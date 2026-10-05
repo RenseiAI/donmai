@@ -44,11 +44,9 @@ var classOrder = map[WritableClass]int{
 
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
-// every earlier self-test record stale.
-// The probe-set version bumps when a probe is added or its expectation
-// changes, so the v3 loopback (IPv6, hostname) and extra pasteboard
-// probes stale every earlier self-test record.
-const ProbeSetVersion = "executor-confinement-probes-v3"
+// every earlier self-test record stale. v4 adds the read-scope pass; v5 adds
+// the terminal, package data tree and extended attribute read probes.
+const ProbeSetVersion = "executor-confinement-probes-v5"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the
@@ -87,6 +85,22 @@ type Spec struct {
 	// the session. Outbound TCP to the local machine is denied except on
 	// these ports; nothing is allowed by default.
 	LoopbackTCPPorts []int
+
+	// ReadScope is the fileRead level the boundary enforces, on the
+	// execution-security ladder. Empty or agent.FileReadHost leaves reads
+	// open, as before. agent.FileReadWorkarea denies file contents and
+	// directory listings everywhere except the read allowlist: the writable
+	// set, the read-only leaves, ReadPaths, and the runtime and toolchain
+	// paths the backend declares. File metadata stays readable, so path
+	// lookups and stat keep working; a search over the whole disk fails fast
+	// instead of walking it. Any other level is refused.
+	ReadScope agent.ExecutionSecurityLevel
+	// ReadPaths are further files or directories the harness may read under
+	// a read scope: its own install and the host configuration it reads.
+	// They stay read-only. None may be the filesystem root or cover the
+	// operator home, the host state home or the profile directory, and they
+	// need a read scope.
+	ReadPaths []string
 }
 
 // Cache is one per-session toolchain cache bound to an environment variable.

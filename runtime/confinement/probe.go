@@ -57,6 +57,11 @@ const (
 	opAttach       stepOp = "attach"
 	opMount        stepOp = "mount"
 	opPrefWrite    stepOp = "preference_write"
+	opRead         stepOp = "read"
+	opList         stepOp = "list"
+	opStat         stepOp = "stat"
+	opOpen         stepOp = "open"
+	opGetxattr     stepOp = "getxattr"
 )
 
 type probeStep struct {
@@ -72,6 +77,8 @@ type probeStep struct {
 	// "127.0.0.1", "::1" or "localhost". Empty means the IPv4
 	// loopback, so older plans keep their meaning.
 	Host string `json:"host,omitempty"`
+	// Flags are the options of the getxattr probe.
+	Flags int `json:"flags,omitempty"`
 }
 
 type probePlan struct {
@@ -185,6 +192,16 @@ func runStep(step probeStep) stepResult {
 		result.Exit, result.Output, err = runTool("/usr/bin/defaults", "write", step.Label, "probe", "1")
 	case opMount:
 		result.Exit, result.Output, err = runTool("/usr/bin/hdiutil", "attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", step.Path, step.Path2)
+	case opRead:
+		_, err = os.ReadFile(step.Path) //nolint:gosec // G304: the probe's own target.
+	case opList:
+		_, err = os.ReadDir(step.Path)
+	case opStat:
+		_, err = os.Lstat(step.Path)
+	case opOpen:
+		err = openForRead(step.Path)
+	case opGetxattr:
+		err = readXattr(step.Path, step.Label, step.Flags)
 	default:
 		err = fmt.Errorf("unknown probe operation %q", step.Op)
 	}
@@ -192,6 +209,30 @@ func runStep(step probeStep) stepResult {
 		result.Err = errnoText(err)
 	}
 	return result
+}
+
+// openForRead opens path read-only without blocking and without taking it as
+// the controlling terminal, then closes it: whether the open is allowed is
+// the question, for a device node a read would block on.
+func openForRead(path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	return unix.Close(fd)
+}
+
+// readXattr reads the whole value of one extended attribute: its size
+// first, then the value, so a value longer than any fixed buffer is not
+// mistaken for a refusal.
+func readXattr(path, name string, options int) error {
+	size, err := getxattr(path, name, nil, options)
+	if err != nil {
+		return err
+	}
+	const most = 1 << 20
+	_, err = getxattr(path, name, make([]byte, min(size, most)), options)
+	return err
 }
 
 func createFile(path string) error {

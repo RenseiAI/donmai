@@ -1,5 +1,11 @@
 package confinement
 
+import (
+	"sort"
+
+	"github.com/RenseiAI/donmai/agent"
+)
+
 // Backend applies a confinement boundary around one harness process. The
 // macOS profile backend is the only implementation in this package today;
 // a Linux mount-namespace backend is the next one.
@@ -74,4 +80,34 @@ type Resolved struct {
 	Caches     []Cache
 	// ReadOnlyLeafNames are the read-only leaves' names, for the record.
 	ReadOnlyLeafNames []string
+	// ReadScope is the enforced fileRead level: empty for open reads, or
+	// agent.FileReadWorkarea.
+	ReadScope agent.ExecutionSecurityLevel
+	// ReadPaths are the declared extra read paths, canonical and sorted.
+	ReadPaths []string
+}
+
+// ReadAllowlist is the session's half of the read allowlist under a read
+// scope: every writable root, every read-only leaf and every declared read
+// path, sorted and without repeats. The backend adds its runtime paths.
+func (r *Resolved) ReadAllowlist() []string {
+	seen := map[string]bool{}
+	var paths []string
+	add := func(path string) {
+		if !seen[path] {
+			seen[path] = true
+			paths = append(paths, path)
+		}
+	}
+	for _, root := range r.Writable {
+		add(root.Path)
+	}
+	for _, leaf := range r.ReadOnly {
+		add(leaf)
+	}
+	for _, path := range r.ReadPaths {
+		add(path)
+	}
+	sort.Strings(paths)
+	return paths
 }

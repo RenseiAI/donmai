@@ -33,7 +33,7 @@ func (r renderingBackend) Version() (string, error) {
 }
 
 func (r renderingBackend) Apply(req ApplyRequest) (Applied, error) {
-	text, err := renderSeatbelt(req.Resolved, []string{"/tmp"}, req.Rules, r.Canonical)
+	text, err := renderSeatbelt(req.Resolved, seatbeltHost{shared: []string{"/tmp"}}, req.Rules, r.Canonical)
 	if err != nil {
 		return Applied{}, err
 	}

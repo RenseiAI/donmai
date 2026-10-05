@@ -43,3 +43,28 @@ func TestMapFilters_DropMalformedKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestFilterHostOwnedMap_DropsTheConfinementSettings pins that a work item
+// cannot set, loosen or widen the host's pi confinement: the requirement,
+// the read scope and the declared read paths are all host-owned.
+func TestFilterHostOwnedMap_DropsTheConfinementSettings(t *testing.T) {
+	t.Parallel()
+	in := map[string]string{
+		PiConfinementEnv:          "off",
+		PiConfinementReadEnv:      "host",
+		PiConfinementReadPathsEnv: "/",
+		"KEEP":                    "yes",
+	}
+	out := FilterHostOwnedMap(in)
+	if len(out) != 1 || out["KEEP"] != "yes" {
+		t.Fatalf("FilterHostOwnedMap = %q, want only KEEP=yes", out)
+	}
+	for _, key := range []string{PiConfinementEnv, PiConfinementReadEnv, PiConfinementReadPathsEnv} {
+		if !IsHostOwned(key) {
+			t.Errorf("%s is not host-owned", key)
+		}
+	}
+	if IsHostOwned("PATH") {
+		t.Error("PATH is host-owned")
+	}
+}

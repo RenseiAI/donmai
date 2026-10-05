@@ -3,8 +3,12 @@ package confinement
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // specWorld is a minimal session on disk: a workarea with a mutable and a
@@ -184,6 +188,34 @@ func TestResolveSpec_RefusesUnrepresentableSets(t *testing.T) {
 		{"missing protected path", func(_ *testing.T, w specWorld, spec *Spec, _ *guards) {
 			spec.Protected = []string{filepath.Join(w.state, "absent")}
 		}},
+		{"read paths without a read scope", func(_ *testing.T, w specWorld, spec *Spec, _ *guards) {
+			spec.ReadPaths = []string{filepath.Join(w.home, ".gitconfig")}
+		}},
+		{"read scope home-minus-secrets", func(_ *testing.T, _ specWorld, spec *Spec, _ *guards) {
+			spec.ReadScope = agent.FileReadHomeMinusSecrets
+		}},
+		{"unknown read scope", func(_ *testing.T, _ specWorld, spec *Spec, _ *guards) { spec.ReadScope = "everything" }},
+		{"relative read path", func(_ *testing.T, _ specWorld, spec *Spec, _ *guards) {
+			spec.ReadScope, spec.ReadPaths = agent.FileReadWorkarea, []string{".gitconfig"}
+		}},
+		{"read path is the filesystem root", func(_ *testing.T, _ specWorld, spec *Spec, _ *guards) {
+			spec.ReadScope, spec.ReadPaths = agent.FileReadWorkarea, []string{"/"}
+		}},
+		{"read path covers the operator home", func(_ *testing.T, w specWorld, spec *Spec, _ *guards) {
+			spec.ReadScope, spec.ReadPaths = agent.FileReadWorkarea, []string{w.home}
+		}},
+		{"read path covers the host state home", func(_ *testing.T, w specWorld, spec *Spec, _ *guards) {
+			spec.ReadScope, spec.ReadPaths = agent.FileReadWorkarea, []string{w.stateHome}
+		}},
+		{"read path covers the workarea root", func(_ *testing.T, w specWorld, spec *Spec, _ *guards) {
+			spec.ReadScope, spec.ReadPaths = agent.FileReadWorkarea, []string{filepath.Dir(w.ws)}
+		}},
+		{"read path through a link planted in harness state", func(t *testing.T, w specWorld, spec *Spec, _ *guards) {
+			if err := os.Symlink(w.home, filepath.Join(w.state, "home")); err != nil {
+				t.Fatal(err)
+			}
+			spec.ReadScope, spec.ReadPaths = agent.FileReadWorkarea, []string{filepath.Join(w.state, "home", ".ssh")}
+		}},
 		{"relative declared socket", func(_ *testing.T, _ specWorld, spec *Spec, _ *guards) { spec.Sockets = []string{"sock"} }},
 		{"declared socket through a link planted in harness state", func(t *testing.T, w specWorld, spec *Spec, _ *guards) {
 			elsewhere := filepath.Join(w.base, "runtime")
@@ -293,6 +325,64 @@ func TestResolveSpec_LoopbackTCPPorts(t *testing.T) {
 		_, err := resolveSpec(bad, w.guards(), evalSymlinks)
 		if reason, _ := ReasonOf(err); reason != ReasonWritableSetUnrepresentable {
 			t.Fatalf("ports %v: err=%v, want writable_set_unrepresentable", ports, err)
+		}
+	}
+}
+
+// TestResolveSpec_ReadScope: a workarea read scope resolves with its
+// declared read paths canonical, sorted and without repeats, and the
+// session's read allowlist is its writable roots, read-only leaves and read
+// paths. Open reads resolve to no scope.
+func TestResolveSpec_ReadScope(t *testing.T) {
+	w := newSpecWorld(t)
+	dotfiles := filepath.Join(w.base, "dotfiles")
+	if err := os.MkdirAll(dotfiles, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dotfiles, "gitconfig"), []byte("[user]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(w.home, ".gitconfig")
+	if err := os.Symlink(filepath.Join(dotfiles, "gitconfig"), link); err != nil {
+		t.Fatal(err)
+	}
+	spec := w.spec()
+	spec.ReadScope = agent.FileReadWorkarea
+	absent := filepath.Join(w.home, ".config", "git")
+	spec.ReadPaths = []string{link, absent, link}
+	resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
+	if err != nil {
+		t.Fatalf("resolveSpec: %v", err)
+	}
+	if resolved.ReadScope != agent.FileReadWorkarea {
+		t.Fatalf("read scope = %q", resolved.ReadScope)
+	}
+	wantPaths := []string{filepath.Join(dotfiles, "gitconfig"), absent}
+	sort.Strings(wantPaths)
+	if strings.Join(resolved.ReadPaths, ",") != strings.Join(wantPaths, ",") {
+		t.Fatalf("read paths = %v, want %v (a link resolves to its target, an absent path stays, repeats fold)", resolved.ReadPaths, wantPaths)
+	}
+	allow := resolved.ReadAllowlist()
+	for _, want := range append([]string{w.mut, w.state, w.tmp, w.cache, w.ro}, wantPaths...) {
+		if !slices.Contains(allow, want) {
+			t.Errorf("read allowlist lacks %s: %v", want, allow)
+		}
+	}
+	for _, never := range []string{w.ws, w.home, w.stateHome, filepath.Join(w.ws, ".workarea")} {
+		if slices.Contains(allow, never) {
+			t.Errorf("read allowlist names %s", never)
+		}
+	}
+	if !sort.StringsAreSorted(allow) {
+		t.Errorf("read allowlist is not sorted: %v", allow)
+	}
+
+	for _, open := range []agent.ExecutionSecurityLevel{"", agent.FileReadHost} {
+		spec := w.spec()
+		spec.ReadScope = open
+		resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
+		if err != nil || resolved.ReadScope != "" {
+			t.Fatalf("read scope %q: resolved %q, err %v; want open reads", open, resolved.ReadScope, err)
 		}
 	}
 }

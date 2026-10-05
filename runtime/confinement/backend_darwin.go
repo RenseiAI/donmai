@@ -141,7 +141,11 @@ func (s *seatbeltBackend) Apply(req ApplyRequest) (Applied, error) {
 	if err != nil {
 		return Applied{}, refuse(ReasonBackendAbsent, "shared locations: %v", err)
 	}
-	text, err := renderSeatbelt(req.Resolved, shared, req.Rules, s.Canonical)
+	host := seatbeltHost{shared: shared}
+	if req.Resolved.ReadScope != "" {
+		host.runtimeReads = append(developerReads(), xcrunCacheReads()...)
+	}
+	text, err := renderSeatbelt(req.Resolved, host, req.Rules, s.Canonical)
 	if err != nil {
 		return Applied{}, err
 	}
@@ -193,14 +197,9 @@ func sharedLocations() ([]string, error) {
 	sharedOnce.Do(func() {
 		locations := []string{"/private/tmp", "/private/var/tmp"}
 		for _, name := range []string{"DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"} {
-			out, err := exec.Command("/usr/bin/getconf", name).Output() //nolint:gosec // G204: fixed absolute tool, fixed names.
+			dir, err := darwinUserDir(name)
 			if err != nil {
-				sharedErr = fmt.Errorf("getconf %s: %w", name, err)
-				return
-			}
-			dir, err := canonicalDarwin(strings.TrimSpace(string(out)))
-			if err != nil {
-				sharedErr = fmt.Errorf("resolve %s: %w", name, err)
+				sharedErr = err
 				return
 			}
 			locations = append(locations, dir)
@@ -208,6 +207,83 @@ func sharedLocations() ([]string, error) {
 		sharedValue = locations
 	})
 	return append([]string(nil), sharedValue...), sharedErr
+}
+
+// darwinUserDir resolves one of the per-user directories the OS assigns
+// (getconf DARWIN_USER_TEMP_DIR and the like), canonicalized.
+func darwinUserDir(name string) (string, error) {
+	out, err := exec.Command("/usr/bin/getconf", name).Output() //nolint:gosec // G204: fixed absolute tool, fixed names.
+	if err != nil {
+		return "", fmt.Errorf("getconf %s: %w", name, err)
+	}
+	dir, err := canonicalDarwin(strings.TrimSpace(string(out)))
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", name, err)
+	}
+	return dir, nil
+}
+
+// xcrunCacheReads is the lookup cache xcrun keeps in the user temporary
+// directory, readable under a read scope: it holds only the paths of the
+// developer tools. Without it every /usr/bin developer shim fails to read
+// the cache, tries to write a new one (the shared temporary location is
+// denied) and prints an error on stderr; a shim run through cc
+// --print-prog-name, as the Go linker finds dsymutil, then returns that
+// error text as the tool's path and the link fails. The cache is read-only
+// here: writing it stays denied.
+func xcrunCacheReads() []string {
+	dir, err := darwinUserDir("DARWIN_USER_TEMP_DIR")
+	if err != nil {
+		return nil
+	}
+	return []string{filepath.Join(dir, "xcrun_db")}
+}
+
+var (
+	developerOnce  sync.Once
+	developerValue []string
+)
+
+// developerReads are the runtime paths of the active developer directory
+// readable under a read scope: the application bundle it lives in, which
+// carries the toolchains, SDKs and shared frameworks the developer tools
+// load. The command line tools are on the static list; a developer
+// directory outside an application bundle adds nothing, so a stray
+// DEVELOPER_DIR cannot open a home directory to reads. Resolved once.
+func developerReads() []string {
+	developerOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "/usr/bin/xcode-select", "-p").Output() //nolint:gosec // G204: fixed absolute tool and argument.
+		if err != nil {
+			return
+		}
+		if bundle, ok := applicationBundle(strings.TrimSpace(string(out))); ok {
+			developerValue = []string{bundle}
+		}
+	})
+	return append([]string(nil), developerValue...)
+}
+
+// applicationBundle returns the canonical application bundle a developer
+// directory lives in, or false when it is in none.
+func applicationBundle(dir string) (string, bool) {
+	if !filepath.IsAbs(dir) {
+		return "", false
+	}
+	resolved, err := canonicalDarwin(dir)
+	if err != nil {
+		return "", false
+	}
+	at := strings.Index(resolved+"/", ".app/")
+	if at < 0 {
+		return "", false
+	}
+	bundle := resolved[:at+len(".app")]
+	if filepath.Dir(bundle) == string(filepath.Separator) {
+		return "", false
+	}
+	return bundle, true
 }
 
 // profileName is a profile file name for one rendering: the harness and

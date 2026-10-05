@@ -125,6 +125,20 @@ type Options struct {
 	// when the host environment carries DONMAI_PI_CONFINEMENT=required.
 	RequireConfinement bool
 
+	// ConfinementReadScope is the host's fileRead level for confined
+	// sessions. agent.FileReadWorkarea confines reads to the session's
+	// workarea, the runtime and toolchain paths, pi's own install, git's
+	// user configuration and ConfinementReadPaths, and implies
+	// RequireConfinement; empty or agent.FileReadHost leaves reads open.
+	// New refuses any other level, and tightens it to workarea when the
+	// host environment carries DONMAI_PI_CONFINEMENT_READ=workarea.
+	ConfinementReadScope agent.ExecutionSecurityLevel
+
+	// ConfinementReadPaths are further absolute paths confined sessions may
+	// read under a read scope. New appends the entries of
+	// DONMAI_PI_CONFINEMENT_READ_PATHS.
+	ConfinementReadPaths []string
+
 	// Test seams. skipProcess wires stdin/stdout overrides instead of execing
 	// a real child; used by the pipe-stub tests that replay pi RPC shapes.
 	skipProcess    bool
@@ -157,6 +171,14 @@ type Options struct {
 // work item's copy, so the worker sees only the host's value.
 const piConfinementEnvVar = runtimeenv.PiConfinementEnv
 
+// piConfinementReadEnvVar and piConfinementReadPathsEnvVar are the
+// host-level read scope and its declared read paths (host-owned, like the
+// requirement): the read scope can only tighten.
+const (
+	piConfinementReadEnvVar      = runtimeenv.PiConfinementReadEnv
+	piConfinementReadPathsEnvVar = runtimeenv.PiConfinementReadPathsEnv
+)
+
 // New probes the pi binary and enforces the version pin (probe-time, per
 // design §2 / opencode §8). A confirmed-below-MinVersion binary fails
 // construction with agent.ErrProviderUnavailable; an unverifiable/above
@@ -176,6 +198,9 @@ func New(opts Options) (*Provider, error) {
 	}
 	if strings.TrimSpace(os.Getenv(piConfinementEnvVar)) == "required" {
 		opts.RequireConfinement = true
+	}
+	if err := applyHostReadScope(&opts); err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
 	p := &Provider{opts: opts, trustedExtensions: append([]TrustedExtensionIdentity(nil), opts.TrustedExtensions...)}
 
@@ -411,7 +436,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// from here to the handle releases the rendered profile.
 	var plan *confinement.Plan
 	if confiner != nil {
-		plan, err = confinePiSession(spec, layout, confiner)
+		plan, err = p.confineSession(spec, layout, confiner)
 		if err != nil {
 			return nil, err
 		}
@@ -581,11 +606,26 @@ func (p *Provider) confinerForSession(ctx context.Context, spec agent.Spec) (*co
 	if err != nil {
 		return nil, fmt.Errorf("%w: pi confinement probe executable: %v", agent.ErrSpawnFailed, err)
 	}
-	dirs := productionConfinementDirs()
+	return ensurePiConfiner(ctx, p.binary, p.hostConfinementDirs(), []string{probe})
+}
+
+// hostConfinementDirs returns the confiner's host directories: the test
+// seam's when set, else the host's own.
+func (p *Provider) hostConfinementDirs() piConfinementDirs {
 	if p.opts.confinementDirs != nil {
-		dirs = *p.opts.confinementDirs
+		return *p.opts.confinementDirs
 	}
-	return ensurePiConfiner(ctx, p.binary, dirs, []string{probe})
+	return productionConfinementDirs()
+}
+
+// confineSession prepares a confined session's plan under the host's read
+// scope.
+func (p *Provider) confineSession(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner) (*confinement.Plan, error) {
+	reads, err := p.sessionReadScope(p.hostConfinementDirs().home)
+	if err != nil {
+		return nil, err
+	}
+	return confinePiSession(spec, layout, confiner, reads)
 }
 
 // piConfinementEnabled reports whether the session requested OS confinement

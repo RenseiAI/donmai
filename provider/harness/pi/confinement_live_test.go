@@ -62,9 +62,11 @@ import (
 // It attempts, in order: a write inside the mutable leaf, a write outside the
 // set, a write into a read-only sibling, an append to the boundary extension
 // (protected under confinement), and a write into $TMPDIR (the session tmp
-// under confinement); it records $TMPDIR and $GOCACHE and the descriptors it
-// holds, and, when the test names two loopback ports, whether it can connect
-// to each. Every attempt sends its errors into the report and the script
+// under confinement); it records $TMPDIR, $GOCACHE, $GOPATH and the pnpm
+// store and the descriptors it holds; when the test names an outside file it
+// reads it, lists the outside directory, reads inside the leaf and runs git
+// there with the test's home; and, when the test names two loopback ports,
+// whether it can connect to each. Every attempt sends its errors into the report and the script
 // always exits zero, so the verdict comes from the report. In headless mode
 // (`--mode rpc`) it then plays the RPC side: the handshake, and after the
 // provider's first two commands (get_state plus the prompt or get_entries) a
@@ -80,6 +82,15 @@ r="$PROBE_MUT/report.txt"
 (echo tmp-ok > "$TMPDIR/probe-tmp.txt") 2>>"$r"; echo "tmp=$?" >> "$r"
 echo "tmpdir=$TMPDIR" >> "$r"
 echo "gocache=$GOCACHE" >> "$r"
+echo "gopath=$GOPATH" >> "$r"
+echo "pnpm_store=$PNPM_CONFIG_STORE_DIR" >> "$r"
+echo "xdg_runtime=$XDG_RUNTIME_DIR" >> "$r"
+if [ -n "$PROBE_READ_OUTSIDE" ]; then
+	(cat "$PROBE_READ_OUTSIDE" > /dev/null) 2>>"$r"; echo "read_outside=$?" >> "$r"
+	(ls "$PROBE_OUTSIDE" > /dev/null) 2>>"$r"; echo "list_outside=$?" >> "$r"
+	(cat "$PROBE_MUT/.git/HEAD" > /dev/null) 2>>"$r"; echo "read_inside=$?" >> "$r"
+	(HOME="$PROBE_HOME" XDG_CONFIG_HOME= git -C "$PROBE_MUT" status --porcelain > /dev/null) 2>>"$r"; echo "git=$?" >> "$r"
+fi
 if [ -n "$PROBE_PORT_DECLARED" ]; then
 	nc -z -G 3 127.0.0.1 "$PROBE_PORT_DECLARED" >/dev/null 2>&1; echo "declared=$?" >> "$r"
 	nc -z -G 3 127.0.0.1 "$PROBE_PORT_UNDECLARED" >/dev/null 2>&1; echo "undeclared=$?" >> "$r"
@@ -124,6 +135,7 @@ func liveConfinementDirs(t *testing.T) *piConfinementDirs {
 			stateHome:  filepath.Join(base, "state"),
 			profileDir: filepath.Join(base, "state", "profiles"),
 			scratchDir: filepath.Join(base, "scratch"),
+			cacheDir:   filepath.Join(base, "state", "selftest-cache"),
 		}
 		for _, dir := range []string{dirs.home, dirs.stateHome, dirs.profileDir} {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -780,7 +792,7 @@ func TestPiConfinement_DigestChangeRetiresAttestation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := confinePiSession(spec, layout, c)
+	plan, err := confinePiSession(spec, layout, c, piReadScope{})
 	if err != nil {
 		t.Fatalf("Prepare under the tested digest: %v", err)
 	}
@@ -799,7 +811,7 @@ func TestPiConfinement_DigestChangeRetiresAttestation(t *testing.T) {
 	if _, ok := changed.Attestation(); ok {
 		t.Fatalf("a confiner that never ran the self-test attests")
 	}
-	if _, err := confinePiSession(spec, layout, changed); err == nil {
+	if _, err := confinePiSession(spec, layout, changed, piReadScope{}); err == nil {
 		t.Fatalf("Prepare under a changed digest succeeded without a self-test: the cached attestation was reused")
 	}
 }
@@ -902,4 +914,178 @@ func TestRealBinary_ConfinedTurnReachesLoopbackEndpoint(t *testing.T) {
 	if !sawReply || len(stub.recordedTurns()) == 0 {
 		t.Fatalf("the confined turn never reached the loopback model endpoint (reply=%v, requests=%d)", sawReply, len(stub.recordedTurns()))
 	}
+}
+
+// TestRealBinary_ReadScopedTurnCompletes runs the REAL pi binary under the
+// workarea read scope against the loopback model stub and proves the turn
+// completes: pi reads its own install, its per-session agent home and the
+// boundary extension inside the profile, and tolerates what it may no
+// longer read — a home holding user-level skills it would otherwise load.
+// Skips without pi on PATH (hosted CI has none).
+func TestRealBinary_ReadScopedTurnCompletes(t *testing.T) {
+	realBinaryAvailable(t)
+	w := newLiveWorld(t)
+	home := filepath.Join(filepath.Dir(w.root), "home")
+	skill := filepath.Join(home, ".agents", "skills", "operator-skill")
+	mustMkdir(t, skill)
+	if err := os.WriteFile(filepath.Join(skill, "SKILL.md"), []byte("---\nname: operator-skill\ndescription: x\n---\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	stub := newRealBinaryStub(t, realBinaryModel)
+	spec := realBinarySpec(w.mut, "reply with a short greeting and nothing else", stub.baseURL())
+	p, err := New(Options{HandshakeTimeout: 60 * time.Second, ConfinementReadScope: agent.FileReadWorkarea})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dirs := *liveConfinementDirs(t)
+	dirs.home = home
+	p.opts.confinementDirs = &dirs
+	h, err := p.Spawn(liveCtx(t), spec)
+	if err != nil {
+		t.Fatalf("read-scoped Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	if h.(*Handle).confinement == nil {
+		t.Fatalf("the host read scope requires confinement but the session spawned without a plan")
+	}
+	sawReply := false
+	for _, ev := range drainToResult(t, h, 90*time.Second) {
+		switch e := ev.(type) {
+		case agent.AssistantTextEvent:
+			if strings.HasPrefix(e.Text, "stub-reply-") {
+				sawReply = true
+			}
+		case agent.ErrorEvent:
+			t.Fatalf("read-scoped session ended with an ErrorEvent: %+v", e)
+		}
+	}
+	if !sawReply || len(stub.recordedTurns()) == 0 {
+		t.Fatalf("the read-scoped turn never completed (reply=%v, requests=%d)", sawReply, len(stub.recordedTurns()))
+	}
+}
+
+// TestPiConfinement_ReadScopeConfinesReads drives Provider.Spawn under the
+// host read scope: the seat reads inside its leaf and runs git with the
+// user configuration the adapter declared readable, and its own harness
+// install is readable, while reading or listing outside the set is refused.
+// The same Spawn confined with reads open succeeds at every read, so the
+// refusals are the read scope's.
+func TestPiConfinement_ReadScopeConfinesReads(t *testing.T) {
+	w := newLiveWorld(t)
+	dirs := liveConfinementDirs(t)
+	secret := filepath.Join(w.outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("outside\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitconfig := filepath.Join(dirs.home, ".gitconfig")
+	if err := os.WriteFile(gitconfig, []byte("[user]\n\tname = probe\n\temail = probe@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(gitconfig) })
+	bin := writeLiveHarness(t, w, "PROBE_READ_OUTSIDE='"+secret+"'", "PROBE_HOME='"+dirs.home+"'")
+
+	opts := Options{ConfinementReadScope: agent.FileReadWorkarea}
+	if err := applyHostReadScope(&opts); err != nil {
+		t.Fatalf("applyHostReadScope: %v", err)
+	}
+	if !opts.RequireConfinement {
+		t.Fatal("a read scope did not require confinement")
+	}
+	p := liveProvider(t, bin, opts.RequireConfinement)
+	p.opts.ConfinementReadScope = opts.ConfinementReadScope
+	h, err := p.Spawn(liveCtx(t), w.spec())
+	if err != nil {
+		t.Fatalf("read-scoped Spawn: %v", err)
+	}
+	finishHeadless(t, h)
+	r := readProbeReport(t, w)
+	for _, key := range []string{"inside", "read_inside", "git"} {
+		if r.vals[key] != "0" {
+			t.Errorf("read scope: %s failed:\n%s", key, r.raw)
+		}
+	}
+	for _, key := range []string{"read_outside", "list_outside", "outside"} {
+		if got, ok := r.vals[key]; !ok || got == "0" {
+			t.Errorf("read scope: %s was not refused (status %q):\n%s", key, got, r.raw)
+		}
+	}
+	layout := newSessionLayoutForSpec(w.spec())
+	runtimeDir := filepath.Join(layout.root, piSessionCacheDir, "run")
+	for key, want := range map[string]string{
+		"gopath":      filepath.Join(layout.root, piSessionCacheDir, "go-path"),
+		"pnpm_store":  filepath.Join(layout.root, piSessionCacheDir, "pnpm-store"),
+		"xdg_runtime": runtimeDir,
+	} {
+		if r.vals[key] != want {
+			t.Errorf("read scope: %s = %q, want the session cache %q", key, r.vals[key], want)
+		}
+	}
+	// Tools only keep locks in a runtime directory their user owns alone.
+	if info, err := os.Stat(runtimeDir); err != nil || info.Mode().Perm() != 0o700 {
+		t.Errorf("the session runtime directory is not owner-only: %v %v", info, err)
+	}
+
+	resetProbe(w)
+	h, err = liveProvider(t, bin, true).Spawn(liveCtx(t), w.spec())
+	if err != nil {
+		t.Fatalf("confined Spawn with reads open: %v", err)
+	}
+	finishHeadless(t, h)
+	r = readProbeReport(t, w)
+	for _, key := range []string{"read_outside", "list_outside", "read_inside", "git"} {
+		if r.vals[key] != "0" {
+			t.Errorf("CONTROL with reads open: %s failed, so the test cannot discriminate:\n%s", key, r.raw)
+		}
+	}
+}
+
+// TestPiConfinement_SecondWorkerReusesTheSelfTest: every seat is its own
+// worker process, so the in-process confiner cache starts empty each time.
+// After one worker's self-test passes, the next worker's confinement setup —
+// the confiner (self-test from the host cache) plus the session plan under
+// the read scope — takes under a second, reusing the same record.
+func TestPiConfinement_SecondWorkerReusesTheSelfTest(t *testing.T) {
+	w := newLiveWorld(t)
+	bin := writeLiveHarness(t, w)
+	dirs := liveConfinementDirs(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := ensurePiConfiner(liveCtx(t), bin, *dirs, []string{exe})
+	if err != nil {
+		t.Fatalf("first worker: %v", err)
+	}
+	firstRecord, _ := first.SelfTestRecord()
+
+	// A new worker process: nothing cached in memory.
+	piConfinerCache.Lock()
+	piConfinerCache.entries = nil
+	piConfinerCache.Unlock()
+
+	p := &Provider{binary: bin, opts: Options{ConfinementReadScope: agent.FileReadWorkarea, RequireConfinement: true, confinementDirs: dirs}}
+	start := time.Now()
+	second, err := ensurePiConfiner(liveCtx(t), bin, *dirs, []string{exe})
+	if err != nil {
+		t.Fatalf("second worker: %v", err)
+	}
+	layout, err := materializeExtensionForSpec(w.spec(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := p.confineSession(w.spec(), layout, second)
+	setup := time.Since(start)
+	if err != nil {
+		t.Fatalf("second worker's session plan: %v", err)
+	}
+	t.Cleanup(func() { _ = plan.Release() })
+	secondRecord, _ := second.SelfTestRecord()
+	if secondRecord.Digest != firstRecord.Digest {
+		t.Fatalf("the second worker probed again: record %s, want the cached %s", secondRecord.Digest, firstRecord.Digest)
+	}
+	if setup >= time.Second {
+		t.Fatalf("the second worker's confinement setup took %s, want under 1s", setup)
+	}
+	t.Logf("second worker confinement setup: %s", setup.Round(time.Millisecond))
 }

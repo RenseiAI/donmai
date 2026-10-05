@@ -346,3 +346,100 @@ func linkCount(t *testing.T, path string) uint64 {
 	}
 	return uint64(st.Nlink)
 }
+
+// TestNew_HostReadScopeOnlyTightens pins the host read-scope settings: the
+// environment can turn the workarea read scope on, never off; a scope pi
+// cannot confine reads to, or a relative read path, refuses the provider
+// instead of leaving reads open; and a read scope requires confinement.
+func TestNew_HostReadScopeOnlyTightens(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		env       string
+		paths     string
+		option    agent.ExecutionSecurityLevel
+		want      agent.ExecutionSecurityLevel
+		wantPaths []string
+		refused   bool
+	}{
+		{name: "unset", want: ""},
+		{name: "host", env: "host", want: ""},
+		{name: "workarea", env: "workarea", want: agent.FileReadWorkarea},
+		{name: "workarea option, host env", env: "host", option: agent.FileReadWorkarea, want: agent.FileReadWorkarea},
+		{name: "workarea option, unset env", option: agent.FileReadWorkarea, want: agent.FileReadWorkarea},
+		{name: "host-owned paths", env: "workarea", paths: "/a/b" + string(os.PathListSeparator) + string(os.PathListSeparator) + "/c", want: agent.FileReadWorkarea, wantPaths: []string{"/a/b", "/c"}},
+		{name: "home-minus-secrets", env: "home-minus-secrets", refused: true},
+		{name: "unknown env scope", env: "workaera", refused: true},
+		{name: "unknown option scope", option: "everything", refused: true},
+		{name: "relative path", env: "workarea", paths: "relative/path", refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(piConfinementEnvVar, "")
+			t.Setenv(piConfinementReadEnvVar, tc.env)
+			t.Setenv(piConfinementReadPathsEnvVar, tc.paths)
+			p, err := New(Options{skipProcess: true, ConfinementReadScope: tc.option})
+			if tc.refused {
+				if !errors.Is(err, agent.ErrProviderUnavailable) {
+					t.Fatalf("New = %v, want a provider-unavailable refusal", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if p.opts.ConfinementReadScope != tc.want {
+				t.Errorf("ConfinementReadScope = %q, want %q", p.opts.ConfinementReadScope, tc.want)
+			}
+			if p.opts.RequireConfinement != (tc.want != "") {
+				t.Errorf("RequireConfinement = %v with read scope %q", p.opts.RequireConfinement, tc.want)
+			}
+			if !slices.Equal(p.opts.ConfinementReadPaths, tc.wantPaths) {
+				t.Errorf("ConfinementReadPaths = %q, want %q", p.opts.ConfinementReadPaths, tc.wantPaths)
+			}
+		})
+	}
+}
+
+// TestSessionReadScope_DeclaresWhatASeatReads pins the read paths a
+// confined pi seat gets beside its workarea: pi's own install root, the
+// git, npm and pnpm user configuration under the operator home, and the
+// host's declared paths — and nothing at all without a read scope.
+func TestSessionReadScope_DeclaresWhatASeatReads(t *testing.T) {
+	t.Parallel()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := filepath.Join(base, "prefix", "lib", "node_modules", "@scope", "pi", "dist", "cli.js")
+	if err := os.MkdirAll(filepath.Dir(cli), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cli, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(base, "home")
+	p := &Provider{binary: cli, opts: Options{ConfinementReadScope: agent.FileReadWorkarea, ConfinementReadPaths: []string{"/host/declared"}}}
+	reads, err := p.sessionReadScope(home)
+	if err != nil {
+		t.Fatalf("sessionReadScope: %v", err)
+	}
+	want := []string{
+		filepath.Join(base, "prefix", "lib", "node_modules"),
+		filepath.Join(home, ".gitconfig"),
+		filepath.Join(home, ".config", "git"),
+		filepath.Join(home, ".npmrc"),
+		filepath.Join(home, "Library", "Preferences", "pnpm"),
+		filepath.Join(home, ".config", "pnpm"),
+		"/host/declared",
+	}
+	if reads.level != agent.FileReadWorkarea || !slices.Equal(reads.paths, want) {
+		t.Fatalf("sessionReadScope = %q %q, want %q %q", reads.level, reads.paths, agent.FileReadWorkarea, want)
+	}
+	open := &Provider{binary: cli, opts: Options{ConfinementReadPaths: []string{"/host/declared"}}}
+	if reads, err := open.sessionReadScope(home); err != nil || reads.level != "" || reads.paths != nil {
+		t.Fatalf("sessionReadScope with reads open = %+v, %v; want nothing", reads, err)
+	}
+	missing := &Provider{binary: filepath.Join(base, "absent"), opts: Options{ConfinementReadScope: agent.FileReadWorkarea}}
+	if _, err := missing.sessionReadScope(home); !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("sessionReadScope with a missing harness binary = %v, want a spawn failure", err)
+	}
+}

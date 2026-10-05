@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -92,6 +93,7 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 	allDeclared = append(allDeclared, spec.ReadOnlyLeaves...)
 	allDeclared = append(allDeclared, spec.Protected...)
 	allDeclared = append(allDeclared, spec.Sockets...)
+	allDeclared = append(allDeclared, spec.ReadPaths...)
 	for _, path := range allDeclared {
 		if err := checkLinkPlants(path, writablePaths, canonical); err != nil {
 			return nil, err
@@ -186,6 +188,39 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 			return nil, refuse(ReasonWritableSetUnrepresentable, "%s lies inside the workarea metadata", entry.Class)
 		}
 	}
+
+	scope, err := resolveReadScope(spec.ReadScope)
+	if err != nil {
+		return nil, err
+	}
+	resolved.ReadScope = scope
+	if scope == "" && len(spec.ReadPaths) > 0 {
+		return nil, refuse(ReasonWritableSetUnrepresentable, "read paths are declared without a read scope")
+	}
+	seenRead := map[string]bool{}
+	for _, raw := range spec.ReadPaths {
+		if raw == "" || !filepath.IsAbs(raw) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a read path must be an absolute path")
+		}
+		path, err := canonicalLoose(raw, canonical)
+		if err != nil {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "read path: %v", errnoText(err))
+		}
+		if path == string(filepath.Separator) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a read path is the filesystem root")
+		}
+		for _, guard := range guardPaths {
+			if insideOrEqual(guard.path, path) {
+				return nil, refuse(ReasonWritableSetUnrepresentable, "a read path covers the %s", guard.name)
+			}
+		}
+		if !seenRead[path] {
+			seenRead[path] = true
+			resolved.ReadPaths = append(resolved.ReadPaths, path)
+		}
+	}
+	sort.Strings(resolved.ReadPaths)
+
 	if err := checkHardLinks(writablePaths); err != nil {
 		return nil, err
 	}
@@ -203,6 +238,22 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		return resolved.Writable[i].Path < resolved.Writable[j].Path
 	})
 	return resolved, nil
+}
+
+// resolveReadScope normalizes a requested fileRead level: open reads resolve
+// to empty, workarea to itself. home-minus-secrets and anything unknown are
+// refused, never rendered as a different level.
+func resolveReadScope(level agent.ExecutionSecurityLevel) (agent.ExecutionSecurityLevel, error) {
+	switch level {
+	case "", agent.FileReadHost:
+		return "", nil
+	case agent.FileReadWorkarea:
+		return agent.FileReadWorkarea, nil
+	case agent.FileReadHomeMinusSecrets:
+		return "", refuse(ReasonWritableSetUnrepresentable, "read scope %s is not implemented by this boundary", level)
+	default:
+		return "", refuse(ReasonWritableSetUnrepresentable, "unknown read scope %q", level)
+	}
 }
 
 // resolveDir resolves an existing directory. When noLink is set the last

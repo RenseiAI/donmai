@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -30,6 +31,7 @@ const (
 	classReadOnly  = "read_only_leaf"
 	classProtected = "protected"
 	classWidening  = "widening"
+	classReadScope = "read_scope"
 )
 
 // probeCacheEnv is the cache variable the self-test binds, standing in for a
@@ -58,17 +60,20 @@ type harnessStep struct {
 
 // fixture is one session mode's probe world: a workarea with a mutable and a
 // read-only leaf, harness state with a protected artifact inside it, session
-// tmp and cache, decoys outside the set, and the write proxies in reach.
+// tmp and cache, decoys outside the set, and the write proxies in reach. The
+// same world serves the read-scope pass (readSteps), which runs under the
+// read scope with a declared read path (rp) outside the set.
 type fixture struct {
-	dir, ws, meta, mut, git, state, ext, ro, rom, tmp, cache, out string
-	tag                                                           string
-	steps                                                         []harnessStep
-	cleanups                                                      []func()
-	listener                                                      net.Listener
-	accepts                                                       atomic.Int32
-	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                      net.Listener
-	tcpOpenPort, tcpClosedPort                                    int
-	tcpAccepts                                                    atomic.Int32
+	dir, ws, meta, mut, git, state, ext, ro, rom, tmp, cache, out, rp string
+	tag                                                               string
+	steps                                                             []harnessStep
+	readSteps                                                         []harnessStep
+	cleanups                                                          []func()
+	listener                                                          net.Listener
+	accepts                                                           atomic.Int32
+	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                          net.Listener
+	tcpOpenPort, tcpClosedPort                                        int
+	tcpAccepts                                                        atomic.Int32
 	// mounted records whether the mount probe got a volume over the
 	// read-only leaf; settle takes it before detaching.
 	mounted bool
@@ -99,7 +104,8 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	fx.tmp = filepath.Join(dir, "t")
 	fx.cache = filepath.Join(dir, "c")
 	fx.out = filepath.Join(dir, "o")
-	for _, path := range []string{fx.meta, fx.git, fx.ext, fx.ro, fx.rom, fx.tmp, fx.cache, fx.out} {
+	fx.rp = filepath.Join(dir, "rp")
+	for _, path := range []string{fx.meta, fx.git, fx.ext, fx.ro, fx.rom, fx.tmp, fx.cache, fx.out, fx.rp} {
 		if err := os.MkdirAll(path, 0o755); err != nil { //nolint:gosec // G301: fixture directories.
 			return nil, fmt.Errorf("confinement: fixture: %w", err)
 		}
@@ -167,6 +173,13 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 			return nil, err
 		}
 	}
+	outsideDirs := make([]readLocation, 0, len(locations))
+	for _, location := range locations {
+		outsideDirs = append(outsideDirs, readLocation{id: location.id, dir: location.dir})
+	}
+	if err := fx.readScope(home, stateHome, outsideDirs); err != nil {
+		return nil, err
+	}
 
 	if err := fx.readOnly(diskImage, diskImageErr); err != nil {
 		return nil, err
@@ -209,8 +222,228 @@ func (fx *fixture) spec(mode agent.PromptSessionMode) Spec {
 	}
 }
 
+// readSpec is the spec of the read-scope pass: the same world under the
+// workarea read scope, with one declared read path outside the set.
+func (fx *fixture) readSpec(mode agent.PromptSessionMode) Spec {
+	spec := fx.spec(mode)
+	spec.ReadScope = agent.FileReadWorkarea
+	spec.ReadPaths = []string{fx.rp}
+	return spec
+}
+
 func (fx *fixture) add(class string, expectAccepted bool, step probeStep, effect func(stepResult) bool) {
 	fx.steps = append(fx.steps, harnessStep{probe: step, class: class, expectAccepted: expectAccepted, effect: effect})
+}
+
+func (fx *fixture) addRead(class string, expectAccepted bool, step probeStep, effect func(stepResult) bool) {
+	fx.readSteps = append(fx.readSteps, harnessStep{probe: step, class: class, expectAccepted: expectAccepted, effect: effect})
+}
+
+// readLocation is one decoy directory outside the read allowlist.
+type readLocation struct{ id, dir string }
+
+// readXattrName is the extended attribute the read-scope pass plants on its
+// decoys, so a read of an attribute is judged where a read of the content is.
+const readXattrName = "user.donmai.confinement-read"
+
+// compressedSources are OS files that are transparently compressed on every
+// macOS install; the fixture clones one, still compressed, as a decoy.
+var compressedSources = []string{
+	"/usr/share/man/man1/ls.1",
+	"/usr/share/man/man1/cat.1",
+	"/usr/share/man/man1/cp.1",
+	"/usr/share/man/man1/rm.1",
+}
+
+// The attributes a transparently compressed file keeps its contents in.
+const (
+	decmpfsXattr = "com.apple.decmpfs"
+	resourceFork = "com.apple.ResourceFork"
+	showCompress = xattrShowCompression
+)
+
+// readScope builds the read-scope pass. Positive controls first: every root
+// of the writable set, the read-only leaf, the declared read path and a
+// runtime path stay readable and listable, their extended attributes are
+// readable, metadata stays readable outside the allowlist, and a write
+// inside the set still lands. Then the refusals: reading a file in, reading
+// an extended attribute of, and listing, every decoy outside the set,
+// including the package data trees under the runtime allows and a
+// transparently compressed file, whose contents live in attributes; opening
+// a terminal; and listing the operator home and the host state home
+// themselves — the shape of a search over the whole disk. The declared read
+// path stays read-only, by the write rules.
+func (fx *fixture) readScope(home, stateHome string, outside []readLocation) error {
+	reported := func(res stepResult) bool { return res.Err == "" }
+	pair := func(class string, expectAccepted bool, prefix, dir string) error {
+		file := filepath.Join(dir, "rd")
+		if err := seed(file); err != nil {
+			return err
+		}
+		fx.addRead(class, expectAccepted, probeStep{ID: prefix + ".file", Op: opRead, Path: file}, reported)
+		fx.addRead(class, expectAccepted, probeStep{ID: prefix + ".list", Op: opList, Path: dir}, reported)
+		fx.addReadPlanted(class, expectAccepted, probeStep{ID: prefix + ".xattr", Op: opGetxattr, Path: file, Label: readXattrName}, reported, func() error {
+			return unix.Setxattr(file, readXattrName, []byte("1"), 0)
+		})
+		return nil
+	}
+	for _, in := range []struct{ name, dir string }{
+		{"mutable_leaf", fx.mut},
+		{"mutable_leaf_git", fx.git},
+		{"harness_state", fx.state},
+		{"session_tmp", fx.tmp},
+		{"session_cache", fx.cache},
+		{"read_only_leaf", fx.ro},
+		{"read_path", fx.rp},
+	} {
+		if err := pair(classPositive, true, "allow.read."+in.name, in.dir); err != nil {
+			return err
+		}
+	}
+	fx.addRead(classPositive, true, probeStep{ID: "allow.read.runtime", Op: opRead, Path: "/bin/sh"}, reported)
+	// The device nodes a process needs stay readable: the random devices and
+	// the directory itself.
+	fx.addRead(classPositive, true, probeStep{ID: "allow.read.dev.urandom", Op: opOpen, Path: "/dev/urandom"}, reported)
+	fx.addRead(classPositive, true, probeStep{ID: "allow.read.dev.list", Op: opList, Path: "/dev"}, reported)
+	written := filepath.Join(fx.mut, "rw")
+	fx.addRead(classPositive, true, probeStep{ID: "allow.read.mutable_leaf.write", Op: opCreate, Path: written}, existsEffect(written))
+	for _, location := range outside {
+		if err := pair(classReadScope, false, "read.outside."+location.id, location.dir); err != nil {
+			return err
+		}
+	}
+	if len(outside) > 0 {
+		fx.addRead(classPositive, true, probeStep{ID: "allow.read.metadata_outside", Op: opStat, Path: filepath.Join(outside[0].dir, "rd")}, reported)
+	}
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.operator_home.list", Op: opList, Path: home}, reported)
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.state_home.list", Op: opList, Path: stateHome}, reported)
+	if err := fx.packageData(pair); err != nil {
+		return err
+	}
+	fx.terminal(reported)
+	if len(outside) > 0 {
+		fx.compressed(reported, outside[0].dir)
+	}
+	// A declared read path is outside the writable set: the write rules,
+	// not the read rules, keep it read-only.
+	created := filepath.Join(fx.rp, "n")
+	fx.addRead(classOutside, false, probeStep{ID: "outside.read_path.create", Op: opCreate, Path: created}, existsEffect(created))
+	return nil
+}
+
+// addReadPlanted adds a read-pass probe that needs the fixture to plant
+// something first, outside the boundary; a plant that fails fails the probe.
+func (fx *fixture) addReadPlanted(class string, expectAccepted bool, step probeStep, effect func(stepResult) bool, plant func() error) {
+	harness := harnessStep{probe: step, class: class, expectAccepted: expectAccepted, effect: effect}
+	if err := plant(); err != nil {
+		harness.setupErr = "fixture: " + step.ID + ": " + errnoText(err)
+	}
+	fx.readSteps = append(fx.readSteps, harness)
+}
+
+// packageData adds the decoys under the package manager data trees the
+// runtime allows would otherwise open (Homebrew's var holds database
+// directories and TLS keys). A tree is probed where the host has it and the
+// operator may write it, which is where a package manager keeps its own
+// data; a host without one has nothing there to read.
+func (fx *fixture) packageData(pair func(class string, expectAccepted bool, prefix, dir string) error) error {
+	for _, tree := range seatbeltPackageData {
+		info, err := os.Stat(tree)
+		if err != nil || !info.IsDir() || unix.Access(tree, unix.W_OK) != nil {
+			continue
+		}
+		dir := filepath.Join(tree, ".donmai-confinement-"+fx.tag)
+		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // G301: a decoy directory.
+			return fmt.Errorf("confinement: fixture: package data decoy: %s", errnoText(err))
+		}
+		fx.cleanups = append(fx.cleanups, func() { _ = removeAllForce(dir) })
+		id := "package_var." + filepath.Base(filepath.Dir(tree))
+		if err := pair(classReadScope, false, "read.outside."+id, dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// terminal adds the device node probes: a pseudo-terminal slave the fixture
+// owns must not open for reading, which would capture what is typed into any
+// terminal on the host.
+func (fx *fixture) terminal(reported func(stepResult) bool) {
+	step := harnessStep{probe: probeStep{ID: "read.outside.dev_pty", Op: opOpen}, class: classReadScope, effect: reported}
+	master, slave, err := pty.Open()
+	if err != nil {
+		step.setupErr = "fixture: pty: " + errnoText(err)
+		fx.readSteps = append(fx.readSteps, step)
+		return
+	}
+	fx.cleanups = append(fx.cleanups, func() { _ = slave.Close(); _ = master.Close() })
+	step.probe.Path = slave.Name()
+	// Outside the boundary the slave opens; that is what makes a refusal
+	// under the profile mean something.
+	if fd, err := unix.Open(step.probe.Path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0); err != nil {
+		step.setupErr = "fixture: pty slave does not open outside the boundary: " + errnoText(err)
+	} else {
+		_ = unix.Close(fd)
+	}
+	fx.readSteps = append(fx.readSteps, step)
+}
+
+// compressed adds the compressed file probes. A transparently compressed
+// file keeps its contents in extended attributes that getxattr returns when
+// asked to show compression, whatever the file's own read rules say, so a
+// decoy outside the allowlist must refuse them and the same file inside it
+// (the declared read path) must serve them: without the control a refusal
+// could be a missing attribute.
+func (fx *fixture) compressed(reported func(stepResult) bool, outsideDir string) {
+	for _, place := range []struct {
+		prefix, dir    string
+		class          string
+		expectAccepted bool
+	}{
+		{"allow.read.compressed", fx.rp, classPositive, true},
+		{"read.outside.compressed", outsideDir, classReadScope, false},
+	} {
+		path, err := cloneCompressed(place.dir)
+		if err != nil {
+			fx.readSteps = append(fx.readSteps, harnessStep{
+				probe: probeStep{ID: place.prefix + ".decmpfs", Op: opGetxattr, Path: filepath.Join(place.dir, "cmp"), Label: decmpfsXattr, Flags: showCompress},
+				class: place.class, expectAccepted: place.expectAccepted, effect: reported, setupErr: "fixture: compressed decoy: " + err.Error(),
+			})
+			continue
+		}
+		for _, attr := range []struct{ id, name string }{{"decmpfs", decmpfsXattr}, {"resource_fork", resourceFork}} {
+			// Outside the boundary the attribute reads; that is what makes a
+			// refusal under the profile mean something. A small file keeps its
+			// contents in the decmpfs attribute alone.
+			if _, err := getxattr(path, attr.name, nil, showCompress); err != nil {
+				continue
+			}
+			fx.addRead(place.class, place.expectAccepted, probeStep{ID: place.prefix + "." + attr.id, Op: opGetxattr, Path: path, Label: attr.name, Flags: showCompress}, reported)
+		}
+	}
+}
+
+// cloneCompressed copies a compressed OS file into dir as "cmp", keeping it
+// compressed, and returns its path.
+func cloneCompressed(dir string) (string, error) {
+	if runtime.GOOS != "darwin" {
+		return "", errors.New("transparent compression is a macOS feature")
+	}
+	dst := filepath.Join(dir, "cmp")
+	for _, source := range compressedSources {
+		if _, err := getxattr(source, decmpfsXattr, nil, showCompress); err != nil {
+			continue
+		}
+		_ = os.Remove(dst)
+		if out, err := exec.Command("/usr/bin/ditto", source, dst).CombinedOutput(); err != nil { //nolint:gosec // G204: fixed tool, fixed sources.
+			return "", fmt.Errorf("ditto %s: %w: %s", source, err, strings.TrimSpace(string(out)))
+		}
+		if _, err := getxattr(dst, decmpfsXattr, nil, showCompress); err != nil {
+			return "", fmt.Errorf("the clone of %s is not compressed: %s", source, errnoText(err))
+		}
+		return dst, nil
+	}
+	return "", errors.New("no compressed OS file to clone")
 }
 
 // fileOps adds the file operation probes for one directory: create, write,
