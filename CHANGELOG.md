@@ -10,6 +10,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.64 — 2026-10-05
+
+### Chores
+
+- Carry pi and Claude cache tokens to the status post; keep Responses gateway pins injected
+
 ## v0.72.63 — 2026-10-05
 
 ### Chores
