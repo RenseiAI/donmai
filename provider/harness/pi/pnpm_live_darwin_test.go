@@ -162,6 +162,13 @@ func seatPlan(t *testing.T, w liveWorld, home, endpoint string, drop ...string) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// pnpm's own install, as a host declares a toolchain outside the
+	// runtime paths (a Homebrew install is inside them already).
+	if path, err := exec.LookPath("pnpm"); err == nil {
+		if root, err := confinement.InstallRoot(path); err == nil {
+			reads.paths = append(reads.paths, root)
+		}
+	}
 	reads.paths = slices.DeleteFunc(reads.paths, func(path string) bool { return slices.Contains(drop, path) })
 	plan, err := confinePiSession(spec, layout, c, reads)
 	if err != nil {
