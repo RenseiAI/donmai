@@ -1193,6 +1193,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.DaemonControlURL == nil {
 		spawnerOpts.DaemonControlURL = d.ControlURL
 	}
+	// Default the executor-side record of created per-session scratch
+	// directories to the host state home (see session_tmpdir.go). The
+	// startup sweep below reclaims recorded directories of sessions that
+	// are no longer running. Operators overriding the spawner can pin a
+	// different value; empty disables persistence.
+	if spawnerOpts.SessionTmpRecordDir == "" {
+		spawnerOpts.SessionTmpRecordDir = statepath.Resolve("session-tmp-record", "/tmp/.donmai/session-tmp-record")
+	}
 	// Default WorktreeParentDir to the same statepath-resolved worktrees
 	// directory the spawned `donmai agent run` worker uses when no
 	// --worktree-dir override is passed (afcli/agent_run.go). Keeping the
@@ -1289,6 +1297,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// first exact heartbeat response accepts the published recovery state.
 		d.spawner.Pause()
 	}
+	// Cleanup the executor-owned per-session scratch directory when
+	// sessions end. The spawner's own reaper covers direct-child sessions;
+	// this covers shim-owned sessions the spawner keeps no process
+	// bookkeeping for (their Ended arrives via finishAdoptedShim). Both
+	// cleanups are idempotent.
+	d.spawner.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			d.spawner.CleanupSessionTmpDir(ev.Spec.SessionID)
+		}
+	})
 	// Cleanup the per-session detail store when sessions end so
 	// stale auth tokens do not linger.
 	d.spawner.On(func(ev SessionEvent) {
@@ -1333,6 +1351,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 		d.recordOSSRoutingDecision(ev.Spec.SessionID)
 	})
+	// Reclaim per-session scratch directories recorded by a previous
+	// generation for sessions that are no longer running. Adoption ran
+	// earlier in Start, so live adopted lineages are known and their
+	// directories are protected; the sweep never fails startup.
+	d.sweepSessionTmpDirs()
 
 	if regResp != nil {
 		// Heartbeat, poll and the proactive refresher share ONE refresher, so a

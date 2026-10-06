@@ -293,6 +293,49 @@ func (p *Plan) Environment() []string {
 	return append([]string(nil), p.env...)
 }
 
+// sessionTmpBindingKeys are the environment variables the plan binds to
+// the session_tmp class. A spawn site that already carries an
+// executor-owned binding of one of these (a per-session scratch directory
+// created before the worker started) must not keep both: the plan's
+// binding wins, exactly once.
+var sessionTmpBindingKeys = []string{"TMPDIR", "TMP", "TEMP"}
+
+// ApplyToEnv returns childEnv with this plan's environment applied: any
+// prior TMPDIR, TMP or TEMP entry is replaced — never shadowed — and the
+// plan's full environment is appended. The result binds each of the three
+// exactly once, to session_tmp, however the child environment was
+// otherwise configured. A spawn site with no prior binding sees only the
+// append; a confined run that already carries an executor-owned session
+// scratch keeps the plan's own binding.
+func (p *Plan) ApplyToEnv(childEnv []string) []string {
+	out := make([]string, 0, len(childEnv)+len(p.env))
+	for _, kv := range childEnv {
+		if isSessionTmpBindingKey(kv) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, p.env...)
+}
+
+// isSessionTmpBindingKey reports whether a KEY=VALUE entry (or a bare
+// key) names one of the session-tmp bindings the plan provides.
+func isSessionTmpBindingKey(kv string) bool {
+	key := kv
+	for i := 0; i < len(kv); i++ {
+		if kv[i] == '=' {
+			key = kv[:i]
+			break
+		}
+	}
+	for _, bound := range sessionTmpBindingKeys {
+		if key == bound {
+			return true
+		}
+	}
+	return false
+}
+
 // Record returns the per-session confinement record.
 func (p *Plan) Record() Record { return p.record }
 
