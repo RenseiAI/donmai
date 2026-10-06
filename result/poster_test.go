@@ -30,6 +30,8 @@ func goodResult() agent.Result {
 		CommitSHA:         "0123456789abcdef0123456789abcdef01234567",
 		Summary:           "Implemented X, opened PR.",
 		WorkResult:        "passed",
+		Resumable:         true,
+		ResumeCheckpoint:  &agent.ResumeCheckpoint{Branch: "wip/sess-1", CommitSHA: "89abcdef0123456789abcdef0123456789abcdef"},
 		Cost: &agent.CostData{
 			InputTokens:  1234,
 			OutputTokens: 567,
@@ -824,6 +826,16 @@ func TestPosterPost_StatusBodyShape(t *testing.T) {
 	if body["pullRequestUrl"] != "https://github.com/x/y/pull/42" {
 		t.Errorf("pullRequestUrl = %v, want goodResult's PullRequestURL", body["pullRequestUrl"])
 	}
+	if body["resumable"] != true {
+		t.Errorf("resumable = %v, want true", body["resumable"])
+	}
+	checkpoint, ok := body["resumeCheckpoint"].(map[string]any)
+	if !ok {
+		t.Fatalf("resumeCheckpoint missing or wrong shape: %v", body["resumeCheckpoint"])
+	}
+	if checkpoint["branch"] != "wip/sess-1" || checkpoint["commitSha"] != "89abcdef0123456789abcdef0123456789abcdef" {
+		t.Errorf("resumeCheckpoint = %v, want branch/head from goodResult", checkpoint)
+	}
 }
 
 // TestPosterPost_StatusCorrelationFieldsSerialized asserts the durable
@@ -896,6 +908,76 @@ func TestPosterPost_StatusCorrelationFieldsSerialized(t *testing.T) {
 			}
 			if got := body["pullRequestUrl"]; got != tc.wantPR {
 				t.Errorf("pullRequestUrl = %v, want %v", got, tc.wantPR)
+			}
+		})
+	}
+}
+
+// TestPosterPost_StatusResumeCheckpointSerialized asserts the resumable retry
+// checkpoint fields on the /status body: resumable is omitted when false, and
+// the nested checkpoint rides only when present.
+func TestPosterPost_StatusResumeCheckpointSerialized(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		resumable       bool
+		checkpoint      *agent.ResumeCheckpoint
+		wantResume      bool
+		wantResumeField bool
+		wantCkpt        string
+	}{
+		{name: "omitted when absent"},
+		{name: "resumable without checkpoint", resumable: true, wantResume: true, wantResumeField: true},
+		{name: "resumable with checkpoint", resumable: true, checkpoint: &agent.ResumeCheckpoint{Branch: "wip/sess-2", CommitSHA: "feedfacefeedfacefeedfacefeedfacefeedface"}, wantResume: true, wantResumeField: true, wantCkpt: `{"branch":"wip/sess-2","commitSha":"feedfacefeedfacefeedfacefeedfacefeedface"}`},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var mu sync.Mutex
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					mu.Lock()
+					statusBody = body
+					mu.Unlock()
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+
+			r := goodResult()
+			r.Resumable = tc.resumable
+			r.ResumeCheckpoint = tc.checkpoint
+			if err := p.Post(context.Background(), "sess-resume", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			mu.Lock()
+			raw := statusBody
+			mu.Unlock()
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("status body not JSON: %v", err)
+			}
+			if !tc.wantResumeField {
+				if _, ok := body["resumable"]; ok {
+					t.Fatalf("resumable present in %s", raw)
+				}
+			} else {
+				var got bool
+				if err := json.Unmarshal(body["resumable"], &got); err != nil || got != tc.wantResume {
+					t.Fatalf("resumable = %s, want %v (err=%v)", body["resumable"], tc.wantResume, err)
+				}
+			}
+			if tc.wantCkpt == "" {
+				if _, ok := body["resumeCheckpoint"]; ok {
+					t.Fatalf("resumeCheckpoint present in %s", raw)
+				}
+			} else if got := string(body["resumeCheckpoint"]); got != tc.wantCkpt {
+				t.Fatalf("resumeCheckpoint = %s, want %s", got, tc.wantCkpt)
 			}
 		})
 	}

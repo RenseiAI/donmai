@@ -183,6 +183,8 @@ func TestResult_RoundTrip(t *testing.T) {
 		CommitSHA:         "abc123",
 		Summary:           "did the thing",
 		WorkResult:        "passed",
+		Resumable:         true,
+		ResumeCheckpoint:  &ResumeCheckpoint{Branch: "wip/sess-123", CommitSHA: "def456"},
 		Cost: &CostData{
 			InputTokens:  100,
 			OutputTokens: 50,
@@ -219,6 +221,8 @@ func TestResult_RoundTrip(t *testing.T) {
 		`"pullRequestUrl":"https://github.com/x/y/pull/1"`,
 		`"commitSha":"abc123"`,
 		`"workResult":"passed"`,
+		`"resumable":true`,
+		`"resumeCheckpoint":{"branch":"wip/sess-123","commitSha":"def456"}`,
 		`"backstopReport"`,
 		`"qualityReport"`,
 		`"unfilledFields":["work_result"]`,

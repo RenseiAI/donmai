@@ -310,6 +310,15 @@ type statusRequest struct {
 	// omitted when the session stayed within its budget.
 	BudgetBreach *agent.BudgetBreach `json:"budgetBreach,omitempty"`
 
+	// Resumable reports whether the runner preserved a retryable failure on a
+	// dedicated resume target the platform can continue from. Additive;
+	// omitted when false.
+	Resumable bool `json:"resumable,omitempty"`
+
+	// ResumeCheckpoint identifies the branch + head commit the platform can
+	// resume from after a retryable failure. Additive; omitted when nil.
+	ResumeCheckpoint *agent.ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
+
 	// UpstreamError carries the model endpoint's structured refusal or
 	// throttle (HTTP status, provider code, truncated provider message,
 	// reset time) on a session that failed because the endpoint refused
@@ -537,8 +546,8 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		BudgetBreach: r.BudgetBreach, UpstreamError: agent.CanonicalUpstreamError(r.Upstream),
-		ToolCalls: r.ToolCalls,
+		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
+		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd
