@@ -37,6 +37,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+
+	"github.com/RenseiAI/donmai/installer/launchd"
 )
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -125,6 +127,10 @@ type InstallOptions struct {
 	// ConfigPath is the path to the daemon config file. When non-empty, it
 	// is exported as DONMAI_DAEMON_CONFIG via Environment= in the unit.
 	ConfigPath string
+
+	// ProcessPriority is accepted for API parity with the macOS installer and
+	// ignored on systemd.
+	ProcessPriority launchd.ProcessPriority
 
 	// SkipSystemctl skips running systemctl daemon-reload / enable --now after
 	// writing the unit file. Useful for tests and CI environments without

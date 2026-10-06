@@ -85,14 +85,20 @@ const ExitTimeOutSeconds = 630
 // must re-run `host install` before upgrading past that release.
 const DaemonSubcommand = "host run"
 
-// PlistPath returns the absolute path to the LaunchAgent plist:
+// PlistPath returns the absolute path to the OSS LaunchAgent plist:
 // ~/Library/LaunchAgents/dev.donmai.daemon.plist.
 func PlistPath() (string, error) {
+	return PlistPathForLabel(LaunchdLabel)
+}
+
+// PlistPathForLabel returns the absolute path to the LaunchAgent plist for the
+// requested launchd label.
+func PlistPathForLabel(label string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("launchd: resolve home dir: %w", err)
 	}
-	return filepath.Join(home, "Library", "LaunchAgents", LaunchdLabel+".plist"), nil
+	return filepath.Join(home, "Library", "LaunchAgents", label+".plist"), nil
 }
 
 // LogDir returns the daemon log directory: ~/Library/Logs/<brand>, where
@@ -132,6 +138,10 @@ type InstallOptions struct {
 	// `daemon run` (typically the running executable). Defaults to
 	// os.Executable() when empty.
 	HostBinPath string
+
+	// ProcessPriority controls how launchd should start the daemon process.
+	// Empty reads as default.
+	ProcessPriority ProcessPriority
 
 	// PlistPath overrides the output plist path (useful for tests).
 	PlistPath string
@@ -225,8 +235,9 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 // ── Plist generation ─────────────────────────────────────────────────────────
 
 // GeneratePlist returns a launchd plist XML string for the daemon
-// LaunchAgent. ProgramArguments registers `<hostBinPath> daemon run` —
-// the locked decision (no separate rensei-daemon binary).
+// LaunchAgent. ProgramArguments registers the host binary's `host run`
+// subcommand by default, or wraps it in taskpolicy when a non-default
+// process-priority option is selected.
 //
 // Key behaviours encoded in the plist:
 //
@@ -237,8 +248,18 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 //   - StandardOutPath / Err  — routes stdio to ~/Library/Logs/<brand>/.
 //   - EnvironmentVariables   — sets HOME and PATH.
 func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
+	return GeneratePlistWithOptions(hostBinPath, logPath, errorLogPath, InstallOptions{})
+}
+
+// GeneratePlistWithOptions renders the launchd plist for the selected
+// process-priority mode.
+func GeneratePlistWithOptions(hostBinPath, logPath, errorLogPath string, opts InstallOptions) (string, error) {
 	if hostBinPath == "" {
 		return "", fmt.Errorf("launchd: GeneratePlist: hostBinPath is required")
+	}
+	priority := NormalizeProcessPriority(opts.ProcessPriority)
+	if err := ValidateProcessPriority(priority); err != nil {
+		return "", err
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -262,15 +283,13 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 		"/sbin",
 	}, ":")
 
-	// Split daemon run subcommand into separate ProgramArguments entries
-	// (launchd requires each argument as its own <string>).
-	subArgs := strings.Fields(DaemonSubcommand)
+	args, err := ProgramArguments(hostBinPath, priority)
+	if err != nil {
+		return "", err
+	}
 
 	var argsXML strings.Builder
-	argsXML.WriteString("    <string>")
-	argsXML.WriteString(escapeXML(hostBinPath))
-	argsXML.WriteString("</string>\n")
-	for _, a := range subArgs {
+	for _, a := range args {
 		argsXML.WriteString("    <string>")
 		argsXML.WriteString(escapeXML(a))
 		argsXML.WriteString("</string>\n")
@@ -427,7 +446,7 @@ func Install(opts InstallOptions) (InstallResult, error) {
 		return InstallResult{}, fmt.Errorf("launchd: mkdir plist dir: %w", err)
 	}
 
-	plistContent, err := GeneratePlist(hostBin, logPath, errorLogPath)
+	plistContent, err := GeneratePlistWithOptions(hostBin, logPath, errorLogPath, opts)
 	if err != nil {
 		return InstallResult{}, err
 	}

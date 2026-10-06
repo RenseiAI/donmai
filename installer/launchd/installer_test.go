@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/RenseiAI/donmai/daemon"
 )
 
 // fakeRunner records calls and returns canned responses.
@@ -95,6 +93,80 @@ func TestGeneratePlist_EncodesKeyBehaviours(t *testing.T) {
 	}
 }
 
+func TestGeneratePlist_GoldenVariants(t *testing.T) {
+	t.Setenv("HOME", "/Users/tester")
+	cases := []struct {
+		name     string
+		priority ProcessPriority
+		golden   string
+	}{
+		{name: "default", priority: ProcessPriorityDefault, golden: "testdata/default.plist.golden"},
+		{name: "utility", priority: ProcessPriorityUtility, golden: "testdata/utility.plist.golden"},
+		{name: "background", priority: ProcessPriorityBackground, golden: "testdata/background.plist.golden"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := GeneratePlistWithOptions("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log", InstallOptions{ProcessPriority: tc.priority})
+			if err != nil {
+				t.Fatalf("GeneratePlistWithOptions: %v", err)
+			}
+			wantBytes, err := os.ReadFile(tc.golden)
+			if err != nil {
+				t.Fatalf("read golden %s: %v", tc.golden, err)
+			}
+			if got != string(wantBytes) {
+				t.Errorf("plist mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, string(wantBytes))
+			}
+		})
+	}
+}
+
+func TestDetectProcessPriorityFromPlist(t *testing.T) {
+	t.Setenv("HOME", "/Users/tester")
+	for _, tc := range []struct {
+		name     string
+		priority ProcessPriority
+		want     ProcessPriority
+	}{
+		{name: "default", priority: ProcessPriorityDefault, want: ProcessPriorityDefault},
+		{name: "utility", priority: ProcessPriorityUtility, want: ProcessPriorityUtility},
+		{name: "background", priority: ProcessPriorityBackground, want: ProcessPriorityBackground},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plist, err := GeneratePlistWithOptions("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log", InstallOptions{ProcessPriority: tc.priority})
+			if err != nil {
+				t.Fatalf("GeneratePlistWithOptions: %v", err)
+			}
+			if got := DetectProcessPriorityFromPlist(plist); got != tc.want {
+				t.Fatalf("DetectProcessPriorityFromPlist() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServiceCommand_ReflectsProcessPriority(t *testing.T) {
+	cases := []struct {
+		name     string
+		priority ProcessPriority
+		want     string
+	}{
+		{name: "default", priority: ProcessPriorityDefault, want: "/usr/local/bin/af host run"},
+		{name: "utility", priority: ProcessPriorityUtility, want: "/usr/sbin/taskpolicy -c utility /usr/local/bin/af host run"},
+		{name: "background", priority: ProcessPriorityBackground, want: "/usr/sbin/taskpolicy -b /usr/local/bin/af host run"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ServiceCommand("/usr/local/bin/af", tc.priority)
+			if err != nil {
+				t.Fatalf("ServiceCommand: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("ServiceCommand() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestGeneratePlist_KeepAliveOnlyOnFailure pins the SuccessfulExit=false
 // shape of the KeepAlive dict. The May-2026 incident saw the boolean form
 // (`<key>KeepAlive</key><true/>`) respawn the daemon within 30s of every
@@ -162,18 +234,14 @@ func TestGeneratePlist_DurabilityKeys(t *testing.T) {
 }
 
 // TestExitTimeOutCoversDrainDefault statically asserts the launchd exit
-// window is at least the daemon's config-default graceful drain (plus
-// margin), pinned against the real default rather than a mirrored literal —
-// if the drain default grows past the plist's exit window, launchd would
-// SIGKILL the job mid-drain again and this test fails first.
+// window still covers the documented 600s daemon drain default plus a 30s
+// escalation margin. This package cannot import daemon without a cycle, so the
+// contract value is pinned here directly.
 func TestExitTimeOutCoversDrainDefault(t *testing.T) {
-	drain := daemon.DefaultConfig().AutoUpdate.DrainTimeoutSeconds
-	if drain <= 0 {
-		t.Fatalf("daemon config-default DrainTimeoutSeconds = %d, want > 0", drain)
-	}
-	if ExitTimeOutSeconds < drain+30 {
-		t.Errorf("ExitTimeOutSeconds = %d, want >= config-default drain %d + 30s escalation margin",
-			ExitTimeOutSeconds, drain)
+	const documentedDrainDefaultSeconds = 600
+	if ExitTimeOutSeconds < documentedDrainDefaultSeconds+30 {
+		t.Errorf("ExitTimeOutSeconds = %d, want >= documented drain default %d + 30s escalation margin",
+			ExitTimeOutSeconds, documentedDrainDefaultSeconds)
 	}
 }
 

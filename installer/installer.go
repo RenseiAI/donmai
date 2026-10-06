@@ -13,6 +13,7 @@ package installer
 
 import (
 	"fmt"
+	"log/slog"
 	"runtime"
 
 	"github.com/RenseiAI/donmai/installer/launchd"
@@ -34,6 +35,18 @@ const (
 	ScopeSystem = systemd.ScopeSystem
 )
 
+// ProcessPriority is the public installer mode for daemon process priority.
+type ProcessPriority = launchd.ProcessPriority
+
+const (
+	// ProcessPriorityDefault preserves today's service definition.
+	ProcessPriorityDefault = launchd.ProcessPriorityDefault
+	// ProcessPriorityUtility wraps the service entrypoint in `taskpolicy -c utility`.
+	ProcessPriorityUtility = launchd.ProcessPriorityUtility
+	// ProcessPriorityBackground wraps the service entrypoint in `taskpolicy -b`.
+	ProcessPriorityBackground = launchd.ProcessPriorityBackground
+)
+
 // InstallOptions are the OS-agnostic options for Install.
 type InstallOptions struct {
 	// HostBinPath is the absolute path to the host binary (af / rensei /
@@ -50,6 +63,10 @@ type InstallOptions struct {
 	// Description overrides the systemd [Unit] Description= field. Ignored
 	// on macOS.
 	Description string
+
+	// ProcessPriority controls how the daemon service should be started.
+	// Empty reads as default.
+	ProcessPriority ProcessPriority
 
 	// SkipServiceManager skips running launchctl/systemctl after writing
 	// the unit file. Useful for tests / CI.
@@ -117,6 +134,9 @@ type DoctorReport struct {
 
 // Install dispatches to the OS-appropriate installer.
 func Install(opts InstallOptions) (InstallResult, error) {
+	if err := launchd.ValidateProcessPriority(opts.ProcessPriority); err != nil {
+		return InstallResult{}, err
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return installDarwin(opts)
@@ -132,9 +152,14 @@ func installDarwin(opts InstallOptions) (InstallResult, error) {
 		return InstallResult{}, fmt.Errorf("installer: --system scope is not supported on macOS (LaunchAgents are user-scoped)")
 	}
 	res, err := launchd.Install(launchd.InstallOptions{
-		HostBinPath:   opts.HostBinPath,
-		SkipLaunchctl: opts.SkipServiceManager,
+		HostBinPath:     opts.HostBinPath,
+		ProcessPriority: opts.ProcessPriority,
+		SkipLaunchctl:   opts.SkipServiceManager,
 	})
+	if err != nil {
+		return InstallResult{}, err
+	}
+	serviceCommand, err := launchd.ServiceCommand(res.HostBinPath, opts.ProcessPriority)
 	if err != nil {
 		return InstallResult{}, err
 	}
@@ -142,7 +167,7 @@ func installDarwin(opts InstallOptions) (InstallResult, error) {
 		OS:             "darwin",
 		HostBinPath:    res.HostBinPath,
 		ServicePath:    res.PlistPath,
-		ServiceCommand: fmt.Sprintf("%s %s", res.HostBinPath, launchd.DaemonSubcommand),
+		ServiceCommand: serviceCommand,
 		Loaded:         res.Loaded,
 	}, nil
 }
@@ -152,12 +177,16 @@ func installLinux(opts InstallOptions) (InstallResult, error) {
 	if scope == "" {
 		scope = ScopeUser
 	}
+	if priority := launchd.NormalizeProcessPriority(opts.ProcessPriority); priority != launchd.ProcessPriorityDefault {
+		slog.Warn("installer: process priority is unsupported on non-macOS installers; ignoring", "os", "linux", "processPriority", priority)
+	}
 	unitPath, err := systemd.Install(systemd.InstallOptions{
-		Scope:         scope,
-		BinPath:       opts.HostBinPath,
-		Description:   opts.Description,
-		ConfigPath:    opts.ConfigPath,
-		SkipSystemctl: opts.SkipServiceManager,
+		Scope:           scope,
+		BinPath:         opts.HostBinPath,
+		Description:     opts.Description,
+		ConfigPath:      opts.ConfigPath,
+		ProcessPriority: opts.ProcessPriority,
+		SkipSystemctl:   opts.SkipServiceManager,
 	})
 	if err != nil {
 		return InstallResult{}, err

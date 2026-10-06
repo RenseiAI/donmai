@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/installer/launchd"
 	"gopkg.in/yaml.v3"
 )
 
@@ -207,7 +209,7 @@ func TestDaemonInstallHelp(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"--bin-path", "--user", "--system"} {
+	for _, want := range []string{"--bin-path", "--process-priority", "--user", "--system"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("install --help missing flag %q; got:\n%s", want, out)
 		}
@@ -433,6 +435,53 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 // against a missing file. Defensive launchctl bootout in t.Cleanup
 // guards against future install-path changes that demote
 // --skip-service-manager.
+func TestDaemonInstallUtilityPriorityRegistersTaskpolicyWrapper(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	hostBin := tmp + "/af-fake"
+	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec
+		t.Fatalf("seed fake host binary: %v", err)
+	}
+
+	cmd := newDaemonInstallCmd("donmai")
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--bin-path", hostBin, "--process-priority", "utility", "--skip-service-manager"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "/usr/sbin/taskpolicy -c utility "+hostBin+" host run") {
+		t.Fatalf("utility install output missing taskpolicy wrapper; got:\n%s", out)
+	}
+	if runtime.GOOS == "darwin" {
+		plistPath := filepath.Join(tmp, "Library", "LaunchAgents", launchd.LaunchdLabel+".plist")
+		plist, err := os.ReadFile(plistPath)
+		if err != nil {
+			t.Fatalf("read plist: %v", err)
+		}
+		if !strings.Contains(string(plist), "<string>/usr/sbin/taskpolicy</string>") || !strings.Contains(string(plist), "<string>utility</string>") {
+			t.Fatalf("utility plist missing taskpolicy wrapper:\n%s", plist)
+		}
+	}
+	t.Cleanup(func() { _ = launchctlBootoutTestUnit() })
+}
+
+func TestDaemonInstallRejectsInvalidProcessPriority(t *testing.T) {
+	cmd := newDaemonInstallCmd("donmai")
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--process-priority", "faster"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected invalid process-priority error")
+	}
+	if !strings.Contains(err.Error(), "invalid --process-priority") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestDaemonInstallNoLegacyShellOut(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
@@ -1203,12 +1252,13 @@ func TestWriteDaemonStatusTable(t *testing.T) {
 	t.Parallel()
 
 	r := fixtureStatusResp()
+	r.ProcessPriority = afclient.DaemonProcessPriorityStatus{Supported: true, Mode: "utility", QoSClass: "utility", IOPolicy: "throttled", ProcessPriority: 20}
 	var buf bytes.Buffer
 	if err := writeDaemonStatusTable(&buf, r); err != nil {
 		t.Fatalf("writeDaemonStatusTable: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed"} {
+	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed", "Priority:", "utility", "throttled"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q; got:\n%s", want, out)
 		}

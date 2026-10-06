@@ -147,6 +147,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory, cfg Config) *cobra.Com
 func newDaemonInstallCmd(bin string) *cobra.Command {
 	var (
 		binPath            string // --bin-path overrides the host binary path resolved via os.Executable()
+		processPriority    string // --process-priority controls launch-time QoS/IO policy for the daemon service.
 		scopeUser          bool   // Linux systemd: --user  (user-scoped unit, default)
 		scopeSystem        bool   // Linux systemd: --system (system-scoped unit, requires root)
 		skipServiceManager bool   // hidden: --skip-service-manager (test/internal hermetic install)
@@ -173,9 +174,14 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 			case scopeSystem:
 				scope = installer.ScopeSystem
 			}
+			priority, err := parseProcessPriority(processPriority)
+			if err != nil {
+				return err
+			}
 
 			res, err := installer.Install(installer.InstallOptions{
 				HostBinPath:        binPath,
+				ProcessPriority:    priority,
 				Scope:              scope,
 				SkipServiceManager: skipServiceManager,
 			})
@@ -229,6 +235,7 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&binPath, "bin-path", "", "Path to the host binary (default: current executable)")
+	cmd.Flags().StringVar(&processPriority, "process-priority", string(installer.ProcessPriorityDefault), "Daemon service process priority: default, utility, or background")
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Install as user-scoped systemd unit (Linux)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Install as system-scoped systemd unit, requires sudo (Linux)")
 	cmd.Flags().BoolVar(&skipServiceManager, "skip-service-manager", false,
@@ -408,8 +415,11 @@ func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error
 		{"Uptime:", uptime},
 		{"Sessions:", fmt.Sprintf("%d / %d", r.ActiveSessions, r.MaxSessions)},
 		{"Projects:", formatStatusProjectIDs(r)},
-		{"Timestamp:", r.Timestamp},
 	}
+	if value := formatProcessPriorityStatus(r.ProcessPriority); value != "" {
+		rows = append(rows, struct{ label, value string }{"Priority:", value})
+	}
+	rows = append(rows, struct{ label, value string }{"Timestamp:", r.Timestamp})
 	for _, row := range rows {
 		if _, err := fmt.Fprintf(tw, "  %s\t%s\n", row.label, row.value); err != nil {
 			return fmt.Errorf("write row: %w", err)
@@ -427,6 +437,51 @@ func formatStatusProjectIDs(r *afclient.DaemonStatusResponse) string {
 		value += fmt.Sprintf(" (desired: %s)", strings.Join(r.EnabledProjectIDs, ", "))
 	}
 	return value
+}
+
+func formatProcessPriorityStatus(status afclient.DaemonProcessPriorityStatus) string {
+	if !status.Supported {
+		if status.Warning == "" {
+			return "unsupported"
+		}
+		return "unsupported — " + status.Warning
+	}
+	if strings.TrimSpace(status.Mode) == "" {
+		return ""
+	}
+	value := status.Mode
+	if status.QoSClass != "" || status.IOPolicy != "" {
+		value += fmt.Sprintf(" (QoS: %s, I/O: %s", blankAs(status.QoSClass, "unknown"), blankAs(status.IOPolicy, "unknown"))
+		if status.ProcessPriority != 0 {
+			value += fmt.Sprintf(", ps PRI: %d", status.ProcessPriority)
+		}
+		value += ")"
+	}
+	if status.Warning != "" {
+		value += " — " + status.Warning
+	}
+	return value
+}
+
+func blankAs(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func parseProcessPriority(raw string) (installer.ProcessPriority, error) {
+	priority := installer.ProcessPriority(strings.ToLower(strings.TrimSpace(raw)))
+	switch priority {
+	case "", installer.ProcessPriorityDefault:
+		return installer.ProcessPriorityDefault, nil
+	case installer.ProcessPriorityUtility:
+		return installer.ProcessPriorityUtility, nil
+	case installer.ProcessPriorityBackground:
+		return installer.ProcessPriorityBackground, nil
+	default:
+		return "", fmt.Errorf("invalid --process-priority %q: want default, utility, or background", raw)
+	}
 }
 
 // ── logs ──────────────────────────────────────────────────────────────────────

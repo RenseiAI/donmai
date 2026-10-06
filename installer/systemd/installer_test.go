@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/installer/launchd"
 )
 
 // fakeRunner records calls and returns canned responses.
@@ -129,6 +131,21 @@ func TestGenerateUnitFile_CustomDescription(t *testing.T) {
 	}
 	if !strings.Contains(out, "Description=Test description") {
 		t.Errorf("expected custom description in unit file")
+	}
+}
+
+func TestGenerateUnitFile_IgnoresProcessPriority(t *testing.T) {
+	out, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{
+		ProcessPriority: launchd.ProcessPriorityBackground,
+	})
+	if err != nil {
+		t.Fatalf("GenerateUnitFile: %v", err)
+	}
+	if strings.Contains(out, "taskpolicy") {
+		t.Fatalf("systemd unit must ignore macOS process-priority wrappers, got:\n%s", out)
+	}
+	if !strings.Contains(out, "ExecStart=/usr/local/bin/af host run") {
+		t.Fatalf("ExecStart changed under ignored process priority, got:\n%s", out)
 	}
 }
 
