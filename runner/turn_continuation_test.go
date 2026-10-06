@@ -1129,6 +1129,35 @@ func TestRun_ReworkWithoutANewCommitIsContinuedThenNotDelivered(t *testing.T) {
 	}
 }
 
+func TestRun_ReworkMergeOnlyHeadIsContinuedAsNoNewCommit(t *testing.T) {
+	ghCalls := sentinelGh(t)
+	note := verdictScriptTurn{
+		text: "Read the review on " + followUpPR + "; I will fix the comments next.",
+		during: func(t *testing.T, cwd string) {
+			advanceMainAndMerge(t, cwd, "refs/heads/"+reworkBranch, "refs/pull/7/head")
+		},
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      githubPullRequestDraft,
+		turns:      append(slices.Repeat([]verdictScriptTurn{note}, 4), verdictScriptTurn{text: "never reached"}),
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
+		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsUnproductive)
+	}
+	if !strings.HasSuffix(res.Error, "the pull request does not deliver the work: no new commit") {
+		t.Fatalf("Error = %q; want it to end with the merge-only no-new-commit reason", res.Error)
+	}
+	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
+	wantContinuations(t, res, DefaultTurnContinuationLimit, 0, true)
+	if _, err := os.Stat(ghCalls); !os.IsNotExist(err) {
+		t.Errorf("gh was called (%s): the merge-only delivery check must not need it", readFile(t, ghCalls))
+	}
+}
+
 // TestRun_UndeliveredContinuationsHaveTheirOwnLimit pins the separate bound
 // on draft and no-new-commit continuations: a session whose turns keep
 // making tool calls — so the progress bound never fires — still ends not

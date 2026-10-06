@@ -1717,15 +1717,32 @@ tailRecovery:
 					continuedURL = continuePullRequestURL(gateCtx, qw, repositoryDeclaration, wpath)
 				}
 				draft, draftErr := lookup(gateCtx, wpath, continuedURL)
+				inspection, inspectErr := inspectContinueRange(gateCtx, wpath, startHead, localHead)
 				switch {
+				case inspectErr != nil:
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d delivery check failed: %v", qw.ContinuePullRequest.Number, inspectErr)
+				case len(inspection.scratchPaths) > 0:
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d commits scratch paths since dispatch: %s", qw.ContinuePullRequest.Number, strings.Join(inspection.scratchPaths, ", "))
 				case draftErr == nil && draft:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
-				case !continueDelivered(localHead, remoteHead, startHead):
+				case localHead == "" || startHead == "" || strings.EqualFold(localHead, startHead):
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
+				case remoteHead == "" || !strings.EqualFold(remoteHead, localHead):
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
+				case !inspection.delivers():
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
 				}
 			}()
 		}

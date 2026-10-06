@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -123,25 +125,101 @@ func checkoutContinuePullRequest(ctx context.Context, worktreePath string, cpr *
 	return nil
 }
 
-// continueDelivered reports whether a continue-mode run delivered work
-// onto the continued pull request: the session's checkout moved past the
-// dispatched head commit. A run that changed nothing — local HEAD still
-// the dispatched head, or a local HEAD the remote head does not carry —
-// is not delivered, mirroring the verifier's no-new-commit rule.
-func continueDelivered(localHead, remoteHead, startHead string) bool {
-	localHead = strings.TrimSpace(localHead)
-	remoteHead = strings.TrimSpace(remoteHead)
-	startHead = strings.TrimSpace(startHead)
-	if localHead == "" || startHead == "" {
+type continueRangeInspection struct {
+	commitCount   int
+	hasCodeChange bool
+	scratchPaths  []string
+}
+
+func (i continueRangeInspection) delivers() bool {
+	return i.hasCodeChange && len(i.scratchPaths) == 0
+}
+
+// inspectContinueRange classifies the commits in from..to for the continued
+// -pull-request delivery gate. Delivery requires at least one non-merge commit
+// in the range that changes a path outside the runner scratch set; any commit
+// in the range touching a scratch path is reported separately so the caller can
+// fail without rewriting history.
+func inspectContinueRange(ctx context.Context, worktreePath, from, to string) (continueRangeInspection, error) {
+	from = strings.TrimSpace(from)
+	to = strings.TrimSpace(to)
+	if from == "" || to == "" || strings.EqualFold(from, to) {
+		return continueRangeInspection{}, nil
+	}
+	rng := from + ".." + to
+	commits, err := continueRangeCommits(ctx, worktreePath, rng)
+	if err != nil {
+		return continueRangeInspection{}, err
+	}
+	if len(commits) == 0 {
+		return continueRangeInspection{}, nil
+	}
+	nonMerges, err := continueRangeCommits(ctx, worktreePath, "--no-merges", rng)
+	if err != nil {
+		return continueRangeInspection{}, err
+	}
+	nonMergeSet := make(map[string]struct{}, len(nonMerges))
+	for _, commit := range nonMerges {
+		nonMergeSet[commit] = struct{}{}
+	}
+	inspection := continueRangeInspection{commitCount: len(commits)}
+	scratchSet := map[string]struct{}{}
+	for _, commit := range commits {
+		paths, pathErr := continueCommitPaths(ctx, worktreePath, commit)
+		if pathErr != nil {
+			return continueRangeInspection{}, pathErr
+		}
+		for _, path := range paths {
+			if isContinueScratchPath(path) {
+				scratchSet[path] = struct{}{}
+				continue
+			}
+			if _, ok := nonMergeSet[commit]; ok {
+				inspection.hasCodeChange = true
+			}
+		}
+	}
+	if len(scratchSet) > 0 {
+		inspection.scratchPaths = make([]string, 0, len(scratchSet))
+		for path := range scratchSet {
+			inspection.scratchPaths = append(inspection.scratchPaths, path)
+		}
+		sort.Strings(inspection.scratchPaths)
+	}
+	return inspection, nil
+}
+
+func continueRangeCommits(ctx context.Context, worktreePath string, args ...string) ([]string, error) {
+	out, err := gitStdout(ctx, worktreePath, nil, append([]string{"rev-list", "--reverse", "--first-parent"}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("runner: list continued pull request commits: %w", err)
+	}
+	return filterEmpty(strings.Split(strings.TrimSpace(out), "\n")), nil
+}
+
+func continueCommitPaths(ctx context.Context, worktreePath, commit string) ([]string, error) {
+	out, err := gitStdout(ctx, worktreePath, nil, "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", commit)
+	if err != nil {
+		return nil, fmt.Errorf("runner: list continued pull request paths for %s: %w", commit, err)
+	}
+	seen := map[string]struct{}{}
+	paths := make([]string, 0)
+	for _, path := range filterEmpty(strings.Split(strings.TrimSpace(out), "\n")) {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func isContinueScratchPath(path string) bool {
+	parts := strings.Split(strings.TrimSpace(path), "/")
+	if len(parts) <= 1 {
 		return false
 	}
-	if strings.EqualFold(localHead, startHead) {
-		return false
-	}
-	if remoteHead == "" {
-		return false
-	}
-	return strings.EqualFold(remoteHead, localHead)
+	return harnessstate.IsStateDir(parts[0])
 }
 
 // continueDiverged reports whether a backstop report carries the typed

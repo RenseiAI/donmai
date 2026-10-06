@@ -394,10 +394,11 @@ const (
 // not deliver the session's work), undeliveredDraft when it is a draft, ""
 // when it delivers or when there is no accepted pull request.
 //
-// moved reports that the pull request's head moved to a commit of the
-// session's own since the previous re-read: the turn pushed to it. A draft
-// or rework that keeps gaining the session's commits is making progress, so
-// the caller does not count its continuations against the undelivered bound
+// moved reports that the pull request gained a deliverable commit of the
+// session's own since the previous re-read: a non-merge commit outside the
+// scratch set. A draft or rework that keeps gaining only merges or scratch
+// commits is not making delivery progress, so the caller keeps counting its
+// continuations against the undelivered bound
 // (turnFollowUps.undeliveredSent).
 //
 // A read that fails is returned as err and does not count against the pull
@@ -408,9 +409,24 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		return "", false, nil
 	}
 	var errs []error
+	readProgress := func(head string, own bool) {
+		previous := v.lastHead
+		if head != "" {
+			v.lastHead = head
+		}
+		if !own || previous == "" || head == "" || head == previous {
+			return
+		}
+		inspection, inspectErr := inspectContinueRange(ctx, v.worktreePath, previous, head)
+		if inspectErr != nil {
+			errs = append(errs, fmt.Errorf("inspect continued pull request progress: %w", inspectErr))
+			return
+		}
+		moved = inspection.delivers()
+	}
 	if v.startHead != "" {
 		head, own, readErr := v.readHead(ctx)
-		moved = v.noteHead(head, own)
+		readProgress(head, own)
 		switch {
 		case readErr != nil && head == "":
 			errs = append(errs, readErr)
@@ -423,6 +439,13 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 			errs = append(errs, readErr)
 		case !own:
 			return undeliveredNoNewCommit, moved, nil
+		default:
+			inspection, inspectErr := inspectContinueRange(ctx, v.worktreePath, v.startHead, head)
+			if inspectErr != nil {
+				errs = append(errs, fmt.Errorf("inspect continued pull request delivery: %w", inspectErr))
+			} else if !inspection.delivers() {
+				return undeliveredNoNewCommit, moved, nil
+			}
 		}
 	}
 	if v.draftLookup != nil {
@@ -433,9 +456,9 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		case draft:
 			if v.startHead == "" {
 				// A draft the session opened: read its head as well, so
-				// a turn that pushed to it counts as progress.
+				// only a deliverable push to it counts as progress.
 				head, own, readErr := v.readHead(ctx)
-				moved = v.noteHead(head, own)
+				readProgress(head, own)
 				if readErr != nil {
 					errs = append(errs, readErr)
 				}
@@ -484,18 +507,6 @@ func (v *sessionPullRequestVerifier) readHead(ctx context.Context) (head string,
 		return head, false, fmt.Errorf("read the session commit: %w", headErr)
 	}
 	return head, local == head, nil
-}
-
-// noteHead records the pull request head a re-read found and reports
-// whether it moved to a commit of the session's own since the previous one.
-// The first head seen (for a rework, the head at run start) is the baseline.
-func (v *sessionPullRequestVerifier) noteHead(head string, own bool) (moved bool) {
-	if head == "" {
-		return false
-	}
-	moved = own && v.lastHead != "" && head != v.lastHead
-	v.lastHead = head
-	return moved
 }
 
 // sessionHead reads the checkout's local HEAD commit: the session's own

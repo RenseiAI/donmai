@@ -304,6 +304,135 @@ func TestContinuePullRequestURL(t *testing.T) {
 	}
 }
 
+func continueFixtureBranch(t *testing.T, repo, branch string) string {
+	t.Helper()
+	gitRun(t, repo, "checkout", "-q", "-b", branch, "origin/main")
+	return gitRun(t, repo, "rev-parse", "HEAD")
+}
+
+func commitFixtureFiles(t *testing.T, repo string, files map[string]string, message string) string {
+	t.Helper()
+	for path, body := range files {
+		writeFile(t, repo, path, body)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", message)
+	return gitRun(t, repo, "rev-parse", "HEAD")
+}
+
+func advanceMainAndMerge(t *testing.T, cwd string, pushRefs ...string) string {
+	t.Helper()
+	remote := strings.TrimSpace(gitRun(t, cwd, "remote", "get-url", "origin"))
+	other := t.TempDir()
+	//nolint:gosec // G204: test fixture, paths come from t.TempDir.
+	if out, err := exec.Command("git", "clone", "-q", remote, other).CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	gitRun(t, other, "config", "user.email", "test@example.com")
+	gitRun(t, other, "config", "user.name", "test")
+	gitRun(t, other, "config", "commit.gpgsign", "false")
+	writeFile(t, other, filepath.Join("upstream", filepath.Base(other)+".txt"), "main moved\n")
+	gitRun(t, other, "add", "-A")
+	gitRun(t, other, "commit", "-q", "-m", "advance main")
+	gitRun(t, other, "push", "-q", "origin", "main")
+
+	gitRun(t, cwd, "fetch", "-q", "origin", "main")
+	gitRun(t, cwd, "merge", "--no-ff", "-m", "merge origin/main", "origin/main")
+	if len(pushRefs) > 0 {
+		args := []string{"push", "-q", "origin"}
+		for _, ref := range pushRefs {
+			args = append(args, "HEAD:"+ref)
+		}
+		gitRun(t, cwd, args...)
+	}
+	return gitRun(t, cwd, "rev-parse", "HEAD")
+}
+
+func TestInspectContinueRange(t *testing.T) {
+	const branch = "continued/pr-12"
+	cases := []struct {
+		name             string
+		arrange          func(t *testing.T) (repo, startHead, newHead string)
+		wantCommitCount  int
+		wantDelivers     bool
+		wantScratchPaths []string
+	}{
+		{
+			name: "merge only head",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+			wantCommitCount: 1,
+		},
+		{
+			name: "scratch only commit",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				newHead = commitFixtureFiles(t, repo, map[string]string{".scratch/comments.json": "{}\n"}, "scratch only")
+				return repo, startHead, newHead
+			},
+			wantCommitCount:  1,
+			wantScratchPaths: []string{".scratch/comments.json"},
+		},
+		{
+			name: "code commit plus merge",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				commitFixtureFiles(t, repo, map[string]string{"fix.go": "package fix\n"}, "code change")
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+			wantCommitCount: 2,
+			wantDelivers:    true,
+		},
+		{
+			name: "code commit with scratch",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				newHead = commitFixtureFiles(t, repo, map[string]string{
+					"fix.go":                "package fix\n",
+					".scratch/gate-full.md": "notes\n",
+				}, "code and scratch")
+				return repo, startHead, newHead
+			},
+			wantCommitCount:  1,
+			wantScratchPaths: []string{".scratch/gate-full.md"},
+		},
+		{
+			name: "no new commits",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				return repo, startHead, startHead
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, startHead, newHead := tc.arrange(t)
+			got, err := inspectContinueRange(context.Background(), repo, startHead, newHead)
+			if err != nil {
+				t.Fatalf("inspectContinueRange: %v", err)
+			}
+			if got.commitCount != tc.wantCommitCount {
+				t.Fatalf("commitCount = %d, want %d", got.commitCount, tc.wantCommitCount)
+			}
+			if got.delivers() != tc.wantDelivers {
+				t.Fatalf("delivers = %v, want %v (%+v)", got.delivers(), tc.wantDelivers, got)
+			}
+			if strings.Join(got.scratchPaths, ",") != strings.Join(tc.wantScratchPaths, ",") {
+				t.Fatalf("scratchPaths = %v, want %v", got.scratchPaths, tc.wantScratchPaths)
+			}
+		})
+	}
+}
+
 // TestRunBackstop_ContinueModePushesHeadWithoutNewPR proves the push
 // target and the no-new-PR rule: the backstop pushes HEAD to the
 // continued branch and reports the envelope URL without invoking gh.
@@ -500,6 +629,88 @@ func TestRun_ContinueModeNoNewCommitIsNotDelivered(t *testing.T) {
 	}
 	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
 		t.Fatalf("PullRequestURL = %q; want the continued pull request under test", res.PullRequestURL)
+	}
+}
+
+func TestRun_ContinueModeMergeOnlyHeadHasNoCodeChange(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during: func(t *testing.T, cwd string) {
+				advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12")
+			},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	}
+	want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"
+	if res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+		t.Fatalf("continued head %q does not carry the merge-only head", remoteHead)
+	}
+}
+
+func TestRun_ContinueModeScratchCommitsFailByPath(t *testing.T) {
+	cases := []struct {
+		name      string
+		files     map[string]string
+		wantPaths string
+	}{
+		{
+			name:      "scratch only commit",
+			files:     map[string]string{".scratch/comments.json": "{}\n"},
+			wantPaths: ".scratch/comments.json",
+		},
+		{
+			name: "code and scratch commit",
+			files: map[string]string{
+				"fix.go":                "package fix\n",
+				".scratch/gate-full.md": "notes\n",
+			},
+			wantPaths: ".scratch/gate-full.md",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				skipSteering:   true,
+				repository:     "https://github.com/example/repo",
+				continueNumber: 12,
+				turns: []verdictScriptTurn{{
+					manifest: passedManifest,
+					text:     "WORK_RESULT:passed",
+					during: func(t *testing.T, cwd string) {
+						for path, body := range tc.files {
+							writeFile(t, cwd, path, body)
+						}
+						gitRun(t, cwd, "add", "-f", "-A")
+						gitRun(t, cwd, "commit", "-q", "-m", "scratch commit")
+						gitRun(t, cwd, "push", "-q", "origin", "HEAD:refs/heads/continued/pr-12")
+					},
+				}},
+			})
+			if res.Status != "failed" || res.FailureMode != FailureBackstop {
+				t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+			}
+			want := "continued pull request #12 commits scratch paths since dispatch: .agent/state.json, .agent/turn-result.json, " + tc.wantPaths
+			if res.Error != want {
+				t.Fatalf("Error = %q, want %q", res.Error, want)
+			}
+			remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+			if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+				t.Fatalf("continued head %q does not carry the committed scratch path", remoteHead)
+			}
+		})
 	}
 }
 
