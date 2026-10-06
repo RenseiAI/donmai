@@ -621,12 +621,15 @@ func confinePiArgv(plan *confinement.Plan, argv []string) ([]string, error) {
 	return plan.Command(argv)
 }
 
-// confinePiEnv appends the plan's environment bindings (TMPDIR/TMP/TEMP and
-// any cache bindings) after the already-composed child environment, so they
-// win under last-entry-wins semantics. A nil plan adds nothing.
+// confinePiEnv applies the plan's environment bindings (TMPDIR/TMP/TEMP and
+// any cache bindings) to the already-composed child environment. The plan's
+// session-tmp binding wins exactly once: a prior TMPDIR/TMP/TEMP entry —
+// for example the executor-owned session scratch bound before the worker
+// started — is replaced, never shadowed by a duplicate. A nil plan adds
+// nothing.
 func confinePiEnv(childEnv []string, plan *confinement.Plan) []string {
 	if plan == nil {
 		return childEnv
 	}
-	return append(childEnv, plan.Environment()...)
+	return plan.ApplyToEnv(childEnv)
 }

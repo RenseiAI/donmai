@@ -1385,6 +1385,11 @@ type adoptedShim struct {
 	// the lifecycle payload delivered to ordinary WorkerSpawner listeners; an
 	// adopted shim deliberately has no fabricated spec.
 	spec SessionSpec
+	// sessionTmp is the executor-owned scratch-directory claim prepared for
+	// a shim this daemon launched (zero when the session carries none). A
+	// shim adopted after a restart has none: the creating generation is gone,
+	// and its directory is covered by the startup sweep instead.
+	sessionTmp sessionTmpClaim
 	// launched distinguishes "this daemon created it" from "this daemon adopted
 	// it after a restart" — a diagnostic distinction only (§D11: ownership mode
 	// is a diagnostic field, never a second lifecycle authority).

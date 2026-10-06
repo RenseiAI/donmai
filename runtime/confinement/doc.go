@@ -38,6 +38,11 @@
 //	env := plan.Environment()        // TMPDIR/TMP/TEMP and cache bindings
 //	evidence := plan.Record().Digest()
 //
+// Prefer plan.ApplyToEnv(childEnv) over appending Environment: it replaces
+// any prior TMPDIR/TMP/TEMP entry (for example an executor-owned session
+// scratch bound before the worker started) instead of shadowing it with a
+// duplicate, so the plan's binding wins exactly once.
+//
 // Prepare refuses, never degrades: with no backend (backend_absent), from a
 // process already inside a profile (nested_sandbox), without a passing and
 // current self-test for the session mode (self_test_failed, self_test_stale),

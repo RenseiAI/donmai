@@ -2101,6 +2101,22 @@ func shimDiscoveryRecordMatchesLaunch(rec sessionshim.Record, id sessionshim.Ide
 		rec.ProcessStartedAt == started.StartedAt
 }
 
+// launchedSessionTmpClaim picks up the executor-owned scratch-directory claim
+// the spawner prepared for a session this daemon is launching under shim
+// ownership. It runs synchronously inside the spawn (the admission
+// reservation is still held), so the live claim is this launch's own. The
+// zero claim means the session carries no scratch directory.
+func (d *Daemon) launchedSessionTmpClaim(sessionID string) sessionTmpClaim {
+	if d.spawner == nil {
+		return sessionTmpClaim{}
+	}
+	claim, ok := d.spawner.sessionTmpClaimFor(sessionID)
+	if !ok {
+		return sessionTmpClaim{}
+	}
+	return claim
+}
+
 // trackLaunchedShim records a newly adopted controller and starts consuming its
 // event stream.
 func (d *Daemon) trackLaunchedShim(
@@ -2140,6 +2156,7 @@ func (d *Daemon) trackLaunchedShim(
 		shimID:          ctrl.Hello().ShimID,
 		handle:          handle,
 		spec:            spec,
+		sessionTmp:      d.launchedSessionTmpClaim(spec.SessionID),
 		launched:        true,
 		adoption:        evidence,
 		adoptionReceipt: cloneSessionShimAdoptionReceipt(receipt),
@@ -2981,6 +2998,13 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 			Spec:    entry.spec,
 			ExitErr: exitErr,
 		})
+		// The spawner keeps no process bookkeeping for shim-owned sessions,
+		// so the reaper never sees them: terminal cleanup of the
+		// executor-owned scratch directory runs here, proven against the
+		// exact generation this entry launched with. (The daemon's
+		// session-end listener also attempts a live-claim cleanup; both
+		// are idempotent.)
+		d.spawner.cleanupSessionTmpClaim(entry.spec.SessionID, entry.sessionTmp)
 	}
 
 	// Retain the exact generation through synchronous listener delivery. A
