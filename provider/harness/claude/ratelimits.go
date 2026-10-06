@@ -37,8 +37,8 @@ const (
 
 // claudeWindowMeta is the fixed metadata for one account-wide window.
 type claudeWindowMeta struct {
-	kind        agent.UsageWindowKind
-	label       string
+	kind         agent.UsageWindowKind
+	label        string
 	durationMins int
 }
 
@@ -87,10 +87,10 @@ func scopedWindowID(displayName string) string {
 func scopedWindow(displayName string, usedPercent float64, resetsAt string) agent.UsageWindow {
 	duration := 7 * 24 * 60
 	w := agent.UsageWindow{
-		ID:               scopedWindowID(displayName),
-		Kind:             agent.UsageWindowWeekly,
-		Label:            "Weekly · " + displayName,
-		UsedPercent:      agent.ClampPercent(usedPercent),
+		ID:                 scopedWindowID(displayName),
+		Kind:               agent.UsageWindowWeekly,
+		Label:              "Weekly · " + displayName,
+		UsedPercent:        agent.ClampPercent(usedPercent),
 		WindowDurationMins: &duration,
 	}
 	if resetsAt != "" {
@@ -104,10 +104,10 @@ func makeClaudeWindow(id string, usedPercent float64, resetsAt string) agent.Usa
 	meta := claudeWindows[id]
 	duration := meta.durationMins
 	w := agent.UsageWindow{
-		ID:               id,
-		Kind:             meta.kind,
-		Label:            meta.label,
-		UsedPercent:      agent.ClampPercent(usedPercent),
+		ID:                 id,
+		Kind:               meta.kind,
+		Label:              meta.label,
+		UsedPercent:        agent.ClampPercent(usedPercent),
 		WindowDurationMins: &duration,
 	}
 	if resetsAt != "" {

@@ -96,7 +96,7 @@ type UsageUnavailable struct {
 // UsageLimits is the subscription usage a provider knows about the
 // signed-in account.
 type UsageLimits struct {
-	CheckedAt string `json:"checkedAt"`
+	CheckedAt string        `json:"checkedAt"`
 	Windows   []UsageWindow `json:"windows"`
 	// ResetCredits rides along when the provider reports reset credits.
 	ResetCredits *ResetCredits `json:"resetCredits,omitempty"`
@@ -109,8 +109,8 @@ type UsageLimits struct {
 // names one window at a time and the read names them all. Windows merge
 // by ID onto the published snapshot; omitted windows are unchanged.
 type UsageLimitsUpdate struct {
-	CheckedAt string         `json:"checkedAt"`
-	Windows   []UsageWindow  `json:"windows"`
+	CheckedAt string        `json:"checkedAt"`
+	Windows   []UsageWindow `json:"windows"`
 }
 
 // UsageAccount is one account a quota source reports on. The account ID
@@ -126,7 +126,7 @@ type UsageAccount struct {
 	Plan string `json:"plan,omitempty"`
 	// LimitID names the allowance bucket the windows describe, when the
 	// provider reports one (for example "codex").
-	LimitID string `json:"limitId,omitempty"`
+	LimitID string      `json:"limitId,omitempty"`
 	Limits  UsageLimits `json:"limits"`
 }
 

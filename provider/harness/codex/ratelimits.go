@@ -42,20 +42,20 @@ const CodexMainLimitID = "codex"
 // the mapper classifies each by its reported duration, falling back
 // to the plan default when the snapshot omits it.
 type RateLimitWindow struct {
-	UsedPercent       float64 `json:"usedPercent"`
-	ResetsAt          *float64 `json:"resetsAt,omitempty"`
-	WindowDurationMins *int    `json:"windowDurationMins,omitempty"`
+	UsedPercent        float64  `json:"usedPercent"`
+	ResetsAt           *float64 `json:"resetsAt,omitempty"`
+	WindowDurationMins *int     `json:"windowDurationMins,omitempty"`
 }
 
 // RateLimitSnapshot is the structural view of the app-server
 // rate-limit snapshot. Both the read response and the updated
 // notification satisfy it.
 type RateLimitSnapshot struct {
-	LimitID             *string          `json:"limitId,omitempty"`
-	PlanType            *string          `json:"planType,omitempty"`
-	RateLimitReachedType *string         `json:"rateLimitReachedType,omitempty"`
-	Primary             *RateLimitWindow `json:"primary,omitempty"`
-	Secondary           *RateLimitWindow `json:"secondary,omitempty"`
+	LimitID              *string          `json:"limitId,omitempty"`
+	PlanType             *string          `json:"planType,omitempty"`
+	RateLimitReachedType *string          `json:"rateLimitReachedType,omitempty"`
+	Primary              *RateLimitWindow `json:"primary,omitempty"`
+	Secondary            *RateLimitWindow `json:"secondary,omitempty"`
 }
 
 // ResetCreditEntry is one banked reset credit on the read response.
@@ -129,10 +129,10 @@ func rateLimitsToWindows(snapshot *RateLimitSnapshot) []agent.UsageWindow {
 		}
 		kind := agent.PoolKind(duration)
 		w := agent.UsageWindow{
-			ID:               p.id,
-			Kind:             kind,
-			Label:            agent.PoolLabel(kind),
-			UsedPercent:      agent.ClampPercent(used),
+			ID:                 p.id,
+			Kind:               kind,
+			Label:              agent.PoolLabel(kind),
+			UsedPercent:        agent.ClampPercent(used),
 			WindowDurationMins: &duration,
 		}
 		if p.window.ResetsAt != nil {
