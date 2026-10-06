@@ -126,6 +126,52 @@ func ErrorLogPath() (string, error) {
 
 // ── Options ──────────────────────────────────────────────────────────────────
 
+// ProcessPriority selects the scheduling tier of the daemon service.
+//
+//   - ProcessPriorityDefault leaves the plist exactly as it has always
+//     been: no ProcessType key, ProgramArguments invoke the host binary
+//     directly. Identical bytes to builds that predate this option.
+//   - ProcessPriorityUtility wraps ProgramArguments as
+//     `/usr/sbin/taskpolicy -c utility <daemon command…>`: a QoS clamp
+//     with a throttled disk-IO tier, inherited by every child.
+//   - ProcessPriorityBackground sets launchd `ProcessType` to `Background`
+//     plus `LowPriorityIO` (see the GeneratePlist doc for why the plist
+//     keys were chosen over a `taskpolicy -b` wrapper).
+type ProcessPriority string
+
+const (
+	// ProcessPriorityDefault is today's plist: no priority keys, direct
+	// ProgramArguments. Zero value, so existing InstallOptions literals
+	// keep today's behaviour without modification.
+	ProcessPriorityDefault ProcessPriority = "default"
+	// ProcessPriorityUtility clamps the daemon (and every child it spawns)
+	// to the utility QoS tier via the taskpolicy wrapper.
+	ProcessPriorityUtility ProcessPriority = "utility"
+	// ProcessPriorityBackground classifies the daemon job as a background
+	// job via the ProcessType key plus LowPriorityIO.
+	ProcessPriorityBackground ProcessPriority = "background"
+)
+
+// validProcessPriority reports whether p names a supported tier. The empty
+// string reads as ProcessPriorityDefault so zero-value InstallOptions keep
+// today's behaviour.
+func validProcessPriority(p ProcessPriority) bool {
+	switch p {
+	case "", ProcessPriorityDefault, ProcessPriorityUtility, ProcessPriorityBackground:
+		return true
+	}
+	return false
+}
+
+// normalizeProcessPriority maps the empty string to ProcessPriorityDefault.
+// Callers must check validProcessPriority first.
+func normalizeProcessPriority(p ProcessPriority) ProcessPriority {
+	if p == "" {
+		return ProcessPriorityDefault
+	}
+	return p
+}
+
 // InstallOptions controls Install behaviour.
 type InstallOptions struct {
 	// HostBinPath is the absolute path to the host binary that exposes
@@ -141,6 +187,10 @@ type InstallOptions struct {
 
 	// ErrorLogPath overrides the stderr log path.
 	ErrorLogPath string
+
+	// ProcessPriority selects the scheduling tier of the daemon service
+	// (default | utility | background). Empty means default.
+	ProcessPriority ProcessPriority
 
 	// SkipLaunchctl skips the `launchctl bootstrap` call after writing the
 	// plist (useful for tests / CI).
@@ -236,10 +286,50 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 //   - ThrottleInterval = 30  — crash restart throttle (prevents storms).
 //   - StandardOutPath / Err  — routes stdio to ~/Library/Logs/<brand>/.
 //   - EnvironmentVariables   — sets HOME and PATH.
+//
+// priority selects the scheduling tier (see the ProcessPriority doc):
+// GeneratePlist(host, log, errLog) with an empty priority renders the
+// historical plist byte-for-byte. Callers that take operator input
+// should resolve through GeneratePlistWithPriority instead — GeneratePlist
+// keeps its three-argument shape so existing embedder call sites compile
+// unchanged.
 func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
+	return GeneratePlistWithPriority(hostBinPath, logPath, errorLogPath, ProcessPriorityDefault)
+}
+
+// taskpolicyPath is the absolute path of the QoS-clamp wrapper used for
+// the utility tier. Absolute because launchd's PATH for ProgramArguments
+// resolution is not the operator's login PATH.
+const taskpolicyPath = "/usr/sbin/taskpolicy"
+
+// GeneratePlistWithPriority renders the daemon LaunchAgent plist at the
+// requested scheduling tier.
+//
+//   - default: the historical plist, byte-identical to GeneratePlist.
+//   - utility: ProgramArguments are wrapped as
+//     `/usr/sbin/taskpolicy -c utility <daemon command…>`. taskpolicy
+//     applies the QoS clamp with a throttled disk-IO tier to the spawned
+//     program, and every child the daemon spawns inherits it.
+//   - background: launchd `ProcessType` is `Background`, plus
+//     `LowPriorityIO`. The plist keys were chosen over a `taskpolicy -b`
+//     wrapper for two reasons. First, the keys are the job's own
+//     scheduling classification: launchd throttles the job's CPU and IO
+//     bandwidth itself and applies the background tier to the whole job
+//     including children it re-parents, while `-b` only raises the
+//     spawned process's nice value (a single-process scheduling hint
+//     the kernel may override). Second, the keys are declarative and
+//     visible to `launchctl print` — an operator inspecting the job sees
+//     the tier without decoding ProgramArguments.
+//
+// An unknown priority is an error; the empty string reads as default.
+func GeneratePlistWithPriority(hostBinPath, logPath, errorLogPath string, priority ProcessPriority) (string, error) {
 	if hostBinPath == "" {
 		return "", fmt.Errorf("launchd: GeneratePlist: hostBinPath is required")
 	}
+	if !validProcessPriority(priority) {
+		return "", fmt.Errorf("launchd: GeneratePlist: unknown process priority %q (want default|utility|background)", priority)
+	}
+	priority = normalizeProcessPriority(priority)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("launchd: resolve home dir: %w", err)
@@ -266,10 +356,19 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 	// (launchd requires each argument as its own <string>).
 	subArgs := strings.Fields(DaemonSubcommand)
 
+	// The utility tier prefixes the daemon command with the QoS-clamp
+	// wrapper; default and background invoke the host binary directly.
+	program := []string{hostBinPath}
+	if priority == ProcessPriorityUtility {
+		program = []string{taskpolicyPath, "-c", "utility", hostBinPath}
+	}
+
 	var argsXML strings.Builder
-	argsXML.WriteString("    <string>")
-	argsXML.WriteString(escapeXML(hostBinPath))
-	argsXML.WriteString("</string>\n")
+	for _, p := range program {
+		argsXML.WriteString("    <string>")
+		argsXML.WriteString(escapeXML(p))
+		argsXML.WriteString("</string>\n")
+	}
 	for _, a := range subArgs {
 		argsXML.WriteString("    <string>")
 		argsXML.WriteString(escapeXML(a))
@@ -353,6 +452,25 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 </dict>
 </plist>
 `
+	// The background tier appends the job-classification keys just before
+	// the closing </dict>. They are concatenated — never interpolated
+	// into — the default template above, so the default tier renders the
+	// historical bytes exactly.
+	if priority == ProcessPriorityBackground {
+		const backgroundKeys = `  <!--
+    Scheduling tier (process-priority=background): classify the job
+    as a Background job so launchd throttles its CPU/IO bandwidth, and
+    mark its filesystem IO low-priority in the kernel.
+  -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>LowPriorityIO</key>
+  <true/>
+
+`
+		plist = strings.Replace(plist, "</dict>\n</plist>\n", backgroundKeys+"</dict>\n</plist>\n", 1)
+	}
 	return plist, nil
 }
 
@@ -374,20 +492,46 @@ func escapeXML(s string) string {
 type InstallResult struct {
 	PlistPath   string
 	HostBinPath string
-	Loaded      bool
+	// ProcessPriority is the scheduling tier the plist was written at
+	// (normalized: empty input reads back as default).
+	ProcessPriority ProcessPriority
+	Loaded          bool
 }
+
+// DetectProcessPriority reads a plist file written by Install and reports
+// the scheduling tier it encodes: utility when ProgramArguments carry the
+// taskpolicy wrapper, background when the ProcessType key says Background,
+// default otherwise (including for plists that predate the option).
+func DetectProcessPriority(plist []byte) ProcessPriority {
+	text := string(plist)
+	if strings.Contains(text, "<string>"+taskpolicyPath+"</string>") {
+		return ProcessPriorityUtility
+	}
+	if backgroundProcessTypeRe.MatchString(text) {
+		return ProcessPriorityBackground
+	}
+	return ProcessPriorityDefault
+}
+
+// backgroundProcessTypeRe matches the background job-classification stanza
+// GeneratePlistWithPriority emits: `<key>ProcessType</key>` followed by a
+// `<string>Background</string>` value.
+var backgroundProcessTypeRe = regexp.MustCompile(`<key>ProcessType</key>\s*<string>Background</string>`)
 
 // Install writes the plist and bootstraps it via launchctl.
 //
 // Steps:
 //  1. Resolve the host binary path.
 //  2. Create ~/Library/Logs/<brand>/ if missing.
-//  3. Write the plist.
+//  3. Write the plist at the requested process priority.
 //  4. Run `launchctl bootstrap gui/<uid> <plist>` unless skipped.
 //
 // Note: we use `launchctl bootstrap` (modern, supported on macOS 10.10+)
 // instead of the deprecated `launchctl load -w`.
 func Install(opts InstallOptions) (InstallResult, error) {
+	if !validProcessPriority(opts.ProcessPriority) {
+		return InstallResult{}, fmt.Errorf("launchd: install: unknown process priority %q (want default|utility|background)", opts.ProcessPriority)
+	}
 	hostBin, err := ResolveHostBinPath(opts.HostBinPath)
 	if err != nil {
 		return InstallResult{}, err
@@ -427,7 +571,7 @@ func Install(opts InstallOptions) (InstallResult, error) {
 		return InstallResult{}, fmt.Errorf("launchd: mkdir plist dir: %w", err)
 	}
 
-	plistContent, err := GeneratePlist(hostBin, logPath, errorLogPath)
+	plistContent, err := GeneratePlistWithPriority(hostBin, logPath, errorLogPath, normalizeProcessPriority(opts.ProcessPriority))
 	if err != nil {
 		return InstallResult{}, err
 	}
@@ -436,7 +580,7 @@ func Install(opts InstallOptions) (InstallResult, error) {
 		return InstallResult{}, fmt.Errorf("launchd: write plist: %w", err)
 	}
 
-	res := InstallResult{PlistPath: plistPath, HostBinPath: hostBin}
+	res := InstallResult{PlistPath: plistPath, HostBinPath: hostBin, ProcessPriority: normalizeProcessPriority(opts.ProcessPriority)}
 
 	if opts.SkipLaunchctl {
 		return res, nil
