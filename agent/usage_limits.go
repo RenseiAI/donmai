@@ -14,7 +14,6 @@ package agent
 import (
 	"math"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -313,22 +312,5 @@ func PoolLabel(kind UsageWindowKind) string {
 		return "Monthly"
 	default:
 		return "Other"
-	}
-}
-
-// normalizeUsageWindowKind maps an arbitrary kind string onto the closed
-// kind set; unknown values land on "other".
-func normalizeUsageWindowKind(kind string) UsageWindowKind {
-	switch UsageWindowKind(strings.ToLower(strings.TrimSpace(kind))) {
-	case UsageWindowSession:
-		return UsageWindowSession
-	case UsageWindowWeekly:
-		return UsageWindowWeekly
-	case UsageWindowMonthly:
-		return UsageWindowMonthly
-	case UsageWindowOther:
-		return UsageWindowOther
-	default:
-		return UsageWindowOther
 	}
 }

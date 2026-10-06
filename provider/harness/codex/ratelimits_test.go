@@ -6,6 +6,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,15 @@ import (
 )
 
 const rateLimitsTestCheckedAt = "2026-07-18T10:00:00.000Z"
+
+func readRateLimitsFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/t3code/" + name)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return raw
+}
 
 func strPtr(s string) *string { return &s }
 
@@ -74,8 +84,35 @@ func TestRateLimitsToLimits_MonthlyPlanDurationlessPrimary(t *testing.T) {
 }
 
 // The recorded studio read: a promax primary with a 10,080-minute
-// window classifies as weekly at about 1% used.
+// window classifies as weekly at about 1% used. The snapshot comes
+// from the recorded read fixture under testdata/t3code.
 func TestRateLimitsToLimits_PromaxWeeklyPrimary(t *testing.T) {
+	t.Parallel()
+	raw := readRateLimitsFixture(t, "promax_rate_limits_read.json")
+	var resp rateLimitsReadResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	got := RateLimitsToLimits(resp.RateLimits, resp.RateLimitsByLimitID, resp.ResetCredits, "2026-10-06T12:00:00.000Z")
+	if len(got.Windows) != 2 {
+		t.Fatalf("got %d windows, want 2", len(got.Windows))
+	}
+	primary := got.Windows[0]
+	if primary.ID != "primary" || primary.Kind != "weekly" {
+		t.Errorf("primary = %+v, want id primary kind weekly", primary)
+	}
+	if primary.WindowDurationMins == nil || *primary.WindowDurationMins != 10080 {
+		t.Errorf("primary duration = %v, want 10080", primary.WindowDurationMins)
+	}
+	if primary.UsedPercent != 1 {
+		t.Errorf("UsedPercent = %v, want 1", primary.UsedPercent)
+	}
+	if !strings.HasPrefix(primary.ResetsAt, "2026-10-10") {
+		t.Errorf("ResetsAt = %q, want the 2026-10-10 reset", primary.ResetsAt)
+	}
+}
+
+func TestRateLimitsToLimits_PromaxWeeklyPrimaryInline(t *testing.T) {
 	t.Parallel()
 	got := RateLimitsToLimits(&RateLimitSnapshot{
 		LimitID:   strPtr("codex"),
@@ -126,6 +163,15 @@ func TestRateLimitsToLimits_SelectsMainAllowance(t *testing.T) {
 
 func TestRateLimitsToUpdate_SparkNeverOverwrites(t *testing.T) {
 	t.Parallel()
+	// The recorded model-specific notification must not produce rows.
+	raw := readRateLimitsFixture(t, "spark_rate_limits_updated.json")
+	var params rateLimitsUpdatedParams
+	if err := json.Unmarshal(raw, &params); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	if got := RateLimitsToUpdate(params.RateLimits, rateLimitsTestCheckedAt); got != nil {
+		t.Errorf("recorded Spark notification produced %+v, want nil", got)
+	}
 	spark := &RateLimitSnapshot{
 		LimitID:   strPtr("spark"),
 		Primary:   &RateLimitWindow{UsedPercent: 0, WindowDurationMins: intPtr(300)},

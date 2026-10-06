@@ -65,16 +65,36 @@ func TestQuotaState_SparseUpdateMerges(t *testing.T) {
 	q := &quotaState{}
 	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	q.noteCodexProbe("opaque-1", "promax", agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows()), base)
+	q.noteClaudeProbe("opaque-2", agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows()), base)
+	q.noteClaudeUpdate(agent.UsageLimitsUpdate{
+		CheckedAt: agent.ISOTime(base.Add(time.Minute)),
+		Windows:   []agent.UsageWindow{{ID: "primary", Kind: agent.UsageWindowWeekly, Label: "Weekly", UsedPercent: 9}},
+	}, base.Add(time.Minute))
+	if got := q.snapshot(); len(got) != 2 {
+		t.Fatalf("snapshot = %+v, want both providers", got)
+	}
+	for _, acct := range q.snapshot() {
+		if acct.Provider == "claude" && (len(acct.Limits.Windows) != 1 || acct.Limits.Windows[0].UsedPercent != 9) {
+			t.Fatalf("claude snapshot = %+v, want the merged 9 percent", acct.Limits.Windows)
+		}
+	}
 	q.noteCodexUpdate(agent.UsageLimitsUpdate{
 		CheckedAt: agent.ISOTime(base.Add(time.Minute)),
 		Windows:   []agent.UsageWindow{{ID: "primary", Kind: agent.UsageWindowWeekly, Label: "Weekly", UsedPercent: 2}},
 	}, base.Add(time.Minute))
 	got := q.snapshot()
-	if len(got) != 1 || got[0].Limits.Windows[0].UsedPercent != 2 {
-		t.Fatalf("snapshot = %+v, want the merged 2 percent", got)
+	if len(got) != 2 {
+		t.Fatalf("snapshot = %+v, want both providers", got)
 	}
-	if got[0].Limits.Windows[0].WindowDurationMins == nil {
-		t.Error("sparse update dropped the probe's window duration")
+	for _, acct := range got {
+		if acct.Provider == "codex" {
+			if len(acct.Limits.Windows) != 1 || acct.Limits.Windows[0].UsedPercent != 2 {
+				t.Fatalf("codex snapshot = %+v, want the merged 2 percent", acct.Limits.Windows)
+			}
+			if acct.Limits.Windows[0].WindowDurationMins == nil {
+				t.Error("sparse update dropped the probe's window duration")
+			}
+		}
 	}
 	var nilDaemon *Daemon
 	if nilDaemon.quotaSnapshot() != nil {

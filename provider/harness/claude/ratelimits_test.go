@@ -5,6 +5,7 @@ package claude
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -12,22 +13,18 @@ import (
 
 const claudeTestCheckedAt = "2026-07-18T10:00:00.000Z"
 
-func truePtr() *bool { v := true; return &v }
+func readClaudeFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/t3code/" + name)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return raw
+}
 
 func TestUsageResponseToLimits_SessionWeeklyAndScoped(t *testing.T) {
 	t.Parallel()
-	raw := []byte(`{
-		"rate_limits_available": true,
-		"rate_limits": {
-			"five_hour": {"utilization": 54, "resets_at": "2026-07-18T14:39:00Z"},
-			"seven_day": {"utilization": 18.4, "resets_at": "2026-07-24T08:59:00+00:00"},
-			"seven_day_opus": {"utilization": 3, "resets_at": null},
-			"model_scoped": [
-				{"display_name": "Fable", "utilization": 73, "resets_at": "2026-07-24T08:59:00Z"},
-				{"display_name": "Ghost", "utilization": null, "resets_at": null}
-			]
-		}
-	}`)
+	raw := readClaudeFixture(t, "usage_read.json")
 	limits, names := UsageResponseToLimits(raw, claudeTestCheckedAt)
 	if names.OverageIncluded != "Fable" {
 		t.Errorf("scoped names = %+v, want Fable recorded", names)

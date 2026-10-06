@@ -1,0 +1,7 @@
+{
+  "rateLimits": {
+    "limitId": "spark",
+    "primary": {"usedPercent": 3, "resetsAt": 1791646860, "windowDurationMins": 300},
+    "secondary": {"usedPercent": 90, "resetsAt": 1791646860, "windowDurationMins": 10080}
+  }
+}
