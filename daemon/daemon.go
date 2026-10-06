@@ -826,6 +826,13 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
 	if d.sessionShimEnabled() {
+		// A first-heartbeat fence for a scope this daemon holds no authority
+		// for is an orphan: the acknowledgement edge that would clear it
+		// matches a retained receipt, so nothing left can reopen it, while the
+		// host-wide gate stays closed for every scope. Reconcile it here — at
+		// the admission seam itself — rather than trusting every path that
+		// drops a receipt to also drop its fence.
+		d.clearOrphanedSessionShimHeartbeatFence()
 		if d.sessionShimReadinessWithdrawn.Load() {
 			return true, "session-shim recovery is not ready"
 		}
@@ -1022,8 +1029,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.config = cfg
 	d.startedAt = time.Now().UTC()
 	d.mu.Unlock()
+	// A refused startup founding stands the composition down before this gate
+	// runs: the daemon no longer presents a composed attestation, so the gate
+	// is a no-op and startup continues as a host that does not do durable
+	// sessions. A host that never established readiness any other way still
+	// fails closed here.
 	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
-		return err
+		return fmt.Errorf("session shim readiness gate: %w", err)
 	}
 
 	var local *localRuntime
@@ -1129,6 +1141,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 			return nil
 		}
 		var registerErr error
+		// Re-resolve the attestation at call time: a refused startup founding
+		// stands the composition down mid-Start, and the stood-down
+		// re-registration below must present the stand-down — not the refused
+		// founder's attestation the options were built with. AuthOnly moves
+		// with it: it suppresses capacity publication only while the
+		// attestation it rides on is composed.
+		regOpts.SessionShim = d.SessionShimHostAttestation()
+		regOpts.AuthOnly = regOpts.SessionShim.enabled()
 		regResp, registerErr = Register(ctx, regOpts)
 		if registerErr != nil {
 			return fmt.Errorf("register: %w", registerErr)
@@ -1149,24 +1169,66 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// credential/host/revision receipt first, while heartbeat, spawner, poll,
 	// claim, and capacity publication do not yet exist. The zero-value legacy
 	// path retains the established adopt-before-register order.
+	//
+	// The readiness gate above runs before the founding registration, so a
+	// daemon constructed with a composed configuration always reaches this
+	// point with a composed attestation still presented: only a refused
+	// founding below stands it down. startupFoundingRefused records that
+	// stand-down so the second registration below still runs: a stood-down
+	// daemon has no worker identity yet and must register for one.
+	startupFoundingRefused := false
 	if d.sessionShimEnabled() {
 		if d.opts.SkipRegistration {
 			return errors.New("session shim: attested recovery cannot skip registration")
 		}
 		d.setState(StateRecovering)
 		if err := register(); err != nil {
-			return err
+			// A refused founder must not take the host down with it. When the
+			// platform answers the startup founding registration with a
+			// definite client error, that answer is about ONE founder's
+			// declaration — never about the composition — so the daemon
+			// stands down in process and keeps serving direct-owned
+			// sessions instead of failing startup. The refusal is retained
+			// on the diagnostics surface so an operator who sees `off` can
+			// see why, and a later deferred install with another composed
+			// configuration may still found the composition. Anything that
+			// is not a definite platform refusal keeps its ordinary error:
+			// a transport blip or an expired credential is recovered by the
+			// supervised restart that an error triggers.
+			if refused := newSessionShimFoundingRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+				slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+					"startup founding registration; the daemon keeps serving direct-owned "+
+					"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+					"scope", refused.Scope, "refusal", refused.Err)
+				d.retainSessionShimFoundingRefusal(refused)
+				d.standDownSessionShimAfterRefusedStartupFounding()
+				startupFoundingRefused = true
+			} else {
+				return err
+			}
 		}
 	}
 
-	if err := d.adoptSessionShims(ctx); err != nil {
-		return err
+	// A refused startup founding stands the composition down above and skips
+	// the adoption pass below: there is no composed attestation to adopt for,
+	// and the pass requires one. The daemon proceeds as a host that does not
+	// do durable sessions; a later deferred install with another composed
+	// configuration runs its own adoption when it founds the composition.
+	if !startupFoundingRefused {
+		if err := d.adoptSessionShims(ctx); err != nil {
+			return err
+		}
 	}
 	// Reclaim crash/SIGKILL/restart leftovers the lifecycle path can never
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
-	if !d.sessionShimEnabled() {
+	// A refused startup founding stands the composition down above, so this
+	// second registration runs exactly when the daemon presents no composed
+	// attestation: either it never did, or its founder was refused and it
+	// serves stood down. Skipping it when the register above already succeeded
+	// would leave a stood-down daemon with no worker identity at all.
+	if !d.sessionShimEnabled() || startupFoundingRefused {
 		if err := register(); err != nil {
 			return err
 		}
@@ -1462,7 +1524,31 @@ func (d *Daemon) Start(ctx context.Context) error {
 		credentials.Attach(d.heartbeat)
 		if d.sessionShimEnabled() {
 			if err := d.heartbeat.StartSynchronized(ctx); err != nil {
-				return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
+				// The same contract as a refused startup registration: the first
+				// beat presenting the composition was heard and answered, so a
+				// definite platform refusal stands the composition down in
+				// process instead of failing startup. A later deferred install
+				// with another composed configuration may still found it.
+				// Anything else keeps its ordinary error.
+				if refused := newSessionShimFoundingRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+					slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+						"first startup heartbeat; the daemon keeps serving direct-owned "+
+						"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+						"scope", refused.Scope, "refusal", refused.Err)
+					d.retainSessionShimFoundingRefusal(refused)
+					// The heartbeat service itself keeps running: it carries the
+					// in-flight sessions' lock refresh and user-turn piggyback,
+					// and a later deferred install rings its first projected
+					// beat through it. Only the shim projection is cleared —
+					// with the attestation stood down there is nothing to
+					// project — so the beats below attest a host that does not
+					// do durable sessions.
+					d.heartbeat.SetSessionShimProjection(nil, nil)
+					d.heartbeat.Start()
+					d.standDownSessionShimAfterRefusedStartupFounding()
+				} else {
+					return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
+				}
 			}
 			if !d.sessionShimReadinessWithdrawn.Load() {
 				d.spawner.Resume()
