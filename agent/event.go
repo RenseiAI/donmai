@@ -24,6 +24,7 @@ const (
 	EventToolUse       EventKind = "tool_use"
 	EventToolResult    EventKind = "tool_result"
 	EventToolProgress  EventKind = "tool_progress"
+	EventUsage         EventKind = "usage"
 	EventSubagent      EventKind = "subagent"
 	EventResult        EventKind = "result"
 	EventError         EventKind = "error"
@@ -336,6 +337,25 @@ type ToolResultEvent struct {
 func (ToolResultEvent) Kind() EventKind { return EventToolResult }
 func (ToolResultEvent) isAgentEvent()   {}
 
+// UsageEvent carries a sparse subscription quota-window update observed
+// mid-turn (for example the streamed rate-limit event). Windows merge by
+// ID onto the published snapshot; omitted windows are unchanged.
+type UsageEvent struct {
+	// Message is the provider's status for the update, when reported
+	// (for example "allowed_warning").
+	Message string `json:"message,omitempty"`
+
+	// Usage is the sparse update. Never nil on a well-formed event.
+	Usage *UsageLimitsUpdate `json:"usage,omitempty"`
+
+	// Raw is the provider-native event payload.
+	Raw any `json:"raw,omitempty"`
+}
+
+// Kind reports the EventKind discriminant.
+func (UsageEvent) Kind() EventKind { return EventUsage }
+func (UsageEvent) isAgentEvent()   {}
+
 // ToolProgressEvent is a long-running tool's progress tick. Verbatim
 // port of AgentToolProgressEvent.
 type ToolProgressEvent struct {
@@ -560,6 +580,12 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		var ev ToolProgressEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, fmt.Errorf("agent: decode ToolProgressEvent: %w", err)
+		}
+		return ev, nil
+	case EventUsage:
+		var ev UsageEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode UsageEvent: %w", err)
 		}
 		return ev, nil
 	case EventSubagent:

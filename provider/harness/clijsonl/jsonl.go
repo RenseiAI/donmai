@@ -302,11 +302,10 @@ func mapLine(line []byte) []agent.Event {
 		// structured cause.
 		return mapStreamEvent(line)
 	case "rate_limit_event":
-		// Surface as a system event so the runner can record it.
-		return []agent.Event{agent.SystemEvent{
-			Subtype: "rate_limit",
-			Raw:     json.RawMessage(line),
-		}}
+		// Map onto the shared quota-window type so the daemon can
+		// publish the window. The parsed update rides the event's
+		// Usage field; the raw line stays attached for diagnostics.
+		return mapRateLimitEvent(line)
 	case "":
 		return []agent.Event{agent.ErrorEvent{
 			Message: "provider/claude: JSONL line missing top-level type",
@@ -625,6 +624,73 @@ func mapStreamEvent(line []byte) []agent.Event {
 		Upstream: agent.NormalizeUpstreamError(status, code, message, ""),
 		Raw:      json.RawMessage(line),
 	}}
+}
+
+// rawRateLimitEnvelope decodes the streamed rate-limit line. The streamed
+// event names one window at a time with a 0–1 utilization fraction and an
+// epoch-seconds reset.
+type rawRateLimitEnvelope struct {
+	Type          string `json:"type"`
+	RateLimitInfo *struct {
+		Status        string   `json:"status"`
+		RateLimitType string   `json:"rateLimitType"`
+		Utilization   *float64 `json:"utilization"`
+		ResetsAt      *float64 `json:"resetsAt"`
+	} `json:"rate_limit_info"`
+}
+
+// mapRateLimitEvent maps one streamed `rate_limit_event` line onto the
+// shared quota-window type. The window carries the probe-stable ID so a
+// consumer merges it onto the row the usage read established; an
+// unrecognised or utilization-less line stays a plain rate-limit marker
+// so the runner still observes it.
+func mapRateLimitEvent(line []byte) []agent.Event {
+	var envelope rawRateLimitEnvelope
+	if err := json.Unmarshal(line, &envelope); err != nil {
+		return []agent.Event{agent.ErrorEvent{
+			Message: fmt.Sprintf("provider/claude: decode rate_limit event: %v", err),
+			Code:    "decode_rate_limit",
+			Raw:     json.RawMessage(line),
+		}}
+	}
+	info := envelope.RateLimitInfo
+	if info == nil || info.RateLimitType == "" || info.Utilization == nil {
+		return []agent.Event{agent.SystemEvent{
+			Subtype: "rate_limit",
+			Raw:     json.RawMessage(line),
+		}}
+	}
+	var resetsAt string
+	if info.ResetsAt != nil {
+		resetsAt = agent.ISOFromEpochSeconds(*info.ResetsAt)
+	}
+	window := agent.UsageWindow{
+		ID:          info.RateLimitType,
+		Kind:        agent.PoolKind(windowDurationForRateLimitType(info.RateLimitType)),
+		UsedPercent: agent.ClampPercent(*info.Utilization * 100),
+	}
+	window.Label = agent.PoolLabel(window.Kind)
+	if resetsAt != "" {
+		window.ResetsAt = resetsAt
+	}
+	return []agent.Event{agent.UsageEvent{
+		Message: info.Status,
+		Usage:   &agent.UsageLimitsUpdate{Windows: []agent.UsageWindow{window}},
+		Raw:     json.RawMessage(line),
+	}}
+}
+
+// windowDurationForRateLimitType classifies one streamed window name by
+// its known duration. Session and weekly windows use their documented
+// lengths; anything else (including the model-scoped weekly bucket)
+// reads as weekly so it merges onto a weekly row.
+func windowDurationForRateLimitType(rateLimitType string) int {
+	switch rateLimitType {
+	case "five_hour":
+		return 5 * 60
+	default:
+		return 7 * 24 * 60
+	}
 }
 
 // resultUpstream reads the endpoint's structured refusal off a failure
