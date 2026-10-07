@@ -30,14 +30,14 @@ func strPtr(s string) *string { return &s }
 
 func floatPtr(f float64) *float64 { return &f }
 
-func intPtr(n int) *int { return &n }
+func minsPtr(n int) *int { return &n }
 
 func TestRateLimitsToLimits_SessionAndWeekly(t *testing.T) {
 	t.Parallel()
 	got := RateLimitsToLimits(&RateLimitSnapshot{
 		PlanType:  strPtr("plus"),
-		Primary:   &RateLimitWindow{UsedPercent: 12, ResetsAt: floatPtr(1784000000), WindowDurationMins: intPtr(300)},
-		Secondary: &RateLimitWindow{UsedPercent: 47, ResetsAt: floatPtr(1784500000), WindowDurationMins: intPtr(10080)},
+		Primary:   &RateLimitWindow{UsedPercent: 12, ResetsAt: floatPtr(1784000000), WindowDurationMins: minsPtr(300)},
+		Secondary: &RateLimitWindow{UsedPercent: 47, ResetsAt: floatPtr(1784500000), WindowDurationMins: minsPtr(10080)},
 	}, nil, nil, rateLimitsTestCheckedAt)
 	if len(got.Windows) != 2 {
 		t.Fatalf("got %d windows, want 2: %+v", len(got.Windows), got.Windows)
@@ -117,8 +117,8 @@ func TestRateLimitsToLimits_PromaxWeeklyPrimaryInline(t *testing.T) {
 	got := RateLimitsToLimits(&RateLimitSnapshot{
 		LimitID:   strPtr("codex"),
 		PlanType:  strPtr("promax"),
-		Primary:   &RateLimitWindow{UsedPercent: 1, ResetsAt: floatPtr(1791646860), WindowDurationMins: intPtr(10080)},
-		Secondary: &RateLimitWindow{UsedPercent: 1, ResetsAt: floatPtr(1791646860), WindowDurationMins: intPtr(10080)},
+		Primary:   &RateLimitWindow{UsedPercent: 1, ResetsAt: floatPtr(1791646860), WindowDurationMins: minsPtr(10080)},
+		Secondary: &RateLimitWindow{UsedPercent: 1, ResetsAt: floatPtr(1791646860), WindowDurationMins: minsPtr(10080)},
 	}, nil, nil, "2026-10-06T12:00:00.000Z")
 	if len(got.Windows) != 2 {
 		t.Fatalf("got %d windows, want 2", len(got.Windows))
@@ -142,12 +142,12 @@ func TestRateLimitsToLimits_SelectsMainAllowance(t *testing.T) {
 	t.Parallel()
 	spark := &RateLimitSnapshot{
 		LimitID:   strPtr("spark"),
-		Primary:   &RateLimitWindow{UsedPercent: 0, WindowDurationMins: intPtr(300)},
-		Secondary: &RateLimitWindow{UsedPercent: 90, WindowDurationMins: intPtr(10080)},
+		Primary:   &RateLimitWindow{UsedPercent: 0, WindowDurationMins: minsPtr(300)},
+		Secondary: &RateLimitWindow{UsedPercent: 90, WindowDurationMins: minsPtr(10080)},
 	}
 	got := RateLimitsToLimits(spark, map[string]*RateLimitSnapshot{
 		"spark": spark,
-		"codex": {Secondary: &RateLimitWindow{UsedPercent: 42, WindowDurationMins: intPtr(10080)}},
+		"codex": {Secondary: &RateLimitWindow{UsedPercent: 42, WindowDurationMins: minsPtr(10080)}},
 	}, nil, rateLimitsTestCheckedAt)
 	if len(got.Windows) != 1 || got.Windows[0].ID != "secondary" || got.Windows[0].UsedPercent != 42 {
 		t.Errorf("windows = %+v, want the main secondary at 42", got.Windows)
@@ -174,15 +174,15 @@ func TestRateLimitsToUpdate_SparkNeverOverwrites(t *testing.T) {
 	}
 	spark := &RateLimitSnapshot{
 		LimitID:   strPtr("spark"),
-		Primary:   &RateLimitWindow{UsedPercent: 0, WindowDurationMins: intPtr(300)},
-		Secondary: &RateLimitWindow{UsedPercent: 90, WindowDurationMins: intPtr(10080)},
+		Primary:   &RateLimitWindow{UsedPercent: 0, WindowDurationMins: minsPtr(300)},
+		Secondary: &RateLimitWindow{UsedPercent: 90, WindowDurationMins: minsPtr(10080)},
 	}
 	if got := RateLimitsToUpdate(spark, rateLimitsTestCheckedAt); got != nil {
 		t.Errorf("Spark update produced %+v, want nil", got)
 	}
 	main := RateLimitsToUpdate(&RateLimitSnapshot{
 		LimitID:   strPtr("codex"),
-		Secondary: &RateLimitWindow{UsedPercent: 42, WindowDurationMins: intPtr(10080)},
+		Secondary: &RateLimitWindow{UsedPercent: 42, WindowDurationMins: minsPtr(10080)},
 	}, rateLimitsTestCheckedAt)
 	if main == nil || len(main.Windows) != 1 || main.Windows[0].UsedPercent != 42 {
 		t.Errorf("main update = %+v, want the secondary at 42", main)
@@ -197,7 +197,7 @@ func TestMergeRateLimits_PartialUpdateKeepsWindows(t *testing.T) {
 	merged := MergeRateLimits(&RateLimitSnapshot{
 		LimitID:  strPtr("codex"),
 		PlanType: strPtr("business"),
-		Primary:  &RateLimitWindow{UsedPercent: 100, ResetsAt: floatPtr(1800000000), WindowDurationMins: intPtr(300)},
+		Primary:  &RateLimitWindow{UsedPercent: 100, ResetsAt: floatPtr(1800000000), WindowDurationMins: minsPtr(300)},
 	}, &RateLimitSnapshot{RateLimitReachedType: strPtr("rate_limit_reached")})
 	if merged == nil || merged.Primary == nil || merged.Primary.UsedPercent != 100 {
 		t.Fatalf("merged = %+v, want the primary window kept", merged)
@@ -207,11 +207,11 @@ func TestMergeRateLimits_PartialUpdateKeepsWindows(t *testing.T) {
 	}
 	main := &RateLimitSnapshot{
 		LimitID: strPtr("codex"),
-		Primary: &RateLimitWindow{UsedPercent: 100, ResetsAt: floatPtr(1800000000), WindowDurationMins: intPtr(300)},
+		Primary: &RateLimitWindow{UsedPercent: 100, ResetsAt: floatPtr(1800000000), WindowDurationMins: minsPtr(300)},
 	}
 	if got := MergeRateLimits(main, &RateLimitSnapshot{
 		LimitID: strPtr("spark"),
-		Primary: &RateLimitWindow{UsedPercent: 3, WindowDurationMins: intPtr(300)},
+		Primary: &RateLimitWindow{UsedPercent: 3, WindowDurationMins: minsPtr(300)},
 	}); got != main {
 		t.Error("model-specific snapshot replaced the main allowance; want it kept")
 	}
@@ -240,7 +240,7 @@ func TestResetCreditsToContract(t *testing.T) {
 		t.Error("nil summary should map to nil")
 	}
 	limits := RateLimitsToLimits(
-		&RateLimitSnapshot{Primary: &RateLimitWindow{UsedPercent: 5, WindowDurationMins: intPtr(300)}},
+		&RateLimitSnapshot{Primary: &RateLimitWindow{UsedPercent: 5, WindowDurationMins: minsPtr(300)}},
 		nil, &ResetCreditsSummary{AvailableCount: 1}, rateLimitsTestCheckedAt)
 	if limits.ResetCredits == nil || limits.ResetCredits.AvailableCount != 1 {
 		t.Errorf("limits credits = %+v, want count 1 riding along", limits.ResetCredits)
@@ -284,7 +284,7 @@ func TestRateLimitsProbe_FailedProbeKeepsLastWindows(t *testing.T) {
 		t.Fatalf("nil-client probe = %+v, want probeFailed", probed.Unavailable)
 	}
 	published := RateLimitsToLimits(&RateLimitSnapshot{
-		Primary: &RateLimitWindow{UsedPercent: 12, WindowDurationMins: intPtr(300)},
+		Primary: &RateLimitWindow{UsedPercent: 12, WindowDurationMins: minsPtr(300)},
 	}, nil, nil, rateLimitsTestCheckedAt)
 	if got := agent.ResolveUsageLimitsAfterProbe(&published, &probed); got != &published {
 		t.Errorf("resolved = %+v, want the last good windows kept", got)
@@ -370,8 +370,8 @@ func TestSubscribeRateLimits_PartialUpdateMerges(t *testing.T) {
 	// Full snapshot first: both rows publish.
 	emitRateLimits(&RateLimitSnapshot{
 		PlanType:  strPtr("plus"),
-		Primary:   &RateLimitWindow{UsedPercent: 12, WindowDurationMins: intPtr(300)},
-		Secondary: &RateLimitWindow{UsedPercent: 47, WindowDurationMins: intPtr(10080)},
+		Primary:   &RateLimitWindow{UsedPercent: 12, WindowDurationMins: minsPtr(300)},
+		Secondary: &RateLimitWindow{UsedPercent: 47, WindowDurationMins: minsPtr(10080)},
 	})
 	select {
 	case <-updated:
@@ -381,7 +381,7 @@ func TestSubscribeRateLimits_PartialUpdateMerges(t *testing.T) {
 
 	// Partial update naming only the secondary: the primary survives.
 	emitRateLimits(&RateLimitSnapshot{
-		Secondary: &RateLimitWindow{UsedPercent: 51, WindowDurationMins: intPtr(10080)},
+		Secondary: &RateLimitWindow{UsedPercent: 51, WindowDurationMins: minsPtr(10080)},
 	})
 	select {
 	case <-updated:
@@ -407,7 +407,7 @@ func TestSubscribeRateLimits_PartialUpdateMerges(t *testing.T) {
 	// A model-specific notification never touches the rows.
 	emitRateLimits(&RateLimitSnapshot{
 		LimitID:   strPtr("spark"),
-		Secondary: &RateLimitWindow{UsedPercent: 90, WindowDurationMins: intPtr(10080)},
+		Secondary: &RateLimitWindow{UsedPercent: 90, WindowDurationMins: minsPtr(10080)},
 	})
 	select {
 	case <-updated:
