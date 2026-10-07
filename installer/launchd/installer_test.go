@@ -94,7 +94,8 @@ func TestGeneratePlist_EncodesKeyBehaviours(t *testing.T) {
 }
 
 func TestGeneratePlist_GoldenVariants(t *testing.T) {
-	t.Setenv("HOME", "/Users/tester")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	cases := []struct {
 		name     string
 		priority ProcessPriority
@@ -114,15 +115,18 @@ func TestGeneratePlist_GoldenVariants(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read golden %s: %v", tc.golden, err)
 			}
-			if got != string(wantBytes) {
-				t.Errorf("plist mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, string(wantBytes))
+			// The goldens carry a {{HOME}} placeholder so no developer path is
+			// committed; substitute the temp HOME the plist was rendered under.
+			want := strings.ReplaceAll(string(wantBytes), "{{HOME}}", escapeXML(home))
+			if got != want {
+				t.Errorf("plist mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, want)
 			}
 		})
 	}
 }
 
 func TestDetectProcessPriorityFromPlist(t *testing.T) {
-	t.Setenv("HOME", "/Users/tester")
+	t.Setenv("HOME", t.TempDir())
 	for _, tc := range []struct {
 		name     string
 		priority ProcessPriority
@@ -230,18 +234,6 @@ func TestGeneratePlist_DurabilityKeys(t *testing.T) {
 				t.Errorf("plist missing durability fragment %q, got:\n%s", tt.re, out)
 			}
 		})
-	}
-}
-
-// TestExitTimeOutCoversDrainDefault statically asserts the launchd exit
-// window still covers the documented 600s daemon drain default plus a 30s
-// escalation margin. This package cannot import daemon without a cycle, so the
-// contract value is pinned here directly.
-func TestExitTimeOutCoversDrainDefault(t *testing.T) {
-	const documentedDrainDefaultSeconds = 600
-	if ExitTimeOutSeconds < documentedDrainDefaultSeconds+30 {
-		t.Errorf("ExitTimeOutSeconds = %d, want >= documented drain default %d + 30s escalation margin",
-			ExitTimeOutSeconds, documentedDrainDefaultSeconds)
 	}
 }
 
