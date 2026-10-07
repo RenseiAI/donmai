@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -1258,6 +1259,112 @@ func TestHeartbeatRequestBody_CarriesQuotaOnTheWire(t *testing.T) {
 			}
 			if _, hasEmail := entry["email"]; hasEmail {
 				t.Errorf("quota entry carries an email address: %v", entry)
+			}
+		})
+	}
+}
+
+// TestHeartbeatRequestBody_QuotaAuthCheckGolden pins the SERIALIZED quota
+// array that reaches the wire. The quota-window fields stay as they were
+// before authCheck existed; each probed account adds exactly harness, ok
+// and checkedAt, with checkedAt the probe time rather than the beat time.
+func TestHeartbeatRequestBody_QuotaAuthCheckGolden(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	later := base.Add(5 * time.Minute)
+	good := func(at time.Time) agent.UsageLimits {
+		return agent.MakeUsageLimits(agent.ISOTime(at), quotaTestWindows())
+	}
+	const window = `{"id":"primary","kind":"weekly","label":"Weekly","usedPercent":1,"windowDurationMins":10080}`
+
+	tests := []struct {
+		name     string
+		getQuota func() []agent.UsageAccount
+		want     string
+	}{
+		{
+			name: "successful probe is ok at the probe time",
+			getQuota: func() []agent.UsageAccount {
+				q := &quotaState{}
+				q.noteCodexProbe("opaque-account-1", "promax", good(base), base)
+				return (&Daemon{quota: q}).quotaSnapshot()
+			},
+			want: `[{"id":"opaque-account-1","provider":"codex","plan":"promax","limitId":"codex",` +
+				`"limits":{"checkedAt":"2026-10-06T12:00:00Z","windows":[` + window + `]},` +
+				`"authCheck":{"harness":"codex","ok":true,"checkedAt":"2026-10-06T12:00:00Z"}}]`,
+		},
+		{
+			name: "failed probe keeps the windows and reports not ok",
+			getQuota: func() []agent.UsageAccount {
+				q := &quotaState{}
+				q.noteClaudeProbe("opaque-account-2", good(base), base)
+				q.noteClaudeProbe("opaque-account-2", agent.MakeUnavailableUsageLimits(agent.ISOTime(later), agent.UsageUnavailableProbeFailed, ""), later)
+				return (&Daemon{quota: q}).quotaSnapshot()
+			},
+			want: `[{"id":"opaque-account-2","provider":"claude",` +
+				`"limits":{"checkedAt":"2026-10-06T12:00:00Z","windows":[` + window + `]},` +
+				`"authCheck":{"harness":"claude","ok":false,"checkedAt":"2026-10-06T12:05:00Z"}}]`,
+		},
+		{
+			name: "no check attempted omits the authCheck key",
+			getQuota: func() []agent.UsageAccount {
+				return []agent.UsageAccount{{
+					ID:       "opaque-account-2",
+					Provider: "claude",
+					Limits:   good(base),
+				}}
+			},
+			want: `[{"id":"opaque-account-2","provider":"claude",` +
+				`"limits":{"checkedAt":"2026-10-06T12:00:00Z","windows":[` + window + `]}}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				mu  sync.Mutex
+				raw []byte
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				buf, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				raw = buf
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+			}))
+			t.Cleanup(srv.Close)
+
+			hs := NewHeartbeatService(HeartbeatOptions{
+				WorkerID:        "wkr_quota_auth",
+				Hostname:        "h",
+				OrchestratorURL: srv.URL,
+				RuntimeJWT:      "runtime.jwt.value",
+				IntervalSeconds: 1,
+				GetActiveCount:  func() int { return 0 },
+				GetMaxCount:     func() int { return 1 },
+				GetStatus:       func() RegistrationStatus { return RegistrationIdle },
+				GetQuota:        tt.getQuota,
+			})
+			hs.sendOne(context.Background())
+
+			mu.Lock()
+			body := append([]byte(nil), raw...)
+			mu.Unlock()
+			var decoded struct {
+				Quota json.RawMessage `json:"quota"`
+			}
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("unmarshal request body: %v (%s)", err, body)
+			}
+			var compact bytes.Buffer
+			if err := json.Compact(&compact, decoded.Quota); err != nil {
+				t.Fatalf("compact quota %q: %v (body: %s)", decoded.Quota, err, body)
+			}
+			if got := compact.String(); got != tt.want {
+				t.Fatalf("quota on the wire =\n%s\nwant\n%s", got, tt.want)
 			}
 		})
 	}

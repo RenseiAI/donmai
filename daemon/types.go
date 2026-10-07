@@ -397,7 +397,8 @@ type HeartbeatPayload struct {
 
 	// Quota carries the subscription quota snapshot for this host's
 	// signed-in accounts: one entry per account with its quota windows,
-	// plan, allowance bucket and reset credits. Populated from
+	// plan, allowance bucket, reset credits and the harness's latest
+	// login-check outcome (authCheck). Populated from
 	// HeartbeatOptions.GetQuota when configured; nil (and thus omitted
 	// from the wire body) otherwise. Account IDs ride as opaque values
 	// the platform hashes — the payload never carries an address.

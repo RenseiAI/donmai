@@ -10,7 +10,7 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Features
 
-- Publish subscription quota windows for the codex and claude harnesses: shared window types with sparse merge in `agent`, app-server `account/rateLimits` mappers under the codex harness, stream-json `rate_limit_event` mappers under the claude harness, and an optional quota snapshot on the daemon heartbeat. Ported from the MIT-licensed t3code provider usage-limits modules; see the per-package LICENSE-t3code notes.
+- Publish subscription quota windows for the codex and claude harnesses: shared window types with sparse merge in `agent`, app-server `account/rateLimits` mappers under the codex harness, stream-json `rate_limit_event` mappers under the claude harness, and an optional quota snapshot on the daemon heartbeat. Each snapshot entry carries an `authCheck` (`harness`, `ok`, `checkedAt`) recording the latest login check for its harness, stamped with the probe time and omitted until a probe has run. Ported from the MIT-licensed t3code provider usage-limits modules; see the per-package LICENSE-t3code notes.
 
 ## v0.72.65 — 2026-10-05
 

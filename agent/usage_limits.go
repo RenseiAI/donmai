@@ -127,6 +127,51 @@ type UsageAccount struct {
 	// provider reports one (for example "codex").
 	LimitID string      `json:"limitId,omitempty"`
 	Limits  UsageLimits `json:"limits"`
+	// AuthCheck is the outcome of the daemon's latest login check for
+	// this account's harness. Omitted when the daemon has not attempted
+	// a check for the harness.
+	AuthCheck *UsageAuthCheck `json:"authCheck,omitempty"`
+}
+
+// Harness names a UsageAuthCheck reports on. They match
+// UsageAccount.Provider.
+const (
+	UsageHarnessCodex  = "codex"
+	UsageHarnessClaude = "claude"
+)
+
+// UsageAuthCheck is the outcome of the daemon's most recent login check
+// for one harness. It carries exactly these three fields: no address,
+// token or credential material ever rides on it. CheckedAt is the
+// instant the check ran, not the instant a beat carrying it was sent,
+// so a consumer can judge how fresh the verdict is.
+type UsageAuthCheck struct {
+	// Harness is the harness the check ran for (UsageHarnessCodex or
+	// UsageHarnessClaude).
+	Harness string `json:"harness"`
+	// OK is true when the check confirmed a valid login and false when
+	// it did not.
+	OK bool `json:"ok"`
+	// CheckedAt is the RFC3339 instant the check ran.
+	CheckedAt string `json:"checkedAt"`
+}
+
+// UsageAuthCheckAfterProbe derives the login-check outcome a quota probe
+// implies. The probe reads quota windows through the signed-in account,
+// so a read that produced windows proves the login is valid; a read that
+// failed, or that found an account with no subscription windows to
+// report, does not. at is when the probe ran. It returns nil when there
+// is no probe outcome or no probe time, so a check that never ran is
+// never reported.
+func UsageAuthCheckAfterProbe(harness string, probed *UsageLimits, at time.Time) *UsageAuthCheck {
+	if probed == nil || at.IsZero() {
+		return nil
+	}
+	return &UsageAuthCheck{
+		Harness:   harness,
+		OK:        probed.Unavailable == nil,
+		CheckedAt: ISOTime(at),
+	}
 }
 
 // ClampPercent bounds a consumed share to the 0–100 display range.
