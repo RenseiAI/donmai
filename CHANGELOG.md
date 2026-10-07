@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.66 — 2026-10-07
+
 ### Features
 
 - Add subscription quota window types, mappers and the per-account login check for the codex and claude harnesses (not yet published on the daemon heartbeat): shared window types with sparse merge in `agent`, app-server `account/rateLimits` mappers under the codex harness, and stream-json `rate_limit_event` mappers under the claude harness. The heartbeat gains an optional `quota` field backed by a per-account snapshot cache, but nothing fills the cache yet, so every beat still omits `quota`. Each entry will carry an `authCheck` (`harness`, `ok`, `checkedAt`) recording the latest login check for its harness, stamped with the probe time and omitted until a probe has run. Ported from the MIT-licensed t3code provider usage-limits modules; see the per-package LICENSE-t3code notes.
