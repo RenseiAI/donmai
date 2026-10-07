@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -138,8 +139,11 @@ func (i continueRangeInspection) delivers() bool {
 // inspectContinueRange classifies the commits in from..to for the continued
 // -pull-request delivery gate. Delivery requires at least one non-merge commit
 // in the range that changes a path outside the runner scratch set; any commit
-// in the range touching a scratch path is reported separately so the caller can
-// fail without rewriting history.
+// in the range adding or modifying a scratch path is reported separately so
+// the caller can fail without rewriting history. Removing a scratch path is
+// cleanup, not a scratch commit, and a merge counts only for what it changed
+// against every parent: what it brings in from either side is the base
+// branch's work or the pull request's own from before dispatch.
 func inspectContinueRange(ctx context.Context, worktreePath, from, to string) (continueRangeInspection, error) {
 	from = strings.TrimSpace(from)
 	to = strings.TrimSpace(to)
@@ -165,17 +169,18 @@ func inspectContinueRange(ctx context.Context, worktreePath, from, to string) (c
 	inspection := continueRangeInspection{commitCount: len(commits)}
 	scratchSet := map[string]struct{}{}
 	for _, commit := range commits {
-		paths, pathErr := continueCommitPaths(ctx, worktreePath, commit)
+		changes, pathErr := continueCommitChanges(ctx, worktreePath, commit)
 		if pathErr != nil {
 			return continueRangeInspection{}, pathErr
 		}
-		for _, path := range paths {
-			if isContinueScratchPath(path) {
-				scratchSet[path] = struct{}{}
-				continue
-			}
-			if _, ok := nonMergeSet[commit]; ok {
-				inspection.hasCodeChange = true
+		for _, change := range changes {
+			switch {
+			case !isContinueScratchPath(change.path):
+				if _, ok := nonMergeSet[commit]; ok {
+					inspection.hasCodeChange = true
+				}
+			case !change.deleted:
+				scratchSet[change.path] = struct{}{}
 			}
 		}
 	}
@@ -197,37 +202,47 @@ func continueRangeCommits(ctx context.Context, worktreePath string, args ...stri
 	return filterEmpty(strings.Split(strings.TrimSpace(out), "\n")), nil
 }
 
-func continueCommitPaths(ctx context.Context, worktreePath, commit string) ([]string, error) {
-	out, err := gitStdout(ctx, worktreePath, nil, "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", commit)
+// continueChange is one path a commit changed, and whether the commit
+// deleted it.
+type continueChange struct {
+	path    string
+	deleted bool
+}
+
+// continueCommitChanges lists the paths commit itself changed. --cc keeps a
+// non-merge commit's diff as is and narrows a merge to the paths it changed
+// against every parent (its own conflict resolution or additions).
+func continueCommitChanges(ctx context.Context, worktreePath, commit string) ([]continueChange, error) {
+	out, err := gitStdout(ctx, worktreePath, nil, "diff-tree", "--no-commit-id", "--name-status", "-z", "-r", "--cc", "--root", commit)
 	if err != nil {
 		return nil, fmt.Errorf("runner: list continued pull request paths for %s: %w", commit, err)
 	}
-	seen := map[string]struct{}{}
-	paths := make([]string, 0)
-	for _, path := range filterEmpty(strings.Split(strings.TrimSpace(out), "\n")) {
-		if _, ok := seen[path]; ok {
+	fields := strings.Split(strings.Trim(out, "\x00\n"), "\x00")
+	changes := make([]continueChange, 0, len(fields)/2)
+	for i := 0; i+1 < len(fields); i += 2 {
+		status, path := strings.TrimSpace(fields[i]), fields[i+1]
+		if status == "" || path == "" {
 			continue
 		}
-		seen[path] = struct{}{}
-		paths = append(paths, path)
+		changes = append(changes, continueChange{path: path, deleted: strings.Trim(status, "D") == ""})
 	}
-	return paths, nil
+	return changes, nil
 }
 
+// continueScratchDirs are the top-level directories a continued pull
+// request must never gain a commit in: the runner's own state, the pi
+// harness's session storage and the seat scratch. harnessstate also lists
+// the Claude Code and Codex CLI directories, which the backstop never
+// auto-commits; a repository may track those as project content (agent
+// settings, skills), so a commit the agent made there is delivered work.
+var continueScratchDirs = []string{harnessstate.RunnerStateDir, harnessstate.PiStateDir, harnessstate.SeatScratchDir}
+
+// isContinueScratchPath reports whether path sits under one of
+// continueScratchDirs. Only the first path component decides, so a nested
+// directory that merely shares the name stays ordinary project content.
 func isContinueScratchPath(path string) bool {
-	return shouldExcludeFromBackstop(strings.TrimSpace(path)) && isTopLevelStatePath(strings.TrimSpace(path))
-}
-
-// isTopLevelStatePath reports whether path sits directly under a
-// checkout-resident state directory (see runtime/harnessstate): only the
-// first path component decides, so a nested directory that merely shares
-// the name stays ordinary project content.
-func isTopLevelStatePath(path string) bool {
-	parts := strings.Split(path, "/")
-	if len(parts) <= 1 {
-		return false
-	}
-	return harnessstate.IsStateDir(parts[0])
+	top, rest, nested := strings.Cut(strings.TrimSpace(path), "/")
+	return nested && rest != "" && slices.Contains(continueScratchDirs, top)
 }
 
 // continueDiverged reports whether a backstop report carries the typed

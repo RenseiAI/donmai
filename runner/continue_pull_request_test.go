@@ -421,6 +421,73 @@ func TestInspectContinueRange(t *testing.T) {
 			wantDelivers:    true,
 		},
 		{
+			name: "tracked agent configuration is code",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				newHead = commitFixtureFiles(t, repo, map[string]string{
+					".claude/settings.json":           "{}\n",
+					".claude/skills/release/SKILL.md": "# release\n",
+					".codex/config.toml":              "model = \"x\"\n",
+				}, "agent configuration")
+				return repo, startHead, newHead
+			},
+			wantCommitCount: 1,
+			wantDelivers:    true,
+		},
+		{
+			name: "pi session state only",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				newHead = commitFixtureFiles(t, repo, map[string]string{".pi/session.jsonl": "{}\n"}, "pi state")
+				return repo, startHead, newHead
+			},
+			wantCommitCount:  1,
+			wantScratchPaths: []string{".pi/session.jsonl"},
+		},
+		{
+			name: "removing earlier scratch is cleanup",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				continueFixtureBranch(t, repo, branch)
+				startHead = commitFixtureFiles(t, repo, map[string]string{".scratch/old.md": "earlier notes\n"}, "earlier scratch")
+				gitRun(t, repo, "rm", "-q", ".scratch/old.md")
+				newHead = commitFixtureFiles(t, repo, map[string]string{"fix.go": "package fix\n"}, "fix and drop the scratch")
+				return repo, startHead, newHead
+			},
+			wantCommitCount: 1,
+			wantDelivers:    true,
+		},
+		{
+			name: "merge does not re-attribute earlier scratch",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				continueFixtureBranch(t, repo, branch)
+				startHead = commitFixtureFiles(t, repo, map[string]string{".scratch/old.md": "earlier notes\n"}, "earlier scratch")
+				commitFixtureFiles(t, repo, map[string]string{"fix.go": "package fix\n"}, "code change")
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+			wantCommitCount: 2,
+			wantDelivers:    true,
+		},
+		{
+			name: "merge adding its own scratch",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				commitFixtureFiles(t, repo, map[string]string{"fix.go": "package fix\n"}, "code change")
+				gitRun(t, repo, "merge", "--no-ff", "--no-commit", "origin/develop")
+				writeFile(t, repo, ".scratch/merge.md", "notes\n")
+				gitRun(t, repo, "add", "-f", ".scratch/merge.md")
+				gitRun(t, repo, "commit", "-q", "-m", "merge develop with notes")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+			wantCommitCount:  2,
+			wantScratchPaths: []string{".scratch/merge.md"},
+		},
+		{
 			name: "no new commits",
 			arrange: func(t *testing.T) (repo, startHead, newHead string) {
 				_, repo = backstopRemoteFixture(t)
