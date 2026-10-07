@@ -154,10 +154,12 @@ func ParseRateLimitInfo(line []byte) (*RateLimitInfo, bool) {
 }
 
 // RateLimitEventToUpdate maps one streamed `rate_limit_event` onto a
-// sparse update. Utilization is a 0–1 fraction on the streamed event.
-// An overage-included event before any probe has named the bucket is
-// dropped: guessing a name would draw a row the next probe cannot
-// reconcile.
+// sparse update through the same window shapes the stream driver uses:
+// account-wide windows map by rate-limit type, and the overage-included
+// event maps onto the model-scoped row the usage read drew. An
+// overage-included event before any probe has named the bucket, or an
+// unknown type, is dropped: drawing a row the probe cannot reconcile
+// would orphan the stream row. checkedAt stamps the update.
 func RateLimitEventToUpdate(info *RateLimitInfo, names ScopedLimitNames, checkedAt string) *agent.UsageLimitsUpdate {
 	if info == nil || info.Utilization == nil {
 		return nil
