@@ -336,6 +336,11 @@ func advanceMainAndMerge(t *testing.T, cwd string, pushRefs ...string) string {
 	gitRun(t, other, "commit", "-q", "-m", "advance main")
 	gitRun(t, other, "push", "-q", "origin", "main")
 
+	// The merge below creates a commit in cwd, so cwd needs its own
+	// identity: CI has no global git identity to fall back on.
+	gitRun(t, cwd, "config", "user.email", "test@example.com")
+	gitRun(t, cwd, "config", "user.name", "test")
+	gitRun(t, cwd, "config", "commit.gpgsign", "false")
 	gitRun(t, cwd, "fetch", "-q", "origin", "main")
 	gitRun(t, cwd, "merge", "--no-ff", "-m", "merge origin/main", "origin/main")
 	if len(pushRefs) > 0 {
@@ -403,6 +408,17 @@ func TestInspectContinueRange(t *testing.T) {
 			},
 			wantCommitCount:  1,
 			wantScratchPaths: []string{".scratch/gate-full.md"},
+		},
+		{
+			name: "nested scratch named dir is code",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				newHead = commitFixtureFiles(t, repo, map[string]string{"docs/.scratch/notes.md": "notes\n"}, "nested same-named dir")
+				return repo, startHead, newHead
+			},
+			wantCommitCount: 1,
+			wantDelivers:    true,
 		},
 		{
 			name: "no new commits",
@@ -693,8 +709,10 @@ func TestRun_ContinueModeScratchCommitsFailByPath(t *testing.T) {
 						for path, body := range tc.files {
 							writeFile(t, cwd, path, body)
 						}
+						// The commit below runs in a fresh clone without
+						// a global identity on CI; pass it inline.
 						gitRun(t, cwd, "add", "-f", "-A")
-						gitRun(t, cwd, "commit", "-q", "-m", "scratch commit")
+						gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "scratch commit")
 						gitRun(t, cwd, "push", "-q", "origin", "HEAD:refs/heads/continued/pr-12")
 					},
 				}},

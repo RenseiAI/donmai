@@ -473,6 +473,12 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 	const own = "https://github.com/acme/widgets/pull/7"
 	start := strings.Repeat("a", 40)
 	moved := strings.Repeat("b", 40)
+	// The stubbed re-reads below exercise only remote lookups: range
+	// inspection is stubbed to a delivering range so the cases never
+	// shell out to git in a directory that is not a checkout.
+	delivering := func(context.Context, string, string, string) (continueRangeInspection, error) {
+		return continueRangeInspection{commitCount: 1, hasCodeChange: true}, nil
+	}
 	refsAt := func(head string) pullRequestRefLookup {
 		return func(_ context.Context, _ string, refs ...string) (map[string]string, error) {
 			if len(refs) != 1 || refs[0] != "refs/pull/7/head" {
@@ -554,6 +560,7 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 			v := &sessionPullRequestVerifier{
 				repository: "acme/widgets", branch: tc.branch, worktreePath: t.TempDir(), accepted: tc.accepted,
 				startHead: tc.startHead, lastHead: tc.lastHead, lookup: lookup, draftLookup: tc.draft, headLookup: head,
+				inspectRange: delivering,
 			}
 			got, gotMoved, err := v.undelivered(context.Background())
 			if got != tc.want || gotMoved != tc.wantMoved {

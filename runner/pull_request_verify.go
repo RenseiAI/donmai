@@ -154,6 +154,11 @@ type sessionPullRequestVerifier struct {
 	lookup       pullRequestRefLookup
 	draftLookup  pullRequestDraftLookup
 	headLookup   pullRequestHeadLookup
+	// inspectRange classifies the commits in from..to for the delivery
+	// progress check. It defaults to inspectContinueRange; tests stub it
+	// so a re-read that only exercises remote lookups never shells out
+	// to git in a directory that is not a checkout.
+	inspectRange func(ctx context.Context, worktreePath, from, to string) (continueRangeInspection, error)
 	// startHead is, for a rework run that continues an existing pull
 	// request, that pull request's head when the run started, recorded
 	// before the agent's first turn (see reworkStartHead); "" for a session
@@ -179,8 +184,8 @@ func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWor
 	v := &sessionPullRequestVerifier{
 		branch: branch, worktreePath: worktreePath, startHead: startHead, lastHead: startHead,
 		lookup: r.pullRequestLookup, draftLookup: r.pullRequestDraftLookup,
-		headLookup: r.pullRequestHeadLookup,
-		outcomes:   map[string]candidateOutcome{},
+		headLookup: r.pullRequestHeadLookup, inspectRange: inspectContinueRange,
+		outcomes: map[string]candidateOutcome{},
 	}
 	if v.lookup == nil {
 		v.lookup = originRefs
@@ -409,6 +414,10 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		return "", false, nil
 	}
 	var errs []error
+	inspect := v.inspectRange
+	if inspect == nil {
+		inspect = inspectContinueRange
+	}
 	readProgress := func(head string, own bool) {
 		previous := v.lastHead
 		if head != "" {
@@ -417,7 +426,7 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		if !own || previous == "" || head == "" || head == previous {
 			return
 		}
-		inspection, inspectErr := inspectContinueRange(ctx, v.worktreePath, previous, head)
+		inspection, inspectErr := inspect(ctx, v.worktreePath, previous, head)
 		if inspectErr != nil {
 			errs = append(errs, fmt.Errorf("inspect continued pull request progress: %w", inspectErr))
 			return
@@ -440,7 +449,7 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		case !own:
 			return undeliveredNoNewCommit, moved, nil
 		default:
-			inspection, inspectErr := inspectContinueRange(ctx, v.worktreePath, v.startHead, head)
+			inspection, inspectErr := inspect(ctx, v.worktreePath, v.startHead, head)
 			if inspectErr != nil {
 				errs = append(errs, fmt.Errorf("inspect continued pull request delivery: %w", inspectErr))
 			} else if !inspection.delivers() {

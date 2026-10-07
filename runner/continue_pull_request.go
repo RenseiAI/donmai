@@ -215,7 +215,15 @@ func continueCommitPaths(ctx context.Context, worktreePath, commit string) ([]st
 }
 
 func isContinueScratchPath(path string) bool {
-	parts := strings.Split(strings.TrimSpace(path), "/")
+	return shouldExcludeFromBackstop(strings.TrimSpace(path)) && isTopLevelStatePath(strings.TrimSpace(path))
+}
+
+// isTopLevelStatePath reports whether path sits directly under a
+// checkout-resident state directory (see runtime/harnessstate): only the
+// first path component decides, so a nested directory that merely shares
+// the name stays ordinary project content.
+func isTopLevelStatePath(path string) bool {
+	parts := strings.Split(path, "/")
 	if len(parts) <= 1 {
 		return false
 	}

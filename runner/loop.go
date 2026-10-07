@@ -1716,8 +1716,13 @@ tailRecovery:
 				if continuedURL == "" {
 					continuedURL = continuePullRequestURL(gateCtx, qw, repositoryDeclaration, wpath)
 				}
+				headMoved := !strings.EqualFold(strings.TrimSpace(localHead), startHead) && strings.TrimSpace(localHead) != "" && strings.TrimSpace(startHead) != ""
 				draft, draftErr := lookup(gateCtx, wpath, continuedURL)
-				inspection, inspectErr := inspectContinueRange(gateCtx, wpath, startHead, localHead)
+				var inspection continueRangeInspection
+				var inspectErr error
+				if headMoved {
+					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, startHead, localHead)
+				}
 				switch {
 				case inspectErr != nil:
 					res.Status = "failed"
