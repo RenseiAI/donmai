@@ -110,6 +110,28 @@ const (
 	// Options.IdleTimeout disables the watchdog.
 	DefaultIdleTimeout = 12 * time.Minute
 
+	// DefaultProviderStallTimeout is the stalled-model-request window
+	// applied to the event stream when [Options.ProviderStallTimeout]
+	// is zero. Unlike DefaultIdleTimeout, it fires only while NO tool
+	// call is in flight: a tool result the agent has not answered with
+	// any response bytes or tokens within the window means the model
+	// request that should follow is stalled, not that a tool is slow.
+	// On expiry the runner stops the provider and surfaces the
+	// provider-stall signal so the caller can retry the turn through
+	// the provider-error path instead of ending the seat at the outer
+	// idle timeout. Three minutes sits between a slow model round trip
+	// and the twelve-minute outer backstop with margin for the bounded
+	// retries to complete before it. A NEGATIVE
+	// Options.ProviderStallTimeout disables the detector entirely.
+	DefaultProviderStallTimeout = 3 * time.Minute
+
+	// DefaultProviderStallRetries bounds the stop-and-retry attempts a
+	// stalled model request gets before the seat fails, applied when
+	// [Options.ProviderStallRetries] is zero. It is deliberately small:
+	// a provider that stalls repeatedly is not recovering between
+	// attempts, and the outer idle timeout still owns the seat.
+	DefaultProviderStallRetries = 2
+
 	// terminalResultPostTimeout bounds the detached cleanup context used for
 	// terminal result delivery after the run context has expired or been
 	// cancelled. Posting remains ahead of worktree teardown.
@@ -194,6 +216,29 @@ type Options struct {
 	// NEGATIVE disables the watchdog entirely (caller relies solely on
 	// MaxSessionDuration / external ctx for liveness).
 	IdleTimeout time.Duration
+
+	// ProviderStallTimeout is the stalled-model-request window applied
+	// to the event stream. A resettable timer is armed in consumeEvents
+	// alongside the idle watchdog and reset on every agent.Event; when
+	// it expires with no event in the window AND no tool call in flight
+	// the runner stops the provider and surfaces the provider-stall
+	// signal so the caller retries the turn through the provider-error
+	// path instead of ending the seat at the outer idle timeout — a
+	// hung model request after a tool result must not reach the
+	// twelve-minute backstop. A tool call in flight suppresses it
+	// (the tool's own bounded timeout owns that call).
+	//
+	// Zero falls back to DefaultProviderStallTimeout (detector ON by
+	// default). NEGATIVE disables the detector entirely (caller relies
+	// solely on the idle watchdog for liveness).
+	ProviderStallTimeout time.Duration
+
+	// ProviderStallRetries bounds the stop-and-retry attempts a stalled
+	// model request gets before the seat fails as FailureProviderError.
+	// Zero uses DefaultProviderStallRetries; negative disables the
+	// retries (a stall then behaves exactly like the idle watchdog
+	// cut-off it replaces).
+	ProviderStallRetries int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
 	// failed Run for debugging. Defaults to true in v0.5.0 per F.1.1
@@ -411,6 +456,8 @@ type Runner struct {
 	now                           func() time.Time
 	maxDuration                   time.Duration
 	idleTimeout                   time.Duration
+	providerStallTimeout          time.Duration
+	providerStallRetries          int
 	preserveOnFail                bool
 	preserveAlways                bool
 	skipBackstop                  bool
@@ -520,6 +567,8 @@ func New(opts Options) (*Runner, error) {
 		now:                              opts.Now,
 		maxDuration:                      opts.MaxSessionDuration,
 		idleTimeout:                      opts.IdleTimeout,
+		providerStallTimeout:             opts.ProviderStallTimeout,
+		providerStallRetries:             opts.ProviderStallRetries,
 		preserveOnFail:                   opts.PreserveWorktreeOnFailure,
 		preserveAlways:                   opts.PreserveWorktreeAlways,
 		skipBackstop:                     opts.SkipBackstop,
@@ -574,6 +623,12 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.idleTimeout == 0 {
 		r.idleTimeout = DefaultIdleTimeout
+	}
+	if r.providerStallTimeout == 0 {
+		r.providerStallTimeout = DefaultProviderStallTimeout
+	}
+	if r.providerStallRetries == 0 {
+		r.providerStallRetries = DefaultProviderStallRetries
 	}
 	return r, nil
 }

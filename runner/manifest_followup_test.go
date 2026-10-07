@@ -337,6 +337,10 @@ type scriptedSession struct {
 	continuationUndeliveredLimit int
 	// idleTimeout is Options.IdleTimeout (0 = default).
 	idleTimeout time.Duration
+	// providerStallTimeout is Options.ProviderStallTimeout (0 = default).
+	providerStallTimeout time.Duration
+	// providerStallRetries is Options.ProviderStallRetries (0 = default).
+	providerStallRetries int
 	// heartbeatInterval is Options.HeartbeatInterval (0 = default).
 	heartbeatInterval time.Duration
 	// declaration, when non-nil, provisions the session through the
@@ -395,6 +399,8 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.TurnContinuationCeiling = cfg.continuationCeiling
 		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
 		o.IdleTimeout = cfg.idleTimeout
+		o.ProviderStallTimeout = cfg.providerStallTimeout
+		o.ProviderStallRetries = cfg.providerStallRetries
 		o.HeartbeatInterval = cfg.heartbeatInterval
 	})
 	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
