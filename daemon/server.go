@@ -120,6 +120,9 @@ func (s *Server) startLocked() (<-chan error, error) {
 		return nil, fmt.Errorf("listen %q: %w", s.httpd.Addr, err)
 	}
 	s.addr = listener.Addr().String()
+	// Observe the daemon's own process priority now, off the request path, so
+	// the first /status does not pay for the probe.
+	warmProcessPriorityStatus()
 	// Publish the address that was really bound, before anything can be
 	// spawned against it. Every worker this daemon starts is told this value,
 	// and it is the only place the truth exists when the configured port is
@@ -350,6 +353,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		ProjectAdmissionMode:    cfg.EffectiveProjectAdmissionMode(),
 		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
 		SessionShim:             s.daemon.SessionShimDiagnostics(),
+		ProcessPriority:         daemonProcessPriorityStatus(),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)
@@ -848,6 +852,9 @@ func (s *Server) handleDoctor(w http.ResponseWriter, _ *http.Request) {
 		"heartbeat":       s.daemon.heartbeat != nil && s.daemon.heartbeat.IsRunning(),
 		"sessionShim":     s.daemon.SessionShimDiagnostics(),
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+	}
+	if priority := daemonProcessPriorityStatus(); priority != nil {
+		report["processPriority"] = priority
 	}
 	writeJSON(w, http.StatusOK, report)
 }

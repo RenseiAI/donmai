@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.donmai.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/af</string>
+    <string>host</string>
+    <string>run</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!--
+    Restart on crash; do NOT restart after a clean stop. The boolean form
+    (<true/>) respawned on any exit and turned a clean host stop into a
+    no-op against the running process. SuccessfulExit=false means respawn
+    only when the program exited unsuccessfully (crashes recover,
+    operator-initiated stops stick). Crashed=true makes the crash-respawn
+    half explicit rather than implied.
+  -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <!-- Throttle crash-restarts to once per 30 seconds. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!--
+    Durability keys (see the pinning tests in installer_test.go):
+
+    ExitTimeOut must cover the daemon's session drain. launchd's default
+    exit window SIGKILLs the whole job process group long before the
+    daemon's graceful drain (config default 600s, daemon config
+    drainTimeoutSeconds) can finish, killing hosted sessions mid-drain on
+    every restart/upgrade/plist reload. 630 = the 600s config-default
+    drain + 30s escalation margin.
+
+    AbandonProcessGroup orphans hosted session children instead of
+    SIGKILLing them with the job — the prerequisite for any
+    orphan-and-re-adopt supervision design.
+
+    LegacyTimers stops launchd timer coalescing from deferring
+    heartbeat/token-refresh timers on battery.
+  -->
+  <key>ExitTimeOut</key>
+  <integer>630</integer>
+
+  <key>AbandonProcessGroup</key>
+  <true/>
+
+  <key>LegacyTimers</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/o.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/e.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>{{HOME}}</string>
+    <key>PATH</key>
+    <string>{{HOME}}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

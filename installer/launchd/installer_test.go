@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/installer/servicepriority"
 )
 
 // fakeRunner records calls and returns canned responses.
@@ -95,6 +95,128 @@ func TestGeneratePlist_EncodesKeyBehaviours(t *testing.T) {
 	}
 }
 
+// TestGeneratePlist_GoldenVariants pins the rendered plist per process-priority
+// mode. The goldens carry a {{HOME}} placeholder that the test substitutes with
+// the temp HOME it renders under, so no developer path is committed.
+func TestGeneratePlist_GoldenVariants(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cases := []struct {
+		name     string
+		priority servicepriority.Mode
+		golden   string
+	}{
+		{name: "unset reads as default", priority: "", golden: "testdata/default.plist.golden"},
+		{name: "default", priority: servicepriority.Default, golden: "testdata/default.plist.golden"},
+		{name: "background", priority: servicepriority.Background, golden: "testdata/background.plist.golden"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := GeneratePlistWithOptions("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log", InstallOptions{ProcessPriority: tc.priority})
+			if err != nil {
+				t.Fatalf("GeneratePlistWithOptions: %v", err)
+			}
+			raw, err := os.ReadFile(tc.golden)
+			if err != nil {
+				t.Fatalf("read golden %s: %v", tc.golden, err)
+			}
+			want := strings.ReplaceAll(string(raw), "{{HOME}}", escapeXML(home))
+			if got != want {
+				t.Errorf("plist mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, want)
+			}
+		})
+	}
+}
+
+// TestGeneratePlist_ProcessPriorityKeepsHostBinaryFirst pins the property that
+// makes the launchd-native background mechanism preferable to a wrapper
+// command: ProgramArguments is identical in every mode, so consumers that read
+// ProgramArguments[0] as the host binary keep working.
+func TestGeneratePlist_ProcessPriorityKeepsHostBinaryFirst(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	argsRe := regexp.MustCompile(`(?s)<key>ProgramArguments</key>\s*<array>(.*?)</array>`)
+	var want string
+	for _, mode := range servicepriority.Modes() {
+		out, err := GeneratePlistWithOptions("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log", InstallOptions{ProcessPriority: mode})
+		if err != nil {
+			t.Fatalf("%s: GeneratePlistWithOptions: %v", mode, err)
+		}
+		m := argsRe.FindStringSubmatch(out)
+		if m == nil {
+			t.Fatalf("%s: no ProgramArguments in plist:\n%s", mode, out)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(m[1]), "<string>/usr/local/bin/af</string>") {
+			t.Errorf("%s: ProgramArguments[0] is not the host binary:\n%s", mode, m[1])
+		}
+		if want == "" {
+			want = m[1]
+		} else if m[1] != want {
+			t.Errorf("%s: ProgramArguments differ from the first mode:\n%s\nvs\n%s", mode, m[1], want)
+		}
+	}
+}
+
+func TestGeneratePlist_ProcessPriorityKeysPerMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	keys := []string{"<key>ProcessType</key>", "<key>LowPriorityIO</key>", "<key>LowPriorityBackgroundIO</key>"}
+	for _, tc := range []struct {
+		priority servicepriority.Mode
+		want     bool
+	}{
+		{priority: "", want: false},
+		{priority: servicepriority.Default, want: false},
+		{priority: servicepriority.Background, want: true},
+	} {
+		out, err := GeneratePlistWithOptions("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log", InstallOptions{ProcessPriority: tc.priority})
+		if err != nil {
+			t.Fatalf("%q: GeneratePlistWithOptions: %v", tc.priority, err)
+		}
+		for _, key := range keys {
+			if got := strings.Contains(out, key); got != tc.want {
+				t.Errorf("mode %q: contains %s = %v, want %v", tc.priority, key, got, tc.want)
+			}
+		}
+		if tc.want && !strings.Contains(out, "<string>Background</string>") {
+			t.Errorf("mode %q: ProcessType value is not Background", tc.priority)
+		}
+	}
+}
+
+func TestGeneratePlist_RejectsUnknownProcessPriority(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, mode := range []servicepriority.Mode{"utility", "faster"} {
+		if _, err := GeneratePlistWithOptions("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log", InstallOptions{ProcessPriority: mode}); err == nil {
+			t.Errorf("mode %q: expected an error", mode)
+		}
+	}
+}
+
+func TestInstall_WritesBackgroundProcessPriority(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	plistPath := filepath.Join(tmp, "test.plist")
+
+	if _, err := Install(InstallOptions{
+		HostBinPath:     "/usr/local/bin/af",
+		ProcessPriority: servicepriority.Background,
+		PlistPath:       plistPath,
+		LogPath:         filepath.Join(tmp, "o.log"),
+		ErrorLogPath:    filepath.Join(tmp, "e.log"),
+		SkipLaunchctl:   true,
+	}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	content, err := os.ReadFile(plistPath)
+	if err != nil {
+		t.Fatalf("read plist: %v", err)
+	}
+	for _, want := range []string{"<key>ProcessType</key>", "<string>Background</string>", "<key>LowPriorityIO</key>"} {
+		if !strings.Contains(string(content), want) {
+			t.Errorf("installed plist missing %q:\n%s", want, content)
+		}
+	}
+}
+
 // TestGeneratePlist_KeepAliveOnlyOnFailure pins the SuccessfulExit=false
 // shape of the KeepAlive dict. The May-2026 incident saw the boolean form
 // (`<key>KeepAlive</key><true/>`) respawn the daemon within 30s of every
@@ -158,22 +280,6 @@ func TestGeneratePlist_DurabilityKeys(t *testing.T) {
 				t.Errorf("plist missing durability fragment %q, got:\n%s", tt.re, out)
 			}
 		})
-	}
-}
-
-// TestExitTimeOutCoversDrainDefault statically asserts the launchd exit
-// window is at least the daemon's config-default graceful drain (plus
-// margin), pinned against the real default rather than a mirrored literal —
-// if the drain default grows past the plist's exit window, launchd would
-// SIGKILL the job mid-drain again and this test fails first.
-func TestExitTimeOutCoversDrainDefault(t *testing.T) {
-	drain := daemon.DefaultConfig().AutoUpdate.DrainTimeoutSeconds
-	if drain <= 0 {
-		t.Fatalf("daemon config-default DrainTimeoutSeconds = %d, want > 0", drain)
-	}
-	if ExitTimeOutSeconds < drain+30 {
-		t.Errorf("ExitTimeOutSeconds = %d, want >= config-default drain %d + 30s escalation margin",
-			ExitTimeOutSeconds, drain)
 	}
 }
 

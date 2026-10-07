@@ -230,6 +230,14 @@ sequence, and every quarantined capacity charge. The projection is deliberately
 secret-free: no paths, output bytes, prompts, host/controller ids, tokens,
 credentials, or opaque composing receipts are exposed.
 
+Both also carry an additive `processPriority` object (omitted by a daemon that
+predates it, and on an OS that cannot observe it): `mode` is what the running
+process observably has (`default` or `background`; `unknown` when the
+observation failed), `configuredMode` is the mode saved by the last explicit
+`host install --process-priority`, and `warning` says so when the two disagree,
+for example after a reinstall that has not restarted the daemon. The
+observation is taken once at start, off the request path, and cached.
+
 For an externally composed session-shim, the outbound
 `POST /api/workers/<id>/heartbeat` carries a separate authority-bound
 `sessionShim` projection. Alongside the stable host, controller, adoption

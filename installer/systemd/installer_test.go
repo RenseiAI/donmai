@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/installer/servicepriority"
 )
 
 // fakeRunner records calls and returns canned responses.
@@ -129,6 +131,104 @@ func TestGenerateUnitFile_CustomDescription(t *testing.T) {
 	}
 	if !strings.Contains(out, "Description=Test description") {
 		t.Errorf("expected custom description in unit file")
+	}
+}
+
+// priorityDirectiveKeys are every unit key the process-priority modes may set.
+var priorityDirectiveKeys = []string{"Nice=", "CPUSchedulingPolicy=", "IOSchedulingClass=", "IOSchedulingPriority="}
+
+func TestGenerateUnitFile_ProcessPriorityPerMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cases := []struct {
+		name     string
+		priority servicepriority.Mode
+		want     []string // directives that must appear, in [Service]
+	}{
+		{name: "unset reads as default", priority: ""},
+		{name: "default", priority: servicepriority.Default},
+		{
+			name:     "background",
+			priority: servicepriority.Background,
+			want:     []string{"Nice=19", "CPUSchedulingPolicy=idle", "IOSchedulingClass=idle"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{ProcessPriority: tc.priority})
+			if err != nil {
+				t.Fatalf("GenerateUnitFile: %v", err)
+			}
+			serviceStart := strings.Index(out, "[Service]")
+			installStart := strings.Index(out, "[Install]")
+			if serviceStart < 0 || installStart < serviceStart {
+				t.Fatalf("unit has no [Service] before [Install]:\n%s", out)
+			}
+			service := out[serviceStart:installStart]
+
+			for _, directive := range tc.want {
+				if !strings.Contains(service, "\n"+directive+"\n") {
+					t.Errorf("[Service] missing %q:\n%s", directive, service)
+				}
+			}
+			for _, key := range priorityDirectiveKeys {
+				if len(tc.want) == 0 && strings.Contains(out, key) {
+					t.Errorf("mode %q must not emit %s, got:\n%s", tc.priority, key, out)
+				}
+			}
+			// The service keeps its entrypoint in every mode.
+			if !strings.Contains(out, "ExecStart=/usr/local/bin/af host run\n") {
+				t.Errorf("ExecStart changed under mode %q:\n%s", tc.priority, out)
+			}
+		})
+	}
+}
+
+// TestGenerateUnitFile_DefaultPriorityIsByteIdentical pins that selecting the
+// default mode, explicitly or not, renders exactly the unit an install without
+// the feature always rendered.
+func TestGenerateUnitFile_DefaultPriorityIsByteIdentical(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	base, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{})
+	if err != nil {
+		t.Fatalf("GenerateUnitFile: %v", err)
+	}
+	got, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{ProcessPriority: servicepriority.Default})
+	if err != nil {
+		t.Fatalf("GenerateUnitFile(default): %v", err)
+	}
+	if got != base {
+		t.Errorf("default mode changed the unit:\n--- got ---\n%s\n--- want ---\n%s", got, base)
+	}
+}
+
+func TestGenerateUnitFile_RejectsUnknownProcessPriority(t *testing.T) {
+	for _, mode := range []servicepriority.Mode{"utility", "faster"} {
+		if _, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{ProcessPriority: mode}); err == nil {
+			t.Errorf("mode %q: expected an error", mode)
+		}
+	}
+}
+
+func TestInstall_WritesBackgroundProcessPriority(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	unitPath, err := Install(InstallOptions{
+		Scope:           ScopeUser,
+		BinPath:         "/usr/local/bin/af",
+		ProcessPriority: servicepriority.Background,
+		SkipSystemctl:   true,
+	})
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	for _, want := range []string{"Nice=19\n", "CPUSchedulingPolicy=idle\n", "IOSchedulingClass=idle\n"} {
+		if !strings.Contains(string(content), want) {
+			t.Errorf("installed unit missing %q:\n%s", want, content)
+		}
 	}
 }
 
