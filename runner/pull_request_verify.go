@@ -359,9 +359,16 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 // backstop then settle it as they always have. A URL whose pull request has
 // another head (for now) or does not exist does not count, and neither does
 // the accepted pull request: whether it finished the turn is judged from the
-// envelope and undelivered. A nil verifier reports none.
+// envelope and undelivered. A rework or continued run whose pull request is
+// accepted reports none: it delivers onto that pull request, so no other URL
+// the turn carried (a sibling quoted in review comments, one settle never
+// looked up because the accepted one came first) can be its result. A nil
+// verifier reports none.
 func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation) bool {
 	if v == nil || v.repository == "" {
+		return false
+	}
+	if v.startHead != "" && v.accepted != "" {
 		return false
 	}
 	for _, candidate := range turn.pullRequestCandidates {
