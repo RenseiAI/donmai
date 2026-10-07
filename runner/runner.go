@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -362,6 +363,14 @@ type Options struct {
 	// Zero uses DefaultDepsInstallTimeout; negative disables the
 	// step-side timeout (the caller owns ctx expiry).
 	DepsInstallTimeout time.Duration
+
+	// QuotaReporterForSession builds the per-session quota reporter
+	// that forwards the sparse quota updates the session's harness
+	// stream carries to the admitting daemon. The runner calls it
+	// once per Run with the session id and the resolved harness
+	// name ("codex" or "claude"); nil disables quota reporting
+	// and leaves every event stream untouched.
+	QuotaReporterForSession func(sessionID, harness string) *QuotaReporter
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -473,6 +482,16 @@ type Runner struct {
 	// manual clock so watchdog expiry is tripped explicitly instead of by
 	// sleeping past a wall-clock window. See Runner.idleTimer.
 	idleClock interviewClock
+
+	// quotaReporterForSession builds the per-session quota reporter
+	// (see Options.QuotaReporterForSession). Nil disables reporting.
+	quotaReporterForSession func(sessionID, harness string) *QuotaReporter
+	// quotaReporters holds the live per-session reporters, keyed by
+	// session id. A reporter is registered once per Run and released
+	// when the run ends, so the consecutive-update dedup sees every
+	// loop of the session (main stream, tails, interactive drain).
+	quotaReportersMu sync.Mutex
+	quotaReporters   map[string]*QuotaReporter
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -547,6 +566,8 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationLimit:            opts.TurnContinuationLimit,
 		turnContinuationCeiling:          opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
+		quotaReporterForSession:          opts.QuotaReporterForSession,
+		quotaReporters:                   map[string]*QuotaReporter{},
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

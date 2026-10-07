@@ -362,6 +362,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 	if err := p.client.Notify("initialized", map[string]any{}); err != nil {
 		return p.failStartLocked(fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err))
 	}
+	p.forwardRateLimitUpdates()
 	p.started = true
 	// Freeze the layer the child actually received. maps.Clone defends against
 	// a caller mutating its own Spec.Env map after the Spawn returns, which
@@ -873,6 +874,37 @@ func (p *Provider) registerHandle(h *Handle) {
 	p.handlesMu.Lock()
 	p.handles[h] = struct{}{}
 	p.handlesMu.Unlock()
+}
+
+// forwardRateLimitUpdates routes `account/rateLimits/updated`
+// notifications into every live handle's event stream. The
+// notification carries no thread id, so the client's fall-through
+// handler is the only place it surfaces; each handle maps it through
+// the shared probe mapper onto a UsageEvent carrying the sparse
+// update. Delivery is non-blocking and best-effort: a handle whose
+// queue is full drops the update rather than stalling the client's
+// read loop, and the next probe reconciles whatever was missed.
+func (p *Provider) forwardRateLimitUpdates() {
+	if p == nil || p.client == nil {
+		return
+	}
+	p.client.SubscribeGlobal(func(n notification) {
+		if n.Method != "account/rateLimits/updated" {
+			return
+		}
+		p.handlesMu.Lock()
+		live := make([]*Handle, 0, len(p.handles))
+		for h := range p.handles {
+			live = append(live, h)
+		}
+		p.handlesMu.Unlock()
+		for _, h := range live {
+			select {
+			case h.notifyCh <- n:
+			default:
+			}
+		}
+	})
 }
 
 func (p *Provider) unregisterHandle(h *Handle) {

@@ -707,6 +707,7 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 //
 //	GET  /api/daemon/sessions/<id>       → handleSessionDetail
 //	POST /api/daemon/sessions/<id>/stop  → handleSessionStop
+//	POST /api/daemon/sessions/<id>/usage → handleSessionUsage
 //
 // A single prefix handler is used because the stdlib mux only supports
 // prefix matching pre-Go 1.22 in this codebase. The path tail is parsed
@@ -716,6 +717,10 @@ func (s *Server) handleSessionSubroute(w http.ResponseWriter, r *http.Request) {
 	tail := strings.TrimPrefix(r.URL.Path, prefix)
 	if id, ok := strings.CutSuffix(tail, "/stop"); ok {
 		s.handleSessionStop(w, r, id)
+		return
+	}
+	if id, ok := strings.CutSuffix(tail, "/usage"); ok {
+		s.handleSessionUsage(w, r, id)
 		return
 	}
 	s.handleSessionDetail(w, r, tail)
