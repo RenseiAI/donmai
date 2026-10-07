@@ -650,6 +650,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// Drive the loop. loop.go owns the step sequence; the helpers
 	// here own the result envelope + post-Run teardown.
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
+	r.checkpointProviderError(qw, res)
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
 	// Never delete work that exists nowhere else. An interactive session has
 	// its own publication check below, which retains an unpublished workarea.

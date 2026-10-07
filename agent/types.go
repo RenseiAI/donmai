@@ -811,6 +811,30 @@ type Result struct {
 	// when the session stayed within its budget. Additive — old platforms
 	// ignore it.
 	BudgetBreach *BudgetBreach `json:"budgetBreach,omitempty"`
+
+	// Resumable reports whether a retry of this failed session loses no work:
+	// either the runner preserved the session's work on a dedicated resume
+	// target (ResumeCheckpoint), or the session left nothing of its own to
+	// preserve (no change, or verdict-only work that owes no commit). Today it
+	// is set on provider-error failures. False when the session's work could
+	// not be preserved. Additive — old platforms ignore it.
+	Resumable bool `json:"resumable,omitempty"`
+
+	// ResumeCheckpoint identifies the checkpoint a retryable failure preserved:
+	// the branch name and head commit the platform can resume from. Nil when no
+	// retry checkpoint was created, including when there was nothing to
+	// preserve. Additive — old platforms ignore it.
+	ResumeCheckpoint *ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
+}
+
+// ResumeCheckpoint identifies the branch + head commit a retryable session
+// failure was preserved on for a later resume.
+type ResumeCheckpoint struct {
+	// Branch is the public branch name carrying the checkpoint, e.g.
+	// "wip/<session-id>".
+	Branch string `json:"branch"`
+	// CommitSHA is the head commit on Branch.
+	CommitSHA string `json:"commitSha"`
 }
 
 // BudgetBreach is the budget cap a session ran into.

@@ -817,6 +817,13 @@ func (id gitIdentity) envOverrides() []string {
 // env either way), so the agent-session identity built by buildSessionEnv
 // never reached backstop commits. Now the identity is threaded explicitly.
 func runGit(ctx context.Context, cwd string, id gitIdentity, args ...string) (string, error) {
+	out, err := gitCommand(ctx, cwd, id, args...).CombinedOutput()
+	return strings.TrimRight(string(out), " \n\t"), err
+}
+
+// gitCommand builds the git subprocess runGit runs, so a caller that needs
+// more control (a WaitDelay) keeps the same environment.
+func gitCommand(ctx context.Context, cwd string, id gitIdentity, args ...string) *exec.Cmd {
 	//nolint:gosec // G204: args come from runner-controlled call sites.
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = cwd
@@ -832,8 +839,7 @@ func runGit(ctx context.Context, cwd string, id gitIdentity, args ...string) (st
 	// non-interactive vars, so the identity overrides remain the last identity
 	// entries and still win.
 	cmd.Env = gitexec.HardenedEnv(runtimeenv.FilterRunnerOnly(append(os.Environ(), id.envOverrides()...)), false, gitexec.Auth{})
-	out, err := cmd.CombinedOutput()
-	return strings.TrimRight(string(out), " \n\t"), err
+	return cmd
 }
 
 // captureHeadSHA returns the worktree's current HEAD commit sha via
