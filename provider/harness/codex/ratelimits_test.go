@@ -415,3 +415,169 @@ func TestSubscribeRateLimits_PartialUpdateMerges(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+// Only the app-server's own refusal is a login verdict. A read that never
+// reached it (no running harness, a cancelled or timed-out request, a
+// stopped client) carries none, so the daemon reports no check for it.
+func TestRateLimitsProbe_OnlyAnAppServerRefusalIsAnswered(t *testing.T) {
+	t.Parallel()
+	refusal := func(t *testing.T) (*Client, func()) {
+		t.Helper()
+		fake := newFakeStdio()
+		client := NewClient(fake.clientWriter, fake.serverReader)
+		go func() {
+			req := fake.readClientLine(t)
+			if req == nil {
+				return
+			}
+			id, _ := req["id"].(float64)
+			fake.writeServerLine(t, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      int(id),
+				"error":   map[string]any{"code": -32600, "message": "authentication required to read rate limits"},
+			})
+		}()
+		return client, func() { client.Stop(nil); fake.close() }
+	}
+	stopped := func(t *testing.T) (*Client, func()) {
+		t.Helper()
+		fake := newFakeStdio()
+		client := NewClient(fake.clientWriter, fake.serverReader)
+		go func() {
+			if fake.readClientLine(t) != nil {
+				client.Stop(nil)
+			}
+		}()
+		return client, func() { client.Stop(nil); fake.close() }
+	}
+	cancelled := func(t *testing.T) (*Client, func()) {
+		t.Helper()
+		fake := newFakeStdio()
+		client := NewClient(fake.clientWriter, fake.serverReader)
+		go func() { _ = fake.readClientLine(t) }()
+		return client, func() { client.Stop(nil); fake.close() }
+	}
+
+	tests := []struct {
+		name         string
+		client       func(t *testing.T) (*Client, func())
+		cancelFirst  bool
+		wantAnswered bool
+	}{
+		{name: "no running harness", client: nil, wantAnswered: false},
+		{name: "app-server refuses the read", client: refusal, wantAnswered: true},
+		{name: "client stopped mid-read", client: stopped, wantAnswered: false},
+		{name: "request cancelled before an answer", client: cancelled, cancelFirst: true, wantAnswered: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var client *Client
+			if tt.client != nil {
+				c, cleanup := tt.client(t)
+				t.Cleanup(cleanup)
+				client = c
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if tt.cancelFirst {
+				cancel()
+			}
+			probed := NewRateLimitsProbe().ReadProbe(ctx, client)
+			if probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableProbeFailed {
+				t.Fatalf("probe = %+v, want probeFailed", probed.Unavailable)
+			}
+			if probed.Unavailable.Answered != tt.wantAnswered {
+				t.Fatalf("Answered = %v, want %v (%s)", probed.Unavailable.Answered, tt.wantAnswered, probed.Unavailable.Message)
+			}
+		})
+	}
+}
+
+// Concurrent subscriptions must not race on the client's fall-through
+// handler (run with -race).
+func TestSubscribeRateLimits_ConcurrentSubscribe(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStdio()
+	defer fake.close()
+	client := NewClient(fake.clientWriter, fake.serverReader)
+	defer client.Stop(nil)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			SubscribeRateLimits(client, nil)()
+		}()
+	}
+	wg.Wait()
+}
+
+// Unsubscribing an earlier subscription must not drop a later one, and
+// the earlier one must stop delivering.
+func TestSubscribeRateLimits_UnsubscribeKeepsLaterSubscriber(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStdio()
+	defer fake.close()
+	client := NewClient(fake.clientWriter, fake.serverReader)
+	defer client.Stop(nil)
+	gotA := make(chan struct{}, 4)
+	gotB := make(chan struct{}, 4)
+	unsubA := SubscribeRateLimits(client, func(agent.UsageLimits) { gotA <- struct{}{} })
+	unsubB := SubscribeRateLimits(client, func(agent.UsageLimits) { gotB <- struct{}{} })
+	defer unsubB()
+	unsubA()
+	params, err := json.Marshal(rateLimitsUpdatedParams{RateLimits: &RateLimitSnapshot{Primary: &RateLimitWindow{UsedPercent: 5, WindowDurationMins: minsPtr(300)}}})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	fake.writeServerLine(t, map[string]any{"jsonrpc": "2.0", "method": "account/rateLimits/updated", "params": json.RawMessage(params)})
+	select {
+	case <-gotB:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unsubscribing the earlier subscription dropped the later one")
+	}
+	select {
+	case <-gotA:
+		t.Fatal("an unsubscribed subscription still delivered")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A partial notification that omits planType keeps the plan an earlier
+// notification named: a free-plan window stays monthly.
+func TestSubscribeRateLimits_PartialNotificationKeepsPlan(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStdio()
+	defer fake.close()
+	client := NewClient(fake.clientWriter, fake.serverReader)
+	defer client.Stop(nil)
+	updates := make(chan agent.UsageLimits, 4)
+	unsub := SubscribeRateLimits(client, func(l agent.UsageLimits) { updates <- l })
+	defer unsub()
+	emit := func(s *RateLimitSnapshot) {
+		t.Helper()
+		params, err := json.Marshal(rateLimitsUpdatedParams{RateLimits: s})
+		if err != nil {
+			t.Fatalf("marshal params: %v", err)
+		}
+		fake.writeServerLine(t, map[string]any{"jsonrpc": "2.0", "method": "account/rateLimits/updated", "params": json.RawMessage(params)})
+	}
+	wait := func() agent.UsageLimits {
+		t.Helper()
+		select {
+		case l := <-updates:
+			return l
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for a quota update")
+		}
+		return agent.UsageLimits{}
+	}
+	emit(&RateLimitSnapshot{PlanType: strPtr("free"), Primary: &RateLimitWindow{UsedPercent: 80}})
+	_ = wait()
+	emit(&RateLimitSnapshot{Primary: &RateLimitWindow{UsedPercent: 85}})
+	got := wait()
+	if len(got.Windows) != 1 || got.Windows[0].Kind != agent.UsageWindowMonthly || got.Windows[0].UsedPercent != 85 {
+		t.Fatalf("windows = %+v, want the monthly window at 85", got.Windows)
+	}
+}

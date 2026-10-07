@@ -140,6 +140,9 @@ type Client struct {
 	threadSubs map[string]notificationHandler
 	// global is fired for notifications without a threadId.
 	global notificationHandler
+	// globalGen counts installations of global, so a wrapGlobal restore
+	// only reinstalls the handler it wrapped while it is still the newest.
+	globalGen uint64
 	// onClose fires once when the read loop exits. It is the
 	// Provider's hook to mark every live Handle as failed.
 	onClose func(error)
@@ -200,7 +203,31 @@ func (c *Client) Unsubscribe(threadID string) {
 func (c *Client) SubscribeGlobal(h notificationHandler) {
 	c.subsMu.Lock()
 	c.global = h
+	c.globalGen++
 	c.subsMu.Unlock()
+}
+
+// wrapGlobal installs the fall-through handler wrap builds around the
+// current one, reading and replacing it under the subscription lock. The
+// returned restore reinstalls the wrapped handler only while this
+// installation is still the newest; once a later caller has replaced or
+// wrapped it, restore leaves the newer handler in place, so a wrapper must
+// also stop acting on its own when it is torn down.
+func (c *Client) wrapGlobal(wrap func(prev notificationHandler) notificationHandler) (restore func()) {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	prev := c.global
+	c.global = wrap(prev)
+	c.globalGen++
+	gen := c.globalGen
+	return func() {
+		c.subsMu.Lock()
+		defer c.subsMu.Unlock()
+		if c.globalGen == gen {
+			c.global = prev
+			c.globalGen++
+		}
+	}
 }
 
 // Request sends a JSON-RPC request and waits for the matching response.

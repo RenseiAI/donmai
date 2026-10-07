@@ -84,7 +84,9 @@ func copyAuthCheck(check *agent.UsageAuthCheck) *agent.UsageAuthCheck {
 // noteCodexProbe records one codex quota probe outcome: a failed probe
 // keeps the last good windows, an unsupported reading clears them, and
 // a successful probe replaces the published windows outright. Either
-// way the probe is a login check, stamped with the probe time.
+// way the probe is a login check, stamped with the probe time. Every
+// attempt advances the probe clock, so retries stay inside the
+// 5-minute cadence even when the read fails.
 func (q *quotaState) noteCodexProbe(accountID, plan string, probed agent.UsageLimits, at time.Time) {
 	if q == nil {
 		return
@@ -92,15 +94,15 @@ func (q *quotaState) noteCodexProbe(accountID, plan string, probed agent.UsageLi
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.codex = agent.ResolveUsageLimitsAfterProbe(q.codex, &probed)
+	q.codexAt = at
 	if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessCodex, &probed, at); check != nil {
 		q.codexAuth = check
 	}
 	// Resolve keeps the previous pointer on a failed probe; only stamp
-	// identity and time when the probe produced a live snapshot.
+	// identity when the probe produced a live snapshot.
 	if q.codex != nil && q.codex.Unavailable == nil {
 		q.codexID = accountID
 		q.codexPlan = plan
-		q.codexAt = at
 	}
 }
 
@@ -113,12 +115,12 @@ func (q *quotaState) noteClaudeProbe(accountID string, probed agent.UsageLimits,
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.claude = agent.ResolveUsageLimitsAfterProbe(q.claude, &probed)
+	q.claudeAt = at
 	if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessClaude, &probed, at); check != nil {
 		q.claudeAuth = check
 	}
 	if q.claude != nil && q.claude.Unavailable == nil {
 		q.claudeID = accountID
-		q.claudeAt = at
 	}
 }
 

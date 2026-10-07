@@ -13,7 +13,9 @@ func TestUsageAuthCheckAfterProbe(t *testing.T) {
 	at := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	live := MakeUsageLimits(ISOTime(at), []UsageWindow{usageTestWeekly()})
 	empty := MakeUsageLimits(ISOTime(at), nil)
-	failed := MakeUnavailableUsageLimits(ISOTime(at), UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	refused := MakeUnavailableUsageLimits(ISOTime(at), UsageUnavailableProbeFailed, "Codex could not read usage (JSON-RPC -32600).")
+	refused.Unavailable.Answered = true
+	unreached := MakeUnavailableUsageLimits(ISOTime(at), UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	unsupported := MakeUnavailableUsageLimits(ISOTime(at), UsageUnavailableUnsupported, "")
 
 	tests := []struct {
@@ -38,11 +40,18 @@ func TestUsageAuthCheckAfterProbe(t *testing.T) {
 			want:    &UsageAuthCheck{Harness: "claude", OK: true, CheckedAt: "2026-10-06T12:00:00Z"},
 		},
 		{
-			name:    "failed probe is a failed check",
+			name:    "read the provider answered with a refusal is a failed check",
 			harness: UsageHarnessCodex,
-			probed:  &failed,
+			probed:  &refused,
 			at:      at,
 			want:    &UsageAuthCheck{Harness: "codex", OK: false, CheckedAt: "2026-10-06T12:00:00Z"},
+		},
+		{
+			name:    "read that never reached the provider reports no check",
+			harness: UsageHarnessCodex,
+			probed:  &unreached,
+			at:      at,
+			want:    nil,
 		},
 		{
 			name:    "account with no subscription windows is not a verified login",

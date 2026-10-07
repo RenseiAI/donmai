@@ -1299,7 +1299,7 @@ func TestHeartbeatRequestBody_QuotaAuthCheckGolden(t *testing.T) {
 			getQuota: func() []agent.UsageAccount {
 				q := &quotaState{}
 				q.noteClaudeProbe("opaque-account-2", good(base), base)
-				q.noteClaudeProbe("opaque-account-2", agent.MakeUnavailableUsageLimits(agent.ISOTime(later), agent.UsageUnavailableProbeFailed, ""), later)
+				q.noteClaudeProbe("opaque-account-2", quotaTestRefusedProbe(later), later)
 				return (&Daemon{quota: q}).quotaSnapshot()
 			},
 			want: `[{"id":"opaque-account-2","provider":"claude",` +

@@ -4,6 +4,7 @@ package agent
 // upstream provider usage-limits suite (see LICENSE-t3code).
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -200,5 +201,20 @@ func TestUsageEvent_RoundTrip(t *testing.T) {
 	}
 	if ev.Usage == nil || len(ev.Usage.Windows) != 1 || ev.Usage.Windows[0].ID != "seven_day" {
 		t.Fatalf("decoded usage = %+v, want the seven_day window", ev.Usage)
+	}
+}
+
+// An answered read with no windows serializes limits.windows as an empty
+// array, never null: consumers read it as an array.
+func TestMakeUsageLimits_EmptyWindowsSerializeAsArray(t *testing.T) {
+	t.Parallel()
+	for _, in := range [][]UsageWindow{nil, {}} {
+		raw, err := json.Marshal(MakeUsageLimits(usageTestCheckedAt(), in))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if want := `{"checkedAt":"` + usageTestCheckedAt() + `","windows":[]}`; string(raw) != want {
+			t.Fatalf("limits JSON = %s, want %s", raw, want)
+		}
 	}
 }

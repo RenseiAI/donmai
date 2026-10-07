@@ -20,6 +20,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -353,7 +354,10 @@ func (p *RateLimitsProbe) LastFire() time.Time {
 
 // ReadProbe performs one quota read against the app-server client. A
 // nil client (the harness is not running) is a failed probe, never an
-// error: the last good windows stay published.
+// error: the last good windows stay published. Only a JSON-RPC error
+// (the app-server answered and refused the read) marks the failure as
+// answered; a nil client, a timeout, an exit or an unreadable reply
+// never reached the account and carries no login verdict.
 func (p *RateLimitsProbe) ReadProbe(ctx context.Context, client *Client) agent.UsageLimits {
 	now := time.Now()
 	if p != nil && p.now != nil {
@@ -370,7 +374,9 @@ func (p *RateLimitsProbe) ReadProbe(ctx context.Context, client *Client) agent.U
 	defer cancel()
 	raw, err := client.Request(reqCtx, "account/rateLimits/read", nil, RateLimitsProbeTimeout)
 	if err != nil {
-		return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
+		out := agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
+		out.Unavailable.Answered = answeredByAppServer(client, err)
+		return out
 	}
 	var resp rateLimitsReadResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -379,11 +385,33 @@ func (p *RateLimitsProbe) ReadProbe(ctx context.Context, client *Client) agent.U
 	return RateLimitsToLimits(resp.RateLimits, resp.RateLimitsByLimitID, resp.ResetCredits, checkedAt)
 }
 
+// answeredByAppServer reports whether a failed read was the app-server's
+// own JSON-RPC refusal. A stopped client fails its pending requests with
+// a synthesized JSON-RPC error, so a closed client never counts as an
+// answer.
+func answeredByAppServer(client *Client, err error) bool {
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	select {
+	case <-client.Done():
+		return false
+	default:
+		return true
+	}
+}
+
 // SubscribeRateLimits routes `account/rateLimits/updated` notifications
 // into the shared snapshot: the notification merges field by field onto
 // the last snapshot, then folds onto the published limits as a sparse
 // update. onUpdate receives the merged limits whenever the notification
 // carries a main-allowance window.
+//
+// The subscription chains onto the client's fall-through handler under
+// the client's subscription lock, so concurrent subscriptions are safe.
+// unsubscribe stops this subscription's delivery without dropping a
+// subscription installed after it.
 func SubscribeRateLimits(client *Client, onUpdate func(agent.UsageLimits)) (unsubscribe func()) {
 	if client == nil {
 		return func() {}
@@ -391,32 +419,45 @@ func SubscribeRateLimits(client *Client, onUpdate func(agent.UsageLimits)) (unsu
 	var mu sync.Mutex
 	var last *RateLimitSnapshot
 	var published *agent.UsageLimits
-	prev := client.global
-	client.SubscribeGlobal(func(n notification) {
-		if prev != nil {
-			prev(n)
-		}
-		if n.Method != "account/rateLimits/updated" {
-			return
-		}
-		var params rateLimitsUpdatedParams
-		if err := json.Unmarshal(n.Params, &params); err != nil || params.RateLimits == nil {
-			return
-		}
-		mu.Lock()
-		last = MergeRateLimits(last, params.RateLimits)
-		checkedAt := agent.ISOTime(time.Now())
-		update := RateLimitsToUpdate(params.RateLimits, checkedAt)
-		if update == nil {
+	var active atomic.Bool
+	active.Store(true)
+	restore := client.wrapGlobal(func(prev notificationHandler) notificationHandler {
+		return func(n notification) {
+			if prev != nil {
+				prev(n)
+			}
+			if !active.Load() || n.Method != "account/rateLimits/updated" {
+				return
+			}
+			var params rateLimitsUpdatedParams
+			if err := json.Unmarshal(n.Params, &params); err != nil || params.RateLimits == nil {
+				return
+			}
+			mu.Lock()
+			last = MergeRateLimits(last, params.RateLimits)
+			// Classify the windows this notification names against the
+			// merged plan: a partial notification that omits planType must
+			// not turn a monthly allowance into a five-hour session.
+			named := *params.RateLimits
+			if named.PlanType == nil && last != nil {
+				named.PlanType = last.PlanType
+			}
+			checkedAt := agent.ISOTime(time.Now())
+			update := RateLimitsToUpdate(&named, checkedAt)
+			if update == nil {
+				mu.Unlock()
+				return
+			}
+			next := agent.ApplyUsageLimitsUpdate(published, *update, checkedAt)
+			published = next
 			mu.Unlock()
-			return
-		}
-		next := agent.ApplyUsageLimitsUpdate(published, *update, checkedAt)
-		published = next
-		mu.Unlock()
-		if onUpdate != nil && next != nil {
-			onUpdate(*next)
+			if onUpdate != nil && next != nil {
+				onUpdate(*next)
+			}
 		}
 	})
-	return func() { client.SubscribeGlobal(prev) }
+	return func() {
+		active.Store(false)
+		restore()
+	}
 }

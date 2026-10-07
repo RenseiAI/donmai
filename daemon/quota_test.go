@@ -15,6 +15,14 @@ func quotaTestWindows() []agent.UsageWindow {
 	}
 }
 
+// quotaTestRefusedProbe is a failed read the provider answered (for
+// example a JSON-RPC refusal): a real login verdict.
+func quotaTestRefusedProbe(at time.Time) agent.UsageLimits {
+	out := agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex could not read usage (JSON-RPC -32600).")
+	out.Unavailable.Answered = true
+	return out
+}
+
 func TestQuotaState_ProbeDueFiveMinutes(t *testing.T) {
 	t.Parallel()
 	q := &quotaState{}
@@ -28,6 +36,33 @@ func TestQuotaState_ProbeDueFiveMinutes(t *testing.T) {
 	}
 	if !q.codexProbeDue(base.Add(5 * time.Minute)) {
 		t.Error("codex probe at the interval must be due")
+	}
+}
+
+// A failed probe advances the probe clock like a successful one: the
+// next read stays on the 5-minute cadence instead of firing again
+// immediately, while the last good windows stay published.
+func TestQuotaState_FailedProbeAdvancesProbeClock(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	attempt := base.Add(time.Minute)
+	failed := agent.MakeUnavailableUsageLimits(agent.ISOTime(attempt), agent.UsageUnavailableProbeFailed, "unreachable")
+	for name, note := range map[string]func(q *quotaState){
+		"codex":  func(q *quotaState) { q.noteCodexProbe("opaque-1", "promax", failed, attempt) },
+		"claude": func(q *quotaState) { q.noteClaudeProbe("opaque-2", failed, attempt) },
+	} {
+		q := &quotaState{}
+		note(q)
+		due := q.codexProbeDue
+		if name == "claude" {
+			due = q.claudeProbeDue
+		}
+		if due(attempt.Add(4 * time.Minute)) {
+			t.Errorf("%s probe inside the interval after a failed attempt must not be due", name)
+		}
+		if !due(attempt.Add(5 * time.Minute)) {
+			t.Errorf("%s probe at the interval after a failed attempt must be due", name)
+		}
 	}
 }
 
@@ -114,7 +149,8 @@ func TestQuotaState_AuthCheck(t *testing.T) {
 	good := func(at time.Time) agent.UsageLimits {
 		return agent.MakeUsageLimits(agent.ISOTime(at), quotaTestWindows())
 	}
-	failed := func(at time.Time) agent.UsageLimits {
+	failed := quotaTestRefusedProbe
+	unreached := func(at time.Time) agent.UsageLimits {
 		return agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
 	update := func(at time.Time) agent.UsageLimitsUpdate {
@@ -175,6 +211,22 @@ func TestQuotaState_AuthCheck(t *testing.T) {
 			},
 		},
 		{
+			name: "read that never reached the provider keeps the previous verdict",
+			run: func(q *quotaState) {
+				q.noteCodexProbe("opaque-1", "promax", good(base), base)
+				q.noteCodexProbe("opaque-1", "promax", unreached(later), later)
+			},
+			want: map[string]*agent.UsageAuthCheck{"codex": check("codex", true, base)},
+		},
+		{
+			name: "read that never reached the provider records no first verdict",
+			run: func(q *quotaState) {
+				q.noteClaudeUpdate(update(base), base)
+				q.noteClaudeProbe("opaque-2", unreached(later), later)
+			},
+			want: map[string]*agent.UsageAuthCheck{"claude": nil},
+		},
+		{
 			name: "turn update never refreshes the verdict",
 			run: func(q *quotaState) {
 				q.noteCodexProbe("opaque-1", "promax", good(base), base)
@@ -230,7 +282,7 @@ func TestQuotaState_FailedProbeKeepsWindowsButReportsNotOK(t *testing.T) {
 	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	later := base.Add(time.Minute)
 	q.noteCodexProbe("opaque-1", "promax", agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows()), base)
-	q.noteCodexProbe("opaque-1", "promax", agent.MakeUnavailableUsageLimits(agent.ISOTime(later), agent.UsageUnavailableProbeFailed, ""), later)
+	q.noteCodexProbe("opaque-1", "promax", quotaTestRefusedProbe(later), later)
 	got := q.snapshot()
 	if len(got) != 1 {
 		t.Fatalf("snapshot = %+v, want one account", got)

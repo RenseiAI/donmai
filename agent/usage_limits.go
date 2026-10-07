@@ -90,6 +90,12 @@ const (
 type UsageUnavailable struct {
 	Reason  UnavailableReason `json:"reason"`
 	Message string            `json:"message,omitempty"`
+	// Answered is true when the provider itself answered the read and
+	// refused it (for example a JSON-RPC error from the app-server). A
+	// read that never reached the provider (no running harness, a
+	// timeout, the process exiting, an unreadable reply) leaves it false:
+	// such a failure says nothing about the login. Never on the wire.
+	Answered bool `json:"-"`
 }
 
 // UsageLimits is the subscription usage a provider knows about the
@@ -158,13 +164,18 @@ type UsageAuthCheck struct {
 
 // UsageAuthCheckAfterProbe derives the login-check outcome a quota probe
 // implies. The probe reads quota windows through the signed-in account,
-// so a read that produced windows proves the login is valid; a read that
-// failed, or that found an account with no subscription windows to
-// report, does not. at is when the probe ran. It returns nil when there
-// is no probe outcome or no probe time, so a check that never ran is
-// never reported.
+// so a read the provider answered with windows proves the login is
+// valid; a read the provider answered with a refusal, or that found an
+// account with no subscription windows to report, does not. at is when
+// the probe ran. It returns nil when there is no probe outcome, no probe
+// time, or the read never reached the provider (Unavailable.Answered is
+// false on a failed probe): a check that never ran is never reported,
+// so the previous verdict keeps its own checkedAt and ages out.
 func UsageAuthCheckAfterProbe(harness string, probed *UsageLimits, at time.Time) *UsageAuthCheck {
 	if probed == nil || at.IsZero() {
+		return nil
+	}
+	if u := probed.Unavailable; u != nil && u.Reason == UsageUnavailableProbeFailed && !u.Answered {
 		return nil
 	}
 	return &UsageAuthCheck{
@@ -190,9 +201,11 @@ func ClampPercent(value float64) float64 {
 }
 
 // SortUsageWindows orders windows by kind (session, weekly, monthly,
-// other) then by ID.
+// other) then by ID. The result is never nil, so an answered read with
+// no windows serializes as an empty array rather than null.
 func SortUsageWindows(windows []UsageWindow) []UsageWindow {
-	out := append([]UsageWindow(nil), windows...)
+	out := make([]UsageWindow, len(windows))
+	copy(out, windows)
 	sort.Slice(out, func(i, j int) bool {
 		if oi, oj := usageWindowKindOrder(out[i].Kind), usageWindowKindOrder(out[j].Kind); oi != oj {
 			return oi < oj
