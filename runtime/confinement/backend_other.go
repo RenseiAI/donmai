@@ -1,9 +1,10 @@
-//go:build !darwin
+//go:build !darwin && !linux
 
 package confinement
 
 // DefaultBackend returns the confinement backend for the running OS. No
 // backend exists here yet, so every Prepare refuses with backend_absent.
+// (Linux carries its own backend in backend_linux.go.)
 func DefaultBackend() Backend { return nil }
 
 // ResolverSockets returns the OS resolver sockets a harness that needs name
