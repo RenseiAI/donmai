@@ -1364,15 +1364,76 @@ func TestWriteDaemonStatusTable(t *testing.T) {
 	t.Parallel()
 
 	r := fixtureStatusResp()
+	r.ProcessPriority = &afclient.DaemonProcessPriorityStatus{Mode: "background", ConfiguredMode: "background", Evidence: "ps PRI=4"}
 	var buf bytes.Buffer
 	if err := writeDaemonStatusTable(&buf, r); err != nil {
 		t.Fatalf("writeDaemonStatusTable: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed"} {
+	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed", "Process priority:", "background"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q; got:\n%s", want, out)
 		}
+	}
+	// The row names the mode, never the scheduler's raw value.
+	for _, banned := range []string{"PRI", "ps "} {
+		if strings.Contains(out, banned) {
+			t.Errorf("table leaks the raw observation %q; got:\n%s", banned, out)
+		}
+	}
+}
+
+// TestWriteDaemonStatusTable_OlderDaemon pins that a daemon predating the
+// processPriority field reads as "not reported" rather than "unsupported".
+func TestWriteDaemonStatusTable_OlderDaemon(t *testing.T) {
+	t.Parallel()
+
+	var r afclient.DaemonStatusResponse
+	if err := json.Unmarshal([]byte(`{"status":"ready","version":"0.0.1","machineId":"old","pid":1}`), &r); err != nil {
+		t.Fatalf("decode older daemon status: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := writeDaemonStatusTable(&buf, &r); err != nil {
+		t.Fatalf("writeDaemonStatusTable: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Process priority:") || !strings.Contains(out, "not reported") {
+		t.Errorf("older daemon must show the row as not reported; got:\n%s", out)
+	}
+	if strings.Contains(out, "unsupported") {
+		t.Errorf("older daemon must not read as unsupported; got:\n%s", out)
+	}
+}
+
+func TestFormatProcessPriorityStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status *afclient.DaemonProcessPriorityStatus
+		want   string
+	}{
+		{name: "daemon does not report it", status: nil, want: "not reported"},
+		{name: "empty mode", status: &afclient.DaemonProcessPriorityStatus{}, want: "not reported"},
+		{name: "default", status: &afclient.DaemonProcessPriorityStatus{Mode: "default", Evidence: "ps PRI=20"}, want: "default"},
+		{name: "background", status: &afclient.DaemonProcessPriorityStatus{Mode: "background", Evidence: "ps PRI=4"}, want: "background"},
+		{
+			name:   "installed setting not applied yet",
+			status: &afclient.DaemonProcessPriorityStatus{Mode: "default", ConfiguredMode: "background", Warning: "installed setting is background but the running daemon is default; restart the daemon to apply it"},
+			want:   "default — installed setting is background but the running daemon is default; restart the daemon to apply it",
+		},
+		{
+			name:   "observation failed",
+			status: &afclient.DaemonProcessPriorityStatus{Mode: "unknown", Warning: "could not read the live process priority: boom"},
+			want:   "unknown — could not read the live process priority: boom",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatProcessPriorityStatus(tc.status); got != tc.want {
+				t.Errorf("formatProcessPriorityStatus() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

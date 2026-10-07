@@ -11,11 +11,13 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/installer/servicepriority"
 )
 
 func mustStartDaemon(t *testing.T) (*Daemon, *Server, func()) {
@@ -141,6 +143,13 @@ func TestServer_Status(t *testing.T) {
 	}
 	if resp.SessionShim.OwnershipMode != afclient.DaemonSessionShimDisabled || !resp.SessionShim.AdoptionComplete || resp.SessionShim.OccupiedSlots != 0 {
 		t.Errorf("default sessionShim status = %+v, want disabled/complete/empty", resp.SessionShim)
+	}
+	if processPriorityObservable() {
+		if resp.ProcessPriority == nil || resp.ProcessPriority.Mode == "" {
+			t.Errorf("ProcessPriority = %+v, want an observed mode", resp.ProcessPriority)
+		}
+	} else if resp.ProcessPriority != nil {
+		t.Errorf("ProcessPriority = %+v, want it omitted where the mode cannot be observed", resp.ProcessPriority)
 	}
 	if len(resp.EnabledProjectIDs) != 1 || resp.EnabledProjectIDs[0] != "demo" {
 		t.Errorf("EnabledProjectIDs = %v, want [demo]", resp.EnabledProjectIDs)
@@ -395,6 +404,46 @@ func TestServer_Doctor_Endpoint(t *testing.T) {
 	}
 	if loaded, _ := resp["configLoaded"].(bool); !loaded {
 		t.Errorf("expected configLoaded=true")
+	}
+	priority, ok := resp["processPriority"].(map[string]any)
+	switch {
+	case processPriorityObservable() && !ok:
+		t.Fatalf("doctor processPriority = %#v, want object", resp["processPriority"])
+	case processPriorityObservable():
+		if mode, _ := priority["mode"].(string); mode == "" {
+			t.Fatalf("doctor processPriority has no mode: %#v", priority)
+		}
+	case ok:
+		t.Fatalf("doctor processPriority = %#v, want it omitted where the mode cannot be observed", priority)
+	}
+}
+
+// processPriorityObservable reports whether this OS can observe its own
+// process priority, i.e. whether /status carries the field.
+func processPriorityObservable() bool {
+	return runtime.GOOS == "darwin" || runtime.GOOS == "linux"
+}
+
+// TestServer_Status_ReportsSavedProcessPriority pins that /status reports the
+// mode saved by the last explicit install next to the observed one.
+func TestServer_Status_ReportsSavedProcessPriority(t *testing.T) {
+	if !processPriorityObservable() {
+		t.Skip("process priority is not observable on " + runtime.GOOS)
+	}
+	t.Setenv("HOME", t.TempDir())
+	if err := servicepriority.Save(servicepriority.Background); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	var status afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &status)
+	if status.ProcessPriority == nil {
+		t.Fatal("ProcessPriority = nil, want an observed mode")
+	}
+	if status.ProcessPriority.ConfiguredMode != "background" {
+		t.Errorf("ConfiguredMode = %q, want background", status.ProcessPriority.ConfiguredMode)
 	}
 }
 

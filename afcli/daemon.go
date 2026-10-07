@@ -172,7 +172,7 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 			"  and LowPriorityIO on macOS; systemd Nice=19, CPUSchedulingPolicy=idle and\n" +
 			"  IOSchedulingClass=idle on Linux). --process-priority default restores the\n" +
 			"  normal priority. The mode is saved, so a later install without the flag keeps\n" +
-			"  it.",
+			"  it; `host status` shows the mode the running daemon actually has.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			scope := installer.ScopeUser
@@ -427,6 +427,7 @@ func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error
 		{"Uptime:", uptime},
 		{"Sessions:", fmt.Sprintf("%d / %d", r.ActiveSessions, r.MaxSessions)},
 		{"Projects:", formatStatusProjectIDs(r)},
+		{"Process priority:", formatProcessPriorityStatus(r.ProcessPriority)},
 		{"Timestamp:", r.Timestamp},
 	}
 	for _, row := range rows {
@@ -446,6 +447,20 @@ func formatStatusProjectIDs(r *afclient.DaemonStatusResponse) string {
 		value += fmt.Sprintf(" (desired: %s)", strings.Join(r.EnabledProjectIDs, ", "))
 	}
 	return value
+}
+
+// formatProcessPriorityStatus renders the daemon's process priority for the
+// status table: the mode name, plus the daemon's note when the observation
+// failed or the running mode differs from the installed one. A daemon that does
+// not report the field, such as one older than it, reads as "not reported".
+func formatProcessPriorityStatus(status *afclient.DaemonProcessPriorityStatus) string {
+	if status == nil || strings.TrimSpace(status.Mode) == "" {
+		return "not reported"
+	}
+	if status.Warning != "" {
+		return status.Mode + " — " + status.Warning
+	}
+	return status.Mode
 }
 
 // formatInstalledProcessPriority is the install report line for the mode that

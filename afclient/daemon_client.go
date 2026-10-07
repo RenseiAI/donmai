@@ -91,8 +91,32 @@ type DaemonStatusResponse struct {
 	// always present, including mode=disabled, so status and doctor never require
 	// callers to infer whether omission means unsupported or empty.
 	SessionShim DaemonSessionShimStatus `json:"sessionShim"`
+	// ProcessPriority is the daemon's self-observed process-priority mode. It
+	// is nil when the daemon does not report it: a daemon older than this
+	// field, or an OS where the mode cannot be observed.
+	ProcessPriority *DaemonProcessPriorityStatus `json:"processPriority,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
+}
+
+// DaemonProcessPriorityStatus is the daemon's self-observed process-priority
+// state. It is additive and secret-free so status/doctor readers can show
+// whether the running daemon is demoted, and whether that matches what was
+// installed.
+type DaemonProcessPriorityStatus struct {
+	// Mode is the effective mode, derived from what the running process
+	// observably has rather than from what was configured: "default",
+	// "background", or "unknown" when the observation failed (see Warning).
+	Mode string `json:"mode"`
+	// ConfiguredMode is the mode saved by the last explicit install. Empty when
+	// none was saved.
+	ConfiguredMode string `json:"configuredMode,omitempty"`
+	// Evidence is the raw observation behind Mode, for example "ps PRI=4" on
+	// macOS or "SCHED_IDLE, nice 19" on Linux.
+	Evidence string `json:"evidence,omitempty"`
+	// Warning is a bounded note: the observation failed, or ConfiguredMode and
+	// Mode disagree (for example the service was reinstalled but not restarted).
+	Warning string `json:"warning,omitempty"`
 }
 
 // DaemonSessionShimOwnershipMode is the configured controller/ownership mode.
