@@ -11,6 +11,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 ### Features
 
 - Add subscription quota window types, mappers and the per-account login check for the codex and claude harnesses (not yet published on the daemon heartbeat): shared window types with sparse merge in `agent`, app-server `account/rateLimits` mappers under the codex harness, and stream-json `rate_limit_event` mappers under the claude harness. The heartbeat gains an optional `quota` field backed by a per-account snapshot cache, but nothing fills the cache yet, so every beat still omits `quota`. Each entry will carry an `authCheck` (`harness`, `ok`, `checkedAt`) recording the latest login check for its harness, stamped with the probe time and omitted until a probe has run. Ported from the MIT-licensed t3code provider usage-limits modules; see the per-package LICENSE-t3code notes.
+- Daemon service process-priority modes: `host install --process-priority default|background`. `background` runs the daemon and every process it spawns at the lowest CPU priority with throttled disk I/O (launchd `ProcessType=Background` with the low-priority I/O keys; systemd `Nice=19` with idle CPU and I/O scheduling); `default` leaves the service definition unchanged. An explicit mode is saved and kept by later installs that omit the flag, and `host status`, `GET /api/daemon/status` and `GET /api/daemon/doctor` report the mode the running daemon actually has. Existing installs are unchanged until `host install` is re-run.
+- A run that ends on a provider error checkpoints its own work onto a dedicated `wip/<session-id>` branch without rewriting the session branch, and its terminal result is marked resumable with the checkpoint branch and head on the status wire. Nothing is pushed when the session left no work of its own or owes no commit.
+
+### Fixes
+
+- A run that continues an existing pull request no longer counts a second pull-request URL seen in tool output (for example `gh pr list`, or a sibling pull request quoted in review comments) as its reported pull request. A turn that stops early without new work now gets the continuation prompt instead of failing the delivery gate with "no new commit since dispatch".
+- The continued pull-request delivery backstop is stricter: a continued pull request counts as delivered only when it gains a non-merge commit of the session's own outside the seat scratch set (`.agent`, `.pi`, `.scratch`), so a base-branch merge alone no longer passes, and a continued run that commits scratch paths fails while its pushed history is left for review. Seat scratch is also excluded from checkout-local `git status`.
 
 ## v0.72.65 — 2026-10-05
 
