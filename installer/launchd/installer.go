@@ -35,6 +35,14 @@
 //	AbandonProcessGroup orphans hosted session children instead of killing
 //	them with the job; LegacyTimers keeps heartbeat/token-refresh timers
 //	from being deferred by launchd timer coalescing on battery.
+//
+// Process priority contract:
+//
+//	servicepriority.Background adds ProcessType=Background, LowPriorityIO and
+//	LowPriorityBackgroundIO to the plist (ProcessPriorityPlistKeys). launchd
+//	applies them to the daemon and every process it spawns, and
+//	ProgramArguments is unchanged, so the host binary stays its first
+//	argument. The default mode leaves the plist byte-for-byte as it was.
 package launchd
 
 import (
@@ -47,6 +55,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/installer/servicepriority"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
@@ -85,20 +94,14 @@ const ExitTimeOutSeconds = 630
 // must re-run `host install` before upgrading past that release.
 const DaemonSubcommand = "host run"
 
-// PlistPath returns the absolute path to the OSS LaunchAgent plist:
+// PlistPath returns the absolute path to the LaunchAgent plist:
 // ~/Library/LaunchAgents/dev.donmai.daemon.plist.
 func PlistPath() (string, error) {
-	return PlistPathForLabel(LaunchdLabel)
-}
-
-// PlistPathForLabel returns the absolute path to the LaunchAgent plist for the
-// requested launchd label.
-func PlistPathForLabel(label string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("launchd: resolve home dir: %w", err)
 	}
-	return filepath.Join(home, "Library", "LaunchAgents", label+".plist"), nil
+	return filepath.Join(home, "Library", "LaunchAgents", LaunchdLabel+".plist"), nil
 }
 
 // LogDir returns the daemon log directory: ~/Library/Logs/<brand>, where
@@ -139,9 +142,10 @@ type InstallOptions struct {
 	// os.Executable() when empty.
 	HostBinPath string
 
-	// ProcessPriority controls how launchd should start the daemon process.
-	// Empty reads as default.
-	ProcessPriority ProcessPriority
+	// ProcessPriority selects the process-priority mode the plist encodes.
+	// The zero value reads as servicepriority.Default, which leaves the plist
+	// byte-for-byte unchanged.
+	ProcessPriority servicepriority.Mode
 
 	// PlistPath overrides the output plist path (useful for tests).
 	PlistPath string
@@ -235,9 +239,8 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 // ── Plist generation ─────────────────────────────────────────────────────────
 
 // GeneratePlist returns a launchd plist XML string for the daemon
-// LaunchAgent. ProgramArguments registers the host binary's `host run`
-// subcommand by default, or wraps it in taskpolicy when a non-default
-// process-priority option is selected.
+// LaunchAgent. ProgramArguments registers `<hostBinPath> daemon run` —
+// the locked decision (no separate rensei-daemon binary).
 //
 // Key behaviours encoded in the plist:
 //
@@ -251,14 +254,16 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 	return GeneratePlistWithOptions(hostBinPath, logPath, errorLogPath, InstallOptions{})
 }
 
-// GeneratePlistWithOptions renders the launchd plist for the selected
-// process-priority mode.
+// GeneratePlistWithOptions renders the launchd plist for the process-priority
+// mode in opts. The default mode renders exactly what GeneratePlist always
+// has; background adds the launchd keys from ProcessPriorityPlistKeys and
+// leaves ProgramArguments untouched.
 func GeneratePlistWithOptions(hostBinPath, logPath, errorLogPath string, opts InstallOptions) (string, error) {
 	if hostBinPath == "" {
 		return "", fmt.Errorf("launchd: GeneratePlist: hostBinPath is required")
 	}
-	priority := NormalizeProcessPriority(opts.ProcessPriority)
-	if err := ValidateProcessPriority(priority); err != nil {
+	priorityKeys, err := ProcessPriorityPlistKeys(opts.ProcessPriority)
+	if err != nil {
 		return "", err
 	}
 	home, err := os.UserHomeDir()
@@ -283,13 +288,15 @@ func GeneratePlistWithOptions(hostBinPath, logPath, errorLogPath string, opts In
 		"/sbin",
 	}, ":")
 
-	args, err := ProgramArguments(hostBinPath, priority)
-	if err != nil {
-		return "", err
-	}
+	// Split daemon run subcommand into separate ProgramArguments entries
+	// (launchd requires each argument as its own <string>).
+	subArgs := strings.Fields(DaemonSubcommand)
 
 	var argsXML strings.Builder
-	for _, a := range args {
+	argsXML.WriteString("    <string>")
+	argsXML.WriteString(escapeXML(hostBinPath))
+	argsXML.WriteString("</string>\n")
+	for _, a := range subArgs {
 		argsXML.WriteString("    <string>")
 		argsXML.WriteString(escapeXML(a))
 		argsXML.WriteString("</string>\n")
@@ -356,7 +363,7 @@ func GeneratePlistWithOptions(hostBinPath, logPath, errorLogPath string, opts In
   <key>LegacyTimers</key>
   <true/>
 
-  <key>StandardOutPath</key>
+` + priorityKeys + `  <key>StandardOutPath</key>
   <string>` + escapeXML(logPath) + `</string>
 
   <key>StandardErrorPath</key>
@@ -373,6 +380,47 @@ func GeneratePlistWithOptions(hostBinPath, logPath, errorLogPath string, opts In
 </plist>
 `
 	return plist, nil
+}
+
+// backgroundPlistKeys is the plist fragment for servicepriority.Background.
+//
+// ProcessType=Background gives the job the background scheduling band and QoS
+// clamp; LowPriorityIO and LowPriorityBackgroundIO throttle its file system
+// I/O. All of it is inherited by every child the daemon spawns, and none of it
+// changes ProgramArguments, so the host binary stays the first argument.
+//
+// A job with no ProcessType already runs at utility QoS, so there is no
+// separate "utility" mode: it would be indistinguishable from the default.
+const backgroundPlistKeys = `  <!--
+    Process priority "background": the daemon and every process it spawns
+    run at background priority with throttled disk I/O. ProcessType=Background
+    applies the background scheduling band and QoS clamp; LowPriorityIO and
+    LowPriorityBackgroundIO throttle file system I/O. ProgramArguments is
+    unchanged.
+  -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>LowPriorityIO</key>
+  <true/>
+
+  <key>LowPriorityBackgroundIO</key>
+  <true/>
+
+`
+
+// ProcessPriorityPlistKeys returns the plist <key>/<value> fragment that
+// encodes mode, ready to splice into the top-level <dict>. The default mode
+// returns the empty string. It is exported so an embedder that renders its own
+// plist can emit the same keys.
+func ProcessPriorityPlistKeys(mode servicepriority.Mode) (string, error) {
+	if err := servicepriority.Validate(mode); err != nil {
+		return "", fmt.Errorf("launchd: %w", err)
+	}
+	if servicepriority.Effective(mode) == servicepriority.Background {
+		return backgroundPlistKeys, nil
+	}
+	return "", nil
 }
 
 // escapeXML returns s with the five XML predefined entities escaped.

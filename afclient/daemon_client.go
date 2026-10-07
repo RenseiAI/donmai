@@ -91,37 +91,8 @@ type DaemonStatusResponse struct {
 	// always present, including mode=disabled, so status and doctor never require
 	// callers to infer whether omission means unsupported or empty.
 	SessionShim DaemonSessionShimStatus `json:"sessionShim"`
-	// ProcessPriority is the daemon's runtime self-check of its effective launch
-	// priority, QoS clamp, and I/O policy.
-	ProcessPriority DaemonProcessPriorityStatus `json:"processPriority"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
-}
-
-// DaemonProcessPriorityStatus is the daemon's self-observed launch priority
-// state. It is additive and secret-free so status/doctor readers can surface
-// whether the daemon is running with the intended service priority.
-type DaemonProcessPriorityStatus struct {
-	// Supported reports whether this daemon can observe and classify the running
-	// process on this operating system.
-	Supported bool `json:"supported"`
-	// Mode is the effective public mode: default, utility, background, or
-	// unknown when the observed process and active service definition disagree.
-	Mode string `json:"mode,omitempty"`
-	// QoSClass is the effective QoS clamp class presented to operators.
-	QoSClass string `json:"qosClass,omitempty"`
-	// IOPolicy is the effective disk I/O policy presented to operators.
-	IOPolicy string `json:"ioPolicy,omitempty"`
-	// ProcessPriority is the live `ps` PRI value when it could be observed.
-	ProcessPriority int `json:"processPriority,omitempty"`
-	// LaunchdMode is the active launchd service definition's configured mode
-	// when the daemon is running as the registered launchd service.
-	LaunchdMode string `json:"launchdMode,omitempty"`
-	// Evidence is a bounded human-readable explanation of how the daemon reached
-	// this classification.
-	Evidence string `json:"evidence,omitempty"`
-	// Warning records a bounded mismatch or unsupported-observation note.
-	Warning string `json:"warning,omitempty"`
 }
 
 // DaemonSessionShimOwnershipMode is the configured controller/ownership mode.

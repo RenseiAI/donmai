@@ -350,7 +350,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		ProjectAdmissionMode:    cfg.EffectiveProjectAdmissionMode(),
 		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
 		SessionShim:             s.daemon.SessionShimDiagnostics(),
-		ProcessPriority:         daemonProcessPriorityStatus(),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)
@@ -848,7 +847,6 @@ func (s *Server) handleDoctor(w http.ResponseWriter, _ *http.Request) {
 		"orchestratorUrl": safeOrchestratorURL(cfg),
 		"heartbeat":       s.daemon.heartbeat != nil && s.daemon.heartbeat.IsRunning(),
 		"sessionShim":     s.daemon.SessionShimDiagnostics(),
-		"processPriority": daemonProcessPriorityStatus(),
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, report)

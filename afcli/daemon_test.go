@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
-	"github.com/RenseiAI/donmai/installer/launchd"
 	"gopkg.in/yaml.v3"
 )
 
@@ -422,6 +421,166 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 	}
 }
 
+// priorityServiceMarkers returns the service-definition fragments that mark the
+// background process-priority mode on this OS, or skips the test where the
+// installer is not supported.
+func priorityServiceMarkers(t *testing.T) []string {
+	t.Helper()
+	switch runtime.GOOS {
+	case "darwin":
+		return []string{
+			"<key>ProcessType</key>", "<string>Background</string>",
+			"<key>LowPriorityIO</key>", "<key>LowPriorityBackgroundIO</key>",
+		}
+	case "linux":
+		return []string{"Nice=19\n", "CPUSchedulingPolicy=idle\n", "IOSchedulingClass=idle\n"}
+	default:
+		t.Skipf("installer only supports darwin/linux; this is %s", runtime.GOOS)
+		return nil
+	}
+}
+
+// installWithArgs runs `install --skip-service-manager` under the isolated HOME
+// and returns its output and the service definition it wrote.
+func installWithArgs(t *testing.T, hostBin string, args ...string) (output, service string) {
+	t.Helper()
+	cmd := newDaemonInstallCmd("donmai")
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs(append([]string{"--bin-path", hostBin, "--skip-service-manager"}, args...))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("install %v: %v\n%s", args, err, buf.String())
+	}
+	output = buf.String()
+	var servicePath string
+	for _, line := range strings.Split(output, "\n") {
+		if rest, ok := strings.CutPrefix(line, "Service registered: "); ok {
+			servicePath = rest
+		}
+	}
+	if servicePath == "" {
+		t.Fatalf("install output has no service path:\n%s", output)
+	}
+	content, err := os.ReadFile(servicePath)
+	if err != nil {
+		t.Fatalf("read service definition: %v", err)
+	}
+	t.Cleanup(func() { _ = launchctlBootoutTestUnit() })
+	return output, string(content)
+}
+
+func isolatedHostBin(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	hostBin := filepath.Join(tmp, "af-fake")
+	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatalf("seed fake host binary: %v", err)
+	}
+	return hostBin
+}
+
+// TestDaemonInstallProcessPriority pins what each mode writes, per OS: launchd
+// keys on macOS, systemd directives on Linux, and nothing at all for the
+// default. The service entrypoint is the plain host command in every mode.
+func TestDaemonInstallProcessPriority(t *testing.T) {
+	markers := priorityServiceMarkers(t)
+	cases := []struct {
+		name       string
+		args       []string
+		wantMarked bool
+		wantLine   string // substring of the install output; empty means no priority line
+		wantAbsent string // substring that must not appear
+	}{
+		{name: "flag omitted", args: nil, wantAbsent: "Process priority:"},
+		{name: "explicit default", args: []string{"--process-priority", "default"}, wantLine: "Process priority: default"},
+		{name: "background", args: []string{"--process-priority", "background"}, wantMarked: true, wantLine: "Process priority: background"},
+		{name: "case and space are ignored", args: []string{"--process-priority", " Background "}, wantMarked: true, wantLine: "Process priority: background"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hostBin := isolatedHostBin(t)
+			out, service := installWithArgs(t, hostBin, tc.args...)
+
+			if want := "Service command: " + hostBin + " host run\n"; !strings.Contains(out, want) {
+				t.Errorf("install output missing the unwrapped service command %q:\n%s", want, out)
+			}
+			if tc.wantLine != "" && !strings.Contains(out, tc.wantLine) {
+				t.Errorf("install output missing %q:\n%s", tc.wantLine, out)
+			}
+			if tc.wantAbsent != "" && strings.Contains(out, tc.wantAbsent) {
+				t.Errorf("install output must not contain %q:\n%s", tc.wantAbsent, out)
+			}
+			for _, marker := range markers {
+				if got := strings.Contains(service, marker); got != tc.wantMarked {
+					t.Errorf("service definition contains %q = %v, want %v:\n%s", marker, got, tc.wantMarked, service)
+				}
+			}
+		})
+	}
+}
+
+// TestDaemonInstallKeepsProcessPriorityWhenFlagOmitted pins that re-running
+// install without the flag, the documented recovery step after an upgrade or a
+// daemon test run, keeps the saved mode. Only an explicit flag changes it.
+func TestDaemonInstallKeepsProcessPriorityWhenFlagOmitted(t *testing.T) {
+	markers := priorityServiceMarkers(t)
+	hostBin := isolatedHostBin(t)
+
+	assertBackground := func(step, service string, want bool) {
+		t.Helper()
+		for _, marker := range markers {
+			if got := strings.Contains(service, marker); got != want {
+				t.Errorf("%s: service definition contains %q = %v, want %v", step, marker, got, want)
+			}
+		}
+	}
+
+	_, service := installWithArgs(t, hostBin, "--process-priority", "background")
+	assertBackground("explicit background", service, true)
+
+	out, service := installWithArgs(t, hostBin)
+	assertBackground("re-install without the flag", service, true)
+	if !strings.Contains(out, "Process priority: background (kept from the previous install") {
+		t.Errorf("re-install output must say the mode was kept:\n%s", out)
+	}
+
+	out, service = installWithArgs(t, hostBin, "--process-priority", "default")
+	assertBackground("explicit default", service, false)
+	if !strings.Contains(out, "Process priority: default") {
+		t.Errorf("explicit default output missing the mode:\n%s", out)
+	}
+
+	out, service = installWithArgs(t, hostBin)
+	assertBackground("re-install after explicit default", service, false)
+	if strings.Contains(out, "Process priority:") {
+		t.Errorf("a kept default is the unremarkable case and must stay silent:\n%s", out)
+	}
+}
+
+func TestDaemonInstallRejectsInvalidProcessPriority(t *testing.T) {
+	for _, value := range []string{"faster", "utility"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			cmd := newDaemonInstallCmd("donmai")
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			cmd.SetArgs([]string{"--process-priority", value, "--skip-service-manager"})
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatalf("expected an error for --process-priority %s", value)
+			}
+			if want := "invalid --process-priority"; !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %v, want it to contain %q", err, want)
+			}
+			if !strings.Contains(err.Error(), "want default or background") {
+				t.Fatalf("error = %v, want it to list the valid modes", err)
+			}
+		})
+	}
+}
+
 // TestDaemonInstallNoLegacyShellOut verifies the install command does NOT
 // fail with the old `rensei-daemon: command not found` error when the
 // legacy binary is absent — the new in-process implementation never looks
@@ -435,53 +594,6 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 // against a missing file. Defensive launchctl bootout in t.Cleanup
 // guards against future install-path changes that demote
 // --skip-service-manager.
-func TestDaemonInstallUtilityPriorityRegistersTaskpolicyWrapper(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	hostBin := tmp + "/af-fake"
-	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec
-		t.Fatalf("seed fake host binary: %v", err)
-	}
-
-	cmd := newDaemonInstallCmd("donmai")
-	buf := &bytes.Buffer{}
-	cmd.SetOut(buf)
-	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--bin-path", hostBin, "--process-priority", "utility", "--skip-service-manager"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "/usr/sbin/taskpolicy -c utility "+hostBin+" host run") {
-		t.Fatalf("utility install output missing taskpolicy wrapper; got:\n%s", out)
-	}
-	if runtime.GOOS == "darwin" {
-		plistPath := filepath.Join(tmp, "Library", "LaunchAgents", launchd.LaunchdLabel+".plist")
-		plist, err := os.ReadFile(plistPath)
-		if err != nil {
-			t.Fatalf("read plist: %v", err)
-		}
-		if !strings.Contains(string(plist), "<string>/usr/sbin/taskpolicy</string>") || !strings.Contains(string(plist), "<string>utility</string>") {
-			t.Fatalf("utility plist missing taskpolicy wrapper:\n%s", plist)
-		}
-	}
-	t.Cleanup(func() { _ = launchctlBootoutTestUnit() })
-}
-
-func TestDaemonInstallRejectsInvalidProcessPriority(t *testing.T) {
-	cmd := newDaemonInstallCmd("donmai")
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"--process-priority", "faster"})
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected invalid process-priority error")
-	}
-	if !strings.Contains(err.Error(), "invalid --process-priority") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestDaemonInstallNoLegacyShellOut(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
@@ -1252,13 +1364,12 @@ func TestWriteDaemonStatusTable(t *testing.T) {
 	t.Parallel()
 
 	r := fixtureStatusResp()
-	r.ProcessPriority = afclient.DaemonProcessPriorityStatus{Supported: true, Mode: "utility", QoSClass: "utility", IOPolicy: "throttled", ProcessPriority: 20}
 	var buf bytes.Buffer
 	if err := writeDaemonStatusTable(&buf, r); err != nil {
 		t.Fatalf("writeDaemonStatusTable: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed", "Priority:", "utility", "throttled"} {
+	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q; got:\n%s", want, out)
 		}

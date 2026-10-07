@@ -8,8 +8,6 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/sbin/taskpolicy</string>
-    <string>-b</string>
     <string>/usr/local/bin/af</string>
     <string>host</string>
     <string>run</string>
@@ -62,6 +60,22 @@
   <true/>
 
   <key>LegacyTimers</key>
+  <true/>
+
+  <!--
+    Process priority "background": the daemon and every process it spawns
+    run at background priority with throttled disk I/O. ProcessType=Background
+    applies the background scheduling band and QoS clamp; LowPriorityIO and
+    LowPriorityBackgroundIO throttle file system I/O. ProgramArguments is
+    unchanged.
+  -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>LowPriorityIO</key>
+  <true/>
+
+  <key>LowPriorityBackgroundIO</key>
   <true/>
 
   <key>StandardOutPath</key>

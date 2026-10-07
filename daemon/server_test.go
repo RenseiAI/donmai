@@ -142,9 +142,6 @@ func TestServer_Status(t *testing.T) {
 	if resp.SessionShim.OwnershipMode != afclient.DaemonSessionShimDisabled || !resp.SessionShim.AdoptionComplete || resp.SessionShim.OccupiedSlots != 0 {
 		t.Errorf("default sessionShim status = %+v, want disabled/complete/empty", resp.SessionShim)
 	}
-	if resp.ProcessPriority.Mode == "" {
-		t.Errorf("ProcessPriority.Mode = empty, want classified status")
-	}
 	if len(resp.EnabledProjectIDs) != 1 || resp.EnabledProjectIDs[0] != "demo" {
 		t.Errorf("EnabledProjectIDs = %v, want [demo]", resp.EnabledProjectIDs)
 	}
@@ -398,13 +395,6 @@ func TestServer_Doctor_Endpoint(t *testing.T) {
 	}
 	if loaded, _ := resp["configLoaded"].(bool); !loaded {
 		t.Errorf("expected configLoaded=true")
-	}
-	priority, ok := resp["processPriority"].(map[string]any)
-	if !ok {
-		t.Fatalf("doctor processPriority = %#v, want object", resp["processPriority"])
-	}
-	if _, ok := priority["supported"]; !ok {
-		t.Fatalf("doctor processPriority missing supported field: %#v", priority)
 	}
 }
 
