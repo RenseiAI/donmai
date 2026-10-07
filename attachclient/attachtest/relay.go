@@ -209,7 +209,34 @@ func (s *StubRelay) HostAckSeq() int64 {
 
 // SendToHost injects a relay→host frame directly (bypassing stamping) — used by
 // the input-trust test to deliver an UNSTAMPED Input from a hostile relay.
+//
+// Delivery targets the currently-bound host leg's sink, which the leg's
+// writer drains onto the wire. When no leg is bound — the ordinary gap
+// between a dropped leg's unbind and its replacement's bind — the frame is a
+// no-op: a real relay has no host connection to write to either, so nothing
+// is queued for a leg that does not exist yet. Tests that inject a frame and
+// then expect the client to observe it must therefore wait until the leg they
+// mean to reach is bound (HostBound, or a delivery-count accessor below)
+// BEFORE injecting; otherwise the frame may land in a half-closed predecessor
+// whose writer has already exited, where it sits unread in that leg's buffer
+// while the test has already moved on to the replacement.
 func (s *StubRelay) SendToHost(f attachwire.Frame) { s.room.sendToHost(f) }
+
+// HostOutDepth reports the number of undelivered relay→host frames queued in
+// the currently-bound leg's sink (zero when no leg is bound). Tests use it to
+// sequence fault injection deterministically: after SendToHost, waiting for
+// the depth to return to zero proves the bound leg's writer consumed the
+// frame — the client will observe it — before the test fires the next one.
+// A frame stranded in a half-closed predecessor's buffer (see SendToHost)
+// does not count toward the bound leg's depth, so a test that fires the next
+// bounce while the predecessor still owns the binding can still lose it;
+// pair this with HostBound sequencing across a rebind (wait until the leg the
+// frame was delivered to has unbound and the replacement has bound).
+func (s *StubRelay) HostOutDepth() int {
+	s.room.mu.Lock()
+	defer s.room.mu.Unlock()
+	return len(s.room.hostOut)
+}
 
 // SimulateRestart wipes all in-memory room state (ring, epoch/host binding,
 // degraded-lane ack, pen, presence) and forcibly drops any currently-bound host

@@ -189,9 +189,24 @@ func TestRepeatedRingMissNeverTerminatesAndResubscribesFresh(t *testing.T) {
 	const bounces = 3
 	prevSubs := len(h.sess.SubscribeSeqs())
 	for i := 0; i < bounces; i++ {
+		// Sequence the bounce against the leg that must observe it. The
+		// client-side re-subscribe fires before the replacement leg binds
+		// server-side, so firing the next bounce on re-subscribe alone can
+		// land it in the half-closed predecessor's sink — delivered to a
+		// writer that already exited, never read, while the replacement
+		// binds into a room that never saw the frame. Each bounce here is
+		// therefore: wait until a leg is bound, inject, wait until the
+		// bound sink drains (the writer consumed the frame onto the wire,
+		// so the client's reader WILL observe it), then wait for the
+		// re-subscribe the frame causes, and finally for the replacement
+		// bind before the next bounce.
+		waitBound(t, h.relay)
 		h.relay.SendToHost(mustFrame(t, attachwire.ControlError{
 			Code: attachwire.CodeRingMiss, Message: "relay restarted, ring lost", Retryable: false,
 		}))
+		if !waitFor(func() bool { return h.relay.HostOutDepth() == 0 }, 3*time.Second) {
+			t.Fatalf("bounce %d: injected ring-miss control never left the relay sink (depth=%d)", i, h.relay.HostOutDepth())
+		}
 		if !waitFor(func() bool { return len(h.sess.SubscribeSeqs()) > prevSubs }, 3*time.Second) {
 			t.Fatalf("bounce %d: host never re-subscribed after ring-miss reset (subscribeSeqs=%v)", i, h.sess.SubscribeSeqs())
 		}
