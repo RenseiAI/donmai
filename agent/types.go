@@ -812,15 +812,18 @@ type Result struct {
 	// ignore it.
 	BudgetBreach *BudgetBreach `json:"budgetBreach,omitempty"`
 
-	// Resumable reports whether the runner preserved a retryable failure on a
-	// dedicated resume target rather than only on the ephemeral workarea. Today
-	// it is set on provider-error failures whose work was checkpointed to a WIP
-	// branch the platform can retry from. Additive — old platforms ignore it.
+	// Resumable reports whether a retry of this failed session loses no work:
+	// either the runner preserved the session's work on a dedicated resume
+	// target (ResumeCheckpoint), or the session left nothing of its own to
+	// preserve (no change, or verdict-only work that owes no commit). Today it
+	// is set on provider-error failures. False when the session's work could
+	// not be preserved. Additive — old platforms ignore it.
 	Resumable bool `json:"resumable,omitempty"`
 
 	// ResumeCheckpoint identifies the checkpoint a retryable failure preserved:
 	// the branch name and head commit the platform can resume from. Nil when no
-	// retry checkpoint was created. Additive — old platforms ignore it.
+	// retry checkpoint was created, including when there was nothing to
+	// preserve. Additive — old platforms ignore it.
 	ResumeCheckpoint *ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
 }
 

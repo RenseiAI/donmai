@@ -310,9 +310,9 @@ type statusRequest struct {
 	// omitted when the session stayed within its budget.
 	BudgetBreach *agent.BudgetBreach `json:"budgetBreach,omitempty"`
 
-	// Resumable reports whether the runner preserved a retryable failure on a
-	// dedicated resume target the platform can continue from. Additive;
-	// omitted when false.
+	// Resumable reports whether a retry of the failed session loses no work:
+	// its work is on ResumeCheckpoint, or it left nothing to preserve.
+	// Additive; omitted when false.
 	Resumable bool `json:"resumable,omitempty"`
 
 	// ResumeCheckpoint identifies the branch + head commit the platform can

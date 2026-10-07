@@ -11,14 +11,31 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-const providerErrorCheckpointTimeout = 20 * time.Second
+// providerErrorCheckpointTimeout bounds the whole checkpoint. A variable so a
+// test can prove the bound without waiting for it.
+var providerErrorCheckpointTimeout = 20 * time.Second
+
+// providerErrorCheckpointWaitDelay bounds how long the push waits for its
+// output after the timeout killed git: a transport child (ssh, a remote
+// helper) that outlives git keeps the output open otherwise.
+const providerErrorCheckpointWaitDelay = 2 * time.Second
 
 // checkpointProviderError preserves a failed provider-error session on a WIP
 // branch the platform can retry from. Best-effort only: any failure is logged
 // and recorded as a warning on res, but the original provider-error result
 // stays authoritative.
+//
+// Only work that owes a commit is checkpointed. A verdict-only session's
+// checkout holds scratch, never a deliverable — the backstop never commits or
+// pushes it either — and a session that changed nothing has nothing to keep.
+// Both are resumable without a checkpoint: a retry from the dispatch loses
+// nothing.
 func (r *Runner) checkpointProviderError(qw QueuedWork, res *Result) {
 	if res == nil || res.Status != "failed" || res.FailureMode != FailureProviderError || res.Resumable || res.ResumeCheckpoint != nil {
+		return
+	}
+	if !RequiresPRURL(qw.WorkType) {
+		res.Resumable = true
 		return
 	}
 	target, ok := providerErrorCheckpointTarget(res)
@@ -39,6 +56,12 @@ func (r *Runner) checkpointProviderError(qw QueuedWork, res *Result) {
 		return
 	}
 	res.Resumable = true
+	if checkpoint == nil {
+		r.logger.Info("provider-error session left no work of its own; resumable without a WIP checkpoint",
+			"sessionId", qw.SessionID,
+		)
+		return
+	}
 	res.ResumeCheckpoint = checkpoint
 	r.logger.Info("provider-error WIP checkpoint pushed",
 		"sessionId", qw.SessionID,
@@ -70,6 +93,17 @@ func providerErrorCheckpointTarget(res *Result) (rescueTarget, bool) {
 	return rescueTarget{}, false
 }
 
+// createProviderErrorCheckpoint pushes the session's work to wip/<session>:
+// the uncommitted working state as one commit on HEAD, or HEAD itself when
+// the session committed but left nothing uncommitted. It returns nil when the
+// session produced nothing — no change of its own and HEAD still at the
+// commit it started on — so no branch is pushed for it.
+//
+// No local branch is written: the commit is pushed by name, so no ref the
+// checkout or another session owns can be moved, and none is left behind in
+// a shared repository. The push is never forced and skips repository hooks:
+// a WIP checkpoint is unverified by definition, and a pre-push hook (a test
+// suite) would outlast the timeout.
 func createProviderErrorCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget) (*agent.ResumeCheckpoint, error) {
 	if _, err := os.Stat(target.path); err != nil {
 		return nil, fmt.Errorf("stat checkout: %w", err)
@@ -96,16 +130,36 @@ func createProviderErrorCheckpoint(ctx context.Context, qw QueuedWork, target re
 			checkpointHead = commitSHA
 		}
 	}
-	// A clean checkout still gets a resumable branch so the platform has an
-	// explicit retry target even when the lost work was only in conversation.
-	if _, err := gitStdout(ctx, target.path, nil, "update-ref", "refs/heads/"+branch, checkpointHead); err != nil {
-		return nil, fmt.Errorf("update local WIP branch: %w", err)
+	if checkpointHead == head {
+		committed, err := sessionCommitted(ctx, target, head)
+		if err != nil {
+			return nil, err
+		}
+		if !committed {
+			return nil, nil
+		}
 	}
-	id := gitIdentityFromSession(qw)
-	if out, err := runGit(ctx, target.path, id, "push", "origin", "refs/heads/"+branch+":refs/heads/"+branch); err != nil {
-		return nil, fmt.Errorf("push WIP branch %q: %w (output: %s)", branch, err, out)
+	push := gitCommand(ctx, target.path, gitIdentityFromSession(qw),
+		"push", "--no-verify", "origin", checkpointHead+":refs/heads/"+branch)
+	push.WaitDelay = providerErrorCheckpointWaitDelay
+	if out, err := push.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("push WIP branch %q: %w (output: %s)", branch, err, strings.TrimSpace(string(out)))
 	}
 	return &agent.ResumeCheckpoint{Branch: branch, CommitSHA: checkpointHead}, nil
+}
+
+// sessionCommitted reports whether HEAD carries commits the session made: it
+// moved off the commit the checkout was provisioned at, or, when that commit
+// is unknown, it holds commits no remote-tracking ref has.
+func sessionCommitted(ctx context.Context, target rescueTarget, head string) (bool, error) {
+	if target.base != "" {
+		return head != target.base, nil
+	}
+	unpushed, err := unpushedCommits(ctx, target)
+	if err != nil {
+		return false, err
+	}
+	return len(unpushed) > 0, nil
 }
 
 func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw QueuedWork) (string, error) {
