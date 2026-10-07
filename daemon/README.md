@@ -238,6 +238,22 @@ observation failed), `configuredMode` is the mode saved by the last explicit
 for example after a reinstall that has not restarted the daemon. The
 observation is taken once at start, off the request path, and cached.
 
+Both also carry an additive `seatBudget` object (omitted by a daemon that
+predates it): `mode` is the posture each seat runs under (`enforced` |
+`best-effort` | `none`) with the values (`cpus`, `memoryMb`) and a short
+human `detail` line. On Linux an enforced seat is confined in a transient
+systemd scope (CPU set, CPU quota, memory max, IO weight) or, without
+systemd, direct cgroupfs limits; with no backend the seat runs unconfined
+and reports `none`. On macOS the seat carries worker-cap environment
+(`GOMAXPROCS` plus the build/test worker knobs) composed with the
+installed process-priority mode. Configured per host under
+`capacity.seatBudget: { cpus, memoryMb, ioWeight, mode }` in `daemon.yaml`
+(`mode` is `auto` by default: enforced on Linux, best-effort elsewhere).
+Omitting the block disables budgeting and leaves every seat exactly as
+before; in particular a single-seat host derives no limits. Each session
+handle on `GET /api/daemon/sessions` and each session result carries the
+same block for the seat it ran under.
+
 For an externally composed session-shim, the outbound
 `POST /api/workers/<id>/heartbeat` carries a separate authority-bound
 `sessionShim` projection. Alongside the stable host, controller, adoption

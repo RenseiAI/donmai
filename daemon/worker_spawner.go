@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/internal/interview"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -165,6 +166,12 @@ type SpawnerOptions struct {
 
 	// Now lets tests deterministically clock acceptedAt timestamps.
 	Now func() time.Time
+	// SeatBudget is the resolved per-seat resource budget applied to
+	// every session this spawner starts. Zero value disables budgeting:
+	// seats spawn exactly as before and report mode "none". The daemon
+	// wires its resolved config budget here; embedders that compose
+	// their own spawner may resolve one with seatbudget.Resolve.
+	SeatBudget SeatBudget `yaml:"-" json:"-"`
 	// Stdout is where worker stdout is forwarded with a "[worker:<id>]"
 	// prefix. Defaults to os.Stdout. Set to io.Discard in tests.
 	StdoutPrefixWriter PrefixedWriter
@@ -620,6 +627,15 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 	return nil
 }
 
+// SetSeatBudget swaps the per-seat budget future spawns apply. Seats
+// already running keep the budget they started with — like capacity, the
+// new share governs only future AcceptWork calls.
+func (s *WorkerSpawner) SetSeatBudget(b SeatBudget) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.SeatBudget = b
+}
+
 // SetProjects atomically swaps the spawner's base project allowlist used by
 // AcceptWork's findProjectLocked check. Existing in-flight sessions
 // continue against whichever project they were dispatched under — the
@@ -872,6 +888,9 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 		return nil, false, nil
 	}
 	env := s.sessionEnv(spec, project)
+	if seatBudget, seatBudgetOK := s.seatBudgetForSpawn(); seatBudgetOK {
+		env = applySeatBudgetToEnv(env, seatBudget, seatBudgetOK)
+	}
 	// OnPreSpawn is the credential rail, and a shim-backed session needs it for
 	// exactly the same reason a direct one does: the harness cannot start without
 	// the credentials the hook resolves. Skipping it for shim sessions would make
@@ -1107,9 +1126,15 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// its cooperative SIGTERM window, so use Command and let the reaper own the
 	// TERM -> bounded grace -> KILL escalation explicitly.
 	ctx, cancel := context.WithCancel(context.Background())
+	// Per-seat resource budget: resolve once per spawn. The env caps ride
+	// every spawn path (Linux and macOS); the Linux cgroup wrap applies
+	// only under an enforced mode with a systemd placement. A disabled
+	// budget leaves command and env exactly as before.
+	seatBudget, seatBudgetOK := s.seatBudgetForSpawn()
+	command = applySeatBudgetToCmd(command, spec.SessionID, seatBudget, seatBudgetOK, seatbudget.HostPlacement())
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
-	cmd.Env = s.sessionEnv(spec, project)
+	cmd.Env = applySeatBudgetToEnv(s.sessionEnv(spec, project), seatBudget, seatBudgetOK)
 
 	// The daemon, rather than os/exec, owns these read ends. That lets a waiter
 	// observe direct-child exit without closing a pump mid-buffer, while still
@@ -1195,6 +1220,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		EndpointOperator: sessionDisplayAxis(spec.EndpointOperator),
 		Protocol:         sessionDisplayAxis(spec.Protocol),
 		WorkType:         spec.WorkType,
+		SeatBudget:       sessionSeatBudgetReport(seatBudget, seatBudgetOK, seatbudget.HostPlacement()),
 	}
 	// Publish the worktree path so GET /api/daemon/sessions is
 	// self-sufficient for a local reader (host-watch). The worker resolves

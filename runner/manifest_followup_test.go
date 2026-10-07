@@ -87,6 +87,18 @@ type verdictScriptProvider struct {
 	// workareaCaps, when non-nil, overrides the wrapped harness manifest's
 	// multi-repository workarea attestation.
 	workareaCaps *agent.HarnessCaps
+	// lastHandle is the most recent spawned handle, so tests can assert on
+	// what the runner handed the harness (e.g. Spec.Env).
+	lastHandle agent.Handle
+}
+
+// lastSpecEnv returns the harness Spec.Env of the most recent spawn, or nil
+// when nothing has spawned yet.
+func (p *verdictScriptProvider) lastSpecEnv() map[string]string {
+	if h, ok := p.lastHandle.(*verdictScriptHandle); ok {
+		return h.specEnv
+	}
+	return nil
 }
 
 func (p *verdictScriptProvider) Manifest() agent.HarnessManifest {
@@ -100,7 +112,8 @@ func (p *verdictScriptProvider) Manifest() agent.HarnessManifest {
 }
 
 func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
-	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts}
+	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts, specEnv: spec.Env}
+	p.lastHandle = h
 	h.events <- agent.InitEvent{SessionID: "scripted-session"}
 	h.play()
 	return h, nil
@@ -120,6 +133,9 @@ type verdictScriptHandle struct {
 	events chan agent.Event
 	// prompts records every follow-up prompt the runner injected.
 	prompts *[]string
+	// specEnv captures the harness Spec.Env the runner spawned with, so
+	// tests can assert on the environment the seat actually carried.
+	specEnv map[string]string
 }
 
 func (h *verdictScriptHandle) SessionID() string          { return "scripted-session" }
@@ -346,6 +362,8 @@ type scriptedSession struct {
 	declaration *workarea.RepositoryDeclarationV1
 	// budget is the session's stage budget (nil = none).
 	budget *prompt.StageBudget
+	// seatBudget is the session's per-seat resource budget (nil = none).
+	seatBudget *SeatBudget
 	// platform, when set, is the platform double the session posts to, so a
 	// test can read the terminal status it received.
 	platform *recordingPlatformServer
@@ -423,6 +441,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	}
 	qw.WorkType = cfg.workType
 	qw.StageBudget = cfg.budget
+	qw.SeatBudget = cfg.seatBudget
 	switch {
 	case cfg.declaration != nil:
 		qw.RepositoryDeclaration = cfg.declaration

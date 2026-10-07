@@ -1186,6 +1186,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 	spawnerOpts.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
 	spawnerOpts.ProjectAdmissionMode = cfg.EffectiveProjectAdmissionMode()
 	spawnerOpts.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
+	// Per-seat resource budget: resolve the authored block against host
+	// capacity once here (not per spawn — NumCPU/meminfo do not change
+	// under a running daemon). A zero block means budgeting is off and
+	// leaves every seat exactly as before. Only set what the operator
+	// authored: an embedder that composed its own SpawnerOptions.SeatBudget
+	// keeps it.
+	if spawnerOpts.SeatBudget == (SeatBudget{}) && cfg.Capacity.SeatBudget != (SeatBudgetConfig{}) {
+		resolved := resolveSeatBudget(cfg.Capacity.SeatBudget, cfg.Capacity.MaxConcurrentSessions, 0, 0)
+		spawnerOpts.SeatBudget = SeatBudget{
+			CPUs:     resolved.CPUs,
+			MemoryMB: resolved.MemoryMB,
+			IOWeight: resolved.IOWeight,
+			Mode:     string(resolved.Mode),
+		}
+	}
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
 	}
@@ -1680,7 +1695,8 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
-	if !projectsChanged && !localChanged && !capacityChanged {
+	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -1701,6 +1717,27 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			}
 		}
 		d.config.Capacity.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
+	}
+	if seatBudgetChanged {
+		if err := validateSeatBudget(cfg.Capacity.SeatBudget); err != nil {
+			d.mu.Unlock()
+			releasePolicy()
+			slog.Warn("[yaml-watcher] rejected seat budget", "error", err)
+			return
+		}
+		// Re-resolve against the (possibly new) seat count so derived
+		// shares track the live capacity. Seats already running keep the
+		// budget they started with; only new spawns see the new share.
+		resolved := resolveSeatBudget(cfg.Capacity.SeatBudget, cfg.Capacity.MaxConcurrentSessions, 0, 0)
+		if d.spawner != nil {
+			d.spawner.SetSeatBudget(SeatBudget{
+				CPUs:     resolved.CPUs,
+				MemoryMB: resolved.MemoryMB,
+				IOWeight: resolved.IOWeight,
+				Mode:     string(resolved.Mode),
+			})
+		}
+		d.config.Capacity.SeatBudget = cfg.Capacity.SeatBudget
 	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {
@@ -2057,6 +2094,18 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	// no-op, so the legacy WorkerCapabilitiesFunc value stands. Appended AFTER
 	// WithWorkerCapabilities so the per-org flag is authoritative when present.
 	opts = append(opts, WithMergeQueueLanding(item.MergeQueueLanding))
+	// Per-seat budget: stamp the daemon's resolved share so the worker
+	// applies the cooperative caps and reports the seat posture on the
+	// session result. A disabled budget stamps nothing.
+	if budget := d.daemonSeatBudget(); !budget.Disabled() {
+		rep := seatBudgetReport(budget)
+		opts = append(opts, WithSeatBudget(&SessionSeatBudget{
+			Mode:     rep.Mode,
+			CPUs:     rep.CPUs,
+			MemoryMB: rep.MemoryMB,
+			Detail:   rep.Detail,
+		}))
+	}
 	detail := PollItemToSessionDetail(
 		item,
 		projects,

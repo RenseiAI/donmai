@@ -825,6 +825,13 @@ type Result struct {
 	// retry checkpoint was created, including when there was nothing to
 	// preserve. Additive — old platforms ignore it.
 	ResumeCheckpoint *ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
+
+	// SeatBudget is the per-seat resource budget this session ran under:
+	// the posture (enforced | best-effort | none) with the values. The
+	// worker reports what the seat actually got, so the platform can see
+	// it. Nil when the seat carried no budget. Additive — old platforms
+	// ignore it.
+	SeatBudget *SeatBudgetReport `json:"seatBudget,omitempty"`
 }
 
 // ResumeCheckpoint identifies the branch + head commit a retryable session
@@ -844,6 +851,21 @@ type BudgetBreach struct {
 	Cap string `json:"cap"`
 	// Detail is the human-readable breach, e.g.
 	// "max-tokens exceeded: observed=5010000 limit=5000000".
+	Detail string `json:"detail,omitempty"`
+}
+
+// SeatBudgetReport is the per-seat resource budget one session ran under.
+// The worker reports what the seat actually got: the posture plus the
+// values. Secret-free; safe for the session result.
+type SeatBudgetReport struct {
+	// Mode is enforced | best-effort | none.
+	Mode string `json:"mode"`
+	// CPUs is the whole-core seat share.
+	CPUs int `json:"cpus,omitempty"`
+	// MemoryMB is the seat memory ceiling in mebibytes. Zero means no cap.
+	MemoryMB int `json:"memoryMb,omitempty"`
+	// Detail is a short human line: which placement enforces the budget
+	// on Linux, which knobs carry it on macOS.
 	Detail string `json:"detail,omitempty"`
 }
 
