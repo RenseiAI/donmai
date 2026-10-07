@@ -476,7 +476,7 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 	// The stubbed re-reads below exercise only remote lookups: range
 	// inspection is stubbed to a delivering range so the cases never
 	// shell out to git in a directory that is not a checkout.
-	delivering := func(context.Context, string, string, string) (continueRangeInspection, error) {
+	delivering := func(context.Context, string, string, string, string) (continueRangeInspection, error) {
 		return continueRangeInspection{commitCount: 1, hasCodeChange: true}, nil
 	}
 	refsAt := func(head string) pullRequestRefLookup {

@@ -136,29 +136,31 @@ func (i continueRangeInspection) delivers() bool {
 	return i.hasCodeChange && len(i.scratchPaths) == 0
 }
 
-// inspectContinueRange classifies the commits in from..to for the continued
-// -pull-request delivery gate. Delivery requires at least one non-merge commit
-// in the range that changes a path outside the runner scratch set; any commit
-// in the range adding or modifying a scratch path is reported separately so
-// the caller can fail without rewriting history. Removing a scratch path is
-// cleanup, not a scratch commit, and a merge counts only for what it changed
-// against every parent: what it brings in from either side is the base
-// branch's work or the pull request's own from before dispatch.
-func inspectContinueRange(ctx context.Context, worktreePath, from, to string) (continueRangeInspection, error) {
+// inspectContinueRange classifies the commits the session added between from
+// and to for the continued-pull-request delivery gate: every commit reachable
+// from to but not from from, nor from any remote-tracking branch other than
+// branch's own (the pull request's head branch, which the session pushes to).
+// A side branch the session committed on and merged in is its work; the base
+// branch, or any other published branch it merged, is someone else's.
+// Delivery requires at least one non-merge commit of the session's that
+// changes a path outside the runner scratch set; any of its commits adding or
+// modifying a scratch path is reported separately so the caller can fail
+// without rewriting history. Removing a scratch path is cleanup, not a scratch
+// commit, and a merge counts only for what it changed against every parent.
+func inspectContinueRange(ctx context.Context, worktreePath, branch, from, to string) (continueRangeInspection, error) {
 	from = strings.TrimSpace(from)
 	to = strings.TrimSpace(to)
 	if from == "" || to == "" || strings.EqualFold(from, to) {
 		return continueRangeInspection{}, nil
 	}
-	rng := from + ".." + to
-	commits, err := continueRangeCommits(ctx, worktreePath, rng)
+	commits, err := continueRangeCommits(ctx, worktreePath, branch, from, to)
 	if err != nil {
 		return continueRangeInspection{}, err
 	}
 	if len(commits) == 0 {
 		return continueRangeInspection{}, nil
 	}
-	nonMerges, err := continueRangeCommits(ctx, worktreePath, "--no-merges", rng)
+	nonMerges, err := continueRangeCommits(ctx, worktreePath, branch, from, to, "--no-merges")
 	if err != nil {
 		return continueRangeInspection{}, err
 	}
@@ -194,8 +196,17 @@ func inspectContinueRange(ctx context.Context, worktreePath, from, to string) (c
 	return inspection, nil
 }
 
-func continueRangeCommits(ctx context.Context, worktreePath string, args ...string) ([]string, error) {
-	out, err := gitStdout(ctx, worktreePath, nil, append([]string{"rev-list", "--reverse", "--first-parent"}, args...)...)
+// continueRangeCommits lists the session's commits between from and to (see
+// inspectContinueRange). With no branch every remote-tracking branch is
+// excluded, so a pushed head reads as nothing new: the check fails closed.
+func continueRangeCommits(ctx context.Context, worktreePath, branch, from, to string, flags ...string) ([]string, error) {
+	args := append([]string{"rev-list", "--reverse"}, flags...)
+	args = append(args, to, "--not", from)
+	if branch = strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/"); branch != "" {
+		args = append(args, "--exclude=origin/"+branch)
+	}
+	args = append(args, "--remotes")
+	out, err := gitStdout(ctx, worktreePath, nil, args...)
 	if err != nil {
 		return nil, fmt.Errorf("runner: list continued pull request commits: %w", err)
 	}

@@ -488,6 +488,47 @@ func TestInspectContinueRange(t *testing.T) {
 			wantScratchPaths: []string{".scratch/merge.md"},
 		},
 		{
+			name: "side branch code merged in",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				gitRun(t, repo, "checkout", "-q", "-b", "side")
+				commitFixtureFiles(t, repo, map[string]string{"fix.go": "package fix\n"}, "code on a side branch")
+				gitRun(t, repo, "checkout", "-q", branch)
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge side", "side")
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+			wantCommitCount: 3,
+			wantDelivers:    true,
+		},
+		{
+			name: "side branch scratch merged in",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				gitRun(t, repo, "checkout", "-q", "-b", "side")
+				commitFixtureFiles(t, repo, map[string]string{".scratch/notes.md": "notes\n"}, "scratch on a side branch")
+				gitRun(t, repo, "checkout", "-q", branch)
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge side", "side")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+			wantCommitCount:  2,
+			wantScratchPaths: []string{".scratch/notes.md"},
+		},
+		{
+			name: "pushed head is the session's own",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				newHead = commitFixtureFiles(t, repo, map[string]string{"fix.go": "package fix\n"}, "code change")
+				gitRun(t, repo, "push", "-q", "origin", "HEAD:refs/heads/"+branch)
+				return repo, startHead, newHead
+			},
+			wantCommitCount: 1,
+			wantDelivers:    true,
+		},
+		{
 			name: "no new commits",
 			arrange: func(t *testing.T) (repo, startHead, newHead string) {
 				_, repo = backstopRemoteFixture(t)
@@ -499,7 +540,7 @@ func TestInspectContinueRange(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			repo, startHead, newHead := tc.arrange(t)
-			got, err := inspectContinueRange(context.Background(), repo, startHead, newHead)
+			got, err := inspectContinueRange(context.Background(), repo, branch, startHead, newHead)
 			if err != nil {
 				t.Fatalf("inspectContinueRange: %v", err)
 			}

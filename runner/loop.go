@@ -1721,7 +1721,7 @@ tailRecovery:
 				var inspection continueRangeInspection
 				var inspectErr error
 				if headMoved {
-					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, startHead, localHead)
+					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, continuePullRequestBranch(qw.ContinuePullRequest), startHead, localHead)
 				}
 				switch {
 				case inspectErr != nil:
