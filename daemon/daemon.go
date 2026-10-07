@@ -1200,6 +1200,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.DaemonControlURL == nil {
 		spawnerOpts.DaemonControlURL = d.ControlURL
 	}
+	// Hand every spawned worker its own session-detail read credential.
+	// The store mints the token at accept time; stating it here lets the
+	// worker read its own detail without holding the operator control
+	// token. An embedder-supplied func keeps priority — the daemon only
+	// fills the gap it would otherwise leave.
+	if spawnerOpts.SessionReadToken == nil {
+		spawnerOpts.SessionReadToken = d.sessionReadToken
+	}
 	// Default WorktreeParentDir to the same statepath-resolved worktrees
 	// directory the spawned `donmai agent run` worker uses when no
 	// --worktree-dir override is passed (afcli/agent_run.go). Keeping the
@@ -2906,6 +2914,31 @@ func (d *Daemon) SessionDetail(sessionID string) (*SessionDetail, bool) {
 		return nil, false
 	}
 	return d.sessionDetails.Get(sessionID)
+}
+
+// sessionReadToken returns the live per-session read credential for
+// sessionID. It is the spawner's lookup for the credential stated in
+// each spawned worker's environment: minting happens in the detail
+// store at accept time, so this is a read, never a mint.
+func (d *Daemon) sessionReadToken(sessionID string) (string, bool) {
+	if d.sessionDetails == nil {
+		return "", false
+	}
+	return d.sessionDetails.readTokenFor(sessionID)
+}
+
+// SessionReadTokenForTest returns the live per-session read credential
+// for sessionID. Exported for the worker-bootstrap tests, which prove
+// the end-to-end read through the production HTTP route: accept a
+// session in-process, read back the credential the daemon would state
+// in the spawned worker's environment, and fetch the detail with it.
+// Production code never calls this; the spawner reads the same value
+// through the SessionReadToken hook wired at Start.
+func SessionReadTokenForTest(d *Daemon, sessionID string) (string, bool) {
+	if d == nil {
+		return "", false
+	}
+	return d.sessionReadToken(sessionID)
 }
 
 // UpdateSessionRuntimeCredentials re-stamps the runtime credentials of the

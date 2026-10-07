@@ -303,14 +303,18 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// operator mistake or this process guessing at an address nobody gave it.
 	daemonURL, daemonURLSource := resolveAgentRunDaemonURL(opts.daemonURL, os.Getenv)
 
-	// 2b. Resolve the optional daemon-control bearer token. In a cloud
-	// sandbox the provisioner points DONMAI_DAEMON_URL at an authenticated
-	// remote endpoint and sets DONMAI_RUNTIME_JWT to the token that
-	// endpoint expects; the token is attached as `Authorization: Bearer
-	// <token>` on daemon-control requests. When unset (the default
-	// localhost loopback at 127.0.0.1:7734) no Authorization header is
-	// sent, preserving the unauthenticated loopback behavior.
-	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+	// 2b. Resolve the bearer token for the session-detail read. Precedence:
+	// the per-session read credential the spawning daemon stated in this
+	// worker's environment (authorizes exactly this session's detail read
+	// and nothing else), then the sandbox provisioner's endpoint token
+	// (an authenticated remote endpoint reached via DONMAI_DAEMON_URL
+	// with the token in DONMAI_RUNTIME_JWT). When neither is set (the
+	// default localhost loopback) the request carries no Authorization
+	// header and the daemon answers with the credential-redacted shape.
+	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_SESSION_READ_TOKEN"))
+	if daemonToken == "" {
+		daemonToken = strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+	}
 	if opts.localRuntime && (daemonToken == "" || daemonURLSource == daemonURLSourceBuiltinDefault) {
 		return preflightErr("local worker requires its explicit daemon origin and attempt credential")
 	}
@@ -367,6 +371,20 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		"provider", providerNameFromDetail(detail),
 		"workType", detail.WorkType,
 	)
+	// A detail read that crossed no credential boundary answers with the
+	// credential fields cleared. A worker that bootstraps from such an
+	// answer cannot talk to the platform it was claimed for, so log the
+	// shortfall loudly: production daemons always state the session's
+	// own read credential in the spawn environment, and its absence here
+	// means this worker was started by hand (or by a daemon that
+	// predates the credential) rather than by its own session's spawn.
+	if detail.AuthToken == "" {
+		logger.Warn(
+			"agent run: session detail carries no runtime credential; platform calls will fail unless the daemon refreshes it",
+			"sessionId", sessionID,
+			"daemonUrlSource", daemonURLSource,
+		)
+	}
 	if len(detail.AdmissionReceipt) > 0 {
 		hostReceipt, err := executioncell.DecodeHostAdaptationReceipt(detail.HostAdaptationReceipt)
 		if err != nil || hostReceipt.RequestID != detail.SessionID ||

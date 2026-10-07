@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"net/http"
 	"strings"
 )
@@ -27,6 +29,22 @@ const (
 // path, error detail, or credential.
 const controlTokenUnavailableMessage = "control token unavailable: mutating control routes are disabled until the daemon restarts with a readable control token; read-only routes stay available"
 
+// controlBearer extracts the bearer credential from r's Authorization
+// header, or "" when the header is absent or malformed. It is the
+// single parser for control-surface bearer checks: the mutating gate and
+// the session-detail read agree on what counts as a presented credential.
+func controlBearer(r *http.Request) string {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") {
+		return ""
+	}
+	token := strings.TrimPrefix(values[0], "Bearer ")
+	if strings.TrimSpace(token) != token || token == "" {
+		return ""
+	}
+	return token
+}
+
 // controlAuthState reports the gate mode and, when enforced, the token.
 func controlAuthState(d *Daemon) (controlAuthMode, string) {
 	if d == nil {
@@ -41,6 +59,23 @@ func controlAuthState(d *Daemon) (controlAuthMode, string) {
 	return controlAuthOpen, ""
 }
 
+// sessionReadTokenEnv names the per-session read credential the daemon
+// states in every spawned worker's environment. It carries no operator
+// privilege: it authorizes exactly one session-detail read, for exactly
+// the session named beside it, and nothing else on the control API.
+const sessionReadTokenEnv = "DONMAI_SESSION_READ_TOKEN" //nolint:gosec // G101: an env-var NAME, not a credential.
+
+// mintSessionReadToken returns a fresh random per-session read credential.
+// The token is opaque to every holder: the daemon compares it with the
+// stored value in constant time and never derives meaning from its bytes.
+func mintSessionReadToken() string {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(raw)
+}
+
 // requireControlAuth gates the mutating methods of a control handler behind
 // the per-install bearer token. GET requests pass through untouched so
 // read-only status stays available to dashboards, spawned workers fetching
@@ -48,6 +83,13 @@ func controlAuthState(d *Daemon) (controlAuthMode, string) {
 // but no token is loaded, mutating requests get 503 — the gate fails
 // closed. Only a daemon built with neither a token nor RequireControlToken
 // (tests, harnesses) runs the routes open.
+//
+// The session-detail read (GET /api/daemon/sessions/<id>) is NOT covered
+// by this gate's GET pass-through: that payload carries per-session
+// credentials, so handleSessionDetail enforces its own read rule
+// (operator control token or the session's own read credential) and this
+// wrapper must not pre-empt it. The wrapper therefore passes the
+// detail-GET path straight to the handler, which owns the decision.
 func (s *Server) requireControlAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {

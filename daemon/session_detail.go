@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"sync"
 
@@ -540,6 +541,10 @@ type sessionDetailStore struct {
 	details        map[string]*SessionDetail
 	generations    map[string]uint64
 	nextGeneration uint64
+	// readTokens holds the per-session read credential minted at accept
+	// time. It authorizes exactly one route — the session-detail GET for
+	// the session named beside it — and is never served on any response.
+	readTokens map[string]string
 }
 
 type sessionDetailLease struct {
@@ -552,6 +557,7 @@ func newSessionDetailStore() *sessionDetailStore {
 	return &sessionDetailStore{
 		details:     make(map[string]*SessionDetail),
 		generations: make(map[string]uint64),
+		readTokens:  make(map[string]string),
 	}
 }
 
@@ -583,6 +589,17 @@ func (s *sessionDetailStore) StoreIfAbsent(d *SessionDetail) (sessionDetailLease
 	generation := s.nextGenerationLocked()
 	s.details[d.SessionID] = d
 	s.generations[d.SessionID] = generation
+	if s.readTokens == nil {
+		s.readTokens = make(map[string]string)
+	}
+	// Mint the per-session read credential exactly once per installation.
+	// A retry that finds the id already owned keeps the first token, so at
+	// most one live credential ever names this session generation.
+	if _, ok := s.readTokens[d.SessionID]; !ok {
+		if tok := mintSessionReadToken(); tok != "" {
+			s.readTokens[d.SessionID] = tok
+		}
+	}
 	return sessionDetailLease{sessionID: d.SessionID, generation: generation}, true
 }
 
@@ -659,6 +676,9 @@ func (s *sessionDetailStore) Delete(id string) {
 	defer s.mu.Unlock()
 	delete(s.details, id)
 	delete(s.generations, id)
+	// The read credential dies with the detail it names: a terminated
+	// session's credential must not outlive the session.
+	delete(s.readTokens, id)
 }
 
 // DeleteIfOwner removes only the generation installed by lease. It is the
@@ -675,6 +695,10 @@ func (s *sessionDetailStore) DeleteIfOwner(lease sessionDetailLease) bool {
 	}
 	delete(s.details, lease.sessionID)
 	delete(s.generations, lease.sessionID)
+	// Roll back the credential minted for this exact installation with it:
+	// a failed attempt must not leave a live credential behind, and a
+	// later generation mints its own on install.
+	delete(s.readTokens, lease.sessionID)
 	return true
 }
 
@@ -684,4 +708,55 @@ func (s *sessionDetailStore) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.details)
+}
+
+// readTokenFor returns the per-session read credential minted for id, or
+// ("", false) when the session is unknown. The token authorizes exactly
+// one route — the session-detail GET for id — and is minted at accept
+// time, rotated never, and deleted with the detail it names.
+func (s *sessionDetailStore) readTokenFor(id string) (string, bool) {
+	if id == "" {
+		return "", false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tok, ok := s.readTokens[id]
+	if !ok || tok == "" {
+		return "", false
+	}
+	return tok, true
+}
+
+// verifySessionReadToken reports whether bearer is the live read
+// credential for id. Comparison is constant-time; an empty bearer never
+// matches, even against an empty stored value.
+func (s *sessionDetailStore) verifySessionReadToken(id, bearer string) bool {
+	if id == "" || bearer == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	want, ok := s.readTokens[id]
+	if !ok || want == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(bearer), []byte(want)) == 1
+}
+
+// redactSessionDetail returns a copy of d with every credential field
+// cleared. The redacted copy answers unauthenticated operator reads
+// (dashboard, CLI status, diagnostics) while the stored original keeps
+// serving credentialed holders. Every field that can carry a bearer or
+// equivalent authenticator belongs here; adding a credential field to
+// SessionDetail without adding it here re-opens the route this exists
+// to close.
+func redactSessionDetail(d *SessionDetail) *SessionDetail {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	out.AuthToken = ""
+	out.McpAuthToken = ""
+	out.McpAuthTokenExpiresAt = ""
+	return &out
 }
