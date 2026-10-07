@@ -442,6 +442,104 @@ func TestMapLine_RateLimitEvent_System(t *testing.T) {
 	}
 }
 
+func TestMapLine_RateLimitEvent_UsageWindow(t *testing.T) {
+	t.Parallel()
+
+	// A streamed event naming a window with a utilization fraction
+	// maps onto the shared quota-window type the daemon publishes.
+	// The production entry point is the stateful mapper: the test
+	// drives MapLine, not the stateless decoder.
+	line := []byte(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.85,"resetsAt":1784000000}}`)
+	var mapper LineMapper
+	events := mapper.MapLine(line)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	usage, ok := events[0].(agent.UsageEvent)
+	if !ok {
+		t.Fatalf("event %T, want UsageEvent", events[0])
+	}
+	if usage.Usage == nil || len(usage.Usage.Windows) != 1 {
+		t.Fatalf("usage = %+v, want one window", usage.Usage)
+	}
+	w := usage.Usage.Windows[0]
+	if w.ID != "seven_day" || w.Kind != agent.UsageWindowWeekly {
+		t.Errorf("window = %+v, want seven_day weekly", w)
+	}
+	if w.UsedPercent != 85 {
+		t.Errorf("UsedPercent = %v, want 85", w.UsedPercent)
+	}
+	if w.ResetsAt == "" {
+		t.Error("window carries no reset time")
+	}
+	if w.WindowDurationMins == nil || *w.WindowDurationMins != 7*24*60 {
+		t.Errorf("duration = %v, want the probe's weekly 10080", w.WindowDurationMins)
+	}
+	if w.Label != "Weekly" {
+		t.Errorf("Label = %q, want the probe's Weekly label", w.Label)
+	}
+}
+
+// A streamed overage event lands on the probe's window id: the mapper
+// records the model-scoped bucket name the usage read drew, and the
+// event reuses that row instead of opening an orphan scoped row. The
+// test drives the production entry point (the stateful mapper fed a
+// probe result, then the streamed line); reverting the stream path to
+// the verbatim event-type id reopens the orphan row and fails it.
+func TestLineMapper_RateLimitOverageLandsOnProbeRow(t *testing.T) {
+	t.Parallel()
+
+	const resetsAt = 1784000000.0
+	overage := []byte(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day_overage_included","utilization":0.4,"resetsAt":1784000000}}`)
+
+	// Without a probe the bucket stays dropped: no name to land on.
+	var unnamed LineMapper
+	if events := unnamed.MapLine(overage); len(events) != 1 {
+		t.Fatalf("unnamed mapper: got %d events, want 1", len(events))
+	} else if _, ok := events[0].(agent.SystemEvent); !ok {
+		t.Fatalf("unnamed mapper: event %T, want the plain rate-limit marker", events[0])
+	}
+
+	var mapper LineMapper
+	mapper.RecordUsageLimits("Fable")
+	events := mapper.MapLine(overage)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	usage, ok := events[0].(agent.UsageEvent)
+	if !ok {
+		t.Fatalf("event %T, want UsageEvent", events[0])
+	}
+	if usage.Usage == nil || len(usage.Usage.Windows) != 1 {
+		t.Fatalf("usage = %+v, want one window", usage.Usage)
+	}
+	w := usage.Usage.Windows[0]
+	if w.ID != "seven_day_fable" {
+		t.Errorf("window id = %q, want the probe's seven_day_fable row", w.ID)
+	}
+	if w.Kind != agent.UsageWindowWeekly || w.Label != "Weekly · Fable" {
+		t.Errorf("window = %+v, want the probe's weekly Fable row", w)
+	}
+	if w.UsedPercent != 40 {
+		t.Errorf("UsedPercent = %v, want 40", w.UsedPercent)
+	}
+	if w.WindowDurationMins == nil || *w.WindowDurationMins != 7*24*60 {
+		t.Errorf("duration = %v, want the probe's weekly 10080", w.WindowDurationMins)
+	}
+	if want := agent.ISOFromEpochSeconds(resetsAt); w.ResetsAt != want {
+		t.Errorf("ResetsAt = %q, want %q", w.ResetsAt, want)
+	}
+
+	// Unknown types stay dropped, matching the probe mapper's nil for
+	// an unrendered window.
+	unknown := []byte(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day_opus","utilization":0.1,"resetsAt":1784000000}}`)
+	if events := mapper.MapLine(unknown); len(events) != 1 {
+		t.Fatalf("unknown type: got %d events, want 1", len(events))
+	} else if sys, ok := events[0].(agent.SystemEvent); !ok || sys.Subtype != "rate_limit" {
+		t.Fatalf("unknown type: event %#v, want the plain rate-limit marker", events[0])
+	}
+}
+
 func TestMapLine_InvalidJSON_ErrorEvent(t *testing.T) {
 	t.Parallel()
 

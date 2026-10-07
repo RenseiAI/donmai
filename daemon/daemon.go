@@ -485,6 +485,12 @@ type Daemon struct {
 	poller    *PollService
 	spawner   *WorkerSpawner
 
+	// quota is the subscription quota-snapshot cache behind the
+	// heartbeat quota field: one entry per signed-in account. Probes
+	// fire at most every 5 minutes per provider; failed probes keep
+	// the last good windows.
+	quota *quotaState
+
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
 	// session composition that lands after startup re-declares this daemon's
@@ -629,6 +635,7 @@ func New(opts Options) *Daemon {
 		sessionDetails:   newSessionDetailStore(),
 		routingTraces:    NewRoutingTraceStore(DefaultRoutingRingBufferSize),
 		shims:            newSessionShimState(),
+		quota:            &quotaState{},
 	}
 	d.shimIdentityRef.Store(newSessionShimIdentity(&d.opts.SessionShim, opts.SessionShimStandDown))
 	if opts.RulesetSnapshot != nil {
@@ -1433,6 +1440,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 					Entries:           AllowlistEntriesFromConfig(d.spawner.AllProjects()),
 				}
 			},
+			// Quota snapshot: subscription windows for this host's
+			// signed-in accounts, read at most every 5 minutes per
+			// provider and merged with turn-driven updates. Nil-safe:
+			// a host with no quota state omits the key.
+			GetQuota: d.quotaSnapshot,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)

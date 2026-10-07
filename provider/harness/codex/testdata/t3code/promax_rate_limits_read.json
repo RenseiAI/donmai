@@ -1,0 +1,16 @@
+{
+  "rateLimits": {
+    "limitId": "codex",
+    "planType": "promax",
+    "primary": {"usedPercent": 1, "resetsAt": 1791646860, "windowDurationMins": 10080},
+    "secondary": {"usedPercent": 1, "resetsAt": 1791646860, "windowDurationMins": 10080}
+  },
+  "rateLimitsByLimitId": {
+    "codex": {
+      "limitId": "codex",
+      "planType": "promax",
+      "primary": {"usedPercent": 1, "resetsAt": 1791646860, "windowDurationMins": 10080},
+      "secondary": {"usedPercent": 1, "resetsAt": 1791646860, "windowDurationMins": 10080}
+    }
+  }
+}

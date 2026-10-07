@@ -25,6 +25,7 @@ package daemon
 import (
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runner/access"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -393,6 +394,15 @@ type HeartbeatPayload struct {
 	// per beat. Best-effort: when unavailable the key is omitted entirely
 	// (GetLoadAverage returns ok=false), matching Load's contract.
 	LoadAverage *heartbeatLoadAverageFields `json:"loadAverage,omitempty"`
+
+	// Quota carries the subscription quota snapshot for this host's
+	// signed-in accounts: one entry per account with its quota windows,
+	// plan, allowance bucket, reset credits and the harness's latest
+	// login-check outcome (authCheck). Populated from
+	// HeartbeatOptions.GetQuota when configured; nil (and thus omitted
+	// from the wire body) otherwise. Account IDs ride as opaque values
+	// the platform hashes — the payload never carries an address.
+	Quota []agent.UsageAccount `json:"quota,omitempty"`
 }
 
 // ── Auto-update channel/schedule ───────────────────────────────────────────
