@@ -47,7 +47,7 @@ func TestDirs_ContractOfTheTable(t *testing.T) {
 // a REMOVAL visible rather than silently narrowing the guarantee everywhere.
 func TestDirs_CoversTheKnownHarnessState(t *testing.T) {
 	t.Parallel()
-	want := []string{".agent", ".claude", ".codex", ".pi"}
+	want := []string{".agent", ".claude", ".codex", ".pi", ".scratch"}
 	got := Dirs()
 	if len(got) != len(want) {
 		t.Fatalf("Dirs() = %v, want %v", got, want)
@@ -92,6 +92,7 @@ func TestIsStateDir_MatchesWholeNames(t *testing.T) {
 		".pi":          true,
 		".claude":      true,
 		".codex":       true,
+		".scratch":     true,
 		".pi-cache":    false,
 		".agentfoo":    false,
 		"pi":           false,

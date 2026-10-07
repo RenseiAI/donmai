@@ -243,6 +243,7 @@ func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 		{".pi/session.jsonl", true},
 		{".pi/agent-home/config.json", true},
 		{".pi", false},
+		{".scratch/comments.json", true},
 		{"app/.pi", false},
 		{".claude/settings.local.json", true},
 		{".codex/history.jsonl", true},

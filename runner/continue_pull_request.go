@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -123,25 +126,134 @@ func checkoutContinuePullRequest(ctx context.Context, worktreePath string, cpr *
 	return nil
 }
 
-// continueDelivered reports whether a continue-mode run delivered work
-// onto the continued pull request: the session's checkout moved past the
-// dispatched head commit. A run that changed nothing — local HEAD still
-// the dispatched head, or a local HEAD the remote head does not carry —
-// is not delivered, mirroring the verifier's no-new-commit rule.
-func continueDelivered(localHead, remoteHead, startHead string) bool {
-	localHead = strings.TrimSpace(localHead)
-	remoteHead = strings.TrimSpace(remoteHead)
-	startHead = strings.TrimSpace(startHead)
-	if localHead == "" || startHead == "" {
-		return false
+type continueRangeInspection struct {
+	commitCount   int
+	hasCodeChange bool
+	scratchPaths  []string
+}
+
+func (i continueRangeInspection) delivers() bool {
+	return i.hasCodeChange && len(i.scratchPaths) == 0
+}
+
+// inspectContinueRange classifies the commits the session added between from
+// and to for the continued-pull-request delivery gate: every commit reachable
+// from to but not from from, nor from any remote-tracking branch other than
+// branch's own (the pull request's head branch, which the session pushes to).
+// A side branch the session committed on and merged in is its work; the base
+// branch, or any other published branch it merged, is someone else's.
+// Delivery requires at least one non-merge commit of the session's that
+// changes a path outside the runner scratch set; any of its commits adding or
+// modifying a scratch path is reported separately so the caller can fail
+// without rewriting history. Removing a scratch path is cleanup, not a scratch
+// commit, and a merge counts only for what it changed against every parent.
+func inspectContinueRange(ctx context.Context, worktreePath, branch, from, to string) (continueRangeInspection, error) {
+	from = strings.TrimSpace(from)
+	to = strings.TrimSpace(to)
+	if from == "" || to == "" || strings.EqualFold(from, to) {
+		return continueRangeInspection{}, nil
 	}
-	if strings.EqualFold(localHead, startHead) {
-		return false
+	commits, err := continueRangeCommits(ctx, worktreePath, branch, from, to)
+	if err != nil {
+		return continueRangeInspection{}, err
 	}
-	if remoteHead == "" {
-		return false
+	if len(commits) == 0 {
+		return continueRangeInspection{}, nil
 	}
-	return strings.EqualFold(remoteHead, localHead)
+	nonMerges, err := continueRangeCommits(ctx, worktreePath, branch, from, to, "--no-merges")
+	if err != nil {
+		return continueRangeInspection{}, err
+	}
+	nonMergeSet := make(map[string]struct{}, len(nonMerges))
+	for _, commit := range nonMerges {
+		nonMergeSet[commit] = struct{}{}
+	}
+	inspection := continueRangeInspection{commitCount: len(commits)}
+	scratchSet := map[string]struct{}{}
+	for _, commit := range commits {
+		changes, pathErr := continueCommitChanges(ctx, worktreePath, commit)
+		if pathErr != nil {
+			return continueRangeInspection{}, pathErr
+		}
+		for _, change := range changes {
+			switch {
+			case !isContinueScratchPath(change.path):
+				if _, ok := nonMergeSet[commit]; ok {
+					inspection.hasCodeChange = true
+				}
+			case !change.deleted:
+				scratchSet[change.path] = struct{}{}
+			}
+		}
+	}
+	if len(scratchSet) > 0 {
+		inspection.scratchPaths = make([]string, 0, len(scratchSet))
+		for path := range scratchSet {
+			inspection.scratchPaths = append(inspection.scratchPaths, path)
+		}
+		sort.Strings(inspection.scratchPaths)
+	}
+	return inspection, nil
+}
+
+// continueRangeCommits lists the session's commits between from and to (see
+// inspectContinueRange). With no branch every remote-tracking branch is
+// excluded, so a pushed head reads as nothing new: the check fails closed.
+func continueRangeCommits(ctx context.Context, worktreePath, branch, from, to string, flags ...string) ([]string, error) {
+	args := append([]string{"rev-list", "--reverse"}, flags...)
+	args = append(args, to, "--not", from)
+	if branch = strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/"); branch != "" {
+		args = append(args, "--exclude=origin/"+branch)
+	}
+	args = append(args, "--remotes")
+	out, err := gitStdout(ctx, worktreePath, nil, args...)
+	if err != nil {
+		return nil, fmt.Errorf("runner: list continued pull request commits: %w", err)
+	}
+	return filterEmpty(strings.Split(strings.TrimSpace(out), "\n")), nil
+}
+
+// continueChange is one path a commit changed, and whether the commit
+// deleted it.
+type continueChange struct {
+	path    string
+	deleted bool
+}
+
+// continueCommitChanges lists the paths commit itself changed. --cc keeps a
+// non-merge commit's diff as is and narrows a merge to the paths it changed
+// against every parent (its own conflict resolution or additions).
+func continueCommitChanges(ctx context.Context, worktreePath, commit string) ([]continueChange, error) {
+	out, err := gitStdout(ctx, worktreePath, nil, "diff-tree", "--no-commit-id", "--name-status", "-z", "-r", "--cc", "--root", commit)
+	if err != nil {
+		return nil, fmt.Errorf("runner: list continued pull request paths for %s: %w", commit, err)
+	}
+	fields := strings.Split(strings.Trim(out, "\x00\n"), "\x00")
+	changes := make([]continueChange, 0, len(fields)/2)
+	for i := 0; i+1 < len(fields); i += 2 {
+		status, path := strings.TrimSpace(fields[i]), fields[i+1]
+		if status == "" || path == "" {
+			continue
+		}
+		changes = append(changes, continueChange{path: path, deleted: strings.Trim(status, "D") == ""})
+	}
+	return changes, nil
+}
+
+// continueScratchDirs are the top-level directories a continued pull
+// request must never gain a commit in: the runner's own state, the pi
+// harness's session storage and the seat scratch. harnessstate also lists
+// the Claude Code and Codex CLI directories, which the backstop never
+// auto-commits; a repository may track those as project content (agent
+// settings, skills), so a commit the agent made there is delivered work.
+var continueScratchDirs = []string{harnessstate.RunnerStateDir, harnessstate.PiStateDir, harnessstate.SeatScratchDir}
+
+// isContinueScratchPath reports whether path sits under one of
+// continueScratchDirs. Only the first path component decides, so a nested
+// directory that merely shares the name stays ordinary project content.
+func isContinueScratchPath(path string) bool {
+	top, rest, nested := strings.Cut(strings.TrimSpace(path), "/")
+	return nested && rest != "" && slices.Contains(continueScratchDirs, top)
 }
 
 // continueDiverged reports whether a backstop report carries the typed
