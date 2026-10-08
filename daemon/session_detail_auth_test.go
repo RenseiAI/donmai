@@ -285,6 +285,91 @@ func TestSessionDetail_SpawnEnvCarriesReadToken(t *testing.T) {
 
 // TestSessionDetail_RedactKeepsStoredOriginal proves the redaction copies:
 // the stored detail still serves credentials after a redacted read.
+// rawSessionDetailBody returns the raw body of GET /api/daemon/sessions/<id>,
+// attaching bearer when non-empty, and fails unless the status is 200.
+func rawSessionDetailBody(t *testing.T, addr, id, bearer string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/api/daemon/sessions/"+id, nil) //nolint:gosec,noctx
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/daemon/sessions/%s: %v", id, err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/daemon/sessions/%s = %d (%v)", id, res.StatusCode, err)
+	}
+	return string(raw)
+}
+
+// TestSessionDetail_RedactedBodyCarriesNoPollCredential seeds the detail
+// through the production poll decode path. There the operational payload
+// is the canonical projection of the raw work item, so it repeats the
+// item's mcpAuthToken, and the agent-card MCP servers arrive verbatim with
+// their own header and env values. A credential-free read must carry none
+// of those bytes anywhere in the body; both credentialed reads keep them.
+func TestSessionDetail_RedactedBodyCarriesNoPollCredential(t *testing.T) {
+	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.RequireControlToken = true
+		o.ControlToken = testControlToken
+	})
+	defer cleanup()
+
+	const raw = `{"sessionId":"sess-poll-creds","repository":"github.com/foo/bar","ref":"main",` +
+		`"mcpAuthToken":"mcp-item-secret","mcpAuthTokenExpiresAt":"2030-01-01T00:00:00Z",` +
+		`"mcpServers":[{"name":"card-http","type":"http","url":"https://mcp.example/x",` +
+		`"headers":{"Authorization":"Bearer card-header-secret"}},` +
+		`{"name":"card-stdio","type":"stdio","command":"card-server","env":{"CARD_API_KEY":"card-env-secret"}}]}`
+	var item PollWorkItem
+	if err := json.Unmarshal([]byte(raw), &item); err != nil {
+		t.Fatalf("decode poll item: %v", err)
+	}
+	detail := PollItemToSessionDetail(item, nil, "https://platform.example.com", "worker-auth-secret", "wkr_1")
+	if !strings.Contains(string(detail.OperationalPayload), "mcp-item-secret") {
+		t.Fatal("fixture: the operational payload no longer repeats the item's mcpAuthToken")
+	}
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{
+		SessionID: "sess-poll-creds", Repository: "github.com/foo/bar", Ref: "main",
+	}, detail); err != nil {
+		t.Fatalf("AcceptWorkWithDetail: %v", err)
+	}
+	secrets := []string{"mcp-item-secret", "card-header-secret", "card-env-secret", "worker-auth-secret"}
+
+	bare := rawSessionDetailBody(t, srv.Addr(), "sess-poll-creds", "")
+	for _, secret := range secrets {
+		if strings.Contains(bare, secret) {
+			t.Errorf("credential-free body carries %q: %s", secret, bare)
+		}
+	}
+	var redacted SessionDetail
+	if err := json.Unmarshal([]byte(bare), &redacted); err != nil {
+		t.Fatalf("decode redacted detail: %v", err)
+	}
+	if len(redacted.McpServers) != 2 || redacted.McpServers[0].Name != "card-http" ||
+		redacted.McpServers[1].Type != "stdio" {
+		t.Errorf("redacted MCP servers lost their names or transports: %+v", redacted.McpServers)
+	}
+
+	readTok, ok := d.sessionReadToken("sess-poll-creds")
+	if !ok {
+		t.Fatal("no read credential minted for sess-poll-creds")
+	}
+	for _, bearer := range []string{testControlToken, readTok} {
+		full := rawSessionDetailBody(t, srv.Addr(), "sess-poll-creds", bearer)
+		for _, secret := range secrets {
+			if !strings.Contains(full, secret) {
+				t.Errorf("credentialed body lost %q", secret)
+			}
+		}
+	}
+}
+
 func TestSessionDetail_RedactKeepsStoredOriginal(t *testing.T) {
 	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
 		o.RequireControlToken = true

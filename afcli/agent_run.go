@@ -311,9 +311,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// with the token in DONMAI_RUNTIME_JWT). When neither is set (the
 	// default localhost loopback) the request carries no Authorization
 	// header and the daemon answers with the credential-redacted shape.
-	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_SESSION_READ_TOKEN"))
-	if daemonToken == "" {
-		daemonToken = strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+	//
+	// A local-runtime worker presents its attempt credential only. Its
+	// spawn environment states both, but the local receiver authenticates
+	// the attempt credential on the detail read and on every callback
+	// (the credential cache below reuses this token) and never consults
+	// the read credential.
+	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+	if readToken := strings.TrimSpace(os.Getenv("DONMAI_SESSION_READ_TOKEN")); readToken != "" && !opts.localRuntime {
+		daemonToken = readToken
 	}
 	if opts.localRuntime && (daemonToken == "" || daemonURLSource == daemonURLSourceBuiltinDefault) {
 		return preflightErr("local worker requires its explicit daemon origin and attempt credential")

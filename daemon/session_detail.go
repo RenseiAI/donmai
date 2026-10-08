@@ -774,5 +774,25 @@ func redactSessionDetail(d *SessionDetail) *SessionDetail {
 	out.AuthToken = ""
 	out.McpAuthToken = ""
 	out.McpAuthTokenExpiresAt = ""
+	// The operational payload is the canonical projection of the raw poll
+	// item (executioncell.ProjectOperationalPayload), so it repeats every
+	// credential the item carried, mcpAuthToken included. Only the worker's
+	// admission-digest check reads it, and that read is credentialed.
+	out.OperationalPayload = nil
+	out.McpServers = redactMCPServers(d.McpServers)
 	return &out
+}
+
+// redactMCPServers keeps only each agent-card MCP server's name and
+// transport. The card forwards its servers verbatim, so headers, env,
+// args, command, and URL are where a server's own credential lives.
+func redactMCPServers(servers []PollMCPServer) []PollMCPServer {
+	if servers == nil {
+		return nil
+	}
+	out := make([]PollMCPServer, len(servers))
+	for i, server := range servers {
+		out[i] = PollMCPServer{Name: server.Name, Type: server.Type}
+	}
+	return out
 }
