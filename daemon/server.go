@@ -457,7 +457,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if withPool {
 		stats, err := s.poolStats(r.Context())
 		if err == nil {
-			resp.Pool = stats
+			resp.Pool = redactPoolStats(stats)
 		}
 	}
 	if byMachine {
@@ -687,7 +687,8 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, stats)
+	redacted := redactPoolStats(stats)
+	writeJSON(w, http.StatusOK, redacted)
 }
 
 func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
@@ -910,7 +911,15 @@ func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id st
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.daemon.ActiveSessions())
+		handles := s.daemon.ActiveSessions()
+		// The inbound spec a session runs under may resolve to an
+		// operator-configured repository URL carrying embedded
+		// credentials. The list is display-only (cloning reads the
+		// credentialed detail), so serve the redacted form.
+		for i := range handles {
+			handles[i].Repository = redactRepositoryURL(handles[i].Repository)
+		}
+		writeJSON(w, http.StatusOK, handles)
 	case http.MethodPost:
 		if s.daemon.localRuntime.Load() != nil {
 			http.Error(w, "local work must enter through authenticated issue intake", http.StatusForbidden)
@@ -938,6 +947,18 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	last := s.daemon.heartbeat.LastPayload()
+	// The allowlist projects operator-configured repository URLs, which
+	// may carry embedded credentials. The serving copy is userinfo-
+	// redacted; the heartbeat's stored payload (also POSTed upstream)
+	// is never rewritten.
+	if last.Allowlist != nil {
+		redacted := make([]ProjectAllowlistEntry, len(last.Allowlist))
+		copy(redacted, last.Allowlist)
+		for i := range redacted {
+			redacted[i].Repository = redactRepositoryURL(redacted[i].Repository)
+		}
+		last.Allowlist = redacted
+	}
 	writeJSON(w, http.StatusOK, &last)
 }
 
@@ -1106,11 +1127,15 @@ func safeOrchestratorURL(c *Config) string {
 	if c == nil {
 		return ""
 	}
-	return c.Orchestrator.URL
+	// Served on the credential-free doctor route: an operator-configured
+	// URL with a user:token@ authority is served userinfo-redacted.
+	return redactRepositoryURL(c.Orchestrator.URL)
 }
 
-// safeProjectRepos returns the list of repository URLs in the project
-// allowlist for inclusion in DaemonStatsResponse.AllowedProjects.
+// safeProjectRepos routes the allowlist through redactRepositoryURLs so
+// the served list has exactly one redaction point: every future caller
+// that needs the same shape reuses this helper instead of growing a
+// second list path.
 func safeProjectRepos(c *Config) []string {
 	if c == nil {
 		return nil
@@ -1119,11 +1144,33 @@ func safeProjectRepos(c *Config) []string {
 	if len(projects) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(projects))
+	raw := make([]string, 0, len(projects))
 	for _, p := range projects {
-		out = append(out, p.Repository)
+		raw = append(raw, p.Repository)
 	}
-	return out
+	return redactRepositoryURLs(raw)
+}
+
+// redactPoolStats returns a copy of stats with embedded credentials
+// dropped from every pool member repository URL. The snapshot may come
+// from a downstream provider the daemon does not control, so the
+// redaction happens here, at the serving boundary. The copy keeps the
+// provider's snapshot untouched: a provider returning a shared or cached
+// pointer must never have its live state rewritten, and concurrent reads
+// must not race on the same backing array.
+func redactPoolStats(stats *afclient.WorkareaPoolStats) *afclient.WorkareaPoolStats {
+	if stats == nil {
+		return nil
+	}
+	out := *stats
+	if stats.Members != nil {
+		out.Members = make([]afclient.WorkareaPoolMember, len(stats.Members))
+		copy(out.Members, stats.Members)
+		for i := range out.Members {
+			out.Members[i].Repository = redactRepositoryURL(out.Members[i].Repository)
+		}
+	}
+	return &out
 }
 
 // buildRegistrationStats summarises the daemon's registration / heartbeat /

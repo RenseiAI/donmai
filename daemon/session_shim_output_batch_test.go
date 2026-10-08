@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -21,6 +22,56 @@ import (
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/coder/websocket"
 )
+
+// batchEmitHarnessEnv selects the output-batch emitter role: this test
+// binary re-executed as the PTY child, waiting for one "start" line and
+// then flooding the terminal with paced `output-%02d` lines. It replaces
+// the `stty -echo; read start; while ... printf ...; done` shell the
+// fixture ran, so the emission window no longer depends on a shell binary
+// being exec-able on the runner. The line the test writes arrives as
+// terminal input (stdin is the PTY slave) and the emission leaves as
+// terminal output (stdout is the same terminal), exactly as with the shell.
+const batchEmitHarnessEnv = "DONMAI_TEST_DAEMON_SESSION_SHIM_BATCH_EMIT"
+
+// daemonShimBatchEmitSpec returns the shell-free PTY harness spec for the
+// output-batch suite: this test binary re-executed in batch-emit mode.
+func daemonShimBatchEmitSpec() (ptyhost.Spec, error) {
+	emitPath, err := os.Executable()
+	if err != nil {
+		return ptyhost.Spec{}, err
+	}
+	//nolint:gosec // G204: emitPath is this test binary; batch-emit mode is selected by env
+	return ptyhost.Spec{
+		Command: []string{emitPath, "-test.run", "TestMain"},
+		Env:     []string{batchEmitHarnessEnv + "=1"},
+	}, nil
+}
+
+// runDaemonShimBatchEmit waits for the test's "start" line, then emits the
+// same 600 lines the replaced shell did: `output-%02d` cycling through
+// 00-99, one per 33ms tick (about 20s), and exits. Terminal echo is cleared
+// in-process for the same reason the shell ran `stty -echo`: without it the
+// line discipline echoes the "start" line back as an extra frame.
+func runDaemonShimBatchEmit() int {
+	disableShimEchoTerminalEcho()
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		line, err := reader.ReadString('\n')
+		if strings.TrimRight(line, "\r\n") == "start" {
+			break
+		}
+		if err != nil {
+			return 1
+		}
+	}
+	for i := 0; i < 600; i++ {
+		if _, err := fmt.Fprintf(os.Stdout, "output-%02d\n", i%100); err != nil {
+			return 1
+		}
+		time.Sleep(33 * time.Millisecond)
+	}
+	return 0
+}
 
 // The production pump consumes a real selected-v3+ Controller, backed by a real
 // shim and PTY, and hands output to a real candidate whose relay fixture
@@ -51,16 +102,21 @@ func TestShimOutputBatchBatchesLiveOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-v2", SessionID: "session-v2"}
-	// The shell reads its start line and then emits one line per tick.
-	// The read is the only synchronization the test needs: the shell cannot
-	// emit before the test writes "start", so every output frame belongs to
-	// this run's emission window by construction. The shell floods 600 lines
-	// (~20s), so the window outlasts the gate: a slow scheduler delays the
-	// verdict without the source running dry first; the test emits its
-	// Marker only after the gate below has passed.
+	// The shell-free emitter (this test binary in batch-emit mode) reads its
+	// start line and then emits one line per 33ms tick. The read is the only
+	// synchronization the test needs: the emitter cannot emit before the test
+	// writes "start", so every output frame belongs to this run's emission
+	// window by construction. It floods 600 lines (~20s), so the window
+	// outlasts the gate: a slow scheduler delays the verdict without the
+	// source running dry first; the test emits its Marker only after the gate
+	// below has passed.
+	emitSpec, err := daemonShimBatchEmitSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 1,
-		Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "stty -echo; read start; i=0; while [ $i -lt 600 ]; do printf 'output-%02d\\n' \"$((i % 100))\"; i=$((i+1)); sleep 0.033; done"}},
+		Spec:   emitSpec,
 		Orphan: sessionshim.OrphanPolicy{Deadline: 30 * time.Second, TerminationGrace: 250 * time.Millisecond},
 	})
 	if err != nil {

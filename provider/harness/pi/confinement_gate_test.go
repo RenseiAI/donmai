@@ -70,9 +70,9 @@ func TestNew_HostConfinementSwitchOnlyTightens(t *testing.T) {
 // with no backend: a session that requested confinement is refused with
 // the typed backend_absent reason, never run unconfined.
 func TestConfinerForSession_RequestWithoutBackendRefuses(t *testing.T) {
-	if confinement.DefaultBackend() != nil {
-		t.Skip("this host has a confinement backend; the darwin live tests cover it")
-	}
+	old := piConfinementBackend
+	piConfinementBackend = func() confinement.Backend { return nil }
+	t.Cleanup(func() { piConfinementBackend = old })
 	p := &Provider{binary: "/bin/sh", opts: Options{RequireConfinement: true}}
 	_, err := p.confinerForSession(context.Background(), agent.Spec{Cwd: t.TempDir()})
 	if reason, ok := confinement.ReasonOf(err); !ok || reason != confinement.ReasonBackendAbsent || !errors.Is(err, agent.ErrSpawnFailed) {

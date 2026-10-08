@@ -65,12 +65,17 @@ func newReadoptedBurstFixtureWithDropBound(
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-burst", SessionID: "session-burst"}
+	// The burst harness is the shell-free echo child (same binary in echo
+	// role): its in-process echo clearing replaces the `stty -echo` the old
+	// shell fixture ran, and the `ack:` answers are what the burst tests
+	// match on.
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 5,
-		Spec: ptyhost.Spec{RingBytes: ringBytes, Command: []string{
-			"/bin/sh", "-c",
-			`stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`,
-		}},
+		Spec:         ptyhost.Spec{RingBytes: ringBytes, Command: echoArgv, Env: daemonShimEchoEnv()},
 		WorkareaPath: filepath.Join(dir, "workarea"),
 	})
 	if err != nil {

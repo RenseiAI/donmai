@@ -50,6 +50,16 @@ const DaemonControlURLEnv = "DONMAI_DAEMON_URL"
 // discloses nothing to the seat.
 const ControlTokenPathEnv = "DONMAI_CONTROL_TOKEN_FILE"
 
+// SessionReadTokenEnv names the per-session read credential a supervisor
+// states in a spawned worker's environment beside the session id it names.
+// It authorizes exactly one session-detail read — the detail for that
+// session — and carries no wider privilege. The worker consumes it during
+// bootstrap and must not pass it to anything it spawns: every inherited-env
+// composition in this package strips it, so it never reaches harness or
+// agent child processes through the parent environment. Only an explicit
+// supervisor-authored layer (the spawner's daemon-owned env) may state it.
+const SessionReadTokenEnv = "DONMAI_SESSION_READ_TOKEN" //nolint:gosec // G101: an env-var NAME, not a credential.
+
 // DefaultDaemonControlPort is the daemon control API's well-known loopback
 // port (daemon.DefaultHTTPPort is this constant).
 const DefaultDaemonControlPort = 7734

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -174,10 +173,17 @@ func TestSelectedV2ConservesOwnershipButRefusesFullFrameCarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-v2-overlap", SessionID: "session-v2-overlap"}
+	// The shell-free echo child: the overlap assertions observe the carrier
+	// negotiation above the harness, so the child only has to stay alive
+	// and answering behind the adopted connection.
+	echoSpec, err := daemonShimEchoSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 1,
 		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V2,
-		Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "sleep 30"}},
+		Spec:   echoSpec,
 		Orphan: sessionshim.DefaultOrphanPolicy(),
 	})
 	if err != nil {

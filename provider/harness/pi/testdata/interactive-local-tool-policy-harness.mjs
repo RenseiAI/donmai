@@ -44,7 +44,8 @@
 //
 // Usage: node interactive-local-tool-policy-harness.mjs <extensionPath> <toolName> <inputJSON>
 // Env: DONMAI_PI_ALLOWED_TOOLS / DONMAI_PI_DISALLOWED_TOOLS (JSON arrays, may
-// be absent or "[]"); DONMAI_PI_HANDSHAKE must NOT be set by the caller.
+// be absent or "[]"); DONMAI_PI_HANDSHAKE must NOT be set by the caller;
+// HARNESS_REPORT_ENV optionally names variables to report after activation.
 
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -359,9 +360,18 @@ const mod = await import(dataURL);
 // verdict below never races the activation.
 await mod.default(stubPi);
 
+// HARNESS_REPORT_ENV (comma-separated names) asks the harness to report
+// those names' values in this process's environment AFTER activation, so a
+// test can observe what the extension restored from the session credential
+// file. Absent names report null.
+const environment = {};
+for (const name of (process.env.HARNESS_REPORT_ENV ?? "").split(",")) {
+  if (name) environment[name] = process.env[name] ?? null;
+}
+
 const handler = handlers["tool_call"];
 if (!handler) {
-  console.log(JSON.stringify({ registered: false, verdict: null, providers }));
+  console.log(JSON.stringify({ registered: false, verdict: null, providers, environment }));
   process.exit(0);
 }
 
@@ -384,4 +394,4 @@ if (ctxJSON) {
 }
 
 const verdict = await handler({ toolName, input }, ctx);
-console.log(JSON.stringify({ registered: true, verdict: verdict ?? null, providers }));
+console.log(JSON.stringify({ registered: true, verdict: verdict ?? null, providers, environment }));

@@ -2,10 +2,12 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -34,8 +36,10 @@ const DefaultCatalogProbeTimeout = 5 * time.Second
 type catalogProbeFunc func(ctx context.Context, binary, provider, model, credEnvVar, credEnvValue string) (string, error)
 
 // defaultCatalogProbe execs `<binary> --list-models <provider>/<model>
-// --offline`, with credEnvVar=credEnvValue added to the child's env when
-// both are non-empty (see catalogProbeFunc's doc comment for why). --offline
+// --offline`, with the resolved credential delivered through an owner-only
+// auth.json in the isolated agent dir (pi's own documented store — see
+// catalogProbeFunc's doc comment for why the probe needs the credential at
+// all) when both credEnvVar and credEnvValue are non-empty. --offline
 // (pi's flag; mirrors the PI_OFFLINE env default this package already sets —
 // offlinePostureEnv) keeps the preflight bounded and deterministic: it must
 // answer from pi's already-installed/cached catalog only, never block a
@@ -54,9 +58,12 @@ type catalogProbeFunc func(ctx context.Context, binary, provider, model, credEnv
 //     "present" even when the cell's OWN BYOK credential is empty or wrong.
 //     defaultCatalogProbe therefore points PI_CODING_AGENT_DIR at a
 //     throwaway, freshly-created, per-call directory — never the real
-//     ~/.pi/agent, never any session's real agentHome — so the ONLY
-//     credential source pi can resolve for this probe is the env var this
-//     function explicitly sets.
+//     ~/.pi/agent, never any session's real agentHome — and writes the
+//     resolved credential there as an owner-only auth.json entry, so the
+//     ONLY credential source pi can resolve for this probe is the file
+//     this function explicitly wrote. The probe child's env carries no
+//     secret: a same-user process listing renders a renamed pi child's env
+//     as if it were its command line, and the probe is a pi child too.
 //   - Env-hygiene parity. The child env is built from a MINIMAL, explicit
 //     base (PATH, HOME, TMPDIR, the isolated agent dir, and the single
 //     resolved credential var) rather than inheriting the full parent
@@ -64,7 +71,11 @@ type catalogProbeFunc func(ctx context.Context, binary, provider, model, credEnv
 //     credentials for OTHER providers/companies that composeChildEnv's
 //     AgentEnvBlocklist (runtime/env/composer.go) exists specifically to
 //     keep out of a harness child. A read-only preflight probe must honor
-//     the same boundary, not bypass it via a wider default.
+//     the same boundary, not bypass it via a wider default. The probe
+//     carries the resolved credential the same way a spawn now does: the
+//     native-route credential rides an owner-only auth.json in the isolated
+//     agent dir (pi's own documented store), never the probe env — a
+//     same-user process listing renders the probe child's env too.
 func defaultCatalogProbe(ctx context.Context, binary, provider, model, credEnvVar, credEnvValue string) (string, error) {
 	agentDir, err := os.MkdirTemp("", "donmai-pi-catalog-probe-*")
 	if err != nil {
@@ -79,7 +90,21 @@ func defaultCatalogProbe(ctx context.Context, binary, provider, model, credEnvVa
 		piCodingAgentDirEnvVar + "=" + agentDir,
 	}
 	if credEnvVar != "" && credEnvValue != "" {
-		env = append(env, credEnvVar+"="+credEnvValue)
+		// The credential rides pi's own store in the isolated agent dir,
+		// never the probe env. The provider slug is this package's own
+		// already-classified string (builtin_providers.go's allowlist),
+		// and the file is 0600 — the same mode pi itself uses.
+		if provider == "" {
+			return "", fmt.Errorf("pi --list-models: credential has no provider slug")
+		}
+		authBytes, _ := json.Marshal(map[string]any{provider: map[string]any{"type": "api_key", "key": credEnvValue}})
+		authPath := filepath.Join(agentDir, "auth.json")
+		if err := os.WriteFile(authPath, authBytes, 0o600); err != nil {
+			return "", fmt.Errorf("pi --list-models: write isolated auth file: %w", err)
+		}
+		if err := os.Chmod(authPath, 0o600); err != nil {
+			return "", fmt.Errorf("pi --list-models: secure isolated auth file: %w", err)
+		}
 	}
 
 	// nolint:gosec // G204: binary is the resolved-from-PATH path New() also

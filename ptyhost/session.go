@@ -116,22 +116,35 @@ type Session struct {
 
 // Spawn runs spec.Command under a pseudo-terminal and returns the live Session.
 // The PTY winsize is applied before the child starts (§8); the process becomes a
-// session/process-group leader for group teardown (§12.2).
+// session/process-group leader for group teardown (§12.2). A start the kernel
+// refuses transiently (EPERM/EAGAIN under spawn churn) is retried a bounded
+// number of times before it fails the spawn — see startPTYWithRetry.
 func Spawn(spec Spec) (*Session, error) {
 	if len(spec.Command) == 0 {
 		return nil, errors.New("ptyhost: Spawn requires a non-empty Command")
 	}
 	cols, rows := spec.cols(), spec.rows()
 
-	cmd := exec.Command(spec.Command[0], spec.Command[1:]...) //nolint:gosec // caller-supplied argv is the session's own command
-	if spec.Cwd != "" {
-		cmd.Dir = spec.Cwd
+	// The command factory builds a fresh *exec.Cmd per attempt: os/exec
+	// forbids calling Start twice on one Cmd even when the first call
+	// failed, so the retry path inside startPTYWithRetry must never reuse
+	// a Cmd across attempts.
+	parentEnv := spec.parentEnv()
+	makeCmd := func() *exec.Cmd {
+		cmd := exec.Command(spec.Command[0], spec.Command[1:]...) //nolint:gosec // caller-supplied argv is the session's own command
+		if spec.Cwd != "" {
+			cmd.Dir = spec.Cwd
+		}
+		cmd.Env = composeEnv(parentEnv, spec.Env)
+		return cmd
 	}
-	cmd.Env = composeEnv(os.Environ(), spec.Env)
 
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
+	var cmd *exec.Cmd
+	ptmx, err := startPTYWithRetry(makeCmd, &pty.Winsize{Rows: rows, Cols: cols}, spec.logger(), func(started *exec.Cmd) {
+		cmd = started
+	})
 	if err != nil {
-		return nil, fmt.Errorf("ptyhost: pty start: %w", err)
+		return nil, err
 	}
 	spawnAt := time.Now()
 

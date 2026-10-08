@@ -46,6 +46,15 @@ type Spec struct {
 	// explicit entries in Env override those defaults.
 	Env []string
 
+	// ExactEnv makes Env the child's complete environment: the parent process
+	// environment is not inherited at all. TERM=xterm-256color and
+	// COLORTERM=truecolor still apply as interactive defaults (Env entries
+	// override them), and runner-only controls are still refused. The zero
+	// value inherits the parent environment as documented on Env. A caller
+	// that builds its child environment from an allowlist sets this, so no
+	// parent name rides around that allowlist.
+	ExactEnv bool
+
 	// Cwd is the child working directory. Empty inherits the parent's.
 	Cwd string
 
@@ -170,6 +179,12 @@ func composeEnv(parent, overrides []string) []string {
 		if runtimeenv.IsRunnerOnly(key) {
 			return
 		}
+		// The per-session read credential never crosses an inherited
+		// boundary into a PTY child: the worker consumed it during
+		// bootstrap. An explicit override may still state it.
+		if inherited && key == runtimeenv.SessionReadTokenEnv {
+			return
+		}
 		if inherited && blocklist.IsBlocked(key) && !declared.Allows(key) {
 			return
 		}
@@ -189,6 +204,15 @@ func composeEnv(parent, overrides []string) []string {
 		put(kv, false)
 	}
 	return out
+}
+
+// parentEnv returns the environment the child inherits beneath Env: this
+// process's own environment, or nothing at all when ExactEnv is set.
+func (s Spec) parentEnv() []string {
+	if s.ExactEnv {
+		return nil
+	}
+	return os.Environ()
 }
 
 // shellName returns a best-effort SHELL basename for the recording header.

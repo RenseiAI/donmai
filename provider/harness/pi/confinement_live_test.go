@@ -729,6 +729,45 @@ func TestPiConfinement_LoopbackEndpointPortIsTheOnlyLoopbackOpening(t *testing.T
 	}
 }
 
+// TestPiConfinement_RefusedPlanRemovesSessionCredentialFiles pins the
+// cleanup on the one refusal that lands AFTER the session credential files
+// are written: a confined session whose plan cannot be prepared (here, an
+// endpoint naming the daemon control port) is refused on both lanes, and
+// neither the credential file nor the session auth.json may survive the
+// refusal — a spawn that never ran must leave no key material on disk.
+//
+// RED proof: drop removeCredentials() from the confineSession failure path
+// in pi.go launch (headless) or interactive.go spawnInteractive and the
+// matching lane fails with the surviving file named.
+func TestPiConfinement_RefusedPlanRemovesSessionCredentialFiles(t *testing.T) {
+	for _, lane := range []string{"headless", "interactive"} {
+		t.Run(lane, func(t *testing.T) {
+			w := newLiveWorld(t)
+			bin := writeLiveHarness(t, w)
+			spec := w.spec()
+			spec.Endpoint = liveEndpoint(fmt.Sprintf("http://127.0.0.1:%d/v1", runtimeenv.DefaultDaemonControlPort))
+			if lane == "interactive" {
+				spec.Interactive = &agent.InteractiveSpec{Cols: 80, Rows: 24}
+			}
+			if h, err := liveProvider(t, bin, true).Spawn(liveCtx(t), spec); err == nil {
+				_ = h.Stop(context.Background())
+				t.Fatal("a confined session whose endpoint names the daemon control port started")
+			} else if !strings.Contains(err.Error(), "daemon control") {
+				t.Fatalf("refused for another reason: %v", err)
+			}
+			layout := newSessionLayoutForSpec(spec)
+			if _, err := os.Stat(layout.root); err != nil {
+				t.Fatalf("the session state root was never created, so the refusal came before any credential write: %v", err)
+			}
+			for _, path := range []string{credentialFilePath(layout), filepath.Join(layout.agentHome, "auth.json")} {
+				if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("session credential material survived the refused spawn: %s (stat err %v)", path, err)
+				}
+			}
+		})
+	}
+}
+
 // liveListener accepts and closes loopback connections until the test ends,
 // and returns its port.
 func liveListener(t *testing.T) int {

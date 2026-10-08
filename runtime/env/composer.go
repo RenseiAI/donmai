@@ -369,6 +369,17 @@ func ValidEnvKey(key string) bool {
 	return key != "" && !strings.ContainsAny(key, "=\x00")
 }
 
+// isSessionReadToken reports whether key is the per-session read
+// credential a supervisor states in a spawned worker's environment
+// (SessionReadTokenEnv). The worker consumes it during bootstrap; it must
+// never cross an inherited-environment boundary into a harness or agent
+// child, so every inherited layer in this package drops it. Explicit
+// supervisor-authored layers may still state it — that is how the worker
+// receives it in the first place.
+func isSessionReadToken(key string) bool {
+	return key == SessionReadTokenEnv
+}
+
 func filterInheritedChildEnv(entries []string) []string {
 	if len(entries) == 0 {
 		return entries
@@ -383,6 +394,12 @@ func filterInheritedChildEnv(entries []string) []string {
 			key = entry[:i]
 		}
 		if IsRunnerOnly(key) {
+			continue
+		}
+		// The per-session read credential never crosses an inherited
+		// boundary: the worker consumed it during bootstrap, and no
+		// harness or agent child it spawns may observe it.
+		if isSessionReadToken(key) {
 			continue
 		}
 		if isAgentEnvBlocked(key) && !declared.Allows(key) {
@@ -499,6 +516,13 @@ func (c *Composer) Compose(base map[string]string, spec agent.Spec) []string {
 	merged := make(map[string]string)
 	for k, v := range base {
 		if IsRunnerOnly(k) {
+			continue
+		}
+		// Same inherited-boundary rule as filterInheritedChildEnv: the
+		// base layer is the parent process environment, so the
+		// per-session read credential it may carry is dropped here.
+		// The explicit spec layer below may still state it.
+		if isSessionReadToken(k) {
 			continue
 		}
 		if _, blocked := blockSet[k]; blocked && !declared.Allows(k) {

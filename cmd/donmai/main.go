@@ -235,6 +235,9 @@ func main() {
 	// spawn binding: a re-executed donmai binary with the probe variable set
 	// runs the probe instead of the CLI. A library never exits; the probe
 	// answers from main, first thing, before anything else runs.
+	if handled, code := confinement.RunLandlockStageFromEnv(); handled {
+		os.Exit(code)
+	}
 	if handled, code := confinement.RunProbeFromEnv(); handled {
 		os.Exit(code)
 	}

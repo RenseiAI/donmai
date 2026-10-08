@@ -295,10 +295,11 @@ func newFakeCatalogProbeBinary(t *testing.T, script string) string {
 // independently of the credential check.
 const ambientCredentialAwareFakePi = `
 echo "AGENTDIR:$PI_CODING_AGENT_DIR"
+if [ -n "$ZAI_API_KEY" ]; then
+  echo "CRED-FROM-ENV:$ZAI_API_KEY"
+fi
 if [ -n "$PI_CODING_AGENT_DIR" ] && [ -d "$PI_CODING_AGENT_DIR" ] && [ -f "$PI_CODING_AGENT_DIR/auth.json" ]; then
-  echo "provider  model"
-  echo "zai       glm-5.3"
-elif [ -n "$ZAI_API_KEY" ]; then
+  echo "CRED-FROM-FILE:$(cat "$PI_CODING_AGENT_DIR/auth.json")"
   echo "provider  model"
   echo "zai       glm-5.3"
 else
@@ -341,14 +342,21 @@ func TestDefaultCatalogProbe_AmbientCredentialCannotSatisfyPreflight(t *testing.
 		t.Fatalf("fake pi did not receive a non-empty PI_CODING_AGENT_DIR: %q", raw)
 	}
 
-	// Real credential: same isolation, but now the explicit env var this
-	// function set carries the resolved key — reports present.
+	// Real credential: same isolation, but now the resolved key rides the
+	// isolated auth.json this function wrote — reports present, with no
+	// credential value in the probe env.
 	raw2, err := defaultCatalogProbe(context.Background(), bin, "zai", "glm-5.3", "ZAI_API_KEY", "resolved-cell-key")
 	if err != nil {
 		t.Fatalf("defaultCatalogProbe(with credential): %v", err)
 	}
 	if !catalogHasModel(raw2, "zai", "glm-5.3") {
-		t.Errorf("a real credential on the explicit env var must satisfy the preflight: %q", raw2)
+		t.Errorf("a real credential in the isolated auth.json must satisfy the preflight: %q", raw2)
+	}
+	if strings.Contains(raw2, "CRED-FROM-ENV:") {
+		t.Errorf("resolved credential reached the probe through its env; it must ride the isolated auth.json: %q", raw2)
+	}
+	if !strings.Contains(raw2, "resolved-cell-key") {
+		t.Errorf("isolated auth.json does not carry the resolved credential: %q", raw2)
 	}
 	agentDir2, ok := catalogProbeAgentDirMarker(raw2)
 	if !ok || agentDir2 == "" {
@@ -408,14 +416,17 @@ func TestDefaultCatalogProbe_BuildsMinimalEnv_BlocklistedVarNeverReachesChild(t 
 	if strings.Contains(raw, canary) {
 		t.Errorf("blocklisted host credential leaked into the catalog-preflight probe's env: %q", raw)
 	}
-	// Positive control: the minimal env this function DOES build must still
-	// carry the explicit credential and the isolated agent dir — an
-	// over-aggressively minimal env would silently break the preflight
+	// Positive control: the resolved credential still reaches the probe —
+	// through the isolated auth.json, never the probe env. An
+	// over-aggressively minimal setup would silently break the preflight
 	// instead of leaking a secret.
-	if !strings.Contains(raw, "ZAI_API_KEY=resolved-cell-key") {
-		t.Errorf("probe env missing the explicit credential var: %q", raw)
+	if strings.Contains(raw, "ZAI_API_KEY=resolved-cell-key") {
+		t.Errorf("resolved credential rides the probe env; it must ride the isolated auth.json: %q", raw)
 	}
+	// The env-dumping fake emits no AGENTDIR marker; assert on the raw
+	// KEY=VALUE dump instead: the isolated agent dir rides the env, the
+	// resolved credential does not.
 	if !strings.Contains(raw, piCodingAgentDirEnvVar+"=") {
-		t.Errorf("probe env missing %s: %q", piCodingAgentDirEnvVar, raw)
+		t.Fatalf("probe env missing %s: %q", piCodingAgentDirEnvVar, raw)
 	}
 }

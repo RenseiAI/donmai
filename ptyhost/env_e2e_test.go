@@ -142,3 +142,41 @@ func TestSpawnE2E_ChildCannotObserveRunnerOnlyAttachControls(t *testing.T) {
 		t.Fatal("PTY child observed runner-only attach controls")
 	}
 }
+
+func TestSpawnE2E_SessionReadTokenSurvivesNoPTYChild(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+
+	// The worker consumed the per-session read credential during bootstrap;
+	// a stale copy lingering in the parent environment must not reach an
+	// interactive PTY child through the inherited layer.
+	t.Setenv(runtimeenv.SessionReadTokenEnv, "stale-read-credential")
+
+	resultPath := filepath.Join(t.TempDir(), "env-result")
+	sess, err := Spawn(Spec{
+		Command: []string{
+			"/bin/sh", "-c",
+			`if [ -z "${DONMAI_SESSION_READ_TOKEN+x}" ]; then printf clean > "$1"; else printf leaked > "$1"; fi`,
+			"sh", resultPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Stop(context.Background()) })
+
+	select {
+	case <-sess.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("PTY child did not exit")
+	}
+
+	got, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read child env result: %v", err)
+	}
+	if string(got) != "clean" {
+		t.Fatal("PTY child observed the per-session read credential")
+	}
+}

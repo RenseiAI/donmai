@@ -16,7 +16,8 @@ func TestVersionProbeCommandStripsStartupInjectionWithoutExecutingCandidate(t *t
 	for _, key := range []string{"DYLD_FUTURE_LOADER_CONTROL", "LD_FUTURE_LOADER_CONTROL"} {
 		t.Setenv(key, "benign-control-value")
 	}
-	t.Setenv("DONMAI_HARMLESS_VAR", "preserved")
+	t.Setenv("LC_MESSAGES", "preserved")
+	t.Setenv("DONMAI_HARMLESS_VAR", "unlisted")
 	cmd := versionProbeCommand(context.Background(), "/artifact/pi")
 	if cmd.Dir != "/artifact" {
 		t.Fatalf("version probe directory=%q, want selected binary directory", cmd.Dir)
@@ -34,8 +35,13 @@ func TestVersionProbeCommandStripsStartupInjectionWithoutExecutingCandidate(t *t
 			t.Fatalf("version probe retained loader namespace environment %s", key)
 		}
 	}
-	if !hasEnvVal(cmd.Env, "DONMAI_HARMLESS_VAR", "preserved") {
-		t.Fatal("version probe dropped an unrelated host environment entry")
+	if !hasEnvVal(cmd.Env, "LC_MESSAGES", "preserved") {
+		t.Fatal("version probe dropped an allowlisted host environment entry")
+	}
+	// The probe is a pi child too (pi renames itself even for --version), so
+	// it carries the allowlisted exec environment only.
+	if hasEnvKey(cmd.Env, "DONMAI_HARMLESS_VAR") {
+		t.Fatal("version probe carried an unlisted host environment entry")
 	}
 }
 
