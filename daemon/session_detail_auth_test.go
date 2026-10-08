@@ -392,3 +392,116 @@ func TestSessionDetail_RedactKeepsStoredOriginal(t *testing.T) {
 		t.Error("operator read after redacted read lost the credentials")
 	}
 }
+
+// TestSessionDetail_StatedTokenPathReachesOnlyCredentialedReads pins the
+// accept-time stamp of the daemon-resolved token path: the stored detail
+// carries the daemon's own answer (never a work item's), the session's own
+// read credential and the operator token receive it, and the
+// credential-free read carries none of it.
+func TestSessionDetail_StatedTokenPathReachesOnlyCredentialedReads(t *testing.T) {
+	const stated = "/var/lib/host/control-token"
+	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.RequireControlToken = true
+		o.ControlToken = testControlToken
+		o.ControlTokenPath = stated
+	})
+	defer cleanup()
+
+	// A work item that tries to aim its own seat's deny at an arbitrary
+	// host file must not survive the accept: the daemon's answer wins.
+	detail := &SessionDetail{
+		SessionID:        "sess-path",
+		Repository:       "github.com/foo/bar",
+		Ref:              "main",
+		WorkerID:         "wkr_1",
+		AuthToken:        "tok-worker-live",
+		ControlTokenPath: "/tmp/smuggled-path",
+	}
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{
+		SessionID:  "sess-path",
+		Repository: detail.Repository,
+		Ref:        detail.Ref,
+	}, detail); err != nil {
+		t.Fatalf("AcceptWorkWithDetail: %v", err)
+	}
+	stored, ok := d.SessionDetail("sess-path")
+	if !ok {
+		t.Fatal("stored detail missing after accept")
+	}
+	if stored.ControlTokenPath != stated {
+		t.Fatalf("stored ControlTokenPath = %q, want the daemon's stated %q", stored.ControlTokenPath, stated)
+	}
+
+	// Credential-free read: redacted shape, no stated path anywhere.
+	status, redacted := getSessionDetail(t, srv.Addr(), "sess-path", "")
+	if status != http.StatusOK {
+		t.Fatalf("unauthenticated GET = %d, want 200 with redacted fields", status)
+	}
+	if redacted.ControlTokenPath != "" {
+		t.Errorf("redacted ControlTokenPath = %q, want empty", redacted.ControlTokenPath)
+	}
+	raw := rawSessionDetailBody(t, srv.Addr(), "sess-path", "")
+	if strings.Contains(raw, stated) {
+		t.Errorf("redacted body carries the stated token path:\n%s", raw)
+	}
+
+	// The session's own read credential receives the full detail with it.
+	readTok, ok := d.sessionReadToken("sess-path")
+	if !ok || readTok == "" {
+		t.Fatal("no read credential minted for sess-path")
+	}
+	if status, own := getSessionDetail(t, srv.Addr(), "sess-path", readTok); status != http.StatusOK {
+		t.Fatalf("session-credential GET = %d, want 200", status)
+	} else if own.ControlTokenPath != stated {
+		t.Errorf("session-credential ControlTokenPath = %q, want %q", own.ControlTokenPath, stated)
+	}
+
+	// The operator token receives it too: it is the operator's own host
+	// topology, and the worker-equivalent operator read stays full.
+	if status, full := getSessionDetail(t, srv.Addr(), "sess-path", testControlToken); status != http.StatusOK {
+		t.Fatalf("operator GET = %d, want 200", status)
+	} else if full.ControlTokenPath != stated {
+		t.Errorf("operator ControlTokenPath = %q, want %q", full.ControlTokenPath, stated)
+	}
+	if raw := rawSessionDetailBody(t, srv.Addr(), "sess-path", testControlToken); !strings.Contains(raw, stated) {
+		t.Errorf("operator body lost the stated token path:\n%s", raw)
+	}
+
+	// A spawned session's environment still carries neither the token
+	// nor its path override: the path travels in the credentialed
+	// detail read, never in env.
+	for _, kv := range d.spawner.sessionEnv(SessionSpec{SessionID: "sess-path"}, nil) {
+		if strings.HasPrefix(kv, "DONMAI_CONTROL_TOKEN=") || strings.HasPrefix(kv, "DONMAI_CONTROL_TOKEN_FILE=") {
+			t.Errorf("spawn env carries operator control credential %q", kv)
+		}
+		if strings.Contains(kv, stated) {
+			t.Errorf("spawn env carries the stated token path: %q", kv)
+		}
+	}
+}
+
+// TestSessionDetail_UnstatedTokenPathKeepsLegacyShape pins the
+// mixed-version default: a daemon that states no path stores and serves
+// an empty one, so older workers resolve the path from their own
+// environment exactly as before.
+func TestSessionDetail_UnstatedTokenPathKeepsLegacyShape(t *testing.T) {
+	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.RequireControlToken = true
+		o.ControlToken = testControlToken
+	})
+	defer cleanup()
+
+	seedCredentialedSession(t, d, "sess-legacy")
+	stored, ok := d.SessionDetail("sess-legacy")
+	if !ok {
+		t.Fatal("stored detail missing after accept")
+	}
+	if stored.ControlTokenPath != "" {
+		t.Fatalf("stored ControlTokenPath = %q, want empty without a stated path", stored.ControlTokenPath)
+	}
+	if status, full := getSessionDetail(t, srv.Addr(), "sess-legacy", testControlToken); status != http.StatusOK {
+		t.Fatalf("operator GET = %d, want 200", status)
+	} else if full.ControlTokenPath != "" {
+		t.Errorf("operator ControlTokenPath = %q, want empty without a stated path", full.ControlTokenPath)
+	}
+}

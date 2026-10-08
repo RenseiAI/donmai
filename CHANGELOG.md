@@ -8,9 +8,51 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.69 — 2026-10-08
+
+### Features
+
+- The viewer sanitizer offers OSC 52 clipboard sets to viewers through a new `Options.OnClipboard` hook, so a viewer can put a copied selection on its own clipboard under its own policy, for example behind a copy preview. The sanitized stream is unchanged and still strips every OSC 52. Queries, clears, unknown selection targets, invalid base64 or UTF-8 and control-only texts are never offered, control characters other than tab and line breaks are removed, and one trailing line break is dropped. `DecodeClipboardSet` and `ClipboardSequence` are exported for viewers.
+- `host watch` redesign. Session cards are five rows in one fixed order: issue id and title, project (repository) and work type, model and harness, state with elapsed time (plus turns and cost when the harness reports them), and the age and text of the last activity. Every card in the grid has the same width, derived from the terminal width only, and the same height, so columns line up at any width; text is measured and truncated in terminal cells, including wide characters and emoji. Selection uses a heavy frame and a `▸` marker in a reserved cell, so the selected card never moves. Each pane keeps the rows its split allocates, so the stream boundary and the help row stay put when the grid is sparse. `enter` swaps the stream for the selected session's full detail (every identity axis, freshness signal and path) and `esc` returns. The header adds the host's occupied/total session slots.
+- The runner records the dispatched issue title in `state.json` (`issueTitle`) so local readers can show it.
+
+### Fixes
+
+- A session's terminal title no longer leaks into the prompt line of attached viewers. The sanitizer keeps a UTF-8 continuation byte inside an OSC, DCS, APC, PM or SOS string as payload instead of reading it as a string terminator, so a title such as Claude Code's `✳ <session name>` stays a title instead of being drawn as text where the cursor sits.
+- The sanitizer is hardened against encoded C1 controls: C1 controls encoded as UTF-8 are stripped in ground state, as raw C1 controls already were, and the strings it passes are re-emitted in 7-bit form so a UTF-8 terminal always closes them.
+- The sanitizer strips modes and queries that make a viewer's terminal write input on its own: enabling in-band resize (`?2048`) or colour-scheme (`?2031`) reports, the DEC locator sequences, the kitty keyboard and modifier-options queries, XTGETTCAP and every other non-Sixel DCS, S8C1T, and the DECREQTPARM, XTSMGRAPHICS, DECRQCRA, DECRQPSR, DECRQTSR and DECRQUPSS requests.
+- `host watch` no longer shows sessions as "not reported" for seconds after attaching to a busy host: every session's journal is caught up each tail tick instead of one session's slice at a time.
+- A quiet session's last-activity age comes from its run's journal modification time instead of reading "never" until its next event, and a session's age falls back to the daemon's admission time before the runner writes its start.
+- An interactive session's journal, which holds only system notices, no longer reports a measured zero tool count.
+- Plain `host watch` output (pipes, `--plain`) no longer carries a colored stream footer, and agent output is stripped of terminal escapes before it reaches the stream.
+
+### Chores
+
+- Deflake the failed-publication rollback heartbeat test under load.
+- Bump the dev-only `source-map-js` dependency of the TypeScript credentials client to 1.2.2 (GHSA-68fv-2mgg-jv7q).
+
+## v0.72.68 — 2026-10-08
+
 ### Features
 
 - Publish subscription quota on the daemon heartbeat: a quota poller reads each installed harness's host login once per 5-minute interval (a short-lived codex app-server `account/rateLimits/read` with the host login projected, a short-lived claude `get_usage` control request with no model turn) into the per-account snapshot cache, and live sessions report their streamed rate-limit updates (codex `account/rateLimits/updated`, claude `rate_limit_event`) to `POST /api/daemon/sessions/<id>/usage`, where they merge by window id onto the probe snapshot. A worker authenticates its own session's update with the per-session credential stated in its spawn environment (or its attempt credential on a local runtime) — never the operator control token — so the update route stays closed to any caller that cannot name its session. The heartbeat `quota` field carries one entry per account with windows, each with an `authCheck` (`harness`, `ok`, `checkedAt`) stamped with the probe time. Only a read the harness answered records a verdict: the codex login refusal is the app-server's -32600 answer (a backend fetch failure records nothing), and the claude verdict comes from the host login check; a read that never reached the harness keeps the previous one.
+- Linux seat confinement: a mount-namespace backend renders the seat boundary as a bubblewrap mount tree (a tmpfs root with read-only system binds, the session's writable set, and a fresh `/dev` and `/proc`) plus a Landlock stage that refuses reads outside the allowlist and TCP connects outside declared loopback ports. Each seat runs in its own PID namespace, so no outside process is visible to it and stopping the launcher stops every process inside. The backend needs bubblewrap, unprivileged user namespaces and Landlock ABI 2 or later; a host without them refuses the seat (`namespace_unavailable` or `backend_absent`) instead of running it unconfined.
+- Per-seat CPU and memory budgets: `capacity.seatBudget: { cpus, memoryMb, ioWeight, mode }` in `daemon.yaml` divides host capacity across concurrent seats. On Linux each seat runs in a transient systemd scope (systemd 252 or newer) with a CPU quota and memory limit; on macOS seats carry worker-cap environment (`GOMAXPROCS` and the build-tool parallelism settings). Host status, session handles and session results report the budget as `enforced`, `best-effort` or `none`. Omitting the block leaves seats unchanged.
+- Embedders can opt in to stalled-model-request retries (`runner.Options.ProviderStallTimeout`, off by default): when no model output follows a tool result within the window, the hung request is aborted and the turn retried with backoff, up to `ProviderStallRetries`, instead of the idle watchdog ending the seat as no-progress.
+
+### Fixes
+
+- Seat confinement denies seats the daemon control token on macOS and Linux: reads and writes of the token are refused, as is listing its directory, the state home and the directories between the state home and the work area.
+- Harness child environments are built from an allowlist of process context (search path, home, scratch, locale, terminal, TLS trust paths and credential-free proxy settings) on both the headless and interactive lanes. Session credentials reach the harness through owner-only files in the session state root, removed at session end, and the worker drops its per-session read credential from its own environment once bootstrap succeeds.
+- Credentials are redacted from unauthenticated control API responses: repository URLs on the stats, heartbeat, doctor, pool, workarea and session list routes, and on credential-free session-detail reads, are served without their userinfo. The session usage route checks the caller's credential before it looks up the session.
+- A timed-out quota probe stops its whole process group, so a forked CLI child cannot outlive it.
+- A transiently refused PTY start (`EPERM` or `EAGAIN` under heavy spawn load) is retried a bounded number of times instead of failing the spawn.
+
+### Chores
+
+- Deflake the durable output batch frame-age test and the shim-spawn tests: the frame-age bound is measured only over recorded output frames, and the shim-spawn harness no longer needs a shell binary.
 
 ## v0.72.67 — 2026-10-08
 

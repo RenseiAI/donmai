@@ -155,8 +155,8 @@ func TestRenderComposerRules(t *testing.T) {
 		rule Rule
 		want []string
 	}{
-		{"deny read, literal", Rule{Kind: RuleDenyRead, Path: "/secrets/key", Scope: ScopeLiteral}, []string{`(deny file-read* (literal "/secrets/key"))`}},
-		{"deny read, subtree", Rule{Kind: RuleDenyRead, Path: "/secrets", Scope: ScopeSubtree}, []string{`(deny file-read* (subpath "/secrets"))`}},
+		{"deny read, literal", Rule{Kind: RuleDenyRead, Path: "/secrets/key", Scope: ScopeLiteral}, []string{`(deny file-read-data file-read-metadata file-read-xattr (literal "/secrets/key"))`}},
+		{"deny read, subtree", Rule{Kind: RuleDenyRead, Path: "/secrets", Scope: ScopeSubtree}, []string{`(deny file-read-data file-read-metadata file-read-xattr (subpath "/secrets"))`}},
 		{"deny write inside a writable root pins its ancestors", Rule{Kind: RuleDenyWrite, Path: "/r/ws/mut/a/b", Scope: ScopeSubtree}, []string{
 			`(deny file-write* (subpath "/r/ws/mut/a/b"))`,
 			`(deny file-link (subpath "/r/ws/mut/a/b"))`,
@@ -180,6 +180,30 @@ func TestRenderComposerRules(t *testing.T) {
 				t.Errorf("a composer rule rendered an allow:\n%s", text)
 			}
 		})
+	}
+}
+
+// TestRenderComposerRules pins that a composer read deny names every read
+// operation one by one, never as file-read*: the profile judges a rule
+// naming an operation ahead of a wildcard rule whatever their order, so a
+// wildcard deny would lose to the session allowlist's file-read-data allow
+// and leave a denied path nested inside the writable set readable. The
+// shape matches the daemon-private read deny.
+func TestRenderComposerRules_ReadDenyNamesEveryOperation(t *testing.T) {
+	for _, rule := range []Rule{
+		{Kind: RuleDenyRead, Path: "/secrets/key", Scope: ScopeLiteral},
+		{Kind: RuleDenyRead, Path: "/secrets", Scope: ScopeSubtree},
+	} {
+		text, err := renderComposerRules(sampleResolved(), []Rule{rule}, identity)
+		if err != nil {
+			t.Fatalf("renderComposerRules: %v", err)
+		}
+		if strings.Contains(text, "file-read*") {
+			t.Fatalf("a composer read deny renders a wildcard that loses to the session allowlist:\n%s", text)
+		}
+		if !strings.Contains(text, "(deny "+seatbeltComposerReadOps+" ") {
+			t.Fatalf("a composer read deny does not name every read operation:\n%s", text)
+		}
 	}
 }
 
@@ -297,7 +321,7 @@ func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
 		"(allow file-read-data file-read-xattr\n  (subpath \"/h/.config/git\")",
 		`(subpath "/r/ws/mut")`,
 		"(deny file-write*)\n",
-		`(deny file-read* (subpath "/r/ws/mut/secret"))`,
+		`(deny file-read-data file-read-metadata file-read-xattr (subpath "/r/ws/mut/secret"))`,
 	}
 	last := -1
 	for _, needle := range order {

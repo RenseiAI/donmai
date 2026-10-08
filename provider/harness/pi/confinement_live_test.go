@@ -831,7 +831,7 @@ func TestPiConfinement_DigestChangeRetiresAttestation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := confinePiSession(spec, layout, c, piReadScope{})
+	plan, err := confinePiSession(spec, layout, c, piReadScope{}, "")
 	if err != nil {
 		t.Fatalf("Prepare under the tested digest: %v", err)
 	}
@@ -850,7 +850,7 @@ func TestPiConfinement_DigestChangeRetiresAttestation(t *testing.T) {
 	if _, ok := changed.Attestation(); ok {
 		t.Fatalf("a confiner that never ran the self-test attests")
 	}
-	if _, err := confinePiSession(spec, layout, changed, piReadScope{}); err == nil {
+	if _, err := confinePiSession(spec, layout, changed, piReadScope{}, ""); err == nil {
 		t.Fatalf("Prepare under a changed digest succeeded without a self-test: the cached attestation was reused")
 	}
 }

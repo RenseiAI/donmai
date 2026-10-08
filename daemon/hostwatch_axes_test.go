@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -123,5 +124,40 @@ func TestHostwatchAxesShimHandleProjection(t *testing.T) {
 	handle := daemon.trackLaunchedShim(controller, spec, ProjectConfig{ID: "example"}, "", "", SessionShimAdoptionEvidence{}, SessionShimAdoptionReceipt{}, false)
 	if handle.ModelProvider != "openai" || handle.ModelAuthor != "meta" || handle.EndpointOperator != "proxy-operator" || handle.Protocol != "openai-chat" {
 		t.Fatalf("actual shim handle publication lost explicit display axes: %+v", handle)
+	}
+}
+
+// TestHostwatchSessionListProjectsIssueIdentifier drives the production
+// list route: a session admitted with a stored detail is labeled with its
+// issue identifier from admission, before any runner state exists, while
+// the work item's title never rides the unauthenticated list.
+func TestHostwatchSessionListProjectsIssueIdentifier(t *testing.T) {
+	d, srv, cleanup := mustStartDaemonWith(t, nil)
+	defer cleanup()
+	const title = "title-must-stay-off-the-list"
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{
+		SessionID: "sess-issue", Repository: "github.com/foo/bar", Ref: "main",
+	}, &SessionDetail{SessionID: "sess-issue", Repository: "github.com/foo/bar", IssueIdentifier: "ENG-77", Title: title}); err != nil {
+		t.Fatalf("AcceptWorkWithDetail: %v", err)
+	}
+	raw := rawControlBody(t, srv.Addr(), "/api/daemon/sessions")
+	var handles []SessionHandle
+	if err := json.Unmarshal([]byte(raw), &handles); err != nil {
+		t.Fatalf("decode list: %v: %s", err, raw)
+	}
+	found := false
+	for _, h := range handles {
+		if h.SessionID == "sess-issue" {
+			found = true
+			if h.IssueIdentifier != "ENG-77" {
+				t.Errorf("list handle issueIdentifier = %q, want ENG-77", h.IssueIdentifier)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("admitted session missing from the list: %s", raw)
+	}
+	if strings.Contains(raw, title) {
+		t.Errorf("work item title leaked onto the session list: %s", raw)
 	}
 }

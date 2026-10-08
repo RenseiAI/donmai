@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/RenseiAI/donmai/afclient"
 )
 
@@ -82,9 +84,6 @@ func TestProjectAllowNoCredentials(t *testing.T) {
 	}
 	if p.CredentialHelper != nil {
 		t.Errorf("expected nil credential helper, got %+v", p.CredentialHelper)
-	}
-	if p.CloneStrategy != afclient.CloneShallow {
-		t.Errorf("expected shallow clone, got %q", p.CloneStrategy)
 	}
 }
 
@@ -328,11 +327,11 @@ func TestProjectAllowWriteError(t *testing.T) {
 	}
 }
 
-func TestProjectAllowCustomCloneStrategy(t *testing.T) {
+func TestProjectAllowRetiredCloneStrategyFlagIsIgnored(t *testing.T) {
 	t.Parallel()
 
 	rw := &mockConfigRW{}
-	_, err := newTestProjectCmd(rw, "", []string{
+	buf, err := newTestProjectCmd(rw, "", []string{
 		"allow", "github.com/foo/bar",
 		"--no-credentials",
 		"--clone-strategy", "full",
@@ -341,8 +340,45 @@ func TestProjectAllowCustomCloneStrategy(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if rw.written.Projects[0].CloneStrategy != afclient.CloneFull {
-		t.Errorf("expected full clone strategy, got %q", rw.written.Projects[0].CloneStrategy)
+	if rw.written == nil {
+		t.Fatal("expected config to be written")
+	}
+	if len(rw.written.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(rw.written.Projects))
+	}
+	// The retired flag is accepted for script compatibility but nothing is
+	// stored: the project allow entry carries no clone override.
+	if rw.written.Projects[0].RepoURL != "github.com/foo/bar" {
+		t.Errorf("expected repoURL github.com/foo/bar, got %q", rw.written.Projects[0].RepoURL)
+	}
+	if !strings.Contains(buf.String(), "retired") {
+		t.Errorf("expected retirement warning in output, got: %s", buf.String())
+	}
+}
+
+func TestProjectAllowHiddenCloneStrategyFlagNamesRemovalVersion(t *testing.T) {
+	t.Parallel()
+
+	cmd := newProjectCmdWithRW(&mockConfigRW{}, Config{})
+	var allow *cobra.Command
+	for _, sub := range cmd.Commands() {
+		if sub.Name() == "allow" {
+			allow = sub
+			break
+		}
+	}
+	if allow == nil {
+		t.Fatal("allow subcommand not found")
+	}
+	flag := allow.Flags().Lookup("clone-strategy")
+	if flag == nil {
+		t.Fatal("expected retired --clone-strategy flag to remain registered as a hidden no-op")
+	}
+	if !flag.Hidden {
+		t.Error("--clone-strategy should be hidden")
+	}
+	if !strings.Contains(flag.Usage, cloneStrategyRemovalVersion) {
+		t.Errorf("flag usage should name the removal version, got: %q", flag.Usage)
 	}
 }
 
@@ -353,7 +389,6 @@ func TestProjectAllowUpsertExisting(t *testing.T) {
 		Projects: []afclient.ProjectEntry{
 			{
 				RepoURL:          "github.com/foo/bar",
-				CloneStrategy:    afclient.CloneShallow,
 				CredentialHelper: &afclient.CredentialHelper{Kind: afclient.CredentialHelperGH},
 			},
 		},
@@ -362,7 +397,6 @@ func TestProjectAllowUpsertExisting(t *testing.T) {
 	_, err := newTestProjectCmd(rw, "", []string{
 		"allow", "github.com/foo/bar",
 		"--no-credentials",
-		"--clone-strategy", "full",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -371,8 +405,8 @@ func TestProjectAllowUpsertExisting(t *testing.T) {
 	if len(rw.written.Projects) != 1 {
 		t.Fatalf("expected 1 project after upsert, got %d", len(rw.written.Projects))
 	}
-	if rw.written.Projects[0].CloneStrategy != afclient.CloneFull {
-		t.Error("expected updated clone strategy")
+	if rw.written.Projects[0].RepoURL != "github.com/foo/bar" {
+		t.Error("expected repo URL preserved after upsert")
 	}
 	if rw.written.Projects[0].CredentialHelper != nil {
 		t.Error("expected nil credential helper after upsert with --no-credentials")
@@ -401,7 +435,7 @@ func TestProjectCredentialsUpdateExisting(t *testing.T) {
 
 	existing := &afclient.DaemonYAML{
 		Projects: []afclient.ProjectEntry{
-			{RepoURL: "github.com/foo/bar", CloneStrategy: afclient.CloneShallow},
+			{RepoURL: "github.com/foo/bar"},
 		},
 	}
 	rw := &mockConfigRW{cfg: existing}
@@ -490,12 +524,10 @@ func TestProjectListWithProjects(t *testing.T) {
 		Projects: []afclient.ProjectEntry{
 			{
 				RepoURL:          "github.com/foo/bar",
-				CloneStrategy:    afclient.CloneShallow,
 				CredentialHelper: &afclient.CredentialHelper{Kind: afclient.CredentialHelperOSXKeychain},
 			},
 			{
 				RepoURL:          "github.com/baz/qux",
-				CloneStrategy:    afclient.CloneFull,
 				CredentialHelper: nil,
 			},
 		},
@@ -519,6 +551,11 @@ func TestProjectListWithProjects(t *testing.T) {
 	if !strings.Contains(out, "(none") {
 		t.Errorf("expected '(none' for unconfigured credentials, got: %s", out)
 	}
+	// TestProjectListNoCloneStrategyColumn pins the retired column's absence:
+	// the list table shows repo URL and credential helper only.
+	if strings.Contains(out, "CLONE") {
+		t.Errorf("retired clone column should not render, got: %s", out)
+	}
 	if !strings.Contains(out, "REPO URL") {
 		t.Errorf("expected table header in output, got: %s", out)
 	}
@@ -530,8 +567,7 @@ func TestProjectListSSHHelper(t *testing.T) {
 	existing := &afclient.DaemonYAML{
 		Projects: []afclient.ProjectEntry{
 			{
-				RepoURL:       "github.com/foo/bar",
-				CloneStrategy: afclient.CloneShallow,
+				RepoURL: "github.com/foo/bar",
 				CredentialHelper: &afclient.CredentialHelper{
 					Kind:       afclient.CredentialHelperSSH,
 					SSHKeyPath: "/home/user/.ssh/id_rsa",
@@ -556,8 +592,7 @@ func TestProjectListPATHelper(t *testing.T) {
 	existing := &afclient.DaemonYAML{
 		Projects: []afclient.ProjectEntry{
 			{
-				RepoURL:       "github.com/foo/bar",
-				CloneStrategy: afclient.CloneShallow,
+				RepoURL: "github.com/foo/bar",
 				CredentialHelper: &afclient.CredentialHelper{
 					Kind:       afclient.CredentialHelperPAT,
 					EnvVarName: "MY_GITHUB_TOKEN",
@@ -796,14 +831,13 @@ func TestDaemonYAMLAddOrUpdateProject(t *testing.T) {
 
 	// Update existing.
 	d.AddOrUpdateProject(afclient.ProjectEntry{
-		RepoURL:       "github.com/a/b",
-		CloneStrategy: afclient.CloneFull,
+		RepoURL: "github.com/a/b",
 	})
 	if len(d.Projects) != 1 {
 		t.Fatalf("expected still 1 project after update, got %d", len(d.Projects))
 	}
-	if d.Projects[0].CloneStrategy != afclient.CloneFull {
-		t.Errorf("expected full strategy after update, got %q", d.Projects[0].CloneStrategy)
+	if d.Projects[0].RepoURL != "github.com/a/b" {
+		t.Errorf("expected repo URL preserved after update, got %q", d.Projects[0].RepoURL)
 	}
 
 	// Add new.

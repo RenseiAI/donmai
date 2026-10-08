@@ -40,6 +40,16 @@ const PiConfinementReadPathsEnv = "DONMAI_PI_CONFINEMENT_READ_PATHS"
 // constant). It is daemon-owned already: the daemon composes it last.
 const DaemonControlURLEnv = "DONMAI_DAEMON_URL"
 
+// ControlTokenPathEnv is the variable that overrides the daemon's
+// control-token file path (afclient.ControlTokenFileEnv is this constant).
+// The pi provider reads it in the worker to learn the token path the
+// daemon resolves for the operator's CLI — the file-env override wins when
+// absolute, else the host state home — and passes that path into the seat
+// confinement as a daemon-private deny. It is runner-only: it never reaches
+// a spawned session's environment (see IsRunnerOnly), so reading it here
+// discloses nothing to the seat.
+const ControlTokenPathEnv = "DONMAI_CONTROL_TOKEN_FILE"
+
 // SessionReadTokenEnv names the per-session read credential a supervisor
 // states in a spawned worker's environment beside the session id it names.
 // It authorizes exactly one session-detail read — the detail for that
