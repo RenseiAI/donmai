@@ -3,6 +3,7 @@ package daemon
 import (
 	"fmt"
 	"runtime"
+	"strconv"
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
@@ -92,7 +93,7 @@ func seatBudgetReportFor(b seatbudget.Budget, placement seatbudget.Placement, go
 // status path stays hermetic and host-independent under test.
 func seatBudgetNoBackendDetailFor(placement seatbudget.Placement) string {
 	if placement == seatbudget.PlacementCgroupFS {
-		return "no systemd on this host: cgroupfs placement is not applied, seat runs unconfined"
+		return "no usable systemd on this host (needs systemd " + strconv.Itoa(seatbudget.MinScopeSystemd) + " or newer): cgroupfs placement is not applied, seat runs unconfined"
 	}
 	return "no enforcement backend on this host"
 }

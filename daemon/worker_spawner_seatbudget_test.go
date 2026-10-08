@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -240,6 +241,9 @@ func TestSessionSeatBudgetReport_CgroupfsIsUnconfined(t *testing.T) {
 	}
 	if !strings.Contains(rep.Detail, "cgroupfs") {
 		t.Errorf("report detail = %q; want the unapplied cgroupfs backend named", rep.Detail)
+	}
+	if !strings.Contains(rep.Detail, "systemd "+strconv.Itoa(seatbudget.MinScopeSystemd)) {
+		t.Errorf("report detail = %q; want the systemd floor named (an old manager reads as no usable systemd)", rep.Detail)
 	}
 	if rep.CPUs != 0 || rep.MemoryMB != 0 {
 		t.Errorf("report = %+v; want no values on an unconfined seat", rep)

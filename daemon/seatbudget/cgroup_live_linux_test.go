@@ -22,8 +22,9 @@ import (
 // the post-exit defaults (--collect reaps the unit once the child goes).
 // The burner and the memory assertions run in the same live window.
 //
-// The test only runs where the backend exists (systemd as PID 1 with
-// systemd-run on PATH and a reachable bus); anywhere else it skips with
+// The test only runs where the backend exists (systemd MinScopeSystemd or
+// newer as PID 1 with systemd-run on PATH and a reachable bus); anywhere
+// else it skips with
 // the reason named. The argv shape itself is pinned on every host by
 // TestSystemdScopeArgs, so a skip here means "no systemd on this host",
 // never "the wrap is broken".
@@ -34,7 +35,7 @@ import (
 // leaves with the child (--collect).
 func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 	if !HasSystemd() {
-		t.Skip("no systemd backend on this host (PID 1 is not systemd or systemd-run is absent)")
+		t.Skipf("no systemd backend on this host (PID 1 is not systemd, systemd-run is absent, or systemd is older than %d)", MinScopeSystemd)
 	}
 	if !HasSystemBus() && !HasUserBus() {
 		t.Skip("no reachable systemd bus on this host (neither system nor user bus answers)")

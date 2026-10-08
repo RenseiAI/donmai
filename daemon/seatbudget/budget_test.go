@@ -352,7 +352,7 @@ func TestHasSystemdAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(dir, "run-helper")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture never executed (LookPath probe target only)
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: a LookPath target whose --version prints nothing (unknown version keeps the placement)
 		t.Fatal(err)
 	}
 	oldPath := os.Getenv("PATH")
@@ -404,5 +404,59 @@ func TestCgroupDocMatchesQuotaOnlyDesign(t *testing.T) {
 	}
 	if !strings.Contains(doc, "no core pinning") {
 		t.Error("cgroup.go doc does not state the deliberate no-pinning rule; want it explicit")
+	}
+}
+
+// TestHasSystemdAt_VersionGate pins the systemd floor for the scope
+// placement through the injected version probe (no real systemd needed):
+// a manager older than MinScopeSystemd gets no placement, so its seats run
+// unconfined and report none instead of dying on "Unknown assignment:
+// OOMPolicy=continue" (measured on 249) or claiming a CPU quota its user
+// manager never delegated.
+func TestHasSystemdAt_VersionGate(t *testing.T) {
+	dir := t.TempDir()
+	comm := filepath.Join(dir, "comm-systemd")
+	if err := os.WriteFile(comm, []byte("systemd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(dir, "run-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: LookPath target only, the version is injected
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, tc := range []struct {
+		version int
+		want    bool
+	}{
+		{249, false},
+		{251, false},
+		{MinScopeSystemd, true},
+		{255, true},
+		{0, true},
+	} {
+		want := tc.want && runtime.GOOS == "linux"
+		v := tc.version
+		if got := hasSystemdAt("run-helper", comm, func() int { return v }); got != want {
+			t.Errorf("hasSystemdAt(systemd %d) = %v; want %v", v, got, want)
+		}
+	}
+}
+
+func TestParseSystemdVersion(t *testing.T) {
+	for in, want := range map[string]int{
+		"systemd 249 (249.11-0ubuntu3.22)\n+PAM +AUDIT +SELINUX": 249,
+		"systemd 252 (252.39-1~deb12u2)\n":                       252,
+		"systemd 255 (255.4-1ubuntu8.17)":                        255,
+		"":                                                       0,
+		"systemd":                                                0,
+		"systemd abc (x)":                                        0,
+		"libsystemd 255":                                         0,
+	} {
+		if got := ParseSystemdVersion(in); got != want {
+			t.Errorf("ParseSystemdVersion(%q) = %d; want %d", in, got, want)
+		}
+	}
+	if ScopeSystemdSupported(249) || !ScopeSystemdSupported(252) || !ScopeSystemdSupported(0) {
+		t.Errorf("ScopeSystemdSupported floor drifted from %d", MinScopeSystemd)
 	}
 }

@@ -246,8 +246,9 @@ systemd scope (CPU quota, CPU weight, memory max, seat-survives-OOM
 policy), on the user bus (`--user`) for per-user installs and the system
 bus for system installs; the quota is the binding CPU limit (no core
 pinning: identical pin ranges across seats shared 2 cores of 6 budgeted,
-and user services never get the cpuset controller delegated). Without
-systemd there is
+and user services never get the cpuset controller delegated). The scope
+needs systemd 252 or newer (249 rejects it and delegates no CPU controller
+to user managers). Without a usable systemd there is
 no enforcement backend, so the seat runs unconfined and reports `none`
 with the backend named as the reason. On macOS the seat carries
 worker-cap environment (`GOMAXPROCS`, `MAKEFLAGS`,

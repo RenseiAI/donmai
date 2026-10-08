@@ -176,10 +176,7 @@ func sessionSeatBudgetReportForGOOS(b seatbudget.Budget, ok bool, placement seat
 				Detail:   detail + " via transient systemd scope",
 			}
 		}
-		if placement == seatbudget.PlacementCgroupFS {
-			return &SessionSeatBudget{Mode: string(seatbudget.ModeNone), Detail: "no systemd on this host: cgroupfs placement is not applied, seat runs unconfined"}
-		}
-		return &SessionSeatBudget{Mode: string(seatbudget.ModeNone), Detail: "no enforcement backend on this host"}
+		return &SessionSeatBudget{Mode: string(seatbudget.ModeNone), Detail: seatBudgetNoBackendDetailFor(placement)}
 	}
 	return &SessionSeatBudget{
 		Mode:     string(seatbudget.ModeBestEffort),

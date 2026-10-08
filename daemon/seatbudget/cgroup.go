@@ -1,6 +1,7 @@
 package seatbudget
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,8 +20,9 @@ import (
 // a CPU quota, a CPU weight share, a memory high/max ceiling, an IO weight
 // and the seat-survives-OOM policy. Exactly one placement exists:
 //
-//  1. systemd transient scope: when the host runs systemd as PID 1 and the
-//     systemd-run helper is available, the seat launches wrapped in
+//  1. systemd transient scope: when the host runs systemd (MinScopeSystemd
+//     or newer) as PID 1 and the systemd-run helper is available, the seat
+//     launches wrapped in
 //     `systemd-run --scope --collect` with CPUQuota=, CPUWeight=,
 //     MemoryMax=/MemoryHigh=, IOWeight= and OOMPolicy=continue properties.
 //     systemd owns the cgroup lifetime, so no cleanup path can leak it.
@@ -170,14 +173,30 @@ func ScopeName(sessionID string) string {
 	return name + ".scope"
 }
 
-// HasSystemd reports whether PID 1 is systemd and the systemd-run helper is
-// on PATH: the precondition for the transient-scope placement.
-// systemdRunBinary and pidOneComm name the probe inputs so the live
-// confinement test can point them at a fixture (or the real host) without
-// recompiling; production passes ("systemd-run", "/proc/1/comm").
+// MinScopeSystemd is the oldest systemd the transient-scope placement
+// supports. Measured: systemd 249 rejects the seat scope outright
+// ("Unknown assignment: OOMPolicy=continue", so the seat never starts)
+// and its user manager delegates only memory and pids (a per-user scope's
+// CPU quota would be silently ignored); 252 and 255 accept the scope,
+// delegate cpu to user managers, and confine. An older manager therefore
+// gets no placement: the seat runs unconfined and reports none, rather
+// than failing to start or claiming a quota it did not get.
+const MinScopeSystemd = 252
+
+// HasSystemd reports whether PID 1 is systemd, the systemd-run helper is
+// on PATH and the manager is MinScopeSystemd or newer: the precondition
+// for the transient-scope placement. systemdRunBinary and pidOneComm name
+// the probe inputs so the live confinement test can point them at a
+// fixture (or the real host) without recompiling; production passes
+// ("systemd-run", "/proc/1/comm"). The version is read once per process:
+// HostPlacement runs on every spawn and status read.
 func HasSystemd() bool {
-	return HasSystemdAt("systemd-run", "/proc/1/comm")
+	return hasSystemdAt("systemd-run", "/proc/1/comm", hostSystemdVersion)
 }
+
+// hostSystemdVersion caches the host's systemd major version (0 when
+// unknown) for HasSystemd.
+var hostSystemdVersion = sync.OnceValue(func() int { return SystemdVersionAt("systemd-run") })
 
 // HasSystemdAt is HasSystemd parametrised by the helper name and the PID 1
 // comm path. The cgroup-confinement suite drives it against the live host
@@ -185,6 +204,12 @@ func HasSystemd() bool {
 // against fixtures elsewhere; unit tests pin the matrix through it on any
 // host.
 func HasSystemdAt(systemdRun, pidOneComm string) bool {
+	return hasSystemdAt(systemdRun, pidOneComm, func() int { return SystemdVersionAt(systemdRun) })
+}
+
+// hasSystemdAt is HasSystemdAt with the version probe injected so tests
+// pin the version gate without a real systemd.
+func hasSystemdAt(systemdRun, pidOneComm string, version func() int) bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
@@ -195,8 +220,44 @@ func HasSystemdAt(systemdRun, pidOneComm string) bool {
 	if strings.TrimSpace(string(raw)) != "systemd" {
 		return false
 	}
-	_, err = exec.LookPath(systemdRun)
-	return err == nil
+	if _, err := exec.LookPath(systemdRun); err != nil {
+		return false
+	}
+	return ScopeSystemdSupported(version())
+}
+
+// SystemdVersionAt runs `<systemdRun> --version` and returns the systemd
+// major version, or 0 when the helper prints none.
+func SystemdVersionAt(systemdRun string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, systemdRun, "--version").Output() //nolint:gosec // G204: production passes the fixed "systemd-run" literal; the parameter exists so tests can point the probe at a fixture
+	if err != nil {
+		return 0
+	}
+	return ParseSystemdVersion(string(out))
+}
+
+// ParseSystemdVersion reads the major version from `systemd-run --version`
+// output ("systemd 252 (252.39-1~deb12u2)"). 0 means unknown.
+func ParseSystemdVersion(out string) int {
+	fields := strings.Fields(out)
+	if len(fields) < 2 || fields[0] != "systemd" {
+		return 0
+	}
+	n, err := strconv.Atoi(fields[1])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// ScopeSystemdSupported reports whether a systemd of major version v can
+// host the seat scope (see MinScopeSystemd). 0 (unknown) keeps the
+// placement: every systemd-run prints its version, so unknown means a
+// fixture, not an old manager.
+func ScopeSystemdSupported(v int) bool {
+	return v == 0 || v >= MinScopeSystemd
 }
 
 // HasSystemBus reports whether the system bus is reachable from this
