@@ -166,6 +166,16 @@ var networkReaching = regexp.MustCompile(`(?i)\b(curl|wget|nc|ncat|ssh|scp|rsync
 type PolicyEngine struct {
 	autonomous bool
 	cwd        string
+	// readOnlyRoots are the declared read-only repository paths a session
+	// must not mutate: every entry of Spec.RepositoryAuthority.ReadOnlyPaths
+	// plus the workarea root itself, which owns the declaration the
+	// session reads but never rewrites. Reads inside them stay allowed;
+	// mutating file ops and bash commands resolving into them are denied.
+	readOnlyRoots []string
+	// workareaRoot is the declared session root owning the read-only
+	// leaves. It is held separately so read admission can tell a sibling
+	// read (admitted) from any other workarea-root read.
+	workareaRoot string
 	// stateRoot is the session's relocated harness state root
 	// (sessionStateRoot). The state-dir guard protects it alongside the
 	// legacy in-checkout directory.
@@ -203,6 +213,8 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 	e := &PolicyEngine{
 		autonomous:      spec.Autonomous,
 		cwd:             spec.Cwd,
+		readOnlyRoots:   readOnlyRepositoryRoots(spec),
+		workareaRoot:    workareaRootOf(spec),
 		stateRoot:       sessionStateRoot(spec),
 		allowGated:      spec.ToolApprovalAllowGated(),
 		allowedTools:    parseToolPatterns(spec.AllowedTools),
@@ -258,14 +270,26 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 		}
 	}
 
-	// 2. Path containment for file ops.
+	// 2. Path containment for file ops. A read inside a declared read-only
+	// repository is allowed even in an autonomous session: the sibling
+	// exists to be read, and the declaration below only ever denies
+	// mutation. Every other out-of-tree read keeps the existing posture.
 	if call.Path != "" && (isMutatingKind(call.Kind) || isReadKind(call.Kind)) {
 		if reason, contained := e.checkContainment(call); !contained {
 			// An explicit allow pattern covering the path re-permits it
 			// (e.g. a sanctioned shared cache outside the worktree).
-			if !e.matchesAllowRegex(subject) {
+			if !e.matchesAllowRegex(subject) && !e.readOnlyRepositoryRead(call) {
 				return Decision{Allow: false, Reason: reason}
 			}
+		}
+	}
+
+	// 2b. Declared read-only repositories: mutating file ops inside one
+	// are denied even when an allow pattern would otherwise admit them —
+	// the declaration is the stronger authority. Reads stay allowed.
+	if call.Path != "" && isMutatingKind(call.Kind) {
+		if reason := e.readOnlyReason(call); reason != "" {
+			return Decision{Allow: false, Reason: reason}
 		}
 	}
 
@@ -302,6 +326,109 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 		return Decision{Allow: true}
 	}
 	return Decision{Allow: false, Reason: "default decision is deny/prompt and no allow pattern matched"}
+}
+
+// readOnlyRepositoryRoots resolves the declared read-only boundary from
+// the spec: every read-only repository path plus the workarea root that
+// owns them, cleaned and deduplicated. Empty when the session carries no
+// declared repository authority. The containment root itself is never
+// listed: the selected leaf stays writable there even when it sits under
+// the root.
+func readOnlyRepositoryRoots(spec agent.Spec) []string {
+	authority := spec.RepositoryAuthority
+	if authority == nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var roots []string
+	add := func(path string) {
+		clean := filepath.Clean(strings.TrimSpace(path))
+		if clean == "" || clean == "." {
+			return
+		}
+		if _, duplicate := seen[clean]; duplicate {
+			return
+		}
+		seen[clean] = struct{}{}
+		roots = append(roots, clean)
+	}
+	add(authority.WorkareaRoot)
+	for _, path := range authority.ReadOnlyPaths {
+		add(path)
+	}
+	return roots
+}
+
+// workareaRootOf returns the cleaned declared session root, or empty when
+// the session carries no declared repository authority.
+func workareaRootOf(spec agent.Spec) string {
+	if spec.RepositoryAuthority == nil {
+		return ""
+	}
+	clean := filepath.Clean(strings.TrimSpace(spec.RepositoryAuthority.WorkareaRoot))
+	if clean == "" || clean == "." {
+		return ""
+	}
+	return clean
+}
+
+// insidePath reports whether clean sits at or under root.
+func insidePath(clean, root string) bool {
+	return clean == root || strings.HasPrefix(clean+string(filepath.Separator), root+string(filepath.Separator))
+}
+
+// readOnlyRepositoryRead reports whether call is a read inside a declared
+// read-only repository path (not the workarea root itself): the sibling
+// exists to be read, so such reads are admitted even in an autonomous
+// session where other out-of-tree reads stay denied.
+func (e *PolicyEngine) readOnlyRepositoryRead(call ToolCall) bool {
+	if !isReadKind(call.Kind) || call.Path == "" {
+		return false
+	}
+	clean := filepath.Clean(call.Path)
+	if e.cwd != "" && insidePath(clean, filepath.Clean(e.cwd)) {
+		return false
+	}
+	authority := e.authorityReadOnlyPaths()
+	for _, root := range authority {
+		if insidePath(clean, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// authorityReadOnlyPaths returns the cleaned declared read-only
+// repository paths held by the engine, without the workarea root.
+func (e *PolicyEngine) authorityReadOnlyPaths() []string {
+	var out []string
+	for _, root := range e.readOnlyRoots {
+		if e.workareaRoot != "" && root == e.workareaRoot {
+			continue
+		}
+		out = append(out, root)
+	}
+	return out
+}
+
+// readOnlyReason denies a mutating call resolving into a declared
+// read-only root. Reads stay allowed: a read-only sibling exists to be
+// read. The containment root (the selected leaf) is exempt so the session
+// keeps writing its own worktree when it sits under the workarea root.
+func (e *PolicyEngine) readOnlyReason(call ToolCall) string {
+	if len(e.readOnlyRoots) == 0 || call.Path == "" {
+		return ""
+	}
+	clean := filepath.Clean(call.Path)
+	if e.cwd != "" && insidePath(clean, filepath.Clean(e.cwd)) {
+		return ""
+	}
+	for _, root := range e.readOnlyRoots {
+		if insidePath(clean, root) {
+			return "file write/edit inside a read-only repository blocked: " + clean
+		}
+	}
+	return ""
 }
 
 // containmentRoot is the session worktree root a call is judged against. The

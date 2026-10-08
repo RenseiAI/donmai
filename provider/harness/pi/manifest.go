@@ -73,7 +73,9 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// orthogonal, exactly as claude/manifest.go and codex/manifest.go
 			// document; PTY is selected per Spawn call by Spec.Interactive != nil,
 			// never by a Transport value.
-			SupportsInteractivePTY: true,
+			SupportsInteractivePTY:           true,
+			MultiRepositoryWorkareaProtocols: []string{"session-root-v1"},
+			RepositoryAuthorityEnforcement:   "isolated-read-only-v1",
 			// `pi --mode rpc` carries an explicit steering verb on the same
 			// JSONL channel that drives the session: Handle.Inject maps to
 			// steer while a turn is in flight and follow_up while idle

@@ -194,9 +194,15 @@ func gitInit(t *testing.T, dir string) {
 	}
 }
 
-// spec returns the session spec for the world's mutable leaf.
+// spec returns the session spec for the world's mutable leaf. The sandbox
+// posture is the authority posture the runner binds alongside any declared
+// repository authority, so an authority-bearing spec passes admission the
+// same way a runner-produced one does.
 func (w liveWorld) spec() agent.Spec {
-	return agent.Spec{SessionName: "live", Cwd: w.mut, Prompt: "probe"}
+	return agent.Spec{
+		SessionName: "live", Cwd: w.mut, Prompt: "probe",
+		SandboxEnabled: true, SandboxLevel: agent.SandboxWorkspaceWrite,
+	}
 }
 
 // authority is a declared repository authority over the world: the mutable
@@ -208,6 +214,7 @@ func (w liveWorld) authority() *agent.RepositoryAuthorityPolicy {
 		SelectedPath:  w.mut,
 		MutablePaths:  []string{w.mut},
 		ReadOnlyPaths: []string{w.ro},
+		Enforcement:   "isolated-read-only-v1",
 	}
 }
 
@@ -488,12 +495,10 @@ func TestPiConfinement_InteractiveSpawnRefusesForbiddenWrites(t *testing.T) {
 
 // TestPiConfinement_AuthorityRequestConfinesThroughLaunch covers the other
 // gate input: a declared repository authority requests confinement, and the
-// per-session confinement record names its read-only leaves. pi's manifest
-// declares no multi-repository workarea protocol yet, so admission refuses
-// such a spec at Spawn (asserted first); the test therefore enters at
-// launch, the shared post-admission entry of Spawn and Resume, with the gate
-// still evaluated on the spec. When the manifest gains a protocol, the
-// admission assertion fails and this test should move to Spawn.
+// per-session confinement record names its read-only leaves. The manifest
+// declares the multi-repository workarea protocol and the read-only
+// enforcement, so admission admits such a spec and the test enters at
+// Spawn, the production entry point.
 func TestPiConfinement_AuthorityRequestConfinesThroughLaunch(t *testing.T) {
 	w := newLiveWorld(t)
 	bin := writeLiveHarness(t, w)
@@ -501,12 +506,7 @@ func TestPiConfinement_AuthorityRequestConfinesThroughLaunch(t *testing.T) {
 	spec.RepositoryAuthority = w.authority()
 	p := liveProvider(t, bin, false)
 
-	if h, err := p.Spawn(liveCtx(t), spec); err == nil {
-		_ = h.Stop(context.Background())
-		t.Fatalf("Spawn admitted a repository authority for pi; drive this test through Spawn now")
-	}
-
-	h, err := p.launch(liveCtx(t), spec, launchPrompt, "")
+	h, err := p.Spawn(liveCtx(t), spec)
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}

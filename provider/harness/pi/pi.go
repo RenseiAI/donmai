@@ -673,10 +673,10 @@ func (p *Provider) confineSession(spec agent.Spec, layout sessionLayout, confine
 // the answer does not depend on whether this host has a backend: a request
 // on a host without one is refused, not dropped (ensurePiConfiner).
 //
-// Today pi's manifest declares no multi-repository workarea protocol, so
-// admission refuses an authority-bearing spec before launch; the host
-// requirement is the trigger a pi session reaches in production. The
-// authority branch is kept for the day the manifest declares one.
+// The manifest declares the multi-repository workarea protocol and the
+// read-only enforcement (manifest.go), so admission admits an
+// authority-bearing spec and this authority branch confines it; the host
+// requirement remains the trigger for sessions without one.
 func piConfinementEnabled(spec agent.Spec, hostRequires bool) bool {
 	if hostRequires {
 		return true
