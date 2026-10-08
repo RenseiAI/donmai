@@ -8,7 +8,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- The claude harness attests the `session-root-v1` multi-repository workarea protocol for declarations whose repositories are all mutable. Every declared mutable repository path is granted as an additional directory (`--add-dir`), session working directory first, in headless and interactive sessions alike, so the agent can work in each writable repository while its working directory stays the selected one. A declaration that carries a read-only repository is still refused on this harness. Interactive claude sessions now pass `--add-dir <working directory>` as headless sessions already did, with or without a declaration.
+
+### Fixes
+
+- Admission checks every entry of a repository declaration, not only the singular repository: each declared source must be a repository configured for the session's own project, and that project must be enabled on this machine. An entry that is unconfigured, configured only for another project, or configured for a project this machine has not enabled is refused, as are a bare repository name and a project id given as a declared source.
+- The daemon's project matcher no longer matches a repository by suffix across hosts or paths: `https://elsewhere.example/x/github.com/acme/web` no longer matches a project configured as `github.com/acme/web`. The same repository in another spelling (scheme, user, `.git` suffix, letter case, scp-style ssh, `owner/name`) still matches, and a project id or a bare repository name still routes the singular repository field.
 
 ## v0.72.69 — 2026-10-08
 
