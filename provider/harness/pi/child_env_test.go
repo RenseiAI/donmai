@@ -67,8 +67,10 @@ var childEnvSentinels = []childEnvSentinel{
 	{"GOOGLE_API_KEY", routeCredential},
 	{"GOOGLE_APPLICATION_CREDENTIALS", routeCredential},
 	{"AZURE_OPENAI_API_KEY", routeCredential},
-	// The worker's runtime bearer and the generic custom-binding spellings.
+	// The worker's runtime bearer, the per-session read credential, and the
+	// generic custom-binding spellings.
 	{"WORKER_AUTH_TOKEN", routeRefused},
+	{runtimeenv.SessionReadTokenEnv, routeRefused},
 	{"API_KEY", routeRefused},
 	{"CUSTOM_SECRET_KEY", routeRefused},
 	// The gateway's upstream credential and other host model auth.
@@ -84,7 +86,7 @@ var childEnvSentinels = []childEnvSentinel{
 	{"GITHUB_TOKEN", routeDeferred},
 	{"GH_TOKEN", routeDeferred},
 	{"LINEAR_API_KEY", routeDeferred},
-	{"SESSION_READ_TOKEN", routeDeferred},
+	{"TRACKER_READ_TOKEN", routeDeferred},
 	// Names nobody has listed yet — including one with no secret shape at
 	// all and one in lower case.
 	{"FUTURE_VENDOR_API_KEY", routeDeferred},

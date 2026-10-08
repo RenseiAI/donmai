@@ -140,10 +140,11 @@ func proxyURLCarriesNoUserinfo(value string) bool {
 // section. These are the session's model credentials (which reach it only
 // through the credential file's credential section and the session
 // auth.json), the known secret-valued bindings no child is entitled to, the
+// per-session read credential the worker consumed during bootstrap, the
 // host model-auth names the shared blocklist guards, runner-only controls,
 // and the harness-owned namespaces.
 func childEnvRefused(name string) bool {
-	if isSessionCredentialName(name) || runtimeenv.IsRunnerOnly(name) {
+	if isSessionCredentialName(name) || runtimeenv.IsRunnerOnly(name) || name == runtimeenv.SessionReadTokenEnv {
 		return true
 	}
 	for _, refused := range undeclaredSecretValueNames {
