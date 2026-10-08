@@ -416,29 +416,39 @@ func TestSubscribeRateLimits_PartialUpdateMerges(t *testing.T) {
 	}
 }
 
-// Only the app-server's own refusal is a login verdict. A read that never
-// reached it (no running harness, a cancelled or timed-out request, a
-// stopped client) carries none, so the daemon reports no check for it.
+// Only the app-server's own login refusal is a login verdict. A read that
+// never reached it (no running harness, a cancelled or timed-out request,
+// a stopped client), or that it answered with an error about something
+// else (a failed backend fetch, an unknown method), carries none, so the
+// daemon reports no check for it.
 func TestRateLimitsProbe_OnlyAnAppServerRefusalIsAnswered(t *testing.T) {
 	t.Parallel()
-	refusal := func(t *testing.T) (*Client, func()) {
-		t.Helper()
-		fake := newFakeStdio()
-		client := NewClient(fake.clientWriter, fake.serverReader)
-		go func() {
-			req := fake.readClientLine(t)
-			if req == nil {
-				return
-			}
-			id, _ := req["id"].(float64)
-			fake.writeServerLine(t, map[string]any{
-				"jsonrpc": "2.0",
-				"id":      int(id),
-				"error":   map[string]any{"code": -32600, "message": "authentication required to read rate limits"},
-			})
-		}()
-		return client, func() { client.Stop(nil); fake.close() }
+	answer := func(code int, message string) func(t *testing.T) (*Client, func()) {
+		return func(t *testing.T) (*Client, func()) {
+			t.Helper()
+			fake := newFakeStdio()
+			client := NewClient(fake.clientWriter, fake.serverReader)
+			go func() {
+				req := fake.readClientLine(t)
+				if req == nil {
+					return
+				}
+				id, _ := req["id"].(float64)
+				fake.writeServerLine(t, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      int(id),
+					"error":   map[string]any{"code": code, "message": message},
+				})
+			}()
+			return client, func() { client.Stop(nil); fake.close() }
+		}
 	}
+	refusal := answer(-32600, "codex account authentication required to read rate limits")
+	// The app-server's backend fetch failed (here: unreachable). The
+	// app-server answered, but not about the login.
+	backendDown := answer(-32603, "failed to fetch codex rate limits: error sending request for url")
+	// An older build that does not know the method.
+	unknownMethod := answer(-32601, "Method not found")
 	stopped := func(t *testing.T) (*Client, func()) {
 		t.Helper()
 		fake := newFakeStdio()
@@ -466,6 +476,8 @@ func TestRateLimitsProbe_OnlyAnAppServerRefusalIsAnswered(t *testing.T) {
 	}{
 		{name: "no running harness", client: nil, wantAnswered: false},
 		{name: "app-server refuses the read", client: refusal, wantAnswered: true},
+		{name: "app-server could not fetch from its backend", client: backendDown, wantAnswered: false},
+		{name: "app-server does not know the method", client: unknownMethod, wantAnswered: false},
 		{name: "client stopped mid-read", client: stopped, wantAnswered: false},
 		{name: "request cancelled before an answer", client: cancelled, cancelFirst: true, wantAnswered: false},
 	}

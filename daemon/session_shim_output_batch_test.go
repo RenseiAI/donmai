@@ -23,10 +23,22 @@ import (
 )
 
 // The production pump consumes a real selected-v3+ Controller, backed by a real
-// shim and PTY. The real candidate writes to a local relay fixture with 75ms
-// acknowledgement latency while the source emits every33ms. Holding a batch
-// callback at this boundary therefore tests the wiring as well as the API.
-func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
+// shim and PTY, and hands output to a real candidate whose relay fixture
+// acknowledges each frame fixtureAckDelay after it arrives while the source
+// emits every 33ms. The test pins the batching property structurally: the pump
+// hands ready output to the carrier in multi-frame windows while output is
+// still arriving. A pump that sends one frame per round trip fails the gate.
+// The hold bound — a ready frame is never held past the gather flush — is
+// pinned deterministically in logical time by
+// TestCollectShimOutputBatchFlushesHeldOutput, which drives the same gather
+// step with an injected timer; an end-to-end wall-clock hold assertion cannot
+// separate a held pump from a loaded scheduler, so this test keeps none.
+func TestShimOutputBatchBatchesLiveOutput(t *testing.T) {
+	// The relay fixture acknowledges each frame this long after it arrives.
+	// It paces the carrier round trips the pump must keep up with; the batching
+	// verdict itself is structural (a multi-frame window while the source
+	// emits), so scheduler jitter delays it instead of flipping it.
+	const fixtureAckDelay = 75 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	dir, err := os.MkdirTemp("/tmp", "dob")
@@ -39,9 +51,16 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-v2", SessionID: "session-v2"}
+	// The shell reads its start line and then emits one line per tick.
+	// The read is the only synchronization the test needs: the shell cannot
+	// emit before the test writes "start", so every output frame belongs to
+	// this run's emission window by construction. The shell floods 600 lines
+	// (~20s), so the window outlasts the gate: a slow scheduler delays the
+	// verdict without the source running dry first; the test emits its
+	// Marker only after the gate below has passed.
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 1,
-		Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "stty -echo; read start; i=0; while [ $i -lt 18 ]; do printf 'output-%02d\\n' \"$i\"; i=$((i+1)); sleep 0.033; done; read finish"}},
+		Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "stty -echo; read start; i=0; while [ $i -lt 600 ]; do printf 'output-%02d\\n' \"$((i % 100))\"; i=$((i+1)); sleep 0.033; done"}},
 		Orphan: sessionshim.OrphanPolicy{Deadline: 30 * time.Second, TerminationGrace: 250 * time.Millisecond},
 	})
 	if err != nil {
@@ -53,18 +72,19 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer direct.Close() //nolint:errcheck // test owns subscription
-	type sourceFrame struct {
+	type arrival struct {
 		raw []byte
-		at  time.Time
 	}
 	var mu sync.Mutex
-	source := make(map[uint64]sourceFrame)
+	source := make(map[uint64]arrival)
 	sourceDone := make(chan struct{})
 	go func() {
 		defer close(sourceDone)
 		for frame := range direct.Frames() {
 			mu.Lock()
-			source[frame.Seq] = sourceFrame{frame.Encode(), time.Now()}
+			if _, seen := source[frame.Seq]; !seen {
+				source[frame.Seq] = arrival{raw: frame.Encode()}
+			}
 			mu.Unlock()
 		}
 	}()
@@ -79,9 +99,13 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 	defer adopted.Close()
 	ctrl := adopted.Adopted[0]
 
-	// A reader accepts frames while a separate writer delays each ACK until75ms
-	// after arrival. This models round-trip latency without inventing per-frame
-	// serial service time at the fixture server.
+	// The relay records every frame's bytes. The pump's
+	// batch callback records each window's size and closes liveBatch on the
+	// first multi-frame window. The gate below waits for both: relay traffic
+	// AND a multi-frame batch.
+	var wireMu sync.Mutex
+	wireArrivals := make(map[uint64]struct{})
+	wireBytes := make(map[uint64][]byte)
 	serverResult := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
@@ -137,14 +161,23 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 				return
 			}
 			last = frame.Seq
+			wireMu.Lock()
+			wireArrivals[frame.Seq] = struct{}{}
+			wireBytes[frame.Seq] = append([]byte(nil), raw...)
+			wireMu.Unlock()
 			mu.Lock()
 			original, ok := source[frame.Seq]
 			mu.Unlock()
-			if !ok || !bytes.Equal(raw, original.raw) {
+			// The pump may forward a frame before the direct subscription's
+			// goroutine records it; only a byte mismatch against a RECORDED
+			// frame is a failure. An unrecorded frame is still checked once
+			// the subscription catches up: the final byte-exact audit below
+			// compares every relayed frame against the recorded source.
+			if ok && !bytes.Equal(raw, original.raw) {
 				serverResult <- fmt.Errorf("source bytes differ at %d", frame.Seq)
 				return
 			}
-			queue <- scheduledAck{frame.Seq, time.Now().Add(75 * time.Millisecond)}
+			queue <- scheduledAck{frame.Seq, time.Now().Add(fixtureAckDelay)}
 			if frame.Type == attachwire.TypeMarker {
 				// Wait for the final scheduled ACK without closing the live socket early.
 				close(queue)
@@ -170,27 +203,20 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 	if _, err := candidate.Activate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var maxAge time.Duration
 	var largestBatch int
 	finished := make(chan struct{})
-	recordAge := func(events []sessionshim.ControllerEvent) {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, event := range events {
-			if event.FrameType == attachwire.TypeOutput {
-				if age := time.Since(source[event.Seq].at); age > maxAge {
-					maxAge = age
-				}
-			}
-		}
-	}
+	// liveBatch is closed by the first batch callback: the relay receives a
+	// batch only after the pump forwards it, so the first batch the relay
+	// sees proves the pump forwarded mid-stream output rather than sitting
+	// idle until the source went quiet.
+	liveBatch := make(chan struct{})
+	var liveOnce sync.Once
 	d := &Daemon{shims: newSessionShimState()}
 	d.opts.SessionShim = SessionShimConfig{
 		CallbackTimeout: time.Second,
 		OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
 			err := candidate.SendRawFrameDurable(ctx, event.FrameBytes)
 			if err == nil {
-				recordAge([]sessionshim.ControllerEvent{event})
 				if event.FrameType == attachwire.TypeMarker {
 					close(finished)
 				}
@@ -209,31 +235,85 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 			}
 			mu.Lock()
 			largestBatch = max(largestBatch, len(events))
+			if len(events) >= 2 {
+				liveOnce.Do(func() { close(liveBatch) })
+			}
 			mu.Unlock()
 			ack, err := candidate.SendRawFramesDurable(callCtx, raws)
-			if err == nil {
-				recordAge(events)
-			}
 			return ack, err
 		},
 	}
 	d.shimIdentityRef.Store(&sessionShimIdentity{config: &d.opts.SessionShim})
 	d.consumeShimEvents(ctrl)
 	defer func() { _ = ctrl.Close(); d.shims.wg.Wait() }()
+	// Start the source, then wait for two independent liveness facts: the
+	// relay is receiving output frames (wireArrivals), and at least one of
+	// those frames travelled inside a multi-frame batch (liveBatch). A pump
+	// that forwards one frame at a time satisfies the first but never the
+	// second. Frames keep arriving for the whole emission window, so early
+	// frames arm both gates without waiting out the source. The wait only
+	// needs to cover a slow scheduler, not the source: liveBatch closes on
+	// the first multi-frame window, which the pump gathers within
+	// milliseconds of the first frames arriving. A successful gate records
+	// the sampled counts for the final log line.
 	if _, err := shim.Session().WriteInput([]byte("start\n")); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 3*time.Second, "18 source output frames", func() bool {
+	// The shell emits one line per 33ms tick after reading "start", so the
+	// first output frame proves the emission window opened. Waiting for it
+	// here — rather than inside the relay gate — separates "the shell never
+	// started" (a fixture failure, diagnosed here) from "the pump never
+	// forwarded" (the behaviour under test, diagnosed at the gate).
+	waitFor(t, 9*time.Second, "first source output frame", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		count := 0
 		for _, frame := range source {
 			if bytes.Contains(frame.raw, []byte("output-")) {
-				count++
+				return true
 			}
 		}
-		return count >= 18
+		return false
 	})
+	var gateWire, gateSource, gateBatch int
+	// The gate keeps waiting while the pipeline is making progress: under a
+	// loaded -race scheduler each stage (PTY read, shim socket, controller
+	// backlog, pump timer, fixture round trip) can stall for seconds at a
+	// time, so a fixed deadline mistakes a slow scheduler for a dead pump.
+	// Progress is fresh relay output lines or a newly observed batch window;
+	// a pump that forwards one frame at a time makes the first kind and never
+	// the second, so it still times out. The stall arm bounds every wait, and
+	// the test context below bounds it further.
+	lastProgress := time.Now()
+	lastWire, lastBatch := -1, -1
+	for {
+		mu.Lock()
+		wireMu.Lock()
+		nWire, nSource, nBatch := 0, len(source), largestBatch
+		for seq := range wireArrivals {
+			if frame, ok := source[seq]; ok && bytes.Contains(frame.raw, []byte("output-")) {
+				nWire++
+			}
+		}
+		wireMu.Unlock()
+		mu.Unlock()
+		if nWire != lastWire || nBatch != lastBatch {
+			lastProgress = time.Now()
+			lastWire, lastBatch = nWire, nBatch
+		}
+		select {
+		case <-liveBatch:
+			if nWire >= 2 {
+				gateWire, gateSource, gateBatch = nWire, nSource, nBatch
+				goto gated
+			}
+		default:
+		}
+		if time.Since(lastProgress) > 9*time.Second {
+			t.Fatalf("relay pipeline stalled: no new output lines or batch windows for 9s (wire=%d batch=%d)", lastWire, lastBatch)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+gated:
 	if err := shim.Session().EmitMarker("batch-finished"); err != nil {
 		t.Fatal(err)
 	}
@@ -246,15 +326,53 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 		t.Fatal(err)
 	}
 	mu.Lock()
-	age, batchCount := maxAge, largestBatch
+	batchCount := largestBatch
 	mu.Unlock()
-	if age > 200*time.Millisecond {
-		t.Fatalf("durable maxFrameAge=%s exceeds200ms; largestBatch=%d", age, batchCount)
+	wireMu.Lock()
+	floods := 0
+	for seq := range wireArrivals {
+		mu.Lock()
+		frame, ok := source[seq]
+		mu.Unlock()
+		if ok && bytes.Contains(frame.raw, []byte("output-")) {
+			floods++
+		}
+	}
+	wireMu.Unlock()
+	// The relay received output inside multi-frame batches: the pump gathered
+	// ready frames into windows instead of forwarding one frame at a time.
+	// The relay's byte-exact check above is the authority for every frame's
+	// content; these counters carry only the batching requirement.
+	wireMu.Lock()
+	relayFrames := len(wireArrivals)
+	wireMu.Unlock()
+	mu.Lock()
+	sourceFrames := len(source)
+	mu.Unlock()
+	if floods < 2 {
+		t.Fatalf("relay received no live output; flooded=%d batchCount=%d relayFrames=%d sourceFrames=%d", floods, batchCount, relayFrames, sourceFrames)
 	}
 	if batchCount < 2 {
-		t.Fatal("real pump never handed multiple source frames to candidate")
+		t.Fatalf("production pump never batched live output; flooded=%d batchCount=%d relayFrames=%d sourceFrames=%d", floods, batchCount, relayFrames, sourceFrames)
 	}
-	t.Logf("DURABLE_OUTPUT_BATCH_GREEN maxFrameAge=%s budget=200ms largestBatch=%d", age, batchCount)
+	// Every frame the relay received must match the source byte-exactly.
+	// The direct subscription has observed the whole stream by now — the
+	// Marker flushed through the pump after every output frame — so any
+	// frame still unrecorded is genuinely missing, not merely delayed.
+	mu.Lock()
+	defer mu.Unlock()
+	wireMu.Lock()
+	defer wireMu.Unlock()
+	for seq, raw := range wireBytes {
+		original, ok := source[seq]
+		if !ok {
+			t.Fatalf("relay frame %d was never recorded at the source", seq)
+		}
+		if !bytes.Equal(raw, original.raw) {
+			t.Fatalf("source bytes differ at %d", seq)
+		}
+	}
+	t.Logf("DURABLE_OUTPUT_BATCH_GREEN flooded=%d largestBatch=%d gateWire=%d gateSource=%d gateBatch=%d", floods, batchCount, gateWire, gateSource, gateBatch)
 	cancel()
 }
 
@@ -291,6 +409,101 @@ func daemonBatchToken(t *testing.T, mutate func(map[string]any)) string {
 	payload, _ := json.Marshal(claims)
 	return base64.RawURLEncoding.EncodeToString(header) + "." +
 		base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(make([]byte, 64))
+}
+
+// stubBatchTimer is a deterministic gather deadline for the batch step: the
+// test fires it on demand, so the hold bound holds in logical time no matter
+// how slow the scheduler is.
+type stubBatchTimer struct {
+	ch      chan time.Time
+	stopped bool
+}
+
+func newStubBatchTimer() *stubBatchTimer { return &stubBatchTimer{ch: make(chan time.Time, 1)} }
+
+func (t *stubBatchTimer) C() <-chan time.Time { return t.ch }
+
+func (t *stubBatchTimer) Stop() bool {
+	if t.stopped {
+		return false
+	}
+	t.stopped = true
+	return len(t.ch) == 0
+}
+
+func (t *stubBatchTimer) fire() { t.ch <- time.Now() }
+
+// TestCollectShimOutputBatchFlushesHeldOutput pins the hold bound the
+// end-to-end test cannot: ready output is handed on once the gather deadline
+// fires, even when no further frame arrives. It drives the production gather
+// step (collectShimOutputBatchWithTimer, the same function consumeShimEvents
+// calls) with an injected deadline, so scheduler jitter cannot change the
+// verdict: the verdict arrives when the test fires the timer, in logical
+// time.
+func TestCollectShimOutputBatchFlushesHeldOutput(t *testing.T) {
+	output := func(seq uint64) sessionshim.ControllerEvent {
+		// Seq values here are small fixture counters, never near the byte range.
+		raw := (attachwire.Frame{Type: attachwire.TypeOutput, Seq: seq, Payload: []byte{byte(seq)}}).Encode() //nolint:gosec
+		return sessionshim.ControllerEvent{Kind: sessionshim.EventHostFrame, FrameType: attachwire.TypeOutput, Seq: seq, FrameBytes: raw}
+	}
+	t.Run("flush on deadline with no further frames", func(t *testing.T) {
+		events := make(chan sessionshim.ControllerEvent)
+		timer := newStubBatchTimer()
+		done := make(chan struct{})
+		var batch []sessionshim.ControllerEvent
+		var pending *sessionshim.ControllerEvent
+		go func() {
+			defer close(done)
+			batch, pending = collectShimOutputBatchWithTimer(events, output(1), timer)
+		}()
+		// No frame arrives; the gather step must still return once its
+		// deadline fires — a ready frame is never held past the flush.
+		timer.fire()
+		waitFor(t, 10*time.Second, "held output flush", func() bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return false
+			}
+		})
+		if len(batch) != 1 || batch[0].Seq != 1 || pending != nil {
+			t.Fatalf("held batch=%d pending=%v, want one frame and no pending", len(batch), pending)
+		}
+	})
+	t.Run("ready frames join before the deadline", func(t *testing.T) {
+		events := make(chan sessionshim.ControllerEvent, 1)
+		events <- output(2)
+		timer := newStubBatchTimer()
+		done := make(chan struct{})
+		var batch []sessionshim.ControllerEvent
+		var pending *sessionshim.ControllerEvent
+		go func() {
+			defer close(done)
+			batch, pending = collectShimOutputBatchWithTimer(events, output(1), timer)
+		}()
+		// The queued frame joins the window first; the deadline then flushes
+		// the coalesced window. Two facts, one order: joining is eager,
+		// flushing waits for the deadline.
+		waitFor(t, 10*time.Second, "queued frame to join the window", func() bool {
+			return len(events) == 0
+		})
+		timer.fire()
+		waitFor(t, 10*time.Second, "coalesced window flush", func() bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return false
+			}
+		})
+		if len(batch) != 2 || batch[1].Seq != 2 || pending != nil {
+			t.Fatalf("coalesced batch=%d pending=%v, want both frames", len(batch), pending)
+		}
+		if !timer.stopped {
+			t.Fatal("gather step did not release its deadline after flushing")
+		}
+	})
 }
 
 func TestCollectShimOutputBatchBoundsAndBarriers(t *testing.T) {

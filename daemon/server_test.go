@@ -723,6 +723,11 @@ func TestServer_PoolStats_UsesProvider(t *testing.T) {
 // TestServer_SessionDetail_HappyPath verifies the
 // /api/daemon/sessions/<id> endpoint returns the SessionDetail
 // recorded by AcceptWorkWithDetail.
+//
+// mustStartDaemon builds the legacy open-mode daemon (no control token),
+// so this credential-free read still receives the full detail. The
+// enforced-gate redaction half is pinned by
+// TestSessionDetail_ReadRequiresCredential below.
 func TestServer_SessionDetail_HappyPath(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()

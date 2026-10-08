@@ -128,14 +128,14 @@ func TestWriteMCPConfig_GatewayAuthorization(t *testing.T) {
 }`,
 		},
 		{
-			name: "token file present emits helper with fallback to static bearer",
+			name: "token file present emits helper with fallback to the private bearer file",
 			env:  map[string]string{mcpGatewayFileEnv: "/run/session/mcp-token"},
 			wantBody: `{
   "mcpServers": {
     "donmai-platform": {
       "type": "http",
       "url": "https://example.com/api/mcp/session",
-      "headersHelper": "token=$(cat -- \"$MCP_GATEWAY_TOKEN_FILE\" 2\u003e/dev/null); if [ -z \"$token\" ]; then token='spawn-token'; fi; printf '{\"Authorization\":\"Bearer %s\"}\\n' \"$token\""
+      "headersHelper": "token=$(cat -- \"$MCP_GATEWAY_TOKEN_FILE\" 2\u003e/dev/null); if [ -z \"$token\" ]; then token=$(cat -- '@FALLBACK@' 2\u003e/dev/null); fi; printf '{\"Authorization\":\"Bearer %s\"}\\n' \"$token\""
     }
   }
 }`,
@@ -156,8 +156,9 @@ func TestWriteMCPConfig_GatewayAuthorization(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read tmpfile: %v", err)
 			}
-			if got := string(body); got != tc.wantBody {
-				t.Fatalf("config bytes mismatch:\n got: %s\nwant: %s", got, tc.wantBody)
+			want := strings.ReplaceAll(tc.wantBody, "@FALLBACK@", path+mcpGatewayFallbackSuffix)
+			if got := string(body); got != want {
+				t.Fatalf("config bytes mismatch:\n got: %s\nwant: %s", got, want)
 			}
 		})
 	}
@@ -166,7 +167,7 @@ func TestWriteMCPConfig_GatewayAuthorization(t *testing.T) {
 func TestWriteMCPConfig_GatewayHeadersHelperFallbackWhenFileAbsent(t *testing.T) {
 	t.Parallel()
 
-	// REN-2690 V16 delete-seed-RED: absent/empty file must fall back to baked bearer, not ENOENT.
+	// An absent or empty live file must fall back to the stored static bearer, not ENOENT.
 	path, err := writeMCPConfigWithEnv([]agent.MCPServerConfig{{
 		Name:    "donmai-platform",
 		Type:    "http",
@@ -187,12 +188,20 @@ func TestWriteMCPConfig_GatewayHeadersHelperFallbackWhenFileAbsent(t *testing.T)
 		t.Fatalf("decode tmpfile: %v", err)
 	}
 	helper := cfg.MCPServers["donmai-platform"].HeadersHelper
-	wantHelper := mcpGatewayHeadersHelperWithFallback("spawn-token")
+	fallbackPath := path + mcpGatewayFallbackSuffix
+	wantHelper := mcpGatewayHeadersHelperWithFallback(fallbackPath)
 	if helper != wantHelper {
 		t.Fatalf("gateway headersHelper = %q, want %q", helper, wantHelper)
 	}
+	info, err := os.Stat(fallbackPath)
+	if err != nil {
+		t.Fatalf("stat fallback bearer file: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("fallback bearer file mode = %o, want 600", mode)
+	}
 
-	// Absent file must not ENOENT — fallback to baked bearer.
+	// Absent file must not ENOENT — fallback to the stored static bearer.
 	absentPath := filepath.Join(t.TempDir(), "no-such-token")
 	cmd := exec.Command("sh", "-c", helper) // #nosec G204 -- helper is fixture under test, input controlled
 	cmd.Env = append(os.Environ(), mcpGatewayFileEnv+"="+absentPath)
@@ -206,6 +215,94 @@ func TestWriteMCPConfig_GatewayHeadersHelperFallbackWhenFileAbsent(t *testing.T)
 	}
 	if got, want := hdr["Authorization"], "Bearer spawn-token"; got != want {
 		t.Fatalf("absent-file fallback Authorization = %q, want %q", got, want)
+	}
+
+	if err := removeMCPConfig(path); err != nil {
+		t.Fatalf("removeMCPConfig: %v", err)
+	}
+	if _, err := os.Stat(fallbackPath); !os.IsNotExist(err) {
+		t.Fatalf("fallback bearer file survived removeMCPConfig: stat err = %v", err)
+	}
+}
+
+// TestWriteMCPConfig_GatewayHelperArgvCarriesNoBearer runs the helper the way
+// Claude runs it, as `sh -c <helper>`, and records the argv of that shell and
+// of every cat it starts. The bearer reaches the header on the fallback path,
+// but never an argv: any local user can read a command line via ps or
+// /proc/<pid>/cmdline.
+func TestWriteMCPConfig_GatewayHelperArgvCarriesNoBearer(t *testing.T) {
+	t.Parallel()
+
+	const bearer = "sentinel-gateway-bearer-must-not-ride-argv"
+	path, err := writeMCPConfigWithEnv([]agent.MCPServerConfig{{
+		Name:    "donmai-platform",
+		Type:    "http",
+		URL:     "https://example.com/api/mcp/session",
+		Headers: map[string]string{"Authorization": "Bearer " + bearer},
+	}}, map[string]string{mcpGatewayFileEnv: "/run/session/mcp-token"})
+	if err != nil {
+		t.Fatalf("writeMCPConfigWithEnv: %v", err)
+	}
+	t.Cleanup(func() { _ = removeMCPConfig(path) })
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read tmpfile: %v", err)
+	}
+	if strings.Contains(string(body), bearer) {
+		t.Fatalf("MCP config carries the bearer, which Claude passes to sh -c as argv:\n%s", body)
+	}
+	var cfg mcpConfigFile
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		t.Fatalf("decode tmpfile: %v", err)
+	}
+	helper := cfg.MCPServers["donmai-platform"].HeadersHelper
+
+	// A cat shim first on PATH records its own argv and its parent shell's
+	// command line, then runs the real cat.
+	realCat, err := exec.LookPath("cat")
+	if err != nil {
+		t.Skipf("cat not on PATH: %v", err)
+	}
+	shimDir := t.TempDir()
+	record := filepath.Join(shimDir, "argv-record")
+	shim := "#!/bin/sh\n" +
+		"printf '%s\\n' \"cat $*\" >> '" + record + "'\n" +
+		"ps -o args= -p \"$PPID\" >> '" + record + "' 2>/dev/null\n" +
+		"exec '" + realCat + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(shimDir, "cat"), []byte(shim), 0o700); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write cat shim: %v", err)
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", helper) // #nosec G204 -- helper is fixture under test, input controlled
+	cmd.Env = append(os.Environ(),
+		"PATH="+shimDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		mcpGatewayFileEnv+"="+filepath.Join(t.TempDir(), "absent-token"),
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run headersHelper: %v", err)
+	}
+	var hdr map[string]string
+	if err := json.Unmarshal(out, &hdr); err != nil {
+		t.Fatalf("decode helper output %q: %v", out, err)
+	}
+	if got, want := hdr["Authorization"], "Bearer "+bearer; got != want {
+		t.Fatalf("fallback Authorization = %q, want %q", got, want)
+	}
+
+	argv, err := os.ReadFile(record) //nolint:gosec // test fixture path
+	if err != nil {
+		t.Fatalf("read argv record: %v", err)
+	}
+	if !strings.Contains(string(argv), "cat ") {
+		t.Fatalf("cat shim never ran; argv record:\n%s", argv)
+	}
+	if strings.Contains(string(argv), bearer) {
+		t.Fatalf("a helper process argv carries the bearer:\n%s", argv)
+	}
+	if strings.Contains(cmd.String(), bearer) {
+		t.Fatalf("the sh -c argv Claude starts carries the bearer: %s", cmd.String())
 	}
 }
 
@@ -232,7 +329,7 @@ func TestWriteMCPConfig_GatewayHeadersHelperReadsLatestToken(t *testing.T) {
 		t.Fatalf("decode tmpfile: %v", err)
 	}
 	helper := cfg.MCPServers["donmai-platform"].HeadersHelper
-	wantHelper := mcpGatewayHeadersHelperWithFallback("spawn-token")
+	wantHelper := mcpGatewayHeadersHelperWithFallback(path + mcpGatewayFallbackSuffix)
 	if helper != wantHelper {
 		t.Fatalf("gateway headersHelper = %q, want %q", helper, wantHelper)
 	}

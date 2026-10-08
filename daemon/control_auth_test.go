@@ -27,6 +27,12 @@ type controlRoute struct {
 
 // mutatingControlRoutes lists every mutating route registered behind
 // requireControlAuth. Keep it in step with Server.register.
+//
+// The session usage POST (/api/daemon/sessions/<id>/usage) is
+// deliberately absent: workers never hold the operator control token,
+// so that leaf enforces its own session-scoped credential instead
+// (see handleSessionUsage). Re-adding it here would 401 every live
+// quota update back to the 5-minute probe cadence.
 var mutatingControlRoutes = []controlRoute{
 	{path: "/api/daemon/pause"},
 	{path: "/api/daemon/resume"},
@@ -256,6 +262,31 @@ func TestRequireControlAuth_Matrix(t *testing.T) {
 		{"enforced rejects token prefix", daemonWith(testControlToken, true), http.MethodPost, "Bearer " + testControlToken[:5], http.StatusUnauthorized, false},
 		{"enforced passes GET without bearer", daemonWith(testControlToken, true), http.MethodGet, "", http.StatusOK, true},
 		{"legacy open mode passes POST", daemonWith("", false), http.MethodPost, "", http.StatusOK, true},
+	}
+	// A duplicated Authorization header is not a credential either leg
+	// can read: the shared bearer parser rejects it, so the mutating
+	// gate refuses and the detail read answers redacted.
+	duplicateAuth := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/api/daemon/pause", nil)
+		req.Header.Add("Authorization", "Bearer "+testControlToken)
+		req.Header.Add("Authorization", "Bearer "+testControlToken)
+		return req
+	}
+	{
+		called := false
+		srv := &Server{daemon: daemonWith(testControlToken, true)}
+		h := srv.requireControlAuth(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		})
+		rec := httptest.NewRecorder()
+		h(rec, duplicateAuth())
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("duplicated Authorization header = %d, want 401", rec.Code)
+		}
+		if called {
+			t.Error("duplicated Authorization header reached the handler, want refusal")
+		}
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

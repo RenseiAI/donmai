@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -118,6 +119,22 @@ func rotateDaemonLogs(errOut io.Writer) {
 // binary (claude/codex/pi/…) being installed in the test/CI environment —
 // BuildDecoratedAgentRunRegistry's real ctor list probes every one of them.
 var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
+
+// resolveQuotaProbeBinaries resolves the harness CLIs the daemon's live
+// quota probes shell out to, keyed by harness. A harness with no binary
+// on PATH is absent from the map, which leaves its probe disabled: the
+// daemon reports no verdict for a harness it cannot read, rather than a
+// false one.
+func resolveQuotaProbeBinaries() map[string]string {
+	out := map[string]string{}
+	if path, err := exec.LookPath("codex"); err == nil && path != "" {
+		out["codex"] = path
+	}
+	if path, err := exec.LookPath("claude"); err == nil && path != "" {
+		out["claude"] = path
+	}
+	return out
+}
 
 // daemonProviderView constructs the daemon's own in-process AgentRuntime
 // registry — the same registry shape `donmai agent run` rebuilds per-session
@@ -339,6 +356,10 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// only the production entry point configures this seam; see
 				// Options.CodexOrphanSweeper's doc comment.
 				CodexOrphanSweeper: providercodex.SweepOrphans,
+				// The live quota probes — resolved from PATH so a host
+				// without an installed harness simply leaves that
+				// harness unprobed. See Options.QuotaProbeBinaries.
+				QuotaProbeBinaries: resolveQuotaProbeBinaries(),
 			}
 			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
 			d = daemon.New(daemonOpts)

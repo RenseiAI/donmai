@@ -149,6 +149,19 @@ type Options struct {
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
 
+	// QuotaProbeBinaries names the harness CLIs the live quota probes
+	// shell out to, keyed by harness ("codex", "claude" — see
+	// agent.UsageHarnessCodex / agent.UsageHarnessClaude). Empty (the
+	// default every Start call gets unless a caller sets this field)
+	// disables that harness's probe: the quota cache then moves only
+	// on worker-reported stream updates. Only the production entry
+	// point (afcli/daemon_run.go) sets this, resolved from PATH, so
+	// a daemon built for real operator use probes its host logins
+	// while a daemon built for a test — including every test that
+	// predates this field and never mentions it — never shells out
+	// to a real harness login.
+	QuotaProbeBinaries map[string]string
+
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
 	// polls, verifies (Ed25519 + content hash), and caches to disk,
@@ -490,6 +503,13 @@ type Daemon struct {
 	// fire at most every 5 minutes per provider; failed probes keep
 	// the last good windows.
 	quota *quotaState
+
+	// quotaPoller runs the live quota probes that fill the cache
+	// above: one codex `account/rateLimits/read` and one claude usage
+	// read per probe interval, plus the worker-reported stream
+	// updates the usage route folds in. Nil until Start wires it;
+	// stopped by Stop.
+	quotaPoller *quotaPoller
 
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
@@ -1200,6 +1220,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.DaemonControlURL == nil {
 		spawnerOpts.DaemonControlURL = d.ControlURL
 	}
+	// Hand every spawned worker its own session-detail read credential.
+	// The store mints the token at accept time; stating it here lets the
+	// worker read its own detail without holding the operator control
+	// token. An embedder-supplied func keeps priority — the daemon only
+	// fills the gap it would otherwise leave.
+	if spawnerOpts.SessionReadToken == nil {
+		spawnerOpts.SessionReadToken = d.sessionReadToken
+	}
 	// Default WorktreeParentDir to the same statepath-resolved worktrees
 	// directory the spawned `donmai agent run` worker uses when no
 	// --worktree-dir override is passed (afcli/agent_run.go). Keeping the
@@ -1487,6 +1515,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 		} else {
 			d.heartbeat.Start()
 		}
+
+		// Live quota probes — the reads that fill the quota cache
+		// behind the heartbeat quota field. The first attempts fire
+		// immediately, so a host with signed-in harnesses reports
+		// quota within one probe interval of starting; stream updates
+		// from live sessions fold in through the usage route while
+		// the probes are the authoritative refresh.
+		d.quotaPoller = newQuotaPoller(d.quota, d.quotaProbes())
+		d.quotaPoller.Start()
 
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar
@@ -1878,6 +1915,13 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	}
 	if refresher != nil {
 		refresher.Stop()
+	}
+	d.lifecycleMu.Lock()
+	quotaPoller := d.quotaPoller
+	d.quotaPoller = nil
+	d.lifecycleMu.Unlock()
+	if quotaPoller != nil {
+		quotaPoller.Stop()
 	}
 
 	d.lifecycleMu.Lock()
@@ -2906,6 +2950,31 @@ func (d *Daemon) SessionDetail(sessionID string) (*SessionDetail, bool) {
 		return nil, false
 	}
 	return d.sessionDetails.Get(sessionID)
+}
+
+// sessionReadToken returns the live per-session read credential for
+// sessionID. It is the spawner's lookup for the credential stated in
+// each spawned worker's environment: minting happens in the detail
+// store at accept time, so this is a read, never a mint.
+func (d *Daemon) sessionReadToken(sessionID string) (string, bool) {
+	if d.sessionDetails == nil {
+		return "", false
+	}
+	return d.sessionDetails.readTokenFor(sessionID)
+}
+
+// SessionReadTokenForTest returns the live per-session read credential
+// for sessionID. Exported for the worker-bootstrap tests, which prove
+// the end-to-end read through the production HTTP route: accept a
+// session in-process, read back the credential the daemon would state
+// in the spawned worker's environment, and fetch the detail with it.
+// Production code never calls this; the spawner reads the same value
+// through the SessionReadToken hook wired at Start.
+func SessionReadTokenForTest(d *Daemon, sessionID string) (string, bool) {
+	if d == nil {
+		return "", false
+	}
+	return d.sessionReadToken(sessionID)
 }
 
 // UpdateSessionRuntimeCredentials re-stamps the runtime credentials of the

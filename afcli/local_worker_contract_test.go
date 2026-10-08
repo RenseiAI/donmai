@@ -132,6 +132,9 @@ func TestLocalCodexHintRequiresExactAdmittedHostBinding(t *testing.T) {
 func TestRunAgentRunLocalV2ConstructsOnlyAdmittedHostAuthProvider(t *testing.T) {
 	detail, _ := localCodexAdmittedDetail(t)
 	t.Setenv("DONMAI_RUNTIME_JWT", "synthetic-attempt-only")
+	// A local spawn also states the session read credential; the local
+	// receiver below authenticates the attempt credential only.
+	t.Setenv("DONMAI_SESSION_READ_TOKEN", "synthetic-read-credential")
 	// If a mutant drops the local host-auth selector, stop before any worktree
 	// clone or provider Spawn. The correct path refuses at construction first.
 	stopBeforeWorktree := filepath.Join(t.TempDir(), "not-a-directory")
