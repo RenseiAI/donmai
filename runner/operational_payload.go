@@ -34,6 +34,7 @@ type OperationalPayload struct {
 	Env                   map[string]string                 `json:"env,omitempty"`
 	ResolvedProfile       ResolvedProfile                   `json:"resolvedProfile,omitempty"`
 	Branch                string                            `json:"branch,omitempty"`
+	SeatBudget            *SeatBudget                       `json:"seatBudget,omitempty"`
 	TerminalWorkareaLease *workarea.TerminalLeaseRequest    `json:"terminalWorkareaLease,omitempty"`
 	PermissionProfile     PermissionProfile                 `json:"permissionProfile,omitempty"`
 	ExecutionSecurity     *agent.ExecutionSecurity          `json:"executionSecurity,omitempty"`
@@ -55,6 +56,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		Env:                   maps.Clone(qw.Env),
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,
+		SeatBudget:            qw.SeatBudget.Clone(),
 		TerminalWorkareaLease: qw.TerminalWorkareaLease,
 		PermissionProfile:     qw.PermissionProfile,
 		ExecutionSecurity:     qw.ExecutionSecurity.Clone(),

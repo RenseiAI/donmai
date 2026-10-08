@@ -64,7 +64,11 @@ func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, 
 	}
 	var execer kit.Execer = r.depsExecer
 	if execer == nil {
-		execer = shellExecer{baseEnv: buildSessionEnv(qw)}
+		// The default installer runs in the seat's capped session env:
+		// dependency installs (pnpm/npm, go) fan out like any other
+		// build, so they carry the same worker caps as the harness
+		// child rather than escaping the seat share.
+		execer = shellExecer{baseEnv: cappedSessionEnv(qw)}
 	}
 	if _, err := os.Stat(filepath.Join(wpath, "pnpm-lock.yaml")); err == nil {
 		if _, err := os.Stat(filepath.Join(wpath, "node_modules", ".bin")); err != nil {

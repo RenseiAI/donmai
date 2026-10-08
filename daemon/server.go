@@ -366,6 +366,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
 		SessionShim:             s.daemon.SessionShimDiagnostics(),
 		ProcessPriority:         daemonProcessPriorityStatus(),
+		SeatBudget:              seatBudgetReport(s.daemon.daemonSeatBudget()),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)

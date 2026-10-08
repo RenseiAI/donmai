@@ -1365,12 +1365,13 @@ func TestWriteDaemonStatusTable(t *testing.T) {
 
 	r := fixtureStatusResp()
 	r.ProcessPriority = &afclient.DaemonProcessPriorityStatus{Mode: "background", ConfiguredMode: "background", Evidence: "ps PRI=4"}
+	r.SeatBudget = &afclient.SeatBudgetStatus{Mode: "best-effort", CPUs: 4, MemoryMB: 8192, Detail: "caps"}
 	var buf bytes.Buffer
 	if err := writeDaemonStatusTable(&buf, r); err != nil {
 		t.Fatalf("writeDaemonStatusTable: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed", "Process priority:", "background"} {
+	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed", "Process priority:", "background", "Seat budget:", "best-effort, 4 CPUs, 8192 MB"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q; got:\n%s", want, out)
 		}
@@ -1432,6 +1433,31 @@ func TestFormatProcessPriorityStatus(t *testing.T) {
 			t.Parallel()
 			if got := formatProcessPriorityStatus(tc.status); got != tc.want {
 				t.Errorf("formatProcessPriorityStatus() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatSeatBudgetStatus pins the seat budget row: the posture with the
+// values, none for budgeting off, not reported against an older daemon.
+func TestFormatSeatBudgetStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status *afclient.SeatBudgetStatus
+		want   string
+	}{
+		{name: "daemon does not report it", status: nil, want: "not reported"},
+		{name: "empty mode", status: &afclient.SeatBudgetStatus{}, want: "not reported"},
+		{name: "off", status: &afclient.SeatBudgetStatus{Mode: "none"}, want: "none"},
+		{name: "best effort", status: &afclient.SeatBudgetStatus{Mode: "best-effort", CPUs: 4, MemoryMB: 8192}, want: "best-effort, 4 CPUs, 8192 MB"},
+		{name: "enforced with detail", status: &afclient.SeatBudgetStatus{Mode: "enforced", CPUs: 2, Detail: "via transient systemd scope"}, want: "enforced, 2 CPUs — via transient systemd scope"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatSeatBudgetStatus(tc.status); got != tc.want {
+				t.Errorf("formatSeatBudgetStatus() = %q, want %q", got, tc.want)
 			}
 		})
 	}
