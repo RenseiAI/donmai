@@ -13,7 +13,7 @@ import (
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v5"
+const seatbeltProfileVersion = "seatbelt-profile-v6"
 
 // seatbeltHost is what a rendering needs from the host beside the session.
 type seatbeltHost struct {
@@ -32,6 +32,14 @@ type seatbeltHost struct {
 // compression, and any other attribute is file data too. Metadata (stat,
 // existence) stays readable.
 const seatbeltReadOps = "file-read-data file-read-xattr"
+
+// seatbeltPrivateReadOps are the read operations a daemon-private path is
+// denied: every one, metadata included. They are named one by one rather
+// than as file-read*: the profile judges a rule naming an operation ahead of
+// a wildcard rule whatever their order, so a file-read* deny would lose to
+// the read scope's file-read-data allow of the session allowlist and leave a
+// daemon-private path nested inside the writable set readable.
+const seatbeltPrivateReadOps = "file-read-data file-read-metadata file-read-xattr"
 
 // seatbeltRuntimeReads are the runtime and toolchain paths readable under a
 // read scope. dyld reads the root directory itself at every exec, so the
@@ -164,19 +172,24 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 //  2. under a read scope only: deny reading file contents, extended
 //     attributes and directory listings, allow the runtime paths, re-deny
 //     the package data trees and the system volumes, re-allow the OS
-//     cryptexes, then allow the session's read allowlist last, so it wins
-//     over the carve-outs; metadata stays readable;
-//  3. deny every write, every hard link, and the shared temporary and cache
+//     cryptexes, then allow the session's read allowlist, so it wins over
+//     the carve-outs; metadata stays readable;
+//  3. in every read scope, open reads included: deny every read of the
+//     daemon-private paths (contents, metadata, extended attributes,
+//     listings) and the listing of the daemon-private directories — after
+//     every read allow, so they win even inside the session's allowlist;
+//  4. deny every write, every hard link, and the shared temporary and cache
 //     locations by name (D2, D2.1);
-//  4. allow the device nodes and the writable set (D2);
-//  5. deny the read-only leaves, the protected paths, the workarea root and
-//     its metadata, and pin every ancestor between a writable root and a
-//     nested denied path against rename — after the allows, so they win;
-//  6. close the write proxies: mounting, job submission, launch services,
+//  5. allow the device nodes and the writable set (D2);
+//  6. deny the read-only leaves, the protected paths, the daemon-private
+//     paths, the workarea root and its metadata, and pin every ancestor
+//     between a writable root and a nested denied path against rename —
+//     after the allows, so they win;
+//  7. close the write proxies: mounting, job submission, launch services,
 //     scripting events, preference writes, task ports, local sockets
 //     outside the set, loopback TCP outside the declared ports, and the
 //     pasteboard (D2.5);
-//  7. the composer's deny-only rules, last, so they always win (D4.3): a
+//  8. the composer's deny-only rules, last, so they always win (D4.3): a
 //     composer read deny holds inside the read allowlist too.
 func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func(string) (string, error)) (string, error) {
 	var b strings.Builder
@@ -218,6 +231,8 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 
 	switch r.ReadScope {
 	case "":
+		// Open reads: no blanket read rule. The daemon-private read denies
+		// below render all the same.
 	case agent.FileReadWorkarea:
 		runtimeFilters, err := filters("subpath", host.runtimeReads)
 		if err != nil {
@@ -241,11 +256,32 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 		b.WriteString("; The system volumes, except the OS cryptexes.\n")
 		fmt.Fprintf(&b, "(deny %s (subpath %q))\n", seatbeltReadOps, seatbeltSystemVolumes)
 		fmt.Fprintf(&b, "(allow %s (subpath %q))\n", seatbeltReadOps, seatbeltCryptexes)
-		b.WriteString("; The session: writable set, read-only leaves, declared read paths. Last, so they win.\n")
+		b.WriteString("; The session: writable set, read-only leaves, declared read paths. They win over\n")
+		b.WriteString("; every read rule above; only the daemon-private denies below win over them.\n")
 		rule("allow", seatbeltReadOps, sessionFilters)
 		b.WriteString("\n")
 	default:
 		return "", refuse(ReasonWritableSetUnrepresentable, "unknown read scope %q", r.ReadScope)
+	}
+
+	// Daemon-private reads, in every read scope (open reads included) and
+	// after every read allow, so they win even over the session's
+	// allowlist: a daemon-private path nested inside the writable set
+	// stays unreadable.
+	privateFilters, err := filters("subpath", r.Denied)
+	if err != nil {
+		return "", err
+	}
+	listingFilters, err := filters("literal", r.DeniedListings)
+	if err != nil {
+		return "", err
+	}
+	if len(privateFilters)+len(listingFilters) > 0 {
+		b.WriteString("; Daemon-private paths: no read of any kind. Daemon-private directories: no listing;\n")
+		b.WriteString("; they stay traversable. Every read scope, after every read allow, so they win.\n")
+		rule("deny", seatbeltPrivateReadOps, privateFilters)
+		rule("deny", seatbeltReadOps, listingFilters)
+		b.WriteString("\n")
 	}
 
 	b.WriteString("; D2: writes and hard links are denied unless the writable set allows them.\n")
@@ -275,6 +311,12 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 
 	denied := append(append([]string{}, r.ReadOnly...), r.Protected...)
 	denied = append(denied, r.MetadataDir)
+	// Daemon-private paths deny writes too, everywhere: even with reads
+	// open a seat must not replace the control token (a planted token the
+	// operator's CLI would then read) nor plant a sibling secret beside
+	// it. They render as subtrees so a file minted after the seat starts
+	// is covered the moment it appears.
+	denied = append(denied, r.Denied...)
 	deniedFilters, err := filters("subpath", denied)
 	if err != nil {
 		return "", err
@@ -287,7 +329,7 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 	if err != nil {
 		return "", err
 	}
-	b.WriteString("; Read-only leaves, protected paths and the workarea root, after the allows.\n")
+	b.WriteString("; Read-only leaves, protected paths, daemon-private paths and the workarea root, after the allows.\n")
 	rule("deny", "file-write*", deniedFilters)
 	rule("deny", "file-link", deniedFilters)
 	rule("deny", "file-write*", rootFilter)

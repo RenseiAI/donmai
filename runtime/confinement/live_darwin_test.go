@@ -94,7 +94,7 @@ func TestSeatbelt_SelfTestRedWithoutBackend(t *testing.T) {
 			refused[probe.Class]++
 		}
 	}
-	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening, classReadScope} {
+	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening, classReadScope, classDaemonPrivate} {
 		if refused[class] == 0 {
 			t.Errorf("no %s probe ran", class)
 		}
@@ -709,6 +709,8 @@ func (b openReadsBackend) Apply(req ApplyRequest) (Applied, error) {
 // TestSeatbelt_SelfTestRedWithOpenReads is the read scope's discriminating
 // control: with the read rules dropped from an otherwise real profile, every
 // read-scope refusal turns red in both session modes, and nothing else does.
+// The daemon-private probes are not read-scope probes: their denies render
+// in every read scope, so they must still hold with reads open.
 func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
 	c, _ := newLiveConfiner(t, openReadsBackend{&seatbeltBackend{exe: sandboxExec}}, nil)
 	record, err := runSelfTest(t, c)
@@ -718,7 +720,7 @@ func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
 	if record.Passed {
 		t.Fatal("the self-test passed with the read rules dropped")
 	}
-	readRefusals := 0
+	readRefusals, daemonHeld := 0, 0
 	for _, probe := range record.Probes {
 		switch {
 		case probe.Class == classReadScope && probe.Pass:
@@ -729,9 +731,15 @@ func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
 		if probe.Class == classReadScope {
 			readRefusals++
 		}
+		if probe.Class == classDaemonPrivate && probe.Pass {
+			daemonHeld++
+		}
 	}
 	if readRefusals == 0 {
 		t.Fatal("no read-scope probe ran")
+	}
+	if daemonHeld == 0 {
+		t.Fatal("no daemon-private probe held with reads open")
 	}
 }
 
