@@ -8,7 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- The viewer sanitizer offers OSC 52 clipboard sets to viewers through a new `Options.OnClipboard` hook, so a viewer can put a copied selection on its own clipboard under its own policy, for example behind a copy preview. The sanitized stream is unchanged and still strips every OSC 52. Queries, clears, unknown selection targets, invalid base64 or UTF-8 and control-only texts are never offered, control characters other than tab and line breaks are removed, and one trailing line break is dropped. `DecodeClipboardSet` and `ClipboardSequence` are exported for viewers.
+
+### Fixes
+
+- A session's terminal title no longer leaks into the prompt line of attached viewers. The sanitizer keeps a UTF-8 continuation byte inside an OSC, DCS, APC, PM or SOS string as payload instead of reading it as a string terminator, so a title such as Claude Code's `✳ <session name>` stays a title instead of being drawn as text where the cursor sits.
+- The sanitizer is hardened against encoded C1 controls: C1 controls encoded as UTF-8 are stripped in ground state, as raw C1 controls already were, and the strings it passes are re-emitted in 7-bit form so a UTF-8 terminal always closes them.
+- The sanitizer strips modes and queries that make a viewer's terminal write input on its own: enabling in-band resize (`?2048`) or colour-scheme (`?2031`) reports, the DEC locator sequences, the kitty keyboard and modifier-options queries, XTGETTCAP and every other non-Sixel DCS, S8C1T, and the DECREQTPARM, XTSMGRAPHICS, DECRQCRA, DECRQPSR, DECRQTSR and DECRQUPSS requests.
+
+### Chores
+
+- Deflake the failed-publication rollback heartbeat test under load.
+- Bump the dev-only `source-map-js` dependency of the TypeScript credentials client to 1.2.2 (GHSA-68fv-2mgg-jv7q).
 
 ## v0.72.68 — 2026-10-08
 
