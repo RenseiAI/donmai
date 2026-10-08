@@ -567,6 +567,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// the dispatch-time fold (v1).
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
+		// Live quota updates ride back to the admitting daemon: the
+		// sparse windows the session's harness stream carries (a codex
+		// `account/rateLimits/updated` notification, a claude
+		// `rate_limit_event`) merge there by window id onto the probe
+		// snapshot behind the heartbeat quota field. Best-effort and
+		// bounded; an unreachable daemon never stalls the session.
+		QuotaReporterForSession: func(_, harness string) *runner.QuotaReporter {
+			return runner.NewQuotaReporter(callbackClient, daemonURL, sessionID, harness, daemonToken, logger)
+		},
 	}
 	applyAgentRunCapabilityOptions(&runnerOptions, opts)
 	r, err := runner.New(runnerOptions)

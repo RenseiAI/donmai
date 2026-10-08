@@ -35,6 +35,13 @@ const (
 	claudeOverageIncludedEventType = "seven_day_overage_included"
 )
 
+// UsageProbeTimeout bounds one claude usage read: the short-lived CLI
+// session it spawns must never outlive the daemon probe tick that
+// started it. It stays below the shared 20s probe-attempt ceiling so
+// a stuck child cannot hold the quota loop past its per-harness
+// budget.
+const UsageProbeTimeout = 15 * time.Second
+
 // claudeWindowMeta is the fixed metadata for one account-wide window.
 type claudeWindowMeta struct {
 	kind         agent.UsageWindowKind
@@ -201,6 +208,11 @@ type modelScopedWindowJSON struct {
 }
 
 // UsageResponse is the structural view of the usage read response.
+// The claude CLI answers it inside the `control_response` to the
+// probe's `get_usage` control request (see usage_probe.go): the probe
+// sends no user message, so the child answers without spending a
+// turn. A control answer that never arrives leaves the read failed,
+// never unsupported.
 type UsageResponse struct {
 	Available *bool           `json:"rate_limits_available"`
 	Windows   json.RawMessage `json:"rate_limits"`

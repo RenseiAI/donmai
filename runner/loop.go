@@ -113,6 +113,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	provider := selection.Provider
+	// Register the session's quota reporter before any harness side
+	// effect: live quota updates stream from the first turn, and the
+	// reporter must already be held so the consecutive-update dedup
+	// sees every loop of the session. Released at the end of the run.
+	r.registerQuotaReporter(qw.SessionID, provider)
+	defer r.releaseQuotaReporter(qw.SessionID)
 	// Refuse a stamped execution-security level this exact harness cannot
 	// render in the session's mode before any workarea, credential or
 	// provider side effect. The same function re-checks the final spec
@@ -2865,6 +2871,12 @@ func (r *Runner) consumeEventsWithin(
 				trackToolEvent(correlatedEvent)
 				appendJSONL(correlatedEvent)
 				r.observeEvent(correlatedEvent, &obs, worktreePath, qw)
+				// Forward sparse quota updates to the admitting daemon:
+				// a codex `account/rateLimits/updated` notification or
+				// a claude `rate_limit_event` arrives here as a
+				// UsageEvent and merges by window id onto the probe
+				// snapshot behind the heartbeat quota field.
+				r.reportQuotaEvent(watchCtx, qw.SessionID, correlatedEvent)
 				// Push every correlated/synthetic event to the platform's
 				// activity buffer. LlmCallEvent intentionally maps to no legacy
 				// activity, while tool events retain their stamped IDs.
