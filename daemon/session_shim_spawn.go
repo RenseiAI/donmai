@@ -2487,18 +2487,38 @@ func (d *Daemon) noteFailedSessionShimActivation(id sessionshim.Identity, ctrl *
 // continuously ready output source cannot starve a queued control barrier.
 const shimOutputBatchFlushDelay = 5 * time.Millisecond
 
+// outputBatchTimer is the wait side of the output-batch gather step.
+// Production blocks on a real timer; a deterministic test substitutes a
+// channel it fires on demand, so the hold bound is asserted in logical time
+// rather than against wall-clock scheduler jitter.
+type outputBatchTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+type realOutputBatchTimer struct{ timer *time.Timer }
+
+func (t *realOutputBatchTimer) C() <-chan time.Time { return t.timer.C }
+func (t *realOutputBatchTimer) Stop() bool          { return t.timer.Stop() }
+
 func isShimBatchOutput(ev sessionshim.ControllerEvent) bool {
 	return ev.Kind == sessionshim.EventHostFrame && ev.FrameType == attachwire.TypeOutput
 }
 
 func collectShimOutputBatch(events <-chan sessionshim.ControllerEvent, first sessionshim.ControllerEvent) ([]sessionshim.ControllerEvent, *sessionshim.ControllerEvent) {
+	return collectShimOutputBatchWithTimer(events, first, &realOutputBatchTimer{timer: time.NewTimer(shimOutputBatchFlushDelay)})
+}
+
+// collectShimOutputBatchWithTimer gathers one output window the same way the
+// production pump does, except the flush deadline is injected. A test advances
+// the deadline deterministically; production always passes the real timer.
+func collectShimOutputBatchWithTimer(events <-chan sessionshim.ControllerEvent, first sessionshim.ControllerEvent, timer outputBatchTimer) ([]sessionshim.ControllerEvent, *sessionshim.ControllerEvent) {
 	batch := []sessionshim.ControllerEvent{first}
 	size := len(first.FrameBytes)
-	timer := time.NewTimer(shimOutputBatchFlushDelay)
 	defer timer.Stop()
 	for len(batch) < attachclient.DurableOutputBatchMaxFrames && size < attachclient.DurableOutputBatchMaxBytes {
 		select {
-		case <-timer.C:
+		case <-timer.C():
 			return batch, nil
 		case event, ok := <-events:
 			if !ok {
