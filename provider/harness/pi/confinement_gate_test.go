@@ -468,7 +468,7 @@ func TestSeatDaemonPrivate_ResolvesTheLiveToken(t *testing.T) {
 	t.Run("override wins, its directory and the state home unlistable", func(t *testing.T) {
 		home := stateHome(t)
 		t.Setenv(runtimeenv.ControlTokenPathEnv, "/var/lib/host/control-token")
-		got := seatDaemonPrivate("")
+		got := seatDaemonPrivate("", "")
 		if !slices.Equal(got.paths, []string{"/var/lib/host/control-token"}) || !slices.Equal(got.dirs, []string{"/var/lib/host", home}) {
 			t.Fatalf("seatDaemonPrivate = %+v", got)
 		}
@@ -476,14 +476,14 @@ func TestSeatDaemonPrivate_ResolvesTheLiveToken(t *testing.T) {
 	t.Run("relative override names no token", func(t *testing.T) {
 		home := stateHome(t)
 		t.Setenv(runtimeenv.ControlTokenPathEnv, "control-token")
-		if got := seatDaemonPrivate(""); len(got.paths) != 0 || !slices.Equal(got.dirs, []string{home}) {
+		if got := seatDaemonPrivate("", ""); len(got.paths) != 0 || !slices.Equal(got.dirs, []string{home}) {
 			t.Fatalf("seatDaemonPrivate = %+v, want no token and the state home unlistable", got)
 		}
 	})
 	t.Run("state home names the token leaf", func(t *testing.T) {
 		home := stateHome(t)
 		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
-		got := seatDaemonPrivate("")
+		got := seatDaemonPrivate("", "")
 		if !slices.Equal(got.paths, []string{filepath.Join(home, "control-token")}) || !slices.Equal(got.dirs, []string{home}) {
 			t.Fatalf("seatDaemonPrivate = %+v, want the token file denied and its directory unlistable", got)
 		}
@@ -491,12 +491,45 @@ func TestSeatDaemonPrivate_ResolvesTheLiveToken(t *testing.T) {
 	t.Run("a work area beneath the state home hides its siblings", func(t *testing.T) {
 		home := stateHome(t)
 		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
-		got := seatDaemonPrivate(filepath.Join(home, "worktrees", "s1"))
+		got := seatDaemonPrivate(filepath.Join(home, "worktrees", "s1"), "")
 		if !slices.Equal(got.dirs, []string{home, filepath.Join(home, "worktrees")}) {
 			t.Fatalf("seatDaemonPrivate dirs = %q, want the state home and the work-area parent", got.dirs)
 		}
-		if got := seatDaemonPrivate(filepath.Join(t.TempDir(), "elsewhere")); !slices.Equal(got.dirs, []string{home}) {
+		if got := seatDaemonPrivate(filepath.Join(t.TempDir(), "elsewhere"), ""); !slices.Equal(got.dirs, []string{home}) {
 			t.Fatalf("a work area elsewhere: dirs = %q, want the state home alone", got.dirs)
+		}
+	})
+	t.Run("stated path wins with the override stripped", func(t *testing.T) {
+		home := stateHome(t)
+		// The spawner strips the override from the worker's environment,
+		// so the stated daemon path is the only live one.
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
+		got := seatDaemonPrivate("", "/var/lib/host/control-token")
+		if !slices.Equal(got.paths, []string{"/var/lib/host/control-token"}) || !slices.Equal(got.dirs, []string{"/var/lib/host", home}) {
+			t.Fatalf("seatDaemonPrivate = %+v", got)
+		}
+	})
+	t.Run("stated path wins over a stale environment copy", func(t *testing.T) {
+		_ = stateHome(t)
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "/stale/env/control-token")
+		got := seatDaemonPrivate("", "/var/lib/host/control-token")
+		if !slices.Equal(got.paths, []string{"/var/lib/host/control-token"}) {
+			t.Fatalf("seatDaemonPrivate paths = %q, want the stated path alone", got.paths)
+		}
+		for _, dir := range got.dirs {
+			if dir == "/stale/env" {
+				t.Fatalf("seatDaemonPrivate dirs = %q, want no stale environment directory", got.dirs)
+			}
+		}
+		if !slices.Contains(got.dirs, "/var/lib/host") {
+			t.Fatalf("seatDaemonPrivate dirs = %q, want the stated path's directory", got.dirs)
+		}
+	})
+	t.Run("relative stated path names no token", func(t *testing.T) {
+		home := stateHome(t)
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
+		if got := seatDaemonPrivate("", "control-token"); len(got.paths) != 0 || !slices.Equal(got.dirs, []string{home}) {
+			t.Fatalf("seatDaemonPrivate = %+v, want no token and the state home unlistable", got)
 		}
 	})
 	t.Run("runner-only", func(t *testing.T) {
@@ -529,9 +562,40 @@ func TestSeatDaemonPrivate_ResolvesTheLiveToken(t *testing.T) {
 		// The production entry point resolves the seat spec through
 		// confineSeatSpecForTest, which shares the daemon-private lines
 		// with confinePiSession: dropping either fails here.
-		spec := confineSeatSpecForTest(agent.Spec{Cwd: mut}, layout, piReadScope{})
+		spec := confineSeatSpecForTest(agent.Spec{Cwd: mut}, layout, piReadScope{}, "")
 		if !slices.Equal(spec.DeniedPaths, []string{token}) || !slices.Contains(spec.DeniedListings, secretDir) {
 			t.Fatalf("seat spec denied = %q, listings %q; want the live token denied and its directory unlistable", spec.DeniedPaths, spec.DeniedListings)
+		}
+	})
+	t.Run("seat spec denies the stated path with the override stripped", func(t *testing.T) {
+		base, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = stateHome(t)
+		mut := filepath.Join(base, "ws", "mut")
+		if err := os.MkdirAll(filepath.Join(mut, ".git"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		secretDir := filepath.Join(base, "daemon-state")
+		token := filepath.Join(secretDir, "control-token")
+		if err := os.MkdirAll(secretDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(token, []byte("sentinel-control-token\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The spawner strips the override from the worker's environment:
+		// the seat spec must still deny the stated live token, not the
+		// default path the environment now resolves to.
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
+		layout, err := materializeExtensionForSpec(agent.Spec{Cwd: mut}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec := confineSeatSpecForTest(agent.Spec{Cwd: mut}, layout, piReadScope{}, token)
+		if !slices.Equal(spec.DeniedPaths, []string{token}) || !slices.Contains(spec.DeniedListings, secretDir) {
+			t.Fatalf("seat spec denied = %q, listings %q; want the stated token denied and its directory unlistable", spec.DeniedPaths, spec.DeniedListings)
 		}
 	})
 }

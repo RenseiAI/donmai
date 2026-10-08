@@ -276,10 +276,15 @@ type daemonPrivate struct {
 // (and, on a backend that empties the directory, never reachable). Every
 // directory between one of them and the work area is denied a listing
 // too, so the other sessions' work areas beside this one are not
-// enumerable either. Read in the worker (supervisor) process, never by the
-// seat: the override variable is runner-only, stripped from every spawned
-// session's environment.
-func seatDaemonPrivate(workareaRoot string) daemonPrivate {
+// enumerable either.
+//
+// tokenPath is the daemon-resolved token path the spawner states for this
+// session (Options.ControlTokenPath): the daemon strips the override
+// variable from every worker it spawns, so reading it here would protect
+// the default path while the live token sits at the override. An explicit
+// path always wins; empty falls back to the process environment (a
+// hand-started worker outside the spawner still sees the override).
+func seatDaemonPrivate(workareaRoot, tokenPath string) daemonPrivate {
 	var d daemonPrivate
 	addDir := func(dir string) {
 		if dir != "" && !slices.Contains(d.dirs, dir) {
@@ -287,7 +292,11 @@ func seatDaemonPrivate(workareaRoot string) daemonPrivate {
 		}
 	}
 	var tops []string
-	if override := strings.TrimSpace(os.Getenv(runtimeenv.ControlTokenPathEnv)); override != "" {
+	override := strings.TrimSpace(tokenPath)
+	if override == "" {
+		override = strings.TrimSpace(os.Getenv(runtimeenv.ControlTokenPathEnv))
+	}
+	if override != "" {
 		// A relative override resolves to no token at all (the daemon
 		// mints none there either), never to a guess.
 		if filepath.IsAbs(override) {
@@ -527,7 +536,8 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 //
 // The daemon's control-token file rides Spec.DeniedPaths and the
 // directories holding it (and the work area) Spec.DeniedListings
-// (seatDaemonPrivate): resolved the same way the operator's CLI resolves
+// (seatDaemonPrivate): the spawner-stated token path when the daemon
+// states one, else resolved the same way the operator's CLI resolves
 // the token, so the seat's boundary denies the live token whatever brand
 // directory holds it. A failure to resolve them is not fatal — an empty
 // set confines exactly as before — but a resolved path that the boundary
@@ -537,7 +547,7 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 // link planted there refuses the spawn before anything is created outside.
 // A nil confiner means the session did not request confinement: no plan.
 // Any failure refuses the spawn — the plan never degrades to a weaker set.
-func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner, reads piReadScope) (*confinement.Plan, error) {
+func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner, reads piReadScope, tokenPath string) (*confinement.Plan, error) {
 	if confiner == nil {
 		return nil, nil
 	}
@@ -578,7 +588,7 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 			return nil, fmt.Errorf("%w: pi confinement session cache: %v", agent.ErrSpawnFailed, err)
 		}
 	}
-	cspec := seatSpec(spec, layout, tmpDir, caches, loopbackPorts, reads)
+	cspec := seatSpec(spec, layout, tmpDir, caches, loopbackPorts, reads, tokenPath)
 	if layout.extension != "" {
 		if _, err := os.Lstat(layout.extension); err == nil {
 			cspec.Protected = append(cspec.Protected, layout.extension)
@@ -593,7 +603,11 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 
 // seatSpec builds the seat confinement spec the spawner prepares: the
 // session, its work area and the daemon-private paths it is denied.
-func seatSpec(spec agent.Spec, layout sessionLayout, tmpDir string, caches []confinement.Cache, loopbackPorts []int, reads piReadScope) confinement.Spec {
+// tokenPath is the spawner-stated daemon token path (Options,
+// threaded from the daemon that minted the token): it reaches the
+// daemon-private deny explicitly, never through the inherited
+// environment the spawner strips.
+func seatSpec(spec agent.Spec, layout sessionLayout, tmpDir string, caches []confinement.Cache, loopbackPorts []int, reads piReadScope, tokenPath string) confinement.Spec {
 	cspec := confinement.Spec{
 		SessionID:   "pi-" + sessionLeafKey(spec),
 		HarnessID:   piHarnessID,
@@ -617,7 +631,7 @@ func seatSpec(spec agent.Spec, layout sessionLayout, tmpDir string, caches []con
 		cspec.WorkareaRoot = filepath.Dir(cwd)
 		cspec.MutableLeaves = []string{cwd}
 	}
-	private := seatDaemonPrivate(cspec.WorkareaRoot)
+	private := seatDaemonPrivate(cspec.WorkareaRoot, tokenPath)
 	cspec.DeniedPaths, cspec.DeniedListings = private.paths, private.dirs
 	return cspec
 }
@@ -626,8 +640,8 @@ func seatSpec(spec agent.Spec, layout sessionLayout, tmpDir string, caches []con
 // builds, minus the session tmp, caches and the protected extension: the
 // work area and daemon-private lines under test are shared through
 // seatSpec, not copied.
-func confineSeatSpecForTest(spec agent.Spec, layout sessionLayout, reads piReadScope) confinement.Spec {
-	return seatSpec(spec, layout, "", nil, nil, reads)
+func confineSeatSpecForTest(spec agent.Spec, layout sessionLayout, reads piReadScope, tokenPath string) confinement.Spec {
+	return seatSpec(spec, layout, "", nil, nil, reads, tokenPath)
 }
 
 // endpointLoopbackPorts returns the port of the session's own model endpoint

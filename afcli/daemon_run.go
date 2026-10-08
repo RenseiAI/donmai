@@ -361,7 +361,13 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// harness unprobed. See Options.QuotaProbeBinaries.
 				QuotaProbeBinaries: resolveQuotaProbeBinaries(),
 			}
-			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
+			tokenPath := controlTokenPath()
+			applyDaemonControlAuth(&daemonOpts, tokenPath, errOut)
+			// State the resolved path beside the minted token: the
+			// spawner strips the path-override variable from every
+			// worker, so accept-time details carry the path to the
+			// worker's seat confinement explicitly instead.
+			daemonOpts.ControlTokenPath = tokenPath
 			d = daemon.New(daemonOpts)
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
