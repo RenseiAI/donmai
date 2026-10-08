@@ -91,13 +91,16 @@ func TestServer_Status_SeatBudget_CgroupfsReportsNone(t *testing.T) {
 	}
 }
 
-// TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly pins the F2
-// contract: seatBudgetDetail's systemd-less enforced line (values plus the
-// no-backend suffix) is the PRE-downgrade rendering seatBudgetReport
-// consumes — no caller may publish it as a posture. The published status
-// half for the same input is mode none with no values. A caller that
-// rendered the detail line directly would claim an enforced budget for a
-// seat that runs unconfined.
+// TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly pins the
+// contract: the systemd-less enforced rendering (values plus the
+// no-backend suffix) is the PRE-downgrade line seatBudgetReport consumes —
+// no caller may publish it as a posture. The published status half for
+// the same input is mode none with no values. The placement rides along
+// as a parameter (never the live host probe): the CI runner has systemd
+// while the systemd-less container does not, so reading the host here
+// makes the test host-dependent. A caller that published the detail line
+// directly would claim an enforced budget for a seat that runs
+// unconfined.
 func TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly(t *testing.T) {
 	// Pin the systemd-less Linux downgrade on ANY host: an enforced seat
 	// with the cgroupfs placement reports mode none with no values — the
@@ -112,9 +115,27 @@ func TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly(t *testing.T) {
 	if got := seatBudgetReportFor(b, seatbudget.PlacementNone, "linux"); got.Mode != string(seatbudget.ModeNone) {
 		t.Errorf("no-placement report = %+v; want mode none", got)
 	}
-	detail := seatBudgetDetailFor(b, "linux")
+	// The downgrade reason names the unapplied backend per placement:
+	// cgroupfs says so explicitly, bare none says no backend at all.
+	if got := seatBudgetReportFor(b, seatbudget.PlacementCgroupFS, "linux"); !strings.Contains(got.Detail, "cgroupfs") {
+		t.Errorf("cgroupfs downgrade detail = %q; want the unapplied backend named", got.Detail)
+	}
+	if got := seatBudgetReportFor(b, seatbudget.PlacementNone, "linux"); !strings.Contains(got.Detail, "no enforcement backend") {
+		t.Errorf("none downgrade detail = %q; want the missing backend named", got.Detail)
+	}
+	// The placement, not the host, selects the enforced suffix: the same
+	// budget renders the systemd line under the systemd placement and
+	// the no-backend line under the systemd-less placement on ANY host.
+	if got := seatBudgetDetailForPlacement(b, "linux", seatbudget.PlacementSystemd); !strings.Contains(got, "via transient systemd scope") {
+		t.Errorf("systemd detail = %q; want the scope line", got)
+	}
+	detail := seatBudgetDetailForPlacement(b, "linux", seatbudget.PlacementCgroupFS)
 	if !strings.Contains(detail, "no enforcement backend") {
 		t.Errorf("detail = %q; want the pre-downgrade line naming the missing backend", detail)
+	}
+	noneDetail := seatBudgetDetailForPlacement(b, "linux", seatbudget.PlacementNone)
+	if !strings.Contains(noneDetail, "no enforcement backend") {
+		t.Errorf("none detail = %q; want the pre-downgrade line naming the missing backend", noneDetail)
 	}
 	if got := seatBudgetReportFor(b, seatbudget.PlacementSystemd, "linux"); got.Mode != string(seatbudget.ModeEnforced) {
 		t.Errorf("systemd report = %+v; want enforced", got)

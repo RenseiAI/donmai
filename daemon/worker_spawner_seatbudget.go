@@ -117,7 +117,10 @@ func wantsEnforcement(b seatbudget.Budget) bool {
 // spawn: the posture the seat actually runs under with the values. A
 // disabled budget reports mode "none". A seat that asked for enforcement
 // reports enforced ONLY for the systemd wrap — the one placement that
-// confines the seat. A systemd-less Linux host (cgroupfs placement) runs
+// confines the seat. The quota (not core pinning) is the binding CPU
+// limit: identical AllowedCPUs ranges across seats shared 2 cores of 6
+// budgeted, and user services never get the cpuset controller delegated,
+// so the scope carries quota+weight and the report says quota. A systemd-less Linux host (cgroupfs placement) runs
 // the seat unconfined: the launcher performs no direct cgroupfs placement,
 // so the report is mode "none" with the missing backend named, never
 // enforced. With no backend at all the report is likewise none. Best-effort

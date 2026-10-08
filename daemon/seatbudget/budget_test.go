@@ -170,11 +170,11 @@ func TestWorkerCapEnv(t *testing.T) {
 }
 
 func TestCPUSetAndQuota(t *testing.T) {
-	if got := CPUSet(1); got != "0" {
-		t.Errorf("CPUSet(1) = %q; want 0", got)
+	if got := CPUSet(1); got != "1 CPUs" {
+		t.Errorf("CPUSet(1) = %q; want 1 CPUs", got)
 	}
-	if got := CPUSet(4); got != "0-3" {
-		t.Errorf("CPUSet(4) = %q; want 0-3", got)
+	if got := CPUSet(4); got != "4 CPUs" {
+		t.Errorf("CPUSet(4) = %q; want 4 CPUs", got)
 	}
 	if got := CPUQuotaPercent(2); got != "200%" {
 		t.Errorf("CPUQuotaPercent(2) = %q; want 200%%", got)
@@ -192,12 +192,20 @@ func TestSystemdScopeArgs(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"systemd-run", "--scope", "--collect",
-		"AllowedCPUs=0-1", "CPUQuota=200%", "CPUWeight=200",
+		"CPUQuota=200%", "CPUWeight=200", "OOMPolicy=continue",
 		"MemoryMax=4294967296", "MemoryHigh=4294967296", "IOWeight=200",
 		"donmai-seat-abc.scope",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("scope args %q missing %q", joined, want)
+		}
+	}
+	// No core pinning: the quota is the binding limit (identical
+	// AllowedCPUs ranges across seats shared 2 cores of 6 budgeted, and
+	// user services never get the cpuset controller delegated).
+	for _, banned := range []string{"AllowedCPUs", "cpuset"} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("scope args %q carry %q; quota+weight confine the seat", joined, banned)
 		}
 	}
 	if strings.Contains(joined, "--user") {
@@ -218,8 +226,8 @@ func TestSystemdScopeArgs(t *testing.T) {
 	if len(userArgs) < 3 || userArgs[0] != "systemd-run" || userArgs[1] != "--user" || userArgs[2] != "--scope" {
 		t.Errorf("user-bus scope args = %q; want systemd-run --user --scope ...", strings.Join(userArgs, " "))
 	}
-	if !strings.Contains(strings.Join(userArgs, " "), "AllowedCPUs=0-1") {
-		t.Errorf("user-bus scope args %q missing the CPU pinning", strings.Join(userArgs, " "))
+	if !strings.Contains(strings.Join(userArgs, " "), "OOMPolicy=continue") {
+		t.Errorf("user-bus scope args %q missing the seat-survives-OOM policy", strings.Join(userArgs, " "))
 	}
 }
 
@@ -228,9 +236,17 @@ func TestSystemdUserScope(t *testing.T) {
 	if !SystemdUserScope(true, false) {
 		t.Error("SystemdUserScope(user, no system) = false; want true (per-user service)")
 	}
-	// System bus reachable => system service, with or without a user bus.
-	if SystemdUserScope(true, true) {
-		t.Error("SystemdUserScope(user, system) = true; want false (system bus wins)")
+	// Root with both buses keeps the system bus. A NON-root process with
+	// both buses reachable is still a per-user install: the system bus
+	// socket is world-readable, so reachability alone would strand it on
+	// the system spelling and every spawn would fail Access denied.
+	if got := SystemdUserScopeForEUID(true, true, 0); got {
+		t.Error("SystemdUserScopeForEUID(user, system, root) = true; want false (system bus wins for root)")
+	}
+	for _, euid := range []int{1000, 501, 65534} {
+		if !SystemdUserScopeForEUID(true, true, euid) {
+			t.Errorf("SystemdUserScopeForEUID(user, system, euid %d) = false; want true (non-root uses the user bus)", euid)
+		}
 	}
 	if SystemdUserScope(false, true) {
 		t.Error("SystemdUserScope(no user, system) = true; want false")
@@ -336,7 +352,7 @@ func TestHasSystemdAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(dir, "run-helper")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o600); err != nil { //nolint:gosec // G306: test fixture never executed (LookPath probe target only)
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture never executed (LookPath probe target only)
 		t.Fatal(err)
 	}
 	oldPath := os.Getenv("PATH")

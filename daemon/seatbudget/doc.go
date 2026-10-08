@@ -16,9 +16,11 @@
 //
 // Enforcement differs by platform:
 //
-//   - Linux: hard enforcement with cgroups v2. The seat's process tree is
-//     confined to its CPU set and memory limit (AllowedCPUs-style pinning,
-//     CPU quota, memory high/max). See cgroup.go.
+//   - Linux: hard enforcement with cgroups v2. The seat's process tree
+//     runs in its own transient systemd scope with a CPU quota, a CPU
+//     weight share, a memory high/max ceiling and the seat-survives-OOM
+//     policy. There is deliberately no core pinning: the quota is the
+//     binding limit. See cgroup.go.
 //   - macOS: best effort. There is no core affinity on Apple Silicon, so the
 //     seat gets worker-cap environment (GOMAXPROCS plus the build/test
 //     worker knobs each tool actually reads) composed with the installed

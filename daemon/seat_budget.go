@@ -74,59 +74,59 @@ func seatBudgetReportFor(b seatbudget.Budget, placement seatbudget.Placement, go
 		// cooperative caps) and the report below renders the knob line;
 		// collapsing that to none would erase a real best-effort budget.
 		if goos == "linux" {
-			return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone), Detail: seatBudgetNoBackendDetail()}
+			return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone), Detail: seatBudgetNoBackendDetailFor(placement)}
 		}
 	}
 	return &afclient.SeatBudgetStatus{
 		Mode:     string(mode),
 		CPUs:     b.CPUs,
 		MemoryMB: b.MemoryMB,
-		Detail:   seatBudgetDetailFor(b, goos),
+		Detail:   seatBudgetDetailForPlacement(b, goos, placement),
 	}
 }
 
 // seatBudgetNoBackendDetail names the missing backend for a Linux seat
 // that asked for enforcement on a host with no systemd: the report must
 // name the reason rather than claim a confinement the seat did not get.
-func seatBudgetNoBackendDetail() string {
-	if seatbudget.HostPlacement() == seatbudget.PlacementCgroupFS {
+// The placement is the caller's live probe (never re-probed here) so the
+// status path stays hermetic and host-independent under test.
+func seatBudgetNoBackendDetailFor(placement seatbudget.Placement) string {
+	if placement == seatbudget.PlacementCgroupFS {
 		return "no systemd on this host: cgroupfs placement is not applied, seat runs unconfined"
 	}
 	return "no enforcement backend on this host"
 }
 
-// seatBudgetDetailFor renders the detail for goos. The enforced branch
-// keeps the values with the no-backend suffix ONLY as the pre-downgrade
-// rendering seatBudgetReportFor consumes on systemd-less Linux: no caller
-// may publish it as a posture. seatBudgetReportFor downgrades that input
-// to mode none with no values before this line is ever published (see
-// TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly). Direct
-// callers must pass the placement downgrade (or use seatBudgetReportFor)
-// rather than rendering an enforced line for a seat that runs unconfined.
-// The host-GOOS entry point below is exercised beside seatBudgetDetailFor
-// by tests; the published status path goes through seatBudgetReportFor.
+// seatBudgetNoBackendDetail names the missing backend at the live
+// placement.
 //
-//nolint:unused
-func seatBudgetDetail(b seatbudget.Budget) string {
-	return seatBudgetDetailFor(b, runtime.GOOS)
+//nolint:unused // kept as the named entry point beside seatBudgetNoBackendDetailFor
+func seatBudgetNoBackendDetail() string {
+	return seatBudgetNoBackendDetailFor(seatbudget.HostPlacement())
 }
 
-// seatBudgetDetailFor renders the detail for goos. The enforced branch
-// keeps the values with the no-backend suffix ONLY as the pre-downgrade
-// rendering seatBudgetReportFor consumes on systemd-less Linux — no caller
-// may publish it as a posture. seatBudgetReportFor downgrades that input
-// to mode none with no values before this line is ever published (see
-// TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly). Direct
-// callers must pass the placement downgrade (or use seatBudgetReportFor)
-// rather than rendering an enforced line for a seat that runs unconfined.
+// seatBudgetDetailFor is the host-GOOS entry point. The published
+// status path goes through seatBudgetReportFor; direct callers must pass
+// the placement downgrade (or use seatBudgetReportFor) rather than
+// rendering an enforced line for a seat that runs unconfined.
+//
+//nolint:unused // kept as the named entry point beside seatBudgetDetailForPlacement
 func seatBudgetDetailFor(b seatbudget.Budget, goos string) string {
+	return seatBudgetDetailForPlacement(b, goos, seatbudget.HostPlacement())
+}
+
+// seatBudgetDetailForPlacement is seatBudgetDetailFor with the placement
+// injected: the CI runner has systemd while the systemd-less container
+// does not, so reading the live host here makes the test host-dependent.
+// Tests pin both placements on any host through this form.
+func seatBudgetDetailForPlacement(b seatbudget.Budget, goos string, placement seatbudget.Placement) string {
 	switch seatbudget.EffectiveModeFor(b.Mode, goos) {
 	case seatbudget.ModeEnforced:
 		detail := fmt.Sprintf("cpus %s, quota %s", seatbudget.CPUSet(b.CPUs), seatbudget.CPUQuotaPercent(b.CPUs))
 		if mem := seatbudget.MemoryBytes(b.MemoryMB); mem != "" {
 			detail += fmt.Sprintf(", memory %s bytes", mem)
 		}
-		switch seatbudget.HostPlacement() {
+		switch placement {
 		case seatbudget.PlacementSystemd:
 			return detail + " via transient systemd scope"
 		default:

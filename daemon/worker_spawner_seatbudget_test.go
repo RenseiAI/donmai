@@ -138,10 +138,16 @@ func TestApplySeatBudgetToCmd_SystemdWrap(t *testing.T) {
 	b := seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: "enforced"}
 	got := applySeatBudgetToCmd([]string{"/bin/sh", "-c", "exit 0"}, "abc-123", b, true, seatbudget.PlacementSystemd)
 	joined := strings.Join(got, " ")
-	for _, want := range []string{"systemd-run", "--scope", "AllowedCPUs=0-1", "CPUQuota=200%", "donmai-seat-abc-123.scope", "/bin/sh"} {
+	for _, want := range []string{"systemd-run", "--scope", "CPUQuota=200%", "CPUWeight=200", "OOMPolicy=continue", "MemoryMax=1073741824", "donmai-seat-abc-123.scope", "/bin/sh"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("wrapped command %q missing %q", joined, want)
 		}
+	}
+	// No core pinning rides the scope: the quota is the binding limit
+	// (identical AllowedCPUs ranges across seats shared 2 cores of 6
+	// budgeted, and user services never get cpuset delegated).
+	if strings.Contains(joined, "AllowedCPUs") {
+		t.Errorf("wrapped command %q pins cores; want quota+weight only", joined)
 	}
 	if strings.Contains(joined, "--user") {
 		t.Errorf("system-service wrap %q carries --user; want the system-bus spelling", joined)

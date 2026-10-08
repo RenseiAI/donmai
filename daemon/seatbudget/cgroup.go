@@ -32,15 +32,21 @@ import (
 // want of a hierarchy, and the report must never claim a confinement the
 // seat did not get.
 
-// CPUSet renders the cpuset.cpus value for a seat: the first `cpus` logical
-// CPUs as a range ("0-3"). Pinning starts at CPU 0 so sequential seats pack
-// onto the same cores the way the default CPU share already does. Ranges
-// keep the value short on many-core hosts.
+// CPUSet renders the seat's CPU count for report lines.
+//
+// No core pinning rides the scope, by measurement: every seat rendered
+// the same first-N range (three 2-CPU seats shared cores 0-1 for 1.99
+// cores of 6 budgeted), and user services never get the cpuset
+// controller delegated, so the property was silently ignored there while
+// the report claimed it. The CPU quota is the binding throughput limit on
+// both install types; the weight divides contended CPU proportionally
+// when seats overcommit. CPUSet therefore only feeds the human detail,
+// never a cgroup property.
 func CPUSet(cpus int) string {
-	if cpus <= 1 {
-		return "0"
+	if cpus < 1 {
+		cpus = 1
 	}
-	return "0-" + strconv.Itoa(cpus-1)
+	return strconv.Itoa(cpus) + " CPUs"
 }
 
 // CPUQuotaPercent renders the cpu.max quota for cpus whole cores as a
@@ -79,7 +85,10 @@ func MemoryBytes(memoryMB int) string {
 // with no memory cap must not get MemoryMax=0, which systemd reads as "no
 // memory at all". userScope selects the bus flag: a per-user daemon
 // reaches only the user manager, so its seats need --user; a system
-// service uses the system bus and must not pass it.
+// service uses the system bus and must not pass it. OOMPolicy=continue
+// keeps the seat alive when one child hits the memory ceiling: the
+// kernel kills only the offender, while the default (stop) would end the
+// whole agent session on the first child OOM.
 func SystemdScopeArgs(name string, b Budget) []string {
 	return SystemdScopeArgsForBus(name, b, false)
 }
@@ -94,9 +103,9 @@ func SystemdScopeArgsForBus(name string, b Budget, userScope bool) []string {
 		args = append(args, "--user")
 	}
 	args = append(args, "--scope", "--collect",
-		"-p", "AllowedCPUs="+CPUSet(b.CPUs),
 		"-p", "CPUQuota="+CPUQuotaPercent(b.CPUs),
 		"-p", "CPUWeight="+CPUWeight(b.CPUs),
+		"-p", "OOMPolicy=continue",
 	)
 	if mem := MemoryBytes(b.MemoryMB); mem != "" {
 		args = append(args, "-p", "MemoryMax="+mem, "-p", "MemoryHigh="+mem)
@@ -111,12 +120,23 @@ func SystemdScopeArgsForBus(name string, b Budget, userScope bool) []string {
 // SystemdUserScope reports whether this process runs under a per-user
 // systemd manager: the user bus is reachable and the system bus is not
 // usable from here. A per-user daemon must create its transient scopes
-// with --user; probing the bus (not the UID) is what answers that, so a
-// root-owned user service and a container with a forwarded user bus both
-// read correctly. userBus, systemBus are injected so tests pin the matrix
-// on any host.
+// with --user; probing the bus (not the install flags) is what answers
+// that, so a root-owned user service and a container with a forwarded
+// user bus both read correctly. The system bus socket is world-readable,
+// so reachability alone cannot distinguish a per-user service from a
+// system one: only root may use the system bus. userBus, systemBus are
+// injected so tests pin the matrix on any host; the euid rule lives in
+// SystemdUserScopeForEUID so tests pin it without changing uids.
 func SystemdUserScope(userBus, systemBus bool) bool {
-	return userBus && !systemBus
+	return SystemdUserScopeForEUID(userBus, systemBus, os.Geteuid())
+}
+
+// SystemdUserScopeForEUID is SystemdUserScope parametrised by the
+// effective uid. A non-root process with both buses reachable is still a
+// per-user install: creating the scope without --user fails there with
+// "Access denied", while root keeps the system bus.
+func SystemdUserScopeForEUID(userBus, systemBus bool, euid int) bool {
+	return userBus && !(systemBus && euid == 0)
 }
 
 // ScopeName returns the transient-scope unit name for a session. The session
@@ -270,12 +290,12 @@ func userBusSocketPath(override string) string {
 	return fmt.Sprintf("/run/user/%d/bus", os.Getuid())
 }
 
-// socketAlive reports whether a unix datagram exchange with path succeeds
-// inside a short bound. SOCK_DGRAM, not STREAM: the bus takes datagrams,
-// and a stream connect to a datagram socket always refuses — probing the
-// wrong type would report every live bus as dead.
+// socketAlive reports whether a unix stream exchange with path succeeds
+// inside a short bound. SOCK_STREAM, not DGRAM: D-Bus listens on
+// SOCK_STREAM, and probing the wrong socket type reports every live bus
+// as dead (which strands per-user installs on the system bus spelling).
 func socketAlive(path string) bool {
-	conn, err := net.DialTimeout("unixpacket", path, 500*time.Millisecond)
+	conn, err := net.DialTimeout("unix", path, 500*time.Millisecond)
 	if err != nil {
 		return false
 	}
