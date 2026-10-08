@@ -249,6 +249,20 @@ var seatBudgetLaunchPlacement = seatbudget.HostPlacement
 
 var seatBudgetLaunchUserScope = seatbudget.UserScopeForBus
 
+// seatBudgetLaunchedReport builds the handle evidence for a shim this daemon
+// just launched: the seat's OWN facts (the scope unit and limits the launch
+// stamped into the contract, carried here explicitly rather than re-read
+// from this daemon's current configuration), reported through the live
+// cgroup read-back with record fallback. scope carries the stamped scope
+// unit; cpus/memoryMB/ioWeight the stamped limits. After the operator
+// reconfigures the budget, the live seat still reports what it runs under —
+// never what a fresh seat would get.
+func seatBudgetLaunchedReport(scope string, cpus, memoryMB, ioWeight int) *SessionSeatBudget {
+	live, liveOK := seatbudget.ReadSeatLimits(scope, seatBudgetLaunchUserScope())
+	rep := seatbudget.ReportSeatLimits(scope, live, liveOK && scope != "", cpus, memoryMB, ioWeight)
+	return &SessionSeatBudget{Mode: string(rep.Mode), CPUs: rep.CPUs, MemoryMB: rep.MemoryMB, Detail: rep.Detail}
+}
+
 // seatBudgetAdoptedReport builds the handle evidence for a shim this daemon
 // adopted (at startup or after a restart): the limits read back from the
 // seat's own cgroup through its scope, falling back to the launch record the

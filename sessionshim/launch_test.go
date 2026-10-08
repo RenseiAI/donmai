@@ -144,23 +144,18 @@ func TestEveryLaunchKeyIsRefusedToTheHarnessChild(t *testing.T) {
 	if sessionshim.IsEnvKey("PATH") {
 		t.Error(`IsEnvKey("PATH") = true`)
 	}
-	// Env() must render exactly the declared key set — no more, no less.
-	// The seat facts render only when a launch carries them: a plain launch
-	// (no scope, no limits) emits the base contract byte-for-byte, while a
-	// scoped launch additionally emits the seat keys. Both shapes must
-	// decode back to the launch they came from.
+	// Env() must render exactly the declared key set — no more, no less —
+	// for EVERY launch. The seat facts always render: a plain launch (no
+	// scope, no limits) carries the seat keys with empty/zero values, so a
+	// restarted daemon recovers the record the shim republishes rather than
+	// an absent field it cannot distinguish from an old launcher. Both
+	// shapes must decode back to the launch they came from.
 	plain := sessionshim.Launch{
 		Identity:    sessionshim.Identity{OrgID: "o", SessionID: "s"},
 		RegistryDir: "/tmp/x", Orphan: sessionshim.DefaultOrphanPolicy(),
 	}
 	env := plain.Env()
 	for _, key := range keys {
-		if plain.SeatScope == "" && (key == sessionshim.EnvSeatScope || key == sessionshim.EnvSeatCPUs || key == sessionshim.EnvSeatMemoryMB || key == sessionshim.EnvSeatIOWeight) {
-			if _, ok := env[key]; ok {
-				t.Errorf("plain Env() renders optional seat key %s", key)
-			}
-			continue
-		}
 		if _, ok := env[key]; !ok {
 			t.Errorf("Env() omitted declared key %s", key)
 		}
@@ -203,9 +198,9 @@ func TestStartFromEnvRequiresAUsableRegistryDirectory(t *testing.T) {
 
 // TestSeatFactsRoundTripThroughLaunch pins the secret-free launch record:
 // the scope unit and the launched limits travel the launch contract and
-// decode back unchanged. A malformed limit fails closed; an absent one
-// decodes to no facts (an old launcher), never to a zero that claims a
-// launch that never happened.
+// decode back unchanged. A budgetless launch renders empty/zero seat values
+// and decodes back to them; a wire that predates the seat keys entirely
+// (an old launcher) decodes to no facts. A malformed limit fails closed.
 func TestSeatFactsRoundTripThroughLaunch(t *testing.T) {
 	t.Parallel()
 
@@ -227,6 +222,8 @@ func TestSeatFactsRoundTripThroughLaunch(t *testing.T) {
 		t.Fatalf("round trip = %+v, want %+v", got, base)
 	}
 	// Absent seat keys decode to no facts — an old launcher — without error.
+	// (Env() itself always renders the keys; only a hand-built wire that
+	// predates them takes this path.)
 	plain := sessionshim.Launch{
 		Identity:     sessionshim.Identity{OrgID: "o", SessionID: "s"},
 		RegistryDir:  "/tmp/shims",

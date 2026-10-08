@@ -23,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	attachwirev2 "github.com/RenseiAI/donmai/attachwire/v2"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/internal/testisolation"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -1093,8 +1094,18 @@ func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string
 // alive long enough to be adopted: the default orphan deadline here is two
 // seconds, and a shim reaped before the pass reaches it is tombstoned rather
 // than adopted or quarantined.
+//
+// The fixture stubs the transient-scope gate off Linux's real systemd: every
+// shim launch wraps in a scope (budget or not), so a test that launches a
+// real shim needs the placement stubbed to systemd and the platform to
+// linux — otherwise a Linux host with a live user bus wraps the launch in
+// a REAL systemd-run whose unit name (one process epoch per test binary)
+// collides across parallel suites, and a host without systemd refuses every
+// launch. The stub keeps the launch hermetic on every host; the real scope
+// shape is pinned by the fake-systemd-run tests and the Linux live proof.
 func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *shimSpawnFixture {
 	t.Helper()
+	stubShimScopeGateForTest(t)
 	// A Unix socket path has a short platform limit (as low as 104 bytes), and
 	// t.TempDir() bakes the test name into the path. Keep the registry short.
 	dir, err := os.MkdirTemp("/tmp", "dsp")
@@ -1152,6 +1163,25 @@ func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *sh
 		d.ReleaseAdoptedSessionShims()
 	})
 	return f
+}
+
+// stubShimScopeGateForTest stubs the transient-scope gate so a test that
+// launches a real shim never touches the host's systemd: the placement
+// reads as systemd and the platform as linux, so startShimProcess renders
+// the scope argv and the bare command runs unwrapped on every host. The
+// stub restores itself through t.Cleanup; tests that pin the gate itself
+// set the vars directly and must not run parallel while stubbed.
+func stubShimScopeGateForTest(t *testing.T) {
+	t.Helper()
+	oldPlacement, oldUserScope := seatBudgetLaunchPlacement, seatBudgetLaunchUserScope
+	oldScopeGOOS := shimScopeGOOS
+	seatBudgetLaunchPlacement = func() seatbudget.Placement { return seatbudget.PlacementSystemd }
+	seatBudgetLaunchUserScope = func() bool { return false }
+	shimScopeGOOS = "darwin"
+	t.Cleanup(func() {
+		seatBudgetLaunchPlacement, seatBudgetLaunchUserScope = oldPlacement, oldUserScope
+		shimScopeGOOS = oldScopeGOOS
+	})
 }
 
 // interactiveSpec is a session spec whose run mode selects shim ownership.

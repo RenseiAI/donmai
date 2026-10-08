@@ -184,6 +184,40 @@ func TestQuarantineProjectionAlwaysConsumesCapacity(t *testing.T) {
 	}
 }
 
+// TestQuarantinedSessionCarriesRecordSeatFacts pins the seat-fact half of
+// NewQuarantinedSession through the PRODUCTION constructor: a record that
+// carries the launch's scope unit and limits produces a quarantine entry
+// that carries them unchanged, so quarantined handles report the launched
+// limits instead of none. Zeroing the four copies keeps the capacity suite
+// green but empties this entry — the duplicate-identity shape that would
+// report none for a seat that runs capped.
+func TestQuarantinedSessionCarriesRecordSeatFacts(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_100, 0)
+	rec := Record{
+		OrgID: "org-1", SessionID: "sess-1", ShimID: "shim-1", ProcessEpoch: 3,
+		ProtocolMin: 7, ProtocolMax: 9, Phase: shimwire.PhaseRunning,
+		SeatScope:         "donmai-seat-abc-3.scope",
+		SeatCPUs:          2,
+		SeatMemoryMB:      512,
+		SeatIOWeight:      100,
+		CreatedAtUnixNano: now.Add(-90 * time.Second).UnixNano(),
+	}
+	q := NewQuarantinedSession(rec, QuarantineDuplicateIdentity, "two live records claim this identity", now)
+	if q.SeatScope != rec.SeatScope || q.SeatCPUs != rec.SeatCPUs || q.SeatMemoryMB != rec.SeatMemoryMB || q.SeatIOWeight != rec.SeatIOWeight {
+		t.Fatalf("quarantine seat facts = %q/%d/%d/%d; want the record's %q/%d/%d/%d",
+			q.SeatScope, q.SeatCPUs, q.SeatMemoryMB, q.SeatIOWeight,
+			rec.SeatScope, rec.SeatCPUs, rec.SeatMemoryMB, rec.SeatIOWeight)
+	}
+	// A record with no seat facts (an old launcher) quarantines to no
+	// facts — never to invented limits.
+	bare := NewQuarantinedSession(Record{OrgID: "o", SessionID: "s"}, QuarantineDuplicateIdentity, "detail", now)
+	if bare.SeatScope != "" || bare.SeatCPUs != 0 || bare.SeatMemoryMB != 0 || bare.SeatIOWeight != 0 {
+		t.Fatalf("bare quarantine seat facts = %+v; want none", bare)
+	}
+}
+
 func TestSortQuarantinedIsStableAcrossSnapshots(t *testing.T) {
 	t.Parallel()
 

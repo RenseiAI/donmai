@@ -42,7 +42,7 @@ func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 	}
 	userScope := UserScopeForBus()
 	budget := Budget{CPUs: 1, MemoryMB: 256, Mode: ModeEnforced}
-	scope := ScopeName("live-proof")
+	scope := ScopeNameForIncarnation("", "live-proof", 0)
 	prefix := SystemdScopeArgsForBus(scope, budget, userScope)
 
 	// The seat child sleeps under the scope so the unit stays live for
@@ -125,10 +125,11 @@ func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 // everywhere.
 func TestLive_CgroupScopeArgvIsConfining(t *testing.T) {
 	budget := Budget{CPUs: 1, MemoryMB: 256, Mode: ModeEnforced}
+	wantUnit := ScopeNameForIncarnation("", "live-proof", 0)
 	for _, userScope := range []bool{false, true} {
-		args := SystemdScopeArgsForBus(ScopeName("live-proof"), budget, userScope)
+		args := SystemdScopeArgsForBus(wantUnit, budget, userScope)
 		joined := strings.Join(args, " ")
-		for _, want := range []string{"systemd-run", "--scope", "--collect", "CPUQuota=100%", "CPUWeight=100", "MemoryMax=268435456", "OOMPolicy=continue", "donmai-seat-live-proof.scope"} {
+		for _, want := range []string{"systemd-run", "--scope", "--collect", "CPUQuota=100%", "CPUWeight=100", "MemoryMax=268435456", "OOMPolicy=continue", wantUnit} {
 			if !strings.Contains(joined, want) {
 				t.Errorf("userScope=%v: live scope argv %q missing %q", userScope, joined, want)
 			}

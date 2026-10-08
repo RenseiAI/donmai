@@ -573,6 +573,66 @@ var (
 	_ = exec.Command
 )
 
+// shimLaunchEnvProbe is a WorkerCommand that records the exact environment
+// the launched shim process starts with, then runs the tail command. The
+// fake systemd-run prefix (see the startShimProcess tests) execs its tail,
+// so chaining this probe BEHIND it captures the launch-contract half of
+// startShimProcess: the scope unit and launched limits stamped into the
+// child env. Deleting the launch.SeatScope/limits stamp keeps the scope
+// wrap green but leaves this probe's record without the seat keys — the
+// mutation B3 names.
+func shimLaunchEnvProbe(t *testing.T, dir string) (workerCommand []string, envPath string) {
+	t.Helper()
+	envPath = filepath.Join(dir, "shim-launch-env")
+	// The probe appends its own environ to envPath (one KEY=VALUE per
+	// line), then execs the tail command unchanged. "$@" preserves the
+	// worker argv startShimProcess configured; the env record lands before
+	// the tail replaces this shell.
+	probe := "env > \"$SHIM_LAUNCH_ENV_PATH\"; exec \"$@\""
+	return []string{"/bin/sh", "-c", probe, "shim-launch-env-probe"}, envPath
+}
+
+// readShimLaunchEnvRecord polls for the probe's env record the same way the
+// scope-argv tests poll for the fake systemd-run argv: Start returns before
+// the child runs, so the record lands asynchronously.
+func readShimLaunchEnvRecord(t *testing.T, envPath string) map[string]string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw, readErr := os.ReadFile(envPath)
+		if readErr == nil {
+			byKey := map[string]string{}
+			for _, line := range strings.Split(string(raw), "\n") {
+				if k, v, ok := strings.Cut(line, "="); ok {
+					byKey[k] = v
+				}
+			}
+			return byKey
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shim launch env probe never ran (no env record): %v — the launch never reached its worker", readErr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// assertShimLaunchEnvCarriesSeatFacts pins the launch-record half of
+// startShimProcess: the child env carries the digest scope unit plus the
+// launched limits, so the shim republishes them into its discovery record
+// and a restarted daemon falls back to them — never to empty facts.
+func assertShimLaunchEnvCarriesSeatFacts(t *testing.T, byKey map[string]string, wantScope string, wantCPUs, wantMemoryMB int) {
+	t.Helper()
+	if got := byKey[sessionshim.EnvSeatScope]; got != wantScope {
+		t.Errorf("launched env %s = %q; want the digest scope %q", sessionshim.EnvSeatScope, got, wantScope)
+	}
+	if got := byKey[sessionshim.EnvSeatCPUs]; got != strconv.Itoa(wantCPUs) {
+		t.Errorf("launched env %s = %q; want %d", sessionshim.EnvSeatCPUs, got, wantCPUs)
+	}
+	if got := byKey[sessionshim.EnvSeatMemoryMB]; got != strconv.Itoa(wantMemoryMB) {
+		t.Errorf("launched env %s = %q; want %d", sessionshim.EnvSeatMemoryMB, got, wantMemoryMB)
+	}
+}
+
 // TestStartShimProcess_WrapsEnforcedSeatInSystemdScope drives the PRODUCTION
 // shim launch entry (startShimProcess) with an enforced seat budget and a
 // stubbed systemd placement, and asserts the shim actually launches inside
@@ -615,13 +675,14 @@ func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
 
 	const sessionID = "shim-budget-wrap"
 	const marker = "shim-budget-wrap-marker"
+	probeCmd, envPath := shimLaunchEnvProbe(t, dir)
 	d := &Daemon{}
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
 		MaxConcurrentSessions: 2,
 		SeatBudget:            SeatBudget{CPUs: 2, MemoryMB: 256, Mode: "enforced"},
-		WorkerCommand:         []string{"/bin/sh", "-c", "echo " + marker + "; exit 0"},
+		WorkerCommand:         append(append([]string(nil), probeCmd...), "/bin/sh", "-c", "echo "+marker+"; exit 0"),
 		WorktreeParentDir:     dir,
 	})
 	identity := sessionshim.Identity{OrgID: "test-org", SessionID: sessionID}
@@ -634,6 +695,7 @@ func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
 	started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, []string{
 		"PATH=" + os.Getenv("PATH"),
 		"FAKE_SYSTEMD_RUN_ARGV=" + argvPath,
+		"SHIM_LAUNCH_ENV_PATH=" + envPath,
 	})
 	if err != nil {
 		t.Fatalf("startShimProcess: %v", err)
@@ -674,6 +736,11 @@ func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
 	if strings.Contains(joined, "AllowedCPUs") {
 		t.Errorf("shim scope argv %q pins cores; want quota+weight only", joined)
 	}
+	// The launch-record half: the child env carries the same digest scope
+	// plus the launched limits, so the shim republishes them into its
+	// discovery record. Deleting the startShimProcess stamp keeps the wrap
+	// above green but empties these — the silent-restart-regression shape.
+	assertShimLaunchEnvCarriesSeatFacts(t, readShimLaunchEnvRecord(t, envPath), wantUnit, 2, 256)
 	// The shim child ran through the wrap: its marker reaches the log.
 	logPath := shimChildLogPath(launch.RegistryDir, identity)
 	deadline := time.Now().Add(5 * time.Second)
@@ -727,12 +794,13 @@ func TestStartShimProcess_BudgetlessSeatStillScopes(t *testing.T) {
 
 	const sessionID = "shim-budgetless-scope"
 	const marker = "shim-budgetless-scope-marker"
+	probeCmd, envPath := shimLaunchEnvProbe(t, dir)
 	d := &Daemon{}
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
 		MaxConcurrentSessions: 2,
-		WorkerCommand:         []string{"/bin/sh", "-c", "echo " + marker + "; exit 0"},
+		WorkerCommand:         append(append([]string(nil), probeCmd...), "/bin/sh", "-c", "echo "+marker+"; exit 0"),
 		WorktreeParentDir:     dir,
 	})
 	identity := sessionshim.Identity{OrgID: "test-org", SessionID: sessionID}
@@ -745,6 +813,7 @@ func TestStartShimProcess_BudgetlessSeatStillScopes(t *testing.T) {
 	started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, []string{
 		"PATH=" + os.Getenv("PATH"),
 		"FAKE_SYSTEMD_RUN_ARGV=" + argvPath,
+		"SHIM_LAUNCH_ENV_PATH=" + envPath,
 	})
 	if err != nil {
 		t.Fatalf("startShimProcess without a budget: %v", err)
@@ -779,6 +848,10 @@ func TestStartShimProcess_BudgetlessSeatStillScopes(t *testing.T) {
 	if wantUnit := seatBudgetShimScopeName("test-org", sessionID, 1); !strings.Contains(joined, wantUnit) {
 		t.Errorf("budgetless shim scope argv %q missing digest unit %q", joined, wantUnit)
 	}
+	// The budgetless seat still stamps its scope: zero limits ride as "0"
+	// so the shim republishes the scope into its record and a restarted
+	// daemon recovers the owning unit instead of an empty one.
+	assertShimLaunchEnvCarriesSeatFacts(t, readShimLaunchEnvRecord(t, envPath), seatBudgetShimScopeName("test-org", sessionID, 1), 0, 0)
 	logPath := shimChildLogPath(launch.RegistryDir, identity)
 	deadline := time.Now().Add(5 * time.Second)
 	for {

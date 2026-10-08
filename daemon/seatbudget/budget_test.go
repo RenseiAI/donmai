@@ -586,6 +586,16 @@ func TestReadSeatLimitsParsesSystemctlShow(t *testing.T) {
 	if _, ok := readSeatLimitsWithRunner("bad scope/unit", true, run, "linux"); ok {
 		t.Error("unsafe scope name reads ok=true; want refusal")
 	}
+	// The goos gate is the production entry's platform branch (ReadSeatLimits
+	// passes runtime.GOOS): off Linux the scope shape does not exist, so the
+	// read refuses and the caller falls back to the launch record. Deleting
+	// the gate keeps this suite green on Linux but would let a future
+	// systemctl-shaped read on darwin report numbers it never observed.
+	if _, ok := readSeatLimitsWithRunner("donmai-seat-x-1.scope", true, func(string, bool) ([]byte, error) {
+		return []byte("CPUQuotaPerSecUSec=200000\nMemoryMax=268435456\nIOWeight=200\n"), nil
+	}, "darwin"); ok {
+		t.Error("off-Linux read reports ok=true; want the record fallback")
+	}
 }
 
 // TestReportSeatLimitsFallsBackToRecord pins the adopted-handle rule: live

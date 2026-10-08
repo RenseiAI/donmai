@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -88,18 +89,25 @@ func TestHostwatchAxesDirectProducer(t *testing.T) {
 
 // TestHostwatchAxesShimHandleSeatBudget calls the actual shim handle
 // publication function (trackLaunchedShim, the F1 report site) with a seat
-// budget on the spawner and pins that the shim handle carries the same
-// posture the direct spawn path reports. A shim seat that ran unconfined
-// while its handle claimed enforced would be the false report this rule
+// budget on the spawner and pins that the shim handle carries the seat's
+// OWN launched facts — the scope unit and limits the launch stamped — and
+// never the daemon's current configuration. The controller carries the
+// record's seat facts (what Dial sets from the discovery record); the
+// spawner's share is deliberately different so a current-config report
+// cannot hide. A shim seat that ran under its launched limits while its
+// handle claimed the current share would be the false report this rule
 // exists to prevent.
 func TestHostwatchAxesShimHandleSeatBudget(t *testing.T) {
 	daemon := &Daemon{shims: newSessionShimState()}
 	daemon.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "example", Repository: "github.com/example/project"}},
 		MaxConcurrentSessions: 1,
-		SeatBudget:            SeatBudget{CPUs: 2, Mode: "best-effort"},
+		// Deliberately different from the launched facts below: the
+		// handle must report the seat's own numbers, not this share.
+		SeatBudget: SeatBudget{CPUs: 8, Mode: "best-effort"},
 	})
 	controller := &sessionshim.Controller{}
+	controller.SetSeatFactsForTest("donmai-seat-launched-1.scope", 2, 1024, 0)
 	item := axesPollFixture(t)
 	item.ResolvedProfile.Company = ""
 	spec := PollItemToSessionSpec(item, nil)
@@ -107,8 +115,11 @@ func TestHostwatchAxesShimHandleSeatBudget(t *testing.T) {
 	if handle.SeatBudget == nil {
 		t.Fatal("shim handle.SeatBudget is nil; want the seat posture")
 	}
-	if handle.SeatBudget.Mode != "best-effort" || handle.SeatBudget.CPUs != 2 {
-		t.Errorf("shim handle.SeatBudget = %+v; want best-effort 2 cpu (same as the direct path)", handle.SeatBudget)
+	if handle.SeatBudget.Mode != "enforced" || handle.SeatBudget.CPUs != 2 || handle.SeatBudget.MemoryMB != 1024 {
+		t.Errorf("shim handle.SeatBudget = %+v; want the launched enforced 2 cpu / 1024MiB, not the current 8-cpu share", handle.SeatBudget)
+	}
+	if !strings.Contains(handle.SeatBudget.Detail, "donmai-seat-launched-1.scope") {
+		t.Errorf("shim handle detail = %q; want the owning scope named", handle.SeatBudget.Detail)
 	}
 }
 

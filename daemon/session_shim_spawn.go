@@ -2171,13 +2171,22 @@ func (d *Daemon) trackLaunchedShim(
 	receipt SessionShimAdoptionReceipt,
 	startConsumer bool,
 ) SessionHandle {
-	shimReportBudget, shimReportBudgetOK := d.shimSeatBudget()
+	// The handle reports the seat's OWN facts — the scope unit and limits
+	// this launch stamped into the contract and the shim republished into
+	// its discovery record — through the live cgroup read-back with record
+	// fallback. The launched facts ride the controller the adoption just
+	// authenticated (its record's scope plus limits), so after the operator
+	// reconfigures the budget the live seat still reports what it runs
+	// under — never what a fresh seat would get.
+	seatScope := ctrl.SeatScope()
+	seatCPUs, seatMemoryMB, seatIOWeight := ctrl.SeatLimits()
+	launchedSeat := seatBudgetLaunchedReport(seatScope, seatCPUs, seatMemoryMB, seatIOWeight)
 	handle := SessionHandle{
 		SessionID:  spec.SessionID,
 		PID:        ctrl.HarnessIdentity().PID,
 		AcceptedAt: d.shimNow().UTC().Format(time.RFC3339),
 		State:      SessionRunning,
-		SeatBudget: sessionSeatBudgetReport(shimReportBudget, shimReportBudgetOK, seatbudget.HostPlacement()),
+		SeatBudget: launchedSeat,
 		// The workarea doubles as the worktree path a local reader joins with
 		// .agent/…; it is the same <parent>/<sessionID> leaf the direct path
 		// publishes, so a reader cannot tell shim-backed sessions apart by shape.

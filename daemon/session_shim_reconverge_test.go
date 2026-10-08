@@ -681,6 +681,48 @@ func TestRevisionAdvancedByOne(t *testing.T) {
 	}
 }
 
+// TestBatchAfterEvidenceRecordedCarriesSeatFacts pins the seat-fact half of
+// sessionShimBatchAfterEvidenceRecorded through the PRODUCTION helper: a
+// stub seatFacts callback's scope and limits land on the quarantine entry,
+// so an evidence-conflict quarantine reports the launched limits instead
+// of none. Calling with nil (the only shape the digest test exercises)
+// keeps the empty facts — dropping the callback keeps every other suite
+// green but silently loses the record's numbers here.
+func TestBatchAfterEvidenceRecordedCarriesSeatFacts(t *testing.T) {
+	t.Parallel()
+
+	id := sessionshim.Identity{OrgID: "org-facts", SessionID: "session-facts"}
+	batch := SessionShimAdoptionBatch{
+		OrgID: "org-facts", HostID: "host-facts",
+		Adopted: []SessionShimAdoptionOutcome{{
+			Evidence: SessionShimAdoptionEvidence{
+				Identity: id, ShimID: "shim-facts", ProcessEpoch: 3, ControllerGeneration: 2,
+			},
+		}},
+	}
+	seatFacts := func(got sessionshim.Identity) (string, int, int, int) {
+		if got != id {
+			t.Errorf("seatFacts identity = %v; want %v", got, id)
+		}
+		return "donmai-seat-facts-3.scope", 2, 512, 100
+	}
+	amended, quarantines := sessionShimBatchAfterEvidenceRecorded(batch, []sessionshim.Identity{id}, seatFacts)
+	if len(quarantines) != 1 {
+		t.Fatalf("produced %d quarantines, want 1", len(quarantines))
+	}
+	q := quarantines[0]
+	if q.SeatScope != "donmai-seat-facts-3.scope" || q.SeatCPUs != 2 || q.SeatMemoryMB != 512 || q.SeatIOWeight != 100 {
+		t.Fatalf("quarantine seat facts = %q/%d/%d/%d; want the stub's scope/2/512/100",
+			q.SeatScope, q.SeatCPUs, q.SeatMemoryMB, q.SeatIOWeight)
+	}
+	if len(amended.Adopted) != 0 {
+		t.Fatalf("amended batch still adopts %d lineages; want the conflicted one moved out", len(amended.Adopted))
+	}
+	if len(amended.Quarantined) != 1 || amended.Quarantined[0] != q {
+		t.Fatalf("amended batch quarantine = %+v; want the one entry %+v", amended.Quarantined, q)
+	}
+}
+
 // TestOrphanDeadlineFitsADeclaredExternalReleaseThreshold is the BLOCKING pin.
 //
 // §D8 rejects a policy that violates its inequality AT STARTUP and prevents

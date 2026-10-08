@@ -982,6 +982,18 @@ func (c *Controller) SeatLimits() (cpus, memoryMB, ioWeight int) {
 	return c.seatCPUs, c.seatMemoryMB, c.seatIOWeight
 }
 
+// SetSeatFactsForTest stamps the seat's transient-scope launch facts onto
+// the controller. Production sets these at adoption from the discovery
+// record (Dial); tests use this to drive the launched-handle report path
+// without a live shim. The values are the record's read-back fallback —
+// the live cgroup read takes precedence wherever it answers.
+func (c *Controller) SetSeatFactsForTest(scope string, cpus, memoryMB, ioWeight int) {
+	c.seatScope = scope
+	c.seatCPUs = cpus
+	c.seatMemoryMB = memoryMB
+	c.seatIOWeight = ioWeight
+}
+
 // Adoption returns the replay disposition the shim committed to.
 func (c *Controller) Adoption() shimwire.Adopted { return c.adopted }
 
