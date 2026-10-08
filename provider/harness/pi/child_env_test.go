@@ -73,6 +73,8 @@ var childEnvSentinels = []childEnvSentinel{
 	{runtimeenv.SessionReadTokenEnv, routeRefused},
 	{"API_KEY", routeRefused},
 	{"CUSTOM_SECRET_KEY", routeRefused},
+	// A provider-native model key pi does not ship a provider for.
+	{"META_API_KEY", routeRefused},
 	// The gateway's upstream credential and other host model auth.
 	{runtimeenv.GatewayUpstreamAPIKeyEnv, routeRefused},
 	{"ANTHROPIC_AUTH_TOKEN", routeRefused},
@@ -285,13 +287,15 @@ func TestPartitionChildEnv_LosesNothingButRefusals(t *testing.T) {
 	spec := agent.Spec{Cwd: t.TempDir(), Env: sentinelSpecEnv()}
 	parts := sessionChildEnv(spec)
 	exec := envSliceMap(parts.exec)
-	for _, entry := range runtimeenv.NewComposer().Compose(envSliceToMap(os.Environ()), spec) {
+	composed := runtimeenv.NewComposer().Compose(envSliceToMap(os.Environ()), spec)
+	credentialValues := sessionCredentialValues(composed)
+	for _, entry := range composed {
 		i := strings.IndexByte(entry, '=')
 		if i <= 0 {
 			continue
 		}
 		name, value := entry[:i], entry[i+1:]
-		if childEnvRefused(name) {
+		if _, isCredential := credentialValues[value]; childEnvRefused(name) || isCredential {
 			continue
 		}
 		if v, ok := exec[name]; ok && v == value {
@@ -301,6 +305,55 @@ func TestPartitionChildEnv_LosesNothingButRefusals(t *testing.T) {
 			continue
 		}
 		t.Errorf("composed entry %s was dropped without a refusal", name)
+	}
+}
+
+// TestPartitionChildEnv_RefusesModelCredentialValueUnderAnyName pins the
+// value half of the model-credential refusal. A control plane may file the
+// session's model key under a second, provider-native name beside the
+// injected provider's key. That copy is the same secret, so it rides neither
+// the exec environment nor the environment section the policy extension
+// restores for pi's tools, whether its name is unlisted or allowlisted,
+// while a tool binding with its own value still arrives.
+//
+// RED proof: drop the credential-value case from partitionChildEnv and the
+// copy is deferred to the tools under its second name.
+func TestPartitionChildEnv_RefusesModelCredentialValueUnderAnyName(t *testing.T) {
+	t.Parallel()
+	const key = "mirrored-model-key-value"
+	spec := agent.Spec{Env: map[string]string{
+		PiKeyEnvVar:             key,
+		"VENDOR_NATIVE_API_KEY": key,
+		"LANG":                  key,
+		"GH_TOKEN":              "tool-binding-value",
+		// A binding-identity value is not a secret: a tool binding that
+		// shares it still arrives.
+		"AWS_REGION":         "region-shared-with-a-tool",
+		"AWS_DEFAULT_REGION": "region-shared-with-a-tool",
+	}}
+	parts := partitionChildEnv(nil, spec)
+	if got := deferredValue(parts, "AWS_DEFAULT_REGION"); got != "region-shared-with-a-tool" {
+		t.Errorf("tool binding AWS_DEFAULT_REGION deferred as %q; a binding-identity value is not a secret", got)
+	}
+	for _, entry := range parts.exec {
+		if strings.Contains(entry, key) {
+			t.Errorf("exec environment carries the model key: %q", entry)
+		}
+	}
+	for _, d := range parts.deferred {
+		if d.Value == key {
+			t.Errorf("environment section carries the model key under %s", d.Env)
+		}
+	}
+	if got := deferredValue(parts, "GH_TOKEN"); got != "tool-binding-value" {
+		t.Errorf("tool binding GH_TOKEN deferred as %q, want its own value", got)
+	}
+	credentials := map[string]string{}
+	for _, e := range sessionCredentialEntries(spec) {
+		credentials[e.Env] = e.Value
+	}
+	if credentials[PiKeyEnvVar] != key {
+		t.Errorf("credentials section %s = %q, want the session key", PiKeyEnvVar, credentials[PiKeyEnvVar])
 	}
 }
 

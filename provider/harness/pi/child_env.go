@@ -27,9 +27,13 @@ import (
 //     terminal, TLS trust paths, proxy routes without credentials, and the
 //     runtime startup controls receipt admission inspects;
 //   - session model credentials (sessionCredentialNames) and refused names
-//     (childEnvRefused) are dropped outright. The model credentials reach
-//     the session only through the owner-only credential file (the injected
-//     provider's key) and the session auth.json (native routes);
+//     (childEnvRefused) are dropped outright, and so is any other entry that
+//     carries a model credential's VALUE (sessionCredentialValues): a
+//     control plane may file the session's model key under a second,
+//     provider-native name beside the injected provider's key, and that copy
+//     is the same secret. The model credentials reach the session only
+//     through the owner-only credential file (the injected provider's key)
+//     and the session auth.json (native routes);
 //   - every other entry is a session binding the agent's TOOLS may need (a
 //     tracker or VCS token, a toolchain home, a platform-declared binding).
 //     It rides the owner-only credential file's environment section instead
@@ -192,14 +196,17 @@ type childEnvPartition struct {
 // entry rides changes.
 func partitionChildEnv(parent []string, spec agent.Spec) childEnvPartition {
 	var out childEnvPartition
-	for _, entry := range runtimeenv.NewComposer().Compose(envSliceToMap(parent), spec) {
+	composed := runtimeenv.NewComposer().Compose(envSliceToMap(parent), spec)
+	credentialValues := sessionCredentialValues(composed)
+	for _, entry := range composed {
 		i := strings.IndexByte(entry, '=')
 		if i <= 0 {
 			continue
 		}
 		name, value := entry[:i], entry[i+1:]
+		_, carriesCredential := credentialValues[value]
 		switch {
-		case childEnvRefused(name):
+		case childEnvRefused(name), carriesCredential:
 			continue
 		case childEnvAllowed(name, value):
 			out.exec = append(out.exec, entry)
@@ -210,6 +217,31 @@ func partitionChildEnv(parent []string, spec agent.Spec) childEnvPartition {
 	sort.Strings(out.exec)
 	sort.Slice(out.deferred, func(a, b int) bool { return out.deferred[a].Env < out.deferred[b].Env })
 	return out
+}
+
+// sessionCredentialValues collects every non-empty value the composed
+// session environment carries under a model-credential name
+// (isSessionCredentialName), except the binding-identity names
+// (manifestIdentityEnvNames), whose values are not secret. partitionChildEnv
+// refuses any other entry that carries one of these values, so a model key
+// filed under a second name — a provider-native spelling a control plane
+// fans out beside the injected provider's key, say — reaches neither the
+// exec environment nor the environment section the policy extension
+// restores for pi's tools.
+func sessionCredentialValues(composed []string) map[string]struct{} {
+	values := make(map[string]struct{})
+	for _, entry := range composed {
+		i := strings.IndexByte(entry, '=')
+		if i <= 0 {
+			continue
+		}
+		name, value := entry[:i], entry[i+1:]
+		if _, identity := manifestIdentityEnvNames[name]; identity || value == "" || !isSessionCredentialName(name) {
+			continue
+		}
+		values[value] = struct{}{}
+	}
+	return values
 }
 
 // sessionChildEnv partitions the session environment against this process's

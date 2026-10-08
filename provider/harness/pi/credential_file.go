@@ -99,6 +99,19 @@ var manifestCredentialEnvNames = []string{
 	"AZURE_OPENAI_ENDPOINT",
 }
 
+// manifestIdentityEnvNames are the manifestCredentialEnvNames entries that
+// name a binding's identity (region, project, endpoint) rather than secret
+// material. They stay on the credential rail with the rest, but their values
+// are not secrets, so the value refusal (sessionCredentialValues) does not
+// reach other bindings that happen to share one: a tool's own region or
+// project setting keeps arriving.
+var manifestIdentityEnvNames = map[string]struct{}{
+	"AWS_REGION":                  {},
+	"GOOGLE_VERTEX_PROJECT_ID":    {},
+	"ANTHROPIC_VERTEX_PROJECT_ID": {},
+	"AZURE_OPENAI_ENDPOINT":       {},
+}
+
 // sessionCredential is one named credential the file carries: the env-var
 // name the value would have ridden under, and the value itself.
 type sessionCredential struct {
@@ -200,9 +213,11 @@ const workerAuthTokenEnvVar = "WORKER_AUTH_TOKEN" //nolint:gosec // G101: env-va
 
 // undeclaredSecretValueNames are Spec.Env names outside the session
 // credential rail that are known to carry secret values: the worker runtime
-// bearer above, plus the generic custom-binding key spellings a control
-// plane may use for a cell credential that is not one of pi's
-// built-in-provider vars. They are refused from the pi child in every form
+// bearer above, the generic custom-binding key spellings a control plane
+// may use for a cell credential that is not one of pi's built-in-provider
+// vars, and the provider-native key name of a model provider pi does not
+// ship, which a control plane files beside the injected provider's key.
+// They are refused from the pi child in every form
 // (childEnvRefused): neither the exec environment nor either section of the
 // credential file carries them — the credential section holds model-route
 // credentials the extension reads, and the environment section holds
@@ -213,6 +228,7 @@ var undeclaredSecretValueNames = []string{
 	workerAuthTokenEnvVar,
 	"API_KEY",
 	"CUSTOM_SECRET_KEY",
+	"META_API_KEY",
 }
 
 // writeSessionCredentialFile writes entries (the session's model
