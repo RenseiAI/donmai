@@ -707,9 +707,6 @@
         "toolPermissionFormat": "claude",
         "streamingTransport": "ndjson",
         "interactivePty": true,
-        "multiRepositoryWorkareaProtocols": [
-          "session-root-v1"
-        ],
         "noticeDelivery": "rpc-steer",
         "drives": [
           "anthropic-messages",

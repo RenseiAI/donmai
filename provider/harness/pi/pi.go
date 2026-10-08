@@ -668,14 +668,15 @@ func (p *Provider) confineSession(spec agent.Spec, layout sessionLayout, confine
 // piConfinementEnabled reports whether the session requested OS confinement
 // (ADR-2026-10-03 D5.1): the host's own configuration requires it for pi
 // (hostRequires — Options.RequireConfinement), or the session declares a
-// repository authority, whose leaves enter the executor boundary as the
-// session's writable set (mutable) and read-only leaves. Confinement
-// applies exactly when requested, never opportunistically, so the answer
-// does not depend on whether this host has a backend: a request on a host
-// without one is refused, not dropped (ensurePiConfiner). The manifest
-// attests session-root-v1 for all-mutable declarations, so admission lets
-// an authority-bearing spec through and the authority branch is the trigger
-// such a session reaches in production.
+// repository authority, whose read-only leaves need the executor boundary.
+// Confinement applies exactly when requested, never opportunistically, so
+// the answer does not depend on whether this host has a backend: a request
+// on a host without one is refused, not dropped (ensurePiConfiner).
+//
+// Today pi's manifest declares no multi-repository workarea protocol, so
+// admission refuses an authority-bearing spec before launch; the host
+// requirement is the trigger a pi session reaches in production. The
+// authority branch is kept for the day the manifest declares one.
 func piConfinementEnabled(spec agent.Spec, hostRequires bool) bool {
 	if hostRequires {
 		return true

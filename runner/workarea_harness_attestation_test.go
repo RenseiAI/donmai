@@ -24,20 +24,19 @@ type manifestAttestingProvider struct {
 
 func (p *manifestAttestingProvider) Manifest() agent.HarnessManifest { return p.manifest }
 
-// TestRunAllMutableDeclarationAdmittedOnClaudeAndPi is the revert-RED gate
-// for the session-root-v1 attestation: an all-mutable two-repository
-// declaration must provision the nested layout under each harness's real
+// TestRunAllMutableDeclarationAdmittedOnClaude is the revert-RED gate for
+// the session-root-v1 attestation: an all-mutable two-repository
+// declaration must provision the nested layout under the harness's real
 // production attestation, binding the selected leaf as the harness CWD
-// and the complete authority partition on the spec. Removing either
-// manifest's attestation makes its subtest fail with
+// and the complete authority partition on the spec. Removing the
+// manifest's attestation makes the subtest fail with
 // workarea_protocol_unsupported before provisioning.
-func TestRunAllMutableDeclarationAdmittedOnClaudeAndPi(t *testing.T) {
+func TestRunAllMutableDeclarationAdmittedOnClaude(t *testing.T) {
 	providers := []struct {
 		name     string
 		manifest agent.HarnessManifest
 	}{
 		{name: "claude", manifest: (&claudeprovider.Provider{}).Manifest()},
-		{name: "pi", manifest: piManifestForTest()},
 	}
 	for _, harness := range providers {
 		t.Run(harness.name, func(t *testing.T) {
