@@ -1124,28 +1124,44 @@ func TestPiConfinement_SecondWorkerReusesTheSelfTest(t *testing.T) {
 	t.Logf("second worker confinement setup: %s", setup.Round(time.Millisecond))
 }
 
-// TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf is the real-binary
-// negative proof behind pi's session-root-v1 attestation: the REAL pi binary
-// spawns through the production entry point with a declared repository
-// authority (mutable selected leaf, read-only context sibling), and the
-// model is driven to attempt a write into the mutable leaf, a write into the
-// read-only sibling, and shell write/rename/remove/chmod attempts there.
-// The mutable control lands; every read-only attempt is refused and leaves
-// nothing behind, the sentinel keeps its bytes and mode, and the turn still
-// completes. Skips without pi on PATH (hosted CI has none).
+// TestRealBinary_AuthorityConfinedTurnAcrossMutableAndReadOnlyLeaves is the
+// real-binary proof behind pi's session-root-v1 attestation: the REAL pi
+// binary spawns through the production entry point with a declared
+// repository authority over two mutable repositories (the selected one and
+// a second) and one read-only repository, and the model drives pi's own
+// read, write and bash tools across all three.
 //
-// RED: remove the manifest's MultiRepositoryWorkareaProtocols attestation and
-// Spawn refuses the authority-bearing spec at admission.
-func TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf(t *testing.T) {
+//   - Allowed, and their effects land: write in the selected repository;
+//     write, read and a bash write in the second mutable repository; read
+//     and a bash read of the read-only repository.
+//   - Refused, and nothing changes: a write, and shell write, rename,
+//     remove and chmod attempts, in the read-only repository; a write and a
+//     bash write of a workarea root entry; a read outside the root.
+//
+// The pi-tool refusals come from the policy engine, the shell refusals from
+// the OS confinement; the turn still completes. Skips without pi on PATH
+// (hosted CI has none).
+func TestRealBinary_AuthorityConfinedTurnAcrossMutableAndReadOnlyLeaves(t *testing.T) {
 	realBinaryAvailable(t)
 	w := newLiveWorld(t)
+	second := filepath.Join(w.root, "second")
+	if err := os.MkdirAll(second, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, second)
+	mustWrite(t, filepath.Join(second, "seed.txt"), "seed-second")
 	sentinel := filepath.Join(w.ro, "sentinel")
 	if err := os.WriteFile(sentinel, []byte("locked"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mutableControl := filepath.Join(w.mut, "control.txt")
+	mustWrite(t, filepath.Join(w.outside, "secret.txt"), "outside-secret")
+	selectedWrite := filepath.Join(w.mut, "control.txt")
+	secondWrite := filepath.Join(second, "second-write.txt")
+	secondBash := filepath.Join(second, "bash.txt")
 	roWrite := filepath.Join(w.ro, "write-attempt.txt")
 	roRenamed := filepath.Join(w.ro, "renamed")
+	rootWrite := filepath.Join(w.root, "top.txt")
+	rootBash := filepath.Join(w.root, "top-bash.txt")
 	marshal := func(v map[string]any) string {
 		raw, err := json.Marshal(v)
 		if err != nil {
@@ -1153,15 +1169,32 @@ func TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf(t *testing.T) {
 		}
 		return string(raw)
 	}
+	write := func(id, path, content string) stubToolCall {
+		return stubToolCall{ID: id, Name: "write", Arguments: marshal(map[string]any{"path": path, "content": content})}
+	}
+	read := func(id, path string) stubToolCall {
+		return stubToolCall{ID: id, Name: "read", Arguments: marshal(map[string]any{"path": path})}
+	}
+	bash := func(id, command string) stubToolCall {
+		return stubToolCall{ID: id, Name: "bash", Arguments: marshal(map[string]any{"command": command})}
+	}
 	stub := newRealBinaryStub(t, realBinaryModel)
 	stub.mu.Lock()
 	stub.responses = []stubResponse{{ToolCalls: []stubToolCall{
-		{ID: "call-mutable-control", Name: "write", Arguments: marshal(map[string]any{"path": mutableControl, "content": "mutable-control\n"})},
-		{ID: "call-ro-write", Name: "write", Arguments: marshal(map[string]any{"path": roWrite, "content": "forbidden\n"})},
-		{ID: "call-ro-shell-write", Name: "bash", Arguments: marshal(map[string]any{"command": "echo forbidden > " + strconv.Quote(roWrite)})},
-		{ID: "call-ro-shell-rename", Name: "bash", Arguments: marshal(map[string]any{"command": "mv " + strconv.Quote(sentinel) + " " + strconv.Quote(roRenamed)})},
-		{ID: "call-ro-shell-remove", Name: "bash", Arguments: marshal(map[string]any{"command": "rm -f " + strconv.Quote(sentinel)})},
-		{ID: "call-ro-shell-chmod", Name: "bash", Arguments: marshal(map[string]any{"command": "chmod 0777 " + strconv.Quote(sentinel)})},
+		write("ok-selected-write", selectedWrite, "selected-write\n"),
+		write("ok-second-write", secondWrite, "second-write\n"),
+		read("ok-second-read", filepath.Join(second, "seed.txt")),
+		bash("ok-second-bash", "echo second-bash > "+strconv.Quote(secondBash)),
+		read("ok-ro-read", sentinel),
+		bash("ok-ro-bash-read", "cat "+strconv.Quote(sentinel)),
+		write("no-ro-write", roWrite, "forbidden\n"),
+		bash("no-ro-bash-write", "echo forbidden > "+strconv.Quote(roWrite)),
+		bash("no-ro-bash-rename", "mv "+strconv.Quote(sentinel)+" "+strconv.Quote(roRenamed)),
+		bash("no-ro-bash-remove", "rm -f "+strconv.Quote(sentinel)),
+		bash("no-ro-bash-chmod", "chmod 0777 "+strconv.Quote(sentinel)),
+		write("no-root-write", rootWrite, "forbidden\n"),
+		bash("no-root-bash-write", "echo forbidden > "+strconv.Quote(rootBash)),
+		read("no-outside-read", filepath.Join(w.outside, "secret.txt")),
 	}}, {Text: "complete"}}
 	stub.mu.Unlock()
 
@@ -1170,6 +1203,7 @@ func TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf(t *testing.T) {
 	spec.SandboxEnabled = true
 	spec.SandboxLevel = agent.SandboxWorkspaceWrite
 	spec.RepositoryAuthority = w.authority()
+	spec.RepositoryAuthority.MutablePaths = []string{w.mut, second}
 	p, err := New(Options{HandshakeTimeout: 60 * time.Second})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1183,24 +1217,40 @@ func TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf(t *testing.T) {
 	if h.(*Handle).confinement == nil {
 		t.Fatal("an authority-bearing session spawned without a confinement plan")
 	}
-	_, failed := toolExecutionStreamRealBinary(t, drainToResult(t, h, 90*time.Second))
+	results := toolResultsRealBinary(t, drainToResult(t, h, 120*time.Second))
+	for id, result := range results {
+		t.Logf("%s: isError=%v content=%q", id, result.IsError, truncateForLog(result.Content))
+	}
 
-	if body, err := os.ReadFile(mutableControl); err != nil || string(body) != "mutable-control\n" {
-		t.Fatalf("mutable control = %q, %v; want the write to land", body, err)
-	}
-	if !failed["call-ro-write"] {
-		t.Error("write into the read-only sibling did not end as an error")
-	}
-	if _, err := os.Lstat(roWrite); !os.IsNotExist(err) {
-		t.Errorf("read-only write attempt had an effect: %v", err)
-	}
-	for _, id := range []string{"call-ro-shell-write", "call-ro-shell-rename", "call-ro-shell-remove", "call-ro-shell-chmod"} {
-		if !failed[id] {
-			t.Errorf("shell attempt %s against the read-only sibling did not end as an error", id)
+	for _, id := range []string{"ok-selected-write", "ok-second-write", "ok-second-read", "ok-second-bash", "ok-ro-read", "ok-ro-bash-read"} {
+		result, ok := results[id]
+		if !ok || result.IsError {
+			t.Errorf("%s: result %+v (seen %v), want success", id, result, ok)
 		}
 	}
-	if _, err := os.Lstat(roRenamed); !os.IsNotExist(err) {
-		t.Errorf("read-only rename had an effect: %v", err)
+	for _, id := range []string{"no-ro-write", "no-ro-bash-write", "no-ro-bash-rename", "no-ro-bash-remove", "no-ro-bash-chmod", "no-root-write", "no-root-bash-write", "no-outside-read"} {
+		result, ok := results[id]
+		if !ok || !result.IsError {
+			t.Errorf("%s: result %+v (seen %v), want a refusal", id, result, ok)
+		}
+	}
+	for id, want := range map[string]string{"ok-second-read": "seed-second", "ok-ro-read": "locked", "ok-ro-bash-read": "locked"} {
+		if !strings.Contains(results[id].Content, want) {
+			t.Errorf("%s content = %q, want it to carry %q", id, results[id].Content, want)
+		}
+	}
+	if strings.Contains(results["no-outside-read"].Content, "outside-secret") {
+		t.Error("the refused outside read returned the file's content")
+	}
+	for path, want := range map[string]string{selectedWrite: "selected-write\n", secondWrite: "second-write\n", secondBash: "second-bash\n"} {
+		if body, err := os.ReadFile(path); err != nil || string(body) != want {
+			t.Errorf("%s = %q, %v; want %q", path, body, err, want)
+		}
+	}
+	for _, path := range []string{roWrite, roRenamed, rootWrite, rootBash} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("refused attempt left %s behind (stat err %v)", path, err)
+		}
 	}
 	if body, err := os.ReadFile(sentinel); err != nil || string(body) != "locked" {
 		t.Fatalf("read-only sentinel = %q, %v; want it unchanged", body, err)
@@ -1210,24 +1260,27 @@ func TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf(t *testing.T) {
 	}
 }
 
-// toolExecutionStreamRealBinary flattens the tool lifecycle of a drained
-// real-binary session into the ids of calls ending in error.
-func toolExecutionStreamRealBinary(t *testing.T, events []agent.Event) ([]string, map[string]bool) {
+// toolResultsRealBinary collects the tool results of a drained real-binary
+// session by tool-use id, failing on an ErrorEvent.
+func toolResultsRealBinary(t *testing.T, events []agent.Event) map[string]agent.ToolResultEvent {
 	t.Helper()
-	failed := map[string]bool{}
-	var stream []string
+	results := map[string]agent.ToolResultEvent{}
 	for _, ev := range events {
 		switch e := ev.(type) {
-		case agent.ToolUseEvent:
-			stream = append(stream, "start "+e.ToolUseID)
 		case agent.ToolResultEvent:
-			stream = append(stream, "end "+e.ToolUseID)
-			failed[e.ToolUseID] = e.IsError
+			results[e.ToolUseID] = e
 		case agent.ErrorEvent:
 			t.Fatalf("authority-confined session ended with an ErrorEvent: %+v", e)
 		}
 	}
-	return stream, failed
+	return results
+}
+
+func truncateForLog(s string) string {
+	if len(s) > 160 {
+		return s[:160] + "…"
+	}
+	return s
 }
 
 // TestPiConfinement_InteractiveAuthoritySpawnConfinesThroughSpawn is the

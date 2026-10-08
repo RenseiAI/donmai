@@ -291,7 +291,12 @@ func TestRunInteractiveUsesSameNestedSelectedRepositoryLayout(t *testing.T) {
 type piWorkareaRunProvider struct {
 	mu       sync.Mutex
 	observed agent.Spec
+	// proof is the host proof pi's manifest needs (ProveWorkareaHost):
+	// nil stands for a host whose pi confinement self-test passed.
+	proof error
 }
+
+func (p *piWorkareaRunProvider) ProveWorkareaHost(context.Context) error { return p.proof }
 
 func (*piWorkareaRunProvider) Name() agent.ProviderName { return agent.ProviderPi }
 func (*piWorkareaRunProvider) Capabilities() agent.Capabilities {

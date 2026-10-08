@@ -711,6 +711,7 @@
           "session-root-v1"
         ],
         "repositoryAuthorityEnforcement": "isolated-read-only-v1",
+        "workareaAttestationNeedsHostProof": true,
         "noticeDelivery": "rpc-steer",
         "drives": [
           "anthropic-messages",

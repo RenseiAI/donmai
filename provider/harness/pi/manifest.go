@@ -74,16 +74,24 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// document; PTY is selected per Spawn call by Spec.Interactive != nil,
 			// never by a Transport value.
 			SupportsInteractivePTY: true,
-			// pi attests the session-root-v1 multi-repository workarea
-			// protocol with isolated-read-only-v1 enforcement: a confined
-			// session's mutable leaves stay writable while read-only
-			// leaves, the workarea root and the boundary extension are
-			// refused by the executor OS confinement (confinement.go),
-			// headless and interactive alike (confinement_live_test.go).
-			// pi does not attest read-only selected CWD: running from a
-			// read-only leaf is refused, as for codex.
-			MultiRepositoryWorkareaProtocols: []string{"session-root-v1"},
-			RepositoryAuthorityEnforcement:   "isolated-read-only-v1",
+			// pi declares the session-root-v1 multi-repository workarea
+			// protocol with isolated-read-only-v1 enforcement as a ceiling
+			// each host must prove (WorkareaAttestationNeedsHostProof): every
+			// declared pi session, all-mutable ones included, runs inside
+			// the executor OS confinement (piConfinementEnabled), whose
+			// mutable leaves stay writable while read-only leaves, the
+			// workarea root and the boundary extension are refused
+			// (confinement.go), headless and interactive alike
+			// (confinement_live_test.go). The confinement is the
+			// executor's, so a host publishes and binds this attestation
+			// only while pi's confinement self-test passes there
+			// (Provider.ProveWorkareaHost); elsewhere pi is a legacy
+			// single-repository harness. pi does not attest a read-only
+			// selected CWD: running from a read-only leaf is refused, as
+			// for codex.
+			MultiRepositoryWorkareaProtocols:  []string{"session-root-v1"},
+			RepositoryAuthorityEnforcement:    "isolated-read-only-v1",
+			WorkareaAttestationNeedsHostProof: true,
 			// `pi --mode rpc` carries an explicit steering verb on the same
 			// JSONL channel that drives the session: Handle.Inject maps to
 			// steer while a turn is in flight and follow_up while idle

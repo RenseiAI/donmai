@@ -103,6 +103,13 @@ type HarnessCaps struct {
 	// SupportsReadOnlySelectedCWD means the executor can run from a
 	// selected read-only repository without implicitly granting its CWD write.
 	SupportsReadOnlySelectedCWD bool `json:"supportsReadOnlySelectedCwd,omitempty"`
+	// WorkareaAttestationNeedsHostProof marks the three workarea fields above
+	// as a ceiling each host must prove before it publishes or binds them
+	// (ADR-2026-10-03 D1): the boundary they rest on is the executor's, not
+	// the harness's own, so it holds only where its self-test passes. The
+	// provider implements WorkareaHostProver; ProvenWorkareaAttestation is
+	// the only reader that turns the declaration into an attestation.
+	WorkareaAttestationNeedsHostProof bool `json:"workareaAttestationNeedsHostProof,omitempty"`
 
 	// NoticeDelivery declares the mechanism — if any — by which a message
 	// can be delivered INTO an already-running session on this harness.

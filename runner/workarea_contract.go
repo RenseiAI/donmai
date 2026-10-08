@@ -1,6 +1,10 @@
 package runner
 
 import (
+	"context"
+	"log/slog"
+	"time"
+
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
@@ -57,6 +61,31 @@ func resolveRepositoryWorkareaDeclaration(
 	return normalized, declaration, capabilities, nil
 }
 
+// provenWorkareaAttestation is the workarea attestation provider holds on
+// this host: its manifest's declaration, withheld when the manifest needs a
+// host proof that does not pass (agent.ProvenWorkareaAttestation). Every
+// runner reader of the workarea capabilities goes through it — the
+// registration list, the sibling-context derivation and the bind-time
+// contract check — so the three never disagree. A provider that is not a
+// harness attests nothing.
+func provenWorkareaAttestation(provider agent.Provider) agent.WorkareaAttestation {
+	harness, ok := provider.(agent.HarnessProvider)
+	if !ok {
+		return agent.WorkareaAttestation{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), workareaHostProofTimeout)
+	defer cancel()
+	attestation, withheld := agent.ProvenWorkareaAttestation(ctx, harness)
+	if withheld != nil {
+		slog.Info("runner: workarea attestation withheld on this host", "harness", harness.Manifest().Name, "reason", withheld.Error())
+	}
+	return attestation
+}
+
+// workareaHostProofTimeout bounds one workarea host proof. A proof that
+// does not finish in time withholds the attestation (fail closed).
+const workareaHostProofTimeout = 3 * time.Minute
+
 func validateRepositoryWorkarea(
 	qw QueuedWork,
 	provider agent.Provider,
@@ -71,14 +100,12 @@ func validateRepositoryWorkarea(
 	if err := normalized.ValidatePrimarySource(workarea.RepositorySource{Repository: qw.Repository, Ref: qw.Ref}); err != nil {
 		return nil, capabilities, err
 	}
-	if harness, ok := provider.(agent.HarnessProvider); ok {
-		manifest := harness.Manifest()
-		for _, protocol := range manifest.Caps.MultiRepositoryWorkareaProtocols {
-			capabilities.MultiRepositoryWorkareaProtocols = append(capabilities.MultiRepositoryWorkareaProtocols, workarea.Protocol(protocol))
-		}
-		capabilities.RepositoryAuthorityEnforcement = workarea.RepositoryAuthorityEnforcement(manifest.Caps.RepositoryAuthorityEnforcement)
-		supportsReadOnlySelectedCWD = manifest.Caps.SupportsReadOnlySelectedCWD
+	attestation := provenWorkareaAttestation(provider)
+	for _, protocol := range attestation.Protocols {
+		capabilities.MultiRepositoryWorkareaProtocols = append(capabilities.MultiRepositoryWorkareaProtocols, workarea.Protocol(protocol))
 	}
+	capabilities.RepositoryAuthorityEnforcement = workarea.RepositoryAuthorityEnforcement(attestation.Enforcement)
+	supportsReadOnlySelectedCWD = attestation.ReadOnlySelectedCWD
 	if err := capabilities.ValidateFor(normalized); err != nil {
 		return nil, capabilities, err
 	}
