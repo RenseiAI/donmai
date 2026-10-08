@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -254,29 +255,63 @@ func productionConfinementDirs() piConfinementDirs {
 	}
 }
 
-// daemonPrivatePaths resolves the daemon-private files a confined seat must
-// never read nor write: the daemon's control-token file (the live bearer
-// for the host's privileged control API) and its directory's other secrets.
-// The path is resolved exactly the way the operator's CLI resolves it — the
-// file-env override wins when absolute, else the host state home — so the
-// boundary denies the live token whatever directory holds it; this package
-// never spells a brand-specific path. Both the token file and its parent
-// directory are denied, so a sibling secret minted beside the token and a
-// token minted after the seat starts are covered too. Read in the worker
-// (supervisor) process, never by the seat: the variable is runner-only and
-// is stripped from every spawned session's environment.
-func daemonPrivatePaths() []string {
-	var out []string
-	if override := strings.TrimSpace(os.Getenv(runtimeenv.ControlTokenPathEnv)); override != "" {
-		if filepath.IsAbs(override) {
-			out = append(out, override, filepath.Dir(override))
+// daemonPrivate is what a confined seat is denied of the daemon's own
+// state: the paths it may neither read nor write (Spec.DeniedPaths) and the
+// directories it may not list (Spec.DeniedListings).
+type daemonPrivate struct {
+	paths []string
+	dirs  []string
+}
+
+// seatDaemonPrivate resolves the daemon-private paths and directories for a
+// seat whose work area is rooted at workareaRoot. The token is the daemon's
+// control-token file (the live bearer for the host's privileged control
+// API), resolved the way the operator's CLI resolves it — the file-env
+// override wins when absolute, else the host state home — so this package
+// never spells a brand-specific path. It is denied outright. Its directory
+// and the host state home hold the token beside the daemon's other files
+// and, on a default host, the per-session work areas, so they are denied a
+// listing instead of hidden: a seat working beneath them keeps working,
+// while a token minted there after the seat starts is never enumerable
+// (and, on a backend that empties the directory, never reachable). Every
+// directory between one of them and the work area is denied a listing
+// too, so the other sessions' work areas beside this one are not
+// enumerable either. Read in the worker (supervisor) process, never by the
+// seat: the override variable is runner-only, stripped from every spawned
+// session's environment.
+func seatDaemonPrivate(workareaRoot string) daemonPrivate {
+	var d daemonPrivate
+	addDir := func(dir string) {
+		if dir != "" && !slices.Contains(d.dirs, dir) {
+			d.dirs = append(d.dirs, dir)
 		}
-		return out
+	}
+	var tops []string
+	if override := strings.TrimSpace(os.Getenv(runtimeenv.ControlTokenPathEnv)); override != "" {
+		// A relative override resolves to no token at all (the daemon
+		// mints none there either), never to a guess.
+		if filepath.IsAbs(override) {
+			token := filepath.Clean(override)
+			d.paths = append(d.paths, token)
+			tops = append(tops, filepath.Dir(token))
+		}
+	} else if dir := statehome.StateDir(""); dir != "" {
+		d.paths = append(d.paths, filepath.Join(dir, controlTokenLeaf))
 	}
 	if dir := statehome.StateDir(""); dir != "" {
-		out = append(out, filepath.Join(dir, controlTokenLeaf), dir)
+		tops = append(tops, filepath.Clean(dir))
 	}
-	return out
+	root := filepath.Clean(workareaRoot)
+	for _, top := range tops {
+		addDir(top)
+		if workareaRoot == "" || !strings.HasPrefix(root, top+string(filepath.Separator)) {
+			continue
+		}
+		for dir := filepath.Dir(root); dir != top && strings.HasPrefix(dir, top+string(filepath.Separator)); dir = filepath.Dir(dir) {
+			addDir(dir)
+		}
+	}
+	return d
 }
 
 // controlTokenLeaf is the token file leaf under the host state directory.
@@ -490,13 +525,13 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 // naming the daemon control API or the credential socket is refused first,
 // before anything is written.
 //
-// The daemon's control-token file and its directory's other secrets ride
-// Spec.DeniedPaths (daemonPrivatePaths): the daemon passes the path in,
-// resolved the same way the operator's CLI resolves it, so the seat's
-// profile denies the live token whatever brand directory holds it. A
-// failure to resolve them is not fatal — an empty set confines exactly as
-// before — but a resolved path that the boundary cannot render refuses the
-// spawn: the session never runs half-denied.
+// The daemon's control-token file rides Spec.DeniedPaths and the
+// directories holding it (and the work area) Spec.DeniedListings
+// (seatDaemonPrivate): resolved the same way the operator's CLI resolves
+// the token, so the seat's boundary denies the live token whatever brand
+// directory holds it. A failure to resolve them is not fatal — an empty
+// set confines exactly as before — but a resolved path that the boundary
+// cannot render refuses the spawn: the session never runs half-denied.
 //
 // The tmp and cache directories are created through sessionStateFS, so a
 // link planted there refuses the spawn before anything is created outside.
@@ -544,15 +579,6 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 		}
 	}
 	cspec := seatSpec(spec, layout, tmpDir, caches, loopbackPorts, reads)
-	if authority := spec.RepositoryAuthority; authority != nil && authority.WorkareaRoot != "" {
-		cspec.WorkareaRoot = authority.WorkareaRoot
-		cspec.MutableLeaves = append([]string(nil), authority.MutablePaths...)
-		cspec.ReadOnlyLeaves = append([]string(nil), authority.ReadOnlyPaths...)
-	} else {
-		cwd := filepath.Clean(spec.Cwd)
-		cspec.WorkareaRoot = filepath.Dir(cwd)
-		cspec.MutableLeaves = []string{cwd}
-	}
 	if layout.extension != "" {
 		if _, err := os.Lstat(layout.extension); err == nil {
 			cspec.Protected = append(cspec.Protected, layout.extension)
@@ -565,9 +591,10 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 	return plan, nil
 }
 
-// seatSpec builds the seat confinement spec the spawner prepares.
+// seatSpec builds the seat confinement spec the spawner prepares: the
+// session, its work area and the daemon-private paths it is denied.
 func seatSpec(spec agent.Spec, layout sessionLayout, tmpDir string, caches []confinement.Cache, loopbackPorts []int, reads piReadScope) confinement.Spec {
-	return confinement.Spec{
+	cspec := confinement.Spec{
 		SessionID:   "pi-" + sessionLeafKey(spec),
 		HarnessID:   piHarnessID,
 		SessionMode: agent.PromptModeForSpec(spec),
@@ -580,13 +607,25 @@ func seatSpec(spec agent.Spec, layout sessionLayout, tmpDir string, caches []con
 		LoopbackTCPPorts: loopbackPorts,
 		ReadScope:        reads.level,
 		ReadPaths:        reads.paths,
-		DeniedPaths:      daemonPrivatePaths(),
 	}
+	if authority := spec.RepositoryAuthority; authority != nil && authority.WorkareaRoot != "" {
+		cspec.WorkareaRoot = authority.WorkareaRoot
+		cspec.MutableLeaves = append([]string(nil), authority.MutablePaths...)
+		cspec.ReadOnlyLeaves = append([]string(nil), authority.ReadOnlyPaths...)
+	} else {
+		cwd := filepath.Clean(spec.Cwd)
+		cspec.WorkareaRoot = filepath.Dir(cwd)
+		cspec.MutableLeaves = []string{cwd}
+	}
+	private := seatDaemonPrivate(cspec.WorkareaRoot)
+	cspec.DeniedPaths, cspec.DeniedListings = private.paths, private.dirs
+	return cspec
 }
 
 // confineSeatSpecForTest builds the seat spec the production entry point
-// builds, minus the workarea mapping confinePiSession adds after: the
-// DeniedPaths line under test is shared through seatSpec, not copied.
+// builds, minus the session tmp, caches and the protected extension: the
+// work area and daemon-private lines under test are shared through
+// seatSpec, not copied.
 func confineSeatSpecForTest(spec agent.Spec, layout sessionLayout, reads piReadScope) confinement.Spec {
 	return seatSpec(spec, layout, "", nil, nil, reads)
 }

@@ -445,34 +445,58 @@ func TestSessionReadScope_DeclaresWhatASeatReads(t *testing.T) {
 	}
 }
 
-// TestDaemonPrivatePaths_ResolvesTheLiveToken pins the daemon-to-seat path:
-// the override wins when absolute (with its parent directory, so sibling
-// secrets are covered); otherwise the host state home names the token leaf
-// and the state home itself. A relative override resolves to nothing rather
-// than to a guess, and the variable never reaches a spawned session's
-// environment (runner-only). The leaf spells the same file the operator's
-// CLI reads.
-func TestDaemonPrivatePaths_ResolvesTheLiveToken(t *testing.T) {
-	t.Run("override wins with its directory", func(t *testing.T) {
+// TestSeatDaemonPrivate_ResolvesTheLiveToken pins the daemon-to-seat path:
+// the token is denied outright — the override when absolute, else the host
+// state home's token leaf — and the directories holding it are denied a
+// listing: the override's directory and the state home, plus every
+// directory between the state home and a work area beneath it, so the
+// sibling work areas are not enumerable. A relative override names no
+// token rather than a guess, and the variable never reaches a spawned
+// session's environment (runner-only). The leaf spells the same file the
+// operator's CLI reads.
+func TestSeatDaemonPrivate_ResolvesTheLiveToken(t *testing.T) {
+	stateHome := func(t *testing.T) string {
+		t.Helper()
+		base, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		statehome.SetBaseHome(base)
+		t.Cleanup(statehome.ResetForTest)
+		return statehome.StateDir("")
+	}
+	t.Run("override wins, its directory and the state home unlistable", func(t *testing.T) {
+		home := stateHome(t)
 		t.Setenv(runtimeenv.ControlTokenPathEnv, "/var/lib/host/control-token")
-		got := daemonPrivatePaths()
-		if !slices.Equal(got, []string{"/var/lib/host/control-token", "/var/lib/host"}) {
-			t.Fatalf("daemonPrivatePaths = %q", got)
+		got := seatDaemonPrivate("")
+		if !slices.Equal(got.paths, []string{"/var/lib/host/control-token"}) || !slices.Equal(got.dirs, []string{"/var/lib/host", home}) {
+			t.Fatalf("seatDaemonPrivate = %+v", got)
 		}
 	})
-	t.Run("relative override resolves to nothing", func(t *testing.T) {
+	t.Run("relative override names no token", func(t *testing.T) {
+		home := stateHome(t)
 		t.Setenv(runtimeenv.ControlTokenPathEnv, "control-token")
-		if got := daemonPrivatePaths(); len(got) != 0 {
-			t.Fatalf("daemonPrivatePaths = %q, want nothing", got)
+		if got := seatDaemonPrivate(""); len(got.paths) != 0 || !slices.Equal(got.dirs, []string{home}) {
+			t.Fatalf("seatDaemonPrivate = %+v, want no token and the state home unlistable", got)
 		}
 	})
 	t.Run("state home names the token leaf", func(t *testing.T) {
+		home := stateHome(t)
 		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
-		statehome.SetBaseHome(t.TempDir())
-		t.Cleanup(statehome.ResetForTest)
-		got := daemonPrivatePaths()
-		if len(got) != 2 || filepath.Base(got[0]) != "control-token" || got[1] != filepath.Dir(got[0]) {
-			t.Fatalf("daemonPrivatePaths = %q, want the token file and its directory", got)
+		got := seatDaemonPrivate("")
+		if !slices.Equal(got.paths, []string{filepath.Join(home, "control-token")}) || !slices.Equal(got.dirs, []string{home}) {
+			t.Fatalf("seatDaemonPrivate = %+v, want the token file denied and its directory unlistable", got)
+		}
+	})
+	t.Run("a work area beneath the state home hides its siblings", func(t *testing.T) {
+		home := stateHome(t)
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
+		got := seatDaemonPrivate(filepath.Join(home, "worktrees", "s1"))
+		if !slices.Equal(got.dirs, []string{home, filepath.Join(home, "worktrees")}) {
+			t.Fatalf("seatDaemonPrivate dirs = %q, want the state home and the work-area parent", got.dirs)
+		}
+		if got := seatDaemonPrivate(filepath.Join(t.TempDir(), "elsewhere")); !slices.Equal(got.dirs, []string{home}) {
+			t.Fatalf("a work area elsewhere: dirs = %q, want the state home alone", got.dirs)
 		}
 	})
 	t.Run("runner-only", func(t *testing.T) {
@@ -503,11 +527,11 @@ func TestDaemonPrivatePaths_ResolvesTheLiveToken(t *testing.T) {
 			t.Fatal(err)
 		}
 		// The production entry point resolves the seat spec through
-		// confineSeatSpecForTest, which shares the DeniedPaths line
-		// with confinePiSession: dropping that line fails here.
+		// confineSeatSpecForTest, which shares the daemon-private lines
+		// with confinePiSession: dropping either fails here.
 		spec := confineSeatSpecForTest(agent.Spec{Cwd: mut}, layout, piReadScope{})
-		if !slices.Contains(spec.DeniedPaths, token) || !slices.Contains(spec.DeniedPaths, secretDir) {
-			t.Fatalf("seat spec denied = %q, want the live token and its directory", spec.DeniedPaths)
+		if !slices.Equal(spec.DeniedPaths, []string{token}) || !slices.Contains(spec.DeniedListings, secretDir) {
+			t.Fatalf("seat spec denied = %q, listings %q; want the live token denied and its directory unlistable", spec.DeniedPaths, spec.DeniedListings)
 		}
 	})
 }

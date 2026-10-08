@@ -36,7 +36,8 @@ type seatCheckPlan struct {
 const seatOrphanEnv = "DONMAI_CONFINEMENT_TEST_SEAT_ORPHAN"
 
 // seatCheckStep is one check: "dial" a TCP address, "get" a URL, "read" or
-// "write" a file; "signal", "ptrace" or "proc_read" a pid outside;
+// "write" a file, "list" a directory (the names land in the output);
+// "signal", "ptrace" or "proc_read" a pid outside;
 // "dial_abstract" an abstract socket; "whoami" reports the seat's pid and
 // parent pid; "foreground" checks the seat owns its terminal; "await_sigint"
 // creates its target as a ready marker and waits for a Ctrl-C; "child_tree"
@@ -116,6 +117,13 @@ func runSeatCheckStep(step seatCheckStep) seatCheckResult {
 		}
 	case "read":
 		_, err = os.ReadFile(step.Target)
+	case "list":
+		var entries []os.DirEntry
+		if entries, err = os.ReadDir(step.Target); err == nil {
+			for _, entry := range entries {
+				result.Output += entry.Name() + "\n"
+			}
+		}
 	case "write":
 		err = appendOrCreate(step.Target)
 	case "signal", "ptrace", "proc_read":
