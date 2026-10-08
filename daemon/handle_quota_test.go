@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -39,6 +40,15 @@ func postSessionUsage(t *testing.T, srv *httptest.Server, sessionID, bearer stri
 // not an httptest one).
 func postSessionUsageAt(t *testing.T, addr, sessionID, bearer string, harness string, update agent.UsageLimitsUpdate) int {
 	t.Helper()
+	_, code := postSessionUsageBody(t, addr, sessionID, bearer, harness, update)
+	return code
+}
+
+// postSessionUsageBody is postSessionUsageAt with the raw response
+// body returned for leak assertions: refused legs must carry no
+// credential bytes.
+func postSessionUsageBody(t *testing.T, addr, sessionID, bearer string, harness string, update agent.UsageLimitsUpdate) ([]byte, int) {
+	t.Helper()
 	body, err := json.Marshal(map[string]any{"harness": harness, "update": update})
 	if err != nil {
 		t.Fatalf("marshal update: %v", err)
@@ -56,7 +66,11 @@ func postSessionUsageAt(t *testing.T, addr, sessionID, bearer string, harness st
 		t.Fatalf("post usage: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return resp.StatusCode
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read usage response: %v", err)
+	}
+	return raw, resp.StatusCode
 }
 
 // quotaUpdateWindows is one sparse worker-observed update: the primary
@@ -131,8 +145,12 @@ func TestSessionUsageRoute_MergesStreamUpdate(t *testing.T) {
 }
 
 // TestSessionUsageRoute_RejectsUnknownSessionsAndHarnesses pins the
-// route's guards: unknown session ids 404 so a stray worker cannot
-// invent quota state, and an unknown harness 400s.
+// route's guards on an open-mode daemon (no control gate): unknown
+// session ids 404 so a stray worker cannot invent quota state, and
+// an unknown harness 400s. Open mode holds no credential to check,
+// so the credential leg passes trivially here; the enforced-gate
+// oracle closure (unknown answers like unauthorized) is pinned by
+// TestSessionUsageRoute_RefusesForeignAndMissingCredentials below.
 func TestSessionUsageRoute_RejectsUnknownSessionsAndHarnesses(t *testing.T) {
 	t.Parallel()
 
@@ -217,12 +235,14 @@ func TestSessionUsageRoute_SessionCredentialAcceptedUnderEnforcedGate(t *testing
 	}
 }
 
-// TestSessionUsageRoute_RefusesForeignAndMissingCredentials pins the
-// session scope: without a credential, with a wrong bearer, or with
-// another session's read credential, the update is refused before any
-// merge — and the refused POSTs leave the published snapshot exactly
-// as the probe left it. An unknown session id 404s rather than 401s,
-// so the gate never confirms or denies a session it cannot name.
+// TestSessionUsageRoute_NoSessionOracle pins the closed oracle: with
+// the control gate enforced, an unknown session id answers 401 — the
+// same status as a known session with a missing, wrong, or foreign
+// credential — so an unauthenticated caller cannot tell a real session
+// id from an unknown one. Only the operator token or the session's
+// own read credential distinguishes the two, and that caller already
+// holds a privileged fact. Responses on the refused legs carry no
+// credential bytes and no merge happens.
 func TestSessionUsageRoute_RefusesForeignAndMissingCredentials(t *testing.T) {
 	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
 		o.RequireControlToken = true
@@ -254,12 +274,29 @@ func TestSessionUsageRoute_RefusesForeignAndMissingCredentials(t *testing.T) {
 		{"missing credential", "sess-own", "", http.StatusUnauthorized},
 		{"wrong bearer", "sess-own", "wrong-bearer", http.StatusUnauthorized},
 		{"foreign session credential", "sess-own", foreignTok, http.StatusUnauthorized},
-		{"unknown session", "sess-missing", ownTok, http.StatusNotFound},
-		{"unknown session without credential", "sess-missing", "", http.StatusNotFound},
+		// An unknown id with no credential answers like a known id
+		// with none: the two are indistinguishable by status.
+		{"unknown session", "sess-missing", ownTok, http.StatusUnauthorized},
+		{"unknown session without credential", "sess-missing", "", http.StatusUnauthorized},
 	}
 	for _, tc := range cases {
 		if got := postSessionUsageAt(t, srv.Addr(), tc.session, tc.bearer, agent.UsageHarnessCodex, update); got != tc.want {
 			t.Errorf("%s: status = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+
+	// The operator token still names an unknown id 404: a caller
+	// that already holds the operator fact learns nothing new about
+	// session existence beyond what the token already grants.
+	if got := postSessionUsageAt(t, srv.Addr(), "sess-missing", testControlToken, agent.UsageHarnessCodex, update); got != http.StatusNotFound {
+		t.Errorf("unknown session with the operator token: status = %d, want 404", got)
+	}
+	// The refused legs carry no credential bytes: fetch the raw
+	// refused body and prove neither read credential appears in it.
+	for _, tc := range cases {
+		body, _ := postSessionUsageBody(t, srv.Addr(), tc.session, tc.bearer, agent.UsageHarnessCodex, update)
+		if bytes.Contains(body, []byte(ownTok)) || bytes.Contains(body, []byte(foreignTok)) {
+			t.Errorf("%s: refused response carries credential bytes: %s", tc.name, body)
 		}
 	}
 

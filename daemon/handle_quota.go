@@ -34,9 +34,13 @@ type quotaUpdateRequest struct {
 // session's own read credential naming exactly this session id — and
 // on a local runtime, the session's attempt credential, verified the
 // same way the local callbacks verify it. Anything else gets 401
-// without reaching the merge. Unknown ids 404 before the credential
-// check so the gate never confirms or denies a session it cannot
-// name; a malformed body or an unknown harness 400s. The update is
+// without reaching the merge. The credential is checked before the
+// session lookup, so an unknown id without a valid credential answers
+// 401 — the same status as a known id with a missing or wrong
+// credential — and the gate never confirms or denies the existence
+// of a session the caller cannot name. Only a caller that passes the
+// credential check reaches the existence check, where a genuinely
+// unknown id 404s; a malformed body or an unknown harness 400s. The update is
 // bounded and merge-only — windows clamp to the display range and
 // cannot touch the probe's login verdict — so a misbehaving worker
 // can skew its own rows and nothing else.
@@ -55,6 +59,16 @@ func (s *Server) handleSessionUsage(w http.ResponseWriter, r *http.Request, id s
 			return
 		}
 	} else {
+		// The credential comes before the session lookup: the 404
+		// leg would otherwise confirm or deny a session id to a
+		// caller that holds no credential for it. An unknown id
+		// presented with a valid credential still 404s below — the
+		// only 404 this route emits — while every credential
+		// failure answers 401.
+		if !s.sessionDetailAuthenticated(r, id) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid session credential"})
+			return
+		}
 		if _, ok := s.daemon.SessionDetail(id); !ok {
 			if !sessionOwnedBySpawner(s.daemon.spawner, id) {
 				writeJSON(w, http.StatusNotFound, map[string]string{
@@ -63,10 +77,6 @@ func (s *Server) handleSessionUsage(w http.ResponseWriter, r *http.Request, id s
 				})
 				return
 			}
-		}
-		if !s.sessionDetailAuthenticated(r, id) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid session credential"})
-			return
 		}
 	}
 	var req quotaUpdateRequest
