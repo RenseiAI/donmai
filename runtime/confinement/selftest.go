@@ -102,6 +102,10 @@ const (
 
 // SelfTestRecord names the backend, its version (implementation plus OS
 // build), the probe-set version, each probe's outcome and a digest (D1.2).
+// A record taken where the scope layer is missing (ScopesAvailable false
+// on Linux below ABI 6) is degraded: every probe it ran passed, but the
+// boundary it proves is partial, so Degraded names the missing layer and
+// Attestation refuses it.
 type SelfTestRecord struct {
 	Backend          BackendName               `json:"backend"`
 	BackendVersion   string                    `json:"backendVersion"`
@@ -111,8 +115,13 @@ type SelfTestRecord struct {
 	Probes           []ProbeOutcome            `json:"probes"`
 	NotProbed        []NotProbed               `json:"notProbed,omitempty"`
 	Passed           bool                      `json:"passed"`
-	TestedAt         time.Time                 `json:"testedAt"`
-	Digest           string                    `json:"digest"`
+	// Degraded names the unenforced layer when the record proves a
+	// partial boundary only (the scope layer below Landlock ABI 6).
+	// Empty means the record proves the full boundary. It is part of
+	// the digest, so a degraded record never verifies as a full one.
+	Degraded string    `json:"degraded,omitempty"`
+	TestedAt time.Time `json:"testedAt"`
+	Digest   string    `json:"digest"`
 }
 
 // Failures returns the probes that did not pass.
@@ -127,8 +136,13 @@ func (r SelfTestRecord) Failures() []ProbeOutcome {
 }
 
 // Attestation is the per-harness attestation this record supports: the
-// session modes whose spawn path passed every probe.
+// session modes whose spawn path passed every probe. A degraded record
+// (Degraded set) attests nothing: the probes passed but the boundary is
+// partial, so no spawn path is reported as confined.
 func (r SelfTestRecord) Attestation() Attestation {
+	if r.Degraded != "" {
+		return Attestation{}
+	}
 	return Attestation{
 		Backend:         r.Backend,
 		BackendVersion:  r.BackendVersion,
@@ -163,9 +177,12 @@ func (r SelfTestRecord) computeDigest() string {
 // write proxies in reach, and observes what changed. A second pass per mode
 // renders the same world under the workarea read scope and proves the read
 // allowlist: reads inside it succeed, reads and listings outside it fail. A
-// mode is attested only when every probe in it passed. The record is kept
-// for Prepare, passing or not; a failure returns the record with a typed
-// error.
+// mode is attested only when every probe in it passed — and where the scope
+// layer is missing (Linux below ABI 6) the passing record is marked
+// degraded instead of attested: the mount tree, the process namespace and
+// the filesystem rules hold, but signals and abstract sockets outside stay
+// reachable. The record is kept for Prepare, passing or not; a failure
+// returns the record with a typed error.
 func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTestRecord, error) {
 	if len(opts.ProbeCommand) == 0 {
 		return SelfTestRecord{}, errors.New("confinement: self-test needs a probe command")
@@ -242,6 +259,17 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 		}
 	}
 	record.Passed = len(record.SessionModes) == 2 && allPass(record.Probes)
+	if record.Passed {
+		// A passing record on a kernel without the scope layer proves a
+		// partial boundary only: every probe passed, but the layer that
+		// holds signals and abstract sockets is missing. Mark it so
+		// Attestation refuses it and operators see it, rather than
+		// reporting the host as confined.
+		if _, why := ScopesAvailable(); why != "" {
+			record.Degraded = why
+			record.SessionModes = nil
+		}
+	}
 	record.Digest = record.computeDigest()
 	c.store(record)
 	if cacheOK && record.Passed && refusal == nil {

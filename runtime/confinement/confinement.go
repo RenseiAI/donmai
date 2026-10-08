@@ -258,16 +258,29 @@ func (c *Confiner) SelfTestRecord() (SelfTestRecord, bool) {
 
 // Attestation returns the per-harness confinement attestation when the last
 // self-test passed in at least one session mode and is still current, or
-// false. Its session modes are exactly the spawn paths that passed.
+// false. Its session modes are exactly the spawn paths that passed. A
+// degraded record (the scope layer missing) never attests: Degraded reports
+// why instead.
 func (c *Confiner) Attestation() (Attestation, bool) {
 	record, ok := c.SelfTestRecord()
-	if !ok || len(record.SessionModes) == 0 {
+	if !ok || len(record.SessionModes) == 0 || record.Degraded != "" {
 		return Attestation{}, false
 	}
 	if err := c.checkCurrent(record); err != nil {
 		return Attestation{}, false
 	}
 	return record.Attestation(), true
+}
+
+// Degraded reports why the last self-test proves a partial boundary only,
+// or false when the record proves the full boundary (or when no record
+// exists). Operators read it from status and doctor output.
+func (c *Confiner) Degraded() (string, bool) {
+	record, ok := c.SelfTestRecord()
+	if !ok || record.Degraded == "" {
+		return "", false
+	}
+	return record.Degraded, true
 }
 
 // Plan is one prepared confinement: a rendered, written profile plus the
@@ -325,8 +338,11 @@ func (p *Plan) Release() error {
 
 // Prepare renders and writes the confinement for spec. It refuses with a
 // typed *Error when the confinement cannot be applied: no backend, a nested
-// profile, no passing or a stale self-test, an unrepresentable writable set,
-// or an unrenderable composer rule. It never returns a weaker plan. It walks
+// profile, no passing or a stale self-test, a degraded record (the scope
+// layer missing: Prepare refuses rather than run a seat the host reports
+// as confined while signals and abstract sockets stay reachable), an
+// unrepresentable writable set, or an unrenderable composer rule. It never
+// returns a weaker plan. It walks
 // the writable set once to account for hard links (D2.3), so its cost grows
 // with the number of files in the set.
 func (c *Confiner) Prepare(spec Spec) (*Plan, error) {
@@ -339,6 +355,9 @@ func (c *Confiner) Prepare(spec Spec) (*Plan, error) {
 	record, ok := c.SelfTestRecord()
 	if !ok {
 		return nil, refuse(ReasonSelfTestFailed, "no self-test has run on this host")
+	}
+	if record.Degraded != "" {
+		return nil, refuse(ReasonSelfTestFailed, "the self-test proves a partial boundary only: %s", record.Degraded)
 	}
 	if !record.Passed || !containsMode(record.SessionModes, spec.SessionMode) {
 		return nil, refuse(ReasonSelfTestFailed, "the self-test did not pass for session mode %s", spec.SessionMode)

@@ -367,6 +367,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		SessionShim:             s.daemon.SessionShimDiagnostics(),
 		ProcessPriority:         daemonProcessPriorityStatus(),
 		SeatBudget:              seatBudgetReport(s.daemon.daemonSeatBudget()),
+		Confinement:             confinementStatus(),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)
@@ -979,6 +980,7 @@ func (s *Server) handleDoctor(w http.ResponseWriter, _ *http.Request) {
 	if priority := daemonProcessPriorityStatus(); priority != nil {
 		report["processPriority"] = priority
 	}
+	report["confinement"] = confinementStatus()
 	writeJSON(w, http.StatusOK, report)
 }
 

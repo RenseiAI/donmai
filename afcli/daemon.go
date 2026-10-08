@@ -429,6 +429,7 @@ func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error
 		{"Projects:", formatStatusProjectIDs(r)},
 		{"Process priority:", formatProcessPriorityStatus(r.ProcessPriority)},
 		{"Seat budget:", formatSeatBudgetStatus(r.SeatBudget)},
+		{"Confinement:", formatConfinementStatus(r.Confinement)},
 		{"Timestamp:", r.Timestamp},
 	}
 	for _, row := range rows {
@@ -486,6 +487,33 @@ func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 		value += " — " + status.Detail
 	}
 	return value
+}
+
+// formatConfinementStatus renders the seat-boundary posture for the status
+// table: attested, degraded with the missing layer, or "not reported"
+// against an older daemon. A host with no backend reads as "none" — the
+// honest shape, not an omission an operator could misread as confined.
+func formatConfinementStatus(status *afclient.ConfinementStatus) string {
+	if status == nil {
+		return "not reported"
+	}
+	if status.Degraded != "" {
+		value := "degraded — " + status.Degraded
+		if status.Detail != "" {
+			value += " — " + status.Detail
+		}
+		return value
+	}
+	if status.Backend == "" {
+		return "none"
+	}
+	if status.Attested {
+		if status.Detail != "" {
+			return "attested (" + status.Backend + ") — " + status.Detail
+		}
+		return "attested (" + status.Backend + ")"
+	}
+	return status.Backend
 }
 
 // formatInstalledProcessPriority is the install report line for the mode that

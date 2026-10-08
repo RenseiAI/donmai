@@ -927,8 +927,11 @@ func (fx *fixture) wideningLinux() error {
 		fx.add(classWidening, false, probeStep{ID: "widen.reenter_backend", Op: opNestedBoundary, Path: reenter, Path2: launcher, Label: touch}, existsEffect(reenter))
 	}
 
-	// An abstract unix socket lives in the network namespace the boundary
-	// shares; only the kernel's abstract-socket scope closes it.
+	// The signal probe stays live on every kernel: the process namespace
+	// hides the decoy, so a signal from inside must refuse whether or not
+	// the signal scope exists. Only the abstract socket — reachable through
+	// the shared network namespace without its scope — is recorded as
+	// unholdable where the scope layer is missing.
 	if scoped, why := abstractSocketsScoped(); !scoped {
 		fx.notProbe("widen.abstract_socket", NotProbedKernel, why)
 	} else {

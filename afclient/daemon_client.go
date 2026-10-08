@@ -99,8 +99,33 @@ type DaemonStatusResponse struct {
 	// posture each seat runs under (enforced | best-effort | none) with
 	// the values. Nil against a daemon older than this field.
 	SeatBudget *SeatBudgetStatus `json:"seatBudget,omitempty"`
+	// Confinement is the host's OS-confinement posture: which backend the
+	// seat boundary uses, whether its self-test proves the full boundary,
+	// and why not when it proves a partial one. Nil against a daemon
+	// older than this field.
+	Confinement *ConfinementStatus `json:"confinement,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
+}
+
+// ConfinementStatus is the additive OS-confinement posture for status and
+// doctor readers. Secret-free: it names the backend and the missing layer,
+// never paths, digests or probe values.
+type ConfinementStatus struct {
+	// Backend names the seat boundary backend (for example the Linux
+	// mount-namespace backend). Empty where no backend exists for this
+	// host.
+	Backend string `json:"backend,omitempty"`
+	// Attested reports whether the last self-test proves the full
+	// boundary on this host.
+	Attested bool `json:"attested"`
+	// Degraded names the unenforced layer when the self-test proves a
+	// partial boundary only (the scope layer on a kernel below the
+	// floor). Empty when the boundary is whole.
+	Degraded string `json:"degraded,omitempty"`
+	// Detail is the operator line: the kernel floor for a full boundary
+	// and what stays reachable below it.
+	Detail string `json:"detail,omitempty"`
 }
 
 // SeatBudgetStatus is the additive per-seat resource budget report: the

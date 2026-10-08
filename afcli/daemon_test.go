@@ -1463,6 +1463,41 @@ func TestFormatSeatBudgetStatus(t *testing.T) {
 	}
 }
 
+// TestFormatConfinementStatus pins the confinement row: attested with the
+// backend, degraded with the missing layer and the floor, none where no
+// backend exists, not reported against an older daemon.
+func TestFormatConfinementStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status *afclient.ConfinementStatus
+		want   string
+	}{
+		{name: "daemon does not report it", status: nil, want: "not reported"},
+		{name: "no backend", status: &afclient.ConfinementStatus{}, want: "none"},
+		{name: "attested", status: &afclient.ConfinementStatus{Backend: "linux-mount-namespace", Attested: true}, want: "attested (linux-mount-namespace)"},
+		{
+			name:   "attested with floor",
+			status: &afclient.ConfinementStatus{Backend: "linux-mount-namespace", Attested: true, Detail: "seat boundary holds at Linux 6.12 or newer"},
+			want:   "attested (linux-mount-namespace) — seat boundary holds at Linux 6.12 or newer",
+		},
+		{
+			name:   "degraded",
+			status: &afclient.ConfinementStatus{Backend: "linux-mount-namespace", Degraded: "the scope layer is unenforced: Landlock ABI 5 has no signal or abstract-socket scope (ABI 6, Linux 6.12, needed)", Detail: "seat boundary is partial below Linux 6.12"},
+			want:   "degraded — the scope layer is unenforced: Landlock ABI 5 has no signal or abstract-socket scope (ABI 6, Linux 6.12, needed) — seat boundary is partial below Linux 6.12",
+		},
+		{name: "backend without attestation", status: &afclient.ConfinementStatus{Backend: "macos-seatbelt"}, want: "macos-seatbelt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatConfinementStatus(tc.status); got != tc.want {
+				t.Errorf("formatConfinementStatus() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestWriteDaemonStatsTable exercises the stats renderer.
 func TestWriteDaemonStatsTable(t *testing.T) {
 	t.Parallel()
