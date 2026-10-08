@@ -486,9 +486,16 @@ func TestConsumedRecoveryHeartbeatReleasesBlockedV3ProgressAfterCarrierActive(t 
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-consumed-barrier", SessionID: "session-consumed-barrier"}
+	// The barrier harness is the shell-free echo child: its in-process echo
+	// clearing replaces the `stty -echo` the old shell fixture ran. The
+	// `ack:` answer below is what the post-active assertions match on.
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 9,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		Spec:         ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()},
 		WorkareaPath: filepath.Join(dir, "workarea"),
 	})
 	if err != nil {
@@ -862,19 +869,13 @@ func runDaemonShimHelper() int {
 	// publishes, which is what makes the adoption-time workarea comparison a real
 	// check rather than a value compared against itself (§D7).
 	workarea := filepath.Join(os.Getenv("DONMAI_TEST_DAEMON_SESSION_SHIM_WORKAREA_PARENT"), launch.Identity.SessionID)
-	// The echo harness must be THIS test binary: os.Executable resolves it even
-	// when the helper was itself launched through a path the child could not
-	// re-resolve (a relative argv[0], a deleted build path), where os.Args[0]
-	// would name a binary the spawn cannot exec.
-	echoPath, err := os.Executable()
+	echoArgv, err := daemonShimEchoCommand()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "daemon shim helper: executable:", err)
 		return 1
 	}
-	//nolint:gosec // G204: echoPath is this test binary; echo mode is selected by env
-	echoArgv := []string{echoPath, "-test.run", "TestMain"}
 	shim, err := sessionshim.StartFromEnv(launch,
-		ptyhost.Spec{Command: echoArgv, Env: []string{interactiveHarnessEchoEnv + "=1"}}, workarea)
+		ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()}, workarea)
 	if err != nil {
 		shimPTYFailureDiagnostic(err)
 		fmt.Fprintln(os.Stderr, "daemon shim helper: start:", err)
@@ -887,7 +888,9 @@ func runDaemonShimHelper() int {
 // runDaemonShimEcho is the harness the shim helper runs under its PTY: it
 // reads terminal input lines and answers each one with an `ack:` echo, which
 // is the round trip every shim-spawn test asserts through the adopted
-// connection.
+// connection. daemonShimEchoCommand builds its argv for direct use in any
+// ptyhost.Spec: the same test binary re-executed in this role, with no
+// shell in the path.
 //
 // It runs as this same test binary re-executed (see runDaemonShimHelper)
 // rather than as /bin/sh -c <script>, so the helper spawns one fewer process
@@ -899,6 +902,23 @@ func runDaemonShimHelper() int {
 // the old shell fixture — which never ran stty -echo in this interactive
 // shape — not an equivalent of it. The tests match on the `ack:` answer,
 // which only this harness produces, so they hold either way.
+func daemonShimEchoCommand() ([]string, error) {
+	// os.Executable resolves THIS test binary even when the caller was
+	// itself launched through a path the child could not re-resolve (a
+	// relative argv[0], a deleted build path), where os.Args[0] would name
+	// a binary the spawn cannot exec.
+	echoPath, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	//nolint:gosec // G204: echoPath is this test binary; echo mode is selected by env
+	return []string{echoPath, "-test.run", "TestMain"}, nil
+}
+
+func daemonShimEchoEnv() []string {
+	return []string{interactiveHarnessEchoEnv + "=1"}
+}
+
 func runDaemonShimEcho() int {
 	disableShimEchoTerminalEcho()
 	reader := bufio.NewReader(os.Stdin)

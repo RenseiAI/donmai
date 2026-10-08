@@ -125,13 +125,24 @@ func Spawn(spec Spec) (*Session, error) {
 	}
 	cols, rows := spec.cols(), spec.rows()
 
-	cmd := exec.Command(spec.Command[0], spec.Command[1:]...) //nolint:gosec // caller-supplied argv is the session's own command
-	if spec.Cwd != "" {
-		cmd.Dir = spec.Cwd
+	// The command factory builds a fresh *exec.Cmd per attempt: os/exec
+	// forbids calling Start twice on one Cmd even when the first call
+	// failed, so the retry path inside startPTYWithRetry must never reuse
+	// a Cmd across attempts.
+	parentEnv := os.Environ()
+	makeCmd := func() *exec.Cmd {
+		cmd := exec.Command(spec.Command[0], spec.Command[1:]...) //nolint:gosec // caller-supplied argv is the session's own command
+		if spec.Cwd != "" {
+			cmd.Dir = spec.Cwd
+		}
+		cmd.Env = composeEnv(parentEnv, spec.Env)
+		return cmd
 	}
-	cmd.Env = composeEnv(os.Environ(), spec.Env)
 
-	ptmx, err := startPTYWithRetry(cmd, &pty.Winsize{Rows: rows, Cols: cols}, spec.logger())
+	var cmd *exec.Cmd
+	ptmx, err := startPTYWithRetry(makeCmd, &pty.Winsize{Rows: rows, Cols: cols}, spec.logger(), func(started *exec.Cmd) {
+		cmd = started
+	})
 	if err != nil {
 		return nil, err
 	}

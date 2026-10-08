@@ -46,22 +46,45 @@ func isTransientSpawnError(err error) bool {
 	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EAGAIN)
 }
 
-// startPTYWithRetry runs cmd under a PTY sized ws, retrying transiently
-// refused starts. It returns the master side; cmd.Process is set on success
-// exactly as pty.StartWithSize leaves it.
+// startPTYWithRetry runs makeCmd under a PTY sized ws, retrying transiently
+// refused starts. It returns the master side; the started command's Process
+// is set on success exactly as pty.StartWithSize leaves it. The started
+// command is reported through onStart so Spawn can keep teardown ownership
+// of it (the Session must signal and Wait the exact *exec.Cmd that started).
 //
-// A fresh PTY pair is opened per attempt: the master/slave from a refused
-// attempt is closed before the next one is opened, so attempts never share
-// terminal state and a refused attempt leaks no fd. The slave is closed in
-// the parent once the child has it (creack/pty's own contract); a refused
-// child never reaches exec, so there is no stray process to reap — the
-// kernel reaps the failed fork itself.
-func startPTYWithRetry(cmd *exec.Cmd, ws *pty.Winsize, logger *slog.Logger) (*os.File, error) {
+// A fresh *exec.Cmd starts every attempt: os/exec marks a Cmd started on the
+// first Start call even when that call fails ("It is an error to call Start
+// twice even if the first call did not create a process"), so reusing one
+// Cmd across attempts would deterministically fail the retry with
+// "exec: already started" and mask the transient refusal it was built to
+// absorb. A fresh PTY pair is likewise opened per attempt: the master/slave
+// from a refused attempt is closed before the next one is opened, so
+// attempts never share terminal state and a refused attempt leaks no fd.
+// The slave is closed in the parent once the child has it (creack/pty's own
+// contract); a refused child never reaches exec, so there is no stray
+// process to reap — the kernel reaps the failed fork itself.
+func startPTYWithRetry(makeCmd func() *exec.Cmd, ws *pty.Winsize, logger *slog.Logger, onStart func(*exec.Cmd)) (*os.File, error) {
+	return startPTYWithStarter(makeCmd, logger, func(cmd *exec.Cmd) (*os.File, error) {
+		return pty.StartWithSize(cmd, ws)
+	}, onStart)
+}
+
+// startPTYWithStarter is the injectable core of startPTYWithRetry: starter
+// performs one PTY start of cmd. Production passes pty.StartWithSize bound
+// to the spawn's winsize; tests pass a fault-injecting starter that refuses
+// transiently before delegating to the real one. The retry contract is
+// identical either way: every attempt starts a FRESH *exec.Cmd from
+// makeCmd, never a reused one.
+func startPTYWithStarter(makeCmd func() *exec.Cmd, logger *slog.Logger, starter func(*exec.Cmd) (*os.File, error), onStart func(*exec.Cmd)) (*os.File, error) {
 	var err error
 	var ptmx *os.File
 	for attempt := 1; ; attempt++ {
-		ptmx, err = pty.StartWithSize(cmd, ws)
+		cmd := makeCmd()
+		ptmx, err = starter(cmd)
 		if err == nil {
+			if onStart != nil {
+				onStart(cmd)
+			}
 			if attempt > 1 && logger != nil {
 				logger.Warn("ptyhost: pty start refused transiently, retry succeeded",
 					"attempt", attempt, "command", cmd.Args)
