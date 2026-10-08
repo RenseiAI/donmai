@@ -813,6 +813,12 @@ const interactiveHarnessEchoEnv = "DONMAI_TEST_DAEMON_SESSION_SHIM_ECHO"
 // its own PTY: this same binary re-executed, answering each terminal input
 // line with an `ack:` echo.
 func TestMain(m *testing.M) {
+	if os.Getenv(wakeHarnessEnv) == "1" {
+		os.Exit(runDaemonShimWakeHarness())
+	}
+	if os.Getenv(batchEmitHarnessEnv) == "1" {
+		os.Exit(runDaemonShimBatchEmit())
+	}
 	if os.Getenv(interactiveHarnessEchoEnv) == "1" {
 		os.Exit(runDaemonShimEcho())
 	}
@@ -902,6 +908,23 @@ func runDaemonShimHelper() int {
 // the old shell fixture — which never ran stty -echo in this interactive
 // shape — not an equivalent of it. The tests match on the `ack:` answer,
 // which only this harness produces, so they hold either way.
+// daemonShimEchoSpec returns the shell-free PTY harness spec every shim
+// suite test uses: this test binary re-executed in echo mode
+// (runDaemonShimEcho), which reads terminal input lines and answers each
+// one with an `ack:` echo. It exists so a test that needs only a live,
+// answering child never names a shell binary: on a runner pool whose
+// confinement refuses the shell exec the spawn fails with
+// `fork/exec /bin/sh: operation not permitted` before any assertion runs.
+// A harness that merely sleeps also avoids the shell, but only this echo
+// form proves the PTY round trip is live through the adopted connection.
+func daemonShimEchoSpec() (ptyhost.Spec, error) {
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		return ptyhost.Spec{}, err
+	}
+	return ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()}, nil
+}
+
 func daemonShimEchoCommand() ([]string, error) {
 	// os.Executable resolves THIS test binary even when the caller was
 	// itself launched through a path the child could not re-resolve (a

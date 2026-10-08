@@ -18,13 +18,20 @@ import (
 // churn (CI and container stress runs, roughly 1 in a few hundred launches):
 // Go reports the child-side errno of the whole fork → setsid → TIOCSCTTY →
 // execve sequence as one opaque error, so the failing step cannot be told
-// apart from outside, and every step in that sequence is transient-capable
-// under load (process-table and PTY-index pressure resolve in milliseconds).
+// apart from outside. The churn reading is a heuristic, not a proof: the
+// same EPERM is also the persistent answer of a pool whose confinement
+// profile forbids the exec outright (see isTransientSpawnError), and such a
+// refusal fails here after exactly spawnRetryAttempts attempts — about
+// 50ms of backoff — with the attempt count in the error, not silently.
 // Production shims start real harnesses through this same path, so a refusal
 // here is a launch failure, not only a test flake — and a launch failure that
 // clears on the next attempt a second later is a retryable one. The bound
 // keeps a genuinely broken command (missing binary, bad argv) failing fast:
 // only the transient errnos below retry, everything else returns at once.
+// A refusal that survives the retries is diagnosed where it happens: the
+// shim helper's failure hook (logShimPTYFailure, Linux) records the errno,
+// session ids, rlimits, and seccomp/cgroup state alongside the error, so
+// the next triage can tell pressure apart from confinement.
 const spawnRetryAttempts = 3
 
 // spawnRetryDelay spaces the retry attempts. Unloaded spawns take single-digit
@@ -37,11 +44,19 @@ const spawnRetryDelay = 25 * time.Millisecond
 // back transiently: EAGAIN is fork's documented answer to process-count and
 // RLIMIT_NPROC pressure, and EPERM is what the same pressure returns through
 // the session/controlling-terminal steps (setsid, TIOCSCTTY) and through a
-// container filter answering an otherwise-allowed call under load — all
-// states of the launcher, not of the command, and all gone on retry. A
-// permanent failure (ENOENT, EACCES, ENOEXEC — the binary is missing,
-// non-executable, or not runnable here) never retries: retrying those would
-// only slow down an answer that cannot change.
+// container filter answering an otherwise-allowed call under load — states
+// of the launcher, not of the command, and usually gone on retry. The
+// reading is deliberately heuristic: the same EPERM is also the persistent
+// answer of a pool whose confinement profile forbids the exec (the
+// confinement hypothesis for the observed flake was never ruled out — no
+// deterministic local reproduction exists). That case is NOT absorbed: it
+// retries spawnRetryAttempts times and then fails with the attempt count in
+// the error, and the shim helper's failure hook (logShimPTYFailure, Linux)
+// records the errno, rlimits, and seccomp/cgroup state, which is what
+// distinguishes pressure from confinement on the next triage. A permanent
+// failure (ENOENT, EACCES, ENOEXEC — the binary is missing, non-executable,
+// or not runnable here) never retries: retrying those would only slow down
+// an answer that cannot change.
 func isTransientSpawnError(err error) bool {
 	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EAGAIN)
 }
