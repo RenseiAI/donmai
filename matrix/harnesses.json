@@ -104,6 +104,9 @@
         "toolPermissionFormat": "claude",
         "streamingTransport": "ndjson",
         "interactivePty": true,
+        "multiRepositoryWorkareaProtocols": [
+          "session-root-v1"
+        ],
         "noticeDelivery": "hook",
         "drives": [
           "anthropic-messages"

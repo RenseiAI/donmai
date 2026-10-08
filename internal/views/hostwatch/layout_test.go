@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/tui-components/theme"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestSplitPaneHeights_DefaultFiftyFifty(t *testing.T) {
@@ -108,6 +109,51 @@ func TestTruncateWidth_CJK(t *testing.T) {
 	}
 	if got := truncateWidth("abcdef", 0); got != "" {
 		t.Errorf("zero budget returns empty, got %q", got)
+	}
+}
+
+// TestTruncateWidth_Graphemes: emoji with modifiers and joiners are one
+// cluster each — truncation never splits one or misjudges its width.
+func TestTruncateWidth_Graphemes(t *testing.T) {
+	tests := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"ab👍🏽cd", 5, "ab👍🏽…"},
+		{"x👩‍💻yz", 4, "x👩‍💻…"},
+		{"ok", 2, "ok"},
+	}
+	for _, tc := range tests {
+		got := truncateWidth(tc.in, tc.n)
+		if got != tc.want || ansi.StringWidth(got) > tc.n {
+			t.Errorf("truncateWidth(%q,%d)=%q (%d cells), want %q", tc.in, tc.n, got, ansi.StringWidth(got), tc.want)
+		}
+	}
+}
+
+// TestModel_HeaderShowsHostSlots: the header carries the host's occupied
+// and total session slots after the queue, and drops them before the queue
+// (but after uptime and version) when narrowing.
+func TestModel_HeaderShowsHostSlots(t *testing.T) {
+	m := New(Options{Plain: true, HostLabel: "studio-test"})
+	m.counters = Counters{Running: 3, HostActive: 9, MaxSessions: 64, QueueDepth: 1, UptimeSeconds: 60, Version: "1.2.3"}
+	m.width = 120
+	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1   slots 9/64   uptime 1m   v1.2.3") {
+		t.Errorf("wide header lacks host slots: %q", out)
+	}
+	m.width = 48
+	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1   slots 9/64") || strings.Contains(out, "uptime") {
+		t.Errorf("slots must outlast uptime/version: %q", out)
+	}
+	m.width = 36
+	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1") || strings.Contains(out, "slots") {
+		t.Errorf("narrow header keeps the queue before slots: %q", out)
+	}
+	m.counters.MaxSessions = 0 // an older daemon without capacity
+	m.width = 120
+	if out := m.renderHeader(); strings.Contains(out, "slots") {
+		t.Errorf("unknown capacity must not render as slots: %q", out)
 	}
 }
 
@@ -268,11 +314,12 @@ func TestRenderGrid_TinyTerminalCompactList(t *testing.T) {
 	if !strings.Contains(out, "ENG-1") || !strings.Contains(out, "ENG-2") {
 		t.Errorf("compact list must keep issue ids, got:\n%s", out)
 	}
-	// At minCardWidth-1 the fallback engages; at minCardWidth cards render.
-	if got := renderGrid(tm, cards, 0, 0, minCardWidth-1, 0, true, now); strings.Contains(got, "elapsed ") {
+	// At minCardWidth-1 the fallback engages (one line per session); at
+	// minCardWidth full cards render (their activity row appears).
+	if got := renderGrid(tm, cards, 0, 0, minCardWidth-1, 0, true, now); strings.Contains(got, "activity not reported") || displayLines(got) != len(cards) {
 		t.Errorf("below min width should be compact, got:\n%s", got)
 	}
-	if got := renderGrid(tm, cards, 0, 0, minCardWidth, 0, true, now); !strings.Contains(got, "elapsed unknown") {
+	if got := renderGrid(tm, cards, 0, 0, minCardWidth, 0, true, now); !strings.Contains(got, "activity not reported") {
 		t.Errorf("at min width full cards should render, got:\n%s", got)
 	}
 }
@@ -301,19 +348,21 @@ func TestRenderCard_SelectedBorder(t *testing.T) {
 	tm := theme.DefaultTheme()
 	now := time.Now()
 	c := SessionCard{SessionID: "s1", IssueIdentifier: "ENG-1", WorkType: "development", DaemonState: "running"}
-	sel := renderCard(tm, c, 0, true, false, now)
-	unsel := renderCard(tm, c, 0, false, false, now)
-	if sel == unsel {
-		t.Error("selected card must render distinctly from unselected")
-	}
-	// Selected ring corners present on all four sides.
-	for _, want := range []string{"╭", "╮", "╰", "╯"} {
+	sel := ansi.Strip(renderCard(tm, c, 0, true, false, now, 40))
+	unsel := ansi.Strip(renderCard(tm, c, 0, false, false, now, 40))
+	// Selection reads without color: a heavy frame and a ▸ marker.
+	for _, want := range []string{"┏", "┓", "┗", "┛", "▸"} {
 		if !strings.Contains(sel, want) {
-			t.Errorf("selected card should carry a full border ring (missing %q):\n%s", want, sel)
+			t.Errorf("selected card missing %q:\n%s", want, sel)
 		}
 	}
-	if strings.Contains(unsel, "╭") {
-		t.Errorf("unselected card should keep the single left bar, got:\n%s", unsel)
+	for _, want := range []string{"╭", "╮", "╰", "╯"} {
+		if !strings.Contains(unsel, want) {
+			t.Errorf("unselected card missing %q:\n%s", want, unsel)
+		}
+	}
+	if strings.Contains(unsel, "▸") {
+		t.Errorf("unselected card must not carry the selection marker:\n%s", unsel)
 	}
 }
 

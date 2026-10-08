@@ -938,7 +938,24 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 	return handle, true, nil
 }
 
+// resolveProjectForSpecLocked admits a spec against the machine's project
+// allowlist: the session's project (resolveSessionProjectLocked), then every
+// entry of its repository declaration (checkDeclarationRepositoriesLocked).
 func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectConfig, error) {
+	project, err := s.resolveSessionProjectLocked(spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkDeclarationRepositoriesLocked(spec, project.ID); err != nil {
+		return nil, err
+	}
+	return project, nil
+}
+
+// resolveSessionProjectLocked resolves the project a spec runs under from its
+// project id and singular repository fields. Every success returns a project
+// whose ID is the session's project.
+func (s *WorkerSpawner) resolveSessionProjectLocked(spec SessionSpec) (*ProjectConfig, error) {
 	if spec.ProjectID != "" {
 		if !s.isProjectAllowedLocked(spec.ProjectID) {
 			return nil, fmt.Errorf("project %q is not allowed", spec.ProjectID)
@@ -978,6 +995,62 @@ func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectC
 		return nil, fmt.Errorf("project %q is not allowed", project.ID)
 	}
 	return project, nil
+}
+
+// checkDeclarationRepositoriesLocked extends admission to every entry of an
+// additive repository declaration, so a declaration cannot carry a
+// repository past the checks the singular repository passes. Each declared
+// source must be the location of a repository configured for the session's
+// own project (projectID), and that project must be enabled on this machine.
+// An entry configured only under another project is refused even when that
+// project is enabled: the session was admitted for one project, and the
+// owner's consent is per project. Every entry is checked, the one that
+// repeats the singular repository included, and only by location
+// (sameRepositoryLocation): the runner clones the declared source exactly
+// as written, so a project id or a bare name never stands in for one.
+func (s *WorkerSpawner) checkDeclarationRepositoriesLocked(spec SessionSpec, projectID string) error {
+	if spec.RepositoryDeclaration == nil {
+		return nil
+	}
+	for i, declared := range spec.RepositoryDeclaration.Repositories {
+		source := declared.Source.Repository
+		if strings.TrimSpace(source) == "" {
+			return fmt.Errorf("declared repository %d has no source", i)
+		}
+		owner := s.findDeclaredRepositoryLocked(source, projectID)
+		if owner == nil {
+			return fmt.Errorf("repository %q is not configured for project %q", source, projectID)
+		}
+		if !s.isProjectAllowedLocked(owner.ID) {
+			return fmt.Errorf("project %q is not allowed", owner.ID)
+		}
+		if owner.ID != projectID {
+			return fmt.Errorf("repository %q is configured for project %q, not for the session's project %q", source, owner.ID, projectID)
+		}
+	}
+	return nil
+}
+
+// findDeclaredRepositoryLocked returns the configured entry whose repository
+// is the location source names, preferring an entry of projectID, or nil when
+// no configured repository is that location.
+func (s *WorkerSpawner) findDeclaredRepositoryLocked(source, projectID string) *ProjectConfig {
+	var other *ProjectConfig
+	for _, projects := range [][]ProjectConfig{s.opts.Projects, s.extraProjects} {
+		for i := range projects {
+			project := &projects[i]
+			if !sameRepositoryLocation(project.Repository, source) {
+				continue
+			}
+			if project.ID == projectID {
+				return project
+			}
+			if other == nil {
+				other = project
+			}
+		}
+	}
+	return other
 }
 
 func (s *WorkerSpawner) findPrimaryProjectRepositoryLocked(projectID string) *ProjectConfig {
@@ -1062,21 +1135,6 @@ func (s *WorkerSpawner) findProjectLocked(repository string) *ProjectConfig {
 		if p := matchProject(&s.extraProjects[i], repository); p != nil {
 			return p
 		}
-	}
-	return nil
-}
-
-// matchProject returns p if its ID or Repository fields match repository, or
-// nil if neither matches. The platform sends spec.Repository as the Linear
-// project slug (e.g. "smoke-alpha"), which doesn't match the GitHub repo name
-// in p.Repository (e.g. ".../rensei-smokes-alpha"). Match by p.ID as well so
-// operators can express the link via the allowlist entry's id. (REN-NEW)
-func matchProject(p *ProjectConfig, repository string) *ProjectConfig {
-	if p.Repository == repository ||
-		p.ID == repository ||
-		strings.HasSuffix(repository, "/"+p.Repository) ||
-		strings.HasSuffix(p.Repository, "/"+repository) {
-		return p
 	}
 	return nil
 }

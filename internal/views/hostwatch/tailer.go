@@ -137,7 +137,15 @@ type Tailer struct {
 	fileInfo      os.FileInfo
 	awaitRunFence bool
 	openFile      func(string) (*os.File, error) // test-local stat/open barrier; nil uses os.Open
+	// attachModTime is the journal's modification time when a metric
+	// tailer attached to bytes this run already wrote: the true time of the
+	// run's last journal append before the watcher started. Zero otherwise.
+	attachModTime time.Time
 }
+
+// maxEventsPerPoll bounds one continuous tailer Poll so a long backlog is
+// replayed in slices rather than in one blocking read.
+const maxEventsPerPoll = 256
 
 // NewMetricTailer replays only the current run's journal bytes for metrics,
 // then follows appends. Unknown run boundaries start at EOF to avoid
@@ -152,9 +160,23 @@ func NewMetricTailer(sessionID, path string, startOffset *int64, now func() time
 		t.primed = true
 		if startOffset != nil && *startOffset >= 0 && *startOffset <= size {
 			t.offset = *startOffset
+			if *startOffset < size {
+				// The journal is append-only within a run, so its mtime is
+				// when this run last wrote an event.
+				t.attachModTime = info.ModTime()
+			}
 		}
 	}
 	return t
+}
+
+// AttachModTime returns the journal's modification time at attach when the
+// current run had already written events, else zero. It is the honest last
+// output time of a session whose earlier events the watcher only replays.
+func (t *Tailer) AttachModTime() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.attachModTime
 }
 
 // NewTailer constructs a Tailer for the events.jsonl at path, attributing
@@ -349,7 +371,7 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 						t.done = true
 						return out, nil
 					}
-					if t.continuous && len(out) >= 256 {
+					if t.continuous && len(out) >= maxEventsPerPoll {
 						return out, nil
 					}
 				}

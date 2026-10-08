@@ -918,6 +918,14 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		// credentialed detail), so serve the redacted form.
 		for i := range handles {
 			handles[i].Repository = redactRepositoryURL(handles[i].Repository)
+			// The issue identifier is known from admission, before the
+			// runner writes any state; project it so a local reader can
+			// label the session from the start.
+			if handles[i].IssueIdentifier == "" {
+				if detail, ok := s.daemon.SessionDetail(handles[i].SessionID); ok && detail != nil {
+					handles[i].IssueIdentifier = detail.IssueIdentifier
+				}
+			}
 		}
 		writeJSON(w, http.StatusOK, handles)
 	case http.MethodPost:

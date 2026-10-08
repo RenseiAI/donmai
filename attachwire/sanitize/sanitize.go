@@ -1,6 +1,12 @@
 package sanitize
 
-import "bytes"
+import (
+	"bytes"
+	"encoding/base64"
+	"regexp"
+	"strings"
+	"unicode/utf8"
+)
 
 // Named byte constants for the control characters the parser recognizes.
 const (
@@ -69,6 +75,19 @@ type Options struct {
 	// still stripped from the byte stream; the callback lets a viewer OPTIONALLY
 	// show a capped title chip without ever retitling its own window (§9).
 	OnTitle func(title string)
+	// OnClipboard, when non-nil, is invoked with the decoded text each time an
+	// OSC 52 clipboard SET (ESC ] 52 ; Pc ; <base64> ST) is stripped. The
+	// sequence itself never reaches the output; the callback lets a viewer
+	// offer the text to its own clipboard under its own policy (for example,
+	// only for the input-control holder, right after their own input). It is
+	// never invoked for a query (Pd "?"), a clear (empty Pd), an unknown
+	// selection target, invalid base64, or text that is not valid UTF-8. The
+	// hold cap bounds the size: a set longer than the cap is stripped whole
+	// without a callback. Control characters other than HT, LF and CR are
+	// removed from the text, then one trailing line break is dropped; a set
+	// left empty is not offered. Format characters (bidi, zero-width, a BOM)
+	// are kept, so a viewer's preview must render them visibly.
+	OnClipboard func(text string)
 }
 
 // parser state.
@@ -104,6 +123,7 @@ type Sanitizer struct {
 	sixelMax  int
 	stripLink bool
 	onTitle   func(string)
+	onClip    func(string)
 
 	st       state
 	pending  []byte  // buffered bytes of the current sequence (incl. introducer)
@@ -115,6 +135,12 @@ type Sanitizer struct {
 	sawEsc   bool    // inside a string: saw ESC, expecting '\' to complete ST
 	utf8Rem  int     // UTF-8 continuation bytes still expected in ground
 	utf8Buf  []byte  // partial multibyte UTF-8 rune held until complete
+
+	// UTF-8 tracking inside a string body. A continuation byte can carry the
+	// value of a C1 control (0x9C is both ST and the middle byte of U+2733);
+	// strRem/strLead keep such a byte payload, as in ground.
+	strRem  int  // UTF-8 continuation bytes still expected in the string body
+	strLead byte // lead byte of the rune being completed in the string body
 }
 
 // New returns a Sanitizer with the frozen reference defaults.
@@ -128,6 +154,7 @@ func NewWithOptions(opts Options) *Sanitizer {
 		sixelMax:  opts.SixelMaxBytes,
 		stripLink: opts.StripHyperlinks,
 		onTitle:   opts.OnTitle,
+		onClip:    opts.OnClipboard,
 	}
 	if s.holdMax <= 0 {
 		s.holdMax = DefaultHoldMaxBytes
@@ -148,6 +175,7 @@ func (s *Sanitizer) Reset() {
 	s.sawEsc = false
 	s.utf8Rem = 0
 	s.utf8Buf = s.utf8Buf[:0]
+	s.strRem = 0
 	s.introLen = 0
 	s.curCap = 0
 }
@@ -208,6 +236,15 @@ func (s *Sanitizer) stepGround(b byte, out *[]byte) bool {
 	// its own, so it can never absorb an unrelated following byte on a re-scan.
 	if s.utf8Rem > 0 {
 		if b >= 0x80 && b <= 0xBF {
+			if s.utf8Buf[0] == 0xC2 && b <= 0x9F {
+				// U+0080..U+009F is a C1 control in UTF-8 form. A UTF-8
+				// terminal decodes it and acts on it exactly as on the raw
+				// 8-bit control (U+009B starts a CSI, so C2 9B 6n is a cursor
+				// position request). Strip it, as a stray raw C1 is stripped.
+				s.utf8Buf = s.utf8Buf[:0]
+				s.utf8Rem = 0
+				return true
+			}
 			s.utf8Buf = append(s.utf8Buf, b)
 			s.utf8Rem--
 			if s.utf8Rem == 0 {
@@ -267,18 +304,28 @@ func (s *Sanitizer) stepGround(b byte, out *[]byte) bool {
 	// high byte (lone continuation 0xA0-0xBF, invalid lead 0xC0/0xC1/0xF5-0xFF)
 	// is invalid UTF-8 and is dropped. Dropping — rather than passing a lone
 	// invalid byte — keeps the output well-formed and the filter idempotent.
-	switch {
-	case b >= 0xC2 && b <= 0xDF:
-		s.utf8Rem = 1
-	case b >= 0xE0 && b <= 0xEF:
-		s.utf8Rem = 2
-	case b >= 0xF0 && b <= 0xF4:
-		s.utf8Rem = 3
-	default:
+	n := utf8Trail(b)
+	if n == 0 {
 		return true // invalid lead / lone continuation — strip
 	}
+	s.utf8Rem = n
 	s.utf8Buf = append(s.utf8Buf[:0], b)
 	return true
+}
+
+// utf8Trail returns how many continuation bytes follow the UTF-8 lead byte b,
+// or 0 when b is not a valid lead byte.
+func utf8Trail(b byte) int {
+	switch {
+	case b >= 0xC2 && b <= 0xDF:
+		return 1
+	case b >= 0xE0 && b <= 0xEF:
+		return 2
+	case b >= 0xF0 && b <= 0xF4:
+		return 3
+	default:
+		return 0
+	}
 }
 
 // --- escape -----------------------------------------------------------------
@@ -352,6 +399,12 @@ func (s *Sanitizer) stepEscInt(b byte, out *[]byte) bool {
 		}
 		return true
 	case b >= 0x30 && b <= 0x7E: // final: charset designation, DECALN, S7C1T… — pass
+		if b == 'G' && len(s.pending) == 2 && s.pending[1] == ' ' {
+			// S8C1T: the terminal would send its replies with 8-bit C1
+			// introducers, which reply detectors that expect ESC miss.
+			s.st = stGround
+			return true
+		}
 		*out = append(*out, s.pending...)
 		*out = append(*out, b)
 		s.st = stGround
@@ -383,8 +436,9 @@ func (s *Sanitizer) stepCSI(b byte, out *[]byte) bool {
 	case b >= 0x20 && b <= 0x2F: // intermediate bytes
 		s.pending = append(s.pending, b)
 	case b >= 0x40 && b <= 0x7E: // final byte — classify
-		if csiPasses(s.pending[s.introLen:], b) {
-			*out = append(*out, s.pending...)
+		if content, ok := csiRewrite(s.pending[s.introLen:], b); ok {
+			*out = append(*out, s.pending[:s.introLen]...)
+			*out = append(*out, content...)
 			*out = append(*out, b)
 		}
 		s.st = stGround
@@ -449,12 +503,113 @@ func csiPasses(content []byte, final byte) bool {
 	return true
 }
 
+// replyModes are DEC private modes whose only effect is to make the terminal
+// write reports on its input by itself: ?2048 (in-band resize reports) and
+// ?2031 (colour-scheme change reports). A viewer must never be asked to
+// write on its input (§9 governing invariant), so setting them is stripped;
+// resetting them passes and is harmless.
+var replyModes = map[int]bool{2031: true, 2048: true}
+
+// csiRewrite extends csiPasses with the reply-triggering forms that need the
+// parameters to decide: a DECSET of a reply mode (removed from the parameter
+// list, and the sequence dropped when nothing is left), the DECANM reset into
+// VT52 mode (?2l), the kitty keyboard flags query (CSI ? u), the
+// modifier-options query (CSI ? Pp m), XTSMGRAPHICS (CSI ? … S), the DEC
+// locator enable, select and request sequences (CSI … ' z, ' {, ' |),
+// DECREQTPARM (CSI Ps x), DECRQCRA (CSI … * y), DECRQPSR (CSI Ps $ w),
+// DECRQTSR (CSI Ps $ u) and DECRQUPSS (CSI & u). It returns the content to
+// emit and whether the sequence passes at all.
+func csiRewrite(content []byte, final byte) ([]byte, bool) {
+	if !csiPasses(content, final) {
+		return nil, false
+	}
+	private := len(content) > 0 && content[0] == '?'
+	intermediates := csiIntermediates(content)
+	switch {
+	case private && (final == 'u' || final == 'm'):
+		return nil, false // kitty keyboard / modifier-options query
+	case private && final == 'S':
+		return nil, false // XTSMGRAPHICS query
+	case intermediates == "'" && (final == 'z' || final == '{' || final == '|'):
+		return nil, false // DEC locator: enable, select events, request position
+	case final == 'x' && !private && intermediates == "":
+		return nil, false // DECREQTPARM
+	case intermediates == "*" && final == 'y':
+		return nil, false // DECRQCRA
+	case intermediates == "$" && (final == 'w' || final == 'u'):
+		return nil, false // DECRQPSR, DECRQTSR
+	case intermediates == "&" && final == 'u':
+		return nil, false // DECRQUPSS
+	case private && final == 'h':
+		return filterPrivateModes(content, replyModes)
+	case private && final == 'l':
+		return filterPrivateModes(content, vt52Modes)
+	}
+	return content, true
+}
+
+// vt52Modes are DEC private modes whose RESET leaves ANSI mode: ?2 (DECANM)
+// switches the terminal to VT52 keys and replies, which no viewer models.
+var vt52Modes = map[int]bool{2: true}
+
+// filterPrivateModes removes the listed modes from a DEC private mode
+// sequence. When any is removed, empty fields are dropped too and the
+// sequence is stripped when nothing is left, so every port emits one
+// canonical form; a sequence with none of the modes passes verbatim.
+func filterPrivateModes(content []byte, drop map[int]bool) ([]byte, bool) {
+	var kept []byte
+	dropped := false
+	for _, field := range bytes.Split(content[1:], []byte{';'}) {
+		if n, ok := leadingDigits(field); ok && drop[n] {
+			dropped = true
+			continue
+		}
+		if len(field) == 0 {
+			continue
+		}
+		if len(kept) > 0 {
+			kept = append(kept, ';')
+		}
+		kept = append(kept, field...)
+	}
+	if !dropped {
+		return content, true
+	}
+	if len(kept) == 0 {
+		return nil, false
+	}
+	return append([]byte{'?'}, kept...), true
+}
+
+// csiIntermediates returns the intermediate bytes (0x20-0x2F) of a CSI's
+// parameter/intermediate content.
+func csiIntermediates(content []byte) string {
+	for i, c := range content {
+		if c >= 0x20 && c <= 0x2F {
+			return string(content[i:])
+		}
+	}
+	return ""
+}
+
+// leadingDigits parses the leading decimal digits of a parameter field
+// ("2048" or "2048:1").
+func leadingDigits(field []byte) (int, bool) {
+	n, i := 0, 0
+	for i < len(field) && field[i] >= '0' && field[i] <= '9' && n < 1<<20 {
+		n = n*10 + int(field[i]-'0')
+		i++
+	}
+	return n, i > 0
+}
+
 // --- DCS header -------------------------------------------------------------
 
 func (s *Sanitizer) beginDCS(introducer byte) {
 	s.st = stDCS
 	s.pending = append(s.pending[:0], introducer)
 	s.introLen = len(s.pending)
+	s.strRem = 0
 }
 
 func (s *Sanitizer) stepDCS(b byte, _ *[]byte) bool {
@@ -479,6 +634,7 @@ func (s *Sanitizer) stepDCS(b byte, _ *[]byte) bool {
 		return true
 	default:
 		s.dropStringUntilST() // malformed header — strip until ST
+		s.strRem, s.strLead = utf8Trail(b), b
 		return true
 	}
 	if len(s.pending) > s.holdMax {
@@ -492,8 +648,7 @@ func (s *Sanitizer) stepDCS(b byte, _ *[]byte) bool {
 // string (DECUDK, DECRQSS, or any unenumerated DCS — §9 default strip).
 func (s *Sanitizer) classifyDCS(final byte) {
 	header := s.pending[s.introLen:]
-	hasDollar := bytes.IndexByte(header, '$') >= 0
-	if final == 'q' && !hasDollar {
+	if final == 'q' && sixelParams(header[:len(header)-1]) {
 		// Sixel graphics: pass, size-capped. Keep buffering the body.
 		s.st = stStr
 		s.kind = kDCS
@@ -503,8 +658,22 @@ func (s *Sanitizer) classifyDCS(final byte) {
 		s.curCap = s.sixelMax
 		return
 	}
-	// DECUDK ('|'), DECRQSS ('$' 'q'), or anything else — strip.
+	// DECUDK ('|'), DECRQSS ('$' 'q'), XTGETTCAP ('+' 'q'), or anything else
+	// — strip.
 	s.dropStringUntilST()
+}
+
+// sixelParams reports whether a DCS header before the final q is the Sixel
+// introducer's parameter list: digits and ';' only, no private marker and no
+// intermediate byte. Every other DCS q (XTGETTCAP "+q", DECRQSS "$q") makes
+// the terminal reply and is stripped.
+func sixelParams(header []byte) bool {
+	for _, c := range header {
+		if (c < '0' || c > '9') && c != ';' {
+			return false
+		}
+	}
+	return true
 }
 
 // --- string body (OSC / Sixel-DCS / APC / PM / SOS) -------------------------
@@ -533,6 +702,7 @@ func (s *Sanitizer) enterStr(kind strKind, oscBEL bool) {
 	s.kind = kind
 	s.oscBEL = oscBEL
 	s.sawEsc = false
+	s.strRem = 0
 	switch kind {
 	case kOSC:
 		s.drop = false
@@ -552,7 +722,8 @@ func (s *Sanitizer) dropStringUntilST() {
 	s.drop = true
 	s.sawEsc = false
 	s.pending = s.pending[:0]
-	// oscBEL/kind retain whatever terminator acceptance the sequence had.
+	// oscBEL/kind retain whatever terminator acceptance the sequence had, and
+	// strRem keeps tracking a rune the cap split.
 }
 
 func (s *Sanitizer) stepStr(b byte, out *[]byte) bool {
@@ -566,6 +737,30 @@ func (s *Sanitizer) stepStr(b byte, out *[]byte) bool {
 		s.st = stEsc
 		s.pending = append(s.pending[:0], esc)
 		return false // re-dispatch b in stEsc
+	}
+
+	// Mid-rune: a continuation byte is payload even when its value is a C1
+	// control. Claude Code titles its terminal "✳ <session name>", and the
+	// middle byte of ✳ (E2 9C B3) is 0x9C. Read as ST, it ended the title early
+	// and the rest of the title was rendered as text at the cursor, which sits
+	// in the prompt input.
+	if s.strRem > 0 {
+		if b >= 0x80 && b <= 0xBF {
+			if s.strLead == 0xC2 && b <= 0x9F {
+				// U+0080..U+009F is a C1 control in UTF-8 form. A UTF-8
+				// terminal leaves the string here (U+009C is ST), so the
+				// following bytes are not inert payload: strip the string and
+				// sanitize the rest from ground.
+				s.st = stGround
+				s.drop = false
+				s.strRem = 0
+				return true
+			}
+			s.strRem--
+			s.strBody(b)
+			return true
+		}
+		s.strRem = 0 // invalid continuation: b is dispatched as a fresh byte
 	}
 
 	switch {
@@ -584,14 +779,21 @@ func (s *Sanitizer) stepStr(b byte, out *[]byte) bool {
 		return true
 	}
 
-	// Body byte.
-	if !s.drop {
-		s.pending = append(s.pending, b)
-		if len(s.pending) > s.curCap {
-			s.dropStringUntilST() // over cap — strip whole and resync (§9)
-		}
-	}
+	s.strRem, s.strLead = utf8Trail(b), b
+	s.strBody(b)
 	return true
+}
+
+// strBody holds one payload byte of the current string, stripping the whole
+// string once it exceeds its cap.
+func (s *Sanitizer) strBody(b byte) {
+	if s.drop {
+		return
+	}
+	s.pending = append(s.pending, b)
+	if len(s.pending) > s.curCap {
+		s.dropStringUntilST() // over cap — strip whole and resync (§9)
+	}
 }
 
 // finishStr terminates the current string body. term is the terminator byte(s)
@@ -607,8 +809,7 @@ func (s *Sanitizer) finishStr(out *[]byte, term []byte) {
 	}
 	switch s.kind {
 	case kDCS: // Sixel — pass
-		*out = append(*out, s.pending...)
-		*out = append(*out, term...)
+		s.emitString(out, term)
 	case kOSC:
 		s.finishOSC(out, term)
 	default:
@@ -616,13 +817,38 @@ func (s *Sanitizer) finishStr(out *[]byte, term []byte) {
 	}
 }
 
+// emitString writes a passed string sequence in 7-bit form. An 8-bit
+// introducer (0x9D OSC, 0x90 DCS) becomes its ESC form and an 8-bit ST (0x9C)
+// becomes ESC '\'. A UTF-8 terminal never reads a raw 0x9C as ST: it would keep
+// the string open and swallow the text that follows, so a later '?' turns a
+// colour set into a colour query that the terminal answers on input. Emitting
+// 7-bit forms makes the terminal agree with the sanitizer on where the string
+// starts and ends.
+func (s *Sanitizer) emitString(out *[]byte, term []byte) {
+	body := s.pending
+	if s.introLen == 1 {
+		switch s.pending[0] {
+		case c1OSC:
+			*out = append(*out, esc, ']')
+		case c1DCS:
+			*out = append(*out, esc, 'P')
+		}
+		body = s.pending[1:]
+	}
+	*out = append(*out, body...)
+	if len(term) == 1 && term[0] == c1ST {
+		*out = append(*out, esc, '\\')
+		return
+	}
+	*out = append(*out, term...)
+}
+
 func (s *Sanitizer) finishOSC(out *[]byte, term []byte) {
 	content := s.pending[s.introLen:]
 	disp, titleStart := classifyOSC(content, s.stripLink)
 	switch disp {
 	case oscPass:
-		*out = append(*out, s.pending...)
-		*out = append(*out, term...)
+		s.emitString(out, term)
 	case oscTitle:
 		if s.onTitle != nil {
 			title := ""
@@ -633,7 +859,12 @@ func (s *Sanitizer) finishOSC(out *[]byte, term []byte) {
 		}
 		// neutralize: stripped from the stream regardless of the callback.
 	case oscStrip:
-		// stripped
+		// stripped; an OSC 52 set is still offered to the clipboard hook.
+		if s.onClip != nil {
+			if text, ok := DecodeClipboardSet(content); ok {
+				s.onClip(text)
+			}
+		}
 	}
 }
 
@@ -697,4 +928,65 @@ func leadingOSCNumber(content []byte) (val, nlen int, ok bool) {
 		v = v*10 + int(c-'0')
 	}
 	return v, i, true
+}
+
+var clipboardSet = regexp.MustCompile(`^52;[cpqs0-7]*;([A-Za-z0-9+/]*={0,2})$`)
+
+// DecodeClipboardSet decodes the text of an OSC 52 clipboard SET from an OSC
+// body ("52;Pc;Pd", introducer and terminator excluded). It reports false for
+// anything that is not a set of valid UTF-8 text: a query (Pd "?"), a clear
+// (empty Pd), an unknown selection target, invalid base64 (padded base64 must
+// be complete), or a text left empty. Control characters other than HT, LF and
+// CR are removed from the text, then one trailing line break is dropped.
+func DecodeClipboardSet(content []byte) (string, bool) {
+	m := clipboardSet.FindSubmatch(content)
+	if m == nil || len(m[1]) == 0 {
+		return "", false
+	}
+	data := string(m[1])
+	// Padded base64 must be complete (a length that is a multiple of 4);
+	// unpadded base64 is accepted as is. This is the browser's forgiving
+	// base64, so every port decodes the same payloads.
+	enc := base64.RawStdEncoding
+	if strings.Contains(data, "=") {
+		enc = base64.StdEncoding
+	}
+	raw, err := enc.DecodeString(data)
+	if err != nil || !utf8.Valid(raw) {
+		return "", false
+	}
+	text := strings.Map(func(r rune) rune {
+		if r == ht || r == lf || r == cr {
+			return r
+		}
+		if r < 0x20 || (r >= del && r <= 0x9F) {
+			return -1
+		}
+		return r
+	}, string(raw))
+	// One trailing line break is dropped: a copy-on-select rarely wants it,
+	// and it is what makes a pasted command run at once in a shell without
+	// bracketed paste. A copy that is only controls or one line break is not
+	// offered, so it can never clear the clipboard.
+	switch {
+	case strings.HasSuffix(text, "\r\n"):
+		text = text[:len(text)-2]
+	case strings.HasSuffix(text, "\n"), strings.HasSuffix(text, "\r"):
+		text = text[:len(text)-1]
+	}
+	if text == "" {
+		return "", false
+	}
+	return text, true
+}
+
+// ClipboardSequence encodes text as an OSC 52 clipboard SET for a viewer that
+// forwards a clipboard write to its own terminal: ESC ] 52 ; c ; <base64>
+// ESC \. The terminal's own OSC 52 policy then decides whether to honour it.
+func ClipboardSequence(text string) []byte {
+	enc := base64.StdEncoding.EncodeToString([]byte(text))
+	out := make([]byte, 0, len(enc)+9)
+	out = append(out, esc, ']', '5', '2', ';', 'c', ';')
+	out = append(out, enc...)
+	return append(out, esc, '\\')
 }

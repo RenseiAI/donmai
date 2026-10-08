@@ -74,10 +74,17 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 			"never affects the daemon or any running agent.\n\n" +
 			"With no --project/--all, the scope auto-detects from the current repo's git\n" +
 			"remote (the \"one tab per project\" ergonomic). --all shows every session on the\n" +
-			"host, grouped by project.\n\n" +
-			"The header leads with the host; session cards flow across the full width\n" +
-			"and share it 50/50 with the merged stream by default. [ and ] move the\n" +
-			"split, 0 resets it, and the ratio survives terminal resizes.",
+			"host.\n\n" +
+			"The header leads with the host, then the sessions in scope, queue depth,\n" +
+			"the host's occupied/total session slots, uptime and version. Session cards\n" +
+			"flow across the full width in equal-size columns, each showing the issue and\n" +
+			"title, project and work type, model and harness, state with elapsed time\n" +
+			"(plus turns and cost when the harness reports them), and the last activity.\n" +
+			"Unreported values read unknown, never zero.\n\n" +
+			"Keys: up/down or j/k select a card; enter swaps the stream for the selected\n" +
+			"session's full detail and esc returns; [ and ] move the cards/stream split\n" +
+			"(50/50 by default), 0 resets it, and the ratio survives terminal resizes;\n" +
+			"f pauses or resumes the stream, g jumps to its tail; q quits.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg := afclient.DefaultDaemonConfig()
@@ -112,7 +119,7 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 		},
 	}
 	cmd.Flags().StringVar(&projectFlag, "project", "", "Scope to a project/repo (default: auto-detect from CWD git remote)")
-	cmd.Flags().BoolVar(&allFlag, "all", false, "Show every session on this host, grouped by project")
+	cmd.Flags().BoolVar(&allFlag, "all", false, "Show every session on this host")
 	cmd.Flags().BoolVar(&replayFlag, "replay", false, "Include history from each session's events.jsonl (scroll-back)")
 	cmd.Flags().BoolVar(&plainFlag, "plain", false, "Plain (no color / box) output for non-TTY / CI")
 	cmd.Flags().StringVar(&daemonURL, "daemon-url", "", "Daemon control URL (default: $DONMAI_DAEMON_URL or http://127.0.0.1:7734)")

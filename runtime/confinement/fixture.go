@@ -36,6 +36,9 @@ const (
 	// classEgress marks the outbound-TCP probes a backend that declares
 	// loopback egress open must let through (see loopbackEgressDeclarer).
 	classEgress = "egress"
+	// classDaemonPrivate probes are held by the daemon-private denies, which
+	// render in every read scope: they stay refused with reads open.
+	classDaemonPrivate = "daemon_private"
 )
 
 // probeCacheEnv is the cache variable the self-test binds, standing in for a
@@ -68,20 +71,34 @@ type harnessStep struct {
 
 // fixture is one session mode's probe world: a workarea with a mutable and a
 // read-only leaf, harness state with a protected artifact inside it, session
-// tmp and cache, decoys outside the set, and the write proxies in reach. The
-// same world serves the read-scope pass (readSteps), which runs under the
+// tmp and cache, decoys outside the set, daemon-private secrets standing in
+// for the host state (a minted control token beside a sibling secret, in a
+// daemon-private directory that holds the whole world the way a host state
+// home holds the per-session work areas), and the write proxies in reach.
+// The same world serves the read-scope pass (readSteps), which runs under the
 // read scope with a declared read path (rp) outside the set.
 type fixture struct {
 	dir, ws, meta, mut, git, state, ext, ro, rom, tmp, cache, out, rp string
-	tag                                                               string
-	steps                                                             []harnessStep
-	readSteps                                                         []harnessStep
-	cleanups                                                          []func()
-	listener                                                          net.Listener
-	accepts                                                           atomic.Int32
-	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                          net.Listener
-	tcpOpenPort, tcpClosedPort                                        int
-	tcpAccepts                                                        atomic.Int32
+	// daemonSecrets holds the daemon-private decoys: a minted token file
+	// (Spec.DeniedPaths) and a sibling secret beside it, directly in the
+	// fixture directory, which is denied its listing (Spec.DeniedListings)
+	// while the work area beneath it keeps working, plus a second token
+	// nested inside the writable set (harness state) the way the resolver
+	// keeps a denied path inside the set denied instead of refusing the
+	// spawn.
+	// The nested one is the executing pin for the daemon-private write
+	// deny: the blanket write deny cannot cover anything inside the
+	// writable set, so only that deny holds it.
+	daemonFile, daemonSibling, daemonNested, daemonNestedFile string
+	tag                                                       string
+	steps                                                     []harnessStep
+	readSteps                                                 []harnessStep
+	cleanups                                                  []func()
+	listener                                                  net.Listener
+	accepts                                                   atomic.Int32
+	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                  net.Listener
+	tcpOpenPort, tcpClosedPort                                int
+	tcpAccepts                                                atomic.Int32
 	// mounted records whether the mount probe got a volume over the
 	// read-only leaf; settle takes it before detaching.
 	mounted bool
@@ -153,6 +170,33 @@ func newFixture(dir string, mode agent.PromptSessionMode, host fixtureHost) (fx 
 		if err := seed(path); err != nil {
 			return nil, err
 		}
+	}
+	// Daemon-private secrets: a minted token file and a sibling secret
+	// directly in the fixture directory, the way a host state home holds
+	// the control token beside the per-session work areas. The token is
+	// denied outright and the directory its listing, through the
+	// production DeniedPaths and DeniedListings path, so every positive
+	// control below also proves a work area beneath a daemon-private
+	// directory keeps working. The token is seeded before the boundary
+	// renders so both the live rendering and the loose canonicalization
+	// (which must also cover a token minted after the seat starts) are
+	// judged. dir stands in for the real host state home, so the probe
+	// never touches operator state.
+	fx.daemonFile = filepath.Join(dir, "control-token")
+	fx.daemonSibling = filepath.Join(dir, "sibling-secret")
+	if err := os.WriteFile(fx.daemonFile, []byte("sentinel-control-token\n"), 0o600); err != nil { //nolint:gosec // G306: fixture secret.
+		return nil, fmt.Errorf("confinement: fixture: daemon secrets: %w", err)
+	}
+	if err := seed(fx.daemonSibling); err != nil {
+		return nil, err
+	}
+	// The nested token lives inside the writable set (harness state),
+	// so the blanket write deny cannot cover it: only the
+	// daemon-private write deny holds it.
+	fx.daemonNested = filepath.Join(fx.state, "daemon-state")
+	fx.daemonNestedFile = filepath.Join(fx.daemonNested, "control-token")
+	if err := os.MkdirAll(fx.daemonNested, 0o700); err != nil {
+		return nil, fmt.Errorf("confinement: fixture: daemon secrets: %w", err)
 	}
 
 	// Positive controls first: without them a profile that denies
@@ -232,6 +276,9 @@ func newFixture(dir string, mode agent.PromptSessionMode, host fixtureHost) (fx 
 	if err := fx.protected(); err != nil {
 		return nil, err
 	}
+	if err := fx.daemonSecrets(); err != nil {
+		return nil, err
+	}
 	if err := fx.widening(shared); err != nil {
 		return nil, err
 	}
@@ -266,6 +313,8 @@ func (fx *fixture) spec(mode agent.PromptSessionMode) Spec {
 		Caches:           []Cache{{Env: probeCacheEnv, Dir: fx.cache}},
 		ReadOnlyLeaves:   []string{fx.ro, fx.rom},
 		Protected:        []string{fx.ext},
+		DeniedPaths:      []string{fx.daemonFile, fx.daemonNestedFile, fx.daemonNested},
+		DeniedListings:   []string{fx.dir},
 		LoopbackTCPPorts: []int{fx.tcpOpenPort},
 	}
 }
@@ -707,6 +756,65 @@ func (fx *fixture) protected() error {
 	fx.add(classProtected, false, probeStep{ID: "protected.create", Op: opCreate, Path: at("n")}, existsEffect(at("n")))
 	fx.add(classProtected, false, probeStep{ID: "protected.remove", Op: opRemove, Path: at("rm")}, func(stepResult) bool { return !exists(at("rm")) })
 	fx.add(classProtected, false, probeStep{ID: "protected.chmod", Op: opChmod, Path: at("ch")}, modeEffect(at("ch"), 0o644))
+	return nil
+}
+
+// daemonSecrets adds the probes for the daemon-private paths and directory,
+// in both session modes. With reads open (the write pass) the token refuses
+// every read — contents, an open, its metadata — and the fixture directory
+// that holds it refuses a listing, while every positive control, all of
+// them beneath that directory, still works. Under the read scope the same
+// reads refuse, and so does a read of a second token nested inside the
+// writable set, which the session's read allowlist covers: only a
+// daemon-private deny rendered after the allowlist holds it. Writes,
+// creates and permission changes refuse too; the nested token's write is
+// held by the daemon-private write deny alone, since the blanket write deny
+// cannot cover anything inside the writable set. Writes are judged by
+// effect on disk, so a backend that merely hides the error string still
+// fails. The sibling secret beside the token is held by the blanket rules
+// (a listing deny does not hide a named file), so its probes stay in their
+// classes.
+func (fx *fixture) daemonSecrets() error {
+	reported := func(res stepResult) bool { return res.Err == "" }
+	// The token holds a sentinel, not the decoy content: changedEffect
+	// compares against the decoy, so the probes below judge against the
+	// exact bytes each operation would leave.
+	tokenChanged := func(stepResult) bool {
+		raw, err := os.ReadFile(fx.daemonFile) //nolint:gosec // G304: fixture path.
+		return err != nil || string(raw) != "sentinel-control-token\n"
+	}
+	// Reads with reads open: the daemon-private denies render in every
+	// read scope.
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.token.read", Op: opRead, Path: fx.daemonFile}, reported)
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.token.open", Op: opOpen, Path: fx.daemonFile}, reported)
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.token.stat", Op: opStat, Path: fx.daemonFile}, reported)
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.dir.list", Op: opList, Path: fx.dir}, reported)
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.nested.read", Op: opRead, Path: fx.daemonNestedFile}, reported)
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.token.write", Op: opWrite, Path: fx.daemonFile}, tokenChanged)
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.token.chmod", Op: opChmod, Path: fx.daemonFile}, modeEffect(fx.daemonFile, 0o600))
+	siblingNew := filepath.Join(filepath.Dir(fx.daemonSibling), "planted")
+	fx.add(classOutside, false, probeStep{ID: "daemon.sibling.create", Op: opCreate, Path: siblingNew}, existsEffect(siblingNew))
+	// The nested token keeps its sentinel bytes and the planted sibling
+	// never lands. The nested file must exist before the boundary
+	// renders: resolution needs nothing on disk (loose
+	// canonicalization), but the passes must judge a read and a write
+	// that would otherwise land.
+	if err := os.WriteFile(fx.daemonNestedFile, []byte("sentinel-nested-token\n"), 0o600); err != nil { //nolint:gosec // G306: fixture secret.
+		return fmt.Errorf("confinement: fixture: daemon secrets: %w", err)
+	}
+	nestedChanged := func(stepResult) bool {
+		raw, err := os.ReadFile(fx.daemonNestedFile) //nolint:gosec // G304: fixture path.
+		return err != nil || string(raw) != "sentinel-nested-token\n"
+	}
+	nestedNew := filepath.Join(fx.daemonNested, "planted")
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.nested.write", Op: opWrite, Path: fx.daemonNestedFile}, nestedChanged)
+	fx.add(classDaemonPrivate, false, probeStep{ID: "daemon.nested.create", Op: opCreate, Path: nestedNew}, existsEffect(nestedNew))
+	// Under the read scope.
+	fx.addRead(classDaemonPrivate, false, probeStep{ID: "read.outside.daemon_token.file", Op: opRead, Path: fx.daemonFile}, reported)
+	fx.addRead(classDaemonPrivate, false, probeStep{ID: "read.outside.daemon_token.open", Op: opOpen, Path: fx.daemonFile}, reported)
+	fx.addRead(classDaemonPrivate, false, probeStep{ID: "read.outside.daemon_token.list", Op: opList, Path: fx.dir}, reported)
+	fx.addRead(classDaemonPrivate, false, probeStep{ID: "read.daemon_nested.file", Op: opRead, Path: fx.daemonNestedFile}, reported)
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.daemon_sibling.file", Op: opRead, Path: fx.daemonSibling}, reported)
 	return nil
 }
 

@@ -21,8 +21,9 @@ import (
 // mountNamespaceProfileVersion is the Linux mount-namespace backend's
 // implementation version. It is part of the backend version, so a self-test
 // record taken under an older launcher, mount-tree shape or Landlock stage
-// is stale.
-const mountNamespaceProfileVersion = "mount-namespace-v5"
+// is stale. v6 hides the daemon-private paths and empties the
+// daemon-private directories.
+const mountNamespaceProfileVersion = "mount-namespace-v6"
 
 // DefaultBackend returns the confinement backend for the running OS: the
 // Linux mount-namespace backend here.
@@ -475,8 +476,11 @@ var mountNamespaceResolverBinds = []string{
 //  1. a tmpfs root hides everything no bind names;
 //  2. read-only binds reveal the OS userland, the resolver inputs, the
 //     operator home and the host state home (so file metadata stays
-//     readable), the declared read paths under a read scope, the declared
-//     sockets and the stage executable;
+//     readable); each daemon-private directory they reveal is then emptied
+//     with a tmpfs of its own, so nothing in it shows — a secret minted
+//     there after spawn included — except what the binds below re-expose
+//     beneath it; then the declared read paths under a read scope, the
+//     declared sockets and the stage executable;
 //  3. a private /dev and a fresh /proc;
 //  4. the writable set, bound read-write over them;
 //  5. rename anchors: every ancestor of a write deny strictly inside a
@@ -487,9 +491,10 @@ var mountNamespaceResolverBinds = []string{
 //  6. write denies: read-only leaves, protected paths, the workarea
 //     metadata (with reads open) and composer write denies, each bound
 //     read-only over itself — readable, never writable, never renamed;
-//  7. hide denies: composer read denies, an empty placeholder bound over
-//     each path some bind above would otherwise reveal (hideDenies is the
-//     one seam a further read-and-write deny list plugs into);
+//  7. hide denies: composer read denies and the daemon-private paths, an
+//     empty placeholder bound over each path some bind above would
+//     otherwise reveal (hideDenies is the one seam a further read-and-write
+//     deny list plugs into);
 //  8. the boundary marker.
 //
 // The namespace flags open it (sessionFlags): private user, mount and
@@ -529,6 +534,16 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 		if path != "" {
 			t.revealUnder(path)
 		}
+	}
+	// Daemon-private directories: a mount namespace cannot refuse a
+	// listing alone, so each one a bind above reveals is emptied instead,
+	// before anything is bound beneath it. Every bind below that lies
+	// beneath it (the writable set, read paths, read-only leaves, sockets,
+	// the stage executable) re-exposes its own path at the original
+	// spelling; everything else there, including a secret minted after
+	// spawn, is absent.
+	if err := t.empty(r.DeniedListings); err != nil {
+		return nil, err
 	}
 	// Declared read paths bind before the writable set, so a read path
 	// that covers a writable root never buries its read-write bind. A read
@@ -631,11 +646,18 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	// first: a path inside one already hidden is covered by it, and the
 	// placeholder over the outer one could not take a mount point anyway.
 	hides := hideDenies(composer)
+	hides = append(hides, r.Denied...)
 	sort.Strings(hides)
 	for _, path := range hides {
 		if err := t.hide(path); err != nil {
 			return nil, err
 		}
+	}
+	// An emptied directory a later bind covers would be buried by that
+	// bind, and its listing would show again: refuse rather than render it
+	// open.
+	if err := t.checkEmptied(); err != nil {
+		return nil, err
 	}
 	// The boundary marks itself: the nested-sandbox check reads it back.
 	t.add("--setenv", mountNamespaceMarkEnv, "1")
@@ -646,14 +668,16 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 // wherever a bind would reveal them: the composer's read denies. This is
 // the one seam a further deny list that must win on read as well as on
 // write (secrets a seat may neither read nor change) plugs into: its paths
-// join this list and render the same way, after every allow.
+// join this list and render the same way, after every allow, as the
+// daemon-private paths (Resolved.Denied) do in renderBubblewrap.
 //
 // A path must exist at spawn to be hidden: a placeholder needs something
 // to mount over, and creating one would write into the host. A path minted
 // later under a read-only bind is created by the host alone, and one minted
 // inside the writable set by the seat; a deny list that must cover a
 // secret not yet minted names the directory it will be minted in, which
-// hides everything later created there.
+// hides everything later created there: the daemon-private directories
+// (Resolved.DeniedListings) are emptied for exactly that (mountTree.empty).
 func hideDenies(composer mountComposerPlan) []string {
 	return append([]string(nil), composer.hideDenies...)
 }
@@ -666,6 +690,87 @@ type mountTree struct {
 	revealed []string
 	hidden   []string
 	writable []WritableRoot
+	// emptied are the daemon-private directories emptied with a tmpfs of
+	// their own, and emptiedAt the number of reveals bound before them:
+	// those earlier reveals no longer show anything beneath an emptied
+	// directory, while every later one does.
+	emptied   []string
+	emptiedAt int
+}
+
+// empty mounts a tmpfs over each daemon-private directory an earlier bind
+// reveals, outermost first; one inside a directory already emptied, or one
+// no bind reveals (the tmpfs root already hides it, and the Landlock stage
+// grants nothing there), needs none. A directory that would bury an
+// earlier bind beneath it (one covering the operator home or the host
+// state home) cannot be rendered as declared and refuses.
+func (t *mountTree) empty(dirs []string) error {
+	sorted := append([]string(nil), dirs...)
+	sort.Strings(sorted)
+	t.emptiedAt = len(t.revealed)
+	for _, dir := range sorted {
+		covered, revealed := false, false
+		for _, done := range t.emptied {
+			if insideOrEqual(dir, done) {
+				covered = true
+			}
+		}
+		for _, base := range t.revealed {
+			if strictlyInside(base, dir) {
+				return refuse(ReasonWritableSetUnrepresentable, "a daemon-private directory over a host directory the boundary binds cannot be rendered")
+			}
+			if insideOrEqual(dir, base) {
+				revealed = true
+			}
+		}
+		if covered || !revealed {
+			continue
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			continue
+		}
+		t.add("--tmpfs", dir)
+		t.emptied = append(t.emptied, dir)
+	}
+	return nil
+}
+
+// checkEmptied refuses when a bind made after the emptying covers an
+// emptied directory: it would bury the tmpfs and show the listing again.
+func (t *mountTree) checkEmptied() error {
+	for _, dir := range t.emptied {
+		for _, base := range t.revealed[t.emptiedAt:] {
+			if insideOrEqual(dir, base) {
+				return refuse(ReasonWritableSetUnrepresentable, "a daemon-private directory inside a path the boundary binds cannot be rendered")
+			}
+		}
+	}
+	return nil
+}
+
+// shows reports whether some bind reveals path inside the boundary: a
+// bind covers it, and no emptied directory between them hides it (an
+// emptied directory hides what the binds before it revealed beneath it,
+// never what the binds after it re-expose).
+func (t *mountTree) shows(path string) bool {
+	for i, base := range t.revealed {
+		if !insideOrEqual(path, base) {
+			continue
+		}
+		shadowed := false
+		if i < t.emptiedAt {
+			for _, dir := range t.emptied {
+				if insideOrEqual(path, dir) && insideOrEqual(dir, base) {
+					shadowed = true
+					break
+				}
+			}
+		}
+		if !shadowed {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *mountTree) add(args ...string) { t.args = append(t.args, args...) }
@@ -741,14 +846,7 @@ func (t *mountTree) hide(path string) error {
 			return refuse(ReasonRuleUnrenderable, "a read deny over the writable set cannot be rendered")
 		}
 	}
-	revealed := false
-	for _, base := range t.revealed {
-		if insideOrEqual(path, base) {
-			revealed = true
-			break
-		}
-	}
-	if !revealed {
+	if !t.shows(path) {
 		return nil
 	}
 	if _, err := os.Lstat(path); err != nil {

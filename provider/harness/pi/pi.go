@@ -139,6 +139,17 @@ type Options struct {
 	// DONMAI_PI_CONFINEMENT_READ_PATHS.
 	ConfinementReadPaths []string
 
+	// ControlTokenPath is the daemon-resolved control-token file path the
+	// seat confinement denies outright. The daemon states it per session
+	// (it strips the path-override variable from every worker it spawns,
+	// so the worker cannot resolve the override from its own environment
+	// and would otherwise deny the default path while the live token sits
+	// elsewhere). Empty falls back to the process environment. It never
+	// reaches a spawned session's environment: confineSession passes it
+	// to the confinement spec in-process, and no child-env composition
+	// reads it.
+	ControlTokenPath string
+
 	// Test seams. skipProcess wires stdin/stdout overrides instead of execing
 	// a real child; used by the pipe-stub tests that replay pi RPC shapes.
 	skipProcess    bool
@@ -656,13 +667,15 @@ func (p *Provider) hostConfinementDirs() piConfinementDirs {
 }
 
 // confineSession prepares a confined session's plan under the host's read
-// scope.
+// scope. The daemon-stated token path rides the spec explicitly: the
+// worker's environment never carries the override variable, so resolving
+// it there would deny the wrong file.
 func (p *Provider) confineSession(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner) (*confinement.Plan, error) {
 	reads, err := p.sessionReadScope(p.hostConfinementDirs().home)
 	if err != nil {
 		return nil, err
 	}
-	return confinePiSession(spec, layout, confiner, reads)
+	return confinePiSession(spec, layout, confiner, reads, p.opts.ControlTokenPath)
 }
 
 // piConfinementEnabled reports whether the session requested OS confinement

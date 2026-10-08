@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/state"
@@ -246,8 +247,9 @@ func TestModelProviderDoesNotInferEndpointSurface(t *testing.T) {
 	}
 }
 
-// TestRenderCard_Widths checks truthful labels at card widths and the
-// deliberate compact fallback below the minimum card width.
+// TestRenderCard_Widths checks the card rows at every acceptance width in
+// plain output: a fully reported card and an old-daemon card with nothing
+// reported both render within the width, the latter saying what is unknown.
 func TestRenderCard_Widths(t *testing.T) {
 	now := time.Date(2026, 6, 13, 14, 5, 0, 0, time.UTC)
 	cards := []SessionCard{
@@ -268,18 +270,17 @@ func TestRenderCard_Widths(t *testing.T) {
 	for _, width := range []int{40, 80, 120, 200} {
 		out := renderGrid(tm, cards, 0, 0, width, 0, true, now)
 		t.Logf("--- width %d ---\n%s", width, out)
-		if width < minCardWidth {
-			if !strings.Contains(out, "ENG-1284") || strings.Contains(out, "harness loop-driver") {
-				t.Errorf("width %d: compact fallback must show identity without full fields:\n%s", width, out)
-			}
-			continue
-		}
 		for _, want := range []string{
-			"harness loop-driver", "Endpoint surface vendor", "tools 37",
-			"harness unknown", "tools not reported",
+			"model-id · loop-driver", "running 4m · 5 turns · $0.84", "10s ago · Bash: pnpm test",
+			"model unknown · harness unknown", "activity not reported",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("width %d: render missing %q", width, want)
+			}
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if w := lipgloss.Width(line); w > width {
+				t.Errorf("width %d: line width %d: %q", width, w, line)
 			}
 		}
 	}

@@ -51,6 +51,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			ToolPermissionFormat:     "claude",
 			StreamingTransport:       "ndjson", // claude CLI JSONL = ndjson framing
 			SupportsInteractivePTY:   true,
+			// session-root-v1 is attested for declarations whose
+			// repositories are all mutable: granting each mutable
+			// repository path as an additional writable directory
+			// (buildArgs/interactiveArgsWith) is the whole write scope,
+			// and no read-only leaf needs executor isolation. A
+			// declaration carrying any read-only repository is still
+			// refused: this harness has no proven executor boundary
+			// for one (enforcement stays unset below).
+			MultiRepositoryWorkareaProtocols: []string{"session-root-v1"},
 			// The claude CLI invokes its own lifecycle hooks (`--bare`'s help
 			// text enumerates hooks among the things it skips), and the Stop
 			// hook is the point at which a message can be handed to a session

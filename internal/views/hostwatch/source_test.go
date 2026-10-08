@@ -139,6 +139,7 @@ func TestSource_Snapshot_StateEnrichment(t *testing.T) {
 	wt := filepath.Join(dir, "sess-1")
 	writeState(t, wt, state.State{
 		IssueIdentifier: "ENG-42",
+		IssueTitle:      "Fix flaky retry in the upload worker",
 		ProviderName:    "claude",
 		WorkType:        "development",
 		CurrentStep:     "streaming",
@@ -163,6 +164,9 @@ func TestSource_Snapshot_StateEnrichment(t *testing.T) {
 	if c.IssueIdentifier != "ENG-42" {
 		t.Errorf("issue: want ENG-42, got %q", c.IssueIdentifier)
 	}
+	if c.IssueTitle != "Fix flaky retry in the upload worker" {
+		t.Errorf("title: state.json title not read, got %q", c.IssueTitle)
+	}
 	if c.Provider != "claude" {
 		t.Errorf("provider: want claude, got %q", c.Provider)
 	}
@@ -174,6 +178,28 @@ func TestSource_Snapshot_StateEnrichment(t *testing.T) {
 	}
 	if c.EventsPath() != filepath.Join(wt, state.AgentDirName, "events.jsonl") {
 		t.Errorf("eventsPath: got %q", c.EventsPath())
+	}
+}
+
+// TestSource_HandleIssueIdentifierLabelsBeforeState: a fresh session is
+// labeled with its issue from the daemon's handle before its runner writes
+// state.json, and the handle's identifier wins over state.
+func TestSource_HandleIssueIdentifierLabelsBeforeState(t *testing.T) {
+	dir := t.TempDir()
+	fresh := filepath.Join(dir, "fresh") // no .agent yet: still provisioning
+	written := filepath.Join(dir, "written")
+	writeState(t, written, state.State{SessionID: "written", IssueIdentifier: "ENG-STALE"})
+	fd := &fakeDaemon{sessions: []afclient.DaemonSessionHandle{
+		{SessionID: "fresh", State: "running", WorktreePath: fresh, IssueIdentifier: "ENG-7"},
+		{SessionID: "written", State: "running", WorktreePath: written, IssueIdentifier: "ENG-8"},
+	}}
+	cards := NewSource(fd, state.NewStore(), "").Snapshot().Cards
+	got := map[string]string{}
+	for _, c := range cards {
+		got[c.SessionID] = c.displayID()
+	}
+	if got["fresh"] != "ENG-7" || got["written"] != "ENG-8" {
+		t.Errorf("handle identifiers not used: %v", got)
 	}
 }
 
@@ -230,6 +256,10 @@ func TestSource_Counters(t *testing.T) {
 	}
 	if scoped.Counters.Version != "0.39.0" {
 		t.Errorf("version: want 0.39.0, got %q", scoped.Counters.Version)
+	}
+	// Slots are host-wide whatever the scope: the daemon's occupied/total.
+	if scoped.Counters.HostActive != 3 || scoped.Counters.MaxSessions != 8 {
+		t.Errorf("host slots: want 3/8, got %d/%d", scoped.Counters.HostActive, scoped.Counters.MaxSessions)
 	}
 	// Unscoped: Sessions counts the rows shown in the grid, including held rows.
 	unscoped := NewSource(fd, &noopState{}, "").Snapshot()
