@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.68 — 2026-10-08
+
 ### Features
 
 - Publish subscription quota on the daemon heartbeat: a quota poller reads each installed harness's host login once per 5-minute interval (a short-lived codex app-server `account/rateLimits/read` with the host login projected, a short-lived claude `get_usage` control request with no model turn) into the per-account snapshot cache, and live sessions report their streamed rate-limit updates (codex `account/rateLimits/updated`, claude `rate_limit_event`) to `POST /api/daemon/sessions/<id>/usage`, where they merge by window id onto the probe snapshot. A worker authenticates its own session's update with the per-session credential stated in its spawn environment (or its attempt credential on a local runtime) — never the operator control token — so the update route stays closed to any caller that cannot name its session. The heartbeat `quota` field carries one entry per account with windows, each with an `authCheck` (`harness`, `ok`, `checkedAt`) stamped with the probe time. Only a read the harness answered records a verdict: the codex login refusal is the app-server's -32600 answer (a backend fetch failure records nothing), and the claude verdict comes from the host login check; a read that never reached the harness keeps the previous one.
