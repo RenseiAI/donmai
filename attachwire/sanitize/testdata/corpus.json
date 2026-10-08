@@ -302,5 +302,61 @@
     "expected_output": "b2s=",
     "disposition": "strip",
     "spec_row": "osc-8"
+  },
+  {
+    "name": "dcs_malformed_header_utf8_strip",
+    "description": "a DCS whose header begins a UTF-8 rune with a 0x9C continuation byte is malformed and stripped whole, through its real ST",
+    "input": "G1DinLMgaGlkZGVuG1xvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "dcs-decudk-decrqss"
+  },
+  {
+    "name": "ground_utf8_c1_csi_strip",
+    "description": "a CSI introducer encoded as UTF-8 (U+009B) is stripped in ground, so C2 9B 6n cannot reach the viewer as a cursor position request",
+    "input": "wps2bsKbYw==",
+    "expected_output": "Nm5j",
+    "disposition": "strip",
+    "spec_row": "c1-utf8"
+  },
+  {
+    "name": "ground_utf8_c1_osc_query_strip",
+    "description": "OSC introducer and ST encoded as UTF-8 (U+009D, U+009C) are stripped in ground, so a colour query cannot be smuggled past the OSC table",
+    "input": "wp0xMTs/wpw=",
+    "expected_output": "MTE7Pw==",
+    "disposition": "strip",
+    "spec_row": "c1-utf8"
+  },
+  {
+    "name": "ground_utf8_c1_dcs_decrqss_strip",
+    "description": "DCS introducer and ST encoded as UTF-8 (U+0090, U+009C) are stripped in ground, so DECRQSS cannot be smuggled past the DCS table",
+    "input": "wpAkcW3CnA==",
+    "expected_output": "JHFt",
+    "disposition": "strip",
+    "spec_row": "c1-utf8"
+  },
+  {
+    "name": "osc_raw_st_reemitted_7bit",
+    "description": "a passed OSC colour set ending in a raw 8-bit ST is re-emitted with ESC \\, so a UTF-8 viewer closes it there and the following '?' stays text instead of turning the set into a query",
+    "input": "G10xMDucPxtbbQ==",
+    "expected_output": "G10xMDsbXD8bW20=",
+    "disposition": "mixed",
+    "spec_row": "osc-color-set"
+  },
+  {
+    "name": "c1_osc8_reemitted_7bit",
+    "description": "an OSC 8 hyperlink with 8-bit introducer and ST passes in 7-bit form (ESC ] ... ESC \\), which a UTF-8 viewer parses the same way the sanitizer did",
+    "input": "nTg7O2h0dHBzOi8vZXhhbXBsZS5jb22cbGluaw==",
+    "expected_output": "G104OztodHRwczovL2V4YW1wbGUuY29tG1xsaW5r",
+    "disposition": "display-only",
+    "spec_row": "osc-8"
+  },
+  {
+    "name": "sixel_c1_reemitted_7bit",
+    "description": "a Sixel DCS with 8-bit introducer and ST passes in 7-bit form (ESC P ... ESC \\)",
+    "input": "kHEjMH6c",
+    "expected_output": "G1BxIzB+G1w=",
+    "disposition": "pass",
+    "spec_row": "dcs-sixel"
   }
 ]

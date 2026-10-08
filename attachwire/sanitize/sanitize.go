@@ -215,6 +215,15 @@ func (s *Sanitizer) stepGround(b byte, out *[]byte) bool {
 	// its own, so it can never absorb an unrelated following byte on a re-scan.
 	if s.utf8Rem > 0 {
 		if b >= 0x80 && b <= 0xBF {
+			if s.utf8Buf[0] == 0xC2 && b <= 0x9F {
+				// U+0080..U+009F is a C1 control in UTF-8 form. A UTF-8
+				// terminal decodes it and acts on it exactly as on the raw
+				// 8-bit control (U+009B starts a CSI, so C2 9B 6n is a cursor
+				// position request). Strip it, as a stray raw C1 is stripped.
+				s.utf8Buf = s.utf8Buf[:0]
+				s.utf8Rem = 0
+				return true
+			}
 			s.utf8Buf = append(s.utf8Buf, b)
 			s.utf8Rem--
 			if s.utf8Rem == 0 {
@@ -659,8 +668,7 @@ func (s *Sanitizer) finishStr(out *[]byte, term []byte) {
 	}
 	switch s.kind {
 	case kDCS: // Sixel — pass
-		*out = append(*out, s.pending...)
-		*out = append(*out, term...)
+		s.emitString(out, term)
 	case kOSC:
 		s.finishOSC(out, term)
 	default:
@@ -668,13 +676,38 @@ func (s *Sanitizer) finishStr(out *[]byte, term []byte) {
 	}
 }
 
+// emitString writes a passed string sequence in 7-bit form. An 8-bit
+// introducer (0x9D OSC, 0x90 DCS) becomes its ESC form and an 8-bit ST (0x9C)
+// becomes ESC '\'. A UTF-8 terminal never reads a raw 0x9C as ST: it would keep
+// the string open and swallow the text that follows, so a later '?' turns a
+// colour set into a colour query that the terminal answers on input. Emitting
+// 7-bit forms makes the terminal agree with the sanitizer on where the string
+// starts and ends.
+func (s *Sanitizer) emitString(out *[]byte, term []byte) {
+	body := s.pending
+	if s.introLen == 1 {
+		switch s.pending[0] {
+		case c1OSC:
+			*out = append(*out, esc, ']')
+		case c1DCS:
+			*out = append(*out, esc, 'P')
+		}
+		body = s.pending[1:]
+	}
+	*out = append(*out, body...)
+	if len(term) == 1 && term[0] == c1ST {
+		*out = append(*out, esc, '\\')
+		return
+	}
+	*out = append(*out, term...)
+}
+
 func (s *Sanitizer) finishOSC(out *[]byte, term []byte) {
 	content := s.pending[s.introLen:]
 	disp, titleStart := classifyOSC(content, s.stripLink)
 	switch disp {
 	case oscPass:
-		*out = append(*out, s.pending...)
-		*out = append(*out, term...)
+		s.emitString(out, term)
 	case oscTitle:
 		if s.onTitle != nil {
 			title := ""

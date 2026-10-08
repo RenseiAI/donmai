@@ -186,6 +186,36 @@ func corpusFixtures() []fixture {
 			"osc_utf8_encoded_c1_ends_string", "a UTF-8-encoded C1 control (U+009C) inside an OSC body ends the string for a UTF-8 terminal, so the sanitizer strips the string and sanitizes the rest from ground (the raw CSI 6n after it is stripped)",
 			"\x1b]8;;x\xc2\x9c\x9b6nok", "ok", "strip", "osc-8",
 		},
+		{
+			"dcs_malformed_header_utf8_strip", "a DCS whose header begins a UTF-8 rune with a 0x9C continuation byte is malformed and stripped whole, through its real ST",
+			"\x1bP\xe2\x9c\xb3 hidden\x1b\\ok", "ok", "strip", "dcs-decudk-decrqss",
+		},
+
+		// --- C1 controls a UTF-8 viewer would act on ----------------------------
+		{
+			"ground_utf8_c1_csi_strip", "a CSI introducer encoded as UTF-8 (U+009B) is stripped in ground, so C2 9B 6n cannot reach the viewer as a cursor position request",
+			"\xc2\x9b6n\xc2\x9bc", "6nc", "strip", "c1-utf8",
+		},
+		{
+			"ground_utf8_c1_osc_query_strip", "OSC introducer and ST encoded as UTF-8 (U+009D, U+009C) are stripped in ground, so a colour query cannot be smuggled past the OSC table",
+			"\xc2\x9d11;?\xc2\x9c", "11;?", "strip", "c1-utf8",
+		},
+		{
+			"ground_utf8_c1_dcs_decrqss_strip", "DCS introducer and ST encoded as UTF-8 (U+0090, U+009C) are stripped in ground, so DECRQSS cannot be smuggled past the DCS table",
+			"\xc2\x90$qm\xc2\x9c", "$qm", "strip", "c1-utf8",
+		},
+		{
+			"osc_raw_st_reemitted_7bit", "a passed OSC colour set ending in a raw 8-bit ST is re-emitted with ESC \\, so a UTF-8 viewer closes it there and the following '?' stays text instead of turning the set into a query",
+			"\x1b]10;\x9c?\x1b[m", "\x1b]10;\x1b\\?\x1b[m", "mixed", "osc-color-set",
+		},
+		{
+			"c1_osc8_reemitted_7bit", "an OSC 8 hyperlink with 8-bit introducer and ST passes in 7-bit form (ESC ] ... ESC \\), which a UTF-8 viewer parses the same way the sanitizer did",
+			"\x9d8;;https://example.com\x9clink", "\x1b]8;;https://example.com\x1b\\link", "display-only", "osc-8",
+		},
+		{
+			"sixel_c1_reemitted_7bit", "a Sixel DCS with 8-bit introducer and ST passes in 7-bit form (ESC P ... ESC \\)",
+			"\x90q#0~\x9c", "\x1bPq#0~\x1b\\", "pass", "dcs-sixel",
+		},
 	}
 }
 
