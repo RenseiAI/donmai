@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
@@ -30,14 +29,16 @@ type rollbackBeatFixture struct {
 
 func newRollbackBeatFixture(t *testing.T, hostID string) *rollbackBeatFixture {
 	t.Helper()
-	// The recovered launch at the end of the rollback test spawns a real
-	// shim whose harness must answer the adoption handshake before the
-	// shim's own orphan deadline reaps it. Under parallel load that
-	// handshake can take longer than the shared fixture's two-second
-	// deadline, which fails the launch for a reason unrelated to the
-	// rollback under test — so this fixture gives its shims a longer
-	// runway. The rollback assertions themselves are unaffected: nothing
-	// here changes the publication, batch, or heartbeat paths.
+	// The shared fixture's two-second orphan deadline lets two unrelated
+	// shim lifecycle events land inside this test under load. The failed
+	// launch's shim is never adopted, so it expires on that deadline; the
+	// expiry is a quarantine change, and the daemon's republish of it is a
+	// legal commit that mints a revision of its own once batches are
+	// accepted again, in the middle of the recovered launch's assertions.
+	// And a slow adoption handshake can let the recovered launch's own
+	// shim expire before adoption. A runway far longer than the test keeps
+	// both out of it. The rollback assertions are unaffected: nothing here
+	// changes the publication, batch, or heartbeat paths.
 	f := newShimSpawnFixture(t, func(cfg *SessionShimConfig) {
 		cfg.Orphan.Deadline = 30 * time.Second
 	})
@@ -152,11 +153,9 @@ func TestFailedDynamicPublicationRollsBackAndKeepsTheHeartbeatAlive(t *testing.T
 	// Barrier invariant, the discriminating control: the failed attempt must
 	// never announce a revision. A "fix" that force-completed the attempt
 	// instead of rolling it back would put a dynamic revision on the wire
-	// here. Match on the shared prefix rather than the literal first
-	// sequence number: the same background republish that can legally
-	// advance the fake's counter before the recovered launch would also
-	// shift the failed attempt's own number, and the invariant is "nothing
-	// uncommitted was announced", not "the failed attempt was number one".
+	// here. Match on the prefix rather than one sequence number: every batch
+	// so far was refused, so any dynamic revision on the wire announces a
+	// commit that never happened.
 	for _, revision := range revisions {
 		if strings.HasPrefix(revision, "dynamic-revision-") {
 			t.Fatalf("the UNcommitted attempt's revision reached the wire: %v", revisions)
@@ -183,14 +182,9 @@ func TestFailedDynamicPublicationRollsBackAndKeepsTheHeartbeatAlive(t *testing.T
 
 	// And the repair is complete end-to-end: with the control plane having
 	// accepted the correcting beat, a subsequent claim is admitted and its
-	// publication commits. The fake control plane mints revisions from a
-	// per-probe counter, so anchor the expectation to the counter's value
-	// just before the recovered launch rather than to a literal sequence
-	// number: anything else the daemon legitimately commits between the two
-	// launches (for example a background sweep republishing a lineage the
-	// failed launch's own harness left behind) advances the same counter,
-	// and pinning the literal would turn that legal commit into a failure.
-	committedBeforeRecovery := rb.probe.revision.Load()
+	// publication commits. Every batch before this point was refused, so the
+	// fake's revision counter is still at zero and the recovered launch's
+	// commit is the first revision it mints.
 	refuse.Store(false)
 	if _, err := d.spawner.AcceptWork(f.interactiveSpec("rollback-recovered")); err != nil {
 		t.Fatalf("claim after the rollback was refused: %v", err)
@@ -198,15 +192,13 @@ func TestFailedDynamicPublicationRollsBackAndKeepsTheHeartbeatAlive(t *testing.T
 	waitFor(t, 5*time.Second, "the recovered launch's own beat to clear its barrier", func() bool {
 		return !d.sessionShimReadinessWithdrawn.Load() && d.State() == StateRunning
 	})
-	wantRecoveredRevision := fmt.Sprintf("dynamic-revision-%d", committedBeforeRecovery+1)
 	revisions = rb.recorder.adoptionCompleteRevisions()
-	if len(revisions) == 0 || revisions[len(revisions)-1] != wantRecoveredRevision {
-		t.Fatalf("recovered launch revisions on the wire = %v, want the last to be %q", revisions, wantRecoveredRevision)
+	if len(revisions) == 0 || revisions[len(revisions)-1] != "dynamic-revision-1" {
+		t.Fatalf("recovered launch revisions on the wire = %v, want the last to be %q", revisions, "dynamic-revision-1")
 	}
 	// The recovered launch's own batch is the commit that minted the
 	// revision above: its adopted section must name exactly the recovered
-	// session, so a stray republish cannot satisfy the assertion by
-	// advancing the counter on its own.
+	// session.
 	_, batches := rb.probe.snapshot()
 	if len(batches) == 0 {
 		t.Fatal("no adoption batches reached the fake control plane")
