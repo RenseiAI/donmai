@@ -59,6 +59,36 @@ const credentialFileEnvVar = "DONMAI_PI_CREDENTIALS_FILE" //nolint:gosec // G101
 // nothing it cannot read from the file.
 const gatewayBearerEnvVar = gateway.TokenEnvVar
 
+// manifestCredentialEnvNames transcribes the endpoint-manifest credential
+// names (provider/endpoint/<company>/manifest.go, HostDesc.EnvKeys) that
+// are NOT in builtinProviderCredentialEnv's value set and so would
+// otherwise bypass the file rail: a bedrock/vertex/azure-style cell's
+// binding Env rides applyEndpoint's merge onto Spec.Env, and the child-env
+// strips below are name-based — a name in NEITHER set keeps riding both
+// spawn lanes, readable host-wide from the renamed child. Only the
+// manifest-declared names are listed: empty-string entries in those
+// manifests declare no credential, and region/project/endpoint names
+// (AWS_REGION, ANTHROPIC_VERTEX_PROJECT_ID, GOOGLE_VERTEX_PROJECT_ID,
+// AZURE_OPENAI_ENDPOINT) are transcribed alongside the key names — they
+// are binding identity the child never needs, and a future rotation that
+// moves secret material under one of them must not silently re-open the
+// listing hole. manifestEnvKeysCovered pins this list against the live
+// manifests, so a new manifest EnvKeys entry breaks the build instead of
+// leaking.
+//
+//nolint:gosec // G101: env-var NAMES, never credential bytes.
+var manifestCredentialEnvNames = []string{
+	"AWS_ACCESS_KEY_ID",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_REGION",
+	"GOOGLE_API_KEY",
+	"GOOGLE_APPLICATION_CREDENTIALS",
+	"GOOGLE_VERTEX_PROJECT_ID",
+	"ANTHROPIC_VERTEX_PROJECT_ID",
+	"AZURE_OPENAI_API_KEY",
+	"AZURE_OPENAI_ENDPOINT",
+}
+
 // sessionCredential is one named credential the file carries: the env-var
 // name the value would have ridden under, and the value itself.
 type sessionCredential struct {
@@ -110,15 +140,30 @@ func credentialFilePath(layout sessionLayout) string {
 
 // sessionCredentialNames is the closed credential-name set both spawn lanes
 // strip from the child env: the injected-provider key (PiKeyEnvVar), the
-// gateway binding bearer (gatewayBearerEnvVar), plus every provider-native
+// gateway binding bearer (gatewayBearerEnvVar), every provider-native
 // credential var (builtinProviderCredentialEnv) applyEndpoint may mirror
-// onto Spec.Env. Deterministic (sorted) order; the set is derived once
-// from the same sources sessionCredentialEntries fans out, so the two can
-// never disagree about which names are credential-carrying.
+// onto Spec.Env, plus every endpoint-manifest cell-credential name
+// (manifestCredentialEnvNames) a bedrock/vertex/azure-style binding Env
+// rides in on through applyEndpoint's merge. Deterministic (sorted) order;
+// the set is derived once from the same sources sessionCredentialEntries
+// fans out, so the two can never disagree about which names are
+// credential-carrying.
 func sessionCredentialNames() []string {
-	names := make([]string, 0, len(builtinProviderCredentialEnv)+2)
+	names := make([]string, 0, len(builtinProviderCredentialEnv)+2+len(manifestCredentialEnvNames))
 	names = append(names, PiKeyEnvVar, gatewayBearerEnvVar)
 	for _, name := range builtinProviderCredentialEnv {
+		duplicate := false
+		for _, have := range names {
+			if have == name {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			names = append(names, name)
+		}
+	}
+	for _, name := range manifestCredentialEnvNames {
 		duplicate := false
 		for _, have := range names {
 			if have == name {
@@ -407,12 +452,14 @@ func sessionCredentialEnv(childEnv []string, path string) []string {
 // isSessionCredentialEnv reports whether a child-env entry carries a
 // session credential VALUE (as opposed to the credential file's path).
 // It covers exactly the sessionCredentialNames set — the injected-provider
-// key, the gateway binding bearer, plus every provider-native credential
-// var (builtinProviderCredentialEnv) — wherever they arrive: on Spec.Env OR
-// inherited from the parent process (an embedding supervisor may re-admit a
-// blocklisted name it injected itself through InjectedEnvKeysVar, and the
-// gateway's own upstream refusal does not cover every snapshot key). Tests
-// use it to assert the spawned child's env holds no secret.
+// key, the gateway binding bearer, every provider-native credential var
+// (builtinProviderCredentialEnv), plus every endpoint-manifest
+// cell-credential name (manifestCredentialEnvNames) — wherever they
+// arrive: on Spec.Env OR inherited from the parent process (an embedding
+// supervisor may re-admit a blocklisted name it injected itself through
+// InjectedEnvKeysVar, and the gateway's own upstream refusal does not cover
+// every snapshot key). Tests use it to assert the spawned child's env holds
+// no secret.
 func isSessionCredentialEnv(entry string) bool {
 	key := entry
 	if i := strings.IndexByte(entry, '='); i >= 0 {

@@ -4,12 +4,18 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/gateway"
+	endpAnthropic "github.com/RenseiAI/donmai/provider/endpoint/anthropic"
+	endpGoogle "github.com/RenseiAI/donmai/provider/endpoint/google"
+	endpLocal "github.com/RenseiAI/donmai/provider/endpoint/local"
+	endpOpenAI "github.com/RenseiAI/donmai/provider/endpoint/openai"
+	endpStub "github.com/RenseiAI/donmai/provider/endpoint/stub"
 )
 
 // This file is the child-environment regression suite for the session
@@ -769,5 +775,206 @@ func TestGatewayBearerConstLinked(t *testing.T) {
 	t.Parallel()
 	if gatewayBearerEnvVar != gateway.TokenEnvVar {
 		t.Fatalf("gatewayBearerEnvVar = %q, want gateway.TokenEnvVar (%q): the rail must track the gateway's own definition", gatewayBearerEnvVar, gateway.TokenEnvVar)
+	}
+}
+
+// TestManifestEnvKeysCoveredByCredentialRail pins the closed producer set:
+// every non-empty EnvKeys name in every endpoint manifest (the names
+// resolve.FromManifest copies onto a binding Env, and applyEndpoint merges
+// onto Spec.Env) that is NOT one of pi's built-in provider key vars must
+// be transcribed in manifestCredentialEnvNames — the half of the rail that
+// strips those names from both lanes' child env and fans them out to the
+// session credential file. A new manifest EnvKeys entry (the next
+// provider) breaks this test instead of silently riding the renamed
+// child's env, readable host-wide. Empty EnvKeys entries declare no
+// credential and need no coverage.
+//
+// RED proof: add a name to any manifest's EnvKeys without transcribing it
+// here and the test fails naming the uncovered name.
+func TestManifestEnvKeysCoveredByCredentialRail(t *testing.T) {
+	t.Parallel()
+	manifests := []agent.ModelEndpointManifest{
+		endpAnthropic.New().Manifest(),
+		endpGoogle.New().Manifest(),
+		endpLocal.New().Manifest(),
+		endpOpenAI.New().Manifest(),
+		endpStub.New().Manifest(),
+	}
+	builtinVals := make(map[string]struct{}, len(builtinProviderCredentialEnv))
+	for _, v := range builtinProviderCredentialEnv {
+		builtinVals[v] = struct{}{}
+	}
+	rail := make(map[string]struct{}, len(manifestCredentialEnvNames))
+	for _, n := range manifestCredentialEnvNames {
+		rail[n] = struct{}{}
+	}
+	// The gateway bearer rides the rail under its own compiler-checked
+	// const (gatewayBearerEnvVar aliases gateway.TokenEnvVar), not the
+	// manifest transcription — see TestGatewayBearerConstLinked.
+	rail[gatewayBearerEnvVar] = struct{}{}
+	var uncovered []string
+	for _, m := range manifests {
+		for _, h := range m.Hosts {
+			for _, k := range h.EnvKeys {
+				if k == "" {
+					continue
+				}
+				if _, ok := builtinVals[k]; ok {
+					continue
+				}
+				if _, ok := rail[k]; ok {
+					continue
+				}
+				uncovered = append(uncovered, string(m.Company)+"/"+string(h.Host)+": "+k)
+			}
+		}
+	}
+	sort.Strings(uncovered)
+	if len(uncovered) > 0 {
+		t.Fatalf("endpoint-manifest credential names outside the pi child-env rail:\n%s\ntranscribe them in manifestCredentialEnvNames (credential_file.go)", strings.Join(uncovered, "\n"))
+	}
+}
+
+// cell-credential shape: every endpoint-manifest credential name
+// (HostDesc.EnvKeys) that is NOT a built-in provider key var, carrying a
+// sentinel value through the production binding merge
+// (applyEndpoint, the route a resolved cell takes onto Spec.Env) and both
+// spawn lanes' child-env composers. The sentinel must reach the session
+// through the credential file and must never appear in either lane's child
+// env — the exact host-wide listing exposure this change exists to close.
+func manifestCellCredentialSentinels() map[string]string {
+	return map[string]string{
+		"AWS_ACCESS_KEY_ID":              "cell-aws-access-key-id",
+		"AWS_SECRET_ACCESS_KEY":          "cell-aws-secret-access-key",
+		"GOOGLE_API_KEY":                 "cell-google-api-key",
+		"GOOGLE_APPLICATION_CREDENTIALS": "cell-google-application-credentials",
+	}
+}
+
+// TestBedrockCellCredentialRidesFileNotChildEnv is the blocking-finding
+// regression test: a bedrock-bound cell's binding Env (access key id +
+// secret access key) projects through the production applyEndpoint merge
+// and must be stripped from BOTH lanes' child env — while the same values
+// fan out to the session credential file the child reads at load. Drives
+// the production entry points: applyEndpoint, composeChildEnv (headless)
+// and interactiveChildEnv (PTY).
+//
+// RED proof: drop the manifest names from sessionCredentialNames and the
+// lane assertions fail with the sentinel quoted in the child env.
+func TestBedrockCellCredentialRidesFileNotChildEnv(t *testing.T) {
+	t.Parallel()
+	layout := newSessionLayout(t.TempDir())
+	projected, err := applyEndpoint(agent.Spec{
+		Cwd: t.TempDir(),
+		Endpoint: &agent.EndpointBinding{
+			Company:  agent.CompanyAnthropic,
+			Host:     agent.HostBedrock,
+			Protocol: agent.ProtoAnthropicMessages,
+			Model:    "claude-sonnet-4-5",
+			Env:      manifestCellCredentialSentinels(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("applyEndpoint rejected a routable bedrock binding: %v", err)
+	}
+
+	// The file rail fans every binding credential out by name.
+	entries := sessionCredentialEntries(projected)
+	byName := make(map[string]string, len(entries))
+	for _, e := range entries {
+		byName[e.Env] = e.Value
+	}
+	for k, want := range manifestCellCredentialSentinels() {
+		if k == "AWS_REGION" {
+			continue // not in this binding's Env; covered by the matrix test below
+		}
+		if byName[k] != want {
+			t.Errorf("credential file %s = %q, want %q", k, byName[k], want)
+		}
+	}
+
+	// Headless lane: no binding credential rides the child env by name or value.
+	headless := composeChildEnv(projected, layout, "sess-token")
+	for _, e := range headless {
+		if isSessionCredentialEnv(e) {
+			t.Fatalf("bedrock cell credential rides the headless child env by name: %q", e)
+		}
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			for _, want := range manifestCellCredentialSentinels() {
+				if strings.Contains(e[i+1:], want) {
+					t.Fatalf("bedrock cell credential rides the headless child env by value: %q", e)
+				}
+			}
+		}
+	}
+	if !hasEnvVal(headless, piHandshakeEnvVar, "sess-token") {
+		t.Errorf("handshake token missing; the env under test is not the headless lane")
+	}
+
+	// Interactive lane: same binding, same strip, through its override map.
+	// Session-absent credential names shadow empty; only a non-empty value
+	// is a leak.
+	interactive := interactiveChildEnv(projected, layout)
+	for k, v := range interactive {
+		if isSessionCredentialEnv(k+"="+v) && v != "" {
+			t.Fatalf("bedrock cell credential rides the interactive child env by name: %q", k)
+		}
+		for _, want := range manifestCellCredentialSentinels() {
+			if strings.Contains(v, want) {
+				t.Fatalf("bedrock cell credential rides the interactive child env by value: %q=%q", k, v)
+			}
+		}
+	}
+}
+
+// TestVertexAzureCellCredentialRidesFileNotChildEnv is the vertex/azure
+// companion: the remaining manifest credential names outside the built-in
+// provider map (vertex project id and credentials path, azure endpoint)
+// ride the same production composers and must likewise stay off both
+// lanes' child env. Drives composeChildEnv + interactiveChildEnv directly
+// with the names on Spec.Env — the strip is name-based, so the binding
+// merge and a direct Spec.Env entry take the same path through it.
+//
+// RED proof: drop the manifest names from sessionCredentialNames and the
+// assertions fail with the sentinel quoted.
+func TestVertexAzureCellCredentialRidesFileNotChildEnv(t *testing.T) {
+	t.Parallel()
+	spec := agent.Spec{
+		Cwd: t.TempDir(),
+		Env: map[string]string{
+			"ANTHROPIC_VERTEX_PROJECT_ID":    "cell-anthropic-vertex-project",
+			"GOOGLE_VERTEX_PROJECT_ID":       "cell-google-vertex-project",
+			"GOOGLE_APPLICATION_CREDENTIALS": "cell-google-application-credentials",
+			"AZURE_OPENAI_API_KEY":           "cell-azure-openai-api-key",
+			"AZURE_OPENAI_ENDPOINT":          "cell-azure-openai-endpoint",
+			"AWS_REGION":                     "cell-aws-region",
+			"DONMAI_HARMLESS_VAR":            "keep",
+		},
+	}
+	layout := newSessionLayout(t.TempDir())
+	headless := composeChildEnv(spec, layout, "sess-token")
+	for _, e := range headless {
+		if isSessionCredentialEnv(e) {
+			t.Fatalf("vertex/azure cell credential rides the headless child env by name: %q", e)
+		}
+		if i := strings.IndexByte(e, '='); i >= 0 && strings.Contains(e[i+1:], "cell-") {
+			t.Fatalf("vertex/azure cell credential rides the headless child env by value: %q", e)
+		}
+	}
+	if !hasEnvVal(headless, "DONMAI_HARMLESS_VAR", "keep") {
+		t.Errorf("non-credential binding was dropped from the headless lane: %q", headless)
+	}
+
+	got := interactiveChildEnv(spec, layout)
+	for k, v := range got {
+		if isSessionCredentialEnv(k+"="+v) && v != "" {
+			t.Fatalf("vertex/azure cell credential rides the interactive child env by name: %q", k)
+		}
+		if strings.Contains(v, "cell-") && k != "DONMAI_HARMLESS_VAR" {
+			t.Fatalf("vertex/azure cell credential rides the interactive child env by value: %q=%q", k, v)
+		}
+	}
+	if got["DONMAI_HARMLESS_VAR"] != "keep" {
+		t.Errorf("non-credential binding was dropped from the interactive lane: %v", got)
 	}
 }
