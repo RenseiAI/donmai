@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -184,11 +185,13 @@ func TestSpawn_ExactEnvInheritsNothingFromParent(t *testing.T) {
 	}
 
 	exact := envMap(strings.Split(strings.TrimSpace(record(true)), "\n"))
+	// Report names only: the inheriting failure mode would otherwise print
+	// this process's whole environment into the test log.
 	if _, ok := exact["PTYHOST_PARENT_CANARY"]; ok {
-		t.Errorf("exact-env child inherited the parent canary: %v", exact)
+		t.Errorf("exact-env child inherited the parent canary; child names: %v", envNames(exact))
 	}
 	if _, ok := exact["PATH"]; ok {
-		t.Errorf("exact-env child inherited the parent PATH: %v", exact)
+		t.Errorf("exact-env child inherited the parent PATH; child names: %v", envNames(exact))
 	}
 	for key, want := range map[string]string{"KEEP": "request", "TERM": "xterm-256color", "COLORTERM": "truecolor"} {
 		if exact[key] != want {
@@ -212,6 +215,17 @@ func TestComposeEnv_ManyOverridesGrowWithoutCapacitySum(t *testing.T) {
 	if len(got) != 4099 || got["PATH"] != "/bin" || got["KEY_4095"] != "value" {
 		t.Fatalf("large composed environment boundaries: len=%d PATH=%q last=%q", len(got), got["PATH"], got["KEY_4095"])
 	}
+}
+
+// envNames returns env's names, sorted, for failure messages that must not
+// print values.
+func envNames(env map[string]string) []string {
+	names := make([]string, 0, len(env))
+	for name := range env {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func envMap(entries []string) map[string]string {

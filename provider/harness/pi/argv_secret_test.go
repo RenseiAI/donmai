@@ -146,8 +146,10 @@ func TestHeadlessChildArgv_CarriesNoCredential(t *testing.T) {
 	if strings.Contains(argv, argvSecretSentinel) {
 		t.Fatalf("harness child argv carries the sentinel credential:\n%s", argv)
 	}
-	if strings.Contains(envRaw, argvSecretSentinel) {
-		t.Fatalf("harness child exec environment carries the sentinel credential:\n%s", envRaw)
+	for _, entry := range strings.Split(envRaw, "\n") {
+		if strings.Contains(entry, argvSecretSentinel) {
+			t.Fatalf("harness child exec environment carries the sentinel credential: %q", entry)
+		}
 	}
 	if delivered != argvSecretSentinel {
 		t.Fatalf("sentinel credential was not delivered through the session credential file (got %q)", delivered)
