@@ -1293,6 +1293,42 @@ func (m *Manager) RunTerminalResultReplayer(ctx context.Context, opts workarea.T
 	m.leases.RunTerminalResultReplayer(ctx, opts, sender)
 }
 
+// SaveStandaloneTerminalOutbox persists one lease-independent terminal-status
+// record keyed by (session, attempt) before the first send. The first writer
+// wins: the runner's terminal record and the worker_exited_without_result
+// fallback never both exist.
+func (m *Manager) SaveStandaloneTerminalOutbox(ctx context.Context, spec workarea.StandaloneOutboxSaveSpec) (string, error) {
+	return m.leases.SaveStandaloneOutbox(ctx, spec)
+}
+
+// MarkStandaloneTerminalOutboxDelivered records receiver transport acceptance
+// for one (session, attempt) without granting acknowledgement-path release
+// authority.
+func (m *Manager) MarkStandaloneTerminalOutboxDelivered(ctx context.Context, sessionID string, attempt uint64) error {
+	_, err := m.leases.MarkStandaloneOutboxDelivered(ctx, sessionID, attempt)
+	return err
+}
+
+// LoadStandaloneTerminalOutbox returns the lease-independent record for one
+// (session, attempt), or the workarea terminal-status-not-found error when no
+// writer has persisted it yet.
+func (m *Manager) LoadStandaloneTerminalOutbox(ctx context.Context, sessionID string, attempt uint64) (*workarea.StandaloneOutboxRecord, error) {
+	return m.leases.LoadStandaloneOutbox(ctx, sessionID, attempt)
+}
+
+// ReplayStandaloneTerminalOutbox performs one bounded recovery pass over the
+// records that have no terminal workarea lease.
+func (m *Manager) ReplayStandaloneTerminalOutbox(ctx context.Context, batch int, attemptTimeout time.Duration, sender workarea.TerminalStatusSender) (int, error) {
+	return m.leases.ReplayStandaloneOutbox(ctx, batch, attemptTimeout, sender)
+}
+
+// RunStandaloneOutboxReplayer runs lease-independent terminal status recovery
+// until ctx is cancelled. Pair it with RunTerminalResultReplayer: that loop
+// drains lease-bound records, this one drains the records that have no lease.
+func (m *Manager) RunStandaloneOutboxReplayer(ctx context.Context, opts workarea.TerminalResultReplayOptions, sender workarea.TerminalStatusSender) {
+	m.leases.RunStandaloneOutboxReplayer(ctx, opts, sender)
+}
+
 // AcknowledgeTerminalResult atomically stores the exact acknowledgement outcome
 // and active -> release-pending transition. Provider disposition remains a
 // separate at-least-once reaper operation.

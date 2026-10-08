@@ -402,6 +402,38 @@ func (p *Poster) PrepareTerminalStatusBody(ctx context.Context, sessionID string
 	return payload, nil
 }
 
+// WorkerExitedWithoutResultFailureMode is the failure mode carried by the
+// fallback terminal record written after a worker's process group was proved
+// gone without a terminal status of its own. It is a stable wire string: the
+// platform routes a seat that died with its worker distinctly from work the
+// worker itself reported as failed.
+const WorkerExitedWithoutResultFailureMode = "worker_exited_without_result"
+
+// PrepareWorkerExitedWithoutResultBody captures the fallback terminal status
+// body for a worker that exited without posting a result. Unlike
+// PrepareTerminalStatusBody — which freezes the calling worker's own fresh
+// credentials into the body — the worker identity here is explicit: the body
+// names the dead worker, and header authorization stays fresh per send. The
+// payload is fully deterministic in its inputs so the first-writer-wins
+// outbox compare is stable across writers.
+func (p *Poster) PrepareWorkerExitedWithoutResultBody(sessionID, workerID string, projection *workarea.TerminalLeaseProjection) ([]byte, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, errors.New("result: sessionID is required")
+	}
+	if strings.TrimSpace(workerID) == "" {
+		return nil, errors.New("result: workerID is required")
+	}
+	body := buildStatusRequest(RuntimeCredentials{WorkerID: workerID}, agent.Result{
+		Status: "failed", FailureMode: WorkerExitedWithoutResultFailureMode,
+		Summary: "Worker exited without posting a terminal result.",
+	}, projection)
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal fallback terminal status body: %w", err)
+	}
+	return payload, nil
+}
+
 // PostPreparedOutcome sends the ancillary completion request and the exact
 // retained terminal-status body.
 func (p *Poster) PostPreparedOutcome(ctx context.Context, sessionID string, r agent.Result, body []byte) PostOutcome {
