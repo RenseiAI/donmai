@@ -71,6 +71,10 @@ type Resolved struct {
 	// path. They are denied as literals so that renaming an ancestor cannot
 	// move a denied path out from under its rule.
 	Pins []string
+	// Denied are the daemon-private paths, canonical and sorted. They are
+	// denied on read as well as on write, after every allow, so they win
+	// even inside the session's read allowlist.
+	Denied []string
 	// Sockets are the declared sockets outside the writable set.
 	Sockets []string
 	// LoopbackTCPPorts are the declared loopback TCP ports.

@@ -13,7 +13,7 @@ import (
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v5"
+const seatbeltProfileVersion = "seatbelt-profile-v6"
 
 // seatbeltHost is what a rendering needs from the host beside the session.
 type seatbeltHost struct {
@@ -164,14 +164,16 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 //  2. under a read scope only: deny reading file contents, extended
 //     attributes and directory listings, allow the runtime paths, re-deny
 //     the package data trees and the system volumes, re-allow the OS
-//     cryptexes, then allow the session's read allowlist last, so it wins
-//     over the carve-outs; metadata stays readable;
+//     cryptexes, re-deny the daemon-private paths, then allow the session's
+//     read allowlist last, so it wins over the carve-outs; metadata stays
+//     readable;
 //  3. deny every write, every hard link, and the shared temporary and cache
 //     locations by name (D2, D2.1);
 //  4. allow the device nodes and the writable set (D2);
-//  5. deny the read-only leaves, the protected paths, the workarea root and
-//     its metadata, and pin every ancestor between a writable root and a
-//     nested denied path against rename — after the allows, so they win;
+//  5. deny the read-only leaves, the protected paths, the daemon-private
+//     paths, the workarea root and its metadata, and pin every ancestor
+//     between a writable root and a nested denied path against rename —
+//     after the allows, so they win;
 //  6. close the write proxies: mounting, job submission, launch services,
 //     scripting events, preference writes, task ports, local sockets
 //     outside the set, loopback TCP outside the declared ports, and the
@@ -218,6 +220,15 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 
 	switch r.ReadScope {
 	case "":
+		// With reads open the daemon-private paths still refuse writes
+		// through the D2 write deny below, and lose nothing by also
+		// refusing reads: a seat with open reads genuinely reads the
+		// whole disk (toolchain paths, package trees), and the token
+		// file is one more file on it. The daemon-private read deny
+		// therefore renders only under a read scope, where reads are
+		// otherwise confined to the allowlist and the token would be the
+		// one secret left reachable. Deployments that gate on the token
+		// run their seats under a read scope.
 	case agent.FileReadWorkarea:
 		runtimeFilters, err := filters("subpath", host.runtimeReads)
 		if err != nil {
@@ -241,6 +252,18 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 		b.WriteString("; The system volumes, except the OS cryptexes.\n")
 		fmt.Fprintf(&b, "(deny %s (subpath %q))\n", seatbeltReadOps, seatbeltSystemVolumes)
 		fmt.Fprintf(&b, "(allow %s (subpath %q))\n", seatbeltReadOps, seatbeltCryptexes)
+		// Daemon-private paths (the control token and its directory's
+		// other secrets): denied after the runtime allows and before the
+		// session's allowlist, so a declared read path that covers one is
+		// refused at resolve time and can never re-allow it here.
+		if len(r.Denied) > 0 {
+			deniedFilters, err := filters("subpath", r.Denied)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString("; Daemon-private paths: the control token and its directory's other secrets.\n")
+			rule("deny", seatbeltReadOps, deniedFilters)
+		}
 		b.WriteString("; The session: writable set, read-only leaves, declared read paths. Last, so they win.\n")
 		rule("allow", seatbeltReadOps, sessionFilters)
 		b.WriteString("\n")
@@ -275,6 +298,12 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 
 	denied := append(append([]string{}, r.ReadOnly...), r.Protected...)
 	denied = append(denied, r.MetadataDir)
+	// Daemon-private paths deny writes too, everywhere: even with reads
+	// open a seat must not replace the control token (a planted token the
+	// operator's CLI would then read) nor plant a sibling secret beside
+	// it. They render as subtrees so a file minted after the seat starts
+	// is covered the moment it appears.
+	denied = append(denied, r.Denied...)
 	deniedFilters, err := filters("subpath", denied)
 	if err != nil {
 		return "", err
@@ -287,7 +316,7 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 	if err != nil {
 		return "", err
 	}
-	b.WriteString("; Read-only leaves, protected paths and the workarea root, after the allows.\n")
+	b.WriteString("; Read-only leaves, protected paths, daemon-private paths and the workarea root, after the allows.\n")
 	rule("deny", "file-write*", deniedFilters)
 	rule("deny", "file-link", deniedFilters)
 	rule("deny", "file-write*", rootFilter)

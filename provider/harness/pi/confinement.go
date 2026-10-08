@@ -254,6 +254,37 @@ func productionConfinementDirs() piConfinementDirs {
 	}
 }
 
+// daemonPrivatePaths resolves the daemon-private files a confined seat must
+// never read nor write: the daemon's control-token file (the live bearer
+// for the host's privileged control API) and its directory's other secrets.
+// The path is resolved exactly the way the operator's CLI resolves it — the
+// file-env override wins when absolute, else the host state home — so the
+// boundary denies the live token whatever directory holds it; this package
+// never spells a brand-specific path. Both the token file and its parent
+// directory are denied, so a sibling secret minted beside the token and a
+// token minted after the seat starts are covered too. Read in the worker
+// (supervisor) process, never by the seat: the variable is runner-only and
+// is stripped from every spawned session's environment.
+func daemonPrivatePaths() []string {
+	var out []string
+	if override := strings.TrimSpace(os.Getenv(runtimeenv.ControlTokenPathEnv)); override != "" {
+		if filepath.IsAbs(override) {
+			out = append(out, override, filepath.Dir(override))
+		}
+		return out
+	}
+	if dir := statehome.StateDir(""); dir != "" {
+		out = append(out, filepath.Join(dir, controlTokenLeaf), dir)
+	}
+	return out
+}
+
+// controlTokenLeaf is the token file leaf under the host state directory.
+// It names the same file the host's control API mints and its CLI reads;
+// the constant lives here (rather than importing the client package) so
+// the provider does not depend on the control-client surface.
+const controlTokenLeaf = "control-token"
+
 // applyHostReadScope folds the host's read-scope settings into opts. The
 // host environment can only tighten the scope; a level this provider cannot
 // confine reads to, or a relative read path, refuses the provider rather
@@ -454,6 +485,14 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 // naming the daemon control API or the credential socket is refused first,
 // before anything is written.
 //
+// The daemon's control-token file and its directory's other secrets ride
+// Spec.DeniedPaths (daemonPrivatePaths): the daemon passes the path in,
+// resolved the same way the operator's CLI resolves it, so the seat's
+// profile denies the live token whatever brand directory holds it. A
+// failure to resolve them is not fatal — an empty set confines exactly as
+// before — but a resolved path that the boundary cannot render refuses the
+// spawn: the session never runs half-denied.
+//
 // The tmp and cache directories are created through sessionStateFS, so a
 // link planted there refuses the spawn before anything is created outside.
 // A nil confiner means the session did not request confinement: no plan.
@@ -499,20 +538,7 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 			return nil, fmt.Errorf("%w: pi confinement session cache: %v", agent.ErrSpawnFailed, err)
 		}
 	}
-	cspec := confinement.Spec{
-		SessionID:   "pi-" + sessionLeafKey(spec),
-		HarnessID:   piHarnessID,
-		SessionMode: agent.PromptModeForSpec(spec),
-		HarnessState: []string{
-			layout.root,
-		},
-		SessionTmp:       tmpDir,
-		Caches:           caches,
-		Sockets:          confinement.ResolverSockets(),
-		LoopbackTCPPorts: loopbackPorts,
-		ReadScope:        reads.level,
-		ReadPaths:        reads.paths,
-	}
+	cspec := seatSpec(spec, layout, tmpDir, caches, loopbackPorts, reads)
 	if authority := spec.RepositoryAuthority; authority != nil && authority.WorkareaRoot != "" {
 		cspec.WorkareaRoot = authority.WorkareaRoot
 		cspec.MutableLeaves = append([]string(nil), authority.MutablePaths...)
@@ -532,6 +558,32 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	return plan, nil
+}
+
+// seatSpec builds the seat confinement spec the spawner prepares.
+func seatSpec(spec agent.Spec, layout sessionLayout, tmpDir string, caches []confinement.Cache, loopbackPorts []int, reads piReadScope) confinement.Spec {
+	return confinement.Spec{
+		SessionID:   "pi-" + sessionLeafKey(spec),
+		HarnessID:   piHarnessID,
+		SessionMode: agent.PromptModeForSpec(spec),
+		HarnessState: []string{
+			layout.root,
+		},
+		SessionTmp:       tmpDir,
+		Caches:           caches,
+		Sockets:          confinement.ResolverSockets(),
+		LoopbackTCPPorts: loopbackPorts,
+		ReadScope:        reads.level,
+		ReadPaths:        reads.paths,
+		DeniedPaths:      daemonPrivatePaths(),
+	}
+}
+
+// confineSeatSpecForTest builds the seat spec the production entry point
+// builds, minus the workarea mapping confinePiSession adds after: the
+// DeniedPaths line under test is shared through seatSpec, not copied.
+func confineSeatSpecForTest(spec agent.Spec, layout sessionLayout, reads piReadScope) confinement.Spec {
+	return seatSpec(spec, layout, "", nil, nil, reads)
 }
 
 // endpointLoopbackPorts returns the port of the session's own model endpoint

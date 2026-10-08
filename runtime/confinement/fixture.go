@@ -60,20 +60,26 @@ type harnessStep struct {
 
 // fixture is one session mode's probe world: a workarea with a mutable and a
 // read-only leaf, harness state with a protected artifact inside it, session
-// tmp and cache, decoys outside the set, and the write proxies in reach. The
-// same world serves the read-scope pass (readSteps), which runs under the
+// tmp and cache, decoys outside the set, daemon-private secrets standing in
+// for the host state (a minted control token and a sibling secret, denied
+// even where a seat might otherwise reach), and the write proxies in reach.
+// The same world serves the read-scope pass (readSteps), which runs under the
 // read scope with a declared read path (rp) outside the set.
 type fixture struct {
 	dir, ws, meta, mut, git, state, ext, ro, rom, tmp, cache, out, rp string
-	tag                                                               string
-	steps                                                             []harnessStep
-	readSteps                                                         []harnessStep
-	cleanups                                                          []func()
-	listener                                                          net.Listener
-	accepts                                                           atomic.Int32
-	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                          net.Listener
-	tcpOpenPort, tcpClosedPort                                        int
-	tcpAccepts                                                        atomic.Int32
+	// daemonSecrets holds the daemon-private decoys: a minted token file
+	// and a sibling secret in the same directory, both denied through the
+	// production Spec.DeniedPaths path.
+	daemonFile, daemonSibling                string
+	tag                                      string
+	steps                                    []harnessStep
+	readSteps                                []harnessStep
+	cleanups                                 []func()
+	listener                                 net.Listener
+	accepts                                  atomic.Int32
+	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6 net.Listener
+	tcpOpenPort, tcpClosedPort               int
+	tcpAccepts                               atomic.Int32
 	// mounted records whether the mount probe got a volume over the
 	// read-only leaf; settle takes it before detaching.
 	mounted bool
@@ -117,6 +123,24 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 		if err := seed(path); err != nil {
 			return nil, err
 		}
+	}
+	// Daemon-private secrets: a minted token file and a sibling secret in
+	// the same directory, both denied through the production DeniedPaths
+	// path. The token is seeded before the boundary renders so both the
+	// live rendering and the loose canonicalization (which must also cover
+	// a token minted after the seat starts) are judged. The directory
+	// lives under dir rather than the real host state home so the probe
+	// never touches operator state.
+	fx.daemonFile = filepath.Join(dir, "daemon-state", "control-token")
+	fx.daemonSibling = filepath.Join(dir, "daemon-state", "sibling-secret")
+	if err := os.MkdirAll(filepath.Dir(fx.daemonFile), 0o700); err != nil {
+		return nil, fmt.Errorf("confinement: fixture: daemon secrets: %w", err)
+	}
+	if err := os.WriteFile(fx.daemonFile, []byte("sentinel-control-token\n"), 0o600); err != nil { //nolint:gosec // G306: fixture secret.
+		return nil, fmt.Errorf("confinement: fixture: daemon secrets: %w", err)
+	}
+	if err := seed(fx.daemonSibling); err != nil {
+		return nil, err
 	}
 
 	// Positive controls first: without them a profile that denies
@@ -187,6 +211,9 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	if err := fx.protected(); err != nil {
 		return nil, err
 	}
+	if err := fx.daemonSecrets(); err != nil {
+		return nil, err
+	}
 	if err := fx.widening(shared); err != nil {
 		return nil, err
 	}
@@ -218,6 +245,7 @@ func (fx *fixture) spec(mode agent.PromptSessionMode) Spec {
 		Caches:           []Cache{{Env: probeCacheEnv, Dir: fx.cache}},
 		ReadOnlyLeaves:   []string{fx.ro, fx.rom},
 		Protected:        []string{fx.ext},
+		DeniedPaths:      []string{fx.daemonFile, filepath.Dir(fx.daemonFile)},
 		LoopbackTCPPorts: []int{fx.tcpOpenPort},
 	}
 }
@@ -597,6 +625,32 @@ func (fx *fixture) protected() error {
 	fx.add(classProtected, false, probeStep{ID: "protected.create", Op: opCreate, Path: at("n")}, existsEffect(at("n")))
 	fx.add(classProtected, false, probeStep{ID: "protected.remove", Op: opRemove, Path: at("rm")}, func(stepResult) bool { return !exists(at("rm")) })
 	fx.add(classProtected, false, probeStep{ID: "protected.chmod", Op: opChmod, Path: at("ch")}, modeEffect(at("ch"), 0o644))
+	return nil
+}
+
+// daemonSecrets adds the probes for the daemon-private paths: the minted
+// token file and its sibling secret must refuse reads (file contents via
+// opRead and open, directory listings of their directory) under the
+// read-scope pass, and refuse writes, creates and permission changes under
+// the write pass — in both session modes. Judged by effect on disk, so a
+// backend that merely hides the error string still fails.
+func (fx *fixture) daemonSecrets() error {
+	reported := func(res stepResult) bool { return res.Err == "" }
+	// The token holds a sentinel, not the decoy content: changedEffect
+	// compares against the decoy, so the probes below judge against the
+	// exact bytes each operation would leave.
+	tokenChanged := func(stepResult) bool {
+		raw, err := os.ReadFile(fx.daemonFile) //nolint:gosec // G304: fixture path.
+		return err != nil || string(raw) != "sentinel-control-token\n"
+	}
+	fx.add(classProtected, false, probeStep{ID: "daemon.token.write", Op: opWrite, Path: fx.daemonFile}, tokenChanged)
+	fx.add(classProtected, false, probeStep{ID: "daemon.token.chmod", Op: opChmod, Path: fx.daemonFile}, modeEffect(fx.daemonFile, 0o600))
+	siblingNew := filepath.Join(filepath.Dir(fx.daemonSibling), "planted")
+	fx.add(classProtected, false, probeStep{ID: "daemon.sibling.create", Op: opCreate, Path: siblingNew}, existsEffect(siblingNew))
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.daemon_token.file", Op: opRead, Path: fx.daemonFile}, reported)
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.daemon_token.open", Op: opOpen, Path: fx.daemonFile}, reported)
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.daemon_token.list", Op: opList, Path: filepath.Dir(fx.daemonFile)}, reported)
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.daemon_sibling.file", Op: opRead, Path: fx.daemonSibling}, reported)
 	return nil
 }
 

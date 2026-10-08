@@ -30,7 +30,10 @@ var reservedEnv = map[string]bool{"TMPDIR": true, "TMP": true, "TEMP": true}
 
 // resolveSpec validates spec and returns it in canonical spelling. Every
 // refusal is writable_set_unrepresentable: the set cannot be confined as
-// declared, and it is never widened or narrowed to make it fit.
+// declared, and it is never widened or narrowed to make it fit. Denied
+// paths are canonicalized loosely (they may not exist yet) so a token
+// minted after the seat starts is still covered; every readAllowlist entry
+// stays renamed last in the profile, after the daemon-private denies.
 func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*Resolved, error) {
 	if strings.TrimSpace(spec.SessionID) == "" || strings.TrimSpace(spec.HarnessID) == "" {
 		return nil, refuse(ReasonWritableSetUnrepresentable, "session id and harness id are required")
@@ -118,6 +121,30 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		}
 		resolved.Protected = append(resolved.Protected, path)
 	}
+	seenDenied := map[string]bool{}
+	for _, raw := range spec.DeniedPaths {
+		if raw == "" || !filepath.IsAbs(raw) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a daemon-private path must be an absolute path")
+		}
+		// Loose: the secret may be minted after the seat starts, and its
+		// directory may not exist yet either. The longest existing
+		// ancestor is canonicalized and the rest appended, so both the
+		// minted file and its parent directory deny the same spelling
+		// the backend renders. Guarded against covering the operator home
+		// or the host state home below, once those resolve.
+		path, err := canonicalLoose(raw, canonical)
+		if err != nil {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "daemon-private path: %v", errnoText(err))
+		}
+		if path == string(filepath.Separator) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a daemon-private path is the filesystem root")
+		}
+		if !seenDenied[path] {
+			seenDenied[path] = true
+			resolved.Denied = append(resolved.Denied, path)
+		}
+	}
+	sort.Strings(resolved.Denied)
 	for _, socket := range spec.Sockets {
 		if !filepath.IsAbs(socket) {
 			return nil, refuse(ReasonWritableSetUnrepresentable, "declared socket must be an absolute path")
@@ -171,6 +198,11 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 				return nil, refuse(ReasonWritableSetUnrepresentable, "%s covers the %s", entry.Class, guard.name)
 			}
 		}
+		for _, denied := range resolved.Denied {
+			if insideOrEqual(entry.Path, denied) {
+				return nil, refuse(ReasonWritableSetUnrepresentable, "%s lies inside a daemon-private path", entry.Class)
+			}
+		}
 		if entry.Class == ClassMutableLeaf {
 			if !strictlyInside(entry.Path, root) {
 				return nil, refuse(ReasonWritableSetUnrepresentable, "mutable leaf %q is not inside the workarea root", filepath.Base(entry.Path))
@@ -214,6 +246,14 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 				return nil, refuse(ReasonWritableSetUnrepresentable, "a read path covers the %s", guard.name)
 			}
 		}
+		// A declared read path never re-opens a daemon-private path:
+		// the token stays denied even when a host declares a broad
+		// read path that would otherwise cover it.
+		for _, denied := range resolved.Denied {
+			if insideOrEqual(denied, path) {
+				return nil, refuse(ReasonWritableSetUnrepresentable, "a read path covers a daemon-private path")
+			}
+		}
 		if !seenRead[path] {
 			seenRead[path] = true
 			resolved.ReadPaths = append(resolved.ReadPaths, path)
@@ -230,6 +270,7 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		resolved.Caches = append(resolved.Caches, Cache{Env: cache.Env, Dir: resolved.Writable[len(spec.MutableLeaves)+len(spec.HarnessState)+1+i].Path})
 	}
 	denied := append(append(append([]string{}, resolved.ReadOnly...), resolved.Protected...), resolved.MetadataDir)
+	denied = append(denied, resolved.Denied...)
 	resolved.Pins = ancestorPins(writablePaths, denied)
 	sort.SliceStable(resolved.Writable, func(i, j int) bool {
 		if classOrder[resolved.Writable[i].Class] != classOrder[resolved.Writable[j].Class] {

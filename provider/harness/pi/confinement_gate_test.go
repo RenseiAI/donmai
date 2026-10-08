@@ -15,6 +15,7 @@ import (
 	credentials "github.com/RenseiAI/donmai/credentials-client"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 // TestPiConfinementEnabled_FollowsTheRequest pins the gate (ADR-2026-10-03
@@ -442,4 +443,71 @@ func TestSessionReadScope_DeclaresWhatASeatReads(t *testing.T) {
 	if _, err := missing.sessionReadScope(home); !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Fatalf("sessionReadScope with a missing harness binary = %v, want a spawn failure", err)
 	}
+}
+
+// TestDaemonPrivatePaths_ResolvesTheLiveToken pins the daemon-to-seat path:
+// the override wins when absolute (with its parent directory, so sibling
+// secrets are covered); otherwise the host state home names the token leaf
+// and the state home itself. A relative override resolves to nothing rather
+// than to a guess, and the variable never reaches a spawned session's
+// environment (runner-only). The leaf spells the same file the operator's
+// CLI reads.
+func TestDaemonPrivatePaths_ResolvesTheLiveToken(t *testing.T) {
+	t.Run("override wins with its directory", func(t *testing.T) {
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "/var/lib/host/control-token")
+		got := daemonPrivatePaths()
+		if !slices.Equal(got, []string{"/var/lib/host/control-token", "/var/lib/host"}) {
+			t.Fatalf("daemonPrivatePaths = %q", got)
+		}
+	})
+	t.Run("relative override resolves to nothing", func(t *testing.T) {
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "control-token")
+		if got := daemonPrivatePaths(); len(got) != 0 {
+			t.Fatalf("daemonPrivatePaths = %q, want nothing", got)
+		}
+	})
+	t.Run("state home names the token leaf", func(t *testing.T) {
+		t.Setenv(runtimeenv.ControlTokenPathEnv, "")
+		statehome.SetBaseHome(t.TempDir())
+		t.Cleanup(statehome.ResetForTest)
+		got := daemonPrivatePaths()
+		if len(got) != 2 || filepath.Base(got[0]) != "control-token" || got[1] != filepath.Dir(got[0]) {
+			t.Fatalf("daemonPrivatePaths = %q, want the token file and its directory", got)
+		}
+	})
+	t.Run("runner-only", func(t *testing.T) {
+		if !runtimeenv.IsRunnerOnly(runtimeenv.ControlTokenPathEnv) {
+			t.Fatalf("%s is not runner-only: it would reach a spawned session's environment", runtimeenv.ControlTokenPathEnv)
+		}
+	})
+	t.Run("seat spec carries the daemon-private paths", func(t *testing.T) {
+		base, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		mut := filepath.Join(base, "ws", "mut")
+		if err := os.MkdirAll(filepath.Join(mut, ".git"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		secretDir := filepath.Join(base, "daemon-state")
+		token := filepath.Join(secretDir, "control-token")
+		if err := os.MkdirAll(secretDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(token, []byte("sentinel-control-token\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(runtimeenv.ControlTokenPathEnv, token)
+		layout, err := materializeExtensionForSpec(agent.Spec{Cwd: mut}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The production entry point resolves the seat spec through
+		// confineSeatSpecForTest, which shares the DeniedPaths line
+		// with confinePiSession: dropping that line fails here.
+		spec := confineSeatSpecForTest(agent.Spec{Cwd: mut}, layout, piReadScope{})
+		if !slices.Contains(spec.DeniedPaths, token) || !slices.Contains(spec.DeniedPaths, secretDir) {
+			t.Fatalf("seat spec denied = %q, want the live token and its directory", spec.DeniedPaths)
+		}
+	})
 }

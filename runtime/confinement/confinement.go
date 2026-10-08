@@ -45,8 +45,9 @@ var classOrder = map[WritableClass]int{
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
 // every earlier self-test record stale. v4 adds the read-scope pass; v5 adds
-// the terminal, package data tree and extended attribute read probes.
-const ProbeSetVersion = "executor-confinement-probes-v5"
+// the terminal, package data tree and extended attribute read probes; v6
+// adds the daemon-private (control token) read and write probes.
+const ProbeSetVersion = "executor-confinement-probes-v6"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the
@@ -77,6 +78,19 @@ type Spec struct {
 	// Protected are paths kept outside the writable set even where they sit
 	// inside it, such as runner-injected artifacts beside harness state.
 	Protected []string
+	// DeniedPaths are daemon-private files and directories the seat must
+	// never read nor write: the daemon's control-token file and its
+	// directory's other secrets. The composing binary passes each path in
+	// (resolved from its own host directories); this package never spells a
+	// brand-specific path. Every entry is denied file contents and
+	// directory listings as well as writes, after every allow, so the deny
+	// wins even inside the session's read allowlist. Entries may not exist
+	// yet (a token minted after the seat spawns is still denied). A
+	// writable root inside a denied path refuses the spawn; a denied path
+	// inside the writable set stays denied. Every backend renders them;
+	// the Linux mount-namespace backend overlays placeholders and programs
+	// its Landlock stage from the same resolved set.
+	DeniedPaths []string
 	// Sockets are the local sockets the adapter declares for the session
 	// (its control channel, an agent socket the credentials level grants, the
 	// OS resolver). Every other socket outside the writable set is closed.
