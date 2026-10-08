@@ -54,9 +54,9 @@ func TestShimOutputBatchBatchesLiveOutput(t *testing.T) {
 	// The shell reads its start line and then emits one line per tick.
 	// The read is the only synchronization the test needs: the shell cannot
 	// emit before the test writes "start", so every output frame belongs to
-	// this run's emission window by construction. The shell dies on its own
-	// after a bounded flood, so a slow scheduler can delay the verdict
-	// without the emission window running dry first: the test emits its
+	// this run's emission window by construction. The shell floods 600 lines
+	// (~20s), so the window outlasts the gate: a slow scheduler delays the
+	// verdict without the source running dry first; the test emits its
 	// Marker only after the gate below has passed.
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 1,
@@ -281,9 +281,8 @@ func TestShimOutputBatchBatchesLiveOutput(t *testing.T) {
 	// time, so a fixed deadline mistakes a slow scheduler for a dead pump.
 	// Progress is fresh relay output lines or a newly observed batch window;
 	// a pump that forwards one frame at a time makes the first kind and never
-	// the second, so it still times out. The overall bound stays well inside
-	// the 10s test context.
-	gateDeadline := time.Now().Add(30 * time.Second)
+	// the second, so it still times out. The stall arm bounds every wait, and
+	// the test context below bounds it further.
 	lastProgress := time.Now()
 	lastWire, lastBatch := -1, -1
 	for {
@@ -308,10 +307,6 @@ func TestShimOutputBatchBatchesLiveOutput(t *testing.T) {
 				goto gated
 			}
 		default:
-		}
-		gateWire, gateSource, gateBatch = nWire, nSource, nBatch
-		if time.Now().After(gateDeadline) {
-			t.Fatalf("timed out after 30s waiting for live relay traffic while the source emits; last progress %s ago (wire=%d batch=%d)", time.Since(lastProgress).Truncate(time.Millisecond), lastWire, lastBatch)
 		}
 		if time.Since(lastProgress) > 9*time.Second {
 			t.Fatalf("relay pipeline stalled: no new output lines or batch windows for 9s (wire=%d batch=%d)", lastWire, lastBatch)
