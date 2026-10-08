@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -82,6 +83,25 @@ func TestProbeUsage_MapsFakeReadThroughSharedMapper(t *testing.T) {
 	}
 }
 
+// TestProbeUsage_RefusalIsAnswered pins the logged-out posture:
+// a CLI that refuses the usage read yields a probe-failed snapshot
+// marked answered, so the daemon records ok:false beside the last
+// good windows.
+func TestProbeUsage_RefusalIsAnswered(t *testing.T) {
+	t.Parallel()
+
+	accountID, probed, _ := ProbeUsage(t.Context(), fakeUsageCLI(t, "refused"))
+	if probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableProbeFailed {
+		t.Fatalf("probed = %+v, want probeFailed", probed.Unavailable)
+	}
+	if !probed.Unavailable.Answered {
+		t.Error("refusal not marked answered; the usage read refused the probe")
+	}
+	if accountID != "" {
+		t.Errorf("account id = %q, want empty when the read produced nothing", accountID)
+	}
+}
+
 // TestProbeUsage_SilentReadIsAnUnansweredFailure pins the unreachable
 // posture: a CLI that answers without a usage response yields a
 // probe-failed snapshot that carries no login verdict.
@@ -111,6 +131,20 @@ func TestProbeUsage_EmptyBinaryIsAnUnansweredFailure(t *testing.T) {
 	}
 	if probed.Unavailable.Answered {
 		t.Errorf("missing binary marked answered; nothing ran to refuse")
+	}
+}
+
+// TestLoginRefused_FalseOnCancelledContext pins the conjunct that
+// keeps an unreachable probe unanswered: a login check that never
+// ran because its context was already expired is not a refusal, so
+// the daemon records no new verdict instead of ok:false.
+func TestLoginRefused_FalseOnCancelledContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if loginRefused(ctx, "/nonexistent-claude-binary") {
+		t.Error("loginRefused = true on a cancelled context; an expired check never answered")
 	}
 }
 

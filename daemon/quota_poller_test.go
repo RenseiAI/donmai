@@ -54,7 +54,8 @@ func quotaPollerFixtureClaude(t *testing.T, at time.Time) agent.UsageLimits {
 
 // TestQuotaPoller_ProbesDueImmediatelyOnStart drives the production
 // poller entry point (Start): with both harnesses due, the first
-// attempts fire at once, and the heartbeat snapshot carries quota
+// attempts fire within about a second of Start (the loop floors its
+// first wait), and the heartbeat snapshot carries quota
 // windows with an ok:true login check for each — the recorded-fixture
 // proof behind the "within one probe interval" acceptance.
 func TestQuotaPoller_ProbesDueImmediatelyOnStart(t *testing.T) {

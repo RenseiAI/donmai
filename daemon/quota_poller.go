@@ -156,13 +156,17 @@ func newQuotaPoller(q *quotaState, probes map[string]quotaProbeFunc) *quotaPolle
 	return &quotaPoller{quota: q, probes: probes}
 }
 
-// Start launches the probe goroutine. It probes what is due
-// immediately, so a freshly started daemon reports quota on its first
-// beats, then sleeps until the next harness comes due. Subsequent
-// calls are no-ops.
+// Start launches the probe goroutine. Probes that are due fire
+// within about a second of Start (the loop floors its first wait),
+// so a freshly started daemon reports quota on its first beats, then
+// sleeps until the next harness comes due. Subsequent calls are
+// no-ops.
 func (p *quotaPoller) Start() {
+	if p == nil {
+		return
+	}
 	p.mu.Lock()
-	if p.running || p == nil || p.quota == nil || len(p.probes) == 0 {
+	if p.running || p.quota == nil || len(p.probes) == 0 {
 		p.mu.Unlock()
 		return
 	}
