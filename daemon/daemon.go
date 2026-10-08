@@ -149,6 +149,19 @@ type Options struct {
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
 
+	// QuotaProbeBinaries names the harness CLIs the live quota probes
+	// shell out to, keyed by harness ("codex", "claude" — see
+	// agent.UsageHarnessCodex / agent.UsageHarnessClaude). Empty (the
+	// default every Start call gets unless a caller sets this field)
+	// disables that harness's probe: the quota cache then moves only
+	// on worker-reported stream updates. Only the production entry
+	// point (afcli/daemon_run.go) sets this, resolved from PATH, so
+	// a daemon built for real operator use probes its host logins
+	// while a daemon built for a test — including every test that
+	// predates this field and never mentions it — never shells out
+	// to a real harness login.
+	QuotaProbeBinaries map[string]string
+
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
 	// polls, verifies (Ed25519 + content hash), and caches to disk,
@@ -490,6 +503,13 @@ type Daemon struct {
 	// fire at most every 5 minutes per provider; failed probes keep
 	// the last good windows.
 	quota *quotaState
+
+	// quotaPoller runs the live quota probes that fill the cache
+	// above: one codex `account/rateLimits/read` and one claude usage
+	// read per probe interval, plus the worker-reported stream
+	// updates the usage route folds in. Nil until Start wires it;
+	// stopped by Stop.
+	quotaPoller *quotaPoller
 
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
@@ -1186,6 +1206,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 	spawnerOpts.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
 	spawnerOpts.ProjectAdmissionMode = cfg.EffectiveProjectAdmissionMode()
 	spawnerOpts.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
+	// Per-seat resource budget: resolve the authored block against host
+	// capacity once here (not per spawn — NumCPU/meminfo do not change
+	// under a running daemon). A zero block means budgeting is off and
+	// leaves every seat exactly as before. Only set what the operator
+	// authored: an embedder that composed its own SpawnerOptions.SeatBudget
+	// keeps it.
+	if spawnerOpts.SeatBudget == (SeatBudget{}) && cfg.Capacity.SeatBudget != (SeatBudgetConfig{}) {
+		resolved := resolveSeatBudget(cfg.Capacity.SeatBudget, cfg.Capacity.MaxConcurrentSessions, 0, 0)
+		spawnerOpts.SeatBudget = SeatBudget{
+			CPUs:     resolved.CPUs,
+			MemoryMB: resolved.MemoryMB,
+			IOWeight: resolved.IOWeight,
+			Mode:     string(resolved.Mode),
+		}
+	}
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
 	}
@@ -1496,6 +1531,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 			d.heartbeat.Start()
 		}
 
+		// Live quota probes — the reads that fill the quota cache
+		// behind the heartbeat quota field. The first attempts fire
+		// immediately, so a host with signed-in harnesses reports
+		// quota within one probe interval of starting; stream updates
+		// from live sessions fold in through the usage route while
+		// the probes are the authoritative refresh.
+		d.quotaPoller = newQuotaPoller(d.quota, d.quotaProbes())
+		d.quotaPoller.Start()
+
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar
 		// behaviour holds: the worker shows "active" but never picks up
@@ -1688,7 +1732,8 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
-	if !projectsChanged && !localChanged && !capacityChanged {
+	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -1709,6 +1754,27 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			}
 		}
 		d.config.Capacity.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
+	}
+	if seatBudgetChanged {
+		if err := validateSeatBudget(cfg.Capacity.SeatBudget); err != nil {
+			d.mu.Unlock()
+			releasePolicy()
+			slog.Warn("[yaml-watcher] rejected seat budget", "error", err)
+			return
+		}
+		// Re-resolve against the (possibly new) seat count so derived
+		// shares track the live capacity. Seats already running keep the
+		// budget they started with; only new spawns see the new share.
+		resolved := resolveSeatBudget(cfg.Capacity.SeatBudget, cfg.Capacity.MaxConcurrentSessions, 0, 0)
+		if d.spawner != nil {
+			d.spawner.SetSeatBudget(SeatBudget{
+				CPUs:     resolved.CPUs,
+				MemoryMB: resolved.MemoryMB,
+				IOWeight: resolved.IOWeight,
+				Mode:     string(resolved.Mode),
+			})
+		}
+		d.config.Capacity.SeatBudget = cfg.Capacity.SeatBudget
 	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {
@@ -1886,6 +1952,13 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	}
 	if refresher != nil {
 		refresher.Stop()
+	}
+	d.lifecycleMu.Lock()
+	quotaPoller := d.quotaPoller
+	d.quotaPoller = nil
+	d.lifecycleMu.Unlock()
+	if quotaPoller != nil {
+		quotaPoller.Stop()
 	}
 
 	d.lifecycleMu.Lock()
@@ -2065,6 +2138,18 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	// no-op, so the legacy WorkerCapabilitiesFunc value stands. Appended AFTER
 	// WithWorkerCapabilities so the per-org flag is authoritative when present.
 	opts = append(opts, WithMergeQueueLanding(item.MergeQueueLanding))
+	// Per-seat budget: stamp the daemon's resolved share so the worker
+	// applies the cooperative caps and reports the seat posture on the
+	// session result. A disabled budget stamps nothing.
+	if budget := d.daemonSeatBudget(); !budget.Disabled() {
+		rep := seatBudgetReport(budget)
+		opts = append(opts, WithSeatBudget(&SessionSeatBudget{
+			Mode:     rep.Mode,
+			CPUs:     rep.CPUs,
+			MemoryMB: rep.MemoryMB,
+			Detail:   rep.Detail,
+		}))
+	}
 	detail := PollItemToSessionDetail(
 		item,
 		projects,

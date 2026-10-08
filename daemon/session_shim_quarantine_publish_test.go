@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -622,9 +621,17 @@ func TestReleaseShimIfLiveConsumesTerminalProofBeforePublishing(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-release-order", SessionID: "session-release-order"}
+	// The shell-free echo child: it only has to stay alive and answering
+	// behind the adopted connection while the disconnect path runs. It
+	// answers every input line with an `ack:` echo, so it shares the PTY
+	// round trip every other shim suite asserts.
+	echoSpec, err := daemonShimEchoSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 11,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		Spec:         echoSpec,
 		WorkareaPath: filepath.Join(dir, "workarea"),
 	})
 	if err != nil {

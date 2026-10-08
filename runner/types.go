@@ -160,6 +160,14 @@ type QueuedWork struct {
 	// daemon that does not advertise capabilities keeps the prior behaviour).
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
 
+	// SeatBudget carries the daemon's resolved per-seat resource budget for
+	// this session: the share plus the mode. Threaded from the daemon's
+	// SessionDetail. Nil means budgeting is off — the seat spawns exactly
+	// as before. The runner applies the cooperative worker caps to the
+	// harness environment and reports what the seat actually got on the
+	// session result.
+	SeatBudget *SeatBudget `json:"seatBudget,omitempty"`
+
 	// RetainRecording suppresses the runner's end-of-session best-effort
 	// deletion of an interactive session's on-disk asciinema-v2 cast. This is
 	// a LOCAL OPERATOR decision only — it never rides the wire (json:"-") and

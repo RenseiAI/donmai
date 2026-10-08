@@ -27,6 +27,12 @@ type controlRoute struct {
 
 // mutatingControlRoutes lists every mutating route registered behind
 // requireControlAuth. Keep it in step with Server.register.
+//
+// The session usage POST (/api/daemon/sessions/<id>/usage) is
+// deliberately absent: workers never hold the operator control token,
+// so that leaf enforces its own session-scoped credential instead
+// (see handleSessionUsage). Re-adding it here would 401 every live
+// quota update back to the 5-minute probe cadence.
 var mutatingControlRoutes = []controlRoute{
 	{path: "/api/daemon/pause"},
 	{path: "/api/daemon/resume"},

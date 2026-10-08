@@ -10,12 +10,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/runner"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -248,3 +251,86 @@ func TestAgentRunBootstrapFakeDaemonRedaction(t *testing.T) {
 type testBootstrapDiscard struct{}
 
 func (testBootstrapDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+// statusRecordingTransport wraps a base RoundTripper and records the
+// status code of every response, so a test can observe whether the
+// production reporter path was accepted or refused without
+// intercepting it.
+type statusRecordingTransport struct {
+	base  http.RoundTripper
+	mu    sync.Mutex
+	codes []int
+}
+
+func (t *statusRecordingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(r)
+	if err == nil {
+		t.mu.Lock()
+		t.codes = append(t.codes, resp.StatusCode)
+		t.mu.Unlock()
+	}
+	return resp, err
+}
+
+func (t *statusRecordingTransport) last() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.codes) == 0 {
+		return 0
+	}
+	return t.codes[len(t.codes)-1]
+}
+
+// TestAgentRunLiveQuotaUpdateDeliversWithSessionCredential is the
+// worker half of the live-update proof: the quota reporter built the
+// way runAgentRun builds it — daemon URL, session id, harness, and
+// the bearer the worker holds — delivers its streamed update to the
+// enforced-gate daemon with the session read credential, and is
+// refused with any other bearer. Delivery is observed at the HTTP
+// layer; the merge half is pinned on the daemon side.
+func TestAgentRunLiveQuotaUpdateDeliversWithSessionCredential(t *testing.T) {
+	d, srv, cleanup := startBootstrapDaemon(t)
+	defer cleanup()
+	stated := seedBootstrapSession(t, d, srv, "quota-delivery")
+
+	daemonURL := "http://" + srv.Addr()
+	update := agent.UsageEvent{Usage: &agent.UsageLimitsUpdate{
+		CheckedAt: "2026-10-06T12:00:00Z",
+		Windows:   []agent.UsageWindow{{ID: "primary", Kind: agent.UsageWindowWeekly, Label: "Weekly", UsedPercent: 42}},
+	}}
+
+	// The worker's reporter carries the stated session credential: the
+	// daemon answers 200.
+	recorder := &statusRecordingTransport{base: http.DefaultTransport}
+	reporter := runner.NewQuotaReporter(
+		&http.Client{Timeout: 10 * time.Second, Transport: recorder},
+		daemonURL, "quota-delivery", agent.UsageHarnessCodex, stated, nil)
+	reporter.ReportUsageEvent(context.Background(), update)
+	if got := recorder.last(); got != http.StatusOK {
+		t.Fatalf("reporter with the session credential = %d, want 200", got)
+	}
+
+	// The same reporter shape with a foreign bearer is refused: the
+	// route stays closed to anything that does not name this session.
+	for _, bearer := range []string{"", "wrong-bearer"} {
+		refused := &statusRecordingTransport{base: http.DefaultTransport}
+		reporter := runner.NewQuotaReporter(
+			&http.Client{Timeout: 10 * time.Second, Transport: refused},
+			daemonURL, "quota-delivery", agent.UsageHarnessCodex, bearer, nil)
+		reporter.ReportUsageEvent(context.Background(), update)
+		if got := refused.last(); got != http.StatusUnauthorized {
+			t.Errorf("reporter with bearer %q = %d, want 401", bearer, got)
+		}
+	}
+
+	// The session credential names no other session either.
+	seedBootstrapSession(t, d, srv, "quota-other")
+	cross := &statusRecordingTransport{base: http.DefaultTransport}
+	reporter = runner.NewQuotaReporter(
+		&http.Client{Timeout: 10 * time.Second, Transport: cross},
+		daemonURL, "quota-other", agent.UsageHarnessCodex, stated, nil)
+	reporter.ReportUsageEvent(context.Background(), update)
+	if got := cross.last(); got != http.StatusUnauthorized {
+		t.Errorf("reporter with a foreign session credential = %d, want 401", got)
+	}
+}

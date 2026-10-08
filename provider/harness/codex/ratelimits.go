@@ -73,11 +73,17 @@ type ResetCreditsSummary struct {
 }
 
 // rateLimitsReadResponse is the structural view of the
-// `account/rateLimits/read` response body.
+// `account/rateLimits/read` response body. accountId rides the
+// response only on newer app-server builds; older ones omit it,
+// so callers must treat an empty id as "the login did not name an
+// account" rather than as a distinct account.
 type rateLimitsReadResponse struct {
 	RateLimits          *RateLimitSnapshot            `json:"rateLimits"`
 	RateLimitsByLimitID map[string]*RateLimitSnapshot `json:"rateLimitsByLimitId"`
 	ResetCredits        *ResetCreditsSummary          `json:"rateLimitResetCredits"`
+	// AccountID is the opaque account identity the read names, when
+	// the app-server build reports one. It never carries an address.
+	AccountID string `json:"accountId"`
 }
 
 // rateLimitsUpdatedParams is the structural view of the
@@ -354,10 +360,11 @@ func (p *RateLimitsProbe) LastFire() time.Time {
 
 // ReadProbe performs one quota read against the app-server client. A
 // nil client (the harness is not running) is a failed probe, never an
-// error: the last good windows stay published. Only a JSON-RPC error
-// (the app-server answered and refused the read) marks the failure as
-// answered; a nil client, a timeout, an exit or an unreadable reply
-// never reached the account and carries no login verdict.
+// error: the last good windows stay published. Only the app-server's
+// login refusal (rateLimitsRefusalCode) marks the failure as answered;
+// a nil client, a timeout, an exit, an unreadable reply or a backend
+// fetch the app-server could not complete says nothing about the login
+// and carries no verdict.
 func (p *RateLimitsProbe) ReadProbe(ctx context.Context, client *Client) agent.UsageLimits {
 	now := time.Now()
 	if p != nil && p.now != nil {
@@ -385,13 +392,76 @@ func (p *RateLimitsProbe) ReadProbe(ctx context.Context, client *Client) agent.U
 	return RateLimitsToLimits(resp.RateLimits, resp.RateLimitsByLimitID, resp.ResetCredits, checkedAt)
 }
 
+// ProbeQuota performs one quota read against the provider's shared
+// app-server and reports the opaque account identity, the plan slug
+// and the mapped limits snapshot. It starts the app-server on first
+// use; a provider with no codex binary or no host login fails closed
+// with agent.ErrProviderUnavailable, and a read the app-server never
+// answered yields a probe-failed snapshot rather than an error, so
+// the caller can feed it straight into the daemon's quota cache.
+//
+// The account identity is the read's own accountId: the value the
+// platform hashes, never an address. Older app-server builds omit it;
+// the empty string then means "the login did not name an account",
+// and the caller must not treat it as a distinct account.
+func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, probed agent.UsageLimits) {
+	if p == nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	if err := p.ensureProbeStarted(); err != nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
+	}
+	p.startMu.Lock()
+	client := p.client
+	p.startMu.Unlock()
+	probed = NewRateLimitsProbe().ReadProbe(ctx, client)
+	if probed.Unavailable != nil {
+		return "", "", probed
+	}
+	return readAccountIdentity(ctx, client, probed)
+}
+
+// readAccountIdentity re-reads the raw response to lift the account
+// identity and plan slug the mapped snapshot drops. It runs under the
+// probe's own timeout; any failure keeps the mapped windows and
+// leaves the identity empty.
+func readAccountIdentity(ctx context.Context, client *Client, probed agent.UsageLimits) (string, string, agent.UsageLimits) {
+	if client == nil {
+		return "", "", probed
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, RateLimitsProbeTimeout)
+	defer cancel()
+	raw, err := client.Request(reqCtx, "account/rateLimits/read", nil, RateLimitsProbeTimeout)
+	if err != nil {
+		return "", "", probed
+	}
+	var resp rateLimitsReadResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", "", probed
+	}
+	var plan string
+	if resp.RateLimits != nil && resp.RateLimits.PlanType != nil {
+		plan = *resp.RateLimits.PlanType
+	}
+	return resp.AccountID, plan, probed
+}
+
+// rateLimitsRefusalCode is the JSON-RPC code the app-server answers a
+// rate-limit read with when no usable login backs it ("codex account
+// authentication required to read rate limits", "chatgpt
+// authentication required to read rate limits"). Its other errors say
+// nothing about the login: -32603 is a backend fetch it could not
+// complete ("failed to fetch codex rate limits: ..." when the backend
+// is unreachable) and -32601 is a build that does not know the method.
+const rateLimitsRefusalCode = -32600
+
 // answeredByAppServer reports whether a failed read was the app-server's
-// own JSON-RPC refusal. A stopped client fails its pending requests with
-// a synthesized JSON-RPC error, so a closed client never counts as an
+// own login refusal. A stopped client fails its pending requests with a
+// synthesized JSON-RPC error, so a closed client never counts as an
 // answer.
 func answeredByAppServer(client *Client, err error) bool {
 	var rpcErr *RPCError
-	if !errors.As(err, &rpcErr) {
+	if !errors.As(err, &rpcErr) || rpcErr.Code != rateLimitsRefusalCode {
 		return false
 	}
 	select {

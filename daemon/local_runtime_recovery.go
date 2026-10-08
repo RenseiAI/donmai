@@ -70,7 +70,7 @@ func (l *localRuntime) recover(ctx context.Context) error {
 
 func (l *localRuntime) hold(projection localqueue.SessionProjection, reason string) {
 	envelope := projection.Admission.Envelope
-	handle := SessionHandle{SessionID: envelope.Session.SessionID, State: SessionUnknown, AcceptedAt: envelope.InitialEvent.RecordedAt, ProjectName: envelope.Source.OwnerRepo, Repository: "https://github.com/" + envelope.Source.OwnerRepo + ".git"}
+	handle := SessionHandle{SessionID: envelope.Session.SessionID, State: SessionUnknown, AcceptedAt: envelope.InitialEvent.RecordedAt, ProjectName: envelope.Source.OwnerRepo, Repository: "https://github.com/" + envelope.Source.OwnerRepo + ".git", SeatBudget: l.daemon.seatBudgetHandleReport()}
 	if projection.Launch != nil {
 		identity, err := sessionshim.ProcessIdentityFor(projection.Launch.ProcessID)
 		if err == nil && strconv.FormatInt(identity.StartedAt, 10) == projection.Launch.ProcessStart {

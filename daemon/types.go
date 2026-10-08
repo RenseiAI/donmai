@@ -248,6 +248,16 @@ type SessionResources struct {
 	MemoryMB int `json:"memoryMb,omitempty"`
 }
 
+// SessionSeatBudget is the per-seat budget evidence one session ran under:
+// the posture (enforced | best-effort | none) with the values. Additive on
+// every handle that carries it; absent against an older daemon.
+type SessionSeatBudget struct {
+	Mode     string `json:"mode"`
+	CPUs     int    `json:"cpus,omitempty"`
+	MemoryMB int    `json:"memoryMb,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
 // SessionHandle is the daemon-side handle for an in-flight session.
 //
 // Wire shape (camelCase JSON) returned by GET /api/daemon/sessions. The
@@ -323,6 +333,11 @@ type SessionHandle struct {
 	// WorkType is the workflow discriminant ("development", "qa", ...).
 	// Mirrors SessionSpec.WorkType.
 	WorkType string `json:"workType,omitempty"`
+
+	// SeatBudget is the per-seat budget this session runs under: the
+	// posture (enforced | best-effort | none) with the values. Nil when
+	// budgeting is off on this host.
+	SeatBudget *SessionSeatBudget `json:"seatBudget,omitempty"`
 }
 
 // ── Heartbeat payload ──────────────────────────────────────────────────────

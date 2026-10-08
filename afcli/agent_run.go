@@ -578,6 +578,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// the dispatch-time fold (v1).
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
+		// Live quota updates ride back to the admitting daemon: the
+		// sparse windows the session's harness stream carries (a codex
+		// `account/rateLimits/updated` notification, a claude
+		// `rate_limit_event`) merge there by window id onto the probe
+		// snapshot behind the heartbeat quota field. Best-effort and
+		// bounded; an unreachable daemon never stalls the session.
+		QuotaReporterForSession: func(_, harness string) *runner.QuotaReporter {
+			return runner.NewQuotaReporter(callbackClient, daemonURL, sessionID, harness, daemonToken, logger)
+		},
 	}
 	applyAgentRunCapabilityOptions(&runnerOptions, opts)
 	r, err := runner.New(runnerOptions)
@@ -1507,6 +1516,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		PlatformURL:           d.PlatformURL,
 		TerminalWorkareaLease: d.TerminalWorkareaLease,
 		Capabilities:          d.Capabilities,
+		SeatBudget:            detailSeatBudget(d.SeatBudget),
 	}
 	if len(d.OperationalPayload) > 0 {
 		// Decode into a zero value: absent receipted fields must stay absent rather
@@ -1700,6 +1710,21 @@ func detailContinuePullRequest(in *daemon.PollContinuePullRequest) *prompt.Conti
 		Number:  in.Number,
 		HeadRef: in.HeadRef,
 		HeadSha: in.HeadSha,
+	}
+}
+
+// detailSeatBudget re-types the daemon's per-seat budget mirror into the
+// runner-consumable shape. Nil stays nil: budgeting off means the seat
+// spawns exactly as before.
+func detailSeatBudget(in *daemon.SessionSeatBudget) *runner.SeatBudget {
+	if in == nil {
+		return nil
+	}
+	return &runner.SeatBudget{
+		Mode:     in.Mode,
+		CPUs:     in.CPUs,
+		MemoryMB: in.MemoryMB,
+		Detail:   in.Detail,
 	}
 }
 

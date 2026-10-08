@@ -86,6 +86,32 @@ func TestHostwatchAxesDirectProducer(t *testing.T) {
 	waitForActiveCount(t, spawner, 0)
 }
 
+// TestHostwatchAxesShimHandleSeatBudget calls the actual shim handle
+// publication function (trackLaunchedShim, the F1 report site) with a seat
+// budget on the spawner and pins that the shim handle carries the same
+// posture the direct spawn path reports. A shim seat that ran unconfined
+// while its handle claimed enforced would be the false report this rule
+// exists to prevent.
+func TestHostwatchAxesShimHandleSeatBudget(t *testing.T) {
+	daemon := &Daemon{shims: newSessionShimState()}
+	daemon.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "example", Repository: "github.com/example/project"}},
+		MaxConcurrentSessions: 1,
+		SeatBudget:            SeatBudget{CPUs: 2, Mode: "best-effort"},
+	})
+	controller := &sessionshim.Controller{}
+	item := axesPollFixture(t)
+	item.ResolvedProfile.Company = ""
+	spec := PollItemToSessionSpec(item, nil)
+	handle := daemon.trackLaunchedShim(controller, spec, ProjectConfig{ID: "example"}, "", "", SessionShimAdoptionEvidence{}, SessionShimAdoptionReceipt{}, false)
+	if handle.SeatBudget == nil {
+		t.Fatal("shim handle.SeatBudget is nil; want the seat posture")
+	}
+	if handle.SeatBudget.Mode != "best-effort" || handle.SeatBudget.CPUs != 2 {
+		t.Errorf("shim handle.SeatBudget = %+v; want best-effort 2 cpu (same as the direct path)", handle.SeatBudget)
+	}
+}
+
 // This calls the actual shim handle publication function without spawning or
 // adopting a shim. It proves metadata projection, not authenticated adoption.
 func TestHostwatchAxesShimHandleProjection(t *testing.T) {

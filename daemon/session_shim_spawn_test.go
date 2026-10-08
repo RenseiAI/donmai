@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -485,9 +486,16 @@ func TestConsumedRecoveryHeartbeatReleasesBlockedV3ProgressAfterCarrierActive(t 
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-consumed-barrier", SessionID: "session-consumed-barrier"}
+	// The barrier harness is the shell-free echo child: its in-process echo
+	// clearing replaces the `stty -echo` the old shell fixture ran. The
+	// `ack:` answer below is what the post-active assertions match on.
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 9,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		Spec:         ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()},
 		WorkareaPath: filepath.Join(dir, "workarea"),
 	})
 	if err != nil {
@@ -781,15 +789,39 @@ func TestConsumedRecoveryHeartbeatReleasesBlockedV3ProgressAfterCarrierActive(t 
 
 const envDaemonShimHelper = "DONMAI_TEST_DAEMON_SESSION_SHIM_HELPER"
 
-// interactiveFixture is a real line-oriented interactive program: it blocks on
-// terminal input and answers each line, so a round trip proves BOTH directions
-// are live through the adopted connection.
-const interactiveFixture = `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`
+// interactiveHarnessEchoEnv names the harness the shim helper runs under its
+// PTY: this test binary re-executed in echo mode (runDaemonShimEcho), which
+// reads terminal input lines and answers each one with an `ack:` echo. A
+// round trip through it proves BOTH directions are live through the adopted
+// connection.
+//
+// It is the same binary as the helper rather than /bin/sh -c <script>: the
+// refusal that motivated the swap (`fork/exec /bin/sh: operation not
+// permitted` on a parallel CI run) was later reproduced with this same
+// binary as the harness, so the fault is in the PTY spawn path the helper
+// shares with production, not in the shell — the spawn path now retries
+// transient refusals (see ptyhost's startPTYWithRetry) instead of depending
+// on which binary is spawned. The echo child keeps the property that
+// matters: a harness genuinely waiting on the PTY, with one fewer process
+// per launch.
+const interactiveHarnessEchoEnv = "DONMAI_TEST_DAEMON_SESSION_SHIM_ECHO"
 
 // TestMain routes this binary into shim-helper mode when the daemon's own launch
 // contract is present in the environment. The daemon composes that environment;
-// the helper consumes it exactly as a real worker's ptycli driver does.
+// the helper consumes it exactly as a real worker's ptycli driver does. The
+// echo role (interactiveHarnessEchoEnv) is the harness the helper spawns under
+// its own PTY: this same binary re-executed, answering each terminal input
+// line with an `ack:` echo.
 func TestMain(m *testing.M) {
+	if os.Getenv(wakeHarnessEnv) == "1" {
+		os.Exit(runDaemonShimWakeHarness())
+	}
+	if os.Getenv(batchEmitHarnessEnv) == "1" {
+		os.Exit(runDaemonShimBatchEmit())
+	}
+	if os.Getenv(interactiveHarnessEchoEnv) == "1" {
+		os.Exit(runDaemonShimEcho())
+	}
 	if os.Getenv(envDaemonShimHelper) == "1" {
 		os.Exit(runDaemonShimHelper())
 	}
@@ -843,8 +875,13 @@ func runDaemonShimHelper() int {
 	// publishes, which is what makes the adoption-time workarea comparison a real
 	// check rather than a value compared against itself (§D7).
 	workarea := filepath.Join(os.Getenv("DONMAI_TEST_DAEMON_SESSION_SHIM_WORKAREA_PARENT"), launch.Identity.SessionID)
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "daemon shim helper: executable:", err)
+		return 1
+	}
 	shim, err := sessionshim.StartFromEnv(launch,
-		ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}}, workarea)
+		ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()}, workarea)
 	if err != nil {
 		shimPTYFailureDiagnostic(err)
 		fmt.Fprintln(os.Stderr, "daemon shim helper: start:", err)
@@ -852,6 +889,78 @@ func runDaemonShimHelper() int {
 	}
 	<-shim.Done()
 	return 0
+}
+
+// runDaemonShimEcho is the harness the shim helper runs under its PTY: it
+// reads terminal input lines and answers each one with an `ack:` echo, which
+// is the round trip every shim-spawn test asserts through the adopted
+// connection. daemonShimEchoCommand builds its argv for direct use in any
+// ptyhost.Spec: the same test binary re-executed in this role, with no
+// shell in the path.
+//
+// It runs as this same test binary re-executed (see runDaemonShimHelper)
+// rather than as /bin/sh -c <script>, so the helper spawns one fewer process
+// per launch and the PTY round trip does not depend on a shell binary being
+// exec-able on the runner. stdio is the PTY slave: stdin is the terminal's
+// input and stdout is its output, so the echo answers on the same terminal
+// the test writes to. Terminal echo is cleared in-process (see
+// disableShimEchoTerminalEcho): that clearing is a fidelity difference from
+// the old shell fixture — which never ran stty -echo in this interactive
+// shape — not an equivalent of it. The tests match on the `ack:` answer,
+// which only this harness produces, so they hold either way.
+// daemonShimEchoSpec returns the shell-free PTY harness spec every shim
+// suite test uses: this test binary re-executed in echo mode
+// (runDaemonShimEcho), which reads terminal input lines and answers each
+// one with an `ack:` echo. It exists so a test that needs only a live,
+// answering child never names a shell binary: on a runner pool whose
+// confinement refuses the shell exec the spawn fails with
+// `fork/exec /bin/sh: operation not permitted` before any assertion runs.
+// A harness that merely sleeps also avoids the shell, but only this echo
+// form proves the PTY round trip is live through the adopted connection.
+func daemonShimEchoSpec() (ptyhost.Spec, error) {
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		return ptyhost.Spec{}, err
+	}
+	return ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()}, nil
+}
+
+func daemonShimEchoCommand() ([]string, error) {
+	// os.Executable resolves THIS test binary even when the caller was
+	// itself launched through a path the child could not re-resolve (a
+	// relative argv[0], a deleted build path), where os.Args[0] would name
+	// a binary the spawn cannot exec.
+	echoPath, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	//nolint:gosec // G204: echoPath is this test binary; echo mode is selected by env
+	return []string{echoPath, "-test.run", "TestMain"}, nil
+}
+
+func daemonShimEchoEnv() []string {
+	return []string{interactiveHarnessEchoEnv + "=1"}
+}
+
+func runDaemonShimEcho() int {
+	disableShimEchoTerminalEcho()
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			// Terminal echo is cleared on this harness (see
+			// disableShimEchoTerminalEcho), so the carrier observes the input
+			// line only on this answer; the tests match on the `ack:` answer,
+			// which only this harness produces.
+			trimmed := strings.TrimRight(line, "\r\n")
+			if _, werr := fmt.Fprintf(os.Stdout, "ack:%s\r\n", trimmed); werr != nil {
+				return 1
+			}
+		}
+		if err != nil {
+			return 0
+		}
+	}
 }
 
 // shimSpawnFixture is a daemon configured to launch interactive sessions through

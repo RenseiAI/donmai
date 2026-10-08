@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -121,9 +120,15 @@ type readoptOtherShim struct {
 func (f *readoptFixture) adoptSecondLiveShim(t *testing.T) readoptOtherShim {
 	t.Helper()
 	id := sessionshim.Identity{OrgID: "org-readopt", SessionID: "session-readopt-other"}
+	// The shell-free echo child: it only has to stay alive behind the
+	// adopted connection, answering every input line with an `ack:` echo.
+	echoSpec, err := daemonShimEchoSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: f.registry, ProcessEpoch: 5,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		Spec:         echoSpec,
 		WorkareaPath: filepath.Join(f.dir, "workarea-other"),
 		Orphan:       sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second, PropagationMargin: 0},
 	})
