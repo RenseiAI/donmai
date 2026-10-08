@@ -21,6 +21,14 @@ type daemonLiveWorld struct {
 	tokenFile   string
 	tokenDir    string
 	siblingFile string
+	// nestedFile is a second token file nested inside the writable set.
+	// The blanket write deny cannot cover it — the writable allow renders
+	// after the blanket deny — so only the daemon-private write deny
+	// holds. A regression that drops that deny still refuses every
+	// outside-set write through the blanket, and only a probe here turns
+	// red at execution.
+	nestedFile string
+	nestedDir  string
 }
 
 func newDaemonLiveWorld(t *testing.T) daemonLiveWorld {
@@ -38,12 +46,24 @@ func newDaemonLiveWorld(t *testing.T) daemonLiveWorld {
 	if err := os.WriteFile(siblingFile, []byte("sibling\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return daemonLiveWorld{w: w, c: c, tokenFile: tokenFile, tokenDir: dir, siblingFile: siblingFile}
+	// The nested secret stands in for a daemon-private path inside the
+	// writable set: denied on write through the daemon-private deny, not
+	// the blanket, the way the resolver keeps a denied path inside the
+	// set denied instead of refusing the spawn.
+	nestedDir := filepath.Join(w.mut, "daemon-state")
+	nestedFile := filepath.Join(nestedDir, "control-token")
+	if err := os.MkdirAll(nestedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nestedFile, []byte("sentinel-nested-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return daemonLiveWorld{w: w, c: c, tokenFile: tokenFile, tokenDir: dir, siblingFile: siblingFile, nestedFile: nestedFile, nestedDir: nestedDir}
 }
 
 func (d daemonLiveWorld) spec() Spec {
 	spec := d.w.spec()
-	spec.DeniedPaths = []string{d.tokenFile, d.tokenDir}
+	spec.DeniedPaths = []string{d.tokenFile, d.tokenDir, d.nestedFile, d.nestedDir}
 	return spec
 }
 
@@ -55,10 +75,13 @@ func (d daemonLiveWorld) readSpec() Spec {
 
 // TestSeatbelt_DaemonTokenDeniedLive: a confined child gets EPERM reading
 // the token file and listing its directory, and EPERM creating beside it,
-// while a read inside the leaf still works. The unconfined control reads
-// the token fine, and with the daemon-private deny rewritten out of the
-// profile the same read succeeds — so the test discriminates the deny,
-// not the fixture.
+// while a read inside the leaf still works. A second token nested inside
+// the writable set pins the daemon-private write deny itself: the blanket
+// write deny cannot cover it, so dropping the daemon-private write deny
+// lets the nested probes through while every outside-set probe still
+// refuses. The unconfined control reads the token fine, and with the
+// daemon-private deny rewritten out of the profile the same read
+// succeeds — so the test discriminates the deny, not the fixture.
 func TestSeatbelt_DaemonTokenDeniedLive(t *testing.T) {
 	d := newDaemonLiveWorld(t)
 
@@ -90,6 +113,8 @@ func TestSeatbelt_DaemonTokenDeniedLive(t *testing.T) {
 		probeStep{ID: "dir-list", Op: opList, Path: d.tokenDir},
 		probeStep{ID: "token-write", Op: opWrite, Path: d.tokenFile},
 		probeStep{ID: "sibling-create", Op: opCreate, Path: filepath.Join(d.tokenDir, "planted")},
+		probeStep{ID: "nested-write", Op: opWrite, Path: d.nestedFile},
+		probeStep{ID: "nested-create", Op: opCreate, Path: filepath.Join(d.nestedDir, "planted")},
 	)
 	for id, result := range results {
 		if !refused(result) {
@@ -98,6 +123,15 @@ func TestSeatbelt_DaemonTokenDeniedLive(t *testing.T) {
 	}
 	if exists(filepath.Join(d.tokenDir, "planted")) {
 		t.Error("the sibling create landed despite the deny")
+	}
+	// The nested probes are judged by effect on disk too, so a backend
+	// that merely hides the error string still fails: the nested token
+	// keeps its sentinel bytes and the planted sibling never lands.
+	if raw, err := os.ReadFile(d.nestedFile); err != nil || string(raw) != "sentinel-nested-token\n" {
+		t.Errorf("the nested token changed despite the deny: %q, err %v", raw, err)
+	}
+	if exists(filepath.Join(d.nestedDir, "planted")) {
+		t.Error("the nested create landed despite the deny")
 	}
 	// Legitimate seat work is unaffected: a read inside the leaf works.
 	inside := filepath.Join(d.w.mut, "inside.txt")
