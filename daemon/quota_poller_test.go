@@ -181,11 +181,12 @@ func TestQuotaPoller_FailedAttemptStillAdvancesClock(t *testing.T) {
 		t.Fatal("failed probe attempt never fired")
 	}
 	// One attempt only: the failed attempt advanced the clock, so no
-	// immediate retry follows.
+	// retry follows. The window runs past the loop's 1s wait floor:
+	// anything shorter cannot tell "held" from "still waiting".
 	select {
 	case <-fired:
 		t.Fatal("failed attempt retried immediately; retries must stay on the interval cadence")
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(1500 * time.Millisecond):
 	}
 	got := (&Daemon{quota: q}).quotaSnapshot()
 	if len(got) != 1 || len(got[0].Limits.Windows) == 0 {

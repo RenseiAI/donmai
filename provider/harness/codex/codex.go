@@ -250,6 +250,28 @@ func (p *Provider) ensureStarted() error {
 	return p.startLocked(nil)
 }
 
+// ensureProbeStarted starts the app-server for a quota read. A
+// host-session provider first projects the host's CLI login into its
+// isolated home, as Spawn does in ensureHeadlessReady: an app-server
+// started without it has no login and refuses every read, which would
+// report a signed-in host as logged out. A host with no login file
+// fails here, before any read, so the probe records no verdict.
+func (p *Provider) ensureProbeStarted() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	select {
+	case <-p.shutdown:
+		return fmt.Errorf("%w: codex provider already shut down", agent.ErrProviderUnavailable)
+	default:
+	}
+	if p.hostAuthFile != "" && !p.started {
+		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
+			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrProviderUnavailable, err)
+		}
+	}
+	return p.startLocked(nil)
+}
+
 // startLocked starts and initializes the app-server. startMu must be held.
 //
 // sessionEnv is the agent.Spec.Env of the session whose Spawn/Resume triggered
@@ -888,8 +910,15 @@ func (p *Provider) forwardRateLimitUpdates() {
 	if p == nil || p.client == nil {
 		return
 	}
-	p.client.SubscribeGlobal(func(n notification) {
+	client := p.client
+	client.SubscribeGlobal(func(n notification) {
 		if n.Method != "account/rateLimits/updated" {
+			// A fall-through handler replaces the client's own, which
+			// answers an unhandled server request with -32601 so codex
+			// does not wait on it. Keep that answer.
+			if len(n.ServerRequestID) > 0 {
+				_ = client.RespondToServerRequestWithError(n.ServerRequestID, -32601, "no handler for "+n.Method)
+			}
 			return
 		}
 		p.handlesMu.Lock()

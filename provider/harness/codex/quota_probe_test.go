@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,5 +181,136 @@ func TestMapRateLimitsUpdated_MapsThroughSharedMapper(t *testing.T) {
 	}
 	if events := mapNotification("account/rateLimits/updated", []byte(`{}`), state, nil); len(events) != 0 {
 		t.Errorf("empty events = %+v, want nothing", events)
+	}
+}
+
+// TestProvider_ProbeQuotaProjectsHostLogin pins the host-session half
+// of the production probe: the app-server must start with the host's
+// CLI login projected into its isolated home, or it has no login and
+// refuses every read (a signed-in host reported as logged out). The
+// fake answers like a real app-server: a refusal unless the isolated
+// home carries the login file.
+func TestProvider_ProbeQuotaProjectsHostLogin(t *testing.T) {
+	hostHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hostHome, codexAuthFileName), []byte(`{"fixture":true}`), 0o600); err != nil {
+		t.Fatalf("write host login: %v", err)
+	}
+	t.Setenv("CODEX_HOME", hostHome)
+
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+	var isolatedHome atomic.Value
+	go func() {
+		dec := json.NewDecoder(stdinReader)
+		for {
+			var msg map[string]any
+			if err := dec.Decode(&msg); err != nil {
+				return
+			}
+			idRaw, hasID := msg["id"]
+			if !hasID {
+				continue
+			}
+			reply := map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{}}
+			if msg["method"] == "account/rateLimits/read" {
+				home, _ := isolatedHome.Load().(string)
+				if _, err := os.Lstat(filepath.Join(home, codexAuthFileName)); home == "" || err != nil {
+					reply = map[string]any{"jsonrpc": "2.0", "id": idRaw, "error": map[string]any{
+						"code": -32600, "message": "codex account authentication required to read rate limits",
+					}}
+				} else {
+					reply["result"] = map[string]any{"rateLimits": map[string]any{
+						"limitId": "codex", "planType": "team",
+						"primary": map[string]any{"usedPercent": 4, "windowDurationMins": 300},
+					}}
+				}
+			}
+			writeQuotaProbeLine(t, stdoutWriter, reply)
+		}
+	}()
+	p, err := New(Options{
+		skipProcess:     true,
+		stdinOverride:   stdinWriter,
+		stdoutOverride:  stdoutReader,
+		configTempDir:   t.TempDir(),
+		HostSessionAuth: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	isolatedHome.Store(p.config.home)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+		_ = stdinReader.Close()
+		_ = stdoutWriter.Close()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, plan, probed := p.ProbeQuota(ctx)
+	if probed.Unavailable != nil {
+		t.Fatalf("probed = %+v, want windows: the probe started the app-server without the host login", probed.Unavailable)
+	}
+	if plan != "team" || len(probed.Windows) != 1 {
+		t.Errorf("plan = %q windows = %+v, want team and one row", plan, probed.Windows)
+	}
+}
+
+// TestProvider_UnhandledServerRequestStillAnswered pins the client
+// fall-through the rate-limit forwarder replaces: a server request no
+// thread handles is still answered with -32601, so codex never waits
+// on it.
+func TestProvider_UnhandledServerRequestStillAnswered(t *testing.T) {
+	t.Parallel()
+
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+	answered := make(chan map[string]any, 1)
+	go func() {
+		dec := json.NewDecoder(stdinReader)
+		for {
+			var msg map[string]any
+			if err := dec.Decode(&msg); err != nil {
+				return
+			}
+			if msg["id"] == "server-1" {
+				answered <- msg
+				continue
+			}
+			if idRaw, hasID := msg["id"]; hasID {
+				writeQuotaProbeLine(t, stdoutWriter, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{}})
+			}
+		}
+	}()
+	p, err := New(Options{
+		skipProcess:    true,
+		stdinOverride:  stdinWriter,
+		stdoutOverride: stdoutReader,
+		configTempDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+		_ = stdinReader.Close()
+		_ = stdoutWriter.Close()
+	})
+	if err := p.ensureStarted(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	writeQuotaProbeLine(t, stdoutWriter, map[string]any{"jsonrpc": "2.0", "id": "server-1", "method": "attestation/generate", "params": map[string]any{}})
+	select {
+	case msg := <-answered:
+		rpcErr, _ := msg["error"].(map[string]any)
+		if code, _ := rpcErr["code"].(float64); code != -32601 {
+			t.Errorf("answer = %+v, want a -32601 error", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("unhandled server request never answered; codex would wait on it")
 	}
 }

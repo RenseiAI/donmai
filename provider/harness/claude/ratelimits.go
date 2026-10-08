@@ -208,12 +208,11 @@ type modelScopedWindowJSON struct {
 }
 
 // UsageResponse is the structural view of the usage read response.
-// The claude CLI prints it on stream-json lines whose type is
-// "usage_response": the probe session's prompt asks for no model
-// work, so the child emits that line and its terminal result without
-// spending a turn. Older CLI builds predate the line and emit no
-// usage response at all; the probe then reports the read as failed,
-// never as unsupported.
+// The claude CLI answers it inside the `control_response` to the
+// probe's `get_usage` control request (see usage_probe.go): the probe
+// sends no user message, so the child answers without spending a
+// turn. A control answer that never arrives leaves the read failed,
+// never unsupported.
 type UsageResponse struct {
 	Available *bool           `json:"rate_limits_available"`
 	Windows   json.RawMessage `json:"rate_limits"`
