@@ -324,6 +324,16 @@ type Options struct {
 	// The OSS binary leaves this nil, the worktree seam stays inert, and
 	// standalone behaviour is byte-identical to before.
 	GitAuth GitAuth
+
+	// RepoKeeperScope resolves the credential scope for one remote for the
+	// per-host repository keeper (see repo_keeper.go), beside GitAuth: GitAuth
+	// mints the per-invocation credential, this seam names the isolation
+	// boundary the resulting mirror belongs to. Nil means DefaultRepoKeeperScope
+	// (one host-wide scope), so one remote maps to exactly one mirror on this
+	// machine. An embedder that isolates mirrors per tenant supplies its own
+	// resolver; the keeper still records only the scope digest, never the
+	// scope value or the remote URL.
+	RepoKeeperScope RepoKeeperScopeFunc
 }
 
 // GitAuth is the per-invocation git auth resolver an embedder supplies via
@@ -511,6 +521,12 @@ type Daemon struct {
 	heartbeat *HeartbeatService
 	poller    *PollService
 	spawner   *WorkerSpawner
+
+	// repoKeeper is the per-host repository keeper (see repo_keeper.go). It is
+	// constructed in Start from the process-level RepoKeeper settings and the
+	// Options.RepoKeeperScope seam; nil until then. Callers degrade to a plain
+	// clone while it is nil, disabled, or still reconciling.
+	repoKeeper *RepoKeeper
 
 	// quota is the subscription quota-snapshot cache behind the
 	// heartbeat quota field: one entry per signed-in account. Probes
@@ -791,6 +807,73 @@ func (d *Daemon) ownsLifecycleLocked(lease *lifecycleLease) bool {
 // the hook through one seam.
 func (d *Daemon) workerCapabilitiesFunc() func() map[string]bool {
 	return d.opts.WorkerCapabilitiesFunc
+}
+
+// repoKeeperRoot resolves the keeper's state-directory root: repo-keeper/
+// under the state home. It is a function so tests can point a Daemon at a
+// temp dir by swapping the config-independent state home.
+func repoKeeperRoot() string {
+	return statepath.Resolve("repo-keeper", "/tmp/.donmai/repo-keeper")
+}
+
+// repoKeeperFor constructs this daemon's keeper from its process-level
+// settings and the Options.RepoKeeperScope seam, or nil when the keeper is
+// disabled. Callers degrade to a plain clone on nil.
+func (d *Daemon) repoKeeperFor() *RepoKeeper {
+	settings := d.Config().EffectiveRepoKeeperSettings()
+	if !settings.Enabled {
+		return nil
+	}
+	var scope RepoKeeperScopeFunc
+	if d.opts.RepoKeeperScope != nil {
+		scope = d.opts.RepoKeeperScope
+	}
+	var auth RepoKeeperGitAuth
+	if d.opts.GitAuth != nil {
+		auth = RepoKeeperGitAuth(d.opts.GitAuth)
+	}
+	return NewRepoKeeper(repoKeeperRoot(), settings, scope, auth)
+}
+
+// reconcileRepoKeeper builds the keeper (when enabled) and reconciles its
+// catalog after session and catalog reconciliation and before
+// workarea-cache admission. A reconcile failure degrades: callers fall back
+// to a plain clone and startup continues. With the keeper disabled this is
+// a no-op and nothing is created under repo-keeper/.
+func (d *Daemon) reconcileRepoKeeper(ctx context.Context) {
+	keeper := d.repoKeeperFor()
+	d.mu.Lock()
+	d.repoKeeper = keeper
+	d.mu.Unlock()
+	if keeper == nil {
+		return
+	}
+	if err := keeper.Reconcile(ctx); err != nil {
+		slog.Warn("repo keeper: reconcile failed; degrading to plain clone", "err", err)
+	}
+}
+
+// RepoKeeper returns the daemon's repository keeper, or nil when it is
+// disabled or not yet constructed. The returned pointer is safe for
+// concurrent use.
+func (d *Daemon) RepoKeeper() *RepoKeeper {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.repoKeeper
+}
+
+// RepoKeeperMirror degrades a clone through the keeper: it returns the
+// mirror directory when the keeper can serve this remote, and ok=false when
+// the caller must fall back to a plain clone (disabled, reconciling,
+// over budget, or scope failure).
+func (d *Daemon) RepoKeeperMirror(ctx context.Context, remote string) (dir string, ok bool) {
+	d.mu.RLock()
+	keeper := d.repoKeeper
+	d.mu.RUnlock()
+	if keeper == nil {
+		return "", false
+	}
+	return keeper.Acquire(ctx, remote)
 }
 
 // onLandingWork returns the configured landing-run handler, or nil when none
@@ -1207,6 +1290,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
+	// Reconcile the repository keeper after session and catalog
+	// reconciliation and before workarea-cache admission. While it
+	// reconciles, callers degrade to a plain clone; with the keeper
+	// disabled this is a no-op and nothing is created under repo-keeper/.
+	d.reconcileRepoKeeper(ctx)
 	if !d.sessionShimEnabled() {
 		if err := register(); err != nil {
 			return err

@@ -159,6 +159,20 @@ type CapacityConfig struct {
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
 }
 
+// RepoKeeperYAML is the in-memory representation of the daemon.yaml
+// `repoKeeper` block. Process-level: a change needs a drain-aware restart.
+type RepoKeeperYAML struct {
+	// Enabled gates keeper construction. Default off.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxDiskGb caps total mirror disk usage in GiB. 0 means no limit.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+	// FetchIntervalSeconds bounds how often a mirror is re-fetched.
+	FetchIntervalSeconds int64 `yaml:"fetchIntervalSeconds,omitempty" json:"fetchIntervalSeconds,omitempty"`
+	// AuthorizationWindowSeconds bounds how long a resolved authorization
+	// is honored.
+	AuthorizationWindowSeconds int64 `yaml:"authorizationWindowSeconds,omitempty" json:"authorizationWindowSeconds,omitempty"`
+}
+
 // DaemonYAML is the in-memory representation of ~/.donmai/daemon.yaml.
 // Only the fields relevant to the project command tree are modelled here;
 // unknown top-level keys are preserved via the yaml decoder's pass-through.
@@ -182,6 +196,9 @@ type DaemonYAML struct {
 	Projects []ProjectEntry `yaml:"projects,omitempty"`
 	// Capacity holds the configurable resource limits for the daemon.
 	Capacity CapacityConfig `yaml:"capacity,omitempty"`
+	// RepoKeeper holds the per-host repository-keeper tunables. Process-level:
+	// a change needs a drain-aware restart.
+	RepoKeeper RepoKeeperYAML `yaml:"repoKeeper,omitempty"`
 }
 
 // ProjectAdmissionVersionV2 marks enabledProjectIds as authoritative.
@@ -319,6 +336,7 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 }
 
 type capacityWriteIntent struct {
+	block string
 	key   string
 	value int
 }
@@ -332,18 +350,21 @@ func WriteDaemonYAMLWithCapacity(path string, cfg *DaemonYAML, key string, value
 		return fmt.Errorf("daemon config is required")
 	}
 	var field string
+	var block string
 	switch key {
 	case "capacity.maxConcurrentSessions":
-		field = "maxConcurrentSessions"
+		block, field = "capacity", "maxConcurrentSessions"
 	case "capacity.poolMaxDiskGb":
-		field = "poolMaxDiskGb"
+		block, field = "capacity", "poolMaxDiskGb"
+	case "repoKeeper.enabled", "repoKeeper.maxDiskGb", "repoKeeper.fetchIntervalSeconds", "repoKeeper.authorizationWindowSeconds":
+		block, field = "repoKeeper", strings.TrimPrefix(key, "repoKeeper.")
 	default:
 		return fmt.Errorf("unsupported capacity key %q", key)
 	}
 	if value < 0 {
 		return fmt.Errorf("%s must be >= 0", key)
 	}
-	return writeDaemonYAML(path, cfg, &capacityWriteIntent{key: field, value: value})
+	return writeDaemonYAML(path, cfg, &capacityWriteIntent{block: block, key: field, value: value})
 }
 
 func writeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) error {
@@ -436,6 +457,10 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 	if err != nil {
 		return nil, fmt.Errorf("encode capacity: %w", err)
 	}
+	repoKeeperNode, err := encodeYAMLNode(cfg.RepoKeeper)
+	if err != nil {
+		return nil, fmt.Errorf("encode repoKeeper: %w", err)
+	}
 
 	if cfg.ProjectAdmissionVersion != 0 {
 		projectAdmissionVersionNode, versionErr := encodeYAMLNode(cfg.ProjectAdmissionVersion)
@@ -465,10 +490,13 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 	// The merge splices cfg-owned keys wholesale, so only unowned leftovers
 	// can still hold the key — drop it wherever it remains.
 	stripRetiredCloneStrategyKey(doc)
-	// Capacity is preserved as a partial overlay — only the cfg-modelled
-	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
-	// mapping. If no capacity key exists yet a new one is added.
-	if intent != nil {
+	// Capacity and repoKeeper are preserved as partial overlays — only the
+	// cfg-modelled fields are merged into the existing mappings. If a block
+	// key does not exist yet a new one is added.
+	if intent != nil && intent.block == "repoKeeper" {
+		upsertMappingKey(repoKeeperNode, intent.key, capacityIntentNode(intent))
+	}
+	if intent != nil && intent.block == "capacity" {
 		upsertMappingKey(capacityNode, intent.key, capacityIntentNode(intent))
 		// Preserve alias inheritance without mutating the shared anchor. The
 		// new local mapping overrides only the explicitly authored capacity.
@@ -483,6 +511,7 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 		}
 	}
 	mergeMappingKey(doc, "capacity", capacityNode)
+	mergeMappingKey(doc, "repoKeeper", repoKeeperNode)
 
 	out, err := yaml.Marshal(&root)
 	if err != nil {
@@ -529,6 +558,15 @@ func stripRetiredCloneStrategyKey(doc *yaml.Node) {
 }
 
 func capacityIntentNode(intent *capacityWriteIntent) *yaml.Node {
+	// repoKeeper.enabled is a boolean: author true/false so the daemon reader
+	// decodes it. Every other key is an integer.
+	if intent.block == "repoKeeper" && intent.key == "enabled" {
+		value := "false"
+		if intent.value != 0 {
+			value = "true"
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: value}
+	}
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(intent.value)}
 }
 
@@ -539,6 +577,15 @@ func marshalDaemonYAML(cfg *DaemonYAML, intent *capacityWriteIntent) ([]byte, er
 	root, err := encodeYAMLNode(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if intent.block == "repoKeeper" {
+		repoKeeper, err := encodeYAMLNode(cfg.RepoKeeper)
+		if err != nil {
+			return nil, err
+		}
+		upsertMappingKey(repoKeeper, intent.key, capacityIntentNode(intent))
+		upsertMappingKey(root, "repoKeeper", repoKeeper)
+		return yaml.Marshal(root)
 	}
 	capacity, err := encodeYAMLNode(cfg.Capacity)
 	if err != nil {
