@@ -7,8 +7,8 @@ import (
 )
 
 // Backend applies a confinement boundary around one harness process. The
-// macOS profile backend is the only implementation in this package today;
-// a Linux mount-namespace backend is the next one.
+// macOS profile backend and the Linux mount-namespace backend are the
+// implementations in this package today.
 type Backend interface {
 	// Name is the backend's attestation name.
 	Name() BackendName
@@ -43,6 +43,10 @@ type Applied struct {
 	// Wrap returns the argv that runs argv inside the boundary. argv[0] is
 	// absolute.
 	Wrap func(argv []string) []string
+	// Environ returns the KEY=VALUE bindings the boundary itself needs on
+	// top of the plan environment (a Landlock stage policy, a marker): the
+	// launcher applies them to the spawned process. Nil when none.
+	Environ func() []string
 	// Release removes whatever Apply wrote. Nil when nothing was written.
 	Release func() error
 }

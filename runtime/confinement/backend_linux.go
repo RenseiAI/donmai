@@ -5,9 +5,11 @@ package confinement
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 
@@ -16,8 +18,9 @@ import (
 
 // mountNamespaceProfileVersion is the Linux mount-namespace backend's
 // implementation version. It is part of the backend version, so a self-test
-// record taken under an older launcher or mount-tree shape is stale.
-const mountNamespaceProfileVersion = "mount-namespace-v1"
+// record taken under an older launcher, mount-tree shape or Landlock stage
+// is stale.
+const mountNamespaceProfileVersion = "mount-namespace-v2"
 
 // DefaultBackend returns the confinement backend for the running OS: the
 // Linux mount-namespace backend here.
@@ -26,7 +29,8 @@ func DefaultBackend() Backend { return &mountNamespaceBackend{} }
 // ResolverSockets returns the OS resolver sockets a harness that needs name
 // resolution declares in Spec.Sockets. The NSS stack reads the static
 // resolver configuration and the host database directly, so those paths are
-// what a harness declares; the mount tree binds them read-only.
+// what a harness declares; the mount tree binds them read-only and the
+// Landlock stage grants them read access.
 func ResolverSockets() []string { return []string{"/etc/resolv.conf"} }
 
 // sharedLocations are the shared temporary locations the boundary hides: a
@@ -38,7 +42,8 @@ func sharedLocations() ([]string, error) {
 
 type mountNamespaceBackend struct {
 	// launcherOverride pins the launcher executable, for tests. Empty
-	// resolves bubblewrap on PATH, falling back to the direct helper.
+	// resolves bubblewrap on PATH; a missing launcher refuses with
+	// backend_absent, never a silent unwrapped run.
 	launcherOverride string
 }
 
@@ -100,12 +105,25 @@ const mountNamespaceMarkEnv = "DONMAI_MOUNT_NAMESPACE"
 // user namespace right now. Where the kernel or the container disallows it
 // the error carries namespace_unavailable with the actionable diagnostic,
 // never a silent pass.
+//
+// The probe runs in a short-lived child: unsharing the caller would move the
+// long-lived worker into a fresh, unmapped user namespace for the rest of
+// its life, corrupting the artifact, receipt and control-channel I/O it
+// still owns. The child unshares a user namespace the parent maps
+// (CLONE_NEWUSER plus a single-uid/gid map of the caller's own identity,
+// exactly what a spawn needs); the parent waits for its exit status, and
+// the parent's own namespace is never touched.
 func probeUserNamespace() error {
-	if err := unix.Unshare(unix.CLONE_NEWUSER); err != nil {
+	cmd := exec.Command("/usr/bin/true")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:                 syscall.CLONE_NEWUSER,
+		UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
+		GidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
+		GidMappingsEnableSetgroups: false,
+	}
+	if err := cmd.Run(); err != nil {
 		return refuse(ReasonNamespaceUnavailable, "unprivileged user namespaces are unavailable: %v", usernsHint(err))
 	}
-	// The unshare above moved this process into a fresh user namespace;
-	// that change is per-process and dies with it, so nothing is undone.
 	return nil
 }
 
@@ -139,25 +157,48 @@ func (b *mountNamespaceBackend) Apply(req ApplyRequest) (Applied, error) {
 	if req.Resolved == nil {
 		return Applied{}, refuse(ReasonWritableSetUnrepresentable, "no resolved set to apply")
 	}
+	launcher, err := resolveLauncher(b.launcher())
+	if err != nil {
+		return Applied{}, err
+	}
+	if !landlockAvailable() {
+		return Applied{}, refuse(ReasonNamespaceUnavailable, "the Landlock stage is unavailable on this kernel; the boundary it enforces cannot be staged")
+	}
+	stage, err := buildLandlockStage(req.Resolved)
+	if err != nil {
+		return Applied{}, err
+	}
 	args, err := renderBubblewrap(req.Resolved, req.Rules, b.Canonical)
 	if err != nil {
 		return Applied{}, err
 	}
-	if err := checkLauncher(b.launcher()); err != nil {
+	self, err := stageSelfExecutable()
+	if err != nil {
 		return Applied{}, err
 	}
-	rendered := "bubblewrap\n" + strings.Join(args, "\n") + "\n"
+	rendered := "bubblewrap\n" + launcher + "\n" + stage.describe() + "\n" + strings.Join(args, "\n") + "\n"
+	policy := stage.describe()
 	return Applied{
 		Rendered: []byte(rendered),
 		Wrap: func(argv []string) []string {
-			return append([]string{b.launcher()}, append(args, append([]string{"--"}, argv...)...)...)
+			wrapped := append([]string{launcher}, append(args, "--")...)
+			wrapped = append(wrapped, self, "stage")
+			wrapped = append(wrapped, stagePortArgs(stage)...)
+			wrapped = append(wrapped, "--")
+			wrapped = append(wrapped, argv...)
+			return wrapped
+		},
+		Environ: func() []string {
+			return []string{landlockStageEnv + "=" + policy}
 		},
 	}, nil
 }
 
 // launcher resolves the helper executable: the test override, else
 // bubblewrap on PATH. Apply never renders a boundary it cannot launch:
-// checkLauncher refuses with backend_absent when it is missing.
+// resolveLauncher refuses with backend_absent when it is missing, and
+// returns the absolute path so the spawn cannot be redirected by a later
+// PATH change between render and exec.
 func (b *mountNamespaceBackend) launcher() string {
 	if b.launcherOverride != "" {
 		return b.launcherOverride
@@ -165,26 +206,37 @@ func (b *mountNamespaceBackend) launcher() string {
 	return "bwrap"
 }
 
-// checkLauncher refuses with backend_absent when the launcher is missing, so
-// a seat is never run unwrapped.
-func checkLauncher(name string) error {
+// resolveLauncher resolves the launcher to an absolute executable path, so
+// a seat is never run unwrapped and never through a PATH lookup at spawn.
+// A bare name is resolved on PATH once, at Apply; an absolute test
+// override must already name an executable file.
+func resolveLauncher(name string) (string, error) {
 	if filepath.IsAbs(name) {
 		info, err := os.Stat(name)
 		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-			return refuse(ReasonBackendAbsent, "the mount-namespace launcher is missing")
+			return "", refuse(ReasonBackendAbsent, "the mount-namespace launcher is missing")
 		}
-		return nil
+		return name, nil
 	}
 	for _, dir := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
 		if dir == "" {
 			continue
 		}
-		info, err := os.Stat(filepath.Join(dir, name))
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
 		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
-			return nil
+			return candidate, nil
 		}
 	}
-	return refuse(ReasonBackendAbsent, "the mount-namespace launcher is missing")
+	return "", refuse(ReasonBackendAbsent, "the mount-namespace launcher is missing")
+}
+
+// checkLauncher refuses with backend_absent when the launcher is missing, so
+// a seat is never run unwrapped. It is the boolean gate over
+// resolveLauncher, kept for callers that only need the verdict.
+func checkLauncher(name string) error {
+	_, err := resolveLauncher(name)
+	return err
 }
 
 var (
@@ -210,12 +262,15 @@ func linuxRelease() (string, error) {
 
 // mountNamespaceRuntimeBinds are the runtime and toolchain paths bound
 // read-only into every boundary: the OS userland and toolchains, the CA
-// bundle and timezone data TLS and name resolution need, and the device
-// nodes a process needs (bound through by name, never a terminal or a
-// pseudo-terminal multiplexer). Entries that do not exist on the host are
-// skipped at render; the session's own allowlist is bound after, so it wins
-// over nothing here — these paths never overlap the writable set, which
-// resolveSpec already guarantees.
+// bundle and timezone data TLS and name resolution need. Entries that do not
+// exist on the host are skipped at render; the session's own allowlist is
+// bound after, so it wins over nothing here — these paths never overlap the
+// writable set, which resolveSpec already guarantees.
+//
+// Device nodes, /proc and /sys are deliberately absent: /dev is a fresh
+// tmpfs populated below with --dev-bind device nodes (a plain --bind of a
+// device node does not carry it through), /proc is a fresh proc mount so no
+// host process table leaks in, and /sys stays hidden behind the tmpfs root.
 var mountNamespaceRuntimeBinds = []string{
 	"/usr",
 	"/bin",
@@ -227,14 +282,6 @@ var mountNamespaceRuntimeBinds = []string{
 	"/etc/gitconfig",
 	"/etc/timezone",
 	"/usr/share/zoneinfo",
-	"/proc",
-	"/sys",
-	"/dev/null",
-	"/dev/zero",
-	"/dev/random",
-	"/dev/urandom",
-	"/dev/tty",
-	"/dev/fd",
 }
 
 // mountNamespaceResolverBinds are the resolver inputs bound read-only into
@@ -253,16 +300,25 @@ var mountNamespaceResolverBinds = []string{
 // workarea root, metadata, pin literals and composer denies as read-only
 // binds of empty placeholders over those, so narrower rules win. Any rule
 // the mount tree cannot express refuses the whole rendering; none is
-// dropped. Returned args end before the "--" separator; Wrap appends it.
+// dropped. The harness process re-executed as the Landlock stage (see
+// stage_linux.go) programs the Landlock policy from inside the mount tree
+// and then execs the harness: Wrap runs `launcher args -- self-exe stage
+// -- argv`, rebinding the current executable by its /proc/self/exe path.
+// Returned args end before the first "--" separator; Wrap appends it.
 func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string, error)) ([]string, error) {
 	var args []string
 	bind := func(flag, source, target string) {
 		args = append(args, flag, source, target)
 	}
 	// A fresh user and mount namespace per command; the process tree stays
-	// visible (no pid namespace: the harness is supervised, not isolated
-	// from its supervisor), and the boundary dies with the command.
-	args = append(args, "--unshare-user", "--unshare-pid", "--die-with-parent", "--new-session")
+	// visible (no pid namespace: the harness is supervised, and
+	// OnProcessSpawned reports the outer launcher pid, which stays the
+	// parent the supervisor signals), and the boundary dies with the
+	// command. Network stays shared: loopback TCP outside the declared
+	// ports is closed by the Landlock stage, which allows connects only to
+	// the declared ports; --unshare-net would isolate the loopback
+	// interface entirely and strand even declared host listeners.
+	args = append(args, "--unshare-user", "--die-with-parent", "--new-session")
 	// Everything outside the binds below is hidden: the root is a tmpfs, so
 	// a path that is bound nowhere reads as absent.
 	args = append(args, "--tmpfs", "/")
@@ -278,6 +334,23 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	for _, path := range mountNamespaceResolverBinds {
 		roBind(path)
 	}
+	// Device nodes a process needs: /dev is a fresh tmpfs, so the host's
+	// terminals never enter the boundary. --dev-bind (not --bind) carries
+	// device nodes through: a plain bind of a device node does not work.
+	// The Landlock stage grants open on this private /dev; nothing else
+	// there exists to open.
+	args = append(args, "--tmpfs", "/dev")
+	for _, path := range []string{"/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"} {
+		if _, err := os.Lstat(path); err != nil {
+			continue
+		}
+		bind("--dev-bind", path, path)
+	}
+	// The descriptor conduit shells need for process substitution.
+	bind("--symlink", "/proc/self/fd", "/dev/fd")
+	// A fresh proc mount: the host's process table stays outside, and
+	// /proc/self/fd (behind /dev/fd) resolves inside.
+	args = append(args, "--proc", "/proc")
 	// The writable set: mutable leaves, harness state, session tmp and
 	// session caches, bound read-write over the read-only tree.
 	for _, root := range r.Writable {
@@ -286,24 +359,21 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 		}
 		bind("--bind", root.Path, root.Path)
 	}
-	// Device nodes a process must write stay writable; the read-only bind
-	// above made them read-only, so they are re-bound read-write after it.
-	for _, path := range []string{"/dev/null", "/dev/zero"} {
-		if _, err := os.Lstat(path); err != nil {
-			continue
-		}
-		bind("--bind", path, path)
-	}
 	// Declared sockets outside the writable set: bound read-only by exact
-	// path so name resolution and the control channel keep working. Every
-	// other socket outside the set has no bind and stays unreachable.
+	// path so name resolution and the control channel keep working — a
+	// connect through a read-only bind succeeds, and the Landlock stage
+	// grants the open. Every other socket outside the set has no bind and
+	// stays unreachable.
 	for _, socket := range r.Sockets {
 		roBind(socket)
 	}
 	// The read-only leaves, protected paths, workarea metadata and pins are
 	// overlaid read-only after the writable allows, so they win. An overlay
-	// needs something to mount: an empty placeholder under the profile
-	// directory stands in for the denied tree.
+	// needs something to mount: an empty placeholder under the OS temporary
+	// directory stands in for the denied tree. A denied path that does not
+	// exist needs no overlay — the tmpfs root already hides it — but its
+	// missing ancestors are created with --dir first, so the render never
+	// names a destination bubblewrap cannot mount onto.
 	deny := append(append([]string{}, r.ReadOnly...), r.Protected...)
 	deny = append(deny, r.MetadataDir)
 	deny = append(deny, r.Pins...)
@@ -311,9 +381,24 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	// leaves through it but cannot rename or create beside them.
 	deny = append(deny, r.WorkareaRoot)
 	for _, path := range deny {
-		empty, err := emptyPlaceholder(path)
+		info, err := os.Lstat(path)
+		if err != nil {
+			// A denied path that does not exist needs no overlay: the
+			// tmpfs root already hides it, and the Landlock stage
+			// denies it too. Skipping keeps the render launchable —
+			// binding a missing source onto its missing target would
+			// fail the spawn.
+			continue
+		}
+		empty, _, err := emptyPlaceholder(path)
 		if err != nil {
 			return nil, err
+		}
+		if info.IsDir() {
+			if parent := filepath.Dir(path); parent != "/" && parent != "." {
+				args = append(args, "--dir", parent)
+			}
+			args = append(args, "--dir", path)
 		}
 		bind("--ro-bind", empty, path)
 	}
@@ -337,27 +422,22 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 		if buried {
 			continue
 		}
-		empty, err := emptyPlaceholder(dir)
+		if _, err := os.Lstat(dir); err != nil {
+			continue
+		}
+		args = append(args, "--dir", dir)
+		empty, _, err := emptyPlaceholder(dir)
 		if err != nil {
 			return nil, err
 		}
 		bind("--ro-bind", empty, dir)
 	}
-	// Loopback TCP outside the declared ports is closed by removing the
-	// loopback interface from the boundary's network view: an isolated
-	// loopback device with no addresses answers nothing, while each
-	// declared port is re-opened by forwarding it from the host into the
-	// boundary. Nothing is allowed by default.
-	//
-	// The forward needs a stable host-side listener per declared port,
-	// which Apply cannot keep alive across Wrap calls; ports are instead
-	// carried as TCP allow rules the helper programs with iptables once it
-	// owns the namespace. Until that helper lands, a spec that declares
-	// loopback ports is refused rather than rendered without its network
-	// rule: the plan never degrades to a weaker set.
-	if len(r.LoopbackTCPPorts) > 0 {
-		return nil, refuse(ReasonRuleUnrenderable, "declared loopback TCP ports need the namespace network helper, which is not staged yet")
-	}
+	// Loopback TCP is closed by default and opened per declared port: the
+	// mount tree carries the policy, and the Landlock stage enforces it —
+	// handled_access_net covers connect, and each declared port is an
+	// allow rule, so an undeclared dial fails closed with EACCES. The
+	// declared ports ride the stage invocation after the second "--";
+	// Wrap appends them there (see Apply).
 	composer, err := renderMountComposerRules(r, rules, canonical)
 	if err != nil {
 		return nil, err
@@ -399,16 +479,29 @@ func renderMountComposerRules(r *Resolved, rules []Rule, canonical func(string) 
 			default:
 				return nil, refuse(ReasonRuleUnrenderable, "composer rule %d: unknown scope %q", i, rule.Scope)
 			}
-			empty, err := emptyPlaceholder(path)
+			if _, err := os.Lstat(path); err != nil {
+				// A deny over a path that does not exist needs no
+				// overlay: the tmpfs root already hides it. Skipping
+				// (rather than binding the missing path onto
+				// itself) keeps the render launchable, and the
+				// Landlock stage denies the path too.
+				continue
+			}
+			empty, _, err := emptyPlaceholder(path)
 			if err != nil {
 				return nil, err
 			}
+			if parent := filepath.Dir(path); parent != "/" && parent != "." {
+				args = append(args, "--dir", parent)
+			}
+			args = append(args, "--dir", path)
 			args = append(args, "--ro-bind", empty, path)
 			for _, pin := range ancestorPins(writable, []string{path}) {
-				anchor, err := emptyPlaceholder(pin)
+				anchor, _, err := emptyPlaceholder(pin)
 				if err != nil {
 					return nil, err
 				}
+				args = append(args, "--dir", pin)
 				args = append(args, "--ro-bind", anchor, pin)
 			}
 		case RuleDenyServiceLookup:
@@ -425,16 +518,35 @@ func renderMountComposerRules(r *Resolved, rules []Rule, canonical func(string) 
 	return args, nil
 }
 
-// renderMountReadScope renders the workarea read scope: with the root
-// hidden by tmpfs, reads outside the allowlist already fail, so the scope
-// binds the session's allowlist read-only last — the writable roots, the
-// read-only leaves and the declared read paths — and refuses any other
-// level rather than rendering it as open reads.
+// renderMountReadScope renders the workarea read scope: the writable set
+// stays read-write (the self-test probe writes its read-pass results into
+// session tmp), while the read-only leaves and the declared read paths are
+// bound read-only last, so a read of the allowlist succeeds and a read
+// outside it falls to the Landlock stage, which denies it. Any other level
+// is refused rather than rendered as open reads.
 func renderMountReadScope(r *Resolved) ([]string, error) {
 	switch r.ReadScope {
 	case agent.FileReadWorkarea:
 		var args []string
-		for _, path := range r.ReadAllowlist() {
+		seen := map[string]bool{}
+		for _, root := range r.Writable {
+			seen[root.Path] = true
+		}
+		for _, path := range r.ReadOnly {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			if _, err := os.Lstat(path); err != nil {
+				continue
+			}
+			args = append(args, "--ro-bind", path, path)
+		}
+		for _, path := range r.ReadPaths {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
 			if _, err := os.Lstat(path); err != nil {
 				continue
 			}
@@ -447,50 +559,33 @@ func renderMountReadScope(r *Resolved) ([]string, error) {
 }
 
 // emptyPlaceholder returns a path whose bind hides the denied target: an
-// empty directory for a directory target, an empty file otherwise. The
-// placeholder lives under the OS temporary directory, outside every
-// session root. Landlock defence-in-depth is staged by the helper where
-// landlockAvailable reports kernel support; the mount tree is the boundary
-// either way, and the backend version names the kernel release so the
-// self-test pins what it proved.
-func emptyPlaceholder(target string) (string, error) {
+// empty directory for a directory target, an empty file otherwise, plus
+// whether the target is a directory. The placeholder lives under the OS
+// temporary directory, outside every session root. Callers skip targets
+// that do not exist — the tmpfs root already hides those — so a missing
+// target never reaches this function; it stays a caller-side decision,
+// documented at each call site.
+func emptyPlaceholder(target string) (string, bool, error) {
 	info, err := os.Lstat(target)
 	if err != nil {
-		// A denied path that does not exist needs no overlay: there is
-		// nothing there to reach. Bind the target onto itself read-only so
-		// the render still names it and a later creation lands on the
-		// read-only tmpfs root, not on the host.
-		return target, nil
+		return "", false, refuse(ReasonWritableSetUnrepresentable, "deny target is not reachable: %v", errnoText(err))
 	}
 	base := filepath.Join(os.TempDir(), "donmai-confine-empty")
 	if info.IsDir() {
 		dir := filepath.Join(base, "dir")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
+			return "", false, refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
 		}
-		return dir, nil
+		return dir, true, nil
 	}
 	file := filepath.Join(base, "file")
 	if err := os.MkdirAll(base, 0o755); err != nil {
-		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
+		return "", false, refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
 	}
 	f, err := os.OpenFile(file, os.O_CREATE|os.O_RDONLY, 0o644)
 	if err != nil {
-		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
+		return "", false, refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
 	}
 	_ = f.Close()
-	return file, nil
-}
-
-// landlockAvailable reports whether the running kernel supports Landlock
-// (5.13+): the create-ruleset call exists and answers. It is defence in
-// depth only; the mount tree is the boundary either way, and the backend
-// version names the kernel release so the self-test pins what it proved.
-func landlockAvailable() bool {
-	fd, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, 0, 0, unix.LANDLOCK_CREATE_RULESET_VERSION)
-	if errno != 0 {
-		return false
-	}
-	_ = unix.Close(int(fd))
-	return true
+	return file, false, nil
 }

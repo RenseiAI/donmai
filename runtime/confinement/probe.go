@@ -98,6 +98,9 @@ type stepResult struct {
 // whether it did, with the exit code the process should end with. The
 // caller exits; a library never does.
 func RunProbeFromEnv() (handled bool, exitCode int) {
+	if handled, code := RunLandlockStageFromEnv(); handled {
+		return true, code
+	}
 	planPath := os.Getenv(ProbeEnv)
 	if planPath == "" {
 		return false, 0

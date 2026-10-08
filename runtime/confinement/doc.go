@@ -69,6 +69,12 @@
 // name: never a terminal. Package data (Homebrew's var and /usr/local/var,
 // where database directories and keys live) is re-denied after the runtime
 // allows. dyld reads the root directory itself at every exec, so the root
-// stays listable and nothing under it does unless named. Other operating
-// systems have no backend yet.
+// stays listable and nothing under it does unless named.
+//
+// The Linux backend renders the same contract as a bubblewrap mount tree:
+// a tmpfs root hides everything, read-only binds carry the OS userland,
+// the writable set is bound read-write over them, deny overlays win last,
+// and a Landlock stage the harness process itself executes confines reads
+// outside the allowlist and TCP connects outside the declared loopback
+// ports. Other operating systems have no backend yet.
 package confinement

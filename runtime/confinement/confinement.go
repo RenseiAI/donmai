@@ -288,9 +288,14 @@ func (p *Plan) Command(argv []string) ([]string, error) {
 
 // Environment returns the KEY=VALUE bindings the confined process needs:
 // TMPDIR, TMP and TEMP bound to session_tmp and each cache variable bound to
-// its per-session directory. Both spawn paths apply the same bindings.
+// its per-session directory, plus whatever the boundary itself needs (a
+// Landlock stage policy). Both spawn paths apply the same bindings.
 func (p *Plan) Environment() []string {
-	return append([]string(nil), p.env...)
+	env := append([]string(nil), p.env...)
+	if p.applied.Environ != nil {
+		env = append(env, p.applied.Environ()...)
+	}
+	return env
 }
 
 // Record returns the per-session confinement record.
