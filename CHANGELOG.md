@@ -11,6 +11,21 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 ### Features
 
 - Publish subscription quota on the daemon heartbeat: a quota poller reads each installed harness's host login once per 5-minute interval (a short-lived codex app-server `account/rateLimits/read` with the host login projected, a short-lived claude `get_usage` control request with no model turn) into the per-account snapshot cache, and live sessions report their streamed rate-limit updates (codex `account/rateLimits/updated`, claude `rate_limit_event`) to `POST /api/daemon/sessions/<id>/usage`, where they merge by window id onto the probe snapshot. A worker authenticates its own session's update with the per-session credential stated in its spawn environment (or its attempt credential on a local runtime) — never the operator control token — so the update route stays closed to any caller that cannot name its session. The heartbeat `quota` field carries one entry per account with windows, each with an `authCheck` (`harness`, `ok`, `checkedAt`) stamped with the probe time. Only a read the harness answered records a verdict: the codex login refusal is the app-server's -32600 answer (a backend fetch failure records nothing), and the claude verdict comes from the host login check; a read that never reached the harness keeps the previous one.
+- Linux seat confinement: a mount-namespace backend renders the seat boundary as a bubblewrap mount tree (a tmpfs root with read-only system binds, the session's writable set, and a fresh `/dev` and `/proc`) plus a Landlock stage that refuses reads outside the allowlist and TCP connects outside declared loopback ports. Each seat runs in its own PID namespace, so no outside process is visible to it and stopping the launcher stops every process inside. The backend needs bubblewrap, unprivileged user namespaces and Landlock ABI 2 or later; a host without them refuses the seat (`namespace_unavailable` or `backend_absent`) instead of running it unconfined.
+- Per-seat CPU and memory budgets: `capacity.seatBudget: { cpus, memoryMb, ioWeight, mode }` in `daemon.yaml` divides host capacity across concurrent seats. On Linux each seat runs in a transient systemd scope (systemd 252 or newer) with a CPU quota and memory limit; on macOS seats carry worker-cap environment (`GOMAXPROCS` and the build-tool parallelism settings). Host status, session handles and session results report the budget as `enforced`, `best-effort` or `none`. Omitting the block leaves seats unchanged.
+- Embedders can opt in to stalled-model-request retries (`runner.Options.ProviderStallTimeout`, off by default): when no model output follows a tool result within the window, the hung request is aborted and the turn retried with backoff, up to `ProviderStallRetries`, instead of the idle watchdog ending the seat as no-progress.
+
+### Fixes
+
+- Seat confinement denies seats the daemon control token on macOS and Linux: reads and writes of the token are refused, as is listing its directory, the state home and the directories between the state home and the work area.
+- Harness child environments are built from an allowlist of process context (search path, home, scratch, locale, terminal, TLS trust paths and credential-free proxy settings) on both the headless and interactive lanes. Session credentials reach the harness through owner-only files in the session state root, removed at session end, and the worker drops its per-session read credential from its own environment once bootstrap succeeds.
+- Credentials are redacted from unauthenticated control API responses: repository URLs on the stats, heartbeat, doctor, pool, workarea and session list routes, and on credential-free session-detail reads, are served without their userinfo. The session usage route checks the caller's credential before it looks up the session.
+- A timed-out quota probe stops its whole process group, so a forked CLI child cannot outlive it.
+- A transiently refused PTY start (`EPERM` or `EAGAIN` under heavy spawn load) is retried a bounded number of times instead of failing the spawn.
+
+### Chores
+
+- Deflake the durable output batch frame-age test and the shim-spawn tests: the frame-age bound is measured only over recorded output frames, and the shim-spawn harness no longer needs a shell binary.
 
 ## v0.72.67 — 2026-10-08
 
