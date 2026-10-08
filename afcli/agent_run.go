@@ -39,6 +39,7 @@ import (
 	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
@@ -318,7 +319,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// (the credential cache below reuses this token) and never consults
 	// the read credential.
 	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
-	if readToken := strings.TrimSpace(os.Getenv("DONMAI_SESSION_READ_TOKEN")); readToken != "" && !opts.localRuntime {
+	if readToken := strings.TrimSpace(os.Getenv(runtimeenv.SessionReadTokenEnv)); readToken != "" && !opts.localRuntime {
 		daemonToken = readToken
 	}
 	if opts.localRuntime && (daemonToken == "" || daemonURLSource == daemonURLSourceBuiltinDefault) {
@@ -361,6 +362,16 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if err != nil {
 		return preflightErr(fmt.Sprintf(
 			"fetch session detail from %s (%s): %v", daemonURL, daemonURLSource, err))
+	}
+	// The bootstrap read consumed the per-session read credential: drop it
+	// from this process's environment before anything it spawns can
+	// inherit it. The credential cache below already captured the token
+	// string it needs for refreshes; every harness and agent child this
+	// worker spawns from here on inherits a credential-free environment.
+	// A local-runtime worker never used it (it presents its attempt
+	// credential only) — dropping the unused copy is the same hygiene.
+	if err := os.Unsetenv(runtimeenv.SessionReadTokenEnv); err != nil {
+		return preflightErr(fmt.Sprintf("drop session read credential after bootstrap: %v", err))
 	}
 	if opts.localRuntime {
 		if err := validateLocalAgentDetail(daemonURL, detail); err != nil {

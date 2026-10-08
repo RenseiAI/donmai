@@ -1916,6 +1916,13 @@ func (s *WorkerSpawner) sessionEnv(spec SessionSpec, project *ProjectConfig) []s
 // settings. None of them may reach a session. Both spawn paths (direct and
 // shim) build their env here, so the parent filter covers both; the shim's
 // own launch contract is appended by the shim launcher afterwards.
+//
+// The parent layer additionally drops the per-session read credential
+// (runtimeenv.SessionReadTokenEnv): the daemon states each session's own
+// credential explicitly in daemonOwnedEnv, so whatever the daemon process
+// inherited names no other session and must not ride along. The explicit
+// maps above are untouched — stripping there would remove the credential
+// the worker needs for its own detail read.
 func composeEnv(parts ...map[string]string) []string {
 	merged := map[string]string{}
 	for _, p := range parts {
@@ -1923,13 +1930,33 @@ func composeEnv(parts ...map[string]string) []string {
 			merged[k] = v
 		}
 	}
-	parent := runtimeenv.FilterRunnerOnly(os.Environ())
+	parent := filterSpawnerParentEnv(os.Environ())
 	out := make([]string, 0, len(parent))
 	out = append(out, parent...)
 	for k, v := range merged {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+// filterSpawnerParentEnv is the daemon spawn path's inherited-environment
+// filter: the runner-only controls plus the per-session read credential.
+// A stale read credential in the daemon's own environment names some other
+// session's detail read; it must not ride into a worker beside that
+// worker's own explicitly stated credential. Kept beside composeEnv (not
+// in runtime/env) because the explicit-map half of that composition must
+// keep stating the credential.
+func filterSpawnerParentEnv(entries []string) []string {
+	out := runtimeenv.FilterRunnerOnly(entries)
+	kept := out[:0]
+	prefix := runtimeenv.SessionReadTokenEnv + "="
+	for _, entry := range out {
+		if entry == runtimeenv.SessionReadTokenEnv || strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept
 }
 
 // PrefixWriterFunc adapts a function to PrefixedWriter.

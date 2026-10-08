@@ -363,3 +363,63 @@ func TestRunnerOnlyRefusesTheSessionShimLaunchContract(t *testing.T) {
 		t.Errorf("FilterRunnerOnly = %v, want only PATH", kept)
 	}
 }
+
+// TestInheritedLayersStripSessionReadToken pins that the per-session read
+// credential never crosses an inherited-environment boundary into a harness
+// or agent child: both ComposeChildEnv's parent layer and Composer's base
+// layer drop it, while an explicit supervisor-authored layer may still
+// state it (that is how the worker receives it).
+//
+// RED: drop the strip from either inherited layer and the corresponding
+// assertion fails with the sentinel quoted in the failure output.
+func TestInheritedLayersStripSessionReadToken(t *testing.T) {
+	t.Parallel()
+
+	const sentinel = "sentinel-read-credential"
+
+	t.Run("ComposeChildEnv", func(t *testing.T) {
+		t.Parallel()
+		got := env.ComposeChildEnv(
+			[]string{env.SessionReadTokenEnv + "=" + sentinel, "KEEP=yes"},
+			map[string]string{"OTHER": "1"},
+		)
+		for _, kv := range got {
+			if strings.Contains(kv, sentinel) {
+				t.Fatalf("inherited read credential reached the child env: %v", got)
+			}
+		}
+		if !reflect.DeepEqual(got, []string{"KEEP=yes", "OTHER=1"}) {
+			t.Fatalf("child env = %v", got)
+		}
+	})
+
+	t.Run("Composer", func(t *testing.T) {
+		t.Parallel()
+		c := env.NewComposer()
+		got := c.Compose(map[string]string{
+			env.SessionReadTokenEnv: sentinel,
+			"PATH":                  "/usr/bin",
+		}, agent.Spec{})
+		for _, kv := range got {
+			if strings.Contains(kv, sentinel) {
+				t.Fatalf("inherited read credential reached the composed env: %v", got)
+			}
+		}
+		if !reflect.DeepEqual(got, []string{"PATH=/usr/bin"}) {
+			t.Fatalf("composed env = %v", got)
+		}
+	})
+
+	t.Run("ExplicitLayerStillStatesIt", func(t *testing.T) {
+		t.Parallel()
+		c := env.NewComposer()
+		got := c.Compose(
+			map[string]string{"PATH": "/usr/bin"},
+			agent.Spec{Env: map[string]string{env.SessionReadTokenEnv: "stated-by-supervisor"}},
+		)
+		want := []string{"DONMAI_SESSION_READ_TOKEN=stated-by-supervisor", "PATH=/usr/bin"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Compose mismatch:\n got: %#v\nwant: %#v", got, want)
+		}
+	})
+}

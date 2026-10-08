@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // controlAuthMode is the state of the mutating-route gate for one request.
@@ -68,7 +70,9 @@ func controlAuthState(d *Daemon) (controlAuthMode, string) {
 // states in every spawned worker's environment. It carries no operator
 // privilege: it authorizes exactly one session-detail read, for exactly
 // the session named beside it, and nothing else on the control API.
-const sessionReadTokenEnv = "DONMAI_SESSION_READ_TOKEN" //nolint:gosec // G101: an env-var NAME, not a credential.
+// The canonical spelling lives in runtime/env (SessionReadTokenEnv) so
+// the worker-side strip and every inherited-env filter agree on the name.
+const sessionReadTokenEnv = runtimeenv.SessionReadTokenEnv
 
 // mintSessionReadToken returns a fresh random per-session read credential.
 // The token is opaque to every holder: the daemon compares it with the
