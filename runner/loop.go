@@ -1527,7 +1527,10 @@ tailRecovery:
 			// makes teardown target whichever handle is now live.
 			handle = newHandle
 			// Re-consume any events the steering inject/resume produced.
-			tailRes, tailErr := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+			// The stall detector stays disarmed here for the same reason
+			// as the inject drain above: tail recovery owns follow-up
+			// liveness.
+			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
 			applyFollowUp(tailRes)
 			lastTurn = tailRes
@@ -1589,7 +1592,7 @@ tailRecovery:
 		} else {
 			followUps.sentContinuation()
 		}
-		tail, tailErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
 		if stopped {
 			res.TurnContinuations = followUps.report()
@@ -1882,26 +1885,34 @@ tailRecovery:
 // and retries the turn through the provider-error path instead of ending
 // the seat at the outer idle timeout.
 //
-// A stall is a model request that never returns: no response bytes or
-// tokens arrive within ProviderStallTimeout of the last observed event
-// while no tool call is in flight (consumeEvents flags
-// obs.providerStall). The hung request is aborted (handle.Stop) and the
-// turn is retried — the same stop-and-resume rail steering uses, against
-// the SAME provider-native session — with backoff, up to
-// ProviderStallRetries attempts. Each retry is recorded on a
-// turnFollowUps so it rides Result.TurnContinuations exactly like the
-// provider-error retries it reuses.
+// A stall is a model request that never answers the tool result it should
+// follow: post-tool silence longer than ProviderStallTimeout with no tool
+// call in flight (consumeEvents flags obs.providerStall). The hung request
+// is aborted (handle.Stop) and the turn is retried — the same
+// stop-and-resume rail steering uses, against the SAME provider-native
+// session — with backoff, up to ProviderStallRetries attempts. Each retry
+// is recorded on a turnFollowUps so it rides Result.TurnContinuations
+// exactly like the provider-error retries it reuses.
 //
 // A stall the retries exhaust fails the seat as FailureProviderError, not
 // FailureNoProgress, so the no-charge rule for provider-side failures
 // applies. A slow tool with no output never trips the detector: a tool
-// call in flight re-arms it, and the tool's own bounded timeout still ends
-// the CALL with an error the agent sees.
+// call in flight keeps the window disarmed, and the tool's own bounded
+// timeout still ends the CALL with an error the agent sees. Nor does a
+// healthy long generation or reasoning pass before the first tool result:
+// the detector only arms once a tool result has been observed, so
+// pre-tool silence never starts the window.
+//
+// A stall the detector flags but the rail cannot retry — retries disabled,
+// or a Resume the harness refuses — fails the seat as FailureProviderError
+// through the same classification the exhausted path uses, never as the
+// generic idle cut-off or a context-cancelled timeout.
 //
 // Only the first turn retries here. Follow-up turns stream through the
-// plain consumeEvents path: tail recovery already retries a turn that ends
-// on an explicit provider error, and a stall there reads as an unfinished
-// turn the continuation bound owns.
+// plain consumeEvents path with the detector disarmed (a non-positive
+// window): tail recovery already retries a turn that ends on an explicit
+// provider error, and a stall there reads as an unfinished turn the
+// continuation bound owns.
 func (r *Runner) consumeEventsWithStallRetries(
 	ctx context.Context,
 	streamCtx context.Context,
@@ -1925,19 +1936,28 @@ func (r *Runner) consumeEventsWithStallRetries(
 			}
 			return obs, err
 		}
+		// The detector flagged a stall: the post-tool model request never
+		// answered. Retry it through the stop-and-resume rail while the
+		// bound lasts; when the rail cannot run, or the bound is spent,
+		// fail as a provider error through one shared helper so every
+		// exit reads the same classification, never the generic idle
+		// cut-off or a context-cancelled timeout.
+		failAsStall := func(o streamObservation, oerr error) (streamObservation, error) {
+			followUps.providerError = stallProviderErrorText(r.providerStallTimeout)
+			followUps.exhaust(boundRetries)
+			res.TurnContinuations = followUps.report()
+			o.providerError = followUps.providerError
+			o.providerErrorNotRetryable = false
+			o.noProgress = true
+			return o, oerr
+		}
 		if attempt >= limit {
 			r.logger.Warn("model request stalled repeatedly; failing the seat as a provider error",
 				"sessionId", qw.SessionID,
 				"retries", followUps.retried,
 				"limit", followUps.limit,
 			)
-			followUps.providerError = stallProviderErrorText(r.providerStallTimeout)
-			followUps.exhaust(boundRetries)
-			res.TurnContinuations = followUps.report()
-			obs.providerError = followUps.providerError
-			obs.providerErrorNotRetryable = false
-			obs.noProgress = true
-			return obs, err
+			return failAsStall(obs, err)
 		}
 		r.logger.Warn("model request stalled with no tool call in flight; stopping the hung request and retrying",
 			"sessionId", qw.SessionID,
@@ -1946,11 +1966,19 @@ func (r *Runner) consumeEventsWithStallRetries(
 			"stallTimeout", r.providerStallTimeout.String(),
 		)
 		if werr := r.waitRetryBackoff(streamCtx, followUps.retried+1); werr != nil {
+			// The backoff was cut short by cancellation (or the retry
+			// clock): the turn ends on that signal, not on the stall.
+			// Still record the provider-side cause on the observation
+			// so classification reads provider-error rather than the
+			// generic cut-off — a stall interrupted by teardown is
+			// still a provider error, not no-progress.
+			obs.providerError = stallProviderErrorText(r.providerStallTimeout)
+			obs.providerErrorNotRetryable = false
+			obs.noProgress = true
+			obs.providerStall = false
 			if followUps.retried > 0 || followUps.exhausted {
 				res.TurnContinuations = followUps.report()
 			}
-			obs.noProgress = false
-			obs.providerStall = false
 			return obs, werr
 		}
 		// Stop the hung request before resuming: resumeWithDirective
@@ -1961,18 +1989,17 @@ func (r *Runner) consumeEventsWithStallRetries(
 		stopCancel()
 		next, resumed, rerr := r.resumeWithDirective(ctx, provider, *handle, spec, qw, retryPrompt, nil)
 		if rerr != nil || !resumed {
-			r.logger.Warn("stalled model request could not resume a new turn; ending the stall retry",
+			r.logger.Warn("stalled model request could not resume a new turn; failing the seat as a provider error",
 				"sessionId", qw.SessionID,
 				"err", rerr,
 			)
-			if followUps.retried > 0 || followUps.exhausted {
-				res.TurnContinuations = followUps.report()
-			}
-			// The hung request was already stopped below; leave the
-			// stall flagged so the caller classifies the provider-side
-			// failure instead of the generic idle cut-off.
+			// The hung request was already stopped above. Classify the
+			// provider-side failure explicitly rather than leaving the
+			// generic idle cut-off or a context-cancelled timeout to
+			// own it — a stall the rail cannot retry is still a
+			// provider error, not no-progress.
 			obs.noProgress = true
-			return obs, err
+			return failAsStall(obs, err)
 		}
 		*handle = next
 		followUps.retried++
@@ -2064,18 +2091,31 @@ func (r *Runner) classifyStreamStop(
 	// the generic ctx-cancelled timeout branch below to classify the
 	// wedged-but-channel-alive session as FailureNoProgress rather than
 	// FailureTimeout. Stop the provider so it doesn't keep burning tokens.
-	// A stall-detector cut-off (obs.providerStall) is NOT terminal here:
-	// consumeEventsWithStallRetries handles it above by stopping the hung
-	// provider and retrying the turn, so this branch only sees it when
-	// retries are disabled or the stall path chose not to retry.
+	// A stall-detector cut-off (obs.providerStall) is NOT terminal here on
+	// its own: consumeEventsWithStallRetries retries it above through the
+	// stop-and-resume rail, and only a stall that exhausted its retries —
+	// or one the rail could not retry (retries disabled, Resume refused)
+	// — reaches this branch, already carrying the provider-error text
+	// consumeEventsWithStallRetries recorded. That text is what
+	// distinguishes the provider-side failure from the generic cut-off:
+	// it rides obs.providerError, so classify by the recorded error
+	// rather than by the detector flag alone. A tail or inject drain that
+	// runs with the detector disarmed never sets either, and keeps the
+	// generic classification it always had.
 	if streamRes.noProgress {
 		res.Status = "failed"
-		if streamRes.providerStall {
+		switch {
+		case streamRes.providerError != "":
+			res.FailureMode = FailureProviderError
+			if res.Error == "" {
+				res.Error = streamRes.providerError
+			}
+		case streamRes.providerStall:
 			res.FailureMode = FailureProviderError
 			if res.Error == "" {
 				res.Error = fmt.Sprintf("model request stalled: no provider response within stall timeout (%s) and no tool call in flight", r.providerStallTimeout)
 			}
-		} else {
+		default:
 			res.FailureMode = FailureNoProgress
 			if res.Error == "" {
 				res.Error = fmt.Sprintf("no agent event within idle timeout (%s)", r.idleTimeout)
@@ -2291,7 +2331,11 @@ func (r *Runner) drainMemoryInjects(
 			// as it ends so an earlier turn's pull request, verdict or error
 			// still reaches the envelope when a later turn carries none;
 			// consumeEvents already counted the turn's tool calls.
-			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+			// The stall detector stays disarmed here: tail recovery owns
+			// follow-up liveness through its continuation bound, and a
+			// post-tool silence on a follow-up turn is an unfinished
+			// turn — never a provider error to retry outside that bound.
+			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
 			injRes.applyTo(res, res.ProviderName)
 			merged = injRes
 			if enforcer != nil && enforcer.breached() != nil {
@@ -2505,6 +2549,30 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 // every return: each stream counts exactly once, including a turn the
 // caller stops on (no progress, timeout, lost ownership, cancel) before
 // applying its observation.
+// consumeEventsWithoutStallDetector drains a follow-up turn's events with
+// the stalled-model-request detector disarmed: tail recovery (the steering
+// re-consume, the deliverFollowUp drain, the memory-inject drain) owns
+// follow-up liveness through its continuation bound, so a post-tool
+// silence there is an unfinished turn that bound owns — never a provider
+// error to retry outside it, and never a provider-error classification on
+// the way out. Only the first turn arms the detector, through
+// consumeEventsWithStallRetries.
+func (r *Runner) consumeEventsWithoutStallDetector(
+	ctx context.Context,
+	handle agent.Handle,
+	worktreePath string,
+	qw QueuedWork,
+	res *Result,
+	enforcer *BudgetEnforcer,
+	sink activitySink,
+	traceProcessor spanEventProcessor,
+) (streamObservation, error) {
+	stallTimeout := r.providerStallTimeout
+	r.providerStallTimeout = 0
+	defer func() { r.providerStallTimeout = stallTimeout }()
+	return r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+}
+
 func (r *Runner) consumeEvents(
 	ctx context.Context,
 	handle agent.Handle,
@@ -2568,16 +2636,24 @@ func (r *Runner) consumeEvents(
 	// (idleC stays nil → its select case never fires).
 	//
 	// The stalled-model-request detector shares the same timer source. It
-	// is armed to r.providerStallTimeout and reset on every agent.Event
-	// alongside the idle timer, but it fires ONLY while no tool call is in
-	// flight: a hung model request after a tool result trips it, while a
-	// slow tool never does. On expiry the stream is flagged
-	// obs.providerStall so the caller stops the provider and retries the
-	// turn through the provider-error path instead of ending the seat at
-	// the outer idle timeout. A non-positive r.providerStallTimeout
-	// disables the detector (stallC stays nil → its select case never
-	// fires), and a zero tool-in-flight count at expiry is what
-	// distinguishes it from the idle watchdog.
+	// is armed to r.providerStallTimeout only AFTER a tool result has
+	// been observed while no tool call is in flight, and reset on every
+	// agent.Event while that post-tool silence lasts — the narrow window
+	// the reported hangs share: the last recorded activity is a tool
+	// result, then a model request that never returns. It fires ONLY
+	// while no tool call is in flight: a hung model request after a tool
+	// result trips it, while a slow tool never does. Stretches with no
+	// tool result yet (the first model generation, a reasoning pass
+	// before the first tool call) never arm it: no harness emits an
+	// event while a response streams, so an event-silence window there
+	// cannot tell a hung request from a healthy long generation, and
+	// arming it would abort healthy turns. On expiry the stream is
+	// flagged obs.providerStall so the caller stops the provider and
+	// retries the turn through the provider-error path instead of ending
+	// the seat at the outer idle timeout. A non-positive
+	// r.providerStallTimeout disables the detector (stallC stays nil →
+	// its select case never fires), and a zero tool-in-flight count at
+	// expiry is what distinguishes it from the idle watchdog.
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
 	var idleTimer interviewTimer
@@ -2587,12 +2663,32 @@ func (r *Runner) consumeEvents(
 		defer idleTimer.Stop()
 		idleC = idleTimer.Chan()
 	}
+	// stallTimer is created lazily: it stays nil until the first tool
+	// result while no tool call is in flight, so the pre-tool silence
+	// of a healthy generation never starts the window. armStall creates
+	// it on that first post-tool result; disarmStall stops it when a
+	// new tool call starts or the turn ends, so each post-tool window
+	// starts fresh.
 	var stallTimer interviewTimer
 	var stallC <-chan time.Time
-	if r.providerStallTimeout > 0 {
-		stallTimer = r.idleTimer(r.providerStallTimeout)
-		defer stallTimer.Stop()
-		stallC = stallTimer.Chan()
+	armStall := func() {
+		if r.providerStallTimeout <= 0 {
+			return
+		}
+		if stallTimer == nil {
+			stallTimer = r.idleTimer(r.providerStallTimeout)
+			stallC = stallTimer.Chan()
+			return
+		}
+		stallTimer.Reset(r.providerStallTimeout)
+	}
+	disarmStall := func() {
+		if stallTimer == nil {
+			return
+		}
+		stallTimer.Stop()
+		stallTimer = nil
+		stallC = nil
 	}
 	// resetIdle re-arms the watchdog after each observed event. Drains a
 	// possibly-already-fired timer tick before Reset so a stale fire from
@@ -2603,8 +2699,9 @@ func (r *Runner) consumeEvents(
 		}
 		idleTimer.Reset(r.idleTimeout)
 	}
-	// resetStall re-arms the stall detector after each observed event,
-	// alongside the idle watchdog.
+	// resetStall re-arms the stall detector after each observed event
+	// while the post-tool window is armed. It is a no-op before the
+	// first post-tool result arms the timer.
 	resetStall := func() {
 		if stallTimer == nil {
 			return
@@ -2615,23 +2712,67 @@ func (r *Runner) consumeEvents(
 	// matching result yet, keyed by tool-use id. A call in flight re-arms
 	// the watchdog on expiry instead of ending the session: the bounded
 	// tool timeout still ends the CALL with an error the agent sees.
+	// sawToolResult records that a tool result arrived while no call
+	// remains in flight: the model request that should follow is the one
+	// the stall detector watches. It arms the detector on the result and
+	// stays set until a new tool call starts or the turn ends.
 	toolInFlight := map[string]struct{}{}
+	sawToolResult := false
 	// trackToolEvent maintains toolInFlight from the correlated stream.
 	// ToolUseID may be empty on some harnesses; those calls share the ""
 	// key as a single in-flight slot, which is enough to suppress the
-	// watchdog while any unidentified call runs.
+	// watchdog while any unidentified call runs. A tool result that leaves
+	// no call in flight arms the stall detector: the silence that follows
+	// is the model request the reported hangs never answer. Any model
+	// output — assistant text, a usage report for a completed model call,
+	// quota or progress signals — or a new tool call disarms it: the
+	// model is answering again, or the silence belongs to the tool.
 	trackToolEvent := func(ev agent.Event) {
 		switch e := ev.(type) {
 		case agent.ToolUseEvent:
 			toolInFlight[e.ToolUseID] = struct{}{}
+			sawToolResult = false
+			disarmStall()
 		case agent.ToolResultEvent:
 			delete(toolInFlight, e.ToolUseID)
+			if len(toolInFlight) == 0 {
+				sawToolResult = true
+				armStall()
+			}
 		case agent.ResultEvent:
 			clear(toolInFlight)
+			sawToolResult = false
+			disarmStall()
 		case agent.ErrorEvent:
 			// A call still runs past an error the session continues past.
 			if !e.SessionContinues {
 				clear(toolInFlight)
+				sawToolResult = false
+				disarmStall()
+			}
+		case agent.AssistantTextEvent,
+			agent.LlmCallEvent,
+			agent.UsageEvent,
+			agent.ToolProgressEvent,
+			agent.SubagentEvent:
+			// Model output ends the post-tool silence the detector
+			// watches: a response is arriving, so there is no hung
+			// request to retry. Usage, progress and sub-agent
+			// lifecycle events only arrive while the provider runs,
+			// never from a wedged request.
+			sawToolResult = false
+			disarmStall()
+		case agent.SystemEvent:
+			// A provider-error observation means the model call
+			// ANSWERED with an error: the request is not hung, and
+			// the turn ends on that error through the normal
+			// provider-error path. Disarm so the detector cannot
+			// race it. All other system chatter (compaction,
+			// rate-limit notices, harness lifecycle) is not model
+			// output and leaves the window armed.
+			if e.Subtype == agent.SystemSubtypeProviderError {
+				sawToolResult = false
+				disarmStall()
 			}
 		}
 	}
@@ -2648,16 +2789,20 @@ func (r *Runner) consumeEvents(
 			// disambiguate the latter two.
 			return obs, watchCtx.Err()
 		case <-stallC:
-			if len(toolInFlight) > 0 {
-				// A tool call is still running: the silence belongs to
-				// the tool, not the model. Re-arm and keep waiting —
-				// a slow tool with no output must never trip the stall
+			if len(toolInFlight) > 0 || !sawToolResult {
+				// A tool call is still running, or no tool result has
+				// been seen yet: the silence belongs to the tool or
+				// to a pre-tool generation, not to a hung post-tool
+				// model request. Re-arm when the window is armed and
+				// keep waiting — a slow tool with no output and a
+				// healthy long generation must never trip the stall
 				// detector, and the tool's own bounded timeout still
 				// ends the CALL with an error the agent sees.
 				resetStall()
-				r.logger.Debug("provider stall detector: tool call in flight — re-arming",
+				r.logger.Debug("provider stall detector: no post-tool window — re-arming",
 					"sessionId", qw.SessionID,
 					"inFlight", len(toolInFlight),
+					"sawToolResult", sawToolResult,
 				)
 				continue
 			}
@@ -2692,7 +2837,8 @@ func (r *Runner) consumeEvents(
 			if !ok {
 				return obs, nil
 			}
-			// Forward progress observed — re-arm both watchdogs.
+			// Forward progress observed — re-arm the idle watchdog, and
+			// the stall detector while its post-tool window is armed.
 			resetIdle()
 			resetStall()
 			for _, correlatedEvent := range traceProcessor.Process(ev) {

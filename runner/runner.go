@@ -112,17 +112,23 @@ const (
 
 	// DefaultProviderStallTimeout is the stalled-model-request window
 	// applied to the event stream when [Options.ProviderStallTimeout]
-	// is zero. Unlike DefaultIdleTimeout, it fires only while NO tool
-	// call is in flight: a tool result the agent has not answered with
-	// any response bytes or tokens within the window means the model
-	// request that should follow is stalled, not that a tool is slow.
-	// On expiry the runner stops the provider and surfaces the
-	// provider-stall signal so the caller can retry the turn through
-	// the provider-error path instead of ending the seat at the outer
-	// idle timeout. Three minutes sits between a slow model round trip
-	// and the twelve-minute outer backstop with margin for the bounded
-	// retries to complete before it. A NEGATIVE
-	// Options.ProviderStallTimeout disables the detector entirely.
+	// is POSITIVE. The window measures the silence after a tool result
+	// while NO tool call is in flight: a tool result the agent has not
+	// answered within the window means the model request that should
+	// follow may be stalled, not that a tool is slow. On expiry the
+	// runner stops the provider and surfaces the provider-stall signal
+	// so the caller can retry the turn through the provider-error path
+	// instead of ending the seat at the outer idle timeout. Three minutes
+	// sits between a slow model round trip and the twelve-minute outer
+	// backstop with margin for the bounded retries to complete before it.
+	//
+	// Zero (the default) DISABLES the detector: no harness emits an event
+	// while a response streams, so an event-silence window cannot tell a
+	// hung request from a healthy long generation or reasoning pass —
+	// arming it by default would abort healthy turns and regenerate them
+	// up to the retry bound. Callers opt in only where the reported
+	// stalled shape dominates. A NEGATIVE Options.ProviderStallTimeout
+	// also disables the detector entirely.
 	DefaultProviderStallTimeout = 3 * time.Minute
 
 	// DefaultProviderStallRetries bounds the stop-and-retry attempts a
@@ -218,18 +224,24 @@ type Options struct {
 	IdleTimeout time.Duration
 
 	// ProviderStallTimeout is the stalled-model-request window applied
-	// to the event stream. A resettable timer is armed in consumeEvents
-	// alongside the idle watchdog and reset on every agent.Event; when
-	// it expires with no event in the window AND no tool call in flight
-	// the runner stops the provider and surfaces the provider-stall
-	// signal so the caller retries the turn through the provider-error
-	// path instead of ending the seat at the outer idle timeout — a
-	// hung model request after a tool result must not reach the
-	// twelve-minute backstop. A tool call in flight suppresses it
-	// (the tool's own bounded timeout owns that call).
+	// to the event stream. A resettable timer arms in consumeEvents
+	// after a tool result while no tool call is in flight and resets on
+	// every agent.Event; when it expires with no event in the window AND
+	// no tool call in flight the runner stops the provider and surfaces
+	// the provider-stall signal so the caller retries the turn through
+	// the provider-error path instead of ending the seat at the outer
+	// idle timeout — a hung model request after a tool result must not
+	// reach the twelve-minute backstop. A tool call in flight suppresses
+	// it (the tool's own bounded timeout owns that call), and so does
+	// any stretch with no tool result yet: the timer only starts once a
+	// tool result has been observed, so a healthy long generation or
+	// reasoning pass before the first tool call never trips it.
 	//
-	// Zero falls back to DefaultProviderStallTimeout (detector ON by
-	// default). NEGATIVE disables the detector entirely (caller relies
+	// Zero (the default) disables the detector entirely: no harness
+	// emits an event while a response streams, so an event-silence
+	// window cannot tell a hung post-tool request from a healthy long
+	// generation. A POSITIVE value opts in explicitly with the window
+	// to apply. NEGATIVE also disables the detector (caller relies
 	// solely on the idle watchdog for liveness).
 	ProviderStallTimeout time.Duration
 
@@ -624,8 +636,12 @@ func New(opts Options) (*Runner, error) {
 	if r.idleTimeout == 0 {
 		r.idleTimeout = DefaultIdleTimeout
 	}
-	if r.providerStallTimeout == 0 {
-		r.providerStallTimeout = DefaultProviderStallTimeout
+	if r.providerStallTimeout < 0 {
+		// Negative opts out explicitly; zero (unset) keeps the
+		// detector disabled until a caller opts in with a positive
+		// window. Normalize both to the same disarmed value so
+		// consumeEvents reads one condition.
+		r.providerStallTimeout = 0
 	}
 	if r.providerStallRetries == 0 {
 		r.providerStallRetries = DefaultProviderStallRetries
