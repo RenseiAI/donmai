@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.67 — 2026-10-08
+
 ### Fixes
 
 - Seat credentials are no longer passed on child process command lines. Fleet child workers receive the provisioning token through their environment, and the Claude MCP gateway header helper reads its fallback bearer from an owner-only file beside its config instead of carrying it in the helper text.
