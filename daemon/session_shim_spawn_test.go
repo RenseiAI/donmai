@@ -3238,6 +3238,13 @@ func TestLaunchContractEpochAdvancesPastPriorIncarnations(t *testing.T) {
 		t.Fatalf("nextShimProcessEpoch on a new identity = %d, want 1", got)
 	}
 
+	// An unreadable registry maps to 1 rather than failing the launch: the
+	// fallback stays inside the 1-based contract, so a later healthy epoch-1
+	// launch can never alias the lineage the epoch disambiguates.
+	if got := d.nextShimProcessEpoch(id, nil); got != 1 {
+		t.Fatalf("nextShimProcessEpoch with an unreadable registry = %d, want 1", got)
+	}
+
 	// A prior incarnation that ended with a tombstone at epoch 5 advances the
 	// next launch to 6.
 	prior := sessionshim.Tombstone{

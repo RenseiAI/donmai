@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -417,5 +418,92 @@ func TestHeadlessPublishFailureReturnsRatherThanHangs(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("StartHeadless did not return after the record publish failed")
+	}
+}
+
+// TestStartRefusesExplicitHeadlessWorkload pins the fail-closed entry-point
+// split: Start serves the interactive profile only, so a caller that meant
+// to start a headless shim gets an error naming the headless entry — never
+// a silently downgraded PTY session — and nothing is started.
+func TestStartRefusesExplicitHeadlessWorkload(t *testing.T) {
+	t.Parallel()
+
+	dir := shortTempDir(t)
+	registry, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{OrgID: "org-refused", SessionID: "sess-refused"}
+	shim, err := Start(Options{Identity: id, Registry: registry, Workload: WorkloadHeadless})
+	if err == nil {
+		_ = shim.Close()
+		t.Fatal("Start with an explicit headless workload succeeded; want refusal toward the headless entry")
+	}
+	if !strings.Contains(err.Error(), "StartHeadless") {
+		t.Fatalf("Start refusal = %v, want the headless entry named", err)
+	}
+	// The refusal happens before the serve core runs: no discovery record is
+	// published, so a downgraded session could never be adopted, and no
+	// adoption socket is left behind.
+	if _, getErr := registry.Get(id); getErr == nil {
+		t.Fatal("refused Start published a discovery record; a downgraded session would be adoptable")
+	}
+	if _, statErr := os.Stat(registry.SocketPath(id)); !os.IsNotExist(statErr) {
+		t.Fatalf("refused Start left an adoption socket behind: %v", statErr)
+	}
+}
+
+// TestHeadlessHeartbeatBeyondTerminalSequenceIsMalformed pins the
+// terminal-courtesy bound on the headless profile: the only sequence a
+// headless shim ever allocates is 1, so a controller heartbeat claiming an
+// acknowledgement of 2 is refused as malformed — before any tombstone
+// exists, not just after it.
+func TestHeadlessHeartbeatBeyondTerminalSequenceIsMalformed(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeRunner(t)
+	_, registry, id := startHeadlessFixture(t, runner, 1)
+
+	rec, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ctrl, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-ahead"})
+	if err != nil {
+		t.Fatalf("Dial headless record: %v", err)
+	}
+	defer func() { _ = ctrl.Close() }()
+
+	committed := ctrl.Generation()
+	if committed == 0 {
+		t.Fatal("adopted headless controller has generation 0")
+	}
+	// A raw write on the controller's own connection, as the stale-generation
+	// test does: the Controller type has no ahead-of-terminal sender, so the
+	// bound is exercised at the wire, through the same connection an adopted
+	// controller holds.
+	ahead, err := shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{Generation: committed, AckedSeq: headlessTerminalSeq + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrl.w.Write(shimwire.TypeHeartbeat, ahead); err != nil {
+		t.Fatalf("write ahead headless heartbeat: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case event := <-ctrl.Events():
+			if event.Kind != EventError {
+				continue
+			}
+			if event.Err.Code != shimwire.CodeMalformed {
+				t.Fatalf("ahead headless heartbeat answer = %s, want %s", event.Err.Code, shimwire.CodeMalformed)
+			}
+			return
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("no malformed refusal arrived for the ahead-of-terminal headless heartbeat")
+		}
 	}
 }
