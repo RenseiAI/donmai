@@ -428,6 +428,7 @@ func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error
 		{"Sessions:", fmt.Sprintf("%d / %d", r.ActiveSessions, r.MaxSessions)},
 		{"Projects:", formatStatusProjectIDs(r)},
 		{"Process priority:", formatProcessPriorityStatus(r.ProcessPriority)},
+		{"Seat budget:", formatSeatBudgetStatus(r.SeatBudget)},
 		{"Timestamp:", r.Timestamp},
 	}
 	for _, row := range rows {
@@ -461,6 +462,30 @@ func formatProcessPriorityStatus(status *afclient.DaemonProcessPriorityStatus) s
 		return status.Mode + " — " + status.Warning
 	}
 	return status.Mode
+}
+
+// formatSeatBudgetStatus renders the per-seat budget for the status table:
+// the posture with the values, or "not reported" against an older daemon.
+// A host with budgeting off reads as "none" — the honest shape, not an
+// omission an operator could misread as a missing probe.
+func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
+	if status == nil || strings.TrimSpace(status.Mode) == "" {
+		return "not reported"
+	}
+	if status.Mode == "none" {
+		return "none"
+	}
+	value := status.Mode
+	if status.CPUs > 0 {
+		value += fmt.Sprintf(", %d CPUs", status.CPUs)
+	}
+	if status.MemoryMB > 0 {
+		value += fmt.Sprintf(", %d MB", status.MemoryMB)
+	}
+	if status.Detail != "" {
+		value += " — " + status.Detail
+	}
+	return value
 }
 
 // formatInstalledProcessPriority is the install report line for the mode that

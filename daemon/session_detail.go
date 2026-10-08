@@ -337,6 +337,13 @@ type SessionDetail struct {
 	// behaviour. Forwarded opaquely; the daemon does not interpret the keys.
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
 
+	// SeatBudget carries the per-seat resource budget the worker applies to
+	// this session: the resolved share plus the mode. Stamped by the daemon
+	// at dispatch from its live config (see PollItemToSessionDetail); the
+	// runner reports what the seat actually got on the session result.
+	// Nil means budgeting is off — the seat spawns exactly as before.
+	SeatBudget *SessionSeatBudget `json:"seatBudget,omitempty"`
+
 	// ── W3C trace-context correlation ────────────────────────────────────
 	//
 	// Platform dispatch stamps these opaquely per

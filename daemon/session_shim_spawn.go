@@ -21,6 +21,7 @@ import (
 
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -1268,7 +1269,8 @@ func shimChildLogPath(registryDir string, id sessionshim.Identity) string {
 // §D1 removes: a daemon that still had to reap this process could not be
 // replaced without ending it.
 func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, env []string) (sessionshim.ProcessIdentity, error) {
-	command := d.shimCommand()
+	shimBudget, shimBudgetOK := d.shimSeatBudget()
+	command := seatBudgetShimCommand(d.shimCommand(), spec.SessionID, shimBudget, shimBudgetOK, seatBudgetLaunchPlacement(), seatBudgetLaunchUserScope())
 	if len(command) == 0 {
 		return sessionshim.ProcessIdentity{}, errors.New("session shim: no worker command is configured to launch a shim with")
 	}
@@ -2113,11 +2115,13 @@ func (d *Daemon) trackLaunchedShim(
 	receipt SessionShimAdoptionReceipt,
 	startConsumer bool,
 ) SessionHandle {
+	shimReportBudget, shimReportBudgetOK := d.shimSeatBudget()
 	handle := SessionHandle{
 		SessionID:  spec.SessionID,
 		PID:        ctrl.HarnessIdentity().PID,
 		AcceptedAt: d.shimNow().UTC().Format(time.RFC3339),
 		State:      SessionRunning,
+		SeatBudget: sessionSeatBudgetReport(shimReportBudget, shimReportBudgetOK, seatbudget.HostPlacement()),
 		// The workarea doubles as the worktree path a local reader joins with
 		// .agent/…; it is the same <parent>/<sessionID> leaf the direct path
 		// publishes, so a reader cannot tell shim-backed sessions apart by shape.
@@ -4032,6 +4036,11 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 		return nil
 	}
 	d.reconcileQuarantinedTombstones()
+	// Recovery handles carry the daemon's current resolved share: the
+	// adopted-at-startup and quarantined entries below have no launch-time
+	// spec (that daemon generation is gone), so they re-report what a
+	// fresh launch would get rather than going stale at nil.
+	recoveryBudget := d.seatBudgetHandleReport()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	out := make([]SessionHandle, 0, len(d.shims.adopted)+len(d.shims.quarantined))
@@ -4040,7 +4049,7 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 		if handle.SessionID == "" {
 			// Adopted at startup rather than launched here: this daemon has the
 			// identity and the shim's report, not the original spec.
-			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning}
+			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning, SeatBudget: recoveryBudget}
 			if entry.controller != nil {
 				handle.PID = entry.controller.HarnessIdentity().PID
 				handle.WorktreePath = entry.controller.Hello().WorkareaPath
@@ -4057,8 +4066,9 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 	}
 	for _, q := range d.shims.quarantined {
 		out = append(out, SessionHandle{
-			SessionID: q.SessionID,
-			State:     SessionRunning,
+			SessionID:  q.SessionID,
+			State:      SessionRunning,
+			SeatBudget: recoveryBudget,
 		})
 	}
 	return out
