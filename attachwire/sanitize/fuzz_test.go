@@ -27,6 +27,7 @@ func FuzzSanitizer(f *testing.F) {
 		[]byte("\x1b_kitty\x1b\\"),
 		[]byte("\x9b1m\x9d52;c;QQ==\x9c"),
 		[]byte("café 日本語 👍🏽 x\xd9\x9by"),
+		[]byte("\x1b]0;\xe2\x9c\xb3 name\x07\x1b]8;;x\xc2\x9c\x9b6n"),
 		[]byte("\x1b]0;" + string(bytes.Repeat([]byte("A"), 100))),
 		[]byte("\x1b\x1b\x1b[[[???ttt"),
 		{0x00, 0x1b, 0x9b, 0x9d, 0x90, 0x9f, 0x9e, 0x98, 0x9c, 0x07, 0x7f},
