@@ -314,6 +314,12 @@ func redactWorkareaSummariesV1(summaries []afclient.WorkareaSummaryV1) {
 // redacts the echoed manifest map: inspect renders the raw manifest JSON
 // verbatim, so a credentialed repository URL stored there would otherwise
 // be served beside the redacted typed field.
+//
+// The per-leaf Repositories list intentionally carries no repository URL
+// field today (name/leaf/path/role/authority/refs/digest only), so there
+// is nothing credential-bearing to redact there. If a URL field ever
+// lands on WorkareaRepository, extend this function to walk it — a new
+// field would otherwise bypass this single redaction point silently.
 func redactWorkareaV1(wa *afclient.WorkareaV1) *afclient.WorkareaV1 {
 	if wa != nil {
 		wa.Repository = redactRepositoryURL(wa.Repository)

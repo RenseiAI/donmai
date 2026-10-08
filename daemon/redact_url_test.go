@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // urlRedactionSentinels are canary credential fragments. No control route
@@ -91,8 +92,10 @@ func rawControlBody(t *testing.T, addr, path string) string {
 // control routes with an operator configuration carrying a credentialed
 // repository URL and asserts the sentinel credential reaches no response
 // body: /api/daemon/stats (allowlist), /api/daemon/pool/stats (pool
-// members, via the stats route's embedded pool too), and the session
-// list (display-only projection of the inbound spec).
+// members, via the stats route's embedded pool too), the session list
+// (display-only projection of the inbound spec), the heartbeat allowlist
+// (last change beat's project entries), and the credential-free session
+// detail (top-level repository plus the forwarded declaration sources).
 //
 // RED: serve any of these URLs unredacted and the raw-body assertion
 // fails with the sentinel quoted in the failure output. The daemon runs
@@ -118,8 +121,28 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 
 	if _, err := d.AcceptWorkWithDetail(SessionSpec{
 		SessionID: "sess-cred-url", Repository: credentialed, Ref: "main",
-	}, &SessionDetail{SessionID: "sess-cred-url", Repository: credentialed}); err != nil {
+	}, &SessionDetail{
+		SessionID:  "sess-cred-url",
+		Repository: credentialed,
+		RepositoryDeclaration: &workarea.RepositoryDeclarationV1{
+			Protocol: workarea.ProtocolSessionRootV1,
+			Repositories: []workarea.DeclaredRepositoryV1{{
+				Source: workarea.RepositorySource{Repository: credentialed, Ref: "main"},
+				Role:   workarea.RepositoryRolePrimary,
+			}},
+		},
+	}); err != nil {
 		t.Fatalf("AcceptWorkWithDetail: %v", err)
+	}
+	// Publish one heartbeat beat carrying the credentialed project
+	// allowlist, so GET /api/daemon/heartbeat has a populated payload
+	// to serve. The stub registration token selects the local stub beat
+	// path, which records the payload without a network call.
+	if d.heartbeat == nil {
+		t.Fatal("daemon has no heartbeat service")
+	}
+	if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("heartbeat beat: %v", err)
 	}
 
 	for _, path := range []string{
@@ -127,9 +150,18 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 		"/api/daemon/stats?pool=true",
 		"/api/daemon/pool/stats",
 		"/api/daemon/sessions",
+		"/api/daemon/heartbeat",
 		"/api/daemon/sessions/sess-cred-url",
 	} {
 		assertNoURLCredential(t, "GET "+path, rawControlBody(t, srv.Addr(), path))
+	}
+
+	// The heartbeat's stored payload is the upstream POST body too:
+	// serving must redact a copy, never the stored entries.
+	for _, entry := range d.heartbeat.LastPayload().Allowlist {
+		if entry.Repository != credentialed {
+			t.Errorf("heartbeat stored allowlist rewritten to %q: serving must redact a copy", entry.Repository)
+		}
 	}
 
 	// The credentialed reads keep the functional URL: redaction is a

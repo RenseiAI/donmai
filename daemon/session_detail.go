@@ -786,6 +786,30 @@ func redactSessionDetail(d *SessionDetail) *SessionDetail {
 	// admission-digest check reads it, and that read is credentialed.
 	out.OperationalPayload = nil
 	out.McpServers = redactMCPServers(d.McpServers)
+	out.RepositoryDeclaration = redactRepositoryDeclaration(d.RepositoryDeclaration)
+	return &out
+}
+
+// redactRepositoryDeclaration returns a copy of d with embedded
+// credentials dropped from every declared repository source URL. The
+// declaration type's own contract says sources are ephemeral provision
+// input that must not be copied into stored records; the credential-free
+// detail projection honors that here, at the serving boundary, so a
+// user:token@ authority never reaches an unauthenticated local read.
+// The stored original is never rewritten: credentialed reads keep the
+// functional URLs the provisioner clones from.
+func redactRepositoryDeclaration(d *workarea.RepositoryDeclarationV1) *workarea.RepositoryDeclarationV1 {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	if d.Repositories != nil {
+		out.Repositories = make([]workarea.DeclaredRepositoryV1, len(d.Repositories))
+		copy(out.Repositories, d.Repositories)
+		for i := range out.Repositories {
+			out.Repositories[i].Source.Repository = redactRepositoryURL(out.Repositories[i].Source.Repository)
+		}
+	}
 	return &out
 }
 

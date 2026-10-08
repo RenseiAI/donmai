@@ -894,6 +894,18 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	last := s.daemon.heartbeat.LastPayload()
+	// The allowlist projects operator-configured repository URLs, which
+	// may carry embedded credentials. The serving copy is userinfo-
+	// redacted; the heartbeat's stored payload (also POSTed upstream)
+	// is never rewritten.
+	if last.Allowlist != nil {
+		redacted := make([]ProjectAllowlistEntry, len(last.Allowlist))
+		copy(redacted, last.Allowlist)
+		for i := range redacted {
+			redacted[i].Repository = redactRepositoryURL(redacted[i].Repository)
+		}
+		last.Allowlist = redacted
+	}
 	writeJSON(w, http.StatusOK, &last)
 }
 
