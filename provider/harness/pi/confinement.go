@@ -364,6 +364,11 @@ type piConfinerEntry struct {
 	digest   string
 }
 
+// piConfinementBackend returns the confinement backend for this OS. A
+// package variable so a test can pin the no-backend refusal on a host that
+// has one; production always takes the OS default.
+var piConfinementBackend = confinement.DefaultBackend
+
 var piConfinerCache struct {
 	sync.Mutex
 	entries map[string]*piConfinerEntry
@@ -384,7 +389,7 @@ var piConfinerCache struct {
 // directories are unchanged and the record is under a day old, instead of
 // probing again on every seat start.
 func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs, probeCommand []string) (*confinement.Confiner, error) {
-	backend := confinement.DefaultBackend()
+	backend := piConfinementBackend()
 	if backend == nil {
 		return nil, fmt.Errorf("%w: pi confinement requested: %w", agent.ErrSpawnFailed,
 			&confinement.Error{Reason: confinement.ReasonBackendAbsent, Detail: "no confinement backend for this operating system"})

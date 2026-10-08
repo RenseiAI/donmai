@@ -76,22 +76,35 @@
 // stays listable and nothing under it does unless named.
 //
 // The Linux backend renders the same contract as a bubblewrap mount tree:
-// a tmpfs root hides everything, read-only binds carry the OS userland,
-// the operator home and the host state home (so file metadata stays
-// readable) and the declared sockets, the writable set is bound read-write
-// over them, deny overlays win last only where host content would otherwise
-// show through a writable bind, and a Landlock stage the harness process
-// itself executes confines reads outside the allowlist. TCP connects are
-// deliberately unhandled by the stage — Landlock port rules carry no
-// address, so handling CONNECT_TCP would deny every undeclared port on any
-// address, including the remote endpoints the contract leaves open — and
-// loopback egress outside the declared ports is a documented gap the
-// self-test observes rather than denies. Three granularity differences from
-// the profile backend follow from the mechanism, and the self-test proves
-// the rest: renames and hard links whose both parents are writable cannot
-// be denied (the permission lives on the parents — both endpoints stay
-// inside the set and the Landlock rules follow inodes across the rename),
-// extended-attribute reads are not mediated on paths left visible for
-// metadata, and file metadata itself is refused where nothing is bound.
-// Other operating systems have no backend yet.
+// a tmpfs root hides everything; read-only binds carry the OS userland,
+// the resolver inputs, the operator home and the host state home (so file
+// metadata stays readable), the declared read paths and sockets; the
+// writable set is bound read-write over them; every write deny (read-only
+// leaves, protected paths, the workarea metadata, composer write denies)
+// is bound read-only over itself after the allows, readable and never
+// writable, with its ancestors inside the writable set anchored as mount
+// points no rename can move; and composer read denies are hidden behind an
+// empty placeholder wherever a bind would reveal them. A Landlock stage
+// the harness process itself executes — RunLandlockStageFromEnv, first in
+// main — then grants writes on the writable set only and, under a read
+// scope, reads on the allowlist only, each rule naming exactly the path
+// the tree binds. The capability check runs the launcher itself once with
+// the same namespace and mount operations, so a host whose security module
+// allows the namespace but denies the mounts refuses with
+// namespace_unavailable instead of failing every spawn.
+//
+// The Linux backend leaves outbound TCP unfiltered and declares it
+// (loopback egress open): Landlock port rules carry no address, so
+// filtering connects by port would cut every undeclared port on every
+// address, remote model endpoints included, and a private network
+// namespace would strand the host loopback and the external network with
+// it. The self-test holds it to that declaration — its undeclared loopback
+// dials must go through — so a change in the network handle turns the
+// self-test red. The daemon control API and any other loopback service stay
+// governed by their own authorization on Linux. Three further differences
+// from the profile backend follow from the mechanism: extended-attribute
+// reads are not mediated on paths left visible for metadata, file metadata
+// is refused where nothing is bound, and procfs is not readable inside the
+// boundary (without a pid namespace it would show every same-user
+// process). Other operating systems have no backend yet.
 package confinement

@@ -32,6 +32,9 @@ const (
 	classProtected = "protected"
 	classWidening  = "widening"
 	classReadScope = "read_scope"
+	// classEgress marks the outbound-TCP probes a backend that declares
+	// loopback egress open must let through (see loopbackEgressDeclarer).
+	classEgress = "egress"
 )
 
 // probeCacheEnv is the cache variable the self-test binds, standing in for a
@@ -81,13 +84,32 @@ type fixture struct {
 	// other probes are judged in; settle records and undoes them.
 	moves []move
 	moved map[string]bool
+	// rpf is a declared read path that is a single file in the operator
+	// home, the shape of a tool's user configuration (~/.gitconfig): its
+	// grant must not open the directory around it.
+	rpf string
+	// loopbackOpen is whether the backend under test declares outbound
+	// TCP to the local machine open on undeclared ports.
+	loopbackOpen bool
 }
 
 // move is one directory rename probe: from is where the directory belongs.
 type move struct{ id, from, to string }
 
-func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskImage string, diskImageErr error) (fx *fixture, err error) {
-	fx = &fixture{dir: dir, tag: randomSuffix()}
+// fixtureHost is what a fixture needs from the host and the backend under
+// test: the operator home and host state home the decoys sit in, the macOS
+// disk image the mount probe attaches, and the backend's declared loopback
+// egress.
+type fixtureHost struct {
+	home, stateHome string
+	diskImage       string
+	diskImageErr    error
+	loopbackOpen    bool
+}
+
+func newFixture(dir string, mode agent.PromptSessionMode, host fixtureHost) (fx *fixture, err error) {
+	home, stateHome := host.home, host.stateHome
+	fx = &fixture{dir: dir, tag: randomSuffix(), loopbackOpen: host.loopbackOpen}
 	defer func() {
 		if err != nil {
 			fx.cleanup()
@@ -190,7 +212,7 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 		return nil, err
 	}
 
-	if err := fx.readOnly(diskImage, diskImageErr); err != nil {
+	if err := fx.readOnly(host.diskImage, host.diskImageErr); err != nil {
 		return nil, err
 	}
 	if err := fx.protected(); err != nil {
@@ -203,17 +225,12 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	// Renames that move a whole leaf or an ancestor of a protected path run
 	// last, and settle undoes any that got through before anything is
 	// judged, so they cannot move paths the other probes are judged in.
-	// A rename whose both parents are writable cannot be denied by a mount
-	// tree — the permission lives on the parents — nor by Landlock's
-	// per-directory grants, which cover both endpoints; the profile backend
-	// denies the operation itself. Both endpoints stay inside the writable
-	// set and the Landlock rules follow inodes across the rename, so host
-	// state outside the set is unaffected; those probes stay darwin-only.
-	if runtime.GOOS == "darwin" {
-		fx.moveProbe(classProtected, "protected.rename", fx.ext, filepath.Join(fx.state, "ext-moved"))
-		fx.moveProbe(classProtected, "protected.rename_state", fx.state, filepath.Join(fx.mut, ".h-moved"))
-		fx.moveProbe(classProtected, "protected.rename_leaf_into_tmp", fx.mut, filepath.Join(fx.tmp, "mut-moved"))
-	}
+	// The profile backend denies these renames as operations; a mount-tree
+	// backend holds them because every writable root and protected path is
+	// a mount point there, and a mount point cannot be renamed.
+	fx.moveProbe(classProtected, "protected.rename", fx.ext, filepath.Join(fx.state, "ext-moved"))
+	fx.moveProbe(classProtected, "protected.rename_state", fx.state, filepath.Join(fx.mut, ".h-moved"))
+	fx.moveProbe(classProtected, "protected.rename_leaf_into_tmp", fx.mut, filepath.Join(fx.tmp, "mut-moved"))
 	fx.moveProbe(classReadOnly, "ro.rename_leaf", fx.ro, filepath.Join(fx.tmp, "ro-moved"))
 	return fx, nil
 }
@@ -244,7 +261,7 @@ func (fx *fixture) spec(mode agent.PromptSessionMode) Spec {
 func (fx *fixture) readSpec(mode agent.PromptSessionMode) Spec {
 	spec := fx.spec(mode)
 	spec.ReadScope = agent.FileReadWorkarea
-	spec.ReadPaths = []string{fx.rp}
+	spec.ReadPaths = []string{fx.rp, fx.rpf}
 	return spec
 }
 
@@ -315,11 +332,23 @@ func (fx *fixture) readScope(home, stateHome string, outside []readLocation) err
 		{"session_cache", fx.cache},
 		{"read_only_leaf", fx.ro},
 		{"read_path", fx.rp},
+		// A protected path stays readable: the harness loads the
+		// runner-injected artifact it may not change.
+		{"protected", fx.ext},
 	} {
 		if err := pair(classPositive, true, "allow.read."+in.name, in.dir, true); err != nil {
 			return err
 		}
 	}
+	// A declared read path that is one file in the operator home opens
+	// that file and nothing beside it: the decoys in the home below and
+	// the home listing still refuse.
+	fx.rpf = filepath.Join(home, ".donmai-confinement-rc-"+fx.tag)
+	if err := seed(fx.rpf); err != nil {
+		return err
+	}
+	fx.cleanups = append(fx.cleanups, func() { _ = os.Remove(fx.rpf) })
+	fx.addRead(classPositive, true, probeStep{ID: "allow.read.read_path_file", Op: opRead, Path: fx.rpf}, reported)
 	fx.addRead(classPositive, true, probeStep{ID: "allow.read.runtime", Op: opRead, Path: "/bin/sh"}, reported)
 	// The device nodes a process needs stay readable: the random devices and
 	// the directory itself.
@@ -576,15 +605,10 @@ func (fx *fixture) readOnly(diskImage string, diskImageErr error) error {
 	}
 	fx.add(classReadOnly, false, probeStep{ID: "ro.rename_in", Op: opRename, Path: inSource, Path2: at("in")}, existsEffect(at("in")))
 	hardlink := filepath.Join(fx.mut, "ro-hardlink")
-	// A hard link into a writable parent cannot be denied by a mount tree
-	// — the permission lives on the destination parent — nor by
-	// per-directory Landlock grants covering both endpoints; the profile
-	// backend denies the link itself. The link stays inside the writable
-	// set, so host state outside it is unaffected; the probe stays
-	// darwin-only.
-	if runtime.GOOS == "darwin" {
-		fx.add(classReadOnly, false, probeStep{ID: "ro.hardlink_from_mutable", Op: opLink, Path: at("ln"), Path2: hardlink}, existsEffect(hardlink))
-	}
+	// The profile backend denies the link itself; a mount-tree backend
+	// holds it because the read-only leaf and the mutable leaf are
+	// different mounts, and a hard link never crosses one.
+	fx.add(classReadOnly, false, probeStep{ID: "ro.hardlink_from_mutable", Op: opLink, Path: at("ln"), Path2: hardlink}, existsEffect(hardlink))
 	fx.add(classReadOnly, false, probeStep{ID: "ro.symlink_write_from_mutable", Op: opSymlinkWrite, Path: at("sw"), Path2: filepath.Join(fx.mut, "ro-symlink")}, changedEffect(at("sw")))
 	fx.add(classReadOnly, false, probeStep{ID: "ro.chmod_leaf", Op: opChmod, Path: fx.ro}, modeEffect(fx.ro, 0o755))
 	// The mount probe needs the macOS disk image tool: off darwin no image
@@ -637,6 +661,9 @@ func (fx *fixture) protected() error {
 			return err
 		}
 	}
+	// The harness reads the artifact it may not change: a boundary that
+	// hides it instead of holding it read-only strips the harness of it.
+	fx.add(classPositive, true, probeStep{ID: "allow.protected.read", Op: opRead, Path: filepath.Join(fx.ext, "boundary")}, func(res stepResult) bool { return res.Err == "" })
 	fx.add(classProtected, false, probeStep{ID: "protected.write", Op: opWrite, Path: at("w")}, changedEffect(at("w")))
 	fx.add(classProtected, false, probeStep{ID: "protected.create", Op: opCreate, Path: at("n")}, existsEffect(at("n")))
 	fx.add(classProtected, false, probeStep{ID: "protected.remove", Op: opRemove, Path: at("rm")}, func(stepResult) bool { return !exists(at("rm")) })
@@ -735,30 +762,43 @@ func (fx *fixture) widening(shared []string) error {
 	fx.tcpClosedPort = closedPort
 	fx.cleanups = append(fx.cleanups, func() { _ = closedListener.Close() })
 	go acceptLoop(closedListener, &fx.tcpAccepts)
-	// The loopback TCP write proxy stays judged by the backend that
-	// renders it: the macOS profile denies loopback except on declared
-	// ports, so the undeclared dials below refuse there; the Linux
-	// mount-namespace stage handles no network right (a Landlock port
-	// rule carries no address, so handling CONNECT_TCP would deny every
-	// undeclared port on any address, including the remote endpoints the
-	// contract leaves open), so there the declared-port dials are the
-	// positive controls proving egress still works. The declared ports
-	// ride the Linux stage invocation for the record only (see
-	// stagePortArgs). A backend that silently changes its network handle
-	// fails exactly the probes that name it.
-	fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp", Op: opTCPDial, Port: closedPort},
-		func(res stepResult) bool { return res.Err == "" })
-	fx.add(classPositive, true, probeStep{ID: "allow.loopback_tcp_declared", Op: opTCPDial, Port: openPort},
-		func(res stepResult) bool { return res.Err == "" })
+	// The undeclared-port dials are judged by what the backend declares.
+	// The macOS profile denies loopback except on declared ports, so there
+	// they are widening probes and must refuse. The Linux mount-namespace
+	// backend declares loopback egress open (loopbackEgressDeclarer): a
+	// Landlock port rule carries no address, so filtering TCP connects by
+	// port would cut every undeclared port on every address, remote
+	// endpoints included. There they are egress probes and must go
+	// through, which also proves the boundary left outbound TCP alone. A
+	// backend that silently changes its network handle fails exactly the
+	// probes that name it, either way.
+	reported := func(res stepResult) bool { return res.Err == "" }
+	undeclared := func(id, host string, port int) {
+		if fx.loopbackOpen {
+			fx.add(classEgress, true, probeStep{ID: "egress." + id + "_undeclared", Op: opTCPDial, Host: host, Port: port}, reported)
+			return
+		}
+		fx.add(classWidening, false, probeStep{ID: "widen." + id, Op: opTCPDial, Host: host, Port: port}, reported)
+	}
+	undeclared("loopback_tcp", "", closedPort)
+	fx.add(classPositive, true, probeStep{ID: "allow.loopback_tcp_declared", Op: opTCPDial, Port: openPort}, reported)
 	// The IPv6 listeners reuse the same two ports, one declared and one
-	// not. Where IPv6 loopback is unavailable the probe fails closed with
-	// a setup error, like the mount probe without its disk image: the
-	// self-test never passes silently where it cannot judge.
-	open6, err := listenLoopback6(openPort)
-	if err != nil {
+	// not. Where IPv6 loopback is unavailable and the backend must refuse
+	// the undeclared dial, the probe fails closed with a setup error, like
+	// the mount probe without its disk image: the self-test never passes
+	// silently where it cannot judge a deny. A backend that leaves loopback
+	// open has no deny to judge there, so it adds no IPv6 probe at all.
+	ipv6Unavailable := func(err error) {
+		if fx.loopbackOpen {
+			return
+		}
 		fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp6", Op: opTCPDial, Host: "::1", Port: closedPort},
 			func(stepResult) bool { return false })
 		fx.steps[len(fx.steps)-1].setupErr = "fixture: IPv6 loopback: " + errnoText(err)
+	}
+	open6, err := listenLoopback6(openPort)
+	if err != nil {
+		ipv6Unavailable(err)
 	} else {
 		fx.tcpOpen6 = open6
 		fx.cleanups = append(fx.cleanups, func() { _ = open6.Close() })
@@ -766,23 +806,18 @@ func (fx *fixture) widening(shared []string) error {
 		closed6, err := listenLoopback6(closedPort)
 		if err != nil {
 			_ = open6.Close()
-			fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp6", Op: opTCPDial, Host: "::1", Port: closedPort},
-				func(stepResult) bool { return false })
-			fx.steps[len(fx.steps)-1].setupErr = "fixture: IPv6 loopback: " + errnoText(err)
+			ipv6Unavailable(err)
 		} else {
 			fx.tcpClosed6 = closed6
 			fx.cleanups = append(fx.cleanups, func() { _ = closed6.Close() })
 			go acceptLoop(closed6, &fx.tcpAccepts)
-			fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp6", Op: opTCPDial, Host: "::1", Port: closedPort},
-				func(res stepResult) bool { return res.Err == "" })
-			fx.add(classPositive, true, probeStep{ID: "allow.loopback_tcp6_declared", Op: opTCPDial, Host: "::1", Port: openPort},
-				func(res stepResult) bool { return res.Err == "" })
+			undeclared("loopback_tcp6", "::1", closedPort)
+			fx.add(classPositive, true, probeStep{ID: "allow.loopback_tcp6_declared", Op: opTCPDial, Host: "::1", Port: openPort}, reported)
 		}
 	}
 	// The hostname probe resolves to a loopback address on this host; it
 	// dials the undeclared port so a name-resolution bypass fails it.
-	fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp_hostname", Op: opTCPDial, Host: "localhost", Port: closedPort},
-		func(res stepResult) bool { return res.Err == "" })
+	undeclared("loopback_tcp_hostname", "localhost", closedPort)
 	return nil
 }
 

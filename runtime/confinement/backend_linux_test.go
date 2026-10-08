@@ -4,6 +4,7 @@ package confinement
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -39,11 +40,11 @@ func newLinuxWorld(t *testing.T) linuxWorld {
 	w.ext = filepath.Join(w.state, "ext")
 	w.tmp = filepath.Join(w.stateHome, "tmp", "s1")
 	w.cache = filepath.Join(w.stateHome, "cache", "s1")
-	w.sock = filepath.Join(w.tmp, "agent.sock")
+	w.sock = filepath.Join(base, "run", "agent.sock")
 	w.rp = filepath.Join(base, "dotfiles")
 	for _, dir := range []string{
 		w.profileDir, filepath.Join(w.mut, ".git"), w.ro, w.ext,
-		w.tmp, w.cache, w.rp, filepath.Join(w.ws, ".workarea"),
+		w.tmp, w.cache, w.rp, filepath.Join(w.ws, ".workarea"), filepath.Dir(w.sock),
 	} {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
@@ -117,18 +118,18 @@ func bindTargets(args []string) [][3]string {
 
 // TestRenderBubblewrap_BindOrder pins the order the boundary depends on:
 // the user namespace first, the tmpfs root hiding everything, read-only
-// binds of the OS userland and the host directories, the writable set
-// over them, the device tree, the declared sockets, the denies after the
-// allows so narrower rules win, and the self-mark last. It never unshares
-// the pid namespace: the harness stays supervised under the outer launcher
-// pid. Denies render only where host content would otherwise show through
-// (strictly inside a writable root): top-level leaves, the metadata, the
-// workarea root and the shared locations stay hidden behind the tmpfs root
-// instead, so a refused listing fails instead of succeeding on an empty
-// overlay.
+// binds of the OS userland and the host directories, the declared sockets,
+// the device tree, the writable set over them, the write denies bound
+// read-only over themselves after the allows so narrower rules win, and
+// the self-mark last. It never unshares the pid namespace: the harness
+// stays supervised under the outer launcher pid. A write deny stays
+// readable: the protected artifact inside harness state and the read-only
+// leaf are bound read-only over themselves, never replaced by an empty
+// placeholder, and the workarea root itself is never mounted.
 func TestRenderBubblewrap_BindOrder(t *testing.T) {
 	w := newLinuxWorld(t)
-	text := joinArgs(mustRenderBubblewrap(t, w.resolved(), nil))
+	args := mustRenderBubblewrap(t, w.resolved(), nil)
+	text := joinArgs(args)
 	order := []string{
 		"--unshare-user",
 		"--tmpfs\n/\n",
@@ -138,8 +139,8 @@ func TestRenderBubblewrap_BindOrder(t *testing.T) {
 		"--dev-bind\n/dev/null\n/dev/null",
 		"--bind\n" + w.mut + "\n" + w.mut,
 		"--bind\n" + w.tmp + "\n" + w.tmp,
-		"--ro-bind\n" + w.sock + "\n" + w.sock,
-		"--ro-bind\n/tmp/donmai-confine-empty/dir\n" + w.ext,
+		"--ro-bind\n" + w.ro + "\n" + w.ro,
+		"--ro-bind\n" + w.ext + "\n" + w.ext,
 		"--setenv\n" + mountNamespaceMarkEnv + "\n1",
 	}
 	last := -1
@@ -153,27 +154,59 @@ func TestRenderBubblewrap_BindOrder(t *testing.T) {
 		}
 		last = at
 	}
-	// The protected artifact sits inside harness state, so its overlay
-	// renders; nothing else is overlaid.
-	if !strings.Contains(text, "--ro-bind\n/tmp/donmai-confine-empty/dir\n"+w.ext) {
-		t.Fatalf("deny overlay for %q is not the empty placeholder:\n%s", w.ext, text)
+	// No path is hidden behind an empty placeholder: nothing here is a
+	// read deny, and a write deny must stay readable.
+	if strings.Contains(text, "donmai-confine-empty") {
+		t.Fatalf("rendering hides a write deny behind an empty placeholder; the harness could not read it:\n%s", text)
 	}
-	for _, target := range []string{w.ro, w.ws, filepath.Join(w.ws, ".workarea"), "/var/tmp", w.mut, w.state} {
-		if strings.Contains(text, "--ro-bind\n/tmp/donmai-confine-empty/dir\n"+target+"\n") {
-			t.Fatalf("rendering overlays %q, which the tmpfs root already hides (or which carries a writable bind):\n%s", target, text)
-		}
+	// With reads open the workarea metadata is readable and never
+	// writable: bound read-only over itself.
+	meta := filepath.Join(w.ws, ".workarea")
+	if !hasTriple(bindTargets(args), "--ro-bind", meta, meta) {
+		t.Fatalf("rendering does not hold the workarea metadata read-only:\n%s", text)
 	}
 	// The workarea root is reachable but never mounted: no bind names it.
-	for _, triple := range bindTargets(mustRenderBubblewrap(t, w.resolved(), nil)) {
+	for _, triple := range bindTargets(args) {
 		if triple[2] == w.ws {
 			t.Fatalf("rendering mounts the workarea root %q, burying or opening the leaves:\n%s", w.ws, text)
 		}
 	}
-	if strings.Contains(text, "--unshare-pid") {
-		t.Fatalf("rendering unshares the pid namespace; the harness must stay supervised:\n%s", text)
+	if strings.Contains(text, "--unshare-pid") || strings.Contains(text, "--unshare-net") {
+		t.Fatalf("rendering unshares the pid or network namespace; the harness must stay supervised and keep its egress:\n%s", text)
 	}
 	if strings.Contains(text, "--ro-bind\n/proc\n/proc") || strings.Contains(text, "--ro-bind\n/sys\n/sys") {
 		t.Fatalf("rendering binds the host /proc or /sys; use the fresh mounts:\n%s", text)
+	}
+}
+
+// TestRenderBubblewrap_RenameAnchors: an ancestor of a write deny strictly
+// inside a writable root is bound read-write over itself — a mount point no
+// rename can move — before the deny beneath it is bound read-only, so the
+// later bind of the ancestor can never bury the deny. Writable roots are
+// mount points already and gain no second bind.
+func TestRenderBubblewrap_RenameAnchors(t *testing.T) {
+	w := newLinuxWorld(t)
+	nested := filepath.Join(w.mut, "pkg", "ext")
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	r := w.resolved()
+	r.Protected = []string{nested}
+	r.Pins = ancestorPins([]string{w.mut, w.state, w.tmp, w.cache}, []string{nested})
+	args := mustRenderBubblewrap(t, r, nil)
+	text := joinArgs(args)
+	anchor := filepath.Join(w.mut, "pkg")
+	anchorAt := strings.Index(text, "--bind\n"+anchor+"\n"+anchor+"\n")
+	denyAt := strings.Index(text, "--ro-bind\n"+nested+"\n"+nested+"\n")
+	if anchorAt < 0 || denyAt < 0 {
+		t.Fatalf("rendering lacks the anchor %q or the deny %q:\n%s", anchor, nested, text)
+	}
+	if denyAt < anchorAt {
+		t.Fatalf("the anchor binds after the deny beneath it and buries it:\n%s", text)
+	}
+	count := strings.Count(text, "--bind\n"+w.mut+"\n"+w.mut+"\n")
+	if count != 1 {
+		t.Fatalf("writable root %q bound %d times, want once:\n%s", w.mut, count, text)
 	}
 }
 
@@ -262,6 +295,9 @@ func TestRenderBubblewrap_ComposerRulesWinLast(t *testing.T) {
 		{Kind: RuleDenyWrite, Path: "/x", Scope: "glob"},
 		{Kind: RuleDenyWrite, Path: w.mut, Scope: ScopeSubtree},
 		{Kind: RuleDenyRead, Path: w.state, Scope: ScopeLiteral},
+		// A read deny over the host state home would bury the writable
+		// roots bound beneath it.
+		{Kind: RuleDenyRead, Path: w.stateHome, Scope: ScopeSubtree},
 	} {
 		if _, err := renderBubblewrap(w.resolved(), []Rule{rule}, linuxIdentity, ""); err == nil {
 			t.Errorf("rule %+v rendered; want rule_unrenderable", rule)
@@ -317,11 +353,96 @@ func TestRenderBubblewrap_DeclaredPortsRideTheStage(t *testing.T) {
 // declared-port allows, every connect to an undeclared port — on any
 // address — fails, and this test goes red.
 
+// TestRenderBubblewrap_ComposerWriteDenyStaysReadable: a composer write
+// deny inside the writable set is bound read-only over itself — readable,
+// not writable — after a read-write anchor on its ancestor, never hidden
+// behind an empty placeholder that would also hide its siblings.
+func TestRenderBubblewrap_ComposerWriteDenyStaysReadable(t *testing.T) {
+	w := newLinuxWorld(t)
+	pkg := filepath.Join(w.mut, "vendor", "pkg")
+	if err := os.MkdirAll(pkg, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	args := mustRenderBubblewrap(t, w.resolved(), []Rule{{Kind: RuleDenyWrite, Path: pkg, Scope: ScopeSubtree}})
+	triples := bindTargets(args)
+	vendor := filepath.Join(w.mut, "vendor")
+	if !hasTriple(triples, "--bind", vendor, vendor) {
+		t.Fatalf("the write deny's ancestor is not anchored read-write:\n%s", joinArgs(args))
+	}
+	if !hasTriple(triples, "--ro-bind", pkg, pkg) {
+		t.Fatalf("the write deny is not bound read-only over itself:\n%s", joinArgs(args))
+	}
+	if strings.Contains(joinArgs(args), "donmai-confine-empty") {
+		t.Fatalf("a write deny hides its path or its siblings behind an empty placeholder:\n%s", joinArgs(args))
+	}
+}
+
+// TestRenderBubblewrap_ComposerReadDenyHidesWhereRevealed: a composer read
+// deny is hidden behind an empty placeholder wherever a bind would reveal
+// it — inside the writable set, and inside the operator home the tree binds
+// read-only for metadata (where, with reads open, the Landlock stage grants
+// reads) — and renders nothing where no bind reveals it. Dropping it under
+// the home would leave the path readable.
+func TestRenderBubblewrap_ComposerReadDenyHidesWhereRevealed(t *testing.T) {
+	w := newLinuxWorld(t)
+	secret := filepath.Join(w.home, ".secrets")
+	inside := filepath.Join(w.mut, "private")
+	for _, dir := range []string{secret, inside} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	elsewhere := filepath.Join(w.base, "elsewhere")
+	if err := os.MkdirAll(elsewhere, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	args := mustRenderBubblewrap(t, w.resolved(), []Rule{
+		{Kind: RuleDenyRead, Path: secret, Scope: ScopeSubtree},
+		{Kind: RuleDenyRead, Path: inside, Scope: ScopeSubtree},
+		{Kind: RuleDenyRead, Path: elsewhere, Scope: ScopeSubtree},
+	})
+	text := joinArgs(args)
+	empty := filepath.Join(os.TempDir(), "donmai-confine-empty", "dir")
+	for _, path := range []string{secret, inside} {
+		if !hasTriple(bindTargets(args), "--ro-bind", empty, path) {
+			t.Errorf("read deny %q is not hidden behind the empty placeholder:\n%s", path, text)
+		}
+	}
+	if strings.Contains(text, elsewhere) {
+		t.Errorf("read deny %q no bind reveals still renders:\n%s", elsewhere, text)
+	}
+	// A read deny inside another one is hidden with it: the placeholder
+	// over the outer path is empty and read-only, so a second placeholder
+	// could not take a mount point inside it and the spawn would fail.
+	nested := filepath.Join(secret, "token")
+	if err := os.WriteFile(nested, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	both := mustRenderBubblewrap(t, w.resolved(), []Rule{
+		{Kind: RuleDenyRead, Path: nested, Scope: ScopeLiteral},
+		{Kind: RuleDenyRead, Path: secret, Scope: ScopeSubtree},
+	})
+	for _, triple := range bindTargets(both) {
+		if triple[2] == nested {
+			t.Fatalf("a read deny inside a hidden path renders its own bind; the spawn would fail:\n%s", joinArgs(both))
+		}
+	}
+	if !hasTriple(bindTargets(both), "--ro-bind", empty, secret) {
+		t.Fatalf("the outer read deny %q is not hidden:\n%s", secret, joinArgs(both))
+	}
+	// Hides render after every reveal: the last placeholder follows the
+	// last read-only self-bind.
+	if strings.LastIndex(text, "--ro-bind\n"+w.ext+"\n") > strings.Index(text, "--ro-bind\n"+empty+"\n") {
+		t.Fatalf("a hide renders before a later reveal could bury it:\n%s", text)
+	}
+}
+
 // TestRenderBubblewrap_ReadScopeKeepsTheSetWritable: under the workarea read
 // scope the writable set stays read-write (the probe writes its read-pass
-// results into session tmp), while read-only leaves and declared read paths
-// bind read-only last; an unknown scope is refused, never rendered as open
-// reads.
+// results into session tmp), read-only leaves and declared read paths bind
+// read-only, and the workarea metadata stays hidden; with reads open the
+// read-only leaf binds too but no read path does; an unknown scope is
+// refused, never rendered as open reads.
 func TestRenderBubblewrap_ReadScopeKeepsTheSetWritable(t *testing.T) {
 	w := newLinuxWorld(t)
 	r := w.resolved()
@@ -341,9 +462,18 @@ func TestRenderBubblewrap_ReadScopeKeepsTheSetWritable(t *testing.T) {
 			t.Errorf("rendering re-binds writable root %q read-only; the write pass could never land:\n%s", root, text)
 		}
 	}
+	// Under the scope the workarea metadata stays hidden, like on the
+	// profile backend; with reads open it is bound read-only.
+	meta := filepath.Join(w.ws, ".workarea")
+	if strings.Contains(text, "--ro-bind\n"+meta+"\n"+meta) {
+		t.Errorf("a read-scoped rendering reveals the workarea metadata:\n%s", text)
+	}
 	plain := joinArgs(mustRenderBubblewrap(t, w.resolved(), nil))
-	if strings.Contains(plain, "--ro-bind\n"+w.ro+"\n"+w.ro) {
-		t.Fatalf("a session without a read scope binds its allowlist read-only:\n%s", plain)
+	if strings.Contains(plain, filepath.Join(w.rp, "gitconfig")) {
+		t.Fatalf("a session without a read scope binds a read path:\n%s", plain)
+	}
+	if !strings.Contains(plain, "--ro-bind\n"+w.ro+"\n"+w.ro) {
+		t.Fatalf("a session with reads open hides its read-only leaf:\n%s", plain)
 	}
 	r.ReadScope = "home-minus-secrets"
 	if _, err := renderBubblewrap(r, nil, linuxIdentity, ""); err == nil {
@@ -351,15 +481,25 @@ func TestRenderBubblewrap_ReadScopeKeepsTheSetWritable(t *testing.T) {
 	}
 }
 
-// TestRenderBubblewrap_SocketsStayConnectable: no --ro-bind names a
-// declared socket target... no: sockets ARE ro-bound (a connect through a
-// read-only bind succeeds); what must never happen is a socket left
-// entirely unbound. This test pins the bind the F1 fix keeps.
+// TestRenderBubblewrap_SocketsAreBound: a declared socket outside the
+// writable set is bound read-only by exact path — a connect through a
+// read-only bind succeeds — and never left unbound, which would hide it. A
+// socket inside the writable set is reachable through the writable bind
+// already and gains no read-only bind that would pin it.
 func TestRenderBubblewrap_SocketsAreBound(t *testing.T) {
 	w := newLinuxWorld(t)
-	text := joinArgs(mustRenderBubblewrap(t, w.resolved(), nil))
-	if !strings.Contains(text, "--ro-bind\n"+w.sock+"\n"+w.sock) {
-		t.Fatalf("rendering does not bind the declared socket %q:\n%s", w.sock, text)
+	inside := filepath.Join(w.tmp, "inside.sock")
+	r := w.resolved()
+	r.Sockets = append(r.Sockets, inside)
+	if err := os.WriteFile(inside, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := mustRenderBubblewrap(t, r, nil)
+	if !hasTriple(bindTargets(args), "--ro-bind", w.sock, w.sock) {
+		t.Fatalf("rendering does not bind the declared socket %q:\n%s", w.sock, joinArgs(args))
+	}
+	if hasTriple(bindTargets(args), "--ro-bind", inside, inside) {
+		t.Fatalf("rendering pins a socket inside the writable set read-only:\n%s", joinArgs(args))
 	}
 }
 
@@ -431,8 +571,9 @@ func TestBackendLinux_NameAndResolvers(t *testing.T) {
 }
 
 // TestLandlockStageDescribe pins the stage policy text: the writable set
-// allows writes, the runtime binds allow reads, declared ports allow TCP,
-// and nothing else is named.
+// allows writes, the runtime binds and the read allowlist allow reads, each
+// at exactly the path the tree binds, declared ports are recorded, and the
+// host directories grant reads only with reads open.
 func TestLandlockStageDescribe(t *testing.T) {
 	w := newLinuxWorld(t)
 	r := w.resolved()
@@ -448,10 +589,8 @@ func TestLandlockStageDescribe(t *testing.T) {
 		"allow-write " + w.mut + "\n",
 		"allow-write " + w.tmp + "\n",
 		"allow-read " + w.ro + "\n",
-		// Files grant their parent directory: the kernel's path-beneath
-		// rule takes a directory descriptor, and the mount tree scopes
-		// what the grant can reach.
-		"allow-read " + w.rp + "\n",
+		// A file grants exactly itself.
+		"allow-read " + filepath.Join(w.rp, "gitconfig") + "\n",
 		"allow-tcp 1234\n",
 		"allow-dev\n",
 	} {
@@ -461,6 +600,28 @@ func TestLandlockStageDescribe(t *testing.T) {
 	}
 	if strings.Contains(text, "allow-write "+w.ro) {
 		t.Errorf("stage policy grants write on the read-only leaf:\n%s", text)
+	}
+	// A declared file never opens the directory around it: a
+	// configuration file in the operator home would otherwise open the
+	// whole home under the read scope, which the tree binds for metadata.
+	if strings.Contains(text, "allow-read "+w.rp+"\n") {
+		t.Errorf("stage policy grants the directory around a declared file:\n%s", text)
+	}
+	// Under the scope the host directories grant nothing; with reads open
+	// they grant reads, and the workarea metadata with them.
+	for _, dir := range []string{w.home, w.stateHome, filepath.Join(w.ws, ".workarea")} {
+		if strings.Contains(text, "allow-read "+dir+"\n") {
+			t.Errorf("read-scoped stage policy grants %q:\n%s", dir, text)
+		}
+	}
+	open, err := buildLandlockStage(w.resolved())
+	if err != nil {
+		t.Fatalf("buildLandlockStage: %v", err)
+	}
+	for _, dir := range []string{w.home, w.stateHome, w.ro, filepath.Join(w.ws, ".workarea")} {
+		if !strings.Contains(open.describe(), "allow-read "+dir+"\n") {
+			t.Errorf("open-read stage policy lacks a read grant on %q:\n%s", dir, open.describe())
+		}
 	}
 }
 
@@ -545,10 +706,13 @@ func TestParseLandlockStage_RoundTrip(t *testing.T) {
 	if len(parsed.writeRoots) != len(built.writeRoots) {
 		t.Fatalf("parsed write roots = %v, want %v", parsed.writeRoots, built.writeRoots)
 	}
-	// The stage and harness executables gain traverse-and-execute grants
-	// on their directories, so binaries outside every other grant run.
-	if len(parsed.execRoots) == 0 {
-		t.Fatal("the parsed stage grants no executable directory; an uncovered harness could not exec")
+	// The stage and harness executables gain read-and-execute grants on
+	// the files themselves, so binaries outside every other grant run.
+	if len(parsed.execRoots) != 2 || parsed.execRoots[0] != "/self" {
+		t.Fatalf("the parsed stage grants executables %v, want the stage and the harness", parsed.execRoots)
+	}
+	if info, err := os.Stat(parsed.execRoots[1]); err != nil || info.IsDir() {
+		t.Fatalf("the harness grant %q is not the executable file itself", parsed.execRoots[1])
 	}
 	if len(argv) != 1 || argv[0] != "/bin/sh" {
 		t.Fatalf("parsed harness argv = %v", argv)
@@ -571,49 +735,6 @@ func TestCheckLauncher(t *testing.T) {
 	}
 }
 
-// TestProbeUserNamespaceLeavesTheCaller: Check (and the user-namespace probe
-// inside it) must not move the calling process into a new user namespace:
-// the worker keeps its identity for the rest of its life.
-func TestProbeUserNamespaceLeavesTheCaller(t *testing.T) {
-	before, err := os.ReadFile("/proc/self/uid_map")
-	if err != nil {
-		t.Skipf("no uid_map on this kernel: %v", err)
-	}
-	b := &mountNamespaceBackend{}
-	if err := b.Check(); err != nil {
-		if reason, _ := ReasonOf(err); reason == ReasonNamespaceUnavailable || reason == ReasonNestedSandbox {
-			t.Skipf("user namespaces unavailable here: %v", err)
-		}
-		t.Fatalf("Check: %v", err)
-	}
-	after, err := os.ReadFile("/proc/self/uid_map")
-	if err != nil {
-		t.Fatalf("uid_map after Check: %v", err)
-	}
-	if string(before) != string(after) {
-		t.Fatalf("Check moved the caller into a new user namespace:\nbefore %q\nafter  %q", before, after)
-	}
-}
-
-// TestUsernsProbes_FallsBackPastMissingBinaries pins the probe fallback:
-// the user-namespace check tries /usr/bin/true, then /bin/true, then the
-// current executable — so a minimal image without either true still probes
-// honestly instead of refusing with a misleading ENOENT. The list always
-// ends with a path that exists (the running test binary itself).
-func TestUsernsProbes_FallsBackPastMissingBinaries(t *testing.T) {
-	probes := usernsProbes()
-	if len(probes) < 3 {
-		t.Fatalf("usernsProbes = %v, want at least [/usr/bin/true /bin/true self]", probes)
-	}
-	if probes[0] != "/usr/bin/true" || probes[1] != "/bin/true" {
-		t.Fatalf("usernsProbes = %v, want the fixed spellings of true first", probes)
-	}
-	self := probes[len(probes)-1]
-	if info, err := os.Stat(self); err != nil || !info.Mode().IsRegular() {
-		t.Fatalf("usernsProbes last = %q, want an existing executable to fall back to", self)
-	}
-}
-
 // linuxApplyWorld is an Apply-level session: a fake launcher executable (so
 // the test needs no bubblewrap on PATH) and the Landlock probe stubbed to
 // present, so the test runs on any Linux kernel, including one without
@@ -632,9 +753,7 @@ func newLinuxApplyWorld(t *testing.T) linuxApplyWorld {
 		t.Fatalf("launcher seed: %v", err)
 	}
 	t.Setenv("PATH", "")
-	oldProbe := landlockProbe
-	landlockProbe = func() bool { return true }
-	t.Cleanup(func() { landlockProbe = oldProbe })
+	stubLandlock(t, 6)
 	b := &mountNamespaceBackend{launcherOverride: launcher}
 	resolved, err := resolveSpec(linuxSpec(w), linuxGuards(w), linuxIdentity)
 	if err != nil {
@@ -760,20 +879,24 @@ func TestApply_WrapSkipsRedundantExecutableBinds(t *testing.T) {
 	}
 }
 
-// TestApply_LandlockGateRefusesClosed: the Landlock availability gate pins
-// both branches — an unavailable kernel refuses with namespace_unavailable
-// instead of staging a weaker boundary, and a present one proceeds.
+// TestApply_LandlockGateRefusesClosed: the Landlock gate pins every branch
+// — a kernel without Landlock, and one whose ABI cannot express the rights
+// the stage needs, refuse with backend_absent (the enforcing stage is
+// missing, not a namespace) instead of staging a weaker boundary, and a
+// capable one proceeds.
 func TestApply_LandlockGateRefusesClosed(t *testing.T) {
 	fx := newLinuxApplyWorld(t)
-	oldProbe := landlockProbe
-	landlockProbe = func() bool { return false }
-	defer func() { landlockProbe = oldProbe }()
-	if _, err := fx.backend.Apply(ApplyRequest{Resolved: fx.resolved}); err == nil {
-		t.Fatal("Apply staged a boundary without Landlock")
-	} else if reason, _ := ReasonOf(err); reason != ReasonNamespaceUnavailable {
-		t.Fatalf("Apply: err=%v, want namespace_unavailable", err)
+	for _, abi := range []int{0, 1} {
+		stubLandlock(t, abi)
+		_, err := fx.backend.Apply(ApplyRequest{Resolved: fx.resolved})
+		if err == nil {
+			t.Fatalf("Apply staged a boundary on Landlock ABI %d", abi)
+		}
+		if reason, _ := ReasonOf(err); reason != ReasonBackendAbsent {
+			t.Fatalf("Apply on Landlock ABI %d: err=%v, want backend_absent", abi, err)
+		}
 	}
-	landlockProbe = func() bool { return true }
+	stubLandlock(t, landlockMinABI)
 	if _, err := fx.backend.Apply(ApplyRequest{Resolved: fx.resolved}); err != nil {
 		t.Fatalf("Apply with Landlock present: %v", err)
 	}
@@ -782,17 +905,14 @@ func TestApply_LandlockGateRefusesClosed(t *testing.T) {
 // TestPrepare_WrapShapeThroughConfiner drives the full production entry
 // point — Confiner.Prepare through plan.Command — asserting the wrapped
 // argv starts with the resolved launcher, invokes the stage, and ends with
-// the harness. It needs user namespaces, so it skips honestly where the
-// kernel or container disallows them.
+// the harness. A stand-in launcher answers Check's capability probe, so the
+// test runs on any Linux host; the live tests prove the real launcher.
 func TestPrepare_WrapShapeThroughConfiner(t *testing.T) {
 	w := newLinuxWorld(t)
-	launcher := filepath.Join(t.TempDir(), "bwrap")
-	if err := os.WriteFile(launcher, []byte("#!/bin/sh\nexec \"$@\"\n"), 0o700); err != nil { //nolint:gosec // G306: a stand-in launcher executable.
-		t.Fatalf("launcher seed: %v", err)
-	}
-	oldProbe := landlockProbe
-	landlockProbe = func() bool { return true }
-	t.Cleanup(func() { landlockProbe = oldProbe })
+	// The stand-in launcher answers the capability probe and is never
+	// asked to run the harness: Prepare only renders the plan.
+	launcher := fakeLauncher(t, "exit 0")
+	stubLandlock(t, 6)
 	c, err := New(Options{
 		Backend:          &mountNamespaceBackend{launcherOverride: launcher},
 		ProfileDir:       w.profileDir,
@@ -817,9 +937,6 @@ func TestPrepare_WrapShapeThroughConfiner(t *testing.T) {
 	spec.LoopbackTCPPorts = []int{1234}
 	plan, err := c.Prepare(spec)
 	if err != nil {
-		if reason, _ := ReasonOf(err); reason == ReasonNamespaceUnavailable || reason == ReasonNestedSandbox {
-			t.Skipf("user namespaces unavailable here: %v", err)
-		}
 		t.Fatalf("Prepare: %v", err)
 	}
 	argv, err := plan.Command([]string{"/bin/sh", "-c", "true"})
@@ -962,4 +1079,158 @@ func hasTriple(triples [][3]string, flag, source, target string) bool {
 		}
 	}
 	return false
+}
+
+// stubLandlock pins the Landlock ABI the gates see for one test, so both
+// branches run on any kernel; production always probes the running one.
+func stubLandlock(t *testing.T, abi int) {
+	t.Helper()
+	old := landlockProbe
+	landlockProbe = func() int { return abi }
+	t.Cleanup(func() { landlockProbe = old })
+}
+
+// fakeLauncher writes a stand-in launcher that records its arguments, one
+// per line, beside itself and then runs body, so a test can drive Check's
+// capability probe without bubblewrap.
+func fakeLauncher(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	launcher := filepath.Join(dir, "bwrap")
+	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$(dirname \"$0\")/args\"\n" + body + "\n"
+	if err := os.WriteFile(launcher, []byte(script), 0o700); err != nil { //nolint:gosec // G306: a stand-in launcher executable.
+		t.Fatalf("launcher seed: %v", err)
+	}
+	return launcher
+}
+
+// TestCheck_ProbesTheLauncher: Check proves the host can build a boundary
+// by running the launcher itself with the namespace flags, the tmpfs root,
+// a fresh proc and a private /dev around a fixed no-op executable — what a
+// bare user-namespace probe cannot see (a security module that allows the
+// namespace but denies the mounts in it). A launcher that refuses turns
+// into namespace_unavailable carrying its own diagnostic and the hint; a
+// missing launcher or Landlock is backend_absent; a working one passes.
+func TestCheck_ProbesTheLauncher(t *testing.T) {
+	t.Setenv(mountNamespaceMarkEnv, "")
+	stubLandlock(t, 6)
+
+	ok := fakeLauncher(t, "exit 0")
+	if err := (&mountNamespaceBackend{launcherOverride: ok}).Check(); err != nil {
+		t.Fatalf("Check with a working launcher: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(ok), "args"))
+	if err != nil {
+		t.Fatalf("the launcher was never run: %v", err)
+	}
+	args := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	if !slices.Equal(args[:len(mountNamespaceFlags)], mountNamespaceFlags) {
+		t.Fatalf("probe args = %v, want the spawn's namespace flags first", args)
+	}
+	text := joinArgs(args)
+	for _, want := range []string{"\n--tmpfs\n/\n", "\n--proc\n/proc\n", "\n--tmpfs\n/dev\n"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("probe args lack %q:\n%s", want, text)
+		}
+	}
+	if n := len(args); n < 2 || args[n-2] != "--" || !slices.Contains(launcherProbeTargets, args[n-1]) {
+		t.Fatalf("probe args = %v, want a fixed no-op target after the separator", args)
+	}
+
+	refused := fakeLauncher(t, "echo 'bwrap: setting up uid map: Permission denied' >&2; exit 1")
+	err = (&mountNamespaceBackend{launcherOverride: refused}).Check()
+	if reason, _ := ReasonOf(err); reason != ReasonNamespaceUnavailable {
+		t.Fatalf("Check with a refusing launcher: err=%v, want namespace_unavailable", err)
+	}
+	for _, want := range []string{"setting up uid map: Permission denied", "AppArmor"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q lacks %q", err, want)
+		}
+	}
+
+	if err := (&mountNamespaceBackend{launcherOverride: "/nonexistent/bwrap-test-launcher"}).Check(); err == nil {
+		t.Fatal("Check passed with no launcher")
+	} else if reason, _ := ReasonOf(err); reason != ReasonBackendAbsent {
+		t.Fatalf("Check with no launcher: err=%v, want backend_absent", err)
+	}
+	for _, abi := range []int{0, 1} {
+		stubLandlock(t, abi)
+		if err := (&mountNamespaceBackend{launcherOverride: ok}).Check(); err == nil {
+			t.Fatalf("Check passed on Landlock ABI %d", abi)
+		} else if reason, _ := ReasonOf(err); reason != ReasonBackendAbsent {
+			t.Fatalf("Check on Landlock ABI %d: err=%v, want backend_absent", abi, err)
+		}
+	}
+}
+
+// TestLandlockRuleset_HandlesNoNetwork pins the stage's handled rights at
+// every Landlock ABI: the filesystem rights that ABI knows, and no network
+// right and no scope, ever. Handling TCP connects with only declared-port
+// allow rules would deny every connect to an undeclared port on any
+// address, remote endpoints included, because a port rule carries no
+// address. restrictLandlockFull creates exactly this ruleset.
+func TestLandlockRuleset_HandlesNoNetwork(t *testing.T) {
+	for abi := 1; abi <= 8; abi++ {
+		attr := landlockRuleset(abi)
+		if attr.Access_net != 0 || attr.Scoped != 0 {
+			t.Fatalf("ABI %d ruleset handles network %#x and scope %#x; want neither", abi, attr.Access_net, attr.Scoped)
+		}
+		want := uint64(landlockHandledFS)
+		if abi < 3 {
+			want &^= landlockAccessFSTruncate
+		}
+		if attr.Access_fs != want {
+			t.Fatalf("ABI %d ruleset handles filesystem rights %#x, want %#x", abi, attr.Access_fs, want)
+		}
+	}
+}
+
+// TestLandlockStage_LeavesTCPOpen proves the network shape live, at the
+// production entry point: the test binary re-executes itself through the
+// real stage dispatcher (RunLandlockStageFromEnv, as main does), which
+// restricts itself with the production ruleset and execs the seat check.
+// Inside, a dial to an undeclared loopback port and one to the declared
+// port both connect, while a read of a file no rule grants refuses — the
+// control proving the ruleset was in force when the dials went through. If
+// the stage ever handles TCP connects again with only the declared-port
+// allows, the undeclared dial refuses and this test goes red. It needs a
+// kernel with Landlock, and reports a skip where there is none.
+func TestLandlockStage_LeavesTCPOpen(t *testing.T) {
+	if abi := landlockABI(); abi < landlockMinABI {
+		t.Skipf("Landlock ABI %d on this kernel; the stage needs %d", abi, landlockMinABI)
+	}
+	undeclared := newCountingListener(t)
+	declared := newCountingListener(t)
+	work := shortTempDir(t, "dcl")
+	secret := filepath.Join(shortTempDir(t, "dcs"), "secret")
+	if err := os.WriteFile(secret, []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy := &landlockPolicy{writeRoots: []string{work}, dev: true, tcpPorts: []int{declared.port}}
+	for _, path := range mountNamespaceRuntimeBinds {
+		if _, err := os.Lstat(path); err == nil {
+			policy.readRoots = append(policy.readRoots, path)
+		}
+	}
+	results := runSeatCheck(t, work, []seatCheckStep{
+		{ID: "undeclared", Op: "dial", Target: undeclared.addr},
+		{ID: "declared", Op: "dial", Target: declared.addr},
+		{ID: "ungranted", Op: "read", Target: secret},
+	}, func(self, planPath string) (string, error) {
+		cmd := exec.Command(self, append([]string{"stage"}, append(stagePortArgs(policy), "--", self, "-test.run=^$")...)...) //nolint:gosec // G204: the test binary re-executed through the stage.
+		cmd.Env = append(os.Environ(), landlockStageEnv+"="+policy.describe(), seatCheckEnv+"="+planPath)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	})
+	if res := results["ungranted"]; !strings.Contains(res.Err, "permission denied") {
+		t.Fatalf("a read no rule grants: %+v; want permission denied (the ruleset was not in force)", res)
+	}
+	for _, id := range []string{"undeclared", "declared"} {
+		if res := results[id]; res.Err != "" {
+			t.Errorf("%s loopback dial from inside the stage: %s; the stage must leave TCP connects unhandled", id, res.Err)
+		}
+	}
+	if !undeclared.reached() || !declared.reached() {
+		t.Fatalf("listener accepts: undeclared=%d declared=%d; want both reached", undeclared.accepted(), declared.accepted())
+	}
 }

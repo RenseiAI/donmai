@@ -237,7 +237,11 @@ func (c *Confiner) store(record SelfTestRecord) {
 }
 
 func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMode, launcher Launcher, opts SelfTestOptions, dir, diskImage string, diskImageErr error) ([]ProbeOutcome, error) {
-	fx, err := newFixture(dir, mode, c.opts.Home, c.opts.StateHome, diskImage, diskImageErr)
+	fx, err := newFixture(dir, mode, fixtureHost{
+		home: c.opts.Home, stateHome: c.opts.StateHome,
+		diskImage: diskImage, diskImageErr: diskImageErr,
+		loopbackOpen: leavesLoopbackEgressOpen(c.opts.Backend),
+	})
 	if err != nil {
 		return nil, err
 	}

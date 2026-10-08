@@ -45,8 +45,10 @@ var classOrder = map[WritableClass]int{
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
 // every earlier self-test record stale. v4 adds the read-scope pass; v5 adds
-// the terminal, package data tree and extended attribute read probes.
-const ProbeSetVersion = "executor-confinement-probes-v5"
+// the terminal, package data tree and extended attribute read probes; v6
+// adds the protected-path read probes and a declared read path that is one
+// file in the operator home.
+const ProbeSetVersion = "executor-confinement-probes-v6"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the
@@ -83,13 +85,12 @@ type Spec struct {
 	Sockets []string
 	// LoopbackTCPPorts are the loopback TCP ports the adapter declares for
 	// the session. On macOS outbound TCP to the local machine is denied
-	// except on these ports; nothing is allowed by default. On Linux the
-	// ports ride the Landlock stage invocation for the record, but the
-	// stage handles no network right (a port rule carries no address, so
-	// handling CONNECT_TCP would deny every undeclared port on any
-	// address, including the remote endpoints the contract leaves open):
-	// loopback egress outside the declared ports is a documented gap the
-	// self-test observes rather than denies.
+	// except on these ports; nothing is allowed by default. The Linux
+	// backend records them but filters no TCP: it declares loopback egress
+	// open (a Landlock port rule carries no address, so filtering connects
+	// by port would cut every undeclared port on every address, remote
+	// endpoints included), and its self-test proves undeclared loopback
+	// dials go through rather than refuse.
 	LoopbackTCPPorts []int
 
 	// ReadScope is the fileRead level the boundary enforces, on the

@@ -99,6 +99,25 @@ type Resolved struct {
 	ReadPaths []string
 }
 
+// loopbackEgressDeclarer is implemented by a backend whose boundary leaves
+// outbound TCP to the local machine open on undeclared ports. The self-test
+// judges the undeclared-port loopback dials by it: a backend that declares
+// nothing must refuse them, and one that declares the gap must let them
+// through, so a backend that silently starts or stops filtering loopback
+// TCP fails exactly the probes that name it.
+type loopbackEgressDeclarer interface {
+	leavesLoopbackEgressOpen() bool
+}
+
+// leavesLoopbackEgressOpen reports whether backend declares outbound TCP to
+// the local machine open on undeclared ports. A backend that declares
+// nothing is held to the contract's default: denied except on the declared
+// ports.
+func leavesLoopbackEgressOpen(backend Backend) bool {
+	declarer, ok := backend.(loopbackEgressDeclarer)
+	return ok && declarer.leavesLoopbackEgressOpen()
+}
+
 // ReadAllowlist is the session's half of the read allowlist under a read
 // scope: every writable root, every read-only leaf and every declared read
 // path, sorted and without repeats. The backend adds its runtime paths.

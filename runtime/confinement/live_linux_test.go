@@ -4,9 +4,16 @@ package confinement
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func newLinuxLiveConfiner(t *testing.T, backend Backend, extra ExtraRules) (*Confiner, string) {
@@ -29,23 +36,18 @@ func linuxProbeCommand(t *testing.T) []string {
 }
 
 // linuxConfinementAvailable reports whether this host can run a confined
-// seat at all: the launcher present, user namespaces creatable, and the
-// Landlock stage stageable. The test skips — never passes silently — where
-// any of them is missing, with the diagnostic Check carries.
+// seat at all: the launcher present and able to build a boundary, and the
+// Landlock stage stageable — exactly what Check proves. The test skips —
+// never passes silently — where any of them is missing, with the
+// diagnostic Check carries.
 func linuxConfinementAvailable(t *testing.T) bool {
 	t.Helper()
 	b := DefaultBackend()
 	if b == nil {
 		t.Skip("no confinement backend for this operating system")
 	}
-	if err := checkLauncher("bwrap"); err != nil {
-		t.Skipf("the mount-namespace launcher is missing: %v", err)
-	}
 	if err := b.Check(); err != nil {
 		t.Skipf("confinement unavailable here: %v", err)
-	}
-	if !landlockProbe() {
-		t.Skip("the Landlock stage is unavailable on this kernel")
 	}
 	return true
 }
@@ -73,7 +75,7 @@ func TestLinux_SelfTestPassesBothModes(t *testing.T) {
 	if record.Backend != BackendLinuxMountNamespace {
 		t.Fatalf("record backend = %q, want the mount-namespace backend", record.Backend)
 	}
-	t.Logf("self-test passed: %d probes across %v, backend %s", len(record.Probes), record.SessionModes, record.BackendVersion)
+	t.Logf("self-test passed: %d probes across %v, backend %s, Landlock ABI %d", len(record.Probes), record.SessionModes, record.BackendVersion, landlockABI())
 }
 
 // TestLinux_SelfTestRedWithoutBackend is the discriminating control: with
@@ -90,5 +92,251 @@ func TestLinux_SelfTestRedWithoutBackend(t *testing.T) {
 	}
 	if len(record.Failures()) == 0 {
 		t.Fatal("SelfTest with no backend failed without a failing probe")
+	}
+}
+
+// liveHTTPSURLEnv overrides the external HTTPS endpoint the live seat test
+// reaches; the default is a public module proxy.
+const liveHTTPSURLEnv = "DONMAI_CONFINEMENT_LIVE_HTTPS_URL"
+
+// daemonDefaultPort is the local daemon control API's default port. The
+// seat test stands its listener there when the port is free, so the dial
+// is the one a seat would make.
+const daemonDefaultPort = "7734"
+
+// TestLinux_ConfinedSeatReachesNetworkAndHoldsDenials starts a real seat
+// through the production path — the self-test gate, Confiner.Prepare,
+// plan.Command and the headless launcher — under the workarea read scope,
+// and checks from inside it: a loopback listener standing on the daemon
+// control port (an undeclared port) answers an HTTP request, an external
+// HTTPS endpoint answers, writes land in the mutable leaf, and writes and
+// reads outside the work area refuse. The network reach is what the
+// backend declares (loopback egress open, outbound TCP unfiltered); the
+// denials prove the same seat ran confined. The HTTPS step needs outbound
+// network from this host and reports a skip where the same request fails
+// outside the boundary too.
+func TestLinux_ConfinedSeatReachesNetworkAndHoldsDenials(t *testing.T) {
+	if !linuxConfinementAvailable(t) {
+		return
+	}
+	c, stateHome := newLinuxLiveConfiner(t, DefaultBackend(), nil)
+	home := filepath.Dir(stateHome)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if record, err := c.SelfTest(ctx, SelfTestOptions{ProbeCommand: linuxProbeCommand(t), ScratchDir: shortTempDir(t, "dcs")}); err != nil {
+		t.Fatalf("SelfTest: %v\n%s", err, failureIDs(record))
+	}
+
+	ws := filepath.Join(stateHome, "ws")
+	mut := filepath.Join(ws, "repo")
+	ro := filepath.Join(ws, "ref")
+	state := filepath.Join(stateHome, "state", "s1")
+	tmp := filepath.Join(stateHome, "tmp", "s1")
+	for _, dir := range []string{filepath.Join(mut, ".git"), ro, state, tmp} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	homeSecret := filepath.Join(home, ".seat-secret")
+	roFile := filepath.Join(ro, "README")
+	for _, file := range []string{homeSecret, roFile} {
+		if err := os.WriteFile(file, []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	daemonListener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", daemonDefaultPort))
+	if err != nil {
+		daemonListener, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("daemon stand-in listener: %v", err)
+		}
+	}
+	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() { _ = server.Serve(daemonListener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	daemonURL := "http://" + daemonListener.Addr().String() + "/api/daemon/health"
+	t.Logf("daemon stand-in on %s (undeclared for the seat)", daemonListener.Addr())
+
+	steps := []seatCheckStep{
+		{ID: "daemon_port", Op: "get", Target: daemonURL},
+		{ID: "write_leaf", Op: "write", Target: filepath.Join(mut, "ok")},
+		{ID: "read_ro_leaf", Op: "read", Target: roFile},
+		{ID: "write_ro_leaf", Op: "write", Target: roFile},
+		{ID: "write_home", Op: "write", Target: filepath.Join(home, ".seat-planted")},
+		{ID: "write_workarea_root", Op: "write", Target: filepath.Join(ws, "planted")},
+		{ID: "write_shared_tmp", Op: "write", Target: filepath.Join(os.TempDir(), "seat-planted-"+randomSuffix())},
+		{ID: "read_home_secret", Op: "read", Target: homeSecret},
+		{ID: "read_procfs", Op: "read", Target: "/proc/self/environ"},
+	}
+	httpsURL := os.Getenv(liveHTTPSURLEnv)
+	if httpsURL == "" {
+		httpsURL = "https://proxy.golang.org/"
+	}
+	outside := runSeatCheckStep(seatCheckStep{ID: "https", Op: "get", Target: httpsURL})
+	if outside.Err == "" {
+		steps = append(steps, seatCheckStep{ID: "https", Op: "get", Target: httpsURL})
+	}
+
+	spec := Spec{
+		SessionID:      "live-seat",
+		HarnessID:      "live-seat",
+		SessionMode:    agent.PromptModeAutonomous,
+		WorkareaRoot:   ws,
+		MutableLeaves:  []string{mut},
+		HarnessState:   []string{state},
+		SessionTmp:     tmp,
+		ReadOnlyLeaves: []string{ro},
+		Sockets:        ResolverSockets(),
+		ReadScope:      agent.FileReadWorkarea,
+	}
+	plan, err := c.Prepare(spec)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	t.Cleanup(func() { _ = plan.Release() })
+	results := runSeatCheck(t, tmp, steps, func(self, planPath string) (string, error) {
+		argv, err := plan.Command([]string{self, "-test.run=^$"})
+		if err != nil {
+			return "", err
+		}
+		code, err := HeadlessLauncher()(ctx, argv, append(plan.Environment(), seatCheckEnv+"="+planPath), mut)
+		if err == nil && code != 0 {
+			err = fmt.Errorf("the seat exited %d", code)
+		}
+		return "", err
+	})
+
+	if res := results["daemon_port"]; res.Err != "" || res.Status != http.StatusNoContent {
+		t.Errorf("the seat could not reach the loopback daemon port: %+v", res)
+	}
+	if res := results["write_leaf"]; res.Err != "" {
+		t.Errorf("a write in the mutable leaf refused: %+v", res)
+	}
+	if res := results["read_ro_leaf"]; res.Err != "" {
+		t.Errorf("a read of the read-only leaf refused: %+v", res)
+	}
+	for _, id := range []string{"write_ro_leaf", "write_home", "write_workarea_root", "write_shared_tmp", "read_home_secret", "read_procfs"} {
+		if res := results[id]; res.Err == "" {
+			t.Errorf("%s: the seat got through; want a refusal", id)
+		} else {
+			t.Logf("%s refused: %s", id, res.Err)
+		}
+	}
+	for _, path := range []string{filepath.Join(home, ".seat-planted"), filepath.Join(ws, "planted")} {
+		if _, err := os.Lstat(path); err == nil {
+			t.Errorf("a write outside the work area landed on the host: %s", path)
+		}
+	}
+	t.Run("https", func(t *testing.T) {
+		if outside.Err != "" {
+			t.Skipf("no outbound HTTPS from this host even outside the boundary (%s): %s", httpsURL, outside.Err)
+		}
+		if res := results["https"]; res.Err != "" || res.Status == 0 {
+			t.Fatalf("the seat could not reach %s: %+v", httpsURL, res)
+		} else {
+			t.Logf("seat reached %s: HTTP %d", httpsURL, res.Status)
+		}
+	})
+	if strings.Contains(results["read_home_secret"].Err, "no such file") {
+		t.Errorf("the home secret read refused as missing, not denied: the operator home is bound for metadata, so the refusal must come from the read scope")
+	}
+}
+
+// TestLinux_ComposerDeniesHoldInsideTheSeat starts a real seat with reads
+// open under composer rules, through the self-test gate and the production
+// spawn path, and checks from inside it: a read deny on a directory in the
+// operator home (which the tree binds read-only and, with reads open, the
+// stage grants) refuses, as does one inside the mutable leaf and one nested
+// inside it; a write deny inside the mutable leaf refuses writes while its
+// contents stay readable; and the controls — a plain home file, a write in
+// the leaf — still go through.
+func TestLinux_ComposerDeniesHoldInsideTheSeat(t *testing.T) {
+	if !linuxConfinementAvailable(t) {
+		return
+	}
+	var rules []Rule
+	c, stateHome := newLinuxLiveConfiner(t, DefaultBackend(), func(RuleContext) []Rule { return rules })
+	home := filepath.Dir(stateHome)
+	ws := filepath.Join(stateHome, "ws")
+	mut := filepath.Join(ws, "repo")
+	private := filepath.Join(mut, "private")
+	vendor := filepath.Join(mut, "vendor")
+	secrets := filepath.Join(home, ".secrets")
+	state := filepath.Join(stateHome, "state", "s1")
+	tmp := filepath.Join(stateHome, "tmp", "s1")
+	for _, dir := range []string{filepath.Join(mut, ".git"), private, vendor, secrets, state, tmp} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{
+		"secret":  filepath.Join(secrets, "key"),
+		"private": filepath.Join(private, "f"),
+		"nested":  filepath.Join(private, "token"),
+		"vendor":  filepath.Join(vendor, "f"),
+		"plain":   filepath.Join(home, "plain"),
+	}
+	for _, file := range files {
+		if err := os.WriteFile(file, []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rules = []Rule{
+		{Kind: RuleDenyRead, Path: secrets, Scope: ScopeSubtree},
+		{Kind: RuleDenyRead, Path: files["nested"], Scope: ScopeLiteral},
+		{Kind: RuleDenyRead, Path: private, Scope: ScopeSubtree},
+		{Kind: RuleDenyWrite, Path: vendor, Scope: ScopeSubtree},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if record, err := c.SelfTest(ctx, SelfTestOptions{ProbeCommand: linuxProbeCommand(t), ScratchDir: shortTempDir(t, "dcs")}); err != nil {
+		t.Fatalf("SelfTest: %v\n%s", err, failureIDs(record))
+	}
+	plan, err := c.Prepare(Spec{
+		SessionID: "live-composer", HarnessID: "live-composer", SessionMode: agent.PromptModeAutonomous,
+		WorkareaRoot: ws, MutableLeaves: []string{mut}, HarnessState: []string{state}, SessionTmp: tmp,
+		Sockets: ResolverSockets(),
+	})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	t.Cleanup(func() { _ = plan.Release() })
+	results := runSeatCheck(t, tmp, []seatCheckStep{
+		{ID: "read_secret", Op: "read", Target: files["secret"]},
+		{ID: "read_private", Op: "read", Target: files["private"]},
+		{ID: "read_nested", Op: "read", Target: files["nested"]},
+		{ID: "write_vendor", Op: "write", Target: files["vendor"]},
+		{ID: "create_vendor", Op: "write", Target: filepath.Join(vendor, "new")},
+		{ID: "read_vendor", Op: "read", Target: files["vendor"]},
+		{ID: "read_plain", Op: "read", Target: files["plain"]},
+		{ID: "write_leaf", Op: "write", Target: filepath.Join(mut, "ok")},
+	}, func(self, planPath string) (string, error) {
+		argv, err := plan.Command([]string{self, "-test.run=^$"})
+		if err != nil {
+			return "", err
+		}
+		code, err := HeadlessLauncher()(ctx, argv, append(plan.Environment(), seatCheckEnv+"="+planPath), mut)
+		if err == nil && code != 0 {
+			err = fmt.Errorf("the seat exited %d", code)
+		}
+		return "", err
+	})
+	for _, id := range []string{"read_secret", "read_private", "read_nested", "write_vendor", "create_vendor"} {
+		if res := results[id]; res.Err == "" {
+			t.Errorf("%s: the seat got through a composer deny", id)
+		} else {
+			t.Logf("%s refused: %s", id, res.Err)
+		}
+	}
+	for _, id := range []string{"read_vendor", "read_plain", "write_leaf"} {
+		if res := results[id]; res.Err != "" {
+			t.Errorf("%s refused: %s; a composer deny must not reach past its path", id, res.Err)
+		}
+	}
+	if raw, err := os.ReadFile(files["vendor"]); err != nil || string(raw) != "x\n" {
+		t.Errorf("the write-denied file changed on the host: %q %v", raw, err)
 	}
 }

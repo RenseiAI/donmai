@@ -17,5 +17,8 @@ func TestMain(m *testing.M) {
 	if handled, code := runNestedCheckFromEnv(); handled {
 		os.Exit(code)
 	}
+	if handled, code := runSeatCheckFromEnv(); handled {
+		os.Exit(code)
+	}
 	os.Exit(m.Run())
 }
