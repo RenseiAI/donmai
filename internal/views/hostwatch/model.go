@@ -12,7 +12,6 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/tui-components/format"
 	"github.com/RenseiAI/tui-components/theme"
-	"github.com/RenseiAI/tui-components/widget"
 )
 
 // Default cadences. The index poll is deliberately low-frequency (a
@@ -23,10 +22,13 @@ import (
 const (
 	defaultIndexInterval = 1500 * time.Millisecond
 	defaultTailInterval  = 350 * time.Millisecond
-	// maxLinesPerTick caps how many merged-stream lines we append per tail
-	// tick so a chatty tool burst cannot stall the render loop (backpressure
-	// onto the LogViewer's ring buffer).
-	maxLinesPerTick = 200
+	// maxEventsPerTailerTick bounds how many events one session's tailer
+	// may contribute per tail tick. Every tailer is polled every tick, so
+	// one session's long backlog can neither starve the others nor stall
+	// the render loop, and a freshly attached watcher catches up on each
+	// session's current run within a tick or two instead of one session
+	// per tick.
+	maxEventsPerTailerTick = 16 * maxEventsPerPoll
 )
 
 // Options configures a hostwatch Model.
@@ -92,7 +94,7 @@ const (
 )
 
 // Model is the host-watch fleet dashboard Bubble Tea model. It owns the
-// merged LogViewer, the per-session tailers, and the card grid. It is a pure
+// merged stream pane, the per-session tailers, and the card grid. It is a pure
 // reader: every data path is local (daemon control API + on-disk files).
 type Model struct {
 	src   *Source
@@ -119,12 +121,16 @@ type Model struct {
 	// so the merged stream stays labeled even after a session ends.
 	labels map[string]string
 
-	stream *widget.LogViewer
+	stream *streamPane
 	frame  int
 
 	// split is the fraction of content height given to the session-card
 	// grid (the stream takes the rest). Operator-adjustable via [ ] / 0.
 	split float64
+
+	// detail, when true, replaces the stream pane with the selected
+	// session's full detail (enter toggles, esc closes).
+	detail bool
 }
 
 // New constructs a host-watch Model.
@@ -145,7 +151,6 @@ func New(opts Options) *Model {
 	if tail <= 0 {
 		tail = defaultTailInterval
 	}
-	lv := widget.NewLogViewer(widget.WithFollow(true), widget.WithWrap(false))
 	return &Model{
 		src:           opts.Source,
 		theme:         t,
@@ -156,7 +161,7 @@ func New(opts Options) *Model {
 		tailers:       map[string]*Tailer{},
 		prefixes:      newPrefixIndex(),
 		labels:        map[string]string{},
-		stream:        lv,
+		stream:        newStreamPane(),
 		split:         defaultSplitRatio,
 	}
 }
@@ -180,11 +185,12 @@ func (m *Model) pollIndex() tea.Cmd {
 	return func() tea.Msg { return snapshotMsg{snap: src.Snapshot()} }
 }
 
-// pollTails reads every active tailer once. It runs in a tea.Cmd goroutine;
-// the tailers are not touched elsewhere concurrently because all access is
-// serialized through the Bubble Tea update loop (this Cmd is the only reader,
-// and tailer registration happens on snapshotMsg, also on the loop). To keep
-// that invariant the Cmd captures the current tailer set by value.
+// pollTails drains every active tailer, each up to maxEventsPerTailerTick
+// events. It runs in a tea.Cmd goroutine; the tailers are not touched
+// elsewhere concurrently because all access is serialized through the
+// Bubble Tea update loop (this Cmd is the only reader, and tailer
+// registration happens on snapshotMsg, also on the loop). To keep that
+// invariant the Cmd captures the current tailer set by value.
 func (m *Model) pollTails() tea.Cmd {
 	// Snapshot the tailer pointers under the loop so the goroutine reads a
 	// stable set. Each *Tailer is internally locked, so concurrent Poll from
@@ -198,16 +204,19 @@ func (m *Model) pollTails() tea.Cmd {
 	return func() tea.Msg {
 		var batch []TailEvent
 		for _, t := range tailers {
-			evs, err := t.Poll()
-			if err != nil {
-				continue // I/O hiccup — skip this tailer this tick
-			}
-			for i := range evs {
-				evs[i].source = t
-			}
-			batch = append(batch, evs...)
-			if len(batch) >= maxLinesPerTick {
-				break
+			for budget := maxEventsPerTailerTick; budget > 0; {
+				evs, err := t.Poll()
+				if err != nil {
+					break // I/O hiccup — skip this tailer this tick
+				}
+				for i := range evs {
+					evs[i].source = t
+				}
+				batch = append(batch, evs...)
+				budget -= len(evs)
+				if len(evs) < maxEventsPerPoll {
+					break // drained to the end of the journal
+				}
 			}
 		}
 		// Sort merged events by ingestion time so interleaving reads across
@@ -221,9 +230,10 @@ func (m *Model) pollTails() tea.Cmd {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		// Pane heights derive from the split ratio at render time, so a
+		// resize keeps the operator's ratio without any recomputation.
 		m.width = msg.Width
 		m.height = msg.Height
-		m.layout()
 		return m, nil
 
 	case indexTickMsg:
@@ -259,6 +269,10 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.cards)-1 {
 			m.cursor++
 		}
+	case "enter":
+		m.detail = !m.detail && len(m.cards) > 0
+	case "esc":
+		m.detail = false
 	case "f":
 		m.stream.SetFollowing(!m.stream.Following())
 	case "g":
@@ -273,11 +287,10 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// setSplit clamps ratio into bounds and re-applies the layout so the next
-// resize preserves the operator-chosen ratio.
+// setSplit clamps ratio into bounds. Only an explicit keypress changes the
+// ratio; resizes keep it.
 func (m *Model) setSplit(ratio float64) {
 	m.split = clampSplit(ratio)
-	m.layout()
 }
 
 // clampSplit bounds a split ratio so neither pane can vanish.
@@ -345,11 +358,7 @@ func (m *Model) applySnapshot(snap Snapshot) {
 					}
 				} else {
 					delete(m.tailers, snap.Cards[i].SessionID)
-					// A valid per-run offset replays only this run's bytes;
-					// absent or invalid offsets attach at EOF, fail closed.
-					if path := snap.Cards[i].EventsPath(); path != "" {
-						m.tailers[snap.Cards[i].SessionID] = NewMetricTailer(snap.Cards[i].SessionID, path, snap.Cards[i].EventLogStartOffset, m.now)
-					}
+					m.attachTailer(&snap.Cards[i])
 				}
 			}
 		}
@@ -371,22 +380,17 @@ func (m *Model) applySnapshot(snap Snapshot) {
 func (m *Model) reconcileTailers() {
 	present := map[string]struct{}{}
 	for i := range m.cards {
-		c := m.cards[i]
+		c := &m.cards[i]
 		present[c.SessionID] = struct{}{}
 		// Remember the label for the stream prefix.
-		label := c.IssueIdentifier
-		if label == "" {
-			label = shortID(c.SessionID)
-		}
-		m.labels[c.SessionID] = label
+		m.labels[c.SessionID] = c.displayID()
 
-		evPath := c.EventsPath()
-		if c.isHeld() || evPath == "" {
+		if c.isHeld() || c.EventsPath() == "" {
 			delete(m.tailers, c.SessionID)
 			continue // held or pathless sessions have no session event stream
 		}
 		if _, ok := m.tailers[c.SessionID]; !ok {
-			m.tailers[c.SessionID] = NewMetricTailer(c.SessionID, evPath, c.EventLogStartOffset, m.now)
+			m.attachTailer(c)
 		}
 	}
 	for id, t := range m.tailers {
@@ -397,7 +401,25 @@ func (m *Model) reconcileTailers() {
 	}
 }
 
-// applyTailBatch appends the tick's merged events to the LogViewer and folds
+// attachTailer starts the card's metric tailer. A valid per-run offset
+// replays only this run's bytes; absent or invalid offsets attach at EOF,
+// fail closed. When the run already wrote events before the watcher
+// attached, the journal's modification time is the run's true last output
+// time, so a quiet session reads "4m ago" rather than "never" until its
+// next event — replayed events themselves still never advance freshness.
+func (m *Model) attachTailer(c *SessionCard) {
+	path := c.EventsPath()
+	if path == "" {
+		return
+	}
+	t := NewMetricTailer(c.SessionID, path, c.EventLogStartOffset, m.now)
+	m.tailers[c.SessionID] = t
+	if c.LastOutputAt.IsZero() {
+		c.LastOutputAt = t.AttachModTime()
+	}
+}
+
+// applyTailBatch appends the tick's merged events to the stream pane and folds
 // per-session live metrics (tool count, last tool, cost) onto the matching
 // card.
 func (m *Model) applyTailBatch(events []TailEvent) {
@@ -515,12 +537,17 @@ func (m *Model) foldMetrics(ev TailEvent) {
 	if c.isHeld() {
 		return
 	}
-	c.Observed = true
+	// Observed means the journal carries the agent event stream, which is
+	// what makes a zero tool count a measurement. System notices alone (an
+	// interactive terminal session's journal holds nothing else) do not.
+	if _, notice := ev.Event.(agent.SystemEvent); !notice {
+		c.Observed = true
+	}
 	live := !ev.Replay
 	switch e := ev.Event.(type) {
 	case agent.ToolUseEvent:
 		c.ToolCalls++
-		c.LastTool = toolUseSummary(e)
+		c.LastTool = truncateRunes(cleanText(toolUseSummary(e)), maxActivityRunes)
 		c.LastActivity = c.LastTool
 		if live {
 			c.LastWorkAt = ev.EventAt()
@@ -578,8 +605,8 @@ func (m *Model) foldMetrics(ev TailEvent) {
 			c.LastOutputAt = ev.EventAt()
 		}
 	case agent.AssistantTextEvent:
-		if txt := collapseWS(e.Text); txt != "" {
-			c.LastActivity = truncateRunes(txt, cardWidth)
+		if txt := cleanText(e.Text); txt != "" {
+			c.LastActivity = truncateRunes(txt, maxActivityRunes)
 			if live {
 				c.LastOutputAt = ev.EventAt()
 			}
@@ -615,7 +642,7 @@ func (m *Model) foldMetrics(ev TailEvent) {
 		}
 	case agent.ErrorEvent:
 		c.Errored = true
-		c.LastActivity = truncateRunes(e.Message, cardWidth)
+		c.LastActivity = truncateRunes(cleanText(e.Message), maxActivityRunes)
 		if live {
 			c.LastOutputAt = ev.EventAt()
 		}
@@ -626,80 +653,103 @@ func finiteNonnegative(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 }
 
-// layout recomputes child sizes after a resize or a split change. The
-// grid and the stream share the content height (everything below the
-// one-line header and above the one-line help) per the operator's split
-// ratio, so a resize preserves the chosen ratio.
-func (m *Model) layout() {
-	if m.width == 0 || m.height == 0 {
-		return
-	}
-	_, streamH := splitPaneHeights(m.height-2, m.split)
-	// -1 for the "session stream" title row above the viewer.
-	bodyH := streamH - 1
-	if bodyH < 0 {
-		bodyH = 0
-	}
-	m.stream.SetSize(m.width, bodyH)
-}
-
-// View renders the full dashboard: counters header, card grid, then the
-// merged session stream.
+// View renders the full dashboard: host header, card grid, then the
+// merged session stream (or the selected session's detail).
 func (m *Model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = !m.opts.Plain
 	return v
 }
 
+// render composes the frame row by row. Each pane occupies exactly the
+// rows the split allocates it — a sparse grid is padded, never collapsed —
+// so the stream boundary and the help row stay at fixed positions for a
+// given terminal size and split. Every row fits the terminal width and
+// the frame never exceeds the terminal height.
 func (m *Model) render() string {
 	if m.width == 0 {
 		return ""
 	}
+	unbounded := m.opts.Plain && m.opts.UnboundedCards
 	header := m.renderHeader()
+	help := m.renderHelp()
 	if m.snapErr != nil {
-		warn := fmt.Sprintf("daemon unreachable: %v", m.snapErr)
+		warn := truncateWidth(fmt.Sprintf("daemon unreachable: %v", cleanText(m.snapErr.Error())), m.width)
 		if !m.opts.Plain {
 			warn = theme.ErrorText().Render(warn)
 		}
-		return lipgloss.JoinVertical(lipgloss.Left, header, "", warn, "", m.renderHelp())
+		return m.clipHeight([]string{header, "", warn, "", help}, unbounded)
 	}
 
-	gridH, _ := splitPaneHeights(m.height-2, m.split)
-	if m.opts.Plain && m.opts.UnboundedCards {
-		gridH = 0
+	gridH, streamH := splitPaneHeights(m.height-2, m.split)
+	rows := []string{header}
+	if unbounded {
+		rows = append(rows, renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, 0, true, m.now()))
+	} else {
+		grid := renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, gridH, m.opts.Plain, m.now())
+		rows = append(rows, fitLines(grid, gridH)...)
 	}
-	grid := renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, gridH, m.opts.Plain, m.now())
-
-	streamTitle := "session stream"
-	if !m.opts.Plain {
-		follow := "follow"
-		if !m.stream.Following() {
-			follow = "paused"
+	if streamH > 0 || unbounded {
+		bodyH := max(streamH-1, 0)
+		if m.detail && m.cursor < len(m.cards) {
+			card := m.cards[m.cursor]
+			rows = append(rows, detailTitle(card, m.opts.Plain, m.theme, m.width))
+			rows = append(rows, fitLines(strings.Join(renderDetail(m.theme, card, m.now(), m.width, bodyH, m.opts.Plain), "\n"), bodyH)...)
+		} else {
+			rows = append(rows, m.renderStreamTitle())
+			body := m.stream.View(m.width, bodyH)
+			if unbounded {
+				body = trimTrailingBlank(body)
+			}
+			rows = append(rows, body...)
 		}
-		streamTitle = theme.SectionTitle().Render("session stream") +
-			lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render("  ["+follow+"]")
 	}
-	streamBody := m.stream.View().Content
-	if m.opts.Plain && m.opts.UnboundedCards {
-		streamBody = strings.TrimRight(streamBody, "\n ")
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		grid,
-		streamTitle,
-		streamBody,
-		m.renderHelp(),
-	)
+	rows = append(rows, help)
+	return m.clipHeight(rows, unbounded)
 }
 
-// renderHeader renders the one-line counters bar: the host identity first,
+// clipHeight joins rows, dropping any beyond the terminal height so the
+// header stays on screen even on a terminal shorter than the chrome.
+func (m *Model) clipHeight(rows []string, unbounded bool) string {
+	out := strings.Join(rows, "\n")
+	if unbounded || m.height <= 0 {
+		return out
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) > m.height {
+		lines = lines[:m.height]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func trimTrailingBlank(lines []string) []string {
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+// renderStreamTitle is the stream pane's title row with its follow state.
+func (m *Model) renderStreamTitle() string {
+	state := "follow"
+	if !m.stream.Following() {
+		state = "paused"
+	}
+	if m.opts.Plain {
+		return truncateWidth("session stream  ["+state+"]", m.width)
+	}
+	return truncateWidth(theme.SectionTitle().Render("session stream")+
+		lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render("  ["+state+"]"), m.width)
+}
+
+// renderHeader renders the one-line host header: the host identity first,
 // then the scope (only when it narrows the default "all projects" view),
-// then running/queue/uptime/version counters. All values are local (daemon
+// then the counters — sessions in scope, queue depth, the host's
+// occupied/total session slots, uptime and version. All values are local (daemon
 // status/stats). The single line is budgeted against the terminal width:
-// the counters pin right, the host-first segment truncates with an
-// ellipsis, and header padding is two spaces (one per side) — the only
-// horizontal chrome the style adds.
+// lower-priority counters drop first, the host is kept whole whenever it
+// fits, and the only horizontal chrome is the style's one padding cell on
+// each side.
 func (m *Model) renderHeader() string {
 	scope := m.opts.ProjectLabel
 	if scope == "" {
@@ -729,34 +779,28 @@ func (m *Model) renderHeader() string {
 	return style.Width(m.width).Render(content)
 }
 
-// headerCounterVariants keeps useful counters in priority order, removing
-// optional details before the running count when the terminal narrows.
+// headerCounterVariants lists the counter strings from richest to barest.
+// Counters drop lowest priority first — version, uptime, host slots, then
+// queue — before the in-scope session count itself, so a narrow header
+// keeps the work waiting before the host's capacity.
 func headerCounterVariants(c Counters) []string {
 	status := fmt.Sprintf("%d running", c.Running)
 	if c.Sessions > c.Running {
 		status = fmt.Sprintf("%d sessions", c.Sessions)
 	}
-	queue := fmt.Sprintf("queue %d", c.QueueDepth)
-	uptime := "uptime " + format.Duration(int(c.UptimeSeconds))
-	full := status + "   " + queue + "   " + uptime
+	parts := []string{status, fmt.Sprintf("queue %d", c.QueueDepth)}
+	if c.MaxSessions > 0 {
+		parts = append(parts, fmt.Sprintf("slots %d/%d", c.HostActive, c.MaxSessions))
+	}
+	parts = append(parts, "uptime "+format.Duration(int(c.UptimeSeconds)))
 	if c.Version != "" {
-		full += "   v" + c.Version
+		parts = append(parts, "v"+c.Version)
 	}
-	variants := []string{
-		full,
-		status + "   " + queue + "   " + uptime,
-		status + "   " + queue,
-		status + "   " + uptime,
-		status,
-		"",
+	variants := make([]string, 0, len(parts)+1)
+	for n := len(parts); n > 0; n-- {
+		variants = append(variants, strings.Join(parts[:n], "   "))
 	}
-	unique := make([]string, 0, len(variants))
-	for _, variant := range variants {
-		if len(unique) == 0 || unique[len(unique)-1] != variant {
-			unique = append(unique, variant)
-		}
-	}
-	return unique
+	return append(variants, "")
 }
 
 // headerBudgetVariants composes a one-line header within the content width left
@@ -841,31 +885,11 @@ func truncateHeaderHost(host string, width int) string {
 	return truncateWidth(host, width)
 }
 
-// truncateWidth shortens s to at most n display cells, appending an
-// ellipsis when truncated. n<=0 returns "". Unlike truncateRunes it
-// accounts wide (CJK) runes, so the result always fits its budget.
-func truncateWidth(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	if lipgloss.Width(s) <= n {
-		return s
-	}
-	w := 0
-	var out []rune
-	for _, r := range s {
-		rw := lipgloss.Width(string(r))
-		if w+rw > n-1 {
-			break
-		}
-		out = append(out, r)
-		w += rw
-	}
-	return string(out) + "…"
-}
+// helpText documents every key. It is truncated to the terminal width.
+const helpText = "↑↓/jk select   enter detail   [ ] split   0 reset   f follow/pause   g tail   q quit"
 
 func (m *Model) renderHelp() string {
-	help := "↑↓ select   [ ] split   0 reset   f follow/pause   g jump to tail   q quit"
+	help := truncateWidth(helpText, m.width)
 	if m.opts.Plain {
 		return help
 	}

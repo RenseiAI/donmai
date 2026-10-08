@@ -46,6 +46,12 @@ type State struct {
 	// value before allowing reuse.
 	IssueIdentifier string `json:"issueIdentifier"`
 
+	// IssueTitle is the work item's title as dispatched. Display-only (the
+	// local host-watch dashboard shows it beside the identifier); empty when
+	// the work source supplied none or on state written before the field
+	// existed, and readers then render no title rather than a guess.
+	IssueTitle string `json:"issueTitle,omitempty"`
+
 	// SessionID is the platform-side session UUID. Populated as soon
 	// as the runner has claimed the work.
 	SessionID string `json:"sessionId,omitempty"`

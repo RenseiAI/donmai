@@ -40,13 +40,17 @@ func (p *prefixIndex) get(sessionID string) int {
 // Returns "" for events that carry no useful stream text (e.g. an empty
 // assistant-text chunk).
 func formatStreamLine(t theme.Theme, ev TailEvent, label string, colorIdx int, plain bool) string {
+	label = cleanText(label)
 	if label == "" {
-		label = shortID(ev.SessionID)
+		label = shortID(cleanText(ev.SessionID))
 	}
 	kind, summary := summarizeEvent(ev)
 	if kind == "" {
 		return ""
 	}
+	// Event text is agent output: strip escapes and controls so a tool
+	// argument can never drive the terminal or break the line.
+	kind, summary = cleanText(kind), cleanText(summary)
 	ts := ev.At.Format("15:04:05")
 
 	if plain {
@@ -215,8 +219,71 @@ func collapseWS(s string) string {
 }
 
 // streamTickerText returns the short "last activity" string a card shows in
-// its tool-ticker line, derived from the most recent meaningful event.
+// its activity row, derived from the most recent meaningful event.
 func streamTickerText(ev TailEvent) string {
 	_, summary := summarizeEvent(ev)
-	return summary
+	return cleanText(summary)
+}
+
+// defaultStreamLines is the merged stream's retained scroll-back.
+const defaultStreamLines = 10_000
+
+// streamPane is the merged session stream: a bounded ring of rendered
+// lines shown newest-last. Following, the pane shows the newest lines;
+// paused, it holds the window it showed when paused while new lines keep
+// arriving (until the ring drops them). It renders exactly the rows it is
+// given, each truncated to the pane width, and adds no chrome of its own —
+// the model draws the title row — so plain output never carries color.
+type streamPane struct {
+	lines  []string
+	max    int
+	total  int // lines ever appended
+	follow bool
+	pinned int // total at pause time: the paused window ends here
+}
+
+func newStreamPane() *streamPane {
+	return &streamPane{max: defaultStreamLines, follow: true}
+}
+
+// Append adds rendered lines, dropping the oldest beyond the ring size.
+func (s *streamPane) Append(lines ...string) {
+	s.lines = append(s.lines, lines...)
+	s.total += len(lines)
+	if over := len(s.lines) - s.max; over > 0 {
+		s.lines = append(s.lines[:0], s.lines[over:]...)
+	}
+}
+
+// Following reports whether the pane tracks the newest line.
+func (s *streamPane) Following() bool { return s.follow }
+
+// SetFollowing resumes following, or pauses on the current window.
+func (s *streamPane) SetFollowing(follow bool) {
+	if !follow && s.follow {
+		s.pinned = s.total
+	}
+	s.follow = follow
+}
+
+// View returns exactly height rows (padded with blank rows), each at most
+// width cells. height <= 0 returns every retained line, newest last.
+func (s *streamPane) View(width, height int) []string {
+	end := len(s.lines)
+	if !s.follow {
+		end -= s.total - s.pinned
+		end = max(end, 0)
+	}
+	start := 0
+	if height > 0 {
+		start = max(end-height, 0)
+	}
+	out := make([]string, 0, max(height, end-start))
+	for _, line := range s.lines[start:end] {
+		out = append(out, truncateWidth(line, width))
+	}
+	for len(out) < height {
+		out = append(out, "")
+	}
+	return out
 }

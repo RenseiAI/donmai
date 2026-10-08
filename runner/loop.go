@@ -948,6 +948,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	if _, err := r.store.Update(runnerStatePath, func(s *state.State) error {
 		journalBoundaryErr = stampRunJournalBoundary(s, qw.SessionID, startedAt, runnerStatePath)
 		s.IssueIdentifier = qw.IssueIdentifier
+		s.IssueTitle = qw.Title
 		s.IssueID = qw.IssueID
 		s.SessionID = qw.SessionID
 		s.ProviderName = provider.Name()
