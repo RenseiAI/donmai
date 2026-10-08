@@ -977,7 +977,33 @@ func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectC
 	if !s.isProjectAllowedLocked(project.ID) {
 		return nil, fmt.Errorf("project %q is not allowed", project.ID)
 	}
+	if err := s.checkDeclarationRepositoriesLocked(spec); err != nil {
+		return nil, err
+	}
 	return project, nil
+}
+
+// checkDeclarationRepositoriesLocked extends the repository check to every
+// entry of an additive repository declaration: each declared source must
+// resolve against the same project allowlist as the singular repository, so
+// a declaration cannot smuggle an unlisted repository past admission. An
+// entry that matches no project entry is refused with the same
+// not-configured shape as the singular check above. Nil declarations and
+// project-scoped specs keep their existing paths.
+func (s *WorkerSpawner) checkDeclarationRepositoriesLocked(spec SessionSpec) error {
+	if spec.RepositoryDeclaration == nil {
+		return nil
+	}
+	for _, declared := range spec.RepositoryDeclaration.Repositories {
+		source := declared.Source.Repository
+		if source == "" || source == spec.Repository {
+			continue
+		}
+		if s.findProjectLocked(source) == nil {
+			return fmt.Errorf("repository %q is not configured", source)
+		}
+	}
+	return nil
 }
 
 func (s *WorkerSpawner) findPrimaryProjectRepositoryLocked(projectID string) *ProjectConfig {

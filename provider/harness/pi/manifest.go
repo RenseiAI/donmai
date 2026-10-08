@@ -74,6 +74,16 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// document; PTY is selected per Spawn call by Spec.Interactive != nil,
 			// never by a Transport value.
 			SupportsInteractivePTY: true,
+			// session-root-v1 is attested for declarations whose
+			// repositories are all mutable, exactly as the other
+			// writable-scope harness declares above: the declared
+			// mutable paths are the spawn's working set (CWD plus the
+			// sibling leaves), and no read-only leaf needs executor
+			// isolation. A declaration carrying any read-only
+			// repository is still refused: the OS boundary that
+			// would hold one read-only is opt-in per host, not a
+			// property of this adapter (enforcement stays unset below).
+			MultiRepositoryWorkareaProtocols: []string{"session-root-v1"},
 			// `pi --mode rpc` carries an explicit steering verb on the same
 			// JSONL channel that drives the session: Handle.Inject maps to
 			// steer while a turn is in flight and follow_up while idle
