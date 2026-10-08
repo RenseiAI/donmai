@@ -266,6 +266,33 @@ type CapacityConfig struct {
 	// PoolMaxDiskGb is the LRU-eviction trigger for the workarea pool.
 	// 0 means no limit.
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
+	// SeatBudget is the per-seat resource budget: the CPU/memory share
+	// one session's process tree may use. Optional; ResolveSeatBudget
+	// derives the per-seat share from host cores and memory divided by
+	// MaxConcurrentSessions when fields are omitted. Zero value means
+	// budgeting is off (report mode "none").
+	SeatBudget SeatBudgetConfig `yaml:"seatBudget,omitempty" json:"seatBudget,omitempty"`
+}
+
+// SeatBudgetConfig is the authored per-seat resource budget in daemon.yaml.
+// Every field is optional: omitted numerics fall back to host cores/memory
+// divided by the max concurrent seat count, and an omitted mode resolves
+// per OS (enforced on Linux, best-effort elsewhere). The type lives here
+// rather than in the enforcement package so the config layer keeps its
+// one-way dependency (daemon -> seatbudget, never the reverse).
+type SeatBudgetConfig struct {
+	// CPUs is the whole-core seat share. Zero derives from host cores.
+	CPUs int `yaml:"cpus,omitempty" json:"cpus,omitempty"`
+	// MemoryMB is the seat memory ceiling in mebibytes. Zero derives
+	// from host memory on multi-seat hosts, and means no cap on a
+	// single-seat host.
+	MemoryMB int `yaml:"memoryMb,omitempty" json:"memoryMb,omitempty"`
+	// IOWeight is the cgroup v2 IO weight (1-10000). Zero means the
+	// backend default (no explicit weight). Linux only.
+	IOWeight int `yaml:"ioWeight,omitempty" json:"ioWeight,omitempty"`
+	// Mode is auto (default), enforced, best-effort or none. "enforced"
+	// on an OS with no enforcement backend degrades to best-effort.
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
 }
 
 // ReservedSystemSpec describes resources reserved for the host OS.
@@ -915,6 +942,9 @@ func validateConfig(c *Config) error {
 	}
 	if c.Capacity.MaxConcurrentSessions < 0 {
 		return errors.New("capacity.maxConcurrentSessions must be >= 0")
+	}
+	if err := validateSeatBudget(c.Capacity.SeatBudget); err != nil {
+		return err
 	}
 	if c.ProjectAdmissionVersion != 0 && c.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
 		return fmt.Errorf("projectAdmissionVersion invalid: %d (want 2)", c.ProjectAdmissionVersion)

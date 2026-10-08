@@ -8,7 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- Publish subscription quota on the daemon heartbeat: a quota poller reads each installed harness's host login once per 5-minute interval (a short-lived codex app-server `account/rateLimits/read` with the host login projected, a short-lived claude `get_usage` control request with no model turn) into the per-account snapshot cache, and live sessions report their streamed rate-limit updates (codex `account/rateLimits/updated`, claude `rate_limit_event`) to `POST /api/daemon/sessions/<id>/usage`, where they merge by window id onto the probe snapshot. A worker authenticates its own session's update with the per-session credential stated in its spawn environment (or its attempt credential on a local runtime) — never the operator control token — so the update route stays closed to any caller that cannot name its session. The heartbeat `quota` field carries one entry per account with windows, each with an `authCheck` (`harness`, `ok`, `checkedAt`) stamped with the probe time. Only a read the harness answered records a verdict: the codex login refusal is the app-server's -32600 answer (a backend fetch failure records nothing), and the claude verdict comes from the host login check; a read that never reached the harness keeps the previous one.
+
+## v0.72.67 — 2026-10-08
+
+### Fixes
+
+- Seat credentials are no longer passed on child process command lines. Fleet child workers receive the provisioning token through their environment, and the Claude MCP gateway header helper reads its fallback bearer from an owner-only file beside its config instead of carrying it in the helper text.
+- When control auth is enforced, the daemon's control API now requires the control token to read session detail (`GET /api/daemon/sessions/<id>`); credentials are redacted from responses to callers without it. A spawned worker reads its own session's detail with a per-session read credential (`DONMAI_SESSION_READ_TOKEN`) that names only that session and carries no operator privilege.
+
+### Chores
+
+- Deflake the repeated ring-miss attach test: each bounce now waits for the replacement host leg to bind before injecting the next fault.
 
 ## v0.72.66 — 2026-10-07
 

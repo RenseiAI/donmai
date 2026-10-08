@@ -24,7 +24,11 @@ func TestExactSessionShimContinuationRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-continuation", SessionID: "session-continuation"}
-	sh, err := sessionshim.Start(sessionshim.Options{Identity: id, Registry: registry, ProcessEpoch: 5, Spec: ptyhost.Spec{Command: []string{"/bin/sh", "-c", "while IFS= read -r line; do printf 'ack:%s\\n' \"$line\"; done"}, Epoch: 7}, Orphan: sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second}})
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, err := sessionshim.Start(sessionshim.Options{Identity: id, Registry: registry, ProcessEpoch: 5, Spec: ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv(), Epoch: 7}, Orphan: sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second}})
 	if err != nil {
 		t.Fatal(err)
 	}

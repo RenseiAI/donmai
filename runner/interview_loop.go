@@ -414,6 +414,7 @@ func (r *Runner) consumeInterviewTurn(
 			for _, correlatedEvent := range cfg.spans.Process(ev) {
 				r.appendInterviewJSONL(cfg.worktree, correlatedEvent)
 				sink.Send(ctx, correlatedEvent)
+				r.reportQuotaEvent(ctx, cfg.qw.SessionID, correlatedEvent)
 
 				if at, isText := correlatedEvent.(agent.AssistantTextEvent); isText && at.Text != "" {
 					sentinelBuf.WriteString(at.Text)

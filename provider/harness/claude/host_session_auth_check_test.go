@@ -19,6 +19,7 @@ func TestCheckHostSessionLogin_RestrictedNativeHome(t *testing.T) {
 	xdg := filepath.Join(home, "xdg")
 	config := filepath.Join(home, "claude-config")
 	t.Setenv("HOME", home)
+	t.Setenv("USER", "probe-operator")
 	t.Setenv("XDG_CONFIG_HOME", xdg)
 	t.Setenv("CLAUDE_CONFIG_DIR", config)
 	for _, name := range []string{"GITHUB_TOKEN", "DONMAI_DAEMON_JWT", "NODE_OPTIONS", "HTTP_PROXY", "OPENAI_API_KEY"} {
@@ -30,6 +31,7 @@ func TestCheckHostSessionLogin_RestrictedNativeHome(t *testing.T) {
 [ "$XDG_CONFIG_HOME" = %q ] || exit 23
 [ "$CLAUDE_CONFIG_DIR" = %q ] || exit 24
 [ "$(pwd -P)" != "$HOME" ] || exit 25
+[ "$USER" = "probe-operator" ] || exit 29
 [ -n "$TMPDIR" ] && [ "$XDG_CACHE_HOME" = "$TMPDIR" ] || exit 26
 [ -z "${GITHUB_TOKEN+x}" ] && [ -z "${DONMAI_DAEMON_JWT+x}" ] || exit 27
 [ -z "${NODE_OPTIONS+x}" ] && [ -z "${HTTP_PROXY+x}" ] && [ -z "${OPENAI_API_KEY+x}" ] || exit 28

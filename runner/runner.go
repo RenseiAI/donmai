@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -110,6 +111,35 @@ const (
 	// Options.IdleTimeout disables the watchdog.
 	DefaultIdleTimeout = 12 * time.Minute
 
+	// DefaultProviderStallTimeout is the suggested stalled-model-request
+	// window for a caller that opts in through
+	// [Options.ProviderStallTimeout]; the runner never applies it on its
+	// own. The window measures the silence after a tool result
+	// while NO tool call is in flight: a tool result the agent has not
+	// answered within the window means the model request that should
+	// follow may be stalled, not that a tool is slow. On expiry the
+	// runner stops the provider and surfaces the provider-stall signal
+	// so the caller can retry the turn through the provider-error path
+	// instead of ending the seat at the outer idle timeout. Three minutes
+	// sits between a slow model round trip and the twelve-minute outer
+	// backstop with margin for the bounded retries to complete before it.
+	//
+	// Zero (the default) DISABLES the detector: no harness emits an event
+	// while a response streams, so an event-silence window cannot tell a
+	// hung request from a healthy long generation or reasoning pass —
+	// arming it by default would abort healthy turns and regenerate them
+	// up to the retry bound. Callers opt in only where the reported
+	// stalled shape dominates. A NEGATIVE Options.ProviderStallTimeout
+	// also disables the detector entirely.
+	DefaultProviderStallTimeout = 3 * time.Minute
+
+	// DefaultProviderStallRetries bounds the stop-and-retry attempts a
+	// stalled model request gets before the seat fails, applied when
+	// [Options.ProviderStallRetries] is zero. It is deliberately small:
+	// a provider that stalls repeatedly is not recovering between
+	// attempts, and the outer idle timeout still owns the seat.
+	DefaultProviderStallRetries = 2
+
 	// terminalResultPostTimeout bounds the detached cleanup context used for
 	// terminal result delivery after the run context has expired or been
 	// cancelled. Posting remains ahead of worktree teardown.
@@ -194,6 +224,45 @@ type Options struct {
 	// NEGATIVE disables the watchdog entirely (caller relies solely on
 	// MaxSessionDuration / external ctx for liveness).
 	IdleTimeout time.Duration
+
+	// ProviderStallTimeout is the stalled-model-request window applied
+	// to the event stream. A resettable timer arms in consumeEvents
+	// after a tool result while no tool call is in flight and resets on
+	// every agent.Event; when it expires with no event in the window AND
+	// no tool call in flight the runner stops the provider and surfaces
+	// the provider-stall signal so the caller retries the turn through
+	// the provider-error path instead of ending the seat at the outer
+	// idle timeout — a hung model request after a tool result must not
+	// reach the twelve-minute backstop. A tool call in flight suppresses
+	// it (the tool's own bounded timeout owns that call), and so does
+	// any stretch with no tool result yet: the timer only starts once a
+	// tool result has been observed, so a healthy long generation or
+	// reasoning pass before the first tool call never trips it.
+	//
+	// Zero (the default) disables the detector entirely: no harness
+	// emits an event while a response streams, so an event-silence
+	// window cannot tell a hung post-tool request from a healthy long
+	// generation. A POSITIVE value opts in explicitly with the window
+	// to apply. NEGATIVE also disables the detector (caller relies
+	// solely on the idle watchdog for liveness).
+	//
+	// Known limits when opted in, measured against the pi, codex and
+	// claude event mappings: a healthy response after a tool result that
+	// emits no event until it completes (a large file written in one
+	// tool call, or an answer with no thinking block first) is aborted
+	// and regenerated; pi reports the previous model call's usage after
+	// its tool results, which disarms the window before the next request
+	// is sent, so the detector never fires on pi; and a resumed turn
+	// opens with the retry prompt rather than a tool result, so a retried
+	// request that hangs before any tool result ends at the idle watchdog.
+	ProviderStallTimeout time.Duration
+
+	// ProviderStallRetries bounds the stop-and-retry attempts a stalled
+	// model request gets before the seat fails as FailureProviderError.
+	// Zero uses DefaultProviderStallRetries; negative disables the
+	// retries (a stall then behaves exactly like the idle watchdog
+	// cut-off it replaces).
+	ProviderStallRetries int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
 	// failed Run for debugging. Defaults to true in v0.5.0 per F.1.1
@@ -362,6 +431,14 @@ type Options struct {
 	// Zero uses DefaultDepsInstallTimeout; negative disables the
 	// step-side timeout (the caller owns ctx expiry).
 	DepsInstallTimeout time.Duration
+
+	// QuotaReporterForSession builds the per-session quota reporter
+	// that forwards the sparse quota updates the session's harness
+	// stream carries to the admitting daemon. The runner calls it
+	// once per Run with the session id and the resolved harness
+	// name ("codex" or "claude"); nil disables quota reporting
+	// and leaves every event stream untouched.
+	QuotaReporterForSession func(sessionID, harness string) *QuotaReporter
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -411,6 +488,8 @@ type Runner struct {
 	now                           func() time.Time
 	maxDuration                   time.Duration
 	idleTimeout                   time.Duration
+	providerStallTimeout          time.Duration
+	providerStallRetries          int
 	preserveOnFail                bool
 	preserveAlways                bool
 	skipBackstop                  bool
@@ -473,6 +552,16 @@ type Runner struct {
 	// manual clock so watchdog expiry is tripped explicitly instead of by
 	// sleeping past a wall-clock window. See Runner.idleTimer.
 	idleClock interviewClock
+
+	// quotaReporterForSession builds the per-session quota reporter
+	// (see Options.QuotaReporterForSession). Nil disables reporting.
+	quotaReporterForSession func(sessionID, harness string) *QuotaReporter
+	// quotaReporters holds the live per-session reporters, keyed by
+	// session id. A reporter is registered once per Run and released
+	// when the run ends, so the consecutive-update dedup sees every
+	// loop of the session (main stream, tails, interactive drain).
+	quotaReportersMu sync.Mutex
+	quotaReporters   map[string]*QuotaReporter
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -520,6 +609,8 @@ func New(opts Options) (*Runner, error) {
 		now:                              opts.Now,
 		maxDuration:                      opts.MaxSessionDuration,
 		idleTimeout:                      opts.IdleTimeout,
+		providerStallTimeout:             opts.ProviderStallTimeout,
+		providerStallRetries:             opts.ProviderStallRetries,
 		preserveOnFail:                   opts.PreserveWorktreeOnFailure,
 		preserveAlways:                   opts.PreserveWorktreeAlways,
 		skipBackstop:                     opts.SkipBackstop,
@@ -547,6 +638,8 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationLimit:            opts.TurnContinuationLimit,
 		turnContinuationCeiling:          opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
+		quotaReporterForSession:          opts.QuotaReporterForSession,
+		quotaReporters:                   map[string]*QuotaReporter{},
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
@@ -574,6 +667,16 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.idleTimeout == 0 {
 		r.idleTimeout = DefaultIdleTimeout
+	}
+	if r.providerStallTimeout < 0 {
+		// Negative opts out explicitly; zero (unset) keeps the
+		// detector disabled until a caller opts in with a positive
+		// window. Normalize both to the same disarmed value so
+		// consumeEvents reads one condition.
+		r.providerStallTimeout = 0
+	}
+	if r.providerStallRetries == 0 {
+		r.providerStallRetries = DefaultProviderStallRetries
 	}
 	return r, nil
 }

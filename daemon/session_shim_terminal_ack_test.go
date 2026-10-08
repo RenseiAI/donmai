@@ -107,6 +107,14 @@ func TestExitSurvivesAnUndeliverableCursorAcknowledgement(t *testing.T) {
 		t.Fatal("the session is not on the selected-v3 rail; the cursor acknowledgement this test is about does not exist")
 	}
 
+	// Pin the echo round trip through the adopted connection before the
+	// StopSession below: the harness under the shim's PTY must answer a
+	// line with its `ack:` echo. The assertions after StopSession observe
+	// only the shim, so without this ping a harness that exits at once —
+	// or any regression that breaks the shell-free echo child — still
+	// passes them with no live child behind the connection.
+	f.exchange(t, id, "ack-liveness")
+
 	if !d.StopSession(id.SessionID) {
 		t.Fatal("StopSession did not route to the adopted shim")
 	}

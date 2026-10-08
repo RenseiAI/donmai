@@ -303,14 +303,24 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// operator mistake or this process guessing at an address nobody gave it.
 	daemonURL, daemonURLSource := resolveAgentRunDaemonURL(opts.daemonURL, os.Getenv)
 
-	// 2b. Resolve the optional daemon-control bearer token. In a cloud
-	// sandbox the provisioner points DONMAI_DAEMON_URL at an authenticated
-	// remote endpoint and sets DONMAI_RUNTIME_JWT to the token that
-	// endpoint expects; the token is attached as `Authorization: Bearer
-	// <token>` on daemon-control requests. When unset (the default
-	// localhost loopback at 127.0.0.1:7734) no Authorization header is
-	// sent, preserving the unauthenticated loopback behavior.
+	// 2b. Resolve the bearer token for the session-detail read. Precedence:
+	// the per-session read credential the spawning daemon stated in this
+	// worker's environment (authorizes exactly this session's detail read
+	// and nothing else), then the sandbox provisioner's endpoint token
+	// (an authenticated remote endpoint reached via DONMAI_DAEMON_URL
+	// with the token in DONMAI_RUNTIME_JWT). When neither is set (the
+	// default localhost loopback) the request carries no Authorization
+	// header and the daemon answers with the credential-redacted shape.
+	//
+	// A local-runtime worker presents its attempt credential only. Its
+	// spawn environment states both, but the local receiver authenticates
+	// the attempt credential on the detail read and on every callback
+	// (the credential cache below reuses this token) and never consults
+	// the read credential.
 	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+	if readToken := strings.TrimSpace(os.Getenv("DONMAI_SESSION_READ_TOKEN")); readToken != "" && !opts.localRuntime {
+		daemonToken = readToken
+	}
 	if opts.localRuntime && (daemonToken == "" || daemonURLSource == daemonURLSourceBuiltinDefault) {
 		return preflightErr("local worker requires its explicit daemon origin and attempt credential")
 	}
@@ -367,6 +377,20 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		"provider", providerNameFromDetail(detail),
 		"workType", detail.WorkType,
 	)
+	// A detail read that crossed no credential boundary answers with the
+	// credential fields cleared. A worker that bootstraps from such an
+	// answer cannot talk to the platform it was claimed for, so log the
+	// shortfall loudly: production daemons always state the session's
+	// own read credential in the spawn environment, and its absence here
+	// means this worker was started by hand (or by a daemon that
+	// predates the credential) rather than by its own session's spawn.
+	if detail.AuthToken == "" {
+		logger.Warn(
+			"agent run: session detail carries no runtime credential; platform calls will fail unless the daemon refreshes it",
+			"sessionId", sessionID,
+			"daemonUrlSource", daemonURLSource,
+		)
+	}
 	if len(detail.AdmissionReceipt) > 0 {
 		hostReceipt, err := executioncell.DecodeHostAdaptationReceipt(detail.HostAdaptationReceipt)
 		if err != nil || hostReceipt.RequestID != detail.SessionID ||
@@ -543,6 +567,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// the dispatch-time fold (v1).
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
+		// Live quota updates ride back to the admitting daemon: the
+		// sparse windows the session's harness stream carries (a codex
+		// `account/rateLimits/updated` notification, a claude
+		// `rate_limit_event`) merge there by window id onto the probe
+		// snapshot behind the heartbeat quota field. Best-effort and
+		// bounded; an unreachable daemon never stalls the session.
+		QuotaReporterForSession: func(_, harness string) *runner.QuotaReporter {
+			return runner.NewQuotaReporter(callbackClient, daemonURL, sessionID, harness, daemonToken, logger)
+		},
 	}
 	applyAgentRunCapabilityOptions(&runnerOptions, opts)
 	r, err := runner.New(runnerOptions)
@@ -1472,6 +1505,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		PlatformURL:           d.PlatformURL,
 		TerminalWorkareaLease: d.TerminalWorkareaLease,
 		Capabilities:          d.Capabilities,
+		SeatBudget:            detailSeatBudget(d.SeatBudget),
 	}
 	if len(d.OperationalPayload) > 0 {
 		// Decode into a zero value: absent receipted fields must stay absent rather
@@ -1665,6 +1699,21 @@ func detailContinuePullRequest(in *daemon.PollContinuePullRequest) *prompt.Conti
 		Number:  in.Number,
 		HeadRef: in.HeadRef,
 		HeadSha: in.HeadSha,
+	}
+}
+
+// detailSeatBudget re-types the daemon's per-seat budget mirror into the
+// runner-consumable shape. Nil stays nil: budgeting off means the seat
+// spawns exactly as before.
+func detailSeatBudget(in *daemon.SessionSeatBudget) *runner.SeatBudget {
+	if in == nil {
+		return nil
+	}
+	return &runner.SeatBudget{
+		Mode:     in.Mode,
+		CPUs:     in.CPUs,
+		MemoryMB: in.MemoryMB,
+		Detail:   in.Detail,
 	}
 }
 

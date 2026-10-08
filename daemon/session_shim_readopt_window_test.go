@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -69,9 +68,15 @@ func newReadoptFixtureWithOptions(t *testing.T, opts readoptFixtureOptions) *rea
 		// point of re-adoption is that the deadline is never reached.
 		orphan = sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second, PropagationMargin: 0}
 	}
+	// The shell-free echo child: it only has to stay alive behind the
+	// adopted connection, answering every input line with an `ack:` echo.
+	echoSpec, err := daemonShimEchoSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: f.id, Registry: registry, ProcessEpoch: 5,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		Spec:         echoSpec,
 		WorkareaPath: filepath.Join(dir, "workarea"),
 		Orphan:       orphan,
 	})
@@ -1050,9 +1055,15 @@ func TestStartupAdoptionSeedsTheBindObservable(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-seed", SessionID: "session-seed"}
+	// The shell-free echo child: the seed only has to be alive behind the
+	// adopted connection for the bind projection to be observable.
+	echoSpec, err := daemonShimEchoSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 9,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		Spec:         echoSpec,
 		WorkareaPath: filepath.Join(dir, "workarea"),
 		Orphan:       sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second},
 	})

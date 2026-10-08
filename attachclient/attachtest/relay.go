@@ -209,7 +209,27 @@ func (s *StubRelay) HostAckSeq() int64 {
 
 // SendToHost injects a relay→host frame directly (bypassing stamping) — used by
 // the input-trust test to deliver an UNSTAMPED Input from a hostile relay.
+//
+// Delivery targets the leg that owns the room binding at that moment, and is a
+// no-op while no leg does. Across a reconnect the owner can still be the
+// predecessor even though its client has hung up: the relay unbinds a leg only
+// once that leg's reader sees the closed socket, and binds the replacement
+// only once the replacement's subscribe arrives. A frame injected in that
+// window is written to the dead connection and never observed, and HostBound
+// reports true throughout it. A test that injects after a reconnect must
+// therefore wait for the replacement's bind (HostBinds), not for a bound leg.
 func (s *StubRelay) SendToHost(f attachwire.Frame) { s.room.sendToHost(f) }
+
+// HostBinds counts the successful host-leg binds since the relay started, and
+// only grows. Record it before a fault that makes the client reconnect, then
+// wait for it to increase: the leg bound after that is the replacement, which
+// HostBound alone cannot tell apart from a predecessor that still owns the
+// binding (see SendToHost).
+func (s *StubRelay) HostBinds() uint64 {
+	s.room.mu.Lock()
+	defer s.room.mu.Unlock()
+	return s.room.hostBinds
+}
 
 // SimulateRestart wipes all in-memory room state (ring, epoch/host binding,
 // degraded-lane ack, pen, presence) and forcibly drops any currently-bound host

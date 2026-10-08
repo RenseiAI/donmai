@@ -496,6 +496,11 @@ func (r *Runner) dispatchInteractive(
 				handleEvents = nil
 				continue
 			}
+			// Sparse quota updates merge onto the daemon's probe
+			// snapshot like the headless lane's; they carry no
+			// transcript content, so only the quota hook observes
+			// them here.
+			r.reportQuotaEvent(interactiveCtx, qw.SessionID, event)
 			r.forwardInteractiveHandleEvent(interactiveCtx, worktreePath, sink, event)
 
 		case err := <-attachDone:
@@ -648,6 +653,7 @@ func (r *Runner) drainInteractiveActivity(
 				if !ok {
 					return
 				}
+				r.reportQuotaEvent(ctx, qw.SessionID, event)
 				r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
 			case <-flusher.ActivityFlushed():
 				break wait
@@ -664,6 +670,7 @@ func (r *Runner) drainInteractiveActivity(
 			if !ok {
 				return
 			}
+			r.reportQuotaEvent(ctx, qw.SessionID, event)
 			r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
 		default:
 			return
