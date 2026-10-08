@@ -2,27 +2,85 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// newQuotaTestServer hosts the production session subroute
-// (/api/daemon/sessions/ → handleSessionSubroute) against a daemon
-// with a live quota cache. Workers reach the usage route through
-// this exact dispatch.
+// newQuotaTestServer hosts the production control stack
+// (gateHandler → register → handleSessionSubrouteAuth) against a
+// daemon with a live quota cache. Workers reach the usage route
+// through this exact dispatch, including the control gate and the
+// usage leaf's session-scoped auth — a bare handler would prove
+// nothing about the credential path.
 func newQuotaTestServer(t *testing.T, d *Daemon) *httptest.Server {
 	t.Helper()
-	s := &Server{daemon: d}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionSubroute)
-	srv := httptest.NewServer(mux)
+	s := NewServer(d)
+	srv := httptest.NewServer(s.httpd.Handler)
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// postSessionUsage POSTs a quota update to the production usage route
+// with bearer attached when non-empty, and returns the status code.
+func postSessionUsage(t *testing.T, srv *httptest.Server, sessionID, bearer string, harness string, update agent.UsageLimitsUpdate) int {
+	t.Helper()
+	return postSessionUsageAt(t, strings.TrimPrefix(srv.URL, "http://"), sessionID, bearer, harness, update)
+}
+
+// postSessionUsageAt is postSessionUsage against a live daemon server
+// address (the mustStartDaemon* fixtures return the daemon server,
+// not an httptest one).
+func postSessionUsageAt(t *testing.T, addr, sessionID, bearer string, harness string, update agent.UsageLimitsUpdate) int {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"harness": harness, "update": update})
+	if err != nil {
+		t.Fatalf("marshal update: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/api/daemon/sessions/"+sessionID+"/usage", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build usage request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post usage: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
+}
+
+// quotaUpdateWindows is one sparse worker-observed update: the primary
+// window moves while every other probed row stays untouched.
+func quotaUpdateWindows(checkedAt string, primary float64) agent.UsageLimitsUpdate {
+	return agent.UsageLimitsUpdate{
+		CheckedAt: checkedAt,
+		Windows:   []agent.UsageWindow{{ID: "primary", Kind: agent.UsageWindowWeekly, Label: "Weekly", UsedPercent: primary}},
+	}
+}
+
+// heartbeatQuotaAfterSendNow composes the next beat through the
+// production heartbeat service and returns its quota field: what the
+// platform would receive on the following POST. It fails the test
+// when no beat composes.
+func heartbeatQuotaAfterSendNow(t *testing.T, d *Daemon) []agent.UsageAccount {
+	t.Helper()
+	if d.heartbeat == nil {
+		t.Fatal("heartbeat service not running; the quota field has no ride")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = d.heartbeat.SendNow(ctx)
+	return d.heartbeat.LastPayload().Quota
 }
 
 // TestSessionUsageRoute_MergesStreamUpdate is the end-to-end proof
@@ -41,21 +99,10 @@ func TestSessionUsageRoute_MergesStreamUpdate(t *testing.T) {
 	d.sessionDetails.Set(&SessionDetail{SessionID: "sess-quota-1"})
 
 	srv := newQuotaTestServer(t, d)
-	update := agent.UsageLimitsUpdate{
-		CheckedAt: agent.ISOTime(base.Add(time.Minute)),
-		Windows:   []agent.UsageWindow{{ID: "primary", Kind: agent.UsageWindowWeekly, Label: "Weekly", UsedPercent: 77}},
-	}
-	body, err := json.Marshal(map[string]any{"harness": agent.UsageHarnessCodex, "update": update})
-	if err != nil {
-		t.Fatalf("marshal update: %v", err)
-	}
-	resp, err := http.Post(srv.URL+"/api/daemon/sessions/sess-quota-1/usage", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post usage: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("post usage status = %d, want 200", resp.StatusCode)
+	// Open-mode daemon (no control gate): the credential-free worker
+	// update the original wiring relied on still merges.
+	if got := postSessionUsage(t, srv, "sess-quota-1", "", agent.UsageHarnessCodex, quotaUpdateWindows(agent.ISOTime(base.Add(time.Minute)), 77)); got != http.StatusOK {
+		t.Fatalf("post usage status = %d, want 200", got)
 	}
 
 	snapshot := d.quotaSnapshot()
@@ -110,6 +157,125 @@ func TestSessionUsageRoute_RejectsUnknownSessionsAndHarnesses(t *testing.T) {
 	}
 	if got := post("/api/daemon/sessions/sess-quota-2/usage", `not json`); got != http.StatusBadRequest {
 		t.Errorf("malformed body status = %d, want 400", got)
+	}
+}
+
+// TestSessionUsageRoute_SessionCredentialAcceptedUnderEnforcedGate is
+// the live-update proof: with the control gate enforced, a worker
+// POSTing its streamed windows with its own session read credential —
+// the credential the spawner states in its environment, never the
+// operator control token — is accepted, and the streamed rows land in
+// the next composed heartbeat beside the probe snapshot. The operator
+// control token keeps working on the same route.
+func TestSessionUsageRoute_SessionCredentialAcceptedUnderEnforcedGate(t *testing.T) {
+	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.RequireControlToken = true
+		o.ControlToken = testControlToken
+	})
+	defer cleanup()
+
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	plan, limits := quotaPollerFixtureCodex(t, base)
+	d.quota.noteCodexProbe("fixture-codex-account", plan, limits, base)
+	d.sessionDetails.Set(&SessionDetail{SessionID: "sess-live-1"})
+	readTok, ok := d.sessionReadToken("sess-live-1")
+	if !ok || readTok == "" {
+		t.Fatal("no read credential minted for sess-live-1")
+	}
+	if readTok == testControlToken {
+		t.Fatal("read credential must differ from the operator control token")
+	}
+
+	updateAt := agent.ISOTime(base.Add(time.Minute))
+	if got := postSessionUsageAt(t, srv.Addr(), "sess-live-1", readTok, agent.UsageHarnessCodex, quotaUpdateWindows(updateAt, 77)); got != http.StatusOK {
+		t.Fatalf("worker update with its session credential = %d, want 200", got)
+	}
+	// The operator token still opens the same route.
+	if got := postSessionUsageAt(t, srv.Addr(), "sess-live-1", testControlToken, agent.UsageHarnessCodex, quotaUpdateWindows(updateAt, 78)); got != http.StatusOK {
+		t.Fatalf("operator update = %d, want 200", got)
+	}
+
+	// The next composed beat carries the streamed rows merged onto the
+	// probe snapshot: the primary row moved twice (77, then 78) while
+	// the probe's secondary row and login verdict stand.
+	quota := heartbeatQuotaAfterSendNow(t, d)
+	if len(quota) != 1 {
+		t.Fatalf("heartbeat quota = %+v, want the one probed codex account", quota)
+	}
+	byID := map[string]agent.UsageWindow{}
+	for _, w := range quota[0].Limits.Windows {
+		byID[w.ID] = w
+	}
+	if byID["primary"].UsedPercent != 78 {
+		t.Errorf("primary = %+v, want the latest streamed 78", byID["primary"])
+	}
+	if byID["secondary"].UsedPercent != 1 {
+		t.Errorf("secondary = %+v, want the probe's 1 kept", byID["secondary"])
+	}
+	if quota[0].AuthCheck == nil || !quota[0].AuthCheck.OK || quota[0].AuthCheck.CheckedAt != agent.ISOTime(base) {
+		t.Errorf("authCheck = %+v, want the probe's ok:true verdict untouched", quota[0].AuthCheck)
+	}
+}
+
+// TestSessionUsageRoute_RefusesForeignAndMissingCredentials pins the
+// session scope: without a credential, with a wrong bearer, or with
+// another session's read credential, the update is refused before any
+// merge — and the refused POSTs leave the published snapshot exactly
+// as the probe left it. An unknown session id 404s rather than 401s,
+// so the gate never confirms or denies a session it cannot name.
+func TestSessionUsageRoute_RefusesForeignAndMissingCredentials(t *testing.T) {
+	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.RequireControlToken = true
+		o.ControlToken = testControlToken
+	})
+	defer cleanup()
+
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	plan, limits := quotaPollerFixtureCodex(t, base)
+	d.quota.noteCodexProbe("fixture-codex-account", plan, limits, base)
+	d.sessionDetails.Set(&SessionDetail{SessionID: "sess-own"})
+	d.sessionDetails.Set(&SessionDetail{SessionID: "sess-foreign"})
+	ownTok, ok := d.sessionReadToken("sess-own")
+	if !ok || ownTok == "" {
+		t.Fatal("no read credential minted for sess-own")
+	}
+	foreignTok, ok := d.sessionReadToken("sess-foreign")
+	if !ok || foreignTok == "" {
+		t.Fatal("no read credential minted for sess-foreign")
+	}
+
+	update := quotaUpdateWindows(agent.ISOTime(base.Add(time.Minute)), 99)
+	cases := []struct {
+		name    string
+		session string
+		bearer  string
+		want    int
+	}{
+		{"missing credential", "sess-own", "", http.StatusUnauthorized},
+		{"wrong bearer", "sess-own", "wrong-bearer", http.StatusUnauthorized},
+		{"foreign session credential", "sess-own", foreignTok, http.StatusUnauthorized},
+		{"unknown session", "sess-missing", ownTok, http.StatusNotFound},
+		{"unknown session without credential", "sess-missing", "", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		if got := postSessionUsageAt(t, srv.Addr(), tc.session, tc.bearer, agent.UsageHarnessCodex, update); got != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+
+	// None of the refused POSTs merged: the snapshot still carries the
+	// probe's rows with the login verdict stamped at the probe time.
+	snapshot := d.quotaSnapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("snapshot = %+v, want the one probed codex account", snapshot)
+	}
+	for _, w := range snapshot[0].Limits.Windows {
+		if w.ID == "primary" && w.UsedPercent == 99 {
+			t.Errorf("refused update merged: primary = %+v", w)
+		}
+	}
+	if snapshot[0].AuthCheck == nil || !snapshot[0].AuthCheck.OK || snapshot[0].AuthCheck.CheckedAt != agent.ISOTime(base) {
+		t.Errorf("authCheck = %+v, want the probe's verdict untouched", snapshot[0].AuthCheck)
 	}
 }
 
