@@ -10,124 +10,185 @@ import (
 )
 
 // TestResolveSpec_DaemonPrivatePaths pins the resolution rules: daemon-
-// private paths resolve loosely (a token minted after the seat starts is
-// covered), sort without repeats, refuse the filesystem root and relative
-// paths, refuse a read path that would re-open one, and refuse a writable
-// root inside one. None of the raw paths leak into refusal details.
+// private paths and directories resolve loosely (a token minted after the
+// seat starts is covered), sort without repeats, refuse the filesystem root
+// and relative paths, and refuse every session path they would narrow. A
+// work area beneath a daemon-private directory — a host state home that
+// holds the per-session worktrees beside the control token — resolves,
+// while the same directory named as a daemon-private path refuses. None of
+// the raw paths leak into refusal details.
 func TestResolveSpec_DaemonPrivatePaths(t *testing.T) {
-	newWorld := func(t *testing.T) (specWorld, func(string) (string, error)) {
-		t.Helper()
-		return newSpecWorld(t), evalSymlinks
-	}
 	t.Run("resolves loose and sorted", func(t *testing.T) {
-		w, canonical := newWorld(t)
+		w := newSpecWorld(t)
 		spec := w.spec()
-		absent := filepath.Join(w.stateHome, "daemon-state", "control-token")
-		spec.DeniedPaths = []string{absent, filepath.Dir(absent), absent}
-		resolved, err := resolveSpec(spec, w.guards(), canonical)
+		absent := filepath.Join(w.base, "daemon-state", "control-token")
+		spec.DeniedPaths = []string{absent, filepath.Join(w.base, "daemon-state", "a-secret"), absent}
+		spec.DeniedListings = []string{filepath.Dir(absent), filepath.Dir(absent)}
+		resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
 		if err != nil {
 			t.Fatalf("resolveSpec: %v", err)
 		}
-		if len(resolved.Denied) != 2 || resolved.Denied[0] != filepath.Dir(absent) || resolved.Denied[1] != absent {
+		if len(resolved.Denied) != 2 || resolved.Denied[0] != filepath.Join(w.base, "daemon-state", "a-secret") || resolved.Denied[1] != absent {
 			t.Fatalf("denied = %v", resolved.Denied)
 		}
-		if len(resolved.Pins) == 0 {
-			t.Error("no ancestor pins for the daemon-private paths")
+		if len(resolved.DeniedListings) != 1 || resolved.DeniedListings[0] != filepath.Dir(absent) {
+			t.Fatalf("denied listings = %v", resolved.DeniedListings)
 		}
 	})
-	t.Run("refusals", func(t *testing.T) {
-		w, canonical := newWorld(t)
-		for _, tc := range []struct {
-			name  string
-			paths []string
-		}{
-			{"relative", []string{"control-token"}},
-			{"filesystem root", []string{"/"}},
-		} {
-			spec := w.spec()
-			spec.DeniedPaths = tc.paths
-			if _, err := resolveSpec(spec, w.guards(), canonical); err == nil {
-				t.Errorf("%s daemon-private path was accepted", tc.name)
-			}
+	t.Run("a work area beneath a daemon-private directory resolves", func(t *testing.T) {
+		// newSpecWorld keeps the workarea under the state home, the way
+		// a host keeps its per-session worktrees there.
+		w := newSpecWorld(t)
+		spec := w.spec()
+		spec.DeniedPaths = []string{filepath.Join(w.stateHome, "control-token")}
+		spec.DeniedListings = []string{w.stateHome}
+		resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
+		if err != nil {
+			t.Fatalf("a work area beneath the token's directory: %v", err)
+		}
+		if len(resolved.DeniedListings) != 1 || resolved.DeniedListings[0] != w.stateHome {
+			t.Fatalf("denied listings = %v", resolved.DeniedListings)
+		}
+		readScoped := spec
+		readScoped.ReadScope = agent.FileReadWorkarea
+		if _, err := resolveSpec(readScoped, w.guards(), evalSymlinks); err != nil {
+			t.Fatalf("the same under the read scope: %v", err)
 		}
 	})
-	t.Run("a read path covering one is refused", func(t *testing.T) {
-		w, canonical := newWorld(t)
+	world := func(t *testing.T) (specWorld, string) {
+		t.Helper()
+		w := newSpecWorld(t)
 		dir := filepath.Join(w.base, "daemon-state")
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatal(err)
 		}
+		return w, dir
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(w specWorld, dir string, spec *Spec)
+	}{
+		{"a relative daemon-private path", func(_ specWorld, _ string, s *Spec) { s.DeniedPaths = []string{"control-token"} }},
+		{"the filesystem root as a daemon-private path", func(_ specWorld, _ string, s *Spec) { s.DeniedPaths = []string{"/"} }},
+		{"a relative daemon-private directory", func(_ specWorld, _ string, s *Spec) { s.DeniedListings = []string{"daemon-state"} }},
+		{"the filesystem root as a daemon-private directory", func(_ specWorld, _ string, s *Spec) { s.DeniedListings = []string{"/"} }},
+		{"the work area's own directory as a daemon-private path", func(w specWorld, _ string, s *Spec) { s.DeniedPaths = []string{w.stateHome} }},
+		{"the workarea root as a daemon-private directory", func(w specWorld, _ string, s *Spec) { s.DeniedListings = []string{w.ws} }},
+		{"a writable root inside a daemon-private path", func(w specWorld, _ string, s *Spec) {
+			s.DeniedPaths = []string{w.state}
+		}},
+		{"a writable root that is a daemon-private directory", func(w specWorld, _ string, s *Spec) {
+			s.DeniedListings = []string{w.tmp}
+		}},
+		{"a read-only leaf inside a daemon-private path", func(w specWorld, _ string, s *Spec) {
+			s.DeniedPaths = []string{w.ro}
+		}},
+		{"a read path covering a daemon-private path", func(_ specWorld, dir string, s *Spec) {
+			s.ReadScope = agent.FileReadWorkarea
+			s.DeniedPaths = []string{filepath.Join(dir, "control-token")}
+			s.ReadPaths = []string{dir}
+		}},
+		{"a read path inside a daemon-private path", func(_ specWorld, dir string, s *Spec) {
+			s.ReadScope = agent.FileReadWorkarea
+			s.DeniedPaths = []string{dir}
+			s.ReadPaths = []string{filepath.Join(dir, "sub")}
+		}},
+		{"a read path that is a daemon-private directory", func(_ specWorld, dir string, s *Spec) {
+			s.ReadScope = agent.FileReadWorkarea
+			s.DeniedListings = []string{dir}
+			s.ReadPaths = []string{dir}
+		}},
+		{"a read path covering a daemon-private directory", func(_ specWorld, dir string, s *Spec) {
+			s.ReadScope = agent.FileReadWorkarea
+			s.DeniedListings = []string{filepath.Join(dir, "sub")}
+			s.ReadPaths = []string{dir}
+		}},
+	} {
+		t.Run(tc.name+" is refused", func(t *testing.T) {
+			w, dir := world(t)
+			spec := w.spec()
+			tc.edit(w, dir, &spec)
+			_, err := resolveSpec(spec, w.guards(), evalSymlinks)
+			if reason, _ := ReasonOf(err); reason != ReasonWritableSetUnrepresentable {
+				t.Fatalf("err=%v, want writable_set_unrepresentable", err)
+			}
+			if strings.Contains(err.Error(), w.base) {
+				t.Fatalf("refusal detail carries a path: %v", err)
+			}
+		})
+	}
+	t.Run("a daemon-private path nested inside the writable set stays denied and pinned", func(t *testing.T) {
+		w := newSpecWorld(t)
+		nested := filepath.Join(w.mut, "daemon-state", "control-token")
 		spec := w.spec()
-		spec.ReadScope = agent.FileReadWorkarea
-		spec.DeniedPaths = []string{filepath.Join(dir, "control-token")}
-		spec.ReadPaths = []string{dir}
-		_, err := resolveSpec(spec, w.guards(), canonical)
-		if reason, _ := ReasonOf(err); reason != ReasonWritableSetUnrepresentable {
-			t.Fatalf("a read path over a daemon-private path: err=%v, want writable_set_unrepresentable", err)
+		spec.DeniedPaths = []string{nested}
+		spec.DeniedListings = []string{filepath.Dir(nested)}
+		resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
+		if err != nil {
+			t.Fatalf("resolveSpec: %v", err)
 		}
-	})
-	t.Run("a writable root inside one is refused", func(t *testing.T) {
-		w, canonical := newWorld(t)
-		dir := filepath.Join(w.mut, "daemon-state")
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatal(err)
+		pinned := false
+		for _, pin := range resolved.Pins {
+			if pin == filepath.Dir(nested) {
+				pinned = true
+			}
 		}
-		spec := w.spec()
-		spec.DeniedPaths = []string{dir}
-		spec.HarnessState = append(spec.HarnessState, dir)
-		_, err := resolveSpec(spec, w.guards(), canonical)
-		if reason, _ := ReasonOf(err); reason != ReasonWritableSetUnrepresentable {
-			t.Fatalf("a writable root inside a daemon-private path: err=%v, want writable_set_unrepresentable", err)
+		if !pinned {
+			t.Fatalf("pins %v lack the nested daemon-private directory", resolved.Pins)
 		}
 	})
 }
 
-// TestRenderSeatbelt_DaemonPrivatePathsDenied pins the profile order: the
-// daemon-private read deny renders after the runtime allows and before the
-// session allowlist (so it wins over the carve-outs but never over the
-// session — a session path covering one is refused at resolve time), and
-// the write deny renders after the writable allows.
+// TestRenderSeatbelt_DaemonPrivatePathsDenied pins the profile shape in
+// every read scope: the daemon-private paths are denied every read
+// operation, named one by one (a file-read* wildcard would lose to the read
+// scope's file-read-data allow), by subpath, and the daemon-private
+// directories their listing
+// by literal, open reads included; under the read scope both come after the
+// session's read allowlist, so they win inside it; and the daemon-private
+// paths are denied writes after the writable allows.
 func TestRenderSeatbelt_DaemonPrivatePathsDenied(t *testing.T) {
-	w := newSpecWorld(t)
-	tokenDir := filepath.Join(w.base, "daemon-state")
-	spec := w.spec()
-	spec.DeniedPaths = []string{filepath.Join(tokenDir, "control-token"), tokenDir}
-	spec.ReadScope = agent.FileReadWorkarea
-	resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
-	if err != nil {
-		t.Fatalf("resolveSpec: %v", err)
-	}
-	text, err := renderSeatbelt(resolved, seatbeltHost{shared: []string{"/tmp"}}, nil, evalSymlinks)
-	if err != nil {
-		t.Fatalf("renderSeatbelt: %v", err)
-	}
-	order := []string{
-		`(subpath "/opt/homebrew")`,
-		`(subpath "` + tokenDir + `")`,
-	}
-	_ = order
-	last := -1
-	for _, needle := range []string{
-		"(deny file-read-data file-read-xattr)\n",
-		`(subpath "/opt/homebrew")`,
-		`(subpath "` + tokenDir + `")`,
-		"(allow file-read-data file-read-xattr\n  (subpath ",
-		"(deny file-write*)\n(deny file-link)",
-		`(subpath "` + tokenDir + `")`,
-	} {
-		at := strings.Index(text[last+1:], needle)
-		if at < 0 {
-			t.Fatalf("profile lacks %q after offset %d:\n%s", needle, last, text)
-		}
-		last += 1 + at
-	}
-	// The session allowlist holds no daemon-private path.
-	allow := resolved.ReadAllowlist()
-	for _, path := range allow {
-		for _, denied := range resolved.Denied {
-			if insideOrEqual(denied, path) || insideOrEqual(path, denied) {
-				t.Fatalf("read allowlist %q overlaps daemon-private %q", path, denied)
+	for _, scope := range []agent.ExecutionSecurityLevel{"", agent.FileReadWorkarea} {
+		t.Run("scope="+string(scope), func(t *testing.T) {
+			w := newSpecWorld(t)
+			token := filepath.Join(w.stateHome, "control-token")
+			spec := w.spec()
+			spec.DeniedPaths = []string{token}
+			spec.DeniedListings = []string{w.stateHome}
+			spec.ReadScope = scope
+			resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
+			if err != nil {
+				t.Fatalf("resolveSpec: %v", err)
 			}
-		}
+			text, err := renderSeatbelt(resolved, seatbeltHost{shared: []string{"/tmp"}}, nil, evalSymlinks)
+			if err != nil {
+				t.Fatalf("renderSeatbelt: %v", err)
+			}
+			readDeny := "(deny file-read-data file-read-metadata file-read-xattr\n  (subpath \"" + token + "\"))\n"
+			listingDeny := "(deny file-read-data file-read-xattr\n  (literal \"" + w.stateHome + "\"))\n"
+			order := []string{"(allow default)\n"}
+			if scope != "" {
+				order = append(order, "(deny file-read-data file-read-xattr)\n", "(allow file-read-data file-read-xattr\n  (subpath ")
+			}
+			order = append(order,
+				readDeny,
+				listingDeny,
+				"(deny file-write*)\n(deny file-link)",
+				"(allow file-write*\n",
+				"(deny file-write*\n",
+				`(subpath "`+token+`")`,
+			)
+			last := -1
+			for _, needle := range order {
+				at := strings.Index(text[last+1:], needle)
+				if at < 0 {
+					t.Fatalf("profile lacks %q after offset %d:\n%s", needle, last, text)
+				}
+				last += 1 + at
+			}
+			if strings.Count(text, readDeny) != 1 || strings.Count(text, listingDeny) != 1 {
+				t.Fatalf("the daemon-private read denies render other than once:\n%s", text)
+			}
+		})
 	}
 }
