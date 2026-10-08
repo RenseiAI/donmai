@@ -7,8 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -121,8 +124,9 @@ func bindTargets(args []string) [][3]string {
 // binds of the OS userland and the host directories, the declared sockets,
 // the device tree, the writable set over them, the write denies bound
 // read-only over themselves after the allows so narrower rules win, and
-// the self-mark last. It never unshares the pid namespace: the harness
-// stays supervised under the outer launcher pid. A write deny stays
+// the self-mark last. The process namespace is private, so no process
+// outside the boundary is visible, and the outer launcher pid stays the
+// one the supervisor signals. A write deny stays
 // readable: the protected artifact inside harness state and the read-only
 // leaf are bound read-only over themselves, never replaced by an empty
 // placeholder, and the workarea root itself is never mounted.
@@ -171,8 +175,25 @@ func TestRenderBubblewrap_BindOrder(t *testing.T) {
 			t.Fatalf("rendering mounts the workarea root %q, burying or opening the leaves:\n%s", w.ws, text)
 		}
 	}
-	if strings.Contains(text, "--unshare-pid") || strings.Contains(text, "--unshare-net") {
-		t.Fatalf("rendering unshares the pid or network namespace; the harness must stay supervised and keep its egress:\n%s", text)
+	// A private process namespace (D3.1) and, for a headless session, a
+	// session of its own; never a private network namespace, which would
+	// strand the declared loopback ports and the external network.
+	for _, flag := range []string{"--unshare-pid", "--new-session"} {
+		if !strings.Contains(text, "\n"+flag+"\n") {
+			t.Fatalf("headless rendering lacks %s:\n%s", flag, text)
+		}
+	}
+	if strings.Contains(text, "--unshare-net") {
+		t.Fatalf("rendering unshares the network namespace; the harness must keep its egress:\n%s", text)
+	}
+	// An interactive session keeps the PTY host's session: the harness
+	// takes its terminal's foreground (the stage), which a new session
+	// would leave it without.
+	interactive := w.resolved()
+	interactive.SessionMode = agent.PromptModeHumanControlled
+	itext := joinArgs(mustRenderBubblewrap(t, interactive, nil))
+	if !strings.Contains(itext, "\n--unshare-pid\n") || strings.Contains(itext, "\n--new-session\n") {
+		t.Fatalf("interactive rendering must unshare the pid namespace and keep the session:\n%s", itext)
 	}
 	if strings.Contains(text, "--ro-bind\n/proc\n/proc") || strings.Contains(text, "--ro-bind\n/sys\n/sys") {
 		t.Fatalf("rendering binds the host /proc or /sys; use the fresh mounts:\n%s", text)
@@ -1173,16 +1194,24 @@ func TestCheck_ProbesTheLauncher(t *testing.T) {
 }
 
 // TestLandlockRuleset_HandlesNoNetwork pins the stage's handled rights at
-// every Landlock ABI: the filesystem rights that ABI knows, and no network
-// right and no scope, ever. Handling TCP connects with only declared-port
-// allow rules would deny every connect to an undeclared port on any
-// address, remote endpoints included, because a port rule carries no
-// address. restrictLandlockFull creates exactly this ruleset.
+// every Landlock ABI: the filesystem rights that ABI knows, the signal and
+// abstract-socket scopes from ABI 6, and no network right, ever. Handling
+// TCP connects with only declared-port allow rules would deny every
+// connect to an undeclared port on any address, remote endpoints included,
+// because a port rule carries no address. restrictLandlockFull creates
+// exactly this ruleset.
 func TestLandlockRuleset_HandlesNoNetwork(t *testing.T) {
 	for abi := 1; abi <= 8; abi++ {
 		attr := landlockRuleset(abi)
-		if attr.Access_net != 0 || attr.Scoped != 0 {
-			t.Fatalf("ABI %d ruleset handles network %#x and scope %#x; want neither", abi, attr.Access_net, attr.Scoped)
+		if attr.Access_net != 0 {
+			t.Fatalf("ABI %d ruleset handles network %#x; want none", abi, attr.Access_net)
+		}
+		wantScope := uint64(0)
+		if abi >= 6 {
+			wantScope = unix.LANDLOCK_SCOPE_SIGNAL | unix.LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+		}
+		if attr.Scoped != wantScope {
+			t.Fatalf("ABI %d ruleset scopes %#x, want %#x", abi, attr.Scoped, wantScope)
 		}
 		want := uint64(landlockHandledFS)
 		if abi < 3 {
@@ -1191,6 +1220,72 @@ func TestLandlockRuleset_HandlesNoNetwork(t *testing.T) {
 		if attr.Access_fs != want {
 			t.Fatalf("ABI %d ruleset handles filesystem rights %#x, want %#x", abi, attr.Access_fs, want)
 		}
+	}
+}
+
+// TestLandlockStage_ScopesSignalsAndAbstractSockets proves the scopes live
+// at the stage alone, without the process namespace that hides outside
+// processes in a full boundary: the test binary re-executes itself through
+// the real stage dispatcher and, from inside, signals a decoy outside its
+// Landlock domain, attaches to it, and connects to an abstract socket
+// created outside. Each refuses. The control runs the same checks without
+// the stage, where each goes through, so a refusal means the ruleset held
+// it. It needs Landlock ABI 6, and reports a skip on an older kernel.
+func TestLandlockStage_ScopesSignalsAndAbstractSockets(t *testing.T) {
+	if abi := landlockABI(); abi < landlockScopeABI {
+		t.Skipf("Landlock ABI %d on this kernel; the scopes need %d", abi, landlockScopeABI)
+	}
+	steps := func(pid int, abstract string) []seatCheckStep {
+		return []seatCheckStep{
+			{ID: "signal", Op: "signal", Target: strconv.Itoa(pid)},
+			{ID: "abstract", Op: "dial_abstract", Target: abstract},
+			{ID: "attach", Op: "ptrace", Target: strconv.Itoa(pid)},
+		}
+	}
+	run := func(staged bool) (map[string]seatCheckResult, string, *countingListener) {
+		marker := filepath.Join(shortTempDir(t, "dcm"), "signalled")
+		pid := startTestDecoy(t, marker)
+		abstract := newAbstractListener(t)
+		work := shortTempDir(t, "dcl")
+		policy := &landlockPolicy{writeRoots: []string{work}, dev: true}
+		for _, path := range mountNamespaceRuntimeBinds {
+			if _, err := os.Lstat(path); err == nil {
+				policy.readRoots = append(policy.readRoots, path)
+			}
+		}
+		results := runSeatCheck(t, work, steps(pid, abstract.name), func(self, planPath string) (string, error) {
+			args := []string{"-test.run=^$"}
+			env := append(os.Environ(), seatCheckEnv+"="+planPath)
+			if staged {
+				args = append([]string{"stage", "--", self}, args...)
+				env = append(env, landlockStageEnv+"="+policy.describe())
+			}
+			cmd := exec.Command(self, args...) //nolint:gosec // G204: the test binary re-executed, through the stage or not.
+			cmd.Env = env
+			out, err := cmd.CombinedOutput()
+			return string(out), err
+		})
+		return results, marker, abstract.counter
+	}
+	open, marker, accepts := run(false)
+	for _, id := range []string{"signal", "abstract", "attach"} {
+		if res := open[id]; res.Err != "" {
+			t.Fatalf("control without the stage: %s refused (%s); the decoy must be reachable for the staged refusal to mean anything", id, res.Err)
+		}
+	}
+	if !waitExists(marker) || !accepts.reached() {
+		t.Fatal("control without the stage: the decoy was not signalled or the abstract socket not reached")
+	}
+	staged, marker, accepts := run(true)
+	for _, id := range []string{"signal", "abstract", "attach"} {
+		if res := staged[id]; res.Err == "" {
+			t.Errorf("%s from inside the stage went through; the Landlock scope must refuse it", id)
+		} else {
+			t.Logf("%s refused inside the stage: %s", id, res.Err)
+		}
+	}
+	if exists(marker) || accepts.accepted() > 0 {
+		t.Fatalf("an effect crossed the stage: signalled=%v abstract accepts=%d", exists(marker), accepts.accepted())
 	}
 }
 

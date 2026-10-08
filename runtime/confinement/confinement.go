@@ -47,8 +47,12 @@ var classOrder = map[WritableClass]int{
 // every earlier self-test record stale. v4 adds the read-scope pass; v5 adds
 // the terminal, package data tree and extended attribute read probes; v6
 // adds the protected-path read probes and a declared read path that is one
-// file in the operator home.
-const ProbeSetVersion = "executor-confinement-probes-v6"
+// file in the operator home; v7 gives Linux its own widening probes (a decoy
+// process to signal, attach to and read, a nested boundary, a nested
+// remount over the read-only leaf, an abstract socket, the per-user bus and
+// service manager), records the probes a host cannot run, and marks the
+// probes the host itself refuses.
+const ProbeSetVersion = "executor-confinement-probes-v7"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the

@@ -22,7 +22,7 @@ import (
 // implementation version. It is part of the backend version, so a self-test
 // record taken under an older launcher, mount-tree shape or Landlock stage
 // is stale.
-const mountNamespaceProfileVersion = "mount-namespace-v4"
+const mountNamespaceProfileVersion = "mount-namespace-v5"
 
 // DefaultBackend returns the confinement backend for the running OS: the
 // Linux mount-namespace backend here.
@@ -122,15 +122,30 @@ func insideMountNamespace() bool {
 // cannot tell.
 const mountNamespaceMarkEnv = "DONMAI_MOUNT_NAMESPACE"
 
-// mountNamespaceFlags open every boundary: a fresh user and mount namespace
-// per command, torn down with the command, in its own session so the
-// harness cannot push input into a terminal outside. The process tree
-// stays visible (no pid namespace: the harness is supervised, and
-// OnProcessSpawned reports the outer launcher pid, which stays the parent
-// the supervisor signals), and the network namespace stays shared (see
-// leavesLoopbackEgressOpen). The capability probe opens with the same
-// flags, so it exercises exactly what a spawn needs.
-var mountNamespaceFlags = []string{"--unshare-user", "--die-with-parent", "--new-session"}
+// mountNamespaceFlags open every boundary: a fresh user, mount and process
+// namespace per command, torn down with the command. In the private
+// process namespace the launcher runs an init that reaps orphans, and no
+// process outside the boundary is visible to signal, attach to or read
+// (ADR-2026-10-03 D3.1). The launcher pid the supervisor holds stays
+// outside, and killing it kills the namespace's init, which takes every
+// process inside with it, descendants that left the session included. The
+// network namespace stays shared (see leavesLoopbackEgressOpen).
+var mountNamespaceFlags = []string{"--unshare-user", "--unshare-pid", "--die-with-parent"}
+
+// sessionFlags are the namespace flags for one session mode. A headless
+// harness runs in a session of its own, so it cannot push input into a
+// terminal outside. An interactive harness keeps the session the PTY host
+// gave the launcher: that terminal is the session's own, and the harness
+// needs it as its controlling terminal for job control and Ctrl-C (the
+// stage makes the harness its foreground process group; see
+// takeForeground).
+func sessionFlags(mode agent.PromptSessionMode) []string {
+	flags := append([]string{}, mountNamespaceFlags...)
+	if mode != agent.PromptModeHumanControlled {
+		flags = append(flags, "--new-session")
+	}
+	return flags
+}
 
 // launcherProbeTargets are the fixed executables the capability probe runs
 // inside its boundary: the first that exists is used. Both are constants,
@@ -182,7 +197,7 @@ func probeLauncher(launcher string) error {
 
 // launcherProbeArgs renders the capability probe's boundary around target.
 func launcherProbeArgs(target string) []string {
-	args := append([]string{}, mountNamespaceFlags...)
+	args := sessionFlags(agent.PromptModeAutonomous)
 	args = append(args, "--tmpfs", "/")
 	for _, path := range mountNamespaceRuntimeBinds {
 		if _, err := os.Lstat(path); err == nil {
@@ -477,6 +492,8 @@ var mountNamespaceResolverBinds = []string{
 //     one seam a further read-and-write deny list plugs into);
 //  8. the boundary marker.
 //
+// The namespace flags open it (sessionFlags): private user, mount and
+// process namespaces, and a session of its own for a headless harness.
 // Any rule the mount tree cannot express refuses the whole rendering; none
 // is dropped. The harness process re-executed as the Landlock stage (see
 // stage_linux.go) programs the Landlock policy from inside the mount tree
@@ -495,7 +512,7 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 		return nil, refuse(ReasonWritableSetUnrepresentable, "unknown read scope %q", r.ReadScope)
 	}
 	t := &mountTree{writable: r.Writable}
-	t.add(mountNamespaceFlags...)
+	t.add(sessionFlags(r.SessionMode)...)
 	t.add("--tmpfs", "/")
 	for _, path := range mountNamespaceRuntimeBinds {
 		t.reveal(path)
@@ -544,7 +561,10 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	// The Landlock stage grants open on this private /dev; nothing else
 	// there exists to open.
 	t.add("--tmpfs", "/dev")
-	for _, path := range []string{"/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"} {
+	// /dev/tty names the opener's own controlling terminal: an
+	// interactive harness reaches its session's terminal through it, and a
+	// headless one, which has none, gets ENXIO.
+	for _, path := range []string{"/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", "/dev/tty"} {
 		if _, err := os.Lstat(path); err == nil {
 			t.add("--dev-bind", path, path)
 		}
@@ -627,6 +647,13 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 // the one seam a further deny list that must win on read as well as on
 // write (secrets a seat may neither read nor change) plugs into: its paths
 // join this list and render the same way, after every allow.
+//
+// A path must exist at spawn to be hidden: a placeholder needs something
+// to mount over, and creating one would write into the host. A path minted
+// later under a read-only bind is created by the host alone, and one minted
+// inside the writable set by the seat; a deny list that must cover a
+// secret not yet minted names the directory it will be minted in, which
+// hides everything later created there.
 func hideDenies(composer mountComposerPlan) []string {
 	return append([]string(nil), composer.hideDenies...)
 }

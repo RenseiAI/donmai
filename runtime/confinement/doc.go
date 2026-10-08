@@ -93,6 +93,29 @@
 // allows the namespace but denies the mounts refuses with
 // namespace_unavailable instead of failing every spawn.
 //
+// The boundary runs in private user, mount and process namespaces: the
+// launcher's init reaps orphans inside, no process outside is visible to
+// signal, attach to or read, and killing the launcher kills every process
+// inside. An interactive harness keeps its PTY's session and becomes the
+// terminal's foreground group, so Ctrl-C and job control reach it; a
+// headless one runs in a session of its own. From Landlock ABI 6 the stage
+// also scopes signals and abstract unix sockets to its domain; below it,
+// abstract sockets outside stay reachable, and the self-test records that
+// as kernel_unsupported instead of passing it.
+//
+// The Linux self-test runs its own widening probes, each judged by its
+// effect outside: a decoy process signalled, attached to and read, a
+// nested boundary, a nested-namespace remount over the read-only leaf, an
+// abstract socket, and the per-user bus and service manager where they
+// answer. The macOS probes whose services Linux lacks are recorded as not
+// probed (NotProbed), never counted as held, and a probe the host itself
+// refuses (a rename across filesystems) is marked HeldBy. With the backend
+// replaced by nothing, every other refusal probe fails.
+//
+// A hide deny must name a path that exists at spawn: a placeholder needs
+// something to mount over. A deny list for a secret not yet minted names
+// the directory it will be minted in.
+//
 // The Linux backend leaves outbound TCP unfiltered and declares it
 // (loopback egress open): Landlock port rules carry no address, so
 // filtering connects by port would cut every undeclared port on every

@@ -8,3 +8,10 @@ package confinement
 func RunLandlockStageFromEnv() (handled bool, exitCode int) {
 	return false, 0
 }
+
+// abstractSocketsScoped reports whether abstract unix sockets outside the
+// boundary are closed: they are a Linux feature, and no other backend has
+// them to close.
+func abstractSocketsScoped() (bool, string) {
+	return false, "abstract unix sockets are a Linux feature"
+}

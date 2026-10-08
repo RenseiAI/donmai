@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -59,6 +60,10 @@ type harnessStep struct {
 	effect func(stepResult) bool
 	// setupErr marks a probe the fixture could not prepare; it fails.
 	setupErr string
+	// heldBy names what other than the boundary refuses this probe on this
+	// host (a rename across filesystems), so the record never counts it as
+	// held by the backend. Empty: only the boundary can refuse it.
+	heldBy string
 }
 
 // fixture is one session mode's probe world: a workarea with a mutable and a
@@ -91,6 +96,11 @@ type fixture struct {
 	// loopbackOpen is whether the backend under test declares outbound
 	// TCP to the local machine open on undeclared ports.
 	loopbackOpen bool
+	// probeCommand starts the probe executable; the Linux widening probes
+	// run it outside the boundary as their decoy.
+	probeCommand []string
+	// notProbed are the probes of the set this host cannot run, and why.
+	notProbed []NotProbed
 }
 
 // move is one directory rename probe: from is where the directory belongs.
@@ -105,14 +115,18 @@ type fixtureHost struct {
 	diskImage       string
 	diskImageErr    error
 	loopbackOpen    bool
+	probeCommand    []string
 }
 
 func newFixture(dir string, mode agent.PromptSessionMode, host fixtureHost) (fx *fixture, err error) {
 	home, stateHome := host.home, host.stateHome
-	fx = &fixture{dir: dir, tag: randomSuffix(), loopbackOpen: host.loopbackOpen}
+	built := &fixture{dir: dir, tag: randomSuffix(), loopbackOpen: host.loopbackOpen, probeCommand: host.probeCommand}
+	fx = built
 	defer func() {
+		// A failed build returns no fixture; what it already started (a
+		// listener, a decoy process) is still released.
 		if err != nil {
-			fx.cleanup()
+			built.cleanup()
 		}
 	}()
 	fx.ws = filepath.Join(dir, "ws")
@@ -267,6 +281,22 @@ func (fx *fixture) readSpec(mode agent.PromptSessionMode) Spec {
 
 func (fx *fixture) add(class string, expectAccepted bool, step probeStep, effect func(stepResult) bool) {
 	fx.steps = append(fx.steps, harnessStep{probe: step, class: class, expectAccepted: expectAccepted, effect: effect})
+}
+
+// markCrossDevice records, on the probe just added, that the host itself
+// refuses it when a and b sit on different filesystems: a rename never
+// crosses one, boundary or not.
+func (fx *fixture) markCrossDevice(a, b string) {
+	var sa, sb unix.Stat_t
+	if unix.Stat(a, &sa) != nil || unix.Stat(b, &sb) != nil || sa.Dev == sb.Dev {
+		return
+	}
+	fx.steps[len(fx.steps)-1].heldBy = heldByCrossDevice
+}
+
+// notProbe records a probe of the set this host cannot run.
+func (fx *fixture) notProbe(id string, reason NotProbedReason, detail string) {
+	fx.notProbed = append(fx.notProbed, NotProbed{ID: id, Reason: reason, Detail: detail})
 }
 
 func (fx *fixture) addRead(class string, expectAccepted bool, step probeStep, effect func(stepResult) bool) {
@@ -570,12 +600,14 @@ func (fx *fixture) outside(id, base, dir string) error {
 	stolen := filepath.Join(fx.mut, "stolen-"+id)
 	fx.add(classOutside, false, probeStep{ID: prefix + ".rename_out", Op: opRename, Path: source, Path2: stolen},
 		func(stepResult) bool { return !exists(source) || exists(stolen) })
+	fx.markCrossDevice(dir, fx.mut)
 	plant := filepath.Join(fx.mut, "plant-"+id)
 	if err := seed(plant); err != nil {
 		return err
 	}
 	planted := filepath.Join(dir, "planted")
 	fx.add(classOutside, false, probeStep{ID: prefix + ".rename_in", Op: opRename, Path: plant, Path2: planted}, existsEffect(planted))
+	fx.markCrossDevice(dir, fx.mut)
 	return nil
 }
 
@@ -611,10 +643,14 @@ func (fx *fixture) readOnly(diskImage string, diskImageErr error) error {
 	fx.add(classReadOnly, false, probeStep{ID: "ro.hardlink_from_mutable", Op: opLink, Path: at("ln"), Path2: hardlink}, existsEffect(hardlink))
 	fx.add(classReadOnly, false, probeStep{ID: "ro.symlink_write_from_mutable", Op: opSymlinkWrite, Path: at("sw"), Path2: filepath.Join(fx.mut, "ro-symlink")}, changedEffect(at("sw")))
 	fx.add(classReadOnly, false, probeStep{ID: "ro.chmod_leaf", Op: opChmod, Path: fx.ro}, modeEffect(fx.ro, 0o755))
-	// The mount probe needs the macOS disk image tool: off darwin no image
-	// exists, the step would carry a setup error, and the self-test would
-	// fail for want of a tool, not of a boundary.
-	if runtime.GOOS == "darwin" {
+	// The mount probe takes the platform's own route to a mount over the
+	// second read-only leaf. On macOS an unprivileged process attaches a
+	// disk image. On Linux the only route is a nested user and mount
+	// namespace, where the probe remounts the leaf read-write and creates a
+	// file through it: the boundary's mounts are locked there, and the
+	// file must never reach the host.
+	switch runtime.GOOS {
+	case "darwin":
 		mount := harnessStep{
 			probe:  probeStep{ID: "ro.mount_over", Op: opMount, Path: fx.rom, Path2: diskImage},
 			class:  classReadOnly,
@@ -624,6 +660,9 @@ func (fx *fixture) readOnly(diskImage string, diskImageErr error) error {
 			mount.setupErr = "fixture: disk image: " + errnoText(diskImageErr)
 		}
 		fx.steps = append(fx.steps, mount)
+	case "linux":
+		through := filepath.Join(fx.rom, "remounted")
+		fx.add(classReadOnly, false, probeStep{ID: "ro.mount_over", Op: opNestedRemount, Path: fx.rom, Path2: through}, existsEffect(through))
 	}
 	fx.cleanups = append(fx.cleanups, fx.detach)
 	return nil
@@ -678,46 +717,16 @@ func (fx *fixture) protected() error {
 // outside, connecting to a socket outside, dialing loopback TCP, and
 // reaching the pasteboard.
 func (fx *fixture) widening(shared []string) error {
-	reenter := filepath.Join(fx.out, "reenter")
-	fx.add(classWidening, false, probeStep{ID: "widen.reenter_backend", Op: opReenter, Path: reenter}, existsEffect(reenter))
-
-	job := filepath.Join(fx.out, "job")
-	label := "dev.donmai.confinement.selftest." + fx.tag
-	fx.cleanups = append(fx.cleanups, func() { _ = exec.Command("/bin/launchctl", "remove", label).Run() }) //nolint:gosec // G204: fixed tool, generated label.
-	fx.add(classWidening, false, probeStep{ID: "widen.job_launcher", Op: opJobSubmit, Label: label, Path: job},
-		func(res stepResult) bool { return res.Exit == 0 || waitExists(job) })
-
-	domain := "dev.donmai.confinement.selftest." + fx.tag
-	fx.cleanups = append(fx.cleanups, func() { removePreferenceDomain(domain) })
-	fx.add(classWidening, false, probeStep{ID: "widen.preferences_write", Op: opPrefWrite, Label: domain},
-		func(res stepResult) bool {
-			return res.Exit == 0 || exec.Command("/usr/bin/defaults", "read", domain, "probe").Run() == nil //nolint:gosec // G204: fixed tool, generated domain.
-		})
-
-	app := filepath.Join(fx.out, "app")
-	bundle, err := writeProbeApp(filepath.Join(fx.dir, "app"), app)
-	if err != nil {
-		return err
+	switch runtime.GOOS {
+	case "darwin":
+		if err := fx.wideningDarwin(); err != nil {
+			return err
+		}
+	case "linux":
+		if err := fx.wideningLinux(); err != nil {
+			return err
+		}
 	}
-	fx.add(classWidening, false, probeStep{ID: "widen.open_application", Op: opAppOpen, Path: app, Path2: bundle},
-		func(res stepResult) bool { return res.Exit == 0 || waitExists(app) })
-
-	for _, deny := range seatbeltLookupDenies {
-		services := deny.services
-		fx.add(classWidening, false, probeStep{ID: "widen.service_lookup." + deny.class, Op: opLookup, Services: services},
-			func(res stepResult) bool {
-				for _, service := range services {
-					if code, ok := res.Lookups[service]; ok && code == 0 {
-						return true
-					}
-				}
-				return false
-			})
-	}
-
-	fx.add(classWidening, false, probeStep{ID: "widen.attach_process", Op: opAttach, PID: os.Getpid()},
-		func(res stepResult) bool { return res.Exit == 0 })
-
 	if len(shared) == 0 {
 		return errors.New("confinement: fixture: no shared temporary location")
 	}
@@ -819,6 +828,193 @@ func (fx *fixture) widening(shared []string) error {
 	// dials the undeclared port so a name-resolution bypass fails it.
 	undeclared("loopback_tcp_hostname", "localhost", closedPort)
 	return nil
+}
+
+// wideningDarwin adds the macOS widening probes: re-entering the profile
+// backend, submitting a job to the per-user job launcher, having the
+// preferences daemon write a domain, opening an application, reaching the
+// scripting, launch and mount services, and attaching to a process outside.
+func (fx *fixture) wideningDarwin() error {
+	reenter := filepath.Join(fx.out, "reenter")
+	fx.add(classWidening, false, probeStep{ID: "widen.reenter_backend", Op: opReenter, Path: reenter}, existsEffect(reenter))
+
+	job := filepath.Join(fx.out, "job")
+	label := "dev.donmai.confinement.selftest." + fx.tag
+	fx.cleanups = append(fx.cleanups, func() { _ = exec.Command("/bin/launchctl", "remove", label).Run() }) //nolint:gosec // G204: fixed tool, generated label.
+	fx.add(classWidening, false, probeStep{ID: "widen.job_launcher", Op: opJobSubmit, Label: label, Path: job},
+		func(res stepResult) bool { return res.Exit == 0 || waitExists(job) })
+
+	domain := "dev.donmai.confinement.selftest." + fx.tag
+	fx.cleanups = append(fx.cleanups, func() { removePreferenceDomain(domain) })
+	fx.add(classWidening, false, probeStep{ID: "widen.preferences_write", Op: opPrefWrite, Label: domain},
+		func(res stepResult) bool {
+			return res.Exit == 0 || exec.Command("/usr/bin/defaults", "read", domain, "probe").Run() == nil //nolint:gosec // G204: fixed tool, generated domain.
+		})
+
+	app := filepath.Join(fx.out, "app")
+	bundle, err := writeProbeApp(filepath.Join(fx.dir, "app"), app)
+	if err != nil {
+		return err
+	}
+	fx.add(classWidening, false, probeStep{ID: "widen.open_application", Op: opAppOpen, Path: app, Path2: bundle},
+		func(res stepResult) bool { return res.Exit == 0 || waitExists(app) })
+
+	for _, deny := range seatbeltLookupDenies {
+		services := deny.services
+		fx.add(classWidening, false, probeStep{ID: "widen.service_lookup." + deny.class, Op: opLookup, Services: services},
+			func(res stepResult) bool {
+				for _, service := range services {
+					if code, ok := res.Lookups[service]; ok && code == 0 {
+						return true
+					}
+				}
+				return false
+			})
+	}
+
+	fx.add(classWidening, false, probeStep{ID: "widen.attach_process", Op: opAttach, PID: os.Getpid()},
+		func(res stepResult) bool { return res.Exit == 0 })
+	return nil
+}
+
+// macOSWideningProbes are the macOS widening probes, by the mechanism each
+// reaches through. None of these services exists on Linux; the per-user
+// bus and service manager probes stand in for them there where the host
+// runs one, and the record names each as not probed.
+var macOSWideningProbes = []string{
+	"widen.job_launcher", "widen.preferences_write", "widen.open_application",
+	"widen.service_lookup.mount", "widen.service_lookup.apple_events",
+	"widen.service_lookup.launch_services", "widen.service_lookup.pasteboard",
+}
+
+// wideningLinux adds the Linux widening probes, each aimed at something the
+// fixture placed outside the boundary and judged by its effect there: a
+// decoy process to signal, attach to and read, a nested boundary built from
+// inside, an abstract unix socket, and the per-user bus and service manager
+// where the host runs them. The macOS probes whose services Linux lacks are
+// recorded as not probed, never counted as held.
+func (fx *fixture) wideningLinux() error {
+	for _, id := range macOSWideningProbes {
+		fx.notProbe(id, NotProbedPlatform, "a macOS service; Linux has none to reach")
+	}
+	reported := func(res stepResult) bool { return res.Err == "" }
+
+	// The decoy: the probe executable, outside the boundary, open to
+	// attachment by any process of this user, creating a marker when
+	// signalled.
+	marker := filepath.Join(fx.out, "signalled")
+	pid, decoyErr := fx.startDecoy(marker)
+	// Signal first: an attached decoy would hold the signal in a stop.
+	fx.add(classWidening, false, probeStep{ID: "widen.signal_process", Op: opSignal, PID: pid}, func(stepResult) bool { return waitExists(marker) })
+	fx.add(classWidening, false, probeStep{ID: "widen.read_process", Op: opProcRead, PID: pid}, reported)
+	fx.add(classWidening, false, probeStep{ID: "widen.attach_process", Op: opPtrace, PID: pid}, reported)
+	if decoyErr != nil {
+		// No decoy, nothing to judge: the three probes fail closed, like
+		// the mount probe without its disk image.
+		for i := len(fx.steps) - 3; i < len(fx.steps); i++ {
+			fx.steps[i].setupErr = errnoText(decoyErr)
+		}
+	}
+
+	// A nested boundary binding everything the probe sees must not reach
+	// the output directory the outer boundary hides.
+	reenter := filepath.Join(fx.out, "reenter")
+	launcher, lookErr := exec.LookPath("bwrap")
+	touch := firstExisting("/usr/bin/touch", "/bin/touch")
+	if lookErr != nil || touch == "" {
+		fx.notProbe("widen.reenter_backend", NotProbedHostService, "no bubblewrap or touch on this host to build a nested boundary with")
+	} else {
+		fx.add(classWidening, false, probeStep{ID: "widen.reenter_backend", Op: opNestedBoundary, Path: reenter, Path2: launcher, Label: touch}, existsEffect(reenter))
+	}
+
+	// An abstract unix socket lives in the network namespace the boundary
+	// shares; only the kernel's abstract-socket scope closes it.
+	if scoped, why := abstractSocketsScoped(); !scoped {
+		fx.notProbe("widen.abstract_socket", NotProbedKernel, why)
+	} else {
+		name := "donmai-confinement-" + fx.tag
+		listener, err := net.Listen("unix", "@"+name)
+		if err != nil {
+			return fmt.Errorf("confinement: fixture: abstract socket: %w", err)
+		}
+		fx.cleanups = append(fx.cleanups, func() { _ = listener.Close() })
+		var accepts atomic.Int32
+		go acceptLoop(listener, &accepts)
+		fx.add(classWidening, false, probeStep{ID: "widen.abstract_socket", Op: opDialAbstract, Label: name},
+			func(res stepResult) bool { return res.Err == "" || accepts.Load() > 0 })
+	}
+
+	// The per-user bus and service manager: the Linux counterparts of the
+	// macOS job launcher and services, where this host runs them.
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" {
+		runtimeDir = filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
+	}
+	for _, service := range []struct{ id, path string }{
+		{"widen.user_bus", filepath.Join(runtimeDir, "bus")},
+		{"widen.service_manager", filepath.Join(runtimeDir, "systemd", "private")},
+	} {
+		// Probed only where it answers outside the boundary: a socket file
+		// with no service behind it refuses everyone, so a refusal there
+		// would say nothing about the boundary.
+		info, err := os.Stat(service.path)
+		if err != nil || info.Mode()&fs.ModeSocket == 0 || dial(service.path) != nil {
+			fx.notProbe(service.id, NotProbedHostService, "no per-user "+strings.TrimPrefix(service.id, "widen.")+" answers on this host")
+			continue
+		}
+		fx.add(classWidening, false, probeStep{ID: service.id, Op: opDial, Path: service.path}, reported)
+	}
+	return nil
+}
+
+// startDecoy runs the probe executable outside the boundary as the decoy
+// and returns its pid once it reports ready. Cleanup closes its input and
+// reaps it.
+func (fx *fixture) startDecoy(marker string) (int, error) {
+	if len(fx.probeCommand) == 0 {
+		return 0, errors.New("confinement: fixture: no probe command to run the decoy")
+	}
+	cmd := exec.Command(fx.probeCommand[0], fx.probeCommand[1:]...) //nolint:gosec // G204: the self-test's own probe command.
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if key, _, _ := strings.Cut(kv, "="); key == ProbeEnv || key == landlockStageEnv {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, probeDecoyEnv+"="+marker)
+	cmd.Env = env
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return 0, fmt.Errorf("confinement: fixture: decoy: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, fmt.Errorf("confinement: fixture: decoy: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("confinement: fixture: decoy: %w", err)
+	}
+	fx.cleanups = append(fx.cleanups, func() {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	ready := make([]byte, len("ready\n"))
+	if _, err := io.ReadFull(stdout, ready); err != nil || string(ready) != "ready\n" {
+		return 0, fmt.Errorf("confinement: fixture: the decoy never became ready: %v", err)
+	}
+	return cmd.Process.Pid, nil
+}
+
+// firstExisting returns the first path that exists, or empty.
+func firstExisting(paths ...string) string {
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
 }
 
 // listenLoopback binds one loopback TCP port on a free port chosen by

@@ -60,8 +60,11 @@ type WritableRoot struct {
 // Resolved is a validated Spec with every path in the backend's canonical
 // spelling.
 type Resolved struct {
-	SessionID    string
-	HarnessID    string
+	SessionID string
+	HarnessID string
+	// SessionMode is the spawn path the boundary wraps: a backend that
+	// shapes the process session (a terminal the harness must own) reads it.
+	SessionMode  agent.PromptSessionMode
 	WorkareaRoot string
 	// MetadataDir is the workarea root's reserved metadata directory.
 	MetadataDir string

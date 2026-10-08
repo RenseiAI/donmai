@@ -5,7 +5,10 @@ package confinement
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -136,4 +139,62 @@ func (l *countingListener) reached() bool {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return l.accepted() > 0
+}
+
+// startTestDecoy runs the test binary as the probe decoy outside any
+// boundary and returns its pid once it is ready; cleanup reaps it.
+func startTestDecoy(t *testing.T, marker string) int {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(self, "-test.run=^$") //nolint:gosec // G204: the test binary re-executed.
+	cmd.Env = append(os.Environ(), probeDecoyEnv+"="+marker)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stdin.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	ready := make([]byte, len("ready\n"))
+	if _, err := io.ReadFull(stdout, ready); err != nil {
+		t.Fatalf("the decoy never became ready: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+// abstractListener is an abstract unix socket outside any boundary,
+// counting the connections it accepted.
+type abstractListener struct {
+	name    string
+	counter *countingListener
+}
+
+func newAbstractListener(t *testing.T) abstractListener {
+	t.Helper()
+	name := "donmai-confinement-test-" + randomSuffix()
+	listener, err := net.Listen("unix", "@"+name)
+	if err != nil {
+		t.Fatalf("abstract listener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	counter := &countingListener{addr: "@" + name}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			counter.count.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	return abstractListener{name: name, counter: counter}
 }

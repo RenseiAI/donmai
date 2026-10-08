@@ -71,6 +71,7 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 	resolved := &Resolved{
 		SessionID:    spec.SessionID,
 		HarnessID:    spec.HarnessID,
+		SessionMode:  spec.SessionMode,
 		WorkareaRoot: root,
 		MetadataDir:  filepath.Join(root, workarea.DeclarationDirName),
 		// The host directories ride the resolved set so the backend can

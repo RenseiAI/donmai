@@ -5,6 +5,7 @@ package confinement
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -52,11 +53,6 @@ import (
 // on itself. Where the kernel's Landlock ABI is older than landlockMinABI
 // the backend refuses closed with backend_absent: a seat is never run with
 // a weaker boundary than rendered.
-
-// landlockStageEnv marks a harness-process execution as the Landlock stage:
-// the process programs the policy described in the invocation and execs the
-// harness. The harness proper never sets it.
-const landlockStageEnv = "DONMAI_CONFINEMENT_LANDLOCK_STAGE"
 
 // landlockExecAccess is the access the stage grants on each executable it
 // re-executes, the file alone: read and execute, so the stage and the
@@ -243,11 +239,14 @@ func landlockApply() error {
 	if err != nil {
 		return err
 	}
-	if err := restrictLandlockFull(stage); err != nil {
-		return err
-	}
 	if len(argv) == 0 {
 		return fmt.Errorf("confinement: landlock stage: no harness command")
+	}
+	if err := takeForeground(); err != nil {
+		return err
+	}
+	if err := restrictLandlockFull(stage); err != nil {
+		return err
 	}
 	// The harness inherits the stage's environment minus the stage marker:
 	// the marker names this invocation only, and a harness that is the
@@ -261,6 +260,33 @@ func landlockApply() error {
 		env = append(env, kv)
 	}
 	return unix.Exec(argv[0], argv, env)
+}
+
+// takeForeground makes the stage, and so the harness it execs, the
+// foreground process group of its controlling terminal when it has one —
+// the interactive spawn path, where the launcher keeps the PTY host's
+// session (see sessionFlags). Ctrl-C and the other terminal signals then
+// reach the harness and its jobs instead of the launcher, and a shell the
+// harness runs can hand the terminal to its own jobs. A headless stage has
+// no controlling terminal on standard input and is left as it is. It is
+// part of the stage's setup and runs before the Landlock restriction.
+func takeForeground() error {
+	if _, err := unix.IoctlGetInt(0, unix.TIOCGPGRP); err != nil {
+		return nil // no controlling terminal on standard input
+	}
+	if err := unix.Setpgid(0, 0); err != nil {
+		return refuse(ReasonNamespaceUnavailable, "the stage cannot start its own process group: %v", errnoText(err))
+	}
+	// The new group is in the background until the ioctl below; ignore the
+	// stop signal the terminal sends a background writer, and restore the
+	// default before the harness is exec'd (an ignored signal would carry
+	// over the exec).
+	signal.Ignore(unix.SIGTTOU)
+	defer signal.Reset(unix.SIGTTOU)
+	if err := unix.IoctlSetPointerInt(0, unix.TIOCSPGRP, unix.Getpgrp()); err != nil {
+		return refuse(ReasonNamespaceUnavailable, "the stage cannot take its terminal's foreground: %v", errnoText(err))
+	}
+	return nil
 }
 
 // parseLandlockStage splits a stage invocation: the environment carries the
@@ -460,19 +486,48 @@ const landlockFileAccess = landlockAccessFSExecute |
 	landlockAccessFSReadFile |
 	landlockAccessFSTruncate
 
+// landlockScopeABI is the first Landlock ABI with scopes (Linux 6.12).
+const landlockScopeABI = 6
+
+// landlockScopes are the scopes the stage sets where the kernel has them:
+// no signal to a process outside the boundary's Landlock domain, and no
+// connection to an abstract unix socket created outside it. The process
+// namespace already hides every outside process; the signal scope holds
+// the same line from inside Landlock. Abstract sockets live in the shared
+// network namespace, so the scope is the only thing that closes them.
+const landlockScopes = unix.LANDLOCK_SCOPE_SIGNAL | unix.LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+
 // landlockRuleset returns the ruleset attributes the stage creates on a
 // kernel at the given Landlock ABI: the filesystem rights that ABI knows,
-// and no network right and no scope, ever. Handling CONNECT_TCP (or
-// BIND_TCP) here would deny every TCP connect to an undeclared port on any
-// address, remote endpoints included, because a port rule carries no
-// address. It is the one place the handled set is chosen;
-// restrictLandlockFull creates exactly this.
+// the signal and abstract-socket scopes from ABI 6, and no network right,
+// ever. Handling CONNECT_TCP (or BIND_TCP) here would deny every TCP
+// connect to an undeclared port on any address, remote endpoints included,
+// because a port rule carries no address. It is the one place the handled
+// set is chosen; restrictLandlockFull creates exactly this. Below ABI 6 the
+// scopes are absent: signals stay held by the process namespace, and
+// abstract sockets outside stay reachable, which the self-test records as
+// unheld for this kernel (see abstractSocketsScoped) rather than passing
+// silently.
 func landlockRuleset(abi int) unix.LandlockRulesetAttr {
 	handled := uint64(landlockHandledFS)
 	if abi < 3 {
 		handled &^= landlockAccessFSTruncate
 	}
-	return unix.LandlockRulesetAttr{Access_fs: handled}
+	attr := unix.LandlockRulesetAttr{Access_fs: handled}
+	if abi >= landlockScopeABI {
+		attr.Scoped = landlockScopes
+	}
+	return attr
+}
+
+// abstractSocketsScoped reports whether this kernel's Landlock can close
+// abstract unix sockets outside the boundary, and why not when it cannot.
+func abstractSocketsScoped() (bool, string) {
+	abi := landlockABI()
+	if abi >= landlockScopeABI {
+		return true, ""
+	}
+	return false, fmt.Sprintf("Landlock ABI %d has no abstract-socket scope (ABI %d, Linux 6.12, needed): abstract unix sockets outside the boundary stay reachable", abi, landlockScopeABI)
 }
 
 // landlockPathRule is the kernel's struct landlock_path_beneath_attr. The

@@ -58,6 +58,39 @@ type ProbeOutcome struct {
 	Observed string                  `json:"observed"`
 	Pass     bool                    `json:"pass"`
 	Detail   string                  `json:"detail,omitempty"`
+	// HeldBy names what other than the boundary refuses this probe on this
+	// host (heldByCrossDevice), so a pass here is never read as the
+	// backend holding it. Empty: only the boundary can refuse it.
+	HeldBy string `json:"heldBy,omitempty"`
+}
+
+// heldByCrossDevice marks a rename probe whose source and destination sit on
+// different filesystems on this host: the kernel refuses it boundary or not.
+const heldByCrossDevice = "os:cross_device"
+
+// NotProbedReason is why a probe of the set does not run on this host.
+type NotProbedReason string
+
+// The reasons a probe does not run.
+const (
+	// NotProbedPlatform: the probe's mechanism does not exist on this OS (a
+	// macOS service on Linux), so there is nothing to reach.
+	NotProbedPlatform NotProbedReason = "platform"
+	// NotProbedHostService: this host runs no such service (no per-user
+	// bus), so there is nothing to reach.
+	NotProbedHostService NotProbedReason = "host_service_absent"
+	// NotProbedKernel: the kernel cannot hold it, so the boundary is weaker
+	// on this host than the contract asks — recorded, never passed.
+	NotProbedKernel NotProbedReason = "kernel_unsupported"
+)
+
+// NotProbed is a probe of the set the self-test did not run on this host,
+// and why. It is never counted as held.
+type NotProbed struct {
+	ID     string                  `json:"id"`
+	Mode   agent.PromptSessionMode `json:"mode"`
+	Reason NotProbedReason         `json:"reason"`
+	Detail string                  `json:"detail,omitempty"`
 }
 
 // The observed and expected outcome names.
@@ -76,6 +109,7 @@ type SelfTestRecord struct {
 	ExecutableDigest string                    `json:"executableDigest,omitempty"`
 	SessionModes     []agent.PromptSessionMode `json:"sessionModes"`
 	Probes           []ProbeOutcome            `json:"probes"`
+	NotProbed        []NotProbed               `json:"notProbed,omitempty"`
 	Passed           bool                      `json:"passed"`
 	TestedAt         time.Time                 `json:"testedAt"`
 	Digest           string                    `json:"digest"`
@@ -192,7 +226,7 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 			continue
 		}
 		modeCtx, cancel := context.WithTimeout(ctx, timeout)
-		outcomes, err := c.selfTestMode(modeCtx, mode, launcher, opts, filepath.Join(scratch, fmt.Sprintf("m%d", i)), diskImage, diskImageErr)
+		outcomes, notProbed, err := c.selfTestMode(modeCtx, mode, launcher, opts, filepath.Join(scratch, fmt.Sprintf("m%d", i)), diskImage, diskImageErr)
 		cancel()
 		if err != nil {
 			if _, typed := ReasonOf(err); typed && refusal == nil {
@@ -202,6 +236,7 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 			continue
 		}
 		record.Probes = append(record.Probes, outcomes...)
+		record.NotProbed = append(record.NotProbed, notProbed...)
 		if allPass(outcomes) {
 			record.SessionModes = append(record.SessionModes, mode)
 		}
@@ -236,14 +271,15 @@ func (c *Confiner) store(record SelfTestRecord) {
 	c.selfTest = &record
 }
 
-func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMode, launcher Launcher, opts SelfTestOptions, dir, diskImage string, diskImageErr error) ([]ProbeOutcome, error) {
+func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMode, launcher Launcher, opts SelfTestOptions, dir, diskImage string, diskImageErr error) ([]ProbeOutcome, []NotProbed, error) {
 	fx, err := newFixture(dir, mode, fixtureHost{
 		home: c.opts.Home, stateHome: c.opts.StateHome,
 		diskImage: diskImage, diskImageErr: diskImageErr,
 		loopbackOpen: leavesLoopbackEgressOpen(c.opts.Backend),
+		probeCommand: opts.ProbeCommand,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer fx.cleanup()
 	// The read-scope pass runs first: it renders the world under the read
@@ -257,7 +293,7 @@ func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMod
 		planPath: filepath.Join(fx.tmp, "read-plan.json"), resultPath: filepath.Join(fx.tmp, "read-result.json"),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// The write and widening probes run with reads open, so a read deny
 	// cannot stand in for the write rule a probe is judging. The plan sits
@@ -271,9 +307,14 @@ func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMod
 		settle: fx.settle,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return append(outcomes, readOutcomes...), nil
+	notProbed := make([]NotProbed, 0, len(fx.notProbed))
+	for _, entry := range fx.notProbed {
+		entry.Mode = mode
+		notProbed = append(notProbed, entry)
+	}
+	return append(outcomes, readOutcomes...), notProbed, nil
 }
 
 // passInput is one probe pass: a spec rendered through the production
@@ -332,7 +373,7 @@ func (c *Confiner) probePass(ctx context.Context, in passInput) ([]ProbeOutcome,
 	outcomes := make([]ProbeOutcome, 0, len(in.steps))
 	for _, step := range in.steps {
 		result, ok := results[step.probe.ID]
-		outcome := ProbeOutcome{ID: step.probe.ID, Class: step.class, Mode: in.mode, Expected: outcomeRefused}
+		outcome := ProbeOutcome{ID: step.probe.ID, Class: step.class, Mode: in.mode, Expected: outcomeRefused, HeldBy: step.heldBy}
 		if step.expectAccepted {
 			outcome.Expected = outcomeAccepted
 		}
@@ -380,7 +421,7 @@ func (c *Confiner) probePass(ctx context.Context, in passInput) ([]ProbeOutcome,
 // whether it got through, so only their observed effect counts.
 var toolOps = map[stepOp]bool{
 	opReenter: true, opJobSubmit: true, opAppOpen: true, opLookup: true, opAttach: true, opMount: true,
-	opPrefWrite: true,
+	opPrefWrite: true, opNestedBoundary: true, opNestedRemount: true,
 }
 
 func describeResult(result stepResult) string {
