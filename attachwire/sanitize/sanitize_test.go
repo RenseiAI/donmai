@@ -2,6 +2,7 @@ package sanitize
 
 import (
 	"bytes"
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -671,5 +672,109 @@ func TestPassedStringsUse7BitForms(t *testing.T) {
 				t.Fatalf("%q split %d: got %q, want %q", tc.in, split, got, tc.want)
 			}
 		}
+	}
+}
+
+// claudeOSC52 is what a mouse-tracking REPL (Claude Code 2.1.294) wrote to its
+// terminal after a drag selection of "  Fable 5.1 · Claude Max", captured from
+// a PTY.
+const claudeOSC52 = "\x1b]52;c;ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA==\x07"
+
+// TestOnClipboardOffersSetsOnly pins the clipboard hook: a set is offered once
+// at every split offset and is still stripped from the stream, while queries,
+// clears, unknown targets, invalid base64, invalid UTF-8 and over-cap sets are
+// never offered.
+func TestOnClipboardOffersSetsOnly(t *testing.T) {
+	in := "a" + claudeOSC52 + "b"
+	for split := 0; split <= len(in); split++ {
+		var copies []string
+		s := NewWithOptions(Options{OnClipboard: func(text string) { copies = append(copies, text) }})
+		got := append(s.Write([]byte(in[:split])), s.Write([]byte(in[split:]))...)
+		if string(got) != "ab" {
+			t.Fatalf("split %d: stream %q, want %q", split, got, "ab")
+		}
+		if len(copies) != 1 || copies[0] != "  Fable 5.1 · Claude Max" {
+			t.Fatalf("split %d: copies %q", split, copies)
+		}
+	}
+
+	never := map[string]string{
+		"query":          "\x1b]52;c;?\x07",
+		"clear":          "\x1b]52;c;\x07",
+		"unknown target": "\x1b]52;z;aGk=\x07",
+		"invalid base64": "\x1b]52;c;not*base64\x07",
+		"not UTF-8":      "\x1b]52;c;//4=\x07",
+		"over hold cap":  "\x1b]52;c;" + strings.Repeat("QUFB", 2100) + "\x07",
+	}
+	for name, seq := range never {
+		var copies []string
+		s := NewWithOptions(Options{OnClipboard: func(text string) { copies = append(copies, text) }})
+		if got := string(s.Write([]byte(seq + "ok"))); got != "ok" || len(copies) != 0 {
+			t.Fatalf("%s: stream %q copies %q", name, got, copies)
+		}
+	}
+}
+
+// TestDecodeClipboardSetRemovesControls pins that a copied payload cannot carry
+// escape sequences or other controls into the clipboard.
+func TestDecodeClipboardSetRemovesControls(t *testing.T) {
+	text := "ls\t-l\r\n\x1b[31mred\x07\x00"
+	body := "52;c;" + base64.StdEncoding.EncodeToString([]byte(text))
+	got, ok := DecodeClipboardSet([]byte(body))
+	if !ok || got != "ls\t-l\r\n[31mred" {
+		t.Fatalf("got %q, %v", got, ok)
+	}
+}
+
+// TestClipboardSequenceRoundTrips pins the forwarding encoding: 7-bit ST, and
+// the sanitizer itself decodes it back to the same text.
+func TestClipboardSequenceRoundTrips(t *testing.T) {
+	seq := ClipboardSequence("  Fable 5.1 · Claude Max")
+	if string(seq) != "\x1b]52;c;ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA==\x1b\\" {
+		t.Fatalf("sequence %q", seq)
+	}
+	var copies []string
+	s := NewWithOptions(Options{OnClipboard: func(text string) { copies = append(copies, text) }})
+	if out := s.Write(seq); len(out) != 0 || len(copies) != 1 || copies[0] != "  Fable 5.1 · Claude Max" {
+		t.Fatalf("round trip: out %q copies %q", out, copies)
+	}
+}
+
+// TestCorpusClipboardHook checks every fixture that pins the OSC 52 clipboard
+// hook, contiguously and split at every offset, so all ports offer the same
+// texts for the same bytes.
+func TestCorpusClipboardHook(t *testing.T) {
+	entries, err := ConformanceCorpus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := 0
+	for _, e := range entries {
+		want, ok, err := e.ClipboardTexts()
+		if err != nil {
+			t.Fatalf("%s: %v", e.Name, err)
+		}
+		if !ok {
+			continue
+		}
+		pinned++
+		in, _ := e.InputBytes()
+		for split := 0; split <= len(in); split++ {
+			var got []string
+			s := NewWithOptions(Options{OnClipboard: func(text string) { got = append(got, text) }})
+			s.Write(in[:split])
+			s.Write(in[split:])
+			if len(got) != len(want) {
+				t.Fatalf("%s split %d: offered %q, want %q", e.Name, split, got, want)
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("%s split %d: offered %q, want %q", e.Name, split, got, want)
+				}
+			}
+		}
+	}
+	if pinned < 6 {
+		t.Fatalf("only %d corpus fixtures pin the clipboard hook, want at least 6", pinned)
 	}
 }
