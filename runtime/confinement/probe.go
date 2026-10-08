@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +22,21 @@ import (
 // self-test probe. Its value is the path of the probe plan. An executable
 // that can serve as the probe calls RunProbeFromEnv first thing in main.
 const ProbeEnv = "DONMAI_CONFINEMENT_PROBE"
+
+// landlockStageEnv marks a harness-process execution as the Linux backend's
+// Landlock stage: the process programs the policy described in the
+// invocation and execs the harness. The harness proper never sets it.
+const landlockStageEnv = "DONMAI_CONFINEMENT_LANDLOCK_STAGE"
+
+// probeDecoyEnv turns the probe executable into the self-test's decoy: a
+// process outside the boundary the confined probe tries to signal, attach
+// to and read. Its value is the marker file it creates when signalled.
+const probeDecoyEnv = "DONMAI_CONFINEMENT_PROBE_DECOY"
+
+// probeRemountEnv turns the probe executable into the nested-namespace
+// remount child: its value is the read-only leaf and the file to create
+// through it, separated by a newline.
+const probeRemountEnv = "DONMAI_CONFINEMENT_PROBE_REMOUNT"
 
 // probeXattr is the extended attribute the probe sets.
 const probeXattr = "user.donmai.confinement-probe"
@@ -62,6 +79,16 @@ const (
 	opStat         stepOp = "stat"
 	opOpen         stepOp = "open"
 	opGetxattr     stepOp = "getxattr"
+	// The Linux widening vocabulary: what a confined process could use to
+	// reach outside its boundary there. Each targets something the
+	// self-test placed outside: a decoy process, an abstract socket, the
+	// read-only leaf.
+	opSignal         stepOp = "signal"
+	opPtrace         stepOp = "ptrace"
+	opProcRead       stepOp = "proc_read"
+	opDialAbstract   stepOp = "dial_abstract"
+	opNestedBoundary stepOp = "nested_boundary"
+	opNestedRemount  stepOp = "nested_remount"
 )
 
 type probeStep struct {
@@ -98,6 +125,22 @@ type stepResult struct {
 // whether it did, with the exit code the process should end with. The
 // caller exits; a library never does.
 func RunProbeFromEnv() (handled bool, exitCode int) {
+	if handled, code := RunLandlockStageFromEnv(); handled {
+		return true, code
+	}
+	if marker := os.Getenv(probeDecoyEnv); marker != "" {
+		if err := runProbeDecoy(marker); err != nil {
+			fmt.Fprintf(os.Stderr, "confinement probe decoy: %v\n", err)
+			return true, 2
+		}
+		return true, 0
+	}
+	if target := os.Getenv(probeRemountEnv); target != "" {
+		if err := runNestedRemountChild(target); err != nil {
+			return true, 3
+		}
+		return true, 0
+	}
 	planPath := os.Getenv(ProbeEnv)
 	if planPath == "" {
 		return false, 0
@@ -202,6 +245,20 @@ func runStep(step probeStep) stepResult {
 		err = openForRead(step.Path)
 	case opGetxattr:
 		err = readXattr(step.Path, step.Label, step.Flags)
+	case opSignal:
+		err = unix.Kill(step.PID, unix.SIGUSR1)
+	case opPtrace:
+		err = ptraceSeize(step.PID)
+	case opProcRead:
+		_, err = os.ReadFile(filepath.Join("/proc", strconv.Itoa(step.PID), "environ")) //nolint:gosec // G304: a fixed procfs file of the probe's own target pid.
+	case opDialAbstract:
+		err = dial("@" + step.Label)
+	case opNestedBoundary:
+		// A boundary built from inside the boundary, binding the whole
+		// visible tree, must not reach what the outer one hides.
+		result.Exit, result.Output, err = runTool(step.Path2, "--dev-bind", "/", "/", "--", step.Label, step.Path)
+	case opNestedRemount:
+		err = nestedRemount(step.Path, step.Path2)
 	default:
 		err = fmt.Errorf("unknown probe operation %q", step.Op)
 	}
@@ -376,4 +433,27 @@ func parseLookups(output string) map[string]int {
 // results and every positive control fails.
 func probeResultPath(sessionTmp string) string {
 	return filepath.Join(sessionTmp, "probe-result.json")
+}
+
+// runProbeDecoy is the decoy process: it opens itself to attachment by any
+// process of its user (so only the boundary, not the host's attach policy,
+// decides whether the confined probe can attach), creates marker when it
+// receives SIGUSR1, tells the self-test it is ready on standard output, and
+// lives until its standard input closes.
+func runProbeDecoy(marker string) error {
+	if err := allowAnyTracer(); err != nil {
+		return err
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, unix.SIGUSR1)
+	go func() {
+		for range signals {
+			_ = createFile(marker)
+		}
+	}()
+	if _, err := os.Stdout.WriteString("ready\n"); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	return nil
 }

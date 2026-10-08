@@ -364,6 +364,11 @@ type piConfinerEntry struct {
 	digest   string
 }
 
+// piConfinementBackend returns the confinement backend for this OS. A
+// package variable so a test can pin the no-backend refusal on a host that
+// has one; production always takes the OS default.
+var piConfinementBackend = confinement.DefaultBackend
+
 var piConfinerCache struct {
 	sync.Mutex
 	entries map[string]*piConfinerEntry
@@ -384,7 +389,7 @@ var piConfinerCache struct {
 // directories are unchanged and the record is under a day old, instead of
 // probing again on every seat start.
 func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs, probeCommand []string) (*confinement.Confiner, error) {
-	backend := confinement.DefaultBackend()
+	backend := piConfinementBackend()
 	if backend == nil {
 		return nil, fmt.Errorf("%w: pi confinement requested: %w", agent.ErrSpawnFailed,
 			&confinement.Error{Reason: confinement.ReasonBackendAbsent, Detail: "no confinement backend for this operating system"})
@@ -536,11 +541,13 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 
 // endpointLoopbackPorts returns the port of the session's own model endpoint
 // when that endpoint is on this machine — a local gateway binding or a local
-// model server. The confinement closes outbound TCP to the local machine
-// except on declared ports, and the harness's own model channel is one the
-// adapter declares for the session (ADR-2026-10-03 D2.5); without it every
-// model call of a gateway-routed session would fail. A remote endpoint, or
-// none, declares nothing.
+// model server. The macOS confinement closes outbound TCP to the local
+// machine except on declared ports, and the harness's own model channel is
+// one the adapter declares for the session (ADR-2026-10-03 D2.5); without
+// it every model call of a gateway-routed session would fail there. The
+// Linux stage records the declaration but handles no network right (see the
+// stage file header), so the declaration is load-bearing on macOS and
+// record-only on Linux. A remote endpoint, or none, declares nothing.
 //
 // The declaration opens the port, not one address: the backend renders it
 // as localhost:<port>, which also opens that port on ::1 and on the host's

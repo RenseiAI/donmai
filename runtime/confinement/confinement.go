@@ -45,8 +45,14 @@ var classOrder = map[WritableClass]int{
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
 // every earlier self-test record stale. v4 adds the read-scope pass; v5 adds
-// the terminal, package data tree and extended attribute read probes.
-const ProbeSetVersion = "executor-confinement-probes-v5"
+// the terminal, package data tree and extended attribute read probes; v6
+// adds the protected-path read probes and a declared read path that is one
+// file in the operator home; v7 gives Linux its own widening probes (a decoy
+// process to signal, attach to and read, a nested boundary, a nested
+// remount over the read-only leaf, an abstract socket, the per-user bus and
+// service manager), records the probes a host cannot run, and marks the
+// probes the host itself refuses.
+const ProbeSetVersion = "executor-confinement-probes-v7"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the
@@ -82,8 +88,13 @@ type Spec struct {
 	// OS resolver). Every other socket outside the writable set is closed.
 	Sockets []string
 	// LoopbackTCPPorts are the loopback TCP ports the adapter declares for
-	// the session. Outbound TCP to the local machine is denied except on
-	// these ports; nothing is allowed by default.
+	// the session. On macOS outbound TCP to the local machine is denied
+	// except on these ports; nothing is allowed by default. The Linux
+	// backend records them but filters no TCP: it declares loopback egress
+	// open (a Landlock port rule carries no address, so filtering connects
+	// by port would cut every undeclared port on every address, remote
+	// endpoints included), and its self-test proves undeclared loopback
+	// dials go through rather than refuse.
 	LoopbackTCPPorts []int
 
 	// ReadScope is the fileRead level the boundary enforces, on the
@@ -288,9 +299,14 @@ func (p *Plan) Command(argv []string) ([]string, error) {
 
 // Environment returns the KEY=VALUE bindings the confined process needs:
 // TMPDIR, TMP and TEMP bound to session_tmp and each cache variable bound to
-// its per-session directory. Both spawn paths apply the same bindings.
+// its per-session directory, plus whatever the boundary itself needs (a
+// Landlock stage policy). Both spawn paths apply the same bindings.
 func (p *Plan) Environment() []string {
-	return append([]string(nil), p.env...)
+	env := append([]string(nil), p.env...)
+	if p.applied.Environ != nil {
+		env = append(env, p.applied.Environ()...)
+	}
+	return env
 }
 
 // Record returns the per-session confinement record.

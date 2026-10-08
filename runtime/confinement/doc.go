@@ -45,7 +45,11 @@
 // for a composer rule the backend cannot render (rule_unrenderable).
 //
 // The self-test drives a probe process — an executable that calls
-// RunProbeFromEnv first in main — through the same Prepare and Command, once
+// RunLandlockStageFromEnv first in main, then RunProbeFromEnv (the stage
+// marker names the re-executed stage invocation only, and the probe marker
+// the probe invocation; an executable that never runs the stage entrypoint
+// fails the self-test closed instead of running unconfined) — through the
+// same Prepare and Command, once
 // through the headless spawn path and once through the PTY host, and judges
 // every probe by what changed on disk. A second pass per mode renders the
 // same world under the workarea read scope and judges reads inside and
@@ -69,6 +73,61 @@
 // name: never a terminal. Package data (Homebrew's var and /usr/local/var,
 // where database directories and keys live) is re-denied after the runtime
 // allows. dyld reads the root directory itself at every exec, so the root
-// stays listable and nothing under it does unless named. Other operating
-// systems have no backend yet.
+// stays listable and nothing under it does unless named.
+//
+// The Linux backend renders the same contract as a bubblewrap mount tree:
+// a tmpfs root hides everything; read-only binds carry the OS userland,
+// the resolver inputs, the operator home and the host state home (so file
+// metadata stays readable), the declared read paths and sockets; the
+// writable set is bound read-write over them; every write deny (read-only
+// leaves, protected paths, the workarea metadata, composer write denies)
+// is bound read-only over itself after the allows, readable and never
+// writable, with its ancestors inside the writable set anchored as mount
+// points no rename can move; and composer read denies are hidden behind an
+// empty placeholder wherever a bind would reveal them. A Landlock stage
+// the harness process itself executes — RunLandlockStageFromEnv, first in
+// main — then grants writes on the writable set only and, under a read
+// scope, reads on the allowlist only, each rule naming exactly the path
+// the tree binds. The capability check runs the launcher itself once with
+// the same namespace and mount operations, so a host whose security module
+// allows the namespace but denies the mounts refuses with
+// namespace_unavailable instead of failing every spawn.
+//
+// The boundary runs in private user, mount and process namespaces: the
+// launcher's init reaps orphans inside, no process outside is visible to
+// signal, attach to or read, and killing the launcher kills every process
+// inside. An interactive harness keeps its PTY's session and becomes the
+// terminal's foreground group, so Ctrl-C and job control reach it; a
+// headless one runs in a session of its own. From Landlock ABI 6 the stage
+// also scopes signals and abstract unix sockets to its domain; below it,
+// abstract sockets outside stay reachable, and the self-test records that
+// as kernel_unsupported instead of passing it.
+//
+// The Linux self-test runs its own widening probes, each judged by its
+// effect outside: a decoy process signalled, attached to and read, a
+// nested boundary, a nested-namespace remount over the read-only leaf, an
+// abstract socket, and the per-user bus and service manager where they
+// answer. The macOS probes whose services Linux lacks are recorded as not
+// probed (NotProbed), never counted as held, and a probe the host itself
+// refuses (a rename across filesystems) is marked HeldBy. With the backend
+// replaced by nothing, every other refusal probe fails.
+//
+// A hide deny must name a path that exists at spawn: a placeholder needs
+// something to mount over. A deny list for a secret not yet minted names
+// the directory it will be minted in.
+//
+// The Linux backend leaves outbound TCP unfiltered and declares it
+// (loopback egress open): Landlock port rules carry no address, so
+// filtering connects by port would cut every undeclared port on every
+// address, remote model endpoints included, and a private network
+// namespace would strand the host loopback and the external network with
+// it. The self-test holds it to that declaration — its undeclared loopback
+// dials must go through — so a change in the network handle turns the
+// self-test red. The daemon control API and any other loopback service stay
+// governed by their own authorization on Linux. Three further differences
+// from the profile backend follow from the mechanism: extended-attribute
+// reads are not mediated on paths left visible for metadata, file metadata
+// is refused where nothing is bound, and procfs is not readable inside the
+// boundary (without a pid namespace it would show every same-user
+// process). Other operating systems have no backend yet.
 package confinement

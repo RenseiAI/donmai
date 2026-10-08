@@ -51,14 +51,19 @@ func TestError_ReportsUnderTheRenderingRefusal(t *testing.T) {
 
 func TestDefaultBackend_ByOS(t *testing.T) {
 	backend := DefaultBackend()
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		if backend == nil || backend.Name() != BackendMacOSSeatbelt {
 			t.Fatalf("DefaultBackend on darwin = %v", backend)
 		}
-		return
-	}
-	if backend != nil {
-		t.Fatalf("DefaultBackend on %s = %v, want none", runtime.GOOS, backend)
+	case "linux":
+		if backend == nil || backend.Name() != BackendLinuxMountNamespace {
+			t.Fatalf("DefaultBackend on linux = %v, want the mount-namespace backend", backend)
+		}
+	default:
+		if backend != nil {
+			t.Fatalf("DefaultBackend on %s = %v, want none", runtime.GOOS, backend)
+		}
 	}
 }
 

@@ -7,8 +7,8 @@ import (
 )
 
 // Backend applies a confinement boundary around one harness process. The
-// macOS profile backend is the only implementation in this package today;
-// a Linux mount-namespace backend is the next one.
+// macOS profile backend and the Linux mount-namespace backend are the
+// implementations in this package today.
 type Backend interface {
 	// Name is the backend's attestation name.
 	Name() BackendName
@@ -43,6 +43,10 @@ type Applied struct {
 	// Wrap returns the argv that runs argv inside the boundary. argv[0] is
 	// absolute.
 	Wrap func(argv []string) []string
+	// Environ returns the KEY=VALUE bindings the boundary itself needs on
+	// top of the plan environment (a Landlock stage policy, a marker): the
+	// launcher applies them to the spawned process. Nil when none.
+	Environ func() []string
 	// Release removes whatever Apply wrote. Nil when nothing was written.
 	Release func() error
 }
@@ -56,8 +60,11 @@ type WritableRoot struct {
 // Resolved is a validated Spec with every path in the backend's canonical
 // spelling.
 type Resolved struct {
-	SessionID    string
-	HarnessID    string
+	SessionID string
+	HarnessID string
+	// SessionMode is the spawn path the boundary wraps: a backend that
+	// shapes the process session (a terminal the harness must own) reads it.
+	SessionMode  agent.PromptSessionMode
 	WorkareaRoot string
 	// MetadataDir is the workarea root's reserved metadata directory.
 	MetadataDir string
@@ -78,6 +85,14 @@ type Resolved struct {
 	// SessionTmp and Caches feed the environment bindings.
 	SessionTmp string
 	Caches     []Cache
+	// Home is the operator home and StateHome the host state home. Both
+	// are bound read-only so file metadata stays readable (the seatbelt
+	// contract reads metadata everywhere); file contents and listings
+	// outside the allowlist are denied by the Landlock stage, which grants
+	// no access there. Empty when the session was resolved without host
+	// directories (unit renders).
+	Home      string
+	StateHome string
 	// ReadOnlyLeafNames are the read-only leaves' names, for the record.
 	ReadOnlyLeafNames []string
 	// ReadScope is the enforced fileRead level: empty for open reads, or
@@ -85,6 +100,25 @@ type Resolved struct {
 	ReadScope agent.ExecutionSecurityLevel
 	// ReadPaths are the declared extra read paths, canonical and sorted.
 	ReadPaths []string
+}
+
+// loopbackEgressDeclarer is implemented by a backend whose boundary leaves
+// outbound TCP to the local machine open on undeclared ports. The self-test
+// judges the undeclared-port loopback dials by it: a backend that declares
+// nothing must refuse them, and one that declares the gap must let them
+// through, so a backend that silently starts or stops filtering loopback
+// TCP fails exactly the probes that name it.
+type loopbackEgressDeclarer interface {
+	leavesLoopbackEgressOpen() bool
+}
+
+// leavesLoopbackEgressOpen reports whether backend declares outbound TCP to
+// the local machine open on undeclared ports. A backend that declares
+// nothing is held to the contract's default: denied except on the declared
+// ports.
+func leavesLoopbackEgressOpen(backend Backend) bool {
+	declarer, ok := backend.(loopbackEgressDeclarer)
+	return ok && declarer.leavesLoopbackEgressOpen()
 }
 
 // ReadAllowlist is the session's half of the read allowlist under a read
