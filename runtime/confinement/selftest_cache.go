@@ -82,7 +82,8 @@ func (c *Confiner) selfTestCache(opts SelfTestOptions, current fingerprint) (sel
 
 // load returns the cached record when it is reusable at now: the same key,
 // passing in both session modes, current by the staleness fingerprint,
-// intact by its own digest, and taken within the TTL (and not in the
+// intact by its own digest, not degraded (a partial-boundary record is
+// never reused as a passing one), and taken within the TTL (and not in the
 // future). Anything else is a miss.
 func (s selfTestCache) load(now time.Time) (SelfTestRecord, bool) {
 	raw, err := os.ReadFile(s.path)
@@ -97,7 +98,7 @@ func (s selfTestCache) load(now time.Time) (SelfTestRecord, bool) {
 	switch {
 	case entry.Version != selfTestCacheVersion, entry.Key != s.key:
 		return SelfTestRecord{}, false
-	case !record.Passed, len(record.SessionModes) != 2, !allPass(record.Probes):
+	case !record.Passed, record.Degraded != "", len(record.SessionModes) != 2, !allPass(record.Probes):
 		return SelfTestRecord{}, false
 	case record.fingerprint() != s.now:
 		return SelfTestRecord{}, false
