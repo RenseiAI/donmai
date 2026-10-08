@@ -1,6 +1,7 @@
 package seatbudget
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -458,5 +459,39 @@ func TestParseSystemdVersion(t *testing.T) {
 	}
 	if ScopeSystemdSupported(249) || !ScopeSystemdSupported(252) || !ScopeSystemdSupported(0) {
 		t.Errorf("ScopeSystemdSupported floor drifted from %d", MinScopeSystemd)
+	}
+}
+
+// TestSocketAliveDialsStream pins the bus probe's socket type: D-Bus
+// listens on SOCK_STREAM, so a probe that dials any other type reports
+// every live bus as dead. Per-user installs then lose --user (the scope
+// fails with "Access denied") and the live confinement test skips
+// silently instead of running.
+func TestSocketAliveDialsStream(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sb") // short path: unix socket paths are length-limited
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "bus")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	if !socketAlive(path) {
+		t.Error("socketAlive(stream listener) = false; want true (D-Bus listens on SOCK_STREAM)")
+	}
+	if socketAlive(filepath.Join(dir, "missing")) {
+		t.Error("socketAlive(missing socket) = true; want false")
 	}
 }
