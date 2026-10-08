@@ -20,15 +20,26 @@ import (
 // one line) and the provider-pin / handshake / home env vars to files in the
 // session cwd, then exits immediately — no PTY interaction is needed for the
 // argv+env assertions. DONMAI_PI_HANDSHAKE is wrapped in brackets so an ABSENT
-// value is distinguishable from any value at all.
+// value is distinguishable from any value at all. DONMAI_PI_KEY is captured
+// the same way: since credentials moved to the session file, the child env
+// must carry NO key — an absent value proves the strip — while the file
+// named by DONMAI_PI_CREDENTIALS_FILE carries it.
 const captureArgvEnvScript = `
 printf '%s\n' "$@" > "$PWD/argv.txt"
 {
   printf 'DONMAI_PI_BASE_URL=%s\n' "$DONMAI_PI_BASE_URL"
   printf 'DONMAI_PI_API=%s\n' "$DONMAI_PI_API"
   printf 'DONMAI_PI_MODEL=%s\n' "$DONMAI_PI_MODEL"
-  printf 'DONMAI_PI_KEY=%s\n' "$DONMAI_PI_KEY"
+  printf 'DONMAI_PI_KEY=[%s]\n' "$DONMAI_PI_KEY"
   printf 'DONMAI_PI_HANDSHAKE=[%s]\n' "$DONMAI_PI_HANDSHAKE"
+  printf 'DONMAI_PI_CREDENTIALS_FILE=%s\n' "$DONMAI_PI_CREDENTIALS_FILE"
+  if [ -n "$DONMAI_PI_CREDENTIALS_FILE" ] && [ -f "$DONMAI_PI_CREDENTIALS_FILE" ]; then
+    printf 'CREDENTIAL-FILE-CONTENT:'
+    cat "$DONMAI_PI_CREDENTIALS_FILE"
+    printf '\n'
+  else
+    printf 'CREDENTIAL-FILE-CONTENT:ABSENT\n'
+  fi
   printf 'DONMAI_PI_PRICES_BOUND=%s\n' "$DONMAI_PI_PRICES_BOUND"
   printf 'DONMAI_PI_PRICE_INPUT=%s\n' "$DONMAI_PI_PRICE_INPUT"
   printf 'DONMAI_PI_PRICE_OUTPUT=%s\n' "$DONMAI_PI_PRICE_OUTPUT"
@@ -172,17 +183,73 @@ func TestSpawn_Interactive_PinArgvAndEnvFromBinding(t *testing.T) {
 		"DONMAI_PI_BASE_URL=https://ai-gateway.invalid/v1",
 		"DONMAI_PI_API=openai-completions",
 		"DONMAI_PI_MODEL=agg-vendor/claude-3-haiku",
-		"DONMAI_PI_KEY=gw-secret",
 	} {
 		if !strings.Contains(env, want) {
 			t.Errorf("captured PTY-child env missing %q; got:\n%s", want, env)
 		}
 	}
+	// The session credential rides the credential FILE, never the child env:
+	// the env carries no key value, only the file's path.
+	if !strings.Contains(env, "DONMAI_PI_KEY=[]") {
+		t.Errorf("interactive child env must carry no session key value; got:\n%s", env)
+	}
+	_ = credentialPathFromCapturedEnv(t, env)
+	got := credentialValuesFromCapture(t, env)
+	if got[PiKeyEnvVar] != "gw-secret" {
+		t.Errorf("credential file %s = %q, want the binding key", PiKeyEnvVar, got[PiKeyEnvVar])
+	}
 	// The interactive spawn NEVER sets the handshake token — the extension's
 	// RPC-mode handshake is skipped, so no UI artifact renders in the TUI.
-	if !strings.Contains(env, "DONMAI_PI_HANDSHAKE=[]") {
-		t.Errorf("interactive child unexpectedly carries a handshake token; got:\n%s", env)
+	// (The capture prints the merged child env, so a token inherited from
+	// the test worker's own process env may show; the override-map test
+	// below pins what this spawn set. What matters here is the session
+	// credential never rides the child.)
+	for _, line := range strings.Split(env, "\n") {
+		if strings.HasPrefix(line, "CREDENTIAL-FILE-CONTENT:") {
+			continue // the file rail itself, echoed here for assertions
+		}
+		if strings.Contains(line, "gw-secret") {
+			t.Errorf("interactive child env carries the session credential value: %q", line)
+		}
 	}
+}
+
+// credentialPathFromCapturedEnv extracts the credential-file path the fake pi
+// captured from its env, failing the test when the session has no rail.
+func credentialPathFromCapturedEnv(t *testing.T, env string) string {
+	t.Helper()
+	for _, line := range strings.Split(env, "\n") {
+		if path, ok := strings.CutPrefix(line, credentialFileEnvVar+"="); ok && strings.TrimSpace(path) != "" {
+			return strings.TrimSpace(path)
+		}
+	}
+	t.Fatalf("captured child env carries no %s pointer; got:\n%s", credentialFileEnvVar, env)
+	return ""
+}
+
+// credentialValuesFromCapture reads the credential-file CONTENT the fake pi
+// captured while the file still existed (the PTY cleanup removes the file
+// when the child exits, so the path alone is unreadable after awaitPTYExit).
+func credentialValuesFromCapture(t *testing.T, env string) map[string]string {
+	t.Helper()
+	const prefix = "CREDENTIAL-FILE-CONTENT:"
+	i := strings.Index(env, prefix)
+	if i < 0 {
+		t.Fatalf("captured env has no credential-file content marker; got:\n%s", env)
+	}
+	// The capture appends further env lines after the JSON payload; the
+	// file content is the marker line's own remainder only.
+	rest := strings.TrimPrefix(env[i:], prefix)
+	content, _, _ := strings.Cut(strings.TrimSpace(rest), "\n")
+	raw := content
+	if raw == "ABSENT" {
+		t.Fatalf("credential file was absent when the child started; got:\n%s", env)
+	}
+	got, err := readSessionCredentialMap([]byte(raw))
+	if err != nil {
+		t.Fatalf("decode captured credential file: %v (raw=%s)", err, raw)
+	}
+	return got
 }
 
 // TestSpawn_Interactive_NilBindingParity pins the nil-binding shape: with no
@@ -224,8 +291,9 @@ func TestSpawn_Interactive_NilBindingParity(t *testing.T) {
 	if strings.Contains(env, "DONMAI_PI_BASE_URL=https") {
 		t.Errorf("nil-binding interactive child carries a non-empty pin base URL; got:\n%s", env)
 	}
-	if !strings.Contains(env, "DONMAI_PI_HANDSHAKE=[]") {
-		t.Errorf("interactive child unexpectedly carries a handshake token; got:\n%s", env)
+	// A keyless session writes no credential file; the pointer stays empty.
+	if !strings.Contains(env, "CREDENTIAL-FILE-CONTENT:ABSENT") {
+		t.Errorf("keyless session unexpectedly produced a credential file; got:\n%s", env)
 	}
 }
 
@@ -258,22 +326,25 @@ func TestSpawn_Interactive_DonmaiPiKeyMirrorSurvivesPreset(t *testing.T) {
 	awaitPTYExit(t, h)
 
 	env := readCapturedFile(t, workdir, "env.txt")
-	if !strings.Contains(env, "DONMAI_PI_KEY=snapshot-key-wins") {
-		t.Errorf("pre-set snapshot DONMAI_PI_KEY did not survive the binding merge; got:\n%s", env)
+	if !strings.Contains(env, "DONMAI_PI_KEY=[]") {
+		t.Errorf("interactive child env must carry no session key value; got:\n%s", env)
 	}
-	if strings.Contains(env, "DONMAI_PI_KEY=binding-key-loses") {
-		t.Errorf("binding key overwrote the snapshot key; got:\n%s", env)
+	got := credentialValuesFromCapture(t, env)
+	if got[PiKeyEnvVar] != "snapshot-key-wins" {
+		t.Errorf("credential file %s = %q, want the pre-set snapshot key to win", PiKeyEnvVar, got[PiKeyEnvVar])
 	}
 }
 
 // TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless is the fast unit-level
-// companion to the fixture tests: it pins the ONE difference between the
+// companion to the fixture tests: it pins the TWO differences between the
 // interactive and headless child env at the seam. The headless composeChildEnv
 // carries the per-session handshake token; the interactive interactiveChildEnv
 // omits it (so the extension's RPC-mode handshake is skipped) while still
-// carrying the provider pin. RED proof: add piHandshakeEnvVar to
-// interactiveChildEnv and this test fails; the headless handshake gate would
-// then wrongly appear reachable from a PTY child that has no RPC consumer.
+// carrying the provider pin. And NEITHER lane carries a credential value:
+// the resolved cell key rides the session credential file on both.
+// RED proof: add piHandshakeEnvVar to interactiveChildEnv and this test
+// fails; the headless handshake gate would then wrongly appear reachable
+// from a PTY child that has no RPC consumer.
 func TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless(t *testing.T) {
 	t.Parallel()
 	cwd := t.TempDir()
@@ -300,8 +371,17 @@ func TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless(t *testing.T) {
 	if inter[piBaseURLEnvVar] != "https://ai-gateway.invalid/v1" {
 		t.Errorf("interactive child env missing the provider pin base URL: %v", inter)
 	}
-	if inter[PiKeyEnvVar] != "k" {
-		t.Errorf("interactive child env dropped the resolved cell key: %v", inter)
+	// The resolved cell key rides the credential file, never either env.
+	if _, present := inter[PiKeyEnvVar]; present {
+		t.Errorf("interactive child env must NOT carry the session key; got %q", inter[PiKeyEnvVar])
+	}
+	for _, e := range headless {
+		if isSessionCredentialEnv(e) {
+			t.Errorf("headless child env must NOT carry a credential-named entry; got %q", e)
+		}
+	}
+	if entries := sessionCredentialEntries(spec); len(entries) != 1 || entries[0].Value != "k" {
+		t.Errorf("session credential entries = %+v, want the one resolved cell key", entries)
 	}
 	if inter[piCodingAgentDirEnvVar] != layout.agentHome {
 		t.Errorf("interactive child env missing the agent-home redirect: %v", inter)

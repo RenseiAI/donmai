@@ -95,8 +95,11 @@ func TestSpawn_Interactive_AllowedDisallowedToolsReachChildEnv(t *testing.T) {
 	if !strings.Contains(env, `DONMAI_PI_DISALLOWED_TOOLS=["Bash"]`) {
 		t.Errorf("interactive child env missing the stamped disallowed-tools list; got:\n%s", env)
 	}
-	if !strings.Contains(env, "DONMAI_PI_HANDSHAKE=[]") {
-		t.Errorf("interactive child unexpectedly carries a handshake token; got:\n%s", env)
+	// The spawn never SETS the handshake token (the capture prints the
+	// merged env, so an inherited worker token may show — the override map
+	// is what this spawn set).
+	if _, present := interactiveChildEnv(agent.Spec{Cwd: t.TempDir()}, newSessionLayout(t.TempDir()))[piHandshakeEnvVar]; present {
+		t.Errorf("interactiveChildEnv must never set the handshake token")
 	}
 }
 

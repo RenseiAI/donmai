@@ -306,6 +306,48 @@ func TestExtensionRegistersOutputLimitOnlyWhenConfigured(t *testing.T) {
 	}
 }
 
+// TestExtensionRegistersSessionKeyFromCredentialFile activates the REAL
+// embedded extension with the session key delivered ONLY through the
+// credential file (no DONMAI_PI_KEY in env): the registered "donmai"
+// provider must carry the file's key. A second run with an empty file
+// (keyless session) registers an empty key, never an inherited one.
+// RED proof: read the key from process.env instead of the file and the
+// first run registers the inherited value (or empty) instead of the file's.
+func TestExtensionRegistersSessionKeyFromCredentialFile(t *testing.T) {
+	t.Parallel()
+	nodeAvailable(t)
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "session-credentials.json")
+	payload := `{"schemaVersion":1,"credentials":[{"env":"DONMAI_PI_KEY","value":"file-rail-key"}]}`
+	if err := os.WriteFile(credPath, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := runExtensionFixture(t, []string{
+		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+		piModelEnvVar + "=served-model",
+		credentialFileEnvVar + "=" + credPath,
+	}, "read", `{"path":"README.md"}`)
+	model := registeredDonmaiModel(t, out)
+	providers, _ := out["providers"].([]any)
+	config, _ := providers[0].(map[string]any)["config"].(map[string]any)
+	if key, _ := config["apiKey"].(string); key != "file-rail-key" {
+		t.Errorf("registered apiKey = %q, want the credential file's key", key)
+	}
+	_ = model
+
+	// Keyless session: no credential file at all — the provider registers
+	// with an empty key rather than any inherited value.
+	out2 := runExtensionFixture(t, []string{
+		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+		piModelEnvVar + "=served-model",
+	}, "read", `{"path":"README.md"}`)
+	providers2, _ := out2["providers"].([]any)
+	config2, _ := providers2[0].(map[string]any)["config"].(map[string]any)
+	if key, _ := config2["apiKey"].(string); key != "" {
+		t.Errorf("keyless registered apiKey = %q, want empty", key)
+	}
+}
+
 // injectedCell is an endpoint binding the injected provider serves (a
 // loopback gateway speaking protocol), with the output limit, when positive,
 // on the spec's provider config.

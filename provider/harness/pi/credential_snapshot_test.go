@@ -56,11 +56,12 @@ func gatewayBinding(model string) *agent.EndpointBinding {
 
 // TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv proves pi's
 // credential parity rides the shared spawn-time Spec.Env snapshot rail, not a
-// pi-specific fan-out list: every snapshot key placed on Spec.Env survives
-// applyEndpoint + composeChildEnv into the headless child env with its cell
-// value intact. The blocklist/redaction contract holds at the same time:
-// blocklisted host-inherited credentials never leak in, and a runner-only
-// control is refused even when it arrives on the trusted Spec.Env layer.
+// pi-specific fan-out list: every snapshot credential placed on Spec.Env
+// survives applyEndpoint + the session credential file with its cell value
+// intact, while the headless child env itself carries no credential value.
+// The blocklist/redaction contract holds at the same time: blocklisted
+// host-inherited credentials never leak in, and a runner-only control is
+// refused even when it arrives on the trusted Spec.Env layer.
 func TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv(t *testing.T) {
 	// Not parallel: mutates process env.
 	const hostCanary = "host-canary-must-not-leak"
@@ -84,15 +85,34 @@ func TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv(t *testing.T
 	}
 	env := composeChildEnv(projected, layout, "sess-token")
 
+	// No credential value rides the child env; non-credential bindings do.
+	for _, e := range env {
+		if isSessionCredentialEnv(e) {
+			t.Fatalf("snapshot credential rides the headless child env: %q", e)
+		}
+	}
+	if !hasEnvVal(env, "ANTHROPIC_BASE_URL", "cell-ANTHROPIC_BASE_URL") {
+		t.Errorf("non-credential snapshot binding ANTHROPIC_BASE_URL missing from pi headless child env")
+	}
+	entries := sessionCredentialEntries(projected)
+	byValue := make(map[string]string, len(entries))
+	for _, e := range entries {
+		byValue[e.Env] = e.Value
+	}
 	for _, k := range credentialSnapshotKeys {
-		if !hasEnvVal(env, k, "cell-"+k) {
-			t.Errorf("snapshot key %s missing or wrong value in pi headless child env", k)
+		switch k {
+		case "ANTHROPIC_BASE_URL", "GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY", "CODEX_API_KEY":
+			continue // non-model credentials: out of the session-file rail's scope
+		}
+		if byValue[k] != "cell-"+k {
+			t.Errorf("snapshot key %s = %q in the credential file, want %q", k, byValue[k], "cell-"+k)
 		}
 	}
 	// The snapshot-supplied model pin survives the binding merge untouched:
-	// applyEndpoint mirrors a cell key onto PiKeyEnvVar only when absent.
-	if !hasEnvVal(env, PiKeyEnvVar, "cell-"+PiKeyEnvVar) {
-		t.Errorf("snapshot %s did not survive the endpoint binding merge", PiKeyEnvVar)
+	// applyEndpoint mirrors a cell key onto PiKeyEnvVar only when absent —
+	// and the file rail carries that same surviving value.
+	if byValue[PiKeyEnvVar] != "cell-"+PiKeyEnvVar {
+		t.Errorf("snapshot %s = %q in the credential file, want the surviving snapshot value", PiKeyEnvVar, byValue[PiKeyEnvVar])
 	}
 	for _, e := range env {
 		if strings.Contains(e, hostCanary) {
@@ -109,10 +129,11 @@ func TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv(t *testing.T
 
 // TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv is the
 // interactive-lane companion: the same full snapshot set on the projected
-// spec survives interactiveChildEnv, the override layer the PTY child is
-// spawned with — while a runner-only control riding the same Spec.Env layer
-// is refused, exactly as the headless lane refuses it. RED proof: drop a
-// snapshot key from the spec.Env copy loop and this test fails.
+// spec fans out to the session credential file, while interactiveChildEnv —
+// the override layer the PTY child is spawned with — carries no credential
+// value. A runner-only control riding the same Spec.Env layer is refused,
+// exactly as the headless lane refuses it. RED proof: drop a snapshot key
+// from sessionCredentialEntries and this test fails.
 func TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv(t *testing.T) {
 	t.Parallel()
 	layout := newSessionLayout(t.TempDir())
@@ -129,11 +150,32 @@ func TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv(t *testin
 	projected.Env["ATTACH_TOKEN"] = "spec-layer-runner-control-must-not-reach-pi"
 	got := interactiveChildEnv(projected, layout)
 	for _, k := range credentialSnapshotKeys {
-		if got[k] != "cell-"+k {
-			t.Errorf("snapshot key %s = %q, want %q in interactive child env", k, got[k], "cell-"+k)
+		switch k {
+		case "ANTHROPIC_BASE_URL", "GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY", "CODEX_API_KEY":
+			continue // non-model credentials: ride env, out of the file rail's scope
 		}
+		if _, present := got[k]; present {
+			t.Errorf("snapshot credential %s = %q reached the interactive child env; it must ride the file", k, got[k])
+		}
+	}
+	if got["ANTHROPIC_BASE_URL"] != "cell-ANTHROPIC_BASE_URL" {
+		t.Errorf("non-credential snapshot binding ANTHROPIC_BASE_URL = %q, want %q", got["ANTHROPIC_BASE_URL"], "cell-ANTHROPIC_BASE_URL")
 	}
 	if _, present := got["ATTACH_TOKEN"]; present {
 		t.Errorf("runner-only ATTACH_TOKEN reached the interactive child env from Spec.Env")
+	}
+	entries := sessionCredentialEntries(projected)
+	byValue := make(map[string]string, len(entries))
+	for _, e := range entries {
+		byValue[e.Env] = e.Value
+	}
+	for _, k := range credentialSnapshotKeys {
+		switch k {
+		case "ANTHROPIC_BASE_URL", "GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY", "CODEX_API_KEY":
+			continue // non-model credentials: out of the session-file rail's scope
+		}
+		if byValue[k] != "cell-"+k {
+			t.Errorf("snapshot key %s = %q in the credential file, want %q", k, byValue[k], "cell-"+k)
+		}
 	}
 }

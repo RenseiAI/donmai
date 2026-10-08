@@ -428,6 +428,29 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if token == "" {
 		token = newHandshakeToken()
 	}
+	// Deliver session credentials through files, never the child env: pi
+	// renames itself into a short process name at startup, and a same-user
+	// process listing then renders the child ENVIRONMENT as if it were its
+	// command line. The credential file carries the injected-provider key
+	// for the extension plus the provider-native mirrors for pi's own
+	// store; the native auth.json covers the --provider <name> route.
+	// Any write failure denies spawn closed, before any child starts.
+	// The files are removed at session end (Stop) and, on spawn-failure
+	// paths below, here.
+	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	removeCredentials := func() {
+		removeSessionCredentialFile(layout)
+		removeNativeProviderAuthFile(layout)
+	}
+	authPath, err := writeNativeProviderAuthFile(layout, spec)
+	if err != nil {
+		removeCredentials()
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	_ = authPath
 	// Prepare the confinement plan for a session that requested it. The
 	// plan wraps the child argv below and binds the session tmp and caches
 	// over their variables; nil means the session did not request
@@ -448,14 +471,17 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	}
 	// Compose once. Receipt admission inspects this exact final environment,
 	// and spawnChild assigns the same immutable slice to exec.Cmd.Env. The
-	// confinement bindings are appended last so they win.
-	childEnv := confinePiEnv(composeChildEnv(spec, layout, token), plan)
+	// confinement bindings are appended last so they win. The credential
+	// file's PATH rides the env (sessionCredentialEnv); the credential VALUES
+	// never do — composeChildEnv strips them from the spec first.
+	childEnv := confinePiEnv(sessionCredentialEnv(composeChildEnv(spec, layout, token), credentialPath), plan)
 	var receipt *receiptAdmission
 	if spec.Autonomous {
 		startup := measureReceiptStartupContext(spec.Cwd, childEnv)
 		receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions, startup)
 		if err != nil {
 			releasePlan()
+			removeCredentials()
 			return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
 		}
 	}
@@ -472,6 +498,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, childEnv, mode, sessionID, p.artifact, receipt, plan)
 		if serr != nil {
 			releasePlan()
+			removeCredentials()
 			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
 		}
 		cmd, stdin, stdout = c, in, out
@@ -482,6 +509,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 			if err := revalidateLaunchTrust(p.artifact, receipt, childEnv); err != nil {
 				stopStartedChild(cmd)
 				releasePlan()
+				removeCredentials()
 				return nil, fmt.Errorf("%w: pi artifact changed after spawn: %v", agent.ErrSpawnFailed, err)
 			}
 		}
@@ -490,6 +518,12 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	client := newRPCClient(stdin, stdout)
 	h := newHandle(client, cmd, spec, token, receipt)
 	h.setConfinement(plan)
+	// The session credential files live in the session state root. Stop
+	// removes them so a finished session leaves no secret on disk; the
+	// worktree lifecycle that removes the state root is the backstop.
+	h.onStop = func() {
+		removeCredentials()
+	}
 	// Set before the pump starts (the go statement orders the write before
 	// every read on the pump goroutine); dispatch emits them directly behind
 	// the session's InitEvent. See launchNotices.

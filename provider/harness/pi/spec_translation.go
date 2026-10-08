@@ -238,25 +238,40 @@ func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareM
 // spawning user, it must NEVER see broader host credentials. The Composer
 // drops every AgentEnvBlocklist key (ANTHROPIC_API_KEY, OPENAI_API_KEY, …) and
 // every runner-only control from the PARENT env, while still trusting the
-// resolved cell's credentials delivered on Spec.Env (applyEndpoint mirrors the
-// cell key onto PiKeyEnvVar). The PI_CODING_AGENT_DIR/_SESSION_DIR redirect
+// resolved cell's non-secret bindings delivered on Spec.Env. Session
+// credentials (PiKeyEnvVar and the provider-native credential mirror) are
+// NOT composed here: they ride the session credential file
+// (writeSessionCredentialFile) the extension reads at load, so the child env
+// pi renames itself into — and a same-user process listing renders — carries
+// no secret value. The PI_CODING_AGENT_DIR/_SESSION_DIR redirect
 // layer is appended last (wins) so the child's pi config/auth/session home
 // resolves inside the session worktree — a fleet box's personal
 // ~/.pi/agent/auth.json is never visible.
 //
 // Credential-snapshot parity: pi carries the platform's full spawn-time
 // credential snapshot through the shared Spec.Env trusted layer — the same
-// rail the other harnesses use — not a pi-specific fan-out list. Any
-// snapshot key present on Spec.Env reaches the child unchanged; there is no
-// pi-side allowlist to extend when the snapshot gains a key. The blocklist
+// rail the other harnesses use — not a pi-specific fan-out list. Non-secret
+// snapshot keys present on Spec.Env reach the child unchanged; credential
+// values are fanned out to the session credential file instead (see
+// sessionCredentialEntries), so there is no pi-side allowlist to extend when
+// the snapshot gains a key. The blocklist
 // still applies to the inherited parent env only, and runner-only controls
 // are refused at every layer.
 //
 // It also carries the trust-boundary handshake token (piHandshakeEnvVar) and
 // the non-secret provider-pin vars (providerPinEnv) the policy extension reads
-// at load; the key itself already rides Spec.Env under PiKeyEnvVar.
+// at load; the key itself already rides the session credential file.
 func composeChildEnv(spec agent.Spec, layout sessionLayout, token string) []string {
 	out := runtimeenv.NewComposer().Compose(envSliceToMap(os.Environ()), spec)
+	// The parent env is NOT trusted for credentials: an embedding supervisor
+	// may re-admit a blocklisted name it injected itself (InjectedEnvKeysVar),
+	// and the gateway's per-session upstream refusal does not cover every
+	// snapshot key — so a same-user listing of the renamed pi child would
+	// still render the inherited value. Strip any surviving credential-named
+	// entry after the merge; the session's own values ride the credential
+	// file (sessionCredentialEntries over the ALREADY-STRIPPED spec is empty
+	// by construction, so compute the names from the original spec).
+	out = stripCredentialNamedEnv(out)
 	// Redirect pi's config/agent home and session home into the session dir
 	// using the EXACT documented variable names (docs/environment-variables.md:
 	// PI_CODING_AGENT_DIR overrides the config directory, default
