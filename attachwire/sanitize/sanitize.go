@@ -399,6 +399,12 @@ func (s *Sanitizer) stepEscInt(b byte, out *[]byte) bool {
 		}
 		return true
 	case b >= 0x30 && b <= 0x7E: // final: charset designation, DECALN, S7C1T… — pass
+		if b == 'G' && len(s.pending) == 2 && s.pending[1] == ' ' {
+			// S8C1T: the terminal would send its replies with 8-bit C1
+			// introducers, which reply detectors that expect ESC miss.
+			s.st = stGround
+			return true
+		}
 		*out = append(*out, s.pending...)
 		*out = append(*out, b)
 		s.st = stGround
@@ -430,8 +436,9 @@ func (s *Sanitizer) stepCSI(b byte, out *[]byte) bool {
 	case b >= 0x20 && b <= 0x2F: // intermediate bytes
 		s.pending = append(s.pending, b)
 	case b >= 0x40 && b <= 0x7E: // final byte — classify
-		if csiPasses(s.pending[s.introLen:], b) {
-			*out = append(*out, s.pending...)
+		if content, ok := csiRewrite(s.pending[s.introLen:], b); ok {
+			*out = append(*out, s.pending[:s.introLen]...)
+			*out = append(*out, content...)
 			*out = append(*out, b)
 		}
 		s.st = stGround
@@ -496,6 +503,106 @@ func csiPasses(content []byte, final byte) bool {
 	return true
 }
 
+// replyModes are DEC private modes whose only effect is to make the terminal
+// write reports on its input by itself: ?2048 (in-band resize reports) and
+// ?2031 (colour-scheme change reports). A viewer must never be asked to
+// write on its input (§9 governing invariant), so setting them is stripped;
+// resetting them passes and is harmless.
+var replyModes = map[int]bool{2031: true, 2048: true}
+
+// csiRewrite extends csiPasses with the reply-triggering forms that need the
+// parameters to decide: a DECSET of a reply mode (removed from the parameter
+// list, and the sequence dropped when nothing is left), the DECANM reset into
+// VT52 mode (?2l), the kitty keyboard flags query (CSI ? u), the
+// modifier-options query (CSI ? Pp m), XTSMGRAPHICS (CSI ? … S), the DEC
+// locator enable, select and request sequences (CSI … ' z, ' {, ' |),
+// DECREQTPARM (CSI Ps x), DECRQCRA (CSI … * y), DECRQPSR (CSI Ps $ w),
+// DECRQTSR (CSI Ps $ u) and DECRQUPSS (CSI & u). It returns the content to
+// emit and whether the sequence passes at all.
+func csiRewrite(content []byte, final byte) ([]byte, bool) {
+	if !csiPasses(content, final) {
+		return nil, false
+	}
+	private := len(content) > 0 && content[0] == '?'
+	intermediates := csiIntermediates(content)
+	switch {
+	case private && (final == 'u' || final == 'm'):
+		return nil, false // kitty keyboard / modifier-options query
+	case private && final == 'S':
+		return nil, false // XTSMGRAPHICS query
+	case intermediates == "'" && (final == 'z' || final == '{' || final == '|'):
+		return nil, false // DEC locator: enable, select events, request position
+	case final == 'x' && !private && intermediates == "":
+		return nil, false // DECREQTPARM
+	case intermediates == "*" && final == 'y':
+		return nil, false // DECRQCRA
+	case intermediates == "$" && (final == 'w' || final == 'u'):
+		return nil, false // DECRQPSR, DECRQTSR
+	case intermediates == "&" && final == 'u':
+		return nil, false // DECRQUPSS
+	case private && final == 'h':
+		return filterPrivateModes(content, replyModes)
+	case private && final == 'l':
+		return filterPrivateModes(content, vt52Modes)
+	}
+	return content, true
+}
+
+// vt52Modes are DEC private modes whose RESET leaves ANSI mode: ?2 (DECANM)
+// switches the terminal to VT52 keys and replies, which no viewer models.
+var vt52Modes = map[int]bool{2: true}
+
+// filterPrivateModes removes the listed modes from a DEC private mode
+// sequence. When any is removed, empty fields are dropped too and the
+// sequence is stripped when nothing is left, so every port emits one
+// canonical form; a sequence with none of the modes passes verbatim.
+func filterPrivateModes(content []byte, drop map[int]bool) ([]byte, bool) {
+	var kept []byte
+	dropped := false
+	for _, field := range bytes.Split(content[1:], []byte{';'}) {
+		if n, ok := leadingDigits(field); ok && drop[n] {
+			dropped = true
+			continue
+		}
+		if len(field) == 0 {
+			continue
+		}
+		if len(kept) > 0 {
+			kept = append(kept, ';')
+		}
+		kept = append(kept, field...)
+	}
+	if !dropped {
+		return content, true
+	}
+	if len(kept) == 0 {
+		return nil, false
+	}
+	return append([]byte{'?'}, kept...), true
+}
+
+// csiIntermediates returns the intermediate bytes (0x20-0x2F) of a CSI's
+// parameter/intermediate content.
+func csiIntermediates(content []byte) string {
+	for i, c := range content {
+		if c >= 0x20 && c <= 0x2F {
+			return string(content[i:])
+		}
+	}
+	return ""
+}
+
+// leadingDigits parses the leading decimal digits of a parameter field
+// ("2048" or "2048:1").
+func leadingDigits(field []byte) (int, bool) {
+	n, i := 0, 0
+	for i < len(field) && field[i] >= '0' && field[i] <= '9' && n < 1<<20 {
+		n = n*10 + int(field[i]-'0')
+		i++
+	}
+	return n, i > 0
+}
+
 // --- DCS header -------------------------------------------------------------
 
 func (s *Sanitizer) beginDCS(introducer byte) {
@@ -541,8 +648,7 @@ func (s *Sanitizer) stepDCS(b byte, _ *[]byte) bool {
 // string (DECUDK, DECRQSS, or any unenumerated DCS — §9 default strip).
 func (s *Sanitizer) classifyDCS(final byte) {
 	header := s.pending[s.introLen:]
-	hasDollar := bytes.IndexByte(header, '$') >= 0
-	if final == 'q' && !hasDollar {
+	if final == 'q' && sixelParams(header[:len(header)-1]) {
 		// Sixel graphics: pass, size-capped. Keep buffering the body.
 		s.st = stStr
 		s.kind = kDCS
@@ -552,8 +658,22 @@ func (s *Sanitizer) classifyDCS(final byte) {
 		s.curCap = s.sixelMax
 		return
 	}
-	// DECUDK ('|'), DECRQSS ('$' 'q'), or anything else — strip.
+	// DECUDK ('|'), DECRQSS ('$' 'q'), XTGETTCAP ('+' 'q'), or anything else
+	// — strip.
 	s.dropStringUntilST()
+}
+
+// sixelParams reports whether a DCS header before the final q is the Sixel
+// introducer's parameter list: digits and ';' only, no private marker and no
+// intermediate byte. Every other DCS q (XTGETTCAP "+q", DECRQSS "$q") makes
+// the terminal reply and is stripped.
+func sixelParams(header []byte) bool {
+	for _, c := range header {
+		if (c < '0' || c > '9') && c != ';' {
+			return false
+		}
+	}
+	return true
 }
 
 // --- string body (OSC / Sixel-DCS / APC / PM / SOS) -------------------------
