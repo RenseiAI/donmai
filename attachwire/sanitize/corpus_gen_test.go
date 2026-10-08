@@ -247,6 +247,34 @@ func corpusFixtures() []fixture {
 			"modifier_options_query_strip", "the modifier-options query (CSI ? 4 m) is stripped; setting modifyOtherKeys (CSI > 4 ; 2 m) passes",
 			"\x1b[?4m\x1b[>4;2m", "\x1b[>4;2m", "mixed", "reply-modes",
 		},
+		{
+			"decset_reply_mode_with_empty_fields_canonical", "when a reply mode is removed, empty fields go too and an empty DECSET is stripped, so every port emits one form",
+			"\x1b[?;2048h\x1b[?2048;h\x1b[?;;2048hok", "ok", "strip", "reply-modes",
+		},
+		{
+			"decset_empty_fields_dropped_around_kept_modes", "removing a reply mode from a set with empty fields keeps only the non-empty modes",
+			"\x1b[?;1000;2048h\x1b[?1000;;2048;1006h", "\x1b[?1000h\x1b[?1000;1006h", "mixed", "reply-modes",
+		},
+		{
+			"dcs_q_with_intermediate_strip", "a DCS q with an intermediate or private marker is not Sixel and is stripped: XTGETTCAP (+q, 7-bit and 8-bit), !q, >q",
+			"\x1bP+q544e\x1b\\\x90+q544e\x9c\x1bP!q~\x1b\\\x1bP>q~\x1b\\ok", "ok", "strip", "dcs-decudk-decrqss",
+		},
+		{
+			"sixel_with_params_pass", "a Sixel DCS with parameters (digits and ';' before q) still passes",
+			"\x1bP0;1;0q#0~\x1b\\", "\x1bP0;1;0q#0~\x1b\\", "pass", "dcs-sixel",
+		},
+		{
+			"s8c1t_strip", "S8C1T (ESC SP G) is stripped: the terminal would send replies with 8-bit C1 introducers; S7C1T passes",
+			"\x1b G\x1b Fok", "\x1b Fok", "mixed", "reply-modes",
+		},
+		{
+			"report_requests_strip", "report requests are stripped: DECREQTPARM (x), XTSMGRAPHICS (?S), DECRQCRA (*y), DECRQPSR ($w), DECRQTSR ($u), DECRQUPSS (&u); scroll-up (S) passes",
+			"\x1b[x\x1b[1x\x1b[?1;1;0S\x1b[1;1;1;1;1;1*y\x1b[1$w\x1b[1$u\x1b[&u\x1b[2Sok", "\x1b[2Sok", "mixed", "reply-modes",
+		},
+		{
+			"decanm_vt52_reset_strip", "resetting ?2 (DECANM, into VT52 mode) is removed from a DEC private reset; other resets pass",
+			"\x1b[?2l\x1b[?25;2lok", "\x1b[?25lok", "mixed", "reply-modes",
+		},
 	}
 }
 

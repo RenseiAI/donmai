@@ -416,6 +416,62 @@
     "spec_row": "reply-modes"
   },
   {
+    "name": "decset_reply_mode_with_empty_fields_canonical",
+    "description": "when a reply mode is removed, empty fields go too and an empty DECSET is stripped, so every port emits one form",
+    "input": "G1s/OzIwNDhoG1s/MjA0ODtoG1s/OzsyMDQ4aG9r",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decset_empty_fields_dropped_around_kept_modes",
+    "description": "removing a reply mode from a set with empty fields keeps only the non-empty modes",
+    "input": "G1s/OzEwMDA7MjA0OGgbWz8xMDAwOzsyMDQ4OzEwMDZo",
+    "expected_output": "G1s/MTAwMGgbWz8xMDAwOzEwMDZo",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "dcs_q_with_intermediate_strip",
+    "description": "a DCS q with an intermediate or private marker is not Sixel and is stripped: XTGETTCAP (+q, 7-bit and 8-bit), !q, \u003eq",
+    "input": "G1ArcTU0NGUbXJArcTU0NGWcG1AhcX4bXBtQPnF+G1xvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "dcs-decudk-decrqss"
+  },
+  {
+    "name": "sixel_with_params_pass",
+    "description": "a Sixel DCS with parameters (digits and ';' before q) still passes",
+    "input": "G1AwOzE7MHEjMH4bXA==",
+    "expected_output": "G1AwOzE7MHEjMH4bXA==",
+    "disposition": "pass",
+    "spec_row": "dcs-sixel"
+  },
+  {
+    "name": "s8c1t_strip",
+    "description": "S8C1T (ESC SP G) is stripped: the terminal would send replies with 8-bit C1 introducers; S7C1T passes",
+    "input": "GyBHGyBGb2s=",
+    "expected_output": "GyBGb2s=",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "report_requests_strip",
+    "description": "report requests are stripped: DECREQTPARM (x), XTSMGRAPHICS (?S), DECRQCRA (*y), DECRQPSR ($w), DECRQTSR ($u), DECRQUPSS (\u0026u); scroll-up (S) passes",
+    "input": "G1t4G1sxeBtbPzE7MTswUxtbMTsxOzE7MTsxOzEqeRtbMSR3G1sxJHUbWyZ1G1syU29r",
+    "expected_output": "G1syU29r",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decanm_vt52_reset_strip",
+    "description": "resetting ?2 (DECANM, into VT52 mode) is removed from a DEC private reset; other resets pass",
+    "input": "G1s/MmwbWz8yNTsybG9r",
+    "expected_output": "G1s/MjVsb2s=",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
     "name": "osc52_set_offered",
     "description": "an OSC 52 clipboard set is stripped from the stream and its decoded text is offered to the clipboard hook (bytes captured from a mouse-tracking REPL)",
     "input": "YRtdNTI7YztJQ0JHWVdKc1pTQTFMakVnd3JjZ1EyeGhkV1JsSUUxaGVBPT0HYg==",
