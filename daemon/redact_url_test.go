@@ -2,8 +2,11 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -38,7 +41,8 @@ func assertNoURLCredential(t *testing.T, where, body string) {
 }
 
 // TestRedactRepositoryURL pins the unit contract: userinfo is dropped from
-// http(s) URLs, while slugs, scp-like remotes, and unparseable input pass
+// http(s) URLs, including ones the URL parser rejects (fail closed), while
+// slugs, scp-like remotes, and input without an authority credential pass
 // through unchanged.
 //
 // RED: return raw unchanged and the credential cases fail.
@@ -57,6 +61,11 @@ func TestRedactRepositoryURL(t *testing.T) {
 		{name: "slug with at untouched", in: "github.com/org/repo@main", want: "github.com/org/repo@main"},
 		{name: "scp-like untouched", in: "git@git.example.com:org/repo.git", want: "git@git.example.com:org/repo.git"},
 		{name: "empty untouched", in: "", want: ""},
+		{name: "unparseable password stripped", in: "https://redact-user:redact^secret@git.example.com/org/repo.git", want: "https://git.example.com/org/repo.git"},
+		{name: "password with space stripped", in: "https://redact-user:redact secret@git.example.com/org/repo.git", want: "https://git.example.com/org/repo.git"},
+		{name: "invalid escape stripped", in: "https://redact-user:redact%zzsecret@git.example.com/org/repo.git", want: "https://git.example.com/org/repo.git"},
+		{name: "unescaped at in unparseable password stripped", in: "https://redact-user:re@dact^secret@git.example.com/org/repo.git", want: "https://git.example.com/org/repo.git"},
+		{name: "unparseable without userinfo untouched", in: "https://git.example.com/org/repo^x@main", want: "https://git.example.com/org/repo^x@main"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -113,7 +122,13 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 	})
 	defer cleanup()
 	d.mu.Lock()
-	d.config.Projects = []ProjectConfig{{ID: "demo", Repository: credentialed}}
+	// The second entry is a remote the URL parser rejects (a '^' in the
+	// password): its credential must not pass through either.
+	d.config.Projects = []ProjectConfig{
+		{ID: "demo", Repository: credentialed},
+		{ID: "demo-unparsed", Repository: "https://" + urlRedactUser + ":" + urlRedactPassword + "^x@git.example.com/org/repo.git"},
+	}
+	d.config.Orchestrator.URL = credentialed
 	d.mu.Unlock()
 	// The spawner allowlist is snapshotted at construction; refresh it so
 	// the seeded session below is admitted against the credentialed URL.
@@ -151,6 +166,7 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 		"/api/daemon/pool/stats",
 		"/api/daemon/sessions",
 		"/api/daemon/heartbeat",
+		"/api/daemon/doctor",
 		"/api/daemon/sessions/sess-cred-url",
 	} {
 		assertNoURLCredential(t, "GET "+path, rawControlBody(t, srv.Addr(), path))
@@ -159,7 +175,7 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 	// The heartbeat's stored payload is the upstream POST body too:
 	// serving must redact a copy, never the stored entries.
 	for _, entry := range d.heartbeat.LastPayload().Allowlist {
-		if entry.Repository != credentialed {
+		if !strings.Contains(entry.Repository, urlRedactPassword) {
 			t.Errorf("heartbeat stored allowlist rewritten to %q: serving must redact a copy", entry.Repository)
 		}
 	}
@@ -281,6 +297,25 @@ func TestWorkareaRoutes_RedactRepositoryCredentials(t *testing.T) {
 		id:       "wa-cred-url",
 		manifest: archiveManifest{SessionID: "sess-cred", Repository: urlRedactSentinelRaw()},
 	})
+	// The inspect response echoes every manifest key: a credentialed URL
+	// under a key other than "repository", or nested, must be redacted too.
+	manifestPath := filepath.Join(root, "wa-cred-url", "manifest.json")
+	rawManifest, err := os.ReadFile(manifestPath) //nolint:gosec // test-local fixture path
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest["cloneUrl"] = urlRedactSentinelRaw()
+	manifest["sources"] = []any{map[string]any{"url": urlRedactSentinelRaw()}}
+	if rawManifest, err = json.Marshal(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, rawManifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	hsrv := newServerForWorkareaTest(t, root, 0)
 
 	assertNoURLCredential(t, "GET /api/daemon/workareas",

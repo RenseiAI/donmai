@@ -1127,7 +1127,9 @@ func safeOrchestratorURL(c *Config) string {
 	if c == nil {
 		return ""
 	}
-	return c.Orchestrator.URL
+	// Served on the credential-free doctor route: an operator-configured
+	// URL with a user:token@ authority is served userinfo-redacted.
+	return redactRepositoryURL(c.Orchestrator.URL)
 }
 
 // safeProjectRepos routes the allowlist through redactRepositoryURLs so

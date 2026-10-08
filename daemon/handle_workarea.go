@@ -328,20 +328,31 @@ func redactWorkareaV1(wa *afclient.WorkareaV1) *afclient.WorkareaV1 {
 	return wa
 }
 
-// manifestURLKeys names manifest fields that carry repository URLs.
-var manifestURLKeys = []string{"repository"}
-
-// redactManifestURLs rewrites known repository-URL fields of a served
-// manifest copy in place. The map is the inspect response's own copy —
-// the stored manifest is never rewritten.
+// redactManifestURLs rewrites every string of a served manifest copy in
+// place, nested maps and lists included. The manifest echoes every key the
+// archive's manifest.json carries (legacy and foreign producers alike), so
+// a credentialed URL can sit under any key, not only "repository".
+// redactRepositoryURL leaves strings that carry no URL userinfo unchanged.
+// The map is decoded fresh from disk for each response; the stored
+// manifest is never rewritten.
 func redactManifestURLs(manifest map[string]any) {
-	for _, key := range manifestURLKeys {
-		raw, ok := manifest[key].(string)
-		if !ok || raw == "" {
-			continue
-		}
-		manifest[key] = redactRepositoryURL(raw)
+	for key, value := range manifest {
+		manifest[key] = redactManifestValue(value)
 	}
+}
+
+func redactManifestValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return redactRepositoryURL(typed)
+	case map[string]any:
+		redactManifestURLs(typed)
+	case []any:
+		for i := range typed {
+			typed[i] = redactManifestValue(typed[i])
+		}
+	}
+	return value
 }
 
 // lookupActiveByID returns the active pool member matching id, if the
