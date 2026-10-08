@@ -295,9 +295,18 @@ func TestShimOutputBatchBoundsDurableFrameAge(t *testing.T) {
 	})
 	var gateWire, gateSource, gateBatch int
 	waitFor(t, 9*time.Second, "live relay traffic while the source emits", func() bool {
+		// Count what the final assertion counts: recorded source output
+		// lines on the wire. Any other frame there, such as the PTY's echo
+		// of "start" when the write beats `stty -echo`, must not open the
+		// gate, or the Marker can follow a single output line.
 		mu.Lock()
 		wireMu.Lock()
-		nWire, nSource, nBatch := len(wireArrivals), len(source), largestBatch
+		nWire, nSource, nBatch := 0, len(source), largestBatch
+		for seq := range wireArrivals {
+			if frame, ok := source[seq]; ok && bytes.Contains(frame.raw, []byte("output-")) {
+				nWire++
+			}
+		}
 		wireMu.Unlock()
 		mu.Unlock()
 		select {
