@@ -442,11 +442,13 @@ const (
 	ScheduleManual    UpdateSchedule = "manual"
 )
 
-// CloneStrategy controls how the daemon clones a project repo for new
-// workarea pool members.
+// CloneStrategy is the retired per-repository clone override. The key is
+// still tolerated on read (see the deprecation notice in config.go) but is
+// never written and never influences behaviour.
 type CloneStrategy string
 
-// Clone strategy constants.
+// Clone strategy constants. Retained only so previously written values keep
+// decoding to the same strings; nothing reads them.
 const (
 	CloneShallow   CloneStrategy = "shallow"
 	CloneFull      CloneStrategy = "full"

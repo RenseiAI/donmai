@@ -1,9 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -244,8 +248,8 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 	if len(loaded.Projects) != 1 || loaded.Projects[0].ID != "agentfactory" {
 		t.Errorf("Projects = %+v", loaded.Projects)
 	}
-	if loaded.Projects[0].CloneStrategy != CloneShallow {
-		t.Errorf("CloneStrategy default = %q, want shallow", loaded.Projects[0].CloneStrategy)
+	if loaded.Projects[0].Repository != "github.com/foo/bar" {
+		t.Errorf("Repository = %q, want github.com/foo/bar", loaded.Projects[0].Repository)
 	}
 }
 
@@ -452,15 +456,14 @@ func TestRepositoryNormalization_V2WinsAndRetainsDistinctLegacy(t *testing.T) {
 		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
 		EnabledProjectIDs:       []string{"alpha"},
 		Projects: []ProjectConfig{
-			{ID: "alpha", Repository: "https://example.com/acme/api.git", CloneStrategy: CloneShallow},
-			{ID: "alpha", Repository: "https://example.com/acme/web.git", CloneStrategy: CloneFull},
+			{ID: "alpha", Repository: "https://example.com/acme/api.git"},
+			{ID: "alpha", Repository: "https://example.com/acme/web.git"},
 		},
 		Repositories: []RepositoryConfig{{
-			ID:            "repo-api",
-			ProjectID:     "alpha",
-			Source:        "https://example.com/acme/api",
-			Primary:       true,
-			CloneStrategy: CloneFull,
+			ID:        "repo-api",
+			ProjectID: "alpha",
+			Source:    "https://example.com/acme/api",
+			Primary:   true,
 		}},
 	}
 	normalizeProjectContract(cfg)
@@ -473,7 +476,7 @@ func TestRepositoryNormalization_V2WinsAndRetainsDistinctLegacy(t *testing.T) {
 			api = repository
 		}
 	}
-	if api.ID != "repo-api" || api.CloneStrategy != CloneFull || !api.Primary {
+	if api.ID != "repo-api" || !api.Primary {
 		t.Fatalf("v2 repository did not win conflict: %+v", api)
 	}
 }
@@ -526,7 +529,6 @@ capacity:
 projects:
   - id: legacy
     repoUrl: github.com/foo/legacy
-    cloneStrategy: shallow
 orchestrator:
   url: https://platform.example.com
 autoUpdate:
@@ -568,8 +570,7 @@ func TestProjectAllowWriter_DaemonReader_RoundTrip(t *testing.T) {
 	writerPath := filepath.Join(dir, "writer.yaml")
 	writer := &afclient.DaemonYAML{
 		Projects: []afclient.ProjectEntry{{
-			RepoURL:       "github.com/foo/bar",
-			CloneStrategy: afclient.CloneShallow,
+			RepoURL: "github.com/foo/bar",
 		}},
 	}
 	if err := afclient.WriteDaemonYAML(writerPath, writer); err != nil {
@@ -673,8 +674,7 @@ func TestProjectAllowWriter_PreservesFullConfig_ThenLoadConfigSucceeds(t *testin
 		t.Fatalf("ReadDaemonYAML: %v", err)
 	}
 	cliCfg.AddOrUpdateProject(afclient.ProjectEntry{
-		RepoURL:       "github.com/foo/bar",
-		CloneStrategy: afclient.CloneShallow,
+		RepoURL: "github.com/foo/bar",
 	})
 	if err := afclient.WriteDaemonYAML(path, cliCfg); err != nil {
 		t.Fatalf("WriteDaemonYAML: %v", err)
@@ -1087,7 +1087,6 @@ projects:
   - id: mixed
     repository: github.com/foo/canonical
     repoUrl: github.com/foo/legacy
-    cloneStrategy: shallow
 orchestrator:
   url: https://platform.example.com
 autoUpdate:
@@ -1207,4 +1206,296 @@ extraEmbeddingKey:
 	if !ok || machine["id"] != "updated-machine" {
 		t.Fatalf("declared field lost to stale raw copy: %s", overrideRaw)
 	}
+}
+
+// daemonSlogWarningCapture holds the log output emitted through the default
+// slog logger while a test runs. warnIfRetiredCloneStrategyPresent logs via
+// the package-level slog.Warn, so tests swap the default handler.
+type daemonSlogWarningCapture struct {
+	buf *bytes.Buffer
+}
+
+func (c *daemonSlogWarningCapture) text() string { return c.buf.String() }
+
+func (c *daemonSlogWarningCapture) count() int {
+	return bytes.Count(c.buf.Bytes(), []byte(retiredCloneStrategyWarning))
+}
+
+// captureDaemonSlogWarnings swaps the default slog logger for a text handler
+// over a buffer and restores it when the test ends.
+func captureDaemonSlogWarnings(t *testing.T) *daemonSlogWarningCapture {
+	t.Helper()
+	capture := &daemonSlogWarningCapture{buf: &bytes.Buffer{}}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(capture.buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return capture
+}
+
+// TestLoadConfig_RetiredCloneStrategyKeyLoadsWithOneWarning is the
+// daemon-side retirement test for the dead per-repository clone override: a
+// file that still carries the key on many entries loads successfully, the
+// value is ignored (the typed schema no longer models it), the writer never
+// emits it, and exactly one deprecation warning is logged per load no matter
+// how many entries carry the key.
+func TestLoadConfig_RetiredCloneStrategyKeyLoadsWithOneWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: donmai.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+projects:
+  - id: one
+    repository: github.com/foo/one
+    cloneStrategy: shallow
+  - id: two
+    repository: github.com/foo/two
+    cloneStrategy: full
+repositories:
+  - id: repo-one
+    projectId: one
+    source: github.com/foo/one
+    cloneStrategy: shallow
+orchestrator:
+  url: https://platform.example.com
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureDaemonSlogWarnings(t)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig with retired key: %v", err)
+	}
+	if len(cfg.Projects) != 2 {
+		t.Fatalf("Projects = %d, want 2 (retired key must not drop entries)", len(cfg.Projects))
+	}
+	if len(cfg.Repositories) != 2 {
+		t.Fatalf("Repositories = %d, want 2 (retired key must not drop entries)", len(cfg.Repositories))
+	}
+	if got := warnings.count(); got != 1 {
+		t.Fatalf("deprecation warnings = %d, want exactly 1", got)
+	}
+	if !strings.Contains(warnings.text(), "cloneStrategy") {
+		t.Errorf("warning should name the retired key, got:\n%s", warnings.text())
+	}
+	// A load-then-write cycle drops the retired key: writers never emit it.
+	out := filepath.Join(dir, "rewritten.yaml")
+	if err := WriteConfig(out, cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "cloneStrategy") {
+		t.Errorf("writer emitted retired key:\n%s", raw)
+	}
+	// A clean file loads with no warning.
+	quiet := captureDaemonSlogWarnings(t)
+	if _, err := LoadConfig(out); err != nil {
+		t.Fatalf("LoadConfig after rewrite: %v", err)
+	}
+	if got := quiet.count(); got != 0 {
+		t.Errorf("warnings on clean file = %d, want 0", got)
+	}
+}
+
+// TestLoadConfig_NoRetiredCloneStrategyKeyIsQuiet pins the other half: a file
+// without the retired key loads with no deprecation warning.
+func TestLoadConfig_NoRetiredCloneStrategyKeyIsQuiet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: donmai.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+projects:
+  - id: one
+    repository: github.com/foo/one
+orchestrator:
+  url: https://platform.example.com
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureDaemonSlogWarnings(t)
+	if _, err := LoadConfig(path); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := warnings.count(); got != 0 {
+		t.Errorf("warnings = %d, want 0", got)
+	}
+}
+
+// TestRetiredCloneStrategySettingIsUnread is the grep-style guard for the
+// retired per-repository clone override. It walks every non-test Go file in
+// the module and fails on any shape that would model, read or write the
+// setting again (see retiredCloneSettingShape). The unrelated clone-versus-
+// worktree selector in runtime/worktree is a different type and is skipped.
+// The ignore-with-warning helpers name the key only inside longer
+// identifiers and string literals, which none of the shapes match.
+func TestRetiredCloneStrategySettingIsUnread(t *testing.T) {
+	root, err := moduleRoot(t)
+	if err != nil {
+		t.Fatalf("module root: %v", err)
+	}
+	var violations []string
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".agent", "vendor", "testdata", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if strings.HasPrefix(rel, "runtime/worktree/") {
+			return nil
+		}
+		//nolint:gosec // G122: the walk root is the repo checkout and rel is
+		// confined below it (filepath.Rel from the walk path); symlinks in a
+		// developer checkout are not an attack surface for this guard test.
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			if shape := retiredCloneSettingShape(rel, stripLineComment(line)); shape != "" {
+				violations = append(violations, rel+":"+itoa(i+1)+": "+shape+": "+strings.TrimSpace(line))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(violations) > 0 {
+		t.Errorf("retired clone setting is modelled, read or written by production code:\n%s", strings.Join(violations, "\n"))
+	}
+}
+
+// moduleRoot returns the repository root by walking up from the test's
+// working directory to the directory holding go.mod.
+func moduleRoot(t *testing.T) (string, error) {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", errNoGoMod
+		}
+		dir = parent
+	}
+}
+
+var errNoGoMod = errors.New("go.mod not found")
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var digits []byte
+	for n > 0 {
+		digits = append([]byte{byte('0' + n%10)}, digits...)
+		n /= 10
+	}
+	return string(digits)
+}
+
+// stripLineComment cuts a // comment, keeping string literals intact for the
+// single-quoted YAML key this guard looks for (backticks are not comment
+// syntax, so quoted mentions in comments stay visible to the allowlist).
+func stripLineComment(line string) string {
+	inString := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '"':
+			if i == 0 || line[i-1] != '\\' {
+				inString = !inString
+			}
+		case '/':
+			if !inString && i+1 < len(line) && line[i+1] == '/' {
+				return line[:i]
+			}
+		}
+	}
+	return line
+}
+
+var (
+	retiredCloneFieldDecl = regexp.MustCompile(`\bCloneStrategy\s+\*?(?:afclient\.|daemon\.)?CloneStrategy\b`)
+	retiredCloneTag       = regexp.MustCompile(`(?:yaml|json):"cloneStrategy\b`)
+	retiredCloneValue     = regexp.MustCompile(`\bClone(?:Shallow|Full|Reference)\b`)
+	retiredCloneSelector  = regexp.MustCompile(`(\w+)\.CloneStrategy\b`)
+	retiredCloneTypeLocal = regexp.MustCompile(`\bCloneStrategy\b`)
+	retiredCloneDecl      = regexp.MustCompile(`^(?:type CloneStrategy string|Clone(?:Shallow|Full|Reference)\s+CloneStrategy\s*=\s*"[a-z-]+")$`)
+)
+
+// retiredCloneSettingShape names the forbidden shape a comment-stripped line
+// of production code takes, or returns "" when it takes none. The only
+// permitted mentions are the retired type and value declarations, which stay
+// so that previously written values keep their names.
+func retiredCloneSettingShape(rel, code string) string {
+	declares := rel == "daemon/types.go" || rel == "afclient/daemon_config.go"
+	if declares && retiredCloneDecl.MatchString(strings.TrimSpace(code)) {
+		return ""
+	}
+	switch {
+	case retiredCloneFieldDecl.MatchString(code):
+		return "field of the retired type"
+	case retiredCloneTag.MatchString(code):
+		return "struct tag naming the retired key"
+	case retiredCloneValue.MatchString(code):
+		return "retired value"
+	}
+	for _, m := range retiredCloneSelector.FindAllStringSubmatch(code, -1) {
+		if m[1] != "worktree" {
+			return "selector on CloneStrategy"
+		}
+	}
+	owner := strings.HasPrefix(rel, "daemon/") || strings.HasPrefix(rel, "afclient/")
+	if owner && retiredCloneTypeLocal.MatchString(code) {
+		return "use of the retired type"
+	}
+	return ""
 }

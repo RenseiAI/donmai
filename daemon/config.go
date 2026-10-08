@@ -304,24 +304,30 @@ type ReservedSystemSpec struct {
 // ProjectConfig describes one repository resource bound to a project. More
 // than one entry may share an ID; project admission is controlled separately
 // by Config.EnabledProjectIDs.
+//
+// The retired per-repository clone override is not modelled here. A file
+// that still carries the key keeps loading; the loader logs one deprecation
+// warning per file (see warnIfRetiredCloneStrategyPresent), and writers
+// never emit the key.
 type ProjectConfig struct {
-	RepositoryID  string        `yaml:"-"                        json:"repositoryId,omitempty"`
-	Primary       bool          `yaml:"-"                        json:"primary,omitempty"`
-	ID            string        `yaml:"id"                       json:"id"`
-	Repository    string        `yaml:"repository"               json:"repository"`
-	CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty"  json:"cloneStrategy,omitempty"`
-	Git           *ProjectGit   `yaml:"git,omitempty"            json:"git,omitempty"`
+	RepositoryID string      `yaml:"-"                        json:"repositoryId,omitempty"`
+	Primary      bool        `yaml:"-"                        json:"primary,omitempty"`
+	ID           string      `yaml:"id"                       json:"id"`
+	Repository   string      `yaml:"repository"               json:"repository"`
+	Git          *ProjectGit `yaml:"git,omitempty"            json:"git,omitempty"`
 }
 
 // RepositoryConfig is one repository resource linked to a project. Repository
 // identity and project admission are independent.
+//
+// The retired per-repository clone override is not modelled here; see
+// ProjectConfig.
 type RepositoryConfig struct {
-	ID            string        `yaml:"id"                      json:"id"`
-	ProjectID     string        `yaml:"projectId"               json:"projectId"`
-	Source        string        `yaml:"source"                  json:"source"`
-	Primary       bool          `yaml:"primary,omitempty"       json:"primary,omitempty"`
-	CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty" json:"cloneStrategy,omitempty"`
-	Git           *ProjectGit   `yaml:"git,omitempty"           json:"git,omitempty"`
+	ID        string      `yaml:"id"                      json:"id"`
+	ProjectID string      `yaml:"projectId"               json:"projectId"`
+	Source    string      `yaml:"source"                  json:"source"`
+	Primary   bool        `yaml:"primary,omitempty"       json:"primary,omitempty"`
+	Git       *ProjectGit `yaml:"git,omitempty"           json:"git,omitempty"`
 }
 
 // UnmarshalYAML accepts either the canonical `repository` key or the legacy
@@ -329,19 +335,22 @@ type RepositoryConfig struct {
 // `rensei project allow`). When the legacy key is found a one-line warning
 // is logged so operators know to rewrite the file; this back-compat shim is
 // scheduled for removal one release after the canonical writer ships.
+//
+// The retired per-repository clone override is not decoded: files that still
+// carry the key keep loading and the value is ignored. LoadConfig logs one
+// deprecation warning per file (see warnIfRetiredCloneStrategyPresent), so
+// this decoder stays silent.
 func (p *ProjectConfig) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
-		ID            string        `yaml:"id"`
-		Repository    string        `yaml:"repository"`
-		RepoURL       string        `yaml:"repoUrl"`
-		CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty"`
-		Git           *ProjectGit   `yaml:"git,omitempty"`
+		ID         string      `yaml:"id"`
+		Repository string      `yaml:"repository"`
+		RepoURL    string      `yaml:"repoUrl"`
+		Git        *ProjectGit `yaml:"git,omitempty"`
 	}
 	if err := node.Decode(&raw); err != nil {
 		return err
 	}
 	p.ID = raw.ID
-	p.CloneStrategy = raw.CloneStrategy
 	p.Git = raw.Git
 	switch {
 	case raw.Repository != "":
@@ -355,6 +364,60 @@ func (p *ProjectConfig) UnmarshalYAML(node *yaml.Node) error {
 		)
 	}
 	return nil
+}
+
+// retiredCloneStrategyWarning is the single deprecation notice logged when
+// a load encounters the retired per-repository clone override. The key is
+// ignored; the warning tells operators to drop it.
+const retiredCloneStrategyWarning = "daemon.yaml: 'cloneStrategy' is retired and ignored; remove the key"
+
+// warnIfRetiredCloneStrategyPresent scans the raw file for the retired key
+// and logs exactly one deprecation warning when any entry still carries it.
+// The typed decoder ignores the key, so detection runs on the raw mapping
+// tree: the typed structs no longer name the key at all.
+func warnIfRetiredCloneStrategyPresent(data []byte) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := root.Content[i]
+		if key.Kind != yaml.ScalarNode {
+			continue
+		}
+		if key.Value != "projects" && key.Value != "repositories" {
+			continue
+		}
+		entries := root.Content[i+1]
+		if entries.Kind == yaml.AliasNode && entries.Alias != nil {
+			entries = entries.Alias
+		}
+		if entries.Kind != yaml.SequenceNode {
+			continue
+		}
+		for _, entry := range entries.Content {
+			item := entry
+			if item.Kind == yaml.AliasNode && item.Alias != nil {
+				item = item.Alias
+			}
+			if item.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j+1 < len(item.Content); j += 2 {
+				if item.Content[j].Kind == yaml.ScalarNode && item.Content[j].Value == "cloneStrategy" {
+					slog.Warn(retiredCloneStrategyWarning)
+					return
+				}
+			}
+		}
+	}
 }
 
 // ProjectGit captures per-project credential helper / SSH key hints.
@@ -468,6 +531,10 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse daemon config %q: %w", path, err)
 	}
+	// The retired clone override is not part of the typed schema, so its
+	// presence is detected on the raw document: one warning per load no
+	// matter how many entries still carry the key.
+	warnIfRetiredCloneStrategyPresent(data)
 
 	// Decode authored presence with the same YAML rules as Config, including
 	// aliases and merge keys. Null, like omission, requests the default.
@@ -725,11 +792,8 @@ func applyDefaultsWithCapacityPresence(c *Config, sessionLimitAuthored bool) {
 		// entirely. Kept in lock-step with kitRegistryOrEmpty.
 		c.Trust.IssuerSet = defaultVendorIssuerSet()
 	}
-	for i := range c.Projects {
-		if c.Projects[i].CloneStrategy == "" {
-			c.Projects[i].CloneStrategy = CloneShallow
-		}
-	}
+	// The retired clone override is not defaulted: nothing reads it, and
+	// writers never emit it.
 }
 
 // EffectiveEnabledProjectIDs returns the normalized project-admission set.
@@ -817,7 +881,7 @@ func (c *Config) EffectiveProjectConfigs() []ProjectConfig {
 	if localRuntimeRequested(c) && c.LocalRuntime != nil {
 		projects := make([]ProjectConfig, 0, len(c.LocalRuntime.Repositories))
 		for _, repository := range c.LocalRuntime.Repositories {
-			projects = append(projects, ProjectConfig{ID: repository.OwnerRepo, RepositoryID: fmt.Sprintf("github:%d", repository.RepositoryID), Repository: "https://github.com/" + repository.OwnerRepo + ".git", Primary: true, CloneStrategy: CloneFull})
+			projects = append(projects, ProjectConfig{ID: repository.OwnerRepo, RepositoryID: fmt.Sprintf("github:%d", repository.RepositoryID), Repository: "https://github.com/" + repository.OwnerRepo + ".git", Primary: true})
 		}
 		return projects
 	}
@@ -829,12 +893,11 @@ func (c *Config) EffectiveProjectConfigs() []ProjectConfig {
 	out := make([]ProjectConfig, 0, len(repositories))
 	for _, repository := range repositories {
 		out = append(out, ProjectConfig{
-			RepositoryID:  repository.ID,
-			Primary:       repository.Primary,
-			ID:            repository.ProjectID,
-			Repository:    repository.Source,
-			CloneStrategy: repository.CloneStrategy,
-			Git:           repository.Git,
+			RepositoryID: repository.ID,
+			Primary:      repository.Primary,
+			ID:           repository.ProjectID,
+			Repository:   repository.Source,
+			Git:          repository.Git,
 		})
 	}
 	return out
@@ -852,9 +915,6 @@ func normalizeRepositories(v2 []RepositoryConfig, legacy []ProjectConfig) []Repo
 		if repository.ID == "" {
 			repository.ID = legacyRepositoryID(repository.ProjectID, repository.Source)
 		}
-		if repository.CloneStrategy == "" {
-			repository.CloneStrategy = CloneShallow
-		}
 		key := repository.ProjectID + "\x00" + normalizeRepositorySource(repository.Source)
 		if _, exists := byKey[key]; exists && !wins {
 			return
@@ -866,11 +926,10 @@ func normalizeRepositories(v2 []RepositoryConfig, legacy []ProjectConfig) []Repo
 	}
 	for _, project := range legacy {
 		add(RepositoryConfig{
-			ID:            legacyRepositoryID(project.ID, project.Repository),
-			ProjectID:     project.ID,
-			Source:        project.Repository,
-			CloneStrategy: project.CloneStrategy,
-			Git:           project.Git,
+			ID:        legacyRepositoryID(project.ID, project.Repository),
+			ProjectID: project.ID,
+			Source:    project.Repository,
+			Git:       project.Git,
 		}, false)
 	}
 	for _, repository := range v2 {
@@ -907,10 +966,9 @@ func syncLegacyProjectProjection(c *Config) {
 			continue
 		}
 		projects = append(projects, ProjectConfig{
-			ID:            repository.ProjectID,
-			Repository:    repository.Source,
-			CloneStrategy: repository.CloneStrategy,
-			Git:           repository.Git,
+			ID:         repository.ProjectID,
+			Repository: repository.Source,
+			Git:        repository.Git,
 		})
 	}
 	c.Projects = projects
@@ -972,11 +1030,9 @@ func validateConfig(c *Config) error {
 		if p.Repository == "" {
 			return fmt.Errorf("projects[%d].repository is required", i)
 		}
-		switch p.CloneStrategy {
-		case "", CloneShallow, CloneFull, CloneReference:
-		default:
-			return fmt.Errorf("projects[%d].cloneStrategy invalid: %q", i, p.CloneStrategy)
-		}
+		// The retired `cloneStrategy` key is not validated: a file that
+		// still carries it loads with one deprecation warning (see
+		// LoadConfig) and the value is ignored.
 	}
 	repositoryIDs := make(map[string]struct{}, len(c.Repositories))
 	primaryByProject := make(map[string]string)
@@ -994,11 +1050,8 @@ func validateConfig(c *Config) error {
 		if strings.TrimSpace(repository.Source) == "" {
 			return fmt.Errorf("repositories[%d].source is required", i)
 		}
-		switch repository.CloneStrategy {
-		case "", CloneShallow, CloneFull, CloneReference:
-		default:
-			return fmt.Errorf("repositories[%d].cloneStrategy invalid: %q", i, repository.CloneStrategy)
-		}
+		// The retired `cloneStrategy` key is not validated here either;
+		// see the projects[] note above.
 		if repository.Primary {
 			if prior, exists := primaryByProject[repository.ProjectID]; exists {
 				return fmt.Errorf("repositories[%d].primary conflicts with %q for project %q", i, prior, repository.ProjectID)
