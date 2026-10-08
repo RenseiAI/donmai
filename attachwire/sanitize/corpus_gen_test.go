@@ -172,6 +172,20 @@ func corpusFixtures() []fixture {
 			"user@host:~$ \x1b[32mok\x1b[0m\x07\x1b]0;title\x07\x1b[6n\r\n",
 			"user@host:~$ \x1b[32mok\x1b[0m\r\n", "mixed", "mixed",
 		},
+
+		// --- UTF-8 inside string bodies ---------------------------------------
+		{
+			"osc_title_utf8_c1_continuation", "OSC 0 title whose payload holds a UTF-8 rune with a 0x9C continuation byte (U+2733, as a REPL writes for its idle title) is neutralized whole: 0x9C inside a rune is payload, not ST, so no title text reaches the prompt",
+			"\xe2\x9d\xaf \x1b]0;\xe2\x9c\xb3 session-name\x07", "\xe2\x9d\xaf ", "neutralize", "osc-title",
+		},
+		{
+			"apc_utf8_c1_continuation_strip", "an APC string whose payload holds a UTF-8 rune with a 0x9C continuation byte is stripped whole, through its real ST",
+			"\x1b_\xe2\x9c\xb3 hidden\x1b\\ok", "ok", "strip", "apc-pm",
+		},
+		{
+			"osc_utf8_encoded_c1_ends_string", "a UTF-8-encoded C1 control (U+009C) inside an OSC body ends the string for a UTF-8 terminal, so the sanitizer strips the string and sanitizes the rest from ground (the raw CSI 6n after it is stripped)",
+			"\x1b]8;;x\xc2\x9c\x9b6nok", "ok", "strip", "osc-8",
+		},
 	}
 }
 

@@ -115,6 +115,12 @@ type Sanitizer struct {
 	sawEsc   bool    // inside a string: saw ESC, expecting '\' to complete ST
 	utf8Rem  int     // UTF-8 continuation bytes still expected in ground
 	utf8Buf  []byte  // partial multibyte UTF-8 rune held until complete
+
+	// UTF-8 tracking inside a string body. A continuation byte can carry the
+	// value of a C1 control (0x9C is both ST and the middle byte of U+2733);
+	// strRem/strLead keep such a byte payload, as in ground.
+	strRem  int  // UTF-8 continuation bytes still expected in the string body
+	strLead byte // lead byte of the rune being completed in the string body
 }
 
 // New returns a Sanitizer with the frozen reference defaults.
@@ -148,6 +154,7 @@ func (s *Sanitizer) Reset() {
 	s.sawEsc = false
 	s.utf8Rem = 0
 	s.utf8Buf = s.utf8Buf[:0]
+	s.strRem = 0
 	s.introLen = 0
 	s.curCap = 0
 }
@@ -267,18 +274,28 @@ func (s *Sanitizer) stepGround(b byte, out *[]byte) bool {
 	// high byte (lone continuation 0xA0-0xBF, invalid lead 0xC0/0xC1/0xF5-0xFF)
 	// is invalid UTF-8 and is dropped. Dropping — rather than passing a lone
 	// invalid byte — keeps the output well-formed and the filter idempotent.
-	switch {
-	case b >= 0xC2 && b <= 0xDF:
-		s.utf8Rem = 1
-	case b >= 0xE0 && b <= 0xEF:
-		s.utf8Rem = 2
-	case b >= 0xF0 && b <= 0xF4:
-		s.utf8Rem = 3
-	default:
+	n := utf8Trail(b)
+	if n == 0 {
 		return true // invalid lead / lone continuation — strip
 	}
+	s.utf8Rem = n
 	s.utf8Buf = append(s.utf8Buf[:0], b)
 	return true
+}
+
+// utf8Trail returns how many continuation bytes follow the UTF-8 lead byte b,
+// or 0 when b is not a valid lead byte.
+func utf8Trail(b byte) int {
+	switch {
+	case b >= 0xC2 && b <= 0xDF:
+		return 1
+	case b >= 0xE0 && b <= 0xEF:
+		return 2
+	case b >= 0xF0 && b <= 0xF4:
+		return 3
+	default:
+		return 0
+	}
 }
 
 // --- escape -----------------------------------------------------------------
@@ -455,6 +472,7 @@ func (s *Sanitizer) beginDCS(introducer byte) {
 	s.st = stDCS
 	s.pending = append(s.pending[:0], introducer)
 	s.introLen = len(s.pending)
+	s.strRem = 0
 }
 
 func (s *Sanitizer) stepDCS(b byte, _ *[]byte) bool {
@@ -479,6 +497,7 @@ func (s *Sanitizer) stepDCS(b byte, _ *[]byte) bool {
 		return true
 	default:
 		s.dropStringUntilST() // malformed header — strip until ST
+		s.strRem, s.strLead = utf8Trail(b), b
 		return true
 	}
 	if len(s.pending) > s.holdMax {
@@ -533,6 +552,7 @@ func (s *Sanitizer) enterStr(kind strKind, oscBEL bool) {
 	s.kind = kind
 	s.oscBEL = oscBEL
 	s.sawEsc = false
+	s.strRem = 0
 	switch kind {
 	case kOSC:
 		s.drop = false
@@ -552,7 +572,8 @@ func (s *Sanitizer) dropStringUntilST() {
 	s.drop = true
 	s.sawEsc = false
 	s.pending = s.pending[:0]
-	// oscBEL/kind retain whatever terminator acceptance the sequence had.
+	// oscBEL/kind retain whatever terminator acceptance the sequence had, and
+	// strRem keeps tracking a rune the cap split.
 }
 
 func (s *Sanitizer) stepStr(b byte, out *[]byte) bool {
@@ -566,6 +587,30 @@ func (s *Sanitizer) stepStr(b byte, out *[]byte) bool {
 		s.st = stEsc
 		s.pending = append(s.pending[:0], esc)
 		return false // re-dispatch b in stEsc
+	}
+
+	// Mid-rune: a continuation byte is payload even when its value is a C1
+	// control. Claude Code titles its terminal "✳ <session name>", and the
+	// middle byte of ✳ (E2 9C B3) is 0x9C. Read as ST, it ended the title early
+	// and the rest of the title was rendered as text at the cursor, which sits
+	// in the prompt input.
+	if s.strRem > 0 {
+		if b >= 0x80 && b <= 0xBF {
+			if s.strLead == 0xC2 && b <= 0x9F {
+				// U+0080..U+009F is a C1 control in UTF-8 form. A UTF-8
+				// terminal leaves the string here (U+009C is ST), so the
+				// following bytes are not inert payload: strip the string and
+				// sanitize the rest from ground.
+				s.st = stGround
+				s.drop = false
+				s.strRem = 0
+				return true
+			}
+			s.strRem--
+			s.strBody(b)
+			return true
+		}
+		s.strRem = 0 // invalid continuation: b is dispatched as a fresh byte
 	}
 
 	switch {
@@ -584,14 +629,21 @@ func (s *Sanitizer) stepStr(b byte, out *[]byte) bool {
 		return true
 	}
 
-	// Body byte.
-	if !s.drop {
-		s.pending = append(s.pending, b)
-		if len(s.pending) > s.curCap {
-			s.dropStringUntilST() // over cap — strip whole and resync (§9)
-		}
-	}
+	s.strRem, s.strLead = utf8Trail(b), b
+	s.strBody(b)
 	return true
+}
+
+// strBody holds one payload byte of the current string, stripping the whole
+// string once it exceeds its cap.
+func (s *Sanitizer) strBody(b byte) {
+	if s.drop {
+		return
+	}
+	s.pending = append(s.pending, b)
+	if len(s.pending) > s.curCap {
+		s.dropStringUntilST() // over cap — strip whole and resync (§9)
+	}
 }
 
 // finishStr terminates the current string body. term is the terminator byte(s)

@@ -549,3 +549,71 @@ func TestCorpusCoverageAllRows(t *testing.T) {
 		}
 	}
 }
+
+// claudeIdleTitle is the exact OSC 0 a Claude Code REPL started with
+// `--name website-refactor` writes when it goes idle: "\x1b]0;" + U+2733 (✳,
+// UTF-8 E2 9C B3) + " website-refactor" + BEL. The middle byte of ✳ is 0x9C,
+// the value of the 8-bit C1 string terminator.
+const claudeIdleTitle = "\x1b]0;\xe2\x9c\xb3 website-refactor\x07"
+
+// TestStringBodyUTF8ContinuationIsNotST pins that a 0x9C byte INSIDE a
+// multibyte UTF-8 rune in a string body is payload, not an 8-bit ST. Treating
+// it as ST ended the title early, and the rest of the payload (" website-
+// refactor") fell back to ground and was rendered as text at the cursor. For an
+// interactive Claude Code session the cursor is parked in the prompt input, so
+// the session name appeared to be typed into the input box.
+func TestStringBodyUTF8ContinuationIsNotST(t *testing.T) {
+	cases := []struct {
+		name, in, want, title string
+	}{
+		{"claude-idle-title-bel", "\xe2\x9d\xaf " + claudeIdleTitle, "\xe2\x9d\xaf ", "\xe2\x9c\xb3 website-refactor"},
+		{"claude-idle-title-st", "\x1b]2;\xe2\x9c\xb3 name\x1b\\ok", "ok", "\xe2\x9c\xb3 name"},
+		{"c1-osc-title", "\x9d0;\xe2\x9c\xb3 name\x9cok", "ok", "\xe2\x9c\xb3 name"},
+		{"four-byte-rune", "\x1b]0;\xf0\x9f\x8c\x9c moon\x07ok", "ok", "\xf0\x9f\x8c\x9c moon"},
+		{"osc8-pass-intact", "\x1b]8;;https://x/\xe2\x9c\xb3\x1b\\t\x1b]8;;\x1b\\", "\x1b]8;;https://x/\xe2\x9c\xb3\x1b\\t\x1b]8;;\x1b\\", ""},
+		{"apc-strip-whole", "\x1b_\xe2\x9c\xb3 hidden\x1b\\ok", "ok", ""},
+		{"malformed-dcs-header-strip-whole", "\x1bP\xe2\x9c\xb3 hidden\x1b\\ok", "ok", ""},
+		{"lone-c1-st-still-terminates", "\x1b]0;name\x9cok", "ok", "name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for split := 0; split <= len(tc.in); split++ {
+				var title string
+				s := NewWithOptions(Options{OnTitle: func(tt string) { title = tt }})
+				got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+				if string(got) != tc.want {
+					t.Fatalf("split %d: got %q, want %q", split, got, tc.want)
+				}
+				if title != tc.title {
+					t.Fatalf("split %d: title chip %q, want %q", split, title, tc.title)
+				}
+			}
+		})
+	}
+}
+
+// TestStringBodyUTF8EncodedC1EndsString pins the conservative side of the
+// string-body UTF-8 rule: a C1 control encoded as UTF-8 (U+0080..U+009F, lead
+// byte 0xC2) is a control to a UTF-8 terminal, which leaves the string there.
+// The sanitizer must not keep treating the following bytes as inert payload, so
+// it strips the string and resumes in ground, where the rest is sanitized.
+func TestStringBodyUTF8EncodedC1EndsString(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// U+009C (C2 9C) ends an OSC 8 that would otherwise pass verbatim; the
+		// raw 8-bit CSI after it is parsed as a DSR and stripped.
+		{"\x1b]8;;x\xc2\x9c\x9b6nok", "ok"},
+		{"\x1b]0;t\xc2\x9cok", "ok"},
+		{"\x1b]0;t\xc2\x85ok", "ok"},
+		// A non-C1 two-byte rune (U+00A9) remains payload.
+		{"\x1b]0;\xc2\xa9 t\x07ok", "ok"},
+	}
+	for _, tc := range cases {
+		for split := 0; split <= len(tc.in); split++ {
+			s := New()
+			got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+			if string(got) != tc.want {
+				t.Fatalf("%q split %d: got %q, want %q", tc.in, split, got, tc.want)
+			}
+		}
+	}
+}
