@@ -478,11 +478,11 @@ func TestEscIntTransitions(t *testing.T) {
 // TestDCSTransitions exercises DCS header aborts, restarts, and overflow.
 func TestDCSTransitions(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"\x1b\x50\x1b7", "\x1b7"},           // DCS aborted by ESC restart -> DECSC passes
-		{"\x1b\x50\x18Z", "Z"},               // DCS aborted by CAN
-		{"\x1b\x50q~\x9c", "\x1b\x50q~\x9c"}, // Sixel terminated by C1 ST -> pass
-		{"\x1b\x90\x9c", ""},                 // empty C1 DCS terminated by C1 ST -> strip
-		{"\x1b\x50\x07~\x1b\\", ""},          // BEL in DCS header is malformed -> strip to ST
+		{"\x1b\x50\x1b7", "\x1b7"},             // DCS aborted by ESC restart -> DECSC passes
+		{"\x1b\x50\x18Z", "Z"},                 // DCS aborted by CAN
+		{"\x1b\x50q~\x9c", "\x1b\x50q~\x1b\\"}, // Sixel terminated by C1 ST -> pass, re-emitted with ESC \\
+		{"\x1b\x90\x9c", ""},                   // empty C1 DCS terminated by C1 ST -> strip
+		{"\x1b\x50\x07~\x1b\\", ""},            // BEL in DCS header is malformed -> strip to ST
 	}
 	for _, c := range cases {
 		if got := string(contiguous([]byte(c.in))); got != c.want {
@@ -606,6 +606,62 @@ func TestStringBodyUTF8EncodedC1EndsString(t *testing.T) {
 		{"\x1b]0;t\xc2\x85ok", "ok"},
 		// A non-C1 two-byte rune (U+00A9) remains payload.
 		{"\x1b]0;\xc2\xa9 t\x07ok", "ok"},
+	}
+	for _, tc := range cases {
+		for split := 0; split <= len(tc.in); split++ {
+			s := New()
+			got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+			if string(got) != tc.want {
+				t.Fatalf("%q split %d: got %q, want %q", tc.in, split, got, tc.want)
+			}
+		}
+	}
+}
+
+// TestGroundUTF8EncodedC1Stripped pins that a C1 control encoded as UTF-8
+// (U+0080..U+009F, C2 80..C2 9F) is stripped in ground. A UTF-8 terminal
+// decodes U+009B as CSI and U+009D as OSC, so passing them re-enabled every
+// reply-triggering request the sanitizer strips in its ESC form: C2 9B 6n made
+// the viewer's terminal answer a cursor position report on its input.
+func TestGroundUTF8EncodedC1Stripped(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"\xc2\x9b6n", "6n"},                                     // CSI: DSR / CPR request
+		{"\xc2\x9bc", "c"},                                       // CSI: DA1 request
+		{"\xc2\x9b>c", ">c"},                                     // CSI: DA2 request
+		{"\xc2\x9b?2004$p", "?2004$p"},                           // CSI: DECRQM request
+		{"\xc2\x9d11;?\xc2\x9c", "11;?"},                         // OSC 11 colour query + ST
+		{"\xc2\x9d4;1;?\xc2\x9c", "4;1;?"},                       // OSC 4 palette query + ST
+		{"\xc2\x90$qm\xc2\x9c", "$qm"},                           // DCS DECRQSS + ST
+		{"a\xc2\x85b\xc2\x80c\xc2\x9fd", "abcd"},                 // NEL, PAD, APC
+		{"\xc2\xa0\xc2\xa9\xc3\x9c", "\xc2\xa0\xc2\xa9\xc3\x9c"}, // U+00A0, U+00A9, U+00DC are text
+	}
+	for _, tc := range cases {
+		for split := 0; split <= len(tc.in); split++ {
+			s := New()
+			got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+			if string(got) != tc.want {
+				t.Fatalf("%q split %d: got %q, want %q", tc.in, split, got, tc.want)
+			}
+		}
+	}
+}
+
+// TestPassedStringsUse7BitForms pins that a string the sanitizer passes is
+// re-emitted with ESC introducer and ESC '\\' terminator. A UTF-8 terminal does
+// not read a raw 0x9C as ST, so a passed OSC ending in 0x9C stayed open in the
+// terminal, swallowed the following text, and a '?' after it turned
+// "ESC]10;" into a foreground-colour query the terminal answered on input.
+func TestPassedStringsUse7BitForms(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"\x1b]10;\x9c?\x1b[m", "\x1b]10;\x1b\\?\x1b[m"},
+		{"\x1b]4;1;#cc0000\x9cok", "\x1b]4;1;#cc0000\x1b\\ok"},
+		{"\x1b]8;;https://x\x9clink\x1b]8;;\x9c", "\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\"},
+		{"\x9d8;;https://x\x9clink", "\x1b]8;;https://x\x1b\\link"},
+		{"\x9d8;;https://x\x07link", "\x1b]8;;https://x\x07link"},
+		{"\x90q#0~\x9c", "\x1bPq#0~\x1b\\"},
+		// 7-bit forms are unchanged.
+		{"\x1b]8;;https://x\x1b\\link", "\x1b]8;;https://x\x1b\\link"},
+		{"\x1bPq#0~\x1b\\", "\x1bPq#0~\x1b\\"},
 	}
 	for _, tc := range cases {
 		for split := 0; split <= len(tc.in); split++ {
