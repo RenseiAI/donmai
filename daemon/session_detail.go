@@ -563,7 +563,11 @@ func newSessionDetailStore() *sessionDetailStore {
 
 // Set stores the detail under d.SessionID. Overwrites any prior entry.
 // Runtime admission uses StoreIfAbsent instead so a retry cannot replace an
-// already-running session's detail.
+// already-running session's detail. Like StoreIfAbsent, Set mints the
+// per-session read credential when the session names none yet, so a
+// detail installed through this path never serves its credentials to the
+// operator token while leaving the spawned worker with no credential of
+// its own.
 func (s *sessionDetailStore) Set(d *SessionDetail) {
 	if d == nil || d.SessionID == "" {
 		return
@@ -572,6 +576,18 @@ func (s *sessionDetailStore) Set(d *SessionDetail) {
 	defer s.mu.Unlock()
 	s.details[d.SessionID] = d
 	s.generations[d.SessionID] = s.nextGenerationLocked()
+	if s.readTokens == nil {
+		s.readTokens = make(map[string]string)
+	}
+	// Mint the read credential for this installation, keeping an
+	// existing one: an overwrite must not invalidate a credential a
+	// live worker already holds, and a session that never named one
+	// must not stay credential-free (see Set's doc comment).
+	if _, ok := s.readTokens[d.SessionID]; !ok {
+		if tok := mintSessionReadToken(); tok != "" {
+			s.readTokens[d.SessionID] = tok
+		}
+	}
 }
 
 // StoreIfAbsent installs d only when its session id is not already owned. The

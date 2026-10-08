@@ -33,6 +33,11 @@ const controlTokenUnavailableMessage = "control token unavailable: mutating cont
 // header, or "" when the header is absent or malformed. It is the
 // single parser for control-surface bearer checks: the mutating gate and
 // the session-detail read agree on what counts as a presented credential.
+// The credential itself is never padded or normalized: a bearer with
+// leading, trailing, or interior whitespace that a proxy added is not the
+// bearer the daemon issued, so it compares unequal instead of passing
+// stripped. Callers that present such a header receive the unauthenticated
+// answer, never another session's detail.
 func controlBearer(r *http.Request) string {
 	values := r.Header.Values("Authorization")
 	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") {
@@ -111,7 +116,7 @@ func (s *Server) requireControlAuth(next http.HandlerFunc) http.HandlerFunc {
 				next(w, r)
 				return
 			}
-			got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			got := controlBearer(r)
 			if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid control token"})
 				return

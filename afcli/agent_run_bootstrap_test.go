@@ -1,8 +1,10 @@
 package afcli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -146,12 +148,21 @@ func TestAgentRunBootstrapEndToEnd(t *testing.T) {
 		t.Error("credential-free fetch returned live tokens")
 	}
 
-	// 3. The worker's own entry point accepts the stated credential path:
+	// 3. The worker's own entry point consumes the stated credential path:
 	// drive runAgentRun with the credential in the spawn environment's
-	// variable and prove the fetch is not the failure. The session's
-	// stub profile runs the loop; what matters here is that bootstrap
-	// passes preflight on the credentialed read.
+	// variable and prove the fetch is not the failure. Capture the worker's
+	// logs: the entry point must bootstrap from the full detail, so the
+	// credential-missing warning must be absent. Dropping the
+	// DONMAI_SESSION_READ_TOKEN read resolves an empty daemon token, the
+	// bootstrap then fetches the redacted shape, and the warning fires —
+	// this leg goes red. The session's stub profile runs the loop; what
+	// matters here is that bootstrap passes preflight on the credentialed
+	// read.
 	t.Setenv("DONMAI_SESSION_READ_TOKEN", stated)
+	logBuf := &bytes.Buffer{}
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, nil)))
+	defer slog.SetDefault(prevLogger)
 	cmd := &cobra.Command{}
 	cmd.SetOut(testBootstrapDiscard{})
 	err = runAgentRun(context.Background(), cmd, &agentRunOpts{
@@ -162,6 +173,9 @@ func TestAgentRunBootstrapEndToEnd(t *testing.T) {
 	})
 	if err != nil && strings.Contains(err.Error(), "no runtime credential") {
 		t.Fatalf("runAgentRun refused the bootstrapped fetch: %v", err)
+	}
+	if strings.Contains(logBuf.String(), "carries no runtime credential") {
+		t.Errorf("runAgentRun bootstrapped from a credential-free detail despite the stated read credential; log: %s", logBuf.String())
 	}
 }
 

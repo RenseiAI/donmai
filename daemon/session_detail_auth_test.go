@@ -156,6 +156,36 @@ func TestSessionDetail_ReadRequiresCredential(t *testing.T) {
 	if wrong.AuthToken != "" || wrong.McpAuthToken != "" {
 		t.Errorf("wrong-bearer read leaked: auth=%q mcp=%q", wrong.AuthToken, wrong.McpAuthToken)
 	}
+	// 5b. A duplicated Authorization header is not a credential either:
+	// the read parser rejects it, so the route answers redacted — the
+	// same verdict the mutating gate reaches (pinned in the gate's own
+	// matrix test). A proxy that duplicates the header must not turn a
+	// credentialed read into a full one, nor a refused mutation into an
+	// accepted one.
+	dupReq, err := http.NewRequest(http.MethodGet, "http://"+srv.Addr()+"/api/daemon/sessions/sess-creds", nil) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	dupReq.Header.Add("Authorization", "Bearer "+readTok)
+	dupReq.Header.Add("Authorization", "Bearer "+readTok)
+	dupRes, err := http.DefaultClient.Do(dupReq)
+	if err != nil {
+		t.Fatalf("duplicated-header GET: %v", err)
+	}
+	defer func() { _ = dupRes.Body.Close() }()
+	var dupDetail SessionDetail
+	dupRaw, _ := io.ReadAll(dupRes.Body)
+	if dupRes.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(dupRaw, &dupDetail); err != nil {
+			t.Fatalf("decode duplicated-header detail: %v", err)
+		}
+	}
+	if dupRes.StatusCode != http.StatusOK {
+		t.Fatalf("duplicated-header GET = %d, want 200 redacted", dupRes.StatusCode)
+	}
+	if dupDetail.AuthToken != "" || dupDetail.McpAuthToken != "" {
+		t.Errorf("duplicated-header read leaked: auth=%q mcp=%q", dupDetail.AuthToken, dupDetail.McpAuthToken)
+	}
 	if status, _ := getSessionDetail(t, srv.Addr(), "sess-missing", ""); status != http.StatusNotFound {
 		t.Errorf("unknown id GET = %d, want 404", status)
 	}
