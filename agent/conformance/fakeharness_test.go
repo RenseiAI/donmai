@@ -79,6 +79,11 @@ type fakeConfig struct {
 	// noticeGrace bounds how long a live-notice session waits for an inject
 	// that never arrives. Zero means a short default.
 	noticeGrace time.Duration
+
+	// resumeHistory is how Resume treats the prior session's history.
+	// Zero (resumeReportsHistory) replays it; resumeBlank starts clean
+	// under the old session id.
+	resumeHistory resumeHistoryMode
 }
 
 func newFake(cfg fakeConfig) *fakeHarness {
@@ -102,7 +107,7 @@ func newFake(cfg fakeConfig) *fakeHarness {
 	if cfg.toolLifecycle == nil && !cfg.omitToolProfile {
 		cfg.toolLifecycle = tools
 	}
-	return &fakeHarness{cfg: cfg}
+	return &fakeHarness{cfg: cfg, history: map[string]string{}}
 }
 
 // defaultScript is a conformant sequence: one Init first, an assistant
@@ -115,11 +120,27 @@ func defaultScript(sessionID, prompt string) []agent.Event {
 	}
 }
 
+// resumeHistoryMode is how a fake adapter behaves when the suite resumes a
+// session that was stopped for resume.
+type resumeHistoryMode int
+
+const (
+	// resumeReportsHistory replays the prior session's prompt into the
+	// resumed stream — the continuity the stop-for-resume path requires.
+	resumeReportsHistory resumeHistoryMode = iota
+	// resumeBlank starts clean under the old session id: a conformant event
+	// contract with no trace of what came before. This is the lie the
+	// history-loaded fixture exists to catch — continuity is the contract,
+	// not just a second start under an old name.
+	resumeBlank
+)
+
 type fakeHarness struct {
 	cfg fakeConfig
 
-	mu     sync.Mutex
-	spawns int
+	mu      sync.Mutex
+	spawns  int
+	history map[string]string // session id -> base prompt, for resumeReportsHistory
 }
 
 var _ agent.HarnessProvider = (*fakeHarness)(nil)
@@ -175,12 +196,52 @@ func (f *fakeHarness) Resume(_ context.Context, sessionID string, spec agent.Spe
 	if sessionID == "" {
 		return nil, fmt.Errorf("fake: Resume needs a session id")
 	}
-	return f.start(sessionID, spec, false), nil
+	return f.startResume(sessionID, spec), nil
 }
 
 func (f *fakeHarness) Shutdown(context.Context) error { return nil }
 
+// startResume continues a prior session as a new process from the artifact:
+// it never re-drains the live handle, it builds a fresh one under the old
+// session id. A history-reporting adapter replays the base prompt the suite
+// stopped with; a blank one emits only the fresh resume prompt.
+func (f *fakeHarness) startResume(sessionID string, spec agent.Spec) *fakeHandle {
+	f.mu.Lock()
+	prior, ok := f.history[sessionID]
+	f.mu.Unlock()
+	prompt := spec.Prompt
+	if ok && f.cfg.resumeHistory == resumeReportsHistory && prior != "" {
+		prompt = "resumed history: " + prior + "\ncontinuing: " + spec.Prompt
+	}
+	return f.startFresh(sessionID, prompt)
+}
+
+// startFresh builds a handle without touching the history map, so a resume
+// never overwrites the base prompt a LATER resume must still report.
+func (f *fakeHarness) startFresh(sessionID string, prompt string) *fakeHandle {
+	h := &fakeHandle{
+		cfg:         f.cfg,
+		sessionID:   sessionID,
+		events:      make(chan agent.Event, 64),
+		deliver:     make(chan string, 4),
+		injectSeen:  make(chan struct{}, 4),
+		stopped:     make(chan struct{}),
+		script:      f.cfg.script(sessionID, prompt),
+		awaitNotice: false,
+	}
+	go h.run()
+	return h
+}
+
 func (f *fakeHarness) start(sessionID string, spec agent.Spec, awaitNotice bool) *fakeHandle {
+	// Record the spawn prompt as the session's history before the script
+	// runs: a later Resume that reports history replays exactly this.
+	f.mu.Lock()
+	if f.history == nil {
+		f.history = map[string]string{}
+	}
+	f.history[sessionID] = spec.Prompt
+	f.mu.Unlock()
 	h := &fakeHandle{
 		cfg:         f.cfg,
 		sessionID:   sessionID,

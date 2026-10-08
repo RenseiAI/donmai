@@ -80,6 +80,10 @@ const (
 
 	// IDResumeContinues — a resumed session re-announces and re-terminates.
 	IDResumeContinues CheckID = "resume/session-continues"
+	// IDResumeHistoryLoaded — a session stopped for resume and started again
+	// from the resume artifact reports the prior session's history instead
+	// of resuming blank.
+	IDResumeHistoryLoaded CheckID = "resume/history-loaded"
 
 	// IDReceiptPlanValid — the compiled adaptation authority validates ready.
 	IDReceiptPlanValid CheckID = "receipt/plan-valid"

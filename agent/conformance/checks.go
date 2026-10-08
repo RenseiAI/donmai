@@ -199,6 +199,11 @@ var checks = []Check{
 		run:  checkResumeContinues,
 	},
 	{
+		ID: IDResumeHistoryLoaded, Tier: TierResume, Row: 6,
+		What: "a session resumed from the stop-for-resume artifact reports the prior history",
+		run:  checkResumeHistoryLoaded,
+	},
+	{
 		ID: IDReceiptPlanValid, Tier: TierAdaptationReceipt, Row: 10,
 		What: "the pre-spawn adaptation authority compiles and validates ready",
 		run:  checkReceiptPlanValid,
@@ -250,6 +255,10 @@ type run struct {
 	pty     *ptyProbe
 	resumed *probe
 	receipt *receiptProbe
+	// baseNonce is the prompt nonce the base probe embedded via
+	// Subject.EchoPrompt. The history-loaded resume fixture anchors the
+	// prior history on it: the resumed stream must repeat it.
+	baseNonce string
 }
 
 // probe is one spawn-and-drain observation.
@@ -277,8 +286,10 @@ func (p *probe) spawnFailure() (string, bool) {
 
 func (r *run) baseProbe(ctx context.Context) *probe {
 	if r.base == nil {
+		nonce := newNonce()
+		r.baseNonce = nonce
 		spec := r.subject.BaseSpec
-		spec.Prompt = r.subject.EchoPrompt(newNonce())
+		spec.Prompt = r.subject.EchoPrompt(nonce)
 		r.base = r.spawn(ctx, spec, nil)
 	}
 	return r.base
@@ -820,6 +831,63 @@ func checkResumeContinues(ctx context.Context, r *run) (Status, string) {
 	}
 	if !r.resumed.closed {
 		return StatusFail, fmt.Sprintf("the resumed session's events channel had not closed %s after Resume", r.subject.timeout())
+	}
+	return StatusPass, ""
+}
+
+// checkResumeHistoryLoaded is the stop-and-resume fixture beside
+// checkResumeContinues: it stops a scripted session through the stop path
+// (Handle.Stop, which the suite's probes call on every drained session),
+// starts a new process from the artifact (a fresh Provider.Resume call under
+// the old session id, never the same live handle re-drained), and requires
+// the harness to report the prior session's history. A harness that resumes
+// blank — the same session id, a conformant event contract, but no trace of
+// what came before — fails: the contract of a resume is continuity, not a
+// second clean start under an old name.
+//
+// The fixture anchors the history on the base prompt nonce. The base probe
+// embeds a fresh nonce via Subject.EchoPrompt, so a base session that
+// honors its glue echoes it; the resumed stream must repeat it. The two
+// probes carry different nonces (the resume probe embeds its own), so the
+// check asks the exact question: does the resumed stream repeat the history
+// it was stopped with, or only its own fresh prompt?
+func checkResumeHistoryLoaded(ctx context.Context, r *run) (Status, string) {
+	if !r.manifest.Caps.SupportsSessionResume {
+		return StatusNotApplicable, "the manifest does not declare session resume"
+	}
+	base := r.baseProbe(ctx)
+	if reason, failed := base.spawnFailure(); failed {
+		return StatusFail, "the session to stop for resume could not be started: " + reason
+	}
+	sessionID := base.sessionID
+	if sessionID == "" {
+		sessionID = initSessionID(base.events)
+	}
+	if sessionID == "" {
+		return StatusFail, "the manifest declares session resume but the first session announced no session id (Handle.SessionID and the InitEvent were both empty), so there is nothing to stop for resume"
+	}
+	if r.baseNonce == "" || !containsText(base.events, r.baseNonce) {
+		return StatusFail, fmt.Sprintf(
+			"the first session never repeated its own prompt nonce %q in its %d drained events, so no prior history was established to require back — either the adapter dropped the prompt or Subject.EchoPrompt does not make the agent echo it",
+			r.baseNonce, len(base.events))
+	}
+
+	if r.resumed == nil {
+		r.resumed = r.resumeProbe(ctx, sessionID)
+	}
+	if r.resumed.spawnErr != nil {
+		return StatusFail, fmt.Sprintf("the manifest declares session resume but Resume(%q) after a stop for resume returned %v", sessionID, r.resumed.spawnErr)
+	}
+	if err := CheckEventContract(r.resumed.events); err != nil {
+		return StatusFail, "the resumed session violated the event contract: " + err.Error()
+	}
+	if !r.resumed.closed {
+		return StatusFail, fmt.Sprintf("the resumed session's events channel had not closed %s after Resume", r.subject.timeout())
+	}
+	if !containsText(r.resumed.events, r.baseNonce) {
+		return StatusFail, fmt.Sprintf(
+			"the resumed session reports none of the prior history: the first session's nonce %q never appeared in the %d resumed events, so the harness resumed blank — a second clean start under an old session id, not a continuation",
+			r.baseNonce, len(r.resumed.events))
 	}
 	return StatusPass, ""
 }

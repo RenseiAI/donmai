@@ -12,6 +12,53 @@ import (
 // Output schema types (the committed JSON shape).
 // ---------------------------------------------------------------------------
 
+// ResumeQualificationRow is one computed stop-for-resume qualification
+// record: the (harness, adapter version) tuple plus whether that exact
+// version has proven history-loaded resume. ResumeQualified is never
+// declared — it is computed by the generator (false until a passing fixture
+// run for the tuple says otherwise), and an adapter-version bump — a new
+// tool/lifecycle profile id — re-runs the fixture by producing a new row
+// that starts unqualified.
+type ResumeQualificationRow struct {
+	Harness         agent.HarnessName       `json:"harness"`
+	AdapterVersion  string                  `json:"adapterVersion"`
+	Mode            agent.PromptSessionMode `json:"mode"`
+	ResumeQualified bool                    `json:"resumeQualified"`
+}
+
+// buildResumeQualification derives one qualification row per harvested
+// (harness, tool/lifecycle profile): the adapter version is the profile id,
+// and every row starts unqualified. A passing history-loaded resume fixture
+// run for the tuple is the only thing that may flip it — which no code path
+// does yet, so every generated row is false today. The derivation reads the
+// profile id rather than any declared resume flag, so a harness that claims
+// resume support still shows one unqualified row per adapter version, and a
+// profile bump (a renamed id) surfaces as a fresh unqualified row instead of
+// inheriting a prior qualification.
+func buildResumeQualification(harnessByName map[agent.HarnessName]HarnessRow) []ResumeQualificationRow {
+	var rows []ResumeQualificationRow
+	for _, h := range harnessByName {
+		for _, profile := range h.ToolLifecycle {
+			rows = append(rows, ResumeQualificationRow{
+				Harness:         h.Name,
+				AdapterVersion:  profile.ID,
+				Mode:            profile.Mode,
+				ResumeQualified: false,
+			})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Harness != rows[j].Harness {
+			return rows[i].Harness < rows[j].Harness
+		}
+		if rows[i].AdapterVersion != rows[j].AdapterVersion {
+			return rows[i].AdapterVersion < rows[j].AdapterVersion
+		}
+		return rows[i].Mode < rows[j].Mode
+	})
+	return rows
+}
+
 // HarnessRow is one uniquely identified harness in the generated harnesses[]
 // section. Duplicate manifest ids are rejected rather than capability-merged.
 type HarnessRow struct {
@@ -83,6 +130,14 @@ type CapabilityMatrix struct {
 	// Both remain independent from HarnessRow.Caps and ToolLifecycle fields.
 	Realizations []CapabilityRealizationEvidenceRow `json:"realizations"`
 	Capabilities []CapabilityEligibilityRow         `json:"capabilities"`
+	// ResumeQualification is the computed stop-for-resume qualification
+	// axis: one row per harvested (harness, adapter version), each saying
+	// whether that exact adapter version has proven history-loaded resume
+	// through the conformance fixture. It is COMPUTED — no manifest
+	// declares it, and the generator derives every row as unqualified
+	// until a passing fixture run says otherwise — so a declared resume
+	// claim can never promote itself.
+	ResumeQualification []ResumeQualificationRow `json:"resumeQualification"`
 }
 
 // LegacyAlias is one (ProviderName → CellKey) row of the back-compat map,
@@ -167,6 +222,7 @@ func BuildWithCapabilityRealizations(
 	if err != nil {
 		return nil, err
 	}
+	resumeQualification := buildResumeQualification(harnessByName)
 
 	canonicalRealizations := cloneCapabilityRealizationEvidenceRows(realizations)
 	canonicalCapabilities := cloneCapabilityEligibilityRows(capabilities)
@@ -184,9 +240,10 @@ func BuildWithCapabilityRealizations(
 			IssueTracker:   []any{},
 			VersionControl: []any{},
 		},
-		BinaryPins:   pins,
-		Realizations: cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
-		Capabilities: cloneCapabilityEligibilityRows(canonicalCapabilities),
+		BinaryPins:          pins,
+		Realizations:        cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
+		Capabilities:        cloneCapabilityEligibilityRows(canonicalCapabilities),
+		ResumeQualification: resumeQualification,
 	}
 
 	return &Built{

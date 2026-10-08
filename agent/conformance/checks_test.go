@@ -39,6 +39,7 @@ func TestRunConformantHarnessEarnsTiers(t *testing.T) {
 		supportInject: true,
 		supportResume: true,
 		inject:        injectDeliver,
+		resumeHistory: resumeReportsHistory,
 	})
 	report := runSubject(t, subject)
 
@@ -142,6 +143,13 @@ func TestRunRejectsNonConformantHarness(t *testing.T) {
 			cfg:        fakeConfig{supportResume: true, resumeErr: agent.ErrUnsupported},
 			wantFail:   IDResumeContinues,
 			wantReason: "Resume(",
+			deniedTier: TierResume,
+		},
+		{
+			name:       "a resume that reports no history",
+			cfg:        fakeConfig{supportResume: true, resumeHistory: resumeBlank},
+			wantFail:   IDResumeHistoryLoaded,
+			wantReason: "resumed blank",
 			deniedTier: TierResume,
 		},
 	}
