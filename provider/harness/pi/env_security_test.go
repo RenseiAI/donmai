@@ -16,7 +16,7 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 	const canary = "sk-host-canary-must-not-leak"
 	t.Setenv("OPENAI_API_KEY", canary)      // blocklisted host credential
 	t.Setenv("ANTHROPIC_API_KEY", canary)   // blocklisted host credential
-	t.Setenv("DONMAI_HARMLESS_VAR", "keep") // non-blocklisted — should pass through
+	t.Setenv("DONMAI_HARMLESS_VAR", "keep") // non-blocklisted — reaches the session through the credential file
 
 	layout := newSessionLayout(t.TempDir())
 	env := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
@@ -26,9 +26,18 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 			t.Fatalf("blocklisted host secret leaked into pi child env: %q", e)
 		}
 	}
-	// A harmless host var still passes through (we filter creds, not everything).
-	if !hasEnvKey(env, "DONMAI_HARMLESS_VAR") {
-		t.Errorf("non-blocklisted host var was dropped; env composition is too aggressive")
+	// A harmless host var still reaches the session — through the credential
+	// file's environment section, not the allowlisted exec environment.
+	if hasEnvKey(env, "DONMAI_HARMLESS_VAR") {
+		t.Errorf("an unlisted host var rode the exec environment")
+	}
+	if got := deferredValue(sessionChildEnv(agent.Spec{Cwd: t.TempDir()}), "DONMAI_HARMLESS_VAR"); got != "keep" {
+		t.Errorf("non-blocklisted host var deferred as %q, want it delivered through the credential file", got)
+	}
+	for _, d := range sessionChildEnv(agent.Spec{Cwd: t.TempDir()}).deferred {
+		if strings.Contains(d.Value, canary) {
+			t.Fatalf("blocklisted host secret %s deferred to the credential file", d.Env)
+		}
 	}
 	// pi's documented agent/config home is redirected into the per-session
 	// subdirectory (auth isolation), NEVER the session root itself — see

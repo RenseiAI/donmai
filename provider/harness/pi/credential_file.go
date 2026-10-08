@@ -29,6 +29,13 @@ import (
 // same file through the command-execution key form, so the parent never
 // re-serializes the key into env at any layer.
 //
+// The same file carries a second, separate section: the session's other
+// environment bindings (child_env.go). The child's exec environment is
+// allowlisted, so a binding outside the allowlist that the agent's tools may
+// still need rides here and the policy extension restores it into pi's
+// in-process environment at load — never into the exec-time block a listing
+// renders.
+//
 // The file is written before spawn and removed at session end (Stop on both
 // lanes, and the PTY cleanup chain on the interactive lane), through the
 // session-state writer so a planted link refuses the spawn instead of
@@ -55,17 +62,20 @@ const credentialFileEnvVar = "DONMAI_PI_CREDENTIALS_FILE" //nolint:gosec // G101
 // provider key — so it rides the session credential file like every other
 // session credential, never the child env. The file rail carries the same
 // bearer under PiKeyEnvVar (applyEndpoint mirrors the binding key there),
-// so the env copy is redundant exposure: stripping it loses the child
-// nothing it cannot read from the file.
+// so an env copy would be redundant exposure: refusing it (childEnvRefused)
+// loses the child nothing it cannot read from the file.
 const gatewayBearerEnvVar = gateway.TokenEnvVar
 
 // manifestCredentialEnvNames transcribes the endpoint-manifest credential
 // names (provider/endpoint/<company>/manifest.go, HostDesc.EnvKeys) that
 // are NOT in builtinProviderCredentialEnv's value set and so would
 // otherwise bypass the file rail: a bedrock/vertex/azure-style cell's
-// binding Env rides applyEndpoint's merge onto Spec.Env, and the child-env
-// strips below are name-based — a name in NEITHER set keeps riding both
-// spawn lanes, readable host-wide from the renamed child. Only the
+// binding Env rides applyEndpoint's merge onto Spec.Env. The exec
+// environment is allowlisted (child_env.go), so such a name never reaches
+// it either way — but a name in NEITHER set would be deferred to the
+// credential file's environment section and restored into pi's in-process
+// environment for its tools, where pi's own provider resolution reads it
+// too. Listing it here keeps cell credentials on the credential rail. Only the
 // manifest-declared names are listed: empty-string entries in those
 // manifests declare no credential, and region/project/endpoint names
 // (AWS_REGION, ANTHROPIC_VERTEX_PROJECT_ID, GOOGLE_VERTEX_PROJECT_ID,
@@ -100,36 +110,18 @@ type sessionCredential struct {
 	Value string `json:"value"`
 }
 
-// sessionCredentialFile is the on-disk shape: a versioned envelope around an
-// ordered credential list, so a future entry kind can be told apart from
-// today's without guessing.
+// sessionCredentialFile is the on-disk shape: a versioned envelope around two
+// ordered lists that are never mixed. Credentials are the session's model
+// credentials; only the extension reads them, and it reads only the
+// injected provider's key. Environment is the session's other bindings,
+// kept out of the allowlisted exec environment (child_env.go); the
+// extension restores them into pi's in-process environment so the tools pi
+// starts inherit them. A reader that predates the environment section
+// ignores it.
 type sessionCredentialFile struct {
 	SchemaVersion int                 `json:"schemaVersion"`
 	Credentials   []sessionCredential `json:"credentials"`
-}
-
-// stripCredentialNamedEnv drops every child-env entry whose NAME is a
-// session credential name (sessionCredentialNames) or an undeclared
-// secret-valued name (undeclaredSecretValueNames), wherever it came from —
-// Spec.Env or the inherited parent. The session's own rail credential values
-// ride the credential file instead; an inherited copy is never the session's
-// credential, so dropping it loses nothing the child is entitled to read.
-// Undeclared secret values are dropped outright (they ride neither the file
-// nor the env on this harness).
-func stripCredentialNamedEnv(childEnv []string) []string {
-	out := childEnv[:0]
-	for _, entry := range childEnv {
-		if !isSessionCredentialEnv(entry) && !isUndeclaredSecretValueEnv(entry) {
-			out = append(out, entry)
-		}
-	}
-	// Zero the tail so dropped credential values do not linger in the
-	// backing array (the slice is freshly composed per spawn, but the
-	// array is still addressable memory until GC).
-	for i := len(out); i < len(childEnv); i++ {
-		childEnv[i] = ""
-	}
-	return out
+	Environment   []sessionCredential `json:"environment,omitempty"`
 }
 
 // credentialFilePath returns the absolute path of the session credential
@@ -138,13 +130,15 @@ func credentialFilePath(layout sessionLayout) string {
 	return filepath.Join(layout.root, credentialFileName)
 }
 
-// sessionCredentialNames is the closed credential-name set both spawn lanes
-// strip from the child env: the injected-provider key (PiKeyEnvVar), the
-// gateway binding bearer (gatewayBearerEnvVar), every provider-native
-// credential var (builtinProviderCredentialEnv) applyEndpoint may mirror
-// onto Spec.Env, plus every endpoint-manifest cell-credential name
-// (manifestCredentialEnvNames) a bedrock/vertex/azure-style binding Env
-// rides in on through applyEndpoint's merge. Deterministic (sorted) order;
+// sessionCredentialNames is the closed model-credential name set both spawn
+// lanes refuse from the child in every form other than the credential
+// section of the credential file (childEnvRefused): the injected-provider
+// key (PiKeyEnvVar), the gateway binding bearer (gatewayBearerEnvVar), every
+// provider-native credential var (builtinProviderCredentialEnv)
+// applyEndpoint may mirror onto Spec.Env, plus every endpoint-manifest
+// cell-credential name (manifestCredentialEnvNames) a bedrock/vertex/
+// azure-style binding Env rides in on through applyEndpoint's merge.
+// Deterministic (sorted) order;
 // the set is derived once from the same sources sessionCredentialEntries
 // fans out, so the two can never disagree about which names are
 // credential-carrying.
@@ -182,10 +176,9 @@ func sessionCredentialNames() []string {
 // sessionCredentialEntries fans the session's credential values out of the
 // spec: every sessionCredentialNames entry present with a non-empty value,
 // in deterministic (sorted) order. Non-credential Spec.Env bindings are NOT
-// entries — they keep riding the child env unchanged through
-// composeChildEnv. An empty value never becomes an entry: an unset
-// credential must read as absent in the child, not as an empty key that
-// shadows nothing.
+// entries — partitionChildEnv routes them (child_env.go). An empty value
+// never becomes an entry: an unset credential must read as absent in the
+// child, not as an empty key.
 func sessionCredentialEntries(spec agent.Spec) []sessionCredential {
 	names := sessionCredentialNames()
 	var out []sessionCredential
@@ -201,17 +194,19 @@ func sessionCredentialEntries(spec agent.Spec) []sessionCredential {
 // (heartbeat, result post, session preflight). It is supervisor authority
 // consumed by in-process runner code, never by the harness child — and a
 // same-user listing of the renamed pi child renders it exactly like a
-// provider key — so it never rides the pi child env on either lane.
+// provider key — so it never reaches the pi child in any form on either
+// lane.
 const workerAuthTokenEnvVar = "WORKER_AUTH_TOKEN" //nolint:gosec // G101: env-var NAME, never credential bytes.
 
 // undeclaredSecretValueNames are Spec.Env names outside the session
 // credential rail that are known to carry secret values: the worker runtime
 // bearer above, plus the generic custom-binding key spellings a control
 // plane may use for a cell credential that is not one of pi's
-// built-in-provider vars. They are refused from the pi child env on both
-// lanes (never fanned out to the credential file: the file rail carries
-// model-route credentials the extension reads, and neither of these is
-// one). Documented non-secret bindings pass through untouched.
+// built-in-provider vars. They are refused from the pi child in every form
+// (childEnvRefused): neither the exec environment nor either section of the
+// credential file carries them — the credential section holds model-route
+// credentials the extension reads, and the environment section holds
+// bindings the agent's tools may use, and neither of these is one.
 //
 //nolint:gosec // G101: env-var NAMES, never credential bytes.
 var undeclaredSecretValueNames = []string{
@@ -220,80 +215,23 @@ var undeclaredSecretValueNames = []string{
 	"CUSTOM_SECRET_KEY",
 }
 
-// stripSessionCredentialEnv returns a copy of spec whose Env no longer
-// carries credential values: every sessionCredentialEntries name plus every
-// undeclaredSecretValueNames entry is dropped. composeChildEnv and
-// interactiveChildEnv build the child env from the stripped spec, so no
-// secret value reaches the child env on either lane; the dropped rail
-// values ride the credential file instead. Non-credential bindings survive
-// untouched, and a spec with no credentials keeps a nil Env rather than
-// gaining an empty map.
-func stripSessionCredentialEnv(spec agent.Spec) agent.Spec {
-	entries := sessionCredentialEntries(spec)
-	if len(entries) == 0 && !hasUndeclaredSecretValue(spec) {
-		return spec
-	}
-	drop := make(map[string]struct{}, len(entries)+len(undeclaredSecretValueNames))
-	for _, e := range entries {
-		drop[e.Env] = struct{}{}
-	}
-	for _, name := range undeclaredSecretValueNames {
-		drop[name] = struct{}{}
-	}
-	out := spec
-	env := make(map[string]string, len(spec.Env))
-	for k, v := range spec.Env {
-		if _, isCredential := drop[k]; !isCredential {
-			env[k] = v
-		}
-	}
-	out.Env = env
-	return out
-}
-
-// hasUndeclaredSecretValue reports whether spec carries any
-// undeclaredSecretValueNames entry, so the strip above can stay a no-op
-// (nil Env preserved) for specs that carry neither rail credentials nor
-// undeclared secrets.
-func hasUndeclaredSecretValue(spec agent.Spec) bool {
-	for _, name := range undeclaredSecretValueNames {
-		if _, ok := spec.Env[name]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-// isUndeclaredSecretValueEnv reports whether a child-env entry carries one
-// of the undeclared secret-valued names. Tests use it alongside
-// isSessionCredentialEnv to assert the spawned child's env holds no secret
-// under any known-secret name.
-func isUndeclaredSecretValueEnv(entry string) bool {
-	key := entry
-	if i := strings.IndexByte(entry, '='); i >= 0 {
-		key = entry[:i]
-	}
-	for _, name := range undeclaredSecretValueNames {
-		if key == name {
-			return true
-		}
-	}
-	return false
-}
-
-// writeSessionCredentialFile writes entries as the session credential file
-// under layout's root, mode 0600, through the session-state writer (which
-// refuses a planted link instead of following it out of the set). A nil
-// entry list writes no file and returns "": a keyless session has no
-// credential to deliver, and the child must read the key as absent rather
-// than as an empty file. The caller composes the returned path onto the
-// child env under credentialFileEnvVar; the caller owns removal (Stop on
-// both lanes).
-func writeSessionCredentialFile(layout sessionLayout, entries []sessionCredential) (string, error) {
-	if len(entries) == 0 {
+// writeSessionCredentialFile writes entries (the session's model
+// credentials) and environment (its deferred non-credential bindings,
+// child_env.go) as the session credential file under layout's root, mode
+// 0600, through the session-state writer (which refuses a planted link
+// instead of following it out of the set). With both lists empty it writes
+// no file and returns "": the session has nothing to deliver, and the child
+// must read the key as absent rather than as an empty file. The caller
+// composes the returned path onto the child env under credentialFileEnvVar;
+// the caller owns removal (Stop on both lanes).
+func writeSessionCredentialFile(layout sessionLayout, entries, environment []sessionCredential) (string, error) {
+	if len(entries) == 0 && len(environment) == 0 {
 		return "", nil
 	}
-	payload, err := json.Marshal(sessionCredentialFile{SchemaVersion: 1, Credentials: entries})
+	if entries == nil {
+		entries = []sessionCredential{}
+	}
+	payload, err := json.Marshal(sessionCredentialFile{SchemaVersion: 1, Credentials: entries, Environment: environment})
 	if err != nil {
 		return "", fmt.Errorf("pi: encode session credential file: %w", err)
 	}
@@ -348,30 +286,18 @@ func readSessionCredentialMap(raw []byte) (map[string]string, error) {
 	return out, nil
 }
 
-// strconvQuote renders path as a double-quoted JavaScript string literal.
-// The path is parent-owned (the session state root), never session content,
-// and it is quoted rather than interpolated raw so a quote or backslash in
-// it cannot break out of the literal.
-func strconvQuote(path string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range path {
-		switch r {
-		case '"', '\\':
-			b.WriteByte('\\')
-			b.WriteRune(r)
-		case '\n':
-			b.WriteString("\\n")
-		case '\r':
-			b.WriteString("\\r")
-		case '\t':
-			b.WriteString("\\t")
-		default:
-			b.WriteRune(r)
-		}
+// readSessionEnvironmentMap decodes the environment section of
+// credential-file bytes into a name-to-value map, for tests.
+func readSessionEnvironmentMap(raw []byte) (map[string]string, error) {
+	var file sessionCredentialFile
+	if err := json.Unmarshal(raw, &file); err != nil {
+		return nil, err
 	}
-	b.WriteByte('"')
-	return b.String()
+	out := make(map[string]string, len(file.Environment))
+	for _, e := range file.Environment {
+		out[e.Env] = e.Value
+	}
+	return out, nil
 }
 
 // writeNativeProviderAuthFile writes the session agent home's auth.json so
@@ -400,25 +326,18 @@ func writeNativeProviderAuthFile(layout sessionLayout, spec agent.Spec) (string,
 	if len(entries) == 0 {
 		return "", nil
 	}
-	names := make([]string, 0, len(entries))
-	for provider := range entries {
-		names = append(names, provider)
+	// encoding/json escapes every control byte and orders map keys, so the
+	// file is valid JSON for any credential value and byte-stable per spec.
+	store := make(map[string]nativeProviderAuthEntry, len(entries))
+	for provider, key := range entries {
+		store[provider] = nativeProviderAuthEntry{Type: "api_key", Key: key}
 	}
-	sort.Strings(names)
-	var b strings.Builder
-	b.WriteString("{")
-	for i, provider := range names {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(strconvQuote(provider))
-		b.WriteString(":{\"type\":\"api_key\",\"key\":")
-		b.WriteString(strconvQuote(entries[provider]))
-		b.WriteString("}")
+	payload, err := json.Marshal(store)
+	if err != nil {
+		return "", fmt.Errorf("pi: encode native provider auth file: %w", err)
 	}
-	b.WriteString("}")
 	path := filepath.Join(layout.agentHome, "auth.json")
-	if err := writeStateFile(layout, path, []byte(b.String()), 0o600); err != nil {
+	if err := writeStateFile(layout, path, payload, 0o600); err != nil {
 		return "", fmt.Errorf("pi: write native provider auth file: %w", err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
@@ -426,6 +345,13 @@ func writeNativeProviderAuthFile(layout sessionLayout, spec agent.Spec) (string,
 		return "", fmt.Errorf("pi: secure native provider auth file: %w", err)
 	}
 	return path, nil
+}
+
+// nativeProviderAuthEntry is one provider's entry in pi's auth.json store
+// (docs/providers.md: per-provider api_key entries).
+type nativeProviderAuthEntry struct {
+	Type string `json:"type"`
+	Key  string `json:"key"`
 }
 
 // removeNativeProviderAuthFile deletes the session agent home's auth.json.
@@ -457,21 +383,34 @@ func sessionCredentialEnv(childEnv []string, path string) []string {
 // cell-credential name (manifestCredentialEnvNames) — wherever they
 // arrive: on Spec.Env OR inherited from the parent process (an embedding
 // supervisor may re-admit a blocklisted name it injected itself through
-// InjectedEnvKeysVar, and the gateway's own upstream refusal does not cover
-// every snapshot key). Tests use it to assert the spawned child's env holds
-// no secret.
+// InjectedEnvKeysVar). Tests use it to assert the spawned child's env holds
+// no model credential by name.
 func isSessionCredentialEnv(entry string) bool {
 	key := entry
 	if i := strings.IndexByte(entry, '='); i >= 0 {
 		key = entry[:i]
 	}
-	for _, name := range sessionCredentialNames() {
-		if key == name {
-			return true
-		}
-	}
-	return false
+	return isSessionCredentialName(key)
 }
+
+// isSessionCredentialName reports whether name is one of the
+// sessionCredentialNames — a model credential the session reaches only
+// through the credential file and the session auth.json.
+func isSessionCredentialName(name string) bool {
+	_, ok := sessionCredentialNameSet[name]
+	return ok
+}
+
+// sessionCredentialNameSet is sessionCredentialNames as a set, built once:
+// the partition consults it for every entry of every spawn's environment.
+var sessionCredentialNameSet = func() map[string]struct{} {
+	names := sessionCredentialNames()
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		set[name] = struct{}{}
+	}
+	return set
+}()
 
 // sessionCredentialValuePresent reports whether any of values appears in the
 // child env's VALUES (not keys). Tests use it with the sentinel credential

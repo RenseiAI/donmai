@@ -57,10 +57,12 @@ func gatewayBinding(model string) *agent.EndpointBinding {
 
 // TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv proves pi's
 // credential parity rides the shared spawn-time Spec.Env snapshot rail, not a
-// pi-specific fan-out list: every snapshot credential placed on Spec.Env
-// survives applyEndpoint + the session credential file with its cell value
-// intact, while the headless child env itself carries no credential value.
-// The blocklist/redaction contract holds at the same time: blocklisted
+// pi-specific fan-out list: every snapshot model credential placed on
+// Spec.Env survives applyEndpoint + the session credential file with its
+// cell value intact, every snapshot tool credential reaches the session
+// through the credential file's environment section, and the headless
+// child env itself carries no credential value at all. The
+// blocklist/redaction contract holds at the same time: blocklisted
 // host-inherited credentials never leak in, and a runner-only control is
 // refused even when it arrives on the trusted Spec.Env layer.
 func TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv(t *testing.T) {
@@ -86,15 +88,16 @@ func TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv(t *testing.T
 	}
 	env := composeChildEnv(projected, layout, "sess-token")
 
-	// No credential value rides the child env; non-credential bindings do.
+	// No snapshot value rides the child env, by name or by value.
 	for _, e := range env {
 		if isSessionCredentialEnv(e) {
 			t.Fatalf("snapshot credential rides the headless child env: %q", e)
 		}
+		if i := strings.IndexByte(e, '='); i >= 0 && strings.HasPrefix(e[i+1:], "cell-") {
+			t.Fatalf("snapshot value rides the headless child env: %q", e)
+		}
 	}
-	if !hasEnvVal(env, "ANTHROPIC_BASE_URL", "cell-ANTHROPIC_BASE_URL") {
-		t.Errorf("non-credential snapshot binding ANTHROPIC_BASE_URL missing from pi headless child env")
-	}
+	assertSnapshotToolCredentialsDeferred(t, sessionChildEnv(projected))
 	entries := sessionCredentialEntries(projected)
 	byValue := make(map[string]string, len(entries))
 	for _, e := range entries {
@@ -131,10 +134,11 @@ func TestCredentialSnapshotParity_FullSnapshotRidesHeadlessChildEnv(t *testing.T
 // TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv is the
 // interactive-lane companion: the same full snapshot set on the projected
 // spec fans out to the session credential file, while interactiveChildEnv —
-// the override layer the PTY child is spawned with — carries no credential
-// value. A runner-only control riding the same Spec.Env layer is refused,
-// exactly as the headless lane refuses it. RED proof: drop a snapshot key
-// from sessionCredentialEntries and this test fails.
+// the complete environment the PTY child is spawned with — carries no
+// snapshot value and no credential name, not even empty. A runner-only
+// control riding the same Spec.Env layer is refused, exactly as the
+// headless lane refuses it. RED proof: drop a snapshot key from
+// sessionCredentialEntries and this test fails.
 func TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv(t *testing.T) {
 	t.Parallel()
 	layout := newSessionLayout(t.TempDir())
@@ -151,24 +155,18 @@ func TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv(t *testin
 	projected.Env["ATTACH_TOKEN"] = "spec-layer-runner-control-must-not-reach-pi"
 	got := interactiveChildEnv(projected, layout)
 	for _, k := range credentialSnapshotKeys {
-		switch k {
-		case "ANTHROPIC_BASE_URL", "GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY", "CODEX_API_KEY":
-			continue // non-model credentials: ride env, out of the file rail's scope
-		}
-		// Session-carried credential names were fanned out to the file;
-		// session-absent ones are shadowed EMPTY (the PTY host inherits
-		// unmentioned parent names, so absence must be explicit). Either
-		// way no credential VALUE may ride the override map.
-		if v, present := got[k]; present && v != "" && v != "cell-"+k {
-			t.Errorf("snapshot credential %s = %q reached the interactive child env; it must ride the file", k, v)
-		}
-		if v := got[k]; v != "" && len(projected.Env[k]) == 0 {
-			t.Errorf("session-absent snapshot credential %s shadowed non-empty: %q", k, v)
+		// Absent, not shadowed: the PTY host inherits nothing (ExactEnv),
+		// so no snapshot name needs an empty override to mask a parent value.
+		if v, present := got[k]; present {
+			t.Errorf("snapshot name %s = %q is present in the interactive child env; it must be absent", k, v)
 		}
 	}
-	if got["ANTHROPIC_BASE_URL"] != "cell-ANTHROPIC_BASE_URL" {
-		t.Errorf("non-credential snapshot binding ANTHROPIC_BASE_URL = %q, want %q", got["ANTHROPIC_BASE_URL"], "cell-ANTHROPIC_BASE_URL")
+	for k, v := range got {
+		if strings.HasPrefix(v, "cell-") {
+			t.Errorf("snapshot value rides the interactive child env: %s=%q", k, v)
+		}
 	}
+	assertSnapshotToolCredentialsDeferred(t, interactiveChildEnvParts(projected))
 	if _, present := got["ATTACH_TOKEN"]; present {
 		t.Errorf("runner-only ATTACH_TOKEN reached the interactive child env from Spec.Env")
 	}
@@ -184,6 +182,31 @@ func TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv(t *testin
 		}
 		if byValue[k] != "cell-"+k {
 			t.Errorf("snapshot key %s = %q in the credential file, want %q", k, byValue[k], "cell-"+k)
+		}
+	}
+}
+
+// assertSnapshotToolCredentialsDeferred pins where the snapshot's non-model
+// names ride: the tool credentials reach the session through the credential
+// file's environment section (the policy extension restores them for the
+// tools pi starts), and ANTHROPIC_BASE_URL — a model-routing name the shared
+// blocklist guards, which the harness pins itself through the provider pin
+// — reaches it in no form.
+func assertSnapshotToolCredentialsDeferred(t *testing.T, parts childEnvPartition) {
+	t.Helper()
+	for _, k := range []string{"GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY", "CODEX_API_KEY"} {
+		if got := deferredValue(parts, k); got != "cell-"+k {
+			t.Errorf("snapshot tool credential %s deferred as %q, want %q", k, got, "cell-"+k)
+		}
+	}
+	if _, present := deferredEntry(parts, "ANTHROPIC_BASE_URL"); present {
+		t.Errorf("ANTHROPIC_BASE_URL was deferred; the harness pins model routing itself")
+	}
+	for _, k := range credentialSnapshotKeys {
+		if isSessionCredentialName(k) {
+			if _, present := deferredEntry(parts, k); present {
+				t.Errorf("model credential %s was deferred to the environment section; it rides the credential section only", k)
+			}
 		}
 	}
 }

@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,7 +32,9 @@ import (
 // production spawn entry point and asserts two halves: the sentinel reaches
 // the session (the harness still authenticates — via the credential file
 // and, on the native route, the session auth.json) and NO child-env entry
-// carries it.
+// carries it. child_env_test.go widens the same proof to every name,
+// including names nobody has listed yet: the exec environment is an
+// allowlist.
 
 // credentialFileSentinel is the canary credential every test in this file
 // injects. It must reach the session through FILES and must never appear in
@@ -46,9 +49,8 @@ const credentialFileSentinel = "sentinel-credential-must-not-ride-child-env"
 // handshake); what matters is the child was exec'd first, with the
 // production env, which the recorder files prove.
 //
-// RED proof: compose the unstripped spec into the child env (drop the
-// stripSessionCredentialEnv call in composeChildEnv) and the env assertion
-// fails with the sentinel quoted in the failure output.
+// RED proof: admit every name in childEnvAllowed (child_env.go) and the
+// env assertion fails with the sentinel quoted in the failure output.
 func TestHeadlessChildEnv_CarriesNoCredentialValue(t *testing.T) {
 	// Not parallel: spawns a real child process with a fixed recording dir.
 	if os.Getenv("SHELL") == "" && os.Getenv("OS") != "" {
@@ -197,6 +199,46 @@ func TestNativeProviderAuthFile_CoversNativeRouteWithoutChildEnv(t *testing.T) {
 	}
 }
 
+// TestNativeProviderAuthFile_EncodesAnyCredentialValue pins that the session
+// auth.json is valid JSON for ANY credential value — quotes, backslashes,
+// newlines and raw control bytes included — and decodes back to the exact
+// value, so a hostile or merely odd credential can neither corrupt pi's
+// store nor smuggle a second entry into it.
+//
+// RED proof: build the payload by string concatenation again and the
+// control-byte rows produce invalid JSON.
+func TestNativeProviderAuthFile_EncodesAnyCredentialValue(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{
+		"plain-key",
+		`quote"and\backslash`,
+		"line\nbreak\ttab",
+		"nul\x00and\x01control\x1fbytes",
+		`"},"openai":{"type":"api_key","key":"smuggled`,
+	} {
+		dir := t.TempDir()
+		layout := sessionLayout{root: filepath.Join(dir, ".pi-x"), agentHome: filepath.Join(dir, ".pi-x", "agent-home")}
+		if err := os.MkdirAll(layout.agentHome, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path, err := writeNativeProviderAuthFile(layout, agent.Spec{Env: map[string]string{"ANTHROPIC_API_KEY": value}})
+		if err != nil {
+			t.Fatalf("writeNativeProviderAuthFile(%q): %v", value, err)
+		}
+		raw, err := os.ReadFile(path) //nolint:gosec // test-owned session path
+		if err != nil {
+			t.Fatal(err)
+		}
+		var store map[string]nativeProviderAuthEntry
+		if err := json.Unmarshal(raw, &store); err != nil {
+			t.Fatalf("auth.json for %q is not valid JSON: %v", value, err)
+		}
+		if len(store) != 1 || store["anthropic"].Key != value || store["anthropic"].Type != "api_key" {
+			t.Fatalf("auth.json for %q decoded to %+v, want exactly the one anthropic entry", value, store)
+		}
+	}
+}
+
 // TestStop_RemovesSessionCredentialFiles drives the production Stop path
 // with the launch-wired onStop hook: a session layout holding both files
 // loses both when the handle stops. The headless spawn test above already
@@ -218,7 +260,7 @@ func TestStop_RemovesSessionCredentialFiles(t *testing.T) {
 		PiKeyEnvVar:   credentialFileSentinel,
 		"ZAI_API_KEY": credentialFileSentinel,
 	}}
-	credPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec))
+	credPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), nil)
 	if err != nil {
 		t.Fatalf("writeSessionCredentialFile: %v", err)
 	}
@@ -263,8 +305,8 @@ func TestStop_RemovesSessionCredentialFiles(t *testing.T) {
 // which must carry the credential file's path but no credential value.
 // The PTY cleanup removes the file when the child exits.
 //
-// RED proof: drop the stripSessionCredentialEnv call in interactiveChildEnv
-// and the env assertion fails with the sentinel.
+// RED proof: admit every name in childEnvAllowed (child_env.go) and the
+// env assertion fails with the sentinel.
 func TestInteractiveChildEnv_CarriesNoCredentialValue(t *testing.T) {
 	workdir := t.TempDir()
 	p := newFakeInteractivePiProvider(t, `
@@ -316,13 +358,15 @@ func TestInteractiveChildEnv_CarriesNoCredentialValue(t *testing.T) {
 
 // TestComposeChildEnv_StripsCredentialValues pins the same invariant one
 // layer down, without spawning: composeChildEnv over a spec carrying the
-// full snapshot set must emit no entry whose VALUE holds a credential,
-// while every non-credential binding survives. The catalog-miss fallback
-// and the native-route mirror both write credentials onto Spec.Env, so the
-// strip must cover PiKeyEnvVar AND every provider-native var.
+// full snapshot set must emit no entry whose VALUE holds a credential. The
+// catalog-miss fallback and the native-route mirror both write credentials
+// onto Spec.Env, so the refusal must cover PiKeyEnvVar AND every
+// provider-native var. A non-credential binding outside the allowlist keeps
+// reaching the session, through the credential file's environment section
+// rather than the exec environment.
 //
-// RED proof: return spec unstripped from stripSessionCredentialEnv and every
-// credential row below fails.
+// RED proof: admit every name in childEnvAllowed and every credential row
+// below fails.
 func TestComposeChildEnv_StripsCredentialValues(t *testing.T) {
 	t.Parallel()
 	layout := newSessionLayout(t.TempDir())
@@ -348,14 +392,17 @@ func TestComposeChildEnv_StripsCredentialValues(t *testing.T) {
 			t.Fatalf("composeChildEnv emitted a credential-named entry: %q (full env: %q)", entry, env)
 		}
 	}
-	if !hasEnvVal(env, "DONMAI_HARMLESS_VAR", "keep") {
-		t.Errorf("non-credential binding was dropped; the strip is too aggressive: %q", env)
+	if hasEnvKey(env, "DONMAI_HARMLESS_VAR") {
+		t.Errorf("an unlisted binding rode the exec environment: %q", env)
+	}
+	if got := deferredValue(sessionChildEnv(spec), "DONMAI_HARMLESS_VAR"); got != "keep" {
+		t.Errorf("unlisted binding deferred as %q, want it delivered through the credential file", got)
 	}
 	if !hasEnvVal(env, piHandshakeEnvVar, "sess-token") {
 		t.Errorf("handshake token missing; the env under test is not the headless lane")
 	}
 
-	// The stripped values are exactly what the credential file carries.
+	// The refused values are exactly what the credential file carries.
 	entries := sessionCredentialEntries(spec)
 	if len(entries) == 0 {
 		t.Fatal("sessionCredentialEntries is empty for a credential-bearing spec")
@@ -368,14 +415,13 @@ func TestComposeChildEnv_StripsCredentialValues(t *testing.T) {
 }
 
 // TestInteractiveChildEnvMap_StripsCredentialValues is the interactive-lane
-// unit companion: the override map carries the pin and the harmless var,
-// never a credential value. Credential names the session does not carry are
-// shadowed with an explicit EMPTY override (so the PTY host cannot inherit a
-// supervisor-declared parent value); an empty read is absent to the child,
-// never a usable key.
+// unit companion: the complete exec environment carries the pin, never a
+// credential — by value OR by name. No credential name is present at all,
+// not even empty: the PTY host inherits nothing (ExactEnv), so absence needs
+// no shadow.
 //
-// RED proof: return spec unstripped from stripSessionCredentialEnv and the
-// value assertions fail with the sentinel.
+// RED proof: admit every name in childEnvAllowed and the value assertions
+// fail with the sentinel.
 func TestInteractiveChildEnvMap_StripsCredentialValues(t *testing.T) {
 	t.Parallel()
 	layout := newSessionLayout(t.TempDir())
@@ -395,12 +441,12 @@ func TestInteractiveChildEnvMap_StripsCredentialValues(t *testing.T) {
 		if strings.Contains(v, credentialFileSentinel) {
 			t.Fatalf("interactiveChildEnv[%q] carries the sentinel credential value", k)
 		}
-		if isSessionCredentialEnv(k+"="+v) && v != "" {
-			t.Fatalf("interactiveChildEnv carries a credential-named entry with a value: %q=%q", k, v)
+		if isSessionCredentialEnv(k) {
+			t.Fatalf("interactiveChildEnv carries a credential-named entry: %q=%q", k, v)
 		}
 	}
-	if got["DONMAI_HARMLESS_VAR"] != "keep" {
-		t.Errorf("non-credential binding was dropped: %v", got)
+	if _, present := got["DONMAI_HARMLESS_VAR"]; present {
+		t.Errorf("an unlisted binding rode the interactive exec environment: %v", got)
 	}
 	if got[piBaseURLEnvVar] != "https://ai-gateway.invalid/v1" {
 		t.Errorf("provider pin base URL missing: %v", got)
@@ -412,12 +458,13 @@ func TestInteractiveChildEnvMap_StripsCredentialValues(t *testing.T) {
 // values reach it through FILES (the credential file plus the session
 // auth.json) with cell values intact, and NO credential-named entry rides
 // the child env — neither from Spec.Env nor inherited from the parent
-// (supervisor re-admission and ambient host keys included). Non-credential
-// snapshot bindings still ride env, and the blocklist/runner-only contract
-// still holds.
+// (supervisor re-admission and ambient host keys included). Tool
+// credentials in the snapshot reach the session through the credential
+// file's environment section, never the exec environment, and the
+// blocklist/runner-only contract still holds.
 //
-// RED proof: return spec unstripped from stripSessionCredentialEnv and the
-// child-env assertion fails with the first snapshot value.
+// RED proof: admit every name in childEnvAllowed and the child-env
+// assertion fails with the first snapshot value.
 func TestCredentialSnapshotParity_CredentialValuesRideFilesNotEnv(t *testing.T) {
 	// Not parallel: mutates process env.
 	const hostCanary = "host-canary-must-not-leak"
@@ -447,9 +494,16 @@ func TestCredentialSnapshotParity_CredentialValuesRideFilesNotEnv(t *testing.T) 
 			t.Fatalf("blocklisted host credential leaked into pi child env: %q", e)
 		}
 	}
-	// Non-credential snapshot bindings still ride env.
-	if !hasEnvVal(env, "ANTHROPIC_BASE_URL", "cell-ANTHROPIC_BASE_URL") {
-		t.Errorf("non-credential snapshot binding ANTHROPIC_BASE_URL missing from child env")
+	// Tool credentials ride the credential file's environment section; the
+	// exec environment carries none of them.
+	parts := sessionChildEnv(projected)
+	for _, k := range []string{"GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY", "CODEX_API_KEY"} {
+		if hasEnvKey(env, k) {
+			t.Errorf("snapshot tool credential %s rode the exec environment", k)
+		}
+		if got := deferredValue(parts, k); got != "cell-"+k {
+			t.Errorf("snapshot tool credential %s deferred as %q, want %q", k, got, "cell-"+k)
+		}
 	}
 	if hasEnvKey(env, "ATTACH_TOKEN") {
 		t.Errorf("runner-only ATTACH_TOKEN reached the pi child env from either layer")
@@ -540,12 +594,11 @@ func TestGatewayBearerRidesFileNotChildEnv(t *testing.T) {
 		t.Errorf("handshake token missing; the env under test is not the headless lane")
 	}
 
-	// Interactive lane: same bearer, same strip, through its own override map.
-	// Session-absent credential names are shadowed empty (see the unit
-	// companion above); only a non-empty value is a leak.
+	// Interactive lane: same bearer, same refusal, through its complete exec
+	// environment. No credential name is present at all, not even empty.
 	interactive := interactiveChildEnv(projected, layout)
 	for k, v := range interactive {
-		if isSessionCredentialEnv(k+"="+v) && v != "" {
+		if isSessionCredentialEnv(k) {
 			t.Fatalf("gateway bearer rides the interactive child env by name: %q", k)
 		}
 		if strings.Contains(v, bearer) {
@@ -645,17 +698,17 @@ func TestHeadlessSpawn_GatewayBearerAbsentFromChildEnv(t *testing.T) {
 	}
 }
 
-// TestInteractiveSpawn_DeclaredParentCredentialAbsentFromChildEnv is the B1
-// regression test: a supervisor-declared inherited credential (the
-// InjectedEnvKeysVar declaration that re-admits a blocklisted name into the
-// worker) must not reach the interactive PTY child. The PTY host layers the
-// override map onto the parent env and inherits unmentioned names, so the
-// interactive lane shadows every session-absent credential name with an
-// explicit empty override — the counterpart of the headless lane's
-// post-merge strip. Drives the production interactive Spawn entry point
-// against a fake binary that records its env.
+// TestInteractiveSpawn_DeclaredParentCredentialAbsentFromChildEnv: a
+// supervisor-declared inherited credential (the InjectedEnvKeysVar
+// declaration that re-admits a blocklisted name into the worker) must not
+// reach the interactive PTY child — not by value, and not even by name. The
+// PTY host spawns the child with the lane's complete allowlisted environment
+// and inherits nothing from the parent (ExactEnv), so the name is simply
+// absent: no empty shadow is needed, and none is present (an empty shadow
+// still reads as a defined variable to the child). Drives the production
+// interactive Spawn entry point against a fake binary that records its env.
 //
-// RED proof: drop the shadow loop from interactiveChildEnv and the recorded
+// RED proof: spawn without ExactEnv (spawnInteractive) and the recorded
 // child env carries the declared parent value.
 func TestInteractiveSpawn_DeclaredParentCredentialAbsentFromChildEnv(t *testing.T) {
 	// Not parallel: mutates process env and spawns a real PTY child.
@@ -687,30 +740,23 @@ func TestInteractiveSpawn_DeclaredParentCredentialAbsentFromChildEnv(t *testing.
 			t.Fatalf("declared parent credential reached the interactive child env: %q", entry)
 		}
 	}
-	// The shadow override is what keeps it out: the name is present but
-	// empty, which reads as absent to the child — never the parent's value.
-	found := false
+	// Absent, not shadowed: the name itself must not appear, empty or not.
 	for _, entry := range strings.Split(envRaw, "\n") {
-		if entry == "ANTHROPIC_API_KEY=" {
-			found = true
+		if strings.HasPrefix(entry, "ANTHROPIC_API_KEY=") {
+			t.Errorf("interactive child env defines ANTHROPIC_API_KEY (%q); it must be absent:\n%s", entry, envRaw)
 		}
-	}
-	if !found {
-		t.Errorf("interactive child env carries no empty ANTHROPIC_API_KEY shadow; the parent value is one unshadowed name away:\n%s", envRaw)
 	}
 }
 
-// TestHeadlessChildEnv_StripsKnownSecretValues is the B2 headless regression
-// test: the finding's named sentinels (a custom binding key and the worker
-// runtime bearer on Spec.Env) must not reach the headless pi child env by
-// NAME or by VALUE. The closed producer set is pinned by the endpoint
-// manifests: model credentials arrive only under endpoint-declared EnvKeys
-// or the gateway bearer, both of which the file rail fans out — so the rail
-// plus the value backstop below leave no named hole. Drives the production
-// composeChildEnv entry point.
+// TestHeadlessChildEnv_StripsKnownSecretValues: the known secret-valued
+// bindings no child is entitled to (a custom binding key and the worker
+// runtime bearer on Spec.Env) must not reach the headless pi child by NAME
+// or by VALUE — not in the exec environment, and not in the credential
+// file's environment section either. Drives the production composeChildEnv
+// entry point and the partition the credential file is written from.
 //
-// RED proof: remove the bearer/custom-name coverage from the rail (or the
-// value backstop) and the assertions fail with the sentinel quoted.
+// RED proof: drop undeclaredSecretValueNames from childEnvRefused and the
+// deferred-section assertion fails with the sentinel quoted.
 func TestHeadlessChildEnv_StripsKnownSecretValues(t *testing.T) {
 	t.Parallel()
 	const customSecret = "super-secret-custom-value"
@@ -731,18 +777,25 @@ func TestHeadlessChildEnv_StripsKnownSecretValues(t *testing.T) {
 			t.Fatalf("secret value rides the headless child env: %q", e)
 		}
 	}
-	if !hasEnvVal(env, "DONMAI_HARMLESS_VAR", "keep") {
-		t.Errorf("non-credential binding was dropped from the headless lane: %q", env)
+	parts := sessionChildEnv(spec)
+	for _, d := range parts.deferred {
+		if strings.Contains(d.Value, customSecret) || strings.Contains(d.Value, workerSecret) {
+			t.Fatalf("refused secret %s is deferred to the credential file's environment section", d.Env)
+		}
+	}
+	if got := deferredValue(parts, "DONMAI_HARMLESS_VAR"); got != "keep" {
+		t.Errorf("unlisted non-secret binding deferred as %q, want it delivered through the credential file", got)
 	}
 }
 
-// TestInteractiveChildEnv_StripsKnownSecretValues is the B2 interactive
-// companion: the same named sentinels are absent from the PTY override map
-// by NAME and by VALUE. Drives the production interactiveChildEnv entry
-// point.
+// TestInteractiveChildEnv_StripsKnownSecretValues is the interactive
+// companion: the same named sentinels are absent from the PTY child's
+// complete environment by NAME and by VALUE, and from the credential file's
+// environment section. Drives the production interactiveChildEnv entry
+// point and the partition the credential file is written from.
 //
-// RED proof: remove the bearer/custom-name coverage from the rail and the
-// assertions fail with the sentinel quoted.
+// RED proof: drop undeclaredSecretValueNames from childEnvRefused and the
+// deferred-section assertion fails with the sentinel quoted.
 func TestInteractiveChildEnv_StripsKnownSecretValues(t *testing.T) {
 	t.Parallel()
 	const customSecret = "super-secret-custom-value"
@@ -761,9 +814,19 @@ func TestInteractiveChildEnv_StripsKnownSecretValues(t *testing.T) {
 		if strings.Contains(v, customSecret) || strings.Contains(v, workerSecret) {
 			t.Fatalf("secret value rides the interactive child env: %q=%q", k, v)
 		}
+		if k == "API_KEY" || k == "CUSTOM_SECRET_KEY" || k == "WORKER_AUTH_TOKEN" {
+			t.Fatalf("refused name %s is present in the interactive child env", k)
+		}
 	}
-	if got["DONMAI_HARMLESS_VAR"] != "keep" {
-		t.Errorf("non-credential binding was dropped from the interactive lane: %v", got)
+	for _, d := range interactiveChildEnvParts(agent.Spec{Env: map[string]string{
+		"API_KEY": customSecret, "CUSTOM_SECRET_KEY": customSecret, "WORKER_AUTH_TOKEN": workerSecret,
+	}}).deferred {
+		if strings.Contains(d.Value, customSecret) || strings.Contains(d.Value, workerSecret) {
+			t.Fatalf("refused secret %s is deferred to the credential file's environment section", d.Env)
+		}
+	}
+	if _, present := got["DONMAI_HARMLESS_VAR"]; present {
+		t.Errorf("an unlisted binding rode the interactive exec environment: %v", got)
 	}
 }
 
@@ -911,12 +974,11 @@ func TestBedrockCellCredentialRidesFileNotChildEnv(t *testing.T) {
 		t.Errorf("handshake token missing; the env under test is not the headless lane")
 	}
 
-	// Interactive lane: same binding, same strip, through its override map.
-	// Session-absent credential names shadow empty; only a non-empty value
-	// is a leak.
+	// Interactive lane: same binding, same refusal, through its complete
+	// exec environment. No credential name is present at all, not even empty.
 	interactive := interactiveChildEnv(projected, layout)
 	for k, v := range interactive {
-		if isSessionCredentialEnv(k+"="+v) && v != "" {
+		if isSessionCredentialEnv(k) {
 			t.Fatalf("bedrock cell credential rides the interactive child env by name: %q", k)
 		}
 		for _, want := range manifestCellCredentialSentinels() {
@@ -961,20 +1023,22 @@ func TestVertexAzureCellCredentialRidesFileNotChildEnv(t *testing.T) {
 			t.Fatalf("vertex/azure cell credential rides the headless child env by value: %q", e)
 		}
 	}
-	if !hasEnvVal(headless, "DONMAI_HARMLESS_VAR", "keep") {
-		t.Errorf("non-credential binding was dropped from the headless lane: %q", headless)
+	if got := deferredValue(sessionChildEnv(spec), "DONMAI_HARMLESS_VAR"); got != "keep" {
+		t.Errorf("unlisted non-secret binding deferred as %q, want it delivered through the credential file", got)
+	}
+	for _, d := range sessionChildEnv(spec).deferred {
+		if strings.HasPrefix(d.Value, "cell-") {
+			t.Fatalf("vertex/azure cell credential %s is deferred to the credential file's environment section; it belongs on the credential rail", d.Env)
+		}
 	}
 
 	got := interactiveChildEnv(spec, layout)
 	for k, v := range got {
-		if isSessionCredentialEnv(k+"="+v) && v != "" {
+		if isSessionCredentialEnv(k) {
 			t.Fatalf("vertex/azure cell credential rides the interactive child env by name: %q", k)
 		}
-		if strings.Contains(v, "cell-") && k != "DONMAI_HARMLESS_VAR" {
+		if strings.Contains(v, "cell-") {
 			t.Fatalf("vertex/azure cell credential rides the interactive child env by value: %q=%q", k, v)
 		}
-	}
-	if got["DONMAI_HARMLESS_VAR"] != "keep" {
-		t.Errorf("non-credential binding was dropped from the interactive lane: %v", got)
 	}
 }

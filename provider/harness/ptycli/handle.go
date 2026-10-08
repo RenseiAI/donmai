@@ -76,6 +76,29 @@ func Spawn(ctx context.Context, binary string, argv []string, spec agent.Spec, m
 // cleanup runs exactly once on spawn failure, child exit, context cancellation,
 // or Stop, whichever happens first.
 func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec agent.Spec, manifest agent.HarnessManifest, cleanup func() error) (*Handle, error) {
+	return SpawnWithOptions(ctx, binary, argv, spec, manifest, SpawnOptions{Cleanup: cleanup})
+}
+
+// SpawnOptions are the optional per-spawn controls SpawnWithOptions accepts.
+// The zero value is Spawn's behavior.
+type SpawnOptions struct {
+	// Cleanup is an optional per-session resource cleanup. Ownership transfers
+	// to the returned handle; it runs exactly once on spawn failure, child
+	// exit, context cancellation, or Stop, whichever happens first.
+	Cleanup func() error
+
+	// ExactEnv makes spec.Env the child's complete environment: the PTY host
+	// does not layer it over this process's own environment
+	// (ptyhost.Spec.ExactEnv). A harness that builds its child environment
+	// from an allowlist sets it, so no parent name rides around that
+	// allowlist. The interactive terminal defaults and the runner-only
+	// refusal still apply.
+	ExactEnv bool
+}
+
+// SpawnWithOptions is Spawn with the optional per-spawn controls in opts.
+func SpawnWithOptions(ctx context.Context, binary string, argv []string, spec agent.Spec, manifest agent.HarnessManifest, opts SpawnOptions) (*Handle, error) {
+	cleanup := opts.Cleanup
 	ispec := spec.Interactive
 	if ispec == nil {
 		ispec = &agent.InteractiveSpec{}
@@ -87,6 +110,7 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 	pspec := ptyhost.Spec{
 		Command:    command,
 		Env:        envSlice(spec.Env),
+		ExactEnv:   opts.ExactEnv,
 		Cwd:        spec.Cwd,
 		Cols:       uint16(ispec.Cols), //nolint:gosec // terminal geometry never exceeds uint16
 		Rows:       uint16(ispec.Rows), //nolint:gosec // terminal geometry never exceeds uint16

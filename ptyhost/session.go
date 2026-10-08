@@ -129,7 +129,7 @@ func Spawn(spec Spec) (*Session, error) {
 	// forbids calling Start twice on one Cmd even when the first call
 	// failed, so the retry path inside startPTYWithRetry must never reuse
 	// a Cmd across attempts.
-	parentEnv := os.Environ()
+	parentEnv := spec.parentEnv()
 	makeCmd := func() *exec.Cmd {
 		cmd := exec.Command(spec.Command[0], spec.Command[1:]...) //nolint:gosec // caller-supplied argv is the session's own command
 		if spec.Cwd != "" {

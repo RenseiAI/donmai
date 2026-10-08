@@ -2,7 +2,11 @@ package ptyhost
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
@@ -128,6 +132,73 @@ func TestComposeEnv_InheritedBlocklistHonoursTheInjectionDeclaration(t *testing.
 				t.Errorf("the injection declaration reached the PTY environment: %v", got)
 			}
 		})
+	}
+}
+
+// TestComposeEnv_NoParentYieldsDefaultsAndOverridesOnly pins the exact-env
+// composition: with no parent layer the child gets the interactive terminal
+// defaults and the request's own entries, nothing else, and runner-only
+// controls are still refused.
+func TestComposeEnv_NoParentYieldsDefaultsAndOverridesOnly(t *testing.T) {
+	t.Parallel()
+	got := envMap(composeEnv(nil, []string{"KEEP=request", "ATTACH_TOKEN=request-secret"}))
+	want := map[string]string{"TERM": "xterm-256color", "COLORTERM": "truecolor", "KEEP": "request"}
+	if len(got) != len(want) {
+		t.Fatalf("exact environment = %v, want exactly %v", got, want)
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Errorf("%s = %q, want %q (full env: %v)", key, got[key], value, got)
+		}
+	}
+}
+
+// TestSpawn_ExactEnvInheritsNothingFromParent drives a REAL PTY spawn: with
+// ExactEnv the child is exec'd with Spec.Env plus the terminal defaults and
+// nothing from this process's environment; without it (the control) the
+// same parent canary is inherited, so the assertion discriminates.
+//
+// RED proof: make Spec.parentEnv ignore ExactEnv and the exact-env child
+// records the parent canary.
+func TestSpawn_ExactEnvInheritsNothingFromParent(t *testing.T) {
+	// Not parallel: writes a canary into the process environment.
+	const canary = "ptyhost-parent-canary-must-not-reach-an-exact-env-child"
+	t.Setenv("PTYHOST_PARENT_CANARY", canary)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("executable: %v", err)
+	}
+	record := func(exact bool) string {
+		path := filepath.Join(t.TempDir(), "child-env")
+		s := mustSpawn(t, Spec{
+			Command:  []string{exe},
+			Env:      []string{"PTYHOST_TEST_ROLE=envfile", "PTYHOST_TEST_ENV_FILE=" + path, "KEEP=request"},
+			ExactEnv: exact,
+		})
+		waitDone(t, s, 15*time.Second)
+		raw, err := os.ReadFile(path) //nolint:gosec // test-owned path
+		if err != nil {
+			t.Fatalf("read recorded child env (exact=%v): %v", exact, err)
+		}
+		return string(raw)
+	}
+
+	exact := envMap(strings.Split(strings.TrimSpace(record(true)), "\n"))
+	if _, ok := exact["PTYHOST_PARENT_CANARY"]; ok {
+		t.Errorf("exact-env child inherited the parent canary: %v", exact)
+	}
+	if _, ok := exact["PATH"]; ok {
+		t.Errorf("exact-env child inherited the parent PATH: %v", exact)
+	}
+	for key, want := range map[string]string{"KEEP": "request", "TERM": "xterm-256color", "COLORTERM": "truecolor"} {
+		if exact[key] != want {
+			t.Errorf("exact-env child %s = %q, want %q", key, exact[key], want)
+		}
+	}
+
+	inherited := envMap(strings.Split(strings.TrimSpace(record(false)), "\n"))
+	if inherited["PTYHOST_PARENT_CANARY"] != canary {
+		t.Errorf("control: the inheriting child did not see the parent canary; the exact-env assertion would be vacuous")
 	}
 }
 

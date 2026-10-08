@@ -12,10 +12,12 @@ import (
 )
 
 // argvSecretSentinel is the canary credential every test in this file injects
-// on Spec.Env. It must reach the harness child through its ENVIRONMENT (the
-// provider pin reads it there) and must never appear in the child's argv —
-// any local user can read another process's command line via ps or
-// /proc/<pid>/cmdline, so a credential placed there is readable host-wide.
+// on Spec.Env. It must reach the harness session through the owner-only
+// session credential file and must never appear in the child's argv — any
+// local user can read another process's command line via ps or
+// /proc/<pid>/cmdline, so a credential placed there is readable host-wide —
+// nor in its exec environment, which the renamed pi process exposes the
+// same way (child_env.go).
 const argvSecretSentinel = "sentinel-credential-must-not-ride-argv"
 
 // fakeArgvRecorderPi writes a fake `pi` binary that records the exact argv
@@ -70,11 +72,13 @@ func waitForArgvRecord(t *testing.T, path string, timeout time.Duration) string 
 
 // TestHeadlessChildArgv_CarriesNoCredential is the argv-secret regression
 // test: a real Provider.Spawn against a fake `pi` binary with a sentinel
-// credential on Spec.Env must deliver the sentinel through the child's
-// environment while the child's recorded argv carries no trace of it. The
-// spawn itself is expected to fail (the fake never answers the policy
-// handshake) — what matters is the child was exec'd first, with the
-// production argv and env, which the recorder files prove.
+// credential on Spec.Env must deliver the sentinel to the session through
+// the credential file (its environment section: the name is no model
+// credential pi resolves, so the policy extension restores it for the
+// tools pi starts) while the child's recorded argv AND exec environment
+// carry no trace of it. The spawn itself is expected to fail (the fake never
+// answers the policy handshake) — what matters is the child was exec'd
+// first, with the production argv and env, which the recorder files prove.
 //
 // RED proof: move any Spec.Env value onto the spawn argv (for example by
 // prepending KEY=value entries in spawnChild) and the argv assertion fails
@@ -110,6 +114,23 @@ func TestHeadlessChildArgv_CarriesNoCredential(t *testing.T) {
 	}()
 
 	argv := waitForArgvRecord(t, filepath.Join(dir, "argv"), 20*time.Second)
+	envRaw := waitForArgvRecord(t, filepath.Join(dir, "child-env"), 20*time.Second)
+	// Read the session credential file while the session is live (Stop
+	// removes it).
+	var delivered string
+	for _, entry := range strings.Split(envRaw, "\n") {
+		if path, ok := strings.CutPrefix(entry, credentialFileEnvVar+"="); ok {
+			raw, err := os.ReadFile(path) //nolint:gosec // the session-owned credential file under test
+			if err != nil {
+				t.Fatalf("read session credential file: %v", err)
+			}
+			environment, err := readSessionEnvironmentMap(raw)
+			if err != nil {
+				t.Fatalf("decode session credential file: %v", err)
+			}
+			delivered = environment["SENTINEL_API_KEY"]
+		}
+	}
 	// The child is still sleeping inside the fake; cancel so Spawn's
 	// handshake gate (and its Stop) reaps it before the test ends.
 	cancel()
@@ -125,12 +146,11 @@ func TestHeadlessChildArgv_CarriesNoCredential(t *testing.T) {
 	if strings.Contains(argv, argvSecretSentinel) {
 		t.Fatalf("harness child argv carries the sentinel credential:\n%s", argv)
 	}
-	envRaw, err := os.ReadFile(filepath.Join(dir, "child-env")) //nolint:gosec // test fixture path
-	if err != nil {
-		t.Fatalf("read recorded child env: %v", err)
+	if strings.Contains(envRaw, argvSecretSentinel) {
+		t.Fatalf("harness child exec environment carries the sentinel credential:\n%s", envRaw)
 	}
-	if !strings.Contains(string(envRaw), "SENTINEL_API_KEY="+argvSecretSentinel) {
-		t.Fatalf("sentinel credential did not reach the child environment:\n%s", envRaw)
+	if delivered != argvSecretSentinel {
+		t.Fatalf("sentinel credential was not delivered through the session credential file (got %q)", delivered)
 	}
 }
 

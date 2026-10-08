@@ -431,13 +431,17 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// Deliver session credentials through files, never the child env: pi
 	// renames itself into a short process name at startup, and a same-user
 	// process listing then renders the child ENVIRONMENT as if it were its
-	// command line. The credential file carries the injected-provider key
-	// for the extension plus the provider-native mirrors for pi's own
-	// store; the native auth.json covers the --provider <name> route.
-	// Any write failure denies spawn closed, before any child starts.
-	// The files are removed at session end (Stop) and, on spawn-failure
-	// paths below, here.
-	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec))
+	// command line. The exec environment is allowlisted (child_env.go); the
+	// credential file carries the injected-provider key for the extension
+	// plus the provider-native mirrors, and — in its environment section —
+	// every other session binding the allowlist keeps out of the exec
+	// environment; the native auth.json covers the --provider <name> route.
+	// The environment is partitioned ONCE so the file and the exec
+	// environment are two halves of the same composition. Any write failure
+	// denies spawn closed, before any child starts. The files are removed at
+	// session end (Stop) and, on spawn-failure paths below, here.
+	childEnvParts := sessionChildEnv(spec)
+	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
@@ -445,12 +449,10 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		removeSessionCredentialFile(layout)
 		removeNativeProviderAuthFile(layout)
 	}
-	authPath, err := writeNativeProviderAuthFile(layout, spec)
-	if err != nil {
+	if _, err := writeNativeProviderAuthFile(layout, spec); err != nil {
 		removeCredentials()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	_ = authPath
 	// Prepare the confinement plan for a session that requested it. The
 	// plan wraps the child argv below and binds the session tmp and caches
 	// over their variables; nil means the session did not request
@@ -461,6 +463,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if confiner != nil {
 		plan, err = p.confineSession(spec, layout, confiner)
 		if err != nil {
+			removeCredentials()
 			return nil, err
 		}
 	}
@@ -472,9 +475,9 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// Compose once. Receipt admission inspects this exact final environment,
 	// and spawnChild assigns the same immutable slice to exec.Cmd.Env. The
 	// confinement bindings are appended last so they win. The credential
-	// file's PATH rides the env (sessionCredentialEnv); the credential VALUES
-	// never do — composeChildEnv strips them from the spec first.
-	childEnv := confinePiEnv(sessionCredentialEnv(composeChildEnv(spec, layout, token), credentialPath), plan)
+	// file's PATH rides the env (sessionCredentialEnv); no credential VALUE
+	// does — the exec half of the partition holds allowlisted names only.
+	childEnv := confinePiEnv(sessionCredentialEnv(headlessChildEnv(childEnvParts.exec, spec, layout, token), credentialPath), plan)
 	var receipt *receiptAdmission
 	if spec.Autonomous {
 		startup := measureReceiptStartupContext(spec.Cwd, childEnv)
