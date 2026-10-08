@@ -61,10 +61,22 @@
 //     the boundary: see registerSequentialTools below.
 //
 //   - Provider pin: at load the factory registers a single "donmai" provider
-//     from env (baseUrl / api / key / model, plus an optional context-window
-//     size), so the session can only reach the resolved cell endpoint. The
-//     key is read from process.env at runtime and never written to disk or
-//     inlined in this source (so the source SHA stays stable and verifiable).
+//     from env (baseUrl / api / model, plus an optional context-window
+//     size) and the session credential file (the key). The key is read from
+//     the file named by DONMAI_PI_CREDENTIALS_FILE at runtime and never
+//     written to disk or inlined in this source (so the source SHA stays
+//     stable and verifiable); the file path rides env, never the key.
+//
+//   - Session environment: the harness execs pi with an allowlisted
+//     environment only, because pi renames its process and a same-user
+//     process listing then renders the exec-time environment as its command
+//     line. The session's other bindings (a VCS or tracker token, a toolchain
+//     home) ride the same owner-only credential file, in its "environment"
+//     section. The factory restores them into this process's environment
+//     FIRST, before anything else loads, so every tool pi starts inherits
+//     them, while the listing — which shows only the exec-time block — never
+//     does. The model credentials in the "credentials" section are never
+//     restored: the provider pin reads the one key it needs directly.
 //
 // This file is intentionally dependency-free (node builtins + a type-only
 // import) and brand-neutral. The one exception is a guarded dynamic import of
@@ -224,6 +236,68 @@ function selfSHA256(): string {
 // headless-vs-interactive evidence).
 const DONMAI_ALLOWED_TOOLS_ENV = "DONMAI_PI_ALLOWED_TOOLS";
 const DONMAI_DISALLOWED_TOOLS_ENV = "DONMAI_PI_DISALLOWED_TOOLS";
+// DONMAI_CREDENTIALS_FILE_ENV names the session credential file the Go
+// harness writes before spawn: a versioned JSON envelope of {env, value}
+// entries (credential_file.go). The path rides the child env; the key bytes
+// never do. readSessionCredential returns the entry filed under the injected
+// provider's env name, or "" when the file is absent, unreadable, or holds
+// no entry for it — a keyless session registers the provider with an empty
+// key, exactly as it did when the key rode env unset.
+const DONMAI_CREDENTIALS_FILE_ENV = "DONMAI_PI_CREDENTIALS_FILE";
+const DONMAI_INJECTED_KEY_ENV = "DONMAI_PI_KEY";
+
+// readSessionCredentialEnvelope parses the session credential file named by
+// DONMAI_CREDENTIALS_FILE_ENV. Any failure — no path, unreadable file,
+// malformed JSON — reads as null, never throws: delivery is best-effort at
+// this layer, and the Go side already refused the spawn when writing the
+// file failed.
+function readSessionCredentialEnvelope(): any {
+  try {
+    const path = (process.env[DONMAI_CREDENTIALS_FILE_ENV] ?? "").trim();
+    if (!path) return null;
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// readSessionCredential returns the session key filed under the injected
+// provider's env name in the envelope's credentials section, or "" when the
+// envelope is absent or holds no entry for it — a keyless session registers
+// the provider with an empty key, exactly as it did when the key rode env
+// unset.
+function readSessionCredential(envelope: any): string {
+  const entries = envelope?.credentials;
+  if (!Array.isArray(entries)) return "";
+  for (const entry of entries) {
+    if (entry?.env === DONMAI_INJECTED_KEY_ENV && typeof entry?.value === "string") {
+      return entry.value;
+    }
+  }
+  return "";
+}
+
+// restoreSessionEnvironment assigns the envelope's environment section into
+// this process's environment, so the tools pi starts inherit the session's
+// bindings even though the exec environment is allowlisted. An in-process
+// assignment never reaches the exec-time environment block a process
+// listing renders. A name already set is never overridden (the exec
+// environment, and anything pi set itself, wins), a malformed name is
+// skipped, and the extension's and pi's own control namespaces are never
+// written from the file.
+function restoreSessionEnvironment(envelope: any): void {
+  const entries = envelope?.environment;
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    const name = entry?.env;
+    const value = entry?.value;
+    if (typeof name !== "string" || typeof value !== "string") continue;
+    if (name === "" || name.includes("=") || name.includes("\u0000")) continue;
+    if (name.startsWith("DONMAI_PI_") || name.startsWith("PI_")) continue;
+    if (process.env[name] !== undefined) continue;
+    process.env[name] = value;
+  }
+}
 // DONMAI_STATE_DIR_ENV carries the relocated per-session state root
 // onto the interactive child. The Go engine guards the same root;
 // the local interactive guard must cover it too, or deleting live
@@ -613,15 +687,24 @@ export default async function activate(pi: ExtensionAPI) {
   // Provider registration below is UNCONDITIONAL either way — it needs no RPC,
   // and it is what points the session at the resolved cell endpoint in BOTH
   // modes.
+  //
+  // Restore the session's deferred environment bindings before anything
+  // else runs: every extension loaded after this one, and every tool pi
+  // starts, then sees them. See the "Session environment" note above.
+  const sessionCredentials = readSessionCredentialEnvelope();
+  restoreSessionEnvironment(sessionCredentials);
+
   const token = process.env.DONMAI_PI_HANDSHAKE ?? "";
   const rpcMode = token !== "";
 
   // Provider pin: register the single "donmai" provider from env so the session
-  // can only route to the resolved cell. Key is read at runtime, never inlined.
+  // can only route to the resolved cell. The key is read from the session
+  // credential file (DONMAI_PI_CREDENTIALS_FILE) at runtime, never from env
+  // and never inlined.
   const baseUrl = process.env.DONMAI_PI_BASE_URL ?? "";
   const api = process.env.DONMAI_PI_API ?? "openai-completions";
   const model = process.env.DONMAI_PI_MODEL ?? "";
-  const apiKey = process.env.DONMAI_PI_KEY ?? "";
+  const apiKey = readSessionCredential(sessionCredentials);
   // Context-window pin: the harness exports the resolved profile's
   // context-window size (tokens) as DONMAI_PI_CONTEXT_WINDOW when the
   // dispatch carried one (extension.go providerPinEnv). A missing or invalid

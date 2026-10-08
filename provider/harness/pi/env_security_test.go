@@ -16,7 +16,7 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 	const canary = "sk-host-canary-must-not-leak"
 	t.Setenv("OPENAI_API_KEY", canary)      // blocklisted host credential
 	t.Setenv("ANTHROPIC_API_KEY", canary)   // blocklisted host credential
-	t.Setenv("DONMAI_HARMLESS_VAR", "keep") // non-blocklisted — should pass through
+	t.Setenv("DONMAI_HARMLESS_VAR", "keep") // non-blocklisted — reaches the session through the credential file
 
 	layout := newSessionLayout(t.TempDir())
 	env := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
@@ -26,9 +26,18 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 			t.Fatalf("blocklisted host secret leaked into pi child env: %q", e)
 		}
 	}
-	// A harmless host var still passes through (we filter creds, not everything).
-	if !hasEnvKey(env, "DONMAI_HARMLESS_VAR") {
-		t.Errorf("non-blocklisted host var was dropped; env composition is too aggressive")
+	// A harmless host var still reaches the session — through the credential
+	// file's environment section, not the allowlisted exec environment.
+	if hasEnvKey(env, "DONMAI_HARMLESS_VAR") {
+		t.Errorf("an unlisted host var rode the exec environment")
+	}
+	if got := deferredValue(sessionChildEnv(agent.Spec{Cwd: t.TempDir()}), "DONMAI_HARMLESS_VAR"); got != "keep" {
+		t.Errorf("non-blocklisted host var deferred as %q, want it delivered through the credential file", got)
+	}
+	for _, d := range sessionChildEnv(agent.Spec{Cwd: t.TempDir()}).deferred {
+		if strings.Contains(d.Value, canary) {
+			t.Fatalf("blocklisted host secret %s deferred to the credential file", d.Env)
+		}
 	}
 	// pi's documented agent/config home is redirected into the per-session
 	// subdirectory (auth isolation), NEVER the session root itself — see
@@ -113,8 +122,11 @@ func TestOfflinePostureEnv_DefaultsOnUnlessExplicit(t *testing.T) {
 }
 
 // TestEnvHygiene_ResolvedCellKeyRides confirms the resolved cell's key still
-// reaches the child via Spec.Env (trusted layer) even though the same key name
-// is blocklisted from the host env — the cell must be able to authenticate.
+// reaches the SESSION via the trusted Spec.Env layer even though the same key
+// name is blocklisted from the host env — the cell must be able to
+// authenticate. The key rides the session credential file (and the session
+// auth.json for the native route), never the child env: the composed env
+// carries neither the cell value nor the host value under that name.
 func TestEnvHygiene_ResolvedCellKeyRides(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "host-value-blocked")
 	layout := newSessionLayout(t.TempDir())
@@ -123,11 +135,17 @@ func TestEnvHygiene_ResolvedCellKeyRides(t *testing.T) {
 		Env: map[string]string{"ANTHROPIC_API_KEY": "cell-resolved-key"},
 	}
 	env := composeChildEnv(spec, layout, "sess-token")
-	if !hasEnvVal(env, "ANTHROPIC_API_KEY", "cell-resolved-key") {
-		t.Errorf("resolved cell key did not ride Spec.Env into the child")
+	for _, e := range env {
+		if isSessionCredentialEnv(e) {
+			t.Fatalf("credential-named entry rides the child env: %q", e)
+		}
+		if strings.Contains(e, "cell-resolved-key") || strings.Contains(e, "host-value-blocked") {
+			t.Fatalf("credential value rides the child env: %q", e)
+		}
 	}
-	if hasEnvVal(env, "ANTHROPIC_API_KEY", "host-value-blocked") {
-		t.Errorf("host value won over the resolved cell key")
+	entries := sessionCredentialEntries(spec)
+	if len(entries) != 1 || entries[0].Env != "ANTHROPIC_API_KEY" || entries[0].Value != "cell-resolved-key" {
+		t.Errorf("session credential entries = %+v, want the one cell-resolved key", entries)
 	}
 }
 
@@ -206,28 +224,39 @@ func TestEnvHygiene_HostPiKeyNeverLeaks(t *testing.T) {
 
 	layout := newSessionLayout(t.TempDir())
 
-	// A spec with no key yields no key: the host copy is stripped, and
-	// nothing on the spec layer reintroduces it.
+	// A spec with no key yields no key anywhere: the host copy is stripped
+	// from the child env, and no credential file entry exists for it.
 	bare := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
 	for _, e := range bare {
-		if strings.HasPrefix(e, PiKeyEnvVar+"=") {
+		if isSessionCredentialEnv(e) {
 			t.Fatalf("host %s leaked into the child env of a keyless spec: %q", PiKeyEnvVar, e)
 		}
+		if strings.Contains(e, hostKey) {
+			t.Fatalf("host %s value leaked into the child env of a keyless spec: %q", PiKeyEnvVar, e)
+		}
+	}
+	if entries := sessionCredentialEntries(agent.Spec{Cwd: t.TempDir()}); len(entries) != 0 {
+		t.Errorf("keyless spec produced credential entries: %+v", entries)
 	}
 
-	// A spec-set key still rides (the blocklist strips the parent env
-	// only), and the host copy is gone rather than shadowing it.
-	seeded := composeChildEnv(agent.Spec{
+	// A spec-set key rides the credential file (the blocklist strips the
+	// parent env only), and the host copy is gone rather than shadowing it.
+	keyed := agent.Spec{
 		Cwd: t.TempDir(),
 		Env: map[string]string{PiKeyEnvVar: "cell-resolved-key"},
-	}, layout, "sess-token")
-	if !hasEnvVal(seeded, PiKeyEnvVar, "cell-resolved-key") {
-		t.Errorf("spec-set %s did not reach the child env", PiKeyEnvVar)
 	}
+	seeded := composeChildEnv(keyed, layout, "sess-token")
 	for _, e := range seeded {
+		if isSessionCredentialEnv(e) {
+			t.Fatalf("spec-set %s rode the child env; it must ride the file: %q", PiKeyEnvVar, e)
+		}
 		if strings.Contains(e, hostKey) {
 			t.Fatalf("host %s value survived alongside the spec key: %q", PiKeyEnvVar, e)
 		}
+	}
+	entries := sessionCredentialEntries(keyed)
+	if len(entries) != 1 || entries[0].Value != "cell-resolved-key" {
+		t.Errorf("session credential entries = %+v, want the one spec-set key", entries)
 	}
 }
 

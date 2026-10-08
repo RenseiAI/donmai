@@ -15,13 +15,17 @@ import (
 // conformance test (§12, Appendix A) re-execs this test binary with
 // PTYHOST_TEST_ROLE=cpr so the child runs under a real ptyhost PTY; the
 // noop role exits at once and exists so shell-free spawn tests have a child
-// that needs no shell binary on the runner.
+// that needs no shell binary on the runner. The envfile role records the
+// environment it was exec'd with to PTYHOST_TEST_ENV_FILE, so a test can
+// read back exactly what the PTY host handed the child.
 func TestMain(m *testing.M) {
 	switch os.Getenv("PTYHOST_TEST_ROLE") {
 	case "cpr":
 		cprChild()
 	case "noop":
 		os.Exit(0)
+	case "envfile":
+		envFileChild()
 	case "":
 		os.Exit(m.Run())
 	default:
@@ -138,4 +142,22 @@ func atoiPositive(b []byte) (int, bool) {
 		n = n*10 + int(c-'0')
 	}
 	return n, true
+}
+
+// envFileChild writes the environment it was exec'd with, one entry per
+// line, to PTYHOST_TEST_ENV_FILE and exits.
+func envFileChild() {
+	path := os.Getenv("PTYHOST_TEST_ENV_FILE")
+	if path == "" {
+		os.Exit(3)
+	}
+	var b bytes.Buffer
+	for _, entry := range os.Environ() {
+		b.WriteString(entry)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, b.Bytes(), 0o600); err != nil { //nolint:gosec // G703: the parent test names a path in its own temp dir
+		os.Exit(4)
+	}
+	os.Exit(0)
 }

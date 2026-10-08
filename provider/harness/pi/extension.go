@@ -145,8 +145,9 @@ func verifyHandshakeToken(claimed, want string) bool {
 }
 
 // sessionLayout describes where a session's pi state lives inside the
-// worktree. All paths are under <cwd>/.pi so the runner's worktree lifecycle
-// owns cleanup.
+// worktree. All paths are under the per-session state root (confinement.go
+// sessionStateRoot / the legacy in-checkout directory) so the runner's
+// worktree lifecycle owns cleanup.
 type sessionLayout struct {
 	root      string // <cwd>/.pi
 	extension string // <cwd>/.pi/donmai-policy.ts (loaded via -e; NOT auto-discovered)
@@ -197,9 +198,10 @@ func newSessionLayout(cwd string) sessionLayout {
 //
 // Fail-closed: any write error is returned; the caller must NOT spawn a
 // prompt when materialization fails. The provider pin (design §6) is delivered
-// to the extension via env (piBaseURLEnvVar/piAPIEnvVar/piModelEnvVar +
-// PiKeyEnvVar), never written to disk — so the extension's on-disk source
-// stays byte-identical to the embedded payload and its SHA verifies.
+// to the extension via env (piBaseURLEnvVar/piAPIEnvVar/piModelEnvVar) plus
+// the session credential file (credentialFileEnvVar) — never written into
+// the extension source itself — so the extension's on-disk source stays
+// byte-identical to the embedded payload and its SHA verifies.
 func materializeExtension(cwd string) (sessionLayout, error) {
 	layout := newSessionLayout(cwd)
 	if err := os.MkdirAll(layout.root, 0o700); err != nil {
@@ -461,8 +463,9 @@ func writeViaCache(digest string, content []byte, destPath string, perm os.FileM
 
 // providerPinEnv builds the non-secret routing-pin env the child extension
 // reads to register the single "donmai" provider (design §6). The API key is
-// NOT here — it rides PiKeyEnvVar (applyEndpoint mirrors the resolved cell key
-// onto it). Under a gateway cell the baseURL is the local gateway binding, so
+// NOT here — it rides the session credential file (credentialFileEnvVar)
+// the extension reads at load. Under a gateway cell the baseURL is the local
+// gateway binding, so
 // pi inherits the whole mesh through one pin.
 //
 // The context-window pin (piContextWindowEnvVar) is appended only when the

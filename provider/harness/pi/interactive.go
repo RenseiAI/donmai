@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/runtime/confinement"
-	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // spawnInteractive opens pi's OWN interactive TUI — bare `pi`, with NEITHER
@@ -32,8 +32,9 @@ import (
 //
 // Extension posture (program decision D4 / the A1 "slimmed extension"): the SAME
 // embedded policy extension headless uses is materialized and loaded — never a
-// second file. Its provider registration from env (DONMAI_PI_BASE_URL/API/MODEL
-// + PiKeyEnvVar) is what points pi at the resolved cell endpoint, and it runs
+// second file. Its provider registration (DONMAI_PI_BASE_URL/API/MODEL from env,
+// the key from the session credential file) is what points pi at the resolved
+// cell endpoint, and it runs
 // unconditionally at load with no RPC. What this spawn mode deliberately does
 // NOT do is set the per-session handshake token (piHandshakeEnvVar): the
 // extension's handshake + Go-adjudication round-trip are RPC-mode-only and are
@@ -77,13 +78,45 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	}
 	extensionPaths := append([]string{layout.extension}, extraPaths...)
 
+	// Deliver session credentials through files, never the child env — the
+	// same posture as the headless lane (pi.go launch): the exec environment
+	// is allowlisted (child_env.go), the credential file carries the
+	// injected-provider key for the extension plus — in its environment
+	// section — every other session binding the allowlist keeps out of the
+	// exec environment, the native auth.json covers the --provider <name>
+	// route, and only the file's PATH rides the child env. The environment
+	// is partitioned ONCE so the file and the exec environment are two
+	// halves of the same composition. Any write failure denies spawn closed,
+	// before the child starts; the files are removed by the PTY cleanup below.
+	childEnvParts := interactiveChildEnvParts(spec)
+	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	removeCredentials := func() {
+		removeSessionCredentialFile(layout)
+		removeNativeProviderAuthFile(layout)
+	}
+	if _, err := writeNativeProviderAuthFile(layout, spec); err != nil {
+		removeCredentials()
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+
 	// The child env carries the same routing pin + config-home isolation the
-	// headless lane composes, MINUS the handshake token. ptyhost layers these
-	// overrides onto the parent environment and drops blocklisted inherited keys
-	// (ptyhost.composeEnv), so host credentials never reach the PTY child while
-	// the resolved cell's key (already on spec.Env under PiKeyEnvVar) survives as
-	// an explicit override.
-	spec.Env = interactiveChildEnv(spec, layout)
+	// headless lane composes, MINUS the handshake token, over the same
+	// allowlisted exec environment. It is the child's COMPLETE environment:
+	// the PTY host is asked for an exact environment below (ExactEnv), so it
+	// inherits nothing from the parent past the allowlist and no credential
+	// name needs an empty shadow to mask an inherited value. The resolved
+	// cell's credentials ride the files above; only the credential file's
+	// path is added here.
+	spec.Env = interactiveExecEnv(childEnvParts.exec, spec, layout)
+	if strings.TrimSpace(credentialPath) != "" {
+		if spec.Env == nil {
+			spec.Env = map[string]string{}
+		}
+		spec.Env[credentialFileEnvVar] = credentialPath
+	}
 
 	// Confine the interactive child the same way the headless lane confines
 	// its own: the wrapped argv runs under the session profile, and the
@@ -95,6 +128,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if confiner != nil {
 		plan, err = p.confineSession(spec, layout, confiner)
 		if err != nil {
+			removeCredentials()
 			return nil, err
 		}
 	}
@@ -107,6 +141,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		if plan != nil {
 			_ = plan.Release()
 		}
+		removeCredentials()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	for _, kv := range confinePiEnv(nil, plan) {
@@ -118,28 +153,41 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		}
 	}
 
-	handle, err := ptycli.SpawnWithCleanup(ctx, wrapped[0], wrapped[1:], spec, p.Manifest(), releaseOnStop(plan))
+	handle, err := ptycli.SpawnWithOptions(ctx, wrapped[0], wrapped[1:], spec, p.Manifest(), ptycli.SpawnOptions{
+		Cleanup: releaseInteractiveSession(plan, removeCredentials),
+		// spec.Env is the child's complete environment: the PTY host must not
+		// layer it over its own parent environment, or every parent name the
+		// allowlist kept out would ride back in around it.
+		ExactEnv: true,
+	})
 	if err != nil {
 		if plan != nil {
 			_ = plan.Release()
 		}
+		removeCredentials()
 		return nil, err
 	}
 	return newInteractiveStateLossHandle(handle, layout.root, tailer), nil
 }
 
-// releaseOnStop turns the plan release into the ptycli per-session cleanup:
-// it runs exactly once on spawn failure, child exit, context cancellation,
-// or Stop, whichever happens first. The rendered profile must stay on disk
-// until the confined child has exited; the profile is read when the wrapped
-// command starts, so releasing once the session is over is safe, and a
-// process already running under the profile stays confined. A nil plan
-// (no backend) needs no cleanup.
-func releaseOnStop(plan *confinement.Plan) func() error {
-	if plan == nil {
-		return nil
+// releaseInteractiveSession turns the plan release plus the session
+// credential-file removal into the ptycli per-session cleanup: it runs
+// exactly once on spawn failure, child exit, context cancellation, or Stop,
+// whichever happens first. The rendered profile must stay on disk until the
+// confined child has exited; the profile is read when the wrapped command
+// starts, so releasing once the session is over is safe, and a process
+// already running under the profile stays confined. A nil plan (no backend)
+// needs no profile cleanup, but the credential files are still removed.
+func releaseInteractiveSession(plan *confinement.Plan, removeCredentials func()) func() error {
+	return func() error {
+		if removeCredentials != nil {
+			removeCredentials()
+		}
+		if plan == nil {
+			return nil
+		}
+		return plan.Release()
 	}
-	return plan.Release
 }
 
 // interactiveArgs builds the argv for pi's own interactive TUI.
@@ -229,32 +277,55 @@ func interactiveToolPolicyEnv(spec agent.Spec) []string {
 	return out
 }
 
-// interactiveChildEnv builds the ptycli override env for an interactive spawn.
-// It carries the already-projected spec.Env (the resolved cell credentials,
-// including PiKeyEnvVar), the two documented config/session-home redirect vars
-// headless also sets (piCodingAgentDirEnvVar/piCodingAgentSessionDirEnvVar —
-// ADR-2026-08-12 D4.1), the offline-posture defaults (D4.3 — the interactive
-// lane is explicitly in scope, not just headless), the non-secret
-// provider-pin vars the embedded extension reads at load, and the stamped
+// interactiveChildEnvParts partitions the interactive session environment
+// (child_env.go partitionChildEnv). The parent's terminal descriptors are
+// dropped first: they describe the process that launched the harness, and
+// the PTY host supplies the child's own interactive defaults, which only an
+// explicit Spec.Env entry may replace.
+func interactiveChildEnvParts(spec agent.Spec) childEnvPartition {
+	return partitionChildEnv(withoutTerminalEnv(os.Environ()), spec)
+}
+
+// interactiveChildEnv builds the complete environment for an interactive
+// spawn from this process's own environment and spec. Tests drive it;
+// spawnInteractive builds the same map from the partition it also writes
+// to the credential file.
+func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]string {
+	return interactiveExecEnv(interactiveChildEnvParts(spec).exec, spec, layout)
+}
+
+// interactiveExecEnv builds the interactive child's complete exec
+// environment: the allowlisted half of the session partition (child_env.go
+// — no credential value and no unlisted binding, so nothing a same-user
+// listing of the renamed child could render is secret), the two documented
+// config/session-home redirect vars headless also sets
+// (piCodingAgentDirEnvVar/piCodingAgentSessionDirEnvVar — ADR-2026-08-12
+// D4.1), the offline-posture defaults (D4.3 — the interactive lane is
+// explicitly in scope, not just headless), the non-secret provider-pin vars
+// the embedded extension reads at load, and the stamped
 // allowed/disallowed-tools lists the SAME extension matches locally
-// (interactiveToolPolicyEnv above).
+// (interactiveToolPolicyEnv above). The credential file's PATH is added by
+// the caller (spawnInteractive), not here.
+//
+// The PTY host spawns the child with exactly this map (ptyhost
+// Spec.ExactEnv) plus its terminal defaults — it inherits nothing from the
+// parent — so a name absent here is absent in the child. No credential name
+// needs an empty shadow to mask an inherited value.
 //
 // It deliberately omits piHandshakeEnvVar: interactive PTY mode runs no Go
 // handshake round-trip, and the extension skips the handshake (and does not
 // block tools awaiting a verdict) exactly when that token is absent — so no UI
-// artifact renders in the TUI. This is the ONE difference from headless
+// artifact renders in the TUI. That is the one difference from headless
 // composeChildEnv, and it is the whole point of the interactive posture.
-func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]string {
+func interactiveExecEnv(allowed []string, spec agent.Spec, layout sessionLayout) map[string]string {
 	// No capacity hint: a Go map grows on demand, so pre-sizing it buys nothing
 	// here, and summing len()s as an allocation size is exactly the shape a
 	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
 	env := make(map[string]string)
-	// Runner-only attach controls address the supervisor, never the workload:
-	// refuse them from the snapshot layer exactly as composeChildEnv (via the
-	// shared Composer) does on the headless lane. Without this, a snapshot
-	// key riding Spec.Env would reach the PTY child headless refuses it from.
-	for k, v := range runtimeenv.FilterRunnerOnlyMap(spec.Env) {
-		env[k] = v
+	for _, kv := range allowed {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			env[kv[:i]] = kv[i+1:]
+		}
 	}
 	env[piCodingAgentDirEnvVar] = layout.agentHome
 	env[piCodingAgentSessionDirEnvVar] = layout.root

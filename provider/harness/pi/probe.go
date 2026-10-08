@@ -86,8 +86,12 @@ func versionProbeCommand(ctx context.Context, binary string) *exec.Cmd {
 	// any candidate binary executes. The later session path preserves legacy
 	// environment behavior but withholds receipt admission when these inputs are
 	// present; construction itself must never execute them.
+	//
+	// The probe is a pi child too, and pi renames itself at startup even for
+	// --version, so it gets the same allowlisted exec environment a session
+	// child gets (child_env.go) — never this process's whole environment.
 	cmd.Dir = filepath.Dir(binary)
-	cmd.Env = withoutUnsafeStartupEnv(os.Environ())
+	cmd.Env = withoutUnsafeStartupEnv(partitionChildEnv(os.Environ(), agent.Spec{}).exec)
 	return cmd
 }
 

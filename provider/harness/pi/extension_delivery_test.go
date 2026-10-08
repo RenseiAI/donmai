@@ -392,10 +392,29 @@ func TestSpawn_Interactive_InvalidAdditionalExtensionsFailBeforePTY(t *testing.T
 
 const interactiveConformanceExtension = `
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { Type } from "typebox";
 
 const markerPath = process.env.DONMAI_INTERACTIVE_EXTENSION_MARKER ?? "";
+
+function readConformanceSessionKey(): string {
+  try {
+    const path = (process.env.DONMAI_PI_CREDENTIALS_FILE ?? "").trim();
+    if (!path) return "";
+    const envelope = JSON.parse(readFileSync(path, "utf8"));
+    const entries = envelope?.credentials;
+    if (!Array.isArray(entries)) return "";
+    let fallback = "";
+    for (const entry of entries) {
+      if (typeof entry?.value !== "string") continue;
+      if (entry.env === "DONMAI_PI_KEY") return entry.value;
+      if (!fallback) fallback = entry.value;
+    }
+    return fallback;
+  } catch {
+    return "";
+  }
+}
 const state = {
   loaded: false,
   toolExecuted: false,
@@ -425,7 +444,10 @@ export default function activate(pi: ExtensionAPI) {
     state.loaded = true;
     state.inheritedProviderSecret = process.env.ANTHROPIC_API_KEY !== undefined || process.env.OPENAI_API_KEY === "parent-secret-must-not-reach-pi";
     state.inheritedRunnerControl = process.env.ATTACH_TOKEN !== undefined;
-    state.sessionKeyPresent = process.env.DONMAI_PI_KEY !== undefined;
+    // The session key rides the credential FILE, never the child env: the
+    // fixture extension reads it back through the same file rail the
+    // production policy extension uses (DONMAI_PI_CREDENTIALS_FILE).
+    state.sessionKeyPresent = readConformanceSessionKey() === "real-binary-stub-key";
     persist();
   });
 }

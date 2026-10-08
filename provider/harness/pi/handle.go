@@ -157,6 +157,12 @@ type Handle struct {
 	// round-trip; the handle rejects any request whose token does not match.
 	token string
 
+	// onStop runs once from Stop, after the child is reaped: launch sets it
+	// to remove the session credential files, so a finished session leaves
+	// no secret on disk. Nil for process-less (protocol-scripted) handles.
+	onStop     func()
+	onStopOnce sync.Once
+
 	// handshakeResult delivers exactly one verdict to Spawn: nil = verified,
 	// err = failed/mismatch. Buffered so the pump never blocks on it.
 	handshakeResult chan error
@@ -373,6 +379,11 @@ func (h *Handle) Stop(ctx context.Context) error {
 	h.signalClosed()
 	h.closeEvents()
 	h.releaseConfinement()
+	h.onStopOnce.Do(func() {
+		if h.onStop != nil {
+			h.onStop()
+		}
+	})
 	return nil
 }
 
