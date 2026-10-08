@@ -73,6 +73,10 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		HarnessID:    spec.HarnessID,
 		WorkareaRoot: root,
 		MetadataDir:  filepath.Join(root, workarea.DeclarationDirName),
+		// The host directories ride the resolved set so the backend can
+		// bind them read-only for metadata readability.
+		Home:      g.home,
+		StateHome: g.stateHome,
 	}
 	var writablePaths []string
 	for _, entry := range writableDecl {

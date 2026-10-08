@@ -82,6 +82,14 @@ type Resolved struct {
 	// SessionTmp and Caches feed the environment bindings.
 	SessionTmp string
 	Caches     []Cache
+	// Home is the operator home and StateHome the host state home. Both
+	// are bound read-only so file metadata stays readable (the seatbelt
+	// contract reads metadata everywhere); file contents and listings
+	// outside the allowlist are denied by the Landlock stage, which grants
+	// no access there. Empty when the session was resolved without host
+	// directories (unit renders).
+	Home      string
+	StateHome string
 	// ReadOnlyLeafNames are the read-only leaves' names, for the record.
 	ReadOnlyLeafNames []string
 	// ReadScope is the enforced fileRead level: empty for open reads, or

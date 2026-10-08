@@ -161,14 +161,10 @@ func (b *mountNamespaceBackend) Apply(req ApplyRequest) (Applied, error) {
 	if err != nil {
 		return Applied{}, err
 	}
-	if !landlockAvailable() {
+	if !landlockProbe() {
 		return Applied{}, refuse(ReasonNamespaceUnavailable, "the Landlock stage is unavailable on this kernel; the boundary it enforces cannot be staged")
 	}
 	stage, err := buildLandlockStage(req.Resolved)
-	if err != nil {
-		return Applied{}, err
-	}
-	args, err := renderBubblewrap(req.Resolved, req.Rules, b.Canonical)
 	if err != nil {
 		return Applied{}, err
 	}
@@ -176,12 +172,19 @@ func (b *mountNamespaceBackend) Apply(req ApplyRequest) (Applied, error) {
 	if err != nil {
 		return Applied{}, err
 	}
+	args, err := renderBubblewrap(req.Resolved, req.Rules, b.Canonical, self)
+	if err != nil {
+		return Applied{}, err
+	}
+	resolved := req.Resolved
 	rendered := "bubblewrap\n" + launcher + "\n" + stage.describe() + "\n" + strings.Join(args, "\n") + "\n"
 	policy := stage.describe()
 	return Applied{
 		Rendered: []byte(rendered),
 		Wrap: func(argv []string) []string {
-			wrapped := append([]string{launcher}, append(args, "--")...)
+			tree := append([]string{}, args...)
+			tree = append(tree, execBinds(argv, self, resolved)...)
+			wrapped := append([]string{launcher}, append(tree, "--")...)
 			wrapped = append(wrapped, self, "stage")
 			wrapped = append(wrapped, stagePortArgs(stage)...)
 			wrapped = append(wrapped, "--")
@@ -192,6 +195,56 @@ func (b *mountNamespaceBackend) Apply(req ApplyRequest) (Applied, error) {
 			return []string{landlockStageEnv + "=" + policy}
 		},
 	}, nil
+}
+
+// landlockProbe reports whether the running kernel supports Landlock. A
+// package variable so tests pin both branches of the Apply gate without a
+// 5.13+ kernel; production always probes the running kernel.
+var landlockProbe = landlockAvailable
+
+// execBinds renders the read-only binds Wrap adds for the executables the
+// spawn re-executes inside the mount tree: the harness binary argv[0]. The
+// stage executable itself is bound at render time (see renderBubblewrap);
+// argv[0] is only known here, and the mount options must precede the first
+// "--" separator, so Wrap splices these binds into the tree it closes
+// over. A binary already reachable (the stage itself, or anything inside
+// the writable set) needs no second bind: re-binding a writable root
+// read-only would shadow it. A missing parent is created with --dir first,
+// so the render never names a destination the launcher cannot mount onto.
+// A binary that cannot be canonicalized still renders its absolute path:
+// the launcher then fails closed instead of running unwrapped.
+func execBinds(argv []string, self string, r *Resolved) []string {
+	if len(argv) == 0 || argv[0] == "" {
+		return nil
+	}
+	binary := argv[0]
+	if !filepath.IsAbs(binary) {
+		return nil
+	}
+	if binary == self {
+		return nil
+	}
+	for _, root := range r.Writable {
+		if insideOrEqual(binary, root.Path) {
+			return nil
+		}
+	}
+	if resolved, err := filepath.EvalSymlinks(binary); err == nil {
+		binary = resolved
+		if binary == self {
+			return nil
+		}
+		for _, root := range r.Writable {
+			if insideOrEqual(binary, root.Path) {
+				return nil
+			}
+		}
+	}
+	var args []string
+	if parent := filepath.Dir(binary); parent != "/" && parent != "." {
+		args = append(args, "--dir", parent)
+	}
+	return append(args, "--ro-bind", binary, binary)
 }
 
 // launcher resolves the helper executable: the test override, else
@@ -222,8 +275,9 @@ func resolveLauncher(name string) (string, error) {
 		if dir == "" {
 			continue
 		}
+		// PATH entries are the operator's own launch environment, and the candidate must stat as a regular executable file before it is used.
 		candidate := filepath.Join(dir, name)
-		info, err := os.Stat(candidate)
+		info, err := os.Stat(candidate) //nolint:gosec // G703: PATH join over the operator's launch environment; the result is checked as a regular executable below.
 		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
 			return candidate, nil
 		}
@@ -303,9 +357,12 @@ var mountNamespaceResolverBinds = []string{
 // dropped. The harness process re-executed as the Landlock stage (see
 // stage_linux.go) programs the Landlock policy from inside the mount tree
 // and then execs the harness: Wrap runs `launcher args -- self-exe stage
-// -- argv`, rebinding the current executable by its /proc/self/exe path.
-// Returned args end before the first "--" separator; Wrap appends it.
-func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string, error)) ([]string, error) {
+// -- argv`. self is the stage executable's own canonical path: it is bound
+// read-only into the tree here, because the root is a tmpfs and the
+// executable would otherwise be absent inside. An empty self skips the
+// bind; Apply always passes the real one. Returned args end before the
+// first "--" separator; Wrap appends it.
+func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string, error), self string) ([]string, error) {
 	var args []string
 	bind := func(flag, source, target string) {
 		args = append(args, flag, source, target)
@@ -333,6 +390,36 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	}
 	for _, path := range mountNamespaceResolverBinds {
 		roBind(path)
+	}
+	// The operator home and the host state home are bound read-only so
+	// file metadata stays readable, as the seatbelt contract promises:
+	// path lookups and stat keep working everywhere. File contents and
+	// directory listings outside the allowlist are denied by the Landlock
+	// stage, which grants nothing here (under a read scope) or read access
+	// (with reads open). They bind before the writable set so session
+	// roots beneath them mount over.
+	for _, path := range []string{r.Home, r.StateHome} {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); err != nil {
+			continue
+		}
+		if parent := filepath.Dir(path); parent != "/" && parent != "." {
+			args = append(args, "--dir", parent)
+		}
+		bind("--ro-bind", path, path)
+	}
+	// The stage executable re-executes inside the tree (see Apply): bind
+	// it read-only by exact path, with its parent created first. Without
+	// this the tmpfs root hides it and the launcher cannot exec the stage.
+	if self != "" {
+		if _, err := os.Lstat(self); err == nil {
+			if parent := filepath.Dir(self); parent != "/" && parent != "." {
+				args = append(args, "--dir", parent)
+			}
+			bind("--ro-bind", self, self)
+		}
 	}
 	// Device nodes a process needs: /dev is a fresh tmpfs, so the host's
 	// terminals never enter the boundary. --dev-bind (not --bind) carries
@@ -367,20 +454,27 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	for _, socket := range r.Sockets {
 		roBind(socket)
 	}
-	// The read-only leaves, protected paths, workarea metadata and pins are
-	// overlaid read-only after the writable allows, so they win. An overlay
-	// needs something to mount: an empty placeholder under the OS temporary
+	// Denies are overlaid read-only after the writable allows, so they win
+	// — but only where host content would otherwise show through: a deny
+	// strictly inside a writable root. Anywhere else the tmpfs root already
+	// hides the path (a listing fails with no-such-file instead of
+	// succeeding on an empty overlay), and the Landlock stage denies
+	// content, listings and writes with no covering rule. An overlay needs
+	// something to mount: an empty placeholder under the OS temporary
 	// directory stands in for the denied tree. A denied path that does not
-	// exist needs no overlay — the tmpfs root already hides it — but its
-	// missing ancestors are created with --dir first, so the render never
-	// names a destination bubblewrap cannot mount onto.
-	deny := append(append([]string{}, r.ReadOnly...), r.Protected...)
-	deny = append(deny, r.MetadataDir)
-	deny = append(deny, r.Pins...)
-	// The workarea root itself is never writable: the harness reaches its
-	// leaves through it but cannot rename or create beside them.
-	deny = append(deny, r.WorkareaRoot)
-	for _, path := range deny {
+	// exist needs no overlay for the same reason, but its missing ancestors
+	// are created with --dir first, so the render never names a destination
+	// the launcher cannot mount onto.
+	//
+	// The workarea root itself is deliberately NOT overlaid: an overlay
+	// would shadow the writable leaves bound above, and the spawn could
+	// start with an empty workarea. The tmpfs root already gives the
+	// seatbelt-literal semantics — the parent reads as an empty directory
+	// the leaves punch through — and anything the seat creates beside the
+	// leaves lands on seat-local tmpfs, discarded with the boundary, while
+	// the Landlock stage (whose rules follow inodes across renames) still
+	// governs every host file.
+	overlayDeny := func(path string) error {
 		info, err := os.Lstat(path)
 		if err != nil {
 			// A denied path that does not exist needs no overlay: the
@@ -388,11 +482,11 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 			// denies it too. Skipping keeps the render launchable —
 			// binding a missing source onto its missing target would
 			// fail the spawn.
-			continue
+			return nil
 		}
 		empty, _, err := emptyPlaceholder(path)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if info.IsDir() {
 			if parent := filepath.Dir(path); parent != "/" && parent != "." {
@@ -401,37 +495,36 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 			args = append(args, "--dir", path)
 		}
 		bind("--ro-bind", empty, path)
+		return nil
 	}
-	// The shared temporary locations are hidden the same way: a seat that
-	// reaches for the host's shared tmp finds an empty directory, while its
-	// own per-session tmp stays bound writable above. A writable root that
-	// lives under a shared parent (a test layout) keeps its bind: hiding
-	// its parent would bury it.
-	shared, err := sharedLocations()
-	if err != nil {
-		return nil, refuse(ReasonBackendAbsent, "shared locations: %v", err)
-	}
-	for _, dir := range shared {
-		buried := false
-		for _, root := range r.Writable {
-			if insideOrEqual(dir, root.Path) || insideOrEqual(root.Path, dir) {
-				buried = true
-				break
-			}
-		}
-		if buried {
+	deny := append(append([]string{}, r.ReadOnly...), r.Protected...)
+	deny = append(deny, r.MetadataDir)
+	for _, path := range deny {
+		if !needsOverlay(r.Writable, path) {
 			continue
 		}
-		if _, err := os.Lstat(dir); err != nil {
-			continue
-		}
-		args = append(args, "--dir", dir)
-		empty, _, err := emptyPlaceholder(dir)
-		if err != nil {
+		if err := overlayDeny(path); err != nil {
 			return nil, err
 		}
-		bind("--ro-bind", empty, dir)
 	}
+	// The rename pins are overlaid the same way, except a pin that is
+	// itself a writable root: its own read-write bind must win, so it is
+	// never overlaid. The rename the pin names stays held by the Landlock
+	// stage, whose rules follow inodes across renames.
+	for _, pin := range r.Pins {
+		if !needsOverlay(r.Writable, pin) || isWritableRoot(r.Writable, pin) {
+			continue
+		}
+		if err := overlayDeny(pin); err != nil {
+			return nil, err
+		}
+	}
+	// The shared temporary locations need no overlay: none of them sits
+	// strictly inside a writable root (a writable root beneath one keeps
+	// its bind — hiding the parent would bury it), so the tmpfs root
+	// already hides them and the Landlock stage denies them. A seat that
+	// reaches for the host's shared tmp finds nothing there, while its own
+	// per-session tmp stays bound writable above.
 	// Loopback TCP is closed by default and opened per declared port: the
 	// mount tree carries the policy, and the Landlock stage enforces it —
 	// handled_access_net covers connect, and each declared port is an
@@ -487,6 +580,21 @@ func renderMountComposerRules(r *Resolved, rules []Rule, canonical func(string) 
 				// Landlock stage denies the path too.
 				continue
 			}
+			// A deny that covers a whole writable root cannot be
+			// confined as declared: overlaying it would shadow the
+			// bind the session needs, and skipping it would drop
+			// the rule. Refuse the rendering instead of either.
+			for _, root := range r.Writable {
+				if insideOrEqual(root.Path, path) {
+					return nil, refuse(ReasonRuleUnrenderable, "composer rule %d: a deny over the writable set cannot be rendered", i)
+				}
+			}
+			// Outside the writable set the tmpfs root already hides
+			// the path and the Landlock stage denies it; only an
+			// inside deny needs the overlay (see needsOverlay).
+			if !needsOverlay(r.Writable, path) {
+				continue
+			}
 			empty, _, err := emptyPlaceholder(path)
 			if err != nil {
 				return nil, err
@@ -497,6 +605,12 @@ func renderMountComposerRules(r *Resolved, rules []Rule, canonical func(string) 
 			args = append(args, "--dir", path)
 			args = append(args, "--ro-bind", empty, path)
 			for _, pin := range ancestorPins(writable, []string{path}) {
+				// Only inside pins render, and never over a writable
+				// root's own bind (see renderBubblewrap). The rename
+				// the pin names stays held by the Landlock stage.
+				if !needsOverlay(r.Writable, pin) || isWritableRoot(r.Writable, pin) {
+					continue
+				}
 				anchor, _, err := emptyPlaceholder(pin)
 				if err != nil {
 					return nil, err
@@ -558,6 +672,32 @@ func renderMountReadScope(r *Resolved) ([]string, error) {
 	}
 }
 
+// needsOverlay reports whether a deny must be overlaid with the empty
+// placeholder: exactly when host content would otherwise show through —
+// the path sits strictly inside a writable root bound read-write above.
+// Anywhere else the tmpfs root hides the path and the Landlock stage
+// denies it, so an overlay would only shadow legitimate binds (a writable
+// root) or turn a refused listing into a successful empty one.
+func needsOverlay(writable []WritableRoot, path string) bool {
+	for _, root := range writable {
+		if strictlyInside(path, root.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+// isWritableRoot reports whether path is itself a writable root, whose
+// own read-write bind must win over any deny overlay.
+func isWritableRoot(writable []WritableRoot, path string) bool {
+	for _, root := range writable {
+		if root.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
 // emptyPlaceholder returns a path whose bind hides the denied target: an
 // empty directory for a directory target, an empty file otherwise, plus
 // whether the target is a directory. The placeholder lives under the OS
@@ -573,16 +713,19 @@ func emptyPlaceholder(target string) (string, bool, error) {
 	base := filepath.Join(os.TempDir(), "donmai-confine-empty")
 	if info.IsDir() {
 		dir := filepath.Join(base, "dir")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		// The placeholder is an empty directory by construction; 0700 keeps it owner-only.
+		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G301: an empty overlay directory.
 			return "", false, refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
 		}
 		return dir, true, nil
 	}
 	file := filepath.Join(base, "file")
-	if err := os.MkdirAll(base, 0o755); err != nil {
+	// The placeholder parent holds only the empty file below; 0700 keeps it owner-only.
+	if err := os.MkdirAll(base, 0o700); err != nil { //nolint:gosec // G301: the empty overlay parent.
 		return "", false, refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
 	}
-	f, err := os.OpenFile(file, os.O_CREATE|os.O_RDONLY, 0o644)
+	// The placeholder is an empty file by construction; 0600 keeps it owner-only.
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_RDONLY, 0o600) //nolint:gosec // G302: an empty overlay file.
 	if err != nil {
 		return "", false, refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
 	}

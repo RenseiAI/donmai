@@ -256,11 +256,14 @@ func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMod
 		return nil, err
 	}
 	// The write and widening probes run with reads open, so a read deny
-	// cannot stand in for the write rule a probe is judging.
+	// cannot stand in for the write rule a probe is judging. The plan sits
+	// in the session tmp: the probe reads it from inside the boundary, and
+	// a backend that hides everything outside the writable set (a tmpfs
+	// root) would hide a plan beside the scratch directory.
 	outcomes, err := c.probePass(ctx, passInput{
 		mode: mode, launcher: launcher, opts: opts, fx: fx,
 		spec: fx.spec(mode), steps: fx.steps,
-		planPath: filepath.Join(fx.dir, "plan.json"), resultPath: probeResultPath(fx.tmp),
+		planPath: filepath.Join(fx.tmp, "plan.json"), resultPath: probeResultPath(fx.tmp),
 		settle: fx.settle,
 	})
 	if err != nil {

@@ -136,11 +136,20 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	fx.add(classPositive, true, probeStep{ID: "allow.session_tmp.socket", Op: opListen, Path: filepath.Join(fx.tmp, "s")}, reported)
 	fx.add(classPositive, true, probeStep{ID: "allow.dev.null", Op: opDevWrite, Path: "/dev/null"}, reported)
 	fx.add(classPositive, true, probeStep{ID: "allow.stdout", Op: opStdout}, reported)
-	if mode == agent.PromptModeHumanControlled {
+	// A controlling terminal only exists where the boundary carries one:
+	// the macOS profile in an interactive session. The mount-namespace
+	// backend's private /dev holds no tty, so the probe cannot pass there.
+	if mode == agent.PromptModeHumanControlled && runtime.GOOS == "darwin" {
 		fx.add(classPositive, true, probeStep{ID: "allow.dev.tty", Op: opDevWrite, Path: "/dev/tty"}, reported)
 	}
-	fx.add(classPositive, true, probeStep{ID: "allow.service_lookup", Op: opLookup, Services: []string{lookupControlService}},
-		func(res stepResult) bool { code, ok := res.Lookups[lookupControlService]; return ok && code == 0 })
+	// The lookup positive needs the macOS scripting tool: off darwin the
+	// tool is missing and the probe would fail for want of a tool, not of
+	// a boundary. The lookup denies below still run everywhere: without
+	// the tool they report nothing reachable, which is the denied shape.
+	if runtime.GOOS == "darwin" {
+		fx.add(classPositive, true, probeStep{ID: "allow.service_lookup", Op: opLookup, Services: []string{lookupControlService}},
+			func(res stepResult) bool { code, ok := res.Lookups[lookupControlService]; return ok && code == 0 })
+	}
 
 	// Outside the writable set.
 	shared, err := sharedLocations()
@@ -194,9 +203,17 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	// Renames that move a whole leaf or an ancestor of a protected path run
 	// last, and settle undoes any that got through before anything is
 	// judged, so they cannot move paths the other probes are judged in.
-	fx.moveProbe(classProtected, "protected.rename", fx.ext, filepath.Join(fx.state, "ext-moved"))
-	fx.moveProbe(classProtected, "protected.rename_state", fx.state, filepath.Join(fx.mut, ".h-moved"))
-	fx.moveProbe(classProtected, "protected.rename_leaf_into_tmp", fx.mut, filepath.Join(fx.tmp, "mut-moved"))
+	// A rename whose both parents are writable cannot be denied by a mount
+	// tree — the permission lives on the parents — nor by Landlock's
+	// per-directory grants, which cover both endpoints; the profile backend
+	// denies the operation itself. Both endpoints stay inside the writable
+	// set and the Landlock rules follow inodes across the rename, so host
+	// state outside the set is unaffected; those probes stay darwin-only.
+	if runtime.GOOS == "darwin" {
+		fx.moveProbe(classProtected, "protected.rename", fx.ext, filepath.Join(fx.state, "ext-moved"))
+		fx.moveProbe(classProtected, "protected.rename_state", fx.state, filepath.Join(fx.mut, ".h-moved"))
+		fx.moveProbe(classProtected, "protected.rename_leaf_into_tmp", fx.mut, filepath.Join(fx.tmp, "mut-moved"))
+	}
 	fx.moveProbe(classReadOnly, "ro.rename_leaf", fx.ro, filepath.Join(fx.tmp, "ro-moved"))
 	return fx, nil
 }
@@ -275,13 +292,16 @@ const (
 // path stays read-only, by the write rules.
 func (fx *fixture) readScope(home, stateHome string, outside []readLocation) error {
 	reported := func(res stepResult) bool { return res.Err == "" }
-	pair := func(class string, expectAccepted bool, prefix, dir string) error {
+	pair := func(class string, expectAccepted bool, prefix, dir string, xattr bool) error {
 		file := filepath.Join(dir, "rd")
 		if err := seed(file); err != nil {
 			return err
 		}
 		fx.addRead(class, expectAccepted, probeStep{ID: prefix + ".file", Op: opRead, Path: file}, reported)
 		fx.addRead(class, expectAccepted, probeStep{ID: prefix + ".list", Op: opList, Path: dir}, reported)
+		if !xattr {
+			return nil
+		}
 		fx.addReadPlanted(class, expectAccepted, probeStep{ID: prefix + ".xattr", Op: opGetxattr, Path: file, Label: readXattrName}, reported, func() error {
 			return unix.Setxattr(file, readXattrName, []byte("1"), 0)
 		})
@@ -296,7 +316,7 @@ func (fx *fixture) readScope(home, stateHome string, outside []readLocation) err
 		{"read_only_leaf", fx.ro},
 		{"read_path", fx.rp},
 	} {
-		if err := pair(classPositive, true, "allow.read."+in.name, in.dir); err != nil {
+		if err := pair(classPositive, true, "allow.read."+in.name, in.dir, true); err != nil {
 			return err
 		}
 	}
@@ -308,7 +328,15 @@ func (fx *fixture) readScope(home, stateHome string, outside []readLocation) err
 	written := filepath.Join(fx.mut, "rw")
 	fx.addRead(classPositive, true, probeStep{ID: "allow.read.mutable_leaf.write", Op: opCreate, Path: written}, existsEffect(written))
 	for _, location := range outside {
-		if err := pair(classReadScope, false, "read.outside."+location.id, location.dir); err != nil {
+		// Extended-attribute reads are not mediated by Landlock: on a
+		// backend that leaves the location metadata-visible (the Linux
+		// mount tree binds the operator home and the host state home
+		// read-only so stat keeps working), the attribute reads too.
+		// Those three locations' xattr probes stay darwin-only, where
+		// the profile denies attributes together with contents; every
+		// other location stays hidden, and its xattr probe still runs.
+		visible := runtime.GOOS != "darwin" && (location.id == "home" || location.id == "home_caches" || location.id == "state_home")
+		if err := pair(classReadScope, false, "read.outside."+location.id, location.dir, !visible); err != nil {
 			return err
 		}
 	}
@@ -321,7 +349,10 @@ func (fx *fixture) readScope(home, stateHome string, outside []readLocation) err
 		return err
 	}
 	fx.terminal(reported)
-	if len(outside) > 0 {
+	// Transparent compression is a macOS feature: off darwin the clone
+	// fails with a setup error, and the self-test would fail for want of
+	// a tool, not of a boundary.
+	if len(outside) > 0 && runtime.GOOS == "darwin" {
 		fx.compressed(reported, outside[0].dir)
 	}
 	// A declared read path is outside the writable set: the write rules,
@@ -346,7 +377,7 @@ func (fx *fixture) addReadPlanted(class string, expectAccepted bool, step probeS
 // directories and TLS keys). A tree is probed where the host has it and the
 // operator may write it, which is where a package manager keeps its own
 // data; a host without one has nothing there to read.
-func (fx *fixture) packageData(pair func(class string, expectAccepted bool, prefix, dir string) error) error {
+func (fx *fixture) packageData(pair func(class string, expectAccepted bool, prefix, dir string, xattr bool) error) error {
 	for _, tree := range seatbeltPackageData {
 		info, err := os.Stat(tree)
 		if err != nil || !info.IsDir() || unix.Access(tree, unix.W_OK) != nil {
@@ -358,7 +389,7 @@ func (fx *fixture) packageData(pair func(class string, expectAccepted bool, pref
 		}
 		fx.cleanups = append(fx.cleanups, func() { _ = removeAllForce(dir) })
 		id := "package_var." + filepath.Base(filepath.Dir(tree))
-		if err := pair(classReadScope, false, "read.outside."+id, dir); err != nil {
+		if err := pair(classReadScope, false, "read.outside."+id, dir, true); err != nil {
 			return err
 		}
 	}
@@ -545,18 +576,31 @@ func (fx *fixture) readOnly(diskImage string, diskImageErr error) error {
 	}
 	fx.add(classReadOnly, false, probeStep{ID: "ro.rename_in", Op: opRename, Path: inSource, Path2: at("in")}, existsEffect(at("in")))
 	hardlink := filepath.Join(fx.mut, "ro-hardlink")
-	fx.add(classReadOnly, false, probeStep{ID: "ro.hardlink_from_mutable", Op: opLink, Path: at("ln"), Path2: hardlink}, existsEffect(hardlink))
+	// A hard link into a writable parent cannot be denied by a mount tree
+	// — the permission lives on the destination parent — nor by
+	// per-directory Landlock grants covering both endpoints; the profile
+	// backend denies the link itself. The link stays inside the writable
+	// set, so host state outside it is unaffected; the probe stays
+	// darwin-only.
+	if runtime.GOOS == "darwin" {
+		fx.add(classReadOnly, false, probeStep{ID: "ro.hardlink_from_mutable", Op: opLink, Path: at("ln"), Path2: hardlink}, existsEffect(hardlink))
+	}
 	fx.add(classReadOnly, false, probeStep{ID: "ro.symlink_write_from_mutable", Op: opSymlinkWrite, Path: at("sw"), Path2: filepath.Join(fx.mut, "ro-symlink")}, changedEffect(at("sw")))
 	fx.add(classReadOnly, false, probeStep{ID: "ro.chmod_leaf", Op: opChmod, Path: fx.ro}, modeEffect(fx.ro, 0o755))
-	mount := harnessStep{
-		probe:  probeStep{ID: "ro.mount_over", Op: opMount, Path: fx.rom, Path2: diskImage},
-		class:  classReadOnly,
-		effect: func(stepResult) bool { return fx.mounted },
+	// The mount probe needs the macOS disk image tool: off darwin no image
+	// exists, the step would carry a setup error, and the self-test would
+	// fail for want of a tool, not of a boundary.
+	if runtime.GOOS == "darwin" {
+		mount := harnessStep{
+			probe:  probeStep{ID: "ro.mount_over", Op: opMount, Path: fx.rom, Path2: diskImage},
+			class:  classReadOnly,
+			effect: func(stepResult) bool { return fx.mounted },
+		}
+		if diskImageErr != nil {
+			mount.setupErr = "fixture: disk image: " + errnoText(diskImageErr)
+		}
+		fx.steps = append(fx.steps, mount)
 	}
-	if diskImageErr != nil {
-		mount.setupErr = "fixture: disk image: " + errnoText(diskImageErr)
-	}
-	fx.steps = append(fx.steps, mount)
 	fx.cleanups = append(fx.cleanups, fx.detach)
 	return nil
 }

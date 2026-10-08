@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -41,6 +42,13 @@ import (
 // harness. The harness proper never sets it.
 const landlockStageEnv = "DONMAI_CONFINEMENT_LANDLOCK_STAGE"
 
+// landlockExecAccess is the access the stage grants on the directories
+// holding the executables it re-executes: read and execute, so the stage
+// and the harness binaries load and run, without directory listings —
+// siblings stay unnamed. Executing needs the read as well as the execute
+// right; listings stay denied.
+const landlockExecAccess = landlockAccessFSExecute | landlockAccessFSReadFile
+
 // landlockStage is one session's Landlock policy: the read allowlist (under
 // a read scope) plus the declared loopback TCP ports. A nil allowlist with
 // no ports is still a policy: nothing outside the mount tree's read-write
@@ -59,6 +67,11 @@ type landlockPolicy struct {
 	// sockets are the exact socket paths the mount tree binds: the stage
 	// grants them read access so connects through them succeed.
 	sockets []string
+	// execRoots are the directories holding the executables the stage
+	// re-executes (itself and the harness): granted read and execute, so
+	// binaries outside every other grant still load and run, without
+	// opening their siblings to listings.
+	execRoots []string
 }
 
 // landlockStage builds the stage policy for one resolved session: the
@@ -68,6 +81,13 @@ type landlockPolicy struct {
 // declared loopback ports are granted TCP connect. Everything else the
 // mount tree reveals stays read-only-or-hidden by the combination: the
 // mount tree binds it read-only, and Landlock withholds write.
+//
+// Landlock path rules name directories: the kernel's path-beneath rule
+// takes a directory descriptor, so a file in the allowlist grants its
+// parent directory. That is no wider than the mount tree: anything the
+// parent reveals that the tree did not bind stays hidden behind the tmpfs
+// root, and the stage runs after the binds are in place, on the inside
+// view.
 func buildLandlockStage(r *Resolved) (*landlockPolicy, error) {
 	stage := &landlockPolicy{tcpPorts: append([]int(nil), r.LoopbackTCPPorts...)}
 	seen := map[string]bool{}
@@ -78,6 +98,20 @@ func buildLandlockStage(r *Resolved) (*landlockPolicy, error) {
 		seen[path] = true
 		*list = append(*list, path)
 	}
+	// dirRule returns the directory the stage grants for path: the path
+	// itself when it names a directory, else its parent. Symbolic links
+	// resolve first, so a link to a directory grants the target (already
+	// covered when the target is bound too) instead of the link's parent.
+	dirRule := func(path string) string {
+		resolved := path
+		if target, err := filepath.EvalSymlinks(path); err == nil {
+			resolved = target
+		}
+		if info, err := os.Lstat(resolved); err == nil && !info.IsDir() {
+			return filepath.Dir(resolved)
+		}
+		return resolved
+	}
 	for _, root := range r.Writable {
 		add(&stage.writeRoots, root.Path)
 	}
@@ -85,36 +119,53 @@ func buildLandlockStage(r *Resolved) (*landlockPolicy, error) {
 		if _, err := os.Lstat(path); err != nil {
 			continue
 		}
-		add(&stage.readRoots, path)
+		add(&stage.readRoots, dirRule(path))
 	}
 	for _, path := range mountNamespaceResolverBinds {
 		if _, err := os.Lstat(path); err != nil {
 			continue
 		}
-		add(&stage.readRoots, path)
+		add(&stage.readRoots, dirRule(path))
 	}
 	if r.ReadScope != "" {
 		for _, path := range r.ReadOnly {
-			if seen[path] {
-				continue
-			}
 			if _, err := os.Lstat(path); err != nil {
 				continue
 			}
-			add(&stage.readRoots, path)
+			if seen[dirRule(path)] {
+				continue
+			}
+			add(&stage.readRoots, dirRule(path))
 		}
 		for _, path := range r.ReadPaths {
-			if seen[path] {
-				continue
-			}
 			if _, err := os.Lstat(path); err != nil {
 				continue
 			}
-			add(&stage.readRoots, path)
+			if seen[dirRule(path)] {
+				continue
+			}
+			add(&stage.readRoots, dirRule(path))
 		}
 	}
 	for _, socket := range r.Sockets {
-		add(&stage.sockets, socket)
+		add(&stage.sockets, dirRule(socket))
+	}
+	// With reads open (no read scope) the host directories the tree
+	// binds read-only stay readable, matching the seatbelt contract that
+	// reads are open without a scope: tools the seat runs (version
+	// control, package managers) read their user configuration there.
+	// Under a read scope they stay visible for metadata only, with no
+	// grant, so contents and listings refuse.
+	if r.ReadScope == "" {
+		for _, path := range []string{r.Home, r.StateHome} {
+			if _, err := os.Lstat(path); err != nil {
+				continue
+			}
+			if seen[dirRule(path)] {
+				continue
+			}
+			add(&stage.readRoots, dirRule(path))
+		}
 	}
 	stage.dev = true
 	return stage, nil
@@ -134,6 +185,9 @@ func (s *landlockPolicy) describe() string {
 	}
 	for _, path := range s.sockets {
 		fmt.Fprintf(&b, "allow-socket %s\n", path)
+	}
+	for _, path := range s.execRoots {
+		fmt.Fprintf(&b, "allow-exec %s\n", path)
 	}
 	if s.dev {
 		b.WriteString("allow-dev\n")
@@ -173,16 +227,14 @@ func stagePortArgs(s *landlockPolicy) []string {
 	return []string{"--tcp", strings.Join(ports, ",")}
 }
 
-// runLandlockStageFromEnv runs the Landlock stage when the stage marker is
-// set and reports whether it did. The caller exits; a library never does.
-// The stage reads the policy from the environment, restricts itself onto
-// the inside view of the mount tree, and execs the harness argv it was
-// given: it never returns on success, so falling off the end is a refusal.
-// RunLandlockStageFromEnv runs the Landlock stage when the stage marker
-// is set and reports whether it did, with the exit code the process should
-// end with. The caller exits; a library never does. On other operating
-// systems it never handles (see stage_other.go).
-func runLandlockStageFromEnv() (handled bool, exitCode int) {
+// RunLandlockStageFromEnv runs the Landlock stage when the stage marker is
+// set and reports whether it did, with the exit code the process should
+// end with. The caller exits; a library never does. The stage reads the
+// policy from the environment, restricts itself onto the inside view of
+// the mount tree, and execs the harness argv it was given: it never
+// returns on success, so falling off the end is a refusal. On other
+// operating systems it never handles (see stage_other.go).
+func RunLandlockStageFromEnv() (handled bool, exitCode int) {
 	if os.Getenv(landlockStageEnv) == "" {
 		return false, 0
 	}
@@ -211,7 +263,18 @@ func landlockApply() error {
 	if len(argv) == 0 {
 		return fmt.Errorf("confinement: landlock stage: no harness command")
 	}
-	return unix.Exec(argv[0], argv, os.Environ())
+	// The harness inherits the stage's environment minus the stage marker:
+	// the marker names this invocation only, and a harness that is the
+	// same executable (the self-test probe, the donmai binary) would
+	// otherwise re-enter the stage on its harness argv and refuse it.
+	env := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, landlockStageEnv+"=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return unix.Exec(argv[0], argv, env)
 }
 
 // parseLandlockStage splits a stage invocation: the environment carries the
@@ -231,6 +294,12 @@ func parseLandlockStage(env string, args []string) (*landlockPolicy, []string, e
 		*list = append(*list, value)
 	}
 	for _, line := range strings.Split(env, "\n") {
+		// The header and the device flag carry no value; everything
+		// else is a "name value" pair.
+		if line == "allow-dev" {
+			stage.dev = true
+			continue
+		}
 		field, value, ok := strings.Cut(line, " ")
 		if !ok {
 			continue
@@ -240,14 +309,16 @@ func parseLandlockStage(env string, args []string) (*landlockPolicy, []string, e
 			remember(&stage.writeRoots, value)
 		case "allow-read", "allow-socket":
 			remember(&stage.readRoots, value)
-		case "allow-dev":
-			stage.dev = true
+		case "allow-exec":
+			remember(&stage.execRoots, value)
 		case "allow-tcp":
 			port, convErr := strconv.Atoi(strings.TrimSpace(value))
 			if convErr != nil || port < 1 || port > 65535 {
 				return nil, nil, fmt.Errorf("confinement: landlock stage: bad port %q", value)
 			}
-			stage.tcpPorts = append(stage.tcpPorts, port)
+			if !slices.Contains(stage.tcpPorts, port) {
+				stage.tcpPorts = append(stage.tcpPorts, port)
+			}
 		}
 	}
 	i := 0
@@ -270,7 +341,12 @@ func parseLandlockStage(env string, args []string) (*landlockPolicy, []string, e
 				if convErr != nil || port < 1 || port > 65535 {
 					return nil, nil, fmt.Errorf("confinement: landlock stage: bad port %q", raw)
 				}
-				stage.tcpPorts = append(stage.tcpPorts, port)
+				// The declared ports ride both the policy text and the
+				// invocation; the ruleset merges identical port rules,
+				// but keep one copy so the applied set stays explicit.
+				if !slices.Contains(stage.tcpPorts, port) {
+					stage.tcpPorts = append(stage.tcpPorts, port)
+				}
 			}
 		default:
 			return nil, nil, fmt.Errorf("confinement: landlock stage: unknown flag %q", args[i])
@@ -281,7 +357,37 @@ func parseLandlockStage(env string, args []string) (*landlockPolicy, []string, e
 		return nil, nil, fmt.Errorf("confinement: landlock stage: no harness separator")
 	}
 	argv := append([]string(nil), args[i+1:]...)
+	// The executables the stage re-executes need traverse and execute
+	// grants on their directories: the stage itself (args[0]) and the
+	// harness (argv[0]) may live outside every other grant — the test
+	// binary, a provider harness — and without the grant the exec fails
+	// closed. Directories already granted (a /usr binary) dedupe out
+	// through the shared seen set.
+	if len(args) > 0 {
+		remember(&stage.execRoots, execDirRule(args[0]))
+	}
+	if len(argv) > 0 {
+		remember(&stage.execRoots, execDirRule(argv[0]))
+	}
 	return stage, argv, nil
+}
+
+// execDirRule returns the directory the stage grants traverse and execute
+// on for one executable path: its containing directory (resolving links
+// first), or empty when the path is not absolute — a relative executable
+// never reaches the stage, since the spawn binding resolves it first.
+func execDirRule(path string) string {
+	if path == "" || !filepath.IsAbs(path) {
+		return ""
+	}
+	resolved := path
+	if target, err := filepath.EvalSymlinks(path); err == nil {
+		resolved = target
+	}
+	if info, err := os.Lstat(resolved); err == nil && !info.IsDir() {
+		return filepath.Dir(resolved)
+	}
+	return resolved
 }
 
 // landlockAvailable reports whether the running kernel supports Landlock
@@ -395,6 +501,11 @@ func restrictLandlockFull(stage *landlockPolicy) error {
 			return err
 		}
 	}
+	for _, root := range stage.execRoots {
+		if err := landlockAddPath(ruleset, root, landlockExecAccess); err != nil {
+			return err
+		}
+	}
 	if stage.dev {
 		if err := landlockAddPath(ruleset, "/dev", landlockDevAccess); err != nil {
 			return err
@@ -417,7 +528,7 @@ func restrictLandlockFull(stage *landlockPolicy) error {
 func landlockCreateRuleset(handledFS, handledNet, scoped uint64) (int, error) {
 	attr := unix.LandlockRulesetAttr{Access_fs: handledFS, Access_net: handledNet, Scoped: scoped}
 	ruleset, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
-		uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
+		uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0) //nolint:gosec // G103: the raw-syscall ABI takes uintptr; no typed wrapper exists for Landlock.
 	if errno != 0 {
 		return -1, refuse(ReasonBackendAbsent, "the Landlock stage is unavailable: %v", errnoText(errno))
 	}
@@ -428,32 +539,34 @@ func landlockCreateRuleset(handledFS, handledNet, scoped uint64) (int, error) {
 // call takes the attribute with size 0 (kernel default); the rule type
 // rides the call's second argument.
 func landlockAddPath(ruleset int, path string, access uint64) error {
-	fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY, 0)
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY, 0) //nolint:gosec // G703: path is the backend-rendered allowlist from the resolved session spec, never probe or session input; a failure refuses closed below.
 	if err != nil {
 		// A rule over a path the mount tree hides is already denied twice
 		// over: skip it rather than refuse a boundary that holds without
 		// it. A rule over a path the mount tree REVEALS must hold, and the
 		// open of a revealed path does not fail.
-		if _, statErr := os.Lstat(path); statErr != nil {
+		if _, statErr := os.Lstat(path); statErr != nil { //nolint:gosec // G703: same backend-rendered allowlist as the open above.
 			return nil
 		}
 		return refuse(ReasonWritableSetUnrepresentable, "the Landlock stage cannot open %s: %v", filepath.Base(path), errnoText(err))
 	}
 	defer func() { _ = unix.Close(fd) }()
-	rule := landlockPathRule{AllowedAccess: access, ParentFD: int32(fd)}
+	rule := landlockPathRule{AllowedAccess: access, ParentFD: int32(fd)} //nolint:gosec // G115: kernel-issued descriptors are small and non-negative.
 	_, _, errno := unix.Syscall(unix.SYS_LANDLOCK_ADD_RULE,
-		uintptr(ruleset), uintptr(landlockRulePathBeneath), uintptr(unsafe.Pointer(&rule)))
+		uintptr(ruleset), uintptr(landlockRulePathBeneath), uintptr(unsafe.Pointer(&rule))) //nolint:gosec // G103: the raw-syscall ABI takes uintptr; no typed wrapper exists for Landlock.
 	if errno != 0 {
 		return refuse(ReasonBackendAbsent, "the Landlock stage cannot add a path rule: %v", errnoText(errno))
 	}
 	return nil
 }
 
-// landlockAddPort grants TCP access on one port in host byte order.
+// landlockAddPort grants TCP access on one port in host byte order. The
+// port is validated 1-65535 by resolveSpec and again by parseLandlockStage
+// before it reaches here.
 func landlockAddPort(ruleset, port int, access uint64) error {
-	rule := landlockNetRule{AllowedAccess: access, Port: uint16(port)}
+	rule := landlockNetRule{AllowedAccess: access, Port: uint16(port)} //nolint:gosec // G115: validated 1-65535 by the callers above.
 	_, _, errno := unix.Syscall(unix.SYS_LANDLOCK_ADD_RULE,
-		uintptr(ruleset), uintptr(landlockRuleNetPort), uintptr(unsafe.Pointer(&rule)))
+		uintptr(ruleset), uintptr(landlockRuleNetPort), uintptr(unsafe.Pointer(&rule))) //nolint:gosec // G103: the raw-syscall ABI takes uintptr; no typed wrapper exists for Landlock.
 	if errno != 0 {
 		return refuse(ReasonBackendAbsent, "the Landlock stage cannot add a port rule: %v", errnoText(errno))
 	}

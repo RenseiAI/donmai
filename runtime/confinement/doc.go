@@ -73,8 +73,17 @@
 //
 // The Linux backend renders the same contract as a bubblewrap mount tree:
 // a tmpfs root hides everything, read-only binds carry the OS userland,
-// the writable set is bound read-write over them, deny overlays win last,
-// and a Landlock stage the harness process itself executes confines reads
-// outside the allowlist and TCP connects outside the declared loopback
-// ports. Other operating systems have no backend yet.
+// the operator home and the host state home (so file metadata stays
+// readable) and the declared sockets, the writable set is bound read-write
+// over them, deny overlays win last only where host content would otherwise
+// show through a writable bind, and a Landlock stage the harness process
+// itself executes confines reads outside the allowlist and TCP connects
+// outside the declared loopback ports. Three granularity differences from
+// the profile backend follow from the mechanism, and the self-test proves
+// the rest: renames and hard links whose both parents are writable cannot
+// be denied (the permission lives on the parents — both endpoints stay
+// inside the set and the Landlock rules follow inodes across the rename),
+// extended-attribute reads are not mediated on paths left visible for
+// metadata, and file metadata itself is refused where nothing is bound.
+// Other operating systems have no backend yet.
 package confinement

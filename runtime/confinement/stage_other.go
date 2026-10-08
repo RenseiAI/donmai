@@ -1,3 +1,5 @@
+//go:build !linux
+
 package confinement
 
 // RunLandlockStageFromEnv runs the Landlock stage when the stage marker is
