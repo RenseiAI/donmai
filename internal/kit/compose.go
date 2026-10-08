@@ -92,6 +92,11 @@ type ManifestView struct {
 	// shape). Empty for every kit shipped as of this field's introduction —
 	// no manifest declares [[provide.lanes]] yet.
 	Lanes []LaneView
+	// DependencyStores is the slice of [[provide.dependency_store]] entries
+	// declaring the package managers this kit supports. Empty unless the
+	// manifest carries the dependency-stores revision. Composed by union
+	// keyed by manager (see dependency_store.go).
+	DependencyStores []DependencyStoreView
 }
 
 // PromptFragmentEntry mirrors one [[provide.prompt_fragments]] TOML
@@ -148,6 +153,12 @@ type ToolchainDemand struct {
 	Commands          []QualifiedCommand      `json:"commands,omitempty"`
 	CommandBindings   []GenericCommandBinding `json:"command_bindings,omitempty"`
 	CompositionDigest string                  `json:"composition_digest,omitempty"`
+	// DependencyStores is the resolved dependency-store plan: one entry per
+	// manager declared by the composed kits. Empty when no kit declares a
+	// store. DependencyStoresDigest binds the exact managers, owners and
+	// commands for diagnostics/audit evidence.
+	DependencyStores       []ComposedDependencyStore `json:"dependency_stores,omitempty"`
+	DependencyStoresDigest string                    `json:"dependency_stores_digest,omitempty"`
 }
 
 // IsEmpty reports whether the demand has nothing to execute. The runner
@@ -273,6 +284,13 @@ func ComposeForTarget(views []ManifestView, target CompositionTarget, lock *Comp
 	d.Commands = commands.Commands
 	d.CommandBindings = commands.Bindings
 	d.CompositionDigest = commands.Digest
+
+	stores, err := ComposeDependencyStores(views, target, lock)
+	if err != nil {
+		return nil, err
+	}
+	d.DependencyStores = stores.Stores
+	d.DependencyStoresDigest = stores.Digest
 
 	return d, nil
 }

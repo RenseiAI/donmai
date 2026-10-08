@@ -462,8 +462,14 @@ func (r *KitRegistry) verifyKitPackage(sourceRoot, descriptorRel, expectedID, ex
 	if err := tomlUnmarshalKit(manifestBytes, &out.Manifest); err != nil {
 		return out, fmt.Errorf("%w: parse manifest: %v", ErrKitPackageInvalid, err)
 	}
-	if out.Manifest.API != "donmai.dev/v1" && out.Manifest.API != "rensei.dev/v1" {
+	if !kitManifestSupportedAPI(out.Manifest.API) {
 		return out, fmt.Errorf("%w: unsupported manifest api %q", ErrKitPackageInvalid, out.Manifest.API)
+	}
+	if err := validateManifestAPIRevision(out.Manifest); err != nil {
+		return out, fmt.Errorf("%w: %v", ErrKitPackageInvalid, err)
+	}
+	if _, err := dependencyStoreViews(out.Manifest); err != nil {
+		return out, fmt.Errorf("%w: %v", ErrKitPackageInvalid, err)
 	}
 	if out.Manifest.Kit.ID != descriptor.Kit.ID || out.Manifest.Kit.Version != descriptor.Kit.Version {
 		return out, fmt.Errorf("%w: descriptor/manifest identity mismatch", ErrKitPackageInvalid)
@@ -652,6 +658,35 @@ func syncPackageStage(root *os.Root) error {
 	return nil
 }
 
+// packageOwnedCommandRef resolves a dependency-store command to a
+// package-owned payload path when it names one: a relative forward-slash
+// path without whitespace. Manager invocations ("pnpm install ..."),
+// variable references, and absolute paths are inline shell text or system
+// commands, never package paths, and need no inventory proof. The
+// relocate command ("bin/pnpm-relocate") is the motivating case: it
+// must be inventoried so the signed closure covers the bytes the keeper
+// will run.
+func packageOwnedCommandRef(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" || strings.ContainsAny(command, " \t\n\r") {
+		return ""
+	}
+	if strings.Contains(command, "://") || strings.HasPrefix(command, "$") || strings.HasPrefix(command, "-") {
+		return ""
+	}
+	if path.IsAbs(command) || strings.Contains(command, "\\") {
+		return ""
+	}
+	if command == "." || command == ".." || strings.HasPrefix(command, "../") || strings.HasPrefix(command, "./") {
+		return ""
+	}
+	clean := path.Clean(command)
+	if clean != command {
+		return ""
+	}
+	return command
+}
+
 func validateManifestPackageReferences(manifest kitManifestTOML, descriptor kitPackageDescriptor) error {
 	inventory := make(map[string]struct{}, len(descriptor.Entries))
 	for _, entry := range descriptor.Entries {
@@ -684,6 +719,20 @@ func validateManifestPackageReferences(manifest kitManifestTOML, descriptor kitP
 		for _, hook := range []string{hooks.PostAcquire, hooks.PreRelease} {
 			if hook != "" {
 				refs = append(refs, strings.ReplaceAll(hook, "\\", "/"))
+			}
+		}
+	}
+	for _, store := range manifest.Provide.DependencyStores {
+		for _, command := range store.Commands {
+			if ref := packageOwnedCommandRef(command); ref != "" {
+				refs = append(refs, ref)
+			}
+		}
+		for _, overlay := range store.CommandsOverride {
+			for _, command := range overlay {
+				if ref := packageOwnedCommandRef(command); ref != "" {
+					refs = append(refs, ref)
+				}
 			}
 		}
 	}
