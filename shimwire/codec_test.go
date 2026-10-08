@@ -237,6 +237,20 @@ func TestMessageTypeMutatingCoversExactlyTheAuthorityBearingSet(t *testing.T) {
 		TypeHello, TypeWelcome, TypeAdopted, TypeOutput, TypeGap, TypeSnapshot,
 		TypeInput, TypeResize, TypeStop, TypeHeartbeat, TypeExit, TypeError,
 	}
+	// The v6 credential rotation carries the controller generation fence, so it
+	// is mutating; the v6 result and terminal observation carry no authority.
+	// They live outside the v1 list above because AllowedIn — not this
+	// predicate — is what keeps them off every released connection.
+	for _, mt := range []MessageType{TypeCredentialUpdate} {
+		if !mt.Mutating() {
+			t.Errorf("%s.Mutating() = false; a fenced rotation must be mutating", mt)
+		}
+	}
+	for _, mt := range []MessageType{TypeCredentialResult, TypeHeadlessExit} {
+		if mt.Mutating() {
+			t.Errorf("%s.Mutating() = true; an observation carries no authority", mt)
+		}
+	}
 	for _, mt := range all {
 		if got, want := mt.Mutating(), mutating[mt]; got != want {
 			t.Errorf("%s.Mutating() = %v, want %v", mt, got, want)
