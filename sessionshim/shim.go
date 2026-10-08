@@ -1534,11 +1534,28 @@ func (s *Shim) handshakeHeadless(conn *net.UnixConn, w *shimwire.Writer, r *shim
 	_ = conn.SetDeadline(time.Time{})
 	// The headless serve loop owns this connection from here: it applies the
 	// generation fence to Stop and Heartbeat and refuses every PTY-shaped
-	// type. Marking the loop owned before serving keeps the deferred
-	// loseController from orphaning a live controller when serving returns.
+	// type. It runs on its own goroutine, exactly as the interactive loops do,
+	// so handshake returns and releases handshakeMu: serving inline would hold
+	// that lock for the life of the connection, and a newer controller could
+	// then never receive a Hello while an old one still holds its socket —
+	// the supersession §D4 depends on.
+	if !s.startHeadlessControllerLoop(ctrl, r) {
+		return net.ErrClosed
+	}
 	loopOwned = true
-	s.serveHeadlessController(ctrl, r)
 	return nil
+}
+
+// startHeadlessControllerLoop linearizes the headless serve loop against
+// controller close, as startControllerLoops does for the interactive loops.
+func (s *Shim) startHeadlessControllerLoop(ctrl *controllerConn, r *shimwire.Reader) bool {
+	ctrl.lifecycleMu.Lock()
+	defer ctrl.lifecycleMu.Unlock()
+	if ctrl.closed {
+		return false
+	}
+	go s.serveHeadlessController(ctrl, r)
+	return true
 }
 
 func (s *Shim) failPostInstall(stage string) error {

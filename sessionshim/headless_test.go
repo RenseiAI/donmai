@@ -507,3 +507,75 @@ func TestHeadlessHeartbeatBeyondTerminalSequenceIsMalformed(t *testing.T) {
 		}
 	}
 }
+
+// TestHeadlessNewerControllerSupersedesLiveOld is the headless form of the
+// split-brain fence: a newer controller adopts while the old one still holds
+// its socket. The newer Hello must be served, the old socket taken away on
+// commit, a Stop carrying the superseded generation refused without reaching
+// the runner, and the new controller left working.
+func TestHeadlessNewerControllerSupersedesLiveOld(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeRunner(t)
+	_, registry, id := startHeadlessFixture(t, runner, 1)
+
+	rec, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	old, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-old"})
+	if err != nil {
+		t.Fatalf("Dial old controller: %v", err)
+	}
+	defer func() { _ = old.Close() }()
+	if err := old.Heartbeat(0); err != nil {
+		t.Fatalf("old controller heartbeat: %v", err)
+	}
+	oldGen := old.Generation()
+
+	// The old controller still holds its socket open here.
+	fresh, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-new", DialTimeout: 8 * time.Second})
+	if err != nil {
+		t.Fatalf("Dial newer controller while the old one holds its socket: %v", err)
+	}
+	defer func() { _ = fresh.Close() }()
+	if fresh.Generation() <= oldGen {
+		t.Fatalf("generation did not advance: was %d, now %d", oldGen, fresh.Generation())
+	}
+	select {
+	case <-old.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the superseded headless controller's socket was not closed")
+	}
+
+	stale, err := shimwire.EncodeStop(shimwire.StopMsg{Generation: oldGen, Reason: shimwire.StopOperator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.w.Write(shimwire.TypeStop, stale); err != nil {
+		t.Fatalf("write stale-generation stop: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case event := <-fresh.Events():
+			if event.Kind != EventError {
+				continue
+			}
+			if event.Err.Code != shimwire.CodeStaleGeneration {
+				t.Fatalf("stale headless stop answer = %s, want %s", event.Err.Code, shimwire.CodeStaleGeneration)
+			}
+			if runner.wasStopped() {
+				t.Fatal("a superseded generation's Stop reached the runner")
+			}
+			if err := fresh.Heartbeat(0); err != nil {
+				t.Fatalf("current controller heartbeat after fencing the old one: %v", err)
+			}
+			return
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("no stale_generation refusal for the superseded generation's Stop")
+		}
+	}
+}
