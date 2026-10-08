@@ -13,7 +13,7 @@ import (
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v6"
+const seatbeltProfileVersion = "seatbelt-profile-v7"
 
 // seatbeltHost is what a rendering needs from the host beside the session.
 type seatbeltHost struct {
@@ -40,6 +40,15 @@ const seatbeltReadOps = "file-read-data file-read-xattr"
 // the read scope's file-read-data allow of the session allowlist and leave a
 // daemon-private path nested inside the writable set readable.
 const seatbeltPrivateReadOps = "file-read-data file-read-metadata file-read-xattr"
+
+// seatbeltComposerReadOps are the read operations a composer read deny
+// names: every one, metadata included. Like the daemon-private deny, they
+// are named one by one rather than as file-read*: the profile judges a
+// rule naming an operation ahead of a wildcard rule whatever their order,
+// so a file-read* deny would lose to the read scope's file-read-data
+// allow of the session allowlist and leave a denied path nested inside
+// the writable set readable.
+const seatbeltComposerReadOps = "file-read-data file-read-metadata file-read-xattr"
 
 // seatbeltRuntimeReads are the runtime and toolchain paths readable under a
 // read scope. dyld reads the root directory itself at every exec, so the
@@ -418,7 +427,7 @@ func renderComposerRules(r *Resolved, rules []Rule, canonical func(string) (stri
 				return "", refuse(ReasonRuleUnrenderable, "composer rule %d: unknown scope %q", i, rule.Scope)
 			}
 			if rule.Kind == RuleDenyRead {
-				fmt.Fprintf(&b, "(deny file-read* %s)\n", filter)
+				fmt.Fprintf(&b, "(deny %s %s)\n", seatbeltComposerReadOps, filter)
 			} else {
 				fmt.Fprintf(&b, "(deny file-write* %s)\n(deny file-link %s)\n", filter, filter)
 			}

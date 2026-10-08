@@ -83,8 +83,8 @@ type Resolved struct {
 	// included, after every allow, so they win even inside the session's
 	// read allowlist: no read of any kind and no write, the whole subtree.
 	// None covers the session's own paths (the resolver refuses that), so a
-	// backend may hide each outright: macOS denies file-read* and writes by
-	// subpath; a mount-namespace backend binds an empty placeholder of the
+	// backend may hide each outright: macOS denies every read operation by
+	// name and writes by subpath; a mount-namespace backend binds an empty placeholder of the
 	// path's type over each that exists (a missing one is minted later, so
 	// its access-control stage must deny the path as well).
 	Denied []string
