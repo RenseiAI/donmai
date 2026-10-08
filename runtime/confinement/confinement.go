@@ -449,6 +449,69 @@ func (c *Confiner) fingerprint() (fingerprint, error) {
 	}, nil
 }
 
+// landlockScopeABI is the first Landlock ABI with scopes: the signal and
+// abstract-socket scopes need ABI 6, which ships in Linux 6.12. Hosts
+// below it run the seat without that layer (see ScopesAvailable), and the
+// self-test never attests them as fully confined.
+const landlockScopeABI = 6
+
+// scopeVerdict is the host-independent reading of one Landlock ABI: at or
+// above the scope floor the layer reports enforced, below it unenforced
+// with the typed reason. scope_degraded_test.go drives it on every host;
+// ScopesAvailable only supplies the probe.
+func scopeVerdict(abi int) (bool, string) {
+	if abi >= landlockScopeABI {
+		return true, ""
+	}
+	return false, scopeDegradedReason(abi)
+}
+
+// scopeDegradedReason is the typed reason one ABI below the scope floor
+// records: the missing signal and abstract-socket scopes, the floor that
+// carries them, and the ABI that was found.
+func scopeDegradedReason(abi int) string {
+	return fmt.Sprintf("the scope layer is unenforced: Landlock ABI %d has no signal or abstract-socket scope (ABI %d, Linux 6.12, needed)", abi, landlockScopeABI)
+}
+
+// scopesProbe is the probe ScopesAvailable reads. It lives in this portable
+// file (not the Linux-only stage file) so tests on every host can stub it:
+// the scope recheck in the self-test cache must go red on macOS too.
+// Production always probes the running kernel through defaultScopesProbe.
+var scopesProbe = defaultScopesProbe
+
+// setScopesProbeForTest swaps the probe ScopesAvailable reads for the
+// calling test, restoring it at cleanup. The *testing.T stays in the
+// test files: production takes an explicit cleanup func instead, so this
+// package never imports testing outside _test.go.
+func setScopesProbeForTest(t interface {
+	Helper()
+	Cleanup(func())
+}, probe func() int,
+) {
+	t.Helper()
+	old := scopesProbe
+	scopesProbe = probe
+	t.Cleanup(func() { scopesProbe = old })
+}
+
+// SetScopesProbeForTest swaps the probe ScopesAvailable reads for the
+// calling test package (the daemon's posture test pins the same gate
+// through the production status entry point), restoring it at cleanup.
+// The caller passes its own *testing.T, which this package only holds as
+// the helper/cleanup interface above, never importing testing itself.
+func SetScopesProbeForTest(t interface {
+	Helper()
+	Cleanup(func())
+}, probe func() int,
+) {
+	setScopesProbeForTest(t, probe)
+}
+
+// ScopeFloorMinusOneForTest is one ABI below the scope floor: the value a
+// test stubs the scope probe with to pin the degraded posture, without
+// naming the kernel constant across the package line.
+func ScopeFloorMinusOneForTest() int { return landlockScopeABI - 1 }
+
 type fingerprint struct {
 	backend          BackendName
 	backendVersion   string

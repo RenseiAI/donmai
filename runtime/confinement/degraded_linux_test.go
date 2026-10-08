@@ -52,7 +52,8 @@ func TestSelfTestRecord_DegradedNeverAttests(t *testing.T) {
 		t.Fatalf("fingerprint: %v", err)
 	}
 	// A passing record taken below the scope ABI: the probes all passed
-	// but the scope layer is missing.
+	// but the scope layer is missing. The verdict runs through the same
+	// marking SelfTest applies to its production record.
 	record := SelfTestRecord{
 		Backend: current.backend, BackendVersion: current.backendVersion, ProbeSetVersion: ProbeSetVersion,
 		ExecutableDigest: current.executableDigest,
@@ -60,10 +61,7 @@ func TestSelfTestRecord_DegradedNeverAttests(t *testing.T) {
 		Passed:           true,
 		Probes:           []ProbeOutcome{{ID: "p", Pass: true}},
 	}
-	if _, why := ScopesAvailable(); why != "" {
-		record.Degraded = why
-		record.SessionModes = nil
-	}
+	record.applyScopeVerdict(ScopesAvailable())
 	record.Digest = record.computeDigest()
 	c.store(record)
 	if record.Degraded == "" {

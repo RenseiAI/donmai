@@ -486,13 +486,6 @@ const landlockFileAccess = landlockAccessFSExecute |
 	landlockAccessFSReadFile |
 	landlockAccessFSTruncate
 
-// landlockScopeABI is the first Landlock ABI with scopes: signal and
-// abstract-socket scoping (the scope layer) need ABI 6, which ships in
-// Linux 6.12. Hosts below it run the seat without that layer (see
-// ScopesAvailable), and the self-test never attests them as fully
-// confined.
-const landlockScopeABI = 6
-
 // landlockScopes are the scopes the stage sets where the kernel has them:
 // no signal to a process outside the boundary's Landlock domain, and no
 // connection to an abstract unix socket created outside it. The process
@@ -531,14 +524,13 @@ func landlockRuleset(abi int) unix.LandlockRulesetAttr {
 // same-user processes outside and abstract sockets outside stay reachable,
 // so a record taken there is degraded, never a full attestation (see
 // SelfTestRecord.Degraded). The string names the missing layer when it is
-// absent. Production probes the running kernel; tests stub landlockProbe.
+// absent. Production probes the running kernel; tests stub scopesProbe.
 func ScopesAvailable() (bool, string) {
-	abi := landlockProbe()
-	if abi >= landlockScopeABI {
-		return true, ""
-	}
-	return false, fmt.Sprintf("the scope layer is unenforced: Landlock ABI %d has no signal or abstract-socket scope (ABI %d, Linux 6.12, needed)", abi, landlockScopeABI)
+	return scopeVerdict(scopesProbe())
 }
+
+// defaultScopesProbe probes the running kernel for the scope layer.
+func defaultScopesProbe() int { return landlockABI() }
 
 // abstractSocketsScoped reports whether this kernel's Landlock can close
 // abstract unix sockets outside the boundary, and why not when it cannot.

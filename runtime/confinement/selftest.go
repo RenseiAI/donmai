@@ -171,6 +171,20 @@ func (r SelfTestRecord) computeDigest() string {
 	return digestBytes(raw)
 }
 
+// applyScopeVerdict marks a passing record degraded where the scope probe
+// says the layer is missing: the probes passed but the boundary they prove
+// is partial, so no spawn path stays attested. An enforced layer, or a
+// record that did not pass, is left alone. SelfTest calls it on its
+// production record; tests drive it directly with both verdicts, without
+// a Linux kernel.
+func (r *SelfTestRecord) applyScopeVerdict(ok bool, why string) {
+	if !r.Passed || ok || why == "" {
+		return
+	}
+	r.Degraded = why
+	r.SessionModes = nil
+}
+
 // SelfTest proves the backend on this host: it drives a probe process through
 // the production spawn binding once per session mode, with every writable
 // class, a read-only leaf, protected paths, decoys outside the set and the
@@ -265,10 +279,7 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 		// holds signals and abstract sockets is missing. Mark it so
 		// Attestation refuses it and operators see it, rather than
 		// reporting the host as confined.
-		if _, why := ScopesAvailable(); why != "" {
-			record.Degraded = why
-			record.SessionModes = nil
-		}
+		record.applyScopeVerdict(ScopesAvailable())
 	}
 	record.Digest = record.computeDigest()
 	c.store(record)

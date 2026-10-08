@@ -160,8 +160,9 @@ func TestSelfTestCache_KeyCoversWhatTheRecordProves(t *testing.T) {
 }
 
 // TestSelfTestCache_LoadRefusesWhatItCannotVouchFor: a cached record is a
-// miss unless it is the same key, passing in both modes, current by the
-// staleness fingerprint, intact by its digest and within the TTL.
+// miss unless it is the same cache version and key, passing in both modes,
+// current by the staleness fingerprint, intact by its digest, never degraded
+// and within the TTL.
 func TestSelfTestCache_LoadRefusesWhatItCannotVouchFor(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {
@@ -171,6 +172,15 @@ func TestSelfTestCache_LoadRefusesWhatItCannotVouchFor(t *testing.T) {
 	}{
 		{"reusable", func(*selfTestCacheEntry) {}, true},
 		{"other cache version", func(e *selfTestCacheEntry) { e.Version = 99 }, false},
+		{"pre-marking cache version", func(e *selfTestCacheEntry) {
+			e.Version = selfTestCacheVersion - 1
+			e.Record.Digest = e.Record.computeDigest()
+		}, false},
+		{"degraded record", func(e *selfTestCacheEntry) {
+			e.Record.Degraded = "the scope layer is unenforced"
+			e.Record.SessionModes = nil
+			e.Record.Digest = e.Record.computeDigest()
+		}, false},
 		{"other key", func(e *selfTestCacheEntry) { e.Key.ProbeDigest = "sha256:other" }, false},
 		{"failing record", func(e *selfTestCacheEntry) { e.Record.Passed = false; e.Record.Digest = e.Record.computeDigest() }, false},
 		{"one session mode", func(e *selfTestCacheEntry) {

@@ -11,8 +11,11 @@ import (
 	"time"
 )
 
-// selfTestCacheVersion versions the cache file shape.
-const selfTestCacheVersion = 1
+// selfTestCacheVersion versions the cache file shape and the degraded
+// contract: v2 rejects the v1 records that predate degraded marking, so a
+// passing record taken before it can never attest on a host the scope
+// layer leaves partial.
+const selfTestCacheVersion = 2
 
 // selfTestCacheKey is everything a cached record proves the self-test for.
 // A record is reused only for the exact key it was taken under.
@@ -80,10 +83,11 @@ func (c *Confiner) selfTestCache(opts SelfTestOptions, current fingerprint) (sel
 	}, true
 }
 
-// load returns the cached record when it is reusable at now: the same key,
-// passing in both session modes, current by the staleness fingerprint,
-// intact by its own digest, not degraded (a partial-boundary record is
-// never reused as a passing one), and taken within the TTL (and not in the
+// load returns the cached record when it is reusable at now: the same
+// cache version and key, passing in both session modes, current by the
+// staleness fingerprint, intact by its own digest, not degraded (a
+// partial-boundary record is never reused as a passing one — the verdict
+// is re-checked against this boot's kernel below), and taken within the
 // future). Anything else is a miss.
 func (s selfTestCache) load(now time.Time) (SelfTestRecord, bool) {
 	raw, err := os.ReadFile(s.path)
@@ -105,6 +109,14 @@ func (s selfTestCache) load(now time.Time) (SelfTestRecord, bool) {
 	case record.Digest == "" || record.computeDigest() != record.Digest:
 		return SelfTestRecord{}, false
 	case record.TestedAt.After(now.Add(time.Minute)), now.Sub(record.TestedAt) >= s.ttl:
+		return SelfTestRecord{}, false
+	}
+	// The record predates knowing the scope floor (or the kernel changed
+	// under it): a passing record from a kernel without the scope layer
+	// proves a partial boundary only. Re-derive the verdict from this
+	// boot's kernel before reuse, so an old cache entry — or a stale one
+	// written on another kernel — never attests as a full boundary.
+	if ok, _ := ScopesAvailable(); !ok {
 		return SelfTestRecord{}, false
 	}
 	return record, true

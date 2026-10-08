@@ -302,7 +302,9 @@ func (b *mountNamespaceBackend) Apply(req ApplyRequest) (Applied, error) {
 // landlockProbe returns the running kernel's Landlock ABI version, 0 where
 // Landlock is absent or disabled. A package variable so tests pin both
 // branches of the gate without a capable kernel; production always probes
-// the running kernel.
+// the running kernel. ScopesAvailable reads through scopesProbe (see
+// stage_linux.go); checkLandlock reads landlockProbe directly, and both
+// default to the running kernel.
 var landlockProbe = landlockABI
 
 // checkLandlock refuses with backend_absent unless the running kernel's

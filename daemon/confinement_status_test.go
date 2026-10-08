@@ -8,7 +8,32 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 )
+
+// TestConfinementStatus_DegradedBelowTheFloor pins the daemon's degraded
+// posture through the production status entry point: with the scope probe
+// stubbed below the floor, confinementStatus reports degraded with the
+// reason and the floor, never attested. Deleting the degraded branch in
+// confinementStatus turns this test red. The stub goes through the
+// confinement package's test helper with a sub-floor version probe, so no
+// kernel constant crosses the package line.
+func TestConfinementStatus_DegradedBelowTheFloor(t *testing.T) {
+	confinement.SetScopesProbeForTest(t, confinement.ScopeFloorMinusOneForTest)
+	status := confinementStatus()
+	if status == nil {
+		t.Fatal("confinementStatus is nil; want the degraded posture block")
+	}
+	if status.Attested {
+		t.Fatalf("confinement status attests below the floor: %+v", status)
+	}
+	if status.Degraded == "" {
+		t.Fatalf("confinement status carries no degraded reason below the floor: %+v", status)
+	}
+	if !strings.Contains(status.Degraded, "scope layer is unenforced") {
+		t.Fatalf("confinement status degraded = %q, want the typed scope-layer reason", status.Degraded)
+	}
+}
 
 // TestConfinementStatusShape pins the status block at the unit level: the
 // backend is named, a degraded host carries the reason with the floor, and
