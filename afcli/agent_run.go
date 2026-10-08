@@ -1505,6 +1505,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		PlatformURL:           d.PlatformURL,
 		TerminalWorkareaLease: d.TerminalWorkareaLease,
 		Capabilities:          d.Capabilities,
+		SeatBudget:            detailSeatBudget(d.SeatBudget),
 	}
 	if len(d.OperationalPayload) > 0 {
 		// Decode into a zero value: absent receipted fields must stay absent rather
@@ -1698,6 +1699,21 @@ func detailContinuePullRequest(in *daemon.PollContinuePullRequest) *prompt.Conti
 		Number:  in.Number,
 		HeadRef: in.HeadRef,
 		HeadSha: in.HeadSha,
+	}
+}
+
+// detailSeatBudget re-types the daemon's per-seat budget mirror into the
+// runner-consumable shape. Nil stays nil: budgeting off means the seat
+// spawns exactly as before.
+func detailSeatBudget(in *daemon.SessionSeatBudget) *runner.SeatBudget {
+	if in == nil {
+		return nil
+	}
+	return &runner.SeatBudget{
+		Mode:     in.Mode,
+		CPUs:     in.CPUs,
+		MemoryMB: in.MemoryMB,
+		Detail:   in.Detail,
 	}
 }
 

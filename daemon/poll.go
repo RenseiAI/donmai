@@ -1528,6 +1528,21 @@ func WithMergeQueueLanding(flag *bool) SessionDetailOption {
 	}
 }
 
+// WithSeatBudget stamps the daemon's resolved per-seat budget onto the
+// built SessionDetail so the worker can apply the cooperative caps and
+// report what the seat actually got on the session result. Nil (budgeting
+// off) leaves SeatBudget nil — the mixed-version-safe default where the
+// seat spawns exactly as before.
+func WithSeatBudget(b *SessionSeatBudget) SessionDetailOption {
+	return func(d *SessionDetail) {
+		if b == nil {
+			return
+		}
+		stamped := *b
+		d.SeatBudget = &stamped
+	}
+}
+
 // PollItemToSessionDetail constructs the SessionDetail payload `donmai agent
 // run` will fetch from the daemon's HTTP API for the given poll item.
 // platformURL + authToken + workerID come from the daemon's

@@ -179,11 +179,19 @@ func TestProbeUsage_UnsupportedReadIsAnswered(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		`printf '{"type":"control_response","response":{"subtype":"success","response":{"subscription_type":null,"rate_limits_available":false,"rate_limits":null}}}\n'` + "\n" +
 		"exit 0\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
-		t.Fatalf("write fake cli: %v", err)
+	// Publish through the immutable dispatcher, never as a freshly
+	// written executable: a sibling test that forks while this file's
+	// writer is open hands the writer to its child, and execve of the
+	// script then fails with ETXTBSY. The failed read fell to the
+	// refusal check and reported probeFailed instead of unsupported.
+	if fakeCLIDispatcherErr != "" {
+		t.Fatalf("prepare fake CLI dispatcher: %s", fakeCLIDispatcherErr)
 	}
-	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
-		t.Fatalf("chmod fake cli: %v", err)
+	if err := writeFakeCLIFile(path+".fixture", script); err != nil {
+		t.Fatalf("write fake cli fixture: %v", err)
+	}
+	if err := os.Link(fakeCLIDispatcher, path); err != nil { //nolint:gosec // atomically publishes a hard-linked test fixture
+		t.Fatalf("publish fake cli dispatcher: %v", err)
 	}
 	_, probed, _ := ProbeUsage(t.Context(), path)
 	if probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableUnsupported {

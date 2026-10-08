@@ -238,6 +238,30 @@ observation failed), `configuredMode` is the mode saved by the last explicit
 for example after a reinstall that has not restarted the daemon. The
 observation is taken once at start, off the request path, and cached.
 
+Both also carry an additive `seatBudget` object (omitted by a daemon that
+predates it): `mode` is the posture each seat runs under (`enforced` |
+`best-effort` | `none`) with the values (`cpus`, `memoryMb`) and a short
+human `detail` line. On Linux an enforced seat is confined in a transient
+systemd scope (CPU quota, CPU weight, memory max, seat-survives-OOM
+policy), on the user bus (`--user`) for per-user installs and the system
+bus for system installs; the quota is the binding CPU limit (no core
+pinning: identical pin ranges across seats shared 2 cores of 6 budgeted,
+and user services never get the cpuset controller delegated). The scope
+needs systemd 252 or newer (249 rejects it and delegates no CPU controller
+to user managers). Without a usable systemd there is
+no enforcement backend, so the seat runs unconfined and reports `none`
+with the backend named as the reason. On macOS the seat carries
+worker-cap environment (`GOMAXPROCS`, `MAKEFLAGS`,
+`CMAKE_BUILD_PARALLEL_LEVEL`, `NINJAFLAGS`, `CARGO_BUILD_JOBS`) composed
+with the
+installed process-priority mode. Configured per host under
+`capacity.seatBudget: { cpus, memoryMb, ioWeight, mode }` in `daemon.yaml`
+(`mode` is `auto` by default: enforced on Linux, best-effort elsewhere).
+Omitting the block disables budgeting and leaves every seat exactly as
+before; in particular a single-seat host derives no limits. Each session
+handle on `GET /api/daemon/sessions` and each session result carries the
+same block for the seat it ran under.
+
 For an externally composed session-shim, the outbound
 `POST /api/workers/<id>/heartbeat` carries a separate authority-bound
 `sessionShim` projection. Alongside the stable host, controller, adoption

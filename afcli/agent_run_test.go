@@ -1076,6 +1076,34 @@ func TestDetailToQueuedWork_MemoryBlockForwarded(t *testing.T) {
 	}
 }
 
+// TestDetailToQueuedWork_SeatBudgetForwarded verifies the per-seat budget
+// survives the SessionDetail → runner.QueuedWork translation (the daemon →
+// worker wire hop). Nil stays nil: budgeting off means the seat spawns
+// exactly as before.
+func TestDetailToQueuedWork_SeatBudgetForwarded(t *testing.T) {
+	plain, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID:       "sess-nobudget",
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if plain.SeatBudget != nil {
+		t.Errorf("SeatBudget = %+v; want nil with no stamped budget", plain.SeatBudget)
+	}
+	stamped, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID:       "sess-budget",
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+		SeatBudget:      &daemon.SessionSeatBudget{Mode: "best-effort", CPUs: 2, MemoryMB: 4096, Detail: "caps"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if stamped.SeatBudget == nil || stamped.SeatBudget.Mode != "best-effort" || stamped.SeatBudget.CPUs != 2 || stamped.SeatBudget.MemoryMB != 4096 {
+		t.Errorf("SeatBudget = %+v; want best-effort 2 cpu 4096MB", stamped.SeatBudget)
+	}
+}
+
 // TestDetailToQueuedWork_InitialPromptForwarded verifies the daemon-to-runner
 // hop preserves the optional interactive seed exactly, including empty,
 // whitespace-only, Unicode, and multiline values.

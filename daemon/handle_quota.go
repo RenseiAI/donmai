@@ -29,8 +29,14 @@ type quotaUpdateRequest struct {
 // hold the control token (it is minted into the state dir after they
 // spawn and never enters their environment). Authentication is the
 // same session-ownership proof as the detail fetch: localhost-only
-// binding plus a session id the daemon itself admitted. Unknown ids
-// 404; a malformed body or an unknown harness 400s. The update is
+// binding plus a session id the daemon itself admitted. The operator
+// control token always passes; otherwise the caller must present the
+// session's own read credential naming exactly this session id — and
+// on a local runtime, the session's attempt credential, verified the
+// same way the local callbacks verify it. Anything else gets 401
+// without reaching the merge. Unknown ids 404 before the credential
+// check so the gate never confirms or denies a session it cannot
+// name; a malformed body or an unknown harness 400s. The update is
 // bounded and merge-only — windows clamp to the display range and
 // cannot touch the probe's login verdict — so a misbehaving worker
 // can skew its own rows and nothing else.
@@ -43,12 +49,23 @@ func (s *Server) handleSessionUsage(w http.ResponseWriter, r *http.Request, id s
 		http.NotFound(w, r)
 		return
 	}
-	if _, ok := s.daemon.SessionDetail(id); !ok {
-		if !sessionOwnedBySpawner(s.daemon.spawner, id) {
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":     "session not found",
-				"sessionId": id,
-			})
+	if local := s.daemon.localRuntime.Load(); local != nil {
+		if _, err := local.authenticate(r.Context(), id, localBearer(r)); err != nil {
+			http.Error(w, "attempt authentication required", http.StatusUnauthorized)
+			return
+		}
+	} else {
+		if _, ok := s.daemon.SessionDetail(id); !ok {
+			if !sessionOwnedBySpawner(s.daemon.spawner, id) {
+				writeJSON(w, http.StatusNotFound, map[string]string{
+					"error":     "session not found",
+					"sessionId": id,
+				})
+				return
+			}
+		}
+		if !s.sessionDetailAuthenticated(r, id) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid session credential"})
 			return
 		}
 	}

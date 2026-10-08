@@ -7,5 +7,5 @@ import (
 )
 
 // configureProbeProcessGroup is a no-op where process groups do not
-// exist; CommandContext plus WaitDelay still bound the child.
+// exist; CommandContext plus WaitDelay still bound the leader.
 func configureProbeProcessGroup(_ *exec.Cmd) {}

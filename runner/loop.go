@@ -538,7 +538,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				"installSteps", len(demand.ToolchainInstall),
 				"postAcquireSteps", len(demand.PostAcquire),
 			)
-			execer := shellExecer{baseEnv: buildSessionEnv(qw)}
+			execer := shellExecer{baseEnv: cappedSessionEnv(qw)}
 			provisioner := kit.NewProvisioner(r.logger)
 			if provErr := provisioner.Provision(ctx, execer, wpath, demand); provErr != nil {
 				res.Status = "failed"
@@ -606,7 +606,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// credential into qw.AuthToken's matching env var via Spec.Env;
 	// we forward whatever the caller set plus the standard session
 	// metadata.
-	specEnv := buildSessionEnv(qw)
+	// Per-seat budget: overlay the cooperative worker caps so the tools
+	// the harness fans out size themselves to the seat share. The daemon
+	// already applies the same caps to the worker environment; re-applying
+	// here covers standalone runs and guarantees the harness child — the
+	// process that actually spawns the fan-out — carries them. Explicit
+	// values win; a disabled budget changes nothing.
+	specEnv := cappedSessionEnv(qw)
 	effectiveMCPBearerFile, err := prepareSessionMCPBearerEnv(
 		qw,
 		specEnv,
@@ -1855,6 +1861,18 @@ tailRecovery:
 	// report on the failure short-circuit above.
 	if res.BudgetReport == nil {
 		res.BudgetReport = enforcer.Report(r.now())
+	}
+	// Per-seat budget evidence: report what the seat actually ran under so
+	// the platform can see it. Stamped from the dispatched share; the
+	// cooperative caps were applied to the harness env above, and the hard
+	// Linux confinement (when any) was applied by the daemon at spawn.
+	if qw.SeatBudget != nil && !qw.SeatBudget.disabled() {
+		res.SeatBudget = &agent.SeatBudgetReport{
+			Mode:     qw.SeatBudget.Mode,
+			CPUs:     qw.SeatBudget.CPUs,
+			MemoryMB: qw.SeatBudget.MemoryMB,
+			Detail:   qw.SeatBudget.Detail,
+		}
 	}
 
 	// 11b. Post-session Linear state transition. Runs after
