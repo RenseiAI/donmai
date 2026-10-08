@@ -82,8 +82,14 @@ type Spec struct {
 	// OS resolver). Every other socket outside the writable set is closed.
 	Sockets []string
 	// LoopbackTCPPorts are the loopback TCP ports the adapter declares for
-	// the session. Outbound TCP to the local machine is denied except on
-	// these ports; nothing is allowed by default.
+	// the session. On macOS outbound TCP to the local machine is denied
+	// except on these ports; nothing is allowed by default. On Linux the
+	// ports ride the Landlock stage invocation for the record, but the
+	// stage handles no network right (a port rule carries no address, so
+	// handling CONNECT_TCP would deny every undeclared port on any
+	// address, including the remote endpoints the contract leaves open):
+	// loopback egress outside the declared ports is a documented gap the
+	// self-test observes rather than denies.
 	LoopbackTCPPorts []int
 
 	// ReadScope is the fileRead level the boundary enforces, on the

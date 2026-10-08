@@ -272,8 +272,12 @@ func TestRenderBubblewrap_ComposerRulesWinLast(t *testing.T) {
 }
 
 // TestRenderBubblewrap_DeclaredPortsRideTheStage: declared loopback ports
-// render (no refusal), and the stage policy carries exactly them as TCP
-// allow rules — nothing is allowed by default.
+// render (no refusal), and the stage policy records exactly them — while
+// granting nothing for them. Landlock port rules carry no address, so
+// handling CONNECT_TCP would deny every undeclared port on any address,
+// including the remote endpoints the contract leaves open; the stage
+// therefore handles no network right, and loopback egress outside the
+// declared ports is a documented gap, not a denied one.
 func TestRenderBubblewrap_DeclaredPortsRideTheStage(t *testing.T) {
 	w := newLinuxWorld(t)
 	r := w.resolved()
@@ -292,19 +296,26 @@ func TestRenderBubblewrap_DeclaredPortsRideTheStage(t *testing.T) {
 			t.Errorf("stage policy lacks %q:\n%s", want, text)
 		}
 	}
-	// No declared ports: the policy names no allow-tcp rule, so every
-	// loopback connect fails closed.
+	// No declared ports: the policy names no allow-tcp rule.
 	empty, err := buildLandlockStage(w.resolved())
 	if err != nil {
 		t.Fatalf("buildLandlockStage: %v", err)
 	}
 	if strings.Contains(empty.describe(), "allow-tcp") {
-		t.Fatalf("portless stage policy allows a TCP port:\n%s", empty.describe())
+		t.Fatalf("portless stage policy names a TCP port:\n%s", empty.describe())
 	}
 	if got := stagePortArgs(empty); len(got) != 0 {
 		t.Fatalf("portless stage argv carries port flags: %v", got)
 	}
 }
+
+// TestLandlockStage_LeavesTCPOpen pins the B1 fix at the production entry
+// point: restrictLandlockFull builds a ruleset that handles no network
+// right, so a confined seat keeps the TCP egress the contract leaves open
+// (remote endpoints, ordinary fetches) however many ports the session
+// declared. If the stage ever handles CONNECT_TCP again with only the
+// declared-port allows, every connect to an undeclared port — on any
+// address — fails, and this test goes red.
 
 // TestRenderBubblewrap_ReadScopeKeepsTheSetWritable: under the workarea read
 // scope the writable set stays read-write (the probe writes its read-pass
@@ -581,6 +592,25 @@ func TestProbeUserNamespaceLeavesTheCaller(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Fatalf("Check moved the caller into a new user namespace:\nbefore %q\nafter  %q", before, after)
+	}
+}
+
+// TestUsernsProbes_FallsBackPastMissingBinaries pins the probe fallback:
+// the user-namespace check tries /usr/bin/true, then /bin/true, then the
+// current executable — so a minimal image without either true still probes
+// honestly instead of refusing with a misleading ENOENT. The list always
+// ends with a path that exists (the running test binary itself).
+func TestUsernsProbes_FallsBackPastMissingBinaries(t *testing.T) {
+	probes := usernsProbes()
+	if len(probes) < 3 {
+		t.Fatalf("usernsProbes = %v, want at least [/usr/bin/true /bin/true self]", probes)
+	}
+	if probes[0] != "/usr/bin/true" || probes[1] != "/bin/true" {
+		t.Fatalf("usernsProbes = %v, want the fixed spellings of true first", probes)
+	}
+	self := probes[len(probes)-1]
+	if info, err := os.Stat(self); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("usernsProbes last = %q, want an existing executable to fall back to", self)
 	}
 }
 

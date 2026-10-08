@@ -17,11 +17,24 @@ import (
 // This file is the Landlock stage of the Linux mount-namespace backend: the
 // half of the boundary the mount tree cannot express. Bubblewrap hides and
 // reveals paths; Landlock governs what the confined process may do with the
-// paths it sees: reads outside the allowlist (under a read scope) and TCP
-// connects outside the declared loopback ports are denied. The stage runs as
+// paths it sees: reads outside the allowlist (under a read scope) are
+// denied. The stage runs as
 // the harness process itself re-executed — Wrap renders the current
 // executable into the mount tree and invokes it with a stage marker — so no
 // second binary is shipped, versioned or resolved.
+//
+// TCP connections are deliberately NOT handled here. Landlock port rules
+// carry no address field, so handling CONNECT_TCP with only declared-port
+// allow rules would deny every TCP connect to an undeclared port on any
+// address — including remote model endpoints and ordinary external fetches
+// the contract leaves open (the macOS backend denies loopback only).
+// Loopback egress outside the declared ports is therefore a documented gap:
+// the self-test's undeclared-loopback widening probes observe what the
+// mount tree alone lets through, and that gap is pinned by
+// TestLandlockStage_LeavesTCPOpen. Declared loopback ports still ride the
+// stage invocation (see stagePortArgs) so the policy text records what the
+// session declared, but the stage grants no network access and handles no
+// network right.
 //
 // Layering, from outer to inner: the worker (outside) renders the mount
 // tree; bubblewrap enters the user and mount namespaces and binds the tree;
@@ -50,16 +63,21 @@ const landlockStageEnv = "DONMAI_CONFINEMENT_LANDLOCK_STAGE"
 const landlockExecAccess = landlockAccessFSExecute | landlockAccessFSReadFile
 
 // landlockStage is one session's Landlock policy: the read allowlist (under
-// a read scope) plus the declared loopback TCP ports. A nil allowlist with
-// no ports is still a policy: nothing outside the mount tree's read-write
-// set may be written, and no loopback TCP may connect.
+// a read scope) plus the session's declared loopback TCP ports, carried for
+// the record only. A nil allowlist with no ports is still a policy:
+// nothing outside the mount tree's read-write set may be written. TCP
+// connects are never granted or denied: Landlock port rules carry no
+// address field, so handling CONNECT_TCP would blackout external TCP the
+// contract leaves open (see the file header).
 type landlockPolicy struct {
 	// readRoots are the filesystem subtrees granted read access, plus the
 	// writable roots granted full access. Sorted, deduplicated.
 	readRoots []string
 	// writeRoots are the subtrees granted full access: the writable set.
 	writeRoots []string
-	// tcpPorts are the loopback TCP ports granted connect, sorted.
+	// tcpPorts are the session's declared loopback TCP ports, carried for
+	// the record. The applied ruleset ignores them: the stage handles no
+	// network right, so no connect is ever granted or denied by Landlock.
 	tcpPorts []int
 	// dev is whether the private /dev tree was rendered (tmpfs + dev-binds):
 	// the stage grants the device access reads and writes need.
@@ -77,8 +95,9 @@ type landlockPolicy struct {
 // landlockStage builds the stage policy for one resolved session: the
 // writable set is granted full access, the read allowlist (read-only leaves
 // and declared read paths under a read scope) is granted read access, the
-// runtime binds the mount tree carries are granted read access, and the
-// declared loopback ports are granted TCP connect. Everything else the
+// runtime binds the mount tree carries are granted read access. The declared
+// loopback ports are recorded on the policy (see describe) but granted
+// nothing: the stage handles no network right. Everything else the
 // mount tree reveals stays read-only-or-hidden by the combination: the
 // mount tree binds it read-only, and Landlock withholds write.
 //
@@ -102,12 +121,15 @@ func buildLandlockStage(r *Resolved) (*landlockPolicy, error) {
 	// itself when it names a directory, else its parent. Symbolic links
 	// resolve first, so a link to a directory grants the target (already
 	// covered when the target is bound too) instead of the link's parent.
+	// The input is the backend-rendered allowlist from the resolved
+	// session, plus the OS runtime and resolver binds below — never probe
+	// or session input.
 	dirRule := func(path string) string {
 		resolved := path
 		if target, err := filepath.EvalSymlinks(path); err == nil {
 			resolved = target
 		}
-		if info, err := os.Lstat(resolved); err == nil && !info.IsDir() {
+		if info, err := os.Lstat(resolved); err == nil && !info.IsDir() { //nolint:gosec // G703: backend-rendered allowlist, resolved above; a failure grants the path itself.
 			return filepath.Dir(resolved)
 		}
 		return resolved
@@ -214,8 +236,11 @@ func stageSelfExecutable() (string, error) {
 }
 
 // stagePortArgs renders the declared-port flags Wrap splices into the stage
-// invocation: `--tcp <p1,p2>`. Empty when no port is declared; the stage
-// then denies every loopback connect.
+// invocation: `--tcp <p1,p2>`. Empty when no port is declared. The ports
+// ride the invocation so the rendered boundary records what the session
+// declared; the applied ruleset grants nothing for them (see
+// restrictLandlockFull), so connects stay governed by the surrounding
+// network, exactly as on an unhandled right.
 func stagePortArgs(s *landlockPolicy) []string {
 	if len(s.tcpPorts) == 0 {
 		return nil
@@ -375,7 +400,9 @@ func parseLandlockStage(env string, args []string) (*landlockPolicy, []string, e
 // execDirRule returns the directory the stage grants traverse and execute
 // on for one executable path: its containing directory (resolving links
 // first), or empty when the path is not absolute — a relative executable
-// never reaches the stage, since the spawn binding resolves it first.
+// never reaches the stage, since the spawn binding resolves it first. The
+// input is the stage or harness executable path the spawn chain rendered,
+// never probe or session input.
 func execDirRule(path string) string {
 	if path == "" || !filepath.IsAbs(path) {
 		return ""
@@ -384,7 +411,7 @@ func execDirRule(path string) string {
 	if target, err := filepath.EvalSymlinks(path); err == nil {
 		resolved = target
 	}
-	if info, err := os.Lstat(resolved); err == nil && !info.IsDir() {
+	if info, err := os.Lstat(resolved); err == nil && !info.IsDir() { //nolint:gosec // G703: the spawn chain's own executable path; a failure grants the path itself.
 		return filepath.Dir(resolved)
 	}
 	return resolved
@@ -399,13 +426,14 @@ func landlockAvailable() bool {
 	if errno != 0 {
 		return false
 	}
-	_ = unix.Close(int(fd))
+	_ = unix.Close(int(fd)) //nolint:gosec // G115: the kernel returns a small non-negative descriptor, or the call failed above.
 	return true
 }
 
 // Landlock access rights. The numeric values are the kernel UAPI (ABI-1
-// filesystem rights plus ABI-4 TCP rights); the names mirror the kernel
-// headers so a reader can check them against linux/landlock.h.
+// filesystem rights); the names mirror the kernel headers so a reader can
+// check them against linux/landlock.h. Network rights are deliberately
+// absent: the stage handles no network access (see the file header).
 const (
 	landlockAccessFSExecute   = 0x1
 	landlockAccessFSWriteFile = 0x2
@@ -423,11 +451,7 @@ const (
 	landlockAccessFSRefer     = 0x2000
 	landlockAccessFSTruncate  = 0x4000
 
-	landlockAccessNetBindTCP    = 0x1
-	landlockAccessNetConnectTCP = 0x2
-
 	landlockRulePathBeneath = 0x1
-	landlockRuleNetPort     = 0x2
 )
 
 // landlockHandledFS is the filesystem access set the stage handles: every
@@ -472,21 +496,15 @@ type landlockPathRule struct {
 	_             int32
 }
 
-// landlockNetRule is the kernel's struct landlock_net_port_attr: the
-// allowed access plus the port in host byte order (proven by experiment:
-// network order denies even the allowed port).
-type landlockNetRule struct {
-	AllowedAccess uint64
-	Port          uint16
-	_             [6]byte
-}
-
 // restrictLandlock programs one ruleset onto this process: full access on
 // the writable roots, read access on the read roots and the bound sockets,
-// device access on the private /dev, TCP connect only on the declared
-// ports, no_new_privs, then restrict_self. Every error refuses closed.
+// device access on the private /dev, no_new_privs, then restrict_self.
+// Network rights are deliberately unhandled: handling CONNECT_TCP would deny
+// every TCP connect to an undeclared port on any address, including the
+// remote endpoints the contract leaves open. The declared ports ride the
+// policy text for the record only. Every error refuses closed.
 func restrictLandlockFull(stage *landlockPolicy) error {
-	ruleset, err := landlockCreateRuleset(landlockHandledFS, landlockAccessNetBindTCP|landlockAccessNetConnectTCP, 0)
+	ruleset, err := landlockCreateRuleset(landlockHandledFS, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -511,11 +529,10 @@ func restrictLandlockFull(stage *landlockPolicy) error {
 			return err
 		}
 	}
-	for _, port := range stage.tcpPorts {
-		if err := landlockAddPort(ruleset, port, landlockAccessNetConnectTCP); err != nil {
-			return err
-		}
-	}
+	// No port rules: the stage handles no network right, so the declared
+	// ports in stage.tcpPorts stay record-only (see stagePortArgs). Adding
+	// a CONNECT_TCP allow here would start handling the right and deny
+	// every unlisted port on every address.
 	if err := landlockNoNewPrivs(); err != nil {
 		return err
 	}
@@ -532,7 +549,7 @@ func landlockCreateRuleset(handledFS, handledNet, scoped uint64) (int, error) {
 	if errno != 0 {
 		return -1, refuse(ReasonBackendAbsent, "the Landlock stage is unavailable: %v", errnoText(errno))
 	}
-	return int(ruleset), nil
+	return int(ruleset), nil //nolint:gosec // G115: the kernel returns a small non-negative descriptor; a failure refused above.
 }
 
 // landlockAddPath grants access on the subtree rooted at path. The add-rule
@@ -560,19 +577,6 @@ func landlockAddPath(ruleset int, path string, access uint64) error {
 	return nil
 }
 
-// landlockAddPort grants TCP access on one port in host byte order. The
-// port is validated 1-65535 by resolveSpec and again by parseLandlockStage
-// before it reaches here.
-func landlockAddPort(ruleset, port int, access uint64) error {
-	rule := landlockNetRule{AllowedAccess: access, Port: uint16(port)} //nolint:gosec // G115: validated 1-65535 by the callers above.
-	_, _, errno := unix.Syscall(unix.SYS_LANDLOCK_ADD_RULE,
-		uintptr(ruleset), uintptr(landlockRuleNetPort), uintptr(unsafe.Pointer(&rule))) //nolint:gosec // G103: the raw-syscall ABI takes uintptr; no typed wrapper exists for Landlock.
-	if errno != 0 {
-		return refuse(ReasonBackendAbsent, "the Landlock stage cannot add a port rule: %v", errnoText(errno))
-	}
-	return nil
-}
-
 // landlockNoNewPrivs sets no_new_privs on this process, which restricting
 // oneself requires.
 func landlockNoNewPrivs() error {
@@ -587,7 +591,7 @@ func landlockNoNewPrivs() error {
 // the policy holds for this process and every descendant, including the
 // harness exec that follows.
 func landlockRestrictSelf(ruleset int) error {
-	_, _, errno := unix.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(ruleset), 0, 0)
+	_, _, errno := unix.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(ruleset), 0, 0) //nolint:gosec // G115: ruleset is the kernel-issued descriptor landlockCreateRuleset returned.
 	if errno != 0 {
 		return refuse(ReasonBackendAbsent, "the Landlock stage cannot restrict itself: %v", errnoText(errno))
 	}

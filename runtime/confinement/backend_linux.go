@@ -4,6 +4,7 @@ package confinement
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +21,7 @@ import (
 // implementation version. It is part of the backend version, so a self-test
 // record taken under an older launcher, mount-tree shape or Landlock stage
 // is stale.
-const mountNamespaceProfileVersion = "mount-namespace-v2"
+const mountNamespaceProfileVersion = "mount-namespace-v3"
 
 // DefaultBackend returns the confinement backend for the running OS: the
 // Linux mount-namespace backend here.
@@ -114,17 +115,37 @@ const mountNamespaceMarkEnv = "DONMAI_MOUNT_NAMESPACE"
 // exactly what a spawn needs); the parent waits for its exit status, and
 // the parent's own namespace is never touched.
 func probeUserNamespace() error {
-	cmd := exec.Command("/usr/bin/true")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:                 syscall.CLONE_NEWUSER,
-		UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
-		GidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
-		GidMappingsEnableSetgroups: false,
+	for _, probe := range usernsProbes() {
+		cmd := exec.Command(probe)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags:                 syscall.CLONE_NEWUSER,
+			UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
+			GidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
+			GidMappingsEnableSetgroups: false,
+		}
+		if err := cmd.Run(); err != nil {
+			// A missing probe binary is not a capability verdict: try
+			// the next spelling before refusing.
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return refuse(ReasonNamespaceUnavailable, "unprivileged user namespaces are unavailable: %v", usernsHint(err))
+		}
+		return nil
 	}
-	if err := cmd.Run(); err != nil {
-		return refuse(ReasonNamespaceUnavailable, "unprivileged user namespaces are unavailable: %v", usernsHint(err))
+	return refuse(ReasonNamespaceUnavailable, "unprivileged user namespaces are unavailable: no probe executable (%s) exists to test them", strings.Join(usernsProbes(), ", "))
+}
+
+// usernsProbes are the probe executables the user-namespace check tries in
+// order: the two fixed spellings of true, then the current executable,
+// which always exists. A minimal seat-host image without either true still
+// probes honestly instead of refusing with a misleading ENOENT.
+func usernsProbes() []string {
+	probes := []string{"/usr/bin/true", "/bin/true"}
+	if self, err := os.Executable(); err == nil && self != "" {
+		probes = append(probes, self)
 	}
-	return nil
+	return probes
 }
 
 // usernsHint renders the actionable diagnostic for a refused user namespace:
@@ -371,10 +392,14 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	// visible (no pid namespace: the harness is supervised, and
 	// OnProcessSpawned reports the outer launcher pid, which stays the
 	// parent the supervisor signals), and the boundary dies with the
-	// command. Network stays shared: loopback TCP outside the declared
-	// ports is closed by the Landlock stage, which allows connects only to
-	// the declared ports; --unshare-net would isolate the loopback
-	// interface entirely and strand even declared host listeners.
+	// command. Network stays shared: Landlock handles no network right
+	// (port rules carry no address, so handling CONNECT_TCP would deny
+	// every TCP connect to an undeclared port on any address, including
+	// the remote endpoints the contract leaves open); --unshare-net would
+	// isolate the loopback interface entirely and strand even declared
+	// host listeners. Loopback egress outside the declared ports is
+	// therefore a documented gap the self-test observes (see the
+	// widen.loopback_tcp probes), not a denied one.
 	args = append(args, "--unshare-user", "--die-with-parent", "--new-session")
 	// Everything outside the binds below is hidden: the root is a tmpfs, so
 	// a path that is bound nowhere reads as absent.
@@ -525,12 +550,10 @@ func renderBubblewrap(r *Resolved, rules []Rule, canonical func(string) (string,
 	// already hides them and the Landlock stage denies them. A seat that
 	// reaches for the host's shared tmp finds nothing there, while its own
 	// per-session tmp stays bound writable above.
-	// Loopback TCP is closed by default and opened per declared port: the
-	// mount tree carries the policy, and the Landlock stage enforces it —
-	// handled_access_net covers connect, and each declared port is an
-	// allow rule, so an undeclared dial fails closed with EACCES. The
-	// declared ports ride the stage invocation after the second "--";
-	// Wrap appends them there (see Apply).
+	// Loopback TCP ports stay declared on the session: they ride the stage
+	// invocation after the second "--" for the record (see Apply), but
+	// the Landlock stage grants nothing for them — connects stay governed
+	// by the surrounding network, exactly as on an unhandled right.
 	composer, err := renderMountComposerRules(r, rules, canonical)
 	if err != nil {
 		return nil, err

@@ -45,7 +45,11 @@
 // for a composer rule the backend cannot render (rule_unrenderable).
 //
 // The self-test drives a probe process — an executable that calls
-// RunProbeFromEnv first in main — through the same Prepare and Command, once
+// RunLandlockStageFromEnv first in main, then RunProbeFromEnv (the stage
+// marker names the re-executed stage invocation only, and the probe marker
+// the probe invocation; an executable that never runs the stage entrypoint
+// fails the self-test closed instead of running unconfined) — through the
+// same Prepare and Command, once
 // through the headless spawn path and once through the PTY host, and judges
 // every probe by what changed on disk. A second pass per mode renders the
 // same world under the workarea read scope and judges reads inside and
@@ -77,8 +81,12 @@
 // readable) and the declared sockets, the writable set is bound read-write
 // over them, deny overlays win last only where host content would otherwise
 // show through a writable bind, and a Landlock stage the harness process
-// itself executes confines reads outside the allowlist and TCP connects
-// outside the declared loopback ports. Three granularity differences from
+// itself executes confines reads outside the allowlist. TCP connects are
+// deliberately unhandled by the stage — Landlock port rules carry no
+// address, so handling CONNECT_TCP would deny every undeclared port on any
+// address, including the remote endpoints the contract leaves open — and
+// loopback egress outside the declared ports is a documented gap the
+// self-test observes rather than denies. Three granularity differences from
 // the profile backend follow from the mechanism, and the self-test proves
 // the rest: renames and hard links whose both parents are writable cannot
 // be denied (the permission lives on the parents — both endpoints stay

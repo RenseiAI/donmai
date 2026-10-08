@@ -735,6 +735,17 @@ func (fx *fixture) widening(shared []string) error {
 	fx.tcpClosedPort = closedPort
 	fx.cleanups = append(fx.cleanups, func() { _ = closedListener.Close() })
 	go acceptLoop(closedListener, &fx.tcpAccepts)
+	// The loopback TCP write proxy stays judged by the backend that
+	// renders it: the macOS profile denies loopback except on declared
+	// ports, so the undeclared dials below refuse there; the Linux
+	// mount-namespace stage handles no network right (a Landlock port
+	// rule carries no address, so handling CONNECT_TCP would deny every
+	// undeclared port on any address, including the remote endpoints the
+	// contract leaves open), so there the declared-port dials are the
+	// positive controls proving egress still works. The declared ports
+	// ride the Linux stage invocation for the record only (see
+	// stagePortArgs). A backend that silently changes its network handle
+	// fails exactly the probes that name it.
 	fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp", Op: opTCPDial, Port: closedPort},
 		func(res stepResult) bool { return res.Err == "" })
 	fx.add(classPositive, true, probeStep{ID: "allow.loopback_tcp_declared", Op: opTCPDial, Port: openPort},

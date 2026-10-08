@@ -536,11 +536,13 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 
 // endpointLoopbackPorts returns the port of the session's own model endpoint
 // when that endpoint is on this machine — a local gateway binding or a local
-// model server. The confinement closes outbound TCP to the local machine
-// except on declared ports, and the harness's own model channel is one the
-// adapter declares for the session (ADR-2026-10-03 D2.5); without it every
-// model call of a gateway-routed session would fail. A remote endpoint, or
-// none, declares nothing.
+// model server. The macOS confinement closes outbound TCP to the local
+// machine except on declared ports, and the harness's own model channel is
+// one the adapter declares for the session (ADR-2026-10-03 D2.5); without
+// it every model call of a gateway-routed session would fail there. The
+// Linux stage records the declaration but handles no network right (see the
+// stage file header), so the declaration is load-bearing on macOS and
+// record-only on Linux. A remote endpoint, or none, declares nothing.
 //
 // The declaration opens the port, not one address: the backend renders it
 // as localhost:<port>, which also opens that port on ::1 and on the host's
