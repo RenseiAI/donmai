@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/state"
@@ -54,6 +55,58 @@ func TestPollTails_EveryTailerCatchesUpInOneTick(t *testing.T) {
 			t.Errorf("session %s after one tick: %+v", id, c)
 		}
 	}
+}
+
+// TestTailTick_PollsNeverOverlap: a catch-up poll can outlast the tail
+// tick. A second poll started while the first is in flight races it over
+// the same tailers, and whichever finishes last is applied last — so a card
+// could fold an older activity (or cumulative cost and turns) over a newer
+// one and keep it until the session's next event. While a poll is in
+// flight, a tick must only reschedule itself.
+func TestTailTick_PollsNeverOverlap(t *testing.T) {
+	root := t.TempDir()
+	wt := journalFixture(t, root, "busy", 3)
+	journal := filepath.Join(wt, state.AgentDirName, "events.jsonl")
+	m := newTestModel(t, &fakeDaemon{sessions: []afclient.DaemonSessionHandle{{SessionID: "busy", State: "running", WorktreePath: wt}}}, "")
+	m.applySnapshot(m.src.Snapshot())
+
+	// A second tick fires before the first tick's poll has delivered.
+	_, first := m.Update(tailTickMsg{})
+	_, second := m.Update(tailTickMsg{})
+	firstBatches := runTailCmds(first)
+	writeEvents(t, journal, agent.ToolUseEvent{ToolName: "Edit", Input: map[string]any{"file_path": "newest.go"}})
+	secondBatches := runTailCmds(second)
+	// The later poll finishes first.
+	for _, b := range append(secondBatches, firstBatches...) {
+		m.Update(b)
+	}
+	// The next tick reads whatever is still unread.
+	_, next := m.Update(tailTickMsg{})
+	for _, b := range runTailCmds(next) {
+		m.Update(b)
+	}
+	c := findCard(m, "busy")
+	if c.ToolCalls != 4 || !strings.HasPrefix(c.LastActivity, "Edit") {
+		t.Fatalf("after overlapping ticks: tools=%d activity=%q, want 4 tools ending at the newest Edit", c.ToolCalls, c.LastActivity)
+	}
+}
+
+// runTailCmds runs a tick's commands synchronously and returns the tail
+// batches they produced, dropping rescheduled ticks.
+func runTailCmds(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	var out []tea.Msg
+	switch msg := cmd().(type) {
+	case tea.BatchMsg:
+		for _, c := range msg {
+			out = append(out, runTailCmds(c)...)
+		}
+	case tailBatchMsg:
+		out = append(out, msg)
+	}
+	return out
 }
 
 // TestAttach_SeedsLastOutputFromJournal: a quiet session whose run already

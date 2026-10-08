@@ -124,6 +124,10 @@ type Model struct {
 	stream *streamPane
 	frame  int
 
+	// tailPolling is true from a tail tick that starts a poll until that
+	// poll's batch is applied, so polls never overlap.
+	tailPolling bool
+
 	// split is the fraction of content height given to the session-card
 	// grid (the stream takes the rest). Operator-adjustable via [ ] / 0.
 	split float64
@@ -241,6 +245,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.pollIndex(), m.indexTick())
 
 	case tailTickMsg:
+		// One tail poll at a time. A catch-up poll can outlast the tick; a
+		// second poll racing it over the same tailers would deliver one
+		// session's events out of order, folding an older activity, cost or
+		// turn count over a newer one. While a poll is in flight the tick
+		// only reschedules itself.
+		if m.tailPolling {
+			return m, m.tailTick()
+		}
+		m.tailPolling = true
 		return m, tea.Batch(m.pollTails(), m.tailTick())
 
 	case snapshotMsg:
@@ -248,6 +261,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tailBatchMsg:
+		m.tailPolling = false
 		m.applyTailBatch(msg.events)
 		return m, nil
 
