@@ -90,6 +90,12 @@ const (
 	// ExtContinuationCheckpoint advertises optional v5 checkpoint support in
 	// Hello. Older controllers ignore its value before selecting their version.
 	ExtContinuationCheckpoint = "continuation_checkpoint"
+	// ExtWorkload declares a shim's workload profile in Hello's optional
+	// extension map. The value is exactly "headless" on a headless shim;
+	// an interactive shim omits the key and absence means the PTY profile.
+	// It is never a required extension: the headless shim's range is what
+	// keeps older controllers from selecting it.
+	ExtWorkload = "workload"
 )
 
 // Extensions is the optional, namespaced negotiation map carried on

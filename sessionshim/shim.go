@@ -29,8 +29,20 @@ type Options struct {
 	// published. Required.
 	Registry *Registry
 
-	// Spec is the PTY spec for the harness this shim will own.
+	// Workload selects the profile this shim serves. Zero means the PTY
+	// (interactive) profile, which is the released behaviour. A headless
+	// shim owns the runner's process group with no PTY, no output stream,
+	// and no ring.
+	Workload Workload
+
+	// Spec is the PTY spec for the harness this shim will own. It is used
+	// only by the interactive profile; a headless start ignores it.
 	Spec ptyhost.Spec
+
+	// Runner is the headless profile's owned process: the runner's process
+	// group, which the headless shim supervises without a PTY. It is used
+	// only by the headless profile; an interactive start ignores it.
+	Runner RunnerProcess
 
 	// WorkareaPath is the workarea the harness runs against. It is recorded and
 	// verified at adoption, so a shim cannot be adopted into a workarea other
@@ -87,17 +99,22 @@ func (o Options) now() func() time.Time {
 	return time.Now
 }
 
-// Shim is the durable owner of one interactive session.
+// Shim is the durable owner of one session, interactive or headless.
 //
-// It owns the harness process group, the PTY master, the VT/snapshot state, the
-// output sequence, the bounded replay ring, and the final exit observation.
-// Whichever daemon happens to be running is only its CONTROLLER, attached over a
-// socket and replaceable at any moment. That inversion is the entire point: a
-// daemon upgrade closes a socket, not a terminal.
+// An interactive shim owns the harness process group, the PTY master, the
+// VT/snapshot state, the output sequence, the bounded replay ring, and the
+// final exit observation. A headless shim owns the runner's process group
+// with no PTY, no output stream, and no ring; its terminal observation is the
+// runner's own exit. In both profiles, whichever daemon happens to be running
+// is only its CONTROLLER, attached over a socket and replaceable at any
+// moment. That inversion is the entire point: a daemon upgrade closes a
+// socket, not a terminal — and not a run.
 type Shim struct {
 	id                Identity
 	registry          *Registry
+	workload          Workload
 	sess              *ptyhost.Session
+	runner            RunnerProcess
 	ln                *net.UnixListener
 	logger            *slog.Logger
 	now               func() time.Time
@@ -141,8 +158,16 @@ type Shim struct {
 	// cache whose only job is to keep a republish from being the write that
 	// erases it.
 	resumeKey *ResumeKey
+	// headlessOutbox is the outbox pointer the headless tombstone names. It
+	// is protected by recordMu because it is read while composing the
+	// tombstone. Set once at StartHeadless; never touched on the interactive
+	// profile.
+	headlessOutbox headlessOutbox
 	// ackedSeq is protected by recordMu because advancing it and publishing its
-	// sidecar are one durability transition.
+	// sidecar are one durability transition. On a headless shim it is the
+	// terminal acknowledgement cursor (§4): 0 until the controller durably
+	// records the HeadlessExit, 1 after. The interactive profile uses it as
+	// the host output sequence cursor instead.
 	ackedSeq          uint64
 	terminalPublished bool
 	// terminalSeq is the host sequence the terminal proof froze — the Exit
@@ -369,68 +394,26 @@ var ErrShimUnsupported = errors.New("sessionshim: session shim adoption is unsup
 // always dial it. Publishing the record first would create a window in which
 // discovery points at nothing, which classifies as socket_unreachable and
 // quarantines a perfectly healthy session.
+//
+// Start always serves the interactive (PTY) profile. A zero workload selects
+// it; an explicit headless workload is refused here — the headless entry is
+// StartHeadless, which takes ownership of an already-running runner instead
+// of spawning a harness. Failing closed keeps a caller that meant to start a
+// headless shim from silently getting a PTY session.
 func Start(opts Options) (*Shim, error) {
-	if !peerCredSupported() {
-		return nil, ErrShimUnsupported
+	workload := opts.Workload
+	if workload == "" {
+		workload = WorkloadInteractive
 	}
-	if err := opts.Identity.Validate(); err != nil {
-		return nil, err
+	if workload != WorkloadInteractive {
+		return nil, fmt.Errorf("sessionshim: Start serves the interactive profile; use StartHeadless for workload %q", string(workload))
 	}
-	if opts.Registry == nil {
-		return nil, errors.New("sessionshim: Start requires a Registry")
-	}
-	protocolMin, protocolMax := opts.ProtocolMin, opts.ProtocolMax
-	if protocolMin == 0 && protocolMax == 0 {
-		protocolMin, protocolMax = shimwire.ProtocolMin, shimwire.ProtocolMax
-	}
-	if protocolMin == 0 || protocolMax < protocolMin || protocolMax > shimwire.ProtocolMax {
-		return nil, fmt.Errorf("sessionshim: invalid shim protocol range [%d,%d]", protocolMin, protocolMax)
-	}
-	orphan := opts.Orphan
-	if orphan.Deadline == 0 {
-		orphan = DefaultOrphanPolicy()
-	}
-	if err := orphan.Validate(); err != nil {
-		return nil, err
-	}
-	finalScreenWindow := opts.FinalScreenWindow
-	if finalScreenWindow <= 0 {
-		finalScreenWindow = defaultFinalScreenWindow
-	}
-	self, err := Self()
+	opts.Workload = WorkloadInteractive
+	core, opened, err := serve(opts)
 	if err != nil {
 		return nil, err
 	}
-	shimID, err := newShimID()
-	if err != nil {
-		return nil, err
-	}
-
-	socketPath := opts.Registry.SocketPath(opts.Identity)
-	// A leftover socket from a dead shim would make Listen fail with EADDRINUSE.
-	// Removing it is safe: the path is derived from the identity inside a 0700
-	// directory this process owns, and a LIVE shim for the same identity is the
-	// duplicate-identity case the classifier quarantines rather than something
-	// this path should be racing.
-	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("sessionshim: clear stale socket: %w", err)
-	}
-	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
-	if err != nil {
-		return nil, fmt.Errorf("sessionshim: listen on adoption socket: %w", err)
-	}
-	// The socket carries no secret, but its 0600 mode keeps the daemon user's
-	// local trust boundary explicit rather than relying on the parent
-	// directory's mode alone.
-	if err := os.Chmod(socketPath, RecordFileMode); err != nil {
-		_ = ln.Close()
-		return nil, fmt.Errorf("sessionshim: tighten adoption socket: %w", err)
-	}
-	dev, ino, err := statSocket(socketPath)
-	if err != nil {
-		_ = ln.Close()
-		return nil, err
-	}
+	ln, socketPath := opened.ln, opened.path
 
 	// Back-pressure is installed HERE rather than left to the caller: a shim is
 	// the one ptyhost owner whose consumer is a replaceable controller that may
@@ -465,7 +448,7 @@ func Start(opts Options) (*Shim, error) {
 		// The harness is running but we cannot pin its identity. Continuing would
 		// leave a tombstone that cannot distinguish "reaped" from "pid reused",
 		// so fail closed and tear the child down now.
-		stopCtx, cancel := context.WithTimeout(context.Background(), orphan.TerminationGrace+2*time.Second)
+		stopCtx, cancel := context.WithTimeout(context.Background(), core.orphan.TerminationGrace+2*time.Second)
 		_ = sess.Stop(stopCtx)
 		cancel()
 		_ = ln.Close()
@@ -473,11 +456,108 @@ func Start(opts Options) (*Shim, error) {
 		return nil, fmt.Errorf("sessionshim: pin harness process identity: %w", startErr)
 	}
 
-	s := &Shim{
+	s := core.finishInteractive(
+		sess,
+		ln,
+		ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
+	)
+
+	flow.bind(s)
+
+	if err := s.publishRecord(); err != nil {
+		s.abortUnserved(ln, socketPath)
+		return nil, err
+	}
+
+	// No controller is attached yet, so the orphan clock starts immediately. A
+	// shim whose creating daemon dies before it ever adopts must still be bounded.
+	s.armOrphan()
+
+	go s.acceptLoop()
+	go s.watchHarness()
+	return s, nil
+}
+
+// serve is the transport-neutral core every profile shares: validate the
+// options, resolve the protocol range and orphan policy, pin the shim's own
+// process identity, mint the shim id, and listen on the session's adoption
+// socket. The caller owns the workload: it spawns or adopts the supervised
+// process, finishes the Shim, publishes the record, arms the orphan clock,
+// and starts the serve loops.
+func serve(opts Options) (core *Shim, opened servedSocket, err error) {
+	fail := func(err error) (*Shim, servedSocket, error) {
+		return nil, servedSocket{}, err
+	}
+	if !peerCredSupported() {
+		return fail(ErrShimUnsupported)
+	}
+	if err := opts.Identity.Validate(); err != nil {
+		return fail(err)
+	}
+	if opts.Registry == nil {
+		return fail(errors.New("sessionshim: Start requires a Registry"))
+	}
+	protocolMin, protocolMax := opts.ProtocolMin, opts.ProtocolMax
+	if protocolMin == 0 && protocolMax == 0 {
+		protocolMin, protocolMax = shimwire.ProtocolMin, shimwire.ProtocolMax
+	}
+	if protocolMin == 0 || protocolMax < protocolMin || protocolMax > shimwire.ProtocolMax {
+		return fail(fmt.Errorf("sessionshim: invalid shim protocol range [%d,%d]", protocolMin, protocolMax))
+	}
+	orphan := opts.Orphan
+	if orphan.Deadline == 0 {
+		orphan = DefaultOrphanPolicy()
+	}
+	if err := orphan.Validate(); err != nil {
+		return fail(err)
+	}
+	finalScreenWindow := opts.FinalScreenWindow
+	if finalScreenWindow <= 0 {
+		finalScreenWindow = defaultFinalScreenWindow
+	}
+	self, err := Self()
+	if err != nil {
+		return fail(err)
+	}
+	shimID, err := newShimID()
+	if err != nil {
+		return fail(err)
+	}
+
+	socketPath := opts.Registry.SocketPath(opts.Identity)
+	// A leftover socket from a dead shim would make Listen fail with EADDRINUSE.
+	// Removing it is safe: the path is derived from the identity inside a 0700
+	// directory this process owns, and a LIVE shim for the same identity is the
+	// duplicate-identity case the classifier quarantines rather than something
+	// this path should be racing.
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fail(fmt.Errorf("sessionshim: clear stale socket: %w", err))
+	}
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		return fail(fmt.Errorf("sessionshim: listen on adoption socket: %w", err))
+	}
+	// The socket carries no secret, but its 0600 mode keeps the daemon user's
+	// local trust boundary explicit rather than relying on the parent
+	// directory's mode alone.
+	if err := os.Chmod(socketPath, RecordFileMode); err != nil {
+		_ = ln.Close()
+		return fail(fmt.Errorf("sessionshim: tighten adoption socket: %w", err))
+	}
+	dev, ino, err := statSocket(socketPath)
+	if err != nil {
+		_ = ln.Close()
+		return fail(err)
+	}
+
+	workload := opts.Workload
+	if workload == "" {
+		workload = WorkloadInteractive
+	}
+	core = &Shim{
 		id:                       opts.Identity,
 		registry:                 opts.Registry,
-		sess:                     sess,
-		ln:                       ln,
+		workload:                 workload,
 		logger:                   opts.logger(),
 		now:                      opts.now(),
 		finalScreenWindow:        finalScreenWindow,
@@ -487,7 +567,6 @@ func Start(opts Options) (*Shim, error) {
 		shimID:                   shimID,
 		epoch:                    opts.ProcessEpoch,
 		self:                     self,
-		harness:                  ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
 		workarea:                 opts.WorkareaPath,
 		workareaRoot:             opts.WorkareaRoot,
 		protocolMin:              protocolMin,
@@ -503,21 +582,40 @@ func Start(opts Options) (*Shim, error) {
 		onTerminalCourtesy: opts.onTerminalCourtesy,
 		postInstallFailure: opts.postInstallFailure,
 	}
+	opened = servedSocket{ln: ln, path: socketPath}
+	return core, opened, nil
+}
 
-	flow.bind(s)
+// servedSocket is the listening adoption socket serve opened: the listener
+// Close owns, and the path the discovery record names.
+type servedSocket struct {
+	ln   *net.UnixListener
+	path string
+}
 
-	if err := s.publishRecord(); err != nil {
-		_ = s.Close()
-		return nil, err
+// finishInteractive attaches the spawned PTY session and its pinned harness
+// identity to a core built by serve. The listener travels with it because
+// Close owns the listener lifetime.
+func (s *Shim) finishInteractive(sess *ptyhost.Session, ln *net.UnixListener, harness ProcessIdentity) *Shim {
+	s.sess = sess
+	s.ln = ln
+	s.harness = harness
+	return s
+}
+
+// abortUnserved releases a Shim whose serve loops never started — the
+// publish-record failure path in Start and StartHeadless. Close cannot be
+// used there: it joins the accept loop, which is only started after the
+// record is durable, so calling it here would wait forever for a goroutine
+// that does not exist. The listener was never served, so closing it and
+// removing the socket path is the complete teardown.
+func (s *Shim) abortUnserved(ln *net.UnixListener, socketPath string) {
+	if ln != nil {
+		_ = ln.Close()
 	}
-
-	// No controller is attached yet, so the orphan clock starts immediately. A
-	// shim whose creating daemon dies before it ever adopts must still be bounded.
-	s.armOrphan()
-
-	go s.acceptLoop()
-	go s.watchHarness()
-	return s, nil
+	if socketPath != "" {
+		_ = os.Remove(socketPath)
+	}
 }
 
 // Identity returns the shim's lifecycle identity.
@@ -551,8 +649,13 @@ func (s *Shim) Phase() shimwire.Phase {
 // Session exposes the owned PTY session. It exists for the in-process
 // composition path (the shim's own runner side) and for tests; a CONTROLLER
 // never gets this — it gets a shimwire connection, which is what keeps the
-// daemon from holding a second direct reference to PTY state (§D1).
+// daemon from holding a second direct reference to PTY state (§D1). It is
+// nil on a headless shim, which owns a RunnerProcess instead of a PTY.
 func (s *Shim) Session() *ptyhost.Session { return s.sess }
+
+// Runner exposes the owned runner process. It is nil on an interactive shim,
+// which owns a ptyhost.Session instead.
+func (s *Shim) Runner() RunnerProcess { return s.runner }
 
 // Done is closed once the shim has fully stopped: harness reaped, terminal
 // observation persisted, listener closed.
@@ -629,12 +732,14 @@ func (s *Shim) beginFinalScreenWindow() {
 	})
 }
 
-// Terminate runs the bounded teardown: SIGTERM→grace→SIGKILL on the harness
-// process group, drain to EOF, persist the terminal observation, and replace the
-// discovery record with a tombstone.
+// Terminate runs the bounded teardown: SIGTERM→grace→SIGKILL on the owned
+// process group, drain to EOF, persist the terminal observation, and replace
+// the discovery record with a tombstone.
 //
 // This is what the orphan deadline fires, and what a generation-fenced Stop
-// reaches. It is idempotent.
+// reaches. It is idempotent. On a headless shim it stops the runner's group
+// and persists the headless terminal observation; on an interactive shim it
+// stops the PTY harness and persists the Exit observation.
 func (s *Shim) Terminate(ctx context.Context) error {
 	var err error
 	s.stopOnce.Do(func() { err = s.terminate(ctx) })
@@ -642,6 +747,9 @@ func (s *Shim) Terminate(ctx context.Context) error {
 }
 
 func (s *Shim) terminate(ctx context.Context) error {
+	if s.WorkloadOf() == WorkloadHeadless {
+		return s.terminateHeadlessOrphan(ctx)
+	}
 	stopCtx, cancel := context.WithTimeout(ctx, s.orphan.TerminationGrace+2*time.Second)
 	defer cancel()
 	_ = s.sess.Stop(stopCtx)
@@ -966,6 +1074,26 @@ func (s *Shim) publishOrphanRecord(episode uint64, deadline time.Time) error {
 	return s.publishRecordWithDeadlineLocked(deadline)
 }
 
+// recordSchemaVersion reports the discovery-record schema for this shim's
+// profile: schema 2 for headless, schema 1 for interactive. Interactive
+// records stay byte-identical to what released readers decode.
+func (s *Shim) recordSchemaVersion() int {
+	if s.WorkloadOf() == WorkloadHeadless {
+		return HeadlessRecordSchemaVersion
+	}
+	return RecordSchemaVersion
+}
+
+// recordWorkload reports the workload member for this shim's discovery
+// record: "headless" on the headless profile, empty (absent, meaning the
+// PTY profile) on interactive records so they stay byte-identical.
+func (s *Shim) recordWorkload() Workload {
+	if s.WorkloadOf() == WorkloadHeadless {
+		return WorkloadHeadless
+	}
+	return ""
+}
+
 // publishRecordWithDeadlineLocked composes and writes a record while recordMu
 // is already held.
 func (s *Shim) publishRecordWithDeadlineLocked(deadline time.Time) error {
@@ -983,7 +1111,8 @@ func (s *Shim) publishRecordWithDeadlineLocked(deadline time.Time) error {
 		return nil
 	}
 	rec := Record{
-		SchemaVersion:     RecordSchemaVersion,
+		SchemaVersion:     s.recordSchemaVersion(),
+		Workload:          s.recordWorkload(),
 		OrgID:             s.id.OrgID,
 		SessionID:         s.id.SessionID,
 		ShimID:            s.shimID,
@@ -1062,10 +1191,16 @@ func (s *Shim) serveController(conn *net.UnixConn) {
 }
 
 // handshake performs Hello → Welcome → Adopted and, on success, hands the
-// connection to the live loops.
+// connection to the live loops. A headless shim answers the same Hello with
+// no output stream and, once Welcome commits a generation, serves the
+// headless controller loop instead of the PTY replay path.
 func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Reader) error {
 	s.handshakeMu.Lock()
 	defer s.handshakeMu.Unlock()
+
+	if s.WorkloadOf() == WorkloadHeadless {
+		return s.handshakeHeadless(conn, w, r)
+	}
 
 	var (
 		outputBarrier *ptyhost.OutputBarrier
@@ -1259,6 +1394,153 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	return nil
 }
 
+// buildHeadlessHello composes the headless profile's opening frame: the
+// same identity, fencing, and phase as the interactive Hello, with no
+// output-stream bounds and the workload declared in the extension map.
+func (s *Shim) buildHeadlessHello() shimwire.Hello {
+	s.mu.Lock()
+	gen, phase := s.gen, s.phase
+	s.mu.Unlock()
+	return shimwire.Hello{
+		Protocol:         shimwire.ProtocolName,
+		Min:              s.protocolMin,
+		Max:              s.protocolMax,
+		OrgID:            s.id.OrgID,
+		SessionID:        s.id.SessionID,
+		ShimID:           s.shimID,
+		ProcessEpoch:     s.epoch,
+		PID:              s.self.PID,
+		ProcessStartedAt: s.self.StartedAt,
+		HarnessPID:       s.harness.PID,
+		HarnessStartedAt: s.harness.StartedAt,
+		WorkareaPath:     s.workarea,
+		Phase:            phase,
+		Generation:       gen,
+		FirstSeq:         0,
+		LastSeq:          0,
+		Extensions:       shimwire.Extensions{Values: map[string]string{shimwire.ExtWorkload: string(WorkloadHeadless)}},
+	}
+}
+
+// handshakeHeadless performs the headless Hello → Welcome → Adopted: the
+// same generation fence as the interactive path, with no replay disposition
+// — there is no output stream to resume — and the headless serve loop after
+// commit. An EXITED headless session stays adoptable so the tombstone can
+// close the lifecycle loop, exactly as the interactive path does.
+func (s *Shim) handshakeHeadless(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Reader) error {
+	_ = conn.SetDeadline(time.Now().Add(adoptionOutputBarrierTimeout))
+	hello := s.buildHeadlessHello()
+	if err := writeTyped(w, shimwire.TypeHello, func() ([]byte, error) { return shimwire.EncodeHello(hello) }); err != nil {
+		return err
+	}
+
+	msg, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("sessionshim: read welcome: %w", err)
+	}
+	if msg.Type == shimwire.TypeHeartbeat {
+		_ = conn.SetDeadline(time.Now().Add(orphanKeepaliveAnswerTimeout))
+		return s.serveOrphanKeepalive(w, msg)
+	}
+	if msg.Type != shimwire.TypeWelcome {
+		_ = sendError(w, shimwire.CodeMalformed, "expected Welcome")
+		return fmt.Errorf("sessionshim: %w: expected Welcome, got %s", shimwire.ErrMalformed, msg.Type)
+	}
+	welcome, err := shimwire.DecodeWelcome(msg.Body)
+	if err != nil {
+		_ = sendError(w, shimwire.CodeMalformed, "welcome did not decode")
+		return err
+	}
+	if welcome.Protocol != shimwire.ProtocolName {
+		_ = sendError(w, shimwire.CodeVersionMismatch, "protocol name mismatch")
+		return fmt.Errorf("sessionshim: %w: welcome names protocol %q", shimwire.ErrVersionMismatch, welcome.Protocol)
+	}
+	if welcome.Selected < s.protocolMin || welcome.Selected > s.protocolMax {
+		_ = sendError(w, shimwire.CodeVersionMismatch, "selected version outside this shim's range")
+		return fmt.Errorf("sessionshim: %w: selected %d outside [%d,%d]",
+			shimwire.ErrVersionMismatch, welcome.Selected, s.protocolMin, s.protocolMax)
+	}
+	if err := welcome.Extensions.CheckRequired(); err != nil {
+		_ = sendError(w, shimwire.CodeExtensionRequired, "required extension unsupported")
+		return err
+	}
+
+	s.recordMu.Lock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.recordMu.Unlock()
+		_ = sendError(w, shimwire.CodePhaseUnknown, "session shim is no longer serving")
+		return net.ErrClosed
+	}
+	if s.orphanExpiring && s.phase != shimwire.PhaseExited {
+		s.mu.Unlock()
+		s.recordMu.Unlock()
+		_ = sendError(w, shimwire.CodePhaseUnknown, "orphan deadline is terminating this shim")
+		return net.ErrClosed
+	}
+	if welcome.ProposedGeneration <= s.gen {
+		current := s.gen
+		s.mu.Unlock()
+		s.recordMu.Unlock()
+		_ = sendError(w, shimwire.CodeStaleGeneration,
+			fmt.Sprintf("proposed generation %d does not advance current %d", welcome.ProposedGeneration, current))
+		return fmt.Errorf("sessionshim: %w: proposed %d, current %d",
+			shimwire.ErrStaleGeneration, welcome.ProposedGeneration, current)
+	}
+	s.gen = welcome.ProposedGeneration
+	ctrl := &controllerConn{
+		conn: conn, w: w, selected: welcome.Selected,
+		snapshotLedger: make(map[uint64]*snapshotLedgerEntry),
+		emissionBySeq:  make(map[uint64]*snapshotLedgerEntry),
+		pumpDone:       make(chan struct{}),
+	}
+	prev := s.installControllerLocked(ctrl)
+	s.mu.Unlock()
+	if err := s.publishRecordWithDeadlineLocked(time.Time{}); err != nil {
+		s.logger.Warn("sessionshim: republish record on adoption", "session", s.id.String(), "error", err)
+	}
+	s.recordMu.Unlock()
+	loopOwned := false
+	defer func() {
+		if !loopOwned {
+			s.loseController(ctrl)
+		}
+	}()
+
+	// The old controller's socket closes the moment a new generation commits,
+	// exactly as the interactive path does: an old daemon can hold an open fd
+	// after losing authority, so the fd itself is taken away.
+	if prev != nil {
+		prev.close()
+	}
+	if err := s.failPostInstall("resume"); err != nil {
+		return err
+	}
+	adopted := shimwire.Adopted{
+		Generation: s.Generation(),
+		Contiguous: true,
+		ReplayFrom: headlessTerminalSeq,
+		ReplayTo:   0,
+		Phase:      s.Phase(),
+		Extensions: welcome.Extensions,
+	}
+	if err := s.failPostInstall("loopstart"); err != nil {
+		return err
+	}
+	if err := writeTyped(w, shimwire.TypeAdopted, func() ([]byte, error) { return shimwire.EncodeAdopted(adopted) }); err != nil {
+		return err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	// The headless serve loop owns this connection from here: it applies the
+	// generation fence to Stop and Heartbeat and refuses every PTY-shaped
+	// type. Marking the loop owned before serving keeps the deferred
+	// loseController from orphaning a live controller when serving returns.
+	loopOwned = true
+	s.serveHeadlessController(ctrl, r)
+	return nil
+}
+
 func (s *Shim) failPostInstall(stage string) error {
 	if s.postInstallFailure == nil {
 		return nil
@@ -1267,6 +1549,9 @@ func (s *Shim) failPostInstall(stage string) error {
 }
 
 func (s *Shim) buildHello() (shimwire.Hello, error) {
+	if s.WorkloadOf() == WorkloadHeadless {
+		return s.buildHeadlessHello(), nil
+	}
 	screen, lastSeq, err := s.sess.Snapshot()
 	if err != nil {
 		return shimwire.Hello{}, fmt.Errorf("sessionshim: hello snapshot: %w", err)
