@@ -183,9 +183,7 @@ func defaultCPUs(hostCPUs, maxSeats int) int {
 //
 // Keys are stable and sorted: GOMAXPROCS caps the Go runtime (go test,
 // go build); MAKEFLAGS -j caps make; CMAKE_BUILD_PARALLEL_LEVEL caps
-// cmake --build; NINJAFLAGS caps ninja; CARGO_BUILD_JOBS caps cargo;
-// the *_NUM_WORKERS / *_MAX_WORKERS entries cap the JS runners that read
-// them (vitest workers, Next/Turbopack build workers).
+// cmake --build; NINJAFLAGS caps ninja; CARGO_BUILD_JOBS caps cargo.
 func WorkerCapEnv(cpus int) map[string]string {
 	if cpus < 1 {
 		cpus = 1
@@ -197,8 +195,6 @@ func WorkerCapEnv(cpus int) map[string]string {
 		"CMAKE_BUILD_PARALLEL_LEVEL": n,
 		"NINJAFLAGS":                 "-j" + n,
 		"CARGO_BUILD_JOBS":           n,
-		"VITEST_MAX_WORKERS":         n,
-		"NEXT_BUILD_WORKERS":         n,
 	}
 }
 

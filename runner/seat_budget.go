@@ -26,6 +26,16 @@ type SeatBudget struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+// Clone returns a defensive copy of the budget. Nil stays nil so a
+// disabled budget never gains a projection entry by copying.
+func (b *SeatBudget) Clone() *SeatBudget {
+	if b == nil {
+		return nil
+	}
+	out := *b
+	return &out
+}
+
 // disabled reports whether the budget carries no constraint.
 func (b *SeatBudget) disabled() bool {
 	if b == nil {
@@ -39,11 +49,10 @@ func (b *SeatBudget) disabled() bool {
 
 // workerCapEnv returns the cooperative worker-cap entries for cpus: the env
 // knobs core-fanning tools actually read (Go runtime, make, cmake, ninja,
-// cargo, vitest, Next build workers). The set mirrors the daemon's
-// enforcement package; the runner re-renders it here (rather than importing
-// the daemon) because the daemon package must stay independent of the
-// runner — `donmai agent run` constructs its runner from the opaque
-// SessionDetail payload.
+// cargo). The set mirrors the daemon's enforcement package; the runner
+// re-renders it here (rather than importing the daemon) because the daemon
+// package must stay independent of the runner — `donmai agent run`
+// constructs its runner from the opaque SessionDetail payload.
 func workerCapEnv(cpus int) map[string]string {
 	if cpus < 1 {
 		cpus = 1
@@ -55,8 +64,6 @@ func workerCapEnv(cpus int) map[string]string {
 		"CMAKE_BUILD_PARALLEL_LEVEL": n,
 		"NINJAFLAGS":                 "-j" + n,
 		"CARGO_BUILD_JOBS":           n,
-		"VITEST_MAX_WORKERS":         n,
-		"NEXT_BUILD_WORKERS":         n,
 	}
 }
 

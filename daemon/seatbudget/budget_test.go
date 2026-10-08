@@ -125,15 +125,20 @@ func TestResolve(t *testing.T) {
 
 func TestWorkerCapEnv(t *testing.T) {
 	env := WorkerCapEnv(4)
-	// Every knob is a real tool control at the seat share.
+	// Every knob is a control the named tool actually reads: the Go
+	// runtime (GOMAXPROCS), make (MAKEFLAGS -j), cmake --build
+	// (CMAKE_BUILD_PARALLEL_LEVEL), ninja (NINJAFLAGS -j) and cargo
+	// (CARGO_BUILD_JOBS). JS runners take no seat env entry: vitest reads
+	// --maxWorkers/maxWorkers config (not an env knob) and Next.js
+	// build parallelism is a config/CLI flag (not an env knob), so
+	// injecting a same-shaped variable for them would claim a cap the
+	// tool ignores.
 	want := map[string]string{
 		"GOMAXPROCS":                 "4",
 		"MAKEFLAGS":                  "-j4",
 		"CMAKE_BUILD_PARALLEL_LEVEL": "4",
 		"NINJAFLAGS":                 "-j4",
 		"CARGO_BUILD_JOBS":           "4",
-		"VITEST_MAX_WORKERS":         "4",
-		"NEXT_BUILD_WORKERS":         "4",
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -185,7 +190,7 @@ func TestSystemdScopeArgs(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"systemd-run", "--scope", "--collect",
-		"AllowedCPUs=0-1", "CPUQuota=200%",
+		"AllowedCPUs=0-1", "CPUQuota=200%", "CPUWeight=200",
 		"MemoryMax=4294967296", "MemoryHigh=4294967296", "IOWeight=200",
 		"donmai-seat-abc.scope",
 	} {
@@ -193,11 +198,57 @@ func TestSystemdScopeArgs(t *testing.T) {
 			t.Errorf("scope args %q missing %q", joined, want)
 		}
 	}
+	if strings.Contains(joined, "--user") {
+		t.Errorf("system-service scope args %q carry --user; want the system-bus spelling", joined)
+	}
 	// No memory cap => no MemoryMax (which systemd would read as zero
 	// memory), no weight => no IOWeight.
 	bare := strings.Join(SystemdScopeArgs("donmai-seat-x.scope", Budget{CPUs: 1}), " ")
 	if strings.Contains(bare, "MemoryMax") || strings.Contains(bare, "IOWeight") {
 		t.Errorf("uncapped seat got a memory/IO property: %q", bare)
+	}
+	if !strings.Contains(bare, "CPUWeight=100") {
+		t.Errorf("uncapped seat scope args %q missing the proportional CPUWeight share", bare)
+	}
+	// A per-user daemon service reaches only the user bus: same scope
+	// shape with --user right after the binary.
+	userArgs := SystemdScopeArgsForBus("donmai-seat-abc.scope", Budget{CPUs: 2}, true)
+	if len(userArgs) < 3 || userArgs[0] != "systemd-run" || userArgs[1] != "--user" || userArgs[2] != "--scope" {
+		t.Errorf("user-bus scope args = %q; want systemd-run --user --scope ...", strings.Join(userArgs, " "))
+	}
+	if !strings.Contains(strings.Join(userArgs, " "), "AllowedCPUs=0-1") {
+		t.Errorf("user-bus scope args %q missing the CPU pinning", strings.Join(userArgs, " "))
+	}
+}
+
+func TestSystemdUserScope(t *testing.T) {
+	// Only the user bus reachable => per-user install => --user.
+	if !SystemdUserScope(true, false) {
+		t.Error("SystemdUserScope(user, no system) = false; want true (per-user service)")
+	}
+	// System bus reachable => system service, with or without a user bus.
+	if SystemdUserScope(true, true) {
+		t.Error("SystemdUserScope(user, system) = true; want false (system bus wins)")
+	}
+	if SystemdUserScope(false, true) {
+		t.Error("SystemdUserScope(no user, system) = true; want false")
+	}
+	if SystemdUserScope(false, false) {
+		t.Error("SystemdUserScope(neither) = true; want false")
+	}
+}
+
+func TestUserBusSocketPath(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	if got := userBusSocketPath(""); got != "/run/user/1000/bus" {
+		t.Errorf("userBusSocketPath = %q; want XDG_RUNTIME_DIR/bus", got)
+	}
+	if got := userBusSocketPath("/custom/bus"); got != "/custom/bus" {
+		t.Errorf("userBusSocketPath(override) = %q; want the override", got)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	if got := userBusSocketPath(""); got == "" || got == "/bus" {
+		t.Errorf("userBusSocketPath fallback = %q; want the per-UID path", got)
 	}
 }
 
@@ -219,6 +270,9 @@ func TestSelectPlacement(t *testing.T) {
 	if got := SelectPlacement(true, true); got != PlacementSystemd {
 		t.Errorf("systemd present => %q; want systemd", got)
 	}
+	// A writable hierarchy without systemd still selects the named
+	// systemd-less placement — but that placement performs NO direct
+	// writes: the seat runs unconfined and the report says none.
 	if got := SelectPlacement(false, true); got != PlacementCgroupFS {
 		t.Errorf("cgroupfs only => %q; want cgroupfs", got)
 	}

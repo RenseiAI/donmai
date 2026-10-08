@@ -21,6 +21,7 @@ import (
 
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -1268,7 +1269,8 @@ func shimChildLogPath(registryDir string, id sessionshim.Identity) string {
 // §D1 removes: a daemon that still had to reap this process could not be
 // replaced without ending it.
 func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, env []string) (sessionshim.ProcessIdentity, error) {
-	command := d.shimCommand()
+	shimBudget, shimBudgetOK := d.shimSeatBudget()
+	command := seatBudgetShimCommand(d.shimCommand(), spec.SessionID, shimBudget, shimBudgetOK, seatbudget.HostPlacement(), seatbudget.UserScopeForBus())
 	if len(command) == 0 {
 		return sessionshim.ProcessIdentity{}, errors.New("session shim: no worker command is configured to launch a shim with")
 	}
@@ -2113,11 +2115,13 @@ func (d *Daemon) trackLaunchedShim(
 	receipt SessionShimAdoptionReceipt,
 	startConsumer bool,
 ) SessionHandle {
+	shimReportBudget, shimReportBudgetOK := d.shimSeatBudget()
 	handle := SessionHandle{
 		SessionID:  spec.SessionID,
 		PID:        ctrl.HarnessIdentity().PID,
 		AcceptedAt: d.shimNow().UTC().Format(time.RFC3339),
 		State:      SessionRunning,
+		SeatBudget: sessionSeatBudgetReport(shimReportBudget, shimReportBudgetOK, seatbudget.HostPlacement()),
 		// The workarea doubles as the worktree path a local reader joins with
 		// .agent/…; it is the same <parent>/<sessionID> leaf the direct path
 		// publishes, so a reader cannot tell shim-backed sessions apart by shape.

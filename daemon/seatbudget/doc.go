@@ -18,11 +18,11 @@
 //
 //   - Linux: hard enforcement with cgroups v2. The seat's process tree is
 //     confined to its CPU set and memory limit (AllowedCPUs-style pinning,
-//     CPU quota, memory high/max, IO weight). See budget_linux.go.
+//     CPU quota, memory high/max). See cgroup.go.
 //   - macOS: best effort. There is no core affinity on Apple Silicon, so the
 //     seat gets worker-cap environment (GOMAXPROCS plus the build/test
 //     worker knobs each tool actually reads) composed with the installed
-//     service process-priority mode. See budget_darwin.go.
+//     service process-priority mode. See coop.go.
 //
 // Every seat reports its budget as enforced | best-effort | none with the
 // values, on host status and on the session result. Additive fields only.

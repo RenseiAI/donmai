@@ -51,21 +51,47 @@ func resolveSeatBudget(authored SeatBudgetConfig, maxSeats, hostCPUs, hostMemory
 
 // seatBudgetReport builds the additive status/report budget block for one
 // resolved budget: the posture the seat actually runs under plus the
-// values. Disabled budgets report mode "none" with no values.
+// values. Disabled budgets report mode "none" with no values. A Linux
+// seat that asked for enforcement but has no systemd backend reports
+// mode "none" with the reason — never enforced for a seat that runs
+// unwrapped.
 func seatBudgetReport(b seatbudget.Budget) *afclient.SeatBudgetStatus {
 	if b.Disabled() {
 		return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone)}
 	}
+	mode := b.EffectiveMode()
+	if mode == seatbudget.ModeEnforced && seatbudget.HostPlacement() != seatbudget.PlacementSystemd {
+		// Downgrade ONLY on Linux, where EffectiveMode promised enforced.
+		// Off Linux the mode already resolved to best-effort (macOS
+		// cooperative caps) and the report below renders the knob line;
+		// collapsing that to none would erase a real best-effort budget.
+		if runtime.GOOS == "linux" {
+			return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone), Detail: seatBudgetNoBackendDetail()}
+		}
+	}
 	return &afclient.SeatBudgetStatus{
-		Mode:     string(b.EffectiveMode()),
+		Mode:     string(mode),
 		CPUs:     b.CPUs,
 		MemoryMB: b.MemoryMB,
 		Detail:   seatBudgetDetail(b),
 	}
 }
 
+// seatBudgetNoBackendDetail names the missing backend for a Linux seat
+// that asked for enforcement on a host with no systemd: the report must
+// name the reason rather than claim a confinement the seat did not get.
+func seatBudgetNoBackendDetail() string {
+	if seatbudget.HostPlacement() == seatbudget.PlacementCgroupFS {
+		return "no systemd on this host: cgroupfs placement is not applied, seat runs unconfined"
+	}
+	return "no enforcement backend on this host"
+}
+
 // seatBudgetDetail renders the short human line behind a budget report:
 // which placement enforces it on Linux, which knobs carry it on macOS.
+// The enforced branch is reached only when the host placement can confine
+// the seat (see seatBudgetReport); a systemd-less host never renders an
+// enforced line.
 func seatBudgetDetail(b seatbudget.Budget) string {
 	switch b.EffectiveMode() {
 	case seatbudget.ModeEnforced:
@@ -76,8 +102,6 @@ func seatBudgetDetail(b seatbudget.Budget) string {
 		switch seatbudget.HostPlacement() {
 		case seatbudget.PlacementSystemd:
 			return detail + " via transient systemd scope"
-		case seatbudget.PlacementCgroupFS:
-			return detail + " via cgroupfs"
 		default:
 			return detail + " (no enforcement backend on this host)"
 		}

@@ -23,18 +23,28 @@ func TestApplySeatBudget(t *testing.T) {
 	})
 	t.Run("caps land at the seat share", func(t *testing.T) {
 		got := applySeatBudget(map[string]string{}, &SeatBudget{Mode: "best-effort", CPUs: 2})
+		// Five verified knobs only: JS runners take no seat env entry
+		// (vitest reads config/CLI, Next.js reads config/CLI), so both
+		// must stay absent — an entry the tool ignores would claim a
+		// cap that does nothing.
 		want := map[string]string{
 			"GOMAXPROCS":                 "2",
 			"MAKEFLAGS":                  "-j2",
 			"CMAKE_BUILD_PARALLEL_LEVEL": "2",
 			"NINJAFLAGS":                 "-j2",
 			"CARGO_BUILD_JOBS":           "2",
-			"VITEST_MAX_WORKERS":         "2",
-			"NEXT_BUILD_WORKERS":         "2",
 		}
 		for k, v := range want {
 			if got[k] != v {
 				t.Errorf("%s = %q; want %q", k, got[k], v)
+			}
+		}
+		if len(got) != len(want) {
+			t.Errorf("applySeatBudget injected %d knobs; want exactly the %d verified controls", len(got), len(want))
+		}
+		for _, dead := range []string{"VITEST_MAX_WORKERS", "NEXT_BUILD_WORKERS"} {
+			if _, ok := got[dead]; ok {
+				t.Errorf("applySeatBudget injected %q; no such tool control exists", dead)
 			}
 		}
 	})
@@ -89,8 +99,7 @@ func TestWorkerCapEnvMatchesDaemonKnobs(t *testing.T) {
 	env := workerCapEnv(3)
 	wantKeys := []string{
 		"GOMAXPROCS", "MAKEFLAGS", "CMAKE_BUILD_PARALLEL_LEVEL",
-		"NINJAFLAGS", "CARGO_BUILD_JOBS", "VITEST_MAX_WORKERS",
-		"NEXT_BUILD_WORKERS",
+		"NINJAFLAGS", "CARGO_BUILD_JOBS",
 	}
 	if len(env) != len(wantKeys) {
 		t.Fatalf("workerCapEnv has %d knobs; want %d", len(env), len(wantKeys))
@@ -120,8 +129,15 @@ func TestRun_SeatBudgetCapsAndReports(t *testing.T) {
 	if provider.lastSpecEnv()["GOMAXPROCS"] != "2" {
 		t.Errorf("harness GOMAXPROCS = %q; want 2", provider.lastSpecEnv()["GOMAXPROCS"])
 	}
-	if provider.lastSpecEnv()["VITEST_MAX_WORKERS"] != "2" {
-		t.Errorf("harness VITEST_MAX_WORKERS = %q; want 2", provider.lastSpecEnv()["VITEST_MAX_WORKERS"])
+	if provider.lastSpecEnv()["MAKEFLAGS"] != "-j2" {
+		t.Errorf("harness MAKEFLAGS = %q; want -j2", provider.lastSpecEnv()["MAKEFLAGS"])
+	}
+	// The unverified JS spellings must stay absent from the harness env:
+	// a seat carrying them would report caps its tools ignore.
+	for _, dead := range []string{"VITEST_MAX_WORKERS", "NEXT_BUILD_WORKERS"} {
+		if _, ok := provider.lastSpecEnv()[dead]; ok {
+			t.Errorf("harness %s = %q; want absent (no such tool control)", dead, provider.lastSpecEnv()[dead])
+		}
 	}
 	if res.SeatBudget == nil {
 		t.Fatal("SeatBudget is nil; want the seat posture on the result")

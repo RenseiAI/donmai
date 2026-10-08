@@ -65,9 +65,18 @@ func applySeatBudgetToEnv(env []string, b seatbudget.Budget, ok bool) []string {
 // non-Linux host, or an explicit best-effort mode, never wraps: the seat
 // runs on cooperative caps and the report says best-effort. A seat that
 // asked for enforcement but has no backend runs unwrapped and the report
-// says none — the spawn must not fail for want of a hierarchy. name scopes
-// the transient unit per session.
+// says none with the missing backend named — the spawn must not fail for
+// want of a hierarchy, and the report must never claim a confinement the
+// seat did not get. name scopes the transient unit per session. userScope
+// selects the systemd bus (--user for a per-user daemon service).
 func applySeatBudgetToCmd(command []string, sessionID string, b seatbudget.Budget, ok bool, placement seatbudget.Placement) []string {
+	return applySeatBudgetToCmdForBus(command, sessionID, b, ok, placement, false)
+}
+
+// applySeatBudgetToCmdForBus is applySeatBudgetToCmd parametrised by the
+// systemd bus. Production resolves userScope from the live bus probe;
+// tests pin both spellings on any host.
+func applySeatBudgetToCmdForBus(command []string, sessionID string, b seatbudget.Budget, ok bool, placement seatbudget.Placement, userScope bool) []string {
 	if !ok || len(command) == 0 {
 		return command
 	}
@@ -77,7 +86,7 @@ func applySeatBudgetToCmd(command []string, sessionID string, b seatbudget.Budge
 	if placement != seatbudget.PlacementSystemd {
 		return command
 	}
-	prefix := seatbudget.SystemdScopeArgs(seatbudget.ScopeName(sessionID), b)
+	prefix := seatbudget.SystemdScopeArgsForBus(seatbudget.ScopeName(sessionID), b, userScope)
 	return append(prefix, command...)
 }
 
@@ -96,34 +105,33 @@ func wantsEnforcement(b seatbudget.Budget) bool {
 // sessionSeatBudgetReport builds the per-session handle evidence for one
 // spawn: the posture the seat actually runs under with the values. A
 // disabled budget reports mode "none". A seat that asked for enforcement
-// reports enforced only when the placement can confine it: systemd wrap, or
-// cgroupfs (confinement without the scope wrapper). With no backend the
-// seat runs unconfined and the report says none — never a posture the seat
-// did not get. Best-effort covers explicit best-effort plus auto off Linux.
+// reports enforced ONLY for the systemd wrap — the one placement that
+// confines the seat. A systemd-less Linux host (cgroupfs placement) runs
+// the seat unconfined: the launcher performs no direct cgroupfs placement,
+// so the report is mode "none" with the missing backend named, never
+// enforced. With no backend at all the report is likewise none. Best-effort
+// covers explicit best-effort plus auto off Linux.
 func sessionSeatBudgetReport(b seatbudget.Budget, ok bool, placement seatbudget.Placement) *SessionSeatBudget {
 	if !ok {
 		return &SessionSeatBudget{Mode: string(seatbudget.ModeNone)}
 	}
 	if wantsEnforcement(b) {
-		rep := &SessionSeatBudget{
-			Mode:     string(seatbudget.ModeEnforced),
-			CPUs:     b.CPUs,
-			MemoryMB: b.MemoryMB,
-		}
 		detail := "cpus " + seatbudget.CPUSet(b.CPUs) + ", quota " + seatbudget.CPUQuotaPercent(b.CPUs)
 		if mem := seatbudget.MemoryBytes(b.MemoryMB); mem != "" {
 			detail += ", memory " + mem + " bytes"
 		}
-		switch placement {
-		case seatbudget.PlacementSystemd:
-			rep.Detail = detail + " via transient systemd scope"
-			return rep
-		case seatbudget.PlacementCgroupFS:
-			rep.Detail = detail + " via cgroupfs (scope wrap unavailable)"
-			return rep
-		default:
-			return &SessionSeatBudget{Mode: string(seatbudget.ModeNone), Detail: "no enforcement backend on this host"}
+		if placement == seatbudget.PlacementSystemd {
+			return &SessionSeatBudget{
+				Mode:     string(seatbudget.ModeEnforced),
+				CPUs:     b.CPUs,
+				MemoryMB: b.MemoryMB,
+				Detail:   detail + " via transient systemd scope",
+			}
 		}
+		if placement == seatbudget.PlacementCgroupFS {
+			return &SessionSeatBudget{Mode: string(seatbudget.ModeNone), Detail: "no systemd on this host: cgroupfs placement is not applied, seat runs unconfined"}
+		}
+		return &SessionSeatBudget{Mode: string(seatbudget.ModeNone), Detail: "no enforcement backend on this host"}
 	}
 	return &SessionSeatBudget{
 		Mode:     string(seatbudget.ModeBestEffort),
@@ -131,6 +139,28 @@ func sessionSeatBudgetReport(b seatbudget.Budget, ok bool, placement seatbudget.
 		MemoryMB: b.MemoryMB,
 		Detail:   seatbudget.DescribeBestEffort(b.CPUs, len(seatbudget.WorkerCapKeys())),
 	}
+}
+
+// shimSeatBudget resolves the spawner's budget for the shim launch path:
+// the same effective budget the direct path wraps at spawn. ok=false means
+// budgeting is off — the shim launches exactly as before. d may be nil in
+// tests that construct a spawner without a daemon.
+func (d *Daemon) shimSeatBudget() (seatbudget.Budget, bool) {
+	if d == nil || d.spawner == nil {
+		return seatbudget.Budget{}, false
+	}
+	return d.spawner.seatBudgetForSpawn()
+}
+
+// seatBudgetShimCommand wraps the shim worker command in the same Linux
+// cgroup placement the direct path applies at spawn: an enforced seat on a
+// systemd host launches inside the transient scope (on the user bus with
+// --user for a per-user daemon service); anywhere else the command runs
+// unwrapped and the handle report says what the seat got. The env caps
+// (applied by spawnThroughShim before this daemon's launch entry) ride
+// along on both paths so tools size their fan-out to the share.
+func seatBudgetShimCommand(command []string, sessionID string, b seatbudget.Budget, ok bool, placement seatbudget.Placement, userScope bool) []string {
+	return applySeatBudgetToCmdForBus(command, sessionID, b, ok, placement, userScope)
 }
 
 // wrapSeatCommandForTest is the production entry point's seam: tests drive

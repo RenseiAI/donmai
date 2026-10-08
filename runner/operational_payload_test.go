@@ -143,6 +143,11 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		// payload would defeat the head verification entirely.
 		"PullRequest":       "projected",
 		"PermissionProfile": "projected", "Env": "projected",
+		// The per-seat resource budget changes what the harness executes
+		// (the worker-cap env the runner overlays on the harness Spec.Env),
+		// so it is admission-bound like Branch and Env: two seats that
+		// verify the same receipt must run under the same constraints.
+		"SeatBudget": "projected",
 		// The stamped execution-security levels decide how much the session
 		// may do; they are admission-bound like every other intent.
 		"ExecutionSecurity": "projected",
@@ -182,6 +187,53 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		if field.PkgPath == "" && field.Tag.Get("json") == "-" {
 			t.Errorf("prompt operational field %q is not losslessly JSON-projectable", field.Name)
 		}
+	}
+}
+
+func TestOperationalPayloadSeatBudgetIsDigestBoundAndDefensivelyProjected(t *testing.T) {
+	base := fullOperationalFixture()
+	absent, err := CanonicalOperationalPayload(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(absent), "seatBudget") {
+		t.Fatalf("absent budget changed the legacy operational shape: %s", absent)
+	}
+	budgeted := base
+	budgeted.SeatBudget = &SeatBudget{Mode: "best-effort", CPUs: 2, MemoryMB: 4096, Detail: "caps"}
+	withBudget, err := CanonicalOperationalPayload(budgeted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(withBudget) == string(absent) {
+		t.Fatal("seat budget did not change the admission digest: two seats could verify one receipt yet run under different constraints")
+	}
+	swapped := budgeted
+	swapped.SeatBudget = &SeatBudget{Mode: "enforced", CPUs: 8, MemoryMB: 8192, Detail: "scope"}
+	swappedCanonical, err := CanonicalOperationalPayload(swapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(swappedCanonical) == string(withBudget) {
+		t.Fatal("seat budget values did not change the admission digest")
+	}
+	// The projection is a defensive copy: mutating it must not move the
+	// queued work it was projected from.
+	projected := ProjectOperationalPayload(budgeted)
+	if projected.SeatBudget == nil || projected.SeatBudget.CPUs != 2 || projected.SeatBudget.Mode != "best-effort" {
+		t.Fatalf("projected seat budget = %+v; want best-effort 2 cpu", projected.SeatBudget)
+	}
+	projected.SeatBudget.CPUs = 99
+	if budgeted.SeatBudget.CPUs != 2 {
+		t.Fatal("projected seat budget aliases queued work")
+	}
+	if ProjectOperationalPayload(base).SeatBudget != nil {
+		t.Fatal("absent seat budget projected non-nil; want nil (legacy shape preserved)")
+	}
+	if digest, err := DigestOperationalPayload(budgeted); err != nil {
+		t.Fatal(err)
+	} else if digest == "" {
+		t.Fatal("empty seat-budget digest")
 	}
 }
 

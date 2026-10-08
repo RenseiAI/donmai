@@ -45,8 +45,12 @@ func TestSpawner_SeatBudget_EnvCapsThroughAcceptWork(t *testing.T) {
 	if byKey["MAKEFLAGS"] != "-j3" {
 		t.Errorf("MAKEFLAGS in seat env = %q; want -j3", byKey["MAKEFLAGS"])
 	}
-	if byKey["VITEST_MAX_WORKERS"] != "3" {
-		t.Errorf("VITEST_MAX_WORKERS in seat env = %q; want 3", byKey["VITEST_MAX_WORKERS"])
+	// The unverified JS spellings must stay absent: a seat carrying them
+	// would report caps its tools ignore.
+	for _, dead := range []string{"VITEST_MAX_WORKERS", "NEXT_BUILD_WORKERS"} {
+		if _, ok := byKey[dead]; ok {
+			t.Errorf("seat env carries %q; no such tool control exists", dead)
+		}
 	}
 	if handle.SeatBudget == nil {
 		t.Fatal("handle.SeatBudget is nil; want the seat posture")
@@ -78,8 +82,10 @@ func TestSpawner_SeatBudget_DisabledSpawnsUnchanged(t *testing.T) {
 	waitSessionEnd(t, ended)
 	waitForActiveCount(t, s, 0)
 	for _, kv := range gotEnv {
-		if strings.HasPrefix(kv, "GOMAXPROCS=") || strings.HasPrefix(kv, "VITEST_MAX_WORKERS=") {
-			t.Errorf("disabled budget leaked cap %q into seat env", kv)
+		for _, dead := range []string{"GOMAXPROCS=", "VITEST_MAX_WORKERS=", "NEXT_BUILD_WORKERS="} {
+			if strings.HasPrefix(kv, dead) {
+				t.Errorf("disabled budget leaked cap %q into seat env", kv)
+			}
 		}
 	}
 	if handle.SeatBudget == nil || handle.SeatBudget.Mode != "none" {
@@ -134,6 +140,40 @@ func TestApplySeatBudgetToCmd_SystemdWrap(t *testing.T) {
 			t.Errorf("wrapped command %q missing %q", joined, want)
 		}
 	}
+	if strings.Contains(joined, "--user") {
+		t.Errorf("system-service wrap %q carries --user; want the system-bus spelling", joined)
+	}
+	// A per-user daemon service reaches only the user bus: its seats wrap
+	// with --user, on the same transient scope shape.
+	userGot := applySeatBudgetToCmdForBus([]string{"/bin/sh", "-c", "exit 0"}, "abc-123", b, true, seatbudget.PlacementSystemd, true)
+	userJoined := strings.Join(userGot, " ")
+	for _, want := range []string{"systemd-run", "--user", "--scope", "donmai-seat-abc-123.scope", "/bin/sh"} {
+		if !strings.Contains(userJoined, want) {
+			t.Errorf("user-bus wrapped command %q missing %q", userJoined, want)
+		}
+	}
+}
+
+// TestSeatBudgetShimCommandMatchesDirectWrap pins the F1 parity: the shim
+// launch path wraps its worker command with the same systemd-scope argv
+// the direct spawn path applies, and stamps the same enforced handle. A
+// divergence here is a seat that runs unconfined while its handle claims
+// a confinement it did not get (or vice versa).
+func TestSeatBudgetShimCommandMatchesDirectWrap(t *testing.T) {
+	b := seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: "enforced"}
+	want := applySeatBudgetToCmdForBus([]string{"/bin/worker", "agent", "run"}, "seat-shim-1", b, true, seatbudget.PlacementSystemd, false)
+	got := seatBudgetShimCommand([]string{"/bin/worker", "agent", "run"}, "seat-shim-1", b, true, seatbudget.PlacementSystemd, false)
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("shim command %q != direct wrap %q", strings.Join(got, " "), strings.Join(want, " "))
+	}
+	if !strings.Contains(strings.Join(got, " "), "donmai-seat-seat-shim-1.scope") {
+		t.Errorf("shim command %q missing the per-session scope", strings.Join(got, " "))
+	}
+	// Disabled budgets leave the shim command byte-identical.
+	plain := []string{"/bin/worker", "agent", "run"}
+	if got := seatBudgetShimCommand(plain, "s", seatbudget.Budget{}, false, seatbudget.PlacementSystemd, false); strings.Join(got, " ") != strings.Join(plain, " ") {
+		t.Errorf("disabled-budget shim wrap changed the command: %q", got)
+	}
 }
 
 // TestApplySeatBudgetToCmd_NoWrapWithoutPlacement pins the safe fallback:
@@ -149,11 +189,16 @@ func TestApplySeatBudgetToCmd_NoWrapWithoutPlacement(t *testing.T) {
 	if rep.Mode != "none" {
 		t.Errorf("report mode = %q; want none when no backend exists", rep.Mode)
 	}
-	// Cgroupfs placement without the systemd wrapper: env caps still ride,
-	// command unwrapped, report names cgroupfs.
+	// Cgroupfs placement without the systemd wrapper: the launcher performs
+	// no direct placement there, so the seat runs unwrapped and the report
+	// is mode none with the missing backend named — never enforced for a
+	// seat that runs unconfined.
+	if got := applySeatBudgetToCmd(cmd, "s1", b, true, seatbudget.PlacementCgroupFS); strings.Join(got, " ") != strings.Join(cmd, " ") {
+		t.Errorf("cgroupfs wrap changed the command: %q", got)
+	}
 	rep = sessionSeatBudgetReport(b, true, seatbudget.PlacementCgroupFS)
-	if rep.Mode != "enforced" || !strings.Contains(rep.Detail, "cgroupfs") {
-		t.Errorf("report = %+v; want enforced via cgroupfs", rep)
+	if rep.Mode != "none" || !strings.Contains(rep.Detail, "cgroupfs") {
+		t.Errorf("report = %+v; want none naming cgroupfs as unapplied", rep)
 	}
 	best := seatbudget.Budget{CPUs: 2, Mode: "best-effort"}
 	if got := applySeatBudgetToCmd(cmd, "s1", best, true, seatbudget.PlacementSystemd); strings.Join(got, " ") != strings.Join(cmd, " ") {
@@ -161,6 +206,33 @@ func TestApplySeatBudgetToCmd_NoWrapWithoutPlacement(t *testing.T) {
 	}
 	if got := applySeatBudgetToCmd(cmd, "s1", b, false, seatbudget.PlacementSystemd); strings.Join(got, " ") != strings.Join(cmd, " ") {
 		t.Errorf("disabled-budget wrap changed the command: %q", got)
+	}
+}
+
+// TestSessionSeatBudgetReport_CgroupfsIsUnconfined pins the honest-fallback
+// rule through the production report helper: a systemd-less Linux host
+// (cgroupfs placement) runs the seat WITHOUT confinement, so the handle
+// reports mode none with the missing backend named — never enforced for a
+// seat that runs unwrapped. The status route (seatBudgetReport) applies the
+// same downgrade; see TestServer_Status_SeatBudget_CgroupfsReportsNone.
+func TestSessionSeatBudgetReport_CgroupfsIsUnconfined(t *testing.T) {
+	b, ok := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		SeatBudget:            SeatBudget{CPUs: 2, MemoryMB: 1024, Mode: "enforced"},
+	}).seatBudgetForSpawn()
+	if !ok {
+		t.Fatal("seatBudgetForSpawn disabled; want the enforced share")
+	}
+	rep := sessionSeatBudgetReport(b, ok, seatbudget.PlacementCgroupFS)
+	if rep.Mode != "none" {
+		t.Errorf("report mode = %q; want none (no direct cgroupfs placement exists)", rep.Mode)
+	}
+	if !strings.Contains(rep.Detail, "cgroupfs") {
+		t.Errorf("report detail = %q; want the unapplied cgroupfs backend named", rep.Detail)
+	}
+	if rep.CPUs != 0 || rep.MemoryMB != 0 {
+		t.Errorf("report = %+v; want no values on an unconfined seat", rep)
 	}
 }
 

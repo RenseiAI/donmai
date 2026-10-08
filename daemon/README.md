@@ -242,10 +242,12 @@ Both also carry an additive `seatBudget` object (omitted by a daemon that
 predates it): `mode` is the posture each seat runs under (`enforced` |
 `best-effort` | `none`) with the values (`cpus`, `memoryMb`) and a short
 human `detail` line. On Linux an enforced seat is confined in a transient
-systemd scope (CPU set, CPU quota, memory max, IO weight) or, without
-systemd, direct cgroupfs limits; with no backend the seat runs unconfined
-and reports `none`. On macOS the seat carries worker-cap environment
-(`GOMAXPROCS` plus the build/test worker knobs) composed with the
+systemd scope (CPU set, CPU quota, memory max); without systemd there is
+no enforcement backend, so the seat runs unconfined and reports `none`
+with the backend named as the reason. On macOS the seat carries
+worker-cap environment (`GOMAXPROCS`, `MAKEFLAGS`,
+`CMAKE_BUILD_PARALLEL_LEVEL`, `NINJAFLAGS`, `CARGO_BUILD_JOBS`) composed
+with the
 installed process-priority mode. Configured per host under
 `capacity.seatBudget: { cpus, memoryMb, ioWeight, mode }` in `daemon.yaml`
 (`mode` is `auto` by default: enforced on Linux, best-effort elsewhere).

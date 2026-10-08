@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 )
 
 // TestServer_Status_SeatBudget drives the PRODUCTION status route
@@ -52,6 +53,41 @@ func TestServer_Status_SeatBudget(t *testing.T) {
 			t.Error("SeatBudget.Detail is empty; want the human line")
 		}
 	})
+}
+
+// TestServer_Status_SeatBudget_CgroupfsReportsNone pins the honest-fallback
+// rule on the PRODUCTION status route: an enforced budget on a host whose
+// placement cannot confine the seat reports mode none with the backend
+// named. This host (darwin CI, or any systemd-less Linux) is exactly that
+// host whenever the placement probe is not systemd: the test asserts the
+// downgrade shape — mode none plus a reason — without pinning which
+// backend this particular machine lacks.
+func TestServer_Status_SeatBudget_CgroupfsReportsNone(t *testing.T) {
+	// A systemd-less Linux host runs an enforced seat unconfined: the
+	// report must be mode none with the backend named. This host is
+	// darwin, so the suite pins the downgrade through the report helper
+	// with the systemd-less placement simulated by the cgroupfs branch:
+	// sessionSeatBudgetReport is the per-spawn half of the same rule, and
+	// this host's own placement is likewise not systemd.
+	if seatbudget.HostPlacement() == seatbudget.PlacementSystemd {
+		t.Skip("systemd host confines the seat; the none-downgrade needs a systemd-less host")
+	}
+	rep := sessionSeatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced}, true, seatbudget.PlacementCgroupFS)
+	if rep.Mode != "none" {
+		t.Errorf("SeatBudget.Mode = %q; want none (no systemd backend on this host)", rep.Mode)
+	}
+	if rep.Detail == "" {
+		t.Error("SeatBudget.Detail is empty; want the missing backend named")
+	}
+	if rep.CPUs != 0 || rep.MemoryMB != 0 {
+		t.Errorf("SeatBudget = %+v; want no values on an unconfined seat", rep)
+	}
+	// And the status half: this host's effective posture for an enforced
+	// budget is best-effort at most — never enforced without systemd.
+	status := seatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced})
+	if seatbudget.HostPlacement() != seatbudget.PlacementSystemd && status.Mode == string(seatbudget.ModeEnforced) {
+		t.Errorf("status mode = enforced on a systemd-less host; want the downgrade")
+	}
 }
 
 // TestPollItemToSessionDetail_SeatBudget pins the dispatch threading: the
