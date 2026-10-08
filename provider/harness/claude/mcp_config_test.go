@@ -67,7 +67,9 @@ func assertLiveGatewayConfig(t *testing.T, body []byte, tokenPath string) {
 			t.Fatalf("MCP config omitted %q: %s", want, body)
 		}
 	}
-	for _, forbidden := range []string{"Bearer spawn-token", tokenPath} {
+	// The helper text is the argv of the shell Claude starts for it, so the
+	// bearer must not appear in it at all, not even as a fallback literal.
+	for _, forbidden := range []string{"spawn-token", tokenPath} {
 		if strings.Contains(string(body), forbidden) {
 			t.Fatalf("MCP config baked %q instead of using the live helper: %s", forbidden, body)
 		}
