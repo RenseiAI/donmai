@@ -8,7 +8,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- Seat credentials are no longer passed on child process command lines. Fleet child workers receive the provisioning token through their environment, and the Claude MCP gateway header helper reads its fallback bearer from an owner-only file beside its config instead of carrying it in the helper text.
+- When control auth is enforced, the daemon's control API now requires the control token to read session detail (`GET /api/daemon/sessions/<id>`); credentials are redacted from responses to callers without it. A spawned worker reads its own session's detail with a per-session read credential (`DONMAI_SESSION_READ_TOKEN`) that names only that session and carries no operator privilege.
+
+### Chores
+
+- Deflake the repeated ring-miss attach test: each bounce now waits for the replacement host leg to bind before injecting the next fault.
 
 ## v0.72.66 — 2026-10-07
 
