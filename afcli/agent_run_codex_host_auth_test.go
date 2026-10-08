@@ -114,3 +114,25 @@ func TestAgentRunHintsThreadsCodexHostSessionAuth(t *testing.T) {
 		t.Fatal("zero-value ctor hints unexpectedly enable host-session auth")
 	}
 }
+
+func TestAgentRunHintsThreadsControlTokenPath(t *testing.T) {
+	t.Parallel()
+
+	detail := &daemon.SessionDetail{ControlTokenPath: "  /var/lib/host/control-token\n"}
+	hints := agentRunHints(detail)
+	if hints.ControlTokenPath != "/var/lib/host/control-token" {
+		t.Fatalf("agentRunHints ControlTokenPath = %q, want the trimmed stated path", hints.ControlTokenPath)
+	}
+	if got := piCtorOptions(hints).ControlTokenPath; got != "/var/lib/host/control-token" {
+		t.Fatalf("piCtorOptions ControlTokenPath = %q, want the stated path", got)
+	}
+	if got := piCtorOptions(agentRunCtorHints{}).ControlTokenPath; got != "" {
+		t.Fatalf("zero-value ctor hints state ControlTokenPath = %q, want empty", got)
+	}
+	if got := agentRunHints(nil).ControlTokenPath; got != "" {
+		t.Fatalf("nil detail hints state ControlTokenPath = %q, want empty", got)
+	}
+	if got := agentRunHints(&daemon.SessionDetail{}).ControlTokenPath; got != "" {
+		t.Fatalf("pathless detail hints state ControlTokenPath = %q, want empty", got)
+	}
+}

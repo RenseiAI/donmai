@@ -20,6 +20,18 @@
 // and a search over the whole disk is refused at the top instead of
 // walking it. home-minus-secrets is not implemented and refuses.
 //
+// Whatever the read scope, open reads included, a Spec denies the seat the
+// daemon's private state the composing binary names: DeniedPaths (such as
+// the daemon's control-token file) refuse every read — contents, metadata,
+// extended attributes, listings — and every write; DeniedListings (such as
+// the directory holding the token, which on a default host also holds the
+// per-session work areas) refuse a listing while staying traversable, so a
+// session working beneath one is unaffected. Both render after every
+// allow, so they win even inside the session's read allowlist, and the
+// resolver refuses a session path they would narrow. Each backend renders
+// them from the same resolved fields (Resolved.Denied and
+// Resolved.DeniedListings).
+//
 // A Confiner is the production spawn binding:
 //
 //	c, _ := confinement.New(confinement.Options{
@@ -83,8 +95,11 @@
 // leaves, protected paths, the workarea metadata, composer write denies)
 // is bound read-only over itself after the allows, readable and never
 // writable, with its ancestors inside the writable set anchored as mount
-// points no rename can move; and composer read denies are hidden behind an
-// empty placeholder wherever a bind would reveal them. A Landlock stage
+// points no rename can move; and composer read denies and the
+// daemon-private paths are hidden behind an empty placeholder wherever a
+// bind would reveal them. A daemon-private directory a bind reveals is
+// emptied with a tmpfs of its own before anything is bound beneath it, so
+// only the session's own paths beneath it show again. A Landlock stage
 // the harness process itself executes — RunLandlockStageFromEnv, first in
 // main — then grants writes on the writable set only and, under a read
 // scope, reads on the allowlist only, each rule naming exactly the path
@@ -114,7 +129,8 @@
 //
 // A hide deny must name a path that exists at spawn: a placeholder needs
 // something to mount over. A deny list for a secret not yet minted names
-// the directory it will be minted in.
+// the directory it will be minted in: a daemon-private directory, emptied,
+// hides everything later created there.
 //
 // The Linux backend leaves outbound TCP unfiltered and declares it
 // (loopback egress open): Landlock port rules carry no address, so

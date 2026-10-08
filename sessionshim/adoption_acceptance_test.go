@@ -238,6 +238,18 @@ func (f *shimFixture) adoptFromMax(t *testing.T, controllerID string, resumeFrom
 
 // exchange writes one line to the harness and waits for its answer, returning
 // the highest output sequence observed. It proves BOTH directions are live.
+//
+// It waits for the COMPLETE ack line through its terminator, not just the
+// token prefix: the harness answers with one `ack:<token>` line per input,
+// and that line's bytes can straddle two PTY reads under scheduling load.
+// Returning on the prefix would leave the line's trailing bytes unframed,
+// and a frame published from them afterwards legitimately advances the host
+// sequence — which reads as a phantom advance to any AtSeq-stability
+// assertion that follows. Waiting through the terminator (bare `\n`, or the
+// `\r\n` the line discipline's output processing produces) establishes
+// host quiescence instead: every byte the harness will ever write before
+// its next input has been framed, so back-to-back read-only inspects must
+// agree on AtSeq.
 func exchange(t *testing.T, c *Controller, token string) uint64 {
 	t.Helper()
 	if err := c.WriteInput([]byte(token + "\r")); err != nil {
@@ -260,7 +272,8 @@ func exchange(t *testing.T, c *Controller, token string) uint64 {
 				maxSeq = ev.Seq
 			}
 			seen.Write(ev.Data)
-			if strings.Contains(seen.String(), want) {
+			got := seen.String()
+			if strings.Contains(got, want+"\r\n") || strings.Contains(got, want+"\n") {
 				return maxSeq
 			}
 		case <-deadline:

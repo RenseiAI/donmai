@@ -2,6 +2,7 @@ package sanitize
 
 import (
 	"bytes"
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -478,11 +479,11 @@ func TestEscIntTransitions(t *testing.T) {
 // TestDCSTransitions exercises DCS header aborts, restarts, and overflow.
 func TestDCSTransitions(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"\x1b\x50\x1b7", "\x1b7"},           // DCS aborted by ESC restart -> DECSC passes
-		{"\x1b\x50\x18Z", "Z"},               // DCS aborted by CAN
-		{"\x1b\x50q~\x9c", "\x1b\x50q~\x9c"}, // Sixel terminated by C1 ST -> pass
-		{"\x1b\x90\x9c", ""},                 // empty C1 DCS terminated by C1 ST -> strip
-		{"\x1b\x50\x07~\x1b\\", ""},          // BEL in DCS header is malformed -> strip to ST
+		{"\x1b\x50\x1b7", "\x1b7"},             // DCS aborted by ESC restart -> DECSC passes
+		{"\x1b\x50\x18Z", "Z"},                 // DCS aborted by CAN
+		{"\x1b\x50q~\x9c", "\x1b\x50q~\x1b\\"}, // Sixel terminated by C1 ST -> pass, re-emitted with ESC \\
+		{"\x1b\x90\x9c", ""},                   // empty C1 DCS terminated by C1 ST -> strip
+		{"\x1b\x50\x07~\x1b\\", ""},            // BEL in DCS header is malformed -> strip to ST
 	}
 	for _, c := range cases {
 		if got := string(contiguous([]byte(c.in))); got != c.want {
@@ -547,5 +548,233 @@ func TestCorpusCoverageAllRows(t *testing.T) {
 		if !rows[r] {
 			t.Errorf("§9 row %q not covered by any corpus fixture", r)
 		}
+	}
+}
+
+// claudeIdleTitle is the exact OSC 0 a Claude Code REPL started with
+// `--name website-refactor` writes when it goes idle: "\x1b]0;" + U+2733 (✳,
+// UTF-8 E2 9C B3) + " website-refactor" + BEL. The middle byte of ✳ is 0x9C,
+// the value of the 8-bit C1 string terminator.
+const claudeIdleTitle = "\x1b]0;\xe2\x9c\xb3 website-refactor\x07"
+
+// TestStringBodyUTF8ContinuationIsNotST pins that a 0x9C byte INSIDE a
+// multibyte UTF-8 rune in a string body is payload, not an 8-bit ST. Treating
+// it as ST ended the title early, and the rest of the payload (" website-
+// refactor") fell back to ground and was rendered as text at the cursor. For an
+// interactive Claude Code session the cursor is parked in the prompt input, so
+// the session name appeared to be typed into the input box.
+func TestStringBodyUTF8ContinuationIsNotST(t *testing.T) {
+	cases := []struct {
+		name, in, want, title string
+	}{
+		{"claude-idle-title-bel", "\xe2\x9d\xaf " + claudeIdleTitle, "\xe2\x9d\xaf ", "\xe2\x9c\xb3 website-refactor"},
+		{"claude-idle-title-st", "\x1b]2;\xe2\x9c\xb3 name\x1b\\ok", "ok", "\xe2\x9c\xb3 name"},
+		{"c1-osc-title", "\x9d0;\xe2\x9c\xb3 name\x9cok", "ok", "\xe2\x9c\xb3 name"},
+		{"four-byte-rune", "\x1b]0;\xf0\x9f\x8c\x9c moon\x07ok", "ok", "\xf0\x9f\x8c\x9c moon"},
+		{"osc8-pass-intact", "\x1b]8;;https://x/\xe2\x9c\xb3\x1b\\t\x1b]8;;\x1b\\", "\x1b]8;;https://x/\xe2\x9c\xb3\x1b\\t\x1b]8;;\x1b\\", ""},
+		{"apc-strip-whole", "\x1b_\xe2\x9c\xb3 hidden\x1b\\ok", "ok", ""},
+		{"malformed-dcs-header-strip-whole", "\x1bP\xe2\x9c\xb3 hidden\x1b\\ok", "ok", ""},
+		{"lone-c1-st-still-terminates", "\x1b]0;name\x9cok", "ok", "name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for split := 0; split <= len(tc.in); split++ {
+				var title string
+				s := NewWithOptions(Options{OnTitle: func(tt string) { title = tt }})
+				got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+				if string(got) != tc.want {
+					t.Fatalf("split %d: got %q, want %q", split, got, tc.want)
+				}
+				if title != tc.title {
+					t.Fatalf("split %d: title chip %q, want %q", split, title, tc.title)
+				}
+			}
+		})
+	}
+}
+
+// TestStringBodyUTF8EncodedC1EndsString pins the conservative side of the
+// string-body UTF-8 rule: a C1 control encoded as UTF-8 (U+0080..U+009F, lead
+// byte 0xC2) is a control to a UTF-8 terminal, which leaves the string there.
+// The sanitizer must not keep treating the following bytes as inert payload, so
+// it strips the string and resumes in ground, where the rest is sanitized.
+func TestStringBodyUTF8EncodedC1EndsString(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// U+009C (C2 9C) ends an OSC 8 that would otherwise pass verbatim; the
+		// raw 8-bit CSI after it is parsed as a DSR and stripped.
+		{"\x1b]8;;x\xc2\x9c\x9b6nok", "ok"},
+		{"\x1b]0;t\xc2\x9cok", "ok"},
+		{"\x1b]0;t\xc2\x85ok", "ok"},
+		// A non-C1 two-byte rune (U+00A9) remains payload.
+		{"\x1b]0;\xc2\xa9 t\x07ok", "ok"},
+	}
+	for _, tc := range cases {
+		for split := 0; split <= len(tc.in); split++ {
+			s := New()
+			got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+			if string(got) != tc.want {
+				t.Fatalf("%q split %d: got %q, want %q", tc.in, split, got, tc.want)
+			}
+		}
+	}
+}
+
+// TestGroundUTF8EncodedC1Stripped pins that a C1 control encoded as UTF-8
+// (U+0080..U+009F, C2 80..C2 9F) is stripped in ground. A UTF-8 terminal
+// decodes U+009B as CSI and U+009D as OSC, so passing them re-enabled every
+// reply-triggering request the sanitizer strips in its ESC form: C2 9B 6n made
+// the viewer's terminal answer a cursor position report on its input.
+func TestGroundUTF8EncodedC1Stripped(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"\xc2\x9b6n", "6n"},                                     // CSI: DSR / CPR request
+		{"\xc2\x9bc", "c"},                                       // CSI: DA1 request
+		{"\xc2\x9b>c", ">c"},                                     // CSI: DA2 request
+		{"\xc2\x9b?2004$p", "?2004$p"},                           // CSI: DECRQM request
+		{"\xc2\x9d11;?\xc2\x9c", "11;?"},                         // OSC 11 colour query + ST
+		{"\xc2\x9d4;1;?\xc2\x9c", "4;1;?"},                       // OSC 4 palette query + ST
+		{"\xc2\x90$qm\xc2\x9c", "$qm"},                           // DCS DECRQSS + ST
+		{"a\xc2\x85b\xc2\x80c\xc2\x9fd", "abcd"},                 // NEL, PAD, APC
+		{"\xc2\xa0\xc2\xa9\xc3\x9c", "\xc2\xa0\xc2\xa9\xc3\x9c"}, // U+00A0, U+00A9, U+00DC are text
+	}
+	for _, tc := range cases {
+		for split := 0; split <= len(tc.in); split++ {
+			s := New()
+			got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+			if string(got) != tc.want {
+				t.Fatalf("%q split %d: got %q, want %q", tc.in, split, got, tc.want)
+			}
+		}
+	}
+}
+
+// TestPassedStringsUse7BitForms pins that a string the sanitizer passes is
+// re-emitted with ESC introducer and ESC '\\' terminator. A UTF-8 terminal does
+// not read a raw 0x9C as ST, so a passed OSC ending in 0x9C stayed open in the
+// terminal, swallowed the following text, and a '?' after it turned
+// "ESC]10;" into a foreground-colour query the terminal answered on input.
+func TestPassedStringsUse7BitForms(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"\x1b]10;\x9c?\x1b[m", "\x1b]10;\x1b\\?\x1b[m"},
+		{"\x1b]4;1;#cc0000\x9cok", "\x1b]4;1;#cc0000\x1b\\ok"},
+		{"\x1b]8;;https://x\x9clink\x1b]8;;\x9c", "\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\"},
+		{"\x9d8;;https://x\x9clink", "\x1b]8;;https://x\x1b\\link"},
+		{"\x9d8;;https://x\x07link", "\x1b]8;;https://x\x07link"},
+		{"\x90q#0~\x9c", "\x1bPq#0~\x1b\\"},
+		// 7-bit forms are unchanged.
+		{"\x1b]8;;https://x\x1b\\link", "\x1b]8;;https://x\x1b\\link"},
+		{"\x1bPq#0~\x1b\\", "\x1bPq#0~\x1b\\"},
+	}
+	for _, tc := range cases {
+		for split := 0; split <= len(tc.in); split++ {
+			s := New()
+			got := append(s.Write([]byte(tc.in[:split])), s.Write([]byte(tc.in[split:]))...)
+			if string(got) != tc.want {
+				t.Fatalf("%q split %d: got %q, want %q", tc.in, split, got, tc.want)
+			}
+		}
+	}
+}
+
+// claudeOSC52 is what a mouse-tracking REPL (Claude Code 2.1.294) wrote to its
+// terminal after a drag selection of "  Fable 5.1 · Claude Max", captured from
+// a PTY.
+const claudeOSC52 = "\x1b]52;c;ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA==\x07"
+
+// TestOnClipboardOffersSetsOnly pins the clipboard hook: a set is offered once
+// at every split offset and is still stripped from the stream, while queries,
+// clears, unknown targets, invalid base64, invalid UTF-8 and over-cap sets are
+// never offered.
+func TestOnClipboardOffersSetsOnly(t *testing.T) {
+	in := "a" + claudeOSC52 + "b"
+	for split := 0; split <= len(in); split++ {
+		var copies []string
+		s := NewWithOptions(Options{OnClipboard: func(text string) { copies = append(copies, text) }})
+		got := append(s.Write([]byte(in[:split])), s.Write([]byte(in[split:]))...)
+		if string(got) != "ab" {
+			t.Fatalf("split %d: stream %q, want %q", split, got, "ab")
+		}
+		if len(copies) != 1 || copies[0] != "  Fable 5.1 · Claude Max" {
+			t.Fatalf("split %d: copies %q", split, copies)
+		}
+	}
+
+	never := map[string]string{
+		"query":          "\x1b]52;c;?\x07",
+		"clear":          "\x1b]52;c;\x07",
+		"unknown target": "\x1b]52;z;aGk=\x07",
+		"invalid base64": "\x1b]52;c;not*base64\x07",
+		"not UTF-8":      "\x1b]52;c;//4=\x07",
+		"over hold cap":  "\x1b]52;c;" + strings.Repeat("QUFB", 2100) + "\x07",
+	}
+	for name, seq := range never {
+		var copies []string
+		s := NewWithOptions(Options{OnClipboard: func(text string) { copies = append(copies, text) }})
+		if got := string(s.Write([]byte(seq + "ok"))); got != "ok" || len(copies) != 0 {
+			t.Fatalf("%s: stream %q copies %q", name, got, copies)
+		}
+	}
+}
+
+// TestDecodeClipboardSetRemovesControls pins that a copied payload cannot carry
+// escape sequences or other controls into the clipboard.
+func TestDecodeClipboardSetRemovesControls(t *testing.T) {
+	text := "ls\t-l\r\n\x1b[31mred\x07\x00"
+	body := "52;c;" + base64.StdEncoding.EncodeToString([]byte(text))
+	got, ok := DecodeClipboardSet([]byte(body))
+	if !ok || got != "ls\t-l\r\n[31mred" {
+		t.Fatalf("got %q, %v", got, ok)
+	}
+}
+
+// TestClipboardSequenceRoundTrips pins the forwarding encoding: 7-bit ST, and
+// the sanitizer itself decodes it back to the same text.
+func TestClipboardSequenceRoundTrips(t *testing.T) {
+	seq := ClipboardSequence("  Fable 5.1 · Claude Max")
+	if string(seq) != "\x1b]52;c;ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA==\x1b\\" {
+		t.Fatalf("sequence %q", seq)
+	}
+	var copies []string
+	s := NewWithOptions(Options{OnClipboard: func(text string) { copies = append(copies, text) }})
+	if out := s.Write(seq); len(out) != 0 || len(copies) != 1 || copies[0] != "  Fable 5.1 · Claude Max" {
+		t.Fatalf("round trip: out %q copies %q", out, copies)
+	}
+}
+
+// TestCorpusClipboardHook checks every fixture that pins the OSC 52 clipboard
+// hook, contiguously and split at every offset, so all ports offer the same
+// texts for the same bytes.
+func TestCorpusClipboardHook(t *testing.T) {
+	entries, err := ConformanceCorpus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := 0
+	for _, e := range entries {
+		want, ok, err := e.ClipboardTexts()
+		if err != nil {
+			t.Fatalf("%s: %v", e.Name, err)
+		}
+		if !ok {
+			continue
+		}
+		pinned++
+		in, _ := e.InputBytes()
+		for split := 0; split <= len(in); split++ {
+			var got []string
+			s := NewWithOptions(Options{OnClipboard: func(text string) { got = append(got, text) }})
+			s.Write(in[:split])
+			s.Write(in[split:])
+			if len(got) != len(want) {
+				t.Fatalf("%s split %d: offered %q, want %q", e.Name, split, got, want)
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("%s split %d: offered %q, want %q", e.Name, split, got, want)
+				}
+			}
+		}
+	}
+	if pinned < 6 {
+		t.Fatalf("only %d corpus fixtures pin the clipboard hook, want at least 6", pinned)
 	}
 }

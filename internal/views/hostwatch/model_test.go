@@ -165,7 +165,7 @@ func TestModel_HeldSessionHasNoTailerActivityOrRunningClaim(t *testing.T) {
 		SessionID: "held-123", At: time.Now(), Event: agent.AssistantTextEvent{Text: "fabricated live activity"},
 	}})
 	out := m.render()
-	for _, want := range []string{"2 sessions", "held-123", "live-123", "held", "project a", "repo o/a"} {
+	for _, want := range []string{"2 sessions", "held-123", "live-123", "held", "awaiting local execution"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render missing %q:\n%s", want, out)
 		}

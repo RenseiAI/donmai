@@ -296,7 +296,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 				if i := strings.LastIndex(repo, "/"); i >= 0 {
 					id = repo[i+1:]
 				}
-				projects = append(projects, ProjectConfig{ID: id, Repository: repo, CloneStrategy: CloneShallow})
+				projects = append(projects, ProjectConfig{ID: id, Repository: repo})
 			}
 		}
 	}
@@ -310,7 +310,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			if i := strings.LastIndex(repoURL, "/"); i >= 0 {
 				id = repoURL[i+1:]
 			}
-			projects = append(projects, ProjectConfig{ID: id, Repository: repoURL, CloneStrategy: CloneShallow})
+			projects = append(projects, ProjectConfig{ID: id, Repository: repoURL})
 		}
 	}
 	// Standing consent, asked ONCE, at the only moment the machine owner is

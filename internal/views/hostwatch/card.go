@@ -14,18 +14,31 @@ import (
 	"github.com/RenseiAI/tui-components/theme"
 )
 
-// cardWidth is the target render width of one session card. Cards lay out
-// in a responsive grid: as many per row as the terminal width allows.
-const cardWidth = 44
+// Card geometry. Every card in the grid shares one outer width (derived
+// from the terminal width, never from its content) and one height, so the
+// cards of a row align and the grid's columns line up.
+const (
+	// minCardWidth is the narrowest full card in terminal cells, borders
+	// included. Below it the grid falls back to one line per session.
+	minCardWidth = 36
+	// cardGap is the blank column between neighbouring cards in a row.
+	cardGap = 1
+	// cardBodyRows is the fixed number of content rows in every card.
+	cardBodyRows = 5
+	// cardChrome is the horizontal cells a styled card spends on its frame:
+	// one border cell and one padding cell on each side.
+	cardChrome = 4
+	// maxActivityRunes bounds the activity text kept per card. Rendering
+	// truncates by terminal cells; this only caps memory per session.
+	maxActivityRunes = 240
+)
 
-// animFrames is the status-dot pulse animation (the FIG 2.0 pulsing dot
-// translated to a TUI frame swap). A running session cycles these; a
-// terminal/idle session shows a static glyph.
+// animFrames is the status-dot pulse animation. A running session cycles
+// these; a terminal or idle session shows a static glyph.
 var animFrames = []string{"●", "◉", "○", "◉"} // ● ◉ ○ ◉
 
-// statusColor maps a card's effective status to a theme status color. The
-// "health glow" of the marketing specimen becomes a colored status dot + a
-// colored left border bar. Colors are read from the theme exclusively.
+// statusColor maps a card's effective status to a theme status color.
+// Colors are read from the theme exclusively.
 func statusColor(t theme.Theme, card SessionCard) color.Color {
 	switch {
 	case card.isHeld():
@@ -44,223 +57,279 @@ func statusColor(t theme.Theme, card SessionCard) color.Color {
 	}
 }
 
-// renderCard renders a single session card: a colored status dot + issue
-// header, a labeled harness/model/provider/state line, a labeled metric
-// line (elapsed / tool-calls / cost / turns), a freshness line
-// (heartbeat / output / work) and a current-tool ticker. Every field is
-// named; missing data renders as "unknown" or "not reported", never an
-// invented running state or a zero. Colors are read from the theme
-// exclusively (no hardcoded hexes). frame drives the dot pulse; selected
-// draws a bright border. When plain is true, color and box drawing are
-// dropped for a pipe-/CI-friendly rendering. Layout only flows the lines;
-// parallel layout work owns the grid/split geometry.
-func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool, now time.Time) string {
-	dot := animFrames[0]
-	if card.isHeld() {
-		dot = "○"
-	}
-	if isLiveState(card.DaemonState) {
-		dot = animFrames[frame%len(animFrames)]
-	}
-
-	header := card.IssueIdentifier
-	if header == "" {
-		header = shortID(card.SessionID)
-	}
-	work := card.WorkType
-	if work == "" {
-		work = "unknown"
-	}
-
-	// Dispatch composition and observed serving identity are independent of
-	// the requested model and harness. Missing components stay explicit.
-	agentCard := "Agent card " + safeIdentityText(card.AgentCardName)
-	cardID := "Card ID " + safeIdentityText(card.AgentCardID)
-	modelIdentity := "Model identity " + safeIdentityText(card.ActualModel)
-	actualProvider := "Actual provider " + safeAxisText(card.ActualModelProvider)
-	modelVersion := "Model version " + safeIdentityText(card.ActualModelVersion)
-	modelAuthor := "Model author " + safeAxisText(card.ModelAuthor)
-	endpointOperator := "Endpoint operator " + safeAxisText(card.EndpointOperator)
-	endpointSurface := "Endpoint surface " + safeAxisText(card.modelProvider())
-	protocol := "Protocol " + safeAxisText(card.Protocol)
-	// Plain cards also reserve one physical row per identity component.
-	agentCard = truncateWidth(agentCard, cardWidth-2)
-	cardID = truncateWidth(cardID, cardWidth-2)
-	modelIdentity = truncateWidth(modelIdentity, cardWidth-2)
-	actualProvider = truncateWidth(actualProvider, cardWidth-2)
-	modelVersion = truncateWidth(modelVersion, cardWidth-2)
-	modelAuthor = truncateWidth(modelAuthor, cardWidth-2)
-	endpointOperator = truncateWidth(endpointOperator, cardWidth-2)
-	endpointSurface = truncateWidth(endpointSurface, cardWidth-2)
-	protocol = truncateWidth(protocol, cardWidth-2)
-	identity := fmt.Sprintf("harness %s · model %s",
-		unknownIfEmpty(card.Harness),
-		unknownIfEmpty(card.Model))
-	state := "state " + card.displayState()
-	// Scope stays visible inside the card. Appending it after the identity
-	// fields would truncate it at ordinary card widths.
-	scope := ""
-	if card.ProjectName != "" {
-		scope = "project " + card.ProjectName
-	}
-	if card.IssueIdentifier != "" {
-		if scope != "" {
-			scope += " · "
-		}
-		scope += "issue " + card.IssueIdentifier
-	}
-
-	metrics := fmt.Sprintf("elapsed %s · tools %s",
-		elapsedStr(card, now),
-		countStr(card.Observed, card.ToolCalls))
-	cost := fmt.Sprintf("cost %s · turns %s",
-		costStr(card),
-		countStr(card.TurnsReported, card.NumTurns))
-
-	fresh := fmt.Sprintf("heartbeat %s · output %s",
-		freshStr(card.heartbeatTime(), now),
-		freshStr(card.LastOutputAt, now))
-	workFresh := "work " + freshStr(card.LastWorkAt, now)
-
-	ticker := card.LastActivity
-	if ticker == "" {
-		ticker = card.LastTool
-	}
-	if card.isHeld() {
-		ticker = ""
-	} else if ticker == "" {
-		ticker = card.CurrentStep
-	}
-	ticker = truncateRunes(ticker, cardWidth-2)
-
-	if plain {
-		var b strings.Builder
-		fmt.Fprintf(&b, "%s %s  %s\n", dot, header, work)
-		if scope != "" {
-			fmt.Fprintf(&b, "  %s\n", scope)
-		}
-		fmt.Fprintf(&b, "  %s\n", identity)
-		fmt.Fprintf(&b, "  %s\n", state)
-		if card.isHeld() {
-			for _, detail := range strings.Split(heldDetails(card), "\n") {
-				fmt.Fprintf(&b, "  %s\n", detail)
-			}
-		} else {
-			fmt.Fprintf(&b, "  %s\n", metrics)
-			fmt.Fprintf(&b, "  %s\n", cost)
-			fmt.Fprintf(&b, "  %s\n", fresh)
-			fmt.Fprintf(&b, "  %s\n", workFresh)
-		}
-		for _, line := range []string{modelAuthor, endpointSurface, endpointOperator, protocol, actualProvider, modelIdentity, modelVersion, agentCard, cardID} {
-			fmt.Fprintf(&b, "  %s\n", line)
-		}
-		if ticker != "" {
-			fmt.Fprintf(&b, "  %s\n", ticker)
-		}
-		return strings.TrimRight(b.String(), "\n")
-	}
-
-	// Budget the body to the inner content width (cardWidth minus the
-	// left border + padding, or the full ring for selected cards) using
-	// display widths, so CJK content truncates inside the border instead
-	// of overflowing it. The card field list is unchanged — only the
-	// widths are enforced.
-	inner := cardWidth - 2
-	if selected {
-		inner = cardWidth - 4
-	}
-	header = truncateWidth(header, inner-4)
-	work = truncateWidth(work, inner-4)
-	agentCard = truncateWidth(agentCard, inner)
-	cardID = truncateWidth(cardID, inner)
-	modelIdentity = truncateWidth(modelIdentity, inner)
-	actualProvider = truncateWidth(actualProvider, inner)
-	modelVersion = truncateWidth(modelVersion, inner)
-	modelAuthor = truncateWidth(modelAuthor, inner)
-	endpointSurface = truncateWidth(endpointSurface, inner)
-	identity = truncateWidth(identity, inner)
-	state = truncateWidth(state, inner)
-	scope = truncateWidth(scope, inner)
-	// Give tool activity a full metric row instead of growing the card.
-	// Elapsed time shares the work-freshness row in the styled view.
-	metrics = "tools " + countStr(card.Observed, card.ToolCalls)
-	if ticker != "" {
-		metrics += " · " + ticker
-	}
-	workFresh = "elapsed " + elapsedStr(card, now) + " · " + workFresh
-	metrics = truncateWidth(metrics, inner)
-	cost = truncateWidth(cost, inner)
-	fresh = truncateWidth(fresh, inner)
-	workFresh = truncateWidth(workFresh, inner)
-
-	sc := statusColor(t, card)
-	dotStyle := lipgloss.NewStyle().Foreground(sc)
-	headStyle := lipgloss.NewStyle().Bold(true).Foreground(t.TextPrimary)
-	workStyle := lipgloss.NewStyle().Foreground(t.TextSecondary)
-	chipStyle := lipgloss.NewStyle().Foreground(t.TextSecondary)
-	metricStyle := lipgloss.NewStyle().Foreground(t.TextPrimary)
-
-	lines := []string{
-		dotStyle.Render(dot) + " " + headStyle.Render(header) + "  " + workStyle.Render(work),
-	}
-	if scope != "" {
-		lines = append(lines, chipStyle.Render(scope))
-	}
-	lines = append(lines, chipStyle.Render(identity), chipStyle.Render(state))
-	if card.isHeld() {
-		for _, detail := range strings.Split(heldDetails(card), "\n") {
-			lines = append(lines, chipStyle.Render(truncateWidth(detail, inner)))
-		}
-	} else {
-		lines = append(lines, metricStyle.Render(metrics), metricStyle.Render(cost),
-			chipStyle.Render(fresh), chipStyle.Render(workFresh))
-	}
-	// Keep the admitted axes distinct while fitting the existing split pane:
-	// the model's author/operator and the endpoint surface/protocol each share
-	// one row. Plain output retains the full labels on individual rows.
-	lines = append(lines,
-		chipStyle.Render(truncateWidth(modelAuthor+" · operator "+safeAxisText(card.EndpointOperator), inner)),
-		chipStyle.Render(truncateWidth(endpointSurface+" · "+safeAxisText(card.Protocol), inner)),
-		chipStyle.Render(actualProvider), chipStyle.Render(modelIdentity), chipStyle.Render(modelVersion),
-		chipStyle.Render(agentCard), chipStyle.Render(cardID))
-
-	body := lipgloss.JoinVertical(lipgloss.Left, lines...)
-
-	borderColor := t.SurfaceBorder
-	if selected {
-		borderColor = t.SurfaceBorderBright
-	}
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder(), false, false, false, true).
-		BorderForeground(sc).
-		PaddingLeft(1).
-		Width(cardWidth)
-	// Selected cards get a full bright border ring for affordance.
-	if selected {
-		box = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(borderColor).
-			Padding(0, 1).
-			Width(cardWidth)
-	}
-	return box.Render(body)
+// segment is one styled run of a card row. Rows are composed from
+// segments, then fitted to the row's cell budget as a whole, so the
+// lowest-priority text (always last) is what an ellipsis replaces.
+type segment struct {
+	text  string
+	style lipgloss.Style
 }
 
-func heldDetails(card SessionCard) string {
-	var parts []string
-	if card.ProjectName != "" {
-		parts = append(parts, "project "+safeIdentityText(card.ProjectName))
+func joinSegments(segs []segment, plain bool) string {
+	var b strings.Builder
+	for _, s := range segs {
+		if s.text == "" {
+			continue
+		}
+		if plain {
+			b.WriteString(s.text)
+		} else {
+			b.WriteString(s.style.Render(s.text))
+		}
 	}
-	if card.Repository != "" {
-		parts = append(parts, "repo "+safeIdentityText(card.Repository))
+	return b.String()
+}
+
+// renderCard renders one session card exactly width cells wide.
+//
+// Rows, in a fixed order every card shares:
+//
+//  1. selection marker, status dot, issue id and title
+//  2. project (repository) and work type
+//  3. model (with the observed serving model when it differs) and harness
+//  4. state, elapsed time, and turns / cost when the harness reported them
+//  5. age of the last activity and what it was
+//
+// Values are bare; a label appears only where a bare value would be
+// ambiguous ("elapsed unknown", "harness unknown"). Missing data stays
+// unknown — it is never rendered as zero or as an invented default.
+// Selection never changes geometry: every card carries the same one-cell
+// frame and reserves the padding cell left of its first row for a marker.
+// The selected card switches to a heavy frame in the bright border color
+// and shows ▸ in that cell, so selection reads without color too.
+//
+// Plain mode drops color and the frame; rows are bounded by width but not
+// padded, and the selection marker is ">".
+func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool, now time.Time, width int) string {
+	if plain {
+		marker := "  "
+		if selected {
+			marker = "> "
+		}
+		rows := cardRows(t, card, frame, true, now, width-len(marker))
+		for i := range rows {
+			lead := "  "
+			if i == 0 {
+				lead = marker
+			}
+			rows[i] = truncateWidth(lead+rows[i], width)
+		}
+		return strings.Join(rows, "\n")
 	}
-	if card.AcceptedAt != "" {
-		parts = append(parts, "accepted "+safeIdentityText(card.AcceptedAt))
+	inner := width - cardChrome
+	if inner < 1 {
+		inner = 1
 	}
-	if len(parts) == 0 {
-		return "awaiting local execution"
+	rows := cardRows(t, card, frame, false, now, inner)
+	border := lipgloss.RoundedBorder()
+	borderColor := t.SurfaceBorder
+	marker := " "
+	if selected {
+		border = lipgloss.ThickBorder()
+		borderColor = t.SurfaceBorderBright
+		marker = lipgloss.NewStyle().Bold(true).Foreground(t.Accent).Render("▸")
 	}
-	return strings.Join(parts, "\n")
+	bs := lipgloss.NewStyle().Foreground(borderColor)
+	out := make([]string, 0, len(rows)+2)
+	out = append(out, bs.Render(border.TopLeft+strings.Repeat(border.Top, inner+2)+border.TopRight))
+	for i, row := range rows {
+		lead := " "
+		if i == 0 {
+			lead = marker
+		}
+		out = append(out, bs.Render(border.Left)+lead+fitCells(row, inner)+" "+bs.Render(border.Right))
+	}
+	out = append(out, bs.Render(border.BottomLeft+strings.Repeat(border.Bottom, inner+2)+border.BottomRight))
+	return strings.Join(out, "\n")
+}
+
+// cardHeight is the number of terminal rows every card occupies.
+func cardHeight(plain bool) int {
+	if plain {
+		return cardBodyRows
+	}
+	return cardBodyRows + 2
+}
+
+// cardRows returns the card's content rows (always cardBodyRows of them),
+// each composed and truncated to at most inner cells. Plain rows after the
+// first are indented to line up under the issue id.
+func cardRows(t theme.Theme, card SessionCard, frame int, plain bool, now time.Time, inner int) []string {
+	sc := statusColor(t, card)
+	primary := lipgloss.NewStyle().Foreground(t.TextPrimary)
+	secondary := lipgloss.NewStyle().Foreground(t.TextSecondary)
+	tertiary := lipgloss.NewStyle().Foreground(t.TextTertiary)
+	state := lipgloss.NewStyle().Foreground(sc)
+
+	indent := ""
+	if plain {
+		indent = "  "
+	}
+
+	identity := []segment{
+		{card.statusDot(frame), lipgloss.NewStyle().Foreground(sc)},
+		{" ", primary},
+		{card.displayID(), lipgloss.NewStyle().Bold(true).Foreground(t.TextPrimary)},
+	}
+	if title := card.title(); title != "" {
+		identity = append(identity, segment{"  " + title, secondary})
+	}
+
+	var context, model, status, activity []segment
+	if card.isHeld() {
+		context = []segment{{indent + card.repoName(), secondary}}
+		model = []segment{{indent + "accepted " + safeIdentityText(card.AcceptedAt), tertiary}}
+		status = []segment{{indent + "held", state}, {" " + card.elapsedText(now), primary}}
+		activity = []segment{{indent + "awaiting local execution", tertiary}}
+	} else {
+		context = []segment{{indent + card.repoName() + " · " + labelIfUnknown(card.WorkType, "work type"), secondary}}
+		model = []segment{{indent + card.modelText(inner-len(indent)), secondary}}
+		status = []segment{{indent + card.displayState(), state}, {" " + card.elapsedText(now), primary}}
+		if card.TurnsReported {
+			status = append(status, segment{fmt.Sprintf(" · %d turns", card.NumTurns), primary})
+		}
+		if card.CostReported {
+			status = append(status, segment{" · " + costStr(card), primary})
+		}
+		if card.Errored {
+			status = append(status, segment{" · errored", lipgloss.NewStyle().Foreground(t.StatusError)})
+		}
+		activity = card.activitySegments(now, indent, primary, tertiary)
+	}
+
+	rows := [][]segment{identity, context, model, status, activity}
+	out := make([]string, len(rows))
+	for i, segs := range rows {
+		out[i] = truncateWidth(joinSegments(segs, plain), inner)
+	}
+	return out
+}
+
+// activitySegments renders the last-activity row: how long ago the session
+// last produced output or work, then what that was. Either part may be
+// absent; with neither, the row says so instead of implying idleness.
+func (c SessionCard) activitySegments(now time.Time, indent string, primary, tertiary lipgloss.Style) []segment {
+	text := c.activityText()
+	last := c.lastActivityAt()
+	switch {
+	case !last.IsZero() && text != "":
+		return []segment{{indent + freshStr(last, now), primary}, {" · " + text, tertiary}}
+	case !last.IsZero():
+		return []segment{{indent + freshStr(last, now), primary}}
+	case text != "":
+		return []segment{{indent + text, tertiary}}
+	default:
+		return []segment{{indent + "activity not reported", tertiary}}
+	}
+}
+
+// activityText is the most specific description of the session's latest
+// activity: folded stream activity, else the last tool, else the runner's
+// current step.
+func (c SessionCard) activityText() string {
+	for _, s := range []string{c.LastActivity, c.LastTool, c.CurrentStep} {
+		if clean := cleanText(s); clean != "" {
+			return clean
+		}
+	}
+	return ""
+}
+
+// lastActivityAt is the freshest observed output or work time. Zero means
+// neither has been observed.
+func (c SessionCard) lastActivityAt() time.Time {
+	if c.LastWorkAt.After(c.LastOutputAt) {
+		return c.LastWorkAt
+	}
+	return c.LastOutputAt
+}
+
+// modelText renders "<model> · <harness>" within budget cells, keeping the
+// harness whole and shortening the model first. When the observed serving
+// model differs from the requested one, both show: "<requested> → <observed>".
+func (c SessionCard) modelText(budget int) string {
+	harness := labelIfUnknown(c.Harness, "harness")
+	model := labelIfUnknown(c.Model, "model")
+	// The observed serving model wins when the harness reported one. A
+	// dated snapshot of the requested alias simply replaces it; a different
+	// model (a fallback) shows as "<requested> → <observed>".
+	if observed := cleanText(c.ActualModel); observed != "" {
+		if requested := cleanText(c.Model); requested == "" || strings.HasPrefix(observed, requested) {
+			model = observed
+		} else {
+			model = requested + " → " + observed
+		}
+	}
+	tail := " · " + harness
+	if room := budget - lipgloss.Width(tail); room > 0 && lipgloss.Width(model) > room {
+		model = truncateWidth(model, room)
+	}
+	return model + tail
+}
+
+// displayID is the card's identifier: the issue identifier when known,
+// else a short session id.
+func (c SessionCard) displayID() string {
+	if id := cleanText(c.IssueIdentifier); id != "" {
+		return id
+	}
+	return shortID(cleanText(c.SessionID))
+}
+
+// title is the sanitized work-item title, or "" when none was reported.
+func (c SessionCard) title() string {
+	return cleanText(c.IssueTitle)
+}
+
+// repoName is the project context a card shows: the repository's short
+// name (the scope the dashboard filters on), else the configured project
+// identifier, else an explicit unknown.
+func (c SessionCard) repoName() string {
+	if name := repoShortName(c.Repository); name != "" {
+		return name
+	}
+	return labelIfUnknown(c.ProjectName, "project")
+}
+
+// repoShortName returns the last path segment of a repository URL or slug
+// without a trailing ".git", or "" when there is none.
+func repoShortName(repo string) string {
+	repo = strings.TrimRight(cleanText(repo), "/")
+	if i := strings.LastIndexAny(repo, "/:"); i >= 0 {
+		repo = repo[i+1:]
+	}
+	return strings.TrimSuffix(repo, ".git")
+}
+
+// statusDot is the pulsing status glyph: animated while live, a hollow
+// glyph for held rows, static otherwise.
+func (c SessionCard) statusDot(frame int) string {
+	switch {
+	case c.isHeld():
+		return "○"
+	case isLiveState(c.DaemonState):
+		return animFrames[frame%len(animFrames)]
+	default:
+		return animFrames[0]
+	}
+}
+
+// elapsedText is the session age, labeled only when unknown.
+func (c SessionCard) elapsedText(now time.Time) string {
+	e := elapsedStr(c, now)
+	if e == "unknown" {
+		return "elapsed unknown"
+	}
+	return e
+}
+
+// labelIfUnknown returns the cleaned value, or "<label> unknown" when it is
+// absent: a bare "unknown" would not say which field is missing.
+func labelIfUnknown(value, label string) string {
+	if clean := cleanText(value); clean != "" {
+		return clean
+	}
+	return label + " unknown"
 }
 
 func (c SessionCard) isHeld() bool {
@@ -272,44 +341,9 @@ func (c SessionCard) displayState() string {
 		return "held"
 	}
 	if c.DaemonState == "" {
-		return "unknown"
+		return "state unknown"
 	}
-	return c.DaemonState
-}
-
-// roleBadge derives a short role label from the work type, falling back to
-// the current step. Matches the specimen's role badge.
-func (c SessionCard) roleBadge() string {
-	switch strings.ToLower(c.WorkType) {
-	case "development", "develop":
-		return "impl"
-	case "qa", "review", "acceptance":
-		return "review"
-	case "research", "backlog-writer":
-		return "planner"
-	case "kg-extraction":
-		return "kg"
-	case "":
-		if c.CurrentStep != "" {
-			return c.CurrentStep
-		}
-		return "agent"
-	default:
-		return c.WorkType
-	}
-}
-
-// ageSeconds returns the session age in whole seconds from StartedAt.
-func (c SessionCard) ageSeconds(now time.Time) int {
-	if c.StartedAtUnixMs <= 0 {
-		return 0
-	}
-	start := time.UnixMilli(c.StartedAtUnixMs)
-	d := now.Sub(start)
-	if d < 0 {
-		return 0
-	}
-	return int(d.Seconds())
+	return cleanText(c.DaemonState)
 }
 
 // modelProvider returns the configured endpoint surface only. The older
@@ -318,8 +352,7 @@ func (c SessionCard) modelProvider() string {
 	return c.ModelProvider
 }
 
-// heartbeatTime returns the freshest heartbeat observation: live tail
-// freshness never exists (heartbeats are not tailed), so the persisted
+// heartbeatTime returns the freshest heartbeat observation: the persisted
 // runner heartbeat snapshot is the only heartbeat signal. Zero means the
 // runner never reported one.
 func (c SessionCard) heartbeatTime() time.Time {
@@ -327,6 +360,18 @@ func (c SessionCard) heartbeatTime() time.Time {
 		return time.Time{}
 	}
 	return time.UnixMilli(c.LastHeartbeatUnixMs)
+}
+
+// startTime is when the session started: the runner's recorded start, else
+// the daemon's admission time. Zero when neither is known.
+func (c SessionCard) startTime() time.Time {
+	if c.StartedAtUnixMs > 0 {
+		return time.UnixMilli(c.StartedAtUnixMs)
+	}
+	if accepted, err := time.Parse(time.RFC3339, strings.TrimSpace(c.AcceptedAt)); err == nil {
+		return accepted
+	}
+	return time.Time{}
 }
 
 // unknownIfEmpty renders an absent display field as unknown instead of an
@@ -338,13 +383,14 @@ func unknownIfEmpty(s string) string {
 	return s
 }
 
-// elapsedStr renders the session age, or unknown when the start time was
-// never reported (never a zero duration).
+// elapsedStr renders the session age, or unknown when neither the runner's
+// start nor the daemon's admission time was reported (never a zero
+// duration).
 func elapsedStr(card SessionCard, now time.Time) string {
-	if card.StartedAtUnixMs <= 0 {
+	start := card.startTime()
+	if start.IsZero() {
 		return "unknown"
 	}
-	start := time.UnixMilli(card.StartedAtUnixMs)
 	d := now.Sub(start)
 	if d < 0 {
 		return "unknown"
@@ -353,8 +399,7 @@ func elapsedStr(card SessionCard, now time.Time) string {
 }
 
 // countStr renders a cumulative count, or "not reported" until its source
-// has been observed: tool calls fold from the tail (Observed), cost/turns
-// need separate native observations. A reported zero is distinct from absent.
+// has been observed. A reported zero is distinct from absent.
 func countStr(reported bool, n int) string {
 	if !reported {
 		return "not reported"
@@ -375,8 +420,7 @@ func costStr(card SessionCard) string {
 }
 
 // freshStr renders one freshness timestamp as a relative age, or "never"
-// when that signal has never been observed live. Replayed history never
-// advances these timestamps (see foldMetrics), so "never" stays honest.
+// when that signal has never been observed.
 func freshStr(ts time.Time, now time.Time) string {
 	if ts.IsZero() {
 		return "never"
@@ -399,16 +443,18 @@ func isLiveState(s string) bool {
 	}
 }
 
-// shortID returns the first 8 chars of an id for compact display.
+// shortID returns the first 8 runes of an id for compact display.
 func shortID(id string) string {
-	if len(id) <= 8 {
+	r := []rune(id)
+	if len(r) <= 8 {
 		return id
 	}
-	return id[:8]
+	return string(r[:8])
 }
 
 // truncateRunes shortens s to at most n runes, appending an ellipsis when
-// truncated. n<=0 returns "".
+// truncated. n<=0 returns "". It bounds stored text; display budgets use
+// truncateWidth, which counts terminal cells.
 func truncateRunes(s string, n int) string {
 	if n <= 0 {
 		return ""
@@ -423,21 +469,52 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// safeIdentityText removes native VT/OSC/CSI sequences and control characters
-// before row-width budgeting. Preserve printable Unicode; identity is data,
-// never terminal instructions. Plain rendering receives the same protection.
-func safeIdentityText(s string) string {
+// truncateWidth shortens s to at most n terminal cells, appending an
+// ellipsis when truncated. It measures grapheme clusters (wide CJK, emoji
+// with modifiers or joiners) and skips ANSI sequences, so styled text keeps
+// its escapes and the result always fits its budget. n<=0 returns "".
+func truncateWidth(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(s) <= n {
+		return s
+	}
+	return ansi.Truncate(s, n, "…")
+}
+
+// fitCells truncates s to n cells and pads it with spaces to exactly n, so
+// a row of fixed-width cells stays aligned whatever its content.
+func fitCells(s string, n int) string {
+	s = truncateWidth(s, n)
+	if pad := n - ansi.StringWidth(s); pad > 0 {
+		s += strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+// cleanText strips terminal escape sequences and control characters and
+// collapses whitespace. Display values are data, never terminal
+// instructions; a newline or tab inside one would also break row geometry.
+func cleanText(s string) string {
 	clean := strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
-			return -1
+			return ' '
 		}
 		return r
 	}, ansi.Strip(s))
-	return unknownIfEmpty(clean)
+	return collapseWS(clean)
 }
 
-// safeAxisText accepts only compact identifiers on the new display axes.
-// A malformed value cannot turn the card into a URL or credential display.
+// safeIdentityText sanitizes an identity value for display, rendering an
+// absent one as unknown. Printable Unicode is preserved.
+func safeIdentityText(s string) string {
+	return unknownIfEmpty(cleanText(s))
+}
+
+// safeAxisText accepts only compact identifiers on the configured display
+// axes. A malformed value cannot turn the view into a URL or credential
+// display.
 func safeAxisText(s string) string {
 	s = safeIdentityText(s)
 	if len(s) == 0 || len(s) > 64 {
