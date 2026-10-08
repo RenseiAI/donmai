@@ -1,0 +1,72 @@
+name: upgrade-acceptance
+
+# Container upgrade acceptance for headless session-shim adoption.
+#
+# Runs the N → N+1 live-seat upgrade inside a Linux container with a systemd
+# user manager and delegated cgroup v2 (upgradeacceptance/container/).
+# On current main the acceptance case is RED (the seat dies on upgrade —
+# headless shim launch is off); the job records that cause and fails. It
+# goes green once the adoption slices land.
+#
+# This job never runs on the release-train host: it builds and runs its own
+# container on the CI runner.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "upgradeacceptance/**"
+      - ".github/workflows/upgrade-acceptance.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "upgradeacceptance/**"
+      - ".github/workflows/upgrade-acceptance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container-upgrade:
+    name: container upgrade (systemd user manager, delegated cgroup v2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: In-repo harness gates
+        run: |
+          set -o pipefail
+          GOWORK=off go test -race -count=1 ./upgradeacceptance/... 2>&1 | tail -5
+          GOWORK=off go vet ./upgradeacceptance/...
+
+      - name: Lint the new package
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.11.4
+          args: --only upgradeacceptance/...
+
+      - name: Build the acceptance image
+        run: |
+          docker build -f upgradeacceptance/container/Containerfile -t donmai-upgrade-acceptance .
+
+      - name: Run the N to N+1 upgrade flow
+        run: |
+          docker run --rm --privileged \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --tmpfs /run --tmpfs /run/lock \
+            -e ACCEPTANCE_BASE_REV=HEAD~1 \
+            donmai-upgrade-acceptance \
+            su acceptance -c 'bash /src/upgradeacceptance/container/upgrade-acceptance.sh'
+
+      - name: Type-check build-tag-gated tests
+        run: make test-tagged

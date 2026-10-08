@@ -1,0 +1,51 @@
+# Upgrade-acceptance container: a Linux image with a systemd user manager
+# and delegated cgroup v2 for the N → N+1 daemon upgrade flow.
+#
+# BUILD CONTEXT: the donmai repo root (this file lives in
+# upgradeacceptance/container/ but builds from the module root so
+# `go build ./cmd/donmai` sees the whole module).
+#
+#   docker build -f upgradeacceptance/container/Containerfile -t donmai-upgrade-acceptance .
+#
+# The image ships the repo at /src plus a Go toolchain, systemd, and the
+# user-manager prerequisites. The CI job (upgrade-acceptance.yml) starts it
+# privileged with a delegated cgroup hierarchy, builds artifacts N and N+1
+# from two revisions inside the container, installs N as a user service from
+# the generated unit, and runs upgrade-acceptance.sh.
+#
+# The container never runs on the release-train host: only CI (and an
+# operator's workstation) builds and runs it.
+
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl git golang-go systemd systemd-sysv dbus nodejs npm sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# The acceptance user: the flow installs N as a USER service, so it needs a
+# lingering user with its own manager. Created at build; lingering is
+# enabled at container start (loginctl enable-linger) once /run/dbus and
+# the delegated hierarchy exist.
+RUN useradd -m -s /bin/bash acceptance \
+    && echo "acceptance ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/acceptance \
+    && chmod 0440 /etc/sudoers.d/acceptance
+
+# systemd user-manager prerequisites inside a container: a delegated cgroup
+# v2 hierarchy and D-Bus. The entrypoint mounts what the runtime allows and
+# execs systemd as PID 1; the CI job runs the container privileged with
+# `-v /sys/fs/cgroup:/sys/fs/cgroup:rw` so delegation sticks.
+STOPSIGNAL SIGRTMIN+3
+
+COPY upgradeacceptance/container/entrypoint.sh /usr/local/bin/upgrade-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/upgrade-entrypoint.sh
+
+WORKDIR /src
+COPY . /src
+
+USER acceptance
+RUN go version && go env GOMODCACHE
+
+USER root
+ENTRYPOINT ["/usr/local/bin/upgrade-entrypoint.sh"]
