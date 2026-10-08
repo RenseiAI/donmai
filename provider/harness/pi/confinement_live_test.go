@@ -26,6 +26,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/harnessstate"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // This file is the Done-when evidence: tests that drive pi through the
@@ -196,8 +197,13 @@ func gitInit(t *testing.T, dir string) {
 
 // spec returns the session spec for the world's mutable leaf. The sandbox
 // posture is the authority posture the runner binds alongside any declared
-// repository authority, so an authority-bearing spec passes admission the
-// same way a runner-produced one does.
+// repository authority (runner ReconcileRepositorySandbox forces
+// workspace-write sandboxing once a repository is declared), so an
+// authority-bearing spec passes admission the same way a runner-produced
+// one does. The posture assertion below pins the fixture to that
+// runner-owned value: if the runner's negotiation changes the level it
+// binds, admission refuses this spec and the test fails instead of
+// silently proving a posture production no longer binds.
 func (w liveWorld) spec() agent.Spec {
 	return agent.Spec{
 		SessionName: "live", Cwd: w.mut, Prompt: "probe",
@@ -206,7 +212,13 @@ func (w liveWorld) spec() agent.Spec {
 }
 
 // authority is a declared repository authority over the world: the mutable
-// leaf writable, the sibling read-only.
+// leaf writable, the sibling read-only. The protocol and enforcement name
+// the exact runner-owned constants the executor gate requires
+// (executorAttestsSiblingContext): if the runner's negotiation changes the
+// enforcement it binds, admission refuses specs carrying the old string
+// and this test fails instead of proving a stale posture. The assertion
+// below pins the fixture literals to those constants so the drift breaks
+// at the assertion with the constant named, before any spawn runs.
 func (w liveWorld) authority() *agent.RepositoryAuthorityPolicy {
 	return &agent.RepositoryAuthorityPolicy{
 		Protocol:      "session-root-v1",
@@ -215,6 +227,27 @@ func (w liveWorld) authority() *agent.RepositoryAuthorityPolicy {
 		MutablePaths:  []string{w.mut},
 		ReadOnlyPaths: []string{w.ro},
 		Enforcement:   "isolated-read-only-v1",
+	}
+}
+
+// assertLiveAuthorityPosture pins the fixture literals above to the
+// runner-owned negotiation they mirror: the sandbox posture
+// ReconcileRepositorySandbox binds for a declared repository, and the
+// protocol/enforcement executorAttestsSiblingContext requires. A change on
+// the runner side breaks here with the constant named, instead of the
+// live test silently proving a posture production no longer binds.
+func assertLiveAuthorityPosture(t *testing.T, w liveWorld) {
+	t.Helper()
+	spec := w.spec()
+	authority := w.authority()
+	if !spec.SandboxEnabled || spec.SandboxLevel != agent.SandboxWorkspaceWrite {
+		t.Fatalf("live fixture sandbox posture = (%v, %q), want (true, %q): mirror runner ReconcileRepositorySandbox", spec.SandboxEnabled, spec.SandboxLevel, agent.SandboxWorkspaceWrite)
+	}
+	if authority.Protocol != string(workarea.ProtocolSessionRootV1) {
+		t.Fatalf("live fixture protocol = %q, want %q", authority.Protocol, workarea.ProtocolSessionRootV1)
+	}
+	if workarea.RepositoryAuthorityEnforcement(authority.Enforcement) != workarea.RepositoryAuthorityIsolatedReadOnlyV1 {
+		t.Fatalf("live fixture enforcement = %q, want %q", authority.Enforcement, workarea.RepositoryAuthorityIsolatedReadOnlyV1)
 	}
 }
 
@@ -501,6 +534,7 @@ func TestPiConfinement_InteractiveSpawnRefusesForbiddenWrites(t *testing.T) {
 // Spawn, the production entry point.
 func TestPiConfinement_AuthorityRequestConfinesThroughLaunch(t *testing.T) {
 	w := newLiveWorld(t)
+	assertLiveAuthorityPosture(t, w)
 	bin := writeLiveHarness(t, w)
 	spec := w.spec()
 	spec.RepositoryAuthority = w.authority()
