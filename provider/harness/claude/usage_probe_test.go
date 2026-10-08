@@ -114,7 +114,11 @@ func writeFakeUsageCLI(t *testing.T, variant string) string {
 // probe-stable window ids, and the account identity is opaque (never
 // an address).
 func TestProbeUsage_MapsFakeReadThroughSharedMapper(t *testing.T) {
-	t.Parallel()
+	// The fake status child answers only when USER reaches it (the
+	// macOS keychain rule the probe pins). Set it here rather than
+	// inherit it: containers and service managers can start the test
+	// binary without USER, and the account id must not depend on that.
+	t.Setenv("USER", "probe-operator")
 
 	accountID, probed, names := ProbeUsage(t.Context(), fakeUsageCLI(t, "ok"))
 	if probed.Unavailable != nil {
