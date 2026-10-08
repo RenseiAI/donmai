@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -199,6 +200,11 @@ var checks = []Check{
 		run:  checkResumeContinues,
 	},
 	{
+		ID: IDResumeHistoryLoaded, Tier: TierResume, Row: 6,
+		What: "a stopped session resumed on a fresh adapter instance reports the prior history without re-running it",
+		run:  checkResumeHistoryLoaded,
+	},
+	{
 		ID: IDReceiptPlanValid, Tier: TierAdaptationReceipt, Row: 10,
 		What: "the pre-spawn adaptation authority compiles and validates ready",
 		run:  checkReceiptPlanValid,
@@ -250,6 +256,10 @@ type run struct {
 	pty     *ptyProbe
 	resumed *probe
 	receipt *receiptProbe
+	// baseNonce is the prompt nonce the base probe embedded via
+	// Subject.EchoPrompt. The history-loaded resume fixture anchors the
+	// prior history on it: the resumed stream must repeat it.
+	baseNonce string
 }
 
 // probe is one spawn-and-drain observation.
@@ -277,8 +287,10 @@ func (p *probe) spawnFailure() (string, bool) {
 
 func (r *run) baseProbe(ctx context.Context) *probe {
 	if r.base == nil {
+		nonce := newNonce()
+		r.baseNonce = nonce
 		spec := r.subject.BaseSpec
-		spec.Prompt = r.subject.EchoPrompt(newNonce())
+		spec.Prompt = r.subject.EchoPrompt(nonce)
 		r.base = r.spawn(ctx, spec, nil)
 	}
 	return r.base
@@ -810,7 +822,7 @@ func checkResumeContinues(ctx context.Context, r *run) (Status, string) {
 	}
 
 	if r.resumed == nil {
-		r.resumed = r.resumeProbe(ctx, sessionID)
+		r.resumed = r.resumeProbe(ctx, r.subject.Provider, sessionID)
 	}
 	if r.resumed.spawnErr != nil {
 		return StatusFail, fmt.Sprintf("the manifest declares session resume but Resume(%q) returned %v", sessionID, r.resumed.spawnErr)
@@ -824,16 +836,148 @@ func checkResumeContinues(ctx context.Context, r *run) (Status, string) {
 	return StatusPass, ""
 }
 
+// checkResumeHistoryLoaded is the stop-and-resume fixture beside
+// checkResumeContinues. The first session is drained and stopped through
+// Handle.Stop (the daemon-level stop-for-resume request does not exist in
+// this tree yet; once it does, the fixture must stop mid-run through it).
+// The session is then resumed under its old id on a FRESH adapter instance
+// from Subject.ResumeProvider, so nothing the spawning instance holds in
+// memory can carry the history: only state the adapter persisted can. The
+// harness must report the prior history. Two lies fail:
+//
+//   - a blank resume (the same session id, a conformant event contract, but
+//     no trace of what came before), which is a second clean start under an
+//     old name;
+//   - a re-run (the resumed stream issues the prior turn's tool call again),
+//     which duplicates side effects instead of continuing.
+//
+// The fixture anchors the history on the base prompt nonce. The base probe
+// embeds a fresh nonce via Subject.EchoPrompt, so a base session that
+// honors its glue echoes it; the resumed narrative (assistant text, result
+// and system messages, never a tool call) must repeat it. The two probes
+// carry different nonces (the resume probe embeds its own), so the check
+// asks the exact question: does the resumed stream repeat the history it
+// was stopped with, or only its own fresh prompt?
+func checkResumeHistoryLoaded(ctx context.Context, r *run) (Status, string) {
+	if !r.manifest.Caps.SupportsSessionResume {
+		return StatusNotApplicable, "the manifest does not declare session resume"
+	}
+	if r.subject.ResumeProvider == nil {
+		return StatusNotApplicable, "Subject.ResumeProvider is unset, so there is no fresh adapter instance to resume on; a resume on the spawning instance can reach in-memory state a new process would not have, so it proves nothing about stop-for-resume"
+	}
+	base := r.baseProbe(ctx)
+	if reason, failed := base.spawnFailure(); failed {
+		return StatusFail, "the session to stop for resume could not be started: " + reason
+	}
+	sessionID := base.sessionID
+	if sessionID == "" {
+		sessionID = initSessionID(base.events)
+	}
+	if sessionID == "" {
+		return StatusFail, "the manifest declares session resume but the first session announced no session id (Handle.SessionID and the InitEvent were both empty), so there is nothing to stop for resume"
+	}
+	if r.baseNonce == "" || !containsText(base.events, r.baseNonce) {
+		return StatusFail, fmt.Sprintf(
+			"the first session never repeated its own prompt nonce %q in its %d drained events, so no prior history was established to require back — either the adapter dropped the prompt or Subject.EchoPrompt does not make the agent echo it",
+			r.baseNonce, len(base.events))
+	}
+
+	fresh, err := r.subject.ResumeProvider(ctx)
+	if err != nil {
+		return StatusFail, "Subject.ResumeProvider could not build a fresh adapter instance: " + err.Error()
+	}
+	if fresh == nil {
+		return StatusFail, "Subject.ResumeProvider returned a nil provider and a nil error"
+	}
+	if sameProviderInstance(fresh, r.subject.Provider) {
+		return StatusFail, "Subject.ResumeProvider returned the spawning instance; the fixture needs a fresh one that shares no in-memory state with it"
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
+		defer cancel()
+		_ = fresh.Shutdown(sctx)
+	}()
+
+	resumed := r.resumeProbe(ctx, fresh, sessionID)
+	if resumed.spawnErr != nil {
+		return StatusFail, fmt.Sprintf("the manifest declares session resume but Resume(%q) on a fresh adapter instance after a stop for resume returned %v", sessionID, resumed.spawnErr)
+	}
+	if err := CheckEventContract(resumed.events); err != nil {
+		return StatusFail, "the resumed session violated the event contract: " + err.Error()
+	}
+	if !resumed.closed {
+		return StatusFail, fmt.Sprintf("the resumed session's events channel had not closed %s after Resume", r.subject.timeout())
+	}
+	if tool, ok := reissuedToolCall(base.events, resumed.events, r.baseNonce); ok {
+		return StatusFail, fmt.Sprintf(
+			"the resumed session issued the prior turn's %s tool call again (its input carries the first session's nonce %q): running the stopped turn again duplicates its side effects, it does not continue it",
+			tool, r.baseNonce)
+	}
+	if !containsNarrativeText(resumed.events, r.baseNonce) {
+		return StatusFail, fmt.Sprintf(
+			"the resumed session reports none of the prior history: the first session's nonce %q never appeared in the %d resumed events, so the harness resumed blank — a second clean start under an old session id, not a continuation",
+			r.baseNonce, len(resumed.events))
+	}
+	return StatusPass, ""
+}
+
+// sameProviderInstance reports whether two providers are the same instance,
+// without panicking on a non-comparable dynamic type.
+func sameProviderInstance(a, b agent.HarnessProvider) bool {
+	ta := reflect.TypeOf(a)
+	return ta != nil && ta == reflect.TypeOf(b) && ta.Comparable() && a == b
+}
+
+// reissuedToolCall reports a resumed tool call that carries needle when the
+// base session also issued one carrying it: the prior turn's call, issued a
+// second time.
+func reissuedToolCall(base, resumed []agent.Event, needle string) (string, bool) {
+	if !containsText(toolUses(base), needle) {
+		return "", false
+	}
+	for _, ev := range toolUses(resumed) {
+		if containsText([]agent.Event{ev}, needle) {
+			return ev.(agent.ToolUseEvent).ToolName, true
+		}
+	}
+	return "", false
+}
+
+func toolUses(events []agent.Event) []agent.Event {
+	var out []agent.Event
+	for _, ev := range events {
+		if _, ok := ev.(agent.ToolUseEvent); ok {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// containsNarrativeText is containsText over everything but tool calls and
+// their results: history is what the session reports, not what a tool run
+// printed.
+func containsNarrativeText(events []agent.Event, needle string) bool {
+	var narrative []agent.Event
+	for _, ev := range events {
+		switch ev.(type) {
+		case agent.ToolUseEvent, agent.ToolResultEvent:
+			continue
+		}
+		narrative = append(narrative, ev)
+	}
+	return containsText(narrative, needle)
+}
+
 // resumeProbe continues a prior session and drains it. It mirrors spawn but
 // calls Resume, and it holds the probe context open across the whole drain —
 // cancelling it at the Resume call would kill the very session under test.
-func (r *run) resumeProbe(ctx context.Context, sessionID string) *probe {
+func (r *run) resumeProbe(ctx context.Context, provider agent.HarnessProvider, sessionID string) *probe {
 	pctx, cancel := context.WithTimeout(ctx, r.subject.timeout())
 	defer cancel()
 
 	spec := r.subject.BaseSpec
 	spec.Prompt = r.subject.EchoPrompt(newNonce())
-	handle, err := r.subject.Provider.Resume(pctx, sessionID, spec)
+	handle, err := provider.Resume(pctx, sessionID, spec)
 	if err != nil {
 		return &probe{spawnErr: err}
 	}
