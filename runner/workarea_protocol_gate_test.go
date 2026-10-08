@@ -13,6 +13,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -280,5 +281,146 @@ func TestRunInteractiveUsesSameNestedSelectedRepositoryLayout(t *testing.T) {
 	}
 	if res.Status != "completed" || res.WorkareaRoot == res.WorktreePath || filepath.Base(res.WorktreePath) != "primary" || filepath.Dir(res.WorktreePath) != res.WorkareaRoot {
 		t.Fatalf("interactive result paths/status = root %q cwd %q status %q", res.WorkareaRoot, res.WorktreePath, res.Status)
+	}
+}
+
+// piWorkareaRunProvider is a Spawn-capable fake carrying pi's REAL,
+// unmutated manifest: it lets a declared-repository session run the
+// production Run path (provisioning, authority binding, spawn-lane
+// admission) against pi's attestation without needing the pi binary.
+type piWorkareaRunProvider struct {
+	mu       sync.Mutex
+	observed agent.Spec
+}
+
+func (*piWorkareaRunProvider) Name() agent.ProviderName { return agent.ProviderPi }
+func (*piWorkareaRunProvider) Capabilities() agent.Capabilities {
+	return (&pi.Provider{}).Capabilities()
+}
+
+func (*piWorkareaRunProvider) Manifest() agent.HarnessManifest { return (&pi.Provider{}).Manifest() }
+
+func (p *piWorkareaRunProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	if _, err := agent.PrepareHarness(spec, p.Manifest()); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	p.observed = spec
+	p.mu.Unlock()
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{SessionID: "pi-workarea-session"}
+	events <- agent.ResultEvent{Success: true, Message: "WORK_RESULT:passed"}
+	close(events)
+	return &workareaGateHandle{events: events}, nil
+}
+
+func (p *piWorkareaRunProvider) Resume(ctx context.Context, _ string, spec agent.Spec) (agent.Handle, error) {
+	return p.Spawn(ctx, spec)
+}
+func (*piWorkareaRunProvider) Shutdown(context.Context) error { return nil }
+
+// TestRunPiAttestedDeclarationProvisionsNestedLayoutAndBindsAuthority drives
+// a declared primary + read-only context session through the production Run
+// path against pi's REAL manifest: the nested session-root layout is
+// provisioned, the provider observes the workspace-write spec with the
+// complete authority partition, and the durable declaration record names the
+// selected repository.
+//
+// RED: remove the manifest's session-root-v1 attestation and Run refuses
+// with protocol unsupported before provisioning.
+func TestRunPiAttestedDeclarationProvisionsNestedLayoutAndBindsAuthority(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	h := newRunnerHarness(t)
+	provider := &piWorkareaRunProvider{}
+	if err := h.runner.registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	qw := h.queuedWork("PI-ATTESTED-WORKAREA")
+	qw.WorkType = "acceptance"
+	qw.ResolvedProfile.Harness = string(agent.HarnessPi)
+	qw.RepositoryDeclaration = &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: qw.Repository}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: makeBareRepo(t)}, Name: "context", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (FailureMode=%q, Error=%q); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	if res.WorkareaRoot == "" || res.WorkareaRoot == res.WorktreePath || filepath.Base(res.WorktreePath) != "primary" || filepath.Dir(res.WorktreePath) != res.WorkareaRoot {
+		t.Fatalf("result paths = root %q cwd %q; want the selected primary a leaf of the session root", res.WorkareaRoot, res.WorktreePath)
+	}
+	provider.mu.Lock()
+	observed := provider.observed
+	provider.mu.Unlock()
+	if observed.Cwd != res.WorktreePath || observed.RepositoryAuthority == nil {
+		t.Fatalf("provider observed CWD/policy = %q/%#v", observed.Cwd, observed.RepositoryAuthority)
+	}
+	policy := observed.RepositoryAuthority
+	if observed.SandboxLevel != agent.SandboxWorkspaceWrite || len(policy.MutablePaths) != 1 || len(policy.ReadOnlyPaths) != 1 ||
+		policy.Protocol != string(workarea.ProtocolSessionRootV1) || policy.Enforcement != string(workarea.RepositoryAuthorityIsolatedReadOnlyV1) ||
+		policy.WorkareaRoot != res.WorkareaRoot || policy.SelectedPath != res.WorktreePath {
+		t.Fatalf("provider authority = %#v sandbox=%q; want the complete partition bound to the session root", policy, observed.SandboxLevel)
+	}
+	if _, err := workarea.ReadDeclaration(workarea.RootPath(res.WorkareaRoot)); err != nil {
+		t.Fatalf("ReadDeclaration: %v", err)
+	}
+}
+
+// TestRunPiSiblingEnvBecomesDeclaredContextLeaves drives the addendum's core
+// scenario through the production Run path against pi's REAL manifest: a
+// plain single-repository work item whose sibling env names a context
+// repository gets it as a declared read-only leaf under the session root,
+// beside the selected primary, so ../<name> resolves — with the authority
+// policy holding it read-only and nothing in the shared parent.
+//
+// RED: remove the manifest's attestation and the sibling keeps the original
+// placement beside the worktree (no nested root, no authority policy).
+func TestRunPiSiblingEnvBecomesDeclaredContextLeaves(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	h := newRunnerHarness(t)
+	provider := &piWorkareaRunProvider{}
+	if err := h.runner.registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(siblingReposEnv, "")
+	qw := h.queuedWork("PI-SIBLING-CONTEXT")
+	qw.WorkType = "acceptance"
+	qw.ResolvedProfile.Harness = string(agent.HarnessPi)
+	qw.Env = map[string]string{siblingReposEnv: namedBareRepo(t, "pi-corpus")}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run = status %q (%s: %s), %v; want completed", res.Status, res.FailureMode, res.Error, err)
+	}
+	if res.WorkareaRoot == "" || res.WorkareaRoot == res.WorktreePath || filepath.Dir(res.WorktreePath) != res.WorkareaRoot {
+		t.Fatalf("WorkareaRoot = %q WorktreePath = %q; want the selected repository a leaf of the session root", res.WorkareaRoot, res.WorktreePath)
+	}
+	sibling := filepath.Join(res.WorktreePath, "..", "pi-corpus")
+	if _, err := os.Stat(filepath.Join(sibling, ".git")); err != nil {
+		t.Fatalf("../pi-corpus from the selected repository is not a clone: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(res.WorkareaRoot), "pi-corpus")); !os.IsNotExist(err) {
+		t.Fatalf("a sibling landed in the shared parent (stat err %v); want it only under the session root", err)
+	}
+	provider.mu.Lock()
+	policy := provider.observed.RepositoryAuthority
+	provider.mu.Unlock()
+	if policy == nil || len(policy.ReadOnlyPaths) != 1 || filepath.Base(policy.ReadOnlyPaths[0]) != "pi-corpus" {
+		t.Fatalf("policy = %+v; want pi-corpus held read-only", policy)
 	}
 }

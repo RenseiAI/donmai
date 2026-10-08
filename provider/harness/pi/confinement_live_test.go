@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -208,6 +209,7 @@ func (w liveWorld) authority() *agent.RepositoryAuthorityPolicy {
 		SelectedPath:  w.mut,
 		MutablePaths:  []string{w.mut},
 		ReadOnlyPaths: []string{w.ro},
+		Enforcement:   "isolated-read-only-v1",
 	}
 }
 
@@ -486,29 +488,22 @@ func TestPiConfinement_InteractiveSpawnRefusesForbiddenWrites(t *testing.T) {
 	assertUnconfined(t, w)
 }
 
-// TestPiConfinement_AuthorityRequestConfinesThroughLaunch covers the other
-// gate input: a declared repository authority requests confinement, and the
-// per-session confinement record names its read-only leaves. pi's manifest
-// declares no multi-repository workarea protocol yet, so admission refuses
-// such a spec at Spawn (asserted first); the test therefore enters at
-// launch, the shared post-admission entry of Spawn and Resume, with the gate
-// still evaluated on the spec. When the manifest gains a protocol, the
-// admission assertion fails and this test should move to Spawn.
-func TestPiConfinement_AuthorityRequestConfinesThroughLaunch(t *testing.T) {
+// TestPiConfinement_AuthorityRequestConfinesThroughSpawn covers the other
+// gate input through the production entry point: a declared repository
+// authority is admitted by the manifest, requests confinement, and the
+// per-session confinement record names its read-only leaves.
+func TestPiConfinement_AuthorityRequestConfinesThroughSpawn(t *testing.T) {
 	w := newLiveWorld(t)
 	bin := writeLiveHarness(t, w)
 	spec := w.spec()
 	spec.RepositoryAuthority = w.authority()
+	spec.SandboxEnabled = true
+	spec.SandboxLevel = agent.SandboxWorkspaceWrite
 	p := liveProvider(t, bin, false)
 
-	if h, err := p.Spawn(liveCtx(t), spec); err == nil {
-		_ = h.Stop(context.Background())
-		t.Fatalf("Spawn admitted a repository authority for pi; drive this test through Spawn now")
-	}
-
-	h, err := p.launch(liveCtx(t), spec, launchPrompt, "")
+	h, err := p.Spawn(liveCtx(t), spec)
 	if err != nil {
-		t.Fatalf("launch: %v", err)
+		t.Fatalf("Spawn with a declared repository authority: %v", err)
 	}
 	plan := h.(*Handle).confinement
 	finishHeadless(t, h)
@@ -1127,4 +1122,140 @@ func TestPiConfinement_SecondWorkerReusesTheSelfTest(t *testing.T) {
 		t.Fatalf("the second worker's confinement setup took %s, want under 1s", setup)
 	}
 	t.Logf("second worker confinement setup: %s", setup.Round(time.Millisecond))
+}
+
+// TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf is the real-binary
+// negative proof behind pi's session-root-v1 attestation: the REAL pi binary
+// spawns through the production entry point with a declared repository
+// authority (mutable selected leaf, read-only context sibling), and the
+// model is driven to attempt a write into the mutable leaf, a write into the
+// read-only sibling, and shell write/rename/remove/chmod attempts there.
+// The mutable control lands; every read-only attempt is refused and leaves
+// nothing behind, the sentinel keeps its bytes and mode, and the turn still
+// completes. Skips without pi on PATH (hosted CI has none).
+//
+// RED: remove the manifest's MultiRepositoryWorkareaProtocols attestation and
+// Spawn refuses the authority-bearing spec at admission.
+func TestRealBinary_AuthorityConfinedTurnRefusesReadOnlyLeaf(t *testing.T) {
+	realBinaryAvailable(t)
+	w := newLiveWorld(t)
+	sentinel := filepath.Join(w.ro, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("locked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mutableControl := filepath.Join(w.mut, "control.txt")
+	roWrite := filepath.Join(w.ro, "write-attempt.txt")
+	roRenamed := filepath.Join(w.ro, "renamed")
+	marshal := func(v map[string]any) string {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	stub := newRealBinaryStub(t, realBinaryModel)
+	stub.mu.Lock()
+	stub.responses = []stubResponse{{ToolCalls: []stubToolCall{
+		{ID: "call-mutable-control", Name: "write", Arguments: marshal(map[string]any{"path": mutableControl, "content": "mutable-control\n"})},
+		{ID: "call-ro-write", Name: "write", Arguments: marshal(map[string]any{"path": roWrite, "content": "forbidden\n"})},
+		{ID: "call-ro-shell-write", Name: "bash", Arguments: marshal(map[string]any{"command": "echo forbidden > " + strconv.Quote(roWrite)})},
+		{ID: "call-ro-shell-rename", Name: "bash", Arguments: marshal(map[string]any{"command": "mv " + strconv.Quote(sentinel) + " " + strconv.Quote(roRenamed)})},
+		{ID: "call-ro-shell-remove", Name: "bash", Arguments: marshal(map[string]any{"command": "rm -f " + strconv.Quote(sentinel)})},
+		{ID: "call-ro-shell-chmod", Name: "bash", Arguments: marshal(map[string]any{"command": "chmod 0777 " + strconv.Quote(sentinel)})},
+	}}, {Text: "complete"}}
+	stub.mu.Unlock()
+
+	spec := realBinarySpec(w.mut, "run the requested tool calls", stub.baseURL())
+	spec.Autonomous = true
+	spec.SandboxEnabled = true
+	spec.SandboxLevel = agent.SandboxWorkspaceWrite
+	spec.RepositoryAuthority = w.authority()
+	p, err := New(Options{HandshakeTimeout: 60 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.opts.confinementDirs = liveConfinementDirs(t)
+	h, err := p.Spawn(liveCtx(t), spec)
+	if err != nil {
+		t.Fatalf("authority-bearing Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	if h.(*Handle).confinement == nil {
+		t.Fatal("an authority-bearing session spawned without a confinement plan")
+	}
+	_, failed := toolExecutionStreamRealBinary(t, drainToResult(t, h, 90*time.Second))
+
+	if body, err := os.ReadFile(mutableControl); err != nil || string(body) != "mutable-control\n" {
+		t.Fatalf("mutable control = %q, %v; want the write to land", body, err)
+	}
+	if !failed["call-ro-write"] {
+		t.Error("write into the read-only sibling did not end as an error")
+	}
+	if _, err := os.Lstat(roWrite); !os.IsNotExist(err) {
+		t.Errorf("read-only write attempt had an effect: %v", err)
+	}
+	for _, id := range []string{"call-ro-shell-write", "call-ro-shell-rename", "call-ro-shell-remove", "call-ro-shell-chmod"} {
+		if !failed[id] {
+			t.Errorf("shell attempt %s against the read-only sibling did not end as an error", id)
+		}
+	}
+	if _, err := os.Lstat(roRenamed); !os.IsNotExist(err) {
+		t.Errorf("read-only rename had an effect: %v", err)
+	}
+	if body, err := os.ReadFile(sentinel); err != nil || string(body) != "locked" {
+		t.Fatalf("read-only sentinel = %q, %v; want it unchanged", body, err)
+	}
+	if info, err := os.Stat(sentinel); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("read-only sentinel mode = %v, %v; want 0600", info, err)
+	}
+}
+
+// toolExecutionStreamRealBinary flattens the tool lifecycle of a drained
+// real-binary session into the ids of calls ending in error.
+func toolExecutionStreamRealBinary(t *testing.T, events []agent.Event) ([]string, map[string]bool) {
+	t.Helper()
+	failed := map[string]bool{}
+	var stream []string
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			stream = append(stream, "start "+e.ToolUseID)
+		case agent.ToolResultEvent:
+			stream = append(stream, "end "+e.ToolUseID)
+			failed[e.ToolUseID] = e.IsError
+		case agent.ErrorEvent:
+			t.Fatalf("authority-confined session ended with an ErrorEvent: %+v", e)
+		}
+	}
+	return stream, failed
+}
+
+// TestPiConfinement_InteractiveAuthoritySpawnConfinesThroughSpawn is the
+// interactive counterpart of
+// TestPiConfinement_AuthorityRequestConfinesThroughSpawn: an
+// authority-bearing interactive spec is admitted and the PTY child runs
+// confined, with the same refusals.
+//
+// RED: remove the manifest's MultiRepositoryWorkareaProtocols attestation and
+// Spawn refuses the authority-bearing spec at admission.
+func TestPiConfinement_InteractiveAuthoritySpawnConfinesThroughSpawn(t *testing.T) {
+	w := newLiveWorld(t)
+	bin := writeLiveHarness(t, w)
+	spec := w.spec()
+	spec.RepositoryAuthority = w.authority()
+	spec.SandboxEnabled = true
+	spec.SandboxLevel = agent.SandboxWorkspaceWrite
+	spec.Interactive = &agent.InteractiveSpec{Cols: 80, Rows: 24}
+	p := liveProvider(t, bin, false)
+
+	h, err := p.Spawn(liveCtx(t), spec)
+	if err != nil {
+		t.Fatalf("interactive Spawn with a declared repository authority: %v", err)
+	}
+	finishInteractive(t, h)
+	// The plan is not reachable through the PTY handle wrapper; the
+	// confinement verdict comes from the probe report: the mutable write
+	// landed while the read-only, outside and extension writes were
+	// refused — which only a confined child produces.
+	assertConfined(t, w)
 }
