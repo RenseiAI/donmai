@@ -556,7 +556,7 @@ func TestAdoptionBatchDigestIsStableAcrossRepresentations(t *testing.T) {
 			name: "a lineage that moved from adopted to quarantined",
 			mutate: func(b SessionShimAdoptionBatch) SessionShimAdoptionBatch {
 				amended, quarantines := sessionShimBatchAfterEvidenceRecorded(
-					b, []sessionshim.Identity{{OrgID: "org-digest", SessionID: "session-a"}})
+					b, []sessionshim.Identity{{OrgID: "org-digest", SessionID: "session-a"}}, nil)
 				if len(quarantines) != 1 {
 					t.Fatalf("fixture produced %d quarantines, want 1", len(quarantines))
 				}

@@ -253,6 +253,14 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		// counter is not incremented; because it is NOT in
 		// RestartPreventExitStatus, systemd still restarts the daemon.
 		"SuccessExitStatus=3",
+		// Shim-owned seats outlive the daemon in their own transient scopes:
+		// restarting this unit must not take them down. KillMode=process
+		// stops only the daemon itself, leaving the seat scopes (which the
+		// manager owns, not this unit's cgroup) running. Delegate=yes hands
+		// the unit's cgroup subtree to the daemon so per-seat subtrees can
+		// be created beneath it where the manager requires delegation.
+		"KillMode=process",
+		"Delegate=yes",
 	)
 
 	if opts.ConfigPath != "" {

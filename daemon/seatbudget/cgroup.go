@@ -2,6 +2,8 @@ package seatbudget
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -16,9 +18,13 @@ import (
 
 // Linux enforcement: cgroups v2.
 //
-// A seat's process tree is confined by a transient systemd scope carrying
-// a CPU quota, a CPU weight share, a memory high/max ceiling, an IO weight
-// and the seat-survives-OOM policy. Exactly one placement exists:
+// A shim-owned seat's process tree always runs in a transient systemd scope
+// (`systemd-run --scope --collect`), budget or not: the scope is what owns
+// the seat's cgroup past a daemon restart, so every shim launch wraps — a
+// budgetless seat simply renders no limit properties. A budgeted seat adds a
+// CPU quota, a CPU weight share, a memory high/max ceiling and an IO weight;
+// every scope carries the seat-survives-OOM policy. Exactly one placement
+// exists:
 //
 //  1. systemd transient scope: when the host runs systemd (MinScopeSystemd
 //     or newer) as PID 1 and the systemd-run helper is available, the seat
@@ -91,14 +97,16 @@ func MemoryBytes(memoryMB int) string {
 
 // SystemdScopeArgs renders the `systemd-run --scope` argv prefix that
 // confines one seat. name scopes the transient unit (per-session, so two
-// seats never share a scope). Empty optional limits are omitted: a seat
-// with no memory cap must not get MemoryMax=0, which systemd reads as "no
-// memory at all". userScope selects the bus flag: a per-user daemon
-// reaches only the user manager, so its seats need --user; a system
-// service uses the system bus and must not pass it. OOMPolicy=continue
-// keeps the seat alive when one child hits the memory ceiling: the
-// kernel kills only the offender, while the default (stop) would end the
-// whole agent session on the first child OOM.
+// seats never share a scope). A budget that carries no numeric limits
+// renders no limit properties — the scope still owns the seat's cgroup, so
+// the seat survives its daemon either way. Empty optional limits are
+// omitted: a seat with no memory cap must not get MemoryMax=0, which
+// systemd reads as "no memory at all". userScope selects the bus flag: a
+// per-user daemon reaches only the user manager, so its seats need --user;
+// a system service uses the system bus and must not pass it.
+// OOMPolicy=continue keeps the seat alive when one child hits the memory
+// ceiling: the kernel kills only the offender, while the default (stop)
+// would end the whole agent session on the first child OOM.
 func SystemdScopeArgs(name string, b Budget) []string {
 	return SystemdScopeArgsForBus(name, b, false)
 }
@@ -107,16 +115,21 @@ func SystemdScopeArgs(name string, b Budget) []string {
 // wraps the seat via `systemd-run --user --scope` (per-user service
 // without the system bus), false via `systemd-run --scope` (system
 // service). Tests pin both spellings on any host.
+//
+// A zero-CPU budget renders no CPUQuota/CPUWeight: with no budget the scope
+// owns the seat's cgroup and nothing else, so the seat still outlives its
+// daemon while systemd applies no throughput limit to it.
 func SystemdScopeArgsForBus(name string, b Budget, userScope bool) []string {
 	args := []string{"systemd-run"}
 	if userScope {
 		args = append(args, "--user")
 	}
-	args = append(args, "--scope", "--collect",
-		"-p", "CPUQuota="+CPUQuotaPercent(b.CPUs),
-		"-p", "CPUWeight="+CPUWeight(b.CPUs),
-		"-p", "OOMPolicy=continue",
-	)
+	args = append(args, "--scope", "--collect")
+	if b.CPUs >= 1 {
+		args = append(args, "-p", "CPUQuota="+CPUQuotaPercent(b.CPUs),
+			"-p", "CPUWeight="+CPUWeight(b.CPUs))
+	}
+	args = append(args, "-p", "OOMPolicy=continue")
 	if mem := MemoryBytes(b.MemoryMB); mem != "" {
 		args = append(args, "-p", "MemoryMax="+mem, "-p", "MemoryHigh="+mem)
 	}
@@ -149,28 +162,30 @@ func SystemdUserScopeForEUID(userBus, systemBus bool, euid int) bool {
 	return userBus && !(systemBus && euid == 0)
 }
 
-// ScopeName returns the transient-scope unit name for a session. The session
-// id is sanitised to the systemd unit alphabet; the prefix keeps seat
-// scopes greppable in systemctl output.
+// ScopeName returns the transient-scope unit name for a session. It is a
+// fixed-length digest of the lifecycle identity plus the incarnation: two
+// sessions whose ids share a long prefix still get distinct scopes, and a
+// hostile id can never escape the unit alphabet or grow the name. The
+// prefix keeps seat scopes greppable in systemctl output.
+//
+// The incarnation is the launch's process epoch: a relaunched session is a
+// new scope, never a reuse of the previous launch's name. Pass the record's
+// own epoch when deriving the name for an already-running seat — the scope
+// belongs to the launch, not to the lifecycle.
 func ScopeName(sessionID string) string {
-	var sb strings.Builder
-	sb.WriteString("donmai-seat-")
-	for _, r := range sessionID {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			sb.WriteRune(r)
-		default:
-			sb.WriteRune('_')
-		}
-		if sb.Len() >= 64 {
-			break
-		}
-	}
-	name := sb.String()
-	if name == "donmai-seat-" {
-		name += "session"
-	}
-	return name + ".scope"
+	return ScopeNameForIncarnation("", sessionID, 0)
+}
+
+// ScopeNameForIncarnation is ScopeName keyed by the full launch identity:
+// the organisation half, the session id, and the launch's process epoch.
+// The digest covers the same unit-separator-joined correlation the registry
+// uses for its own per-incarnation sidecars, so the name is fixed-length
+// and collision-shaped only by the hash — never by truncation. The epoch
+// suffix keeps the incarnation greppable in unit listings after the digest.
+func ScopeNameForIncarnation(orgID, sessionID string, processEpoch uint64) string {
+	correlation := orgID + "\x1f" + sessionID + "\x1f" + strconv.FormatUint(processEpoch, 10)
+	sum := sha256.Sum256([]byte(correlation))
+	return "donmai-seat-" + hex.EncodeToString(sum[:16]) + "-" + strconv.FormatUint(processEpoch, 10) + ".scope"
 }
 
 // MinScopeSystemd is the oldest systemd the transient-scope placement
@@ -411,4 +426,109 @@ func SelectPlacement(hasSystemd, cgroupWritable bool) Placement {
 // HostPlacement probes this host and picks the placement.
 func HostPlacement() Placement {
 	return SelectPlacement(HasSystemd(), CgroupV2Writable())
+}
+
+// SeatLimits are the limits a seat's cgroup actually carries, read back from
+// the live scope. CPUs is the whole-core share derived from the CPU quota;
+// MemoryMB the ceiling in mebibytes; IOWeight the cgroup v2 IO weight. Zero
+// means that controller carries no limit (a budgetless seat's scope still
+// owns the cgroup, it just caps nothing). ok=false means the scope could
+// not be read — reaped, unreachable bus, or no systemd — and the caller
+// falls back to the launch record instead of reporting numbers it did not
+// observe.
+type SeatLimits struct {
+	CPUs     int
+	MemoryMB int
+	IOWeight int
+}
+
+// ReadSeatLimits reads the limits a live transient scope carries, through
+// `systemctl show` against the seat's own unit. userScope selects the bus,
+// the same decision the launch used: a scope created with --user is only
+// visible with --user. run is injected so tests pin the parse on any host;
+// production passes the systemctl runner below.
+func ReadSeatLimits(scope string, userScope bool) (SeatLimits, bool) {
+	return readSeatLimitsWithRunner(scope, userScope, runSystemctlShow, runtime.GOOS)
+}
+
+// runSystemctlShow runs `systemctl [--user] show <scope>` for the three
+// seat properties. The binary and property names are fixed; only the scope
+// unit and the bus flag vary.
+func runSystemctlShow(scope string, userScope bool) ([]byte, error) {
+	args := []string{"show", scope, "--property=CPUQuotaPerSecUSec,MemoryMax,IOWeight"}
+	if userScope {
+		args = append([]string{"--user"}, args...)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "systemctl", args...).Output() //nolint:gosec // G204: fixed binary and property names; only the unit name (a digest) and the bus flag vary
+}
+
+// readSeatLimitsWithRunner is ReadSeatLimits with the systemctl call
+// injected so tests pin the parse without a live manager.
+func readSeatLimitsWithRunner(scope string, userScope bool, run func(scope string, userScope bool) ([]byte, error), goos string) (SeatLimits, bool) {
+	if goos != "linux" {
+		return SeatLimits{}, false
+	}
+	if scope == "" || strings.ContainsAny(scope, "/ ") {
+		return SeatLimits{}, false
+	}
+	out, err := run(scope, userScope)
+	if err != nil {
+		return SeatLimits{}, false
+	}
+	props := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
+			props[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	var limits SeatLimits
+	if raw, ok := props["CPUQuotaPerSecUSec"]; ok && raw != "" && raw != "infinity" {
+		if usec, err := strconv.Atoi(raw); err == nil && usec > 0 {
+			// systemd renders the quota per one second of CPU time:
+			// 200000 is two cores. Round UP so a fractional share never
+			// reports zero CPUs for a seat that holds a quota.
+			limits.CPUs = (usec + 100000 - 1) / 100000
+		}
+	}
+	if raw, ok := props["MemoryMax"]; ok && raw != "" && raw != "infinity" {
+		if bytes, err := strconv.ParseInt(raw, 10, 64); err == nil && bytes > 0 {
+			limits.MemoryMB = int(bytes / (1024 * 1024))
+		}
+	}
+	if raw, ok := props["IOWeight"]; ok && raw != "" {
+		if w, err := strconv.Atoi(raw); err == nil && w > 0 {
+			limits.IOWeight = w
+		}
+	}
+	return limits, true
+}
+
+// ReportSeatLimits renders the adopted-handle evidence for one seat: the
+// limits read back from the seat's live cgroup, falling back to the
+// launch-time record. liveOK=false means the scope could not be read, so
+// the record's own numbers stand in — never the daemon's current
+// configuration, which may have changed since the launch. A seat with no
+// limits in either source reports mode none with the scope named: it still
+// owns its cgroup, it just caps nothing.
+func ReportSeatLimits(scope string, live SeatLimits, liveOK bool, recordCPUs, recordMemoryMB, recordIOWeight int) Report {
+	cpus, memoryMB, ioWeight := live.CPUs, live.MemoryMB, live.IOWeight
+	if !liveOK {
+		cpus, memoryMB, ioWeight = recordCPUs, recordMemoryMB, recordIOWeight
+	}
+	if cpus < 1 && memoryMB <= 0 {
+		return Report{Mode: ModeNone, Detail: "seat scope " + scope + " carries no limits"}
+	}
+	if cpus < 1 {
+		cpus = 1
+	}
+	detail := "cpus " + CPUSet(cpus) + ", quota " + CPUQuotaPercent(cpus)
+	if mem := MemoryBytes(memoryMB); mem != "" {
+		detail += ", memory " + mem + " bytes"
+	}
+	if ioWeight > 0 {
+		detail += ", io weight " + strconv.Itoa(ioWeight)
+	}
+	return Report{Mode: ModeEnforced, CPUs: cpus, MemoryMB: memoryMB, Detail: detail + " via transient systemd scope " + scope}
 }

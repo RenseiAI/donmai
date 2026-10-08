@@ -560,6 +560,62 @@ func TestRecordValidationRejectsMissingStartIdentity(t *testing.T) {
 	}
 }
 
+// TestRecordSeatFactsRoundTrip pins the secret-free launch record: the scope
+// unit and the launched limits persist through Put/Get unchanged, old records
+// without them stay valid, and malformed limits fail closed. A negative limit
+// is never a real launch; an over-long scope would defeat the record bound
+// through this field.
+func TestRecordSeatFactsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	want := testRecord(t, id, reg)
+	want.SeatScope = "donmai-seat-abc-1.scope"
+	want.SeatCPUs = 2
+	want.SeatMemoryMB = 512
+	want.SeatIOWeight = 100
+	if err := reg.Put(want); err != nil {
+		t.Fatalf("Put with seat facts: %v", err)
+	}
+	got, err := reg.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.SeatScope != want.SeatScope || got.SeatCPUs != want.SeatCPUs || got.SeatMemoryMB != want.SeatMemoryMB || got.SeatIOWeight != want.SeatIOWeight {
+		t.Fatalf("seat facts = %+v, want %+v", got, want)
+	}
+	// Old records without seat facts stay valid: the daemon falls back the
+	// same way it does for any record that predates them.
+	plain := testRecord(t, id, reg)
+	if err := plain.Validate(); err != nil {
+		t.Fatalf("record without seat facts invalid: %v", err)
+	}
+	for _, mutate := range []func(*Record){
+		func(r *Record) { r.SeatCPUs = -1 },
+		func(r *Record) { r.SeatMemoryMB = -1 },
+		func(r *Record) { r.SeatIOWeight = 10001 },
+		func(r *Record) { r.SeatScope = strings.Repeat("x", 257) },
+	} {
+		rec := plain
+		mutate(&rec)
+		if err := rec.Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("Validate with malformed seat facts = %v, want ErrRecordInvalid", err)
+		}
+	}
+	// The record carries no secret: a grep-shaped assertion over the encoded
+	// bytes keeps a bearer, token or credential out of the launch record.
+	raw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, banned := range []string{"bearer", "token", "credential", "secret", "password", "apiKey", "api_key"} {
+		if strings.Contains(strings.ToLower(string(raw)), banned) {
+			t.Fatalf("encoded record mentions %q; the launch record is secret-free", banned)
+		}
+	}
+}
+
 func TestRecordValidationRejectsBadSchemaAndRange(t *testing.T) {
 	t.Parallel()
 

@@ -341,6 +341,7 @@ func rewrapSessionShimAdvance(advanced *SessionShimAdoptionRevisionAdvanced, cau
 func sessionShimBatchAfterEvidenceRecorded(
 	batch SessionShimAdoptionBatch,
 	conflicted []sessionshim.Identity,
+	seatFacts func(sessionshim.Identity) (scope string, cpus, memoryMB, ioWeight int),
 ) (SessionShimAdoptionBatch, []sessionshim.QuarantinedSession) {
 	named := make(map[sessionshim.Identity]struct{}, len(conflicted))
 	for _, id := range conflicted {
@@ -353,6 +354,11 @@ func sessionShimBatchAfterEvidenceRecorded(
 			kept = append(kept, outcome)
 			continue
 		}
+		var seatScope string
+		var seatCPUs, seatMemoryMB, seatIOWeight int
+		if seatFacts != nil {
+			seatScope, seatCPUs, seatMemoryMB, seatIOWeight = seatFacts(outcome.Evidence.Identity)
+		}
 		quarantines = append(quarantines, sessionshim.QuarantinedSession{
 			OrgID:                outcome.Evidence.Identity.OrgID,
 			SessionID:            outcome.Evidence.Identity.SessionID,
@@ -363,6 +369,10 @@ func sessionShimBatchAfterEvidenceRecorded(
 			Detail: "the control plane already holds durable adoption evidence for this lineage; " +
 				"presented quarantined so the rest of the host keeps its durable sessions",
 			ConsumesCapacity: true,
+			SeatScope:        seatScope,
+			SeatCPUs:         seatCPUs,
+			SeatMemoryMB:     seatMemoryMB,
+			SeatIOWeight:     seatIOWeight,
 		})
 	}
 	if len(quarantines) == 0 {
@@ -418,7 +428,7 @@ func (d *Daemon) commitBootBatchAroundRecordedEvidence(
 		if !errors.As(cause, &recorded) || len(recorded.Lineages) == 0 {
 			break
 		}
-		amended, quarantines := sessionShimBatchAfterEvidenceRecorded(batch, recorded.Lineages)
+		amended, quarantines := sessionShimBatchAfterEvidenceRecorded(batch, recorded.Lineages, d.shimLaunchSeatFacts)
 		if len(quarantines) == 0 {
 			// The conflict names nothing this batch adopts; there is nothing
 			// narrower than the whole composition left to do.
