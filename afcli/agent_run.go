@@ -1109,6 +1109,14 @@ type agentRunCtorHints struct {
 	// PiTrustedExtensions comes only from afcli.Config in the compiled
 	// embedder. It is never derived from SessionDetail or ProviderConfig.
 	PiTrustedExtensions []providerpi.TrustedExtensionIdentity
+
+	// ControlTokenPath is the daemon-resolved control-token file path
+	// the spawned worker's seat confinement denies outright. Derived
+	// from the fetched SessionDetail (stamped by the spawning daemon at
+	// accept time): the worker's environment never carries the
+	// path-override variable, so resolving it there would deny the
+	// default path while the live token sits at the override.
+	ControlTokenPath string
 }
 
 // agentRunHints collects every per-session constructor signal in one pass.
@@ -1117,6 +1125,9 @@ type agentRunCtorHints struct {
 func agentRunHints(d *daemon.SessionDetail) agentRunCtorHints {
 	h := opencodeCtorHints(d)
 	h.CodexHostSessionAuth = codexHostSessionCtorHint(d)
+	if d != nil {
+		h.ControlTokenPath = strings.TrimSpace(d.ControlTokenPath)
+	}
 	return h
 }
 
@@ -1263,7 +1274,10 @@ func codexCtorOptions(h agentRunCtorHints) providercodex.Options {
 }
 
 func piCtorOptions(h agentRunCtorHints) providerpi.Options {
-	return providerpi.Options{TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...)}
+	return providerpi.Options{
+		TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...),
+		ControlTokenPath:  h.ControlTokenPath,
+	}
 }
 
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT

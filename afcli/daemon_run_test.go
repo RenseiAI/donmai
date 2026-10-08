@@ -540,6 +540,98 @@ func TestApplyDaemonControlAuth(t *testing.T) {
 	}
 }
 
+// TestApplyDaemonControlAuth_StatesTheResolvedTokenPath pins the token path
+// the daemon states to its seats (Options.ControlTokenPath): the file the
+// token was really minted into or read from, symbolic links and ".." walked
+// the way the kernel walks them. A ".." after a symbolic link names a
+// different file when cleaned lexically, so stating the override as spelled
+// would aim the seat's deny at a file that does not hold the token.
+func TestApplyDaemonControlAuth_StatesTheResolvedTokenPath(t *testing.T) {
+	t.Parallel()
+
+	resolvedDir := func(t *testing.T, dir string) string {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resolved
+	}
+	cases := []struct {
+		name string
+		// setup returns the path the operator configured and the path the
+		// daemon must state.
+		setup func(t *testing.T) (configured, want string)
+	}{
+		{
+			name: "plain path",
+			setup: func(t *testing.T) (string, string) {
+				dir := filepath.Join(t.TempDir(), "state")
+				return filepath.Join(dir, afclient.ControlTokenFileName), filepath.Join(resolvedDir(t, dir), afclient.ControlTokenFileName)
+			},
+		},
+		{
+			name: "dot-dot after a symbolic link",
+			setup: func(t *testing.T) (string, string) {
+				base := t.TempDir()
+				target := resolvedDir(t, filepath.Join(base, "real", "sub"))
+				tokens := resolvedDir(t, filepath.Join(base, "real", "tokens"))
+				if err := os.Symlink(target, filepath.Join(base, "link")); err != nil {
+					t.Fatal(err)
+				}
+				configured := filepath.Join(base, "link") + "/../tokens/" + afclient.ControlTokenFileName
+				return configured, filepath.Join(tokens, afclient.ControlTokenFileName)
+			},
+		},
+		{
+			name: "symbolic link to the token file",
+			setup: func(t *testing.T) (string, string) {
+				base := t.TempDir()
+				token := filepath.Join(resolvedDir(t, filepath.Join(base, "real")), afclient.ControlTokenFileName)
+				if err := os.WriteFile(token, []byte("sentinel-token\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				link := filepath.Join(base, "token-link")
+				if err := os.Symlink(token, link); err != nil {
+					t.Fatal(err)
+				}
+				return link, token
+			},
+		},
+		{
+			name: "mint fails: stated as given",
+			setup: func(t *testing.T) (string, string) {
+				path := unmintableControlTokenPath(t)
+				return path, path
+			},
+		},
+		{name: "unresolved", setup: func(*testing.T) (string, string) { return "", "" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			configured, want := tc.setup(t)
+			var errOut bytes.Buffer
+			var opts daemon.Options
+			applyDaemonControlAuth(&opts, configured, &errOut)
+			if opts.ControlTokenPath != want {
+				t.Fatalf("stated ControlTokenPath = %q, want %q", opts.ControlTokenPath, want)
+			}
+			if opts.ControlToken == "" {
+				return
+			}
+			// The stated file is the one holding the live token.
+			raw, err := os.ReadFile(want) //nolint:gosec // G304: the test's own temp token.
+			if err != nil || strings.TrimSpace(string(raw)) != opts.ControlToken {
+				t.Fatalf("stated path %q does not hold the daemon's token (err %v)", want, err)
+			}
+		})
+	}
+}
+
 // TestDaemonRunControlAuth_FailsClosedEndToEnd drives the entry-point wiring
 // against a live daemon whose token cannot be minted: the operator client's
 // mutating call is refused with ErrUnavailable and a non-sensitive reason,

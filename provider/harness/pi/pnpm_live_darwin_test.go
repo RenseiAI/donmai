@@ -252,7 +252,7 @@ func seatPlan(t *testing.T, w liveWorld, home, endpoint string, drop ...string) 
 		}
 	}
 	reads.paths = slices.DeleteFunc(reads.paths, func(path string) bool { return slices.Contains(drop, path) })
-	plan, err := confinePiSession(spec, layout, c, reads)
+	plan, err := confinePiSession(spec, layout, c, reads, "")
 	if err != nil {
 		t.Fatalf("confinePiSession: %v", err)
 	}
