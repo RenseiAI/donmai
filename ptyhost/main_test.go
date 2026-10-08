@@ -13,11 +13,15 @@ import (
 
 // TestMain dispatches re-exec child roles before running the suite. The CPR
 // conformance test (§12, Appendix A) re-execs this test binary with
-// PTYHOST_TEST_ROLE=cpr so the child runs under a real ptyhost PTY.
+// PTYHOST_TEST_ROLE=cpr so the child runs under a real ptyhost PTY; the
+// noop role exits at once and exists so shell-free spawn tests have a child
+// that needs no shell binary on the runner.
 func TestMain(m *testing.M) {
 	switch os.Getenv("PTYHOST_TEST_ROLE") {
 	case "cpr":
 		cprChild()
+	case "noop":
+		os.Exit(0)
 	case "":
 		os.Exit(m.Run())
 	default:
