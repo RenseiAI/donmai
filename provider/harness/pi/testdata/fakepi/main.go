@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -66,6 +67,44 @@ const (
 // needs.
 const replyEnvVar = "FAKEPI_REPLY"
 
+// restoreSessionEnvironment does what the real boundary extension does at
+// load (extensions/donmai-policy.ts restoreSessionEnvironment): the harness
+// execs pi with an allowlisted environment only, and the session's other
+// bindings ride the environment section of the credential file named by
+// DONMAI_PI_CREDENTIALS_FILE. This stub stands in for pi AND that extension,
+// so it restores them the same way — a name already set wins, and the
+// harness's own namespaces are never written — before reading its own
+// FAKEPI_* knobs from the environment.
+func restoreSessionEnvironment() {
+	path := os.Getenv("DONMAI_PI_CREDENTIALS_FILE")
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // the session credential file the harness named
+	if err != nil {
+		return
+	}
+	var envelope struct {
+		Environment []struct {
+			Env   string `json:"env"`
+			Value string `json:"value"`
+		} `json:"environment"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return
+	}
+	for _, entry := range envelope.Environment {
+		if entry.Env == "" || strings.ContainsAny(entry.Env, "=\x00") ||
+			strings.HasPrefix(entry.Env, "DONMAI_PI_") || strings.HasPrefix(entry.Env, "PI_") {
+			continue
+		}
+		if _, set := os.LookupEnv(entry.Env); set {
+			continue
+		}
+		_ = os.Setenv(entry.Env, entry.Value)
+	}
+}
+
 func main() {
 	for _, a := range os.Args[1:] {
 		if a == "--version" {
@@ -79,6 +118,7 @@ func main() {
 		}
 	}
 
+	restoreSessionEnvironment()
 	extPath, sessionDelay := parseArgs(os.Args[1:])
 	token := os.Getenv("DONMAI_PI_HANDSHAKE")
 	sha := extensionSHAOf(extPath)
