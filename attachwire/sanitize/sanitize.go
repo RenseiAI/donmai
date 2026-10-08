@@ -84,7 +84,9 @@ type Options struct {
 	// selection target, invalid base64, or text that is not valid UTF-8. The
 	// hold cap bounds the size: a set longer than the cap is stripped whole
 	// without a callback. Control characters other than HT, LF and CR are
-	// removed from the text.
+	// removed from the text, then one trailing line break is dropped; a set
+	// left empty is not offered. Format characters (bidi, zero-width, a BOM)
+	// are kept, so a viewer's preview must render them visibly.
 	OnClipboard func(text string)
 }
 
@@ -813,18 +815,23 @@ var clipboardSet = regexp.MustCompile(`^52;[cpqs0-7]*;([A-Za-z0-9+/]*={0,2})$`)
 // DecodeClipboardSet decodes the text of an OSC 52 clipboard SET from an OSC
 // body ("52;Pc;Pd", introducer and terminator excluded). It reports false for
 // anything that is not a set of valid UTF-8 text: a query (Pd "?"), a clear
-// (empty Pd), an unknown selection target, or invalid base64. Control
-// characters other than HT, LF and CR are removed from the text.
+// (empty Pd), an unknown selection target, invalid base64 (padded base64 must
+// be complete), or a text left empty. Control characters other than HT, LF and
+// CR are removed from the text, then one trailing line break is dropped.
 func DecodeClipboardSet(content []byte) (string, bool) {
 	m := clipboardSet.FindSubmatch(content)
 	if m == nil || len(m[1]) == 0 {
 		return "", false
 	}
 	data := string(m[1])
-	raw, err := base64.StdEncoding.DecodeString(data)
-	if err != nil {
-		raw, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(data, "="))
+	// Padded base64 must be complete (a length that is a multiple of 4);
+	// unpadded base64 is accepted as is. This is the browser's forgiving
+	// base64, so every port decodes the same payloads.
+	enc := base64.RawStdEncoding
+	if strings.Contains(data, "=") {
+		enc = base64.StdEncoding
 	}
+	raw, err := enc.DecodeString(data)
 	if err != nil || !utf8.Valid(raw) {
 		return "", false
 	}
@@ -837,6 +844,16 @@ func DecodeClipboardSet(content []byte) (string, bool) {
 		}
 		return r
 	}, string(raw))
+	// One trailing line break is dropped: a copy-on-select rarely wants it,
+	// and it is what makes a pasted command run at once in a shell without
+	// bracketed paste. A copy that is only controls or one line break is not
+	// offered, so it can never clear the clipboard.
+	switch {
+	case strings.HasSuffix(text, "\r\n"):
+		text = text[:len(text)-2]
+	case strings.HasSuffix(text, "\n"), strings.HasSuffix(text, "\r"):
+		text = text[:len(text)-1]
+	}
 	if text == "" {
 		return "", false
 	}

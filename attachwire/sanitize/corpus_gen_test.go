@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -219,6 +220,49 @@ func corpusFixtures() []fixture {
 	}
 }
 
+// clipboardFixture pins the OSC 52 clipboard hook as well as the stream. The
+// stream for every one is the input minus the sequence; clip lists the texts
+// the hook must offer (empty: none).
+type clipboardFixture struct {
+	name, desc, in, want string
+	clip                 []string
+}
+
+func clipboardFixtures() []clipboardFixture {
+	return []clipboardFixture{
+		{
+			"osc52_set_offered", "an OSC 52 clipboard set is stripped from the stream and its decoded text is offered to the clipboard hook (bytes captured from a mouse-tracking REPL)",
+			"a\x1b]52;c;ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA==\x07b", "ab",
+			[]string{"  Fable 5.1 \u00b7 Claude Max"},
+		},
+		{
+			"osc52_query_not_offered", "an OSC 52 query is stripped and never offered or answered",
+			"\x1b]52;c;?\x07ok", "ok",
+			[]string{},
+		},
+		{
+			"osc52_controls_only_not_offered", "a set whose text is only control characters is not offered, so it can never clear the clipboard",
+			"\x1b]52;c;AQIb\x07ok", "ok",
+			[]string{},
+		},
+		{
+			"osc52_trailing_break_dropped", "one trailing line break is dropped from the offered text, so a pasted command does not run at once",
+			"\x1b]52;c;bHMgLWwK\x07ok", "ok",
+			[]string{"ls -l"},
+		},
+		{
+			"osc52_leading_bom_kept", "a leading BOM is kept in the offered text (every port decodes the same text; previews render it visibly)",
+			"\x1b]52;c;77u/aGk=\x07ok", "ok",
+			[]string{"\ufeffhi"},
+		},
+		{
+			"osc52_incomplete_padding_not_offered", "padded base64 must be complete: QQ= is rejected while unpadded QQ decodes",
+			"\x1b]52;c;QQ=\x07\x1b]52;c;QQ\x07ok", "ok",
+			[]string{"A"},
+		},
+	}
+}
+
 // TestGenerateCorpus regenerates testdata/corpus.json. It is skipped unless
 // GEN_CORPUS is set, and it fails loudly if any hand-authored `want` disagrees
 // with the reference sanitizer (contiguous OR split), so the emitted corpus is
@@ -257,6 +301,31 @@ func TestGenerateCorpus(t *testing.T) {
 			ExpectedOutput: base64.StdEncoding.EncodeToString([]byte(f.want)),
 			Disposition:    f.disp,
 			SpecRow:        f.row,
+		})
+	}
+
+	for _, f := range clipboardFixtures() {
+		if seen[f.name] {
+			t.Fatalf("duplicate fixture name %q", f.name)
+		}
+		seen[f.name] = true
+		var offered []string
+		got := string(NewWithOptions(Options{OnClipboard: func(text string) { offered = append(offered, text) }}).Write([]byte(f.in)))
+		if got != f.want || !slices.Equal(offered, f.clip) {
+			t.Fatalf("fixture %q: stream %q clipboard %q, want %q %q", f.name, got, offered, f.want, f.clip)
+		}
+		enc := make([]string, 0, len(f.clip))
+		for _, c := range f.clip {
+			enc = append(enc, base64.StdEncoding.EncodeToString([]byte(c)))
+		}
+		entries = append(entries, Entry{
+			Name:           f.name,
+			Description:    f.desc,
+			Input:          base64.StdEncoding.EncodeToString([]byte(f.in)),
+			ExpectedOutput: base64.StdEncoding.EncodeToString([]byte(f.want)),
+			Disposition:    "strip",
+			SpecRow:        "osc-52",
+			Clipboard:      &enc,
 		})
 	}
 

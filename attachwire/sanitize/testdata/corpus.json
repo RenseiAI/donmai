@@ -358,5 +358,67 @@
     "expected_output": "G1BxIzB+G1w=",
     "disposition": "pass",
     "spec_row": "dcs-sixel"
+  },
+  {
+    "name": "osc52_set_offered",
+    "description": "an OSC 52 clipboard set is stripped from the stream and its decoded text is offered to the clipboard hook (bytes captured from a mouse-tracking REPL)",
+    "input": "YRtdNTI7YztJQ0JHWVdKc1pTQTFMakVnd3JjZ1EyeGhkV1JsSUUxaGVBPT0HYg==",
+    "expected_output": "YWI=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA=="
+    ]
+  },
+  {
+    "name": "osc52_query_not_offered",
+    "description": "an OSC 52 query is stripped and never offered or answered",
+    "input": "G101MjtjOz8Hb2s=",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": []
+  },
+  {
+    "name": "osc52_controls_only_not_offered",
+    "description": "a set whose text is only control characters is not offered, so it can never clear the clipboard",
+    "input": "G101MjtjO0FRSWIHb2s=",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": []
+  },
+  {
+    "name": "osc52_trailing_break_dropped",
+    "description": "one trailing line break is dropped from the offered text, so a pasted command does not run at once",
+    "input": "G101MjtjO2JITWdMV3dLB29r",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "bHMgLWw="
+    ]
+  },
+  {
+    "name": "osc52_leading_bom_kept",
+    "description": "a leading BOM is kept in the offered text (every port decodes the same text; previews render it visibly)",
+    "input": "G101MjtjOzc3dS9hR2s9B29r",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "77u/aGk="
+    ]
+  },
+  {
+    "name": "osc52_incomplete_padding_not_offered",
+    "description": "padded base64 must be complete: QQ= is rejected while unpadded QQ decodes",
+    "input": "G101MjtjO1FRPQcbXTUyO2M7UVEHb2s=",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "QQ=="
+    ]
   }
 ]

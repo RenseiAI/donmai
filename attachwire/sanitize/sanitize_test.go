@@ -739,3 +739,42 @@ func TestClipboardSequenceRoundTrips(t *testing.T) {
 		t.Fatalf("round trip: out %q copies %q", out, copies)
 	}
 }
+
+// TestCorpusClipboardHook checks every fixture that pins the OSC 52 clipboard
+// hook, contiguously and split at every offset, so all ports offer the same
+// texts for the same bytes.
+func TestCorpusClipboardHook(t *testing.T) {
+	entries, err := ConformanceCorpus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := 0
+	for _, e := range entries {
+		want, ok, err := e.ClipboardTexts()
+		if err != nil {
+			t.Fatalf("%s: %v", e.Name, err)
+		}
+		if !ok {
+			continue
+		}
+		pinned++
+		in, _ := e.InputBytes()
+		for split := 0; split <= len(in); split++ {
+			var got []string
+			s := NewWithOptions(Options{OnClipboard: func(text string) { got = append(got, text) }})
+			s.Write(in[:split])
+			s.Write(in[split:])
+			if len(got) != len(want) {
+				t.Fatalf("%s split %d: offered %q, want %q", e.Name, split, got, want)
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("%s split %d: offered %q, want %q", e.Name, split, got, want)
+				}
+			}
+		}
+	}
+	if pinned < 6 {
+		t.Fatalf("only %d corpus fixtures pin the clipboard hook, want at least 6", pinned)
+	}
+}
