@@ -162,16 +162,49 @@ type Snapshot struct {
 // It mirrors the daemon's matchProject leniency so a Linear project slug
 // and a git URL that refer to the same repo both match: exact, or either
 // being the "/"-suffix of the other.
+//
+// Both sides are normalized first (normalizeRepoRef): the daemon reports
+// clone URLs such as "https://github.com/o/a.git" while the CWD scope is
+// usually "o/a", and an SSH remote spells the same repo "git@github.com:o/a.git".
+// Without normalization a ".git" suffix alone hid every session from a
+// scoped watch.
 func repoMatch(scope, repo string) bool {
-	if scope == "" {
+	if strings.TrimSpace(scope) == "" {
 		return true
 	}
-	if repo == "" {
+	scope, repo = normalizeRepoRef(scope), normalizeRepoRef(repo)
+	if repo == "" || scope == "" {
 		return false
 	}
 	return scope == repo ||
 		strings.HasSuffix(repo, "/"+scope) ||
 		strings.HasSuffix(scope, "/"+repo)
+}
+
+// normalizeRepoRef reduces a repository reference to a lowercase
+// "owner/name"-style path: it drops a URL scheme, a user ("git@"), an SCP-style
+// "host:" separator, a leading host segment, trailing slashes and a ".git"
+// suffix. A bare slug ("donmai") or "owner/name" passes through lowercased.
+func normalizeRepoRef(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.Index(s, "@"); i >= 0 {
+		s = s[i+1:]
+	}
+	// SCP-style remote: "host:owner/name" (a colon before any slash).
+	if i := strings.Index(s, ":"); i >= 0 && !strings.Contains(s[:i], "/") {
+		s = s[:i] + "/" + s[i+1:]
+	}
+	s = strings.TrimRight(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	s = strings.TrimRight(s, "/")
+	// Drop a leading host segment ("github.com/...").
+	if i := strings.Index(s, "/"); i >= 0 && strings.Contains(s[:i], ".") {
+		s = s[i+1:]
+	}
+	return s
 }
 
 // Snapshot performs one index poll and returns the scoped, header-enriched
