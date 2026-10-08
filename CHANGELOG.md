@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.69 — 2026-10-08
+
 ### Features
 
 - The viewer sanitizer offers OSC 52 clipboard sets to viewers through a new `Options.OnClipboard` hook, so a viewer can put a copied selection on its own clipboard under its own policy, for example behind a copy preview. The sanitized stream is unchanged and still strips every OSC 52. Queries, clears, unknown selection targets, invalid base64 or UTF-8 and control-only texts are never offered, control characters other than tab and line breaks are removed, and one trailing line break is dropped. `DecodeClipboardSet` and `ClipboardSequence` are exported for viewers.
