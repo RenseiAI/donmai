@@ -287,6 +287,9 @@ type DaemonStatsResponse struct {
 	Pool *WorkareaPoolStats `json:"pool,omitempty"`
 	// ByMachine is the per-machine breakdown (populated with --by-machine).
 	ByMachine []MachineStats `json:"byMachine,omitempty"`
+	// RepoKeeper is the secret-free repository-keeper snapshot (mirror count,
+	// last fetch, revoked count, bytes). Nil when the keeper is disabled.
+	RepoKeeper *RepoKeeperStats `json:"repoKeeper,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
 
