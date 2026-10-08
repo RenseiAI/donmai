@@ -3224,8 +3224,6 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 // prior incarnation ended carries one past the highest epoch on disk —
 // records and tombstones alike — so two launches never alias.
 func TestLaunchContractEpochAdvancesPastPriorIncarnations(t *testing.T) {
-	t.Parallel()
-
 	f := newShimSpawnFixture(t)
 	d := f.daemon
 	registry, err := d.sessionShimRegistry()
@@ -3289,8 +3287,6 @@ func TestLaunchContractEpochAdvancesPastPriorIncarnations(t *testing.T) {
 // new identity, past the highest prior incarnation after one ended — not a
 // constant.
 func TestLaunchedSessionCarriesContractEpoch(t *testing.T) {
-	t.Parallel()
-
 	f := newShimSpawnFixture(t)
 	spec := f.interactiveSpec("sess-launch-epoch")
 	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
