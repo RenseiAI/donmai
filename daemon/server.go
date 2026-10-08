@@ -236,7 +236,13 @@ func (s *Server) gateHandler(mux http.Handler) http.Handler {
 				return
 			}
 			callback := strings.HasPrefix(r.URL.Path, localRuntimePrefix+"/api/sessions/")
-			if r.Method != http.MethodGet && r.Method != http.MethodHead && !callback && local.auth.VerifyOperator(localBearer(r)) != nil {
+			// A local worker's quota update carries its attempt
+			// credential, never the operator one. It reaches the
+			// handler like any other session callback, where the
+			// attempt is verified against the session it names.
+			_, usageCallback := sessionUsagePath(r.URL.Path)
+			usageCallback = usageCallback && r.Method == http.MethodPost
+			if r.Method != http.MethodGet && r.Method != http.MethodHead && !callback && !usageCallback && local.auth.VerifyOperator(localBearer(r)) != nil {
 				http.Error(w, "operator authentication required", http.StatusUnauthorized)
 				return
 			}
@@ -286,11 +292,16 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/sessions", s.requireControlAuth(s.handleSessions)) // GET=list, POST=accept
 	// Per-session sub-routes. Spawned `donmai agent run` processes fetch
 	// their full QueuedWork shape via GET <id>; the deterministic cancel
-	// wire posts to <id>/stop to kill exactly one session + free its slot.
+	// wire posts to <id>/stop to kill exactly one session + free its slot;
+	// live workers post streamed quota updates to <id>/usage.
 	// The path-pattern dispatch is custom because the stdlib mux only
 	// supports prefix matching pre-Go 1.22 in this codebase, so the single
-	// prefix handler multiplexes both shapes.
-	mux.HandleFunc("/api/daemon/sessions/", s.requireControlAuth(s.handleSessionSubroute))
+	// prefix handler multiplexes the shapes. The usage leaf bypasses the
+	// blanket mutating gate on purpose: workers never hold the operator
+	// control token, so handleSessionUsage enforces its own session-scoped
+	// credential (the session's read credential, or the local attempt
+	// credential) instead. Every other leaf keeps the gate.
+	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionSubrouteAuth)
 	mux.HandleFunc("/api/daemon/heartbeat", s.method(http.MethodGet, s.handleHeartbeat))
 	mux.HandleFunc("/api/daemon/doctor", s.method(http.MethodGet, s.handleDoctor))
 	// providers (Wave 9)
@@ -703,6 +714,39 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// sessionUsagePath reports whether path targets a session usage
+// update (/api/daemon/sessions/<id>/usage with a non-empty id) and
+// returns the session id. The usage leaf is the one subroute a worker
+// may call with its own session-scoped credential instead of the
+// operator control token, so the auth dispatcher recognizes it before
+// the mutating gate runs. Method matching stays with the callers:
+// only POSTs take the session-scoped path.
+func sessionUsagePath(path string) (string, bool) {
+	const prefix = "/api/daemon/sessions/"
+	tail, ok := strings.CutPrefix(path, prefix)
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(tail, "/usage")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
+}
+
+// handleSessionSubrouteAuth is the registered prefix handler for
+// /api/daemon/sessions/. It steers the usage leaf to its own
+// session-scoped auth and holds every other leaf behind the control
+// gate, so a worker's quota update never needs the operator token
+// while stop and accept keep it.
+func (s *Server) handleSessionSubrouteAuth(w http.ResponseWriter, r *http.Request) {
+	if id, ok := sessionUsagePath(r.URL.Path); ok && r.Method == http.MethodPost {
+		s.handleSessionUsage(w, r, id)
+		return
+	}
+	s.requireControlAuth(s.handleSessionSubroute)(w, r)
+}
+
 // handleSessionSubroute multiplexes the per-session paths under the
 // /api/daemon/sessions/ prefix:
 //
@@ -712,7 +756,10 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 //
 // A single prefix handler is used because the stdlib mux only supports
 // prefix matching pre-Go 1.22 in this codebase. The path tail is parsed
-// here so each leaf handler sees a clean session id.
+// here so each leaf handler sees a clean session id. The usage leaf
+// only reaches this multiplexer for non-POST methods (a GET on the
+// usage path answers 405 from the leaf); usage POSTs are steered to
+// the leaf directly by handleSessionSubrouteAuth.
 func (s *Server) handleSessionSubroute(w http.ResponseWriter, r *http.Request) {
 	const prefix = "/api/daemon/sessions/"
 	tail := strings.TrimPrefix(r.URL.Path, prefix)
