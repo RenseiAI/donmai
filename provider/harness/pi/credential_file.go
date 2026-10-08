@@ -44,6 +44,20 @@ const credentialFileName = "session-credentials.json"
 // child env on both spawn lanes.
 const credentialFileEnvVar = "DONMAI_PI_CREDENTIALS_FILE" //nolint:gosec // G101: env-var NAME, never credential bytes.
 
+// gatewayBearerEnvVar is the env-var NAME the worker-local translating
+// gateway's per-session bearer rides under when it arrives on the spec
+// (gateway.TokenEnvVar). It is spelled literally here rather than imported:
+// the gateway package's own dependency set must stay independent of any one
+// harness, and this name is the stable cross-package contract both read.
+// The bearer is a per-session secret — a same-user process listing of the
+// renamed pi child renders it exactly like a provider key — so it rides
+// the session credential file like every other session credential, never
+// the child env. The file rail carries the same bearer under PiKeyEnvVar
+// (applyEndpoint mirrors the binding key there), so the env copy is
+// redundant exposure: stripping it loses the child nothing it cannot read
+// from the file.
+const gatewayBearerEnvVar = "DONMAI_GW_TOKEN" //nolint:gosec // G101: env-var NAME, never credential bytes.
+
 // sessionCredential is one named credential the file carries: the env-var
 // name the value would have ridden under, and the value itself.
 type sessionCredential struct {
@@ -64,8 +78,8 @@ type sessionCredentialFile struct {
 }
 
 // stripCredentialNamedEnv drops every child-env entry whose NAME is a
-// session credential name (PiKeyEnvVar or a provider-native credential
-// var), wherever it came from — Spec.Env or the inherited parent. The
+// session credential name (PiKeyEnvVar, the gateway bearer, or a
+// provider-native credential var), wherever it came from — Spec.Env or the inherited parent. The
 // session's own credential values ride the credential file instead; an
 // inherited copy is never the session's credential, so dropping it loses
 // nothing the child is entitled to read.
@@ -92,15 +106,16 @@ func credentialFilePath(layout sessionLayout) string {
 }
 
 // sessionCredentialEntries fans the session's credential values out of the
-// spec: the injected-provider key (PiKeyEnvVar) plus any provider-native
-// credential mirror applyEndpoint placed on Spec.Env, in deterministic
-// (sorted) order. Non-credential Spec.Env bindings are NOT entries — they
+// spec: the injected-provider key (PiKeyEnvVar), the gateway binding bearer
+// (gatewayBearerEnvVar), plus any provider-native credential mirror
+// applyEndpoint placed on Spec.Env, in deterministic (sorted) order.
+// Non-credential Spec.Env bindings are NOT entries — they
 // keep riding the child env unchanged through composeChildEnv. An empty
 // value never becomes an entry: an unset credential must read as absent in
 // the child, not as an empty key that shadows nothing.
 func sessionCredentialEntries(spec agent.Spec) []sessionCredential {
-	names := make([]string, 0, len(builtinProviderCredentialEnv)+1)
-	names = append(names, PiKeyEnvVar)
+	names := make([]string, 0, len(builtinProviderCredentialEnv)+2)
+	names = append(names, PiKeyEnvVar, gatewayBearerEnvVar)
 	for _, name := range builtinProviderCredentialEnv {
 		duplicate := false
 		for _, have := range names {
@@ -320,19 +335,19 @@ func sessionCredentialEnv(childEnv []string, path string) []string {
 
 // isSessionCredentialEnv reports whether a child-env entry carries a
 // session credential VALUE (as opposed to the credential file's path).
-// It covers the injected-provider key plus every provider-native
-// credential var (builtinProviderCredentialEnv) wherever they arrive — on
-// Spec.Env OR inherited from the parent process (an embedding supervisor
-// may re-admit a blocklisted name it injected itself through
-// InjectedEnvKeysVar, and the gateway's own upstream refusal does not cover
-// every snapshot key). Tests use it to assert the spawned child's env holds
-// no secret.
+// It covers the injected-provider key, the gateway binding bearer, plus
+// every provider-native credential var (builtinProviderCredentialEnv)
+// wherever they arrive — on Spec.Env OR inherited from the parent process
+// (an embedding supervisor may re-admit a blocklisted name it injected
+// itself through InjectedEnvKeysVar, and the gateway's own upstream refusal
+// does not cover every snapshot key). Tests use it to assert the spawned
+// child's env holds no secret.
 func isSessionCredentialEnv(entry string) bool {
 	key := entry
 	if i := strings.IndexByte(entry, '='); i >= 0 {
 		key = entry[:i]
 	}
-	if key == PiKeyEnvVar {
+	if key == PiKeyEnvVar || key == gatewayBearerEnvVar {
 		return true
 	}
 	for _, name := range builtinProviderCredentialEnv {

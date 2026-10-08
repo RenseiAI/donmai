@@ -464,3 +464,171 @@ func TestCredentialSnapshotParity_CredentialValuesRideFilesNotEnv(t *testing.T) 
 		t.Errorf("handshake token missing; the env under test is not the headless lane")
 	}
 }
+
+// TestGatewayBearerRidesFileNotChildEnv is the gateway-binding regression
+// test: a gateway binding carrying its per-session bearer under Endpoint.Env
+// must deliver that bearer through the session credential file, never the
+// child env, on BOTH lanes. applyEndpoint mirrors the binding key onto
+// PiKeyEnvVar, so the env copy of the bearer is redundant exposure — the
+// renamed pi child renders it to same-user listings either way.
+//
+// Drives the production entry points: applyEndpoint (the binding merge),
+// composeChildEnv (headless lane) and interactiveChildEnv (PTY lane), plus a
+// live headless Spawn against the fake recorder asserting the same.
+//
+// RED proof: drop the bearer from sessionCredentialEntries and the bearer
+// assertions below fail with the sentinel quoted in the child env.
+func TestGatewayBearerRidesFileNotChildEnv(t *testing.T) {
+	// Not parallel: asserts on inherited-env stripping behavior.
+	const bearer = "gw-bearer-must-not-ride-child-env"
+	binding := &agent.EndpointBinding{
+		Company:  agent.CompanyOpenAI,
+		Model:    "served-model",
+		BaseURL:  "http://127.0.0.1:8080/v1",
+		Host:     agent.HostGateway,
+		Protocol: agent.ProtoOpenAIChat,
+		Env:      map[string]string{gatewayBearerEnvVar: bearer},
+	}
+	projected, err := applyEndpoint(agent.Spec{Cwd: t.TempDir(), Endpoint: binding})
+	if err != nil {
+		t.Fatalf("applyEndpoint rejected a routable gateway binding: %v", err)
+	}
+
+	// The projected spec carries the bearer twice: verbatim under its binding
+	// name and mirrored onto the injected-provider key.
+	if projected.Env[gatewayBearerEnvVar] != bearer {
+		t.Fatalf("binding bearer missing from projected spec env: %v", projected.Env)
+	}
+	if projected.Env[PiKeyEnvVar] != bearer {
+		t.Fatalf("binding key not mirrored onto %s: %v", PiKeyEnvVar, projected.Env)
+	}
+
+	// The credential file fans both copies out; the headless lane strips both.
+	entries := sessionCredentialEntries(projected)
+	byName := make(map[string]string, len(entries))
+	for _, e := range entries {
+		byName[e.Env] = e.Value
+	}
+	if byName[gatewayBearerEnvVar] != bearer {
+		t.Errorf("credential file %s = %q, want the bearer", gatewayBearerEnvVar, byName[gatewayBearerEnvVar])
+	}
+	if byName[PiKeyEnvVar] != bearer {
+		t.Errorf("credential file %s = %q, want the mirrored bearer", PiKeyEnvVar, byName[PiKeyEnvVar])
+	}
+
+	layout := newSessionLayout(t.TempDir())
+	headless := composeChildEnv(projected, layout, "sess-token")
+	for _, e := range headless {
+		if isSessionCredentialEnv(e) {
+			t.Fatalf("gateway bearer rides the headless child env by name: %q", e)
+		}
+		if i := strings.IndexByte(e, '='); i >= 0 && strings.Contains(e[i+1:], bearer) {
+			t.Fatalf("gateway bearer rides the headless child env by value: %q", e)
+		}
+	}
+	if !hasEnvVal(headless, piHandshakeEnvVar, "sess-token") {
+		t.Errorf("handshake token missing; the env under test is not the headless lane")
+	}
+
+	// Interactive lane: same bearer, same strip, through its own override map.
+	interactive := interactiveChildEnv(projected, layout)
+	for k, v := range interactive {
+		if isSessionCredentialEnv(k + "=" + v) {
+			t.Fatalf("gateway bearer rides the interactive child env by name: %q", k)
+		}
+		if strings.Contains(v, bearer) {
+			t.Fatalf("gateway bearer rides the interactive child env by value: %q=%q", k, v)
+		}
+	}
+}
+
+// TestHeadlessSpawn_GatewayBearerAbsentFromChildEnv drives a live headless
+// Spawn with a gateway binding carrying the bearer and asserts the recorded
+// child env carries the credential file's path but neither bearer copy.
+// The spawn is expected to fail (the fake never answers the handshake);
+// what matters is the child was exec'd with the production env.
+func TestHeadlessSpawn_GatewayBearerAbsentFromChildEnv(t *testing.T) {
+	if os.Getenv("SHELL") == "" && os.Getenv("OS") != "" {
+		t.Skip("fake pi recorder needs /bin/sh")
+	}
+	const bearer = "gw-bearer-must-not-ride-child-env"
+	dir := t.TempDir()
+	fake := fakeArgvRecorderPi(t, dir)
+
+	p, err := New(Options{
+		PiBin:            fake,
+		HandshakeTimeout: 30 * time.Second,
+		VersionProbe:     func(context.Context, string) (string, error) { return PinnedVersion, nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	workdir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	spawnErr := make(chan error, 1)
+	go func() {
+		_, err := p.Spawn(ctx, agent.Spec{
+			Cwd:    workdir,
+			Prompt: "prove gateway bearer rides file not env",
+			Endpoint: &agent.EndpointBinding{
+				Company:  agent.CompanyOpenAI,
+				Model:    "served-model",
+				BaseURL:  "http://127.0.0.1:8080/v1",
+				Host:     agent.HostGateway,
+				Protocol: agent.ProtoOpenAIChat,
+				Env:      map[string]string{gatewayBearerEnvVar: bearer},
+			},
+		})
+		spawnErr <- err
+	}()
+
+	_ = waitForArgvRecord(t, filepath.Join(dir, "argv"), 20*time.Second)
+	envRaw := waitForArgvRecord(t, filepath.Join(dir, "child-env"), 20*time.Second)
+	var credPath string
+	for _, entry := range strings.Split(envRaw, "\n") {
+		if strings.HasPrefix(entry, credentialFileEnvVar+"=") {
+			credPath = strings.TrimPrefix(entry, credentialFileEnvVar+"=")
+		}
+	}
+	if credPath == "" {
+		t.Fatalf("child env carries no %s pointer; the session has no credential rail:\n%s", credentialFileEnvVar, envRaw)
+	}
+	got, err := readSessionCredentialFile(credPath)
+	if err != nil {
+		t.Fatalf("read session credential file: %v", err)
+	}
+	if got[gatewayBearerEnvVar] != bearer {
+		t.Errorf("credential file %s = %q, want the bearer", gatewayBearerEnvVar, got[gatewayBearerEnvVar])
+	}
+	if got[PiKeyEnvVar] != bearer {
+		t.Errorf("credential file %s = %q, want the mirrored bearer", PiKeyEnvVar, got[PiKeyEnvVar])
+	}
+
+	cancel()
+	select {
+	case err := <-spawnErr:
+		if err == nil {
+			t.Fatal("Spawn against a handshake-silent fake unexpectedly succeeded")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Spawn did not return after context cancellation")
+	}
+
+	for _, entry := range strings.Split(envRaw, "\n") {
+		if entry == "" {
+			continue
+		}
+		if isSessionCredentialEnv(entry) {
+			t.Fatalf("gateway binding bearer rides the spawned child env by name: %q", entry)
+		}
+		if i := strings.IndexByte(entry, '='); i >= 0 && strings.Contains(entry[i+1:], bearer) {
+			t.Fatalf("gateway binding bearer rides the spawned child env by value: %q", entry)
+		}
+	}
+	if _, statErr := os.Stat(credPath); !os.IsNotExist(statErr) {
+		t.Errorf("session credential file still exists after Stop: %s", credPath)
+	}
+}
