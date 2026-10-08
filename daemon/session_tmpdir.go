@@ -569,8 +569,10 @@ func (s *WorkerSpawner) SweepSessionTmpDirs(liveIDs map[string]struct{}) Session
 
 // sweepSessionTmpDirs reclaims per-session scratch directories recorded by
 // a previous daemon generation for sessions that are no longer running.
-// Live adopted lineages (known because adoption ran earlier in Start) keep
-// their directories. It never fails startup.
+// Live adopted and quarantined lineages (known because adoption ran earlier
+// in Start) keep their directories: a quarantined lineage keeps its shim
+// alive by design, so its worker's live scratch must survive the sweep.
+// It never fails startup.
 func (d *Daemon) sweepSessionTmpDirs() {
 	if d.spawner == nil {
 		return
@@ -578,6 +580,9 @@ func (d *Daemon) sweepSessionTmpDirs() {
 	live := map[string]struct{}{}
 	for _, id := range d.AdoptedSessionShims() {
 		live[id.SessionID] = struct{}{}
+	}
+	for _, q := range d.QuarantinedSessions() {
+		live[q.SessionID] = struct{}{}
 	}
 	report := d.spawner.SweepSessionTmpDirs(live)
 	if report.Examined == 0 {

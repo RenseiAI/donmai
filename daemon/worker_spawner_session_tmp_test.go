@@ -11,7 +11,9 @@ package daemon
 // remove the reaper cleanup, and the gone-after-end assertions fail.
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -323,6 +325,71 @@ func TestSpawner_SessionTmp_NoKeyLeavesEnvAlone(t *testing.T) {
 	for _, key := range append([]string{SessionTmpDirEnv}, sessionTmpBindingKeys...) {
 		if got[key] != parent[key] {
 			t.Fatalf("%s = %q, want the inherited %q: the composition must add nothing without a stamped key", key, got[key], parent[key])
+		}
+	}
+}
+
+// TestSpawner_SessionTmp_NoKeyDirectSpawnAddsNoBindings pins AC-5 on the
+// direct spawn path at the launch level: with no advisory key the executor
+// adds no binding of its own — the spawn env carries no TMPDIR/TMP/TEMP
+// entry whose value is the (empty) claim dir. The direct-path owned() gate
+// decides this; deleting it (an unconditional applySessionTmpBindings with
+// an empty claim dir) binds three empty variables, and this test goes RED.
+// Inherited host values pass through untouched: the assertion is on empty
+// executor bindings, not on absence. The captured env is what startCommand
+// receives — the seam immediately before the real exec.
+func TestSpawner_SessionTmp_NoKeyDirectSpawnAddsNoBindings(t *testing.T) {
+	t.Parallel()
+	var gotEnv []string
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects: []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+	})
+	s.startCommand = func(cmd *exec.Cmd) error {
+		gotEnv = append([]string(nil), cmd.Env...)
+		return errors.New("controlled capture: never start a real worker")
+	}
+	if _, err := s.AcceptWork(seatTmpSpec("seat-no-key-direct", "")); err == nil {
+		t.Fatal("expected the controlled capture failure, got an accept")
+	}
+	if gotEnv == nil {
+		t.Fatal("startCommand never ran: no spawn env to assert on")
+	}
+	bound := envToMapSessionTmpTest(gotEnv)
+	for _, key := range sessionTmpBindingKeys {
+		if value, present := bound[key]; present && value == "" {
+			t.Fatalf("direct spawn env carries an empty executor %s binding with no advisory key: the executor must add nothing", key)
+		}
+	}
+}
+
+// TestSpawner_SessionTmp_NoKeyShimSpawnAddsNoBindings pins AC-5 on the shim
+// spawn path at the launch level: with no advisory key the executor adds no
+// binding of its own — the env handed to the shim launcher carries no
+// TMPDIR/TMP/TEMP entry whose value is the (empty) claim dir. The shim-path
+// owned() gate decides this; deleting it binds three empty variables, and
+// this test goes RED. Inherited host values pass through untouched.
+func TestSpawner_SessionTmp_NoKeyShimSpawnAddsNoBindings(t *testing.T) {
+	t.Parallel()
+	var gotEnv []string
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects: []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		ShimOwns: func(SessionSpec) bool { return true },
+		ShimSpawn: func(_ SessionSpec, _ ProjectConfig, env []string) (*SessionHandle, error) {
+			gotEnv = append([]string(nil), env...)
+			return &SessionHandle{SessionID: "seat-no-key-shim", State: SessionRunning}, nil
+		},
+	})
+	if _, err := s.AcceptWork(seatTmpSpec("seat-no-key-shim", "")); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	t.Cleanup(func() { s.CleanupSessionTmpDir("seat-no-key-shim") })
+	if gotEnv == nil {
+		t.Fatal("shim launcher never ran: no spawn env to assert on")
+	}
+	bound := envToMapSessionTmpTest(gotEnv)
+	for _, key := range sessionTmpBindingKeys {
+		if value, present := bound[key]; present && value == "" {
+			t.Fatalf("shim spawn env carries an empty executor %s binding with no advisory key: the executor must add nothing", key)
 		}
 	}
 }

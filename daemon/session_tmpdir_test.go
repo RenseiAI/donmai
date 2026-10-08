@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // TestValidateSessionTmpDir pins every acceptance and every refusal. Each
@@ -281,8 +283,14 @@ func TestSweepSessionTmpDirs(t *testing.T) {
 	if _, err := ensureSessionTmpDir(live); err != nil {
 		t.Fatal(err)
 	}
-	squat, err := os.MkdirTemp("", "sweep-squat-outside-tmp-*")
-	if err != nil {
+	// A recorded path outside /tmp must be dropped without deleting, on
+	// every platform. os.MkdirTemp("", ...) cannot pin that: on Linux it
+	// lands inside /tmp, where it passes validation and is removed. A
+	// scratch entry built under recordDir (t.TempDir()) is nested at least
+	// two levels under the platform temp dir on every platform, so it
+	// always fails validation as "not a direct child" and is dropped.
+	squat := filepath.Join(recordDir, "outside-tmp", "sweep-squat-outside-tmp")
+	if err := os.MkdirAll(squat, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(squat) })
@@ -341,6 +349,74 @@ func TestSweepSessionTmpDirs(t *testing.T) {
 	}
 	if len(after.Entries) != 1 || after.Entries["live"].Path != live {
 		t.Fatalf("record after sweep = %+v, want only the live entry", after.Entries)
+	}
+}
+
+// TestSweepSessionTmpDirs_QuarantinedKeptLive pins that the startup sweep
+// protects quarantined lineages: the daemon-side entry point builds its
+// live set from adopted identities plus quarantined session ids, because a
+// quarantined lineage keeps its shim alive and its worker's live scratch
+// must survive a daemon restart. Driven through (d *Daemon),
+// sweepSessionTmpDirs — the production crash-recovery entry point — with a
+// daemon carrying one adopted identity and one quarantined session, so
+// narrowing the live set to adopted identities alone goes RED.
+func TestSweepSessionTmpDirs_QuarantinedKeptLive(t *testing.T) {
+	t.Parallel()
+	recordDir := t.TempDir()
+	spawner := NewWorkerSpawner(SpawnerOptions{SessionTmpRecordDir: recordDir})
+
+	adoptedDir := filepath.Join("/tmp", "sweep-quarantined-adopted")
+	quarantinedDir := filepath.Join("/tmp", "sweep-quarantined-live")
+	deadDir := filepath.Join("/tmp", "sweep-quarantined-dead")
+	for _, dir := range []string{adoptedDir, quarantinedDir, deadDir} {
+		_ = os.RemoveAll(dir)
+		if _, err := ensureSessionTmpDir(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(adoptedDir)
+		_ = os.RemoveAll(quarantinedDir)
+		_ = os.RemoveAll(deadDir)
+	})
+
+	record := sessionTmpRecord{Version: 1, Entries: map[string]sessionTmpRecordEntry{
+		"adopted":     {Path: adoptedDir},
+		"quarantined": {Path: quarantinedDir},
+		"dead":        {Path: deadDir},
+	}}
+	if err := saveSessionTmpRecord(recordDir, record); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{
+		spawner: spawner,
+		shims: &sessionShimState{
+			adopted: map[sessionshim.Identity]adoptedShim{
+				{OrgID: "org-quarantine", SessionID: "adopted"}: {},
+			},
+			quarantined: []sessionshim.QuarantinedSession{
+				{OrgID: "org-quarantine", SessionID: "quarantined", ConsumesCapacity: true},
+			},
+		},
+	}
+	d.sweepSessionTmpDirs()
+
+	if _, err := os.Lstat(adoptedDir); err != nil {
+		t.Fatalf("adopted session directory swept: %v", err)
+	}
+	if _, err := os.Lstat(quarantinedDir); err != nil {
+		t.Fatalf("quarantined session directory swept: the sweep deletes a live lineage's scratch: %v", err)
+	}
+	if _, err := os.Lstat(deadDir); !os.IsNotExist(err) {
+		t.Fatalf("dead session directory survives the sweep: %v", err)
+	}
+	after, err := loadSessionTmpRecord(recordDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Entries) != 2 || after.Entries["adopted"].Path != adoptedDir || after.Entries["quarantined"].Path != quarantinedDir {
+		t.Fatalf("record after sweep = %+v, want only the adopted and quarantined entries", after.Entries)
 	}
 }
 
