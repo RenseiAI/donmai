@@ -445,8 +445,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if withPool {
 		stats, err := s.poolStats(r.Context())
 		if err == nil {
-			redactPoolStats(stats)
-			resp.Pool = stats
+			resp.Pool = redactPoolStats(stats)
 		}
 	}
 	if byMachine {
@@ -676,8 +675,8 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	redactPoolStats(stats)
-	writeJSON(w, http.StatusOK, stats)
+	redacted := redactPoolStats(stats)
+	writeJSON(w, http.StatusOK, redacted)
 }
 
 func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
@@ -1066,10 +1065,10 @@ func safeOrchestratorURL(c *Config) string {
 	return c.Orchestrator.URL
 }
 
-// safeProjectRepos returns the list of repository URLs in the project
-// allowlist for inclusion in DaemonStatsResponse.AllowedProjects.
-// Embedded credentials are redacted: the route answers unauthenticated
-// local GETs, so a user:token@ authority must never be served verbatim.
+// safeProjectRepos routes the allowlist through redactRepositoryURLs so
+// the served list has exactly one redaction point: every future caller
+// that needs the same shape reuses this helper instead of growing a
+// second list path.
 func safeProjectRepos(c *Config) []string {
 	if c == nil {
 		return nil
@@ -1078,24 +1077,33 @@ func safeProjectRepos(c *Config) []string {
 	if len(projects) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(projects))
+	raw := make([]string, 0, len(projects))
 	for _, p := range projects {
-		out = append(out, redactRepositoryURL(p.Repository))
+		raw = append(raw, p.Repository)
 	}
-	return out
+	return redactRepositoryURLs(raw)
 }
 
-// redactPoolStats drops embedded credentials from every pool member
-// repository URL before the snapshot is served. The snapshot may come
+// redactPoolStats returns a copy of stats with embedded credentials
+// dropped from every pool member repository URL. The snapshot may come
 // from a downstream provider the daemon does not control, so the
-// redaction happens here, at the serving boundary.
-func redactPoolStats(stats *afclient.WorkareaPoolStats) {
+// redaction happens here, at the serving boundary. The copy keeps the
+// provider's snapshot untouched: a provider returning a shared or cached
+// pointer must never have its live state rewritten, and concurrent reads
+// must not race on the same backing array.
+func redactPoolStats(stats *afclient.WorkareaPoolStats) *afclient.WorkareaPoolStats {
 	if stats == nil {
-		return
+		return nil
 	}
-	for i := range stats.Members {
-		stats.Members[i].Repository = redactRepositoryURL(stats.Members[i].Repository)
+	out := *stats
+	if stats.Members != nil {
+		out.Members = make([]afclient.WorkareaPoolMember, len(stats.Members))
+		copy(out.Members, stats.Members)
+		for i := range out.Members {
+			out.Members[i].Repository = redactRepositoryURL(out.Members[i].Repository)
+		}
 	}
+	return &out
 }
 
 // buildRegistrationStats summarises the daemon's registration / heartbeat /

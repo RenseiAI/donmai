@@ -774,6 +774,12 @@ func redactSessionDetail(d *SessionDetail) *SessionDetail {
 	out.AuthToken = ""
 	out.McpAuthToken = ""
 	out.McpAuthTokenExpiresAt = ""
+	// The redacted copy answers credential-free local reads, so the
+	// operator-configured repository URL is served userinfo-redacted: a
+	// user:token@ authority would otherwise be readable by anything on
+	// the box. The stored original keeps the functional URL the worker
+	// clones from; credentialed reads serve it untouched.
+	out.Repository = redactRepositoryURL(out.Repository)
 	// The operational payload is the canonical projection of the raw poll
 	// item (executioncell.ProjectOperationalPayload), so it repeats every
 	// credential the item carried, mcpAuthToken included. Only the worker's

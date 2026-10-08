@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,13 +95,18 @@ func rawControlBody(t *testing.T, addr, path string) string {
 // list (display-only projection of the inbound spec).
 //
 // RED: serve any of these URLs unredacted and the raw-body assertion
-// fails with the sentinel quoted in the failure output.
+// fails with the sentinel quoted in the failure output. The daemon runs
+// the control gate enforced, so the detail assertion pins the
+// credential-free projection exactly as the blocking probe drove it:
+// no bearer, redacted repository, still 200.
 func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 	credentialed := urlRedactSentinelRaw()
 	d, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
 		o.PoolStatsProvider = stubPoolStatsProvider{members: []afclient.WorkareaPoolMember{
 			{ID: "pool-1", Repository: credentialed, Ref: "main", Status: afclient.PoolMemberReady},
 		}}
+		o.RequireControlToken = true
+		o.ControlToken = testControlToken
 	})
 	defer cleanup()
 	d.mu.Lock()
@@ -121,12 +127,14 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 		"/api/daemon/stats?pool=true",
 		"/api/daemon/pool/stats",
 		"/api/daemon/sessions",
+		"/api/daemon/sessions/sess-cred-url",
 	} {
 		assertNoURLCredential(t, "GET "+path, rawControlBody(t, srv.Addr(), path))
 	}
 
-	// The stored detail keeps the functional URL: redaction is a serving
-	// projection, and the worker clones from the credentialed read.
+	// The credentialed reads keep the functional URL: redaction is a
+	// serving projection for credential-free reads, and the worker
+	// clones from the credentialed read.
 	stored, ok := d.SessionDetail("sess-cred-url")
 	if !ok {
 		t.Fatal("stored detail missing")
@@ -134,9 +142,34 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 	if stored.Repository != credentialed {
 		t.Errorf("stored detail Repository = %q, want the functional URL %q", stored.Repository, credentialed)
 	}
+	readTok, ok := d.sessionReadToken("sess-cred-url")
+	if !ok || readTok == "" {
+		t.Fatal("no read credential minted for sess-cred-url")
+	}
+	for _, bearer := range []string{testControlToken, readTok} {
+		req, err := http.NewRequest(http.MethodGet, "http://"+srv.Addr()+"/api/daemon/sessions/sess-cred-url", nil) //nolint:gosec,noctx
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("credentialed GET: %v", err)
+		}
+		raw, err := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if err != nil || res.StatusCode != http.StatusOK {
+			t.Fatalf("credentialed GET = %d (%v): %s", res.StatusCode, err, raw)
+		}
+		if !strings.Contains(string(raw), credentialed) {
+			t.Errorf("credentialed read lost the functional URL: %s", raw)
+		}
+	}
 }
 
 // stubPoolStatsProvider serves a fixed pool snapshot for redaction tests.
+// The provider below also records the snapshot pointer it hands out so
+// the copy test can prove serving never rewrites provider-owned state.
 type stubPoolStatsProvider struct {
 	members []afclient.WorkareaPoolMember
 }
@@ -146,6 +179,61 @@ func (s stubPoolStatsProvider) Stats(_ context.Context) (*afclient.WorkareaPoolS
 		Members:   append([]afclient.WorkareaPoolMember(nil), s.members...),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}, nil
+}
+
+// TestPoolStats_RedactKeepsProviderSnapshotProves proves the serving
+// boundary redacts a copy: the provider-owned snapshot still carries
+// the functional URL after the route is served. A future caller that
+// regresses to in-place redaction poisons the provider's live state
+// (and races concurrent readers on the same backing array); this test
+// goes RED on that revert.
+func TestPoolStats_RedactKeepsProviderSnapshot(t *testing.T) {
+	credentialed := urlRedactSentinelRaw()
+	provider := &recordingPoolStatsProvider{members: []afclient.WorkareaPoolMember{
+		{ID: "pool-1", Repository: credentialed, Ref: "main", Status: afclient.PoolMemberReady},
+	}}
+	_, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.PoolStatsProvider = provider
+	})
+	defer cleanup()
+
+	assertNoURLCredential(t, "GET /api/daemon/pool/stats",
+		rawControlBody(t, srv.Addr(), "/api/daemon/pool/stats"))
+
+	handed := provider.last()
+	if handed == nil {
+		t.Fatal("provider handed out no snapshot")
+	}
+	for _, m := range handed.Members {
+		if m.Repository != credentialed {
+			t.Errorf("provider snapshot rewritten to %q: serving must redact a copy", m.Repository)
+		}
+	}
+}
+
+// recordingPoolStatsProvider wraps the fixed snapshot and remembers the
+// exact pointer it handed out, so the copy test can inspect
+// provider-owned state after the route is served.
+type recordingPoolStatsProvider struct {
+	mu      sync.Mutex
+	members []afclient.WorkareaPoolMember
+	handed  *afclient.WorkareaPoolStats
+}
+
+func (s *recordingPoolStatsProvider) Stats(_ context.Context) (*afclient.WorkareaPoolStats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handed = &afclient.WorkareaPoolStats{
+		Members:   append([]afclient.WorkareaPoolMember(nil), s.members...),
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	return s.handed, nil
+}
+
+func (s *recordingPoolStatsProvider) last() *afclient.WorkareaPoolStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handed
 }
 
 // TestWorkareaRoutes_RedactRepositoryCredentials seeds an archived workarea
