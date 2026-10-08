@@ -117,7 +117,20 @@ func TestLinux_DaemonPrivateDeniedEveryReadScope(t *testing.T) {
 			}, func(self, planPath string) (string, error) {
 				return "", launch([]string{self, "-test.run=^$"}, seatCheckEnv+"="+planPath)
 			})
-			for _, id := range []string{"read_token", "read_late_token", "read_nested", "write_token", "write_nested", "create_beside_token"} {
+			// A read is held when it fails or reads nothing of the
+			// sentinel: a hidden path may read as the empty placeholder
+			// bound over it.
+			for _, id := range []string{"read_token", "read_late_token", "read_nested"} {
+				switch res := results[id]; {
+				case res.Err != "":
+					t.Logf("%s refused: %s", id, res.Err)
+				case strings.Contains(res.Output, "sentinel=true"):
+					t.Errorf("%s: the seat read the sentinel through the daemon-private deny", id)
+				default:
+					t.Logf("%s read the empty placeholder", id)
+				}
+			}
+			for _, id := range []string{"write_token", "write_nested", "create_beside_token"} {
 				if res := results[id]; res.Err == "" {
 					t.Errorf("%s: the seat got through the daemon-private deny", id)
 				} else {
