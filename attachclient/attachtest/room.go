@@ -28,6 +28,7 @@ type room struct {
 	hostJti    string
 	hostCancel context.CancelFunc
 	hostOut    chan attachwire.Frame // relay→host delivery sink of the bound leg
+	hostBinds  uint64                // successful host-leg binds; only grows
 
 	ended   bool
 	exitSeq uint64
@@ -101,7 +102,7 @@ func (r *room) bindHost(epoch int64, jti string, out chan attachwire.Frame, canc
 			r.hostCancel = cancel
 			r.hostOut = out
 			r.signalLocked()
-			return bindOK
+			return r.boundOK()
 		case epoch > r.epoch:
 			if r.hostCancel != nil {
 				r.hostCancel()
@@ -111,7 +112,7 @@ func (r *room) bindHost(epoch int64, jti string, out chan attachwire.Frame, canc
 			r.hostJti = jti
 			r.hostCancel = cancel
 			r.hostOut = out
-			return bindOK
+			return r.boundOK()
 		default:
 			return bindStale // epoch ≤ current, different jti → zombie
 		}
@@ -130,6 +131,13 @@ func (r *room) bindHost(epoch int64, jti string, out chan attachwire.Frame, canc
 	r.hostCancel = cancel
 	r.hostOut = out
 	r.signalLocked()
+	return r.boundOK()
+}
+
+// boundOK counts one successful host-leg bind and reports it. The caller
+// holds r.mu.
+func (r *room) boundOK() bindResult {
+	r.hostBinds++
 	return bindOK
 }
 

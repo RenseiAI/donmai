@@ -189,6 +189,14 @@ func TestRepeatedRingMissNeverTerminatesAndResubscribesFresh(t *testing.T) {
 	const bounces = 3
 	prevSubs := len(h.sess.SubscribeSeqs())
 	for i := 0; i < bounces; i++ {
+		// Each bounce must reach a live leg. The client re-subscribes before
+		// the relay binds the replacement leg, and the predecessor keeps the
+		// binding until its reader sees the closed socket, so HostBound can
+		// be true while the only bound leg is the dead predecessor. A bounce
+		// fired then is lost, and the wait for its re-subscribe times out.
+		// The bounce therefore records the bind count, and the loop below
+		// waits for a later bind (the replacement) before the next bounce.
+		binds := h.relay.HostBinds()
 		h.relay.SendToHost(mustFrame(t, attachwire.ControlError{
 			Code: attachwire.CodeRingMiss, Message: "relay restarted, ring lost", Retryable: false,
 		}))
@@ -196,11 +204,9 @@ func TestRepeatedRingMissNeverTerminatesAndResubscribesFresh(t *testing.T) {
 			t.Fatalf("bounce %d: host never re-subscribed after ring-miss reset (subscribeSeqs=%v)", i, h.sess.SubscribeSeqs())
 		}
 		prevSubs = len(h.sess.SubscribeSeqs())
-		// Wait for the relay to finish processing the re-attach's subscribe
-		// control before firing the next bounce — SendToHost is a no-op while
-		// unbound, and Subscribe() is called client-side slightly before the
-		// relay-side bind completes.
-		waitBound(t, h.relay)
+		if !waitFor(func() bool { return h.relay.HostBound() && h.relay.HostBinds() > binds }, 3*time.Second) {
+			t.Fatalf("bounce %d: the replacement host leg never bound (binds=%d, before the bounce=%d)", i, h.relay.HostBinds(), binds)
+		}
 
 		select {
 		case err := <-h.done:
