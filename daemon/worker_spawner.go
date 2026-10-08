@@ -29,7 +29,15 @@ var _ ActiveWorkareaProvider = (*WorkerSpawner)(nil)
 
 // SpawnerOptions configure a WorkerSpawner.
 type SpawnerOptions struct {
-	Projects []ProjectConfig
+	// SessionReadToken reports the live per-session read credential for
+	// a session id, minted at accept time and deleted with the detail it
+	// names. The spawner states the token in the spawned worker's
+	// environment so the worker can read its own session detail without
+	// holding the operator control token. Nil (tests, embedders that
+	// never mint one) states nothing — the worker's read then follows
+	// the daemon's operator-credential path.
+	SessionReadToken func(sessionID string) (string, bool)
+	Projects         []ProjectConfig
 	// EnabledProjectIDs is the authoritative project-admission set. When nil,
 	// IDs are derived from Projects for legacy callers.
 	EnabledProjectIDs []string
@@ -1808,6 +1816,15 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 	if s.opts.DaemonControlURL != nil {
 		if url := strings.TrimSpace(s.opts.DaemonControlURL()); url != "" {
 			env[EnvDaemonControlURL] = url
+		}
+	}
+	// The per-session read credential travels beside the session id it
+	// names. It authorizes exactly one route — the detail GET for this
+	// session — and carries no operator privilege, so stating it here
+	// does not widen what the session can reach beyond its own detail.
+	if s.opts.SessionReadToken != nil && spec.SessionID != "" {
+		if tok, ok := s.opts.SessionReadToken(spec.SessionID); ok && tok != "" {
+			env[sessionReadTokenEnv] = tok
 		}
 	}
 	return env

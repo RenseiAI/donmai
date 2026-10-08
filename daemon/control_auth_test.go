@@ -257,6 +257,31 @@ func TestRequireControlAuth_Matrix(t *testing.T) {
 		{"enforced passes GET without bearer", daemonWith(testControlToken, true), http.MethodGet, "", http.StatusOK, true},
 		{"legacy open mode passes POST", daemonWith("", false), http.MethodPost, "", http.StatusOK, true},
 	}
+	// A duplicated Authorization header is not a credential either leg
+	// can read: the shared bearer parser rejects it, so the mutating
+	// gate refuses and the detail read answers redacted.
+	duplicateAuth := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/api/daemon/pause", nil)
+		req.Header.Add("Authorization", "Bearer "+testControlToken)
+		req.Header.Add("Authorization", "Bearer "+testControlToken)
+		return req
+	}
+	{
+		called := false
+		srv := &Server{daemon: daemonWith(testControlToken, true)}
+		h := srv.requireControlAuth(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		})
+		rec := httptest.NewRecorder()
+		h(rec, duplicateAuth())
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("duplicated Authorization header = %d, want 401", rec.Code)
+		}
+		if called {
+			t.Error("duplicated Authorization header reached the handler, want refusal")
+		}
+	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
