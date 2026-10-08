@@ -445,6 +445,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if withPool {
 		stats, err := s.poolStats(r.Context())
 		if err == nil {
+			redactPoolStats(stats)
 			resp.Pool = stats
 		}
 	}
@@ -675,6 +676,7 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	redactPoolStats(stats)
 	writeJSON(w, http.StatusOK, stats)
 }
 
@@ -857,7 +859,15 @@ func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id st
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.daemon.ActiveSessions())
+		handles := s.daemon.ActiveSessions()
+		// The inbound spec a session runs under may resolve to an
+		// operator-configured repository URL carrying embedded
+		// credentials. The list is display-only (cloning reads the
+		// credentialed detail), so serve the redacted form.
+		for i := range handles {
+			handles[i].Repository = redactRepositoryURL(handles[i].Repository)
+		}
+		writeJSON(w, http.StatusOK, handles)
 	case http.MethodPost:
 		if s.daemon.localRuntime.Load() != nil {
 			http.Error(w, "local work must enter through authenticated issue intake", http.StatusForbidden)
@@ -1058,6 +1068,8 @@ func safeOrchestratorURL(c *Config) string {
 
 // safeProjectRepos returns the list of repository URLs in the project
 // allowlist for inclusion in DaemonStatsResponse.AllowedProjects.
+// Embedded credentials are redacted: the route answers unauthenticated
+// local GETs, so a user:token@ authority must never be served verbatim.
 func safeProjectRepos(c *Config) []string {
 	if c == nil {
 		return nil
@@ -1068,9 +1080,22 @@ func safeProjectRepos(c *Config) []string {
 	}
 	out := make([]string, 0, len(projects))
 	for _, p := range projects {
-		out = append(out, p.Repository)
+		out = append(out, redactRepositoryURL(p.Repository))
 	}
 	return out
+}
+
+// redactPoolStats drops embedded credentials from every pool member
+// repository URL before the snapshot is served. The snapshot may come
+// from a downstream provider the daemon does not control, so the
+// redaction happens here, at the serving boundary.
+func redactPoolStats(stats *afclient.WorkareaPoolStats) {
+	if stats == nil {
+		return
+	}
+	for i := range stats.Members {
+		stats.Members[i].Repository = redactRepositoryURL(stats.Members[i].Repository)
+	}
 }
 
 // buildRegistrationStats summarises the daemon's registration / heartbeat /

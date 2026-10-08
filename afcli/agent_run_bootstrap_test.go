@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/RenseiAI/donmai/daemon"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // startBootstrapDaemon starts a real daemon + control server for the
@@ -176,6 +178,15 @@ func TestAgentRunBootstrapEndToEnd(t *testing.T) {
 	}
 	if strings.Contains(logBuf.String(), "carries no runtime credential") {
 		t.Errorf("runAgentRun bootstrapped from a credential-free detail despite the stated read credential; log: %s", logBuf.String())
+	}
+
+	// 4. Bootstrap consumed the read credential: the worker drops it from
+	// its own environment once the detail read succeeds, so no harness or
+	// agent child it spawns afterwards can inherit it. The credential
+	// cache captured the token string before the drop, so refreshes keep
+	// working — only the inheritable copy is gone.
+	if _, present := os.LookupEnv(runtimeenv.SessionReadTokenEnv); present {
+		t.Errorf("runAgentRun left %s in its environment after bootstrap; every child it spawns would inherit it", runtimeenv.SessionReadTokenEnv)
 	}
 }
 

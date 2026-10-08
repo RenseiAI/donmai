@@ -170,6 +170,12 @@ func composeEnv(parent, overrides []string) []string {
 		if runtimeenv.IsRunnerOnly(key) {
 			return
 		}
+		// The per-session read credential never crosses an inherited
+		// boundary into a PTY child: the worker consumed it during
+		// bootstrap. An explicit override may still state it.
+		if inherited && key == runtimeenv.SessionReadTokenEnv {
+			return
+		}
 		if inherited && blocklist.IsBlocked(key) && !declared.Allows(key) {
 			return
 		}
