@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1351,22 +1352,16 @@ autoUpdate:
 }
 
 // TestRetiredCloneStrategySettingIsUnread is the grep-style guard for the
-// retired per-repository clone override: no production code may read the
-// field. The typed schema no longer models it, so any reintroduction — a
-// restored struct field, a read of the value, a write of the key — fails
-// this test. The retired constants and the warning/decode/detect helpers
-// that implement the ignore-with-warning contract are the only allowed
-// production mentions.
+// retired per-repository clone override. It walks every non-test Go file in
+// the module and fails on any shape that would model, read or write the
+// setting again (see retiredCloneSettingShape). The unrelated clone-versus-
+// worktree selector in runtime/worktree is a different type and is skipped.
+// The ignore-with-warning helpers name the key only inside longer
+// identifiers and string literals, which none of the shapes match.
 func TestRetiredCloneStrategySettingIsUnread(t *testing.T) {
 	root, err := moduleRoot(t)
 	if err != nil {
 		t.Fatalf("module root: %v", err)
-	}
-	allowedFiles := map[string]bool{
-		"daemon/types.go":           true,
-		"daemon/config.go":          true,
-		"afclient/daemon_config.go": true,
-		"afcli/project.go":          true,
 	}
 	var violations []string
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
@@ -1374,8 +1369,8 @@ func TestRetiredCloneStrategySettingIsUnread(t *testing.T) {
 			return walkErr
 		}
 		if entry.IsDir() {
-			name := entry.Name()
-			if name == ".git" || name == ".agent" {
+			switch entry.Name() {
+			case ".git", ".agent", "vendor", "testdata", "node_modules":
 				return filepath.SkipDir
 			}
 			return nil
@@ -1387,7 +1382,8 @@ func TestRetiredCloneStrategySettingIsUnread(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if !allowedFiles[rel] {
+		rel = filepath.ToSlash(rel)
+		if strings.HasPrefix(rel, "runtime/worktree/") {
 			return nil
 		}
 		//nolint:gosec // G122: the walk root is the repo checkout and rel is
@@ -1398,14 +1394,9 @@ func TestRetiredCloneStrategySettingIsUnread(t *testing.T) {
 			return err
 		}
 		for i, line := range strings.Split(string(data), "\n") {
-			stripped := stripLineComment(line)
-			if !mentionsRetiredCloneSetting(stripped) {
-				continue
+			if shape := retiredCloneSettingShape(rel, stripLineComment(line)); shape != "" {
+				violations = append(violations, rel+":"+itoa(i+1)+": "+shape+": "+strings.TrimSpace(line))
 			}
-			if isAllowedRetiredCloneMention(rel, stripped) {
-				continue
-			}
-			violations = append(violations, rel+":"+itoa(i+1)+": "+strings.TrimSpace(line))
 		}
 		return nil
 	})
@@ -1413,7 +1404,7 @@ func TestRetiredCloneStrategySettingIsUnread(t *testing.T) {
 		t.Fatalf("walk: %v", err)
 	}
 	if len(violations) > 0 {
-		t.Errorf("retired clone setting is read or written by production code:\n%s", strings.Join(violations, "\n"))
+		t.Errorf("retired clone setting is modelled, read or written by production code:\n%s", strings.Join(violations, "\n"))
 	}
 }
 
@@ -1471,47 +1462,40 @@ func stripLineComment(line string) string {
 	return line
 }
 
-// mentionsRetiredCloneSetting reports whether the code (comments stripped)
-// names the retired setting outside its own machinery.
-func mentionsRetiredCloneSetting(code string) bool {
-	return strings.Contains(code, "CloneStrategy") ||
-		strings.Contains(code, "cloneStrategy") ||
-		strings.Contains(code, "clone-strategy") ||
-		strings.Contains(code, "CloneShallow") ||
-		strings.Contains(code, "CloneFull") ||
-		strings.Contains(code, "CloneReference")
-}
+var (
+	retiredCloneFieldDecl = regexp.MustCompile(`\bCloneStrategy\s+\*?(?:afclient\.|daemon\.)?CloneStrategy\b`)
+	retiredCloneTag       = regexp.MustCompile(`(?:yaml|json):"cloneStrategy\b`)
+	retiredCloneValue     = regexp.MustCompile(`\bClone(?:Shallow|Full|Reference)\b`)
+	retiredCloneSelector  = regexp.MustCompile(`(\w+)\.CloneStrategy\b`)
+	retiredCloneTypeLocal = regexp.MustCompile(`\bCloneStrategy\b`)
+	retiredCloneDecl      = regexp.MustCompile(`^(?:type CloneStrategy string|Clone(?:Shallow|Full|Reference)\s+CloneStrategy\s*=\s*"[a-z-]+")$`)
+)
 
-// isAllowedRetiredCloneMention permits only the ignore-with-warning
-// machinery: the retired type and its constants, the warning constant and
-// detector, the YAML decode slots that tolerate the key, and the hidden
-// no-op flag with its declared removal version.
-func isAllowedRetiredCloneMention(file, code string) bool {
-	trimmed := strings.TrimSpace(code)
-	// The retired type declaration and its constants.
-	if strings.HasPrefix(trimmed, "type CloneStrategy ") {
-		return true
+// retiredCloneSettingShape names the forbidden shape a comment-stripped line
+// of production code takes, or returns "" when it takes none. The only
+// permitted mentions are the retired type and value declarations, which stay
+// so that previously written values keep their names.
+func retiredCloneSettingShape(rel, code string) string {
+	declares := rel == "daemon/types.go" || rel == "afclient/daemon_config.go"
+	if declares && retiredCloneDecl.MatchString(strings.TrimSpace(code)) {
+		return ""
 	}
-	if strings.HasPrefix(trimmed, "CloneShallow") || strings.HasPrefix(trimmed, "CloneFull") || strings.HasPrefix(trimmed, "CloneReference") {
-		return true
+	switch {
+	case retiredCloneFieldDecl.MatchString(code):
+		return "field of the retired type"
+	case retiredCloneTag.MatchString(code):
+		return "struct tag naming the retired key"
+	case retiredCloneValue.MatchString(code):
+		return "retired value"
 	}
-	// The warning constant, detector, strip helper, and their comments.
-	if strings.Contains(code, "retiredCloneStrategyWarning") ||
-		strings.Contains(code, "warnIfRetiredCloneStrategyPresent") ||
-		strings.Contains(code, "stripRetiredCloneStrategyKey") ||
-		strings.Contains(code, `"cloneStrategy"`) {
-		return true
+	for _, m := range retiredCloneSelector.FindAllStringSubmatch(code, -1) {
+		if m[1] != "worktree" {
+			return "selector on CloneStrategy"
+		}
 	}
-	// The hidden no-op flag and its declared removal version.
-	if strings.Contains(code, "cloneStrategyRemovalVersion") ||
-		strings.Contains(code, "clone-strategy") ||
-		strings.Contains(code, "cloneStrategy ") {
-		return true
+	owner := strings.HasPrefix(rel, "daemon/") || strings.HasPrefix(rel, "afclient/")
+	if owner && retiredCloneTypeLocal.MatchString(code) {
+		return "use of the retired type"
 	}
-	// Comments naming the retired key (lowercase prose, not code).
-	if strings.HasPrefix(trimmed, "//") {
-		return true
-	}
-	_ = file
-	return false
+	return ""
 }
