@@ -155,12 +155,20 @@ func runDaemonShimWakeHarness() int {
 		// rung that submits nothing still answers with what it received.
 		line, err := reader.ReadString('\n')
 		if len(line) > 0 {
-			if _, werr := fmt.Fprintf(os.Stdout, "ack:%x\r\n", line); werr != nil {
-				return 1
-			}
+			// The raw-mode switch runs BEFORE the acknowledgement, matching
+			// the old shell fixture's `read line; stty raw; printf ack:`
+			// order: the fixture handshake treats the ack as proof the
+			// mode setup completed, so a test's next write lands on a
+			// terminal that is already raw. Switching after the ack
+			// opened a race where a wake's Ctrl-U still met the canonical
+			// line discipline and was consumed by it ("010b0a" instead of
+			// "15010b0a").
 			if mode == wakeFixtureTransitionHarness {
 				configureWakeHarnessTerminal(wakeFixtureRaw)
 				mode = wakeFixtureRawHarness
+			}
+			if _, werr := fmt.Fprintf(os.Stdout, "ack:%x\r\n", line); werr != nil {
+				return 1
 			}
 		}
 		if err != nil {
