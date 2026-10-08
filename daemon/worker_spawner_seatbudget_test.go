@@ -5,8 +5,11 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/internal/localqueue"
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // TestSpawner_SeatBudget_EnvCapsThroughAcceptWork drives the PRODUCTION spawn
@@ -252,6 +255,103 @@ func TestSpawner_SeatBudget_SetSeatBudget(t *testing.T) {
 	}
 	if _, ok := NewWorkerSpawner(SpawnerOptions{}).seatBudgetForSpawn(); ok {
 		t.Error("zero spawner reports a budget; want disabled")
+	}
+}
+
+// TestSpawner_SeatBudget_ConcurrentReloadAndSpawn pins the B3 lock: a live
+// config reload (SetSeatBudget from the yaml watcher) racing spawns must
+// not trip -race. The unlocked struct read this replaces passed every
+// scoped suite because nothing hammered both sides concurrently — drive
+// them together through the production AcceptWork path.
+func TestSpawner_SeatBudget_ConcurrentReloadAndSpawn(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		SeatBudget:            SeatBudget{CPUs: 2, Mode: "best-effort"},
+		StdoutPrefixWriter:    PrefixWriterFunc(func(_, _ string) {}),
+		StderrPrefixWriter:    PrefixWriterFunc(func(_, _ string) {}),
+	})
+	s.Resume()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			s.SetSeatBudget(SeatBudget{CPUs: 2 + i%3, Mode: "best-effort"})
+		}
+	}()
+	for i := 0; i < 8; i++ {
+		spec := SessionSpec{SessionID: "race-reload-spawn-" + string(rune('a'+i)), Repository: "github.com/a/b"}
+		if _, err := s.AcceptWork(spec); err != nil {
+			// At-capacity rejections are fine: the race window is the
+			// admission snapshot itself, which every call exercises
+			// whether it spawns or not.
+			if !strings.Contains(err.Error(), "at capacity") && !strings.Contains(err.Error(), "already") {
+				t.Errorf("accept: %v", err)
+			}
+		}
+	}
+	<-done
+}
+
+// TestSeatBudgetHandleReport_RecoverySurfaces pins F1 through the
+// production handle paths: sessions the daemon adopts at startup (empty
+// published handle), quarantines, or holds for recovery re-report the
+// daemon's CURRENT resolved share instead of going stale at nil. A fresh
+// direct/shim launch stamps the share at spawn; these three sites have no
+// launch-time spec, so they snapshot the same helper the launch paths use.
+func TestSeatBudgetHandleReport_RecoverySurfaces(t *testing.T) {
+	d := New(Options{SkipRegistration: true})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 4,
+		SeatBudget:            SeatBudget{CPUs: 2, MemoryMB: 1024, Mode: "best-effort"},
+	})
+	// Quarantined + startup-adopted (empty handle) entries project the
+	// current share.
+	d.shims.adopted[sessionshim.Identity{OrgID: "o", SessionID: "adopted-at-startup"}] = adoptedShim{}
+	d.shims.quarantined = append(d.shims.quarantined, sessionshim.QuarantinedSession{OrgID: "o", SessionID: "quarantined-lineage"})
+	byID := map[string]SessionHandle{}
+	for _, h := range d.sessionShimHandles() {
+		byID[h.SessionID] = h
+	}
+	for _, id := range []string{"adopted-at-startup", "quarantined-lineage"} {
+		h, ok := byID[id]
+		if !ok {
+			t.Fatalf("no handle projected for %q", id)
+		}
+		if h.SeatBudget == nil {
+			t.Fatalf("%s handle carries no SeatBudget; want the current share", id)
+		}
+		if h.SeatBudget.Mode != "best-effort" || h.SeatBudget.CPUs != 2 {
+			t.Errorf("%s SeatBudget = %+v; want best-effort 2 cpu", id, h.SeatBudget)
+		}
+	}
+	// Held recovery projections stamp the same share. The projection
+	// below is the minimal journal shape hold() reads: envelope session,
+	// source, and initial event.
+	proj := localqueue.SessionProjection{
+		Admission: localqueue.AdmissionRecord{Envelope: localqueue.AdmissionEnvelope{
+			Source:       localqueue.GitHubSource{OwnerRepo: "a/b"},
+			InitialEvent: localqueue.LifecycleEvent{RecordedAt: time.Now().UTC().Format(time.RFC3339)},
+		}},
+	}
+	proj.Admission.Envelope.Session.SessionID = "held-recovery"
+	l := &localRuntime{daemon: d, held: map[string]SessionHandle{}, holdReasons: map[string]string{}}
+	l.hold(proj, "test")
+	held := l.heldSessions()
+	if len(held) != 1 || held[0].SeatBudget == nil {
+		t.Fatalf("held handle = %+v; want the current share stamped", held)
+	}
+	if held[0].SeatBudget.Mode != "best-effort" || held[0].SeatBudget.CPUs != 2 {
+		t.Errorf("held SeatBudget = %+v; want best-effort 2 cpu", held[0].SeatBudget)
+	}
+	// Budgeting off reads as mode none, never nil-shaped drift.
+	d.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 4,
+	})
+	if rep := d.seatBudgetHandleReport(); rep == nil || rep.Mode != "none" {
+		t.Errorf("disabled handle report = %+v; want mode none", rep)
 	}
 }
 

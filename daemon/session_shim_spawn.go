@@ -4016,6 +4016,11 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 		return nil
 	}
 	d.reconcileQuarantinedTombstones()
+	// Recovery handles carry the daemon's current resolved share: the
+	// adopted-at-startup and quarantined entries below have no launch-time
+	// spec (that daemon generation is gone), so they re-report what a
+	// fresh launch would get rather than going stale at nil.
+	recoveryBudget := d.seatBudgetHandleReport()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	out := make([]SessionHandle, 0, len(d.shims.adopted)+len(d.shims.quarantined))
@@ -4024,7 +4029,7 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 		if handle.SessionID == "" {
 			// Adopted at startup rather than launched here: this daemon has the
 			// identity and the shim's report, not the original spec.
-			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning}
+			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning, SeatBudget: recoveryBudget}
 			if entry.controller != nil {
 				handle.PID = entry.controller.HarnessIdentity().PID
 				handle.WorktreePath = entry.controller.Hello().WorkareaPath
@@ -4041,8 +4046,9 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 	}
 	for _, q := range d.shims.quarantined {
 		out = append(out, SessionHandle{
-			SessionID: q.SessionID,
-			State:     SessionRunning,
+			SessionID:  q.SessionID,
+			State:      SessionRunning,
+			SeatBudget: recoveryBudget,
 		})
 	}
 	return out

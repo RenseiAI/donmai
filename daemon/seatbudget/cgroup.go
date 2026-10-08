@@ -145,18 +145,30 @@ func ScopeName(sessionID string) string {
 
 // HasSystemd reports whether PID 1 is systemd and the systemd-run helper is
 // on PATH: the precondition for the transient-scope placement.
+// systemdRunBinary and pidOneComm name the probe inputs so the live
+// confinement test can point them at a fixture (or the real host) without
+// recompiling; production passes ("systemd-run", "/proc/1/comm").
 func HasSystemd() bool {
+	return HasSystemdAt("systemd-run", "/proc/1/comm")
+}
+
+// HasSystemdAt is HasSystemd parametrised by the helper name and the PID 1
+// comm path. The cgroup-confinement suite drives it against the live host
+// (asserting the real backend exists before confining anything) and
+// against fixtures elsewhere; unit tests pin the matrix through it on any
+// host.
+func HasSystemdAt(systemdRun, pidOneComm string) bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
-	raw, err := os.ReadFile("/proc/1/comm")
+	raw, err := os.ReadFile(pidOneComm) //nolint:gosec // G304: production passes the fixed /proc/1/comm literal; the parameter exists so tests can point the probe at a fixture
 	if err != nil {
 		return false
 	}
 	if strings.TrimSpace(string(raw)) != "systemd" {
 		return false
 	}
-	_, err = exec.LookPath("systemd-run")
+	_, err = exec.LookPath(systemdRun)
 	return err == nil
 }
 

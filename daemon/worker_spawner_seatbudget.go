@@ -34,9 +34,20 @@ func (b SeatBudget) toSeatBudget() seatbudget.Budget {
 
 // seatBudgetForSpawn resolves the effective seat budget for one spawn: the
 // spawner's configured budget with its mode resolved for this OS. ok=false
-// means budgeting is off — the seat spawns exactly as before.
+// means budgeting is off — the seat spawns exactly as before. The share
+// lives behind its own RWMutex (not the spawn mutex) because SetSeatBudget
+// swaps it from the config watcher while AcceptWork/spawn run unlocked;
+// an unlocked struct read there races the write under -race.
 func (s *WorkerSpawner) seatBudgetForSpawn() (seatbudget.Budget, bool) {
-	b := s.opts.SeatBudget.toSeatBudget()
+	s.seatBudgetMu.RLock()
+	defer s.seatBudgetMu.RUnlock()
+	return s.seatBudgetForSpawnLocked()
+}
+
+// seatBudgetForSpawnLocked is seatBudgetForSpawn for callers that hold the
+// seat-budget lock (read or write).
+func (s *WorkerSpawner) seatBudgetForSpawnLocked() (seatbudget.Budget, bool) {
+	b := s.seatBudget.toSeatBudget()
 	if b.Disabled() {
 		return seatbudget.Budget{}, false
 	}

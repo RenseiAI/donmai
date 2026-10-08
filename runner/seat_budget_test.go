@@ -48,6 +48,24 @@ func TestApplySeatBudget(t *testing.T) {
 			}
 		}
 	})
+	t.Run("input map is not aliased", func(t *testing.T) {
+		// The overlay must copy: callers reuse one env map across
+		// sessions, and a seat's caps leaking into the next seat (or
+		// into an unbounded seat that follows a capped one) is a
+		// cross-session constraint leak. Mutating the input map in
+		// place passes every value assertion yet poisons the caller.
+		env := map[string]string{"PATH": "/bin"}
+		got := applySeatBudget(env, &SeatBudget{Mode: "best-effort", CPUs: 2})
+		if len(env) != 1 {
+			t.Fatalf("applySeatBudget mutated its input: %v", env)
+		}
+		if _, ok := env["GOMAXPROCS"]; ok {
+			t.Fatalf("applySeatBudget leaked caps into its input: %v", env)
+		}
+		if got["GOMAXPROCS"] != "2" {
+			t.Errorf("GOMAXPROCS = %q; want 2", got["GOMAXPROCS"])
+		}
+	})
 	t.Run("explicit values win", func(t *testing.T) {
 		env := map[string]string{"GOMAXPROCS": "16", "PATH": "/bin"}
 		got := applySeatBudget(env, &SeatBudget{Mode: "enforced", CPUs: 2})

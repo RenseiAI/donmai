@@ -56,16 +56,24 @@ func resolveSeatBudget(authored SeatBudgetConfig, maxSeats, hostCPUs, hostMemory
 // mode "none" with the reason — never enforced for a seat that runs
 // unwrapped.
 func seatBudgetReport(b seatbudget.Budget) *afclient.SeatBudgetStatus {
+	return seatBudgetReportFor(b, seatbudget.HostPlacement(), runtime.GOOS)
+}
+
+// seatBudgetReportFor is seatBudgetReport parametrised by placement and
+// GOOS so tests pin the systemd-less Linux downgrade on any host. The mode
+// resolves for the same GOOS (an enforced seat off Linux is already
+// best-effort before the placement question arises).
+func seatBudgetReportFor(b seatbudget.Budget, placement seatbudget.Placement, goos string) *afclient.SeatBudgetStatus {
 	if b.Disabled() {
 		return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone)}
 	}
-	mode := b.EffectiveMode()
-	if mode == seatbudget.ModeEnforced && seatbudget.HostPlacement() != seatbudget.PlacementSystemd {
+	mode := seatbudget.EffectiveModeFor(b.Mode, goos)
+	if mode == seatbudget.ModeEnforced && placement != seatbudget.PlacementSystemd {
 		// Downgrade ONLY on Linux, where EffectiveMode promised enforced.
 		// Off Linux the mode already resolved to best-effort (macOS
 		// cooperative caps) and the report below renders the knob line;
 		// collapsing that to none would erase a real best-effort budget.
-		if runtime.GOOS == "linux" {
+		if goos == "linux" {
 			return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone), Detail: seatBudgetNoBackendDetail()}
 		}
 	}
@@ -73,7 +81,7 @@ func seatBudgetReport(b seatbudget.Budget) *afclient.SeatBudgetStatus {
 		Mode:     string(mode),
 		CPUs:     b.CPUs,
 		MemoryMB: b.MemoryMB,
-		Detail:   seatBudgetDetail(b),
+		Detail:   seatBudgetDetailFor(b, goos),
 	}
 }
 
@@ -87,13 +95,32 @@ func seatBudgetNoBackendDetail() string {
 	return "no enforcement backend on this host"
 }
 
-// seatBudgetDetail renders the short human line behind a budget report:
-// which placement enforces it on Linux, which knobs carry it on macOS.
-// The enforced branch is reached only when the host placement can confine
-// the seat (see seatBudgetReport); a systemd-less host never renders an
-// enforced line.
+// seatBudgetDetailFor renders the detail for goos. The enforced branch
+// keeps the values with the no-backend suffix ONLY as the pre-downgrade
+// rendering seatBudgetReportFor consumes on systemd-less Linux: no caller
+// may publish it as a posture. seatBudgetReportFor downgrades that input
+// to mode none with no values before this line is ever published (see
+// TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly). Direct
+// callers must pass the placement downgrade (or use seatBudgetReportFor)
+// rather than rendering an enforced line for a seat that runs unconfined.
+// The host-GOOS entry point below is exercised beside seatBudgetDetailFor
+// by tests; the published status path goes through seatBudgetReportFor.
+//
+//nolint:unused
 func seatBudgetDetail(b seatbudget.Budget) string {
-	switch b.EffectiveMode() {
+	return seatBudgetDetailFor(b, runtime.GOOS)
+}
+
+// seatBudgetDetailFor renders the detail for goos. The enforced branch
+// keeps the values with the no-backend suffix ONLY as the pre-downgrade
+// rendering seatBudgetReportFor consumes on systemd-less Linux — no caller
+// may publish it as a posture. seatBudgetReportFor downgrades that input
+// to mode none with no values before this line is ever published (see
+// TestSeatBudgetDetail_SystemdlessEnforcedIsPreDowngradeOnly). Direct
+// callers must pass the placement downgrade (or use seatBudgetReportFor)
+// rather than rendering an enforced line for a seat that runs unconfined.
+func seatBudgetDetailFor(b seatbudget.Budget, goos string) string {
+	switch seatbudget.EffectiveModeFor(b.Mode, goos) {
 	case seatbudget.ModeEnforced:
 		detail := fmt.Sprintf("cpus %s, quota %s", seatbudget.CPUSet(b.CPUs), seatbudget.CPUQuotaPercent(b.CPUs))
 		if mem := seatbudget.MemoryBytes(b.MemoryMB); mem != "" {
@@ -110,6 +137,27 @@ func seatBudgetDetail(b seatbudget.Budget) string {
 	default:
 		return ""
 	}
+}
+
+// seatBudgetHandleReport builds the handle evidence for a session whose
+// launch-time spec is gone: an adopted-at-startup shim, a quarantined
+// lineage, or a held recovery projection. The posture is the daemon's
+// CURRENT resolved share (the share a fresh launch would get), with the
+// same systemd-less downgrade the launch paths apply — a disabled budget
+// reports mode none with no values. Recovery surfaces never invent a
+// per-session share; they re-report the host's current share.
+func (d *Daemon) seatBudgetHandleReport() *SessionSeatBudget {
+	var budget seatbudget.Budget
+	var ok bool
+	if d != nil {
+		if spawner := d.Spawner(); spawner != nil {
+			budget, ok = spawner.seatBudgetForSpawn()
+		} else {
+			budget = d.daemonSeatBudget()
+			ok = !budget.Disabled()
+		}
+	}
+	return sessionSeatBudgetReport(budget, ok, seatbudget.HostPlacement())
 }
 
 // daemonSeatBudget resolves the daemon's own configured budget against its

@@ -1,6 +1,8 @@
 package seatbudget
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -317,5 +319,44 @@ func TestDisabled(t *testing.T) {
 	}
 	if (Budget{Mode: "auto"}).Disabled() {
 		t.Error("auto budget reports disabled")
+	}
+}
+
+func TestHasSystemdAt(t *testing.T) {
+	// The live confinement suite gates on HasSystemd; pin the probe
+	// matrix through the injected form on any host so a broken probe
+	// cannot silently skip (or falsely run) the live proof.
+	dir := t.TempDir()
+	systemdComm := filepath.Join(dir, "comm-systemd")
+	if err := os.WriteFile(systemdComm, []byte("systemd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherComm := filepath.Join(dir, "comm-other")
+	if err := os.WriteFile(otherComm, []byte("init\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(dir, "run-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o600); err != nil { //nolint:gosec // G306: test fixture never executed (LookPath probe target only)
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
+	if runtime.GOOS != "linux" {
+		if HasSystemdAt("run-helper", systemdComm) {
+			t.Error("HasSystemdAt = true off Linux; want false (GOOS gate)")
+		}
+		return
+	}
+	if !HasSystemdAt("run-helper", systemdComm) {
+		t.Error("HasSystemdAt(helper, systemd comm) = false; want true")
+	}
+	if HasSystemdAt("run-helper", otherComm) {
+		t.Error("HasSystemdAt(helper, non-systemd comm) = true; want false")
+	}
+	if HasSystemdAt("run-helper", filepath.Join(dir, "missing")) {
+		t.Error("HasSystemdAt(helper, missing comm) = true; want false")
+	}
+	if HasSystemdAt("definitely-not-on-path-xyz", systemdComm) {
+		t.Error("HasSystemdAt(missing helper, systemd comm) = true; want false")
 	}
 }

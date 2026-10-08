@@ -236,7 +236,14 @@ func (t *realPumpDrainTimer) Stop() bool          { return t.timer.Stop() }
 type WorkerSpawner struct {
 	opts SpawnerOptions
 
-	mu                     sync.Mutex
+	mu sync.Mutex
+	// seatBudgetMu guards seatBudget separately from mu: SetSeatBudget
+	// swaps the share from the config watcher while AcceptWork/spawn
+	// read it unlocked, so sharing mu would either race or serialize
+	// every spawn on admission. A struct value races under -race even
+	// when both sides hold no common lock — hence the dedicated RWMutex.
+	seatBudgetMu           sync.RWMutex
+	seatBudget             SeatBudget
 	sessions               map[string]*spawnedSession
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
@@ -309,6 +316,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	opts.ProjectAdmissionMode = normalizeProjectAdmissionMode(opts.ProjectAdmissionMode)
 	return &WorkerSpawner{
 		opts:                   opts,
+		seatBudget:             opts.SeatBudget,
 		sessions:               make(map[string]*spawnedSession),
 		spawnReservations:      make(map[string]struct{}),
 		sessionHistory:         make(map[string]struct{}),
@@ -629,11 +637,16 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 
 // SetSeatBudget swaps the per-seat budget future spawns apply. Seats
 // already running keep the budget they started with — like capacity, the
-// new share governs only future AcceptWork calls.
+// new share governs only future AcceptWork calls. The share lives behind
+// its own lock (see seatBudgetForSpawn): the config watcher calls this
+// while spawns read concurrently.
 func (s *WorkerSpawner) SetSeatBudget(b SeatBudget) {
+	s.seatBudgetMu.Lock()
+	defer s.seatBudgetMu.Unlock()
+	s.seatBudget = b
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.opts.SeatBudget = b
+	s.mu.Unlock()
 }
 
 // SetProjects atomically swaps the spawner's base project allowlist used by

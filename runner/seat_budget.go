@@ -70,7 +70,10 @@ func workerCapEnv(cpus int) map[string]string {
 // applySeatBudget overlays the seat's cooperative worker caps onto the
 // already-composed harness Spec.Env. Operator/session values win: an
 // explicitly set knob is never overridden — the budget is a default, not
-// an override. A disabled budget returns env unchanged.
+// an override. A disabled budget returns env unchanged. The returned map
+// is a copy: callers that reuse one env map across sessions must not see
+// a seat's caps leak into the next seat's budget (or into an unbounded
+// seat that follows a capped one).
 func applySeatBudget(env map[string]string, budget *SeatBudget) map[string]string {
 	if budget.disabled() {
 		return env
@@ -81,9 +84,9 @@ func applySeatBudget(env map[string]string, budget *SeatBudget) map[string]strin
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	out := env
-	if out == nil {
-		out = make(map[string]string, len(caps))
+	out := make(map[string]string, len(env)+len(caps))
+	for k, v := range env {
+		out[k] = v
 	}
 	for _, k := range keys {
 		if _, ok := out[k]; !ok {
