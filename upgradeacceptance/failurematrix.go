@@ -18,10 +18,6 @@ package upgradeacceptance
 // and pass once the adoption slices land. The red-run record names the
 // failing case and its cause.
 
-import (
-	"testing"
-)
-
 // failureCase is one row of the D6 failure matrix.
 type failureCase struct {
 	// name is the stable case id used by both the Go test and the
@@ -164,39 +160,4 @@ func matrixLiveNames() []string {
 		}
 	}
 	return out
-}
-
-// TestFailureMatrixRegistered pins the matrix shape: every row the
-// container driver executes must be listed here, so a case cannot silently
-// stop running. The driver asserts the same count.
-func TestFailureMatrixRegistered(t *testing.T) {
-	t.Parallel()
-	seen := map[string]bool{}
-	for _, c := range failureMatrix {
-		if c.name == "" || c.want == "" {
-			t.Fatalf("matrix row %+v needs a stable name and a required outcome", c)
-		}
-		if seen[c.name] {
-			t.Fatalf("duplicate matrix case %q", c.name)
-		}
-		seen[c.name] = true
-	}
-	const wantCases = 22
-	if len(failureMatrix) != wantCases {
-		t.Fatalf("matrix has %d cases, want %d; the container driver asserts the same count", len(failureMatrix), wantCases)
-	}
-	local := 0
-	liveNames := matrixLiveNames()
-	for _, c := range failureMatrix {
-		if c.local {
-			local++
-		}
-	}
-	if len(liveNames) == 0 {
-		t.Fatal("matrix lists no live-seat cases; the container driver would run nothing")
-	}
-	const wantLocal = 8
-	if local != wantLocal {
-		t.Fatalf("matrix has %d local cases, want %d", local, wantLocal)
-	}
 }

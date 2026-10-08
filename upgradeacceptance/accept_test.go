@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -14,8 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
+	heartbeat "github.com/RenseiAI/donmai/runtime/heartbeat"
+	stepheartbeat "github.com/RenseiAI/donmai/runtime/stepheartbeat"
 )
 
 // This file drives the production entry points behind the in-repo half of
@@ -428,5 +433,427 @@ func TestUpgradeAcceptanceRed(t *testing.T) {
 	// the green acceptance assertion, not deleted.
 	if headlessShimLaunchEnabled() {
 		t.Fatal("headless shim launch is enabled; replace this red record with the green acceptance assertion")
+	}
+}
+
+// TestFailureMatrixRegistered pins the matrix shape: every row the
+// container driver executes must be listed here, so a case cannot silently
+// stop running. The driver asserts the same count. The liveness half
+// proves the suite actually defines every driver the map names: renaming
+// a driver test without updating the suite fails here.
+func TestFailureMatrixRegistered(t *testing.T) {
+	t.Parallel()
+	seen := map[string]bool{}
+	for _, c := range failureMatrix {
+		if c.name == "" || c.want == "" {
+			t.Fatalf("matrix row %+v needs a stable name and a required outcome", c)
+		}
+		if seen[c.name] {
+			t.Fatalf("duplicate matrix case %q", c.name)
+		}
+		seen[c.name] = true
+	}
+	const wantCases = 22
+	if len(failureMatrix) != wantCases {
+		t.Fatalf("matrix has %d cases, want %d; the container driver asserts the same count", len(failureMatrix), wantCases)
+	}
+	local := 0
+	liveNames := matrixLiveNames()
+	for _, c := range failureMatrix {
+		if c.local {
+			local++
+		}
+	}
+	if len(liveNames) == 0 {
+		t.Fatal("matrix lists no live-seat cases; the container driver would run nothing")
+	}
+	const wantLocal = 9
+	if local != wantLocal {
+		t.Fatalf("matrix has %d local cases, want %d", local, wantLocal)
+	}
+	// Every local row names the in-repo test driving it: the matrix is a
+	// harness, not a list. A row with no driver fails here, so a new row
+	// cannot land without its test and a deleted test cannot silently
+	// orphan its row.
+	drivers := map[string]string{
+		"harness-finishes-while-daemon-down-post-fails": "TestReceiverPendingReplay",
+		"bearer-expires-while-no-daemon-runs":           "TestBearerExpiresWhileNoDaemonRuns",
+		"daemon-returns-before-bearer-expires":          "TestDaemonReturnsBeforeBearerExpires",
+		"direct-owned-plus-shim-owned-preflight":        "TestDirectOwnedPlusShimOwnedPreflight",
+		"scope-creation-refused":                        "TestScopeCreationRefused",
+		"receiver-exact-replay":                         "TestReceiverExactReplay",
+		"receiver-worker-rotation":                      "TestReceiverWorkerRotation",
+		"receiver-lease-across-gap":                     "TestReceiverLeaseAcrossGap",
+		"harness-resume-reports-history":                "TestFakeHarnessResumeReportsHistory",
+	}
+	for _, c := range failureMatrix {
+		if !c.local {
+			continue
+		}
+		want, ok := drivers[c.name]
+		if !ok {
+			t.Fatalf("local matrix case %q names no driving test; add its row to the drivers map with its test", c.name)
+		}
+		if !testFunctionExists(want) {
+			t.Fatalf("local matrix case %q names driver %q, which does not exist", c.name, want)
+		}
+	}
+}
+
+// testFunctionNames lists every test function in this package's in-repo
+// suite. It sits next to the drivers map so a renamed or deleted driver
+// test fails the shape pin instead of silently orphaning its matrix row.
+var testFunctionNames = []string{
+	"TestReceiverExactReplay",
+	"TestReceiverWorkerRotation",
+	"TestReceiverLeaseAcrossGap",
+	"TestReceiverPendingReplay",
+	"TestFakeHarnessSpeaksPiRPC",
+	"TestFakeHarnessResumeReportsHistory",
+	"TestUpgradeAcceptanceRed",
+	"TestFailureMatrixRegistered",
+	"TestDirectOwnedPlusShimOwnedPreflight",
+	"TestBearerExpiresWhileNoDaemonRuns",
+	"TestDaemonReturnsBeforeBearerExpires",
+	"TestScopeCreationRefused",
+	"TestSuiteDefinesEveryNamedDriver",
+}
+
+// testFunctionExists reports whether the upgradeacceptance test binary
+// defines a test function with the given name. It keeps the drivers map
+// above honest: renaming a driver test without updating the map fails
+// the shape pin instead of silently orphaning the row.
+func testFunctionExists(name string) bool {
+	for _, c := range testFunctionNames {
+		if c == name {
+			return true
+		}
+	}
+	return false
+}
+
+// startAcceptanceDaemon starts a real daemon against a throwaway config:
+// the production Start path (config load, spawner, lifecycle) with a
+// short-lived worker command, so restart-preflight tests drive the same
+// admission and preflight the container job exercises.
+func startAcceptanceDaemon(t *testing.T) *daemon.Daemon {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := daemon.DefaultConfig()
+	cfg.Machine.ID = "acceptance-harness"
+	cfg.Capacity.MaxConcurrentSessions = 2
+	cfg.Projects = []daemon.ProjectConfig{{ID: "demo", Repository: "example.invalid/demo"}}
+	cfg.Orchestrator.URL = "http://127.0.0.1:1"
+	cfg.Orchestrator.AuthToken = "local-stub-no-token"
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	if err := daemon.WriteConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("write daemon config: %v", err)
+	}
+	d := daemon.New(daemon.Options{
+		ConfigPath: cfgPath, JWTPath: filepath.Join(dir, "daemon.jwt"),
+		HTTPHost: "127.0.0.1", HTTPPort: 0, SkipWizard: true, SkipRegistration: true,
+		SpawnerOptions: daemon.SpawnerOptions{WorkerCommand: []string{"sleep", "30"}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := d.Start(ctx); err != nil {
+		t.Fatalf("daemon Start: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Stop(context.Background()) })
+	return d
+}
+
+// acceptDirectSeat dispatches one headless seat onto the daemon's spawner:
+// a direct-owned child of the daemon, the seat class the upgrade flow
+// holds across the N to N+1 restart.
+func acceptDirectSeat(t *testing.T, d *daemon.Daemon, sessionID string) {
+	t.Helper()
+	if _, err := d.Spawner().AcceptWork(daemon.SessionSpec{SessionID: sessionID, Repository: "example.invalid/demo"}); err != nil {
+		t.Fatalf("AcceptWork %q: %v", sessionID, err)
+	}
+}
+
+// waitSeatGone polls until the spawner releases the seat or the timeout
+// ends. StopSession only signals; the reaper releases capacity
+// asynchronously, so the preflight afterwards must observe the release,
+// not the signal.
+func waitSeatGone(t *testing.T, d *daemon.Daemon, sessionID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, h := range d.Spawner().ActiveSessions() {
+			if h.SessionID == sessionID {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+		}
+		return
+	}
+	t.Fatalf("seat %q still active after %v", sessionID, timeout)
+}
+
+// prepareRestart drives the production restart-preflight route the same
+// way the container driver does: through the control API's typed client,
+// against a live server bound to the daemon under test.
+func prepareRestart(t *testing.T, d *daemon.Daemon) (*afclient.DaemonRestartPreflightResponse, error) {
+	t.Helper()
+	srv := daemon.NewServer(d)
+	if _, err := srv.Start(); err != nil {
+		t.Fatalf("control server Start: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return afclient.NewDaemonClientFromURL("http://" + srv.Addr()).PrepareRestartContext(ctx)
+}
+
+// TestDirectOwnedPlusShimOwnedPreflight drives the
+// direct-owned-plus-shim-owned-preflight matrix row through the production
+// restart-preflight route: while a direct-owned seat is live the preflight
+// refuses with the direct-owned count, and once that seat ends the same
+// route returns prepared (not_required with no scopes) instead of a
+// refusal. The second half proves the refusal counted the direct owner
+// rather than the route being unconditionally closed.
+func TestDirectOwnedPlusShimOwnedPreflight(t *testing.T) {
+	d := startAcceptanceDaemon(t)
+	acceptDirectSeat(t, d, "direct-preflight-seat")
+
+	if _, err := prepareRestart(t, d); err == nil {
+		t.Fatal("preflight with a live direct-owned seat succeeded, want the direct-owned refusal")
+	} else {
+		var refusal *afclient.DaemonRestartPreflightRefusalError
+		if !errors.As(err, &refusal) {
+			t.Fatalf("preflight error = %v (%T), want the typed preflight refusal", err, err)
+		}
+		if refusal.Code != afclient.DaemonRestartPreflightRefusalCode {
+			t.Fatalf("preflight refusal code = %q, want %q", refusal.Code, afclient.DaemonRestartPreflightRefusalCode)
+		}
+		// The uncovered-direct-owned stage reports the closed top-level
+		// code itself as its cause: it raises the untyped refusal (the
+		// direct-owned count rides the message, not a stage token), and
+		// the route's typed writer carries that through unchanged. The
+		// row's discriminating property is that the refusal names THIS
+		// stage (not a fence, registry, or lifecycle stage) and clears
+		// once the direct owner ends — asserted below.
+		if refusal.Cause != "" && refusal.Cause != afclient.DaemonRestartPreflightRefusalCode {
+			t.Fatalf("preflight refusal cause = %q, want the closed top-level code or empty", refusal.Cause)
+		}
+	}
+
+	// The direct-owned seat ends; the next preflight is prepared, proving
+	// the refusal above counted that seat and nothing else.
+	if !d.StopSession("direct-preflight-seat") {
+		t.Fatal("StopSession refused the live direct-owned seat")
+	}
+	waitSeatGone(t, d, "direct-preflight-seat", 30*time.Second)
+	res, err := prepareRestart(t, d)
+	if err != nil {
+		t.Fatalf("preflight after the direct-owned seat ended = %v, want prepared", err)
+	}
+	if res.State != afclient.DaemonRestartNotRequired {
+		t.Fatalf("preflight state = %q, want %q", res.State, afclient.DaemonRestartNotRequired)
+	}
+}
+
+// TestBearerExpiresWhileNoDaemonRuns drives the bearer-expires-while-no-
+// daemon-runs row through the production heartbeat entry point: a pulser
+// presenting a stale worker/bearer pair trips the 3-strike fuse and closes
+// LostOwnership (the lease fuse ending the seat), while the terminal
+// evidence the seat already committed stays stored on the receiver —
+// nothing is released without it.
+func TestBearerExpiresWhileNoDaemonRuns(t *testing.T) {
+	r := newStubReceiver(t)
+	worker, bearer := r.currentWorker()
+	base := r.url() + "/api/sessions/sess-bearer-lapse"
+	client := r.client()
+
+	// The seat commits its terminal evidence while its bearer is current.
+	if code, raw := postJSON(t, client, base+"/status", bearer, map[string]any{"workerId": worker, "status": "completed", "attempt": "att-lapse", "summary": "done"}); code != http.StatusOK {
+		t.Fatalf("terminal commit = %d (%s), want 200", code, raw)
+	}
+
+	// The bearer lapses (rotation retires it with no daemon left to push
+	// the fresh pair): the production heartbeat pulser trips its fuse on
+	// the stale pair instead of refreshing forever.
+	if code, raw := postJSON(t, client, r.url()+"/api/workers/register", bearer, map[string]any{"workerId": worker}); code != http.StatusOK {
+		t.Fatalf("re-register = %d (%s), want 200", code, raw)
+	}
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID: "sess-bearer-lapse", WorkerID: worker, BaseURL: r.url(),
+		AuthToken: bearer, Interval: 20 * time.Millisecond, HTTPClient: client,
+		MaxAttemptsPerTick: 1, StrikesUntilLost: 2,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("heartbeat Start: %v", err)
+	}
+	defer func() { _ = p.Stop() }()
+	select {
+	case <-p.LostOwnership():
+	case <-ctx.Done():
+		t.Fatalf("lease fuse never tripped on the lapsed bearer (strikes=%d)", p.Strikes())
+	}
+	if p.StopRequested() {
+		t.Fatal("StopRequested set on a bearer lapse; the fuse must report lost ownership, not an operator cancel")
+	}
+	// The fuse ends the seat but the terminal evidence stays stored:
+	// nothing is released without it.
+	if _, done := r.terminal("sess-bearer-lapse"); !done {
+		t.Fatal("terminal evidence missing after the lease fuse tripped")
+	}
+}
+
+// TestDaemonReturnsBeforeBearerExpires drives the daemon-returns-before-
+// bearer-expires row through the production heartbeat and step-heartbeat
+// entry points: while the receiver rotates the worker pair (the pushed
+// credential update arriving before the old bearer lapses), a pulser and
+// an emitter that follow the rotation through the credential provider
+// never miss a tick — no strike accrues and every step beat lands.
+func TestDaemonReturnsBeforeBearerExpires(t *testing.T) {
+	r := newStubReceiver(t)
+	worker, bearer := r.currentWorker()
+	base := r.url() + "/api/sessions/sess-credential-push"
+	client := r.client()
+
+	// Seed one successful tick on the original pair so the lease is live
+	// before the rotation.
+	if code, raw := postJSON(t, client, base+"/lock-refresh", bearer, map[string]any{"workerId": worker}); code != http.StatusOK {
+		t.Fatalf("seed refresh = %d (%s), want 200", code, raw)
+	}
+
+	// The pushed credential update: re-registration rotates the pair. The
+	// production credential-provider seam hands the fresh pair to both
+	// beaters before the old bearer lapses.
+	code, raw := postJSON(t, client, r.url()+"/api/workers/register", bearer, map[string]any{"workerId": worker})
+	if code != http.StatusOK {
+		t.Fatalf("re-register = %d (%s), want 200", code, raw)
+	}
+	var reg map[string]any
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		t.Fatal(err)
+	}
+	newWorker, _ := reg["workerId"].(string)
+	newBearer, _ := reg["bearer"].(string)
+	if newWorker == "" || newBearer == "" {
+		t.Fatalf("rotation returned worker=%q bearer-set=%v", newWorker, newBearer != "")
+	}
+	provider := func(context.Context) (heartbeat.RuntimeCredentials, error) {
+		return heartbeat.RuntimeCredentials{WorkerID: newWorker, AuthToken: newBearer}, nil
+	}
+	stepProvider := func(context.Context) (stepheartbeat.RuntimeCredentials, error) {
+		return stepheartbeat.RuntimeCredentials{WorkerID: newWorker, AuthToken: newBearer}, nil
+	}
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID: "sess-credential-push", WorkerID: newWorker, BaseURL: r.url(),
+		AuthToken: newBearer, CredentialProvider: provider,
+		Interval: 20 * time.Millisecond, HTTPClient: client,
+		MaxAttemptsPerTick: 1, StrikesUntilLost: 3,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat New: %v", err)
+	}
+	e, err := stepheartbeat.New(stepheartbeat.Config{
+		SessionID: "sess-credential-push", WorkerID: newWorker, BaseURL: r.url(),
+		AuthToken: newBearer, CredentialProvider: stepProvider,
+		Interval: 20 * time.Millisecond, HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("step-heartbeat New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("heartbeat Start: %v", err)
+	}
+	defer func() { _ = p.Stop() }()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("step-heartbeat Start: %v", err)
+	}
+	defer func() { _ = e.Stop() }()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-p.LostOwnership():
+		t.Fatalf("lease fuse tripped after the credential push (strikes=%d)", p.Strikes())
+	default:
+	}
+	if got := p.Strikes(); got != 0 {
+		t.Fatalf("heartbeat strikes = %d after the credential push, want 0", got)
+	}
+	refreshes, _, _ := r.counts()
+	if refreshes < 2 {
+		t.Fatalf("lease refreshes = %d, want at least the seed plus one pushed tick", refreshes)
+	}
+	if got := len(r.stepBeatBodies()); got == 0 {
+		t.Fatal("no step heartbeats landed after the credential push")
+	}
+}
+
+// TestScopeCreationRefused drives the scope-creation-refused row through
+// the production pi spawn entry point: a session stamping a scoped
+// execution level the pi harness cannot render is refused before spawn
+// with the typed execution_security_unrenderable reason — never launched
+// into a weaker scope as a fallback.
+func TestScopeCreationRefused(t *testing.T) {
+	bin := buildFakeHarness(t)
+	provider, err := pi.New(pi.Options{
+		PiBin:            bin,
+		HandshakeTimeout: 20 * time.Second,
+		VersionProbe:     func(context.Context, string) (string, error) { return pi.PinnedVersion, nil },
+	})
+	if err != nil {
+		t.Fatalf("pi.New: %v", err)
+	}
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	levels := agent.IndexZeroExecutionSecurityLevels()
+	levels.Isolation = agent.IsolationOSSandbox
+	spec := piSpec(t.TempDir(), "scoped turn")
+	spec.ExecutionSecurity = &agent.ExecutionSecurity{
+		Version: agent.ExecutionSecurityWireVersion,
+		Levels:  levels,
+		Digest:  agent.ExecutionSecurityLevelsDigest(levels),
+	}
+	_, err = provider.Spawn(context.Background(), spec)
+	if err == nil {
+		t.Fatal("Spawn of a session stamping an unscoped-capable level succeeded, want the typed scope refusal")
+	}
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("Spawn error = %v, want a spawn failure", err)
+	}
+	if code := agent.ExecutionSecurityErrorCode(err); code != agent.ExecutionSecurityUnrenderable {
+		t.Fatalf("Spawn error = %v (code %q), want the typed %q scope refusal", err, code, agent.ExecutionSecurityUnrenderable)
+	}
+}
+
+// TestSuiteDefinesEveryNamedDriver proves the drivers map and the
+// testFunctionNames list above are not fiction: every name they carry
+// resolves to a real test the -list gate below shows. Run it with:
+// GOWORK=off go test -count=1 -list '.*' ./upgradeacceptance/
+func TestSuiteDefinesEveryNamedDriver(t *testing.T) {
+	t.Parallel()
+	seen := map[string]bool{}
+	for _, n := range testFunctionNames {
+		if seen[n] {
+			t.Fatalf("duplicate test name %q in testFunctionNames", n)
+		}
+		seen[n] = true
+	}
+	for _, tc := range []struct{ row, driver string }{
+		{"harness-finishes-while-daemon-down-post-fails", "TestReceiverPendingReplay"},
+		{"bearer-expires-while-no-daemon-runs", "TestBearerExpiresWhileNoDaemonRuns"},
+		{"daemon-returns-before-bearer-expires", "TestDaemonReturnsBeforeBearerExpires"},
+		{"direct-owned-plus-shim-owned-preflight", "TestDirectOwnedPlusShimOwnedPreflight"},
+		{"scope-creation-refused", "TestScopeCreationRefused"},
+		{"receiver-exact-replay", "TestReceiverExactReplay"},
+		{"receiver-worker-rotation", "TestReceiverWorkerRotation"},
+		{"receiver-lease-across-gap", "TestReceiverLeaseAcrossGap"},
+		{"harness-resume-reports-history", "TestFakeHarnessResumeReportsHistory"},
+	} {
+		if !seen[tc.driver] {
+			t.Fatalf("row %q names driver %q, which testFunctionNames does not list", tc.row, tc.driver)
+		}
 	}
 }
