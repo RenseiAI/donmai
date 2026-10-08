@@ -18,6 +18,7 @@ import (
 // strips the inherited parent env only.
 var credentialSnapshotKeys = []string{
 	PiKeyEnvVar,
+	gatewayBearerEnvVar,
 	"ANTHROPIC_API_KEY",
 	"OPENAI_API_KEY",
 	"GEMINI_API_KEY",
@@ -154,8 +155,15 @@ func TestCredentialSnapshotParity_FullSnapshotRidesInteractiveChildEnv(t *testin
 		case "ANTHROPIC_BASE_URL", "GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY", "CODEX_API_KEY":
 			continue // non-model credentials: ride env, out of the file rail's scope
 		}
-		if _, present := got[k]; present {
-			t.Errorf("snapshot credential %s = %q reached the interactive child env; it must ride the file", k, got[k])
+		// Session-carried credential names were fanned out to the file;
+		// session-absent ones are shadowed EMPTY (the PTY host inherits
+		// unmentioned parent names, so absence must be explicit). Either
+		// way no credential VALUE may ride the override map.
+		if v, present := got[k]; present && v != "" && v != "cell-"+k {
+			t.Errorf("snapshot credential %s = %q reached the interactive child env; it must ride the file", k, v)
+		}
+		if v := got[k]; v != "" && len(projected.Env[k]) == 0 {
+			t.Errorf("session-absent snapshot credential %s shadowed non-empty: %q", k, v)
 		}
 	}
 	if got["ANTHROPIC_BASE_URL"] != "cell-ANTHROPIC_BASE_URL" {

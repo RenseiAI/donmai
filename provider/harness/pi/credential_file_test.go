@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/gateway"
 )
 
 // This file is the child-environment regression suite for the session
@@ -362,10 +363,13 @@ func TestComposeChildEnv_StripsCredentialValues(t *testing.T) {
 
 // TestInteractiveChildEnvMap_StripsCredentialValues is the interactive-lane
 // unit companion: the override map carries the pin and the harmless var,
-// never a credential value.
+// never a credential value. Credential names the session does not carry are
+// shadowed with an explicit EMPTY override (so the PTY host cannot inherit a
+// supervisor-declared parent value); an empty read is absent to the child,
+// never a usable key.
 //
 // RED proof: return spec unstripped from stripSessionCredentialEnv and the
-// credential assertions fail.
+// value assertions fail with the sentinel.
 func TestInteractiveChildEnvMap_StripsCredentialValues(t *testing.T) {
 	t.Parallel()
 	layout := newSessionLayout(t.TempDir())
@@ -385,8 +389,8 @@ func TestInteractiveChildEnvMap_StripsCredentialValues(t *testing.T) {
 		if strings.Contains(v, credentialFileSentinel) {
 			t.Fatalf("interactiveChildEnv[%q] carries the sentinel credential value", k)
 		}
-		if isSessionCredentialEnv(k + "=" + v) {
-			t.Fatalf("interactiveChildEnv carries a credential-named entry %q", k)
+		if isSessionCredentialEnv(k+"="+v) && v != "" {
+			t.Fatalf("interactiveChildEnv carries a credential-named entry with a value: %q=%q", k, v)
 		}
 	}
 	if got["DONMAI_HARMLESS_VAR"] != "keep" {
@@ -531,9 +535,11 @@ func TestGatewayBearerRidesFileNotChildEnv(t *testing.T) {
 	}
 
 	// Interactive lane: same bearer, same strip, through its own override map.
+	// Session-absent credential names are shadowed empty (see the unit
+	// companion above); only a non-empty value is a leak.
 	interactive := interactiveChildEnv(projected, layout)
 	for k, v := range interactive {
-		if isSessionCredentialEnv(k + "=" + v) {
+		if isSessionCredentialEnv(k+"="+v) && v != "" {
 			t.Fatalf("gateway bearer rides the interactive child env by name: %q", k)
 		}
 		if strings.Contains(v, bearer) {
@@ -630,5 +636,138 @@ func TestHeadlessSpawn_GatewayBearerAbsentFromChildEnv(t *testing.T) {
 	}
 	if _, statErr := os.Stat(credPath); !os.IsNotExist(statErr) {
 		t.Errorf("session credential file still exists after Stop: %s", credPath)
+	}
+}
+
+// TestInteractiveSpawn_DeclaredParentCredentialAbsentFromChildEnv is the B1
+// regression test: a supervisor-declared inherited credential (the
+// InjectedEnvKeysVar declaration that re-admits a blocklisted name into the
+// worker) must not reach the interactive PTY child. The PTY host layers the
+// override map onto the parent env and inherits unmentioned names, so the
+// interactive lane shadows every session-absent credential name with an
+// explicit empty override — the counterpart of the headless lane's
+// post-merge strip. Drives the production interactive Spawn entry point
+// against a fake binary that records its env.
+//
+// RED proof: drop the shadow loop from interactiveChildEnv and the recorded
+// child env carries the declared parent value.
+func TestInteractiveSpawn_DeclaredParentCredentialAbsentFromChildEnv(t *testing.T) {
+	// Not parallel: mutates process env and spawns a real PTY child.
+	const parentSecret = "parent-secret-declared-must-not-reach-pi"
+	t.Setenv("ANTHROPIC_API_KEY", parentSecret)
+	t.Setenv("DONMAI_INJECTED_ENV_KEYS", "ANTHROPIC_API_KEY")
+	workdir := t.TempDir()
+	p := newFakeInteractivePiProvider(t, `
+{
+  env > "$PWD/pty-env.txt"
+}
+`)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+
+	envRaw := readCapturedFile(t, workdir, "pty-env.txt")
+	for _, entry := range strings.Split(envRaw, "\n") {
+		if entry == "" {
+			continue
+		}
+		if i := strings.IndexByte(entry, '='); i >= 0 && strings.Contains(entry[i+1:], parentSecret) {
+			t.Fatalf("declared parent credential reached the interactive child env: %q", entry)
+		}
+	}
+	// The shadow override is what keeps it out: the name is present but
+	// empty, which reads as absent to the child — never the parent's value.
+	found := false
+	for _, entry := range strings.Split(envRaw, "\n") {
+		if entry == "ANTHROPIC_API_KEY=" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("interactive child env carries no empty ANTHROPIC_API_KEY shadow; the parent value is one unshadowed name away:\n%s", envRaw)
+	}
+}
+
+// TestHeadlessChildEnv_StripsKnownSecretValues is the B2 headless regression
+// test: the finding's named sentinels (a custom binding key and the worker
+// runtime bearer on Spec.Env) must not reach the headless pi child env by
+// NAME or by VALUE. The closed producer set is pinned by the endpoint
+// manifests: model credentials arrive only under endpoint-declared EnvKeys
+// or the gateway bearer, both of which the file rail fans out — so the rail
+// plus the value backstop below leave no named hole. Drives the production
+// composeChildEnv entry point.
+//
+// RED proof: remove the bearer/custom-name coverage from the rail (or the
+// value backstop) and the assertions fail with the sentinel quoted.
+func TestHeadlessChildEnv_StripsKnownSecretValues(t *testing.T) {
+	t.Parallel()
+	const customSecret = "super-secret-custom-value"
+	const workerSecret = "worker-secret-value"
+	layout := newSessionLayout(t.TempDir())
+	spec := agent.Spec{
+		Cwd: t.TempDir(),
+		Env: map[string]string{
+			"API_KEY":             customSecret,
+			"CUSTOM_SECRET_KEY":   customSecret,
+			"WORKER_AUTH_TOKEN":   workerSecret,
+			"DONMAI_HARMLESS_VAR": "keep",
+		},
+	}
+	env := composeChildEnv(spec, layout, "sess-token")
+	for _, e := range env {
+		if i := strings.IndexByte(e, '='); i >= 0 && (strings.Contains(e[i+1:], customSecret) || strings.Contains(e[i+1:], workerSecret)) {
+			t.Fatalf("secret value rides the headless child env: %q", e)
+		}
+	}
+	if !hasEnvVal(env, "DONMAI_HARMLESS_VAR", "keep") {
+		t.Errorf("non-credential binding was dropped from the headless lane: %q", env)
+	}
+}
+
+// TestInteractiveChildEnv_StripsKnownSecretValues is the B2 interactive
+// companion: the same named sentinels are absent from the PTY override map
+// by NAME and by VALUE. Drives the production interactiveChildEnv entry
+// point.
+//
+// RED proof: remove the bearer/custom-name coverage from the rail and the
+// assertions fail with the sentinel quoted.
+func TestInteractiveChildEnv_StripsKnownSecretValues(t *testing.T) {
+	t.Parallel()
+	const customSecret = "super-secret-custom-value"
+	const workerSecret = "worker-secret-value"
+	layout := newSessionLayout(t.TempDir())
+	got := interactiveChildEnv(agent.Spec{
+		Cwd: t.TempDir(),
+		Env: map[string]string{
+			"API_KEY":             customSecret,
+			"CUSTOM_SECRET_KEY":   customSecret,
+			"WORKER_AUTH_TOKEN":   workerSecret,
+			"DONMAI_HARMLESS_VAR": "keep",
+		},
+	}, layout)
+	for k, v := range got {
+		if strings.Contains(v, customSecret) || strings.Contains(v, workerSecret) {
+			t.Fatalf("secret value rides the interactive child env: %q=%q", k, v)
+		}
+	}
+	if got["DONMAI_HARMLESS_VAR"] != "keep" {
+		t.Errorf("non-credential binding was dropped from the interactive lane: %v", got)
+	}
+}
+
+// TestGatewayBearerConstLinked pins F1: the pi-local bearer name is one
+// compiler-checked definition with the gateway package's own TokenEnvVar,
+// so a gateway rename breaks the build instead of silently re-opening the
+// child-env hole. A literal re-spelling here would compile either way.
+func TestGatewayBearerConstLinked(t *testing.T) {
+	t.Parallel()
+	if gatewayBearerEnvVar != gateway.TokenEnvVar {
+		t.Fatalf("gatewayBearerEnvVar = %q, want gateway.TokenEnvVar (%q): the rail must track the gateway's own definition", gatewayBearerEnvVar, gateway.TokenEnvVar)
 	}
 }

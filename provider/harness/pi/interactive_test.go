@@ -371,9 +371,14 @@ func TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless(t *testing.T) {
 	if inter[piBaseURLEnvVar] != "https://ai-gateway.invalid/v1" {
 		t.Errorf("interactive child env missing the provider pin base URL: %v", inter)
 	}
-	// The resolved cell key rides the credential file, never either env.
-	if _, present := inter[PiKeyEnvVar]; present {
-		t.Errorf("interactive child env must NOT carry the session key; got %q", inter[PiKeyEnvVar])
+	// The resolved cell key rides the credential file, never either env as a
+	// VALUE: the interactive lane shadows every credential name the session
+	// does not itself carry with an explicit EMPTY override (so the PTY host
+	// cannot inherit a supervisor-declared parent value into the renamed
+	// child), and the session-carried key was fanned out to the file above.
+	// An empty read is absent to the child, never a usable key.
+	if got := inter[PiKeyEnvVar]; got != "" {
+		t.Errorf("interactive child env carries the session key value; got %q", got)
 	}
 	for _, e := range headless {
 		if isSessionCredentialEnv(e) {

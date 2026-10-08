@@ -266,14 +266,27 @@ func interactiveToolPolicyEnv(spec agent.Spec) []string {
 // interactiveChildEnv builds the ptycli override env for an interactive spawn.
 // It carries the already-projected spec.Env MINUS session credential values
 // (stripped first: the resolved cell credentials ride the session credential
-// file, never the child env), the two documented config/session-home redirect
-// vars headless also sets (piCodingAgentDirEnvVar/piCodingAgentSessionDirEnvVar —
-// ADR-2026-08-12 D4.1), the offline-posture defaults (D4.3 — the interactive
-// lane is explicitly in scope, not just headless), the non-secret
-// provider-pin vars the embedded extension reads at load, and the stamped
+// file, never the child env), MINUS any inherited-credential shadow (a
+// supervisor-declared name the PTY host would otherwise inherit from the
+// parent into the renamed child — see shadowCredentialDeclaredParent below),
+// the two documented config/session-home redirect vars headless also sets
+// (piCodingAgentDirEnvVar/piCodingAgentSessionDirEnvVar — ADR-2026-08-12
+// D4.1), the offline-posture defaults (D4.3 — the interactive lane is
+// explicitly in scope, not just headless), the non-secret provider-pin vars
+// the embedded extension reads at load, and the stamped
 // allowed/disallowed-tools lists the SAME extension matches locally
 // (interactiveToolPolicyEnv above). The credential file's PATH is composed by
 // the caller (spawnInteractive), not here.
+//
+// The shadow entries are the interactive counterpart of the headless lane's
+// stripCredentialNamedEnv backstop (spec_translation.go composeChildEnv):
+// the PTY host layers these overrides onto the parent environment and
+// inherits any name the override map does not mention — including a
+// supervisor-declared credential the parent carries — so a credential-named
+// entry must be present here to keep the parent's value out, exactly as the
+// headless lane drops it after the merge. An empty value reads as absent to
+// the child (no entry in sessionCredentialEntries is ever empty), never as
+// a usable key.
 //
 // It deliberately omits piHandshakeEnvVar: interactive PTY mode runs no Go
 // handshake round-trip, and the extension skips the handshake (and does not
@@ -310,6 +323,27 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 	for _, kv := range interactiveToolPolicyEnv(spec) {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			env[kv[:i]] = kv[i+1:]
+		}
+	}
+	// Shadow every credential name the session does not itself carry: the PTY
+	// host inherits unmentioned names from the parent, so without an explicit
+	// (empty) override a supervisor-declared credential the parent carries
+	// would reach the renamed child — the exact hole the headless lane's
+	// post-merge strip closes. Names the session DOES carry were already
+	// fanned out to the credential file above; shadowing them too would
+	// change nothing (both are empty/absent reads to the child) but would
+	// hide a merge regression, so only the absent ones are shadowed. The
+	// undeclared secret-valued names are shadowed unconditionally: they ride
+	// neither the file nor the env on this harness, so there is no
+	// session-carried value to preserve.
+	for _, name := range sessionCredentialNames() {
+		if _, present := env[name]; !present {
+			env[name] = ""
+		}
+	}
+	for _, name := range undeclaredSecretValueNames {
+		if _, present := env[name]; !present {
+			env[name] = ""
 		}
 	}
 	return env
