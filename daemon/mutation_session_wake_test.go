@@ -89,17 +89,24 @@ const wakeFixtureTransitionHarness = "transition"
 const wakeFixtureReadyProbe = "wake-fixture-ready"
 
 // wakeFixtureFrozenHarness never reads its terminal. It is the wedge itself:
-// alive, holding the PTY, consuming no input, emitting nothing. Writes to it
+// alive, holding the PTY, consuming no input, emitting nothing once its
+// one-time setup announcement (wakeFixtureFrozenReady) is out. Writes to it
 // succeed at every layer and produce no output — which is the property that
 // makes "delivered" and "answered" two different facts.
 const wakeFixtureFrozenHarness = "frozen"
+
+// wakeFixtureFrozenReady is the frozen harness's output-side readiness
+// marker. A harness that never reads cannot answer the readiness probe, so it
+// announces its completed terminal setup instead. It deliberately carries no
+// `ack:`: it is not an answer to anything.
+const wakeFixtureFrozenReady = "frozen-fixture-ready"
 
 // wakeHarnessEnv selects the wake-harness child role: this test binary
 // re-executed as the PTY child, owning the terminal mode in-process and
 // answering each input line with a hex-encoded `ack:` report. The mode
 // travels in a second variable so the fixture's readiness handshake keeps
-// working: the frozen mode never reads, so it is the sole no-handshake
-// case, exactly as before.
+// working: the frozen mode never reads, so it announces its completed setup
+// on the output side instead of answering the probe.
 const (
 	wakeHarnessEnv     = "DONMAI_TEST_DAEMON_SESSION_WAKE_HARNESS"
 	wakeHarnessModeEnv = "DONMAI_TEST_DAEMON_SESSION_WAKE_HARNESS_MODE"
@@ -138,7 +145,21 @@ func runDaemonShimWakeHarness() int {
 	mode := os.Getenv(wakeHarnessModeEnv)
 	if mode == wakeFixtureFrozenHarness {
 		configureWakeHarnessTerminal(wakeFixtureCanonical)
-		select {}
+		// Announce the completed mode setup on the output side, then go
+		// quiet. Without it a wake can reach the terminal before `-isig`
+		// applies, and restart-harness's interrupt byte becomes a real
+		// SIGINT that kills the fixture.
+		if _, err := fmt.Fprintf(os.Stdout, "%s\n", wakeFixtureFrozenReady); err != nil {
+			return 1
+		}
+		// Stay alive without reading, as the old shell fixture's
+		// `while :; do sleep 30; done` did. A bare `select {}` is not that:
+		// with no other goroutine and no pending timer, the runtime's
+		// deadlock detector aborts the process ("all goroutines are
+		// asleep"), so the fixture was a dead seat rather than a frozen one.
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 	if mode == wakeFixtureTransitionHarness {
 		configureWakeHarnessTerminal(wakeFixtureCanonical)
@@ -275,9 +296,13 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	// The fixture harness changes terminal mode asynchronously after exec.
 	// Before control-byte assertions, prove it has completed that setup by
 	// sending an ordinary probe and reading the harness's exact
-	// acknowledgement. The frozen fixture intentionally never reads, so it
-	// is the sole no-handshake case.
-	if harness != wakeFixtureFrozenHarness {
+	// acknowledgement. The frozen fixture never reads, so it announces its
+	// completed setup on the output side instead.
+	if harness == wakeFixtureFrozenHarness {
+		if !awaitWakeMarker(output, wakeFixtureFrozenReady, 10*time.Second) {
+			t.Fatal("frozen fixture never announced its completed terminal setup")
+		}
+	} else {
 		if err := ctrl.WriteInput([]byte(wakeFixtureReadyProbe + "\r")); err != nil {
 			t.Fatalf("send fixture readiness probe: %v", err)
 		}
@@ -322,6 +347,27 @@ func (f *wakeFixture) awaitAck(t *testing.T, within time.Duration) bool {
 func (f *wakeFixture) awaitLine(t *testing.T, within time.Duration) (string, bool) {
 	t.Helper()
 	return awaitWakeLine(f.output, within)
+}
+
+// awaitWakeMarker reports whether marker appears in the harness output within
+// the deadline.
+func awaitWakeMarker(output <-chan []byte, marker string, within time.Duration) bool {
+	deadline := time.After(within)
+	var seen strings.Builder
+	for {
+		select {
+		case data, ok := <-output:
+			if !ok {
+				return false
+			}
+			seen.Write(data)
+			if strings.Contains(seen.String(), marker) {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
 }
 
 func awaitWakeLine(output <-chan []byte, within time.Duration) (string, bool) {
@@ -662,6 +708,13 @@ func TestSessionWakeVerbsDeliverToAFrozenHarnessWithoutRecovery(t *testing.T) {
 			}
 			if f.awaitAck(t, 2*time.Second) {
 				t.Fatalf("%s: a harness that never reads its terminal answered; fixture is not frozen", op)
+			}
+			// Frozen means alive: a harness that has exited also never
+			// answers, and would pass the check above vacuously.
+			select {
+			case ev := <-f.terminal:
+				t.Fatalf("%s: the frozen harness exited (%+v); a dead seat is not a wedged one", op, ev)
+			default:
 			}
 		})
 	}
