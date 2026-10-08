@@ -116,7 +116,9 @@ type Session struct {
 
 // Spawn runs spec.Command under a pseudo-terminal and returns the live Session.
 // The PTY winsize is applied before the child starts (§8); the process becomes a
-// session/process-group leader for group teardown (§12.2).
+// session/process-group leader for group teardown (§12.2). A start the kernel
+// refuses transiently (EPERM/EAGAIN under spawn churn) is retried a bounded
+// number of times before it fails the spawn — see startPTYWithRetry.
 func Spawn(spec Spec) (*Session, error) {
 	if len(spec.Command) == 0 {
 		return nil, errors.New("ptyhost: Spawn requires a non-empty Command")
@@ -129,9 +131,9 @@ func Spawn(spec Spec) (*Session, error) {
 	}
 	cmd.Env = composeEnv(os.Environ(), spec.Env)
 
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
+	ptmx, err := startPTYWithRetry(cmd, &pty.Winsize{Rows: rows, Cols: cols}, spec.logger())
 	if err != nil {
-		return nil, fmt.Errorf("ptyhost: pty start: %w", err)
+		return nil, err
 	}
 	spawnAt := time.Now()
 
