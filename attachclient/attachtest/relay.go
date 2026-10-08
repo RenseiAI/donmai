@@ -210,32 +210,25 @@ func (s *StubRelay) HostAckSeq() int64 {
 // SendToHost injects a relay→host frame directly (bypassing stamping) — used by
 // the input-trust test to deliver an UNSTAMPED Input from a hostile relay.
 //
-// Delivery targets the currently-bound host leg's sink, which the leg's
-// writer drains onto the wire. When no leg is bound — the ordinary gap
-// between a dropped leg's unbind and its replacement's bind — the frame is a
-// no-op: a real relay has no host connection to write to either, so nothing
-// is queued for a leg that does not exist yet. Tests that inject a frame and
-// then expect the client to observe it must therefore wait until the leg they
-// mean to reach is bound (HostBound, or a delivery-count accessor below)
-// BEFORE injecting; otherwise the frame may land in a half-closed predecessor
-// whose writer has already exited, where it sits unread in that leg's buffer
-// while the test has already moved on to the replacement.
+// Delivery targets the leg that owns the room binding at that moment, and is a
+// no-op while no leg does. Across a reconnect the owner can still be the
+// predecessor even though its client has hung up: the relay unbinds a leg only
+// once that leg's reader sees the closed socket, and binds the replacement
+// only once the replacement's subscribe arrives. A frame injected in that
+// window is written to the dead connection and never observed, and HostBound
+// reports true throughout it. A test that injects after a reconnect must
+// therefore wait for the replacement's bind (HostBinds), not for a bound leg.
 func (s *StubRelay) SendToHost(f attachwire.Frame) { s.room.sendToHost(f) }
 
-// HostOutDepth reports the number of undelivered relay→host frames queued in
-// the currently-bound leg's sink (zero when no leg is bound). Tests use it to
-// sequence fault injection deterministically: after SendToHost, waiting for
-// the depth to return to zero proves the bound leg's writer consumed the
-// frame — the client will observe it — before the test fires the next one.
-// A frame stranded in a half-closed predecessor's buffer (see SendToHost)
-// does not count toward the bound leg's depth, so a test that fires the next
-// bounce while the predecessor still owns the binding can still lose it;
-// pair this with HostBound sequencing across a rebind (wait until the leg the
-// frame was delivered to has unbound and the replacement has bound).
-func (s *StubRelay) HostOutDepth() int {
+// HostBinds counts the successful host-leg binds since the relay started, and
+// only grows. Record it before a fault that makes the client reconnect, then
+// wait for it to increase: the leg bound after that is the replacement, which
+// HostBound alone cannot tell apart from a predecessor that still owns the
+// binding (see SendToHost).
+func (s *StubRelay) HostBinds() uint64 {
 	s.room.mu.Lock()
 	defer s.room.mu.Unlock()
-	return len(s.room.hostOut)
+	return s.room.hostBinds
 }
 
 // SimulateRestart wipes all in-memory room state (ring, epoch/host binding,
