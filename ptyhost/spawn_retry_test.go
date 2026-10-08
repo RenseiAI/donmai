@@ -151,11 +151,16 @@ func TestSpawnRetriesATransientRefusal(t *testing.T) {
 		}
 		return pty.StartWithSize(cmd, ws)
 	}
+	// The argument is a sentinel: the retry logs name the program only, so
+	// it must never appear in them.
+	const argvSentinel = "ptyhost-retry-argv-sentinel"
 	makeCmd := func() *exec.Cmd {
-		return exec.Command("true")
+		return exec.Command("true", argvSentinel)
 	}
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	var started *exec.Cmd
-	ptmx, err := startPTYWithStarter(makeCmd, slog.Default(), starter, func(cmd *exec.Cmd) {
+	ptmx, err := startPTYWithStarter(makeCmd, logger, starter, func(cmd *exec.Cmd) {
 		started = cmd
 	})
 	if err != nil {
@@ -167,6 +172,12 @@ func TestSpawnRetriesATransientRefusal(t *testing.T) {
 	}
 	if started == nil || started.Process == nil {
 		t.Fatal("onStart did not report the started command; teardown would signal the wrong process")
+	}
+	if !strings.Contains(logs.String(), "refused transiently") {
+		t.Fatalf("retry logs = %q, want the transient refusal reported", logs.String())
+	}
+	if strings.Contains(logs.String(), argvSentinel) {
+		t.Fatalf("retry logs = %q, want no argv in them", logs.String())
 	}
 	// Reap the only real child this test started so it never outlives the
 	// test's PTY close.

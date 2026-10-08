@@ -102,7 +102,7 @@ func startPTYWithStarter(makeCmd func() *exec.Cmd, logger *slog.Logger, starter 
 			}
 			if attempt > 1 && logger != nil {
 				logger.Warn("ptyhost: pty start refused transiently, retry succeeded",
-					"attempt", attempt, "command", cmd.Args)
+					"attempt", attempt, "program", cmd.Path)
 			}
 			return ptmx, nil
 		}
@@ -110,8 +110,11 @@ func startPTYWithStarter(makeCmd func() *exec.Cmd, logger *slog.Logger, starter 
 			return nil, fmt.Errorf("ptyhost: pty start: %w (attempt %d of %d)", err, attempt, spawnRetryAttempts)
 		}
 		if logger != nil {
+			// Only the program is logged, never the argv: a harness argv
+			// can carry prompts or other caller data that no log line
+			// formats.
 			logger.Warn("ptyhost: pty start refused transiently, retrying",
-				"attempt", attempt, "error", err, "command", cmd.Args)
+				"attempt", attempt, "error", err, "program", cmd.Path)
 		}
 		time.Sleep(spawnRetryDelay)
 	}
