@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -40,6 +41,11 @@ import (
 // starts, but every mutating control route refuses with 503 until a restart
 // finds a readable token. Read-only routes and the rest of the daemon keep
 // working. The failure is logged loudly on errOut and through slog.
+//
+// It also states the token file on opts (Options.ControlTokenPath) beside
+// the minted token: the spawner strips the path-override variable from
+// every worker, so accept-time details carry the path to the worker's seat
+// confinement explicitly instead (statedControlTokenPath).
 func applyDaemonControlAuth(opts *daemon.Options, tokenPath string, errOut io.Writer) {
 	opts.RequireControlToken = true
 	token, err := afclient.EnsureControlToken(tokenPath)
@@ -55,6 +61,24 @@ func applyDaemonControlAuth(opts *daemon.Options, tokenPath string, errOut io.Wr
 		token = ""
 	}
 	opts.ControlToken = token
+	opts.ControlTokenPath = statedControlTokenPath(tokenPath)
+}
+
+// statedControlTokenPath names the token file the daemon states to its
+// seats: the file the kernel resolves the path to, symbolic links and ".."
+// walked in order, never a lexical clean. With a symbolic link before a
+// "..", the lexical spelling names a different file than the one the token
+// was minted into and read from, and a seat denied that spelling could read
+// the live token. A path that does not resolve (nothing minted there) is
+// stated as given, so the seat still denies it.
+func statedControlTokenPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }
 
 func protectedRuntimeMCPHelperCommand(tokenFilePath string) (string, error) {
@@ -361,13 +385,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// harness unprobed. See Options.QuotaProbeBinaries.
 				QuotaProbeBinaries: resolveQuotaProbeBinaries(),
 			}
-			tokenPath := controlTokenPath()
-			applyDaemonControlAuth(&daemonOpts, tokenPath, errOut)
-			// State the resolved path beside the minted token: the
-			// spawner strips the path-override variable from every
-			// worker, so accept-time details carry the path to the
-			// worker's seat confinement explicitly instead.
-			daemonOpts.ControlTokenPath = tokenPath
+			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
 			d = daemon.New(daemonOpts)
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()

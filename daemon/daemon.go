@@ -95,8 +95,10 @@ type Options struct {
 	// ControlTokenPath is the resolved control-token file path the daemon
 	// minted ControlToken into: the explicit file-env override when
 	// absolute, else the host state home. The production entry point
-	// resolves it the same way the operator CLI does and states it here
-	// so accept-time session details can carry it to the spawned worker,
+	// resolves it the same way the operator CLI does and states here the
+	// file the kernel resolves that path to (symbolic links and ".."
+	// walked in order, never a lexical clean, which can name a different
+	// file) so accept-time session details can carry it to the spawned worker,
 	// whose seat confinement denies it outright. Empty (tests, embedders
 	// that never set it) states nothing — the worker falls back to its
 	// own environment resolution. The path is host topology, not a
