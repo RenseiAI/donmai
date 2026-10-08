@@ -1,6 +1,12 @@
 package sanitize
 
-import "bytes"
+import (
+	"bytes"
+	"encoding/base64"
+	"regexp"
+	"strings"
+	"unicode/utf8"
+)
 
 // Named byte constants for the control characters the parser recognizes.
 const (
@@ -69,6 +75,17 @@ type Options struct {
 	// still stripped from the byte stream; the callback lets a viewer OPTIONALLY
 	// show a capped title chip without ever retitling its own window (§9).
 	OnTitle func(title string)
+	// OnClipboard, when non-nil, is invoked with the decoded text each time an
+	// OSC 52 clipboard SET (ESC ] 52 ; Pc ; <base64> ST) is stripped. The
+	// sequence itself never reaches the output; the callback lets a viewer
+	// offer the text to its own clipboard under its own policy (for example,
+	// only for the input-control holder, right after their own input). It is
+	// never invoked for a query (Pd "?"), a clear (empty Pd), an unknown
+	// selection target, invalid base64, or text that is not valid UTF-8. The
+	// hold cap bounds the size: a set longer than the cap is stripped whole
+	// without a callback. Control characters other than HT, LF and CR are
+	// removed from the text.
+	OnClipboard func(text string)
 }
 
 // parser state.
@@ -104,6 +121,7 @@ type Sanitizer struct {
 	sixelMax  int
 	stripLink bool
 	onTitle   func(string)
+	onClip    func(string)
 
 	st       state
 	pending  []byte  // buffered bytes of the current sequence (incl. introducer)
@@ -134,6 +152,7 @@ func NewWithOptions(opts Options) *Sanitizer {
 		sixelMax:  opts.SixelMaxBytes,
 		stripLink: opts.StripHyperlinks,
 		onTitle:   opts.OnTitle,
+		onClip:    opts.OnClipboard,
 	}
 	if s.holdMax <= 0 {
 		s.holdMax = DefaultHoldMaxBytes
@@ -718,7 +737,12 @@ func (s *Sanitizer) finishOSC(out *[]byte, term []byte) {
 		}
 		// neutralize: stripped from the stream regardless of the callback.
 	case oscStrip:
-		// stripped
+		// stripped; an OSC 52 set is still offered to the clipboard hook.
+		if s.onClip != nil {
+			if text, ok := DecodeClipboardSet(content); ok {
+				s.onClip(text)
+			}
+		}
 	}
 }
 
@@ -782,4 +806,50 @@ func leadingOSCNumber(content []byte) (val, nlen int, ok bool) {
 		v = v*10 + int(c-'0')
 	}
 	return v, i, true
+}
+
+var clipboardSet = regexp.MustCompile(`^52;[cpqs0-7]*;([A-Za-z0-9+/]*={0,2})$`)
+
+// DecodeClipboardSet decodes the text of an OSC 52 clipboard SET from an OSC
+// body ("52;Pc;Pd", introducer and terminator excluded). It reports false for
+// anything that is not a set of valid UTF-8 text: a query (Pd "?"), a clear
+// (empty Pd), an unknown selection target, or invalid base64. Control
+// characters other than HT, LF and CR are removed from the text.
+func DecodeClipboardSet(content []byte) (string, bool) {
+	m := clipboardSet.FindSubmatch(content)
+	if m == nil || len(m[1]) == 0 {
+		return "", false
+	}
+	data := string(m[1])
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(data, "="))
+	}
+	if err != nil || !utf8.Valid(raw) {
+		return "", false
+	}
+	text := strings.Map(func(r rune) rune {
+		if r == ht || r == lf || r == cr {
+			return r
+		}
+		if r < 0x20 || (r >= del && r <= 0x9F) {
+			return -1
+		}
+		return r
+	}, string(raw))
+	if text == "" {
+		return "", false
+	}
+	return text, true
+}
+
+// ClipboardSequence encodes text as an OSC 52 clipboard SET for a viewer that
+// forwards a clipboard write to its own terminal: ESC ] 52 ; c ; <base64>
+// ESC \. The terminal's own OSC 52 policy then decides whether to honour it.
+func ClipboardSequence(text string) []byte {
+	enc := base64.StdEncoding.EncodeToString([]byte(text))
+	out := make([]byte, 0, len(enc)+9)
+	out = append(out, esc, ']', '5', '2', ';', 'c', ';')
+	out = append(out, enc...)
+	return append(out, esc, '\\')
 }

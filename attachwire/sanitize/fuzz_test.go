@@ -2,7 +2,9 @@ package sanitize
 
 import (
 	"bytes"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // FuzzSanitizer asserts the three security-critical invariants over arbitrary
@@ -29,6 +31,7 @@ func FuzzSanitizer(f *testing.F) {
 		[]byte("café 日本語 👍🏽 x\xd9\x9by"),
 		[]byte("\x1b]0;\xe2\x9c\xb3 name\x07\x1b]8;;x\xc2\x9c\x9b6n"),
 		[]byte("\xc2\x9b6n\xc2\x9d11;?\xc2\x9c\x1b]10;\x9c?\x9d8;;u\x9cl\x90q~\x9c"),
+		[]byte("\x1b]52;c;ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA==\x07\x1b]52;c;?\x07\x9d52;p;Gx0=\x9c"),
 		[]byte("\x1b]0;" + string(bytes.Repeat([]byte("A"), 100))),
 		[]byte("\x1b\x1b\x1b[[[???ttt"),
 		{0x00, 0x1b, 0x9b, 0x9d, 0x90, 0x9f, 0x9e, 0x98, 0x9c, 0x07, 0x7f},
@@ -39,7 +42,18 @@ func FuzzSanitizer(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// (1) never panics — implicit; and produce the contiguous result.
-		out := New().Write(data)
+		// The clipboard hook must never change the stream, and what it offers is
+		// valid UTF-8 with no escape or other control besides HT/LF/CR.
+		out := NewWithOptions(Options{OnClipboard: func(text string) {
+			if !utf8.ValidString(text) || strings.ContainsFunc(text, func(r rune) bool {
+				return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || (r >= 0x7F && r <= 0x9F)
+			}) {
+				t.Fatalf("clipboard hook offered %q for %q", text, data)
+			}
+		}}).Write(data)
+		if plain := New().Write(data); !bytes.Equal(plain, out) {
+			t.Fatalf("clipboard hook changed the stream: %q vs %q", out, plain)
+		}
 
 		// (2) idempotence: re-sanitizing the output changes nothing. This is the
 		// spec-meaningful "output contains no forbidden sequence" check — a
