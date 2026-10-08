@@ -552,15 +552,24 @@ func linuxGuards(w linuxWorld) guards {
 }
 
 // TestBackendLinux_NameAndResolvers pins the attestation name and the
-// resolver declaration the adapter binds into the boundary.
+// resolver shape: the boundary binds the resolver inputs itself, and a
+// harness declares no resolver socket.
 func TestBackendLinux_NameAndResolvers(t *testing.T) {
 	b := &mountNamespaceBackend{}
 	if b.Name() != BackendLinuxMountNamespace {
 		t.Fatalf("Name = %q, want %q", b.Name(), BackendLinuxMountNamespace)
 	}
-	sockets := ResolverSockets()
-	if len(sockets) != 1 || sockets[0] != "/etc/resolv.conf" {
-		t.Fatalf("ResolverSockets = %v", sockets)
+	// The resolver inputs are bound by every boundary, so a harness
+	// declares no socket for them: a declared /etc/resolv.conf would refuse
+	// every spawn where systemd-resolved makes it a link.
+	if sockets := ResolverSockets(); len(sockets) != 0 {
+		t.Fatalf("ResolverSockets = %v, want none", sockets)
+	}
+	text := joinArgs(mustRenderBubblewrap(t, newLinuxWorld(t).resolved(), nil))
+	for _, path := range mountNamespaceResolverBinds {
+		if _, err := os.Lstat(path); err == nil && !strings.Contains(text, "\n--ro-bind\n"+path+"\n"+path+"\n") {
+			t.Errorf("rendering does not bind the resolver input %q:\n%s", path, text)
+		}
 	}
 	if _, err := b.Canonical("/tmp"); err != nil {
 		t.Fatalf("Canonical: %v", err)

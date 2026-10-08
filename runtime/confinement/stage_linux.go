@@ -85,8 +85,7 @@ type landlockPolicy struct {
 	dev bool
 	// sockets are the exact declared socket paths the mount tree binds.
 	// Connecting to a path socket is not a Landlock-mediated access; the
-	// grant covers resolver inputs declared beside them (a configuration
-	// file such as /etc/resolv.conf).
+	// read grant covers a declared path that is a plain file.
 	sockets []string
 	// execRoots are the executables the stage re-executes (itself and the
 	// harness), granted read and execute on the file alone, so binaries

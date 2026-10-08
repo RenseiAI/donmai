@@ -29,11 +29,14 @@ const mountNamespaceProfileVersion = "mount-namespace-v4"
 func DefaultBackend() Backend { return &mountNamespaceBackend{} }
 
 // ResolverSockets returns the OS resolver sockets a harness that needs name
-// resolution declares in Spec.Sockets. The NSS stack reads the static
-// resolver configuration and the host database directly, so those paths are
-// what a harness declares; the mount tree binds them read-only and the
-// Landlock stage grants them read access.
-func ResolverSockets() []string { return []string{"/etc/resolv.conf"} }
+// resolution declares in Spec.Sockets: none here. The NSS stack reads the
+// static resolver configuration and the host database, which every boundary
+// binds read-only and the Landlock stage grants read access
+// (mountNamespaceResolverBinds), whether or not a harness declares them.
+// Declaring /etc/resolv.conf would also refuse every spawn on a host where
+// it is a link (systemd-resolved points it at its stub file): a declared
+// socket must not be a symbolic link.
+func ResolverSockets() []string { return nil }
 
 // sharedLocations are the shared temporary locations the boundary hides: a
 // confined seat reaches its own per-session tmp through the TMPDIR binding,

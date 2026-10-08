@@ -276,7 +276,7 @@ jobs:
   # the restriction, where neither is done.
   linux-confinement:
     name: Linux executor confinement (bubblewrap + Landlock)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
       contents: read
