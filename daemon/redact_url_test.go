@@ -156,9 +156,28 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 	if d.heartbeat == nil {
 		t.Fatal("daemon has no heartbeat service")
 	}
-	if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
-		t.Fatalf("heartbeat beat: %v", err)
-	}
+	// Freeze the background beat first: the loop's immediate beat is an
+	// async goroutine, and any loop beat composed after the spawner
+	// refresh above transmits the same allowlist hash and therefore
+	// OMITS the allowlist from its payload (change-only reporting).
+	// Whichever beat runs last owns LastPayload, so a loop beat landing
+	// after the manual one leaves GET /api/daemon/heartbeat with no
+	// allowlist entries at all — the host and path vanish along with the
+	// credential. Holding the beat lock across the baseline reset and the
+	// manual beat below makes this beat deterministically last and
+	// deterministically complete: no interleaving beat can slip between
+	// the reset and the compose.
+	d.heartbeat.Stop()
+	d.heartbeat.sendMu.Lock()
+	func() {
+		defer d.heartbeat.sendMu.Unlock()
+		d.heartbeat.mu.Lock()
+		d.heartbeat.lastAllowlistHash = ""
+		d.heartbeat.mu.Unlock()
+		if err := d.heartbeat.sendOneSerialized(context.Background()); err != nil {
+			t.Fatalf("heartbeat beat: %v", err)
+		}
+	}()
 
 	for _, path := range []string{
 		"/api/daemon/stats",
