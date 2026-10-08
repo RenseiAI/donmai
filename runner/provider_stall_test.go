@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,12 +19,13 @@ import (
 // the stall detector and the stop-and-resume rail.
 //
 // Every resumed turn replays a tool call and its result before the turn's
-// own script: the retry prompt Resume delivers is itself model input, so
-// the resumed turn's post-tool silence is the same hung shape the first
-// turn showed — a resumed turn that opened with bare silence would not be
-// one (the detector only arms after a tool result, never on pre-tool
-// silence). A nil script therefore stalls the resumed turn exactly like
-// the first, while a scripted turn answers after its own tool result.
+// own script, so a nil script stalls the resumed turn after a tool result
+// exactly like the first, while a scripted turn answers after its own
+// tool result. That replay is a fixture choice, not harness behaviour: a
+// real resumed turn opens with the retry prompt, and a retried request
+// that hangs before any tool result is never armed and ends at the idle
+// watchdog. These fixtures pin the retry bound and the classification of
+// the rail, not real resume shapes.
 type stallScriptProvider struct {
 	// resumeTurns scripts the ANSWER each resumed turn gives after its
 	// replayed tool result: nil stalls again (silence), anything else is
@@ -449,7 +451,10 @@ func TestConsumeEvents_ModelOutputAfterToolResultDisarmsStallDetector(t *testing
 // with a healthy generation — a model output tick inside the stall window
 // that disarms the detector, then the finished text after a further
 // silence the disarmed detector ignores — and every resumed turn answers
-// the same way. A resumed turn that opened with bare silence longer than
+// the same way. The tick models a harness that reports output while a
+// response streams; pi, codex and claude do not do so today for text or
+// tool-call input (claude reports thinking progress only), which is why
+// the detector is off by default. A resumed turn that opened with bare silence longer than
 // the window would be a true stall (the detector arms on the replayed
 // tool result), so the probe's resumed turns answer at once: the test
 // asserts the FIRST turn is never aborted, i.e. resumes stays zero.
@@ -560,5 +565,104 @@ func TestRun_StallDetectorDefaultsToDisabled(t *testing.T) {
 	}
 	if provider.resumes.Load() != 0 {
 		t.Fatalf("resumes = %d; want 0 (the disabled detector never resumes)", provider.resumes.Load())
+	}
+}
+
+// TestRun_ProviderErrorThenSilenceStaysNoProgressByDefault pins the default
+// classification: with the detector off, a turn that reported a provider
+// error and then went silent (a harness that began its own retry and hung)
+// ends at the idle watchdog as FailureNoProgress, exactly as before the
+// detector existed. Only a stall the retry rail gave up on reads as a
+// provider error.
+func TestRun_ProviderErrorThenSilenceStaysNoProgressByDefault(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:    WorkTypeQAStr,
+		repository:  followUpRepository,
+		pulls:       map[int]string{7: pullAtSessionCommit},
+		idleTimeout: 300 * time.Millisecond,
+		turns: []verdictScriptTurn{
+			{toolCalls: 1, providerError: "upstream 503 service unavailable", hang: true},
+		},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureNoProgress {
+		t.Fatalf("Status = %q, FailureMode = %q (%s); want failed/%s (the idle cut-off owns a silence the detector did not flag)", res.Status, res.FailureMode, res.Error, FailureNoProgress)
+	}
+}
+
+// startedHandle is an agent.Handle over a caller-filled events channel that
+// reports when the consumer first reads it.
+type startedHandle struct {
+	events  chan agent.Event
+	started chan struct{}
+	once    sync.Once
+}
+
+func newStartedHandle(evs ...agent.Event) *startedHandle {
+	h := &startedHandle{events: make(chan agent.Event, 8), started: make(chan struct{})}
+	for _, ev := range evs {
+		h.events <- ev
+	}
+	return h
+}
+
+func (h *startedHandle) SessionID() string { return "" }
+func (h *startedHandle) Events() <-chan agent.Event {
+	h.once.Do(func() { close(h.started) })
+	return h.events
+}
+func (h *startedHandle) Inject(context.Context, string) error { return nil }
+func (h *startedHandle) Stop(context.Context) error           { return nil }
+
+// drainWithoutStallDetector runs a follow-up drain on h until ctx ends.
+func drainWithoutStallDetector(ctx context.Context, t *testing.T, r *Runner, h *startedHandle, done chan<- struct{}) {
+	defer close(done)
+	_, _ = r.consumeEventsWithoutStallDetector(ctx, h, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("STALL-TAIL")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
+}
+
+// TestConsumeEvents_TailDrainLeavesOtherSessionsArmed pins that disarming
+// the detector for a follow-up drain is per call: Runner is shared across
+// concurrent sessions, so one session's tail drain must neither disarm
+// another session's first turn while it runs nor lose the configured
+// window when overlapping drains finish out of order.
+func TestConsumeEvents_TailDrainLeavesOtherSessionsArmed(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	r.idleTimeout = 5 * time.Second
+	r.providerStallTimeout = 50 * time.Millisecond
+	postToolHang := func() *startedHandle {
+		return newStartedHandle(
+			agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-1"},
+			agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-1", Content: "ok"},
+		)
+	}
+	firstTurn := func(key string) streamObservation {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		obs, _ := r.consumeEvents(ctx, postToolHang(), t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase(key)}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
+		return obs
+	}
+
+	// Two follow-up drains overlap; the first one started ends first.
+	a, b := newStartedHandle(), newStartedHandle()
+	actx, acancel := context.WithCancel(context.Background())
+	bctx, bcancel := context.WithCancel(context.Background())
+	adone, bdone := make(chan struct{}), make(chan struct{})
+	go drainWithoutStallDetector(actx, t, r, a, adone)
+	<-a.started
+	go drainWithoutStallDetector(bctx, t, r, b, bdone)
+	<-b.started
+
+	// While both drains run, another session's first turn stays armed.
+	if obs := firstTurn("STALL-CONCURRENT"); !obs.providerStall {
+		t.Fatalf("providerStall = false (noProgress = %v); want a post-tool hang flagged while another session drains a follow-up", obs.noProgress)
+	}
+	acancel()
+	<-adone
+	bcancel()
+	<-bdone
+
+	// After both drains, a later session's first turn is still armed.
+	if obs := firstTurn("STALL-AFTER"); !obs.providerStall {
+		t.Fatalf("providerStall = false (noProgress = %v); want the configured window to survive overlapping follow-up drains", obs.noProgress)
 	}
 }

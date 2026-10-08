@@ -110,9 +110,10 @@ const (
 	// Options.IdleTimeout disables the watchdog.
 	DefaultIdleTimeout = 12 * time.Minute
 
-	// DefaultProviderStallTimeout is the stalled-model-request window
-	// applied to the event stream when [Options.ProviderStallTimeout]
-	// is POSITIVE. The window measures the silence after a tool result
+	// DefaultProviderStallTimeout is the suggested stalled-model-request
+	// window for a caller that opts in through
+	// [Options.ProviderStallTimeout]; the runner never applies it on its
+	// own. The window measures the silence after a tool result
 	// while NO tool call is in flight: a tool result the agent has not
 	// answered within the window means the model request that should
 	// follow may be stalled, not that a tool is slow. On expiry the
@@ -243,6 +244,16 @@ type Options struct {
 	// generation. A POSITIVE value opts in explicitly with the window
 	// to apply. NEGATIVE also disables the detector (caller relies
 	// solely on the idle watchdog for liveness).
+	//
+	// Known limits when opted in, measured against the pi, codex and
+	// claude event mappings: a healthy response after a tool result that
+	// emits no event until it completes (a large file written in one
+	// tool call, or an answer with no thinking block first) is aborted
+	// and regenerated; pi reports the previous model call's usage after
+	// its tool results, which disarms the window before the next request
+	// is sent, so the detector never fires on pi; and a resumed turn
+	// opens with the retry prompt rather than a tool result, so a retried
+	// request that hangs before any tool result ends at the idle watchdog.
 	ProviderStallTimeout time.Duration
 
 	// ProviderStallRetries bounds the stop-and-retry attempts a stalled
