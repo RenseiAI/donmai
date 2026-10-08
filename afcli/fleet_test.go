@@ -128,7 +128,10 @@ func TestFleetStartInvalidCount(t *testing.T) {
 	}
 }
 
-// TestBuildWorkerChildArgs verifies the argv assembly for children.
+// TestBuildWorkerChildArgs verifies the argv assembly for children. The
+// provisioning token must never appear here: it rides the child
+// environment (fleetChildEnv), not argv, so a process listing cannot read
+// it — see TestBuildWorkerChildArgs_NeverCarriesProvisioningToken.
 func TestBuildWorkerChildArgs(t *testing.T) {
 	t.Parallel()
 
@@ -145,7 +148,6 @@ func TestBuildWorkerChildArgs(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"worker start",
-		"--provisioning-token token-xyz",
 		"--base-url https://coord.example",
 		"--max-agents 3",
 		"--poll-interval 5s",
@@ -157,6 +159,64 @@ func TestBuildWorkerChildArgs(t *testing.T) {
 			t.Errorf("args missing %q; got: %s", want, joined)
 		}
 	}
+}
+
+// TestBuildWorkerChildArgs_NeverCarriesProvisioningToken is the argv-secret
+// regression test: even when the operator passes --provisioning-token, the
+// assembled child argv must not contain the token value or its flag — any
+// local user can read a process's command line via ps or /proc/<pid>/cmdline.
+// The token reaches the child through fleetChildEnv instead. Reverting
+// buildWorkerChildArgs to re-emit --provisioning-token fails here.
+func TestBuildWorkerChildArgs_NeverCarriesProvisioningToken(t *testing.T) {
+	t.Parallel()
+
+	const sentinel = "sentinel-token-must-not-ride-argv"
+	args := buildWorkerChildArgs(&fleetStartFlags{
+		provisioningToken: sentinel,
+		baseURL:           "https://coord.example",
+		maxAgents:         3,
+	})
+	for _, a := range args {
+		if strings.Contains(a, sentinel) {
+			t.Fatalf("child argv carries the provisioning token value: %q (argv=%q)", a, args)
+		}
+		if a == "--provisioning-token" {
+			t.Fatalf("child argv carries the --provisioning-token flag: argv=%q", args)
+		}
+	}
+}
+
+// TestFleetChildEnv_DeliversProvisioningTokenViaEnv pins the other half of
+// the contract: a --provisioning-token flag value lands on the child
+// environment under DONMAI_PROVISIONING_TOKEN (which resolveWorkerToken
+// reads) and wins over an inherited value, while an empty flag leaves the
+// parent environment untouched so the child's own env fallback still works.
+func TestFleetChildEnv_DeliversProvisioningTokenViaEnv(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv(fleetProvisioningTokenEnv, "inherited-token")
+
+	got := fleetChildEnv("flag-token")
+	if last := lastFleetEnvValue(got, fleetProvisioningTokenEnv); last != "flag-token" {
+		t.Fatalf("%s = %q, want the flag value to win", fleetProvisioningTokenEnv, last)
+	}
+
+	untouched := fleetChildEnv("")
+	if last := lastFleetEnvValue(untouched, fleetProvisioningTokenEnv); last != "inherited-token" {
+		t.Fatalf("empty flag changed %s to %q, want the inherited value untouched", fleetProvisioningTokenEnv, last)
+	}
+}
+
+// lastFleetEnvValue returns the last KEY=VALUE entry naming key, matching
+// exec's last-entry-wins semantics for duplicate environment entries.
+func lastFleetEnvValue(env []string, key string) string {
+	prefix := key + "="
+	value := ""
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			value = entry[len(prefix):]
+		}
+	}
+	return value
 }
 
 // TestBuildWorkerChildArgsMinimal verifies that omitted flags do not
