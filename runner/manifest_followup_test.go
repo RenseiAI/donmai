@@ -364,6 +364,9 @@ type scriptedSession struct {
 	budget *prompt.StageBudget
 	// seatBudget is the session's per-seat resource budget (nil = none).
 	seatBudget *SeatBudget
+	// kitComposer, when set, wires the runner's kit toolchain composer so
+	// the session runs the kit-provision step against the stubbed demand.
+	kitComposer KitComposer
 	// platform, when set, is the platform double the session posts to, so a
 	// test can read the terminal status it received.
 	platform *recordingPlatformServer
@@ -414,6 +417,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
 		o.IdleTimeout = cfg.idleTimeout
 		o.HeartbeatInterval = cfg.heartbeatInterval
+		o.KitComposer = cfg.kitComposer
 	})
 	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
 	r.skipSteering = cfg.skipSteering

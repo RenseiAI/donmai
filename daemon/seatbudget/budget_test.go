@@ -376,3 +376,33 @@ func TestHasSystemdAt(t *testing.T) {
 		t.Error("HasSystemdAt(missing helper, systemd comm) = true; want false")
 	}
 }
+
+// TestCgroupDocMatchesQuotaOnlyDesign pins the enforcement package doc to
+// the shipped quota-only design: the scope carries quota, weight, memory
+// and IO limits plus the seat-survives-OOM policy on the per-user bus —
+// and deliberately no core pinning. The header previously specified
+// AllowedCPUs pinning the implementation never applies (user services
+// never get the cpuset controller delegated), so a reader following the
+// doc expected a confinement the seat never gets. The sibling doc.go and
+// the daemon README already state the quota-only design; this test keeps
+// the two package docs from disagreeing again.
+func TestCgroupDocMatchesQuotaOnlyDesign(t *testing.T) {
+	raw, err := os.ReadFile("cgroup.go")
+	if err != nil {
+		t.Fatalf("read cgroup.go: %v", err)
+	}
+	doc := string(raw)
+	for _, want := range []string{"CPUQuota=", "CPUWeight=", "MemoryMax=", "OOMPolicy=continue", "--user"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("cgroup.go doc missing %q; want the quota-only scope design documented", want)
+		}
+	}
+	for _, banned := range []string{"AllowedCPUs", "CPU set pinning", "CPUSet="} {
+		if strings.Contains(doc, banned) {
+			t.Errorf("cgroup.go doc mentions %q; the scope carries no core pinning", banned)
+		}
+	}
+	if !strings.Contains(doc, "no core pinning") {
+		t.Error("cgroup.go doc does not state the deliberate no-pinning rule; want it explicit")
+	}
+}

@@ -45,7 +45,11 @@ func (s *WorkerSpawner) seatBudgetForSpawn() (seatbudget.Budget, bool) {
 }
 
 // seatBudgetForSpawnLocked is seatBudgetForSpawn for callers that hold the
-// seat-budget lock (read or write).
+// seat-budget lock (read or write). Numeric limits clamp at the boundary:
+// the config path validates, but an embedder composing a spawner directly
+// bypasses it — a negative memory cap or IO weight must read as uncapped
+// (the renderers already drop non-positive values) rather than travel
+// into scope argv or reports as a negative number.
 func (s *WorkerSpawner) seatBudgetForSpawnLocked() (seatbudget.Budget, bool) {
 	b := s.seatBudget.toSeatBudget()
 	if b.Disabled() {
@@ -53,6 +57,12 @@ func (s *WorkerSpawner) seatBudgetForSpawnLocked() (seatbudget.Budget, bool) {
 	}
 	if b.CPUs < 1 {
 		b.CPUs = 1
+	}
+	if b.MemoryMB < 0 {
+		b.MemoryMB = 0
+	}
+	if b.IOWeight < 0 {
+		b.IOWeight = 0
 	}
 	return b, true
 }
@@ -88,10 +98,19 @@ func applySeatBudgetToCmd(command []string, sessionID string, b seatbudget.Budge
 // systemd bus. Production resolves userScope from the live bus probe;
 // tests pin both spellings on any host.
 func applySeatBudgetToCmdForBus(command []string, sessionID string, b seatbudget.Budget, ok bool, placement seatbudget.Placement, userScope bool) []string {
+	return applySeatBudgetToCmdForBusGOOS(command, sessionID, b, ok, placement, userScope, runtime.GOOS)
+}
+
+// applySeatBudgetToCmdForBusGOOS is applySeatBudgetToCmdForBus parametrised
+// by GOOS: the default `auto` mode confines on Linux and degrades elsewhere,
+// so the wrap decision differs per OS. Production passes runtime.GOOS;
+// tests pin both platforms on any host (the auto-mode wrap is the
+// documented default and must stay pinned where it confines).
+func applySeatBudgetToCmdForBusGOOS(command []string, sessionID string, b seatbudget.Budget, ok bool, placement seatbudget.Placement, userScope bool, goos string) []string {
 	if !ok || len(command) == 0 {
 		return command
 	}
-	if !wantsEnforcement(b) {
+	if !wantsEnforcementForGOOS(b, goos) {
 		return command
 	}
 	if placement != seatbudget.PlacementSystemd {
@@ -101,16 +120,21 @@ func applySeatBudgetToCmdForBus(command []string, sessionID string, b seatbudget
 	return append(prefix, command...)
 }
 
-// wantsEnforcement reports whether the seat asked for hard OS enforcement:
-// explicit enforced mode anywhere, or auto on Linux. Kept beside the wrap
-// (not on Budget) because it answers the spawner's question — "wrap this
-// command?" — while EffectiveMode answers the reporter's ("what did the
-// seat get?").
-func wantsEnforcement(b seatbudget.Budget) bool {
+// wantsEnforcementForGOOS reports whether the seat asked for hard OS
+// enforcement: explicit enforced mode anywhere, or auto on Linux. Kept
+// beside the wrap (not on Budget) because it answers the spawner's
+// question — "wrap this command?" — while EffectiveMode answers the
+// reporter's ("what did the seat get?"). The GOOS parameter lets tests
+// pin the default-mode matrix on any host: `auto` is the documented
+// default and resolveSeatBudget stores it verbatim, so the branch that
+// confines default-configured Linux seats (wrap) versus degrades them
+// (best-effort report) needs its own pin — EffectiveModeFor does not
+// answer the spawner's wrap question. Production passes runtime.GOOS.
+func wantsEnforcementForGOOS(b seatbudget.Budget, goos string) bool {
 	if b.Mode == seatbudget.ModeEnforced {
 		return true
 	}
-	return b.Mode == "auto" && runtime.GOOS == "linux"
+	return b.Mode == "auto" && goos == "linux"
 }
 
 // sessionSeatBudgetReport builds the per-session handle evidence for one
@@ -126,10 +150,20 @@ func wantsEnforcement(b seatbudget.Budget) bool {
 // enforced. With no backend at all the report is likewise none. Best-effort
 // covers explicit best-effort plus auto off Linux.
 func sessionSeatBudgetReport(b seatbudget.Budget, ok bool, placement seatbudget.Placement) *SessionSeatBudget {
+	return sessionSeatBudgetReportForGOOS(b, ok, placement, runtime.GOOS)
+}
+
+// sessionSeatBudgetReportForGOOS is sessionSeatBudgetReport parametrised by
+// GOOS: the default `auto` mode reports enforced on Linux (where it wraps)
+// and best-effort elsewhere. Production passes runtime.GOOS; tests pin the
+// wrap/report agreement on any host — a wrap without an enforced report
+// (or vice versa) is the false-confinement shape this package exists to
+// prevent.
+func sessionSeatBudgetReportForGOOS(b seatbudget.Budget, ok bool, placement seatbudget.Placement, goos string) *SessionSeatBudget {
 	if !ok {
 		return &SessionSeatBudget{Mode: string(seatbudget.ModeNone)}
 	}
-	if wantsEnforcement(b) {
+	if wantsEnforcementForGOOS(b, goos) {
 		detail := "cpus " + seatbudget.CPUSet(b.CPUs) + ", quota " + seatbudget.CPUQuotaPercent(b.CPUs)
 		if mem := seatbudget.MemoryBytes(b.MemoryMB); mem != "" {
 			detail += ", memory " + mem + " bytes"
@@ -180,3 +214,12 @@ func seatBudgetShimCommand(command []string, sessionID string, b seatbudget.Budg
 // wrapSeatCommandForTest is the production entry point's seam: tests drive
 // AcceptWork (the real spawn path) and assert on the wrapped command via
 // WorkerCommand capture, not this helper directly.
+//
+// seatBudgetLaunchPlacement and seatBudgetLaunchUserScope resolve the Linux
+// enforcement placement for a fresh spawn. The direct spawn and the shim
+// launch read these instead of probing inline so tests pin the systemd
+// spelling on any host; they default to the live probes and a test that
+// overrides them must restore the defaults (no parallel use while stubbed).
+var seatBudgetLaunchPlacement = seatbudget.HostPlacement
+
+var seatBudgetLaunchUserScope = seatbudget.UserScopeForBus

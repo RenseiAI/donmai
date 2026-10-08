@@ -3,6 +3,7 @@ package daemon
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -405,7 +406,199 @@ func TestSeatBudget_EnvKnobsMatchEnforcement(t *testing.T) {
 	}
 }
 
+// TestWantsEnforcementForGOOS_AutoMode pins the default-mode decision at
+// the wrap level: `auto` is the documented default and resolveSeatBudget
+// stores it verbatim, so the branch that confines default-configured Linux
+// seats (wrap) versus degrades them (best-effort report) needs its own pin.
+// EffectiveModeFor is pinned elsewhere but answers the reporter's question,
+// not the spawner's — INVERTing the auto clause here (linux <-> non-linux)
+// must fail this test, or default Linux seats ship unconfined while status
+// still renders an enforced-shape line.
+func TestWantsEnforcementForGOOS_AutoMode(t *testing.T) {
+	cases := []struct {
+		mode seatbudget.Mode
+		goos string
+		want bool
+	}{
+		{seatbudget.ModeEnforced, "linux", true},
+		{seatbudget.ModeEnforced, "darwin", true},
+		{"auto", "linux", true},
+		{"auto", "darwin", false},
+		{seatbudget.ModeBestEffort, "linux", false},
+		{seatbudget.ModeBestEffort, "darwin", false},
+		{seatbudget.ModeNone, "linux", false},
+		{"", "linux", false},
+	}
+	for _, tc := range cases {
+		if got := wantsEnforcementForGOOS(seatbudget.Budget{Mode: tc.mode}, tc.goos); got != tc.want {
+			t.Errorf("wantsEnforcementForGOOS(%q, %q) = %v; want %v", tc.mode, tc.goos, got, tc.want)
+		}
+	}
+}
+
+// TestApplySeatBudgetToCmdForBusGOOS_AutoWrapAgreement pins the wrap/report
+// agreement for the default mode on both platforms: an auto seat on a
+// systemd Linux host wraps AND reports enforced; without a backend it runs
+// unwrapped and reports none; off Linux it never wraps and reports
+// best-effort. A wrap without an enforced report (or vice versa) is the
+// false-confinement shape this package exists to prevent.
+func TestApplySeatBudgetToCmdForBusGOOS_AutoWrapAgreement(t *testing.T) {
+	auto := seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: "auto"}
+	cmd := []string{"/bin/worker", "agent", "run"}
+	// Linux + systemd: enforced-shape wrap with the per-session scope.
+	wrapped := applySeatBudgetToCmdForBusGOOS(cmd, "auto-seat", auto, true, seatbudget.PlacementSystemd, false, "linux")
+	if joined := strings.Join(wrapped, " "); !strings.Contains(joined, "donmai-seat-auto-seat.scope") || !strings.Contains(joined, "CPUQuota=200%") {
+		t.Errorf("auto/linux/systemd wrap = %q; want the enforced-shape scope argv", joined)
+	}
+	if rep := sessionSeatBudgetReportForGOOS(auto, true, seatbudget.PlacementSystemd, "linux"); rep.Mode != "enforced" {
+		t.Errorf("auto/linux/systemd report mode = %q; want enforced to match the wrap", rep.Mode)
+	}
+	// Linux + no backend: no wrap, report none with the reason.
+	if got := applySeatBudgetToCmdForBusGOOS(cmd, "auto-seat", auto, true, seatbudget.PlacementNone, false, "linux"); strings.Join(got, " ") != strings.Join(cmd, " ") {
+		t.Errorf("auto/linux/none wrap changed the command: %q", strings.Join(got, " "))
+	}
+	if rep := sessionSeatBudgetReportForGOOS(auto, true, seatbudget.PlacementNone, "linux"); rep.Mode != "none" {
+		t.Errorf("auto/linux/none report mode = %q; want none for the unwrapped seat", rep.Mode)
+	}
+	// Off Linux: never wraps (no backend exists there), reports best-effort.
+	if got := applySeatBudgetToCmdForBusGOOS(cmd, "auto-seat", auto, true, seatbudget.PlacementSystemd, false, "darwin"); strings.Join(got, " ") != strings.Join(cmd, " ") {
+		t.Errorf("auto/darwin wrap changed the command: %q", strings.Join(got, " "))
+	}
+	if rep := sessionSeatBudgetReportForGOOS(auto, true, seatbudget.PlacementSystemd, "darwin"); rep.Mode != "best-effort" {
+		t.Errorf("auto/darwin report mode = %q; want best-effort for the cooperative seat", rep.Mode)
+	}
+}
+
+// TestSeatBudgetForSpawn_ClampsNegativeLimits pins the embedder-composed
+// boundary: a spawner built directly with negative memory or IO weight
+// (bypassing config validation) reads back as uncapped, never as a
+// negative number travelling into scope argv or reports.
+func TestSeatBudgetForSpawn_ClampsNegativeLimits(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		SeatBudget:            SeatBudget{CPUs: 2, MemoryMB: -512, IOWeight: -5, Mode: "enforced"},
+	})
+	b, ok := s.seatBudgetForSpawn()
+	if !ok {
+		t.Fatal("seatBudgetForSpawn disabled; want the clamped share")
+	}
+	if b.MemoryMB != 0 {
+		t.Errorf("MemoryMB = %d; want 0 (uncapped), not a negative cap", b.MemoryMB)
+	}
+	if b.IOWeight != 0 {
+		t.Errorf("IOWeight = %d; want 0 (backend default), not a negative weight", b.IOWeight)
+	}
+	if b.CPUs != 2 {
+		t.Errorf("CPUs = %d; want the authored 2", b.CPUs)
+	}
+}
+
 var (
 	_ = os.Getenv
 	_ = exec.Command
 )
+
+// TestStartShimProcess_WrapsEnforcedSeatInSystemdScope drives the PRODUCTION
+// shim launch entry (startShimProcess) with an enforced seat budget and a
+// stubbed systemd placement, and asserts the shim actually launches inside
+// the transient scope. A fake systemd-run on PATH records the argv it was
+// invoked with and execs the tail worker command, so the test observes both
+// halves: the scope argv carries the seat's quota, weight, memory ceiling
+// and per-session unit, and the shim child still starts (its marker lands
+// in the per-session log). Reverting startShimProcess to the bare worker
+// command keeps every other suite green but leaves no argv record here —
+// the parity helper test alone cannot catch a dropped production wrap.
+func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
+	dir := t.TempDir()
+	fakes := filepath.Join(dir, "fakes")
+	if err := os.MkdirAll(fakes, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argvPath := filepath.Join(dir, "systemd-run-argv")
+	fake := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" > \"$FAKE_SYSTEMD_RUN_ARGV\"\n" +
+		"while [ $# -gt 0 ]; do\n" +
+		"  if [ \"$1\" = \"--unit\" ]; then shift 2; break; fi\n" +
+		"  shift\n" +
+		"done\n" +
+		"exec \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(fakes, "systemd-run"), []byte(fake), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (LookPath + exec need +x)
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_SYSTEMD_RUN_ARGV", argvPath)
+
+	oldPlacement, oldUserScope := seatBudgetLaunchPlacement, seatBudgetLaunchUserScope
+	seatBudgetLaunchPlacement = func() seatbudget.Placement { return seatbudget.PlacementSystemd }
+	seatBudgetLaunchUserScope = func() bool { return false }
+	defer func() {
+		seatBudgetLaunchPlacement, seatBudgetLaunchUserScope = oldPlacement, oldUserScope
+	}()
+
+	const sessionID = "shim-budget-wrap"
+	const marker = "shim-budget-wrap-marker"
+	d := &Daemon{}
+	d.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
+		EnabledProjectIDs:     []string{"p1"},
+		MaxConcurrentSessions: 2,
+		SeatBudget:            SeatBudget{CPUs: 2, MemoryMB: 256, Mode: "enforced"},
+		WorkerCommand:         []string{"/bin/sh", "-c", "echo " + marker + "; exit 0"},
+		WorktreeParentDir:     dir,
+	})
+	identity := sessionshim.Identity{OrgID: "test-org", SessionID: sessionID}
+	launch := sessionshim.Launch{
+		Identity:     identity,
+		RegistryDir:  dir + "/registry",
+		Orphan:       sessionshim.DefaultOrphanPolicy(),
+		ProcessEpoch: 1,
+	}
+	started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, []string{
+		"PATH=" + os.Getenv("PATH"),
+		"FAKE_SYSTEMD_RUN_ARGV=" + argvPath,
+	})
+	if err != nil {
+		t.Fatalf("startShimProcess: %v", err)
+	}
+	if started.PID == 0 {
+		t.Fatal("startShimProcess returned pid 0")
+	}
+	// The fake records its argv asynchronously after Start returns: poll
+	// for the record the same way the stdio test polls for the child log.
+	var raw []byte
+	argvDeadline := time.Now().Add(5 * time.Second)
+	for {
+		var readErr error
+		raw, readErr = os.ReadFile(argvPath)
+		if readErr == nil {
+			break
+		}
+		if time.Now().After(argvDeadline) {
+			t.Fatalf("fake systemd-run never invoked (no argv record): %v — the shim launched unwrapped", readErr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	joined := strings.Join(strings.Split(strings.TrimSpace(string(raw)), "\n"), " ")
+	for _, want := range []string{"--scope", "--collect", "CPUQuota=200%", "CPUWeight=200", "OOMPolicy=continue", "MemoryMax=268435456", "donmai-seat-shim-budget-wrap.scope", "/bin/sh"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("shim scope argv %q missing %q", joined, want)
+		}
+	}
+	if strings.Contains(joined, "AllowedCPUs") {
+		t.Errorf("shim scope argv %q pins cores; want quota+weight only", joined)
+	}
+	// The shim child ran through the wrap: its marker reaches the log.
+	logPath := shimChildLogPath(launch.RegistryDir, identity)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		content, readErr := os.ReadFile(logPath)
+		if readErr == nil && strings.Contains(string(content), marker) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shim child marker %q missing from %s; the wrap swallowed the launch", marker, logPath)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

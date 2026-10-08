@@ -1,9 +1,14 @@
 package runner
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/kit"
 )
 
 func TestApplySeatBudget(t *testing.T) {
@@ -182,5 +187,100 @@ func TestRun_NoSeatBudgetReportsNothing(t *testing.T) {
 	}
 	if res.SeatBudget != nil {
 		t.Errorf("SeatBudget = %+v; want nil with no budget", res.SeatBudget)
+	}
+}
+
+// TestCappedSessionEnv pins the shared subprocess-env composer: a budgeted
+// session carries the seat's worker caps, an unbounded session carries
+// none, and explicit values win. Kit-provision, dependency-install and
+// harness-spawn execers all build from this helper, so pinning it here
+// pins the contract each of those paths inherits.
+func TestCappedSessionEnv(t *testing.T) {
+	qw := QueuedWork{QueuedWork: queuedWorkBase("SEAT-ENV-1")}
+	qw.SeatBudget = &SeatBudget{Mode: "best-effort", CPUs: 2}
+	env := cappedSessionEnv(qw)
+	if env["GOMAXPROCS"] != "2" {
+		t.Errorf("GOMAXPROCS = %q; want the seat share 2", env["GOMAXPROCS"])
+	}
+	if env["MAKEFLAGS"] != "-j2" {
+		t.Errorf("MAKEFLAGS = %q; want -j2", env["MAKEFLAGS"])
+	}
+	if env["DONMAI_SESSION_ID"] == "" {
+		t.Error("session entries missing from the capped env")
+	}
+	// No budget: the session entries stand alone.
+	plain := cappedSessionEnv(QueuedWork{QueuedWork: queuedWorkBase("SEAT-ENV-2")})
+	if _, ok := plain["GOMAXPROCS"]; ok {
+		t.Errorf("GOMAXPROCS = %q; want absent with no budget", plain["GOMAXPROCS"])
+	}
+}
+
+// TestRun_SeatBudgetCapsKitProvision drives the PRODUCTION Run path with a
+// seat budget and a stubbed kit composer, and asserts the provision child
+// — the same install fan-out (pnpm/npm, go, make) that motivated the seat
+// budget — runs under the seat's worker caps. The demand's install step
+// records the GOMAXPROCS it observes; reverting the provision execer to
+// the uncapped session env leaves that record empty.
+func TestRun_SeatBudgetCapsKitProvision(t *testing.T) {
+	report := filepath.Join(t.TempDir(), "provision-gomaxprocs")
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		seatBudget: &SeatBudget{Mode: "best-effort", CPUs: 2, MemoryMB: 4096},
+		kitComposer: func(_ string, _ kit.CompositionTarget, _ []kit.Selection) (*kit.ToolchainDemand, error) {
+			return &kit.ToolchainDemand{
+				OS:               "test",
+				Kits:             []string{"fixture@1"},
+				ToolchainInstall: []string{`printf '%s' "$GOMAXPROCS" > "$REPORT_PATH"`},
+				Env:              map[string]string{"REPORT_PATH": report},
+			}, nil
+		},
+		turns: []verdictScriptTurn{
+			{text: "Opened " + followUpPR + "\nWORK_RESULT: passed"},
+		},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	raw, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("provision step never observed GOMAXPROCS (no report): %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != "2" {
+		t.Errorf("provision GOMAXPROCS = %q; want the seat share 2", raw)
+	}
+}
+
+// TestInstallSessionDependencies_CapsSeatEnv drives the PRODUCTION
+// dependency-install path with a seat budget and the default (real)
+// shell execer, and asserts the install child observes the seat's worker
+// caps. A fake `go` on PATH records the GOMAXPROCS it observes for a
+// worktree carrying a go.mod; reverting the default execer to the
+// uncapped session env leaves that record empty.
+func TestInstallSessionDependencies_CapsSeatEnv(t *testing.T) {
+	dir := t.TempDir()
+	fakes := filepath.Join(dir, "fakes")
+	if err := os.MkdirAll(fakes, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	report := filepath.Join(dir, "install-gomaxprocs")
+	fakeGo := "#!/bin/sh\nprintf '%s' \"$GOMAXPROCS\" > \"$REPORT_PATH\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakes, "go"), []byte(fakeGo), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("REPORT_PATH", report)
+
+	h := newRunnerHarness(t)
+	qw := h.queuedWork("DEPS-SEAT-1")
+	qw.SeatBudget = &SeatBudget{Mode: "best-effort", CPUs: 3}
+	wpath := t.TempDir()
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+	h.runner.installSessionDependencies(context.Background(), qw, wpath, false)
+	raw, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("install step never observed GOMAXPROCS (no report): %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != "3" {
+		t.Errorf("install GOMAXPROCS = %q; want the seat share 3", raw)
 	}
 }

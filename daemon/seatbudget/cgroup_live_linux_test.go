@@ -51,6 +51,7 @@ func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	args := append(append([]string(nil), prefix...), "/bin/sh", "-c", `echo seat-ready; exec sleep 90`)
+	//nolint:gosec // G204: test-owned argv — the scope prefix is rendered from fixed literals plus ScopeName (sanitised to the unit alphabet), the tail is a fixed shell snippet
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -80,6 +81,7 @@ func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 	}
 	showCtx, showCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer showCancel()
+	//nolint:gosec // G204: fixed systemctl binary; args are fixed property names plus the ScopeName-derived unit above
 	show := exec.CommandContext(showCtx, "systemctl", showArgs...)
 	showOut, err := show.CombinedOutput()
 	if err != nil {
@@ -152,6 +154,7 @@ func readScopeCgroupFile(t *testing.T, scope string, userScope bool, file string
 	if userScope {
 		pidsArgs = append([]string{"--user"}, pidsArgs...)
 	}
+	//nolint:gosec // G204: fixed systemctl binary; args are a fixed property name plus the ScopeName-derived unit above
 	out, err := exec.CommandContext(ctx, "systemctl", pidsArgs...).CombinedOutput()
 	if err != nil {
 		t.Skipf("scope %s already reaped (--collect); launch+show proved the wrap: %v", scope, err)

@@ -67,6 +67,16 @@ func workerCapEnv(cpus int) map[string]string {
 	}
 }
 
+// cappedSessionEnv composes the per-session subprocess environment every
+// runner-owned child runs under: the session entries (git identity and
+// friends) plus the seat's cooperative worker caps. Kit-provision,
+// dependency-install and harness-spawn execers all build from this one
+// helper so a budgeted session's install fan-out (pnpm/npm, go, make)
+// cannot escape the seat share while the harness child is capped.
+func cappedSessionEnv(qw QueuedWork) map[string]string {
+	return applySeatBudget(buildSessionEnv(qw), qw.SeatBudget)
+}
+
 // applySeatBudget overlays the seat's cooperative worker caps onto the
 // already-composed harness Spec.Env. Operator/session values win: an
 // explicitly set knob is never overridden — the budget is a default, not

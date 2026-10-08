@@ -14,17 +14,24 @@ import (
 
 // Linux enforcement: cgroups v2.
 //
-// A seat's process tree is confined by a transient systemd scope with CPU
-// set pinning, a CPU quota and a memory ceiling. Exactly one placement
-// exists:
+// A seat's process tree is confined by a transient systemd scope carrying
+// a CPU quota, a CPU weight share, a memory high/max ceiling, an IO weight
+// and the seat-survives-OOM policy. Exactly one placement exists:
 //
 //  1. systemd transient scope: when the host runs systemd as PID 1 and the
 //     systemd-run helper is available, the seat launches wrapped in
-//     `systemd-run --scope --collect` with AllowedCPUs=, CPUQuota= and
-//     MemoryMax=/MemoryHigh= properties. systemd owns the cgroup lifetime,
-//     so no cleanup path can leak it. When the daemon runs without the
-//     system bus (a per-user service), the scope is created on the user
-//     bus (--user).
+//     `systemd-run --scope --collect` with CPUQuota=, CPUWeight=,
+//     MemoryMax=/MemoryHigh=, IOWeight= and OOMPolicy=continue properties.
+//     systemd owns the cgroup lifetime, so no cleanup path can leak it.
+//     When the daemon runs without the system bus (a per-user service),
+//     the scope is created on the user bus (--user).
+//
+// There is deliberately no core pinning: the quota is the binding
+// throughput limit (identical pin ranges across seats shared 2 cores of 6
+// budgeted, and user services never get the cpuset controller delegated),
+// while the weight divides contended CPU proportionally when seats
+// overcommit. CPUSet therefore only feeds the human detail line, never a
+// scope property.
 //
 // When systemd is unavailable the launcher does NOT pretend: the seat runs
 // unconfined and the report says ModeNone with a detail line naming the

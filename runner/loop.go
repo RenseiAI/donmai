@@ -532,7 +532,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				"installSteps", len(demand.ToolchainInstall),
 				"postAcquireSteps", len(demand.PostAcquire),
 			)
-			execer := shellExecer{baseEnv: buildSessionEnv(qw)}
+			execer := shellExecer{baseEnv: cappedSessionEnv(qw)}
 			provisioner := kit.NewProvisioner(r.logger)
 			if provErr := provisioner.Provision(ctx, execer, wpath, demand); provErr != nil {
 				res.Status = "failed"
@@ -600,14 +600,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// credential into qw.AuthToken's matching env var via Spec.Env;
 	// we forward whatever the caller set plus the standard session
 	// metadata.
-	specEnv := buildSessionEnv(qw)
 	// Per-seat budget: overlay the cooperative worker caps so the tools
 	// the harness fans out size themselves to the seat share. The daemon
 	// already applies the same caps to the worker environment; re-applying
 	// here covers standalone runs and guarantees the harness child — the
 	// process that actually spawns the fan-out — carries them. Explicit
 	// values win; a disabled budget changes nothing.
-	specEnv = applySeatBudget(specEnv, qw.SeatBudget)
+	specEnv := cappedSessionEnv(qw)
 	effectiveMCPBearerFile, err := prepareSessionMCPBearerEnv(
 		qw,
 		specEnv,

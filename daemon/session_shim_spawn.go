@@ -1270,7 +1270,7 @@ func shimChildLogPath(registryDir string, id sessionshim.Identity) string {
 // replaced without ending it.
 func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, env []string) (sessionshim.ProcessIdentity, error) {
 	shimBudget, shimBudgetOK := d.shimSeatBudget()
-	command := seatBudgetShimCommand(d.shimCommand(), spec.SessionID, shimBudget, shimBudgetOK, seatbudget.HostPlacement(), seatbudget.UserScopeForBus())
+	command := seatBudgetShimCommand(d.shimCommand(), spec.SessionID, shimBudget, shimBudgetOK, seatBudgetLaunchPlacement(), seatBudgetLaunchUserScope())
 	if len(command) == 0 {
 		return sessionshim.ProcessIdentity{}, errors.New("session shim: no worker command is configured to launch a shim with")
 	}
