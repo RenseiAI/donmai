@@ -12,12 +12,6 @@ import (
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
-// TestRunAllMutableDeclarationAdmittedOnClaudeAndPi is the revert-RED gate
-// for the session-root-v1 attestation: an all-mutable two-repository
-// declaration must provision the nested layout on both harnesses, binding
-// the selected leaf as the harness CWD and the complete authority
-// partition on the spec. Removing either manifest's attestation makes its
-// subtest fail with workarea_protocol_unsupported before provisioning.
 // manifestAttestingProvider wraps a real harness manifest's workarea
 // attestation behind the test gate provider's spawn: the runner binds the
 // harness by name, so the declaration is validated against a manifest that

@@ -464,6 +464,10 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 // A nil confiner means the session did not request confinement: no plan.
 // Any failure refuses the spawn — the plan never degrades to a weaker set.
 func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner, reads piReadScope) (*confinement.Plan, error) {
+	return confinePiSessionWithPreparer(spec, layout, confiner, reads, (*confinement.Confiner).Prepare)
+}
+
+func confinePiSessionWithPreparer(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner, reads piReadScope, prepare func(*confinement.Confiner, confinement.Spec) (*confinement.Plan, error)) (*confinement.Plan, error) {
 	if confiner == nil {
 		return nil, nil
 	}
@@ -532,7 +536,7 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 			cspec.Protected = append(cspec.Protected, layout.extension)
 		}
 	}
-	plan, err := confiner.Prepare(cspec)
+	plan, err := prepare(confiner, cspec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

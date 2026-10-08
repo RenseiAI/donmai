@@ -70,4 +70,42 @@ func TestSpawner_DeclarationEntriesCheckedAgainstAllowlist(t *testing.T) {
 			t.Fatalf("resolveProjectForSpecLocked = %v, want admission", err)
 		}
 	})
+
+	t.Run("project-scoped spec with unlisted declaration entry refused", func(t *testing.T) {
+		t.Parallel()
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects: []ProjectConfig{
+				{ID: "primary", Repository: "github.com/acme/primary"},
+				{ID: "primary", Repository: "github.com/acme/secondary"},
+			},
+			EnabledProjectIDs:     []string{"primary"},
+			MaxConcurrentSessions: 4,
+		})
+		spec := SessionSpec{SessionID: "project-declared-unlisted", ProjectID: "primary", Repository: "github.com/acme/primary", RepositoryDeclaration: declaration("github.com/elsewhere/hidden")}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, err := s.resolveProjectForSpecLocked(spec); err == nil {
+			t.Fatal("resolveProjectForSpecLocked admitted a project-scoped spec with an unlisted declaration entry, want refusal")
+		} else if got := err.Error(); !strings.Contains(got, "is not configured") {
+			t.Fatalf("error = %q, want the not-configured shape", got)
+		}
+	})
+
+	t.Run("project-scoped spec with fully listed declaration admitted", func(t *testing.T) {
+		t.Parallel()
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects: []ProjectConfig{
+				{ID: "primary", Repository: "github.com/acme/primary"},
+				{ID: "primary", Repository: "github.com/acme/secondary"},
+			},
+			EnabledProjectIDs:     []string{"primary"},
+			MaxConcurrentSessions: 4,
+		})
+		spec := SessionSpec{SessionID: "project-declared-listed", ProjectID: "primary", Repository: "github.com/acme/primary", RepositoryDeclaration: declaration("github.com/acme/secondary")}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, err := s.resolveProjectForSpecLocked(spec); err != nil {
+			t.Fatalf("resolveProjectForSpecLocked = %v, want admission", err)
+		}
+	})
 }

@@ -489,10 +489,11 @@ func TestPiConfinement_InteractiveSpawnRefusesForbiddenWrites(t *testing.T) {
 // TestPiConfinement_AuthorityRequestConfinesThroughLaunch covers the other
 // gate input: a declared repository authority requests confinement, and the
 // per-session confinement record names its read-only leaves. pi's manifest
-// declares no multi-repository workarea protocol yet, so admission refuses
-// such a spec at Spawn (asserted first); the test therefore enters at
-// launch, the shared post-admission entry of Spawn and Resume, with the gate
-// still evaluated on the spec. When the manifest gains a protocol, the
+// attests session-root-v1 for all-mutable declarations only (no read-only
+// enforcement), so admission still refuses a read-only-bearing spec at
+// Spawn (asserted first); the test therefore enters at launch, the shared
+// post-admission entry of Spawn and Resume, with the gate still evaluated
+// on the spec. When the manifest gains read-only enforcement, the
 // admission assertion fails and this test should move to Spawn.
 func TestPiConfinement_AuthorityRequestConfinesThroughLaunch(t *testing.T) {
 	w := newLiveWorld(t)

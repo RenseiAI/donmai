@@ -946,9 +946,15 @@ func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectC
 		if spec.Repository == "" && spec.RepositoryID == "" {
 			if spec.RequiresRepository {
 				if primary := s.findPrimaryProjectRepositoryLocked(spec.ProjectID); primary != nil {
+					if err := s.checkDeclarationRepositoriesLocked(spec); err != nil {
+						return nil, err
+					}
 					return primary, nil
 				}
 				return nil, fmt.Errorf("project %q requires an explicit repository or configured primary", spec.ProjectID)
+			}
+			if err := s.checkDeclarationRepositoriesLocked(spec); err != nil {
+				return nil, err
 			}
 			return &ProjectConfig{ID: spec.ProjectID}, nil
 		}
@@ -966,6 +972,9 @@ func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectC
 				return nil, fmt.Errorf("repository %q is not configured for project %q", spec.RepositoryID, spec.ProjectID)
 			}
 			return nil, fmt.Errorf("repository %q is not configured for project %q", spec.Repository, spec.ProjectID)
+		}
+		if err := s.checkDeclarationRepositoriesLocked(spec); err != nil {
+			return nil, err
 		}
 		return project, nil
 	}
@@ -988,8 +997,10 @@ func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectC
 // resolve against the same project allowlist as the singular repository, so
 // a declaration cannot smuggle an unlisted repository past admission. An
 // entry that matches no project entry is refused with the same
-// not-configured shape as the singular check above. Nil declarations and
-// project-scoped specs keep their existing paths.
+// not-configured shape as the singular check above. A nil declaration keeps
+// the existing path; project-scoped specs check the same entries, because
+// their project binding already passed admission and must not exempt the
+// declaration.
 func (s *WorkerSpawner) checkDeclarationRepositoriesLocked(spec SessionSpec) error {
 	if spec.RepositoryDeclaration == nil {
 		return nil
