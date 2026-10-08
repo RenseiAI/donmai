@@ -80,9 +80,9 @@ const (
 
 	// IDResumeContinues — a resumed session re-announces and re-terminates.
 	IDResumeContinues CheckID = "resume/session-continues"
-	// IDResumeHistoryLoaded — a session stopped for resume and started again
-	// from the resume artifact reports the prior session's history instead
-	// of resuming blank.
+	// IDResumeHistoryLoaded — a stopped session resumed on a fresh adapter
+	// instance (Subject.ResumeProvider) reports the prior session's history,
+	// instead of resuming blank or running the prior turn's tool calls again.
 	IDResumeHistoryLoaded CheckID = "resume/history-loaded"
 
 	// IDReceiptPlanValid — the compiled adaptation authority validates ready.
@@ -258,6 +258,17 @@ type Subject struct {
 	// Adaptation is the optional row-10 fixture. Without it the
 	// adaptation-receipt tier is reported not-applicable, never earned.
 	Adaptation *AdaptationFixture
+
+	// ResumeProvider builds a FRESH adapter instance for the
+	// resume/history-loaded fixture. Stop-for-resume continues a seat in a
+	// new process, after the daemon that spawned it is gone, so the fixture
+	// resumes on an instance that shares nothing in memory with Provider:
+	// only state the adapter keeps on disk may carry the history across.
+	// Return a new instance on every call, never Provider itself. Without it
+	// the fixture is reported not-applicable and the resume tier is never
+	// earned, because a resume on the spawning instance can reach in-memory
+	// state that a new process would not have.
+	ResumeProvider func(ctx context.Context) (agent.HarnessProvider, error)
 
 	// NotApplicable declares, per check, why the author believes it cannot
 	// run in this environment. A reason is mandatory — an entry with an empty

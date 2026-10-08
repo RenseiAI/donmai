@@ -40,6 +40,7 @@ func TestRunConformantHarnessEarnsTiers(t *testing.T) {
 		supportResume: true,
 		inject:        injectDeliver,
 		resumeHistory: resumeReportsHistory,
+		stateDir:      t.TempDir(),
 	})
 	report := runSubject(t, subject)
 

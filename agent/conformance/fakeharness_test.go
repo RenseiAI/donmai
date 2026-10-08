@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -82,8 +84,14 @@ type fakeConfig struct {
 
 	// resumeHistory is how Resume treats the prior session's history.
 	// Zero (resumeReportsHistory) replays it; resumeBlank starts clean
-	// under the old session id.
+	// under the old session id; resumeReruns runs the prior turn again.
 	resumeHistory resumeHistoryMode
+
+	// stateDir is the declared on-disk location the fake keeps session
+	// history in, keyed by session id. Empty keeps history in this
+	// instance's memory only, which a fresh instance (a new process) cannot
+	// see.
+	stateDir string
 }
 
 func newFake(cfg fakeConfig) *fakeHarness {
@@ -133,6 +141,10 @@ const (
 	// history-loaded fixture exists to catch — continuity is the contract,
 	// not just a second start under an old name.
 	resumeBlank
+	// resumeReruns ignores the resume prompt and runs the prior turn again
+	// from scratch under the old session id: no history loaded, and every
+	// tool call of the stopped turn issued a second time.
+	resumeReruns
 )
 
 type fakeHarness struct {
@@ -140,7 +152,7 @@ type fakeHarness struct {
 
 	mu      sync.Mutex
 	spawns  int
-	history map[string]string // session id -> base prompt, for resumeReportsHistory
+	history map[string]string // session id -> base prompt, when cfg.stateDir is empty
 }
 
 var _ agent.HarnessProvider = (*fakeHarness)(nil)
@@ -206,14 +218,43 @@ func (f *fakeHarness) Shutdown(context.Context) error { return nil }
 // session id. A history-reporting adapter replays the base prompt the suite
 // stopped with; a blank one emits only the fresh resume prompt.
 func (f *fakeHarness) startResume(sessionID string, spec agent.Spec) *fakeHandle {
-	f.mu.Lock()
-	prior, ok := f.history[sessionID]
-	f.mu.Unlock()
+	prior, ok := f.loadHistory(sessionID)
 	prompt := spec.Prompt
-	if ok && f.cfg.resumeHistory == resumeReportsHistory && prior != "" {
+	switch {
+	case !ok || prior == "":
+	case f.cfg.resumeHistory == resumeReportsHistory:
 		prompt = "resumed history: " + prior + "\ncontinuing: " + spec.Prompt
+	case f.cfg.resumeHistory == resumeReruns:
+		prompt = prior
 	}
 	return f.startFresh(sessionID, prompt)
+}
+
+// recordHistory keeps a session's spawn prompt where a later Resume looks
+// for it: the declared state dir when there is one, else this instance's
+// memory.
+func (f *fakeHarness) recordHistory(sessionID, prompt string) {
+	if f.cfg.stateDir != "" {
+		_ = os.WriteFile(filepath.Join(f.cfg.stateDir, sessionID), []byte(prompt), 0o600)
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.history == nil {
+		f.history = map[string]string{}
+	}
+	f.history[sessionID] = prompt
+}
+
+func (f *fakeHarness) loadHistory(sessionID string) (string, bool) {
+	if f.cfg.stateDir != "" {
+		b, err := os.ReadFile(filepath.Join(f.cfg.stateDir, sessionID))
+		return string(b), err == nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prior, ok := f.history[sessionID]
+	return prior, ok
 }
 
 // startFresh builds a handle without touching the history map, so a resume
@@ -236,12 +277,7 @@ func (f *fakeHarness) startFresh(sessionID string, prompt string) *fakeHandle {
 func (f *fakeHarness) start(sessionID string, spec agent.Spec, awaitNotice bool) *fakeHandle {
 	// Record the spawn prompt as the session's history before the script
 	// runs: a later Resume that reports history replays exactly this.
-	f.mu.Lock()
-	if f.history == nil {
-		f.history = map[string]string{}
-	}
-	f.history[sessionID] = spec.Prompt
-	f.mu.Unlock()
+	f.recordHistory(sessionID, spec.Prompt)
 	h := &fakeHandle{
 		cfg:         f.cfg,
 		sessionID:   sessionID,
@@ -378,8 +414,13 @@ func echoPrompt(nonce string) string {
 // conformantSubject is the baseline subject every check should pass against.
 func conformantSubject(cfg fakeConfig) Subject {
 	return Subject{
-		Provider:     newFake(cfg),
-		EchoPrompt:   echoPrompt,
+		Provider:   newFake(cfg),
+		EchoPrompt: echoPrompt,
+		// A new instance per call: what a restarted daemon has. Only
+		// history kept under cfg.stateDir survives into it.
+		ResumeProvider: func(context.Context) (agent.HarnessProvider, error) {
+			return newFake(cfg), nil
+		},
 		ProbeTimeout: 5 * time.Second,
 	}
 }
