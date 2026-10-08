@@ -63,6 +63,10 @@ func (s *Server) handleWorkareasRoot(w http.ResponseWriter, r *http.Request) {
 	if archived == nil {
 		archived = []afclient.WorkareaSummaryV1{}
 	}
+	// Operator-configured repository URLs may carry embedded credentials;
+	// serve the redacted form (see redact_url.go).
+	redactWorkareaSummariesV1(active)
+	redactWorkareaSummariesV1(archived)
 	writeJSON(w, http.StatusOK, &afclient.ListWorkareasV1Response{
 		Active:   active,
 		Archived: archived,
@@ -117,6 +121,7 @@ func (s *Server) serveWorkareaInspect(w http.ResponseWriter, r *http.Request, id
 		http.Error(w, "inspect active workarea: "+err.Error(), http.StatusInternalServerError)
 		return
 	} else if ok {
+		redactWorkareaV1(&active)
 		writeJSON(w, http.StatusOK, &afclient.WorkareaV1Envelope{Workarea: active})
 		return
 	}
@@ -133,6 +138,7 @@ func (s *Server) serveWorkareaInspect(w http.ResponseWriter, r *http.Request, id
 		http.Error(w, "inspect workarea: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	redactWorkareaV1(wa)
 	writeJSON(w, http.StatusOK, &afclient.WorkareaV1Envelope{Workarea: *wa})
 }
 
@@ -174,7 +180,7 @@ func (s *Server) serveWorkareaRestore(w http.ResponseWriter, r *http.Request, ar
 		}
 		return
 	}
-	writeJSON(w, http.StatusCreated, &afclient.WorkareaRestoreV1Result{Workarea: *wa})
+	writeJSON(w, http.StatusCreated, &afclient.WorkareaRestoreV1Result{Workarea: *redactWorkareaV1(wa)})
 }
 
 // serveWorkareaDiff handles GET /api/daemon/workareas/<idA>/diff/<idB>.
@@ -291,6 +297,62 @@ func (s *Server) serveDiffNDJSON(w http.ResponseWriter, reg *WorkareaArchiveRegi
 	if flusher != nil {
 		flusher.Flush()
 	}
+}
+
+// redactWorkareaSummariesV1 drops embedded credentials from the repository
+// URLs of every summary before it is served. The summaries project
+// operator-configured remotes verbatim; only the served copies are
+// rewritten, never the stored manifests or live pool state.
+func redactWorkareaSummariesV1(summaries []afclient.WorkareaSummaryV1) {
+	for i := range summaries {
+		summaries[i].Repository = redactRepositoryURL(summaries[i].Repository)
+	}
+}
+
+// redactWorkareaV1 drops embedded credentials from the repository URL of
+// one served workarea record, returning it for call chaining. It also
+// redacts the echoed manifest map: inspect renders the raw manifest JSON
+// verbatim, so a credentialed repository URL stored there would otherwise
+// be served beside the redacted typed field.
+//
+// The per-leaf Repositories list intentionally carries no repository URL
+// field today (name/leaf/path/role/authority/refs/digest only), so there
+// is nothing credential-bearing to redact there. If a URL field ever
+// lands on WorkareaRepository, extend this function to walk it — a new
+// field would otherwise bypass this single redaction point silently.
+func redactWorkareaV1(wa *afclient.WorkareaV1) *afclient.WorkareaV1 {
+	if wa != nil {
+		wa.Repository = redactRepositoryURL(wa.Repository)
+		redactManifestURLs(wa.Manifest)
+	}
+	return wa
+}
+
+// redactManifestURLs rewrites every string of a served manifest copy in
+// place, nested maps and lists included. The manifest echoes every key the
+// archive's manifest.json carries (legacy and foreign producers alike), so
+// a credentialed URL can sit under any key, not only "repository".
+// redactRepositoryURL leaves strings that carry no URL userinfo unchanged.
+// The map is decoded fresh from disk for each response; the stored
+// manifest is never rewritten.
+func redactManifestURLs(manifest map[string]any) {
+	for key, value := range manifest {
+		manifest[key] = redactManifestValue(value)
+	}
+}
+
+func redactManifestValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return redactRepositoryURL(typed)
+	case map[string]any:
+		redactManifestURLs(typed)
+	case []any:
+		for i := range typed {
+			typed[i] = redactManifestValue(typed[i])
+		}
+	}
+	return value
 }
 
 // lookupActiveByID returns the active pool member matching id, if the

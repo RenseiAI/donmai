@@ -781,12 +781,42 @@ func redactSessionDetail(d *SessionDetail) *SessionDetail {
 	out.AuthToken = ""
 	out.McpAuthToken = ""
 	out.McpAuthTokenExpiresAt = ""
+	// The redacted copy answers credential-free local reads, so the
+	// operator-configured repository URL is served userinfo-redacted: a
+	// user:token@ authority would otherwise be readable by anything on
+	// the box. The stored original keeps the functional URL the worker
+	// clones from; credentialed reads serve it untouched.
+	out.Repository = redactRepositoryURL(out.Repository)
 	// The operational payload is the canonical projection of the raw poll
 	// item (executioncell.ProjectOperationalPayload), so it repeats every
 	// credential the item carried, mcpAuthToken included. Only the worker's
 	// admission-digest check reads it, and that read is credentialed.
 	out.OperationalPayload = nil
 	out.McpServers = redactMCPServers(d.McpServers)
+	out.RepositoryDeclaration = redactRepositoryDeclaration(d.RepositoryDeclaration)
+	return &out
+}
+
+// redactRepositoryDeclaration returns a copy of d with embedded
+// credentials dropped from every declared repository source URL. The
+// declaration type's own contract says sources are ephemeral provision
+// input that must not be copied into stored records; the credential-free
+// detail projection honors that here, at the serving boundary, so a
+// user:token@ authority never reaches an unauthenticated local read.
+// The stored original is never rewritten: credentialed reads keep the
+// functional URLs the provisioner clones from.
+func redactRepositoryDeclaration(d *workarea.RepositoryDeclarationV1) *workarea.RepositoryDeclarationV1 {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	if d.Repositories != nil {
+		out.Repositories = make([]workarea.DeclaredRepositoryV1, len(d.Repositories))
+		copy(out.Repositories, d.Repositories)
+		for i := range out.Repositories {
+			out.Repositories[i].Source.Repository = redactRepositoryURL(out.Repositories[i].Source.Repository)
+		}
+	}
 	return &out
 }
 
