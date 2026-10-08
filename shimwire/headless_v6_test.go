@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -49,21 +50,21 @@ func TestV6HeadlessVocabularyIsSelectedV6Only(t *testing.T) {
 		body func() []byte
 	}{
 		{"credential update", TypeCredentialUpdate, func() []byte {
-			b, err := EncodeCredentialUpdate(CredentialUpdate{Generation: 3, WorkerID: "w-1", Bearer: "bearer-1", ExpiresAt: 1700000000})
+			b, err := EncodeCredentialUpdate(CredentialUpdate{RequestID: 7, Generation: 3, WorkerID: "w-1", Bearer: "bearer-1", ExpiresAt: 1700000000})
 			if err != nil {
 				t.Fatal(err)
 			}
 			return b
 		}},
 		{"credential result", TypeCredentialResult, func() []byte {
-			b, err := EncodeCredentialResult(CredentialResult{Generation: 3})
+			b, err := EncodeCredentialResult(CredentialResult{RequestID: 7, Generation: 3, Status: CredentialSuccess})
 			if err != nil {
 				t.Fatal(err)
 			}
 			return b
 		}},
 		{"headless exit", TypeHeadlessExit, func() []byte {
-			b, err := EncodeHeadlessExit(HeadlessExit{Cause: HeadlessExitCompleted, OutboxKey: "sess/1", OutboxState: HeadlessExitDelivered, GroupReaped: true})
+			b, err := EncodeHeadlessExit(HeadlessExit{Seq: 1, ProcessEpoch: 2, Cause: HeadlessExitCompleted, OutboxKey: "sess/1", OutboxState: HeadlessExitDelivered, GroupReaped: true, ObservedAt: 1700000000})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -212,6 +213,13 @@ func TestHelloWorkloadAdvertisesHeadlessExclusively(t *testing.T) {
 	if _, err := EncodeHello(conflict); err == nil {
 		t.Fatal("conflicting workload sources accepted")
 	}
+	// The F2 direction the first version of this codec missed: a caller map
+	// carrying the headless advertisement beside an interactive field is the
+	// same ambiguity, and fails closed the same way.
+	mapOnly := Hello{Workload: ProfileInteractive, Extensions: Extensions{Values: map[string]string{ExtWorkload: WorkloadHeadless}}}
+	if _, err := EncodeHello(mapOnly); err == nil {
+		t.Fatal("headless map entry beside an interactive field accepted")
+	}
 	if _, err := EncodeHello(Hello{Workload: "terminal"}); err == nil {
 		t.Fatal("unassigned workload value accepted")
 	}
@@ -253,15 +261,17 @@ func TestHeadlessRangeNeverOverlapsAnInteractivePeer(t *testing.T) {
 }
 
 // TestCredentialBodiesValidateTheFenceAndTheSecret pins the strict JSON
-// bodies: a CredentialUpdate without a generation, worker id, bearer or
-// positive expiry is malformed (an empty bearer must never blank the runner's
-// credential), a CredentialResult ack carries no refusal detail while a
-// refusal carries exactly one assigned result code, and unknown fields or
-// trailing documents are refused like every other control body.
+// bodies: a CredentialUpdate carries the nonzero strictly-increasing request
+// id, the generation fence, a 1–256 byte worker id, a 1–16384 byte bearer and
+// a nonzero Unix-nanosecond expiry (an empty bearer must never blank the
+// runner's credential), a CredentialResult carries the correlated request id,
+// generation and exactly one assigned status (exited is never used), and
+// unknown fields or trailing documents are refused like every other control
+// body.
 func TestCredentialBodiesValidateTheFenceAndTheSecret(t *testing.T) {
 	t.Parallel()
 
-	update := CredentialUpdate{Generation: 9, WorkerID: "worker-2", Bearer: "bearer-2", ExpiresAt: 1700003600}
+	update := CredentialUpdate{RequestID: 7, Generation: 9, WorkerID: "worker-2", Bearer: "bearer-2", ExpiresAt: 1700003600000000000}
 	body, err := EncodeCredentialUpdate(update)
 	if err != nil {
 		t.Fatalf("EncodeCredentialUpdate: %v", err)
@@ -270,55 +280,103 @@ func TestCredentialBodiesValidateTheFenceAndTheSecret(t *testing.T) {
 	if err != nil || got != update {
 		t.Fatalf("credential update round trip = (%+v,%v), want %+v", got, err, update)
 	}
+	// The review probe that blocked the first version of this codec: the
+	// contract's own §3 vector decodes through the production entry point.
+	if _, err := DecodeCredentialUpdate([]byte(`{"requestId":7,"generation":3,"workerId":"wrk_9","bearer":"opaque","expiresAt":1760000000000000000}`)); err != nil {
+		t.Fatalf("contract §3 update vector refused: %v", err)
+	}
 	for _, bad := range []CredentialUpdate{
-		{WorkerID: "w", Bearer: "b", ExpiresAt: 1},
-		{Generation: 9, Bearer: "b", ExpiresAt: 1},
-		{Generation: 9, WorkerID: "w", ExpiresAt: 1},
-		{Generation: 9, WorkerID: "w", Bearer: "b"},
-		{Generation: 9, WorkerID: "w", Bearer: "b", ExpiresAt: -1},
+		{Generation: 9, WorkerID: "w", Bearer: "b", ExpiresAt: 1},
+		{RequestID: 7, WorkerID: "w", Bearer: "b", ExpiresAt: 1},
+		{RequestID: 7, Generation: 9, Bearer: "b", ExpiresAt: 1},
+		{RequestID: 7, Generation: 9, WorkerID: "w", ExpiresAt: 1},
+		{RequestID: 7, Generation: 9, WorkerID: "w", Bearer: "b"},
+		{RequestID: 7, Generation: 9, WorkerID: "w", Bearer: "b", ExpiresAt: -1},
+		{RequestID: 7, Generation: 9, WorkerID: strings.Repeat("w", credentialWorkerIDMax+1), Bearer: "b", ExpiresAt: 1},
+		{RequestID: 7, Generation: 9, WorkerID: "w", Bearer: strings.Repeat("b", credentialBearerMax+1), ExpiresAt: 1},
 	} {
-		raw, err := EncodeCredentialUpdate(bad)
+		if _, err := EncodeCredentialUpdate(bad); err == nil {
+			t.Errorf("EncodeCredentialUpdate(%+v) accepted, want ErrMalformed", bad)
+		}
+		raw, err := encodeJSON(bad)
 		if err != nil {
-			t.Fatalf("EncodeCredentialUpdate(%+v): %v", bad, err)
+			t.Fatalf("encodeJSON(%+v): %v", bad, err)
 		}
 		if _, err := DecodeCredentialUpdate(raw); !errors.Is(err, ErrMalformed) {
 			t.Errorf("DecodeCredentialUpdate(%+v) accepted, want ErrMalformed", bad)
 		}
 	}
+	// Bound edges: 1 and the maxima are legal; zero and maxima+1 are not.
+	for _, ok := range []CredentialUpdate{
+		{RequestID: 1, Generation: 1, WorkerID: "w", Bearer: "b", ExpiresAt: 1},
+		{RequestID: 1, Generation: 1, WorkerID: strings.Repeat("w", credentialWorkerIDMax), Bearer: strings.Repeat("b", credentialBearerMax), ExpiresAt: 1},
+	} {
+		raw, err := EncodeCredentialUpdate(ok)
+		if err != nil {
+			t.Fatalf("EncodeCredentialUpdate(%+v): %v", ok, err)
+		}
+		if _, err := DecodeCredentialUpdate(raw); err != nil {
+			t.Errorf("DecodeCredentialUpdate(%+v): %v", ok, err)
+		}
+	}
 
-	ack, err := EncodeCredentialResult(CredentialResult{Generation: 9})
-	if err != nil {
-		t.Fatalf("EncodeCredentialResult ack: %v", err)
+	for _, status := range []CredentialStatus{
+		CredentialSuccess, CredentialMalformed, CredentialStaleGeneration,
+		CredentialDuplicateChanged, CredentialRequestLedgerFull, CredentialInternal,
+		CredentialRequestMismatch, CredentialTimeout,
+	} {
+		want := CredentialResult{RequestID: 7, Generation: 9, Status: status}
+		raw, err := EncodeCredentialResult(want)
+		if err != nil {
+			t.Fatalf("EncodeCredentialResult(%s): %v", status, err)
+		}
+		if got, err := DecodeCredentialResult(raw); err != nil || got != want {
+			t.Fatalf("credential result round trip = (%+v,%v), want %+v", got, err, want)
+		}
 	}
-	if got, err := DecodeCredentialResult(ack); err != nil || got.Generation != 9 || got.Code != "" {
-		t.Fatalf("credential ack round trip = (%+v,%v)", got, err)
+	// The contract's own result vector, and the exited refusal the contract
+	// explicitly forbids here (a shim past its terminal observation answers
+	// internal, never exited).
+	if _, err := DecodeCredentialResult([]byte(`{"requestId":7,"generation":3,"status":"success"}`)); err != nil {
+		t.Fatalf("contract §3 result vector refused: %v", err)
 	}
-	refusal, err := EncodeCredentialResult(CredentialResult{Generation: 9, Code: CodeStaleGeneration, Detail: "resurfaced controller"})
-	if err != nil {
-		t.Fatalf("EncodeCredentialResult refusal: %v", err)
+	if _, err := DecodeCredentialResult([]byte(`{"requestId":7,"generation":3,"status":"exited"}`)); err == nil {
+		t.Fatal("exited credential status accepted; the contract forbids it here")
 	}
-	if got, err := DecodeCredentialResult(refusal); err != nil || got.Code != CodeStaleGeneration {
-		t.Fatalf("credential refusal round trip = (%+v,%v)", got, err)
+	if _, err := EncodeCredentialResult(CredentialResult{RequestID: 7, Generation: 9, Status: "exited"}); err == nil {
+		t.Fatal("EncodeCredentialResult accepted exited; the contract forbids it here")
+	}
+	if _, err := EncodeCredentialResult(CredentialResult{Generation: 9, Status: CredentialSuccess}); err == nil {
+		t.Fatal("EncodeCredentialResult accepted a missing request id")
 	}
 	for _, raw := range [][]byte{
-		[]byte(`{"generation":9,"code":"teapot"}`),
-		[]byte(`{"generation":0,"code":"stale_generation"}`),
-		[]byte(`{"generation":9,"detail":"without a code"}`),
-		[]byte(`{"generation":9,"surprise":1}`),
-		[]byte(`{"generation":9}{"generation":9}`),
+		[]byte(`{"requestId":7,"generation":9,"status":"teapot"}`),
+		[]byte(`{"requestId":0,"generation":9,"status":"success"}`),
+		[]byte(`{"requestId":7,"generation":0,"status":"success"}`),
+		[]byte(`{"requestId":7,"generation":9}`),
+		[]byte(`{"generation":9,"status":"success"}`),
+		[]byte(`{"requestId":7,"generation":9,"status":"success","code":"malformed"}`),
+		[]byte(`{"requestId":7,"generation":9,"status":"success","surprise":1}`),
+		[]byte(`{"requestId":7,"generation":9,"status":"success"}{"requestId":7,"generation":9,"status":"success"}`),
 	} {
 		if _, err := DecodeCredentialResult(raw); !errors.Is(err, ErrMalformed) {
 			t.Errorf("DecodeCredentialResult(%s) accepted, want ErrMalformed", raw)
 		}
 	}
+	if CredentialStatus("exited").Known() || CredentialStatus("teapot").Known() {
+		t.Error("unassigned credential status reported known; the registry is closed")
+	}
 }
 
 // TestHeadlessExitNamesTheOutboxRecord pins the immutable terminal
-// observation: every cause in the closed registry round-trips with its outbox
-// key, state and group proof, while an unknown cause, an unknown state, a
-// missing key, an unknown field or a trailing document is malformed. The key
-// is required in both states — pending names what the replacement controller
-// replays, delivered names what it must not send again.
+// observation: seq is always 1 with the incarnation and observation instant
+// named, every cause in the closed registry round-trips with its outbox key,
+// state and group proof, while a non-1 sequence, an unknown cause, an unknown
+// state, a missing observation instant, none outside stopped_for_resume, an
+// unknown field or a trailing document is malformed. None names no record —
+// it marks a resume that wrote no terminal — while delivered and pending both
+// require the key: pending names what the replacement controller replays,
+// delivered names what it must not send again.
 func TestHeadlessExitNamesTheOutboxRecord(t *testing.T) {
 	t.Parallel()
 
@@ -327,35 +385,60 @@ func TestHeadlessExitNamesTheOutboxRecord(t *testing.T) {
 		state HeadlessExitState
 	}{
 		{HeadlessExitCompleted, HeadlessExitDelivered},
-		{HeadlessExitFailed, HeadlessExitPending},
-		{HeadlessExitCancelled, HeadlessExitPending},
-		{HeadlessExitLostOwnership, HeadlessExitPending},
+		{HeadlessExitCompleted, HeadlessExitPending},
+		{HeadlessExitOrphaned, HeadlessExitDelivered},
 		{HeadlessExitOrphaned, HeadlessExitPending},
-		{HeadlessExitWorkerGone, HeadlessExitPending},
+		{HeadlessExitStoppedForResume, HeadlessExitNone},
+		{HeadlessExitShimFailure, HeadlessExitPending},
 	} {
-		want := HeadlessExit{ExitCode: 3, Signal: "SIGTERM", Cause: tc.cause, OutboxKey: "org/sess/attempt-2", OutboxState: tc.state, GroupReaped: true}
+		want := HeadlessExit{Seq: 1, ProcessEpoch: 4, ExitCode: 3, Signal: "SIGTERM", Cause: tc.cause, OutboxKey: "org/sess/attempt-2", OutboxState: tc.state, GroupReaped: true, ObservedAt: 1760000000000000000}
+		if tc.state == HeadlessExitNone {
+			want.OutboxKey = ""
+		}
 		body, err := EncodeHeadlessExit(want)
 		if err != nil {
-			t.Fatalf("EncodeHeadlessExit(%s): %v", tc.cause, err)
+			t.Fatalf("EncodeHeadlessExit(%s/%s): %v", tc.cause, tc.state, err)
 		}
 		got, err := DecodeHeadlessExit(body)
 		if err != nil || got != want {
 			t.Fatalf("headless exit round trip = (%+v,%v), want %+v", got, err, want)
 		}
 	}
+	// The review probes that blocked the first version of this codec: the
+	// contract's own §4 vectors — the terminal observation and the
+	// stopped_for_resume resume marker — decode through the production entry
+	// point.
 	for _, raw := range [][]byte{
-		[]byte(`{"cause":" vaporized ","outboxKey":"k","outboxState":"pending"}`),
-		[]byte(`{"cause":"completed","outboxKey":"k","outboxState":"maybe"}`),
-		[]byte(`{"cause":"completed","outboxState":"delivered"}`),
-		[]byte(`{"cause":"completed","outboxKey":"k","outboxState":"delivered","surprise":1}`),
-		[]byte(`{"cause":"completed","outboxKey":"k","outboxState":"delivered"}{}`),
+		[]byte(`{"seq":1,"processEpoch":1,"exitCode":0,"signal":"","groupReaped":true,"cause":"completed","outboxKey":"org/sess/attempt-2","outboxState":"delivered","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"exitCode":0,"signal":"","groupReaped":false,"cause":"stopped_for_resume","outboxKey":"","outboxState":"none","observedAt":1760000000000000000}`),
+	} {
+		if _, err := DecodeHeadlessExit(raw); err != nil {
+			t.Fatalf("contract §4 exit vector refused: %v", err)
+		}
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"seq":2,"processEpoch":1,"cause":"completed","outboxKey":"k","outboxState":"delivered","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":0,"cause":"completed","outboxKey":"k","outboxState":"delivered","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"completed","outboxKey":"k","outboxState":"delivered"}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"failed","outboxKey":"k","outboxState":"pending","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"cancelled","outboxKey":"k","outboxState":"pending","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"lost_ownership","outboxKey":"k","outboxState":"pending","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"worker_exited_without_result","outboxKey":"k","outboxState":"pending","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"completed","outboxKey":"k","outboxState":"none","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"stopped_for_resume","outboxKey":"k","outboxState":"none","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"stopped_for_resume","outboxKey":"","outboxState":"pending","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"completed","outboxState":"delivered","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"completed","outboxKey":"k","outboxState":"maybe","observedAt":1760000000000000000}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"completed","outboxKey":"k","outboxState":"delivered","observedAt":1760000000000000000,"surprise":1}`),
+		[]byte(`{"seq":1,"processEpoch":1,"cause":"completed","outboxKey":"k","outboxState":"delivered","observedAt":1760000000000000000}{}`),
 	} {
 		if _, err := DecodeHeadlessExit(raw); !errors.Is(err, ErrMalformed) {
 			t.Errorf("DecodeHeadlessExit(%s) accepted, want ErrMalformed", raw)
 		}
 	}
-	if HeadlessExitCause("vaporized").Known() || HeadlessExitState("maybe").Known() {
-		t.Error("unassigned headless cause/state reported known; the registries are closed")
+	if HeadlessExitCause("failed").Known() || HeadlessExitCause("vaporized").Known() ||
+		HeadlessExitState("maybe").Known() || !HeadlessExitState("none").Known() {
+		t.Error("headless cause/state registries disagree with the contract's closed sets")
 	}
 }
 

@@ -99,6 +99,11 @@ func (p Profile) Known() bool {
 // bytes — because a headless connection has no terminal byte stream whose
 // continuity such a frame could honestly claim. A refusal is a typed
 // malformed classification at the reader, never a silent skip.
+//
+// ReadProfileVersion refuses through this predicate: a headless connection
+// that receives a refused type is answered with Error{code:"malformed"} and the
+// frame is never acted on, so the predicate has a production enforcement
+// point, not just a unit pin.
 func (t MessageType) RefusedIn(profile Profile, version uint32) bool {
 	if profile != ProfileHeadless {
 		return false

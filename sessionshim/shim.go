@@ -193,23 +193,33 @@ type Shim struct {
 
 // controllerConn is one attached controller.
 type controllerConn struct {
-	conn              *net.UnixConn
-	w                 *shimwire.Writer
-	lifecycleMu       sync.Mutex
-	sub               agent.InteractiveSubscription
-	closed            bool
-	selected          uint32
+	conn        *net.UnixConn
+	w           *shimwire.Writer
+	lifecycleMu sync.Mutex
+	sub         agent.InteractiveSubscription
+	closed      bool
+	selected    uint32
+	// profile is the workload shape this connection carries, from the
+	// Hello workload advertisement (interactive unless the shim declared
+	// headless). The control read consults it so a headless connection
+	// refuses PTY-shaped frames at the reader, never in dispatch.
+	profile           shimwire.Profile
 	checkpointRequest shimwire.CheckpointRequest
 	checkpointResult  []shimwire.Message
 	snapshotLedger    map[uint64]*snapshotLedgerEntry
 	emissionMu        sync.Mutex
 	emissionBySeq     map[uint64]*snapshotLedgerEntry
-	pumpDone          chan struct{}
-	barrierMu         sync.Mutex
-	outputBarrier     *ptyhost.OutputBarrier
-	barrierTimer      *time.Timer
-	barrierState      uint8
-	closeOnce         sync.Once
+	// credentialLedger keys first-seen CredentialUpdate bodies by request id so
+	// an exact retry replays its first result and a reused id with changed
+	// content is duplicate_changed. It is per connection, like the snapshot
+	// retry ledger, and bounded by credentialRetryLedgerLimit.
+	credentialLedger map[uint64]*credentialLedgerEntry
+	pumpDone         chan struct{}
+	barrierMu        sync.Mutex
+	outputBarrier    *ptyhost.OutputBarrier
+	barrierTimer     *time.Timer
+	barrierState     uint8
+	closeOnce        sync.Once
 }
 
 const (
@@ -222,6 +232,18 @@ const (
 const adoptionOutputBarrierTimeout = 30 * time.Second
 
 const snapshotRetryLedgerLimit = 1024
+
+// credentialRetryLedgerLimit bounds the per-connection credential-update
+// ledger the same way the snapshot retry ledger is bounded: an unbounded map
+// of request ids is a memory commitment to a peer that names them.
+const credentialRetryLedgerLimit = 1024
+
+// credentialLedgerEntry is one first-seen CredentialUpdate with the result
+// its exact retry must replay byte-for-byte.
+type credentialLedgerEntry struct {
+	request shimwire.CredentialUpdate
+	result  shimwire.CredentialResult
+}
 
 // Matches attachclient's post-Exit service window (§12.2).
 const defaultFinalScreenWindow = 60 * time.Second
@@ -1181,10 +1203,11 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	}
 	s.gen = welcome.ProposedGeneration
 	ctrl := &controllerConn{
-		conn: conn, w: w, selected: welcome.Selected,
-		snapshotLedger: make(map[uint64]*snapshotLedgerEntry),
-		emissionBySeq:  make(map[uint64]*snapshotLedgerEntry),
-		pumpDone:       make(chan struct{}),
+		conn: conn, w: w, selected: welcome.Selected, profile: hello.Workload,
+		snapshotLedger:   make(map[uint64]*snapshotLedgerEntry),
+		emissionBySeq:    make(map[uint64]*snapshotLedgerEntry),
+		credentialLedger: make(map[uint64]*credentialLedgerEntry),
+		pumpDone:         make(chan struct{}),
 	}
 	if outputBarrier != nil {
 		ctrl.installOutputBarrier(outputBarrier)
@@ -1562,21 +1585,64 @@ func (s *Shim) writeHostFrameSnapshotPair(
 }
 
 // readControl consumes controller-originated frames, enforcing the generation
-// fence on every mutating one.
+// fence on every mutating one. On a headless-profile connection it reads
+// through the profile reader, so every PTY-shaped frame is refused with
+// Error{code:"malformed"} and never reaches dispatch: the corpus "every
+// refused PTY type" column is enforced at this read, not asserted by a
+// predicate alone.
 func (s *Shim) readControl(ctrl *controllerConn, r *shimwire.Reader) {
 	defer func() {
 		s.loseController(ctrl)
 	}()
 
 	for {
-		msg, err := r.ReadVersion(ctrl.selected)
+		msg, err := s.readControllerFrame(ctrl, r)
 		if err != nil {
 			return
 		}
-		if err := s.dispatch(ctrl, msg); err != nil {
+		if msg.Handled {
+			continue
+		}
+		if err := s.dispatch(ctrl, msg.Message); err != nil {
 			return
 		}
 	}
+}
+
+// controllerFrame is one read off a controller connection: either a frame for
+// dispatch, or a profile refusal already answered on the wire.
+type controllerFrame struct {
+	shimwire.Message
+	// Handled reports that the frame was a refused headless-profile type that
+	// the profile reader already answered with Error{code:"malformed"}. The
+	// read loop continues to the next frame; dispatch never sees the refused
+	// type.
+	Handled bool
+}
+
+// readControllerFrame reads one controller frame. A headless-profile
+// connection reads through the profile reader so refused PTY-shaped types are
+// answered and skipped; every other connection reads the version vocabulary
+// directly.
+func (s *Shim) readControllerFrame(ctrl *controllerConn, r *shimwire.Reader) (controllerFrame, error) {
+	if ctrl.profile != shimwire.ProfileHeadless {
+		msg, err := r.ReadVersion(ctrl.selected)
+		if err != nil {
+			return controllerFrame{}, err
+		}
+		return controllerFrame{Message: msg}, nil
+	}
+	msg, err := r.ReadProfileVersion(ctrl.w, ctrl.profile, ctrl.selected)
+	if err != nil {
+		if errors.Is(err, shimwire.ErrMalformed) {
+			// A refused PTY-shaped frame: the reader already answered it.
+			// A readVersion-level refusal (unknown length or type) carries
+			// no message to answer, and ends the connection as before.
+			return controllerFrame{Handled: true}, nil
+		}
+		return controllerFrame{}, err
+	}
+	return controllerFrame{Message: msg}, nil
 }
 
 // dispatch handles one controller-originated frame.
@@ -1653,6 +1719,10 @@ func (s *Shim) dispatch(ctrl *controllerConn, msg shimwire.Message) error {
 		return nil // display-only from the controller; nothing to act on
 	case shimwire.TypeCheckpointRequest:
 		return s.dispatchContinuationRequest(ctrl, msg.Body)
+	case shimwire.TypeCredentialUpdate:
+		return s.dispatchCredentialUpdate(ctrl, msg.Body)
+	case shimwire.TypeCredentialResult, shimwire.TypeHeadlessExit:
+		return sendError(ctrl.w, shimwire.CodeMalformed, "message type is not controller-originated")
 	case shimwire.TypeSnapshotRequest:
 		if ctrl.selected < shimwire.V2 {
 			return sendError(ctrl.w, shimwire.CodeMalformed, "SnapshotRequest is not legal in selected v1")
@@ -1883,6 +1953,65 @@ func refusedSnapshotResult(req shimwire.SnapshotRequest, code shimwire.ErrorCode
 	return shimwire.SnapshotResult{RequestID: req.RequestID, Generation: req.Generation, Mode: req.Mode, Code: code}
 }
 
+// dispatchCredentialUpdate serves one generation-fenced bearer rotation on a
+// selected-v6 connection. The correlation order mirrors dispatchSnapshotRequest
+// exactly: malformed body, then the per-connection request-id ledger (exact
+// retry replays the first result byte-for-byte, a reused id with changed
+// content is duplicate_changed, a full ledger is request_ledger_full), then
+// the generation fence (stale_generation). Slice 1 installs the correlation
+// and the fence refusals; slice 3 owns the provider install behind success.
+// A dispatch-level refusal answers CredentialResult; the connection stays up.
+func (s *Shim) dispatchCredentialUpdate(ctrl *controllerConn, body []byte) error {
+	if ctrl.selected != shimwire.V6 {
+		// Unreachable through the versioned reader — a v6-only type never
+		// arrives below v6 — so this is a defense-in-depth Error answer in
+		// the same shape as the checkpoint version guard, not a correlated
+		// result (there is no trustworthy request id to correlate).
+		return sendError(ctrl.w, shimwire.CodeMalformed, "credential update requires selected v6")
+	}
+	req, err := shimwire.DecodeCredentialUpdate(body)
+	if err != nil {
+		// The body did not decode, so there is no trustworthy request id or
+		// generation to correlate: the frame is malformed at the dispatch
+		// level and the connection answers Error, like every other
+		// undecodable controller frame.
+		return sendError(ctrl.w, shimwire.CodeMalformed, "credential update did not decode")
+	}
+	if prior := ctrl.credentialLedger[req.RequestID]; prior != nil {
+		if prior.request != req {
+			return writeCredentialResult(ctrl, refusedCredentialResult(req, shimwire.CredentialDuplicateChanged))
+		}
+		return writeCredentialResult(ctrl, prior.result)
+	}
+	result := refusedCredentialResult(req, shimwire.CredentialSuccess)
+	if len(ctrl.credentialLedger) >= credentialRetryLedgerLimit {
+		result.Status = shimwire.CredentialRequestLedgerFull
+		return writeCredentialResult(ctrl, result)
+	}
+	if !s.authorized(req.Generation) {
+		result.Status = shimwire.CredentialStaleGeneration
+		ctrl.credentialLedger[req.RequestID] = &credentialLedgerEntry{request: req, result: result}
+		return writeCredentialResult(ctrl, result)
+	}
+	// The provider install lands in slice 3; slice 1 records the first-seen
+	// update and answers success so the correlation contract is already the
+	// one the install will keep.
+	ctrl.credentialLedger[req.RequestID] = &credentialLedgerEntry{request: req, result: result}
+	return writeCredentialResult(ctrl, result)
+}
+
+func refusedCredentialResult(req shimwire.CredentialUpdate, status shimwire.CredentialStatus) shimwire.CredentialResult {
+	return shimwire.CredentialResult{RequestID: req.RequestID, Generation: req.Generation, Status: status}
+}
+
+func writeCredentialResult(ctrl *controllerConn, result shimwire.CredentialResult) error {
+	body, err := shimwire.EncodeCredentialResult(result)
+	if err != nil {
+		return err
+	}
+	return ctrl.w.WriteVersion(ctrl.selected, shimwire.TypeCredentialResult, body)
+}
+
 func writeSnapshotResult(ctrl *controllerConn, result shimwire.SnapshotResult) error {
 	body, err := shimwire.EncodeSnapshotResult(result)
 	if err != nil {
@@ -2014,6 +2143,10 @@ func writeTyped(w *shimwire.Writer, t shimwire.MessageType, enc func() ([]byte, 
 // it is refused cannot read WHY it was refused, and would retry the same frame
 // on a fresh connection forever. The one place a refusal is terminal is the
 // handshake, where the caller returns its own error after calling this.
+// The one exception to "keeps the connection" is the headless profile's
+// wire-level refusal, which answers through shimwire's profile reader instead:
+// dispatchHeadlessRefusal exists so a headless connection that receives a
+// PTY-shaped frame gets exactly that answer rather than a dispatch-level one.
 func sendError(w *shimwire.Writer, code shimwire.ErrorCode, detail string) error {
 	body, err := shimwire.EncodeError(shimwire.ErrorMsg{Code: code, Detail: detail})
 	if err != nil {
