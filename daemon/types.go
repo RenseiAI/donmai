@@ -334,6 +334,12 @@ type SessionHandle struct {
 	// Mirrors SessionSpec.WorkType.
 	WorkType string `json:"workType,omitempty"`
 
+	// IssueIdentifier is the work item's human-readable identifier,
+	// projected from the session's stored detail when the list is served,
+	// so a local reader can label a session before its runner writes any
+	// state. An identifier only: the title and body never ride the list.
+	IssueIdentifier string `json:"issueIdentifier,omitempty"`
+
 	// SeatBudget is the per-seat budget this session runs under: the
 	// posture (enforced | best-effort | none) with the values. Nil when
 	// budgeting is off on this host.

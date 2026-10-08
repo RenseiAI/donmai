@@ -493,6 +493,10 @@ type DaemonSessionHandle struct {
 	// Display-only; absent against an older daemon (renders as unknown).
 	WorkType string `json:"workType,omitempty"`
 
+	// IssueIdentifier is the work item's human-readable identifier, known
+	// from admission. Display-only; absent against an older daemon.
+	IssueIdentifier string `json:"issueIdentifier,omitempty"`
+
 	// SeatBudget is the per-seat budget this session runs under: the
 	// posture (enforced | best-effort | none) with the values. Nil when
 	// budgeting is off on this host, or against an older daemon.

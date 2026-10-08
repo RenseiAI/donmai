@@ -1,0 +1,10 @@
+build-host-01                                             14 sessions   queue 2   slots 13/16   uptime 3h 16m   v0.72.68
+↑ 9 more
+> ● ENG-1401  Backfill audit rows for tenant shard 1
+    api · development
+↓ 4 more
+session stream  [follow]
+20:29:57 [ENG-1284] tool_use  Bash: go test ./internal/upload/...
+20:29:58 [ENG-1290] thought  Reconciliation totals match for the sampled accounts red.
+20:29:59 [ENG-1301] tool_result  Edit → ok
+↑↓/jk select   enter detail   [ ] split   0 reset   f follow/pause   g tail   q quit

@@ -31,7 +31,7 @@ type stateReader interface {
 // (id, pid, state, worktree path, project, repo) enriched with the on-disk
 // state.json header (issue identifier, provider, work type, phase) and the
 // live metrics the tailer accumulates (tool count, last tool, cost). It is
-// the unit the FleetGrid renders.
+// the unit the card grid renders.
 type SessionCard struct {
 	AcceptedAt          string
 	AgentCardID         string
@@ -49,6 +49,7 @@ type SessionCard struct {
 	// From state.json (best-effort; zero values when unreadable).
 	IssueID          string
 	IssueIdentifier  string
+	IssueTitle       string
 	Provider         string
 	Harness          string
 	Model            string
@@ -137,8 +138,11 @@ func NewSource(daemon daemonLister, st stateReader, repoScope string) *Source {
 // Counters is the dashboard header summary. Sessions is the visible row count;
 // status and stats are sourced from the daemon's local endpoints.
 type Counters struct {
-	Sessions      int
-	Running       int // visible running/starting rows, excluding held and terminal rows
+	Sessions int
+	Running  int // visible running/starting rows, excluding held and terminal rows
+	// HostActive and MaxSessions are the daemon's host-wide occupied and
+	// total session slots, whatever the dashboard's scope.
+	HostActive    int
 	MaxSessions   int
 	QueueDepth    int
 	UptimeSeconds int64
@@ -208,6 +212,7 @@ func (s *Source) Snapshot() Snapshot {
 			EndpointOperator: h.EndpointOperator,
 			Protocol:         h.Protocol,
 			WorkType:         h.WorkType,
+			IssueIdentifier:  h.IssueIdentifier,
 		}
 		if card.isHeld() {
 			// A held row has no live process or workarea, even if a malformed
@@ -251,7 +256,10 @@ func (s *Source) enrichFromState(card *SessionCard) {
 		return // a reused path still contains another session's state
 	}
 	card.IssueID = st.IssueID
-	card.IssueIdentifier = st.IssueIdentifier
+	if card.IssueIdentifier == "" {
+		card.IssueIdentifier = st.IssueIdentifier
+	}
+	card.IssueTitle = st.IssueTitle
 	card.Provider = string(st.ProviderName)
 	// Card name and ID belong to one annotation. Do not mix an index ID
 	// with an unrelated stale state name (or the converse).
@@ -302,6 +310,7 @@ func (s *Source) enrichFromState(card *SessionCard) {
 func (s *Source) counters(sessions, running int) Counters {
 	c := Counters{Sessions: sessions, Running: running}
 	if st, err := s.daemon.GetStatus(); err == nil && st != nil {
+		c.HostActive = st.ActiveSessions
 		c.MaxSessions = st.MaxSessions
 		c.UptimeSeconds = st.UptimeSeconds
 		c.Version = st.Version
