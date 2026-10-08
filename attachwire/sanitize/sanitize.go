@@ -430,8 +430,9 @@ func (s *Sanitizer) stepCSI(b byte, out *[]byte) bool {
 	case b >= 0x20 && b <= 0x2F: // intermediate bytes
 		s.pending = append(s.pending, b)
 	case b >= 0x40 && b <= 0x7E: // final byte — classify
-		if csiPasses(s.pending[s.introLen:], b) {
-			*out = append(*out, s.pending...)
+		if content, ok := csiRewrite(s.pending[s.introLen:], b); ok {
+			*out = append(*out, s.pending[:s.introLen]...)
+			*out = append(*out, content...)
 			*out = append(*out, b)
 		}
 		s.st = stGround
@@ -494,6 +495,64 @@ func csiPasses(content []byte, final byte) bool {
 		}
 	}
 	return true
+}
+
+// replyModes are DEC private modes whose only effect is to make the terminal
+// write reports on its input by itself: ?2048 (in-band resize reports) and
+// ?2031 (colour-scheme change reports). A viewer must never be asked to
+// write on its input (§9 governing invariant), so setting them is stripped;
+// resetting them passes and is harmless.
+var replyModes = map[int]bool{2031: true, 2048: true}
+
+// csiRewrite extends csiPasses with the reply-triggering forms that need the
+// parameters to decide: a DECSET of a reply mode (removed from the parameter
+// list, and the sequence dropped when nothing is left), the kitty keyboard
+// flags query (CSI ? u), the modifier-options query (CSI ? Pp m), and the DEC
+// locator enable, select and request sequences (CSI … ' z, ' {, ' |). It
+// returns the content to emit and whether the sequence passes at all.
+func csiRewrite(content []byte, final byte) ([]byte, bool) {
+	if !csiPasses(content, final) {
+		return nil, false
+	}
+	private := len(content) > 0 && content[0] == '?'
+	switch {
+	case private && (final == 'u' || final == 'm'):
+		return nil, false // kitty keyboard / modifier-options query
+	case bytes.IndexByte(content, '\'') >= 0 && (final == 'z' || final == '{' || final == '|'):
+		return nil, false // DEC locator: enable, select events, request position
+	case private && final == 'h':
+		var kept []byte
+		dropped := false
+		for _, field := range bytes.Split(content[1:], []byte{';'}) {
+			if n, ok := leadingDigits(field); ok && replyModes[n] {
+				dropped = true
+				continue
+			}
+			if len(kept) > 0 {
+				kept = append(kept, ';')
+			}
+			kept = append(kept, field...)
+		}
+		if !dropped {
+			return content, true
+		}
+		if len(kept) == 0 {
+			return nil, false
+		}
+		return append([]byte{'?'}, kept...), true
+	}
+	return content, true
+}
+
+// leadingDigits parses the leading decimal digits of a parameter field
+// ("2048" or "2048:1").
+func leadingDigits(field []byte) (int, bool) {
+	n, i := 0, 0
+	for i < len(field) && field[i] >= '0' && field[i] <= '9' && n < 1<<20 {
+		n = n*10 + int(field[i]-'0')
+		i++
+	}
+	return n, i > 0
 }
 
 // --- DCS header -------------------------------------------------------------

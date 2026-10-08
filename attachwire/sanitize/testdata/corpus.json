@@ -360,6 +360,62 @@
     "spec_row": "dcs-sixel"
   },
   {
+    "name": "decset_inband_resize_strip",
+    "description": "setting ?2048 (in-band resize reports) is stripped: the terminal would write size reports on its input by itself",
+    "input": "G1s/MjA0OGhvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decset_color_scheme_reports_strip",
+    "description": "setting ?2031 (colour-scheme change reports) is stripped",
+    "input": "G1s/MjAzMWhvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decset_reply_mode_removed_from_mixed_set",
+    "description": "a reply mode is removed from a combined DECSET; the other modes still pass",
+    "input": "G1s/MTA0OTsyMDQ4OzIwMzE6MTsyNWg=",
+    "expected_output": "G1s/MTA0OTsyNWg=",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decrst_reply_modes_pass",
+    "description": "resetting ?2048 and ?2031 passes (it can only stop reports)",
+    "input": "G1s/MjA0ODsyMDMxbA==",
+    "expected_output": "G1s/MjA0ODsyMDMxbA==",
+    "disposition": "pass",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "dec_locator_requests_strip",
+    "description": "DEC locator enable (DECELR), select events (DECSLE) and request position (DECRQLP) are stripped",
+    "input": "G1sxOzEnehtbMSd7G1swJ3xvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "kitty_keyboard_query_strip",
+    "description": "the kitty keyboard flags query (CSI ? u) is stripped; push and pop pass",
+    "input": "G1s/dRtbPjF1G1s8dQ==",
+    "expected_output": "G1s+MXUbWzx1",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "modifier_options_query_strip",
+    "description": "the modifier-options query (CSI ? 4 m) is stripped; setting modifyOtherKeys (CSI \u003e 4 ; 2 m) passes",
+    "input": "G1s/NG0bWz40OzJt",
+    "expected_output": "G1s+NDsybQ==",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
     "name": "osc52_set_offered",
     "description": "an OSC 52 clipboard set is stripped from the stream and its decoded text is offered to the clipboard hook (bytes captured from a mouse-tracking REPL)",
     "input": "YRtdNTI7YztJQ0JHWVdKc1pTQTFMakVnd3JjZ1EyeGhkV1JsSUUxaGVBPT0HYg==",

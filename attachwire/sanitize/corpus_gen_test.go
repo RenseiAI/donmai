@@ -217,6 +217,36 @@ func corpusFixtures() []fixture {
 			"sixel_c1_reemitted_7bit", "a Sixel DCS with 8-bit introducer and ST passes in 7-bit form (ESC P ... ESC \\)",
 			"\x90q#0~\x9c", "\x1bPq#0~\x1b\\", "pass", "dcs-sixel",
 		},
+
+		// --- Modes and queries that make the terminal write on its own ---------
+		{
+			"decset_inband_resize_strip", "setting ?2048 (in-band resize reports) is stripped: the terminal would write size reports on its input by itself",
+			"\x1b[?2048hok", "ok", "strip", "reply-modes",
+		},
+		{
+			"decset_color_scheme_reports_strip", "setting ?2031 (colour-scheme change reports) is stripped",
+			"\x1b[?2031hok", "ok", "strip", "reply-modes",
+		},
+		{
+			"decset_reply_mode_removed_from_mixed_set", "a reply mode is removed from a combined DECSET; the other modes still pass",
+			"\x1b[?1049;2048;2031:1;25h", "\x1b[?1049;25h", "mixed", "reply-modes",
+		},
+		{
+			"decrst_reply_modes_pass", "resetting ?2048 and ?2031 passes (it can only stop reports)",
+			"\x1b[?2048;2031l", "\x1b[?2048;2031l", "pass", "reply-modes",
+		},
+		{
+			"dec_locator_requests_strip", "DEC locator enable (DECELR), select events (DECSLE) and request position (DECRQLP) are stripped",
+			"\x1b[1;1'z\x1b[1'{\x1b[0'|ok", "ok", "strip", "reply-modes",
+		},
+		{
+			"kitty_keyboard_query_strip", "the kitty keyboard flags query (CSI ? u) is stripped; push and pop pass",
+			"\x1b[?u\x1b[>1u\x1b[<u", "\x1b[>1u\x1b[<u", "mixed", "reply-modes",
+		},
+		{
+			"modifier_options_query_strip", "the modifier-options query (CSI ? 4 m) is stripped; setting modifyOtherKeys (CSI > 4 ; 2 m) passes",
+			"\x1b[?4m\x1b[>4;2m", "\x1b[>4;2m", "mixed", "reply-modes",
+		},
 	}
 }
 
