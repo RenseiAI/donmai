@@ -250,6 +250,28 @@ func (p *Provider) ensureStarted() error {
 	return p.startLocked(nil)
 }
 
+// ensureProbeStarted starts the app-server for a quota read. A
+// host-session provider first projects the host's CLI login into its
+// isolated home, as Spawn does in ensureHeadlessReady: an app-server
+// started without it has no login and refuses every read, which would
+// report a signed-in host as logged out. A host with no login file
+// fails here, before any read, so the probe records no verdict.
+func (p *Provider) ensureProbeStarted() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	select {
+	case <-p.shutdown:
+		return fmt.Errorf("%w: codex provider already shut down", agent.ErrProviderUnavailable)
+	default:
+	}
+	if p.hostAuthFile != "" && !p.started {
+		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
+			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrProviderUnavailable, err)
+		}
+	}
+	return p.startLocked(nil)
+}
+
 // startLocked starts and initializes the app-server. startMu must be held.
 //
 // sessionEnv is the agent.Spec.Env of the session whose Spawn/Resume triggered
@@ -362,6 +384,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 	if err := p.client.Notify("initialized", map[string]any{}); err != nil {
 		return p.failStartLocked(fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err))
 	}
+	p.forwardRateLimitUpdates()
 	p.started = true
 	// Freeze the layer the child actually received. maps.Clone defends against
 	// a caller mutating its own Spec.Env map after the Spawn returns, which
@@ -873,6 +896,44 @@ func (p *Provider) registerHandle(h *Handle) {
 	p.handlesMu.Lock()
 	p.handles[h] = struct{}{}
 	p.handlesMu.Unlock()
+}
+
+// forwardRateLimitUpdates routes `account/rateLimits/updated`
+// notifications into every live handle's event stream. The
+// notification carries no thread id, so the client's fall-through
+// handler is the only place it surfaces; each handle maps it through
+// the shared probe mapper onto a UsageEvent carrying the sparse
+// update. Delivery is non-blocking and best-effort: a handle whose
+// queue is full drops the update rather than stalling the client's
+// read loop, and the next probe reconciles whatever was missed.
+func (p *Provider) forwardRateLimitUpdates() {
+	if p == nil || p.client == nil {
+		return
+	}
+	client := p.client
+	client.SubscribeGlobal(func(n notification) {
+		if n.Method != "account/rateLimits/updated" {
+			// A fall-through handler replaces the client's own, which
+			// answers an unhandled server request with -32601 so codex
+			// does not wait on it. Keep that answer.
+			if len(n.ServerRequestID) > 0 {
+				_ = client.RespondToServerRequestWithError(n.ServerRequestID, -32601, "no handler for "+n.Method)
+			}
+			return
+		}
+		p.handlesMu.Lock()
+		live := make([]*Handle, 0, len(p.handles))
+		for h := range p.handles {
+			live = append(live, h)
+		}
+		p.handlesMu.Unlock()
+		for _, h := range live {
+			select {
+			case h.notifyCh <- n:
+			default:
+			}
+		}
+	})
 }
 
 func (p *Provider) unregisterHandle(h *Handle) {

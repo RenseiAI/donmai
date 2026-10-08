@@ -2,6 +2,7 @@ package clijsonl
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,14 +38,24 @@ const (
 	// from spawn). Claude runs the helper through a shell and requires a JSON
 	// object of string headers on stdout.
 	mcpGatewayHeadersHelper = `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE") || exit 1; printf '{"Authorization":"Bearer %s"}\n' "$token"` //nolint:unused // retained for compat
+
+	// mcpGatewayFallbackSuffix names the private sibling file, next to the
+	// config tmpfile, that holds the gateway entry's static bearer for the
+	// helper's fallback. removeMCPConfig deletes it with the config.
+	mcpGatewayFallbackSuffix = ".bearer"
 )
 
 // mcpGatewayHeadersHelperWithFallback returns a helper that tries the live file
-// first and falls back to staticBearer when absent/empty. staticBearer is the
-// raw token (no "Bearer " prefix), single-quote escaped for sh.
-func mcpGatewayHeadersHelperWithFallback(staticBearer string) string {
-	esc := strings.ReplaceAll(staticBearer, "'", "'\\''")
-	return `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE" 2>/dev/null); if [ -z "$token" ]; then token='` + esc + `'; fi; printf '{"Authorization":"Bearer %s"}\n' "$token"`
+// first and falls back to the static bearer stored in fallbackPath when the
+// live file is absent or empty.
+//
+// The helper text carries paths only, never bearer bytes. Claude runs the
+// helper as `sh -c <helper>`, so the text is that shell's argv, which any
+// local user can read via ps or /proc/<pid>/cmdline. cat receives only the
+// paths, and printf is a shell builtin, so the bearer never reaches an argv.
+func mcpGatewayHeadersHelperWithFallback(fallbackPath string) string {
+	esc := strings.ReplaceAll(fallbackPath, "'", "'\\''")
+	return `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE" 2>/dev/null); if [ -z "$token" ]; then token=$(cat -- '` + esc + `' 2>/dev/null); fi; printf '{"Authorization":"Bearer %s"}\n' "$token"`
 }
 
 // writeMCPConfig serializes Spec.MCPServers to a JSON tmpfile and
@@ -79,41 +90,64 @@ func writeMCPConfigWithEnv(servers []agent.MCPServerConfig, env map[string]strin
 	if err != nil {
 		return "", fmt.Errorf("provider/claude: build MCP config: %w", err)
 	}
-	preferLiveGatewayHeader(&cfg, servers, env)
-
-	body, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("provider/claude: marshal MCP config: %w", err)
-	}
 
 	f, err := os.CreateTemp("", "donmai-claude-mcp-*.json")
 	if err != nil {
 		return "", fmt.Errorf("provider/claude: create MCP tmpfile: %w", err)
 	}
-	closed := false
-	defer func() {
-		if !closed {
-			_ = f.Close()
-		}
-	}()
-
-	if _, err := f.Write(body); err != nil {
-		_ = f.Close()
-		_ = os.Remove(f.Name())
-		return "", fmt.Errorf("provider/claude: write MCP tmpfile: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(f.Name())
-		return "", fmt.Errorf("provider/claude: close MCP tmpfile: %w", err)
-	}
-	closed = true
-
 	abs, err := filepath.Abs(f.Name())
 	if err != nil {
+		_ = f.Close()
 		_ = os.Remove(f.Name())
 		return "", fmt.Errorf("provider/claude: resolve MCP tmpfile path: %w", err)
 	}
+	if err := writeMCPConfigBody(f, abs, &cfg, servers, env); err != nil {
+		_ = f.Close()
+		_ = removeMCPConfig(abs)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = removeMCPConfig(abs)
+		return "", fmt.Errorf("provider/claude: close MCP tmpfile: %w", err)
+	}
 	return abs, nil
+}
+
+// writeMCPConfigBody applies the live gateway header, stores the gateway's
+// static bearer in the private fallback file when the helper needs one, and
+// writes the config JSON to f, whose absolute path is path.
+func writeMCPConfigBody(f *os.File, path string, cfg *mcp.ConfigFile, servers []agent.MCPServerConfig, env map[string]string) error {
+	fallbackPath := path + mcpGatewayFallbackSuffix
+	if bearer := preferLiveGatewayHeader(cfg, servers, env, fallbackPath); bearer != "" {
+		if err := writeGatewayFallbackBearer(fallbackPath, bearer); err != nil {
+			return err
+		}
+	}
+	body, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("provider/claude: marshal MCP config: %w", err)
+	}
+	if _, err := f.Write(body); err != nil {
+		return fmt.Errorf("provider/claude: write MCP tmpfile: %w", err)
+	}
+	return nil
+}
+
+// writeGatewayFallbackBearer creates path owner-only and writes bearer to it.
+// O_EXCL refuses a file that already exists at the path.
+func writeGatewayFallbackBearer(path, bearer string) error {
+	fb, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: path derives from our own CreateTemp name
+	if err != nil {
+		return fmt.Errorf("provider/claude: create MCP gateway fallback file: %w", err)
+	}
+	if _, err := fb.WriteString(bearer); err != nil {
+		_ = fb.Close()
+		return fmt.Errorf("provider/claude: write MCP gateway fallback file: %w", err)
+	}
+	if err := fb.Close(); err != nil {
+		return fmt.Errorf("provider/claude: close MCP gateway fallback file: %w", err)
+	}
+	return nil
 }
 
 // refuseUnrealizedProtectedHeadersHelper fails closed when a server carries
@@ -138,14 +172,17 @@ func refuseUnrealizedProtectedHeadersHelper(servers []agent.MCPServerConfig) err
 // preferLiveGatewayHeader changes only the runner-authored gateway entry. The
 // runner guarantees that entry leads the MCP list; the remaining shape checks
 // keep a caller-supplied first server from being rewritten accidentally.
-func preferLiveGatewayHeader(cfg *mcp.ConfigFile, servers []agent.MCPServerConfig, env map[string]string) {
+//
+// When it installs the helper it returns the static bearer the helper falls
+// back to, which the caller must store at fallbackPath. Otherwise it returns "".
+func preferLiveGatewayHeader(cfg *mcp.ConfigFile, servers []agent.MCPServerConfig, env map[string]string, fallbackPath string) string {
 	if cfg == nil || len(servers) == 0 || strings.TrimSpace(env[mcpGatewayFileEnv]) == "" {
-		return
+		return ""
 	}
 
 	gateway := servers[0]
 	if gateway.Type != "http" || !strings.HasSuffix(gateway.Name, "-platform") {
-		return
+		return ""
 	}
 
 	authorizationKey := ""
@@ -158,12 +195,12 @@ func preferLiveGatewayHeader(cfg *mcp.ConfigFile, servers []agent.MCPServerConfi
 		}
 	}
 	if authorizationKey == "" || strings.TrimSpace(staticValue) == "" {
-		return
+		return ""
 	}
 
 	entry, ok := cfg.MCPServers[gateway.Name]
 	if !ok || entry.Type != "http" {
-		return
+		return ""
 	}
 	if len(entry.Headers) == 1 {
 		entry.Headers = nil
@@ -176,20 +213,26 @@ func preferLiveGatewayHeader(cfg *mcp.ConfigFile, servers []agent.MCPServerConfi
 		}
 		entry.Headers = headers
 	}
-	entry.HeadersHelper = mcpGatewayHeadersHelperWithFallback(staticValue)
+	entry.HeadersHelper = mcpGatewayHeadersHelperWithFallback(fallbackPath)
 	cfg.MCPServers[gateway.Name] = entry
+	return staticValue
 }
 
-// removeMCPConfig deletes the tmpfile written by writeMCPConfig.
-// Idempotent: missing file returns nil. Empty path returns nil.
+// removeMCPConfig deletes the tmpfile written by writeMCPConfig and its
+// gateway fallback file, if any.
+// Idempotent: missing files return nil. Empty path returns nil.
 func removeMCPConfig(path string) error {
 	if path == "" {
 		return nil
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("provider/claude: remove MCP tmpfile: %w", err)
+	var errs []error
+	if err := os.Remove(path + mcpGatewayFallbackSuffix); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("provider/claude: remove MCP gateway fallback file: %w", err))
 	}
-	return nil
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("provider/claude: remove MCP tmpfile: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 // WriteMCPConfig is the exported wrapper for writeMCPConfig, allowing

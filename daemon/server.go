@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -707,6 +708,7 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 //
 //	GET  /api/daemon/sessions/<id>       → handleSessionDetail
 //	POST /api/daemon/sessions/<id>/stop  → handleSessionStop
+//	POST /api/daemon/sessions/<id>/usage → handleSessionUsage
 //
 // A single prefix handler is used because the stdlib mux only supports
 // prefix matching pre-Go 1.22 in this codebase. The path tail is parsed
@@ -718,13 +720,61 @@ func (s *Server) handleSessionSubroute(w http.ResponseWriter, r *http.Request) {
 		s.handleSessionStop(w, r, id)
 		return
 	}
+	if id, ok := strings.CutSuffix(tail, "/usage"); ok {
+		s.handleSessionUsage(w, r, id)
+		return
+	}
 	s.handleSessionDetail(w, r, tail)
+}
+
+// sessionDetailAuthenticated reports whether r carries a credential that
+// authorizes the full session-detail payload for id: the operator control
+// token (or the local protected-operator alternative the mutating gate
+// already honors), or the per-session read credential the daemon stated in
+// the spawned worker's environment at accept time. An empty id never
+// authenticates.
+func (s *Server) sessionDetailAuthenticated(r *http.Request, id string) bool {
+	if s.daemon == nil || id == "" {
+		return false
+	}
+	mode, want := controlAuthState(s.daemon)
+	if mode == controlAuthOpen {
+		// Legacy open mode (tests, harnesses): no credential exists to
+		// check, so the detail read stays available.
+		return true
+	}
+	bearer := controlBearer(r)
+	if bearer == "" {
+		return false
+	}
+	if mode == controlAuthEnforced {
+		if subtle.ConstantTimeCompare([]byte(bearer), []byte(want)) == 1 {
+			return true
+		}
+		if local := s.daemon.localRuntime.Load(); local != nil && local.auth != nil &&
+			local.auth.VerifyOperator(bearer) == nil {
+			return true
+		}
+	}
+	// controlAuthUnavailable falls through: no operator credential
+	// exists to present, so only the per-session credential can pass.
+	if store := s.daemon.sessionDetails; store != nil {
+		return store.verifySessionReadToken(id, bearer)
+	}
+	return false
 }
 
 // handleSessionDetail handles GET /api/daemon/sessions/<id> — the
 // detail endpoint a spawned `donmai agent run` process reads on startup
 // to recover its full QueuedWork shape. Localhost-only (the daemon
 // binds to 127.0.0.1); 404s on unknown ids; 405s on non-GET methods.
+//
+// The payload carries per-session credentials, so the read is gated:
+// a caller presenting the operator control token (or the local
+// protected-operator alternative) receives the full detail, while any
+// other caller receives the same shape with every credential field
+// cleared. Unknown ids 404 before either branch so the gate never
+// confirms or denies the existence of a session it cannot name.
 //
 // (F.2.8 — daemon wire-up.)
 func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id string) {
@@ -763,6 +813,10 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id 
 	projected := *detail
 	if key, found := s.daemon.sessionResumeKey(projected.SessionID, projected.OrganizationID); found {
 		projected.ResumeKey = key
+	}
+	if !s.sessionDetailAuthenticated(r, id) {
+		writeJSON(w, http.StatusOK, redactSessionDetail(&projected))
+		return
 	}
 	writeJSON(w, http.StatusOK, &projected)
 }

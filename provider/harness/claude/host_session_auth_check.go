@@ -44,6 +44,14 @@ func CheckHostSessionLogin(ctx context.Context, binary string) error {
 		return fmt.Errorf("%w: Claude host login home is unavailable", agent.ErrProviderUnavailable)
 	}
 	env := []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "NO_COLOR=1"}
+	// The login status child reads the keychain-backed login on macOS,
+	// which needs USER to locate the operator's login item. Without it
+	// a signed-in host reports logged-out, and a quota probe built on
+	// this check would record ok:false every interval. USER carries no
+	// credential material, only the account name the login already names.
+	if user, present := os.LookupEnv("USER"); present && user != "" {
+		env = append(env, "USER="+user)
+	}
 	for _, name := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
 		if value, present := os.LookupEnv(name); present && value != "" {
 			if !filepath.IsAbs(value) {
