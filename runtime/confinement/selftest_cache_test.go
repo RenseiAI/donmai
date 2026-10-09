@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 var bothModes = []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}
@@ -64,6 +66,116 @@ func (cw cacheWorld) seed(t *testing.T, testedAt time.Time) (selfTestCache, Self
 	record.Digest = record.computeDigest()
 	slot.save(record)
 	return slot, record
+}
+
+// writeProvenFileForTest plants one proven-record file under dir without
+// going through recordProvenSelfTest's whole-record gate, so the test can
+// prove LatestProvenRecord refuses shapes the recorder never writes (a
+// degraded file smuggled onto disk, a wrong version, a tampered digest).
+func writeProvenFileForTest(t *testing.T, dir string, name string, file provenSelfTestFile) {
+	t.Helper()
+	raw, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProvenRecord_StatusReadsWhatSeatsProved pins the status path's
+// evidence seam on every host: a passing, whole record recorded through
+// recordProvenSelfTest reads back through LatestProvenRecord, while a
+// degraded record, a failing record, a tampered digest, and an empty
+// directory read back as no evidence. Deleting the degraded or digest
+// checks in LatestProvenRecord turns this test red.
+func TestProvenRecord_StatusReadsWhatSeatsProved(t *testing.T) {
+	base := t.TempDir()
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+
+	passing := SelfTestRecord{
+		Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+		ExecutableDigest: "sha256:test",
+		SessionModes:     bothModes, Passed: true,
+		Probes: []ProbeOutcome{{ID: "p", Pass: true}}, TestedAt: time.Now().UTC(),
+	}
+	passing.Digest = passing.computeDigest()
+	recordProvenSelfTest(passing)
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != passing.Digest {
+		t.Fatalf("LatestProvenRecord = %+v, %v; want the proven %s", latest, ok, passing.Digest)
+	}
+	// A degraded record proves a partial boundary only: recording it
+	// keeps no evidence, so the previous whole record still reads back —
+	// and a degraded file smuggled onto disk is refused as well.
+	degraded := passing
+	degraded.Degraded = "the scope layer is unenforced"
+	degraded.SessionModes = nil
+	degraded.Digest = degraded.computeDigest()
+	recordProvenSelfTest(degraded)
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != passing.Digest {
+		t.Fatalf("LatestProvenRecord after a degraded record = %+v, %v; want the whole %s", latest, ok, passing.Digest)
+	}
+	if dir := latestSelfTestCacheDir(); dir == "" {
+		t.Fatal("latestSelfTestCacheDir is empty; want the shared proven directory")
+	} else {
+		// The smuggled file keeps its session modes: only the Degraded
+		// check refuses it. (A degraded record that dropped its modes
+		// is already refused by the empty-modes check.)
+		modesKept := degraded
+		modesKept.SessionModes = bothModes
+		// Newer than the whole record, so without the Degraded check
+		// it would win the latest-pick and read back as evidence.
+		modesKept.TestedAt = passing.TestedAt.Add(time.Hour)
+		modesKept.Digest = modesKept.computeDigest()
+		writeProvenFileForTest(t, dir, "proven-smuggled.json", provenSelfTestFile{Version: provenSelfTestFileVersion, Record: modesKept})
+		if latest, ok := LatestProvenRecord(); !ok || latest.Digest != passing.Digest {
+			t.Fatalf("LatestProvenRecord with a smuggled degraded file = %+v, %v; want only the whole %s", latest, ok, passing.Digest)
+		}
+		if err := os.Remove(filepath.Join(dir, "proven-smuggled.json")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A failing record proves nothing either.
+	failing := passing
+	failing.Passed = false
+	failing.Digest = failing.computeDigest()
+	recordProvenSelfTest(failing)
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != passing.Digest {
+		t.Fatalf("LatestProvenRecord after a failing record = %+v, %v; want the whole %s", latest, ok, passing.Digest)
+	}
+	// A tampered file is not evidence: the digest no longer covers it.
+	if dir := latestSelfTestCacheDir(); dir == "" {
+		t.Fatal("latestSelfTestCacheDir is empty; want the shared proven directory")
+	} else if entries, err := os.ReadDir(dir); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), "proven-") {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var file provenSelfTestFile
+			if err := json.Unmarshal(raw, &file); err != nil {
+				t.Fatal(err)
+			}
+			file.Record.Probes = append(file.Record.Probes, ProbeOutcome{ID: "q"})
+			raw, err = json.Marshal(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, ok := LatestProvenRecord(); ok {
+		t.Fatal("LatestProvenRecord reads a tampered file as evidence")
+	}
 }
 
 // TestSelfTest_ReusesACachedPassingRecord: a later process on the same host
