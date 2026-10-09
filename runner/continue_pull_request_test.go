@@ -984,3 +984,209 @@ func TestBuildSteeringPrompt_ContinueModePushesToHeadBranch(t *testing.T) {
 		t.Fatalf("steering prompt must never open a new pull request:\n%s", got)
 	}
 }
+
+// TestRun_ContinueModeDraftAllowedByPolicyIsDelivered proves the draft
+// allowance through the production entry point: a draft continued pull
+// request carrying the run's own new commit counts as delivered when the
+// dispatch declared it, while the no-new-commit and code-change checks
+// still apply. It drives Run, the production entry point, not a helper.
+func TestRun_ContinueModeDraftAllowedByPolicyIsDelivered(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		delivery:       &prompt.DeliveryPolicy{AllowDraft: true},
+		draft:          func(context.Context, string, string) (bool, error) { return true, nil },
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed for a draft allowed by policy", res.Status, res.FailureMode, res.Error)
+	}
+	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("PullRequestURL = %q; want the continued pull request", res.PullRequestURL)
+	}
+	// The commit really landed on the continued head: the draft rule,
+	// not a missing commit, is what the policy waives.
+	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+		t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+	}
+}
+
+// TestRun_ContinueModeDraftAllowedByPolicyStillNeedsANewCommit proves the
+// allowance is narrow: a draft continued pull request with no new commit
+// since dispatch still ends not delivered. The draft check is waived; the
+// new-commit check is not.
+func TestRun_ContinueModeDraftAllowedByPolicyStillNeedsANewCommit(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		delivery:       &prompt.DeliveryPolicy{AllowDraft: true},
+		draft:          func(context.Context, string, string) (bool, error) { return true, nil },
+		turns:          []verdictScriptTurn{{text: "nothing to do"}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	}
+	if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+}
+
+// TestRun_ContinueModeMergeAllowedByPolicyDelivers proves the merge
+// allowance through the production entry point: a run whose only change
+// since dispatch is merging the base branch — with its own conflict
+// resolution on the merge — counts as delivered when the dispatch
+// declared it. Without the flag the same head fails as merge-only.
+func TestRun_ContinueModeMergeAllowedByPolicyDelivers(t *testing.T) {
+	mergeWithResolution := func(t *testing.T, cwd string) {
+		advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12", "refs/pull/12/head")
+		// Give the merge its own resolution: a file that exists on
+		// neither parent, committed as part of the merge commit.
+		writeFile(t, cwd, "resolved.txt", "resolution\n")
+		gitRun(t, cwd, "add", "resolved.txt")
+		gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
+		gitRun(t, cwd, "push", "-q", "-f", "origin", "HEAD:refs/heads/continued/pr-12", "HEAD:refs/pull/12/head")
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		delivery:       &prompt.DeliveryPolicy{AllowMergeCommits: true},
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during:   mergeWithResolution,
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed for a merge allowed by policy", res.Status, res.FailureMode, res.Error)
+	}
+	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("PullRequestURL = %q; want the continued pull request", res.PullRequestURL)
+	}
+}
+
+// TestRun_ContinueModeMergeWithoutPolicyStillFails proves the merge
+// allowance is opt-in: the same merge-with-resolution head that delivers
+// under the flag fails as merge-only without it.
+func TestRun_ContinueModeMergeWithoutPolicyStillFails(t *testing.T) {
+	mergeWithResolution := func(t *testing.T, cwd string) {
+		advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12", "refs/pull/12/head")
+		writeFile(t, cwd, "resolved.txt", "resolution\n")
+		gitRun(t, cwd, "add", "resolved.txt")
+		gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
+		gitRun(t, cwd, "push", "-q", "-f", "origin", "HEAD:refs/heads/continued/pr-12", "HEAD:refs/pull/12/head")
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during:   mergeWithResolution,
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	}
+	if want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"; res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+}
+
+// TestInspectContinueRangeDeliversUnderPolicy pins the merge allowance at
+// the inspection level: a merge carrying its own resolution delivers
+// under the flag and not without it, while a merge that only absorbed
+// the base branch never delivers and scratch still blocks.
+func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
+	const branch = "continued/pr-12"
+	allowMerges := &prompt.DeliveryPolicy{AllowMergeCommits: true}
+	cases := []struct {
+		name    string
+		arrange func(t *testing.T) (repo, startHead, newHead string)
+		// wantWithout is delivers() (today's behaviour); wantWith is
+		// deliversUnder with the merge allowance.
+		wantWithout bool
+		wantWith    bool
+	}{
+		{
+			name: "merge with its own resolution",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
+				// The merge's own resolution: a file on neither parent.
+				writeFile(t, repo, "resolved.txt", "resolution\n")
+				gitRun(t, repo, "add", "resolved.txt")
+				gitRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+			wantWith: true,
+		},
+		{
+			name: "merge only absorbing the base",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+		},
+		{
+			name: "code commit still delivers either way",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				newHead = commitFixtureFiles(t, repo, map[string]string{"fix.go": "package fix\n"}, "code change")
+				return repo, startHead, newHead
+			},
+			wantWithout: true,
+			wantWith:    true,
+		},
+		{
+			name: "merge resolution plus scratch still blocked",
+			arrange: func(t *testing.T) (repo, startHead, newHead string) {
+				_, repo = backstopRemoteFixture(t)
+				startHead = continueFixtureBranch(t, repo, branch)
+				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
+				writeFile(t, repo, "resolved.txt", "resolution\n")
+				writeFile(t, repo, ".scratch/notes.md", "notes\n")
+				gitRun(t, repo, "add", "-f", "resolved.txt", ".scratch/notes.md")
+				gitRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
+				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, startHead, newHead := tc.arrange(t)
+			got, err := inspectContinueRange(context.Background(), repo, branch, startHead, newHead)
+			if err != nil {
+				t.Fatalf("inspectContinueRange: %v", err)
+			}
+			if got.delivers() != tc.wantWithout {
+				t.Errorf("delivers() = %v; want %v (%+v)", got.delivers(), tc.wantWithout, got)
+			}
+			if got.deliversUnder(nil) != tc.wantWithout {
+				t.Errorf("deliversUnder(nil) = %v; want today's %v (%+v)", got.deliversUnder(nil), tc.wantWithout, got)
+			}
+			if got.deliversUnder(allowMerges) != tc.wantWith {
+				t.Errorf("deliversUnder(allow-merges) = %v; want %v (%+v)", got.deliversUnder(allowMerges), tc.wantWith, got)
+			}
+		})
+	}
+}

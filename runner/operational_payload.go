@@ -44,7 +44,7 @@ type OperationalPayload struct {
 // receipt producers and the runner verifier. It is never persisted as evidence;
 // only its canonical digest belongs in an AdmissionReceipt.
 func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
-	return OperationalPayload{
+	projected := OperationalPayload{
 		QueuedWork:            qw.QueuedWork,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
 		WorkareaMode:          qw.WorkareaMode,
@@ -61,6 +61,15 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		PermissionProfile:     qw.PermissionProfile,
 		ExecutionSecurity:     qw.ExecutionSecurity.Clone(),
 	}
+	// The embedded QueuedWork copy aliases the dispatch-declared
+	// delivery policy pointer: clone it so mutating the projection
+	// cannot move the queued work it was projected from (the SeatBudget
+	// Clone above exists for the same reason).
+	if qw.Delivery != nil {
+		cloned := *qw.Delivery
+		projected.Delivery = &cloned
+	}
+	return projected
 }
 
 var (

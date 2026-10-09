@@ -1721,8 +1721,12 @@ tailRecovery:
 	// draft. A no-new-commit continue run (and a draft) must NOT read as
 	// delivered: fail the session instead of ending completed against an
 	// unchanged head, mirroring the verifier's no-new-commit/draft rules.
-	// Runs only when no failure was already recorded, so a runner-authored
-	// refusal (divergence, provision) keeps its own typed reason.
+	// Under a dispatch-declared delivery policy the draft check is
+	// skipped when the policy allows drafts, and the code-change check
+	// counts merge resolutions when the policy allows merges; every
+	// other check still applies. Runs only when no failure was already
+	// recorded, so a runner-authored refusal (divergence, provision)
+	// keeps its own typed reason.
 	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType) && res.FailureMode == "" && budgetStop == nil {
 		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
@@ -1749,6 +1753,7 @@ tailRecovery:
 				if headMoved {
 					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, continuePullRequestBranch(qw.ContinuePullRequest), startHead, localHead)
 				}
+				draftBlocks := draftErr == nil && draft && !qw.Delivery.AllowsDraft()
 				switch {
 				case inspectErr != nil:
 					res.Status = "failed"
@@ -1758,7 +1763,7 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d commits scratch paths since dispatch: %s", qw.ContinuePullRequest.Number, strings.Join(inspection.scratchPaths, ", "))
-				case draftErr == nil && draft:
+				case draftBlocks:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
@@ -1770,7 +1775,7 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
-				case !inspection.delivers():
+				case !inspection.deliversUnder(qw.Delivery):
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
