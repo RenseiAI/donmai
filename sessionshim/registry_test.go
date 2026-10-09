@@ -698,6 +698,101 @@ func TestHeadlessExitValidationPinsKnownCauses(t *testing.T) {
 	}
 }
 
+// TestHeadlessExitCausesAreExactlyTheContractSet pins the one closed cause
+// registry the tombstone and the wire share (session-shim v6 §4): exactly
+// completed, orphaned, stopped_for_resume and shim_failure. Every contract
+// value is accepted by both the durable tombstone validator and the wire
+// decoder; every other name, including each cause an earlier draft of the
+// wire codec carried, is refused by both. The outbox-state coupling rides the
+// same registry: none is valid only beside stopped_for_resume.
+func TestHeadlessExitCausesAreExactlyTheContractSet(t *testing.T) {
+	t.Parallel()
+
+	contract := []string{"completed", "orphaned", "stopped_for_resume", "shim_failure"}
+	if got := []HeadlessExitCause{HeadlessExitCompleted, HeadlessExitOrphaned, HeadlessExitStoppedForResume, HeadlessExitShimFailure}; len(got) != len(contract) {
+		t.Fatalf("registry names %d causes, contract names %d", len(got), len(contract))
+	} else {
+		for i, cause := range got {
+			if string(cause) != contract[i] {
+				t.Fatalf("registry cause %d = %q, contract says %q", i, cause, contract[i])
+			}
+		}
+	}
+	refused := []string{
+		"", "failed", "cancelled", "lost_ownership", "worker_exited_without_result",
+		"exited", "stopped", "Completed", "COMPLETED", "interactive", "headless",
+	}
+
+	id := testIdentity()
+	tombstone := func(cause HeadlessExitCause, state HeadlessOutboxState) Tombstone {
+		tomb := Tombstone{
+			SchemaVersion: HeadlessRecordSchemaVersion, Workload: WorkloadHeadless,
+			OrgID: id.OrgID, SessionID: id.SessionID,
+			ShimID: "shim-1", ProcessEpoch: 1, HarnessPID: 4242, HarnessStartedAt: 17,
+			LastSeq: 1, GroupReaped: true,
+			Cause: cause, OutboxState: state, OutboxKey: "org/sess/attempt-1",
+			ObservedAtUnixNano: time.Now().UnixNano(),
+		}
+		if state == HeadlessOutboxNone {
+			tomb.OutboxKey = ""
+		}
+		return tomb
+	}
+	wire := func(cause HeadlessExitCause, state HeadlessOutboxState) error {
+		exit := shimwire.HeadlessExit{
+			Seq: 1, ProcessEpoch: 1, GroupReaped: true, Cause: cause,
+			OutboxKey: "org/sess/attempt-1", OutboxState: state, ObservedAt: 1760000000000000000,
+		}
+		if state == HeadlessOutboxNone {
+			exit.OutboxKey = ""
+		}
+		body, err := json.Marshal(exit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = shimwire.DecodeHeadlessExit(body)
+		return err
+	}
+
+	for _, name := range contract {
+		cause := HeadlessExitCause(name)
+		state := HeadlessOutboxDelivered
+		if cause == HeadlessExitStoppedForResume {
+			state = HeadlessOutboxNone
+		}
+		if !cause.Known() {
+			t.Fatalf("contract cause %q is not in the registry", name)
+		}
+		if err := tombstone(cause, state).Validate(); err != nil {
+			t.Fatalf("tombstone with contract cause %q = %v, want valid", name, err)
+		}
+		if err := wire(cause, state); err != nil {
+			t.Fatalf("wire HeadlessExit with contract cause %q = %v, want valid", name, err)
+		}
+	}
+	for _, name := range refused {
+		cause := HeadlessExitCause(name)
+		if cause.Known() {
+			t.Fatalf("non-contract cause %q is in the registry", name)
+		}
+		if err := tombstone(cause, HeadlessOutboxDelivered).Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("tombstone with non-contract cause %q = %v, want ErrRecordInvalid", name, err)
+		}
+		if err := wire(cause, HeadlessOutboxDelivered); !errors.Is(err, shimwire.ErrMalformed) {
+			t.Fatalf("wire HeadlessExit with non-contract cause %q = %v, want ErrMalformed", name, err)
+		}
+	}
+	for _, name := range []string{"completed", "orphaned", "shim_failure"} {
+		cause := HeadlessExitCause(name)
+		if err := tombstone(cause, HeadlessOutboxNone).Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("tombstone %q with outbox none = %v, want ErrRecordInvalid", name, err)
+		}
+		if err := wire(cause, HeadlessOutboxNone); !errors.Is(err, shimwire.ErrMalformed) {
+			t.Fatalf("wire HeadlessExit %q with outbox none = %v, want ErrMalformed", name, err)
+		}
+	}
+}
+
 // TestInteractiveTombstoneRefusesHeadlessMembers pins the profile boundary
 // on the tombstone contract: an interactive tombstone carrying any headless
 // exit member — cause, outbox key, or outbox state — is refused, so a
