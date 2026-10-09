@@ -469,7 +469,7 @@ func (r *Runner) dispatchInteractive(
 		case <-isess.Done():
 			// Child exited and the PTY drained to EOF (Exit emitted). Deliver
 			// the handle's trailing activity before the session-ended marker.
-			r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink)
+			r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink, res)
 			return r.finishInteractive(worktreePath, qw, res, sink, isess), nil
 
 		case <-interactiveCtx.Done():
@@ -499,8 +499,13 @@ func (r *Runner) dispatchInteractive(
 			// Sparse quota updates merge onto the daemon's probe
 			// snapshot like the headless lane's; they carry no
 			// transcript content, so only the quota hook observes
-			// them here.
+			// them here. The terminal ResultEvent can also arrive on
+			// this branch (a steady-state select win before Done is
+			// observed): its cost is applied like the drain does, so
+			// the session result is costed whichever branch sees it
+			// first. Double observation merges idempotently.
 			r.reportQuotaEvent(interactiveCtx, qw.SessionID, event)
+			r.applyInteractiveTerminalEvent(event, res)
 			r.forwardInteractiveHandleEvent(interactiveCtx, worktreePath, sink, event)
 
 		case err := <-attachDone:
@@ -613,6 +618,17 @@ func (r *Runner) recordAttachLoss(qw QueuedWork, res *Result, err error) {
 // signals; the session still finishes, just without that activity.
 const interactiveActivityFlushGrace = 5 * time.Second
 
+// interactiveTerminalEventGrace bounds the post-flush wait for the
+// handle's terminal ResultEvent after the PTY session is Done. It must
+// cover run()'s post-exit work before the terminal send: the shim finalize
+// wait (the shim's own finalize bound plus scheduling slack), the exit
+// read, the session-file cost read, and cleanup. The shim bound is at most
+// 2×5s courtesy windows (sessionshim.maxFinalizeWaitBound); the grace adds
+// scheduling slack on top, so a slow host still observes the contractually
+// promised event instead of timing out on it. Waiting longer than needed
+// only delays the session result; returning early loses the token cost.
+const interactiveTerminalEventGrace = 12 * time.Second
+
 // forwardInteractiveHandleEvent posts the handle events an interactive session
 // surfaces as activity: the typed harness-state-loss condition and, for
 // harnesses that tail their own transcript (interactive pi), assistant turns,
@@ -633,8 +649,24 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 // drainInteractiveActivity runs once the PTY session is Done. A handle that
 // implements agent.InteractiveActivityFlusher enqueues its final activity
 // after Done, so keep forwarding events until it signals the flush (bounded
-// by interactiveActivityFlushGrace); then forward whatever is already
-// buffered without waiting. events may be nil (already closed).
+// by interactiveActivityFlushGrace); then the handle's terminal ResultEvent
+// is awaited (bounded by interactiveTerminalEventGrace) — see below.
+//
+// The handle's terminal ResultEvent is consumed here too — not forwarded as
+// activity, but applied to the session result: a harness whose interactive
+// surface emits no structured usage of its own attaches its real totals (for
+// example read from its native session file at child exit) as that event's
+// cost, and this is what carries them onto the terminal result. A nil cost
+// keeps whatever the result already carries.
+//
+// The channel contract is: run() sends the terminal ResultEvent strictly
+// after the PTY session's Done fires, then closes the channel. The Done
+// branch runs the instant Done closes — before run()'s post-exit work
+// (shim finalize wait, exit read, session-file cost read, cleanup) has sent
+// anything — so a non-blocking drain would return on the still-empty channel
+// and lose the terminal event. The post-flush tail therefore WAITS for the
+// terminal ResultEvent (or channel close) bounded by
+// interactiveTerminalEventGrace, instead of returning on an empty read.
 func (r *Runner) drainInteractiveActivity(
 	ctx context.Context,
 	handle agent.Handle,
@@ -642,6 +674,7 @@ func (r *Runner) drainInteractiveActivity(
 	worktreePath string,
 	qw QueuedWork,
 	sink activitySink,
+	res *Result,
 ) {
 	if flusher, ok := handle.(agent.InteractiveActivityFlusher); ok {
 		grace := time.NewTimer(interactiveActivityFlushGrace)
@@ -654,6 +687,7 @@ func (r *Runner) drainInteractiveActivity(
 					return
 				}
 				r.reportQuotaEvent(ctx, qw.SessionID, event)
+				r.applyInteractiveTerminalEvent(event, res)
 				r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
 			case <-flusher.ActivityFlushed():
 				break wait
@@ -664,6 +698,15 @@ func (r *Runner) drainInteractiveActivity(
 			}
 		}
 	}
+	// After the flush (or for a handle with no flush), the terminal
+	// ResultEvent is still in flight: run() sends it only after its
+	// post-exit work, which starts the instant Done fires. Block for it
+	// (or channel close) bounded by interactiveTerminalEventGrace so the
+	// event run() is contractually about to send is always observed.
+	// A ResultEvent already consumed on the steady-state branch merges
+	// idempotently below, so observing it here too is safe.
+	grace := time.NewTimer(interactiveTerminalEventGrace)
+	defer grace.Stop()
 	for {
 		select {
 		case event, ok := <-events:
@@ -671,11 +714,59 @@ func (r *Runner) drainInteractiveActivity(
 				return
 			}
 			r.reportQuotaEvent(ctx, qw.SessionID, event)
+			r.applyInteractiveTerminalEvent(event, res)
 			r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
-		default:
+			if _, terminal := event.(agent.ResultEvent); terminal {
+				return
+			}
+		case <-grace.C:
+			r.logger.Warn("[interactive] terminal ResultEvent did not arrive within the grace — finishing without it",
+				"sessionId", qw.SessionID, "grace", interactiveTerminalEventGrace)
 			return
 		}
 	}
+}
+
+// applyInteractiveTerminalEvent carries a harness-reported terminal cost
+// onto the session result. Interactive sessions never flow through the
+// budget enforcer (human think-time is not metered), so without this the
+// totals a handle attaches to its terminal ResultEvent would be observed
+// for quota and dropped for billing.
+func (r *Runner) applyInteractiveTerminalEvent(event agent.Event, res *Result) {
+	if res == nil {
+		return
+	}
+	result, ok := event.(agent.ResultEvent)
+	if !ok || result.Cost == nil {
+		return
+	}
+	if res.Cost == nil {
+		res.Cost = result.Cost
+		return
+	}
+	merged := *res.Cost
+	if result.Cost.InputTokens > merged.InputTokens {
+		merged.InputTokens = result.Cost.InputTokens
+	}
+	if result.Cost.OutputTokens > merged.OutputTokens {
+		merged.OutputTokens = result.Cost.OutputTokens
+	}
+	if result.Cost.CachedInputTokens > merged.CachedInputTokens {
+		merged.CachedInputTokens = result.Cost.CachedInputTokens
+	}
+	if result.Cost.CacheWriteTokens > merged.CacheWriteTokens {
+		merged.CacheWriteTokens = result.Cost.CacheWriteTokens
+	}
+	if result.Cost.ReasoningTokens > merged.ReasoningTokens {
+		merged.ReasoningTokens = result.Cost.ReasoningTokens
+	}
+	if result.Cost.TotalCostUsd > merged.TotalCostUsd {
+		merged.TotalCostUsd = result.Cost.TotalCostUsd
+	}
+	if result.Cost.NumTurns > merged.NumTurns {
+		merged.NumTurns = result.Cost.NumTurns
+	}
+	res.Cost = &merged
 }
 
 // postInteractiveActivity emits ONE coarse, low-cadence lifecycle signal:

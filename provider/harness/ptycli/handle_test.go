@@ -351,3 +351,106 @@ func TestEnvSlice_StripsRunnerOnlyControls(t *testing.T) {
 		t.Fatalf("envSlice leaked runner-only controls: got %v, want %v", got, want)
 	}
 }
+
+func TestSpawnWithOptions_TerminalCostAttachesToSuccessResult(t *testing.T) {
+	t.Parallel()
+	requireShell(t)
+
+	want := &agent.CostData{InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20}
+	h, err := SpawnWithOptions(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
+		Cwd:         t.TempDir(),
+		Interactive: &agent.InteractiveSpec{},
+	}, ptyNoticeManifest(), SpawnOptions{TerminalCost: func() *agent.CostData { return want }})
+	if err != nil {
+		t.Fatalf("SpawnWithOptions: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	evs := collectEvents(t, h)
+	if len(evs) != 2 {
+		t.Fatalf("expected exactly 2 events (Init, Result), got %d: %#v", len(evs), evs)
+	}
+	res, ok := evs[1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("event[1] = %#v, want ResultEvent", evs[1])
+	}
+	if !res.Success {
+		t.Fatalf("ResultEvent.Success = false, want true: %#v", res)
+	}
+	if res.Cost == nil || *res.Cost != *want {
+		t.Fatalf("ResultEvent.Cost = %+v, want %+v", res.Cost, want)
+	}
+}
+
+func TestSpawnWithOptions_TerminalCostAttachesToFailureResult(t *testing.T) {
+	t.Parallel()
+	requireShell(t)
+
+	want := &agent.CostData{InputTokens: 10, OutputTokens: 5}
+	h, err := SpawnWithOptions(context.Background(), "sh", []string{"-c", "exit 7"}, agent.Spec{
+		Cwd:         t.TempDir(),
+		Interactive: &agent.InteractiveSpec{},
+	}, ptyNoticeManifest(), SpawnOptions{TerminalCost: func() *agent.CostData { return want }})
+	if err != nil {
+		t.Fatalf("SpawnWithOptions: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	evs := collectEvents(t, h)
+	res, ok := evs[1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("event[1] = %#v, want ResultEvent", evs[1])
+	}
+	if res.Success || res.ErrorSubtype != "nonzero_exit" {
+		t.Fatalf("expected a nonzero_exit failure, got %#v", res)
+	}
+	if res.Cost == nil || *res.Cost != *want {
+		t.Fatalf("ResultEvent.Cost = %+v, want %+v", res.Cost, want)
+	}
+}
+
+func TestSpawnWithOptions_NilTerminalCostKeepsBareResult(t *testing.T) {
+	t.Parallel()
+	requireShell(t)
+
+	h, err := SpawnWithOptions(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
+		Cwd:         t.TempDir(),
+		Interactive: &agent.InteractiveSpec{},
+	}, ptyNoticeManifest(), SpawnOptions{TerminalCost: func() *agent.CostData { return nil }})
+	if err != nil {
+		t.Fatalf("SpawnWithOptions: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	evs := collectEvents(t, h)
+	res, ok := evs[1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("event[1] = %#v, want ResultEvent", evs[1])
+	}
+	if !res.Success || res.Cost != nil {
+		t.Fatalf("expected a bare success result, got %#v", res)
+	}
+}
+
+func TestSpawnWithOptions_PanickingTerminalCostKeepsBareResult(t *testing.T) {
+	t.Parallel()
+	requireShell(t)
+
+	h, err := SpawnWithOptions(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
+		Cwd:         t.TempDir(),
+		Interactive: &agent.InteractiveSpec{},
+	}, ptyNoticeManifest(), SpawnOptions{TerminalCost: func() *agent.CostData { panic("fixture boom") }})
+	if err != nil {
+		t.Fatalf("SpawnWithOptions: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	evs := collectEvents(t, h)
+	res, ok := evs[1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("event[1] = %#v, want ResultEvent", evs[1])
+	}
+	if !res.Success || res.Cost != nil {
+		t.Fatalf("expected a bare success result despite the panicking hook, got %#v", res)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -115,7 +116,9 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 				return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, server.close)
 			}
 			spec.Env = launch.env
-			return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
+			return ptycli.SpawnWithOptions(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), ptycli.SpawnOptions{
+				TerminalCost: interactiveTerminalCost(launch.env["CODEX_HOME"], nil),
+			})
 		}
 	}
 	// A gateway-routed cell falls through to the isolated boundary below so
@@ -230,14 +233,35 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		cleanup := func() error { return errors.Join(server.close(), config.remove()) }
 		return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
 	}
-	return ptycli.SpawnWithCleanup(
+	return ptycli.SpawnWithOptions(
 		ctx,
 		bin,
 		launch.argv,
 		spec,
 		(&Provider{}).Manifest(),
-		config.remove,
+		ptycli.SpawnOptions{
+			Cleanup:      config.remove,
+			TerminalCost: interactiveTerminalCost(config.home, nil),
+		},
 	)
+}
+
+// interactiveTerminalCost returns the TerminalCost closure for one
+// interactive PTY spawn: at child exit it reads the thread's session file
+// under home and attaches the last cumulative token total as the terminal
+// cost. home is the exact CODEX_HOME the child ran under; resolveThreadID
+// reports the thread the session actually ran as, or "" when it is not
+// known (an attach path records the resume key up front, the fresh path
+// only after naming). Either unknown keeps the bare result — absent records
+// are "unknown", never "free" — and a re-adopted session after a daemon
+// restart reads the same cumulative file, so it reports the same total.
+func interactiveTerminalCost(home string, resolveThreadID func() string) func() *agent.CostData {
+	return func() *agent.CostData {
+		if home == "" || resolveThreadID == nil {
+			return nil
+		}
+		return rolloutUsageCost(home, resolveThreadID())
+	}
 }
 
 // spawnNamedInteractivePTY points launch's argv at server (remoteInteractiveArgs
@@ -263,11 +287,19 @@ func spawnNamedInteractivePTY(
 	cleanup func() error,
 ) (agent.Handle, error) {
 	launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
-	handle, err := ptycli.SpawnWithCleanup(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), cleanup)
+	home := spec.Env["CODEX_HOME"]
+	var currentThreadID atomic.Value
+	currentThreadID.Store("")
+	resolveThreadID := func() string { id, _ := currentThreadID.Load().(string); return id }
+	handle, err := ptycli.SpawnWithOptions(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), ptycli.SpawnOptions{
+		Cleanup:      cleanup,
+		TerminalCost: interactiveTerminalCost(home, resolveThreadID),
+	})
 	if err != nil {
 		return nil, err
 	}
 	if attachToExistingNamedSession(spec) {
+		currentThreadID.Store(spec.SessionName)
 		return handle, nil
 	}
 	nameTimeout := opts.HandshakeTimeout
@@ -297,6 +329,7 @@ func spawnNamedInteractivePTY(
 	// finishNamingLiveInteractiveThread waits through Codex's rollout-flush
 	// race, so the resume key is recorded only after the native state exists.
 	recordResumeKey(spec.Env["CODEX_HOME"], threadID)
+	currentThreadID.Store(threadID)
 	return handle, nil
 }
 
