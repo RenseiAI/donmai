@@ -253,6 +253,11 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		// counter is not incremented; because it is NOT in
 		// RestartPreventExitStatus, systemd still restarts the daemon.
 		"SuccessExitStatus=3",
+		// No KillMode and no Delegate, deliberately: stopping this unit keeps
+		// systemd's default control-group kill, so a direct-owned seat in the
+		// unit's cgroup ends with its daemon. A shim-owned seat survives
+		// because it starts in its own transient scope, which lives outside
+		// this unit's cgroup — never because this unit stops killing it.
 	)
 
 	if opts.ConfigPath != "" {

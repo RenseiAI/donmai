@@ -232,6 +232,26 @@ func TestSystemdScopeArgs(t *testing.T) {
 	}
 }
 
+// TestSystemdScopeArgs_BudgetlessSeatStillScopes pins the every-shim-scoped
+// rule at the argv level: a budget that carries no limits renders no limit
+// properties — but still renders the scope shape (--scope, --collect, the
+// seat-survives-OOM policy, the unit). A budgetless seat gets its own scope
+// with nothing capped, so it still outlives its daemon.
+func TestSystemdScopeArgs_BudgetlessSeatStillScopes(t *testing.T) {
+	args := SystemdScopeArgsForBus(ScopeNameForIncarnation("org", "s", 1), Budget{}, true)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"systemd-run", "--user", "--scope", "--collect", "OOMPolicy=continue", ".scope"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("budgetless scope args %q missing %q", joined, want)
+		}
+	}
+	for _, banned := range []string{"CPUQuota=", "CPUWeight=", "MemoryMax=", "MemoryHigh=", "IOWeight="} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("budgetless scope args %q carry %q; want no limit properties", joined, banned)
+		}
+	}
+}
+
 func TestSystemdUserScope(t *testing.T) {
 	// Only the user bus reachable => per-user install => --user.
 	if !SystemdUserScope(true, false) {
@@ -272,16 +292,50 @@ func TestUserBusSocketPath(t *testing.T) {
 }
 
 func TestScopeName(t *testing.T) {
-	if got := ScopeName("abc-123_X"); got != "donmai-seat-abc-123_X.scope" {
-		t.Errorf("ScopeName = %q", got)
+	// The scope name is a fixed-length digest of the launch identity plus
+	// the incarnation — never a truncation of the session id. Two long
+	// session ids sharing a prefix get distinct scopes, and a hostile id
+	// can never escape the unit alphabet or grow the name.
+	first := ScopeNameForIncarnation("org", "abc-123_X", 1)
+	again := ScopeNameForIncarnation("org", "abc-123_X", 1)
+	if first != again {
+		t.Errorf("ScopeNameForIncarnation unstable: %q != %q", first, again)
 	}
-	// Hostile ids stay in the unit alphabet.
-	got := ScopeName("../../evil;rm -rf")
-	if strings.ContainsAny(strings.TrimSuffix(got, ".scope"), "/; ") || !strings.HasSuffix(got, ".scope") {
-		t.Errorf("ScopeName(%q) = %q; want sanitised unit name", "../../evil;rm -rf", got)
+	if !strings.HasPrefix(first, "donmai-seat-") || !strings.HasSuffix(first, "-1.scope") {
+		t.Errorf("ScopeNameForIncarnation = %q; want the digest unit for epoch 1", first)
 	}
-	if got := ScopeName(""); got != "donmai-seat-session.scope" {
-		t.Errorf("ScopeName(\"\") = %q", got)
+	body := strings.TrimSuffix(strings.TrimPrefix(first, "donmai-seat-"), "-1.scope")
+	for _, r := range body {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			t.Errorf("ScopeNameForIncarnation = %q; digest body carries %q outside hex", first, r)
+		}
+	}
+	if len(first) != len(ScopeNameForIncarnation("org", strings.Repeat("x", 300), 1)) {
+		t.Error("scope name length varies with session id length; want fixed-length")
+	}
+	prefix := strings.Repeat("shared-prefix-", 20)
+	a := ScopeNameForIncarnation("org", prefix+"session-alpha", 1)
+	b := ScopeNameForIncarnation("org", prefix+"session-bravo", 1)
+	if a == b {
+		t.Errorf("shared-prefix sessions share scope %q; want distinct scopes", a)
+	}
+	if got := ScopeNameForIncarnation("org", "s", 1); got == ScopeNameForIncarnation("org", "s", 2) {
+		t.Errorf("epochs 1 and 2 share scope %q; want distinct scopes per incarnation", got)
+	}
+	if got := ScopeNameForIncarnation("org-a", "s", 1); got == ScopeNameForIncarnation("org-b", "s", 1) {
+		t.Errorf("orgs share scope %q; the digest must cover the org half", got)
+	}
+	// Hostile and empty ids stay in the unit alphabet at fixed length.
+	for _, id := range []string{"../../evil;rm -rf", "", "abc 123"} {
+		got := ScopeNameForIncarnation("org", id, 1)
+		if got == "" || !strings.HasSuffix(got, ".scope") || strings.ContainsAny(strings.TrimSuffix(got, ".scope"), "/; ") {
+			t.Errorf("ScopeNameForIncarnation(%q) = %q; want a sanitised unit name", id, got)
+		}
+	}
+	// The legacy single-argument form keeps compiling for the direct-spawn
+	// path: it names the epoch-0 digest, which no shim launch ever uses.
+	if got := ScopeName("abc-123_X"); got != ScopeNameForIncarnation("", "abc-123_X", 0) {
+		t.Errorf("ScopeName = %q; want the epoch-0 digest alias", got)
 	}
 }
 

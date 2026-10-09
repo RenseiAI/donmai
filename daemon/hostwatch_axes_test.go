@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -89,27 +91,50 @@ func TestHostwatchAxesDirectProducer(t *testing.T) {
 
 // TestHostwatchAxesShimHandleSeatBudget calls the actual shim handle
 // publication function (trackLaunchedShim, the F1 report site) with a seat
-// budget on the spawner and pins that the shim handle carries the same
-// posture the direct spawn path reports. A shim seat that ran unconfined
-// while its handle claimed enforced would be the false report this rule
+// budget on the spawner and pins that the shim handle carries the seat's
+// OWN launched facts — the launch record startShimProcess writes beside the
+// discovery record — and never the daemon's current configuration. The
+// spawner's share is deliberately different so a current-config report
+// cannot hide. A shim seat that ran under its launched limits while its
+// handle claimed the current share would be the false report this rule
 // exists to prevent.
 func TestHostwatchAxesShimHandleSeatBudget(t *testing.T) {
+	registry, err := sessionshim.NewRegistry(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
 	daemon := &Daemon{shims: newSessionShimState()}
+	daemon.shims.registry = registry
+	// The live scope is not readable here, so the launch record stands in.
+	daemon.shimScope = shimScopeProbe{readLimits: func(string, bool) (seatbudget.SeatLimits, bool) {
+		return seatbudget.SeatLimits{}, false
+	}}
 	daemon.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "example", Repository: "github.com/example/project"}},
 		MaxConcurrentSessions: 1,
-		SeatBudget:            SeatBudget{CPUs: 2, Mode: "best-effort"},
+		// Deliberately different from the launched facts below: the
+		// handle must report the seat's own numbers, not this share.
+		SeatBudget: SeatBudget{CPUs: 8, Mode: "best-effort"},
 	})
 	controller := &sessionshim.Controller{}
 	item := axesPollFixture(t)
 	item.ResolvedProfile.Company = ""
 	spec := PollItemToSessionSpec(item, nil)
-	handle := daemon.trackLaunchedShim(controller, spec, ProjectConfig{ID: "example"}, "", "", SessionShimAdoptionEvidence{}, SessionShimAdoptionReceipt{}, false)
+	id := sessionshim.Identity{OrgID: "example-org", SessionID: spec.SessionID}
+	scope := seatbudget.ScopeNameForIncarnation(id.OrgID, id.SessionID, 1)
+	if err := registry.PutSeatLaunch(sessionshim.NewSeatLaunch(id, 1, scope, sessionshim.SeatModeEnforced, 2, 1024, 0, time.Now())); err != nil {
+		t.Fatalf("PutSeatLaunch: %v", err)
+	}
+	evidence := SessionShimAdoptionEvidence{Identity: id, ProcessEpoch: 1}
+	handle := daemon.trackLaunchedShim(controller, spec, ProjectConfig{ID: "example"}, "", "", evidence, SessionShimAdoptionReceipt{}, false)
 	if handle.SeatBudget == nil {
 		t.Fatal("shim handle.SeatBudget is nil; want the seat posture")
 	}
-	if handle.SeatBudget.Mode != "best-effort" || handle.SeatBudget.CPUs != 2 {
-		t.Errorf("shim handle.SeatBudget = %+v; want best-effort 2 cpu (same as the direct path)", handle.SeatBudget)
+	if handle.SeatBudget.Mode != "enforced" || handle.SeatBudget.CPUs != 2 || handle.SeatBudget.MemoryMB != 1024 {
+		t.Errorf("shim handle.SeatBudget = %+v; want the launched enforced 2 cpu / 1024MiB, not the current 8-cpu share", handle.SeatBudget)
+	}
+	if !strings.Contains(handle.SeatBudget.Detail, scope) {
+		t.Errorf("shim handle detail = %q; want the owning scope named", handle.SeatBudget.Detail)
 	}
 }
 

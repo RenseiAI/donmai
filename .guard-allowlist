@@ -151,3 +151,14 @@ CLOSED_TUI_REPO :: ^internal/credentials/blocklist_test\.go :: rens[e]i-tui :: (
 # literal fixture path so a real developer path landing in this file some
 # other way is still reported.
 DEV_ABS_PATH :: ^provider/harness/agycli/testdata/transcript_sample\.jsonl :: /Us[e]rs/dev/
+
+# installer/systemd/installer.go and installer/systemd/installer_test.go: the
+# generated unit's default [Unit] Description and the Doctor fixture's fake
+# `systemctl status` line carry the parent brand — pre-existing, unrelated to
+# the change that first staged these files (removing two [Service] directives
+# and pinning their absence); --staged scans the whole file, not just the
+# diff. Changing the shipped default unit text is a separate debrand change
+# with its own install-upgrade considerations; out of scope here. Scoped to
+# the three exact pre-existing lines so a NEW unscoped hit still fails.
+BRAND_NAME :: ^installer/systemd/installer\.go :: Rens[e]i :: DefaultDescription = "Rens[e]i local daemon
+BRAND_NAME :: ^installer/systemd/installer_test\.go :: Rens[e]i :: ("Description=Rens[e]i local daemon|"● rens[e]i-daemon\.service - Rens[e]i", nil\))

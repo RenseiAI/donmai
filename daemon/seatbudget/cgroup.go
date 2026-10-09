@@ -2,6 +2,8 @@ package seatbudget
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -16,9 +18,13 @@ import (
 
 // Linux enforcement: cgroups v2.
 //
-// A seat's process tree is confined by a transient systemd scope carrying
-// a CPU quota, a CPU weight share, a memory high/max ceiling, an IO weight
-// and the seat-survives-OOM policy. Exactly one placement exists:
+// A shim-owned seat's process tree always runs in a transient systemd scope
+// (`systemd-run --scope --collect`), budget or not: the scope keeps the seat
+// out of the daemon unit's control-group kill, so every shim launch wraps — a
+// seat with no enforced budget simply renders no limit properties. A seat
+// whose budget asks for enforcement adds a CPU quota, a CPU weight share, a
+// memory high/max ceiling and an IO weight; every scope carries the
+// seat-survives-OOM policy. Exactly one placement exists:
 //
 //  1. systemd transient scope: when the host runs systemd (MinScopeSystemd
 //     or newer) as PID 1 and the systemd-run helper is available, the seat
@@ -91,14 +97,16 @@ func MemoryBytes(memoryMB int) string {
 
 // SystemdScopeArgs renders the `systemd-run --scope` argv prefix that
 // confines one seat. name scopes the transient unit (per-session, so two
-// seats never share a scope). Empty optional limits are omitted: a seat
-// with no memory cap must not get MemoryMax=0, which systemd reads as "no
-// memory at all". userScope selects the bus flag: a per-user daemon
-// reaches only the user manager, so its seats need --user; a system
-// service uses the system bus and must not pass it. OOMPolicy=continue
-// keeps the seat alive when one child hits the memory ceiling: the
-// kernel kills only the offender, while the default (stop) would end the
-// whole agent session on the first child OOM.
+// seats never share a scope). A budget that carries no numeric limits
+// renders no limit properties — the scope still owns the seat's cgroup, so
+// the seat survives its daemon either way. Empty optional limits are
+// omitted: a seat with no memory cap must not get MemoryMax=0, which
+// systemd reads as "no memory at all". userScope selects the bus flag: a
+// per-user daemon reaches only the user manager, so its seats need --user;
+// a system service uses the system bus and must not pass it.
+// OOMPolicy=continue keeps the seat alive when one child hits the memory
+// ceiling: the kernel kills only the offender, while the default (stop)
+// would end the whole agent session on the first child OOM.
 func SystemdScopeArgs(name string, b Budget) []string {
 	return SystemdScopeArgsForBus(name, b, false)
 }
@@ -107,16 +115,21 @@ func SystemdScopeArgs(name string, b Budget) []string {
 // wraps the seat via `systemd-run --user --scope` (per-user service
 // without the system bus), false via `systemd-run --scope` (system
 // service). Tests pin both spellings on any host.
+//
+// A zero-CPU budget renders no CPUQuota/CPUWeight: with no budget the scope
+// owns the seat's cgroup and nothing else, so the seat still outlives its
+// daemon while systemd applies no throughput limit to it.
 func SystemdScopeArgsForBus(name string, b Budget, userScope bool) []string {
 	args := []string{"systemd-run"}
 	if userScope {
 		args = append(args, "--user")
 	}
-	args = append(args, "--scope", "--collect",
-		"-p", "CPUQuota="+CPUQuotaPercent(b.CPUs),
-		"-p", "CPUWeight="+CPUWeight(b.CPUs),
-		"-p", "OOMPolicy=continue",
-	)
+	args = append(args, "--scope", "--collect")
+	if b.CPUs >= 1 {
+		args = append(args, "-p", "CPUQuota="+CPUQuotaPercent(b.CPUs),
+			"-p", "CPUWeight="+CPUWeight(b.CPUs))
+	}
+	args = append(args, "-p", "OOMPolicy=continue")
 	if mem := MemoryBytes(b.MemoryMB); mem != "" {
 		args = append(args, "-p", "MemoryMax="+mem, "-p", "MemoryHigh="+mem)
 	}
@@ -149,28 +162,28 @@ func SystemdUserScopeForEUID(userBus, systemBus bool, euid int) bool {
 	return userBus && !(systemBus && euid == 0)
 }
 
-// ScopeName returns the transient-scope unit name for a session. The session
-// id is sanitised to the systemd unit alphabet; the prefix keeps seat
-// scopes greppable in systemctl output.
+// ScopeName returns the transient-scope unit name for a direct-child seat,
+// keyed by its session id alone (a direct child has no organisation half and
+// no incarnation). It is the same fixed-length digest form as
+// ScopeNameForIncarnation: two sessions whose ids share a long prefix still
+// get distinct scopes, and a hostile id can never escape the unit alphabet or
+// grow the name. The prefix keeps seat scopes greppable in systemctl output.
 func ScopeName(sessionID string) string {
-	var sb strings.Builder
-	sb.WriteString("donmai-seat-")
-	for _, r := range sessionID {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			sb.WriteRune(r)
-		default:
-			sb.WriteRune('_')
-		}
-		if sb.Len() >= 64 {
-			break
-		}
-	}
-	name := sb.String()
-	if name == "donmai-seat-" {
-		name += "session"
-	}
-	return name + ".scope"
+	return ScopeNameForIncarnation("", sessionID, 0)
+}
+
+// ScopeNameForIncarnation names the transient scope for one shim launch,
+// keyed by the full launch identity: the organisation half, the session id,
+// and the launch's process epoch. The digest covers the same
+// unit-separator-joined correlation the registry uses for its own
+// per-incarnation sidecars, so the name is fixed-length and collision-shaped
+// only by the hash, never by truncation. The epoch suffix keeps the
+// incarnation greppable in unit listings: a relaunched session at a new epoch
+// is a new scope, never a reuse of its predecessor's name.
+func ScopeNameForIncarnation(orgID, sessionID string, processEpoch uint64) string {
+	correlation := orgID + "\x1f" + sessionID + "\x1f" + strconv.FormatUint(processEpoch, 10)
+	sum := sha256.Sum256([]byte(correlation))
+	return "donmai-seat-" + hex.EncodeToString(sum[:16]) + "-" + strconv.FormatUint(processEpoch, 10) + ".scope"
 }
 
 // MinScopeSystemd is the oldest systemd the transient-scope placement

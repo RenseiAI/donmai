@@ -42,7 +42,7 @@ func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 	}
 	userScope := UserScopeForBus()
 	budget := Budget{CPUs: 1, MemoryMB: 256, Mode: ModeEnforced}
-	scope := ScopeName("live-proof")
+	scope := ScopeNameForIncarnation("", "live-proof", 0)
 	prefix := SystemdScopeArgsForBus(scope, budget, userScope)
 
 	// The seat child sleeps under the scope so the unit stays live for
@@ -101,6 +101,17 @@ func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 	if !strings.Contains(shown, "OOMPolicy=continue") {
 		t.Errorf("OOMPolicy not continue on the live scope (one child OOM would end the seat):\n%s", shown)
 	}
+	// 1b. The adopted-handle read-back parses the same live unit: the
+	// production ReadSeatLimits must recover the launched 1 CPU / 256MiB
+	// from systemd's own rendering, and must refuse a scope that does not
+	// exist (systemctl answers it with exit 0 and default limits).
+	limits, readOK := ReadSeatLimits(scope, userScope)
+	if !readOK || limits.CPUs != 1 || limits.MemoryMB != 256 {
+		t.Errorf("ReadSeatLimits(live %s) = %+v, %v; want 1 cpu / 256MiB read back", scope, limits, readOK)
+	}
+	if missing, missingOK := ReadSeatLimits(ScopeNameForIncarnation("", "never-created", 0), userScope); missingOK {
+		t.Errorf("ReadSeatLimits(never-created scope) = %+v, ok; want the record fallback", missing)
+	}
 	// 2. The kernel's cgroup controls carry the ceiling while the seat
 	// is live: cpu.max bounds a burning child, memory.max bounds the
 	// hog. Absent files (a controller the manager did not delegate)
@@ -125,10 +136,11 @@ func TestLive_CgroupScopeConfinesSeat(t *testing.T) {
 // everywhere.
 func TestLive_CgroupScopeArgvIsConfining(t *testing.T) {
 	budget := Budget{CPUs: 1, MemoryMB: 256, Mode: ModeEnforced}
+	wantUnit := ScopeNameForIncarnation("", "live-proof", 0)
 	for _, userScope := range []bool{false, true} {
-		args := SystemdScopeArgsForBus(ScopeName("live-proof"), budget, userScope)
+		args := SystemdScopeArgsForBus(wantUnit, budget, userScope)
 		joined := strings.Join(args, " ")
-		for _, want := range []string{"systemd-run", "--scope", "--collect", "CPUQuota=100%", "CPUWeight=100", "MemoryMax=268435456", "OOMPolicy=continue", "donmai-seat-live-proof.scope"} {
+		for _, want := range []string{"systemd-run", "--scope", "--collect", "CPUQuota=100%", "CPUWeight=100", "MemoryMax=268435456", "OOMPolicy=continue", wantUnit} {
 			if !strings.Contains(joined, want) {
 				t.Errorf("userScope=%v: live scope argv %q missing %q", userScope, joined, want)
 			}

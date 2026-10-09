@@ -543,6 +543,15 @@ type Daemon struct {
 	// nil dance at each call site.
 	shims *sessionShimState
 
+	// shimScope is the host facts the shim launch gate and the seat read-back
+	// consult. The zero value is production (see shimScopeProbe); tests set it
+	// on their own daemon instead of a package variable, so parallel suites
+	// never race on it.
+	shimScope shimScopeProbe
+	// shimSeatReports caches each adopted or quarantined seat's report, read
+	// once per launch incarnation (see shimSeatReport).
+	shimSeatReports shimSeatReportCache
+
 	// gateway is the translating-gateway loopback host, started in Start when
 	// Options.EnableGateway is set and torn down in Stop. Nil when disabled.
 	// gatewayLedger is the cost-ledger path reported by /api/daemon/gateway.

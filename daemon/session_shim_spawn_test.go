@@ -23,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	attachwirev2 "github.com/RenseiAI/donmai/attachwire/v2"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/internal/testisolation"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -1093,6 +1094,13 @@ func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string
 // alive long enough to be adopted: the default orphan deadline here is two
 // seconds, and a shim reaped before the pass reaches it is tombstoned rather
 // than adopted or quarantined.
+//
+// The fixture's daemon runs under hermeticShimScope: on Linux every shim
+// launch wraps in a scope (budget or not), so without it a systemd host would
+// wrap each launch in a REAL systemd-run whose unit name (one process epoch
+// per test binary) collides across suites, and a host without systemd would
+// refuse every launch. The real scope shape is pinned by the fake-systemd-run
+// tests and the Linux live proof.
 func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *shimSpawnFixture {
 	t.Helper()
 	// A Unix socket path has a short platform limit (as low as 104 bytes), and
@@ -1124,6 +1132,7 @@ func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *sh
 		mutate(&shimCfg)
 	}
 	d := New(Options{SkipRegistration: true, SessionShim: shimCfg})
+	d.shimScope = hermeticShimScope()
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
@@ -1152,6 +1161,22 @@ func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *sh
 		d.ReleaseAdoptedSessionShims()
 	})
 	return f
+}
+
+// hermeticShimScope is the shim scope probe for a test that launches real
+// shims: the platform reads as off Linux, so startShimProcess launches the
+// bare worker and never reaches the host's systemd-run, and the seat
+// read-back never execs systemctl. It is set on the test's own daemon, so
+// suites running in parallel never share it.
+func hermeticShimScope() shimScopeProbe {
+	return shimScopeProbe{
+		goos:      "darwin",
+		placement: func() seatbudget.Placement { return seatbudget.PlacementNone },
+		userScope: func() bool { return false },
+		readLimits: func(string, bool) (seatbudget.SeatLimits, bool) {
+			return seatbudget.SeatLimits{}, false
+		},
+	}
 }
 
 // interactiveSpec is a session spec whose run mode selects shim ownership.
@@ -2580,6 +2605,7 @@ func TestLaunchFailureFailsTheAcceptClosed(t *testing.T) {
 			LaunchTimeout:   750 * time.Millisecond,
 		},
 	})
+	d.shimScope = hermeticShimScope()
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
@@ -2606,6 +2632,16 @@ func TestLaunchFailureFailsTheAcceptClosed(t *testing.T) {
 	}
 	if _, tracked := d.spawner.sessions["sess-fail"]; tracked {
 		t.Error("a failed shim launch left a direct-child entry behind")
+	}
+	// The seat launch record is written before the worker starts; a launch
+	// that never announced itself leaves no lineage that would ever dispose
+	// of it, so the launch path removes it.
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("sessionShimRegistry: %v", err)
+	}
+	if _, found, err := registry.SeatLaunch(sessionshim.Identity{OrgID: "test-org", SessionID: "sess-fail"}, 1); err != nil || found {
+		t.Errorf("seat launch record after a launch that never announced itself = found %v, err %v; want it removed", found, err)
 	}
 }
 

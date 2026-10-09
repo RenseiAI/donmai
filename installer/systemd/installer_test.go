@@ -456,3 +456,25 @@ func TestUnitDir_UnknownScope(t *testing.T) {
 		t.Errorf("expected error for unknown scope")
 	}
 }
+
+// TestGenerateUnitFile_KeepsTheControlGroupKill pins the generated unit's
+// stop posture to the corpus: the unit sets no KillMode, so stopping it keeps
+// systemd's default control-group kill and a direct-owned seat in the unit's
+// cgroup ends with its daemon. Shim-owned seats survive a restart because each
+// starts in its own transient scope outside this cgroup, not because the unit
+// stops killing its children; `KillMode=process` on the daemon unit is
+// explicitly not used. Delegate is absent too: the daemon creates no cgroups
+// beneath its unit, so delegating the subtree to it buys nothing.
+func TestGenerateUnitFile_KeepsTheControlGroupKill(t *testing.T) {
+	for _, scope := range []Scope{ScopeUser, ScopeSystem} {
+		out, err := GenerateUnitFile(scope, "/usr/local/bin/af", InstallOptions{})
+		if err != nil {
+			t.Fatalf("GenerateUnitFile(%s): %v", scope, err)
+		}
+		for _, banned := range []string{"KillMode=", "Delegate="} {
+			if strings.Contains(out, banned) {
+				t.Errorf("scope %s unit sets %q; the unit keeps the default control-group kill and the seat scope is the survival boundary:\n%s", scope, banned, out)
+			}
+		}
+	}
+}
