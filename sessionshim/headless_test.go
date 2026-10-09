@@ -642,3 +642,47 @@ func TestHeadlessFrameLevelMalformedEndsTheConnection(t *testing.T) {
 		}
 	}
 }
+
+// TestHeadlessCredentialUpdateAfterTheTerminalAnswersInternal pins the
+// contract's post-terminal answer (session-shim v6 §3): once the shim has
+// written its terminal observation, a fenced CredentialUpdate is answered
+// internal — never exited, and never a success claiming a runner now holds
+// the pair.
+func TestHeadlessCredentialUpdateAfterTheTerminalAnswersInternal(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeRunner(t)
+	shim, registry, id := startHeadlessFixture(t, runner, 1)
+	rec, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-post-terminal"})
+	if err != nil {
+		t.Fatalf("Dial headless record: %v", err)
+	}
+	defer func() { _ = ctrl.Close() }()
+
+	expires := time.Now().Add(time.Hour).UnixNano()
+	live, err := ctrl.PushCredential(ctx, 1, "worker-live", "bearer-live", expires)
+	if err != nil || live.Status != shimwire.CredentialSuccess {
+		t.Fatalf("live PushCredential = %+v, %v; want success", live, err)
+	}
+	if err := ctrl.Stop(shimwire.StopOperator); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-shim.TerminalDone():
+	case <-time.After(10 * time.Second):
+		t.Fatal("no terminal observation after a fenced Stop")
+	}
+	after, err := ctrl.PushCredential(ctx, 2, "worker-after", "bearer-after", expires)
+	if after.Status != shimwire.CredentialInternal {
+		t.Fatalf("post-terminal PushCredential = %+v, %v; want status internal", after, err)
+	}
+	if !errors.Is(err, shimwire.ErrSnapshotRefused) {
+		t.Fatalf("post-terminal PushCredential error = %v, want the closed refusal", err)
+	}
+}

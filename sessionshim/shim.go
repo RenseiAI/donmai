@@ -2330,6 +2330,17 @@ func (s *Shim) dispatchCredentialUpdate(ctrl *controllerConn, body []byte) error
 		ctrl.credentialLedger[req.RequestID] = &credentialLedgerEntry{request: req, result: result}
 		return writeCredentialResult(ctrl, result)
 	}
+	// A shim that has written its terminal observation has no runner left to
+	// hold a credential, so the contract's answer is internal (never exited,
+	// and never a success that claims a provider installed the pair).
+	s.recordMu.Lock()
+	terminal := s.terminalPublished
+	s.recordMu.Unlock()
+	if terminal {
+		result.Status = shimwire.CredentialInternal
+		ctrl.credentialLedger[req.RequestID] = &credentialLedgerEntry{request: req, result: result}
+		return writeCredentialResult(ctrl, result)
+	}
 	// The provider install lands in slice 3; slice 1 records the first-seen
 	// update and answers success so the correlation contract is already the
 	// one the install will keep.
