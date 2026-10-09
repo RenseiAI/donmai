@@ -132,15 +132,30 @@ var failureMatrix = []failureCase{
 	},
 	{
 		name:  "direct-owned-plus-shim-owned-preflight",
-		want:  "the preflight refuses with the direct-owned count and returns prepared once the direct-owned seat ends",
-		local: true, requiresAdoption: false,
-		driver: "TestDirectOwnedPlusShimOwnedPreflight",
+		want:  "with one direct-owned and one shim-owned seat live, the preflight refuses with the direct-owned count and returns prepared once the direct-owned seat ends",
+		local: false, requiresAdoption: true,
 	},
 	{
 		name:  "scope-creation-refused",
-		want:  "the seat is refused before spawn with a typed reason and never falls back to an unscoped shim",
+		want:  "on a user install where creating the seat's transient scope is refused, the seat is refused before spawn with a typed reason and never falls back to an unscoped shim",
+		local: false, requiresAdoption: true,
+	},
+	{
+		// The direct-owned half of direct-owned-plus-shim-owned-preflight:
+		// no shim-owned seat is live, so the preflight ends not_required
+		// rather than prepared.
+		name:  "direct-owned-preflight",
+		want:  "while a direct-owned seat is live the preflight refuses with the direct-owned count, and once it ends the preflight returns not_required",
 		local: true, requiresAdoption: false,
-		driver: "TestScopeCreationRefused",
+		driver: "TestDirectOwnedPreflight",
+	},
+	{
+		// The execution-security scope, not the seat's transient scope that
+		// scope-creation-refused is about.
+		name:  "unrenderable-execution-scope-refused",
+		want:  "a session stamping an execution-security level the harness cannot render is refused before spawn with the typed unrenderable reason and no harness process starts",
+		local: true, requiresAdoption: false,
+		driver: "TestUnrenderableExecutionScopeRefused",
 	},
 	{
 		name:  "receiver-exact-replay",

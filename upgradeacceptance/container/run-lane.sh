@@ -41,10 +41,11 @@ lane_fail() {
 }
 
 # Extra engine run flags, word-split on purpose (an operator's resource caps,
-# e.g. "--memory 6g --cpus 4" on a shared host).
+# e.g. "--memory 6g --cpus 4" on a shared host). The guarded expansion keeps
+# an empty list from tripping `set -u` on bash before 4.4 (macOS /bin/bash).
 read -r -a extra_run_args <<<"${ACCEPTANCE_RUN_ARGS:-}"
 cid="$("${ENGINE}" run -d --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
-  "${extra_run_args[@]}" "${IMAGE}")"
+  ${extra_run_args[@]+"${extra_run_args[@]}"} "${IMAGE}")"
 diagnostics() {
   echo "--- failed units ---"
   "${ENGINE}" exec "${cid}" systemctl --failed --no-pager 2>&1 || true
