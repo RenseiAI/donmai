@@ -158,10 +158,10 @@ type Snapshot struct {
 	Err      error // sessions-list fetch error (fatal for the grid this tick)
 }
 
-// repoMatch reports whether a session's repository belongs to the scope.
-// It mirrors the daemon's matchProject leniency so a Linear project slug
-// and a git URL that refer to the same repo both match: exact, or either
-// being the "/"-suffix of the other.
+// repoMatch reports whether a session's repository belongs to the scope, so
+// a project slug and a git URL that refer to the same repo both match:
+// exact, or either being the "/"-suffix of the other. It only filters what
+// the view shows; admission uses the daemon's stricter location match.
 //
 // Both sides are normalized first (normalizeRepoRef): the daemon reports
 // clone URLs such as "https://github.com/o/a.git" while the CWD scope is
