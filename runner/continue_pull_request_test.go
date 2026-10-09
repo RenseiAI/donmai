@@ -783,7 +783,24 @@ func TestRun_ContinueModeMergeOnlyHeadHasNoCodeChange(t *testing.T) {
 	}
 }
 
+// TestRun_ContinueModeScratchCommitsFailByPath proves the scratch rule
+// through the production entry point, with and without a
+// dispatch-declared delivery policy: the policy waives the draft check
+// and lets a merge resolution count, but never the scratch rule, so a
+// scratch commit on a draft the policy accepts still fails by path.
 func TestRun_ContinueModeScratchCommitsFailByPath(t *testing.T) {
+	policies := []struct {
+		name     string
+		delivery *prompt.DeliveryPolicy
+		draft    pullRequestDraftLookup
+	}{
+		{name: "no policy"},
+		{
+			name:     "draft and merges allowed, still a draft",
+			delivery: &prompt.DeliveryPolicy{AllowDraft: true, AllowMergeCommits: true},
+			draft:    func(context.Context, string, string) (bool, error) { return true, nil },
+		},
+	}
 	cases := []struct {
 		name      string
 		files     map[string]string
@@ -803,40 +820,44 @@ func TestRun_ContinueModeScratchCommitsFailByPath(t *testing.T) {
 			wantPaths: ".scratch/gate-full.md",
 		},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			res, _ := runScriptedSession(t, scriptedSession{
-				workType:       "development",
-				skipSteering:   true,
-				repository:     "https://github.com/example/repo",
-				continueNumber: 12,
-				turns: []verdictScriptTurn{{
-					manifest: passedManifest,
-					text:     "WORK_RESULT:passed",
-					during: func(t *testing.T, cwd string) {
-						for path, body := range tc.files {
-							writeFile(t, cwd, path, body)
-						}
-						// The commit below runs in a fresh clone without
-						// a global identity on CI; pass it inline.
-						gitRun(t, cwd, "add", "-f", "-A")
-						gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "scratch commit")
-						gitRun(t, cwd, "push", "-q", "origin", "HEAD:refs/heads/continued/pr-12")
-					},
-				}},
+	for _, policy := range policies {
+		for _, tc := range cases {
+			t.Run(policy.name+"/"+tc.name, func(t *testing.T) {
+				res, _ := runScriptedSession(t, scriptedSession{
+					workType:       "development",
+					skipSteering:   true,
+					repository:     "https://github.com/example/repo",
+					continueNumber: 12,
+					delivery:       policy.delivery,
+					draft:          policy.draft,
+					turns: []verdictScriptTurn{{
+						manifest: passedManifest,
+						text:     "WORK_RESULT:passed",
+						during: func(t *testing.T, cwd string) {
+							for path, body := range tc.files {
+								writeFile(t, cwd, path, body)
+							}
+							// The commit below runs in a fresh clone without
+							// a global identity on CI; pass it inline.
+							gitRun(t, cwd, "add", "-f", "-A")
+							gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "scratch commit")
+							gitRun(t, cwd, "push", "-q", "origin", "HEAD:refs/heads/continued/pr-12")
+						},
+					}},
+				})
+				if res.Status != "failed" || res.FailureMode != FailureBackstop {
+					t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+				}
+				want := "continued pull request #12 commits scratch paths since dispatch: .agent/state.json, .agent/turn-result.json, " + tc.wantPaths
+				if res.Error != want {
+					t.Fatalf("Error = %q, want %q", res.Error, want)
+				}
+				remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+				if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+					t.Fatalf("continued head %q does not carry the committed scratch path", remoteHead)
+				}
 			})
-			if res.Status != "failed" || res.FailureMode != FailureBackstop {
-				t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
-			}
-			want := "continued pull request #12 commits scratch paths since dispatch: .agent/state.json, .agent/turn-result.json, " + tc.wantPaths
-			if res.Error != want {
-				t.Fatalf("Error = %q, want %q", res.Error, want)
-			}
-			remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
-			if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
-				t.Fatalf("continued head %q does not carry the committed scratch path", remoteHead)
-			}
-		})
+		}
 	}
 }
 
