@@ -519,12 +519,13 @@ func landlockRuleset(abi int) unix.LandlockRulesetAttr {
 
 // ScopesAvailable reports whether this kernel carries the scope layer the
 // full boundary needs: the signal and abstract-socket scopes need Landlock
-// ABI 6 (Linux 6.12). Below it the seat still starts — the mount tree, the
-// process namespace and the Landlock filesystem rules hold — but signals to
-// same-user processes outside and abstract sockets outside stay reachable,
-// so a record taken there is degraded, never a full attestation (see
-// SelfTestRecord.Degraded). The string names the missing layer when it is
-// absent. Production probes the running kernel; tests stub scopesProbe.
+// ABI 6 (Linux 6.12). Below it confined seats refuse closed — the mount
+// tree, the process namespace and the Landlock filesystem rules would hold,
+// but signals to same-user processes outside and abstract sockets outside
+// stay reachable — so a record taken there is degraded, never a full
+// attestation (see SelfTestRecord.Degraded). The string names the missing
+// layer when it is absent. Production probes the running kernel; tests stub
+// scopesProbe.
 func ScopesAvailable() (bool, string) {
 	return scopeVerdict(scopesProbe())
 }

@@ -21,10 +21,6 @@ func stubScopeProbe(t *testing.T, abi int) {
 
 // writeScopeCacheEntry rewrites the cache file at path through mutate, so a
 // test can age a record into a shape the current binary must refuse.
-// versionForScopeCacheTest reports the cache version the binary under test
-// accepts, so the pre-marking shape below stays one behind it even if the
-// constant moves again.
-func versionForScopeCacheTest() int { return selfTestCacheVersion }
 
 func writeScopeCacheEntry(t *testing.T, path string, mutate func(*selfTestCacheEntry)) {
 	t.Helper()
@@ -188,8 +184,11 @@ func TestScopeVerdict_CacheNeverReusesAScopeGap(t *testing.T) {
 	// A pre-marking record: cache version 1, full pass, no Degraded
 	// content, intact digest. The new binary must refuse it even while the
 	// scope layer reports enforced, so the version bump alone pins it.
+	// The version is the absolute pre-marking value, never relative to
+	// the current constant: a future version bump must not re-point this
+	// case at a version the binary still accepts.
 	writeScopeCacheEntry(t, slot.path, func(entry *selfTestCacheEntry) {
-		entry.Version = versionForScopeCacheTest() - 1
+		entry.Version = 1
 		entry.Record.Digest = entry.Record.computeDigest()
 	})
 	if loaded, hit := slot.load(now); hit {
