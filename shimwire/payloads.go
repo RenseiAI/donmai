@@ -76,6 +76,12 @@ type Hello struct {
 	// DecodeHello carry it through the optional extension map, never a new
 	// top-level field that released strict decoders would reject.
 	Continuation *CheckpointCapability `json:"-"`
+	// Workload is the closed workload-profile advertisement: empty for the
+	// interactive profile (the wire default every released shim speaks), or
+	// WorkloadHeadless for a headless shim. EncodeHello and DecodeHello carry
+	// it through the optional extension map under ExtWorkload, never a new
+	// top-level field that released strict decoders would reject.
+	Workload Profile `json:"-"`
 }
 
 // Welcome is the daemon's adoption proposal.
@@ -435,6 +441,30 @@ func decodeJSON(body []byte, v any) error {
 
 // EncodeHello encodes a Hello body.
 func EncodeHello(h Hello) ([]byte, error) {
+	if h.Workload != "" && h.Workload != ProfileInteractive && h.Workload != ProfileHeadless {
+		return nil, fmt.Errorf("shimwire: %w: unknown workload %q", ErrMalformed, h.Workload)
+	}
+	if old, ok := h.Extensions.Values[ExtWorkload]; ok && (h.Workload != ProfileHeadless || old != WorkloadHeadless) {
+		// A caller map carrying the workload key beside a disagreeing field is
+		// ambiguous about which profile this shim claims: a headless
+		// advertisement riding on an interactive field (or the reverse) would
+		// let the two sources tell different peers different stories. Fail
+		// closed in both directions, not only when the field is headless. The
+		// key is only ever "headless": an interactive shim omits it, so an
+		// explicit interactive value is refused too, as DecodeHello would.
+		return nil, fmt.Errorf("shimwire: %w: conflicting workload advertisement", ErrMalformed)
+	}
+	if err := checkWorkloadRange(h.Workload, h.Min); err != nil {
+		return nil, err
+	}
+	if h.Workload == ProfileHeadless {
+		values := make(map[string]string, len(h.Extensions.Values)+1)
+		for k, v := range h.Extensions.Values {
+			values[k] = v
+		}
+		values[ExtWorkload] = WorkloadHeadless
+		h.Extensions.Values = values
+	}
 	if h.Continuation != nil {
 		value, err := encodeJSON(h.Continuation)
 		if err != nil {
@@ -465,7 +495,14 @@ func DecodeHello(body []byte) (Hello, error) {
 	if err := decodeJSON(body, &h); err != nil {
 		return h, err
 	}
-	var err error
+	workload, err := h.Extensions.Workload()
+	if err != nil {
+		return h, err
+	}
+	if err := checkWorkloadRange(workload, h.Min); err != nil {
+		return h, err
+	}
+	h.Workload = workload
 	h.Continuation, err = h.Extensions.CheckpointCapability()
 	return h, err
 }
@@ -572,6 +609,262 @@ func DecodeError(body []byte) (ErrorMsg, error) {
 	var e ErrorMsg
 	err := decodeJSON(body, &e)
 	return e, err
+}
+
+// ---- headless workload profile (selected v6) -------------------------------
+
+// CredentialUpdate is the controller-to-shim bearer rotation: the new worker
+// id, bearer and expiry a refreshed controller pushes over the fenced shim
+// connection. It is a mutating frame — the shim rejects it unless its
+// generation matches the adopted controller's, so an old controller that
+// resurfaces can never overwrite a newer credential. RequestID is nonzero and
+// strictly increasing per controller connection: it is the key the exact-retry
+// / changed-duplicate correlation a later slice provides reads. ExpiresAt is a
+// signed Unix-nanosecond instant, nonzero. The bearer is a control secret: it
+// is never written to disk, logs, the discovery record or the tombstone.
+type CredentialUpdate struct {
+	RequestID  uint64     `json:"requestId"`
+	Generation Generation `json:"generation"`
+	WorkerID   string     `json:"workerId"`
+	Bearer     string     `json:"bearer"`
+	ExpiresAt  int64      `json:"expiresAt"`
+}
+
+// CredentialResult is the shim's correlated answer to one CredentialUpdate,
+// keyed by the request's own id so an exact retry returns its first result
+// and a reused id with changed content is duplicate_changed. Status uses the
+// closed result set by name: success, malformed, stale_generation,
+// duplicate_changed, request_ledger_full, internal, request_mismatch, timeout.
+// Exited is never used here — a shim that has written its terminal
+// observation answers internal. A refusal carries no credential material
+// back.
+type CredentialResult struct {
+	RequestID  uint64           `json:"requestId"`
+	Generation Generation       `json:"generation"`
+	Status     CredentialStatus `json:"status"`
+}
+
+// CredentialStatus is the closed set of correlated credential outcomes.
+type CredentialStatus string
+
+// The closed credential-status registry: the result-code set the contract
+// names, minus exited (see CredentialResult).
+const (
+	CredentialSuccess           CredentialStatus = "success"
+	CredentialMalformed         CredentialStatus = "malformed"
+	CredentialStaleGeneration   CredentialStatus = "stale_generation"
+	CredentialDuplicateChanged  CredentialStatus = "duplicate_changed"
+	CredentialRequestLedgerFull CredentialStatus = "request_ledger_full"
+	CredentialInternal          CredentialStatus = "internal"
+	CredentialRequestMismatch   CredentialStatus = "request_mismatch"
+	CredentialTimeout           CredentialStatus = "timeout"
+)
+
+// Known reports whether s is an assigned credential status.
+func (s CredentialStatus) Known() bool {
+	switch s {
+	case CredentialSuccess, CredentialMalformed, CredentialStaleGeneration,
+		CredentialDuplicateChanged, CredentialRequestLedgerFull, CredentialInternal,
+		CredentialRequestMismatch, CredentialTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// HeadlessExitCause is the closed set of causes a headless terminal
+// observation may report.
+type HeadlessExitCause string
+
+// The closed v6 headless-exit-cause registry.
+const (
+	// HeadlessExitCompleted: the runner reached its own end, successful or
+	// not.
+	HeadlessExitCompleted HeadlessExitCause = "completed"
+	// HeadlessExitOrphaned: the orphan deadline ended the run.
+	HeadlessExitOrphaned HeadlessExitCause = "orphaned"
+	// HeadlessExitStoppedForResume: the run stopped with its resume record
+	// written; it is not a session end.
+	HeadlessExitStoppedForResume HeadlessExitCause = "stopped_for_resume"
+	// HeadlessExitShimFailure: the runner is gone and the observation is
+	// written by the adopting controller's janitor, never sent on the wire.
+	HeadlessExitShimFailure HeadlessExitCause = "shim_failure"
+)
+
+// Known reports whether c is an assigned v6 headless-exit cause.
+func (c HeadlessExitCause) Known() bool {
+	switch c {
+	case HeadlessExitCompleted, HeadlessExitOrphaned,
+		HeadlessExitStoppedForResume, HeadlessExitShimFailure:
+		return true
+	default:
+		return false
+	}
+}
+
+// HeadlessExitState is the closed set of terminal-status outbox states a
+// headless terminal observation may report.
+type HeadlessExitState string
+
+// The closed v6 headless-exit-state registry.
+const (
+	// HeadlessExitDelivered: the terminal-status bytes reached the receiver.
+	HeadlessExitDelivered HeadlessExitState = "delivered"
+	// HeadlessExitPending: the terminal-status bytes are retained in the
+	// outbox for the replacement controller to replay.
+	HeadlessExitPending HeadlessExitState = "pending"
+	// HeadlessExitNone: no terminal status was written, valid only with the
+	// stopped_for_resume cause.
+	HeadlessExitNone HeadlessExitState = "none"
+)
+
+// Known reports whether s is an assigned v6 headless-exit outbox state. The
+// none state is closed but cause-bound; DecodeHeadlessExit pins that binding.
+func (s HeadlessExitState) Known() bool {
+	switch s {
+	case HeadlessExitDelivered, HeadlessExitPending, HeadlessExitNone:
+		return true
+	default:
+		return false
+	}
+}
+
+// HeadlessExit is the immutable terminal observation of a headless seat, the
+// sole terminal authority of its lineage — no legacy Exit accompanies it. Seq
+// is always 1: the headless profile has no host output stream, so the terminal
+// observation is its only sequence-bearing message. Cause and OutboxState use
+// the closed registries above; ProcessEpoch and ObservedAt name the shim
+// incarnation and the observation instant. OutboxKey/OutboxState name the
+// session's terminal-status outbox record and its state; pending names what
+// the replacement controller must replay, delivered names what it must not
+// send again, and none — valid only with stopped_for_resume — marks a resume
+// that wrote no terminal. GroupReaped is true only after the harness process
+// group was proved gone.
+type HeadlessExit struct {
+	Seq          uint64            `json:"seq"`
+	ProcessEpoch uint64            `json:"processEpoch"`
+	ExitCode     uint64            `json:"exitCode"`
+	Signal       string            `json:"signal,omitempty"`
+	GroupReaped  bool              `json:"groupReaped"`
+	Cause        HeadlessExitCause `json:"cause"`
+	OutboxKey    string            `json:"outboxKey"`
+	OutboxState  HeadlessExitState `json:"outboxState"`
+	ObservedAt   int64             `json:"observedAt"`
+}
+
+// credentialWorkerIDMax is the contract bound on the registration the bearer
+// belongs to: 1–256 bytes. It may differ from the registration the session
+// was claimed under.
+const credentialWorkerIDMax = 256
+
+// credentialBearerMax is the contract bound on the opaque credential: 1–16384
+// bytes.
+const credentialBearerMax = 16384
+
+// EncodeCredentialUpdate encodes a CredentialUpdate body.
+func EncodeCredentialUpdate(u CredentialUpdate) ([]byte, error) {
+	if u.RequestID == 0 || u.Generation == 0 || len(u.WorkerID) == 0 ||
+		len(u.WorkerID) > credentialWorkerIDMax || len(u.Bearer) == 0 ||
+		len(u.Bearer) > credentialBearerMax || u.ExpiresAt <= 0 {
+		return nil, fmt.Errorf("shimwire: %w: incomplete credential update", ErrMalformed)
+	}
+	return encodeJSON(u)
+}
+
+// DecodeCredentialUpdate strictly decodes a CredentialUpdate body and rejects
+// a missing request id or fence, a worker id or bearer outside its contract
+// bound, or a non-positive Unix-nanosecond expiry. An empty bearer is refused
+// at the codec so a rotation can never blank the runner's credential by
+// accident.
+func DecodeCredentialUpdate(body []byte) (CredentialUpdate, error) {
+	var u CredentialUpdate
+	if err := decodeJSON(body, &u); err != nil {
+		return u, err
+	}
+	if u.RequestID == 0 || u.Generation == 0 || len(u.WorkerID) == 0 ||
+		len(u.WorkerID) > credentialWorkerIDMax || len(u.Bearer) == 0 ||
+		len(u.Bearer) > credentialBearerMax || u.ExpiresAt <= 0 {
+		return u, fmt.Errorf("shimwire: %w: incomplete credential update", ErrMalformed)
+	}
+	return u, nil
+}
+
+// EncodeCredentialResult encodes a CredentialResult body.
+func EncodeCredentialResult(r CredentialResult) ([]byte, error) {
+	if r.RequestID == 0 || r.Generation == 0 || !r.Status.Known() {
+		return nil, fmt.Errorf("shimwire: %w: incomplete credential result", ErrMalformed)
+	}
+	return encodeJSON(r)
+}
+
+// DecodeCredentialResult strictly decodes a CredentialResult body. The result
+// is correlated by request id and carries the committed generation with
+// exactly one assigned status (see CredentialResult); an unknown status —
+// exited included — is a protocol defect, surfaced rather than guessed.
+func DecodeCredentialResult(body []byte) (CredentialResult, error) {
+	var r CredentialResult
+	if err := decodeJSON(body, &r); err != nil {
+		return r, err
+	}
+	if r.RequestID == 0 || r.Generation == 0 || !r.Status.Known() {
+		return r, fmt.Errorf("shimwire: %w: incomplete credential result", ErrMalformed)
+	}
+	return r, nil
+}
+
+// EncodeHeadlessExit encodes a HeadlessExit body.
+func EncodeHeadlessExit(e HeadlessExit) ([]byte, error) {
+	if err := validateHeadlessExit(e); err != nil {
+		return nil, err
+	}
+	return encodeJSON(e)
+}
+
+// DecodeHeadlessExit strictly decodes a HeadlessExit body and rejects a
+// non-1 sequence, an unknown cause, an unknown outbox state, a missing
+// observation instant, the none state outside stopped_for_resume, or an
+// outbox key that is missing where the state requires one. None marks a
+// resume that wrote no terminal, so it names no record; delivered and pending
+// name what the replacement controller must not resend / must replay.
+func DecodeHeadlessExit(body []byte) (HeadlessExit, error) {
+	var e HeadlessExit
+	if err := decodeJSON(body, &e); err != nil {
+		return e, err
+	}
+	if err := validateHeadlessExit(e); err != nil {
+		return e, err
+	}
+	return e, nil
+}
+
+func validateHeadlessExit(e HeadlessExit) error {
+	if e.Seq != 1 {
+		return fmt.Errorf("shimwire: %w: headless exit seq %d, want 1", ErrMalformed, e.Seq)
+	}
+	if !e.Cause.Known() {
+		return fmt.Errorf("shimwire: %w: unknown headless exit cause %q", ErrMalformed, e.Cause)
+	}
+	if !e.OutboxState.Known() {
+		return fmt.Errorf("shimwire: %w: unknown headless outbox state %q", ErrMalformed, e.OutboxState)
+	}
+	if e.ProcessEpoch == 0 || e.ObservedAt <= 0 {
+		return fmt.Errorf("shimwire: %w: headless exit without incarnation or observation instant", ErrMalformed)
+	}
+	if e.OutboxState == HeadlessExitNone {
+		if e.Cause != HeadlessExitStoppedForResume {
+			return fmt.Errorf("shimwire: %w: headless outbox none outside stopped_for_resume", ErrMalformed)
+		}
+		// None marks a resume that wrote no terminal, so it names no record:
+		// a key beside none claims a terminal exists that the state denies.
+		if e.OutboxKey != "" {
+			return fmt.Errorf("shimwire: %w: headless outbox none names a record", ErrMalformed)
+		}
+		return nil
+	}
+	if e.OutboxKey == "" {
+		return fmt.Errorf("shimwire: %w: headless exit without an outbox key", ErrMalformed)
+	}
+	return nil
 }
 
 // ---- byte-carrying messages ------------------------------------------------

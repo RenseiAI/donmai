@@ -34,6 +34,12 @@ const (
 	// v5-only complete-state inspection; never canonical host frames.
 	TypeCheckpointRequest MessageType = 0x11
 	TypeCheckpointResult  MessageType = 0x12
+
+	// v6-only headless workload profile. These values remain illegal under
+	// selected v1 through v5.
+	TypeCredentialUpdate MessageType = 0x13 // controller -> shim: fenced bearer rotation
+	TypeCredentialResult MessageType = 0x14 // shim -> controller: fenced acknowledgement or closed refusal
+	TypeHeadlessExit     MessageType = 0x15 // shim -> controller: immutable terminal observation, no host sequence
 )
 
 // Known reports whether t is assigned in the frozen v1 vocabulary. It remains
@@ -49,18 +55,69 @@ func (t MessageType) Known() bool { return t >= TypeHello && t <= TypeError }
 // TypeAttributedInput is exclusive to it.
 func (t MessageType) AllowedIn(version uint32) bool {
 	if t >= TypeHello && t <= TypeError {
-		return version == V1 || version == V2 || version == V3 || version == V4 || version == V5
+		return version >= V1 && version <= V6
 	}
 	if t == TypeSnapshotRequest || t == TypeSnapshotResult {
-		return version == V2 || version == V3 || version == V4 || version == V5
+		return version >= V2 && version <= V6
 	}
 	if t == TypeHostFrame {
-		return version == V3 || version == V4 || version == V5
+		return version >= V3 && version <= V6
 	}
 	if t == TypeAttributedInput {
-		return version == V4 || version == V5
+		return version >= V4 && version <= V6
 	}
-	return version == V5 && (t == TypeCheckpointRequest || t == TypeCheckpointResult)
+	if t == TypeCheckpointRequest || t == TypeCheckpointResult {
+		return version == V5 || version == V6
+	}
+	return version == V6 && (t == TypeCredentialUpdate || t == TypeCredentialResult || t == TypeHeadlessExit)
+}
+
+// Profile names the workload shape a selected connection carries. The
+// interactive profile owns a terminal byte stream; the headless profile owns
+// a runner process group and carries no terminal bytes at all.
+type Profile string
+
+// The closed workload-profile registry.
+const (
+	// ProfileInteractive is the terminal-owning profile every selected v1
+	// through v5 connection speaks.
+	ProfileInteractive Profile = "interactive"
+	// ProfileHeadless is the runner-owning profile selected v6 speaks. It
+	// carries ownership, the generation fence, liveness, stop, credential
+	// refresh and the terminal observation, and nothing terminal-shaped.
+	ProfileHeadless Profile = "headless"
+)
+
+// Known reports whether p is an assigned workload profile.
+func (p Profile) Known() bool {
+	return p == ProfileInteractive || p == ProfileHeadless
+}
+
+// RefusedIn reports whether t is refused on a connection carrying profile p
+// with the given selected version. The headless profile refuses every
+// PTY-shaped type — anything that sequences, replays, or renders terminal
+// bytes — because a headless connection has no terminal byte stream whose
+// continuity such a frame could honestly claim. A refusal is a typed
+// malformed classification at the reader, never a silent skip.
+//
+// ReadProfileVersion refuses through this predicate: a headless connection
+// that receives a refused type is answered with Error{code:"malformed"} and the
+// frame is never acted on, so the predicate has a production enforcement
+// point, not just a unit pin.
+func (t MessageType) RefusedIn(profile Profile, version uint32) bool {
+	if profile != ProfileHeadless {
+		return false
+	}
+	if version != V6 {
+		return true
+	}
+	switch t {
+	case TypeHello, TypeWelcome, TypeAdopted, TypeStop, TypeHeartbeat, TypeError,
+		TypeCredentialUpdate, TypeCredentialResult, TypeHeadlessExit:
+		return false
+	default:
+		return true
+	}
 }
 
 // Mutating reports whether t carries controller authority and therefore MUST
@@ -72,7 +129,7 @@ func (t MessageType) AllowedIn(version uint32) bool {
 // and a per-caller check is exactly where an omission hides.
 func (t MessageType) Mutating() bool {
 	switch t {
-	case TypeInput, TypeResize, TypeStop, TypeSnapshotRequest, TypeAttributedInput, TypeCheckpointRequest:
+	case TypeInput, TypeResize, TypeStop, TypeSnapshotRequest, TypeAttributedInput, TypeCheckpointRequest, TypeCredentialUpdate:
 		return true
 	default:
 		return false
@@ -117,6 +174,12 @@ func (t MessageType) String() string {
 		return "CheckpointRequest"
 	case TypeCheckpointResult:
 		return "CheckpointResult"
+	case TypeCredentialUpdate:
+		return "CredentialUpdate"
+	case TypeCredentialResult:
+		return "CredentialResult"
+	case TypeHeadlessExit:
+		return "HeadlessExit"
 	default:
 		return "Unknown(0x" + hexByte(byte(t)) + ")"
 	}

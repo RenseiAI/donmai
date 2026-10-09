@@ -1,5 +1,7 @@
 package sessionshim
 
+import "github.com/RenseiAI/donmai/shimwire"
+
 // Workload is the closed set of session workloads a shim can own.
 //
 // An interactive shim owns a PTY-hosted session: a harness process group, a
@@ -26,59 +28,42 @@ func (w Workload) Known() bool {
 	return w == WorkloadInteractive || w == WorkloadHeadless
 }
 
-// HeadlessExitCause is the closed set of reasons a headless run ended.
-type HeadlessExitCause string
+// HeadlessExitCause is the closed set of reasons a headless run ended. It is
+// the wire registry itself (shimwire.HeadlessExitCause), not a copy: the
+// tombstone and the HeadlessExit frame carry the same members, so one closed
+// registry decides both and they can never disagree.
+type HeadlessExitCause = shimwire.HeadlessExitCause
 
-// The closed headless-exit-cause registry.
+// The closed headless-exit-cause registry, exactly the contract's set.
 const (
 	// HeadlessExitCompleted: the runner reached its own end, successful or not.
-	HeadlessExitCompleted HeadlessExitCause = "completed"
+	HeadlessExitCompleted = shimwire.HeadlessExitCompleted
 	// HeadlessExitOrphaned: the orphan deadline ended the run.
-	HeadlessExitOrphaned HeadlessExitCause = "orphaned"
+	HeadlessExitOrphaned = shimwire.HeadlessExitOrphaned
 	// HeadlessExitStoppedForResume: the run stopped for a later resume; it
 	// writes no session terminal.
-	HeadlessExitStoppedForResume HeadlessExitCause = "stopped_for_resume"
+	HeadlessExitStoppedForResume = shimwire.HeadlessExitStoppedForResume
 	// HeadlessExitShimFailure: written only by an adopting controller's
 	// janitor, never sent on the wire.
-	HeadlessExitShimFailure HeadlessExitCause = "shim_failure"
+	HeadlessExitShimFailure = shimwire.HeadlessExitShimFailure
 )
 
-// Known reports whether c is an assigned headless-exit cause.
-func (c HeadlessExitCause) Known() bool {
-	switch c {
-	case HeadlessExitCompleted, HeadlessExitOrphaned,
-		HeadlessExitStoppedForResume, HeadlessExitShimFailure:
-		return true
-	default:
-		return false
-	}
-}
-
 // HeadlessOutboxState is the closed set of terminal-status outbox states a
-// headless tombstone can report.
-type HeadlessOutboxState string
+// headless tombstone can report: the wire registry (shimwire.HeadlessExitState)
+// for the same reason as HeadlessExitCause.
+type HeadlessOutboxState = shimwire.HeadlessExitState
 
 // The closed headless-outbox-state registry.
 const (
 	// HeadlessOutboxDelivered: the terminal record reached its receiver.
-	HeadlessOutboxDelivered HeadlessOutboxState = "delivered"
+	HeadlessOutboxDelivered = shimwire.HeadlessExitDelivered
 	// HeadlessOutboxPending: the terminal record is persisted but not yet
 	// delivered.
-	HeadlessOutboxPending HeadlessOutboxState = "pending"
+	HeadlessOutboxPending = shimwire.HeadlessExitPending
 	// HeadlessOutboxNone: no terminal record exists. Valid only beside
 	// HeadlessExitStoppedForResume, which writes no session terminal.
-	HeadlessOutboxNone HeadlessOutboxState = "none"
+	HeadlessOutboxNone = shimwire.HeadlessExitNone
 )
-
-// Known reports whether s is an assigned headless-outbox state.
-func (s HeadlessOutboxState) Known() bool {
-	switch s {
-	case HeadlessOutboxDelivered, HeadlessOutboxPending, HeadlessOutboxNone:
-		return true
-	default:
-		return false
-	}
-}
 
 // HeadlessExit is the one immutable terminal observation of a headless
 // lineage. It carries the runner's own exit beside the outbox record that

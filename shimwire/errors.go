@@ -17,6 +17,13 @@ var (
 	// message type, or a body that fails strict decoding.
 	ErrMalformed = errors.New("shimwire: malformed message")
 
+	// ErrProfileRefused reports a frame that decoded but is refused on its
+	// connection's workload profile. ReadProfileVersion has already answered
+	// it with Error{code:"malformed"}, so the caller can keep reading; it
+	// always also matches ErrMalformed. A frame-level refusal (zero length,
+	// unknown type) is plain ErrMalformed and carries no answer.
+	ErrProfileRefused = errors.New("shimwire: message type refused on this workload profile")
+
 	// ErrMessageTooLarge reports a declared length above MaxMessageBytes. It is
 	// returned BEFORE any allocation is made for the body.
 	ErrMessageTooLarge = errors.New("shimwire: message exceeds maximum size")

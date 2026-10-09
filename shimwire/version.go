@@ -38,11 +38,33 @@ const (
 	// V5 adds correlated out-of-band complete continuation inspection.
 	// Canonical host frames and all selected v1-v4 messages remain unchanged.
 	V5 uint32 = 5
+	// V6 adds the headless workload profile: the runner-owning shape that
+	// carries ownership, the generation fence, liveness, stop, credential
+	// refresh and the terminal observation, and nothing terminal-shaped. Its
+	// vocabulary is NOT a superset of v5: a headless connection refuses every
+	// PTY-shaped type (see MessageType.RefusedIn). Selection stays "highest
+	// common version", but a headless shim advertises HeadlessRange ([6,6]),
+	// which never overlaps an interactive-only peer.
+	V6 uint32 = 6
+
+	// HeadlessMin is the headless shim's advertised minimum: v6 exclusively.
+	// A daemon that predates v6 has no overlap, so it quarantines the shim as
+	// a protocol mismatch — it never treats it as a terminal session and
+	// never ends it.
+	HeadlessMin uint32 = V6
+	// HeadlessMax is the headless shim's advertised maximum: v6 exclusively.
+	HeadlessMax uint32 = V6
 
 	// ProtocolMin / ProtocolMax is the range THIS build advertises. A protocol
 	// bump widens Max and only ever raises Min after an overlap window at least
 	// as long as the maximum supported session duration (ADR-2026-08-17 §D3) —
 	// raising Min is a separate migration decision, not a release detail.
+	//
+	// ProtocolMax stays at V5 until the headless launch gate lands: the v6
+	// codec, vocabulary and corpus ship first so every peer can decode the
+	// headless range before any shim advertises it or any controller selects
+	// it. Widening Max to V6 is a separate release decision, not part of this
+	// codec change.
 	ProtocolMin = V1
 	ProtocolMax = V5
 )
@@ -90,12 +112,15 @@ const (
 	// ExtContinuationCheckpoint advertises optional v5 checkpoint support in
 	// Hello. Older controllers ignore its value before selecting their version.
 	ExtContinuationCheckpoint = "continuation_checkpoint"
-	// ExtWorkload declares a shim's workload profile in Hello's optional
-	// extension map. The value is exactly "headless" on a headless shim;
-	// an interactive shim omits the key and absence means the PTY profile.
-	// It is never a required extension: the headless shim's range is what
-	// keeps older controllers from selecting it.
+	// ExtWorkload names the closed workload-profile field inside the optional
+	// Hello extension map. A headless shim carries ExtWorkload="headless";
+	// an interactive shim omits the key entirely. The key must never appear in
+	// the required-extension list: an older controller that cannot interpret
+	// the profile must still complete version selection (and refuse by range
+	// overlap) rather than fail on a requirement it predates.
 	ExtWorkload = "workload"
+	// WorkloadHeadless is the one workload value a headless shim advertises.
+	WorkloadHeadless = "headless"
 )
 
 // Extensions is the optional, namespaced negotiation map carried on
@@ -111,8 +136,40 @@ type Extensions struct {
 }
 
 // supported is the set of extension names this build understands. Membership is
-// what makes a Required entry satisfiable.
+// what makes a Required entry satisfiable. ExtContinuationCheckpoint stays
+// optional-only (a required advertisement is refused) and ExtWorkload is
+// informational (an older controller must still complete version selection),
+// so neither joins this set.
 var supported = map[string]bool{ExtCarrierEpoch: true}
+
+// Workload reports the optional workload-profile advertisement carried in the
+// Hello extension map. Absence means the interactive profile: every released
+// shim predates the field, and only a headless shim sets it. A present but
+// unassigned value is a protocol defect, surfaced rather than guessed.
+func (e Extensions) Workload() (Profile, error) {
+	value, ok := e.Values[ExtWorkload]
+	if !ok {
+		return ProfileInteractive, nil
+	}
+	if Profile(value) != ProfileHeadless {
+		return "", fmt.Errorf("shimwire: %w: unknown workload %q", ErrMalformed, value)
+	}
+	return ProfileHeadless, nil
+}
+
+// checkWorkloadRange enforces the contract's binding between the workload
+// advertisement and the advertised range: the headless key on a shim whose
+// range includes a version below 6 is malformed. The value registry alone
+// (Extensions.Workload) is not enough, because a headless Hello on [1,6] would
+// otherwise decode cleanly as headless while a released controller selects an
+// interactive version from the same range. Only the minimum matters: a range
+// that starts at 6 or above includes no version below 6.
+func checkWorkloadRange(profile Profile, advertisedMin uint32) error {
+	if profile == ProfileHeadless && advertisedMin < V6 {
+		return fmt.Errorf("shimwire: %w: headless workload on a range that includes v%d", ErrMalformed, advertisedMin)
+	}
+	return nil
+}
 
 // CheckRequired fails closed when the peer requires an extension this build does
 // not understand. An empty Required set always passes, so an OSS-only peer that

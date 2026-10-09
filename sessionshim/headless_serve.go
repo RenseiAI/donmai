@@ -17,24 +17,45 @@ import (
 // its sole sequence-bearing message.
 const headlessTerminalSeq = 1
 
-// RunnerProcess is the headless profile's owned process: the runner's process
-// group, supervised without a PTY. It is the headless analogue of the
-// interactive profile's ptyhost.Session: the thing the shim watches, stops,
-// and proves gone before it writes the terminal observation.
+// RunnerProcess is the headless profile's owned run: the runner and the
+// harness process group(s) it drives, supervised without a PTY. It is the
+// headless analogue of the interactive profile's ptyhost.Session: the thing
+// the shim watches, stops, and proves gone before it writes the terminal
+// observation.
+//
+// The runner may be hosted in the shim's own process (ADR-2026-10-07 D1,
+// Option C: the worker process hosts the shim in process). Nothing in this
+// contract may therefore lean on the runner's PID being a separate process:
+// the PID is correlation only, Stop never signals the shim's own process
+// group, and the reap proof comes from the harness groups, never from the
+// runner PID.
 type RunnerProcess interface {
-	// PID is the runner's process id.
+	// PID is the runner's process id. Under Option C it is the shim's own
+	// PID. It is recorded as correlation (the record's and Hello's harness
+	// identity), never used as the reap proof.
 	PID() int
-	// Done closes when the runner exits.
+	// Done closes when the run has ended: the runner's work is over and it
+	// has waited its harness processes.
 	Done() <-chan struct{}
 	// Exit reports the runner's terminal exit. It is called after Done
 	// closes; like ptyhost.Session.Exit, the second value reports whether
 	// the observation is authoritative.
 	Exit() (RunnerExit, bool)
-	// Stop runs the bounded teardown: signal the runner's process group,
-	// wait for it, and return. It mirrors ptyhost.Session.Stop's contract —
-	// a bounded SIGTERM→grace→SIGKILL on the owned group — so the orphan
-	// deadline and a generation-fenced Stop share one teardown semantic.
+	// Stop runs the bounded teardown: end the runner's work, signal every
+	// harness process group it owns, wait for them, and return. It mirrors
+	// ptyhost.Session.Stop's contract — a bounded SIGTERM→grace→SIGKILL on
+	// the owned groups — so the orphan deadline and a generation-fenced Stop
+	// share one teardown semantic. A runner hosted in the shim's own process
+	// must never signal its own process group: the shim lives there.
 	Stop(ctx context.Context) error
+	// HarnessGroupsReaped is the reap proof the terminal observation carries
+	// as groupReaped: true only when every harness process group the runner
+	// started is proved to have no member left (ProcessGroupGone is the
+	// primitive for that). It must not be answered from the runner's own PID,
+	// which under Option C is the shim's process and is alive while the
+	// tombstone is written. An error means unproved, which the tombstone
+	// records as not reaped.
+	HarnessGroupsReaped() (bool, error)
 }
 
 // RunnerExit is a runner's terminal exit: the process exit code and, when the
@@ -76,10 +97,9 @@ type HeadlessOptions struct {
 	// ProcessEpoch is the monotonic per-session value for this shim incarnation.
 	ProcessEpoch uint64
 
-	// ProtocolMin/ProtocolMax optionally narrow this shim's supported range.
-	// Zero/zero uses the build range.
-	ProtocolMin uint32
-	ProtocolMax uint32
+	// There is deliberately no protocol-range option: a headless shim
+	// advertises exactly [shimwire.HeadlessMin, shimwire.HeadlessMax], the
+	// contract's [6,6], and refuses every lower selection.
 
 	Logger *slog.Logger
 
@@ -96,6 +116,11 @@ type HeadlessOptions struct {
 // plane directly, never sequenced through the daemon. The runner's own exit,
 // after the harness group is proved gone, is the terminal observation.
 //
+// It advertises exactly [shimwire.HeadlessMin, shimwire.HeadlessMax] (the
+// contract's [6,6]) and refuses any lower selection, so a controller that
+// predates the headless profile quarantines it as protocol_mismatch instead of
+// adopting it as a terminal session.
+//
 // Like Start, the socket exists before the record names it, and the orphan
 // clock starts immediately: a shim whose creating daemon dies before it ever
 // adopts must still be bounded.
@@ -111,8 +136,6 @@ func StartHeadless(opts HeadlessOptions) (*Shim, error) {
 		WorkareaRoot: opts.WorkareaRoot,
 		Orphan:       opts.Orphan,
 		ProcessEpoch: opts.ProcessEpoch,
-		ProtocolMin:  opts.ProtocolMin,
-		ProtocolMax:  opts.ProtocolMax,
 		Now:          opts.Now,
 	}
 	if opts.Logger != nil {
@@ -132,11 +155,11 @@ func StartHeadless(opts HeadlessOptions) (*Shim, error) {
 	}
 	runnerStart, startErr := processStartTime(pid)
 	if startErr != nil {
-		// The runner is supervised but its identity cannot be pinned.
-		// Continuing would leave a tombstone that cannot distinguish
-		// "reaped" from "pid reused", so fail closed without stopping the
-		// runner: unlike the interactive profile's freshly spawned harness,
-		// this process was already running before the shim took ownership.
+		// The runner is supervised but its identity cannot be pinned, and
+		// the record, Hello and tombstone carry that identity as their
+		// correlation. Fail closed without stopping the runner: unlike the
+		// interactive profile's freshly spawned harness, this process was
+		// already running before the shim took ownership.
 		_ = ln.Close()
 		_ = os.Remove(socketPath)
 		return nil, fmt.Errorf("sessionshim: pin headless runner process identity: %w", startErr)
@@ -247,12 +270,15 @@ func (s *Shim) terminateRunner(ctx context.Context) error {
 func (s *Shim) finalizeHeadlessTerminal(cause HeadlessExitCause) error {
 	exit, _ := s.runner.Exit()
 
-	// Proof, not assumption: ask the OS whether the recorded runner incarnation
-	// is really gone. A tombstone that claims a reap it did not verify is worse
-	// than no tombstone, because the release rule lets a proven tombstone
-	// release a claim.
-	alive, aliveErr := s.harness.Alive()
-	reaped := aliveErr == nil && !alive
+	// Proof, not assumption: the runner proves its harness process groups
+	// gone. A tombstone that claims a reap it did not verify is worse than no
+	// tombstone, because the release rule lets a proven tombstone release a
+	// claim. The runner PID is deliberately not the proof: a runner hosted in
+	// the shim's own process (Option C) is alive right here, so a PID proof
+	// would never pass, and an out-of-process runner's exit says nothing about
+	// a harness group it left behind.
+	groupsReaped, reapErr := s.runner.HarnessGroupsReaped()
+	reaped := reapErr == nil && groupsReaped
 
 	s.mu.Lock()
 	if s.tombstoned {
@@ -325,17 +351,25 @@ func (s *Shim) finalizeHeadlessTerminal(cause HeadlessExitCause) error {
 }
 
 // serveHeadlessController runs one adopted headless controller connection:
-// the generation fence on Stop and Heartbeat, refusal of every PTY-shaped
-// type, and the terminal courtesy. Heartbeat doubles as the terminal
-// acknowledgement: ackedSeq 1 after the tombstone is durable is the receipt.
+// the generation fence on Stop, Heartbeat and CredentialUpdate, refusal of
+// every PTY-shaped type, and the terminal courtesy. Heartbeat doubles as the
+// terminal acknowledgement: ackedSeq 1 after the tombstone is durable is the
+// receipt.
+//
+// Every frame is read through readControllerFrame, which reads a headless
+// connection with shimwire's profile reader: a PTY-shaped type is answered
+// Error{code:"malformed"} at the read and never reaches dispatchHeadless.
 func (s *Shim) serveHeadlessController(ctrl *controllerConn, r *shimwire.Reader) {
 	defer s.loseController(ctrl)
 	for {
-		msg, err := r.ReadVersion(ctrl.selected)
+		frame, err := s.readControllerFrame(ctrl, r)
 		if err != nil {
 			return
 		}
-		if end := s.dispatchHeadless(ctrl, msg); end {
+		if frame.Handled {
+			continue
+		}
+		if end := s.dispatchHeadless(ctrl, frame.Message); end {
 			return
 		}
 	}
@@ -371,20 +405,18 @@ func (s *Shim) dispatchHeadless(ctrl *controllerConn, msg shimwire.Message) (end
 			return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat did not decode") != nil
 		}
 		return s.persistHeadlessHeartbeatAck(ctrl, heartbeat) != nil
+	case shimwire.TypeCredentialUpdate:
+		// Legal on both profiles at selected v6: the same correlation, ledger
+		// and generation fence the interactive dispatch applies.
+		return s.dispatchCredentialUpdate(ctrl, msg.Body) != nil
 	case shimwire.TypeError:
 		return false // display-only from the controller; nothing to act on
-	case shimwire.TypeHello, shimwire.TypeWelcome, shimwire.TypeAdopted,
-		shimwire.TypeOutput, shimwire.TypeGap, shimwire.TypeSnapshot,
-		shimwire.TypeInput, shimwire.TypeResize, shimwire.TypeExit,
-		shimwire.TypeSnapshotRequest, shimwire.TypeSnapshotResult,
-		shimwire.TypeHostFrame, shimwire.TypeAttributedInput,
-		shimwire.TypeCheckpointRequest, shimwire.TypeCheckpointResult:
-		// Every PTY-shaped type — and every shim-originated type a
-		// controller must never send — is refused without action. The
-		// connection stays up so the controller can read WHY it was
-		// refused rather than retrying the same frame forever.
-		return sendError(ctrl.w, shimwire.CodeMalformed, "message type is not legal on a headless connection") != nil
 	default:
+		// Every PTY-shaped type was already refused at the profile read, so
+		// what reaches here is a shim-originated type a controller must never
+		// send (Hello, Welcome, Adopted, CredentialResult, HeadlessExit). It is
+		// refused without action; the connection stays up so the controller
+		// can read WHY rather than retrying the same frame forever.
 		return sendError(ctrl.w, shimwire.CodeMalformed, "message type is not controller-originated") != nil
 	}
 }

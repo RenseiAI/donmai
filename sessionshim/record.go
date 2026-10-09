@@ -168,6 +168,15 @@ func (r Record) Validate() error {
 	if r.ProtocolMin == 0 || r.ProtocolMin > r.ProtocolMax {
 		return fmt.Errorf("%w: inverted protocol range [%d,%d]", ErrRecordInvalid, r.ProtocolMin, r.ProtocolMax)
 	}
+	if r.Workload == WorkloadHeadless && r.ProtocolMin < shimwire.V6 {
+		// The contract binds the headless workload to a range with no version
+		// below 6 (session-shim v6 §1). A headless record on a lower range is
+		// the shape a controller that predates the headless profile could
+		// select and treat as a terminal session, so it is malformed and
+		// quarantined as record_malformed, never adopted.
+		return fmt.Errorf("%w: headless record on protocol range [%d,%d], which includes a version below %d",
+			ErrRecordInvalid, r.ProtocolMin, r.ProtocolMax, shimwire.V6)
+	}
 	if !r.Phase.Known() {
 		return fmt.Errorf("%w: unknown phase %q", ErrRecordInvalid, r.Phase)
 	}

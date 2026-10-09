@@ -16,13 +16,17 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
-// fakeRunner is a controllable RunnerProcess: a real spawned process the
-// headless shim supervises without spawning anything of its own. It sleeps
-// until stopped or finished, so its PID pins, its exit is observed, and the
-// reap is proven against the OS rather than asserted.
+// fakeRunner is a controllable out-of-process RunnerProcess: a real spawned
+// process the headless shim supervises without spawning anything of its own.
+// It sleeps until stopped or finished, so its PID pins, its exit is observed,
+// and the reap is proven against the OS rather than asserted. Its harness is
+// that one pinned process, so its reap proof is the pinned identity being
+// gone; the in-process runner (inProcessRunner) proves a harness group gone
+// instead.
 type fakeRunner struct {
 	mu       sync.Mutex
 	cmd      *exec.Cmd
+	identity ProcessIdentity
 	done     chan struct{}
 	exit     RunnerExit
 	exitOK   bool
@@ -37,7 +41,12 @@ func newFakeRunner(t *testing.T) *fakeRunner {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fake runner: %v", err)
 	}
-	f := &fakeRunner{cmd: cmd, done: make(chan struct{})}
+	started, err := processStartTime(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("pin fake runner identity: %v", err)
+	}
+	f := &fakeRunner{cmd: cmd, identity: ProcessIdentity{PID: cmd.Process.Pid, StartedAt: started}, done: make(chan struct{})}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
@@ -90,6 +99,15 @@ func (f *fakeRunner) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// HarnessGroupsReaped proves the one pinned harness process gone.
+func (f *fakeRunner) HarnessGroupsReaped() (bool, error) {
+	alive, err := f.identity.Alive()
+	if err != nil {
+		return false, err
+	}
+	return !alive, nil
 }
 
 func (f *fakeRunner) wasStopped() bool {
@@ -220,7 +238,7 @@ func TestHeadlessAdoptionServesHelloAdoptedHeartbeat(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ctrl, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-headless"})
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-headless"})
 	if err != nil {
 		t.Fatalf("Dial headless record: %v", err)
 	}
@@ -254,7 +272,7 @@ func TestHeadlessFenceRefusesStaleGeneration(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ctrl, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-fence"})
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-fence"})
 	if err != nil {
 		t.Fatalf("Dial headless record: %v", err)
 	}
@@ -470,7 +488,7 @@ func TestHeadlessHeartbeatBeyondTerminalSequenceIsMalformed(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ctrl, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-ahead"})
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-ahead"})
 	if err != nil {
 		t.Fatalf("Dial headless record: %v", err)
 	}
@@ -525,7 +543,7 @@ func TestHeadlessNewerControllerSupersedesLiveOld(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	old, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-old"})
+	old, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-old"})
 	if err != nil {
 		t.Fatalf("Dial old controller: %v", err)
 	}
@@ -536,7 +554,7 @@ func TestHeadlessNewerControllerSupersedesLiveOld(t *testing.T) {
 	oldGen := old.Generation()
 
 	// The old controller still holds its socket open here.
-	fresh, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-new", DialTimeout: 8 * time.Second})
+	fresh, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-new", DialTimeout: 8 * time.Second})
 	if err != nil {
 		t.Fatalf("Dial newer controller while the old one holds its socket: %v", err)
 	}
@@ -577,5 +595,94 @@ func TestHeadlessNewerControllerSupersedesLiveOld(t *testing.T) {
 		case <-time.After(time.Until(deadline)):
 			t.Fatal("no stale_generation refusal for the superseded generation's Stop")
 		}
+	}
+}
+
+// TestHeadlessFrameLevelMalformedEndsTheConnection pins the headless control
+// read's handling of a frame-level defect: a zero-length frame or an
+// unassigned type is never answered and never skipped — it ends the
+// connection exactly as it does on the interactive profile — while the runner
+// keeps running and a fresh controller can adopt again. Only a decoded
+// PTY-shaped type is an answered profile refusal that keeps the connection.
+func TestHeadlessFrameLevelMalformedEndsTheConnection(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeRunner(t)
+	_, registry, id := startHeadlessFixture(t, runner, 1)
+	rec, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := []struct {
+		name  string
+		bytes []byte
+	}{
+		{"zero length", []byte{0, 0, 0, 0}},
+		{"unassigned type", []byte{0, 0, 0, 3, 0x16, '{', '}'}},
+	}
+	for _, frame := range frames {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-" + frame.name})
+		cancel()
+		if err != nil {
+			t.Fatalf("%s: Dial headless record: %v", frame.name, err)
+		}
+		if _, err := ctrl.conn.Write(frame.bytes); err != nil {
+			t.Fatalf("%s: write frame: %v", frame.name, err)
+		}
+		select {
+		case <-ctrl.Done():
+		case <-time.After(5 * time.Second):
+			_ = ctrl.Close()
+			t.Fatalf("%s: the headless connection survived a frame-level malformed frame; it was silently skipped", frame.name)
+		}
+		_ = ctrl.Close()
+		if runner.wasStopped() {
+			t.Fatalf("%s: a malformed frame stopped the runner", frame.name)
+		}
+	}
+}
+
+// TestHeadlessCredentialUpdateAfterTheTerminalAnswersInternal pins the
+// contract's post-terminal answer (session-shim v6 §3): once the shim has
+// written its terminal observation, a fenced CredentialUpdate is answered
+// internal — never exited, and never a success claiming a runner now holds
+// the pair.
+func TestHeadlessCredentialUpdateAfterTheTerminalAnswersInternal(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeRunner(t)
+	shim, registry, id := startHeadlessFixture(t, runner, 1)
+	rec, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-post-terminal"})
+	if err != nil {
+		t.Fatalf("Dial headless record: %v", err)
+	}
+	defer func() { _ = ctrl.Close() }()
+
+	expires := time.Now().Add(time.Hour).UnixNano()
+	live, err := ctrl.PushCredential(ctx, 1, "worker-live", "bearer-live", expires)
+	if err != nil || live.Status != shimwire.CredentialSuccess {
+		t.Fatalf("live PushCredential = %+v, %v; want success", live, err)
+	}
+	if err := ctrl.Stop(shimwire.StopOperator); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-shim.TerminalDone():
+	case <-time.After(10 * time.Second):
+		t.Fatal("no terminal observation after a fenced Stop")
+	}
+	after, err := ctrl.PushCredential(ctx, 2, "worker-after", "bearer-after", expires)
+	if after.Status != shimwire.CredentialInternal {
+		t.Fatalf("post-terminal PushCredential = %+v, %v; want status internal", after, err)
+	}
+	if !errors.Is(err, shimwire.ErrSnapshotRefused) {
+		t.Fatalf("post-terminal PushCredential error = %v, want the closed refusal", err)
 	}
 }
