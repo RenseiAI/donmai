@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.71 — 2026-10-09
+
 ### Features
 
 - The claude harness attests the `session-root-v1` multi-repository workarea protocol for declarations whose repositories are all mutable. Every declared mutable repository path is granted as an additional directory (`--add-dir`), session working directory first, in headless and interactive sessions alike, so the agent can work in each writable repository while its working directory stays the selected one. A declaration that carries a read-only repository is still refused on this harness. Interactive claude sessions now pass `--add-dir <working directory>` as headless sessions already did, with or without a declaration.
