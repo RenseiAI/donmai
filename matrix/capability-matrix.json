@@ -104,6 +104,9 @@
         "toolPermissionFormat": "claude",
         "streamingTransport": "ndjson",
         "interactivePty": true,
+        "multiRepositoryWorkareaProtocols": [
+          "session-root-v1"
+        ],
         "noticeDelivery": "hook",
         "drives": [
           "anthropic-messages"
@@ -1810,5 +1813,91 @@
     }
   ],
   "realizations": [],
-  "capabilities": []
+  "capabilities": [],
+  "resumeQualification": [
+    {
+      "harness": "antigravity",
+      "adapterVersion": "antigravity/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "claude-code",
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "claude-code",
+      "adapterVersion": "claude-code/interactive/tool-lifecycle-v1",
+      "mode": "human_controlled",
+      "resumeQualified": false
+    },
+    {
+      "harness": "codex",
+      "adapterVersion": "codex/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "codex",
+      "adapterVersion": "codex/interactive/tool-lifecycle-v1",
+      "mode": "human_controlled",
+      "resumeQualified": false
+    },
+    {
+      "harness": "codex",
+      "adapterVersion": "codex/interactive/tool-lifecycle-v2",
+      "mode": "human_controlled",
+      "resumeQualified": false
+    },
+    {
+      "harness": "gemini-direct",
+      "adapterVersion": "gemini-direct/gemini-generate/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "ollama",
+      "adapterVersion": "ollama/ollama-chat/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "opencode",
+      "adapterVersion": "opencode/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "pi",
+      "adapterVersion": "pi/headless/tool-lifecycle-v2",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "pi",
+      "adapterVersion": "pi/interactive/tool-lifecycle-v6",
+      "mode": "human_controlled",
+      "resumeQualified": false
+    },
+    {
+      "harness": "shell",
+      "adapterVersion": "shell/interactive/tool-lifecycle-v1",
+      "mode": "human_controlled",
+      "resumeQualified": false
+    },
+    {
+      "harness": "stub",
+      "adapterVersion": "stub/interactive/tool-lifecycle-v1",
+      "mode": "human_controlled",
+      "resumeQualified": false
+    },
+    {
+      "harness": "stub",
+      "adapterVersion": "stub/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    }
+  ]
 }

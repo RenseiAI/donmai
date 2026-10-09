@@ -203,6 +203,16 @@ type SessionDetail struct {
 	// attribute usage to the correct metered/shared pool.
 	CredentialPoolID string `json:"credentialPoolId,omitempty"`
 
+	// ControlTokenPath is the daemon-resolved control-token file path
+	// (Options.ControlTokenPath), stamped at accept time so the spawned
+	// worker's seat confinement can deny the live token file explicitly
+	// instead of resolving the path-override variable the spawner
+	// strips from its environment. Empty when the daemon states none —
+	// the worker then resolves the path from its own environment as
+	// before. Cleared from redacted reads: only a credentialed holder
+	// (the operator, or the session's own read credential) receives it.
+	ControlTokenPath string `json:"controlTokenPath,omitempty"`
+
 	// ── Phase 2 stage-driven SDLC fields ───────
 	//
 	// Forwarded opaquely from PollWorkItem; the daemon does not parse
@@ -781,6 +791,10 @@ func redactSessionDetail(d *SessionDetail) *SessionDetail {
 	out.AuthToken = ""
 	out.McpAuthToken = ""
 	out.McpAuthTokenExpiresAt = ""
+	// The stated token path answers the same credentialed read as the
+	// runtime credentials: it names the host file the seat confinement
+	// denies, so a credential-free local read must not carry it.
+	out.ControlTokenPath = ""
 	// The redacted copy answers credential-free local reads, so the
 	// operator-configured repository URL is served userinfo-redacted: a
 	// user:token@ authority would otherwise be readable by anything on

@@ -12,6 +12,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/tui-components/theme"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestIdentityObservedResponseAndCardSurviveRefresh(t *testing.T) {
@@ -39,16 +40,51 @@ func TestIdentityObservedResponseAndCardSurviveRefresh(t *testing.T) {
 	assertIdentityText(t, m.cards[0], "Model identity fallback-id", "Actual provider unknown", "Model version unknown")
 }
 
+// assertIdentityText checks "<Label> <value>" pairs against the session
+// detail view: the structured field must hold exactly that value, and the
+// rendered detail (plain and styled) must show it on the label's row.
 func assertIdentityText(t *testing.T, c SessionCard, wants ...string) {
 	t.Helper()
-	for _, plain := range []bool{true, false} {
-		text := renderCard(theme.DefaultTheme(), c, 0, true, plain, time.Now())
-		for _, want := range wants {
-			if !strings.Contains(text, want) {
-				t.Errorf("plain=%v missing %q:\n%s", plain, want, text)
+	now := time.Now()
+	fields := detailFields(c, now)
+	for _, want := range wants {
+		label := ""
+		for _, f := range fields {
+			if strings.HasPrefix(strings.ToLower(want), strings.ToLower(f.label)+" ") && len(f.label) > len(label) {
+				label = f.label
+			}
+		}
+		if label == "" {
+			t.Errorf("no detail field for %q", want)
+			continue
+		}
+		value := want[len(label)+1:]
+		if got := detailValue(fields, label); got != value {
+			t.Errorf("detail %s = %q, want %q", label, got, value)
+		}
+		for _, plain := range []bool{true, false} {
+			rows := renderDetail(theme.DefaultTheme(), c, now, 80, 0, plain) // one field per row
+			found := false
+			for _, row := range rows {
+				row = ansi.Strip(row)
+				if strings.HasPrefix(row, label+" ") && strings.TrimSpace(row[len(label):]) == value {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("plain=%v rendered detail lacks %s %q:\n%s", plain, label, value, strings.Join(rows, "\n"))
 			}
 		}
 	}
+}
+
+func detailValue(fields []detailField, label string) string {
+	for _, f := range fields {
+		if strings.EqualFold(f.label, label) {
+			return f.value
+		}
+	}
+	return ""
 }
 
 func TestIdentityRunReplacementRejectsStaleTailBatch(t *testing.T) {
@@ -134,18 +170,24 @@ func TestIdentityMetadataStatusEventCodecAndTerminalUsage(t *testing.T) {
 
 func TestIdentityRenderStripsNativeTerminalControlsAndBudgetsRows(t *testing.T) {
 	hostile := "東京" + "\x1b]52;c;clipboard-secret\x07" + "\x1b[2J" + "\n\r\t" + strings.Repeat("界", 100)
-	card := SessionCard{AgentCardID: hostile, AgentCardName: hostile, ActualModel: hostile, ActualModelProvider: hostile, ActualModelVersion: hostile}
+	card := SessionCard{AgentCardID: hostile, AgentCardName: hostile, ActualModel: hostile, ActualModelProvider: hostile, ActualModelVersion: hostile, IssueTitle: hostile, LastActivity: hostile}
+	const width = 44
 	for _, plain := range []bool{true, false} {
-		out := renderCard(theme.DefaultTheme(), card, 0, true, plain, time.Now())
-		if strings.Contains(out, "clipboard-secret") || strings.Contains(out, "\x1b]52") || strings.Contains(out, "\x1b[2J") || strings.ContainsAny(out, "\r\t") {
-			t.Fatalf("plain=%v native terminal control escaped sanitation: %q", plain, out)
+		rendered := map[string]string{
+			"card":   renderCard(theme.DefaultTheme(), card, 0, true, plain, time.Now(), width),
+			"detail": strings.Join(renderDetail(theme.DefaultTheme(), card, time.Now(), width, 0, plain), "\n"),
 		}
-		if !strings.Contains(out, "東京") {
-			t.Fatalf("plain=%v printable Unicode disappeared", plain)
-		}
-		for _, line := range strings.Split(out, "\n") {
-			if width := lipgloss.Width(line); width > cardWidth {
-				t.Fatalf("plain=%v physical row width %d exceeds %d: %q", plain, width, cardWidth, line)
+		for name, out := range rendered {
+			if strings.Contains(out, "clipboard-secret") || strings.Contains(out, "\x1b]52") || strings.Contains(out, "\x1b[2J") || strings.ContainsAny(out, "\r\t") {
+				t.Fatalf("plain=%v %s: native terminal control escaped sanitation: %q", plain, name, out)
+			}
+			if !strings.Contains(out, "東京") {
+				t.Fatalf("plain=%v %s: printable Unicode disappeared", plain, name)
+			}
+			for _, line := range strings.Split(out, "\n") {
+				if w := lipgloss.Width(line); w > width {
+					t.Fatalf("plain=%v %s: physical row width %d exceeds %d: %q", plain, name, w, width, line)
+				}
 			}
 		}
 	}

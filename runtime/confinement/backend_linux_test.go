@@ -1338,3 +1338,80 @@ func TestLandlockStage_LeavesTCPOpen(t *testing.T) {
 		t.Fatalf("listener accepts: undeclared=%d declared=%d; want both reached", undeclared.accepted(), declared.accepted())
 	}
 }
+
+// TestRenderBubblewrap_DaemonPrivate pins the daemon-private rendering: a
+// daemon-private path a bind reveals is hidden behind the empty placeholder
+// after every reveal (a token nested inside the writable set too), and a
+// daemon-private directory a bind reveals (the host state home that holds
+// the work area) is emptied with a tmpfs right after that bind and before
+// anything is bound beneath it, so a token in it needs no placeholder — it
+// is gone, and so is one minted after spawn — while the session's own paths
+// beneath it are bound back. An emptied directory a later bind would cover,
+// or one that would bury an earlier bind, refuses.
+func TestRenderBubblewrap_DaemonPrivate(t *testing.T) {
+	w := newLinuxWorld(t)
+	token := filepath.Join(w.stateHome, "control-token")
+	nestedDir := filepath.Join(w.mut, "daemon-state")
+	nested := filepath.Join(nestedDir, "control-token")
+	if err := os.MkdirAll(nestedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{token, nested} {
+		if err := os.WriteFile(file, []byte("sentinel\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	emptyFile := filepath.Join(os.TempDir(), "donmai-confine-empty", "file")
+
+	t.Run("daemon-private paths hide where revealed", func(t *testing.T) {
+		r := w.resolved()
+		r.Denied = []string{nested, token}
+		args := mustRenderBubblewrap(t, r, nil)
+		for _, path := range []string{token, nested} {
+			if !hasTriple(bindTargets(args), "--ro-bind", emptyFile, path) {
+				t.Errorf("daemon-private path %q is not hidden behind the empty placeholder:\n%s", path, joinArgs(args))
+			}
+		}
+	})
+	t.Run("a daemon-private directory is emptied before the binds beneath it", func(t *testing.T) {
+		r := w.resolved()
+		r.Denied = []string{nested, token}
+		r.DeniedListings = []string{w.stateHome}
+		args := mustRenderBubblewrap(t, r, nil)
+		text := joinArgs(args)
+		reveal := strings.Index(text, "\n--ro-bind\n"+w.stateHome+"\n"+w.stateHome+"\n")
+		emptied := strings.Index(text, "\n--tmpfs\n"+w.stateHome+"\n")
+		rebound := strings.Index(text, "\n--bind\n"+w.mut+"\n"+w.mut+"\n")
+		if reveal < 0 || emptied < 0 || rebound < 0 || !(reveal < emptied && emptied < rebound) {
+			t.Fatalf("want the state home revealed, then emptied, then the work area bound beneath it (%d, %d, %d):\n%s", reveal, emptied, rebound, text)
+		}
+		if strings.Contains(text, token) {
+			t.Errorf("a token inside the emptied directory still renders a bind:\n%s", text)
+		}
+		if !hasTriple(bindTargets(args), "--ro-bind", emptyFile, nested) {
+			t.Errorf("the nested token the work area re-exposes is not hidden:\n%s", text)
+		}
+		for _, root := range r.Writable {
+			if !hasTriple(bindTargets(args), "--bind", root.Path, root.Path) {
+				t.Errorf("writable root %q is not bound back beneath the emptied directory:\n%s", root.Path, text)
+			}
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		dir  string
+	}{
+		{"one a later bind covers", w.state},
+		{"one that would bury an earlier bind", w.home},
+	} {
+		t.Run("a daemon-private directory "+tc.name+" refuses", func(t *testing.T) {
+			r := w.resolved()
+			r.DeniedListings = []string{tc.dir}
+			if _, err := renderBubblewrap(r, nil, linuxIdentity, ""); err == nil {
+				t.Fatalf("daemon-private directory %q rendered", tc.dir)
+			} else if reason, _ := ReasonOf(err); reason != ReasonWritableSetUnrepresentable {
+				t.Fatalf("err=%v, want writable_set_unrepresentable", err)
+			}
+		})
+	}
+}

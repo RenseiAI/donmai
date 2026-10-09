@@ -948,6 +948,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	if _, err := r.store.Update(runnerStatePath, func(s *state.State) error {
 		journalBoundaryErr = stampRunJournalBoundary(s, qw.SessionID, startedAt, runnerStatePath)
 		s.IssueIdentifier = qw.IssueIdentifier
+		s.IssueTitle = qw.Title
 		s.IssueID = qw.IssueID
 		s.SessionID = qw.SessionID
 		s.ProviderName = provider.Name()
@@ -3135,6 +3136,10 @@ func (r *Runner) resolveKitDemand(qw QueuedWork, wpath string, res *Result) *kit
 		demand.Commands = append([]kit.QualifiedCommand(nil), composed.Commands...)
 		demand.CommandBindings = append([]kit.GenericCommandBinding(nil), composed.CommandBindings...)
 		demand.CompositionDigest = composed.CompositionDigest
+		// The dependency-store plan is local authority too: a payload's own
+		// dependency_stores never survive the preflight.
+		demand.DependencyStores = append([]kit.ComposedDependencyStore(nil), composed.DependencyStores...)
+		demand.DependencyStoresDigest = composed.DependencyStoresDigest
 		r.logger.Info("kit toolchain: using platform-supplied lifecycle demand after command composition preflight",
 			"sessionId", qw.SessionID,
 			"os", demand.OS,

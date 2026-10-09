@@ -158,6 +158,14 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 		argv = append(argv, "--name", spec.SessionName)
 	}
 
+	// The interactive REPL accepts the same --add-dir working-directory
+	// grants as the headless lane (buildArgs): every declared mutable
+	// repository path, with the session CWD first. It must not diverge
+	// from buildArgs' mapping — see additionalWorkdirs.
+	for _, dir := range additionalWorkdirs(spec) {
+		argv = append(argv, "--add-dir", dir)
+	}
+
 	// Notice channel first: it is a session-level flag like the rest, and every
 	// flag-shaped argument must precede the positional prompt.
 	if settingsJSON != "" {

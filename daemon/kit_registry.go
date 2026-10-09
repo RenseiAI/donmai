@@ -37,8 +37,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/BurntSushi/toml"
-
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
@@ -214,6 +212,12 @@ type kitManifestTOML struct {
 			OS   []string `toml:"os"`
 			Arch []string `toml:"arch"`
 		} `toml:"lanes"`
+		// DependencyStores is [[provide.dependency_store]] — one entry per
+		// package manager the kit supports. Introduced with the v2
+		// manifest api revision; validated and composed by internal/kit
+		// (ValidateDependencyStores, ComposeDependencyStores,
+		// SelectDependencyStores).
+		DependencyStores []kitDependencyStoreTOML `toml:"dependency_store"`
 	} `toml:"provide"`
 
 	Composition struct {
@@ -221,6 +225,71 @@ type kitManifestTOML struct {
 		ComposesWith  []string `toml:"composes_with"`
 		Order         string   `toml:"order"`
 	} `toml:"composition"`
+}
+
+// Supported manifest api revisions. v1 is the long-standing revision; v2
+// carries the kit-declared dependency-store contribution
+// ([[provide.dependency_store]]). A v1 consumer rejects v2 rather than
+// half-applying it; a v2 consumer continues to accept v1 manifests that
+// declare no dependency store.
+const (
+	kitManifestAPIV1       = "donmai.dev/v1"
+	kitManifestAPIV1Legacy = "rensei.dev/v1"
+	// kitManifestAPIV1Shorthand is the bare "v1" revision the registry's
+	// own skill-source fixtures (and pre-revision operator kits) declare.
+	// It predates the qualified revision strings and carries no
+	// dependency-store section; it is accepted as v1-family so existing
+	// working kits keep scanning.
+	kitManifestAPIV1Shorthand = "v1"
+	kitManifestAPIV2          = "donmai.dev/v2"
+)
+
+// kitManifestSupportedAPI is the set this binary understands. The legacy
+// scan path accepts v1 and v2; the package path gates the same set before
+// composition so a v2 package never reaches an older consumer's composer.
+func kitManifestSupportedAPI(api string) bool {
+	switch api {
+	case kitManifestAPIV1, kitManifestAPIV1Legacy, kitManifestAPIV1Shorthand, kitManifestAPIV2:
+		return true
+	}
+	return false
+}
+
+// kitDependencyStoreTOML is the on-disk TOML shape of one
+// [[provide.dependency_store]] entry. Commands is the generic command per
+// name; CommandsOverride is the OS-keyed specialization that wins for the
+// same store owned by the same kit.
+type kitDependencyStoreTOML struct {
+	Manager   string   `toml:"manager"`
+	Ecosystem string   `toml:"ecosystem"`
+	Lockfiles []string `toml:"lockfiles"`
+	Inputs    []string `toml:"inputs"`
+	Version   string   `toml:"version"`
+	Store     struct {
+		Env         []string          `toml:"env"`
+		Default     map[string]string `toml:"default"`
+		Sharing     string            `toml:"sharing"`
+		Integrity   string            `toml:"integrity"`
+		Content     []string          `toml:"content"`
+		Bookkeeping []string          `toml:"bookkeeping"`
+		Secrets     []string          `toml:"secrets"`
+		NeverShare  []string          `toml:"never_share"`
+		RecordsPath bool              `toml:"records_path"`
+	} `toml:"store"`
+	Import struct {
+		Env map[string]string `toml:"env"`
+	} `toml:"import"`
+	Commands         map[string]string            `toml:"commands"`
+	CommandsOverride map[string]map[string]string `toml:"commands_override"`
+	Snapshot         struct {
+		Installed       []string `toml:"installed"`
+		ABI             []string `toml:"abi"`
+		Relocation      string   `toml:"relocation"`
+		RunsPackageCode bool     `toml:"runs_package_code"`
+	} `toml:"snapshot"`
+	Proxy struct {
+		Env map[string]string `toml:"env"`
+	} `toml:"proxy"`
 }
 
 // KitRegistry is a minimal in-process Kit registry.
@@ -575,8 +644,10 @@ func (r *KitRegistry) installFromGit(id string, source afclient.KitInstallSource
 
 	// Read the fetched manifest now so we can populate the install
 	// result envelope and double-check kit.id alignment with the
-	// requested id.
-	parsed, err := loadKitManifestFile(fetched.ManifestPath)
+	// requested id. The strict loader applies the api revision gate so
+	// a fetched manifest the installed daemon cannot faithfully apply
+	// fails the install instead of persisting a half-applied kit.
+	parsed, err := loadKitManifestFileStrict(fetched.ManifestPath)
 	if err != nil {
 		return afclient.KitInstallResult{}, fmt.Errorf("%w: parse fetched manifest: %w", ErrKitInstallManifestNotFound, err)
 	}
@@ -837,6 +908,20 @@ func (r *KitRegistry) scanWithPaths() ([]kitManifestTOML, []string) {
 				)
 				continue
 			}
+			if err := validateManifestAPIRevision(m); err != nil {
+				slog.Warn("kit registry: manifest revision rejected", //nolint:gosec // structured slog handler escapes values
+					"path", full,
+					"err", err.Error(),
+				)
+				continue
+			}
+			if _, err := dependencyStoreViews(m); err != nil {
+				slog.Warn("kit registry: dependency store entry rejected", //nolint:gosec // structured slog handler escapes values
+					"path", full,
+					"err", err.Error(),
+				)
+				continue
+			}
 			if m.Kit.ID == "" {
 				slog.Warn("kit registry: manifest missing kit.id", //nolint:gosec // structured slog handler escapes values
 					"path", full,
@@ -931,8 +1016,27 @@ func loadKitManifestFile(path string) (kitManifestTOML, error) {
 	if err != nil {
 		return m, fmt.Errorf("read manifest: %w", err)
 	}
-	if err := toml.Unmarshal(data, &m); err != nil {
+	if err := tomlUnmarshalKit(data, &m); err != nil {
 		return m, fmt.Errorf("parse manifest: %w", err)
+	}
+	return m, nil
+}
+
+// loadKitManifestFileStrict decodes a single .kit.toml file and applies
+// the api revision gate. Manifests carrying dependency stores under the
+// wrong revision, or declaring an unknown revision, are rejected rather
+// than half-applied. Used by install resolution paths that surface the
+// rejection as an error instead of scan-time exclusion.
+func loadKitManifestFileStrict(path string) (kitManifestTOML, error) {
+	m, err := loadKitManifestFile(path)
+	if err != nil {
+		return m, err
+	}
+	if err := validateManifestAPIRevision(m); err != nil {
+		return kitManifestTOML{}, err
+	}
+	if _, err := dependencyStoreViews(m); err != nil {
+		return kitManifestTOML{}, err
 	}
 	return m, nil
 }
@@ -995,30 +1099,31 @@ func (r *KitRegistry) saveStateLocked(st kitState) error {
 // manifestToKit converts a parsed TOML manifest to the wire Kit summary.
 func manifestToKit(m kitManifestTOML) afclient.Kit {
 	return afclient.Kit{
-		ID:                 m.Kit.ID,
-		Name:               m.Kit.Name,
-		Version:            m.Kit.Version,
-		Description:        m.Kit.Description,
-		Author:             m.Kit.Author,
-		AuthorID:           m.Kit.AuthorIdentity,
-		License:            m.Kit.License,
-		Homepage:           m.Kit.Homepage,
-		Repository:         m.Kit.Repository,
-		Priority:           m.Kit.Priority,
-		Source:             afclient.KitSourceLocal,
-		Scope:              afclient.KitScopeProject,
-		Trust:              afclient.KitTrustUnsigned,
-		InstallKind:        afclient.KitInstallKindLegacy,
-		DetectFiles:        copyStrings(m.Detect.Files),
-		DetectExec:         m.Detect.Exec,
-		ProvidesCommands:   len(m.Provide.Commands) > 0,
-		ProvidesPrompts:    len(m.Provide.PromptFragments) > 0,
-		ProvidesTools:      len(m.Provide.ToolPermissions) > 0,
-		ProvidesMCPServers: len(m.Provide.MCPServers) > 0,
-		ProvidesSkills:     len(m.Provide.Skills) > 0,
-		ProvidesAgents:     len(m.Provide.Agents) > 0,
-		ProvidesA2ASkills:  len(m.Provide.A2ASkills) > 0,
-		ProvidesExtractors: len(m.Provide.IntelligenceExtractors) > 0,
+		ID:                       m.Kit.ID,
+		Name:                     m.Kit.Name,
+		Version:                  m.Kit.Version,
+		Description:              m.Kit.Description,
+		Author:                   m.Kit.Author,
+		AuthorID:                 m.Kit.AuthorIdentity,
+		License:                  m.Kit.License,
+		Homepage:                 m.Kit.Homepage,
+		Repository:               m.Kit.Repository,
+		Priority:                 m.Kit.Priority,
+		Source:                   afclient.KitSourceLocal,
+		Scope:                    afclient.KitScopeProject,
+		Trust:                    afclient.KitTrustUnsigned,
+		InstallKind:              afclient.KitInstallKindLegacy,
+		DetectFiles:              copyStrings(m.Detect.Files),
+		DetectExec:               m.Detect.Exec,
+		ProvidesCommands:         len(m.Provide.Commands) > 0,
+		ProvidesPrompts:          len(m.Provide.PromptFragments) > 0,
+		ProvidesTools:            len(m.Provide.ToolPermissions) > 0,
+		ProvidesMCPServers:       len(m.Provide.MCPServers) > 0,
+		ProvidesSkills:           len(m.Provide.Skills) > 0,
+		ProvidesAgents:           len(m.Provide.Agents) > 0,
+		ProvidesA2ASkills:        len(m.Provide.A2ASkills) > 0,
+		ProvidesExtractors:       len(m.Provide.IntelligenceExtractors) > 0,
+		ProvidesDependencyStores: len(m.Provide.DependencyStores) > 0,
 	}
 }
 
@@ -1068,6 +1173,36 @@ func manifestToKitManifest(m kitManifestTOML, k afclient.Kit) afclient.KitManife
 	}
 	for _, x := range m.Provide.IntelligenceExtractors {
 		out.ExtractorNames = append(out.ExtractorNames, x.Name)
+	}
+	for _, s := range m.Provide.DependencyStores {
+		out.DependencyStores = append(out.DependencyStores, afclient.KitDependencyStore{
+			Manager:   s.Manager,
+			Ecosystem: s.Ecosystem,
+			Lockfiles: copyStrings(s.Lockfiles),
+			Inputs:    copyStrings(s.Inputs),
+			Version:   s.Version,
+			Store: afclient.KitDependencyStoreLayout{
+				Env:         copyStrings(s.Store.Env),
+				Default:     copyStringMap(s.Store.Default),
+				Sharing:     s.Store.Sharing,
+				Integrity:   s.Store.Integrity,
+				Content:     copyStrings(s.Store.Content),
+				Bookkeeping: copyStrings(s.Store.Bookkeeping),
+				Secrets:     copyStrings(s.Store.Secrets),
+				NeverShare:  copyStrings(s.Store.NeverShare),
+				RecordsPath: s.Store.RecordsPath,
+			},
+			ImportEnv:        copyStringMap(s.Import.Env),
+			Commands:         copyStringMap(s.Commands),
+			CommandsOverride: copyStringMapMap(s.CommandsOverride),
+			Snapshot: afclient.KitDependencyStoreSnapshot{
+				Installed:       copyStrings(s.Snapshot.Installed),
+				ABI:             copyStrings(s.Snapshot.ABI),
+				Relocation:      s.Snapshot.Relocation,
+				RunsPackageCode: s.Snapshot.RunsPackageCode,
+			},
+			ProxyEnv: copyStringMap(s.Proxy.Env),
+		})
 	}
 	return out
 }

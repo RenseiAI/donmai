@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -172,6 +173,151 @@ func corpusFixtures() []fixture {
 			"user@host:~$ \x1b[32mok\x1b[0m\x07\x1b]0;title\x07\x1b[6n\r\n",
 			"user@host:~$ \x1b[32mok\x1b[0m\r\n", "mixed", "mixed",
 		},
+
+		// --- UTF-8 inside string bodies ---------------------------------------
+		{
+			"osc_title_utf8_c1_continuation", "OSC 0 title whose payload holds a UTF-8 rune with a 0x9C continuation byte (U+2733, as a REPL writes for its idle title) is neutralized whole: 0x9C inside a rune is payload, not ST, so no title text reaches the prompt",
+			"\xe2\x9d\xaf \x1b]0;\xe2\x9c\xb3 session-name\x07", "\xe2\x9d\xaf ", "neutralize", "osc-title",
+		},
+		{
+			"apc_utf8_c1_continuation_strip", "an APC string whose payload holds a UTF-8 rune with a 0x9C continuation byte is stripped whole, through its real ST",
+			"\x1b_\xe2\x9c\xb3 hidden\x1b\\ok", "ok", "strip", "apc-pm",
+		},
+		{
+			"osc_utf8_encoded_c1_ends_string", "a UTF-8-encoded C1 control (U+009C) inside an OSC body ends the string for a UTF-8 terminal, so the sanitizer strips the string and sanitizes the rest from ground (the raw CSI 6n after it is stripped)",
+			"\x1b]8;;x\xc2\x9c\x9b6nok", "ok", "strip", "osc-8",
+		},
+		{
+			"dcs_malformed_header_utf8_strip", "a DCS whose header begins a UTF-8 rune with a 0x9C continuation byte is malformed and stripped whole, through its real ST",
+			"\x1bP\xe2\x9c\xb3 hidden\x1b\\ok", "ok", "strip", "dcs-decudk-decrqss",
+		},
+
+		// --- C1 controls a UTF-8 viewer would act on ----------------------------
+		{
+			"ground_utf8_c1_csi_strip", "a CSI introducer encoded as UTF-8 (U+009B) is stripped in ground, so C2 9B 6n cannot reach the viewer as a cursor position request",
+			"\xc2\x9b6n\xc2\x9bc", "6nc", "strip", "c1-utf8",
+		},
+		{
+			"ground_utf8_c1_osc_query_strip", "OSC introducer and ST encoded as UTF-8 (U+009D, U+009C) are stripped in ground, so a colour query cannot be smuggled past the OSC table",
+			"\xc2\x9d11;?\xc2\x9c", "11;?", "strip", "c1-utf8",
+		},
+		{
+			"ground_utf8_c1_dcs_decrqss_strip", "DCS introducer and ST encoded as UTF-8 (U+0090, U+009C) are stripped in ground, so DECRQSS cannot be smuggled past the DCS table",
+			"\xc2\x90$qm\xc2\x9c", "$qm", "strip", "c1-utf8",
+		},
+		{
+			"osc_raw_st_reemitted_7bit", "a passed OSC colour set ending in a raw 8-bit ST is re-emitted with ESC \\, so a UTF-8 viewer closes it there and the following '?' stays text instead of turning the set into a query",
+			"\x1b]10;\x9c?\x1b[m", "\x1b]10;\x1b\\?\x1b[m", "mixed", "osc-color-set",
+		},
+		{
+			"c1_osc8_reemitted_7bit", "an OSC 8 hyperlink with 8-bit introducer and ST passes in 7-bit form (ESC ] ... ESC \\), which a UTF-8 viewer parses the same way the sanitizer did",
+			"\x9d8;;https://example.com\x9clink", "\x1b]8;;https://example.com\x1b\\link", "display-only", "osc-8",
+		},
+		{
+			"sixel_c1_reemitted_7bit", "a Sixel DCS with 8-bit introducer and ST passes in 7-bit form (ESC P ... ESC \\)",
+			"\x90q#0~\x9c", "\x1bPq#0~\x1b\\", "pass", "dcs-sixel",
+		},
+
+		// --- Modes and queries that make the terminal write on its own ---------
+		{
+			"decset_inband_resize_strip", "setting ?2048 (in-band resize reports) is stripped: the terminal would write size reports on its input by itself",
+			"\x1b[?2048hok", "ok", "strip", "reply-modes",
+		},
+		{
+			"decset_color_scheme_reports_strip", "setting ?2031 (colour-scheme change reports) is stripped",
+			"\x1b[?2031hok", "ok", "strip", "reply-modes",
+		},
+		{
+			"decset_reply_mode_removed_from_mixed_set", "a reply mode is removed from a combined DECSET; the other modes still pass",
+			"\x1b[?1049;2048;2031:1;25h", "\x1b[?1049;25h", "mixed", "reply-modes",
+		},
+		{
+			"decrst_reply_modes_pass", "resetting ?2048 and ?2031 passes (it can only stop reports)",
+			"\x1b[?2048;2031l", "\x1b[?2048;2031l", "pass", "reply-modes",
+		},
+		{
+			"dec_locator_requests_strip", "DEC locator enable (DECELR), select events (DECSLE) and request position (DECRQLP) are stripped",
+			"\x1b[1;1'z\x1b[1'{\x1b[0'|ok", "ok", "strip", "reply-modes",
+		},
+		{
+			"kitty_keyboard_query_strip", "the kitty keyboard flags query (CSI ? u) is stripped; push and pop pass",
+			"\x1b[?u\x1b[>1u\x1b[<u", "\x1b[>1u\x1b[<u", "mixed", "reply-modes",
+		},
+		{
+			"modifier_options_query_strip", "the modifier-options query (CSI ? 4 m) is stripped; setting modifyOtherKeys (CSI > 4 ; 2 m) passes",
+			"\x1b[?4m\x1b[>4;2m", "\x1b[>4;2m", "mixed", "reply-modes",
+		},
+		{
+			"decset_reply_mode_with_empty_fields_canonical", "when a reply mode is removed, empty fields go too and an empty DECSET is stripped, so every port emits one form",
+			"\x1b[?;2048h\x1b[?2048;h\x1b[?;;2048hok", "ok", "strip", "reply-modes",
+		},
+		{
+			"decset_empty_fields_dropped_around_kept_modes", "removing a reply mode from a set with empty fields keeps only the non-empty modes",
+			"\x1b[?;1000;2048h\x1b[?1000;;2048;1006h", "\x1b[?1000h\x1b[?1000;1006h", "mixed", "reply-modes",
+		},
+		{
+			"dcs_q_with_intermediate_strip", "a DCS q with an intermediate or private marker is not Sixel and is stripped: XTGETTCAP (+q, 7-bit and 8-bit), !q, >q",
+			"\x1bP+q544e\x1b\\\x90+q544e\x9c\x1bP!q~\x1b\\\x1bP>q~\x1b\\ok", "ok", "strip", "dcs-decudk-decrqss",
+		},
+		{
+			"sixel_with_params_pass", "a Sixel DCS with parameters (digits and ';' before q) still passes",
+			"\x1bP0;1;0q#0~\x1b\\", "\x1bP0;1;0q#0~\x1b\\", "pass", "dcs-sixel",
+		},
+		{
+			"s8c1t_strip", "S8C1T (ESC SP G) is stripped: the terminal would send replies with 8-bit C1 introducers; S7C1T passes",
+			"\x1b G\x1b Fok", "\x1b Fok", "mixed", "reply-modes",
+		},
+		{
+			"report_requests_strip", "report requests are stripped: DECREQTPARM (x), XTSMGRAPHICS (?S), DECRQCRA (*y), DECRQPSR ($w), DECRQTSR ($u), DECRQUPSS (&u); scroll-up (S) passes",
+			"\x1b[x\x1b[1x\x1b[?1;1;0S\x1b[1;1;1;1;1;1*y\x1b[1$w\x1b[1$u\x1b[&u\x1b[2Sok", "\x1b[2Sok", "mixed", "reply-modes",
+		},
+		{
+			"decanm_vt52_reset_strip", "resetting ?2 (DECANM, into VT52 mode) is removed from a DEC private reset; other resets pass",
+			"\x1b[?2l\x1b[?25;2lok", "\x1b[?25lok", "mixed", "reply-modes",
+		},
+	}
+}
+
+// clipboardFixture pins the OSC 52 clipboard hook as well as the stream. The
+// stream for every one is the input minus the sequence; clip lists the texts
+// the hook must offer (empty: none).
+type clipboardFixture struct {
+	name, desc, in, want string
+	clip                 []string
+}
+
+func clipboardFixtures() []clipboardFixture {
+	return []clipboardFixture{
+		{
+			"osc52_set_offered", "an OSC 52 clipboard set is stripped from the stream and its decoded text is offered to the clipboard hook (bytes captured from a mouse-tracking REPL)",
+			"a\x1b]52;c;ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA==\x07b", "ab",
+			[]string{"  Fable 5.1 \u00b7 Claude Max"},
+		},
+		{
+			"osc52_query_not_offered", "an OSC 52 query is stripped and never offered or answered",
+			"\x1b]52;c;?\x07ok", "ok",
+			[]string{},
+		},
+		{
+			"osc52_controls_only_not_offered", "a set whose text is only control characters is not offered, so it can never clear the clipboard",
+			"\x1b]52;c;AQIb\x07ok", "ok",
+			[]string{},
+		},
+		{
+			"osc52_trailing_break_dropped", "one trailing line break is dropped from the offered text, so a pasted command does not run at once",
+			"\x1b]52;c;bHMgLWwK\x07ok", "ok",
+			[]string{"ls -l"},
+		},
+		{
+			"osc52_leading_bom_kept", "a leading BOM is kept in the offered text (every port decodes the same text; previews render it visibly)",
+			"\x1b]52;c;77u/aGk=\x07ok", "ok",
+			[]string{"\ufeffhi"},
+		},
+		{
+			"osc52_incomplete_padding_not_offered", "padded base64 must be complete: QQ= is rejected while unpadded QQ decodes",
+			"\x1b]52;c;QQ=\x07\x1b]52;c;QQ\x07ok", "ok",
+			[]string{"A"},
+		},
 	}
 }
 
@@ -213,6 +359,31 @@ func TestGenerateCorpus(t *testing.T) {
 			ExpectedOutput: base64.StdEncoding.EncodeToString([]byte(f.want)),
 			Disposition:    f.disp,
 			SpecRow:        f.row,
+		})
+	}
+
+	for _, f := range clipboardFixtures() {
+		if seen[f.name] {
+			t.Fatalf("duplicate fixture name %q", f.name)
+		}
+		seen[f.name] = true
+		var offered []string
+		got := string(NewWithOptions(Options{OnClipboard: func(text string) { offered = append(offered, text) }}).Write([]byte(f.in)))
+		if got != f.want || !slices.Equal(offered, f.clip) {
+			t.Fatalf("fixture %q: stream %q clipboard %q, want %q %q", f.name, got, offered, f.want, f.clip)
+		}
+		enc := make([]string, 0, len(f.clip))
+		for _, c := range f.clip {
+			enc = append(enc, base64.StdEncoding.EncodeToString([]byte(c)))
+		}
+		entries = append(entries, Entry{
+			Name:           f.name,
+			Description:    f.desc,
+			Input:          base64.StdEncoding.EncodeToString([]byte(f.in)),
+			ExpectedOutput: base64.StdEncoding.EncodeToString([]byte(f.want)),
+			Disposition:    "strip",
+			SpecRow:        "osc-52",
+			Clipboard:      &enc,
 		})
 	}
 

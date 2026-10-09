@@ -12,9 +12,18 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
-// RecordSchemaVersion is the discovery-record schema version. A reader that
-// does not recognise it quarantines rather than guessing at the fields.
+// RecordSchemaVersion is the discovery-record schema version for an
+// interactive (PTY) record. A reader that does not recognise a schema version
+// quarantines rather than guessing at the fields.
 const RecordSchemaVersion = 1
+
+// HeadlessRecordSchemaVersion is the discovery-record schema version for a
+// headless record. It is 2, and the headless record carries the workload
+// field, so an older strict decoder — which knows only schema 1 and rejects
+// unknown fields — refuses a headless record as malformed. That refusal is
+// the intended outcome: an older daemon must never adopt a record whose
+// workload it cannot serve.
+const HeadlessRecordSchemaVersion = 2
 
 // MaxRecordBytes bounds one discovery record on disk. §D6 requires records to be
 // BOUNDED; the bound is enforced on read before decoding so a corrupted or
@@ -40,6 +49,12 @@ var ErrRecordInvalid = errors.New("sessionshim: invalid discovery record")
 // is exactly the ambiguity §D7 quarantines. It is a location, not a credential.
 type Record struct {
 	SchemaVersion int `json:"schemaVersion"`
+
+	// Workload names the session workload this record describes. It is empty
+	// on interactive records — absence means the PTY profile, and interactive
+	// records stay byte-identical to what released readers decode. A headless
+	// record carries workload "headless" beside schema version 2.
+	Workload Workload `json:"workload,omitempty"`
 
 	OrgID     string `json:"orgId"`
 	SessionID string `json:"sessionId"`
@@ -118,8 +133,20 @@ func (r Record) OrphanDeadline() time.Time {
 
 // Validate enforces the §D6 schema contract on a decoded record.
 func (r Record) Validate() error {
-	if r.SchemaVersion != RecordSchemaVersion {
-		return fmt.Errorf("%w: schemaVersion %d, want %d", ErrRecordInvalid, r.SchemaVersion, RecordSchemaVersion)
+	if r.Workload == "" {
+		r.Workload = WorkloadInteractive
+	}
+	switch r.Workload {
+	case WorkloadInteractive:
+		if r.SchemaVersion != RecordSchemaVersion {
+			return fmt.Errorf("%w: schemaVersion %d, want %d", ErrRecordInvalid, r.SchemaVersion, RecordSchemaVersion)
+		}
+	case WorkloadHeadless:
+		if r.SchemaVersion != HeadlessRecordSchemaVersion {
+			return fmt.Errorf("%w: headless schemaVersion %d, want %d", ErrRecordInvalid, r.SchemaVersion, HeadlessRecordSchemaVersion)
+		}
+	default:
+		return fmt.Errorf("%w: unknown workload %q", ErrRecordInvalid, string(r.Workload))
 	}
 	if err := r.Identity().Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrRecordInvalid, err)
@@ -140,6 +167,15 @@ func (r Record) Validate() error {
 	}
 	if r.ProtocolMin == 0 || r.ProtocolMin > r.ProtocolMax {
 		return fmt.Errorf("%w: inverted protocol range [%d,%d]", ErrRecordInvalid, r.ProtocolMin, r.ProtocolMax)
+	}
+	if r.Workload == WorkloadHeadless && r.ProtocolMin < shimwire.V6 {
+		// The contract binds the headless workload to a range with no version
+		// below 6 (session-shim v6 §1). A headless record on a lower range is
+		// the shape a controller that predates the headless profile could
+		// select and treat as a terminal session, so it is malformed and
+		// quarantined as record_malformed, never adopted.
+		return fmt.Errorf("%w: headless record on protocol range [%d,%d], which includes a version below %d",
+			ErrRecordInvalid, r.ProtocolMin, r.ProtocolMax, shimwire.V6)
 	}
 	if !r.Phase.Known() {
 		return fmt.Errorf("%w: unknown phase %q", ErrRecordInvalid, r.Phase)
@@ -212,6 +248,13 @@ func decodeRecord(data []byte) (Record, error) {
 type Tombstone struct {
 	SchemaVersion int `json:"schemaVersion"`
 
+	// Workload names the session workload this tombstone closes. It is empty
+	// on interactive tombstones — absence means the PTY profile, and
+	// interactive tombstones stay byte-identical to what released readers
+	// decode. A headless tombstone carries workload "headless" beside
+	// schema version 2 and the exit members below.
+	Workload Workload `json:"workload,omitempty"`
+
 	OrgID     string `json:"orgId"`
 	SessionID string `json:"sessionId"`
 
@@ -234,7 +277,20 @@ type Tombstone struct {
 	GroupReaped bool       `json:"groupReaped"`
 	ResumeKey   *ResumeKey `json:"resumeKey,omitempty"`
 
+	// Cause names why a headless run ended. It is set only on headless
+	// tombstones; interactive tombstones omit it.
+	Cause HeadlessExitCause `json:"cause,omitempty"`
+	// OutboxKey names the session's terminal-status outbox record, and
+	// OutboxState is that record's delivery state. Both are set only on
+	// headless tombstones.
+	OutboxKey   string              `json:"outboxKey,omitempty"`
+	OutboxState HeadlessOutboxState `json:"outboxState,omitempty"`
+
 	ObservedAtUnixNano int64 `json:"observedAt"`
+}
+
+func invalidRecordf(format string, args ...any) error {
+	return fmt.Errorf("%w: "+format, append([]any{ErrRecordInvalid}, args...)...)
 }
 
 // Identity returns the tombstone's lifecycle identity.
@@ -247,8 +303,27 @@ func (t Tombstone) ObservedAt() time.Time { return time.Unix(0, t.ObservedAtUnix
 
 // Validate enforces the tombstone contract.
 func (t Tombstone) Validate() error {
-	if t.SchemaVersion != RecordSchemaVersion {
-		return fmt.Errorf("%w: tombstone schemaVersion %d, want %d", ErrRecordInvalid, t.SchemaVersion, RecordSchemaVersion)
+	workload := t.Workload
+	if workload == "" {
+		workload = WorkloadInteractive
+	}
+	switch workload {
+	case WorkloadInteractive:
+		if t.SchemaVersion != RecordSchemaVersion {
+			return fmt.Errorf("%w: tombstone schemaVersion %d, want %d", ErrRecordInvalid, t.SchemaVersion, RecordSchemaVersion)
+		}
+		if t.Cause != "" || t.OutboxKey != "" || t.OutboxState != "" {
+			return fmt.Errorf("%w: interactive tombstone carries headless exit members", ErrRecordInvalid)
+		}
+	case WorkloadHeadless:
+		if t.SchemaVersion != HeadlessRecordSchemaVersion {
+			return fmt.Errorf("%w: headless tombstone schemaVersion %d, want %d", ErrRecordInvalid, t.SchemaVersion, HeadlessRecordSchemaVersion)
+		}
+		if err := (HeadlessExit{Cause: t.Cause, OutboxState: t.OutboxState, OutboxKey: t.OutboxKey}).Validate(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: unknown tombstone workload %q", ErrRecordInvalid, string(t.Workload))
 	}
 	if err := t.Identity().Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrRecordInvalid, err)

@@ -94,7 +94,7 @@ func TestSeatbelt_SelfTestRedWithoutBackend(t *testing.T) {
 			refused[probe.Class]++
 		}
 	}
-	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening, classReadScope} {
+	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening, classReadScope, classDaemonPrivate} {
 		if refused[class] == 0 {
 			t.Errorf("no %s probe ran", class)
 		}
@@ -709,6 +709,8 @@ func (b openReadsBackend) Apply(req ApplyRequest) (Applied, error) {
 // TestSeatbelt_SelfTestRedWithOpenReads is the read scope's discriminating
 // control: with the read rules dropped from an otherwise real profile, every
 // read-scope refusal turns red in both session modes, and nothing else does.
+// The daemon-private probes are not read-scope probes: their denies render
+// in every read scope, so they must still hold with reads open.
 func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
 	c, _ := newLiveConfiner(t, openReadsBackend{&seatbeltBackend{exe: sandboxExec}}, nil)
 	record, err := runSelfTest(t, c)
@@ -718,7 +720,7 @@ func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
 	if record.Passed {
 		t.Fatal("the self-test passed with the read rules dropped")
 	}
-	readRefusals := 0
+	readRefusals, daemonHeld := 0, 0
 	for _, probe := range record.Probes {
 		switch {
 		case probe.Class == classReadScope && probe.Pass:
@@ -729,9 +731,15 @@ func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
 		if probe.Class == classReadScope {
 			readRefusals++
 		}
+		if probe.Class == classDaemonPrivate && probe.Pass {
+			daemonHeld++
+		}
 	}
 	if readRefusals == 0 {
 		t.Fatal("no read-scope probe ran")
+	}
+	if daemonHeld == 0 {
+		t.Fatal("no daemon-private probe held with reads open")
 	}
 }
 
@@ -748,6 +756,93 @@ func readScopedWorld(t *testing.T, readPaths ...string) (specWorld, *Plan) {
 	}
 	t.Cleanup(func() { _ = plan.Release() })
 	return w, plan
+}
+
+// TestSeatbelt_ComposerReadDenyHoldsInsideTheWorkareaAllowlist is the live
+// proof that a composer read deny on a path inside the workarea allowlist
+// holds under the workarea read scope: the profile judges a rule naming an
+// operation ahead of a wildcard rule whatever their order, so a wildcard
+// deny would lose to the session allowlist's file-read-data allow. A denied
+// file nested inside the writable set refuses a read, an open, its
+// metadata and its extended attribute; a read beside it still succeeds.
+// The red control rewrites the named deny back to the wildcard and shows
+// the content and attribute reads then succeed (metadata stays refused:
+// the wildcard still names it, which is why the deny names every
+// operation), so the test discriminates the operation list, not the
+// fixture.
+func TestSeatbelt_ComposerReadDenyHoldsInsideTheWorkareaAllowlist(t *testing.T) {
+	w, _ := liveWorld(t)
+	deniedDir := filepath.Join(w.mut, "denied")
+	if err := os.MkdirAll(deniedDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	deniedFile := filepath.Join(deniedDir, "secret")
+	if err := os.WriteFile(deniedFile, []byte("denied\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(deniedFile, readXattrName, []byte("denied attribute"), 0); err != nil {
+		t.Fatalf("Setxattr: %v", err)
+	}
+	besideFile := filepath.Join(w.mut, "beside")
+	if err := os.WriteFile(besideFile, []byte("beside\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Unconfined control: the denied file reads, so a refusal below means
+	// the boundary.
+	if raw, err := os.ReadFile(deniedFile); err != nil || string(raw) != "denied\n" {
+		t.Fatalf("unconfined control: the denied file does not read: %v", err)
+	}
+	c, err := New(Options{Backend: DefaultBackend(), ProfileDir: w.profileDir, Home: w.home, StateHome: w.stateHome, ExtraRules: func(RuleContext) []Rule {
+		return []Rule{{Kind: RuleDenyRead, Path: deniedFile, Scope: ScopeLiteral}}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := w.spec()
+	spec.ReadScope = agent.FileReadWorkarea
+	plan, err := c.prepare(spec, "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", deniedFile); code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Errorf("confined cat of the denied file: exit %d: %q; want a refusal", code, out)
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", besideFile); code != 0 {
+		t.Errorf("confined cat beside the deny: exit %d: %q; the deny must not reach past its path", code, out)
+	}
+	results := runProbeSteps(t, plan, w,
+		probeStep{ID: "denied-read", Op: opRead, Path: deniedFile},
+		probeStep{ID: "denied-open", Op: opOpen, Path: deniedFile},
+		probeStep{ID: "denied-stat", Op: opStat, Path: deniedFile},
+		probeStep{ID: "denied-xattr", Op: opGetxattr, Path: deniedFile, Label: readXattrName},
+		probeStep{ID: "beside-read", Op: opRead, Path: besideFile},
+	)
+	for _, id := range []string{"denied-read", "denied-open", "denied-stat", "denied-xattr"} {
+		if result, ok := results[id]; !ok || !refused(result) {
+			t.Errorf("confined probe %s: %+v; want a refusal", id, result)
+		}
+	}
+	if result, ok := results["beside-read"]; !ok || result.Err != "" {
+		t.Errorf("confined probe beside-read: %+v; want it served", result)
+	}
+	if raw, err := os.ReadFile(deniedFile); err != nil || string(raw) != "denied\n" {
+		t.Errorf("the denied file changed despite the deny: %q, err %v", raw, err)
+	}
+
+	red := runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runRewritten(t, plan, w.mut, env,
+			"(deny "+seatbeltComposerReadOps+" (literal "+"\""+deniedFile+"\""+"))\n",
+			"(deny file-read* (literal "+"\""+deniedFile+"\""+"))\n", argv...)
+	},
+		probeStep{ID: "denied-read", Op: opRead, Path: deniedFile},
+		probeStep{ID: "denied-xattr", Op: opGetxattr, Path: deniedFile, Label: readXattrName},
+	)
+	for _, id := range []string{"denied-read", "denied-xattr"} {
+		if red[id].Err != "" {
+			t.Errorf("with the wildcard deny, %s still refused: %q; the test does not discriminate", id, red[id].Err)
+		}
+	}
 }
 
 // TestSeatbelt_ReadScopeFindIsFastAndBlind is the whole-disk search under

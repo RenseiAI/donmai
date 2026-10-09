@@ -223,6 +223,9 @@ func manifestToView(m kitManifestTOML, packageDigest, legacyDigest string) kit.M
 			})
 		}
 	}
+	if stores, err := dependencyStoreViews(m); err == nil && len(stores) > 0 {
+		v.DependencyStores = stores
+	}
 	return v
 }
 

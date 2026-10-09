@@ -354,6 +354,17 @@ func buildProvidesSummary(m *afclient.KitManifest, noColor bool) []string {
 		}
 		lines = append(lines, s)
 	}
+	if m.ProvidesDependencyStores {
+		s := colored("dependency stores", ansiCyan, noColor)
+		if len(m.DependencyStores) > 0 {
+			managers := make([]string, 0, len(m.DependencyStores))
+			for _, store := range m.DependencyStores {
+				managers = append(managers, store.Manager)
+			}
+			s += muted(" ("+strings.Join(managers, ", ")+")", noColor)
+		}
+		lines = append(lines, s)
+	}
 	return lines
 }
 

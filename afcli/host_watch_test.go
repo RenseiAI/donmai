@@ -216,7 +216,7 @@ func TestHostWatchPlainPipeRunsWithoutTTY(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/daemon/sessions":
-			_, _ = w.Write([]byte(`[{"sessionId":"watch-fixture-session-1234","pid":42,"state":"running","projectName":"private-watch-project","repository":"https://github.com/example/project.git","harness":"claude-code","model":"fixture-model","workType":"development"}]`))
+			_, _ = w.Write([]byte(`[{"sessionId":"watch-fixture-session-1234","pid":42,"state":"running","projectName":"private-watch-project","repository":"https://github.com/example/watch-fixture-repo.git","harness":"claude-code","model":"fixture-model","workType":"development","issueIdentifier":"FIX-77"}]`))
 		case "/api/daemon/status":
 			_, _ = w.Write([]byte(`{"status":"running","version":"9.9.9-fixture","maxSessions":2,"uptimeSeconds":90}`))
 		case "/api/daemon/stats":
@@ -272,8 +272,11 @@ func TestHostWatchPlainPipeRunsWithoutTTY(t *testing.T) {
 				t.Fatalf("owned watch child failed: state=%v err=%v output=%s", state, err, raw)
 			}
 			text := string(raw)
-			t.Logf("piped renderer emitted ANSI control bytes: %t", strings.Contains(text, "\x1b["))
-			for _, wanted := range []string{"private-watch-project", "fixture-model", "9.9.9-fixture"} {
+			if strings.Contains(text, "\x1b") {
+				t.Errorf("piped plain output carries terminal escapes: %q", text)
+			}
+			// The card's project context is the repository's short name.
+			for _, wanted := range []string{"FIX-77", "watch-fixture-repo · development", "fixture-model", "9.9.9-fixture"} {
 				if !strings.Contains(text, wanted) {
 					t.Errorf("piped watch lost %q: %q", wanted, text)
 				}

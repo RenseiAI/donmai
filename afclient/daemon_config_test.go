@@ -1,6 +1,8 @@
 package afclient
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -53,8 +55,7 @@ projects:
 		t.Fatalf("ReadDaemonYAML: %v", err)
 	}
 	cfg.AddOrUpdateProject(ProjectEntry{
-		RepoURL:       "github.com/foo/bar",
-		CloneStrategy: CloneShallow,
+		RepoURL: "github.com/foo/bar",
 	})
 	if err := WriteDaemonYAML(path, cfg); err != nil {
 		t.Fatalf("WriteDaemonYAML: %v", err)
@@ -274,8 +275,7 @@ projects:
 		t.Fatal(err)
 	}
 	cfg.AddOrUpdateProject(ProjectEntry{
-		RepoURL:       "github.com/foo/bar",
-		CloneStrategy: CloneFull,
+		RepoURL: "github.com/foo/bar",
 	})
 	if err := WriteDaemonYAML(path, cfg); err != nil {
 		t.Fatal(err)
@@ -287,8 +287,8 @@ projects:
 	if len(loaded.Projects) != 1 {
 		t.Errorf("Projects = %d, want 1", len(loaded.Projects))
 	}
-	if loaded.Projects[0].CloneStrategy != CloneFull {
-		t.Errorf("CloneStrategy not updated: %q", loaded.Projects[0].CloneStrategy)
+	if loaded.Projects[0].RepoURL != "github.com/foo/bar" {
+		t.Errorf("RepoURL not preserved: %q", loaded.Projects[0].RepoURL)
 	}
 }
 
@@ -543,5 +543,118 @@ func TestWriteDaemonYAML_AnchoredCapacityOmission(t *testing.T) {
 	}
 	if decoded["observer"].(map[string]any)["limit"] != 3 {
 		t.Fatalf("omitted scalar alias changed: %s", data)
+	}
+}
+
+// slogWarningCapture holds the log output emitted through the default
+// slog logger while a test runs. warnIfRetiredCloneStrategyPresent logs via
+// the package-level slog.Warn, so tests swap the default handler.
+type slogWarningCapture struct {
+	buf *bytes.Buffer
+}
+
+func (c *slogWarningCapture) text() string { return c.buf.String() }
+
+func (c *slogWarningCapture) count() int {
+	return bytes.Count(c.buf.Bytes(), []byte(retiredCloneStrategyWarning))
+}
+
+// captureSlogWarnings swaps the default slog logger for a text handler over
+// a buffer and restores it when the test ends.
+func captureSlogWarnings(t *testing.T) *slogWarningCapture {
+	t.Helper()
+	capture := &slogWarningCapture{buf: &bytes.Buffer{}}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(capture.buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return capture
+}
+
+// TestReadDaemonYAML_RetiredCloneStrategyKeyLoadsWithOneWarning is the
+// retirement test for the dead per-repository clone override: a file that
+// still carries the key on many entries loads successfully, the value is
+// ignored (the typed schema no longer models it), the writer never emits
+// it, and exactly one deprecation warning is logged per read no matter how
+// many entries carry the key.
+func TestReadDaemonYAML_RetiredCloneStrategyKeyLoadsWithOneWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`machine:
+  id: m
+orchestrator:
+  url: https://platform.example.com
+projects:
+  - id: one
+    repository: github.com/foo/one
+    cloneStrategy: shallow
+  - id: two
+    repository: github.com/foo/two
+    cloneStrategy: full
+repositories:
+  - id: repo-one
+    projectId: one
+    source: github.com/foo/one
+    cloneStrategy: shallow
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureSlogWarnings(t)
+	cfg, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML with retired key: %v", err)
+	}
+	if len(cfg.Projects) != 2 {
+		t.Fatalf("Projects = %d, want 2 (retired key must not drop entries)", len(cfg.Projects))
+	}
+	if got := warnings.count(); got != 1 {
+		t.Fatalf("deprecation warnings = %d, want exactly 1", got)
+	}
+	if !strings.Contains(warnings.text(), "cloneStrategy") {
+		t.Errorf("warning should name the retired key, got:\n%s", warnings.text())
+	}
+	// A read-then-write cycle drops the retired key: writers never emit it.
+	if err := WriteDaemonYAML(path, cfg); err != nil {
+		t.Fatalf("WriteDaemonYAML: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "cloneStrategy") {
+		t.Errorf("writer emitted retired key:\n%s", raw)
+	}
+	// A clean file loads with no warning.
+	quiet := captureSlogWarnings(t)
+	if _, err := ReadDaemonYAML(path); err != nil {
+		t.Fatalf("ReadDaemonYAML after rewrite: %v", err)
+	}
+	if got := quiet.count(); got != 0 {
+		t.Errorf("warnings on clean file = %d, want 0", got)
+	}
+}
+
+// TestReadDaemonYAML_NoRetiredCloneStrategyKeyIsQuiet pins the other half:
+// a file without the retired key loads with no deprecation warning.
+func TestReadDaemonYAML_NoRetiredCloneStrategyKeyIsQuiet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`machine:
+  id: m
+orchestrator:
+  url: https://platform.example.com
+projects:
+  - id: one
+    repository: github.com/foo/one
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureSlogWarnings(t)
+	if _, err := ReadDaemonYAML(path); err != nil {
+		t.Fatalf("ReadDaemonYAML: %v", err)
+	}
+	if got := warnings.count(); got != 0 {
+		t.Errorf("warnings = %d, want 0", got)
 	}
 }
