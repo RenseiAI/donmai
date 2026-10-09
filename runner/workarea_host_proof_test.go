@@ -159,3 +159,21 @@ func TestRunPiDeclarationRefusedWhereHostProofFails(t *testing.T) {
 		t.Fatal("the provider was spawned for a declaration its host cannot hold")
 	}
 }
+
+// TestExecutorAttestsSiblingContextFollowsTheHostProof pins the sibling
+// reader on its own: it reports a read-only context capability for pi only
+// where pi's host proof passes. (On the Run path the bind-time check would
+// also drop a derived declaration the proof does not cover; this keeps the
+// derivation from being attempted at all.)
+func TestExecutorAttestsSiblingContextFollowsTheHostProof(t *testing.T) {
+	t.Parallel()
+	if !executorAttestsSiblingContext(&piWorkareaRunProvider{}) {
+		t.Fatal("executorAttestsSiblingContext(pi, proof passes) = false, want true")
+	}
+	if executorAttestsSiblingContext(&piWorkareaRunProvider{proof: errNestedSandboxProof}) {
+		t.Fatal("executorAttestsSiblingContext(pi, proof fails) = true, want false")
+	}
+	if executorAttestsSiblingContext(&piManifestOnlyProvider{}) {
+		t.Fatal("executorAttestsSiblingContext(pi, proof hidden) = true, want false")
+	}
+}
