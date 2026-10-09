@@ -347,12 +347,22 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("construct local runtime: %w", err)
 			}
-			if localProviders != nil {
+			switch {
+			case localProviders != nil:
 				if cfg.AgentSpecExtensionDecorator != nil {
 					return errors.New("local runtime does not yet admit additional extension decorators")
 				}
 				providerView = localProviders
-			} else {
+			case localOptions != nil:
+				// A fresh-host seed (file queue URL with an explicit
+				// policy but no harness or repository profile yet)
+				// reaches composition before any operator ran setup.
+				// Refuse with the operator action before the daemon
+				// starts any runtime, heartbeat, or poller — Daemon.Start
+				// repeats the same refusal for callers that bypass this
+				// entry point.
+				return errors.New("daemon is not configured yet: run `host setup` to choose a harness and repository, then restart")
+			default:
 				providerView, err = daemonProviderView(cfg, slog.Default())
 				if err != nil {
 					return fmt.Errorf("construct daemon provider view: %w", err)

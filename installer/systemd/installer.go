@@ -126,6 +126,10 @@ type InstallOptions struct {
 
 	// ConfigPath is the path to the daemon config file. When non-empty, it
 	// is exported as DONMAI_DAEMON_CONFIG via Environment= in the unit.
+	// Install ensures a loadable config exists there (seeding the
+	// fresh-host config when absent, validating when present) before
+	// writing the unit. Empty means the daemon default
+	// (~/.donmai/daemon.yaml), which Install likewise ensures.
 	ConfigPath string
 
 	// ProcessPriority selects the process-priority mode the unit encodes. The
@@ -385,15 +389,26 @@ func installHomeDir(scope Scope) (string, error) {
 //
 // Steps:
 //  1. Resolve the host binary path.
-//  2. Generate the unit file content.
-//  3. Write the unit file (creating parent dirs).
-//  4. Run `systemctl [--user] daemon-reload && enable --now` unless skipped.
+//  2. Ensure a loadable daemon config exists (seed or validate).
+//  3. Generate the unit file content.
+//  4. Write the unit file (creating parent dirs).
+//  5. Run `systemctl [--user] daemon-reload && enable --now` unless skipped.
+//
+// Step 2 is the fresh-host contract: with no config the service-mode
+// start would run the interactive wizard under the unit (stdin /dev/null)
+// and crash-loop, so the seed — a local file queue with an explicit
+// execution policy, no harness or repository profile — is written first.
+// An existing config is validated and left untouched.
 //
 // Returns the absolute path of the written unit file.
 func Install(opts InstallOptions) (string, error) {
 	scope := opts.Scope
 	if scope == "" {
 		scope = ScopeUser
+	}
+
+	if _, err := EnsureFreshHostConfig(opts.ConfigPath); err != nil {
+		return "", err
 	}
 
 	binPath, err := ResolveHostBinPath(opts.BinPath)

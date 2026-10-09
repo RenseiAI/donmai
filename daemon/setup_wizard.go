@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/term"
+
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
@@ -73,21 +75,26 @@ type WizardOptions struct {
 	DetectGitRemote func() string
 }
 
+// ServiceModeStdin reports whether the process runs under a service manager
+// with no terminal attached: stdin is /dev/null (a character device that is
+// not a terminal) or is otherwise not a terminal at all. A mode-bit test
+// alone reads /dev/null as a terminal because /dev/null IS a character
+// device, so a service-mode start whose stdin is /dev/null ran the
+// interactive wizard and failed on its first required answer instead of
+// taking the non-interactive path.
+func ServiceModeStdin() bool {
+	return !term.IsTerminal(int(os.Stdin.Fd()))
+}
+
 // ShouldSkipWizard returns true when the wizard should be bypassed:
-//   - stdin is not a TTY, OR
+//   - stdin is not a terminal (including the service-mode /dev/null
+//     case — see ServiceModeStdin), OR
 //   - DONMAI_DAEMON_SKIP_WIZARD is set.
 func ShouldSkipWizard() bool {
 	if os.Getenv("DONMAI_DAEMON_SKIP_WIZARD") != "" {
 		return true
 	}
-	// We treat non-TTY stdin as "skip the wizard". We use a coarse fallback
-	// — we don't pull in golang.org/x/term to keep the dependency surface
-	// minimal — instead we Stat() stdin and check the mode.
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return true
-	}
-	return (fi.Mode() & os.ModeCharDevice) == 0
+	return ServiceModeStdin()
 }
 
 // RunSetupWizard runs the interactive first-run wizard (or returns the
@@ -607,12 +614,54 @@ func configureLocalRuntime(ctx context.Context, r *bufio.Reader, out io.Writer, 
 	return &LocalRuntimeConfig{ExecutionSecurity: policy, Harness: selected.Harness, Model: selected.Model, ModelAuthor: selected.ModelAuthor, ModelCatalogRevision: selected.ModelCatalogRevision, Repositories: repositories}, nil
 }
 
+// FreshHostQueueURL is the file-queue URL a fresh host seeds when the
+// operator never authored a config: the local file-queue root under the
+// host state home. Exported so `host install` seeds the same URL the
+// non-interactive first-run path does.
+func FreshHostQueueURL() string {
+	return "file://" + statepath.Resolve("queue", "/tmp/.donmai/queue")
+}
+
+// FreshHostConfig returns the seed config a fresh host starts from: the
+// local file queue plus the explicit execution-security seed the startup
+// migration would apply. No harness or repository profile — `host setup`
+// adds those. The seed loads under validateConfig and starts without the
+// interactive wizard; composition refuses with the operator action until
+// setup completes.
+func FreshHostConfig() *Config {
+	cfg := DefaultConfig()
+	cfg.APIVersion = LocalRuntimeConfigAPIVersion
+	cfg.Orchestrator.URL = FreshHostQueueURL()
+	cfg.LocalRuntime = &LocalRuntimeConfig{ExecutionSecurity: InitialLocalExecutionSecurity()}
+	applyDefaults(cfg)
+	return cfg
+}
+
 // BuildDefaultConfigFromExisting returns a default Config (or the existing
 // one) and optionally persists it to configPath.
+//
+// A fresh host whose operator never authored a config gets a config the
+// daemon can actually load: DefaultConfig carries an empty orchestrator URL
+// (no vendor default — the operator configures it explicitly), which
+// validateConfig refuses. Seeding the local file-queue URL plus the
+// explicit execution-security seed the startup migration would apply keeps
+// a service-mode start on a fresh host out of the crash loop: with no
+// harness or repository profile the file queue still refuses at
+// composition time, but with a typed error the operator can act on, not a
+// reopened prompt.
 func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Config, error) {
 	cfg := existing
 	if cfg == nil {
-		cfg = DefaultConfig()
+		// No operator config and no explicit orchestrator URL: seed the
+		// fresh-host file queue (with its explicit execution policy)
+		// instead of an empty URL no authored config could ever load.
+		// An explicitly configured URL (env or otherwise) keeps the
+		// plain default so stub and platform paths behave as before.
+		if DefaultConfig().Orchestrator.URL == "" {
+			cfg = FreshHostConfig()
+		} else {
+			cfg = DefaultConfig()
+		}
 	} else {
 		applyDefaults(cfg)
 	}

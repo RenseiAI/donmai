@@ -7,8 +7,7 @@
 //
 // This package is the single import surface for `donmai daemon install`,
 // `rensei daemon install`, etc. It is exported so downstream binaries
-// (rensei-tui, etc.) can drive the same in-process install flow without
-// reimplementing it.
+// can drive the same in-process install flow without reimplementing it.
 package installer
 
 import (
@@ -72,8 +71,11 @@ type InstallOptions struct {
 	// Scope is the systemd unit scope (Linux only). Ignored on macOS.
 	Scope Scope
 
-	// ConfigPath is the daemon config path; sets DONMAI_DAEMON_CONFIG on
-	// Linux. Currently unused on macOS.
+	// ConfigPath is the daemon config path to ensure before installing:
+	// the fresh-host config is seeded when absent, an existing config
+	// is validated and left untouched. On Linux it is also exported as
+	// DONMAI_DAEMON_CONFIG via Environment= in the unit. Empty means the
+	// daemon default (~/.donmai/daemon.yaml).
 	ConfigPath string
 
 	// Description overrides the systemd [Unit] Description= field. Ignored
@@ -225,6 +227,7 @@ func installDarwin(opts InstallOptions, priority ProcessPriority, source Process
 		HostBinPath:     opts.HostBinPath,
 		ProcessPriority: priority,
 		SkipLaunchctl:   opts.SkipServiceManager,
+		ConfigPath:      opts.ConfigPath,
 	})
 	if err != nil {
 		return InstallResult{}, err

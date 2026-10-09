@@ -1100,6 +1100,24 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if d.sessionShimEnabled() {
 			return errors.New("local file runtime supports direct headless execution only")
 		}
+		if cfg.LocalRuntime == nil || cfg.LocalRuntime.Harness == "" || cfg.LocalRuntime.Model == "" || len(cfg.LocalRuntime.Repositories) == 0 {
+			// A fresh-host seed (file queue URL with an explicit policy
+			// but no harness or repository profile yet) reaches Start
+			// without the shipped composition the entry point would
+			// supply — and without the profile the composition could
+			// not serve. Refuse with the operator action before any
+			// runtime, heartbeat, or poller starts, not an internal
+			// wiring complaint.
+			return errors.New("daemon is not configured yet: run `host setup` to choose a harness and repository, then restart")
+		}
+		if d.opts.LocalRuntime == nil || d.opts.LocalRuntime.NewCompiler == nil {
+			// A fresh-host seed (file queue URL with an explicit policy
+			// but no harness or repository profile yet) reaches Start
+			// without the shipped composition the entry point
+			// supplies. Refuse with the operator action, not an
+			// internal wiring complaint.
+			return errors.New("daemon is not configured yet: run `host setup` to choose a harness and repository, then restart")
+		}
 		local, err = newLocalRuntime(ctx, d, cfg)
 		if err != nil {
 			return err

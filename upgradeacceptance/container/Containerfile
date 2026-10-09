@@ -1,0 +1,69 @@
+# Upgrade-acceptance container: a Linux image that boots systemd as PID 1,
+# runs a lingering user manager for the acceptance user with a delegated
+# cgroup v2 subtree, and carries the Go toolchain the N → N+1 driver builds
+# both daemon artifacts with.
+#
+# BUILD CONTEXT: the repo root (this file lives in upgradeacceptance/container/
+# but builds from the module root so the driver sees the whole module and its
+# git history — artifact N is built from an earlier revision).
+#
+#   docker build -f upgradeacceptance/container/Containerfile -t donmai-upgrade-acceptance .
+#
+# Run it with upgradeacceptance/container/run-lane.sh: the image's entrypoint
+# is systemd itself, so every command runs through `exec` into the booted
+# container, never as container arguments (systemd would parse them as its
+# own options).
+#
+# The container never runs on the release-train host: only CI (and an
+# operator's workstation) builds and runs it.
+
+# The official toolchain image: Go at /usr/local/go/bin on PATH, plus git,
+# curl and ca-certificates. Pinned to the module's go directive (go.mod);
+# bump the two together. run-lane.sh checks the toolchain the driver sees
+# against go.mod, so a drift fails the lane by name.
+FROM docker.io/library/golang:1.26.6-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    GOTOOLCHAIN=local \
+    container=docker
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus dbus-user-session jq procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Units that need hardware or a console a container does not have. Masking
+# them keeps the boot quiet; the driver accepts a degraded system manager
+# but requires the acceptance user manager itself to be running.
+RUN systemctl mask \
+        systemd-udevd.service systemd-udevd-control.socket systemd-udevd-kernel.socket \
+        systemd-modules-load.service systemd-firstboot.service \
+        getty.target console-getty.service \
+        sys-kernel-config.mount sys-kernel-debug.mount sys-kernel-tracing.mount
+
+# The acceptance user. The flow installs N as a USER service, so the user
+# needs its own manager at boot: the linger marker makes logind start
+# user@1000.service (Delegate=yes, so the manager owns its cgroup subtree)
+# without a login session.
+RUN useradd --create-home --uid 1000 --shell /bin/bash acceptance \
+    && mkdir -p /var/lib/systemd/linger \
+    && touch /var/lib/systemd/linger/acceptance
+
+# Module downloads ride their own layer, owned by the acceptance user who
+# builds both artifacts.
+ENV GOPATH=/home/acceptance/go \
+    GOCACHE=/home/acceptance/.cache/go-build \
+    GOWORK=off
+COPY --chown=acceptance:acceptance go.mod go.sum /src/
+USER acceptance
+WORKDIR /src
+RUN go version && go mod download
+
+# The repo with its history, owned by the acceptance user so the driver can
+# read the earlier revision artifact N is built from without a
+# dubious-ownership refusal.
+USER root
+COPY --chown=acceptance:acceptance . /src
+
+STOPSIGNAL SIGRTMIN+3
+ENTRYPOINT ["/lib/systemd/systemd"]

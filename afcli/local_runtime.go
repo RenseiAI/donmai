@@ -248,7 +248,11 @@ func newLocalRuntimeComposition(configPath string, current func() *daemon.Config
 		return nil, nil, err
 	}
 	if initial.LocalRuntime == nil || initial.LocalRuntime.Harness == "" || initial.LocalRuntime.Model == "" || len(initial.LocalRuntime.Repositories) == 0 {
-		return nil, nil, errors.New("file queue requires a localRuntime harness/model/GitHub source profile")
+		// A fresh-host seed reaches composition before any operator ran
+		// setup. Return the queue root with no profile so the
+		// caller refuses with the operator action (`host setup`)
+		// instead of an internal wiring complaint.
+		return &daemon.LocalRuntimeOptions{QueueRoot: root, AuthRoot: root + ".auth"}, nil, nil
 	}
 	settings := func() *daemon.LocalRuntimeConfig {
 		if current != nil {
