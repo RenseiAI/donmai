@@ -290,21 +290,21 @@ func (o ControllerOptions) logger() *slog.Logger {
 // *ptyhost.Session. That is the §D1 ownership boundary made concrete: when this
 // object is garbage, the session is unaffected.
 type Controller struct {
-	id           Identity
-	controllerID string
-	conn         *net.UnixConn
-	w            *shimwire.Writer
-	r            *shimwire.Reader
-	gen          shimwire.Generation
-	selected     uint32
-	// profile is the workload this connection carries, agreed by the
-	// controller's options, the record, and the shim's Hello. Zero is the
-	// interactive profile.
-	profile            shimwire.Profile
+	id                 Identity
+	controllerID       string
+	conn               *net.UnixConn
+	w                  *shimwire.Writer
+	r                  *shimwire.Reader
+	gen                shimwire.Generation
+	selected           uint32
 	hello              shimwire.Hello
 	workareaRoot       string
 	helloAuthenticated bool
 	adopted            shimwire.Adopted
+	// profile is the workload this connection carries, agreed by the
+	// controller's options, the record, and the shim's Hello. Zero is the
+	// interactive profile.
+	profile shimwire.Profile
 	// resumeFrom is the exact durable cursor proposed in Welcome. Retaining it
 	// lets a replacement daemon preserve last_forwarded_seq before any newly
 	// replayed or live output advances its own bookkeeping.
