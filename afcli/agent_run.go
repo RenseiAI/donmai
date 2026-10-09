@@ -192,8 +192,8 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 		"Daemon control URL (default: $DONMAI_DAEMON_URL, which the spawning daemon sets, or http://127.0.0.1:7734)")
 	cmd.Flags().StringVar(&opts.worktree, "worktree-dir", "",
 		"Per-session worktree parent directory (default: ~/.donmai/worktrees)")
-	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", true,
-		"Preserve the worktree on disk after the session ends (debugging)")
+	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", keepFailedWorktreeFromEnv(os.Getenv),
+		"Keep a failed session's worktree on disk for post-mortem recovery (default false; the daemon's keepFailedWorktrees setting answers yes for every worker it spawns; unpublished work is archived to the rescue directory before teardown either way)")
 	cmd.Flags().BoolVar(&opts.jsonOut, "json", true,
 		"Emit a single JSON line describing the terminal Result (default true)")
 	cmd.Flags().BoolVar(&opts.keepRecording, "keep-recording", false,
@@ -692,6 +692,22 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 func donmaiSpanTracingEnabled() bool {
 	v := strings.TrimSpace(os.Getenv("DONMAI_OTEL_TRACES"))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// keepFailedWorktreeFromEnv reports whether this worker should keep a
+// failed session's worktree on disk: the --preserve-worktree default when
+// the flag is not passed explicitly. The spawning daemon states
+// DONMAI_KEEP_FAILED_WORKTREE from its keepFailedWorktrees setting; an
+// operator-exported value reaches the worker the same way. Anything else —
+// including unset — tears the worktree down once the rescue has archived
+// its unpublished work, so idle disk use stays bounded to live sessions.
+// getenv is os.Getenv in production and a test double under test.
+func keepFailedWorktreeFromEnv(getenv func(string) string) bool {
+	if getenv == nil {
+		return false
+	}
+	v := strings.TrimSpace(getenv(runtimeenv.KeepFailedWorktreeEnv))
 	return v == "1" || strings.EqualFold(v, "true")
 }
 

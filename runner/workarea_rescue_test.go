@@ -307,3 +307,62 @@ func TestPreserveUnpublishedWork_KeepsTheNewestArchivesPerSession(t *testing.T) 
 		t.Errorf("another session's archives = %d; want its 1 untouched", got)
 	}
 }
+
+// TestRun_FailedSessionTearsDownWorktreeAfterRescue pins the no-preserve
+// path end to end through Run: a failed session's unpublished work is
+// archived to the rescue directory first, and only then is the worktree
+// removed. The preserved variant pins the other side: with preservation
+// on, the same failed session keeps its worktree for post-mortem.
+func TestRun_FailedSessionTearsDownWorktreeAfterRescue(t *testing.T) {
+	t.Run("teardown", func(t *testing.T) {
+		rescueDir := t.TempDir()
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:     "development",
+			skipSteering: true,
+			teardown:     true,
+			rescueDir:    rescueDir,
+			turns: []verdictScriptTurn{{
+				files: map[string]string{"work.txt": "uncommitted\n"},
+				text:  "Still working on it.",
+				crash: true,
+			}},
+		})
+		if res.Status != "failed" {
+			t.Fatalf("Status = %q (%s: %s); want failed", res.Status, res.FailureMode, res.Error)
+		}
+		if res.WorktreePath == "" {
+			t.Fatal("failed session has no worktree path")
+		}
+		// The rescue runs before the teardown: the patch carries the work
+		// the crashed session left uncommitted.
+		patch := onlyRescuePatch(t, rescueDir)
+		if body := readFile(t, patch); !strings.Contains(body, "work.txt") {
+			t.Errorf("rescue patch does not carry the uncommitted work.txt")
+		}
+		if _, err := os.Stat(res.WorktreePath); !os.IsNotExist(err) {
+			t.Fatalf("worktree stat err = %v; want the failed session's worktree torn down", err)
+		}
+	})
+	t.Run("preserved", func(t *testing.T) {
+		rescueDir := t.TempDir()
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:     "development",
+			skipSteering: true,
+			rescueDir:    rescueDir,
+			turns: []verdictScriptTurn{{
+				files: map[string]string{"work.txt": "uncommitted\n"},
+				text:  "Still working on it.",
+				crash: true,
+			}},
+		})
+		if res.Status != "failed" {
+			t.Fatalf("Status = %q (%s: %s); want failed", res.Status, res.FailureMode, res.Error)
+		}
+		if got := readFile(t, filepath.Join(res.WorktreePath, "work.txt")); got != "uncommitted\n" {
+			t.Fatalf("work.txt = %q; want the failed session's work kept in place", got)
+		}
+		if patches := rescuePatches(t, rescueDir); len(patches) != 0 {
+			t.Fatalf("rescue patches = %v; want none when the worktree is preserved", patches)
+		}
+	})
+}

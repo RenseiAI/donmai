@@ -425,8 +425,14 @@ When a session appears wedged in the dashboard:
    platform's view (already terminal) usually indicates a missed
    `result.Post` — re-run `donmai host stats` to see whether the
    poller has retried.
-6. **Worktree state** — `~/.donmai/worktrees/<sessionId>/.agent/`
-   contains the per-session `state.json` snapshot and the
+6. **Worktree state** — by default a failed session's worktree is torn
+   down once the rescue has archived its unpublished work as a patch
+   under the sibling `rescue/` directory (`<session>/<stamp>/…patch` plus
+   a JSON sidecar describing how to re-apply it). Apply the patch onto a
+   fresh checkout of the recorded base to recover the work. Set
+   `keepFailedWorktrees: true` in `daemon.yaml` to keep failed sessions'
+   worktrees on disk instead: `~/.donmai/worktrees/<sessionId>/.agent/`
+   then still contains the per-session `state.json` snapshot and the
    `events.jsonl` audit log. Look here when the agent emitted no
    visible output but the session is marked failed.
 

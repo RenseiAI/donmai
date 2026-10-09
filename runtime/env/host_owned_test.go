@@ -68,3 +68,19 @@ func TestFilterHostOwnedMap_DropsTheConfinementSettings(t *testing.T) {
 		t.Error("PATH is host-owned")
 	}
 }
+
+// TestFilterHostOwnedMap_DropsKeepFailedWorktree pins that a work item
+// cannot set the host's failed-worktree recovery answer: the operator's
+// keep (or teardown) policy for its own session is not the session's to
+// override.
+func TestFilterHostOwnedMap_DropsKeepFailedWorktree(t *testing.T) {
+	t.Parallel()
+	if !IsHostOwned(KeepFailedWorktreeEnv) {
+		t.Fatalf("%s is not host-owned", KeepFailedWorktreeEnv)
+	}
+	in := map[string]string{KeepFailedWorktreeEnv: "1", "KEEP": "yes"}
+	out := FilterHostOwnedMap(in)
+	if len(out) != 1 || out["KEEP"] != "yes" {
+		t.Fatalf("FilterHostOwnedMap = %q, want only KEEP=yes", out)
+	}
+}
