@@ -131,6 +131,12 @@ type archiveManifest struct {
 	RootIdentity    workarea.FileIdentity         `json:"rootIdentity,omitempty"`
 	TreeDigest      string                        `json:"treeDigest,omitempty"`
 	SourceSizeBytes int64                         `json:"sourceSizeBytes,omitempty"`
+	// Excluded lists the regenerable dependency and build-output
+	// directories the capture skipped (see archiveExcludedDirNames), as
+	// slash-separated paths relative to the archived root, sorted. The
+	// tree digest and size cover the filtered tree only — SourceSizeBytes
+	// above still reports the unfiltered source so the saving is visible.
+	Excluded []string `json:"excluded,omitempty"`
 	// Extra holds any fields not declared above so consumers can render
 	// them without the registry needing to evolve the manifest schema in
 	// lockstep with archive producers.
@@ -478,9 +484,15 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 			return err
 		}
 	}
-	if err := copyRootContents(rootHandle, archiveHandle); err != nil {
+	// The capture skips regenerable dependency and build-output directories
+	// (archiveExcludedDirNames); the digest and size below therefore cover
+	// the filtered tree, while SourceSizeBytes above still reports the
+	// unfiltered source.
+	excluded, err := copyRootContentsExcluding(rootHandle, archiveHandle)
+	if err != nil {
 		return fmt.Errorf("archive root: copy complete tree: %w", err)
 	}
+	manifest.Excluded = excluded
 	manifest.SizeBytes, err = workarea.PhysicalUsageRoot(archiveHandle)
 	if err != nil {
 		return fmt.Errorf("archive root: account copied tree: %w", err)
@@ -2406,10 +2418,48 @@ func copyTreeRoot(sourceRoot *os.Root, dst string) error {
 }
 
 func copyRootContents(source, destination *os.Root) error {
-	return copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string))
+	return copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string), nil)
 }
 
-func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlinks map[workarea.FileIdentity]string) error {
+// archiveExcludedDirNames are regenerable dependency and build-output
+// directories the archive capture skips at any depth: reinstalling or
+// rebuilding them is cheaper than storing every session's copy, and they
+// dominate archive disk use. Only real directories are skipped — a file
+// or symlink that happens to carry one of these names is still copied —
+// and every skipped path is recorded on the manifest's excluded list so
+// the omission is visible to operators and restore callers.
+var archiveExcludedDirNames = map[string]struct{}{
+	"node_modules": {},
+	".next":        {},
+	"dist":         {},
+	"target":       {},
+}
+
+// isArchiveExcludedDir reports whether a real directory leaf is a
+// regenerable dependency or build-output directory the archive skips.
+func isArchiveExcludedDir(leaf string) bool {
+	_, ok := archiveExcludedDirNames[leaf]
+	return ok
+}
+
+// copyRootContentsExcluding copies like copyRootContents but skips
+// regenerable dependency and build-output directories (see
+// archiveExcludedDirNames) at any depth. It returns the skipped
+// directories as slash-separated paths relative to the copied root,
+// sorted, for the archive manifest's excluded list. Restore paths keep
+// using copyRootContents so an already-committed archive always
+// reproduces byte for byte, including archives written before the
+// exclusion existed.
+func copyRootContentsExcluding(source, destination *os.Root) ([]string, error) {
+	excluded := []string(nil)
+	if err := copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string), &excluded); err != nil {
+		return nil, err
+	}
+	sort.Strings(excluded)
+	return excluded, nil
+}
+
+func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlinks map[workarea.FileIdentity]string, excluded *[]string) error {
 	directory, err := source.Open(relativeDir)
 	if err != nil {
 		return err
@@ -2438,6 +2488,10 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 				return err
 			}
 		case info.IsDir():
+			if excluded != nil && isArchiveExcludedDir(entry.Name()) {
+				*excluded = append(*excluded, filepath.ToSlash(name))
+				continue
+			}
 			if err := destination.Mkdir(name, info.Mode().Perm()); err != nil {
 				return err
 			}
@@ -2450,7 +2504,7 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 				_ = sourceChild.Close()
 				return fmt.Errorf("archive copy source directory identity changed")
 			}
-			copyErr := copyRootDirectory(source, destination, name, hardlinks)
+			copyErr := copyRootDirectory(source, destination, name, hardlinks, excluded)
 			_ = sourceChild.Close()
 			if copyErr != nil {
 				return copyErr

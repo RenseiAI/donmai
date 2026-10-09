@@ -11,6 +11,7 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 ### Features
 
 - `agent run` no longer preserves a failed session's worktree by default: once the rescue has archived the session's unpublished work as a patch, the worktree is torn down, so disk use stays bounded to live sessions. Operators who need failed worktrees on disk for post-mortem recovery can opt back in with `keepFailedWorktrees: true` in the daemon configuration (or `--preserve-worktree` for one worker); successful sessions are still always torn down.
+- Workarea archives skip regenerable dependency and build-output directories (`node_modules`, `.next`, `dist`, `target`) at capture time. The skipped paths are recorded on the archive manifest's `excluded` list (visible on the inspect surface), and the archive digest and size cover the filtered tree.
 
 ## v0.72.71 — 2026-10-09
 
