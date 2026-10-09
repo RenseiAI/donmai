@@ -961,6 +961,16 @@ func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse, bin str
 		return fmt.Errorf("flush table: %w", err)
 	}
 
+	// Repository-keeper section (secret-free: counts and bytes only).
+	if r.RepoKeeper != nil {
+		if _, err := fmt.Fprintf(tw, "  %s\t%s\n", "Repository keeper:", formatRepoKeeperStat(r)); err != nil {
+			return fmt.Errorf("write row: %w", err)
+		}
+		if err := tw.Flush(); err != nil {
+			return fmt.Errorf("flush table: %w", err)
+		}
+	}
+
 	// Pool section.
 	if r.Pool != nil {
 		if err := writePoolStatsSection(w, r.Pool); err != nil {
@@ -1187,8 +1197,22 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 
 // allowedCapacityKeys is the set of dotted config keys accepted by `donmai host set`.
 var allowedCapacityKeys = map[string]struct{}{
-	"capacity.maxConcurrentSessions": {},
-	"capacity.poolMaxDiskGb":         {},
+	"capacity.maxConcurrentSessions":        {},
+	"capacity.poolMaxDiskGb":                {},
+	"repoKeeper.enabled":                    {},
+	"repoKeeper.maxDiskGb":                  {},
+	"repoKeeper.fetchIntervalSeconds":       {},
+	"repoKeeper.authorizationWindowSeconds": {},
+}
+
+// repoKeeperRestartKeys are the process-level keeper keys: the running daemon
+// never re-reads them, so `host set` persists the value and tells the operator
+// a drain-aware restart is needed.
+var repoKeeperRestartKeys = map[string]struct{}{
+	"repoKeeper.enabled":                    {},
+	"repoKeeper.maxDiskGb":                  {},
+	"repoKeeper.fetchIntervalSeconds":       {},
+	"repoKeeper.authorizationWindowSeconds": {},
 }
 
 // newDaemonSetCmd returns the `donmai host set` command.
@@ -1209,9 +1233,17 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"  capacity.maxConcurrentSessions  Maximum concurrently accepted sessions\n" +
 			"                                  for this local daemon (0 = accept none).\n" +
 			"  capacity.poolMaxDiskGb          Maximum total pool disk usage in GiB before\n" +
-			"                                  LRU eviction triggers (0 = no limit).\n\n" +
-			"The change is written atomically to ~/.donmai/daemon.yaml and the daemon\n" +
-			"reloads the affected subsystem without a restart.",
+			"                                  LRU eviction triggers (0 = no limit).\n" +
+			"  repoKeeper.enabled              Enable the per-host repository keeper\n" +
+			"                                  (0 or 1; default off).\n" +
+			"  repoKeeper.maxDiskGb            Maximum total keeper disk usage in GiB\n" +
+			"                                  before eviction (0 = no limit).\n" +
+			"  repoKeeper.fetchIntervalSeconds Bound on how often a mirror is re-fetched.\n" +
+			"  repoKeeper.authorizationWindowSeconds  Bound on how long a resolved\n" +
+			"                                  authorization is honored.\n\n" +
+			"The change is written atomically to ~/.donmai/daemon.yaml. Capacity keys\n" +
+			"reload the affected subsystem without a restart; repoKeeper.* keys are\n" +
+			"process-level and need a drain-aware restart to take effect.",
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1219,11 +1251,34 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			value := args[1]
 
 			if _, ok := allowedCapacityKeys[key]; !ok {
-				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb", key)
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds", key)
 			}
 
 			// Validate integer capacity keys locally so we give a clear error
 			// before hitting the daemon.
+			if _, ok := repoKeeperRestartKeys[key]; ok {
+				n, err := strconv.Atoi(value)
+				if err != nil || n < 0 || (key == "repoKeeper.enabled" && n > 1) {
+					return fmt.Errorf("%s must be a non-negative integer%s, got %q", key, boolRangeHint(key), value)
+				}
+				yamlPath := cfgPath
+				if yamlPath == "" {
+					yamlPath = afclient.DefaultDaemonYAMLPath()
+				}
+				cfg, readErr := afclient.ReadDaemonYAML(yamlPath)
+				if readErr != nil {
+					return fmt.Errorf("read daemon config: %w", readErr)
+				}
+				applyRepoKeeperSet(cfg, key, int64(n))
+				if writeErr := afclient.WriteDaemonYAMLWithCapacity(yamlPath, cfg, key, n); writeErr != nil {
+					return fmt.Errorf("write daemon config: %w", writeErr)
+				}
+				// Process-level: persist the value, then tell the operator a
+				// drain-aware restart is needed. Still notify the daemon
+				// best-effort below so a live daemon can report its view.
+				notifyRepoKeeperRestartKey(cmd, factory, host, port, jsonOut, key, value)
+				return nil
+			}
 			if key == "capacity.poolMaxDiskGb" || key == "capacity.maxConcurrentSessions" {
 				n, err := strconv.Atoi(value)
 				if err != nil || n < 0 {
@@ -1288,6 +1343,55 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
 
 	return cmd
+}
+
+// boolRangeHint names the 0-or-1 range for boolean keeper keys.
+func boolRangeHint(key string) string {
+	if key == "repoKeeper.enabled" {
+		return " (0 or 1)"
+	}
+	return ""
+}
+
+// applyRepoKeeperSet records one repoKeeper.* set into the in-memory YAML.
+func applyRepoKeeperSet(cfg *afclient.DaemonYAML, key string, n int64) {
+	switch key {
+	case "repoKeeper.enabled":
+		cfg.RepoKeeper.Enabled = n == 1
+	case "repoKeeper.maxDiskGb":
+		cfg.RepoKeeper.MaxDiskGb = n
+	case "repoKeeper.fetchIntervalSeconds":
+		cfg.RepoKeeper.FetchIntervalSeconds = n
+	case "repoKeeper.authorizationWindowSeconds":
+		cfg.RepoKeeper.AuthorizationWindowSeconds = n
+	}
+}
+
+// notifyRepoKeeperRestartKey tells the running daemon about a process-level
+// keeper change best-effort, then reports that a drain-aware restart is
+// needed for it to take effect.
+func notifyRepoKeeperRestartKey(cmd *cobra.Command, factory daemonClientFactory, host string, port int, jsonOut bool, key, value string) {
+	httpCfg := afclient.DefaultDaemonConfig()
+	if host != "" {
+		httpCfg.Host = host
+	}
+	if port != 0 {
+		httpCfg.Port = port
+	}
+	client := factory(httpCfg)
+	if _, err := client.SetCapacityConfig(key, value); err != nil {
+		out := cmd.OutOrStdout()
+		_, _ = fmt.Fprintf(out, "set %s=%s (daemon not reachable; config written to disk; restart the daemon with drained work for it to take effect)\n", key, value)
+		return
+	}
+	out := cmd.OutOrStdout()
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]string{"key": key, "value": value, "message": "config written to disk; restart the daemon with drained work for it to take effect"})
+		return
+	}
+	_, _ = fmt.Fprintf(out, "set %s=%s: config written to disk; restart the daemon with drained work for it to take effect\n", key, value)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1392,6 +1496,20 @@ func padRight(s string, w int) string {
 
 // formatWorkerStat renders the "Worker:" row of `host stats`. Returns a
 // short description of the worker id with stub annotation when applicable.
+// formatRepoKeeperStat renders the secret-free keeper snapshot: mirror
+// count, last fetch, revoked count, and bytes. No scope values or URLs.
+func formatRepoKeeperStat(r *afclient.DaemonStatsResponse) string {
+	if r == nil || r.RepoKeeper == nil {
+		return "disabled"
+	}
+	k := r.RepoKeeper
+	last := k.LastFetchAt
+	if last == "" {
+		last = "never"
+	}
+	return fmt.Sprintf("%d mirror(s), last fetch %s, %d revoked, %d bytes", k.MirrorCount, last, k.RevokedCount, k.Bytes)
+}
+
 func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.WorkerID == "" {
 		return "(unregistered)"

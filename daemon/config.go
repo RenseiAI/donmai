@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -87,6 +88,12 @@ type Config struct {
 	// applyDefaults seeds ScanPaths to [DefaultKitScanPath()] when
 	// absent. Per ADR-2026-05-07 § D4.
 	Kit KitConfig `yaml:"kit,omitempty"          json:"kit,omitempty"`
+	// RepoKeeper holds the per-host repository-keeper tunables (see
+	// repo_keeper.go). Optional; all zero means the keeper stays off and
+	// nothing is created under repo-keeper/. Process-level: changing any of
+	// these needs a drain-aware restart — the running keeper never re-reads
+	// them, and `daemon set` persists the value and says so.
+	RepoKeeper RepoKeeperConfig `yaml:"repoKeeper,omitempty" json:"repoKeeper,omitempty"`
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
 	// actor). Optional; applyDefaults seeds Mode via
@@ -509,6 +516,53 @@ type KitConfig struct {
 // DefaultConfigPath returns the path to daemon.yaml under ~/.donmai/.
 func DefaultConfigPath() string {
 	return statepath.Resolve("daemon.yaml", "/tmp/.donmai/daemon.yaml")
+}
+
+// RepoKeeperConfig configures the per-host repository keeper. The zero value
+// keeps the keeper disabled: nothing is created under repo-keeper/.
+type RepoKeeperConfig struct {
+	// Enabled gates keeper construction. Default off.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxDiskGb caps total mirror disk usage in GiB before budget eviction.
+	// 0 means no limit.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+	// FetchIntervalSeconds bounds how often a mirror is re-fetched.
+	// 0 means the keeper default.
+	FetchIntervalSeconds int64 `yaml:"fetchIntervalSeconds,omitempty" json:"fetchIntervalSeconds,omitempty"`
+	// AuthorizationWindowSeconds bounds how long a resolved authorization
+	// is honored. 0 means the keeper default.
+	AuthorizationWindowSeconds int64 `yaml:"authorizationWindowSeconds,omitempty" json:"authorizationWindowSeconds,omitempty"`
+}
+
+// DefaultRepoKeeperFetchIntervalSeconds is the keeper default when
+// fetchIntervalSeconds is unset.
+const DefaultRepoKeeperFetchIntervalSeconds = 30
+
+// DefaultRepoKeeperAuthorizationWindowSeconds is the keeper default when
+// authorizationWindowSeconds is unset.
+const DefaultRepoKeeperAuthorizationWindowSeconds = 300
+
+// EffectiveRepoKeeperSettings resolves the authored config to the
+// process-level settings the keeper constructs with.
+func (c *Config) EffectiveRepoKeeperSettings() RepoKeeperSettings {
+	var cfg RepoKeeperConfig
+	if c != nil {
+		cfg = c.RepoKeeper
+	}
+	fetchInterval := cfg.FetchIntervalSeconds
+	if fetchInterval <= 0 {
+		fetchInterval = DefaultRepoKeeperFetchIntervalSeconds
+	}
+	authorizationWindow := cfg.AuthorizationWindowSeconds
+	if authorizationWindow <= 0 {
+		authorizationWindow = DefaultRepoKeeperAuthorizationWindowSeconds
+	}
+	return RepoKeeperSettings{
+		Enabled:             cfg.Enabled,
+		MaxBytes:            cfg.MaxDiskGb * 1024 * 1024 * 1024,
+		FetchInterval:       time.Duration(fetchInterval) * time.Second,
+		AuthorizationWindow: time.Duration(authorizationWindow) * time.Second,
+	}
 }
 
 // DefaultJWTPath returns the path to the cached JWT under ~/.donmai/.
@@ -1000,6 +1054,15 @@ func validateConfig(c *Config) error {
 	}
 	if c.Capacity.MaxConcurrentSessions < 0 {
 		return errors.New("capacity.maxConcurrentSessions must be >= 0")
+	}
+	if c.RepoKeeper.MaxDiskGb < 0 {
+		return errors.New("repoKeeper.maxDiskGb must be >= 0")
+	}
+	if c.RepoKeeper.FetchIntervalSeconds < 0 {
+		return errors.New("repoKeeper.fetchIntervalSeconds must be >= 0")
+	}
+	if c.RepoKeeper.AuthorizationWindowSeconds < 0 {
+		return errors.New("repoKeeper.authorizationWindowSeconds must be >= 0")
 	}
 	if err := validateSeatBudget(c.Capacity.SeatBudget); err != nil {
 		return err
