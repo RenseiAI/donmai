@@ -59,8 +59,9 @@ USER acceptance
 WORKDIR /src
 RUN go version && go mod download
 
-# The repo, owned by the acceptance user so the driver can add a git
-# worktree for artifact N without a dubious-ownership refusal.
+# The repo with its history, owned by the acceptance user so the driver can
+# read the earlier revision artifact N is built from without a
+# dubious-ownership refusal.
 USER root
 COPY --chown=acceptance:acceptance . /src
 

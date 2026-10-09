@@ -55,10 +55,7 @@ INSTALL_PATH="${HOME}/.local/opt/donmai-acceptance/donmai"
 mkdir -p "${RESULT_DIR}" "$(dirname "${INSTALL_PATH}")"
 
 WORK="$(mktemp -d /tmp/upgrade-acceptance.XXXXXX)"
-cleanup() {
-  git -C /src worktree remove --force "${WORK}/n" >/dev/null 2>&1 || true
-  rm -rf "${WORK}"
-}
+cleanup() { rm -rf "${WORK}"; }
 trap cleanup EXIT
 
 CHECKPOINTS='{}'
@@ -136,7 +133,8 @@ HEAD_SHA="$(git rev-parse HEAD)"
 N_VERSION="0.0.0-acceptance.n.${BASE_SHA:0:12}"
 NEXT_VERSION="0.0.1-acceptance.next.${HEAD_SHA:0:12}"
 echo "building artifact N (${N_VERSION}) from ${BASE_REV}"
-git worktree add --detach "${WORK}/n" "${BASE_SHA}" >/dev/null 2>&1 || infra base_worktree_failed "${BASE_SHA}"
+mkdir -p "${WORK}/n"
+git archive --format=tar "${BASE_SHA}" | tar -x -C "${WORK}/n" || infra base_tree_failed "${BASE_SHA}"
 (cd "${WORK}/n" && go build -ldflags "-X main.version=${N_VERSION}" -o "${WORK}/donmai-n" ./cmd/donmai) \
   || infra build_n_failed "${BASE_SHA}"
 echo "building artifact N+1 (${NEXT_VERSION}) from this revision"

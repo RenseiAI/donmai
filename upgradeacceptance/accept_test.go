@@ -1038,7 +1038,16 @@ func TestScopeCreationRefused(t *testing.T) {
 	}
 	handle, err := provider.Spawn(context.Background(), spec)
 	if err == nil {
-		_ = handle.Stop(context.Background())
+		t.Cleanup(func() { _ = handle.Stop(context.Background()) })
+	}
+	// The refusal happens before spawn. Checked first: a fallback launch —
+	// into a weaker scope, or one that fails late with the typed code —
+	// starts a harness process, and the marker it leaves is the violation
+	// whatever Spawn returns.
+	if raw, statErr := os.ReadFile(started); !os.IsNotExist(statErr) {
+		t.Fatalf("a harness process started for a scope the harness cannot render (marker %q, err %v); the seat must be refused before spawn", raw, statErr)
+	}
+	if err == nil {
 		t.Fatal("Spawn of a session stamping a scope the harness cannot render succeeded, want the typed scope refusal")
 	}
 	if !errors.Is(err, agent.ErrSpawnFailed) {
@@ -1046,11 +1055,5 @@ func TestScopeCreationRefused(t *testing.T) {
 	}
 	if code := agent.ExecutionSecurityErrorCode(err); code != agent.ExecutionSecurityUnrenderable {
 		t.Fatalf("Spawn error = %v (code %q), want the typed %q scope refusal", err, code, agent.ExecutionSecurityUnrenderable)
-	}
-	// The refusal happens before spawn: a late-failing fallback launch
-	// would satisfy the typed-refusal shape above, so the absent marker is
-	// what proves the seat never launched.
-	if raw, statErr := os.ReadFile(started); !os.IsNotExist(statErr) {
-		t.Fatalf("harness process started before the scope refusal (marker %q, err %v); the seat must be refused before spawn", raw, statErr)
 	}
 }
