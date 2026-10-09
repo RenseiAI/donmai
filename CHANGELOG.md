@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.70 — 2026-10-09
+
 ### Features
 
 - `host watch` is redesigned. Every session card has the same width and height (issue and title, project and work type, model and harness, state with elapsed time plus turns and cost when reported, and the last activity), so columns align at any terminal width; unreported values read unknown, never zero. Selection keeps the selected card in place, the header shows the host's occupied and total session slots, and enter opens a detail pane with the session's full identity, freshness and paths (esc returns to the stream). Data that existed but showed as missing is now filled in: tail catch-up reads every session each tick, a quiet run's last activity comes from its journal, elapsed time falls back to the admission time, and the session list carries the issue identifier.
