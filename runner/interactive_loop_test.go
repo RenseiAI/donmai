@@ -879,6 +879,75 @@ func TestInteractive_LocalOnlyCompletes(t *testing.T) {
 	}
 }
 
+// costTerminalHandle is an interactive PTY handle whose Events channel
+// carries a harness-accounted terminal ResultEvent, as a harness that sums
+// its own transcript at exit emits.
+type costTerminalHandle struct {
+	*interactivePTYHandle
+	events chan agent.Event
+}
+
+func (h *costTerminalHandle) Events() <-chan agent.Event { return h.events }
+
+// TestInteractive_TerminalCostReachesTheSessionResult drives the production
+// exit path: a handle whose terminal ResultEvent carries session totals
+// (accounted by the harness from its own transcript) lands those totals on
+// the session result, so an interactive session ends with its real usage
+// instead of no cost. A costless terminal leaves the result untouched.
+func TestInteractive_TerminalCostReachesTheSessionResult(t *testing.T) {
+	requireSh(t)
+
+	for _, tc := range []struct {
+		name string
+		cost *agent.CostData
+	}{
+		{name: "cost accounted by the harness", cost: &agent.CostData{InputTokens: 300, OutputTokens: 60, CachedInputTokens: 1000, CacheWriteTokens: 50, NumTurns: 2}},
+		{name: "costless terminal", cost: nil},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envAttachURL, "")
+			t.Setenv(envAttachToken, "")
+
+			r := minimalRunner(t)
+			sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", "exit 0"}})
+			if err != nil {
+				t.Fatalf("ptyhost.Spawn: %v", err)
+			}
+			events := make(chan agent.Event, 2)
+			events <- agent.InitEvent{}
+			events <- agent.ResultEvent{Success: true, Cost: tc.cost}
+			close(events)
+			h := &costTerminalHandle{interactivePTYHandle: newInteractivePTYHandle(sess), events: events}
+
+			res := &Result{SessionID: "s"}
+			qw := QueuedWork{}
+			qw.SessionID = "s"
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+			if err != nil {
+				t.Fatalf("dispatchInteractive: unexpected err %v", err)
+			}
+			if out.Status != "completed" {
+				t.Fatalf("status=%q error=%q; want completed", out.Status, out.Error)
+			}
+			if tc.cost == nil {
+				if out.Cost != nil {
+					t.Fatalf("Cost = %+v; want nil — a costless terminal must not invent usage", out.Cost)
+				}
+				return
+			}
+			if out.Cost == nil {
+				t.Fatal("Cost is nil; want the harness-accounted session totals — the session ends with no cost")
+			}
+			if *out.Cost != *tc.cost {
+				t.Fatalf("Cost = %+v; want %+v", out.Cost, tc.cost)
+			}
+		})
+	}
+}
+
 // boolPtr returns a pointer to b, for constructing the *bool
 // RecordingEnabled wire value in table-driven tests.
 func boolPtr(b bool) *bool { return &b }
