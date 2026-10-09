@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -103,6 +104,10 @@ type stopHookChannel struct {
 	dir string
 
 	mu sync.Mutex
+	// transcriptsMu guards transcripts on its own: the usage tailer notes
+	// paths while a notice operation may hold mu, and exitUsage reads them
+	// while holding mu.
+	transcriptsMu sync.Mutex
 	// text is the outstanding offer's message body, empty when nothing is
 	// outstanding.
 	text string
@@ -117,6 +122,14 @@ type stopHookChannel struct {
 	// snapshotPath pins the session's transcript path in memory once the
 	// drop directory is about to be removed (see snapshotTranscriptPath).
 	snapshotPath string
+	// transcripts is every distinct transcript path the hook has named this
+	// session, in first-seen order. Clearing the conversation moves the
+	// session to a new transcript, so the exit totals sum all of them.
+	transcripts []string
+	// createdAt is when the channel — and so the session — began. Transcript
+	// lines stamped earlier belong to a conversation this session resumed,
+	// not to this session's spend.
+	createdAt time.Time
 }
 
 // Compile-time assertion: the drop implements the pull seam the runner drives.
@@ -135,7 +148,7 @@ func newStopHookChannel() (*stopHookChannel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stop-hook channel: create drop dir: %w", err)
 	}
-	c := &stopHookChannel{dir: dir}
+	c := &stopHookChannel{dir: dir, createdAt: time.Now()}
 	script := stopHookScript(dir)
 	if err := os.WriteFile(c.path(stopHookScriptFile), []byte(script), 0o700); err != nil { //nolint:gosec // the hook is executed by the CLI; it is owner-only
 		_ = os.RemoveAll(dir)
@@ -293,7 +306,30 @@ func (c *stopHookChannel) claimedTranscriptPath() (string, bool, error) {
 // which case the session has no transcript to account. It is what the exit
 // usage accounting reads.
 func (c *stopHookChannel) transcriptPath() (string, bool, error) {
-	return transcriptPathFromStdinFile(c.path(stopHookTranscriptFile))
+	path, ok, err := transcriptPathFromStdinFile(c.path(stopHookTranscriptFile))
+	if err == nil && ok {
+		c.noteTranscript(path)
+	}
+	return path, ok, err
+}
+
+// noteTranscript records a transcript path the hook named, once.
+func (c *stopHookChannel) noteTranscript(path string) {
+	c.transcriptsMu.Lock()
+	defer c.transcriptsMu.Unlock()
+	for _, seen := range c.transcripts {
+		if seen == path {
+			return
+		}
+	}
+	c.transcripts = append(c.transcripts, path)
+}
+
+// namedTranscripts returns every transcript path the hook has named.
+func (c *stopHookChannel) namedTranscripts() []string {
+	c.transcriptsMu.Lock()
+	defer c.transcriptsMu.Unlock()
+	return append([]string(nil), c.transcripts...)
 }
 
 // snapshotTranscriptPath pins the session's transcript path in memory. The
@@ -308,36 +344,41 @@ func (c *stopHookChannel) snapshotTranscriptPath() {
 	if c.snapshotPath != "" {
 		return
 	}
-	path, ok, err := transcriptPathFromStdinFile(c.path(stopHookTranscriptFile))
+	path, ok, err := c.transcriptPath()
 	if err != nil || !ok {
 		return
 	}
 	c.snapshotPath = path
 }
 
-// exitUsage sums the session's token totals from its transcript, deduplicated
-// by message id so repeated content blocks and re-reads count once (see
-// transcript_usage.go). It reads the pinned snapshot path when the drop is
-// already gone (the terminal event fires after the session cleanup), else
-// the live locator. A session whose hook never fired — or whose transcript
-// never materialized — reports no usage, never an error.
+// exitUsage sums the session's token totals from every transcript it named,
+// with the subagent transcripts beside each, deduplicated by message id so
+// repeated content blocks, re-reads and copies count once, and counting only
+// lines stamped after the session began (see transcript_usage.go). The
+// pinned snapshot path stands in for the locator once the drop is gone (the
+// terminal event fires after the session cleanup). A session whose hook never
+// fired — or whose transcript never materialized — reports no usage, never an
+// error; a transcript that cannot be trusted reports an error, so the
+// session's usage reads as unreported.
 func (c *stopHookChannel) exitUsage() (agent.CostData, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	path := c.snapshotPath
-	if path == "" {
-		var ok bool
-		var err error
-		path, ok, err = c.transcriptPath()
-		if err != nil || !ok {
+	if c.snapshotPath == "" {
+		if _, _, err := c.transcriptPath(); err != nil {
 			return agent.CostData{}, err
 		}
 	}
-	total, err := sumTranscriptUsage(path)
-	if err != nil {
-		return agent.CostData{}, err
+	paths := c.namedTranscripts()
+	if len(paths) == 0 {
+		return agent.CostData{}, nil
 	}
-	return total, nil
+	sum := newTranscriptUsageSum(c.createdAt)
+	for _, path := range paths {
+		if err := sum.addTranscript(path); err != nil {
+			return agent.CostData{}, err
+		}
+	}
+	return sum.result()
 }
 
 // transcriptPathFromStdinFile reads transcript_path out of one verbatim hook

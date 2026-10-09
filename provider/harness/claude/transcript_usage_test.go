@@ -2,9 +2,12 @@ package claude
 
 import (
 	"encoding/json"
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -160,7 +163,7 @@ func TestMapTranscriptUsageEvent_DedupesAcrossSweeps(t *testing.T) {
 	seen := make(map[string]struct{})
 	line := []byte(usageLine(t, "msg-1", 100, 20, 1000, 50))
 
-	first, ok := mapTranscriptUsageEvent(line, seen)
+	first, ok := mapTranscriptUsageEvent(line, seen, time.Time{})
 	if !ok {
 		t.Fatal("first sight of msg-1 mapped to nothing")
 	}
@@ -171,7 +174,7 @@ func TestMapTranscriptUsageEvent_DedupesAcrossSweeps(t *testing.T) {
 	if first.UsageSource != agent.LlmUsageProvider || !first.TurnCompleted {
 		t.Fatalf("usage event = %+v; want the headless lane's provider-completed shape", first)
 	}
-	if _, ok := mapTranscriptUsageEvent(line, seen); ok {
+	if _, ok := mapTranscriptUsageEvent(line, seen, time.Time{}); ok {
 		t.Fatal("second sight of msg-1 emitted again — a re-read would double count")
 	}
 }
@@ -416,5 +419,207 @@ func TestSumTranscriptUsage_IdLessLinesDedupeByContent(t *testing.T) {
 	}
 	if got.InputTokens != 300 || got.NumTurns != 2 {
 		t.Fatalf("usage = %+v; want 300 input tokens over 2 turns", got)
+	}
+}
+
+// stampedUsageLine is usageLine with the transcript's own line timestamp.
+func stampedUsageLine(t *testing.T, id string, at time.Time, in, out int64) string {
+	t.Helper()
+	return jsonLine(t, map[string]any{
+		"type":      "assistant",
+		"timestamp": at.UTC().Format(time.RFC3339Nano),
+		"message": map[string]any{
+			"id":   id,
+			"role": "assistant",
+			"usage": map[string]any{
+				"input_tokens":  in,
+				"output_tokens": out,
+			},
+			"content": []any{map[string]any{"type": "text", "text": "work"}},
+		},
+	})
+}
+
+// TestStopHookChannel_ExitUsageSumsEveryTranscriptTheSessionNamed pins the
+// conversation-clear case: clearing starts a new transcript under a new
+// session id and the hook names the new file from then on. The turns written
+// to the first transcript were still spent by this session, so the exit
+// totals sum every transcript the hook named — a message copied into both
+// counts once.
+func TestStopHookChannel_ExitUsageSumsEveryTranscriptTheSessionNamed(t *testing.T) {
+	t.Parallel()
+	c := newTestStopHookChannel(t)
+	first := writeTranscript(t, []string{
+		usageLine(t, "msg-a", 5000, 500, 0, 0),
+		usageLine(t, "msg-c", 7, 0, 0, 0),
+	})
+	fireHook(t, c, hookStdin(first, false))
+	if _, _, err := c.transcriptPath(); err != nil { // the live tail's poll
+		t.Fatalf("transcriptPath: %v", err)
+	}
+	second := writeTranscript(t, []string{
+		usageLine(t, "msg-a", 5000, 500, 0, 0), // carried over: counted once
+		usageLine(t, "msg-b", 10, 1, 0, 0),
+	})
+	fireHook(t, c, hookStdin(second, false))
+	c.snapshotTranscriptPath() // the session cleanup, before the drop is removed
+
+	got, err := c.exitUsage()
+	if err != nil {
+		t.Fatalf("exitUsage: %v", err)
+	}
+	want := agent.CostData{InputTokens: 5017, OutputTokens: 501, NumTurns: 3}
+	if got != want {
+		t.Fatalf("exitUsage = %+v; want %+v (both transcripts, each message once)", got, want)
+	}
+}
+
+// TestStopHookChannel_ExitUsageCountsSubagentTranscripts pins that subagent
+// turns count: the harness writes them to their own files beside the session
+// transcript (<transcript minus .jsonl>/subagents/*.jsonl), never into it, and
+// a session that delegates spends much of its tokens there.
+func TestStopHookChannel_ExitUsageCountsSubagentTranscripts(t *testing.T) {
+	t.Parallel()
+	c := newTestStopHookChannel(t)
+	main := writeTranscript(t, []string{usageLine(t, "msg-main", 100, 10, 1000, 0)})
+	subDir := filepath.Join(strings.TrimSuffix(main, ".jsonl"), "subagents")
+	if err := os.MkdirAll(subDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, line := range map[string]string{
+		"agent-one.jsonl": usageLine(t, "msg-sub-1", 300, 30, 9000, 40),
+		"agent-two.jsonl": usageLine(t, "msg-sub-2", 200, 20, 0, 0),
+	} {
+		if err := os.WriteFile(filepath.Join(subDir, name), []byte(line+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fireHook(t, c, hookStdin(main, false))
+
+	got, err := c.exitUsage()
+	if err != nil {
+		t.Fatalf("exitUsage: %v", err)
+	}
+	want := agent.CostData{InputTokens: 600, OutputTokens: 60, CachedInputTokens: 10000, CacheWriteTokens: 40, NumTurns: 3}
+	if got != want {
+		t.Fatalf("exitUsage = %+v; want %+v (session plus subagent transcripts)", got, want)
+	}
+}
+
+// TestStopHookChannel_ExitUsageSkipsTurnsFromBeforeTheSession pins the resume
+// case: resuming an earlier conversation continues its transcript, whose
+// earlier turns were spent before this session began. Only lines stamped
+// after the session began count, in the exit sum and in the live tail alike.
+func TestStopHookChannel_ExitUsageSkipsTurnsFromBeforeTheSession(t *testing.T) {
+	t.Parallel()
+	c := newTestStopHookChannel(t)
+	path := writeTranscript(t, []string{
+		stampedUsageLine(t, "msg-earlier", c.createdAt.Add(-time.Hour), 7000, 700),
+		stampedUsageLine(t, "msg-now", c.createdAt.Add(time.Second), 10, 1),
+	})
+	fireHook(t, c, hookStdin(path, false))
+
+	got, err := c.exitUsage()
+	if err != nil {
+		t.Fatalf("exitUsage: %v", err)
+	}
+	if want := (agent.CostData{InputTokens: 10, OutputTokens: 1, NumTurns: 1}); got != want {
+		t.Fatalf("exitUsage = %+v; want %+v (only this session's turn)", got, want)
+	}
+	events := newInteractiveUsageTailer(c).sweep()
+	if len(events) != 1 || events[0].(agent.LlmCallEvent).InputTokens != 10 {
+		t.Fatalf("live tail emitted %+v; want only this session's turn", events)
+	}
+}
+
+// TestStopHookChannel_UntrustedTranscriptReadsAsUnreported pins that a
+// transcript the accounting cannot take at face value never becomes a wrong
+// number: a count no model call produces, or a total that would overflow,
+// makes the session's usage unreported (the terminal event stays costless),
+// and a transcript path that is not a regular file is refused before any read
+// (a FIFO would otherwise block the exit forever).
+func TestStopHookChannel_UntrustedTranscriptReadsAsUnreported(t *testing.T) {
+	t.Parallel()
+	fifo := filepath.Join(t.TempDir(), "fifo.jsonl")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	tests := []struct {
+		name string
+		path func(t *testing.T) string
+		// liveEvents is how many per-turn events the live tail emits: an
+		// impossible count is never forwarded, a valid line still is.
+		liveEvents int
+	}{
+		{"negative count", func(t *testing.T) string {
+			return writeTranscript(t, []string{
+				usageLine(t, "msg-1", 1000, 100, 0, 0),
+				usageLine(t, "msg-2", -900, 10, 0, 0),
+			})
+		}, 1},
+		{"total overflows", func(t *testing.T) string {
+			return writeTranscript(t, []string{
+				usageLine(t, "msg-1", 1000, 100, 0, 0),
+				usageLine(t, "msg-2", math.MaxInt64, 10, 0, 0),
+			})
+		}, 2},
+		{"not a regular file", func(*testing.T) string { return fifo }, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newTestStopHookChannel(t)
+			fireHook(t, c, hookStdin(tc.path(t), false))
+			done := make(chan agent.Event, 1)
+			go func() { done <- withTranscriptCost(agent.ResultEvent{Success: true}, c) }()
+			select {
+			case got := <-done:
+				if cost := got.(agent.ResultEvent).Cost; cost != nil {
+					t.Fatalf("terminal cost = %+v; want none (unreported)", *cost)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("exit accounting blocked on the transcript")
+			}
+			if _, err := c.exitUsage(); !errors.Is(err, errTranscriptUntrusted) {
+				t.Fatalf("exitUsage err = %v; want errTranscriptUntrusted", err)
+			}
+			live := make(chan int, 1)
+			go func() { live <- len(newInteractiveUsageTailer(c).sweep()) }()
+			select {
+			case n := <-live:
+				if n != tc.liveEvents {
+					t.Fatalf("live tail emitted %d events; want %d", n, tc.liveEvents)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("live tail blocked on the transcript")
+			}
+		})
+	}
+}
+
+// TestInteractiveUsageTailer_RestartsAtANewTranscript pins the live tail's
+// read position across a transcript switch: the offset belongs to one file,
+// so when the hook names a new transcript the tail reads it from its first
+// byte instead of skipping as many bytes as it had read of the old one.
+func TestInteractiveUsageTailer_RestartsAtANewTranscript(t *testing.T) {
+	t.Parallel()
+	c := newTestStopHookChannel(t)
+	tailer := newInteractiveUsageTailer(c)
+	first := writeTranscript(t, []string{usageLine(t, "msg-a", 1, 1, 0, 0)})
+	fireHook(t, c, hookStdin(first, false))
+	if got := tailer.sweep(); len(got) != 1 {
+		t.Fatalf("first transcript emitted %d events; want 1", len(got))
+	}
+	second := writeTranscript(t, []string{
+		usageLine(t, "msg-b1", 3000, 300, 0, 0),
+		usageLine(t, "msg-b2", 40, 4, 0, 0),
+	})
+	fireHook(t, c, hookStdin(second, false))
+	var input int64
+	for _, ev := range tailer.sweep() {
+		input += ev.(agent.LlmCallEvent).InputTokens
+	}
+	if input != 3040 {
+		t.Fatalf("second transcript input = %d; want 3040 (every line of the new file)", input)
 	}
 }

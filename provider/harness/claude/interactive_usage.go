@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
-	"os"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -65,7 +64,11 @@ const (
 // ids already emitted across sweeps. It is not safe for concurrent use; the
 // single tailer goroutine owns it.
 type interactiveUsageTailer struct {
-	hook   *stopHookChannel
+	hook *stopHookChannel
+	// path is the transcript offset belongs to. Clearing the conversation
+	// moves the session to a new transcript; the read restarts at its first
+	// byte rather than at the old file's offset.
+	path   string
 	offset int64
 	seen   map[string]struct{}
 }
@@ -126,8 +129,10 @@ func (t *interactiveUsageTailer) sweepCapped() (events []agent.Event, more bool)
 	if err != nil || !ok {
 		return nil, false
 	}
-	//nolint:gosec // path is the harness's own transcript, resolved from its hook payload.
-	f, err := os.Open(path)
+	if path != t.path {
+		t.path, t.offset = path, 0
+	}
+	f, err := openTranscript(path)
 	if err != nil {
 		return nil, false
 	}
@@ -167,7 +172,7 @@ func (t *interactiveUsageTailer) sweepCapped() (events []agent.Event, more bool)
 			return events, true
 		}
 		lines++
-		if ev, ok := mapTranscriptUsageEvent(line, t.seen); ok {
+		if ev, ok := mapTranscriptUsageEvent(line, t.seen, t.hook.createdAt); ok {
 			events = append(events, ev)
 		}
 		t.offset += int64(len(line))
@@ -180,19 +185,18 @@ func (t *interactiveUsageTailer) sweepCapped() (events []agent.Event, more bool)
 // mapTranscriptUsageEvent maps one transcript line to the LlmCallEvent the
 // headless lane emits for the equivalent model call. Lines already in seen
 // map to nothing so a re-read never double-emits; usage is credited per
-// message id, the same identity the exit sum dedupes on.
-func mapTranscriptUsageEvent(line []byte, seen map[string]struct{}) (agent.LlmCallEvent, bool) {
+// message id, the same identity the exit sum dedupes on, and only for the
+// lines the exit sum counts (classifyUsageLine): a line stamped before since
+// or carrying an impossible count emits nothing.
+func mapTranscriptUsageEvent(line []byte, seen map[string]struct{}, since time.Time) (agent.LlmCallEvent, bool) {
 	var parsed transcriptUsageLine
 	if err := json.Unmarshal(line, &parsed); err != nil {
 		return agent.LlmCallEvent{}, false
 	}
-	if parsed.Type != "assistant" || parsed.Message == nil || parsed.Message.Usage == nil {
+	if classifyUsageLine(parsed, since) != usageCredit {
 		return agent.LlmCallEvent{}, false
 	}
 	u := parsed.Message.Usage
-	if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadInputTokens == 0 && u.CacheCreationInputTokens == 0 {
-		return agent.LlmCallEvent{}, false
-	}
 	key, ok := usageLineKey(parsed)
 	if !ok {
 		return agent.LlmCallEvent{}, false
