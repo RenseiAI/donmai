@@ -387,10 +387,10 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 			out = append(out, agent.LlmCallEvent{
 				System:            msg.Provider,
 				Model:             msg.Model,
-				InputTokens:       int64(msg.Usage.Input),
-				OutputTokens:      int64(msg.Usage.Output),
-				CachedInputTokens: int64(msg.Usage.CacheRead),
-				CacheWriteTokens:  int64(msg.Usage.CacheWrite),
+				InputTokens:       transcriptTokens(msg.Usage.Input),
+				OutputTokens:      transcriptTokens(msg.Usage.Output),
+				CachedInputTokens: transcriptTokens(msg.Usage.CacheRead),
+				CacheWriteTokens:  transcriptTokens(msg.Usage.CacheWrite),
 				UsageSource:       agent.LlmUsageProvider,
 				ObservedCostUsd:   transcriptCost(msg.Usage.Cost.Total),
 				TurnCompleted:     true,
@@ -448,6 +448,23 @@ type interactiveTranscriptMessage struct {
 			Total *float64 `json:"total"`
 		} `json:"cost"`
 	} `json:"usage"`
+}
+
+// transcriptTokenLimit is the largest token count a transcript can carry
+// exactly: pi writes JSON numbers from a JavaScript runtime, whose integers
+// are exact only up to 2^53. A larger count is not a real token count.
+const transcriptTokenLimit = 1 << 53
+
+// transcriptTokens converts one transcript token count. A count no model
+// call produces — negative, or beyond transcriptTokenLimit (where the plain
+// float-to-int conversion is also platform-dependent) — maps to -1, which
+// the runner's usage meter refuses, so the session's usage reads as
+// unreported rather than as a wrong number.
+func transcriptTokens(n float64) int64 {
+	if n < 0 || n > transcriptTokenLimit {
+		return -1
+	}
+	return int64(n)
 }
 
 // transcriptCost mirrors the headless observedPiCost guard: only a finite,

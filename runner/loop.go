@@ -1246,21 +1246,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: stepCredentialProvider,
-		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
-			if qw.isInteractive() {
-				return r.interactiveUsageForSession(qw.SessionID).heartbeatSnapshot()
-			}
-			in, out, cached, usd := enforcer.usageSnapshot()
-			return stepheartbeat.UsageSnapshot{
-				InputTokens:       in,
-				OutputTokens:      out,
-				CachedInputTokens: cached,
-				TotalCostUsd:      usd,
-			}
-		},
-		HTTPClient: r.httpClient,
-		Logger:     r.logger,
-		Interval:   r.stepHeartbeatInterval,
+		UsageProvider:      r.stepHeartbeatUsage(qw, enforcer),
+		HTTPClient:         r.httpClient,
+		Logger:             r.logger,
+		Interval:           r.stepHeartbeatInterval,
 		// Interval is zero in production, keeping the 15s default —
 		// calibrated against the platform's 60s SESSION_STALE_THRESHOLD_MS.
 	})

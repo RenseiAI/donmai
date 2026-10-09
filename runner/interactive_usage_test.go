@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -237,5 +239,186 @@ func TestInteractive_StepHeartbeatReadsLiveTranscriptTotals(t *testing.T) {
 	r.interactiveUsageMu.Unlock()
 	if leaked {
 		t.Error("usage totals still registered after dispatch returned")
+	}
+}
+
+// TestInteractive_StoppedReportCarriesTranscriptUsage pins the stop exit
+// (runner cancel or the wall-clock cap, both of which end interactiveCtx):
+// the turns metered before the stop still spent tokens, so the stopped
+// report carries them — the same rule the headless lane's stop paths
+// follow with the budget meter. Before, this exit returned with a nil cost
+// and the session recorded nothing.
+func TestInteractive_StoppedReportCarriesTranscriptUsage(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := liveRecordingInteractiveSession()
+	t.Cleanup(func() { close(session.done) })
+	base := &fakeHandle{events: make(chan agent.Event, 8)}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "transcript-stopped-usage", Mode: interactiveRunMode}}
+	r := minimalRunner(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dispatchDone := make(chan struct{})
+	var result *Result
+	var dispatchErr error
+	go func() {
+		defer close(dispatchDone)
+		result, dispatchErr = r.dispatchInteractive(
+			ctx, handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, &recordingSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+		)
+	}()
+
+	turnCost := 0.02
+	base.events <- agent.LlmCallEvent{
+		InputTokens: 500, OutputTokens: 50, CachedInputTokens: 4000,
+		UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &turnCost, TurnCompleted: true,
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for r.interactiveUsageForSession(qw.SessionID).heartbeatSnapshot().InputTokens != 500 {
+		if time.Now().After(deadline) {
+			cancel()
+			<-dispatchDone
+			t.Fatal("supervisor never metered the turn")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-dispatchDone
+
+	if dispatchErr == nil || result.Status != "stopped" {
+		t.Fatalf("dispatchInteractive = status %q err %v, want stopped with the ctx error", result.Status, dispatchErr)
+	}
+	want := agent.CostData{InputTokens: 500, OutputTokens: 50, CachedInputTokens: 4000, TotalCostUsd: 0.02, NumTurns: 1}
+	if result.Cost == nil || *result.Cost != want {
+		t.Fatalf("stopped Cost = %+v; want %+v", result.Cost, want)
+	}
+}
+
+// TestInteractiveUsageTotals_ImpossibleValuesReadAsUnreported pins that a
+// transcript turn no real model call produces never becomes a wrong
+// number: a negative token count or a running total that would overflow
+// turns the whole total into "nothing metered" (nil cost, no heartbeat
+// usage), and a dollar sum that leaves the finite range drops the dollars
+// — keeping the tokens — instead of carrying +Inf, which would fail to
+// encode and lose the terminal report.
+func TestInteractiveUsageTotals_ImpossibleValuesReadAsUnreported(t *testing.T) {
+	t.Parallel()
+	price := 0.01
+	huge := math.MaxFloat64 / 1.5
+	negative := -0.5
+	good := agent.LlmCallEvent{InputTokens: 100, OutputTokens: 10, UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &price, TurnCompleted: true}
+	tests := []struct {
+		name       string
+		events     []agent.LlmCallEvent
+		wantOK     bool
+		wantTokens int64 // InputTokens, when wantOK
+		wantUsd    float64
+	}{
+		{
+			name: "negative token count",
+			events: []agent.LlmCallEvent{
+				good,
+				{InputTokens: -90, OutputTokens: 10, UsageSource: agent.LlmUsageProvider, TurnCompleted: true},
+			},
+		},
+		{
+			name: "negative count first",
+			events: []agent.LlmCallEvent{
+				{CachedInputTokens: -1, UsageSource: agent.LlmUsageProvider, TurnCompleted: true}, good,
+			},
+		},
+		{
+			name: "token sum overflows",
+			events: []agent.LlmCallEvent{
+				good,
+				{InputTokens: math.MaxInt64, UsageSource: agent.LlmUsageProvider, TurnCompleted: true},
+			},
+		},
+		{
+			name: "dollar sum leaves the finite range",
+			events: []agent.LlmCallEvent{
+				{InputTokens: 1, UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &huge, TurnCompleted: true},
+				{InputTokens: 1, UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &huge, TurnCompleted: true},
+				good,
+			},
+			wantOK: true, wantTokens: 102, wantUsd: 0,
+		},
+		{
+			name: "negative price",
+			events: []agent.LlmCallEvent{
+				good,
+				{InputTokens: 1, UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &negative, TurnCompleted: true},
+			},
+			wantOK: true, wantTokens: 101, wantUsd: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			u := &interactiveUsageTotals{}
+			for _, ev := range tc.events {
+				u.add(ev)
+			}
+			got, ok := u.snapshot()
+			if ok != tc.wantOK {
+				t.Fatalf("snapshot ok = %v (%+v); want %v", ok, got, tc.wantOK)
+			}
+			res := &Result{}
+			u.applyTo(res)
+			if !tc.wantOK {
+				if res.Cost != nil {
+					t.Errorf("terminal Cost = %+v; want nil (unreported)", *res.Cost)
+				}
+				if hb := u.heartbeatSnapshot(); hb != (stepheartbeat.UsageSnapshot{}) {
+					t.Errorf("heartbeat snapshot = %+v; want zero (unreported)", hb)
+				}
+				return
+			}
+			if got.InputTokens != tc.wantTokens || got.TotalCostUsd != tc.wantUsd {
+				t.Errorf("snapshot = %+v; want input %d with $%v", got, tc.wantTokens, tc.wantUsd)
+			}
+			if _, err := json.Marshal(res.Cost); err != nil {
+				t.Errorf("terminal Cost does not encode: %v", err)
+			}
+		})
+	}
+}
+
+// TestStepHeartbeatUsage_ReadsTheSessionLanesMeter pins the emitter wiring
+// runLoop hands the step heartbeat: an interactive session's beats carry the
+// transcript-tail totals its supervisor registered, while a headless session
+// keeps reading the budget enforcer's meter. The interactive lane never
+// meters through the enforcer, so reading it there would leave every
+// interactive beat usage-less.
+func TestStepHeartbeatUsage_ReadsTheSessionLanesMeter(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	const sessionID = "step-usage-lane"
+	transcriptCost := 0.02
+	totals := &interactiveUsageTotals{}
+	totals.add(agent.LlmCallEvent{
+		InputTokens: 700, OutputTokens: 70, CachedInputTokens: 7000,
+		UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &transcriptCost, TurnCompleted: true,
+	})
+	r.registerInteractiveUsage(sessionID, totals)
+	t.Cleanup(func() { r.releaseInteractiveUsage(sessionID) })
+
+	enforcer := NewBudgetEnforcer(nil, time.Now())
+	if breach := enforcer.ObserveEvent(agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 300, OutputTokens: 30, TotalCostUsd: 0.01, NumTurns: 1}}); breach != nil {
+		t.Fatalf("ObserveEvent with no budget = %v; want no breach", breach)
+	}
+
+	interactive := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: sessionID, Mode: interactiveRunMode}}
+	if got, want := r.stepHeartbeatUsage(interactive, enforcer)(context.Background()),
+		(stepheartbeat.UsageSnapshot{InputTokens: 700, OutputTokens: 70, CachedInputTokens: 7000, TotalCostUsd: 0.02}); got != want {
+		t.Errorf("interactive beat usage = %+v; want the transcript totals %+v", got, want)
+	}
+	headless := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: sessionID}}
+	if got, want := r.stepHeartbeatUsage(headless, enforcer)(context.Background()),
+		(stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 30, TotalCostUsd: 0.01}); got != want {
+		t.Errorf("headless beat usage = %+v; want the enforcer's meter %+v", got, want)
 	}
 }

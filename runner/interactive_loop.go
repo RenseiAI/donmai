@@ -495,6 +495,10 @@ func (r *Runner) dispatchInteractive(
 				"interactive session stopped: "+res.Error)
 			r.logger.Info("[interactive] ctx done — stopping session",
 				"sessionId", qw.SessionID, "reason", res.Error)
+			// The turns metered before the stop still spent tokens; the
+			// stopped report carries them exactly as the headless lane's
+			// stop paths carry the budget meter's total.
+			usage.applyTo(res)
 			return res, interactiveCtx.Err()
 
 		case <-lost:

@@ -588,3 +588,37 @@ func TestSpawn_Interactive_RealBinary_TranscriptToolCallReachesEvents(t *testing
 		t.Fatalf("an earlier session's transcript surfaced as this session's activity: %v", names)
 	}
 }
+
+// TestInteractiveTranscriptTail_ImpossibleTokenCountsMapToRefused pins the
+// transcript's half of the "never a wrong number" rule: a usage count no
+// model call produces (negative, or beyond the exact JSON integer range,
+// where a plain float-to-int conversion is platform-dependent) maps to -1,
+// the value the runner's usage meter refuses, while in-range counts pass
+// through unchanged.
+func TestInteractiveTranscriptTail_ImpossibleTokenCountsMapToRefused(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tailer := newInteractiveTranscriptTailer(dir)
+	path := filepath.Join(dir, "sess.jsonl")
+	writeTranscriptLine(t, path, transcriptMessage("m-bad", map[string]any{
+		"role": "assistant",
+		"usage": map[string]any{
+			"input": -5000, "output": 10, "cacheRead": 1e300, "cacheWrite": float64(transcriptTokenLimit),
+		},
+	}))
+
+	events, _ := tailer.sweep()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1 usage event", len(events))
+	}
+	llm, ok := events[0].(agent.LlmCallEvent)
+	if !ok {
+		t.Fatalf("event = %T, want agent.LlmCallEvent", events[0])
+	}
+	if llm.InputTokens != -1 || llm.CachedInputTokens != -1 {
+		t.Errorf("impossible counts = input %d cacheRead %d; want -1 each (refused by the meter)", llm.InputTokens, llm.CachedInputTokens)
+	}
+	if llm.OutputTokens != 10 || llm.CacheWriteTokens != transcriptTokenLimit {
+		t.Errorf("in-range counts = output %d cacheWrite %d; want 10 and %d", llm.OutputTokens, llm.CacheWriteTokens, int64(transcriptTokenLimit))
+	}
+}
