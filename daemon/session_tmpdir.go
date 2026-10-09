@@ -151,31 +151,48 @@ func verifySessionTmpExisting(dir string, fi os.FileInfo, uid int) error {
 // only strip bits the explicit Chmod then restores, and the final Lstat
 // judges what is on disk rather than what Mkdir asked for.
 func ensureSessionTmpDir(raw string) (string, error) {
+	dir, _, err := ensureSessionTmpDirCreated(raw)
+	return dir, err
+}
+
+// ensureSessionTmpDirCreated behaves as ensureSessionTmpDir and
+// additionally reports whether this call created the directory. Callers
+// roll back only what they created: a reused directory is never removed on
+// a later bookkeeping failure.
+func ensureSessionTmpDirCreated(raw string) (string, bool, error) {
 	dir, err := validateSessionTmpDir(raw)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
+	created := false
 	fi, err := os.Lstat(dir)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return "", fmt.Errorf("session tmpdir: inspect %q: %w", dir, err)
+			return "", false, fmt.Errorf("session tmpdir: inspect %q: %w", dir, err)
 		}
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return "", fmt.Errorf("session tmpdir: create %q: %w", dir, err)
+			return "", false, fmt.Errorf("session tmpdir: create %q: %w", dir, err)
 		}
 		if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: restoring the exact 0700 the reuse check demands after a umask-weakened MkdirAll.
 			_ = os.Remove(dir)
-			return "", fmt.Errorf("session tmpdir: secure %q: %w", dir, err)
+			return "", false, fmt.Errorf("session tmpdir: secure %q: %w", dir, err)
 		}
 		fi, err = os.Lstat(dir)
 		if err != nil {
-			return "", fmt.Errorf("session tmpdir: re-inspect %q: %w", dir, err)
+			return "", false, fmt.Errorf("session tmpdir: re-inspect %q: %w", dir, err)
 		}
+		created = true
 	}
 	if err := verifySessionTmpExisting(dir, fi, os.Getuid()); err != nil {
-		return "", err
+		if created {
+			// Just created and already failing its own checks (nothing
+			// else could have written here yet): Remove deletes only an
+			// empty directory, so a reused directory is never at risk.
+			_ = os.Remove(dir)
+		}
+		return "", false, err
 	}
-	return dir, nil
+	return dir, created, nil
 }
 
 // sessionTmpClaim is one generation's ownership of a scratch directory: the
@@ -355,7 +372,7 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 	if raw == "" {
 		return sessionTmpClaim{}, nil
 	}
-	dir, err := ensureSessionTmpDir(raw)
+	dir, created, err := ensureSessionTmpDirCreated(raw)
 	if err != nil {
 		return sessionTmpClaim{}, err
 	}
@@ -364,8 +381,18 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 		gen = nextSessionTmpGen.Add(1)
 	}
 	claim := sessionTmpClaim{Dir: dir, Gen: gen}
+	// removeOwn rolls back only a directory this launch created, and only
+	// while the ownership marker still names this generation. A reused
+	// directory (the prior turn's files) is never removed: the launch
+	// already fails closed with an error, and wiping on a bookkeeping
+	// failure would destroy data that is not ours to delete.
+	removeOwn := func() {
+		if created && sessionTmpOwnerMatches(dir, claim) {
+			_ = os.RemoveAll(dir)
+		}
+	}
 	if err := writeSessionTmpOwner(dir, spec.SessionID, gen); err != nil {
-		_ = os.RemoveAll(dir)
+		removeOwn()
 		return sessionTmpClaim{}, err
 	}
 	s.mu.Lock()
@@ -379,13 +406,13 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 		record, err := loadSessionTmpRecord(recordDir)
 		if err != nil {
 			s.forgetSessionTmpClaim(spec.SessionID, claim)
-			_ = os.RemoveAll(dir)
+			removeOwn()
 			return sessionTmpClaim{}, err
 		}
 		record.Entries[spec.SessionID] = sessionTmpRecordEntry{Path: dir, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 		if err := saveSessionTmpRecord(recordDir, record); err != nil {
 			s.forgetSessionTmpClaim(spec.SessionID, claim)
-			_ = os.RemoveAll(dir)
+			removeOwn()
 			return sessionTmpClaim{}, err
 		}
 	}
@@ -539,11 +566,26 @@ func (s *WorkerSpawner) SweepSessionTmpDirs(liveIDs map[string]struct{}) Session
 		protected[id] = struct{}{}
 	}
 	s.mu.Unlock()
+	// Protected paths: a live entry's path is never deleted, even by a
+	// dead entry naming the same path (a duplicated stamp). A dead entry
+	// sharing a live path is dropped without deleting.
+	protectedPaths := map[string]struct{}{}
+	for sessionID, entry := range record.Entries {
+		if _, live := protected[sessionID]; live && entry.Path != "" {
+			protectedPaths[entry.Path] = struct{}{}
+		}
+	}
 	changed := false
 	for sessionID, entry := range record.Entries {
 		report.Examined++
 		if _, live := protected[sessionID]; live {
 			report.KeptLive++
+			continue
+		}
+		if _, shielded := protectedPaths[entry.Path]; shielded {
+			delete(record.Entries, sessionID)
+			changed = true
+			report.Dropped++
 			continue
 		}
 		if dropSessionTmpSweepEntry(entry) {

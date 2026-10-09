@@ -420,6 +420,53 @@ func TestSweepSessionTmpDirs_QuarantinedKeptLive(t *testing.T) {
 	}
 }
 
+// TestSweepSessionTmpDirs_SharedPathKeepsLive pins that the startup sweep
+// never deletes a path still named by a live entry: two record entries
+// sharing one path (a duplicated stamp) keep the live seat's directory
+// and its data. The dead entry is dropped without deleting. Driven through
+// SweepSessionTmpDirs — the production crash-recovery entry point — so
+// removing by path instead of by protected path goes RED.
+func TestSweepSessionTmpDirs_SharedPathKeepsLive(t *testing.T) {
+	t.Parallel()
+	recordDir := t.TempDir()
+	s := NewWorkerSpawner(SpawnerOptions{SessionTmpRecordDir: recordDir})
+
+	shared := filepath.Join("/tmp", "sweep-shared-path")
+	_ = os.RemoveAll(shared)
+	if _, err := ensureSessionTmpDir(shared); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(shared, "prbody.md")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shared) })
+
+	record := sessionTmpRecord{Version: 1, Entries: map[string]sessionTmpRecordEntry{
+		"dead": {Path: shared},
+		"live": {Path: shared},
+	}}
+	if err := saveSessionTmpRecord(recordDir, record); err != nil {
+		t.Fatal(err)
+	}
+
+	report := s.SweepSessionTmpDirs(map[string]struct{}{"live": {}})
+	if report.Examined != 2 || report.Removed != 0 || report.KeptLive != 1 || report.Dropped != 1 {
+		t.Fatalf("report = %+v, want {Examined:2 Removed:0 KeptLive:1 Dropped:1}", report)
+	}
+	raw, err := os.ReadFile(sentinel) //nolint:gosec // G304: the path is a constant fixture under /tmp.
+	if err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live seat's scratch lost to the dead entry's sweep: %v %q", err, raw)
+	}
+	after, err := loadSessionTmpRecord(recordDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Entries) != 1 || after.Entries["live"].Path != shared {
+		t.Fatalf("record after sweep = %+v, want only the live entry", after.Entries)
+	}
+}
+
 // TestSweepSessionTmpDirs_DisabledWithoutRecordDir pins that a spawner with
 // no record directory sweeps nothing: memory-only mode opts out of restart
 // recovery explicitly.

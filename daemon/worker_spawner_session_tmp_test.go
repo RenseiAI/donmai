@@ -439,6 +439,82 @@ func TestSpawner_SessionTmp_ShimPathBound(t *testing.T) {
 	}
 }
 
+// TestSpawner_SessionTmp_BookkeepingFailureKeepsReusedDir pins that a
+// record failure fails the launch closed without wiping a reused
+// directory: the advisory path already holds the prior turn's files, the
+// record is corrupt, so prepare refuses the launch — and the prior
+// contents must survive. Fail-closed must not mean wipe-on-failure.
+// Driven through AcceptWork — the production launch entry point — so
+// unconditionally removing the directory on the record-failure path goes
+// RED.
+func TestSpawner_SessionTmp_BookkeepingFailureKeepsReusedDir(t *testing.T) {
+	t.Parallel()
+	dir := "/tmp/seat-bookkeeping-keeps-reused"
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if _, err := ensureSessionTmpDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(dir, "prior-turn-data.txt")
+	if err := os.WriteFile(sentinel, []byte("prior"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recordDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(recordDir, sessionTmpRecordFileName), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var started bool
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:            []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		WorkerCommand:       []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir: recordDir,
+		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
+			started = true
+			return nil, nil
+		},
+	})
+	if _, err := s.AcceptWork(seatTmpSpec("seat-bookkeeping", dir)); err == nil {
+		t.Fatal("expected a record-failure refusal, got an accept")
+	}
+	if started {
+		t.Fatal("a worker started despite the record failure")
+	}
+	raw, err := os.ReadFile(sentinel) //nolint:gosec // G304: the path is a constant fixture under /tmp.
+	if err != nil || string(raw) != "prior" {
+		t.Fatalf("reused directory's prior contents deleted on a record failure the launch already reports: %v %q", err, raw)
+	}
+	if fi, err := os.Lstat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("reused directory disturbed by the refused launch: %v %v", fi, err)
+	}
+}
+
+// TestSpawner_SessionTmp_BookkeepingFailureRemovesCreatedDir pins the
+// counterpart: when this launch created the directory and record
+// bookkeeping then fails, the launch still refuses — and removes exactly
+// what it created, so a failed launch leaks nothing. Driven through
+// AcceptWork, so skipping the created-new rollback goes RED.
+func TestSpawner_SessionTmp_BookkeepingFailureRemovesCreatedDir(t *testing.T) {
+	t.Parallel()
+	dir := "/tmp/seat-bookkeeping-removes-created"
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	recordDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(recordDir, sessionTmpRecordFileName), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:            []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		WorkerCommand:       []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir: recordDir,
+	})
+	if _, err := s.AcceptWork(seatTmpSpec("seat-bookkeeping-new", dir)); err == nil {
+		t.Fatal("expected a record-failure refusal, got an accept")
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("created directory leaks after the refused launch: %v", err)
+	}
+}
+
 // envToMapSessionTmpTest parses KEY=VALUE entries into a map for
 // assertions. Bare keys (no '=') are skipped: they cannot name a binding.
 func envToMapSessionTmpTest(entries []string) map[string]string {
