@@ -57,15 +57,25 @@ jobs:
       - name: Build the acceptance image
         run: |
           docker build -f upgradeacceptance/container/Containerfile -t donmai-upgrade-acceptance .
+          docker run --rm donmai-upgrade-acceptance go version
 
       - name: Run the N to N+1 upgrade flow
         run: |
-          docker run --rm --privileged \
+          cid=$(docker run -d --rm --privileged \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             --tmpfs /run --tmpfs /run/lock \
             -e ACCEPTANCE_BASE_REV=HEAD~1 \
             donmai-upgrade-acceptance \
-            su acceptance -c 'bash /src/upgradeacceptance/container/upgrade-acceptance.sh'
+            bash /src/upgradeacceptance/container/upgrade-acceptance.sh)
+          status=0
+          docker wait "$cid" > /tmp/upgrade-acceptance.exit || status=$?
+          docker logs "$cid" || true
+          # --rm cleans the container up on its own exit; an explicit rm
+          # covers the wait-failed path without failing the lane twice.
+          docker rm -f "$cid" >/dev/null 2>&1 || true
+          cat /tmp/upgrade-acceptance.exit
+          test "$(cat /tmp/upgrade-acceptance.exit)" = "0"
+          exit "$status"
 
       - name: Type-check build-tag-gated tests
         run: make test-tagged

@@ -89,7 +89,16 @@ systemctl --user restart donmai 2>&1 | tail -2 || systemctl --user restart rense
 # The live-seat assertions need headless shim adoption (selection rule +
 # local-runtime adopt-on-recover). Probe the N+1 binary for it: current main
 # reports headless shim launch off, which is the recorded red cause.
-if "${WORK}/donmai-next" host status --json 2>/dev/null | grep -q 'headless-shim-launch.."enabled"'; then
+#
+# The probe reads the real `host status --json` ownership projection
+# (`sessionShim.ownershipMode`, emitted by SessionShimDiagnostics on the
+# status route): the ownership stage enables launching new shim-owned seats
+# and the adoption stage the takeover the upgrade needs. Both must be on —
+# either stage alone leaves the seat direct-owned across the restart.
+# The in-repo red record (TestUpgradeAcceptanceRed) follows the same rule
+# through the daemon's own selection predicate, so the two cannot disagree.
+STATUS_JSON="$("${WORK}/donmai-next" host status --json 2>/dev/null || true)"
+if printf '%s' "${STATUS_JSON}" | grep -q '"ownershipMode"[[:space:]]*:[[:space:]]*"adoption_and_ownership"'; then
   fail green null '"seat-survives-upgrade","scope-survives-upgrade","credential-pushed-after-adoption","exactly-one-terminal-commit"'
 else
   fail red '"headless shim launch is off: the selection rule owns interactive sessions only and the local runtime holds rather than adopts a recovered session; the restart killed the direct-owned seat"' '"seat-survives-upgrade"'

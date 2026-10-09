@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
@@ -17,7 +18,7 @@ import (
 // production rule, and this helper must follow it — never the other way
 // around — so the red cannot be edited green without the behaviour.
 func headlessShimLaunchEnabled() bool {
-	return false
+	return adoptionProbeForHeadlessSpec(defaultAdoptionProbeDaemon()).ownsHeadless
 }
 
 // piSpec builds a minimal headless spec for the fake harness: a bare prompt
@@ -83,4 +84,38 @@ func resumeFakeHarness(ctx context.Context, provider *pi.Provider, bin, dir, ses
 		return nil, err
 	}
 	return handle, nil
+}
+
+// adoptionProbeResult is the production selection-rule reading for one
+// headless candidate spec. ownsHeadless is true once the adoption slices
+// let the daemon launch headless seats under shim ownership.
+type adoptionProbeResult struct {
+	ownsHeadless bool
+	ownsControl  bool
+}
+
+// defaultAdoptionProbeDaemon builds the daemon the acceptance probe asks
+// its selection question of: shim ownership plus adoption enabled (the
+// posture the green slices land in daemon.yaml), no registration, so the
+// probe is hermetic — it never touches the network or the host unit.
+func defaultAdoptionProbeDaemon() *daemon.Daemon {
+	return daemon.New(daemon.Options{
+		SkipRegistration: true,
+		SessionShim:      daemon.SessionShimConfig{EnableAdoption: true, EnableOwnership: true},
+	})
+}
+
+// adoptionProbeForHeadlessSpec asks the production §D11 selection rule
+// whether a headless seat — the seat class the N→N+1 driver upgrades —
+// launches under shim ownership, with an interactive control alongside so
+// a blanket-false rule cannot pass as the red record. The container
+// driver's green/red branch and the in-repo red record both follow this
+// probe: flipping the production rule flips the record, never an edit.
+func adoptionProbeForHeadlessSpec(d *daemon.Daemon) adoptionProbeResult {
+	headless := daemon.SessionSpec{SessionID: "acceptance-probe-headless"}
+	control := daemon.SessionSpec{SessionID: "acceptance-probe-interactive", Mode: "interactive"}
+	return adoptionProbeResult{
+		ownsHeadless: d.SessionShimOwnsSession(headless),
+		ownsControl:  d.SessionShimOwnsSession(control),
+	}
 }

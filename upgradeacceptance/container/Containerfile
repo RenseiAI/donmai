@@ -18,10 +18,17 @@
 
 FROM debian:bookworm-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive GOTOOLCHAIN=local
+# Go 1.26+ toolchain from the official download (Debian bookworm ships a
+# Go too old for this module: go.mod requires go >= 1.26). Pinned to the
+# minimum the module builds with; bump alongside the go directive in go.mod.
+RUN curl -fsSL -o /tmp/go.tgz https://go.dev/dl/go1.26.6.linux-amd64.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:${PATH}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git golang-go systemd systemd-sysv dbus nodejs npm sudo \
+        ca-certificates curl git systemd systemd-sysv dbus nodejs npm sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # The acceptance user: the flow installs N as a USER service, so it needs a
@@ -33,9 +40,9 @@ RUN useradd -m -s /bin/bash acceptance \
     && chmod 0440 /etc/sudoers.d/acceptance
 
 # systemd user-manager prerequisites inside a container: a delegated cgroup
-# v2 hierarchy and D-Bus. The entrypoint mounts what the runtime allows and
-# execs systemd as PID 1; the CI job runs the container privileged with
-# `-v /sys/fs/cgroup:/sys/fs/cgroup:rw` so delegation sticks.
+# v2 hierarchy and D-Bus. The entrypoint execs systemd as PID 1; command
+# dispatch inside the running unit goes through nsenter (see entrypoint.sh
+# and the CI job): PID 1 must stay systemd, never the test script itself.
 STOPSIGNAL SIGRTMIN+3
 
 COPY upgradeacceptance/container/entrypoint.sh /usr/local/bin/upgrade-entrypoint.sh

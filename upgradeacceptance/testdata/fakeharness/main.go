@@ -17,7 +17,9 @@
 //     the driver touches the path named by FAKE_HARNESS_TRIGGER. Removing
 //     the file or writing "abort" to it ends the session instead, so the
 //     upgrade flow can hold a live seat across the daemon restart and then
-//     release it.
+//     release it. A file that never appears within the wait ends the turn
+//     with a "timeout" verdict instead of the abort text, so a slow
+//     runner is distinguishable from an operator abort.
 //   - D8 variant: with FAKE_HARNESS_STATE_DIR set, every turn appends one
 //     JSONL transcript line under that directory (the session-owned state
 //     location), and a resume (argv carrying --session) reports the number
@@ -158,11 +160,15 @@ func run(args []string) error {
 			if stateDir != "" {
 				appendTranscript(stateDir, sessionID, text)
 			}
-			if decision := gateOnTrigger(trigger); decision == "abort" {
+			if decision := gateOnTrigger(trigger); decision != "go" {
+				verdict := "aborted"
+				if decision == "timeout" {
+					verdict = "timeout"
+				}
 				writeEvent(out, map[string]any{"type": "agent_start"})
 				writeEvent(out, map[string]any{
 					"type":                  "message_update",
-					"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "aborted"},
+					"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": verdict},
 				})
 				writeEvent(out, map[string]any{"type": "message_end"})
 				writeEvent(out, map[string]any{"type": "turn_end", "message": map[string]any{
@@ -183,7 +189,10 @@ func run(args []string) error {
 }
 
 // gateOnTrigger blocks until the trigger file exists (or no trigger is
-// configured). It reports "abort" when the file holds the word "abort".
+// configured). It reports "abort" when the file holds the word "abort"
+// and "timeout" when the file never appears within the ~10 minute wait —
+// a slow runner is a distinct verdict from an operator abort, never a
+// silent abort-shaped exit 0.
 func gateOnTrigger(trigger string) string {
 	if trigger == "" {
 		return "go"
@@ -198,7 +207,7 @@ func gateOnTrigger(trigger string) string {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return "abort"
+	return "timeout"
 }
 
 func runTurn(out *bufio.Writer, text string) {

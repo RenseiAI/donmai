@@ -176,6 +176,12 @@ func TestReceiverWorkerRotation(t *testing.T) {
 	}
 }
 
+// TestReceiverLeaseAcrossGap drives the receiver-lease-across-gap matrix
+// row through the production heartbeat and step-heartbeat entry points:
+// a pulser and an emitter that follow the credential rotation through the
+// credential provider never miss a tick — no strike accrues and every step
+// beat lands. A beat sent with a lapsed bearer is refused: the lease fuse
+// is the only writer after rotation.
 func TestReceiverLeaseAcrossGap(t *testing.T) {
 	t.Parallel()
 	r := newStubReceiver(t)
@@ -199,13 +205,27 @@ func TestReceiverLeaseAcrossGap(t *testing.T) {
 		t.Fatalf("recorded beats = %d, want 3", got)
 	}
 
+	// A beat with a lapsed bearer is refused, not recorded: rotating the
+	// pair retires the old bearer for step heartbeats exactly as it does
+	// for lease refresh.
+	if code, raw := postJSON(t, client, r.url()+"/api/workers/register", bearer, map[string]any{"workerId": worker}); code != http.StatusOK {
+		t.Fatalf("re-register = %d (%s), want 200", code, raw)
+	}
+	if code, raw := postJSON(t, client, base+"/step-heartbeat", bearer, map[string]any{"workerId": worker}); code != http.StatusUnauthorized {
+		t.Fatalf("beat with lapsed bearer = %d (%s), want 401", code, raw)
+	}
+	if _, beats, _ := r.counts(); beats != 3 {
+		t.Fatalf("beats after lapsed-beat refusal = %d, want 3 (refused beats are not recorded)", beats)
+	}
+
 	// Committing the terminal flips refresh to stop without releasing the
 	// evidence: the stored terminal stays readable.
-	body := map[string]any{"workerId": worker, "status": "completed", "attempt": "att-3"}
-	if code, raw := postJSON(t, client, base+"/status", bearer, body); code != http.StatusOK {
+	newWorker, newBearer := r.currentWorker()
+	body := map[string]any{"workerId": newWorker, "status": "completed", "attempt": "att-3"}
+	if code, raw := postJSON(t, client, base+"/status", newBearer, body); code != http.StatusOK {
 		t.Fatalf("terminal commit = %d (%s), want 200", code, raw)
 	}
-	code, raw := postJSON(t, client, base+"/lock-refresh", bearer, map[string]any{"workerId": worker})
+	code, raw := postJSON(t, client, base+"/lock-refresh", newBearer, map[string]any{"workerId": newWorker})
 	if code != http.StatusOK || !strings.Contains(string(raw), `"stop":true`) {
 		t.Fatalf("refresh after terminal = %d (%s), want stop=true", code, raw)
 	}
@@ -408,6 +428,12 @@ Loop:
 // local runtime holds (rather than adopts) a recovered session whose shim
 // it adopted. This test goes green once those slices land; until then it
 // pins the red with the cause attached.
+//
+// The gate follows the production selection predicate (headlessShimLaunch-
+// Enabled asks the daemon's own SessionShimOwnsSession about a headless
+// spec), so the record flips exactly when the rule flips — an edit that
+// hard-codes the gate green fails the probe-consistency test below, and a
+// landed behaviour with a stale red record fails here.
 func TestUpgradeAcceptanceRed(t *testing.T) {
 	t.Parallel()
 	// The matrix must keep listing the live-seat cases even though this
@@ -433,6 +459,49 @@ func TestUpgradeAcceptanceRed(t *testing.T) {
 	// the green acceptance assertion, not deleted.
 	if headlessShimLaunchEnabled() {
 		t.Fatal("headless shim launch is enabled; replace this red record with the green acceptance assertion")
+	}
+}
+
+// TestHeadlessLaunchProbeFollowsTheSelectionRule pins the B3 contract both
+// ways: the probe the red record and the container driver follow reports
+// the production selection rule's own answer for a headless spec, with an
+// interactive control proving the rule discriminates. On current main the
+// headless answer is false while the interactive answer is true; once the
+// adoption slices flip the rule, the headless answer flips with it and the
+// red record above must become the green acceptance assertion.
+func TestHeadlessLaunchProbeFollowsTheSelectionRule(t *testing.T) {
+	t.Parallel()
+	probe := adoptionProbeForHeadlessSpec(defaultAdoptionProbeDaemon())
+	if probe.ownsHeadless {
+		t.Fatal("production selection rule owns the headless probe spec; replace the red record with the green acceptance assertion")
+	}
+	if !probe.ownsControl {
+		t.Fatal("production selection rule does not own the interactive control spec; the probe is not reading the rule")
+	}
+	if headlessShimLaunchEnabled() != probe.ownsHeadless {
+		t.Fatalf("headlessShimLaunchEnabled() = %v, production rule = %v; the gate must follow the rule",
+			headlessShimLaunchEnabled(), probe.ownsHeadless)
+	}
+}
+
+// TestHeadlessLaunchProbeTurnsGreenWithTheRule proves the green arm is
+// reachable without an edit to the gate: the probe predicate already
+// answers true for the session class the rule owns, so flipping the rule
+// to cover headless seats flips the probe with it. A red record whose gate
+// could never turn green — a dead green arm — fails here.
+func TestHeadlessLaunchProbeTurnsGreenWithTheRule(t *testing.T) {
+	t.Parallel()
+	d := daemon.New(daemon.Options{
+		SkipRegistration: true,
+		SessionShim:      daemon.SessionShimConfig{EnableAdoption: true, EnableOwnership: true},
+	})
+	if got := d.SessionShimOwnsSession(daemon.SessionSpec{SessionID: "acceptance-probe-interactive", Mode: "interactive"}); !got {
+		t.Fatalf("SessionShimOwnsSession(interactive) with ownership enabled = %v, want true; "+
+			"without a reachable green arm the driver's green branch is dead text", got)
+	}
+	if got := d.SessionShimOwnsSession(daemon.SessionSpec{SessionID: "acceptance-probe-headless"}); got {
+		t.Fatalf("SessionShimOwnsSession(headless) with ownership enabled = %v, want false "+
+			"until the adoption slices flip the rule; the red record pins this false", got)
 	}
 }
 
@@ -511,6 +580,8 @@ var testFunctionNames = []string{
 	"TestFakeHarnessSpeaksPiRPC",
 	"TestFakeHarnessResumeReportsHistory",
 	"TestUpgradeAcceptanceRed",
+	"TestHeadlessLaunchProbeFollowsTheSelectionRule",
+	"TestHeadlessLaunchProbeTurnsGreenWithTheRule",
 	"TestFailureMatrixRegistered",
 	"TestDirectOwnedPlusShimOwnedPreflight",
 	"TestBearerExpiresWhileNoDaemonRuns",
@@ -618,6 +689,23 @@ func TestDirectOwnedPlusShimOwnedPreflight(t *testing.T) {
 	d := startAcceptanceDaemon(t)
 	acceptDirectSeat(t, d, "direct-preflight-seat")
 
+	// The seat the refusal must count is live right now: exactly one
+	// active session, and it is this direct-owned seat. Without this
+	// anchor the refusal below could come from any other stage (a fence,
+	// registry, or lifecycle refusal) and the test would still pass.
+	if active, _ := d.Spawner().ActiveSessionCounts(); active != 1 {
+		t.Fatalf("active sessions = %d, want 1 (the direct-owned seat under test)", active)
+	}
+	found := false
+	for _, h := range d.Spawner().ActiveSessions() {
+		if h.SessionID == "direct-preflight-seat" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("direct-preflight-seat not among active sessions; the refusal below would count the wrong seat")
+	}
+
 	if _, err := prepareRestart(t, d); err == nil {
 		t.Fatal("preflight with a live direct-owned seat succeeded, want the direct-owned refusal")
 	} else {
@@ -628,15 +716,15 @@ func TestDirectOwnedPlusShimOwnedPreflight(t *testing.T) {
 		if refusal.Code != afclient.DaemonRestartPreflightRefusalCode {
 			t.Fatalf("preflight refusal code = %q, want %q", refusal.Code, afclient.DaemonRestartPreflightRefusalCode)
 		}
-		// The uncovered-direct-owned stage reports the closed top-level
-		// code itself as its cause: it raises the untyped refusal (the
-		// direct-owned count rides the message, not a stage token), and
-		// the route's typed writer carries that through unchanged. The
-		// row's discriminating property is that the refusal names THIS
-		// stage (not a fence, registry, or lifecycle stage) and clears
-		// once the direct owner ends — asserted below.
-		if refusal.Cause != "" && refusal.Cause != afclient.DaemonRestartPreflightRefusalCode {
-			t.Fatalf("preflight refusal cause = %q, want the closed top-level code or empty", refusal.Cause)
+		// The uncovered-direct-owned stage has no assigned stage token:
+		// it raises the untyped refusal, and the route's typed writer
+		// carries the closed top-level code through as the cause. An
+		// empty cause would mean the refusal came from a daemon older
+		// than the cause registry — not this build — and any other
+		// token would name a different stage (fence, registry, or
+		// lifecycle) than the direct-owned count under test.
+		if refusal.Cause != afclient.DaemonRestartPreflightRefusalCode {
+			t.Fatalf("preflight refusal cause = %q, want the closed top-level code %q (the uncovered-direct-owned stage)", refusal.Cause, afclient.DaemonRestartPreflightRefusalCode)
 		}
 	}
 
@@ -799,6 +887,12 @@ func TestDaemonReturnsBeforeBearerExpires(t *testing.T) {
 // into a weaker scope as a fallback.
 func TestScopeCreationRefused(t *testing.T) {
 	bin := buildFakeHarness(t)
+	// The trigger file must not exist before the refused spawn: the fake
+	// blocks on it, so its absence afterwards proves no harness child
+	// started. A fresh temp dir guarantees no leftover from another test.
+	triggerDir := t.TempDir()
+	trigger := filepath.Join(triggerDir, "trigger")
+	t.Setenv("FAKE_HARNESS_TRIGGER", trigger)
 	provider, err := pi.New(pi.Options{
 		PiBin:            bin,
 		HandshakeTimeout: 20 * time.Second,
@@ -825,6 +919,14 @@ func TestScopeCreationRefused(t *testing.T) {
 	}
 	if code := agent.ExecutionSecurityErrorCode(err); code != agent.ExecutionSecurityUnrenderable {
 		t.Fatalf("Spawn error = %v (code %q), want the typed %q scope refusal", err, code, agent.ExecutionSecurityUnrenderable)
+	}
+	// The refusal happens before spawn: no harness child starts, so the
+	// trigger file the fake would block on stays untouched and no session
+	// transcript exists. A late-failing fallback launch would still satisfy
+	// the typed-refusal shape above; the absence of harness side effects
+	// proves the seat never launched.
+	if _, statErr := os.Stat(trigger); !os.IsNotExist(statErr) {
+		t.Fatalf("trigger file exists after the refused spawn (%v); the harness must never start", statErr)
 	}
 }
 

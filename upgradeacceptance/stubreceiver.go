@@ -25,8 +25,10 @@ import (
 //     the previous worker id) rotates the worker id; the old bearer lapses
 //     and the refresh fails closed until the caller presents the rotated
 //     pair.
-//   - /api/sessions/{id}/step-heartbeat — step liveness. Recorded; always
-//     succeeds while the session is not terminal.
+//   - /api/sessions/{id}/step-heartbeat — step liveness. Recorded; succeeds
+//     while the bearer is current. A lapsed bearer is refused: a stale or
+//     rotated-out worker cannot keep writing step beats after its bearer
+//     lapsed, so beats/stepBeats only grow under authority.
 //   - /api/sessions/{id}/status — terminal status. The first commit for a
 //     session+attempt+body digest wins and its receipt (revision) is
 //     returned; an exact replay returns the original receipt unchanged; a
@@ -175,6 +177,10 @@ func (r *stubReceiver) handleSession(w http.ResponseWriter, req *http.Request) {
 		r.refreshes++
 		writeJSON(w, map[string]any{"refreshed": true})
 	case "step-heartbeat":
+		if !authorized {
+			http.Error(w, "stale registration", http.StatusUnauthorized)
+			return
+		}
 		r.beats++
 		r.stepBeats = append(r.stepBeats, bytes.Clone(raw))
 		if _, done := r.terminals[sessionID]; done {
