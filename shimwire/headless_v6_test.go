@@ -502,3 +502,73 @@ func TestSelectedV1ThroughV5TrafficIsByteIdentical(t *testing.T) {
 		}
 	}
 }
+
+// TestHelloHeadlessWorkloadIsBoundToTheV6Range pins the contract's range
+// binding (§1: "the key on a shim whose range includes a version below 6, is
+// malformed") at both codec directions. Without it a headless Hello on [1,6]
+// or [1,5] decodes cleanly as headless while a released controller selects an
+// interactive version from the same range and treats the shim as a terminal
+// session. A headless range that starts at 6 stays valid, and an interactive
+// Hello on any range is untouched.
+func TestHelloHeadlessWorkloadIsBoundToTheV6Range(t *testing.T) {
+	t.Parallel()
+
+	headlessOn := func(lo, hi uint32) []byte {
+		t.Helper()
+		body, err := EncodeHello(Hello{Protocol: ProtocolName, Min: lo, Max: hi})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Fatal(err)
+		}
+		fields["extensions"] = map[string]any{"values": map[string]string{ExtWorkload: WorkloadHeadless}}
+		raw, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	for _, malformed := range [][2]uint32{{V1, V5}, {V1, V6}, {V5, V6}, {V5, V5}} {
+		lo, hi := malformed[0], malformed[1]
+		if _, err := EncodeHello(Hello{Protocol: ProtocolName, Min: lo, Max: hi, Workload: ProfileHeadless}); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("EncodeHello headless [%d,%d] = %v, want ErrMalformed", lo, hi, err)
+		}
+		if _, err := DecodeHello(headlessOn(lo, hi)); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("DecodeHello headless [%d,%d] = %v, want ErrMalformed", lo, hi, err)
+		}
+	}
+	for _, valid := range [][2]uint32{{V6, V6}, {V6, V6 + 1}} {
+		lo, hi := valid[0], valid[1]
+		raw, err := EncodeHello(Hello{Protocol: ProtocolName, Min: lo, Max: hi, Workload: ProfileHeadless})
+		if err != nil {
+			t.Fatalf("EncodeHello headless [%d,%d] = %v, want accepted", lo, hi, err)
+		}
+		decoded, err := DecodeHello(raw)
+		if err != nil || decoded.Workload != ProfileHeadless {
+			t.Fatalf("DecodeHello headless [%d,%d] = (%q,%v), want headless", lo, hi, decoded.Workload, err)
+		}
+	}
+	for _, interactive := range [][2]uint32{{V1, V5}, {V1, V6}, {V6, V6}} {
+		lo, hi := interactive[0], interactive[1]
+		raw, err := EncodeHello(Hello{Protocol: ProtocolName, Min: lo, Max: hi})
+		if err != nil {
+			t.Fatalf("EncodeHello interactive [%d,%d] = %v", lo, hi, err)
+		}
+		if decoded, err := DecodeHello(raw); err != nil || decoded.Workload != ProfileInteractive {
+			t.Fatalf("DecodeHello interactive [%d,%d] = (%q,%v), want interactive", lo, hi, decoded.Workload, err)
+		}
+	}
+	// The key is only ever "headless": an explicit interactive value is not a
+	// form any shim writes, and the decoder refuses it, so the encoder does
+	// too rather than emit bytes its own peer would reject.
+	explicit := Hello{
+		Protocol: ProtocolName, Min: V1, Max: V5, Workload: ProfileInteractive,
+		Extensions: Extensions{Values: map[string]string{ExtWorkload: string(ProfileInteractive)}},
+	}
+	if _, err := EncodeHello(explicit); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("EncodeHello with an explicit interactive workload key = %v, want ErrMalformed", err)
+	}
+}

@@ -444,13 +444,18 @@ func EncodeHello(h Hello) ([]byte, error) {
 	if h.Workload != "" && h.Workload != ProfileInteractive && h.Workload != ProfileHeadless {
 		return nil, fmt.Errorf("shimwire: %w: unknown workload %q", ErrMalformed, h.Workload)
 	}
-	if old, ok := h.Extensions.Values[ExtWorkload]; ok && old != string(h.Workload) {
+	if old, ok := h.Extensions.Values[ExtWorkload]; ok && (h.Workload != ProfileHeadless || old != WorkloadHeadless) {
 		// A caller map carrying the workload key beside a disagreeing field is
 		// ambiguous about which profile this shim claims: a headless
 		// advertisement riding on an interactive field (or the reverse) would
 		// let the two sources tell different peers different stories. Fail
-		// closed in both directions, not only when the field is headless.
+		// closed in both directions, not only when the field is headless. The
+		// key is only ever "headless": an interactive shim omits it, so an
+		// explicit interactive value is refused too, as DecodeHello would.
 		return nil, fmt.Errorf("shimwire: %w: conflicting workload advertisement", ErrMalformed)
+	}
+	if err := checkWorkloadRange(h.Workload, h.Min); err != nil {
+		return nil, err
 	}
 	if h.Workload == ProfileHeadless {
 		values := make(map[string]string, len(h.Extensions.Values)+1)
@@ -492,6 +497,9 @@ func DecodeHello(body []byte) (Hello, error) {
 	}
 	workload, err := h.Extensions.Workload()
 	if err != nil {
+		return h, err
+	}
+	if err := checkWorkloadRange(workload, h.Min); err != nil {
 		return h, err
 	}
 	h.Workload = workload

@@ -220,7 +220,7 @@ func TestHeadlessAdoptionServesHelloAdoptedHeartbeat(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ctrl, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-headless"})
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-headless"})
 	if err != nil {
 		t.Fatalf("Dial headless record: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestHeadlessFenceRefusesStaleGeneration(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ctrl, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-fence"})
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-fence"})
 	if err != nil {
 		t.Fatalf("Dial headless record: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestHeadlessHeartbeatBeyondTerminalSequenceIsMalformed(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ctrl, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-ahead"})
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-ahead"})
 	if err != nil {
 		t.Fatalf("Dial headless record: %v", err)
 	}
@@ -525,7 +525,7 @@ func TestHeadlessNewerControllerSupersedesLiveOld(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	old, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-old"})
+	old, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-old"})
 	if err != nil {
 		t.Fatalf("Dial old controller: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestHeadlessNewerControllerSupersedesLiveOld(t *testing.T) {
 	oldGen := old.Generation()
 
 	// The old controller still holds its socket open here.
-	fresh, err := Dial(ctx, rec, ControllerOptions{ControllerID: "controller-new", DialTimeout: 8 * time.Second})
+	fresh, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-new", DialTimeout: 8 * time.Second})
 	if err != nil {
 		t.Fatalf("Dial newer controller while the old one holds its socket: %v", err)
 	}

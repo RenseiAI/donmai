@@ -76,10 +76,9 @@ type HeadlessOptions struct {
 	// ProcessEpoch is the monotonic per-session value for this shim incarnation.
 	ProcessEpoch uint64
 
-	// ProtocolMin/ProtocolMax optionally narrow this shim's supported range.
-	// Zero/zero uses the build range.
-	ProtocolMin uint32
-	ProtocolMax uint32
+	// There is deliberately no protocol-range option: a headless shim
+	// advertises exactly [shimwire.HeadlessMin, shimwire.HeadlessMax], the
+	// contract's [6,6], and refuses every lower selection.
 
 	Logger *slog.Logger
 
@@ -96,6 +95,11 @@ type HeadlessOptions struct {
 // plane directly, never sequenced through the daemon. The runner's own exit,
 // after the harness group is proved gone, is the terminal observation.
 //
+// It advertises exactly [shimwire.HeadlessMin, shimwire.HeadlessMax] (the
+// contract's [6,6]) and refuses any lower selection, so a controller that
+// predates the headless profile quarantines it as protocol_mismatch instead of
+// adopting it as a terminal session.
+//
 // Like Start, the socket exists before the record names it, and the orphan
 // clock starts immediately: a shim whose creating daemon dies before it ever
 // adopts must still be bounded.
@@ -111,8 +115,6 @@ func StartHeadless(opts HeadlessOptions) (*Shim, error) {
 		WorkareaRoot: opts.WorkareaRoot,
 		Orphan:       opts.Orphan,
 		ProcessEpoch: opts.ProcessEpoch,
-		ProtocolMin:  opts.ProtocolMin,
-		ProtocolMax:  opts.ProtocolMax,
 		Now:          opts.Now,
 	}
 	if opts.Logger != nil {
@@ -325,17 +327,25 @@ func (s *Shim) finalizeHeadlessTerminal(cause HeadlessExitCause) error {
 }
 
 // serveHeadlessController runs one adopted headless controller connection:
-// the generation fence on Stop and Heartbeat, refusal of every PTY-shaped
-// type, and the terminal courtesy. Heartbeat doubles as the terminal
-// acknowledgement: ackedSeq 1 after the tombstone is durable is the receipt.
+// the generation fence on Stop, Heartbeat and CredentialUpdate, refusal of
+// every PTY-shaped type, and the terminal courtesy. Heartbeat doubles as the
+// terminal acknowledgement: ackedSeq 1 after the tombstone is durable is the
+// receipt.
+//
+// Every frame is read through readControllerFrame, which reads a headless
+// connection with shimwire's profile reader: a PTY-shaped type is answered
+// Error{code:"malformed"} at the read and never reaches dispatchHeadless.
 func (s *Shim) serveHeadlessController(ctrl *controllerConn, r *shimwire.Reader) {
 	defer s.loseController(ctrl)
 	for {
-		msg, err := r.ReadVersion(ctrl.selected)
+		frame, err := s.readControllerFrame(ctrl, r)
 		if err != nil {
 			return
 		}
-		if end := s.dispatchHeadless(ctrl, msg); end {
+		if frame.Handled {
+			continue
+		}
+		if end := s.dispatchHeadless(ctrl, frame.Message); end {
 			return
 		}
 	}
@@ -371,20 +381,18 @@ func (s *Shim) dispatchHeadless(ctrl *controllerConn, msg shimwire.Message) (end
 			return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat did not decode") != nil
 		}
 		return s.persistHeadlessHeartbeatAck(ctrl, heartbeat) != nil
+	case shimwire.TypeCredentialUpdate:
+		// Legal on both profiles at selected v6: the same correlation, ledger
+		// and generation fence the interactive dispatch applies.
+		return s.dispatchCredentialUpdate(ctrl, msg.Body) != nil
 	case shimwire.TypeError:
 		return false // display-only from the controller; nothing to act on
-	case shimwire.TypeHello, shimwire.TypeWelcome, shimwire.TypeAdopted,
-		shimwire.TypeOutput, shimwire.TypeGap, shimwire.TypeSnapshot,
-		shimwire.TypeInput, shimwire.TypeResize, shimwire.TypeExit,
-		shimwire.TypeSnapshotRequest, shimwire.TypeSnapshotResult,
-		shimwire.TypeHostFrame, shimwire.TypeAttributedInput,
-		shimwire.TypeCheckpointRequest, shimwire.TypeCheckpointResult:
-		// Every PTY-shaped type — and every shim-originated type a
-		// controller must never send — is refused without action. The
-		// connection stays up so the controller can read WHY it was
-		// refused rather than retrying the same frame forever.
-		return sendError(ctrl.w, shimwire.CodeMalformed, "message type is not legal on a headless connection") != nil
 	default:
+		// Every PTY-shaped type was already refused at the profile read, so
+		// what reaches here is a shim-originated type a controller must never
+		// send (Hello, Welcome, Adopted, CredentialResult, HeadlessExit). It is
+		// refused without action; the connection stays up so the controller
+		// can read WHY rather than retrying the same frame forever.
 		return sendError(ctrl.w, shimwire.CodeMalformed, "message type is not controller-originated") != nil
 	}
 }

@@ -604,6 +604,7 @@ func TestRecordValidationPinsHeadlessSchema(t *testing.T) {
 		rec := testRecord(t, id, reg)
 		rec.Workload = WorkloadHeadless
 		rec.SchemaVersion = HeadlessRecordSchemaVersion
+		rec.ProtocolMin, rec.ProtocolMax = shimwire.HeadlessMin, shimwire.HeadlessMax
 		return rec
 	}
 	if err := headless().Validate(); err != nil {
@@ -620,6 +621,48 @@ func TestRecordValidationPinsHeadlessSchema(t *testing.T) {
 		if err := reg.Put(rec); !errors.Is(err, ErrRecordInvalid) {
 			t.Fatalf("Put headless schema %d = %v, want ErrRecordInvalid", version, err)
 		}
+	}
+}
+
+// TestRecordValidationBindsHeadlessToTheV6Range pins the record half of the
+// range binding (session-shim v6 §1): the headless workload on a range that
+// includes any version below 6 is malformed, at Validate and at the durable
+// write, so the startup pass quarantines it as record_malformed instead of
+// letting a controller that predates the profile select it as a terminal
+// session. A range starting at 6 stays valid, so a later headless version can
+// widen the maximum.
+func TestRecordValidationBindsHeadlessToTheV6Range(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	headless := func(protocolMin, protocolMax uint32) Record {
+		rec := testRecord(t, id, reg)
+		rec.Workload = WorkloadHeadless
+		rec.SchemaVersion = HeadlessRecordSchemaVersion
+		rec.ProtocolMin, rec.ProtocolMax = protocolMin, protocolMax
+		return rec
+	}
+	for _, valid := range [][2]uint32{{shimwire.V6, shimwire.V6}, {shimwire.V6, shimwire.V6 + 1}} {
+		if err := headless(valid[0], valid[1]).Validate(); err != nil {
+			t.Fatalf("Validate headless [%d,%d] = %v, want nil", valid[0], valid[1], err)
+		}
+	}
+	for _, malformed := range [][2]uint32{
+		{shimwire.V1, shimwire.V5}, {shimwire.V1, shimwire.V6}, {shimwire.V5, shimwire.V6}, {shimwire.V5, shimwire.V5},
+	} {
+		rec := headless(malformed[0], malformed[1])
+		if err := rec.Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("Validate headless [%d,%d] = %v, want ErrRecordInvalid", malformed[0], malformed[1], err)
+		}
+		if err := reg.Put(rec); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("Put headless [%d,%d] = %v, want ErrRecordInvalid", malformed[0], malformed[1], err)
+		}
+	}
+	// The interactive record is untouched by the rule: the released range
+	// stays valid exactly as before.
+	if err := testRecord(t, id, reg).Validate(); err != nil {
+		t.Fatalf("Validate interactive [%d,%d] = %v, want nil", shimwire.ProtocolMin, shimwire.ProtocolMax, err)
 	}
 }
 

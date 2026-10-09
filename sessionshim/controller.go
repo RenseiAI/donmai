@@ -121,6 +121,16 @@ type ControllerOptions struct {
 	// also set RequireFullHostFrames; that opts zero/zero into the build range.
 	ProtocolMin uint32
 	ProtocolMax uint32
+	// Workload is the profile this controller adopts. Zero is the interactive
+	// (PTY) profile, the only one production adoption serves while the
+	// headless launch gate holds: Adopt never sets it, so a startup pass that
+	// meets a headless shim quarantines it as protocol_mismatch and never
+	// ends it. A headless controller selects exactly v6 against a headless
+	// shim's [6,6], fails the stream closed on every PTY-shaped frame, and
+	// reports no terminal capability. A controller whose workload differs
+	// from the record's or the shim's Hello never adopts: the disagreement is
+	// a protocol mismatch.
+	Workload Workload
 	// RequireFullHostFrames declares that this controller consumes HostFrame as
 	// the sole selected-v3 host-sequence authority. It enables max 3; it does not
 	// reject a released max-2 shim, which must still be adopted conservatively.
@@ -173,7 +183,29 @@ type ControllerOptions struct {
 	Logger      *slog.Logger
 }
 
+// workload resolves the profile this controller adopts; zero is interactive.
+func (o ControllerOptions) workload() Workload {
+	if o.Workload == "" {
+		return WorkloadInteractive
+	}
+	return o.Workload
+}
+
 func (o ControllerOptions) protocolRange() (uint32, uint32, error) {
+	switch o.workload() {
+	case WorkloadInteractive:
+	case WorkloadHeadless:
+		// The headless profile has exactly one version. RequireFullHostFrames
+		// is a terminal-stream promise and has nothing to bind to here.
+		if (o.ProtocolMin != 0 || o.ProtocolMax != 0) &&
+			(o.ProtocolMin != shimwire.HeadlessMin || o.ProtocolMax != shimwire.HeadlessMax) {
+			return 0, 0, fmt.Errorf("sessionshim: a headless controller speaks exactly [%d,%d], not [%d,%d]",
+				shimwire.HeadlessMin, shimwire.HeadlessMax, o.ProtocolMin, o.ProtocolMax)
+		}
+		return shimwire.HeadlessMin, shimwire.HeadlessMax, nil
+	default:
+		return 0, 0, fmt.Errorf("sessionshim: unknown controller workload %q", string(o.Workload))
+	}
 	if o.ProtocolMin == 0 && o.ProtocolMax == 0 {
 		if o.RequireFullHostFrames {
 			return shimwire.ProtocolMin, shimwire.ProtocolMax, nil
@@ -258,13 +290,17 @@ func (o ControllerOptions) logger() *slog.Logger {
 // *ptyhost.Session. That is the §D1 ownership boundary made concrete: when this
 // object is garbage, the session is unaffected.
 type Controller struct {
-	id                 Identity
-	controllerID       string
-	conn               *net.UnixConn
-	w                  *shimwire.Writer
-	r                  *shimwire.Reader
-	gen                shimwire.Generation
-	selected           uint32
+	id           Identity
+	controllerID string
+	conn         *net.UnixConn
+	w            *shimwire.Writer
+	r            *shimwire.Reader
+	gen          shimwire.Generation
+	selected     uint32
+	// profile is the workload this connection carries, agreed by the
+	// controller's options, the record, and the shim's Hello. Zero is the
+	// interactive profile.
+	profile            shimwire.Profile
 	hello              shimwire.Hello
 	workareaRoot       string
 	helloAuthenticated bool
@@ -751,6 +787,16 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 		return err
 	}
 	c.hello, c.helloAuthenticated = hello, true
+	// The profile is agreed before any version is selected or authority is
+	// proposed: a controller never adopts a shim of another workload. For an
+	// interactive controller meeting a headless shim this is the refusal that
+	// keeps it from ever being treated as a terminal session, classified as
+	// protocol_mismatch (quarantine, never kill) like any other disjoint wire.
+	if peer := helloWorkload(hello); peer != opts.workload() {
+		return fmt.Errorf("%w: shim serves the %s workload, this controller adopts %s",
+			shimwire.ErrVersionMismatch, string(peer), string(opts.workload()))
+	}
+	c.profile = shimwire.Profile(opts.workload())
 	if err := hello.Extensions.CheckRequired(); err != nil {
 		return err
 	}
@@ -881,10 +927,35 @@ func validateAdoptionCommit(adopted shimwire.Adopted, proposed shimwire.Generati
 	return nil
 }
 
+// helloWorkload reports the workload a shim's Hello declares. Absence (and a
+// Hello built without the field) is the interactive profile.
+func helloWorkload(h shimwire.Hello) Workload {
+	if h.Workload == shimwire.ProfileHeadless {
+		return WorkloadHeadless
+	}
+	return WorkloadInteractive
+}
+
+// recordWorkload reports the workload a discovery record declares. Absence is
+// the interactive profile.
+func recordWorkload(rec Record) Workload {
+	if rec.Workload == "" {
+		return WorkloadInteractive
+	}
+	return rec.Workload
+}
+
 // verifyHello checks that the live peer is the shim the record described.
 func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea, expectedWorkareaRoot string) error {
 	if h.Protocol != shimwire.ProtocolName {
 		return fmt.Errorf("%w: hello names protocol %q", shimwire.ErrVersionMismatch, h.Protocol)
+	}
+	if peer, recorded := helloWorkload(h), recordWorkload(rec); peer != recorded {
+		// The workload is part of what the record describes: a record that
+		// says interactive and a peer that says headless (or the reverse) is
+		// not the shim the record named.
+		return fmt.Errorf("%w: shim reports workload %q, record says %q",
+			ErrAdoptionRefused, string(peer), string(recorded))
 	}
 	if h.OrgID != rec.OrgID || h.SessionID != rec.SessionID {
 		return fmt.Errorf("%w: shim reports identity %s/%s, record says %s/%s",
@@ -971,11 +1042,23 @@ func (c *Controller) SelectedVersion() uint32 { return c.selected }
 
 // SupportsAuthoritativeSnapshot reports whether fresh inspect/emit proxying is
 // available. Selected v1 remains adoptable but intentionally returns false.
-func (c *Controller) SupportsAuthoritativeSnapshot() bool { return c.selected >= shimwire.V2 }
+func (c *Controller) SupportsAuthoritativeSnapshot() bool {
+	return c.selected >= shimwire.V2 && c.profile != shimwire.ProfileHeadless
+}
 
 // SupportsFullHostFrames reports whether the selected local wire supplies one
 // exact complete attach-frame event for every host sequence.
-func (c *Controller) SupportsFullHostFrames() bool { return c.selected >= shimwire.V3 }
+func (c *Controller) SupportsFullHostFrames() bool {
+	return c.selected >= shimwire.V3 && c.profile != shimwire.ProfileHeadless
+}
+
+// Workload reports the profile this adopted connection carries.
+func (c *Controller) Workload() Workload {
+	if c.profile == shimwire.ProfileHeadless {
+		return WorkloadHeadless
+	}
+	return WorkloadInteractive
+}
 
 // Hello returns the shim's opening self-report.
 func (c *Controller) Hello() shimwire.Hello { return c.hello }
@@ -1023,7 +1106,9 @@ func (c *Controller) WriteInput(data []byte) error {
 // relay-stamped userId alongside input bytes (shimwire.TypeAttributedInput,
 // v4+). Selected v1/v2/v3 controllers never negotiate it — WriteAttributedInput
 // degrades to WriteInput's exact byte-identical unattributed send for them.
-func (c *Controller) SupportsAttributedInput() bool { return c.selected >= shimwire.V4 }
+func (c *Controller) SupportsAttributedInput() bool {
+	return c.selected >= shimwire.V4 && c.profile != shimwire.ProfileHeadless
+}
 
 // WriteAttributedInput sends input bytes under this controller's generation,
 // additionally carrying userID — the relay-stamped sender identity (§5 of the
@@ -1549,6 +1634,12 @@ func (c *Controller) readLoop() {
 			c.failSnapshotCalls(err)
 			return
 		}
+		if refusal := c.refuseOffProfile(msg.Type); refusal != nil {
+			c.failCredentialCalls(refusal)
+			c.failSnapshotCalls(refusal)
+			c.closeStream("frame is not legal on this workload profile", refusal)
+			return
+		}
 		if pendingRequested != nil && msg.Type != shimwire.TypeSnapshotResult {
 			c.failSnapshotCalls(shimwire.ErrSnapshotMismatch)
 			c.closeStream("requested Snapshot was not followed by its result", shimwire.ErrSnapshotMismatch)
@@ -1701,6 +1792,26 @@ func (c *Controller) readLoop() {
 			return
 		}
 	}
+}
+
+// refuseOffProfile is the controller half of the profile vocabulary
+// (session-shim v6 §2): on a headless connection every PTY-shaped type is
+// refused and never acted on, and on an interactive connection HeadlessExit is
+// refused the same way. The controller fails the stream closed, as it does for
+// every other frame that breaks the contract, so a headless lineage can never
+// be read as a terminal stream and an interactive one never gains a second
+// terminal authority.
+func (c *Controller) refuseOffProfile(t shimwire.MessageType) error {
+	if c.profile == shimwire.ProfileHeadless {
+		if t.RefusedIn(shimwire.ProfileHeadless, c.selected) {
+			return fmt.Errorf("sessionshim: %w: %s is refused on the headless profile", shimwire.ErrMalformed, t)
+		}
+		return nil
+	}
+	if t == shimwire.TypeHeadlessExit {
+		return fmt.Errorf("sessionshim: %w: HeadlessExit is refused on the interactive profile", shimwire.ErrMalformed)
+	}
+	return nil
 }
 
 func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error {

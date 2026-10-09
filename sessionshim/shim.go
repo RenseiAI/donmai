@@ -39,11 +39,6 @@ type Options struct {
 	// only by the interactive profile; a headless start ignores it.
 	Spec ptyhost.Spec
 
-	// Runner is the headless profile's owned process: the runner's process
-	// group, which the headless shim supervises without a PTY. It is used
-	// only by the headless profile; an interactive start ignores it.
-	Runner RunnerProcess
-
 	// WorkareaPath is the workarea the harness runs against. It is recorded and
 	// verified at adoption, so a shim cannot be adopted into a workarea other
 	// than the one it is actually running in.
@@ -65,6 +60,8 @@ type Options struct {
 
 	// ProtocolMin/ProtocolMax optionally narrow this shim's supported range.
 	// Zero/zero uses the build range; immutable overlap fixtures use max 2.
+	// The headless profile has no range to narrow: it advertises exactly
+	// [shimwire.HeadlessMin, shimwire.HeadlessMax] (see shimProtocolRange).
 	ProtocolMin uint32
 	ProtocolMax uint32
 
@@ -519,12 +516,13 @@ func serve(opts Options) (core *Shim, opened servedSocket, err error) {
 	if opts.Registry == nil {
 		return fail(errors.New("sessionshim: Start requires a Registry"))
 	}
-	protocolMin, protocolMax := opts.ProtocolMin, opts.ProtocolMax
-	if protocolMin == 0 && protocolMax == 0 {
-		protocolMin, protocolMax = shimwire.ProtocolMin, shimwire.ProtocolMax
+	workload := opts.Workload
+	if workload == "" {
+		workload = WorkloadInteractive
 	}
-	if protocolMin == 0 || protocolMax < protocolMin || protocolMax > shimwire.ProtocolMax {
-		return fail(fmt.Errorf("sessionshim: invalid shim protocol range [%d,%d]", protocolMin, protocolMax))
+	protocolMin, protocolMax, err := shimProtocolRange(workload, opts.ProtocolMin, opts.ProtocolMax)
+	if err != nil {
+		return fail(err)
 	}
 	orphan := opts.Orphan
 	if orphan.Deadline == 0 {
@@ -572,10 +570,6 @@ func serve(opts Options) (core *Shim, opened servedSocket, err error) {
 		return fail(err)
 	}
 
-	workload := opts.Workload
-	if workload == "" {
-		workload = WorkloadInteractive
-	}
 	core = &Shim{
 		id:                       opts.Identity,
 		registry:                 opts.Registry,
@@ -606,6 +600,38 @@ func serve(opts Options) (core *Shim, opened servedSocket, err error) {
 	}
 	opened = servedSocket{ln: ln, path: socketPath}
 	return core, opened, nil
+}
+
+// shimProtocolRange resolves the wire range a shim of the given workload
+// advertises in its record and Hello.
+//
+// An interactive shim advertises the build range, or a narrowing of it, so its
+// range and every byte it sends are exactly what a released shim's are.
+//
+// A headless shim advertises exactly [shimwire.HeadlessMin, shimwire.HeadlessMax]
+// (the contract's [6,6]) and nothing else. That range is the whole protection a
+// controller that predates the headless profile has: with no overlap it
+// quarantines the shim as protocol_mismatch, never treats it as a terminal
+// session and never ends it. A headless range that included a version below 6
+// would let exactly that controller select it, so any other requested range is
+// refused rather than narrowed.
+func shimProtocolRange(workload Workload, requestedMin, requestedMax uint32) (uint32, uint32, error) {
+	if workload == WorkloadHeadless {
+		if (requestedMin != 0 || requestedMax != 0) &&
+			(requestedMin != shimwire.HeadlessMin || requestedMax != shimwire.HeadlessMax) {
+			return 0, 0, fmt.Errorf("sessionshim: a headless shim advertises exactly [%d,%d], not [%d,%d]",
+				shimwire.HeadlessMin, shimwire.HeadlessMax, requestedMin, requestedMax)
+		}
+		return shimwire.HeadlessMin, shimwire.HeadlessMax, nil
+	}
+	protocolMin, protocolMax := requestedMin, requestedMax
+	if protocolMin == 0 && protocolMax == 0 {
+		protocolMin, protocolMax = shimwire.ProtocolMin, shimwire.ProtocolMax
+	}
+	if protocolMin == 0 || protocolMax < protocolMin || protocolMax > shimwire.ProtocolMax {
+		return 0, 0, fmt.Errorf("sessionshim: invalid shim protocol range [%d,%d]", protocolMin, protocolMax)
+	}
+	return protocolMin, protocolMax, nil
 }
 
 // servedSocket is the listening adoption socket serve opened: the listener
@@ -1441,7 +1467,10 @@ func (s *Shim) buildHeadlessHello() shimwire.Hello {
 		Generation:       gen,
 		FirstSeq:         0,
 		LastSeq:          0,
-		Extensions:       shimwire.Extensions{Values: map[string]string{shimwire.ExtWorkload: string(WorkloadHeadless)}},
+		// The codec writes the workload into the optional extension map
+		// (shimwire.EncodeHello), and refuses it on a range that includes a
+		// version below 6, so the advertisement and the range cannot drift.
+		Workload: shimwire.ProfileHeadless,
 	}
 }
 
@@ -1478,6 +1507,10 @@ func (s *Shim) handshakeHeadless(conn *net.UnixConn, w *shimwire.Writer, r *shim
 		_ = sendError(w, shimwire.CodeVersionMismatch, "protocol name mismatch")
 		return fmt.Errorf("sessionshim: %w: welcome names protocol %q", shimwire.ErrVersionMismatch, welcome.Protocol)
 	}
+	// The headless range is exactly [6,6] (shimProtocolRange), so this is the
+	// refusal of every lower selection: a controller that selects 5 or below
+	// is asking to speak a terminal vocabulary this shim does not carry, and
+	// it is refused before any generation commits.
 	if welcome.Selected < s.protocolMin || welcome.Selected > s.protocolMax {
 		_ = sendError(w, shimwire.CodeVersionMismatch, "selected version outside this shim's range")
 		return fmt.Errorf("sessionshim: %w: selected %d outside [%d,%d]",
@@ -1513,10 +1546,11 @@ func (s *Shim) handshakeHeadless(conn *net.UnixConn, w *shimwire.Writer, r *shim
 	}
 	s.gen = welcome.ProposedGeneration
 	ctrl := &controllerConn{
-		conn: conn, w: w, selected: welcome.Selected,
-		snapshotLedger: make(map[uint64]*snapshotLedgerEntry),
-		emissionBySeq:  make(map[uint64]*snapshotLedgerEntry),
-		pumpDone:       make(chan struct{}),
+		conn: conn, w: w, selected: welcome.Selected, profile: shimwire.ProfileHeadless,
+		snapshotLedger:   make(map[uint64]*snapshotLedgerEntry),
+		emissionBySeq:    make(map[uint64]*snapshotLedgerEntry),
+		credentialLedger: make(map[uint64]*credentialLedgerEntry),
+		pumpDone:         make(chan struct{}),
 	}
 	prev := s.installControllerLocked(ctrl)
 	s.mu.Unlock()
@@ -2445,10 +2479,10 @@ func writeTyped(w *shimwire.Writer, t shimwire.MessageType, enc func() ([]byte, 
 // it is refused cannot read WHY it was refused, and would retry the same frame
 // on a fresh connection forever. The one place a refusal is terminal is the
 // handshake, where the caller returns its own error after calling this.
-// The one exception to "keeps the connection" is the headless profile's
-// wire-level refusal, which answers through shimwire's profile reader instead:
-// dispatchHeadlessRefusal exists so a headless connection that receives a
-// PTY-shaped frame gets exactly that answer rather than a dispatch-level one.
+// A headless connection's PTY-shaped frames are refused one step earlier, at
+// the read: readControllerFrame reads through shimwire's ReadProfileVersion,
+// which answers Error{code:"malformed"} itself and never hands the frame to
+// dispatch.
 func sendError(w *shimwire.Writer, code shimwire.ErrorCode, detail string) error {
 	body, err := shimwire.EncodeError(shimwire.ErrorMsg{Code: code, Detail: detail})
 	if err != nil {

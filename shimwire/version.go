@@ -157,6 +157,20 @@ func (e Extensions) Workload() (Profile, error) {
 	return ProfileHeadless, nil
 }
 
+// checkWorkloadRange enforces the contract's binding between the workload
+// advertisement and the advertised range: the headless key on a shim whose
+// range includes a version below 6 is malformed. The value registry alone
+// (Extensions.Workload) is not enough, because a headless Hello on [1,6] would
+// otherwise decode cleanly as headless while a released controller selects an
+// interactive version from the same range. Only the minimum matters: a range
+// that starts at 6 or above includes no version below 6.
+func checkWorkloadRange(profile Profile, advertisedMin uint32) error {
+	if profile == ProfileHeadless && advertisedMin < V6 {
+		return fmt.Errorf("shimwire: %w: headless workload on a range that includes v%d", ErrMalformed, advertisedMin)
+	}
+	return nil
+}
+
 // CheckRequired fails closed when the peer requires an extension this build does
 // not understand. An empty Required set always passes, so an OSS-only peer that
 // negotiates no extensions is never penalised.

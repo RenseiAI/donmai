@@ -27,8 +27,10 @@ import (
 //     controller as protocol_mismatch (quarantined, never adopted, never
 //     killed), and an interactive [1,6] range still selects 5 with a v5
 //     controller;
-//   - strict record decode: a headless schema-2 record is refused by this
-//     build's strict decoder and quarantined as record_malformed;
+//   - strict record decode: an older daemon's schema-1 decoder refuses a
+//     headless record (TestOldSchemaDecoderRefusesHeadlessRecord), and this
+//     build, which reads schema 2, refuses a headless record whose range
+//     includes a version below 6 and quarantines it as record_malformed;
 //   - stale-generation and changed-duplicate updates through the shim's
 //     dispatch, plus the exact-retry replay;
 //   - every refused PTY-shaped type on a headless connection, answered on the
@@ -53,8 +55,8 @@ func TestV6CorpusHeadlessRangeMeetsAReleasedControllerAsMismatch(t *testing.T) {
 		t.Fatalf("own process identity: %v", err)
 	}
 	rec := Record{
-		SchemaVersion: RecordSchemaVersion,
-		OrgID:         id.OrgID, SessionID: id.SessionID,
+		SchemaVersion: HeadlessRecordSchemaVersion, Workload: WorkloadHeadless,
+		OrgID: id.OrgID, SessionID: id.SessionID,
 		ShimID: "shim-headless-1", ProcessEpoch: 1,
 		PID: self.PID, ProcessStartedAt: self.StartedAt,
 		SocketPath: reg.SocketPath(id), SocketDevice: 1, SocketInode: 2,
@@ -129,12 +131,16 @@ func TestV6CorpusInteractiveV6RangeStillSelectsV5(t *testing.T) {
 	}
 }
 
-// TestV6CorpusHeadlessRecordIsRefusedByTheStrictDecoder drives the registry —
-// the production record path — with a headless schema-2 record carrying the
-// workload member. This build's strict decoder refuses it, and the startup
-// pass quarantines it as record_malformed: exactly the outcome the contract
-// prescribes for an older daemon meeting a headless record.
-func TestV6CorpusHeadlessRecordIsRefusedByTheStrictDecoder(t *testing.T) {
+// TestV6CorpusHeadlessRecordOnALowerRangeIsRefused drives the registry — the
+// production record path — with a headless schema-2 record on the released
+// [1,5] range: the shape a headless shim built before the range binding
+// advertised. The contract makes the headless key on a range that includes a
+// version below 6 malformed, so this build's strict decoder refuses it and the
+// startup pass quarantines it as record_malformed rather than selecting v5 and
+// adopting a headless shim as a terminal session. (The older-daemon column,
+// a schema-1-only decoder meeting any headless record, is
+// TestOldSchemaDecoderRefusesHeadlessRecord.)
+func TestV6CorpusHeadlessRecordOnALowerRangeIsRefused(t *testing.T) {
 	t.Parallel()
 
 	reg := newTestRegistry(t)
@@ -153,7 +159,8 @@ func TestV6CorpusHeadlessRecordIsRefusedByTheStrictDecoder(t *testing.T) {
 	if err := json.Unmarshal(raw, &asMap); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	// The headless record shape: schema 2 with the workload member.
+	// The headless record shape (schema 2 with the workload member) on the
+	// released range testRecord carries.
 	asMap["schemaVersion"] = 2
 	asMap["workload"] = "headless"
 	tampered, err := json.Marshal(asMap)
@@ -164,8 +171,11 @@ func TestV6CorpusHeadlessRecordIsRefusedByTheStrictDecoder(t *testing.T) {
 		t.Fatalf("write headless record: %v", err)
 	}
 
+	if rec.ProtocolMin >= shimwire.V6 {
+		t.Fatalf("fixture range [%d,%d] does not include a version below 6", rec.ProtocolMin, rec.ProtocolMax)
+	}
 	if _, err := reg.Get(id); !errors.Is(err, ErrRecordInvalid) {
-		t.Fatalf("Get headless schema-2 record = %v, want ErrRecordInvalid", err)
+		t.Fatalf("Get headless record on [%d,%d] = %v, want ErrRecordInvalid", rec.ProtocolMin, rec.ProtocolMax, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -523,7 +533,7 @@ func TestV6CorpusHeadlessExitAcknowledgementWait(t *testing.T) {
 	defer shimConn.Close()   //nolint:errcheck
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
-		gen: 3, selected: shimwire.V6,
+		gen: 3, selected: shimwire.V6, profile: shimwire.ProfileHeadless,
 		events: make(chan ControllerEvent, 64), done: make(chan struct{}), closing: make(chan struct{}),
 		backlog:       newEventBacklog(0, 0, nil, nil, 0, 0),
 		snapshotCalls: make(map[uint64]*snapshotCall), credentialCalls: make(map[uint64]*credentialCall),
