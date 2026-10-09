@@ -613,6 +613,18 @@ func TestCalculateCostUSD_UnknownModelFallsBack(t *testing.T) {
 	}
 }
 
+// The cost helper takes fresh input and floors it at zero: a negative
+// fresh-input value must price identically to zero, never as a negative
+// dollar contribution. Deleting the clamp turns this RED.
+func TestCalculateCostUSD_NegativeFreshInputFloorsAtZero(t *testing.T) {
+	t.Parallel()
+	floored := calculateCostUSD(0, 500, 50, DefaultCodexModel)
+	got := calculateCostUSD(-100, 500, 50, DefaultCodexModel)
+	if abs(got-floored) > 0.0001 {
+		t.Fatalf("negative fresh input priced at %.6f, want floored %.6f", got, floored)
+	}
+}
+
 func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	buf, err := json.Marshal(v)
