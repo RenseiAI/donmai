@@ -319,6 +319,10 @@ type scriptedSession struct {
 	// ref, when set, makes the session a rework run on that existing
 	// branch of repository (qw.Ref), created at main.
 	ref string
+	// delivery, when set, dispatches the run with that delivery policy
+	// (qw.Delivery): the dispatch-declared rule for what counts as a
+	// delivered pull request.
+	delivery *prompt.DeliveryPolicy
 	// continueNumber, when positive, makes the session a continue run on
 	// the pull request numbered here: its head branch is created on the
 	// fixture repository at main, the head commit is pinned on the
@@ -452,6 +456,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	qw.WorkType = cfg.workType
 	qw.StageBudget = cfg.budget
 	qw.SeatBudget = cfg.seatBudget
+	qw.Delivery = cfg.delivery
 	switch {
 	case cfg.declaration != nil:
 		qw.RepositoryDeclaration = cfg.declaration
