@@ -1533,6 +1533,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			Skills:               detailSkills(d.Skills),
 			MemoryBlock:          d.MemoryBlock,
 			ContinuePullRequest:  detailContinuePullRequest(d.ContinuePullRequest),
+			Delivery:             detailDeliveryPolicy(d.Delivery),
 			Mode:                 d.Mode,
 			InitialPrompt:        d.InitialPrompt,
 			RecordingEnabled:     d.RecordingEnabled,
@@ -1576,7 +1577,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID ||
 			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) ||
-			!reflect.DeepEqual(detailContinuePullRequest(d.ContinuePullRequest), admitted.ContinuePullRequest) {
+			!reflect.DeepEqual(detailContinuePullRequest(d.ContinuePullRequest), admitted.ContinuePullRequest) ||
+			!reflect.DeepEqual(detailDeliveryPolicy(d.Delivery), admitted.Delivery) {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
 		}
 		if d.AgentCardID != admitted.AgentCardID || d.AgentCardName != admitted.AgentCardName {
@@ -1745,6 +1747,20 @@ func detailContinuePullRequest(in *daemon.PollContinuePullRequest) *prompt.Conti
 		Number:  in.Number,
 		HeadRef: in.HeadRef,
 		HeadSha: in.HeadSha,
+	}
+}
+
+// detailDeliveryPolicy re-types the daemon's PollDeliveryPolicy mirror
+// into the runner-consumable prompt.DeliveryPolicy. Nil in returns nil
+// so the omitempty round-trip is faithful: absent stays absent and the
+// runner keeps today's delivery behaviour.
+func detailDeliveryPolicy(in *daemon.PollDeliveryPolicy) *prompt.DeliveryPolicy {
+	if in == nil {
+		return nil
+	}
+	return &prompt.DeliveryPolicy{
+		AllowDraft:        in.AllowDraft,
+		AllowMergeCommits: in.AllowMergeCommits,
 	}
 }
 

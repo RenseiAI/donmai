@@ -322,6 +322,13 @@ type SessionDetail struct {
 	// today's new-PR behaviour. Opaque forwarder only.
 	ContinuePullRequest *PollContinuePullRequest `json:"continuePullRequest,omitempty"`
 
+	// Delivery forwards the dispatch-declared delivery policy from
+	// PollWorkItem onto the runner's QueuedWork. nil/absent preserves
+	// today's behaviour (a draft is undelivered, merges alone do not
+	// deliver). Opaque forwarder only — same pattern as
+	// ContinuePullRequest above.
+	Delivery *PollDeliveryPolicy `json:"delivery,omitempty"`
+
 	// InterviewBudget forwards the per-interview wall-clock + idle-grace
 	// budget from PollWorkItem onto the runner's QueuedWork. nil/absent
 	// is safe and backward-compatible. Opaque forwarder only.

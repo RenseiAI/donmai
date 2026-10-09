@@ -2277,3 +2277,59 @@ func TestPollItemToSessionDetail_WS5FidelityForwarded(t *testing.T) {
 		}
 	})
 }
+
+// TestPollResponse_DecodesDeliveryPolicy proves the dispatch-declared
+// delivery policy survives strict poll-wire decoding: absent stays nil
+// (today's behaviour), and both flags decode when present. Without this
+// field the strict JSON decoder silently drops the platform's emit — the
+// v0.9.3 SystemPromptOverride wire-gap precedent.
+func TestPollResponse_DecodesDeliveryPolicy(t *testing.T) {
+	body := []byte(`{
+		"work": [{
+			"sessionId": "delivery-sess-1",
+			"workType": "development",
+			"delivery": {"allowDraft": true, "allowMergeCommits": true}
+		}, {
+			"sessionId": "delivery-sess-2",
+			"workType": "development"
+		}]
+	}`)
+
+	var resp PollResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode wire shape: %v", err)
+	}
+	if len(resp.Work) != 2 {
+		t.Fatalf("Work len = %d, want 2", len(resp.Work))
+	}
+	got := resp.Work[0].Delivery
+	if got == nil || !got.AllowDraft || !got.AllowMergeCommits {
+		t.Errorf("Delivery = %+v; want both flags set", got)
+	}
+	if resp.Work[1].Delivery != nil {
+		t.Errorf("Delivery = %+v; want nil when absent", resp.Work[1].Delivery)
+	}
+}
+
+// TestPollItemToSessionDetail_DeliveryPolicyForwarded verifies the
+// dispatch-declared delivery policy survives the PollWorkItem →
+// SessionDetail forwarding step. Mirrors the DisallowedTools / v0.9.3
+// SystemPromptOverride precedent.
+func TestPollItemToSessionDetail_DeliveryPolicyForwarded(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		item := PollWorkItem{
+			SessionID: "sess-delivery",
+			Delivery:  &PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true},
+		}
+		detail := PollItemToSessionDetail(item, nil, "", "", "")
+		if detail.Delivery == nil || !detail.Delivery.AllowDraft || !detail.Delivery.AllowMergeCommits {
+			t.Errorf("Delivery = %+v; want both flags set", detail.Delivery)
+		}
+	})
+	t.Run("absent — omitted", func(t *testing.T) {
+		detail := PollItemToSessionDetail(PollWorkItem{SessionID: "bare"}, nil, "", "", "")
+		if detail.Delivery != nil {
+			t.Errorf("Delivery = %+v; want nil when absent", detail.Delivery)
+		}
+	})
+}

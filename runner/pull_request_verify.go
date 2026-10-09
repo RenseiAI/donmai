@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -167,6 +168,10 @@ type sessionPullRequestVerifier struct {
 	// lastHead is the accepted pull request's head at the latest re-read
 	// (undelivered); it starts at startHead.
 	lastHead string
+	// delivery is the dispatch-declared delivery policy for the run's
+	// pull request (see prompt.DeliveryPolicy). Nil is today's
+	// behaviour: a draft is undelivered, merges alone do not deliver.
+	delivery *prompt.DeliveryPolicy
 	accepted string
 	outcomes map[string]candidateOutcome
 }
@@ -183,7 +188,8 @@ type sessionPullRequestVerifier struct {
 func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWork, declaration *workarea.NormalizedDeclaration, worktreePath, branch, startHead string, repositoryFree bool) *sessionPullRequestVerifier {
 	v := &sessionPullRequestVerifier{
 		branch: branch, worktreePath: worktreePath, startHead: startHead, lastHead: startHead,
-		lookup: r.pullRequestLookup, draftLookup: r.pullRequestDraftLookup,
+		delivery: qw.Delivery,
+		lookup:   r.pullRequestLookup, draftLookup: r.pullRequestDraftLookup,
 		headLookup: r.pullRequestHeadLookup, inspectRange: inspectContinueRange,
 		outcomes: map[string]candidateOutcome{},
 	}
@@ -406,9 +412,16 @@ const (
 // not deliver the session's work), undeliveredDraft when it is a draft, ""
 // when it delivers or when there is no accepted pull request.
 //
+// Under a dispatch-declared delivery policy (see prompt.DeliveryPolicy)
+// the draft check is skipped when the policy allows drafts, and the
+// delivery inspection counts merge resolutions when the policy allows
+// merges; every other check still applies, so a draft without the run's
+// own new commit still ends undelivered, naming the missing commit.
+//
 // moved reports that the pull request gained a deliverable commit of the
 // session's own since the previous re-read: a non-merge commit outside the
-// scratch set. A draft or rework that keeps gaining only merges or scratch
+// scratch set (or, under the merge allowance, a merge carrying the run's
+// own resolution). A draft or rework that keeps gaining only merges or scratch
 // commits is not making delivery progress, so the caller keeps counting its
 // continuations against the undelivered bound
 // (turnFollowUps.undeliveredSent).
@@ -425,6 +438,9 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 	if inspect == nil {
 		inspect = inspectContinueRange
 	}
+	delivers := func(inspection continueRangeInspection) bool {
+		return inspection.deliversUnder(v.delivery)
+	}
 	readProgress := func(head string, own bool) {
 		previous := v.lastHead
 		if head != "" {
@@ -438,7 +454,7 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 			errs = append(errs, fmt.Errorf("inspect continued pull request progress: %w", inspectErr))
 			return
 		}
-		moved = inspection.delivers()
+		moved = delivers(inspection)
 	}
 	if v.startHead != "" {
 		head, own, readErr := v.readHead(ctx)
@@ -459,12 +475,12 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 			inspection, inspectErr := inspect(ctx, v.worktreePath, v.branch, v.startHead, head)
 			if inspectErr != nil {
 				errs = append(errs, fmt.Errorf("inspect continued pull request delivery: %w", inspectErr))
-			} else if !inspection.delivers() {
+			} else if !delivers(inspection) {
 				return undeliveredNoNewCommit, moved, nil
 			}
 		}
 	}
-	if v.draftLookup != nil {
+	if !v.delivery.AllowsDraft() && v.draftLookup != nil {
 		draft, draftErr := v.draftLookup(ctx, v.worktreePath, v.accepted)
 		switch {
 		case draftErr != nil:

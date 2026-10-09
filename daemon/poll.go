@@ -178,6 +178,14 @@ type PollWorkItem struct {
 	// PollContinuePullRequest mirror. Nil preserves today's new-PR behaviour.
 	ContinuePullRequest *PollContinuePullRequest `json:"continuePullRequest,omitempty"`
 
+	// Delivery is the dispatch-declared delivery policy for the run's
+	// pull request. Forwarded opaquely; nil/absent preserves today's
+	// behaviour (a draft is undelivered, merges alone do not deliver).
+	// Same v0.9.3 SystemPromptOverride wire-gap precedent as the fields
+	// above: without it the strict JSON decoder silently drops the
+	// platform's emit. The runner consumes it as prompt.DeliveryPolicy.
+	Delivery *PollDeliveryPolicy `json:"delivery,omitempty"`
+
 	// McpServers is the platform-supplied agent-card MCP server set.
 	// Forwarded opaquely via the PollMCPServer mirror.
 	McpServers []PollMCPServer `json:"mcpServers,omitempty"`
@@ -372,6 +380,18 @@ type PollContinuePullRequest struct {
 	Number  int    `json:"number,omitempty"`
 	HeadRef string `json:"headRef,omitempty"`
 	HeadSha string `json:"headSha,omitempty"`
+}
+
+// PollDeliveryPolicy mirrors prompt.DeliveryPolicy for the daemon package
+// so the daemon can decode + forward the dispatch-declared delivery
+// policy without importing the prompt package (cardinal
+// package-architecture rule: poll.go stays import-light — same rule that
+// produced PollStageBudget / PollContinuePullRequest). The runner re-types
+// this into prompt.DeliveryPolicy in detailToQueuedWork. JSON tags are
+// byte-identical to prompt.DeliveryPolicy.
+type PollDeliveryPolicy struct {
+	AllowDraft        bool `json:"allowDraft,omitempty"`
+	AllowMergeCommits bool `json:"allowMergeCommits,omitempty"`
 }
 
 // PollSkill mirrors prompt.SkillSpec for the daemon package so the daemon can
@@ -1660,6 +1680,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		Skills:                  item.Skills,
 		MemoryBlock:             item.MemoryBlock,
 		ContinuePullRequest:     item.ContinuePullRequest,
+		Delivery:                item.Delivery,
 		Mode:                    item.Mode,
 		InitialPrompt:           item.InitialPrompt,
 		RecordingEnabled:        item.RecordingEnabled,

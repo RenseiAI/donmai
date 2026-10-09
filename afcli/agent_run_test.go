@@ -2608,3 +2608,72 @@ func TestDetailToQueuedWork_ExecutionSecurity(t *testing.T) {
 		})
 	}
 }
+
+// TestDetailToQueuedWork_DeliveryPolicyForwarded verifies the
+// dispatch-declared delivery policy survives the SessionDetail →
+// runner.QueuedWork translation (the daemon → worker wire hop).
+// Nil stays nil: absent means today's delivery behaviour. Mirrors the
+// DisallowedTools / v0.9.3 SystemPromptOverride precedent.
+func TestDetailToQueuedWork_DeliveryPolicyForwarded(t *testing.T) {
+	plain, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID:       "sess-nodelivery",
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if plain.Delivery != nil {
+		t.Errorf("Delivery = %+v; want nil with no stamped policy", plain.Delivery)
+	}
+
+	queued, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID:       "sess-delivery",
+		Delivery:        &daemon.PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true},
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if queued.Delivery == nil || !queued.Delivery.AllowDraft || !queued.Delivery.AllowMergeCommits {
+		t.Fatalf("Delivery = %+v; want both flags set", queued.Delivery)
+	}
+}
+
+// TestDetailToQueuedWork_DeliveryPolicyCannotDivergeFromTheReceiptedPayload
+// pins the receipt guard: the policy decides what counts as delivered
+// work, so a compatibility mirror that disagrees with the receipted
+// payload is refused rather than silently running under the wrong rule.
+func TestDetailToQueuedWork_DeliveryPolicyCannotDivergeFromTheReceiptedPayload(t *testing.T) {
+	admitted := map[string]any{"sessionId": "sess-1", "delivery": map[string]any{"allowDraft": true}}
+	payload, err := json.Marshal(admitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	moved := &daemon.PollDeliveryPolicy{AllowDraft: false, AllowMergeCommits: true}
+	if _, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID: "sess-1", OperationalPayload: payload, Delivery: moved,
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	}); err == nil {
+		t.Fatal("a mirror naming a different policy than the receipted payload was accepted")
+	}
+
+	if _, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID: "sess-1", OperationalPayload: payload,
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	}); err == nil {
+		t.Fatal("a mirror that dropped the receipted delivery policy was accepted")
+	}
+
+	queued, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID: "sess-1", OperationalPayload: payload,
+		Delivery:        &daemon.PollDeliveryPolicy{AllowDraft: true},
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if queued.Delivery == nil || !queued.Delivery.AllowDraft || queued.Delivery.AllowMergeCommits {
+		t.Fatalf("Delivery = %+v; want the receipted policy", queued.Delivery)
+	}
+}

@@ -11,8 +11,23 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
+
+// draftAlwaysQueried fails the case when the draft state is read: under
+// a draft allowance the draft check is skipped and the lookup must never
+// run. want is returned only if the production code wrongly calls it.
+func draftAlwaysQueried(t *testing.T, url string, want bool) pullRequestDraftLookup {
+	t.Helper()
+	return func(_ context.Context, _ string, got string) (bool, error) {
+		if got != url {
+			return false, fmt.Errorf("unexpected url %q", got)
+		}
+		t.Error("draft state was read under a draft allowance; want it skipped")
+		return want, nil
+	}
+}
 
 // The example URL a task prompt quoted in the incident: it looks like a pull
 // request URL but belongs to no session.
@@ -517,6 +532,7 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 		branch    string
 		startHead string
 		lastHead  string
+		delivery  *prompt.DeliveryPolicy
 		lookup    pullRequestRefLookup
 		head      pullRequestHeadLookup
 		draft     pullRequestDraftLookup
@@ -540,6 +556,13 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 		{name: "draft state unknown", accepted: own, draft: ghDown, wantErr: "not authenticated"},
 		{name: "rework head unreadable", accepted: own, startHead: start, lastHead: start, lookup: unreadable, draft: draftIs(false), wantErr: "remote unreachable"},
 		{name: "rework head unreadable, draft", accepted: own, startHead: start, lastHead: start, lookup: unreadable, draft: draftIs(true), want: undeliveredDraft, wantErr: "remote unreachable"},
+		// Dispatch-declared delivery policy: the draft check is
+		// skipped when the policy allows drafts, while the
+		// new-commit check still applies.
+		{name: "draft allowed by policy, ready", accepted: own, delivery: &prompt.DeliveryPolicy{AllowDraft: true}, draft: draftIs(false)},
+		{name: "draft allowed by policy, still draft", accepted: own, branch: "agent/s", delivery: &prompt.DeliveryPolicy{AllowDraft: true}, lastHead: start, lookup: refsAtBranch(moved, moved), draft: draftAlwaysQueried(t, own, true)},
+		{name: "rework draft allowed by policy, new commit", accepted: own, branch: "agent/s", startHead: start, lastHead: start, delivery: &prompt.DeliveryPolicy{AllowDraft: true}, lookup: refsAtBranch(moved, moved), draft: draftAlwaysQueried(t, own, true), wantMoved: true},
+		{name: "rework draft allowed by policy, no new commit", accepted: own, startHead: start, lastHead: start, delivery: &prompt.DeliveryPolicy{AllowDraft: true}, lookup: refsAt(start), draft: draftAlwaysQueried(t, own, true), want: undeliveredNoNewCommit},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -559,7 +582,7 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 			}
 			v := &sessionPullRequestVerifier{
 				repository: "acme/widgets", branch: tc.branch, worktreePath: t.TempDir(), accepted: tc.accepted,
-				startHead: tc.startHead, lastHead: tc.lastHead, lookup: lookup, draftLookup: tc.draft, headLookup: head,
+				startHead: tc.startHead, lastHead: tc.lastHead, delivery: tc.delivery, lookup: lookup, draftLookup: tc.draft, headLookup: head,
 				inspectRange: delivering,
 			}
 			got, gotMoved, err := v.undelivered(context.Background())

@@ -441,3 +441,52 @@ func TestOperationalPayloadEveryLeafMutationDeniesPreSpawn(t *testing.T) {
 		}
 	}
 }
+
+// TestOperationalPayloadDeliveryPolicyIsDigestBound pins that the
+// dispatch-declared delivery policy rides the admission digest: it
+// decides what counts as delivered work, so two runs that verify one
+// receipt must run under the same rule. Absent stays absent (legacy
+// shape preserved).
+func TestOperationalPayloadDeliveryPolicyIsDigestBound(t *testing.T) {
+	base := exactReceiptQueuedWork("operational-delivery-binding")
+	absent, err := CanonicalOperationalPayload(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(absent), `"delivery"`) {
+		t.Fatalf("absent policy changed the legacy operational shape: %s", absent)
+	}
+	withoutPolicy, err := DigestOperationalPayload(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withDraft := base
+	withDraft.Delivery = &prompt.DeliveryPolicy{AllowDraft: true}
+	withDraftDigest, err := DigestOperationalPayload(withDraft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withDraftDigest == withoutPolicy {
+		t.Fatal("delivery policy did not change the admission digest: two runs could verify one receipt yet run under different delivery rules")
+	}
+	withMerges := base
+	withMerges.Delivery = &prompt.DeliveryPolicy{AllowMergeCommits: true}
+	withMergesDigest, err := DigestOperationalPayload(withMerges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withMergesDigest == withoutPolicy || withMergesDigest == withDraftDigest {
+		t.Fatal("delivery policy values did not change the admission digest")
+	}
+	projected := ProjectOperationalPayload(withDraft)
+	if projected.Delivery == nil || !projected.Delivery.AllowDraft || projected.Delivery.AllowMergeCommits {
+		t.Fatalf("projected delivery = %+v; want the stamped policy", projected.Delivery)
+	}
+	projected.Delivery.AllowDraft = false
+	if !withDraft.Delivery.AllowDraft {
+		t.Fatal("projected delivery aliases queued work")
+	}
+	if ProjectOperationalPayload(base).Delivery != nil {
+		t.Fatal("absent delivery policy projected non-nil; want nil (legacy shape preserved)")
+	}
+}

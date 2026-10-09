@@ -587,6 +587,16 @@ type Runner struct {
 	quotaReportersMu sync.Mutex
 	quotaReporters   map[string]*QuotaReporter
 
+	// interactiveUsage holds the live per-session transcript-tail usage
+	// totals, keyed by session id. An interactive dispatch registers its
+	// totals before supervising the PTY so the step-heartbeat emitter
+	// (wired in runLoop before the dispatch) reads the same running
+	// total the terminal report carries; the entry is released when the
+	// dispatch returns. Guarded by interactiveUsageMu; the totals value
+	// itself is concurrency-safe.
+	interactiveUsageMu sync.Mutex
+	interactiveUsage   map[string]*interactiveUsageTotals
+
 	// shimSeat is Options.ShimSeat (see its doc comment). Nil disables
 	// the standalone outbox persist; non-nil persists every terminal
 	// status body before the first send.
@@ -669,6 +679,7 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
 		quotaReporterForSession:          opts.QuotaReporterForSession,
 		quotaReporters:                   map[string]*QuotaReporter{},
+		interactiveUsage:                 map[string]*interactiveUsageTotals{},
 		shimSeat:                         opts.ShimSeat,
 	}
 	if r.envc == nil {
