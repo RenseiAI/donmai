@@ -2,6 +2,7 @@ package kit
 
 import (
 	"errors"
+	"path"
 	"strings"
 	"testing"
 )
@@ -221,6 +222,55 @@ func TestValidateDependencyStoreTable(t *testing.T) {
 			s.CommandsOverride = map[string]map[string]string{OSLinux: {"relocate": "bin/relocate"}}
 		}, "no same-entry base command"},
 		{"bad relocation", func(s *DependencyStoreView) { s.Snapshot.Relocation = "teleport" }, "unknown snapshot relocation"},
+		// Store paths that clean to the store root would make content
+		// cover every secrets path while the overlap check misses it.
+		{"content ./ is the store root", func(s *DependencyStoreView) {
+			s.Store.Content, s.Store.Secrets = []string{"./"}, []string{"credentials.toml"}
+		}, "not in canonical form"},
+		{"content a/.. is the store root", func(s *DependencyStoreView) {
+			s.Store.Content, s.Store.Secrets = []string{"a/.."}, []string{"credentials.toml"}
+		}, "not in canonical form"},
+		{"never_share x/../ is the store root", func(s *DependencyStoreView) {
+			s.Store.Content, s.Store.NeverShare = []string{"x/../"}, []string{"bin"}
+		}, "not in canonical form"},
+		{"content glob", func(s *DependencyStoreView) {
+			s.Store.Content, s.Store.Secrets = []string{"*"}, []string{"credentials.toml"}
+		}, "not a literal path"},
+		{"non-canonical secrets", func(s *DependencyStoreView) { s.Store.Secrets = []string{"./credentials.toml"} }, "not in canonical form"},
+		{"manager traversal", func(s *DependencyStoreView) { s.Manager = "../../tmp/evil" }, "not an identifier"},
+		{"manager with slash", func(s *DependencyStoreView) { s.Manager = "pnpm/10" }, "not an identifier"},
+		{"manager dot-dot", func(s *DependencyStoreView) { s.Manager = ".." }, "not an identifier"},
+		{"manager with version dot valid", func(s *DependencyStoreView) { s.Manager = "pnpm-10.x" }, ""},
+		{"empty lockfile", func(s *DependencyStoreView) { s.Lockfiles = []string{""} }, "empty lockfile entry"},
+		{"absolute lockfile", func(s *DependencyStoreView) { s.Lockfiles = []string{"/etc/passwd"} }, "not a canonical relative"},
+		{"escaping lockfile", func(s *DependencyStoreView) { s.Lockfiles = []string{"../../.ssh/id_rsa"} }, "escapes the leaf"},
+		{"absolute input", func(s *DependencyStoreView) { s.Inputs = []string{"/home/u/.npmrc"} }, "not a canonical relative"},
+		{"escaping input glob", func(s *DependencyStoreView) { s.Inputs = []string{"**/../../.aws/credentials"} }, "not a canonical relative"},
+		{"escaping input", func(s *DependencyStoreView) { s.Inputs = []string{"../.npmrc"} }, "escapes the leaf"},
+		{"input globs valid", func(s *DependencyStoreView) {
+			s.Inputs = []string{"pnpm-workspace.yaml", "**/package.json", ".npmrc", "patches/**"}
+		}, ""},
+		{"escaping installed", func(s *DependencyStoreView) { s.Snapshot.Installed = []string{"../.."} }, "escapes the leaf"},
+		{"absolute installed", func(s *DependencyStoreView) { s.Snapshot.Installed = []string{"/"} }, "not a canonical relative"},
+		{"installed glob valid", func(s *DependencyStoreView) { s.Snapshot.Installed = []string{"node_modules", "**/node_modules"} }, ""},
+		{"store env bad name", func(s *DependencyStoreView) { s.Store.Env = []string{"BAD NAME=1"} }, "not an environment variable name"},
+		{"store env empty", func(s *DependencyStoreView) { s.Store.Env = []string{""} }, "not an environment variable name"},
+		{"store env leading digit", func(s *DependencyStoreView) { s.Store.Env = []string{"1STORE"} }, "not an environment variable name"},
+		{"import env bad key", func(s *DependencyStoreView) { s.ImportEnv = map[string]string{"A=B": "c"} }, "not an environment variable name"},
+		{"proxy env empty key", func(s *DependencyStoreView) { s.ProxyEnv = map[string]string{"": "x"} }, "not an environment variable name"},
+		{"store default unknown OS", func(s *DependencyStoreView) { s.Store.Default = map[string]string{"darwin": "~/x"} }, "unknown OS"},
+		{"store default valid", func(s *DependencyStoreView) {
+			s.Store.Default = map[string]string{OSMacOS: "~/Library/pnpm/store", OSLinux: "~/.local/share/pnpm/store"}
+		}, ""},
+		{"relocate package path valid", func(s *DependencyStoreView) { s.Commands["relocate"] = "bin/pnpm-relocate" }, ""},
+		{"relocate with arguments", func(s *DependencyStoreView) { s.Commands["relocate"] = "bin/relocate --flag" }, "must be a package path"},
+		{"relocate absolute", func(s *DependencyStoreView) { s.Commands["relocate"] = "/usr/bin/relocate" }, "must be a package path"},
+		{"relocate escaping", func(s *DependencyStoreView) { s.Commands["relocate"] = "../relocate" }, "escapes the package"},
+		{"relocate variable", func(s *DependencyStoreView) { s.Commands["relocate"] = "$HOME/relocate" }, "must be a package path"},
+		{"relocate override with arguments", func(s *DependencyStoreView) {
+			s.Commands["relocate"] = "bin/relocate"
+			s.CommandsOverride = map[string]map[string]string{OSMacOS: {"relocate": "bin/relocate --macos"}}
+		}, "must be a package path"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -376,4 +426,42 @@ func TestSelectDependencyStoresDigestDeterminism(t *testing.T) {
 	if first.Digest != second.Digest {
 		t.Fatalf("digests differ: %s vs %s", first.Digest, second.Digest)
 	}
+}
+
+// FuzzDependencyStorePathContainment holds the classification invariant
+// for any accepted spelling: a content path and a secrets path resolve
+// strictly inside the store, and content never covers the secret. The
+// seeds include the spellings that once cleaned to the store root.
+func FuzzDependencyStorePathContainment(f *testing.F) {
+	for _, seed := range [][2]string{
+		{"v10/files", "credentials.toml"},
+		{"./", "credentials.toml"},
+		{"a/..", "x"},
+		{"./.", "credentials.toml"},
+		{"*", "credentials.toml"},
+		{"registry", "registry/credentials.toml"},
+		{"../x", "y"},
+		{"a//b", "a/b/c"},
+	} {
+		f.Add(seed[0], seed[1])
+	}
+	f.Fuzz(func(t *testing.T, content, secret string) {
+		entry := pnpmStoreView()
+		entry.Store.Content = []string{content}
+		entry.Store.Secrets = []string{secret}
+		if ValidateDependencyStore(entry) != nil {
+			return
+		}
+		root := "/store"
+		c, s := path.Join(root, content), path.Join(root, secret)
+		if !strings.HasPrefix(c, root+"/") || !strings.HasPrefix(s, root+"/") {
+			t.Fatalf("accepted content %q / secret %q resolving outside or at the store root", content, secret)
+		}
+		if c == s || strings.HasPrefix(s, c+"/") || strings.HasPrefix(c, s+"/") {
+			t.Fatalf("accepted content %q covering secret %q", content, secret)
+		}
+		if strings.ContainsAny(content, "*?[") {
+			t.Fatalf("accepted glob content %q", content)
+		}
+	})
 }

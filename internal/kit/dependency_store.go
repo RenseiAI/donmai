@@ -167,7 +167,7 @@ type LockedDependencyBinding struct {
 	SelectedKitID string `json:"selectedKitId"`
 }
 
-// LeafDependencyFacts are theMutable-leaf facts selection needs: which
+// LeafDependencyFacts are the mutable-leaf facts selection needs: which
 // repo-relative paths the leaf holds and the leaf's own manager
 // declaration (Node packageManager, "" when the ecosystem has none).
 type LeafDependencyFacts struct {
@@ -176,20 +176,60 @@ type LeafDependencyFacts struct {
 }
 
 // ValidateDependencyStore validates one entry. manager, lockfiles, fetch
-// and install are required; integrity is on-use, on-fetch or none with
-// none forcing session-only; store paths are relative and contained;
-// secrets and never_share may not overlap content; override commands must
-// specialize a same-entry base command on a known OS.
+// and install are required, and manager is a path-safe identifier;
+// integrity is on-use, on-fetch or none with none forcing session-only;
+// store paths are literal, canonical, relative and contained, and never
+// the store root; lockfiles, inputs and snapshot.installed cannot leave
+// the leaf; env names are POSIX names; secrets and never_share may not
+// overlap content; relocate is a typed package path; override commands
+// must specialize a same-entry base command on a known OS.
 func ValidateDependencyStore(store DependencyStoreView) error {
 	if store.Manager == "" {
 		return fmt.Errorf("%w: manager is required", ErrDependencyStoreInvalid)
 	}
+	if !validManagerID(store.Manager) {
+		// The manager names a directory in the keeper's storage layout
+		// (stores/<scope>/<manager>/...), so it must be one safe segment.
+		return fmt.Errorf("%w: manager %q is not an identifier", ErrDependencyStoreInvalid, store.Manager)
+	}
 	if len(store.Lockfiles) == 0 {
 		return fmt.Errorf("%w: %s lockfiles are required", ErrDependencyStoreInvalid, store.Manager)
 	}
-	for _, lockfile := range store.Lockfiles {
-		if lockfile == "" {
-			return fmt.Errorf("%w: %s has an empty lockfile entry", ErrDependencyStoreInvalid, store.Manager)
+	for _, leafField := range []struct {
+		name     string
+		patterns []string
+	}{
+		{"lockfile", store.Lockfiles},
+		{"input", store.Inputs},
+		{"snapshot.installed", store.Snapshot.Installed},
+	} {
+		for _, p := range leafField.patterns {
+			if err := checkLeafPattern(store.Manager, leafField.name, p); err != nil {
+				return err
+			}
+		}
+	}
+	for _, name := range store.Store.Env {
+		if !validEnvName(name) {
+			return fmt.Errorf("%w: %s store.env %q is not an environment variable name", ErrDependencyStoreInvalid, store.Manager, name)
+		}
+	}
+	for _, env := range []struct {
+		field string
+		vars  map[string]string
+	}{
+		{"import.env", store.ImportEnv},
+		{"proxy.env", store.ProxyEnv},
+	} {
+		for name := range env.vars {
+			if !validEnvName(name) {
+				return fmt.Errorf("%w: %s %s key %q is not an environment variable name", ErrDependencyStoreInvalid, store.Manager, env.field, name)
+			}
+		}
+	}
+	for osKey := range store.Store.Default {
+		if _, ok := dependencyStoreOSKeys[osKey]; !ok {
+			return fmt.Errorf("%w: %s store.default names unknown OS %q", ErrDependencyStoreInvalid, store.Manager, osKey)
 		}
 	}
 	fetch, fetchOK := store.Commands[DependencyStoreCommandFetch]
@@ -244,6 +284,22 @@ func ValidateDependencyStore(store DependencyStoreView) error {
 			return fmt.Errorf("%w: %s has unknown command %q", ErrDependencyStoreInvalid, store.Manager, name)
 		}
 	}
+	// relocate is package-owned by field (D1), never inline shell text: it
+	// must be a typed package path the signed inventory can pin
+	// (ADR-2026-07-10 reference closure), so arguments, absolute paths and
+	// escapes are rejected rather than silently left uninventoried.
+	if relocate, ok := store.Commands[DependencyStoreCommandRelocate]; ok {
+		if err := checkPackagePath(store.Manager, "", relocate); err != nil {
+			return err
+		}
+	}
+	for osKey, overlay := range store.CommandsOverride {
+		if relocate, ok := overlay[DependencyStoreCommandRelocate]; ok {
+			if err := checkPackagePath(store.Manager, osKey, relocate); err != nil {
+				return err
+			}
+		}
+	}
 	for osKey, overlay := range store.CommandsOverride {
 		if _, ok := dependencyStoreOSKeys[osKey]; !ok {
 			return fmt.Errorf("%w: %s has commands for unknown OS %q", ErrDependencyStoreInvalid, store.Manager, osKey)
@@ -285,7 +341,11 @@ func ValidateDependencyStores(stores []DependencyStoreView) error {
 	return nil
 }
 
-// checkStorePath requires a relative, contained, forward-slash store path.
+// checkStorePath requires a relative, contained, forward-slash, canonical
+// store path naming a proper subtree. Store paths are literal: a spelling
+// that cleans to the store root ("./", "a/..") or a glob would make
+// content cover every secrets and never_share path while the overlap check
+// compares strings that never meet.
 func checkStorePath(manager, field, p string) error {
 	if p == "" || p == "." {
 		return fmt.Errorf("%w: %s has an empty %s path", ErrDependencyStoreInvalid, manager, field)
@@ -294,11 +354,90 @@ func checkStorePath(manager, field, p string) error {
 		return fmt.Errorf("%w: %s %s path %q is not relative forward-slash form",
 			ErrDependencyStoreInvalid, manager, field, p)
 	}
+	if strings.ContainsAny(p, "*?[\x00") {
+		return fmt.Errorf("%w: %s %s path %q is not a literal path", ErrDependencyStoreInvalid, manager, field, p)
+	}
 	clean := path.Clean(p)
 	if clean == ".." || strings.HasPrefix(clean, "../") {
 		return fmt.Errorf("%w: %s %s path %q escapes the store", ErrDependencyStoreInvalid, manager, field, p)
 	}
+	if clean != p {
+		return fmt.Errorf("%w: %s %s path %q is not in canonical form", ErrDependencyStoreInvalid, manager, field, p)
+	}
 	return nil
+}
+
+// checkLeafPattern requires a leaf-relative path or glob (lockfiles,
+// inputs, snapshot.installed) that cannot leave the leaf: relative,
+// forward-slash, canonical, and free of "." and ".." segments. These
+// patterns later select files the filler copies out of the leaf and paths
+// retention deletes from it.
+func checkLeafPattern(manager, field, p string) error {
+	if p == "" || p == "." {
+		return fmt.Errorf("%w: %s has an empty %s entry", ErrDependencyStoreInvalid, manager, field)
+	}
+	if path.IsAbs(p) || strings.ContainsAny(p, "\\\x00") || path.Clean(p) != p {
+		return fmt.Errorf("%w: %s %s %q is not a canonical relative forward-slash path",
+			ErrDependencyStoreInvalid, manager, field, p)
+	}
+	for _, segment := range strings.Split(p, "/") {
+		if segment == ".." {
+			return fmt.Errorf("%w: %s %s %q escapes the leaf", ErrDependencyStoreInvalid, manager, field, p)
+		}
+	}
+	return nil
+}
+
+// checkPackagePath requires a package-owned command (relocate) to be a
+// typed package path: one canonical, contained, relative path with no
+// arguments, variables, flags or URLs.
+func checkPackagePath(manager, osKey, p string) error {
+	where := "relocate"
+	if osKey != "" {
+		where = "relocate for OS " + osKey
+	}
+	if p == "" || p == "." || path.IsAbs(p) || path.Clean(p) != p ||
+		strings.ContainsAny(p, " \t\r\n\\\x00$") || strings.HasPrefix(p, "-") || strings.Contains(p, "://") {
+		return fmt.Errorf("%w: %s %s %q must be a package path with no arguments",
+			ErrDependencyStoreInvalid, manager, where, p)
+	}
+	if p == ".." || strings.HasPrefix(p, "../") {
+		return fmt.Errorf("%w: %s %s %q escapes the package", ErrDependencyStoreInvalid, manager, where, p)
+	}
+	return nil
+}
+
+// validManagerID accepts one path-safe identifier segment.
+func validManagerID(manager string) bool {
+	if len(manager) > 64 {
+		return false
+	}
+	for i := 0; i < len(manager); i++ {
+		c := manager[i]
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 && !alnum {
+			return false
+		}
+		if !alnum && c != '.' && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return manager != ""
+}
+
+// validEnvName accepts a POSIX environment variable name.
+func validEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		letter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		if !letter && (i == 0 || c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // storePathsOverlap reports whether two normalized store-relative paths

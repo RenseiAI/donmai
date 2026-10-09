@@ -37,8 +37,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/BurntSushi/toml"
-
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
@@ -1018,7 +1016,7 @@ func loadKitManifestFile(path string) (kitManifestTOML, error) {
 	if err != nil {
 		return m, fmt.Errorf("read manifest: %w", err)
 	}
-	if err := toml.Unmarshal(data, &m); err != nil {
+	if err := tomlUnmarshalKit(data, &m); err != nil {
 		return m, fmt.Errorf("parse manifest: %w", err)
 	}
 	return m, nil

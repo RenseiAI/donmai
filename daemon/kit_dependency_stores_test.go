@@ -313,6 +313,52 @@ func TestKitPackageV2StoreRelocateRequiresInventory(t *testing.T) {
 	if _, err := badRegistry.verifyKitPackage(badRoot, kitPackageDescriptorName, "default/go", "1.0.0", "", nil); !errors.Is(err, ErrKitPackageInvalid) {
 		t.Fatalf("missing relocate error = %v, want ErrKitPackageInvalid", err)
 	}
+
+	// Negative: arguments must not turn a package-owned relocate into
+	// inline shell text that escapes the inventory proof.
+	argsRoot := copyReleasedFixture(t, "go")
+	mustWrite(t, filepath.Join(argsRoot, "bin", "relocate"), relocateBody, 0o755)
+	rewriteFixtureAsV2WithRelocate(t, argsRoot, "bin/missing-relocate --flag")
+	argsRegistry := NewKitRegistry([]string{t.TempDir()})
+	if _, err := argsRegistry.verifyKitPackage(argsRoot, kitPackageDescriptorName, "default/go", "1.0.0", "", nil); !errors.Is(err, ErrKitPackageInvalid) {
+		t.Fatalf("relocate with arguments error = %v, want ErrKitPackageInvalid", err)
+	}
+}
+
+// TestKitRegistry_ScanRejectsUnknownDependencyStoreKeys pins strict
+// decoding of the section: a misspelled secrets or never_share key, or a
+// key from a later revision, rejects the manifest instead of silently
+// dropping the classification it carried.
+func TestKitRegistry_ScanRejectsUnknownDependencyStoreKeys(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ name, from, to string }{
+		{"misspelled secrets", "records_path = true", "records_path = true\nsecret = [\"credentials.toml\"]"},
+		{"camel-case never_share", "records_path = true", "records_path = true\nneverShare = [\"bin\"]"},
+		{"unknown entry key", `version = "pnpm --version"`, "version = \"pnpm --version\"\nlayout_authority = \"v10\""},
+		{"unknown sub-table", "[provide.dependency_store.snapshot]", "[provide.dependency_store.aliases]\nfetch = \"x\"\n\n[provide.dependency_store.snapshot]"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := strings.Replace(dependencyStoreManifestTOML, tc.from, tc.to, 1)
+			if body == dependencyStoreManifestTOML {
+				t.Fatalf("fixture rewrite for %q did not apply", tc.name)
+			}
+			scanDir := t.TempDir()
+			writeV2Kit(t, scanDir, "pnpm", body)
+			if listed := NewKitRegistry([]string{scanDir}).List(); len(listed) != 0 {
+				t.Fatalf("List = %+v, want empty: unknown dependency_store key must reject the manifest", listed)
+			}
+		})
+	}
+	// Control: the unmodified manifest scans, so the rejections above are
+	// the unknown key and nothing else.
+	scanDir := t.TempDir()
+	writeV2Kit(t, scanDir, "pnpm", dependencyStoreManifestTOML)
+	if listed := NewKitRegistry([]string{scanDir}).List(); len(listed) != 1 {
+		t.Fatalf("control List = %d kits, want 1", len(listed))
+	}
 }
 
 // rewriteFixtureAsV2WithRelocate rewrites the copied fixture's kit.toml

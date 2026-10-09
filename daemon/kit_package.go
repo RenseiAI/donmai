@@ -25,6 +25,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/kit"
 )
 
 const (
@@ -483,8 +484,22 @@ func (r *KitRegistry) verifyKitPackage(sourceRoot, descriptorRel, expectedID, ex
 	return out, nil
 }
 
+// tomlUnmarshalKit decodes manifest TOML. Every key is tolerated except
+// inside [[provide.dependency_store]]: that section is new with the v2
+// revision and carries the credential and sharing classification, so a key
+// this binary does not understand (a misspelled secrets or never_share, or
+// a later field) rejects the manifest instead of being silently dropped.
 func tomlUnmarshalKit(data []byte, out *kitManifestTOML) error {
-	return toml.Unmarshal(data, out)
+	meta, err := toml.Decode(string(data), out)
+	if err != nil {
+		return err
+	}
+	for _, key := range meta.Undecoded() {
+		if len(key) > 2 && key[0] == "provide" && key[1] == "dependency_store" {
+			return fmt.Errorf("unknown dependency_store key %q", key.String())
+		}
+	}
+	return nil
 }
 
 func verifyPackageInventory(root *os.Root, descriptor kitPackageDescriptor, limits kitPackageLimits, stageDir string, descriptorBytes, signatureBytes []byte, signatureErr error, fault func(string) error) (map[string][]byte, error) {
@@ -658,35 +673,6 @@ func syncPackageStage(root *os.Root) error {
 	return nil
 }
 
-// packageOwnedCommandRef resolves a dependency-store command to a
-// package-owned payload path when it names one: a relative forward-slash
-// path without whitespace. Manager invocations ("pnpm install ..."),
-// variable references, and absolute paths are inline shell text or system
-// commands, never package paths, and need no inventory proof. The
-// relocate command ("bin/pnpm-relocate") is the motivating case: it
-// must be inventoried so the signed closure covers the bytes the keeper
-// will run.
-func packageOwnedCommandRef(command string) string {
-	command = strings.TrimSpace(command)
-	if command == "" || strings.ContainsAny(command, " \t\n\r") {
-		return ""
-	}
-	if strings.Contains(command, "://") || strings.HasPrefix(command, "$") || strings.HasPrefix(command, "-") {
-		return ""
-	}
-	if path.IsAbs(command) || strings.Contains(command, "\\") {
-		return ""
-	}
-	if command == "." || command == ".." || strings.HasPrefix(command, "../") || strings.HasPrefix(command, "./") {
-		return ""
-	}
-	clean := path.Clean(command)
-	if clean != command {
-		return ""
-	}
-	return command
-}
-
 func validateManifestPackageReferences(manifest kitManifestTOML, descriptor kitPackageDescriptor) error {
 	inventory := make(map[string]struct{}, len(descriptor.Entries))
 	for _, entry := range descriptor.Entries {
@@ -722,18 +708,14 @@ func validateManifestPackageReferences(manifest kitManifestTOML, descriptor kitP
 			}
 		}
 	}
+	// relocate is the one package-owned store command, typed by field
+	// (validation already proved it a clean package path). The other store
+	// commands are inline shell text; no slash heuristic reclassifies them
+	// (ADR-2026-07-10 reference closure).
 	for _, store := range manifest.Provide.DependencyStores {
-		for _, command := range store.Commands {
-			if ref := packageOwnedCommandRef(command); ref != "" {
-				refs = append(refs, ref)
-			}
-		}
+		refs = append(refs, store.Commands[kit.DependencyStoreCommandRelocate])
 		for _, overlay := range store.CommandsOverride {
-			for _, command := range overlay {
-				if ref := packageOwnedCommandRef(command); ref != "" {
-					refs = append(refs, ref)
-				}
-			}
+			refs = append(refs, overlay[kit.DependencyStoreCommandRelocate])
 		}
 	}
 	for _, ref := range refs {

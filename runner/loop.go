@@ -3135,6 +3135,10 @@ func (r *Runner) resolveKitDemand(qw QueuedWork, wpath string, res *Result) *kit
 		demand.Commands = append([]kit.QualifiedCommand(nil), composed.Commands...)
 		demand.CommandBindings = append([]kit.GenericCommandBinding(nil), composed.CommandBindings...)
 		demand.CompositionDigest = composed.CompositionDigest
+		// The dependency-store plan is local authority too: a payload's own
+		// dependency_stores never survive the preflight.
+		demand.DependencyStores = append([]kit.ComposedDependencyStore(nil), composed.DependencyStores...)
+		demand.DependencyStoresDigest = composed.DependencyStoresDigest
 		r.logger.Info("kit toolchain: using platform-supplied lifecycle demand after command composition preflight",
 			"sessionId", qw.SessionID,
 			"os", demand.OS,
