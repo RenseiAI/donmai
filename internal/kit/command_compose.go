@@ -99,6 +99,9 @@ type LockedCommandBinding struct {
 type LockedCompositionTarget struct {
 	Target   CompositionTarget      `json:"target"`
 	Bindings []LockedCommandBinding `json:"bindings"`
+	// Dependencies selects one kit per contested manager. Empty when no
+	// two kits declare the same manager for the target.
+	Dependencies []LockedDependencyBinding `json:"dependencies,omitempty"`
 }
 
 // CompositionLock is the operator-owned canonical command authority record.
@@ -165,6 +168,9 @@ func CanonicalCompositionLock(lock CompositionLock) ([]byte, error) {
 			}
 			return identityKey(x.Selected) < identityKey(y.Selected)
 		})
+		sort.Slice(lock.Targets[i].Dependencies, func(a, b int) bool {
+			return lock.Targets[i].Dependencies[a].Manager < lock.Targets[i].Dependencies[b].Manager
+		})
 	}
 	sort.Slice(lock.Targets, func(i, j int) bool {
 		return targetKey(lock.Targets[i].Target) < targetKey(lock.Targets[j].Target)
@@ -203,6 +209,16 @@ func validateCompositionLock(lock *CompositionLock) error {
 				return fmt.Errorf("%w: duplicate binding for %s", ErrCompositionLockInvalid, binding.Alias)
 			}
 			seenBindings[bindingKey] = struct{}{}
+		}
+		seenDependencies := map[string]struct{}{}
+		for _, binding := range entry.Dependencies {
+			if binding.Manager == "" || binding.SelectedKitID == "" {
+				return fmt.Errorf("%w: malformed dependency binding", ErrCompositionLockInvalid)
+			}
+			if _, ok := seenDependencies[binding.Manager]; ok {
+				return fmt.Errorf("%w: duplicate binding for manager %s", ErrCompositionLockInvalid, binding.Manager)
+			}
+			seenDependencies[binding.Manager] = struct{}{}
 		}
 	}
 	return nil

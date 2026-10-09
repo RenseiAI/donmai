@@ -25,6 +25,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/kit"
 )
 
 const (
@@ -462,8 +463,14 @@ func (r *KitRegistry) verifyKitPackage(sourceRoot, descriptorRel, expectedID, ex
 	if err := tomlUnmarshalKit(manifestBytes, &out.Manifest); err != nil {
 		return out, fmt.Errorf("%w: parse manifest: %v", ErrKitPackageInvalid, err)
 	}
-	if out.Manifest.API != "donmai.dev/v1" && out.Manifest.API != "rensei.dev/v1" {
+	if !kitManifestSupportedAPI(out.Manifest.API) {
 		return out, fmt.Errorf("%w: unsupported manifest api %q", ErrKitPackageInvalid, out.Manifest.API)
+	}
+	if err := validateManifestAPIRevision(out.Manifest); err != nil {
+		return out, fmt.Errorf("%w: %v", ErrKitPackageInvalid, err)
+	}
+	if _, err := dependencyStoreViews(out.Manifest); err != nil {
+		return out, fmt.Errorf("%w: %v", ErrKitPackageInvalid, err)
 	}
 	if out.Manifest.Kit.ID != descriptor.Kit.ID || out.Manifest.Kit.Version != descriptor.Kit.Version {
 		return out, fmt.Errorf("%w: descriptor/manifest identity mismatch", ErrKitPackageInvalid)
@@ -477,8 +484,22 @@ func (r *KitRegistry) verifyKitPackage(sourceRoot, descriptorRel, expectedID, ex
 	return out, nil
 }
 
+// tomlUnmarshalKit decodes manifest TOML. Every key is tolerated except
+// inside [[provide.dependency_store]]: that section is new with the v2
+// revision and carries the credential and sharing classification, so a key
+// this binary does not understand (a misspelled secrets or never_share, or
+// a later field) rejects the manifest instead of being silently dropped.
 func tomlUnmarshalKit(data []byte, out *kitManifestTOML) error {
-	return toml.Unmarshal(data, out)
+	meta, err := toml.Decode(string(data), out)
+	if err != nil {
+		return err
+	}
+	for _, key := range meta.Undecoded() {
+		if len(key) > 2 && key[0] == "provide" && key[1] == "dependency_store" {
+			return fmt.Errorf("unknown dependency_store key %q", key.String())
+		}
+	}
+	return nil
 }
 
 func verifyPackageInventory(root *os.Root, descriptor kitPackageDescriptor, limits kitPackageLimits, stageDir string, descriptorBytes, signatureBytes []byte, signatureErr error, fault func(string) error) (map[string][]byte, error) {
@@ -685,6 +706,16 @@ func validateManifestPackageReferences(manifest kitManifestTOML, descriptor kitP
 			if hook != "" {
 				refs = append(refs, strings.ReplaceAll(hook, "\\", "/"))
 			}
+		}
+	}
+	// relocate is the one package-owned store command, typed by field
+	// (validation already proved it a clean package path). The other store
+	// commands are inline shell text; no slash heuristic reclassifies them
+	// (ADR-2026-07-10 reference closure).
+	for _, store := range manifest.Provide.DependencyStores {
+		refs = append(refs, store.Commands[kit.DependencyStoreCommandRelocate])
+		for _, overlay := range store.CommandsOverride {
+			refs = append(refs, overlay[kit.DependencyStoreCommandRelocate])
 		}
 	}
 	for _, ref := range refs {
