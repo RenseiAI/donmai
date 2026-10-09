@@ -299,6 +299,9 @@ func newLeaseStore(opts StoreOptions, deps leaseStoreDependencies) (*LeaseStore,
 	if err := s.reconcile(); err != nil {
 		return nil, fmt.Errorf("runtime/workarea: reconcile lease authority: %w", err)
 	}
+	if err := s.reconcileStandaloneOutbox(); err != nil {
+		return nil, fmt.Errorf("runtime/workarea: reconcile standalone outbox: %w", err)
+	}
 	return s, nil
 }
 

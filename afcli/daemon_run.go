@@ -419,6 +419,14 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			go leaseManager.RunTerminalResultReplayer(ctx, workarea.TerminalResultReplayOptions{
 				OnError: func(err error) { slog.Warn("terminal status replay failed", "err", err) },
 			}, leaseSender)
+			// The standalone loop drains the records that have no terminal
+			// workarea lease: every terminal status a shim-owned seat
+			// persisted before its first send, plus the
+			// worker_exited_without_result fallback. Same sender — each
+			// record resolves its own receiver key per attempt.
+			go leaseManager.RunStandaloneOutboxReplayer(ctx, workarea.TerminalResultReplayOptions{
+				OnError: func(err error) { slog.Warn("standalone terminal status replay failed", "err", err) },
+			}, leaseSender)
 			go leaseManager.RunTerminalLeaseReaper(ctx, workarea.ReaperOptions{
 				OnError: func(err error) { slog.Warn("terminal lease reaping failed", "err", err) },
 			})

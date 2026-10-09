@@ -439,6 +439,19 @@ type Options struct {
 	// name ("codex" or "claude"); nil disables quota reporting
 	// and leaves every event stream untouched.
 	QuotaReporterForSession func(sessionID, harness string) *QuotaReporter
+
+	// ShimSeat marks this Runner as the worker of a seat launched under
+	// per-session shim ownership. When non-nil the runner persists every
+	// terminal status body in the lease-independent terminal-status
+	// outbox BEFORE the first send — completed, failed, or cancelled,
+	// whether or not a terminal workarea lease was acquired — so a runner
+	// killed after persist but before send has its exact bytes replayed
+	// once by the daemon. Nil (the default) preserves the historical
+	// behaviour: only the lease-bound completed path persists a replayable
+	// body. The production `agent run` command sets this from the shim
+	// launch contract in its own environment; the library itself stays
+	// env-free.
+	ShimSeat *ShimSeatConfig
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -458,6 +471,17 @@ type KitSkillDetector func(repoRoot, targetOS string) ([]kit.KitSkillSource, err
 // the cloned worktree path for workType-filtered injection. Implemented
 // by KitRegistry.PromptFragmentSourcesForRepo.
 type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error)
+
+// ShimSeatConfig identifies one shim-owned seat to the runner: the attempt
+// is the launch contract's monotonic per-session incarnation counter, and it
+// disambiguates repeated runs of the same session in the standalone outbox
+// key. Zero is a valid first attempt; the zero value of the POINTER (nil)
+// is what disables the behaviour.
+type ShimSeatConfig struct {
+	// Attempt is the per-session incarnation counter from the shim launch
+	// contract (sessionshim Launch.ProcessEpoch).
+	Attempt uint64
+}
 
 // DepsExecer runs repository dependency install commands against
 // the acquired worktree. It mirrors kit.Execer so the dependency
@@ -562,6 +586,11 @@ type Runner struct {
 	// loop of the session (main stream, tails, interactive drain).
 	quotaReportersMu sync.Mutex
 	quotaReporters   map[string]*QuotaReporter
+
+	// shimSeat is Options.ShimSeat (see its doc comment). Nil disables
+	// the standalone outbox persist; non-nil persists every terminal
+	// status body before the first send.
+	shimSeat *ShimSeatConfig
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -640,6 +669,7 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
 		quotaReporterForSession:          opts.QuotaReporterForSession,
 		quotaReporters:                   map[string]*QuotaReporter{},
+		shimSeat:                         opts.ShimSeat,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
@@ -851,16 +881,72 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		}
 	}
 
+	// A shim-owned seat persists every terminal status body in the
+	// lease-independent outbox BEFORE the first send — completed, failed, or
+	// cancelled, whether or not a terminal workarea lease was acquired. The
+	// daemon replayer drains exactly these leaseless records, so a runner
+	// killed after this persist but before the send below has its exact
+	// bytes replayed once. A persist failure never changes the seat's
+	// outcome: the send below remains authoritative, and a successful send
+	// needs no replay. The failure is logged so a seat that persistently
+	// cannot persist is visible, but the seat reports what the work did —
+	// unlike the lease path, where a missing hold means the successful
+	// workarea cannot be proved retained and the seat must fail.
+	standalonePrepared := false
+	if r.shimSeat != nil && res.Status != "" {
+		standaloneBody := preparedStatusBody
+		if !leasePrepared {
+			var bodyErr error
+			standaloneBody, bodyErr = r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+			if bodyErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", bodyErr)
+				standaloneBody = nil
+			}
+		}
+		if standaloneBody != nil {
+			standaloneDigest, identityErr := stableTerminalResultID(qw.SessionID, res.Result)
+			if identityErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", identityErr)
+			} else if registerErr := r.wt.RegisterTerminalReceiver(r.poster.ReceiverKey(), r.poster.TerminalStatusEndpoint(qw.SessionID)); registerErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", registerErr)
+			} else if _, saveErr := r.wt.SaveStandaloneTerminalOutbox(context.Background(), workarea.StandaloneOutboxSaveSpec{
+				SessionID: qw.SessionID, Attempt: r.shimSeat.Attempt, TerminalResultID: standaloneDigest,
+				ReceiverKey: r.poster.ReceiverKey(), Body: standaloneBody,
+				DeadlineAt: r.now().Add(workarea.MaximumLeaseDuration).UTC().Truncate(time.Millisecond),
+				Kind:       workarea.StandaloneOutboxTerminal,
+			}); saveErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", saveErr)
+			} else {
+				standalonePrepared = true
+				// The standalone body is the exact bytes the send below
+				// transmits: when a lease already prepared the same body,
+				// reuse it; otherwise send the bytes just persisted so
+				// persist and first send can never disagree.
+				preparedStatusBody = standaloneBody
+			}
+		}
+	}
+
 	// Terminal delivery must outlive run cancellation but remain bounded, including
 	// prepared leased statuses whose immutable outbox body may need replay.
 	postCtx, postCancel := terminalResultPostContext(runCtx)
 	var postOutcome result.PostOutcome
-	if leasePrepared {
+	if leasePrepared || standalonePrepared {
 		postOutcome = r.poster.PostPreparedOutcome(postCtx, qw.SessionID, res.Result, preparedStatusBody)
 	} else {
 		postOutcome = r.poster.PostWithOptionsOutcome(postCtx, qw.SessionID, res.Result, result.PostOptions{})
 	}
 	postCancel()
+	if standalonePrepared && postOutcome.StatusObserved() {
+		if observeErr := r.wt.MarkStandaloneTerminalOutboxDelivered(context.Background(), qw.SessionID, r.shimSeat.Attempt); observeErr != nil {
+			r.logger.Warn("terminal status delivery persistence failed; restart replay remains armed",
+				"sessionId", qw.SessionID, "err", observeErr)
+		}
+	}
 	if leasePrepared && postOutcome.StatusObserved() {
 		if _, observeErr := r.wt.MarkTerminalStatusDelivered(context.Background(), leaseProjection.LeaseID, qw.SessionID, terminalResultID, leaseProjection.WorkareaID); observeErr != nil {
 			r.logger.Warn("terminal status delivery persistence failed; restart replay remains armed",

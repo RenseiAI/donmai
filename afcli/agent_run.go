@@ -102,6 +102,18 @@ var buildRegistryForAgentRun = func(logger *slog.Logger, hints agentRunCtorHints
 	return buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
 }
 
+// shimSeatFromEnv reports this worker's shim-owned seat, or nil when this
+// process was not launched under the per-session shim launch contract. It is
+// a var so tests can drive the shim-owned runner path without mutating the
+// process environment.
+var shimSeatFromEnv = func() *runner.ShimSeatConfig {
+	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
+	if err != nil {
+		return nil
+	}
+	return &runner.ShimSeatConfig{Attempt: launch.ProcessEpoch}
+}
+
 // gatewayHarnessIdentity projects the canonical loop-driver identity already
 // fixed by successful explicit admission. Absent-harness work has no preflight
 // admission, so it projects the legacy provider through the generated matrix
@@ -571,6 +583,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// each other and with the daemon's preflight compiler (see
 		// runner.ReconcileAdditionalExtensions).
 		AdditionalExtensionDecorator: opts.specDecorator,
+		// A seat launched under per-session shim ownership persists every
+		// terminal status body in the standalone outbox before the first
+		// send, so a runner killed after persist but before send has its
+		// exact bytes replayed once by the daemon. Detection mirrors the
+		// harness's own launch-contract read: the contract in this
+		// process's environment is what makes this seat shim-owned, and
+		// its monotonic process epoch is the outbox attempt. Absent the
+		// contract this stays nil and the runner behaves exactly as before.
+		ShimSeat: shimSeatFromEnv(),
 		// Runtime memory-inject (v2) needs NO worker config: the runner always
 		// wires the inject handler when the provider supports injection, and the
 		// PLATFORM decides per-session whether to deliver (per-project memory
