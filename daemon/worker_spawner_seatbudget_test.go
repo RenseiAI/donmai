@@ -564,6 +564,43 @@ func TestReadShimSeatReportNeverReadsCurrentConfig(t *testing.T) {
 	}
 }
 
+// TestReadShimSeatReportReadsOnlyItsOwnScope pins the read-back to the scope
+// the launch identity names. A launch record is written only by the launching
+// daemon and always names the scope derived from (identity, epoch); a record
+// that names any other unit — even a well-formed seat scope that passes the
+// shape check, such as a different seat's — is corrupt, and querying that unit
+// would attribute another seat's limits to this one. The read-back must query
+// only the derived scope and must not report the record's facts.
+func TestReadShimSeatReportReadsOnlyItsOwnScope(t *testing.T) {
+	d, registry := newSeatReportDaemon(t, noLiveScope)
+	id := sessionshim.Identity{OrgID: "o", SessionID: "own-seat"}
+	own := seatBudgetShimScopeName(id.OrgID, id.SessionID, 1)
+	foreign := seatBudgetShimScopeName("o", "other-seat", 1)
+	if !seatbudget.ValidScopeName(foreign) {
+		t.Fatalf("fixture scope %q must pass the shape check, or this test proves nothing", foreign)
+	}
+	if err := registry.PutSeatLaunch(sessionshim.NewSeatLaunch(id, 1, foreign, sessionshim.SeatModeEnforced, 16, 65536, 0, time.Now())); err != nil {
+		t.Fatalf("PutSeatLaunch: %v", err)
+	}
+	var queried []string
+	d.shimScope.readLimits = func(scope string, _ bool) (seatbudget.SeatLimits, bool) {
+		queried = append(queried, scope)
+		if scope == foreign {
+			return seatbudget.SeatLimits{CPUs: 16, MemoryMB: 65536}, true
+		}
+		return seatbudget.SeatLimits{}, false
+	}
+	rep := d.readShimSeatReport(registry, id, 1)
+	for _, scope := range queried {
+		if scope != own {
+			t.Errorf("read-back queried %q; only the launch identity's own scope %q may reach systemctl", scope, own)
+		}
+	}
+	if rep.CPUs == 16 || rep.MemoryMB == 65536 || strings.Contains(rep.Detail, foreign) {
+		t.Errorf("report = %+v; it carries the foreign scope's or the corrupt record's facts", rep)
+	}
+}
+
 // TestResolveSeatBudget_SingleSeatKeepsHost pins the throughput rule at the
 // daemon boundary: a lone seat is never throttled by defaults. A zero
 // authored block means budgeting is off (CPUs 0, disabled) — the daemon

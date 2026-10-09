@@ -368,13 +368,27 @@ func (d *Daemon) shimSeatReport(registry *sessionshim.Registry, key shimSeatRepo
 // launch record (a seat launched before records existed, or a registry that
 // cannot be read) the scope name is still derived from the launch identity,
 // so a seat this release launched reads back even if its record was lost.
+//
+// The only scope ever read is the one the launch identity names. The launching
+// daemon always records exactly that scope, so a record naming any other unit
+// is corrupt: it is set aside, never followed, because a well-formed name of a
+// different seat's scope would attribute that seat's limits to this one.
 func (d *Daemon) readShimSeatReport(registry *sessionshim.Registry, id sessionshim.Identity, epoch uint64) *SessionSeatBudget {
+	derived := ""
+	if id.Validate() == nil {
+		derived = seatBudgetShimScopeName(id.OrgID, id.SessionID, epoch)
+	}
 	var seat seatbudget.LaunchedSeat
 	if registry != nil {
 		rec, found, err := registry.SeatLaunch(id, epoch)
 		if err != nil {
 			slog.Warn("session shim: seat launch record unreadable; reporting from the live scope only",
 				"session", id.String(), "error", err)
+		}
+		if found && rec.Scope != "" && rec.Scope != derived {
+			slog.Warn("session shim: seat launch record names a scope its launch identity does not; reporting from the live scope only",
+				"session", id.String(), "recorded_scope", rec.Scope, "scope", derived)
+			found = false
 		}
 		if found {
 			seat = seatbudget.LaunchedSeat{
@@ -387,8 +401,8 @@ func (d *Daemon) readShimSeatReport(registry *sessionshim.Registry, id sessionsh
 		}
 	}
 	scope := seat.Scope
-	if scope == "" && seat.Mode == "" && id.Validate() == nil {
-		scope = seatBudgetShimScopeName(id.OrgID, id.SessionID, epoch)
+	if scope == "" && seat.Mode == "" {
+		scope = derived
 	}
 	var live seatbudget.SeatLimits
 	liveOK := false
