@@ -483,6 +483,62 @@ func TestLocalReceiverAcceptsShippedRuntimeEmitters(t *testing.T) {
 	}
 }
 
+// TestLocalUsageAcceptsAttemptCredentialAndMerges proves a local
+// worker's streamed quota update reaches the daemon's quota cache
+// with the credential it legitimately holds: its attempt credential
+// for its own session. No credential, the operator credential, or
+// another session's attempt credential is refused before any merge;
+// an unknown session id is refused too, so the route never confirms
+// or denies a session the caller cannot name. The merged rows land
+// in the quota snapshot the heartbeat reads, and no response carries
+// credential bytes.
+func TestLocalUsageAcceptsAttemptCredentialAndMerges(t *testing.T) {
+	t.Parallel()
+	f := startLocalHTTPFixture(t)
+	first := f.admit(t, 21)
+	second := f.admit(t, 22)
+	token := f.claim(t, first.Session)
+	other := f.claim(t, second.Session)
+
+	path := "/api/daemon/sessions/" + first.Session.SessionID + "/usage"
+	update := []byte(`{"harness":"claude","update":{"checkedAt":"2026-10-06T12:00:00Z",` +
+		`"windows":[{"id":"five_hour","kind":"session","label":"Session","usedPercent":33}]}}`)
+	for _, bad := range []string{"", f.operator, other} {
+		if code, _ := f.request(t, http.MethodPost, path, bad, update); code != http.StatusUnauthorized {
+			t.Fatalf("wrong usage credential=%d, want 401", code)
+		}
+	}
+	if code, _ := f.request(t, http.MethodPost, "/api/daemon/sessions/sess-missing/usage", token, update); code != http.StatusUnauthorized {
+		t.Fatalf("unknown session usage=%d, want 401", code)
+	}
+	// The refused POSTs merged nothing: no quota state exists yet.
+	if snapshot := f.d.quotaSnapshot(); len(snapshot) != 0 {
+		t.Fatalf("refused updates merged: snapshot = %+v", snapshot)
+	}
+
+	code, raw := f.request(t, http.MethodPost, path, token, update)
+	if code != http.StatusOK {
+		t.Fatalf("own-attempt usage=%d, want 200: %s", code, raw)
+	}
+	if bytes.Contains(raw, []byte(token)) {
+		t.Fatal("usage response carries credential bytes")
+	}
+
+	snapshot := f.d.quotaSnapshot()
+	if len(snapshot) != 1 || snapshot[0].Provider != agent.UsageHarnessClaude {
+		t.Fatalf("snapshot = %+v, want the one updated claude account", snapshot)
+	}
+	found := false
+	for _, w := range snapshot[0].Limits.Windows {
+		if w.ID == "five_hour" && w.UsedPercent == 33 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("windows = %+v, want the streamed five_hour row at 33", snapshot[0].Limits.Windows)
+	}
+}
+
 func basePath(id, route string) string {
 	return localRuntimePrefix + "/api/sessions/" + id + "/" + route
 }

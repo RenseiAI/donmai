@@ -6,6 +6,7 @@ import (
 	"io"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,10 +123,27 @@ func TestModelRouting_BoundEndpoint(t *testing.T) {
 			wantVendorVar: "OPENROUTER_API_KEY",
 		},
 		{
+			name:  "promoted openrouter pin routes natively on a non-catalog path (aggregators stay host-based)",
+			model: "openrouter/anthropic/claude-sonnet-4.6", baseURL: "https://openrouter.ai/api/v2",
+			wantArgs: []string{"--provider", "openrouter", "--model", "anthropic/claude-sonnet-4.6"}, wantPinModel: "anthropic/claude-sonnet-4.6",
+			wantVendorVar: "OPENROUTER_API_KEY",
+		},
+		{
 			name:  "direct vendor on its own host routes natively (unchanged)",
 			model: "zai/glm-5.3", baseURL: "https://api.z.ai/api/coding/paas/v4",
 			wantArgs: []string{"--provider", "zai", "--model", "glm-5.3"}, wantPinModel: "glm-5.3",
 			wantVendorVar: "ZAI_API_KEY",
+		},
+		{
+			name:  "direct vendor on the same host with a different path stays injected",
+			model: "zai/glm-5.3", baseURL: "https://api.z.ai/api/paas/v4",
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "glm-5.3"}, wantPinModel: "glm-5.3",
+		},
+		{
+			name:  "gateway binding on a non-v1 path still promotes to the native lane after the catalog confirms the slug",
+			model: "vercel-ai-gateway/" + aggregatorGatewayModel, baseURL: "https://ai-gateway.vercel.sh/v2",
+			wantArgs: []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel}, wantPinModel: aggregatorGatewayModel,
+			wantVendorVar: "AI_GATEWAY_API_KEY",
 		},
 		{
 			name:  "vendor-prefixed model on an unknown https proxy stays injected",
@@ -351,4 +369,113 @@ func TestSpawn_AggregatorEndpoint_Native(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = h.Stop(context.Background()) })
 	drain(t, h)
+}
+
+// TestSpawn_AggregatorEndpoint_ResponsesBindingStaysInjected pins that a
+// gateway binding on the Responses protocol keeps it. pi's catalog lists the
+// slug in every case, so a promotion that consulted it would route natively
+// through pi's own aggregator provider, which speaks the protocol its catalog
+// lists (Anthropic Messages on the Vercel AI Gateway) — where the gateway
+// does not prompt-cache "meta/" models. Bound to Responses, the session stays
+// on the injected provider over openai-responses, the protocol on which pi
+// sends its session id as prompt_cache_key; no catalog probe runs and no
+// aggregator credential is mirrored. A Chat Completions binding, the control
+// plane's default, keeps today's native promotion.
+func TestSpawn_AggregatorEndpoint_ResponsesBindingStaysInjected(t *testing.T) {
+	t.Parallel()
+	const metaSlug = "meta/muse-spark-1.3-contributor"
+	listing := func(slug string) string {
+		return "provider           model                            context  max-out  thinking  images\n" +
+			"vercel-ai-gateway  " + slug + "  1M       1M       yes       yes   \n"
+	}
+	cases := []struct {
+		name       string
+		model      string
+		protocol   agent.WireProtocol
+		wantProbe  bool
+		wantArgs   []string
+		wantPinAPI string // "" = the injected provider is not selected
+	}{
+		{
+			name: "meta slug bound to responses stays injected over responses", model: metaSlug,
+			protocol:   agent.ProtoOpenAIResponses,
+			wantArgs:   []string{"--provider", pinnedProviderName, "--model", metaSlug},
+			wantPinAPI: "openai-responses",
+		},
+		{
+			name: "any slug bound to responses stays injected over responses", model: aggregatorGatewayModel,
+			protocol:   agent.ProtoOpenAIResponses,
+			wantArgs:   []string{"--provider", pinnedProviderName, "--model", aggregatorGatewayModel},
+			wantPinAPI: "openai-responses",
+		},
+		{
+			name: "meta slug bound to chat completions keeps the native promotion", model: metaSlug,
+			protocol:  agent.ProtoOpenAIChat,
+			wantProbe: true,
+			wantArgs:  []string{"--provider", "vercel-ai-gateway", "--model", metaSlug},
+		},
+		{
+			name: "non-meta slug bound to chat completions keeps the native promotion", model: aggregatorGatewayModel,
+			protocol:  agent.ProtoOpenAIChat,
+			wantProbe: true,
+			wantArgs:  []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			probed := false
+			p := &Provider{binary: "pi", opts: Options{
+				CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+					probed = true
+					return listing(tc.model), nil
+				},
+			}}
+			ep := aggregatorGatewayBinding()
+			ep.Model = tc.model
+			ep.ModelAuthor, _, _ = strings.Cut(tc.model, "/")
+			ep.Protocol = tc.protocol
+			spec, err := p.prepare(context.Background(), agent.Spec{
+				Prompt:   "hi",
+				Cwd:      t.TempDir(),
+				Model:    tc.model,
+				Env:      map[string]string{PiKeyEnvVar: "gw-key"},
+				Endpoint: ep,
+			})
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			if probed != tc.wantProbe {
+				t.Errorf("catalog probe ran = %v; want %v", probed, tc.wantProbe)
+			}
+			if args := modelPinArgs(spec); !reflect.DeepEqual(args, tc.wantArgs) {
+				t.Errorf("modelPinArgs = %q; want %q", args, tc.wantArgs)
+			}
+			if got := injectedProviderSelected(spec); got != (tc.wantPinAPI != "") {
+				t.Errorf("injectedProviderSelected = %v; want %v", got, tc.wantPinAPI != "")
+			}
+			if tc.wantPinAPI == "" {
+				if spec.Env["AI_GATEWAY_API_KEY"] != "gw-key" {
+					t.Errorf("AI_GATEWAY_API_KEY = %q; want the cell key mirrored for the native route", spec.Env["AI_GATEWAY_API_KEY"])
+				}
+				return
+			}
+			env := providerPinEnv(spec)
+			for _, want := range []string{
+				piAPIEnvVar + "=" + tc.wantPinAPI,
+				piModelEnvVar + "=" + tc.model,
+				piBaseURLEnvVar + "=" + aggregatorGatewayBaseURL,
+			} {
+				if !slices.Contains(env, want) {
+					t.Errorf("providerPinEnv = %v; want it to contain %q", env, want)
+				}
+			}
+			if spec.Env["AI_GATEWAY_API_KEY"] != "" {
+				t.Errorf("AI_GATEWAY_API_KEY = %q; want unset: the native aggregator route must not get a credential mirror", spec.Env["AI_GATEWAY_API_KEY"])
+			}
+			if err := requireOutputLimit(spec); err != nil {
+				t.Errorf("requireOutputLimit = %v; the Responses protocol needs no output limit", err)
+			}
+		})
+	}
 }

@@ -12,7 +12,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // NOT anthropic-messages — so there is no opencode×anthropic cell; the
 // north-star opencode×google cell rides Google's local /v1 (openai-chat) host.
 func (*Provider) Manifest() agent.HarnessManifest {
-	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
+	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventSubagent, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
 		Name:              agent.HarnessOpenCode,
 		HumanLabel:        "OpenCode",
@@ -25,7 +25,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SupportsToolPlugins:      false, // OpenCode plugins are independent of MCP config acceptance.
 			AcceptsMcpServerSpec:     true,  // provider-owned per-session config; see config.go projectMCP.
 			AcceptsAllowedToolsList:  true,  // owned opencode.json permission map (07 §5.2)
-			EmitsSubagentEvents:      false,
+			EmitsSubagentEvents:      true,
 			SetsParentToolUseID:      false, // this adapter cannot know the parent delegation id; the field stays empty by contract
 			SupportsReasoningEffort:  true,
 			SupportsOneShot:          true,

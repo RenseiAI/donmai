@@ -78,12 +78,41 @@ func EnsureGitExcluded(dir string, entries ...string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("harnessstate: read git exclude file %s: %w", excludePath, err)
 	}
+	appendix := ExcludeAppendix(existing, entries...)
+	if len(appendix) == 0 {
+		return nil
+	}
 
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil { //nolint:gosec // G301: git's own info/ directory, created with the permissions git itself uses.
+		return fmt.Errorf("harnessstate: create git exclude directory: %w", err)
+	}
+	f, err := os.OpenFile(excludePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644) //nolint:gosec // G302/G304: a git metadata file, world-readable exactly as git writes it.
+	if err != nil {
+		return fmt.Errorf("harnessstate: open git exclude file %s: %w", excludePath, err)
+	}
+	if _, err := f.Write(appendix); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("harnessstate: write git exclude file %s: %w", excludePath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("harnessstate: close git exclude file %s: %w", excludePath, err)
+	}
+	return nil
+}
+
+// ExcludeAppendix returns the bytes to append to an exclude file whose
+// current content is existing so that every entry is present: the header
+// when it is missing, each missing entry on its own line, and a leading
+// newline when existing does not end in one (so the first entry is not glued
+// onto the file's last line). It returns nil when nothing is missing. It is
+// the content half of EnsureGitExcluded, shared with callers that must open
+// the exclude file themselves (for example through a directory handle that
+// refuses symbolic links).
+func ExcludeAppendix(existing []byte, entries ...string) []byte {
 	present := make(map[string]bool)
 	for _, line := range strings.Split(string(existing), "\n") {
 		present[strings.TrimSpace(line)] = true
 	}
-
 	var pending bytes.Buffer
 	if !present[gitExcludeHeader] {
 		pending.WriteString(gitExcludeHeader + "\n")
@@ -101,29 +130,12 @@ func EnsureGitExcluded(dir string, entries ...string) error {
 	if !wrote {
 		return nil
 	}
-
-	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil { //nolint:gosec // G301: git's own info/ directory, created with the permissions git itself uses.
-		return fmt.Errorf("harnessstate: create git exclude directory: %w", err)
-	}
-	f, err := os.OpenFile(excludePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644) //nolint:gosec // G302/G304: a git metadata file, world-readable exactly as git writes it.
-	if err != nil {
-		return fmt.Errorf("harnessstate: open git exclude file %s: %w", excludePath, err)
-	}
-	// A pre-existing file that does not end in a newline would otherwise get
-	// our first entry glued onto its last line.
 	var out bytes.Buffer
 	if len(existing) > 0 && !bytes.HasSuffix(existing, []byte("\n")) {
 		out.WriteString("\n")
 	}
 	out.Write(pending.Bytes())
-	if _, err := f.Write(out.Bytes()); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("harnessstate: write git exclude file %s: %w", excludePath, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("harnessstate: close git exclude file %s: %w", excludePath, err)
-	}
-	return nil
+	return out.Bytes()
 }
 
 // InfoExcludePath asks git where dir's exclude file lives. `rev-parse

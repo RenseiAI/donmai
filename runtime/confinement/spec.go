@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -29,7 +30,10 @@ var reservedEnv = map[string]bool{"TMPDIR": true, "TMP": true, "TEMP": true}
 
 // resolveSpec validates spec and returns it in canonical spelling. Every
 // refusal is writable_set_unrepresentable: the set cannot be confined as
-// declared, and it is never widened or narrowed to make it fit.
+// declared, and it is never widened or narrowed to make it fit. The
+// daemon-private paths and directories are canonicalized loosely (they may
+// not exist yet), so a token minted after the seat starts is still covered;
+// a session path they would narrow is refused (checkDaemonPrivateOverlap).
 func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*Resolved, error) {
 	if strings.TrimSpace(spec.SessionID) == "" || strings.TrimSpace(spec.HarnessID) == "" {
 		return nil, refuse(ReasonWritableSetUnrepresentable, "session id and harness id are required")
@@ -70,8 +74,13 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 	resolved := &Resolved{
 		SessionID:    spec.SessionID,
 		HarnessID:    spec.HarnessID,
+		SessionMode:  spec.SessionMode,
 		WorkareaRoot: root,
 		MetadataDir:  filepath.Join(root, workarea.DeclarationDirName),
+		// The host directories ride the resolved set so the backend can
+		// bind them read-only for metadata readability.
+		Home:      g.home,
+		StateHome: g.stateHome,
 	}
 	var writablePaths []string
 	for _, entry := range writableDecl {
@@ -92,6 +101,7 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 	allDeclared = append(allDeclared, spec.ReadOnlyLeaves...)
 	allDeclared = append(allDeclared, spec.Protected...)
 	allDeclared = append(allDeclared, spec.Sockets...)
+	allDeclared = append(allDeclared, spec.ReadPaths...)
 	for _, path := range allDeclared {
 		if err := checkLinkPlants(path, writablePaths, canonical); err != nil {
 			return nil, err
@@ -116,6 +126,30 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		}
 		resolved.Protected = append(resolved.Protected, path)
 	}
+	if resolved.Denied, err = resolveDaemonPrivate(spec.DeniedPaths, "daemon-private path", canonical); err != nil {
+		return nil, err
+	}
+	if resolved.DeniedListings, err = resolveDaemonPrivate(spec.DeniedListings, "daemon-private directory", canonical); err != nil {
+		return nil, err
+	}
+	// The workarea root is the session's own: a daemon-private path over
+	// it would hide the session from itself, and a listing deny on it
+	// would refuse the seat its own root.
+	for _, denied := range resolved.Denied {
+		if insideOrEqual(root, denied) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "the workarea root lies inside a daemon-private path")
+		}
+	}
+	for _, listing := range resolved.DeniedListings {
+		if strings.EqualFold(root, listing) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "the workarea root is a daemon-private directory")
+		}
+	}
+	for _, leaf := range resolved.ReadOnly {
+		if err := checkDaemonPrivateOverlap(leaf, "read-only leaf", false, resolved); err != nil {
+			return nil, err
+		}
+	}
 	for _, socket := range spec.Sockets {
 		if !filepath.IsAbs(socket) {
 			return nil, refuse(ReasonWritableSetUnrepresentable, "declared socket must be an absolute path")
@@ -129,6 +163,15 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		}
 		resolved.Sockets = append(resolved.Sockets, path)
 	}
+	seenPorts := map[int]bool{}
+	for _, port := range spec.LoopbackTCPPorts {
+		if port < 1 || port > 65535 || seenPorts[port] {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "declared loopback TCP port %d is invalid or repeated", port)
+		}
+		seenPorts[port] = true
+		resolved.LoopbackTCPPorts = append(resolved.LoopbackTCPPorts, port)
+	}
+	sort.Ints(resolved.LoopbackTCPPorts)
 
 	type guardPath struct{ name, path string }
 	var guardPaths []guardPath
@@ -160,6 +203,12 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 				return nil, refuse(ReasonWritableSetUnrepresentable, "%s covers the %s", entry.Class, guard.name)
 			}
 		}
+		// A daemon-private path nested inside the writable set stays
+		// denied (and pinned below); a writable root inside one, or equal
+		// to a daemon-private directory, is refused.
+		if err := checkDaemonPrivateOverlap(entry.Path, string(entry.Class), false, resolved); err != nil {
+			return nil, err
+		}
 		if entry.Class == ClassMutableLeaf {
 			if !strictlyInside(entry.Path, root) {
 				return nil, refuse(ReasonWritableSetUnrepresentable, "mutable leaf %q is not inside the workarea root", filepath.Base(entry.Path))
@@ -177,6 +226,45 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 			return nil, refuse(ReasonWritableSetUnrepresentable, "%s lies inside the workarea metadata", entry.Class)
 		}
 	}
+
+	scope, err := resolveReadScope(spec.ReadScope)
+	if err != nil {
+		return nil, err
+	}
+	resolved.ReadScope = scope
+	if scope == "" && len(spec.ReadPaths) > 0 {
+		return nil, refuse(ReasonWritableSetUnrepresentable, "read paths are declared without a read scope")
+	}
+	seenRead := map[string]bool{}
+	for _, raw := range spec.ReadPaths {
+		if raw == "" || !filepath.IsAbs(raw) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a read path must be an absolute path")
+		}
+		path, err := canonicalLoose(raw, canonical)
+		if err != nil {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "read path: %v", errnoText(err))
+		}
+		if path == string(filepath.Separator) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a read path is the filesystem root")
+		}
+		for _, guard := range guardPaths {
+			if insideOrEqual(guard.path, path) {
+				return nil, refuse(ReasonWritableSetUnrepresentable, "a read path covers the %s", guard.name)
+			}
+		}
+		// A declared read path never overlaps a daemon-private path or
+		// directory: the denies render after the allowlist and would
+		// narrow it silently, so the declaration is refused instead.
+		if err := checkDaemonPrivateOverlap(path, "a read path", true, resolved); err != nil {
+			return nil, err
+		}
+		if !seenRead[path] {
+			seenRead[path] = true
+			resolved.ReadPaths = append(resolved.ReadPaths, path)
+		}
+	}
+	sort.Strings(resolved.ReadPaths)
+
 	if err := checkHardLinks(writablePaths); err != nil {
 		return nil, err
 	}
@@ -186,6 +274,8 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		resolved.Caches = append(resolved.Caches, Cache{Env: cache.Env, Dir: resolved.Writable[len(spec.MutableLeaves)+len(spec.HarnessState)+1+i].Path})
 	}
 	denied := append(append(append([]string{}, resolved.ReadOnly...), resolved.Protected...), resolved.MetadataDir)
+	denied = append(denied, resolved.Denied...)
+	denied = append(denied, resolved.DeniedListings...)
 	resolved.Pins = ancestorPins(writablePaths, denied)
 	sort.SliceStable(resolved.Writable, func(i, j int) bool {
 		if classOrder[resolved.Writable[i].Class] != classOrder[resolved.Writable[j].Class] {
@@ -194,6 +284,77 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		return resolved.Writable[i].Path < resolved.Writable[j].Path
 	})
 	return resolved, nil
+}
+
+// resolveReadScope normalizes a requested fileRead level: open reads resolve
+// to empty, workarea to itself. home-minus-secrets and anything unknown are
+// refused, never rendered as a different level.
+func resolveReadScope(level agent.ExecutionSecurityLevel) (agent.ExecutionSecurityLevel, error) {
+	switch level {
+	case "", agent.FileReadHost:
+		return "", nil
+	case agent.FileReadWorkarea:
+		return agent.FileReadWorkarea, nil
+	case agent.FileReadHomeMinusSecrets:
+		return "", refuse(ReasonWritableSetUnrepresentable, "read scope %s is not implemented by this boundary", level)
+	default:
+		return "", refuse(ReasonWritableSetUnrepresentable, "unknown read scope %q", level)
+	}
+}
+
+// resolveDaemonPrivate resolves daemon-private paths (what names the kind in
+// refusals) loosely, sorted and without repeats. Loose: a secret may be
+// minted after the seat starts, and its directory may not exist yet either.
+// The longest existing ancestor is canonicalized and the rest appended, so a
+// path minted later is denied in the same spelling the backend renders.
+// Raw paths never reach a refusal detail.
+func resolveDaemonPrivate(raws []string, what string, canonical func(string) (string, error)) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range raws {
+		if raw == "" || !filepath.IsAbs(raw) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a %s must be an absolute path", what)
+		}
+		path, err := canonicalLoose(raw, canonical)
+		if err != nil {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "%s: %v", what, errnoText(err))
+		}
+		if path == string(filepath.Separator) {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "a %s is the filesystem root", what)
+		}
+		if !seen[path] {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// checkDaemonPrivateOverlap refuses a session path (what names it) that the
+// daemon-private denies would narrow: one inside or equal to a
+// daemon-private path, which is hidden outright, or equal to a
+// daemon-private directory, whose listing is refused. With covering set it
+// also refuses a path that covers either, the rule for a declared read
+// path, which must never read as re-opening one.
+func checkDaemonPrivateOverlap(path, what string, covering bool, r *Resolved) error {
+	for _, denied := range r.Denied {
+		if insideOrEqual(path, denied) {
+			return refuse(ReasonWritableSetUnrepresentable, "%s lies inside a daemon-private path", what)
+		}
+		if covering && insideOrEqual(denied, path) {
+			return refuse(ReasonWritableSetUnrepresentable, "%s covers a daemon-private path", what)
+		}
+	}
+	for _, listing := range r.DeniedListings {
+		if strings.EqualFold(filepath.Clean(path), filepath.Clean(listing)) {
+			return refuse(ReasonWritableSetUnrepresentable, "%s is a daemon-private directory", what)
+		}
+		if covering && insideOrEqual(listing, path) {
+			return refuse(ReasonWritableSetUnrepresentable, "%s covers a daemon-private directory", what)
+		}
+	}
+	return nil
 }
 
 // resolveDir resolves an existing directory. When noLink is set the last

@@ -92,6 +92,20 @@ type Options struct {
 	// included); a same-user, unsandboxed session can still read the token
 	// file itself.
 	ControlToken string
+	// ControlTokenPath is the resolved control-token file path the daemon
+	// minted ControlToken into: the explicit file-env override when
+	// absolute, else the host state home. The production entry point
+	// resolves it the same way the operator CLI does and states here the
+	// file the kernel resolves that path to (symbolic links and ".."
+	// walked in order, never a lexical clean, which can name a different
+	// file) so accept-time session details can carry it to the spawned worker,
+	// whose seat confinement denies it outright. Empty (tests, embedders
+	// that never set it) states nothing — the worker falls back to its
+	// own environment resolution. The path is host topology, not a
+	// credential: it is cleared from redacted detail reads like the
+	// other host-path fields, and it never reaches a spawned session's
+	// environment.
+	ControlTokenPath string
 	// RequireControlToken arms the mutating-route gate unconditionally.
 	// With it set, an empty ControlToken (the token could not be minted
 	// or read) makes every mutating control route refuse with 503 instead
@@ -148,6 +162,19 @@ type Options struct {
 	// a test — including every test that predates this field and never
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
+
+	// QuotaProbeBinaries names the harness CLIs the live quota probes
+	// shell out to, keyed by harness ("codex", "claude" — see
+	// agent.UsageHarnessCodex / agent.UsageHarnessClaude). Empty (the
+	// default every Start call gets unless a caller sets this field)
+	// disables that harness's probe: the quota cache then moves only
+	// on worker-reported stream updates. Only the production entry
+	// point (afcli/daemon_run.go) sets this, resolved from PATH, so
+	// a daemon built for real operator use probes its host logins
+	// while a daemon built for a test — including every test that
+	// predates this field and never mentions it — never shells out
+	// to a real harness login.
+	QuotaProbeBinaries map[string]string
 
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
@@ -485,6 +512,19 @@ type Daemon struct {
 	poller    *PollService
 	spawner   *WorkerSpawner
 
+	// quota is the subscription quota-snapshot cache behind the
+	// heartbeat quota field: one entry per signed-in account. Probes
+	// fire at most every 5 minutes per provider; failed probes keep
+	// the last good windows.
+	quota *quotaState
+
+	// quotaPoller runs the live quota probes that fill the cache
+	// above: one codex `account/rateLimits/read` and one claude usage
+	// read per probe interval, plus the worker-reported stream
+	// updates the usage route folds in. Nil until Start wires it;
+	// stopped by Stop.
+	quotaPoller *quotaPoller
+
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
 	// session composition that lands after startup re-declares this daemon's
@@ -502,6 +542,15 @@ type Daemon struct {
 	// it holds. Non-nil from New onward so every accessor is lock-safe without a
 	// nil dance at each call site.
 	shims *sessionShimState
+
+	// shimScope is the host facts the shim launch gate and the seat read-back
+	// consult. The zero value is production (see shimScopeProbe); tests set it
+	// on their own daemon instead of a package variable, so parallel suites
+	// never race on it.
+	shimScope shimScopeProbe
+	// shimSeatReports caches each adopted or quarantined seat's report, read
+	// once per launch incarnation (see shimSeatReport).
+	shimSeatReports shimSeatReportCache
 
 	// gateway is the translating-gateway loopback host, started in Start when
 	// Options.EnableGateway is set and torn down in Stop. Nil when disabled.
@@ -629,6 +678,7 @@ func New(opts Options) *Daemon {
 		sessionDetails:   newSessionDetailStore(),
 		routingTraces:    NewRoutingTraceStore(DefaultRoutingRingBufferSize),
 		shims:            newSessionShimState(),
+		quota:            &quotaState{},
 	}
 	d.shimIdentityRef.Store(newSessionShimIdentity(&d.opts.SessionShim, opts.SessionShimStandDown))
 	if opts.RulesetSnapshot != nil {
@@ -826,6 +876,13 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
 	if d.sessionShimEnabled() {
+		// A first-heartbeat fence for a scope this daemon holds no authority
+		// for is an orphan: the acknowledgement edge that would clear it
+		// matches a retained receipt, so nothing left can reopen it, while the
+		// host-wide gate stays closed for every scope. Reconcile it here — at
+		// the admission seam itself — rather than trusting every path that
+		// drops a receipt to also drop its fence.
+		d.clearOrphanedSessionShimHeartbeatFence()
 		if d.sessionShimReadinessWithdrawn.Load() {
 			return true, "session-shim recovery is not ready"
 		}
@@ -1022,8 +1079,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.config = cfg
 	d.startedAt = time.Now().UTC()
 	d.mu.Unlock()
+	// A refused startup founding stands the composition down before this gate
+	// runs: the daemon no longer presents a composed attestation, so the gate
+	// is a no-op and startup continues as a host that does not do durable
+	// sessions. A host that never established readiness any other way still
+	// fails closed here.
 	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
-		return err
+		return fmt.Errorf("session shim readiness gate: %w", err)
 	}
 
 	var local *localRuntime
@@ -1129,6 +1191,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 			return nil
 		}
 		var registerErr error
+		// Re-resolve the attestation at call time: a refused startup founding
+		// stands the composition down mid-Start, and the stood-down
+		// re-registration below must present the stand-down — not the refused
+		// founder's attestation the options were built with. AuthOnly moves
+		// with it: it suppresses capacity publication only while the
+		// attestation it rides on is composed.
+		regOpts.SessionShim = d.SessionShimHostAttestation()
+		regOpts.AuthOnly = regOpts.SessionShim.enabled()
 		regResp, registerErr = Register(ctx, regOpts)
 		if registerErr != nil {
 			return fmt.Errorf("register: %w", registerErr)
@@ -1149,24 +1219,66 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// credential/host/revision receipt first, while heartbeat, spawner, poll,
 	// claim, and capacity publication do not yet exist. The zero-value legacy
 	// path retains the established adopt-before-register order.
+	//
+	// The readiness gate above runs before the founding registration, so a
+	// daemon constructed with a composed configuration always reaches this
+	// point with a composed attestation still presented: only a refused
+	// founding below stands it down. startupFoundingRefused records that
+	// stand-down so the second registration below still runs: a stood-down
+	// daemon has no worker identity yet and must register for one.
+	startupFoundingRefused := false
 	if d.sessionShimEnabled() {
 		if d.opts.SkipRegistration {
 			return errors.New("session shim: attested recovery cannot skip registration")
 		}
 		d.setState(StateRecovering)
 		if err := register(); err != nil {
-			return err
+			// A refused founder must not take the host down with it. When the
+			// platform answers the startup founding registration with a
+			// definite client error, that answer is about ONE founder's
+			// declaration — never about the composition — so the daemon
+			// stands down in process and keeps serving direct-owned
+			// sessions instead of failing startup. The refusal is retained
+			// on the diagnostics surface so an operator who sees `off` can
+			// see why, and a later deferred install with another composed
+			// configuration may still found the composition. Anything that
+			// is not a definite platform refusal keeps its ordinary error:
+			// a transport blip or an expired credential is recovered by the
+			// supervised restart that an error triggers.
+			if refused := newSessionShimFoundingRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+				slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+					"startup founding registration; the daemon keeps serving direct-owned "+
+					"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+					"scope", refused.Scope, "refusal", refused.Err)
+				d.retainSessionShimFoundingRefusal(refused)
+				d.standDownSessionShimAfterRefusedStartupFounding()
+				startupFoundingRefused = true
+			} else {
+				return err
+			}
 		}
 	}
 
-	if err := d.adoptSessionShims(ctx); err != nil {
-		return err
+	// A refused startup founding stands the composition down above and skips
+	// the adoption pass below: there is no composed attestation to adopt for,
+	// and the pass requires one. The daemon proceeds as a host that does not
+	// do durable sessions; a later deferred install with another composed
+	// configuration runs its own adoption when it founds the composition.
+	if !startupFoundingRefused {
+		if err := d.adoptSessionShims(ctx); err != nil {
+			return err
+		}
 	}
 	// Reclaim crash/SIGKILL/restart leftovers the lifecycle path can never
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
-	if !d.sessionShimEnabled() {
+	// A refused startup founding stands the composition down above, so this
+	// second registration runs exactly when the daemon presents no composed
+	// attestation: either it never did, or its founder was refused and it
+	// serves stood down. Skipping it when the register above already succeeded
+	// would leave a stood-down daemon with no worker identity at all.
+	if !d.sessionShimEnabled() || startupFoundingRefused {
 		if err := register(); err != nil {
 			return err
 		}
@@ -1179,6 +1291,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 	spawnerOpts.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
 	spawnerOpts.ProjectAdmissionMode = cfg.EffectiveProjectAdmissionMode()
 	spawnerOpts.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
+	// Per-seat resource budget: resolve the authored block against host
+	// capacity once here (not per spawn — NumCPU/meminfo do not change
+	// under a running daemon). A zero block means budgeting is off and
+	// leaves every seat exactly as before. Only set what the operator
+	// authored: an embedder that composed its own SpawnerOptions.SeatBudget
+	// keeps it.
+	if spawnerOpts.SeatBudget == (SeatBudget{}) && cfg.Capacity.SeatBudget != (SeatBudgetConfig{}) {
+		resolved := resolveSeatBudget(cfg.Capacity.SeatBudget, cfg.Capacity.MaxConcurrentSessions, 0, 0)
+		spawnerOpts.SeatBudget = SeatBudget{
+			CPUs:     resolved.CPUs,
+			MemoryMB: resolved.MemoryMB,
+			IOWeight: resolved.IOWeight,
+			Mode:     string(resolved.Mode),
+		}
+	}
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
 	}
@@ -1192,6 +1319,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// accessor that knows the difference between "bound" and "configured".
 	if spawnerOpts.DaemonControlURL == nil {
 		spawnerOpts.DaemonControlURL = d.ControlURL
+	}
+	// Hand every spawned worker its own session-detail read credential.
+	// The store mints the token at accept time; stating it here lets the
+	// worker read its own detail without holding the operator control
+	// token. An embedder-supplied func keeps priority — the daemon only
+	// fills the gap it would otherwise leave.
+	if spawnerOpts.SessionReadToken == nil {
+		spawnerOpts.SessionReadToken = d.sessionReadToken
 	}
 	// Default WorktreeParentDir to the same statepath-resolved worktrees
 	// directory the spawned `donmai agent run` worker uses when no
@@ -1433,6 +1568,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 					Entries:           AllowlistEntriesFromConfig(d.spawner.AllProjects()),
 				}
 			},
+			// Quota snapshot: subscription windows for this host's
+			// signed-in accounts, read at most every 5 minutes per
+			// provider and merged with turn-driven updates. Nil-safe:
+			// a host with no quota state omits the key.
+			GetQuota: d.quotaSnapshot,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)
@@ -1462,7 +1602,42 @@ func (d *Daemon) Start(ctx context.Context) error {
 		credentials.Attach(d.heartbeat)
 		if d.sessionShimEnabled() {
 			if err := d.heartbeat.StartSynchronized(ctx); err != nil {
-				return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
+				// The same contract as a refused startup registration: the first
+				// beat presenting the composition was heard and answered, so a
+				// definite platform refusal stands the composition down in
+				// process instead of failing startup. A later deferred install
+				// with another composed configuration may still found it.
+				// Anything else keeps its ordinary error.
+				if refused := newSessionShimFoundingRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+					slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+						"first startup heartbeat; the daemon keeps serving direct-owned "+
+						"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+						"scope", refused.Scope, "refusal", refused.Err)
+					d.retainSessionShimFoundingRefusal(refused)
+					// The heartbeat service itself keeps running: it carries the
+					// in-flight sessions' lock refresh and user-turn piggyback,
+					// and a later deferred install rings its first projected
+					// beat through it. Only the shim projection is cleared —
+					// with the attestation stood down there is nothing to
+					// project — so the beats below attest a host that does not
+					// do durable sessions.
+					d.heartbeat.SetSessionShimProjection(nil, nil)
+					d.standDownSessionShimAfterRefusedStartupFounding()
+					// Unlike a refused founding registration, this founder's
+					// registration was ACCEPTED: the control plane records the
+					// host as composed, and the shared credential lane was built
+					// presenting that attestation. Withdraw it on the wire, the
+					// way a failed deferred install that had already declared
+					// does. Otherwise the next refresh re-presents the refused
+					// founder, a full re-registration mints an auth-only identity
+					// for a composition this host abandoned, and the beats below
+					// are silence from a host the control plane believes is
+					// composed.
+					d.redeclareSessionShimStandDown(ctx, d.SessionShimHostAttestation())
+					d.heartbeat.Start()
+				} else {
+					return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
+				}
 			}
 			if !d.sessionShimReadinessWithdrawn.Load() {
 				d.spawner.Resume()
@@ -1475,6 +1650,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 		} else {
 			d.heartbeat.Start()
 		}
+
+		// Live quota probes — the reads that fill the quota cache
+		// behind the heartbeat quota field. The first attempts fire
+		// immediately, so a host with signed-in harnesses reports
+		// quota within one probe interval of starting; stream updates
+		// from live sessions fold in through the usage route while
+		// the probes are the authoritative refresh.
+		d.quotaPoller = newQuotaPoller(d.quota, d.quotaProbes())
+		d.quotaPoller.Start()
 
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar
@@ -1668,7 +1852,8 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
-	if !projectsChanged && !localChanged && !capacityChanged {
+	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -1689,6 +1874,27 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			}
 		}
 		d.config.Capacity.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
+	}
+	if seatBudgetChanged {
+		if err := validateSeatBudget(cfg.Capacity.SeatBudget); err != nil {
+			d.mu.Unlock()
+			releasePolicy()
+			slog.Warn("[yaml-watcher] rejected seat budget", "error", err)
+			return
+		}
+		// Re-resolve against the (possibly new) seat count so derived
+		// shares track the live capacity. Seats already running keep the
+		// budget they started with; only new spawns see the new share.
+		resolved := resolveSeatBudget(cfg.Capacity.SeatBudget, cfg.Capacity.MaxConcurrentSessions, 0, 0)
+		if d.spawner != nil {
+			d.spawner.SetSeatBudget(SeatBudget{
+				CPUs:     resolved.CPUs,
+				MemoryMB: resolved.MemoryMB,
+				IOWeight: resolved.IOWeight,
+				Mode:     string(resolved.Mode),
+			})
+		}
+		d.config.Capacity.SeatBudget = cfg.Capacity.SeatBudget
 	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {
@@ -1866,6 +2072,13 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	}
 	if refresher != nil {
 		refresher.Stop()
+	}
+	d.lifecycleMu.Lock()
+	quotaPoller := d.quotaPoller
+	d.quotaPoller = nil
+	d.lifecycleMu.Unlock()
+	if quotaPoller != nil {
+		quotaPoller.Stop()
 	}
 
 	d.lifecycleMu.Lock()
@@ -2045,6 +2258,18 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	// no-op, so the legacy WorkerCapabilitiesFunc value stands. Appended AFTER
 	// WithWorkerCapabilities so the per-org flag is authoritative when present.
 	opts = append(opts, WithMergeQueueLanding(item.MergeQueueLanding))
+	// Per-seat budget: stamp the daemon's resolved share so the worker
+	// applies the cooperative caps and reports the seat posture on the
+	// session result. A disabled budget stamps nothing.
+	if budget := d.daemonSeatBudget(); !budget.Disabled() {
+		rep := seatBudgetReport(budget)
+		opts = append(opts, WithSeatBudget(&SessionSeatBudget{
+			Mode:     rep.Mode,
+			CPUs:     rep.CPUs,
+			MemoryMB: rep.MemoryMB,
+			Detail:   rep.Detail,
+		}))
+	}
 	detail := PollItemToSessionDetail(
 		item,
 		projects,
@@ -2328,6 +2553,17 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 		// that would refuse it anyway.
 		if _, err := agent.ExecutionSecurityFromOperationalPayload(detail.OperationalPayload); err != nil {
 			return nil, fmt.Errorf("execution security: %w", err)
+		}
+		// Stamp the daemon-resolved token path so the spawned worker's
+		// seat confinement denies the live token file explicitly. The
+		// spawner strips the path-override variable from the worker's
+		// environment, so the worker cannot resolve the override itself;
+		// without this stamp the seat would deny the default path while
+		// the live token sits at the override. The daemon's own answer
+		// always wins here: a work item must not be able to aim its own
+		// seat's deny at an arbitrary host file.
+		if path := strings.TrimSpace(d.opts.ControlTokenPath); path != "" {
+			detail.ControlTokenPath = path
 		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound
@@ -2894,6 +3130,31 @@ func (d *Daemon) SessionDetail(sessionID string) (*SessionDetail, bool) {
 		return nil, false
 	}
 	return d.sessionDetails.Get(sessionID)
+}
+
+// sessionReadToken returns the live per-session read credential for
+// sessionID. It is the spawner's lookup for the credential stated in
+// each spawned worker's environment: minting happens in the detail
+// store at accept time, so this is a read, never a mint.
+func (d *Daemon) sessionReadToken(sessionID string) (string, bool) {
+	if d.sessionDetails == nil {
+		return "", false
+	}
+	return d.sessionDetails.readTokenFor(sessionID)
+}
+
+// SessionReadTokenForTest returns the live per-session read credential
+// for sessionID. Exported for the worker-bootstrap tests, which prove
+// the end-to-end read through the production HTTP route: accept a
+// session in-process, read back the credential the daemon would state
+// in the spawned worker's environment, and fetch the detail with it.
+// Production code never calls this; the spawner reads the same value
+// through the SessionReadToken hook wired at Start.
+func SessionReadTokenForTest(d *Daemon, sessionID string) (string, bool) {
+	if d == nil {
+		return "", false
+	}
+	return d.sessionReadToken(sessionID)
 }
 
 // UpdateSessionRuntimeCredentials re-stamps the runtime credentials of the

@@ -407,6 +407,20 @@ func runDirectMCPFixture(
 	t.Logf("real MCP method summary sha256=%s", func() string { sum := sha256.Sum256(methodSummary); return hex.EncodeToString(sum[:]) }())
 }
 
+// allowedRealMCPFixtureStderr reports whether the real app-server binary's
+// captured stderr holds only known-benign fixture noise: the temporary-home
+// PATH-alias warning, and a refused model-endpoint connection. Starting a
+// thread warms the binary's model connection in the background, and the
+// fixture's model credential is deliberately fake, so that dial can only
+// ever fail — but whether the failure line lands in the captured stderr
+// before the fixture closes stdin is the network's schedule, not the test's,
+// which is what made the direct-calls fixture flaky under load. Tolerating
+// the refused-dial family (anchored on the model-endpoint subsystem plus an
+// explicit connection failure) keeps the assertion timing-insensitive while
+// still rejecting every other diagnostic: a crash, a panic, a successful
+// model interaction, or a failure anywhere else still fails the fixture.
+// The no-model-turn contract itself stays enforced by the RPC method
+// summary, independently of stderr.
 func allowedRealMCPFixtureStderr(raw string) bool {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -414,9 +428,13 @@ func allowedRealMCPFixtureStderr(raw string) bool {
 	}
 	const temporaryHomeWarning = "WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir"
 	for _, line := range strings.Split(trimmed, "\n") {
-		if !strings.HasPrefix(line, temporaryHomeWarning) || !strings.Contains(line, "(codex_home:") {
-			return false
+		if strings.HasPrefix(line, temporaryHomeWarning) && strings.Contains(line, "(codex_home:") {
+			continue
 		}
+		if strings.Contains(line, "responses_websocket") && strings.Contains(line, "failed to connect") {
+			continue
+		}
+		return false
 	}
 	return true
 }
@@ -424,6 +442,10 @@ func allowedRealMCPFixtureStderr(raw string) bool {
 func TestAllowedRealMCPFixtureStderrIsNarrow(t *testing.T) {
 	t.Parallel()
 	warning := `WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp/example" (codex_home: AbsolutePathBuf("/tmp/example/home"))`
+	// The exact refused-dial shape observed on a loaded gate runner: the
+	// binary's background model-endpoint warmup rejected with the fixture's
+	// fake model credential (timestamped, colorized log line).
+	refusedDial := "\x1b[2m2026-10-08T13:32:39.396281Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_api::endpoint::responses_websocket\x1b[0m\x1b[2m:\x1b[0m failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses"
 	for _, test := range []struct {
 		name string
 		raw  string
@@ -431,8 +453,13 @@ func TestAllowedRealMCPFixtureStderrIsNarrow(t *testing.T) {
 	}{
 		{name: "empty", want: true},
 		{name: "temporary home warning", raw: warning, want: true},
+		{name: "refused model dial alongside warning", raw: warning + "\n" + refusedDial, want: true},
+		{name: "refused model dial alone", raw: refusedDial, want: true},
 		{name: "unrelated warning", raw: "WARNING: MCP startup failed", want: false},
 		{name: "extra line", raw: warning + "\nother", want: false},
+		{name: "model subsystem without a refused dial", raw: warning + "\nERROR codex_api::endpoint::responses_websocket: stream closed", want: false},
+		{name: "refused dial outside the model subsystem", raw: warning + "\nERROR something else: failed to connect", want: false},
+		{name: "refused dial plus trailing noise", raw: warning + "\n" + refusedDial + "\nunexpected crash", want: false},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {

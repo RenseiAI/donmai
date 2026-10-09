@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -207,7 +208,7 @@ func TestDaemonInstallHelp(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"--bin-path", "--user", "--system"} {
+	for _, want := range []string{"--bin-path", "--process-priority", "--user", "--system"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("install --help missing flag %q; got:\n%s", want, out)
 		}
@@ -417,6 +418,166 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 
 	if _, err := os.Stat(jwtPath); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("cache file at %s should be wiped after uninstall (err=%v)", jwtPath, err)
+	}
+}
+
+// priorityServiceMarkers returns the service-definition fragments that mark the
+// background process-priority mode on this OS, or skips the test where the
+// installer is not supported.
+func priorityServiceMarkers(t *testing.T) []string {
+	t.Helper()
+	switch runtime.GOOS {
+	case "darwin":
+		return []string{
+			"<key>ProcessType</key>", "<string>Background</string>",
+			"<key>LowPriorityIO</key>", "<key>LowPriorityBackgroundIO</key>",
+		}
+	case "linux":
+		return []string{"Nice=19\n", "CPUSchedulingPolicy=idle\n", "IOSchedulingClass=idle\n"}
+	default:
+		t.Skipf("installer only supports darwin/linux; this is %s", runtime.GOOS)
+		return nil
+	}
+}
+
+// installWithArgs runs `install --skip-service-manager` under the isolated HOME
+// and returns its output and the service definition it wrote.
+func installWithArgs(t *testing.T, hostBin string, args ...string) (output, service string) {
+	t.Helper()
+	cmd := newDaemonInstallCmd("donmai")
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs(append([]string{"--bin-path", hostBin, "--skip-service-manager"}, args...))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("install %v: %v\n%s", args, err, buf.String())
+	}
+	output = buf.String()
+	var servicePath string
+	for _, line := range strings.Split(output, "\n") {
+		if rest, ok := strings.CutPrefix(line, "Service registered: "); ok {
+			servicePath = rest
+		}
+	}
+	if servicePath == "" {
+		t.Fatalf("install output has no service path:\n%s", output)
+	}
+	content, err := os.ReadFile(servicePath)
+	if err != nil {
+		t.Fatalf("read service definition: %v", err)
+	}
+	t.Cleanup(func() { _ = launchctlBootoutTestUnit() })
+	return output, string(content)
+}
+
+func isolatedHostBin(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	hostBin := filepath.Join(tmp, "af-fake")
+	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatalf("seed fake host binary: %v", err)
+	}
+	return hostBin
+}
+
+// TestDaemonInstallProcessPriority pins what each mode writes, per OS: launchd
+// keys on macOS, systemd directives on Linux, and nothing at all for the
+// default. The service entrypoint is the plain host command in every mode.
+func TestDaemonInstallProcessPriority(t *testing.T) {
+	markers := priorityServiceMarkers(t)
+	cases := []struct {
+		name       string
+		args       []string
+		wantMarked bool
+		wantLine   string // substring of the install output; empty means no priority line
+		wantAbsent string // substring that must not appear
+	}{
+		{name: "flag omitted", args: nil, wantAbsent: "Process priority:"},
+		{name: "explicit default", args: []string{"--process-priority", "default"}, wantLine: "Process priority: default"},
+		{name: "background", args: []string{"--process-priority", "background"}, wantMarked: true, wantLine: "Process priority: background"},
+		{name: "case and space are ignored", args: []string{"--process-priority", " Background "}, wantMarked: true, wantLine: "Process priority: background"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hostBin := isolatedHostBin(t)
+			out, service := installWithArgs(t, hostBin, tc.args...)
+
+			if want := "Service command: " + hostBin + " host run\n"; !strings.Contains(out, want) {
+				t.Errorf("install output missing the unwrapped service command %q:\n%s", want, out)
+			}
+			if tc.wantLine != "" && !strings.Contains(out, tc.wantLine) {
+				t.Errorf("install output missing %q:\n%s", tc.wantLine, out)
+			}
+			if tc.wantAbsent != "" && strings.Contains(out, tc.wantAbsent) {
+				t.Errorf("install output must not contain %q:\n%s", tc.wantAbsent, out)
+			}
+			for _, marker := range markers {
+				if got := strings.Contains(service, marker); got != tc.wantMarked {
+					t.Errorf("service definition contains %q = %v, want %v:\n%s", marker, got, tc.wantMarked, service)
+				}
+			}
+		})
+	}
+}
+
+// TestDaemonInstallKeepsProcessPriorityWhenFlagOmitted pins that re-running
+// install without the flag, the documented recovery step after an upgrade or a
+// daemon test run, keeps the saved mode. Only an explicit flag changes it.
+func TestDaemonInstallKeepsProcessPriorityWhenFlagOmitted(t *testing.T) {
+	markers := priorityServiceMarkers(t)
+	hostBin := isolatedHostBin(t)
+
+	assertBackground := func(step, service string, want bool) {
+		t.Helper()
+		for _, marker := range markers {
+			if got := strings.Contains(service, marker); got != want {
+				t.Errorf("%s: service definition contains %q = %v, want %v", step, marker, got, want)
+			}
+		}
+	}
+
+	_, service := installWithArgs(t, hostBin, "--process-priority", "background")
+	assertBackground("explicit background", service, true)
+
+	out, service := installWithArgs(t, hostBin)
+	assertBackground("re-install without the flag", service, true)
+	if !strings.Contains(out, "Process priority: background (kept from the previous install") {
+		t.Errorf("re-install output must say the mode was kept:\n%s", out)
+	}
+
+	out, service = installWithArgs(t, hostBin, "--process-priority", "default")
+	assertBackground("explicit default", service, false)
+	if !strings.Contains(out, "Process priority: default") {
+		t.Errorf("explicit default output missing the mode:\n%s", out)
+	}
+
+	out, service = installWithArgs(t, hostBin)
+	assertBackground("re-install after explicit default", service, false)
+	if strings.Contains(out, "Process priority:") {
+		t.Errorf("a kept default is the unremarkable case and must stay silent:\n%s", out)
+	}
+}
+
+func TestDaemonInstallRejectsInvalidProcessPriority(t *testing.T) {
+	for _, value := range []string{"faster", "utility"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			cmd := newDaemonInstallCmd("donmai")
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			cmd.SetArgs([]string{"--process-priority", value, "--skip-service-manager"})
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatalf("expected an error for --process-priority %s", value)
+			}
+			if want := "invalid --process-priority"; !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %v, want it to contain %q", err, want)
+			}
+			if !strings.Contains(err.Error(), "want default or background") {
+				t.Fatalf("error = %v, want it to list the valid modes", err)
+			}
+		})
 	}
 }
 
@@ -1203,15 +1364,102 @@ func TestWriteDaemonStatusTable(t *testing.T) {
 	t.Parallel()
 
 	r := fixtureStatusResp()
+	r.ProcessPriority = &afclient.DaemonProcessPriorityStatus{Mode: "background", ConfiguredMode: "background", Evidence: "ps PRI=4"}
+	r.SeatBudget = &afclient.SeatBudgetStatus{Mode: "best-effort", CPUs: 4, MemoryMB: 8192, Detail: "caps"}
 	var buf bytes.Buffer
 	if err := writeDaemonStatusTable(&buf, r); err != nil {
 		t.Fatalf("writeDaemonStatusTable: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed"} {
+	for _, want := range []string{"mac-studio-test", "0.1.0", "42", "3 / 8", "2 allowed", "Process priority:", "background", "Seat budget:", "best-effort, 4 CPUs, 8192 MB"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q; got:\n%s", want, out)
 		}
+	}
+	// The row names the mode, never the scheduler's raw value.
+	for _, banned := range []string{"PRI", "ps "} {
+		if strings.Contains(out, banned) {
+			t.Errorf("table leaks the raw observation %q; got:\n%s", banned, out)
+		}
+	}
+}
+
+// TestWriteDaemonStatusTable_OlderDaemon pins that a daemon predating the
+// processPriority field reads as "not reported" rather than "unsupported".
+func TestWriteDaemonStatusTable_OlderDaemon(t *testing.T) {
+	t.Parallel()
+
+	var r afclient.DaemonStatusResponse
+	if err := json.Unmarshal([]byte(`{"status":"ready","version":"0.0.1","machineId":"old","pid":1}`), &r); err != nil {
+		t.Fatalf("decode older daemon status: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := writeDaemonStatusTable(&buf, &r); err != nil {
+		t.Fatalf("writeDaemonStatusTable: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Process priority:") || !strings.Contains(out, "not reported") {
+		t.Errorf("older daemon must show the row as not reported; got:\n%s", out)
+	}
+	if strings.Contains(out, "unsupported") {
+		t.Errorf("older daemon must not read as unsupported; got:\n%s", out)
+	}
+}
+
+func TestFormatProcessPriorityStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status *afclient.DaemonProcessPriorityStatus
+		want   string
+	}{
+		{name: "daemon does not report it", status: nil, want: "not reported"},
+		{name: "empty mode", status: &afclient.DaemonProcessPriorityStatus{}, want: "not reported"},
+		{name: "default", status: &afclient.DaemonProcessPriorityStatus{Mode: "default", Evidence: "ps PRI=20"}, want: "default"},
+		{name: "background", status: &afclient.DaemonProcessPriorityStatus{Mode: "background", Evidence: "ps PRI=4"}, want: "background"},
+		{
+			name:   "installed setting not applied yet",
+			status: &afclient.DaemonProcessPriorityStatus{Mode: "default", ConfiguredMode: "background", Warning: "installed setting is background but the running daemon is default; restart the daemon to apply it"},
+			want:   "default — installed setting is background but the running daemon is default; restart the daemon to apply it",
+		},
+		{
+			name:   "observation failed",
+			status: &afclient.DaemonProcessPriorityStatus{Mode: "unknown", Warning: "could not read the live process priority: boom"},
+			want:   "unknown — could not read the live process priority: boom",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatProcessPriorityStatus(tc.status); got != tc.want {
+				t.Errorf("formatProcessPriorityStatus() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatSeatBudgetStatus pins the seat budget row: the posture with the
+// values, none for budgeting off, not reported against an older daemon.
+func TestFormatSeatBudgetStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status *afclient.SeatBudgetStatus
+		want   string
+	}{
+		{name: "daemon does not report it", status: nil, want: "not reported"},
+		{name: "empty mode", status: &afclient.SeatBudgetStatus{}, want: "not reported"},
+		{name: "off", status: &afclient.SeatBudgetStatus{Mode: "none"}, want: "none"},
+		{name: "best effort", status: &afclient.SeatBudgetStatus{Mode: "best-effort", CPUs: 4, MemoryMB: 8192}, want: "best-effort, 4 CPUs, 8192 MB"},
+		{name: "enforced with detail", status: &afclient.SeatBudgetStatus{Mode: "enforced", CPUs: 2, Detail: "via transient systemd scope"}, want: "enforced, 2 CPUs — via transient systemd scope"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatSeatBudgetStatus(tc.status); got != tc.want {
+				t.Errorf("formatSeatBudgetStatus() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -39,6 +41,11 @@ import (
 // starts, but every mutating control route refuses with 503 until a restart
 // finds a readable token. Read-only routes and the rest of the daemon keep
 // working. The failure is logged loudly on errOut and through slog.
+//
+// It also states the token file on opts (Options.ControlTokenPath) beside
+// the minted token: the spawner strips the path-override variable from
+// every worker, so accept-time details carry the path to the worker's seat
+// confinement explicitly instead (statedControlTokenPath).
 func applyDaemonControlAuth(opts *daemon.Options, tokenPath string, errOut io.Writer) {
 	opts.RequireControlToken = true
 	token, err := afclient.EnsureControlToken(tokenPath)
@@ -54,6 +61,24 @@ func applyDaemonControlAuth(opts *daemon.Options, tokenPath string, errOut io.Wr
 		token = ""
 	}
 	opts.ControlToken = token
+	opts.ControlTokenPath = statedControlTokenPath(tokenPath)
+}
+
+// statedControlTokenPath names the token file the daemon states to its
+// seats: the file the kernel resolves the path to, symbolic links and ".."
+// walked in order, never a lexical clean. With a symbolic link before a
+// "..", the lexical spelling names a different file than the one the token
+// was minted into and read from, and a seat denied that spelling could read
+// the live token. A path that does not resolve (nothing minted there) is
+// stated as given, so the seat still denies it.
+func statedControlTokenPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }
 
 func protectedRuntimeMCPHelperCommand(tokenFilePath string) (string, error) {
@@ -118,6 +143,22 @@ func rotateDaemonLogs(errOut io.Writer) {
 // binary (claude/codex/pi/…) being installed in the test/CI environment —
 // BuildDecoratedAgentRunRegistry's real ctor list probes every one of them.
 var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
+
+// resolveQuotaProbeBinaries resolves the harness CLIs the daemon's live
+// quota probes shell out to, keyed by harness. A harness with no binary
+// on PATH is absent from the map, which leaves its probe disabled: the
+// daemon reports no verdict for a harness it cannot read, rather than a
+// false one.
+func resolveQuotaProbeBinaries() map[string]string {
+	out := map[string]string{}
+	if path, err := exec.LookPath("codex"); err == nil && path != "" {
+		out["codex"] = path
+	}
+	if path, err := exec.LookPath("claude"); err == nil && path != "" {
+		out["claude"] = path
+	}
+	return out
+}
 
 // daemonProviderView constructs the daemon's own in-process AgentRuntime
 // registry — the same registry shape `donmai agent run` rebuilds per-session
@@ -339,6 +380,10 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// only the production entry point configures this seam; see
 				// Options.CodexOrphanSweeper's doc comment.
 				CodexOrphanSweeper: providercodex.SweepOrphans,
+				// The live quota probes — resolved from PATH so a host
+				// without an installed harness simply leaves that
+				// harness unprobed. See Options.QuotaProbeBinaries.
+				QuotaProbeBinaries: resolveQuotaProbeBinaries(),
 			}
 			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
 			d = daemon.New(daemonOpts)
@@ -373,6 +418,14 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			)
 			go leaseManager.RunTerminalResultReplayer(ctx, workarea.TerminalResultReplayOptions{
 				OnError: func(err error) { slog.Warn("terminal status replay failed", "err", err) },
+			}, leaseSender)
+			// The standalone loop drains the records that have no terminal
+			// workarea lease: every terminal status a shim-owned seat
+			// persisted before its first send, plus the
+			// worker_exited_without_result fallback. Same sender — each
+			// record resolves its own receiver key per attempt.
+			go leaseManager.RunStandaloneOutboxReplayer(ctx, workarea.TerminalResultReplayOptions{
+				OnError: func(err error) { slog.Warn("standalone terminal status replay failed", "err", err) },
 			}, leaseSender)
 			go leaseManager.RunTerminalLeaseReaper(ctx, workarea.ReaperOptions{
 				OnError: func(err error) { slog.Warn("terminal lease reaping failed", "err", err) },

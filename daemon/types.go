@@ -25,6 +25,7 @@ package daemon
 import (
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runner/access"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -247,6 +248,16 @@ type SessionResources struct {
 	MemoryMB int `json:"memoryMb,omitempty"`
 }
 
+// SessionSeatBudget is the per-seat budget evidence one session ran under:
+// the posture (enforced | best-effort | none) with the values. Additive on
+// every handle that carries it; absent against an older daemon.
+type SessionSeatBudget struct {
+	Mode     string `json:"mode"`
+	CPUs     int    `json:"cpus,omitempty"`
+	MemoryMB int    `json:"memoryMb,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
 // SessionHandle is the daemon-side handle for an in-flight session.
 //
 // Wire shape (camelCase JSON) returned by GET /api/daemon/sessions. The
@@ -322,6 +333,17 @@ type SessionHandle struct {
 	// WorkType is the workflow discriminant ("development", "qa", ...).
 	// Mirrors SessionSpec.WorkType.
 	WorkType string `json:"workType,omitempty"`
+
+	// IssueIdentifier is the work item's human-readable identifier,
+	// projected from the session's stored detail when the list is served,
+	// so a local reader can label a session before its runner writes any
+	// state. An identifier only: the title and body never ride the list.
+	IssueIdentifier string `json:"issueIdentifier,omitempty"`
+
+	// SeatBudget is the per-seat budget this session runs under: the
+	// posture (enforced | best-effort | none) with the values. Nil when
+	// budgeting is off on this host.
+	SeatBudget *SessionSeatBudget `json:"seatBudget,omitempty"`
 }
 
 // ── Heartbeat payload ──────────────────────────────────────────────────────
@@ -393,6 +415,15 @@ type HeartbeatPayload struct {
 	// per beat. Best-effort: when unavailable the key is omitted entirely
 	// (GetLoadAverage returns ok=false), matching Load's contract.
 	LoadAverage *heartbeatLoadAverageFields `json:"loadAverage,omitempty"`
+
+	// Quota carries the subscription quota snapshot for this host's
+	// signed-in accounts: one entry per account with its quota windows,
+	// plan, allowance bucket, reset credits and the harness's latest
+	// login-check outcome (authCheck). Populated from
+	// HeartbeatOptions.GetQuota when configured; nil (and thus omitted
+	// from the wire body) otherwise. Account IDs ride as opaque values
+	// the platform hashes — the payload never carries an address.
+	Quota []agent.UsageAccount `json:"quota,omitempty"`
 }
 
 // ── Auto-update channel/schedule ───────────────────────────────────────────
@@ -417,11 +448,13 @@ const (
 	ScheduleManual    UpdateSchedule = "manual"
 )
 
-// CloneStrategy controls how the daemon clones a project repo for new
-// workarea pool members.
+// CloneStrategy is the retired per-repository clone override. The key is
+// still tolerated on read (see the deprecation notice in config.go) but is
+// never written and never influences behaviour.
 type CloneStrategy string
 
-// Clone strategy constants.
+// Clone strategy constants. Retained only so previously written values keep
+// decoding to the same strings; nothing reads them.
 const (
 	CloneShallow   CloneStrategy = "shallow"
 	CloneFull      CloneStrategy = "full"

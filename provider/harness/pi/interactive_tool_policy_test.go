@@ -95,8 +95,11 @@ func TestSpawn_Interactive_AllowedDisallowedToolsReachChildEnv(t *testing.T) {
 	if !strings.Contains(env, `DONMAI_PI_DISALLOWED_TOOLS=["Bash"]`) {
 		t.Errorf("interactive child env missing the stamped disallowed-tools list; got:\n%s", env)
 	}
-	if !strings.Contains(env, "DONMAI_PI_HANDSHAKE=[]") {
-		t.Errorf("interactive child unexpectedly carries a handshake token; got:\n%s", env)
+	// The spawn never SETS the handshake token (the capture prints the
+	// merged env, so an inherited worker token may show — the override map
+	// is what this spawn set).
+	if _, present := interactiveChildEnv(agent.Spec{Cwd: t.TempDir()}, newSessionLayout(t.TempDir()))[piHandshakeEnvVar]; present {
+		t.Errorf("interactiveChildEnv must never set the handshake token")
 	}
 }
 
@@ -162,6 +165,15 @@ func localToolPolicyFixtureVerdict(t *testing.T, allowedJSON, disallowedJSON, to
 // extension registered).
 func runExtensionFixture(t *testing.T, env []string, toolName, inputJSON string) map[string]any {
 	t.Helper()
+	return runExtensionFixtureWithCtx(t, env, toolName, inputJSON, "")
+}
+
+// runExtensionFixtureWithCtx is runExtensionFixture plus the ctx the tool_call
+// handler observes (the harness passes it through as its second argument).
+// The real pi runtime supplies ctx.cwd; the fixture needs it to resolve
+// cwd-relative operands exactly as the production extension does.
+func runExtensionFixtureWithCtx(t *testing.T, env []string, toolName, inputJSON, ctxJSON string) map[string]any {
+	t.Helper()
 	nodeAvailable(t)
 
 	harness, err := filepath.Abs(filepath.Join("testdata", "interactive-local-tool-policy-harness.mjs"))
@@ -173,7 +185,11 @@ func runExtensionFixture(t *testing.T, env []string, toolName, inputJSON string)
 		t.Fatalf("resolve extension path: %v", err)
 	}
 
-	cmd := exec.Command("node", harness, extPath, toolName, inputJSON) //nolint:gosec // G204: fixed test-only harness path + node binary resolved from PATH; args are constants and this test's own JSON literals.
+	args := []string{harness, extPath, toolName, inputJSON}
+	if ctxJSON != "" {
+		args = append(args, ctxJSON)
+	}
+	cmd := exec.Command("node", args...) //nolint:gosec // G204: fixed test-only harness path + node binary resolved from PATH; args are constants and this test's own JSON literals.
 	cmd.Env = append(os.Environ(), env...)
 	// DONMAI_PI_HANDSHAKE deliberately absent from cmd.Env beyond whatever the
 	// test process itself has (none, in CI) — the interactive lane never sets
@@ -296,5 +312,85 @@ func TestInteractiveLocalToolPolicyFixture_StateDirDeletionDenied(t *testing.T) 
 				t.Errorf("state-dir refusal must retain the typed headless reason, got %q", reason)
 			}
 		})
+	}
+}
+
+// TestInteractiveLocalToolPolicyFixture_RelocatedStateDirDeletionDenied
+// pins the B3 scenario the review reproduced as allowed: in an interactive
+// session whose workarea leaf is `repo`, `rm -rf .pi-repo` deletes the
+// LIVE session state root (<cwd>/.pi-repo) and must be refused exactly
+// like `rm -rf .pi`. The relocated root travels on DONMAI_PI_STATE_DIR —
+// the same env interactiveChildEnv stamps on the real child — and the
+// fixture resolves the operand against ctx.cwd the way the production
+// extension does.
+//
+// RED: read only the legacy root (drop the DONMAI_PI_STATE_DIR lookup)
+// and the relocated refusal passes.
+func TestInteractiveLocalToolPolicyFixture_RelocatedStateDirDeletionDenied(t *testing.T) {
+	t.Parallel()
+	cwd := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := agent.Spec{Cwd: cwd, SessionName: "s1"}
+	layout := newSessionLayoutForSpec(spec)
+	ctxJSON, err := json.Marshal(map[string]string{"cwd": cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := []string{
+		"DONMAI_PI_ALLOWED_TOOLS=[]",
+		"DONMAI_PI_DISALLOWED_TOOLS=[]",
+		piStateDirEnvVar + "=" + layout.root,
+	}
+	leaf := filepath.Base(layout.root)
+	for _, command := range []string{
+		"rm -rf " + leaf,
+		"rm -rf " + filepath.Join(leaf, "sessions", "x.jsonl"),
+		"rm -rf " + layout.root,
+	} {
+		out := runExtensionFixtureWithCtx(t, env, "bash", `{"command":`+strconv.Quote(command)+`}`, string(ctxJSON))
+		verdict, _ := out["verdict"].(map[string]any)
+		if verdict == nil {
+			t.Fatalf("%q allowed, want refused: the relocated root is live harness state (got %v)", command, out)
+		}
+		if block, _ := verdict["block"].(bool); !block {
+			t.Errorf("%q: want block=true, got %v", command, verdict)
+		}
+		if reason, _ := verdict["reason"].(string); !strings.Contains(reason, stateDirGuardReasonPrefix) {
+			t.Errorf("%q: refusal must carry the typed headless reason, got %q", command, reason)
+		}
+	}
+	// Same leaf name in an UNRELATED workarea is not this session's state:
+	// it must stay allowed, proving the guard resolves against the root
+	// rather than blanket-blocking the name.
+	other := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.MkdirAll(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	otherCtx, err := json.Marshal(map[string]string{"cwd": other})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := runExtensionFixtureWithCtx(t, env, "bash", `{"command":`+strconv.Quote("rm -rf "+leaf)+`}`, string(otherCtx))
+	if verdict := out["verdict"]; verdict != nil {
+		t.Errorf("same leaf name in another workarea was blocked: %v", verdict)
+	}
+}
+
+// TestInteractiveChildEnv_CarriesRelocatedStateDir proves the Go half of
+// the B3 fix: interactiveChildEnv stamps the session state root onto the
+// child env under the name the extension's local guard reads, so the
+// production spawn — not just the fixture — actually delivers it.
+//
+// RED: drop the piStateDirEnvVar assignment from interactiveChildEnv and
+// the entry vanishes.
+func TestInteractiveChildEnv_CarriesRelocatedStateDir(t *testing.T) {
+	t.Parallel()
+	spec := agent.Spec{Cwd: filepath.Join(t.TempDir(), "repo"), SessionName: "s1"}
+	layout := newSessionLayoutForSpec(spec)
+	env := interactiveChildEnv(spec, layout)
+	if got := env[piStateDirEnvVar]; got != layout.root {
+		t.Errorf("interactive child env %s = %q, want the session state root %q", piStateDirEnvVar, got, layout.root)
 	}
 }

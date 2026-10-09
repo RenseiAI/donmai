@@ -54,12 +54,18 @@ const sessionShimEnvPrefix = "DONMAI_SESSION_SHIM"
 // receives only the gateway's per-session loopback bearer while the upstream
 // credential and route stay in the worker process. An inherited copy in the
 // child would silently undo that isolation.
+// DONMAI_PI_KEY is likewise donmai-native with no legacy counterpart: it is
+// the resolved cell key the provider pin reads in the child. A session spec
+// with no key must not inherit the host's copy (which would then ride the
+// injected provider to the vendor), so it is blocked from the parent env
+// while the spec layer may still set it (see Composer.Compose).
 var AgentEnvBlocklist = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
 	GatewayUpstreamAPIKeyEnv,
 	GatewayUpstreamBaseURLEnv,
+	"DONMAI_PI_KEY",
 	"GEMINI_API_KEY",
 	"GOOGLE_API_KEY",
 	"OPENCLAW_GATEWAY_TOKEN",
@@ -334,18 +340,44 @@ func FilterRunnerOnly(entries []string) []string {
 // FilterRunnerOnlyMap returns a defensive copy of entries with runner-owned
 // controls removed. It is the serialization counterpart to FilterRunnerOnly:
 // callers use it before placing explicit environment maps in child configs.
+// An entry whose key is not a valid variable name (ValidEnvKey) is dropped
+// too: serialized as key+"="+value, a key holding '=' names a DIFFERENT
+// variable, so a map entry like {"DONMAI_CONTROL_TOKEN=x": ""} would slip a
+// runner-only name past the check above.
 func FilterRunnerOnlyMap(entries map[string]string) map[string]string {
 	if entries == nil {
 		return nil
 	}
 	out := make(map[string]string, len(entries))
 	for key, value := range entries {
-		if IsRunnerOnly(key) {
+		if !ValidEnvKey(key) || IsRunnerOnly(key) {
 			continue
 		}
 		out[key] = value
 	}
 	return out
+}
+
+// ValidEnvKey reports whether key can be serialized as one environment
+// entry key+"="+value that names exactly key: it is non-empty and holds no
+// '=' and no NUL. The process environment splits an entry at its first '=',
+// so a key holding one names a different variable — whatever precedes the
+// '=' — and its value then absorbs the rest. A map entry with such a key can
+// set any variable while its key passes every by-name check, so map filters
+// drop it.
+func ValidEnvKey(key string) bool {
+	return key != "" && !strings.ContainsAny(key, "=\x00")
+}
+
+// isSessionReadToken reports whether key is the per-session read
+// credential a supervisor states in a spawned worker's environment
+// (SessionReadTokenEnv). The worker consumes it during bootstrap; it must
+// never cross an inherited-environment boundary into a harness or agent
+// child, so every inherited layer in this package drops it. Explicit
+// supervisor-authored layers may still state it — that is how the worker
+// receives it in the first place.
+func isSessionReadToken(key string) bool {
+	return key == SessionReadTokenEnv
 }
 
 func filterInheritedChildEnv(entries []string) []string {
@@ -362,6 +394,12 @@ func filterInheritedChildEnv(entries []string) []string {
 			key = entry[:i]
 		}
 		if IsRunnerOnly(key) {
+			continue
+		}
+		// The per-session read credential never crosses an inherited
+		// boundary: the worker consumed it during bootstrap, and no
+		// harness or agent child it spawns may observe it.
+		if isSessionReadToken(key) {
 			continue
 		}
 		if isAgentEnvBlocked(key) && !declared.Allows(key) {
@@ -478,6 +516,13 @@ func (c *Composer) Compose(base map[string]string, spec agent.Spec) []string {
 	merged := make(map[string]string)
 	for k, v := range base {
 		if IsRunnerOnly(k) {
+			continue
+		}
+		// Same inherited-boundary rule as filterInheritedChildEnv: the
+		// base layer is the parent process environment, so the
+		// per-session read credential it may carry is dropped here.
+		// The explicit spec layer below may still state it.
+		if isSessionReadToken(k) {
 			continue
 		}
 		if _, blocked := blockSet[k]; blocked && !declared.Allows(k) {

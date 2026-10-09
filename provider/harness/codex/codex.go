@@ -70,6 +70,18 @@ type Provider struct {
 	pinnedSessionEnv map[string]string
 	sessionEnvPinned bool
 
+	// pinnedGatewayBaseURL/pinnedGatewayRouted freeze the gateway route the
+	// running app-server child was started with, and gatewayRoutePinned
+	// records that a headless Spawn/Resume pinned it. Guarded by startMu.
+	// A later Spawn/Resume naming a different route is refused rather than
+	// silently served the first session's gateway — see
+	// checkGatewayRouteLocked. The provider block is append-once, so without
+	// this pin a same-key resume against a different base URL would succeed
+	// while the child stayed on the first gateway.
+	pinnedGatewayBaseURL string
+	pinnedGatewayRouted  bool
+	gatewayRoutePinned   bool
+
 	// mcpMu serializes app-server-global config changes. mcpUsers counts
 	// live handles holding the current config digest: equal configs may share
 	// it, while an incompatible config is denied until all prior handles have
@@ -238,6 +250,28 @@ func (p *Provider) ensureStarted() error {
 	return p.startLocked(nil)
 }
 
+// ensureProbeStarted starts the app-server for a quota read. A
+// host-session provider first projects the host's CLI login into its
+// isolated home, as Spawn does in ensureHeadlessReady: an app-server
+// started without it has no login and refuses every read, which would
+// report a signed-in host as logged out. A host with no login file
+// fails here, before any read, so the probe records no verdict.
+func (p *Provider) ensureProbeStarted() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	select {
+	case <-p.shutdown:
+		return fmt.Errorf("%w: codex provider already shut down", agent.ErrProviderUnavailable)
+	default:
+	}
+	if p.hostAuthFile != "" && !p.started {
+		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
+			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrProviderUnavailable, err)
+		}
+	}
+	return p.startLocked(nil)
+}
+
 // startLocked starts and initializes the app-server. startMu must be held.
 //
 // sessionEnv is the agent.Spec.Env of the session whose Spawn/Resume triggered
@@ -350,6 +384,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 	if err := p.client.Notify("initialized", map[string]any{}); err != nil {
 		return p.failStartLocked(fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err))
 	}
+	p.forwardRateLimitUpdates()
 	p.started = true
 	// Freeze the layer the child actually received. maps.Clone defends against
 	// a caller mutating its own Spec.Env map after the Spawn returns, which
@@ -423,9 +458,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return spawnInteractivePrepared(ctx, p.opts, spec)
 	}
 
-	if err := p.ensureHeadlessReady(spec); err != nil {
+	ready, err := p.ensureHeadlessReady(spec)
+	if err != nil {
 		return nil, err
 	}
+	spec = ready
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
@@ -463,9 +500,11 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	if err := p.ensureHeadlessReady(spec); err != nil {
+	ready, err := p.ensureHeadlessReady(spec)
+	if err != nil {
 		return nil, err
 	}
+	spec = ready
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
@@ -513,29 +552,83 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 // The overlay only applies at start, so this is also where the one-session
 // invariant is enforced: a divergent later layer is refused BEFORE the host
 // auth link and before startLocked, so a denied spawn leaves no side effect.
-func (p *Provider) ensureHeadlessReady(spec agent.Spec) error {
+// The comparison runs against the gateway-projected layer, not the raw
+// Spec.Env: a gateway-routed cell's child carries the binding-selected key
+// under the gateway env name, so comparing the original layer would refuse a
+// same-session Resume for carrying exactly what the child was started with.
+func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
 	select {
 	case <-p.shutdown:
-		return fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
+		return spec, fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
 	default:
 	}
-	if err := p.checkSessionEnvLocked(spec.Env); err != nil {
-		return err
+	// Resolve the gateway route first: gatewayBinding is pure (no side
+	// effects) and the projected layer is what the running child actually
+	// carries, so the session-env check below must compare against it. A
+	// gateway-routed cell's child carries the binding-selected key under
+	// the gateway env name; comparing the original Spec.Env would refuse a
+	// same-session Resume for carrying exactly what the child was started
+	// with. Keeping the resolution and the check before the protected-MCP
+	// pin, the host-auth link, and startLocked preserves the fail-closed
+	// ordering: a refused spawn leaves no side effect.
+	baseURL, gatewayKey, gatewayRouted, routeErr := gatewayBinding(spec)
+	if routeErr != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr)
+	}
+	projectedEnv := spec.Env
+	if gatewayRouted {
+		projectedEnv = projectGatewayKey(spec.Env, gatewayKey)
+	}
+	// The provider block is append-once: a boundary already carrying the
+	// provider id keeps the FIRST base URL. Without a route pin, a same-key
+	// Resume against a different base URL would succeed while the child
+	// stayed on the first gateway — a silent misroute. Refuse it here,
+	// before the session-env check and before any side effect.
+	if err := p.checkGatewayRouteLocked(baseURL, gatewayRouted); err != nil {
+		return spec, err
+	}
+	if err := p.checkSessionEnvLocked(projectedEnv); err != nil {
+		return spec, err
 	}
 	if err := p.prepareHeadlessProtectedMCPAuthorityLocked(spec.MCPServers); err != nil {
-		return err
+		return spec, err
 	}
-	if p.hostAuthFile != "" {
+	// A gateway-routed cell skips the host-session auth link so the child
+	// cannot fall back to an operator login; the provider block plus the
+	// binding-selected key projected below are its only route.
+	if gatewayRouted {
+		if p.hostAuthFile != "" {
+			return spec, fmt.Errorf("%w: codex gateway route cannot combine with host-session auth", agent.ErrSpawnFailed)
+		}
+		nextEnv, err := p.config.appendGatewayProviderBlock(baseURL, gatewayKey, spec.Env)
+		if err != nil {
+			return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		}
+		if nextEnv == nil {
+			nextEnv = map[string]string{}
+		}
+		nextEnv[codexGatewayEnvKey] = gatewayKey
+		if strings.TrimSpace(nextEnv[codexGatewayEnvKey]) == "" {
+			return spec, fmt.Errorf("%w: codex gateway route requires a key on %s", agent.ErrSpawnFailed, codexGatewayEnvKey)
+		}
+		spec.Env = nextEnv
+	} else if p.hostAuthFile != "" {
 		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
-			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
+			return spec, fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
 		}
 	}
 	if err := p.startLocked(spec.Env); err != nil {
-		return fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	return nil
+	// Freeze the route the child was started with. baseURL is empty when the
+	// session is not gateway-routed, so the pin also refuses a later flip
+	// between a routed and an unrouted session on the same child.
+	p.pinnedGatewayBaseURL = baseURL
+	p.pinnedGatewayRouted = gatewayRouted
+	p.gatewayRoutePinned = true
+	return spec, nil
 }
 
 func (p *Provider) prepareHeadlessProtectedMCPAuthorityLocked(servers []agent.MCPServerConfig) error {
@@ -805,6 +898,44 @@ func (p *Provider) registerHandle(h *Handle) {
 	p.handlesMu.Unlock()
 }
 
+// forwardRateLimitUpdates routes `account/rateLimits/updated`
+// notifications into every live handle's event stream. The
+// notification carries no thread id, so the client's fall-through
+// handler is the only place it surfaces; each handle maps it through
+// the shared probe mapper onto a UsageEvent carrying the sparse
+// update. Delivery is non-blocking and best-effort: a handle whose
+// queue is full drops the update rather than stalling the client's
+// read loop, and the next probe reconciles whatever was missed.
+func (p *Provider) forwardRateLimitUpdates() {
+	if p == nil || p.client == nil {
+		return
+	}
+	client := p.client
+	client.SubscribeGlobal(func(n notification) {
+		if n.Method != "account/rateLimits/updated" {
+			// A fall-through handler replaces the client's own, which
+			// answers an unhandled server request with -32601 so codex
+			// does not wait on it. Keep that answer.
+			if len(n.ServerRequestID) > 0 {
+				_ = client.RespondToServerRequestWithError(n.ServerRequestID, -32601, "no handler for "+n.Method)
+			}
+			return
+		}
+		p.handlesMu.Lock()
+		live := make([]*Handle, 0, len(p.handles))
+		for h := range p.handles {
+			live = append(live, h)
+		}
+		p.handlesMu.Unlock()
+		for _, h := range live {
+			select {
+			case h.notifyCh <- n:
+			default:
+			}
+		}
+	})
+}
+
 func (p *Provider) unregisterHandle(h *Handle) {
 	p.handlesMu.Lock()
 	delete(p.handles, h)
@@ -1010,6 +1141,33 @@ func mergeEnv(extra, session map[string]string, codexHome string) []string {
 // this never fires; it exists so an embedder that pools Providers across
 // sessions gets a loud failure instead of a wrong answer.
 var errSessionEnvConflict = errors.New("codex app-server is already bound to a different session environment")
+
+// errGatewayRouteConflict marks a headless Spawn/Resume whose gateway route
+// (routed vs unrouted, and the routed base URL) differs from the route the
+// running app-server child was started with. The private config's provider
+// block is append-once and the child authenticates with the pinned session
+// key, so a different route could never be what the child actually serves;
+// it fails closed with this instead of silently staying on the first route.
+var errGatewayRouteConflict = errors.New("codex app-server is already bound to a different gateway route")
+
+// checkGatewayRouteLocked refuses a session whose gateway route the running
+// app-server child cannot actually be serving. startMu must be held.
+//
+// Before any headless start there is nothing to conflict with, so the first
+// caller always passes and ensureHeadlessReady pins its route after a
+// successful start. A matching route passes forever after, which is what
+// keeps same-route Resume working. The comparison names the conflict but
+// never echoes either base URL: a base URL can carry a tenant-scoped path
+// segment, and this error reaches session records.
+func (p *Provider) checkGatewayRouteLocked(baseURL string, routed bool) error {
+	if !p.gatewayRoutePinned {
+		return nil
+	}
+	if p.pinnedGatewayRouted == routed && (!routed || p.pinnedGatewayBaseURL == baseURL) {
+		return nil
+	}
+	return fmt.Errorf("%w: %w: gateway endpoint differs from the pinned route", agent.ErrSpawnFailed, errGatewayRouteConflict)
+}
 
 // checkSessionEnvLocked refuses a session whose environment layer the running
 // app-server child cannot actually be carrying. startMu must be held.

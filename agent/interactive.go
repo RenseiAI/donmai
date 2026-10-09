@@ -94,6 +94,20 @@ type InteractiveCapable interface {
 	InteractiveSession() InteractiveSession
 }
 
+// InteractiveActivityFlusher is an optional capability of an interactive
+// Handle that publishes provider activity (for example assistant turns and
+// tool calls read from the harness's own transcript) on Events while the PTY
+// session runs. Activity the child writes on its way out can only be read
+// after InteractiveSession().Done closes, so it is enqueued after Done.
+// ActivityFlushed closes once the handle has enqueued the session's last
+// activity event. A supervisor that observes Done keeps draining Events
+// until ActivityFlushed closes (bounded by its own grace) so that trailing
+// activity is not lost. Handles without the capability have no activity to
+// flush after Done.
+type InteractiveActivityFlusher interface {
+	ActivityFlushed() <-chan struct{}
+}
+
 // InteractiveSession is the live interactive surface of one
 // PTY-hosted session. Implementations must be safe for concurrent use.
 //

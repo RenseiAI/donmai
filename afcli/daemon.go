@@ -21,6 +21,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	daemonRuntime "github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/installer"
+	"github.com/RenseiAI/donmai/installer/servicepriority"
 	"github.com/RenseiAI/donmai/internal/anontoken"
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
@@ -147,6 +148,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory, cfg Config) *cobra.Com
 func newDaemonInstallCmd(bin string) *cobra.Command {
 	var (
 		binPath            string // --bin-path overrides the host binary path resolved via os.Executable()
+		processPriority    string // --process-priority: default or background; empty keeps the saved mode
 		scopeUser          bool   // Linux systemd: --user  (user-scoped unit, default)
 		scopeSystem        bool   // Linux systemd: --system (system-scoped unit, requires root)
 		skipServiceManager bool   // hidden: --skip-service-manager (test/internal hermetic install)
@@ -163,7 +165,14 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 			"  " + bin + " host install [--bin-path /path/to/" + bin + "]\n\n" +
 			"Linux:\n" +
 			"  " + bin + " host install --user    (user-scoped systemd unit, default)\n" +
-			"  " + bin + " host install --system  (system-scoped systemd unit, requires sudo)",
+			"  " + bin + " host install --system  (system-scoped systemd unit, requires sudo)\n\n" +
+			"Process priority:\n" +
+			"  --process-priority background runs the daemon, and every process it spawns, at\n" +
+			"  the lowest CPU priority with throttled disk I/O (launchd ProcessType=Background\n" +
+			"  and LowPriorityIO on macOS; systemd Nice=19, CPUSchedulingPolicy=idle and\n" +
+			"  IOSchedulingClass=idle on Linux). --process-priority default restores the\n" +
+			"  normal priority. The mode is saved, so a later install without the flag keeps\n" +
+			"  it; `host status` shows the mode the running daemon actually has.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			scope := installer.ScopeUser
@@ -173,9 +182,14 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 			case scopeSystem:
 				scope = installer.ScopeSystem
 			}
+			priority, err := parseProcessPriority(processPriority)
+			if err != nil {
+				return err
+			}
 
 			res, err := installer.Install(installer.InstallOptions{
 				HostBinPath:        binPath,
+				ProcessPriority:    priority,
 				Scope:              scope,
 				SkipServiceManager: skipServiceManager,
 			})
@@ -186,6 +200,9 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintf(out, "Service registered: %s\n", res.ServicePath)
 			_, _ = fmt.Fprintf(out, "Service command: %s\n", res.ServiceCommand)
+			if line := formatInstalledProcessPriority(res); line != "" {
+				_, _ = fmt.Fprintln(out, line)
+			}
 
 			// Wipe any cached JWT so the daemon's first boot performs a
 			// fresh registration handshake with the orchestrator. Without
@@ -229,6 +246,8 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&binPath, "bin-path", "", "Path to the host binary (default: current executable)")
+	cmd.Flags().StringVar(&processPriority, "process-priority", "",
+		"Daemon service process priority: \"default\", or \"background\" (lowest CPU priority and throttled disk I/O for the daemon and everything it spawns). Omit to keep the saved mode")
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Install as user-scoped systemd unit (Linux)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Install as system-scoped systemd unit, requires sudo (Linux)")
 	cmd.Flags().BoolVar(&skipServiceManager, "skip-service-manager", false,
@@ -408,6 +427,8 @@ func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error
 		{"Uptime:", uptime},
 		{"Sessions:", fmt.Sprintf("%d / %d", r.ActiveSessions, r.MaxSessions)},
 		{"Projects:", formatStatusProjectIDs(r)},
+		{"Process priority:", formatProcessPriorityStatus(r.ProcessPriority)},
+		{"Seat budget:", formatSeatBudgetStatus(r.SeatBudget)},
 		{"Timestamp:", r.Timestamp},
 	}
 	for _, row := range rows {
@@ -427,6 +448,72 @@ func formatStatusProjectIDs(r *afclient.DaemonStatusResponse) string {
 		value += fmt.Sprintf(" (desired: %s)", strings.Join(r.EnabledProjectIDs, ", "))
 	}
 	return value
+}
+
+// formatProcessPriorityStatus renders the daemon's process priority for the
+// status table: the mode name, plus the daemon's note when the observation
+// failed or the running mode differs from the installed one. A daemon that does
+// not report the field, such as one older than it, reads as "not reported".
+func formatProcessPriorityStatus(status *afclient.DaemonProcessPriorityStatus) string {
+	if status == nil || strings.TrimSpace(status.Mode) == "" {
+		return "not reported"
+	}
+	if status.Warning != "" {
+		return status.Mode + " — " + status.Warning
+	}
+	return status.Mode
+}
+
+// formatSeatBudgetStatus renders the per-seat budget for the status table:
+// the posture with the values, or "not reported" against an older daemon.
+// A host with budgeting off reads as "none" — the honest shape, not an
+// omission an operator could misread as a missing probe.
+func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
+	if status == nil || strings.TrimSpace(status.Mode) == "" {
+		return "not reported"
+	}
+	if status.Mode == "none" {
+		return "none"
+	}
+	value := status.Mode
+	if status.CPUs > 0 {
+		value += fmt.Sprintf(", %d CPUs", status.CPUs)
+	}
+	if status.MemoryMB > 0 {
+		value += fmt.Sprintf(", %d MB", status.MemoryMB)
+	}
+	if status.Detail != "" {
+		value += " — " + status.Detail
+	}
+	return value
+}
+
+// formatInstalledProcessPriority is the install report line for the mode that
+// was applied. The unremarkable case, an install that named no mode and has
+// none saved, stays silent so its output is unchanged.
+func formatInstalledProcessPriority(res installer.InstallResult) string {
+	switch res.ProcessPrioritySource {
+	case installer.ProcessPrioritySourceExplicit:
+		return fmt.Sprintf("Process priority: %s", res.ProcessPriority)
+	case installer.ProcessPrioritySourceSaved:
+		if res.ProcessPriority == installer.ProcessPriorityDefault {
+			return ""
+		}
+		return fmt.Sprintf("Process priority: %s (kept from the previous install; pass --process-priority to change it)", res.ProcessPriority)
+	default:
+		return ""
+	}
+}
+
+// parseProcessPriority validates the --process-priority value. An empty value
+// is not the default mode: it means the flag was not given, and the installer
+// keeps the saved mode.
+func parseProcessPriority(raw string) (installer.ProcessPriority, error) {
+	priority, err := servicepriority.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid --process-priority: %w", err)
+	}
+	return priority, nil
 }
 
 // ── logs ──────────────────────────────────────────────────────────────────────

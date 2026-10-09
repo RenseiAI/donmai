@@ -24,6 +24,8 @@ const (
 	EventToolUse       EventKind = "tool_use"
 	EventToolResult    EventKind = "tool_result"
 	EventToolProgress  EventKind = "tool_progress"
+	EventUsage         EventKind = "usage"
+	EventSubagent      EventKind = "subagent"
 	EventResult        EventKind = "result"
 	EventError         EventKind = "error"
 )
@@ -32,7 +34,7 @@ const (
 //
 // Implementations: InitEvent, SystemEvent, AssistantTextEvent,
 // LlmCallEvent, ToolUseEvent, ToolResultEvent, ToolProgressEvent,
-// ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
+// SubagentEvent, ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
 // packages from satisfying the interface, keeping the discriminated
 // union closed.
 //
@@ -221,10 +223,16 @@ type LlmCallEvent struct {
 	ResponseModel         string `json:"responseModel,omitempty"`
 	ResponseModelProvider string `json:"responseModelProvider,omitempty"`
 
-	InputTokens       int64  `json:"inputTokens,omitempty"`
-	OutputTokens      int64  `json:"outputTokens,omitempty"`
-	CachedInputTokens int64  `json:"cachedInputTokens,omitempty"`
-	FinishReason      string `json:"finishReason,omitempty"`
+	InputTokens       int64 `json:"inputTokens,omitempty"`
+	OutputTokens      int64 `json:"outputTokens,omitempty"`
+	CachedInputTokens int64 `json:"cachedInputTokens,omitempty"`
+	// CacheWriteTokens is the cache-write (cache creation) input token
+	// count. Like CachedInputTokens it is excluded from InputTokens.
+	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens is the reasoning token count inside OutputTokens,
+	// never an additive extra (see CostData).
+	ReasoningTokens int64  `json:"reasoningTokens,omitempty"`
+	FinishReason    string `json:"finishReason,omitempty"`
 	// ObservedCostUsd is the provider's price for this exact call. A pointer
 	// distinguishes a reported zero from an absent price. Estimated prices
 	// and aggregate fallbacks must not populate it.
@@ -329,6 +337,25 @@ type ToolResultEvent struct {
 func (ToolResultEvent) Kind() EventKind { return EventToolResult }
 func (ToolResultEvent) isAgentEvent()   {}
 
+// UsageEvent carries a sparse subscription quota-window update observed
+// mid-turn (for example the streamed rate-limit event). Windows merge by
+// ID onto the published snapshot; omitted windows are unchanged.
+type UsageEvent struct {
+	// Message is the provider's status for the update, when reported
+	// (for example "allowed_warning").
+	Message string `json:"message,omitempty"`
+
+	// Usage is the sparse update. Never nil on a well-formed event.
+	Usage *UsageLimitsUpdate `json:"usage,omitempty"`
+
+	// Raw is the provider-native event payload.
+	Raw any `json:"raw,omitempty"`
+}
+
+// Kind reports the EventKind discriminant.
+func (UsageEvent) Kind() EventKind { return EventUsage }
+func (UsageEvent) isAgentEvent()   {}
+
 // ToolProgressEvent is a long-running tool's progress tick. Verbatim
 // port of AgentToolProgressEvent.
 type ToolProgressEvent struct {
@@ -345,6 +372,54 @@ type ToolProgressEvent struct {
 // Kind reports the EventKind discriminant.
 func (ToolProgressEvent) Kind() EventKind { return EventToolProgress }
 func (ToolProgressEvent) isAgentEvent()   {}
+
+// SubagentPhase is the lifecycle phase carried on a SubagentEvent.
+type SubagentPhase string
+
+// Subagent lifecycle phases. Stable wire values.
+const (
+	SubagentStarted   SubagentPhase = "started"
+	SubagentCompleted SubagentPhase = "completed"
+	SubagentFailed    SubagentPhase = "failed"
+)
+
+// SubagentEvent is the typed lifecycle event an adapter emits around a
+// native sub-agent delegation tool call: `started` when the delegation
+// tool is invoked, `completed` when its result arrives successfully,
+// `failed` when its result arrives as an error.
+//
+// ToolName is the adapter's own delegation tool name (the adapter names
+// its tools; the runner keeps no list). ToolUseID pairs the lifecycle
+// with the delegating ToolUseEvent/ToolResultEvent. ChildSessionID is
+// the sub-agent's session ref when the harness exposes one, else empty
+// — adapters never guess.
+type SubagentEvent struct {
+	// TraceID, SpanID, and ParentSpanID are populated by the runner's session
+	// correlator. SpanID identifies the subagent span the runtime span
+	// processor emits for this lifecycle.
+	TraceID      string `json:"traceId,omitempty"`
+	SpanID       string `json:"spanId,omitempty"`
+	ParentSpanID string `json:"parentSpanId,omitempty"`
+
+	// ToolName is the delegation tool identifier (e.g. "Task", "Agent").
+	ToolName string `json:"toolName"`
+
+	// ToolUseID pairs with the delegating ToolUseEvent.ToolUseID.
+	ToolUseID string `json:"toolUseId,omitempty"`
+
+	// Phase is the lifecycle phase: started | completed | failed.
+	Phase SubagentPhase `json:"phase"`
+
+	// ChildSessionID is the sub-agent's session ref when known.
+	ChildSessionID string `json:"childSessionId,omitempty"`
+
+	// Raw is the provider-native event payload.
+	Raw any `json:"raw,omitempty"`
+}
+
+// Kind reports the EventKind discriminant.
+func (SubagentEvent) Kind() EventKind { return EventSubagent }
+func (SubagentEvent) isAgentEvent()   {}
 
 // ResultEvent is the terminal session-outcome event from the provider.
 // Distinct from agent.Result which is the runner's higher-level
@@ -505,6 +580,18 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		var ev ToolProgressEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, fmt.Errorf("agent: decode ToolProgressEvent: %w", err)
+		}
+		return ev, nil
+	case EventUsage:
+		var ev UsageEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode UsageEvent: %w", err)
+		}
+		return ev, nil
+	case EventSubagent:
+		var ev SubagentEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode SubagentEvent: %w", err)
 		}
 		return ev, nil
 	case EventResult:

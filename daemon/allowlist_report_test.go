@@ -51,14 +51,13 @@ func TestAllowlistEntriesFromConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("trims clone/git fields from the wire payload", func(t *testing.T) {
+	t.Run("trims git fields from the wire payload", func(t *testing.T) {
 		t.Parallel()
 		in := []ProjectConfig{
 			{
-				ID:            "alpha",
-				Repository:    "github.com/x/alpha",
-				CloneStrategy: "shallow",
-				Git:           &ProjectGit{},
+				ID:         "alpha",
+				Repository: "github.com/x/alpha",
+				Git:        &ProjectGit{},
 			},
 		}
 		got := AllowlistEntriesFromConfig(in)

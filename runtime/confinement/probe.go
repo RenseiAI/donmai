@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +22,21 @@ import (
 // self-test probe. Its value is the path of the probe plan. An executable
 // that can serve as the probe calls RunProbeFromEnv first thing in main.
 const ProbeEnv = "DONMAI_CONFINEMENT_PROBE"
+
+// landlockStageEnv marks a harness-process execution as the Linux backend's
+// Landlock stage: the process programs the policy described in the
+// invocation and execs the harness. The harness proper never sets it.
+const landlockStageEnv = "DONMAI_CONFINEMENT_LANDLOCK_STAGE"
+
+// probeDecoyEnv turns the probe executable into the self-test's decoy: a
+// process outside the boundary the confined probe tries to signal, attach
+// to and read. Its value is the marker file it creates when signalled.
+const probeDecoyEnv = "DONMAI_CONFINEMENT_PROBE_DECOY"
+
+// probeRemountEnv turns the probe executable into the nested-namespace
+// remount child: its value is the read-only leaf and the file to create
+// through it, separated by a newline.
+const probeRemountEnv = "DONMAI_CONFINEMENT_PROBE_REMOUNT"
 
 // probeXattr is the extended attribute the probe sets.
 const probeXattr = "user.donmai.confinement-probe"
@@ -47,6 +64,7 @@ const (
 	opSymlinkWrite stepOp = "symlink_write"
 	opListen       stepOp = "listen"
 	opDial         stepOp = "dial"
+	opTCPDial      stepOp = "tcp_dial"
 	opDevWrite     stepOp = "dev_write"
 	opStdout       stepOp = "stdout"
 	opReenter      stepOp = "reenter"
@@ -56,6 +74,21 @@ const (
 	opAttach       stepOp = "attach"
 	opMount        stepOp = "mount"
 	opPrefWrite    stepOp = "preference_write"
+	opRead         stepOp = "read"
+	opList         stepOp = "list"
+	opStat         stepOp = "stat"
+	opOpen         stepOp = "open"
+	opGetxattr     stepOp = "getxattr"
+	// The Linux widening vocabulary: what a confined process could use to
+	// reach outside its boundary there. Each targets something the
+	// self-test placed outside: a decoy process, an abstract socket, the
+	// read-only leaf.
+	opSignal         stepOp = "signal"
+	opPtrace         stepOp = "ptrace"
+	opProcRead       stepOp = "proc_read"
+	opDialAbstract   stepOp = "dial_abstract"
+	opNestedBoundary stepOp = "nested_boundary"
+	opNestedRemount  stepOp = "nested_remount"
 )
 
 type probeStep struct {
@@ -66,6 +99,13 @@ type probeStep struct {
 	Label    string   `json:"label,omitempty"`
 	Services []string `json:"services,omitempty"`
 	PID      int      `json:"pid,omitempty"`
+	Port     int      `json:"port,omitempty"`
+	// Host selects the dial target for the loopback TCP probe: one of
+	// "127.0.0.1", "::1" or "localhost". Empty means the IPv4
+	// loopback, so older plans keep their meaning.
+	Host string `json:"host,omitempty"`
+	// Flags are the options of the getxattr probe.
+	Flags int `json:"flags,omitempty"`
 }
 
 type probePlan struct {
@@ -85,6 +125,22 @@ type stepResult struct {
 // whether it did, with the exit code the process should end with. The
 // caller exits; a library never does.
 func RunProbeFromEnv() (handled bool, exitCode int) {
+	if handled, code := RunLandlockStageFromEnv(); handled {
+		return true, code
+	}
+	if marker := os.Getenv(probeDecoyEnv); marker != "" {
+		if err := runProbeDecoy(marker); err != nil {
+			fmt.Fprintf(os.Stderr, "confinement probe decoy: %v\n", err)
+			return true, 2
+		}
+		return true, 0
+	}
+	if target := os.Getenv(probeRemountEnv); target != "" {
+		if err := runNestedRemountChild(target); err != nil {
+			return true, 3
+		}
+		return true, 0
+	}
 	planPath := os.Getenv(ProbeEnv)
 	if planPath == "" {
 		return false, 0
@@ -157,6 +213,8 @@ func runStep(step probeStep) stepResult {
 		err = listenAndDial(step.Path)
 	case opDial:
 		err = dial(step.Path)
+	case opTCPDial:
+		err = dialTCP(tcpHost(step.Host), step.Port)
 	case opDevWrite:
 		err = appendFile(step.Path)
 	case opStdout:
@@ -177,6 +235,30 @@ func runStep(step probeStep) stepResult {
 		result.Exit, result.Output, err = runTool("/usr/bin/defaults", "write", step.Label, "probe", "1")
 	case opMount:
 		result.Exit, result.Output, err = runTool("/usr/bin/hdiutil", "attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", step.Path, step.Path2)
+	case opRead:
+		_, err = os.ReadFile(step.Path) //nolint:gosec // G304: the probe's own target.
+	case opList:
+		_, err = os.ReadDir(step.Path)
+	case opStat:
+		_, err = os.Lstat(step.Path)
+	case opOpen:
+		err = openForRead(step.Path)
+	case opGetxattr:
+		err = readXattr(step.Path, step.Label, step.Flags)
+	case opSignal:
+		err = unix.Kill(step.PID, unix.SIGUSR1)
+	case opPtrace:
+		err = ptraceSeize(step.PID)
+	case opProcRead:
+		_, err = os.ReadFile(filepath.Join("/proc", strconv.Itoa(step.PID), "environ")) //nolint:gosec // G304: a fixed procfs file of the probe's own target pid.
+	case opDialAbstract:
+		err = dial("@" + step.Label)
+	case opNestedBoundary:
+		// A boundary built from inside the boundary, binding the whole
+		// visible tree, must not reach what the outer one hides.
+		result.Exit, result.Output, err = runTool(step.Path2, "--dev-bind", "/", "/", "--", step.Label, step.Path)
+	case opNestedRemount:
+		err = nestedRemount(step.Path, step.Path2)
 	default:
 		err = fmt.Errorf("unknown probe operation %q", step.Op)
 	}
@@ -184,6 +266,30 @@ func runStep(step probeStep) stepResult {
 		result.Err = errnoText(err)
 	}
 	return result
+}
+
+// openForRead opens path read-only without blocking and without taking it as
+// the controlling terminal, then closes it: whether the open is allowed is
+// the question, for a device node a read would block on.
+func openForRead(path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	return unix.Close(fd)
+}
+
+// readXattr reads the whole value of one extended attribute: its size
+// first, then the value, so a value longer than any fixed buffer is not
+// mistaken for a refusal.
+func readXattr(path, name string, options int) error {
+	size, err := getxattr(path, name, nil, options)
+	if err != nil {
+		return err
+	}
+	const most = 1 << 20
+	_, err = getxattr(path, name, make([]byte, min(size, most)), options)
+	return err
 }
 
 func createFile(path string) error {
@@ -237,6 +343,29 @@ func listenAndDial(path string) error {
 
 func dial(path string) error {
 	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+// tcpHost normalizes the loopback TCP probe's dial target. The deny rule
+// names the local machine, so the probe must cover the numeric IPv4 and
+// IPv6 loopbacks and the hostname that may resolve to either.
+func tcpHost(host string) string {
+	switch host {
+	case "::1", "localhost":
+		return host
+	default:
+		return "127.0.0.1"
+	}
+}
+
+// dialTCP connects to the loopback target on one port: the probe the
+// profile's loopback deny is judged by.
+func dialTCP(host string, port int) error {
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
 		return err
 	}
@@ -304,4 +433,27 @@ func parseLookups(output string) map[string]int {
 // results and every positive control fails.
 func probeResultPath(sessionTmp string) string {
 	return filepath.Join(sessionTmp, "probe-result.json")
+}
+
+// runProbeDecoy is the decoy process: it opens itself to attachment by any
+// process of its user (so only the boundary, not the host's attach policy,
+// decides whether the confined probe can attach), creates marker when it
+// receives SIGUSR1, tells the self-test it is ready on standard output, and
+// lives until its standard input closes.
+func runProbeDecoy(marker string) error {
+	if err := allowAnyTracer(); err != nil {
+		return err
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, unix.SIGUSR1)
+	go func() {
+		for range signals {
+			_ = createFile(marker)
+		}
+	}()
+	if _, err := os.Stdout.WriteString("ready\n"); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	return nil
 }

@@ -20,15 +20,33 @@ import (
 // one line) and the provider-pin / handshake / home env vars to files in the
 // session cwd, then exits immediately — no PTY interaction is needed for the
 // argv+env assertions. DONMAI_PI_HANDSHAKE is wrapped in brackets so an ABSENT
-// value is distinguishable from any value at all.
+// value is distinguishable from any value at all. DONMAI_PI_KEY is captured
+// the same way: since credentials moved to the session file, the child env
+// must carry NO key — an absent value proves it — while the file named by
+// DONMAI_PI_CREDENTIALS_FILE carries it. The file is COPIED beside the
+// capture rather than echoed into env.txt: its environment section holds
+// the session's other bindings, and a failure message must never print
+// them.
 const captureArgvEnvScript = `
 printf '%s\n' "$@" > "$PWD/argv.txt"
 {
   printf 'DONMAI_PI_BASE_URL=%s\n' "$DONMAI_PI_BASE_URL"
   printf 'DONMAI_PI_API=%s\n' "$DONMAI_PI_API"
   printf 'DONMAI_PI_MODEL=%s\n' "$DONMAI_PI_MODEL"
-  printf 'DONMAI_PI_KEY=%s\n' "$DONMAI_PI_KEY"
+  printf 'DONMAI_PI_KEY=[%s]\n' "$DONMAI_PI_KEY"
   printf 'DONMAI_PI_HANDSHAKE=[%s]\n' "$DONMAI_PI_HANDSHAKE"
+  printf 'DONMAI_PI_CREDENTIALS_FILE=%s\n' "$DONMAI_PI_CREDENTIALS_FILE"
+  if [ -n "$DONMAI_PI_CREDENTIALS_FILE" ] && [ -f "$DONMAI_PI_CREDENTIALS_FILE" ]; then
+    cp "$DONMAI_PI_CREDENTIALS_FILE" "$PWD/credential-file.json"
+    printf 'CREDENTIAL-FILE:PRESENT\n'
+  else
+    printf 'CREDENTIAL-FILE:ABSENT\n'
+  fi
+  printf 'DONMAI_PI_PRICES_BOUND=%s\n' "$DONMAI_PI_PRICES_BOUND"
+  printf 'DONMAI_PI_PRICE_INPUT=%s\n' "$DONMAI_PI_PRICE_INPUT"
+  printf 'DONMAI_PI_PRICE_OUTPUT=%s\n' "$DONMAI_PI_PRICE_OUTPUT"
+  printf 'DONMAI_PI_PRICE_CACHE_READ=%s\n' "$DONMAI_PI_PRICE_CACHE_READ"
+  printf 'DONMAI_PI_PRICE_CACHE_WRITE=%s\n' "$DONMAI_PI_PRICE_CACHE_WRITE"
   printf 'PI_HOME=%s\n' "$PI_HOME"
 } > "$PWD/env.txt"
 `
@@ -167,17 +185,64 @@ func TestSpawn_Interactive_PinArgvAndEnvFromBinding(t *testing.T) {
 		"DONMAI_PI_BASE_URL=https://ai-gateway.invalid/v1",
 		"DONMAI_PI_API=openai-completions",
 		"DONMAI_PI_MODEL=agg-vendor/claude-3-haiku",
-		"DONMAI_PI_KEY=gw-secret",
 	} {
 		if !strings.Contains(env, want) {
 			t.Errorf("captured PTY-child env missing %q; got:\n%s", want, env)
 		}
 	}
+	// The session credential rides the credential FILE, never the child env:
+	// the env carries no key value, only the file's path.
+	if !strings.Contains(env, "DONMAI_PI_KEY=[]") {
+		t.Errorf("interactive child env must carry no session key value; got:\n%s", env)
+	}
+	_ = credentialPathFromCapturedEnv(t, env)
+	got := credentialValuesFromCapture(t, workdir)
+	if got[PiKeyEnvVar] != "gw-secret" {
+		t.Errorf("credential file %s = %q, want the binding key", PiKeyEnvVar, got[PiKeyEnvVar])
+	}
 	// The interactive spawn NEVER sets the handshake token — the extension's
 	// RPC-mode handshake is skipped, so no UI artifact renders in the TUI.
+	// The capture prints the child's complete environment (the PTY host
+	// inherits nothing past the allowlist), and the session credential never
+	// rides it.
 	if !strings.Contains(env, "DONMAI_PI_HANDSHAKE=[]") {
-		t.Errorf("interactive child unexpectedly carries a handshake token; got:\n%s", env)
+		t.Errorf("interactive child env carries a handshake token; got:\n%s", env)
 	}
+	for _, line := range strings.Split(env, "\n") {
+		if strings.Contains(line, "gw-secret") {
+			t.Errorf("interactive child env carries the session credential value: %q", line)
+		}
+	}
+}
+
+// credentialPathFromCapturedEnv extracts the credential-file path the fake pi
+// captured from its env, failing the test when the session has no rail.
+func credentialPathFromCapturedEnv(t *testing.T, env string) string {
+	t.Helper()
+	for _, line := range strings.Split(env, "\n") {
+		if path, ok := strings.CutPrefix(line, credentialFileEnvVar+"="); ok && strings.TrimSpace(path) != "" {
+			return strings.TrimSpace(path)
+		}
+	}
+	t.Fatalf("captured child env carries no %s pointer; got:\n%s", credentialFileEnvVar, env)
+	return ""
+}
+
+// credentialValuesFromCapture reads the credentials section of the
+// credential-file copy the fake pi captured while the file still existed
+// (the PTY cleanup removes the file when the child exits, so the path alone
+// is unreadable after awaitPTYExit).
+func credentialValuesFromCapture(t *testing.T, workdir string) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(workdir, "credential-file.json")) //nolint:gosec // test-owned capture path
+	if err != nil {
+		t.Fatalf("credential file was absent when the child started: %v", err)
+	}
+	got, err := readSessionCredentialMap(raw)
+	if err != nil {
+		t.Fatalf("decode captured credential file: %v", err)
+	}
+	return got
 }
 
 // TestSpawn_Interactive_NilBindingParity pins the nil-binding shape: with no
@@ -219,8 +284,20 @@ func TestSpawn_Interactive_NilBindingParity(t *testing.T) {
 	if strings.Contains(env, "DONMAI_PI_BASE_URL=https") {
 		t.Errorf("nil-binding interactive child carries a non-empty pin base URL; got:\n%s", env)
 	}
-	if !strings.Contains(env, "DONMAI_PI_HANDSHAKE=[]") {
-		t.Errorf("interactive child unexpectedly carries a handshake token; got:\n%s", env)
+	// A keyless session carries no key: the child env has none, and the
+	// credential file (present only to carry the session's other bindings in
+	// its environment section) has an empty credentials section.
+	if !strings.Contains(env, "DONMAI_PI_KEY=[]") {
+		t.Errorf("keyless interactive child env carries a session key; got:\n%s", env)
+	}
+	if strings.Contains(env, "CREDENTIAL-FILE:PRESENT") {
+		if got := credentialValuesFromCapture(t, workdir); len(got) != 0 {
+			names := make([]string, 0, len(got))
+			for name := range got {
+				names = append(names, name)
+			}
+			t.Errorf("keyless session filed credentials under %v; want none", names)
+		}
 	}
 }
 
@@ -253,22 +330,25 @@ func TestSpawn_Interactive_DonmaiPiKeyMirrorSurvivesPreset(t *testing.T) {
 	awaitPTYExit(t, h)
 
 	env := readCapturedFile(t, workdir, "env.txt")
-	if !strings.Contains(env, "DONMAI_PI_KEY=snapshot-key-wins") {
-		t.Errorf("pre-set snapshot DONMAI_PI_KEY did not survive the binding merge; got:\n%s", env)
+	if !strings.Contains(env, "DONMAI_PI_KEY=[]") {
+		t.Errorf("interactive child env must carry no session key value; got:\n%s", env)
 	}
-	if strings.Contains(env, "DONMAI_PI_KEY=binding-key-loses") {
-		t.Errorf("binding key overwrote the snapshot key; got:\n%s", env)
+	got := credentialValuesFromCapture(t, workdir)
+	if got[PiKeyEnvVar] != "snapshot-key-wins" {
+		t.Errorf("credential file %s = %q, want the pre-set snapshot key to win", PiKeyEnvVar, got[PiKeyEnvVar])
 	}
 }
 
 // TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless is the fast unit-level
-// companion to the fixture tests: it pins the ONE difference between the
+// companion to the fixture tests: it pins the TWO differences between the
 // interactive and headless child env at the seam. The headless composeChildEnv
 // carries the per-session handshake token; the interactive interactiveChildEnv
 // omits it (so the extension's RPC-mode handshake is skipped) while still
-// carrying the provider pin. RED proof: add piHandshakeEnvVar to
-// interactiveChildEnv and this test fails; the headless handshake gate would
-// then wrongly appear reachable from a PTY child that has no RPC consumer.
+// carrying the provider pin. And NEITHER lane carries a credential value:
+// the resolved cell key rides the session credential file on both.
+// RED proof: add piHandshakeEnvVar to interactiveChildEnv and this test
+// fails; the headless handshake gate would then wrongly appear reachable
+// from a PTY child that has no RPC consumer.
 func TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless(t *testing.T) {
 	t.Parallel()
 	cwd := t.TempDir()
@@ -295,8 +375,22 @@ func TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless(t *testing.T) {
 	if inter[piBaseURLEnvVar] != "https://ai-gateway.invalid/v1" {
 		t.Errorf("interactive child env missing the provider pin base URL: %v", inter)
 	}
-	if inter[PiKeyEnvVar] != "k" {
-		t.Errorf("interactive child env dropped the resolved cell key: %v", inter)
+	// The resolved cell key rides the credential file, never either env —
+	// not as a value, and not as a name: the interactive env is the child's
+	// complete environment (the PTY host inherits nothing past it), so no
+	// credential name needs an empty shadow and none is present.
+	for name, value := range inter {
+		if isSessionCredentialName(name) {
+			t.Errorf("interactive child env defines credential name %s (%q); it must be absent", name, value)
+		}
+	}
+	for _, e := range headless {
+		if isSessionCredentialEnv(e) {
+			t.Errorf("headless child env must NOT carry a credential-named entry; got %q", e)
+		}
+	}
+	if entries := sessionCredentialEntries(spec); len(entries) != 1 || entries[0].Value != "k" {
+		t.Errorf("session credential entries = %+v, want the one resolved cell key", entries)
 	}
 	if inter[piCodingAgentDirEnvVar] != layout.agentHome {
 		t.Errorf("interactive child env missing the agent-home redirect: %v", inter)
@@ -410,6 +504,90 @@ func TestSpawn_Interactive_MismatchedEndpointFailsLoudly(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Spawn: want error for an unroutable endpoint host on the interactive lane, got nil")
+	}
+}
+
+// interactiveGatewaySpec builds the gateway-backed spec the PTY price tests
+// share: an aggregator slug served through the injected provider lane.
+func interactiveGatewaySpec(workdir string, prices *agent.UnitPrices) agent.Spec {
+	return agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		Endpoint: &agent.EndpointBinding{
+			Company:    agent.CompanyAnthropic,
+			Model:      "agg-vendor/claude-3-haiku",
+			Protocol:   agent.ProtoOpenAIChat,
+			Host:       agent.HostDirect,
+			BaseURL:    "https://ai-gateway.invalid/v1",
+			Env:        map[string]string{"OPENAI_API_KEY": "gw-secret"},
+			UnitPrices: prices,
+		},
+	}
+}
+
+// TestSpawn_Interactive_BoundPricesReachPTYChild drives the production
+// interactive Spawn entry point with a priced binding: the PTY child env
+// carries the bound flag plus all four rates, so the extension registers
+// the real cost table on this lane too.
+func TestSpawn_Interactive_BoundPricesReachPTYChild(t *testing.T) {
+	workdir := t.TempDir()
+	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+	h, err := p.Spawn(context.Background(), interactiveGatewaySpec(workdir,
+		&agent.UnitPrices{Input: 3, Output: 15, CacheRead: 0.3, CacheWrite: 3.75}))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+	env := readCapturedFile(t, workdir, "env.txt")
+	for _, want := range []string{
+		"DONMAI_PI_PRICES_BOUND=1",
+		"DONMAI_PI_PRICE_INPUT=3",
+		"DONMAI_PI_PRICE_OUTPUT=15",
+		"DONMAI_PI_PRICE_CACHE_READ=0.3",
+		"DONMAI_PI_PRICE_CACHE_WRITE=3.75",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("PTY child env missing %q; got:\n%s", want, env)
+		}
+	}
+}
+
+// TestSpawn_Interactive_UnboundPricesClearPTYChild drives the production
+// interactive Spawn entry point with no prices bound: every price key is
+// present but empty in the PTY child env, so no inherited stale price
+// survives. RED proof: drop the price pin from interactiveChildEnv and the
+// stale host values below ride into the child.
+func TestSpawn_Interactive_UnboundPricesClearPTYChild(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv(piPricesBoundEnvVar, "1")
+	t.Setenv(piPriceInputEnvVar, "99")
+	t.Setenv(piPriceOutputEnvVar, "99")
+	t.Setenv(piPriceCacheReadEnvVar, "99")
+	t.Setenv(piPriceCacheWriteEnvVar, "99")
+
+	workdir := t.TempDir()
+	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+	h, err := p.Spawn(context.Background(), interactiveGatewaySpec(workdir, nil))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+	env := readCapturedFile(t, workdir, "env.txt")
+	for _, want := range []string{
+		"DONMAI_PI_PRICES_BOUND=\n",
+		"DONMAI_PI_PRICE_INPUT=\n",
+		"DONMAI_PI_PRICE_OUTPUT=\n",
+		"DONMAI_PI_PRICE_CACHE_READ=\n",
+		"DONMAI_PI_PRICE_CACHE_WRITE=\n",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("PTY child env missing clearing entry %q; got:\n%s", want, env)
+		}
+	}
+	if strings.Contains(env, "=99") {
+		t.Errorf("stale inherited price survived into the PTY child; got:\n%s", env)
 	}
 }
 
@@ -543,7 +721,7 @@ func TestSpawn_Interactive_RealBinary_StateDirGuardRefusesAndSessionContinues(t 
 	if !strings.Contains(string(secondTurn), stateDirGuardReasonPrefix) {
 		t.Fatalf("second real-pi model turn did not receive the typed refusal: %s", secondTurn)
 	}
-	if _, err := os.Stat(filepath.Join(workdir, piStateDir)); err != nil {
+	if _, err := os.Stat(filepath.Join(workdir, ".pi-"+filepath.Base(workdir))); err != nil {
 		t.Fatalf("the guarded state directory did not survive the real tool call: %v", err)
 	}
 	capable, ok := h.(agent.InteractiveCapable)

@@ -112,8 +112,19 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 	// Provide --add-dir so the agent can read outside the strict cwd
 	// when the worktree references shared paths. Mirrors the legacy
 	// SDK's `cwd` + project-root behavior.
-	if spec.Cwd != "" {
-		argv = append(argv, "--add-dir", spec.Cwd)
+	//
+	// Under a session-root-v1 declaration every mutable repository path is
+	// granted as an additional directory: the CLI's working directories are
+	// exactly the declared write scope, which is how the agent can work in
+	// each writable repository while its CWD stays the selected one. The
+	// selected repository's own CWD entry is kept first (it is also the
+	// process working directory set by the caller), and every other mutable
+	// path is appended after, deduplicated case-sensitively against it.
+	// Read-only declaration paths are never granted here: without a proven
+	// executor boundary they must not enter the write scope.
+	addDirs := additionalWorkdirs(spec)
+	for _, dir := range addDirs {
+		argv = append(argv, "--add-dir", dir)
 	}
 
 	if resumeSessionID != "" {
@@ -188,6 +199,26 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 	// this into cmd.Stdin in handle.go.
 	stdinPrompt = spec.Prompt
 	return argv, stdinPrompt
+}
+
+// additionalWorkdirs returns the ordered --add-dir list for a spawn: the
+// session working directory first, then every other declared mutable
+// repository path. A spec without a repository authority keeps the legacy
+// single entry.
+func additionalWorkdirs(spec agent.Spec) []string {
+	if spec.Cwd == "" {
+		return nil
+	}
+	dirs := []string{spec.Cwd}
+	if policy := spec.RepositoryAuthority; policy != nil {
+		for _, mutablePath := range policy.MutablePaths {
+			if mutablePath == "" || mutablePath == spec.Cwd {
+				continue
+			}
+			dirs = append(dirs, mutablePath)
+		}
+	}
+	return dirs
 }
 
 // dedupAndSort returns a stable, deduplicated, sorted copy of s with

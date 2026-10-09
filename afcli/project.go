@@ -139,6 +139,13 @@ func newProjectModeCmd(rw configReaderWriter, bin string) *cobra.Command {
 	}
 }
 
+// cloneStrategyRemovalVersion is the release in which the retired hidden
+// --clone-strategy no-op flag is deleted. The flag accepts and ignores any
+// value today so existing scripts keep parsing; the version names the
+// concrete removal release rather than "the next release" (see
+// hostAliasRemovalVersion's comment for why the promise must be concrete).
+const cloneStrategyRemovalVersion = "v0.73.0"
+
 // ── allow ─────────────────────────────────────────────────────────────────────
 
 func newProjectAllowCmd(rw configReaderWriter, bin string) *cobra.Command {
@@ -164,19 +171,21 @@ func newProjectAllowCmd(rw configReaderWriter, bin string) *cobra.Command {
 				return fmt.Errorf("repo-url must not be empty")
 			}
 
-			strategy := afclient.CloneStrategy(cloneStrategy)
-			if strategy == "" {
-				strategy = afclient.CloneShallow
+			entry := afclient.ProjectEntry{
+				RepoURL: repoURL,
+			}
+			if cloneStrategy != "" {
+				// The retired clone override is accepted and ignored so
+				// existing scripts keep parsing; nothing is stored.
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+					"warning: --clone-strategy is retired and ignored; "+
+						"remove the flag (removed in "+cloneStrategyRemovalVersion+").",
+				)
 			}
 
 			cfg, err := rw.ReadConfig()
 			if err != nil {
 				return fmt.Errorf("read daemon config: %w", err)
-			}
-
-			entry := afclient.ProjectEntry{
-				RepoURL:       repoURL,
-				CloneStrategy: strategy,
 			}
 
 			switch {
@@ -223,8 +232,9 @@ func newProjectAllowCmd(rw configReaderWriter, bin string) *cobra.Command {
 		"Allow the project without configuring credentials (daemon will refuse work until credentials added)")
 	cmd.Flags().BoolVar(&nonInteractive, "non-interactive", false,
 		"Suppress all interactive prompts (for CI/scripts)")
-	cmd.Flags().StringVar(&cloneStrategy, "clone-strategy", string(afclient.CloneShallow),
-		"Clone strategy: shallow (default), full, reference-clone")
+	cmd.Flags().StringVar(&cloneStrategy, "clone-strategy", "",
+		"Retired: accepted and ignored (removed in "+cloneStrategyRemovalVersion+")")
+	_ = cmd.Flags().MarkHidden("clone-strategy")
 
 	return cmd
 }
@@ -309,7 +319,7 @@ func newProjectListCmd(rw configReaderWriter, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List all allowed projects",
-		Long: "List the projects in the daemon's allowlist with repo URL, clone strategy,\n" +
+		Long: "List the projects in the daemon's allowlist with repo URL\n" +
 			"and credential helper. Data is read from ~/.donmai/daemon.yaml.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -337,16 +347,12 @@ func newProjectListCmd(rw configReaderWriter, bin string) *cobra.Command {
 // writeProjectTable renders a tabwriter table of projects.
 func writeProjectTable(w io.Writer, projects []afclient.ProjectEntry) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "  REPO URL\tCLONE STRATEGY\tCREDENTIAL HELPER"); err != nil {
+	if _, err := fmt.Fprintln(tw, "  REPO URL\tCREDENTIAL HELPER"); err != nil {
 		return fmt.Errorf("write table header: %w", err)
 	}
 	for _, p := range projects {
-		strategy := string(p.CloneStrategy)
-		if strategy == "" {
-			strategy = string(afclient.CloneShallow)
-		}
 		helperStr := credentialHelperString(p.CredentialHelper)
-		if _, err := fmt.Fprintf(tw, "  %s\t%s\t%s\n", p.RepoURL, strategy, helperStr); err != nil {
+		if _, err := fmt.Fprintf(tw, "  %s\t%s\n", p.RepoURL, helperStr); err != nil {
 			return fmt.Errorf("write table row: %w", err)
 		}
 	}

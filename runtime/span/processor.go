@@ -42,7 +42,7 @@ type ProcessorConfig struct {
 	System      string
 	Model       string
 
-	// REN-2649 incoming trace correlation (optional). When present the
+	// Incoming trace correlation (optional). When present the
 	// processor reuses the platform-minted trace ID and parents the session
 	// root to the dispatch parent ID; absent preserves locally minted trace.
 	Traceparent      string
@@ -57,6 +57,15 @@ type ProcessorConfig struct {
 }
 
 type pendingTool struct {
+	traceID      string
+	spanID       string
+	parentSpanID string
+	toolName     string
+	toolUseID    string
+	start        time.Time
+}
+
+type pendingSubagent struct {
 	traceID      string
 	spanID       string
 	parentSpanID string
@@ -88,7 +97,9 @@ type Processor struct {
 	pendingTools   map[string]pendingTool
 	pendingOrder   []string
 	completedTools map[string]pendingTool
-	finished       bool
+
+	pendingSubagents map[string]pendingSubagent
+	finished         bool
 }
 
 // NewProcessor validates cfg and allocates the session trace/root ids.
@@ -111,7 +122,7 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 	if cfg.IDGenerator == nil {
 		cfg.IDGenerator = randomHexID
 	}
-	// REN-2649: reuse incoming W3C traceparent when valid; otherwise mint.
+	// Reuse incoming W3C traceparent when valid; otherwise mint.
 	var traceID, dispatchParentID string
 	if cfg.Traceparent != "" {
 		if tid, pid, ok := parseTraceparent(cfg.Traceparent); ok {
@@ -146,6 +157,7 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 		turnStart:        now,
 		pendingTools:     make(map[string]pendingTool),
 		completedTools:   make(map[string]pendingTool),
+		pendingSubagents: make(map[string]pendingSubagent),
 	}, nil
 }
 
@@ -181,6 +193,8 @@ func (p *Processor) Process(ev agent.Event) []agent.Event {
 		return []agent.Event{p.processToolUse(e, now)}
 	case agent.ToolResultEvent:
 		return []agent.Event{p.processToolResult(e, now)}
+	case agent.SubagentEvent:
+		return []agent.Event{p.processSubagent(e, now)}
 	case agent.ResultEvent:
 		out := make([]agent.Event, 0, 2)
 		if !p.llmSinceResult {
@@ -294,12 +308,14 @@ func (p *Processor) processLlm(e agent.LlmCallEvent, now time.Time) agent.LlmCal
 			),
 		},
 		GenAI: agent.GenAIAttributes{
-			System:                    e.System,
-			RequestModel:              e.Model,
-			UsageInputTokens:          e.InputTokens,
-			UsageOutputTokens:         e.OutputTokens,
-			UsageCacheReadInputTokens: e.CachedInputTokens,
-			ResponseFinishReason:      e.FinishReason,
+			System:                     e.System,
+			RequestModel:               e.Model,
+			UsageInputTokens:           e.InputTokens,
+			UsageOutputTokens:          e.OutputTokens,
+			UsageCacheReadInputTokens:  e.CachedInputTokens,
+			UsageCacheWriteInputTokens: e.CacheWriteTokens,
+			UsageReasoningTokens:       e.ReasoningTokens,
+			ResponseFinishReason:       e.FinishReason,
 		},
 	})
 	p.activeLlmEmitted = true
@@ -433,6 +449,104 @@ func (p *Processor) emitTool(pending pendingTool, toolName string, isError bool,
 	})
 }
 
+// processSubagent correlates the typed sub-agent lifecycle and emits the
+// `subagent` span: `started` opens the span, `completed`/`failed` closes
+// it. The span nests under the delegating `tool` span (matched by ToolUseID
+// through the pending, then completed, tool records) instead of hanging off
+// the session root, so a delegation reads as a child of the call that
+// started it. Unknown phases pass through untouched.
+func (p *Processor) processSubagent(e agent.SubagentEvent, now time.Time) agent.SubagentEvent {
+	switch e.Phase {
+	case agent.SubagentStarted:
+		spanID := e.SpanID
+		if !validHexID(spanID, 8) {
+			spanID = p.mustID(8)
+		}
+		e.TraceID = p.traceID
+		e.SpanID = spanID
+		e.ParentSpanID = p.subagentParent(e.ToolUseID)
+		if e.ToolUseID != "" {
+			p.pendingSubagents[e.ToolUseID] = pendingSubagent{
+				traceID:      e.TraceID,
+				spanID:       e.SpanID,
+				parentSpanID: e.ParentSpanID,
+				toolName:     e.ToolName,
+				toolUseID:    e.ToolUseID,
+				start:        now,
+			}
+		}
+		return e
+	case agent.SubagentCompleted, agent.SubagentFailed:
+		pending, ok := p.pendingSubagents[e.ToolUseID]
+		if !ok || e.ToolUseID == "" {
+			p.ensureLlm(now)
+			spanID := e.SpanID
+			if !validHexID(spanID, 8) {
+				spanID = p.mustID(8)
+			}
+			pending = pendingSubagent{
+				traceID:      p.traceID,
+				spanID:       spanID,
+				parentSpanID: p.subagentParent(e.ToolUseID),
+				toolName:     e.ToolName,
+				toolUseID:    e.ToolUseID,
+				start:        now,
+			}
+		}
+		if e.ToolName == "" {
+			e.ToolName = pending.toolName
+		}
+		e.TraceID = pending.traceID
+		e.SpanID = pending.spanID
+		e.ParentSpanID = pending.parentSpanID
+		status := agent.SpanStatus{Code: agent.StatusOK}
+		if e.Phase == agent.SubagentFailed {
+			status = agent.SpanStatus{Code: agent.StatusError, Message: "subagent failed"}
+		}
+		p.emitSubagent(pending, e.ToolName, now, status)
+		delete(p.pendingSubagents, e.ToolUseID)
+		return e
+	default:
+		return e
+	}
+}
+
+// subagentParent resolves the parent span for a sub-agent lifecycle event:
+// the delegating `tool` span matched by ToolUseID when the correlator has
+// seen that tool call (pending or already completed), else the session root.
+func (p *Processor) subagentParent(toolUseID string) string {
+	if toolUseID != "" {
+		if pending, ok := p.pendingTools[toolUseID]; ok {
+			return pending.spanID
+		}
+		if completed, ok := p.completedTools[toolUseID]; ok {
+			return completed.spanID
+		}
+	}
+	return p.rootSpanID
+}
+
+func (p *Processor) emitSubagent(pending pendingSubagent, toolName string, end time.Time, status agent.SpanStatus) {
+	name := "subagent"
+	if toolName != "" {
+		name += " " + toolName
+	}
+	p.cfg.Sender.Send(agent.SubagentSpan{
+		SpanCore: agent.SpanCore{
+			TraceID:           pending.traceID,
+			SpanID:            pending.spanID,
+			ParentSpanID:      pending.parentSpanID,
+			Kind:              agent.SpanKindSubagent,
+			Name:              name,
+			StartTimeUnixNano: unixNanoString(pending.start),
+			EndTimeUnixNano:   unixNanoString(end),
+			Status:            status,
+			Donmai:            p.extensions("", "", ""),
+		},
+		SubagentProvider: pending.toolName,
+	})
+}
+
 func (p *Processor) flushPendingTools(now time.Time, terminalStatus agent.SpanStatus) {
 	for key, pending := range p.pendingTools {
 		status := agent.SpanStatus{Code: agent.StatusUnset, Message: "tool result not observed"}
@@ -448,6 +562,14 @@ func (p *Processor) flushPendingTools(now time.Time, terminalStatus agent.SpanSt
 		delete(p.pendingTools, key)
 	}
 	p.pendingOrder = p.pendingOrder[:0]
+	for key, pending := range p.pendingSubagents {
+		status := agent.SpanStatus{Code: agent.StatusUnset, Message: "subagent result not observed"}
+		if terminalStatus.Code == agent.StatusError {
+			status = terminalStatus
+		}
+		p.emitSubagent(pending, pending.toolName, now, status)
+		delete(p.pendingSubagents, key)
+	}
 }
 
 func (p *Processor) startProvisionalLlm(now time.Time) {
@@ -532,6 +654,8 @@ func aggregateLlmEvent(result agent.ResultEvent, system, model string) agent.Llm
 		e.InputTokens = result.Cost.InputTokens
 		e.OutputTokens = result.Cost.OutputTokens
 		e.CachedInputTokens = result.Cost.CachedInputTokens
+		e.CacheWriteTokens = result.Cost.CacheWriteTokens
+		e.ReasoningTokens = result.Cost.ReasoningTokens
 	}
 	switch {
 	case result.Success:

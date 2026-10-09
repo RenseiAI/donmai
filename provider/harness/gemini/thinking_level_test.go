@@ -101,8 +101,8 @@ func TestLive_ThinkingLevelCasing(t *testing.T) {
 	if model == "" {
 		model = "gemini-3.5-flash"
 	}
-	if !is3xModel(model) {
-		t.Fatalf("GEMINI_LIVE_MODEL %q is not a 3.x model; thinkingLevel only applies to the 3.x family", model)
+	if !usesThinkingLevel(model) {
+		t.Fatalf("GEMINI_LIVE_MODEL %q is not a level-knob model; thinkingLevel only applies to major >= 3 and unversioned ids", model)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

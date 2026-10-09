@@ -677,10 +677,17 @@ func ToolLifecycleProfileID(spec Spec) string { return spec.toolLifecycleProfile
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.
 //
 // All fields are optional; providers populate what they have available.
+//
+// Token accounting rule: InputTokens excludes cache read and cache write
+// tokens (those ride CachedInputTokens and CacheWriteTokens); ReasoningTokens
+// is a count inside OutputTokens, never an additive extra — totals must never
+// add it twice.
 type CostData struct {
 	InputTokens       int64   `json:"inputTokens,omitempty"`
 	OutputTokens      int64   `json:"outputTokens,omitempty"`
 	CachedInputTokens int64   `json:"cachedInputTokens,omitempty"`
+	CacheWriteTokens  int64   `json:"cacheWriteTokens,omitempty"`
+	ReasoningTokens   int64   `json:"reasoningTokens,omitempty"`
 	TotalCostUsd      float64 `json:"totalCostUsd,omitempty"`
 	NumTurns          int     `json:"numTurns,omitempty"`
 }
@@ -750,6 +757,12 @@ type Result struct {
 	// Additive — old platforms ignore it.
 	ReviewVerdict string `json:"reviewVerdict,omitempty"`
 
+	// ToolCalls counts the tool calls the session made across every
+	// stream: the initial turn, injected turns, continuations and
+	// in-session retries. Always serialized (no omitempty) so a zero
+	// reads as "did nothing" rather than unknown.
+	ToolCalls int `json:"toolCalls"`
+
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
 
@@ -798,6 +811,37 @@ type Result struct {
 	// when the session stayed within its budget. Additive — old platforms
 	// ignore it.
 	BudgetBreach *BudgetBreach `json:"budgetBreach,omitempty"`
+
+	// Resumable reports whether a retry of this failed session loses no work:
+	// either the runner preserved the session's work on a dedicated resume
+	// target (ResumeCheckpoint), or the session left nothing of its own to
+	// preserve (no change, or verdict-only work that owes no commit). Today it
+	// is set on provider-error failures. False when the session's work could
+	// not be preserved. Additive — old platforms ignore it.
+	Resumable bool `json:"resumable,omitempty"`
+
+	// ResumeCheckpoint identifies the checkpoint a retryable failure preserved:
+	// the branch name and head commit the platform can resume from. Nil when no
+	// retry checkpoint was created, including when there was nothing to
+	// preserve. Additive — old platforms ignore it.
+	ResumeCheckpoint *ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
+
+	// SeatBudget is the per-seat resource budget this session ran under:
+	// the posture (enforced | best-effort | none) with the values. The
+	// worker reports what the seat actually got, so the platform can see
+	// it. Nil when the seat carried no budget. Additive — old platforms
+	// ignore it.
+	SeatBudget *SeatBudgetReport `json:"seatBudget,omitempty"`
+}
+
+// ResumeCheckpoint identifies the branch + head commit a retryable session
+// failure was preserved on for a later resume.
+type ResumeCheckpoint struct {
+	// Branch is the public branch name carrying the checkpoint, e.g.
+	// "wip/<session-id>".
+	Branch string `json:"branch"`
+	// CommitSHA is the head commit on Branch.
+	CommitSHA string `json:"commitSha"`
 }
 
 // BudgetBreach is the budget cap a session ran into.
@@ -807,6 +851,21 @@ type BudgetBreach struct {
 	Cap string `json:"cap"`
 	// Detail is the human-readable breach, e.g.
 	// "max-tokens exceeded: observed=5010000 limit=5000000".
+	Detail string `json:"detail,omitempty"`
+}
+
+// SeatBudgetReport is the per-seat resource budget one session ran under.
+// The worker reports what the seat actually got: the posture plus the
+// values. Secret-free; safe for the session result.
+type SeatBudgetReport struct {
+	// Mode is enforced | best-effort | none.
+	Mode string `json:"mode"`
+	// CPUs is the whole-core seat share.
+	CPUs int `json:"cpus,omitempty"`
+	// MemoryMB is the seat memory ceiling in mebibytes. Zero means no cap.
+	MemoryMB int `json:"memoryMb,omitempty"`
+	// Detail is a short human line: which placement enforces the budget
+	// on Linux, which knobs carry it on macOS.
 	Detail string `json:"detail,omitempty"`
 }
 
@@ -980,6 +1039,15 @@ type BackstopReport struct {
 
 	// Diagnostics is human-readable text describing what happened.
 	Diagnostics string `json:"diagnostics,omitempty"`
+
+	// ContinueDiverged is true when a continue-mode backstop push was
+	// refused because the continued pull request's head moved after
+	// dispatch. It is set from a git ancestry check (the fetched remote
+	// head is not an ancestor of the session's HEAD), never by matching
+	// push-output or diagnostics text, so a policy rejection of an
+	// otherwise fast-forward push leaves it false. The runner maps it to
+	// the continue-pr-diverged failure mode.
+	ContinueDiverged bool `json:"continueDiverged,omitempty"`
 
 	// Repositories is the additive per-mutable-repository backstop projection.
 	// Empty retains the legacy singular report semantics.

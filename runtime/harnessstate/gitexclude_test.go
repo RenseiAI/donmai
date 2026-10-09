@@ -117,6 +117,24 @@ func TestEnsureExcluded_SilencesEveryStateDir(t *testing.T) {
 	}
 }
 
+func TestEnsureExcluded_SilencesSeatScratch(t *testing.T) {
+	t.Parallel()
+	dir := newGitCheckout(t)
+
+	if err := EnsureExcluded(dir); err != nil {
+		t.Fatalf("EnsureExcluded: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, SeatScratchDir), 0o700); err != nil {
+		t.Fatalf("create %s: %v", SeatScratchDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, SeatScratchDir, "gate-full.md"), []byte("notes\n"), 0o600); err != nil {
+		t.Fatalf("write seat scratch: %v", err)
+	}
+	if status := gitStatusPorcelain(t, dir); strings.TrimSpace(status) != "" {
+		t.Fatalf("checkout is dirty with seat scratch present:\n%s", status)
+	}
+}
+
 // TestEnsureExcluded_Idempotent proves repeated session starts leave exactly
 // one line per entry, for every entry.
 func TestEnsureExcluded_Idempotent(t *testing.T) {

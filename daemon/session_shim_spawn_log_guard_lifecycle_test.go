@@ -46,6 +46,7 @@ func TestFailedShimLaunchKeepsTheChildLogAndStopsTheGuard(t *testing.T) {
 			LaunchTimeout:   750 * time.Millisecond,
 		},
 	})
+	d.shimScope = hermeticShimScope()
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},

@@ -183,6 +183,8 @@ jobs:
   # backend, same-identity chmod), nested-profile refusal, composer rules and
   # declared sockets. Those tests are darwin-only, so the Linux `test` job
   # never runs them; without this job the boundary has no CI coverage at all.
+  # The pi harness's live confinement tests ride the same job for the same
+  # reason.
   macos-confinement:
     name: macOS executor confinement (seatbelt)
     runs-on: macos-15
@@ -230,3 +232,98 @@ jobs:
             fi
           done
           echo "Gate-liveness OK: $(echo "$LIVE" | wc -l | tr -d ' ') live sandbox-exec tests ran and passed, no SKIPs."
+
+      # The pi harness wraps its seats in that boundary on both spawn paths.
+      # Its live tests drive Provider.Spawn and Resume (headless and
+      # interactive) through the production gate under the real backend,
+      # and refuse planted links on resume; they are darwin-only too.
+      - name: pi confinement suite (live sandbox-exec)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 15m -v -run 'TestPiConfinement_' ./provider/harness/pi/ 2>&1 | tee "${RUNNER_TEMP}/pi-confinement.log"
+
+      - name: Guard — the pi confinement tests must RUN, not skip
+        run: |
+          LOG="${RUNNER_TEMP}/pi-confinement.log"
+          if grep -Eq '^\s*--- SKIP: ' "$LOG"; then
+            echo "::error::a pi confinement test SKIPPED on macOS"
+            grep -E '^\s*--- SKIP: ' "$LOG"
+            exit 1
+          fi
+          LIVE=$(grep -oE '^func (TestPiConfinement_[A-Za-z0-9_]+)' provider/harness/pi/confinement_live_test.go | awk '{print $2}')
+          if [ -z "$LIVE" ]; then
+            echo "::error::no pi confinement tests found"
+            exit 1
+          fi
+          for TEST in $LIVE; do
+            if ! grep -Eq "^--- PASS: ${TEST} " "$LOG"; then
+              echo "::error::${TEST} did not report PASS"
+              exit 1
+            fi
+          done
+          echo "Gate-liveness OK: $(echo "$LIVE" | wc -l | tr -d ' ') pi confinement tests ran and passed, no SKIPs."
+
+  # The Linux mount-namespace backend's live tests build real boundaries:
+  # bubblewrap user and mount namespaces plus the Landlock stage, the
+  # startup self-test over both spawn paths with its no-backend control, a
+  # confined seat's network reach and denials, and the stage's TCP shape.
+  # The `test` job's runner has no bubblewrap, so there they skip; this job
+  # installs it and makes them RUN. Runner requirement (the same a seat host
+  # has): unprivileged user namespaces allowed. Ubuntu 23.10+ restricts them
+  # through AppArmor, so the job lifts that restriction for the run; a seat
+  # host either does the same or installs an AppArmor profile for bwrap, and
+  # the backend's capability check refuses with namespace_unavailable, naming
+  # the restriction, where neither is done.
+  linux-confinement:
+    name: Linux executor confinement (bubblewrap + Landlock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install bubblewrap and allow unprivileged user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          uname -r
+          cat /sys/kernel/security/lsm; echo
+          bwrap --version
+
+      - name: Confinement suite (live bubblewrap + Landlock)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 15m -v -run 'TestLinux_|TestLandlockStage_|TestLandlockRuleset_|TestCheck_' ./runtime/confinement/ 2>&1 | tee "${RUNNER_TEMP}/linux-confinement.log"
+
+      - name: Guard — the live Linux confinement tests must RUN, not skip
+        run: |
+          LOG="${RUNNER_TEMP}/linux-confinement.log"
+          if grep -Eq '^\s*--- SKIP: ' "$LOG"; then
+            echo "::error::a Linux confinement test SKIPPED"
+            grep -E '^\s*--- SKIP: ' "$LOG"
+            exit 1
+          fi
+          LIVE=$(grep -oE '^func (TestLinux_[A-Za-z0-9_]+)' runtime/confinement/live_linux_test.go | awk '{print $2}')
+          if [ -z "$LIVE" ]; then
+            echo "::error::no live Linux confinement tests found"
+            exit 1
+          fi
+          for TEST in $LIVE TestLandlockStage_LeavesTCPOpen TestCheck_ProbesTheLauncher; do
+            if ! grep -Eq "^--- PASS: ${TEST} " "$LOG"; then
+              echo "::error::${TEST} did not report PASS"
+              exit 1
+            fi
+          done
+          echo "Gate-liveness OK: live bubblewrap + Landlock tests ran and passed, no SKIPs."

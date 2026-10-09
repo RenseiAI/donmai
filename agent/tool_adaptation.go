@@ -1055,7 +1055,7 @@ func validEventSet(events []EventKind) bool {
 
 func isKnownEvent(event EventKind) bool {
 	switch event {
-	case EventInit, EventSystem, EventAssistantText, EventLlmCall, EventToolUse, EventToolResult, EventToolProgress, EventResult, EventError:
+	case EventInit, EventSystem, EventAssistantText, EventLlmCall, EventToolUse, EventToolResult, EventToolProgress, EventUsage, EventSubagent, EventResult, EventError:
 		return true
 	default:
 		return false

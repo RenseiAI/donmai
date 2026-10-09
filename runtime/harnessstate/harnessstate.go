@@ -33,6 +33,10 @@ const RunnerStateDir = ".agent"
 // PiStateDir is the pi harness's session state directory.
 const PiStateDir = ".pi"
 
+// SeatScratchDir is the runner-owned seat scratch directory. It holds
+// ephemeral brief/review scratch material and must never enter a commit.
+const SeatScratchDir = ".scratch"
+
 // Dir describes one checkout-resident state directory and who writes it. The
 // Owner/Why fields are documentation that stays attached to the data: the
 // next person to touch this table needs to know whether donmai writes the
@@ -75,6 +79,11 @@ var dirs = []Dir{
 		Name:  ".codex",
 		Owner: "the Codex CLI the codex harness drives",
 		Why:   "project-local CLI state. The harness redirects CODEX_HOME to a private directory outside the checkout, so this should stay absent — it is listed so a CLI version that ignores the redirect cannot quietly land in a commit",
+	},
+	{
+		Name:  SeatScratchDir,
+		Owner: "the runner's seat scratch writer",
+		Why:   "ephemeral seat scratch files such as copied review text and gate notes; they are session machinery, not project content",
 	},
 }
 

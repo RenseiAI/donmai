@@ -442,6 +442,104 @@ func TestMapLine_RateLimitEvent_System(t *testing.T) {
 	}
 }
 
+func TestMapLine_RateLimitEvent_UsageWindow(t *testing.T) {
+	t.Parallel()
+
+	// A streamed event naming a window with a utilization fraction
+	// maps onto the shared quota-window type the daemon publishes.
+	// The production entry point is the stateful mapper: the test
+	// drives MapLine, not the stateless decoder.
+	line := []byte(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.85,"resetsAt":1784000000}}`)
+	var mapper LineMapper
+	events := mapper.MapLine(line)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	usage, ok := events[0].(agent.UsageEvent)
+	if !ok {
+		t.Fatalf("event %T, want UsageEvent", events[0])
+	}
+	if usage.Usage == nil || len(usage.Usage.Windows) != 1 {
+		t.Fatalf("usage = %+v, want one window", usage.Usage)
+	}
+	w := usage.Usage.Windows[0]
+	if w.ID != "seven_day" || w.Kind != agent.UsageWindowWeekly {
+		t.Errorf("window = %+v, want seven_day weekly", w)
+	}
+	if w.UsedPercent != 85 {
+		t.Errorf("UsedPercent = %v, want 85", w.UsedPercent)
+	}
+	if w.ResetsAt == "" {
+		t.Error("window carries no reset time")
+	}
+	if w.WindowDurationMins == nil || *w.WindowDurationMins != 7*24*60 {
+		t.Errorf("duration = %v, want the probe's weekly 10080", w.WindowDurationMins)
+	}
+	if w.Label != "Weekly" {
+		t.Errorf("Label = %q, want the probe's Weekly label", w.Label)
+	}
+}
+
+// A streamed overage event lands on the probe's window id: the mapper
+// records the model-scoped bucket name the usage read drew, and the
+// event reuses that row instead of opening an orphan scoped row. The
+// test drives the production entry point (the stateful mapper fed a
+// probe result, then the streamed line); reverting the stream path to
+// the verbatim event-type id reopens the orphan row and fails it.
+func TestLineMapper_RateLimitOverageLandsOnProbeRow(t *testing.T) {
+	t.Parallel()
+
+	const resetsAt = 1784000000.0
+	overage := []byte(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day_overage_included","utilization":0.4,"resetsAt":1784000000}}`)
+
+	// Without a probe the bucket stays dropped: no name to land on.
+	var unnamed LineMapper
+	if events := unnamed.MapLine(overage); len(events) != 1 {
+		t.Fatalf("unnamed mapper: got %d events, want 1", len(events))
+	} else if _, ok := events[0].(agent.SystemEvent); !ok {
+		t.Fatalf("unnamed mapper: event %T, want the plain rate-limit marker", events[0])
+	}
+
+	var mapper LineMapper
+	mapper.RecordUsageLimits("Fable")
+	events := mapper.MapLine(overage)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	usage, ok := events[0].(agent.UsageEvent)
+	if !ok {
+		t.Fatalf("event %T, want UsageEvent", events[0])
+	}
+	if usage.Usage == nil || len(usage.Usage.Windows) != 1 {
+		t.Fatalf("usage = %+v, want one window", usage.Usage)
+	}
+	w := usage.Usage.Windows[0]
+	if w.ID != "seven_day_fable" {
+		t.Errorf("window id = %q, want the probe's seven_day_fable row", w.ID)
+	}
+	if w.Kind != agent.UsageWindowWeekly || w.Label != "Weekly · Fable" {
+		t.Errorf("window = %+v, want the probe's weekly Fable row", w)
+	}
+	if w.UsedPercent != 40 {
+		t.Errorf("UsedPercent = %v, want 40", w.UsedPercent)
+	}
+	if w.WindowDurationMins == nil || *w.WindowDurationMins != 7*24*60 {
+		t.Errorf("duration = %v, want the probe's weekly 10080", w.WindowDurationMins)
+	}
+	if want := agent.ISOFromEpochSeconds(resetsAt); w.ResetsAt != want {
+		t.Errorf("ResetsAt = %q, want %q", w.ResetsAt, want)
+	}
+
+	// Unknown types stay dropped, matching the probe mapper's nil for
+	// an unrendered window.
+	unknown := []byte(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day_opus","utilization":0.1,"resetsAt":1784000000}}`)
+	if events := mapper.MapLine(unknown); len(events) != 1 {
+		t.Fatalf("unknown type: got %d events, want 1", len(events))
+	} else if sys, ok := events[0].(agent.SystemEvent); !ok || sys.Subtype != "rate_limit" {
+		t.Fatalf("unknown type: event %#v, want the plain rate-limit marker", events[0])
+	}
+}
+
 func TestMapLine_InvalidJSON_ErrorEvent(t *testing.T) {
 	t.Parallel()
 
@@ -749,5 +847,149 @@ func TestMapLine_TopLevelLinesHaveEmptyParentToolUseID(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A fixture with a native delegation (Agent) call emits the typed
+// sub-agent lifecycle: `started` on the tool_use line, then
+// `completed` on the matching successful result and `failed` on the
+// matching error result. Table-driven on the raw stream-json lines so
+// removing the emission turns the assertions RED.
+func TestLineMapper_SubagentLifecycleFromFixture(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_agent_call.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4", len(lines))
+	}
+
+	var mapper LineMapper
+	got := make([]agent.Event, 0, 8)
+	for _, line := range lines {
+		got = append(got, mapper.MapLine(line)...)
+	}
+
+	var phases []agent.SubagentPhase
+	var ids []string
+	for _, ev := range got {
+		sub, ok := ev.(agent.SubagentEvent)
+		if !ok {
+			continue
+		}
+		phases = append(phases, sub.Phase)
+		ids = append(ids, sub.ToolUseID)
+		if sub.ToolName != "Agent" {
+			t.Fatalf("SubagentEvent ToolName = %q, want Agent", sub.ToolName)
+		}
+	}
+	wantPhases := []agent.SubagentPhase{agent.SubagentStarted, agent.SubagentCompleted, agent.SubagentStarted, agent.SubagentFailed}
+	wantIDs := []string{"toolu_agent_1", "toolu_agent_1", "toolu_agent_2", "toolu_agent_2"}
+	if !reflect.DeepEqual(phases, wantPhases) {
+		t.Fatalf("subagent phases = %v, want %v", phases, wantPhases)
+	}
+	if !reflect.DeepEqual(ids, wantIDs) {
+		t.Fatalf("subagent toolUseIds = %v, want %v", ids, wantIDs)
+	}
+}
+
+// The stateless line decoder stays name-blind: a raw delegation tool_use
+// line decodes to plain tool events only, with no typed lifecycle. The
+// stateful mapper adds the lifecycle; removing it turns the lifecycle
+// test RED while this pin stays GREEN.
+func TestMapLine_DelegationToolUseHasNoSubagentEvent(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_agent_call.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	for _, ev := range mapLine(lines[0]) {
+		if _, ok := ev.(agent.SubagentEvent); ok {
+			t.Fatalf("stateless mapLine emitted SubagentEvent: %#v", ev)
+		}
+	}
+}
+
+// Non-delegation tool calls never emit a lifecycle, even across the
+// matching result line.
+func TestLineMapper_NonDelegationToolsEmitNoSubagentEvent(t *testing.T) {
+	t.Parallel()
+
+	var mapper LineMapper
+	assistant := []byte(`{"type":"assistant","session_id":"s","message":{"model":"m","id":"msg","role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls"}}]}}`)
+	user := []byte(`{"type":"user","session_id":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"ok","is_error":false}]}}`)
+	for _, ev := range append(mapper.MapLine(assistant), mapper.MapLine(user)...) {
+		if _, ok := ev.(agent.SubagentEvent); ok {
+			t.Fatalf("non-delegation tool emitted SubagentEvent: %#v", ev)
+		}
+	}
+}
+
+// TestMapLine_CacheWriteTokens pins the Anthropic cache-write bucket on both
+// usage carriers: a complete assistant message's per-call usage and the
+// terminal result's session usage. input_tokens excludes both cache classes,
+// so cache_creation_input_tokens must ride CacheWriteTokens; before it was
+// read, every cache write a session made (billed above the input price) was
+// dropped before the status post.
+func TestMapLine_CacheWriteTokens(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		line string
+		want agent.CostData
+	}{
+		{
+			name: "assistant usage carries every class",
+			line: `{"type":"assistant","message":{"model":"claude-opus-4","stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":30,"cache_read_input_tokens":16526,"cache_creation_input_tokens":1200},"content":[{"type":"text","text":"done"}]}}`,
+			want: agent.CostData{InputTokens: 4, OutputTokens: 30, CachedInputTokens: 16526, CacheWriteTokens: 1200},
+		},
+		{
+			name: "assistant usage with only a cache write is still usage",
+			line: `{"type":"assistant","message":{"model":"claude-opus-4","usage":{"cache_creation_input_tokens":900},"content":[]}}`,
+			want: agent.CostData{CacheWriteTokens: 900},
+		},
+		{
+			name: "assistant usage without a cache write reports none",
+			line: `{"type":"assistant","message":{"model":"claude-opus-4","stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":30,"cache_read_input_tokens":80},"content":[]}}`,
+			want: agent.CostData{InputTokens: 4, OutputTokens: 30, CachedInputTokens: 80},
+		},
+		{
+			name: "result usage carries every class",
+			line: `{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":1.25,"usage":{"input_tokens":12,"output_tokens":900,"cache_read_input_tokens":250000,"cache_creation_input_tokens":42000}}`,
+			want: agent.CostData{InputTokens: 12, OutputTokens: 900, CachedInputTokens: 250000, CacheWriteTokens: 42000, TotalCostUsd: 1.25, NumTurns: 3},
+		},
+		{
+			name: "result usage without a cache write reports none",
+			line: `{"type":"result","subtype":"success","is_error":false,"num_turns":1,"usage":{"input_tokens":5,"output_tokens":8,"cache_read_input_tokens":16526}}`,
+			want: agent.CostData{InputTokens: 5, OutputTokens: 8, CachedInputTokens: 16526, NumTurns: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var got *agent.CostData
+			for _, ev := range mapLine([]byte(tt.line)) {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					got = &agent.CostData{
+						InputTokens: e.InputTokens, OutputTokens: e.OutputTokens,
+						CachedInputTokens: e.CachedInputTokens, CacheWriteTokens: e.CacheWriteTokens,
+					}
+				case agent.ResultEvent:
+					got = e.Cost
+				}
+			}
+			if got == nil {
+				t.Fatalf("no usage-carrying event mapped from %s", tt.line)
+			}
+			if *got != tt.want {
+				t.Errorf("usage = %+v; want %+v", *got, tt.want)
+			}
+		})
 	}
 }

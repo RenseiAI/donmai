@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,9 +17,31 @@ import (
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
-// The fake harness. It is the specimen shape reduced to a shell line: a
-// process that owns a terminal, reads it line by line, and answers each line
-// with a marker.
+// Wake fixture modes select the terminal mode the shell-free wake harness
+// (this test binary in wake-harness mode, runDaemonShimWakeHarness) puts
+// its PTY in before answering input lines. The harness owns the terminal
+// mode in-process, so no shell binary is exec-ed on the runner to run
+// `stty`: on a pool whose confinement refuses the shell exec the spawn
+// used to fail with `fork/exec /bin/sh: operation not permitted` before
+// any assertion ran. The mode values travel to the child as the strings
+// below; the typed constants name the same modes for the in-process
+// terminal setup.
+type wakeFixtureMode int
+
+const (
+	// wakeFixtureCanonical keeps the kernel line discipline in canonical
+	// mode: the discipline holds the pending line and honours its own kill
+	// character. That is the mode in which the draft assertion is
+	// meaningful, because there is a real buffer to clear.
+	wakeFixtureCanonical wakeFixtureMode = iota
+	// wakeFixtureRaw is NON-CANONICAL: every byte arrives as data and
+	// nothing is interpreted on the way in.
+	wakeFixtureRaw
+)
+
+// The fake harness. It is the specimen shape reduced to a mode and a read
+// loop: a process that owns a terminal, reads it line by line, and answers
+// each line with a marker.
 //
 //   - `-echo` so the terminal does not answer for the harness. Without it the
 //     line discipline echoes every byte written and a test would pass on the
@@ -36,7 +60,7 @@ import (
 // This fixture is CANONICAL mode: the kernel line discipline holds the pending
 // line and honours its own kill character. That is the mode in which the draft
 // assertion is meaningful, because there is a real buffer to clear.
-const wakeFixtureHarness = wakeFixtureCanonicalStty + wakeFixtureReportLoop
+const wakeFixtureHarness = "canonical"
 
 // wakeFixtureRawHarness is NON-CANONICAL: every byte arrives as data and
 // nothing is interpreted on the way in.
@@ -48,36 +72,142 @@ const wakeFixtureHarness = wakeFixtureCanonicalStty + wakeFixtureReportLoop
 // And it is the closer model of the seats this class actually occurs on: raw
 // full-screen terminal UIs.
 //
-// LIMIT, stated here rather than only in prose: a shell reading bytes is not a
-// TUI. Neither fixture has a line editor, so neither can prove what Ctrl-A /
-// Ctrl-K do inside one. What they prove is what this code controls — the exact
-// bytes delivered, and that a kernel-held draft is killed.
-const wakeFixtureRawHarness = wakeFixtureRawStty + wakeFixtureReportLoop
+// LIMIT, stated here rather than only in prose: a harness reading bytes is
+// not a TUI. Neither fixture has a line editor, so neither can prove what
+// Ctrl-A / Ctrl-K do inside one. What they prove is what this code
+// controls — the exact bytes delivered, and that a kernel-held draft is
+// killed.
+const wakeFixtureRawHarness = "raw"
 
 // wakeFixtureTransitionHarness begins in canonical mode and switches to raw
-// only after the first ordinary line. The constructor's readiness probe must
-// own that first line; otherwise the wake's Ctrl-U is consumed canonically and
-// the exact delivery assertion goes red.
-const wakeFixtureTransitionHarness = wakeFixtureCanonicalStty +
-	`IFS= read -r line; ` + wakeFixtureRawStty +
-	`printf 'ack:'; printf '%s' "$line" | od -An -tx1 | tr -d ' \n'; printf '\n'; ` +
-	wakeFixtureReportLoop
+// only after the first ordinary line (see runDaemonShimWakeHarness). The
+// constructor's readiness probe must own that first line; otherwise the
+// wake's Ctrl-U is consumed canonically and the exact delivery assertion
+// goes red.
+const wakeFixtureTransitionHarness = "transition"
 
 const wakeFixtureReadyProbe = "wake-fixture-ready"
 
-const (
-	wakeFixtureCanonicalStty = `stty -echo -isig; `
-	wakeFixtureRawStty       = `stty -echo -isig -icanon min 1 time 0; `
-)
-
-const wakeFixtureReportLoop = `while IFS= read -r line; do ` +
-	`printf 'ack:'; printf '%s' "$line" | od -An -tx1 | tr -d ' \n'; printf '\n'; done`
-
 // wakeFixtureFrozenHarness never reads its terminal. It is the wedge itself:
-// alive, holding the PTY, consuming no input, emitting nothing. Writes to it
+// alive, holding the PTY, consuming no input, emitting nothing once its
+// one-time setup announcement (wakeFixtureFrozenReady) is out. Writes to it
 // succeed at every layer and produce no output — which is the property that
 // makes "delivered" and "answered" two different facts.
-const wakeFixtureFrozenHarness = `stty -echo -isig; while :; do sleep 30; done`
+const wakeFixtureFrozenHarness = "frozen"
+
+// wakeFixtureFrozenReady is the frozen harness's output-side readiness
+// marker. A harness that never reads cannot answer the readiness probe, so it
+// announces its completed terminal setup instead. It deliberately carries no
+// `ack:`: it is not an answer to anything.
+const wakeFixtureFrozenReady = "frozen-fixture-ready"
+
+// wakeHarnessEnv selects the wake-harness child role: this test binary
+// re-executed as the PTY child, owning the terminal mode in-process and
+// answering each input line with a hex-encoded `ack:` report. The mode
+// travels in a second variable so the fixture's readiness handshake keeps
+// working: the frozen mode never reads, so it announces its completed setup
+// on the output side instead of answering the probe.
+const (
+	wakeHarnessEnv     = "DONMAI_TEST_DAEMON_SESSION_WAKE_HARNESS"
+	wakeHarnessModeEnv = "DONMAI_TEST_DAEMON_SESSION_WAKE_HARNESS_MODE"
+)
+
+// wakeHarnessSpec returns the shell-free PTY harness spec for the wake
+// fixture: this test binary re-executed in wake-harness mode. The mode
+// names the terminal shape the child configures in-process
+// (`canonical`, `raw`, `transition`, `frozen`); the harness answers every
+// input line with `ack:` plus the hex-encoded bytes it read, which is what
+// the delivery assertions match on.
+func wakeHarnessSpec(mode string) (ptyhost.Spec, error) {
+	harnessPath, err := os.Executable()
+	if err != nil {
+		return ptyhost.Spec{}, err
+	}
+	//nolint:gosec // G204: harnessPath is this test binary; the harness role is selected by env
+	return ptyhost.Spec{
+		Command: []string{harnessPath, "-test.run", "TestMain"},
+		Env:     []string{wakeHarnessEnv + "=1", wakeHarnessModeEnv + "=" + mode},
+	}, nil
+}
+
+// runDaemonShimWakeHarness is the wake fixture's PTY child: it configures
+// the terminal mode the fixture mode names, then answers each input line
+// with `ack:` plus the hex encoding of the exact bytes it read. The mode
+// setup the old shell fixture ran through `stty` now happens in-process
+// (see configureWakeHarnessTerminal): `-echo -isig` in every mode so the
+// carrier observes only the harness's own answers, `-icanon` cleared in
+// raw mode so every byte arrives as data with nothing interpreted on the
+// way in. The kernel still owns the line discipline itself — canonical
+// kill handling, raw delivery — so the fixture keeps proving what this
+// code controls: the exact bytes delivered, and that a kernel-held draft
+// is killed rather than submitted.
+func runDaemonShimWakeHarness() int {
+	mode := os.Getenv(wakeHarnessModeEnv)
+	if mode == wakeFixtureFrozenHarness {
+		configureWakeHarnessTerminal(wakeFixtureCanonical)
+		// Announce the completed mode setup on the output side, then go
+		// quiet. Without it a wake can reach the terminal before `-isig`
+		// applies, and restart-harness's interrupt byte becomes a real
+		// SIGINT that kills the fixture.
+		if _, err := fmt.Fprintf(os.Stdout, "%s\n", wakeFixtureFrozenReady); err != nil {
+			return 1
+		}
+		// Stay alive without reading, as the old shell fixture's
+		// `while :; do sleep 30; done` did. A bare `select {}` is not that:
+		// with no other goroutine and no pending timer, the runtime's
+		// deadlock detector aborts the process ("all goroutines are
+		// asleep"), so the fixture was a dead seat rather than a frozen one.
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	if mode == wakeFixtureTransitionHarness {
+		configureWakeHarnessTerminal(wakeFixtureCanonical)
+	} else {
+		configureWakeHarnessTerminal(wakeMode(mode))
+	}
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		// The line is reported with its terminator: in canonical mode the
+		// discipline holds the whole line and the reader only returns once
+		// the newline arrives, while in raw mode control bytes arrive
+		// without any terminator of their own. Reporting the exact bytes
+		// read — terminator included — keeps both modes observable, so a
+		// rung that submits nothing still answers with what it received.
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			// The raw-mode switch runs BEFORE the acknowledgement, matching
+			// the old shell fixture's `read line; stty raw; printf ack:`
+			// order: the fixture handshake treats the ack as proof the
+			// mode setup completed, so a test's next write lands on a
+			// terminal that is already raw. Switching after the ack
+			// opened a race where a wake's Ctrl-U still met the canonical
+			// line discipline and was consumed by it ("010b0a" instead of
+			// "15010b0a").
+			if mode == wakeFixtureTransitionHarness {
+				configureWakeHarnessTerminal(wakeFixtureRaw)
+				mode = wakeFixtureRawHarness
+			}
+			if _, werr := fmt.Fprintf(os.Stdout, "ack:%x\r\n", line); werr != nil {
+				return 1
+			}
+		}
+		if err != nil {
+			return 0
+		}
+	}
+}
+
+// wakeMode maps the fixture's harness name to the terminal mode the child
+// configures before its first read.
+func wakeMode(mode string) wakeFixtureMode {
+	switch mode {
+	case wakeFixtureRawHarness:
+		return wakeFixtureRaw
+	default:
+		return wakeFixtureCanonical
+	}
+}
 
 type wakeFixture struct {
 	daemon   *Daemon
@@ -110,9 +240,16 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	}
 
 	id := sessionshim.Identity{OrgID: "org-wake", SessionID: "session-wake"}
+	// The shell-free wake harness (this test binary in wake-harness mode):
+	// it owns the terminal mode in-process and answers each input line
+	// with a hex-encoded `ack:` report. No shell is exec-ed on the runner.
+	harnessSpec, err := wakeHarnessSpec(harness)
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 1,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", harness}},
+		Spec:         harnessSpec,
 		WorkareaPath: filepath.Join(dir, "w"),
 	})
 	if err != nil {
@@ -156,16 +293,26 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 			}
 		}
 	}()
-	// The fixture shell changes terminal mode asynchronously after exec. Before
-	// control-byte assertions, prove it has completed that setup by sending an
-	// ordinary probe and reading the harness's exact acknowledgement. The frozen
-	// fixture intentionally never reads, so it is the sole no-handshake case.
-	if harness != wakeFixtureFrozenHarness {
+	// The fixture harness changes terminal mode asynchronously after exec.
+	// Before control-byte assertions, prove it has completed that setup by
+	// sending an ordinary probe and reading the harness's exact
+	// acknowledgement. The frozen fixture never reads, so it announces its
+	// completed setup on the output side instead.
+	if harness == wakeFixtureFrozenHarness {
+		if !awaitWakeMarker(output, wakeFixtureFrozenReady, 10*time.Second) {
+			t.Fatal("frozen fixture never announced its completed terminal setup")
+		}
+	} else {
 		if err := ctrl.WriteInput([]byte(wakeFixtureReadyProbe + "\r")); err != nil {
 			t.Fatalf("send fixture readiness probe: %v", err)
 		}
-		if got, ok := awaitWakeLine(output, 10*time.Second); !ok || got != hex.EncodeToString([]byte(wakeFixtureReadyProbe)) {
-			t.Fatalf("fixture raw-mode readiness acknowledgement=%q (ok=%v), want %q", got, ok, hex.EncodeToString([]byte(wakeFixtureReadyProbe)))
+		// The harness reports the exact bytes it read, terminator
+		// included: in canonical mode the line arrives with its newline
+		// (`...0a`), in raw mode as the lone carriage return the test
+		// wrote (`...0d`). Either proves the mode setup completed and
+		// the read loop is answering.
+		if got, ok := awaitWakeLine(output, 10*time.Second); !ok || (got != hex.EncodeToString([]byte(wakeFixtureReadyProbe+"\n")) && got != hex.EncodeToString([]byte(wakeFixtureReadyProbe+"\r"))) {
+			t.Fatalf("fixture raw-mode readiness acknowledgement=%q (ok=%v), want %q or %q", got, ok, hex.EncodeToString([]byte(wakeFixtureReadyProbe+"\n")), hex.EncodeToString([]byte(wakeFixtureReadyProbe+"\r")))
 		}
 	}
 
@@ -185,18 +332,42 @@ func (f *wakeFixture) awaitAck(t *testing.T, within time.Duration) bool {
 	return ok
 }
 
-// awaitLine returns the hex-encoded bytes of the next line the harness read.
+// awaitLine returns the hex-encoded bytes of the next line the harness read,
+// terminator included: in canonical mode the line arrives with its newline,
+// in raw mode control bytes arrive bare except for the submit's CR, which
+// the terminal translates to a newline on the way in.
 //
 // Note what these fixtures CAN and cannot show. Neither has a line editor, so
 // the clear bytes are never interpreted: on the canonical fixture Ctrl-U is
 // eaten by the line discipline and Ctrl-A/Ctrl-K arrive as data, so the line
-// read back is "010b", not empty. An empty line is what a seat whose editor
+// read back is "010b0a", not empty. An empty line is what a seat whose editor
 // interprets the pair submits, and no fixture here can produce one. What these
 // assertions do prove is the part this code controls — the exact bytes
 // delivered, and that a kernel-held draft is killed rather than submitted.
 func (f *wakeFixture) awaitLine(t *testing.T, within time.Duration) (string, bool) {
 	t.Helper()
 	return awaitWakeLine(f.output, within)
+}
+
+// awaitWakeMarker reports whether marker appears in the harness output within
+// the deadline.
+func awaitWakeMarker(output <-chan []byte, marker string, within time.Duration) bool {
+	deadline := time.After(within)
+	var seen strings.Builder
+	for {
+		select {
+		case data, ok := <-output:
+			if !ok {
+				return false
+			}
+			seen.Write(data)
+			if strings.Contains(seen.String(), marker) {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
 }
 
 func awaitWakeLine(output <-chan []byte, within time.Duration) (string, bool) {
@@ -443,12 +614,12 @@ func TestSessionWakeVerbsDeliverTheirOwnByteSequence(t *testing.T) {
 	}{
 		{
 			// Ctrl-U, Ctrl-A, Ctrl-K, then the submit. No interrupt.
-			name: "wake clears the line and submits", op: "session.wake", wantHex: "15010b",
+			name: "wake clears the line and submits", op: "session.wake", wantHex: "15010b0a",
 		},
 		{
 			// The interrupt FIRST, then the same clear-and-submit.
 			name: "restart-harness interrupts, then clears and submits",
-			op:   "session.restart-harness", wantHex: "0315010b",
+			op:   "session.restart-harness", wantHex: "0315010b0a",
 		},
 	}
 	for _, tc := range tests {
@@ -538,6 +709,13 @@ func TestSessionWakeVerbsDeliverToAFrozenHarnessWithoutRecovery(t *testing.T) {
 			if f.awaitAck(t, 2*time.Second) {
 				t.Fatalf("%s: a harness that never reads its terminal answered; fixture is not frozen", op)
 			}
+			// Frozen means alive: a harness that has exited also never
+			// answers, and would pass the check above vacuously.
+			select {
+			case ev := <-f.terminal:
+				t.Fatalf("%s: the frozen harness exited (%+v); a dead seat is not a wedged one", op, ev)
+			default:
+			}
 		})
 	}
 }
@@ -579,8 +757,8 @@ func TestSessionRestartHarnessRefusesBeforeAWake(t *testing.T) {
 	})); err != nil {
 		t.Fatalf("restart-harness after a wake = %v, want applied", err)
 	}
-	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "0315010b" {
-		t.Fatalf("restart-harness after a wake delivered %q (ok=%v), want 0315010b", got, ok)
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "0315010b0a" {
+		t.Fatalf("restart-harness after a wake delivered %q (ok=%v), want 0315010b0a", got, ok)
 	}
 }
 
@@ -598,8 +776,8 @@ func TestSessionWakeVerbsAreIdempotentUnderRedelivery(t *testing.T) {
 	if err := f.daemon.applyOneMutation(wake); err != nil {
 		t.Fatalf("wake = %v", err)
 	}
-	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b" {
-		t.Fatalf("wake delivered %q (ok=%v), want 15010b", got, ok)
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b0a" {
+		t.Fatalf("wake delivered %q (ok=%v), want 15010b0a", got, ok)
 	}
 
 	restart := wakeMutation(t, "session.restart-harness", "m-restart", sessionWakeParams{
@@ -608,8 +786,8 @@ func TestSessionWakeVerbsAreIdempotentUnderRedelivery(t *testing.T) {
 	if err := f.daemon.applyOneMutation(restart); err != nil {
 		t.Fatalf("restart = %v", err)
 	}
-	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "0315010b" {
-		t.Fatalf("restart delivered %q (ok=%v), want 0315010b", got, ok)
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "0315010b0a" {
+		t.Fatalf("restart delivered %q (ok=%v), want 0315010b0a", got, ok)
 	}
 
 	// Both re-presented, byte-identical, as a lost ack would re-present them.
@@ -692,8 +870,8 @@ func TestRedeliveryAfterASuccessfulWriteIsDeduped(t *testing.T) {
 	if err := f.daemon.applyOneMutation(m); err != nil {
 		t.Fatalf("wake = %v", err)
 	}
-	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b" {
-		t.Fatalf("wake delivered %q (ok=%v), want 15010b", got, ok)
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b0a" {
+		t.Fatalf("wake delivered %q (ok=%v), want 15010b0a", got, ok)
 	}
 	already, err := f.daemon.checkWakeMutation(f.id, "m-1", "session.wake")
 	if err != nil {
@@ -716,8 +894,8 @@ func TestWakeFixtureCanonicalModeConsumesCtrlU(t *testing.T) {
 	if err := f.daemon.applyOneMutation(m); err != nil {
 		t.Fatalf("canonical wake = %v", err)
 	}
-	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "010b" {
-		t.Fatalf("canonical wake delivered %q (ok=%v), want 010b", got, ok)
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "010b0a" {
+		t.Fatalf("canonical wake delivered %q (ok=%v), want 010b0a", got, ok)
 	}
 }
 
@@ -729,8 +907,8 @@ func TestWakeFixtureReadinessHandshakePrecedesControlBytes(t *testing.T) {
 	if err := f.daemon.applyOneMutation(m); err != nil {
 		t.Fatalf("transition wake = %v", err)
 	}
-	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b" {
-		t.Fatalf("transition wake delivered %q (ok=%v), want 15010b", got, ok)
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b0a" {
+		t.Fatalf("transition wake delivered %q (ok=%v), want 15010b0a", got, ok)
 	}
 	already, err := f.daemon.checkWakeMutation(f.id, m.ID, m.Op)
 	if err != nil || !already {

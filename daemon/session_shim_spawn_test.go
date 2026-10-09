@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	attachwirev2 "github.com/RenseiAI/donmai/attachwire/v2"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/internal/testisolation"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -485,9 +487,16 @@ func TestConsumedRecoveryHeartbeatReleasesBlockedV3ProgressAfterCarrierActive(t 
 		t.Fatal(err)
 	}
 	id := sessionshim.Identity{OrgID: "org-consumed-barrier", SessionID: "session-consumed-barrier"}
+	// The barrier harness is the shell-free echo child: its in-process echo
+	// clearing replaces the `stty -echo` the old shell fixture ran. The
+	// `ack:` answer below is what the post-active assertions match on.
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 9,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		Spec:         ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()},
 		WorkareaPath: filepath.Join(dir, "workarea"),
 	})
 	if err != nil {
@@ -781,15 +790,39 @@ func TestConsumedRecoveryHeartbeatReleasesBlockedV3ProgressAfterCarrierActive(t 
 
 const envDaemonShimHelper = "DONMAI_TEST_DAEMON_SESSION_SHIM_HELPER"
 
-// interactiveFixture is a real line-oriented interactive program: it blocks on
-// terminal input and answers each line, so a round trip proves BOTH directions
-// are live through the adopted connection.
-const interactiveFixture = `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`
+// interactiveHarnessEchoEnv names the harness the shim helper runs under its
+// PTY: this test binary re-executed in echo mode (runDaemonShimEcho), which
+// reads terminal input lines and answers each one with an `ack:` echo. A
+// round trip through it proves BOTH directions are live through the adopted
+// connection.
+//
+// It is the same binary as the helper rather than /bin/sh -c <script>: the
+// refusal that motivated the swap (`fork/exec /bin/sh: operation not
+// permitted` on a parallel CI run) was later reproduced with this same
+// binary as the harness, so the fault is in the PTY spawn path the helper
+// shares with production, not in the shell — the spawn path now retries
+// transient refusals (see ptyhost's startPTYWithRetry) instead of depending
+// on which binary is spawned. The echo child keeps the property that
+// matters: a harness genuinely waiting on the PTY, with one fewer process
+// per launch.
+const interactiveHarnessEchoEnv = "DONMAI_TEST_DAEMON_SESSION_SHIM_ECHO"
 
 // TestMain routes this binary into shim-helper mode when the daemon's own launch
 // contract is present in the environment. The daemon composes that environment;
-// the helper consumes it exactly as a real worker's ptycli driver does.
+// the helper consumes it exactly as a real worker's ptycli driver does. The
+// echo role (interactiveHarnessEchoEnv) is the harness the helper spawns under
+// its own PTY: this same binary re-executed, answering each terminal input
+// line with an `ack:` echo.
 func TestMain(m *testing.M) {
+	if os.Getenv(wakeHarnessEnv) == "1" {
+		os.Exit(runDaemonShimWakeHarness())
+	}
+	if os.Getenv(batchEmitHarnessEnv) == "1" {
+		os.Exit(runDaemonShimBatchEmit())
+	}
+	if os.Getenv(interactiveHarnessEchoEnv) == "1" {
+		os.Exit(runDaemonShimEcho())
+	}
 	if os.Getenv(envDaemonShimHelper) == "1" {
 		os.Exit(runDaemonShimHelper())
 	}
@@ -843,8 +876,13 @@ func runDaemonShimHelper() int {
 	// publishes, which is what makes the adoption-time workarea comparison a real
 	// check rather than a value compared against itself (§D7).
 	workarea := filepath.Join(os.Getenv("DONMAI_TEST_DAEMON_SESSION_SHIM_WORKAREA_PARENT"), launch.Identity.SessionID)
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "daemon shim helper: executable:", err)
+		return 1
+	}
 	shim, err := sessionshim.StartFromEnv(launch,
-		ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}}, workarea)
+		ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()}, workarea)
 	if err != nil {
 		shimPTYFailureDiagnostic(err)
 		fmt.Fprintln(os.Stderr, "daemon shim helper: start:", err)
@@ -852,6 +890,78 @@ func runDaemonShimHelper() int {
 	}
 	<-shim.Done()
 	return 0
+}
+
+// runDaemonShimEcho is the harness the shim helper runs under its PTY: it
+// reads terminal input lines and answers each one with an `ack:` echo, which
+// is the round trip every shim-spawn test asserts through the adopted
+// connection. daemonShimEchoCommand builds its argv for direct use in any
+// ptyhost.Spec: the same test binary re-executed in this role, with no
+// shell in the path.
+//
+// It runs as this same test binary re-executed (see runDaemonShimHelper)
+// rather than as /bin/sh -c <script>, so the helper spawns one fewer process
+// per launch and the PTY round trip does not depend on a shell binary being
+// exec-able on the runner. stdio is the PTY slave: stdin is the terminal's
+// input and stdout is its output, so the echo answers on the same terminal
+// the test writes to. Terminal echo is cleared in-process (see
+// disableShimEchoTerminalEcho): that clearing is a fidelity difference from
+// the old shell fixture — which never ran stty -echo in this interactive
+// shape — not an equivalent of it. The tests match on the `ack:` answer,
+// which only this harness produces, so they hold either way.
+// daemonShimEchoSpec returns the shell-free PTY harness spec every shim
+// suite test uses: this test binary re-executed in echo mode
+// (runDaemonShimEcho), which reads terminal input lines and answers each
+// one with an `ack:` echo. It exists so a test that needs only a live,
+// answering child never names a shell binary: on a runner pool whose
+// confinement refuses the shell exec the spawn fails with
+// `fork/exec /bin/sh: operation not permitted` before any assertion runs.
+// A harness that merely sleeps also avoids the shell, but only this echo
+// form proves the PTY round trip is live through the adopted connection.
+func daemonShimEchoSpec() (ptyhost.Spec, error) {
+	echoArgv, err := daemonShimEchoCommand()
+	if err != nil {
+		return ptyhost.Spec{}, err
+	}
+	return ptyhost.Spec{Command: echoArgv, Env: daemonShimEchoEnv()}, nil
+}
+
+func daemonShimEchoCommand() ([]string, error) {
+	// os.Executable resolves THIS test binary even when the caller was
+	// itself launched through a path the child could not re-resolve (a
+	// relative argv[0], a deleted build path), where os.Args[0] would name
+	// a binary the spawn cannot exec.
+	echoPath, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	//nolint:gosec // G204: echoPath is this test binary; echo mode is selected by env
+	return []string{echoPath, "-test.run", "TestMain"}, nil
+}
+
+func daemonShimEchoEnv() []string {
+	return []string{interactiveHarnessEchoEnv + "=1"}
+}
+
+func runDaemonShimEcho() int {
+	disableShimEchoTerminalEcho()
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			// Terminal echo is cleared on this harness (see
+			// disableShimEchoTerminalEcho), so the carrier observes the input
+			// line only on this answer; the tests match on the `ack:` answer,
+			// which only this harness produces.
+			trimmed := strings.TrimRight(line, "\r\n")
+			if _, werr := fmt.Fprintf(os.Stdout, "ack:%s\r\n", trimmed); werr != nil {
+				return 1
+			}
+		}
+		if err != nil {
+			return 0
+		}
+	}
 }
 
 // shimSpawnFixture is a daemon configured to launch interactive sessions through
@@ -984,6 +1094,13 @@ func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string
 // alive long enough to be adopted: the default orphan deadline here is two
 // seconds, and a shim reaped before the pass reaches it is tombstoned rather
 // than adopted or quarantined.
+//
+// The fixture's daemon runs under hermeticShimScope: on Linux every shim
+// launch wraps in a scope (budget or not), so without it a systemd host would
+// wrap each launch in a REAL systemd-run whose unit name (one process epoch
+// per test binary) collides across suites, and a host without systemd would
+// refuse every launch. The real scope shape is pinned by the fake-systemd-run
+// tests and the Linux live proof.
 func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *shimSpawnFixture {
 	t.Helper()
 	// A Unix socket path has a short platform limit (as low as 104 bytes), and
@@ -1015,6 +1132,7 @@ func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *sh
 		mutate(&shimCfg)
 	}
 	d := New(Options{SkipRegistration: true, SessionShim: shimCfg})
+	d.shimScope = hermeticShimScope()
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
@@ -1043,6 +1161,22 @@ func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *sh
 		d.ReleaseAdoptedSessionShims()
 	})
 	return f
+}
+
+// hermeticShimScope is the shim scope probe for a test that launches real
+// shims: the platform reads as off Linux, so startShimProcess launches the
+// bare worker and never reaches the host's systemd-run, and the seat
+// read-back never execs systemctl. It is set on the test's own daemon, so
+// suites running in parallel never share it.
+func hermeticShimScope() shimScopeProbe {
+	return shimScopeProbe{
+		goos:      "darwin",
+		placement: func() seatbudget.Placement { return seatbudget.PlacementNone },
+		userScope: func() bool { return false },
+		readLimits: func(string, bool) (seatbudget.SeatLimits, bool) {
+			return seatbudget.SeatLimits{}, false
+		},
+	}
 }
 
 // interactiveSpec is a session spec whose run mode selects shim ownership.
@@ -2471,6 +2605,7 @@ func TestLaunchFailureFailsTheAcceptClosed(t *testing.T) {
 			LaunchTimeout:   750 * time.Millisecond,
 		},
 	})
+	d.shimScope = hermeticShimScope()
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
@@ -2497,6 +2632,16 @@ func TestLaunchFailureFailsTheAcceptClosed(t *testing.T) {
 	}
 	if _, tracked := d.spawner.sessions["sess-fail"]; tracked {
 		t.Error("a failed shim launch left a direct-child entry behind")
+	}
+	// The seat launch record is written before the worker starts; a launch
+	// that never announced itself leaves no lineage that would ever dispose
+	// of it, so the launch path removes it.
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("sessionShimRegistry: %v", err)
+	}
+	if _, found, err := registry.SeatLaunch(sessionshim.Identity{OrgID: "test-org", SessionID: "sess-fail"}, 1); err != nil || found {
+		t.Errorf("seat launch record after a launch that never announced itself = found %v, err %v; want it removed", found, err)
 	}
 }
 
@@ -3108,4 +3253,111 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 	if !reflect.DeepEqual(doctor.SessionShim, diagnostic) {
 		t.Fatalf("doctor/status session-shim drift:\ndoctor=%+v\nstatus=%+v", doctor.SessionShim, diagnostic)
 	}
+}
+
+// TestLaunchContractEpochAdvancesPastPriorIncarnations pins the launch
+// contract's process epoch: a first launch carries 1, and a launch after a
+// prior incarnation ended carries one past the highest epoch on disk —
+// records and tombstones alike — so two launches never alias.
+func TestLaunchContractEpochAdvancesPastPriorIncarnations(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("sessionShimRegistry: %v", err)
+	}
+	id := f.identity("sess-epoch")
+
+	if got := d.nextShimProcessEpoch(id, registry); got != 1 {
+		t.Fatalf("nextShimProcessEpoch on a new identity = %d, want 1", got)
+	}
+
+	// An unreadable registry maps to 1 rather than failing the launch: the
+	// fallback stays inside the 1-based contract, so a later healthy epoch-1
+	// launch can never alias the lineage the epoch disambiguates.
+	if got := d.nextShimProcessEpoch(id, nil); got != 1 {
+		t.Fatalf("nextShimProcessEpoch with an unreadable registry = %d, want 1", got)
+	}
+
+	// A prior incarnation that ended with a tombstone at epoch 5 advances the
+	// next launch to 6.
+	prior := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-prior", ProcessEpoch: 5,
+		HarnessPID: 1, HarnessStartedAt: 2,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(prior); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	if got := d.nextShimProcessEpoch(id, registry); got != 6 {
+		t.Fatalf("nextShimProcessEpoch past a tombstone at epoch 5 = %d, want 6", got)
+	}
+
+	// A live record at a higher epoch wins over the tombstone.
+	live := sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-live", ProcessEpoch: 9,
+		PID: 1, ProcessStartedAt: 2,
+		SocketPath: "/tmp/not-a-socket", ProtocolMin: 1, ProtocolMax: 2,
+		Phase: shimwire.PhaseRunning, CreatedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.Put(live); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got := d.nextShimProcessEpoch(id, registry); got != 10 {
+		t.Fatalf("nextShimProcessEpoch past a live record at epoch 9 = %d, want 10", got)
+	}
+
+	// A sibling identity is unaffected.
+	sibling := sessionshim.Identity{OrgID: id.OrgID, SessionID: "sess-other"}
+	if got := d.nextShimProcessEpoch(sibling, registry); got != 1 {
+		t.Fatalf("nextShimProcessEpoch for an untouched identity = %d, want 1", got)
+	}
+}
+
+// TestLaunchedSessionCarriesContractEpoch drives the production launch path:
+// the record a real launch publishes carries the contract's epoch — 1 on a
+// new identity, past the highest prior incarnation after one ended — not a
+// constant.
+func TestLaunchedSessionCarriesContractEpoch(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	spec := f.interactiveSpec("sess-launch-epoch")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	registry, err := f.daemon.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("sessionShimRegistry: %v", err)
+	}
+	waitFor(t, 20*time.Second, "the launched record to carry epoch 1", func() bool {
+		rec, err := registry.Get(id)
+		return err == nil && rec.ProcessEpoch == 1
+	})
+
+	// A relaunch after the lineage ended advances past the tombstone: seed
+	// a terminal proof at epoch 4 for a second session and launch it, then
+	// require epoch 5 on the published record.
+	spec2 := f.interactiveSpec("sess-relaunch-epoch")
+	id2 := f.identity(spec2.SessionID)
+	prior := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id2.OrgID, SessionID: id2.SessionID,
+		ShimID: "shim-prior", ProcessEpoch: 4,
+		HarnessPID: 1, HarnessStartedAt: 2,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(prior); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	if _, err := f.daemon.spawner.AcceptWork(spec2); err != nil {
+		t.Fatalf("AcceptWork for the relaunch: %v", err)
+	}
+	waitFor(t, 20*time.Second, "the relaunched record to carry epoch 5", func() bool {
+		rec, err := registry.Get(id2)
+		return err == nil && rec.ProcessEpoch == 5
+	})
 }

@@ -131,6 +131,10 @@ func reconciledEndpointBinding(in *agent.EndpointBinding) (*agent.EndpointBindin
 		return nil, fmt.Errorf("resolved profile endpoint: %w", err)
 	}
 	out := *in
+	if in.UnitPrices != nil {
+		prices := *in.UnitPrices
+		out.UnitPrices = &prices
+	}
 	return &out, nil
 }
 

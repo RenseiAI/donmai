@@ -1,8 +1,6 @@
 package claude
 
 import (
-	"os"
-	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -230,22 +228,16 @@ func fakeEnvEchoCLI(t *testing.T) string {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake CLI uses /bin/sh; skip on windows")
 	}
-	dir := t.TempDir()
-	path := filepath.Join(dir, "fake-claude.sh")
-	script := "#!/bin/sh\n" +
-		`printf '{"type":"system","subtype":"init","session_id":"sess-ep-1"}\n'` + "\n" +
-		`printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s|%s"}]}}\n' "$CLAUDE_CODE_USE_BEDROCK" "$AWS_REGION"` + "\n" +
-		`printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1}\n'` + "\n"
-	// Write WITHOUT the exec bit, then chmod-add it after close (avoids
-	// ETXTBSY on fork+exec under parallel test load — see clijsonl's
-	// fakeCLI for the full rationale).
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
-		t.Fatalf("write fake cli: %v", err)
-	}
-	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
-		t.Fatalf("chmod fake cli: %v", err)
-	}
-	return path
+	// Publish through the shared immutable dispatcher (see writeFakeCLI
+	// in oneshot_test.go), never as a freshly written executable: a
+	// sibling test that forks while this file's writer is open hands the
+	// writer to its child, and execve of the script then fails with
+	// ETXTBSY.
+	return writeFakeCLI(t, "fake-claude.sh",
+		"#!/bin/sh\n"+
+			`printf '{"type":"system","subtype":"init","session_id":"sess-ep-1"}\n'`+"\n"+
+			`printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s|%s"}]}}\n' "$CLAUDE_CODE_USE_BEDROCK" "$AWS_REGION"`+"\n"+
+			`printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1}\n'`+"\n")
 }
 
 // TestProvider_Spawn_EndpointEnvReachesSubprocess proves Provider.Spawn

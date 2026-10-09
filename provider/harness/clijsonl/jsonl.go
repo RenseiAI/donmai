@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -48,9 +50,10 @@ type rawAssistantEnvelope struct {
 		StopReason string            `json:"stop_reason,omitempty"`
 		Content    []rawContentBlock `json:"content"`
 		Usage      struct {
-			InputTokens          int64 `json:"input_tokens"`
-			OutputTokens         int64 `json:"output_tokens"`
-			CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 		} `json:"usage,omitempty"`
 	} `json:"message"`
 }
@@ -127,6 +130,7 @@ type rawAuthStatusEnvelope struct {
 //	    "input_tokens": 5,
 //	    "output_tokens": 8,
 //	    "cache_read_input_tokens": 16526,
+//	    "cache_creation_input_tokens": 1200,
 //	    ...
 //	  }
 //	}
@@ -141,10 +145,15 @@ type rawResultEnvelope struct {
 	Errors       []struct {
 		Message string `json:"message,omitempty"`
 	} `json:"errors,omitempty"`
+	// Usage follows the Anthropic accounting: input_tokens excludes both
+	// cache classes, which ride cache_read_input_tokens (CostData
+	// CachedInputTokens) and cache_creation_input_tokens (CostData
+	// CacheWriteTokens).
 	Usage struct {
-		InputTokens          int64 `json:"input_tokens"`
-		OutputTokens         int64 `json:"output_tokens"`
-		CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+		InputTokens              int64 `json:"input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 	// APIError carries the endpoint's structured refusal on failure
 	// lines (for example HTTP 429 with a usage-limit code and a reset
@@ -187,7 +196,132 @@ type rawAPIError struct {
 // in `Raw` so the runner can persist it to <worktree>/.agent/events.jsonl per
 // F.1.1 §4 step 9. LlmCallEvent is the deliberate exception: it stays
 // metadata/digest-only and never duplicates prompt/completion content.
-func mapLine(line []byte) []agent.Event {
+
+// delegationToolName reports whether name is one of this adapter's native
+// sub-agent delegation tools. The adapter names its own delegation tools
+// (matched the same way the runner historically matched them: "Task" and
+// "Agent", case-insensitive with MCP-style namespace suffixes); the
+// runner keeps no list of tool names and counts the typed SubagentEvent
+// the mapper emits instead.
+func delegationToolName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "task" || n == "agent" {
+		return true
+	}
+	return strings.HasSuffix(n, "__task") || strings.HasSuffix(n, "__agent")
+}
+
+// LineMapper is the stateful stream-json line mapper. It pairs delegation
+// tool calls with their results by ToolUseID so a delegation emits the
+// typed sub-agent lifecycle (started on the tool_use line, completed or
+// failed on the matching tool_result line) alongside the plain tool events.
+// It also carries the quota-window names the usage read established so a
+// streamed rate-limit event lands on the probe's window id: an
+// overage-included event names the model-scoped bucket the probe drew,
+// and a streamed event for any other type the probe never rendered stays
+// a plain rate-limit marker instead of opening an orphan scoped row.
+// The zero value is ready to use; concurrent callers are safe.
+type LineMapper struct {
+	mu      sync.Mutex
+	pending map[string]string // ToolUseID -> delegation tool name
+	// scopedNames is the display name of the model-scoped weekly bucket
+	// the last usage read drew a row for. RecordUsageLimits sets it
+	// from the probe result; mapRateLimitEvent reads it for the
+	// overage-included event type.
+	scopedNames scopedUsageNames
+}
+
+// scopedUsageNames records the model-scoped bucket name the usage read
+// saw. It mirrors the probe package's names type without importing it:
+// the stream driver must stay importable from the probe package's
+// consumers.
+type scopedUsageNames struct {
+	// OverageIncluded is the display name of the model-scoped weekly
+	// bucket the last usage read drew a row for.
+	OverageIncluded string
+}
+
+// MapLine maps one JSONL line, tracking delegation pairs across lines.
+// A streamed rate-limit event maps through the quota names Recorded on
+// the mapper, so it lands on the probe's window id.
+func (m *LineMapper) MapLine(line []byte) []agent.Event {
+	events := mapLineWithNames(line, m.scopedNamesFor())
+	if m == nil {
+		return events
+	}
+	out := make([]agent.Event, 0, len(events)+1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pending == nil {
+		m.pending = make(map[string]string)
+	}
+	for _, ev := range events {
+		out = append(out, ev)
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			if e.ToolUseID == "" || !delegationToolName(e.ToolName) {
+				continue
+			}
+			m.pending[e.ToolUseID] = e.ToolName
+			out = append(out, agent.SubagentEvent{
+				ToolName:  e.ToolName,
+				ToolUseID: e.ToolUseID,
+				Phase:     agent.SubagentStarted,
+				Raw:       e.Raw,
+			})
+		case agent.ToolResultEvent:
+			name, ok := m.pending[e.ToolUseID]
+			if e.ToolUseID == "" || !ok {
+				continue
+			}
+			delete(m.pending, e.ToolUseID)
+			phase := agent.SubagentCompleted
+			if e.IsError {
+				phase = agent.SubagentFailed
+			}
+			if e.ToolName != "" {
+				name = e.ToolName
+			}
+			out = append(out, agent.SubagentEvent{
+				ToolName:  name,
+				ToolUseID: e.ToolUseID,
+				Phase:     phase,
+				Raw:       e.Raw,
+			})
+		}
+	}
+	return out
+}
+
+// scopedNamesFor returns the quota names a rate-limit line maps with.
+// The nil mapper keeps the zero names, so an overage-included event
+// without a probe stays dropped.
+func (m *LineMapper) scopedNamesFor() scopedUsageNames {
+	if m == nil {
+		return scopedUsageNames{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.scopedNames
+}
+
+// RecordUsageLimits records the model-scoped bucket name a usage read
+// drew a row for, so a later streamed rate-limit event lands on that
+// row. An empty name clears the record: the next overage-included
+// event stays dropped until a probe names the bucket again.
+func (m *LineMapper) RecordUsageLimits(overageIncludedDisplayName string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.scopedNames.OverageIncluded = overageIncludedDisplayName
+}
+
+// mapLineWithNames is the production entry: it decodes one line with
+// the mapper's recorded quota names. Tests pinning lines that never
+// carry quota state call it with zero names through mapLine.
+func mapLineWithNames(line []byte, names scopedUsageNames) []agent.Event {
 	var head rawJSONLEnvelope
 	if err := json.Unmarshal(line, &head); err != nil {
 		return []agent.Event{agent.ErrorEvent{
@@ -218,11 +352,12 @@ func mapLine(line []byte) []agent.Event {
 		// structured cause.
 		return mapStreamEvent(line)
 	case "rate_limit_event":
-		// Surface as a system event so the runner can record it.
-		return []agent.Event{agent.SystemEvent{
-			Subtype: "rate_limit",
-			Raw:     json.RawMessage(line),
-		}}
+		// Map onto the shared quota-window type so the daemon can
+		// publish the window. The parsed update rides the event's
+		// Usage field; the raw line stays attached for diagnostics.
+		// The mapper's recorded probe names decide the overage bucket's
+		// window id, so the event lands on the probe's row.
+		return mapRateLimitEvent(line, names)
 	case "":
 		return []agent.Event{agent.ErrorEvent{
 			Message: "provider/claude: JSONL line missing top-level type",
@@ -238,6 +373,12 @@ func mapLine(line []byte) []agent.Event {
 			Raw:     json.RawMessage(line),
 		}}
 	}
+}
+
+// mapLine decodes one line with no recorded probe names: an
+// overage-included event stays dropped until a probe names the bucket.
+func mapLine(line []byte) []agent.Event {
+	return mapLineWithNames(line, scopedUsageNames{})
 }
 
 func mapSystem(line []byte) []agent.Event {
@@ -286,13 +427,15 @@ func mapAssistant(line []byte) []agent.Event {
 	// Older emitters omit message.usage; their terminal ResultEvent is handled
 	// conservatively by the aggregate fallback in runtime/span.
 	if a.Message.Usage.InputTokens != 0 || a.Message.Usage.OutputTokens != 0 ||
-		a.Message.Usage.CacheReadInputTokens != 0 || a.Message.StopReason != "" {
+		a.Message.Usage.CacheReadInputTokens != 0 || a.Message.Usage.CacheCreationInputTokens != 0 ||
+		a.Message.StopReason != "" {
 		out = append(out, agent.LlmCallEvent{
 			Model:             a.Message.Model,
 			ResponseModel:     a.Message.Model,
 			InputTokens:       a.Message.Usage.InputTokens,
 			OutputTokens:      a.Message.Usage.OutputTokens,
 			CachedInputTokens: a.Message.Usage.CacheReadInputTokens,
+			CacheWriteTokens:  a.Message.Usage.CacheCreationInputTokens,
 			FinishReason:      a.Message.StopReason,
 			UsageSource:       agent.LlmUsageProvider,
 			TurnCompleted:     true,
@@ -404,6 +547,7 @@ func mapResult(line []byte) []agent.Event {
 		InputTokens:       r.Usage.InputTokens,
 		OutputTokens:      r.Usage.OutputTokens,
 		CachedInputTokens: r.Usage.CacheReadInputTokens,
+		CacheWriteTokens:  r.Usage.CacheCreationInputTokens,
 	}
 	if observedCost != nil {
 		cost.TotalCostUsd = *observedCost
@@ -538,6 +682,148 @@ func mapStreamEvent(line []byte) []agent.Event {
 		Upstream: agent.NormalizeUpstreamError(status, code, message, ""),
 		Raw:      json.RawMessage(line),
 	}}
+}
+
+// rawRateLimitEnvelope decodes the streamed rate-limit line. The streamed
+// event names one window at a time with a 0–1 utilization fraction and an
+// epoch-seconds reset.
+type rawRateLimitEnvelope struct {
+	Type          string `json:"type"`
+	RateLimitInfo *struct {
+		Status        string   `json:"status"`
+		RateLimitType string   `json:"rateLimitType"`
+		Utilization   *float64 `json:"utilization"`
+		ResetsAt      *float64 `json:"resetsAt"`
+	} `json:"rate_limit_info"`
+}
+
+// mapRateLimitEvent maps one streamed `rate_limit_event` line onto the
+// shared quota-window type through the shared quota mapper: account-wide
+// windows map by rate-limit type, and the overage-included event maps
+// onto the model-scoped row the usage read drew (dropping when no probe
+// has named the bucket). Unknown types are dropped to the same plain
+// rate-limit marker the probe mapper yields for an unrendered window,
+// so stream and probe rows never diverge on window id.
+func mapRateLimitEvent(line []byte, names scopedUsageNames) []agent.Event {
+	var envelope rawRateLimitEnvelope
+	if err := json.Unmarshal(line, &envelope); err != nil {
+		return []agent.Event{agent.ErrorEvent{
+			Message: fmt.Sprintf("provider/claude: decode rate_limit event: %v", err),
+			Code:    "decode_rate_limit",
+			Raw:     json.RawMessage(line),
+		}}
+	}
+	info := envelope.RateLimitInfo
+	if info == nil || info.RateLimitType == "" || info.Utilization == nil {
+		return []agent.Event{agent.SystemEvent{
+			Subtype: "rate_limit",
+			Raw:     json.RawMessage(line),
+		}}
+	}
+	window, ok := mapRateLimitWindow(info.RateLimitType, *info.Utilization, info.ResetsAt, names.OverageIncluded)
+	if !ok {
+		return []agent.Event{agent.SystemEvent{
+			Subtype: "rate_limit",
+			Raw:     json.RawMessage(line),
+		}}
+	}
+	return []agent.Event{agent.UsageEvent{
+		Message: info.Status,
+		Usage:   &agent.UsageLimitsUpdate{Windows: []agent.UsageWindow{window}},
+		Raw:     json.RawMessage(line),
+	}}
+}
+
+// claudeWindowMeta is the fixed metadata for one account-wide window.
+// It mirrors the probe mapper's window table so stream and probe rows
+// share ids, kinds, labels and durations.
+type claudeWindowMeta struct {
+	kind         agent.UsageWindowKind
+	label        string
+	durationMins int
+}
+
+// claudeAccountWindows is the account-wide window table, shared with
+// the usage-read mapper.
+var claudeAccountWindows = map[string]claudeWindowMeta{
+	"five_hour": {kind: agent.UsageWindowSession, label: "Session", durationMins: 5 * 60},
+	"seven_day": {kind: agent.UsageWindowWeekly, label: "Weekly", durationMins: 7 * 24 * 60},
+}
+
+// claudeOverageIncludedEventType is how the streamed event names the
+// model-scoped weekly bucket the usage read draws per display name.
+const claudeOverageIncludedEventType = "seven_day_overage_included"
+
+// mapRateLimitWindow maps one streamed window onto the probe-stable
+// window shape. ok=false drops the line to the plain marker: the type
+// is unknown, or the overage bucket arrived before any probe named it.
+func mapRateLimitWindow(rateLimitType string, utilization float64, resetsAt *float64, overageIncludedDisplayName string) (agent.UsageWindow, bool) {
+	used := agent.ClampPercent(utilization * 100)
+	var reset string
+	if resetsAt != nil {
+		reset = agent.ISOFromEpochSeconds(*resetsAt)
+	}
+	if meta, ok := claudeAccountWindows[rateLimitType]; ok {
+		duration := meta.durationMins
+		w := agent.UsageWindow{
+			ID:                 rateLimitType,
+			Kind:               meta.kind,
+			Label:              meta.label,
+			UsedPercent:        used,
+			WindowDurationMins: &duration,
+		}
+		if reset != "" {
+			w.ResetsAt = reset
+		}
+		return w, true
+	}
+	if rateLimitType == claudeOverageIncludedEventType && overageIncludedDisplayName != "" {
+		return scopedRateLimitWindow(overageIncludedDisplayName, used, reset), true
+	}
+	return agent.UsageWindow{}, false
+}
+
+// scopedRateLimitWindow builds one model-scoped weekly window with the
+// probe-stable id the usage read draws for the display name.
+func scopedRateLimitWindow(displayName string, usedPercent float64, resetsAt string) agent.UsageWindow {
+	duration := 7 * 24 * 60
+	w := agent.UsageWindow{
+		ID:                 scopedRateLimitWindowID(displayName),
+		Kind:               agent.UsageWindowWeekly,
+		Label:              "Weekly · " + displayName,
+		UsedPercent:        agent.ClampPercent(usedPercent),
+		WindowDurationMins: &duration,
+	}
+	if resetsAt != "" {
+		w.ResetsAt = resetsAt
+	}
+	return w
+}
+
+// scopedRateLimitWindowID derives the window ID for one model-scoped
+// bucket. It mirrors the probe mapper's id rule so a streamed event
+// lands on the row the usage read drew.
+func scopedRateLimitWindowID(displayName string) string {
+	var b strings.Builder
+	b.WriteString("seven_day_")
+	prevUnderscore := true
+	for _, r := range strings.ToLower(displayName) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevUnderscore = false
+		default:
+			if !prevUnderscore {
+				b.WriteRune('_')
+				prevUnderscore = true
+			}
+		}
+	}
+	id := strings.TrimRight(b.String(), "_")
+	if id == "seven_day_" || id == "seven_day" {
+		return "seven_day_scoped"
+	}
+	return id
 }
 
 // resultUpstream reads the endpoint's structured refusal off a failure

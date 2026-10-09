@@ -39,6 +39,7 @@ import (
 	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
@@ -99,6 +100,18 @@ var bindWorkerGatewayForAgentRun = func(
 
 var buildRegistryForAgentRun = func(logger *slog.Logger, hints agentRunCtorHints, agentBin string) *runner.Registry {
 	return buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
+}
+
+// shimSeatFromEnv reports this worker's shim-owned seat, or nil when this
+// process was not launched under the per-session shim launch contract. It is
+// a var so tests can drive the shim-owned runner path without mutating the
+// process environment.
+var shimSeatFromEnv = func() *runner.ShimSeatConfig {
+	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
+	if err != nil {
+		return nil
+	}
+	return &runner.ShimSeatConfig{Attempt: launch.ProcessEpoch}
 }
 
 // gatewayHarnessIdentity projects the canonical loop-driver identity already
@@ -303,14 +316,24 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// operator mistake or this process guessing at an address nobody gave it.
 	daemonURL, daemonURLSource := resolveAgentRunDaemonURL(opts.daemonURL, os.Getenv)
 
-	// 2b. Resolve the optional daemon-control bearer token. In a cloud
-	// sandbox the provisioner points DONMAI_DAEMON_URL at an authenticated
-	// remote endpoint and sets DONMAI_RUNTIME_JWT to the token that
-	// endpoint expects; the token is attached as `Authorization: Bearer
-	// <token>` on daemon-control requests. When unset (the default
-	// localhost loopback at 127.0.0.1:7734) no Authorization header is
-	// sent, preserving the unauthenticated loopback behavior.
+	// 2b. Resolve the bearer token for the session-detail read. Precedence:
+	// the per-session read credential the spawning daemon stated in this
+	// worker's environment (authorizes exactly this session's detail read
+	// and nothing else), then the sandbox provisioner's endpoint token
+	// (an authenticated remote endpoint reached via DONMAI_DAEMON_URL
+	// with the token in DONMAI_RUNTIME_JWT). When neither is set (the
+	// default localhost loopback) the request carries no Authorization
+	// header and the daemon answers with the credential-redacted shape.
+	//
+	// A local-runtime worker presents its attempt credential only. Its
+	// spawn environment states both, but the local receiver authenticates
+	// the attempt credential on the detail read and on every callback
+	// (the credential cache below reuses this token) and never consults
+	// the read credential.
 	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+	if readToken := strings.TrimSpace(os.Getenv(runtimeenv.SessionReadTokenEnv)); readToken != "" && !opts.localRuntime {
+		daemonToken = readToken
+	}
 	if opts.localRuntime && (daemonToken == "" || daemonURLSource == daemonURLSourceBuiltinDefault) {
 		return preflightErr("local worker requires its explicit daemon origin and attempt credential")
 	}
@@ -352,6 +375,16 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		return preflightErr(fmt.Sprintf(
 			"fetch session detail from %s (%s): %v", daemonURL, daemonURLSource, err))
 	}
+	// The bootstrap read consumed the per-session read credential: drop it
+	// from this process's environment before anything it spawns can
+	// inherit it. The credential cache below already captured the token
+	// string it needs for refreshes; every harness and agent child this
+	// worker spawns from here on inherits a credential-free environment.
+	// A local-runtime worker never used it (it presents its attempt
+	// credential only) — dropping the unused copy is the same hygiene.
+	if err := os.Unsetenv(runtimeenv.SessionReadTokenEnv); err != nil {
+		return preflightErr(fmt.Sprintf("drop session read credential after bootstrap: %v", err))
+	}
 	if opts.localRuntime {
 		if err := validateLocalAgentDetail(daemonURL, detail); err != nil {
 			return preflightErr(err.Error())
@@ -367,6 +400,20 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		"provider", providerNameFromDetail(detail),
 		"workType", detail.WorkType,
 	)
+	// A detail read that crossed no credential boundary answers with the
+	// credential fields cleared. A worker that bootstraps from such an
+	// answer cannot talk to the platform it was claimed for, so log the
+	// shortfall loudly: production daemons always state the session's
+	// own read credential in the spawn environment, and its absence here
+	// means this worker was started by hand (or by a daemon that
+	// predates the credential) rather than by its own session's spawn.
+	if detail.AuthToken == "" {
+		logger.Warn(
+			"agent run: session detail carries no runtime credential; platform calls will fail unless the daemon refreshes it",
+			"sessionId", sessionID,
+			"daemonUrlSource", daemonURLSource,
+		)
+	}
 	if len(detail.AdmissionReceipt) > 0 {
 		hostReceipt, err := executioncell.DecodeHostAdaptationReceipt(detail.HostAdaptationReceipt)
 		if err != nil || hostReceipt.RequestID != detail.SessionID ||
@@ -536,6 +583,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// each other and with the daemon's preflight compiler (see
 		// runner.ReconcileAdditionalExtensions).
 		AdditionalExtensionDecorator: opts.specDecorator,
+		// A seat launched under per-session shim ownership persists every
+		// terminal status body in the standalone outbox before the first
+		// send, so a runner killed after persist but before send has its
+		// exact bytes replayed once by the daemon. Detection mirrors the
+		// harness's own launch-contract read: the contract in this
+		// process's environment is what makes this seat shim-owned, and
+		// its monotonic process epoch is the outbox attempt. Absent the
+		// contract this stays nil and the runner behaves exactly as before.
+		ShimSeat: shimSeatFromEnv(),
 		// Runtime memory-inject (v2) needs NO worker config: the runner always
 		// wires the inject handler when the provider supports injection, and the
 		// PLATFORM decides per-session whether to deliver (per-project memory
@@ -543,6 +599,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// the dispatch-time fold (v1).
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
+		// Live quota updates ride back to the admitting daemon: the
+		// sparse windows the session's harness stream carries (a codex
+		// `account/rateLimits/updated` notification, a claude
+		// `rate_limit_event`) merge there by window id onto the probe
+		// snapshot behind the heartbeat quota field. Best-effort and
+		// bounded; an unreachable daemon never stalls the session.
+		QuotaReporterForSession: func(_, harness string) *runner.QuotaReporter {
+			return runner.NewQuotaReporter(callbackClient, daemonURL, sessionID, harness, daemonToken, logger)
+		},
 	}
 	applyAgentRunCapabilityOptions(&runnerOptions, opts)
 	r, err := runner.New(runnerOptions)
@@ -1065,6 +1130,14 @@ type agentRunCtorHints struct {
 	// PiTrustedExtensions comes only from afcli.Config in the compiled
 	// embedder. It is never derived from SessionDetail or ProviderConfig.
 	PiTrustedExtensions []providerpi.TrustedExtensionIdentity
+
+	// ControlTokenPath is the daemon-resolved control-token file path
+	// the spawned worker's seat confinement denies outright. Derived
+	// from the fetched SessionDetail (stamped by the spawning daemon at
+	// accept time): the worker's environment never carries the
+	// path-override variable, so resolving it there would deny the
+	// default path while the live token sits at the override.
+	ControlTokenPath string
 }
 
 // agentRunHints collects every per-session constructor signal in one pass.
@@ -1073,6 +1146,9 @@ type agentRunCtorHints struct {
 func agentRunHints(d *daemon.SessionDetail) agentRunCtorHints {
 	h := opencodeCtorHints(d)
 	h.CodexHostSessionAuth = codexHostSessionCtorHint(d)
+	if d != nil {
+		h.ControlTokenPath = strings.TrimSpace(d.ControlTokenPath)
+	}
 	return h
 }
 
@@ -1219,7 +1295,10 @@ func codexCtorOptions(h agentRunCtorHints) providercodex.Options {
 }
 
 func piCtorOptions(h agentRunCtorHints) providerpi.Options {
-	return providerpi.Options{TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...)}
+	return providerpi.Options{
+		TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...),
+		ControlTokenPath:  h.ControlTokenPath,
+	}
 }
 
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT
@@ -1453,6 +1532,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			McpServers:           detailMCPServers(d.McpServers),
 			Skills:               detailSkills(d.Skills),
 			MemoryBlock:          d.MemoryBlock,
+			ContinuePullRequest:  detailContinuePullRequest(d.ContinuePullRequest),
 			Mode:                 d.Mode,
 			InitialPrompt:        d.InitialPrompt,
 			RecordingEnabled:     d.RecordingEnabled,
@@ -1475,6 +1555,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		// the daemon capability/lease knobs rather than inside the prompt
 		// payload: it gates a runner post-session policy, not prompt text.
 		DeferFailureTransition: d.DeferFailureTransition,
+		SeatBudget:             detailSeatBudget(d.SeatBudget),
 	}
 	if len(d.OperationalPayload) > 0 {
 		// Decode into a zero value: absent receipted fields must stay absent rather
@@ -1498,7 +1579,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		if d.BaseRef != admitted.BaseRef || !reflect.DeepEqual(d.RepositoryDeclaration, admitted.RepositoryDeclaration) ||
 			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID ||
-			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) {
+			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) ||
+			!reflect.DeepEqual(detailContinuePullRequest(d.ContinuePullRequest), admitted.ContinuePullRequest) {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
 		}
 		if d.AgentCardID != admitted.AgentCardID || d.AgentCardName != admitted.AgentCardName {
@@ -1659,6 +1741,35 @@ func detailMCPServers(in []daemon.PollMCPServer) []agent.MCPServerConfig {
 		}
 	}
 	return out
+}
+
+// detailContinuePullRequest re-types the daemon's PollContinuePullRequest
+// mirror into the runner-consumable prompt.ContinuePullRequest. Nil in
+// returns nil so the omitempty round-trip is faithful.
+func detailContinuePullRequest(in *daemon.PollContinuePullRequest) *prompt.ContinuePullRequest {
+	if in == nil {
+		return nil
+	}
+	return &prompt.ContinuePullRequest{
+		Number:  in.Number,
+		HeadRef: in.HeadRef,
+		HeadSha: in.HeadSha,
+	}
+}
+
+// detailSeatBudget re-types the daemon's per-seat budget mirror into the
+// runner-consumable shape. Nil stays nil: budgeting off means the seat
+// spawns exactly as before.
+func detailSeatBudget(in *daemon.SessionSeatBudget) *runner.SeatBudget {
+	if in == nil {
+		return nil
+	}
+	return &runner.SeatBudget{
+		Mode:     in.Mode,
+		CPUs:     in.CPUs,
+		MemoryMB: in.MemoryMB,
+		Detail:   in.Detail,
+	}
 }
 
 // detailSkills re-types the daemon's PollSkill mirror slice into the

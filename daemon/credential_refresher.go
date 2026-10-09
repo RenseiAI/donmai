@@ -160,6 +160,18 @@ func (r *CredentialRefresher) UpdateRegistrationProjects(entries []ProjectAllowl
 	r.mu.Unlock()
 }
 
+// UpdateRegistrationToken replaces the registration token presented on the
+// next refresh or re-registration, so a rotated token takes effect without a
+// restart. Only the token changes; every other registration field retains its
+// current value. Safe for concurrent use with an in-flight refresh: Refresh,
+// Reregister, and DeclareSessionShim each copy the registration under the
+// same lock this setter holds.
+func (r *CredentialRefresher) UpdateRegistrationToken(token string) {
+	r.mu.Lock()
+	r.opts.Registration.RegistrationToken = token
+	r.mu.Unlock()
+}
+
 // Reregister sends the latest project declaration and publishes the resulting
 // identity to every credential lane. It is serialized with both ordinary
 // refresh and session-shim declaration operations.
@@ -379,7 +391,12 @@ func (r *CredentialRefresher) DeclareSessionShim(
 	defer r.releaseOperation()
 	r.mu.Lock()
 	previous := cloneSessionShimHostAttestation(r.opts.Registration.SessionShim)
+	previousAuthOnly := r.opts.Registration.AuthOnly
 	r.opts.Registration.SessionShim = cloneSessionShimHostAttestation(attestation)
+	// Auth-only registration rides on a composed attestation, and Register
+	// refuses it without one. A declared stand-down drops it, or a later full
+	// re-registration could not mint a replacement identity at all.
+	r.opts.Registration.AuthOnly = previousAuthOnly && attestation.enabled()
 	r.mu.Unlock()
 
 	r.mu.Lock()
@@ -403,6 +420,7 @@ func (r *CredentialRefresher) DeclareSessionShim(
 	if err != nil {
 		r.mu.Lock()
 		r.opts.Registration.SessionShim = previous
+		r.opts.Registration.AuthOnly = previousAuthOnly
 		r.mu.Unlock()
 		return nil, err
 	}

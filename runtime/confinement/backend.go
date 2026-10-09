@@ -1,8 +1,14 @@
 package confinement
 
+import (
+	"sort"
+
+	"github.com/RenseiAI/donmai/agent"
+)
+
 // Backend applies a confinement boundary around one harness process. The
-// macOS profile backend is the only implementation in this package today;
-// a Linux mount-namespace backend is the next one.
+// macOS profile backend and the Linux mount-namespace backend are the
+// implementations in this package today.
 type Backend interface {
 	// Name is the backend's attestation name.
 	Name() BackendName
@@ -37,6 +43,10 @@ type Applied struct {
 	// Wrap returns the argv that runs argv inside the boundary. argv[0] is
 	// absolute.
 	Wrap func(argv []string) []string
+	// Environ returns the KEY=VALUE bindings the boundary itself needs on
+	// top of the plan environment (a Landlock stage policy, a marker): the
+	// launcher applies them to the spawned process. Nil when none.
+	Environ func() []string
 	// Release removes whatever Apply wrote. Nil when nothing was written.
 	Release func() error
 }
@@ -50,8 +60,11 @@ type WritableRoot struct {
 // Resolved is a validated Spec with every path in the backend's canonical
 // spelling.
 type Resolved struct {
-	SessionID    string
-	HarnessID    string
+	SessionID string
+	HarnessID string
+	// SessionMode is the spawn path the boundary wraps: a backend that
+	// shapes the process session (a terminal the harness must own) reads it.
+	SessionMode  agent.PromptSessionMode
 	WorkareaRoot string
 	// MetadataDir is the workarea root's reserved metadata directory.
 	MetadataDir string
@@ -65,11 +78,91 @@ type Resolved struct {
 	// path. They are denied as literals so that renaming an ancestor cannot
 	// move a denied path out from under its rule.
 	Pins []string
+	// Denied are the daemon-private paths (Spec.DeniedPaths), canonical and
+	// sorted. Every backend renders them in every read scope, open reads
+	// included, after every allow, so they win even inside the session's
+	// read allowlist: no read of any kind and no write, the whole subtree.
+	// None covers the session's own paths (the resolver refuses that), so a
+	// backend may hide each outright: macOS denies every read operation by
+	// name and writes by subpath; a mount-namespace backend binds an empty placeholder of the
+	// path's type over each that exists (a missing one is minted later, so
+	// its access-control stage must deny the path as well).
+	Denied []string
+	// DeniedListings are the daemon-private directories
+	// (Spec.DeniedListings), canonical and sorted. Every backend renders
+	// them in every read scope, after every allow: the directory's listing
+	// is refused while the directory stays traversable and the paths
+	// beneath it keep what the rest of the boundary grants. macOS denies
+	// file-read-data and file-read-xattr on the literal directory. A
+	// mount-namespace backend that cannot refuse a listing alone may hide
+	// the directory's entries with an empty overlay, then bind back beneath
+	// it, at their original spelling, every writable root, read-only leaf
+	// and read path that lies there; it must never hide those.
+	DeniedListings []string
 	// Sockets are the declared sockets outside the writable set.
 	Sockets []string
+	// LoopbackTCPPorts are the declared loopback TCP ports.
+	LoopbackTCPPorts []int
 	// SessionTmp and Caches feed the environment bindings.
 	SessionTmp string
 	Caches     []Cache
+	// Home is the operator home and StateHome the host state home. Both
+	// are bound read-only so file metadata stays readable (the seatbelt
+	// contract reads metadata everywhere); file contents and listings
+	// outside the allowlist are denied by the Landlock stage, which grants
+	// no access there. Empty when the session was resolved without host
+	// directories (unit renders).
+	Home      string
+	StateHome string
 	// ReadOnlyLeafNames are the read-only leaves' names, for the record.
 	ReadOnlyLeafNames []string
+	// ReadScope is the enforced fileRead level: empty for open reads, or
+	// agent.FileReadWorkarea.
+	ReadScope agent.ExecutionSecurityLevel
+	// ReadPaths are the declared extra read paths, canonical and sorted.
+	ReadPaths []string
+}
+
+// loopbackEgressDeclarer is implemented by a backend whose boundary leaves
+// outbound TCP to the local machine open on undeclared ports. The self-test
+// judges the undeclared-port loopback dials by it: a backend that declares
+// nothing must refuse them, and one that declares the gap must let them
+// through, so a backend that silently starts or stops filtering loopback
+// TCP fails exactly the probes that name it.
+type loopbackEgressDeclarer interface {
+	leavesLoopbackEgressOpen() bool
+}
+
+// leavesLoopbackEgressOpen reports whether backend declares outbound TCP to
+// the local machine open on undeclared ports. A backend that declares
+// nothing is held to the contract's default: denied except on the declared
+// ports.
+func leavesLoopbackEgressOpen(backend Backend) bool {
+	declarer, ok := backend.(loopbackEgressDeclarer)
+	return ok && declarer.leavesLoopbackEgressOpen()
+}
+
+// ReadAllowlist is the session's half of the read allowlist under a read
+// scope: every writable root, every read-only leaf and every declared read
+// path, sorted and without repeats. The backend adds its runtime paths.
+func (r *Resolved) ReadAllowlist() []string {
+	seen := map[string]bool{}
+	var paths []string
+	add := func(path string) {
+		if !seen[path] {
+			seen[path] = true
+			paths = append(paths, path)
+		}
+	}
+	for _, root := range r.Writable {
+		add(root.Path)
+	}
+	for _, leaf := range r.ReadOnly {
+		add(leaf)
+	}
+	for _, path := range r.ReadPaths {
+		add(path)
+	}
+	sort.Strings(paths)
+	return paths
 }

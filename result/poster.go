@@ -212,6 +212,18 @@ type statusRequest struct {
 	TotalCostUsd      float64        `json:"totalCostUsd,omitempty"`
 	InputTokens       int64          `json:"inputTokens,omitempty"`
 	OutputTokens      int64          `json:"outputTokens,omitempty"`
+	// CacheReadTokens is the cache-read token count carried from
+	// CostData.CachedInputTokens. Additive and backward-compatible:
+	// omitted when zero, so an old receiver that ignores the key still
+	// parses the body.
+	CacheReadTokens int64 `json:"cacheReadTokens,omitempty"`
+	// CacheWriteTokens is the cache-write (cache creation) token count
+	// carried from CostData.CacheWriteTokens. Same additive contract.
+	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens is the reasoning token count inside OutputTokens
+	// (see CostData), carried for observability only — never added to
+	// totals. Same additive contract.
+	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
 
 	// FailureMode carries the runner's structural failure classification
 	// (e.g. "agent-blocked") so the platform routes on the authoritative
@@ -298,6 +310,15 @@ type statusRequest struct {
 	// omitted when the session stayed within its budget.
 	BudgetBreach *agent.BudgetBreach `json:"budgetBreach,omitempty"`
 
+	// Resumable reports whether a retry of the failed session loses no work:
+	// its work is on ResumeCheckpoint, or it left nothing to preserve.
+	// Additive; omitted when false.
+	Resumable bool `json:"resumable,omitempty"`
+
+	// ResumeCheckpoint identifies the branch + head commit the platform can
+	// resume from after a retryable failure. Additive; omitted when nil.
+	ResumeCheckpoint *agent.ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
+
 	// UpstreamError carries the model endpoint's structured refusal or
 	// throttle (HTTP status, provider code, truncated provider message,
 	// reset time) on a session that failed because the endpoint refused
@@ -305,6 +326,12 @@ type statusRequest struct {
 	// rejected" from "server error". Additive; omitted on every run
 	// without an endpoint error — old platforms ignore it.
 	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
+
+	// ToolCalls counts the tool calls the session made across every
+	// stream: the initial turn, injected turns, continuations and
+	// in-session retries. Always serialized (no omitempty) so a zero
+	// reads as "did nothing" rather than unknown.
+	ToolCalls int `json:"toolCalls"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -371,6 +398,38 @@ func (p *Poster) PrepareTerminalStatusBody(ctx context.Context, sessionID string
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal terminal status body: %w", err)
+	}
+	return payload, nil
+}
+
+// WorkerExitedWithoutResultFailureMode is the failure mode carried by the
+// fallback terminal record written after a worker's process group was proved
+// gone without a terminal status of its own. It is a stable wire string: the
+// platform routes a seat that died with its worker distinctly from work the
+// worker itself reported as failed.
+const WorkerExitedWithoutResultFailureMode = "worker_exited_without_result"
+
+// PrepareWorkerExitedWithoutResultBody captures the fallback terminal status
+// body for a worker that exited without posting a result. Unlike
+// PrepareTerminalStatusBody — which freezes the calling worker's own fresh
+// credentials into the body — the worker identity here is explicit: the body
+// names the dead worker, and header authorization stays fresh per send. The
+// payload is fully deterministic in its inputs so the first-writer-wins
+// outbox compare is stable across writers.
+func (p *Poster) PrepareWorkerExitedWithoutResultBody(sessionID, workerID string, projection *workarea.TerminalLeaseProjection) ([]byte, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, errors.New("result: sessionID is required")
+	}
+	if strings.TrimSpace(workerID) == "" {
+		return nil, errors.New("result: workerID is required")
+	}
+	body := buildStatusRequest(RuntimeCredentials{WorkerID: workerID}, agent.Result{
+		Status: "failed", FailureMode: WorkerExitedWithoutResultFailureMode,
+		Summary: "Worker exited without posting a terminal result.",
+	}, projection)
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal fallback terminal status body: %w", err)
 	}
 	return payload, nil
 }
@@ -519,12 +578,16 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		BudgetBreach: r.BudgetBreach, UpstreamError: agent.CanonicalUpstreamError(r.Upstream),
+		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
+		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd
 		body.InputTokens = r.Cost.InputTokens
 		body.OutputTokens = r.Cost.OutputTokens
+		body.CacheReadTokens = r.Cost.CachedInputTokens
+		body.CacheWriteTokens = r.Cost.CacheWriteTokens
+		body.ReasoningTokens = r.Cost.ReasoningTokens
 	}
 	if r.Error != "" {
 		body.Error = &errorEnvelope{Message: r.Error}

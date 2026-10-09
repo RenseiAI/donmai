@@ -16,6 +16,7 @@ import (
 	"runtime"
 
 	"github.com/RenseiAI/donmai/installer/launchd"
+	"github.com/RenseiAI/donmai/installer/servicepriority"
 	"github.com/RenseiAI/donmai/installer/systemd"
 )
 
@@ -34,6 +35,34 @@ const (
 	ScopeSystem = systemd.ScopeSystem
 )
 
+// ProcessPriority is the daemon service's process-priority mode.
+type ProcessPriority = servicepriority.Mode
+
+const (
+	// ProcessPriorityDefault leaves the service definition unchanged.
+	ProcessPriorityDefault = servicepriority.Default
+	// ProcessPriorityBackground runs the daemon and everything it spawns at
+	// the lowest CPU priority with throttled disk I/O: launchd ProcessType and
+	// LowPriorityIO keys on macOS, systemd Nice=/CPUSchedulingPolicy=/
+	// IOSchedulingClass= on Linux.
+	ProcessPriorityBackground = servicepriority.Background
+)
+
+// ProcessPrioritySource says where an install's effective process-priority
+// mode came from.
+type ProcessPrioritySource string
+
+const (
+	// ProcessPrioritySourceExplicit means the caller named the mode. It is
+	// saved, so it also governs later installs that name none.
+	ProcessPrioritySourceExplicit ProcessPrioritySource = "explicit"
+	// ProcessPrioritySourceSaved means the caller named no mode and the mode
+	// saved by an earlier explicit install was kept.
+	ProcessPrioritySourceSaved ProcessPrioritySource = "saved"
+	// ProcessPrioritySourceDefault means nothing was named or saved.
+	ProcessPrioritySourceDefault ProcessPrioritySource = "default"
+)
+
 // InstallOptions are the OS-agnostic options for Install.
 type InstallOptions struct {
 	// HostBinPath is the absolute path to the host binary (af / rensei /
@@ -50,6 +79,13 @@ type InstallOptions struct {
 	// Description overrides the systemd [Unit] Description= field. Ignored
 	// on macOS.
 	Description string
+
+	// ProcessPriority is the daemon service's process-priority mode. Only an
+	// explicit value changes the mode: the empty value keeps the mode saved by
+	// the last explicit install (or the default when none was saved), so a
+	// re-install that does not mention it never silently resets it. An explicit
+	// value, including ProcessPriorityDefault, is saved for later installs.
+	ProcessPriority ProcessPriority
 
 	// SkipServiceManager skips running launchctl/systemctl after writing
 	// the unit file. Useful for tests / CI.
@@ -73,6 +109,11 @@ type InstallResult struct {
 	// the service manager call failed (in which case Install returned an
 	// error).
 	Loaded bool
+	// ProcessPriority is the mode the written service definition encodes.
+	ProcessPriority ProcessPriority
+	// ProcessPrioritySource says whether that mode was named by the caller,
+	// kept from an earlier install, or is the default.
+	ProcessPrioritySource ProcessPrioritySource
 }
 
 // UninstallOptions are the OS-agnostic options for Uninstall.
@@ -117,23 +158,73 @@ type DoctorReport struct {
 
 // Install dispatches to the OS-appropriate installer.
 func Install(opts InstallOptions) (InstallResult, error) {
+	if err := servicepriority.Validate(opts.ProcessPriority); err != nil {
+		return InstallResult{}, fmt.Errorf("installer: %w", err)
+	}
+	priority, source, err := resolveProcessPriority(opts.ProcessPriority)
+	if err != nil {
+		return InstallResult{}, err
+	}
+
+	var res InstallResult
 	switch runtime.GOOS {
 	case "darwin":
-		return installDarwin(opts)
+		res, err = installDarwin(opts, priority, source)
 	case "linux":
-		return installLinux(opts)
+		res, err = installLinux(opts, priority, source)
 	default:
 		return InstallResult{}, fmt.Errorf("installer: unsupported OS %q (only darwin/linux are supported)", runtime.GOOS)
 	}
+	if err != nil {
+		return InstallResult{}, err
+	}
+	res.ProcessPriority = priority
+	res.ProcessPrioritySource = source
+	return res, nil
 }
 
-func installDarwin(opts InstallOptions) (InstallResult, error) {
+// resolveProcessPriority picks the mode an install applies: an explicit mode
+// wins, otherwise the mode saved by an earlier explicit install, otherwise the
+// default. Saved state that cannot be read is an error, not a silent reset to
+// the default.
+func resolveProcessPriority(requested ProcessPriority) (ProcessPriority, ProcessPrioritySource, error) {
+	if requested != "" {
+		return requested, ProcessPrioritySourceExplicit, nil
+	}
+	saved, found, err := servicepriority.Load()
+	if err != nil {
+		return "", "", fmt.Errorf("installer: read saved process priority: %w (pass --process-priority to set it explicitly)", err)
+	}
+	if found {
+		return saved, ProcessPrioritySourceSaved, nil
+	}
+	return ProcessPriorityDefault, ProcessPrioritySourceDefault, nil
+}
+
+// savePriorityChoice records an explicit mode so later installs keep it. It
+// runs before the service definition is written, so a failure leaves the
+// existing service untouched.
+func savePriorityChoice(priority ProcessPriority, source ProcessPrioritySource) error {
+	if source != ProcessPrioritySourceExplicit {
+		return nil
+	}
+	if err := servicepriority.Save(priority); err != nil {
+		return fmt.Errorf("installer: save process priority: %w", err)
+	}
+	return nil
+}
+
+func installDarwin(opts InstallOptions, priority ProcessPriority, source ProcessPrioritySource) (InstallResult, error) {
 	if opts.Scope == ScopeSystem {
 		return InstallResult{}, fmt.Errorf("installer: --system scope is not supported on macOS (LaunchAgents are user-scoped)")
 	}
+	if err := savePriorityChoice(priority, source); err != nil {
+		return InstallResult{}, err
+	}
 	res, err := launchd.Install(launchd.InstallOptions{
-		HostBinPath:   opts.HostBinPath,
-		SkipLaunchctl: opts.SkipServiceManager,
+		HostBinPath:     opts.HostBinPath,
+		ProcessPriority: priority,
+		SkipLaunchctl:   opts.SkipServiceManager,
 	})
 	if err != nil {
 		return InstallResult{}, err
@@ -147,17 +238,21 @@ func installDarwin(opts InstallOptions) (InstallResult, error) {
 	}, nil
 }
 
-func installLinux(opts InstallOptions) (InstallResult, error) {
+func installLinux(opts InstallOptions, priority ProcessPriority, source ProcessPrioritySource) (InstallResult, error) {
 	scope := opts.Scope
 	if scope == "" {
 		scope = ScopeUser
 	}
+	if err := savePriorityChoice(priority, source); err != nil {
+		return InstallResult{}, err
+	}
 	unitPath, err := systemd.Install(systemd.InstallOptions{
-		Scope:         scope,
-		BinPath:       opts.HostBinPath,
-		Description:   opts.Description,
-		ConfigPath:    opts.ConfigPath,
-		SkipSystemctl: opts.SkipServiceManager,
+		Scope:           scope,
+		BinPath:         opts.HostBinPath,
+		Description:     opts.Description,
+		ConfigPath:      opts.ConfigPath,
+		ProcessPriority: priority,
+		SkipSystemctl:   opts.SkipServiceManager,
 	})
 	if err != nil {
 		return InstallResult{}, err

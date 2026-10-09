@@ -24,8 +24,12 @@ func TestBudgetEnforcer_DisabledWhenBudgetNil(t *testing.T) {
 	if enf.Enabled() {
 		t.Fatalf("expected disabled enforcer for nil budget")
 	}
-	// Construct a fake Task tool-use; should not trip anything.
-	if err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: "Task"}); err != nil {
+	// A sub-agent lifecycle event on a disabled enforcer trips nothing.
+	if err := enf.ObserveEvent(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t1", Phase: agent.SubagentStarted}); err != nil {
+		t.Fatalf("disabled enforcer should not return error on subagent start: %v", err)
+	}
+	// A plain tool-use never counts as a sub-agent.
+	if err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: "Task", ToolUseID: "t1"}); err != nil {
 		t.Fatalf("disabled enforcer should not return error on Task: %v", err)
 	}
 	if err := enf.ObserveEvent(agent.ResultEvent{Cost: &agent.CostData{InputTokens: 999_999_999}}); err != nil {
@@ -43,18 +47,18 @@ func TestBudgetEnforcer_DisabledWhenBudgetNil(t *testing.T) {
 	}
 }
 
-// TestBudgetEnforcer_SubAgentCap asserts that the (N+1)th Task tool
-// invocation trips the max-sub-agents cap and returns a
+// TestBudgetEnforcer_SubAgentCap asserts that the (N+1)th sub-agent
+// lifecycle start trips the max-sub-agents cap and returns a
 // *BudgetExceededError.
 func TestBudgetEnforcer_SubAgentCap(t *testing.T) {
 	t.Parallel()
 	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxSubAgents: subAgentCap(2)}, time.Now())
 	for i := 0; i < 2; i++ {
-		if err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: "Task"}); err != nil {
-			t.Fatalf("Task #%d should be within budget: %v", i+1, err)
+		if err := enf.ObserveEvent(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t" + string(rune('0'+i)), Phase: agent.SubagentStarted}); err != nil {
+			t.Fatalf("subagent #%d should be within budget: %v", i+1, err)
 		}
 	}
-	err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: "Task"})
+	err := enf.ObserveEvent(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t2", Phase: agent.SubagentStarted})
 	if err == nil {
 		t.Fatalf("expected BudgetExceededError on 3rd Task with cap=2")
 	}
@@ -329,6 +333,68 @@ func TestBudgetEnforcer_WrapUpPoint(t *testing.T) {
 	}
 }
 
+// TestBudgetEnforcer_CarriesEveryTokenClass pins that cache-write and
+// reasoning tokens ride the meter into the reported cost: per-call usage
+// accumulates them, a running-total ResultEvent reconciles them by
+// difference, and addCost sums them — while the token-cap meter counts
+// input + output plus cache reads at a tenth, never cache writes or
+// reasoning.
+func TestBudgetEnforcer_CarriesEveryTokenClass(t *testing.T) {
+	t.Parallel()
+	turn := func(in, out, cached, written, reasoning int64) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			InputTokens: in, OutputTokens: out, CachedInputTokens: cached,
+			CacheWriteTokens: written, ReasoningTokens: reasoning,
+			UsageSource: agent.LlmUsageProvider,
+		}
+	}
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	// First turn: per-call usage accumulates every class into pending.
+	if err := enf.ObserveEvent(turn(5, 200, 16526, 1200, 40)); err != nil {
+		t.Fatalf("ObserveEvent(call): %v", err)
+	}
+	got := enf.cost()
+	want := agent.CostData{
+		InputTokens: 5, OutputTokens: 200, CachedInputTokens: 16526,
+		CacheWriteTokens: 1200, ReasoningTokens: 40, NumTurns: 1,
+	}
+	if got == nil || *got != want {
+		t.Fatalf("per-call cost = %+v; want %+v", got, want)
+	}
+	// The turn's ResultEvent reports the running total; then a second
+	// turn's running total reconciles against it by difference per class.
+	first := &agent.CostData{
+		InputTokens: 5, OutputTokens: 200, CachedInputTokens: 16526,
+		CacheWriteTokens: 1200, ReasoningTokens: 40, NumTurns: 1,
+	}
+	if err := enf.ObserveEvent(agent.ResultEvent{Success: true, Cost: first}); err != nil {
+		t.Fatalf("ObserveEvent(first result): %v", err)
+	}
+	if err := enf.ObserveEvent(turn(5, 200, 0, 1200, 40)); err != nil {
+		t.Fatalf("ObserveEvent(call): %v", err)
+	}
+	second := &agent.CostData{
+		InputTokens: 10, OutputTokens: 400, CachedInputTokens: 16526,
+		CacheWriteTokens: 2400, ReasoningTokens: 80, NumTurns: 2,
+	}
+	if err := enf.ObserveEvent(agent.ResultEvent{Success: true, Cost: second}); err != nil {
+		t.Fatalf("ObserveEvent(second result): %v", err)
+	}
+	got = enf.cost()
+	want = agent.CostData{
+		InputTokens: 10, OutputTokens: 400, CachedInputTokens: 16526,
+		CacheWriteTokens: 2400, ReasoningTokens: 80, NumTurns: 2,
+	}
+	if got == nil || *got != want {
+		t.Fatalf("reconciled cost = %+v; want %+v", got, want)
+	}
+	// 10 input + 400 output + 16,526 cache reads / 10 = 2,062; the 2,400
+	// cache writes and 80 reasoning tokens do not move the meter.
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 2_062 {
+		t.Fatalf("ObservedTokens = %d; want 2062 (input + output + cache reads / 10)", rep.ObservedTokens)
+	}
+}
+
 // TestBudgetEnforcer_MetersWithoutABudget pins that the usage meter runs for
 // every session — the reported cost comes from it — while a session with no
 // budget is never breached.
@@ -347,8 +413,9 @@ func TestBudgetEnforcer_MetersWithoutABudget(t *testing.T) {
 	if got := enf.cost(); got == nil || *got != want {
 		t.Fatalf("cost = %+v; want %+v", got, want)
 	}
-	if rep := enf.Report(time.Now()); rep.ObservedTokens != 450 || rep.Enforced || rep.CapBreached != "" {
-		t.Fatalf("Report = %+v; want 450 observed, not enforced, no breach", rep)
+	// 340 input + 110 output + 20 cache reads / 10.
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 452 || rep.Enforced || rep.CapBreached != "" {
+		t.Fatalf("Report = %+v; want 452 observed, not enforced, no breach", rep)
 	}
 	if NewBudgetEnforcer(nil, time.Now()).cost() != nil {
 		t.Fatal("cost of a session that metered nothing; want nil")
@@ -414,24 +481,36 @@ func TestBudgetEnforcer_WithDurationCap_NoCapPassesThroughCancel(t *testing.T) {
 	}
 }
 
-// TestBudgetEnforcer_NamespacedTaskToolCounts asserts that MCP-namespaced
-// Task tool names (e.g. "mcp__af__Task") count toward the sub-agent cap.
-func TestBudgetEnforcer_NamespacedTaskToolCounts(t *testing.T) {
+// TestBudgetEnforcer_SubAgentTerminalPhasesDoNotCount asserts that only
+// the `started` phase counts toward the sub-agent cap: terminal phases
+// (completed/failed) and plain tool-use calls are observations, not new
+// delegations.
+func TestBudgetEnforcer_SubAgentTerminalPhasesDoNotCount(t *testing.T) {
 	t.Parallel()
 	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxSubAgents: subAgentCap(1)}, time.Now())
-	if err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: "Task"}); err != nil {
-		t.Fatalf("first Task should pass: %v", err)
+	if err := enf.ObserveEvent(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t1", Phase: agent.SubagentStarted}); err != nil {
+		t.Fatalf("first start should pass: %v", err)
 	}
-	err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: "mcp__af__Task"})
-	if err == nil {
-		t.Fatalf("expected breach on namespaced Task")
+	if err := enf.ObserveEvent(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t1", Phase: agent.SubagentCompleted}); err != nil {
+		t.Fatalf("completed phase should not breach: %v", err)
+	}
+	if err := enf.ObserveEvent(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t1", Phase: agent.SubagentFailed}); err != nil {
+		t.Fatalf("failed phase should not breach: %v", err)
+	}
+	if err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: "Task", ToolUseID: "t1"}); err != nil {
+		t.Fatalf("plain tool-use should not breach: %v", err)
+	}
+	rep := enf.Report(time.Now())
+	if rep.ObservedSubAgents != 1 {
+		t.Fatalf("expected ObservedSubAgents=1, got %d", rep.ObservedSubAgents)
 	}
 }
 
 // TestBudgetEnforcer_SubAgentCapTable is the table-driven sub-agent
-// budget test: caps of 0 (explicit "none"), 2 (third call breaches),
-// and unset (nil, not enforced), each exercised with both delegation
-// tool names ("Task" and "Agent") in plain and MCP-suffixed form.
+// budget test over the typed lifecycle event: caps of 0 (explicit
+// "none"), 2 (third start breaches), and unset (nil, not enforced).
+// Only `started` phases count; the adapter names its own delegation
+// tools, so tool names are opaque labels here.
 func TestBudgetEnforcer_SubAgentCapTable(t *testing.T) {
 	t.Parallel()
 	zero := 0
@@ -439,29 +518,23 @@ func TestBudgetEnforcer_SubAgentCapTable(t *testing.T) {
 	cases := []struct {
 		name      string
 		cap       *int
-		toolNames []string
+		phases    []agent.SubagentPhase
 		calls     int
 		wantErrAt int // 1-based call index that must breach; 0 = no breach
 	}{
-		{name: "cap 0 Task", cap: &zero, toolNames: []string{"Task"}, calls: 1, wantErrAt: 1},
-		{name: "cap 0 Agent", cap: &zero, toolNames: []string{"Agent"}, calls: 1, wantErrAt: 1},
-		{name: "cap 0 mixed Task then Agent", cap: &zero, toolNames: []string{"Task", "Agent"}, calls: 2, wantErrAt: 1},
-		{name: "cap 0 MCP-suffixed Agent", cap: &zero, toolNames: []string{"mcp__af__Agent"}, calls: 1, wantErrAt: 1},
-		{name: "cap 2 Task", cap: &two, toolNames: []string{"Task"}, calls: 3, wantErrAt: 3},
-		{name: "cap 2 Agent", cap: &two, toolNames: []string{"Agent"}, calls: 3, wantErrAt: 3},
-		{name: "cap 2 mixed Task and Agent", cap: &two, toolNames: []string{"Task", "Agent", "Task"}, calls: 3, wantErrAt: 3},
-		{name: "cap 2 MCP-suffixed Agent", cap: &two, toolNames: []string{"mcp__af__Agent", "agent", "MCP__X__AGENT"}, calls: 3, wantErrAt: 3},
-		{name: "unset Task unbounded", cap: nil, toolNames: []string{"Task", "Task", "Task"}, calls: 3, wantErrAt: 0},
-		{name: "unset Agent unbounded", cap: nil, toolNames: []string{"Agent", "Agent", "Agent"}, calls: 3, wantErrAt: 0},
-		{name: "unset mixed unbounded", cap: nil, toolNames: []string{"Task", "Agent", "mcp__af__Task", "mcp__af__Agent"}, calls: 4, wantErrAt: 0},
+		{name: "cap 0 first start", cap: &zero, phases: []agent.SubagentPhase{agent.SubagentStarted}, calls: 1, wantErrAt: 1},
+		{name: "cap 0 terminal first", cap: &zero, phases: []agent.SubagentPhase{agent.SubagentCompleted}, calls: 1, wantErrAt: 0},
+		{name: "cap 2 third start", cap: &two, phases: []agent.SubagentPhase{agent.SubagentStarted}, calls: 3, wantErrAt: 3},
+		{name: "cap 2 mixed phases", cap: &two, phases: []agent.SubagentPhase{agent.SubagentStarted, agent.SubagentCompleted, agent.SubagentStarted, agent.SubagentFailed, agent.SubagentStarted}, calls: 5, wantErrAt: 5},
+		{name: "unset starts unbounded", cap: nil, phases: []agent.SubagentPhase{agent.SubagentStarted}, calls: 3, wantErrAt: 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			enf := NewBudgetEnforcer(&prompt.StageBudget{MaxSubAgents: tc.cap}, time.Now())
 			for i := 0; i < tc.calls; i++ {
-				name := tc.toolNames[i%len(tc.toolNames)]
-				err := enf.ObserveEvent(agent.ToolUseEvent{ToolName: name})
+				phase := tc.phases[i%len(tc.phases)]
+				err := enf.ObserveEvent(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t" + string(rune('0'+i)), Phase: phase})
 				want := i+1 == tc.wantErrAt
 				// Once breached the enforcer keeps reporting the
 				// breach on later calls; any call at or past the
@@ -470,18 +543,24 @@ func TestBudgetEnforcer_SubAgentCapTable(t *testing.T) {
 					want = true
 				}
 				if want && err == nil {
-					t.Fatalf("call #%d (%s) should breach: cap=%v", i+1, name, intCapForTest(tc.cap))
+					t.Fatalf("call #%d (%s) should breach: cap=%v", i+1, phase, intCapForTest(tc.cap))
 				}
 				if !want && err != nil {
-					t.Fatalf("call #%d (%s) should be within budget: cap=%v err=%v", i+1, name, intCapForTest(tc.cap), err)
+					t.Fatalf("call #%d (%s) should be within budget: cap=%v err=%v", i+1, phase, intCapForTest(tc.cap), err)
 				}
 				if err != nil && err.Cap != CapSubAgents {
 					t.Fatalf("expected CapSubAgents, got %s", err.Cap)
 				}
 			}
 			rep := enf.Report(time.Now())
-			if rep.ObservedSubAgents != tc.calls {
-				t.Fatalf("expected ObservedSubAgents=%d, got %d", tc.calls, rep.ObservedSubAgents)
+			wantObserved := 0
+			for i := 0; i < tc.calls; i++ {
+				if tc.phases[i%len(tc.phases)] == agent.SubagentStarted {
+					wantObserved++
+				}
+			}
+			if rep.ObservedSubAgents != wantObserved {
+				t.Fatalf("expected ObservedSubAgents=%d, got %d", wantObserved, rep.ObservedSubAgents)
 			}
 			if tc.wantErrAt > 0 && rep.CapBreached != CapSubAgents {
 				t.Fatalf("expected report.CapBreached=CapSubAgents, got %s", rep.CapBreached)
@@ -521,13 +600,13 @@ func TestBudgetEnforcer_SubAgentCapDecoding(t *testing.T) {
 	if explicit.MaxSubAgents == nil || *explicit.MaxSubAgents != 0 {
 		t.Fatalf("explicit maxSubAgents:0 = %+v; want non-nil zero (none allowed)", explicit.MaxSubAgents)
 	}
-	// The explicit zero breaches on the first Agent call; the omitted
-	// cap never breaches.
-	if err := NewBudgetEnforcer(&explicit, time.Now()).ObserveEvent(agent.ToolUseEvent{ToolName: "Agent"}); err == nil || err.Cap != CapSubAgents {
-		t.Fatalf("explicit zero cap with Agent call = %v; want the max-sub-agents breach", err)
+	// The explicit zero breaches on the first sub-agent start; the
+	// omitted cap never breaches.
+	if err := NewBudgetEnforcer(&explicit, time.Now()).ObserveEvent(agent.SubagentEvent{ToolName: "Agent", ToolUseID: "t1", Phase: agent.SubagentStarted}); err == nil || err.Cap != CapSubAgents {
+		t.Fatalf("explicit zero cap with subagent start = %v; want the max-sub-agents breach", err)
 	}
-	if err := NewBudgetEnforcer(&prompt.StageBudget{}, time.Now()).ObserveEvent(agent.ToolUseEvent{ToolName: "Agent"}); err != nil {
-		t.Fatalf("omitted cap with Agent call = %v; want no breach", err)
+	if err := NewBudgetEnforcer(&prompt.StageBudget{}, time.Now()).ObserveEvent(agent.SubagentEvent{ToolName: "Agent", ToolUseID: "t1", Phase: agent.SubagentStarted}); err != nil {
+		t.Fatalf("omitted cap with subagent start = %v; want no breach", err)
 	}
 }
 
@@ -546,5 +625,77 @@ func TestIsBudgetExceeded(t *testing.T) {
 	}
 	if !IsBudgetExceeded(&BudgetExceededError{Cap: CapTokens, Detail: "x"}) {
 		t.Fatalf("BudgetExceededError should be detected")
+	}
+}
+
+// TestBudgetEnforcer_CacheReadsMeterAtATenth pins the token cap's weight for
+// cache reads. A harness that reports its cached prefix as cache reads, not
+// as input (pi, once its cache buckets are mapped), would otherwise read ten
+// times the context before the cap noticed; each cache-read token therefore
+// counts a tenth toward the cap, on the live per-call meter and on the
+// reconciled ResultEvent meter alike. Cache writes never move it.
+func TestBudgetEnforcer_CacheReadsMeterAtATenth(t *testing.T) {
+	t.Parallel()
+	call := func(in, out, cached, written int64) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			InputTokens: in, OutputTokens: out, CachedInputTokens: cached, CacheWriteTokens: written,
+			UsageSource: agent.LlmUsageProvider,
+		}
+	}
+	cases := []struct {
+		name       string
+		events     []agent.Event
+		wantTokens int64
+		wantBreach string
+	}{
+		{
+			name:       "cache reads at a tenth stay within the cap",
+			events:     []agent.Event{call(100, 0, 9_000, 0)},
+			wantTokens: 1_000,
+		},
+		{
+			name:       "cache reads alone can cross the cap",
+			events:     []agent.Event{call(100, 0, 9_000, 0), call(0, 0, 20, 0)},
+			wantTokens: 1_002,
+			wantBreach: "max-tokens exceeded: observed=1002 limit=1000",
+		},
+		{
+			name:       "cache writes never move the meter",
+			events:     []agent.Event{call(100, 50, 0, 50_000)},
+			wantTokens: 150,
+		},
+		{
+			name: "a running-total result meters its cache reads once",
+			events: []agent.Event{
+				call(100, 10, 4_000, 0),
+				agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 100, OutputTokens: 10, CachedInputTokens: 4_000, NumTurns: 1}},
+				call(100, 10, 4_000, 0),
+				agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 200, OutputTokens: 20, CachedInputTokens: 8_000, NumTurns: 2}},
+			},
+			wantTokens: 1_020,
+			wantBreach: "max-tokens exceeded: observed=1020 limit=1000",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000}, time.Now())
+			var breach *BudgetExceededError
+			for _, ev := range tc.events {
+				if err := enf.ObserveEvent(ev); err != nil && breach == nil {
+					breach = err
+				}
+			}
+			rep := enf.Report(time.Now())
+			if rep.ObservedTokens != tc.wantTokens {
+				t.Errorf("ObservedTokens = %d; want %d", rep.ObservedTokens, tc.wantTokens)
+			}
+			switch {
+			case tc.wantBreach == "" && breach != nil:
+				t.Errorf("breach = %v; want none", breach)
+			case tc.wantBreach != "" && (breach == nil || breach.Detail != tc.wantBreach):
+				t.Errorf("breach = %v; want %q", breach, tc.wantBreach)
+			}
+		})
 	}
 }

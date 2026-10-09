@@ -24,6 +24,15 @@ type mapperState struct {
 	completedTurns       int
 	seenCompletedTurnIDs map[string]struct{}
 	turnStarted          time.Time
+	// rateLimits is the last account rate-limit snapshot this handle
+	// saw, merged field by field across partial
+	// `account/rateLimits/updated` notifications. A partial
+	// notification omits the plan, so classifying its windows against
+	// the merged snapshot keeps a monthly allowance monthly instead
+	// of falling back to the session default — the same merged-plan
+	// rule the probe-side subscription applies, so stream and probe
+	// rows share window ids.
+	rateLimits *RateLimitSnapshot
 }
 
 // mapNotification translates one inbound JSON-RPC notification into
@@ -104,6 +113,16 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 
 	case "turn/completed":
 		return mapTurnCompleted(params, state, raw)
+
+	// The account rate-limit notification carries the same snapshot
+	// shape as the probe's read response, so it maps through the one
+	// shared mapper onto the probe-stable window ids. The snapshot
+	// merges field by field onto the last one this handle saw before
+	// mapping, so a partial notification that omits the plan still
+	// classifies against it. A model-specific notification maps to
+	// nothing and stays silent.
+	case "account/rateLimits/updated":
+		return mapRateLimitsUpdated(params, state, raw)
 
 	// ─── Item lifecycle ───────────────────────────────────────────
 	case "item/started", "item/completed":
@@ -297,6 +316,34 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 			Raw:     raw,
 		}}
 	}
+}
+
+// mapRateLimitsUpdated maps one `account/rateLimits/updated`
+// notification onto a sparse quota-window update through the shared
+// probe mapper. The notification merges field by field onto the last
+// snapshot this handle saw, then maps; a window the notification
+// omits is unchanged, and a notification that names no main-allowance
+// window maps to nothing. The update rides a UsageEvent so the runner
+// can forward it to the daemon's quota cache, where it merges by
+// window id onto the probe snapshot.
+func mapRateLimitsUpdated(params json.RawMessage, state *mapperState, raw any) []agent.Event {
+	if state == nil {
+		return nil
+	}
+	var decoded rateLimitsUpdatedParams
+	if err := json.Unmarshal(params, &decoded); err != nil || decoded.RateLimits == nil {
+		return nil
+	}
+	state.rateLimits = MergeRateLimits(state.rateLimits, decoded.RateLimits)
+	named := *decoded.RateLimits
+	if named.PlanType == nil && state.rateLimits != nil {
+		named.PlanType = state.rateLimits.PlanType
+	}
+	update := RateLimitsToUpdate(&named, agent.ISOTime(time.Now()))
+	if update == nil {
+		return nil
+	}
+	return []agent.Event{agent.UsageEvent{Usage: update, Raw: raw}}
 }
 
 // mapItem handles item/started and item/completed notifications.

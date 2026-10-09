@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -303,6 +304,124 @@ func TestExtensionRegistersOutputLimitOnlyWhenConfigured(t *testing.T) {
 				t.Errorf("registered maxTokens = %v (present=%t), want %v", got, present, tc.want)
 			}
 		})
+	}
+}
+
+// TestExtensionRegistersSessionKeyFromCredentialFile activates the REAL
+// embedded extension with the session key delivered ONLY through the
+// credential file (no DONMAI_PI_KEY in env): the registered "donmai"
+// provider must carry the file's key. A second run with an empty file
+// (keyless session) registers an empty key, never an inherited one.
+// RED proof: read the key from process.env instead of the file and the
+// first run registers the inherited value (or empty) instead of the file's.
+func TestExtensionRegistersSessionKeyFromCredentialFile(t *testing.T) {
+	t.Parallel()
+	nodeAvailable(t)
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "session-credentials.json")
+	payload := `{"schemaVersion":1,"credentials":[{"env":"DONMAI_PI_KEY","value":"file-rail-key"}]}`
+	if err := os.WriteFile(credPath, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := runExtensionFixture(t, []string{
+		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+		piModelEnvVar + "=served-model",
+		credentialFileEnvVar + "=" + credPath,
+	}, "read", `{"path":"README.md"}`)
+	model := registeredDonmaiModel(t, out)
+	providers, _ := out["providers"].([]any)
+	config, _ := providers[0].(map[string]any)["config"].(map[string]any)
+	if key, _ := config["apiKey"].(string); key != "file-rail-key" {
+		t.Errorf("registered apiKey = %q, want the credential file's key", key)
+	}
+	_ = model
+
+	// Keyless session: no credential file at all — the provider registers
+	// with an empty key rather than any inherited value.
+	out2 := runExtensionFixture(t, []string{
+		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+		piModelEnvVar + "=served-model",
+	}, "read", `{"path":"README.md"}`)
+	providers2, _ := out2["providers"].([]any)
+	config2, _ := providers2[0].(map[string]any)["config"].(map[string]any)
+	if key, _ := config2["apiKey"].(string); key != "" {
+		t.Errorf("keyless registered apiKey = %q, want empty", key)
+	}
+}
+
+// TestExtensionRestoresSessionEnvironmentFromCredentialFile activates the
+// REAL embedded extension with a credential file whose environment section
+// carries the session's deferred bindings (child_env.go): after activation
+// they are in the process environment the tools pi starts inherit — while
+// the exec environment never carried them. A name the exec environment
+// already defines keeps its exec value, the extension's and pi's own
+// control namespaces are never written from the file, a malformed name is
+// skipped, and the credentials section is never restored (the provider pin
+// reads the one key it needs directly).
+//
+// RED proof: make restoreSessionEnvironment a no-op and the restored-binding
+// assertion fails; drop its namespace or defined-name guards and the
+// steering assertions fail.
+func TestExtensionRestoresSessionEnvironmentFromCredentialFile(t *testing.T) {
+	t.Parallel()
+	nodeAvailable(t)
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "session-credentials.json")
+	payload, err := json.Marshal(sessionCredentialFile{
+		SchemaVersion: 1,
+		Credentials: []sessionCredential{
+			{Env: PiKeyEnvVar, Value: "file-rail-key"},
+			{Env: "SENTINEL_MODEL_KEY_RESTORE", Value: "credential-must-not-restore"},
+		},
+		Environment: []sessionCredential{
+			{Env: "SENTINEL_TOOL_TOKEN", Value: "restored-tool-token"},
+			{Env: "SENTINEL_EXEC_DEFINED", Value: "file-must-not-override"},
+			{Env: piBaseURLEnvVar, Value: "http://file-must-not-steer.invalid/v1"},
+			{Env: "PI_FUTURE_CONFIG", Value: "file-must-not-steer"},
+			{Env: "SENTINEL_BAD=NAME", Value: "malformed-must-not-restore"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := runExtensionFixture(t, []string{
+		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+		piModelEnvVar + "=served-model",
+		credentialFileEnvVar + "=" + credPath,
+		"SENTINEL_EXEC_DEFINED=exec-value",
+		"HARNESS_REPORT_ENV=SENTINEL_TOOL_TOKEN,SENTINEL_EXEC_DEFINED," + piBaseURLEnvVar + ",PI_FUTURE_CONFIG,SENTINEL_BAD,SENTINEL_MODEL_KEY_RESTORE," + PiKeyEnvVar,
+	}, "read", `{"path":"README.md"}`)
+	env, _ := out["environment"].(map[string]any)
+	if env == nil {
+		t.Fatalf("fixture reported no environment: %v", out)
+	}
+	want := map[string]any{
+		"SENTINEL_TOOL_TOKEN":        "restored-tool-token",
+		"SENTINEL_EXEC_DEFINED":      "exec-value",
+		piBaseURLEnvVar:              "http://127.0.0.1:9/v1",
+		"PI_FUTURE_CONFIG":           nil,
+		"SENTINEL_BAD":               nil,
+		"SENTINEL_MODEL_KEY_RESTORE": nil,
+		PiKeyEnvVar:                  nil,
+	}
+	for name, wantValue := range want {
+		if got := env[name]; got != wantValue {
+			t.Errorf("after activation %s = %v, want %v", name, got, wantValue)
+		}
+	}
+	providers, _ := out["providers"].([]any)
+	if len(providers) == 0 {
+		t.Fatalf("extension registered no provider: %v", out)
+	}
+	config, _ := providers[0].(map[string]any)["config"].(map[string]any)
+	if key, _ := config["apiKey"].(string); key != "file-rail-key" {
+		t.Errorf("registered apiKey = %q, want the credential file's key", key)
+	}
+	if baseURL, _ := config["baseUrl"].(string); baseURL != "http://127.0.0.1:9/v1" {
+		t.Errorf("registered baseUrl = %q, want the exec environment's pin", baseURL)
 	}
 }
 

@@ -250,6 +250,34 @@ func TestDaemonUpdateSessionRuntimeCredentials(t *testing.T) {
 	}
 }
 
+// TestSessionDetailStore_SetMintsReadToken pins the install-path guard:
+// a detail installed through Set (not StoreIfAbsent) still mints the
+// per-session read credential, so no install path leaves a session whose
+// detail serves credentials to the operator token while its worker reads
+// redacted. An overwrite of the same session keeps the existing
+// credential rather than invalidating one a live worker already holds.
+func TestSessionDetailStore_SetMintsReadToken(t *testing.T) {
+	s := newSessionDetailStore()
+	s.Set(&SessionDetail{SessionID: "set-path", WorkerID: "wkr_set", AuthToken: "tok-set"})
+	first, ok := s.readTokenFor("set-path")
+	if !ok || first == "" {
+		t.Fatal("Set installed a detail with no read credential")
+	}
+	if !s.verifySessionReadToken("set-path", first) {
+		t.Fatal("Set-minted credential does not verify")
+	}
+	if s.verifySessionReadToken("set-path", testControlToken) {
+		t.Fatal("operator token verifies as a session read credential")
+	}
+	// Overwriting the detail must not rotate the credential out from
+	// under a live worker.
+	s.Set(&SessionDetail{SessionID: "set-path", WorkerID: "wkr_set", AuthToken: "tok-set-v2"})
+	kept, ok := s.readTokenFor("set-path")
+	if !ok || kept != first {
+		t.Errorf("Set overwrite rotated the credential: kept=%q first=%q", kept, first)
+	}
+}
+
 // TestSessionDetailStore_ConcurrentAccess sanity-checks the mutex
 // against concurrent readers and writers. Run with -race to surface
 // data races.

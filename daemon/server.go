@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,6 +121,9 @@ func (s *Server) startLocked() (<-chan error, error) {
 		return nil, fmt.Errorf("listen %q: %w", s.httpd.Addr, err)
 	}
 	s.addr = listener.Addr().String()
+	// Observe the daemon's own process priority now, off the request path, so
+	// the first /status does not pay for the probe.
+	warmProcessPriorityStatus()
 	// Publish the address that was really bound, before anything can be
 	// spawned against it. Every worker this daemon starts is told this value,
 	// and it is the only place the truth exists when the configured port is
@@ -232,7 +236,13 @@ func (s *Server) gateHandler(mux http.Handler) http.Handler {
 				return
 			}
 			callback := strings.HasPrefix(r.URL.Path, localRuntimePrefix+"/api/sessions/")
-			if r.Method != http.MethodGet && r.Method != http.MethodHead && !callback && local.auth.VerifyOperator(localBearer(r)) != nil {
+			// A local worker's quota update carries its attempt
+			// credential, never the operator one. It reaches the
+			// handler like any other session callback, where the
+			// attempt is verified against the session it names.
+			_, usageCallback := sessionUsagePath(r.URL.Path)
+			usageCallback = usageCallback && r.Method == http.MethodPost
+			if r.Method != http.MethodGet && r.Method != http.MethodHead && !callback && !usageCallback && local.auth.VerifyOperator(localBearer(r)) != nil {
 				http.Error(w, "operator authentication required", http.StatusUnauthorized)
 				return
 			}
@@ -282,11 +292,16 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/sessions", s.requireControlAuth(s.handleSessions)) // GET=list, POST=accept
 	// Per-session sub-routes. Spawned `donmai agent run` processes fetch
 	// their full QueuedWork shape via GET <id>; the deterministic cancel
-	// wire posts to <id>/stop to kill exactly one session + free its slot.
+	// wire posts to <id>/stop to kill exactly one session + free its slot;
+	// live workers post streamed quota updates to <id>/usage.
 	// The path-pattern dispatch is custom because the stdlib mux only
 	// supports prefix matching pre-Go 1.22 in this codebase, so the single
-	// prefix handler multiplexes both shapes.
-	mux.HandleFunc("/api/daemon/sessions/", s.requireControlAuth(s.handleSessionSubroute))
+	// prefix handler multiplexes the shapes. The usage leaf bypasses the
+	// blanket mutating gate on purpose: workers never hold the operator
+	// control token, so handleSessionUsage enforces its own session-scoped
+	// credential (the session's read credential, or the local attempt
+	// credential) instead. Every other leaf keeps the gate.
+	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionSubrouteAuth)
 	mux.HandleFunc("/api/daemon/heartbeat", s.method(http.MethodGet, s.handleHeartbeat))
 	mux.HandleFunc("/api/daemon/doctor", s.method(http.MethodGet, s.handleDoctor))
 	// providers (Wave 9)
@@ -350,6 +365,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		ProjectAdmissionMode:    cfg.EffectiveProjectAdmissionMode(),
 		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
 		SessionShim:             s.daemon.SessionShimDiagnostics(),
+		ProcessPriority:         daemonProcessPriorityStatus(),
+		SeatBudget:              seatBudgetReport(s.daemon.daemonSeatBudget()),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)
@@ -440,7 +457,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if withPool {
 		stats, err := s.poolStats(r.Context())
 		if err == nil {
-			resp.Pool = stats
+			resp.Pool = redactPoolStats(stats)
 		}
 	}
 	if byMachine {
@@ -670,7 +687,8 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, stats)
+	redacted := redactPoolStats(stats)
+	writeJSON(w, http.StatusOK, redacted)
 }
 
 func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
@@ -698,15 +716,52 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// sessionUsagePath reports whether path targets a session usage
+// update (/api/daemon/sessions/<id>/usage with a non-empty id) and
+// returns the session id. The usage leaf is the one subroute a worker
+// may call with its own session-scoped credential instead of the
+// operator control token, so the auth dispatcher recognizes it before
+// the mutating gate runs. Method matching stays with the callers:
+// only POSTs take the session-scoped path.
+func sessionUsagePath(path string) (string, bool) {
+	const prefix = "/api/daemon/sessions/"
+	tail, ok := strings.CutPrefix(path, prefix)
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(tail, "/usage")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
+}
+
+// handleSessionSubrouteAuth is the registered prefix handler for
+// /api/daemon/sessions/. It steers the usage leaf to its own
+// session-scoped auth and holds every other leaf behind the control
+// gate, so a worker's quota update never needs the operator token
+// while stop and accept keep it.
+func (s *Server) handleSessionSubrouteAuth(w http.ResponseWriter, r *http.Request) {
+	if id, ok := sessionUsagePath(r.URL.Path); ok && r.Method == http.MethodPost {
+		s.handleSessionUsage(w, r, id)
+		return
+	}
+	s.requireControlAuth(s.handleSessionSubroute)(w, r)
+}
+
 // handleSessionSubroute multiplexes the per-session paths under the
 // /api/daemon/sessions/ prefix:
 //
 //	GET  /api/daemon/sessions/<id>       → handleSessionDetail
 //	POST /api/daemon/sessions/<id>/stop  → handleSessionStop
+//	POST /api/daemon/sessions/<id>/usage → handleSessionUsage
 //
 // A single prefix handler is used because the stdlib mux only supports
 // prefix matching pre-Go 1.22 in this codebase. The path tail is parsed
-// here so each leaf handler sees a clean session id.
+// here so each leaf handler sees a clean session id. The usage leaf
+// only reaches this multiplexer for non-POST methods (a GET on the
+// usage path answers 405 from the leaf); usage POSTs are steered to
+// the leaf directly by handleSessionSubrouteAuth.
 func (s *Server) handleSessionSubroute(w http.ResponseWriter, r *http.Request) {
 	const prefix = "/api/daemon/sessions/"
 	tail := strings.TrimPrefix(r.URL.Path, prefix)
@@ -714,13 +769,61 @@ func (s *Server) handleSessionSubroute(w http.ResponseWriter, r *http.Request) {
 		s.handleSessionStop(w, r, id)
 		return
 	}
+	if id, ok := strings.CutSuffix(tail, "/usage"); ok {
+		s.handleSessionUsage(w, r, id)
+		return
+	}
 	s.handleSessionDetail(w, r, tail)
+}
+
+// sessionDetailAuthenticated reports whether r carries a credential that
+// authorizes the full session-detail payload for id: the operator control
+// token (or the local protected-operator alternative the mutating gate
+// already honors), or the per-session read credential the daemon stated in
+// the spawned worker's environment at accept time. An empty id never
+// authenticates.
+func (s *Server) sessionDetailAuthenticated(r *http.Request, id string) bool {
+	if s.daemon == nil || id == "" {
+		return false
+	}
+	mode, want := controlAuthState(s.daemon)
+	if mode == controlAuthOpen {
+		// Legacy open mode (tests, harnesses): no credential exists to
+		// check, so the detail read stays available.
+		return true
+	}
+	bearer := controlBearer(r)
+	if bearer == "" {
+		return false
+	}
+	if mode == controlAuthEnforced {
+		if subtle.ConstantTimeCompare([]byte(bearer), []byte(want)) == 1 {
+			return true
+		}
+		if local := s.daemon.localRuntime.Load(); local != nil && local.auth != nil &&
+			local.auth.VerifyOperator(bearer) == nil {
+			return true
+		}
+	}
+	// controlAuthUnavailable falls through: no operator credential
+	// exists to present, so only the per-session credential can pass.
+	if store := s.daemon.sessionDetails; store != nil {
+		return store.verifySessionReadToken(id, bearer)
+	}
+	return false
 }
 
 // handleSessionDetail handles GET /api/daemon/sessions/<id> — the
 // detail endpoint a spawned `donmai agent run` process reads on startup
 // to recover its full QueuedWork shape. Localhost-only (the daemon
 // binds to 127.0.0.1); 404s on unknown ids; 405s on non-GET methods.
+//
+// The payload carries per-session credentials, so the read is gated:
+// a caller presenting the operator control token (or the local
+// protected-operator alternative) receives the full detail, while any
+// other caller receives the same shape with every credential field
+// cleared. Unknown ids 404 before either branch so the gate never
+// confirms or denies the existence of a session it cannot name.
 //
 // (F.2.8 — daemon wire-up.)
 func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id string) {
@@ -759,6 +862,10 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id 
 	projected := *detail
 	if key, found := s.daemon.sessionResumeKey(projected.SessionID, projected.OrganizationID); found {
 		projected.ResumeKey = key
+	}
+	if !s.sessionDetailAuthenticated(r, id) {
+		writeJSON(w, http.StatusOK, redactSessionDetail(&projected))
+		return
 	}
 	writeJSON(w, http.StatusOK, &projected)
 }
@@ -804,7 +911,23 @@ func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id st
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.daemon.ActiveSessions())
+		handles := s.daemon.ActiveSessions()
+		// The inbound spec a session runs under may resolve to an
+		// operator-configured repository URL carrying embedded
+		// credentials. The list is display-only (cloning reads the
+		// credentialed detail), so serve the redacted form.
+		for i := range handles {
+			handles[i].Repository = redactRepositoryURL(handles[i].Repository)
+			// The issue identifier is known from admission, before the
+			// runner writes any state; project it so a local reader can
+			// label the session from the start.
+			if handles[i].IssueIdentifier == "" {
+				if detail, ok := s.daemon.SessionDetail(handles[i].SessionID); ok && detail != nil {
+					handles[i].IssueIdentifier = detail.IssueIdentifier
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, handles)
 	case http.MethodPost:
 		if s.daemon.localRuntime.Load() != nil {
 			http.Error(w, "local work must enter through authenticated issue intake", http.StatusForbidden)
@@ -832,6 +955,18 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	last := s.daemon.heartbeat.LastPayload()
+	// The allowlist projects operator-configured repository URLs, which
+	// may carry embedded credentials. The serving copy is userinfo-
+	// redacted; the heartbeat's stored payload (also POSTed upstream)
+	// is never rewritten.
+	if last.Allowlist != nil {
+		redacted := make([]ProjectAllowlistEntry, len(last.Allowlist))
+		copy(redacted, last.Allowlist)
+		for i := range redacted {
+			redacted[i].Repository = redactRepositoryURL(redacted[i].Repository)
+		}
+		last.Allowlist = redacted
+	}
 	writeJSON(w, http.StatusOK, &last)
 }
 
@@ -848,6 +983,9 @@ func (s *Server) handleDoctor(w http.ResponseWriter, _ *http.Request) {
 		"heartbeat":       s.daemon.heartbeat != nil && s.daemon.heartbeat.IsRunning(),
 		"sessionShim":     s.daemon.SessionShimDiagnostics(),
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+	}
+	if priority := daemonProcessPriorityStatus(); priority != nil {
+		report["processPriority"] = priority
 	}
 	writeJSON(w, http.StatusOK, report)
 }
@@ -997,11 +1135,15 @@ func safeOrchestratorURL(c *Config) string {
 	if c == nil {
 		return ""
 	}
-	return c.Orchestrator.URL
+	// Served on the credential-free doctor route: an operator-configured
+	// URL with a user:token@ authority is served userinfo-redacted.
+	return redactRepositoryURL(c.Orchestrator.URL)
 }
 
-// safeProjectRepos returns the list of repository URLs in the project
-// allowlist for inclusion in DaemonStatsResponse.AllowedProjects.
+// safeProjectRepos routes the allowlist through redactRepositoryURLs so
+// the served list has exactly one redaction point: every future caller
+// that needs the same shape reuses this helper instead of growing a
+// second list path.
 func safeProjectRepos(c *Config) []string {
 	if c == nil {
 		return nil
@@ -1010,11 +1152,33 @@ func safeProjectRepos(c *Config) []string {
 	if len(projects) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(projects))
+	raw := make([]string, 0, len(projects))
 	for _, p := range projects {
-		out = append(out, p.Repository)
+		raw = append(raw, p.Repository)
 	}
-	return out
+	return redactRepositoryURLs(raw)
+}
+
+// redactPoolStats returns a copy of stats with embedded credentials
+// dropped from every pool member repository URL. The snapshot may come
+// from a downstream provider the daemon does not control, so the
+// redaction happens here, at the serving boundary. The copy keeps the
+// provider's snapshot untouched: a provider returning a shared or cached
+// pointer must never have its live state rewritten, and concurrent reads
+// must not race on the same backing array.
+func redactPoolStats(stats *afclient.WorkareaPoolStats) *afclient.WorkareaPoolStats {
+	if stats == nil {
+		return nil
+	}
+	out := *stats
+	if stats.Members != nil {
+		out.Members = make([]afclient.WorkareaPoolMember, len(stats.Members))
+		copy(out.Members, stats.Members)
+		for i := range out.Members {
+			out.Members[i].Repository = redactRepositoryURL(out.Members[i].Repository)
+		}
+	}
+	return &out
 }
 
 // buildRegistrationStats summarises the daemon's registration / heartbeat /

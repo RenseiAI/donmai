@@ -154,6 +154,11 @@ type sessionPullRequestVerifier struct {
 	lookup       pullRequestRefLookup
 	draftLookup  pullRequestDraftLookup
 	headLookup   pullRequestHeadLookup
+	// inspectRange classifies the session's commits between from and to on
+	// branch for the delivery progress check. It defaults to inspectContinueRange; tests stub it
+	// so a re-read that only exercises remote lookups never shells out
+	// to git in a directory that is not a checkout.
+	inspectRange func(ctx context.Context, worktreePath, branch, from, to string) (continueRangeInspection, error)
 	// startHead is, for a rework run that continues an existing pull
 	// request, that pull request's head when the run started, recorded
 	// before the agent's first turn (see reworkStartHead); "" for a session
@@ -179,8 +184,8 @@ func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWor
 	v := &sessionPullRequestVerifier{
 		branch: branch, worktreePath: worktreePath, startHead: startHead, lastHead: startHead,
 		lookup: r.pullRequestLookup, draftLookup: r.pullRequestDraftLookup,
-		headLookup: r.pullRequestHeadLookup,
-		outcomes:   map[string]candidateOutcome{},
+		headLookup: r.pullRequestHeadLookup, inspectRange: inspectContinueRange,
+		outcomes: map[string]candidateOutcome{},
 	}
 	if v.lookup == nil {
 		v.lookup = originRefs
@@ -359,9 +364,16 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 // backstop then settle it as they always have. A URL whose pull request has
 // another head (for now) or does not exist does not count, and neither does
 // the accepted pull request: whether it finished the turn is judged from the
-// envelope and undelivered. A nil verifier reports none.
+// envelope and undelivered. A rework or continued run whose pull request is
+// accepted reports none: it delivers onto that pull request, so no other URL
+// the turn carried (a sibling quoted in review comments, one settle never
+// looked up because the accepted one came first) can be its result. A nil
+// verifier reports none.
 func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation) bool {
 	if v == nil || v.repository == "" {
+		return false
+	}
+	if v.startHead != "" && v.accepted != "" {
 		return false
 	}
 	for _, candidate := range turn.pullRequestCandidates {
@@ -394,10 +406,11 @@ const (
 // not deliver the session's work), undeliveredDraft when it is a draft, ""
 // when it delivers or when there is no accepted pull request.
 //
-// moved reports that the pull request's head moved to a commit of the
-// session's own since the previous re-read: the turn pushed to it. A draft
-// or rework that keeps gaining the session's commits is making progress, so
-// the caller does not count its continuations against the undelivered bound
+// moved reports that the pull request gained a deliverable commit of the
+// session's own since the previous re-read: a non-merge commit outside the
+// scratch set. A draft or rework that keeps gaining only merges or scratch
+// commits is not making delivery progress, so the caller keeps counting its
+// continuations against the undelivered bound
 // (turnFollowUps.undeliveredSent).
 //
 // A read that fails is returned as err and does not count against the pull
@@ -408,9 +421,28 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		return "", false, nil
 	}
 	var errs []error
+	inspect := v.inspectRange
+	if inspect == nil {
+		inspect = inspectContinueRange
+	}
+	readProgress := func(head string, own bool) {
+		previous := v.lastHead
+		if head != "" {
+			v.lastHead = head
+		}
+		if !own || previous == "" || head == "" || head == previous {
+			return
+		}
+		inspection, inspectErr := inspect(ctx, v.worktreePath, v.branch, previous, head)
+		if inspectErr != nil {
+			errs = append(errs, fmt.Errorf("inspect continued pull request progress: %w", inspectErr))
+			return
+		}
+		moved = inspection.delivers()
+	}
 	if v.startHead != "" {
 		head, own, readErr := v.readHead(ctx)
-		moved = v.noteHead(head, own)
+		readProgress(head, own)
 		switch {
 		case readErr != nil && head == "":
 			errs = append(errs, readErr)
@@ -423,6 +455,13 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 			errs = append(errs, readErr)
 		case !own:
 			return undeliveredNoNewCommit, moved, nil
+		default:
+			inspection, inspectErr := inspect(ctx, v.worktreePath, v.branch, v.startHead, head)
+			if inspectErr != nil {
+				errs = append(errs, fmt.Errorf("inspect continued pull request delivery: %w", inspectErr))
+			} else if !inspection.delivers() {
+				return undeliveredNoNewCommit, moved, nil
+			}
 		}
 	}
 	if v.draftLookup != nil {
@@ -433,9 +472,9 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		case draft:
 			if v.startHead == "" {
 				// A draft the session opened: read its head as well, so
-				// a turn that pushed to it counts as progress.
+				// only a deliverable push to it counts as progress.
 				head, own, readErr := v.readHead(ctx)
-				moved = v.noteHead(head, own)
+				readProgress(head, own)
 				if readErr != nil {
 					errs = append(errs, readErr)
 				}
@@ -486,18 +525,6 @@ func (v *sessionPullRequestVerifier) readHead(ctx context.Context) (head string,
 	return head, local == head, nil
 }
 
-// noteHead records the pull request head a re-read found and reports
-// whether it moved to a commit of the session's own since the previous one.
-// The first head seen (for a rework, the head at run start) is the baseline.
-func (v *sessionPullRequestVerifier) noteHead(head string, own bool) (moved bool) {
-	if head == "" {
-		return false
-	}
-	moved = own && v.lastHead != "" && head != v.lastHead
-	v.lastHead = head
-	return moved
-}
-
 // sessionHead reads the checkout's local HEAD commit: the session's own
 // commit. The runner's verifier reads it through captureHeadSHA; a verifier
 // built without a head lookup reads none, rather than running git in
@@ -518,6 +545,9 @@ func (v *sessionPullRequestVerifier) sessionHead(ctx context.Context) (string, e
 // started at — recorded right after provisioning, before the agent's first
 // turn. "" for a run that opens its own pull request.
 func reworkStartHead(qw QueuedWork, res *Result, worktreePath string) string {
+	if qw.ContinuePullRequest != nil && headSHARE.MatchString(qw.ContinuePullRequest.HeadSha) {
+		return qw.ContinuePullRequest.HeadSha
+	}
 	if qw.PullRequest != nil && headSHARE.MatchString(qw.PullRequest.HeadSHA) {
 		return qw.PullRequest.HeadSHA
 	}
@@ -536,6 +566,25 @@ func reworkStartHead(qw QueuedWork, res *Result, worktreePath string) string {
 type pullRequestRejection struct {
 	url    string
 	reason string
+}
+
+// seedContinuedPullRequest accepts the continued pull request as the
+// run's own before tail recovery: the seed goes through the same settle
+// path as a pull request the agent reported, so verification (same
+// repository, head at the session branch or commit) and the no-new-commit
+// and draft delivery rules apply unchanged. A nil verifier (work that owes
+// no pull request) leaves the envelope untouched.
+func (r *Runner) seedContinuedPullRequest(v *sessionPullRequestVerifier, continuedURL string, res *Result, obs *streamObservation) {
+	if v == nil || strings.TrimSpace(continuedURL) == "" {
+		return
+	}
+	seed := streamObservation{pullRequestURL: continuedURL, pullRequestCandidates: []string{continuedURL}}
+	for _, rejection := range v.settle(context.Background(), res, obs, seed) {
+		r.logger.Warn("continued pull request is not this session's pull request; ignored",
+			"url", rejection.url,
+			"reason", rejection.reason,
+		)
+	}
 }
 
 // acceptSessionPullRequest runs the verifier over one turn and logs every

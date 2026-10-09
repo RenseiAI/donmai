@@ -44,8 +44,17 @@ var classOrder = map[WritableClass]int{
 
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
-// every earlier self-test record stale.
-const ProbeSetVersion = "executor-confinement-probes-v1"
+// every earlier self-test record stale. v4 adds the read-scope pass; v5 adds
+// the terminal, package data tree and extended attribute read probes; v6
+// adds the protected-path read probes and a declared read path that is one
+// file in the operator home; v7 gives Linux its own widening probes (a decoy
+// process to signal, attach to and read, a nested boundary, a nested
+// remount over the read-only leaf, an abstract socket, the per-user bus and
+// service manager), records the probes a host cannot run, and marks the
+// probes the host itself refuses; v8 adds the daemon-private (control token)
+// read, listing and write probes, with reads open as well as under the read
+// scope.
+const ProbeSetVersion = "executor-confinement-probes-v8"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the
@@ -76,10 +85,71 @@ type Spec struct {
 	// Protected are paths kept outside the writable set even where they sit
 	// inside it, such as runner-injected artifacts beside harness state.
 	Protected []string
+	// DeniedPaths are daemon-private files (or whole subtrees) the seat must
+	// never read nor write, such as the daemon's control-token file. The
+	// composing binary passes each path in, resolved from its own host
+	// directories; this package never spells a brand-specific path. Each
+	// entry is denied in every read scope, open reads included: no read of
+	// any kind (contents, metadata, extended attributes, directory
+	// listings) and no write, after every allow, so the deny wins even
+	// inside the session's read allowlist. Entries may not exist yet (a
+	// token minted after the seat spawns is still denied). The workarea
+	// root, a writable root, a read-only leaf or a read path inside or
+	// equal to one refuses the spawn, and so does a read path covering
+	// one; a denied path nested inside the writable set stays denied.
+	//
+	// A denied path hides a subtree outright, so it must never cover the
+	// session's own paths. A directory that holds daemon secrets beside
+	// the session's own work area (a host state home whose per-session
+	// worktrees live beneath it) is named in DeniedListings instead, and
+	// its secrets here one by one.
+	DeniedPaths []string
+	// DeniedListings are daemon-private directories the seat must not
+	// enumerate, such as the directory holding the control token. Each is
+	// denied a directory listing (and its extended attributes) in every
+	// read scope, after every allow, while it stays traversable: the paths
+	// beneath it keep whatever the rest of the boundary grants them, so a
+	// session whose work area lives beneath one is unaffected. Entries may
+	// not exist yet. The workarea root, a writable root, a read-only leaf
+	// or a read path equal to one refuses the spawn (the seat could not
+	// list its own path), and so does a read path covering one.
+	//
+	// Backends: macOS denies the listing by name. A backend that cannot
+	// refuse a listing alone (a mount-namespace backend) may instead hide
+	// the directory's entries outright, with an empty overlay, provided it
+	// re-exposes beneath it, at their original spelling, every writable
+	// root, read-only leaf and read path the session declares there; it
+	// must never hide those. See Resolved.DeniedListings.
+	DeniedListings []string
 	// Sockets are the local sockets the adapter declares for the session
 	// (its control channel, an agent socket the credentials level grants, the
 	// OS resolver). Every other socket outside the writable set is closed.
 	Sockets []string
+	// LoopbackTCPPorts are the loopback TCP ports the adapter declares for
+	// the session. On macOS outbound TCP to the local machine is denied
+	// except on these ports; nothing is allowed by default. The Linux
+	// backend records them but filters no TCP: it declares loopback egress
+	// open (a Landlock port rule carries no address, so filtering connects
+	// by port would cut every undeclared port on every address, remote
+	// endpoints included), and its self-test proves undeclared loopback
+	// dials go through rather than refuse.
+	LoopbackTCPPorts []int
+
+	// ReadScope is the fileRead level the boundary enforces, on the
+	// execution-security ladder. Empty or agent.FileReadHost leaves reads
+	// open, as before. agent.FileReadWorkarea denies file contents and
+	// directory listings everywhere except the read allowlist: the writable
+	// set, the read-only leaves, ReadPaths, and the runtime and toolchain
+	// paths the backend declares. File metadata stays readable, so path
+	// lookups and stat keep working; a search over the whole disk fails fast
+	// instead of walking it. Any other level is refused.
+	ReadScope agent.ExecutionSecurityLevel
+	// ReadPaths are further files or directories the harness may read under
+	// a read scope: its own install and the host configuration it reads.
+	// They stay read-only. None may be the filesystem root or cover the
+	// operator home, the host state home or the profile directory, and they
+	// need a read scope.
+	ReadPaths []string
 }
 
 // Cache is one per-session toolchain cache bound to an environment variable.
@@ -267,9 +337,14 @@ func (p *Plan) Command(argv []string) ([]string, error) {
 
 // Environment returns the KEY=VALUE bindings the confined process needs:
 // TMPDIR, TMP and TEMP bound to session_tmp and each cache variable bound to
-// its per-session directory. Both spawn paths apply the same bindings.
+// its per-session directory, plus whatever the boundary itself needs (a
+// Landlock stage policy). Both spawn paths apply the same bindings.
 func (p *Plan) Environment() []string {
-	return append([]string(nil), p.env...)
+	env := append([]string(nil), p.env...)
+	if p.applied.Environ != nil {
+		env = append(env, p.applied.Environ()...)
+	}
+	return env
 }
 
 // Record returns the per-session confinement record.

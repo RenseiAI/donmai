@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -106,6 +107,13 @@ type HeartbeatOptions struct {
 	// to SampleLoadAverage. Additive: absence preserves the Load-only
 	// beat byte-identical.
 	GetLoadAverage func() (one, five, fifteen float64, ok bool)
+
+	// GetQuota returns the subscription quota snapshot for this host's
+	// signed-in accounts (one entry per account). Called once per beat.
+	// Optional — leave nil to omit the quota key entirely, matching the
+	// GetLoad convention. Account IDs must be opaque values the platform
+	// hashes; never put an address in them.
+	GetQuota func() []agent.UsageAccount
 
 	// GetAllowlist returns the daemon's current project allowlist entries
 	// (derived from cfg.Projects). Called every beat so a hot yaml reload
@@ -515,6 +523,15 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 	}
 	payload.SessionShim = sessionShim
 
+	// Quota snapshot rides every beat when configured. An empty report
+	// is omitted like the quarantine projection above: the key is only
+	// present when there is quota state to report.
+	if h.opts.GetQuota != nil {
+		if q := h.opts.GetQuota(); len(q) > 0 {
+			payload.Quota = q
+		}
+	}
+
 	// Item 8: sample per-beat CPU/mem load when a sampler is configured.
 	// ok=false leaves payload.Load nil so the wire body omits the key
 	// entirely (best-effort — a sampling miss must never fail a beat).
@@ -704,7 +721,8 @@ func (h *HeartbeatService) projectAdmissionReport() (ProjectAdmissionReport, boo
 // /api/workers/<id>/heartbeat. Matches the platform contract:
 //
 //	{ status?, activeCount, activeInteractiveCount?, maxSessions?, load?,
-//	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures? }
+//	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures?,
+//	  quota? }
 //
 // activeInteractiveCount is the interactive-occupancy split of activeCount:
 // live Mode == "interactive" or legacy Mode == "interview" sessions count,
@@ -743,6 +761,10 @@ type heartbeatRequestBody struct {
 	// this daemon refused to adopt, each carrying consumesCapacity:true.
 	QuarantinedSessions []sessionshim.QuarantinedSession `json:"quarantinedSessions,omitempty"`
 	SessionShim         *SessionShimHeartbeatProjection  `json:"sessionShim,omitempty"`
+	// Quota is the subscription quota snapshot for this host's signed-in
+	// accounts. Omitted when the daemon reports no quota state; account
+	// IDs ride as opaque values the platform hashes.
+	Quota []agent.UsageAccount `json:"quota,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -869,6 +891,7 @@ func (h *HeartbeatService) callEndpoint(
 		MutationFailures:       ackFailures,
 		QuarantinedSessions:    payload.QuarantinedSessions,
 		SessionShim:            payload.SessionShim,
+		Quota:                  payload.Quota,
 	}
 	// NB: region is deliberately NOT sent on the heartbeat leg. The platform's
 	// heartbeat route parses no `region` key — region is a register-time-only

@@ -93,8 +93,19 @@
 // What this deliberately does NOT claim: OS-level sandboxing. The policy
 // extension is an in-process boundary — a hostile MODEL OUTPUT is contained
 // (it can only call overridden tools), but a hostile TOOL EXECUTION still
-// runs as the user. OS/sandbox-family enforcement stays the sandbox provider
-// family's job (E2B/container cells), unchanged. Do not mistake this
+// runs as the user. OS-level confinement is the executor's job, not this
+// extension's: when the host's own configuration requires it
+// (Options.RequireConfinement / DONMAI_PI_CONFINEMENT=required) or the
+// session declares a repository authority, the provider spawns pi inside the
+// executor confinement of ADR-2026-10-03-executor-os-confinement.md,
+// headless and interactive alike (confinement.go). The host can also confine
+// a confined seat's reads (Options.ConfinementReadScope /
+// DONMAI_PI_CONFINEMENT_READ=workarea): file contents and directory listings
+// outside the session's workarea, the runtime and toolchain paths, pi's own
+// install, git's user configuration and the host-declared read paths are
+// refused, so a search over the whole disk fails fast. Container and microVM
+// isolation stay with the sandbox provider family. Without that confinement
+// a hostile tool execution still runs as the user. Do not mistake this
 // extension for a sandbox.
 //
 // # The fail-safe fence
@@ -260,6 +271,37 @@
 //     inside this package. Rebuilding it would mean trusting a re-read of an
 //     audit file to decide a security outcome, which is worse than recording
 //     the calls as unproven.
+//
+// # Sequential shell and file-write tools (ordering, not a trust layer)
+//
+// pi runs the tool calls of one assistant message concurrently by default:
+// every call's tool_call hook runs first, in order, then all executions
+// start together, so dependent shell calls (git add, git status, git commit)
+// race. The runtime's only switch is a per-tool executionMode — a batch that
+// names any tool registered "sequential" runs one call at a time, in source
+// order, each hook immediately before its own execution. The policy extension
+// therefore re-registers bash, write and edit under their own names with that
+// mode and pi's own implementation (registerSequentialTools). It is layered
+// under the fence above, not beside it: tool_call still fires for every call
+// under the unchanged names, so adjudication, the bounds rail and the
+// state-dir guard all apply, and the overrides are registered only after
+// those handlers. A hook-side queue cannot do this (every hook in a parallel
+// batch returns before the first execution starts), and a missing host
+// factory leaves the built-ins in place, unordered, with the fence intact.
+// The overrides are extension tools, so they re-enable bash, write and edit
+// even when a defaultTools setting or --no-builtin-tools left those built-ins
+// off: the runtime builds its tool list with extension tools switched on
+// regardless of the built-in defaults (only --tools/--exclude-tools still
+// constrain extension tools, and donmai passes neither flag — only a
+// repo-controlled .pi/settings.json could narrow the built-ins). This stays
+// ordering-only, never a wider tool surface: tool_call still fires for every
+// call under the unchanged names, so the fence above still adjudicates each
+// one.
+// Fixtures: tool_call_bounds_test.go —
+// TestToolCallBounds_SequentialOverridesLayerUnderTheFence (scripted, both
+// lanes); extension_delivery_real_binary_test.go —
+// TestRealBinary_SequentialShellTools_RunInOrder and
+// TestRealBinary_SequentialToolOverride_KeepsPolicyFence (real binary).
 //
 // # D8 fixture family
 //

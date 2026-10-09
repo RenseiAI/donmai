@@ -31,8 +31,22 @@ type mapperState struct {
 	debug       bool // when true, thinking deltas are surfaced; default drops them
 	initEmitted bool
 
-	accInputTokens       int64
-	accOutputTokens      int64
+	// suppressCost is set when the session runs on the injected provider
+	// with no per-token prices bound (extension.go unitPricePinEnv): pi
+	// still reports a cost computed from the registered zero cost table,
+	// but it is not a real price, so per-turn observed costs and the
+	// terminal totals are dropped and cost reads as absent, not $0.
+	// Native lanes leave it false and are unchanged.
+	suppressCost bool
+
+	accInputTokens  int64
+	accOutputTokens int64
+	// accCachedInputTokens and accCacheWriteTokens accumulate pi's
+	// usage.cacheRead / usage.cacheWrite. pi's input count already
+	// excludes both (every pi-ai protocol subtracts them), so they are
+	// separate classes here exactly as agent.CostData defines them.
+	accCachedInputTokens int64
+	accCacheWriteTokens  int64
 	accCostUSD           float64
 	accTurns             int
 	allTurnCostsObserved bool
@@ -159,14 +173,27 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 
 	case "turn_end":
 		// Per-turn usage rides message.usage (AssistantMessage). Accumulate it
-		// so the terminal ResultEvent carries whole-session cost.
+		// so the terminal ResultEvent carries whole-session cost. Cache reads
+		// and writes are their own buckets ({input, output, cacheRead,
+		// cacheWrite}): pi's input already excludes them, so they are never
+		// folded into InputTokens.
 		msg := mapField(f, "message")
 		usage := mapField(msg, "usage")
 		in := intField(usage, "input", "inputTokens")
 		outTok := intField(usage, "output", "outputTokens")
+		cacheRead := intField(usage, "cacheRead", "cacheReadTokens")
+		cacheWrite := intField(usage, "cacheWrite", "cacheWriteTokens")
 		st.accInputTokens += in
 		st.accOutputTokens += outTok
+		st.accCachedInputTokens += cacheRead
+		st.accCacheWriteTokens += cacheWrite
 		cost := observedPiCost(mapField(usage, "cost"))
+		// On an unpriced injected lane the zero cost pi reports comes
+		// from the registered zero cost table, not a real price: drop it
+		// so cost reads as absent. Native lanes are unchanged.
+		if st.suppressCost {
+			cost = nil
+		}
 		if st.accTurns == 0 {
 			st.allTurnCostsObserved = true
 		}
@@ -186,12 +213,14 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			Model:  stringField(msg, "model"),
 			// Pi pre-fills provider/model from its selected catalog entry.
 			// responseModel alone is native response evidence when supplied.
-			ResponseModel:   stringField(msg, "responseModel"),
-			InputTokens:     in,
-			OutputTokens:    outTok,
-			UsageSource:     agent.LlmUsageProvider,
-			ObservedCostUsd: cost,
-			TurnCompleted:   true,
+			ResponseModel:     stringField(msg, "responseModel"),
+			InputTokens:       in,
+			OutputTokens:      outTok,
+			CachedInputTokens: cacheRead,
+			CacheWriteTokens:  cacheWrite,
+			UsageSource:       agent.LlmUsageProvider,
+			ObservedCostUsd:   cost,
+			TurnCompleted:     true,
 		}}, false
 
 	case "agent_end":
@@ -218,7 +247,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		if st.accTurns > 0 {
 			turns := st.accTurns
 			res.ObservedTurns = &turns
-			if st.allTurnCostsObserved {
+			if st.allTurnCostsObserved && !st.suppressCost {
 				cost := st.accCostUSD
 				res.ObservedCostUsd = &cost
 			}
@@ -264,17 +293,26 @@ func observedPiCost(cost map[string]any) *float64 {
 }
 
 // accumulatedCost returns the session's accumulated CostData, or nil if nothing
-// was observed.
+// was observed. Every token class pi reports rides along: input, output,
+// cache reads and cache writes. On an unpriced injected lane the dollar
+// total is suppressed (cost reads as absent, not $0) while token counts
+// still accumulate, so the terminal status omits the total cost but keeps
+// usage.
 func (st *mapperState) accumulatedCost() *agent.CostData {
-	if st.accInputTokens == 0 && st.accOutputTokens == 0 && st.accCostUSD == 0 && st.accTurns == 0 {
+	tokens := agent.CostData{
+		InputTokens:       st.accInputTokens,
+		OutputTokens:      st.accOutputTokens,
+		CachedInputTokens: st.accCachedInputTokens,
+		CacheWriteTokens:  st.accCacheWriteTokens,
+		NumTurns:          st.accTurns,
+	}
+	if !st.suppressCost {
+		tokens.TotalCostUsd = st.accCostUSD
+	}
+	if tokens == (agent.CostData{}) {
 		return nil
 	}
-	return &agent.CostData{
-		InputTokens:  st.accInputTokens,
-		OutputTokens: st.accOutputTokens,
-		TotalCostUsd: st.accCostUSD,
-		NumTurns:     st.accTurns,
-	}
+	return &tokens
 }
 
 // toolResultContent flattens tool_execution_end's result.content[] text parts

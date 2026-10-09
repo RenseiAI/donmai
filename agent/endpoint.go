@@ -117,6 +117,16 @@ type EndpointRequest struct {
 	EnvProvided map[string]string `json:"-"`
 }
 
+// UnitPrices carries optional per-token prices in USD per million
+// tokens. Nil means no prices are bound; a non-nil but all-zero value
+// is an explicit zero price, not an absent one.
+type UnitPrices struct {
+	Input      float64 `json:"input,omitempty"`
+	Output     float64 `json:"output,omitempty"`
+	CacheRead  float64 `json:"cacheRead,omitempty"`
+	CacheWrite float64 `json:"cacheWrite,omitempty"`
+}
+
 // EndpointBinding — the resolved cell. The currency crossing into
 // Spec.Endpoint.
 type EndpointBinding struct {
@@ -156,9 +166,16 @@ type EndpointBinding struct {
 	// projects/{p}/locations/{r}/publishers) read it here rather than
 	// re-parsing the templated URL. Empty for region-less hosts
 	// (direct/local/oauth-cli).
-	Region        string    `json:"region,omitempty"`
-	CostModel     CostModel `json:"costModel"`
-	BringsOwnAuth bool      `json:"bringsOwnAuth"`
+	Region    string    `json:"region,omitempty"`
+	CostModel CostModel `json:"costModel"`
+	// UnitPrices carries optional per-token prices in USD per million
+	// tokens (the unit pi's cost table uses: usage.cost.* = rate/1e6 *
+	// tokens). Nil means no prices are bound: the harness must report
+	// cost as absent rather than zero. A non-nil but all-zero value is
+	// an explicit zero price, not an absent one. Additive + omitempty;
+	// absent on every dispatch that predates it.
+	UnitPrices    *UnitPrices `json:"unitPrices,omitempty"`
+	BringsOwnAuth bool        `json:"bringsOwnAuth"`
 	// Env carries the resolved credential/config VALUES for the cell's
 	// declared EnvKeys. json:"-" — values never cross the wire; bindings
 	// that travel (QueuedWork payloads) deliver credentials via Spec.Env,

@@ -58,6 +58,16 @@ type verdictScriptTurn struct {
 	// of these refs on origin (e.g. a branch and refs/pull/<n>/head), as an
 	// agent that pushes to its pull request does.
 	push []string
+	// hang leaves the turn open after its events: no terminal event, and
+	// the stream stays open, as a wedged harness does.
+	hang bool
+	// before, when set, runs before the turn plays (inside the Inject that
+	// starts it), so a test can hold the turn until a condition holds.
+	before func()
+	// during runs after the turn's files and push, before its events: the
+	// world changing while the agent works (e.g. someone else pushing to
+	// the session's branch). It receives the session worktree.
+	during func(t *testing.T, cwd string)
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -77,6 +87,18 @@ type verdictScriptProvider struct {
 	// workareaCaps, when non-nil, overrides the wrapped harness manifest's
 	// multi-repository workarea attestation.
 	workareaCaps *agent.HarnessCaps
+	// lastHandle is the most recent spawned handle, so tests can assert on
+	// what the runner handed the harness (e.g. Spec.Env).
+	lastHandle agent.Handle
+}
+
+// lastSpecEnv returns the harness Spec.Env of the most recent spawn, or nil
+// when nothing has spawned yet.
+func (p *verdictScriptProvider) lastSpecEnv() map[string]string {
+	if h, ok := p.lastHandle.(*verdictScriptHandle); ok {
+		return h.specEnv
+	}
+	return nil
 }
 
 func (p *verdictScriptProvider) Manifest() agent.HarnessManifest {
@@ -90,7 +112,8 @@ func (p *verdictScriptProvider) Manifest() agent.HarnessManifest {
 }
 
 func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
-	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts}
+	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts, specEnv: spec.Env}
+	p.lastHandle = h
 	h.events <- agent.InitEvent{SessionID: "scripted-session"}
 	h.play()
 	return h, nil
@@ -110,6 +133,9 @@ type verdictScriptHandle struct {
 	events chan agent.Event
 	// prompts records every follow-up prompt the runner injected.
 	prompts *[]string
+	// specEnv captures the harness Spec.Env the runner spawned with, so
+	// tests can assert on the environment the seat actually carried.
+	specEnv map[string]string
 }
 
 func (h *verdictScriptHandle) SessionID() string          { return "scripted-session" }
@@ -135,6 +161,9 @@ func (h *verdictScriptHandle) play() {
 func (h *verdictScriptHandle) playLocked() {
 	turn := h.turns[h.next]
 	h.next++
+	if turn.before != nil {
+		turn.before()
+	}
 	if turn.manifest != "" {
 		dir := filepath.Join(h.cwd, state.AgentDirName)
 		if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -168,6 +197,9 @@ func (h *verdictScriptHandle) playLocked() {
 	if len(turn.push) > 0 {
 		h.commitAndPush(turn)
 	}
+	if turn.during != nil {
+		turn.during(h.t, h.cwd)
+	}
 	for _, ev := range turn.events {
 		h.events <- ev
 	}
@@ -186,6 +218,9 @@ func (h *verdictScriptHandle) playLocked() {
 		h.events <- agent.ErrorEvent{Message: "provider crashed mid turn"}
 		h.closed = true
 		close(h.events)
+		return
+	}
+	if turn.hang {
 		return
 	}
 	h.events <- agent.ResultEvent{Success: true, Message: turn.text, Cost: turn.cost}
@@ -284,6 +319,20 @@ type scriptedSession struct {
 	// ref, when set, makes the session a rework run on that existing
 	// branch of repository (qw.Ref), created at main.
 	ref string
+	// continueNumber, when positive, makes the session a continue run on
+	// the pull request numbered here: its head branch is created on the
+	// fixture repository at main, the head commit is pinned on the
+	// dispatched record, and refs/pull/<n>/head tracks the head branch.
+	// continueRef additionally dispatches qw.Ref naming the head branch
+	// (the platform keeps sending the ref pin older runners rely on).
+	continueNumber int
+	continueRef    bool
+	// protectContinue arms a pre-receive hook on the fixture repository
+	// that rejects every push to the continued head branch with a policy
+	// message worded to trip the old diagnostics-text matcher: a policy
+	// rejection of an otherwise fast-forward push must not read as
+	// divergence.
+	protectContinue bool
 	// backstop lets the deterministic backstop run (off by default).
 	backstop bool
 	// stepHeartbeatInterval, when positive, sets the runner's private
@@ -302,6 +351,14 @@ type scriptedSession struct {
 	// continuationUndeliveredLimit is
 	// Options.TurnContinuationUndeliveredLimit (0 = default).
 	continuationUndeliveredLimit int
+	// idleTimeout is Options.IdleTimeout (0 = default).
+	idleTimeout time.Duration
+	// providerStallTimeout is Options.ProviderStallTimeout (0 = default).
+	providerStallTimeout time.Duration
+	// providerStallRetries is Options.ProviderStallRetries (0 = default).
+	providerStallRetries int
+	// heartbeatInterval is Options.HeartbeatInterval (0 = default).
+	heartbeatInterval time.Duration
 	// declaration, when non-nil, provisions the session through the
 	// session-root-v1 workarea protocol with that repository declaration;
 	// the session's legacy Repository is cleared so the primary source
@@ -309,6 +366,11 @@ type scriptedSession struct {
 	declaration *workarea.RepositoryDeclarationV1
 	// budget is the session's stage budget (nil = none).
 	budget *prompt.StageBudget
+	// seatBudget is the session's per-seat resource budget (nil = none).
+	seatBudget *SeatBudget
+	// kitComposer, when set, wires the runner's kit toolchain composer so
+	// the session runs the kit-provision step against the stubbed demand.
+	kitComposer KitComposer
 	// platform, when set, is the platform double the session posts to, so a
 	// test can read the terminal status it received.
 	platform *recordingPlatformServer
@@ -357,6 +419,11 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.TurnContinuationLimit = cfg.continuationLimit
 		o.TurnContinuationCeiling = cfg.continuationCeiling
 		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
+		o.IdleTimeout = cfg.idleTimeout
+		o.ProviderStallTimeout = cfg.providerStallTimeout
+		o.ProviderStallRetries = cfg.providerStallRetries
+		o.HeartbeatInterval = cfg.heartbeatInterval
+		o.KitComposer = cfg.kitComposer
 	})
 	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
 	r.skipSteering = cfg.skipSteering
@@ -384,6 +451,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	}
 	qw.WorkType = cfg.workType
 	qw.StageBudget = cfg.budget
+	qw.SeatBudget = cfg.seatBudget
 	switch {
 	case cfg.declaration != nil:
 		qw.RepositoryDeclaration = cfg.declaration
@@ -403,6 +471,25 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		if cfg.ref != "" {
 			gitRun(t, bare, "branch", cfg.ref, "main")
 			qw.Ref = cfg.ref
+		}
+		if cfg.continueNumber > 0 {
+			// The continued head branch starts at main, exactly the
+			// shape a real pull request head the clone never saw has
+			// after the checkout fetches it.
+			continueBranch := fmt.Sprintf("continued/pr-%d", cfg.continueNumber)
+			gitRun(t, bare, "branch", continueBranch, "main")
+			gitRun(t, bare, "update-ref", fmt.Sprintf("refs/pull/%d/head", cfg.continueNumber), gitRun(t, bare, "rev-parse", continueBranch))
+			if cfg.protectContinue {
+				installProtectedBranchHook(t, bare, continueBranch)
+			}
+			qw.ContinuePullRequest = &prompt.ContinuePullRequest{
+				Number:  cfg.continueNumber,
+				HeadRef: continueBranch,
+				HeadSha: gitRun(t, bare, "rev-parse", continueBranch),
+			}
+			if cfg.continueRef {
+				qw.Ref = continueBranch
+			}
 		}
 	default:
 		qw.Repository = makeBareRepo(t)

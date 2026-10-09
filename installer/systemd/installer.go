@@ -37,6 +37,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+
+	"github.com/RenseiAI/donmai/installer/servicepriority"
 )
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -125,6 +127,11 @@ type InstallOptions struct {
 	// ConfigPath is the path to the daemon config file. When non-empty, it
 	// is exported as DONMAI_DAEMON_CONFIG via Environment= in the unit.
 	ConfigPath string
+
+	// ProcessPriority selects the process-priority mode the unit encodes. The
+	// zero value reads as servicepriority.Default, which leaves the unit
+	// byte-for-byte unchanged.
+	ProcessPriority servicepriority.Mode
 
 	// SkipSystemctl skips running systemctl daemon-reload / enable --now after
 	// writing the unit file. Useful for tests and CI environments without
@@ -220,6 +227,10 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 	if binPath == "" {
 		return "", fmt.Errorf("systemd: GenerateUnitFile: binPath is required")
 	}
+	priorityDirectives, err := ProcessPriorityDirectives(opts.ProcessPriority)
+	if err != nil {
+		return "", err
+	}
 
 	description := opts.Description
 	if description == "" {
@@ -242,6 +253,11 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		// counter is not incremented; because it is NOT in
 		// RestartPreventExitStatus, systemd still restarts the daemon.
 		"SuccessExitStatus=3",
+		// No KillMode and no Delegate, deliberately: stopping this unit keeps
+		// systemd's default control-group kill, so a direct-owned seat in the
+		// unit's cgroup ends with its daemon. A shim-owned seat survives
+		// because it starts in its own transient scope, which lives outside
+		// this unit's cgroup — never because this unit stops killing it.
 	)
 
 	if opts.ConfigPath != "" {
@@ -269,6 +285,7 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		"StandardError=journal",
 		"SyslogIdentifier="+UnitName,
 	)
+	lines = append(lines, priorityDirectives...)
 
 	if scope == ScopeSystem {
 		// System-scope unit must run as a specific user; default to the
@@ -297,6 +314,39 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		out = strings.ReplaceAll(out, "\n\n\n", "\n\n")
 	}
 	return strings.TrimRight(out, "\n") + "\n", nil
+}
+
+// backgroundDirectives are the [Service] directives for
+// servicepriority.Background. They mirror the macOS intent: the lowest CPU
+// priority and the lowest disk I/O priority, inherited by every process the
+// daemon spawns. Each one only lowers the service's own priority, so none needs
+// privilege, which keeps a user-scoped unit working.
+//
+//   - Nice=19                     lowest nice value.
+//   - CPUSchedulingPolicy=idle    SCHED_IDLE: runs only in CPU the rest of the
+//     system leaves free, yet is still scheduled
+//     (it is not starved outright).
+//   - IOSchedulingClass=idle      the idle I/O class. It takes no
+//     IOSchedulingPriority=; that setting only
+//     applies to the best-effort and realtime
+//     classes.
+var backgroundDirectives = []string{
+	"Nice=19",
+	"CPUSchedulingPolicy=idle",
+	"IOSchedulingClass=idle",
+}
+
+// ProcessPriorityDirectives returns the [Service] directives that encode mode.
+// The default mode returns none. It is exported so an embedder that renders its
+// own unit can emit the same directives.
+func ProcessPriorityDirectives(mode servicepriority.Mode) ([]string, error) {
+	if err := servicepriority.Validate(mode); err != nil {
+		return nil, fmt.Errorf("systemd: %w", err)
+	}
+	if servicepriority.Effective(mode) == servicepriority.Background {
+		return append([]string(nil), backgroundDirectives...), nil
+	}
+	return nil, nil
 }
 
 // currentUsername returns the SUDO_USER (when present, so we register the

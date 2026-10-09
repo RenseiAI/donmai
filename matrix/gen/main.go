@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/RenseiAI/donmai/matrix"
 )
@@ -56,17 +55,35 @@ func run() error {
 	return nil
 }
 
-// matrixDir resolves the matrix/ package directory. go generate sets the CWD to
-// the directory of the file holding the //go:generate directive (matrix/), and
-// `go run ./matrix/gen` from the repo root also wants matrix/. Resolve robustly
-// from this source file's location (../ from matrix/gen) so the command works
-// from any CWD.
+// matrixDir resolves the matrix/ package directory from the module root, found
+// by walking up from the working directory. go generate sets the CWD to the
+// directory of the file holding the //go:generate directive (matrix/), and
+// `go run ./matrix/gen` from the repo root has the repo root as CWD; both reach
+// the same module root. runtime.Caller is deliberately avoided: under
+// `-trimpath` it returns a module-relative path that does not exist on disk.
 func matrixDir() (string, error) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", fmt.Errorf("cannot resolve generator source path")
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("getwd: %w", err)
 	}
-	// thisFile = <repo>/matrix/gen/main.go → matrix/ is the parent of gen/.
-	genDir := filepath.Dir(thisFile)
-	return filepath.Dir(genDir), nil
+	root, err := moduleRoot(wd)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "matrix"), nil
+}
+
+// moduleRoot walks up from dir to the directory holding go.mod.
+func moduleRoot(dir string) (string, error) {
+	start := dir
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no go.mod found walking up from %s", start)
+		}
+		dir = parent
+	}
 }

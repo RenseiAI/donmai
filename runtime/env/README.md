@@ -32,6 +32,7 @@ Plus donmai-native entries with no legacy counterpart:
 ```
 DONMAI_GATEWAY_UPSTREAM_API_KEY   # worker-local gateway's upstream credential
 DONMAI_GATEWAY_UPSTREAM_BASE_URL  # worker-local gateway's upstream route
+DONMAI_PI_KEY                     # resolved cell key for the pi harness's injected provider; blocked from the parent env
 ```
 
 The gateway entries are load-bearing for the translating-gateway host: the

@@ -588,3 +588,51 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return b
 }
+
+// TestOneShotCost_CacheClasses pins the one-shot projection of the Anthropic
+// usage: cache reads and cache writes ride their own CostData buckets (both
+// are excluded from input_tokens), and a usage that reports only cache
+// tokens is still attributable usage, not "nothing reported".
+func TestOneShotCost_CacheClasses(t *testing.T) {
+	t.Parallel()
+	price := 0.02
+	type usage = struct {
+		InputTokens              int64 `json:"input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		CacheReadInputToken      int64 `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	}
+	tests := []struct {
+		name string
+		env  oneShotEnvelope
+		want *agent.CostData
+	}{
+		{
+			name: "every class projects onto its bucket",
+			env:  oneShotEnvelope{NumTurns: 1, TotalCostUSD: &price, Usage: usage{InputTokens: 11, OutputTokens: 22, CacheReadInputToken: 3, CacheCreationInputTokens: 4}},
+			want: &agent.CostData{InputTokens: 11, OutputTokens: 22, CachedInputTokens: 3, CacheWriteTokens: 4, TotalCostUsd: 0.02, NumTurns: 1},
+		},
+		{
+			name: "cache-only usage is usage",
+			env:  oneShotEnvelope{NumTurns: 1, Usage: usage{CacheCreationInputTokens: 2048}},
+			want: &agent.CostData{CacheWriteTokens: 2048, NumTurns: 1},
+		},
+		{
+			name: "nothing reported is no cost",
+			env:  oneShotEnvelope{NumTurns: 1},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := oneShotCost(tt.env)
+			switch {
+			case tt.want == nil && got != nil:
+				t.Errorf("oneShotCost = %+v; want nil", *got)
+			case tt.want != nil && (got == nil || *got != *tt.want):
+				t.Errorf("oneShotCost = %+v; want %+v", got, *tt.want)
+			}
+		})
+	}
+}

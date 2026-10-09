@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/internal/interview"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -29,7 +30,15 @@ var _ ActiveWorkareaProvider = (*WorkerSpawner)(nil)
 
 // SpawnerOptions configure a WorkerSpawner.
 type SpawnerOptions struct {
-	Projects []ProjectConfig
+	// SessionReadToken reports the live per-session read credential for
+	// a session id, minted at accept time and deleted with the detail it
+	// names. The spawner states the token in the spawned worker's
+	// environment so the worker can read its own session detail without
+	// holding the operator control token. Nil (tests, embedders that
+	// never mint one) states nothing — the worker's read then follows
+	// the daemon's operator-credential path.
+	SessionReadToken func(sessionID string) (string, bool)
+	Projects         []ProjectConfig
 	// EnabledProjectIDs is the authoritative project-admission set. When nil,
 	// IDs are derived from Projects for legacy callers.
 	EnabledProjectIDs []string
@@ -165,6 +174,12 @@ type SpawnerOptions struct {
 
 	// Now lets tests deterministically clock acceptedAt timestamps.
 	Now func() time.Time
+	// SeatBudget is the resolved per-seat resource budget applied to
+	// every session this spawner starts. Zero value disables budgeting:
+	// seats spawn exactly as before and report mode "none". The daemon
+	// wires its resolved config budget here; embedders that compose
+	// their own spawner may resolve one with seatbudget.Resolve.
+	SeatBudget SeatBudget `yaml:"-" json:"-"`
 	// Stdout is where worker stdout is forwarded with a "[worker:<id>]"
 	// prefix. Defaults to os.Stdout. Set to io.Discard in tests.
 	StdoutPrefixWriter PrefixedWriter
@@ -229,7 +244,14 @@ func (t *realPumpDrainTimer) Stop() bool          { return t.timer.Stop() }
 type WorkerSpawner struct {
 	opts SpawnerOptions
 
-	mu                     sync.Mutex
+	mu sync.Mutex
+	// seatBudgetMu guards seatBudget separately from mu: SetSeatBudget
+	// swaps the share from the config watcher while AcceptWork/spawn
+	// read it unlocked, so sharing mu would either race or serialize
+	// every spawn on admission. A struct value races under -race even
+	// when both sides hold no common lock — hence the dedicated RWMutex.
+	seatBudgetMu           sync.RWMutex
+	seatBudget             SeatBudget
 	sessions               map[string]*spawnedSession
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
@@ -302,6 +324,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	opts.ProjectAdmissionMode = normalizeProjectAdmissionMode(opts.ProjectAdmissionMode)
 	return &WorkerSpawner{
 		opts:                   opts,
+		seatBudget:             opts.SeatBudget,
 		sessions:               make(map[string]*spawnedSession),
 		spawnReservations:      make(map[string]struct{}),
 		sessionHistory:         make(map[string]struct{}),
@@ -620,6 +643,20 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 	return nil
 }
 
+// SetSeatBudget swaps the per-seat budget future spawns apply. Seats
+// already running keep the budget they started with — like capacity, the
+// new share governs only future AcceptWork calls. The share lives behind
+// its own lock (see seatBudgetForSpawn): the config watcher calls this
+// while spawns read concurrently.
+func (s *WorkerSpawner) SetSeatBudget(b SeatBudget) {
+	s.seatBudgetMu.Lock()
+	defer s.seatBudgetMu.Unlock()
+	s.seatBudget = b
+	s.mu.Lock()
+	s.opts.SeatBudget = b
+	s.mu.Unlock()
+}
+
 // SetProjects atomically swaps the spawner's base project allowlist used by
 // AcceptWork's findProjectLocked check. Existing in-flight sessions
 // continue against whichever project they were dispatched under — the
@@ -871,7 +908,10 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 	if s.opts.ShimSpawn == nil {
 		return nil, false, nil
 	}
-	env := composeEnv(s.opts.BaseEnv, spec.Env, s.daemonOwnedEnv(spec, project))
+	env := s.sessionEnv(spec, project)
+	if seatBudget, seatBudgetOK := s.seatBudgetForSpawn(); seatBudgetOK {
+		env = applySeatBudgetToEnv(env, seatBudget, seatBudgetOK)
+	}
 	// OnPreSpawn is the credential rail, and a shim-backed session needs it for
 	// exactly the same reason a direct one does: the harness cannot start without
 	// the credentials the hook resolves. Skipping it for shim sessions would make
@@ -898,7 +938,24 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 	return handle, true, nil
 }
 
+// resolveProjectForSpecLocked admits a spec against the machine's project
+// allowlist: the session's project (resolveSessionProjectLocked), then every
+// entry of its repository declaration (checkDeclarationRepositoriesLocked).
 func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectConfig, error) {
+	project, err := s.resolveSessionProjectLocked(spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkDeclarationRepositoriesLocked(spec, project.ID); err != nil {
+		return nil, err
+	}
+	return project, nil
+}
+
+// resolveSessionProjectLocked resolves the project a spec runs under from its
+// project id and singular repository fields. Every success returns a project
+// whose ID is the session's project.
+func (s *WorkerSpawner) resolveSessionProjectLocked(spec SessionSpec) (*ProjectConfig, error) {
 	if spec.ProjectID != "" {
 		if !s.isProjectAllowedLocked(spec.ProjectID) {
 			return nil, fmt.Errorf("project %q is not allowed", spec.ProjectID)
@@ -938,6 +995,62 @@ func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectC
 		return nil, fmt.Errorf("project %q is not allowed", project.ID)
 	}
 	return project, nil
+}
+
+// checkDeclarationRepositoriesLocked extends admission to every entry of an
+// additive repository declaration, so a declaration cannot carry a
+// repository past the checks the singular repository passes. Each declared
+// source must be the location of a repository configured for the session's
+// own project (projectID), and that project must be enabled on this machine.
+// An entry configured only under another project is refused even when that
+// project is enabled: the session was admitted for one project, and the
+// owner's consent is per project. Every entry is checked, the one that
+// repeats the singular repository included, and only by location
+// (sameRepositoryLocation): the runner clones the declared source exactly
+// as written, so a project id or a bare name never stands in for one.
+func (s *WorkerSpawner) checkDeclarationRepositoriesLocked(spec SessionSpec, projectID string) error {
+	if spec.RepositoryDeclaration == nil {
+		return nil
+	}
+	for i, declared := range spec.RepositoryDeclaration.Repositories {
+		source := declared.Source.Repository
+		if strings.TrimSpace(source) == "" {
+			return fmt.Errorf("declared repository %d has no source", i)
+		}
+		owner := s.findDeclaredRepositoryLocked(source, projectID)
+		if owner == nil {
+			return fmt.Errorf("repository %q is not configured for project %q", source, projectID)
+		}
+		if !s.isProjectAllowedLocked(owner.ID) {
+			return fmt.Errorf("project %q is not allowed", owner.ID)
+		}
+		if owner.ID != projectID {
+			return fmt.Errorf("repository %q is configured for project %q, not for the session's project %q", source, owner.ID, projectID)
+		}
+	}
+	return nil
+}
+
+// findDeclaredRepositoryLocked returns the configured entry whose repository
+// is the location source names, preferring an entry of projectID, or nil when
+// no configured repository is that location.
+func (s *WorkerSpawner) findDeclaredRepositoryLocked(source, projectID string) *ProjectConfig {
+	var other *ProjectConfig
+	for _, projects := range [][]ProjectConfig{s.opts.Projects, s.extraProjects} {
+		for i := range projects {
+			project := &projects[i]
+			if !sameRepositoryLocation(project.Repository, source) {
+				continue
+			}
+			if project.ID == projectID {
+				return project
+			}
+			if other == nil {
+				other = project
+			}
+		}
+	}
+	return other
 }
 
 func (s *WorkerSpawner) findPrimaryProjectRepositoryLocked(projectID string) *ProjectConfig {
@@ -1026,21 +1139,6 @@ func (s *WorkerSpawner) findProjectLocked(repository string) *ProjectConfig {
 	return nil
 }
 
-// matchProject returns p if its ID or Repository fields match repository, or
-// nil if neither matches. The platform sends spec.Repository as the Linear
-// project slug (e.g. "smoke-alpha"), which doesn't match the GitHub repo name
-// in p.Repository (e.g. ".../rensei-smokes-alpha"). Match by p.ID as well so
-// operators can express the link via the allowlist entry's id. (REN-NEW)
-func matchProject(p *ProjectConfig, repository string) *ProjectConfig {
-	if p.Repository == repository ||
-		p.ID == repository ||
-		strings.HasSuffix(repository, "/"+p.Repository) ||
-		strings.HasSuffix(p.Repository, "/"+repository) {
-		return p
-	}
-	return nil
-}
-
 func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*SessionHandle, error) {
 	reservationTransferred := false
 	defer func() {
@@ -1107,9 +1205,15 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// its cooperative SIGTERM window, so use Command and let the reaper own the
 	// TERM -> bounded grace -> KILL escalation explicitly.
 	ctx, cancel := context.WithCancel(context.Background())
+	// Per-seat resource budget: resolve once per spawn. The env caps ride
+	// every spawn path (Linux and macOS); the Linux cgroup wrap applies
+	// only under an enforced mode with a systemd placement. A disabled
+	// budget leaves command and env exactly as before.
+	seatBudget, seatBudgetOK := s.seatBudgetForSpawn()
+	command = applySeatBudgetToCmdForBus(command, spec.SessionID, seatBudget, seatBudgetOK, seatBudgetLaunchPlacement(), seatBudgetLaunchUserScope())
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
-	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, s.daemonOwnedEnv(spec, project))
+	cmd.Env = applySeatBudgetToEnv(s.sessionEnv(spec, project), seatBudget, seatBudgetOK)
 
 	// The daemon, rather than os/exec, owns these read ends. That lets a waiter
 	// observe direct-child exit without closing a pump mid-buffer, while still
@@ -1195,6 +1299,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		EndpointOperator: sessionDisplayAxis(spec.EndpointOperator),
 		Protocol:         sessionDisplayAxis(spec.Protocol),
 		WorkType:         spec.WorkType,
+		SeatBudget:       sessionSeatBudgetReport(seatBudget, seatBudgetOK, seatbudget.HostPlacement()),
 	}
 	// Publish the worktree path so GET /api/daemon/sessions is
 	// self-sufficient for a local reader (host-watch). The worker resolves
@@ -1810,7 +1915,33 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 			env[EnvDaemonControlURL] = url
 		}
 	}
+	// The per-session read credential travels beside the session id it
+	// names. It authorizes exactly one route — the detail GET for this
+	// session — and carries no operator privilege, so stating it here
+	// does not widen what the session can reach beyond its own detail.
+	if s.opts.SessionReadToken != nil && spec.SessionID != "" {
+		if tok, ok := s.opts.SessionReadToken(spec.SessionID); ok && tok != "" {
+			env[sessionReadTokenEnv] = tok
+		}
+	}
 	return env
+}
+
+// sessionEnv is the environment both spawn paths (direct and shim) hand a
+// worker, before OnPreSpawn: the daemon's filtered inherited environment,
+// then SpawnerOptions.BaseEnv, then the work item's SessionSpec.Env, then
+// daemonOwnedEnv.
+//
+// The work item's map loses the host-owned settings first
+// (runtimeenv.IsHostOwned). SessionSpec.Env is copied verbatim from the
+// orchestrator's work item and is applied after the daemon's own
+// environment, so without the filter a work item could override a host
+// setting for its own session — for example turn a host's
+// DONMAI_PI_CONFINEMENT=required into an unconfined pi seat. The host's
+// value comes from the daemon's inherited environment or BaseEnv, both of
+// which the host controls.
+func (s *WorkerSpawner) sessionEnv(spec SessionSpec, project *ProjectConfig) []string {
+	return composeEnv(s.opts.BaseEnv, runtimeenv.FilterHostOwnedMap(spec.Env), s.daemonOwnedEnv(spec, project))
 }
 
 // composeEnv flattens the merged env into the os.Environ() form expected by
@@ -1826,6 +1957,12 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 // leak runtime/env's blocklist exists to prevent, and one no value of item.Env
 // could reach before that variable existed.
 //
+// The same filter drops an entry whose key is not a valid variable name
+// (runtimeenv.ValidEnvKey): an entry is serialized as key+"="+value and the
+// process environment splits it at the first '=', so a key like
+// "DONMAI_CONTROL_TOKEN=x" or "DONMAI_PI_CONFINEMENT=" would set a variable
+// every by-name check had already refused.
+//
 // Filtering here rather than at the poll boundary keeps the rule where the
 // composition happens, and leaves exactly one author: OnPreSpawn, which runs
 // AFTER this function and is by definition the embedding daemon.
@@ -1837,6 +1974,13 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 // settings. None of them may reach a session. Both spawn paths (direct and
 // shim) build their env here, so the parent filter covers both; the shim's
 // own launch contract is appended by the shim launcher afterwards.
+//
+// The parent layer additionally drops the per-session read credential
+// (runtimeenv.SessionReadTokenEnv): the daemon states each session's own
+// credential explicitly in daemonOwnedEnv, so whatever the daemon process
+// inherited names no other session and must not ride along. The explicit
+// maps above are untouched — stripping there would remove the credential
+// the worker needs for its own detail read.
 func composeEnv(parts ...map[string]string) []string {
 	merged := map[string]string{}
 	for _, p := range parts {
@@ -1844,13 +1988,33 @@ func composeEnv(parts ...map[string]string) []string {
 			merged[k] = v
 		}
 	}
-	parent := runtimeenv.FilterRunnerOnly(os.Environ())
+	parent := filterSpawnerParentEnv(os.Environ())
 	out := make([]string, 0, len(parent))
 	out = append(out, parent...)
 	for k, v := range merged {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+// filterSpawnerParentEnv is the daemon spawn path's inherited-environment
+// filter: the runner-only controls plus the per-session read credential.
+// A stale read credential in the daemon's own environment names some other
+// session's detail read; it must not ride into a worker beside that
+// worker's own explicitly stated credential. Kept beside composeEnv (not
+// in runtime/env) because the explicit-map half of that composition must
+// keep stating the credential.
+func filterSpawnerParentEnv(entries []string) []string {
+	out := runtimeenv.FilterRunnerOnly(entries)
+	kept := out[:0]
+	prefix := runtimeenv.SessionReadTokenEnv + "="
+	for _, entry := range out {
+		if entry == runtimeenv.SessionReadTokenEnv || strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept
 }
 
 // PrefixWriterFunc adapts a function to PrefixedWriter.

@@ -236,6 +236,13 @@ type RefreshTokenResult struct {
 	// swaps credentials.
 	RegistrationTokenSwapped bool
 
+	// RegistrationTokenExpiresAt and RegistrationTokenRenewAfter mirror the
+	// refresh endpoint's optional registration-token lifetime hints, when the
+	// platform sends them. Empty means unknown — older platforms omit both
+	// fields and callers must not treat absence as expired.
+	RegistrationTokenExpiresAt  string
+	RegistrationTokenRenewAfter string
+
 	// Reason is the structured reason the refresh path was taken
 	// (e.g. "runtime-token-expired", "worker-not-found"). Surfaces in
 	// the [runtime-token] log line.
@@ -336,14 +343,16 @@ func RepresentRuntimeToken(
 		"reason", reason,
 	)
 	return r.rememberValidated(regOpts, &RefreshTokenResult{
-		Mode:                  "refresh",
-		WorkerID:              currentWorkerID,
-		RuntimeToken:          fresh.RuntimeToken,
-		RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
-		HeartbeatInterval:     fresh.HeartbeatInterval,
-		PollInterval:          fresh.PollInterval,
-		SessionShim:           cloneSessionShimCredentialReceipt(fresh.SessionShim),
-		Reason:                reason,
+		Mode:                        "refresh",
+		WorkerID:                    currentWorkerID,
+		RuntimeToken:                fresh.RuntimeToken,
+		RuntimeTokenExpiresAt:       fresh.RuntimeTokenExpiresAt,
+		HeartbeatInterval:           fresh.HeartbeatInterval,
+		PollInterval:                fresh.PollInterval,
+		SessionShim:                 cloneSessionShimCredentialReceipt(fresh.SessionShim),
+		RegistrationTokenExpiresAt:  fresh.RegistrationTokenExpiresAt,
+		RegistrationTokenRenewAfter: fresh.RegistrationTokenRenewAfter,
+		Reason:                      reason,
 	})
 }
 
@@ -402,14 +411,16 @@ func (r *runtimeTokenRefresher) refresh(
 				"reason", reason,
 			)
 			return r.rememberValidated(regOpts, &RefreshTokenResult{
-				Mode:                  "refresh",
-				WorkerID:              currentWorkerID,
-				RuntimeToken:          fresh.RuntimeToken,
-				RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
-				HeartbeatInterval:     fresh.HeartbeatInterval,
-				PollInterval:          fresh.PollInterval,
-				SessionShim:           cloneSessionShimCredentialReceipt(fresh.SessionShim),
-				Reason:                reason,
+				Mode:                        "refresh",
+				WorkerID:                    currentWorkerID,
+				RuntimeToken:                fresh.RuntimeToken,
+				RuntimeTokenExpiresAt:       fresh.RuntimeTokenExpiresAt,
+				HeartbeatInterval:           fresh.HeartbeatInterval,
+				PollInterval:                fresh.PollInterval,
+				SessionShim:                 cloneSessionShimCredentialReceipt(fresh.SessionShim),
+				RegistrationTokenExpiresAt:  fresh.RegistrationTokenExpiresAt,
+				RegistrationTokenRenewAfter: fresh.RegistrationTokenRenewAfter,
+				Reason:                      reason,
 			})
 		}
 		// 404 / 405 → the durable registration is gone, or the endpoint is
@@ -552,14 +563,16 @@ func (r *runtimeTokenRefresher) adoptCachedRegistration(
 		"detail", "another lane in this process holds a live registration; adopting it instead of minting a competing identity",
 	)
 	return &RefreshTokenResult{
-		Mode:                  "refresh",
-		WorkerID:              candidate,
-		RuntimeToken:          fresh.RuntimeToken,
-		RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
-		HeartbeatInterval:     fresh.HeartbeatInterval,
-		PollInterval:          fresh.PollInterval,
-		SessionShim:           cloneSessionShimCredentialReceipt(fresh.SessionShim),
-		Reason:                reason,
+		Mode:                        "refresh",
+		WorkerID:                    candidate,
+		RuntimeToken:                fresh.RuntimeToken,
+		RuntimeTokenExpiresAt:       fresh.RuntimeTokenExpiresAt,
+		HeartbeatInterval:           fresh.HeartbeatInterval,
+		PollInterval:                fresh.PollInterval,
+		SessionShim:                 cloneSessionShimCredentialReceipt(fresh.SessionShim),
+		RegistrationTokenExpiresAt:  fresh.RegistrationTokenExpiresAt,
+		RegistrationTokenRenewAfter: fresh.RegistrationTokenRenewAfter,
+		Reason:                      reason,
 	}
 }
 
@@ -626,11 +639,13 @@ func (e *refreshHTTPError) Error() string {
 // fields are honoured when present and ignored when absent (existing
 // services keep their current cadence).
 type refreshResponse struct {
-	RuntimeToken          string                        `json:"runtimeToken"`
-	RuntimeTokenExpiresAt string                        `json:"runtimeTokenExpiresAt,omitempty"`
-	HeartbeatInterval     int                           `json:"heartbeatInterval,omitempty"`
-	PollInterval          int                           `json:"pollInterval,omitempty"`
-	SessionShim           *SessionShimCredentialReceipt `json:"sessionShim,omitempty"`
+	RuntimeToken                string                        `json:"runtimeToken"`
+	RuntimeTokenExpiresAt       string                        `json:"runtimeTokenExpiresAt,omitempty"`
+	HeartbeatInterval           int                           `json:"heartbeatInterval,omitempty"`
+	PollInterval                int                           `json:"pollInterval,omitempty"`
+	SessionShim                 *SessionShimCredentialReceipt `json:"sessionShim,omitempty"`
+	RegistrationTokenExpiresAt  string                        `json:"registrationTokenExpiresAt,omitempty"`
+	RegistrationTokenRenewAfter string                        `json:"registrationTokenRenewAfter,omitempty"`
 }
 
 // callRefreshEndpoint posts to the platform's refresh probe with the

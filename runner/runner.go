@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -110,6 +111,35 @@ const (
 	// Options.IdleTimeout disables the watchdog.
 	DefaultIdleTimeout = 12 * time.Minute
 
+	// DefaultProviderStallTimeout is the suggested stalled-model-request
+	// window for a caller that opts in through
+	// [Options.ProviderStallTimeout]; the runner never applies it on its
+	// own. The window measures the silence after a tool result
+	// while NO tool call is in flight: a tool result the agent has not
+	// answered within the window means the model request that should
+	// follow may be stalled, not that a tool is slow. On expiry the
+	// runner stops the provider and surfaces the provider-stall signal
+	// so the caller can retry the turn through the provider-error path
+	// instead of ending the seat at the outer idle timeout. Three minutes
+	// sits between a slow model round trip and the twelve-minute outer
+	// backstop with margin for the bounded retries to complete before it.
+	//
+	// Zero (the default) DISABLES the detector: no harness emits an event
+	// while a response streams, so an event-silence window cannot tell a
+	// hung request from a healthy long generation or reasoning pass —
+	// arming it by default would abort healthy turns and regenerate them
+	// up to the retry bound. Callers opt in only where the reported
+	// stalled shape dominates. A NEGATIVE Options.ProviderStallTimeout
+	// also disables the detector entirely.
+	DefaultProviderStallTimeout = 3 * time.Minute
+
+	// DefaultProviderStallRetries bounds the stop-and-retry attempts a
+	// stalled model request gets before the seat fails, applied when
+	// [Options.ProviderStallRetries] is zero. It is deliberately small:
+	// a provider that stalls repeatedly is not recovering between
+	// attempts, and the outer idle timeout still owns the seat.
+	DefaultProviderStallRetries = 2
+
 	// terminalResultPostTimeout bounds the detached cleanup context used for
 	// terminal result delivery after the run context has expired or been
 	// cancelled. Posting remains ahead of worktree teardown.
@@ -194,6 +224,45 @@ type Options struct {
 	// NEGATIVE disables the watchdog entirely (caller relies solely on
 	// MaxSessionDuration / external ctx for liveness).
 	IdleTimeout time.Duration
+
+	// ProviderStallTimeout is the stalled-model-request window applied
+	// to the event stream. A resettable timer arms in consumeEvents
+	// after a tool result while no tool call is in flight and resets on
+	// every agent.Event; when it expires with no event in the window AND
+	// no tool call in flight the runner stops the provider and surfaces
+	// the provider-stall signal so the caller retries the turn through
+	// the provider-error path instead of ending the seat at the outer
+	// idle timeout — a hung model request after a tool result must not
+	// reach the twelve-minute backstop. A tool call in flight suppresses
+	// it (the tool's own bounded timeout owns that call), and so does
+	// any stretch with no tool result yet: the timer only starts once a
+	// tool result has been observed, so a healthy long generation or
+	// reasoning pass before the first tool call never trips it.
+	//
+	// Zero (the default) disables the detector entirely: no harness
+	// emits an event while a response streams, so an event-silence
+	// window cannot tell a hung post-tool request from a healthy long
+	// generation. A POSITIVE value opts in explicitly with the window
+	// to apply. NEGATIVE also disables the detector (caller relies
+	// solely on the idle watchdog for liveness).
+	//
+	// Known limits when opted in, measured against the pi, codex and
+	// claude event mappings: a healthy response after a tool result that
+	// emits no event until it completes (a large file written in one
+	// tool call, or an answer with no thinking block first) is aborted
+	// and regenerated; pi reports the previous model call's usage after
+	// its tool results, which disarms the window before the next request
+	// is sent, so the detector never fires on pi; and a resumed turn
+	// opens with the retry prompt rather than a tool result, so a retried
+	// request that hangs before any tool result ends at the idle watchdog.
+	ProviderStallTimeout time.Duration
+
+	// ProviderStallRetries bounds the stop-and-retry attempts a stalled
+	// model request gets before the seat fails as FailureProviderError.
+	// Zero uses DefaultProviderStallRetries; negative disables the
+	// retries (a stall then behaves exactly like the idle watchdog
+	// cut-off it replaces).
+	ProviderStallRetries int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
 	// failed Run for debugging. Defaults to true in v0.5.0 per F.1.1
@@ -350,6 +419,39 @@ type Options struct {
 	// Empty uses a "rescue" directory beside the worktree parent. When the
 	// archive cannot be written the workarea is kept instead.
 	RescueDir string
+
+	// DepsExecer runs the post-acquire repository dependency install
+	// step (loop.go step 2b-bis). Nil uses the same local in-box shell
+	// executor as kit provisioning. Tests substitute a fake to assert
+	// the install command, working directory and order without
+	// running real installs.
+	DepsExecer DepsExecer
+
+	// DepsInstallTimeout bounds the whole dependency install step.
+	// Zero uses DefaultDepsInstallTimeout; negative disables the
+	// step-side timeout (the caller owns ctx expiry).
+	DepsInstallTimeout time.Duration
+
+	// QuotaReporterForSession builds the per-session quota reporter
+	// that forwards the sparse quota updates the session's harness
+	// stream carries to the admitting daemon. The runner calls it
+	// once per Run with the session id and the resolved harness
+	// name ("codex" or "claude"); nil disables quota reporting
+	// and leaves every event stream untouched.
+	QuotaReporterForSession func(sessionID, harness string) *QuotaReporter
+
+	// ShimSeat marks this Runner as the worker of a seat launched under
+	// per-session shim ownership. When non-nil the runner persists every
+	// terminal status body in the lease-independent terminal-status
+	// outbox BEFORE the first send — completed, failed, or cancelled,
+	// whether or not a terminal workarea lease was acquired — so a runner
+	// killed after persist but before send has its exact bytes replayed
+	// once by the daemon. Nil (the default) preserves the historical
+	// behaviour: only the lease-bound completed path persists a replayable
+	// body. The production `agent run` command sets this from the shim
+	// launch contract in its own environment; the library itself stays
+	// env-free.
+	ShimSeat *ShimSeatConfig
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -369,6 +471,24 @@ type KitSkillDetector func(repoRoot, targetOS string) ([]kit.KitSkillSource, err
 // the cloned worktree path for workType-filtered injection. Implemented
 // by KitRegistry.PromptFragmentSourcesForRepo.
 type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error)
+
+// ShimSeatConfig identifies one shim-owned seat to the runner: the attempt
+// is the launch contract's monotonic per-session incarnation counter, and it
+// disambiguates repeated runs of the same session in the standalone outbox
+// key. Zero is a valid first attempt; the zero value of the POINTER (nil)
+// is what disables the behaviour.
+type ShimSeatConfig struct {
+	// Attempt is the per-session incarnation counter from the shim launch
+	// contract (sessionshim Launch.ProcessEpoch).
+	Attempt uint64
+}
+
+// DepsExecer runs repository dependency install commands against
+// the acquired worktree. It mirrors kit.Execer so the dependency
+// install step reuses the same local in-box shell execution as kit
+// provisioning. Production code leaves Options.DepsExecer nil and
+// gets shellExecer; tests substitute a fake.
+type DepsExecer = kit.Execer
 
 // Runner is the long-lived per-daemon orchestrator. Build one via
 // [New] at daemon startup and call [Runner.Run] for every claimed
@@ -392,6 +512,8 @@ type Runner struct {
 	now                           func() time.Time
 	maxDuration                   time.Duration
 	idleTimeout                   time.Duration
+	providerStallTimeout          time.Duration
+	providerStallRetries          int
 	preserveOnFail                bool
 	preserveAlways                bool
 	skipBackstop                  bool
@@ -417,6 +539,10 @@ type Runner struct {
 
 	// rescueDir is Options.RescueDir (see rescueRoot for the default).
 	rescueDir string
+	// depsExecer is Options.DepsExecer.
+	depsExecer DepsExecer
+	// depsInstallTimeout is Options.DepsInstallTimeout.
+	depsInstallTimeout time.Duration
 	// turnContinuationLimit is Options.TurnContinuationLimit.
 	turnContinuationLimit int
 	// turnContinuationCeiling is Options.TurnContinuationCeiling.
@@ -450,6 +576,21 @@ type Runner struct {
 	// manual clock so watchdog expiry is tripped explicitly instead of by
 	// sleeping past a wall-clock window. See Runner.idleTimer.
 	idleClock interviewClock
+
+	// quotaReporterForSession builds the per-session quota reporter
+	// (see Options.QuotaReporterForSession). Nil disables reporting.
+	quotaReporterForSession func(sessionID, harness string) *QuotaReporter
+	// quotaReporters holds the live per-session reporters, keyed by
+	// session id. A reporter is registered once per Run and released
+	// when the run ends, so the consecutive-update dedup sees every
+	// loop of the session (main stream, tails, interactive drain).
+	quotaReportersMu sync.Mutex
+	quotaReporters   map[string]*QuotaReporter
+
+	// shimSeat is Options.ShimSeat (see its doc comment). Nil disables
+	// the standalone outbox persist; non-nil persists every terminal
+	// status body before the first send.
+	shimSeat *ShimSeatConfig
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -497,6 +638,8 @@ func New(opts Options) (*Runner, error) {
 		now:                              opts.Now,
 		maxDuration:                      opts.MaxSessionDuration,
 		idleTimeout:                      opts.IdleTimeout,
+		providerStallTimeout:             opts.ProviderStallTimeout,
+		providerStallRetries:             opts.ProviderStallRetries,
 		preserveOnFail:                   opts.PreserveWorktreeOnFailure,
 		preserveAlways:                   opts.PreserveWorktreeAlways,
 		skipBackstop:                     opts.SkipBackstop,
@@ -519,9 +662,14 @@ func New(opts Options) (*Runner, error) {
 		protectedRuntimeMCPV2Selector:    selectionPolicy.v2,
 		selectionPolicy:                  selectionPolicy,
 		rescueDir:                        opts.RescueDir,
+		depsExecer:                       opts.DepsExecer,
+		depsInstallTimeout:               opts.DepsInstallTimeout,
 		turnContinuationLimit:            opts.TurnContinuationLimit,
 		turnContinuationCeiling:          opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
+		quotaReporterForSession:          opts.QuotaReporterForSession,
+		quotaReporters:                   map[string]*QuotaReporter{},
+		shimSeat:                         opts.ShimSeat,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
@@ -549,6 +697,16 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.idleTimeout == 0 {
 		r.idleTimeout = DefaultIdleTimeout
+	}
+	if r.providerStallTimeout < 0 {
+		// Negative opts out explicitly; zero (unset) keeps the
+		// detector disabled until a caller opts in with a positive
+		// window. Normalize both to the same disarmed value so
+		// consumeEvents reads one condition.
+		r.providerStallTimeout = 0
+	}
+	if r.providerStallRetries == 0 {
+		r.providerStallRetries = DefaultProviderStallRetries
 	}
 	return r, nil
 }
@@ -625,6 +783,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// Drive the loop. loop.go owns the step sequence; the helpers
 	// here own the result envelope + post-Run teardown.
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
+	r.checkpointProviderError(qw, res)
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
 	// Never delete work that exists nowhere else. An interactive session has
 	// its own publication check below, which retains an unpublished workarea.
@@ -722,16 +881,72 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		}
 	}
 
+	// A shim-owned seat persists every terminal status body in the
+	// lease-independent outbox BEFORE the first send — completed, failed, or
+	// cancelled, whether or not a terminal workarea lease was acquired. The
+	// daemon replayer drains exactly these leaseless records, so a runner
+	// killed after this persist but before the send below has its exact
+	// bytes replayed once. A persist failure never changes the seat's
+	// outcome: the send below remains authoritative, and a successful send
+	// needs no replay. The failure is logged so a seat that persistently
+	// cannot persist is visible, but the seat reports what the work did —
+	// unlike the lease path, where a missing hold means the successful
+	// workarea cannot be proved retained and the seat must fail.
+	standalonePrepared := false
+	if r.shimSeat != nil && res.Status != "" {
+		standaloneBody := preparedStatusBody
+		if !leasePrepared {
+			var bodyErr error
+			standaloneBody, bodyErr = r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+			if bodyErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", bodyErr)
+				standaloneBody = nil
+			}
+		}
+		if standaloneBody != nil {
+			standaloneDigest, identityErr := stableTerminalResultID(qw.SessionID, res.Result)
+			if identityErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", identityErr)
+			} else if registerErr := r.wt.RegisterTerminalReceiver(r.poster.ReceiverKey(), r.poster.TerminalStatusEndpoint(qw.SessionID)); registerErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", registerErr)
+			} else if _, saveErr := r.wt.SaveStandaloneTerminalOutbox(context.Background(), workarea.StandaloneOutboxSaveSpec{
+				SessionID: qw.SessionID, Attempt: r.shimSeat.Attempt, TerminalResultID: standaloneDigest,
+				ReceiverKey: r.poster.ReceiverKey(), Body: standaloneBody,
+				DeadlineAt: r.now().Add(workarea.MaximumLeaseDuration).UTC().Truncate(time.Millisecond),
+				Kind:       workarea.StandaloneOutboxTerminal,
+			}); saveErr != nil {
+				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+					"sessionId", qw.SessionID, "err", saveErr)
+			} else {
+				standalonePrepared = true
+				// The standalone body is the exact bytes the send below
+				// transmits: when a lease already prepared the same body,
+				// reuse it; otherwise send the bytes just persisted so
+				// persist and first send can never disagree.
+				preparedStatusBody = standaloneBody
+			}
+		}
+	}
+
 	// Terminal delivery must outlive run cancellation but remain bounded, including
 	// prepared leased statuses whose immutable outbox body may need replay.
 	postCtx, postCancel := terminalResultPostContext(runCtx)
 	var postOutcome result.PostOutcome
-	if leasePrepared {
+	if leasePrepared || standalonePrepared {
 		postOutcome = r.poster.PostPreparedOutcome(postCtx, qw.SessionID, res.Result, preparedStatusBody)
 	} else {
 		postOutcome = r.poster.PostWithOptionsOutcome(postCtx, qw.SessionID, res.Result, result.PostOptions{})
 	}
 	postCancel()
+	if standalonePrepared && postOutcome.StatusObserved() {
+		if observeErr := r.wt.MarkStandaloneTerminalOutboxDelivered(context.Background(), qw.SessionID, r.shimSeat.Attempt); observeErr != nil {
+			r.logger.Warn("terminal status delivery persistence failed; restart replay remains armed",
+				"sessionId", qw.SessionID, "err", observeErr)
+		}
+	}
 	if leasePrepared && postOutcome.StatusObserved() {
 		if _, observeErr := r.wt.MarkTerminalStatusDelivered(context.Background(), leaseProjection.LeaseID, qw.SessionID, terminalResultID, leaseProjection.WorkareaID); observeErr != nil {
 			r.logger.Warn("terminal status delivery persistence failed; restart replay remains armed",

@@ -191,7 +191,7 @@ func resolveKitSourcePaths(cloneDir, requestedPath, kitID, version string) (stri
 		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", "", fmt.Errorf("%w: inspect package descriptor: %v", ErrKitInstallManifestNotFound, err)
 		}
-		manifest, err := loadKitManifestFile(resolved)
+		manifest, err := loadKitManifestFileStrict(resolved)
 		if err != nil || manifest.Kit.ID != kitID || (version != "" && manifest.Kit.Version != version) {
 			return "", "", fmt.Errorf("%w: explicit legacy manifest identity does not match request", ErrKitInstallManifestNotFound)
 		}
@@ -254,7 +254,16 @@ func resolveKitSourcePaths(cloneDir, requestedPath, kitID, version string) (stri
 			return nil
 		}
 		manifest, err := loadKitManifestFile(name)
-		if err == nil && manifest.Kit.ID == kitID && (version == "" || manifest.Kit.Version == version) {
+		if err != nil {
+			return nil
+		}
+		if err := validateManifestAPIRevision(manifest); err != nil {
+			return nil
+		}
+		if _, err := dependencyStoreViews(manifest); err != nil {
+			return nil
+		}
+		if manifest.Kit.ID == kitID && (version == "" || manifest.Kit.Version == version) {
 			legacy = append(legacy, name)
 		}
 		return nil

@@ -6,12 +6,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func newLiveConfiner(t *testing.T, backend Backend, extra ExtraRules) (*Confiner, string) {
@@ -87,7 +94,7 @@ func TestSeatbelt_SelfTestRedWithoutBackend(t *testing.T) {
 			refused[probe.Class]++
 		}
 	}
-	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening} {
+	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening, classReadScope, classDaemonPrivate} {
 		if refused[class] == 0 {
 			t.Errorf("no %s probe ran", class)
 		}
@@ -176,7 +183,18 @@ func runConfined(t *testing.T, plan *Plan, dir string, env []string, argv ...str
 // runProbeSteps runs probe steps inside the plan and returns their results.
 func runProbeSteps(t *testing.T, plan *Plan, w specWorld, steps ...probeStep) map[string]stepResult {
 	t.Helper()
-	planPath := filepath.Join(w.base, "plan-"+randomSuffix()+".json")
+	return runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runConfined(t, plan, w.mut, env, argv...)
+	}, steps...)
+}
+
+// runProbeStepsVia runs probe steps through run, which starts the probe
+// executable under whatever profile the caller chose, and returns their
+// results.
+func runProbeStepsVia(t *testing.T, w specWorld, run func(env []string, argv []string) (int, string), steps ...probeStep) map[string]stepResult {
+	t.Helper()
+	// The plan sits in the session tmp: readable under a read scope.
+	planPath := filepath.Join(w.tmp, "plan-"+randomSuffix()+".json")
 	raw, err := json.Marshal(probePlan{ResultPath: probeResultPath(w.tmp), Steps: steps})
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +202,7 @@ func runProbeSteps(t *testing.T, plan *Plan, w specWorld, steps ...probeStep) ma
 	if err := os.WriteFile(planPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if code, out := runConfined(t, plan, w.mut, []string{ProbeEnv + "=" + planPath}, probeCommand(t)...); code != 0 {
+	if code, out := run([]string{ProbeEnv + "=" + planPath}, probeCommand(t)); code != 0 {
 		t.Fatalf("probe exit %d: %s", code, out)
 	}
 	raw, err = os.ReadFile(probeResultPath(w.tmp))
@@ -372,5 +390,879 @@ func TestSeatbelt_ToolsWorkInsideTheSet(t *testing.T) {
 	}
 	if code, _ := runConfined(t, plan, w.mut, nil, "/usr/bin/touch", filepath.Join(w.home, "planted")); code == 0 || exists(filepath.Join(w.home, "planted")) {
 		t.Fatal("the confined shell wrote the operator home")
+	}
+}
+
+// TestSeatbelt_LoopbackTCPDeclaredPortsOnly is the live proof for the
+// loopback deny: listeners answer on an undeclared loopback port over the
+// numeric IPv4 and IPv6 loopbacks, the confined connects to each fail, and
+// the connects to a declared port succeed — including through the hostname,
+// which may resolve to either family.
+func TestSeatbelt_LoopbackTCPDeclaredPortsOnly(t *testing.T) {
+	openPort := freeLoopbackPort(t)
+	closedPort := freeLoopbackPort(t)
+	if openPort == closedPort {
+		t.Skip("could not allocate two distinct loopback ports")
+	}
+	openListener := startLoopbackListener(t, openPort)
+	defer func() { _ = openListener.Process.Kill(); _ = openListener.Wait() }()
+	closedListener := startLoopbackListener(t, closedPort)
+	defer func() { _ = closedListener.Process.Kill(); _ = closedListener.Wait() }()
+	waitLoopbackListener(t, closedPort)
+	// The IPv6 listeners answer on the same two ports, one declared and
+	// one not, so the test judges address family rather than port number.
+	open6, closed6 := startLoopbackListener6(t, openPort), startLoopbackListener6(t, closedPort)
+	defer closeListener6(open6)
+	defer closeListener6(closed6)
+
+	w, c := liveWorld(t)
+	spec := w.spec()
+	spec.LoopbackTCPPorts = []int{openPort}
+	plan, err := c.prepare(spec, "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	for _, target := range []struct{ host, port string }{
+		{"127.0.0.1", itoaPort(openPort)},
+		{"::1", itoaPort(openPort)},
+	} {
+		if code, out := runConfined(t, plan, w.mut, nil, "/usr/bin/nc", "-z", "-w", "2", target.host, target.port); code != 0 {
+			t.Fatalf("confined nc to declared %s port %s failed: exit %d: %s", target.host, target.port, code, out)
+		}
+	}
+	for _, target := range []struct{ host, port string }{
+		{"127.0.0.1", itoaPort(closedPort)},
+		{"::1", itoaPort(closedPort)},
+		{"localhost", itoaPort(closedPort)},
+	} {
+		if code, out := runConfined(t, plan, w.mut, nil, "/usr/bin/nc", "-z", "-w", "2", target.host, target.port); code == 0 {
+			t.Fatalf("confined nc to undeclared %s port %s succeeded: %s", target.host, target.port, out)
+		}
+	}
+}
+
+// TestSeatbelt_LoopbackTCPRedWithoutDeny is the discriminating control: the
+// same two nc connects with the loopback deny stripped from the rendered
+// profile both succeed, so the test above pins the deny and nothing else.
+func TestSeatbelt_LoopbackTCPRedWithoutDeny(t *testing.T) {
+	openPort := freeLoopbackPort(t)
+	closedPort := freeLoopbackPort(t)
+	if openPort == closedPort {
+		t.Skip("could not allocate two distinct loopback ports")
+	}
+	openListener := startLoopbackListener(t, openPort)
+	defer func() { _ = openListener.Process.Kill(); _ = openListener.Wait() }()
+	closedListener := startLoopbackListener(t, closedPort)
+	defer func() { _ = closedListener.Process.Kill(); _ = closedListener.Wait() }()
+	waitLoopbackListener(t, closedPort)
+
+	w, c := liveWorld(t)
+	plan, err := c.prepare(w.spec(), "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	runRed := func(args ...string) int {
+		code, _ := runStripped(t, plan, w.mut, loopbackTCPDeny+"\n", args...)
+		return code
+	}
+	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(openPort)); code != 0 {
+		t.Fatalf("nc to port %d without the deny failed: exit %d", openPort, code)
+	}
+	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(closedPort)); code != 0 {
+		t.Fatalf("nc to port %d without the deny failed: exit %d; the red control does not discriminate", closedPort, code)
+	}
+}
+
+// runStripped runs argv under the plan's rendered profile with one rule
+// removed, through the same launcher and environment: the red control that
+// shows the removed rule, and nothing else, is what holds. It fails the test
+// when the profile does not hold the rule.
+func runStripped(t *testing.T, plan *Plan, dir, remove string, argv ...string) (int, string) {
+	t.Helper()
+	return runRewritten(t, plan, dir, nil, remove, "", argv...)
+}
+
+// runRewritten runs argv under the plan's rendered profile with one piece of
+// it replaced, which is how a red control reverts one rule: the old text,
+// and only it, becomes the new. It fails the test when the profile does not
+// hold the old text.
+func runRewritten(t *testing.T, plan *Plan, dir string, env []string, old, replacement string, argv ...string) (int, string) {
+	t.Helper()
+	wrapped, err := plan.Command([]string{"/usr/bin/true"})
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	// The wrapped argv is sandbox-exec -f <profile> -- <binary>.
+	var profilePath string
+	for i, arg := range wrapped {
+		if arg == "-f" && i+1 < len(wrapped) {
+			profilePath = wrapped[i+1]
+		}
+	}
+	if profilePath == "" {
+		t.Fatal("wrapped command names no profile file")
+	}
+	raw, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten := strings.ReplaceAll(string(raw), old, replacement)
+	if rewritten == string(raw) {
+		t.Fatalf("rendered profile holds no %q to rewrite", old)
+	}
+	redPath := profilePath + ".red"
+	if err := os.WriteFile(redPath, []byte(rewritten), 0o600); err != nil { //nolint:gosec // G703: the profile path comes from the plan under test.
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(redPath) }()
+	full := []string{sandboxExec, "-f", redPath, "--"}
+	full = append(full, argv...)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, full[0], full[1:]...) //nolint:gosec // G204: the confined argv under test.
+	cmd.Dir = dir
+	cmd.Env = overlayEnv(os.Environ(), append(plan.Environment(), env...))
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), string(out)
+	}
+	if err != nil {
+		t.Fatalf("run %v: %v", argv, err)
+	}
+	return 0, string(out)
+}
+
+func itoaPort(port int) string {
+	return strconv.Itoa(port)
+}
+
+// freeLoopbackPort returns a currently free loopback TCP port: bind port
+// zero, read the assigned port, close, and hand it to nc. The nc listener
+// rebinds it immediately; a collision fails the test loudly instead of
+// passing quietly.
+func freeLoopbackPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("no loopback listener: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	return port
+}
+
+// startLoopbackListener starts an nc listener on a loopback port. The -k
+// flag keeps it answering across the readiness probe and both connects.
+func startLoopbackListener(t *testing.T, port int) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("/usr/bin/nc", "-l", "-k", "127.0.0.1", itoaPort(port)) //nolint:gosec // G204: fixed test tool, allocated port.
+	if err := cmd.Start(); err != nil {
+		t.Skipf("nc listener on %d: %v", port, err)
+	}
+	return cmd
+}
+
+// startLoopbackListener6 listens on the IPv6 loopback in-process: the
+// stock listener tool binds IPv4 only, so the IPv6 half cannot use it.
+// It returns nil where IPv6 loopback is unavailable; the caller skips
+// the IPv6 cases rather than passing without judging them.
+func startLoopbackListener6(t *testing.T, port int) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", net.JoinHostPort("::1", itoaPort(port)))
+	if err != nil {
+		t.Skipf("no IPv6 loopback listener: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("::1", itoaPort(port)), time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return listener
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = listener.Close()
+	t.Fatalf("IPv6 loopback listener on %d never answered", port)
+	return nil
+}
+
+func closeListener6(listener net.Listener) {
+	if listener != nil {
+		_ = listener.Close()
+	}
+}
+
+// waitLoopbackListener waits until a loopback port accepts, so the confined
+// connects race nothing.
+func waitLoopbackListener(t *testing.T, port int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+itoaPort(port), time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("nc listener on %d never answered", port)
+}
+
+// TestSeatbelt_PasteboardClosed is the live proof for the pasteboard deny:
+// the confined lookup of each pasteboard service fails while the positive
+// control still resolves, and a confined pbcopy write fails.
+func TestSeatbelt_PasteboardClosed(t *testing.T) {
+	w, c := liveWorld(t)
+	plan, err := c.prepare(w.spec(), "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	pasteboardServices := []string{
+		"com.apple.pasteboard.1",
+		"com.apple.coreservices.uauseractivitypasteboardclient.xpc",
+	}
+	results := runProbeSteps(t, plan, w,
+		probeStep{ID: "pasteboard", Op: opLookup, Services: pasteboardServices},
+		probeStep{ID: "control", Op: opLookup, Services: []string{lookupControlService}},
+	)
+	for _, service := range pasteboardServices {
+		if code, ok := results["pasteboard"].Lookups[service]; !ok || code == 0 {
+			t.Errorf("confined lookup of the pasteboard service %s succeeded: %+v", service, results["pasteboard"].Lookups)
+		}
+	}
+	if code, ok := results["control"].Lookups[lookupControlService]; !ok || code != 0 {
+		t.Errorf("positive control lookup failed under the profile: %+v", results["control"].Lookups)
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/sh", "-c", "echo probe | /usr/bin/pbcopy -pboard probe-test-board"); code == 0 {
+		t.Errorf("confined pbcopy succeeded: %s", out)
+	}
+}
+
+// TestSeatbelt_SelfTestCachedAcrossProcesses: a passing self-test is kept
+// under the host state home, and a later process on the same host — a new
+// confiner with the same backend, probe and harness executables and host
+// directories — reuses it in well under a second instead of probing again,
+// with the same record.
+func TestSeatbelt_SelfTestCachedAcrossProcesses(t *testing.T) {
+	home, stateHome, profileDir := hostDirs(t)
+	newConfiner := func() *Confiner {
+		c, err := New(Options{Backend: DefaultBackend(), ProfileDir: profileDir, Home: home, StateHome: stateHome, ExecutableDigest: "sha256:test"})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return c
+	}
+	opts := SelfTestOptions{ProbeCommand: probeCommand(t), ScratchDir: shortTempDir(t, "dcs"), CacheDir: filepath.Join(stateHome, "selftest-cache")}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	start := time.Now()
+	first, err := newConfiner().SelfTest(ctx, opts)
+	if err != nil {
+		t.Fatalf("first SelfTest: %v\n%s", err, failureIDs(first))
+	}
+	cold := time.Since(start)
+	start = time.Now()
+	again := newConfiner()
+	second, err := again.SelfTest(ctx, opts)
+	warm := time.Since(start)
+	if err != nil {
+		t.Fatalf("second SelfTest: %v", err)
+	}
+	if second.Digest != first.Digest {
+		t.Fatalf("the second process probed again: record %s, want the cached %s", second.Digest, first.Digest)
+	}
+	if warm >= time.Second {
+		t.Fatalf("the cached self-test took %s, want under 1s", warm)
+	}
+	if _, err := again.Prepare(Spec{SessionMode: agent.PromptModeAutonomous}); err != nil {
+		if reason, _ := ReasonOf(err); reason == ReasonSelfTestFailed || reason == ReasonSelfTestStale {
+			t.Fatalf("Prepare refused a cached passing self-test: %v", err)
+		}
+	}
+	t.Logf("self-test: %s probing, %s from the cache", cold.Round(time.Millisecond), warm.Round(time.Millisecond))
+}
+
+// openReadsBackend is the real macOS backend rendering every session with
+// reads open: the read-scope rules, and only they, are missing.
+type openReadsBackend struct{ *seatbeltBackend }
+
+func (b openReadsBackend) Apply(req ApplyRequest) (Applied, error) {
+	open := *req.Resolved
+	open.ReadScope, open.ReadPaths = "", nil
+	req.Resolved = &open
+	return b.seatbeltBackend.Apply(req)
+}
+
+// TestSeatbelt_SelfTestRedWithOpenReads is the read scope's discriminating
+// control: with the read rules dropped from an otherwise real profile, every
+// read-scope refusal turns red in both session modes, and nothing else does.
+// The daemon-private probes are not read-scope probes: their denies render
+// in every read scope, so they must still hold with reads open.
+func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
+	c, _ := newLiveConfiner(t, openReadsBackend{&seatbeltBackend{exe: sandboxExec}}, nil)
+	record, err := runSelfTest(t, c)
+	if reason, _ := ReasonOf(err); reason != ReasonSelfTestFailed {
+		t.Fatalf("SelfTest with open reads: err=%v, want self_test_failed", err)
+	}
+	if record.Passed {
+		t.Fatal("the self-test passed with the read rules dropped")
+	}
+	readRefusals, daemonHeld := 0, 0
+	for _, probe := range record.Probes {
+		switch {
+		case probe.Class == classReadScope && probe.Pass:
+			t.Errorf("%s/%s passed with open reads; the probe does not discriminate the read scope", probe.Mode, probe.ID)
+		case probe.Class != classReadScope && !probe.Pass:
+			t.Errorf("%s/%s failed although only the read rules are missing: %s", probe.Mode, probe.ID, probe.Detail)
+		}
+		if probe.Class == classReadScope {
+			readRefusals++
+		}
+		if probe.Class == classDaemonPrivate && probe.Pass {
+			daemonHeld++
+		}
+	}
+	if readRefusals == 0 {
+		t.Fatal("no read-scope probe ran")
+	}
+	if daemonHeld == 0 {
+		t.Fatal("no daemon-private probe held with reads open")
+	}
+}
+
+// readScopedWorld is a live session under the workarea read scope.
+func readScopedWorld(t *testing.T, readPaths ...string) (specWorld, *Plan) {
+	t.Helper()
+	w, c := liveWorld(t)
+	spec := w.spec()
+	spec.ReadScope = agent.FileReadWorkarea
+	spec.ReadPaths = readPaths
+	plan, err := c.prepare(spec, "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	t.Cleanup(func() { _ = plan.Release() })
+	return w, plan
+}
+
+// TestSeatbelt_ComposerReadDenyHoldsInsideTheWorkareaAllowlist is the live
+// proof that a composer read deny on a path inside the workarea allowlist
+// holds under the workarea read scope: the profile judges a rule naming an
+// operation ahead of a wildcard rule whatever their order, so a wildcard
+// deny would lose to the session allowlist's file-read-data allow. A denied
+// file nested inside the writable set refuses a read, an open, its
+// metadata and its extended attribute; a read beside it still succeeds.
+// The red control rewrites the named deny back to the wildcard and shows
+// the content and attribute reads then succeed (metadata stays refused:
+// the wildcard still names it, which is why the deny names every
+// operation), so the test discriminates the operation list, not the
+// fixture.
+func TestSeatbelt_ComposerReadDenyHoldsInsideTheWorkareaAllowlist(t *testing.T) {
+	w, _ := liveWorld(t)
+	deniedDir := filepath.Join(w.mut, "denied")
+	if err := os.MkdirAll(deniedDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	deniedFile := filepath.Join(deniedDir, "secret")
+	if err := os.WriteFile(deniedFile, []byte("denied\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(deniedFile, readXattrName, []byte("denied attribute"), 0); err != nil {
+		t.Fatalf("Setxattr: %v", err)
+	}
+	besideFile := filepath.Join(w.mut, "beside")
+	if err := os.WriteFile(besideFile, []byte("beside\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Unconfined control: the denied file reads, so a refusal below means
+	// the boundary.
+	if raw, err := os.ReadFile(deniedFile); err != nil || string(raw) != "denied\n" {
+		t.Fatalf("unconfined control: the denied file does not read: %v", err)
+	}
+	c, err := New(Options{Backend: DefaultBackend(), ProfileDir: w.profileDir, Home: w.home, StateHome: w.stateHome, ExtraRules: func(RuleContext) []Rule {
+		return []Rule{{Kind: RuleDenyRead, Path: deniedFile, Scope: ScopeLiteral}}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := w.spec()
+	spec.ReadScope = agent.FileReadWorkarea
+	plan, err := c.prepare(spec, "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", deniedFile); code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Errorf("confined cat of the denied file: exit %d: %q; want a refusal", code, out)
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", besideFile); code != 0 {
+		t.Errorf("confined cat beside the deny: exit %d: %q; the deny must not reach past its path", code, out)
+	}
+	results := runProbeSteps(t, plan, w,
+		probeStep{ID: "denied-read", Op: opRead, Path: deniedFile},
+		probeStep{ID: "denied-open", Op: opOpen, Path: deniedFile},
+		probeStep{ID: "denied-stat", Op: opStat, Path: deniedFile},
+		probeStep{ID: "denied-xattr", Op: opGetxattr, Path: deniedFile, Label: readXattrName},
+		probeStep{ID: "beside-read", Op: opRead, Path: besideFile},
+	)
+	for _, id := range []string{"denied-read", "denied-open", "denied-stat", "denied-xattr"} {
+		if result, ok := results[id]; !ok || !refused(result) {
+			t.Errorf("confined probe %s: %+v; want a refusal", id, result)
+		}
+	}
+	if result, ok := results["beside-read"]; !ok || result.Err != "" {
+		t.Errorf("confined probe beside-read: %+v; want it served", result)
+	}
+	if raw, err := os.ReadFile(deniedFile); err != nil || string(raw) != "denied\n" {
+		t.Errorf("the denied file changed despite the deny: %q, err %v", raw, err)
+	}
+
+	red := runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runRewritten(t, plan, w.mut, env,
+			"(deny "+seatbeltComposerReadOps+" (literal "+"\""+deniedFile+"\""+"))\n",
+			"(deny file-read* (literal "+"\""+deniedFile+"\""+"))\n", argv...)
+	},
+		probeStep{ID: "denied-read", Op: opRead, Path: deniedFile},
+		probeStep{ID: "denied-xattr", Op: opGetxattr, Path: deniedFile, Label: readXattrName},
+	)
+	for _, id := range []string{"denied-read", "denied-xattr"} {
+		if red[id].Err != "" {
+			t.Errorf("with the wildcard deny, %s still refused: %q; the test does not discriminate", id, red[id].Err)
+		}
+	}
+}
+
+// TestSeatbelt_ReadScopeFindIsFastAndBlind is the whole-disk search under
+// the workarea read scope: find over the root to depth six finishes in
+// under five seconds and never reports a sentinel in the operator's home,
+// and find over the home is refused at the top instead of walking it. The
+// same search with the blanket read deny stripped finds the sentinel.
+func TestSeatbelt_ReadScopeFindIsFastAndBlind(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	if home, err = filepath.EvalSymlinks(home); err != nil {
+		t.Fatal(err)
+	}
+	name := ".donmai-read-scope-sentinel-" + randomSuffix()
+	sentinel := filepath.Join(home, name)
+	if err := os.WriteFile(sentinel, []byte("sentinel\n"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(sentinel) })
+	out, err := exec.Command("/usr/bin/find", home, "-maxdepth", "1", "-name", name).Output() //nolint:gosec // G204: fixed tool, test paths.
+	if err != nil || !strings.Contains(string(out), sentinel) {
+		t.Fatalf("unconfined control: find over the home did not report the sentinel (err %v): %q", err, out)
+	}
+
+	w, plan := readScopedWorld(t)
+	start := time.Now()
+	_, out2 := runConfined(t, plan, w.mut, nil, "/usr/bin/find", "/", "-maxdepth", "6", "-name", name)
+	elapsed := time.Since(start)
+	if strings.Contains(out2, sentinel) {
+		t.Errorf("confined find over the root reported the sentinel in the home")
+	}
+	if elapsed >= 5*time.Second {
+		t.Errorf("confined find over the root to depth 6 took %s, want under 5s", elapsed)
+	}
+	t.Logf("confined find / -maxdepth 6: %s", elapsed.Round(time.Millisecond))
+
+	start = time.Now()
+	_, out2 = runConfined(t, plan, w.mut, nil, "/usr/bin/find", home, "-maxdepth", "4", "-name", name)
+	if strings.Contains(out2, sentinel) {
+		t.Error("confined find over the home reported the sentinel")
+	}
+	if !strings.Contains(out2, "Operation not permitted") {
+		t.Errorf("confined find over the home was not refused at the top: %q", out2)
+	}
+	t.Logf("confined find <home> -maxdepth 4: %s", time.Since(start).Round(time.Millisecond))
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/ls", home); code == 0 {
+		t.Errorf("confined ls of the home succeeded: %q", out)
+	}
+	if code, _ := runConfined(t, plan, w.mut, nil, "/bin/cat", sentinel); code == 0 {
+		t.Error("confined cat of the sentinel succeeded")
+	}
+	if code, _ := runConfined(t, plan, w.mut, nil, "/bin/test", "-f", sentinel); code != 0 {
+		t.Error("confined stat of the sentinel failed; metadata must stay readable")
+	}
+
+	_, red := runStripped(t, plan, w.mut, "(deny file-read-data file-read-xattr)\n", "/usr/bin/find", home, "-maxdepth", "1", "-name", name)
+	if !strings.Contains(red, sentinel) {
+		t.Fatalf("with the read deny stripped, find over the home did not report the sentinel; the test does not discriminate: %q", red)
+	}
+}
+
+// goEnv returns one go env value from outside the boundary.
+func goEnv(t *testing.T, key string) string {
+	t.Helper()
+	out, err := exec.Command("go", "env", key).Output() //nolint:gosec // G204: fixed tool, fixed key.
+	if err != nil {
+		t.Fatalf("go env %s: %v", key, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestSeatbelt_ReadScopeSeatWork: ordinary seat work still succeeds inside
+// the workarea under the read scope — git status and commit with the user
+// config declared readable, a go build with the toolchain declared, and
+// node and pnpm where they are installed — while an undeclared git user
+// config is a fatal error for git, which is why an adapter declares it.
+func TestSeatbelt_ReadScopeSeatWork(t *testing.T) {
+	base := shortTempDir(t, "dcg")
+	gitconfig := filepath.Join(base, "gitconfig")
+	if err := os.WriteFile(gitconfig, []byte("[user]\n\tname = probe\n\temail = probe@example.invalid\n[init]\n\tdefaultBranch = main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reads := []string{goEnv(t, "GOROOT"), gitconfig}
+	optional := map[string]bool{}
+	for _, tool := range []string{"node", "pnpm"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Logf("%s is not installed here; not exercised", tool)
+			continue
+		}
+		root, err := InstallRoot(path)
+		if err != nil {
+			t.Fatalf("InstallRoot(%s): %v", tool, err)
+		}
+		if resolved, _ := filepath.EvalSymlinks(path); strings.Contains(resolved, string(filepath.Separator)+"corepack"+string(filepath.Separator)) {
+			// A corepack shim runs a package manager it downloaded into a
+			// cache under the home: a host declares that cache, this test
+			// does not guess it.
+			t.Logf("%s is a corepack shim; not exercised", tool)
+			continue
+		}
+		if out, err := exec.Command(path, "--version").CombinedOutput(); err != nil { //nolint:gosec // G204: a tool found on PATH.
+			t.Logf("%s --version fails unconfined (%v: %s); not exercised", tool, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		reads = append(reads, root)
+		optional[tool] = true
+	}
+	// pnpm 12 refuses to start when its global configuration is unreadable
+	// (pnpm 10 only warns); a host that runs pnpm in its seats declares it,
+	// as here.
+	if home, err := os.UserHomeDir(); err == nil && optional["pnpm"] {
+		reads = append(reads, filepath.Join(home, "Library", "Preferences", "pnpm"))
+	}
+	w, plan := readScopedWorld(t, reads...)
+	gomod, gopath := filepath.Join(w.cache, "go-mod"), filepath.Join(w.cache, "go-path")
+	for _, dir := range []string{gomod, gopath} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := []string{"GIT_CONFIG_GLOBAL=" + gitconfig, "GIT_CONFIG_NOSYSTEM=1", "GOMODCACHE=" + gomod, "GOPATH=" + gopath, "GOTOOLCHAIN=local", "GOFLAGS=", "GOENV=off"}
+	repo := filepath.Join(w.mut, "repo")
+	script := strings.Join([]string{
+		`set -e`,
+		`mkdir -p "` + repo + `" && cd "` + repo + `"`,
+		`git init -q .`,
+		`printf 'module example.com/probe\n\ngo 1.21\n' > go.mod`,
+		`printf 'package main\n\nfunc main() { println("ok") }\n' > main.go`,
+		`git add -A`,
+		`git commit -q -m first`,
+		`git status --porcelain`,
+		`git log --oneline | grep -q first`,
+		`go build -o "$TMPDIR/probe" .`,
+		`"$TMPDIR/probe"`,
+	}, "\n")
+	if code, out := runConfined(t, plan, w.mut, env, "/bin/sh", "-c", script); code != 0 || !strings.Contains(out, "ok") {
+		t.Fatalf("git and go under the read scope: exit %d: %s", code, out)
+	}
+	// The C toolchain: a compile through the /usr/bin shim, and a cgo build
+	// that links through it. Both go through xcrun, which reads the active
+	// developer application and the Xcode licence record.
+	if out, err := exec.Command("/usr/bin/cc", "--version").CombinedOutput(); err != nil {
+		t.Logf("cc fails unconfined (%v: %s): this host has no usable C toolchain, so none is exercised confined", err, strings.TrimSpace(string(out)))
+	} else {
+		cgo := strings.Join([]string{
+			`set -e`,
+			`mkdir -p "` + repo + `/c" && cd "` + repo + `/c"`,
+			`printf '#include <stdio.h>\nint main(void) { puts("cc compiled"); return 0; }\n' > hello.c`,
+			`/usr/bin/cc -o "$TMPDIR/hello" hello.c`,
+			`"$TMPDIR/hello"`,
+			`mkdir -p "` + repo + `/cgo" && cd "` + repo + `/cgo"`,
+			`printf 'module example.com/cgo\n\ngo 1.21\n' > go.mod`,
+			`printf 'package main\n\n// static int add(int a, int b) { return a + b; }\nimport "C"\n\nfunc main() { println("cgo", C.add(2, 3)) }\n' > main.go`,
+			`CGO_ENABLED=1 go build -o "$TMPDIR/cgoprobe" .`,
+			`"$TMPDIR/cgoprobe"`,
+		}, "\n")
+		if code, out := runConfined(t, plan, w.mut, env, "/bin/sh", "-c", cgo); code != 0 || !strings.Contains(out, "cc compiled") || !strings.Contains(out, "cgo 5") {
+			t.Fatalf("cc and cgo under the read scope: exit %d: %s", code, out)
+		}
+	}
+	for tool := range optional {
+		if code, out := runConfined(t, plan, w.mut, nil, tool, "--version"); code != 0 {
+			t.Errorf("%s --version under the read scope: exit %d: %s", tool, code, out)
+		}
+	}
+
+	undeclared := filepath.Join(base, "undeclared-gitconfig")
+	if err := os.WriteFile(undeclared, []byte("[user]\n\tname = probe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runConfined(t, plan, w.mut, []string{"GIT_CONFIG_GLOBAL=" + undeclared, "GIT_CONFIG_NOSYSTEM=1"}, "git", "-C", repo, "status")
+	if code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Fatalf("git with an undeclared user config: exit %d: %s; want a refusal", code, out)
+	}
+}
+
+// plantXattr writes a file and plants an extended attribute on it.
+func plantXattr(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("decoy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(path, readXattrName, []byte("decoy attribute"), 0); err != nil {
+		t.Fatalf("Setxattr: %v", err)
+	}
+}
+
+// refused reports whether a probe step was refused by the profile.
+func refused(result stepResult) bool {
+	return strings.Contains(result.Err, "not permitted")
+}
+
+// TestSeatbelt_ReadScopeClosesPackageData: Homebrew and /usr are readable
+// whole, but the data trees under them (Homebrew's var and /usr/local/var,
+// where database directories and TLS keys live) are not, while the etc trees
+// beside them stay readable. With the deny removed the same read succeeds,
+// so the test discriminates it.
+func TestSeatbelt_ReadScopeClosesPackageData(t *testing.T) {
+	var dir, file string
+	for _, tree := range seatbeltPackageData {
+		if info, err := os.Stat(tree); err != nil || !info.IsDir() || unix.Access(tree, unix.W_OK) != nil {
+			continue
+		}
+		dir = filepath.Join(tree, ".donmai-confinement-test-"+randomSuffix())
+		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // G301: a decoy directory.
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = removeAllForce(dir) })
+		file = filepath.Join(dir, "server-key.pem")
+		plantXattr(t, file)
+		break
+	}
+	if file == "" {
+		t.Skipf("no writable package data tree (%s) on this host; nothing is kept there to read", strings.Join(seatbeltPackageData, ", "))
+	}
+	w, plan := readScopedWorld(t)
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", file); code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Errorf("confined cat of a key under a package data tree: exit %d: %q; want a refusal", code, out)
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/ls", dir); code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Errorf("confined ls of a package data directory: exit %d: %q; want a refusal", code, out)
+	}
+	results := runProbeSteps(t, plan, w, probeStep{ID: "xattr", Op: opGetxattr, Path: file, Label: readXattrName})
+	if !refused(results["xattr"]) {
+		t.Errorf("confined getxattr under a package data tree: %+v; want a refusal", results["xattr"])
+	}
+	for _, etc := range []string{"/opt/homebrew/etc", "/usr/local/etc"} {
+		if info, err := os.Stat(etc); err == nil && info.IsDir() {
+			if code, out := runConfined(t, plan, w.mut, nil, "/bin/ls", etc); code != 0 {
+				t.Errorf("confined ls of %s: exit %d: %q; the etc trees stay readable", etc, code, out)
+			}
+		}
+	}
+
+	var block strings.Builder
+	block.WriteString("(deny file-read-data file-read-xattr\n")
+	for i, tree := range seatbeltPackageData {
+		block.WriteString("  (subpath \"" + tree + "\")")
+		if i == len(seatbeltPackageData)-1 {
+			block.WriteString(")")
+		}
+		block.WriteString("\n")
+	}
+	if code, out := runStripped(t, plan, w.mut, block.String(), "/bin/cat", file); code != 0 {
+		t.Fatalf("with the package data deny stripped, cat of the key failed: exit %d: %q; the test does not discriminate", code, out)
+	}
+	if code, out := runStripped(t, plan, w.mut, block.String(), "/bin/ls", dir); code != 0 {
+		t.Fatalf("with the package data deny stripped, ls of the directory failed: exit %d: %q; the test does not discriminate", code, out)
+	}
+}
+
+// TestSeatbelt_ReadScopeClosesTerminals: the device nodes a process needs
+// stay readable (the random devices, the directory, the descriptors process
+// substitution hands out) but no terminal does: a pseudo-terminal slave
+// does not open for reading, so a seat cannot capture what is typed into
+// another session's terminal or the operator's. With the /dev subtree
+// allowed again the same open succeeds, so the test discriminates.
+func TestSeatbelt_ReadScopeClosesTerminals(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = slave.Close(); _ = master.Close() })
+	if fd, err := unix.Open(slave.Name(), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0); err != nil {
+		t.Fatalf("unconfined control: the pseudo-terminal slave does not open: %v", err)
+	} else {
+		_ = unix.Close(fd)
+	}
+	w, plan := readScopedWorld(t)
+	steps := []probeStep{
+		{ID: "pty", Op: opOpen, Path: slave.Name()},
+		{ID: "urandom", Op: opOpen, Path: "/dev/urandom"},
+		{ID: "null", Op: opOpen, Path: "/dev/null"},
+		{ID: "list", Op: opList, Path: "/dev"},
+	}
+	results := runProbeSteps(t, plan, w, steps...)
+	if !refused(results["pty"]) {
+		t.Errorf("confined open of a pseudo-terminal slave: %+v; want a refusal", results["pty"])
+	}
+	for _, id := range []string{"urandom", "null", "list"} {
+		if results[id].Err != "" {
+			t.Errorf("confined %s: %q; the device stays readable", id, results[id].Err)
+		}
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/bash", "-c", "cat <(echo substituted)"); code != 0 || !strings.Contains(out, "substituted") {
+		t.Errorf("process substitution under the read scope: exit %d: %q", code, out)
+	}
+
+	red := runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runRewritten(t, plan, w.mut, env, "(literal \"/dev\")\n", "(subpath \"/dev\")\n", argv...)
+	}, steps...)
+	if red["pty"].Err != "" {
+		t.Fatalf("with the /dev subtree allowed, the open of a pseudo-terminal slave failed: %q; the test does not discriminate", red["pty"].Err)
+	}
+}
+
+// TestSeatbelt_ReadScopeClosesExtendedAttributes: an extended attribute
+// outside the allowlist does not read, and neither does the content of a
+// transparently compressed file, which the file keeps in attributes that
+// getxattr returns when asked to show compression, while the same reads
+// inside the allowlist work. With the attribute rule dropped from the
+// blanket deny the outside reads succeed although the file itself is still
+// refused, so the test discriminates.
+func TestSeatbelt_ReadScopeClosesExtendedAttributes(t *testing.T) {
+	outside := shortTempDir(t, "dco")
+	w, plan := readScopedWorld(t)
+	places := map[string]string{"outside": outside, "inside": w.mut}
+	for _, dir := range places {
+		plantXattr(t, filepath.Join(dir, "plain"))
+		if _, err := cloneCompressed(dir); err != nil {
+			t.Fatalf("compressed decoy: %v", err)
+		}
+	}
+	// A compressed file keeps its contents in the resource fork, or, when
+	// small, in the decmpfs attribute alone: probe each that exists.
+	attrs := []struct{ id, name string }{{"decmpfs", decmpfsXattr}}
+	if _, err := getxattr(filepath.Join(outside, "cmp"), resourceFork, nil, showCompress); err == nil {
+		attrs = append(attrs, struct{ id, name string }{"fork", resourceFork})
+	}
+	var steps []probeStep
+	for place, dir := range places {
+		steps = append(steps, probeStep{ID: place + ".xattr", Op: opGetxattr, Path: filepath.Join(dir, "plain"), Label: readXattrName})
+		for _, attr := range attrs {
+			steps = append(steps, probeStep{ID: place + "." + attr.id, Op: opGetxattr, Path: filepath.Join(dir, "cmp"), Label: attr.name, Flags: showCompress})
+		}
+	}
+
+	results := runProbeSteps(t, plan, w, steps...)
+	for _, step := range steps {
+		got := results[step.ID]
+		if strings.HasPrefix(step.ID, "outside.") && !refused(got) {
+			t.Errorf("confined getxattr %s: %+v; want a refusal", step.ID, got)
+		}
+		if strings.HasPrefix(step.ID, "inside.") && got.Err != "" {
+			t.Errorf("confined getxattr %s inside the allowlist: %+v; want it served", step.ID, got)
+		}
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", filepath.Join(outside, "cmp")); code == 0 {
+		t.Errorf("confined cat of the compressed decoy outside the allowlist: %q; want a refusal", out)
+	}
+
+	red := runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runRewritten(t, plan, w.mut, env, "(deny file-read-data file-read-xattr)\n", "(deny file-read-data)\n", argv...)
+	}, steps...)
+	for _, step := range steps {
+		if strings.HasPrefix(step.ID, "outside.") && red[step.ID].Err != "" {
+			t.Errorf("with the attribute rule dropped, getxattr %s still failed: %q; the test does not discriminate", step.ID, red[step.ID].Err)
+		}
+	}
+}
+
+// TestSeatbelt_ReadScopeDeveloperShims: the /usr/bin developer shims (git,
+// python3, make, cc) run under the read scope on a host whose developer
+// directory is an application bundle. xcrun reads the Xcode licence record
+// to check the licence was accepted; refused, every shim exits with a
+// licence error. A shim that already fails unconfined says nothing about the
+// profile (the licence is not accepted, or no developer tools are
+// installed), so it is skipped with that said.
+func TestSeatbelt_ReadScopeDeveloperShims(t *testing.T) {
+	w, plan := readScopedWorld(t)
+	shims := [][]string{
+		{"/usr/bin/git", "--version"},
+		{"/usr/bin/python3", "--version"},
+		{"/usr/bin/make", "--version"},
+		{"/usr/bin/cc", "--version"},
+	}
+	for _, shim := range shims {
+		t.Run(filepath.Base(shim[0]), func(t *testing.T) {
+			if out, err := exec.Command(shim[0], shim[1:]...).CombinedOutput(); err != nil { //nolint:gosec // G204: fixed shims.
+				t.Skipf("%s fails unconfined (%v: %s): the host's developer tools are not usable (licence not accepted?); not a confinement result", shim[0], err, strings.TrimSpace(string(out)))
+			}
+			// A global git configuration of the operator's is not declared
+			// readable, and git treats an unreadable one as fatal.
+			env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"}
+			if code, out := runConfined(t, plan, w.mut, env, shim...); code != 0 {
+				t.Errorf("confined %s: exit %d: %s", strings.Join(shim, " "), code, strings.TrimSpace(out))
+			}
+		})
+	}
+	t.Run("tool lookup", func(t *testing.T) {
+		// The Go linker finds dsymutil by running cc --print-prog-name and
+		// taking everything the shim prints as the tool's path, so a shim
+		// that complains about its lookup cache on stderr breaks every cgo
+		// link. The unconfined run also makes sure the cache exists.
+		out, err := exec.Command("/usr/bin/cc", "--print-prog-name", "dsymutil").CombinedOutput()
+		if err != nil || strings.Count(strings.TrimSpace(string(out)), "\n") != 0 {
+			t.Skipf("cc --print-prog-name fails or is noisy unconfined (%v: %s); not a confinement result", err, strings.TrimSpace(string(out)))
+		}
+		want := strings.TrimSpace(string(out))
+		env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"}
+		if code, got := runConfined(t, plan, w.mut, env, "/usr/bin/cc", "--print-prog-name", "dsymutil"); code != 0 || strings.TrimSpace(got) != want {
+			t.Errorf("confined cc --print-prog-name dsymutil: exit %d: %q; want exactly %q", code, got, want)
+		}
+		dir, err := darwinUserDir("DARWIN_USER_TEMP_DIR")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, got := runRewritten(t, plan, w.mut, env, `(subpath "`+filepath.Join(dir, "xcrun_db")+`")`, "", "/usr/bin/cc", "--print-prog-name", "dsymutil")
+		if strings.TrimSpace(got) == want {
+			t.Fatalf("with the xcrun cache unreadable, cc --print-prog-name still answered cleanly; the test does not discriminate")
+		}
+	})
+	if len(developerReads()) == 0 {
+		t.Log("the developer directory is not an application bundle on this host; the licence record control does not apply")
+		return
+	}
+	// The licence record is read on every lookup the shim's cache cannot
+	// answer; --no-cache asks for exactly that, whatever the cache holds.
+	lookup := []string{"/usr/bin/xcrun", "--no-cache", "-f", "clang"}
+	if out, err := exec.Command(lookup[0], lookup[1:]...).CombinedOutput(); err != nil { //nolint:gosec // G204: fixed tool.
+		t.Skipf("%s fails unconfined (%v: %s); the licence control cannot run", strings.Join(lookup, " "), err, strings.TrimSpace(string(out)))
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, lookup...); code != 0 {
+		t.Errorf("confined %s: exit %d: %s", strings.Join(lookup, " "), code, strings.TrimSpace(out))
+	}
+	code, out := runRewritten(t, plan, w.mut, nil, "(literal \"/Library/Preferences/com.apple.dt.Xcode.plist\")\n", "", lookup...)
+	if code == 0 || !strings.Contains(out, "license") {
+		t.Fatalf("with the licence record unreadable, %s: exit %d: %q; want the licence refusal", strings.Join(lookup, " "), code, out)
 	}
 }

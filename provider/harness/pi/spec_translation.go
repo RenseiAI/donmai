@@ -4,17 +4,17 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"sort"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
-	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
-// PiKeyEnvVar is the env var the materialized provider pin references for the
-// resolved cell's API key (extension.go providerPinConfig). The key rides this
-// env var into the child process; it is never written to disk.
+// PiKeyEnvVar names the resolved cell's API key for the injected provider.
+// applyEndpoint mirrors the key onto Spec.Env under this name; the harness
+// then delivers it to the policy extension through the owner-only session
+// credential file (credential_file.go), filed under this name, and never
+// through the child's environment.
 const PiKeyEnvVar = "DONMAI_PI_KEY"
 
 // SpecFieldNote names an agent.Spec field the pi provider does not honor and
@@ -189,10 +189,15 @@ const pinnedProviderName = "donmai"
 // A bound endpoint narrows the native route. pi's native route talks to the
 // built-in provider's OWN endpoint and ignores Endpoint.BaseURL, so a pin
 // routes natively only when the binding carries no BaseURL (the
-// pre-existing unbound/direct behavior) or its BaseURL is an https URL on
-// that provider's own serving host (builtinProviderServingHost). Any other
-// BaseURL — an unknown proxy, a look-alike host, plain http, or an
-// aggregator such as https://ai-gateway.vercel.sh/v1 — stays on the injected
+// pre-existing unbound/direct behavior) or its BaseURL is that provider's
+// own endpoint (baseURLMatchesProviderEndpoint): the same https host AND,
+// for direct providers, a path under pi's own catalog base URL for the
+// provider (builtinProviderBaseURL). One vendor host can serve separately
+// billed APIs on different paths, so a same-host binding to a different
+// path stays on the injected provider, which is registered against the
+// BaseURL itself. Any other BaseURL — an unknown proxy, a look-alike host,
+// plain http, or an aggregator such as https://ai-gateway.vercel.sh/v1 —
+// stays on the injected
 // provider, which is registered against the BaseURL itself, so a proxy key
 // never reaches a vendor's own endpoint.
 //
@@ -219,7 +224,7 @@ func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareM
 		return provider, bareModel, false
 	case ep.BaseURL == "":
 		return provider, bareModel, true
-	case baseURLIsProviderHost(ep.BaseURL, provider):
+	case baseURLMatchesProviderEndpoint(ep.BaseURL, provider):
 		return provider, bareModel, true
 	case aggregatorHost:
 		return provider, model, false
@@ -228,30 +233,38 @@ func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareM
 	}
 }
 
-// composeChildEnv builds the child process env with the env-hygiene posture
-// design §5.3 requires: because pi runs tools with the FULL permissions of the
-// spawning user, it must NEVER see broader host credentials. The Composer
-// drops every AgentEnvBlocklist key (ANTHROPIC_API_KEY, OPENAI_API_KEY, …) and
-// every runner-only control from the PARENT env, while still trusting the
-// resolved cell's credentials delivered on Spec.Env (applyEndpoint mirrors the
-// cell key onto PiKeyEnvVar). The PI_CODING_AGENT_DIR/_SESSION_DIR redirect
-// layer is appended last (wins) so the child's pi config/auth/session home
-// resolves inside the session worktree — a fleet box's personal
-// ~/.pi/agent/auth.json is never visible.
+// composeChildEnv builds the headless child's exec environment with the
+// env-hygiene posture design §5.3 requires: because pi runs tools with the
+// FULL permissions of the spawning user, it must NEVER see broader host
+// credentials — and because pi renames itself into a short process name at
+// startup, whatever it is exec'd with is readable from a same-user process
+// listing. The environment is therefore built from an allowlist
+// (child_env.go partitionChildEnv), never inherited: process context pi
+// needs to start rides it; the session's model credentials ride the session
+// credential file (writeSessionCredentialFile) and the session auth.json;
+// every other binding rides the credential file's environment section,
+// which the policy extension restores into pi's in-process environment for
+// the tools it starts.
 //
-// Credential-snapshot parity: pi carries the platform's full spawn-time
-// credential snapshot through the shared Spec.Env trusted layer — the same
-// rail the other harnesses use — not a pi-specific fan-out list. Any
-// snapshot key present on Spec.Env reaches the child unchanged; there is no
-// pi-side allowlist to extend when the snapshot gains a key. The blocklist
-// still applies to the inherited parent env only, and runner-only controls
-// are refused at every layer.
+// Credential-snapshot parity: pi composes the platform's full spawn-time
+// snapshot through the shared Composer over the trusted Spec.Env layer —
+// the same rail the other harnesses use, with the blocklist applied to the
+// inherited parent env only and runner-only controls refused at every
+// layer — so the session's effective environment matches theirs. Only the
+// carrier differs: the exec environment holds allowlisted names alone.
 //
-// It also carries the trust-boundary handshake token (piHandshakeEnvVar) and
-// the non-secret provider-pin vars (providerPinEnv) the policy extension reads
-// at load; the key itself already rides Spec.Env under PiKeyEnvVar.
+// It also carries the trust-boundary handshake token (piHandshakeEnvVar),
+// the non-secret provider-pin vars (providerPinEnv) the policy extension
+// reads at load, and the config-home redirect; the caller appends the
+// credential file's path (sessionCredentialEnv).
 func composeChildEnv(spec agent.Spec, layout sessionLayout, token string) []string {
-	out := runtimeenv.NewComposer().Compose(envSliceToMap(os.Environ()), spec)
+	return headlessChildEnv(sessionChildEnv(spec).exec, spec, layout, token)
+}
+
+// headlessChildEnv appends the harness-owned entries to an allowlisted exec
+// environment (partitionChildEnv's exec half).
+func headlessChildEnv(allowed []string, spec agent.Spec, layout sessionLayout, token string) []string {
+	out := append([]string(nil), allowed...)
 	// Redirect pi's config/agent home and session home into the session dir
 	// using the EXACT documented variable names (docs/environment-variables.md:
 	// PI_CODING_AGENT_DIR overrides the config directory, default
@@ -424,7 +437,8 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 // mirrorNativeProviderCredential copies the resolved cell key onto the
 // built-in provider's own credential env var when model routes natively
 // (nativeProviderPin). The key is taken from the binding's in-process Env
-// first. Only when the binding names that provider's own serving host does
+// first. Only when the binding names that provider's own endpoint
+// (baseURLMatchesProviderEndpoint) does
 // it fall back to the PiKeyEnvVar value on env: a binding that travelled over
 // the dispatch wire carries no Env values (json:"-"), so on a runner the key
 // arrives on Spec.Env, and it may only be handed to a provider whose own
@@ -445,7 +459,7 @@ func mirrorNativeProviderCredential(env map[string]string, model string, ep *age
 	key := ""
 	if ep != nil {
 		key = pickAPIKey(ep.Env)
-		if key == "" && baseURLIsProviderHost(ep.BaseURL, provider) {
+		if key == "" && baseURLMatchesProviderEndpoint(ep.BaseURL, provider) {
 			key = env[PiKeyEnvVar]
 		}
 	}

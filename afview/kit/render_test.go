@@ -141,6 +141,24 @@ func TestRenderShow_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRenderShow_DependencyStoresListed(t *testing.T) {
+	m := sampleManifest()
+	m.ProvidesDependencyStores = true
+	m.DependencyStores = []afclient.KitDependencyStore{
+		{Manager: "pnpm", Ecosystem: "node"},
+		{Manager: "gomod", Ecosystem: "go"},
+	}
+	var buf bytes.Buffer
+	if err := kit.RenderShow(&buf, m, true); err != nil {
+		t.Fatalf("RenderShow: %v", err)
+	}
+	for _, want := range []string{"dependency stores", "pnpm", "gomod"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("RenderShow: missing %q\n--- output ---\n%s", want, buf.String())
+		}
+	}
+}
+
 func TestRenderShow_DeterministicCommandOrder(t *testing.T) {
 	// Two runs of RenderShow must produce byte-identical output despite
 	// map iteration randomness.

@@ -63,6 +63,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // sessionShimCompositionRefreshReason is the classified refresh trigger for the
@@ -183,7 +184,17 @@ func (d *Daemon) SessionShimCompositionPending() bool {
 // ONE failure is CLASSIFIED for the caller rather than left opaque: a boot
 // adoption batch the control plane refused for a reason no bounded recovery
 // can settle comes back as *SessionShimDurabilityRefused, wrapped, so
-// errors.As reaches it. It is still an error and it still means nothing was
+// errors.As reaches it. A founding declaration or first projected heartbeat
+// the platform refuses with a definite client error comes back as the
+// DISTINCT type *SessionShimFoundingRefused — never as
+// *SessionShimDurabilityRefused — so a caller that treats the batch refusal
+// as terminal cannot accidentally make a founding refusal terminal too. A
+// founding refusal is always retryable: found again with backoff, with
+// another composed configuration when one exists, otherwise with the same
+// one. InstallSessionShimCompositionRetrying runs that loop; the one-line
+// caller change an embedding binary needs is to call it instead of
+// InstallSessionShimComposition, or to key its own retry loop off
+// *SessionShimFoundingRefused. It is still an error and it still means nothing was
 // installed — but it is the one failure whose honest handling is "warn, do not
 // announce durable sessions, keep serving direct-owned ones" rather than
 // "exit". An embedder that exits on any error from this call keeps a working
@@ -257,6 +268,21 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 
 	var err error
 	if declared, err = d.declareSessionShimComposition(ctx); err != nil {
+		// A refused founder must not block a later healthy founder. When this
+		// returns, the deferred rollback above restores the stand-down
+		// posture, so a later install with another composed configuration
+		// may found the composition. The refusal is retained and readable
+		// from SessionShimDurabilityRefusal() so an operator who sees `off`
+		// can see why; anything that is not a definite platform refusal
+		// keeps its ordinary untyped error.
+		if refused := newSessionShimFoundingRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+			slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+				"founding declaration; the daemon keeps serving direct-owned "+
+				"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+				"scope", refused.Scope, "refusal", refused.Err)
+			d.retainSessionShimFoundingRefusal(refused)
+			return fmt.Errorf("session shim: declare composition: %w", refused)
+		}
 		return err
 	}
 
@@ -300,12 +326,134 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 	d.shimIdentityRef.Store(&live)
 
 	if err := d.publishSessionShimHeartbeatProjection(ctx); err != nil {
+		// Same contract as a refused declaring refresh: the first beat
+		// presenting the composition was heard and answered, so a
+		// classifier-driven caller founds the composition again with
+		// another composed configuration, or the same one after backoff.
+		// When this returns, the deferred rollback above restores the
+		// stand-down posture and re-declares it, because `declared`
+		// flipped when the declaration was accepted.
+		if refused := newSessionShimFoundingRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+			slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+				"first projected heartbeat; the daemon keeps serving direct-owned "+
+				"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+				"scope", refused.Scope, "refusal", refused.Err)
+			d.retainSessionShimFoundingRefusal(refused)
+			return fmt.Errorf("session shim: first projected heartbeat: %w", refused)
+		}
 		return err
 	}
 	installed = true
 	slog.Info("session shim: durable-session composition installed",
 		"controller", live.controllerID, "scope", d.sessionShimConfig().orgID())
 	return nil
+}
+
+// SessionShimFoundingRetryPolicy bounds the retry-with-backoff loop
+// InstallSessionShimCompositionRetrying runs after a founder is refused.
+type SessionShimFoundingRetryPolicy struct {
+	// Configs lists the composed configurations to found with, in order: the
+	// next healthy founder first. When empty the loop still retries the
+	// refused founder itself with backoff, so a process with a single
+	// composed scope does not need a list to recover.
+	Configs []SessionShimConfig
+	// MaxAttempts bounds the total install attempts, including the refused
+	// one already counted. Zero means a small bounded default, so the loop
+	// cannot spin forever on a platform that refuses every founder.
+	MaxAttempts int
+	// InitialBackoff is the wait before the first retry; each later wait
+	// doubles. Zero uses a short default.
+	InitialBackoff time.Duration
+	// MaxBackoff ceilings the doubling. Zero uses a short default.
+	MaxBackoff time.Duration
+	// Sleep is the wait primitive, so tests drive the retry loop without
+	// sleeping. Nil uses a context-aware timer.
+	Sleep func(ctx context.Context, d time.Duration) error
+}
+
+// sessionShimDefaultFoundingRetryAttempts is the attempt budget a caller that
+// sets no MaxAttempts gets: enough for the refused founder plus a healthy
+// one, plus a same-founder retry when no other founder exists.
+const sessionShimDefaultFoundingRetryAttempts = 3
+
+const (
+	sessionShimDefaultFoundingInitialBackoff = 200 * time.Millisecond
+	sessionShimDefaultFoundingMaxBackoff     = 5 * time.Second
+)
+
+// InstallSessionShimCompositionRetrying installs the given composition and,
+// when the platform refuses its founding declaration or first projected
+// heartbeat with a definite client error, retries founding with backoff —
+// with the policy's next composed configuration when one is listed,
+// otherwise with the same configuration — instead of leaving durable sessions
+// off until restart. Any other failure returns immediately with the install's
+// own error, exactly as InstallSessionShimComposition reports it.
+//
+// A refused founder never blocks a later healthy founder: each attempt fully
+// rolls back to stand-down before the next begins. A founder that recovers
+// later does not create a second composition: an accepted composition still
+// refuses any further install outright.
+func (d *Daemon) InstallSessionShimCompositionRetrying(ctx context.Context, cfg SessionShimConfig, policy SessionShimFoundingRetryPolicy) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attempts := append([]SessionShimConfig{cfg}, policy.Configs...)
+	maxAttempts := policy.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = sessionShimDefaultFoundingRetryAttempts
+	}
+	if maxAttempts > len(attempts) {
+		// No other founder exists: keep founding with the last listed
+		// configuration instead of staying off until restart.
+		last := attempts[len(attempts)-1]
+		for len(attempts) < maxAttempts {
+			attempts = append(attempts, last)
+		}
+	} else {
+		attempts = attempts[:maxAttempts]
+	}
+	backoff := policy.InitialBackoff
+	if backoff <= 0 {
+		backoff = sessionShimDefaultFoundingInitialBackoff
+	}
+	capBackoff := policy.MaxBackoff
+	if capBackoff <= 0 {
+		capBackoff = sessionShimDefaultFoundingMaxBackoff
+	}
+	sleep := policy.Sleep
+	if sleep == nil {
+		sleep = func(ctx context.Context, d time.Duration) error {
+			timer := time.NewTimer(d)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		}
+	}
+	var err error
+	for i, attempt := range attempts {
+		if i > 0 {
+			if sleepErr := sleep(ctx, backoff); sleepErr != nil {
+				return fmt.Errorf("session shim: founding retry abandoned: %w", sleepErr)
+			}
+			backoff *= 2
+			if backoff > capBackoff {
+				backoff = capBackoff
+			}
+		}
+		err = d.InstallSessionShimComposition(ctx, attempt)
+		if err == nil {
+			return nil
+		}
+		var refused *SessionShimFoundingRefused
+		if !errors.As(err, &refused) {
+			return err
+		}
+	}
+	return err
 }
 
 // declareSessionShimComposition presents the composed attestation to the
@@ -426,6 +574,85 @@ func (d *Daemon) discardSessionShimCompositionState() {
 	defer d.shims.mu.Unlock()
 	for scope := range d.shims.credentialReceipts {
 		delete(d.shims.credentialReceipts, scope)
+	}
+	// The admission fence is bookkept beside the authority it fences: a scope
+	// whose receipt is discarded while its first-heartbeat acknowledgement is
+	// still pending would otherwise keep the host-wide new-work claim gate
+	// closed for every scope — including scopes whose own founding is healthy
+	// — with no heartbeat left that could ever reopen it. See
+	// clearOrphanedSessionShimHeartbeatFence.
+	for scope := range d.shims.pendingHeartbeatAcks {
+		if _, retained := d.shims.credentialReceipts[scope]; !retained {
+			delete(d.shims.pendingHeartbeatAcks, scope)
+		}
+	}
+}
+
+// clearOrphanedSessionShimHeartbeatFence drops a first-heartbeat admission
+// fence no heartbeat can clear: a pending acknowledgement for a scope this
+// daemon holds no retained authority receipt for. The fence and its
+// bookkeeping must move together — updateSessionShimAdoptionRevisionLocked
+// publishes them in one critical section for exactly this reason — so a scope
+// whose receipt was discarded while its acknowledgement was still pending
+// leaves the host-wide new-work claim gate closed for every scope with
+// nothing left to reopen it: the withdrawing beat already ran, the
+// acknowledgement edge matches a retained receipt, and the spawner stays
+// paused. Clearing the orphan reopens admission; anything durable that
+// actually advanced keeps its own state, because only the fence entry is
+// dropped, never a receipt.
+//
+// Callers hold no locks; it takes d.shims.mu. It reports whether it cleared
+// anything, so call sites that also own the lifecycle transition can reopen
+// admission exactly when the fence was the only thing holding it closed.
+func (d *Daemon) clearOrphanedSessionShimHeartbeatFence() bool {
+	if d.shims == nil {
+		return false
+	}
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	cleared := false
+	for scope := range d.shims.pendingHeartbeatAcks {
+		if _, retained := d.shims.credentialReceipts[scope]; !retained {
+			delete(d.shims.pendingHeartbeatAcks, scope)
+			cleared = true
+		}
+	}
+	if cleared && len(d.shims.pendingHeartbeatAcks) == 0 {
+		d.sessionShimReadinessWithdrawn.Store(false)
+	}
+	return cleared
+}
+
+// standDownSessionShimAfterRefusedStartupFounding moves a starting daemon to
+// the stand-down posture after the platform refused its startup founding
+// registration or first heartbeat with a definite client error. Startup —
+// unlike the deferred install — has no prior generation to roll back to: the
+// daemon was constructed with the composed configuration, so standing down
+// means publishing a fresh stand-down generation and dropping whatever the
+// refused founding retained. The daemon then completes startup as a host that
+// does not do durable sessions: direct-owned sessions, no shim projection on
+// the beat, a control plane that expects none. A later deferred install with
+// another composed configuration may still found the composition in process.
+//
+// Callers hold no locks; the lifecycle owner is the Start call itself, so
+// the state transition is safe without re-claiming it.
+func (d *Daemon) standDownSessionShimAfterRefusedStartupFounding() {
+	standDown := SessionShimConfig{}
+	d.shimIdentityRef.Store(newSessionShimIdentity(&standDown, true))
+	d.discardSessionShimCompositionState()
+	d.clearOrphanedSessionShimHeartbeatFence()
+	d.sessionShimReadinessWithdrawn.Store(false)
+	// Start owns the lifecycle lease throughout; take the lock only for the
+	// state read and the transition itself. Never touch stopGen here: a
+	// concurrent Stop owns the shutdown transition, and resurrecting a
+	// draining daemon would strand it serving after Stop returned.
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopGen != nil {
+		return
+	}
+	if d.State() == StateRecovering {
+		d.setState(StateRunning)
 	}
 }
 
