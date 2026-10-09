@@ -726,8 +726,9 @@ func sessionShimBatchRefusalIsUnresolvable(err error) bool {
 }
 
 // sessionShimFoundingRefusalIsDefinite reports whether a failed founding
-// declaration or first projected heartbeat is a definite platform refusal
-// rather than a transient outage or a republishable answer.
+// declaration, first projected heartbeat, or startup founding registration
+// is a definite platform refusal rather than a transient outage or a
+// republishable answer.
 // Only the definite client errors qualify: the platform heard the composed
 // attestation and answered it. A transport failure, a deadline, an auth or
 // missing-endpoint status, a 5xx, or anything else keeps its ordinary error
@@ -751,15 +752,19 @@ func sessionShimFoundingRefusalIsDefinite(err error) bool {
 	if isSessionShimReconciliationRequired(err) {
 		return false
 	}
-	// Both legs of the founding round trip carry their HTTP status and body:
-	// the declaring refresh as *refreshHTTPError, the first projected
-	// heartbeat as *heartbeatHTTPError. Either one heard and answered is a
-	// definite refusal either way.
+	// The three legs of the founding round trip carry their HTTP status and
+	// body: the startup founding registration as *registerHTTPError, the
+	// declaring refresh as *refreshHTTPError, the first projected heartbeat
+	// as *heartbeatHTTPError. Any one heard and answered is a definite refusal
+	// either way.
 	var status int
 	var body string
+	var registerErr *registerHTTPError
 	var refreshErr *refreshHTTPError
 	var heartbeatErr *heartbeatHTTPError
 	switch {
+	case errors.As(err, &registerErr):
+		status, body = registerErr.status, registerErr.body
 	case errors.As(err, &refreshErr):
 		status, body = refreshErr.status, refreshErr.body
 	case errors.As(err, &heartbeatErr):
@@ -782,8 +787,9 @@ func sessionShimFoundingRefusalIsDefinite(err error) bool {
 }
 
 // SessionShimFoundingRefused reports that the platform refused this scope's
-// founding declaration or first projected heartbeat with a definite client
-// error, and that the install rolled back to stand-down rather than failing.
+// startup founding registration, founding declaration, or first projected
+// heartbeat with a definite client error, and that the daemon stood down
+// rather than failing.
 //
 // IT IS DELIBERATELY NOT A *SessionShimDurabilityRefused. That type tells a
 // caller durable sessions are off for a reason no bounded recovery settles,

@@ -575,6 +575,85 @@ func (d *Daemon) discardSessionShimCompositionState() {
 	for scope := range d.shims.credentialReceipts {
 		delete(d.shims.credentialReceipts, scope)
 	}
+	// The admission fence is bookkept beside the authority it fences: a scope
+	// whose receipt is discarded while its first-heartbeat acknowledgement is
+	// still pending would otherwise keep the host-wide new-work claim gate
+	// closed for every scope — including scopes whose own founding is healthy
+	// — with no heartbeat left that could ever reopen it. See
+	// clearOrphanedSessionShimHeartbeatFence.
+	for scope := range d.shims.pendingHeartbeatAcks {
+		if _, retained := d.shims.credentialReceipts[scope]; !retained {
+			delete(d.shims.pendingHeartbeatAcks, scope)
+		}
+	}
+}
+
+// clearOrphanedSessionShimHeartbeatFence drops a first-heartbeat admission
+// fence no heartbeat can clear: a pending acknowledgement for a scope this
+// daemon holds no retained authority receipt for. The fence and its
+// bookkeeping must move together — updateSessionShimAdoptionRevisionLocked
+// publishes them in one critical section for exactly this reason — so a scope
+// whose receipt was discarded while its acknowledgement was still pending
+// leaves the host-wide new-work claim gate closed for every scope with
+// nothing left to reopen it: the withdrawing beat already ran, the
+// acknowledgement edge matches a retained receipt, and the spawner stays
+// paused. Clearing the orphan reopens admission; anything durable that
+// actually advanced keeps its own state, because only the fence entry is
+// dropped, never a receipt.
+//
+// Callers hold no locks; it takes d.shims.mu. It reports whether it cleared
+// anything, so call sites that also own the lifecycle transition can reopen
+// admission exactly when the fence was the only thing holding it closed.
+func (d *Daemon) clearOrphanedSessionShimHeartbeatFence() bool {
+	if d.shims == nil {
+		return false
+	}
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	cleared := false
+	for scope := range d.shims.pendingHeartbeatAcks {
+		if _, retained := d.shims.credentialReceipts[scope]; !retained {
+			delete(d.shims.pendingHeartbeatAcks, scope)
+			cleared = true
+		}
+	}
+	if cleared && len(d.shims.pendingHeartbeatAcks) == 0 {
+		d.sessionShimReadinessWithdrawn.Store(false)
+	}
+	return cleared
+}
+
+// standDownSessionShimAfterRefusedStartupFounding moves a starting daemon to
+// the stand-down posture after the platform refused its startup founding
+// registration or first heartbeat with a definite client error. Startup —
+// unlike the deferred install — has no prior generation to roll back to: the
+// daemon was constructed with the composed configuration, so standing down
+// means publishing a fresh stand-down generation and dropping whatever the
+// refused founding retained. The daemon then completes startup as a host that
+// does not do durable sessions: direct-owned sessions, no shim projection on
+// the beat, a control plane that expects none. A later deferred install with
+// another composed configuration may still found the composition in process.
+//
+// Callers hold no locks; the lifecycle owner is the Start call itself, so
+// the state transition is safe without re-claiming it.
+func (d *Daemon) standDownSessionShimAfterRefusedStartupFounding() {
+	standDown := SessionShimConfig{}
+	d.shimIdentityRef.Store(newSessionShimIdentity(&standDown, true))
+	d.discardSessionShimCompositionState()
+	d.clearOrphanedSessionShimHeartbeatFence()
+	d.sessionShimReadinessWithdrawn.Store(false)
+	// Start owns the lifecycle lease throughout; take the lock only for the
+	// state read and the transition itself. Never touch stopGen here: a
+	// concurrent Stop owns the shutdown transition, and resurrecting a
+	// draining daemon would strand it serving after Stop returned.
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopGen != nil {
+		return
+	}
+	if d.State() == StateRecovering {
+		d.setState(StateRunning)
+	}
 }
 
 // publishSessionShimHeartbeatProjection is the announcement. It installs the
