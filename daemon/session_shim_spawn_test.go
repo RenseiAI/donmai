@@ -3218,3 +3218,110 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 		t.Fatalf("doctor/status session-shim drift:\ndoctor=%+v\nstatus=%+v", doctor.SessionShim, diagnostic)
 	}
 }
+
+// TestLaunchContractEpochAdvancesPastPriorIncarnations pins the launch
+// contract's process epoch: a first launch carries 1, and a launch after a
+// prior incarnation ended carries one past the highest epoch on disk —
+// records and tombstones alike — so two launches never alias.
+func TestLaunchContractEpochAdvancesPastPriorIncarnations(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("sessionShimRegistry: %v", err)
+	}
+	id := f.identity("sess-epoch")
+
+	if got := d.nextShimProcessEpoch(id, registry); got != 1 {
+		t.Fatalf("nextShimProcessEpoch on a new identity = %d, want 1", got)
+	}
+
+	// An unreadable registry maps to 1 rather than failing the launch: the
+	// fallback stays inside the 1-based contract, so a later healthy epoch-1
+	// launch can never alias the lineage the epoch disambiguates.
+	if got := d.nextShimProcessEpoch(id, nil); got != 1 {
+		t.Fatalf("nextShimProcessEpoch with an unreadable registry = %d, want 1", got)
+	}
+
+	// A prior incarnation that ended with a tombstone at epoch 5 advances the
+	// next launch to 6.
+	prior := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-prior", ProcessEpoch: 5,
+		HarnessPID: 1, HarnessStartedAt: 2,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(prior); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	if got := d.nextShimProcessEpoch(id, registry); got != 6 {
+		t.Fatalf("nextShimProcessEpoch past a tombstone at epoch 5 = %d, want 6", got)
+	}
+
+	// A live record at a higher epoch wins over the tombstone.
+	live := sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-live", ProcessEpoch: 9,
+		PID: 1, ProcessStartedAt: 2,
+		SocketPath: "/tmp/not-a-socket", ProtocolMin: 1, ProtocolMax: 2,
+		Phase: shimwire.PhaseRunning, CreatedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.Put(live); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got := d.nextShimProcessEpoch(id, registry); got != 10 {
+		t.Fatalf("nextShimProcessEpoch past a live record at epoch 9 = %d, want 10", got)
+	}
+
+	// A sibling identity is unaffected.
+	sibling := sessionshim.Identity{OrgID: id.OrgID, SessionID: "sess-other"}
+	if got := d.nextShimProcessEpoch(sibling, registry); got != 1 {
+		t.Fatalf("nextShimProcessEpoch for an untouched identity = %d, want 1", got)
+	}
+}
+
+// TestLaunchedSessionCarriesContractEpoch drives the production launch path:
+// the record a real launch publishes carries the contract's epoch — 1 on a
+// new identity, past the highest prior incarnation after one ended — not a
+// constant.
+func TestLaunchedSessionCarriesContractEpoch(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	spec := f.interactiveSpec("sess-launch-epoch")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	registry, err := f.daemon.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("sessionShimRegistry: %v", err)
+	}
+	waitFor(t, 20*time.Second, "the launched record to carry epoch 1", func() bool {
+		rec, err := registry.Get(id)
+		return err == nil && rec.ProcessEpoch == 1
+	})
+
+	// A relaunch after the lineage ended advances past the tombstone: seed
+	// a terminal proof at epoch 4 for a second session and launch it, then
+	// require epoch 5 on the published record.
+	spec2 := f.interactiveSpec("sess-relaunch-epoch")
+	id2 := f.identity(spec2.SessionID)
+	prior := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id2.OrgID, SessionID: id2.SessionID,
+		ShimID: "shim-prior", ProcessEpoch: 4,
+		HarnessPID: 1, HarnessStartedAt: 2,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(prior); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	if _, err := f.daemon.spawner.AcceptWork(spec2); err != nil {
+		t.Fatalf("AcceptWork for the relaunch: %v", err)
+	}
+	waitFor(t, 20*time.Second, "the relaunched record to carry epoch 5", func() bool {
+		rec, err := registry.Get(id2)
+		return err == nil && rec.ProcessEpoch == 5
+	})
+}

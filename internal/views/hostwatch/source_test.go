@@ -279,6 +279,17 @@ func TestRepoMatch(t *testing.T) {
 		{"donmai", "https://github.com/RenseiAI/donmai", true},
 		{"RenseiAI/donmai", "donmai", true}, // repo "donmai" is the "/donmai" suffix of the scope
 		{"o/a", "", false},
+		// The daemon reports clone URLs; the CWD scope is owner/name. A
+		// ".git" suffix, a scheme, an SSH remote or case must not hide a
+		// session that belongs to the scope.
+		{"o/a", "https://github.com/o/a.git", true},
+		{"o/a", "https://github.com/o/a/", true},
+		{"o/a", "git@github.com:o/a.git", true},
+		{"o/a", "ssh://git@github.com/o/a.git", true},
+		{"O/A", "https://github.com/o/a.git", true},
+		{"https://github.com/o/a.git", "git@github.com:o/a.git", true},
+		{"o/a", "https://github.com/o/ab.git", false},
+		{"o/a", "https://github.com/x/o/a-fork.git", false},
 	}
 	for _, tc := range tests {
 		if got := repoMatch(tc.scope, tc.repo); got != tc.want {
