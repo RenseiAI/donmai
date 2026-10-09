@@ -587,6 +587,23 @@ func cachedMatchesSessionShim(cached *CachedJWT, attestation SessionShimHostAtte
 	return validateSessionShimCredentialReceipt(attestation, cached.SessionShim, cached.WorkerID) == nil
 }
 
+// registerHTTPError carries the HTTP status and body of a refused worker
+// registration, the startup founding leg. It mirrors refreshHTTPError and
+// heartbeatHTTPError so the founding-refusal classifier can treat a refused
+// startup founding registration exactly like a refused declaring refresh: the
+// platform heard the composed attestation and answered it.
+type registerHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *registerHTTPError) Error() string {
+	if e.body != "" {
+		return fmt.Sprintf("registration failed: HTTP %d: %s", e.status, e.body)
+	}
+	return fmt.Sprintf("registration failed: HTTP %d", e.status)
+}
+
 // callRegisterEndpoint calls the real platform endpoint.
 //
 // The registration token is sent in the Authorization: Bearer header (per
@@ -617,11 +634,7 @@ func callRegisterEndpoint(ctx context.Context, opts RegistrationOptions, body *R
 	if res.StatusCode >= 400 {
 		// Read up to 2 KiB of the error body so failures are diagnosable.
 		errBuf, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
-		snippet := strings.TrimSpace(string(errBuf))
-		if snippet != "" {
-			return nil, fmt.Errorf("registration failed: HTTP %d: %s", res.StatusCode, snippet)
-		}
-		return nil, fmt.Errorf("registration failed: HTTP %d", res.StatusCode)
+		return nil, &registerHTTPError{status: res.StatusCode, body: strings.TrimSpace(string(errBuf))}
 	}
 	var resp RegisterResponse
 	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
