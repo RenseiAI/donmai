@@ -182,12 +182,6 @@ func (c *stopHookChannel) settingsJSON() (string, error) {
 		// harness already passes (additive, beside hooks), so no extra
 		// flag or file is introduced.
 		"skipDangerousModePermissionPrompt": true,
-		// skipDangerousModePermissionPrompt answers the bypass-permissions
-		// acceptance the CLI raises on an interactive TTY before the first
-		// turn — the same modal class as workspace trust, and equally
-		// unanswerable by an unattended session. It rides the settings the
-		// harness already passes (additive, beside hooks), so no extra
-		// flag or file is introduced.
 		"hooks": map[string]any{
 			"Stop": []any{
 				map[string]any{

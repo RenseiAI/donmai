@@ -2,9 +2,12 @@ package claude
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -104,17 +107,15 @@ func resolveTrustPath(dir string) string {
 }
 
 // claudeConfigHome returns the directory holding the CLI's trust record:
-// CLAUDE_CONFIG_DIR when set (absolute, or resolved against the cwd),
-// otherwise the operator's home. An empty or unusable home is an error the
-// caller treats as "do not seed".
+// CLAUDE_CONFIG_DIR when set, otherwise the operator's home. A relative
+// override is an error the caller treats as "do not seed": the CLI
+// resolves its own config home by its own rules, so resolving a relative
+// override against the worker process cwd would seed the wrong home — a
+// seed that silently does nothing while the session still hits the modal.
 func claudeConfigHome() (string, error) {
 	if override := os.Getenv(claudeConfigDirEnv); override != "" {
 		if !filepath.IsAbs(override) {
-			abs, err := filepath.Abs(override)
-			if err != nil {
-				return "", err
-			}
-			override = abs
+			return "", fmt.Errorf("relative %s %q: refusing to seed outside the CLI's own config home", claudeConfigDirEnv, override)
 		}
 		return override, nil
 	}
@@ -131,10 +132,22 @@ const claudeTrustFileName = ".claude.json"
 // seedTrustFile adds dirs to the trust record at path, creating the file
 // when absent. Malformed content starts fresh; unknown fields are
 // preserved; existing trust entries are kept. Every failure is silent.
+//
+// The read-modify-write merges under a sibling lock directory, so
+// concurrent sessions sharing one config home cannot lose each other's
+// entries: without the lock the loser of the race rewrites the winner's
+// seed away and parks on the workspace-trust modal. The final write rides
+// a temp-file rename, so a concurrent reader never sees a half-written
+// record.
 func seedTrustFile(path string, dirs []string) {
 	if path == "" || len(dirs) == 0 {
 		return
 	}
+	release, ok := acquireTrustLock(path)
+	if !ok {
+		return
+	}
+	defer release()
 	var record map[string]any
 	if data, err := os.ReadFile(path); err == nil { //nolint:gosec // config path, not session input
 		_ = json.Unmarshal(data, &record) // tolerate a malformed file → start fresh below
@@ -168,8 +181,87 @@ func seedTrustFile(path string, dirs []string) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return
 	}
-	//nolint:gosec // 0600 owner-only; the record holds no secrets but the CLI's own file is 0600
-	_ = os.WriteFile(path, body, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".claude.json.tmp-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+	}
+}
+
+// Trust-lock tuning: the seed holds the lock for one small read plus one
+// small write (milliseconds), so a lock older than trustLockStaleAfter can
+// only belong to a dead holder. Bounded retries keep a contended spawn
+// from stalling: losing the race skips the seed and the modal says so.
+const (
+	trustLockSuffix     = ".lock.d"
+	trustLockStaleAfter = 30 * time.Second
+	trustLockRetries    = 100
+	trustLockRetryWait  = 10 * time.Millisecond
+)
+
+// acquireTrustLock serializes trust-record merges across every session
+// sharing the config home, in-process and cross-process: directory
+// creation is atomic, so exactly one contender wins the Mkdir. The
+// returned release removes the lock directory; ok is false when the lock
+// cannot be taken in time or the parent cannot be prepared — both silent
+// under the seed's best-effort contract.
+func acquireTrustLock(path string) (release func(), ok bool) {
+	lockDir := path + trustLockSuffix
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, false
+	}
+	for range trustLockRetries {
+		if err := os.Mkdir(lockDir, 0o700); err == nil {
+			stampTrustLock(lockDir)
+			return func() { _ = os.RemoveAll(lockDir) }, true
+		} else if !errors.Is(err, os.ErrExist) {
+			return nil, false
+		}
+		if trustLockIsStale(lockDir) {
+			_ = os.RemoveAll(lockDir)
+			continue
+		}
+		time.Sleep(trustLockRetryWait)
+	}
+	return nil, false
+}
+
+// stampTrustLock records when this holder took the lock, so a contender
+// can tell a live merge (milliseconds old) from a dead holder's residue.
+// Best-effort: an unstamped lock simply never reads as stale.
+func stampTrustLock(lockDir string) {
+	_ = os.WriteFile( //nolint:gosec // harness-owned lock dir, fixed filename
+		filepath.Join(lockDir, "holder"),
+		[]byte(time.Now().UTC().Format(time.RFC3339Nano)),
+		0o600,
+	)
+}
+
+// trustLockIsStale reports whether the lock directory belongs to a holder
+// that cannot still be merging. Anything unreadable or unparseable reads
+// as live: only a positively old stamp breaks the lock.
+func trustLockIsStale(lockDir string) bool {
+	raw, err := os.ReadFile(filepath.Join(lockDir, "holder")) //nolint:gosec // harness-owned lock dir, fixed filename
+	if err != nil {
+		return false
+	}
+	stamped, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return false
+	}
+	return time.Since(stamped) > trustLockStaleAfter
 }
 
 // claudeTrustProjectsKey / claudeTrustAcceptedKey are the trust-record

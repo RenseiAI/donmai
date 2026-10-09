@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -152,6 +153,76 @@ func TestSeedTrustFile_ToleratesMalformedContent(t *testing.T) {
 	added, _ := projects["/session/worktree"].(map[string]any)
 	if added["hasTrustDialogAccepted"] != true {
 		t.Errorf("seed missing after malformed repair: %v", after)
+	}
+}
+
+// TestSeedTrustFile_ConcurrentSeedsKeepEveryEntry drives the PRODUCTION
+// merge under fleet-daemon concurrency: N sessions sharing one config home
+// each seed one distinct directory at once, and all N entries — plus a
+// pre-existing one — must survive. A read-modify-write merge with no lock
+// parks the loser on the workspace-trust modal, the exact defect the seed
+// exists to close.
+func TestSeedTrustFile_ConcurrentSeedsKeepEveryEntry(t *testing.T) {
+	const sessions = 16
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	if raw, err := json.Marshal(map[string]any{
+		"projects": map[string]any{"/pre/existing": map[string]any{claudeTrustAcceptedKey: true}},
+	}); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dirs := make([]string, sessions)
+	for i := range dirs {
+		dirs[i] = filepath.Join(string(filepath.Separator), "session", "worktree-"+strings.Repeat("x", i+1))
+	}
+	var wg sync.WaitGroup
+	for _, dir := range dirs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			seedTrustFile(path, []string{dir})
+		}()
+	}
+	wg.Wait()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after map[string]any
+	if err := json.Unmarshal(raw, &after); err != nil {
+		t.Fatalf("concurrent seed left an unparseable record: %v", err)
+	}
+	projects, _ := after["projects"].(map[string]any)
+	if projects == nil {
+		t.Fatalf("concurrent seed dropped the projects record: %v", after)
+	}
+	var missing []string
+	if _, ok := projects["/pre/existing"]; !ok {
+		missing = append(missing, "/pre/existing")
+	}
+	for _, dir := range dirs {
+		entry, _ := projects[dir].(map[string]any)
+		if accepted, _ := entry[claudeTrustAcceptedKey].(bool); !accepted {
+			missing = append(missing, dir)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("concurrent seed lost %d/%d entries: %q", len(missing), sessions+1, missing)
+	}
+}
+
+// TestClaudeConfigHome_RejectsARelativeOverride proves a relative
+// config-home redirect is not resolved against the worker process cwd: the
+// CLI resolves its own config home by its own rules, so seeding the
+// worker-relative path would silently seed the wrong home and leave the
+// session on the modal.
+func TestClaudeConfigHome_RejectsARelativeOverride(t *testing.T) {
+	t.Setenv(claudeConfigDirEnv, filepath.Join("relative", "config", "home"))
+	if home, err := claudeConfigHome(); err == nil {
+		t.Errorf("claudeConfigHome() = %q, want an error for a relative override — seeding it would miss the CLI's home", home)
 	}
 }
 
@@ -334,6 +405,44 @@ func TestApplyEndpoint_GatewayHostProjectsTokenPairNotKeyName(t *testing.T) {
 				t.Errorf("modal-generating key name survives the projection: %v", got.Env)
 			}
 		})
+	}
+}
+
+// TestPickGatewayBearer_IgnoresUnrelatedCredentialNames pins the bearer
+// allowlist: only the two bearer spellings are read, so an unrelated
+// credential on the layer can never be presented as the session bearer.
+// A generic "first non-empty value" fallback would pass every other
+// gateway test and silently mis-route the session onto the wrong key.
+func TestPickGatewayBearer_IgnoresUnrelatedCredentialNames(t *testing.T) {
+	t.Parallel()
+	if got := pickGatewayBearer(map[string]string{"SOME_OTHER_KEY": "unrelated"}); got != "" {
+		t.Errorf("pickGatewayBearer(unrelated-only) = %q, want empty — unrelated keys must never read as the bearer", got)
+	}
+	if got := pickGatewayBearer(map[string]string{
+		"SOME_OTHER_KEY":    "unrelated",
+		gatewayModalKeyName: "re-homed",
+	}); got != "re-homed" {
+		t.Errorf("pickGatewayBearer(unrelated + key name) = %q, want the bearer spelling to win", got)
+	}
+}
+
+// TestApplyEndpoint_GatewayHostWithOnlyUnrelatedKeysFailsLoudly proves a
+// gateway binding carrying credentials under no bearer spelling fails the
+// spawn like the bearer-less case — never by projecting an unrelated key
+// onto the token pair.
+func TestApplyEndpoint_GatewayHostWithOnlyUnrelatedKeysFailsLoudly(t *testing.T) {
+	t.Parallel()
+	_, err := applyEndpoint(agent.Spec{
+		Endpoint: &agent.EndpointBinding{
+			Company: agent.CompanyAnthropic,
+			Model:   "served-model",
+			Host:    agent.HostGateway,
+			BaseURL: "http://127.0.0.1:1/v1",
+			Env:     map[string]string{"SOME_OTHER_KEY": "unrelated"},
+		},
+	})
+	if err == nil {
+		t.Fatal("applyEndpoint: want error for a gateway binding with no bearer spelling, got nil")
 	}
 }
 
