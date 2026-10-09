@@ -1350,6 +1350,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Apply event-stream observations onto the result envelope.
 	streamRes.applyTo(res, provider.Name())
+	res.noteToolCalls(streamRes.toolCalls)
 
 	// 10·M. Turn-result manifest resolution (W3 — deterministic turn outcome).
 	// Resolution order for the verdict: the agent-written
@@ -1440,6 +1441,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	if runtimeInjectEnabled && !streamRes.blocked && budgetStop == nil {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
+		res.noteToolCalls(injRes.toolCalls)
 		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
 			applyFollowUp(injRes)
 		}
@@ -1545,6 +1547,7 @@ tailRecovery:
 			// liveness.
 			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
+			res.noteToolCalls(tailRes.toolCalls)
 			applyFollowUp(tailRes)
 			lastTurn = tailRes
 			if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
@@ -1613,6 +1616,7 @@ tailRecovery:
 			return res, stopErr
 		}
 		tail.applyTo(res, provider.Name())
+		res.noteToolCalls(tail.toolCalls)
 		applyFollowUp(tail)
 		lastTurn = tail
 		if budget != nil {
@@ -2359,6 +2363,7 @@ func (r *Runner) drainMemoryInjects(
 			// turn — never a provider error to retry outside that bound.
 			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
 			injRes.applyTo(res, res.ProviderName)
+			res.noteToolCalls(injRes.toolCalls)
 			merged = injRes
 			if enforcer != nil && enforcer.breached() != nil {
 				// A budget cap ended the turn: deliver nothing more.

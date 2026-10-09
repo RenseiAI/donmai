@@ -66,6 +66,18 @@ func (r *Runner) runPostSession(parentCtx context.Context, qw QueuedWork, res *R
 
 	decision := resolveTargetStatus(workType, res.Status, workResult, hasMergeQueueAdapter)
 
+	// Retry-eligible attempts leave the tracker issue untouched so a
+	// re-dispatch starts from the same state. The deferral applies only
+	// to the failure-side branch: a provider-error failure with zero
+	// tool calls on work that opts in. The skipped transition is
+	// recorded on the terminal result (reason "deferred-provider-error")
+	// so the control plane can complete or apply it later.
+	if decision.ShouldTransition && shouldDeferFailureTransition(qw.DeferFailureTransition, res.FailureMode, res.sessionToolCalls()) {
+		decision.ShouldTransition = false
+		decision.Deferred = true
+		decision.Reason = "deferred-provider-error"
+	}
+
 	// Mirror the decision onto the result envelope before any side
 	// effect so the caller sees the chosen branch even if the proxy
 	// call below errors out.
@@ -147,9 +159,10 @@ func (r *Runner) runPostSession(parentCtx context.Context, qw QueuedWork, res *R
 	// Nothing to do for these branches; the decision is already
 	// recorded on transition.Reason so dashboards can surface it.
 	if decision.Deferred {
-		r.logger.Info("post-session: transition deferred to merge queue",
+		r.logger.Info("post-session: transition deferred",
 			"sessionId", qw.SessionID,
 			"workType", decision.WorkType,
+			"reason", decision.Reason,
 		)
 	} else {
 		r.logger.Debug("post-session: no transition required",

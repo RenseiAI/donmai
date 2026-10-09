@@ -534,3 +534,117 @@ func TestRunPostSession_NoIssueIDSkips(t *testing.T) {
 		t.Errorf("expected validation warning; got 0")
 	}
 }
+
+// TestRunPostSession_ProviderErrorDefersFailureTransition covers the
+// retry-eligible path end to end through the production entry point:
+// opted-in work that fails on a provider error with zero tool calls makes
+// no tracker call and records the deferral on the terminal result.
+func TestRunPostSession_ProviderErrorDefersFailureTransition(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+	r := makePostSessionRunner(t, srv)
+
+	qw := QueuedWork{
+		QueuedWork:             queuedWorkBase("REN-PS-DEFER"),
+		WorkerID:               "wkr-post",
+		AuthToken:              "tok-post",
+		PlatformURL:            srv.URL,
+		DeferFailureTransition: true,
+	}
+	qw.WorkType = WorkTypeQAStr
+	qw.IssueID = "issue-uuid-defer"
+
+	res := &Result{}
+	res.Status = "failed"
+	res.FailureMode = FailureProviderError
+
+	r.runPostSession(context.Background(), qw, res)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 0 {
+		t.Fatalf("expected 0 proxy calls (deferred failure transition); got %d (%v)", len(*calls), *calls)
+	}
+	tr := res.LinearStatusTransition
+	if tr == nil {
+		t.Fatal("expected a LinearStatusTransition; got nil")
+	}
+	if tr.Attempted {
+		t.Errorf("Attempted = true; want false (deferred)")
+	}
+	if tr.Succeeded {
+		t.Errorf("Succeeded = true; want false (deferred)")
+	}
+	if tr.Reason != "deferred-provider-error" {
+		t.Errorf("Reason = %q; want deferred-provider-error", tr.Reason)
+	}
+	if tr.TargetStatus != "Rejected" {
+		t.Errorf("TargetStatus = %q; want Rejected (recorded for a later re-dispatch)", tr.TargetStatus)
+	}
+}
+
+// TestRunPostSession_ProviderErrorWithoutFlagTransitions covers the
+// unchanged path: without the opt-in, the same provider-error failure
+// still transitions the issue to its failure status.
+func TestRunPostSession_ProviderErrorWithoutFlagTransitions(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+	r := makePostSessionRunner(t, srv)
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-PS-NODEFER"),
+		WorkerID:    "wkr-post",
+		AuthToken:   "tok-post",
+		PlatformURL: srv.URL,
+	}
+	qw.WorkType = WorkTypeQAStr
+	qw.IssueID = "issue-uuid-nodefer"
+
+	res := &Result{}
+	res.Status = "failed"
+	res.FailureMode = FailureProviderError
+
+	r.runPostSession(context.Background(), qw, res)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 proxy call; got %d", len(*calls))
+	}
+	c := (*calls)[0]
+	if c.Method != "updateIssueStatus" || c.Args[1] != "Rejected" {
+		t.Errorf("got Method=%s Args=%v; want updateIssueStatus [issue Rejected]", c.Method, c.Args)
+	}
+}
+
+// TestRunPostSession_ProviderErrorWithToolCallsTransitions covers the
+// side-effect guard: opted-in work that made a tool call keeps the prior
+// behaviour even on a provider-error failure.
+func TestRunPostSession_ProviderErrorWithToolCallsTransitions(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+	r := makePostSessionRunner(t, srv)
+
+	qw := QueuedWork{
+		QueuedWork:             queuedWorkBase("REN-PS-CALLS"),
+		WorkerID:               "wkr-post",
+		AuthToken:              "tok-post",
+		PlatformURL:            srv.URL,
+		DeferFailureTransition: true,
+	}
+	qw.WorkType = WorkTypeQAStr
+	qw.IssueID = "issue-uuid-calls"
+
+	res := &Result{}
+	res.Status = "failed"
+	res.FailureMode = FailureProviderError
+	res.noteToolCalls(1)
+
+	r.runPostSession(context.Background(), qw, res)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 proxy call (tool call ran, no deferral); got %d", len(*calls))
+	}
+	if res.LinearStatusTransition == nil || res.LinearStatusTransition.Reason != "agent-failed" {
+		t.Errorf("Reason = %v; want agent-failed", res.LinearStatusTransition)
+	}
+}
