@@ -587,10 +587,6 @@ func cachedMatchesSessionShim(cached *CachedJWT, attestation SessionShimHostAtte
 	return validateSessionShimCredentialReceipt(attestation, cached.SessionShim, cached.WorkerID) == nil
 }
 
-// callRegisterEndpoint calls the real platform endpoint.
-//
-// The registration token is sent in the Authorization: Bearer header (per
-// platform contract — the token is NOT in the request body).
 // registerHTTPError carries the HTTP status and body of a refused worker
 // registration, the startup founding leg. It mirrors refreshHTTPError and
 // heartbeatHTTPError so the founding-refusal classifier can treat a refused
@@ -608,6 +604,10 @@ func (e *registerHTTPError) Error() string {
 	return fmt.Sprintf("registration failed: HTTP %d", e.status)
 }
 
+// callRegisterEndpoint calls the real platform endpoint.
+//
+// The registration token is sent in the Authorization: Bearer header (per
+// platform contract — the token is NOT in the request body).
 func callRegisterEndpoint(ctx context.Context, opts RegistrationOptions, body *RegisterRequest) (*RegisterResponse, error) {
 	client := opts.HTTPClient
 	if client == nil {
