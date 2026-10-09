@@ -169,8 +169,8 @@ func TestV6ProfileRefusalAnswersOnTheWire(t *testing.T) {
 			}
 			select {
 			case err := <-refused:
-				if !errors.Is(err, ErrMalformed) {
-					t.Fatalf("profile read = %v, want ErrMalformed", err)
+				if !errors.Is(err, ErrMalformed) || !errors.Is(err, ErrProfileRefused) {
+					t.Fatalf("profile read = %v, want ErrProfileRefused and ErrMalformed", err)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("profile read did not report the refusal")
@@ -341,4 +341,47 @@ func TestReleasedV1ThroughV5BytesAreIdentical(t *testing.T) {
 			t.Fatalf("v6 credential update body refused by its own decoder: %v", err)
 		}
 	})
+}
+
+// TestV6CorpusHeadlessReadFrameLevelMalformedIsNotAProfileRefusal pins the
+// split between the two refusals a headless profile read can report. A
+// decoded PTY-shaped type is a profile refusal, answered on the wire, after
+// which the caller keeps reading. A frame-level defect (zero length, an
+// unassigned type) is plain ErrMalformed with no answer, which ends the
+// connection exactly as it does on the interactive profile; it must never be
+// mistaken for an answered refusal and silently skipped.
+func TestV6CorpusHeadlessReadFrameLevelMalformedIsNotAProfileRefusal(t *testing.T) {
+	t.Parallel()
+
+	frames := map[string][]byte{
+		"zero length":     {0, 0, 0, 0},
+		"unassigned type": {0, 0, 0, 3, 0x16, '{', '}'},
+	}
+	for name, frame := range frames {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			shim, controller := netPipe(t)
+			shimReader, shimWriter := NewReader(shim), NewWriter(shim)
+
+			read := make(chan error, 1)
+			go func() {
+				_, err := shimReader.ReadProfileVersion(shimWriter, ProfileHeadless, V6)
+				read <- err
+			}()
+			if _, err := controller.Write(frame); err != nil {
+				t.Fatalf("write %s frame: %v", name, err)
+			}
+			select {
+			case err := <-read:
+				if !errors.Is(err, ErrMalformed) {
+					t.Fatalf("profile read of a %s frame = %v, want ErrMalformed", name, err)
+				}
+				if errors.Is(err, ErrProfileRefused) {
+					t.Fatalf("profile read of a %s frame = %v, reported as an answered profile refusal", name, err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("profile read of a %s frame did not return", name)
+			}
+		})
+	}
 }

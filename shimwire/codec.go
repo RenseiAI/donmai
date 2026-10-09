@@ -185,5 +185,5 @@ func (x *Reader) ReadProfileVersion(w *Writer, profile Profile, version uint32) 
 	if wErr := w.WriteVersion(version, TypeError, body); wErr != nil {
 		return Message{}, fmt.Errorf("shimwire: refuse %s on the headless profile: %w", msg.Type, wErr)
 	}
-	return Message{}, fmt.Errorf("shimwire: refuse %s on the headless profile: %w", msg.Type, ErrMalformed)
+	return Message{}, fmt.Errorf("shimwire: refuse %s on the headless profile: %w: %w", msg.Type, ErrProfileRefused, ErrMalformed)
 }

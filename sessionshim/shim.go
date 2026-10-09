@@ -1970,10 +1970,11 @@ func (s *Shim) readControllerFrame(ctrl *controllerConn, r *shimwire.Reader) (co
 	}
 	msg, err := r.ReadProfileVersion(ctrl.w, ctrl.profile, ctrl.selected)
 	if err != nil {
-		if errors.Is(err, shimwire.ErrMalformed) {
+		if errors.Is(err, shimwire.ErrProfileRefused) {
 			// A refused PTY-shaped frame: the reader already answered it.
-			// A readVersion-level refusal (unknown length or type) carries
-			// no message to answer, and ends the connection as before.
+			// A readVersion-level refusal (zero length or unknown type) is
+			// plain ErrMalformed with no answer, and ends the connection
+			// exactly as it does on the interactive profile.
 			return controllerFrame{Handled: true}, nil
 		}
 		return controllerFrame{}, err

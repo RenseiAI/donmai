@@ -597,3 +597,48 @@ func TestHeadlessNewerControllerSupersedesLiveOld(t *testing.T) {
 		}
 	}
 }
+
+// TestHeadlessFrameLevelMalformedEndsTheConnection pins the headless control
+// read's handling of a frame-level defect: a zero-length frame or an
+// unassigned type is never answered and never skipped — it ends the
+// connection exactly as it does on the interactive profile — while the runner
+// keeps running and a fresh controller can adopt again. Only a decoded
+// PTY-shaped type is an answered profile refusal that keeps the connection.
+func TestHeadlessFrameLevelMalformedEndsTheConnection(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeRunner(t)
+	_, registry, id := startHeadlessFixture(t, runner, 1)
+	rec, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := []struct {
+		name  string
+		bytes []byte
+	}{
+		{"zero length", []byte{0, 0, 0, 0}},
+		{"unassigned type", []byte{0, 0, 0, 3, 0x16, '{', '}'}},
+	}
+	for _, frame := range frames {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-" + frame.name})
+		cancel()
+		if err != nil {
+			t.Fatalf("%s: Dial headless record: %v", frame.name, err)
+		}
+		if _, err := ctrl.conn.Write(frame.bytes); err != nil {
+			t.Fatalf("%s: write frame: %v", frame.name, err)
+		}
+		select {
+		case <-ctrl.Done():
+		case <-time.After(5 * time.Second):
+			_ = ctrl.Close()
+			t.Fatalf("%s: the headless connection survived a frame-level malformed frame; it was silently skipped", frame.name)
+		}
+		_ = ctrl.Close()
+		if runner.wasStopped() {
+			t.Fatalf("%s: a malformed frame stopped the runner", frame.name)
+		}
+	}
+}
