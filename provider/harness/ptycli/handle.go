@@ -27,8 +27,9 @@ const stopGrace = 5 * time.Second
 // shared by every harness's interactive PTY spawn mode. See doc.go for the
 // event-semantics and suspend/resume contract.
 type Handle struct {
-	sess   *ptyhost.Session
-	events chan agent.Event
+	sess         *ptyhost.Session
+	events       chan agent.Event
+	terminalCost func() *agent.CostData
 
 	// shim is non-nil when this process OWNS the session on behalf of a
 	// replaceable controller (ADR-2026-08-17 §D1). The handle still drives the
@@ -94,6 +95,16 @@ type SpawnOptions struct {
 	// allowlist. The interactive terminal defaults and the runner-only
 	// refusal still apply.
 	ExactEnv bool
+
+	// TerminalCost is read once the PTY child exits and attached as the
+	// terminal ResultEvent's Cost. It lets a harness whose interactive
+	// surface emits no structured usage of its own (the byte-accurate PTY
+	// stream is the product) report the session's real totals from
+	// wherever it persisted them — for example the native session file.
+	// Nil keeps the historical bare result. A nil return likewise keeps
+	// the previous cost rather than reporting a zero that never ran, so
+	// a session whose records are absent is "unknown", never "free".
+	TerminalCost func() *agent.CostData
 }
 
 // SpawnWithOptions is Spawn with the optional per-spawn controls in opts.
@@ -144,8 +155,9 @@ func SpawnWithOptions(ctx context.Context, binary string, argv []string, spec ag
 		// Buffered for exactly the two events this driver ever emits
 		// (InitEvent, terminal ResultEvent) so sendEvent never blocks on a
 		// slow/absent consumer.
-		events:    make(chan agent.Event, 2),
-		cleanupFn: cleanup,
+		events:       make(chan agent.Event, 2),
+		cleanupFn:    cleanup,
+		terminalCost: opts.TerminalCost,
 	}
 	// The session is up the instant ptyhost.Spawn returns (pty.StartWithSize
 	// blocks until fork+exec completes) — emit InitEvent synchronously,
@@ -245,11 +257,33 @@ func (h *Handle) run() {
 	h.awaitShimTerminal()
 	exit, _ := h.sess.Exit()
 	result := buildResult(exit)
+	if cost := h.readTerminalCost(); cost != nil {
+		if res, ok := result.(agent.ResultEvent); ok {
+			res.Cost = cost
+			result = res
+		}
+	}
 	if err := h.cleanup(); err != nil {
 		result = cleanupFailureResult(err)
 	}
 	h.events <- result
 	h.closeOnce.Do(func() { close(h.events) })
+}
+
+// readTerminalCost invokes the harness-supplied TerminalCost exactly once,
+// after the child has exited so its persisted records are fully flushed.
+// A nil hook or a nil return keeps the bare result; a panic in the hook
+// must never take down the terminal event, so it is recovered to nil.
+func (h *Handle) readTerminalCost() (cost *agent.CostData) {
+	if h.terminalCost == nil {
+		return nil
+	}
+	defer func() {
+		if recover() != nil {
+			cost = nil
+		}
+	}()
+	return h.terminalCost()
 }
 
 func cleanupFailureResult(err error) agent.Event {

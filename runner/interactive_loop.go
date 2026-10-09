@@ -469,7 +469,7 @@ func (r *Runner) dispatchInteractive(
 		case <-isess.Done():
 			// Child exited and the PTY drained to EOF (Exit emitted). Deliver
 			// the handle's trailing activity before the session-ended marker.
-			r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink)
+			r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink, res)
 			return r.finishInteractive(worktreePath, qw, res, sink, isess), nil
 
 		case <-interactiveCtx.Done():
@@ -635,6 +635,13 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 // after Done, so keep forwarding events until it signals the flush (bounded
 // by interactiveActivityFlushGrace); then forward whatever is already
 // buffered without waiting. events may be nil (already closed).
+//
+// The handle's terminal ResultEvent is consumed here too — not forwarded as
+// activity, but applied to the session result: a harness whose interactive
+// surface emits no structured usage of its own attaches its real totals (for
+// example read from its native session file at child exit) as that event's
+// cost, and this is what carries them onto the terminal result. A nil cost
+// keeps whatever the result already carries.
 func (r *Runner) drainInteractiveActivity(
 	ctx context.Context,
 	handle agent.Handle,
@@ -642,6 +649,7 @@ func (r *Runner) drainInteractiveActivity(
 	worktreePath string,
 	qw QueuedWork,
 	sink activitySink,
+	res *Result,
 ) {
 	if flusher, ok := handle.(agent.InteractiveActivityFlusher); ok {
 		grace := time.NewTimer(interactiveActivityFlushGrace)
@@ -654,6 +662,7 @@ func (r *Runner) drainInteractiveActivity(
 					return
 				}
 				r.reportQuotaEvent(ctx, qw.SessionID, event)
+				r.applyInteractiveTerminalEvent(event, res)
 				r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
 			case <-flusher.ActivityFlushed():
 				break wait
@@ -671,11 +680,54 @@ func (r *Runner) drainInteractiveActivity(
 				return
 			}
 			r.reportQuotaEvent(ctx, qw.SessionID, event)
+			r.applyInteractiveTerminalEvent(event, res)
 			r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
 		default:
 			return
 		}
 	}
+}
+
+// applyInteractiveTerminalEvent carries a harness-reported terminal cost
+// onto the session result. Interactive sessions never flow through the
+// budget enforcer (human think-time is not metered), so without this the
+// totals a handle attaches to its terminal ResultEvent would be observed
+// for quota and dropped for billing.
+func (r *Runner) applyInteractiveTerminalEvent(event agent.Event, res *Result) {
+	if res == nil {
+		return
+	}
+	result, ok := event.(agent.ResultEvent)
+	if !ok || result.Cost == nil {
+		return
+	}
+	if res.Cost == nil {
+		res.Cost = result.Cost
+		return
+	}
+	merged := *res.Cost
+	if result.Cost.InputTokens > merged.InputTokens {
+		merged.InputTokens = result.Cost.InputTokens
+	}
+	if result.Cost.OutputTokens > merged.OutputTokens {
+		merged.OutputTokens = result.Cost.OutputTokens
+	}
+	if result.Cost.CachedInputTokens > merged.CachedInputTokens {
+		merged.CachedInputTokens = result.Cost.CachedInputTokens
+	}
+	if result.Cost.CacheWriteTokens > merged.CacheWriteTokens {
+		merged.CacheWriteTokens = result.Cost.CacheWriteTokens
+	}
+	if result.Cost.ReasoningTokens > merged.ReasoningTokens {
+		merged.ReasoningTokens = result.Cost.ReasoningTokens
+	}
+	if result.Cost.TotalCostUsd > merged.TotalCostUsd {
+		merged.TotalCostUsd = result.Cost.TotalCostUsd
+	}
+	if result.Cost.NumTurns > merged.NumTurns {
+		merged.NumTurns = result.Cost.NumTurns
+	}
+	res.Cost = &merged
 }
 
 // postInteractiveActivity emits ONE coarse, low-cadence lifecycle signal:

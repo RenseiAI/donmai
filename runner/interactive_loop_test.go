@@ -1767,3 +1767,76 @@ func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
 		t.Fatalf("unreadable warning count=%d; want 2 after recovery and recurrence\nlogs:\n%s", got, logs.String())
 	}
 }
+
+// TestInteractive_TerminalCostReachesSessionResult drives the production
+// dispatchInteractive entry point with a handle whose terminal ResultEvent
+// carries session-file totals: the drain must apply them to the session
+// result even though the terminal status (completed, from the exit payload)
+// is decided by the PTY lifecycle. Removing the apply call from the drain
+// leaves the result costless and turns this red.
+func TestInteractive_TerminalCostReachesSessionResult(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{}
+	events <- agent.ResultEvent{Success: true, Cost: &agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}}
+	close(events)
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "terminal-cost"}}
+	res := &Result{SessionID: qw.SessionID}
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil {
+		t.Fatalf("dispatchInteractive: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", out.Status)
+	}
+	if out.Cost == nil {
+		t.Fatal("session result carries no cost; want the handle's terminal totals")
+	}
+	want := agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}
+	if *out.Cost != want {
+		t.Fatalf("session cost = %+v, want %+v", out.Cost, want)
+	}
+}
+
+// TestInteractive_BareTerminalKeepsResultCostless is the companion: a handle
+// whose terminal ResultEvent carries no cost leaves the session result
+// costless instead of fabricating a zero.
+func TestInteractive_BareTerminalKeepsResultCostless(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{}
+	events <- agent.ResultEvent{Success: true}
+	close(events)
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "bare-terminal"}}
+	res := &Result{SessionID: qw.SessionID}
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil {
+		t.Fatalf("dispatchInteractive: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", out.Status)
+	}
+	if out.Cost != nil {
+		t.Fatalf("session cost = %+v with a bare terminal, want nil", out.Cost)
+	}
+}
