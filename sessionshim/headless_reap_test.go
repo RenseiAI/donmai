@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -206,6 +207,13 @@ func TestHeadlessReapProofIsNeverAssumed(t *testing.T) {
 // gone, the same group after its members are killed and waited is gone, and
 // the probes that would name the caller's own group or every process are
 // refused rather than answered.
+//
+// The EPERM branch is driven with an injected probe, because the kernel state
+// behind it is a race: darwin answers EPERM, not ESRCH, for a group that still
+// exists with no live member while it is torn down (seen under parallel load
+// right after the harness was killed and waited). There the members are
+// counted, so an emptied group is gone and a populated one is not; on Linux
+// EPERM already means a live member owned by another user.
 func TestProcessGroupGone(t *testing.T) {
 	t.Parallel()
 
@@ -232,5 +240,25 @@ func TestProcessGroupGone(t *testing.T) {
 	_ = cmd.Wait()
 	if gone, err := ProcessGroupGone(pgid); err != nil || !gone {
 		t.Fatalf("ProcessGroupGone(killed and waited group) = (%v,%v), want (true,nil)", gone, err)
+	}
+
+	eperm := func(int, syscall.Signal) error { return syscall.EPERM }
+	wantEmptied := runtime.GOOS == "darwin"
+	if gone, err := processGroupGone(pgid, eperm); err != nil || gone != wantEmptied {
+		t.Fatalf("processGroupGone(emptied group, EPERM) on %s = (%v,%v), want (%v,nil)", runtime.GOOS, gone, err, wantEmptied)
+	}
+	//nolint:gosec // G204: fixed test-only argv
+	live := exec.Command("/bin/sleep", "60")
+	live.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := live.Start(); err != nil {
+		t.Fatal(err)
+	}
+	livePgid := live.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(-livePgid, syscall.SIGKILL)
+		_ = live.Wait()
+	})
+	if gone, err := processGroupGone(livePgid, eperm); err != nil || gone {
+		t.Fatalf("processGroupGone(populated group, EPERM) = (%v,%v), want (false,nil)", gone, err)
 	}
 }
