@@ -37,7 +37,10 @@ const (
 	CredentialHelperGH CredentialHelperKind = "gh"
 )
 
-// CloneStrategy controls how the daemon clones a repo for session workareas.
+// CloneStrategy is the retired per-repository clone override. The key is
+// still tolerated on read (see the deprecation notice in ReadDaemonYAML) but
+// is never written and never influences behaviour. The constants stay so
+// previously written values keep decoding to the same strings.
 type CloneStrategy string
 
 const (
@@ -77,6 +80,10 @@ type CredentialHelper struct {
 //
 // On read, ProjectEntry tolerates the legacy `repoUrl` key for one cycle
 // (see UnmarshalYAML below) so pre-fix files in the wild still load.
+//
+// The retired per-repository clone override is not modelled here. Files that
+// still carry the key keep loading; ReadDaemonYAML logs one deprecation
+// warning per file and the value is ignored. Writers never emit the key.
 type ProjectEntry struct {
 	// ID is the daemon-side project identifier. The daemon reader requires
 	// projects[i].id (see daemon/config.go validateConfig); DeriveProjectID
@@ -85,15 +92,14 @@ type ProjectEntry struct {
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// RepoURL is the canonical remote URL, e.g. "github.com/foo/bar".
 	RepoURL string `yaml:"repository" json:"repository"`
-	// CloneStrategy controls how the daemon clones the repo. Default: shallow.
-	CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty" json:"cloneStrategy,omitempty"`
 	// CredentialHelper is the credential source for this project.
 	// A nil pointer means no credentials are configured (--no-credentials).
 	CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty" json:"credentialHelper,omitempty"`
 }
 
 // RepositoryEntry is one normalized repository resource. Its ProjectID link
-// does not grant project admission.
+// does not grant project admission. The retired clone override is not
+// modelled here; see ProjectEntry.
 type RepositoryEntry struct {
 	// ID is the durable repository-row identifier. It remains distinct from
 	// PathID so consumers retain database metadata without confusing it for the
@@ -105,7 +111,6 @@ type RepositoryEntry struct {
 	ProjectID        string            `yaml:"projectId"                  json:"projectId"`
 	Source           string            `yaml:"source"                     json:"source"`
 	Primary          bool              `yaml:"primary,omitempty"          json:"primary,omitempty"`
-	CloneStrategy    CloneStrategy     `yaml:"cloneStrategy,omitempty"    json:"cloneStrategy,omitempty"`
 	CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty" json:"credentialHelper,omitempty"`
 }
 
@@ -113,19 +118,21 @@ type RepositoryEntry struct {
 // legacy `repoUrl` key. When the legacy key is found a
 // one-line warning is logged via slog so operators know to rewrite the file
 // (the next write will use the canonical key automatically).
+//
+// The retired `cloneStrategy` key is not decoded: files that still carry it
+// keep loading and the value is ignored. ReadDaemonYAML logs one deprecation
+// warning per file, so this decoder stays silent.
 func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
 		ID               string            `yaml:"id"`
 		Repository       string            `yaml:"repository"`
 		RepoURL          string            `yaml:"repoUrl"`
-		CloneStrategy    CloneStrategy     `yaml:"cloneStrategy,omitempty"`
 		CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty"`
 	}
 	if err := node.Decode(&raw); err != nil {
 		return err
 	}
 	p.ID = raw.ID
-	p.CloneStrategy = raw.CloneStrategy
 	p.CredentialHelper = raw.CredentialHelper
 	switch {
 	case raw.Repository != "":
@@ -202,6 +209,59 @@ func NormalizeProjectAdmissionMode(mode string) string {
 	return ProjectAdmissionModeEnumerated
 }
 
+// retiredCloneStrategyWarning is the single deprecation notice logged when
+// a read encounters the retired per-repository clone override. The key is
+// ignored; the warning tells operators to drop it.
+const retiredCloneStrategyWarning = "daemon.yaml: 'cloneStrategy' is retired and ignored; remove the key"
+
+// warnIfRetiredCloneStrategyPresent logs exactly one deprecation warning
+// when the raw file still carries the retired key on any entry. The typed
+// decoder ignores the key, so detection runs on the raw mapping tree.
+func warnIfRetiredCloneStrategyPresent(data []byte) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := root.Content[i]
+		if key.Kind != yaml.ScalarNode {
+			continue
+		}
+		if key.Value != "projects" && key.Value != "repositories" {
+			continue
+		}
+		entries := root.Content[i+1]
+		if entries.Kind == yaml.AliasNode && entries.Alias != nil {
+			entries = entries.Alias
+		}
+		if entries.Kind != yaml.SequenceNode {
+			continue
+		}
+		for _, entry := range entries.Content {
+			item := entry
+			if item.Kind == yaml.AliasNode && item.Alias != nil {
+				item = item.Alias
+			}
+			if item.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j+1 < len(item.Content); j += 2 {
+				if item.Content[j].Kind == yaml.ScalarNode && item.Content[j].Value == "cloneStrategy" {
+					slog.Warn(retiredCloneStrategyWarning)
+					return
+				}
+			}
+		}
+	}
+}
+
 // ── default path ─────────────────────────────────────────────────────────────
 
 // DefaultDaemonYAMLPath returns the canonical path to daemon.yaml, expanding ~.
@@ -230,6 +290,10 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse daemon config %q: %w", path, err)
 	}
+	// The retired clone override is not part of the typed schema, so its
+	// presence is detected on the raw document: one warning per read no
+	// matter how many entries still carry the key.
+	warnIfRetiredCloneStrategyPresent(data)
 	cfg.normalizeProjectContract()
 	return &cfg, nil
 }
@@ -396,6 +460,11 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 		}
 	}
 	upsertMappingKey(doc, "projects", projectsNode)
+	// The retired clone override must not survive a write: a file that
+	// still carries it loses the key on the next write, entry by entry.
+	// The merge splices cfg-owned keys wholesale, so only unowned leftovers
+	// can still hold the key — drop it wherever it remains.
+	stripRetiredCloneStrategyKey(doc)
 	// Capacity is preserved as a partial overlay — only the cfg-modelled
 	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
 	// mapping. If no capacity key exists yet a new one is added.
@@ -420,6 +489,43 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 		return nil, fmt.Errorf("marshal merged config: %w", err)
 	}
 	return out, nil
+}
+
+// stripRetiredCloneStrategyKey removes the retired per-repository clone
+// override from every entry under the projects and repositories sequences.
+// Writers never emit the key; this scrubs copies the merge preserved from
+// the on-disk file (e.g. a repositories block the project command tree does
+// not own in legacy files).
+func stripRetiredCloneStrategyKey(doc *yaml.Node) {
+	if doc == nil || doc.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(doc.Content); i += 2 {
+		key := doc.Content[i]
+		if key.Kind != yaml.ScalarNode {
+			continue
+		}
+		if key.Value != "projects" && key.Value != "repositories" {
+			continue
+		}
+		entries := doc.Content[i+1]
+		if entries.Kind == yaml.AliasNode && entries.Alias != nil {
+			entries = entries.Alias
+		}
+		if entries.Kind != yaml.SequenceNode {
+			continue
+		}
+		for _, entry := range entries.Content {
+			item := entry
+			if item.Kind == yaml.AliasNode && item.Alias != nil {
+				item = item.Alias
+			}
+			if item.Kind != yaml.MappingNode {
+				continue
+			}
+			deleteMappingKey(item, "cloneStrategy")
+		}
+	}
 }
 
 func capacityIntentNode(intent *capacityWriteIntent) *yaml.Node {
@@ -587,7 +693,6 @@ func (d *DaemonYAML) AddOrUpdateProject(entry ProjectEntry) {
 		ID:               deriveRepositoryID(entry.ID, entry.RepoURL),
 		ProjectID:        entry.ID,
 		Source:           entry.RepoURL,
-		CloneStrategy:    entry.CloneStrategy,
 		CredentialHelper: entry.CredentialHelper,
 	}
 	if existingIndex >= 0 {
@@ -749,9 +854,6 @@ func normalizeRepositoryEntries(v2 []RepositoryEntry, legacy []ProjectEntry) []R
 		if repository.ID == "" {
 			repository.ID = deriveRepositoryID(repository.ProjectID, repository.Source)
 		}
-		if repository.CloneStrategy == "" {
-			repository.CloneStrategy = CloneShallow
-		}
 		key := repository.ProjectID + "\x00" + normalizeRepositoryEntrySource(repository.Source)
 		if _, exists := byKey[key]; exists && !wins {
 			return
@@ -770,7 +872,6 @@ func normalizeRepositoryEntries(v2 []RepositoryEntry, legacy []ProjectEntry) []R
 			ID:               deriveRepositoryID(projectID, project.RepoURL),
 			ProjectID:        projectID,
 			Source:           project.RepoURL,
-			CloneStrategy:    project.CloneStrategy,
 			CredentialHelper: project.CredentialHelper,
 		}, false)
 	}
@@ -810,7 +911,6 @@ func (d *DaemonYAML) syncLegacyProjectProjection() {
 		projects = append(projects, ProjectEntry{
 			ID:               repository.ProjectID,
 			RepoURL:          repository.Source,
-			CloneStrategy:    repository.CloneStrategy,
 			CredentialHelper: repository.CredentialHelper,
 		})
 	}

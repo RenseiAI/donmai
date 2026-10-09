@@ -183,7 +183,10 @@ func TestSeatLaunchIsDisposedWithTheTerminalProof(t *testing.T) {
 // member set. Released daemons decode it with DisallowUnknownFields, so a new
 // member — a seat fact, say — would make every older daemon quarantine every
 // interactive shim launched after it. New per-launch state goes in a sidecar
-// beside the record instead (see seat.go, flowcontrol.go, ack.go).
+// beside the record instead (see seat.go, flowcontrol.go, ack.go). The one
+// member added since is `workload`, which interactive records omit (absence
+// means the PTY profile), so their bytes are unchanged; it is pinned below
+// together with that omission.
 func TestInteractiveRecordKeepsTheReleasedSchema(t *testing.T) {
 	t.Parallel()
 
@@ -191,7 +194,7 @@ func TestInteractiveRecordKeepsTheReleasedSchema(t *testing.T) {
 		"createdAt", "orgId", "orphanDeadlineAt", "phase", "pid", "processEpoch",
 		"processStartedAt", "protocolMax", "protocolMin", "resumeKey", "schemaVersion",
 		"sessionId", "shimId", "socketDevice", "socketInode", "socketPath",
-		"workareaPath", "workarea_root",
+		"workareaPath", "workarea_root", "workload",
 	}
 	var members []string
 	recordType := reflect.TypeOf(Record{})
@@ -205,5 +208,13 @@ func TestInteractiveRecordKeepsTheReleasedSchema(t *testing.T) {
 	sort.Strings(members)
 	if !reflect.DeepEqual(members, released) {
 		t.Fatalf("Record JSON members = %v\nwant the released set %v\na new member makes older daemons quarantine every interactive shim; put new state in a sidecar", members, released)
+	}
+	reg := newTestRegistry(t)
+	raw, err := json.Marshal(testRecord(t, testIdentity(), reg))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), `"workload"`) {
+		t.Fatalf("interactive record encodes a workload member: %s; released readers refuse it", raw)
 	}
 }

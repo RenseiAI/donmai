@@ -109,6 +109,47 @@ func TestResolveKitDemandPlatformLifecycleRequiresExactComposition(t *testing.T)
 	}
 }
 
+// TestResolveKitDemandPlatformStorePlanIsLocal pins that a payload's own
+// dependency_stores plan never survives the local composition preflight:
+// the locally composed plan and digest replace it, as commands do.
+func TestResolveKitDemandPlatformStorePlanIsLocal(t *testing.T) {
+	t.Parallel()
+	platform := &kit.ToolchainDemand{
+		Kits: []string{"node/pnpm@1.0.0"}, OS: kit.OSLinux,
+		DependencyStores: []kit.ComposedDependencyStore{{
+			Manager: "pnpm", KitID: "payload/kit",
+			Commands: map[string]string{"fetch": "payload fetch", "install": "payload install"},
+		}},
+		DependencyStoresDigest: "payload-digest",
+	}
+	local := kit.ComposedDependencyStore{
+		Manager: "pnpm", KitID: "node/pnpm",
+		Commands: map[string]string{"fetch": "pnpm fetch", "install": "pnpm install --offline --frozen-lockfile"},
+	}
+	r := &Runner{
+		logger: slog.Default(),
+		kitComposer: func(string, kit.CompositionTarget, []kit.Selection) (*kit.ToolchainDemand, error) {
+			return &kit.ToolchainDemand{
+				OS:                     kit.OSLinux,
+				DependencyStores:       []kit.ComposedDependencyStore{local},
+				DependencyStoresDigest: "local-digest",
+			}, nil
+		},
+	}
+	res := &Result{}
+	demand := r.resolveKitDemand(QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "session-stores", Kits: platform}}, "/work/repo", res)
+	if res.Status == "failed" || demand == nil {
+		t.Fatalf("demand/result = %+v / %+v", demand, res)
+	}
+	if demand.DependencyStoresDigest != "local-digest" || len(demand.DependencyStores) != 1 ||
+		demand.DependencyStores[0].KitID != "node/pnpm" || demand.DependencyStores[0].Commands["fetch"] != "pnpm fetch" {
+		t.Fatalf("store plan = %+v (digest %q), want the local composition", demand.DependencyStores, demand.DependencyStoresDigest)
+	}
+	if platform.DependencyStoresDigest != "payload-digest" || platform.DependencyStores[0].KitID != "payload/kit" {
+		t.Fatalf("platform input mutated: %+v", platform)
+	}
+}
+
 func TestResolveKitDemandPlatformConflictFailsBeforeProvision(t *testing.T) {
 	t.Parallel()
 	r := &Runner{

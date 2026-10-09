@@ -31,7 +31,7 @@ type stateReader interface {
 // (id, pid, state, worktree path, project, repo) enriched with the on-disk
 // state.json header (issue identifier, provider, work type, phase) and the
 // live metrics the tailer accumulates (tool count, last tool, cost). It is
-// the unit the FleetGrid renders.
+// the unit the card grid renders.
 type SessionCard struct {
 	AcceptedAt          string
 	AgentCardID         string
@@ -49,6 +49,7 @@ type SessionCard struct {
 	// From state.json (best-effort; zero values when unreadable).
 	IssueID          string
 	IssueIdentifier  string
+	IssueTitle       string
 	Provider         string
 	Harness          string
 	Model            string
@@ -137,8 +138,11 @@ func NewSource(daemon daemonLister, st stateReader, repoScope string) *Source {
 // Counters is the dashboard header summary. Sessions is the visible row count;
 // status and stats are sourced from the daemon's local endpoints.
 type Counters struct {
-	Sessions      int
-	Running       int // visible running/starting rows, excluding held and terminal rows
+	Sessions int
+	Running  int // visible running/starting rows, excluding held and terminal rows
+	// HostActive and MaxSessions are the daemon's host-wide occupied and
+	// total session slots, whatever the dashboard's scope.
+	HostActive    int
 	MaxSessions   int
 	QueueDepth    int
 	UptimeSeconds int64
@@ -154,20 +158,53 @@ type Snapshot struct {
 	Err      error // sessions-list fetch error (fatal for the grid this tick)
 }
 
-// repoMatch reports whether a session's repository belongs to the scope.
-// It mirrors the daemon's matchProject leniency so a Linear project slug
-// and a git URL that refer to the same repo both match: exact, or either
-// being the "/"-suffix of the other.
+// repoMatch reports whether a session's repository belongs to the scope, so
+// a project slug and a git URL that refer to the same repo both match:
+// exact, or either being the "/"-suffix of the other. It only filters what
+// the view shows; admission uses the daemon's stricter location match.
+//
+// Both sides are normalized first (normalizeRepoRef): the daemon reports
+// clone URLs such as "https://github.com/o/a.git" while the CWD scope is
+// usually "o/a", and an SSH remote spells the same repo "git@github.com:o/a.git".
+// Without normalization a ".git" suffix alone hid every session from a
+// scoped watch.
 func repoMatch(scope, repo string) bool {
-	if scope == "" {
+	if strings.TrimSpace(scope) == "" {
 		return true
 	}
-	if repo == "" {
+	scope, repo = normalizeRepoRef(scope), normalizeRepoRef(repo)
+	if repo == "" || scope == "" {
 		return false
 	}
 	return scope == repo ||
 		strings.HasSuffix(repo, "/"+scope) ||
 		strings.HasSuffix(scope, "/"+repo)
+}
+
+// normalizeRepoRef reduces a repository reference to a lowercase
+// "owner/name"-style path: it drops a URL scheme, a user ("git@"), an SCP-style
+// "host:" separator, a leading host segment, trailing slashes and a ".git"
+// suffix. A bare slug ("donmai") or "owner/name" passes through lowercased.
+func normalizeRepoRef(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.Index(s, "@"); i >= 0 {
+		s = s[i+1:]
+	}
+	// SCP-style remote: "host:owner/name" (a colon before any slash).
+	if i := strings.Index(s, ":"); i >= 0 && !strings.Contains(s[:i], "/") {
+		s = s[:i] + "/" + s[i+1:]
+	}
+	s = strings.TrimRight(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	s = strings.TrimRight(s, "/")
+	// Drop a leading host segment ("github.com/...").
+	if i := strings.Index(s, "/"); i >= 0 && strings.Contains(s[:i], ".") {
+		s = s[i+1:]
+	}
+	return s
 }
 
 // Snapshot performs one index poll and returns the scoped, header-enriched
@@ -208,6 +245,7 @@ func (s *Source) Snapshot() Snapshot {
 			EndpointOperator: h.EndpointOperator,
 			Protocol:         h.Protocol,
 			WorkType:         h.WorkType,
+			IssueIdentifier:  h.IssueIdentifier,
 		}
 		if card.isHeld() {
 			// A held row has no live process or workarea, even if a malformed
@@ -251,7 +289,10 @@ func (s *Source) enrichFromState(card *SessionCard) {
 		return // a reused path still contains another session's state
 	}
 	card.IssueID = st.IssueID
-	card.IssueIdentifier = st.IssueIdentifier
+	if card.IssueIdentifier == "" {
+		card.IssueIdentifier = st.IssueIdentifier
+	}
+	card.IssueTitle = st.IssueTitle
 	card.Provider = string(st.ProviderName)
 	// Card name and ID belong to one annotation. Do not mix an index ID
 	// with an unrelated stale state name (or the converse).
@@ -302,6 +343,7 @@ func (s *Source) enrichFromState(card *SessionCard) {
 func (s *Source) counters(sessions, running int) Counters {
 	c := Counters{Sessions: sessions, Running: running}
 	if st, err := s.daemon.GetStatus(); err == nil && st != nil {
+		c.HostActive = st.ActiveSessions
 		c.MaxSessions = st.MaxSessions
 		c.UptimeSeconds = st.UptimeSeconds
 		c.Version = st.Version

@@ -105,14 +105,15 @@ type Kit struct {
 	DetectExec  string   `json:"detectExec,omitempty"`
 
 	// Contribution summary — concise view of what the kit provides.
-	ProvidesCommands   bool `json:"providesCommands"`
-	ProvidesPrompts    bool `json:"providesPrompts"`
-	ProvidesTools      bool `json:"providesTools"`
-	ProvidesMCPServers bool `json:"providesMcpServers"`
-	ProvidesSkills     bool `json:"providesSkills"`
-	ProvidesAgents     bool `json:"providesAgents"`
-	ProvidesA2ASkills  bool `json:"providesA2aSkills"`
-	ProvidesExtractors bool `json:"providesExtractors"`
+	ProvidesCommands         bool `json:"providesCommands"`
+	ProvidesPrompts          bool `json:"providesPrompts"`
+	ProvidesTools            bool `json:"providesTools"`
+	ProvidesMCPServers       bool `json:"providesMcpServers"`
+	ProvidesSkills           bool `json:"providesSkills"`
+	ProvidesAgents           bool `json:"providesAgents"`
+	ProvidesA2ASkills        bool `json:"providesA2aSkills"`
+	ProvidesExtractors       bool `json:"providesExtractors"`
+	ProvidesDependencyStores bool `json:"providesDependencyStores"`
 }
 
 // KitManifest is the full manifest detail for a kit, as returned by
@@ -153,6 +154,10 @@ type KitManifest struct {
 	// string per hook.
 	Hooks *KitHooks `json:"hooks,omitempty"`
 
+	// [[provide.dependency_store]] — one entry per package manager the
+	// kit supports. Empty for v1 manifests.
+	DependencyStores []KitDependencyStore `json:"dependencyStores,omitempty"`
+
 	// Provide arrays — names/ids only for summary.
 	MCPServerNames []string `json:"mcpServerNames,omitempty"`
 	SkillFiles     []string `json:"skillFiles,omitempty"`
@@ -170,6 +175,50 @@ type KitHooks struct {
 	PostAcquire string                  `json:"postAcquire,omitempty"`
 	PreRelease  string                  `json:"preRelease,omitempty"`
 	OS          map[string]KitHookEntry `json:"os,omitempty"`
+}
+
+// KitDependencyStoreLayout carries the [provide.dependency_store.store]
+// block: where the manager keeps its store and which store-relative
+// subtrees are shareable content, per-session bookkeeping, secret-bearing
+// or tainted by package code.
+type KitDependencyStoreLayout struct {
+	Env         []string          `json:"env,omitempty"`
+	Default     map[string]string `json:"default,omitempty"`
+	Sharing     string            `json:"sharing,omitempty"`
+	Integrity   string            `json:"integrity,omitempty"`
+	Content     []string          `json:"content,omitempty"`
+	Bookkeeping []string          `json:"bookkeeping,omitempty"`
+	Secrets     []string          `json:"secrets,omitempty"`
+	NeverShare  []string          `json:"neverShare,omitempty"`
+	RecordsPath bool              `json:"recordsPath,omitempty"`
+}
+
+// KitDependencyStoreSnapshot carries the
+// [provide.dependency_store.snapshot] block: which leaf paths an install
+// creates and whether a pristine tree is snapshot-restorable.
+type KitDependencyStoreSnapshot struct {
+	Installed       []string `json:"installed,omitempty"`
+	ABI             []string `json:"abi,omitempty"`
+	Relocation      string   `json:"relocation,omitempty"`
+	RunsPackageCode bool     `json:"runsPackageCode,omitempty"`
+}
+
+// KitDependencyStore is one [[provide.dependency_store]] entry: the
+// package managers the kit supports. Commands holds the generic command
+// per name; CommandsOverride holds OS specializations that win over the
+// generic form for the same store owned by the same kit.
+type KitDependencyStore struct {
+	Manager          string                       `json:"manager"`
+	Ecosystem        string                       `json:"ecosystem,omitempty"`
+	Lockfiles        []string                     `json:"lockfiles,omitempty"`
+	Inputs           []string                     `json:"inputs,omitempty"`
+	Version          string                       `json:"version,omitempty"`
+	Store            KitDependencyStoreLayout     `json:"store"`
+	ImportEnv        map[string]string            `json:"importEnv,omitempty"`
+	Commands         map[string]string            `json:"commands,omitempty"`
+	CommandsOverride map[string]map[string]string `json:"commandsOverride,omitempty"`
+	Snapshot         KitDependencyStoreSnapshot   `json:"snapshot"`
+	ProxyEnv         map[string]string            `json:"proxyEnv,omitempty"`
 }
 
 // KitHookEntry is one OS-keyed hook overlay inside KitHooks.OS.

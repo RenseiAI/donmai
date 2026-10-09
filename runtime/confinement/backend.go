@@ -78,6 +78,27 @@ type Resolved struct {
 	// path. They are denied as literals so that renaming an ancestor cannot
 	// move a denied path out from under its rule.
 	Pins []string
+	// Denied are the daemon-private paths (Spec.DeniedPaths), canonical and
+	// sorted. Every backend renders them in every read scope, open reads
+	// included, after every allow, so they win even inside the session's
+	// read allowlist: no read of any kind and no write, the whole subtree.
+	// None covers the session's own paths (the resolver refuses that), so a
+	// backend may hide each outright: macOS denies every read operation by
+	// name and writes by subpath; a mount-namespace backend binds an empty placeholder of the
+	// path's type over each that exists (a missing one is minted later, so
+	// its access-control stage must deny the path as well).
+	Denied []string
+	// DeniedListings are the daemon-private directories
+	// (Spec.DeniedListings), canonical and sorted. Every backend renders
+	// them in every read scope, after every allow: the directory's listing
+	// is refused while the directory stays traversable and the paths
+	// beneath it keep what the rest of the boundary grants. macOS denies
+	// file-read-data and file-read-xattr on the literal directory. A
+	// mount-namespace backend that cannot refuse a listing alone may hide
+	// the directory's entries with an empty overlay, then bind back beneath
+	// it, at their original spelling, every writable root, read-only leaf
+	// and read path that lies there; it must never hide those.
+	DeniedListings []string
 	// Sockets are the declared sockets outside the writable set.
 	Sockets []string
 	// LoopbackTCPPorts are the declared loopback TCP ports.

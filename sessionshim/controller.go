@@ -41,6 +41,12 @@ const (
 	EventHostFrame EventKind = "host_frame"
 	// EventExit is the immutable terminal observation.
 	EventExit EventKind = "exit"
+	// EventHeadlessExit is the immutable terminal observation of a
+	// headless-profile lineage: the one sequence-bearing message (seq 1) of a
+	// connection that carries no host output stream. It is published through
+	// the same event channel as EventExit so a controller consumer observes
+	// exactly one terminal observation per lineage, never both.
+	EventHeadlessExit EventKind = "headless_exit"
 	// EventError is a closed code with display-only detail.
 	EventError EventKind = "error"
 )
@@ -62,7 +68,10 @@ type ControllerEvent struct {
 	Gap      shimwire.GapMsg
 	Snapshot shimwire.SnapshotMsg
 	Exit     shimwire.ExitMsg
-	Err      shimwire.ErrorMsg
+	// HeadlessExit is set on EventHeadlessExit only: the headless terminal
+	// observation with its outbox record and harness-group proof.
+	HeadlessExit shimwire.HeadlessExit
+	Err          shimwire.ErrorMsg
 }
 
 // ControllerOptions configure a dial.
@@ -112,6 +121,16 @@ type ControllerOptions struct {
 	// also set RequireFullHostFrames; that opts zero/zero into the build range.
 	ProtocolMin uint32
 	ProtocolMax uint32
+	// Workload is the profile this controller adopts. Zero is the interactive
+	// (PTY) profile, the only one production adoption serves while the
+	// headless launch gate holds: Adopt never sets it, so a startup pass that
+	// meets a headless shim quarantines it as protocol_mismatch and never
+	// ends it. A headless controller selects exactly v6 against a headless
+	// shim's [6,6], fails the stream closed on every PTY-shaped frame, and
+	// reports no terminal capability. A controller whose workload differs
+	// from the record's or the shim's Hello never adopts: the disagreement is
+	// a protocol mismatch.
+	Workload Workload
 	// RequireFullHostFrames declares that this controller consumes HostFrame as
 	// the sole selected-v3 host-sequence authority. It enables max 3; it does not
 	// reject a released max-2 shim, which must still be adopted conservatively.
@@ -164,7 +183,29 @@ type ControllerOptions struct {
 	Logger      *slog.Logger
 }
 
+// workload resolves the profile this controller adopts; zero is interactive.
+func (o ControllerOptions) workload() Workload {
+	if o.Workload == "" {
+		return WorkloadInteractive
+	}
+	return o.Workload
+}
+
 func (o ControllerOptions) protocolRange() (uint32, uint32, error) {
+	switch o.workload() {
+	case WorkloadInteractive:
+	case WorkloadHeadless:
+		// The headless profile has exactly one version. RequireFullHostFrames
+		// is a terminal-stream promise and has nothing to bind to here.
+		if (o.ProtocolMin != 0 || o.ProtocolMax != 0) &&
+			(o.ProtocolMin != shimwire.HeadlessMin || o.ProtocolMax != shimwire.HeadlessMax) {
+			return 0, 0, fmt.Errorf("sessionshim: a headless controller speaks exactly [%d,%d], not [%d,%d]",
+				shimwire.HeadlessMin, shimwire.HeadlessMax, o.ProtocolMin, o.ProtocolMax)
+		}
+		return shimwire.HeadlessMin, shimwire.HeadlessMax, nil
+	default:
+		return 0, 0, fmt.Errorf("sessionshim: unknown controller workload %q", string(o.Workload))
+	}
 	if o.ProtocolMin == 0 && o.ProtocolMax == 0 {
 		if o.RequireFullHostFrames {
 			return shimwire.ProtocolMin, shimwire.ProtocolMax, nil
@@ -260,6 +301,10 @@ type Controller struct {
 	workareaRoot       string
 	helloAuthenticated bool
 	adopted            shimwire.Adopted
+	// profile is the workload this connection carries, agreed by the
+	// controller's options, the record, and the shim's Hello. Zero is the
+	// interactive profile.
+	profile shimwire.Profile
 	// resumeFrom is the exact durable cursor proposed in Welcome. Retaining it
 	// lets a replacement daemon preserve last_forwarded_seq before any newly
 	// replayed or live output advances its own bookkeeping.
@@ -281,6 +326,11 @@ type Controller struct {
 	closing chan struct{}
 	exitMu  sync.RWMutex
 	exit    *shimwire.ExitMsg
+	// headlessExit is the observed v6 headless terminal observation, when one
+	// has arrived. It shares exitMu with the interactive Exit: a lineage has
+	// exactly one terminal authority, and observing one while the other is
+	// held is a changed-observation refusal rather than a second event.
+	headlessExit *shimwire.HeadlessExit
 
 	// streamEnd is the fail-closed decision this controller made about its own
 	// stream, or nil when the ending came from the peer or a caller. See
@@ -295,6 +345,14 @@ type Controller struct {
 	snapshotMu     sync.Mutex
 	nextSnapshotID uint64
 	snapshotCalls  map[uint64]*snapshotCall
+
+	// credentialMu guards the per-connection credential-update ledger. It
+	// mirrors the snapshot retry ledger: an exact retry of a sent update
+	// returns its first result, a reused id with changed content is refused
+	// locally before another wire request is emitted, and the ledger is
+	// bounded so a peer that names ids cannot grow it without bound.
+	credentialMu    sync.Mutex
+	credentialCalls map[uint64]*credentialCall
 
 	heartbeatCallMu sync.Mutex
 	heartbeatMu     sync.Mutex
@@ -668,18 +726,19 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	}
 
 	c := &Controller{
-		id:            rec.Identity(),
-		controllerID:  opts.ControllerID,
-		conn:          conn,
-		w:             shimwire.NewWriter(conn),
-		r:             shimwire.NewReader(conn),
-		resumeFrom:    opts.ResumeFrom,
-		workareaRoot:  rec.WorkareaRoot,
-		events:        make(chan ControllerEvent, publicEventBufferLimit),
-		logger:        opts.logger(),
-		done:          make(chan struct{}),
-		closing:       make(chan struct{}),
-		snapshotCalls: make(map[uint64]*snapshotCall),
+		id:              rec.Identity(),
+		controllerID:    opts.ControllerID,
+		conn:            conn,
+		w:               shimwire.NewWriter(conn),
+		r:               shimwire.NewReader(conn),
+		resumeFrom:      opts.ResumeFrom,
+		workareaRoot:    rec.WorkareaRoot,
+		events:          make(chan ControllerEvent, publicEventBufferLimit),
+		logger:          opts.logger(),
+		done:            make(chan struct{}),
+		closing:         make(chan struct{}),
+		snapshotCalls:   make(map[uint64]*snapshotCall),
+		credentialCalls: make(map[uint64]*credentialCall),
 	}
 	if err := c.handshake(rec, opts); err != nil {
 		_ = conn.Close()
@@ -728,6 +787,16 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 		return err
 	}
 	c.hello, c.helloAuthenticated = hello, true
+	// The profile is agreed before any version is selected or authority is
+	// proposed: a controller never adopts a shim of another workload. For an
+	// interactive controller meeting a headless shim this is the refusal that
+	// keeps it from ever being treated as a terminal session, classified as
+	// protocol_mismatch (quarantine, never kill) like any other disjoint wire.
+	if peer := helloWorkload(hello); peer != opts.workload() {
+		return fmt.Errorf("%w: shim serves the %s workload, this controller adopts %s",
+			shimwire.ErrVersionMismatch, string(peer), string(opts.workload()))
+	}
+	c.profile = shimwire.Profile(opts.workload())
 	if err := hello.Extensions.CheckRequired(); err != nil {
 		return err
 	}
@@ -858,10 +927,35 @@ func validateAdoptionCommit(adopted shimwire.Adopted, proposed shimwire.Generati
 	return nil
 }
 
+// helloWorkload reports the workload a shim's Hello declares. Absence (and a
+// Hello built without the field) is the interactive profile.
+func helloWorkload(h shimwire.Hello) Workload {
+	if h.Workload == shimwire.ProfileHeadless {
+		return WorkloadHeadless
+	}
+	return WorkloadInteractive
+}
+
+// recordWorkload reports the workload a discovery record declares. Absence is
+// the interactive profile.
+func recordWorkload(rec Record) Workload {
+	if rec.Workload == "" {
+		return WorkloadInteractive
+	}
+	return rec.Workload
+}
+
 // verifyHello checks that the live peer is the shim the record described.
 func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea, expectedWorkareaRoot string) error {
 	if h.Protocol != shimwire.ProtocolName {
 		return fmt.Errorf("%w: hello names protocol %q", shimwire.ErrVersionMismatch, h.Protocol)
+	}
+	if peer, recorded := helloWorkload(h), recordWorkload(rec); peer != recorded {
+		// The workload is part of what the record describes: a record that
+		// says interactive and a peer that says headless (or the reverse) is
+		// not the shim the record named.
+		return fmt.Errorf("%w: shim reports workload %q, record says %q",
+			ErrAdoptionRefused, string(peer), string(recorded))
 	}
 	if h.OrgID != rec.OrgID || h.SessionID != rec.SessionID {
 		return fmt.Errorf("%w: shim reports identity %s/%s, record says %s/%s",
@@ -948,11 +1042,23 @@ func (c *Controller) SelectedVersion() uint32 { return c.selected }
 
 // SupportsAuthoritativeSnapshot reports whether fresh inspect/emit proxying is
 // available. Selected v1 remains adoptable but intentionally returns false.
-func (c *Controller) SupportsAuthoritativeSnapshot() bool { return c.selected >= shimwire.V2 }
+func (c *Controller) SupportsAuthoritativeSnapshot() bool {
+	return c.selected >= shimwire.V2 && c.profile != shimwire.ProfileHeadless
+}
 
 // SupportsFullHostFrames reports whether the selected local wire supplies one
 // exact complete attach-frame event for every host sequence.
-func (c *Controller) SupportsFullHostFrames() bool { return c.selected >= shimwire.V3 }
+func (c *Controller) SupportsFullHostFrames() bool {
+	return c.selected >= shimwire.V3 && c.profile != shimwire.ProfileHeadless
+}
+
+// Workload reports the profile this adopted connection carries.
+func (c *Controller) Workload() Workload {
+	if c.profile == shimwire.ProfileHeadless {
+		return WorkloadHeadless
+	}
+	return WorkloadInteractive
+}
 
 // Hello returns the shim's opening self-report.
 func (c *Controller) Hello() shimwire.Hello { return c.hello }
@@ -1000,7 +1106,9 @@ func (c *Controller) WriteInput(data []byte) error {
 // relay-stamped userId alongside input bytes (shimwire.TypeAttributedInput,
 // v4+). Selected v1/v2/v3 controllers never negotiate it — WriteAttributedInput
 // degrades to WriteInput's exact byte-identical unattributed send for them.
-func (c *Controller) SupportsAttributedInput() bool { return c.selected >= shimwire.V4 }
+func (c *Controller) SupportsAttributedInput() bool {
+	return c.selected >= shimwire.V4 && c.profile != shimwire.ProfileHeadless
+}
 
 // WriteAttributedInput sends input bytes under this controller's generation,
 // additionally carrying userID — the relay-stamped sender identity (§5 of the
@@ -1275,6 +1383,152 @@ func cloneSnapshotResult(in shimwire.SnapshotResult) shimwire.SnapshotResult {
 	return in
 }
 
+// credentialCall is one outstanding correlated bearer rotation.
+type credentialCall struct {
+	request shimwire.CredentialUpdate
+	result  *shimwire.CredentialResult
+	err     error
+	sent    bool
+	done    chan struct{}
+}
+
+// credentialResultLimit bounds the per-connection credential-update ledger,
+// mirroring the snapshot retry ledger.
+const credentialResultLimit = 1024
+
+// SupportsCredentialPush reports whether this controller's selected version
+// carries the correlated credential rotation: selected v6 only. A released
+// controller never sends a v6 type merely because its binary can encode one.
+func (c *Controller) SupportsCredentialPush() bool { return c.selected >= shimwire.V6 }
+
+// PushCredential sends one generation-fenced bearer rotation and waits for
+// the shim's correlated result. An exact retry of a sent request id returns
+// its first result without another wire request; a reused id with changed
+// content is refused locally as a request mismatch. Slice 1 provides the
+// correlation and the refusals; the pushed pair reaches the runner's
+// credential provider in slice 3.
+func (c *Controller) PushCredential(ctx context.Context, requestID uint64, workerID, bearer string, expiresAt int64) (shimwire.CredentialResult, error) {
+	if !c.SupportsCredentialPush() {
+		return shimwire.CredentialResult{}, fmt.Errorf("sessionshim: %w: selected local-wire v%d has no credential push", shimwire.ErrVersionMismatch, c.selected)
+	}
+	req := shimwire.CredentialUpdate{RequestID: requestID, Generation: c.gen, WorkerID: workerID, Bearer: bearer, ExpiresAt: expiresAt}
+	body, err := shimwire.EncodeCredentialUpdate(req)
+	if err != nil {
+		return shimwire.CredentialResult{}, err
+	}
+	c.credentialMu.Lock()
+	if c.credentialCalls == nil {
+		c.credentialCalls = make(map[uint64]*credentialCall)
+	}
+	call := c.credentialCalls[requestID]
+	if call != nil && call.request != req {
+		c.credentialMu.Unlock()
+		return shimwire.CredentialResult{}, fmt.Errorf("sessionshim: %w: changed replay for credential request id %d", shimwire.ErrSnapshotMismatch, requestID)
+	}
+	if call == nil {
+		if len(c.credentialCalls) >= credentialResultLimit {
+			c.credentialMu.Unlock()
+			return shimwire.CredentialResult{}, fmt.Errorf("sessionshim: %w: credential retry ledger is full", shimwire.ErrSnapshotRefused)
+		}
+		call = &credentialCall{request: req, done: make(chan struct{})}
+		c.credentialCalls[requestID] = call
+	}
+	if call.result != nil {
+		result := *call.result
+		err := call.err
+		c.credentialMu.Unlock()
+		return result, err
+	}
+	if !call.sent {
+		call.sent = true
+		if err := c.w.WriteVersion(c.selected, shimwire.TypeCredentialUpdate, body); err != nil {
+			call.err = err
+			close(call.done)
+		}
+	}
+	c.credentialMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.awaitCredentialCall(ctx, requestID, call)
+}
+
+func (c *Controller) awaitCredentialCall(ctx context.Context, requestID uint64, call *credentialCall) (shimwire.CredentialResult, error) {
+	done := call.done
+	select {
+	case <-done:
+		return c.credentialCallOutcome(call)
+	default:
+	}
+	select {
+	case <-done:
+		return c.credentialCallOutcome(call)
+	case <-ctx.Done():
+		return shimwire.CredentialResult{}, fmt.Errorf("sessionshim: credential request %d: %w", requestID, ctx.Err())
+	case <-c.done:
+		select {
+		case <-done:
+			return c.credentialCallOutcome(call)
+		default:
+		}
+		return shimwire.CredentialResult{}, io.EOF
+	}
+}
+
+func (c *Controller) credentialCallOutcome(call *credentialCall) (shimwire.CredentialResult, error) {
+	c.credentialMu.Lock()
+	defer c.credentialMu.Unlock()
+	if call.result == nil {
+		return shimwire.CredentialResult{}, call.err
+	}
+	result := *call.result
+	return result, call.err
+}
+
+// acceptCredentialResult correlates one shim answer with its outstanding push.
+// A non-success status completes the call with ErrSnapshotRefused carrying the
+// closed status, mirroring the snapshot refusal shape; a result for an unknown
+// id, or one whose generation disagrees with the request, is a request
+// mismatch and fails the stream closed.
+func (c *Controller) acceptCredentialResult(body []byte) error {
+	result, err := shimwire.DecodeCredentialResult(body)
+	if err != nil {
+		return err
+	}
+	c.credentialMu.Lock()
+	defer c.credentialMu.Unlock()
+	call := c.credentialCalls[result.RequestID]
+	if call == nil || call.request.Generation != result.Generation {
+		return fmt.Errorf("sessionshim: %w: credential result id=%d generation=%d", shimwire.ErrSnapshotMismatch, result.RequestID, result.Generation)
+	}
+	if call.result != nil {
+		if *call.result != result {
+			return fmt.Errorf("sessionshim: %w: changed credential result for request id %d", shimwire.ErrSnapshotMismatch, result.RequestID)
+		}
+		return nil
+	}
+	stored := result
+	call.result = &stored
+	if result.Status != shimwire.CredentialSuccess {
+		call.err = fmt.Errorf("sessionshim: %w: %s", shimwire.ErrSnapshotRefused, result.Status)
+	} else if result.Generation != c.gen {
+		call.err = fmt.Errorf("sessionshim: %w: credential result generation %d is not the adopted %d", shimwire.ErrSnapshotMismatch, result.Generation, c.gen)
+	}
+	close(call.done)
+	return nil
+}
+
+func (c *Controller) failCredentialCalls(err error) {
+	c.credentialMu.Lock()
+	defer c.credentialMu.Unlock()
+	for _, call := range c.credentialCalls {
+		if call.result == nil && call.err == nil {
+			call.err = err
+			close(call.done)
+		}
+	}
+}
+
 // log is the nil-safe controller logger. A controller assembled without one
 // still has to be able to say why it dropped a connection.
 func (c *Controller) log() *slog.Logger {
@@ -1376,7 +1630,14 @@ func (c *Controller) readLoop() {
 	for {
 		msg, err := c.r.ReadVersion(c.selected)
 		if err != nil {
+			c.failCredentialCalls(err)
 			c.failSnapshotCalls(err)
+			return
+		}
+		if refusal := c.refuseOffProfile(msg.Type); refusal != nil {
+			c.failCredentialCalls(refusal)
+			c.failSnapshotCalls(refusal)
+			c.closeStream("frame is not legal on this workload profile", refusal)
 			return
 		}
 		if pendingRequested != nil && msg.Type != shimwire.TypeSnapshotResult {
@@ -1387,6 +1648,24 @@ func (c *Controller) readLoop() {
 		if msg.Type == shimwire.TypeCheckpointResult {
 			if err := c.acceptContinuationChunk(msg.Body); err != nil {
 				c.closeStream("checkpoint result was refused", err)
+				return
+			}
+			continue
+		}
+		if c.selected >= shimwire.V6 && msg.Type == shimwire.TypeCredentialResult {
+			if err := c.acceptCredentialResult(msg.Body); err != nil {
+				c.failCredentialCalls(err)
+				c.failSnapshotCalls(err)
+				c.closeStream("credential result was refused", err)
+				return
+			}
+			continue
+		}
+		if c.selected >= shimwire.V6 && msg.Type == shimwire.TypeHeadlessExit {
+			if err := c.observeHeadlessExit(msg.Body); err != nil {
+				c.failCredentialCalls(err)
+				c.failSnapshotCalls(err)
+				c.closeStream("headless exit was refused", err)
 				return
 			}
 			continue
@@ -1449,6 +1728,7 @@ func (c *Controller) readLoop() {
 			ev, emit, completion, resultErr := c.acceptSnapshotResult(msg.Body, pendingRequested)
 			pendingRequested = nil
 			if resultErr != nil {
+				c.failCredentialCalls(resultErr)
 				c.failSnapshotCalls(resultErr)
 				c.closeStream("Snapshot result was refused", resultErr)
 				return
@@ -1499,17 +1779,39 @@ func (c *Controller) readLoop() {
 		}
 		if ev.Kind == EventExit {
 			if err := c.observeExit(ev.Exit); err != nil {
+				c.failCredentialCalls(err)
 				c.failSnapshotCalls(err)
 				c.closeStream("terminal observation was refused", err)
 				return
 			}
 		}
 		if err := c.publishEvent(ev); err != nil {
+			c.failCredentialCalls(err)
 			c.failSnapshotCalls(err)
 			c.closeStream("event could not be published", err)
 			return
 		}
 	}
+}
+
+// refuseOffProfile is the controller half of the profile vocabulary
+// (session-shim v6 §2): on a headless connection every PTY-shaped type is
+// refused and never acted on, and on an interactive connection HeadlessExit is
+// refused the same way. The controller fails the stream closed, as it does for
+// every other frame that breaks the contract, so a headless lineage can never
+// be read as a terminal stream and an interactive one never gains a second
+// terminal authority.
+func (c *Controller) refuseOffProfile(t shimwire.MessageType) error {
+	if c.profile == shimwire.ProfileHeadless {
+		if t.RefusedIn(shimwire.ProfileHeadless, c.selected) {
+			return fmt.Errorf("sessionshim: %w: %s is refused on the headless profile", shimwire.ErrMalformed, t)
+		}
+		return nil
+	}
+	if t == shimwire.TypeHeadlessExit {
+		return fmt.Errorf("sessionshim: %w: HeadlessExit is refused on the interactive profile", shimwire.ErrMalformed)
+	}
+	return nil
 }
 
 func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error {
@@ -2440,6 +2742,9 @@ func validateSnapshotResult(result shimwire.SnapshotResult, observedExit *shimwi
 func (c *Controller) observeExit(exit shimwire.ExitMsg) error {
 	c.exitMu.Lock()
 	defer c.exitMu.Unlock()
+	if c.headlessExit != nil {
+		return fmt.Errorf("sessionshim: %w: Exit arrived after the headless terminal observation", shimwire.ErrSnapshotMismatch)
+	}
 	if c.exit == nil {
 		observed := exit
 		c.exit = &observed
@@ -2449,6 +2754,83 @@ func (c *Controller) observeExit(exit shimwire.ExitMsg) error {
 		return fmt.Errorf("sessionshim: %w: changed immutable Exit observation", shimwire.ErrSnapshotMismatch)
 	}
 	return nil
+}
+
+// observeHeadlessExit records one v6 HeadlessExit frame and publishes it as
+// the lineage's terminal observation. It is the headless counterpart of
+// observeExit: exactly one terminal authority per lineage, so a second
+// HeadlessExit that differs — or any Exit beside it — is a changed
+// observation and fails the stream closed. The controller acknowledges the
+// observation with a generation-fenced Heartbeat ackedSeq=1 (see
+// AcknowledgeHeadlessExit); the shim's finalize wait for that ack is the
+// acknowledgement-wait half of the corpus.
+func (c *Controller) observeHeadlessExit(body []byte) error {
+	exit, err := shimwire.DecodeHeadlessExit(body)
+	if err != nil {
+		return err
+	}
+	c.exitMu.Lock()
+	if c.exit != nil {
+		c.exitMu.Unlock()
+		return fmt.Errorf("sessionshim: %w: headless exit arrived after the Exit observation", shimwire.ErrSnapshotMismatch)
+	}
+	if c.headlessExit != nil {
+		if *c.headlessExit != exit {
+			c.exitMu.Unlock()
+			return fmt.Errorf("sessionshim: %w: changed immutable HeadlessExit observation", shimwire.ErrSnapshotMismatch)
+		}
+		c.exitMu.Unlock()
+		return nil
+	}
+	observed := exit
+	c.headlessExit = &observed
+	c.exitMu.Unlock()
+	return c.publishEvent(ControllerEvent{Kind: EventHeadlessExit, Seq: exit.Seq, HeadlessExit: exit})
+}
+
+// ObservedHeadlessExit reports the headless terminal observation when one has
+// arrived, or nil. A lineage observes at most one terminal authority.
+func (c *Controller) ObservedHeadlessExit() *shimwire.HeadlessExit {
+	c.exitMu.RLock()
+	defer c.exitMu.RUnlock()
+	if c.headlessExit == nil {
+		return nil
+	}
+	observed := *c.headlessExit
+	return &observed
+}
+
+// AcknowledgeHeadlessExit durably acknowledges the headless terminal
+// observation: a generation-fenced Heartbeat with ackedSeq=1, sent only after
+// the caller has durably recorded the terminal evidence. The shim waits for
+// exactly this acknowledgement within its finalize bound, then exits; a
+// missing acknowledgement leaves the tombstone for the next adoption. It is
+// the controller-side half of the acknowledgement-wait corpus column.
+func (c *Controller) AcknowledgeHeadlessExit(ctx context.Context) error {
+	if c.ObservedHeadlessExit() == nil {
+		return fmt.Errorf("sessionshim: %w: no headless exit to acknowledge", shimwire.ErrSnapshotMismatch)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	type ackResult struct {
+		err error
+	}
+	done := make(chan ackResult, 1)
+	go func() { done <- ackResult{c.Heartbeat(1)} }()
+	select {
+	case r := <-done:
+		return r.err
+	case <-ctx.Done():
+		return fmt.Errorf("sessionshim: acknowledge headless exit: %w", ctx.Err())
+	case <-c.done:
+		select {
+		case r := <-done:
+			return r.err
+		default:
+		}
+		return io.EOF
+	}
 }
 
 func (c *Controller) observedExit() *shimwire.ExitMsg {

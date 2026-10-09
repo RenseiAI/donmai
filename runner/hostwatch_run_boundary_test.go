@@ -38,6 +38,27 @@ func TestRunStampsEventLogBoundaryBeforeFirstAppend(t *testing.T) {
 	}
 }
 
+// The local dashboard reads the dispatched title from state.json; the runner
+// is the only writer that holds it, so it must persist it at state init.
+func TestRunPersistsIssueTitleForLocalReaders(t *testing.T) {
+	h := newRunnerHarness(t)
+	work := h.queuedWork("RUN-TITLE-1")
+	work.Title = "Fix flaky retry in the upload worker"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := h.runner.Run(ctx, work)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	st, err := h.runner.store.Read(result.WorktreePath)
+	if err != nil {
+		t.Fatalf("read run state: %v", err)
+	}
+	if st.IssueTitle != work.Title || st.IssueIdentifier != "RUN-TITLE-1" {
+		t.Fatalf("state.json title=%q identifier=%q, want %q/%q", st.IssueTitle, st.IssueIdentifier, work.Title, "RUN-TITLE-1")
+	}
+}
+
 func TestStampRunJournalBoundaryFreshAndExactContinuation(t *testing.T) {
 	worktree := t.TempDir()
 	st := &state.State{SessionID: "old", StartedAt: 100, LastHeartbeat: 75, ProviderSessionID: "native"}

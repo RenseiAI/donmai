@@ -591,6 +591,253 @@ func TestRecordValidationRejectsBadSchemaAndRange(t *testing.T) {
 	}
 }
 
+// TestRecordValidationPinsHeadlessSchema pins the headless arm of the record
+// contract: workload headless is valid ONLY beside schema 2. A writer
+// emitting workload headless at schema 1 or 3 must be refused here, because
+// the quarantine path treats those bytes as malformed rather than adoptable.
+func TestRecordValidationPinsHeadlessSchema(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	headless := func() Record {
+		rec := testRecord(t, id, reg)
+		rec.Workload = WorkloadHeadless
+		rec.SchemaVersion = HeadlessRecordSchemaVersion
+		rec.ProtocolMin, rec.ProtocolMax = shimwire.HeadlessMin, shimwire.HeadlessMax
+		return rec
+	}
+	if err := headless().Validate(); err != nil {
+		t.Fatalf("Validate headless schema %d = %v, want nil", HeadlessRecordSchemaVersion, err)
+	}
+	for _, version := range []int{RecordSchemaVersion, HeadlessRecordSchemaVersion + 1} {
+		rec := headless()
+		rec.SchemaVersion = version
+		if err := rec.Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("Validate headless schema %d = %v, want ErrRecordInvalid", version, err)
+		}
+		// The durable write path refuses too: Put encodes through Validate,
+		// so a bad-schema headless record can never reach disk.
+		if err := reg.Put(rec); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("Put headless schema %d = %v, want ErrRecordInvalid", version, err)
+		}
+	}
+}
+
+// TestRecordValidationBindsHeadlessToTheV6Range pins the record half of the
+// range binding (session-shim v6 §1): the headless workload on a range that
+// includes any version below 6 is malformed, at Validate and at the durable
+// write, so the startup pass quarantines it as record_malformed instead of
+// letting a controller that predates the profile select it as a terminal
+// session. A range starting at 6 stays valid, so a later headless version can
+// widen the maximum.
+func TestRecordValidationBindsHeadlessToTheV6Range(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	headless := func(protocolMin, protocolMax uint32) Record {
+		rec := testRecord(t, id, reg)
+		rec.Workload = WorkloadHeadless
+		rec.SchemaVersion = HeadlessRecordSchemaVersion
+		rec.ProtocolMin, rec.ProtocolMax = protocolMin, protocolMax
+		return rec
+	}
+	for _, valid := range [][2]uint32{{shimwire.V6, shimwire.V6}, {shimwire.V6, shimwire.V6 + 1}} {
+		if err := headless(valid[0], valid[1]).Validate(); err != nil {
+			t.Fatalf("Validate headless [%d,%d] = %v, want nil", valid[0], valid[1], err)
+		}
+	}
+	for _, malformed := range [][2]uint32{
+		{shimwire.V1, shimwire.V5}, {shimwire.V1, shimwire.V6}, {shimwire.V5, shimwire.V6}, {shimwire.V5, shimwire.V5},
+	} {
+		rec := headless(malformed[0], malformed[1])
+		if err := rec.Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("Validate headless [%d,%d] = %v, want ErrRecordInvalid", malformed[0], malformed[1], err)
+		}
+		if err := reg.Put(rec); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("Put headless [%d,%d] = %v, want ErrRecordInvalid", malformed[0], malformed[1], err)
+		}
+	}
+	// The interactive record is untouched by the rule: the released range
+	// stays valid exactly as before.
+	if err := testRecord(t, id, reg).Validate(); err != nil {
+		t.Fatalf("Validate interactive [%d,%d] = %v, want nil", shimwire.ProtocolMin, shimwire.ProtocolMax, err)
+	}
+}
+
+// TestHeadlessExitValidationPinsKnownCauses pins the closed cause registry:
+// a headless exit naming a cause outside it is refused, and a tombstone
+// carrying that cause is refused at the durable write — never persisted as
+// an immutable terminal observation a replacement daemon would replay.
+func TestHeadlessExitValidationPinsKnownCauses(t *testing.T) {
+	t.Parallel()
+
+	if err := (HeadlessExit{Cause: HeadlessExitCompleted}).Validate(); err != nil {
+		t.Fatalf("Validate completed exit = %v, want nil", err)
+	}
+	if err := (HeadlessExit{Cause: "bogus"}).Validate(); !errors.Is(err, ErrRecordInvalid) {
+		t.Fatalf("Validate bogus-cause exit = %v, want ErrRecordInvalid", err)
+	}
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	tomb := Tombstone{
+		SchemaVersion: HeadlessRecordSchemaVersion, Workload: WorkloadHeadless,
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-1", ProcessEpoch: 1, HarnessPID: 4242, HarnessStartedAt: 17,
+		ExitCode: 0, LastSeq: 1, GroupReaped: true,
+		Cause:              "bogus",
+		ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := tomb.Validate(); !errors.Is(err, ErrRecordInvalid) {
+		t.Fatalf("Validate bogus-cause tombstone = %v, want ErrRecordInvalid", err)
+	}
+	if err := reg.PutTombstone(tomb); !errors.Is(err, ErrRecordInvalid) {
+		t.Fatalf("PutTombstone bogus-cause = %v, want ErrRecordInvalid", err)
+	}
+}
+
+// TestHeadlessExitCausesAreExactlyTheContractSet pins the one closed cause
+// registry the tombstone and the wire share (session-shim v6 §4): exactly
+// completed, orphaned, stopped_for_resume and shim_failure. Every contract
+// value is accepted by both the durable tombstone validator and the wire
+// decoder; every other name, including each cause an earlier draft of the
+// wire codec carried, is refused by both. The outbox-state coupling rides the
+// same registry: none is valid only beside stopped_for_resume.
+func TestHeadlessExitCausesAreExactlyTheContractSet(t *testing.T) {
+	t.Parallel()
+
+	contract := []string{"completed", "orphaned", "stopped_for_resume", "shim_failure"}
+	if got := []HeadlessExitCause{HeadlessExitCompleted, HeadlessExitOrphaned, HeadlessExitStoppedForResume, HeadlessExitShimFailure}; len(got) != len(contract) {
+		t.Fatalf("registry names %d causes, contract names %d", len(got), len(contract))
+	} else {
+		for i, cause := range got {
+			if string(cause) != contract[i] {
+				t.Fatalf("registry cause %d = %q, contract says %q", i, cause, contract[i])
+			}
+		}
+	}
+	refused := []string{
+		"", "failed", "cancelled", "lost_ownership", "worker_exited_without_result",
+		"exited", "stopped", "Completed", "COMPLETED", "interactive", "headless",
+	}
+
+	id := testIdentity()
+	tombstone := func(cause HeadlessExitCause, state HeadlessOutboxState) Tombstone {
+		tomb := Tombstone{
+			SchemaVersion: HeadlessRecordSchemaVersion, Workload: WorkloadHeadless,
+			OrgID: id.OrgID, SessionID: id.SessionID,
+			ShimID: "shim-1", ProcessEpoch: 1, HarnessPID: 4242, HarnessStartedAt: 17,
+			LastSeq: 1, GroupReaped: true,
+			Cause: cause, OutboxState: state, OutboxKey: "org/sess/attempt-1",
+			ObservedAtUnixNano: time.Now().UnixNano(),
+		}
+		if state == HeadlessOutboxNone {
+			tomb.OutboxKey = ""
+		}
+		return tomb
+	}
+	wire := func(cause HeadlessExitCause, state HeadlessOutboxState) error {
+		exit := shimwire.HeadlessExit{
+			Seq: 1, ProcessEpoch: 1, GroupReaped: true, Cause: cause,
+			OutboxKey: "org/sess/attempt-1", OutboxState: state, ObservedAt: 1760000000000000000,
+		}
+		if state == HeadlessOutboxNone {
+			exit.OutboxKey = ""
+		}
+		body, err := json.Marshal(exit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = shimwire.DecodeHeadlessExit(body)
+		return err
+	}
+
+	for _, name := range contract {
+		cause := HeadlessExitCause(name)
+		state := HeadlessOutboxDelivered
+		if cause == HeadlessExitStoppedForResume {
+			state = HeadlessOutboxNone
+		}
+		if !cause.Known() {
+			t.Fatalf("contract cause %q is not in the registry", name)
+		}
+		if err := tombstone(cause, state).Validate(); err != nil {
+			t.Fatalf("tombstone with contract cause %q = %v, want valid", name, err)
+		}
+		if err := wire(cause, state); err != nil {
+			t.Fatalf("wire HeadlessExit with contract cause %q = %v, want valid", name, err)
+		}
+	}
+	for _, name := range refused {
+		cause := HeadlessExitCause(name)
+		if cause.Known() {
+			t.Fatalf("non-contract cause %q is in the registry", name)
+		}
+		if err := tombstone(cause, HeadlessOutboxDelivered).Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("tombstone with non-contract cause %q = %v, want ErrRecordInvalid", name, err)
+		}
+		if err := wire(cause, HeadlessOutboxDelivered); !errors.Is(err, shimwire.ErrMalformed) {
+			t.Fatalf("wire HeadlessExit with non-contract cause %q = %v, want ErrMalformed", name, err)
+		}
+	}
+	for _, name := range []string{"completed", "orphaned", "shim_failure"} {
+		cause := HeadlessExitCause(name)
+		if err := tombstone(cause, HeadlessOutboxNone).Validate(); !errors.Is(err, ErrRecordInvalid) {
+			t.Fatalf("tombstone %q with outbox none = %v, want ErrRecordInvalid", name, err)
+		}
+		if err := wire(cause, HeadlessOutboxNone); !errors.Is(err, shimwire.ErrMalformed) {
+			t.Fatalf("wire HeadlessExit %q with outbox none = %v, want ErrMalformed", name, err)
+		}
+	}
+}
+
+// TestInteractiveTombstoneRefusesHeadlessMembers pins the profile boundary
+// on the tombstone contract: an interactive tombstone carrying any headless
+// exit member — cause, outbox key, or outbox state — is refused, so a
+// schema-1 tombstone leaking those members can never reach an older strict
+// reader that would choke on them at adoption.
+func TestInteractiveTombstoneRefusesHeadlessMembers(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	base := func() Tombstone {
+		return Tombstone{
+			SchemaVersion: RecordSchemaVersion,
+			OrgID:         id.OrgID, SessionID: id.SessionID,
+			ShimID: "shim-1", ProcessEpoch: 1, HarnessPID: 4242, HarnessStartedAt: 17,
+			ExitCode: 0, LastSeq: 12, GroupReaped: true,
+			ObservedAtUnixNano: time.Now().UnixNano(),
+		}
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("Validate interactive tombstone = %v, want nil", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Tombstone)
+	}{
+		{"cause", func(tb *Tombstone) { tb.Cause = HeadlessExitCompleted }},
+		{"outbox key", func(tb *Tombstone) { tb.OutboxKey = "outbox-1" }},
+		{"outbox state", func(tb *Tombstone) { tb.OutboxState = HeadlessOutboxPending }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tomb := base()
+			tc.mutate(&tomb)
+			if err := tomb.Validate(); !errors.Is(err, ErrRecordInvalid) {
+				t.Fatalf("Validate interactive tombstone with %s = %v, want ErrRecordInvalid", tc.name, err)
+			}
+			if err := reg.PutTombstone(tomb); !errors.Is(err, ErrRecordInvalid) {
+				t.Fatalf("PutTombstone interactive tombstone with %s = %v, want ErrRecordInvalid", tc.name, err)
+			}
+		})
+	}
+}
+
 func TestNewRegistryTightensAnExistingLooseDirectory(t *testing.T) {
 	t.Parallel()
 

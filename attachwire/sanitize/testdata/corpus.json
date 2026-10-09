@@ -278,5 +278,259 @@
     "expected_output": "dXNlckBob3N0On4kIBtbMzJtb2sbWzBtDQo=",
     "disposition": "mixed",
     "spec_row": "mixed"
+  },
+  {
+    "name": "osc_title_utf8_c1_continuation",
+    "description": "OSC 0 title whose payload holds a UTF-8 rune with a 0x9C continuation byte (U+2733, as a REPL writes for its idle title) is neutralized whole: 0x9C inside a rune is payload, not ST, so no title text reaches the prompt",
+    "input": "4p2vIBtdMDvinLMgc2Vzc2lvbi1uYW1lBw==",
+    "expected_output": "4p2vIA==",
+    "disposition": "neutralize",
+    "spec_row": "osc-title"
+  },
+  {
+    "name": "apc_utf8_c1_continuation_strip",
+    "description": "an APC string whose payload holds a UTF-8 rune with a 0x9C continuation byte is stripped whole, through its real ST",
+    "input": "G1/inLMgaGlkZGVuG1xvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "apc-pm"
+  },
+  {
+    "name": "osc_utf8_encoded_c1_ends_string",
+    "description": "a UTF-8-encoded C1 control (U+009C) inside an OSC body ends the string for a UTF-8 terminal, so the sanitizer strips the string and sanitizes the rest from ground (the raw CSI 6n after it is stripped)",
+    "input": "G104Ozt4wpybNm5vaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-8"
+  },
+  {
+    "name": "dcs_malformed_header_utf8_strip",
+    "description": "a DCS whose header begins a UTF-8 rune with a 0x9C continuation byte is malformed and stripped whole, through its real ST",
+    "input": "G1DinLMgaGlkZGVuG1xvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "dcs-decudk-decrqss"
+  },
+  {
+    "name": "ground_utf8_c1_csi_strip",
+    "description": "a CSI introducer encoded as UTF-8 (U+009B) is stripped in ground, so C2 9B 6n cannot reach the viewer as a cursor position request",
+    "input": "wps2bsKbYw==",
+    "expected_output": "Nm5j",
+    "disposition": "strip",
+    "spec_row": "c1-utf8"
+  },
+  {
+    "name": "ground_utf8_c1_osc_query_strip",
+    "description": "OSC introducer and ST encoded as UTF-8 (U+009D, U+009C) are stripped in ground, so a colour query cannot be smuggled past the OSC table",
+    "input": "wp0xMTs/wpw=",
+    "expected_output": "MTE7Pw==",
+    "disposition": "strip",
+    "spec_row": "c1-utf8"
+  },
+  {
+    "name": "ground_utf8_c1_dcs_decrqss_strip",
+    "description": "DCS introducer and ST encoded as UTF-8 (U+0090, U+009C) are stripped in ground, so DECRQSS cannot be smuggled past the DCS table",
+    "input": "wpAkcW3CnA==",
+    "expected_output": "JHFt",
+    "disposition": "strip",
+    "spec_row": "c1-utf8"
+  },
+  {
+    "name": "osc_raw_st_reemitted_7bit",
+    "description": "a passed OSC colour set ending in a raw 8-bit ST is re-emitted with ESC \\, so a UTF-8 viewer closes it there and the following '?' stays text instead of turning the set into a query",
+    "input": "G10xMDucPxtbbQ==",
+    "expected_output": "G10xMDsbXD8bW20=",
+    "disposition": "mixed",
+    "spec_row": "osc-color-set"
+  },
+  {
+    "name": "c1_osc8_reemitted_7bit",
+    "description": "an OSC 8 hyperlink with 8-bit introducer and ST passes in 7-bit form (ESC ] ... ESC \\), which a UTF-8 viewer parses the same way the sanitizer did",
+    "input": "nTg7O2h0dHBzOi8vZXhhbXBsZS5jb22cbGluaw==",
+    "expected_output": "G104OztodHRwczovL2V4YW1wbGUuY29tG1xsaW5r",
+    "disposition": "display-only",
+    "spec_row": "osc-8"
+  },
+  {
+    "name": "sixel_c1_reemitted_7bit",
+    "description": "a Sixel DCS with 8-bit introducer and ST passes in 7-bit form (ESC P ... ESC \\)",
+    "input": "kHEjMH6c",
+    "expected_output": "G1BxIzB+G1w=",
+    "disposition": "pass",
+    "spec_row": "dcs-sixel"
+  },
+  {
+    "name": "decset_inband_resize_strip",
+    "description": "setting ?2048 (in-band resize reports) is stripped: the terminal would write size reports on its input by itself",
+    "input": "G1s/MjA0OGhvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decset_color_scheme_reports_strip",
+    "description": "setting ?2031 (colour-scheme change reports) is stripped",
+    "input": "G1s/MjAzMWhvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decset_reply_mode_removed_from_mixed_set",
+    "description": "a reply mode is removed from a combined DECSET; the other modes still pass",
+    "input": "G1s/MTA0OTsyMDQ4OzIwMzE6MTsyNWg=",
+    "expected_output": "G1s/MTA0OTsyNWg=",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decrst_reply_modes_pass",
+    "description": "resetting ?2048 and ?2031 passes (it can only stop reports)",
+    "input": "G1s/MjA0ODsyMDMxbA==",
+    "expected_output": "G1s/MjA0ODsyMDMxbA==",
+    "disposition": "pass",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "dec_locator_requests_strip",
+    "description": "DEC locator enable (DECELR), select events (DECSLE) and request position (DECRQLP) are stripped",
+    "input": "G1sxOzEnehtbMSd7G1swJ3xvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "kitty_keyboard_query_strip",
+    "description": "the kitty keyboard flags query (CSI ? u) is stripped; push and pop pass",
+    "input": "G1s/dRtbPjF1G1s8dQ==",
+    "expected_output": "G1s+MXUbWzx1",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "modifier_options_query_strip",
+    "description": "the modifier-options query (CSI ? 4 m) is stripped; setting modifyOtherKeys (CSI \u003e 4 ; 2 m) passes",
+    "input": "G1s/NG0bWz40OzJt",
+    "expected_output": "G1s+NDsybQ==",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decset_reply_mode_with_empty_fields_canonical",
+    "description": "when a reply mode is removed, empty fields go too and an empty DECSET is stripped, so every port emits one form",
+    "input": "G1s/OzIwNDhoG1s/MjA0ODtoG1s/OzsyMDQ4aG9r",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decset_empty_fields_dropped_around_kept_modes",
+    "description": "removing a reply mode from a set with empty fields keeps only the non-empty modes",
+    "input": "G1s/OzEwMDA7MjA0OGgbWz8xMDAwOzsyMDQ4OzEwMDZo",
+    "expected_output": "G1s/MTAwMGgbWz8xMDAwOzEwMDZo",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "dcs_q_with_intermediate_strip",
+    "description": "a DCS q with an intermediate or private marker is not Sixel and is stripped: XTGETTCAP (+q, 7-bit and 8-bit), !q, \u003eq",
+    "input": "G1ArcTU0NGUbXJArcTU0NGWcG1AhcX4bXBtQPnF+G1xvaw==",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "dcs-decudk-decrqss"
+  },
+  {
+    "name": "sixel_with_params_pass",
+    "description": "a Sixel DCS with parameters (digits and ';' before q) still passes",
+    "input": "G1AwOzE7MHEjMH4bXA==",
+    "expected_output": "G1AwOzE7MHEjMH4bXA==",
+    "disposition": "pass",
+    "spec_row": "dcs-sixel"
+  },
+  {
+    "name": "s8c1t_strip",
+    "description": "S8C1T (ESC SP G) is stripped: the terminal would send replies with 8-bit C1 introducers; S7C1T passes",
+    "input": "GyBHGyBGb2s=",
+    "expected_output": "GyBGb2s=",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "report_requests_strip",
+    "description": "report requests are stripped: DECREQTPARM (x), XTSMGRAPHICS (?S), DECRQCRA (*y), DECRQPSR ($w), DECRQTSR ($u), DECRQUPSS (\u0026u); scroll-up (S) passes",
+    "input": "G1t4G1sxeBtbPzE7MTswUxtbMTsxOzE7MTsxOzEqeRtbMSR3G1sxJHUbWyZ1G1syU29r",
+    "expected_output": "G1syU29r",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "decanm_vt52_reset_strip",
+    "description": "resetting ?2 (DECANM, into VT52 mode) is removed from a DEC private reset; other resets pass",
+    "input": "G1s/MmwbWz8yNTsybG9r",
+    "expected_output": "G1s/MjVsb2s=",
+    "disposition": "mixed",
+    "spec_row": "reply-modes"
+  },
+  {
+    "name": "osc52_set_offered",
+    "description": "an OSC 52 clipboard set is stripped from the stream and its decoded text is offered to the clipboard hook (bytes captured from a mouse-tracking REPL)",
+    "input": "YRtdNTI7YztJQ0JHWVdKc1pTQTFMakVnd3JjZ1EyeGhkV1JsSUUxaGVBPT0HYg==",
+    "expected_output": "YWI=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "ICBGYWJsZSA1LjEgwrcgQ2xhdWRlIE1heA=="
+    ]
+  },
+  {
+    "name": "osc52_query_not_offered",
+    "description": "an OSC 52 query is stripped and never offered or answered",
+    "input": "G101MjtjOz8Hb2s=",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": []
+  },
+  {
+    "name": "osc52_controls_only_not_offered",
+    "description": "a set whose text is only control characters is not offered, so it can never clear the clipboard",
+    "input": "G101MjtjO0FRSWIHb2s=",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": []
+  },
+  {
+    "name": "osc52_trailing_break_dropped",
+    "description": "one trailing line break is dropped from the offered text, so a pasted command does not run at once",
+    "input": "G101MjtjO2JITWdMV3dLB29r",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "bHMgLWw="
+    ]
+  },
+  {
+    "name": "osc52_leading_bom_kept",
+    "description": "a leading BOM is kept in the offered text (every port decodes the same text; previews render it visibly)",
+    "input": "G101MjtjOzc3dS9hR2s9B29r",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "77u/aGk="
+    ]
+  },
+  {
+    "name": "osc52_incomplete_padding_not_offered",
+    "description": "padded base64 must be complete: QQ= is rejected while unpadded QQ decodes",
+    "input": "G101MjtjO1FRPQcbXTUyO2M7UVEHb2s=",
+    "expected_output": "b2s=",
+    "disposition": "strip",
+    "spec_row": "osc-52",
+    "clipboard": [
+      "QQ=="
+    ]
   }
 ]

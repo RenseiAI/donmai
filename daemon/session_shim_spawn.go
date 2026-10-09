@@ -125,6 +125,42 @@ func (d *Daemon) shimOwnsSession(spec SessionSpec) bool {
 	return spec.Mode == interactiveRunMode
 }
 
+// nextShimProcessEpoch resolves the launch contract's process epoch for one
+// new shim incarnation: one past the highest epoch this identity already
+// holds on disk — live records and tombstones alike — or 1 when the identity
+// is new to this host.
+//
+// The epoch is per-session monotonic across relaunches, never across
+// adoptions: a replacement daemon that adopts a live shim keeps its epoch,
+// while a fresh launch after the lineage ended advances it. Deriving it from
+// the registry is what makes a relaunch after a crash distinct from the
+// incarnation it replaces, so the discovery match and the tombstone
+// correlation never alias two launches. A registry that cannot be read maps
+// to 1 rather than failing the launch: the incarnation is still pinned by
+// PID and start identity beside the epoch, so a defaulted epoch cannot alias
+// two launches either.
+func (d *Daemon) nextShimProcessEpoch(id sessionshim.Identity, registry *sessionshim.Registry) uint64 {
+	var highest uint64
+	if registry == nil {
+		return 1
+	}
+	if entries, err := registry.Scan(); err == nil {
+		for _, e := range entries {
+			if e.Err == nil && e.Record.Identity() == id && e.Record.ProcessEpoch > highest {
+				highest = e.Record.ProcessEpoch
+			}
+		}
+	}
+	if tombstones, err := registry.ScanTombstones(); err == nil {
+		for _, t := range tombstones {
+			if t.Identity() == id && t.ProcessEpoch > highest {
+				highest = t.ProcessEpoch
+			}
+		}
+	}
+	return highest + 1
+}
+
 // SessionShimOwnsSession reports whether this daemon will launch spec under
 // per-session shim ownership, right now.
 //
@@ -188,7 +224,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		Identity:     id,
 		RegistryDir:  registry.Dir(),
 		Orphan:       cfg.Orphan,
-		ProcessEpoch: 1,
+		ProcessEpoch: d.nextShimProcessEpoch(id, registry),
 		// Zero on every ordinary launch. Non-zero only while the acceptance
 		// seam is armed, so its burst can actually reach the ring's eviction
 		// path instead of missing it by two orders of magnitude.

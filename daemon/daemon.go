@@ -92,6 +92,20 @@ type Options struct {
 	// included); a same-user, unsandboxed session can still read the token
 	// file itself.
 	ControlToken string
+	// ControlTokenPath is the resolved control-token file path the daemon
+	// minted ControlToken into: the explicit file-env override when
+	// absolute, else the host state home. The production entry point
+	// resolves it the same way the operator CLI does and states here the
+	// file the kernel resolves that path to (symbolic links and ".."
+	// walked in order, never a lexical clean, which can name a different
+	// file) so accept-time session details can carry it to the spawned worker,
+	// whose seat confinement denies it outright. Empty (tests, embedders
+	// that never set it) states nothing — the worker falls back to its
+	// own environment resolution. The path is host topology, not a
+	// credential: it is cleared from redacted detail reads like the
+	// other host-path fields, and it never reaches a spawned session's
+	// environment.
+	ControlTokenPath string
 	// RequireControlToken arms the mutating-route gate unconditionally.
 	// With it set, an empty ControlToken (the token could not be minted
 	// or read) makes every mutating control route refuse with 503 instead
@@ -2442,6 +2456,17 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 		// that would refuse it anyway.
 		if _, err := agent.ExecutionSecurityFromOperationalPayload(detail.OperationalPayload); err != nil {
 			return nil, fmt.Errorf("execution security: %w", err)
+		}
+		// Stamp the daemon-resolved token path so the spawned worker's
+		// seat confinement denies the live token file explicitly. The
+		// spawner strips the path-override variable from the worker's
+		// environment, so the worker cannot resolve the override itself;
+		// without this stamp the seat would deny the default path while
+		// the live token sits at the override. The daemon's own answer
+		// always wins here: a work item must not be able to aim its own
+		// seat's deny at an arbitrary host file.
+		if path := strings.TrimSpace(d.opts.ControlTokenPath); path != "" {
+			detail.ControlTokenPath = path
 		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound

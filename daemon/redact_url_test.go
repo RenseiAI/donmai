@@ -156,9 +156,37 @@ func TestControlRoutes_RedactRepositoryCredentials(t *testing.T) {
 	if d.heartbeat == nil {
 		t.Fatal("daemon has no heartbeat service")
 	}
-	if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
-		t.Fatalf("heartbeat beat: %v", err)
-	}
+	// The heartbeat reports the allowlist change-only: a beat whose
+	// allowlist hash matches the last transmitted one OMITS the entries,
+	// and whichever beat runs last owns LastPayload. The background
+	// loop's immediate beat is an async goroutine that can compose at any
+	// point relative to this test, so a loop beat landing after the
+	// spawner refresh above would leave GET /api/daemon/heartbeat with no
+	// allowlist entries at all — the host and path vanish along with the
+	// credential.
+	//
+	// Stop() ends the periodic loop but does not join it: a loop whose
+	// immediate beat has not yet taken the beat lock still runs that one
+	// beat after we release it. So, under the beat lock, reset the
+	// baseline before the manual beat (it carries the entries even if a
+	// loop beat already reported this hash) and again after it (the one
+	// loop beat that can still follow carries them too). Every beat that
+	// can own LastPayload from here on is complete, whatever the schedule.
+	d.heartbeat.Stop()
+	d.heartbeat.sendMu.Lock()
+	func() {
+		defer d.heartbeat.sendMu.Unlock()
+		resetAllowlistBaseline := func() {
+			d.heartbeat.mu.Lock()
+			d.heartbeat.lastAllowlistHash = ""
+			d.heartbeat.mu.Unlock()
+		}
+		resetAllowlistBaseline()
+		if err := d.heartbeat.sendOneSerialized(context.Background()); err != nil {
+			t.Fatalf("heartbeat beat: %v", err)
+		}
+		resetAllowlistBaseline()
+	}()
 
 	for _, path := range []string{
 		"/api/daemon/stats",

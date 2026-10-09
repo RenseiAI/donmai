@@ -56,7 +56,10 @@ func TestSpawner_HandleEnrichment(t *testing.T) {
 func TestSpawnerHandlePublishesNestedRootAndSelectedRepositoryCWD(t *testing.T) {
 	parent := t.TempDir()
 	spawner := NewWorkerSpawner(SpawnerOptions{
-		Projects:              []ProjectConfig{{ID: "acme", Repository: "github.com/acme/web"}},
+		Projects: []ProjectConfig{
+			{ID: "acme", Repository: "github.com/acme/web"},
+			{ID: "acme", Repository: "github.com/acme/docs"},
+		},
 		MaxConcurrentSessions: 1, WorktreeParentDir: parent,
 		WorkerCommand: []string{"/bin/sh", "-c", "sleep 5"},
 	})

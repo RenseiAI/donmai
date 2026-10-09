@@ -160,3 +160,30 @@ func (x *Reader) readVersion(version uint32) (Message, error) {
 func (x *Reader) ReadVersion(version uint32) (Message, error) {
 	return x.readVersion(version)
 }
+
+// ReadProfileVersion reads one message on a connection carrying the given
+// workload profile and refuses per the profile vocabulary: under the headless
+// profile every PTY-shaped type is a typed malformed classification, never a
+// silent skip and never an acted-on frame. It answers the refusal itself with
+// an Error{code:"malformed"} on w and reports ErrMalformed to the caller, so a
+// headless connection cannot be driven into terminal behavior by a peer that
+// sends it. The interactive profile refuses nothing beyond version admission.
+func (x *Reader) ReadProfileVersion(w *Writer, profile Profile, version uint32) (Message, error) {
+	msg, err := x.readVersion(version)
+	if err != nil {
+		return msg, err
+	}
+	if !msg.Type.RefusedIn(profile, version) {
+		return msg, nil
+	}
+	body, encErr := encodeJSON(ErrorMsg{Code: CodeMalformed, Detail: "message type is refused on the headless profile"})
+	if encErr != nil {
+		return Message{}, encErr
+	}
+	// The answer goes on the versioned writer so a v6 headless peer is never
+	// answered with a frame its own reader would refuse.
+	if wErr := w.WriteVersion(version, TypeError, body); wErr != nil {
+		return Message{}, fmt.Errorf("shimwire: refuse %s on the headless profile: %w", msg.Type, wErr)
+	}
+	return Message{}, fmt.Errorf("shimwire: refuse %s on the headless profile: %w: %w", msg.Type, ErrProfileRefused, ErrMalformed)
+}

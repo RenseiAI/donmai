@@ -31,6 +31,28 @@ type Entry struct {
 	Disposition string `json:"disposition"`
 	// SpecRow names the §9 table row (or edge case) the fixture covers.
 	SpecRow string `json:"spec_row"`
+	// Clipboard, when present, pins the OSC 52 clipboard hook: the
+	// base64-encoded texts a sanitizer built with an OnClipboard hook must
+	// offer for Input, in order. An empty list means nothing may be offered;
+	// an absent field leaves the hook unchecked for this fixture.
+	Clipboard *[]string `json:"clipboard,omitempty"`
+}
+
+// ClipboardTexts decodes Clipboard. It reports false when the fixture does not
+// pin the hook.
+func (e Entry) ClipboardTexts() ([]string, bool, error) {
+	if e.Clipboard == nil {
+		return nil, false, nil
+	}
+	out := make([]string, 0, len(*e.Clipboard))
+	for _, b := range *e.Clipboard {
+		raw, err := base64.StdEncoding.DecodeString(b)
+		if err != nil {
+			return nil, true, fmt.Errorf("decode clipboard text: %w", err)
+		}
+		out = append(out, string(raw))
+	}
+	return out, true, nil
 }
 
 // InputBytes decodes the base64 Input.
