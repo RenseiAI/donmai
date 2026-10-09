@@ -1810,6 +1810,129 @@ func TestInteractive_TerminalCostReachesSessionResult(t *testing.T) {
 	}
 }
 
+// TestInteractive_LateTerminalEventStillCostsSessionResult reproduces the
+// production timing the drain must survive: the PTY session is Done (so the
+// supervisor takes the Done branch) but the handle's terminal ResultEvent
+// only arrives later — after the post-exit work that strictly follows Done
+// (shim finalize wait, exit read, session-file cost read, cleanup). A
+// non-blocking drain returns on the still-empty channel and the cost is
+// lost; the bounded wait observes the late event and applies it.
+func TestInteractive_LateTerminalEventStillCostsSessionResult(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{}
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+	go func() {
+		// run()'s post-exit delay before the terminal send.
+		time.Sleep(300 * time.Millisecond)
+		events <- agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+		}}
+		close(events)
+	}()
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "late-terminal-cost"}}
+	res := &Result{SessionID: qw.SessionID}
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil {
+		t.Fatalf("dispatchInteractive: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", out.Status)
+	}
+	if out.Cost == nil {
+		t.Fatal("session result carries no cost; the late terminal ResultEvent was lost")
+	}
+	want := agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}
+	if *out.Cost != want {
+		t.Fatalf("session cost = %+v, want %+v", out.Cost, want)
+	}
+}
+
+// TestInteractive_SteadyStateTerminalEventStillCostsSessionResult pins the
+// other arrival path: the supervisor's steady-state select consumes the
+// terminal ResultEvent BEFORE Done is observed (a select win while both are
+// ready). The cost must still reach the session result — the steady-state
+// branch applies it exactly like the drain does.
+func TestInteractive_SteadyStateTerminalEventStillCostsSessionResult(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	// The session stays alive until the terminal event has been consumed on
+	// the steady-state branch; Done then fires and the drain sees only the
+	// channel close. Without the steady-state apply, the result stays
+	// costless even though the event was observed.
+	session := liveRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	release := make(chan struct{})
+	consumed := make(chan struct{})
+	go func() {
+		events <- agent.InitEvent{}
+		events <- agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+		}}
+		close(consumed)
+		<-release
+		close(session.done)
+		close(events)
+	}()
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "steady-terminal-cost"}}
+	res := &Result{SessionID: qw.SessionID}
+	type outcome struct {
+		out *Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		out, err := minimalRunner(t).dispatchInteractive(
+			context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+		)
+		done <- outcome{out: out, err: err}
+	}()
+	select {
+	case <-consumed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal event was not consumed on the steady-state branch")
+	}
+	// Give the supervisor a scheduling window to process the consumed event
+	// before Done fires; the drain path (channel already closed of the
+	// terminal event) must not be what carries the cost.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("dispatchInteractive did not finish after Done")
+	}
+	if got.err != nil {
+		t.Fatalf("dispatchInteractive: %v", got.err)
+	}
+	if got.out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", got.out.Status)
+	}
+	if got.out.Cost == nil {
+		t.Fatal("session result carries no cost; the steady-state terminal ResultEvent was dropped")
+	}
+	want := agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}
+	if *got.out.Cost != want {
+		t.Fatalf("session cost = %+v, want %+v", got.out.Cost, want)
+	}
+}
+
 // TestInteractive_BareTerminalKeepsResultCostless is the companion: a handle
 // whose terminal ResultEvent carries no cost leaves the session result
 // costless instead of fabricating a zero.

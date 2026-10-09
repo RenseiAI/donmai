@@ -97,9 +97,11 @@ func readRolloutUsage(path, threadID string) *rolloutUsageTotals {
 		}
 		cumulative := line.Payload.ThreadTokenUsage
 		if cumulative == nil {
-			cumulative = line.Payload.Usage
-		}
-		if cumulative == nil {
+			// No cumulative total on this record: skip it. A per-call
+			// usage without the thread total is one call's count, and
+			// reporting it as the thread TOTAL would undercount while
+			// looking exact. The writer always carries the cumulative
+			// field, so skipping only drops shapes it never emits.
 			continue
 		}
 		totals = &rolloutUsageTotals{

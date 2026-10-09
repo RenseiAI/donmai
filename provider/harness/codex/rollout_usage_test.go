@@ -147,9 +147,18 @@ func TestFindThreadRollout_MatchesThreadSuffixOnly(t *testing.T) {
 	if err := os.WriteFile(decoy, []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// "-<threadID>.jsonl" still suffix-matches the decoy name, so plant the
-	// real file too and assert the newest (real) one wins only by mtime.
+	// "-<threadID>.jsonl" suffix-matches the evil-prefixed decoy name too,
+	// so plant the real file newest and assert it wins by mtime.
 	wantPath := writeRolloutFixture(t, home)
+	// A still-newer file whose name merely CONTAINS the id — not as the
+	// last dash group — must not win: it proves the match is a suffix
+	// match, not a substring match. The Contains mutant picks this decoy
+	// and goes red. Sleep so its mtime is strictly newest.
+	time.Sleep(10 * time.Millisecond)
+	containsDecoy := filepath.Join(dir, "rollout-"+rolloutFixtureThreadID+"-extra.jsonl")
+	if err := os.WriteFile(containsDecoy, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if got := findThreadRollout(home, rolloutFixtureThreadID); got != wantPath {
 		t.Fatalf("findThreadRollout = %q, want %q", got, wantPath)
 	}
@@ -158,6 +167,28 @@ func TestFindThreadRollout_MatchesThreadSuffixOnly(t *testing.T) {
 	}
 	if got := findThreadRollout("", rolloutFixtureThreadID); got != "" {
 		t.Fatalf("findThreadRollout with no home = %q, want empty", got)
+	}
+}
+
+func TestReadRolloutUsage_UsageOnlyRecordIsSkipped(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dir := filepath.Join(home, codexSessionStateSubdir, "2026", "10", "09")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A record carrying per-call usage but no cumulative thread total must
+	// not move the total: the per-call count is not the thread total, and
+	// reporting it as one would undercount while looking exact.
+	const thread = "thread-usage-only"
+	body := `{"type":"token_usage_record","payload":{"thread_id":"` + thread + `","usage":{"input_tokens":100,` +
+		`"cached_input_tokens":10,"cache_write_input_tokens":1,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":150}}}` + "\n"
+	path := filepath.Join(dir, "rollout-2026-10-09T00-00-00-"+thread+".jsonl")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if totals := readRolloutUsage(path, thread); totals != nil {
+		t.Fatalf("usage-only record totals = %+v, want nil (skipped, not reported as the total)", totals)
 	}
 }
 
@@ -213,6 +244,17 @@ func drainTerminalResult(t *testing.T, h agent.Handle) agent.ResultEvent {
 
 func spawnInteractiveForUsageTest(t *testing.T, bin, boundaryRoot, workdir string, mcpServers []agent.MCPServerConfig, extraEnv map[string]string, beforePTY func(home string)) agent.Handle {
 	t.Helper()
+	return spawnInteractiveForUsageTestWithSpec(t, bin, boundaryRoot, workdir, mcpServers, extraEnv, beforePTY, agent.Spec{
+		SessionName: "chief-of-staff",
+		Cwd:         workdir,
+		MCPServers:  mcpServers,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		Env:         nil, // filled below
+	})
+}
+
+func spawnInteractiveForUsageTestWithSpec(t *testing.T, bin, boundaryRoot, _ string, mcpServers []agent.MCPServerConfig, extraEnv map[string]string, beforePTY func(home string), spec agent.Spec) agent.Handle {
+	t.Helper()
 	env := map[string]string{
 		codexFakeNamedAppServerEnv:         "1",
 		codexFakePTYClientCreatesThreadEnv: "1",
@@ -221,12 +263,14 @@ func spawnInteractiveForUsageTest(t *testing.T, bin, boundaryRoot, workdir strin
 	for key, value := range extraEnv {
 		env[key] = value
 	}
-	spec := agent.Spec{
-		SessionName: "chief-of-staff",
-		Cwd:         workdir,
-		MCPServers:  mcpServers,
-		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
-		Env:         env,
+	if spec.Env == nil {
+		spec.Env = env
+	} else {
+		for key, value := range env {
+			if _, ok := spec.Env[key]; !ok {
+				spec.Env[key] = value
+			}
+		}
 	}
 	h, err := SpawnInteractive(context.Background(), Options{
 		CodexBin:                      bin,
@@ -308,6 +352,82 @@ func TestSpawnInteractive_TerminalResultCarriesSessionFileUsage(t *testing.T) {
 	}
 	if *result.Cost != *want {
 		t.Fatalf("terminal cost = %+v, want %+v", result.Cost, want)
+	}
+}
+
+// TestSpawnInteractiveAttach_TerminalResultCarriesSessionFileUsage drives
+// the attach (ResumeExisting) production path end to end: the session name
+// is a thread-id-shaped value whose fixture rollout is pre-planted in the
+// spawned home — the re-adoption shape after a daemon restart — and the
+// terminal ResultEvent must carry its last cumulative total. The fresh-path
+// tests above never exercise spawnNamedInteractivePTY's attach branch
+// (currentThreadID = SessionName), so a regression that breaks attach-path
+// cost (for example resolving against the wrong home) stays green without
+// this test.
+func TestSpawnInteractiveAttach_TerminalResultCarriesSessionFileUsage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named interactive sessions are unix-only (validateNamedInteractiveTransport)")
+	}
+	clearInteractiveCodexAuthEnv(t)
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	root := t.TempDir()
+	boundaryRoot := filepath.Join(root, "session-boundaries")
+	workdir := filepath.Join(root, "work")
+	for _, dir := range []string{boundaryRoot, workdir} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	mcpServers := []agent.MCPServerConfig{{
+		Name: "donmai-platform",
+		Type: "http",
+		URL:  "https://platform.example.com/api/mcp/sess_project",
+		Headers: map[string]string{
+			"Authorization": "Bearer session-mcp-bearer",
+		},
+	}}
+	// A thread-id-shaped session name: the attach path requires it (the
+	// resume RPC takes a thread id, never a human-assigned name). The
+	// fixture rollout is pre-planted for exactly this id — the re-adoption
+	// shape, where the session file already exists when the session starts.
+	attachThreadID := testThreadUUID
+	plant := func(home string) {
+		dir := filepath.Join(home, codexSessionStateSubdir, "2026", "10", "09")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		body := `{"type":"session_meta","payload":{"id":"` + attachThreadID + `"}}` + "\n" +
+			usageLine(attachThreadID, 1000, 800, 10, 50, 4, 2000, 1600, 20, 100, 8) + "\n" +
+			usageLine(attachThreadID, 1800, 1500, 40, 120, 9, 3600, 3000, 70, 240, 20) + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "rollout-2026-10-09T00-00-00-"+attachThreadID+".jsonl"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := agent.Spec{
+		SessionName: attachThreadID,
+		Cwd:         workdir,
+		MCPServers:  mcpServers,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24, ResumeExisting: true},
+	}
+	h := spawnInteractiveForUsageTestWithSpec(t, self, boundaryRoot, workdir, mcpServers, map[string]string{
+		codexFakeNamedAppServerResumeThreadEnv: attachThreadID,
+	}, plant, spec)
+	result := drainTerminalResult(t, h)
+	if !result.Success {
+		t.Fatalf("fake codex interactive attach session failed: %+v", result)
+	}
+	if result.Cost == nil {
+		t.Fatal("attach terminal ResultEvent carries no cost; want the session file totals")
+	}
+	want := &agent.CostData{
+		InputTokens: 530, CachedInputTokens: 3000, CacheWriteTokens: 70,
+		OutputTokens: 240, ReasoningTokens: 20,
+	}
+	if *result.Cost != *want {
+		t.Fatalf("attach terminal cost = %+v, want %+v", result.Cost, want)
 	}
 }
 
