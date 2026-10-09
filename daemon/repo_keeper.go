@@ -195,15 +195,18 @@ func (k *RepoKeeper) Reconcile(ctx context.Context) error {
 	}
 
 	k.mu.Lock()
+	defer k.mu.Unlock()
 	k.entries = merged
-	k.ready = true
-	k.mu.Unlock()
+	// Publish and persist under one hold of k.mu: persistCatalogLocked
+	// marshals k.entries, and a concurrent Acquire writes the same map, so
+	// releasing the lock between publish and persist races. A persist
+	// failure leaves the keeper not-ready; callers degrade until the next
+	// successful reconcile.
 	if err := k.persistCatalogLocked(); err != nil {
-		k.mu.Lock()
 		k.ready = false
-		k.mu.Unlock()
 		return err
 	}
+	k.ready = true
 	return nil
 }
 
