@@ -495,10 +495,9 @@ func setScopesProbeForTest(t interface {
 }
 
 // SetScopesProbeForTest swaps the probe ScopesAvailable reads for the
-// calling test package (the daemon's posture test pins the same gate
-// through the production status entry point), restoring it at cleanup.
-// The caller passes its own *testing.T, which this package only holds as
-// the helper/cleanup interface above, never importing testing itself.
+// calling test package, restoring it at cleanup. The caller passes its
+// own *testing.T, which this package only holds as the helper/cleanup
+// interface above, never importing testing itself.
 func SetScopesProbeForTest(t interface {
 	Helper()
 	Cleanup(func())
@@ -507,9 +506,16 @@ func SetScopesProbeForTest(t interface {
 	setScopesProbeForTest(t, probe)
 }
 
-// ScopeFloorMinusOneForTest is one ABI below the scope floor: the value a
-// test stubs the scope probe with to pin the degraded posture, without
-// naming the kernel constant across the package line.
+// ScopeVerdictForTest is the host-independent reading of one scope-layer
+// version for tests outside this package: at or above the floor the layer
+// reports enforced, below it unenforced with the typed reason. The daemon's
+// posture test pins the same gate through the production status entry
+// point without naming the kernel constant across the package line.
+func ScopeVerdictForTest(abi int) (bool, string) { return scopeVerdict(abi) }
+
+// ScopeFloorMinusOneForTest is one version below the scope floor: the
+// value a test reads the degraded posture with, without naming the kernel
+// constant across the package line.
 func ScopeFloorMinusOneForTest() int { return landlockScopeABI - 1 }
 
 type fingerprint struct {

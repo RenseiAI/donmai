@@ -1487,6 +1487,11 @@ func TestFormatConfinementStatus(t *testing.T) {
 			want:   "degraded — the scope layer is unenforced: Landlock ABI 5 has no signal or abstract-socket scope (ABI 6, Linux 6.12, needed) — seat boundary is partial below Linux 6.12",
 		},
 		{name: "backend without attestation", status: &afclient.ConfinementStatus{Backend: "macos-seatbelt"}, want: "macos-seatbelt"},
+		{
+			name:   "unproven boundary",
+			status: &afclient.ConfinementStatus{Backend: "macos-seatbelt", Detail: "seat boundary unproven at Linux 6.12 (Landlock ABI 6) for the full boundary or newer: no passing self-test recorded on this host"},
+			want:   "macos-seatbelt",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

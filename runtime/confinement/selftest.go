@@ -283,7 +283,17 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 	}
 	record.Digest = record.computeDigest()
 	c.store(record)
-	if cacheOK && record.Passed && refusal == nil {
+	// A passing, whole record is proof seats start from: keep it where
+	// the status path reads it back, so the operator surface reports
+	// what the seats proved rather than what the daemon guessed.
+	if record.Passed && record.Degraded == "" && refusal == nil {
+		recordProvenSelfTest(record)
+	}
+	// A degraded record proves a partial boundary only: the load path
+	// refuses it (Degraded set, plus the scope recheck), so persisting it
+	// would pay a write on every sub-floor run for an entry that can
+	// never hit.
+	if cacheOK && record.Passed && record.Degraded == "" && refusal == nil {
 		cache.save(record)
 	}
 	if refusal != nil {

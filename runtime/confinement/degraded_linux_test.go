@@ -15,14 +15,19 @@ import (
 // the test runs on any host.
 func TestScopesAvailable_DegradedBelowABI6(t *testing.T) {
 	for _, abi := range []int{0, 1, 2, 5} {
-		stubLandlock(t, abi)
+		// ScopesAvailable reads scopesProbe (see stage_linux.go), not the
+		// checkLandlock floor probe, so stub the scope probe: the portable
+		// stubScopeProbe seam in scope_degraded_test.go pins it on every
+		// host, including a scoped kernel where the real answer is
+		// enforced.
+		stubScopeProbe(t, abi)
 		if ok, why := ScopesAvailable(); ok || why == "" {
 			t.Fatalf("ScopesAvailable on ABI %d = (%v, %q), want unenforced with a reason", abi, ok, why)
 		} else if !strings.Contains(why, "scope layer is unenforced") {
 			t.Fatalf("ScopesAvailable on ABI %d reason = %q, want the typed scope-layer reason", abi, why)
 		}
 	}
-	stubLandlock(t, landlockScopeABI)
+	stubScopeProbe(t, landlockScopeABI)
 	if ok, why := ScopesAvailable(); !ok || why != "" {
 		t.Fatalf("ScopesAvailable on ABI %d = (%v, %q), want enforced", landlockScopeABI, ok, why)
 	}
@@ -34,7 +39,7 @@ func TestScopesAvailable_DegradedBelowABI6(t *testing.T) {
 // as confined while the scope layer is missing. Reverting the degraded
 // marking (passing the record through as attested) turns this test red.
 func TestSelfTestRecord_DegradedNeverAttests(t *testing.T) {
-	stubLandlock(t, landlockScopeABI-1)
+	stubScopeProbe(t, landlockScopeABI-1)
 	w := newLinuxWorld(t)
 	launcher := fakeLauncher(t, "exit 0")
 	c, err := New(Options{
