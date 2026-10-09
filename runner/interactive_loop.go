@@ -717,15 +717,10 @@ func (r *Runner) drainInteractiveActivity(
 // ResultEvent after the PTY session is Done. The wait only runs when the
 // terminal was not observed on the supervisor loop or in the exit drain and
 // the events channel is still open — i.e. the terminal is in flight behind
-// Done (every handle emits it once the child has exited and drained). A
-// harness that accounts its own transcript at exit computes the totals
-// before it sends the terminal, and that read grows with the session: a
-// long delegating session's transcripts (subagent files included) measured
-// about 1 GB and took 2.6s to sum. The wait ends as soon as the terminal
-// arrives, so the bound only matters for a handle that never sends one,
-// which then finishes without a harness-accounted cost rather than stalling
-// session end indefinitely.
-const interactiveTerminalCostGrace = 30 * time.Second
+// Done (every handle emits it once the child has exited and drained). One
+// second is ample for that handoff; a handle that never sends one finishes
+// without a harness-accounted cost rather than stalling session end.
+const interactiveTerminalCostGrace = time.Second
 
 // applyInteractiveTerminalCost carries a cost-bearing terminal ResultEvent
 // from the handle onto the session result. Interactive PTY sessions
