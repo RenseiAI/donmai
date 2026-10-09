@@ -3,6 +3,7 @@ package afclient
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -37,6 +38,46 @@ func TestRepoKeeperYAML_RoundTrip(t *testing.T) {
 	}
 	if reloaded.RepoKeeper != cfg.RepoKeeper {
 		t.Errorf("reload repoKeeper = %+v, want %+v", reloaded.RepoKeeper, cfg.RepoKeeper)
+	}
+}
+
+// TestWriteDaemonYAMLWithCapacity_KeepsRetiredKeyStripped proves the rebase
+// resolution keeps both halves: a legacy file carrying the retired
+// per-repository clone override loses that key on write while the keeper
+// overlay still lands. Guards the merge of the keeper overlay with the
+// retired-key scrub in mergeDaemonYAML.
+func TestWriteDaemonYAMLWithCapacity_KeepsRetiredKeyStripped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	legacy := "projects:\n- id: foo-bar\n  repository: github.com/foo/bar\n  cloneStrategy: full\ncapacity:\n    maxConcurrentSessions: 2\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML: %v", err)
+	}
+	if err := WriteDaemonYAMLWithCapacity(path, cfg, "repoKeeper.maxDiskGb", 5); err != nil {
+		t.Fatalf("WriteDaemonYAMLWithCapacity: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reread: %v", err)
+	}
+	if strings.Contains(string(data), "cloneStrategy") {
+		t.Errorf("retired clone override survived the write:\n%s", data)
+	}
+	reloaded, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML(reload): %v", err)
+	}
+	if reloaded.RepoKeeper.MaxDiskGb != 5 {
+		t.Errorf("repoKeeper.maxDiskGb = %d, want 5", reloaded.RepoKeeper.MaxDiskGb)
+	}
+	if reloaded.Capacity.MaxConcurrentSessions != 2 {
+		t.Errorf("capacity.maxConcurrentSessions = %d, want 2 (undisturbed)", reloaded.Capacity.MaxConcurrentSessions)
 	}
 }
 

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -224,43 +223,78 @@ func TestRepoKeeper_BudgetExceededFallsBackToPlainClone(t *testing.T) {
 // TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed proves the
 // minimal budget rule: eviction takes mirrors with no in-flight seed, least
 // recently used first, and never evicts a seeded mirror.
+//
+// Three unpinned mirrors carry distinct use times (oldest → newest: a, b,
+// c). The budget admits exactly two, so one eviction must take the oldest
+// digest. Flipping the victim order to most-recently-used evicts c instead
+// and this test goes RED, pinning "least recently used first". A seeded
+// fourth mirror proves in-flight seeds are never evicted.
 func TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
+	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, nil, nil)
 	if err := k.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	oldDir, ok := k.Acquire(context.Background(), "https://example.com/org/old.git")
-	if !ok {
-		t.Fatal("acquire old: degraded")
+	remotes := []string{
+		"https://example.com/org/a.git",
+		"https://example.com/org/b.git",
+		"https://example.com/org/c.git",
+		"https://example.com/org/seeded.git",
 	}
-	oldDigest := filepath.Base(oldDir)
-	k.RecordFetch(oldDigest, 6, time.Millisecond, false)
-
-	newDir, ok := k.Acquire(context.Background(), "https://example.com/org/new.git")
-	if !ok {
-		t.Fatal("acquire new: degraded")
+	digests := make([]string, 0, len(remotes))
+	for _, remote := range remotes {
+		dir, ok := k.Acquire(context.Background(), remote)
+		if !ok {
+			t.Fatalf("acquire %s: degraded", remote)
+		}
+		digests = append(digests, filepath.Base(dir))
 	}
-	newDigest := filepath.Base(newDir)
-	k.RecordFetch(newDigest, 6, time.Millisecond, false)
+	// Assign byte loads and the enforcement cap without tripping the
+	// admission gate mid-setup: the fourth Acquire would otherwise degrade
+	// once the first three record 6 bytes each against the 18-byte cap.
+	// The cap is armed just before enforcement — this test exercises
+	// eviction order, not the admission gate.
+	k.mu.Lock()
+	for _, digest := range digests {
+		if e, ok := k.entries[digest]; ok {
+			e.Bytes = 6
+		}
+	}
+	k.settings.MaxBytes = 20
+	k.mu.Unlock()
+	// Assign distinct use times oldest-first: a < b < c < seeded.
+	// (Acquire stamps LastUse at second granularity, so same-second
+	// acquires would tie; the explicit stagger makes the LRU order
+	// unambiguous.)
+	k.mu.Lock()
+	for i, digest := range digests {
+		if e, ok := k.entries[digest]; ok {
+			e.LastUse = fmt.Sprintf("2000-01-01T00:00:%02dZ", i)
+		}
+	}
+	k.mu.Unlock()
 
-	// Pin the NEW mirror with an in-flight seed, then force the budget.
-	k.SeedBegin(newDigest)
+	// Pin the newest mirror with an in-flight seed, then force the
+	// budget: 24 bytes against a 20-byte cap evicts exactly one mirror,
+	// and it must be the oldest unpinned one (a).
+	k.SeedBegin(digests[3])
 	k.EnforceBudget()
 
 	stats := k.Stats()
-	if stats.MirrorCount != 1 {
-		t.Fatalf("MirrorCount = %d, want 1 after evicting the LRU mirror", stats.MirrorCount)
+	if stats.MirrorCount != 3 {
+		t.Fatalf("MirrorCount = %d, want 3 after evicting the LRU mirror", stats.MirrorCount)
 	}
-	if _, err := os.Stat(filepath.Join(root, "mirrors", oldDigest)); !os.IsNotExist(err) {
-		t.Errorf("LRU mirror still on disk: err = %v", err)
+	if _, err := os.Stat(filepath.Join(root, "mirrors", digests[0])); !os.IsNotExist(err) {
+		t.Errorf("oldest (LRU) mirror %s still on disk: err = %v", digests[0], err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "mirrors", newDigest)); err != nil {
-		t.Errorf("seeded mirror evicted: %v", err)
+	for i, d := range digests[1:] {
+		if _, err := os.Stat(filepath.Join(root, "mirrors", d)); err != nil {
+			t.Errorf("mirror %d (%s) evicted instead of the oldest: %v", i+1, d, err)
+		}
 	}
-	k.SeedEnd(newDigest, 6, time.Millisecond)
+	k.SeedEnd(digests[3], 6, time.Millisecond)
 }
 
 // TestRepoKeeper_RecoveryOrderDegradesWhileReconciling proves callers degrade
@@ -419,6 +453,14 @@ func TestServer_Stats_RepoKeeperDisabledOmitsBlock(t *testing.T) {
 // Acquire through the production entry points under -race: the publish and
 // the catalog persist hold one lock, so the race detector must stay silent
 // and every Acquire must either serve or degrade without an error.
+//
+// A test-only rendezvous parks Reconcile inside the publish→persist window
+// (after k.entries is swapped, before the catalog is marshalled) while a
+// concurrent Acquire hammers the same map. Restoring the racy shape —
+// publish under lock, persist after unlock — makes the detector fire on the
+// overlap, so this test pins the lock-holding fix rather than the timing.
+// The hammer uses the serve-existing path (no file I/O, just the entry-map
+// write), so it overlaps the persist marshal on every parked round.
 func TestRepoKeeper_ReconcileRacesNoAcquire(t *testing.T) {
 	t.Parallel()
 
@@ -428,28 +470,77 @@ func TestRepoKeeper_ReconcileRacesNoAcquire(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			for j := 0; j < 25; j++ {
-				remote := fmt.Sprintf("https://example.com/org/repo-%d-%d.git", i, j)
-				_, _ = k.Acquire(context.Background(), remote)
-			}
-		}(i)
+	// Seed one mirror so the racing Acquire takes the serve-existing path:
+	// lock, entry-map write, unlock — no file I/O to dilute the overlap.
+	seed := "https://example.com/org/seed.git"
+	if _, ok := k.Acquire(context.Background(), seed); !ok {
+		t.Fatal("seed Acquire degraded")
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for j := 0; j < 10; j++ {
-			if err := k.Reconcile(context.Background()); err != nil {
-				t.Errorf("Reconcile: %v", err)
-				return
+
+	for round := 0; round < 3; round++ {
+		// entered fires once Reconcile is parked in the publish→persist
+		// window; release unblocks it. Buffered + select-default so a
+		// surprising scheduler ordering cannot deadlock the test.
+		entered := make(chan struct{}, 1)
+		release := make(chan struct{})
+		stop := make(chan struct{})
+		k.reconcilePrePersist = func() {
+			select {
+			case entered <- struct{}{}:
+			default:
 			}
+			<-release
 		}
-	}()
-	wg.Wait()
+
+		// Hammer Acquire on the seeded mirror until told to stop. While
+		// Reconcile is parked holding the lock this queues on the mutex
+		// (fixed code); with the racy shape it spins concurrently with
+		// the unlocked persist (mutant) and the detector fires.
+		hammerDone := make(chan struct{})
+		go func() {
+			defer close(hammerDone)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = k.Acquire(context.Background(), seed)
+				}
+			}
+		}()
+
+		reconcileDone := make(chan error, 1)
+		go func() {
+			reconcileDone <- k.Reconcile(context.Background())
+		}()
+
+		// Wait until Reconcile is parked in the window, then give the
+		// hammer a moment to pile onto the overlap before releasing.
+		// The main goroutine never touches the keeper lock here, so
+		// neither shape can deadlock the test.
+		select {
+		case <-entered:
+			time.Sleep(20 * time.Millisecond)
+			close(release)
+		case err := <-reconcileDone:
+			// Reconcile finished without parking (must not happen
+			// while enabled, but never deadlock if it does).
+			close(stop)
+			<-hammerDone
+			if err != nil {
+				t.Fatalf("round %d Reconcile: %v", round, err)
+			}
+			t.Fatalf("round %d: Reconcile finished without entering the persist window", round)
+		}
+		if err := <-reconcileDone; err != nil {
+			close(stop)
+			<-hammerDone
+			t.Fatalf("round %d Reconcile: %v", round, err)
+		}
+		close(stop)
+		<-hammerDone
+	}
+	k.reconcilePrePersist = nil
 }
 
 // TestRepoKeeper_CredentialBearingRemoteStaysSecretFree drives the production
@@ -502,6 +593,73 @@ func TestRepoKeeper_CredentialBearingRemoteStaysSecretFree(t *testing.T) {
 	}
 	if decoded.Remote != bare {
 		t.Errorf("mirror.json remote = %q, want canonical %q", decoded.Remote, bare)
+	}
+}
+
+// TestRepoKeeper_NonHTTPRemoteHashesTrimmedAsIs pins the documented boundary
+// of the credential strip: non-URL remotes (SSH-style, local paths) carry
+// no URL credentials, so they hash trimmed as-is. The conservative choice
+// is http(s)-only stripping — an SSH userinfo like git@ is not a
+// credential — and this test locks that boundary against silent widening.
+func TestRepoKeeper_NonHTTPRemoteHashesTrimmedAsIs(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, nil, nil)
+	if err := k.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	ssh := "git@example.com:org/repo.git"
+	padded := "  " + ssh + "\n"
+
+	sshDir, ok := k.Acquire(context.Background(), ssh)
+	if !ok {
+		t.Fatal("ssh Acquire degraded")
+	}
+	paddedDir, ok := k.Acquire(context.Background(), padded)
+	if !ok {
+		t.Fatal("padded ssh Acquire degraded")
+	}
+	if sshDir != paddedDir {
+		t.Fatalf("whitespace-padded remote split mirrors: %q vs %q, want one digest", paddedDir, sshDir)
+	}
+	httpStyle := "ssh://git@example.com/org/repo.git"
+	httpDir, ok := k.Acquire(context.Background(), httpStyle)
+	if !ok {
+		t.Fatal("ssh-scheme Acquire degraded")
+	}
+	if httpDir == sshDir {
+		t.Errorf("ssh-scheme remote %q shares the scp-style digest %q: schemes must stay distinct", httpStyle, sshDir)
+	}
+	httpMeta, err := os.ReadFile(filepath.Join(root, "mirrors", filepath.Base(httpDir), "mirror.json")) //nolint:gosec // test-owned state file
+	if err != nil {
+		t.Fatalf("read ssh-scheme mirror.json: %v", err)
+	}
+	var httpDecoded repoKeeperMirrorMeta
+	if err := json.Unmarshal(httpMeta, &httpDecoded); err != nil {
+		t.Fatalf("decode ssh-scheme mirror.json: %v", err)
+	}
+	// The conservative http(s)-only strip leaves non-http(s) remotes
+	// untouched — even when they parse as URLs with userinfo — so the
+	// provenance keeps the remote exactly as the caller passed it
+	// (trimmed). Widening the strip to every scheme would rewrite this
+	// to "ssh://example.com/org/repo.git" and split no digests, but it
+	// would silently change the recorded provenance.
+	if httpDecoded.Remote != httpStyle {
+		t.Errorf("ssh-scheme mirror.json remote = %q, want untouched %q", httpDecoded.Remote, httpStyle)
+	}
+
+	digest := filepath.Base(sshDir)
+	meta, err := os.ReadFile(filepath.Join(root, "mirrors", digest, "mirror.json")) //nolint:gosec // test-owned state file
+	if err != nil {
+		t.Fatalf("read mirror.json: %v", err)
+	}
+	var decoded repoKeeperMirrorMeta
+	if err := json.Unmarshal(meta, &decoded); err != nil {
+		t.Fatalf("decode mirror.json: %v", err)
+	}
+	if decoded.Remote != ssh {
+		t.Errorf("mirror.json remote = %q, want trimmed-as-is %q", decoded.Remote, ssh)
 	}
 }
 
