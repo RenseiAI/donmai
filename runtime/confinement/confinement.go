@@ -296,16 +296,29 @@ func (c *Confiner) SelfTestRecord() (SelfTestRecord, bool) {
 
 // Attestation returns the per-harness confinement attestation when the last
 // self-test passed in at least one session mode and is still current, or
-// false. Its session modes are exactly the spawn paths that passed.
+// false. Its session modes are exactly the spawn paths that passed. A
+// degraded record (the scope layer missing) never attests: Degraded reports
+// why instead.
 func (c *Confiner) Attestation() (Attestation, bool) {
 	record, ok := c.SelfTestRecord()
-	if !ok || len(record.SessionModes) == 0 {
+	if !ok || len(record.SessionModes) == 0 || record.Degraded != "" {
 		return Attestation{}, false
 	}
 	if err := c.checkCurrent(record); err != nil {
 		return Attestation{}, false
 	}
 	return record.Attestation(), true
+}
+
+// Degraded reports why the last self-test proves a partial boundary only,
+// or false when the record proves the full boundary (or when no record
+// exists). Operators read it from status and doctor output.
+func (c *Confiner) Degraded() (string, bool) {
+	record, ok := c.SelfTestRecord()
+	if !ok || record.Degraded == "" {
+		return "", false
+	}
+	return record.Degraded, true
 }
 
 // Plan is one prepared confinement: a rendered, written profile plus the
@@ -363,8 +376,11 @@ func (p *Plan) Release() error {
 
 // Prepare renders and writes the confinement for spec. It refuses with a
 // typed *Error when the confinement cannot be applied: no backend, a nested
-// profile, no passing or a stale self-test, an unrepresentable writable set,
-// or an unrenderable composer rule. It never returns a weaker plan. It walks
+// profile, no passing or a stale self-test, a degraded record (the scope
+// layer missing: Prepare refuses rather than run a seat the host reports
+// as confined while signals and abstract sockets stay reachable), an
+// unrepresentable writable set, or an unrenderable composer rule. It never
+// returns a weaker plan. It walks
 // the writable set once to account for hard links (D2.3), so its cost grows
 // with the number of files in the set.
 func (c *Confiner) Prepare(spec Spec) (*Plan, error) {
@@ -377,6 +393,9 @@ func (c *Confiner) Prepare(spec Spec) (*Plan, error) {
 	record, ok := c.SelfTestRecord()
 	if !ok {
 		return nil, refuse(ReasonSelfTestFailed, "no self-test has run on this host")
+	}
+	if record.Degraded != "" {
+		return nil, refuse(ReasonSelfTestFailed, "the self-test proves a partial boundary only: %s", record.Degraded)
 	}
 	if !record.Passed || !containsMode(record.SessionModes, spec.SessionMode) {
 		return nil, refuse(ReasonSelfTestFailed, "the self-test did not pass for session mode %s", spec.SessionMode)
@@ -467,6 +486,75 @@ func (c *Confiner) fingerprint() (fingerprint, error) {
 		executableDigest: c.opts.ExecutableDigest,
 	}, nil
 }
+
+// landlockScopeABI is the first Landlock ABI with scopes: the signal and
+// abstract-socket scopes need ABI 6, which ships in Linux 6.12. Hosts
+// below it run the seat without that layer (see ScopesAvailable), and the
+// self-test never attests them as fully confined.
+const landlockScopeABI = 6
+
+// scopeVerdict is the host-independent reading of one Landlock ABI: at or
+// above the scope floor the layer reports enforced, below it unenforced
+// with the typed reason. scope_degraded_test.go drives it on every host;
+// ScopesAvailable only supplies the probe.
+func scopeVerdict(abi int) (bool, string) {
+	if abi >= landlockScopeABI {
+		return true, ""
+	}
+	return false, scopeDegradedReason(abi)
+}
+
+// scopeDegradedReason is the typed reason one ABI below the scope floor
+// records: the missing signal and abstract-socket scopes, the floor that
+// carries them, and the ABI that was found.
+func scopeDegradedReason(abi int) string {
+	return fmt.Sprintf("the scope layer is unenforced: Landlock ABI %d has no signal or abstract-socket scope (ABI %d, Linux 6.12, needed)", abi, landlockScopeABI)
+}
+
+// scopesProbe is the probe ScopesAvailable reads. It lives in this portable
+// file (not the Linux-only stage file) so tests on every host can stub it:
+// the scope recheck in the self-test cache must go red on macOS too.
+// Production always probes the running kernel through defaultScopesProbe.
+var scopesProbe = defaultScopesProbe
+
+// setScopesProbeForTest swaps the probe ScopesAvailable reads for the
+// calling test, restoring it at cleanup. The *testing.T stays in the
+// test files: production takes an explicit cleanup func instead, so this
+// package never imports testing outside _test.go.
+func setScopesProbeForTest(t interface {
+	Helper()
+	Cleanup(func())
+}, probe func() int,
+) {
+	t.Helper()
+	old := scopesProbe
+	scopesProbe = probe
+	t.Cleanup(func() { scopesProbe = old })
+}
+
+// SetScopesProbeForTest swaps the probe ScopesAvailable reads for the
+// calling test package, restoring it at cleanup. The caller passes its
+// own *testing.T, which this package only holds as the helper/cleanup
+// interface above, never importing testing itself.
+func SetScopesProbeForTest(t interface {
+	Helper()
+	Cleanup(func())
+}, probe func() int,
+) {
+	setScopesProbeForTest(t, probe)
+}
+
+// ScopeVerdictForTest is the host-independent reading of one scope-layer
+// version for tests outside this package: at or above the floor the layer
+// reports enforced, below it unenforced with the typed reason. The daemon's
+// posture test pins the same gate through the production status entry
+// point without naming the kernel constant across the package line.
+func ScopeVerdictForTest(abi int) (bool, string) { return scopeVerdict(abi) }
+
+// ScopeFloorMinusOneForTest is one version below the scope floor: the
+// value a test reads the degraded posture with, without naming the kernel
+// constant across the package line.
+func ScopeFloorMinusOneForTest() int { return landlockScopeABI - 1 }
 
 type fingerprint struct {
 	backend          BackendName

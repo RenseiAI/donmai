@@ -423,7 +423,11 @@ func TestRenderBubblewrap_ComposerReadDenyHidesWhereRevealed(t *testing.T) {
 		{Kind: RuleDenyRead, Path: elsewhere, Scope: ScopeSubtree},
 	})
 	text := joinArgs(args)
-	empty := filepath.Join(os.TempDir(), "donmai-confine-empty", "dir")
+	emptyBase, emptyErr := emptyPlaceholderBase()
+	if emptyErr != nil {
+		t.Fatalf("emptyPlaceholderBase: %v", emptyErr)
+	}
+	empty := filepath.Join(emptyBase, "dir")
 	for _, path := range []string{secret, inside} {
 		if !hasTriple(bindTargets(args), "--ro-bind", empty, path) {
 			t.Errorf("read deny %q is not hidden behind the empty placeholder:\n%s", path, text)
@@ -1111,13 +1115,15 @@ func hasTriple(triples [][3]string, flag, source, target string) bool {
 	return false
 }
 
-// stubLandlock pins the Landlock ABI the gates see for one test, so both
-// branches run on any kernel; production always probes the running one.
+// stubLandlock pins the Landlock ABI the floor probe checkLandlock reads
+// for one test, so both branches run on any kernel; production always
+// probes the running one. The scope probe ScopesAvailable reads is the
+// portable scopesProbe stubbed by stubScopeProbe in scope_degraded_test.go.
 func stubLandlock(t *testing.T, abi int) {
 	t.Helper()
-	old := landlockProbe
+	oldProbe := landlockProbe
 	landlockProbe = func() int { return abi }
-	t.Cleanup(func() { landlockProbe = old })
+	t.Cleanup(func() { landlockProbe = oldProbe })
 }
 
 // fakeLauncher writes a stand-in launcher that records its arguments, one

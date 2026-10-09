@@ -113,10 +113,17 @@
 // signal, attach to or read, and killing the launcher kills every process
 // inside. An interactive harness keeps its PTY's session and becomes the
 // terminal's foreground group, so Ctrl-C and job control reach it; a
-// headless one runs in a session of its own. From Landlock ABI 6 the stage
-// also scopes signals and abstract unix sockets to its domain; below it,
-// abstract sockets outside stay reachable, and the self-test records that
-// as kernel_unsupported instead of passing it.
+// headless one runs in a session of its own. The full boundary needs
+// Landlock ABI 6 (Linux 6.12), where the stage also scopes signals and
+// abstract unix sockets to its domain. Below it confined seats refuse
+// closed: the mount tree, the process namespace and the filesystem rules
+// would hold, but signals to same-user processes outside and abstract
+// sockets outside stay reachable, so the self-test records that kernel as
+// kernel_unsupported instead of passing it, marks the record degraded,
+// never attests it, and Prepare refuses it — the host reports a partial
+// boundary, never a confined one. Status and doctor output carry the
+// degraded reason, and seat hosts that must attest confinement run
+// Linux 6.12 or newer.
 //
 // The Linux self-test runs its own widening probes, each judged by its
 // effect outside: a decoy process signalled, attached to and read, a
