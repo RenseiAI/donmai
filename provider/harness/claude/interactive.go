@@ -35,6 +35,14 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	// Unattended trust: a bare interactive REPL parks on the workspace
+	// trust modal for any cwd the CLI has not recorded as trusted, and
+	// there is no flag that skips it — pre-seeding the record is the only
+	// unattended path. Seed exactly the platform-authorized boundary
+	// (the session cwd plus its declared mutable paths, resolved) before
+	// the child starts. Best-effort: a seed that cannot be written still
+	// spawns, and the modal — not a spawn failure — says so.
+	seedWorkspaceTrust(spec)
 
 	// The Stop-hook notice channel is BEST EFFORT at spawn time and load-
 	// bearing at delivery time. A drop directory that cannot be created is a

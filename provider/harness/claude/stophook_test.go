@@ -430,9 +430,13 @@ func TestStopHookSettings_DeclareTheStopHookAndNothingElse(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
 		t.Fatalf("settings is not a JSON string the CLI can parse: %v (%q)", err, raw)
 	}
-	if keys := sortedKeys(settings); !slices.Equal(keys, []string{"hooks"}) {
-		t.Fatalf("settings declares %v; want only [hooks] — --settings merges, so anything "+
-			"else here overrides the operator's own configuration", keys)
+	if keys := sortedKeys(settings); !slices.Equal(keys, []string{"hooks", "skipDangerousModePermissionPrompt"}) {
+		t.Fatalf("settings declares %v; want only [hooks skipDangerousModePermissionPrompt] — "+
+			"--settings merges, so anything else here overrides the operator's own configuration", keys)
+	}
+	if skip, _ := settings["skipDangerousModePermissionPrompt"].(bool); !skip {
+		t.Fatalf("skipDangerousModePermissionPrompt = %v; want true — without it an interactive "+
+			"session parks on the bypass-permissions acceptance no unattended session can answer", settings["skipDangerousModePermissionPrompt"])
 	}
 
 	hooks, _ := settings["hooks"].(map[string]any)
