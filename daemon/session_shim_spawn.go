@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -139,16 +138,6 @@ func (d *Daemon) shimOwnsSession(spec SessionSpec) bool {
 // for a posture the daemon has since left.
 func (d *Daemon) SessionShimOwnsSession(spec SessionSpec) bool { return d.shimOwnsSession(spec) }
 
-// shimScopeAvailable reports whether this host can place a shim launch in
-// its own transient scope: Linux with the systemd placement. Anywhere else
-// the launch must not happen — a shim that starts unscoped dies with its
-// daemon while its handle claims a survivorship it does not have. goos is
-// injected so tests pin the platform gate on any host; production passes
-// runtime.GOOS.
-func shimScopeAvailable(placement seatbudget.Placement, goos string) bool {
-	return goos == "linux" && placement == seatbudget.PlacementSystemd
-}
-
 // shimScopeGateError is the launch refusal when the scope placement is
 // unavailable. It names the missing backend rather than failing the accept
 // silently: the operator's next move is the install, not the session.
@@ -156,13 +145,8 @@ func shimScopeGateError(placement seatbudget.Placement) error {
 	return fmt.Errorf("session shim: no transient-scope backend on this host (%s): shim launches need systemd %d or newer, nothing launches unscoped", placement, seatbudget.MinScopeSystemd)
 }
 
-// shimScopeGOOS is the platform startShimProcess enforces the transient
-// scope on. A var (not runtime.GOOS inline) so tests pin the Linux-only
-// scope gate on any host; production leaves the default. The scope is a
-// Linux systemd placement — off Linux the shim launches bare, the way it
-// always has.
-var shimScopeGOOS = runtime.GOOS
-
+// launchSessionShim is the spawner's shim launch path (SpawnerOptions.ShimSpawn).
+//
 // It returns (nil, nil) for a session this daemon does not own through a shim,
 // which is the signal the spawner reads as "use the ordinary direct-child
 // spawn". Returning an error fails the accept.
@@ -286,6 +270,13 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 			// provenance, it is the pid+start-time this daemon pinned when it
 			// exec'd the process itself.
 			d.stopAbandonedShimLaunch(id, started, launchProcess, err)
+		}
+		// No discovery record means no lineage any later pass can adopt,
+		// quarantine or tombstone, so nothing else will ever dispose of this
+		// launch's seat record.
+		if removeErr := registry.RemoveSeatLaunch(id, launch.ProcessEpoch); removeErr != nil {
+			slog.Warn("session shim: remove the seat launch record of a launch that never announced itself",
+				"session", id.String(), "error", removeErr)
 		}
 		return nil, fmt.Errorf("session shim: %s: %w", id, err)
 	}
@@ -782,7 +773,6 @@ func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
 ) {
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.sessionShimConfig().callbackTimeout())
 	defer cancel()
-	seatScope, seatCPUs, seatMemoryMB, seatIOWeight := d.shimLaunchSeatFacts(evidence.Identity)
 	d.shims.mu.Lock()
 	d.upsertShimQuarantineLocked(sessionshim.QuarantinedSession{
 		OrgID: evidence.Identity.OrgID, SessionID: evidence.Identity.SessionID,
@@ -791,10 +781,6 @@ func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
 		Reason:               sessionshim.QuarantineAdoptionFailed,
 		Detail:               "adoption batch commit exhausted its retries; already durably adopted server-side, presented quarantined pending a successful batch commit",
 		ConsumesCapacity:     true,
-		SeatScope:            seatScope,
-		SeatCPUs:             seatCPUs,
-		SeatMemoryMB:         seatMemoryMB,
-		SeatIOWeight:         seatIOWeight,
 	})
 	d.shims.mu.Unlock()
 	// sessionShimProjectionBatch now includes the entry recorded above — the
@@ -1207,7 +1193,6 @@ func (d *Daemon) recordAmbiguousLaunchBatchQuarantine(
 	evidence SessionShimAdoptionEvidence,
 	causeErr error,
 ) bool {
-	seatScope, seatCPUs, seatMemoryMB, seatIOWeight := d.shimLaunchSeatFacts(evidence.Identity)
 	d.shims.mu.Lock()
 	d.upsertShimQuarantineLocked(sessionshim.QuarantinedSession{
 		OrgID: evidence.Identity.OrgID, SessionID: evidence.Identity.SessionID,
@@ -1216,10 +1201,6 @@ func (d *Daemon) recordAmbiguousLaunchBatchQuarantine(
 		Reason:               sessionshim.QuarantineAdoptionFailed,
 		Detail:               ambiguousLaunchBatchQuarantineDetail,
 		ConsumesCapacity:     true,
-		SeatScope:            seatScope,
-		SeatCPUs:             seatCPUs,
-		SeatMemoryMB:         seatMemoryMB,
-		SeatIOWeight:         seatIOWeight,
 	})
 	d.shims.mu.Unlock()
 	slog.Warn("session shim: adoption batch commit outcome unknown; recorded the launching lineage quarantined so every later "+
@@ -1302,34 +1283,53 @@ func shimChildLogPath(registryDir string, id sessionshim.Identity) string {
 // §D1 removes: a daemon that still had to reap this process could not be
 // replaced without ending it.
 //
-// The worker always launches inside its own transient systemd scope
-// (systemd-run --scope --collect), budget or not: the scope is what owns the
-// seat's cgroup past a daemon restart. A host that cannot create the scope
-// refuses the launch here — nothing launches unscoped, because an unscoped
-// shim dies with its daemon while its handle claims a survivorship it does
-// not have.
+// On Linux the worker always launches inside its own transient systemd scope
+// (systemd-run --scope --collect), budget or not: the scope is what keeps the
+// seat out of the daemon unit's control-group kill. A host that cannot create
+// the scope refuses the launch here — nothing launches unscoped, because an
+// unscoped shim dies with its daemon while its handle claims a survivorship it
+// does not have.
+//
+// Before the process starts, the launch's seat facts (scope unit, posture,
+// limits) are written as a secret-free launch record beside the discovery
+// record, so a daemon that later adopts the seat can fall back to them when
+// the live scope cannot be read — never to its own current configuration.
+// The record is written synchronously and removed again if the launch fails
+// before the process exists.
 func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, env []string) (sessionshim.ProcessIdentity, error) {
-	shimBudget, shimBudgetOK := d.shimSeatBudget()
-	// The scope name and the seat facts are derived ONCE here and travel both
-	// halves of the launch: the scope unit names the systemd-run wrapper,
-	// and the same values ride the launch contract so the shim republishes
-	// them into its discovery record. A restarted daemon reads the limits
-	// back from the seat's cgroup (falling back to that record) — never
-	// from its own current configuration.
-	scopeName := seatBudgetShimScopeName(launch.Identity.OrgID, spec.SessionID, launch.ProcessEpoch)
-	launch.SeatScope = scopeName
-	if shimBudgetOK {
-		launch.SeatCPUs = shimBudget.CPUs
-		launch.SeatMemoryMB = shimBudget.MemoryMB
-		launch.SeatIOWeight = shimBudget.IOWeight
-	}
-	command, scopeOK := seatBudgetShimCommandForLaunch(d.shimCommand(), launch.Identity.OrgID, spec.SessionID, launch.ProcessEpoch, shimBudget, shimBudgetOK, seatBudgetLaunchPlacement(), seatBudgetLaunchUserScope(), shimScopeGOOS)
-	if !scopeOK {
-		return sessionshim.ProcessIdentity{}, shimScopeGateError(seatBudgetLaunchPlacement())
-	}
-	if len(command) == 0 {
+	worker := d.shimCommand()
+	if len(worker) == 0 {
 		return sessionshim.ProcessIdentity{}, errors.New("session shim: no worker command is configured to launch a shim with")
 	}
+	shimBudget, shimBudgetOK := d.shimSeatBudget()
+	goos := d.shimScope.hostGOOS()
+	placement := d.shimScope.hostPlacement()
+	scope := ""
+	if goos == "linux" {
+		scope = seatBudgetShimScopeName(launch.Identity.OrgID, launch.Identity.SessionID, launch.ProcessEpoch)
+	}
+	command, scopeOK := seatBudgetShimCommandForLaunch(worker, scope, shimBudget, shimBudgetOK, placement, d.shimScope.hostUserScope(), goos)
+	if !scopeOK {
+		return sessionshim.ProcessIdentity{}, shimScopeGateError(placement)
+	}
+	registry, err := sessionshim.NewRegistry(launch.RegistryDir)
+	if err != nil {
+		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: open registry for the seat launch record: %w", err)
+	}
+	seat := shimSeatLaunchRecord(launch.Identity, launch.ProcessEpoch, scope, shimBudget, shimBudgetOK, goos, d.shimNow())
+	if err := registry.PutSeatLaunch(seat); err != nil {
+		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: write the seat launch record for %s: %w", launch.Identity, err)
+	}
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		if err := registry.RemoveSeatLaunch(launch.Identity, launch.ProcessEpoch); err != nil {
+			slog.Warn("session shim: remove the seat launch record of a launch that never started",
+				"session", launch.Identity.String(), "error", err)
+		}
+	}()
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec // G204: operator-configured worker command, same source as the direct-spawn path
 	configureShimProcess(cmd)
 	cmd.Env = append(append([]string(nil), env...), envPairs(launch.Env())...)
@@ -1366,6 +1366,7 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	if err := cmd.Start(); err != nil {
 		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: start %s: %w", spec.SessionID, err)
 	}
+	started = true
 	pid := cmd.Process.Pid
 	// Pin the OS-reported start time now, while the process is definitely
 	// still running (mirrors the acceptance mutator's own harness-pinning
@@ -2171,16 +2172,16 @@ func (d *Daemon) trackLaunchedShim(
 	receipt SessionShimAdoptionReceipt,
 	startConsumer bool,
 ) SessionHandle {
-	// The handle reports the seat's OWN facts — the scope unit and limits
-	// this launch stamped into the contract and the shim republished into
-	// its discovery record — through the live cgroup read-back with record
-	// fallback. The launched facts ride the controller the adoption just
-	// authenticated (its record's scope plus limits), so after the operator
-	// reconfigures the budget the live seat still reports what it runs
-	// under — never what a fresh seat would get.
-	seatScope := ctrl.SeatScope()
-	seatCPUs, seatMemoryMB, seatIOWeight := ctrl.SeatLimits()
-	launchedSeat := seatBudgetLaunchedReport(seatScope, seatCPUs, seatMemoryMB, seatIOWeight)
+	// The handle reports the seat's OWN facts: the limits read back from its
+	// live scope, falling back to the launch record startShimProcess wrote
+	// beside the discovery record. After the operator reconfigures the budget
+	// the live seat still reports what it runs under — never what a fresh
+	// seat would get.
+	seatID, seatEpoch := evidence.Identity, evidence.ProcessEpoch
+	if seatID == (sessionshim.Identity{}) {
+		seatID, seatEpoch = ctrl.Identity(), ctrl.Hello().ProcessEpoch
+	}
+	launchedSeat := d.readShimSeatReport(d.openedShimRegistry(), seatID, seatEpoch)
 	handle := SessionHandle{
 		SessionID:  spec.SessionID,
 		PID:        ctrl.HarnessIdentity().PID,
@@ -3409,7 +3410,6 @@ func (d *Daemon) quarantineLostSessionShim(
 		// this identity must start from a clean streak.
 		delete(d.shims.ambiguityCycles, id)
 		hello := entry.controller.Hello()
-		seatCPUs, seatMemoryMB, seatIOWeight := entry.controller.SeatLimits()
 		q := sessionshim.NewQuarantinedSession(sessionshim.Record{
 			OrgID:             id.OrgID,
 			SessionID:         id.SessionID,
@@ -3418,10 +3418,6 @@ func (d *Daemon) quarantineLostSessionShim(
 			ProtocolMin:       hello.Min,
 			ProtocolMax:       hello.Max,
 			Phase:             hello.Phase,
-			SeatScope:         entry.controller.SeatScope(),
-			SeatCPUs:          seatCPUs,
-			SeatMemoryMB:      seatMemoryMB,
-			SeatIOWeight:      seatIOWeight,
 			CreatedAtUnixNano: now.UnixNano(),
 		}, reason, detail, now)
 		q.ControllerGeneration = uint64(entry.controller.Generation())
@@ -4106,8 +4102,16 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 		return nil
 	}
 	d.reconcileQuarantinedTombstones()
+	registry := d.openedShimRegistry()
+	// The seat reports for adopted-at-startup and quarantined seats are
+	// filled in AFTER the shim-state lock is released: a first read of a
+	// seat execs systemctl, which must never hold that lock.
+	type pendingSeatReport struct {
+		index int
+		key   shimSeatReportKey
+	}
+	var pending []pendingSeatReport
 	d.shims.mu.RLock()
-	defer d.shims.mu.RUnlock()
 	out := make([]SessionHandle, 0, len(d.shims.adopted)+len(d.shims.quarantined))
 	for id, entry := range d.shims.adopted {
 		handle := entry.handle
@@ -4115,35 +4119,49 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 			// Adopted at startup rather than launched here: this daemon has the
 			// identity and the shim's report, not the original spec. The
 			// limits come from the seat's own cgroup read back through its
-			// scope, falling back to the launch record the shim republished
-			// — never this daemon's current configuration, which may have
-			// changed since the launch.
-			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning, SeatBudget: d.seatBudgetAdoptedReport(entry.controller)}
+			// scope, falling back to the launch record written beside the
+			// discovery record — never this daemon's current configuration,
+			// which may have changed since the launch.
+			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning}
+			key := shimSeatReportKey{id: id, epoch: entry.adoption.ProcessEpoch, shimID: entry.shimID}
 			if entry.controller != nil {
+				hello := entry.controller.Hello()
+				if key.epoch == 0 {
+					key.epoch = hello.ProcessEpoch
+				}
 				handle.PID = entry.controller.HarnessIdentity().PID
-				handle.WorktreePath = entry.controller.Hello().WorkareaPath
+				handle.WorktreePath = hello.WorkareaPath
 				handle.WorkareaRoot = entry.controller.WorkareaRoot()
 				if handle.WorkareaRoot == "" {
 					handle.WorkareaRoot = handle.WorktreePath
 				}
-				if started := entry.controller.Hello().ProcessStartedAt; started > 0 {
+				if started := hello.ProcessStartedAt; started > 0 {
 					handle.AcceptedAt = time.Unix(0, started).UTC().Format(time.RFC3339)
 				}
 			}
+			pending = append(pending, pendingSeatReport{index: len(out), key: key})
 		}
 		out = append(out, handle)
 	}
 	for _, q := range d.shims.quarantined {
-		out = append(out, SessionHandle{
-			SessionID: q.SessionID,
-			State:     SessionRunning,
-			// A quarantined lineage has no controller to read back from;
-			// its record still names the scope and the launched limits, so
-			// the handle reports those rather than this daemon's current
-			// configuration.
-			SeatBudget: d.seatBudgetQuarantinedReport(q),
+		// A quarantined lineage has no controller this daemon trusts, but its
+		// scope and launch record are still the seat's own facts, so the
+		// handle reports those rather than this daemon's current
+		// configuration.
+		pending = append(pending, pendingSeatReport{
+			index: len(out),
+			key:   shimSeatReportKey{id: q.Identity(), epoch: q.ProcessEpoch, shimID: q.ShimID},
 		})
+		out = append(out, SessionHandle{SessionID: q.SessionID, State: SessionRunning})
 	}
+	d.shims.mu.RUnlock()
+
+	live := make(map[shimSeatReportKey]struct{}, len(pending))
+	for _, p := range pending {
+		out[p.index].SeatBudget = d.shimSeatReport(registry, p.key)
+		live[p.key] = struct{}{}
+	}
+	d.shimSeatReports.retain(live)
 	return out
 }
 
@@ -4175,6 +4193,18 @@ func (d *Daemon) shimAfter(wait time.Duration) <-chan time.Time {
 		}
 	}
 	return time.After(wait)
+}
+
+// openedShimRegistry returns the discovery registry if this daemon has
+// already opened it, or nil. Unlike sessionShimRegistry it never opens one,
+// so a report path can read launch records without creating state on disk.
+func (d *Daemon) openedShimRegistry() *sessionshim.Registry {
+	if d.shims == nil {
+		return nil
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return d.shims.registry
 }
 
 // sessionShimRegistry opens the registry once and reuses it for the daemon's

@@ -317,6 +317,9 @@ func (r *Registry) RemoveTombstone(id Identity) error {
 
 // RemoveTombstoneIncarnation deletes every legacy/new filename that contains
 // the exact terminal correlation, leaving sibling incarnations untouched.
+//
+// The launch's seat record goes with it: the tombstone is the incarnation's
+// last proof, and once it is disposed no handle reports that seat again.
 func (r *Registry) RemoveTombstoneIncarnation(t Tombstone) error {
 	entries, err := r.tombstoneEntries()
 	if err != nil {
@@ -329,7 +332,10 @@ func (r *Registry) RemoveTombstoneIncarnation(t Tombstone) error {
 			matched = append(matched, entry)
 		}
 	}
-	return r.removeTombstoneFiles(matched)
+	if err := r.removeTombstoneFiles(matched); err != nil {
+		return err
+	}
+	return r.RemoveSeatLaunch(t.Identity(), t.ProcessEpoch)
 }
 
 // Get reads one discovery record by identity.

@@ -38,12 +38,6 @@ var ErrRecordInvalid = errors.New("sessionshim: invalid discovery record")
 // must verify WORKAREA identity as well as process identity: a shim whose
 // harness is running against a different workarea than the session's record says
 // is exactly the ambiguity §D7 quarantines. It is a location, not a credential.
-//
-// Seat carries the secret-free launch facts the daemon reads back after a
-// restart: which transient scope owns the seat's cgroup and which limits the
-// launch asked for. Adopted handles report the limits the seat's cgroup
-// actually carries, falling back to this record — never to the daemon's
-// current configuration, which may have changed since the launch.
 type Record struct {
 	SchemaVersion int `json:"schemaVersion"`
 
@@ -82,21 +76,6 @@ type Record struct {
 	// credential or conversation bytes. It survives quarantine and is copied to
 	// the terminal tombstone so a later operator can resume the same thread.
 	ResumeKey *ResumeKey `json:"resumeKey,omitempty"`
-
-	// SeatScope is the transient scope unit that owns this seat's cgroup
-	// (for example "donmai-seat-<digest>-1.scope"). Written by the
-	// launching daemon; read back by a restarted daemon to find the seat's
-	// cgroup and re-derive the limits it runs under.
-	SeatScope string `json:"seatScope,omitempty"`
-	// SeatCPUs is the whole-core CPU share the launch asked for. Zero means
-	// the scope carries no CPU limit — the seat still owns its cgroup.
-	SeatCPUs int `json:"seatCpus,omitempty"`
-	// SeatMemoryMB is the memory ceiling in mebibytes the launch asked for.
-	// Zero means no memory limit.
-	SeatMemoryMB int `json:"seatMemoryMb,omitempty"`
-	// SeatIOWeight is the cgroup v2 IO weight the launch asked for. Zero
-	// means the backend default.
-	SeatIOWeight int `json:"seatIoWeight,omitempty"`
 
 	CreatedAtUnixNano      int64 `json:"createdAt"`
 	OrphanDeadlineUnixNano int64 `json:"orphanDeadlineAt,omitempty"`
@@ -181,16 +160,6 @@ func (r Record) Validate() error {
 		if err := r.ResumeKey.Validate(); err != nil {
 			return err
 		}
-	}
-	// The seat launch facts are advisory read-back hints, but they must
-	// still be well-formed: a negative limit is never a real launch, and an
-	// unbounded scope string would defeat the record bound through this
-	// field.
-	if r.SeatCPUs < 0 || r.SeatMemoryMB < 0 || r.SeatIOWeight < 0 || r.SeatIOWeight > 10000 {
-		return fmt.Errorf("%w: seat limits are not well-formed", ErrRecordInvalid)
-	}
-	if len(r.SeatScope) > 256 {
-		return fmt.Errorf("%w: seatScope is %d bytes, max 256", ErrRecordInvalid, len(r.SeatScope))
 	}
 	return nil
 }

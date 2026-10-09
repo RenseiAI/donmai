@@ -1095,17 +1095,14 @@ func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string
 // seconds, and a shim reaped before the pass reaches it is tombstoned rather
 // than adopted or quarantined.
 //
-// The fixture stubs the transient-scope gate off Linux's real systemd: every
-// shim launch wraps in a scope (budget or not), so a test that launches a
-// real shim needs the placement stubbed to systemd and the platform to
-// linux — otherwise a Linux host with a live user bus wraps the launch in
-// a REAL systemd-run whose unit name (one process epoch per test binary)
-// collides across parallel suites, and a host without systemd refuses every
-// launch. The stub keeps the launch hermetic on every host; the real scope
-// shape is pinned by the fake-systemd-run tests and the Linux live proof.
+// The fixture's daemon runs under hermeticShimScope: on Linux every shim
+// launch wraps in a scope (budget or not), so without it a systemd host would
+// wrap each launch in a REAL systemd-run whose unit name (one process epoch
+// per test binary) collides across suites, and a host without systemd would
+// refuse every launch. The real scope shape is pinned by the fake-systemd-run
+// tests and the Linux live proof.
 func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *shimSpawnFixture {
 	t.Helper()
-	stubShimScopeGateForTest(t)
 	// A Unix socket path has a short platform limit (as low as 104 bytes), and
 	// t.TempDir() bakes the test name into the path. Keep the registry short.
 	dir, err := os.MkdirTemp("/tmp", "dsp")
@@ -1135,6 +1132,7 @@ func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *sh
 		mutate(&shimCfg)
 	}
 	d := New(Options{SkipRegistration: true, SessionShim: shimCfg})
+	d.shimScope = hermeticShimScope()
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
@@ -1165,23 +1163,20 @@ func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *sh
 	return f
 }
 
-// stubShimScopeGateForTest stubs the transient-scope gate so a test that
-// launches a real shim never touches the host's systemd: the placement
-// reads as systemd and the platform as linux, so startShimProcess renders
-// the scope argv and the bare command runs unwrapped on every host. The
-// stub restores itself through t.Cleanup; tests that pin the gate itself
-// set the vars directly and must not run parallel while stubbed.
-func stubShimScopeGateForTest(t *testing.T) {
-	t.Helper()
-	oldPlacement, oldUserScope := seatBudgetLaunchPlacement, seatBudgetLaunchUserScope
-	oldScopeGOOS := shimScopeGOOS
-	seatBudgetLaunchPlacement = func() seatbudget.Placement { return seatbudget.PlacementSystemd }
-	seatBudgetLaunchUserScope = func() bool { return false }
-	shimScopeGOOS = "darwin"
-	t.Cleanup(func() {
-		seatBudgetLaunchPlacement, seatBudgetLaunchUserScope = oldPlacement, oldUserScope
-		shimScopeGOOS = oldScopeGOOS
-	})
+// hermeticShimScope is the shim scope probe for a test that launches real
+// shims: the platform reads as off Linux, so startShimProcess launches the
+// bare worker and never reaches the host's systemd-run, and the seat
+// read-back never execs systemctl. It is set on the test's own daemon, so
+// suites running in parallel never share it.
+func hermeticShimScope() shimScopeProbe {
+	return shimScopeProbe{
+		goos:      "darwin",
+		placement: func() seatbudget.Placement { return seatbudget.PlacementNone },
+		userScope: func() bool { return false },
+		readLimits: func(string, bool) (seatbudget.SeatLimits, bool) {
+			return seatbudget.SeatLimits{}, false
+		},
+	}
 }
 
 // interactiveSpec is a session spec whose run mode selects shim ownership.
@@ -2610,6 +2605,7 @@ func TestLaunchFailureFailsTheAcceptClosed(t *testing.T) {
 			LaunchTimeout:   750 * time.Millisecond,
 		},
 	})
+	d.shimScope = hermeticShimScope()
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
@@ -2636,6 +2632,16 @@ func TestLaunchFailureFailsTheAcceptClosed(t *testing.T) {
 	}
 	if _, tracked := d.spawner.sessions["sess-fail"]; tracked {
 		t.Error("a failed shim launch left a direct-child entry behind")
+	}
+	// The seat launch record is written before the worker starts; a launch
+	// that never announced itself leaves no lineage that would ever dispose
+	// of it, so the launch path removes it.
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("sessionShimRegistry: %v", err)
+	}
+	if _, found, err := registry.SeatLaunch(sessionshim.Identity{OrgID: "test-org", SessionID: "sess-fail"}, 1); err != nil || found {
+		t.Errorf("seat launch record after a launch that never announced itself = found %v, err %v; want it removed", found, err)
 	}
 }
 

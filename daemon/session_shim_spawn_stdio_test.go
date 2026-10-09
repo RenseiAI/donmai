@@ -36,21 +36,17 @@ import (
 func TestShimChildStdoutStderrLandInThePerSessionLogFile(t *testing.T) {
 	t.Parallel()
 
-	// startShimProcess enforces the Linux scope gate; this test owns no
-	// backend, so it runs the production entry off Linux where the shim
-	// launches bare — the stdio capture under test is identical on both
-	// paths (the scope only prefixes the argv).
-	oldScopeGOOS := shimScopeGOOS
-	shimScopeGOOS = "darwin"
-	t.Cleanup(func() { shimScopeGOOS = oldScopeGOOS })
-
 	dir := t.TempDir()
 	registryDir := dir + "/registry"
 	const sessionID = "sess-stdio-capture"
 	const stdoutLine = "shim-child-stdout-marker"
 	const stderrLine = "shim-child-stderr-marker"
 
-	d := &Daemon{}
+	// startShimProcess enforces the Linux scope gate; this test owns no
+	// backend, so it runs the production entry off Linux where the shim
+	// launches bare — the stdio capture under test is identical on both
+	// paths (the scope only prefixes the argv).
+	d := &Daemon{shimScope: hermeticShimScope()}
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},

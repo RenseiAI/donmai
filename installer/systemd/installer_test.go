@@ -457,26 +457,24 @@ func TestUnitDir_UnknownScope(t *testing.T) {
 	}
 }
 
-// TestGenerateUnitFile_SeatScopesSurviveRestarts pins the shim-survival
-// posture of the generated unit: restarting the daemon unit must not take
-// down shim-owned seats living in their own transient scopes. KillMode=process
-// stops only the daemon itself (never the seat scopes the manager owns), and
-// Delegate=yes lets per-seat subtrees live beneath the unit's cgroup. Dropping
-// either directive reintroduces the restart-kills-seats shape this slice
-// exists to remove.
-func TestGenerateUnitFile_SeatScopesSurviveRestarts(t *testing.T) {
+// TestGenerateUnitFile_KeepsTheControlGroupKill pins the generated unit's
+// stop posture to the corpus: the unit sets no KillMode, so stopping it keeps
+// systemd's default control-group kill and a direct-owned seat in the unit's
+// cgroup ends with its daemon. Shim-owned seats survive a restart because each
+// starts in its own transient scope outside this cgroup, not because the unit
+// stops killing its children; `KillMode=process` on the daemon unit is
+// explicitly not used. Delegate is absent too: the daemon creates no cgroups
+// beneath its unit, so delegating the subtree to it buys nothing.
+func TestGenerateUnitFile_KeepsTheControlGroupKill(t *testing.T) {
 	for _, scope := range []Scope{ScopeUser, ScopeSystem} {
 		out, err := GenerateUnitFile(scope, "/usr/local/bin/af", InstallOptions{})
 		if err != nil {
 			t.Fatalf("GenerateUnitFile(%s): %v", scope, err)
 		}
-		for _, want := range []string{"KillMode=process", "Delegate=yes"} {
-			if !strings.Contains(out, want) {
-				t.Errorf("scope %s unit missing %q (seat scopes die with the daemon without it):\n%s", scope, want, out)
+		for _, banned := range []string{"KillMode=", "Delegate="} {
+			if strings.Contains(out, banned) {
+				t.Errorf("scope %s unit sets %q; the unit keeps the default control-group kill and the seat scope is the survival boundary:\n%s", scope, banned, out)
 			}
-		}
-		if strings.Contains(out, "KillMode=control-group") {
-			t.Errorf("scope %s unit kills the control group: restarting the daemon ends every seat", scope)
 		}
 	}
 }

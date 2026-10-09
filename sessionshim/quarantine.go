@@ -128,15 +128,6 @@ type QuarantinedSession struct {
 	ConsumesCapacity bool `json:"consumesCapacity"`
 
 	Phase shimwire.Phase `json:"phase,omitempty"`
-
-	// SeatScope, SeatCPUs, SeatMemoryMB and SeatIOWeight are the seat's
-	// transient-scope launch facts, carried from the discovery record so a
-	// quarantined handle reports the limits the launch asked for — never
-	// the daemon's current configuration.
-	SeatScope    string `json:"seatScope,omitempty"`
-	SeatCPUs     int    `json:"seatCpus,omitempty"`
-	SeatMemoryMB int    `json:"seatMemoryMb,omitempty"`
-	SeatIOWeight int    `json:"seatIoWeight,omitempty"`
 }
 
 // Identity returns the quarantined session's lifecycle identity.
@@ -163,10 +154,6 @@ func NewQuarantinedSession(rec Record, reason QuarantineReason, detail string, n
 		Detail:               detail,
 		ConsumesCapacity:     true,
 		Phase:                rec.Phase,
-		SeatScope:            rec.SeatScope,
-		SeatCPUs:             rec.SeatCPUs,
-		SeatMemoryMB:         rec.SeatMemoryMB,
-		SeatIOWeight:         rec.SeatIOWeight,
 	}
 	if rec.CreatedAtUnixNano > 0 {
 		if age := now.Sub(rec.CreatedAt()); age > 0 {

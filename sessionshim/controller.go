@@ -251,10 +251,6 @@ func (o ControllerOptions) logger() *slog.Logger {
 type Controller struct {
 	id                 Identity
 	controllerID       string
-	seatScope          string
-	seatCPUs           int
-	seatMemoryMB       int
-	seatIOWeight       int
 	conn               *net.UnixConn
 	w                  *shimwire.Writer
 	r                  *shimwire.Reader
@@ -679,10 +675,6 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 		r:             shimwire.NewReader(conn),
 		resumeFrom:    opts.ResumeFrom,
 		workareaRoot:  rec.WorkareaRoot,
-		seatScope:     rec.SeatScope,
-		seatCPUs:      rec.SeatCPUs,
-		seatMemoryMB:  rec.SeatMemoryMB,
-		seatIOWeight:  rec.SeatIOWeight,
 		events:        make(chan ControllerEvent, publicEventBufferLimit),
 		logger:        opts.logger(),
 		done:          make(chan struct{}),
@@ -968,31 +960,6 @@ func (c *Controller) Hello() shimwire.Hello { return c.hello }
 // WorkareaRoot returns the optional secret-free discovery-record root. Empty
 // means the adopted record predates session-root-v1.
 func (c *Controller) WorkareaRoot() string { return c.workareaRoot }
-
-// SeatScope returns the transient scope unit that owns this seat's cgroup,
-// as the adopted discovery record reported it. Empty means the record
-// predates seat scopes (or the seat runs off Linux, where no scope exists).
-func (c *Controller) SeatScope() string { return c.seatScope }
-
-// SeatLimits returns the limits the launch asked for, as the adopted
-// discovery record reported them. Zero means the scope carries no limit of
-// that kind. These are the record's read-back fallback — the live cgroup
-// read takes precedence wherever it answers.
-func (c *Controller) SeatLimits() (cpus, memoryMB, ioWeight int) {
-	return c.seatCPUs, c.seatMemoryMB, c.seatIOWeight
-}
-
-// SetSeatFactsForTest stamps the seat's transient-scope launch facts onto
-// the controller. Production sets these at adoption from the discovery
-// record (Dial); tests use this to drive the launched-handle report path
-// without a live shim. The values are the record's read-back fallback —
-// the live cgroup read takes precedence wherever it answers.
-func (c *Controller) SetSeatFactsForTest(scope string, cpus, memoryMB, ioWeight int) {
-	c.seatScope = scope
-	c.seatCPUs = cpus
-	c.seatMemoryMB = memoryMB
-	c.seatIOWeight = ioWeight
-}
 
 // Adoption returns the replay disposition the shim committed to.
 func (c *Controller) Adoption() shimwire.Adopted { return c.adopted }

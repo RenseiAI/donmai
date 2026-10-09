@@ -144,38 +144,18 @@ func TestEveryLaunchKeyIsRefusedToTheHarnessChild(t *testing.T) {
 	if sessionshim.IsEnvKey("PATH") {
 		t.Error(`IsEnvKey("PATH") = true`)
 	}
-	// Env() must render exactly the declared key set — no more, no less —
-	// for EVERY launch. The seat facts always render: a plain launch (no
-	// scope, no limits) carries the seat keys with empty/zero values, so a
-	// restarted daemon recovers the record the shim republishes rather than
-	// an absent field it cannot distinguish from an old launcher. Both
-	// shapes must decode back to the launch they came from.
-	plain := sessionshim.Launch{
+	// Env() must render exactly the declared key set — no more, no less.
+	env := sessionshim.Launch{
 		Identity:    sessionshim.Identity{OrgID: "o", SessionID: "s"},
 		RegistryDir: "/tmp/x", Orphan: sessionshim.DefaultOrphanPolicy(),
+	}.Env()
+	if len(env) != len(keys) {
+		t.Fatalf("Env() rendered %d keys, EnvKeys declares %d", len(env), len(keys))
 	}
-	env := plain.Env()
 	for _, key := range keys {
 		if _, ok := env[key]; !ok {
 			t.Errorf("Env() omitted declared key %s", key)
 		}
-	}
-	if back, err := sessionshim.LaunchFromEnv(lookupFrom(env)); err != nil || back != plain {
-		t.Errorf("plain round trip = %+v, %v; want %+v", back, err, plain)
-	}
-	scoped := plain
-	scoped.SeatScope = "donmai-seat-abc-1.scope"
-	scoped.SeatCPUs = 2
-	scoped.SeatMemoryMB = 512
-	scoped.SeatIOWeight = 100
-	scopedEnv := scoped.Env()
-	for _, key := range keys {
-		if _, ok := scopedEnv[key]; !ok {
-			t.Errorf("scoped Env() omitted declared key %s", key)
-		}
-	}
-	if back, err := sessionshim.LaunchFromEnv(lookupFrom(scopedEnv)); err != nil || back != scoped {
-		t.Errorf("scoped round trip = %+v, %v; want %+v", back, err, scoped)
 	}
 }
 
@@ -193,66 +173,5 @@ func TestStartFromEnvRequiresAUsableRegistryDirectory(t *testing.T) {
 	}, ptyhost.Spec{Command: []string{"/bin/sh", "-c", "exit 0"}}, "/tmp")
 	if err == nil {
 		t.Fatal("StartFromEnv accepted an unusable registry directory")
-	}
-}
-
-// TestSeatFactsRoundTripThroughLaunch pins the secret-free launch record:
-// the scope unit and the launched limits travel the launch contract and
-// decode back unchanged. A budgetless launch renders empty/zero seat values
-// and decodes back to them; a wire that predates the seat keys entirely
-// (an old launcher) decodes to no facts. A malformed limit fails closed.
-func TestSeatFactsRoundTripThroughLaunch(t *testing.T) {
-	t.Parallel()
-
-	base := sessionshim.Launch{
-		Identity:     sessionshim.Identity{OrgID: "o", SessionID: "s"},
-		RegistryDir:  "/tmp/shims",
-		Orphan:       sessionshim.DefaultOrphanPolicy(),
-		ProcessEpoch: 3,
-		SeatScope:    "donmai-seat-abc-3.scope",
-		SeatCPUs:     2,
-		SeatMemoryMB: 512,
-		SeatIOWeight: 100,
-	}
-	got, err := sessionshim.LaunchFromEnv(lookupFrom(base.Env()))
-	if err != nil {
-		t.Fatalf("LaunchFromEnv: %v", err)
-	}
-	if got != base {
-		t.Fatalf("round trip = %+v, want %+v", got, base)
-	}
-	// Absent seat keys decode to no facts — an old launcher — without error.
-	// (Env() itself always renders the keys; only a hand-built wire that
-	// predates them takes this path.)
-	plain := sessionshim.Launch{
-		Identity:     sessionshim.Identity{OrgID: "o", SessionID: "s"},
-		RegistryDir:  "/tmp/shims",
-		Orphan:       sessionshim.DefaultOrphanPolicy(),
-		ProcessEpoch: 3,
-	}
-	env := plain.Env()
-	for _, key := range []string{sessionshim.EnvSeatScope, sessionshim.EnvSeatCPUs, sessionshim.EnvSeatMemoryMB, sessionshim.EnvSeatIOWeight} {
-		delete(env, key)
-	}
-	got, err = sessionshim.LaunchFromEnv(lookupFrom(env))
-	if err != nil {
-		t.Fatalf("LaunchFromEnv without seat keys: %v", err)
-	}
-	if got.SeatScope != "" || got.SeatCPUs != 0 || got.SeatMemoryMB != 0 || got.SeatIOWeight != 0 {
-		t.Fatalf("launch without seat keys = %+v; want no seat facts", got)
-	}
-	// Malformed limits fail closed: a limit that silently became zero would
-	// un-confine a seat while its record claimed otherwise.
-	for _, key := range []string{sessionshim.EnvSeatCPUs, sessionshim.EnvSeatMemoryMB, sessionshim.EnvSeatIOWeight} {
-		bad := base.Env()
-		bad[key] = "many"
-		if _, err := sessionshim.LaunchFromEnv(lookupFrom(bad)); err == nil {
-			t.Errorf("LaunchFromEnv accepted %s=many", key)
-		}
-	}
-	bad := base.Env()
-	bad[sessionshim.EnvSeatIOWeight] = "20000"
-	if _, err := sessionshim.LaunchFromEnv(lookupFrom(bad)); err == nil {
-		t.Error("LaunchFromEnv accepted an IO weight above the record bound")
 	}
 }

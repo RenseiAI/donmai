@@ -54,17 +54,6 @@ const (
 	// only controller path that sets it is gated on the acceptance-control
 	// token file. A launch without it is byte-for-byte the released contract.
 	EnvRingBytes = "DONMAI_SESSION_SHIM_RING_BYTES"
-	// EnvSeatScope, EnvSeatCPUs, EnvSeatMemoryMB and EnvSeatIOWeight carry the
-	// seat's transient-scope launch facts: the scope unit that owns this
-	// seat's cgroup and the limits the launch asked for. The shim republishes
-	// them into its discovery record so a restarted daemon reads the limits
-	// back from the seat's cgroup (falling back to this record) rather than
-	// from its own current configuration. All four are non-secret; zero
-	// values mean the scope carries no limit of that kind.
-	EnvSeatScope    = "DONMAI_SESSION_SHIM_SEAT_SCOPE"
-	EnvSeatCPUs     = "DONMAI_SESSION_SHIM_SEAT_CPUS"
-	EnvSeatMemoryMB = "DONMAI_SESSION_SHIM_SEAT_MEMORY_MB"
-	EnvSeatIOWeight = "DONMAI_SESSION_SHIM_SEAT_IO_WEIGHT"
 	// EnvCodexResumeRegistry deliberately reaches the Codex harness. It grants
 	// only publication of its non-secret resume key into this shim's registry;
 	// it is not part of the supervisor launch contract.
@@ -87,14 +76,6 @@ type Launch struct {
 	// payload bytes. Zero means the worker's own spec decides, which is the
 	// released behaviour.
 	RingBytes int
-	// SeatScope is the transient scope unit that owns this seat's cgroup.
-	// Empty off Linux, where no scope exists.
-	SeatScope string
-	// SeatCPUs, SeatMemoryMB and SeatIOWeight are the limits the launch
-	// asked for. Zero means the scope carries no limit of that kind.
-	SeatCPUs     int
-	SeatMemoryMB int
-	SeatIOWeight int
 }
 
 // Env renders the launch as the environment overlay a controller adds to the
@@ -104,15 +85,6 @@ type Launch struct {
 // key set cannot drift between the two halves of the contract — a mismatch there
 // would surface as a worker that silently stays on the direct-ownership path
 // while the controller waits for a discovery record that never arrives.
-//
-// The seat facts ALWAYS render: a budgetless seat carries no limits, but its
-// scope unit still travels the contract (the shim republishes it into its
-// discovery record so a restarted daemon reads the limits back from the
-// seat's cgroup rather than from its own current configuration). Limits of
-// zero render as "0" — "no limit", distinguishable from "field absent"
-// only by presence — so Env() renders exactly the EnvKeys() set for every
-// launch, and a key added to EnvKeys without a render here fails
-// TestLaunchEnvironmentCarriesTheContractAndNoSecrets.
 func (l Launch) Env() map[string]string {
 	env := map[string]string{
 		EnvOwnership:           "1",
@@ -128,20 +100,6 @@ func (l Launch) Env() map[string]string {
 	if l.RingBytes > 0 {
 		env[EnvRingBytes] = strconv.Itoa(l.RingBytes)
 	}
-	// The seat facts ride the same contract: the shim republishes them into
-	// its discovery record so a restarted daemon reads the limits back from
-	// the seat's cgroup (falling back to the record) rather than from its
-	// own current configuration. Non-secret; well-formed values only — a
-	// negative limit is never a real launch. The scope renders under its key
-	// even when empty (off Linux there is no scope): Env() renders exactly
-	// the EnvKeys() set for every launch, so a dropped seat key fails the
-	// contract test rather than silently stranding a restarted daemon on an
-	// empty record. Zero limits ride as "0" so the shim can distinguish
-	// "no limit" from "field absent".
-	env[EnvSeatScope] = l.SeatScope
-	env[EnvSeatCPUs] = strconv.Itoa(l.SeatCPUs)
-	env[EnvSeatMemoryMB] = strconv.Itoa(l.SeatMemoryMB)
-	env[EnvSeatIOWeight] = strconv.Itoa(l.SeatIOWeight)
 	env[EnvCodexResumeRegistry] = l.RegistryDir
 	env[EnvCodexResumeOrg] = l.Identity.OrgID
 	env[EnvCodexResumeSession] = l.Identity.SessionID
@@ -162,7 +120,6 @@ func EnvKeys() []string {
 		EnvOwnership, EnvOrgID, EnvSessionID, EnvRegistryDir, EnvProcessEpoch,
 		EnvOrphanDeadlineMS, EnvTerminationGraceMS, EnvPropagationMarginMS,
 		EnvExternalReleaseMS,
-		EnvSeatScope, EnvSeatCPUs, EnvSeatMemoryMB, EnvSeatIOWeight,
 		EnvCodexResumeRegistry, EnvCodexResumeOrg, EnvCodexResumeSession,
 	}
 }
@@ -254,45 +211,6 @@ func LaunchFromEnv(lookup func(string) string) (Launch, error) {
 	if err := l.Orphan.Validate(); err != nil {
 		return Launch{}, err
 	}
-	// The seat facts are OPTIONAL on the wire: absent means the launcher
-	// predates them — the shim then publishes a record with no seat facts,
-	// and the daemon falls back the same way it does for any old record.
-	// Env() always renders all four keys (empty scope and zero limits ride
-	// as "" and "0"), so presence alone never proves a scope exists;
-	// only a non-empty scope names one. Present and malformed is an error:
-	// a limit that silently became zero would un-confine a seat while its
-	// record claimed otherwise. The scope string is length-bounded to match
-	// the record's own bound; over-long is refused the same way.
-	if raw := lookup(EnvSeatScope); raw != "" {
-		if len(raw) > 256 {
-			return Launch{}, fmt.Errorf("sessionshim: %s is %d bytes, max 256", EnvSeatScope, len(raw))
-		}
-		l.SeatScope = raw
-	}
-	for _, key := range []struct {
-		name string
-		dst  *int
-	}{
-		{EnvSeatCPUs, &l.SeatCPUs},
-		{EnvSeatMemoryMB, &l.SeatMemoryMB},
-		{EnvSeatIOWeight, &l.SeatIOWeight},
-	} {
-		raw := lookup(key.name)
-		if raw == "" {
-			continue
-		}
-		n, err := parseUint(raw, key.name)
-		if err != nil {
-			return Launch{}, err
-		}
-		if n > 1<<30 {
-			return Launch{}, fmt.Errorf("sessionshim: %s is %d, want at most %d", key.name, n, 1<<30)
-		}
-		*key.dst = int(n) //nolint:gosec // G115: bounded above by 1<<30
-	}
-	if l.SeatIOWeight > 10000 {
-		return Launch{}, fmt.Errorf("sessionshim: %s is %d, want at most 10000", EnvSeatIOWeight, l.SeatIOWeight)
-	}
 	return l, nil
 }
 
@@ -339,10 +257,6 @@ func StartFromEnvWithRoot(l Launch, spec ptyhost.Spec, workareaPath, workareaRoo
 		WorkareaRoot: workareaRoot,
 		Orphan:       l.Orphan,
 		ProcessEpoch: l.ProcessEpoch,
-		SeatScope:    l.SeatScope,
-		SeatCPUs:     l.SeatCPUs,
-		SeatMemoryMB: l.SeatMemoryMB,
-		SeatIOWeight: l.SeatIOWeight,
 		// Options.logger() defaults to io.Discard when Logger is nil — every
 		// "sessionshim: ..." adoption/orphan/finalize diagnostic this Shim
 		// emits (Close, watchHarness, the terminal-observation path, …) was

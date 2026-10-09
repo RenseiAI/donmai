@@ -51,17 +51,6 @@ type Options struct {
 	// ProcessEpoch is the monotonic per-session value for this shim incarnation.
 	ProcessEpoch uint64
 
-	// SeatScope, SeatCPUs, SeatMemoryMB and SeatIOWeight are the seat's
-	// transient-scope launch facts, decoded from the launch contract. The
-	// shim republishes them into every discovery record it writes so a
-	// restarted daemon reads the limits back from the seat's cgroup
-	// (falling back to the record) rather than from its own current
-	// configuration. Empty scope means no scope (off Linux).
-	SeatScope    string
-	SeatCPUs     int
-	SeatMemoryMB int
-	SeatIOWeight int
-
 	// ProtocolMin/ProtocolMax optionally narrow this shim's supported range.
 	// Zero/zero uses the build range; immutable overlap fixtures use max 2.
 	ProtocolMin uint32
@@ -121,10 +110,6 @@ type Shim struct {
 	harness      ProcessIdentity
 	workarea     string
 	workareaRoot string
-	seatScope    string
-	seatCPUs     int
-	seatMemoryMB int
-	seatIOWeight int
 	protocolMin  uint32
 	protocolMax  uint32
 
@@ -505,10 +490,6 @@ func Start(opts Options) (*Shim, error) {
 		harness:                  ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
 		workarea:                 opts.WorkareaPath,
 		workareaRoot:             opts.WorkareaRoot,
-		seatScope:                opts.SeatScope,
-		seatCPUs:                 opts.SeatCPUs,
-		seatMemoryMB:             opts.SeatMemoryMB,
-		seatIOWeight:             opts.SeatIOWeight,
 		protocolMin:              protocolMin,
 		protocolMax:              protocolMax,
 		socketPath:               socketPath,
@@ -1018,10 +999,6 @@ func (s *Shim) publishRecordWithDeadlineLocked(deadline time.Time) error {
 		WorkareaPath:      s.workarea,
 		WorkareaRoot:      s.workareaRoot,
 		ResumeKey:         s.resumeKey,
-		SeatScope:         s.seatScope,
-		SeatCPUs:          s.seatCPUs,
-		SeatMemoryMB:      s.seatMemoryMB,
-		SeatIOWeight:      s.seatIOWeight,
 		CreatedAtUnixNano: s.now().UnixNano(),
 	}
 	if !deadline.IsZero() {

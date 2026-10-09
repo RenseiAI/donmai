@@ -2649,7 +2649,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			// other seat on the host.
 			d.cancelStagedSessionShimSnapshot(id)
 			hello := c.Hello()
-			seatCPUs, seatMemoryMB, seatIOWeight := c.SeatLimits()
 			adoptionFailures[id] = sessionshim.QuarantinedSession{
 				OrgID: id.OrgID, SessionID: id.SessionID,
 				ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
@@ -2658,10 +2657,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 				Reason:           sessionshim.QuarantineAdoptionFailed,
 				Detail:           callbackErr.Error(),
 				ConsumesCapacity: true,
-				SeatScope:        c.SeatScope(),
-				SeatCPUs:         seatCPUs,
-				SeatMemoryMB:     seatMemoryMB,
-				SeatIOWeight:     seatIOWeight,
 			}
 			continue
 		}
@@ -2831,7 +2826,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 						})
 					} else {
 						hello := entry.controller.Hello()
-						seatCPUs, seatMemoryMB, seatIOWeight := entry.controller.SeatLimits()
 						batch.Quarantined = append(batch.Quarantined, sessionshim.QuarantinedSession{
 							OrgID: entry.adoption.Identity.OrgID, SessionID: entry.adoption.Identity.SessionID,
 							ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
@@ -2839,10 +2833,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 							ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
 							Reason:           sessionShimCarrierQuarantineReason(entry.adoption.CarrierIncompatibility),
 							ConsumesCapacity: true,
-							SeatScope:        entry.controller.SeatScope(),
-							SeatCPUs:         seatCPUs,
-							SeatMemoryMB:     seatMemoryMB,
-							SeatIOWeight:     seatIOWeight,
 						})
 					}
 				}
@@ -3785,17 +3775,12 @@ func (d *Daemon) sessionShimProjectionBatch(orgID, hostID string) SessionShimAdo
 			continue
 		}
 		hello := entry.controller.Hello()
-		seatCPUs, seatMemoryMB, seatIOWeight := entry.controller.SeatLimits()
 		batch.Quarantined = append(batch.Quarantined, sessionshim.QuarantinedSession{
 			OrgID: entry.adoption.Identity.OrgID, SessionID: entry.adoption.Identity.SessionID,
 			ShimID: entry.shimID, ProcessEpoch: hello.ProcessEpoch,
 			ControllerGeneration: entry.adoption.ControllerGeneration,
 			ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
 			Reason: sessionShimCarrierQuarantineReason(entry.adoption.CarrierIncompatibility), ConsumesCapacity: true,
-			SeatScope:    entry.controller.SeatScope(),
-			SeatCPUs:     seatCPUs,
-			SeatMemoryMB: seatMemoryMB,
-			SeatIOWeight: seatIOWeight,
 		})
 	}
 	for _, quarantined := range d.shims.quarantined {

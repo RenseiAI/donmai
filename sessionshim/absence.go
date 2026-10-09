@@ -158,7 +158,8 @@ func (r *Registry) ScanWithdrawnAbsences() ([]Record, error) {
 // DisposeWithdrawnAbsence removes one incarnation's sidecar. Like every other
 // registry removal it is idempotent, and like the tombstone's disposal it is
 // called ONLY after the composer has durably accepted the evidence the file
-// backs — it is the last artifact that can re-derive the proof.
+// backs — it is the last artifact that can re-derive the proof. The launch's
+// seat record goes with it, as it does with a disposed tombstone.
 func (r *Registry) DisposeWithdrawnAbsence(id Identity, shimID string, processEpoch uint64) error {
 	root, err := r.openRoot()
 	if err != nil {
@@ -167,6 +168,9 @@ func (r *Registry) DisposeWithdrawnAbsence(id Identity, shimID string, processEp
 	defer func() { _ = root.Close() }()
 	if err := root.Remove(absenceName(id, shimID, processEpoch)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("sessionshim: remove absence sidecar: %w", err)
+	}
+	if err := root.Remove(seatLaunchName(id, processEpoch)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("sessionshim: remove seat launch: %w", err)
 	}
 	return nil
 }

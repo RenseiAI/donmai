@@ -1,7 +1,6 @@
 package seatbudget
 
 import (
-	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -548,77 +547,5 @@ func TestSocketAliveDialsStream(t *testing.T) {
 	}
 	if socketAlive(filepath.Join(dir, "missing")) {
 		t.Error("socketAlive(missing socket) = true; want false")
-	}
-}
-
-// TestReadSeatLimitsParsesSystemctlShow pins the adopted-handle read-back:
-// the live scope's CPUQuotaPerSecUSec/MemoryMax/IOWeight parse into seat
-// limits; infinity means no limit; an unreachable scope reads as not-ok so
-// the caller falls back to the launch record.
-func TestReadSeatLimitsParsesSystemctlShow(t *testing.T) {
-	run := func(_ string, userScope bool) ([]byte, error) {
-		if !userScope {
-			t.Errorf("run got userScope=false; the launch used --user so the read must too")
-		}
-		return []byte("CPUQuotaPerSecUSec=200000\nMemoryMax=268435456\nIOWeight=200\n"), nil
-	}
-	got, ok := readSeatLimitsWithRunner("donmai-seat-abc-1.scope", true, run, "linux")
-	if !ok {
-		t.Fatal("readSeatLimitsWithRunner refused a live scope")
-	}
-	if got.CPUs != 2 || got.MemoryMB != 256 || got.IOWeight != 200 {
-		t.Errorf("limits = %+v; want 2 CPUs, 256MiB, weight 200", got)
-	}
-	// Uncapped controllers read as no limit, not as zero CPUs.
-	got, ok = readSeatLimitsWithRunner("donmai-seat-x-1.scope", true, func(string, bool) ([]byte, error) {
-		return []byte("CPUQuotaPerSecUSec=infinity\nMemoryMax=infinity\nIOWeight=100\n"), nil
-	}, "linux")
-	if !ok || got.CPUs != 0 || got.MemoryMB != 0 {
-		t.Errorf("uncapped scope = %+v, %v; want no CPU/memory limit", got, ok)
-	}
-	// An unreachable scope (reaped, bus refused) reads as not-ok: the
-	// caller falls back to the launch record rather than inventing numbers.
-	if _, ok := readSeatLimitsWithRunner("donmai-seat-x-1.scope", true, func(string, bool) ([]byte, error) {
-		return nil, errors.New("bus refused")
-	}, "linux"); ok {
-		t.Error("unreachable scope reads ok=true; want the record fallback")
-	}
-	if _, ok := readSeatLimitsWithRunner("bad scope/unit", true, run, "linux"); ok {
-		t.Error("unsafe scope name reads ok=true; want refusal")
-	}
-	// The goos gate is the production entry's platform branch (ReadSeatLimits
-	// passes runtime.GOOS): off Linux the scope shape does not exist, so the
-	// read refuses and the caller falls back to the launch record. Deleting
-	// the gate keeps this suite green on Linux but would let a future
-	// systemctl-shaped read on darwin report numbers it never observed.
-	if _, ok := readSeatLimitsWithRunner("donmai-seat-x-1.scope", true, func(string, bool) ([]byte, error) {
-		return []byte("CPUQuotaPerSecUSec=200000\nMemoryMax=268435456\nIOWeight=200\n"), nil
-	}, "darwin"); ok {
-		t.Error("off-Linux read reports ok=true; want the record fallback")
-	}
-}
-
-// TestReportSeatLimitsFallsBackToRecord pins the adopted-handle rule: live
-// cgroup numbers win; an unreadable scope falls back to the launch record;
-// neither source carrying limits reports none with the scope named — never
-// the daemon's current configuration.
-func TestReportSeatLimitsFallsBackToRecord(t *testing.T) {
-	live := ReportSeatLimits("donmai-seat-a-1.scope", SeatLimits{CPUs: 2, MemoryMB: 256}, true, 8, 8192, 0)
-	if live.Mode != ModeEnforced || live.CPUs != 2 || live.MemoryMB != 256 {
-		t.Errorf("live report = %+v; want the live cgroup numbers, not the record's 8/8192", live)
-	}
-	fallback := ReportSeatLimits("donmai-seat-a-1.scope", SeatLimits{}, false, 2, 512, 0)
-	if fallback.Mode != ModeEnforced || fallback.CPUs != 2 || fallback.MemoryMB != 512 {
-		t.Errorf("fallback report = %+v; want the launch record's 2/512", fallback)
-	}
-	if !strings.Contains(fallback.Detail, "donmai-seat-a-1.scope") {
-		t.Errorf("fallback detail = %q; want the owning scope named", fallback.Detail)
-	}
-	empty := ReportSeatLimits("donmai-seat-a-1.scope", SeatLimits{}, false, 0, 0, 0)
-	if empty.Mode != ModeNone {
-		t.Errorf("budgetless report mode = %q; want none (the scope owns the cgroup but caps nothing)", empty.Mode)
-	}
-	if !strings.Contains(empty.Detail, "donmai-seat-a-1.scope") {
-		t.Errorf("budgetless detail = %q; want the scope named", empty.Detail)
 	}
 }

@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"log/slog"
 	"runtime"
+	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -94,9 +97,9 @@ func applySeatBudgetToEnv(env []string, b seatbudget.Budget, ok bool) []string {
 //
 // NOTE: this is the DIRECT-child lane only. Shim launches never come here:
 // they wrap through seatBudgetShimCommandForLaunch, which scopes EVERY shim
-// launch (budget or not) in a digest-named unit and refuses to launch
-// without a backend. The direct lane keeps its truncation-named, budget-only
-// wrap so a non-shim seat spawns exactly as before.
+// launch (budget or not) in a unit named for the launch incarnation and
+// refuses to launch without a backend. The direct lane keeps its budget-only
+// wrap, named by ScopeName from the session id alone.
 func applySeatBudgetToCmd(command []string, sessionID string, b seatbudget.Budget, ok bool, placement seatbudget.Placement) []string {
 	return applySeatBudgetToCmdForBus(command, sessionID, b, ok, placement, false)
 }
@@ -196,8 +199,8 @@ func sessionSeatBudgetReportForGOOS(b seatbudget.Budget, ok bool, placement seat
 // shimSeatBudget resolves the spawner's budget for the shim launch path:
 // the same effective budget the direct path wraps at spawn. ok=false means
 // budgeting is off — the shim still launches inside its own scope (see
-// seatBudgetShimCommand), just without limit properties. d may be nil in
-// tests that construct a spawner without a daemon.
+// seatBudgetShimCommandForLaunch), just without limit properties. d may be
+// nil in tests that construct a spawner without a daemon.
 func (d *Daemon) shimSeatBudget() (seatbudget.Budget, bool) {
 	if d == nil || d.spawner == nil {
 		return seatbudget.Budget{}, false
@@ -215,25 +218,188 @@ func seatBudgetShimScopeName(orgID, sessionID string, processEpoch uint64) strin
 	return seatbudget.ScopeNameForIncarnation(orgID, sessionID, processEpoch)
 }
 
-// seatBudgetShimCommandForLaunch is seatBudgetShimCommand keyed by the full
-// launch identity (organisation, session, process epoch) and GOOS so tests
-// pin the digest naming and the platform gate on any host. Production passes
-// runtime.GOOS.
-func seatBudgetShimCommandForLaunch(command []string, orgID, sessionID string, processEpoch uint64, b seatbudget.Budget, ok bool, placement seatbudget.Placement, userScope bool, goos string) ([]string, bool) {
-	if len(command) == 0 {
-		return command, false
-	}
+// seatBudgetShimCommandForLaunch wraps the worker command for one shim launch
+// in its own transient scope named scope. On Linux every shim launch wraps,
+// budget or not: the scope is what keeps the seat out of the daemon unit's
+// control-group kill. The scope carries the budget's limits only when the
+// budget asks for hard enforcement — the same rule the direct lane applies
+// (wantsEnforcementForGOOS) — so a best-effort budget runs on its cooperative
+// worker caps inside a limit-free scope, exactly as its report says. ok=false
+// refuses the launch: Linux without the systemd placement, where an unscoped
+// shim would die with its daemon. Off Linux no scope exists and the bare
+// command runs. goos is injected so tests pin the platform gate on any host.
+func seatBudgetShimCommandForLaunch(command []string, scope string, b seatbudget.Budget, ok bool, placement seatbudget.Placement, userScope bool, goos string) ([]string, bool) {
 	if goos != "linux" {
 		return command, true
 	}
 	if placement != seatbudget.PlacementSystemd {
 		return nil, false
 	}
-	if !ok {
-		b = seatbudget.Budget{}
+	limits := seatbudget.Budget{}
+	if ok && wantsEnforcementForGOOS(b, goos) {
+		limits = b
 	}
-	prefix := seatbudget.SystemdScopeArgsForBus(seatBudgetShimScopeName(orgID, sessionID, processEpoch), b, userScope)
+	prefix := seatbudget.SystemdScopeArgsForBus(scope, limits, userScope)
 	return append(prefix, command...), true
+}
+
+// shimSeatLaunchRecord states what one shim launch gives its seat: the scope
+// unit (Linux only; empty where no scope exists), and the posture and limits
+// the direct lane would report for the same budget on the same placement —
+// enforced only where the scope carries the limits, best-effort for the
+// cooperative caps, none when budgeting is off. The launching daemon writes it
+// beside the discovery record before the shim starts, so an adopting daemon
+// can fall back to it when the live scope cannot be read.
+func shimSeatLaunchRecord(id sessionshim.Identity, processEpoch uint64, scope string, b seatbudget.Budget, ok bool, goos string, now time.Time) sessionshim.SeatLaunch {
+	placement := seatbudget.PlacementNone
+	if scope != "" {
+		placement = seatbudget.PlacementSystemd
+	}
+	rep := sessionSeatBudgetReportForGOOS(b, ok, placement, goos)
+	ioWeight := 0
+	if rep.Mode == string(seatbudget.ModeEnforced) && b.IOWeight > 0 {
+		ioWeight = b.IOWeight
+	}
+	return sessionshim.NewSeatLaunch(id, processEpoch, scope, rep.Mode, rep.CPUs, rep.MemoryMB, ioWeight, now)
+}
+
+// shimScopeProbe is the host facts the shim launch gate and the seat
+// read-back consult. The zero value is production: runtime.GOOS, the live
+// placement and bus probes, and the systemctl read-back. A test sets the
+// fields it needs on its own daemon, so suites that run in parallel never
+// share a stub.
+type shimScopeProbe struct {
+	goos       string
+	placement  func() seatbudget.Placement
+	userScope  func() bool
+	readLimits func(scope string, userScope bool) (seatbudget.SeatLimits, bool)
+}
+
+func (p shimScopeProbe) hostGOOS() string {
+	if p.goos != "" {
+		return p.goos
+	}
+	return runtime.GOOS
+}
+
+func (p shimScopeProbe) hostPlacement() seatbudget.Placement {
+	if p.placement != nil {
+		return p.placement()
+	}
+	return seatBudgetLaunchPlacement()
+}
+
+func (p shimScopeProbe) hostUserScope() bool {
+	if p.userScope != nil {
+		return p.userScope()
+	}
+	return seatBudgetLaunchUserScope()
+}
+
+func (p shimScopeProbe) readSeatLimits(scope string, userScope bool) (seatbudget.SeatLimits, bool) {
+	if p.readLimits != nil {
+		return p.readLimits(scope, userScope)
+	}
+	return seatbudget.ReadSeatLimits(scope, userScope)
+}
+
+// shimSeatReportKey names one launch incarnation: the lifecycle identity, the
+// process epoch, and the shim id (random per shim process, so a relaunch at
+// the same epoch never reads its predecessor's cached report).
+type shimSeatReportKey struct {
+	id     sessionshim.Identity
+	epoch  uint64
+	shimID string
+}
+
+// shimSeatReportCache holds one report per launch incarnation. Adoption never
+// changes a running seat's limits, so a seat is read back once rather than
+// on every status poll — the read execs systemctl, which must not run per
+// poll, and never under the shim-state lock. The zero value is ready to use.
+type shimSeatReportCache struct {
+	mu      sync.Mutex
+	reports map[shimSeatReportKey]SessionSeatBudget
+}
+
+func (c *shimSeatReportCache) get(key shimSeatReportKey) (SessionSeatBudget, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rep, ok := c.reports[key]
+	return rep, ok
+}
+
+func (c *shimSeatReportCache) put(key shimSeatReportKey, rep SessionSeatBudget) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reports == nil {
+		c.reports = make(map[shimSeatReportKey]SessionSeatBudget)
+	}
+	c.reports[key] = rep
+}
+
+// retain drops every cached report whose incarnation is no longer adopted or
+// quarantined, so the cache never outgrows the live set.
+func (c *shimSeatReportCache) retain(live map[shimSeatReportKey]struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key := range c.reports {
+		if _, ok := live[key]; !ok {
+			delete(c.reports, key)
+		}
+	}
+}
+
+// shimSeatReport is the handle evidence for one adopted or quarantined
+// shim-owned seat, read once per launch incarnation and cached (see
+// shimSeatReportCache).
+func (d *Daemon) shimSeatReport(registry *sessionshim.Registry, key shimSeatReportKey) *SessionSeatBudget {
+	if rep, ok := d.shimSeatReports.get(key); ok {
+		return &rep
+	}
+	rep := d.readShimSeatReport(registry, key.id, key.epoch)
+	d.shimSeatReports.put(key, *rep)
+	return rep
+}
+
+// readShimSeatReport builds one shim-owned seat's handle evidence: the limits
+// read back from its live scope, falling back to the launch record the
+// launching daemon wrote beside the discovery record, and never this daemon's
+// current configuration, which may have changed since the launch. Without a
+// launch record (a seat launched before records existed, or a registry that
+// cannot be read) the scope name is still derived from the launch identity,
+// so a seat this release launched reads back even if its record was lost.
+func (d *Daemon) readShimSeatReport(registry *sessionshim.Registry, id sessionshim.Identity, epoch uint64) *SessionSeatBudget {
+	var seat seatbudget.LaunchedSeat
+	if registry != nil {
+		rec, found, err := registry.SeatLaunch(id, epoch)
+		if err != nil {
+			slog.Warn("session shim: seat launch record unreadable; reporting from the live scope only",
+				"session", id.String(), "error", err)
+		}
+		if found {
+			seat = seatbudget.LaunchedSeat{
+				Scope:    rec.Scope,
+				Mode:     seatbudget.Mode(rec.Mode),
+				CPUs:     rec.CPUs,
+				MemoryMB: rec.MemoryMB,
+				IOWeight: rec.IOWeight,
+			}
+		}
+	}
+	scope := seat.Scope
+	if scope == "" && seat.Mode == "" && id.Validate() == nil {
+		scope = seatBudgetShimScopeName(id.OrgID, id.SessionID, epoch)
+	}
+	var live seatbudget.SeatLimits
+	liveOK := false
+	if scope != "" {
+		live, liveOK = d.shimScope.readSeatLimits(scope, d.shimScope.hostUserScope())
+	}
+	if liveOK {
+		seat.Scope = scope
+	}
+	rep := seatbudget.ReportSeatLimits(seat, live, liveOK)
+	return &SessionSeatBudget{Mode: string(rep.Mode), CPUs: rep.CPUs, MemoryMB: rep.MemoryMB, Detail: rep.Detail}
 }
 
 // wrapSeatCommandForTest is the production entry point's seam: tests drive
@@ -241,86 +407,10 @@ func seatBudgetShimCommandForLaunch(command []string, orgID, sessionID string, p
 // WorkerCommand capture, not this helper directly.
 //
 // seatBudgetLaunchPlacement and seatBudgetLaunchUserScope resolve the Linux
-// enforcement placement for a fresh spawn. The direct spawn and the shim
-// launch read these instead of probing inline so tests pin the systemd
-// spelling on any host; they default to the live probes and a test that
-// overrides them must restore the defaults (no parallel use while stubbed).
+// enforcement placement for a fresh direct spawn, and are the production
+// default behind shimScopeProbe for a shim launch. They default to the live
+// probes; a test that overrides them must restore the defaults (no parallel
+// use while stubbed) — a shim test sets its daemon's shimScope instead.
 var seatBudgetLaunchPlacement = seatbudget.HostPlacement
 
 var seatBudgetLaunchUserScope = seatbudget.UserScopeForBus
-
-// seatBudgetLaunchedReport builds the handle evidence for a shim this daemon
-// just launched: the seat's OWN facts (the scope unit and limits the launch
-// stamped into the contract, carried here explicitly rather than re-read
-// from this daemon's current configuration), reported through the live
-// cgroup read-back with record fallback. scope carries the stamped scope
-// unit; cpus/memoryMB/ioWeight the stamped limits. After the operator
-// reconfigures the budget, the live seat still reports what it runs under —
-// never what a fresh seat would get.
-func seatBudgetLaunchedReport(scope string, cpus, memoryMB, ioWeight int) *SessionSeatBudget {
-	live, liveOK := seatbudget.ReadSeatLimits(scope, seatBudgetLaunchUserScope())
-	rep := seatbudget.ReportSeatLimits(scope, live, liveOK && scope != "", cpus, memoryMB, ioWeight)
-	return &SessionSeatBudget{Mode: string(rep.Mode), CPUs: rep.CPUs, MemoryMB: rep.MemoryMB, Detail: rep.Detail}
-}
-
-// seatBudgetAdoptedReport builds the handle evidence for a shim this daemon
-// adopted (at startup or after a restart): the limits read back from the
-// seat's own cgroup through its scope, falling back to the launch record the
-// shim republished into its discovery record. It never consults this
-// daemon's current configuration: the operator may have reconfigured the
-// host since the launch, and the handle must say what the seat runs under,
-// not what a fresh seat would get. A nil controller (or a record with no
-// seat facts at all) reports mode none with the reason named.
-func (d *Daemon) seatBudgetAdoptedReport(ctrl *sessionshim.Controller) *SessionSeatBudget {
-	if ctrl == nil {
-		return &SessionSeatBudget{Mode: string(seatbudget.ModeNone), Detail: "seat scope unknown: adopted without a live controller"}
-	}
-	scope := ctrl.SeatScope()
-	recordCPUs, recordMemoryMB, recordIOWeight := ctrl.SeatLimits()
-	live, liveOK := seatbudget.ReadSeatLimits(scope, seatBudgetLaunchUserScope())
-	rep := seatbudget.ReportSeatLimits(scope, live, liveOK && scope != "", recordCPUs, recordMemoryMB, recordIOWeight)
-	return &SessionSeatBudget{Mode: string(rep.Mode), CPUs: rep.CPUs, MemoryMB: rep.MemoryMB, Detail: rep.Detail}
-}
-
-// seatBudgetQuarantinedReport builds the handle evidence for a quarantined
-// lineage: no controller exists to read back from, but the discovery record
-// still names the scope and the launched limits. Those stand in directly —
-// never this daemon's current configuration.
-func (d *Daemon) seatBudgetQuarantinedReport(q sessionshim.QuarantinedSession) *SessionSeatBudget {
-	if d == nil {
-		return &SessionSeatBudget{Mode: string(seatbudget.ModeNone)}
-	}
-	// The registry cannot be opened here: sessionShimHandles already holds
-	// the adopted-set read lock, and sessionShimRegistry takes the write
-	// lock. A quarantined lineage therefore reports its own launched
-	// limits, which the quarantine record already carries from adoption —
-	// never this daemon's current configuration.
-	_ = d
-	// The entry carries the launch's own seat facts (scope + limits), read
-	// from the discovery record at quarantine time — never this daemon's
-	// current configuration. A live cgroup read still takes precedence
-	// where it answers; otherwise the record's numbers stand in.
-	live, liveOK := seatbudget.ReadSeatLimits(q.SeatScope, seatBudgetLaunchUserScope())
-	rep := seatbudget.ReportSeatLimits(q.SeatScope, live, liveOK && q.SeatScope != "", q.SeatCPUs, q.SeatMemoryMB, q.SeatIOWeight)
-	return &SessionSeatBudget{Mode: string(rep.Mode), CPUs: rep.CPUs, MemoryMB: rep.MemoryMB, Detail: rep.Detail}
-}
-
-// shimLaunchSeatFacts reads the seat launch facts back from the discovery
-// record: the scope unit and the limits the launch asked for. It is the
-// secret-free launch record the slice requires — no bearer, no credential,
-// only the scope name and the numbers. ok=false means no record exists
-// (or it carries no facts), and the caller reports accordingly.
-func (d *Daemon) shimLaunchSeatFacts(id sessionshim.Identity) (scope string, cpus, memoryMB, ioWeight int) {
-	if d == nil {
-		return "", 0, 0, 0
-	}
-	registry, err := d.sessionShimRegistry()
-	if err != nil {
-		return "", 0, 0, 0
-	}
-	rec, err := registry.Get(id)
-	if err != nil {
-		return "", 0, 0, 0
-	}
-	return rec.SeatScope, rec.SeatCPUs, rec.SeatMemoryMB, rec.SeatIOWeight
-}

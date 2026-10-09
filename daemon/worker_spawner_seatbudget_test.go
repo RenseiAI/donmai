@@ -166,67 +166,84 @@ func TestApplySeatBudgetToCmd_SystemdWrap(t *testing.T) {
 }
 
 // TestSeatBudgetShimCommandMatchesDirectWrap pins the shim launch wrap through
-// the PRODUCTION entry point: seatBudgetShimCommandForLaunch is what
-// startShimProcess calls, keyed by the full launch identity. A budgetless
-// seat still wraps (no limit properties, still its own scope); a budgeted
-// seat carries the quota, weight and memory ceiling. Reverting the
-// production wrap to the bare worker command keeps every helper-level suite
-// green but launches no scope here.
+// the PRODUCTION entry point startShimProcess calls. On Linux every shim
+// launch wraps in its own scope, budget or not; the scope carries limits only
+// when the budget asks for hard enforcement — the same rule the direct lane
+// applies — so a best-effort budget runs inside a limit-free scope on its
+// cooperative caps. Without the systemd placement the launch is refused; off
+// Linux the bare command runs. Reverting the production wrap to the bare
+// worker command, or letting a best-effort budget carry limits, fails here.
 func TestSeatBudgetShimCommandMatchesDirectWrap(t *testing.T) {
-	b := seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: "enforced"}
-	got, ok := seatBudgetShimCommandForLaunch([]string{"/bin/worker", "agent", "run"}, "test-org", "seat-shim-1", 1, b, true, seatbudget.PlacementSystemd, false, "linux")
-	if !ok {
-		t.Fatal("shim wrap refused on a systemd host; want the scope argv")
+	worker := []string{"/bin/worker", "agent", "run"}
+	unit := seatBudgetShimScopeName("test-org", "seat-shim-1", 1)
+	limitProps := []string{"CPUQuota=", "CPUWeight=", "MemoryMax=", "MemoryHigh=", "IOWeight="}
+	cases := []struct {
+		name       string
+		budget     seatbudget.Budget
+		ok         bool
+		wantLimits []string
+	}{
+		{
+			name: "enforced", budget: seatbudget.Budget{CPUs: 2, MemoryMB: 1024, IOWeight: 300, Mode: "enforced"}, ok: true,
+			wantLimits: []string{"CPUQuota=200%", "CPUWeight=200", "MemoryMax=1073741824", "IOWeight=300"},
+		},
+		{
+			name: "auto confines on Linux", budget: seatbudget.Budget{CPUs: 2, Mode: "auto"}, ok: true,
+			wantLimits: []string{"CPUQuota=200%", "CPUWeight=200"},
+		},
+		{name: "best-effort scopes without limits", budget: seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: "best-effort"}, ok: true},
+		{name: "budgetless scopes without limits", budget: seatbudget.Budget{}, ok: false},
 	}
-	joined := strings.Join(got, " ")
-	for _, want := range []string{"systemd-run", "--scope", "--collect", "CPUQuota=200%", "CPUWeight=200", "OOMPolicy=continue", "MemoryMax=1073741824", "/bin/worker"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("shim command %q missing %q", joined, want)
+	for _, tc := range cases {
+		got, ok := seatBudgetShimCommandForLaunch(worker, unit, tc.budget, tc.ok, seatbudget.PlacementSystemd, false, "linux")
+		if !ok {
+			t.Fatalf("%s: shim wrap refused on a systemd host; want the scope argv", tc.name)
+		}
+		joined := strings.Join(got, " ")
+		for _, want := range []string{"systemd-run", "--scope", "--collect", "OOMPolicy=continue", "/bin/worker agent run"} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("%s: shim command %q missing %q", tc.name, joined, want)
+			}
+		}
+		if unitOf(got) != unit {
+			t.Errorf("%s: shim command unit = %q; want the launch's scope %q", tc.name, unitOf(got), unit)
+		}
+		for _, want := range tc.wantLimits {
+			if !strings.Contains(joined, want) {
+				t.Errorf("%s: shim command %q missing limit %q", tc.name, joined, want)
+			}
+		}
+		if len(tc.wantLimits) == 0 {
+			for _, banned := range limitProps {
+				if strings.Contains(joined, banned) {
+					t.Errorf("%s: shim command %q carries %q; this seat's scope must cap nothing", tc.name, joined, banned)
+				}
+			}
 		}
 	}
-	if !strings.HasPrefix(unitOf(got), "donmai-seat-") || !strings.HasSuffix(unitOf(got), ".scope") {
-		t.Errorf("shim command %q missing the per-launch scope unit", joined)
+	// The scope name is stable for one launch identity and distinct per
+	// incarnation.
+	if seatBudgetShimScopeName("test-org", "seat-shim-1", 1) != unit {
+		t.Error("scope name is not stable for one launch identity")
 	}
-	// The digest name is stable for one launch identity: same inputs, same
-	// scope. Two launches of one session differ only by epoch.
-	again, _ := seatBudgetShimCommandForLaunch([]string{"/bin/worker"}, "test-org", "seat-shim-1", 1, b, true, seatbudget.PlacementSystemd, false, "linux")
-	if unitOf(got) != unitOf(again) {
-		t.Errorf("scope unit %q != %q for the same launch; want a stable name", unitOf(got), unitOf(again))
-	}
-	next, _ := seatBudgetShimCommandForLaunch([]string{"/bin/worker"}, "test-org", "seat-shim-1", 2, b, true, seatbudget.PlacementSystemd, false, "linux")
-	if unitOf(got) == unitOf(next) {
-		t.Errorf("epoch 1 and 2 share scope unit %q; want distinct scopes per incarnation", unitOf(got))
-	}
-	// A budgetless seat still gets its own scope, with no limit
-	// properties: the scope owns the seat's cgroup past a daemon restart.
-	plain := []string{"/bin/worker", "agent", "run"}
-	unbudgeted, ok := seatBudgetShimCommandForLaunch(plain, "test-org", "s", 1, seatbudget.Budget{}, false, seatbudget.PlacementSystemd, false, "linux")
-	if !ok {
-		t.Fatal("budgetless shim wrap refused on a systemd host; want a limit-free scope")
-	}
-	unjoined := strings.Join(unbudgeted, " ")
-	if !strings.Contains(unjoined, "systemd-run") || !strings.Contains(unjoined, "--scope") {
-		t.Errorf("budgetless shim command %q is unwrapped; want a scope with no limits", unjoined)
-	}
-	for _, banned := range []string{"CPUQuota=", "CPUWeight=", "MemoryMax="} {
-		if strings.Contains(unjoined, banned) {
-			t.Errorf("budgetless shim command %q carries %q; want no limit properties", unjoined, banned)
-		}
+	if seatBudgetShimScopeName("test-org", "seat-shim-1", 2) == unit {
+		t.Error("epoch 1 and 2 share a scope; want distinct scopes per incarnation")
 	}
 	// No systemd placement: the launch is refused, never unwrapped. An
 	// unscoped shim dies with its daemon while its handle claims a
 	// survivorship it does not have.
-	if _, ok := seatBudgetShimCommandForLaunch(plain, "test-org", "s", 1, b, true, seatbudget.PlacementNone, false, "linux"); ok {
-		t.Error("shim wrap succeeded with no backend; want refusal (nothing launches unscoped)")
+	enforced := seatbudget.Budget{CPUs: 2, Mode: "enforced"}
+	for _, placement := range []seatbudget.Placement{seatbudget.PlacementNone, seatbudget.PlacementCgroupFS} {
+		if _, ok := seatBudgetShimCommandForLaunch(worker, unit, enforced, true, placement, false, "linux"); ok {
+			t.Errorf("shim wrap succeeded on the %s placement; want refusal (nothing launches unscoped)", placement)
+		}
 	}
-	if _, ok := seatBudgetShimCommandForLaunch(plain, "test-org", "s", 1, b, true, seatbudget.PlacementCgroupFS, false, "linux"); ok {
-		t.Error("shim wrap succeeded on the cgroupfs placement; want refusal (nothing launches unscoped)")
+	if err := shimScopeGateError(seatbudget.PlacementNone); err == nil || !strings.Contains(err.Error(), "nothing launches unscoped") {
+		t.Errorf("gate error = %v; want the unscoped-launch refusal named", err)
 	}
-	if _, ok := seatBudgetShimCommandForLaunch(plain, "test-org", "s", 1, b, true, seatbudget.PlacementSystemd, false, "darwin"); !ok {
-		t.Error("shim wrap refused off Linux; want the bare command (no scope exists there)")
-	}
-	if bare, _ := seatBudgetShimCommandForLaunch(plain, "test-org", "s", 1, b, true, seatbudget.PlacementSystemd, false, "darwin"); strings.Join(bare, " ") != strings.Join(plain, " ") {
-		t.Errorf("off-Linux shim command %q != bare %q", strings.Join(bare, " "), strings.Join(plain, " "))
+	bare, ok := seatBudgetShimCommandForLaunch(worker, "", enforced, true, seatbudget.PlacementSystemd, false, "darwin")
+	if !ok || strings.Join(bare, " ") != strings.Join(worker, " ") {
+		t.Errorf("off-Linux shim command = %q, %v; want the bare %q (no scope exists there)", bare, ok, worker)
 	}
 }
 
@@ -357,55 +374,73 @@ func TestSpawner_SeatBudget_ConcurrentReloadAndSpawn(t *testing.T) {
 	<-done
 }
 
-// TestSeatBudgetHandleReport_RecoverySurfaces pins the adopted-handle rule
-// through the production handle paths: sessions the daemon adopts at startup
-// (empty published handle) or quarantines report the limits read back from
-// the seat's own cgroup, falling back to the launch record — never this
-// daemon's current configuration. A quarantined entry whose record carries
-// the launched limits reports them even after the operator reconfigures the
-// host; an entry with no seat facts reports none with the reason named.
-func TestSeatBudgetHandleReport_RecoverySurfaces(t *testing.T) {
+// newSeatReportDaemon builds a daemon whose shim registry is open on a temp
+// directory and whose current seat budget (8 cpu best-effort) deliberately
+// differs from every launch record the tests write, so a report that read the
+// current configuration could not hide. readLimits is the seat read-back.
+func newSeatReportDaemon(t *testing.T, readLimits func(scope string, userScope bool) (seatbudget.SeatLimits, bool)) (*Daemon, *sessionshim.Registry) {
+	t.Helper()
 	d := New(Options{SkipRegistration: true})
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 4,
-		// Deliberately DIFFERENT from the record's launched limits below:
-		// the handles must report the seat's own facts, not this share.
-		SeatBudget: SeatBudget{CPUs: 8, MemoryMB: 8192, Mode: "best-effort"},
+		SeatBudget:            SeatBudget{CPUs: 8, MemoryMB: 8192, Mode: "best-effort"},
 	})
-	// A quarantined entry whose discovery record carried the launched limits
-	// reports those limits — not the daemon's current 8-CPU share.
+	registry, err := sessionshim.NewRegistry(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	d.shims.registry = registry
+	d.shimScope = shimScopeProbe{goos: "linux", userScope: func() bool { return true }, readLimits: readLimits}
+	return d, registry
+}
+
+func putSeatLaunch(t *testing.T, registry *sessionshim.Registry, id sessionshim.Identity, epoch uint64, mode string, cpus, memoryMB int) string {
+	t.Helper()
+	scope := seatBudgetShimScopeName(id.OrgID, id.SessionID, epoch)
+	if err := registry.PutSeatLaunch(sessionshim.NewSeatLaunch(id, epoch, scope, mode, cpus, memoryMB, 0, time.Now())); err != nil {
+		t.Fatalf("PutSeatLaunch: %v", err)
+	}
+	return scope
+}
+
+func noLiveScope(string, bool) (seatbudget.SeatLimits, bool) { return seatbudget.SeatLimits{}, false }
+
+// TestSeatBudgetHandleReport_RecoverySurfaces pins the adopted-handle rule
+// through the production handle path: sessions the daemon adopts at startup
+// (empty published handle) or quarantines report the limits read back from
+// the seat's own scope, falling back to the launch record written beside the
+// discovery record — never this daemon's current configuration. A seat with
+// no launch record reports none with the reason named.
+func TestSeatBudgetHandleReport_RecoverySurfaces(t *testing.T) {
+	d, registry := newSeatReportDaemon(t, noLiveScope)
+	quarantinedID := sessionshim.Identity{OrgID: "o", SessionID: "quarantined-lineage"}
+	quarantinedScope := putSeatLaunch(t, registry, quarantinedID, 1, sessionshim.SeatModeEnforced, 2, 1024)
 	d.shims.quarantined = append(d.shims.quarantined, sessionshim.QuarantinedSession{
-		OrgID: "o", SessionID: "quarantined-lineage",
-		ShimID: "shim-1", ProcessEpoch: 1,
-		SeatScope: "donmai-seat-abc-1.scope", SeatCPUs: 2, SeatMemoryMB: 1024,
+		OrgID: quarantinedID.OrgID, SessionID: quarantinedID.SessionID, ShimID: "shim-1", ProcessEpoch: 1,
 	})
-	// Adopted-at-startup with no controller and no seat facts: the honest
-	// report is none with the reason named, never the current share.
-	d.shims.adopted[sessionshim.Identity{OrgID: "o", SessionID: "adopted-at-startup"}] = adoptedShim{}
+	adoptedID := sessionshim.Identity{OrgID: "o", SessionID: "adopted-at-startup"}
+	d.shims.adopted[adoptedID] = adoptedShim{
+		shimID:   "shim-2",
+		adoption: SessionShimAdoptionEvidence{Identity: adoptedID, ShimID: "shim-2", ProcessEpoch: 1},
+	}
 	byID := map[string]SessionHandle{}
 	for _, h := range d.sessionShimHandles() {
 		byID[h.SessionID] = h
 	}
 	h, ok := byID["quarantined-lineage"]
-	if !ok {
-		t.Fatal("no handle projected for quarantined-lineage")
-	}
-	if h.SeatBudget == nil {
-		t.Fatal("quarantined handle carries no SeatBudget; want the launched limits")
+	if !ok || h.SeatBudget == nil {
+		t.Fatalf("quarantined handle = %+v; want one carrying the launched limits", h)
 	}
 	if h.SeatBudget.Mode != "enforced" || h.SeatBudget.CPUs != 2 || h.SeatBudget.MemoryMB != 1024 {
-		t.Errorf("quarantined SeatBudget = %+v; want the record's enforced 2 cpu / 1024MiB, not the current 8-cpu share", h.SeatBudget)
+		t.Errorf("quarantined SeatBudget = %+v; want the launch record's enforced 2 cpu / 1024MiB, not the current 8-cpu share", h.SeatBudget)
 	}
-	if !strings.Contains(h.SeatBudget.Detail, "donmai-seat-abc-1.scope") {
+	if !strings.Contains(h.SeatBudget.Detail, quarantinedScope) {
 		t.Errorf("quarantined detail = %q; want the owning scope named", h.SeatBudget.Detail)
 	}
 	a, ok := byID["adopted-at-startup"]
-	if !ok {
-		t.Fatal("no handle projected for adopted-at-startup")
-	}
-	if a.SeatBudget == nil || a.SeatBudget.Mode != "none" {
-		t.Errorf("adopted-without-facts SeatBudget = %+v; want mode none (never the current share)", a.SeatBudget)
+	if !ok || a.SeatBudget == nil || a.SeatBudget.Mode != "none" || !strings.Contains(a.SeatBudget.Detail, "no seat launch record") {
+		t.Errorf("adopted-without-record SeatBudget = %+v; want none with the missing record named (never the current share)", a.SeatBudget)
 	}
 	// Held recovery projections stamp the same share. The projection
 	// below is the minimal journal shape hold() reads: envelope session,
@@ -433,6 +468,99 @@ func TestSeatBudgetHandleReport_RecoverySurfaces(t *testing.T) {
 	})
 	if rep := d.seatBudgetHandleReport(); rep == nil || rep.Mode != "none" {
 		t.Errorf("disabled handle report = %+v; want mode none", rep)
+	}
+}
+
+// TestShimSeatReportReadsBackOnceOutsideTheLock pins how the handle path
+// reads a seat back: the live scope wins over the launch record, each launch
+// incarnation is read once (adoption never changes a running seat's limits,
+// and the read execs systemctl), the read never runs under the shim-state
+// lock, and a seat that leaves the adopted and quarantined sets leaves the
+// cache with it.
+func TestShimSeatReportReadsBackOnceOutsideTheLock(t *testing.T) {
+	var d *Daemon
+	calls := map[string]int{}
+	readLimits := func(scope string, userScope bool) (seatbudget.SeatLimits, bool) {
+		calls[scope]++
+		if !userScope {
+			t.Error("read-back used the system bus; want the launch's bus decision")
+		}
+		if !d.shims.mu.TryLock() {
+			t.Error("seat read-back ran while the shim-state lock was held")
+		} else {
+			d.shims.mu.Unlock()
+		}
+		return seatbudget.SeatLimits{CPUs: 3, MemoryMB: 768}, true
+	}
+	d, registry := newSeatReportDaemon(t, readLimits)
+	id := sessionshim.Identity{OrgID: "o", SessionID: "live-seat"}
+	scope := putSeatLaunch(t, registry, id, 1, sessionshim.SeatModeEnforced, 2, 1024)
+	d.shims.quarantined = append(d.shims.quarantined, sessionshim.QuarantinedSession{
+		OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-1", ProcessEpoch: 1,
+	})
+	for round := 0; round < 3; round++ {
+		handles := d.sessionShimHandles()
+		if len(handles) != 1 || handles[0].SeatBudget == nil {
+			t.Fatalf("round %d handles = %+v; want the one quarantined seat", round, handles)
+		}
+		if got := handles[0].SeatBudget; got.Mode != "enforced" || got.CPUs != 3 || got.MemoryMB != 768 {
+			t.Errorf("round %d SeatBudget = %+v; want the live 3 cpu / 768MiB over the record's 2/1024", round, got)
+		}
+	}
+	if calls[scope] != 1 {
+		t.Errorf("live scope read %d times across three status reads; want once per incarnation", calls[scope])
+	}
+	d.shims.quarantined = nil
+	_ = d.sessionShimHandles()
+	d.shimSeatReports.mu.Lock()
+	cached := len(d.shimSeatReports.reports)
+	d.shimSeatReports.mu.Unlock()
+	if cached != 0 {
+		t.Errorf("cache holds %d reports after the seat left; want none", cached)
+	}
+}
+
+// TestReadShimSeatReportNeverReadsCurrentConfig pins the report helper behind
+// every shim handle: a launch record stands in when the live scope cannot be
+// read, a best-effort record stays best-effort even in a limit-free live
+// scope, and a seat whose record is missing is still read back through the
+// scope its launch identity names. None of it reads the daemon's current
+// configuration.
+func TestReadShimSeatReportNeverReadsCurrentConfig(t *testing.T) {
+	d, registry := newSeatReportDaemon(t, noLiveScope)
+	recorded := sessionshim.Identity{OrgID: "o", SessionID: "recorded"}
+	putSeatLaunch(t, registry, recorded, 2, sessionshim.SeatModeEnforced, 4, 2048)
+	if rep := d.readShimSeatReport(registry, recorded, 2); rep.Mode != "enforced" || rep.CPUs != 4 || rep.MemoryMB != 2048 {
+		t.Errorf("record fallback = %+v; want the record's 4 cpu / 2048MiB, not the current 8-cpu share", rep)
+	}
+	if rep := d.readShimSeatReport(registry, recorded, 3); rep.Mode != "none" {
+		t.Errorf("another epoch without a record = %+v; want none", rep)
+	}
+
+	d.shimScope.readLimits = func(string, bool) (seatbudget.SeatLimits, bool) { return seatbudget.SeatLimits{}, true }
+	bestEffort := sessionshim.Identity{OrgID: "o", SessionID: "best-effort"}
+	putSeatLaunch(t, registry, bestEffort, 1, sessionshim.SeatModeBestEffort, 2, 0)
+	if rep := d.readShimSeatReport(registry, bestEffort, 1); rep.Mode != "best-effort" || rep.CPUs != 2 {
+		t.Errorf("best-effort seat in a limit-free scope = %+v; want best-effort 2 cpu", rep)
+	}
+
+	unrecorded := sessionshim.Identity{OrgID: "o", SessionID: "unrecorded"}
+	derived := seatBudgetShimScopeName(unrecorded.OrgID, unrecorded.SessionID, 1)
+	d.shimScope.readLimits = func(scope string, _ bool) (seatbudget.SeatLimits, bool) {
+		if scope != derived {
+			return seatbudget.SeatLimits{}, false
+		}
+		return seatbudget.SeatLimits{CPUs: 1, MemoryMB: 256}, true
+	}
+	if rep := d.readShimSeatReport(registry, unrecorded, 1); rep.Mode != "enforced" || rep.CPUs != 1 || !strings.Contains(rep.Detail, derived) {
+		t.Errorf("seat without a record = %+v; want the live 1 cpu read back through %s", rep, derived)
+	}
+	d.shimScope.readLimits = func(scope string, _ bool) (seatbudget.SeatLimits, bool) {
+		t.Errorf("read-back called with %q for an invalid identity; no scope may be derived from it", scope)
+		return seatbudget.SeatLimits{}, false
+	}
+	if rep := d.readShimSeatReport(nil, sessionshim.Identity{}, 0); rep.Mode != "none" {
+		t.Errorf("invalid identity = %+v; want none, with no scope derived", rep)
 	}
 }
 
@@ -573,85 +701,20 @@ var (
 	_ = exec.Command
 )
 
-// shimLaunchEnvProbe is a WorkerCommand that records the exact environment
-// the launched shim process starts with, then runs the tail command. The
-// fake systemd-run prefix (see the startShimProcess tests) execs its tail,
-// so chaining this probe BEHIND it captures the launch-contract half of
-// startShimProcess: the scope unit and launched limits stamped into the
-// child env. Deleting the launch.SeatScope/limits stamp keeps the scope
-// wrap green but leaves this probe's record without the seat keys — the
-// mutation B3 names.
-func shimLaunchEnvProbe(t *testing.T, dir string) (workerCommand []string, envPath string) {
+// installFakeSystemdRun puts a fake systemd-run on PATH that records the argv
+// it was invoked with and execs its tail command, and returns where the argv
+// lands. The record is written to a temporary name and renamed into place, so
+// a reader polling for the file never sees a half-written argv.
+func installFakeSystemdRun(t *testing.T, dir string) string {
 	t.Helper()
-	envPath = filepath.Join(dir, "shim-launch-env")
-	// The probe appends its own environ to envPath (one KEY=VALUE per
-	// line), then execs the tail command unchanged. "$@" preserves the
-	// worker argv startShimProcess configured; the env record lands before
-	// the tail replaces this shell.
-	probe := "env > \"$SHIM_LAUNCH_ENV_PATH\"; exec \"$@\""
-	return []string{"/bin/sh", "-c", probe, "shim-launch-env-probe"}, envPath
-}
-
-// readShimLaunchEnvRecord polls for the probe's env record the same way the
-// scope-argv tests poll for the fake systemd-run argv: Start returns before
-// the child runs, so the record lands asynchronously.
-func readShimLaunchEnvRecord(t *testing.T, envPath string) map[string]string {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		raw, readErr := os.ReadFile(envPath)
-		if readErr == nil {
-			byKey := map[string]string{}
-			for _, line := range strings.Split(string(raw), "\n") {
-				if k, v, ok := strings.Cut(line, "="); ok {
-					byKey[k] = v
-				}
-			}
-			return byKey
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("shim launch env probe never ran (no env record): %v — the launch never reached its worker", readErr)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-// assertShimLaunchEnvCarriesSeatFacts pins the launch-record half of
-// startShimProcess: the child env carries the digest scope unit plus the
-// launched limits, so the shim republishes them into its discovery record
-// and a restarted daemon falls back to them — never to empty facts.
-func assertShimLaunchEnvCarriesSeatFacts(t *testing.T, byKey map[string]string, wantScope string, wantCPUs, wantMemoryMB int) {
-	t.Helper()
-	if got := byKey[sessionshim.EnvSeatScope]; got != wantScope {
-		t.Errorf("launched env %s = %q; want the digest scope %q", sessionshim.EnvSeatScope, got, wantScope)
-	}
-	if got := byKey[sessionshim.EnvSeatCPUs]; got != strconv.Itoa(wantCPUs) {
-		t.Errorf("launched env %s = %q; want %d", sessionshim.EnvSeatCPUs, got, wantCPUs)
-	}
-	if got := byKey[sessionshim.EnvSeatMemoryMB]; got != strconv.Itoa(wantMemoryMB) {
-		t.Errorf("launched env %s = %q; want %d", sessionshim.EnvSeatMemoryMB, got, wantMemoryMB)
-	}
-}
-
-// TestStartShimProcess_WrapsEnforcedSeatInSystemdScope drives the PRODUCTION
-// shim launch entry (startShimProcess) with an enforced seat budget and a
-// stubbed systemd placement, and asserts the shim actually launches inside
-// the transient scope. A fake systemd-run on PATH records the argv it was
-// invoked with and execs the tail worker command, so the test observes both
-// halves: the scope argv carries the seat's quota, weight, memory ceiling
-// and per-session unit, and the shim child still starts (its marker lands
-// in the per-session log). Reverting startShimProcess to the bare worker
-// command keeps every other suite green but leaves no argv record here —
-// the parity helper test alone cannot catch a dropped production wrap.
-func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
-	dir := t.TempDir()
 	fakes := filepath.Join(dir, "fakes")
 	if err := os.MkdirAll(fakes, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	argvPath := filepath.Join(dir, "systemd-run-argv")
 	fake := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$@\" > \"$FAKE_SYSTEMD_RUN_ARGV\"\n" +
+		"printf '%s\\n' \"$@\" > \"$FAKE_SYSTEMD_RUN_ARGV.tmp\"\n" +
+		"mv \"$FAKE_SYSTEMD_RUN_ARGV.tmp\" \"$FAKE_SYSTEMD_RUN_ARGV\"\n" +
 		"while [ $# -gt 0 ]; do\n" +
 		"  if [ \"$1\" = \"--unit\" ]; then shift 2; break; fi\n" +
 		"  shift\n" +
@@ -662,92 +725,35 @@ func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
 	}
 	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_SYSTEMD_RUN_ARGV", argvPath)
+	return argvPath
+}
 
-	oldPlacement, oldUserScope := seatBudgetLaunchPlacement, seatBudgetLaunchUserScope
-	seatBudgetLaunchPlacement = func() seatbudget.Placement { return seatbudget.PlacementSystemd }
-	seatBudgetLaunchUserScope = func() bool { return false }
-	oldScopeGOOS := shimScopeGOOS
-	shimScopeGOOS = "linux"
-	defer func() {
-		seatBudgetLaunchPlacement, seatBudgetLaunchUserScope = oldPlacement, oldUserScope
-		shimScopeGOOS = oldScopeGOOS
-	}()
-
-	const sessionID = "shim-budget-wrap"
-	const marker = "shim-budget-wrap-marker"
-	probeCmd, envPath := shimLaunchEnvProbe(t, dir)
-	d := &Daemon{}
-	d.spawner = NewWorkerSpawner(SpawnerOptions{
-		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
-		EnabledProjectIDs:     []string{"p1"},
-		MaxConcurrentSessions: 2,
-		SeatBudget:            SeatBudget{CPUs: 2, MemoryMB: 256, Mode: "enforced"},
-		WorkerCommand:         append(append([]string(nil), probeCmd...), "/bin/sh", "-c", "echo "+marker+"; exit 0"),
-		WorktreeParentDir:     dir,
-	})
-	identity := sessionshim.Identity{OrgID: "test-org", SessionID: sessionID}
-	launch := sessionshim.Launch{
-		Identity:     identity,
-		RegistryDir:  dir + "/registry",
-		Orphan:       sessionshim.DefaultOrphanPolicy(),
-		ProcessEpoch: 1,
-	}
-	started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, []string{
-		"PATH=" + os.Getenv("PATH"),
-		"FAKE_SYSTEMD_RUN_ARGV=" + argvPath,
-		"SHIM_LAUNCH_ENV_PATH=" + envPath,
-	})
-	if err != nil {
-		t.Fatalf("startShimProcess: %v", err)
-	}
-	if started.PID == 0 {
-		t.Fatal("startShimProcess returned pid 0")
-	}
-	// The fake records its argv asynchronously after Start returns: poll
-	// for the record the same way the stdio test polls for the child log.
-	var raw []byte
-	argvDeadline := time.Now().Add(5 * time.Second)
+// waitForFile polls for a file another process writes after Start returns.
+func waitForFile(t *testing.T, path, what string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
 	for {
-		var readErr error
-		raw, readErr = os.ReadFile(argvPath)
-		if readErr == nil {
-			break
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			return raw
 		}
-		if time.Now().After(argvDeadline) {
-			t.Fatalf("fake systemd-run never invoked (no argv record): %v — the shim launched unwrapped", readErr)
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never appeared at %s: %v", what, path, err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	joined := strings.Join(strings.Split(strings.TrimSpace(string(raw)), "\n"), " ")
-	for _, want := range []string{"--scope", "--collect", "CPUQuota=200%", "CPUWeight=200", "OOMPolicy=continue", "MemoryMax=268435456", "/bin/sh"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("shim scope argv %q missing %q", joined, want)
-		}
-	}
-	// The unit is the digest scope for this launch identity (org, session,
-	// epoch 1) — never a truncation of the session id.
-	wantUnit := seatBudgetShimScopeName("test-org", sessionID, 1)
-	if !strings.Contains(joined, wantUnit) {
-		t.Errorf("shim scope argv %q missing digest unit %q", joined, wantUnit)
-	}
-	if strings.Contains(joined, "donmai-seat-shim-budget-wrap.scope") {
-		t.Errorf("shim scope argv %q carries the legacy truncated unit; want the digest scope", joined)
-	}
-	if strings.Contains(joined, "AllowedCPUs") {
-		t.Errorf("shim scope argv %q pins cores; want quota+weight only", joined)
-	}
-	// The launch-record half: the child env carries the same digest scope
-	// plus the launched limits, so the shim republishes them into its
-	// discovery record. Deleting the startShimProcess stamp keeps the wrap
-	// above green but empties these — the silent-restart-regression shape.
-	assertShimLaunchEnvCarriesSeatFacts(t, readShimLaunchEnvRecord(t, envPath), wantUnit, 2, 256)
-	// The shim child ran through the wrap: its marker reaches the log.
-	logPath := shimChildLogPath(launch.RegistryDir, identity)
+}
+
+// waitForShimMarker waits until the launched child's marker reaches its
+// per-session log, proving the launch ran its worker through the wrap.
+func waitForShimMarker(t *testing.T, registryDir string, identity sessionshim.Identity, marker string) {
+	t.Helper()
+	logPath := shimChildLogPath(registryDir, identity)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		content, readErr := os.ReadFile(logPath)
 		if readErr == nil && strings.Contains(string(content), marker) {
-			break
+			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("shim child marker %q missing from %s; the wrap swallowed the launch", marker, logPath)
@@ -756,86 +762,116 @@ func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
 	}
 }
 
-// TestStartShimProcess_BudgetlessSeatStillScopes drives the PRODUCTION shim
-// launch entry (startShimProcess) with budgeting OFF and a stubbed systemd
-// placement, and asserts the shim still launches inside its own transient
-// scope — with no limit properties. Reverting the production wrap to
-// budget-only keeps every other suite green but launches this seat bare,
-// which is the restart-kills-the-seat shape this slice exists to remove.
-func TestStartShimProcess_BudgetlessSeatStillScopes(t *testing.T) {
-	dir := t.TempDir()
-	fakes := filepath.Join(dir, "fakes")
-	if err := os.MkdirAll(fakes, 0o700); err != nil {
-		t.Fatal(err)
+// linuxSystemdShimScope is the probe for a test that drives the Linux scope
+// path against a fake systemd-run: the platform reads as Linux with the
+// systemd placement on the system bus, and nothing reads a live scope.
+func linuxSystemdShimScope() shimScopeProbe {
+	return shimScopeProbe{
+		goos:       "linux",
+		placement:  func() seatbudget.Placement { return seatbudget.PlacementSystemd },
+		userScope:  func() bool { return false },
+		readLimits: noLiveScope,
 	}
-	argvPath := filepath.Join(dir, "systemd-run-argv")
-	fake := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$@\" > \"$FAKE_SYSTEMD_RUN_ARGV\"\n" +
-		"while [ $# -gt 0 ]; do\n" +
-		"  if [ \"$1\" = \"--unit\" ]; then shift 2; break; fi\n" +
-		"  shift\n" +
-		"done\n" +
-		"exec \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(fakes, "systemd-run"), []byte(fake), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (LookPath + exec need +x)
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("FAKE_SYSTEMD_RUN_ARGV", argvPath)
+}
 
-	oldPlacement, oldUserScope := seatBudgetLaunchPlacement, seatBudgetLaunchUserScope
-	seatBudgetLaunchPlacement = func() seatbudget.Placement { return seatbudget.PlacementSystemd }
-	seatBudgetLaunchUserScope = func() bool { return false }
-	oldScopeGOOS := shimScopeGOOS
-	shimScopeGOOS = "linux"
-	defer func() {
-		seatBudgetLaunchPlacement, seatBudgetLaunchUserScope = oldPlacement, oldUserScope
-		shimScopeGOOS = oldScopeGOOS
-	}()
-
-	const sessionID = "shim-budgetless-scope"
-	const marker = "shim-budgetless-scope-marker"
-	probeCmd, envPath := shimLaunchEnvProbe(t, dir)
-	d := &Daemon{}
+// startShimForScopeTest launches one shim through the PRODUCTION entry with
+// the given budget under probe, and returns the launch and its registry.
+func startShimForScopeTest(t *testing.T, dir, sessionID, marker string, budget SeatBudget, probe shimScopeProbe, env []string) (sessionshim.Launch, *sessionshim.Registry) {
+	t.Helper()
+	d := &Daemon{shimScope: probe}
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
 		MaxConcurrentSessions: 2,
-		WorkerCommand:         append(append([]string(nil), probeCmd...), "/bin/sh", "-c", "echo "+marker+"; exit 0"),
+		SeatBudget:            budget,
+		WorkerCommand:         []string{"/bin/sh", "-c", "echo " + marker + "; exit 0"},
 		WorktreeParentDir:     dir,
 	})
-	identity := sessionshim.Identity{OrgID: "test-org", SessionID: sessionID}
 	launch := sessionshim.Launch{
-		Identity:     identity,
+		Identity:     sessionshim.Identity{OrgID: "test-org", SessionID: sessionID},
 		RegistryDir:  dir + "/registry",
 		Orphan:       sessionshim.DefaultOrphanPolicy(),
 		ProcessEpoch: 1,
 	}
-	started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, []string{
-		"PATH=" + os.Getenv("PATH"),
-		"FAKE_SYSTEMD_RUN_ARGV=" + argvPath,
-		"SHIM_LAUNCH_ENV_PATH=" + envPath,
-	})
+	started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, append([]string{"PATH=" + os.Getenv("PATH")}, env...))
 	if err != nil {
-		t.Fatalf("startShimProcess without a budget: %v", err)
+		t.Fatalf("startShimProcess: %v", err)
 	}
 	if started.PID == 0 {
 		t.Fatal("startShimProcess returned pid 0")
 	}
-	var raw []byte
-	argvDeadline := time.Now().Add(5 * time.Second)
-	for {
-		var readErr error
-		raw, readErr = os.ReadFile(argvPath)
-		if readErr == nil {
-			break
-		}
-		if time.Now().After(argvDeadline) {
-			t.Fatalf("fake systemd-run never invoked (no argv record): %v — the budgetless seat launched bare", readErr)
-		}
-		time.Sleep(50 * time.Millisecond)
+	registry, err := sessionshim.NewRegistry(launch.RegistryDir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
 	}
-	joined := strings.Join(strings.Split(strings.TrimSpace(string(raw)), "\n"), " ")
-	for _, want := range []string{"--scope", "--collect", "OOMPolicy=continue", "/bin/sh"} {
+	return launch, registry
+}
+
+// requireSeatLaunch reads the launch record startShimProcess wrote. It is
+// written synchronously before the process starts, so it is already there
+// when startShimProcess returns — no polling.
+func requireSeatLaunch(t *testing.T, registry *sessionshim.Registry, launch sessionshim.Launch) sessionshim.SeatLaunch {
+	t.Helper()
+	rec, found, err := registry.SeatLaunch(launch.Identity, launch.ProcessEpoch)
+	if err != nil || !found {
+		t.Fatalf("seat launch record = found %v, err %v; startShimProcess must write it before the shim starts", found, err)
+	}
+	return rec
+}
+
+// TestStartShimProcess_WrapsEnforcedSeatInSystemdScope drives the PRODUCTION
+// shim launch entry (startShimProcess) with an enforced seat budget against a
+// fake systemd-run, and asserts both halves of the launch: the shim starts
+// inside the transient scope carrying the seat's quota, weight and memory
+// ceiling under the launch's digest unit, and the secret-free launch record
+// beside the discovery record states that scope and those limits. Reverting
+// startShimProcess to the bare worker command leaves no argv record; dropping
+// the launch-record write leaves no record.
+func TestStartShimProcess_WrapsEnforcedSeatInSystemdScope(t *testing.T) {
+	dir := t.TempDir()
+	argvPath := installFakeSystemdRun(t, dir)
+	const sessionID, marker = "shim-budget-wrap", "shim-budget-wrap-marker"
+	launch, registry := startShimForScopeTest(t, dir, sessionID, marker,
+		SeatBudget{CPUs: 2, MemoryMB: 256, Mode: "enforced"}, linuxSystemdShimScope(),
+		[]string{"FAKE_SYSTEMD_RUN_ARGV=" + argvPath})
+	wantUnit := seatBudgetShimScopeName("test-org", sessionID, 1)
+
+	rec := requireSeatLaunch(t, registry, launch)
+	if rec.Scope != wantUnit || rec.Mode != sessionshim.SeatModeEnforced || rec.CPUs != 2 || rec.MemoryMB != 256 {
+		t.Errorf("seat launch record = %+v; want enforced 2 cpu / 256MiB in %s", rec, wantUnit)
+	}
+	joined := strings.Join(strings.Split(strings.TrimSpace(string(waitForFile(t, argvPath, "fake systemd-run argv"))), "\n"), " ")
+	for _, want := range []string{"--scope", "--collect", "CPUQuota=200%", "CPUWeight=200", "OOMPolicy=continue", "MemoryMax=268435456", "--unit " + wantUnit, "/bin/sh"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("shim scope argv %q missing %q", joined, want)
+		}
+	}
+	if strings.Contains(joined, "AllowedCPUs") {
+		t.Errorf("shim scope argv %q pins cores; want quota+weight only", joined)
+	}
+	waitForShimMarker(t, launch.RegistryDir, launch.Identity, marker)
+}
+
+// TestStartShimProcess_BudgetlessSeatStillScopes drives the PRODUCTION shim
+// launch entry with budgeting OFF and asserts the shim still launches inside
+// its own transient scope — with no limit properties — and that the launch
+// record names that scope with posture none. Reverting the production wrap to
+// budget-only launches this seat bare, which is the restart-kills-the-seat
+// shape this change exists to remove.
+func TestStartShimProcess_BudgetlessSeatStillScopes(t *testing.T) {
+	dir := t.TempDir()
+	argvPath := installFakeSystemdRun(t, dir)
+	const sessionID, marker = "shim-budgetless-scope", "shim-budgetless-scope-marker"
+	launch, registry := startShimForScopeTest(t, dir, sessionID, marker, SeatBudget{}, linuxSystemdShimScope(),
+		[]string{"FAKE_SYSTEMD_RUN_ARGV=" + argvPath})
+	wantUnit := seatBudgetShimScopeName("test-org", sessionID, 1)
+
+	rec := requireSeatLaunch(t, registry, launch)
+	if rec.Scope != wantUnit || rec.Mode != sessionshim.SeatModeNone || rec.CPUs != 0 || rec.MemoryMB != 0 {
+		t.Errorf("seat launch record = %+v; want posture none in %s", rec, wantUnit)
+	}
+	joined := strings.Join(strings.Split(strings.TrimSpace(string(waitForFile(t, argvPath, "fake systemd-run argv"))), "\n"), " ")
+	for _, want := range []string{"--scope", "--collect", "OOMPolicy=continue", "--unit " + wantUnit, "/bin/sh"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("budgetless shim scope argv %q missing %q", joined, want)
 		}
@@ -845,46 +881,75 @@ func TestStartShimProcess_BudgetlessSeatStillScopes(t *testing.T) {
 			t.Errorf("budgetless shim scope argv %q carries %q; want no limit properties", joined, banned)
 		}
 	}
-	if wantUnit := seatBudgetShimScopeName("test-org", sessionID, 1); !strings.Contains(joined, wantUnit) {
-		t.Errorf("budgetless shim scope argv %q missing digest unit %q", joined, wantUnit)
+	waitForShimMarker(t, launch.RegistryDir, launch.Identity, marker)
+}
+
+// TestShimSeatLaunchRecordStatesWhatTheSeatGot pins the launch record against
+// the direct lane's report for the same budget and placement: enforced only
+// where the scope carries the limits, best-effort for cooperative caps, none
+// when budgeting is off — and off Linux never a scope and never enforced, so
+// a macOS shim's handle cannot claim a transient systemd scope.
+func TestShimSeatLaunchRecordStatesWhatTheSeatGot(t *testing.T) {
+	id := sessionshim.Identity{OrgID: "org", SessionID: "seat"}
+	scope := seatBudgetShimScopeName(id.OrgID, id.SessionID, 1)
+	now := time.Unix(1_700_000_000, 0)
+	cases := []struct {
+		name     string
+		scope    string
+		budget   seatbudget.Budget
+		ok       bool
+		goos     string
+		wantMode string
+		wantCPUs int
+		wantIO   int
+	}{
+		{name: "linux enforced", scope: scope, budget: seatbudget.Budget{CPUs: 2, MemoryMB: 256, IOWeight: 300, Mode: "enforced"}, ok: true, goos: "linux", wantMode: sessionshim.SeatModeEnforced, wantCPUs: 2, wantIO: 300},
+		{name: "linux auto", scope: scope, budget: seatbudget.Budget{CPUs: 2, Mode: "auto"}, ok: true, goos: "linux", wantMode: sessionshim.SeatModeEnforced, wantCPUs: 2},
+		{name: "linux best-effort", scope: scope, budget: seatbudget.Budget{CPUs: 2, IOWeight: 300, Mode: "best-effort"}, ok: true, goos: "linux", wantMode: sessionshim.SeatModeBestEffort, wantCPUs: 2},
+		{name: "linux budgetless", scope: scope, goos: "linux", wantMode: sessionshim.SeatModeNone},
+		{name: "darwin enforced", budget: seatbudget.Budget{CPUs: 2, Mode: "enforced"}, ok: true, goos: "darwin", wantMode: sessionshim.SeatModeNone},
+		{name: "darwin auto", budget: seatbudget.Budget{CPUs: 2, Mode: "auto"}, ok: true, goos: "darwin", wantMode: sessionshim.SeatModeBestEffort, wantCPUs: 2},
+		{name: "darwin budgetless", goos: "darwin", wantMode: sessionshim.SeatModeNone},
 	}
-	// The budgetless seat still stamps its scope: zero limits ride as "0"
-	// so the shim republishes the scope into its record and a restarted
-	// daemon recovers the owning unit instead of an empty one.
-	assertShimLaunchEnvCarriesSeatFacts(t, readShimLaunchEnvRecord(t, envPath), seatBudgetShimScopeName("test-org", sessionID, 1), 0, 0)
-	logPath := shimChildLogPath(launch.RegistryDir, identity)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		content, readErr := os.ReadFile(logPath)
-		if readErr == nil && strings.Contains(string(content), marker) {
-			break
+	for _, tc := range cases {
+		rec := shimSeatLaunchRecord(id, 1, tc.scope, tc.budget, tc.ok, tc.goos, now)
+		if err := rec.Validate(); err != nil {
+			t.Errorf("%s: launch record does not validate: %v", tc.name, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("shim child marker %q missing from %s; the wrap swallowed the launch", marker, logPath)
+		if rec.Scope != tc.scope || rec.Mode != tc.wantMode || rec.CPUs != tc.wantCPUs || rec.IOWeight != tc.wantIO {
+			t.Errorf("%s: launch record = %+v; want scope %q, mode %s, %d cpu, io %d", tc.name, rec, tc.scope, tc.wantMode, tc.wantCPUs, tc.wantIO)
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// TestStartShimProcess_OffLinuxNeverClaimsAScope drives the PRODUCTION launch
+// entry off Linux with an enforced budget: the bare worker runs, the launch
+// record names no scope, and the fresh handle's report is never enforced via
+// a transient systemd scope that does not exist there.
+func TestStartShimProcess_OffLinuxNeverClaimsAScope(t *testing.T) {
+	dir := t.TempDir()
+	const sessionID, marker = "shim-off-linux", "shim-off-linux-marker"
+	probe := shimScopeProbe{goos: "darwin", placement: func() seatbudget.Placement { return seatbudget.PlacementNone }, readLimits: noLiveScope}
+	launch, registry := startShimForScopeTest(t, dir, sessionID, marker, SeatBudget{CPUs: 2, MemoryMB: 256, Mode: "enforced"}, probe, nil)
+	rec := requireSeatLaunch(t, registry, launch)
+	if rec.Scope != "" || rec.Mode == sessionshim.SeatModeEnforced {
+		t.Errorf("off-Linux launch record = %+v; want no scope and no enforced claim", rec)
+	}
+	d := &Daemon{shimScope: probe}
+	if rep := d.readShimSeatReport(registry, launch.Identity, launch.ProcessEpoch); rep.Mode == "enforced" || strings.Contains(rep.Detail, "systemd") {
+		t.Errorf("off-Linux handle report = %+v; want no enforced transient-scope claim", rep)
+	}
+	waitForShimMarker(t, launch.RegistryDir, launch.Identity, marker)
 }
 
 // TestStartShimProcess_RefusesWithoutScopeBackend pins the no-scope gate at
 // the PRODUCTION launch entry: on Linux with no systemd placement the launch
 // is REFUSED — nothing launches unscoped, because an unscoped shim dies with
-// its daemon while its handle claims a survivorship it does not have.
-// Reverting the gate to the old unwrap-and-run keeps every other suite green
-// but lets this launch succeed bare here.
+// its daemon while its handle claims a survivorship it does not have — and it
+// leaves no launch record behind.
 func TestStartShimProcess_RefusesWithoutScopeBackend(t *testing.T) {
 	dir := t.TempDir()
-	oldPlacement, oldUserScope := seatBudgetLaunchPlacement, seatBudgetLaunchUserScope
-	seatBudgetLaunchPlacement = func() seatbudget.Placement { return seatbudget.PlacementNone }
-	seatBudgetLaunchUserScope = func() bool { return false }
-	oldScopeGOOS := shimScopeGOOS
-	shimScopeGOOS = "linux"
-	defer func() {
-		seatBudgetLaunchPlacement, seatBudgetLaunchUserScope = oldPlacement, oldUserScope
-		shimScopeGOOS = oldScopeGOOS
-	}()
-
-	d := &Daemon{}
+	d := &Daemon{shimScope: shimScopeProbe{goos: "linux", placement: func() seatbudget.Placement { return seatbudget.PlacementNone }, readLimits: noLiveScope}}
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
@@ -893,9 +958,8 @@ func TestStartShimProcess_RefusesWithoutScopeBackend(t *testing.T) {
 		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
 		WorktreeParentDir:     dir,
 	})
-	identity := sessionshim.Identity{OrgID: "test-org", SessionID: "no-scope-seat"}
 	launch := sessionshim.Launch{
-		Identity:     identity,
+		Identity:     sessionshim.Identity{OrgID: "test-org", SessionID: "no-scope-seat"},
 		RegistryDir:  dir + "/registry",
 		Orphan:       sessionshim.DefaultOrphanPolicy(),
 		ProcessEpoch: 1,
@@ -905,62 +969,41 @@ func TestStartShimProcess_RefusesWithoutScopeBackend(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "transient-scope") {
 		t.Errorf("refusal %q does not name the missing transient-scope backend", err)
 	}
-}
-
-// TestShimScopeGateMatrix pins the platform gate: only Linux with the systemd
-// placement may launch shims. Off Linux the shim launches bare (no scope
-// exists there); on Linux without systemd nothing launches at all.
-func TestShimScopeGateMatrix(t *testing.T) {
-	if !shimScopeAvailable(seatbudget.PlacementSystemd, "linux") {
-		t.Error("systemd/linux must allow shim launches")
-	}
-	for _, placement := range []seatbudget.Placement{seatbudget.PlacementNone, seatbudget.PlacementCgroupFS} {
-		if shimScopeAvailable(placement, "linux") {
-			t.Errorf("linux/%s must refuse shim launches (nothing launches unscoped)", placement)
+	if registry, err := sessionshim.NewRegistry(launch.RegistryDir); err == nil {
+		if _, found, _ := registry.SeatLaunch(launch.Identity, 1); found {
+			t.Error("a refused launch left a seat launch record behind")
 		}
 	}
-	if shimScopeAvailable(seatbudget.PlacementSystemd, "darwin") {
-		t.Error("darwin must not take the scope path (no scope exists there)")
-	}
-	if err := shimScopeGateError(seatbudget.PlacementNone); err == nil || !strings.Contains(err.Error(), "nothing launches unscoped") {
-		t.Errorf("gate error = %v; want the unscoped-launch refusal named", err)
-	}
 }
 
-// TestAdoptedHandleReportsRecordLimitsNotCurrentConfig pins the adopted-handle
-// rule through the PRODUCTION report helper: a started-at-startup handle whose
-// record carries the launched limits reports THOSE limits — even though this
-// daemon's current configuration resolves a different share. Reverting the
-// helper to the current-config report keeps every other suite green but
-// reports the wrong numbers here.
-func TestAdoptedHandleReportsRecordLimitsNotCurrentConfig(t *testing.T) {
-	d := New(Options{SkipRegistration: true})
+// TestStartShimProcess_FailedStartRemovesTheLaunchRecord pins the launch
+// record's failure path: the record is written before the process starts, so
+// a start that fails must remove it again — nothing else will ever dispose of
+// a record for a seat that never existed.
+func TestStartShimProcess_FailedStartRemovesTheLaunchRecord(t *testing.T) {
+	dir := t.TempDir()
+	d := &Daemon{shimScope: shimScopeProbe{goos: "darwin", readLimits: noLiveScope}}
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
-		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
-		MaxConcurrentSessions: 4,
-		// Best-effort on purpose: the current-config report reads non-none
-		// for it on any host, so a reverted helper cannot hide behind the
-		// no-backend downgrade.
-		SeatBudget: SeatBudget{CPUs: 8, MemoryMB: 8192, Mode: "best-effort"},
+		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
+		EnabledProjectIDs:     []string{"p1"},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{filepath.Join(dir, "no-such-worker")},
+		WorktreeParentDir:     dir,
 	})
-	// A controller-less adopted entry with no seat facts reports none —
-	// never the current 8-CPU best-effort share.
-	entry := adoptedShim{}
-	rep := d.seatBudgetAdoptedReport(entry.controller)
-	if rep == nil || rep.Mode != "none" {
-		t.Fatalf("adopted report without facts = %+v; want mode none, never the current best-effort share", rep)
+	launch := sessionshim.Launch{
+		Identity:     sessionshim.Identity{OrgID: "test-org", SessionID: "failed-start"},
+		RegistryDir:  dir + "/registry",
+		Orphan:       sessionshim.DefaultOrphanPolicy(),
+		ProcessEpoch: 1,
 	}
-	if rep.CPUs != 0 || rep.MemoryMB != 0 {
-		t.Errorf("adopted report without facts = %+v; want no values", rep)
+	if _, err := d.startShimProcess(SessionSpec{SessionID: "failed-start"}, launch, nil); err == nil {
+		t.Fatal("startShimProcess with a missing worker succeeded; want a start failure")
 	}
-	// A quarantined entry reports its own record facts through the same
-	// production helper the handle path uses.
-	q := sessionshim.QuarantinedSession{
-		OrgID: "o", SessionID: "q-1", ShimID: "shim-9", ProcessEpoch: 2,
-		SeatScope: "donmai-seat-q-2.scope", SeatCPUs: 4, SeatMemoryMB: 2048,
+	registry, err := sessionshim.NewRegistry(launch.RegistryDir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
 	}
-	qrep := d.seatBudgetQuarantinedReport(q)
-	if qrep.Mode != "enforced" || qrep.CPUs != 4 || qrep.MemoryMB != 2048 {
-		t.Errorf("quarantined report = %+v; want the entry's 4 cpu / 2048MiB, not the current 8-cpu share", qrep)
+	if _, found, err := registry.SeatLaunch(launch.Identity, 1); err != nil || found {
+		t.Errorf("seat launch record after a failed start = found %v, err %v; want it removed", found, err)
 	}
 }
