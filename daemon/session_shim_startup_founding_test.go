@@ -46,7 +46,9 @@ type startupFoundingHarness struct {
 
 	mu                        sync.Mutex
 	registerBodies            [][]byte
+	refreshBodies             [][]byte
 	heartbeatBodies           []heartbeatRequestBody
+	workerForgotten           bool
 	refuseRegisterComposed    bool
 	refuseFirstProjectedBeat  bool
 	refuseFirstProjectedBeats int
@@ -90,6 +92,21 @@ func (h *startupFoundingHarness) registrations() [][]byte {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([][]byte(nil), h.registerBodies...)
+}
+
+func (h *startupFoundingHarness) refreshes() [][]byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([][]byte(nil), h.refreshBodies...)
+}
+
+// forgetWorker makes the refresh endpoint answer 404, the way a control plane
+// that no longer holds this worker's registration does, so the refresher falls
+// through to a full re-registration with the options it holds.
+func (h *startupFoundingHarness) forgetWorker() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.workerForgotten = true
 }
 
 // newStartupFoundingHarness stands up the fake control plane and the daemon
@@ -153,6 +170,14 @@ func newStartupFoundingHarness(t *testing.T) *startupFoundingHarness {
 			raw, _ := io.ReadAll(r.Body)
 			var presented SessionShimHostAttestation
 			_ = json.Unmarshal(raw, &presented)
+			h.mu.Lock()
+			h.refreshBodies = append(h.refreshBodies, append([]byte(nil), raw...))
+			forgotten := h.workerForgotten
+			h.mu.Unlock()
+			if forgotten {
+				http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+				return
+			}
 			token := "runtime-startup-founding-refreshed"
 			resp := refreshResponse{RuntimeToken: token}
 			if presented.Supports() {
@@ -390,6 +415,59 @@ func TestRefusedStartupFirstHeartbeatStandsDownAndServes(t *testing.T) {
 	}
 }
 
+// TestRefusedStartupFirstHeartbeatWithdrawsTheCompositionFromTheCredentialLane
+// pins what the heartbeat leg owes the control plane that the registration leg
+// does not. The refused founder's registration was ACCEPTED, so the control
+// plane records the host as composed and the shared credential lane was built
+// presenting that attestation. Standing down locally is not enough: the
+// stand-down goes on the wire exactly once, the lane presents it from then on,
+// and a full re-registration mints an ordinary identity with the host's real
+// capacity rather than an auth-only one for the abandoned composition.
+func TestRefusedStartupFirstHeartbeatWithdrawsTheCompositionFromTheCredentialLane(t *testing.T) {
+	h := newStartupFoundingHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.setRefuseFirstProjectedHeartbeat(1)
+
+	if err := h.daemon.Start(ctx); err != nil {
+		t.Fatalf("Start after a refused startup first heartbeat: %v", err)
+	}
+	t.Cleanup(func() { _ = h.daemon.Stop(context.Background()) })
+
+	refreshes := h.refreshes()
+	if len(refreshes) != 1 {
+		t.Fatalf("refreshes during Start = %d, want exactly the stand-down re-declaration", len(refreshes))
+	}
+	if keys := shimKeysIn(t, refreshes[0]); len(keys) != 1 || keys["sessionShimSupported"] != false {
+		t.Fatalf("re-declaration presented %#v, want exactly sessionShimSupported=false: %s", keys, refreshes[0])
+	}
+	if got := h.daemon.credentials.SessionShimAttestation(); !got.StandsDown() {
+		t.Fatalf("credential lane attestation after the stand-down = %#v, want the stand-down", got)
+	}
+
+	// The control plane forgets the worker, so the lane falls through to a
+	// full re-registration with the options it now holds.
+	before := len(h.registrations())
+	h.forgetWorker()
+	if _, err := h.daemon.credentials.Refresh(ctx, "worker-not-found"); err != nil {
+		t.Fatalf("a stood-down daemon could not re-register: %v", err)
+	}
+	registrations := h.registrations()
+	if len(registrations) != before+1 {
+		t.Fatalf("re-registrations = %d, want exactly 1", len(registrations)-before)
+	}
+	var request RegisterRequest
+	if err := json.Unmarshal(registrations[before], &request); err != nil {
+		t.Fatalf("decode re-registration: %v", err)
+	}
+	if !request.SessionShimHostAttestation.StandsDown() {
+		t.Fatalf("re-registration presented %#v, want the stand-down", request.SessionShimHostAttestation)
+	}
+	if request.Capacity <= 0 {
+		t.Fatalf("re-registration capacity = %d, want the host's real capacity, not auth-only", request.Capacity)
+	}
+}
+
 // TestStartupFoundingRefusalClassifierCoversTheRegistrationLeg pins the new
 // carrier: a refused startup founding registration classifies as a retryable
 // founding refusal — never the batch refusal — while every status that is not
@@ -533,6 +611,46 @@ func TestHealthyFirstHeartbeatFenceStillClosesTheClaimGate(t *testing.T) {
 			t.Fatal("the claim gate opened behind a live first-heartbeat fence")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestRefusedFirstHeartbeatLeavesNoFenceForTheNextOrg pins the claim-gate half
+// on the sequence that really produces an orphaned fence, not on planted state:
+// a deferred install's boot adoption raises its scope's first-heartbeat fence,
+// the platform refuses that first projected heartbeat, and a DIFFERENT org then
+// founds the composition. The refused scope's fence must not survive the
+// rollback, and once the new founder's first beat is acknowledged the
+// host-wide claim gate is open. Without either reconciliation the refused
+// scope's fence kept the gate closed for every scope, with no heartbeat left
+// that could clear it.
+func TestRefusedFirstHeartbeatLeavesNoFenceForTheNextOrg(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	h.setRefuseFirstProjectedHeartbeat(true)
+	first := h.composedConfig(acceptingBatch)
+	var refused *SessionShimFoundingRefused
+	if err := h.daemon.InstallSessionShimComposition(ctx, first); !errors.As(err, &refused) {
+		t.Fatalf("refused first-heartbeat install error = %v, want a founding refusal", err)
+	}
+	h.daemon.shims.mu.RLock()
+	leftover := len(h.daemon.shims.pendingHeartbeatAcks)
+	h.daemon.shims.mu.RUnlock()
+	if leftover != 0 {
+		t.Fatalf("the refused install left %d first-heartbeat fence(s) behind", leftover)
+	}
+
+	second := h.composedConfig(acceptingBatch)
+	second.OrgID = "org-second-composition"
+	second.ControllerID = "controller-second-org"
+	second.AttestationCapabilities = append([]string(nil), first.AttestationCapabilities...)
+	if err := h.daemon.InstallSessionShimComposition(ctx, second); err != nil {
+		t.Fatalf("a refused first heartbeat blocked another org: %v", err)
+	}
+	if suspended, reason := h.daemon.PollClaimGate()(); suspended {
+		t.Fatalf("the claim gate stayed closed after another org founded and was acknowledged: %s", reason)
 	}
 }
 

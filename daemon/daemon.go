@@ -1544,8 +1544,19 @@ func (d *Daemon) Start(ctx context.Context) error {
 					// project — so the beats below attest a host that does not
 					// do durable sessions.
 					d.heartbeat.SetSessionShimProjection(nil, nil)
-					d.heartbeat.Start()
 					d.standDownSessionShimAfterRefusedStartupFounding()
+					// Unlike a refused founding registration, this founder's
+					// registration was ACCEPTED: the control plane records the
+					// host as composed, and the shared credential lane was built
+					// presenting that attestation. Withdraw it on the wire, the
+					// way a failed deferred install that had already declared
+					// does. Otherwise the next refresh re-presents the refused
+					// founder, a full re-registration mints an auth-only identity
+					// for a composition this host abandoned, and the beats below
+					// are silence from a host the control plane believes is
+					// composed.
+					d.redeclareSessionShimStandDown(ctx, d.SessionShimHostAttestation())
+					d.heartbeat.Start()
 				} else {
 					return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
 				}

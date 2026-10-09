@@ -391,7 +391,12 @@ func (r *CredentialRefresher) DeclareSessionShim(
 	defer r.releaseOperation()
 	r.mu.Lock()
 	previous := cloneSessionShimHostAttestation(r.opts.Registration.SessionShim)
+	previousAuthOnly := r.opts.Registration.AuthOnly
 	r.opts.Registration.SessionShim = cloneSessionShimHostAttestation(attestation)
+	// Auth-only registration rides on a composed attestation, and Register
+	// refuses it without one. A declared stand-down drops it, or a later full
+	// re-registration could not mint a replacement identity at all.
+	r.opts.Registration.AuthOnly = previousAuthOnly && attestation.enabled()
 	r.mu.Unlock()
 
 	r.mu.Lock()
@@ -415,6 +420,7 @@ func (r *CredentialRefresher) DeclareSessionShim(
 	if err != nil {
 		r.mu.Lock()
 		r.opts.Registration.SessionShim = previous
+		r.opts.Registration.AuthOnly = previousAuthOnly
 		r.mu.Unlock()
 		return nil, err
 	}
