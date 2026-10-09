@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -76,6 +77,14 @@ const (
 	// needs without out-of-band state.
 	stopHookStdinFile = "claim-stdin.json"
 
+	// stopHookTranscriptFile is the durable transcript locator: the hook's
+	// latest stdin, kept verbatim on every fire whether or not a notice was
+	// claimed. Consumed's claim receipt answers the delivery question; this
+	// file answers the session question (which transcript is mine) so a
+	// session that ends with nothing outstanding still has its usage source
+	// at exit. The hook parses nothing — Go reads transcript_path out of it.
+	stopHookTranscriptFile = "last-stdin.json"
+
 	// stopHookScriptFile is the POSIX script the CLI invokes.
 	stopHookScriptFile = "stop-hook.sh"
 
@@ -95,6 +104,10 @@ type stopHookChannel struct {
 	dir string
 
 	mu sync.Mutex
+	// transcriptsMu guards transcripts on its own: the usage tailer notes
+	// paths while a notice operation may hold mu, and exitUsage reads them
+	// while holding mu.
+	transcriptsMu sync.Mutex
 	// text is the outstanding offer's message body, empty when nothing is
 	// outstanding.
 	text string
@@ -106,6 +119,17 @@ type stopHookChannel struct {
 	// and credited. It only ever advances, which is what stops a repeated
 	// message from acking itself against the record of its predecessor.
 	scanned int64
+	// snapshotPath pins the session's transcript path in memory once the
+	// drop directory is about to be removed (see snapshotTranscriptPath).
+	snapshotPath string
+	// transcripts is every distinct transcript path the hook has named this
+	// session, in first-seen order. Clearing the conversation moves the
+	// session to a new transcript, so the exit totals sum all of them.
+	transcripts []string
+	// createdAt is when the channel — and so the session — began. Transcript
+	// lines stamped earlier belong to a conversation this session resumed,
+	// not to this session's spend.
+	createdAt time.Time
 }
 
 // Compile-time assertion: the drop implements the pull seam the runner drives.
@@ -124,7 +148,7 @@ func newStopHookChannel() (*stopHookChannel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stop-hook channel: create drop dir: %w", err)
 	}
-	c := &stopHookChannel{dir: dir}
+	c := &stopHookChannel{dir: dir, createdAt: time.Now()}
 	script := stopHookScript(dir)
 	if err := os.WriteFile(c.path(stopHookScriptFile), []byte(script), 0o700); err != nil { //nolint:gosec // the hook is executed by the CLI; it is owner-only
 		_ = os.RemoveAll(dir)
@@ -237,6 +261,11 @@ func (c *stopHookChannel) Retract() (bool, error) {
 // the conversation. Only the second fact is consumption. A claim receipt with
 // no transcript record is precisely the discarded-output case the CLI reports
 // nowhere else, and it must read as NOT delivered.
+//
+// Every hook fire refreshes the durable transcript locator (see
+// stopHookTranscriptFile): the transcript path is session state, not just
+// delivery evidence, so a session that ends with no notice outstanding still
+// knows which file its usage accounting reads at exit.
 func (c *stopHookChannel) Consumed() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -268,7 +297,94 @@ func (c *stopHookChannel) Consumed() (bool, error) {
 // ok is false while the hook has not fired for this offer yet, which is the
 // ordinary waiting state and not an error.
 func (c *stopHookChannel) claimedTranscriptPath() (string, bool, error) {
-	b, err := os.ReadFile(c.path(stopHookStdinFile))
+	return transcriptPathFromStdinFile(c.path(stopHookStdinFile))
+}
+
+// transcriptPath returns the session's durable transcript locator: the
+// transcript_path from the latest hook stdin, kept on every fire whether or
+// not a notice was claimed. ok is false while the hook has never fired, in
+// which case the session has no transcript to account. It is what the exit
+// usage accounting reads.
+func (c *stopHookChannel) transcriptPath() (string, bool, error) {
+	path, ok, err := transcriptPathFromStdinFile(c.path(stopHookTranscriptFile))
+	if err == nil && ok {
+		c.noteTranscript(path)
+	}
+	return path, ok, err
+}
+
+// noteTranscript records a transcript path the hook named, once.
+func (c *stopHookChannel) noteTranscript(path string) {
+	c.transcriptsMu.Lock()
+	defer c.transcriptsMu.Unlock()
+	for _, seen := range c.transcripts {
+		if seen == path {
+			return
+		}
+	}
+	c.transcripts = append(c.transcripts, path)
+}
+
+// namedTranscripts returns every transcript path the hook has named.
+func (c *stopHookChannel) namedTranscripts() []string {
+	c.transcriptsMu.Lock()
+	defer c.transcriptsMu.Unlock()
+	return append([]string(nil), c.transcripts...)
+}
+
+// snapshotTranscriptPath pins the session's transcript path in memory. The
+// drop directory is removed by the session cleanup before the terminal event
+// is emitted, so a locator read at exit would find nothing; the path itself
+// is stable for the session's life, so pinning it early keeps the exit
+// accounting able to read the transcript file (which survives the cleanup).
+// Called from the session cleanup, which runs before the terminal event.
+func (c *stopHookChannel) snapshotTranscriptPath() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshotPath != "" {
+		return
+	}
+	path, ok, err := c.transcriptPath()
+	if err != nil || !ok {
+		return
+	}
+	c.snapshotPath = path
+}
+
+// exitUsage sums the session's token totals from every transcript it named,
+// with the subagent transcripts beside each, deduplicated by message id so
+// repeated content blocks, re-reads and copies count once, and counting only
+// lines stamped after the session began (see transcript_usage.go). The
+// pinned snapshot path stands in for the locator once the drop is gone (the
+// terminal event fires after the session cleanup). A session whose hook never
+// fired — or whose transcript never materialized — reports no usage, never an
+// error; a transcript that cannot be trusted reports an error, so the
+// session's usage reads as unreported.
+func (c *stopHookChannel) exitUsage() (agent.CostData, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshotPath == "" {
+		if _, _, err := c.transcriptPath(); err != nil {
+			return agent.CostData{}, err
+		}
+	}
+	paths := c.namedTranscripts()
+	if len(paths) == 0 {
+		return agent.CostData{}, nil
+	}
+	sum := newTranscriptUsageSum(c.createdAt)
+	for _, path := range paths {
+		if err := sum.addTranscript(path); err != nil {
+			return agent.CostData{}, err
+		}
+	}
+	return sum.result()
+}
+
+// transcriptPathFromStdinFile reads transcript_path out of one verbatim hook
+// stdin file. ok is false when the file does not exist yet.
+func transcriptPathFromStdinFile(path string) (string, bool, error) {
+	b, err := os.ReadFile(path) //nolint:gosec // path is the harness's own drop dir
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return "", false, nil
@@ -397,6 +513,14 @@ func transcriptContentText(raw json.RawMessage) string {
 // bakes the absolute paths in, so the hook needs no environment: hook processes
 // inherit whatever the CLI hands them, and a channel that depends on a variable
 // surviving that is a channel that fails silently on the day it does not.
+//
+// The hook keeps the transcript locator on EVERY fire, before the claim
+// branch: transcript_path arrives on stdin whether or not a notice is
+// outstanding, and the session's usage accounting needs it in exactly the
+// case the claim never happens. The locator write is best-effort — a failure
+// leaves the previous locator in place and never affects the claim — and it
+// rides a temp-file rename so a concurrent reader never sees a half-written
+// path.
 func stopHookScript(dir string) string {
 	d := shellQuote(dir)
 	return `#!/bin/sh
@@ -410,6 +534,12 @@ set -u
 d=` + d + `
 tmp="$d/claim-stdin.$$.tmp"
 cat > "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 0; }
+# Durable transcript locator: the latest stdin, kept verbatim on every fire
+# whether or not a notice is claimed, so the session knows its transcript at
+# exit even when the claim never happens. It parses nothing — Go reads
+# transcript_path out of it. Best-effort and never affecting the claim: a
+# failed copy leaves the previous locator in place.
+cp "$tmp" "$d/` + stopHookTranscriptFile + `" 2>/dev/null || true
 if mv "$d/` + stopHookPendingFile + `" "$d/` + stopHookClaimedFile + `" 2>/dev/null; then
   mv "$tmp" "$d/` + stopHookStdinFile + `" 2>/dev/null
   cat "$d/` + stopHookClaimedFile + `"

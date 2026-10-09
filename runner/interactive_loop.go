@@ -478,7 +478,15 @@ func (r *Runner) dispatchInteractive(
 		case <-isess.Done():
 			// Child exited and the PTY drained to EOF (Exit emitted). Deliver
 			// the handle's trailing activity before the session-ended marker.
-			r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink, usage)
+			// The drain carries a harness-accounted terminal cost onto the
+			// result when it sees one; only when the terminal has not
+			// arrived yet — and the channel is still open, so it still can
+			// — is the bounded wait below needed. The transcript-tail
+			// totals fill res.Cost in finishInteractive only when no
+			// harness-accounted cost landed (applyTo never overwrites).
+			if sawTerminal, alive := r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink, res, usage); !sawTerminal && alive {
+				r.applyInteractiveTerminalCost(handleEvents, res)
+			}
 			return r.finishInteractive(worktreePath, qw, res, sink, isess, usage), nil
 
 		case <-interactiveCtx.Done():
@@ -514,6 +522,12 @@ func (r *Runner) dispatchInteractive(
 			// transcript content, so only the quota hook observes
 			// them here.
 			r.reportQuotaEvent(interactiveCtx, qw.SessionID, event)
+			// A harness-accounted terminal cost lands on the session
+			// result wherever the terminal is observed — the supervisor
+			// may consume it before the exit drain runs.
+			if result, terminal := event.(agent.ResultEvent); terminal && result.Cost != nil {
+				res.Cost = result.Cost
+			}
 			r.forwardInteractiveHandleEvent(interactiveCtx, worktreePath, sink, event, usage)
 
 		case err := <-attachDone:
@@ -669,6 +683,13 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 // buffered without waiting. events may be nil (already closed). Per-turn
 // usage is metered into usage alongside the forwarding, exactly as in the
 // live supervisor loop; a nil usage only forwards.
+// It reports whether the drain observed the handle's terminal ResultEvent,
+// and whether the events channel is still open. The terminal is a lifecycle
+// event, not activity, so it is never forwarded — but the drain is the one
+// place that sees every event, which makes it the one place that can carry
+// a harness-accounted terminal cost onto the session result (see
+// applyInteractiveTerminalCost). A closed channel means nothing more can
+// arrive, so the caller skips the terminal wait entirely.
 func (r *Runner) drainInteractiveActivity(
 	ctx context.Context,
 	handle agent.Handle,
@@ -676,8 +697,20 @@ func (r *Runner) drainInteractiveActivity(
 	worktreePath string,
 	qw QueuedWork,
 	sink activitySink,
+	res *Result,
 	usage *interactiveUsageTotals,
-) {
+) (sawTerminal, alive bool) {
+	observe := func(event agent.Event) {
+		r.reportQuotaEvent(ctx, qw.SessionID, event)
+		if result, terminal := event.(agent.ResultEvent); terminal {
+			sawTerminal = true
+			if result.Cost != nil {
+				res.Cost = result.Cost
+			}
+			return
+		}
+		r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event, usage)
+	}
 	if flusher, ok := handle.(agent.InteractiveActivityFlusher); ok {
 		grace := time.NewTimer(interactiveActivityFlushGrace)
 		defer grace.Stop()
@@ -686,10 +719,12 @@ func (r *Runner) drainInteractiveActivity(
 			select {
 			case event, ok := <-events:
 				if !ok {
-					return
+					return sawTerminal, false
 				}
-				r.reportQuotaEvent(ctx, qw.SessionID, event)
-				r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event, usage)
+				observe(event)
+				if sawTerminal {
+					return true, true
+				}
 			case <-flusher.ActivityFlushed():
 				break wait
 			case <-grace.C:
@@ -703,11 +738,57 @@ func (r *Runner) drainInteractiveActivity(
 		select {
 		case event, ok := <-events:
 			if !ok {
+				return sawTerminal, false
+			}
+			observe(event)
+			if sawTerminal {
+				return true, true
+			}
+		default:
+			return sawTerminal, true
+		}
+	}
+}
+
+// interactiveTerminalCostGrace bounds the wait for the handle's terminal
+// ResultEvent after the PTY session is Done. The wait only runs when the
+// terminal was not observed on the supervisor loop or in the exit drain and
+// the events channel is still open — i.e. the terminal is in flight behind
+// Done (every handle emits it once the child has exited and drained). One
+// second is ample for that handoff; a handle that never sends one finishes
+// without a harness-accounted cost rather than stalling session end.
+const interactiveTerminalCostGrace = time.Second
+
+// applyInteractiveTerminalCost carries a cost-bearing terminal ResultEvent
+// from the handle onto the session result. Interactive PTY sessions
+// historically ended with no cost — the terminal event described only the
+// exit — so harnesses that account their own transcript (reading it at exit,
+// after the child is gone) report the session totals on that event. A handle
+// that emits no terminal event, or one without a cost, leaves the result
+// untouched: no usage is reported, never a failure.
+func (r *Runner) applyInteractiveTerminalCost(events <-chan agent.Event, res *Result) {
+	if events == nil {
+		// The supervisor already consumed the handle's events to their
+		// close: any terminal cost was captured where it was observed.
+		return
+	}
+	grace := time.NewTimer(interactiveTerminalCostGrace)
+	defer grace.Stop()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
 				return
 			}
-			r.reportQuotaEvent(ctx, qw.SessionID, event)
-			r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event, usage)
-		default:
+			if result, terminal := event.(agent.ResultEvent); terminal {
+				if result.Cost != nil {
+					res.Cost = result.Cost
+				}
+				return
+			}
+		case <-grace.C:
+			r.logger.Warn("[interactive] handle sent no terminal event within the grace — finishing without a harness-accounted cost",
+				"sessionId", res.SessionID, "grace", interactiveTerminalCostGrace)
 			return
 		}
 	}

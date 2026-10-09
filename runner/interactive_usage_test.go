@@ -9,6 +9,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/runtime/stepheartbeat"
 )
 
@@ -420,5 +421,42 @@ func TestStepHeartbeatUsage_ReadsTheSessionLanesMeter(t *testing.T) {
 	if got, want := r.stepHeartbeatUsage(headless, enforcer)(context.Background()),
 		(stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 30, TotalCostUsd: 0.01}); got != want {
 		t.Errorf("headless beat usage = %+v; want the enforcer's meter %+v", got, want)
+	}
+}
+
+// TestInteractive_HarnessAccountedCostWinsOverLiveTranscriptTotals pins how
+// the two interactive usage sources compose: a harness that reads its own
+// transcript at exit puts the session totals on its terminal ResultEvent,
+// while its live per-turn events also feed the transcript-tail meter. The
+// terminal report carries the harness-accounted totals — never the live
+// sum, and never the two added together.
+func TestInteractive_HarnessAccountedCostWinsOverLiveTranscriptTotals(t *testing.T) {
+	requireSh(t)
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	r := minimalRunner(t)
+	sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", "exit 0"}})
+	if err != nil {
+		t.Fatalf("ptyhost.Spawn: %v", err)
+	}
+	accounted := &agent.CostData{InputTokens: 900, OutputTokens: 90, CachedInputTokens: 9000, NumTurns: 3}
+	events := make(chan agent.Event, 4)
+	events <- agent.InitEvent{}
+	events <- agent.LlmCallEvent{InputTokens: 100, OutputTokens: 10, UsageSource: agent.LlmUsageProvider, TurnCompleted: true}
+	events <- agent.ResultEvent{Success: true, Cost: accounted}
+	close(events)
+	h := &costTerminalHandle{interactivePTYHandle: newInteractivePTYHandle(sess), events: events}
+
+	qw := QueuedWork{}
+	qw.SessionID = "harness-accounted"
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+	if err != nil || out.Status != "completed" {
+		t.Fatalf("dispatchInteractive = status %q err %v; want completed", out.Status, err)
+	}
+	if out.Cost == nil || *out.Cost != *accounted {
+		t.Fatalf("Cost = %+v; want the harness-accounted totals %+v", out.Cost, *accounted)
 	}
 }
