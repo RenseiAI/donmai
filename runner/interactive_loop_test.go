@@ -1836,3 +1836,42 @@ func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
 		t.Fatalf("unreadable warning count=%d; want 2 after recovery and recurrence\nlogs:\n%s", got, logs.String())
 	}
 }
+
+// TestInteractive_SlowExitAccountingStillReachesTheSessionResult pins the
+// wait for a terminal that is in flight behind Done: a harness that sums its
+// own transcripts at exit sends the terminal only once that read finishes,
+// and a long session's read takes seconds. The cost still lands on the
+// session result instead of the session finishing costless.
+func TestInteractive_SlowExitAccountingStillReachesTheSessionResult(t *testing.T) {
+	requireSh(t)
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	r := minimalRunner(t)
+	sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", "exit 0"}})
+	if err != nil {
+		t.Fatalf("ptyhost.Spawn: %v", err)
+	}
+	accounted := &agent.CostData{InputTokens: 400, OutputTokens: 40, NumTurns: 2}
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{}
+	go func() {
+		<-sess.Done()
+		time.Sleep(2 * time.Second) // the exit read of a long session
+		events <- agent.ResultEvent{Success: true, Cost: accounted}
+		close(events)
+	}()
+	h := &costTerminalHandle{interactivePTYHandle: newInteractivePTYHandle(sess), events: events}
+
+	qw := QueuedWork{}
+	qw.SessionID = "slow-exit-accounting"
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+	if err != nil || out.Status != "completed" {
+		t.Fatalf("dispatchInteractive = status %q err %v; want completed", out.Status, err)
+	}
+	if out.Cost == nil || *out.Cost != *accounted {
+		t.Fatalf("Cost = %+v; want the harness-accounted totals %+v", out.Cost, *accounted)
+	}
+}
