@@ -54,3 +54,31 @@ func TestProcessGroupMemberCountSkipsZombies(t *testing.T) {
 		t.Fatalf("processGroupHasLiveMember(zombie-only group) = (%v,%v), want (false,nil)", live, err)
 	}
 }
+
+// TestProcessGroupMemberCountNeverTurnsAReadErrorIntoGone pins the darwin
+// count's error handling: only an empty answer or ESRCH proves a group has no
+// member. Any other sysctl failure is unproved, so the reap proof it feeds can
+// never claim a group gone that it failed to read.
+func TestProcessGroupMemberCountNeverTurnsAReadErrorIntoGone(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		err     error
+		wantErr bool
+	}{
+		{"empty answer", nil, false},
+		{"no such group", unix.ESRCH, false},
+		{"invalid argument", unix.EINVAL, true},
+		{"io error", unix.EIO, true},
+		{"no such sysctl", unix.ENOENT, true},
+	} {
+		live, err := liveGroupMember(4242, nil, tc.err)
+		if live {
+			t.Fatalf("%s: liveGroupMember reported a live member from an empty answer", tc.name)
+		}
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: liveGroupMember error = %v, want error %v", tc.name, err, tc.wantErr)
+		}
+	}
+}
