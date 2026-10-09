@@ -127,6 +127,11 @@ type RepoKeeper struct {
 	entries  map[string]*repoKeeperEntry
 	inflight map[string]int
 	events   []RepoKeeperEvent
+	// reconcilePrePersist is a test-only rendezvous invoked between the
+	// catalog publish and the catalog persist in Reconcile. It lets the
+	// race test park Reconcile inside the publish→persist window while a
+	// concurrent Acquire hammers the entry map. Nil in production.
+	reconcilePrePersist func()
 }
 
 // NewRepoKeeper constructs a keeper rooted at root. A nil scope resolves to
@@ -202,6 +207,9 @@ func (k *RepoKeeper) Reconcile(ctx context.Context) error {
 	// releasing the lock between publish and persist races. A persist
 	// failure leaves the keeper not-ready; callers degrade until the next
 	// successful reconcile.
+	if k.reconcilePrePersist != nil {
+		k.reconcilePrePersist()
+	}
 	if err := k.persistCatalogLocked(); err != nil {
 		k.ready = false
 		return err
