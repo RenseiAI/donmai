@@ -65,8 +65,11 @@
 //  2. Go-side adjudication + handshake (policy.go, extension.go, handle.go):
 //     policy.go is the codex approval.go engine generalized — built-in
 //     safety-deny regexes first, then path containment (writes/edits outside
-//     Spec.Cwd denied unless an AllowPattern covers them; reads outside cwd
-//     denied by default for autonomous sessions), then Spec allow/deny patterns
+//     Spec.Cwd and the declared mutable repositories denied unless an
+//     AllowPattern covers them; reads outside them and outside the declared
+//     read-only repositories denied by default for autonomous sessions; a
+//     write to a declared read-only repository or to the workarea root's own
+//     entries denied whatever the patterns say), then Spec allow/deny patterns
 //     in the Claude grammar, then DefaultDecision. At session_start the
 //     extension sends a handshake carrying a per-session secret TOKEN (read
 //     from the DONMAI_PI_HANDSHAKE env var the harness set on the child) AND
@@ -98,7 +101,10 @@
 // (Options.RequireConfinement / DONMAI_PI_CONFINEMENT=required) or the
 // session declares a repository authority, the provider spawns pi inside the
 // executor confinement of ADR-2026-10-03-executor-os-confinement.md,
-// headless and interactive alike (confinement.go). The host can also confine
+// headless and interactive alike (confinement.go). Because every declared
+// session needs that confinement, pi's workarea attestation is published
+// and bound only on a host whose confinement self-test passes
+// (Provider.ProveWorkareaHost). The host can also confine
 // a confined seat's reads (Options.ConfinementReadScope /
 // DONMAI_PI_CONFINEMENT_READ=workarea): file contents and directory listings
 // outside the session's workarea, the runtime and toolchain paths, pi's own

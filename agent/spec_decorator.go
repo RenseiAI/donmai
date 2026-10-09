@@ -161,3 +161,15 @@ func (d decoratedHarnessProvider) Spawn(ctx context.Context, spec Spec) (Handle,
 func (d decoratedHarnessProvider) Resume(ctx context.Context, sessionID string, spec Spec) (Handle, error) {
 	return d.HarnessProvider.Resume(ctx, sessionID, decorateSpec(spec, d.decorate))
 }
+
+// ProveWorkareaHost forwards the wrapped harness's workarea host proof, so
+// decorating a provider never withholds an attestation its host proved.
+// A wrapped harness with no proof to run reports
+// ErrWorkareaHostProofUnavailable, which ProvenWorkareaAttestation reads
+// only when the manifest needs a proof.
+func (d decoratedHarnessProvider) ProveWorkareaHost(ctx context.Context) error {
+	if prover, ok := d.HarnessProvider.(WorkareaHostProver); ok {
+		return prover.ProveWorkareaHost(ctx)
+	}
+	return ErrWorkareaHostProofUnavailable
+}

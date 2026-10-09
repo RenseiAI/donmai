@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -166,6 +167,21 @@ var networkReaching = regexp.MustCompile(`(?i)\b(curl|wget|nc|ncat|ssh|scp|rsync
 type PolicyEngine struct {
 	autonomous bool
 	cwd        string
+	// writableRoots are the roots file ops are contained to: the session
+	// working directory plus, under a declared repository authority, every
+	// declared mutable repository path. Reads and writes inside any of them
+	// pass containment, so the agent's own file tools work in each writable
+	// repository, not only the selected one.
+	writableRoots []string
+	// readOnlyRoots are the declared read-only repository paths. Reads
+	// inside them pass containment in every session (a read-only
+	// repository exists to be read); mutation is denied even when an allow
+	// pattern covers the path (Evaluate step 2b).
+	readOnlyRoots []string
+	// workareaRoot is the declared session root. A mutation inside it but
+	// outside every writable root (its reserved metadata, a stray file
+	// beside the leaves) is denied like a read-only path.
+	workareaRoot string
 	// stateRoot is the session's relocated harness state root
 	// (sessionStateRoot). The state-dir guard protects it alongside the
 	// legacy in-checkout directory.
@@ -209,6 +225,7 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 		disallowedTools: parseToolPatterns(spec.DisallowedTools),
 		defaultAllow:    true,
 	}
+	e.writableRoots, e.readOnlyRoots, e.workareaRoot = authorityRoots(spec)
 	if cfg := spec.PermissionConfig; cfg != nil {
 		e.allowRegexes = compilePatterns(cfg.AllowPatterns)
 		e.denyRegexes = compilePatterns(cfg.DisallowPatterns)
@@ -226,10 +243,15 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 //
 // Order (fail-closed at every step):
 //  1. Built-in safety deny (bash only; cannot be overridden by any config).
-//  2. Path containment (mutating ops outside cwd; reads outside cwd for
-//     autonomous sessions) — checked BEFORE allow patterns so an allow cannot
-//     grant an out-of-tree write it did not resolve a path for. An explicit
-//     PermissionConfig AllowPattern covering the resolved path re-permits it.
+//  2. Path containment (mutating ops outside the writable roots — cwd plus
+//     every declared mutable repository; reads outside them and outside the
+//     declared read-only repositories for autonomous sessions) — checked
+//     BEFORE allow patterns so an allow cannot grant an out-of-tree write it
+//     did not resolve a path for. An explicit PermissionConfig AllowPattern
+//     covering the resolved path re-permits it, except:
+//     2b. a mutation inside a declared read-only repository, or inside the
+//     declared workarea root outside every writable root, is denied
+//     regardless of allow patterns.
 //  3. Spec.DisallowedTools tool-pattern match ⇒ deny.
 //  4. PermissionConfig DisallowPatterns regex match ⇒ deny.
 //  5. Spec.AllowedTools / PermissionConfig AllowPatterns ⇒ allow-gate: when
@@ -266,6 +288,15 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 			if !e.matchesAllowRegex(subject) {
 				return Decision{Allow: false, Reason: reason}
 			}
+		}
+	}
+
+	// 2b. The declared repository authority is stronger than an allow
+	// pattern: no pattern re-permits a mutation of a read-only repository
+	// or of the workarea root's own entries.
+	if call.Path != "" && isMutatingKind(call.Kind) {
+		if reason := e.readOnlyMutationReason(call); reason != "" {
+			return Decision{Allow: false, Reason: reason}
 		}
 	}
 
@@ -325,15 +356,16 @@ func (c ToolCall) subject() string {
 }
 
 // checkContainment enforces the worktree boundary. Returns contained=false
-// with a reason when the path escapes cwd (mutating ops always; reads only in
-// autonomous sessions — an interactive user may legitimately read outside).
+// with a reason when the path escapes every writable root — the session cwd
+// and, under a declared repository authority, each declared mutable
+// repository — for mutating ops always, and for reads only in autonomous
+// sessions (an interactive user may legitimately read outside), where a
+// read inside a declared read-only repository is contained too.
 func (e *PolicyEngine) checkContainment(call ToolCall) (reason string, contained bool) {
 	if e.cwd == "" {
 		return "", true
 	}
 	clean := filepath.Clean(call.Path)
-	root := filepath.Clean(e.cwd)
-	inside := clean == root || strings.HasPrefix(clean+string(filepath.Separator), root+string(filepath.Separator))
 
 	// .git mutation is always denied regardless of containment.
 	if isMutatingKind(call.Kind) {
@@ -343,17 +375,85 @@ func (e *PolicyEngine) checkContainment(call ToolCall) (reason string, contained
 		}
 	}
 
-	if inside {
+	if insideAnyRoot(clean, e.writableRoots) {
 		return "", true
 	}
 	switch {
 	case isMutatingKind(call.Kind):
 		return "file write/edit outside the worktree blocked: " + clean, false
 	case isReadKind(call.Kind) && e.autonomous:
+		if insideAnyRoot(clean, e.readOnlyRoots) {
+			return "", true
+		}
 		return "file read outside the worktree denied for autonomous session: " + clean, false
 	default:
 		return "", true
 	}
+}
+
+// readOnlyMutationReason denies a mutating call inside a declared read-only
+// repository, or inside the declared workarea root but outside every
+// writable root. Empty when the call is not such a mutation.
+func (e *PolicyEngine) readOnlyMutationReason(call ToolCall) string {
+	clean := filepath.Clean(call.Path)
+	if insideAnyRoot(clean, e.writableRoots) {
+		return ""
+	}
+	if insideAnyRoot(clean, e.readOnlyRoots) {
+		return "file write/edit inside a read-only repository blocked: " + clean
+	}
+	if e.workareaRoot != "" && insidePath(clean, e.workareaRoot) {
+		return "file write/edit in the workarea root outside its mutable repositories blocked: " + clean
+	}
+	return ""
+}
+
+// authorityRoots resolves the containment roots from the spec: the writable
+// roots (the cwd first, then every declared mutable repository path), the
+// declared read-only repository paths, and the declared workarea root, all
+// cleaned and deduplicated. Without a declared repository authority the
+// writable roots are the cwd alone and the other two are empty.
+func authorityRoots(spec agent.Spec) (writable, readOnly []string, workareaRoot string) {
+	add := func(list []string, path string) []string {
+		if strings.TrimSpace(path) == "" {
+			return list
+		}
+		clean := filepath.Clean(path)
+		if slices.Contains(list, clean) {
+			return list
+		}
+		return append(list, clean)
+	}
+	writable = add(writable, spec.Cwd)
+	authority := spec.RepositoryAuthority
+	if authority == nil {
+		return writable, nil, ""
+	}
+	for _, path := range authority.MutablePaths {
+		writable = add(writable, path)
+	}
+	for _, path := range authority.ReadOnlyPaths {
+		readOnly = add(readOnly, path)
+	}
+	if strings.TrimSpace(authority.WorkareaRoot) != "" {
+		workareaRoot = filepath.Clean(authority.WorkareaRoot)
+	}
+	return writable, readOnly, workareaRoot
+}
+
+// insideAnyRoot reports whether clean sits at or under one of roots.
+func insideAnyRoot(clean string, roots []string) bool {
+	for _, root := range roots {
+		if insidePath(clean, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// insidePath reports whether clean sits at or under root.
+func insidePath(clean, root string) bool {
+	return clean == root || strings.HasPrefix(clean+string(filepath.Separator), root+string(filepath.Separator))
 }
 
 func (e *PolicyEngine) matchesAllowRegex(subject string) bool {

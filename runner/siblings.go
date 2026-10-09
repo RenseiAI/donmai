@@ -126,18 +126,16 @@ func siblingContextEligible(qw QueuedWork) bool {
 }
 
 // executorAttestsSiblingContext reports whether provider can hold a declared
-// read-only context leaf: it attests the session-root-v1 workarea protocol and
-// isolated-read-only-v1 enforcement.
+// read-only context leaf on this host: it attests the session-root-v1
+// workarea protocol and isolated-read-only-v1 enforcement, host proof
+// included (provenWorkareaAttestation). Where the proof fails, sibling
+// context keeps its legacy placement and stays never-fatal.
 func executorAttestsSiblingContext(provider agent.Provider) bool {
-	harness, ok := provider.(agent.HarnessProvider)
-	if !ok {
+	attestation := provenWorkareaAttestation(provider)
+	if workarea.RepositoryAuthorityEnforcement(attestation.Enforcement) != workarea.RepositoryAuthorityIsolatedReadOnlyV1 {
 		return false
 	}
-	caps := harness.Manifest().Caps
-	if workarea.RepositoryAuthorityEnforcement(caps.RepositoryAuthorityEnforcement) != workarea.RepositoryAuthorityIsolatedReadOnlyV1 {
-		return false
-	}
-	for _, protocol := range caps.MultiRepositoryWorkareaProtocols {
+	for _, protocol := range attestation.Protocols {
 		if workarea.Protocol(protocol) == workarea.ProtocolSessionRootV1 {
 			return true
 		}

@@ -14,44 +14,6 @@ import (
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
-// declaredRepositoryPiManifestForTest is a SYNTHETIC manifest: it mirrors
-// piManifestForTest (resolved_profile_reconcile_test.go) but additionally
-// attests the session-root-v1 multi-repository workarea protocol pi's
-// actually-shipped manifest does NOT declare — at v0.72.8 (this file's base
-// commit), grep confirms `MultiRepositoryWorkareaProtocols` is set ONLY by
-// provider/harness/codex/manifest.go; provider/harness/pi/manifest.go never
-// sets it. That means a REAL pi session carrying a RepositoryDeclaration
-// would fail workarea.ExecutorWorkareaCapabilities.ValidateFor
-// (runtime/workarea/declaration.go, ReasonProtocolUnsupported) inside
-// resolveRepositoryWorkarea BEFORE ever reaching the sandbox override this
-// file's fix reconciles — a "protocol unsupported" refusal, not the
-// "tool/lifecycle application differs" text the reported production
-// incident showed.
-//
-// This test proves the RECONCILIATION LOGIC is correct for any harness that
-// DOES declare the protocol (codex, today) and exercises it against pi's
-// manifest only because the original incident report named pi and this
-// file's test names/fixtures (piReceiptCell, piManifestForTest,
-// resolved_profile_reconcile_test.go's sibling test) already existed for
-// it — it does NOT prove pi's production manifest can reach this code
-// path. Whether the reported pi incident's exact failing authority field
-// is this file's fix, a version/manifest mismatch, or something else
-// entirely is UNPROVEN — see this repo's PR description for the disclosed
-// gap. The bounded, redacting shim-child log capture
-// (session_shim_spawn.go) added alongside this fix is what will capture
-// the ACTUAL failing field directly from a live pi session on its next
-// occurrence, closing that gap without guessing here.
-//
-// Do not "fix" this by adding MultiRepositoryWorkareaProtocols to pi's real
-// manifest just to make this test's premise true — that is a capability
-// grant with its own review (workarea protocol + authority-enforcement
-// attestation, ADR-scoped), not a side effect of a test fixture.
-func declaredRepositoryPiManifestForTest() agent.HarnessManifest {
-	manifest := piManifestForTest()
-	manifest.Caps.MultiRepositoryWorkareaProtocols = []string{string(workarea.ProtocolSessionRootV1)}
-	return manifest
-}
-
 // TestPreflightAndSpawnAgreeForHumanControlledPiWithDeclaredRepository
 // reproduces the production defect this file's sibling function
 // (ReconcileRepositorySandbox, repository_sandbox_reconcile.go) fixes: a
@@ -79,16 +41,14 @@ func declaredRepositoryPiManifestForTest() agent.HarnessManifest {
 // lane makes immediately before provider.Spawn — reproduces the real
 // byte-for-byte Spec without provisioning a worktree.
 //
-// IMPORTANT — the manifest below is SYNTHETIC: pi's real, shipped manifest
-// does not declare the multi-repository workarea protocol this scenario
-// needs (see declaredRepositoryPiManifestForTest's doc comment). This test
-// proves ReconcileRepositorySandbox's reconciliation is correct for any
-// harness that DOES declare it; it does not prove the reported pi incident
-// actually reaches this exact code path.
+// The manifest below is pi's REAL, unmutated manifest: pi attests the
+// session-root-v1 protocol this scenario needs, so this test proves
+// ReconcileRepositorySandbox's reconciliation against the production premise
+// a real pi session reaches — the same standing as the codex counterpart.
 func TestPreflightAndSpawnAgreeForHumanControlledPiWithDeclaredRepository(t *testing.T) {
 	provider := &selectorFakeProvider{name: agent.ProviderPi, harness: agent.HarnessPi}
 	providerWithManifest := &manifestSelectorProvider{
-		selectorFakeProvider: provider, manifest: declaredRepositoryPiManifestForTest(), capabilities: piCapabilitiesForTest(),
+		selectorFakeProvider: provider, manifest: piManifestForTest(), capabilities: piCapabilitiesForTest(),
 	}
 	registry := NewRegistry()
 	if err := registry.Register(providerWithManifest); err != nil {
@@ -247,16 +207,13 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithDeclaredRepository(t *tes
 	})
 }
 
-// TestPreflightAndSpawnAgreeForHumanControlledCodexWithDeclaredRepository is
-// the NON-synthetic counterpart to the pi-based test above: it drives the
-// exact same reconciliation scenario through codex's REAL, unmutated
-// manifest (codexManifestForTest / codexCapabilitiesForTest,
-// executioncell_adaptation_test.go) — codex is the one harness that
-// genuinely declares MultiRepositoryWorkareaProtocols at this file's base
-// commit (provider/harness/codex/manifest.go). Where the pi-based test
-// above proves the reconciliation logic is correct in principle, this test
-// proves it is correct against a real, currently-shipped harness capable of
-// reaching this code path in production today.
+// TestPreflightAndSpawnAgreeForHumanControlledCodexWithDeclaredRepository
+// drives the exact same reconciliation scenario through codex's REAL,
+// unmutated manifest (codexManifestForTest / codexCapabilitiesForTest,
+// executioncell_adaptation_test.go) — codex and pi both attest the
+// session-root-v1 protocol (provider/harness/codex/manifest.go,
+// provider/harness/pi/manifest.go), and this test pins the reconciliation
+// against codex's production premise alongside the pi-based test above.
 func TestPreflightAndSpawnAgreeForHumanControlledCodexWithDeclaredRepository(t *testing.T) {
 	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
 	providerWithManifest := &manifestSelectorProvider{

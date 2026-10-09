@@ -969,6 +969,11 @@ type manifestSelectorProvider struct {
 
 func (p *manifestSelectorProvider) Manifest() agent.HarnessManifest { return p.manifest }
 
+// ProveWorkareaHost stands for a host whose workarea proof passed: this fake
+// carries a real manifest's attestation, and a manifest that needs a host
+// proof (pi's) would otherwise be withheld before the lane under test.
+func (*manifestSelectorProvider) ProveWorkareaHost(context.Context) error { return nil }
+
 // Capabilities must come from the same harness the manifest describes: spec
 // translation reads them to decide whether tool policy travels as a flat
 // allow-list or through the approval bridge, and a mismatch denies on the tool

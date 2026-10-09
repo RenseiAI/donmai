@@ -747,9 +747,12 @@ func (v *ProviderView) Capabilities(name string) (map[string]any, bool) {
 }
 
 // WorkareaExecutorCapabilities returns exact harness-scoped attestations for
-// registration. Only positive protocol declarations are emitted; zero-value
+// registration. Only positive protocol attestations are emitted; zero-value
 // harnesses remain registrable for the legacy singular path without being
-// mistaken for session-root-v1 executors.
+// mistaken for session-root-v1 executors. A harness whose manifest needs a
+// host proof is attested only when its proof passes on this host
+// (provenWorkareaAttestation): a host that cannot hold the boundary
+// publishes nothing for that harness, so declared work routes elsewhere.
 func (v *ProviderView) WorkareaExecutorCapabilities() []workarea.ExecutorCapabilityAttestation {
 	if v == nil || v.reg == nil {
 		return nil
@@ -768,8 +771,12 @@ func (v *ProviderView) WorkareaExecutorCapabilities() []workarea.ExecutorCapabil
 		if len(manifest.Caps.MultiRepositoryWorkareaProtocols) == 0 {
 			continue
 		}
-		protocols := make([]workarea.Protocol, 0, len(manifest.Caps.MultiRepositoryWorkareaProtocols))
-		for _, protocol := range manifest.Caps.MultiRepositoryWorkareaProtocols {
+		attestation := provenWorkareaAttestation(harness)
+		if len(attestation.Protocols) == 0 {
+			continue
+		}
+		protocols := make([]workarea.Protocol, 0, len(attestation.Protocols))
+		for _, protocol := range attestation.Protocols {
 			protocols = append(protocols, workarea.Protocol(protocol))
 		}
 		modeSet := make(map[string]struct{}, len(manifest.PromptDelivery))
@@ -791,10 +798,10 @@ func (v *ProviderView) WorkareaExecutorCapabilities() []workarea.ExecutorCapabil
 		attestations = append(attestations, workarea.ExecutorCapabilityAttestation{
 			HarnessID: string(manifest.Name), AdapterVersion: manifest.ContractABI,
 			ManifestDigest: manifestDigest, SessionModes: modes,
-			SupportsReadOnlySelectedCWD: manifest.Caps.SupportsReadOnlySelectedCWD,
+			SupportsReadOnlySelectedCWD: attestation.ReadOnlySelectedCWD,
 			ExecutorWorkareaCapabilities: workarea.ExecutorWorkareaCapabilities{
 				MultiRepositoryWorkareaProtocols: protocols,
-				RepositoryAuthorityEnforcement:   workarea.RepositoryAuthorityEnforcement(manifest.Caps.RepositoryAuthorityEnforcement),
+				RepositoryAuthorityEnforcement:   workarea.RepositoryAuthorityEnforcement(attestation.Enforcement),
 			},
 		})
 	}

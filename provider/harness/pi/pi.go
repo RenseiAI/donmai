@@ -657,6 +657,31 @@ func (p *Provider) confinerForSession(ctx context.Context, spec agent.Spec) (*co
 	return ensurePiConfiner(ctx, p.binary, p.hostConfinementDirs(), []string{probe})
 }
 
+// ProveWorkareaHost implements agent.WorkareaHostProver: pi's workarea
+// attestation (manifest.go) holds on this host only while the executor
+// confinement every declared pi session runs inside passes its self-test
+// here. It runs the same self-test a confined spawn runs, through the same
+// production binding and caches (ensurePiConfiner: in memory per host
+// directories and pi binary digest, on disk per backend, probe set, pi
+// binary, worker executable and host directories), so a pass at
+// registration is reused by the spawn and a host that cannot confine pi —
+// no backend, a failed probe, or a process already inside an outer sandbox
+// profile (nested_sandbox) — attests nothing. It never confines anything
+// itself and never caches a failure.
+func (p *Provider) ProveWorkareaHost(ctx context.Context) error {
+	if p.opts.skipProcess {
+		return fmt.Errorf("pi workarea host proof: a process-less provider spawns nothing to confine")
+	}
+	probe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("pi workarea host proof: probe executable: %w", err)
+	}
+	if _, err := ensurePiConfiner(ctx, p.binary, p.hostConfinementDirs(), []string{probe}); err != nil {
+		return fmt.Errorf("pi workarea host proof: %w", err)
+	}
+	return nil
+}
+
 // hostConfinementDirs returns the confiner's host directories: the test
 // seam's when set, else the host's own.
 func (p *Provider) hostConfinementDirs() piConfinementDirs {
@@ -681,15 +706,14 @@ func (p *Provider) confineSession(spec agent.Spec, layout sessionLayout, confine
 // piConfinementEnabled reports whether the session requested OS confinement
 // (ADR-2026-10-03 D5.1): the host's own configuration requires it for pi
 // (hostRequires — Options.RequireConfinement), or the session declares a
-// repository authority, whose read-only leaves need the executor boundary.
-// Confinement applies exactly when requested, never opportunistically, so
-// the answer does not depend on whether this host has a backend: a request
-// on a host without one is refused, not dropped (ensurePiConfiner).
-//
-// Today pi's manifest declares no multi-repository workarea protocol, so
-// admission refuses an authority-bearing spec before launch; the host
-// requirement is the trigger a pi session reaches in production. The
-// authority branch is kept for the day the manifest declares one.
+// repository authority. Every declared session requests it, all-mutable
+// ones included: its leaves enter the executor boundary as the writable
+// set and the read-only set. Confinement applies exactly when requested,
+// never opportunistically, so the answer does not depend on whether this
+// host has a backend: a request on a host without one is refused, not
+// dropped (ensurePiConfiner). That is why the manifest's workarea
+// attestation is published and bound only where ProveWorkareaHost passes:
+// a host that would refuse every declared spawn never advertises one.
 func piConfinementEnabled(spec agent.Spec, hostRequires bool) bool {
 	if hostRequires {
 		return true
