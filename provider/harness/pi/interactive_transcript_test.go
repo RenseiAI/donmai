@@ -622,3 +622,92 @@ func TestInteractiveTranscriptTail_ImpossibleTokenCountsMapToRefused(t *testing.
 		t.Errorf("in-range counts = output %d cacheWrite %d; want 10 and %d", llm.OutputTokens, llm.CacheWriteTokens, int64(transcriptTokenLimit))
 	}
 }
+
+// TestInteractiveTranscriptTail_RefusesPathSwappedAfterWalk pins that the
+// tail reads only the regular file the walk found inside the state dir.
+// The state dir is writable from inside the session, so between the walk
+// and the open a transcript (or the directory holding it) can be swapped
+// for a symbolic link to another session's transcript outside it; the open
+// would follow the link and that session's text and usage would be read as
+// this session's. Each swap is driven between the walk (pendingFiles) and
+// the read (tail), the window a sweep leaves.
+func TestInteractiveTranscriptTail_RefusesPathSwappedAfterWalk(t *testing.T) {
+	t.Parallel()
+	outsideLine := transcriptMessage("other-1", map[string]any{
+		"role":    "assistant",
+		"content": []any{map[string]any{"type": "text", "text": "another session's text"}},
+		"usage":   map[string]any{"input": 7777, "output": 1},
+	})
+	tests := []struct {
+		name string
+		// layout writes this session's transcript and returns its path.
+		layout func(t *testing.T, state string) string
+		// swap replaces the walked path with a link to outside.
+		swap func(t *testing.T, state, walked, outside string)
+	}{
+		{
+			name: "transcript swapped for a link",
+			layout: func(_ *testing.T, state string) string {
+				return filepath.Join(state, "mine.jsonl")
+			},
+			swap: func(t *testing.T, _, walked, outside string) {
+				if err := os.Remove(walked); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(outside, "mine.jsonl"), walked); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "directory above the transcript swapped for a link",
+			layout: func(t *testing.T, state string) string {
+				if err := os.MkdirAll(filepath.Join(state, "sessions"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return filepath.Join(state, "sessions", "mine.jsonl")
+			},
+			swap: func(t *testing.T, state, _, outside string) {
+				if err := os.Rename(filepath.Join(state, "sessions"), filepath.Join(state, "moved")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, filepath.Join(state, "sessions")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			state := filepath.Join(root, "state")
+			outside := filepath.Join(root, "outside")
+			for _, dir := range []string{state, outside} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeTranscriptLine(t, filepath.Join(outside, "mine.jsonl"), outsideLine)
+			tailer := newInteractiveTranscriptTailer(state)
+			mine := tc.layout(t, state)
+			writeTranscriptLine(t, mine, map[string]any{"type": "session", "id": "s"})
+
+			files, _ := tailer.pendingFiles()
+			if len(files) != 1 || files[0].path != mine {
+				t.Fatalf("walk found %+v; want only %s", files, mine)
+			}
+			tc.swap(t, state, mine, outside)
+
+			var events []agent.Event
+			st := &interactiveTranscriptFile{}
+			st.tail(files[0].path, files[0].info, func(line []byte) bool {
+				events = append(events, mapInteractiveTranscriptLine(line, tailer.seen)...)
+				return true
+			})
+			if len(events) != 0 || st.offset != 0 {
+				t.Fatalf("tail read %d events (offset %d) through the swapped path; want nothing read", len(events), st.offset)
+			}
+		})
+	}
+}

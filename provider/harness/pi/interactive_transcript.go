@@ -174,27 +174,35 @@ func (t *interactiveTranscriptTailer) sweep() (events []agent.Event, more bool) 
 		events = append(events, mapInteractiveTranscriptLine(line, t.seen)...)
 		return true
 	}
-	paths, morePaths := t.pendingFiles()
-	for _, path := range paths {
-		st := t.files[path]
+	files, morePaths := t.pendingFiles()
+	for _, file := range files {
+		st := t.files[file.path]
 		if st == nil {
 			st = &interactiveTranscriptFile{}
-			t.files[path] = st
+			t.files[file.path] = st
 		}
-		if st.tail(path, accept) {
+		if st.tail(file.path, file.info, accept) {
 			more = true
 		}
 	}
 	return events, more || morePaths
 }
 
+// pendingTranscript is one transcript the walk found with unread bytes, and
+// the file the walk saw at that path (a regular file inside the state dir).
+type pendingTranscript struct {
+	path string
+	info os.FileInfo
+}
+
 // pendingFiles returns this session's transcripts that have unread bytes,
 // newest modification first, capped at interactiveTranscriptMaxFilesPerSweep
 // (more reports that the cap left some for a later sweep). Baseline files
 // are never candidates.
-func (t *interactiveTranscriptTailer) pendingFiles() (paths []string, more bool) {
+func (t *interactiveTranscriptTailer) pendingFiles() (files []pendingTranscript, more bool) {
 	type candidate struct {
 		path    string
+		info    os.FileInfo
 		modTime time.Time
 	}
 	var candidates []candidate
@@ -213,7 +221,7 @@ func (t *interactiveTranscriptTailer) pendingFiles() (paths []string, more bool)
 		if info.Size() == offset {
 			return
 		}
-		candidates = append(candidates, candidate{path: path, modTime: info.ModTime()})
+		candidates = append(candidates, candidate{path: path, info: info, modTime: info.ModTime()})
 	})
 	sort.Slice(candidates, func(i, j int) bool {
 		if !candidates[i].modTime.Equal(candidates[j].modTime) {
@@ -225,11 +233,11 @@ func (t *interactiveTranscriptTailer) pendingFiles() (paths []string, more bool)
 		candidates = candidates[:interactiveTranscriptMaxFilesPerSweep]
 		more = true
 	}
-	paths = make([]string, 0, len(candidates))
+	files = make([]pendingTranscript, 0, len(candidates))
 	for _, c := range candidates {
-		paths = append(paths, c.path)
+		files = append(files, pendingTranscript{path: c.path, info: c.info})
 	}
-	return paths, more
+	return files, more
 }
 
 // walkInteractiveTranscriptFiles calls fn for every .jsonl file under dir,
@@ -265,15 +273,21 @@ func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.Di
 // is skipped through its newline. tail also reports stopped=true when the
 // read window filled, since more bytes may follow. Best-effort: any IO
 // failure consumes nothing.
-func (st *interactiveTranscriptFile) tail(path string, accept func([]byte) bool) (stopped bool) {
-	//nolint:gosec // G304: path is discovered by walking the session's own state dir.
+//
+// seen is the file the walk found at path. The state dir is writable from
+// inside the session, so between the walk and the open the path (or a
+// directory above it) can be swapped for a symbolic link to a file outside
+// the state dir, which the open would follow. tail reads only when the
+// opened file is that same regular file; anything else consumes nothing.
+func (st *interactiveTranscriptFile) tail(path string, seen os.FileInfo, accept func([]byte) bool) (stopped bool) {
+	//nolint:gosec // G304: path is discovered by walking the session's own state dir; the opened file is checked against the walked one below.
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
-	if err != nil {
+	if err != nil || !info.Mode().IsRegular() || seen == nil || !os.SameFile(seen, info) {
 		return false
 	}
 	if info.Size() < st.offset {
