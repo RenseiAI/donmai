@@ -259,3 +259,43 @@ func TestStandaloneOutboxSendsThroughRegisteredReceiver(t *testing.T) {
 		t.Fatalf("resolved=%q err=%v", resolved, err)
 	}
 }
+
+func TestSaveStandaloneOutboxRejectsInvalidSaveSpec(t *testing.T) {
+	t.Parallel()
+	store, clock := standaloneOutboxStore(t)
+	session := "11111111-1111-4111-8111-111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"failed"}`)
+	deadline := clock.now.Add(MaximumLeaseDuration)
+	valid := standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, deadline)
+
+	cases := []struct {
+		name   string
+		mutate func(*StandaloneOutboxSaveSpec)
+	}{
+		{"empty session", func(s *StandaloneOutboxSaveSpec) { s.SessionID = "" }},
+		{"non-UUID session", func(s *StandaloneOutboxSaveSpec) { s.SessionID = "owner-session" }},
+		{"empty body", func(s *StandaloneOutboxSaveSpec) { s.Body = nil }},
+		{"zero deadline", func(s *StandaloneOutboxSaveSpec) { s.DeadlineAt = time.Time{} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			spec := valid
+			tc.mutate(&spec)
+			if _, err := store.SaveStandaloneOutbox(context.Background(), spec); err == nil {
+				t.Fatal("invalid save spec was accepted")
+			}
+		})
+	}
+
+	// None of the refused saves left a record behind: the authority holds
+	// no standalone outbox envelopes at all.
+	envelopes, err := store.listStandaloneOutbox()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envelopes) != 0 {
+		t.Fatalf("refused saves left %d records behind", len(envelopes))
+	}
+}

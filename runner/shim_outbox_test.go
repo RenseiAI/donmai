@@ -291,3 +291,91 @@ func TestShimSeatPersistsFailedTerminalStatus(t *testing.T) {
 		t.Fatalf("persisted status=%v, want failed", envelope["status"])
 	}
 }
+
+// TestShimSeatPersistsStoppedTerminalStatus covers the third terminal status
+// through the production Run entry point with the standalone outbox enabled:
+// an interview-mode seat whose run context is cancelled ends "stopped", and
+// that terminal body must be persisted before the (refused) first send like
+// every other non-empty terminal status. No runner path produces a
+// "cancelled" result today — the receiver vocabulary accepts it, and the
+// persist guard is status-agnostic (`res.Status != ""`) — so the stopped
+// path is the reachable third status proving the block is not gated to
+// completed/failed.
+func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	var startedOnce atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, "/lock-refresh") {
+			if startedOnce.CompareAndSwap(false, true) {
+				close(started)
+			}
+			_, _ = w.Write([]byte(`{"refreshed":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := shimSeatRunner(t, manager, poster)
+	queued := QueuedWork{QueuedWork: queuedWorkBase("SHIM-OUTBOX-STOPPED"), WorkerID: "worker", PlatformURL: srv.URL, ResolvedProfile: ResolvedProfile{
+		Provider:       agent.ProviderStub,
+		ProviderConfig: map[string]any{"stub.behavior": string(stub.BehaviorHangThenTimeout)},
+	}}
+	queued.SessionID = runnerLeaseSessionID
+	queued.Repository = bareRepo
+	queued.Mode = "interview"
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	type runResult struct {
+		res *Result
+		err error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		res, runErr := r.Run(runCtx, queued)
+		done <- runResult{res: res, err: runErr}
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(30 * time.Second):
+		cancel()
+		t.Fatal("Run did not reach lock refresh before cancellation")
+	}
+	var got runResult
+	select {
+	case got = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if got.res == nil || got.res.Status != "stopped" {
+		t.Fatalf("result=%+v err=%v, want stopped", got.res, got.err)
+	}
+	loaded, err := manager.LoadStandaloneTerminalOutbox(context.Background(), queued.SessionID, 1)
+	if err != nil {
+		t.Fatalf("stopped body not persisted: %v", err)
+	}
+	retained, _ := loaded.Record.Body()
+	var envelope map[string]any
+	if err := json.Unmarshal(retained, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope["status"] != "stopped" {
+		t.Fatalf("persisted status=%v, want stopped", envelope["status"])
+	}
+	if loaded.Record.DeliveryState != workarea.TerminalStatusPending {
+		t.Fatalf("delivery=%q, want pending", loaded.Record.DeliveryState)
+	}
+}

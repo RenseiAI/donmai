@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/result"
 )
 
 // TestPrepareWorkerExitedWithoutResultBody pins the fallback record body: a
@@ -37,8 +36,11 @@ func TestPrepareWorkerExitedWithoutResultBody(t *testing.T) {
 	if body["workerId"] != "worker-9" {
 		t.Fatalf("workerId=%v, want worker-9", body["workerId"])
 	}
-	if body["failureMode"] != result.WorkerExitedWithoutResultFailureMode {
-		t.Fatalf("failureMode=%v, want %q", body["failureMode"], result.WorkerExitedWithoutResultFailureMode)
+	// The wire string is asserted literally, not through the production
+	// constant: the platform routes this exact value, so a rename or typo
+	// in the constant must fail this test rather than move with it.
+	if body["failureMode"] != "worker_exited_without_result" {
+		t.Fatalf("failureMode=%v, want %q", body["failureMode"], "worker_exited_without_result")
 	}
 	if body["summary"] == nil || body["summary"] == "" {
 		t.Fatal("fallback body carries no human summary")
@@ -62,8 +64,8 @@ func TestPrepareWorkerExitedWithoutResultBody(t *testing.T) {
 func TestFallbackBodySendsThroughPreparedOutcome(t *testing.T) {
 	t.Parallel()
 	srv, state := captureServer(t,
-		func(attempt int) (int, string) { return 200, `{"ok":true}` },
-		func(attempt int) (int, string) { return 200, `{"ok":true}` },
+		func(_ int) (int, string) { return 200, `{"ok":true}` },
+		func(_ int) (int, string) { return 200, `{"ok":true}` },
 	)
 	p := newPoster(t, srv.URL, 0)
 	fallback, err := p.PrepareWorkerExitedWithoutResultBody("sess-fallback", "worker-9", nil)
