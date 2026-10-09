@@ -75,10 +75,13 @@ func New(stateDir, worktreeRoot string, logf func(format string, args ...any)) (
 //
 // source is the clone URL; the directory key is its canonicalization, so a
 // URL that differs only by embedded userinfo, query, or fragment addresses
-// the same mirror. scope is the opaque credential-scope name; the empty
+// the same mirror. The clone fetches that canonical remote (plus only the
+// source's userinfo), never a query or fragment the identity drops, and a
+// URL-shaped source that does not parse is refused. scope is the opaque
+// credential-scope name; the empty
 // scope is the host-wide default. Neither value is written to the log.
 func (s *Store) Ensure(ctx context.Context, source, scope string) (string, error) {
-	canonical, remoteDigest, err := CanonicalRemote(source)
+	canonical, cloneURL, remoteDigest, err := resolveSource(source)
 	if err != nil {
 		return "", err
 	}
@@ -122,7 +125,10 @@ func (s *Store) Ensure(ctx context.Context, source, scope string) (string, error
 	if err := chmodPath(tmp, 0o700); err != nil {
 		return "", err
 	}
-	if _, err := runGit(ctx, localGitEnv(), "clone", "--mirror", "--", source, tmp); err != nil {
+	// cloneURL fetches exactly the repository the identity records, and the
+	// empty --template keeps the daemon user's template directory (which
+	// may carry executable hooks) out of the mirror.
+	if _, err := runGit(ctx, localGitEnv(), "clone", "--mirror", "--template=", "--", cloneURL, tmp); err != nil {
 		return "", fmt.Errorf("repo keeper: clone mirror: %w", err)
 	}
 	if err := s.hardenMirror(tmp, canonical); err != nil {
@@ -174,7 +180,7 @@ func (s *Store) verifyMirror(mirrorDir, digest, canonical, scope string) error {
 	if err != nil || bound != digest {
 		return fmt.Errorf("%w: mirror identity digest does not match its directory", ErrOriginMismatch)
 	}
-	out, err := runGit(ctxBackground(), localGitEnv(), "--git-dir", mirrorDir, "remote", "get-url", "origin")
+	out, err := runGit(ctxBackground(), mirrorOnlyGitEnv(), "--git-dir", mirrorDir, "remote", "get-url", "origin")
 	if err != nil {
 		return fmt.Errorf("%w: read existing mirror origin", ErrOriginMismatch)
 	}
@@ -279,6 +285,16 @@ func ctxBackground() context.Context {
 func localGitEnv() []string {
 	base := credentials.Filter(os.Environ())
 	return gitexec.HardenedEnv(base, true, gitexec.Auth{})
+}
+
+// mirrorOnlyGitEnv is localGitEnv without the system and global git
+// config, for reads that judge the mirror's own state. `remote get-url`
+// expands url.<base>.insteadOf, so an operator's ambient rewrite (such as
+// https to ssh) would otherwise make a freshly published mirror fail its
+// own origin check. A rewrite planted in the mirror's config is still
+// expanded, and still fails closed.
+func mirrorOnlyGitEnv() []string {
+	return append(localGitEnv(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
 }
 
 // runGit runs git with an explicit argv (never a shell) and an explicitly

@@ -12,22 +12,44 @@ import (
 // keeper keys mirrors on: URL userinfo, query, and fragment are removed
 // before hashing, so a credential embedded in the URL can neither change
 // the mirror directory nor reach the catalog. Non-URL sources (scp-style
-// remotes, local paths) hash verbatim. An empty source is an error.
+// remotes, local paths) hash verbatim. An empty source, or a URL-shaped
+// source that does not parse, is an error.
 func CanonicalRemote(source string) (canonical string, digest string, err error) {
+	canonical, _, digest, err = resolveSource(source)
+	return canonical, digest, err
+}
+
+// resolveSource derives, from one parse, both the canonical remote the
+// mirror records and the exact URL the clone fetches. The clone URL is the
+// canonical remote plus only its userinfo, so what the clone reads is what
+// the identity names: git treats a file:// (or ssh://) query or fragment as
+// part of the path, so cloning the raw source could fetch another
+// repository than the one the canonical remote records. A URL-shaped
+// source that does not parse fails closed, because its verbatim form may
+// still carry userinfo that would otherwise reach the sidecar, the
+// persisted origin, and the directory key. Neither value is echoed in an
+// error.
+func resolveSource(source string) (canonical, cloneURL, digest string, err error) {
 	trimmed := strings.TrimSpace(source)
 	if trimmed == "" {
-		return "", "", fmt.Errorf("repo keeper: repository source is empty")
+		return "", "", "", fmt.Errorf("repo keeper: repository source is empty")
 	}
-	canonical = trimmed
-	if parsed, parseErr := url.Parse(trimmed); parseErr == nil && parsed.Scheme != "" {
-		parsed.User = nil
+	canonical, cloneURL = trimmed, trimmed
+	parsed, parseErr := url.Parse(trimmed)
+	switch {
+	case parseErr == nil && parsed.Scheme != "":
 		parsed.RawQuery = ""
 		parsed.ForceQuery = false
 		parsed.Fragment = ""
+		parsed.RawFragment = ""
+		cloneURL = parsed.String()
+		parsed.User = nil
 		canonical = parsed.String()
+	case strings.Contains(trimmed, "://"):
+		return "", "", "", fmt.Errorf("repo keeper: repository source is not a well-formed URL")
 	}
 	sum := sha256.Sum256([]byte(canonical))
-	return canonical, "sha256:" + hex.EncodeToString(sum[:]), nil
+	return canonical, cloneURL, "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 // ScopeDigest binds one opaque credential-scope name to a short,

@@ -628,3 +628,172 @@ func TestNewAcceptsSameFilesystemLayout(t *testing.T) {
 		t.Error("New(relative state dir) error = nil, want an error")
 	}
 }
+
+// newNamedSourceRepo creates a one-commit repository named name under
+// parent whose commit subject is subject, so a test can tell which
+// repository a mirror actually holds.
+func newNamedSourceRepo(t *testing.T, parent, name, subject string) {
+	t.Helper()
+	dir := filepath.Join(parent, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("create fixture repo dir: %v", err)
+	}
+	runGitT(t, dir, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte(subject), 0o600); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+	runGitT(t, dir, "add", "f")
+	runGitT(t, dir, "commit", "-q", "-m", subject)
+}
+
+// TestEnsureClonesTheRemoteItsIdentityRecords drives the production entry
+// point with sources whose query or fragment git reads as part of a file://
+// path. The identity drops both, so the clone must too: otherwise the
+// mirror recorded for one remote holds another repository's content, and
+// every later Ensure for the genuine remote is served it.
+func TestEnsureClonesTheRemoteItsIdentityRecords(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	newNamedSourceRepo(t, parent, "repo", "genuine")
+	newNamedSourceRepo(t, parent, "repo?x", "query-named")
+	newNamedSourceRepo(t, parent, "repo#y", "fragment-named")
+	genuine := "file://" + parent + "/repo"
+
+	tests := []struct {
+		name    string
+		crafted string
+	}{
+		{name: "query", crafted: genuine + "?x"},
+		{name: "fragment", crafted: genuine + "#y"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := newTestStore(t)
+			if _, err := store.Ensure(context.Background(), tt.crafted, "scope-a"); err != nil {
+				t.Fatalf("Ensure(crafted) error = %v", err)
+			}
+			dir, err := store.Ensure(context.Background(), genuine, "scope-a")
+			if err != nil {
+				t.Fatalf("Ensure(genuine) error = %v", err)
+			}
+			if got := runGitT(t, dir, "log", "-1", "--format=%s", "main"); got != "genuine" {
+				t.Errorf("mirror recorded for the genuine remote holds %q, want %q", got, "genuine")
+			}
+		})
+	}
+}
+
+// TestEnsureRefusesUnparseableURLSource drives the production entry point
+// with a URL-shaped source that url.Parse rejects but git still clones. Its
+// verbatim form keeps the userinfo, so it must be refused before anything
+// is written rather than persisted as the canonical remote.
+func TestEnsureRefusesUnparseableURLSource(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	newNamedSourceRepo(t, parent, "repo%zz", "percent-named")
+	const secret = "s3cr3t-token-ABC123"
+	source := "file://user:" + secret + "@localhost" + parent + "/repo%zz"
+	store := newTestStore(t)
+
+	_, err := store.Ensure(context.Background(), source, "")
+	if err == nil {
+		t.Fatal("Ensure(unparseable URL source) error = nil, want a refusal")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("refusal error = %q, must not echo the source", err.Error())
+	}
+	var leaked []string
+	_ = filepath.Walk(store.stateDir, func(sweepPath string, info os.FileInfo, err error) error { //nolint:gosec // G122: secret sweep over the test's own TempDir; no writes.
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(sweepPath) //nolint:gosec // G304: files enumerated from the test's own TempDir walk.
+		if err == nil && strings.Contains(string(data), secret) {
+			leaked = append(leaked, sweepPath)
+		}
+		return nil
+	})
+	if len(leaked) > 0 {
+		t.Errorf("credential persisted under the state dir: %v", leaked)
+	}
+}
+
+// TestEnsureIgnoresAmbientGitConfig drives the production entry point under
+// a global git config of the kind a developer host carries. A template
+// directory must not seed hooks into the mirror, and an insteadOf rewrite
+// of the remote must not make the store refuse its own fresh mirror. These
+// cases set process environment, so they do not run in parallel.
+func TestEnsureIgnoresAmbientGitConfig(t *testing.T) {
+	srcDir, sha := newSourceRepo(t)
+	templateDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(templateDir, "hooks"), 0o700); err != nil {
+		t.Fatalf("create template hooks dir: %v", err)
+	}
+	//nolint:gosec // G306: the fixture hook must be executable to prove it is not copied.
+	if err := os.WriteFile(filepath.Join(templateDir, "hooks", "reference-transaction"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write template hook: %v", err)
+	}
+	const rewritten = "https://forge.invalid/org/repo.git"
+
+	tests := []struct {
+		name   string
+		config string
+		source string
+	}{
+		{
+			name:   "template directory with an executable hook",
+			config: "[init]\n\ttemplateDir = " + templateDir + "\n",
+			source: srcDir,
+		},
+		{
+			name:   "insteadOf rewrite of the remote",
+			config: "[url \"file://" + srcDir + "\"]\n\tinsteadOf = " + rewritten + "\n",
+			source: rewritten,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+			if err := os.WriteFile(globalConfig, []byte(tt.config), 0o600); err != nil {
+				t.Fatalf("write global config: %v", err)
+			}
+			t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+			store := newTestStore(t)
+
+			dir, err := store.Ensure(context.Background(), tt.source, "")
+			if err != nil {
+				t.Fatalf("Ensure() error = %v", err)
+			}
+			if _, err := store.Ensure(context.Background(), tt.source, ""); err != nil {
+				t.Fatalf("second Ensure() error = %v", err)
+			}
+			if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
+				t.Errorf("cat-file output = %q, want empty on success", got)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "hooks", "reference-transaction")); !os.IsNotExist(err) {
+				t.Errorf("mirror carries the template hook (err = %v)", err)
+			}
+		})
+	}
+}
+
+// TestEnsureMirrorLocalInsteadOfFailsClosed pins the other half of the
+// ambient-config rule: a rewrite planted in the mirror's own config
+// re-points its live origin, and must still fail closed.
+func TestEnsureMirrorLocalInsteadOfFailsClosed(t *testing.T) {
+	t.Parallel()
+	srcA, _ := newSourceRepo(t)
+	srcB, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	dirB, err := store.Ensure(context.Background(), srcB, "")
+	if err != nil {
+		t.Fatalf("Ensure(srcB) error = %v", err)
+	}
+	runGitT(t, dirB, "config", "url."+srcA+".insteadOf", srcB)
+
+	if _, err := store.Ensure(context.Background(), srcB, ""); !errors.Is(err, ErrOriginMismatch) {
+		t.Fatalf("Ensure(srcB with a mirror-local rewrite) error = %v, want ErrOriginMismatch", err)
+	}
+}
