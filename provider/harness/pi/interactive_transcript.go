@@ -385,13 +385,15 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 		}
 		if msg.Usage != nil {
 			out = append(out, agent.LlmCallEvent{
-				System:          msg.Provider,
-				Model:           msg.Model,
-				InputTokens:     int64(msg.Usage.Input),
-				OutputTokens:    int64(msg.Usage.Output),
-				UsageSource:     agent.LlmUsageProvider,
-				ObservedCostUsd: transcriptCost(msg.Usage.Cost.Total),
-				TurnCompleted:   true,
+				System:            msg.Provider,
+				Model:             msg.Model,
+				InputTokens:       int64(msg.Usage.Input),
+				OutputTokens:      int64(msg.Usage.Output),
+				CachedInputTokens: int64(msg.Usage.CacheRead),
+				CacheWriteTokens:  int64(msg.Usage.CacheWrite),
+				UsageSource:       agent.LlmUsageProvider,
+				ObservedCostUsd:   transcriptCost(msg.Usage.Cost.Total),
+				TurnCompleted:     true,
 			})
 		}
 		return out
@@ -420,7 +422,9 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 // content parts carry {"type":"text","text"} or
 // {"type":"toolCall","id","name","arguments"}; tool results arrive as
 // role:"toolResult" with text content parts; per-turn usage rides the
-// assistant message.
+// assistant message in pi's own usage shape ({input, output, cacheRead,
+// cacheWrite}, with input already excluding both cache buckets — the same
+// shape the headless turn_end mapper reads).
 type interactiveTranscriptMessage struct {
 	Role    string `json:"role"`
 	Content []struct {
@@ -436,9 +440,11 @@ type interactiveTranscriptMessage struct {
 	Provider   string `json:"provider"`
 	Model      string `json:"model"`
 	Usage      *struct {
-		Input  float64 `json:"input"`
-		Output float64 `json:"output"`
-		Cost   struct {
+		Input      float64 `json:"input"`
+		Output     float64 `json:"output"`
+		CacheRead  float64 `json:"cacheRead"`
+		CacheWrite float64 `json:"cacheWrite"`
+		Cost       struct {
 			Total *float64 `json:"total"`
 		} `json:"cost"`
 	} `json:"usage"`

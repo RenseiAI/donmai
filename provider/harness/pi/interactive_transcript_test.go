@@ -57,7 +57,7 @@ func TestInteractiveTranscriptTailSweep_MapsTurnsToolsAndResultsInOrder(t *testi
 			map[string]any{"type": "toolCall", "id": "call-2", "name": "read", "arguments": map[string]any{"path": "f"}},
 		},
 		"provider": "anthropic", "model": "m",
-		"usage": map[string]any{"input": 10, "output": 20, "cost": map[string]any{"total": 0.01}},
+		"usage": map[string]any{"input": 10, "output": 20, "cacheRead": 48000, "cacheWrite": 512, "cost": map[string]any{"total": 0.01}},
 	}))
 	writeTranscriptLine(t, path, transcriptMessage("m-res1", map[string]any{
 		"role": "toolResult", "toolCallId": "call-1", "toolName": "bash",
@@ -91,6 +91,9 @@ func TestInteractiveTranscriptTailSweep_MapsTurnsToolsAndResultsInOrder(t *testi
 	llm := events[3].(agent.LlmCallEvent)
 	if llm.InputTokens != 10 || llm.OutputTokens != 20 || !llm.TurnCompleted {
 		t.Errorf("llm call = %+v", llm)
+	}
+	if llm.CachedInputTokens != 48000 || llm.CacheWriteTokens != 512 {
+		t.Errorf("llm cache buckets = read %d write %d; want read 48000 write 512", llm.CachedInputTokens, llm.CacheWriteTokens)
 	}
 	if llm.ObservedCostUsd == nil || *llm.ObservedCostUsd != 0.01 {
 		t.Errorf("llm cost = %+v", llm.ObservedCostUsd)
