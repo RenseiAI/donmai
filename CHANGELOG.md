@@ -8,7 +8,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- `host watch` is redesigned. Every session card has the same width and height (issue and title, project and work type, model and harness, state with elapsed time plus turns and cost when reported, and the last activity), so columns align at any terminal width; unreported values read unknown, never zero. Selection keeps the selected card in place, the header shows the host's occupied and total session slots, and enter opens a detail pane with the session's full identity, freshness and paths (esc returns to the stream). Data that existed but showed as missing is now filled in: tail catch-up reads every session each tick, a quiet run's last activity comes from its journal, elapsed time falls back to the admission time, and the session list carries the issue identifier.
+- The session shim splits into a transport-neutral core with a headless profile: a headless entry supervises an already-running runner process with no PTY, its records carry workload `headless` at schema 2 while interactive records stay byte-identical, and its tombstone records the headless exit. The launch contract's process epoch now advances past prior incarnations, and a start whose record publish fails returns instead of waiting on a serve loop that never started.
+- The conformance suite gains a history-loaded resume check, and the generated matrix a computed resume qualification per harvested adapter version.
+
+### Fixes
+
+- `host watch` scoped to the current repository shows its sessions again: clone URLs (HTTPS or SSH, with or without `.git`, any case) and the `owner/name` scope derived from the working directory are normalized to the same form before they are compared. `--all` still shows every session on the host.
+- Seat confinement on macOS names every read operation in composer read denies, so a denied path nested inside the writable set stays unreadable. The confinement profile version moves on, so a record taken under the old profile reads as stale.
+- Seat confinement denies the daemon's control token at the path the daemon actually uses when the token-file override is set: the daemon states the kernel-resolved token path on each session's detail and the worker passes it to the confinement spec, instead of resolving it from an environment variable spawned workers never receive.
+
+### Chores
+
+- Retire the dead per-repository clone override: `cloneStrategy` is no longer written and is ignored on load with one deprecation warning, and `project allow --clone-strategy` is a hidden no-op until its removal in v0.73.0.
+- Stabilize the wake harness and three gate flakes.
 
 ## v0.72.69 — 2026-10-08
 
