@@ -22,8 +22,9 @@ import (
 // Mirrors are private to their scope: two scopes for one remote resolve to
 // two directories, and the store never configures git alternates between
 // them, so objects fetched under one scope are never reachable from
-// another. Credentials never touch the mirror config: every remote
-// operation authenticates through per-invocation environment only, and the
+// another. Credentials never touch the mirror config: after a fresh clone
+// the persisted origin is reset to the canonical remote (which carries no
+// userinfo), every remote operation runs with ambient auth only, and the
 // identity sidecar and catalog are secret-free by construction.
 type Store struct {
 	stateDir     string
@@ -124,7 +125,7 @@ func (s *Store) Ensure(ctx context.Context, source, scope string) (string, error
 	if _, err := runGit(ctx, localGitEnv(), "clone", "--mirror", "--", source, tmp); err != nil {
 		return "", fmt.Errorf("repo keeper: clone mirror: %w", err)
 	}
-	if err := s.hardenMirror(tmp); err != nil {
+	if err := s.hardenMirror(tmp, canonical); err != nil {
 		return "", err
 	}
 	if err := writeMirrorIdentity(tmp, mirrorIdentity{
@@ -187,16 +188,21 @@ func (s *Store) verifyMirror(mirrorDir, digest, canonical, scope string) error {
 // hardenMirror enforces the two cross-mirror isolation invariants on a
 // freshly cloned mirror: no alternates file (a clone must never borrow
 // objects from another scope's mirror), and no leftover alternates
-// reference in config. The origin URL is left exactly as cloned — it is
-// the provenance verifyMirror re-checks on every use — and credentials
-// never reach it because remote operations run with per-invocation
-// environment only, never a persisted config entry.
-func (s *Store) hardenMirror(mirrorDir string) error {
+// reference in config. The persisted origin URL is reset to the canonical
+// remote first: a clone records the exact source URL, which may carry an
+// embedded credential, and credentials must never reach the mirror config.
+// The canonical remote carries no userinfo, query, or fragment, and is the
+// provenance verifyMirror re-checks on every use, so the check is
+// unaffected.
+func (s *Store) hardenMirror(mirrorDir, canonical string) error {
 	alternates := filepath.Join(mirrorDir, "objects", "info", "alternates")
 	if _, err := os.Lstat(alternates); err == nil {
 		return fmt.Errorf("repo keeper: fresh mirror carries an alternates file")
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("repo keeper: inspect mirror alternates: %w", err)
+	}
+	if _, err := runGit(ctxBackground(), localGitEnv(), "--git-dir", mirrorDir, "remote", "set-url", "origin", canonical); err != nil {
+		return fmt.Errorf("repo keeper: reset mirror origin to canonical remote: %w", err)
 	}
 	return nil
 }

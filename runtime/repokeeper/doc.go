@@ -9,10 +9,10 @@
 // and scope it was created for; both are re-verified against the live git
 // origin before every use and any mismatch fails closed.
 //
-// The store never handles credential values: remote operations run with
-// ambient authentication only, every credential travels per-invocation
-// environment (never the mirror's config file), and the listing type is
-// secret-free by construction. Later consumers resolve per-scope
-// credentials above this package; this package only keeps the scopes
-// separate.
+// The store never handles credential values: after a fresh clone the
+// persisted origin is reset to the canonical remote (which carries no
+// userinfo), so no credential reaches the mirror's config file, and the
+// listing type is secret-free by construction. Later consumers resolve
+// per-scope credentials above this package; this package only keeps the
+// scopes separate.
 package repokeeper

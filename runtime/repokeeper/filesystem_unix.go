@@ -20,8 +20,8 @@ func deviceOf(path string) (uint64, error) {
 	if !ok {
 		return 0, fmt.Errorf("repo keeper: filesystem identity unavailable")
 	}
-	if stat.Dev < 0 {
-		return 0, fmt.Errorf("repo keeper: negative filesystem device identity")
-	}
-	return uint64(stat.Dev), nil //nolint:gosec // G115: negative devices refused above.
+	// The kernel never reports a negative device number. Dev is an unsigned
+	// width on 64-bit Linux, where a `< 0` guard is dead code that trips
+	// SA4003, and a small signed integer on darwin, so convert directly.
+	return uint64(stat.Dev), nil //nolint:gosec // G115: device numbers are non-negative on both platforms.
 }

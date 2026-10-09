@@ -3,6 +3,7 @@ package repokeeper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -297,6 +298,36 @@ func TestEnsureOriginMismatchFailsClosed(t *testing.T) {
 	}
 }
 
+// TestEnsureLiveOriginMismatchFailsClosed isolates the live git-origin leg
+// of the fail-closed re-verification: the planted mirror's sidecar is fully
+// consistent with the request (recorded remote, scope, and directory
+// binding all match), but its git origin points at another remote, so the
+// production Ensure entry point must fail closed with ErrOriginMismatch
+// rather than serve foreign content.
+func TestEnsureLiveOriginMismatchFailsClosed(t *testing.T) {
+	t.Parallel()
+	srcA, _ := newSourceRepo(t)
+	srcB, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	dirB, err := store.Ensure(context.Background(), srcB, "")
+	if err != nil {
+		t.Fatalf("Ensure(srcB) error = %v", err)
+	}
+	// Re-point only the live git origin at srcA: the sidecar still records
+	// srcB under the default scope in srcB's slot, so only the live-origin
+	// comparison can catch the desync.
+	runGitT(t, dirB, "remote", "set-url", "origin", srcA)
+
+	_, err = store.Ensure(context.Background(), srcB, "")
+	if !errors.Is(err, ErrOriginMismatch) {
+		t.Fatalf("Ensure(srcB with desynced live origin) error = %v, want ErrOriginMismatch", err)
+	}
+	if err != nil && (strings.Contains(err.Error(), srcA) || strings.Contains(err.Error(), srcB)) {
+		t.Errorf("mismatch error = %q, must not echo either source", err.Error())
+	}
+}
+
 // TestEnsureMirrorLayoutModeAndFilesystem drives the production entry point
 // and then proves the layout contract: mirrors live under
 // repo-keeper/mirrors/<digest>, every store-created directory is owner-only,
@@ -419,6 +450,87 @@ func TestEnsureNoCredentialInConfigCatalogOrLogs(t *testing.T) {
 	}
 	if identity.CanonicalRemote != srcDir {
 		t.Errorf("identity remote = %q, want %q", identity.CanonicalRemote, srcDir)
+	}
+}
+
+// TestEnsureCredentialBearingSourceLeavesNoCredential drives the production
+// Ensure entry point with a credential-bearing source that still clones
+// successfully (file transport ignores URL userinfo): the published mirror
+// must serve the cloned content while its config, identity sidecar,
+// catalog row, and captured logs carry no trace of the credential.
+func TestEnsureCredentialBearingSourceLeavesNoCredential(t *testing.T) {
+	t.Parallel()
+	srcDir, sha := newSourceRepo(t)
+	const secret = "s3cr3t-token-ABC123"
+	source := "file://user:" + secret + "@localhost" + srcDir
+
+	var logsMu sync.Mutex
+	var logged []string
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	store, err := New(stateDir, worktreeRoot, func(format string, args ...any) {
+		logsMu.Lock()
+		defer logsMu.Unlock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	dir, err := store.Ensure(context.Background(), source, "scope-a")
+	if err != nil {
+		t.Fatalf("Ensure(credential-bearing file source) error = %v", err)
+	}
+	if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
+		t.Errorf("cat-file output = %q, want empty on success", got)
+	}
+	// The persisted origin must be the canonical remote, which carries no
+	// userinfo: a clone records the exact source URL otherwise.
+	origin := runGitT(t, dir, "config", "--get", "remote.origin.url")
+	canonical, _, err := CanonicalRemote(source)
+	if err != nil {
+		t.Fatalf("CanonicalRemote() error = %v", err)
+	}
+	if origin != canonical {
+		t.Errorf("persisted origin = %q, want canonical %q", origin, canonical)
+	}
+
+	var sweep strings.Builder
+	config, err := os.ReadFile(filepath.Join(dir, "config")) //nolint:gosec // G304: constant config name under the test's own TempDir.
+	if err != nil {
+		t.Fatalf("read mirror config: %v", err)
+	}
+	sweep.Write(config)
+	sweep.WriteByte('\n')
+	sidecar, err := os.ReadFile(filepath.Join(dir, identityFileName)) //nolint:gosec // G304: constant sidecar name under the test's own TempDir.
+	if err != nil {
+		t.Fatalf("read mirror identity: %v", err)
+	}
+	sweep.Write(sidecar)
+	sweep.WriteByte('\n')
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, entry := range entries {
+		sweep.WriteString(entry.Digest)
+		sweep.WriteByte('\n')
+	}
+	logsMu.Lock()
+	for _, line := range logged {
+		sweep.WriteString(line)
+		sweep.WriteByte('\n')
+	}
+	logsMu.Unlock()
+	if strings.Contains(sweep.String(), secret) {
+		t.Error("credential reached the published mirror config, sidecar, catalog, or logs")
 	}
 }
 
