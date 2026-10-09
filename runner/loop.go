@@ -1222,6 +1222,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// (including a 404 from a platform build without the companion route)
 	// is swallowed inside the emitter — a step-heartbeat outage must never
 	// fail the run. Wave 3 item 1.
+	//
+	// The usage behind the beat depends on the lane: headless sessions read
+	// the budget enforcer's meter, while interactive sessions read the
+	// transcript-tail totals the interactive supervisor accumulates (an
+	// interactive session never constructs an enforcer reading). The totals
+	// live on the Runner for the session so both the emitter wiring here
+	// and the supervisor below share them; the heartbeat carries the
+	// running totals, clamped non-decreasing by the emitter.
 	var stepCredentialProvider stepheartbeat.CredentialProvider
 	if r.credentialProvider != nil {
 		stepCredentialProvider = func(ctx context.Context) (stepheartbeat.RuntimeCredentials, error) {
@@ -1238,18 +1246,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: stepCredentialProvider,
-		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
-			in, out, cached, usd := enforcer.usageSnapshot()
-			return stepheartbeat.UsageSnapshot{
-				InputTokens:       in,
-				OutputTokens:      out,
-				CachedInputTokens: cached,
-				TotalCostUsd:      usd,
-			}
-		},
-		HTTPClient: r.httpClient,
-		Logger:     r.logger,
-		Interval:   r.stepHeartbeatInterval,
+		UsageProvider:      r.stepHeartbeatUsage(qw, enforcer),
+		HTTPClient:         r.httpClient,
+		Logger:             r.logger,
+		Interval:           r.stepHeartbeatInterval,
 		// Interval is zero in production, keeping the 15s default —
 		// calibrated against the platform's 60s SESSION_STALE_THRESHOLD_MS.
 	})
