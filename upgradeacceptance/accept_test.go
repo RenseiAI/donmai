@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,18 +33,24 @@ import (
 //   - The stub receiver (stubreceiver.go) is exercised over HTTP exactly as
 //     a runner would call it: lease refresh, step heartbeat, terminal
 //     status with exact replay, and worker-id rotation on re-registration.
-//   - The local queue's CommitTerminal is exercised directly: it is the
-//     production entry point the standalone lane's receiver calls, and the
-//     forced-second-replay case asserts the original receipt returns with
-//     its revision unchanged.
+//   - The production heartbeat pulser and step-heartbeat emitter run
+//     against the stub receiver for the bearer-lapse and credential-push
+//     rows.
+//   - The production restart-preflight route runs against a real daemon
+//     Start for the direct-owned preflight row.
 //   - The scripted fake harness binary is built from real source and driven
-//     through the real pi provider (Spawn), proving it speaks the line
-//     protocol the harness claims — including the D8 variant that reports
-//     loaded transcript history on resume.
+//     through the real pi provider (Spawn, Resume), proving it speaks the
+//     line protocol the harness claims — including the D8 variant that
+//     reports loaded transcript history on resume — and that a scope the
+//     harness cannot render is refused before any harness process starts.
+//
+// The standalone lane's exact-replay commit (the local queue's
+// CommitTerminal) is pinned by its owning suite, internal/localqueue; the
+// stub receiver mirrors its semantics for the hosted shape.
 //
 // The live-seat cases (seat-survives-upgrade and friends) need a systemd
-// user manager and run in the container job; here they are recorded red
-// with their failure cause (TestUpgradeAcceptanceRed).
+// user manager and are recorded by the container lane; here the red they
+// share is pinned with its cause (TestUpgradeAcceptanceRed).
 
 func buildFakeHarness(t *testing.T) string {
 	t.Helper()
@@ -294,6 +304,8 @@ func TestFakeHarnessSpeaksPiRPC(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_HARNESS_TRIGGER", trigger)
+	started := filepath.Join(t.TempDir(), "started")
+	t.Setenv("FAKE_HARNESS_STARTED", started)
 	provider, err := pi.New(pi.Options{
 		PiBin:            bin,
 		HandshakeTimeout: 20 * time.Second,
@@ -318,6 +330,95 @@ func TestFakeHarnessSpeaksPiRPC(t *testing.T) {
 	}
 	if id := handle.SessionID(); id == "" {
 		t.Fatal("SessionID empty after get_state through the fake harness")
+	}
+	// Positive control for TestScopeCreationRefused: a spawned session
+	// marks its start, so that test's absent marker means no harness
+	// process started rather than a marker that is never written.
+	if _, err := os.Stat(started); err != nil {
+		t.Fatalf("started marker after a successful spawn: %v; the fake did not record its start", err)
+	}
+}
+
+// TestFakeHarnessTriggerVerdicts pins the three ways the trigger gate ends
+// a held turn, which the upgrade flow tells apart: a trigger that appears
+// releases the turn with its reply, a trigger holding "abort" ends it as
+// aborted, and a trigger that never appears within the wait ends it as
+// timeout — a slow runner is never recorded as an operator abort.
+func TestFakeHarnessTriggerVerdicts(t *testing.T) {
+	bin := buildFakeHarness(t)
+	for _, tc := range []struct {
+		name    string
+		trigger string // file content; empty means the file never appears
+		want    string
+	}{
+		{name: "released", trigger: "go\n", want: "ok"},
+		{name: "aborted", trigger: "abort\n", want: "aborted"},
+		{name: "timed-out", want: "timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			trigger := filepath.Join(t.TempDir(), "trigger")
+			if tc.trigger != "" {
+				if err := os.WriteFile(trigger, []byte(tc.trigger), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := fakeHarnessTurnText(t, bin, "FAKE_HARNESS_TRIGGER="+trigger, "FAKE_HARNESS_TRIGGER_WAIT=300ms")
+			if got != tc.want {
+				t.Fatalf("turn text = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// fakeHarnessTurnText runs the fake harness binary for one prompt over the
+// pi RPC line protocol on stdio and returns the turn's assistant text.
+func fakeHarnessTurnText(t *testing.T, bin string, env ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin) //nolint:gosec // bin is the fake harness this test built.
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()}, env...)
+	cmd.Stdin = strings.NewReader(`{"type":"prompt","message":"hold"}` + "\n")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("fake harness turn: %v\n%s", err, out)
+	}
+	var text string
+	settled := false
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		var ev struct {
+			Type  string `json:"type"`
+			Event struct {
+				Delta string `json:"delta"`
+			} `json:"assistantMessageEvent"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("fake harness emitted a non-JSON line %q: %v", line, err)
+		}
+		switch ev.Type {
+		case "message_update":
+			text += ev.Event.Delta
+		case "agent_settled":
+			settled = true
+		}
+	}
+	if !settled {
+		t.Fatalf("fake harness turn never settled:\n%s", out)
+	}
+	return text
+}
+
+// TestFakeHarnessReportsThePinnedVersion keeps the fake's --version answer
+// equal to the pi provider's pin, so the version probe labels the fake
+// verified exactly as it labels the real binary.
+func TestFakeHarnessReportsThePinnedVersion(t *testing.T) {
+	bin := buildFakeHarness(t)
+	out, err := exec.Command(bin, "--version").Output() //nolint:gosec // bin is the fake harness this test built.
+	if err != nil {
+		t.Fatalf("fake --version: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != pi.PinnedVersion {
+		t.Fatalf("fake --version = %q, want the pi provider pin %q", got, pi.PinnedVersion)
 	}
 }
 
@@ -407,7 +508,7 @@ Loop:
 		t.Fatal("SessionID empty after get_state through the fake harness")
 	}
 	_ = handle.Stop(context.Background())
-	resumed, err2 := resumeFakeHarness(context.Background(), provider, bin, dir, sessionID, "after resume")
+	resumed, err2 := resumeFakeHarness(context.Background(), provider, dir, sessionID, "after resume")
 	if err2 != nil {
 		t.Fatalf("Resume through fake harness: %v", err2)
 	}
@@ -505,11 +606,12 @@ func TestHeadlessLaunchProbeTurnsGreenWithTheRule(t *testing.T) {
 	}
 }
 
-// TestFailureMatrixRegistered pins the matrix shape: every row the
-// container driver executes must be listed here, so a case cannot silently
-// stop running. The driver asserts the same count. The liveness half
-// proves the suite actually defines every driver the map names: renaming
-// a driver test without updating the suite fails here.
+// TestFailureMatrixRegistered pins the matrix shape: the row count, the
+// local/live split, and that every local row names the in-repo test that
+// drives it while no live row claims one (only the container records live
+// rows). The matrix is a harness, not a list: a new local row cannot land
+// without its driver, and TestSuiteDefinesEveryNamedDriver proves each
+// named driver exists.
 func TestFailureMatrixRegistered(t *testing.T) {
 	t.Parallel()
 	seen := map[string]bool{}
@@ -524,83 +626,78 @@ func TestFailureMatrixRegistered(t *testing.T) {
 	}
 	const wantCases = 22
 	if len(failureMatrix) != wantCases {
-		t.Fatalf("matrix has %d cases, want %d; the container driver asserts the same count", len(failureMatrix), wantCases)
+		t.Fatalf("matrix has %d cases, want %d", len(failureMatrix), wantCases)
+	}
+	if len(matrixLiveNames()) == 0 {
+		t.Fatal("matrix lists no live-seat cases; the container record would carry nothing")
 	}
 	local := 0
-	liveNames := matrixLiveNames()
 	for _, c := range failureMatrix {
-		if c.local {
+		switch {
+		case c.local && c.driver == "":
+			t.Fatalf("local matrix case %q names no driving test", c.name)
+		case !c.local && c.driver != "":
+			t.Fatalf("live matrix case %q names in-repo driver %q; live cases are recorded by the container lane", c.name, c.driver)
+		case c.local:
 			local++
 		}
-	}
-	if len(liveNames) == 0 {
-		t.Fatal("matrix lists no live-seat cases; the container driver would run nothing")
 	}
 	const wantLocal = 9
 	if local != wantLocal {
 		t.Fatalf("matrix has %d local cases, want %d", local, wantLocal)
 	}
-	// Every local row names the in-repo test driving it: the matrix is a
-	// harness, not a list. A row with no driver fails here, so a new row
-	// cannot land without its test and a deleted test cannot silently
-	// orphan its row.
-	drivers := map[string]string{
-		"harness-finishes-while-daemon-down-post-fails": "TestReceiverPendingReplay",
-		"bearer-expires-while-no-daemon-runs":           "TestBearerExpiresWhileNoDaemonRuns",
-		"daemon-returns-before-bearer-expires":          "TestDaemonReturnsBeforeBearerExpires",
-		"direct-owned-plus-shim-owned-preflight":        "TestDirectOwnedPlusShimOwnedPreflight",
-		"scope-creation-refused":                        "TestScopeCreationRefused",
-		"receiver-exact-replay":                         "TestReceiverExactReplay",
-		"receiver-worker-rotation":                      "TestReceiverWorkerRotation",
-		"receiver-lease-across-gap":                     "TestReceiverLeaseAcrossGap",
-		"harness-resume-reports-history":                "TestFakeHarnessResumeReportsHistory",
-	}
+}
+
+// TestSuiteDefinesEveryNamedDriver proves every driver a local matrix row
+// names is a real top-level test in this package: it parses the package's
+// own _test.go files rather than trusting a list kept by hand, so renaming
+// or deleting a driver test orphans its row loudly.
+func TestSuiteDefinesEveryNamedDriver(t *testing.T) {
+	t.Parallel()
+	defined := packageTestFunctions(t)
 	for _, c := range failureMatrix {
-		if !c.local {
+		if c.driver == "" {
 			continue
 		}
-		want, ok := drivers[c.name]
-		if !ok {
-			t.Fatalf("local matrix case %q names no driving test; add its row to the drivers map with its test", c.name)
-		}
-		if !testFunctionExists(want) {
-			t.Fatalf("local matrix case %q names driver %q, which does not exist", c.name, want)
+		if !defined[c.driver] {
+			t.Fatalf("matrix row %q names driver %q, which no _test.go file in this package defines", c.name, c.driver)
 		}
 	}
 }
 
-// testFunctionNames lists every test function in this package's in-repo
-// suite. It sits next to the drivers map so a renamed or deleted driver
-// test fails the shape pin instead of silently orphaning its matrix row.
-var testFunctionNames = []string{
-	"TestReceiverExactReplay",
-	"TestReceiverWorkerRotation",
-	"TestReceiverLeaseAcrossGap",
-	"TestReceiverPendingReplay",
-	"TestFakeHarnessSpeaksPiRPC",
-	"TestFakeHarnessResumeReportsHistory",
-	"TestUpgradeAcceptanceRed",
-	"TestHeadlessLaunchProbeFollowsTheSelectionRule",
-	"TestHeadlessLaunchProbeTurnsGreenWithTheRule",
-	"TestFailureMatrixRegistered",
-	"TestDirectOwnedPlusShimOwnedPreflight",
-	"TestBearerExpiresWhileNoDaemonRuns",
-	"TestDaemonReturnsBeforeBearerExpires",
-	"TestScopeCreationRefused",
-	"TestSuiteDefinesEveryNamedDriver",
-}
-
-// testFunctionExists reports whether the upgradeacceptance test binary
-// defines a test function with the given name. It keeps the drivers map
-// above honest: renaming a driver test without updating the map fails
-// the shape pin instead of silently orphaning the row.
-func testFunctionExists(name string) bool {
-	for _, c := range testFunctionNames {
-		if c == name {
-			return true
+// packageTestFunctions returns the names of the top-level test functions
+// (func TestXxx(t *testing.T)) the package's _test.go files declare.
+func packageTestFunctions(t *testing.T) map[string]bool {
+	t.Helper()
+	paths, err := filepath.Glob("*_test.go")
+	if err != nil {
+		t.Fatalf("list test files: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no _test.go files found; the test must run from the package directory")
+	}
+	fset := token.NewFileSet()
+	out := map[string]bool{}
+	for _, path := range paths {
+		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Test") {
+				continue
+			}
+			if params := fn.Type.Params.List; len(params) == 1 {
+				if star, ok := params[0].Type.(*ast.StarExpr); ok {
+					if sel, ok := star.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "T" {
+						out[fn.Name.Name] = true
+					}
+				}
+			}
 		}
 	}
-	return false
+	return out
 }
 
 // startAcceptanceDaemon starts a real daemon against a throwaway config:
@@ -652,15 +749,22 @@ func waitSeatGone(t *testing.T, d *daemon.Daemon, sessionID string, timeout time
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		for _, h := range d.Spawner().ActiveSessions() {
-			if h.SessionID == sessionID {
-				time.Sleep(20 * time.Millisecond)
-				continue
-			}
+		if !seatActive(d, sessionID) {
+			return
 		}
-		return
+		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("seat %q still active after %v", sessionID, timeout)
+}
+
+// seatActive reports whether the spawner still holds sessionID.
+func seatActive(d *daemon.Daemon, sessionID string) bool {
+	for _, h := range d.Spawner().ActiveSessions() {
+		if h.SessionID == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 // prepareRestart drives the production restart-preflight route the same
@@ -696,13 +800,7 @@ func TestDirectOwnedPlusShimOwnedPreflight(t *testing.T) {
 	if active, _ := d.Spawner().ActiveSessionCounts(); active != 1 {
 		t.Fatalf("active sessions = %d, want 1 (the direct-owned seat under test)", active)
 	}
-	found := false
-	for _, h := range d.Spawner().ActiveSessions() {
-		if h.SessionID == "direct-preflight-seat" {
-			found = true
-		}
-	}
-	if !found {
+	if !seatActive(d, "direct-preflight-seat") {
 		t.Fatal("direct-preflight-seat not among active sessions; the refusal below would count the wrong seat")
 	}
 
@@ -797,47 +895,39 @@ func TestBearerExpiresWhileNoDaemonRuns(t *testing.T) {
 
 // TestDaemonReturnsBeforeBearerExpires drives the daemon-returns-before-
 // bearer-expires row through the production heartbeat and step-heartbeat
-// entry points: while the receiver rotates the worker pair (the pushed
-// credential update arriving before the old bearer lapses), a pulser and
-// an emitter that follow the rotation through the credential provider
-// never miss a tick — no strike accrues and every step beat lands.
+// entry points. Both beaters start on the original worker pair; the
+// returning daemon re-registers (a fresh pair, with the old one still valid
+// for the overlap) and pushes the rotated pair to the runner, the stand-in
+// for CredentialUpdate. Only then does the old bearer lapse. The beaters
+// must follow the push through their credential providers: the lease keeps
+// refreshing under the rotated pair, no strike ever accrues, and step beats
+// carry the rotated worker id. A beater that ignored the push would keep
+// presenting the lapsed pair and strike out.
 func TestDaemonReturnsBeforeBearerExpires(t *testing.T) {
 	r := newStubReceiver(t)
 	worker, bearer := r.currentWorker()
-	base := r.url() + "/api/sessions/sess-credential-push"
 	client := r.client()
 
-	// Seed one successful tick on the original pair so the lease is live
-	// before the rotation.
-	if code, raw := postJSON(t, client, base+"/lock-refresh", bearer, map[string]any{"workerId": worker}); code != http.StatusOK {
-		t.Fatalf("seed refresh = %d (%s), want 200", code, raw)
-	}
-
-	// The pushed credential update: re-registration rotates the pair. The
-	// production credential-provider seam hands the fresh pair to both
-	// beaters before the old bearer lapses.
-	code, raw := postJSON(t, client, r.url()+"/api/workers/register", bearer, map[string]any{"workerId": worker})
-	if code != http.StatusOK {
-		t.Fatalf("re-register = %d (%s), want 200", code, raw)
-	}
-	var reg map[string]any
-	if err := json.Unmarshal(raw, &reg); err != nil {
-		t.Fatal(err)
-	}
-	newWorker, _ := reg["workerId"].(string)
-	newBearer, _ := reg["bearer"].(string)
-	if newWorker == "" || newBearer == "" {
-		t.Fatalf("rotation returned worker=%q bearer-set=%v", newWorker, newBearer != "")
+	// pushed is what the runner last received from its daemon: the
+	// original pair at launch, the rotated pair once the update lands.
+	var pushedMu sync.Mutex
+	pushedWorker, pushedBearer := worker, bearer
+	pushed := func() (string, string) {
+		pushedMu.Lock()
+		defer pushedMu.Unlock()
+		return pushedWorker, pushedBearer
 	}
 	provider := func(context.Context) (heartbeat.RuntimeCredentials, error) {
-		return heartbeat.RuntimeCredentials{WorkerID: newWorker, AuthToken: newBearer}, nil
+		w, b := pushed()
+		return heartbeat.RuntimeCredentials{WorkerID: w, AuthToken: b}, nil
 	}
 	stepProvider := func(context.Context) (stepheartbeat.RuntimeCredentials, error) {
-		return stepheartbeat.RuntimeCredentials{WorkerID: newWorker, AuthToken: newBearer}, nil
+		w, b := pushed()
+		return stepheartbeat.RuntimeCredentials{WorkerID: w, AuthToken: b}, nil
 	}
 	p, err := heartbeat.New(heartbeat.Config{
-		SessionID: "sess-credential-push", WorkerID: newWorker, BaseURL: r.url(),
-		AuthToken: newBearer, CredentialProvider: provider,
+		SessionID: "sess-credential-push", WorkerID: worker, BaseURL: r.url(),
+		AuthToken: bearer, CredentialProvider: provider,
 		Interval: 20 * time.Millisecond, HTTPClient: client,
 		MaxAttemptsPerTick: 1, StrikesUntilLost: 3,
 	})
@@ -845,8 +935,8 @@ func TestDaemonReturnsBeforeBearerExpires(t *testing.T) {
 		t.Fatalf("heartbeat New: %v", err)
 	}
 	e, err := stepheartbeat.New(stepheartbeat.Config{
-		SessionID: "sess-credential-push", WorkerID: newWorker, BaseURL: r.url(),
-		AuthToken: newBearer, CredentialProvider: stepProvider,
+		SessionID: "sess-credential-push", WorkerID: worker, BaseURL: r.url(),
+		AuthToken: bearer, CredentialProvider: stepProvider,
 		Interval: 20 * time.Millisecond, HTTPClient: client,
 	})
 	if err != nil {
@@ -862,22 +952,58 @@ func TestDaemonReturnsBeforeBearerExpires(t *testing.T) {
 		t.Fatalf("step-heartbeat Start: %v", err)
 	}
 	defer func() { _ = e.Stop() }()
-	time.Sleep(300 * time.Millisecond)
+
+	waitUntil := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s never happened (strikes=%d)", what, p.Strikes())
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitUntil("a lease refresh on the original pair", func() bool { return r.refreshesFor(worker) > 0 })
+
+	// The daemon returns: re-registration rotates the pair while the old
+	// bearer is still valid, and the rotated pair is pushed to the runner.
+	newWorker, newBearer, retire := r.rotateWithOverlap()
+	pushedMu.Lock()
+	pushedWorker, pushedBearer = newWorker, newBearer
+	pushedMu.Unlock()
+	waitUntil("a lease refresh on the pushed pair", func() bool { return r.refreshesFor(newWorker) > 0 })
+	waitUntil("a step beat on the pushed pair", func() bool { return stepBeatsFrom(t, r, newWorker) > 0 })
+
+	// The old bearer lapses; the lease keeps refreshing on the pushed pair.
+	retire()
+	after := r.refreshesFor(newWorker)
+	waitUntil("three more lease refreshes after the old bearer lapsed", func() bool { return r.refreshesFor(newWorker) >= after+3 })
 	select {
 	case <-p.LostOwnership():
-		t.Fatalf("lease fuse tripped after the credential push (strikes=%d)", p.Strikes())
+		t.Fatalf("lease fuse tripped across the credential push (strikes=%d)", p.Strikes())
 	default:
 	}
 	if got := p.Strikes(); got != 0 {
-		t.Fatalf("heartbeat strikes = %d after the credential push, want 0", got)
+		t.Fatalf("heartbeat strikes = %d across the credential push, want 0 (the lease never misses a tick)", got)
 	}
-	refreshes, _, _ := r.counts()
-	if refreshes < 2 {
-		t.Fatalf("lease refreshes = %d, want at least the seed plus one pushed tick", refreshes)
+}
+
+// stepBeatsFrom counts the recorded step heartbeats attributed to workerID.
+func stepBeatsFrom(t *testing.T, r *stubReceiver, workerID string) int {
+	t.Helper()
+	n := 0
+	for _, raw := range r.stepBeatBodies() {
+		var body struct {
+			WorkerID string `json:"workerId"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("step beat body %q: %v", raw, err)
+		}
+		if body.WorkerID == workerID {
+			n++
+		}
 	}
-	if got := len(r.stepBeatBodies()); got == 0 {
-		t.Fatal("no step heartbeats landed after the credential push")
-	}
+	return n
 }
 
 // TestScopeCreationRefused drives the scope-creation-refused row through
@@ -887,12 +1013,12 @@ func TestDaemonReturnsBeforeBearerExpires(t *testing.T) {
 // into a weaker scope as a fallback.
 func TestScopeCreationRefused(t *testing.T) {
 	bin := buildFakeHarness(t)
-	// The trigger file must not exist before the refused spawn: the fake
-	// blocks on it, so its absence afterwards proves no harness child
-	// started. A fresh temp dir guarantees no leftover from another test.
-	triggerDir := t.TempDir()
-	trigger := filepath.Join(triggerDir, "trigger")
-	t.Setenv("FAKE_HARNESS_TRIGGER", trigger)
+	// Every RPC session process the fake starts appends its PID to this
+	// marker (TestFakeHarnessSpeaksPiRPC is the positive control), so its
+	// absence after the refusal proves no harness process started.
+	started := filepath.Join(t.TempDir(), "started")
+	t.Setenv("FAKE_HARNESS_STARTED", started)
+	t.Setenv("FAKE_HARNESS_TRIGGER", filepath.Join(t.TempDir(), "trigger"))
 	provider, err := pi.New(pi.Options{
 		PiBin:            bin,
 		HandshakeTimeout: 20 * time.Second,
@@ -910,9 +1036,10 @@ func TestScopeCreationRefused(t *testing.T) {
 		Levels:  levels,
 		Digest:  agent.ExecutionSecurityLevelsDigest(levels),
 	}
-	_, err = provider.Spawn(context.Background(), spec)
+	handle, err := provider.Spawn(context.Background(), spec)
 	if err == nil {
-		t.Fatal("Spawn of a session stamping an unscoped-capable level succeeded, want the typed scope refusal")
+		_ = handle.Stop(context.Background())
+		t.Fatal("Spawn of a session stamping a scope the harness cannot render succeeded, want the typed scope refusal")
 	}
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Fatalf("Spawn error = %v, want a spawn failure", err)
@@ -920,42 +1047,10 @@ func TestScopeCreationRefused(t *testing.T) {
 	if code := agent.ExecutionSecurityErrorCode(err); code != agent.ExecutionSecurityUnrenderable {
 		t.Fatalf("Spawn error = %v (code %q), want the typed %q scope refusal", err, code, agent.ExecutionSecurityUnrenderable)
 	}
-	// The refusal happens before spawn: no harness child starts, so the
-	// trigger file the fake would block on stays untouched and no session
-	// transcript exists. A late-failing fallback launch would still satisfy
-	// the typed-refusal shape above; the absence of harness side effects
-	// proves the seat never launched.
-	if _, statErr := os.Stat(trigger); !os.IsNotExist(statErr) {
-		t.Fatalf("trigger file exists after the refused spawn (%v); the harness must never start", statErr)
-	}
-}
-
-// TestSuiteDefinesEveryNamedDriver proves the drivers map and the
-// testFunctionNames list above are not fiction: every name they carry
-// resolves to a real test the -list gate below shows. Run it with:
-// GOWORK=off go test -count=1 -list '.*' ./upgradeacceptance/
-func TestSuiteDefinesEveryNamedDriver(t *testing.T) {
-	t.Parallel()
-	seen := map[string]bool{}
-	for _, n := range testFunctionNames {
-		if seen[n] {
-			t.Fatalf("duplicate test name %q in testFunctionNames", n)
-		}
-		seen[n] = true
-	}
-	for _, tc := range []struct{ row, driver string }{
-		{"harness-finishes-while-daemon-down-post-fails", "TestReceiverPendingReplay"},
-		{"bearer-expires-while-no-daemon-runs", "TestBearerExpiresWhileNoDaemonRuns"},
-		{"daemon-returns-before-bearer-expires", "TestDaemonReturnsBeforeBearerExpires"},
-		{"direct-owned-plus-shim-owned-preflight", "TestDirectOwnedPlusShimOwnedPreflight"},
-		{"scope-creation-refused", "TestScopeCreationRefused"},
-		{"receiver-exact-replay", "TestReceiverExactReplay"},
-		{"receiver-worker-rotation", "TestReceiverWorkerRotation"},
-		{"receiver-lease-across-gap", "TestReceiverLeaseAcrossGap"},
-		{"harness-resume-reports-history", "TestFakeHarnessResumeReportsHistory"},
-	} {
-		if !seen[tc.driver] {
-			t.Fatalf("row %q names driver %q, which testFunctionNames does not list", tc.row, tc.driver)
-		}
+	// The refusal happens before spawn: a late-failing fallback launch
+	// would satisfy the typed-refusal shape above, so the absent marker is
+	// what proves the seat never launched.
+	if raw, statErr := os.ReadFile(started); !os.IsNotExist(statErr) {
+		t.Fatalf("harness process started before the scope refusal (marker %q, err %v); the seat must be refused before spawn", raw, statErr)
 	}
 }

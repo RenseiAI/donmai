@@ -21,10 +21,13 @@ import (
 // Routes (all POST, JSON bodies):
 //
 //   - /api/sessions/{id}/lock-refresh — lease refresh. Succeeds while the
-//     bearer is current. A re-registration (POST /api/workers/register with
-//     the previous worker id) rotates the worker id; the old bearer lapses
-//     and the refresh fails closed until the caller presents the rotated
-//     pair.
+//     caller presents the current worker id AND its bearer. A
+//     re-registration (POST /api/workers/register with the previous worker
+//     id) rotates the pair; the old pair lapses at once and the refresh
+//     fails closed until the caller presents the rotated pair.
+//     rotateWithOverlap rotates without the immediate lapse: the old pair
+//     stays valid until retired, the window in which a returning daemon
+//     pushes the rotated pair before the old bearer expires.
 //   - /api/sessions/{id}/step-heartbeat — step liveness. Recorded; succeeds
 //     while the bearer is current. A lapsed bearer is refused: a stale or
 //     rotated-out worker cannot keep writing step beats after its bearer
@@ -46,6 +49,12 @@ type stubReceiver struct {
 	// workerID is the currently valid registration; bearer is its bearer.
 	workerID string
 	bearer   string
+	// prevWorkerID/prevBearer stay valid during a rotation overlap, until
+	// the overlap is retired.
+	prevWorkerID string
+	prevBearer   string
+	// refreshesBy counts successful lease refreshes per worker id.
+	refreshesBy map[string]int
 	// registrations counts re-registrations (rotations).
 	registrations int
 	// refreshes counts successful lease refreshes.
@@ -70,9 +79,10 @@ type storedTerminal struct {
 func newStubReceiver(t *testing.T) *stubReceiver {
 	t.Helper()
 	r := &stubReceiver{
-		workerID:  "worker-1",
-		bearer:    "bearer-1",
-		terminals: map[string]storedTerminal{},
+		workerID:    "worker-1",
+		bearer:      "bearer-1",
+		terminals:   map[string]storedTerminal{},
+		refreshesBy: map[string]int{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/workers/register", r.handleRegister)
@@ -112,6 +122,48 @@ func (r *stubReceiver) stepBeatBodies() [][]byte {
 	return append([][]byte(nil), r.stepBeats...)
 }
 
+// refreshesFor reports the successful lease refreshes presented by workerID.
+func (r *stubReceiver) refreshesFor(workerID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.refreshesBy[workerID]
+}
+
+// rotateWithOverlap mints a fresh worker pair while the current pair stays
+// valid, and returns the fresh pair plus the func that retires the old
+// one. It models re-registration by a daemon that returns before the old
+// bearer expires: the rotated pair is pushed to the runner while both
+// pairs are accepted, then the old pair lapses.
+func (r *stubReceiver) rotateWithOverlap() (workerID, bearer string, retire func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prevWorkerID, r.prevBearer = r.workerID, r.bearer
+	r.rotateLocked()
+	return r.workerID, r.bearer, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.prevWorkerID, r.prevBearer = "", ""
+	}
+}
+
+// rotateLocked mints the next worker pair. Caller holds r.mu.
+func (r *stubReceiver) rotateLocked() {
+	r.registrations++
+	r.workerID = "worker-" + strings.TrimPrefix(r.workerID, "worker-") + "-r"
+	r.bearer = "bearer-" + strings.TrimPrefix(r.bearer, "bearer-") + "-r"
+}
+
+// authorizedLocked reports whether the presented pair is the current
+// registration, or the previous one during a rotation overlap. Both halves
+// must match: a rotated worker id with a lapsed bearer is not the rotated
+// pair. Caller holds r.mu.
+func (r *stubReceiver) authorizedLocked(workerID, bearer string) bool {
+	if workerID == r.workerID && bearer == r.bearer {
+		return true
+	}
+	return r.prevBearer != "" && workerID == r.prevWorkerID && bearer == r.prevBearer
+}
+
 // setOutage toggles the simulated receiver outage for terminal posts.
 func (r *stubReceiver) setOutage(down bool) {
 	r.mu.Lock()
@@ -137,9 +189,8 @@ func (r *stubReceiver) handleRegister(w http.ResponseWriter, req *http.Request) 
 	}
 	// Rotate: the replacement registration mints a fresh worker id and
 	// bearer; the previous pair lapses immediately.
-	r.registrations++
-	r.workerID = "worker-" + strings.TrimPrefix(r.workerID, "worker-") + "-r"
-	r.bearer = "bearer-" + strings.TrimPrefix(r.bearer, "bearer-") + "-r"
+	r.prevWorkerID, r.prevBearer = "", ""
+	r.rotateLocked()
 	writeJSON(w, map[string]any{"workerId": r.workerID, "bearer": r.bearer})
 }
 
@@ -163,7 +214,7 @@ func (r *stubReceiver) handleSession(w http.ResponseWriter, req *http.Request) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	authorized := identity.WorkerID == r.workerID || bearerOf(req) == r.bearer
+	authorized := r.authorizedLocked(identity.WorkerID, bearerOf(req))
 	switch route {
 	case "lock-refresh":
 		if !authorized {
@@ -175,6 +226,7 @@ func (r *stubReceiver) handleSession(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		r.refreshes++
+		r.refreshesBy[identity.WorkerID]++
 		writeJSON(w, map[string]any{"refreshed": true})
 	case "step-heartbeat":
 		if !authorized {

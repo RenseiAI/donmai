@@ -17,9 +17,13 @@
 //     the driver touches the path named by FAKE_HARNESS_TRIGGER. Removing
 //     the file or writing "abort" to it ends the session instead, so the
 //     upgrade flow can hold a live seat across the daemon restart and then
-//     release it. A file that never appears within the wait ends the turn
-//     with a "timeout" verdict instead of the abort text, so a slow
-//     runner is distinguishable from an operator abort.
+//     release it. A file that never appears within the wait
+//     (FAKE_HARNESS_TRIGGER_WAIT, a Go duration, default ten minutes) ends
+//     the turn with a "timeout" verdict instead of the abort text, so a
+//     slow runner is distinguishable from an operator abort.
+//   - With FAKE_HARNESS_STARTED set, every RPC session process appends its
+//     PID to that file at start, so a test can prove a refused spawn never
+//     started a harness process.
 //   - D8 variant: with FAKE_HARNESS_STATE_DIR set, every turn appends one
 //     JSONL transcript line under that directory (the session-owned state
 //     location), and a resume (argv carrying --session) reports the number
@@ -48,8 +52,14 @@ const (
 
 	envHandshakeToken = "DONMAI_PI_HANDSHAKE"
 	envTrigger        = "FAKE_HARNESS_TRIGGER"
+	envTriggerWait    = "FAKE_HARNESS_TRIGGER_WAIT"
 	envStateDir       = "FAKE_HARNESS_STATE_DIR"
 	envReply          = "FAKE_HARNESS_REPLY"
+	envStarted        = "FAKE_HARNESS_STARTED"
+
+	// defaultTriggerWait bounds how long a turn waits for its trigger file
+	// before ending with the "timeout" verdict.
+	defaultTriggerWait = 10 * time.Minute
 )
 
 func main() {
@@ -102,11 +112,13 @@ func run(args []string) error {
 			return nil
 		}
 	}
+	markStarted(os.Getenv(envStarted))
 	extPath := extPathOf(args)
 	resumed := resumedOf(args)
 	token := os.Getenv(envHandshakeToken)
 	sha := extensionSHAOf(extPath)
 	trigger := os.Getenv(envTrigger)
+	triggerWait := triggerWaitOf(os.Getenv(envTriggerWait))
 	stateDir := os.Getenv(envStateDir)
 	reply := os.Getenv(envReply)
 	if reply == "" {
@@ -160,7 +172,7 @@ func run(args []string) error {
 			if stateDir != "" {
 				appendTranscript(stateDir, sessionID, text)
 			}
-			if decision := gateOnTrigger(trigger); decision != "go" {
+			if decision := gateOnTrigger(trigger, triggerWait); decision != "go" {
 				verdict := "aborted"
 				if decision == "timeout" {
 					verdict = "timeout"
@@ -190,14 +202,15 @@ func run(args []string) error {
 
 // gateOnTrigger blocks until the trigger file exists (or no trigger is
 // configured). It reports "abort" when the file holds the word "abort"
-// and "timeout" when the file never appears within the ~10 minute wait —
-// a slow runner is a distinct verdict from an operator abort, never a
-// silent abort-shaped exit 0.
-func gateOnTrigger(trigger string) string {
+// and "timeout" when the file never appears within wait — a slow runner
+// is a distinct verdict from an operator abort, never a silent
+// abort-shaped exit 0.
+func gateOnTrigger(trigger string, wait time.Duration) string {
 	if trigger == "" {
 		return "go"
 	}
-	for i := 0; i < 6000; i++ {
+	deadline := time.Now().Add(wait)
+	for {
 		raw, err := os.ReadFile(trigger) //nolint:gosec // path comes from the driver's own environment.
 		if err == nil {
 			if strings.TrimSpace(string(raw)) == "abort" {
@@ -205,9 +218,36 @@ func gateOnTrigger(trigger string) string {
 			}
 			return "go"
 		}
+		if !time.Now().Before(deadline) {
+			return "timeout"
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return "timeout"
+}
+
+// triggerWaitOf parses FAKE_HARNESS_TRIGGER_WAIT (a Go duration); empty or
+// malformed means the default wait.
+func triggerWaitOf(raw string) time.Duration {
+	if d, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil && d > 0 {
+		return d
+	}
+	return defaultTriggerWait
+}
+
+// markStarted records that an RPC session process started (never the
+// --version probe): one line with the PID, appended to path. A refusal
+// that must happen before any harness process starts is proved by this
+// file's absence.
+func markStarted(path string) {
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // marker path comes from the driver's own environment.
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
 }
 
 func runTurn(out *bufio.Writer, text string) {

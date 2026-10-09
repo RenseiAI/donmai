@@ -31,9 +31,11 @@ func piSpec(dir, prompt string) agent.Spec {
 		Cwd:    dir,
 		Prompt: prompt,
 		Env: map[string]string{
-			"FAKE_HARNESS_TRIGGER":   os.Getenv("FAKE_HARNESS_TRIGGER"),
-			"FAKE_HARNESS_STATE_DIR": os.Getenv("FAKE_HARNESS_STATE_DIR"),
-			"FAKE_HARNESS_REPLY":     os.Getenv("FAKE_HARNESS_REPLY"),
+			"FAKE_HARNESS_TRIGGER":      os.Getenv("FAKE_HARNESS_TRIGGER"),
+			"FAKE_HARNESS_TRIGGER_WAIT": os.Getenv("FAKE_HARNESS_TRIGGER_WAIT"),
+			"FAKE_HARNESS_STATE_DIR":    os.Getenv("FAKE_HARNESS_STATE_DIR"),
+			"FAKE_HARNESS_REPLY":        os.Getenv("FAKE_HARNESS_REPLY"),
+			"FAKE_HARNESS_STARTED":      os.Getenv("FAKE_HARNESS_STARTED"),
 		},
 	}
 }
@@ -71,8 +73,7 @@ func collectAssistantText(ctx context.Context, handle agent.Handle, timeout time
 // runner's stop-and-resume fallback uses (stop the turn, Resume, then the
 // queued steer content rides an Inject). The first resumed turn reports the
 // loaded history.
-func resumeFakeHarness(ctx context.Context, provider *pi.Provider, bin, dir, sessionID, prompt string) (agent.Handle, error) {
-	_ = bin
+func resumeFakeHarness(ctx context.Context, provider *pi.Provider, dir, sessionID, prompt string) (agent.Handle, error) {
 	// Drive the production Resume entry point: the fake answers get_entries
 	// and reports its loaded history on the next turn.
 	handle, err := provider.Resume(ctx, sessionID, piSpec(dir, prompt))

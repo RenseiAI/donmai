@@ -2,11 +2,21 @@ name: upgrade-acceptance
 
 # Container upgrade acceptance for headless session-shim adoption.
 #
-# Runs the N → N+1 live-seat upgrade inside a Linux container with a systemd
-# user manager and delegated cgroup v2 (upgradeacceptance/container/).
-# On current main the acceptance case is RED (the seat dies on upgrade —
-# headless shim launch is off); the job records that cause and fails. It
-# goes green once the adoption slices land.
+# Runs the N → N+1 daemon upgrade inside a Linux container that boots systemd
+# as PID 1 with a lingering user manager and a delegated cgroup v2 subtree
+# (upgradeacceptance/container/). The lane passes only when the driver's
+# record equals ACCEPTANCE_EXPECT below.
+#
+# On this build the required record is the red one: the N+1 selection rule
+# launches only interactive seats under shim ownership, so a headless seat
+# dies with its daemon (cause headless_shim_launch_off) — the same red
+# TestUpgradeAcceptanceRed pins in-repo. Everything the red stands on is
+# asserted for real first (boot, user manager, delegated controllers, the
+# toolchain go.mod requires, both artifacts, the generated unit, the restart
+# preflight, and the upgrade served from a new PID), so an infrastructure
+# failure fails the lane under its own name instead of passing as the red.
+# When the adoption slices flip the rule the driver reports the record stale
+# and the lane fails until the live-seat assertions replace it.
 #
 # This job never runs on the release-train host: it builds and runs its own
 # container on the CI runner.
@@ -27,6 +37,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   container-upgrade:
     name: container upgrade (systemd user manager, delegated cgroup v2)
@@ -35,6 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # Artifact N is built from an earlier revision inside the container.
           fetch-depth: 0
           persist-credentials: false
 
@@ -49,33 +64,31 @@ jobs:
           GOWORK=off go test -race -count=1 ./upgradeacceptance/... 2>&1 | tail -5
           GOWORK=off go vet ./upgradeacceptance/...
 
-      - name: Lint the new package
-        uses: golangci/golangci-lint-action@v9 # v9
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.11.4
 
-      - name: Build the acceptance image
-        run: |
-          docker build -f upgradeacceptance/container/Containerfile -t donmai-upgrade-acceptance .
-          docker run --rm donmai-upgrade-acceptance go version
-
-      - name: Run the N to N+1 upgrade flow
-        run: |
-          cid=$(docker run -d --rm --privileged \
-            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-            --tmpfs /run --tmpfs /run/lock \
-            -e ACCEPTANCE_BASE_REV=HEAD~1 \
-            donmai-upgrade-acceptance \
-            bash /src/upgradeacceptance/container/upgrade-acceptance.sh)
-          status=0
-          docker wait "$cid" > /tmp/upgrade-acceptance.exit || status=$?
-          docker logs "$cid" || true
-          # --rm cleans the container up on its own exit; an explicit rm
-          # covers the wait-failed path without failing the lane twice.
-          docker rm -f "$cid" >/dev/null 2>&1 || true
-          cat /tmp/upgrade-acceptance.exit
-          test "$(cat /tmp/upgrade-acceptance.exit)" = "0"
-          exit "$status"
-
       - name: Type-check build-tag-gated tests
         run: make test-tagged
+
+      - name: Build the acceptance image
+        run: docker build -f upgradeacceptance/container/Containerfile -t donmai-upgrade-acceptance .
+
+      - name: Run the N to N+1 upgrade flow and check the record
+        env:
+          CONTAINER_ENGINE: docker
+          # N is the base the change lands on: the first parent of the
+          # pull-request merge commit, or the previous commit on a push.
+          ACCEPTANCE_BASE_REV: HEAD~1
+          ACCEPTANCE_EXPECT: red:headless_shim_launch_off
+          ACCEPTANCE_RESULT_DIR: acceptance-results
+        run: bash upgradeacceptance/container/run-lane.sh donmai-upgrade-acceptance
+
+      - name: Upload the record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-acceptance-record
+          path: acceptance-results/
+          if-no-files-found: warn

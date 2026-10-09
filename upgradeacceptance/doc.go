@@ -25,18 +25,27 @@
 // Layout:
 //
 //   - testdata/fakeharness — the scripted fake harness binary (pi RPC line
-//     protocol, trigger-file gating, session-owned transcript variant).
+//     protocol, trigger-file gating with distinct release, abort and
+//     timeout verdicts, session-owned transcript variant, start marker).
 //   - stubreceiver.go — the stub hosted receiver (lease refresh, step
 //     heartbeat, terminal status with exact replay; worker id rotation on
-//     re-registration).
-//   - failurematrix.go — the D6 failure matrix as table-driven cases.
-//   - container/Containerfile + container/upgrade-acceptance.sh — the
-//     systemd user-manager image and the N→N+1 driver.
-//   - accept_test.go — the in-repo acceptance test driving the production
-//     entry points (local runtime intake → dispatch → local receiver) with
-//     real binaries.
+//     re-registration, with or without an overlap window).
+//   - failurematrix.go — the D6 failure matrix as table-driven cases; every
+//     local row names its in-repo driver.
+//   - container/Containerfile, container/run-lane.sh and
+//     container/upgrade-acceptance.sh — the systemd user-manager image, the
+//     host-side lane runner, and the N→N+1 driver.
+//   - accept_test.go and record_probe_test.go — the in-repo suite driving
+//     the production entry points, the red record, and the record probe the
+//     container driver runs from the N+1 tree.
 //
-// The container driver and the CI job (.github/workflows/upgrade-acceptance.yml)
-// are the record of the red run: they capture the failure cause, and they
-// pass once the adoption slices land.
+// The container lane (.github/workflows/upgrade-acceptance.yml) asserts the
+// flow's infrastructure for real — systemd as PID 1, the user manager and
+// its delegated controllers, the toolchain go.mod requires, both artifacts,
+// the generated unit, the restart preflight, and the upgrade served from a
+// new PID — and then records the acceptance case from the N+1 selection
+// rule. On current main that record is red (headless_shim_launch_off) and
+// the lane requires exactly it: an infrastructure failure, another cause,
+// or a stale record (the rule flipped without the live-seat assertions)
+// fails the lane.
 package upgradeacceptance
