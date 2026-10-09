@@ -1103,20 +1103,19 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if cfg.LocalRuntime == nil || cfg.LocalRuntime.Harness == "" || cfg.LocalRuntime.Model == "" || len(cfg.LocalRuntime.Repositories) == 0 {
 			// A fresh-host seed (file queue URL with an explicit policy
 			// but no harness or repository profile yet) reaches Start
-			// without the shipped composition the entry point would
-			// supply — and without the profile the composition could
-			// not serve. Refuse with the operator action before any
-			// runtime, heartbeat, or poller starts, not an internal
-			// wiring complaint.
-			return errors.New("daemon is not configured yet: run `host setup` to choose a harness and repository, then restart")
+			// without the profile the composition could not serve.
+			// Refuse with the operator action before any runtime,
+			// heartbeat, or poller starts, not an internal wiring
+			// complaint. The typed refusal maps to the no-restart
+			// setup exit at the entry point.
+			return afclient.ErrNeedsSetup
 		}
 		if d.opts.LocalRuntime == nil || d.opts.LocalRuntime.NewCompiler == nil {
-			// A fresh-host seed (file queue URL with an explicit policy
-			// but no harness or repository profile yet) reaches Start
-			// without the shipped composition the entry point
-			// supplies. Refuse with the operator action, not an
-			// internal wiring complaint.
-			return errors.New("daemon is not configured yet: run `host setup` to choose a harness and repository, then restart")
+			// The shipped composition is missing — an embedder wiring
+			// fault, not an unconfigured host. Its own message keeps
+			// the journal grep for the setup action from
+			// misdiagnosing a misbuilt composition as "not set up yet".
+			return errors.New("local runtime composition missing: reinstall or report a bug")
 		}
 		local, err = newLocalRuntime(ctx, d, cfg)
 		if err != nil {

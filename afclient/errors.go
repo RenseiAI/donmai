@@ -30,6 +30,12 @@ var (
 	// prepare every authority scope for a planned restart. Callers must not invoke
 	// the service manager after this error.
 	ErrRestartPreflightRefused = errors.New("daemon restart preflight refused")
+	// ErrNeedsSetup is the typed setup refusal the service entry point
+	// returns when the host has no harness or repository profile yet
+	// (fresh-host seed). The entry point maps it to ExitCodeNeedsSetup
+	// so the supervisor holds the unit failed instead of restarting it
+	// every RestartSec while it waits for `host setup`.
+	ErrNeedsSetup = errors.New("daemon is not configured yet: run `host setup` to choose a harness and repository, then restart")
 	// ErrInvalidRestartPreflightResponse reports a 2xx response that is not the
 	// closed session-shim-restart-preflight-v1 permission schema. Unknown or
 	// malformed success is a refusal, never implied permission.

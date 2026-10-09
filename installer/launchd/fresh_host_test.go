@@ -76,3 +76,16 @@ func TestEnsureFreshHostConfigRefusesMalformedConfig(t *testing.T) {
 		t.Fatalf("EnsureFreshHostConfig(malformed) = %v, want an error naming the config", err)
 	}
 }
+
+// TestEnsureFreshHostConfigRefusesEmptyConfig pins the empty-file half: an
+// empty file loads as nil (no config) rather than failing, which would let
+// the unit run the wizard. Install refuses it loudly instead.
+func TestEnsureFreshHostConfigRefusesEmptyConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	if err := os.WriteFile(path, []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureFreshHostConfig(path); err == nil {
+		t.Fatal("EnsureFreshHostConfig(empty) succeeded; want a loud refusal")
+	}
+}

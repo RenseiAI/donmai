@@ -150,7 +150,7 @@ for pair in "donmai-n:${N_VERSION}" "donmai-next:${NEXT_VERSION}"; do
 done
 checkpoint artifacts "N=${N_VERSION} N+1=${NEXT_VERSION}"
 
-# --- 3. Fresh-install N as a user service, then run --------------------------
+# --- 3. Fresh-install N+1 as a user service, then run ----------------------
 # Fresh-install-then-run: no config exists when install runs, so install
 # seeds the fresh-host config and the unit starts without the interactive
 # first-run wizard (the unit's stdin is /dev/null, a character device that
@@ -160,9 +160,11 @@ checkpoint artifacts "N=${N_VERSION} N+1=${NEXT_VERSION}"
 # answer; the driver then writes the standalone config the upgrade flow
 # stands on and restarts into it. Every checkpoint below stays live: the
 # fresh refusal, the seed's presence, and the configured serving state are
-# each asserted, never assumed.
+# each asserted, never assumed. The fresh install runs artifact N+1 (this
+# revision): N predates the seed/refusal and cannot assert what it never
+# implemented — N still proves the upgrade half of the lane below.
 rm -f "${HOME}/.donmai/daemon.yaml"
-install -m 0755 "${WORK}/donmai-n" "${INSTALL_PATH}"
+install -m 0755 "${WORK}/donmai-next" "${INSTALL_PATH}"
 INSTALL_OUT="$("${INSTALL_PATH}" host install --user 2>&1)" || infra install_failed "${INSTALL_OUT}"
 SEED_PATH="${HOME}/.donmai/daemon.yaml"
 [ -f "${SEED_PATH}" ] || infra fresh_seed_missing "host install wrote no config at ${SEED_PATH}"
@@ -176,15 +178,18 @@ UNIT="$(basename "${UNIT_PATH}")"
 # install under test.
 EXEC_PATH="$(systemctl --user show -p ExecStart --value "${UNIT}" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -1)"
 [ -n "${EXEC_PATH}" ] && [ -x "${EXEC_PATH}" ] || infra unit_exec_unresolved "${UNIT}: ExecStart path '${EXEC_PATH}'"
-"${EXEC_PATH}" --version 2>&1 | grep -qF "${N_VERSION}" || infra unit_exec_not_n "${EXEC_PATH} is not artifact N"
+"${EXEC_PATH}" --version 2>&1 | grep -qF "${NEXT_VERSION}" || infra unit_exec_not_next "${EXEC_PATH} is not artifact N+1"
 checkpoint unit "${UNIT} ExecStart=${EXEC_PATH}"
 # The fresh unit must refuse with the setup action, not crash-loop on a
 # missing answer: it never reaches serving (wait_serving times out), it
 # never restarts in a storm, and the journal names the fix. The refusal
-# exit is stable — Restart=on-failure does not re-fire on it — so the
-# start count stays flat while the unit waits for its config.
+# exits with the setup status the unit holds failed
+# (RestartPreventExitStatus), so Restart=on-failure does not re-fire on
+# it — the start count stays flat while the unit waits for its config.
+systemctl --user show "${UNIT}" | grep -qF 'RestartPreventExitStatus=4' \
+  || infra fresh_refusal_restartable "unit does not hold the setup refusal failed (want RestartPreventExitStatus=4)"
 STARTS_BEFORE="$(systemctl --user show -p NRestarts --value "${UNIT}")"
-if wait_serving_timeout "${N_VERSION}" 0 12 >/dev/null 2>&1; then
+if wait_serving_timeout "${NEXT_VERSION}" 0 12 >/dev/null 2>&1; then
   infra fresh_unit_served "the fresh-host unit served without a harness or repository profile; it must refuse until setup completes"
 fi
 STARTS_AFTER="$(systemctl --user show -p NRestarts --value "${UNIT}")"
@@ -205,12 +210,25 @@ capacity:
 orchestrator:
   url: http://127.0.0.1:1
 YAML
+# The installed N+1 binary is refreshed from N+1 (same artifact the fresh
+# install laid down) before the configured restart, so the serving state
+# below proves the standalone config — never a stale ExecStart copy.
+cp "${WORK}/donmai-next" "${EXEC_PATH}.next"
+mv -f "${EXEC_PATH}.next" "${EXEC_PATH}"
 systemctl --user restart "${UNIT}" || infra restart_failed "$(unit_diagnostics)"
-N_STATUS="$(wait_serving "${N_VERSION}" 0)" || infra n_not_serving "$(unit_diagnostics)"
+N_STATUS="$(wait_serving "${NEXT_VERSION}" 0)" || infra n_not_serving "$(unit_diagnostics)"
 N_PID="$(jq -r '.pid' <<<"${N_STATUS}")"
-checkpoint n_serving "version=${N_VERSION} pid=${N_PID}"
+checkpoint n_serving "version=${NEXT_VERSION} pid=${N_PID}"
 
-# --- 4. Preflight, replace, restart --------------------------------------------
+# --- 4. Preflight, downgrade to N, upgrade to N+1 ---------------------------
+# The N/N+1 upgrade half of the lane: replace the installed N+1 with N,
+# restart into N, then replace with N+1 and restart into N+1 from a new
+# PID. The N+1 selection-rule record below is read from the final N+1.
+cp "${WORK}/donmai-n" "${EXEC_PATH}.next"
+mv -f "${EXEC_PATH}.next" "${EXEC_PATH}"
+systemctl --user restart "${UNIT}" || infra restart_failed "$(unit_diagnostics)"
+DOWNGRADED_STATUS="$(wait_serving "${N_VERSION}" "${N_PID}")" || infra downgrade_not_applied "$(unit_diagnostics)"
+checkpoint downgraded "version=${N_VERSION} pid=$(jq -r '.pid' <<<"${DOWNGRADED_STATUS}")"
 TOKEN_FILE="${HOME}/.donmai/control-token"
 AUTH=()
 [ -r "${TOKEN_FILE}" ] && AUTH=(-H "Authorization: Bearer $(cat "${TOKEN_FILE}")")
@@ -225,7 +243,8 @@ esac
 cp "${WORK}/donmai-next" "${EXEC_PATH}.next"
 mv -f "${EXEC_PATH}.next" "${EXEC_PATH}"
 systemctl --user restart "${UNIT}" || infra restart_failed "$(unit_diagnostics)"
-NEXT_STATUS="$(wait_serving "${NEXT_VERSION}" "${N_PID}")" || infra upgrade_not_applied "$(unit_diagnostics)"
+DOWNGRADED_PID="$(jq -r '.pid' <<<"${DOWNGRADED_STATUS}")"
+NEXT_STATUS="$(wait_serving "${NEXT_VERSION}" "${DOWNGRADED_PID}")" || infra upgrade_not_applied "$(unit_diagnostics)"
 NEXT_PID="$(jq -r '.pid' <<<"${NEXT_STATUS}")"
 checkpoint upgraded "version=${NEXT_VERSION} pid=${NEXT_PID}"
 # Context only: the configured ownership mode. It is derived from the two

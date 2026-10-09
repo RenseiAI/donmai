@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // TestServiceModeStdinSkipsWizardWithDevNullStdin pins the crash-loop root
@@ -55,6 +58,27 @@ func TestServiceModeStdinDetectsRegularFile(t *testing.T) {
 // install` writes and the non-interactive first-run path starts from must
 // load under validateConfig. A seed that does not load reopens the
 // crash loop it was meant to close.
+// TestFreshHostSeedCarriesV2Header pins the header the container lane
+// asserts: the written seed file starts with the local-runtime schema
+// version, not a bare constant comparison that stays green if the
+// constant ever drifts.
+func TestFreshHostSeedCarriesV2Header(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	if err := WriteConfig(path, FreshHostConfig()); err != nil {
+		t.Fatalf("write fresh-host config: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "apiVersion: "+LocalRuntimeConfigAPIVersion+"\n") {
+		t.Fatalf("seed file carries no %q line:\n%.500s", "apiVersion: "+LocalRuntimeConfigAPIVersion, raw)
+	}
+	if LocalRuntimeConfigAPIVersion != "donmai.dev/v2" {
+		t.Fatalf("seed schema constant = %q, want the header the container lane asserts", LocalRuntimeConfigAPIVersion)
+	}
+}
+
 func TestFreshHostConfigLoads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.yaml")
 	if err := WriteConfig(path, FreshHostConfig()); err != nil {
@@ -84,6 +108,10 @@ func TestFreshHostConfigLoads(t *testing.T) {
 // written (the start falls back to an in-memory default the next restart
 // cannot see) or when the written file does not load.
 func TestNonInteractiveFirstRunSeedsFreshHostConfig(t *testing.T) {
+	// The seed decision reads DONMAI_ORCHESTRATOR_URL: an image-exported
+	// orchestrator URL selects the plain default, not the seed. Pin the
+	// fresh-host contract (no operator URL) so the test is hermetic.
+	t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
 	path := filepath.Join(t.TempDir(), "daemon.yaml")
 	existing, err := LoadConfig(path)
 	if err != nil {
@@ -105,6 +133,25 @@ func TestNonInteractiveFirstRunSeedsFreshHostConfig(t *testing.T) {
 	}
 	if loaded.Orchestrator.URL != cfg.Orchestrator.URL {
 		t.Errorf("persisted URL = %q, want %q", loaded.Orchestrator.URL, cfg.Orchestrator.URL)
+	}
+}
+
+// TestNonInteractiveFirstRunKeepsExplicitOrchestratorURL pins the other
+// half of the seed contract: an explicit operator orchestrator URL keeps
+// the plain default (stub/platform path) instead of the fresh-host file
+// queue. It drives the same production first-run path as the seed test.
+func TestNonInteractiveFirstRunKeepsExplicitOrchestratorURL(t *testing.T) {
+	t.Setenv("DONMAI_ORCHESTRATOR_URL", "http://127.0.0.1:1")
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	cfg, err := RunSetupWizard(WizardOptions{ConfigPath: path, SkipWizard: true})
+	if err != nil {
+		t.Fatalf("non-interactive first run: %v", err)
+	}
+	if cfg == nil || cfg.Orchestrator.URL != "http://127.0.0.1:1" {
+		t.Fatalf("first run with an explicit orchestrator URL = %+v, want the plain default", cfg)
+	}
+	if cfg.LocalRuntime != nil {
+		t.Fatalf("explicit-URL default carries a local profile: %+v", cfg.LocalRuntime)
 	}
 }
 
@@ -130,5 +177,60 @@ func TestFreshHostSeedRefusesWithoutProfile(t *testing.T) {
 		t.Fatal("seeded start without a profile succeeded; want the setup refusal")
 	} else if !strings.Contains(err.Error(), "host setup") {
 		t.Fatalf("seeded start error = %q, want the `host setup` operator action", err)
+	} else if !errors.Is(err, afclient.ErrNeedsSetup) {
+		t.Fatalf("seeded start error = %q, want the typed setup refusal (errors.Is ErrNeedsSetup)", err)
+	}
+}
+
+// TestFreshHostSeedCompositionRefusesWithSetupAction drives the
+// composition-level refusal arm directly: a seed with no harness or
+// repository profile returns the queue root with no provider view. The
+// entry point turns that into the setup refusal; this test pins the
+// arm itself, so dropping it cannot stay green behind the Start gate.
+// (The composition helper lives in the CLI layer; the assertion here is
+// on the shape the daemon layer guarantees: seed plus no profile.)
+func TestFreshHostSeedCompositionShape(t *testing.T) {
+	cfg := FreshHostConfig()
+	if cfg.LocalRuntime == nil {
+		t.Fatal("seed carries no local runtime block")
+	}
+	if cfg.LocalRuntime.Harness != "" || cfg.LocalRuntime.Model != "" || len(cfg.LocalRuntime.Repositories) != 0 {
+		t.Fatalf("seed carries a harness or repository profile: %+v", cfg.LocalRuntime)
+	}
+	if !strings.HasPrefix(cfg.Orchestrator.URL, "file://") {
+		t.Fatalf("seed orchestrator URL = %q, want the local file queue", cfg.Orchestrator.URL)
+	}
+}
+
+// TestMissingCompositionIsNotASetupRefusal pins the second Start gate's
+// own message: a configured host whose shipped composition is missing
+// (embedder wiring fault) must not read as "not set up yet" in the
+// journal.
+func TestMissingCompositionIsNotASetupRefusal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	cfg := FreshHostConfig()
+	cfg.LocalRuntime.Harness = "codex"
+	cfg.LocalRuntime.Model = "test-model"
+	cfg.LocalRuntime.ModelAuthor = "test-author"
+	cfg.LocalRuntime.Repositories = []LocalGitHubRepository{{RepositoryID: 1, OwnerRepo: "example/repo", Label: "donmai", Ref: "main"}}
+	if err := WriteConfig(path, cfg); err != nil {
+		t.Fatalf("write configured config: %v", err)
+	}
+	d := New(Options{
+		ConfigPath: path,
+		JWTPath:    filepath.Join(dir, "daemon.jwt"),
+		SkipWizard: true,
+		HTTPHost:   "127.0.0.1",
+		HTTPPort:   0,
+		// No LocalRuntime composition: the embedder never supplied it.
+	})
+	if err := d.Start(t.Context()); err == nil {
+		_ = d.Stop(t.Context())
+		t.Fatal("start without a shipped composition succeeded; want the composition refusal")
+	} else if strings.Contains(err.Error(), "host setup") {
+		t.Fatalf("composition fault reads as a setup refusal: %q", err)
+	} else if !strings.Contains(err.Error(), "composition missing") {
+		t.Fatalf("composition fault error = %q, want the embedder-action message", err)
 	}
 }

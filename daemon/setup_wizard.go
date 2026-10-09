@@ -652,12 +652,16 @@ func FreshHostConfig() *Config {
 func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Config, error) {
 	cfg := existing
 	if cfg == nil {
-		// No operator config and no explicit orchestrator URL: seed the
-		// fresh-host file queue (with its explicit execution policy)
-		// instead of an empty URL no authored config could ever load.
-		// An explicitly configured URL (env or otherwise) keeps the
-		// plain default so stub and platform paths behave as before.
-		if DefaultConfig().Orchestrator.URL == "" {
+		// No config file on disk and no explicit non-file orchestrator
+		// URL (env or otherwise): seed the fresh-host file queue (with
+		// its explicit execution policy) instead of an empty URL no
+		// authored config could ever load. An explicit URL keeps the
+		// plain default so stub and platform paths behave as before —
+		// the seed decision reads the operator's URL, never a bare
+		// env-empty default, so ambient process env alone cannot flip
+		// a fresh host back to an in-memory default the next restart
+		// cannot see.
+		if explicitOrchestratorURL() == "" {
 			cfg = FreshHostConfig()
 		} else {
 			cfg = DefaultConfig()
@@ -676,6 +680,20 @@ func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Confi
 		}
 	}
 	return cfg, nil
+}
+
+// explicitOrchestratorURL reports the operator's explicit non-file
+// orchestrator URL from the process environment, or "" when none is
+// configured. Empty (or a file: URL, which selects the local queue,
+// never the stub/platform path) means the non-interactive first run
+// seeds the fresh-host file queue. A remote URL keeps the plain default
+// so stub registration and platform polling behave as before.
+func explicitOrchestratorURL() string {
+	raw := strings.TrimSpace(os.Getenv("DONMAI_ORCHESTRATOR_URL"))
+	if raw == "" || strings.HasPrefix(raw, "file:") {
+		return ""
+	}
+	return raw
 }
 
 // ── prompt helpers ───────────────────────────────────────────────────────

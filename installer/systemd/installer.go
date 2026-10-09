@@ -23,11 +23,14 @@
 //	                     Requires root (sudo).
 //	                     Logs visible via `journalctl -u rensei-daemon`.
 //
-// Restart contract (exit code 3):
+// Restart contract (exit codes 3 and 4):
 //
 //	The unit file uses SuccessExitStatus=3 so that exit code 3 (the daemon's
 //	EXIT_CODE_RESTART contract) is treated as a clean restart request — the
 //	crash counter is not incremented but systemd still restarts the process.
+//	Exit code 4 (EXIT_CODE_NEEDS_SETUP) is the fresh-host setup refusal:
+//	RestartPreventExitStatus=4 keeps the unit failed until the operator
+//	runs setup, instead of restarting every RestartSec while it waits.
 package systemd
 
 import (
@@ -257,6 +260,12 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		// counter is not incremented; because it is NOT in
 		// RestartPreventExitStatus, systemd still restarts the daemon.
 		"SuccessExitStatus=3",
+		// Exit code 4 = EXIT_CODE_NEEDS_SETUP: the fresh-host seed
+		// refuses without a harness or repository profile until the
+		// operator runs setup. A failed start must stay failed — the
+		// unit waits for its config instead of restarting every
+		// RestartSec until then.
+		"RestartPreventExitStatus=4",
 		// No KillMode and no Delegate, deliberately: stopping this unit keeps
 		// systemd's default control-group kill, so a direct-owned seat in the
 		// unit's cgroup ends with its daemon. A shim-owned seat survives

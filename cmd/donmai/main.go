@@ -255,6 +255,13 @@ func main() {
 		if code, ok := afcli.StubAgentExitCode(err); ok {
 			os.Exit(code)
 		}
+		// The fresh-host setup refusal's whole purpose is to exit with
+		// a status the supervisor holds failed (RestartPreventExitStatus)
+		// instead of restarting. Flattening that to 1 here would turn
+		// the unit's wait-for-setup into a restart every RestartSec.
+		if code, ok := afcli.NeedsSetupExitCode(err); ok {
+			os.Exit(code)
+		}
 		os.Exit(1)
 	}
 }

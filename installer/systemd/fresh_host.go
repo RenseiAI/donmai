@@ -1,12 +1,7 @@
 package systemd
 
 import (
-	"bytes"
-	"errors"
-	"fmt"
-	"os"
-
-	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/installer/freshhost"
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
@@ -31,25 +26,5 @@ func EnsureFreshHostConfig(path string) (seeded bool, err error) {
 	if path == "" {
 		path = DefaultConfigPath()
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // operator config path
-	if err == nil {
-		if len(bytes.TrimSpace(raw)) == 0 {
-			return false, fmt.Errorf("systemd: daemon config %s is empty — move it aside or run `host setup`", path)
-		}
-		if _, err := daemon.LoadConfig(path); err != nil {
-			return false, fmt.Errorf("systemd: daemon config %s does not load: %w", path, err)
-		}
-		return false, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("systemd: read daemon config %s: %w", path, err)
-	}
-	cfg := daemon.FreshHostConfig()
-	if err := daemon.WriteConfig(path, cfg); err != nil {
-		return false, fmt.Errorf("systemd: write fresh-host daemon config %s: %w", path, err)
-	}
-	if _, err := daemon.LoadConfig(path); err != nil {
-		return false, fmt.Errorf("systemd: fresh-host daemon config %s does not load: %w", path, err)
-	}
-	return true, nil
+	return freshhost.EnsureConfig(path, "systemd")
 }

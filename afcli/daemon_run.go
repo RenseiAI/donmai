@@ -360,8 +360,9 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// Refuse with the operator action before the daemon
 				// starts any runtime, heartbeat, or poller — Daemon.Start
 				// repeats the same refusal for callers that bypass this
-				// entry point.
-				return errors.New("daemon is not configured yet: run `host setup` to choose a harness and repository, then restart")
+				// entry point. The typed refusal maps to the
+				// no-restart setup exit below.
+				return afclient.ErrNeedsSetup
 			default:
 				providerView, err = daemonProviderView(cfg, slog.Default())
 				if err != nil {
