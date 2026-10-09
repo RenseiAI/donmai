@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,9 +43,11 @@ func shimSeatRunner(t *testing.T, manager *worktree.Manager, poster *result.Post
 
 // TestShimSeatPersistsTerminalBodyBeforeFirstSend drives the production Run
 // entry point with the standalone outbox enabled and the status endpoint
-// refusing every send. The run must still persist the exact terminal bytes
-// before that first refused send, so a later daemon replay delivers them
-// byte-identically.
+// refusing every send. The receiver inspects the outbox at the moment the
+// FIRST status request arrives: the record must already be durable and hold
+// exactly the bytes on the wire. Checking only after Run returns cannot tell
+// persist-then-send from send-then-persist, and only the first ordering
+// survives a runner killed mid-send.
 func TestShimSeatPersistsTerminalBodyBeforeFirstSend(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git unavailable")
@@ -56,12 +59,44 @@ func TestShimSeatPersistsTerminalBodyBeforeFirstSend(t *testing.T) {
 		t.Fatal(err)
 	}
 	var statusAttempts atomic.Int64
+	var firstSend struct {
+		sync.Mutex
+		seen      bool
+		loadErr   error
+		sameBytes bool
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if strings.HasSuffix(req.URL.Path, "/lock-refresh") {
 			_, _ = w.Write([]byte(`{"refreshed":true}`))
 			return
 		}
 		if strings.HasSuffix(req.URL.Path, "/status") {
+			wire, readErr := ioReadAll(req)
+			var posted struct {
+				Status string `json:"status"`
+			}
+			if readErr == nil && json.Unmarshal(wire, &posted) == nil && posted.Status == "running" {
+				// The start-of-session running transition is not the
+				// terminal send this test is about.
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			firstSend.Lock()
+			if !firstSend.seen {
+				firstSend.seen = true
+				loaded, loadErr := manager.LoadStandaloneTerminalOutbox(req.Context(), runnerLeaseSessionID, 1)
+				switch {
+				case readErr != nil:
+					firstSend.loadErr = readErr
+				case loadErr != nil:
+					firstSend.loadErr = loadErr
+				default:
+					retained, bodyErr := loaded.Record.Body()
+					firstSend.loadErr = bodyErr
+					firstSend.sameBytes = bodyErr == nil && bytes.Equal(retained, wire)
+				}
+			}
+			firstSend.Unlock()
 			statusAttempts.Add(1)
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -83,6 +118,15 @@ func TestShimSeatPersistsTerminalBodyBeforeFirstSend(t *testing.T) {
 	}
 	if statusAttempts.Load() == 0 {
 		t.Fatal("status endpoint was never attempted")
+	}
+	firstSend.Lock()
+	seen, loadErr, sameBytes := firstSend.seen, firstSend.loadErr, firstSend.sameBytes
+	firstSend.Unlock()
+	if !seen || loadErr != nil {
+		t.Fatalf("standalone outbox not durable when the first status send arrived: seen=%v err=%v", seen, loadErr)
+	}
+	if !sameBytes {
+		t.Fatal("first status send carried bytes other than the persisted outbox body")
 	}
 	// The send failed, so the run reports the post failure — but the exact
 	// bytes must already be durable in the standalone outbox.
@@ -219,6 +263,7 @@ func TestShimSeatPersistFailureKeepsSeatOutcome(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if strings.HasSuffix(req.URL.Path, "/lock-refresh") {
 			_, _ = w.Write([]byte(`{"refreshed":true}`))
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 	}))

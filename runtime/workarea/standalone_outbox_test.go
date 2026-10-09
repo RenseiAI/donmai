@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -278,24 +280,31 @@ func TestSaveStandaloneOutboxRejectsInvalidSaveSpec(t *testing.T) {
 		{"empty body", func(s *StandaloneOutboxSaveSpec) { s.Body = nil }},
 		{"zero deadline", func(s *StandaloneOutboxSaveSpec) { s.DeadlineAt = time.Time{} }},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			spec := valid
-			tc.mutate(&spec)
-			if _, err := store.SaveStandaloneOutbox(context.Background(), spec); err == nil {
-				t.Fatal("invalid save spec was accepted")
-			}
-		})
-	}
+	// The parallel subtests run inside a group so the leftover check below
+	// runs after every refused save has finished. Paused t.Parallel subtests
+	// only start once their parent function returns, so a check placed
+	// directly after the loop would run before any save was attempted.
+	t.Run("refused", func(t *testing.T) {
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				spec := valid
+				tc.mutate(&spec)
+				if _, err := store.SaveStandaloneOutbox(context.Background(), spec); err == nil {
+					t.Fatal("invalid save spec was accepted")
+				}
+			})
+		}
+	})
 
-	// None of the refused saves left a record behind: the authority holds
-	// no standalone outbox envelopes at all.
-	envelopes, err := store.listStandaloneOutbox()
-	if err != nil {
+	// None of the refused saves left a record behind. Count raw directory
+	// entries rather than decoded envelopes: a leftover record from a
+	// refused spec need not decode.
+	entries, err := os.ReadDir(store.standaloneOutboxDir())
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal(err)
 	}
-	if len(envelopes) != 0 {
-		t.Fatalf("refused saves left %d records behind", len(envelopes))
+	if len(entries) != 0 {
+		t.Fatalf("refused saves left %d records behind", len(entries))
 	}
 }
