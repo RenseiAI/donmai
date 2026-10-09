@@ -16,13 +16,17 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
-// fakeRunner is a controllable RunnerProcess: a real spawned process the
-// headless shim supervises without spawning anything of its own. It sleeps
-// until stopped or finished, so its PID pins, its exit is observed, and the
-// reap is proven against the OS rather than asserted.
+// fakeRunner is a controllable out-of-process RunnerProcess: a real spawned
+// process the headless shim supervises without spawning anything of its own.
+// It sleeps until stopped or finished, so its PID pins, its exit is observed,
+// and the reap is proven against the OS rather than asserted. Its harness is
+// that one pinned process, so its reap proof is the pinned identity being
+// gone; the in-process runner (inProcessRunner) proves a harness group gone
+// instead.
 type fakeRunner struct {
 	mu       sync.Mutex
 	cmd      *exec.Cmd
+	identity ProcessIdentity
 	done     chan struct{}
 	exit     RunnerExit
 	exitOK   bool
@@ -37,7 +41,12 @@ func newFakeRunner(t *testing.T) *fakeRunner {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fake runner: %v", err)
 	}
-	f := &fakeRunner{cmd: cmd, done: make(chan struct{})}
+	started, err := processStartTime(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("pin fake runner identity: %v", err)
+	}
+	f := &fakeRunner{cmd: cmd, identity: ProcessIdentity{PID: cmd.Process.Pid, StartedAt: started}, done: make(chan struct{})}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
@@ -90,6 +99,15 @@ func (f *fakeRunner) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// HarnessGroupsReaped proves the one pinned harness process gone.
+func (f *fakeRunner) HarnessGroupsReaped() (bool, error) {
+	alive, err := f.identity.Alive()
+	if err != nil {
+		return false, err
+	}
+	return !alive, nil
 }
 
 func (f *fakeRunner) wasStopped() bool {
