@@ -618,16 +618,31 @@ func (r *Runner) recordAttachLoss(qw QueuedWork, res *Result, err error) {
 // signals; the session still finishes, just without that activity.
 const interactiveActivityFlushGrace = 5 * time.Second
 
-// interactiveTerminalEventGrace bounds the post-flush wait for the
-// handle's terminal ResultEvent after the PTY session is Done. It must
-// cover run()'s post-exit work before the terminal send: the shim finalize
-// wait (the shim's own finalize bound plus scheduling slack), the exit
-// read, the session-file cost read, and cleanup. The shim bound is at most
-// 2×5s courtesy windows (sessionshim.maxFinalizeWaitBound); the grace adds
-// scheduling slack on top, so a slow host still observes the contractually
-// promised event instead of timing out on it. Waiting longer than needed
-// only delays the session result; returning early loses the token cost.
+// interactiveTerminalEventGrace bounds the post-flush wait for a handle's
+// terminal ResultEvent after the PTY session is Done — and it runs ONLY
+// when the handle declares a harness-accounted cost is coming (see
+// agent.InteractiveTerminalCostSource). It must cover run()'s post-exit
+// work before the terminal send: the shim finalize wait (the shim's own
+// finalize bound plus scheduling slack), the exit read, the session-file
+// cost read, and cleanup. The shim bound is at most 2x5s courtesy windows
+// (sessionshim.maxFinalizeWaitBound); the grace adds scheduling slack on
+// top, so a slow host still observes the contractually promised event
+// instead of timing out on it. Waiting when no cost is coming would stall
+// every costless session end for the full grace — the inject suite's
+// handles never send a terminal at all — so the wait is conditional and
+// session end stays immediate for them.
 const interactiveTerminalEventGrace = 12 * time.Second
+
+// handleReportsTerminalCost reports whether handle will attach a
+// harness-accounted cost to its terminal ResultEvent. Only then does the
+// post-exit drain wait for an in-flight terminal: every other handle
+// finishes the instant its channel closes, exactly as before the terminal
+// wait existed. A test decorator (runner's testInteractiveHandle) forwards
+// the declaration through, so tests exercise the production wait rule.
+func handleReportsTerminalCost(handle agent.Handle) bool {
+	src, ok := handle.(agent.InteractiveTerminalCostSource)
+	return ok && src.HasTerminalCost()
+}
 
 // forwardInteractiveHandleEvent posts the handle events an interactive session
 // surfaces as activity: the typed harness-state-loss condition and, for
@@ -666,7 +681,10 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 // anything — so a non-blocking drain would return on the still-empty channel
 // and lose the terminal event. The post-flush tail therefore WAITS for the
 // terminal ResultEvent (or channel close) bounded by
-// interactiveTerminalEventGrace, instead of returning on an empty read.
+// interactiveTerminalEventGrace — but ONLY when the handle declares a
+// harness-accounted cost is coming (handleReportsTerminalCost). A handle
+// with no cost coming (no terminal will ever arrive) returns on the first
+// empty read exactly as before, so costless sessions finish immediately.
 func (r *Runner) drainInteractiveActivity(
 	ctx context.Context,
 	handle agent.Handle,
@@ -698,11 +716,34 @@ func (r *Runner) drainInteractiveActivity(
 			}
 		}
 	}
-	// After the flush (or for a handle with no flush), the terminal
-	// ResultEvent is still in flight: run() sends it only after its
-	// post-exit work, which starts the instant Done fires. Block for it
-	// (or channel close) bounded by interactiveTerminalEventGrace so the
-	// event run() is contractually about to send is always observed.
+	// After the flush (or for a handle with no flush), a cost-bearing
+	// handle's terminal ResultEvent may still be in flight: run() sends it
+	// only after its post-exit work, which starts the instant Done fires.
+	// Block for it (or channel close) bounded by
+	// interactiveTerminalEventGrace so the event run() is contractually
+	// about to send is always observed — but only when the handle declares
+	// one is coming. A handle with no cost coming keeps the historical
+	// non-blocking drain: the first empty read returns immediately.
+	if !handleReportsTerminalCost(handle) {
+		// No cost coming: the historical non-blocking drain. The
+		// first empty read returns immediately, exactly as before
+		// the terminal wait existed.
+		for {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
+				r.reportQuotaEvent(ctx, qw.SessionID, event)
+				r.applyInteractiveTerminalEvent(event, res)
+				r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
+			default:
+				return
+			}
+		}
+	}
+	// A cost-bearing handle's terminal is still in flight: block for it
+	// (or channel close) bounded by interactiveTerminalEventGrace.
 	// A ResultEvent already consumed on the steady-state branch merges
 	// idempotently below, so observing it here too is safe.
 	grace := time.NewTimer(interactiveTerminalEventGrace)

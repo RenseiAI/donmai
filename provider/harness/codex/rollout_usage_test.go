@@ -1,16 +1,21 @@
 package codex
 
-// Fixture session file for the interactive terminal-usage path: a thread
-// with two model calls, then a forked subagent's appended resume segment
-// (a second session_meta plus a compacted line, as observed on real files),
-// then one more call on the original thread. The terminal cost must be the
-// original thread's last cumulative total — never the fork's, never a sum.
+// Fixture session files for the interactive terminal-usage path, in the
+// shape real rollouts take: ONE file per thread. The parent thread has
+// three model calls in its own file; its subagent runs as a separate
+// thread in its own file, named by a session_meta record carrying
+// source.subagent.thread_spawn.parent_thread_id. A genuinely different
+// thread that merely shares the parent's file never moves the total.
+// The terminal cost must be the parent's last cumulative PLUS the
+// subagent's own last cumulative — never the parent alone, never a
+// per-call count presented as a total.
 
 import (
 	"context"
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,27 +24,17 @@ import (
 
 const (
 	rolloutFixtureThreadID = "thread-terminal-usage"
-	rolloutFixtureForkID   = "thread-forked-subagent"
+	rolloutFixtureSubID    = "thread-subagent-usage"
+	rolloutFixtureOtherID  = "thread-other-usage"
 )
 
-func writeRolloutFixture(t *testing.T, home string) string {
+func writeRolloutFile(t *testing.T, home, threadID string, lines []string) string {
 	t.Helper()
-	lines := []string{
-		`{"type":"session_meta","payload":{"id":"` + rolloutFixtureThreadID + `"}}`,
-		usageLine(rolloutFixtureThreadID, 1000, 800, 10, 50, 4, 2000, 1600, 20, 100, 8),
-		usageLine(rolloutFixtureThreadID, 1500, 1200, 30, 90, 6, 3000, 2400, 50, 190, 14),
-		`{"type":"session_meta","payload":{"id":"` + rolloutFixtureForkID + `","forked_from_id":"` + rolloutFixtureThreadID + `"}}`,
-		`{"type":"compacted","payload":{"message":""}}`,
-		usageLine(rolloutFixtureForkID, 9000, 1000, 0, 400, 40, 9000, 1000, 0, 400, 40),
-		`{"type":"event_msg","payload":{"message":"done"}}`,
-		`not json at all`,
-		usageLine(rolloutFixtureThreadID, 1800, 1500, 40, 120, 9, 3600, 3000, 70, 240, 20),
-	}
 	dir := filepath.Join(home, codexSessionStateSubdir, "2026", "10", "09")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "rollout-2026-10-09T00-00-00-"+rolloutFixtureThreadID+".jsonl")
+	path := filepath.Join(dir, "rollout-2026-10-09T00-00-00-"+threadID+".jsonl")
 	body := ""
 	for _, line := range lines {
 		body += line + "\n"
@@ -48,6 +43,33 @@ func writeRolloutFixture(t *testing.T, home string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func subagentMetaLine(threadID, parentID string) string {
+	return `{"type":"session_meta","payload":{"id":"` + threadID +
+		`","source":{"subagent":{"thread_spawn":{"parent_thread_id":"` + parentID + `"}}}}}`
+}
+
+func writeRolloutFixture(t *testing.T, home string) string {
+	t.Helper()
+	writeRolloutFile(t, home, rolloutFixtureSubID, []string{
+		subagentMetaLine(rolloutFixtureSubID, rolloutFixtureThreadID),
+		// A subagent's cumulative starts fresh: its first record's
+		// usage equals its thread total.
+		usageLine(rolloutFixtureSubID, 9000, 1000, 0, 900, 90, 9000, 1000, 0, 900, 90),
+		usageLine(rolloutFixtureSubID, 500, 100, 0, 60, 6, 9500, 1100, 0, 960, 96),
+	})
+	return writeRolloutFile(t, home, rolloutFixtureThreadID, []string{
+		`{"type":"session_meta","payload":{"id":"` + rolloutFixtureThreadID + `"}}`,
+		usageLine(rolloutFixtureThreadID, 1000, 800, 10, 50, 4, 2000, 1600, 20, 100, 8),
+		usageLine(rolloutFixtureThreadID, 1500, 1200, 30, 90, 6, 3000, 2400, 50, 190, 14),
+		// A genuinely different thread sharing the parent's file never
+		// moves the parent's total.
+		usageLine(rolloutFixtureOtherID, 9000, 1000, 0, 400, 40, 9000, 1000, 0, 400, 40),
+		`{"type":"event_msg","payload":{"message":"done"}}`,
+		`not json at all`,
+		usageLine(rolloutFixtureThreadID, 1800, 1500, 40, 120, 9, 3600, 3000, 70, 240, 20),
+	})
 }
 
 func usageLine(thread string, in, cached, written, out, reasoning, cumIn, cumCached, cumWritten, cumOut, cumReasoning int64) string {
@@ -95,26 +117,28 @@ func TestReadRolloutUsage_LastCumulativeTotalWins(t *testing.T) {
 		t.Fatal("no totals for the fixture thread")
 	}
 	// Last cumulative thread_token_usage: in=3600 cached=3000 written=70
-	// out=240 reasoning=20. Input excludes both cache buckets.
+	// out=240 reasoning=20. Input excludes both cache buckets. The other
+	// thread's records in the same file never move this total.
 	if totals.InputTokens != 530 || totals.CachedInputTokens != 3000 || totals.CacheWriteTokens != 70 ||
 		totals.OutputTokens != 240 || totals.ReasoningTokens != 20 {
 		t.Fatalf("totals = %+v, want input=530 cached=3000 written=70 output=240 reasoning=20", totals)
 	}
 }
 
-func TestReadRolloutUsage_ForkedThreadNeverMovesTheTotal(t *testing.T) {
+func TestReadRolloutUsage_OtherThreadInSameFileNeverMovesTheTotal(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
 	path := writeRolloutFixture(t, home)
 
-	totals := readRolloutUsage(path, rolloutFixtureForkID)
+	totals := readRolloutUsage(path, rolloutFixtureOtherID)
 	if totals == nil || !totals.Found {
-		t.Fatal("no totals for the forked thread")
+		t.Fatal("no totals for the other thread")
 	}
-	// The fork's own single record: in=9000 cached=1000 out=400 reasoning=40.
+	// The other thread's own single record: in=9000 cached=1000 out=400
+	// reasoning=40.
 	if totals.InputTokens != 8000 || totals.CachedInputTokens != 1000 ||
 		totals.OutputTokens != 400 || totals.ReasoningTokens != 40 {
-		t.Fatalf("fork totals = %+v, want input=8000 cached=1000 output=400 reasoning=40", totals)
+		t.Fatalf("other totals = %+v, want input=8000 cached=1000 output=400 reasoning=40", totals)
 	}
 }
 
@@ -201,9 +225,14 @@ func TestRolloutUsageCost_RealTokensZeroPrice(t *testing.T) {
 	if cost == nil {
 		t.Fatal("no terminal cost for the fixture thread")
 	}
+	// Parent last cumulative (input=530 cached=3000 written=70 output=240
+	// reasoning=20) PLUS the subagent's own last cumulative (its first
+	// record's usage equals its total, so input=9500-1100=8400 cached=1100
+	// output=960 reasoning=96). Reading the parent file alone would
+	// report the parent total as complete — a large undercount.
 	want := &agent.CostData{
-		InputTokens: 530, CachedInputTokens: 3000, CacheWriteTokens: 70,
-		OutputTokens: 240, ReasoningTokens: 20,
+		InputTokens: 8930, CachedInputTokens: 4100, CacheWriteTokens: 70,
+		OutputTokens: 1200, ReasoningTokens: 116,
 	}
 	if *cost != *want {
 		t.Fatalf("terminal cost = %+v, want %+v", cost, want)
@@ -467,5 +496,199 @@ func TestSpawnInteractive_TerminalResultWithoutSessionFileKeepsBareResult(t *tes
 	}
 	if result.Cost != nil {
 		t.Fatalf("terminal cost = %+v with no session file, want nil", result.Cost)
+	}
+}
+
+func TestRolloutParentThreadID_SubagentNamesItsParent(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	writeRolloutFixture(t, home)
+
+	parentPath := findThreadRollout(home, rolloutFixtureThreadID)
+	if got := rolloutParentThreadID(parentPath); got != "" {
+		t.Fatalf("parent file's parent = %q, want empty (top-level session)", got)
+	}
+	subPath := findThreadRollout(home, rolloutFixtureSubID)
+	if subPath == "" {
+		t.Fatal("no session file for the fixture subagent thread")
+	}
+	if got := rolloutParentThreadID(subPath); got != rolloutFixtureThreadID {
+		t.Fatalf("subagent file's parent = %q, want %q", got, rolloutFixtureThreadID)
+	}
+	if got := rolloutParentThreadID(filepath.Join(home, "missing.jsonl")); got != "" {
+		t.Fatalf("missing file's parent = %q, want empty", got)
+	}
+}
+
+func TestSubagentThreadIDs_FindsTransitiveDescendantsOnly(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	writeRolloutFixture(t, home)
+	// A grandchild names the subagent as its parent: transitive credit must
+	// reach it. An unrelated thread names nobody and stays out.
+	grandchild := "thread-grandchild-usage"
+	unrelated := "thread-unrelated-usage"
+	writeRolloutFile(t, home, grandchild, []string{
+		subagentMetaLine(grandchild, rolloutFixtureSubID),
+		usageLine(grandchild, 100, 10, 0, 20, 2, 100, 10, 0, 20, 2),
+	})
+	writeRolloutFile(t, home, unrelated, []string{
+		`{"type":"session_meta","payload":{"id":"` + unrelated + `"}}`,
+		usageLine(unrelated, 700, 70, 0, 80, 8, 700, 70, 0, 80, 8),
+	})
+
+	got := subagentThreadIDs(home, rolloutFixtureThreadID)
+	want := map[string]bool{rolloutFixtureSubID: true, grandchild: true}
+	if len(got) != len(want) {
+		t.Fatalf("subagents of %q = %v, want %v", rolloutFixtureThreadID, got, keysOf(want))
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Fatalf("subagents of %q = %v, want %v (unexpected %q)", rolloutFixtureThreadID, got, keysOf(want), id)
+		}
+	}
+	if got := subagentThreadIDs(home, unrelated); len(got) != 0 {
+		t.Fatalf("subagents of unrelated thread = %v, want none", got)
+	}
+	if got := subagentThreadIDs(home, "thread-never-ran"); len(got) != 0 {
+		t.Fatalf("subagents of an absent thread = %v, want none", got)
+	}
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func TestRolloutUsageCost_CreditsTransitiveSubagents(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	writeRolloutFixture(t, home)
+	grandchild := "thread-grandchild-usage"
+	writeRolloutFile(t, home, grandchild, []string{
+		subagentMetaLine(grandchild, rolloutFixtureSubID),
+		usageLine(grandchild, 100, 10, 0, 20, 2, 100, 10, 0, 20, 2),
+	})
+
+	// Parent (input=530 cached=3000 written=70 output=240 reasoning=20) +
+	// subagent (input=8400 cached=1100 output=960 reasoning=96) +
+	// grandchild (input=90 cached=10 output=20 reasoning=2).
+	cost := rolloutUsageCost(home, rolloutFixtureThreadID)
+	if cost == nil {
+		t.Fatal("no terminal cost for the fixture thread")
+	}
+	want := &agent.CostData{
+		InputTokens: 9020, CachedInputTokens: 4110, CacheWriteTokens: 70,
+		OutputTokens: 1220, ReasoningTokens: 118,
+	}
+	if *cost != *want {
+		t.Fatalf("terminal cost = %+v, want %+v", cost, want)
+	}
+}
+
+func TestReadRolloutUsage_ImpossibleCountsReadAsUnknown(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	// Cache buckets exceeding input, and negative fields, are corruption —
+	// not measurement. The last CONSISTENT cumulative wins; a file with no
+	// consistent record reads as unknown, never as a negative count on
+	// the wire.
+	const goodThread = "thread-consistent-usage"
+	const badThread = "thread-corrupt-usage"
+	writeRolloutFile(t, home, goodThread, []string{
+		`{"type":"session_meta","payload":{"id":"` + goodThread + `"}}`,
+		usageLine(goodThread, 1000, 800, 10, 50, 4, 2000, 1600, 20, 100, 8),
+		// Corrupt tail: cached (900) exceeds input (100).
+		`{"type":"token_usage_record","payload":{"thread_id":"` + goodThread + `","usage":{"input_tokens":100,` +
+			`"cached_input_tokens":900,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":150},` +
+			`"thread_token_usage":{"input_tokens":100,"cached_input_tokens":900,"cache_write_input_tokens":0,` +
+			`"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":150}}}`,
+		// Negative output is likewise impossible.
+		`{"type":"token_usage_record","payload":{"thread_id":"` + goodThread + `","usage":{"input_tokens":100,` +
+			`"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":-50,"reasoning_output_tokens":0,"total_tokens":50},` +
+			`"thread_token_usage":{"input_tokens":2000,"cached_input_tokens":1600,"cache_write_input_tokens":20,` +
+			`"output_tokens":-50,"reasoning_output_tokens":0,"total_tokens":1950}}}`,
+	})
+	path := findThreadRollout(home, goodThread)
+	totals := readRolloutUsage(path, goodThread)
+	if totals == nil || !totals.Found {
+		t.Fatal("no totals: the corrupt tail must not hide the last consistent cumulative")
+	}
+	// The first record's cumulative: in=2000 cached=1600 written=20
+	// out=100 reasoning=8 → input=380.
+	if totals.InputTokens != 380 || totals.CachedInputTokens != 1600 || totals.CacheWriteTokens != 20 ||
+		totals.OutputTokens != 100 || totals.ReasoningTokens != 8 {
+		t.Fatalf("totals = %+v, want the last consistent cumulative (input=380 cached=1600 written=20 output=100 reasoning=8)", totals)
+	}
+
+	writeRolloutFile(t, home, badThread, []string{
+		`{"type":"session_meta","payload":{"id":"` + badThread + `"}}`,
+		`{"type":"token_usage_record","payload":{"thread_id":"` + badThread + `","usage":{"input_tokens":100,` +
+			`"cached_input_tokens":900,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":150},` +
+			`"thread_token_usage":{"input_tokens":100,"cached_input_tokens":900,"cache_write_input_tokens":0,` +
+			`"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":150}}}`,
+	})
+	if totals := readRolloutUsage(findThreadRollout(home, badThread), badThread); totals != nil {
+		t.Fatalf("all-corrupt totals = %+v, want nil (unreported, not negative)", totals)
+	}
+	if cost := rolloutUsageCost(home, badThread); cost != nil {
+		t.Fatalf("all-corrupt terminal cost = %+v, want nil", cost)
+	}
+}
+
+func TestThreadIDFromRolloutName_ParsesTimestampedNames(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"rollout-2026-10-09T00-00-00-thread-terminal-usage.jsonl":                "thread-terminal-usage",
+		"rollout-2026-10-09T00-00-00-01a0548d-9a06-7a30-a72c-f7c94b8c899c.jsonl": "01a0548d-9a06-7a30-a72c-f7c94b8c899c",
+		"rollout-2026-10-09T00-00-00-usage.jsonl":                                "usage",
+		"not-a-rollout.jsonl": "",
+		"rollout-.jsonl":      "",
+	}
+	for name, want := range cases {
+		if got := threadIDFromRolloutName(name); got != want {
+			t.Errorf("threadIDFromRolloutName(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestOpenRolloutFile_RefusesNonRegularFiles(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFO fixtures are unix-only")
+	}
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "rollout-2026-10-09T00-00-00-fifo.jsonl")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	// The open must refuse the FIFO immediately — never block for a
+	// writer. The read runs inside the PTY exit path before cleanup, so
+	// a hang there would leave the terminal unsent and the session's
+	// resources unreleased. Removing the regular-file refusal turns
+	// this red (the FIFO opens as a rollout file).
+	done := make(chan error, 1)
+	go func() {
+		f, err := openRolloutFile(fifo)
+		if err == nil {
+			_ = f.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO opened as a rollout file; want refusal")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("openRolloutFile blocked on a FIFO for 5s; want immediate refusal")
+	}
+	// A FIFO planted where the thread's session file should be reads as
+	// unknown (nil cost), never as a hang.
+	if totals := readRolloutUsage(fifo, "fifo"); totals != nil {
+		t.Fatalf("FIFO totals = %+v, want nil", totals)
 	}
 }

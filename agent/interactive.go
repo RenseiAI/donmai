@@ -108,6 +108,19 @@ type InteractiveActivityFlusher interface {
 	ActivityFlushed() <-chan struct{}
 }
 
+// InteractiveTerminalCostSource is the OPTIONAL capability a Handle
+// implements when its terminal ResultEvent may carry a harness-accounted
+// token cost read at exit (for example from the harness's own session
+// file, for an interactive surface that emits no structured usage of its
+// own). The runner waits for an in-flight terminal only when the handle
+// declares one is coming: a handle that never sends a terminal must not
+// stall session end while the supervisor waits out a grace for nothing.
+type InteractiveTerminalCostSource interface {
+	// HasTerminalCost reports whether the handle will attach a
+	// harness-accounted cost to its terminal ResultEvent.
+	HasTerminalCost() bool
+}
+
 // InteractiveSession is the live interactive surface of one
 // PTY-hosted session. Implementations must be safe for concurrent use.
 //

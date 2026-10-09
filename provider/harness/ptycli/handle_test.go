@@ -454,3 +454,17 @@ func TestSpawnWithOptions_PanickingTerminalCostKeepsBareResult(t *testing.T) {
 		t.Fatalf("expected a bare success result despite the panicking hook, got %#v", res)
 	}
 }
+
+func TestHandle_HasTerminalCostReflectsHookPresence(t *testing.T) {
+	t.Parallel()
+	var nilHandle *Handle
+	if nilHandle.HasTerminalCost() {
+		t.Fatal("nil handle reports a terminal cost; want false")
+	}
+	if (&Handle{}).HasTerminalCost() {
+		t.Fatal("handle without a TerminalCost hook reports a terminal cost; want false")
+	}
+	if got := (&Handle{terminalCost: func() *agent.CostData { return nil }}).HasTerminalCost(); !got {
+		t.Fatal("handle with a TerminalCost hook reports no terminal cost; want true")
+	}
+}

@@ -366,6 +366,14 @@ func (h *Handle) Stop(ctx context.Context) error {
 // returned by Spawn — satisfies agent.InteractiveCapable.
 func (h *Handle) InteractiveSession() agent.InteractiveSession { return h.sess }
 
+// HasTerminalCost reports whether this handle will attach a
+// harness-accounted cost to its terminal ResultEvent: true exactly when a
+// TerminalCost hook was supplied at spawn. The runner's post-exit terminal
+// wait keys off it (see agent.InteractiveTerminalCostSource), so handles
+// with a bare terminal finish immediately instead of stalling out a grace
+// for a terminal that will never come.
+func (h *Handle) HasTerminalCost() bool { return h != nil && h.terminalCost != nil }
+
 // EmitMarker is a passthrough convenience to the underlying
 // ptyhost.Session.EmitMarker so the P5-WS6 suspend/resume seam does not need
 // a type assertion to agent.InteractiveCapable before calling it. Suspend
@@ -375,10 +383,12 @@ func (h *Handle) InteractiveSession() agent.InteractiveSession { return h.sess }
 func (h *Handle) EmitMarker(label string) error { return h.sess.EmitMarker(label) }
 
 // Compile-time assertions: Handle satisfies both agent.Handle and the
-// additive agent.InteractiveCapable seam.
+// additive agent.InteractiveCapable seam, plus the optional terminal-cost
+// declaration the runner's post-exit wait keys off.
 var (
-	_ agent.Handle             = (*Handle)(nil)
-	_ agent.InteractiveCapable = (*Handle)(nil)
+	_ agent.Handle                        = (*Handle)(nil)
+	_ agent.InteractiveCapable            = (*Handle)(nil)
+	_ agent.InteractiveTerminalCostSource = (*Handle)(nil)
 )
 
 // envSlice converts a Spec.Env map into the "KEY=VALUE" slice
