@@ -24,6 +24,150 @@ func internalAcquireSpec(root string, index int) AcquireSpec {
 	}
 }
 
+func TestSampleClockEqualSamplePreservesClockFileIdentity(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	fixed := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases"), Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.sampleClock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filepath.Join(store.Dir(), "clock-high-watermark-ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.sampleClock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("repeated clock sample=%d, want durable value %d", second, first)
+	}
+	after, err := os.Stat(filepath.Join(store.Dir(), "clock-high-watermark-ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("equal clock sample rewrote the durable high-water mark file")
+	}
+}
+
+func TestSampleClockBackwardSamplePreservesClockFileIdentity(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	current := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases"), Now: func() time.Time { return current }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := store.sampleClock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return current.Add(-time.Hour) }
+	before, err := os.Stat(filepath.Join(store.Dir(), "clock-high-watermark-ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clamped, err := store.sampleClock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clamped != advanced {
+		t.Fatalf("backward clock sample=%d, want durable high-water mark %d", clamped, advanced)
+	}
+	after, err := os.Stat(filepath.Join(store.Dir(), "clock-high-watermark-ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("backward clock sample rewrote the durable high-water mark file")
+	}
+}
+
+func TestSampleClockAdvanceRewritesDurableBytes(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	start := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases"), Now: func() time.Time { return start }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.sampleClock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filepath.Join(store.Dir(), "clock-high-watermark-ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return start.Add(time.Minute) }
+	advanced, err := store.sampleClock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := start.Add(time.Minute).UnixMilli(); advanced != want {
+		t.Fatalf("advanced clock sample=%d, want %d", advanced, want)
+	}
+	after, err := os.Stat(filepath.Join(store.Dir(), "clock-high-watermark-ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("advanced clock sample did not replace the durable high-water mark file")
+	}
+	data, err := os.ReadFile(filepath.Join(store.Dir(), "clock-high-watermark-ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := parseClock(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted != advanced {
+		t.Fatalf("durable high-water mark=%d, want sampled %d", persisted, advanced)
+	}
+}
+
+func TestSampleClockMalformedDurableMarkRefuses(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Dir(), "clock-high-watermark-ms"), []byte("not-a-mark"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.sampleClock(context.Background()); err == nil {
+		t.Fatal("malformed durable high-water mark was accepted")
+	}
+	if err := store.Ready(); !errors.Is(err, ErrProviderRootUnready) {
+		t.Fatalf("ready error=%v, want provider root unready", err)
+	}
+}
+
+func TestSampleClockUnreadableDurableMarkRefuses(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(store.Dir(), "clock-high-watermark-ms")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.sampleClock(context.Background()); err == nil {
+		t.Fatal("missing durable high-water mark was accepted")
+	}
+	if err := store.Ready(); !errors.Is(err, ErrProviderRootUnready) {
+		t.Fatalf("ready error=%v, want provider root unready", err)
+	}
+}
+
 func TestIntFileDescriptorBounds(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
