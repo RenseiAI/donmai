@@ -21,6 +21,16 @@ const (
 	// EnvUseVertex flips the CLI onto the Google Vertex serving host.
 	EnvUseVertex = "CLAUDE_CODE_USE_VERTEX"
 
+	// EnvAuthToken carries the session credential for a translating-gateway
+	// cell. The CLI documents ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN as
+	// the gateway pair (its own changelog names exactly this pair for
+	// sessions that reach it through a gateway with no first-party
+	// account): unlike ANTHROPIC_API_KEY, which raises an interactive
+	// "Detected a custom API key" approval the moment a TTY is present,
+	// the token pair is accepted unattended on both the headless and the
+	// interactive lanes. Name only — never a value; see applyEndpoint.
+	EnvAuthToken = "ANTHROPIC_AUTH_TOKEN" //nolint:gosec // G101: env-var NAME, never credential bytes.
+
 	// EnvAWSRegion is the AWS region the Bedrock host serves from.
 	EnvAWSRegion = "AWS_REGION"
 
@@ -39,6 +49,9 @@ const (
 //	direct        ANTHROPIC_BASE_URL=<BaseURL> (when set) + binding env
 //	bedrock       CLAUDE_CODE_USE_BEDROCK=1 + AWS_REGION=<Region> + binding env
 //	vertex        CLAUDE_CODE_USE_VERTEX=1 + CLOUD_ML_REGION=<Region> + binding env
+//	gateway       ANTHROPIC_BASE_URL=<BaseURL> + ANTHROPIC_AUTH_TOKEN=<key>;
+//	              the modal-generating ANTHROPIC_API_KEY name is kept out of
+//	              the child env (see projectGatewayCredential)
 //
 // Merge precedence (most → least specific): host-derived routing vars >
 // Endpoint.Env (the deliberately resolved cell credentials) > Spec.Env (the
@@ -69,6 +82,13 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 		return spec, nil
 	case agent.HostDirect, agent.HostBedrock, agent.HostVertex:
 		// fall through to the env projection below
+	case agent.HostGateway:
+		// Translating-gateway cell: the harness drives the gateway's
+		// loopback surface over the anthropic-messages dialect, presenting
+		// the session bearer through the CLI's own unattended token pair.
+		// The manifest's DrivesHosts gates admission upstream
+		// (validateReceiptCell); this read site only projects.
+		return projectGatewayCredential(spec, ep)
 	default:
 		return spec, fmt.Errorf("serving host %q is not routable by the claude harness", ep.Host)
 	}
@@ -101,6 +121,76 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 
 	spec.Env = env
 	return spec, nil
+}
+
+// projectGatewayCredential projects a translating-gateway binding onto the
+// spec the CLI subprocess sees: the gateway's loopback surface becomes the
+// base URL and the session bearer rides the CLI's unattended token pair.
+//
+// The bearer is selected exactly once, from the binding's own cell key first
+// (Endpoint.Env, the resolved credential the control plane bound for this
+// session) and otherwise from the trusted Spec.Env layer the platform's
+// credential fan-out already populated — never from the ambient parent
+// process. A gateway cell with no bearer anywhere fails loudly: silently
+// spawning against the default host would mis-bill and mis-route, and an
+// unattended session parked on a login prompt is the defect this closes.
+//
+// The modal-generating key name (ANTHROPIC_API_KEY) is kept OUT of the
+// child env: with a TTY present the CLI answers that name with an
+// interactive "Detected a custom API key" approval no unattended session
+// can answer, and without one the session degrades to ambient host login.
+// Only the token name the CLI honors unattended rides the child.
+func projectGatewayCredential(spec agent.Spec, ep *agent.EndpointBinding) (agent.Spec, error) {
+	if ep.Model != "" {
+		spec.Model = ep.Model
+	}
+	if err := agent.ValidateEndpointBindingBaseURL(ep.BaseURL); err != nil {
+		return spec, fmt.Errorf("gateway endpoint: %w", err)
+	}
+	key := ""
+	if ep.Env != nil {
+		key = pickGatewayBearer(ep.Env)
+	}
+	if key == "" && spec.Env != nil {
+		key = pickGatewayBearer(spec.Env)
+	}
+	if key == "" {
+		return spec, fmt.Errorf("gateway endpoint serves %q but carries no session bearer", ep.BaseURL)
+	}
+	env := make(map[string]string)
+	for k, v := range spec.Env {
+		if k == gatewayModalKeyName {
+			continue
+		}
+		env[k] = v
+	}
+	for k, v := range ep.Env {
+		if v == "" || k == gatewayModalKeyName {
+			continue
+		}
+		env[k] = v
+	}
+	env[EnvBaseURL] = ep.BaseURL
+	env[EnvAuthToken] = key
+	spec.Env = env
+	return spec, nil
+}
+
+// gatewayModalKeyName is the credential name the CLI answers with an
+// interactive approval on a TTY. It must never ride an unattended session's
+// child env; the token pair carries the same bearer without the modal.
+const gatewayModalKeyName = "ANTHROPIC_API_KEY"
+
+// pickGatewayBearer selects the session bearer from a credential layer: the
+// gateway token name first, then the modal-generating key name (a binding
+// may file the same bearer under either spelling). Only these two spellings
+// are read — a generic fallback would risk presenting an unrelated key as
+// the session credential. Empty when the layer carries no bearer.
+func pickGatewayBearer(layer map[string]string) string {
+	if v := layer[EnvAuthToken]; v != "" {
+		return v
+	}
+	return layer[gatewayModalKeyName]
 }
 
 // setIfAbsent sets env[key]=value unless value is empty or the key already
