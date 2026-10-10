@@ -364,26 +364,22 @@ func TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig(t *testing.T) 
 	}
 }
 
-// TestTranslateSpec_AgyCli_RetainsUnsupportedPolicy verifies a requested
+// TestTranslateSpec_Ollama_RetainsUnsupportedPolicy verifies a requested
 // policy is preserved for the exact adapter's typed pre-spawn denial.
-func TestTranslateSpec_AgyCli_RetainsUnsupportedPolicy(t *testing.T) {
+func TestTranslateSpec_Ollama_RetainsUnsupportedPolicy(t *testing.T) {
 	t.Parallel()
-	for _, provider := range []string{"agy-cli"} {
-		t.Run(provider, func(t *testing.T) {
-			t.Parallel()
-			caps := agent.Capabilities{
-				NeedsPermissionConfig:   false,
-				AcceptsAllowedToolsList: false,
-			}
-			qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Bash(cargo:*)"}}}
-			spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do", ProviderName: provider})
-			if !slices.Equal(spec.AllowedTools, []string{"Bash(cargo:*)"}) {
-				t.Errorf("AllowedTools must remain for %s adapter denial; got %v", provider, spec.AllowedTools)
-			}
-			if spec.PermissionConfig != nil {
-				t.Errorf("%s must NOT get a PermissionConfig; got %+v", provider, spec.PermissionConfig)
-			}
-		})
+	provider := "ollama"
+	caps := agent.Capabilities{
+		NeedsPermissionConfig:   false,
+		AcceptsAllowedToolsList: false,
+	}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Bash(cargo:*)"}}}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do", ProviderName: provider})
+	if !slices.Equal(spec.AllowedTools, []string{"Bash(cargo:*)"}) {
+		t.Errorf("AllowedTools must remain for %s adapter denial; got %v", provider, spec.AllowedTools)
+	}
+	if spec.PermissionConfig != nil {
+		t.Errorf("%s must NOT get a PermissionConfig; got %+v", provider, spec.PermissionConfig)
 	}
 }
 

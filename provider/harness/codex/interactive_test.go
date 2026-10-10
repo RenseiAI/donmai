@@ -581,7 +581,7 @@ func TestResolveCodexBinary_MissingReturnsError(t *testing.T) {
 
 // writeFakeCodexScript materializes a fake-codex shell script under a real
 // PTY (the PATH-shim technique used across this repo's harness tests, e.g.
-// provider/harness/agycli's handle_test.go newFakeProvider).
+// provider/harness/clijsonl's handle_test.go).
 func writeFakeCodexScript(t *testing.T, script string) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {

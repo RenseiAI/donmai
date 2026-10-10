@@ -7,7 +7,7 @@
 //	../donmai-libraries/packages/core/src/providers/types.ts
 //
 // It defines the types every provider implementation (claude, codex, stub,
-// gemini, agy-cli, ollama, opencode, jules, amp) and the runner
+// gemini, ollama, opencode, jules) and the runner
 // orchestrator depend on. The package is pure types + interfaces with zero
 // behavior, no I/O, no business logic, and no dependencies beyond the Go
 // standard library and log/slog.
@@ -18,7 +18,7 @@
 //
 //	github.com/RenseiAI/donmai/agent
 //
-// It is importable by downstream consumers including rensei-tui without
+// It is importable by downstream consumers without
 // requiring an donmai dependency cascade. F.1.1 §1 ratifies this
 // boundary.
 //

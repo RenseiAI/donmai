@@ -28,7 +28,6 @@ import (
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
-	provideragycli "github.com/RenseiAI/donmai/provider/harness/agycli"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -1338,11 +1337,6 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// comment for how PreferServer routes between them. Gemini is a
 		// full streaming impl against generativelanguage.googleapis.com.
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
-		// agy-cli is a LOCAL/HOST-SESSION/OAUTH provider wrapping the Antigravity `agy` CLI under a pty.
-		// It is the SUBSCRIPTION/no-key local-Gemini path (the user's own OAuth-authed agy on the user's
-		// own machine). Distinct from the API-direct "gemini" provider. Requires `agy` installed AND
-		// logged in on the host PATH. NOT for cloud sandboxes.
-		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
 		// opencode's PreferServer threads the resolved profile's Lane-B
 		// signal (opencodeCtorHints above) so a `donmai agent run` session
 		// can select the serve/HTTP adapter (07 §2 Lane B) instead of
@@ -1801,7 +1795,7 @@ func detailSkills(in []daemon.PollSkill) []prompt.SkillSpec {
 // pre-run display and gateway metadata. The runner's harness admission remains
 // the only authoritative runtime selection.
 //
-// Display order: ModelProfile.ProviderID → the historical `agy` projection →
+// Display order: ModelProfile.ProviderID → the historical harness projection →
 // ResolvedProfile.Provider → ResolvedProfile.Runner → default claude. Unknown
 // explicit harnesses may fall through here for display only; runner admission
 // still denies them and never follows this compatibility chain.
@@ -1812,9 +1806,6 @@ func providerNameFromDetail(d *daemon.SessionDetail) string {
 	if d.ResolvedProfile == nil {
 		return string(agent.ProviderClaude)
 	}
-	if name, ok := harnessToProviderName(d.ResolvedProfile.Harness); ok {
-		return name
-	}
 	if d.ResolvedProfile.Provider != "" {
 		return d.ResolvedProfile.Provider
 	}
@@ -1822,19 +1813,6 @@ func providerNameFromDetail(d *daemon.SessionDetail) string {
 		return d.ResolvedProfile.Runner
 	}
 	return string(agent.ProviderClaude)
-}
-
-// harnessToProviderName handles the one historical pre-run projection needed
-// for Antigravity logs/gateway metadata. It is not an admission selector: an
-// unrecognized token returns ("", false), while the runner independently
-// denies unknown explicit harness intent instead of following this fallback.
-func harnessToProviderName(harness string) (string, bool) {
-	switch harness {
-	case "agy":
-		return string(agent.ProviderAGYCLI), true
-	default:
-		return "", false
-	}
 }
 
 // emitResultJSON writes the runner.Result as a single newline-

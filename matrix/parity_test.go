@@ -282,13 +282,13 @@ func TestParity_CapsNarrowingOnly(t *testing.T) {
 }
 
 // TestParity_ManifestAgreesWithCapabilities is rule 7 (the P1 additive-safety
-// guard): for each of the 9 harness providers, the Manifest().Caps agent-loop
+// guard): for each of the 8 harness providers, the Manifest().Caps agent-loop
 // fields equal the corresponding Capabilities() fields — proving the manifest
 // is a faithful additive projection, not a divergent second source of truth.
 func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 	providers := HarnessProvidersForParity()
-	if len(providers) != 9 {
-		t.Fatalf("expected 9 harness providers, got %d", len(providers))
+	if len(providers) != 8 {
+		t.Fatalf("expected 8 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if p == nil {
@@ -429,6 +429,33 @@ func TestParity_NoCrossProtocolOpencodeAnthropic(t *testing.T) {
 			if c.Protocol == agent.ProtoAnthropicMessages {
 				t.Errorf("opencode cell %+v drives anthropic-messages (opencode is openai-chat only)", c.Key())
 			}
+		}
+	}
+}
+
+// TestParity_NoRetiredAntigravityCell is the retirement guard: the removed
+// harness must not reappear as a harvested row, a valid cell, or a legacy
+// alias. Re-adding the harvest entry, the cell, or the provider anchor flips
+// this test red — see the retirement revert proof in the PR description.
+func TestParity_NoRetiredAntigravityCell(t *testing.T) {
+	t.Parallel()
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	for _, h := range built.Harnesses {
+		if h.Name == agent.HarnessName("antigravity") {
+			t.Errorf("retired antigravity harness present in generated harnesses")
+		}
+	}
+	for _, c := range built.Matrix.Cells {
+		if c.Harness == agent.HarnessName("antigravity") {
+			t.Errorf("retired antigravity cell present: %+v", c.Key())
+		}
+	}
+	for _, a := range built.AliasMap {
+		if a.ProviderName == agent.ProviderName("agy-cli") {
+			t.Errorf("retired agy-cli legacy alias present: %+v", a.Cell)
 		}
 	}
 }

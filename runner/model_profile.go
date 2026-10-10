@@ -35,8 +35,8 @@ type ResolvedModelProfile struct {
 	ProviderID string `json:"providerId"`
 
 	// Harness is the loop-driver attribute the platform catalog models on
-	// the model identity (e.g. "antigravity", "gemini-direct", or "ollama";
-	// legacy wire aliases such as "agy", "native", and "raw" remain accepted).
+	// the model identity (e.g. "gemini-direct" or "ollama";
+	// legacy wire aliases such as "native" and "raw" remain accepted).
 	// When non-empty it is AUTHORITATIVE for provider selection over
 	// ProviderID: ToResolvedProfile copies it into ResolvedProfile.Harness,
 	// which the runner's authoritative harness selector reads first. This keeps

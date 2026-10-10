@@ -156,20 +156,20 @@ func TestResolvedModelProfile_ToResolvedProfile(t *testing.T) {
 // TestResolvedModelProfile_ToResolvedProfile_CarriesHarness verifies that the
 // Harness loop-driver attribute survives the bridge into the legacy
 // ResolvedProfile shape. The platform may model a model as
-// ProviderID="gemini" with Harness="agy"; the authoritative selector reads
+// ProviderID="gemini" with Harness="codex"; the authoritative selector reads
 // ResolvedProfile.Harness first, so the modelProfile dispatch path must produce
 // the same harness-aware profile the resolvedProfile path does.
 func TestResolvedModelProfile_ToResolvedProfile_CarriesHarness(t *testing.T) {
 	profile := ResolvedModelProfile{
 		ID:         "mp_test_harness",
 		ProviderID: string(agent.ProviderGemini),
-		Harness:    "agy",
+		Harness:    "codex",
 		Model:      "gemini-3.1-pro",
 	}
 	rp := profile.ToResolvedProfile()
 
-	if rp.Harness != "agy" {
-		t.Errorf("Harness = %q; want %q", rp.Harness, "agy")
+	if rp.Harness != "codex" {
+		t.Errorf("Harness = %q; want %q", rp.Harness, "codex")
 	}
 	// Harness must not clobber Provider — both survive the bridge. Provider is
 	// compatibility/disambiguation context, not an explicit-harness fallback.
@@ -177,17 +177,17 @@ func TestResolvedModelProfile_ToResolvedProfile_CarriesHarness(t *testing.T) {
 		t.Errorf("Provider = %q; want %q (Harness must not clobber Provider)", rp.Provider, agent.ProviderGemini)
 	}
 
-	// The bridged profile must resolve to the agy-cli provider via the
+	// The bridged profile must resolve to the codex provider via the
 	// runner's harness-native selection, proving end-to-end carriage.
 	registry := selectorRegistry(t, &selectorFakeProvider{
-		name: agent.ProviderAGYCLI, harness: agent.HarnessAntigravity,
+		name: agent.ProviderCodex, harness: agent.HarnessCodex,
 	})
 	selection, err := registry.selectExplicitHarness(rp)
 	if err != nil {
 		t.Fatalf("selectExplicitHarness: %v", err)
 	}
-	if got := selection.Provider.Name(); got != agent.ProviderAGYCLI {
-		t.Errorf("selected provider = %q; want %q (harness=agy must select agy-cli)", got, agent.ProviderAGYCLI)
+	if got := selection.Provider.Name(); got != agent.ProviderCodex {
+		t.Errorf("selected provider = %q; want %q (harness=codex must select codex)", got, agent.ProviderCodex)
 	}
 }
 
@@ -198,14 +198,14 @@ func TestResolvedModelProfile_HarnessJSONRoundTrip(t *testing.T) {
 	in := ResolvedModelProfile{
 		ID:         "mp_test_rt",
 		ProviderID: string(agent.ProviderGemini),
-		Harness:    "agy",
+		Harness:    "codex",
 		Model:      "gemini-3.1-pro",
 	}
 	b, err := json.Marshal(in)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	if !strings.Contains(string(b), `"harness":"agy"`) {
+	if !strings.Contains(string(b), `"harness":"codex"`) {
 		t.Errorf("marshalled JSON missing harness field: %s", b)
 	}
 
@@ -213,8 +213,8 @@ func TestResolvedModelProfile_HarnessJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-	if out.Harness != "agy" {
-		t.Errorf("round-tripped Harness = %q; want %q", out.Harness, "agy")
+	if out.Harness != "codex" {
+		t.Errorf("round-tripped Harness = %q; want %q", out.Harness, "codex")
 	}
 
 	// omitempty: an empty harness must not appear on the wire.

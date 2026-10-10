@@ -106,7 +106,7 @@ func TestShellBinary_HonorsEnv(t *testing.T) {
 // TestSpawn_Interactive_RunsUnderPTY proves Spawn actually wires through to
 // ptycli.Spawn end-to-end (not just the error-path branch above), using
 // $SHELL pointed at a trivial fake script — the same PATH-shim technique
-// provider/harness/agycli's handle_test.go uses.
+// provider/harness/clijsonl's handle_test.go uses.
 func TestSpawn_Interactive_RunsUnderPTY(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("pty spawn tests are unix-only")
