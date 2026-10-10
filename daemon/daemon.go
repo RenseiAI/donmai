@@ -24,6 +24,7 @@ import (
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/rulesetsnapshot"
 	"github.com/RenseiAI/donmai/runner"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -1313,6 +1314,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.BaseEnv["DONMAI_WORKER_ID"] = d.workerID
 	}
 	spawnerOpts.BaseEnv["DONMAI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
+	// Carry the operator's failed-worktree recovery policy to every worker.
+	// keepFailedWorktrees states DONMAI_KEEP_FAILED_WORKTREE so `agent run`
+	// preserves a failed session's worktree instead of tearing it down
+	// after the rescue. An embedder-composed BaseEnv keeps priority — the
+	// daemon only fills the gap it would otherwise leave — and a work item
+	// cannot override it (the name is host-owned).
+	if cfg.KeepFailedWorktrees {
+		if _, ok := spawnerOpts.BaseEnv[runtimeenv.KeepFailedWorktreeEnv]; !ok {
+			spawnerOpts.BaseEnv[runtimeenv.KeepFailedWorktreeEnv] = "1"
+		}
+	}
 	// Tell every worker this daemon spawns where this daemon actually lives.
 	// Resolved per spawn rather than snapshotted here: the control listener may
 	// still be binding an ephemeral port at this point, and ControlURL is the

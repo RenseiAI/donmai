@@ -2671,3 +2671,115 @@ func TestDetailToQueuedWork_DeliveryPolicyCannotDivergeFromTheReceiptedPayload(t
 		t.Fatalf("Delivery = %+v; want the receipted policy", queued.Delivery)
 	}
 }
+
+// TestAgentRunCmd_PreserveWorktreeDefault drives the production `agent run`
+// command through a failed stub session and pins the worktree lifecycle:
+// by default the failed session's worktree is torn down; the daemon's
+// keep-failed recovery answer (DONMAI_KEEP_FAILED_WORKTREE) keeps it; and
+// an explicit --preserve-worktree flag beats the environment either way.
+func TestAgentRunCmd_PreserveWorktreeDefault(t *testing.T) {
+	if codexOnPath() && raceEnabled() {
+		t.Skip("skipping under -race because codex is on PATH and codex.New/Shutdown have a known race; rerun without -race")
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	// The flag default reads the process environment at command
+	// construction, so each case starts from a known environment.
+	if prev, ok := os.LookupEnv("DONMAI_KEEP_FAILED_WORKTREE"); ok {
+		t.Cleanup(func() { _ = os.Setenv("DONMAI_KEEP_FAILED_WORKTREE", prev) })
+	} else {
+		t.Cleanup(func() { _ = os.Unsetenv("DONMAI_KEEP_FAILED_WORKTREE") })
+	}
+	_ = os.Unsetenv("DONMAI_KEEP_FAILED_WORKTREE")
+
+	tests := []struct {
+		name      string
+		keepEnv   string
+		extraArgs []string
+		wantKept  bool
+	}{
+		{name: "default tears the failed worktree down", wantKept: false},
+		{name: "keep env preserves the failed worktree", keepEnv: "1", wantKept: true},
+		{name: "explicit flag preserves without env", extraArgs: []string{"--preserve-worktree=true"}, wantKept: true},
+		{name: "explicit flag beats keep env", keepEnv: "true", extraArgs: []string{"--preserve-worktree=false"}, wantKept: false},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.keepEnv != "" {
+				t.Setenv("DONMAI_KEEP_FAILED_WORKTREE", tc.keepEnv)
+			}
+			repo := makeSpecDecoratorBareRepo(t)
+			binDir := t.TempDir()
+			if err := os.Symlink(gitPath, filepath.Join(binDir, "git")); err != nil {
+				t.Fatalf("symlink git into isolated PATH: %v", err)
+			}
+			t.Setenv("PATH", binDir)
+
+			platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+			}))
+			t.Cleanup(platform.Close)
+
+			sessionID := fmt.Sprintf("%s-%d", strings.ReplaceAll(strings.ToLower(tc.name), " ", "-"), i)
+			detail := &daemon.SessionDetail{
+				SessionID:       sessionID,
+				IssueIdentifier: "EXAMPLE-1",
+				Repository:      repo,
+				Ref:             "main",
+				WorkType:        "development",
+				Body:            "Exercise failed-session worktree lifecycle.",
+				WorkerID:        "worker-test",
+				AuthToken:       "token-test",
+				PlatformURL:     platform.URL,
+				ResolvedProfile: &daemon.SessionResolvedProfile{
+					Provider:       string(agent.ProviderStub),
+					ProviderConfig: map[string]any{"stub.behavior": string(providerstub.BehaviorMidStreamError)},
+				},
+			}
+			daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // fixed test-only credentials
+			}))
+			t.Cleanup(daemonServer.Close)
+
+			wtDir := t.TempDir()
+			cmd := newAgentRunCmd(Config{})
+			var stdout, stderr bytes.Buffer
+			cmd.SetOut(&stdout)
+			cmd.SetErr(&stderr)
+			cmd.SetArgs(append([]string{
+				"--session-id=" + sessionID,
+				"--daemon-url=" + daemonServer.URL,
+				"--worktree-dir=" + wtDir,
+				"--json=true",
+			}, tc.extraArgs...))
+			runErr := cmd.Execute()
+			if runErr == nil || !strings.Contains(runErr.Error(), `"failed"`) {
+				t.Fatalf("Execute error = %v; want the failed terminal status", runErr)
+			}
+			var got runner.Result
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("decode terminal result: %v\n%s", err, stdout.String())
+			}
+			if got.Status != "failed" {
+				t.Fatalf("terminal status = %q; want failed", got.Status)
+			}
+			if got.WorktreePath == "" {
+				t.Fatal("terminal result has no worktree path")
+			}
+			_, statErr := os.Stat(got.WorktreePath)
+			if tc.wantKept && os.IsNotExist(statErr) {
+				t.Fatalf("worktree %s is gone; want it kept for post-mortem", got.WorktreePath)
+			}
+			if !tc.wantKept && !os.IsNotExist(statErr) {
+				t.Fatalf("worktree stat err = %v; want the failed session's worktree torn down", statErr)
+			}
+		})
+	}
+}

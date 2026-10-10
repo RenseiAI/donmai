@@ -35,6 +35,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -43,6 +44,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/gitexec"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
@@ -131,6 +133,12 @@ type archiveManifest struct {
 	RootIdentity    workarea.FileIdentity         `json:"rootIdentity,omitempty"`
 	TreeDigest      string                        `json:"treeDigest,omitempty"`
 	SourceSizeBytes int64                         `json:"sourceSizeBytes,omitempty"`
+	// Excluded lists the regenerable dependency and build-output
+	// directories the capture skipped (see archiveExcludedDirNames), as
+	// slash-separated paths relative to the archived root, sorted. The
+	// tree digest and size cover the filtered tree only — SourceSizeBytes
+	// above still reports the unfiltered source so the saving is visible.
+	Excluded []string `json:"excluded,omitempty"`
 	// Extra holds any fields not declared above so consumers can render
 	// them without the registry needing to evolve the manifest schema in
 	// lockstep with archive producers.
@@ -478,9 +486,18 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 			return err
 		}
 	}
-	if err := copyRootContents(rootHandle, archiveHandle); err != nil {
+	// The capture skips regenerable dependency and build-output directories
+	// (archiveExcludedDirNames) that the guard proves ignored and
+	// tracked-free; the digest and size below therefore cover the
+	// filtered tree, while SourceSizeBytes above still reports the
+	// unfiltered source. Anything the guard cannot prove regenerable
+	// — tracked source, uncommitted source, git metadata — is copied
+	// whole.
+	excluded, err := copyRootContentsExcluding(rootHandle, archiveHandle, root.String())
+	if err != nil {
 		return fmt.Errorf("archive root: copy complete tree: %w", err)
 	}
+	manifest.Excluded = excluded
 	manifest.SizeBytes, err = workarea.PhysicalUsageRoot(archiveHandle)
 	if err != nil {
 		return fmt.Errorf("archive root: account copied tree: %w", err)
@@ -2406,10 +2423,350 @@ func copyTreeRoot(sourceRoot *os.Root, dst string) error {
 }
 
 func copyRootContents(source, destination *os.Root) error {
-	return copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string))
+	return copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string), nil)
 }
 
-func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlinks map[workarea.FileIdentity]string) error {
+// archiveExcludedDirNames are regenerable dependency and build-output
+// directories the archive capture skips at any depth: reinstalling or
+// rebuilding them is cheaper than storing every session's copy, and they
+// dominate archive disk use. Only real directories are skipped — a file
+// or symlink that happens to carry one of these names is still copied —
+// every skipped path is recorded on the manifest's excluded list so
+// the omission is visible to operators and restore callers, and a
+// candidate is skipped only when the enclosing checkout ignores it and
+// it holds no tracked files (see archiveExclusionGuard). Tracked source,
+// uncommitted source and git metadata are never slimmed: the archive is
+// the loss-prevention store, so a candidate the guard cannot prove
+// regenerable is copied whole.
+var archiveExcludedDirNames = map[string]struct{}{
+	"node_modules": {},
+	".next":        {},
+	"dist":         {},
+	"target":       {},
+}
+
+// isArchiveExcludedDir reports whether a real directory leaf is a
+// regenerable dependency or build-output directory the archive skips.
+func isArchiveExcludedDir(leaf string) bool {
+	_, ok := archiveExcludedDirNames[leaf]
+	return ok
+}
+
+// isArchiveGitMetadataPath reports whether a slash-separated,
+// root-relative candidate path names git metadata: the exact `.git`
+// directory, anything under it, or anything nested under a segment
+// that reads as a git-metadata directory (a segment starting with
+// `.git`, covering linked or nested metadata directories). Both the
+// copy walk and the guard consult it so the rule cannot drift between
+// the two.
+func isArchiveGitMetadataPath(candidate string) bool {
+	for _, segment := range strings.Split(candidate, "/") {
+		if strings.HasPrefix(segment, ".git") {
+			return true
+		}
+	}
+	return false
+}
+
+// archiveExclusionTimeout bounds the whole guard inspection of one archive
+// capture. Git ignore and index reads are local and fast; the bound keeps
+// a wedged checkout from stalling the capture.
+const archiveExclusionTimeout = 30 * time.Second
+
+// archiveExclusionGuard decides, per capture, which candidate directories
+// under one source root may be skipped. The zero value skips nothing: a
+// root that is not a git checkout, or one whose git inspection fails for
+// any reason, is copied whole.
+type archiveExclusionGuard struct {
+	// root is the absolute source path the capture copies. Git runs with
+	// this directory so ignore rules and the index resolve exactly as
+	// the checkout sees them.
+	root string
+	// once memoizes the per-root inspection; built lazily on first use.
+	once sync.Once
+	// git is false when the root is not a git checkout (no .git) or
+	// the inspection failed; every candidate is then kept.
+	git bool
+	// ignored holds the slash-separated, root-relative paths git
+	// ignores, as reported by check-ignore over the capture's
+	// candidate set. Only candidate directories are queried, so the
+	// listing stays small.
+	ignored map[string]struct{}
+	// trackedDirs holds every root-relative directory that holds a
+	// tracked file (each tracked file's directory chain up to the
+	// root). A candidate in this set is kept even when ignored.
+	trackedDirs map[string]struct{}
+}
+
+// newArchiveExclusionGuard builds the guard for one capture root.
+// Callers pass the absolute source path the capture copies.
+func newArchiveExclusionGuard(root string) *archiveExclusionGuard {
+	return &archiveExclusionGuard{root: root}
+}
+
+// init runs the git inspection once: it collects the ignored and tracked
+// state the exclusion check needs. Any failure leaves git false, so the
+// capture keeps every candidate.
+func (g *archiveExclusionGuard) init() {
+	g.once.Do(func() {
+		if g.root == "" {
+			return
+		}
+		info, err := os.Lstat(filepath.Join(g.root, ".git"))
+		if err != nil {
+			return
+		}
+		// A `.git` file (worktree pointer or submodule file) still
+		// names a real checkout, so only its absence skips the
+		// inspection. A `.git` symlink escapes the root and is
+		// treated as no checkout.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), archiveExclusionTimeout)
+		defer cancel()
+		ignored, trackedDirs, err := inspectArchiveExclusionGit(ctx, g.root)
+		if err != nil {
+			return
+		}
+		g.ignored = ignored
+		g.trackedDirs = trackedDirs
+		g.git = true
+	})
+}
+
+// skippable reports whether the candidate directory (slash-separated,
+// root-relative, as recorded on the manifest's excluded list) may be
+// skipped. It returns false for everything under .git, for any path
+// whose every segment reads as git metadata (any segment starting
+// with .git, covering linked or nested metadata directories), for any
+// path the enclosing checkout does not ignore, and for any path
+// holding tracked files. Roots that are not git checkouts keep every
+// candidate.
+func (g *archiveExclusionGuard) skippable(candidate string) bool {
+	g.init()
+	if !g.git {
+		return false
+	}
+	if isArchiveGitMetadataPath(candidate) {
+		return false
+	}
+	if _, ok := g.ignored[candidate]; !ok {
+		return false
+	}
+	if _, ok := g.trackedDirs[candidate]; ok {
+		return false
+	}
+	return true
+}
+
+// inspectArchiveExclusionGit reads one checkout's ignore and tracked state
+// for the archive slimming guard. It returns the candidate directories git
+// ignores (querying only the capture's candidate set, so the listing stays
+// small) and every directory holding a tracked file. Tracked state comes
+// from the index, so committed, staged and skip-worktree entries all
+// count; ignore state comes from check-ignore with --no-index, so
+// tracked files never read as ignored.
+func inspectArchiveExclusionGit(ctx context.Context, root string) (map[string]struct{}, map[string]struct{}, error) {
+	candidates, err := collectArchiveExclusionCandidates(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	ignored := make(map[string]struct{})
+	if len(candidates) > 0 {
+		// check-ignore --verbose echoes each ignored input on its
+		// own line as `<rule-source>\t<pathname>`; inputs no rule
+		// matches produce no output at all. The pathname echoes
+		// the input verbatim (no trailing slash for a bare
+		// directory), so it keys the ignored set directly.
+		verbose := append([]string{"-c", "core.quotePath=false", "check-ignore", "--verbose", "--no-index", "--stdin"}, archivePathspecSeparator...)
+		out, err := runArchiveExclusionGit(ctx, root, verbose, candidates)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			if line == "" {
+				continue
+			}
+			tab := strings.LastIndex(line, "\t")
+			if tab < 0 {
+				continue
+			}
+			pathname := strings.TrimSpace(line[tab+1:])
+			if pathname == "" {
+				continue
+			}
+			pathname = strings.TrimSuffix(filepath.ToSlash(pathname), "/")
+			ignored[pathname] = struct{}{}
+		}
+	}
+	trackedDirs := make(map[string]struct{})
+	out, err := runArchiveExclusionGit(ctx, root, []string{"-c", "core.quotePath=false", "ls-files", "-z"}, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, path := range strings.Split(string(out), "\x00") {
+		if path == "" {
+			continue
+		}
+		slashed := filepath.ToSlash(path)
+		for dir := filepath.Dir(slashed); dir != "." && dir != "/"; dir = filepath.Dir(dir) {
+			trackedDirs[dir] = struct{}{}
+		}
+	}
+	return ignored, trackedDirs, nil
+}
+
+// archivePathspecSeparator pins the end-of-options separator git inserts
+// between flags and pathspecs, so a candidate that names a ref (a
+// branch called `target`, a tag called `dist`) is always read as a
+// path, never as a revision.
+var archivePathspecSeparator = []string{"--"}
+
+// collectArchiveExclusionCandidates walks one source root and returns the
+// slash-separated, root-relative paths of every real directory whose leaf
+// names a regenerable dependency or build-output directory, excluding
+// anything under .git (git metadata is never slimmed) and anything under
+// a nested repository boundary (a directory holding its own `.git` entry
+// is a different checkout: the outer index never lists its files and the
+// outer ignore rules do not govern it, so none of its content is a
+// candidate). Symlinks are not followed: a link carrying an excluded name
+// is copied as a link by the capture itself, and a `.git` symlink escapes
+// the root so it does not mark a boundary.
+func collectArchiveExclusionCandidates(root string) ([]string, error) {
+	var candidates []string
+	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		slashed := filepath.ToSlash(rel)
+		if slashed == ".git" || strings.HasPrefix(slashed, ".git/") {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// A nested repository is a boundary: a non-root directory
+		// holding its own `.git` entry is a different checkout
+		// (submodule gitfile, nested clone directory, or linked
+		// worktree pointer). The outer checkout's ignore rules do
+		// not govern it and the outer index never lists its files,
+		// so nothing beneath it becomes a candidate — the copy walk
+		// keeps it whole. (The root itself is the enclosing checkout
+		// the guard inspects, so it never marks a boundary.) A
+		// `.git` symlink escapes the root and does not mark a
+		// boundary: Lstat reports the link itself, and the entry
+		// walk never descends through it.
+		if entry.IsDir() && !isArchiveGitMetadataPath(slashed) {
+			if info, err := os.Lstat(filepath.Join(path, ".git")); err == nil && info.Mode()&os.ModeSymlink == 0 {
+				return filepath.SkipDir
+			}
+		}
+		if entry.IsDir() {
+			if isArchiveExcludedDir(entry.Name()) {
+				info, err := os.Lstat(path)
+				if err != nil {
+					return err
+				}
+				if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+					candidates = append(candidates, slashed)
+				}
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	sort.Strings(candidates)
+	return candidates, nil
+}
+
+// runArchiveExclusionGit runs one read-only git inspection inside root.
+// Only the two subcommands the guard needs are admitted; anything else
+// is refused. The environment is hardened (no prompts, no credential
+// helpers) and stdin carries the candidate list for --stdin invocations.
+func runArchiveExclusionGit(ctx context.Context, root string, args []string, stdin []string) ([]byte, error) {
+	if len(args) < 4 || args[2] != "check-ignore" && args[2] != "ls-files" {
+		return nil, fmt.Errorf("archive exclusion: unsupported git inspection")
+	}
+	//nolint:gosec // G204: argv is a fixed inspection template plus a
+	// pinned separator; candidate paths travel on stdin, never argv.
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = root
+	cmd.Env = gitexec.HardenedEnv(os.Environ(), true, gitexec.Auth{})
+	if stdin != nil {
+		cmd.Stdin = strings.NewReader(strings.Join(stdin, "\n") + "\n")
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	// check-ignore exits 1 when no input is ignored — that is a
+	// successful inspection with an empty ignored set, not a failure.
+	if err != nil {
+		if args[2] == "check-ignore" {
+			if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+				return stdout.Bytes(), nil
+			}
+		}
+		return nil, fmt.Errorf("archive exclusion: git %s: %w: %s", args[2], err, archiveFirstLine(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
+// archiveFirstLine reports the first line of git stderr for error
+// attribution. The daemon package owns no shared helper for this, so
+// the exclusion guard keeps its own.
+func archiveFirstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// copyRootContentsExcluding copies like copyRootContents but skips
+// regenerable dependency and build-output directories (see
+// archiveExcludedDirNames) at any depth. It returns the skipped
+// directories as slash-separated paths relative to the copied root,
+// sorted, for the archive manifest's excluded list. A candidate is
+// skipped only when the guard proves it regenerable — ignored by the
+// enclosing checkout and holding no tracked files — so tracked source,
+// uncommitted source and git metadata are always copied. Roots that are
+// not git checkouts copy whole: sourceRootName carries the absolute
+// source path the guard inspects (empty keeps every candidate).
+// Restore paths keep using copyRootContents so an already-committed
+// archive always reproduces byte for byte, including archives written
+// before the exclusion existed.
+func copyRootContentsExcluding(source, destination *os.Root, sourceRootName string) ([]string, error) {
+	guard := newArchiveExclusionGuard(sourceRootName)
+	exclusion := &copyExclusion{guard: guard}
+	if err := copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string), exclusion); err != nil {
+		return nil, err
+	}
+	excluded := exclusion.skipped
+	sort.Strings(excluded)
+	return excluded, nil
+}
+
+// copyExclusion carries the guard into the copy walk and collects the
+// skipped paths for the manifest. A nil guard keeps every candidate
+// (the unfiltered copyRootContents path passes excluded nil instead).
+type copyExclusion struct {
+	guard   *archiveExclusionGuard
+	skipped []string
+}
+
+func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlinks map[workarea.FileIdentity]string, exclusion *copyExclusion) error {
 	directory, err := source.Open(relativeDir)
 	if err != nil {
 		return err
@@ -2438,6 +2795,23 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 				return err
 			}
 		case info.IsDir():
+			if exclusion != nil && isArchiveExcludedDir(entry.Name()) {
+				candidate := filepath.ToSlash(name)
+				// Git metadata is never slimmed — the exact `.git`
+				// directory and anything nested under a
+				// git-metadata segment — and anything the guard
+				// cannot prove regenerable is copied whole: the
+				// archive is the loss-prevention store. The walk
+				// consults the same helper as the guard so the
+				// rule cannot drift between the two; the guard's
+				// keep is pinned by the exact-excluded assertion
+				// below, this condition by the kept-file
+				// assertions above.
+				if !isArchiveGitMetadataPath(candidate) && exclusion.guard.skippable(candidate) {
+					exclusion.skipped = append(exclusion.skipped, candidate)
+					continue
+				}
+			}
 			if err := destination.Mkdir(name, info.Mode().Perm()); err != nil {
 				return err
 			}
@@ -2450,7 +2824,7 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 				_ = sourceChild.Close()
 				return fmt.Errorf("archive copy source directory identity changed")
 			}
-			copyErr := copyRootDirectory(source, destination, name, hardlinks)
+			copyErr := copyRootDirectory(source, destination, name, hardlinks, exclusion)
 			_ = sourceChild.Close()
 			if copyErr != nil {
 				return copyErr

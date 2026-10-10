@@ -265,8 +265,11 @@ type Options struct {
 	ProviderStallRetries int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
-	// failed Run for debugging. Defaults to true in v0.5.0 per F.1.1
-	// §10 Q7 — flip to false after smoke-harness confidence is high.
+	// failed Run for debugging. The operator surface is opt-in: `agent run
+	// --preserve-worktree` defaults to false and the daemon's
+	// keepFailedWorktrees setting answers it per worker. Either way, a
+	// failed teardown first archives unpublished work to the rescue
+	// directory (see preserveUnpublishedWork).
 	PreserveWorktreeOnFailure bool
 
 	// PreserveWorktreeAlways keeps the worktree on disk after every
@@ -796,10 +799,13 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
 	r.checkpointProviderError(qw, res)
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
-	// Never delete work that exists nowhere else. An interactive session has
-	// its own publication check below, which retains an unpublished workarea.
+	// Never delete work that exists nowhere else: a teardown first archives
+	// every checkout's unpublished work under the rescue directory, and keeps
+	// the workarea when the archive cannot be written. Interactive sessions
+	// take the same path except on the completed path, where the publication
+	// hold below already retains an unpublished workarea.
 	retainUnpreserved := false
-	if teardownRequired && !qw.isInteractive() && !r.preserveUnpublishedWork(qw, res) {
+	if teardownRequired && (!qw.isInteractive() || res == nil || res.Status != "completed") && !r.preserveUnpublishedWork(qw, res) {
 		teardownRequired = false
 		retainUnpreserved = true
 	}
