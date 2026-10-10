@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/RenseiAI/donmai/internal/gitexec"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // Teardown deletes the session's workarea. Before it does, the runner checks
@@ -105,6 +108,57 @@ func recordRescueTargets(ctx context.Context, res *Result, targets []rescueTarge
 		cancel()
 	}
 	res.rescueTargets = targets
+}
+
+// reseedRescueBasesFromDeclaration repairs the rescue base for a re-entered
+// session-root generation. Provision records HEAD as the base, but on
+// re-entry HEAD already holds the earlier attempt's commits: a patch and
+// unpushed-commit listing measured from it would miss work committed
+// before the re-entry, and a failed session's teardown would then delete
+// it. When the worktree manager reports the session re-entered an
+// existing generation, each named checkout's base is reseeded from the
+// generation's durable declaration record (the resolved ref each
+// repository was provisioned at), verified to resolve in the checkout;
+// anything unverifiable keeps the HEAD-measured base. Fresh generations
+// and repository-free sessions are untouched, as is every checkout the
+// record does not name.
+func reseedRescueBasesFromDeclaration(ctx context.Context, res *Result, workareaRoot string, wt *worktree.Manager, sessionID string, logger *slog.Logger) {
+	if res == nil || len(res.rescueTargets) == 0 || wt == nil || workareaRoot == "" {
+		return
+	}
+	provisioned, err := wt.Result(sessionID)
+	if err != nil || !provisioned.Reentered {
+		return
+	}
+	declaration, err := workarea.ReadDeclaration(workarea.RootPath(workareaRoot))
+	if err != nil {
+		logger.Debug("re-entered session keeps HEAD-measured rescue base: declaration unreadable", "sessionId", sessionID, "err", err)
+		return
+	}
+	resolved := make(map[string]string, len(declaration.Repositories))
+	for _, repository := range declaration.Repositories {
+		if repository.ResolvedRef != "" {
+			resolved[repository.Name] = repository.ResolvedRef
+		}
+	}
+	for i, target := range res.rescueTargets {
+		want, ok := resolved[target.name]
+		if !ok || want == target.base || target.name == "" {
+			continue
+		}
+		// The resolved ref must name a commit the checkout holds;
+		// otherwise the patch cannot be cut from it and the
+		// HEAD-measured base stands.
+		checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
+		if _, err := gitStdout(checkCtx, target.path, nil, "rev-parse", "--verify", want+"^{commit}"); err != nil {
+			checkCancel()
+			logger.Debug("re-entered session keeps HEAD-measured rescue base: resolved ref unresolvable", "sessionId", sessionID, "repository", target.name, "err", err)
+			continue
+		}
+		checkCancel()
+		res.rescueTargets[i].base = want
+		logger.Info("re-entered session reseeds rescue base from declared resolved ref", "sessionId", sessionID, "repository", target.name)
+	}
 }
 
 // preserveUnpublishedWork archives every checkout's unpublished work before

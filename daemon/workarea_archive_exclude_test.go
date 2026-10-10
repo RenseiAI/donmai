@@ -3,13 +3,54 @@ package daemon
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
+
+// excludeTestGit runs git in dir, failing the test on error, and returns
+// trimmed combined output. Commits use a fixed author/committer date so
+// fixtures built from the same content hash the same: the archive digest
+// test compares captures whose .git metadata must be byte-identical.
+func excludeTestGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...) //nolint:gosec // test fixture with caller-supplied args
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_DATE=2005-04-07T22:13:13+00:00",
+		"GIT_COMMITTER_DATE=2005-04-07T22:13:13+00:00",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// initExcludeTestRepo turns dir into a git checkout whose ignore rules
+// mark every regenerable candidate in writeExcludeSource as ignored, so
+// the slimming guard proves them regenerable. `target` is deliberately
+// left unignored: the guard keeps it and the tests below pin that.
+func initExcludeTestRepo(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	excludeTestGit(t, dir, "init", "-q", "-b", "main")
+	excludeTestGit(t, dir, "config", "user.email", "test@example.com")
+	excludeTestGit(t, dir, "config", "user.name", "test")
+	excludeTestGit(t, dir, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("node_modules/\n.next/\ndist/\n"), 0o600); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	excludeTestGit(t, dir, "add", "-A")
+	excludeTestGit(t, dir, "commit", "-qm", "fixture base")
+}
 
 // writeExcludeSource lays out a source tree mixing real content with
 // regenerable dependency and build-output directories, at the top level
@@ -53,6 +94,9 @@ func TestWorkareaArchiveRegistry_SkipsRegenerableDependencyDirs(t *testing.T) {
 	root := t.TempDir()
 	source := t.TempDir()
 	writeExcludeSource(t, source)
+	// The guard skips a candidate only when the checkout ignores it:
+	// ignored candidates slim, the unignored `target` stays.
+	initExcludeTestRepo(t, source)
 	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
 	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
 		WorkareaID: "wa-slim", SessionID: "slim-session", WorkareaRoot: source, SelectedPath: source,
@@ -60,7 +104,7 @@ func TestWorkareaArchiveRegistry_SkipsRegenerableDependencyDirs(t *testing.T) {
 		t.Fatalf("archive: %v", err)
 	}
 	for _, skipped := range []string{
-		"node_modules", ".next", "dist", "target",
+		"node_modules", ".next", "dist",
 		"pkg/nested/node_modules", "pkg/nested/dist",
 	} {
 		if _, err := os.Lstat(filepath.Join(root, "wa-slim", "tree", skipped)); !os.IsNotExist(err) {
@@ -69,7 +113,7 @@ func TestWorkareaArchiveRegistry_SkipsRegenerableDependencyDirs(t *testing.T) {
 	}
 	for _, kept := range []string{
 		"src/app.go", "src/app_test.go", "README.md",
-		"pkg/target", "realdir/keep.txt", "pkg/dist", "pkg/nested",
+		"target/debug/binary", "pkg/target", "realdir/keep.txt", "pkg/dist", "pkg/nested",
 	} {
 		if _, err := os.Lstat(filepath.Join(root, "wa-slim", "tree", kept)); err != nil {
 			t.Errorf("archived tree lost %q: %v", kept, err)
@@ -84,7 +128,7 @@ func TestWorkareaArchiveRegistry_SkipsRegenerableDependencyDirs(t *testing.T) {
 	}
 	wantExcluded := []string{
 		".next", "dist", "node_modules",
-		"pkg/nested/dist", "pkg/nested/node_modules", "target",
+		"pkg/nested/dist", "pkg/nested/node_modules",
 	}
 	if !slices.Equal(manifest.Excluded, wantExcluded) {
 		t.Errorf("manifest excluded = %q; want %q", manifest.Excluded, wantExcluded)
@@ -125,25 +169,21 @@ func TestWorkareaArchiveRegistry_SkipsRegenerableDependencyDirs(t *testing.T) {
 }
 
 // TestWorkareaArchiveRegistry_DigestCoversFilteredTreeOnly pins that the
-// tree digest is computed over the filtered tree: sources differing only
-// inside regenerable directories share a digest, while a one-byte change
-// to real content moves it.
+// tree digest is computed over the filtered tree: captures of one checkout
+// differing only inside the ignored `node_modules` share a digest, while
+// a one-byte change to real content moves it. All three captures run
+// against the SAME source directory with no new commits between them, so
+// the checkout's own metadata is byte-identical and only the filtered
+// content varies. Git-aware slimming itself is pinned by the
+// dependency-dirs test above.
 func TestWorkareaArchiveRegistry_DigestCoversFilteredTreeOnly(t *testing.T) {
-	archive := func(t *testing.T, id, depBody, appBody string) string {
+	root := t.TempDir()
+	source := t.TempDir()
+	writeExcludeSource(t, source)
+	initExcludeTestRepo(t, source)
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	archive := func(t *testing.T, id string) string {
 		t.Helper()
-		root := t.TempDir()
-		source := t.TempDir()
-		writeExcludeSource(t, source)
-		if err := os.WriteFile(filepath.Join(source, "node_modules", "pkg", "index.js"), []byte(depBody), 0o600); err != nil {
-			t.Fatalf("write dep: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(source, "target", "debug", "binary"), []byte(depBody), 0o600); err != nil {
-			t.Fatalf("write build output: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(source, "src", "app.go"), []byte(appBody), 0o600); err != nil {
-			t.Fatalf("write app: %v", err)
-		}
-		registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
 		if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
 			WorkareaID: id, SessionID: "digest-session", WorkareaRoot: source, SelectedPath: source,
 		}); err != nil {
@@ -158,12 +198,25 @@ func TestWorkareaArchiveRegistry_DigestCoversFilteredTreeOnly(t *testing.T) {
 		}
 		return manifest.TreeDigest
 	}
-	base := archive(t, "wa-digest-a", "dependency v1\n", "package src\n")
-	movedDeps := archive(t, "wa-digest-b", "dependency v2, rebuilt\n", "package src\n")
+	writeDep := func(t *testing.T, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(source, "node_modules", "pkg", "index.js"), []byte(body), 0o600); err != nil {
+			t.Fatalf("write dep: %v", err)
+		}
+	}
+	writeDep(t, "dependency v1\n")
+	base := archive(t, "wa-digest-a")
+	// The ignored dependency tree is rebuilt between captures; the
+	// checkout itself (tracked files, index, refs) is untouched.
+	writeDep(t, "dependency v2, rebuilt\n")
+	movedDeps := archive(t, "wa-digest-b")
 	if base != movedDeps {
 		t.Errorf("digests differ on regenerable-only change:\n%s\n%s", base, movedDeps)
 	}
-	movedSource := archive(t, "wa-digest-c", "dependency v1\n", "package src // edited\n")
+	if err := os.WriteFile(filepath.Join(source, "src", "app.go"), []byte("package src // edited\n"), 0o600); err != nil {
+		t.Fatalf("write app: %v", err)
+	}
+	movedSource := archive(t, "wa-digest-c")
 	if base == movedSource {
 		t.Errorf("digest did not move on real content change: %s", base)
 	}
@@ -176,6 +229,7 @@ func TestWorkareaArchiveRegistry_RestoreFilteredArchiveRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	source := t.TempDir()
 	writeExcludeSource(t, source)
+	initExcludeTestRepo(t, source)
 	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
 	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
 		WorkareaID: "wa-slim-restore", SessionID: "slim-restore", WorkareaRoot: source, SelectedPath: source,
@@ -189,7 +243,7 @@ func TestWorkareaArchiveRegistry_RestoreFilteredArchiveRoundTrip(t *testing.T) {
 	if body, err := os.ReadFile(filepath.Join(restored.Path, "src", "app.go")); err != nil || string(body) != "package src\n" {
 		t.Errorf("restored app.go = %q, err %v", body, err)
 	}
-	for _, skipped := range []string{"node_modules", ".next", "target", "pkg/nested/node_modules"} {
+	for _, skipped := range []string{"node_modules", ".next", "pkg/nested/node_modules"} {
 		if _, err := os.Lstat(filepath.Join(restored.Path, skipped)); !os.IsNotExist(err) {
 			t.Errorf("restored tree holds regenerable %q (stat err %v)", skipped, err)
 		}
@@ -246,6 +300,15 @@ func TestWorkareaArchiveRegistry_SessionRootArchiveSkipsRegenerableDirs(t *testi
 	if _, err := acquisitions.Commit(acquisition.Record.AcquisitionID); err != nil {
 		t.Fatal(err)
 	}
+	// The committed leaf is a real checkout whose ignore rules mark
+	// `node_modules` as regenerable; `target` stays unignored so the
+	// guard keeps it even on the nested path.
+	excludeTestGit(t, sourceRoot, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(sourceRoot, ".gitignore"), []byte("node_modules/\n"), 0o600); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	excludeTestGit(t, sourceRoot, "add", "-A")
+	excludeTestGit(t, sourceRoot, "commit", "-qm", "nested fixture base")
 	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions})
 	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
 		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: "wa_slim_root", SessionID: "slim-session-root",
@@ -257,7 +320,7 @@ func TestWorkareaArchiveRegistry_SessionRootArchiveSkipsRegenerableDirs(t *testi
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	if want := []string{"web/node_modules", "web/target"}; !slices.Equal(manifest.Excluded, want) {
+	if want := []string{"web/node_modules"}; !slices.Equal(manifest.Excluded, want) {
 		t.Fatalf("manifest excluded = %q; want %q", manifest.Excluded, want)
 	}
 	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
@@ -270,9 +333,172 @@ func TestWorkareaArchiveRegistry_SessionRootArchiveSkipsRegenerableDirs(t *testi
 	if body, err := os.ReadFile(filepath.Join(restored.WorkareaRoot, "web", "source.txt")); err != nil || string(body) != "mutable\n" {
 		t.Errorf("restored source.txt = %q, err %v", body, err)
 	}
-	for _, skipped := range []string{"web/node_modules", "web/target"} {
+	for _, skipped := range []string{"web/node_modules"} {
 		if _, err := os.Lstat(filepath.Join(restored.WorkareaRoot, skipped)); !os.IsNotExist(err) {
 			t.Errorf("restored tree holds regenerable %q (stat err %v)", skipped, err)
+		}
+	}
+	if body, err := os.ReadFile(filepath.Join(restored.WorkareaRoot, "web", "target", "debug", "binary")); err != nil || string(body) != "build output\n" {
+		t.Errorf("restored unignored web/target = %q, err %v; want it kept", body, err)
+	}
+}
+
+// writeGitProbeSource lays out a checkout holding the four cases the
+// slimming guard must never drop: a tracked file inside a
+// regenerable-named directory, an uncommitted new file in one, a
+// committed build bundle, and an unpushed commit on a branch whose name
+// collides with an excluded leaf.
+func writeGitProbeSource(t *testing.T, dir string) (base string) {
+	t.Helper()
+	writeFile := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			t.Fatalf("mkdir parent: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+	}
+	writeFile("README.md", "# probe\n")
+	writeFile("internal/target/model.go", "package target\n")
+	writeFile("dist/index.js", "committed bundle\n")
+	writeFile("node_modules/pkg/index.js", "installed dependency\n")
+	// `.git/logs/` is ignored so the reflog directory for the `dist`
+	// branch below is an ignored, untracked candidate: without the
+	// never-slim-git-metadata rule the capture would drop it.
+	writeFile(".gitignore", "node_modules/\n.git/logs/\n")
+	excludeTestGit(t, dir, "init", "-q", "-b", "main")
+	excludeTestGit(t, dir, "add", "-A")
+	excludeTestGit(t, dir, "commit", "-qm", "probe base")
+	base = excludeTestGit(t, dir, "rev-parse", "HEAD")
+	// An unpushed commit on a branch colliding with an excluded leaf.
+	excludeTestGit(t, dir, "checkout", "-qb", "dist/hotfix")
+	writeFile("hotfix.txt", "hotfix\n")
+	excludeTestGit(t, dir, "add", "-A")
+	excludeTestGit(t, dir, "commit", "-qm", "hotfix commit")
+	// Uncommitted source inside a regenerable-named directory: written
+	// AFTER the last commit so it stays untracked.
+	writeFile("internal/target/new.go", "package target\n")
+	return base
+}
+
+// TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames pins the
+// loss-prevention rule through the production ArchiveRoot entry point: a
+// tracked file under `internal/target`, an uncommitted file under it, a
+// committed `dist` bundle and the refs holding an unpushed commit on
+// branch `dist/hotfix` all survive the capture, and the archived checkout
+// still resolves HEAD with the unpushed commit reachable.
+func TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	root := t.TempDir()
+	source := t.TempDir()
+	base := writeGitProbeSource(t, source)
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa-probe", SessionID: "probe-session", WorkareaRoot: source, SelectedPath: source,
+	}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	tree := filepath.Join(root, "wa-probe", "tree")
+	for _, kept := range []string{
+		"internal/target/model.go",
+		"internal/target/new.go",
+		"dist/index.js",
+		"hotfix.txt",
+		".git/refs/heads/dist/hotfix",
+		// The reflog for the `dist` branch is ignored and untracked,
+		// so it is exactly the candidate the name heuristic would
+		// drop: git metadata is never slimmed.
+		".git/logs/refs/heads/dist/hotfix",
+	} {
+		if _, err := os.Lstat(filepath.Join(tree, kept)); err != nil {
+			t.Errorf("archived tree lost %q: %v", kept, err)
+		}
+	}
+	if got := excludeTestGit(t, tree, "rev-parse", "HEAD"); got != excludeTestGit(t, source, "rev-parse", "HEAD") {
+		t.Errorf("archived HEAD = %q; want the source HEAD", got)
+	}
+	if got := excludeTestGit(t, tree, "branch", "--show-current"); got != "dist/hotfix" {
+		t.Errorf("archived branch = %q; want dist/hotfix", got)
+	}
+	if status := excludeTestGit(t, tree, "status", "--porcelain=v1", "--untracked-files=all"); !strings.Contains(status, "internal/target/new.go") {
+		t.Errorf("archived status = %q; want the uncommitted internal/target/new.go listed", status)
+	}
+	manifest, err := registry.readManifest("wa-probe")
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	for _, dropped := range []string{"dist", "internal/target", ".git/refs/heads/dist"} {
+		if slices.Contains(manifest.Excluded, dropped) {
+			t.Errorf("manifest excluded = %q; want no %q — tracked source is never slimmed", manifest.Excluded, dropped)
+		}
+	}
+	_ = base
+}
+
+// TestWorkareaArchiveRegistry_SkipsIgnoredUntrackedDependencyDirs pins the
+// other side through the same entry point: an ignored, untracked
+// `node_modules` IS slimmed and recorded, while the probe's tracked files
+// around it survive.
+func TestWorkareaArchiveRegistry_SkipsIgnoredUntrackedDependencyDirs(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	root := t.TempDir()
+	source := t.TempDir()
+	writeGitProbeSource(t, source)
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa-probe-slim", SessionID: "probe-session", WorkareaRoot: source, SelectedPath: source,
+	}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "wa-probe-slim", "tree", "node_modules")); !os.IsNotExist(err) {
+		t.Errorf("archived tree still holds ignored node_modules (stat err %v)", err)
+	}
+	manifest, err := registry.readManifest("wa-probe-slim")
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if !slices.Contains(manifest.Excluded, "node_modules") {
+		t.Errorf("manifest excluded = %q; want node_modules recorded", manifest.Excluded)
+	}
+	for _, kept := range []string{"internal/target/model.go", "dist/index.js"} {
+		if _, err := os.Lstat(filepath.Join(root, "wa-probe-slim", "tree", kept)); err != nil {
+			t.Errorf("archived tree lost tracked %q: %v", kept, err)
+		}
+	}
+}
+
+// TestWorkareaArchiveRegistry_RestoreLegacyArchiveKeepsRegenerableDirs pins
+// the restore path byte-for-byte: an archive committed before the
+// exclusion existed — whose tree still holds a `node_modules` directory —
+// restores with that directory intact. The capture may slim, but the
+// restore never does.
+func TestWorkareaArchiveRegistry_RestoreLegacyArchiveKeepsRegenerableDirs(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureArchive(t, root, fixtureArchive{
+		id:       "wa-legacy-deps",
+		manifest: archiveManifest{SessionID: "legacy-session"},
+		tree: map[string]string{
+			"src/app.go":                "package src\n",
+			"node_modules/pkg/index.js": "dependency output\n",
+			"dist/bundle.js":            "build output\n",
+		},
+	})
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	restored, _, err := registry.Restore("wa-legacy-deps", afclient.WorkareaRestoreRequest{})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for _, kept := range []string{"src/app.go", "node_modules/pkg/index.js", "dist/bundle.js"} {
+		if body, err := os.ReadFile(filepath.Join(restored.Path, kept)); err != nil {
+			t.Errorf("restored tree lost legacy %q: %v", kept, err)
+		} else if body == nil {
+			t.Errorf("restored tree holds empty legacy %q", kept)
 		}
 	}
 }

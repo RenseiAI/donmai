@@ -456,7 +456,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Record every mutable checkout with the commit it starts at, so teardown
 	// can tell the session's own unpublished work from the base and preserve
-	// it before deleting the workarea (Run → preserveUnpublishedWork).
+	// it before deleting the workarea (Run → preserveUnpublishedWork). A
+	// re-entered generation already holds the earlier attempt's commits at
+	// HEAD, so its base is reseeded from the generation's declared
+	// resolved ref below; without that the rescue would miss work
+	// committed before the re-entry.
 	switch {
 	case repositoryFree:
 	case repositoryDeclaration != nil:
@@ -469,6 +473,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}
 		}
 		recordRescueTargets(ctx, res, targets)
+		reseedRescueBasesFromDeclaration(ctx, res, res.WorkareaRoot, r.wt, qw.SessionID, r.logger)
 	case selectedRepositoryMutable:
 		recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
 	}

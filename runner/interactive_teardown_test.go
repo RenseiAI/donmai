@@ -175,6 +175,33 @@ func TestRun_FailedInteractiveSessionRescuesBeforeTeardown(t *testing.T) {
 	}
 }
 
+// TestRun_FailedInteractiveSessionKeepsAWorkareaWhoseWorkCannotBePreserved
+// pins the fail-closed guard on the failed terminal path: a terminal
+// session whose shell exits nonzero with uncommitted work keeps its
+// worktree when the rescue directory cannot be written, through the same
+// production Run entry point the teardown test above drives.
+func TestRun_FailedInteractiveSessionKeepsAWorkareaWhoseWorkCannotBePreserved(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("a file where the rescue directory should go\n"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	provider := &failingInteractiveProvider{
+		manifest: (&claude.Provider{}).Manifest(),
+		files:    map[string]string{"work.txt": "uncommitted\n"},
+		exitCode: 3,
+	}
+	res := runInteractiveSession(t, provider, "interactive-failed-keep", blocked, false)
+	if res.Status != "failed" {
+		t.Fatalf("Status = %q (%s: %s); want failed", res.Status, res.FailureMode, res.Error)
+	}
+	if got := readFile(t, filepath.Join(res.WorktreePath, "work.txt")); got != "uncommitted\n" {
+		t.Fatalf("work.txt = %q; want the unpreserved work kept in place", got)
+	}
+}
+
 // TestRun_CompletedInteractiveSessionKeepsUnpublishedWorkarea pins the other
 // side of the same gate: a completed interactive session with uncommitted
 // work keeps its worktree through the publication hold, and the rescue

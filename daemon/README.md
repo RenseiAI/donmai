@@ -429,9 +429,12 @@ When a session appears wedged in the dashboard:
    down once the rescue has archived its unpublished work as a patch
    under the sibling `rescue/` directory (`<session>/<stamp>/…patch` plus
    a JSON sidecar describing how to re-apply it). Apply the patch onto a
-   fresh checkout of the recorded base to recover the work. Set
+   fresh checkout of the recorded base to recover the work. Sessions
+   without a repository have no checkout for the rescue to archive, so
+   their worktrees are torn down with nothing preserved. Set
    `keepFailedWorktrees: true` in `daemon.yaml` to keep failed sessions'
-   worktrees on disk instead: `~/.donmai/worktrees/<sessionId>/.agent/`
+   worktrees on disk instead (read at daemon start, so restart the daemon
+   after changing it): `~/.donmai/worktrees/<sessionId>/.agent/`
    then still contains the per-session `state.json` snapshot and the
    `events.jsonl` audit log. Look here when the agent emitted no
    visible output but the session is marked failed.
