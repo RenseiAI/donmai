@@ -353,11 +353,12 @@ func TestWorkareaArchiveRegistry_SessionRootArchiveSkipsRegenerableDirs(t *testi
 	}
 }
 
-// writeGitProbeSource lays out a checkout holding the four cases the
-// slimming guard must never drop: a tracked file inside a
+// writeGitProbeSource lays out a checkout holding the five cases the
+// slimming guard must never drop: a tracked file inside an unignored
 // regenerable-named directory, an uncommitted new file in one, a
-// committed build bundle, and an unpushed commit on a branch whose name
-// collides with an excluded leaf.
+// force-added tracked file under the ignored `target` (kept only by the
+// tracked-files check), a committed build bundle, and an unpushed commit
+// on a branch whose name collides with an excluded leaf.
 func writeGitProbeSource(t *testing.T, dir string) (base string) {
 	t.Helper()
 	writeFile := func(rel, body string) {
@@ -371,9 +372,20 @@ func writeGitProbeSource(t *testing.T, dir string) (base string) {
 		}
 	}
 	writeFile("README.md", "# probe\n")
+	// `internal/target` is deliberately anchored as not-ignored below (the
+	// `internal/` prefix keeps the unanchored `target/` rule from matching
+	// it): the tracked file under it passes the ignore check, while the
+	// force-added file under the ignored top-level `target/` would be
+	// slimmed by the ignore check alone — together they pin both sides
+	// of the tracked-files gate.
 	writeFile("internal/target/model.go", "package target\n")
 	writeFile("dist/index.js", "committed bundle\n")
 	writeFile("node_modules/pkg/index.js", "installed dependency\n")
+	// A force-added tracked file under the ignored `target`: `check-ignore`
+	// still reports the directory as ignored (`--no-index` never consults
+	// the index), so only the guard's tracked-files check keeps it.
+	// Committed below with -f (the ignore rule blocks a plain add).
+	writeFile("target/keep.rs", "force-added tracked build output\n")
 	// `sub/.git-tmp/dist/` is ignored, so the excluded-named
 	// directory nested under it is an ignored, untracked candidate:
 	// its leaf (not its ancestors) carries the excluded name, and
@@ -382,12 +394,17 @@ func writeGitProbeSource(t *testing.T, dir string) (base string) {
 	// `.git/logs/` is ignored so the reflog directory for the `dist`
 	// branch below is an ignored, untracked candidate: without the
 	// never-slim-git-metadata rule the capture would drop it.
-	writeFile(".gitignore", "node_modules/\n.git/logs/\nsub/.git-tmp/\n")
+	// (`target/` stays ignored so the force-added file under it pins
+	// the tracked-files check: the `ignored` check alone would slim
+	// it.)
+	writeFile(".gitignore", "node_modules/\n.git/logs/\nsub/.git-tmp/\ntarget/\n!internal/target/\n")
 	excludeTestGit(t, dir, "init", "-q", "-b", "main")
 	// The probe commits carry their identity as -c flags (via
 	// excludeTestGit), so the fixture builds with no global git
-	// identity, as on CI runners.
+	// identity, as on CI runners. The force-added file under the
+	// ignored `target` needs -f: the ignore rule blocks a plain add.
 	excludeTestGit(t, dir, "add", "-A")
+	excludeTestGit(t, dir, "add", "-f", "--", "target/keep.rs")
 	excludeTestGit(t, dir, "commit", "-qm", "probe base")
 	base = excludeTestGit(t, dir, "rev-parse", "HEAD")
 	// An unpushed commit on a branch colliding with an excluded leaf.
@@ -404,9 +421,10 @@ func writeGitProbeSource(t *testing.T, dir string) (base string) {
 // TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames pins the
 // loss-prevention rule through the production ArchiveRoot entry point: a
 // tracked file under `internal/target`, an uncommitted file under it, a
-// committed `dist` bundle and the refs holding an unpushed commit on
-// branch `dist/hotfix` all survive the capture, and the archived checkout
-// still resolves HEAD with the unpushed commit reachable.
+// force-added tracked file under the ignored `target`, a committed `dist`
+// bundle and the refs holding an unpushed commit on branch `dist/hotfix` all
+// survive the capture, and the archived checkout still resolves HEAD with
+// the unpushed commit reachable.
 func TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -424,6 +442,10 @@ func TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames(t *testing
 	for _, kept := range []string{
 		"internal/target/model.go",
 		"internal/target/new.go",
+		// The force-added tracked file under the ignored `target`:
+		// `check-ignore` reports nothing, so only the guard's
+		// tracked-files check keeps it — this pins that check.
+		"target/keep.rs",
 		"dist/index.js",
 		"hotfix.txt",
 		".git/refs/heads/dist/hotfix",
@@ -454,11 +476,11 @@ func TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames(t *testing
 		t.Fatalf("read manifest: %v", err)
 	}
 	// Only the ignored, untracked `node_modules` is slimmed: the
-	// git-metadata leaf and every tracked candidate stay out of the
-	// excluded list. The exact-equality assertion below pins the
-	// guard's keep (a narrowed guard would record
-	// `sub/.git-tmp/dist` here); the kept-file assertions above pin
-	// the copy walk's keep.
+	// git-metadata leaf, the force-added `target` and every other tracked
+	// candidate stay out of the excluded list. The exact-equality
+	// assertion below pins the guard's keep (a narrowed guard would
+	// record `sub/.git-tmp/dist` here); the kept-file assertions above
+	// pin the copy walk's keep.
 	if want := []string{"node_modules"}; !slices.Equal(manifest.Excluded, want) {
 		t.Errorf("manifest excluded = %q; want %q", manifest.Excluded, want)
 	}
@@ -473,7 +495,10 @@ func TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames(t *testing
 // TestWorkareaArchiveRegistry_SkipsIgnoredUntrackedDependencyDirs pins the
 // other side through the same entry point: an ignored, untracked
 // `node_modules` IS slimmed and recorded, while the probe's tracked files
-// around it survive.
+// around it survive. A brand-new `src/dist/feature.go` — an excluded-name
+// directory no rule ignores and with no tracked sibling — is kept: this
+// pins the `ignored` check, which the tracked-only fixtures above would
+// otherwise mask.
 func TestWorkareaArchiveRegistry_SkipsIgnoredUntrackedDependencyDirs(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -481,6 +506,15 @@ func TestWorkareaArchiveRegistry_SkipsIgnoredUntrackedDependencyDirs(t *testing.
 	root := t.TempDir()
 	source := t.TempDir()
 	writeGitProbeSource(t, source)
+	// An unignored excluded-name directory with no tracked files: the
+	// only thing keeping it is the guard's `ignored` check.
+	fresh := filepath.Join(source, "src", "dist", "feature.go")
+	if err := os.MkdirAll(filepath.Dir(fresh), 0o750); err != nil {
+		t.Fatalf("mkdir fresh: %v", err)
+	}
+	if err := os.WriteFile(fresh, []byte("package dist // brand-new source\n"), 0o600); err != nil {
+		t.Fatalf("write fresh: %v", err)
+	}
 	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
 	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
 		WorkareaID: "wa-probe-slim", SessionID: "probe-session", WorkareaRoot: source, SelectedPath: source,
@@ -497,10 +531,85 @@ func TestWorkareaArchiveRegistry_SkipsIgnoredUntrackedDependencyDirs(t *testing.
 	if !slices.Contains(manifest.Excluded, "node_modules") {
 		t.Errorf("manifest excluded = %q; want node_modules recorded", manifest.Excluded)
 	}
-	for _, kept := range []string{"internal/target/model.go", "dist/index.js"} {
+	for _, kept := range []string{"internal/target/model.go", "dist/index.js", "src/dist/feature.go"} {
 		if _, err := os.Lstat(filepath.Join(root, "wa-probe-slim", "tree", kept)); err != nil {
-			t.Errorf("archived tree lost tracked %q: %v", kept, err)
+			t.Errorf("archived tree lost %q: %v", kept, err)
 		}
+	}
+	if slices.Contains(manifest.Excluded, "src/dist") {
+		t.Errorf("manifest excluded = %q; want no src/dist — unignored source is never slimmed", manifest.Excluded)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "wa-probe-slim", "tree", "src", "dist", "feature.go")); err != nil || string(body) != "package dist // brand-new source\n" {
+		t.Errorf("archived src/dist/feature.go = %q, err %v; want the brand-new source kept", body, err)
+	}
+}
+
+// TestWorkareaArchiveRegistry_KeepsNestedRepositoryContent pins the
+// repository boundary through the production ArchiveRoot entry point: an
+// excluded-name directory tracked by a nested checkout (`vendor/lib`, its
+// own repository with an uncommitted edit inside `dist/index.js`) is kept
+// whole, even though the outer checkout's unanchored `dist/` ignore rule
+// matches it and the outer index never lists its files. The guard asks
+// the archived root's own checkout about every candidate, so without the
+// boundary the nested content would slim and be lost with the source.
+// A submodule carries the same shape — its `.git` entry is a file
+// pointing at the parent's modules directory — and the Lstat boundary
+// sees it the same way, so the nested-clone fixture covers both.
+func TestWorkareaArchiveRegistry_KeepsNestedRepositoryContent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	root := t.TempDir()
+	source := t.TempDir()
+	writeFile := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(source, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			t.Fatalf("mkdir parent: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+	}
+	excludeTestGit(t, source, "init", "-q", "-b", "main")
+	writeFile(".gitignore", "dist/\n")
+	writeFile("README.md", "# outer\n")
+	// The nested repository tracks its own `dist/index.js`: committed
+	// first, then edited so the working tree also holds an uncommitted
+	// change the index alone does not describe.
+	writeFile("vendor/lib/lib.go", "package lib\n")
+	writeFile("vendor/lib/dist/index.js", "nested tracked\n")
+	excludeTestGit(t, filepath.Join(source, "vendor", "lib"), "init", "-q", "-b", "main")
+	excludeTestGit(t, filepath.Join(source, "vendor", "lib"), "add", "-A")
+	excludeTestGit(t, filepath.Join(source, "vendor", "lib"), "commit", "-qm", "nested base")
+	writeFile("vendor/lib/dist/index.js", "nested tracked edited\n")
+	excludeTestGit(t, source, "add", "-A")
+	excludeTestGit(t, source, "commit", "-qm", "outer base")
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa-nested", SessionID: "nested-session", WorkareaRoot: source, SelectedPath: source,
+	}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	tree := filepath.Join(root, "wa-nested", "tree")
+	for _, kept := range []string{
+		"vendor/lib/lib.go",
+		"vendor/lib/dist/index.js",
+		"README.md",
+	} {
+		if _, err := os.Lstat(filepath.Join(tree, kept)); err != nil {
+			t.Errorf("archived tree lost nested %q: %v", kept, err)
+		}
+	}
+	if body, err := os.ReadFile(filepath.Join(tree, "vendor", "lib", "dist", "index.js")); err != nil || string(body) != "nested tracked edited\n" {
+		t.Errorf("archived vendor/lib/dist/index.js = %q, err %v; want the uncommitted nested edit", body, err)
+	}
+	manifest, err := registry.readManifest("wa-nested")
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if slices.Contains(manifest.Excluded, "vendor/lib/dist") {
+		t.Errorf("manifest excluded = %q; want no vendor/lib/dist — nested checkouts are never slimmed", manifest.Excluded)
 	}
 }
 

@@ -2626,9 +2626,13 @@ var archivePathspecSeparator = []string{"--"}
 // collectArchiveExclusionCandidates walks one source root and returns the
 // slash-separated, root-relative paths of every real directory whose leaf
 // names a regenerable dependency or build-output directory, excluding
-// anything under .git (git metadata is never slimmed). Symlinks are not
-// followed: a link carrying an excluded name is copied as a link by the
-// capture itself.
+// anything under .git (git metadata is never slimmed) and anything under
+// a nested repository boundary (a directory holding its own `.git` entry
+// is a different checkout: the outer index never lists its files and the
+// outer ignore rules do not govern it, so none of its content is a
+// candidate). Symlinks are not followed: a link carrying an excluded name
+// is copied as a link by the capture itself, and a `.git` symlink escapes
+// the root so it does not mark a boundary.
 func collectArchiveExclusionCandidates(root string) ([]string, error) {
 	var candidates []string
 	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
@@ -2648,6 +2652,22 @@ func collectArchiveExclusionCandidates(root string) ([]string, error) {
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		// A nested repository is a boundary: a non-root directory
+		// holding its own `.git` entry is a different checkout
+		// (submodule gitfile, nested clone directory, or linked
+		// worktree pointer). The outer checkout's ignore rules do
+		// not govern it and the outer index never lists its files,
+		// so nothing beneath it becomes a candidate — the copy walk
+		// keeps it whole. (The root itself is the enclosing checkout
+		// the guard inspects, so it never marks a boundary.) A
+		// `.git` symlink escapes the root and does not mark a
+		// boundary: Lstat reports the link itself, and the entry
+		// walk never descends through it.
+		if entry.IsDir() && !isArchiveGitMetadataPath(slashed) {
+			if info, err := os.Lstat(filepath.Join(path, ".git")); err == nil && info.Mode()&os.ModeSymlink == 0 {
+				return filepath.SkipDir
+			}
 		}
 		if entry.IsDir() {
 			if isArchiveExcludedDir(entry.Name()) {
