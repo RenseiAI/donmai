@@ -17,8 +17,17 @@ import (
 // trimmed combined output. Commits use a fixed author/committer date so
 // fixtures built from the same content hash the same: the archive digest
 // test compares captures whose .git metadata must be byte-identical.
+// The identity travels as -c flags (not process state) so the fixture
+// commits on machines with no global git identity, such as CI runners.
 func excludeTestGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	if len(args) > 0 && args[0] == "commit" {
+		args = append([]string{
+			"-c", "user.email=test@example.com",
+			"-c", "user.name=test",
+			"-c", "commit.gpgsign=false",
+		}, args...)
+	}
 	cmd := exec.Command("git", args...) //nolint:gosec // test fixture with caller-supplied args
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -302,7 +311,8 @@ func TestWorkareaArchiveRegistry_SessionRootArchiveSkipsRegenerableDirs(t *testi
 	}
 	// The committed leaf is a real checkout whose ignore rules mark
 	// `node_modules` as regenerable; `target` stays unignored so the
-	// guard keeps it even on the nested path.
+	// guard keeps it even on the nested path. The identity travels as
+	// -c flags so the fixture commits with no global git identity.
 	excludeTestGit(t, sourceRoot, "init", "-q", "-b", "main")
 	if err := os.WriteFile(filepath.Join(sourceRoot, ".gitignore"), []byte("node_modules/\n"), 0o600); err != nil {
 		t.Fatalf("write gitignore: %v", err)
@@ -364,11 +374,19 @@ func writeGitProbeSource(t *testing.T, dir string) (base string) {
 	writeFile("internal/target/model.go", "package target\n")
 	writeFile("dist/index.js", "committed bundle\n")
 	writeFile("node_modules/pkg/index.js", "installed dependency\n")
+	// `sub/.git-tmp/dist/` is ignored, so the excluded-named
+	// directory nested under it is an ignored, untracked candidate:
+	// its leaf (not its ancestors) carries the excluded name, and
+	// only the never-slim-git-metadata rule keeps it.
+	writeFile("sub/.git-tmp/dist/payload.bin", "tool payload\n")
 	// `.git/logs/` is ignored so the reflog directory for the `dist`
 	// branch below is an ignored, untracked candidate: without the
 	// never-slim-git-metadata rule the capture would drop it.
-	writeFile(".gitignore", "node_modules/\n.git/logs/\n")
+	writeFile(".gitignore", "node_modules/\n.git/logs/\nsub/.git-tmp/\n")
 	excludeTestGit(t, dir, "init", "-q", "-b", "main")
+	// The probe commits carry their identity as -c flags (via
+	// excludeTestGit), so the fixture builds with no global git
+	// identity, as on CI runners.
 	excludeTestGit(t, dir, "add", "-A")
 	excludeTestGit(t, dir, "commit", "-qm", "probe base")
 	base = excludeTestGit(t, dir, "rev-parse", "HEAD")
@@ -413,6 +431,10 @@ func TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames(t *testing
 		// so it is exactly the candidate the name heuristic would
 		// drop: git metadata is never slimmed.
 		".git/logs/refs/heads/dist/hotfix",
+		// The ignored, untracked excluded-named directory nested
+		// under `sub/.git-tmp/`: only the never-slim-git-metadata
+		// rule keeps it.
+		"sub/.git-tmp/dist/payload.bin",
 	} {
 		if _, err := os.Lstat(filepath.Join(tree, kept)); err != nil {
 			t.Errorf("archived tree lost %q: %v", kept, err)
@@ -430,6 +452,15 @@ func TestWorkareaArchiveRegistry_KeepsTrackedSourceUnderExcludedNames(t *testing
 	manifest, err := registry.readManifest("wa-probe")
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
+	}
+	// Only the ignored, untracked `node_modules` is slimmed: the
+	// git-metadata leaf and every tracked candidate stay out of the
+	// excluded list. The exact-equality assertion below pins the
+	// guard's keep (a narrowed guard would record
+	// `sub/.git-tmp/dist` here); the kept-file assertions above pin
+	// the copy walk's keep.
+	if want := []string{"node_modules"}; !slices.Equal(manifest.Excluded, want) {
+		t.Errorf("manifest excluded = %q; want %q", manifest.Excluded, want)
 	}
 	for _, dropped := range []string{"dist", "internal/target", ".git/refs/heads/dist"} {
 		if slices.Contains(manifest.Excluded, dropped) {

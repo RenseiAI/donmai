@@ -501,9 +501,11 @@ func TestRun_ReenteredSessionRescuesWorkCommittedBeforeReentry(t *testing.T) {
 		t.Fatal("first attempt has no worktree path")
 	}
 	// The agent's first attempt commits locally without pushing — exactly
-	// the state a re-entry finds at HEAD.
+	// the state a re-entry finds at HEAD. The identity travels as -c
+	// flags so the fixture commits with no ambient git identity, as on
+	// CI runners.
 	gitRun(t, res1.WorktreePath, "add", "attempt1.txt")
-	gitRun(t, res1.WorktreePath, "commit", "-q", "-m", "first attempt commit")
+	gitRun(t, res1.WorktreePath, "-c", "user.email=test@example.com", "-c", "user.name=test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "first attempt commit")
 	attemptHead := gitRun(t, res1.WorktreePath, "rev-parse", "HEAD")
 
 	// Second attempt: re-enters the same generation on a manager that

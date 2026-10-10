@@ -2452,6 +2452,22 @@ func isArchiveExcludedDir(leaf string) bool {
 	return ok
 }
 
+// isArchiveGitMetadataPath reports whether a slash-separated,
+// root-relative candidate path names git metadata: the exact `.git`
+// directory, anything under it, or anything nested under a segment
+// that reads as a git-metadata directory (a segment starting with
+// `.git`, covering linked or nested metadata directories). Both the
+// copy walk and the guard consult it so the rule cannot drift between
+// the two.
+func isArchiveGitMetadataPath(candidate string) bool {
+	for _, segment := range strings.Split(candidate, "/") {
+		if strings.HasPrefix(segment, ".git") {
+			return true
+		}
+	}
+	return false
+}
+
 // archiveExclusionTimeout bounds the whole guard inspection of one archive
 // capture. Git ignore and index reads are local and fast; the bound keeps
 // a wedged checkout from stalling the capture.
@@ -2521,15 +2537,18 @@ func (g *archiveExclusionGuard) init() {
 
 // skippable reports whether the candidate directory (slash-separated,
 // root-relative, as recorded on the manifest's excluded list) may be
-// skipped. It returns false for everything under .git, for any path the
-// enclosing checkout does not ignore, and for any path holding tracked
-// files. Roots that are not git checkouts keep every candidate.
+// skipped. It returns false for everything under .git, for any path
+// whose every segment reads as git metadata (any segment starting
+// with .git, covering linked or nested metadata directories), for any
+// path the enclosing checkout does not ignore, and for any path
+// holding tracked files. Roots that are not git checkouts keep every
+// candidate.
 func (g *archiveExclusionGuard) skippable(candidate string) bool {
 	g.init()
 	if !g.git {
 		return false
 	}
-	if candidate == ".git" || strings.HasPrefix(candidate, ".git/") {
+	if isArchiveGitMetadataPath(candidate) {
 		return false
 	}
 	if _, ok := g.ignored[candidate]; !ok {
@@ -2758,11 +2777,17 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 		case info.IsDir():
 			if exclusion != nil && isArchiveExcludedDir(entry.Name()) {
 				candidate := filepath.ToSlash(name)
-				// Git metadata is never slimmed, and anything
-				// the guard cannot prove regenerable is copied
-				// whole: the archive is the loss-prevention
-				// store.
-				if candidate != ".git" && !strings.HasPrefix(candidate, ".git/") && exclusion.guard.skippable(candidate) {
+				// Git metadata is never slimmed — the exact `.git`
+				// directory and anything nested under a
+				// git-metadata segment — and anything the guard
+				// cannot prove regenerable is copied whole: the
+				// archive is the loss-prevention store. The walk
+				// consults the same helper as the guard so the
+				// rule cannot drift between the two; the guard's
+				// keep is pinned by the exact-excluded assertion
+				// below, this condition by the kept-file
+				// assertions above.
+				if !isArchiveGitMetadataPath(candidate) && exclusion.guard.skippable(candidate) {
 					exclusion.skipped = append(exclusion.skipped, candidate)
 					continue
 				}
