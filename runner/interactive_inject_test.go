@@ -711,7 +711,7 @@ func TestInteractive_UndrivenChannelRefusesWithoutWritingOrAcking(t *testing.T) 
 		agent.NoticeDeliveryMCPRPC,      // codex
 		agent.NoticeDeliveryHTTPSession, // opencode
 		agent.NoticeDeliveryRPCSteer,    // pi
-		agent.NoticeDeliveryNone,        // antigravity / ollama
+		agent.NoticeDeliveryNone,        // ollama (no delivery channel)
 		"",                              // a manifest that never answered
 	}
 	for _, channel := range channels {
@@ -795,7 +795,7 @@ func TestInteractive_AttemptCapDeadLettersAndUnblocksTheQueue(t *testing.T) {
 // never calls Handle.Inject; it writes into its PTY, and every interactive
 // session has one. Gating the rail on the provider capability silently
 // disabled it for the harnesses that declare SupportsMessageInjection=false
-// (codex, shell, agycli, ollama) while the platform still reported the
+// (codex, shell, ollama) while the platform still reported the
 // message delivered — so the capability=false row is the regression.
 func TestInteractive_RunLoopHandsInjectChToDispatch(t *testing.T) {
 	tests := []struct {

@@ -4,26 +4,6 @@
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "cells": [
     {
-      "harness": "antigravity",
-      "endpoint": "google",
-      "host": "oauth-cli",
-      "protocol": "antigravity-oauth",
-      "transport": "pty",
-      "authModes": [
-        "host-session",
-        "local"
-      ],
-      "bringsOwnAuth": true,
-      "needsApiKey": false,
-      "costModel": "host-subscription",
-      "oneShot": true,
-      "nativeJsonMode": false,
-      "structuredVia": "spawn-collect",
-      "legacyProviderId": "agy-cli",
-      "stability": "stable",
-      "smoked": true
-    },
-    {
       "harness": "claude-code",
       "endpoint": "anthropic",
       "host": "bedrock",
@@ -341,14 +321,6 @@
   ],
   "denylist": [],
   "legacyAliases": [
-    {
-      "providerName": "agy-cli",
-      "cell": {
-        "harness": "antigravity",
-        "endpoint": "google",
-        "host": "oauth-cli"
-      }
-    },
     {
       "providerName": "claude",
       "cell": {

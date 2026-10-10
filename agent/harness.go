@@ -25,7 +25,6 @@ const (
 	HarnessClaudeCode   HarnessName = "claude-code"
 	HarnessCodex        HarnessName = "codex"
 	HarnessOpenCode     HarnessName = "opencode"
-	HarnessAntigravity  HarnessName = "antigravity"
 	HarnessGeminiDirect HarnessName = "gemini-direct" // in-box Gemini generateContent loop
 	HarnessOllama       HarnessName = "ollama"        // in-box Ollama /api/chat loop
 	// HarnessRaw is the deprecated pre-split wire token for the two in-box

@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/harness/agycli"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -34,7 +33,6 @@ func TestToolLifecycleAdapterMatrix(t *testing.T) {
 		{"codex", (&codex.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}, true, false, true},
 		{"gemini", (&gemini.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, true, true},
 		{"ollama", (&ollama.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, false, true},
-		{"agy-cli", (&agycli.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, false, false},
 		{"opencode", (&opencode.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, true, true},
 		{"pi", (&pi.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}, false, true, true},
 		{"shell", (&shell.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeHumanControlled}, false, false, false},
@@ -138,7 +136,6 @@ func TestToolLifecycleAdapterUnsupportedPoliciesDeny(t *testing.T) {
 		mode     agent.PromptSessionMode
 	}{
 		{"codex-flat-list", (&codex.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
-		{"agy-cli", (&agycli.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
 		{"ollama", (&ollama.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
 		{"shell", (&shell.Provider{}).Manifest(), agent.Spec{Interactive: &agent.InteractiveSpec{}, AllowedTools: []string{"Read"}}, agent.PromptModeHumanControlled},
 	}
@@ -211,11 +208,6 @@ func TestToolLifecycleRuntimeEvidenceIsPerHarness(t *testing.T) {
 		// interactive profile does not inherit pi's structured headless evidence.
 		{(&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"pi-interactive", coarse, cast, cleanup, ""}},
 		{(&shell.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"shell", coarse, cast, cleanup, ""}},
-		// Antigravity drives a PTY with no replay adapter at all: coarse
-		// lifecycle evidence is deliverable, replay is not, and neither is a
-		// structured claim over the same bytes.
-		{(&agycli.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceCoarse, runtimeEvidenceCase{"agy-cli-coarse", coarse, "", cleanup, coarse}},
-		{(&agycli.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"agy-cli-structured", "", "", cleanup, ""}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -295,15 +287,15 @@ func TestToolLifecycleUndeliverableRequiredRuntimeEvidenceDenies(t *testing.T) {
 		channel  agent.ToolLifecycleChannel
 	}{
 		{
-			name: "replay adapter absent", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous,
+			name: "replay adapter absent", manifest: (&shell.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled,
 			plan: agent.ToolLifecyclePlan{
 				ContractVersion: agent.ToolLifecycleContractVersion,
-				Replay:          &agent.LifecycleRequirement{ID: "replay", Event: agent.EventResult, Required: true, MinimumFidelity: agent.EvidenceCoarse},
+				Replay:          &agent.LifecycleRequirement{ID: "replay", Event: agent.EventToolUse, Required: true, MinimumFidelity: agent.EvidenceCoarse},
 			},
 			channel: agent.ToolChannelReplay,
 		},
 		{
-			name: "coarse profile cannot answer a structured demand", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous,
+			name: "coarse profile cannot answer a structured demand", manifest: (&shell.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled,
 			plan: agent.ToolLifecyclePlan{
 				ContractVersion: agent.ToolLifecycleContractVersion,
 				Lifecycle:       []agent.LifecycleRequirement{{ID: "watch-init", Event: agent.EventInit, Required: true, MinimumFidelity: agent.EvidenceStructured}},
@@ -492,7 +484,7 @@ func TestToolLifecycleDeniedReceiptPersistenceFailsClosed(t *testing.T) {
 			return errors.New("store unavailable")
 		},
 	}
-	_, err := agent.PrepareToolLifecycle(spec, (&agycli.Provider{}).Manifest())
+	_, err := agent.PrepareToolLifecycle(spec, (&ollama.Provider{}).Manifest())
 	var adaptationErr *agent.ToolAdaptationError
 	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialApplicationFailed {
 		t.Fatalf("PrepareToolLifecycle error = %v, want application-failed denial", err)
@@ -1372,7 +1364,7 @@ func TestToolLifecyclePlanRequireToolPluginsNowAdmitsOnPi(t *testing.T) {
 // TestInteractiveProfiles_TellCoarseTruthNoInjectedBoundary). RED proof: set
 // the interactive profile's NativeToolPolicyDelivery back to Unsupported and
 // this admission fails closed again, exactly like
-// TestToolLifecycleAdapterUnsupportedPoliciesDeny's shell/codex/agy-cli/
+// TestToolLifecycleAdapterUnsupportedPoliciesDeny's shell/codex/
 // ollama cases above.
 func TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally(t *testing.T) {
 	t.Parallel()

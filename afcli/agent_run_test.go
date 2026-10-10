@@ -794,12 +794,12 @@ func TestDetailToQueuedWork_EndpointBindingBaseURL(t *testing.T) {
 // ResolvedProfile.Harness (the platform catalog loop-driver attribute) is
 // threaded onto the runner's QueuedWork so the runner's harness-native
 // provider selection sees it. The platform models the model as
-// provider="gemini" with harness="agy"; the runner must resolve agy-cli.
+// provider="gemini" with harness="codex"; the runner must resolve codex.
 func TestDetailToQueuedWork_ThreadsHarness(t *testing.T) {
 	d := &daemon.SessionDetail{
 		SessionID: "sess-harness",
 		ResolvedProfile: &daemon.SessionResolvedProfile{
-			Harness:  "agy",
+			Harness:  "codex",
 			Provider: string(agent.ProviderGemini),
 			Model:    "gemini-3.1-pro",
 		},
@@ -808,8 +808,8 @@ func TestDetailToQueuedWork_ThreadsHarness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("detailToQueuedWork: %v", err)
 	}
-	if qw.ResolvedProfile.Harness != "agy" {
-		t.Errorf("Harness = %q; want agy", qw.ResolvedProfile.Harness)
+	if qw.ResolvedProfile.Harness != "codex" {
+		t.Errorf("Harness = %q; want codex", qw.ResolvedProfile.Harness)
 	}
 	if qw.ResolvedProfile.Provider != agent.ProviderGemini {
 		t.Errorf("Provider = %q; want gemini (Harness must not clobber Provider)", qw.ResolvedProfile.Provider)
@@ -817,8 +817,8 @@ func TestDetailToQueuedWork_ThreadsHarness(t *testing.T) {
 }
 
 // TestProviderNameFromDetail_Harness verifies the dispatch log-line helper
-// mirrors the runner's harness-native selection (agy → agy-cli) and keeps
-// the legacy provider=agy-cli alias path working.
+// falls through to the resolved provider: harness tokens are admission
+// input, not display aliases, so the helper never maps them.
 func TestProviderNameFromDetail_Harness(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -826,14 +826,9 @@ func TestProviderNameFromDetail_Harness(t *testing.T) {
 		want    string
 	}{
 		{
-			name:    "harness agy maps to agy-cli over provider",
-			profile: &daemon.SessionResolvedProfile{Harness: "agy", Provider: string(agent.ProviderGemini)},
-			want:    string(agent.ProviderAGYCLI),
-		},
-		{
-			name:    "legacy provider agy-cli without harness",
-			profile: &daemon.SessionResolvedProfile{Provider: string(agent.ProviderAGYCLI)},
-			want:    string(agent.ProviderAGYCLI),
+			name:    "harness does not override provider",
+			profile: &daemon.SessionResolvedProfile{Harness: "codex", Provider: string(agent.ProviderGemini)},
+			want:    string(agent.ProviderGemini),
 		},
 		{
 			name:    "plain claude provider",
@@ -976,23 +971,23 @@ func TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback(t *testing.T) {
 // modelProfile dispatch path is harness-aware in lock-step with the
 // resolvedProfile path. When ONLY modelProfile is present (no
 // resolvedProfile) and it models the model as ProviderID="gemini" with
-// Harness="agy", the bridged QueuedWork.ResolvedProfile must carry Harness
-// so the runner's harness-native selection resolves the agy-cli provider.
+// Harness="codex", the bridged QueuedWork.ResolvedProfile must carry Harness
+// so the runner's harness-native selection resolves the codex provider.
 // Defense-in-depth: the platform writes only resolvedProfile today, so this
 // guards the day it populates modelProfile.
 func TestDetailToQueuedWork_ModelProfileOnlyThreadsHarness(t *testing.T) {
 	d := &daemon.SessionDetail{
 		SessionID:       "sess-mp-harness",
-		IssueIdentifier: "REN-MP-AGY",
+		IssueIdentifier: "sess-mp-harness",
 		Body:            "test body",
 		WorkerID:        "wkr_mp",
 		AuthToken:       "tok_mp",
 		PlatformURL:     "https://app.example.com",
 		// resolvedProfile intentionally absent — only modelProfile drives this.
 		ModelProfile: &daemon.SessionModelProfile{
-			ID:         "mp_agy",
+			ID:         "mp_codex",
 			ProviderID: string(agent.ProviderGemini),
-			Harness:    "agy",
+			Harness:    "codex",
 			Model:      "gemini-3.1-pro",
 		},
 	}
@@ -1000,8 +995,8 @@ func TestDetailToQueuedWork_ModelProfileOnlyThreadsHarness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("detailToQueuedWork: %v", err)
 	}
-	if qw.ResolvedProfile.Harness != "agy" {
-		t.Errorf("Harness = %q; want agy (modelProfile path must carry harness)", qw.ResolvedProfile.Harness)
+	if qw.ResolvedProfile.Harness != "codex" {
+		t.Errorf("Harness = %q; want codex (modelProfile path must carry harness)", qw.ResolvedProfile.Harness)
 	}
 	// Harness must not clobber Provider — both survive the bridge.
 	if qw.ResolvedProfile.Provider != agent.ProviderGemini {
@@ -1393,7 +1388,7 @@ func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
 	registry := runner.NewRegistry()
 	for _, provider := range []*fakeAdmissionHarnessProvider{
 		{fakeProvider: fakeProvider{name: agent.ProviderClaude}, harness: agent.HarnessClaudeCode},
-		{fakeProvider: fakeProvider{name: agent.ProviderAGYCLI}, harness: agent.HarnessAntigravity},
+		{fakeProvider: fakeProvider{name: agent.ProviderCodex}, harness: agent.HarnessCodex},
 		{fakeProvider: fakeProvider{name: agent.ProviderGemini}, harness: agent.HarnessGeminiDirect},
 		{fakeProvider: fakeProvider{name: agent.ProviderOllama}, harness: agent.HarnessOllama},
 	} {
@@ -1406,7 +1401,6 @@ func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
 		name, harness, provider, want string
 	}{
 		{name: "contradictory claude harness and gemini provider", harness: "claude", provider: "gemini", want: "claude-code"},
-		{name: "agy legacy wire", harness: "agy", provider: "gemini", want: "antigravity"},
 		{name: "native gemini wire", harness: "native", provider: "gemini", want: "gemini-direct"},
 		{name: "native ollama wire", harness: "native", provider: "ollama", want: "ollama"},
 		{name: "raw gemini wire", harness: "raw", provider: "gemini", want: "gemini-direct"},
