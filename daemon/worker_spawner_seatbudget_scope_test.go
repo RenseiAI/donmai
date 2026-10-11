@@ -37,7 +37,8 @@ func newScopeProbeRegistry(dir string) (*sessionshim.Registry, error) {
 // past it with only "exited without publishing one".
 func TestStartShimProcess_ProbeDeniedRefusesUpFront(t *testing.T) {
 	dir := t.TempDir()
-	denied := shimScopeProbe{goos: "linux", placement: func() seatbudget.Placement { return seatbudget.PlacementNone }, readLimits: noLiveScope}
+	const refusal = "Failed to start transient scope unit: Interactive authentication required"
+	denied := shimScopeProbe{goos: "linux", placement: func() seatbudget.Placement { return seatbudget.PlacementNone }, scopeReason: func() string { return refusal }, readLimits: noLiveScope}
 	d := &Daemon{shimScope: denied}
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
@@ -50,8 +51,16 @@ func TestStartShimProcess_ProbeDeniedRefusesUpFront(t *testing.T) {
 	launch := newScopeProbeLaunch(dir, "probe-denied-seat")
 	if _, err := d.startShimProcess(SessionSpec{SessionID: "probe-denied-seat"}, launch, nil); err == nil {
 		t.Fatal("startShimProcess on a permission-denied host succeeded; want the up-front refusal")
-	} else if !strings.Contains(err.Error(), "transient-scope") {
-		t.Errorf("refusal %q does not name the missing transient-scope backend", err)
+	} else {
+		if !strings.Contains(err.Error(), "transient-scope") {
+			t.Errorf("refusal %q does not name the missing transient-scope backend", err)
+		}
+		// The gate folds the probe's own refusal line into the error
+		// (see ScopeRefusalReason): the accept error names the reason,
+		// not only the placement.
+		if !strings.Contains(err.Error(), refusal) {
+			t.Errorf("refusal %q does not carry the manager's own refusal line", err)
+		}
 	}
 	if registry, err := newScopeProbeRegistry(launch.RegistryDir); err == nil {
 		if _, found, _ := registry.SeatLaunch(launch.Identity, 1); found {

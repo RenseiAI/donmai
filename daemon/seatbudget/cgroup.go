@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -435,19 +436,20 @@ func SelectPlacement(hasSystemd, cgroupWritable bool) Placement {
 // new-enough systemd it additionally verifies that this user may create a
 // transient scope (user bus first, then the system bus): presence without
 // permission reports none, so the shim launch gate refuses up front with
-// the missing backend named instead of dying opaquely after it starts.
+// the missing backend named instead of dying opaquely after it starts. The
+// permission verdict is cached per process, so every spawn and status read
+// in a process agrees with every other.
 func HostPlacement() Placement {
-	return hostedPlacement()
+	return selectPlacementWithScopeProbe(HasSystemd(), CgroupV2Writable(), hostScopePermitted)
 }
 
-// hostedPlacement is HostPlacement with the scope-permission probe
-// injectable, so tests pin the whole gate on any host without a real
-// systemd. hasSystemd and cgroupWritable answer the presence probes;
-// verifyScope runs the creation-permission check only when presence
-// holds, and reports whether any reachable bus permits this user a
-// transient scope.
-func hostedPlacement() Placement {
-	return selectPlacementWithScopeProbe(HasSystemd(), CgroupV2Writable(), verifyScopePlacement)
+// hostScopePermitted answers the cached transient-scope
+// creation-permission verdict, the same shape as hostSystemdVersion:
+// HostPlacement runs on every spawn and status read, and an uncached
+// probe would charge every caller up to two systemd-run execs and let
+// two sequential calls in one process disagree with each other.
+func hostScopePermitted() bool {
+	return hostScopePlacementVerdict()
 }
 
 // selectPlacementWithScopeProbe extends SelectPlacement with the
@@ -466,10 +468,10 @@ func selectPlacementWithScopeProbe(hasSystemd, cgroupWritable bool, verifyScope 
 // else confirmation of system-scope permission. False means neither
 // works, so the shim launch gate reports no backend and refuses up
 // front. The probe runs synchronously and stays bounded (one short
-// systemd-run per reachable bus); production backs hostPlacement with
-// it, and the launch path consults hostPlacement rather than re-probing.
+// systemd-run per reachable bus); production consults the cached
+// verdict through HostPlacement rather than re-probing per call.
 func VerifyScopePlacement() bool {
-	return verifyScopePlacement()
+	return hostScopePermitted()
 }
 
 // verifyScopePlacement is VerifyScopePlacement with the runner
@@ -477,73 +479,218 @@ func VerifyScopePlacement() bool {
 // that answers but refuses the scope, then a system bus that refuses
 // too) without a real systemd.
 func verifyScopePlacement() bool {
-	return verifyScopePlacementWithRunner(runScopeProbe)
+	return verifyScopePlacementWithUnitRunner(runScopeProbeOnUnit, scopeProbeUnit)
 }
 
-// verifyScopePlacementWithRunner checks creation permission bus by bus:
-// the user manager first when its bus is reachable, then the system bus.
-// The first bus that accepts a throwaway scope wins; a host where
-// neither does has no usable scope backend. run names the
-// systemd-run-shaped probe each bus needs. hasUserBus answers the
-// user-manager reachability probe, injected so tests pin the preference
-// order (user manager first, system fallback, neither) on any host:
-// production passes HasUserBus, which gates the --user attempt the same
-// way UserScopeForBus resolves the launch's own bus.
-func verifyScopePlacementWithRunner(run func(userScope bool) error) bool {
-	return verifyScopePlacementWithBusProbe(run, HasUserBus)
+// verifyScopePlacementWithUnitRunner checks creation permission bus by bus
+// with the throwaway unit rendered per attempt: production passes
+// runScopeProbeOnUnit, so each attempt on one bus runs under a fresh
+// unique name and a same-name collision retries rather than refusing.
+// The unit renderer is injected so tests pin the retry through the real
+// loop without a real systemd.
+func verifyScopePlacementWithUnitRunner(run func(userScope bool, unit string) error, unit func() string) bool {
+	return verifyScopePlacementWithUnitBusProbe(run, unit, HasUserBus)
 }
 
-// verifyScopePlacementWithBusProbe is verifyScopePlacementWithRunner
-// with the user-bus reachability probe injected. The preference order
-// is load-bearing: the user bus is the preferred home — a per-user
-// daemon reaches only its user manager, and a scope created there never
-// needs polkit — so an absent user manager (no lingering, no session)
-// answers at dial time rather than with the manager's own refusal, and
-// there is nothing to confirm there. Only a manager that answers gets
-// asked.
-func verifyScopePlacementWithBusProbe(run func(userScope bool) error, hasUserBus func() bool) bool {
+// verifyScopePlacementWithUnitBusProbe is verifyScopePlacementWithUnitRunner
+// with the user-bus reachability probe injected. Each reachable bus is
+// asked through verifyScopeBusRefusal: the first bus that accepts a
+// throwaway scope wins, and a host where neither does has no usable scope
+// backend.
+func verifyScopePlacementWithUnitBusProbe(run func(userScope bool, unit string) error, unit func() string, hasUserBus func() bool) bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
 	if hasUserBus() {
-		if run(true) == nil {
+		if verifyScopeBusRefusal(func(name string) error { return run(true, name) }, unit) == nil {
 			return true
 		}
 	}
-	if run(false) == nil {
-		return true
-	}
-	return false
+	return verifyScopeBusRefusal(func(name string) error { return run(false, name) }, unit) == nil
 }
 
 // scopeProbeTimeout bounds one creation-permission probe.
 const scopeProbeTimeout = 10 * time.Second
 
-// scopeProbeUnit names the throwaway unit the creation-permission probe
-// creates. The --collect flag reaps it the moment its child exits, so no
-// probe leaves a unit behind; the name is fixed because only one probe
-// runs at a time per process and it never collides with a seat scope's
-// digest name.
-const scopeProbeUnit = "donmai-scope-probe.scope"
+// scopeProbeAttemptsPerBus bounds how many times one bus is asked before
+// its answer stands: a throwaway unit that fails only because a sibling
+// probe owns the same unit name is retried under a fresh name, while a
+// real refusal answers on every name and stands after the last attempt.
+const scopeProbeAttemptsPerBus = 3
 
-// runScopeProbe asks systemd for a throwaway scope on one bus, so the
-// manager itself answers whether this user may create one. The child is
-// true(1): it exits at once, and --collect reaps the unit behind it.
-// userScope selects the bus the same way a launch does (--user for the
-// user manager, the system bus otherwise), so the answer matches what a
-// launch on that bus would get. The combined output is folded into the
-// error, so a refusal carries the manager's own message (for example
-// "Interactive authentication required") to the caller that reports it.
-func runScopeProbe(userScope bool) error {
-	args := []string{"--scope", "--collect", "--unit", scopeProbeUnit}
+// scopeProbePrefix names the throwaway unit the creation-permission probe
+// creates. The --collect flag reaps it the moment its child exits, so no
+// probe leaves a unit behind; the pid-plus-counter suffix keeps the name
+// unique per attempt, so concurrent probes (parallel test packages, a
+// spawn racing a status poll) never collide on a fixed unit the way two
+// systemd-run --unit calls with the same name do ("already exists").
+// The prefix never collides with a seat scope's digest name.
+const scopeProbePrefix = "donmai-scope-probe"
+
+// hostScopePlacementVerdict is the cached creation-permission verdict
+// behind hostScopePermitted. HostPlacement's presence probes stay live
+// on every call; only the permission verdict caches, the same way
+// hostSystemdVersion caches only the manager version.
+var hostScopePlacementVerdict = sync.OnceValue(verifyScopePlacement)
+
+// hostScopeRefusal caches the manager's own refusal line beside the
+// verdict: the probe error's folded stderr (for example the polkit denial
+// that answers a system-scope probe with no user manager). The launch
+// gate reads it through ScopeRefusalReason, so a permission-denied host's
+// up-front refusal names the reason instead of only the placement — the
+// production reader the folded message needs.
+var hostScopeRefusal = sync.OnceValue(probeScopeRefusal)
+
+// ScopeRefusalReason reports why the scope placement is unavailable: the
+// cached probe's own refusal line when the manager denied the scope,
+// empty when the backend is merely absent (or the probe passed). The shim
+// launch gate folds it into its refusal; the status path keeps the bare
+// placement downgrade.
+func ScopeRefusalReason() string {
+	return hostScopeRefusal()
+}
+
+// probeScopeRefusal re-runs the creation-permission probe for its refusal
+// line only. It runs at most once per process, beside the verdict cache:
+// HostPlacement consults the verdict per spawn and status read, and the
+// gate reads the reason only on the refusal path.
+func probeScopeRefusal() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	if !HasSystemd() {
+		return ""
+	}
+	if verifyScopePlacementWithUnitRunner(runScopeProbeOnUnit, scopeProbeUnit) {
+		return ""
+	}
+	_, reason := probeScopeRefusalOn(runScopeProbeOnUnit, scopeProbeUnit, HasUserBus)
+	return reason
+}
+
+// probeScopeRefusalOn replays the bus-by-bus probe and returns the first
+// real refusal line: the user bus's when a user manager is reachable and
+// refuses, else the system bus's. A same-name collision is not a refusal
+// (see verifyScopeBusRefusal); a bus that never answers contributes no
+// line. run and unit are injected so tests pin the first-refusal rule
+// through the real replay without a real systemd.
+func probeScopeRefusalOn(run func(userScope bool, unit string) error, unit func() string, hasUserBus func() bool) (bool, string) {
+	if runtime.GOOS != "linux" {
+		return false, ""
+	}
+	if hasUserBus() {
+		if err := verifyScopeBusRefusal(func(name string) error { return run(true, name) }, unit); err != nil {
+			if line := scopeRefusalLine(err); line != "" {
+				return true, line
+			}
+			return true, ""
+		}
+		return false, ""
+	}
+	if err := verifyScopeBusRefusal(func(name string) error { return run(false, name) }, unit); err != nil {
+		return true, scopeRefusalLine(err)
+	}
+	return false, ""
+}
+
+// scopeRefusalLine extracts the manager's own message from a probe error:
+// the folded stderr tail after the ": " separator (see runScopeProbeOnUnit).
+// Empty when the error carries no message: a collision-only outcome (see
+// verifyScopeBusRefusal) or the name-unavailable exhaustion.
+func scopeRefusalLine(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "unit name unavailable") || isScopeNameCollision(msg) {
+		return ""
+	}
+	if i := strings.LastIndex(msg, ": "); i >= 0 {
+		return strings.TrimSpace(msg[i+2:])
+	}
+	return ""
+}
+
+// scopeProbeSeq numbers throwaway probe units inside this process, so
+// concurrent in-process probes never share a unit name. Cross-process
+// races keep their own counters; the attempt loop treats a same-name
+// collision as transient and retries under a fresh name.
+var scopeProbeSeq atomic.Uint64
+
+// verifyScopeBusRefusal decides whether one bus permits a scope: success
+// on the first accepted probe, a same-name collision retried under a
+// fresh name, any other failure the bus's real answer — recorded, not
+// retried, with the manager's own message folded in (see runScopeProbeOnUnit).
+func verifyScopeBusRefusal(run func(unit string) error, unit func() string) error {
+	var last error
+	for range scopeProbeAttemptsPerBus {
+		name := unit()
+		err := run(name)
+		if err == nil {
+			return nil
+		}
+		if !isScopeNameCollision(err.Error()) {
+			return err
+		}
+		last = err
+	}
+	// Every attempt collided on the name: the bus never actually
+	// answered, so this attempt reports no usable verdict rather than a
+	// refusal — the sibling that owns the name decides for its own
+	// caller, and the cached verdict never learns a collision as a no.
+	return fmt.Errorf("systemd-run --scope probe: unit name unavailable: %w", last)
+}
+
+// scopeProbeUnit renders one unique throwaway unit name for a probe
+// attempt: the process id plus a per-process counter, so no two
+// in-process probes share a name and no probe collides with a seat.
+func scopeProbeUnit() string {
+	return scopeProbePrefix + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatUint(scopeProbeSeq.Add(1), 10) + ".scope"
+}
+
+// isScopeNameCollision reports whether a failed probe's output reads as a
+// same-unit-name race rather than a real refusal: the manager already runs
+// a unit by that name, so the attempt answered nothing about permission.
+func isScopeNameCollision(out string) bool {
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "already exists") || strings.Contains(lower, "already running")
+}
+
+// runScopeProbeWithCommand is runScopeProbeOnUnit with the command
+// constructor injected, so tests drive the real argv rendering and the
+// stderr-folding error shape against a fake systemd-run on PATH without
+// a real systemd. command renders the argv for one bus and unit the same
+// way production does; run executes it and returns its combined output.
+func runScopeProbeWithCommand(userScope bool, unit string, command func(userScope bool, unit string) (string, []string), run func(name string, args ...string) ([]byte, error)) error {
+	name, args := command(userScope, unit)
+	out, err := run(name, args...)
+	if err != nil {
+		return fmt.Errorf("systemd-run --scope probe: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// scopeProbeCommand renders the throwaway-scope argv for one bus and unit:
+// --user for the user manager, the system bus otherwise, always --scope
+// --collect with true(1) as the child. Tests pin the argv through this
+// renderer; production executes it through runScopeProbeOnUnit.
+func scopeProbeCommand(userScope bool, unit string) (string, []string) {
+	args := []string{"--scope", "--collect", "--unit", unit}
 	if userScope {
 		args = append([]string{"--user"}, args...)
 	}
-	args = append(args, "true")
+	return "systemd-run", append(args, "true")
+}
+
+// runScopeProbeOnUnit is runScopeProbe with the throwaway unit injected,
+// so tests pin the refusal shape (stderr folded into the error) and the
+// collision retry through the real constructor without a real systemd.
+func runScopeProbeOnUnit(userScope bool, unit string) error {
+	name, args := scopeProbeCommand(userScope, unit)
 	ctx, cancel := context.WithTimeout(context.Background(), scopeProbeTimeout)
 	defer cancel()
 	//nolint:gosec // G204: fixed systemd-run binary; every argument is a fixed literal
-	out, err := exec.CommandContext(ctx, "systemd-run", args...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemd-run --scope probe: %w: %s", err, strings.TrimSpace(string(out)))
 	}

@@ -181,8 +181,15 @@ func (d *Daemon) SessionShimOwnsSession(spec SessionSpec) bool { return d.shimOw
 // reachable bus, the placement probe already reports none — so this refusal
 // is also what a permission-denied host reads, up front, instead of a
 // launch that dies past the gate with only "exited without publishing one".
-func shimScopeGateError(placement seatbudget.Placement) error {
-	return fmt.Errorf("session shim: no transient-scope backend on this host (%s): shim launches need systemd %d or newer with permission to create a transient scope (a reachable user manager, or system-scope rights); nothing launches unscoped", placement, seatbudget.MinScopeSystemd)
+// reason carries the probe's own refusal line (see
+// seatbudget.ScopeRefusalReason): empty when the backend is merely absent,
+// the manager's message when permission was denied, so the accept error
+// names the reason instead of only the placement.
+func shimScopeGateError(placement seatbudget.Placement, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("session shim: no transient-scope backend on this host (%s): shim launches need systemd %d or newer with permission to create a transient scope (a reachable user manager, or system-scope rights); nothing launches unscoped", placement, seatbudget.MinScopeSystemd)
+	}
+	return fmt.Errorf("session shim: no transient-scope backend on this host (%s): %s; shim launches need systemd %d or newer with permission to create a transient scope (a reachable user manager, or system-scope rights); nothing launches unscoped", placement, reason, seatbudget.MinScopeSystemd)
 }
 
 // launchSessionShim is the spawner's shim launch path (SpawnerOptions.ShimSpawn).
@@ -1350,7 +1357,7 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	}
 	command, scopeOK := seatBudgetShimCommandForLaunch(worker, scope, shimBudget, shimBudgetOK, placement, d.shimScope.hostUserScope(), goos)
 	if !scopeOK {
-		return sessionshim.ProcessIdentity{}, shimScopeGateError(placement)
+		return sessionshim.ProcessIdentity{}, shimScopeGateError(placement, d.shimScope.hostScopeReason())
 	}
 	registry, err := sessionshim.NewRegistry(launch.RegistryDir)
 	if err != nil {

@@ -57,8 +57,15 @@ func resolveSeatBudget(authored SeatBudgetConfig, maxSeats, hostCPUs, hostMemory
 // mode "none" with the reason — never enforced for a seat that runs
 // unwrapped.
 func seatBudgetReport(b seatbudget.Budget) *afclient.SeatBudgetStatus {
-	return seatBudgetReportFor(b, seatbudget.HostPlacement(), runtime.GOOS)
+	return seatBudgetReportFor(b, seatBudgetStatusPlacement(), runtime.GOOS)
 }
+
+// seatBudgetStatusPlacement resolves the placement the status path
+// publishes: the single cached HostPlacement verdict for this process, so
+// every status read in a process agrees with every launch gate. Tests pin
+// the downgrade through seatBudgetReportFor with an explicit placement and
+// never stub this.
+var seatBudgetStatusPlacement = seatbudget.HostPlacement
 
 // seatBudgetReportFor is seatBudgetReport parametrised by placement and
 // GOOS so tests pin the systemd-less Linux downgrade on any host. The mode

@@ -59,20 +59,15 @@ func TestServer_Status_SeatBudget(t *testing.T) {
 // TestServer_Status_SeatBudget_CgroupfsReportsNone pins the honest-fallback
 // rule on the PRODUCTION status route: an enforced budget on a host whose
 // placement cannot confine the seat reports mode none with the backend
-// named. This host (darwin CI, or any systemd-less Linux) is exactly that
-// host whenever the placement probe is not systemd: the test asserts the
-// downgrade shape — mode none plus a reason — without pinning which
-// backend this particular machine lacks.
+// named. The downgrade pins through the hermetic report helpers with an
+// explicit systemd-less placement — never through the live host probe — so
+// no two sequential live probes in one test can disagree with each other
+// (and no live systemd-run exec runs here at all).
 func TestServer_Status_SeatBudget_CgroupfsReportsNone(t *testing.T) {
 	// A systemd-less Linux host runs an enforced seat unconfined: the
-	// report must be mode none with the backend named. This host is
-	// darwin, so the suite pins the downgrade through the report helper
-	// with the systemd-less placement simulated by the cgroupfs branch:
-	// sessionSeatBudgetReport is the per-spawn half of the same rule, and
-	// this host's own placement is likewise not systemd.
-	if seatbudget.HostPlacement() == seatbudget.PlacementSystemd {
-		t.Skip("systemd host confines the seat; the none-downgrade needs a systemd-less host")
-	}
+	// report must be mode none with the backend named. The per-spawn half
+	// pins through the report helper with the systemd-less placement as
+	// the parameter, the same rule the launch path applies.
 	rep := sessionSeatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced}, true, seatbudget.PlacementCgroupFS)
 	if rep.Mode != "none" {
 		t.Errorf("SeatBudget.Mode = %q; want none (no systemd backend on this host)", rep.Mode)
@@ -83,11 +78,25 @@ func TestServer_Status_SeatBudget_CgroupfsReportsNone(t *testing.T) {
 	if rep.CPUs != 0 || rep.MemoryMB != 0 {
 		t.Errorf("SeatBudget = %+v; want no values on an unconfined seat", rep)
 	}
-	// And the status half: this host's effective posture for an enforced
-	// budget is best-effort at most — never enforced without systemd.
-	status := seatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced})
-	if seatbudget.HostPlacement() != seatbudget.PlacementSystemd && status.Mode == string(seatbudget.ModeEnforced) {
-		t.Errorf("status mode = enforced on a systemd-less host; want the downgrade")
+	// And the status half: an enforced budget under the systemd-less
+	// placement downgrades to none with the backend named — the published
+	// posture, pinned through the hermetic placement parameter rather
+	// than the live host probe.
+	status := seatBudgetReportFor(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced}, seatbudget.PlacementCgroupFS, "linux")
+	if status.Mode != string(seatbudget.ModeNone) {
+		t.Errorf("status mode = %q on a systemd-less placement; want the downgrade to none", status.Mode)
+	}
+	if status.Detail == "" {
+		t.Error("status detail is empty; want the missing backend named")
+	}
+	// The agreement half: the production status entry consults the same
+	// cached placement the launch gate does, so every status read in a
+	// process agrees with every launch — pinned here by calling the
+	// production entry twice and requiring the same answer.
+	first := seatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced})
+	second := seatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced})
+	if first.Mode != second.Mode || first.Detail != second.Detail {
+		t.Errorf("status report = %+v then %+v; want every read in a process to agree", first, second)
 	}
 }
 
