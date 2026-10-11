@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -132,28 +133,61 @@ func TestSeedTrustFile_AddOnlyPreservesUnknownFields(t *testing.T) {
 	}
 }
 
-// TestSeedTrustFile_ToleratesMalformedContent proves a malformed record
-// starts fresh instead of failing: the session still gets its seed.
-func TestSeedTrustFile_ToleratesMalformedContent(t *testing.T) {
+// TestSeedTrustFile_NeverOverwritesARecordItCannotParse proves a record
+// that does not parse — or whose projects field has an unexpected shape — is
+// left byte-for-byte as found. The record is the CLI's whole config (account
+// state, servers, per-project settings), so replacing it with a trust-only
+// record would wipe the operator's configuration; the session meets the
+// modal instead.
+func TestSeedTrustFile_NeverOverwritesARecordItCannotParse(t *testing.T) {
+	t.Parallel()
+	for name, body := range map[string]string{
+		"malformed":       "{not json",
+		"truncated":       `{"oauthAccount":{"id":"x"},"projects":{`,
+		"empty":           "",
+		"projects-string": `{"oauthAccount":{"id":"x"},"projects":"unexpected"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), ".claude.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			seedTrustFile(path, []string{"/session/worktree"})
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw) != body {
+				t.Errorf("seed rewrote an unparseable record: got %q, want it untouched %q", raw, body)
+			}
+		})
+	}
+}
+
+// TestAcquireTrustLock_BreaksAnOldUnstampedLock proves a lock left by a
+// holder that died between taking it and stamping it is reclaimed once it is
+// old, while a fresh unstamped lock still reads as live. Without the
+// fallback every later seed on the config home would skip forever.
+func TestAcquireTrustLock_BreaksAnOldUnstampedLock(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), ".claude.json")
-	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+	lockDir := path + trustLockSuffix
+	if err := os.Mkdir(lockDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	seedTrustFile(path, []string{"/session/worktree"})
-	raw, err := os.ReadFile(path)
-	if err != nil {
+	if trustLockIsStale(lockDir) {
+		t.Fatal("a fresh unstamped lock reads as stale; a live holder about to stamp would lose it")
+	}
+	old := time.Now().Add(-2 * trustLockStaleAfter)
+	if err := os.Chtimes(lockDir, old, old); err != nil {
 		t.Fatal(err)
 	}
-	var after map[string]any
-	if err := json.Unmarshal(raw, &after); err != nil {
-		t.Fatalf("seed did not repair the malformed record: %v", err)
+	release, ok := acquireTrustLock(path)
+	if !ok {
+		t.Fatal("an old unstamped lock was never reclaimed; every later seed would skip")
 	}
-	projects, _ := after["projects"].(map[string]any)
-	added, _ := projects["/session/worktree"].(map[string]any)
-	if added["hasTrustDialogAccepted"] != true {
-		t.Errorf("seed missing after malformed repair: %v", after)
-	}
+	release()
 }
 
 // TestSeedTrustFile_ConcurrentSeedsKeepEveryEntry drives the PRODUCTION
@@ -221,8 +255,63 @@ func TestSeedTrustFile_ConcurrentSeedsKeepEveryEntry(t *testing.T) {
 // session on the modal.
 func TestClaudeConfigHome_RejectsARelativeOverride(t *testing.T) {
 	t.Setenv(claudeConfigDirEnv, filepath.Join("relative", "config", "home"))
-	if home, err := claudeConfigHome(); err == nil {
+	if home, err := claudeConfigHome(nil); err == nil {
 		t.Errorf("claudeConfigHome() = %q, want an error for a relative override — seeding it would miss the CLI's home", home)
+	}
+	if home, err := claudeConfigHome(map[string]string{claudeConfigDirEnv: "relative"}); err == nil {
+		t.Errorf("claudeConfigHome(session relative) = %q, want an error", home)
+	}
+}
+
+// TestClaudeConfigHome_SessionEnvWins proves the seed targets the config home
+// the CHILD reads: the child env is the session's env layer over the parent
+// process env, so a session-scoped CLAUDE_CONFIG_DIR must win over the
+// parent's. Seeding the parent's home instead would miss the child's record
+// and write trust into a config home the session never reads.
+func TestClaudeConfigHome_SessionEnvWins(t *testing.T) {
+	parent, session := t.TempDir(), t.TempDir()
+	t.Setenv(claudeConfigDirEnv, parent)
+	if home, err := claudeConfigHome(map[string]string{claudeConfigDirEnv: session}); err != nil || home != session {
+		t.Errorf("claudeConfigHome(session) = %q, %v; want %q", home, err, session)
+	}
+	if home, err := claudeConfigHome(nil); err != nil || home != parent {
+		t.Errorf("claudeConfigHome(nil) = %q, %v; want the parent's %q", home, err, parent)
+	}
+}
+
+// TestTrustBoundaryDirs_NeverSeedsHomeRootOrAncestors proves the seed never
+// records the filesystem root, the operator's home, or an ancestor of the
+// home — even when the spec names one as its cwd. The CLI honors an
+// ancestor's trust entry for directories beneath it and itself never
+// persists home trust, so any of these would trust every later session on
+// the host, a person's own included. A real worktree under the home stays
+// seedable.
+func TestTrustBoundaryDirs_NeverSeedsHomeRootOrAncestors(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "operator")
+	worktree := filepath.Join(home, "worktrees", "session-1")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	for _, broad := range []string{home, filepath.Dir(home), string(filepath.Separator)} {
+		dirs := trustBoundaryDirs(agent.Spec{
+			Cwd:                 broad,
+			RepositoryAuthority: &agent.RepositoryAuthorityPolicy{MutablePaths: []string{broad}},
+		})
+		if len(dirs) != 0 {
+			t.Errorf("trustBoundaryDirs(cwd=%q) = %q; want nothing — a root this broad trusts the whole host", broad, dirs)
+		}
+	}
+	if dirs := trustBoundaryDirs(agent.Spec{Cwd: worktree}); !slices.Contains(dirs, filepath.Clean(worktree)) {
+		t.Errorf("trustBoundaryDirs(worktree under home) = %q; want it seeded", dirs)
+	}
+
+	cfg := t.TempDir()
+	seedWorkspaceTrust(agent.Spec{Cwd: home, Env: map[string]string{claudeConfigDirEnv: cfg}})
+	if _, err := os.Stat(filepath.Join(cfg, claudeTrustFileName)); !os.IsNotExist(err) {
+		t.Errorf("seeding a home-rooted session wrote a trust record (stat err = %v); want none", err)
 	}
 }
 
@@ -297,7 +386,8 @@ func TestSpawn_Interactive_GatewayBearerRidesTheUnattendedTokenPair(t *testing.T
 		t.Skip("pty spawn tests are unix-only")
 	}
 	workdir := t.TempDir()
-	t.Setenv(claudeConfigDirEnv, t.TempDir())
+	cfgHome := t.TempDir()
+	t.Setenv(claudeConfigDirEnv, cfgHome)
 
 	const bearer = "sess-bearer-rides-token-pair"
 	p := newFakeInteractiveProvider(t, captureEnvArgvScriptWithToken)
@@ -338,6 +428,38 @@ func TestSpawn_Interactive_GatewayBearerRidesTheUnattendedTokenPair(t *testing.T
 	argv := argvLines(readCapturedFile(t, workdir, "argv.txt"))
 	if got, ok := flagValue(argv, "--model"); !ok || got != "served-model" {
 		t.Errorf("--model = %q (present=%v), want the binding model; argv: %q", got, ok, argv)
+	}
+	// Env-only: the bearer never reaches argv (visible to every local
+	// process), the config home the trust seed writes, or any file in the
+	// worktree — env.txt is the fake CLI's own capture of its env.
+	for _, arg := range argv {
+		if strings.Contains(arg, bearer) {
+			t.Errorf("session bearer rides argv: %q", arg)
+		}
+	}
+	assertNoFileContains(t, cfgHome, bearer, "")
+	assertNoFileContains(t, workdir, bearer, filepath.Join(workdir, "env.txt"))
+}
+
+// assertNoFileContains fails when any regular file under root other than
+// except carries needle.
+func assertNoFileContains(t *testing.T, root, needle, except string) {
+	t.Helper()
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || path == except {
+			return err
+		}
+		raw, err := os.ReadFile(path) //nolint:gosec // test-owned temp tree
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(raw), needle) {
+			t.Errorf("session bearer written to disk at %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
 	}
 }
 

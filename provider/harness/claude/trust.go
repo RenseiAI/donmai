@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -46,7 +47,7 @@ func seedWorkspaceTrust(spec agent.Spec) {
 	if len(dirs) == 0 {
 		return
 	}
-	home, err := claudeConfigHome()
+	home, err := claudeConfigHome(spec.Env)
 	if err != nil {
 		return
 	}
@@ -69,6 +70,7 @@ func trustBoundaryDirs(spec agent.Spec) []string {
 		raw = append(raw, policy.MutablePaths...)
 	}
 	seen := make(map[string]struct{}, len(raw)*2)
+	homes := operatorHomes()
 	var out []string
 	for _, dir := range raw {
 		if strings.TrimSpace(dir) == "" {
@@ -80,7 +82,7 @@ func trustBoundaryDirs(spec agent.Spec) []string {
 		}
 		cleaned := filepath.Clean(abs)
 		for _, candidate := range []string{cleaned, resolveTrustPath(cleaned)} {
-			if candidate == "" {
+			if candidate == "" || tooBroadForTrust(candidate, homes) {
 				continue
 			}
 			if _, dup := seen[candidate]; dup {
@@ -106,14 +108,58 @@ func resolveTrustPath(dir string) string {
 	return filepath.Clean(resolved)
 }
 
-// claudeConfigHome returns the directory holding the CLI's trust record:
-// CLAUDE_CONFIG_DIR when set, otherwise the operator's home. A relative
-// override is an error the caller treats as "do not seed": the CLI
-// resolves its own config home by its own rules, so resolving a relative
-// override against the worker process cwd would seed the wrong home — a
-// seed that silently does nothing while the session still hits the modal.
-func claudeConfigHome() (string, error) {
-	if override := os.Getenv(claudeConfigDirEnv); override != "" {
+// operatorHomes returns the operator's home directory in its cleaned and
+// symlink-resolved spellings (either may be absent).
+func operatorHomes() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" || !filepath.IsAbs(home) {
+		return nil
+	}
+	cleaned := filepath.Clean(home)
+	return []string{cleaned, resolveTrustPath(cleaned)}
+}
+
+// tooBroadForTrust reports whether dir is a root the seed must never record:
+// the filesystem root, or the operator's home directory or any ancestor of
+// it. The CLI's trust lookup honors an ancestor's entry for a cwd outside a
+// repository, and the CLI itself never persists trust for the home
+// directory (home trust is session-only), so a persisted entry at one of
+// these roots would silently trust every directory beneath it for every
+// later session on the host — a person's own included.
+func tooBroadForTrust(dir string, homes []string) bool {
+	if filepath.Dir(dir) == dir {
+		return true
+	}
+	fold := runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+	for _, home := range homes {
+		if home == "" {
+			continue
+		}
+		d, h := dir, home
+		if fold {
+			d, h = strings.ToLower(d), strings.ToLower(h)
+		}
+		if d == h || strings.HasPrefix(h, d+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeConfigHome returns the directory holding the CLI's trust record —
+// the one the child will read: CLAUDE_CONFIG_DIR from the session's own env
+// layer when set (the child env is that layer over the parent's), else the
+// parent process's, otherwise the operator's home. A relative override is an
+// error the caller treats as "do not seed": the CLI resolves its own config
+// home by its own rules, so resolving a relative override against the
+// worker process cwd would seed the wrong home — a seed that silently does
+// nothing while the session still hits the modal.
+func claudeConfigHome(sessionEnv map[string]string) (string, error) {
+	override := sessionEnv[claudeConfigDirEnv]
+	if override == "" {
+		override = os.Getenv(claudeConfigDirEnv)
+	}
+	if override != "" {
 		if !filepath.IsAbs(override) {
 			return "", fmt.Errorf("relative %s %q: refusing to seed outside the CLI's own config home", claudeConfigDirEnv, override)
 		}
@@ -130,8 +176,9 @@ const claudeConfigDirEnv = "CLAUDE_CONFIG_DIR"
 const claudeTrustFileName = ".claude.json"
 
 // seedTrustFile adds dirs to the trust record at path, creating the file
-// when absent. Malformed content starts fresh; unknown fields are
-// preserved; existing trust entries are kept. Every failure is silent.
+// when absent. A record that cannot be read or parsed is left untouched (no
+// seed); unknown fields are preserved; existing trust entries are kept.
+// Every failure is silent.
 //
 // The read-modify-write merges under a sibling lock directory, so
 // concurrent sessions sharing one config home cannot lose each other's
@@ -149,15 +196,29 @@ func seedTrustFile(path string, dirs []string) {
 	}
 	defer release()
 	var record map[string]any
-	if data, err := os.ReadFile(path); err == nil { //nolint:gosec // config path, not session input
-		_ = json.Unmarshal(data, &record) // tolerate a malformed file → start fresh below
+	data, err := os.ReadFile(path) //nolint:gosec // config path, not session input
+	switch {
+	case err == nil:
+		// The record is the CLI's whole config, not just trust: a file that
+		// does not parse (truncated, mid-write, hand-edited) is left exactly
+		// as found rather than replaced by a trust-only record that would
+		// drop every other field. The session meets the modal instead.
+		if json.Unmarshal(data, &record) != nil {
+			return
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// absent → create below
+	default:
+		return // unreadable: never overwrite what cannot be read
 	}
 	if record == nil {
 		record = make(map[string]any)
 	}
 	var projects map[string]any
-	if raw, ok := record[claudeTrustProjectsKey]; ok {
-		projects, _ = raw.(map[string]any)
+	if raw, ok := record[claudeTrustProjectsKey]; ok && raw != nil {
+		if projects, ok = raw.(map[string]any); !ok {
+			return // an unexpected shape is not ours to replace
+		}
 	}
 	if projects == nil {
 		projects = make(map[string]any)
@@ -250,18 +311,22 @@ func stampTrustLock(lockDir string) {
 }
 
 // trustLockIsStale reports whether the lock directory belongs to a holder
-// that cannot still be merging. Anything unreadable or unparseable reads
-// as live: only a positively old stamp breaks the lock.
+// that cannot still be merging: a positively old stamp, or — when the stamp
+// is missing or unparseable (a holder that died between taking the lock and
+// stamping it) — a lock directory that is itself old. A lock that cannot be
+// inspected at all reads as live.
 func trustLockIsStale(lockDir string) bool {
 	raw, err := os.ReadFile(filepath.Join(lockDir, "holder")) //nolint:gosec // harness-owned lock dir, fixed filename
+	if err == nil {
+		if stamped, perr := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(raw))); perr == nil {
+			return time.Since(stamped) > trustLockStaleAfter
+		}
+	}
+	info, err := os.Stat(lockDir)
 	if err != nil {
 		return false
 	}
-	stamped, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(raw)))
-	if err != nil {
-		return false
-	}
-	return time.Since(stamped) > trustLockStaleAfter
+	return time.Since(info.ModTime()) > trustLockStaleAfter
 }
 
 // claudeTrustProjectsKey / claudeTrustAcceptedKey are the trust-record

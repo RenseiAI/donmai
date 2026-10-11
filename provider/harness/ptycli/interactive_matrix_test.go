@@ -116,6 +116,14 @@ var terminalEnvCases = []terminalEnvCase{
 func spawnTable() map[agent.HarnessName]spawnFn {
 	return map[agent.HarnessName]spawnFn{
 		agent.HarnessClaudeCode: func(t *testing.T, bin string, spec agent.Spec) (agent.Handle, error) {
+			// An interactive claude Spawn seeds the CLI's workspace-trust
+			// record; point it at a throwaway config home, never the real one.
+			env := make(map[string]string, len(spec.Env)+1)
+			for k, v := range spec.Env {
+				env[k] = v
+			}
+			env["CLAUDE_CONFIG_DIR"] = t.TempDir()
+			spec.Env = env
 			p, err := claude.New(claude.Options{
 				Binary:   bin,
 				LookPath: func(string) (string, error) { return bin, nil },
