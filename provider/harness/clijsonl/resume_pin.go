@@ -16,24 +16,40 @@ package clijsonl
 import "encoding/json"
 
 // resumePinEnvNames are the routing-destination env names a --settings
-// pin may carry on a --resume turn: the endpoint base URL plus the
-// serving-host knob vars. Credential values and unrelated variables
-// are never admitted — a repo naming its own token only breaks its own
-// auth loudly at the pinned endpoint, and an unrelated variable would
-// widen the winning layer beyond routing.
+// pin may carry on a --resume turn: the session's own routing names plus
+// the fallback routing names (see pinnedFallbackRoutingEnv in the claude
+// harness) whose "" blanks hold the ambient default on the winning layer.
+// Credential values and unrelated variables are never admitted — a repo
+// naming its own token only breaks its own auth loudly at the pinned
+// endpoint, and an unrelated variable would widen the winning layer beyond
+// routing.
 var resumePinEnvNames = map[string]struct{}{
-	"ANTHROPIC_BASE_URL":      {},
-	"CLAUDE_CODE_USE_BEDROCK": {},
-	"AWS_REGION":              {},
-	"CLAUDE_CODE_USE_VERTEX":  {},
-	"CLOUD_ML_REGION":         {},
+	"ANTHROPIC_BASE_URL":         {},
+	"CLAUDE_CODE_USE_BEDROCK":    {},
+	"AWS_REGION":                 {},
+	"CLAUDE_CODE_USE_VERTEX":     {},
+	"CLOUD_ML_REGION":            {},
+	"CLAUDE_CODE_USE_FOUNDRY":    {},
+	"ANTHROPIC_BEDROCK_BASE_URL": {},
+	"ANTHROPIC_VERTEX_BASE_URL":  {},
+	"ANTHROPIC_FOUNDRY_BASE_URL": {},
+	"HTTP_PROXY":                 {},
+	"HTTPS_PROXY":                {},
+	"ALL_PROXY":                  {},
+	"http_proxy":                 {},
+	"https_proxy":                {},
+	"all_proxy":                  {},
 }
 
 // isRoutingPinJSON reports whether raw is a routing-pin envelope: a JSON
 // object with exactly one key ("env") whose value is a non-empty object
-// mapping only resumePinEnvNames members to non-empty strings. Anything
-// else — hooks, extra top-level keys, unknown env names, empty values —
-// is not the pin and must not ride the winning layer.
+// mapping only resumePinEnvNames members to strings. Fallback routing names
+// (proxies, alternate serving-host switches and base URLs) may be blank:
+// a blank states the ambient default on the winning layer. The session's
+// own routing names must be non-empty — the driver cannot tell a session
+// value from a caller smuggling an empty override. Anything else — hooks,
+// extra top-level keys, unknown env names — is not the pin and must not
+// ride the winning layer.
 func isRoutingPinJSON(raw string) bool {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
@@ -54,9 +70,35 @@ func isRoutingPinJSON(raw string) bool {
 		return false
 	}
 	for k, v := range env {
-		if _, ok := resumePinEnvNames[k]; !ok || v == "" {
+		if _, ok := resumePinEnvNames[k]; !ok {
+			return false
+		}
+		if v == "" && !isBlankableResumePinName(k) {
 			return false
 		}
 	}
 	return true
+}
+
+// isBlankableResumePinName reports whether a resume pin member may carry an
+// empty value: the fallback routing names, whose blank states the ambient
+// default on the winning layer. The session's own routing names must still
+// be non-empty.
+func isBlankableResumePinName(name string) bool {
+	switch name {
+	case "CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_USE_VERTEX",
+		"CLAUDE_CODE_USE_FOUNDRY",
+		"ANTHROPIC_BEDROCK_BASE_URL",
+		"ANTHROPIC_VERTEX_BASE_URL",
+		"ANTHROPIC_FOUNDRY_BASE_URL",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"ALL_PROXY",
+		"http_proxy",
+		"https_proxy",
+		"all_proxy":
+		return true
+	}
+	return false
 }

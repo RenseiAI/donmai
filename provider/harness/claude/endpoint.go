@@ -2,6 +2,7 @@ package claude
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -40,13 +41,23 @@ const (
 
 // routingPinEnvNames are the CLI routing DESTINATION knobs the session
 // launcher pins AFTER repo-local harness config is applied, so a repo
-// setting can never redirect the session bearer. The pin rides the
-// --settings JSON string donmai itself passes (stophook.go / cli_args.go /
-// oneshot.go): the CLI resolves that layer above the process environment,
-// which in turn sits above repo settings files. Pinning the same
-// destinations the child env already carries keeps every layer pointed at
-// the session's own endpoint — a repo file naming an attacker URL loses to
-// the pin on every layer the CLI honors.
+// setting never redirects the session bearer to an attacker endpoint. The
+// pin rides the --settings JSON string donmai itself passes (stophook.go /
+// cli_args.go / oneshot.go): the CLI resolves that layer above the process
+// environment, which in turn sits above repo settings files. The pin states
+// the session's own destinations (see pinnedRoutingEnv) plus explicit
+// "" blanks for the alternate serving-host and proxy names the session
+// does not set (see pinnedFallbackRoutingEnv), so a repo flipping a
+// provider switch or naming a proxy loses to the pin. A repo setting naming
+// one of the session's own values is likewise overridden — every layer the
+// CLI honors points at the session's own endpoint.
+//
+// The pin covers only these declarative routing destinations. Repo config
+// that runs code (hooks, apiKeyHelper and other helpers, stdio MCP
+// servers, the agent's own tools) still runs with the session environment
+// once the repo path is trusted, exactly as on the headless lane — that
+// execution surface is the accepted model for a trusted repo, not something
+// the pin closes. See the file-level trust doc in trust.go.
 //
 // Credential VALUES are deliberately NOT pinned: the bearer rides the
 // process environment (never argv), and --settings travels on the process
@@ -64,27 +75,111 @@ var routingPinEnvNames = map[string]struct{}{
 	EnvVertexRegion: {},
 }
 
+// pinnedFallbackRoutingEnv are the extra routing-adjacent env names the
+// launcher pins to the CLI's winning --settings layer alongside the
+// session's own routing. A gateway session carries only its own base URL,
+// so without these entries a repo-local settings file could flip an
+// alternate serving host on (or point the request at an attacker proxy) and
+// redirect the session bearer there: the pin states every name the CLI
+// consults for where the request goes, with "" restoring the ambient
+// default. Values ride the effective child layer — spec.Env over the parent
+// process — so a host that genuinely proxies keeps its own proxy, while a
+// repo naming one loses to the pin. These ride only when the session
+// carries routing of its own (see pinnedRoutingEnv), so host-login sessions
+// stay byte-identical. The names here and in resumePinEnvNames must stay in
+// step; the proxy/provider-switch tests fail if one side drops a name.
+var pinnedFallbackRoutingEnv = []string{
+	// Alternate serving-host switches the session never sets: pinned off so
+	// a repo cannot flip the request onto a non-default provider surface.
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_VERTEX",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	// Alternate base URLs for those hosts: pinned empty so a repo cannot
+	// arm a redirect the switches would then use.
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"ANTHROPIC_FOUNDRY_BASE_URL",
+	// Plaintext request proxies: pinned empty so a repo cannot observe the
+	// session bearer in transit by naming an attacker listener.
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"all_proxy",
+}
+
 // pinnedRoutingEnv returns the routing DESTINATION knobs the session
-// authoritatively carries, for the --settings pin: the subset of the
-// projected child env (see applyEndpoint) that steers where the session's
-// credential goes. A repo-local harness setting naming any of these (for
-// example env.ANTHROPIC_BASE_URL in the repo's settings file) must never
-// change where the bearer goes, so the launcher re-states them on the layer
-// the CLI resolves last. Credential values are never pinned (see
-// routingPinEnvNames). Empty when the session carries no routing of its own
-// (host-login cells): pinning nothing keeps those sessions byte-identical.
-// The returned map is a fresh copy; spec is never mutated.
+// authoritatively carries, for the --settings pin: the session's own values
+// for routingPinEnvNames members (see applyEndpoint), PLUS a
+// pinnedFallbackRoutingEnv entry for every fallback name — the effective
+// child value (spec.Env over the parent process) or "" when the session
+// sets none. A repo-local harness setting naming any of these (for example
+// env.ANTHROPIC_BASE_URL in the repo's settings file) is overridden by the
+// pin on the layer the CLI resolves last, so the session bearer stays on
+// the session's own route. Pinning the alternates even when the session
+// sets none is what closes the provider-switch and proxy redirects: a
+// gateway session whose spec carries only ANTHROPIC_BASE_URL still pins
+// CLAUDE_CODE_USE_BEDROCK="" and HTTP_PROXY="", so a repo flipping the
+// switch (or naming a proxy) loses to the pin. Credential values are never
+// pinned (see routingPinEnvNames).
+//
+// The pin is present only when the session carries routing of its own (a
+// non-empty routingPinEnvNames value in spec.Env): without a session
+// destination to hold, a fallback-only pin would change host-login argv
+// for no redirect it closes — those sessions pin nothing and stay
+// byte-identical. The returned map is a fresh copy; spec is never mutated.
 func pinnedRoutingEnv(spec agent.Spec) map[string]string {
 	pin := make(map[string]string)
+	hasOwnRouting := false
 	for k, v := range spec.Env {
 		if _, ok := routingPinEnvNames[k]; ok && v != "" {
 			pin[k] = v
+			hasOwnRouting = true
 		}
 	}
-	if len(pin) == 0 {
+	if !hasOwnRouting {
 		return nil
 	}
+	for _, name := range pinnedFallbackRoutingEnv {
+		if _, already := pin[name]; already {
+			continue
+		}
+		pin[name] = effectiveRoutingValue(name, spec.Env)
+	}
 	return pin
+}
+
+// effectiveRoutingValue reads the session process's effective value for a
+// fallback routing name: the spec layer first, then the parent process.
+// Using the effective value (rather than always blanking) keeps a host's
+// real proxy working: a repo naming its own proxy still loses to the pin,
+// but the pin states the host's own value rather than breaking it.
+func effectiveRoutingValue(name string, specEnv map[string]string) string {
+	if v, ok := specEnv[name]; ok && v != "" {
+		return v
+	}
+	if v, ok := routingParentEnv(name); ok {
+		return v
+	}
+	return ""
+}
+
+// routingParentEnv reads one name from the parent process environment.
+// Split out so tests can isolate the spec layer from ambient state.
+func routingParentEnv(name string) (string, bool) {
+	return lookupRoutingParentEnv(name)
+}
+
+// lookupRoutingParentEnv is the os.Getenv seam behind routingParentEnv.
+// Declared as a variable so tests can stub the ambient layer without
+// mutating the real process environment.
+var lookupRoutingParentEnv = func(name string) (string, bool) {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
+		return "", false
+	}
+	return v, true
 }
 
 // applyEndpoint projects a resolved Spec.Endpoint binding onto the spec the

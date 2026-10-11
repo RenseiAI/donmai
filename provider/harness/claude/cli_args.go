@@ -66,8 +66,12 @@ var linearMCPDisallowList = []string{
 //
 // --settings carries ONLY the routing pin (see pinnedRoutingEnv), stated on
 // the layer the CLI resolves above the process environment and above repo
-// settings files: a repo-local harness setting naming a routing var (for
-// example env.ANTHROPIC_BASE_URL) must never redirect the session bearer.
+// settings files: a repo-local harness setting naming a routing destination
+// (for example env.ANTHROPIC_BASE_URL) or flipping an alternate serving
+// host or naming a proxy is overridden by the pin, so the session bearer
+// stays on the session's own route. The pin cannot close repo config that
+// runs code (hooks, helpers, stdio MCP servers) — that execution surface is
+// the accepted model for a trusted repo, matching the headless lane.
 // The JSON holds no hooks — the headless lane has no notice channel — and
 // is absent entirely when the session carries no routing of its own, so a
 // host-login spawn's argv is byte-identical to before the pin existed.
@@ -242,13 +246,26 @@ func resumePinArgs(spec agent.Spec) []string {
 }
 
 // marshalRoutingPin renders the routing pin as the --settings JSON string
-// the headless lane passes. Only routingPinEnvNames members are honored —
-// anything else is dropped rather than passed through, so a caller cannot
-// smuggle an unrelated variable onto the CLI's winning layer. The envelope
-// holds no hooks: the headless lane has no notice channel to declare.
+// the headless lane passes. Both the session's own routing names AND the
+// pinnedFallbackRoutingEnv names (including their "" blanks) are honored —
+// a blank explicitly states the ambient default on the winning layer, which
+// is what keeps a repo naming a proxy or an alternate provider surface from
+// taking effect. Anything outside that set is dropped rather than passed
+// through, so a caller cannot smuggle an unrelated variable onto the CLI's
+// winning layer. The envelope holds no hooks: the headless lane has no
+// notice channel to declare.
 func marshalRoutingPin(pin map[string]string) (string, error) {
 	env := make(map[string]string, len(pin))
 	for k, v := range pin {
+		// Fallback names first: their "" blanks ride the pin (a blank
+		// states the ambient default on the winning layer). Two session
+		// routing names (the bedrock/vertex switches) are also fallback
+		// names, and their blanks must ride too — checking the session
+		// set first would drop them as "empty session values".
+		if isFallbackRoutingName(k) {
+			env[k] = v
+			continue
+		}
 		if _, ok := routingPinEnvNames[k]; !ok || v == "" {
 			continue
 		}
@@ -262,6 +279,17 @@ func marshalRoutingPin(pin map[string]string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// isFallbackRoutingName reports whether name is one of the
+// pinnedFallbackRoutingEnv entries, whose "" blanks ride the pin.
+func isFallbackRoutingName(name string) bool {
+	for _, n := range pinnedFallbackRoutingEnv {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // additionalWorkdirs returns the ordered --add-dir list for a spawn: the

@@ -176,21 +176,35 @@ func (c *stopHookChannel) close() error {
 //
 // pin carries the session's own routing knobs (see pinnedRoutingEnv), stated
 // on this highest-precedence layer AFTER repo-local harness config is
-// applied: a repo settings file naming a routing var (for example
-// env.ANTHROPIC_BASE_URL) loses to the pin, so the session bearer always
-// goes where the resolved endpoint binding says. Nil/empty pins nothing — a
-// host-login session's settings stay exactly hooks plus the modal answer.
+// applied: a repo settings file naming a routing destination, flipping an
+// alternate serving host, or naming a proxy is overridden by the pin, so the
+// session bearer stays on the session's own route. It cannot close repo
+// config that runs code (hooks, helpers, stdio MCP servers) — that
+// execution surface is the accepted model for a trusted repo. Nil/empty
+// pins nothing — a host-login session's settings stay exactly hooks plus
+// the modal answer.
 func (c *stopHookChannel) settingsJSON() (string, error) {
 	return c.settingsJSONWithPin(nil)
 }
 
 // settingsJSONWithPin renders settingsJSON with pin stated under the `env`
-// key. Only routingPinEnvNames members are honored — anything else in pin
-// is dropped rather than passed through, so a caller cannot smuggle an
-// unrelated variable onto the CLI's winning layer.
+// key. Both the session's own routing names AND the pinnedFallbackRoutingEnv
+// names (including their "" blanks) are honored — a blank explicitly states
+// the ambient default on the winning layer, which is what keeps a repo
+// naming a proxy or an alternate provider surface from taking effect.
+// Anything outside that set is dropped rather than passed through, so a
+// caller cannot smuggle an unrelated variable onto the CLI's winning layer.
 func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, error) {
 	env := make(map[string]string)
 	for k, v := range pin {
+		// Fallback names first, for the same reason as marshalRoutingPin:
+		// the bedrock/vertex switches sit in both sets, and their ""
+		// blanks must ride the pin rather than be dropped as empty
+		// session values.
+		if isFallbackRoutingName(k) {
+			env[k] = v
+			continue
+		}
 		if _, ok := routingPinEnvNames[k]; !ok || v == "" {
 			continue
 		}
