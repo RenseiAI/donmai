@@ -217,6 +217,40 @@ func TestRepoKeeper_DisabledCreatesNothing(t *testing.T) {
 	}
 }
 
+// TestRepoKeeper_ProductionLayoutUnderStateHome builds the keeper the way
+// Start does and proves its mirrors and catalog land directly under
+// <state-home>/repo-keeper/ (the root the disabled-keeper test watches),
+// never one level deeper in a nested repo-keeper/repo-keeper/.
+func TestRepoKeeper_ProductionLayoutUnderStateHome(t *testing.T) {
+	root := repoKeeperRoot()
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	cfg := DefaultConfig()
+	cfg.RepoKeeper.Enabled = true
+	d := New(Options{})
+	d.config = cfg
+	k := d.repoKeeperFor(filepath.Join(filepath.Dir(root), "worktrees"))
+	if k == nil {
+		t.Fatal("repoKeeperFor() = nil with the keeper enabled, want a keeper")
+	}
+	if err := k.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	dir, ok := k.Acquire(context.Background(), newKeeperSourceRepo(t))
+	if !ok {
+		t.Fatal("Acquire degraded, want a served mirror")
+	}
+	if got, want := filepath.Dir(dir), filepath.Join(root, "mirrors"); got != want {
+		t.Errorf("mirror parent = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(root, "catalog.json")); err != nil {
+		t.Errorf("catalog not at the keeper root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "repo-keeper")); !os.IsNotExist(err) {
+		t.Errorf("nested repo-keeper/ under the keeper root: err = %v, want not-exist", err)
+	}
+}
+
 // TestRepoKeeper_ScopeSeam drives the production Acquire entry point with two
 // scopes for one remote and proves two store-backed mirrors result, with no
 // scope value or URL in the secret-free catalog.

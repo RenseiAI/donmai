@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -846,7 +847,11 @@ func (d *Daemon) repoKeeperFor(worktreeParentDir string) *RepoKeeper {
 	if d.opts.GitAuth != nil {
 		auth = RepoKeeperGitAuth(d.opts.GitAuth)
 	}
-	store, err := repokeeper.New(repoKeeperRoot(), worktreeParentDir, nil)
+	// The store appends repo-keeper/ to the state dir it is given, so it is
+	// handed the state home itself: mirrors and catalog land at
+	// <state-home>/repo-keeper/{mirrors,catalog.json}, the root repoKeeperRoot
+	// names, never one level deeper.
+	store, err := repokeeper.New(filepath.Dir(repoKeeperRoot()), worktreeParentDir, nil)
 	if err != nil {
 		slog.Warn("repo keeper: store unavailable; degrading to plain clone", "err", err)
 		return nil
