@@ -182,6 +182,8 @@ func (r *CredentialRefresher) Registration() (token, orchestratorURL string) {
 	defer r.mu.Unlock()
 	return r.opts.Registration.RegistrationToken, r.opts.Registration.OrchestratorURL
 }
+
+// Reregister sends the latest project declaration and publishes the resulting
 // identity to every credential lane. It is serialized with both ordinary
 // refresh and session-shim declaration operations.
 func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResult, error) {
