@@ -25,6 +25,7 @@ import (
 	"github.com/RenseiAI/donmai/rulesetsnapshot"
 	"github.com/RenseiAI/donmai/runner"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/repokeeper"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -823,13 +824,16 @@ func (d *Daemon) workerCapabilitiesFunc() func() map[string]bool {
 // under the state home. It is a function so tests can point a Daemon at a
 // temp dir by swapping the config-independent state home.
 func repoKeeperRoot() string {
-	return statepath.Resolve("repo-keeper", "/tmp/.donmai/repo-keeper")
+	return repoKeeperStateDir()
 }
 
 // repoKeeperFor constructs this daemon's keeper from its process-level
 // settings and the Options.RepoKeeperScope seam, or nil when the keeper is
-// disabled. Callers degrade to a plain clone on nil.
-func (d *Daemon) repoKeeperFor() *RepoKeeper {
+// disabled. Callers degrade to a plain clone on nil. The store is built
+// with the same worktree parent Start gives the spawner, and a store that
+// refuses to start (including a cross-filesystem state/worktree layout)
+// yields a nil keeper, which degrades.
+func (d *Daemon) repoKeeperFor(worktreeParentDir string) *RepoKeeper {
 	settings := d.Config().EffectiveRepoKeeperSettings()
 	if !settings.Enabled {
 		return nil
@@ -842,7 +846,12 @@ func (d *Daemon) repoKeeperFor() *RepoKeeper {
 	if d.opts.GitAuth != nil {
 		auth = RepoKeeperGitAuth(d.opts.GitAuth)
 	}
-	return NewRepoKeeper(repoKeeperRoot(), settings, scope, auth)
+	store, err := repokeeper.New(repoKeeperRoot(), worktreeParentDir, nil)
+	if err != nil {
+		slog.Warn("repo keeper: store unavailable; degrading to plain clone", "err", err)
+		return nil
+	}
+	return NewRepoKeeper(store, settings, scope, auth)
 }
 
 // reconcileRepoKeeper builds the keeper (when enabled) and reconciles its
@@ -850,8 +859,8 @@ func (d *Daemon) repoKeeperFor() *RepoKeeper {
 // workarea-cache admission. A reconcile failure degrades: callers fall back
 // to a plain clone and startup continues. With the keeper disabled this is
 // a no-op and nothing is created under repo-keeper/.
-func (d *Daemon) reconcileRepoKeeper(ctx context.Context) {
-	keeper := d.repoKeeperFor()
+func (d *Daemon) reconcileRepoKeeper(ctx context.Context, worktreeParentDir string) {
+	keeper := d.repoKeeperFor(worktreeParentDir)
 	d.mu.Lock()
 	d.repoKeeper = keeper
 	d.mu.Unlock()
@@ -1357,11 +1366,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
-	// Reconcile the repository keeper after session and catalog
-	// reconciliation and before workarea-cache admission. While it
-	// reconciles, callers degrade to a plain clone; with the keeper
-	// disabled this is a no-op and nothing is created under repo-keeper/.
-	d.reconcileRepoKeeper(ctx)
 	// A refused startup founding stands the composition down above, so this
 	// second registration runs exactly when the daemon presents no composed
 	// attestation: either it never did, or its founder was refused and it
@@ -1439,6 +1443,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.WorktreeParentDir == "" {
 		spawnerOpts.WorktreeParentDir = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 	}
+	// Reconcile the repository keeper after session and catalog
+	// reconciliation and before workarea-cache admission, with the same
+	// worktree parent the spawner serves from above: the store refuses a
+	// cross-filesystem state/worktree layout, and a refusal degrades to a
+	// plain clone. While it reconciles, callers degrade; with the keeper
+	// disabled this is a no-op and nothing is created under repo-keeper/.
+	d.reconcileRepoKeeper(ctx, spawnerOpts.WorktreeParentDir)
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.

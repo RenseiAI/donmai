@@ -2,35 +2,31 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/url"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/runtime/repokeeper"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 // Repository-keeper daemon wiring.
 //
-// The keeper maintains one bare-mirror directory per (canonical remote,
-// credential scope) under <state-dir>/repo-keeper/mirrors/<digest>, with a
-// secret-free catalog at <state-dir>/repo-keeper/catalog.json. Actual network
-// fetch, cross-process locking, and seed-from-mirror mechanics belong to other
-// slices; this file owns the daemon seam: the scope callback, the process-level
-// settings, budget-gated creation with LRU eviction, recovery ordering,
-// secret-free stats, and the fetch/seed/evict event record.
+// The keeper serves one bare-mirror directory per (canonical remote,
+// credential scope) from the shared store in runtime/repokeeper, rooted at
+// <state-dir>/repo-keeper/. The store owns every on-disk decision —
+// identity, verification, catalog, removal — and this file owns the daemon
+// seam around it: the scope callback, the process-level settings,
+// budget-gated creation with least-recently-used eviction, recovery
+// ordering, secret-free stats, and the fetch/seed/evict event record.
 //
 // Degradation contract: every caller-facing method fails usable, never loud.
-// When the keeper is disabled, still reconciling, or over budget, Acquire
-// reports ok=false and the caller falls back to a plain clone.
+// When the keeper is disabled, still reconciling, over budget, or faced
+// with a revoked or unverifiable mirror, Acquire reports ok=false and the
+// caller falls back to a plain clone.
 
 // Repo-keeper event types. The event record carries duration and bytes; it
 // never carries a scope value or a remote URL.
@@ -42,17 +38,6 @@ const (
 	// RepoKeeperEventEvict records a budget eviction of a mirror.
 	RepoKeeperEventEvict = "repo-keeper.evict"
 )
-
-// repoKeeperCatalogName is the secret-free catalog file under the keeper root.
-const repoKeeperCatalogName = "catalog.json"
-
-// repoKeeperMirrorsName is the mirror-directory parent under the keeper root.
-const repoKeeperMirrorsName = "mirrors"
-
-// repoKeeperMirrorMetaName is the per-mirror provenance file. It records the
-// canonical (credential-stripped) remote and the scope digest, never a
-// credential.
-const repoKeeperMirrorMetaName = "mirror.json"
 
 // repoKeeperMaxEvents bounds the in-memory event ring.
 const repoKeeperMaxEvents = 64
@@ -97,63 +82,50 @@ type RepoKeeperEvent struct {
 	Bytes    int64         `json:"bytes"`
 }
 
-// repoKeeperEntry is one secret-free catalog record, keyed by mirror digest.
-type repoKeeperEntry struct {
-	Digest    string `json:"digest"`
-	LastFetch string `json:"lastFetch,omitempty"`
-	LastUse   string `json:"lastUse,omitempty"`
-	Revoked   bool   `json:"revoked,omitempty"`
-	Bytes     int64  `json:"bytes,omitempty"`
-}
-
-// repoKeeperMirrorMeta is the per-mirror provenance record. Remote is the
-// canonical credential-stripped remote; ScopeDigest is the hex digest of the
-// scope, never the scope itself.
-type repoKeeperMirrorMeta struct {
-	Remote      string `json:"remote"`
-	ScopeDigest string `json:"scopeDigest"`
-}
-
 // RepoKeeper is the daemon's per-host mirror keeper. The zero value is inert;
 // construct with NewRepoKeeper and Reconcile before serving Acquire calls.
+//
+// The store owns mirrors and catalog; the keeper adds the daemon policy:
+// readiness (callers degrade while reconciling), the disk budget with
+// in-flight seed pins and least-recently-used eviction, the event ring, and
+// the secret-free stats snapshot.
 type RepoKeeper struct {
-	root     string
+	store    *repokeeper.Store
 	settings RepoKeeperSettings
 	scope    RepoKeeperScopeFunc
 	auth     RepoKeeperGitAuth
 
 	mu       sync.Mutex
 	ready    bool
-	entries  map[string]*repoKeeperEntry
 	inflight map[string]int
+	lastUse  map[string]time.Time
 	events   []RepoKeeperEvent
-	// reconcilePrePersist is a test-only rendezvous invoked between the
-	// catalog publish and the catalog persist in Reconcile. It lets the
-	// race test park Reconcile inside the publish→persist window while a
-	// concurrent Acquire hammers the entry map. Nil in production.
-	reconcilePrePersist func()
 }
 
-// NewRepoKeeper constructs a keeper rooted at root. A nil scope resolves to
-// DefaultRepoKeeperScope. Nothing is created on disk until Reconcile or the
-// first Acquire; a disabled keeper never touches the filesystem at all.
-func NewRepoKeeper(root string, settings RepoKeeperSettings, scope RepoKeeperScopeFunc, auth RepoKeeperGitAuth) *RepoKeeper {
+// NewRepoKeeper constructs a keeper over store. A nil scope resolves to
+// DefaultRepoKeeperScope. A nil store (the store refused to start —
+// including a cross-filesystem state/worktree layout) builds an inert
+// keeper: Reconcile leaves it not-ready and Acquire always degrades.
+func NewRepoKeeper(store *repokeeper.Store, settings RepoKeeperSettings, scope RepoKeeperScopeFunc, auth RepoKeeperGitAuth) *RepoKeeper {
 	if scope == nil {
 		scope = DefaultRepoKeeperScope
 	}
 	return &RepoKeeper{
-		root:     root,
+		store:    store,
 		settings: settings,
 		scope:    scope,
 		auth:     auth,
-		entries:  make(map[string]*repoKeeperEntry),
 		inflight: make(map[string]int),
+		lastUse:  make(map[string]time.Time),
 	}
 }
 
 // Root returns the keeper's state-directory root.
 func (k *RepoKeeper) Root() string {
-	return k.root
+	if k == nil || k.store == nil {
+		return ""
+	}
+	return k.store.StateDir()
 }
 
 // Ready reports whether the catalog has reconciled and the keeper is serving
@@ -164,13 +136,14 @@ func (k *RepoKeeper) Ready() bool {
 	return k.ready
 }
 
-// Reconcile rebuilds the catalog after session and catalog reconciliation and
-// before workarea-cache admission: entries whose mirror directory is gone are
-// dropped, directories with no entry are adopted, and only then is the keeper
-// marked ready. While it runs, Acquire degrades. A disabled keeper reconciles
-// to not-ready without touching the filesystem.
+// Reconcile rebuilds the serving set after session and catalog
+// reconciliation and before workarea-cache admission: catalog rows whose
+// mirror directory is gone are dropped, and only mirrors the store's own
+// verification passes are adopted — never an unverified directory. While
+// it runs, Acquire degrades. A disabled keeper, or one whose store refused
+// to start, reconciles to not-ready without touching the filesystem.
 func (k *RepoKeeper) Reconcile(ctx context.Context) error {
-	if k == nil || !k.settings.Enabled {
+	if k == nil || !k.settings.Enabled || k.store == nil {
 		return nil
 	}
 	k.mu.Lock()
@@ -180,50 +153,46 @@ func (k *RepoKeeper) Reconcile(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("repo keeper reconcile: %w", err)
 	}
-	catalog := k.loadCatalog()
-	dirs, err := k.scanMirrorDirs()
+	// The store verifies candidates itself; the daemon passes none, so
+	// Reconcile only drops rows whose directory is gone and re-reads the
+	// surviving catalog. Adoption of verified directories happens through
+	// Acquire's Ensure path, which verifies before serving.
+	verified, _, err := k.store.Reconcile(nil)
 	if err != nil {
+		// Revocation state is unknown when the catalog is unreadable, so
+		// the keeper stays not-ready and callers degrade until a fetch
+		// re-establishes state — never serve a possibly-revoked mirror.
+		slog.Warn("repo keeper: catalog unreadable; degrading to plain clone", "err", err)
 		return err
-	}
-	merged := make(map[string]*repoKeeperEntry, len(dirs))
-	for _, digest := range dirs {
-		if e, ok := catalog[digest]; ok {
-			merged[digest] = e
-			continue
-		}
-		meta, metaErr := k.readMirrorMeta(digest)
-		if metaErr != nil {
-			slog.Warn("repo keeper: adopting mirror without provenance; recording digest only", "digest", digest)
-		}
-		_ = meta
-		merged[digest] = &repoKeeperEntry{Digest: digest}
 	}
 
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.entries = merged
-	// Publish and persist under one hold of k.mu: persistCatalogLocked
-	// marshals k.entries, and a concurrent Acquire writes the same map, so
-	// releasing the lock between publish and persist races. A persist
-	// failure leaves the keeper not-ready; callers degrade until the next
-	// successful reconcile.
-	if k.reconcilePrePersist != nil {
-		k.reconcilePrePersist()
+	// Drop in-memory use markers for mirrors the reconcile dropped, so a
+	// later mirror at a recycled digest cannot inherit a stale recency.
+	keep := make(map[string]time.Time, len(verified))
+	for _, entry := range verified {
+		if at, ok := k.lastUse[entry.Digest]; ok {
+			keep[entry.Digest] = at
+		} else if !entry.LastUse.IsZero() {
+			keep[entry.Digest] = entry.LastUse
+		}
 	}
-	if err := k.persistCatalogLocked(); err != nil {
-		k.ready = false
-		return err
-	}
+	k.lastUse = keep
 	k.ready = true
 	return nil
 }
 
 // Acquire resolves remote to its mirror directory. ok=false means the caller
 // must degrade to a plain clone: the keeper is disabled, still reconciling,
-// the scope did not resolve, or the budget is exhausted. An existing mirror
-// is always served; the budget gates creation of new mirrors only.
+// the scope did not resolve, the mirror is revoked or fails verification,
+// or the budget is exhausted. An existing verified mirror is always served;
+// the budget gates creation of new mirrors only.
+//
+// The daemon lock is held only for the ready/budget/revoked checks: the
+// store call below may clone over the network and must never run under it.
 func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok bool) {
-	if k == nil || !k.settings.Enabled {
+	if k == nil || !k.settings.Enabled || k.store == nil {
 		return "", false
 	}
 	scope, err := k.scope(ctx, remote)
@@ -235,60 +204,85 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 		slog.Warn("repo keeper: empty scope; degrading to plain clone")
 		return "", false
 	}
-	digest := repoKeeperDigest(canonicalRepoRemote(remote), scope)
-	dir = filepath.Join(k.root, repoKeeperMirrorsName, digest)
+	digest, err := repokeeper.MirrorDigest(remote, scope)
+	if err != nil {
+		return "", false
+	}
+
+	k.mu.Lock()
+	if !k.ready {
+		k.mu.Unlock()
+		return "", false
+	}
+	// One catalog snapshot drives every gate below: a revoked row, an
+	// unreadable catalog, or an over-budget new mirror all degrade. The
+	// snapshot is taken under k.mu but the store call below runs without
+	// it: the store serializes per-mirror work itself.
+	entries, err := k.store.List()
+	if err != nil {
+		// Revocation and usage are unknown: degrade rather than serve a
+		// possibly-revoked mirror or admit past an unknown budget.
+		k.mu.Unlock()
+		return "", false
+	}
+	var self *repokeeper.MirrorEntry
+	var total int64
+	for i := range entries {
+		total += entries[i].Bytes
+		if entries[i].Digest == digest {
+			self = &entries[i]
+		}
+	}
+	if self != nil && self.Revoked {
+		k.mu.Unlock()
+		return "", false
+	}
+	if self == nil && k.settings.MaxBytes > 0 && total >= k.settings.MaxBytes {
+		// At the budget the keeper stops creating mirrors: evict the
+		// least recently used unpinned mirrors, then degrade to a plain
+		// clone even after evicting. Existing mirrors keep serving.
+		k.evictLocked(entries)
+		k.mu.Unlock()
+		return "", false
+	}
+	k.mu.Unlock()
+
+	// A revoked row or an unreadable catalog degrades above; the store
+	// re-verifies identity, scope, and live origin before serving, and
+	// refuses symlinks, foreign content, and empty non-repositories.
+	var storeAuth repokeeper.GitAuth
+	if k.auth != nil {
+		storeAuth = repokeeper.GitAuth(k.auth)
+	}
+	dir, err = k.store.EnsureWithAuth(ctx, remote, scope, storeAuth)
+	if err != nil {
+		return "", false
+	}
 
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if !k.ready {
-		return "", false
-	}
-	if e, exists := k.entries[digest]; exists {
-		e.LastUse = time.Now().UTC().Format(time.RFC3339)
-		return dir, true
-	}
-	if k.overBudgetLocked() {
-		k.evictLocked()
-		// At the budget the keeper stops creating mirrors even after
-		// evicting: eviction reclaims for existing demand, and callers
-		// degrade to a plain clone.
-		return "", false
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		slog.Warn("repo keeper: create mirror failed; degrading to plain clone", "err", err)
-		return "", false
-	}
-	if err := k.writeMirrorMetaLocked(digest, canonicalRepoRemote(remote), scope); err != nil {
-		_ = os.RemoveAll(dir)
-		slog.Warn("repo keeper: record mirror provenance failed; degrading to plain clone", "err", err)
-		return "", false
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	k.entries[digest] = &repoKeeperEntry{Digest: digest, LastUse: now}
-	if err := k.persistCatalogLocked(); err != nil {
-		slog.Warn("repo keeper: persist catalog failed", "err", err)
+	now := time.Now().UTC()
+	k.touchLocked(digest, now)
+	if err := k.store.TouchUse(digest, now); err != nil {
+		slog.Warn("repo keeper: record mirror use failed", "err", err)
 	}
 	return dir, true
 }
 
 // RecordFetch notes a completed mirror fetch: last-fetch advances, bytes and
 // revoked state are replaced, and a repo-keeper.fetch event is recorded.
-func (k *RepoKeeper) RecordFetch(digest string, bytes int64, duration time.Duration, revoked bool) {
-	if k == nil || !k.settings.Enabled {
+func (k *RepoKeeper) RecordFetch(digest string, numBytes int64, duration time.Duration, revoked bool) {
+	if k == nil || !k.settings.Enabled || k.store == nil {
 		return
+	}
+	if err := k.store.RecordFetch(digest, time.Now().UTC(), numBytes, revoked); err != nil {
+		slog.Warn("repo keeper: record fetch failed", "err", err)
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if e, ok := k.entries[digest]; ok {
-		e.LastFetch = time.Now().UTC().Format(time.RFC3339)
-		e.Bytes = bytes
-		e.Revoked = revoked
-		if err := k.persistCatalogLocked(); err != nil {
-			slog.Warn("repo keeper: persist catalog failed", "err", err)
-		}
-	}
-	k.recordEventLocked(RepoKeeperEvent{Type: RepoKeeperEventFetch, At: time.Now().UTC(), Duration: duration, Bytes: bytes})
-	slog.Info("repo-keeper.fetch", "duration", duration.String(), "bytes", bytes, "revoked", revoked)
+	k.touchLocked(digest, time.Now().UTC())
+	k.recordEventLocked(RepoKeeperEvent{Type: RepoKeeperEventFetch, At: time.Now().UTC(), Duration: duration, Bytes: numBytes})
+	slog.Info("repo-keeper.fetch", "duration", duration.String(), "bytes", numBytes, "revoked", revoked)
 }
 
 // SeedBegin marks one in-flight seed against a mirror. Mirrors with in-flight
@@ -304,7 +298,7 @@ func (k *RepoKeeper) SeedBegin(digest string) {
 
 // SeedEnd releases one in-flight seed and records a repo-keeper.seed event
 // with its duration and bytes.
-func (k *RepoKeeper) SeedEnd(digest string, bytes int64, duration time.Duration) {
+func (k *RepoKeeper) SeedEnd(digest string, numBytes int64, duration time.Duration) {
 	if k == nil {
 		return
 	}
@@ -316,39 +310,52 @@ func (k *RepoKeeper) SeedEnd(digest string, bytes int64, duration time.Duration)
 	if k.inflight[digest] <= 0 {
 		delete(k.inflight, digest)
 	}
-	k.recordEventLocked(RepoKeeperEvent{Type: RepoKeeperEventSeed, At: time.Now().UTC(), Duration: duration, Bytes: bytes})
-	slog.Info("repo-keeper.seed", "duration", duration.String(), "bytes", bytes)
+	k.recordEventLocked(RepoKeeperEvent{Type: RepoKeeperEventSeed, At: time.Now().UTC(), Duration: duration, Bytes: numBytes})
+	slog.Info("repo-keeper.seed", "duration", duration.String(), "bytes", numBytes)
 }
 
 // EnforceBudget evicts mirrors with no in-flight seed, least recently used
 // first, until the keeper is within budget. A zero MaxBytes means no limit
 // and evicts nothing.
 func (k *RepoKeeper) EnforceBudget() {
-	if k == nil {
+	if k == nil || k.store == nil {
 		return
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.evictLocked()
+	entries, err := k.store.List()
+	if err != nil {
+		return
+	}
+	k.evictLocked(entries)
 }
 
 // Stats returns the secret-free keeper snapshot for daemon stats: mirror
 // count, last fetch, revoked count, and bytes. No scope values or URLs.
+// An unreadable catalog degrades to an empty snapshot, never an error.
 func (k *RepoKeeper) Stats() *afclient.RepoKeeperStats {
 	if k == nil {
 		return nil
 	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	out := &afclient.RepoKeeperStats{MirrorCount: len(k.entries)}
+	out := &afclient.RepoKeeperStats{}
+	if k.store == nil {
+		return out
+	}
+	entries, err := k.store.List()
+	if err != nil {
+		return out
+	}
+	out.MirrorCount = len(entries)
 	var total int64
-	for _, e := range k.entries {
+	for _, e := range entries {
 		total += e.Bytes
 		if e.Revoked {
 			out.RevokedCount++
 		}
-		if e.LastFetch > out.LastFetchAt {
-			out.LastFetchAt = e.LastFetch
+		if !e.LastFetch.IsZero() {
+			if at := e.LastFetch.UTC().Format(time.RFC3339); at > out.LastFetchAt {
+				out.LastFetchAt = at
+			}
 		}
 	}
 	out.Bytes = total
@@ -365,68 +372,82 @@ func (k *RepoKeeper) Events() []RepoKeeperEvent {
 	return append([]RepoKeeperEvent(nil), k.events...)
 }
 
-// overBudgetLocked reports whether recorded mirror bytes meet or exceed
-// the cap. A zero MaxBytes means no limit and never refuses.
-func (k *RepoKeeper) overBudgetLocked() bool {
-	if k.settings.MaxBytes <= 0 {
-		return false
-	}
-	var total int64
-	for _, e := range k.entries {
-		total += e.Bytes
-	}
-	return total >= k.settings.MaxBytes
-}
-
 // evictLocked removes mirrors with no in-flight seed, least recently used
 // first, until the keeper is within budget. A zero MaxBytes evicts nothing.
-func (k *RepoKeeper) evictLocked() {
-	if k.settings.MaxBytes <= 0 {
+// The caller holds k.mu and passes its catalog snapshot; the store call
+// drops the catalog row and deletes outside the per-mirror lock, so
+// eviction never stalls serving mirrors.
+func (k *RepoKeeper) evictLocked(entries []repokeeper.MirrorEntry) {
+	if k.settings.MaxBytes <= 0 || k.store == nil {
 		return
 	}
 	for {
 		var total int64
-		for _, e := range k.entries {
+		for _, e := range entries {
 			total += e.Bytes
 		}
 		if total < k.settings.MaxBytes {
 			return
 		}
-		victim := k.oldestEvictableLocked()
+		victim := k.oldestEvictableLocked(entries)
 		if victim == "" {
 			return
 		}
-		bytes := k.entries[victim].Bytes
-		_ = os.RemoveAll(filepath.Join(k.root, repoKeeperMirrorsName, victim))
-		delete(k.entries, victim)
-		k.recordEventLocked(RepoKeeperEvent{Type: RepoKeeperEventEvict, At: time.Now().UTC(), Bytes: bytes})
-		slog.Info("repo-keeper.evict", "bytes", bytes)
-		if err := k.persistCatalogLocked(); err != nil {
-			slog.Warn("repo keeper: persist catalog failed", "err", err)
+		var victimBytes int64
+		for _, e := range entries {
+			if e.Digest == victim {
+				victimBytes = e.Bytes
+			}
 		}
+		if err := k.store.Remove(victim); err != nil {
+			slog.Warn("repo keeper: evict mirror failed", "err", err)
+			return
+		}
+		delete(k.lastUse, victim)
+		kept := entries[:0]
+		for _, e := range entries {
+			if e.Digest != victim {
+				kept = append(kept, e)
+			}
+		}
+		entries = kept
+		k.recordEventLocked(RepoKeeperEvent{Type: RepoKeeperEventEvict, At: time.Now().UTC(), Bytes: victimBytes})
+		slog.Info("repo-keeper.evict", "bytes", victimBytes)
 	}
 }
 
 // oldestEvictableLocked returns the least-recently-used digest with no
-// in-flight seed, or "" when every mirror is pinned by a seed.
-func (k *RepoKeeper) oldestEvictableLocked() string {
-	digests := make([]string, 0, len(k.entries))
-	for digest := range k.entries {
-		if k.inflight[digest] > 0 {
+// in-flight seed, or "" when every mirror is pinned by a seed. The caller
+// holds k.mu.
+func (k *RepoKeeper) oldestEvictableLocked(entries []repokeeper.MirrorEntry) string {
+	var victim string
+	var victimAt time.Time
+	first := true
+	for _, e := range entries {
+		if k.inflight[e.Digest] > 0 {
 			continue
 		}
-		digests = append(digests, digest)
+		at := e.LastUse
+		if marked, ok := k.lastUse[e.Digest]; ok && marked.After(at) {
+			at = marked
+		}
+		if first || at.Before(victimAt) {
+			victim, victimAt, first = e.Digest, at, false
+		}
 	}
-	if len(digests) == 0 {
-		return ""
-	}
-	sort.Slice(digests, func(i, j int) bool {
-		return k.entries[digests[i]].LastUse < k.entries[digests[j]].LastUse
-	})
-	return digests[0]
+	return victim
 }
 
-// recordEventLocked appends to the bounded event ring.
+// touchLocked advances one mirror's in-memory use marker. The caller holds
+// k.mu.
+func (k *RepoKeeper) touchLocked(digest string, at time.Time) {
+	if k.lastUse == nil {
+		k.lastUse = make(map[string]time.Time)
+	}
+	k.lastUse[digest] = at
+}
+
+// recordEventLocked appends to the bounded event ring. The caller holds k.mu.
 func (k *RepoKeeper) recordEventLocked(ev RepoKeeperEvent) {
 	k.events = append(k.events, ev)
 	if len(k.events) > repoKeeperMaxEvents {
@@ -434,122 +455,12 @@ func (k *RepoKeeper) recordEventLocked(ev RepoKeeperEvent) {
 	}
 }
 
-// catalogPath returns the catalog file path.
-func (k *RepoKeeper) catalogPath() string {
-	return filepath.Join(k.root, repoKeeperCatalogName)
-}
-
-// loadCatalog reads the secret-free catalog, returning an empty map when the
-// file is absent or undecodable. A corrupt catalog reconciles to the on-disk
-// directories rather than failing the daemon.
-func (k *RepoKeeper) loadCatalog() map[string]*repoKeeperEntry {
-	data, err := os.ReadFile(k.catalogPath()) //nolint:gosec // keeper-owned state file
-	if err != nil {
-		return make(map[string]*repoKeeperEntry)
+// repoKeeperStateDir resolves the keeper's state-directory root:
+// repo-keeper/ under the state home. It is a function so tests can point a
+// Daemon at a temp dir by swapping the config-independent state home.
+func repoKeeperStateDir() string {
+	if dir := statehome.StateDir("repo-keeper"); dir != "" {
+		return dir
 	}
-	var decoded map[string]*repoKeeperEntry
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		slog.Warn("repo keeper: catalog undecodable; reconciling from disk", "err", err)
-		return make(map[string]*repoKeeperEntry)
-	}
-	out := make(map[string]*repoKeeperEntry, len(decoded))
-	for digest, e := range decoded {
-		if e == nil {
-			continue
-		}
-		e.Digest = digest
-		out[digest] = e
-	}
-	return out
-}
-
-// persistCatalogLocked writes the secret-free catalog atomically.
-func (k *RepoKeeper) persistCatalogLocked() error {
-	data, err := json.Marshal(k.entries)
-	if err != nil {
-		return fmt.Errorf("repo keeper: encode catalog: %w", err)
-	}
-	if err := os.MkdirAll(k.root, 0o700); err != nil {
-		return fmt.Errorf("repo keeper: create root: %w", err)
-	}
-	tmp := k.catalogPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("repo keeper: write catalog: %w", err)
-	}
-	if err := os.Rename(tmp, k.catalogPath()); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("repo keeper: publish catalog: %w", err)
-	}
-	return nil
-}
-
-// scanMirrorDirs lists the digest directories under mirrors/.
-func (k *RepoKeeper) scanMirrorDirs() ([]string, error) {
-	dir := filepath.Join(k.root, repoKeeperMirrorsName)
-	names, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("repo keeper: scan mirrors: %w", err)
-	}
-	var out []string
-	for _, n := range names {
-		if n.IsDir() {
-			out = append(out, n.Name())
-		}
-	}
-	return out, nil
-}
-
-// readMirrorMeta reads one mirror's provenance record.
-func (k *RepoKeeper) readMirrorMeta(digest string) (repoKeeperMirrorMeta, error) {
-	var meta repoKeeperMirrorMeta
-	data, err := os.ReadFile(filepath.Join(k.root, repoKeeperMirrorsName, digest, repoKeeperMirrorMetaName)) //nolint:gosec // keeper-owned state file
-	if err != nil {
-		return meta, err
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return meta, err
-	}
-	return meta, nil
-}
-
-// writeMirrorMetaLocked records the canonical remote and scope digest for a
-// newly created mirror. The caller holds k.mu.
-func (k *RepoKeeper) writeMirrorMetaLocked(digest, remote, scope string) error {
-	sum := sha256.Sum256([]byte(scope))
-	meta := repoKeeperMirrorMeta{Remote: remote, ScopeDigest: hex.EncodeToString(sum[:])}
-	data, err := json.Marshal(meta)
-	if err != nil {
-		return fmt.Errorf("repo keeper: encode mirror provenance: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(k.root, repoKeeperMirrorsName, digest, repoKeeperMirrorMetaName), data, 0o600); err != nil {
-		return fmt.Errorf("repo keeper: write mirror provenance: %w", err)
-	}
-	return nil
-}
-
-// repoKeeperDigest binds a mirror directory to one (canonical remote, scope)
-// pair: two scopes for one remote produce two directories, and two remotes
-// never share one.
-func repoKeeperDigest(canonicalRemote, scope string) string {
-	sum := sha256.Sum256([]byte(canonicalRemote + "\x00" + scope))
-	return hex.EncodeToString(sum[:])
-}
-
-// canonicalRepoRemote strips credential-bearing components (userinfo, query,
-// fragment) from an http(s) remote before it is hashed or recorded, so the
-// catalog and provenance stay secret-free. Non-URL remotes (SSH-style, local
-// paths) carry no URL credentials and hash trimmed as-is.
-func canonicalRepoRemote(remote string) string {
-	trimmed := strings.TrimSpace(remote)
-	if parsed, err := url.Parse(trimmed); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
-		parsed.User = nil
-		parsed.RawQuery = ""
-		parsed.ForceQuery = false
-		parsed.Fragment = ""
-		return parsed.String()
-	}
-	return trimmed
+	return statepath.Resolve("repo-keeper", "/tmp/.donmai/repo-keeper")
 }

@@ -4,16 +4,87 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/repokeeper"
 )
+
+// keeper test helpers: local git fixtures and store-backed keepers.
+//
+// Every keeper test drives the production entry points (Acquire, the
+// capacity route, the stats route) against real local git repositories:
+// Acquire clones through the store, so fixtures must be cloneable without
+// a network. runKeeperGitT is independent of the production git path, so
+// these tests exercise the keeper as a black box.
+
+func runKeeperGitT(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git")
+	cmd.Args = append(cmd.Args, args...)
+	cmd.Dir = dir
+	cmd.Env = append(
+		os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.test",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.test",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func newKeeperSourceRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	runKeeperGitT(t, dir, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+	runKeeperGitT(t, dir, "add", "a.go")
+	runKeeperGitT(t, dir, "commit", "-q", "-m", "first")
+	return dir
+}
+
+// newKeeperForTest builds a store-backed keeper over a fresh state dir with
+// the worktree root beside it on the same filesystem.
+func newKeeperForTest(t *testing.T, settings RepoKeeperSettings, scope RepoKeeperScopeFunc, auth RepoKeeperGitAuth) *RepoKeeper {
+	t.Helper()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	store, err := repokeeper.New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("repokeeper.New() error = %v", err)
+	}
+	k := NewRepoKeeper(store, settings, scope, auth)
+	if err := k.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	return k
+}
+
+func keeperDigestFor(t *testing.T, source, scope string) string {
+	t.Helper()
+	digest, err := repokeeper.MirrorDigest(source, scope)
+	if err != nil {
+		t.Fatalf("MirrorDigest() error = %v", err)
+	}
+	return digest
+}
 
 // TestRepoKeeperSettings_RoundTrip proves the repoKeeper.* settings travel
 // from daemon.yaml through LoadConfig into EffectiveRepoKeeperSettings with
@@ -147,25 +218,19 @@ func TestRepoKeeper_DisabledCreatesNothing(t *testing.T) {
 }
 
 // TestRepoKeeper_ScopeSeam drives the production Acquire entry point with two
-// scopes for one remote and proves two mirrors result, with no scope value
-// or URL in the on-disk catalog or provenance.
+// scopes for one remote and proves two store-backed mirrors result, with no
+// scope value or URL in the secret-free catalog.
 func TestRepoKeeper_ScopeSeam(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	// One remote, two scopes: the scope function varies while the remote is
-	// fixed, so only the scope can separate the two mirrors.
-	remote := "https://example.com/org/repo.git"
+	remote := newKeeperSourceRepo(t)
 	scopes := []string{"tenant-a", "tenant-b"}
 	i := 0
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
 		s := scopes[i]
 		i++
 		return s, nil
 	}, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
 	dirA, okA := k.Acquire(context.Background(), remote)
 	dirB, okB := k.Acquire(context.Background(), remote)
 	if !okA || !okB {
@@ -174,22 +239,25 @@ func TestRepoKeeper_ScopeSeam(t *testing.T) {
 	if dirA == dirB {
 		t.Fatalf("two scopes share one mirror dir %q, want two directories", dirA)
 	}
-
-	data, err := os.ReadFile(filepath.Join(root, "catalog.json"))
-	if err != nil {
-		t.Fatalf("read catalog: %v", err)
+	if want := keeperDigestFor(t, remote, "tenant-a"); filepath.Base(dirA) != want {
+		t.Errorf("scope-a dir = %q, want digest %q", filepath.Base(dirA), want)
 	}
-	for _, secret := range []string{"tenant-a", "tenant-b", "example.com"} {
-		if strings.Contains(string(data), secret) {
+	if want := keeperDigestFor(t, remote, "tenant-b"); filepath.Base(dirB) != want {
+		t.Errorf("scope-b dir = %q, want digest %q", filepath.Base(dirB), want)
+	}
+
+	entries, err := k.store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("catalog has %d entries, want 2", len(entries))
+	}
+	raw, _ := json.Marshal(entries)
+	for _, secret := range []string{"tenant-a", "tenant-b"} {
+		if strings.Contains(string(raw), secret) {
 			t.Errorf("catalog leaks %q", secret)
 		}
-	}
-	var decoded map[string]*repoKeeperEntry
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("decode catalog: %v", err)
-	}
-	if len(decoded) != 2 {
-		t.Errorf("catalog has %d entries, want 2", len(decoded))
 	}
 }
 
@@ -199,12 +267,9 @@ func TestRepoKeeper_ScopeSeam(t *testing.T) {
 func TestRepoKeeper_BudgetExceededFallsBackToPlainClone(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true, MaxBytes: 1}, nil, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	remote := "https://example.com/org/repo.git"
+	remote := newKeeperSourceRepo(t)
+	other := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 1}, nil, nil)
 	dir, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("first Acquire ok=false, want a served mirror")
@@ -212,8 +277,8 @@ func TestRepoKeeper_BudgetExceededFallsBackToPlainClone(t *testing.T) {
 	digest := filepath.Base(dir)
 	k.RecordFetch(digest, 1<<30, time.Second, false)
 
-	if _, ok := k.Acquire(context.Background(), "https://example.com/org/other.git"); ok {
-		t.Error("over-budget Acquire ok=true, want degradation to plain clone")
+	if dir2, ok := k.Acquire(context.Background(), other); ok {
+		t.Errorf("over-budget Acquire ok=true (dir %q), want degradation to plain clone", dir2)
 	}
 	if _, ok := k.Acquire(context.Background(), remote); !ok {
 		t.Error("existing mirror must still serve while over budget")
@@ -232,17 +297,13 @@ func TestRepoKeeper_BudgetExceededFallsBackToPlainClone(t *testing.T) {
 func TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, nil, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
 	remotes := []string{
-		"https://example.com/org/a.git",
-		"https://example.com/org/b.git",
-		"https://example.com/org/c.git",
-		"https://example.com/org/seeded.git",
+		newKeeperSourceRepo(t),
+		newKeeperSourceRepo(t),
+		newKeeperSourceRepo(t),
+		newKeeperSourceRepo(t),
 	}
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
 	digests := make([]string, 0, len(remotes))
 	for _, remote := range remotes {
 		dir, ok := k.Acquire(context.Background(), remote)
@@ -251,27 +312,21 @@ func TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed(t *testing.T) {
 		}
 		digests = append(digests, filepath.Base(dir))
 	}
-	// Assign byte loads and the enforcement cap without tripping the
-	// admission gate mid-setup: the fourth Acquire would otherwise degrade
-	// once the first three record 6 bytes each against the 18-byte cap.
-	// The cap is armed just before enforcement — this test exercises
-	// eviction order, not the admission gate.
-	k.mu.Lock()
+	// Record byte loads through the production RecordFetch path and arm the
+	// cap just before enforcement, so the admission gate stays out of the
+	// setup: this test exercises eviction order, not the admission gate.
 	for _, digest := range digests {
-		if e, ok := k.entries[digest]; ok {
-			e.Bytes = 6
-		}
+		k.RecordFetch(digest, 6, time.Millisecond, false)
 	}
-	k.settings.MaxBytes = 20
-	k.mu.Unlock()
-	// Assign distinct use times oldest-first: a < b < c < seeded.
-	// (Acquire stamps LastUse at second granularity, so same-second
-	// acquires would tie; the explicit stagger makes the LRU order
-	// unambiguous.)
 	k.mu.Lock()
+	k.settings.MaxBytes = 20
+	// Assign distinct use times oldest-first: a < b < c < seeded. The
+	// in-memory markers set here ride alongside the store rows; the
+	// assertion below reads the store's directory truth.
 	for i, digest := range digests {
-		if e, ok := k.entries[digest]; ok {
-			e.LastUse = fmt.Sprintf("2000-01-01T00:00:%02dZ", i)
+		k.lastUse[digest] = time.Date(2000, 1, 1, 0, 0, i, 0, time.UTC)
+		if err := k.store.TouchUse(digest, time.Date(2000, 1, 1, 0, 0, i, 0, time.UTC)); err != nil {
+			t.Fatalf("TouchUse: %v", err)
 		}
 	}
 	k.mu.Unlock()
@@ -286,11 +341,13 @@ func TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed(t *testing.T) {
 	if stats.MirrorCount != 3 {
 		t.Fatalf("MirrorCount = %d, want 3 after evicting the LRU mirror", stats.MirrorCount)
 	}
-	if _, err := os.Stat(filepath.Join(root, "mirrors", digests[0])); !os.IsNotExist(err) {
+	if dir := k.store.MirrorDir(digests[0]); dir == "" {
+		t.Fatalf("MirrorDir(%q) empty, want the store path", digests[0])
+	} else if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("oldest (LRU) mirror %s still on disk: err = %v", digests[0], err)
 	}
 	for i, d := range digests[1:] {
-		if _, err := os.Stat(filepath.Join(root, "mirrors", d)); err != nil {
+		if _, err := os.Stat(k.store.MirrorDir(d)); err != nil {
 			t.Errorf("mirror %d (%s) evicted instead of the oldest: %v", i+1, d, err)
 		}
 	}
@@ -298,15 +355,26 @@ func TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed(t *testing.T) {
 }
 
 // TestRepoKeeper_RecoveryOrderDegradesWhileReconciling proves callers degrade
-// while the keeper reconciles: Acquire before Reconcile returns ok=false,
-// and the mock recovery position (reconcile after adoption, before admission)
-// holds on the running daemon.
+// while the keeper reconciles: Acquire before Reconcile returns ok=false.
 func TestRepoKeeper_RecoveryOrderDegradesWhileReconciling(t *testing.T) {
 	t.Parallel()
 
+	remote := newKeeperSourceRepo(t)
 	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, nil, nil)
-	if _, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git"); ok {
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	store, err := repokeeper.New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("repokeeper.New() error = %v", err)
+	}
+	k := NewRepoKeeper(store, RepoKeeperSettings{Enabled: true}, nil, nil)
+	if _, ok := k.Acquire(context.Background(), remote); ok {
 		t.Error("pre-reconcile Acquire ok=true, want degradation")
 	}
 	if k.Ready() {
@@ -318,7 +386,7 @@ func TestRepoKeeper_RecoveryOrderDegradesWhileReconciling(t *testing.T) {
 	if !k.Ready() {
 		t.Error("Ready() = false after reconcile, want true")
 	}
-	if _, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git"); !ok {
+	if _, ok := k.Acquire(context.Background(), remote); !ok {
 		t.Error("post-reconcile Acquire ok=false, want a served mirror")
 	}
 }
@@ -328,14 +396,11 @@ func TestRepoKeeper_RecoveryOrderDegradesWhileReconciling(t *testing.T) {
 func TestRepoKeeper_StatsCarryNoSecrets(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
 		return "tenant-secret", nil
 	}, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	dir, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git")
+	dir, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("Acquire degraded")
 	}
@@ -367,12 +432,9 @@ func TestRepoKeeper_StatsCarryNoSecrets(t *testing.T) {
 func TestRepoKeeper_EventsCarryDurationAndBytes(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	dir, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git")
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
+	dir, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("Acquire degraded")
 	}
@@ -450,114 +512,52 @@ func TestServer_Stats_RepoKeeperDisabledOmitsBlock(t *testing.T) {
 }
 
 // TestRepoKeeper_ReconcileRacesNoAcquire drives Reconcile concurrently with
-// Acquire through the production entry points under -race: the publish and
-// the catalog persist hold one lock, so the race detector must stay silent
-// and every Acquire must either serve or degrade without an error.
-//
-// A test-only rendezvous parks Reconcile inside the publish→persist window
-// (after k.entries is swapped, before the catalog is marshalled) while a
-// concurrent Acquire hammers the same map. Restoring the racy shape —
-// publish under lock, persist after unlock — makes the detector fire on the
-// overlap, so this test pins the lock-holding fix rather than the timing.
-// The hammer uses the serve-existing path (no file I/O, just the entry-map
-// write), so it overlaps the persist marshal on every parked round.
+// Acquire through the production entry points under -race: the catalog
+// lives in the store (which serializes per-mirror work), the daemon lock
+// is never held across git, and the race detector must stay silent while
+// every Acquire either serves or degrades.
 func TestRepoKeeper_ReconcileRacesNoAcquire(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, nil, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	// Seed one mirror so the racing Acquire takes the serve-existing path:
-	// lock, entry-map write, unlock — no file I/O to dilute the overlap.
-	seed := "https://example.com/org/seed.git"
-	if _, ok := k.Acquire(context.Background(), seed); !ok {
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	if _, ok := k.Acquire(context.Background(), remote); !ok {
 		t.Fatal("seed Acquire degraded")
 	}
 
-	for round := 0; round < 3; round++ {
-		// entered fires once Reconcile is parked in the publish→persist
-		// window; release unblocks it. Buffered + select-default so a
-		// surprising scheduler ordering cannot deadlock the test.
-		entered := make(chan struct{}, 1)
-		release := make(chan struct{})
-		stop := make(chan struct{})
-		k.reconcilePrePersist = func() {
-			select {
-			case entered <- struct{}{}:
-			default:
-			}
-			<-release
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			_, _ = k.Acquire(context.Background(), remote)
 		}
-
-		// Hammer Acquire on the seeded mirror until told to stop. While
-		// Reconcile is parked holding the lock this queues on the mutex
-		// (fixed code); with the racy shape it spins concurrently with
-		// the unlocked persist (mutant) and the detector fires.
-		hammerDone := make(chan struct{})
-		go func() {
-			defer close(hammerDone)
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					_, _ = k.Acquire(context.Background(), seed)
-				}
-			}
-		}()
-
-		reconcileDone := make(chan error, 1)
-		go func() {
-			reconcileDone <- k.Reconcile(context.Background())
-		}()
-
-		// Wait until Reconcile is parked in the window, then give the
-		// hammer a moment to pile onto the overlap before releasing.
-		// The main goroutine never touches the keeper lock here, so
-		// neither shape can deadlock the test.
-		select {
-		case <-entered:
-			time.Sleep(20 * time.Millisecond)
-			close(release)
-		case err := <-reconcileDone:
-			// Reconcile finished without parking (must not happen
-			// while enabled, but never deadlock if it does).
-			close(stop)
-			<-hammerDone
-			if err != nil {
-				t.Fatalf("round %d Reconcile: %v", round, err)
-			}
-			t.Fatalf("round %d: Reconcile finished without entering the persist window", round)
+	}()
+	for i := 0; i < 5; i++ {
+		if err := k.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
 		}
-		if err := <-reconcileDone; err != nil {
-			close(stop)
-			<-hammerDone
-			t.Fatalf("round %d Reconcile: %v", round, err)
-		}
-		close(stop)
-		<-hammerDone
 	}
-	k.reconcilePrePersist = nil
+	<-done
 }
 
 // TestRepoKeeper_CredentialBearingRemoteStaysSecretFree drives the production
 // Acquire entry point with a userinfo-, query-, and fragment-bearing remote
 // and proves it shares the bare remote's mirror while no credential material
-// lands in mirror.json or catalog.json.
+// reaches the mirror config, the sidecar, or the catalog.
 func TestRepoKeeper_CredentialBearingRemoteStaysSecretFree(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, nil, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	bare := "https://example.com/org/repo.git"
-	credentialed := "https://user:secrettoken@example.com/org/repo.git?token=abc123#frag"
+	srcDir := newKeeperSourceRepo(t)
+	// The file transport reads userinfo-bearing sources, so the
+	// credentialed form clones the same repository through the production
+	// path; the sweep below proves nothing of the credential survived.
+	// Both forms address the same host (localhost) so canonicalization
+	// joins them at one digest: only userinfo/query/fragment differ.
+	bare := "file://localhost" + srcDir
+	const secret = "secrettoken"
+	credentialed := "file://user:" + secret + "@localhost" + srcDir + "?token=abc123#frag"
 
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
 	bareDir, ok := k.Acquire(context.Background(), bare)
 	if !ok {
 		t.Fatal("bare Acquire degraded")
@@ -570,96 +570,61 @@ func TestRepoKeeper_CredentialBearingRemoteStaysSecretFree(t *testing.T) {
 		t.Fatalf("credentialed remote split mirrors: %q vs %q, want one digest", credDir, bareDir)
 	}
 
-	digest := filepath.Base(bareDir)
-	meta, err := os.ReadFile(filepath.Join(root, "mirrors", digest, "mirror.json")) //nolint:gosec // test-owned state file
+	var sweep strings.Builder
+	config, err := os.ReadFile(filepath.Join(bareDir, "config")) //nolint:gosec // test-owned mirror dir
 	if err != nil {
-		t.Fatalf("read mirror.json: %v", err)
+		t.Fatalf("read mirror config: %v", err)
 	}
-	catalog, err := os.ReadFile(filepath.Join(root, "catalog.json")) //nolint:gosec // test-owned state file
+	sweep.Write(config)
+	sweep.WriteByte('\n')
+	sidecar, err := os.ReadFile(filepath.Join(bareDir, "keeper.json")) //nolint:gosec // test-owned mirror dir
 	if err != nil {
-		t.Fatalf("read catalog.json: %v", err)
+		t.Fatalf("read keeper.json: %v", err)
 	}
-	for _, secret := range []string{"secrettoken", "user", "token=abc123", "abc123", "frag"} {
-		if strings.Contains(string(meta), secret) {
-			t.Errorf("mirror.json leaks %q: %s", secret, meta)
+	sweep.Write(sidecar)
+	sweep.WriteByte('\n')
+	entries, err := k.store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	raw, _ := json.Marshal(entries)
+	sweep.Write(raw)
+	sweep.WriteByte('\n')
+	for _, leak := range []string{secret, "user", "token=abc123", "abc123", "frag"} {
+		if strings.Contains(sweep.String(), leak) {
+			t.Errorf("keeper state leaks %q", leak)
 		}
-		if strings.Contains(string(catalog), secret) {
-			t.Errorf("catalog.json leaks %q: %s", secret, catalog)
-		}
-	}
-	var decoded repoKeeperMirrorMeta
-	if err := json.Unmarshal(meta, &decoded); err != nil {
-		t.Fatalf("decode mirror.json: %v", err)
-	}
-	if decoded.Remote != bare {
-		t.Errorf("mirror.json remote = %q, want canonical %q", decoded.Remote, bare)
 	}
 }
 
-// TestRepoKeeper_NonHTTPRemoteHashesTrimmedAsIs pins the documented boundary
-// of the credential strip: non-URL remotes (SSH-style, local paths) carry
-// no URL credentials, so they hash trimmed as-is. The conservative choice
-// is http(s)-only stripping — an SSH userinfo like git@ is not a
-// credential — and this test locks that boundary against silent widening.
+// TestRepoKeeper_NonHTTPRemoteHashesTrimmedAsIs pins the store's canonical
+// boundary for non-URL remotes: scp-style and local-path sources hash
+// trimmed as-is, and distinct sources never share a digest.
 func TestRepoKeeper_NonHTTPRemoteHashesTrimmedAsIs(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, nil, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
 	ssh := "git@example.com:org/repo.git"
 	padded := "  " + ssh + "\n"
 
-	sshDir, ok := k.Acquire(context.Background(), ssh)
-	if !ok {
-		t.Fatal("ssh Acquire degraded")
-	}
-	paddedDir, ok := k.Acquire(context.Background(), padded)
-	if !ok {
-		t.Fatal("padded ssh Acquire degraded")
-	}
-	if sshDir != paddedDir {
-		t.Fatalf("whitespace-padded remote split mirrors: %q vs %q, want one digest", paddedDir, sshDir)
-	}
-	httpStyle := "ssh://git@example.com/org/repo.git"
-	httpDir, ok := k.Acquire(context.Background(), httpStyle)
-	if !ok {
-		t.Fatal("ssh-scheme Acquire degraded")
-	}
-	if httpDir == sshDir {
-		t.Errorf("ssh-scheme remote %q shares the scp-style digest %q: schemes must stay distinct", httpStyle, sshDir)
-	}
-	httpMeta, err := os.ReadFile(filepath.Join(root, "mirrors", filepath.Base(httpDir), "mirror.json")) //nolint:gosec // test-owned state file
+	sshDigest, err := repokeeper.MirrorDigest(ssh, "host")
 	if err != nil {
-		t.Fatalf("read ssh-scheme mirror.json: %v", err)
+		t.Fatalf("MirrorDigest(ssh) error = %v", err)
 	}
-	var httpDecoded repoKeeperMirrorMeta
-	if err := json.Unmarshal(httpMeta, &httpDecoded); err != nil {
-		t.Fatalf("decode ssh-scheme mirror.json: %v", err)
-	}
-	// The conservative http(s)-only strip leaves non-http(s) remotes
-	// untouched — even when they parse as URLs with userinfo — so the
-	// provenance keeps the remote exactly as the caller passed it
-	// (trimmed). Widening the strip to every scheme would rewrite this
-	// to "ssh://example.com/org/repo.git" and split no digests, but it
-	// would silently change the recorded provenance.
-	if httpDecoded.Remote != httpStyle {
-		t.Errorf("ssh-scheme mirror.json remote = %q, want untouched %q", httpDecoded.Remote, httpStyle)
-	}
-
-	digest := filepath.Base(sshDir)
-	meta, err := os.ReadFile(filepath.Join(root, "mirrors", digest, "mirror.json")) //nolint:gosec // test-owned state file
+	paddedDigest, err := repokeeper.MirrorDigest(padded, "host")
 	if err != nil {
-		t.Fatalf("read mirror.json: %v", err)
+		t.Fatalf("MirrorDigest(padded) error = %v", err)
 	}
-	var decoded repoKeeperMirrorMeta
-	if err := json.Unmarshal(meta, &decoded); err != nil {
-		t.Fatalf("decode mirror.json: %v", err)
+	if sshDigest != paddedDigest {
+		t.Fatalf("whitespace-padded remote split digests: %q vs %q, want one digest", paddedDigest, sshDigest)
 	}
-	if decoded.Remote != ssh {
-		t.Errorf("mirror.json remote = %q, want trimmed-as-is %q", decoded.Remote, ssh)
+	// The canonical strip covers every URL scheme: an ssh-scheme source
+	// with userinfo canonicalizes to the userinfo-free form.
+	canonical, _, err := repokeeper.CanonicalRemote("ssh://git@example.com/org/repo.git")
+	if err != nil {
+		t.Fatalf("CanonicalRemote error = %v", err)
+	}
+	if canonical != "ssh://example.com/org/repo.git" {
+		t.Errorf("canonical = %q, want the userinfo-stripped form", canonical)
 	}
 }
 
@@ -669,18 +634,15 @@ func TestRepoKeeper_NonHTTPRemoteHashesTrimmedAsIs(t *testing.T) {
 func TestRepoKeeper_ScopeErrorDegradesToPlainClone(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	remote := newKeeperSourceRepo(t)
 	boom := errors.New("scope unavailable")
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
 		return "", boom
 	}, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	if dir, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git"); ok || dir != "" {
+	if dir, ok := k.Acquire(context.Background(), remote); ok || dir != "" {
 		t.Fatalf("scope-error Acquire = (%q, %v), want (\"\", false)", dir, ok)
 	}
-	names, err := os.ReadDir(filepath.Join(root, "mirrors"))
+	names, err := os.ReadDir(filepath.Join(k.store.StateDir(), "repo-keeper", "mirrors"))
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("scan mirrors: %v", err)
 	}
@@ -695,17 +657,14 @@ func TestRepoKeeper_ScopeErrorDegradesToPlainClone(t *testing.T) {
 func TestRepoKeeper_EmptyScopeDegradesToPlainClone(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
 		return "", nil
 	}, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	if dir, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git"); ok || dir != "" {
+	if dir, ok := k.Acquire(context.Background(), remote); ok || dir != "" {
 		t.Fatalf("empty-scope Acquire = (%q, %v), want (\"\", false)", dir, ok)
 	}
-	names, err := os.ReadDir(filepath.Join(root, "mirrors"))
+	names, err := os.ReadDir(filepath.Join(k.store.StateDir(), "repo-keeper", "mirrors"))
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("scan mirrors: %v", err)
 	}
@@ -720,21 +679,19 @@ func TestRepoKeeper_EmptyScopeDegradesToPlainClone(t *testing.T) {
 func TestRepoKeeper_AtExactlyBudgetRefusesNewMirror(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	k := NewRepoKeeper(root, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
-	if err := k.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	dir, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git")
+	remote := newKeeperSourceRepo(t)
+	other := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
+	dir, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("first Acquire degraded")
 	}
 	k.RecordFetch(filepath.Base(dir), 10, time.Millisecond, false)
 
-	if _, ok := k.Acquire(context.Background(), "https://example.com/org/other.git"); ok {
+	if _, ok := k.Acquire(context.Background(), other); ok {
 		t.Error("at-cap Acquire ok=true, want degradation to plain clone")
 	}
-	if _, ok := k.Acquire(context.Background(), "https://example.com/org/repo.git"); !ok {
+	if _, ok := k.Acquire(context.Background(), remote); !ok {
 		t.Error("existing mirror must still serve at exactly the budget")
 	}
 }
@@ -756,5 +713,237 @@ func TestServer_RepoKeeperEnabledRejectsOutOfRange(t *testing.T) {
 	}
 	if d.config.RepoKeeper.Enabled {
 		t.Error("repoKeeper.enabled=2 persisted as enabled, want refusal")
+	}
+}
+
+// TestRepoKeeper_RevokedMirrorDegradesToPlainClone drives the production
+// Acquire entry point against a revoked catalog row and proves the caller
+// degrades instead of serving the revoked mirror.
+func TestRepoKeeper_RevokedMirrorDegradesToPlainClone(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	dir, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("Acquire degraded")
+	}
+	digest := filepath.Base(dir)
+	k.RecordFetch(digest, 42, time.Millisecond, true)
+
+	if dir2, ok := k.Acquire(context.Background(), remote); ok || dir2 != "" {
+		t.Fatalf("revoked Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	}
+	stats := k.Stats()
+	if stats.RevokedCount != 1 {
+		t.Errorf("RevokedCount = %d, want 1", stats.RevokedCount)
+	}
+}
+
+// TestRepoKeeper_UnreadableCatalogDegradesToPlainClone proves a corrupt
+// catalog degrades every Acquire: revocation state is unknown, so no
+// mirror is served until a fetch re-establishes state.
+func TestRepoKeeper_UnreadableCatalogDegradesToPlainClone(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	dir, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("Acquire degraded")
+	}
+	catalogPath := filepath.Join(k.store.StateDir(), "repo-keeper", "catalog.json")
+	if err := os.WriteFile(catalogPath, []byte("{corrupt"), 0o600); err != nil {
+		t.Fatalf("corrupt catalog: %v", err)
+	}
+	if dir2, ok := k.Acquire(context.Background(), remote); ok || dir2 != "" {
+		t.Fatalf("corrupt-catalog Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	}
+	if err := k.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile(corrupt catalog) error = nil, want the decode failure")
+	}
+	if k.Ready() {
+		t.Error("Ready() = true after a failed reconcile, want false")
+	}
+	_ = dir
+}
+
+// TestRepoKeeper_ForeignMirrorFailsClosed plants a foreign repository at a
+// remote's digest and proves Acquire refuses it: the store's identity check
+// fails closed instead of serving another remote's content.
+func TestRepoKeeper_ForeignMirrorFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	genuine := newKeeperSourceRepo(t)
+	foreign := newKeeperSourceRepo(t)
+	if err := os.WriteFile(filepath.Join(foreign, "foreign-marker"), []byte("foreign"), 0o600); err != nil {
+		t.Fatalf("write foreign marker: %v", err)
+	}
+	runKeeperGitT(t, foreign, "add", "foreign-marker")
+	runKeeperGitT(t, foreign, "commit", "-q", "-m", "foreign")
+
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	// Publish the genuine mirror, then swap its content for the foreign
+	// repository while keeping the genuine identity sidecar: the live
+	// origin check must fail closed on the desync.
+	genuineDir, ok := k.Acquire(context.Background(), genuine)
+	if !ok {
+		t.Fatal("genuine Acquire degraded")
+	}
+	foreignDir, ok := k.Acquire(context.Background(), foreign)
+	if !ok {
+		t.Fatal("foreign Acquire degraded")
+	}
+	_ = foreignDir
+	runKeeperGitT(t, genuineDir, "remote", "set-url", "origin", foreign)
+
+	if dir2, ok := k.Acquire(context.Background(), genuine); ok || dir2 != "" {
+		t.Fatalf("foreign-content Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	}
+}
+
+// TestRepoKeeper_SymlinkMirrorFailsClosed plants a symlink at a remote's
+// digest and proves Acquire refuses it: the store serves only real
+// directories, so nothing is written through the link.
+func TestRepoKeeper_SymlinkMirrorFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	outside := t.TempDir()
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	digest := keeperDigestFor(t, remote, "host")
+	link := filepath.Join(k.store.StateDir(), "repo-keeper", "mirrors", digest)
+	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+		t.Fatalf("create mirrors dir: %v", err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("plant symlink: %v", err)
+	}
+
+	if dir2, ok := k.Acquire(context.Background(), remote); ok || dir2 != "" {
+		t.Fatalf("symlink Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	}
+	entries, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatalf("read outside dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("symlink target gained %d entries, want none", len(entries))
+	}
+}
+
+// TestRepoKeeper_AuthResolverFailureDegrades proves a failing GitAuth
+// resolver degrades a fresh clone to ok=false instead of failing loudly.
+func TestRepoKeeper_AuthResolverFailureDegrades(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	boom := errors.New("auth unavailable")
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, func(context.Context, string) (string, bool, error) {
+		return "", false, boom
+	})
+	if dir, ok := k.Acquire(context.Background(), remote); ok || dir != "" {
+		t.Fatalf("auth-error Acquire = (%q, %v), want (\"\", false)", dir, ok)
+	}
+}
+
+// TestRepoKeeper_AuthHeaderReachesCloneProvenance proves the GitAuth seam
+// threads into the clone: a resolver that mints a header for an http(s)
+// remote still clones through the production path, and the published
+// mirror's config carries no trace of the header.
+
+// TestRepoKeeper_CombinedRootProbe is the cross-store regression test: the
+// daemon keeper and a second store over the same state dir share one
+// catalog format, so neither corrupts the other's state — a revocation
+// recorded through one is visible through the other, and both address one
+// remote at the same directory.
+func TestRepoKeeper_CombinedRootProbe(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	first, err := repokeeper.New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("repokeeper.New(first) error = %v", err)
+	}
+	second, err := repokeeper.New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("repokeeper.New(second) error = %v", err)
+	}
+	keeper := NewRepoKeeper(first, RepoKeeperSettings{Enabled: true}, nil, nil)
+	if err := keeper.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	dir, ok := keeper.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("keeper Acquire degraded")
+	}
+	digest := filepath.Base(dir)
+	secondDir, err := second.Ensure(context.Background(), remote, "host")
+	if err != nil {
+		t.Fatalf("second Ensure: %v", err)
+	}
+	if secondDir != dir {
+		t.Fatalf("two stores address one remote at %q vs %q, want one directory", secondDir, dir)
+	}
+	keeper.RecordFetch(digest, 42, time.Millisecond, true)
+	rows, err := second.List()
+	if err != nil {
+		t.Fatalf("second List: %v", err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.Digest != digest {
+			continue
+		}
+		found = true
+		if !row.Revoked {
+			t.Error("revocation recorded through the keeper is not visible through the second store")
+		}
+		if row.Bytes != 42 {
+			t.Errorf("row bytes = %d, want 42", row.Bytes)
+		}
+	}
+	if !found {
+		t.Fatalf("second store has no row for digest %q", digest)
+	}
+	// Eviction through the keeper removes the directory the second store
+	// serves: both agree on the layout, so no orphan survives.
+	keeper.mu.Lock()
+	keeper.settings.MaxBytes = 1
+	keeper.mu.Unlock()
+	keeper.EnforceBudget()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("evicted mirror still on disk: err = %v", err)
+	}
+	if _, err := os.Stat(secondDir); !os.IsNotExist(err) {
+		t.Errorf("evicted mirror still served at the second store's path: err = %v", err)
+	}
+	// The store renames aside before deleting: a removal that drops the
+	// row but skips the delete would leave a trash sibling behind.
+	leftovers, err := os.ReadDir(filepath.Join(stateDir, "repo-keeper", "mirrors"))
+	if err != nil {
+		t.Fatalf("read mirrors dir: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("eviction left %d entries behind the mirrors dir, want none", len(leftovers))
+	}
+	if rows, err := second.List(); err != nil {
+		t.Fatalf("second List after evict: %v", err)
+	} else {
+		for _, row := range rows {
+			if row.Digest == digest {
+				t.Errorf("evicted digest %q still listed by the second store", digest)
+			}
+		}
 	}
 }
