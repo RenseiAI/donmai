@@ -45,14 +45,16 @@ type Gateway struct {
 	started  bool
 }
 
-// bearerTTLBounds caps how long a bound session bearer stays usable. A
-// stolen bearer is then worthless off-host (the gateway listens on loopback
-// only) and expires quickly: Unbind at session teardown releases the route
+// BearerTTL caps how long a bound session bearer stays usable. A stolen
+// bearer is then worthless off-host (the gateway listens on loopback only)
+// and expires quickly: Unbind at session teardown releases the route
 // immediately, and expiry closes the window a teardown that never runs
 // (a crashed worker, a leaked token file) would otherwise leave open.
 // The bound is deliberately short — well inside any session duration — so
 // the bearer is a per-session capability, not a long-lived credential.
-const bearerTTLBounds = 15 * time.Minute
+// Exported so the worker-local producer and tests name the same bound the
+// gateway enforces, rather than restating it.
+const BearerTTL = 15 * time.Minute
 
 // route is one bound session: the upstream to dial and the credential scope to
 // dial it with, plus the attribution facts stamped onto every cost row.
@@ -212,7 +214,7 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 		model:      cfg.Model,
 		upstream:   cfg.Upstream,
 		pool:       pool.New(cfg.Source, cfg.PoolOpts),
-		expiresAt:  g.now().Add(bearerTTLBounds),
+		expiresAt:  g.now().Add(BearerTTL),
 	}
 	addr := g.addr
 	g.mu.Unlock()

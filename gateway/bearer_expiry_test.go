@@ -42,7 +42,7 @@ func TestGateway_BearerExpiresShortTTL(t *testing.T) {
 
 	// Past the short TTL the same bearer is refused — never borrowed, never
 	// extended. A hostile repo holding this value gets 401, not a model call.
-	current = now.Add(16 * time.Minute)
+	current = now.Add(gateway.BearerTTL + time.Minute)
 	resp2 := chatRequest(t, b, false)
 	defer func() { _ = resp2.Body.Close() }()
 	if resp2.StatusCode != 401 {
@@ -67,7 +67,7 @@ func TestGateway_ModelsSurfaceHonorsBearerExpiry(t *testing.T) {
 	up := fakeUpstream(t, "sk-upstream")
 	b := bindSession(t, g, "sess-models-expiry", "claude-code", "sk-upstream", up.URL, "gpt-4o")
 
-	current = now.Add(16 * time.Minute)
+	current = now.Add(gateway.BearerTTL + time.Minute)
 	req, err := http.NewRequest(http.MethodGet, b.BaseURL+"/models", nil)
 	if err != nil {
 		t.Fatalf("build models request: %v", err)
