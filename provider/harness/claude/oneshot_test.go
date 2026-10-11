@@ -3,6 +3,7 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,6 +25,21 @@ var (
 
 func TestMain(m *testing.M) {
 	code := func() int {
+		// No test here may touch the operator's real CLI config: every
+		// interactive Spawn seeds the workspace-trust record, so the whole
+		// package defaults the config home to a throwaway directory. Tests
+		// that pin a config home still set their own with t.Setenv.
+		cfgHome, err := os.MkdirTemp("", "claude-config-home-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "isolate CLI config home:", err)
+			return 1
+		}
+		defer func() { _ = os.RemoveAll(cfgHome) }()
+		if err := os.Setenv(claudeConfigDirEnv, cfgHome); err != nil {
+			fmt.Fprintln(os.Stderr, "isolate CLI config home:", err)
+			return 1
+		}
+
 		if runtime.GOOS == "windows" {
 			return m.Run()
 		}

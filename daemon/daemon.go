@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"github.com/RenseiAI/donmai/rulesetsnapshot"
 	"github.com/RenseiAI/donmai/runner"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/repokeeper"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -325,6 +327,16 @@ type Options struct {
 	// The OSS binary leaves this nil, the worktree seam stays inert, and
 	// standalone behaviour is byte-identical to before.
 	GitAuth GitAuth
+
+	// RepoKeeperScope resolves the credential scope for one remote for the
+	// per-host repository keeper (see repo_keeper.go), beside GitAuth: GitAuth
+	// mints the per-invocation credential, this seam names the isolation
+	// boundary the resulting mirror belongs to. Nil means DefaultRepoKeeperScope
+	// (one host-wide scope), so one remote maps to exactly one mirror on this
+	// machine. An embedder that isolates mirrors per tenant supplies its own
+	// resolver; the keeper still records only the scope digest, never the
+	// scope value or the remote URL.
+	RepoKeeperScope RepoKeeperScopeFunc
 }
 
 // GitAuth is the per-invocation git auth resolver an embedder supplies via
@@ -512,6 +524,12 @@ type Daemon struct {
 	heartbeat *HeartbeatService
 	poller    *PollService
 	spawner   *WorkerSpawner
+
+	// repoKeeper is the per-host repository keeper (see repo_keeper.go). It is
+	// constructed in Start from the process-level RepoKeeper settings and the
+	// Options.RepoKeeperScope seam; nil until then. Callers degrade to a plain
+	// clone while it is nil, disabled, or still reconciling.
+	repoKeeper *RepoKeeper
 
 	// quota is the subscription quota-snapshot cache behind the
 	// heartbeat quota field: one entry per signed-in account. Probes
@@ -801,6 +819,85 @@ func (d *Daemon) ownsLifecycleLocked(lease *lifecycleLease) bool {
 // the hook through one seam.
 func (d *Daemon) workerCapabilitiesFunc() func() map[string]bool {
 	return d.opts.WorkerCapabilitiesFunc
+}
+
+// repoKeeperRoot resolves the keeper's state-directory root: repo-keeper/
+// under the state home. It is a function so tests can point a Daemon at a
+// temp dir by swapping the config-independent state home.
+func repoKeeperRoot() string {
+	return repoKeeperStateDir()
+}
+
+// repoKeeperFor constructs this daemon's keeper from its process-level
+// settings and the Options.RepoKeeperScope seam, or nil when the keeper is
+// disabled. Callers degrade to a plain clone on nil. The store is built
+// with the same worktree parent Start gives the spawner, and a store that
+// refuses to start (including a cross-filesystem state/worktree layout)
+// yields a nil keeper, which degrades.
+func (d *Daemon) repoKeeperFor(worktreeParentDir string) *RepoKeeper {
+	settings := d.Config().EffectiveRepoKeeperSettings()
+	if !settings.Enabled {
+		return nil
+	}
+	var scope RepoKeeperScopeFunc
+	if d.opts.RepoKeeperScope != nil {
+		scope = d.opts.RepoKeeperScope
+	}
+	var auth RepoKeeperGitAuth
+	if d.opts.GitAuth != nil {
+		auth = RepoKeeperGitAuth(d.opts.GitAuth)
+	}
+	// The store appends repo-keeper/ to the state dir it is given, so it is
+	// handed the state home itself: mirrors and catalog land at
+	// <state-home>/repo-keeper/{mirrors,catalog.json}, the root repoKeeperRoot
+	// names, never one level deeper.
+	store, err := repokeeper.New(filepath.Dir(repoKeeperRoot()), worktreeParentDir, nil)
+	if err != nil {
+		slog.Warn("repo keeper: store unavailable; degrading to plain clone", "err", err)
+		return nil
+	}
+	return NewRepoKeeper(store, settings, scope, auth)
+}
+
+// reconcileRepoKeeper builds the keeper (when enabled) and reconciles its
+// catalog after session and catalog reconciliation and before
+// workarea-cache admission. A reconcile failure degrades: callers fall back
+// to a plain clone and startup continues. With the keeper disabled this is
+// a no-op and nothing is created under repo-keeper/.
+func (d *Daemon) reconcileRepoKeeper(ctx context.Context, worktreeParentDir string) {
+	keeper := d.repoKeeperFor(worktreeParentDir)
+	d.mu.Lock()
+	d.repoKeeper = keeper
+	d.mu.Unlock()
+	if keeper == nil {
+		return
+	}
+	if err := keeper.Reconcile(ctx); err != nil {
+		slog.Warn("repo keeper: reconcile failed; degrading to plain clone", "err", err)
+	}
+}
+
+// RepoKeeper returns the daemon's repository keeper, or nil when it is
+// disabled or not yet constructed. The returned pointer is safe for
+// concurrent use.
+func (d *Daemon) RepoKeeper() *RepoKeeper {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.repoKeeper
+}
+
+// RepoKeeperMirror degrades a clone through the keeper: it returns the
+// mirror directory when the keeper can serve this remote, and ok=false when
+// the caller must fall back to a plain clone (disabled, reconciling,
+// over budget, or scope failure).
+func (d *Daemon) RepoKeeperMirror(ctx context.Context, remote string) (dir string, ok bool) {
+	d.mu.RLock()
+	keeper := d.repoKeeper
+	d.mu.RUnlock()
+	if keeper == nil {
+		return "", false
+	}
+	return keeper.Acquire(ctx, remote)
 }
 
 // onLandingWork returns the configured landing-run handler, or nil when none
@@ -1101,6 +1198,23 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if d.sessionShimEnabled() {
 			return errors.New("local file runtime supports direct headless execution only")
 		}
+		if cfg.LocalRuntime == nil || cfg.LocalRuntime.Harness == "" || cfg.LocalRuntime.Model == "" || len(cfg.LocalRuntime.Repositories) == 0 {
+			// A fresh-host seed (file queue URL with an explicit policy
+			// but no harness or repository profile yet) reaches Start
+			// without the profile the composition could not serve.
+			// Refuse with the operator action before any runtime,
+			// heartbeat, or poller starts, not an internal wiring
+			// complaint. The typed refusal maps to the no-restart
+			// setup exit at the entry point.
+			return afclient.ErrNeedsSetup
+		}
+		if d.opts.LocalRuntime == nil || d.opts.LocalRuntime.NewCompiler == nil {
+			// The shipped composition is missing — an embedder wiring
+			// fault, not an unconfigured host. Its own message keeps
+			// the journal grep for the setup action from
+			// misdiagnosing a misbuilt composition as "not set up yet".
+			return errors.New("local runtime composition missing: reinstall or report a bug")
+		}
 		local, err = newLocalRuntime(ctx, d, cfg)
 		if err != nil {
 			return err
@@ -1351,6 +1465,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.WorktreeParentDir == "" {
 		spawnerOpts.WorktreeParentDir = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 	}
+	// Reconcile the repository keeper after session and catalog
+	// reconciliation and before workarea-cache admission, with the same
+	// worktree parent the spawner serves from above: the store refuses a
+	// cross-filesystem state/worktree layout, and a refusal degrades to a
+	// plain clone. While it reconciles, callers degrade; with the keeper
+	// disabled this is a no-op and nothing is created under repo-keeper/.
+	d.reconcileRepoKeeper(ctx, spawnerOpts.WorktreeParentDir)
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.

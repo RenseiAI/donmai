@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/provider/harness/stub/stubagent"
 	"github.com/spf13/cobra"
 )
@@ -38,6 +39,23 @@ func StubAgentExitCode(err error) (int, bool) {
 	var exit *StubAgentExit
 	if errors.As(err, &exit) {
 		return exit.Code, true
+	}
+	return 0, false
+}
+
+// NeedsSetupExitCode reports the process exit status for the fresh-host
+// setup refusal, and whether err is that refusal at all. The refusal
+// carries the operator action (`host setup`) as its message; the status
+// is what the supervisor reads. The systemd unit names it in
+// RestartPreventExitStatus so the unit waits for its config instead of
+// restarting every RestartSec; a binary's main uses this so the status
+// reaches the supervisor instead of being flattened to 1.
+func NeedsSetupExitCode(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	if errors.Is(err, afclient.ErrNeedsSetup) {
+		return afclient.ExitCodeNeedsSetup, true
 	}
 	return 0, false
 }

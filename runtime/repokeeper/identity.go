@@ -66,6 +66,20 @@ func ScopeDigest(remoteDigest, scope string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// MirrorDigest resolves one (source, scope) pair to its mirror directory
+// digest: the canonical remote's digest joined with the scope. It is the
+// single choke point the daemon layer uses to name a mirror without
+// cloning, so budget, revocation, and eviction all address exactly the
+// directory the store would serve. An unparseable or empty source is an
+// error, never a digest.
+func MirrorDigest(source, scope string) (string, error) {
+	_, remoteDigest, err := CanonicalRemote(source)
+	if err != nil {
+		return "", err
+	}
+	return ScopeDigest(remoteDigest, scope)
+}
+
 // validDigest reports whether value carries the sha256:<64-hex> shape
 // produced by CanonicalRemote and ScopeDigest.
 func validDigest(value string) bool {

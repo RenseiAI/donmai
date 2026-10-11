@@ -40,6 +40,12 @@ func DefaultDaemonConfig() DaemonConfig {
 	}
 }
 
+// ExitCodeNeedsSetup is the process exit status the service entry point
+// uses for the fresh-host setup refusal (no harness or repository
+// profile yet). The systemd unit names it in RestartPreventExitStatus so
+// the unit waits for `host setup` instead of restarting every RestartSec.
+const ExitCodeNeedsSetup = 4
+
 // BaseURL returns the base URL for the daemon API derived from cfg.
 func (c DaemonConfig) BaseURL() string {
 	host := c.Host
@@ -287,6 +293,9 @@ type DaemonStatsResponse struct {
 	Pool *WorkareaPoolStats `json:"pool,omitempty"`
 	// ByMachine is the per-machine breakdown (populated with --by-machine).
 	ByMachine []MachineStats `json:"byMachine,omitempty"`
+	// RepoKeeper is the secret-free repository-keeper snapshot (mirror count,
+	// last fetch, revoked count, bytes). Nil when the keeper is disabled.
+	RepoKeeper *RepoKeeperStats `json:"repoKeeper,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
 

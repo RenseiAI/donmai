@@ -36,11 +36,14 @@
 // that still fails at launch surfaces the manager's own message on the
 // accept error.
 //
-// Restart contract (exit code 3):
+// Restart contract (exit codes 3 and 4):
 //
 //	The unit file uses SuccessExitStatus=3 so that exit code 3 (the daemon's
 //	EXIT_CODE_RESTART contract) is treated as a clean restart request — the
 //	crash counter is not incremented but systemd still restarts the process.
+//	Exit code 4 (EXIT_CODE_NEEDS_SETUP) is the fresh-host setup refusal:
+//	RestartPreventExitStatus=4 keeps the unit failed until the operator
+//	runs setup, instead of restarting every RestartSec while it waits.
 package systemd
 
 import (
@@ -139,6 +142,10 @@ type InstallOptions struct {
 
 	// ConfigPath is the path to the daemon config file. When non-empty, it
 	// is exported as DONMAI_DAEMON_CONFIG via Environment= in the unit.
+	// Install ensures a loadable config exists there (seeding the
+	// fresh-host config when absent, validating when present) before
+	// writing the unit. Empty means the daemon default
+	// (~/.donmai/daemon.yaml), which Install likewise ensures.
 	ConfigPath string
 
 	// ProcessPriority selects the process-priority mode the unit encodes. The
@@ -266,6 +273,12 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		// counter is not incremented; because it is NOT in
 		// RestartPreventExitStatus, systemd still restarts the daemon.
 		"SuccessExitStatus=3",
+		// Exit code 4 = EXIT_CODE_NEEDS_SETUP: the fresh-host seed
+		// refuses without a harness or repository profile until the
+		// operator runs setup. A failed start must stay failed — the
+		// unit waits for its config instead of restarting every
+		// RestartSec until then.
+		"RestartPreventExitStatus=4",
 		// No KillMode and no Delegate, deliberately: stopping this unit keeps
 		// systemd's default control-group kill, so a direct-owned seat in the
 		// unit's cgroup ends with its daemon. A shim-owned seat survives
@@ -398,15 +411,26 @@ func installHomeDir(scope Scope) (string, error) {
 //
 // Steps:
 //  1. Resolve the host binary path.
-//  2. Generate the unit file content.
-//  3. Write the unit file (creating parent dirs).
-//  4. Run `systemctl [--user] daemon-reload && enable --now` unless skipped.
+//  2. Ensure a loadable daemon config exists (seed or validate).
+//  3. Generate the unit file content.
+//  4. Write the unit file (creating parent dirs).
+//  5. Run `systemctl [--user] daemon-reload && enable --now` unless skipped.
+//
+// Step 2 is the fresh-host contract: with no config the service-mode
+// start would run the interactive wizard under the unit (stdin /dev/null)
+// and crash-loop, so the seed — a local file queue with an explicit
+// execution policy, no harness or repository profile — is written first.
+// An existing config is validated and left untouched.
 //
 // Returns the absolute path of the written unit file.
 func Install(opts InstallOptions) (string, error) {
 	scope := opts.Scope
 	if scope == "" {
 		scope = ScopeUser
+	}
+
+	if _, err := EnsureFreshHostConfig(opts.ConfigPath); err != nil {
+		return "", err
 	}
 
 	binPath, err := ResolveHostBinPath(opts.BinPath)

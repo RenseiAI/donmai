@@ -26,6 +26,19 @@ import (
 // the persisted origin is reset to the canonical remote (which carries no
 // userinfo), every remote operation runs with ambient auth only, and the
 // identity sidecar and catalog are secret-free by construction.
+
+// GitAuth resolves authorization for one remote git operation. It mirrors
+// the daemon and worktree seams: authHeader is injected as an in-memory
+// http.extraHeader scoped to the remote, suppressHelper disables configured
+// OS credential helpers for the invocation, and an error aborts the
+// operation. Returning ("", false, nil) preserves the ambient behavior.
+type GitAuth func(ctx context.Context, repoURL string) (authHeader string, suppressHelper bool, err error)
+
+// Store keeps one private bare git mirror per (canonical remote,
+// credential scope) under <state-dir>/repo-keeper/mirrors/<digest>.
+//
+// The zero value is not usable: build one with New and keep using the same
+// instance so per-mirror locks serialize concurrent callers.
 type Store struct {
 	stateDir     string
 	worktreeRoot string
@@ -35,6 +48,29 @@ type Store struct {
 	mirrorMu map[string]*sync.Mutex
 
 	catalogMu sync.Mutex
+}
+
+// StateDir returns the absolute state directory the store was built with.
+// The daemon layer derives the mirror path for a digest from it when it
+// needs filesystem operations the catalog alone cannot serve (budget
+// eviction); the store remains the only writer of mirrors and catalog.
+func (s *Store) StateDir() string {
+	return s.stateDir
+}
+
+// MirrorDir returns the on-disk mirror directory for a scope digest. It
+// reports "" for a digest outside the store's shape so callers cannot be
+// steered at an arbitrary path.
+func (s *Store) MirrorDir(digest string) string {
+	if len(digest) != 64 {
+		return ""
+	}
+	for _, c := range digest {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return ""
+		}
+	}
+	return filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)
 }
 
 // New builds a keeper Store rooted at stateDir, holding its mirrors under
@@ -81,6 +117,17 @@ func New(stateDir, worktreeRoot string, logf func(format string, args ...any)) (
 // credential-scope name; the empty
 // scope is the host-wide default. Neither value is written to the log.
 func (s *Store) Ensure(ctx context.Context, source, scope string) (string, error) {
+	return s.EnsureWithAuth(ctx, source, scope, nil)
+}
+
+// EnsureWithAuth is Ensure with a per-invocation authorization resolver
+// for the clone: the resolver runs only when a fresh clone is needed (an
+// existing mirror is served from its verified state without touching the
+// network), and its header travels to git as an in-memory extraHeader
+// scoped to the clone URL — never via argv, never into the mirror config.
+// A resolver error aborts the clone. Neither the source nor the header is
+// written to the log or echoed in an error.
+func (s *Store) EnsureWithAuth(ctx context.Context, source, scope string, auth GitAuth) (string, error) {
 	canonical, cloneURL, remoteDigest, err := resolveSource(source)
 	if err != nil {
 		return "", err
@@ -128,7 +175,11 @@ func (s *Store) Ensure(ctx context.Context, source, scope string) (string, error
 	// cloneURL fetches exactly the repository the identity records, and the
 	// empty --template keeps the daemon user's template directory (which
 	// may carry executable hooks) out of the mirror.
-	if _, err := runGit(ctx, localGitEnv(), "clone", "--mirror", "--template=", "--", cloneURL, tmp); err != nil {
+	cloneEnv, err := s.cloneEnv(ctx, cloneURL, auth)
+	if err != nil {
+		return "", err
+	}
+	if _, err := runGit(ctx, cloneEnv, "clone", "--mirror", "--template=", "--", cloneURL, tmp); err != nil {
 		return "", fmt.Errorf("repo keeper: clone mirror: %w", err)
 	}
 	if err := s.hardenMirror(tmp, canonical); err != nil {
@@ -265,6 +316,29 @@ func (s *Store) lockMirror(digest string) func() {
 	s.mu.Unlock()
 	mu.Lock()
 	return mu.Unlock
+}
+
+// cloneEnv builds the environment for the fresh-clone git invocation: the
+// ambient-auth baseline plus, when auth is non-nil, the resolver's header
+// scoped to the clone URL. The resolver runs at most once per clone, after
+// the store has committed to cloning; a resolver error aborts before git
+// starts. The header travels via in-memory config (never argv), and the
+// source URL is never logged or echoed in an error.
+func (s *Store) cloneEnv(ctx context.Context, cloneURL string, auth GitAuth) ([]string, error) {
+	if auth == nil {
+		return localGitEnv(), nil
+	}
+	header, suppress, err := auth(ctx, cloneURL)
+	if err != nil {
+		return nil, fmt.Errorf("repo keeper: resolve git auth: %w", err)
+	}
+	if header != "" {
+		if _, scoped := gitexec.ExtraHeaderConfigKey(cloneURL); !scoped {
+			s.logf("repo keeper: git auth header dropped: its source is not an http(s) URL, so the header cannot be scoped to it")
+		}
+	}
+	base := credentials.Filter(os.Environ())
+	return gitexec.HardenedEnv(base, suppress, gitexec.Auth{Header: header, RemoteURL: cloneURL}), nil
 }
 
 func (s *Store) catalogPath() string {
