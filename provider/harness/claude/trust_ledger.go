@@ -1,0 +1,419 @@
+package claude
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/RenseiAI/donmai/agent"
+)
+
+// This file is the crash-safety half of the workspace-trust seed
+// (trust.go): a per-config-home ledger of seeded trust entries.
+//
+// The problem: removeSeededTrust runs in the spawning process at session
+// end, so a crash between seed and cleanup — the worker dies, the host
+// reboots, the daemon restarts — leaves the seed in the CLI's trust record
+// with nobody left to remove it. That entry then trusts the worktree for
+// every later session on the host, silently. A crashed session's leftovers
+// must be found and undone at the next start, while a live session's
+// entries must never be touched.
+//
+// The ledger records, under the same trust lock that guards the record, one
+// entry per (path, owning session): every directory the seed created or
+// flipped, the prior value a flipped entry carried (absent means the entry
+// had no trust key), and the owning session. The daemon sweep at start
+// (daemon/trust_ledger_sweep.go, fed by this package's exported Sweep
+// entry) drops every entry whose session is no longer live: entries the
+// ledger's own seed created are removed whole, flipped entries are put back
+// to their prior value — the same ownership rule removeSeededTrust applies
+// on the live path.
+//
+// Best-effort throughout, like the seed itself: a ledger that cannot be
+// read, parsed, or written leaves the session to the modal rather than
+// failing the spawn, and a sweep that cannot run leaves the record as
+// found. The ledger is harness state, never trust state: the CLI never
+// reads it, and the seed never consults it when deciding what to trust.
+
+// trustLedgerFileName is the ledger basename beside the trust record under
+// the same config home.
+const trustLedgerFileName = ".claude.json.seeded-trust-ledger"
+
+// trustLedgerMaxEntries bounds the ledger file: each entry is one seeded
+// directory of one session, so this is generous by construction. Past the
+// bound the ledger stops recording new seeds (the seed itself still lands —
+// the operator-visible behaviour never degrades) and the sweep still drains
+// what is recorded.
+const trustLedgerMaxEntries = 4096
+
+// trustLedgerEntry is one seeded directory's ledger row.
+type trustLedgerEntry struct {
+	// Dir is the trust-record key the seed wrote.
+	Dir string `json:"dir"`
+	// Created is true when the seed created the entry (absent before);
+	// false when it flipped an existing entry's trust key.
+	Created bool `json:"created,omitempty"`
+	// Prior carries the flipped entry's previous trust-key value. HadKey is
+	// false when the entry had no trust key at all (so the sweep deletes
+	// the key rather than restoring it).
+	Prior  any  `json:"prior,omitempty"`
+	HadKey bool `json:"hadKey,omitempty"`
+	// Session identifies the owning session (see seededTrust.session).
+	Session string `json:"session,omitempty"`
+	// SeededAt is when the seed landed, for operator diagnosis.
+	SeededAt time.Time `json:"seededAt,omitempty"`
+}
+
+// trustLedgerOwner returns the ledger's owning-session identity for a
+// spawn: the session's own name when it carries one, else a process-scoped
+// fallback. The fallback still distinguishes this process's entries from
+// another process's (and from a crashed process's): two unnamed sessions in
+// one process share it, but the live-session set the sweep consults is
+// per-process too, so a live process's unnamed entries are never swept
+// while it lives.
+func trustLedgerOwner(spec agent.Spec) string {
+	if name := strings.TrimSpace(spec.SessionName); name != "" {
+		return "session:" + name
+	}
+	return fmt.Sprintf("pid:%d", os.Getpid())
+}
+
+// recordSeededTrustLedger appends seed's entries to the per-config-home
+// ledger under the trust lock. Silent and best-effort: any failure leaves
+// the seed in place (the live-path cleanup still knows exactly what to
+// remove) and the session proceeds.
+func recordSeededTrustLedger(seed *seededTrust) {
+	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
+		return
+	}
+	release, ok := acquireTrustLock(seed.path)
+	if !ok {
+		return
+	}
+	defer release()
+	entries, _ := readTrustLedger(seed.path)
+	if len(entries) >= trustLedgerMaxEntries {
+		return
+	}
+	now := time.Now().UTC()
+	for _, dir := range seed.dirs {
+		entries = append(entries, trustLedgerEntry{Dir: dir, Created: true, Session: seed.session, SeededAt: now})
+	}
+	for _, dir := range seed.flipped {
+		var prior any
+		hadKey := false
+		if seed.prior != nil {
+			prior, hadKey = seed.prior[dir]
+		}
+		entries = append(entries, trustLedgerEntry{Dir: dir, Prior: prior, HadKey: hadKey, Session: seed.session, SeededAt: now})
+	}
+	_ = writeTrustLedger(seed.path, entries)
+}
+
+// forgetSeededTrustLedger drops seed's entries from the ledger under the
+// trust lock. It runs deferred at the top of removeSeededTrust — before the
+// lock for the record itself is taken — so the ledger cannot retain an
+// entry the live cleanup already removed, even if that cleanup then fails
+// to take the record lock. Silent and best-effort throughout.
+func forgetSeededTrustLedger(seed *seededTrust) {
+	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
+		return
+	}
+	release, ok := acquireTrustLock(seed.path)
+	if !ok {
+		return
+	}
+	defer release()
+	entries, ok := readTrustLedger(seed.path)
+	if !ok {
+		return
+	}
+	keep := entries[:0]
+	for _, e := range entries {
+		if ledgerEntryOwnedBy(e, seed) {
+			continue
+		}
+		keep = append(keep, e)
+	}
+	if len(keep) == len(entries) {
+		return
+	}
+	_ = writeTrustLedger(seed.path, keep)
+}
+
+// ledgerEntryOwnedBy reports whether ledger entry e is one seed wrote: same
+// directory, same creation kind, same owning session. The session match is
+// what keeps one live session's cleanup from dropping another live
+// session's row for the same directory.
+func ledgerEntryOwnedBy(e trustLedgerEntry, seed *seededTrust) bool {
+	if e.Session != seed.session {
+		return false
+	}
+	if e.Created {
+		for _, dir := range seed.dirs {
+			if e.Dir == dir {
+				return true
+			}
+		}
+		return false
+	}
+	for _, dir := range seed.flipped {
+		if e.Dir == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// trustLedgerPath returns the ledger path beside the trust record.
+func trustLedgerPath(trustRecordPath string) string {
+	return filepath.Join(filepath.Dir(trustRecordPath), trustLedgerFileName)
+}
+
+// readTrustLedger returns the ledger entries beside the trust record at
+// trustRecordPath. ok is false when the ledger is absent, unreadable, or
+// unparseable — all three read as "no ledger", never as an error, so a
+// missing or foreign ledger never disturbs the seed.
+func readTrustLedger(trustRecordPath string) (entries []trustLedgerEntry, ok bool) {
+	data, err := os.ReadFile(trustLedgerPath(trustRecordPath)) //nolint:gosec // harness-owned ledger beside the trust record
+	if err != nil {
+		return nil, false
+	}
+	var decoded []trustLedgerEntry
+	if json.Unmarshal(data, &decoded) != nil {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// writeTrustLedger replaces the ledger beside the trust record at
+// trustRecordPath with entries, riding a temp-file rename so a concurrent
+// reader never sees a half-written ledger. The caller holds the trust lock.
+func writeTrustLedger(trustRecordPath string, entries []trustLedgerEntry) error {
+	dir := filepath.Dir(trustRecordPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	body, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".seeded-trust-ledger.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, trustLedgerPath(trustRecordPath)); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+// SweepTrustLedgerOptions configures one crash-sweep pass over the ledger
+// beside a trust record.
+type SweepTrustLedgerOptions struct {
+	// TrustRecordPath is the CLI trust record the ledger sits beside.
+	TrustRecordPath string
+	// Live reports whether a ledger session identity still owns a live
+	// session. Entries whose session reads as live are kept; every other
+	// entry is undone. Nil reads every session as dead — the caller that
+	// cannot enumerate live sessions must say so explicitly.
+	Live func(session string) bool
+}
+
+// sweepTrustLedger undoes every ledger entry whose session is no longer
+// live: entries the dead session's seed created are removed whole, flipped
+// entries are put back to their prior value — the same ownership rule the
+// live-path cleanup applies. The ledger rows themselves are dropped only
+// for entries the sweep actually undid; an entry the record no longer
+// honours (already cleaned, already re-trusted by its owner) still drops
+// its row, but a row the sweep could not apply — the record is unparseable,
+// the lock is held — stays for the next start to retry.
+//
+// It returns the number of ledger rows dropped. Every failure is silent:
+// the sweep must never fail a start.
+func sweepTrustLedger(opts SweepTrustLedgerOptions) (dropped int) {
+	path := opts.TrustRecordPath
+	if path == "" {
+		return 0
+	}
+	live := opts.Live
+	if live == nil {
+		live = func(string) bool { return false }
+	}
+	release, ok := acquireTrustLock(path)
+	if !ok {
+		return 0
+	}
+	defer release()
+	entries, ok := readTrustLedger(path)
+	if !ok || len(entries) == 0 {
+		return 0
+	}
+	var dead []trustLedgerEntry
+	for _, e := range entries {
+		if e.Dir == "" {
+			dropped++
+			continue
+		}
+		if live(e.Session) {
+			continue
+		}
+		dead = append(dead, e)
+	}
+	if len(dead) == 0 && dropped == 0 {
+		return 0
+	}
+	if len(dead) > 0 {
+		// A created entry whose directory the record no longer carries, or a
+		// flipped entry whose record entry is gone, is already undone — but
+		// the row still drains. Only an unparseable or foreign record keeps
+		// rows for the next start.
+		if !applyTrustLedgerSweep(path, dead) {
+			// The record could not be rewritten (unparseable, not ours to
+			// replace, lock lost): keep every row so the next start
+			// retries, but still drop rows with no directory — they can
+			// never apply to anything.
+			if dropped > 0 {
+				var keep []trustLedgerEntry
+				for _, e := range entries {
+					if e.Dir != "" {
+						keep = append(keep, e)
+					}
+				}
+				_ = writeTrustLedger(path, keep)
+			}
+			return dropped
+		}
+		for range dead {
+			dropped++
+		}
+	}
+	keep := make([]trustLedgerEntry, 0, len(entries)-len(dead))
+deadLoop:
+	for _, e := range entries {
+		if e.Dir == "" {
+			continue
+		}
+		for _, d := range dead {
+			if d.Dir == e.Dir && d.Session == e.Session && d.Created == e.Created {
+				continue deadLoop
+			}
+		}
+		keep = append(keep, e)
+	}
+	_ = writeTrustLedger(path, keep)
+	return dropped
+}
+
+// applyTrustLedgerSweep rewrites the trust record at path, undoing dead's
+// entries: created entries are removed whole, flipped entries get only
+// their trust key put back to its prior value. It reports false when the
+// record is not ours to rewrite — absent (nothing to undo), unparseable, or
+// carrying an unexpected projects shape — so the caller keeps the rows for
+// the next start. Unknown record fields are preserved; entries the record
+// no longer carries are no-ops. The caller holds the trust lock.
+func applyTrustLedgerSweep(path string, dead []trustLedgerEntry) bool {
+	data, err := os.ReadFile(path) //nolint:gosec // config path, not session input
+	if err != nil {
+		// Absent: a dead session's entries have nowhere to live. Report
+		// success so the rows drain — there is nothing to undo.
+		return errors.Is(err, os.ErrNotExist)
+	}
+	var record map[string]any
+	if json.Unmarshal(data, &record) != nil {
+		return false
+	}
+	raw, ok := record[claudeTrustProjectsKey]
+	if raw == nil {
+		return true // no projects table: nothing to undo, rows drain
+	}
+	projects, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, e := range dead {
+		if e.Created {
+			delete(projects, e.Dir)
+			continue
+		}
+		entry, ok := projects[e.Dir].(map[string]any)
+		if !ok {
+			continue
+		}
+		if e.HadKey {
+			entry[claudeTrustAcceptedKey] = e.Prior
+		} else {
+			delete(entry, claudeTrustAcceptedKey)
+		}
+	}
+	body, err := json.Marshal(record)
+	if err != nil {
+		return false
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".claude.json.tmp-*")
+	if err != nil {
+		return false
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return false
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return false
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return false
+	}
+	return true
+}
+
+// SweepSeededTrustForConfigHome sweeps the ledger beside the trust record
+// under configHome, undoing entries whose session is no longer live. It is
+// the daemon startup entry point (see daemon/trust_ledger_sweep.go): config
+// homes the daemon never seeds — a relative override, an unset home —
+// resolve to nothing and sweep nothing. A home whose ledger is absent or
+// foreign is a no-op. It returns the number of ledger rows dropped.
+func SweepSeededTrustForConfigHome(configHome string, live func(session string) bool) int {
+	if strings.TrimSpace(configHome) == "" || !filepath.IsAbs(configHome) {
+		return 0
+	}
+	path := filepath.Join(configHome, claudeTrustFileName)
+	if _, err := os.Stat(trustLedgerPath(path)); err != nil {
+		return 0
+	}
+	return sweepTrustLedger(SweepTrustLedgerOptions{TrustRecordPath: path, Live: live})
+}
+
+// trustLedgerSortForTest orders ledger rows for deterministic test
+// comparison.
+func trustLedgerSortForTest(entries []trustLedgerEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Dir != entries[j].Dir {
+			return entries[i].Dir < entries[j].Dir
+		}
+		if entries[i].Session != entries[j].Session {
+			return entries[i].Session < entries[j].Session
+		}
+		return !entries[i].Created && entries[j].Created
+	})
+}

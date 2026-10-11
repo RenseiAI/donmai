@@ -43,6 +43,11 @@ import (
 // session-end cleanup can undo exactly that and nothing else. A directory
 // that was already trusted before the seed is in neither list: that trust
 // belongs to someone else (the operator, or another live session).
+//
+// session identifies the owning session for the on-disk ledger
+// (trust_ledger.go): it lets a later daemon sweep tell this live session's
+// entries from a crashed session's, and it is the only per-session identity
+// the ledger carries.
 type seededTrust struct {
 	// path is the trust record the seed wrote.
 	path string
@@ -56,6 +61,12 @@ type seededTrust struct {
 	// and leaves every other field on the entry as found.
 	flipped []string
 	prior   map[string]any
+	// session identifies the owning session (agent.Spec.SessionName, or a
+	// process-scoped fallback when the session is unnamed). Empty means the
+	// seed predates the ledger, or the session declined ownership — the
+	// cleanup still removes exactly dirs/flipped, but the daemon crash
+	// sweep cannot re-home the entry to a live session.
+	session string
 }
 
 // seedWorkspaceTrust records trust for exactly the session's authorized
@@ -73,7 +84,13 @@ func seedWorkspaceTrust(spec agent.Spec) *seededTrust {
 	if err != nil {
 		return nil
 	}
-	return seedTrustFile(filepath.Join(home, claudeTrustFileName), dirs)
+	seed := seedTrustFile(filepath.Join(home, claudeTrustFileName), dirs)
+	if seed == nil {
+		return nil
+	}
+	seed.session = trustLedgerOwner(spec)
+	recordSeededTrustLedger(seed)
+	return seed
 }
 
 // removeSeededTrust undoes what seed changed at session end: entries the
@@ -88,6 +105,7 @@ func removeSeededTrust(seed *seededTrust) {
 	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
 		return
 	}
+	defer forgetSeededTrustLedger(seed)
 	release, ok := acquireTrustLock(seed.path)
 	if !ok {
 		return
