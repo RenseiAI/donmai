@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,10 +58,19 @@ var linearMCPDisallowList = []string{
 //	   --output-format stream-json --verbose \
 //	   --dangerously-skip-permissions \
 //	   --add-dir <cwd> \
+//	   [--settings <routing-pin>] \
 //	   [optional flags...]
 //
 // (--print, --output-format, --verbose are required to enable the JSONL
 // stream that the JSONL parser consumes.)
+//
+// --settings carries ONLY the routing pin (see pinnedRoutingEnv), stated on
+// the layer the CLI resolves above the process environment and above repo
+// settings files: a repo-local harness setting naming a routing var (for
+// example env.ANTHROPIC_BASE_URL) must never redirect the session bearer.
+// The JSON holds no hooks — the headless lane has no notice channel — and
+// is absent entirely when the session carries no routing of its own, so a
+// host-login spawn's argv is byte-identical to before the pin existed.
 //
 // resumeSessionID is empty for fresh spawns; when non-empty it is
 // rendered as `--resume <id>`. v0.5.0 does not exercise this path
@@ -104,6 +114,18 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 		"--output-format", "stream-json",
 		"--verbose",
 		"--dangerously-skip-permissions",
+	}
+	// Routing pin first among the optional flags: it must be present
+	// whenever the session carries routing of its own, on this lane exactly
+	// as on the interactive lane (see spawnInteractive). Host-login sessions
+	// pin nothing and skip the flag entirely.
+	if pin := pinnedRoutingEnv(spec); len(pin) > 0 {
+		if pinJSON, err := marshalRoutingPin(pin); err == nil && pinJSON != "" {
+			argv = append(argv, "--settings", pinJSON)
+		}
+		// A pin that cannot be marshalled (string maps never fail in
+		// practice) still spawns: the process environment the pin mirrors
+		// remains, and failing the spawn would lie about what happened.
 	}
 	if spec.SessionName != "" && resumeSessionID == "" {
 		argv = append(argv, "--name", spec.SessionName)
@@ -199,6 +221,29 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 	// this into cmd.Stdin in handle.go.
 	stdinPrompt = spec.Prompt
 	return argv, stdinPrompt
+}
+
+// marshalRoutingPin renders the routing pin as the --settings JSON string
+// the headless lane passes. Only routingPinEnvNames members are honored —
+// anything else is dropped rather than passed through, so a caller cannot
+// smuggle an unrelated variable onto the CLI's winning layer. The envelope
+// holds no hooks: the headless lane has no notice channel to declare.
+func marshalRoutingPin(pin map[string]string) (string, error) {
+	env := make(map[string]string, len(pin))
+	for k, v := range pin {
+		if _, ok := routingPinEnvNames[k]; !ok || v == "" {
+			continue
+		}
+		env[k] = v
+	}
+	if len(env) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(map[string]any{"env": env})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // additionalWorkdirs returns the ordered --add-dir list for a spawn: the

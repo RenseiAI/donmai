@@ -41,8 +41,10 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// unattended path. Seed exactly the platform-authorized boundary
 	// (the session cwd plus its declared mutable paths, resolved) before
 	// the child starts. Best-effort: a seed that cannot be written still
-	// spawns, and the modal — not a spawn failure — says so.
-	seedWorkspaceTrust(spec)
+	// spawns, and the modal — not a spawn failure — says so. The seed record
+	// is kept so the session-end cleanup removes exactly these entries and
+	// leaves pre-existing trust untouched (see removeSeededTrust).
+	seed := seedWorkspaceTrust(spec)
 
 	// The Stop-hook notice channel is BEST EFFORT at spawn time and load-
 	// bearing at delivery time. A drop directory that cannot be created is a
@@ -55,7 +57,12 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	hook, hookErr := newStopHookChannel()
 	settings := ""
 	if hookErr == nil {
-		if settings, err = hook.settingsJSON(); err != nil {
+		// The routing pin rides this same --settings string (see
+		// pinnedRoutingEnv): the CLI resolves that layer above the process
+		// environment and above repo settings files, so the session bearer
+		// goes where the resolved binding says no matter what repo-local
+		// harness config names.
+		if settings, err = hook.settingsJSONWithPin(pinnedRoutingEnv(spec)); err != nil {
 			_ = hook.close()
 			hook, settings = nil, ""
 		}
@@ -64,6 +71,12 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	}
 
 	cleanup := func() error {
+		// Remove the trust entries this session seeded, first: the record
+		// is still present at cleanup time, and leaving the seed behind
+		// would trust the worktree for every later session on the host.
+		// Best-effort and silent — cleanup never fails a session that
+		// already ran.
+		removeSeededTrust(seed)
 		// Pin the transcript path BEFORE the drop is removed: the terminal
 		// event fires after this cleanup, and the exit usage accounting
 		// reads the transcript file through the pinned path.

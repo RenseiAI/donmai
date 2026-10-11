@@ -38,6 +38,55 @@ const (
 	EnvVertexRegion = "CLOUD_ML_REGION"
 )
 
+// routingPinEnvNames are the CLI routing DESTINATION knobs the session
+// launcher pins AFTER repo-local harness config is applied, so a repo
+// setting can never redirect the session bearer. The pin rides the
+// --settings JSON string donmai itself passes (stophook.go / cli_args.go /
+// oneshot.go): the CLI resolves that layer above the process environment,
+// which in turn sits above repo settings files. Pinning the same
+// destinations the child env already carries keeps every layer pointed at
+// the session's own endpoint — a repo file naming an attacker URL loses to
+// the pin on every layer the CLI honors.
+//
+// Credential VALUES are deliberately NOT pinned: the bearer rides the
+// process environment (never argv), and --settings travels on the process
+// listing — pinning the token there would publish the session bearer to
+// every same-user process. Pinning the destination alone closes the
+// redirect: with the URL fixed, a repo naming its own token only breaks its
+// own auth loudly (the foreign token is invalid at the pinned endpoint),
+// and the session bearer still goes to — and only to — the pinned URL.
+// Name only — never a value; see pinnedRoutingEnv.
+var routingPinEnvNames = map[string]struct{}{
+	EnvBaseURL:      {},
+	EnvUseBedrock:   {},
+	EnvAWSRegion:    {},
+	EnvUseVertex:    {},
+	EnvVertexRegion: {},
+}
+
+// pinnedRoutingEnv returns the routing DESTINATION knobs the session
+// authoritatively carries, for the --settings pin: the subset of the
+// projected child env (see applyEndpoint) that steers where the session's
+// credential goes. A repo-local harness setting naming any of these (for
+// example env.ANTHROPIC_BASE_URL in the repo's settings file) must never
+// change where the bearer goes, so the launcher re-states them on the layer
+// the CLI resolves last. Credential values are never pinned (see
+// routingPinEnvNames). Empty when the session carries no routing of its own
+// (host-login cells): pinning nothing keeps those sessions byte-identical.
+// The returned map is a fresh copy; spec is never mutated.
+func pinnedRoutingEnv(spec agent.Spec) map[string]string {
+	pin := make(map[string]string)
+	for k, v := range spec.Env {
+		if _, ok := routingPinEnvNames[k]; ok && v != "" {
+			pin[k] = v
+		}
+	}
+	if len(pin) == 0 {
+		return nil
+	}
+	return pin
+}
+
 // applyEndpoint projects a resolved Spec.Endpoint binding onto the spec the
 // CLI subprocess actually sees, making the declared claude-code × anthropic
 // matrix cells (direct / bedrock / vertex) actually route:

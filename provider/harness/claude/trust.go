@@ -39,19 +39,90 @@ import (
 // leaves the session to the modal rather than failing the spawn — the modal
 // is the honest signal, a spawn failure would be a lie about what happened.
 
+// seededTrust records what one seedWorkspaceTrust call added, so the
+// session-end cleanup can remove exactly those entries and nothing else.
+type seededTrust struct {
+	// path is the trust record the seed wrote.
+	path string
+	// dirs are the boundary directories the seed recorded.
+	dirs []string
+}
+
 // seedWorkspaceTrust records trust for exactly the session's authorized
 // boundary. It never returns an error: every failure mode is silent, and
 // the session proceeds to the modal it would have seen without the seed.
-func seedWorkspaceTrust(spec agent.Spec) {
+// The returned record names what was seeded so the caller can remove those
+// entries — and only those — at session end (see removeSeededTrust); nil
+// means nothing was seeded and there is nothing to clean up.
+func seedWorkspaceTrust(spec agent.Spec) *seededTrust {
 	dirs := trustBoundaryDirs(spec)
 	if len(dirs) == 0 {
-		return
+		return nil
 	}
 	home, err := claudeConfigHome(spec.Env)
 	if err != nil {
+		return nil
+	}
+	path := filepath.Join(home, claudeTrustFileName)
+	seedTrustFile(path, dirs)
+	return &seededTrust{path: path, dirs: dirs}
+}
+
+// removeSeededTrust removes the trust entries seed added at session end.
+// Pre-existing entries — the operator's own trust, other sessions' seeds —
+// are left untouched, as is a record that can no longer be read or parsed
+// (it is not ours to rewrite) or whose projects field has an unexpected
+// shape. Every failure is silent: cleanup must never fail a session that
+// already ran. A nil seed is a no-op.
+func removeSeededTrust(seed *seededTrust) {
+	if seed == nil || seed.path == "" || len(seed.dirs) == 0 {
 		return
 	}
-	seedTrustFile(filepath.Join(home, claudeTrustFileName), dirs)
+	release, ok := acquireTrustLock(seed.path)
+	if !ok {
+		return
+	}
+	defer release()
+	data, err := os.ReadFile(seed.path) //nolint:gosec // config path, not session input
+	if err != nil {
+		return
+	}
+	var record map[string]any
+	if json.Unmarshal(data, &record) != nil {
+		return
+	}
+	raw := record[claudeTrustProjectsKey]
+	if raw == nil {
+		return
+	}
+	projects, ok := raw.(map[string]any)
+	if !ok {
+		return
+	}
+	for _, dir := range seed.dirs {
+		delete(projects, dir)
+	}
+	body, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(seed.path), ".claude.json.tmp-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, seed.path); err != nil {
+		_ = os.Remove(tmpName)
+	}
 }
 
 // trustBoundaryDirs returns the exact directories trust may be seeded for:

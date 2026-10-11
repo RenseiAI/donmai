@@ -173,7 +173,29 @@ func (c *stopHookChannel) close() error {
 // "a settings JSON file OR a JSON string" and applies ADDITIVELY on top of
 // whichever base layer --setting-sources selects. Declaring only `hooks` here
 // therefore adds this Stop hook without disturbing any other setting.
+//
+// pin carries the session's own routing knobs (see pinnedRoutingEnv), stated
+// on this highest-precedence layer AFTER repo-local harness config is
+// applied: a repo settings file naming a routing var (for example
+// env.ANTHROPIC_BASE_URL) loses to the pin, so the session bearer always
+// goes where the resolved endpoint binding says. Nil/empty pins nothing — a
+// host-login session's settings stay exactly hooks plus the modal answer.
 func (c *stopHookChannel) settingsJSON() (string, error) {
+	return c.settingsJSONWithPin(nil)
+}
+
+// settingsJSONWithPin renders settingsJSON with pin stated under the `env`
+// key. Only routingPinEnvNames members are honored — anything else in pin
+// is dropped rather than passed through, so a caller cannot smuggle an
+// unrelated variable onto the CLI's winning layer.
+func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, error) {
+	env := make(map[string]string)
+	for k, v := range pin {
+		if _, ok := routingPinEnvNames[k]; !ok || v == "" {
+			continue
+		}
+		env[k] = v
+	}
 	settings := map[string]any{
 		// skipDangerousModePermissionPrompt answers the bypass-permissions
 		// acceptance the CLI raises on an interactive TTY before the first
@@ -195,6 +217,9 @@ func (c *stopHookChannel) settingsJSON() (string, error) {
 				},
 			},
 		},
+	}
+	if len(env) > 0 {
+		settings["env"] = env
 	}
 	b, err := json.Marshal(settings)
 	if err != nil {
