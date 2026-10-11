@@ -238,8 +238,13 @@ func TestSeatBudgetShimCommandMatchesDirectWrap(t *testing.T) {
 			t.Errorf("shim wrap succeeded on the %s placement; want refusal (nothing launches unscoped)", placement)
 		}
 	}
-	if err := shimScopeGateError(seatbudget.PlacementNone); err == nil || !strings.Contains(err.Error(), "nothing launches unscoped") {
+	if err := shimScopeGateError(seatbudget.PlacementNone, ""); err == nil || !strings.Contains(err.Error(), "nothing launches unscoped") {
 		t.Errorf("gate error = %v; want the unscoped-launch refusal named", err)
+	}
+	// A permission-denied host names the manager's own refusal line, not
+	// only the placement.
+	if err := shimScopeGateError(seatbudget.PlacementNone, "Failed to start transient scope unit: Interactive authentication required"); err == nil || !strings.Contains(err.Error(), "Interactive authentication required") {
+		t.Errorf("gate error = %v; want the manager's refusal line carried", err)
 	}
 	bare, ok := seatBudgetShimCommandForLaunch(worker, "", enforced, true, seatbudget.PlacementSystemd, false, "darwin")
 	if !ok || strings.Join(bare, " ") != strings.Join(worker, " ") {

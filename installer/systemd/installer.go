@@ -23,6 +23,19 @@
 //	                     Requires root (sudo).
 //	                     Logs visible via `journalctl -u rensei-daemon`.
 //
+// Seat-scope requirement (every shim-owned session launches inside its own
+// transient systemd scope, budget or not — nothing launches unscoped):
+// systemd 252 or newer, plus permission for the daemon user to create a
+// transient scope. A user-scoped install needs a reachable user manager —
+// enable lingering for the daemon user (`loginctl enable-linger <user>`)
+// so it answers without an active session — and its scopes are created on
+// the user bus (`--user`). A system-scoped install creates its scopes on
+// the system bus and needs the manager to permit them there. A host whose
+// manager refuses the scope on every reachable bus reports no backend, so
+// launches are refused up front with the missing backend named; a scope
+// that still fails at launch surfaces the manager's own message on the
+// accept error.
+//
 // Restart contract (exit codes 3 and 4):
 //
 //	The unit file uses SuccessExitStatus=3 so that exit code 3 (the daemon's

@@ -265,14 +265,16 @@ func shimSeatLaunchRecord(id sessionshim.Identity, processEpoch uint64, scope st
 
 // shimScopeProbe is the host facts the shim launch gate and the seat
 // read-back consult. The zero value is production: runtime.GOOS, the live
-// placement and bus probes, and the systemctl read-back. A test sets the
+// placement (presence plus creation-permission) and bus probes, the
+// probe's own refusal line, and the systemctl read-back. A test sets the
 // fields it needs on its own daemon, so suites that run in parallel never
 // share a stub.
 type shimScopeProbe struct {
-	goos       string
-	placement  func() seatbudget.Placement
-	userScope  func() bool
-	readLimits func(scope string, userScope bool) (seatbudget.SeatLimits, bool)
+	goos        string
+	placement   func() seatbudget.Placement
+	userScope   func() bool
+	scopeReason func() string
+	readLimits  func(scope string, userScope bool) (seatbudget.SeatLimits, bool)
 }
 
 func (p shimScopeProbe) hostGOOS() string {
@@ -294,6 +296,17 @@ func (p shimScopeProbe) hostUserScope() bool {
 		return p.userScope()
 	}
 	return seatBudgetLaunchUserScope()
+}
+
+// hostScopeReason reports why the scope placement is unavailable: the
+// manager's own refusal line when the probe was denied, empty when the
+// backend is merely absent. The launch gate folds it into the refusal so
+// the accept error names the reason instead of only the placement.
+func (p shimScopeProbe) hostScopeReason() string {
+	if p.scopeReason != nil {
+		return p.scopeReason()
+	}
+	return seatbudget.ScopeRefusalReason()
 }
 
 func (p shimScopeProbe) readSeatLimits(scope string, userScope bool) (seatbudget.SeatLimits, bool) {
