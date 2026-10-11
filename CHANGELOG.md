@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.72 — 2026-10-11
+
 ### Features
 
 - `agent run` no longer preserves a failed session's worktree by default: once the rescue has archived the session's unpublished work as a patch, the worktree is torn down, so disk use stays bounded to live sessions. Operators who need failed worktrees on disk for post-mortem recovery can opt back in with `keepFailedWorktrees: true` in the daemon configuration (or `--preserve-worktree` for one worker); successful sessions are still always torn down. Sessions without a repository have no checkout for the rescue to archive, so their worktrees are torn down with nothing preserved — opt back in to keep them.
