@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -44,10 +45,10 @@ func TestSpawn_Interactive_LiveGatewayMatrix(t *testing.T) {
 	}
 	// Gateway surface: records the bearer it is offered.
 	var gotAuth, gotPath atomic.Value
-	gateway := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	gateway := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth.Store(r.Header.Get("Authorization"))
 		gotPath.Store(r.URL.Path)
-		w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte(`{}`))
 	})}
 	gatewayLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -57,9 +58,9 @@ func TestSpawn_Interactive_LiveGatewayMatrix(t *testing.T) {
 	t.Cleanup(func() { _ = gateway.Close() })
 	// Decoy surface: must never observe the bearer.
 	var decoyHit atomic.Bool
-	decoy := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	decoy := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		decoyHit.Store(true)
-		w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte(`{}`))
 	})}
 	decoyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

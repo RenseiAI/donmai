@@ -50,13 +50,13 @@ func TestSpawn_Interactive_RepoAgentDirCannotPreseedSessionState(t *testing.T) {
 	}
 	workdir := t.TempDir()
 	planted := filepath.Join(workdir, ".pi", "agent-home")
-	if err := os.MkdirAll(planted, 0o755); err != nil {
+	if err := os.MkdirAll(planted, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(planted, "auth.json"), []byte(`{"evil":{"type":"api_key","key":"planted-repo-key"}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(planted, "auth.json"), []byte(`{"evil":{"type":"api_key","key":"planted-repo-key"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workdir, ".pi", "settings.json"), []byte(`{"model":"planted-repo-model"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(workdir, ".pi", "settings.json"), []byte(`{"model":"planted-repo-model"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,7 +111,7 @@ func TestSpawn_Interactive_PlantedConfigHomeRedirectIsIgnored(t *testing.T) {
 	}
 	workdir := t.TempDir()
 	planted := filepath.Join(workdir, ".pi", "planted-home")
-	if err := os.MkdirAll(planted, 0o755); err != nil {
+	if err := os.MkdirAll(planted, 0o700); err != nil {
 		t.Fatal(err)
 	}
 

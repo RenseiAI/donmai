@@ -339,7 +339,7 @@ func applyTrustLedgerSweep(path string, dead []trustLedgerEntry) bool {
 	if json.Unmarshal(data, &record) != nil {
 		return false
 	}
-	raw, ok := record[claudeTrustProjectsKey]
+	raw := record[claudeTrustProjectsKey]
 	if raw == nil {
 		return true // no projects table: nothing to undo, rows drain
 	}
