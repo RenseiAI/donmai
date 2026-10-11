@@ -166,6 +166,16 @@ type Options struct {
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
 
+	// TrustLedgerSweeper undoes seeded workspace-trust entries whose owning
+	// session is no longer live, once per Start, after shim adoption and
+	// before registration — see sweepSeededTrustLedger. Nil (the default
+	// every Start call gets unless a caller sets this field) makes the
+	// sweep step a no-op. Only the production entry point
+	// (afcli/daemon_run.go) sets it, to
+	// providerclaude.SweepSeededTrustForConfigHome, so a daemon built for
+	// real operator use always sweeps; a daemon built for a test never does.
+	TrustLedgerSweeper TrustLedgerSweepFunc
+
 	// QuotaProbeBinaries names the harness CLIs the live quota probes
 	// shell out to, keyed by harness ("codex", "claude" — see
 	// agent.UsageHarnessCodex / agent.UsageHarnessClaude). Empty (the
@@ -1388,6 +1398,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
+	// Undo seeded workspace trust whose owning session died before its
+	// cleanup ran. Runs after adoption so live sessions' ledger rows are
+	// protected, and never fails startup — see sweepSeededTrustLedger.
+	d.sweepSeededTrustLedger(ctx)
 	// A refused startup founding stands the composition down above, so this
 	// second registration runs exactly when the daemon presents no composed
 	// attestation: either it never did, or its founder was refused and it
