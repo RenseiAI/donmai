@@ -172,7 +172,16 @@ func (r *CredentialRefresher) UpdateRegistrationToken(token string) {
 	r.mu.Unlock()
 }
 
-// Reregister sends the latest project declaration and publishes the resulting
+// Registration returns a copy of the registration this refresher presents
+// on the next refresh or re-registration: the orchestrator URL (the running
+// identity's control plane) and the current registration token generation.
+// A config watcher compares both before adopting a rotated token, so a
+// token for a different control plane is refused instead of presented.
+func (r *CredentialRefresher) Registration() (token, orchestratorURL string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.opts.Registration.RegistrationToken, r.opts.Registration.OrchestratorURL
+}
 // identity to every credential lane. It is serialized with both ordinary
 // refresh and session-shim declaration operations.
 func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResult, error) {

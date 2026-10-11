@@ -413,3 +413,216 @@ func TestOnYamlChanged_UpdatesProjects(t *testing.T) {
 		t.Errorf("d.config.Projects = %+v, want 2 entries with beta", d.config.Projects)
 	}
 }
+
+// TestOnYamlChanged_AdoptsRotatedRegistrationToken pins the live-rotation
+// contract: when the config file carries a new registration token for the
+// same orchestrator, the watcher adopts it into the credential refresher
+// before the re-registration runs, so the reload presents the current
+// generation instead of the revoked boot-time one.
+//
+// Against the pre-change code this test fails: nothing adopts the reloaded
+// token, so the registration request still carries the stale generation.
+func TestOnYamlChanged_AdoptsRotatedRegistrationToken(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var gotAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_rotated", "runtimeToken": "rotated.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	opts.Registration.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			EnabledProjectIDs:       []string{"alpha"},
+			Orchestrator:            OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_before"},
+		},
+		credentials:           credentials,
+		registrationReloadCtx: ctx,
+	}
+	// The reloaded file enables a second project AND carries the rotated key,
+	// the shape a project enable writes.
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha", "beta"},
+		Orchestrator:            OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_rotated"},
+	})
+	if err := credentials.WaitReregister(ctx); err != nil {
+		t.Fatalf("rotated reload registration: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotAuth) == 0 {
+		t.Fatal("project enable with a rotated key made no registration request")
+	}
+	for _, auth := range gotAuth {
+		if auth != "Bearer rsp_live_rotated" {
+			t.Errorf("registration presented %q, want Bearer rsp_live_rotated — the reload used the revoked generation", auth)
+		}
+	}
+	if token, _ := credentials.Registration(); token != "rsp_live_rotated" {
+		t.Errorf("refresher token = %q, want the rotated generation", token)
+	}
+	if d.config.Orchestrator.AuthToken != "rsp_live_rotated" {
+		t.Errorf("stored config token = %q, want the rotated generation", d.config.Orchestrator.AuthToken)
+	}
+}
+
+// TestOnYamlChanged_PureTokenRotationReregisters pins that a rotation with no
+// accompanying project change still triggers a re-registration presenting the
+// new generation. Without this, a key-only file edit is swallowed by the
+// watcher's no-change early return and the daemon keeps the revoked key until
+// the next project edit or restart.
+func TestOnYamlChanged_PureTokenRotationReregisters(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	requests := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		requests <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_rotated", "runtimeToken": "rotated.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	opts.Registration.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			EnabledProjectIDs:       []string{"alpha"},
+			Orchestrator:            OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_before"},
+		},
+		credentials:           credentials,
+		registrationReloadCtx: ctx,
+	}
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha"},
+		Orchestrator:            OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_rotated"},
+	})
+	if err := credentials.WaitReregister(ctx); err != nil {
+		t.Fatalf("pure rotation registration: %v", err)
+	}
+	select {
+	case auth := <-requests:
+		if auth != "Bearer rsp_live_rotated" {
+			t.Errorf("registration presented %q, want Bearer rsp_live_rotated", auth)
+		}
+	case <-ctx.Done():
+		t.Fatal("pure token rotation made no registration request")
+	}
+}
+
+// TestOnYamlChanged_RefusesTokenForADifferentOrchestrator pins the adoption
+// guard: a token arriving alongside a changed orchestrator URL is refused —
+// the previous generation stays in place and the stored config keeps the old
+// key, because a re-home is a restart-level change the watcher never applies.
+func TestOnYamlChanged_RefusesTokenForADifferentOrchestrator(t *testing.T) {
+	t.Parallel()
+
+	opts := testRefresherOptions(t, "https://orchestrator.example.test", "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			Orchestrator: OrchestratorConfig{URL: "https://orchestrator.example.test", AuthToken: "rsp_live_before"},
+		},
+		credentials: credentials,
+	}
+	d.onYamlChanged(&Config{
+		Orchestrator: OrchestratorConfig{URL: "https://elsewhere.example.test", AuthToken: "rsp_live_foreign"},
+	})
+	if token, _ := credentials.Registration(); token != "rsp_live_before" {
+		t.Errorf("refresher token = %q, want the previous generation kept", token)
+	}
+	if d.config.Orchestrator.AuthToken != "rsp_live_before" {
+		t.Errorf("stored config token = %q, want the previous generation kept", d.config.Orchestrator.AuthToken)
+	}
+}
+
+// TestOnYamlChanged_RefusesForeignShapedToken pins the second adoption guard:
+// a non-blank value without the platform's registration-token shape is never
+// adopted mid-flight — the previous generation stays so a mis-edited file
+// cannot strand the daemon on a credential the control plane will refuse.
+func TestOnYamlChanged_RefusesForeignShapedToken(t *testing.T) {
+	t.Parallel()
+
+	opts := testRefresherOptions(t, "https://orchestrator.example.test", "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			Projects:     []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}},
+			Orchestrator: OrchestratorConfig{URL: "https://orchestrator.example.test", AuthToken: "rsp_live_before"},
+		},
+		credentials: credentials,
+	}
+	d.onYamlChanged(&Config{
+		Projects:     []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}, {ID: "beta", Repository: "github.com/x/beta"}},
+		Orchestrator: OrchestratorConfig{URL: "https://orchestrator.example.test", AuthToken: "operator-pasted-wrong-value"},
+	})
+	if token, _ := credentials.Registration(); token != "rsp_live_before" {
+		t.Errorf("refresher token = %q, want the previous generation kept", token)
+	}
+	if d.config.Orchestrator.AuthToken != "rsp_live_before" {
+		t.Errorf("stored config token = %q, want the previous generation kept", d.config.Orchestrator.AuthToken)
+	}
+	if len(d.config.Projects) != 2 {
+		t.Errorf("projects = %+v, want the project half of the reload to still apply", d.config.Projects)
+	}
+}
+
+// TestOnYamlChanged_IgnoresUnchangedToken pins that an identical token is a
+// no-op for the refresher: the watcher must not churn the registration when
+// the file is rewritten with the same key.
+func TestOnYamlChanged_IgnoresUnchangedToken(t *testing.T) {
+	t.Parallel()
+
+	opts := testRefresherOptions(t, "https://orchestrator.example.test", "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.RegistrationToken = "rsp_live_same"
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			Projects:     []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}},
+			Orchestrator: OrchestratorConfig{URL: "https://orchestrator.example.test", AuthToken: "rsp_live_same"},
+		},
+		credentials: credentials,
+	}
+	d.onYamlChanged(&Config{
+		Projects:     []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}, {ID: "beta", Repository: "github.com/x/beta"}},
+		Orchestrator: OrchestratorConfig{URL: "https://orchestrator.example.test", AuthToken: "rsp_live_same"},
+	})
+	if token, _ := credentials.Registration(); token != "rsp_live_same" {
+		t.Errorf("refresher token = %q, want the unchanged generation", token)
+	}
+}
