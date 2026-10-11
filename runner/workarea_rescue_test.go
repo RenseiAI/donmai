@@ -1,12 +1,20 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // onlyRescuePatch returns the single archived patch under dir, failing the
@@ -176,7 +184,10 @@ func TestPreserveUnpublishedWork_ReportsAnArchiveItCannotWrite(t *testing.T) {
 
 // TestRun_TeardownKeepsAWorkareaWhoseWorkCannotBePreserved pins Run's side of
 // the fail-closed rule: when the rescue cannot archive uncommitted work, the
-// completed session's worktree is kept rather than deleted.
+// completed session's worktree is kept rather than deleted. The failed
+// variants pin the same guard on the teardown paths this change opens:
+// a crashed headless session and a failed terminal session whose rescue
+// directory is unusable both keep their worktrees.
 func TestRun_TeardownKeepsAWorkareaWhoseWorkCannotBePreserved(t *testing.T) {
 	blocked := filepath.Join(t.TempDir(), "not-a-directory")
 	writeFile(t, filepath.Dir(blocked), filepath.Base(blocked), "a file where the rescue directory should go\n")
@@ -195,6 +206,32 @@ func TestRun_TeardownKeepsAWorkareaWhoseWorkCannotBePreserved(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(res.WorktreePath, "work.txt")); got != "uncommitted\n" {
 		t.Fatalf("work.txt = %q; want the uncommitted work kept in place", got)
+	}
+}
+
+// TestRun_FailedSessionKeepsAWorkareaWhoseWorkCannotBePreserved pins the
+// fail-closed guard on the failed headless path: a crashed session whose
+// rescue directory cannot be written keeps its worktree instead of
+// deleting unpublished work no patch preserves.
+func TestRun_FailedSessionKeepsAWorkareaWhoseWorkCannotBePreserved(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	writeFile(t, filepath.Dir(blocked), filepath.Base(blocked), "a file where the rescue directory should go\n")
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:     "development",
+		skipSteering: true,
+		teardown:     true,
+		rescueDir:    blocked,
+		turns: []verdictScriptTurn{{
+			files: map[string]string{"work.txt": "uncommitted\n"},
+			text:  "Still working on it.",
+			crash: true,
+		}},
+	})
+	if res.Status != "failed" {
+		t.Fatalf("Status = %q (%s: %s); want failed", res.Status, res.FailureMode, res.Error)
+	}
+	if got := readFile(t, filepath.Join(res.WorktreePath, "work.txt")); got != "uncommitted\n" {
+		t.Fatalf("work.txt = %q; want the unpreserved work kept in place", got)
 	}
 }
 
@@ -305,5 +342,195 @@ func TestPreserveUnpublishedWork_KeepsTheNewestArchivesPerSession(t *testing.T) 
 	}
 	if got := len(rescuePatches(t, filepath.Join(r.rescueDir, "test-session-OTHER"))); got != 1 {
 		t.Errorf("another session's archives = %d; want its 1 untouched", got)
+	}
+}
+
+// TestRun_FailedSessionTearsDownWorktreeAfterRescue pins the no-preserve
+// path end to end through Run: a failed session's unpublished work is
+// archived to the rescue directory first, and only then is the worktree
+// removed. The preserved variant pins the other side: with preservation
+// on, the same failed session keeps its worktree for post-mortem.
+func TestRun_FailedSessionTearsDownWorktreeAfterRescue(t *testing.T) {
+	t.Run("teardown", func(t *testing.T) {
+		rescueDir := t.TempDir()
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:     "development",
+			skipSteering: true,
+			teardown:     true,
+			rescueDir:    rescueDir,
+			turns: []verdictScriptTurn{{
+				files: map[string]string{"work.txt": "uncommitted\n"},
+				text:  "Still working on it.",
+				crash: true,
+			}},
+		})
+		if res.Status != "failed" {
+			t.Fatalf("Status = %q (%s: %s); want failed", res.Status, res.FailureMode, res.Error)
+		}
+		if res.WorktreePath == "" {
+			t.Fatal("failed session has no worktree path")
+		}
+		// The rescue runs before the teardown: the patch carries the work
+		// the crashed session left uncommitted.
+		patch := onlyRescuePatch(t, rescueDir)
+		if body := readFile(t, patch); !strings.Contains(body, "work.txt") {
+			t.Errorf("rescue patch does not carry the uncommitted work.txt")
+		}
+		if _, err := os.Stat(res.WorktreePath); !os.IsNotExist(err) {
+			t.Fatalf("worktree stat err = %v; want the failed session's worktree torn down", err)
+		}
+	})
+	t.Run("preserved", func(t *testing.T) {
+		rescueDir := t.TempDir()
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:     "development",
+			skipSteering: true,
+			rescueDir:    rescueDir,
+			turns: []verdictScriptTurn{{
+				files: map[string]string{"work.txt": "uncommitted\n"},
+				text:  "Still working on it.",
+				crash: true,
+			}},
+		})
+		if res.Status != "failed" {
+			t.Fatalf("Status = %q (%s: %s); want failed", res.Status, res.FailureMode, res.Error)
+		}
+		if got := readFile(t, filepath.Join(res.WorktreePath, "work.txt")); got != "uncommitted\n" {
+			t.Fatalf("work.txt = %q; want the failed session's work kept in place", got)
+		}
+		if patches := rescuePatches(t, rescueDir); len(patches) != 0 {
+			t.Fatalf("rescue patches = %v; want none when the worktree is preserved", patches)
+		}
+	})
+}
+
+// TestRun_ReenteredSessionRescuesWorkCommittedBeforeReentry pins the
+// re-entry base through the production Run entry point: the first attempt
+// commits work without pushing, the second attempt re-enters the same
+// generation on a shared worktree manager and crashes, and the teardown's
+// rescue patch still carries the first attempt's commit. Without reseeding
+// the base from the generation's declared resolved ref, the patch would
+// measure from the re-entry HEAD and the earlier commit would be deleted
+// with the worktree.
+func TestRun_ReenteredSessionRescuesWorkCommittedBeforeReentry(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	bare := githubRepositoryFixture(t, "https://github.com/example/reentry-repo")
+	_ = bare
+	declaration := &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: "https://github.com/example/reentry-repo"}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+		},
+	}
+	workareaCaps := &agent.HarnessCaps{
+		MultiRepositoryWorkareaProtocols: []string{string(workarea.ProtocolSessionRootV1)},
+		RepositoryAuthorityEnforcement:   string(workarea.RepositoryAuthorityIsolatedReadOnlyV1),
+		SupportsReadOnlySelectedCWD:      true,
+	}
+	sharedParent := t.TempDir()
+	rescueDir := t.TempDir()
+	platform := newRecordingPlatformServer(t)
+	newRunner := func(turns []verdictScriptTurn, preserveAlways bool) (*Runner, *verdictScriptProvider) {
+		t.Helper()
+		base, err := stub.New()
+		if err != nil {
+			t.Fatalf("stub.New: %v", err)
+		}
+		harness, ok := base.(agent.HarnessProvider)
+		if !ok {
+			t.Fatal("stub provider is not a HarnessProvider")
+		}
+		provider := &verdictScriptProvider{HarnessProvider: harness, t: t, turns: turns, workareaCaps: workareaCaps}
+		manager, err := worktree.NewManager(worktree.Options{ParentDir: sharedParent})
+		if err != nil {
+			t.Fatalf("worktree.NewManager: %v", err)
+		}
+		poster, err := result.NewPoster(result.Options{
+			PlatformURL: platform.URL, WorkerID: "worker-1", AuthToken: "tok",
+			HTTPClient: platform.Client(), BaseDelay: 1,
+		})
+		if err != nil {
+			t.Fatalf("result.NewPoster: %v", err)
+		}
+		reg := NewRegistry()
+		if err := reg.Register(provider); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		r, err := New(Options{
+			Registry: reg, WorktreeManager: manager, Poster: poster,
+			HTTPClient: platform.Client(), SkipBackstop: true, SkipPostSession: true,
+			PreserveWorktreeAlways: preserveAlways,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		r.skipSteering = true
+		r.rescueDir = rescueDir
+		r.providerRetryBackoff = func(int) time.Duration { return 0 }
+		return r, provider
+	}
+	queuedWork := func() QueuedWork {
+		qw := QueuedWork{
+			QueuedWork:      queuedWorkBase("REENTRY"),
+			WorkerID:        "worker-1",
+			AuthToken:       "tok",
+			PlatformURL:     platform.URL,
+			ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+		}
+		qw.SessionID = "test-session-REENTRY"
+		qw.RepositoryDeclaration = declaration
+		qw.Repository = "https://github.com/example/reentry-repo"
+		return qw
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// First attempt: provisions fresh, leaves uncommitted work, keeps the
+	// worktree.
+	first, _ := newRunner([]verdictScriptTurn{{
+		files: map[string]string{"attempt1.txt": "first attempt work\n"},
+		text:  "Stopping here.",
+	}}, true)
+	res1, err := first.Run(ctx, queuedWork())
+	if err != nil && res1 == nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if res1.WorktreePath == "" {
+		t.Fatal("first attempt has no worktree path")
+	}
+	// The agent's first attempt commits locally without pushing — exactly
+	// the state a re-entry finds at HEAD. The identity travels as -c
+	// flags so the fixture commits with no ambient git identity, as on
+	// CI runners.
+	gitRun(t, res1.WorktreePath, "add", "attempt1.txt")
+	gitRun(t, res1.WorktreePath, "-c", "user.email=test@example.com", "-c", "user.name=test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "first attempt commit")
+	attemptHead := gitRun(t, res1.WorktreePath, "rev-parse", "HEAD")
+
+	// Second attempt: re-enters the same generation on a manager that
+	// already owns it, crashes, and tears down.
+	second, _ := newRunner([]verdictScriptTurn{{
+		files: map[string]string{"attempt2.txt": "second attempt work\n"},
+		text:  "Still working on it.",
+		crash: true,
+	}}, false)
+	res2, err := second.Run(ctx, queuedWork())
+	if err != nil && res2 == nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if res2.Status != "failed" {
+		t.Fatalf("Status = %q (%s: %s); want failed", res2.Status, res2.FailureMode, res2.Error)
+	}
+	patch := onlyRescuePatch(t, rescueDir)
+	body := readFile(t, patch)
+	if !strings.Contains(body, "attempt1.txt") || !strings.Contains(body, "first attempt work") {
+		t.Errorf("rescue patch does not carry the pre-re-entry commit (HEAD %s)", attemptHead)
+	}
+	if !strings.Contains(body, "attempt2.txt") {
+		t.Errorf("rescue patch does not carry the re-entered attempt's work")
+	}
+	if _, err := os.Stat(res2.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("worktree stat err = %v; want the re-entered session's worktree torn down", err)
 	}
 }

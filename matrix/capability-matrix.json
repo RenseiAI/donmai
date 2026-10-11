@@ -4,88 +4,6 @@
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "harnesses": [
     {
-      "name": "antigravity",
-      "humanLabel": "Antigravity",
-      "family": "agent-runtime",
-      "contractAbi": "harness/v2",
-      "capabilities": {
-        "inject": false,
-        "resume": false,
-        "tools": false,
-        "mcp": false,
-        "allowedToolsList": false,
-        "subagents": false,
-        "parentToolUseId": false,
-        "reasoningEffort": false,
-        "oneShot": true,
-        "nativeJsonMode": false,
-        "toolPermissionFormat": "",
-        "streamingTransport": "none",
-        "interactivePty": false,
-        "noticeDelivery": "none",
-        "drives": [
-          "antigravity-oauth"
-        ],
-        "drivesHosts": [
-          "oauth-cli"
-        ],
-        "transport": "pty"
-      },
-      "drives": [
-        "antigravity-oauth"
-      ],
-      "drivesHosts": [
-        "oauth-cli"
-      ],
-      "promptDelivery": [
-        {
-          "id": "antigravity/headless/agy-pty-v1",
-          "mode": "autonomous",
-          "systemDelivery": "unsupported",
-          "baseAppendDelivery": "unsupported",
-          "baseReplaceDelivery": "unsupported",
-          "contextDelivery": "unsupported",
-          "userDelivery": "agy_prompt_flag",
-          "amendmentDelivery": "agy_prompt_flag"
-        }
-      ],
-      "toolLifecycle": [
-        {
-          "id": "antigravity/headless/tool-lifecycle-v1",
-          "mode": "autonomous",
-          "toolPluginDelivery": "unsupported",
-          "mcpDelivery": "unsupported",
-          "nativeToolPolicyDelivery": "unsupported",
-          "permissionConfigDelivery": "unsupported",
-          "mcpToolPolicyDelivery": "unsupported",
-          "toolHookDelivery": "unsupported",
-          "lifecycleDelivery": "coarse_pty_events",
-          "lifecycleFidelity": "coarse",
-          "lifecycleEvents": [
-            "init",
-            "assistant_text",
-            "tool_use",
-            "tool_result",
-            "result",
-            "error"
-          ],
-          "replayDelivery": "unsupported",
-          "replayFidelity": "unsupported",
-          "replayEvents": null,
-          "cleanupDelivery": "handle_stop_and_resource_cleanup",
-          "evidenceTier": "unit_verified",
-          "productionEligible": false
-        }
-      ],
-      "executionSecurity": [
-        {
-          "mode": "autonomous",
-          "toolDenyBaseline": "unavailable",
-          "networkDenyBaseline": "unavailable"
-        }
-      ]
-    },
-    {
       "name": "claude-code",
       "humanLabel": "Claude Code",
       "family": "agent-runtime",
@@ -1391,26 +1309,6 @@
   ],
   "cells": [
     {
-      "harness": "antigravity",
-      "endpoint": "google",
-      "host": "oauth-cli",
-      "protocol": "antigravity-oauth",
-      "transport": "pty",
-      "authModes": [
-        "host-session",
-        "local"
-      ],
-      "bringsOwnAuth": true,
-      "needsApiKey": false,
-      "costModel": "host-subscription",
-      "oneShot": true,
-      "nativeJsonMode": false,
-      "structuredVia": "spawn-collect",
-      "legacyProviderId": "agy-cli",
-      "stability": "stable",
-      "smoked": true
-    },
-    {
       "harness": "claude-code",
       "endpoint": "anthropic",
       "host": "bedrock",
@@ -1729,14 +1627,6 @@
   "denylist": [],
   "legacyAliases": [
     {
-      "providerName": "agy-cli",
-      "cell": {
-        "harness": "antigravity",
-        "endpoint": "google",
-        "host": "oauth-cli"
-      }
-    },
-    {
       "providerName": "claude",
       "cell": {
         "harness": "claude-code",
@@ -1815,12 +1705,6 @@
   "realizations": [],
   "capabilities": [],
   "resumeQualification": [
-    {
-      "harness": "antigravity",
-      "adapterVersion": "antigravity/headless/tool-lifecycle-v1",
-      "mode": "autonomous",
-      "resumeQualified": false
-    },
     {
       "harness": "claude-code",
       "adapterVersion": "claude-code/headless/tool-lifecycle-v1",

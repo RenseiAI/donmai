@@ -15,7 +15,7 @@ import (
 
 // requireShell skips the test on platforms/environments this pty-spawning
 // package's tests cannot run on (mirrors the guard in
-// provider/harness/agycli's handle_test.go).
+// provider/harness/clijsonl's handle_test.go).
 func requireShell(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" {

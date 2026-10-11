@@ -19,7 +19,7 @@ import (
 // ProviderName is the stable identifier for an agent provider family.
 //
 // It mirrors AgentProviderName from the legacy TS port. v0.5.0 ships
-// claude, codex, and stub. Additional families (gemini, agy-cli,
+// claude, codex, and stub. Additional families (gemini,
 // ollama, opencode, jules) extend this enum without breaking the
 // contract.
 //
@@ -34,7 +34,6 @@ const (
 	ProviderCodex    ProviderName = "codex"
 	ProviderStub     ProviderName = "stub" // test-only; deterministic
 	ProviderGemini   ProviderName = "gemini"
-	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key.
 	ProviderOllama   ProviderName = "ollama"
 	ProviderOpenCode ProviderName = "opencode"
 	// ProviderPi is the legacy wire enum for the pi harness (HarnessPi).
@@ -502,7 +501,7 @@ type Spec struct {
 	// (direct/vertex — spawnURL in provider/harness/gemini/gemini.go), and
 	// OpenCode injects a session-scoped generic openai-chat config. All three
 	// honor Endpoint.Model over Spec.Model when set. Harnesses without a read
-	// site (codex / agycli) still intentionally ignore the field.
+	// site (codex) still intentionally ignore the field.
 	//
 	// Declared as a POINTER (not a value) so the json:"endpoint,omitempty"
 	// tag actually omits the field for pre-P1 producers — Go's encoding/json

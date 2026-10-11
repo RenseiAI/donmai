@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -975,7 +976,105 @@ func (d *scriptedDraft) reads() []string {
 // session's pull request (followUpPR) has it as its head.
 const reworkBranch = "feature/rework"
 
-// TestRun_DraftPullRequestIsContinued is the reported failure: the brief asked
+// TestRun_DraftAllowedByPolicyIsDelivered is the reported failure's
+// remedy through the production entry point: under a dispatch-declared
+// draft allowance a draft pull request carrying the run's new commit is
+// delivered — the turn that left only the draft ends the session
+// completed, with no continuation prompt and no draft lookup at all.
+// The new-commit check still applies (see the no-new-commit case
+// below), and without the flag the same draft is continued (see
+// TestRun_DraftPullRequestIsContinued).
+func TestRun_DraftAllowedByPolicyIsDelivered(t *testing.T) {
+	draft := &scriptedDraft{states: []bool{true}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		draft:      draft.lookup,
+		delivery:   &prompt.DeliveryPolicy{AllowDraft: true},
+		turns: []verdictScriptTurn{
+			{
+				files: map[string]string{"fix.txt": "review comments addressed\n"},
+				push:  []string{"refs/heads/" + scriptedSessionBranch, "refs/pull/7/head"},
+				text:  "Pushed the fix to " + followUpPR + ".",
+			},
+			{text: "never reached"},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+	if res.SteeringTriggered {
+		t.Errorf("SteeringTriggered = true; a delivered draft is not nudged")
+	}
+	if got := draft.reads(); len(got) != 0 {
+		t.Errorf("draft reads = %q; want none under a draft allowance", got)
+	}
+}
+
+// TestRun_DraftAllowedByPolicyStillNeedsANewCommit proves the allowance
+// is narrow through the production entry point: a rework run under a
+// draft allowance whose pull request has no new commit since the run
+// started is still continued as undelivered, naming the missing commit.
+func TestRun_DraftAllowedByPolicyStillNeedsANewCommit(t *testing.T) {
+	draft := &scriptedDraft{states: []bool{true}}
+	note := verdictScriptTurn{text: "Read the review on " + followUpPR + "; I will fix the comments next."}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      draft.lookup,
+		delivery:   &prompt.DeliveryPolicy{AllowDraft: true},
+		turns:      append(slices.Repeat([]verdictScriptTurn{note}, 4), verdictScriptTurn{text: "never reached"}),
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
+		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsUnproductive)
+	}
+	if !strings.HasSuffix(res.Error, "the pull request does not deliver the work: no new commit") {
+		t.Errorf("Error = %q; want it to end with the reason, no new commit", res.Error)
+	}
+	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
+	wantContinuations(t, res, DefaultTurnContinuationLimit, 0, true)
+	if got := draft.reads(); len(got) != 0 {
+		t.Errorf("draft reads = %q; want none under a draft allowance", got)
+	}
+}
+
+// TestRun_ReworkMergeAllowedByPolicyIsDelivered proves the merge
+// allowance through the production entry point on the rework path: a
+// rework run whose pull request gained only a merge carrying the run's
+// own resolution is delivered when the dispatch declared it, with no
+// continuation prompt.
+func TestRun_ReworkMergeAllowedByPolicyIsDelivered(t *testing.T) {
+	note := verdictScriptTurn{
+		text: "Merged the base branch into " + followUpPR + ".",
+		during: func(t *testing.T, cwd string) {
+			advanceMainAndMerge(t, cwd, "refs/heads/"+reworkBranch, "refs/pull/7/head")
+			writeFile(t, cwd, "resolved.txt", "resolution\n")
+			gitRun(t, cwd, "add", "resolved.txt")
+			gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
+			gitRun(t, cwd, "push", "-q", "-f", "origin", "HEAD:refs/heads/"+reworkBranch, "HEAD:refs/pull/7/head")
+		},
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      githubPullRequestDraft,
+		delivery:   &prompt.DeliveryPolicy{AllowMergeCommits: true},
+		turns:      []verdictScriptTurn{note, {text: "never reached"}},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+}
+
 // for a draft pull request early, and the turn ended on a progress note with
 // that draft as its only result. The turn is continued with a prompt that
 // names the draft, and once the pull request is ready the work is delivered.
@@ -1473,7 +1572,7 @@ func TestRun_SessionVerdictEndsThePullRequestReRead(t *testing.T) {
 // request a draft says so and reports its turn result, and the session
 // completes instead of being continued to its bound.
 func TestRun_IntentionalDraftVerdictAfterTheDraftPromptCompletes(t *testing.T) {
-	for _, want := range []string{"deliberately needs the pull request to stay a draft", "report your turn result (WORK_RESULT)"} {
+	for _, want := range []string{"deliberately needs the pull request to stay a draft", "report your turn result (WORK_RESULT)", "gh pr ready"} {
 		if !strings.Contains(continueDraftPrompt, want) {
 			t.Fatalf("continueDraftPrompt does not offer the intentional-draft way out (%q):\n%s", want, continueDraftPrompt)
 		}

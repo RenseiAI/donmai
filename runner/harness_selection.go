@@ -621,8 +621,6 @@ func recognizedHarnessToken(token string) (agent.HarnessName, bool) {
 		return agent.HarnessCodex, true
 	case string(agent.HarnessOpenCode):
 		return agent.HarnessOpenCode, true
-	case string(agent.HarnessAntigravity), "agy":
-		return agent.HarnessAntigravity, true
 	case string(agent.HarnessGeminiDirect):
 		return agent.HarnessGeminiDirect, true
 	case string(agent.HarnessOllama):
@@ -672,8 +670,6 @@ func legacyHarnessNameForProvider(name agent.ProviderName) agent.HarnessName {
 		return agent.HarnessClaudeCode
 	case agent.ProviderCodex:
 		return agent.HarnessCodex
-	case agent.ProviderAGYCLI:
-		return agent.HarnessAntigravity
 	case agent.ProviderOpenCode:
 		return agent.HarnessOpenCode
 	case agent.ProviderGemini:
@@ -702,7 +698,7 @@ func legacyHarnessRef(provider agent.Provider) executioncell.HarnessRef {
 
 func explicitHarnessSourceRef(token string) string {
 	switch token {
-	case "claude", "agy", "native", string(legacyRawHarness):
+	case "claude", "native", string(legacyRawHarness):
 		return "legacy-harness:" + token
 	default:
 		// codex and opencode are both live Platform wire values and

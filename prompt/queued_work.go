@@ -97,6 +97,32 @@ type QueuedWork struct {
 	// Absent means today's behaviour, byte for byte.
 	ContinuePullRequest *ContinuePullRequest `json:"continuePullRequest,omitempty"`
 
+	// Delivery is the dispatch-declared delivery policy for the run's
+	// pull request. Nil is today's behaviour, byte for byte. When set,
+	// it records what the dispatcher declared the run's pull request
+	// must carry for the run to count as delivered:
+	//
+	//   - AllowDraft, when true, lets a draft pull request count as
+	//     delivered: the draft check is skipped and every other delivery
+	//     check still applies. The run's own new commit must still be on
+	//     the pull request, and the no-new-commit and code-change rules
+	//     apply unchanged.
+	//   - AllowMergeCommits, when true, lets a merge commit count toward
+	//     delivery: the range inspection treats merges that carry the
+	//     run's own resolution as delivered work instead of requiring a
+	//     non-merge code change. The scratch-path rule still applies, so
+	//     a merge that only carries runner scratch stays undelivered.
+	//
+	// The flag only ever widens what counts as delivered; it never
+	//   narrows it, and a run without the flag behaves exactly as before.
+	//
+	// Wire shape: "delivery" (camelCase, omitempty). Threaded opaquely
+	// through every wire hop so Go's strict JSON decoder never drops the
+	// platform's emit — the v0.9.3 SystemPromptOverride wire-gap
+	// precedent (silent-drop hazard). Old runners ignore the unknown
+	// field; old dispatchers simply never emit it (nil = unchanged).
+	Delivery *DeliveryPolicy `json:"delivery,omitempty"`
+
 	// WorkType is the work-type discriminant (e.g. "development",
 	// "qa", "research"). Drives template selection in [Builder.Build].
 	// Unknown values fall through to the development template.
@@ -379,6 +405,34 @@ type ContinuePullRequest struct {
 	// HeadSha is the head commit the dispatch was decided against.
 	// Required; the runner checks out the branch at exactly this commit.
 	HeadSha string `json:"headSha,omitempty"`
+}
+
+// DeliveryPolicy is the dispatch-declared delivery policy for the run's
+// pull request. Both flags default false; a zero policy behaves exactly
+// like no policy. The policy only ever widens what counts as delivered;
+// it never narrows it. See QueuedWork.Delivery for the wire contract.
+type DeliveryPolicy struct {
+	// AllowDraft, when true, lets a draft pull request count as
+	// delivered: the draft check is skipped and every other delivery
+	// check still applies.
+	AllowDraft bool `json:"allowDraft,omitempty"`
+	// AllowMergeCommits, when true, lets a merge commit count toward
+	// delivery: the range inspection treats merges carrying the run's
+	// own resolution as delivered work. The scratch-path rule still
+	// applies.
+	AllowMergeCommits bool `json:"allowMergeCommits,omitempty"`
+}
+
+// AllowsDraft reports whether the policy lets a draft pull request count
+// as delivered. Nil is today's behaviour: a draft is undelivered.
+func (p *DeliveryPolicy) AllowsDraft() bool {
+	return p != nil && p.AllowDraft
+}
+
+// AllowsMerges reports whether the policy lets a merge commit count
+// toward delivery. Nil is today's behaviour: merges alone do not deliver.
+func (p *DeliveryPolicy) AllowsMerges() bool {
+	return p != nil && p.AllowMergeCommits
 }
 
 // CodeIntelWork is the typed code-intelligence capability block on QueuedWork.

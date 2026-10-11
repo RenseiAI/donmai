@@ -40,7 +40,7 @@ const codeIntelEnforcementUnsupportedSubtype = "code_intel_enforcement_unsupport
 // first. Every other in-tree harness drops this field the same way (see
 // codex/spec_translation.go's own CodeIntelEnforcement note, and the
 // SupportsCodeIntelligenceEnforcement:false comments on claude/gemini/
-// ollama/opencode/agycli); pi previously dropped it with no note at all.
+// ollama/opencode); pi previously dropped it with no note at all.
 func codeIntelEnforcementNote(spec agent.Spec) *SpecFieldNote {
 	if spec.CodeIntelEnforcement == nil {
 		return nil

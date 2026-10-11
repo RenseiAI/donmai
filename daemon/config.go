@@ -79,6 +79,15 @@ type Config struct {
 	// daemon read the same struct (daemon -> runner/access, one-way; no
 	// cycle). Mirrors the Observability optional-block slot above.
 	ModelAccess *access.ModelAccessConfig `yaml:"modelAccess,omitempty" json:"modelAccess,omitempty"`
+	// KeepFailedWorktrees lets an operator keep failed sessions' worktrees
+	// on disk for post-mortem recovery. Absent or false (the default), a
+	// failed, stopped or timed-out session's worktree is torn down once
+	// the rescue has archived its unpublished work as a patch; true states
+	// DONMAI_KEEP_FAILED_WORKTREE in every spawned worker's environment so
+	// `agent run` preserves the worktree instead. Successful sessions are
+	// always torn down; interactive sessions keep their own publication
+	// hold regardless of this setting.
+	KeepFailedWorktrees bool `yaml:"keepFailedWorktrees,omitempty" json:"keepFailedWorktrees,omitempty"`
 	// Workarea holds Layer-3 workarea-surface tunables (archive root,
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.

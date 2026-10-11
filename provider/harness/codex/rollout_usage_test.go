@@ -692,3 +692,51 @@ func TestOpenRolloutFile_RefusesNonRegularFiles(t *testing.T) {
 		t.Fatalf("FIFO totals = %+v, want nil", totals)
 	}
 }
+
+// TestRolloutUsageCost_ParentCycleTerminates pins the bounded ancestry walk:
+// corrupt session_meta that names a thread as its own parent, or two threads
+// as each other's, must not spin the walk forever — it runs inside ptycli
+// run() before cleanup, so a hang there leaves the terminal unsent and the
+// session's resources unreleased. The real session's total is unaffected.
+// Removing the hop bound in subagentThreadIDs turns this red (timeout).
+func TestRolloutUsageCost_ParentCycleTerminates(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	writeRolloutFixture(t, home)
+	writeRolloutFile(t, home, "thread-cycle-a", []string{subagentMetaLine("thread-cycle-a", "thread-cycle-b")})
+	writeRolloutFile(t, home, "thread-cycle-b", []string{subagentMetaLine("thread-cycle-b", "thread-cycle-a")})
+	writeRolloutFile(t, home, "thread-self", []string{subagentMetaLine("thread-self", "thread-self")})
+
+	done := make(chan *agent.CostData, 1)
+	go func() { done <- rolloutUsageCost(home, rolloutFixtureThreadID) }()
+	select {
+	case got := <-done:
+		want := &agent.CostData{InputTokens: 8930, OutputTokens: 1200, CachedInputTokens: 4100, CacheWriteTokens: 70, ReasoningTokens: 116}
+		if got == nil || *got != *want {
+			t.Fatalf("terminal cost = %+v with cyclic metadata present, want %+v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rolloutUsageCost did not return within 5s with a parent cycle in the sessions tree")
+	}
+}
+
+// TestSubagentThreadIDs_ThreadWithTwoFilesCreditedOnce pins the dedupe: a
+// subagent thread that has more than one session file is credited once,
+// never once per file.
+func TestSubagentThreadIDs_ThreadWithTwoFilesCreditedOnce(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	writeRolloutFixture(t, home)
+	dir := filepath.Join(home, codexSessionStateSubdir, "2026", "10", "10")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(dir, "rollout-2026-10-10T00-00-00-"+rolloutFixtureSubID+".jsonl")
+	if err := os.WriteFile(second, []byte(subagentMetaLine(rolloutFixtureSubID, rolloutFixtureThreadID)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := subagentThreadIDs(home, rolloutFixtureThreadID)
+	if len(got) != 1 || got[0] != rolloutFixtureSubID {
+		t.Fatalf("subagents of %q = %v, want exactly [%s]", rolloutFixtureThreadID, got, rolloutFixtureSubID)
+	}
+}

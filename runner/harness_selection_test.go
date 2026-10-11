@@ -64,7 +64,6 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 	providers := []*selectorFakeProvider{
 		{name: agent.ProviderClaude, harness: agent.HarnessClaudeCode},
 		{name: agent.ProviderCodex, harness: agent.HarnessCodex},
-		{name: agent.ProviderAGYCLI, harness: agent.HarnessAntigravity},
 		{name: agent.ProviderOpenCode, harness: agent.HarnessOpenCode},
 		{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect},
 		{name: agent.ProviderOllama, harness: agent.HarnessOllama},
@@ -79,7 +78,6 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 	}{
 		{name: "legacy claude wire", harness: "claude", provider: agent.ProviderClaude, wantProvider: agent.ProviderClaude, wantHarness: "claude-code"},
 		{name: "legacy codex wire", harness: "codex", provider: agent.ProviderCodex, wantProvider: agent.ProviderCodex, wantHarness: "codex"},
-		{name: "legacy agy wire", harness: "agy", provider: agent.ProviderGemini, wantProvider: agent.ProviderAGYCLI, wantHarness: "antigravity"},
 		{name: "legacy opencode wire", harness: "opencode", provider: agent.ProviderOpenCode, wantProvider: agent.ProviderOpenCode, wantHarness: "opencode"},
 		{name: "legacy native gemini wire", harness: "native", provider: agent.ProviderGemini, wantProvider: agent.ProviderGemini, wantHarness: "gemini-direct", wantSource: "legacy-harness:native"},
 		{name: "legacy native ollama wire", harness: "native", provider: agent.ProviderOllama, wantProvider: agent.ProviderOllama, wantHarness: "ollama", wantSource: "legacy-harness:native"},
@@ -90,7 +88,6 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 		{name: "canonical gemini direct ignores contradictory provider", harness: "gemini-direct", provider: agent.ProviderOllama, wantProvider: agent.ProviderGemini, wantHarness: "gemini-direct"},
 		{name: "canonical ollama ignores contradictory provider", harness: "ollama", provider: agent.ProviderGemini, wantProvider: agent.ProviderOllama, wantHarness: "ollama"},
 		{name: "canonical claude manifest id", harness: "claude-code", provider: agent.ProviderGemini, wantProvider: agent.ProviderClaude, wantHarness: "claude-code"},
-		{name: "canonical antigravity manifest id", harness: "antigravity", provider: agent.ProviderGemini, wantProvider: agent.ProviderAGYCLI, wantHarness: "antigravity"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -362,14 +359,14 @@ func TestExplicitHarnessDenialPrecedesAllSideEffects(t *testing.T) {
 	}
 }
 
-// TestRetiredHarnessTokenIsUnknown is the retirement guard: the removed
+// TestRetiredHarnessTokenIsUnknown is the retirement guard: each removed
 // harness token must fail closed as an unknown harness rather than
-// resolving to any registered runtime. "amp" is the literal wire token
-// recognizedHarnessToken used to accept (case string(agent.HarnessAmp)); a
-// generic placeholder token would pass this test whether or not that case
-// were ever restored, so this pins the exact retired string. Restoring the
-// token (or its provider mapping) flips this test red — see the retirement
-// guard revert proof in the PR description.
+// resolving to any registered runtime. "amp" and "agy"/"antigravity" are
+// the literal wire tokens recognizedHarnessToken used to accept; a generic
+// placeholder token would pass this test whether or not those cases were
+// ever restored, so this pins the exact retired strings. Restoring any token
+// (or its provider mapping) flips this test red — see the retirement guard
+// revert proof in the PR description.
 func TestRetiredHarnessTokenIsUnknown(t *testing.T) {
 	t.Parallel()
 	registry := selectorRegistry(t,
@@ -379,6 +376,10 @@ func TestRetiredHarnessTokenIsUnknown(t *testing.T) {
 	for _, profile := range []ResolvedProfile{
 		{Harness: "amp"},
 		{Harness: "amp", Provider: agent.ProviderName("amp")},
+		{Harness: "agy"},
+		{Harness: "agy", Provider: agent.ProviderGemini},
+		{Harness: "antigravity"},
+		{Harness: "antigravity", Provider: agent.ProviderName("agy-cli")},
 		{Harness: "retired-harness"},
 		{Harness: "retired-harness", Provider: "retired-harness"},
 	} {

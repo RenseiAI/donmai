@@ -1107,7 +1107,7 @@ var (
 // enough to hit it. Upstream: golang/go#22315.
 //
 // Writing the file with the exec bit off and chmod-ing after close (the
-// mitigation used in provider/harness/agycli) does not close this window —
+// mitigation used in provider/harness/clijsonl) does not close this window —
 // ETXTBSY is decided by the writer count on the inode at execve time, not by
 // the mode bits at write time. Creating the script before any test starts
 // does close it: after TestMain returns, no writable descriptor to that inode

@@ -91,7 +91,7 @@ type OneShotResult struct {
 //     full agent harness (tool definitions, MCP servers, project memory) and
 //     merely caps its turns. See provider/harness/claude/oneshot.go.
 //
-// The remaining session harnesses (codex, antigravity, opencode, stub) do
+// The remaining session harnesses (codex, opencode, stub) do
 // NOT implement it and ride SpawnComplete; the direct in-box harnesses (Gemini,
 // Ollama) deliver STRICT structured natively by honoring Spec.ResponseSchema
 // inside their existing Spawn — so SpawnComplete already yields native-strict
@@ -119,7 +119,7 @@ func Complete(ctx context.Context, h HarnessProvider, req OneShotRequest) (OneSh
 // onto a OneShotResult. Native-JSON harnesses (raw) override with a direct
 // Complete(); codex stays on this path but threads Spec.ResponseSchema as
 // turn/start outputSchema (native strict); everything else (claude-code,
-// antigravity, opencode, stub) rides this soft path.
+// opencode, stub) rides this soft path.
 //
 // SOFT JSON: when req.ResponseSchema is set, the schema instruction is appended
 // to the prompt and the collected text is run through extractAndValidate. A

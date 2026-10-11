@@ -218,7 +218,7 @@ func codeIntelMCPEntry(root string, ci *prompt.CodeIntelWork) agent.MCPServerCon
 //   - MCP-capable providers (SupportsToolPlugins && AcceptsMcpServerSpec:
 //     claude/codex/gemini) get the six mcp__af-code-intelligence__* FQ tool
 //     names with one-line when-to-use guidance.
-//   - Providers that ignore MCP specs (ollama/opencode/agycli) get Bash-CLI
+//   - Providers that ignore MCP specs (ollama/opencode) get Bash-CLI
 //     fallback guidance (`<brand> code <subcommand>`) — the binary is in-box on
 //     every target — so the capability is still discoverable without an MCP
 //     surface.

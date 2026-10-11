@@ -174,27 +174,35 @@ func (t *interactiveTranscriptTailer) sweep() (events []agent.Event, more bool) 
 		events = append(events, mapInteractiveTranscriptLine(line, t.seen)...)
 		return true
 	}
-	paths, morePaths := t.pendingFiles()
-	for _, path := range paths {
-		st := t.files[path]
+	files, morePaths := t.pendingFiles()
+	for _, file := range files {
+		st := t.files[file.path]
 		if st == nil {
 			st = &interactiveTranscriptFile{}
-			t.files[path] = st
+			t.files[file.path] = st
 		}
-		if st.tail(path, accept) {
+		if st.tail(file.path, file.info, accept) {
 			more = true
 		}
 	}
 	return events, more || morePaths
 }
 
+// pendingTranscript is one transcript the walk found with unread bytes, and
+// the file the walk saw at that path (a regular file inside the state dir).
+type pendingTranscript struct {
+	path string
+	info os.FileInfo
+}
+
 // pendingFiles returns this session's transcripts that have unread bytes,
 // newest modification first, capped at interactiveTranscriptMaxFilesPerSweep
 // (more reports that the cap left some for a later sweep). Baseline files
 // are never candidates.
-func (t *interactiveTranscriptTailer) pendingFiles() (paths []string, more bool) {
+func (t *interactiveTranscriptTailer) pendingFiles() (files []pendingTranscript, more bool) {
 	type candidate struct {
 		path    string
+		info    os.FileInfo
 		modTime time.Time
 	}
 	var candidates []candidate
@@ -213,7 +221,7 @@ func (t *interactiveTranscriptTailer) pendingFiles() (paths []string, more bool)
 		if info.Size() == offset {
 			return
 		}
-		candidates = append(candidates, candidate{path: path, modTime: info.ModTime()})
+		candidates = append(candidates, candidate{path: path, info: info, modTime: info.ModTime()})
 	})
 	sort.Slice(candidates, func(i, j int) bool {
 		if !candidates[i].modTime.Equal(candidates[j].modTime) {
@@ -225,11 +233,11 @@ func (t *interactiveTranscriptTailer) pendingFiles() (paths []string, more bool)
 		candidates = candidates[:interactiveTranscriptMaxFilesPerSweep]
 		more = true
 	}
-	paths = make([]string, 0, len(candidates))
+	files = make([]pendingTranscript, 0, len(candidates))
 	for _, c := range candidates {
-		paths = append(paths, c.path)
+		files = append(files, pendingTranscript{path: c.path, info: c.info})
 	}
-	return paths, more
+	return files, more
 }
 
 // walkInteractiveTranscriptFiles calls fn for every .jsonl file under dir,
@@ -265,15 +273,21 @@ func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.Di
 // is skipped through its newline. tail also reports stopped=true when the
 // read window filled, since more bytes may follow. Best-effort: any IO
 // failure consumes nothing.
-func (st *interactiveTranscriptFile) tail(path string, accept func([]byte) bool) (stopped bool) {
-	//nolint:gosec // G304: path is discovered by walking the session's own state dir.
+//
+// seen is the file the walk found at path. The state dir is writable from
+// inside the session, so between the walk and the open the path (or a
+// directory above it) can be swapped for a symbolic link to a file outside
+// the state dir, which the open would follow. tail reads only when the
+// opened file is that same regular file; anything else consumes nothing.
+func (st *interactiveTranscriptFile) tail(path string, seen os.FileInfo, accept func([]byte) bool) (stopped bool) {
+	//nolint:gosec // G304: path is discovered by walking the session's own state dir; the opened file is checked against the walked one below.
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
-	if err != nil {
+	if err != nil || !info.Mode().IsRegular() || seen == nil || !os.SameFile(seen, info) {
 		return false
 	}
 	if info.Size() < st.offset {
@@ -385,13 +399,15 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 		}
 		if msg.Usage != nil {
 			out = append(out, agent.LlmCallEvent{
-				System:          msg.Provider,
-				Model:           msg.Model,
-				InputTokens:     int64(msg.Usage.Input),
-				OutputTokens:    int64(msg.Usage.Output),
-				UsageSource:     agent.LlmUsageProvider,
-				ObservedCostUsd: transcriptCost(msg.Usage.Cost.Total),
-				TurnCompleted:   true,
+				System:            msg.Provider,
+				Model:             msg.Model,
+				InputTokens:       transcriptTokens(msg.Usage.Input),
+				OutputTokens:      transcriptTokens(msg.Usage.Output),
+				CachedInputTokens: transcriptTokens(msg.Usage.CacheRead),
+				CacheWriteTokens:  transcriptTokens(msg.Usage.CacheWrite),
+				UsageSource:       agent.LlmUsageProvider,
+				ObservedCostUsd:   transcriptCost(msg.Usage.Cost.Total),
+				TurnCompleted:     true,
 			})
 		}
 		return out
@@ -420,7 +436,9 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 // content parts carry {"type":"text","text"} or
 // {"type":"toolCall","id","name","arguments"}; tool results arrive as
 // role:"toolResult" with text content parts; per-turn usage rides the
-// assistant message.
+// assistant message in pi's own usage shape ({input, output, cacheRead,
+// cacheWrite}, with input already excluding both cache buckets — the same
+// shape the headless turn_end mapper reads).
 type interactiveTranscriptMessage struct {
 	Role    string `json:"role"`
 	Content []struct {
@@ -436,12 +454,31 @@ type interactiveTranscriptMessage struct {
 	Provider   string `json:"provider"`
 	Model      string `json:"model"`
 	Usage      *struct {
-		Input  float64 `json:"input"`
-		Output float64 `json:"output"`
-		Cost   struct {
+		Input      float64 `json:"input"`
+		Output     float64 `json:"output"`
+		CacheRead  float64 `json:"cacheRead"`
+		CacheWrite float64 `json:"cacheWrite"`
+		Cost       struct {
 			Total *float64 `json:"total"`
 		} `json:"cost"`
 	} `json:"usage"`
+}
+
+// transcriptTokenLimit is the largest token count a transcript can carry
+// exactly: pi writes JSON numbers from a JavaScript runtime, whose integers
+// are exact only up to 2^53. A larger count is not a real token count.
+const transcriptTokenLimit = 1 << 53
+
+// transcriptTokens converts one transcript token count. A count no model
+// call produces — negative, or beyond transcriptTokenLimit (where the plain
+// float-to-int conversion is also platform-dependent) — maps to -1, which
+// the runner's usage meter refuses, so the session's usage reads as
+// unreported rather than as a wrong number.
+func transcriptTokens(n float64) int64 {
+	if n < 0 || n > transcriptTokenLimit {
+		return -1
+	}
+	return int64(n)
 }
 
 // transcriptCost mirrors the headless observedPiCost guard: only a finite,

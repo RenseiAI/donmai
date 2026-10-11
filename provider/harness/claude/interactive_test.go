@@ -310,7 +310,7 @@ func TestInteractiveArgs_PromptIsAlwaysLast(t *testing.T) {
 
 // newFakeInteractiveProvider builds a Provider whose binary is a fake-claude
 // script, run under a real PTY by ptycli. Mirrors the PATH-shim technique in
-// provider/harness/agycli's handle_test.go newFakeProvider.
+// provider/harness/clijsonl's handle_test.go.
 func newFakeInteractiveProvider(t *testing.T, script string) *Provider {
 	t.Helper()
 	if runtime.GOOS == "windows" {

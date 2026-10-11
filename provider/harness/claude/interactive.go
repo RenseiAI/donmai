@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
@@ -55,6 +56,12 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	}
 
 	cleanup := func() error {
+		// Pin the transcript path BEFORE the drop is removed: the terminal
+		// event fires after this cleanup, and the exit usage accounting
+		// reads the transcript file through the pinned path.
+		if hook != nil {
+			hook.snapshotTranscriptPath()
+		}
 		errs := []error{clijsonl.RemoveMCPConfig(mcpPath)}
 		if hook != nil {
 			errs = append(errs, hook.close())
@@ -70,7 +77,113 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if hook == nil {
 		return h, nil
 	}
-	return &interactiveHandle{Handle: h, notices: hook}, nil
+	return wrapInteractiveHandle(h, hook), nil
+}
+
+// interactiveEventSlots sizes the wrapped handle's event channel. The coarse
+// events — InitEvent and the terminal ResultEvent — always have a reserved
+// slot, so their blocking sends complete even when nobody drains Events.
+// Transcript usage only ever fills the remaining slots, and is dropped (never
+// queued) once they are taken.
+const (
+	interactiveCoarseEventSlots = 2
+	interactiveUsageEventSlots  = 64
+)
+
+// wrapInteractiveHandle adds the Stop-hook pull channel and the transcript
+// usage tail to a spawned PTY handle. The usage tail reads the session's own
+// transcript — located through the hook's durable locator — and maps each new
+// assistant message.usage to an LlmCallEvent, so per-turn usage reaches the
+// runner's activity sink live; the terminal ResultEvent carries the deduped
+// session totals instead of the PTY's costless one.
+//
+// Ordering: usage the child wrote on its way out can only be read after
+// InteractiveSession().Done closes, so the final flush is enqueued strictly
+// after Done. ActivityFlushed closes once that flush is enqueued, and the
+// terminal ResultEvent is forwarded only after it.
+//
+// Teardown: every helper goroutine returns at session end whether or not the
+// caller drains Events — the tailer stops on Done and never blocks, and the
+// coarse sends always fit the reserved slots — after which Events closes.
+func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactiveHandle {
+	w := &interactiveHandle{
+		Handle:          h,
+		notices:         hook,
+		events:          make(chan agent.Event, interactiveCoarseEventSlots+interactiveUsageEventSlots),
+		activityFlushed: make(chan struct{}),
+		finished:        make(chan struct{}),
+	}
+	session := h.InteractiveSession()
+	// emit forwards one usage event best-effort. Only the tailer goroutine
+	// calls it, and it never takes a slot reserved for the coarse events:
+	// with at most interactiveCoarseEventSlots coarse sends over the handle's
+	// life, the coarse senders below can never block on a channel usage
+	// events filled. When the consumer is slow the event is dropped rather
+	// than blocking the tailer behind the terminal.
+	emit := func(ev agent.Event) {
+		if len(w.events) >= cap(w.events)-interactiveCoarseEventSlots {
+			return
+		}
+		select {
+		case w.events <- ev:
+		default:
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for event := range h.Events() {
+			if result, terminal := event.(agent.ResultEvent); terminal {
+				// ptycli sends the result strictly after Done; the tailer's
+				// final flush, which also starts at Done, goes first.
+				<-w.activityFlushed
+				w.events <- withTranscriptCost(result, hook)
+				continue
+			}
+			w.events <- event
+		}
+	}()
+	// Transcript usage tail: while the session runs, its JSONL transcript is
+	// tailed and each new assistant message.usage is forwarded as the same
+	// LlmCallEvent the headless lane emits, so an interactive session's
+	// spend reaches the session activity stream. Best-effort and
+	// rate-limited (see interactive_usage.go). It stops when the PTY child
+	// has exited and drained, after one final flush of trailing writes.
+	go func() {
+		defer wg.Done()
+		defer close(w.activityFlushed)
+		tailer := newInteractiveUsageTailer(hook)
+		tailer.run(session.Done(), emit)
+	}()
+	go func() {
+		wg.Wait()
+		close(w.events)
+		close(w.finished)
+	}()
+	return w
+}
+
+// withTranscriptCost replaces a costless terminal ResultEvent with one
+// carrying the session's deduped transcript totals. A transcript that cannot
+// be read — the hook never fired, the file never materialized — leaves the
+// event untouched: no usage is reported, never a failure.
+func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.Event {
+	if result.Cost != nil || hook == nil {
+		return result
+	}
+	total, err := hook.exitUsage()
+	if err != nil || total == (agent.CostData{}) {
+		return result
+	}
+	result.Cost = &agent.CostData{
+		InputTokens:       total.InputTokens,
+		OutputTokens:      total.OutputTokens,
+		CachedInputTokens: total.CachedInputTokens,
+		CacheWriteTokens:  total.CacheWriteTokens,
+		NumTurns:          total.NumTurns,
+	}
+	return result
 }
 
 // interactiveHandle adds the Stop-hook pull channel to the shared PTY handle.
@@ -78,19 +191,44 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 // Embedding *ptycli.Handle rather than reimplementing it keeps agent.Handle and
 // agent.InteractiveCapable behaviour byte-identical to every other interactive
 // harness; the only thing this type adds is the door the runner delivers
-// through.
+// through, plus the session's own transcript usage at exit (the REPL has no
+// stream-json wire, so without it an interactive session would end with no
+// cost). Events carries the coarse Init/Result contract plus per-turn usage
+// tailed from the session's transcript; the terminal ResultEvent carries the
+// deduped session totals.
 type interactiveHandle struct {
 	*ptycli.Handle
 	notices *stopHookChannel
+	events  chan agent.Event
+	// activityFlushed closes once the transcript tailer has enqueued its
+	// final flush (or given up on a full channel) and returned.
+	activityFlushed chan struct{}
+	// finished closes after events is closed, i.e. once every helper
+	// goroutine has returned.
+	finished chan struct{}
 }
 
 var (
-	_ agent.InteractiveCapable   = (*interactiveHandle)(nil)
-	_ agent.NoticeChannelCapable = (*interactiveHandle)(nil)
+	_ agent.InteractiveCapable         = (*interactiveHandle)(nil)
+	_ agent.NoticeChannelCapable       = (*interactiveHandle)(nil)
+	_ agent.InteractiveActivityFlusher = (*interactiveHandle)(nil)
 )
 
 // NoticeChannel returns this session's Stop-hook channel.
 func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notices }
+
+// Events overrides ptycli.Handle.Events with the coarse Init/Result contract
+// plus per-turn usage tailed from the session's own transcript (the runner
+// forwards LlmCallEvents through its activity sink) and, after Done, the
+// final flush plus the cost-bearing terminal ResultEvent. The terminal event
+// is forwarded only after the flush, so a consumer reading to the ResultEvent
+// (or waiting on ActivityFlushed after Done) sees every delivered usage event
+// before the session totals.
+func (h *interactiveHandle) Events() <-chan agent.Event { return h.events }
+
+// ActivityFlushed implements agent.InteractiveActivityFlusher: it closes once
+// the session's final transcript usage has been enqueued on Events.
+func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activityFlushed }
 
 // interactiveArgs builds the argv for claude's own interactive REPL.
 //

@@ -261,7 +261,12 @@ func findThreadRollout(home, threadID string) string {
 // subagentThreadIDs returns the thread ids of every rollout file under home
 // that descends from threadID: files whose session_meta names threadID as
 // the subagent parent, transitively. A file that names no parent, names an
-// unknown parent, or cannot be read contributes nothing.
+// unknown parent, or cannot be read contributes nothing. Each thread is
+// returned at most once (a thread with more than one file is credited once,
+// from the file findThreadRollout picks), and the ancestry walk is bounded:
+// a parent cycle in corrupt metadata (a thread naming itself, or two naming
+// each other) ends the walk instead of spinning forever inside ptycli run()
+// before cleanup.
 func subagentThreadIDs(home, threadID string) []string {
 	if home == "" || threadID == "" {
 		return nil
@@ -274,15 +279,21 @@ func subagentThreadIDs(home, threadID string) []string {
 		if thread == "" {
 			continue
 		}
-		parentOf[thread] = rolloutParentThreadID(path)
-		threads = append(threads, thread)
+		if _, seen := parentOf[thread]; !seen {
+			threads = append(threads, thread)
+		}
+		if parent := rolloutParentThreadID(path); parent != "" || parentOf[thread] == "" {
+			parentOf[thread] = parent
+		}
 	}
 	var out []string
 	for _, thread := range threads {
 		if thread == threadID {
 			continue
 		}
-		for parent := parentOf[thread]; parent != ""; {
+		// At most len(parentOf) hops: any longer chain revisits a thread.
+		hops := 0
+		for parent := parentOf[thread]; parent != "" && hops <= len(parentOf); hops++ {
 			if parent == threadID {
 				out = append(out, thread)
 				break

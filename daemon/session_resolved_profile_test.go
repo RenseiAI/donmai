@@ -16,7 +16,7 @@ func TestSessionResolvedProfile_HarnessRoundTrips(t *testing.T) {
 	t.Parallel()
 
 	in := SessionResolvedProfile{
-		Harness:  "agy",
+		Harness:  "codex",
 		Provider: "gemini",
 		Model:    "gemini-3.1-pro",
 		Endpoint: &SessionEndpointBinding{
@@ -33,7 +33,7 @@ func TestSessionResolvedProfile_HarnessRoundTrips(t *testing.T) {
 	}
 	// The camelCase wire tag must be present so the platform producer and
 	// the runner consumer agree on the key.
-	if !strings.Contains(string(buf), `"harness":"agy"`) {
+	if !strings.Contains(string(buf), `"harness":"codex"`) {
 		t.Fatalf("marshalled JSON missing harness key: %s", buf)
 	}
 
@@ -41,8 +41,8 @@ func TestSessionResolvedProfile_HarnessRoundTrips(t *testing.T) {
 	if err := json.Unmarshal(buf, &out); err != nil {
 		t.Fatalf("unmarshal SessionResolvedProfile: %v", err)
 	}
-	if got := out.Harness; got != "agy" {
-		t.Errorf("Harness round-trip = %q; want %q", got, "agy")
+	if got := out.Harness; got != "codex" {
+		t.Errorf("Harness round-trip = %q; want %q", got, "codex")
 	}
 	if got := out.Provider; got != "gemini" {
 		t.Errorf("Provider round-trip = %q; want %q", got, "gemini")

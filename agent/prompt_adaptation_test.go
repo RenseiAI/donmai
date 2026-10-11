@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/harness/agycli"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -34,7 +33,6 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 		{name: "codex/interactive", manifest: (&codex.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
 		{name: "gemini/raw", manifest: (&gemini.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "ollama", manifest: (&ollama.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
-		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "pi/headless", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "pi/interactive", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
@@ -166,7 +164,7 @@ func TestPromptAdaptation_ReplacementMatrix(t *testing.T) {
 	t.Parallel()
 	manifests := []agent.HarnessManifest{
 		(&claude.Provider{}).Manifest(), (&codex.Provider{}).Manifest(), (&gemini.Provider{}).Manifest(),
-		(&ollama.Provider{}).Manifest(), (&agycli.Provider{}).Manifest(),
+		(&ollama.Provider{}).Manifest(),
 		(&opencode.Provider{}).Manifest(), (&pi.Provider{}).Manifest(), (&shell.Provider{}).Manifest(),
 	}
 	for _, manifest := range manifests {
@@ -233,6 +231,28 @@ func TestRetiredAmpPromptDeliveryKindStaysUnknown(t *testing.T) {
 	_, _, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
 	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
 		t.Fatalf("retired amp_stdin delivery error = %v, want malformed-plan denial", err)
+	}
+}
+
+// TestRetiredAgyPromptDeliveryKindStaysUnknown is the retirement guard for
+// the removed subscription-CLI harness's prompt delivery kind.
+// "agy_prompt_flag" is the literal former PromptDeliveryAgyPromptFlag wire
+// value; a generic "invented" string (as used above) would pass this test
+// whether or not that constant and its knownPromptDelivery case were ever
+// restored, so this pins the exact retired string. Re-adding
+// PromptDeliveryAgyPromptFlag = "agy_prompt_flag" and its case in
+// knownPromptDelivery flips this test red.
+func TestRetiredAgyPromptDeliveryKindStaysUnknown(t *testing.T) {
+	t.Parallel()
+	profile, ok := (&claude.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)
+	if !ok {
+		t.Fatal("claude manifest has no autonomous prompt profile")
+	}
+	profile.UserDelivery = agent.PromptDeliveryKind("agy_prompt_flag")
+	plan := fullPromptPlan()
+	_, _, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
+	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
+		t.Fatalf("retired agy_prompt_flag delivery error = %v, want malformed-plan denial", err)
 	}
 }
 
