@@ -391,6 +391,22 @@ func seedTrustFile(path string, dirs []string) *seededTrust {
 	return seed
 }
 
+// Lock interop: the CLI itself reads and writes this same record — it
+// records trust answers the operator gives at the terminal, and it rewrites
+// the whole file when it does. The seed cannot stop the CLI from writing
+// between the seed's own read and write, and the CLI does not take this
+// lock — so the merge is optimistic: it re-reads under the lock, applies
+// only its own entries, and writes through a temp-file rename, so the
+// worst case is a lost CLI-side update landing in the same window, never a
+// half-written record. The temp-file rename additionally keeps the CLI's
+// own concurrent reader from ever seeing a half-written record, and the
+// lock keeps every harness-side writer (concurrent seeds, live-path
+// cleanups, ledger rows, daemon crash sweeps) serialized with each other.
+// A per-session config home would remove the sharing entirely, but the CLI
+// resolves its home by its own rules (claudeConfigHome) and the child must
+// read the home the seed wrote — so the lock, not isolation, is the
+// coordination.
+//
 // Trust-lock tuning: the seed holds the lock for one small read plus one
 // small write (milliseconds), so a lock older than trustLockStaleAfter can
 // only belong to a dead holder. Bounded retries keep a contended spawn

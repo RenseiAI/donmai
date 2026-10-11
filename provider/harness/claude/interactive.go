@@ -75,7 +75,10 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		// is still present at cleanup time, and leaving the seed behind
 		// would trust the worktree for every later session on the host.
 		// Best-effort and silent — cleanup never fails a session that
-		// already ran.
+		// already ran. The CLI's own writes to the same record ride the
+		// same lock (see trust_ledger.go's interop note): the seed, the
+		// CLI, and this cleanup all serialize through acquireTrustLock,
+		// so no party's merge loses another's entries.
 		removeSeededTrust(seed)
 		// Pin the transcript path BEFORE the drop is removed: the terminal
 		// event fires after this cleanup, and the exit usage accounting
