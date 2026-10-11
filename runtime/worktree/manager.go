@@ -194,6 +194,13 @@ type ProvisionResult struct {
 	OwnerSessionID string
 	// CacheSeedID is correlation only; it never becomes session identity.
 	CacheSeedID string
+	// Reentered reports that this Provision adopted an existing session
+	// generation instead of materializing a fresh checkout: the working
+	// tree already holds a prior attempt's commits. The runner uses it
+	// to seed the rescue base from the generation's declared resolved
+	// ref, so a failed re-entered session's teardown still preserves
+	// work committed before the re-entry.
+	Reentered bool
 	// Repositories maps normalized declared names to their repository paths.
 	// Legacy flat workareas contain only the selected repository when known.
 	// Repositories that were skipped after a failed clone (see
@@ -702,7 +709,19 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 		if retained {
 			return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, existing.workareaRootOrPath())
 		}
-		return m.reenterProvision(spec, mode, *existing)
+		path, err := m.reenterProvision(spec, mode, *existing)
+		if err != nil {
+			return "", err
+		}
+		// Mark the adopted generation so the runner can seed its
+		// rescue base from the declared resolved ref: HEAD already
+		// holds the earlier attempt's commits.
+		m.mu.Lock()
+		if current := m.sessions[spec.SessionID]; current != nil {
+			current.Reentered = true
+		}
+		m.mu.Unlock()
+		return path, nil
 	}
 	if spec.RepositoryDeclaration != nil {
 		restored, found, err := m.restoredSessionResult(spec.SessionID)
@@ -721,6 +740,10 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			if err != nil {
 				return "", err
 			}
+			// Mark the adopted generation so the runner can seed its
+			// rescue base from the declared resolved ref: HEAD already
+			// holds the earlier attempt's commits.
+			restored.Reentered = true
 			m.mu.Lock()
 			m.sessions[spec.SessionID] = restored
 			m.mu.Unlock()

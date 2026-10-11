@@ -187,11 +187,12 @@ func TestReceiverWorkerRotation(t *testing.T) {
 }
 
 // TestReceiverLeaseAcrossGap drives the receiver-lease-across-gap matrix
-// row through the production heartbeat and step-heartbeat entry points:
-// a pulser and an emitter that follow the credential rotation through the
-// credential provider never miss a tick — no strike accrues and every step
-// beat lands. A beat sent with a lapsed bearer is refused: the lease fuse
-// is the only writer after rotation.
+// row against the stub receiver over HTTP: lease refreshes and step beats
+// on the current pair are counted and recorded, a step beat sent with a
+// lapsed bearer after re-registration is refused and not recorded, and a
+// committed terminal turns refresh into stop while its evidence stays
+// stored. The production pulser and emitter following a rotation are
+// driven by TestDaemonReturnsBeforeBearerExpires.
 func TestReceiverLeaseAcrossGap(t *testing.T) {
 	t.Parallel()
 	r := newStubReceiver(t)
@@ -331,7 +332,7 @@ func TestFakeHarnessSpeaksPiRPC(t *testing.T) {
 	if id := handle.SessionID(); id == "" {
 		t.Fatal("SessionID empty after get_state through the fake harness")
 	}
-	// Positive control for TestScopeCreationRefused: a spawned session
+	// Positive control for TestUnrenderableExecutionScopeRefused: a spawned session
 	// marks its start, so that test's absent marker means no harness
 	// process started rather than a marker that is never written.
 	if _, err := os.Stat(started); err != nil {
@@ -624,7 +625,7 @@ func TestFailureMatrixRegistered(t *testing.T) {
 		}
 		seen[c.name] = true
 	}
-	const wantCases = 22
+	const wantCases = 24
 	if len(failureMatrix) != wantCases {
 		t.Fatalf("matrix has %d cases, want %d", len(failureMatrix), wantCases)
 	}
@@ -782,14 +783,15 @@ func prepareRestart(t *testing.T, d *daemon.Daemon) (*afclient.DaemonRestartPref
 	return afclient.NewDaemonClientFromURL("http://" + srv.Addr()).PrepareRestartContext(ctx)
 }
 
-// TestDirectOwnedPlusShimOwnedPreflight drives the
-// direct-owned-plus-shim-owned-preflight matrix row through the production
-// restart-preflight route: while a direct-owned seat is live the preflight
-// refuses with the direct-owned count, and once that seat ends the same
-// route returns prepared (not_required with no scopes) instead of a
-// refusal. The second half proves the refusal counted the direct owner
-// rather than the route being unconditionally closed.
-func TestDirectOwnedPlusShimOwnedPreflight(t *testing.T) {
+// TestDirectOwnedPreflight drives the direct-owned-preflight matrix row
+// through the production restart-preflight route: while a direct-owned seat
+// is live the preflight refuses with the direct-owned count, and once that
+// seat ends the same route returns not_required (no shim-owned seat is
+// live, so there is nothing to prepare) instead of a refusal. The second
+// half proves the refusal counted the direct owner rather than the route
+// being unconditionally closed. The live row with a shim-owned seat beside
+// it, which must end prepared, is direct-owned-plus-shim-owned-preflight.
+func TestDirectOwnedPreflight(t *testing.T) {
 	d := startAcceptanceDaemon(t)
 	acceptDirectSeat(t, d, "direct-preflight-seat")
 
@@ -1006,12 +1008,14 @@ func stepBeatsFrom(t *testing.T, r *stubReceiver, workerID string) int {
 	return n
 }
 
-// TestScopeCreationRefused drives the scope-creation-refused row through
-// the production pi spawn entry point: a session stamping a scoped
-// execution level the pi harness cannot render is refused before spawn
-// with the typed execution_security_unrenderable reason — never launched
-// into a weaker scope as a fallback.
-func TestScopeCreationRefused(t *testing.T) {
+// TestUnrenderableExecutionScopeRefused drives the
+// unrenderable-execution-scope-refused row through the production pi spawn
+// entry point: a session stamping a scoped execution level the pi harness
+// cannot render is refused before spawn with the typed
+// execution_security_unrenderable reason — never launched into a weaker
+// scope as a fallback. It is not the scope-creation-refused row, which is
+// about the seat's transient scope and is recorded by the container lane.
+func TestUnrenderableExecutionScopeRefused(t *testing.T) {
 	bin := buildFakeHarness(t)
 	// Every RPC session process the fake starts appends its PID to this
 	// marker (TestFakeHarnessSpeaksPiRPC is the positive control), so its

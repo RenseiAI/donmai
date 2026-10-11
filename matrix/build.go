@@ -536,14 +536,13 @@ func isCanonicalAuthMode(a agent.AuthMode) bool {
 }
 
 // realProviderNames is the set of ProviderName consts that name a real,
-// implemented provider (8 of them). The platform-reserved name (jules)
+// implemented provider (7 of them). The platform-reserved name (jules)
 // is intentionally absent.
 func realProviderNames() []agent.ProviderName {
 	return []agent.ProviderName{
 		agent.ProviderClaude,
 		agent.ProviderCodex,
 		agent.ProviderGemini,
-		agent.ProviderAGYCLI,
 		agent.ProviderOllama,
 		agent.ProviderOpenCode,
 		agent.ProviderPi,

@@ -794,12 +794,12 @@ func TestDetailToQueuedWork_EndpointBindingBaseURL(t *testing.T) {
 // ResolvedProfile.Harness (the platform catalog loop-driver attribute) is
 // threaded onto the runner's QueuedWork so the runner's harness-native
 // provider selection sees it. The platform models the model as
-// provider="gemini" with harness="agy"; the runner must resolve agy-cli.
+// provider="gemini" with harness="codex"; the runner must resolve codex.
 func TestDetailToQueuedWork_ThreadsHarness(t *testing.T) {
 	d := &daemon.SessionDetail{
 		SessionID: "sess-harness",
 		ResolvedProfile: &daemon.SessionResolvedProfile{
-			Harness:  "agy",
+			Harness:  "codex",
 			Provider: string(agent.ProviderGemini),
 			Model:    "gemini-3.1-pro",
 		},
@@ -808,8 +808,8 @@ func TestDetailToQueuedWork_ThreadsHarness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("detailToQueuedWork: %v", err)
 	}
-	if qw.ResolvedProfile.Harness != "agy" {
-		t.Errorf("Harness = %q; want agy", qw.ResolvedProfile.Harness)
+	if qw.ResolvedProfile.Harness != "codex" {
+		t.Errorf("Harness = %q; want codex", qw.ResolvedProfile.Harness)
 	}
 	if qw.ResolvedProfile.Provider != agent.ProviderGemini {
 		t.Errorf("Provider = %q; want gemini (Harness must not clobber Provider)", qw.ResolvedProfile.Provider)
@@ -817,8 +817,8 @@ func TestDetailToQueuedWork_ThreadsHarness(t *testing.T) {
 }
 
 // TestProviderNameFromDetail_Harness verifies the dispatch log-line helper
-// mirrors the runner's harness-native selection (agy → agy-cli) and keeps
-// the legacy provider=agy-cli alias path working.
+// falls through to the resolved provider: harness tokens are admission
+// input, not display aliases, so the helper never maps them.
 func TestProviderNameFromDetail_Harness(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -826,14 +826,9 @@ func TestProviderNameFromDetail_Harness(t *testing.T) {
 		want    string
 	}{
 		{
-			name:    "harness agy maps to agy-cli over provider",
-			profile: &daemon.SessionResolvedProfile{Harness: "agy", Provider: string(agent.ProviderGemini)},
-			want:    string(agent.ProviderAGYCLI),
-		},
-		{
-			name:    "legacy provider agy-cli without harness",
-			profile: &daemon.SessionResolvedProfile{Provider: string(agent.ProviderAGYCLI)},
-			want:    string(agent.ProviderAGYCLI),
+			name:    "harness does not override provider",
+			profile: &daemon.SessionResolvedProfile{Harness: "codex", Provider: string(agent.ProviderGemini)},
+			want:    string(agent.ProviderGemini),
 		},
 		{
 			name:    "plain claude provider",
@@ -976,23 +971,23 @@ func TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback(t *testing.T) {
 // modelProfile dispatch path is harness-aware in lock-step with the
 // resolvedProfile path. When ONLY modelProfile is present (no
 // resolvedProfile) and it models the model as ProviderID="gemini" with
-// Harness="agy", the bridged QueuedWork.ResolvedProfile must carry Harness
-// so the runner's harness-native selection resolves the agy-cli provider.
+// Harness="codex", the bridged QueuedWork.ResolvedProfile must carry Harness
+// so the runner's harness-native selection resolves the codex provider.
 // Defense-in-depth: the platform writes only resolvedProfile today, so this
 // guards the day it populates modelProfile.
 func TestDetailToQueuedWork_ModelProfileOnlyThreadsHarness(t *testing.T) {
 	d := &daemon.SessionDetail{
 		SessionID:       "sess-mp-harness",
-		IssueIdentifier: "REN-MP-AGY",
+		IssueIdentifier: "sess-mp-harness",
 		Body:            "test body",
 		WorkerID:        "wkr_mp",
 		AuthToken:       "tok_mp",
 		PlatformURL:     "https://app.example.com",
 		// resolvedProfile intentionally absent — only modelProfile drives this.
 		ModelProfile: &daemon.SessionModelProfile{
-			ID:         "mp_agy",
+			ID:         "mp_codex",
 			ProviderID: string(agent.ProviderGemini),
-			Harness:    "agy",
+			Harness:    "codex",
 			Model:      "gemini-3.1-pro",
 		},
 	}
@@ -1000,8 +995,8 @@ func TestDetailToQueuedWork_ModelProfileOnlyThreadsHarness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("detailToQueuedWork: %v", err)
 	}
-	if qw.ResolvedProfile.Harness != "agy" {
-		t.Errorf("Harness = %q; want agy (modelProfile path must carry harness)", qw.ResolvedProfile.Harness)
+	if qw.ResolvedProfile.Harness != "codex" {
+		t.Errorf("Harness = %q; want codex (modelProfile path must carry harness)", qw.ResolvedProfile.Harness)
 	}
 	// Harness must not clobber Provider — both survive the bridge.
 	if qw.ResolvedProfile.Provider != agent.ProviderGemini {
@@ -1393,7 +1388,7 @@ func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
 	registry := runner.NewRegistry()
 	for _, provider := range []*fakeAdmissionHarnessProvider{
 		{fakeProvider: fakeProvider{name: agent.ProviderClaude}, harness: agent.HarnessClaudeCode},
-		{fakeProvider: fakeProvider{name: agent.ProviderAGYCLI}, harness: agent.HarnessAntigravity},
+		{fakeProvider: fakeProvider{name: agent.ProviderCodex}, harness: agent.HarnessCodex},
 		{fakeProvider: fakeProvider{name: agent.ProviderGemini}, harness: agent.HarnessGeminiDirect},
 		{fakeProvider: fakeProvider{name: agent.ProviderOllama}, harness: agent.HarnessOllama},
 	} {
@@ -1406,7 +1401,6 @@ func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
 		name, harness, provider, want string
 	}{
 		{name: "contradictory claude harness and gemini provider", harness: "claude", provider: "gemini", want: "claude-code"},
-		{name: "agy legacy wire", harness: "agy", provider: "gemini", want: "antigravity"},
 		{name: "native gemini wire", harness: "native", provider: "gemini", want: "gemini-direct"},
 		{name: "native ollama wire", harness: "native", provider: "ollama", want: "ollama"},
 		{name: "raw gemini wire", harness: "raw", provider: "gemini", want: "gemini-direct"},
@@ -2604,6 +2598,187 @@ func TestDetailToQueuedWork_ExecutionSecurity(t *testing.T) {
 			}
 			if qw.ExecutionSecurity == nil || qw.ExecutionSecurity.Levels.FileWrite != tc.wantWrite {
 				t.Fatalf("section = %+v", qw.ExecutionSecurity)
+			}
+		})
+	}
+}
+
+// TestDetailToQueuedWork_DeliveryPolicyForwarded verifies the
+// dispatch-declared delivery policy survives the SessionDetail →
+// runner.QueuedWork translation (the daemon → worker wire hop).
+// Nil stays nil: absent means today's delivery behaviour. Mirrors the
+// DisallowedTools / v0.9.3 SystemPromptOverride precedent.
+func TestDetailToQueuedWork_DeliveryPolicyForwarded(t *testing.T) {
+	plain, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID:       "sess-nodelivery",
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if plain.Delivery != nil {
+		t.Errorf("Delivery = %+v; want nil with no stamped policy", plain.Delivery)
+	}
+
+	queued, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID:       "sess-delivery",
+		Delivery:        &daemon.PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true},
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if queued.Delivery == nil || !queued.Delivery.AllowDraft || !queued.Delivery.AllowMergeCommits {
+		t.Fatalf("Delivery = %+v; want both flags set", queued.Delivery)
+	}
+}
+
+// TestDetailToQueuedWork_DeliveryPolicyCannotDivergeFromTheReceiptedPayload
+// pins the receipt guard: the policy decides what counts as delivered
+// work, so a compatibility mirror that disagrees with the receipted
+// payload is refused rather than silently running under the wrong rule.
+func TestDetailToQueuedWork_DeliveryPolicyCannotDivergeFromTheReceiptedPayload(t *testing.T) {
+	admitted := map[string]any{"sessionId": "sess-1", "delivery": map[string]any{"allowDraft": true}}
+	payload, err := json.Marshal(admitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	moved := &daemon.PollDeliveryPolicy{AllowDraft: false, AllowMergeCommits: true}
+	if _, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID: "sess-1", OperationalPayload: payload, Delivery: moved,
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	}); err == nil {
+		t.Fatal("a mirror naming a different policy than the receipted payload was accepted")
+	}
+
+	if _, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID: "sess-1", OperationalPayload: payload,
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	}); err == nil {
+		t.Fatal("a mirror that dropped the receipted delivery policy was accepted")
+	}
+
+	queued, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID: "sess-1", OperationalPayload: payload,
+		Delivery:        &daemon.PollDeliveryPolicy{AllowDraft: true},
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if queued.Delivery == nil || !queued.Delivery.AllowDraft || queued.Delivery.AllowMergeCommits {
+		t.Fatalf("Delivery = %+v; want the receipted policy", queued.Delivery)
+	}
+}
+
+// TestAgentRunCmd_PreserveWorktreeDefault drives the production `agent run`
+// command through a failed stub session and pins the worktree lifecycle:
+// by default the failed session's worktree is torn down; the daemon's
+// keep-failed recovery answer (DONMAI_KEEP_FAILED_WORKTREE) keeps it; and
+// an explicit --preserve-worktree flag beats the environment either way.
+func TestAgentRunCmd_PreserveWorktreeDefault(t *testing.T) {
+	if codexOnPath() && raceEnabled() {
+		t.Skip("skipping under -race because codex is on PATH and codex.New/Shutdown have a known race; rerun without -race")
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	// The flag default reads the process environment at command
+	// construction, so each case starts from a known environment.
+	if prev, ok := os.LookupEnv("DONMAI_KEEP_FAILED_WORKTREE"); ok {
+		t.Cleanup(func() { _ = os.Setenv("DONMAI_KEEP_FAILED_WORKTREE", prev) })
+	} else {
+		t.Cleanup(func() { _ = os.Unsetenv("DONMAI_KEEP_FAILED_WORKTREE") })
+	}
+	_ = os.Unsetenv("DONMAI_KEEP_FAILED_WORKTREE")
+
+	tests := []struct {
+		name      string
+		keepEnv   string
+		extraArgs []string
+		wantKept  bool
+	}{
+		{name: "default tears the failed worktree down", wantKept: false},
+		{name: "keep env preserves the failed worktree", keepEnv: "1", wantKept: true},
+		{name: "explicit flag preserves without env", extraArgs: []string{"--preserve-worktree=true"}, wantKept: true},
+		{name: "explicit flag beats keep env", keepEnv: "true", extraArgs: []string{"--preserve-worktree=false"}, wantKept: false},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.keepEnv != "" {
+				t.Setenv("DONMAI_KEEP_FAILED_WORKTREE", tc.keepEnv)
+			}
+			repo := makeSpecDecoratorBareRepo(t)
+			binDir := t.TempDir()
+			if err := os.Symlink(gitPath, filepath.Join(binDir, "git")); err != nil {
+				t.Fatalf("symlink git into isolated PATH: %v", err)
+			}
+			t.Setenv("PATH", binDir)
+
+			platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+			}))
+			t.Cleanup(platform.Close)
+
+			sessionID := fmt.Sprintf("%s-%d", strings.ReplaceAll(strings.ToLower(tc.name), " ", "-"), i)
+			detail := &daemon.SessionDetail{
+				SessionID:       sessionID,
+				IssueIdentifier: "EXAMPLE-1",
+				Repository:      repo,
+				Ref:             "main",
+				WorkType:        "development",
+				Body:            "Exercise failed-session worktree lifecycle.",
+				WorkerID:        "worker-test",
+				AuthToken:       "token-test",
+				PlatformURL:     platform.URL,
+				ResolvedProfile: &daemon.SessionResolvedProfile{
+					Provider:       string(agent.ProviderStub),
+					ProviderConfig: map[string]any{"stub.behavior": string(providerstub.BehaviorMidStreamError)},
+				},
+			}
+			daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // fixed test-only credentials
+			}))
+			t.Cleanup(daemonServer.Close)
+
+			wtDir := t.TempDir()
+			cmd := newAgentRunCmd(Config{})
+			var stdout, stderr bytes.Buffer
+			cmd.SetOut(&stdout)
+			cmd.SetErr(&stderr)
+			cmd.SetArgs(append([]string{
+				"--session-id=" + sessionID,
+				"--daemon-url=" + daemonServer.URL,
+				"--worktree-dir=" + wtDir,
+				"--json=true",
+			}, tc.extraArgs...))
+			runErr := cmd.Execute()
+			if runErr == nil || !strings.Contains(runErr.Error(), `"failed"`) {
+				t.Fatalf("Execute error = %v; want the failed terminal status", runErr)
+			}
+			var got runner.Result
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("decode terminal result: %v\n%s", err, stdout.String())
+			}
+			if got.Status != "failed" {
+				t.Fatalf("terminal status = %q; want failed", got.Status)
+			}
+			if got.WorktreePath == "" {
+				t.Fatal("terminal result has no worktree path")
+			}
+			_, statErr := os.Stat(got.WorktreePath)
+			if tc.wantKept && os.IsNotExist(statErr) {
+				t.Fatalf("worktree %s is gone; want it kept for post-mortem", got.WorktreePath)
+			}
+			if !tc.wantKept && !os.IsNotExist(statErr) {
+				t.Fatalf("worktree stat err = %v; want the failed session's worktree torn down", statErr)
 			}
 		})
 	}

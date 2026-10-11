@@ -39,7 +39,12 @@ import (
 // continuation prompt that names the reason, under the same bounds. A
 // session still in that state when its continuations run out, or that
 // cannot be continued at all, ends not delivered: failed, with the reason
-// in Result.Error.
+// in Result.Error. A dispatch-declared delivery policy
+// (QueuedWork.Delivery) widens what counts as delivered — allowing
+// drafts skips the draft check, allowing merges counts a merge carrying
+// the run's own resolution — while every other check still applies; and
+// without the policy the draft continuation prompt names the remedy
+// (gh pr ready).
 //
 // Continuations are bounded by progress, not by count alone. A turn is
 // productive when its event stream carried at least one tool call
@@ -421,10 +426,13 @@ const continuePrompt = "Your previous turn ended before the task was finished: i
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
 
 // continueDraftPrompt is the continuation prompt after a turn that stopped
-// early while the session's pull request is still a draft.
+// early while the session's pull request is still a draft. It names the
+// remedy: without a dispatch-declared draft allowance the run counts as
+// delivered only once the pull request is marked ready for review, so the
+// prompt tells the seat to run exactly that step.
 const continueDraftPrompt = "Your previous turn ended before the task was finished: your pull request is still a draft, " +
 	"and the turn left no turn result and no blocked or failed verdict. Continue the task from where you stopped. " +
-	"When the work is done, commit it, push the branch, mark the pull request ready for review and report the result. " +
+	"When the work is done, commit it, push the branch, mark the pull request ready for review (gh pr ready) and report the result. " +
 	"If the task deliberately needs the pull request to stay a draft, say so and report your turn result (WORK_RESULT). " +
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
 

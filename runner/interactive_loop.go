@@ -426,6 +426,15 @@ func (r *Runner) dispatchInteractive(
 	// own session JSONL vanished), and some harnesses surface their own
 	// transcript activity there (forwardInteractiveHandleEvent). Normal
 	// Init/Result events remain governed by the PTY session lifecycle below.
+	//
+	// usage accumulates the session's running token + cost totals from the
+	// transcript tail's per-turn usage events. It rides finishInteractive onto
+	// the terminal report (so the existing cost-event writer records it) and
+	// is visible to the step-heartbeat emitter wired below through
+	// usageSnapshot.
+	usage := &interactiveUsageTotals{}
+	r.registerInteractiveUsage(qw.SessionID, usage)
+	defer r.releaseInteractiveUsage(qw.SessionID)
 	handleEvents := handle.Events()
 	for {
 		// A nil source parks the inject case while a notice is held.
@@ -469,8 +478,16 @@ func (r *Runner) dispatchInteractive(
 		case <-isess.Done():
 			// Child exited and the PTY drained to EOF (Exit emitted). Deliver
 			// the handle's trailing activity before the session-ended marker.
-			r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink)
-			return r.finishInteractive(worktreePath, qw, res, sink, isess), nil
+			// The drain carries a harness-accounted terminal cost onto the
+			// result when it sees one; only when the terminal has not
+			// arrived yet — and the channel is still open, so it still can
+			// — is the bounded wait below needed. The transcript-tail
+			// totals fill res.Cost in finishInteractive only when no
+			// harness-accounted cost landed (applyTo never overwrites).
+			if sawTerminal, alive := r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink, res, usage); !sawTerminal && alive {
+				r.applyInteractiveTerminalCost(handleEvents, res)
+			}
+			return r.finishInteractive(worktreePath, qw, res, sink, isess, usage), nil
 
 		case <-interactiveCtx.Done():
 			// Runner stop / cancel / wall-clock cap. The deferred handle.Stop
@@ -486,10 +503,14 @@ func (r *Runner) dispatchInteractive(
 				"interactive session stopped: "+res.Error)
 			r.logger.Info("[interactive] ctx done — stopping session",
 				"sessionId", qw.SessionID, "reason", res.Error)
+			// The turns metered before the stop still spent tokens; the
+			// stopped report carries them exactly as the headless lane's
+			// stop paths carry the budget meter's total.
+			usage.applyTo(res)
 			return res, interactiveCtx.Err()
 
 		case <-lost:
-			return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser)
+			return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser, usage)
 
 		case event, ok := <-handleEvents:
 			if !ok {
@@ -501,7 +522,13 @@ func (r *Runner) dispatchInteractive(
 			// transcript content, so only the quota hook observes
 			// them here.
 			r.reportQuotaEvent(interactiveCtx, qw.SessionID, event)
-			r.forwardInteractiveHandleEvent(interactiveCtx, worktreePath, sink, event)
+			// A harness-accounted terminal cost lands on the session
+			// result wherever the terminal is observed — the supervisor
+			// may consume it before the exit drain runs.
+			if result, terminal := event.(agent.ResultEvent); terminal && result.Cost != nil {
+				res.Cost = result.Cost
+			}
+			r.forwardInteractiveHandleEvent(interactiveCtx, worktreePath, sink, event, usage)
 
 		case err := <-attachDone:
 			// The attach leg terminated (epoch-stale, a non-retryable relay
@@ -516,12 +543,15 @@ func (r *Runner) dispatchInteractive(
 
 // finishInteractiveOwnershipLoss classifies both ownership-loss observation
 // points: the steady-state supervisor and a blocked initial-prompt write.
+// The running usage total rides the terminal report, exactly as on the
+// clean-exit path — the turns that ran still spent tokens.
 func (r *Runner) finishInteractiveOwnershipLoss(
 	worktreePath string,
 	qw QueuedWork,
 	res *Result,
 	sink activitySink,
 	pulser interactivePulser,
+	usage *interactiveUsageTotals,
 ) (*Result, error) {
 	// Operator cancel ({"stop":true}) is terminal and non-retryable; a
 	// heartbeat fuse or hand-off retains the generic lost-ownership mode.
@@ -537,19 +567,24 @@ func (r *Runner) finishInteractiveOwnershipLoss(
 		"interactive session ownership lost: "+res.FailureMode)
 	r.logger.Info("[interactive] ownership lost — stopping session",
 		"sessionId", qw.SessionID, "failureMode", res.FailureMode)
+	usage.applyTo(res)
 	return res, heartbeat.ErrLostOwnership
 }
 
 // finishInteractive builds the terminal Result from the PTY child's Exit
 // payload (spec § 12.2): a clean exit 0 → completed; a nonzero exit or
 // signal death → failed, carrying the exit detail. Follows the interview
-// loop's finish convention (status + a short structured reason).
+// loop's finish convention (status + a short structured reason). The
+// session's running usage total rides res.Cost, so the terminal status
+// report (and the cost-event writer downstream of it) records the real
+// tokens the transcript tail observed instead of a zero-token cost event.
 func (r *Runner) finishInteractive(
 	worktreePath string,
 	qw QueuedWork,
 	res *Result,
 	sink activitySink,
 	isess agent.InteractiveSession,
+	usage *interactiveUsageTotals,
 ) *Result {
 	exit, ok := isess.Exit()
 	var detail string
@@ -584,6 +619,7 @@ func (r *Runner) finishInteractive(
 		"interactive session ended: "+detail)
 	r.logger.Info("[interactive] session end",
 		"sessionId", qw.SessionID, "status", res.Status, "exit", detail)
+	usage.applyTo(res)
 	return res
 }
 
@@ -618,15 +654,25 @@ const interactiveActivityFlushGrace = 5 * time.Second
 // harnesses that tail their own transcript (interactive pi), assistant turns,
 // tool calls, tool results, and per-turn usage, which flow through the same
 // activity sink as the headless lane's events. Coarse Init/Result events are
-// governed by the PTY lifecycle instead and are ignored here.
-func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath string, sink activitySink, event agent.Event) {
+// governed by the PTY lifecycle instead and are ignored here. Per-turn usage
+// (a non-aggregate LlmCallEvent) is also metered into usage, the session's
+// running usage total — the interactive lane's equivalent of the headless
+// lane's BudgetEnforcer — so the terminal report and the step heartbeat can
+// carry it. A nil usage leaves the total untouched, so callers that only
+// forward (and never report) may pass nil.
+func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath string, sink activitySink, event agent.Event, usage *interactiveUsageTotals) {
 	if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
 		r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
 		return
 	}
-	switch event.(type) {
-	case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent, agent.LlmCallEvent:
+	switch e := event.(type) {
+	case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent:
 		r.postInteractiveEvent(ctx, worktreePath, sink, event)
+	case agent.LlmCallEvent:
+		r.postInteractiveEvent(ctx, worktreePath, sink, event)
+		if usage != nil {
+			usage.add(e)
+		}
 	}
 }
 
@@ -634,7 +680,16 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 // implements agent.InteractiveActivityFlusher enqueues its final activity
 // after Done, so keep forwarding events until it signals the flush (bounded
 // by interactiveActivityFlushGrace); then forward whatever is already
-// buffered without waiting. events may be nil (already closed).
+// buffered without waiting. events may be nil (already closed). Per-turn
+// usage is metered into usage alongside the forwarding, exactly as in the
+// live supervisor loop; a nil usage only forwards.
+// It reports whether the drain observed the handle's terminal ResultEvent,
+// and whether the events channel is still open. The terminal is a lifecycle
+// event, not activity, so it is never forwarded — but the drain is the one
+// place that sees every event, which makes it the one place that can carry
+// a harness-accounted terminal cost onto the session result (see
+// applyInteractiveTerminalCost). A closed channel means nothing more can
+// arrive, so the caller skips the terminal wait entirely.
 func (r *Runner) drainInteractiveActivity(
 	ctx context.Context,
 	handle agent.Handle,
@@ -642,7 +697,20 @@ func (r *Runner) drainInteractiveActivity(
 	worktreePath string,
 	qw QueuedWork,
 	sink activitySink,
-) {
+	res *Result,
+	usage *interactiveUsageTotals,
+) (sawTerminal, alive bool) {
+	observe := func(event agent.Event) {
+		r.reportQuotaEvent(ctx, qw.SessionID, event)
+		if result, terminal := event.(agent.ResultEvent); terminal {
+			sawTerminal = true
+			if result.Cost != nil {
+				res.Cost = result.Cost
+			}
+			return
+		}
+		r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event, usage)
+	}
 	if flusher, ok := handle.(agent.InteractiveActivityFlusher); ok {
 		grace := time.NewTimer(interactiveActivityFlushGrace)
 		defer grace.Stop()
@@ -651,10 +719,12 @@ func (r *Runner) drainInteractiveActivity(
 			select {
 			case event, ok := <-events:
 				if !ok {
-					return
+					return sawTerminal, false
 				}
-				r.reportQuotaEvent(ctx, qw.SessionID, event)
-				r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
+				observe(event)
+				if sawTerminal {
+					return true, true
+				}
 			case <-flusher.ActivityFlushed():
 				break wait
 			case <-grace.C:
@@ -668,11 +738,57 @@ func (r *Runner) drainInteractiveActivity(
 		select {
 		case event, ok := <-events:
 			if !ok {
+				return sawTerminal, false
+			}
+			observe(event)
+			if sawTerminal {
+				return true, true
+			}
+		default:
+			return sawTerminal, true
+		}
+	}
+}
+
+// interactiveTerminalCostGrace bounds the wait for the handle's terminal
+// ResultEvent after the PTY session is Done. The wait only runs when the
+// terminal was not observed on the supervisor loop or in the exit drain and
+// the events channel is still open — i.e. the terminal is in flight behind
+// Done (every handle emits it once the child has exited and drained). One
+// second is ample for that handoff; a handle that never sends one finishes
+// without a harness-accounted cost rather than stalling session end.
+const interactiveTerminalCostGrace = time.Second
+
+// applyInteractiveTerminalCost carries a cost-bearing terminal ResultEvent
+// from the handle onto the session result. Interactive PTY sessions
+// historically ended with no cost — the terminal event described only the
+// exit — so harnesses that account their own transcript (reading it at exit,
+// after the child is gone) report the session totals on that event. A handle
+// that emits no terminal event, or one without a cost, leaves the result
+// untouched: no usage is reported, never a failure.
+func (r *Runner) applyInteractiveTerminalCost(events <-chan agent.Event, res *Result) {
+	if events == nil {
+		// The supervisor already consumed the handle's events to their
+		// close: any terminal cost was captured where it was observed.
+		return
+	}
+	grace := time.NewTimer(interactiveTerminalCostGrace)
+	defer grace.Stop()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
 				return
 			}
-			r.reportQuotaEvent(ctx, qw.SessionID, event)
-			r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
-		default:
+			if result, terminal := event.(agent.ResultEvent); terminal {
+				if result.Cost != nil {
+					res.Cost = result.Cost
+				}
+				return
+			}
+		case <-grace.C:
+			r.logger.Warn("[interactive] handle sent no terminal event within the grace — finishing without a harness-accounted cost",
+				"sessionId", res.SessionID, "grace", interactiveTerminalCostGrace)
 			return
 		}
 	}
@@ -703,6 +819,47 @@ func (r *Runner) postInteractiveEvent(ctx context.Context, worktreePath string, 
 	if body, err := agent.MarshalEvent(ev); err == nil {
 		r.appendJSONLLine(filepath.Join(worktreePath, state.AgentDirName, "events.jsonl"), body)
 	}
+}
+
+// interactiveUsageForSession returns the live transcript-tail usage totals
+// for an interactive session, or a throwaway empty total when none is
+// registered. The step-heartbeat emitter reads through this so beats carry
+// the running totals; a missing entry (headless sessions, or a dispatch
+// that never registered) yields the zero snapshot the emitter leaves off
+// the wire.
+func (r *Runner) interactiveUsageForSession(sessionID string) *interactiveUsageTotals {
+	r.interactiveUsageMu.Lock()
+	defer r.interactiveUsageMu.Unlock()
+	if u, ok := r.interactiveUsage[sessionID]; ok && u != nil {
+		return u
+	}
+	return &interactiveUsageTotals{}
+}
+
+// registerInteractiveUsage installs the transcript-tail usage totals for an
+// interactive session; releaseInteractiveUsage removes them. The dispatch
+// registers before supervising the PTY and releases when it returns, so
+// the step-heartbeat emitter wired in runLoop shares the exact totals the
+// terminal report carries.
+func (r *Runner) registerInteractiveUsage(sessionID string, u *interactiveUsageTotals) {
+	if r == nil || sessionID == "" || u == nil {
+		return
+	}
+	r.interactiveUsageMu.Lock()
+	defer r.interactiveUsageMu.Unlock()
+	if r.interactiveUsage == nil {
+		r.interactiveUsage = map[string]*interactiveUsageTotals{}
+	}
+	r.interactiveUsage[sessionID] = u
+}
+
+func (r *Runner) releaseInteractiveUsage(sessionID string) {
+	if r == nil || sessionID == "" {
+		return
+	}
+	r.interactiveUsageMu.Lock()
+	defer r.interactiveUsageMu.Unlock()
+	delete(r.interactiveUsage, sessionID)
 }
 
 // attachTokenSource builds the host leg's attachclient.TokenSource. RunHost

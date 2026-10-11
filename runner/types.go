@@ -238,13 +238,11 @@ const (
 // by the daemon poll handler).
 type ResolvedProfile struct {
 	// Harness is the loop-driver attribute the platform catalog models on
-	// the model identity (e.g. "antigravity", "gemini-direct", or "ollama";
-	// legacy wire aliases such as "agy", "native", and "raw" remain accepted).
+	// the model identity (e.g. "gemini-direct" or "ollama";
+	// legacy wire aliases such as "native" and "raw" remain accepted).
 	// When present it is AUTHORITATIVE for binary/provider selection: the
 	// runner maps the harness token onto its concrete provider impl
-	// regardless of the Provider value (so a catalog that models the
-	// model as Provider="gemini" with Harness="agy" still resolves to the
-	// agy-cli provider). Empty is handled only by the named legacy harness
+	// regardless of the Provider value. Empty is handled only by the named legacy harness
 	// adapter. A non-empty value never falls through to Provider, Runner, a
 	// default, or posterior routing.
 	Harness string `json:"harness,omitempty"`

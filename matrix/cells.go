@@ -217,16 +217,6 @@ var validCells = []HarnessEndpointCell{
 		Stability: "beta", Smoked: false,
 	},
 
-	// antigravity × Google (agy host login) ---------------------------------
-	{
-		Harness: agent.HarnessAntigravity, Endpoint: agent.CompanyGoogle, Host: agent.HostOAuthCLI,
-		Protocol: agent.ProtoAntigravityOAuth, Transport: agent.TransportPTY,
-		AuthModes: []agent.AuthMode{agent.AuthHostSession, agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
-		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
-		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderAGYCLI),
-		Stability: "stable", Smoked: true,
-	},
-
 	// ollama × Local --------------------------------------------------------
 	{
 		Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: agent.HostLocal,

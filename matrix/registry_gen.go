@@ -11,7 +11,6 @@ import "github.com/RenseiAI/donmai/agent"
 // ProviderName until P1b swaps them to this map. Generated from the
 // hand-authored validCells' legacyProviderId anchors.
 var LegacyAliasMap = map[agent.ProviderName]CellKey{
-	"agy-cli":  {Harness: "antigravity", Endpoint: "google", Host: "oauth-cli"},
 	"claude":   {Harness: "claude-code", Endpoint: "anthropic", Host: "oauth-cli"},
 	"codex":    {Harness: "codex", Endpoint: "openai", Host: "oauth-cli"},
 	"gemini":   {Harness: "gemini-direct", Endpoint: "google", Host: "direct"},

@@ -97,7 +97,10 @@ status_json() {
 # with an explicit deadline in seconds, for the fresh-refusal check where
 # serving must NOT happen and a 90s wait would burn the lane.
 wait_serving_timeout() {
-  local want="$1" not_pid="$2" timeout="$3" deadline=$((SECONDS + timeout)) out
+  local want="$1" not_pid="$2" timeout="$3"
+  # A separate local: a `local` expands every word before assigning any, so
+  # a same-line deadline would read an unset timeout (fatal under set -u).
+  local deadline=$((SECONDS + timeout)) out
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     if out="$(status_json)" \
       && [ "$(jq -r '.version // empty' <<<"${out}")" = "${want}" ] \
@@ -186,15 +189,21 @@ checkpoint unit "${UNIT} ExecStart=${EXEC_PATH}"
 # exits with the setup status the unit holds failed
 # (RestartPreventExitStatus), so Restart=on-failure does not re-fire on
 # it — the start count stays flat while the unit waits for its config.
-systemctl --user show "${UNIT}" | grep -qF 'RestartPreventExitStatus=4' \
-  || infra fresh_refusal_restartable "unit does not hold the setup refusal failed (want RestartPreventExitStatus=4)"
+# Read the one property, never `systemctl show | grep -q`: under pipefail
+# grep's early exit SIGPIPEs systemctl (141) and fails a matching check.
+PREVENT_STATUS="$(systemctl --user show -p RestartPreventExitStatus --value "${UNIT}")"
+case " ${PREVENT_STATUS} " in
+  *" 4 "*) ;;
+  *) infra fresh_refusal_restartable "unit does not hold the setup refusal failed (RestartPreventExitStatus='${PREVENT_STATUS}', want 4)" ;;
+esac
 STARTS_BEFORE="$(systemctl --user show -p NRestarts --value "${UNIT}")"
 if wait_serving_timeout "${NEXT_VERSION}" 0 12 >/dev/null 2>&1; then
   infra fresh_unit_served "the fresh-host unit served without a harness or repository profile; it must refuse until setup completes"
 fi
 STARTS_AFTER="$(systemctl --user show -p NRestarts --value "${UNIT}")"
 [ "${STARTS_AFTER}" = "${STARTS_BEFORE}" ] || infra fresh_unit_restart_storm "fresh unit restarts ${STARTS_BEFORE} -> ${STARTS_AFTER} in 12s; the setup refusal must not crash-loop"
-journalctl --user -u "${UNIT}" --no-pager -n 30 2>/dev/null | grep -qF 'host setup' \
+FRESH_JOURNAL="$(journalctl --user -u "${UNIT}" --no-pager -n 30 2>/dev/null || true)"
+grep -qF 'host setup' <<<"${FRESH_JOURNAL}" \
   || infra fresh_refusal_unactionable "$(unit_diagnostics)"
 checkpoint fresh_refusal "unit refuses without setup and does not restart (restarts=${STARTS_AFTER})"
 # The standalone config the upgrade flow stands on: no control plane (the

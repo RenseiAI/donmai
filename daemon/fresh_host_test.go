@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/creack/pty"
+
 	"github.com/RenseiAI/donmai/afclient"
 )
 
@@ -30,6 +32,29 @@ func TestServiceModeStdinSkipsWizardWithDevNullStdin(t *testing.T) {
 	}
 	if !ShouldSkipWizard() {
 		t.Fatal("ShouldSkipWizard() with stdin /dev/null = false, want true")
+	}
+}
+
+// TestInteractiveTerminalStdinKeepsWizard is the interactive first-run
+// control: a real terminal on stdin (a pty, as an operator's shell
+// provides) is not service mode, so the wizard still runs. It fails when
+// the service-mode test widens into "always skip".
+func TestInteractiveTerminalStdinKeepsWizard(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_SKIP_WIZARD", "")
+	ptmx, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("pty unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = tty.Close(); _ = ptmx.Close() })
+	previous := os.Stdin
+	os.Stdin = tty
+	t.Cleanup(func() { os.Stdin = previous })
+
+	if ServiceModeStdin() {
+		t.Fatal("ServiceModeStdin() with a terminal on stdin = true, want false: the interactive first run would skip the wizard")
+	}
+	if ShouldSkipWizard() {
+		t.Fatal("ShouldSkipWizard() with a terminal on stdin = true, want false")
 	}
 }
 
@@ -112,6 +137,8 @@ func TestNonInteractiveFirstRunSeedsFreshHostConfig(t *testing.T) {
 	// orchestrator URL selects the plain default, not the seed. Pin the
 	// fresh-host contract (no operator URL) so the test is hermetic.
 	t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
 	path := filepath.Join(t.TempDir(), "daemon.yaml")
 	existing, err := LoadConfig(path)
 	if err != nil {
@@ -152,6 +179,29 @@ func TestNonInteractiveFirstRunKeepsExplicitOrchestratorURL(t *testing.T) {
 	}
 	if cfg.LocalRuntime != nil {
 		t.Fatalf("explicit-URL default carries a local profile: %+v", cfg.LocalRuntime)
+	}
+}
+
+// TestNonInteractiveFirstRunForceStubKeepsPlainDefault pins the stub
+// opt-in half of the seed contract: with no config and no orchestrator
+// URL, an explicit stub-mode request keeps the plain default the stub
+// daemon serves from, not the fresh-host seed that refuses until setup.
+// Forced-stub harnesses (the live-daemon smokes) start this way.
+func TestNonInteractiveFirstRunForceStubKeepsPlainDefault(t *testing.T) {
+	t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
+	for _, v := range []string{"1", "true"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("DONMAI_DAEMON_FORCE_STUB", v)
+			path := filepath.Join(t.TempDir(), "daemon.yaml")
+			cfg, err := RunSetupWizard(WizardOptions{ConfigPath: path, SkipWizard: true})
+			if err != nil {
+				t.Fatalf("non-interactive first run: %v", err)
+			}
+			if cfg == nil || cfg.Orchestrator.URL != "" || cfg.LocalRuntime != nil {
+				t.Fatalf("forced-stub first run = %+v, want the plain default (no URL, no local profile)", cfg)
+			}
+		})
 	}
 }
 

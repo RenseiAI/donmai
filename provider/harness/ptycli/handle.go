@@ -20,7 +20,7 @@ import (
 // stopGrace bounds how long watchCtx waits for a graceful exit after ctx is
 // cancelled before falling back to ptyhost.Session.Stop's own SIGTERM→grace→
 // SIGKILL escalation. Matches the grace period used across the other
-// CLI-backed harnesses (clijsonl, agycli).
+// CLI-backed harnesses (clijsonl).
 const stopGrace = 5 * time.Second
 
 // Handle is the agent.Handle + agent.InteractiveCapable implementation
@@ -271,7 +271,7 @@ func (h *Handle) cleanup() error {
 
 // watchCtx Stops the session when ctx is cancelled, so a caller that only
 // cancels its context (rather than calling Stop explicitly) still tears the
-// PTY child down. Mirrors the watchCtx pattern in clijsonl/agycli.
+// PTY child down. Mirrors the watchCtx pattern in clijsonl.
 func (h *Handle) watchCtx(ctx context.Context) {
 	select {
 	case <-ctx.Done():
@@ -285,8 +285,7 @@ func (h *Handle) watchCtx(ctx context.Context) {
 // buildResult maps a ptyhost Exit payload onto the terminal ResultEvent per
 // doc.go's coarse event-semantics contract: exit code 0 (no signal) is
 // success, anything else is a failure carrying the exit/signal detail.
-// Mirrors the ErrorSubtype convention agycli's buildResult uses
-// ("nonzero_exit").
+// Uses the shared nonzero-exit ErrorSubtype convention.
 func buildResult(exit attachwire.ExitPayload) agent.Event {
 	if exit.ExitCode == 0 && !exit.BySignal() {
 		return agent.ResultEvent{Success: true}
@@ -349,7 +348,7 @@ var (
 
 // envSlice converts a Spec.Env map into the "KEY=VALUE" slice
 // ptyhost.Spec.Env expects. Keys are sorted for deterministic child argv/env
-// across runs (matches the composeEnv convention in clijsonl and agycli).
+// across runs (matches the composeEnv convention in clijsonl).
 func envSlice(env map[string]string) []string {
 	if len(env) == 0 {
 		return nil

@@ -29,11 +29,11 @@ func TestHostRunFreshHostRefusesWithSetupAction(t *testing.T) {
 	t.Cleanup(func() { statehome.SetBaseHome(priorHome) })
 	t.Setenv("HOME", home)
 	t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
-	// Force the stub registration path: without it the run dials the
-	// (empty) orchestrator URL first and the test waits on the network
-	// instead of reaching the fresh-host refusal. Same opt-in the
-	// skipped-wizard stub test uses.
-	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "1")
+	// A service unit sets no stub opt-in; an explicit one keeps the plain
+	// stub default instead of the fresh-host seed
+	// (TestDaemonRunSkippedWizardStartsDefaultStub), so pin it off.
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
 
 	devNull, err := os.Open("/dev/null")
 	if err != nil {
@@ -121,6 +121,12 @@ func TestFreshHostCompositionReturnsSeedWithoutProfile(t *testing.T) {
 // returns the provider view, proving the arm above keys on the missing
 // profile rather than the file scheme.
 func TestFreshHostCompositionServesConfiguredProfile(t *testing.T) {
+	// Hermetic GitHub source credential: an explicit fixture token and no
+	// native gh on PATH, so the control never probes the host's own login
+	// (absent on CI and clean hosts, a real credential elsewhere).
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "fixture-gh-only")
+	t.Setenv("PATH", t.TempDir())
 	queue := filepath.Join(t.TempDir(), "queue")
 	cfg := daemon.DefaultConfig()
 	cfg.APIVersion = daemon.LocalRuntimeConfigAPIVersion
@@ -135,7 +141,7 @@ func TestFreshHostCompositionServesConfiguredProfile(t *testing.T) {
 	if err := daemon.WriteConfig(path, cfg); err != nil {
 		t.Fatal(err)
 	}
-	options, providers, err := newLocalRuntimeComposition(path, nil, map[string]string{})
+	options, providers, err := newLocalRuntimeComposition(path, nil, map[string]string{"GH_TOKEN": "fixture-gh-only"})
 	if err != nil {
 		t.Fatalf("configured composition: %v", err)
 	}

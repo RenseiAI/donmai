@@ -129,11 +129,35 @@ func checkoutContinuePullRequest(ctx context.Context, worktreePath string, cpr *
 type continueRangeInspection struct {
 	commitCount   int
 	hasCodeChange bool
-	scratchPaths  []string
+	// hasMergeChange reports that a merge commit changed a non-scratch
+	// path against every parent — its own conflict resolution or
+	// additions. It only matters under a dispatch-declared merge
+	// allowance (see deliversUnder); without one, merges alone never
+	// deliver.
+	hasMergeChange bool
+	scratchPaths   []string
 }
 
 func (i continueRangeInspection) delivers() bool {
 	return i.hasCodeChange && len(i.scratchPaths) == 0
+}
+
+// deliversUnder reports whether the inspected range delivers the work
+// under the dispatch-declared delivery policy. Without the merge
+// allowance this is delivers: at least one non-merge code change and
+// no scratch path. With it, a merge that carries the run's own
+// resolution also delivers — the merge commit itself changed a
+// non-scratch path against every parent — while the scratch rule
+// still applies, so a merge that only carries runner scratch stays
+// undelivered. Nil is today's behaviour.
+func (i continueRangeInspection) deliversUnder(policy *prompt.DeliveryPolicy) bool {
+	if len(i.scratchPaths) > 0 {
+		return false
+	}
+	if i.hasCodeChange {
+		return true
+	}
+	return policy.AllowsMerges() && i.hasMergeChange
 }
 
 // inspectContinueRange classifies the commits the session added between from
@@ -175,11 +199,18 @@ func inspectContinueRange(ctx context.Context, worktreePath, branch, from, to st
 		if pathErr != nil {
 			return continueRangeInspection{}, pathErr
 		}
+		// A merge is judged only by what it changed against every
+		// parent (its own resolution): continueCommitChanges already
+		// narrows merges that way, so a merge that only absorbed the
+		// base branch reports no change here.
+		_, isNonMerge := nonMergeSet[commit]
 		for _, change := range changes {
 			switch {
 			case !isContinueScratchPath(change.path):
-				if _, ok := nonMergeSet[commit]; ok {
+				if isNonMerge {
 					inspection.hasCodeChange = true
+				} else {
+					inspection.hasMergeChange = true
 				}
 			case !change.deleted:
 				scratchSet[change.path] = struct{}{}

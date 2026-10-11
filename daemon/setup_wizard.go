@@ -83,7 +83,7 @@ type WizardOptions struct {
 // interactive wizard and failed on its first required answer instead of
 // taking the non-interactive path.
 func ServiceModeStdin() bool {
-	return !term.IsTerminal(int(os.Stdin.Fd()))
+	return !term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: a file descriptor fits in int on every supported platform.
 }
 
 // ShouldSkipWizard returns true when the wizard should be bypassed:
@@ -660,8 +660,11 @@ func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Confi
 		// the seed decision reads the operator's URL, never a bare
 		// env-empty default, so ambient process env alone cannot flip
 		// a fresh host back to an in-memory default the next restart
-		// cannot see.
-		if explicitOrchestratorURL() == "" {
+		// cannot see. An explicit stub-mode opt-in (stubModeRequested)
+		// also keeps the plain default: the operator asked for the stub
+		// daemon, which needs no queue profile, and a service unit
+		// never sets it — so a fresh unit still takes the seed.
+		if explicitOrchestratorURL() == "" && !stubModeRequested() {
 			cfg = FreshHostConfig()
 		} else {
 			cfg = DefaultConfig()

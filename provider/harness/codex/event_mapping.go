@@ -245,7 +245,16 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	if cached == 0 {
 		cached = p.Turn.Usage.CachedInputCamel
 	}
-	state.totalInputTokens += in
+	// The provider reports input_tokens with cached reads inside it, but the
+	// token rule (CostData) counts cached input once, at the cached rate:
+	// InputTokens excludes cache reads. Report the fresh remainder here so
+	// per-call and accumulated input match. Floored: a provider that
+	// over-reports cached beyond input yields zero fresh, never negative.
+	fresh := in - cached
+	if fresh < 0 {
+		fresh = 0
+	}
+	state.totalInputTokens += fresh
 	state.totalOutputTokens += out
 	state.totalCachedInputTok += cached
 
@@ -263,7 +272,7 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	llm := agent.LlmCallEvent{
 		System:            "openai",
 		Model:             state.model,
-		InputTokens:       in,
+		InputTokens:       fresh,
 		OutputTokens:      out,
 		CachedInputTokens: cached,
 		FinishReason:      finishReason,
@@ -571,20 +580,21 @@ var codexPricing = map[string]struct {
 var defaultCodexPricing = codexPricing["gpt-5-codex"]
 
 // calculateCostUSD mirrors calculateCostUsd from the legacy TS. It
-// applies the input/cachedInput/output split and falls back to the
-// default pricing for unknown models.
-func calculateCostUSD(inputTokens, cachedInputTokens, outputTokens int64, model string) float64 {
+// applies the fresh-input/cachedInput/output split and falls back to the
+// default pricing for unknown models. The first argument is fresh input
+// (reported input minus cached reads); the caller does the subtraction so
+// per-call tokens, accumulated totals and dollars all share one meaning.
+func calculateCostUSD(freshInputTokens, cachedInputTokens, outputTokens int64, model string) float64 {
 	pricing := defaultCodexPricing
 	if model != "" {
 		if p, ok := codexPricing[model]; ok {
 			pricing = p
 		}
 	}
-	freshInput := inputTokens - cachedInputTokens
-	if freshInput < 0 {
-		freshInput = 0
+	if freshInputTokens < 0 {
+		freshInputTokens = 0
 	}
-	return (float64(freshInput)/1_000_000)*pricing.input +
+	return (float64(freshInputTokens)/1_000_000)*pricing.input +
 		(float64(cachedInputTokens)/1_000_000)*pricing.cachedInput +
 		(float64(outputTokens)/1_000_000)*pricing.output
 }

@@ -23,7 +23,6 @@ var canonicalAgentRunProviders = []agent.ProviderName{
 	agent.ProviderCodex,
 	agent.ProviderOllama,
 	agent.ProviderGemini,
-	agent.ProviderAGYCLI,
 	agent.ProviderOpenCode,
 	agent.ProviderPi,
 	agent.ProviderShell,
@@ -32,9 +31,9 @@ var canonicalAgentRunProviders = []agent.ProviderName{
 // TestBuildAgentRunRegistry_DeclaresAllCanonicalProviders is the host-independent
 // no-behavior-change proof: the single-source ctor list (agentRunProviderCtors)
 // enumerates EXACTLY the canonical ProviderNames — no more, no fewer —
-// regardless of what is probe-available on this host. This is what lets
-// rensei-tui delete its byte-for-byte fork and call BuildAgentRunRegistry:
-// every embedder gets the same eight providers.
+// regardless of what is probe-available on this host. Every embedder that
+// calls BuildAgentRunRegistry gets the same seven providers with no forked
+// list to drift.
 func TestBuildAgentRunRegistry_DeclaresAllCanonicalProviders(t *testing.T) {
 	t.Parallel()
 
@@ -92,7 +91,7 @@ func TestBuildAgentRunRegistry_PublicEqualsInternal(t *testing.T) {
 			pub, internal)
 	}
 
-	// Every resolved provider must be one of the canonical eight — the
+	// Every resolved provider must be one of the canonical seven — the
 	// registry never resolves a name outside the single-source set.
 	canon := map[agent.ProviderName]bool{}
 	for _, p := range canonicalAgentRunProviders {

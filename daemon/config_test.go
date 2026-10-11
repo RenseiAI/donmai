@@ -1499,3 +1499,95 @@ func retiredCloneSettingShape(rel, code string) string {
 	}
 	return ""
 }
+
+func TestLoadConfig_KeepFailedWorktrees(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "omitted defaults to teardown", body: "", want: false},
+		{name: "explicit true keeps", body: "keepFailedWorktrees: true\n", want: true},
+		{name: "explicit false tears down", body: "keepFailedWorktrees: false\n", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.yaml")
+			body := "machine:\n  id: isolated-fixture\norchestrator:\n  url: file:///" + dir + "/queue\n" + tt.body
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if loaded.KeepFailedWorktrees != tt.want {
+				t.Errorf("KeepFailedWorktrees = %v, want %v", loaded.KeepFailedWorktrees, tt.want)
+			}
+			roundTripped, err := func() (*Config, error) {
+				if err := WriteConfig(path, loaded); err != nil {
+					return nil, err
+				}
+				return LoadConfig(path)
+			}()
+			if err != nil {
+				t.Fatalf("round trip: %v", err)
+			}
+			if roundTripped.KeepFailedWorktrees != tt.want {
+				t.Errorf("round-tripped KeepFailedWorktrees = %v, want %v", roundTripped.KeepFailedWorktrees, tt.want)
+			}
+		})
+	}
+}
+
+func TestDaemonStart_KeepFailedWorktreesStatesWorkerEnv(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		configKey string
+		baseEnv   map[string]string
+		want      string
+		wantOK    bool
+	}{
+		{name: "omitted states nothing", configKey: "", wantOK: false},
+		{name: "enabled states the keep answer", configKey: "keepFailedWorktrees: true\n", want: "1", wantOK: true},
+		{name: "disabled states nothing", configKey: "keepFailedWorktrees: false\n", wantOK: false},
+		{
+			name: "embedder base env keeps priority", configKey: "keepFailedWorktrees: true\n",
+			baseEnv: map[string]string{"DONMAI_KEEP_FAILED_WORKTREE": "true"}, want: "true", wantOK: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.yaml")
+			body := "machine:\n  id: isolated-fixture\norchestrator:\n  url: file:///" + dir + "/queue\n" + tt.configKey
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			d := New(Options{
+				ConfigPath:       path,
+				JWTPath:          filepath.Join(dir, "daemon.jwt"),
+				SkipWizard:       true,
+				SkipRegistration: true,
+				HTTPHost:         "127.0.0.1",
+				HTTPPort:         0,
+				SpawnerOptions:   SpawnerOptions{WorkerCommand: []string{"/bin/false"}, BaseEnv: tt.baseEnv},
+			})
+			if err := d.Start(context.Background()); err != nil {
+				t.Fatalf("foreground Start: %v", err)
+			}
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := d.Stop(ctx); err != nil {
+					t.Errorf("foreground Stop: %v", err)
+				}
+			})
+			d.spawner.mu.Lock()
+			got, ok := d.spawner.opts.BaseEnv["DONMAI_KEEP_FAILED_WORKTREE"]
+			d.spawner.mu.Unlock()
+			if ok != tt.wantOK || (ok && got != tt.want) {
+				t.Fatalf("worker keep env = %q, %v; want %q, %v", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}

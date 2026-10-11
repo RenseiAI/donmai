@@ -221,10 +221,11 @@ func TestDaemonRunSkippedWizardStartsDefaultStub(t *testing.T) {
 			t.Setenv("HOME", home)
 			t.Setenv("DONMAI_STATE_HOME", home)
 			t.Setenv("DONMAI_DAEMON_FORCE_STUB", "1")
-			// A closed loopback URL, not "": an empty URL now seeds
-			// the fresh-host file queue (which refuses until setup),
-			// while this stub-path test needs the plain default.
-			t.Setenv("DONMAI_ORCHESTRATOR_URL", "http://127.0.0.1:1")
+			// No orchestrator URL, as the OSS live-daemon smoke harness
+			// spawns it: the explicit stub opt-in above keeps the plain
+			// default instead of the fresh-host seed, so a forced-stub
+			// start with no config still serves.
+			t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
 			t.Setenv("DONMAI_DAEMON_SKIP_WIZARD", "")
 			t.Setenv(afclient.ControlTokenEnv, "")
 			t.Setenv(afclient.ControlTokenFileEnv, filepath.Join(home, "control-token"))

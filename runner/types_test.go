@@ -11,7 +11,7 @@ import (
 func TestResolvedProfileHarnessWireRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := ResolvedProfile{
-		Harness:  "agy",
+		Harness:  "codex",
 		Provider: agent.ProviderGemini,
 		Model:    "gemini-3.1-pro",
 	}

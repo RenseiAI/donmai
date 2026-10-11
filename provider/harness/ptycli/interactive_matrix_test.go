@@ -40,7 +40,7 @@ const shimScript = "#!/bin/bash\n" +
 	"stty size\n"
 
 // writeShim materializes the shim script fixture — the same PATH-shim
-// technique provider/harness/agycli's handle_test.go newFakeProvider uses:
+// technique provider/harness/clijsonl's handle_test.go uses:
 // write without the exec bit, then chmod after close (avoids ETXTBSY on
 // Linux when a writable fd is still open on an executable inode).
 func writeShim(t *testing.T) string {

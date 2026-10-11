@@ -10,7 +10,6 @@ a code change without regeneration fails it too.
 
 | harness | mode | launch lanes | model delivery | effort | tool delivery | mcp delivery | extension delivery | exec tool deny | exec network deny | resume | events | attach | evidence tier | prod eligible | binary pin | stability | smoked |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| antigravity | autonomous | headless | agy_prompt_flag | no | unsupported | unsupported | unsupported | unavailable | unavailable | no | coarse_pty_events(coarse,6) | no | unit_verified | no | - | stable | yes |
 | claude-code | autonomous | headless | claude_cli_stdin | yes | claude_cli_allow_deny / unsupported | claude_cli_mcp_config | unsupported | best_effort | unavailable | no | structured_provider_events(structured,9) | yes | unit_verified | no | - | beta/stable | yes |
 | claude-code | human_controlled | interactive | claude_cli_pty_seed | yes | unsupported | claude_cli_mcp_config | unsupported | unavailable | unavailable | no | coarse_pty_events(coarse,2) | yes | unit_verified | no | - | beta/stable | yes |
 | codex | autonomous | headless | codex_app_server_turn_input | yes | codex_approval_bridge / unsupported | codex_app_server_mcp | unsupported | best_effort | unavailable | yes | structured_provider_events(structured,8) | yes | unit_verified | no | - | beta/stable | yes |

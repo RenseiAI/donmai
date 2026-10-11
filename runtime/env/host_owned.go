@@ -60,6 +60,16 @@ const ControlTokenPathEnv = "DONMAI_CONTROL_TOKEN_FILE"
 // supervisor-authored layer (the spawner's daemon-owned env) may state it.
 const SessionReadTokenEnv = "DONMAI_SESSION_READ_TOKEN" //nolint:gosec // G101: an env-var NAME, not a credential.
 
+// KeepFailedWorktreeEnv is the host-level switch that keeps a failed
+// session's worktree on disk for post-mortem recovery instead of tearing
+// it down after the rescue archives its unpublished work. The daemon
+// states it from its keepFailedWorktrees setting; an operator-exported
+// value on the daemon process reaches workers the same way. A work item
+// must not be able to set it: the work item's environment is applied
+// after the host's, so without host ownership a session could keep (or
+// drop) its own worktree against the operator's recovery policy.
+const KeepFailedWorktreeEnv = "DONMAI_KEEP_FAILED_WORKTREE"
+
 // DefaultDaemonControlPort is the daemon control API's well-known loopback
 // port (daemon.DefaultHTTPPort is this constant).
 const DefaultDaemonControlPort = 7734
@@ -68,7 +78,8 @@ const DefaultDaemonControlPort = 7734
 // not set.
 func IsHostOwned(key string) bool {
 	switch key {
-	case PiConfinementEnv, PiConfinementReadEnv, PiConfinementReadPathsEnv:
+	case PiConfinementEnv, PiConfinementReadEnv, PiConfinementReadPathsEnv,
+		KeepFailedWorktreeEnv:
 		return true
 	default:
 		return false

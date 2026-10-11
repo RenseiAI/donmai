@@ -456,7 +456,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Record every mutable checkout with the commit it starts at, so teardown
 	// can tell the session's own unpublished work from the base and preserve
-	// it before deleting the workarea (Run → preserveUnpublishedWork).
+	// it before deleting the workarea (Run → preserveUnpublishedWork). A
+	// re-entered generation already holds the earlier attempt's commits at
+	// HEAD, so its base is reseeded from the generation's declared
+	// resolved ref below; without that the rescue would miss work
+	// committed before the re-entry.
 	switch {
 	case repositoryFree:
 	case repositoryDeclaration != nil:
@@ -469,6 +473,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}
 		}
 		recordRescueTargets(ctx, res, targets)
+		reseedRescueBasesFromDeclaration(ctx, res, res.WorkareaRoot, r.wt, qw.SessionID, r.logger)
 	case selectedRepositoryMutable:
 		recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
 	}
@@ -1222,6 +1227,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// (including a 404 from a platform build without the companion route)
 	// is swallowed inside the emitter — a step-heartbeat outage must never
 	// fail the run. Wave 3 item 1.
+	//
+	// The usage behind the beat depends on the lane: headless sessions read
+	// the budget enforcer's meter, while interactive sessions read the
+	// transcript-tail totals the interactive supervisor accumulates (an
+	// interactive session never constructs an enforcer reading). The totals
+	// live on the Runner for the session so both the emitter wiring here
+	// and the supervisor below share them; the heartbeat carries the
+	// running totals, clamped non-decreasing by the emitter.
 	var stepCredentialProvider stepheartbeat.CredentialProvider
 	if r.credentialProvider != nil {
 		stepCredentialProvider = func(ctx context.Context) (stepheartbeat.RuntimeCredentials, error) {
@@ -1238,18 +1251,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: stepCredentialProvider,
-		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
-			in, out, cached, usd := enforcer.usageSnapshot()
-			return stepheartbeat.UsageSnapshot{
-				InputTokens:       in,
-				OutputTokens:      out,
-				CachedInputTokens: cached,
-				TotalCostUsd:      usd,
-			}
-		},
-		HTTPClient: r.httpClient,
-		Logger:     r.logger,
-		Interval:   r.stepHeartbeatInterval,
+		UsageProvider:      r.stepHeartbeatUsage(qw, enforcer),
+		HTTPClient:         r.httpClient,
+		Logger:             r.logger,
+		Interval:           r.stepHeartbeatInterval,
 		// Interval is zero in production, keeping the 15s default —
 		// calibrated against the platform's 60s SESSION_STALE_THRESHOLD_MS.
 	})
@@ -1721,8 +1726,12 @@ tailRecovery:
 	// draft. A no-new-commit continue run (and a draft) must NOT read as
 	// delivered: fail the session instead of ending completed against an
 	// unchanged head, mirroring the verifier's no-new-commit/draft rules.
-	// Runs only when no failure was already recorded, so a runner-authored
-	// refusal (divergence, provision) keeps its own typed reason.
+	// Under a dispatch-declared delivery policy the draft check is
+	// skipped when the policy allows drafts, and the code-change check
+	// counts merge resolutions when the policy allows merges; every
+	// other check still applies. Runs only when no failure was already
+	// recorded, so a runner-authored refusal (divergence, provision)
+	// keeps its own typed reason.
 	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType) && res.FailureMode == "" && budgetStop == nil {
 		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
@@ -1749,6 +1758,7 @@ tailRecovery:
 				if headMoved {
 					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, continuePullRequestBranch(qw.ContinuePullRequest), startHead, localHead)
 				}
+				draftBlocks := draftErr == nil && draft && !qw.Delivery.AllowsDraft()
 				switch {
 				case inspectErr != nil:
 					res.Status = "failed"
@@ -1758,7 +1768,7 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d commits scratch paths since dispatch: %s", qw.ContinuePullRequest.Number, strings.Join(inspection.scratchPaths, ", "))
-				case draftErr == nil && draft:
+				case draftBlocks:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
@@ -1770,7 +1780,7 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
-				case !inspection.delivers():
+				case !inspection.deliversUnder(qw.Delivery):
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
