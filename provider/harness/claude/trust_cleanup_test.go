@@ -207,3 +207,79 @@ func TestSeedWorkspaceTrust_ReturnsNilWhenNothingIsSeeded(t *testing.T) {
 		t.Errorf("seedWorkspaceTrust(home cwd) = %+v, want nil — a refused seed cleans up nothing", seed)
 	}
 }
+
+// TestSeedThenRemove_NeverRemovesTrustThatPredatesTheSeed pins the
+// ownership rule at the SAME path the session seeds: an entry that was
+// already trusted before the seed (the operator's own project entry, with
+// its per-project fields) is not the seed's, so the session-end cleanup
+// leaves it exactly as found. An entry that existed WITHOUT trust gets only
+// the trust key put back to its prior state; its other fields stay. RED
+// proof: record every boundary dir as seeded (the earlier behaviour) and
+// the operator's entries are deleted whole.
+func TestSeedThenRemove_NeverRemovesTrustThatPredatesTheSeed(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	writeTrustRecord(t, path, map[string]any{
+		"/operator/trusted":            map[string]any{claudeTrustAcceptedKey: true, "allowedTools": []any{"Bash(make:*)"}},
+		"/operator/untrusted-explicit": map[string]any{claudeTrustAcceptedKey: false, "history": []any{"h"}},
+		"/operator/untrusted-implicit": map[string]any{"history": []any{"h"}},
+	})
+	seed := seedTrustFile(path, []string{
+		"/operator/trusted", "/operator/untrusted-explicit", "/operator/untrusted-implicit", "/session/new",
+	})
+	if seed == nil {
+		t.Fatal("seed wrote nothing")
+	}
+	mid := readTrustProjects(t, path)
+	for _, dir := range []string{"/operator/trusted", "/operator/untrusted-explicit", "/operator/untrusted-implicit", "/session/new"} {
+		if !trustedEntry(mid, dir) {
+			t.Fatalf("seed did not trust %s: %v", dir, mid)
+		}
+	}
+	removeSeededTrust(seed)
+	projects := readTrustProjects(t, path)
+
+	trusted, ok := projects["/operator/trusted"].(map[string]any)
+	if !ok || trusted[claudeTrustAcceptedKey] != true || trusted["allowedTools"] == nil {
+		t.Errorf("trust that predates the seed was removed or disturbed: %v", projects)
+	}
+	explicit, ok := projects["/operator/untrusted-explicit"].(map[string]any)
+	if !ok || explicit[claudeTrustAcceptedKey] != false || explicit["history"] == nil {
+		t.Errorf("flipped entry not restored to its prior state: %v", projects)
+	}
+	implicit, ok := projects["/operator/untrusted-implicit"].(map[string]any)
+	if !ok || implicit["history"] == nil {
+		t.Errorf("flipped entry lost its own fields: %v", projects)
+	}
+	if _, has := implicit[claudeTrustAcceptedKey]; has {
+		t.Errorf("seeded trust key survives on a flipped entry: %v", implicit)
+	}
+	if _, present := projects["/session/new"]; present {
+		t.Errorf("entry the seed created survives cleanup: %v", projects)
+	}
+}
+
+// TestSeedTrustFile_AllAlreadyTrustedWritesNothing proves a seed that adds
+// nothing returns nil (nothing for the cleanup to undo) and leaves the
+// record byte-for-byte.
+func TestSeedTrustFile_AllAlreadyTrustedWritesNothing(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	writeTrustRecord(t, path, map[string]any{
+		"/operator/trusted": map[string]any{claudeTrustAcceptedKey: true},
+	})
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed := seedTrustFile(path, []string{"/operator/trusted"}); seed != nil {
+		t.Errorf("seedTrustFile(already trusted) = %+v, want nil", seed)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("record rewritten although nothing was added:\nbefore %s\nafter  %s", before, after)
+	}
+}
