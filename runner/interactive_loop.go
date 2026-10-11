@@ -485,7 +485,7 @@ func (r *Runner) dispatchInteractive(
 			// totals fill res.Cost in finishInteractive only when no
 			// harness-accounted cost landed (applyTo never overwrites).
 			if sawTerminal, alive := r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink, res, usage); !sawTerminal && alive {
-				r.applyInteractiveTerminalCost(handleEvents, res)
+				r.applyInteractiveTerminalCost(handleEvents, res, interactiveTerminalCostWait(handle))
 			}
 			return r.finishInteractive(worktreePath, qw, res, sink, isess, usage), nil
 
@@ -759,6 +759,29 @@ func (r *Runner) drainInteractiveActivity(
 // without a harness-accounted cost rather than stalling session end.
 const interactiveTerminalCostGrace = time.Second
 
+// interactiveTerminalEventGrace replaces interactiveTerminalCostGrace for a
+// handle that declares a harness-accounted cost is coming (see
+// agent.InteractiveTerminalCostSource): such a handle reads its cost from
+// native session state after the child exits, so its terminal is sent only
+// after run()'s post-exit work — the shim finalize wait (at most 2x5s
+// courtesy windows, sessionshim.maxFinalizeWaitBound), the exit read, the
+// session-file cost read, and cleanup. The grace adds scheduling slack on
+// top so a slow host still observes the promised event. It is a bound, not
+// a delay: the wait returns the instant the terminal (or channel close)
+// arrives, and handles that declare nothing keep the short grace.
+const interactiveTerminalEventGrace = 12 * time.Second
+
+// interactiveTerminalCostWait picks the post-Done terminal wait bound for
+// handle: the long grace only when it declares a harness-accounted cost is
+// coming, the short one otherwise, so a handle that never sends a terminal
+// cannot stall session end for the long bound.
+func interactiveTerminalCostWait(handle agent.Handle) time.Duration {
+	if src, ok := handle.(agent.InteractiveTerminalCostSource); ok && src.HasTerminalCost() {
+		return interactiveTerminalEventGrace
+	}
+	return interactiveTerminalCostGrace
+}
+
 // applyInteractiveTerminalCost carries a cost-bearing terminal ResultEvent
 // from the handle onto the session result. Interactive PTY sessions
 // historically ended with no cost — the terminal event described only the
@@ -766,13 +789,13 @@ const interactiveTerminalCostGrace = time.Second
 // after the child is gone) report the session totals on that event. A handle
 // that emits no terminal event, or one without a cost, leaves the result
 // untouched: no usage is reported, never a failure.
-func (r *Runner) applyInteractiveTerminalCost(events <-chan agent.Event, res *Result) {
+func (r *Runner) applyInteractiveTerminalCost(events <-chan agent.Event, res *Result, wait time.Duration) {
 	if events == nil {
 		// The supervisor already consumed the handle's events to their
 		// close: any terminal cost was captured where it was observed.
 		return
 	}
-	grace := time.NewTimer(interactiveTerminalCostGrace)
+	grace := time.NewTimer(wait)
 	defer grace.Stop()
 	for {
 		select {
@@ -788,7 +811,7 @@ func (r *Runner) applyInteractiveTerminalCost(events <-chan agent.Event, res *Re
 			}
 		case <-grace.C:
 			r.logger.Warn("[interactive] handle sent no terminal event within the grace — finishing without a harness-accounted cost",
-				"sessionId", res.SessionID, "grace", interactiveTerminalCostGrace)
+				"sessionId", res.SessionID, "grace", wait)
 			return
 		}
 	}

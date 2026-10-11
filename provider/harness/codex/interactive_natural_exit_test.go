@@ -52,6 +52,15 @@ func runCodexFakePTYClientCreatesThread() int {
 		return 5
 	}
 	defer func() { _ = conn.CloseNow() }()
+	// The attach path spawns the PTY as `resume --remote <socket> <name>`:
+	// there is no thread to create, so exit 0 immediately. The fresh path
+	// (bare --remote, no resume verb) creates the thread as before.
+	for _, a := range os.Args {
+		if a == "resume" {
+			_, _, _ = conn.Read(ctx)
+			return 0
+		}
+	}
 	one := 1
 	body, _ := json.Marshal(rpcRequest{JSONRPC: "2.0", Method: "thread/start", ID: &one})
 	if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
