@@ -29,8 +29,8 @@ import (
 //
 //  1. systemd transient scope: when the host runs systemd (MinScopeSystemd
 //     or newer) as PID 1, the systemd-run helper is available, AND the
-//     manager permits this user to create a transient scope (see
-//     VerifyScopePlacement: the user bus first when a user manager is
+//     manager permits this user to create a transient scope (the cached
+//     scope probe asks the user bus first when a user manager is
 //     reachable, then the system bus). The seat launches wrapped in
 //     `systemd-run --scope --collect` with CPUQuota=, CPUWeight=,
 //     MemoryMax=/MemoryHigh=, IOWeight= and OOMPolicy=continue properties.
@@ -449,7 +449,7 @@ func HostPlacement() Placement {
 // probe would charge every caller up to two systemd-run execs and let
 // two sequential calls in one process disagree with each other.
 func hostScopePermitted() bool {
-	return hostScopePlacementVerdict()
+	return hostScopeProbe().permitted
 }
 
 // selectPlacementWithScopeProbe extends SelectPlacement with the
@@ -463,50 +463,57 @@ func selectPlacementWithScopeProbe(hasSystemd, cgroupWritable bool, verifyScope 
 	return SelectPlacement(hasSystemd, cgroupWritable)
 }
 
-// VerifyScopePlacement reports whether this user may create a transient
-// scope on this host: the user bus when a user manager is reachable,
-// else confirmation of system-scope permission. False means neither
-// works, so the shim launch gate reports no backend and refuses up
-// front. The probe runs synchronously and stays bounded (one short
-// systemd-run per reachable bus); production consults the cached
-// verdict through HostPlacement rather than re-probing per call.
-func VerifyScopePlacement() bool {
-	return hostScopePermitted()
+// scopeProbeVerdict is the outcome of one creation-permission pass: whether
+// any reachable bus accepted a throwaway scope, and the first real refusal
+// line when none did. Both halves come from the same execution, so the
+// placement verdict and the reason the launch gate reports can never
+// disagree with each other the way two probes beside each other could.
+type scopeProbeVerdict struct {
+	permitted bool
+	reason    string
 }
 
-// verifyScopePlacement is VerifyScopePlacement with the runner
-// injectable, so tests stage the polkit-denied matrix (a user manager
-// that answers but refuses the scope, then a system bus that refuses
-// too) without a real systemd.
-func verifyScopePlacement() bool {
-	return verifyScopePlacementWithUnitRunner(runScopeProbeOnUnit, scopeProbeUnit)
-}
-
-// verifyScopePlacementWithUnitRunner checks creation permission bus by bus
-// with the throwaway unit rendered per attempt: production passes
-// runScopeProbeOnUnit, so each attempt on one bus runs under a fresh
-// unique name and a same-name collision retries rather than refusing.
-// The unit renderer is injected so tests pin the retry through the real
-// loop without a real systemd.
-func verifyScopePlacementWithUnitRunner(run func(userScope bool, unit string) error, unit func() string) bool {
-	return verifyScopePlacementWithUnitBusProbe(run, unit, HasUserBus)
-}
-
-// verifyScopePlacementWithUnitBusProbe is verifyScopePlacementWithUnitRunner
-// with the user-bus reachability probe injected. Each reachable bus is
-// asked through verifyScopeBusRefusal: the first bus that accepts a
-// throwaway scope wins, and a host where neither does has no usable scope
-// backend.
-func verifyScopePlacementWithUnitBusProbe(run func(userScope bool, unit string) error, unit func() string, hasUserBus func() bool) bool {
+// verifyScopeProbe runs one uncached creation-permission pass through the
+// order core: the user bus first when a user manager is reachable, then
+// the system bus. Production reads the cached pass through HostPlacement
+// and ScopeRefusalReason rather than re-probing per call; tests stage the
+// denied matrix through probeScopeBuses without a real systemd.
+func verifyScopeProbe() scopeProbeVerdict {
 	if runtime.GOOS != "linux" {
-		return false
+		return scopeProbeVerdict{}
 	}
+	if !HasSystemd() {
+		return scopeProbeVerdict{}
+	}
+	return probeScopeBuses(runScopeProbeOnUnit, scopeProbeUnit, HasUserBus)
+}
+
+// probeScopeBuses asks each reachable bus in preference order — the user
+// manager first when its bus is reachable, then the system bus — and
+// reports the first acceptance plus the first real refusal line. A bus
+// that accepts wins at once without asking the next; a bus that refuses
+// falls through to the next, keeping the first refusal line; a host where
+// neither accepts has no usable scope backend. run, unit and hasUserBus
+// are injected so tests pin the order through the real loop without a
+// real systemd; the loop itself gates on nothing host-specific (only the
+// cached production probe gates on GOOS), so the order pins on every host.
+func probeScopeBuses(run func(userScope bool, unit string) error, unit func() string, hasUserBus func() bool) scopeProbeVerdict {
+	var firstReason string
 	if hasUserBus() {
-		if verifyScopeBusRefusal(func(name string) error { return run(true, name) }, unit) == nil {
-			return true
+		err := verifyScopeBusRefusal(func(name string) error { return run(true, name) }, unit)
+		if err == nil {
+			return scopeProbeVerdict{permitted: true}
 		}
+		firstReason = scopeRefusalLine(err)
 	}
-	return verifyScopeBusRefusal(func(name string) error { return run(false, name) }, unit) == nil
+	err := verifyScopeBusRefusal(func(name string) error { return run(false, name) }, unit)
+	if err == nil {
+		return scopeProbeVerdict{permitted: true}
+	}
+	if firstReason == "" {
+		firstReason = scopeRefusalLine(err)
+	}
+	return scopeProbeVerdict{reason: firstReason}
 }
 
 // scopeProbeTimeout bounds one creation-permission probe.
@@ -527,70 +534,21 @@ const scopeProbeAttemptsPerBus = 3
 // The prefix never collides with a seat scope's digest name.
 const scopeProbePrefix = "donmai-scope-probe"
 
-// hostScopePlacementVerdict is the cached creation-permission verdict
-// behind hostScopePermitted. HostPlacement's presence probes stay live
-// on every call; only the permission verdict caches, the same way
-// hostSystemdVersion caches only the manager version.
-var hostScopePlacementVerdict = sync.OnceValue(verifyScopePlacement)
-
-// hostScopeRefusal caches the manager's own refusal line beside the
-// verdict: the probe error's folded stderr (for example the polkit denial
-// that answers a system-scope probe with no user manager). The launch
-// gate reads it through ScopeRefusalReason, so a permission-denied host's
-// up-front refusal names the reason instead of only the placement — the
-// production reader the folded message needs.
-var hostScopeRefusal = sync.OnceValue(probeScopeRefusal)
+// hostScopeProbe is the single cached creation-permission pass behind both
+// hostScopePermitted and ScopeRefusalReason. HostPlacement's presence
+// probes stay live on every call; only the permission pass caches, the
+// same way hostSystemdVersion caches only the manager version — so every
+// spawn, status read and launch-gate refusal in a process agrees, and the
+// probe cost is paid once.
+var hostScopeProbe = sync.OnceValue(verifyScopeProbe)
 
 // ScopeRefusalReason reports why the scope placement is unavailable: the
-// cached probe's own refusal line when the manager denied the scope,
-// empty when the backend is merely absent (or the probe passed). The shim
-// launch gate folds it into its refusal; the status path keeps the bare
-// placement downgrade.
+// cached pass's own refusal line when the manager denied the scope,
+// empty when the backend is merely absent (or the pass permitted). The
+// shim launch gate folds it into its refusal; the status path keeps the
+// bare placement downgrade.
 func ScopeRefusalReason() string {
-	return hostScopeRefusal()
-}
-
-// probeScopeRefusal re-runs the creation-permission probe for its refusal
-// line only. It runs at most once per process, beside the verdict cache:
-// HostPlacement consults the verdict per spawn and status read, and the
-// gate reads the reason only on the refusal path.
-func probeScopeRefusal() string {
-	if runtime.GOOS != "linux" {
-		return ""
-	}
-	if !HasSystemd() {
-		return ""
-	}
-	if verifyScopePlacementWithUnitRunner(runScopeProbeOnUnit, scopeProbeUnit) {
-		return ""
-	}
-	_, reason := probeScopeRefusalOn(runScopeProbeOnUnit, scopeProbeUnit, HasUserBus)
-	return reason
-}
-
-// probeScopeRefusalOn replays the bus-by-bus probe and returns the first
-// real refusal line: the user bus's when a user manager is reachable and
-// refuses, else the system bus's. A same-name collision is not a refusal
-// (see verifyScopeBusRefusal); a bus that never answers contributes no
-// line. run and unit are injected so tests pin the first-refusal rule
-// through the real replay without a real systemd.
-func probeScopeRefusalOn(run func(userScope bool, unit string) error, unit func() string, hasUserBus func() bool) (bool, string) {
-	if runtime.GOOS != "linux" {
-		return false, ""
-	}
-	if hasUserBus() {
-		if err := verifyScopeBusRefusal(func(name string) error { return run(true, name) }, unit); err != nil {
-			if line := scopeRefusalLine(err); line != "" {
-				return true, line
-			}
-			return true, ""
-		}
-		return false, ""
-	}
-	if err := verifyScopeBusRefusal(func(name string) error { return run(false, name) }, unit); err != nil {
-		return true, scopeRefusalLine(err)
-	}
-	return false, ""
+	return hostScopeProbe().reason
 }
 
 // scopeRefusalLine extracts the manager's own message from a probe error:

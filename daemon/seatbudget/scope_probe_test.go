@@ -12,15 +12,20 @@ import (
 )
 
 // TestVerifyScopePlacementPrefersTheUserManager pins the permission gate's
-// preference order through the injected bus probe and runner: a reachable
-// user manager that accepts the throwaway scope wins without ever asking
-// the system bus; a user manager that refuses falls back to the system
-// bus; a host where neither accepts reports no usable backend. The runner
-// is the systemd-run-shaped fake — no test here may need real systemd, so
-// the order pins on every host including non-Linux CI (where the gate
-// answers false without calling the runner).
+// preference order through the real loop: a reachable user manager that
+// accepts the throwaway scope wins without ever asking the system bus; a
+// user manager that refuses falls back to the system bus; a host where
+// neither accepts reports no usable backend. The order core is
+// GOOS-independent (only the cached production probe gates on GOOS), and
+// the runner is injectable — no test here needs real systemd, so the
+// asked-bus order pins on every host, and deleting the user-bus branch
+// fails the bus-order assertion here.
 func TestVerifyScopePlacementPrefersTheUserManager(t *testing.T) {
 	const refusal = "Failed to start transient scope unit: Interactive authentication required"
+	// scopeRefusalLine extracts the manager's own message — the tail after
+	// the probe's ": " separator — so the verdict reason is this short
+	// line, the one the launch gate reports.
+	const wantReason = "Interactive authentication required"
 	cases := []struct {
 		name       string
 		hasUserBus bool
@@ -84,17 +89,13 @@ func TestVerifyScopePlacementPrefersTheUserManager(t *testing.T) {
 					})
 			}
 			unit := func() string { return "test-probe.scope" }
-			if runtime.GOOS != "linux" {
-				if verifyScopePlacementWithUnitBusProbe(run, unit, func() bool { return tc.hasUserBus }) {
-					t.Fatal("scope permission granted off Linux; want false without a real systemd")
-				}
-				if len(asked) != 0 {
-					t.Fatalf("runner asked on buses %v off Linux; want no probe at all", asked)
-				}
-				return
-			}
-			if got := verifyScopePlacementWithUnitBusProbe(run, unit, func() bool { return tc.hasUserBus }); got != tc.want {
-				t.Fatalf("verify = %v; want %v", got, tc.want)
+			// The order core is GOOS-independent (only the cached
+			// production probe gates on GOOS), so the asked-bus order
+			// pins here on every host — including off Linux, where the
+			// old early-return used to skip the order half.
+			verdict := probeScopeBuses(run, unit, func() bool { return tc.hasUserBus })
+			if verdict.permitted != tc.want {
+				t.Fatalf("verify = %v; want %v", verdict.permitted, tc.want)
 			}
 			if len(asked) != len(tc.wantBuses) {
 				t.Fatalf("probed buses = %v; want %v", asked, tc.wantBuses)
@@ -103,6 +104,11 @@ func TestVerifyScopePlacementPrefersTheUserManager(t *testing.T) {
 				if asked[i] != tc.wantBuses[i] {
 					t.Fatalf("probed buses = %v; want %v", asked, tc.wantBuses)
 				}
+			}
+			// A denied verdict carries the first bus's own refusal
+			// line, so the launch gate names the reason.
+			if !tc.want && verdict.reason != wantReason {
+				t.Fatalf("refusal reason = %q; want the first bus's manager line %q", verdict.reason, wantReason)
 			}
 		})
 	}
@@ -259,39 +265,49 @@ func TestScopeCollisionOnEveryAttemptIsNotARefusal(t *testing.T) {
 	}
 }
 
-// TestProbeScopeRefusalOnReportsTheFirstRefusal pins the reason replay
-// through the REAL function: the first bus that really refuses contributes
-// its manager line, and a collision-only bus contributes nothing.
-func TestProbeScopeRefusalOnReportsTheFirstRefusal(t *testing.T) {
+// TestProbeScopeBusesReportsTheFirstRefusal pins the reason half through
+// the REAL loop: the first bus that really refuses contributes its manager
+// line, the user bus's acceptance wins at once with no refusal, and a
+// collision-only bus contributes nothing. GOOS-independent like the order
+// test above: the runner and unit renderer are injected, so no case needs
+// a real systemd.
+func TestProbeScopeBusesReportsTheFirstRefusal(t *testing.T) {
 	const refusal = "Failed to start transient scope unit: Interactive authentication required"
-	if runtime.GOOS != "linux" {
-		if denied, line := probeScopeRefusalOn(nil, nil, func() bool { return true }); denied || line != "" {
-			t.Fatalf("refusal replay off Linux = (%v, %q); want no refusal without a real systemd", denied, line)
+	// The verdict reason extracts the manager's own message (the tail
+	// after the probe's ": " separator) — the line the launch gate
+	// reports, not the whole folded error.
+	const wantReason = "Interactive authentication required"
+	refuse := func(msg string) func(userScope bool, unit string) error {
+		return func(bool, string) error {
+			return fmt.Errorf("systemd-run --scope probe: %w: %s", errors.New("exit status 1"), msg)
 		}
-		// probeScopeRefusalOn gates on GOOS the same way the probe loop
-		// does: the acceptance/refusal matrix below pins on Linux CI.
-		// Off Linux the branch above is the whole pin.
-		return
-	}
-	run := func(userScope bool, unit string) error {
-		_ = unit
-		if userScope {
-			return fmt.Errorf("systemd-run --scope probe: %w: %s", errors.New("exit status 1"), refusal)
-		}
-		return nil
 	}
 	unit := func() string { return "test-replay.scope" }
-	denied, line := probeScopeRefusalOn(run, unit, func() bool { return true })
-	if denied {
-		t.Fatalf("refusal replay = denied with line %q; want the user bus's acceptance to win (no refusal)", line)
-	}
-	runBoth := func(userScope bool, unit string) error {
+	// The user bus accepts: permitted, with no refusal line and no need
+	// to ask the system bus.
+	acceptUser := func(userScope bool, unit string) error {
 		_ = unit
-		_ = userScope
-		return fmt.Errorf("systemd-run --scope probe: %w: %s", errors.New("exit status 1"), refusal)
+		if userScope {
+			return nil
+		}
+		return refuse(refusal)(userScope, unit)
 	}
-	denied, line = probeScopeRefusalOn(runBoth, unit, func() bool { return true })
-	if !denied || !strings.Contains(line, "Interactive authentication required") {
-		t.Fatalf("refusal replay = (%v, %q); want the first bus's manager line", denied, line)
+	if verdict := probeScopeBuses(acceptUser, unit, func() bool { return true }); !verdict.permitted || verdict.reason != "" {
+		t.Fatalf("user-accepts verdict = %+v; want permitted with no refusal line", verdict)
+	}
+	// Every reachable bus refuses: denied, with the first bus's manager
+	// line — the line the launch gate reports.
+	if verdict := probeScopeBuses(refuse(refusal), unit, func() bool { return true }); verdict.permitted || verdict.reason != wantReason {
+		t.Fatalf("both-refuse verdict = %+v; want denied with the first bus's manager line", verdict)
+	}
+	// No user manager: the system bus alone decides, and its line rides.
+	if verdict := probeScopeBuses(refuse(refusal), unit, func() bool { return false }); verdict.permitted || verdict.reason != wantReason {
+		t.Fatalf("system-refuse verdict = %+v; want denied with the system bus's manager line", verdict)
+	}
+	// Every attempt collides: the bus never answered, so the verdict is
+	// denied with no refusal line — a collision is not a refusal.
+	collide := refuse("Failed to start transient scope unit: Unit test-replay.scope already exists.")
+	if verdict := probeScopeBuses(collide, unit, func() bool { return false }); verdict.permitted || verdict.reason != "" {
+		t.Fatalf("collision-only verdict = %+v; want denied with no refusal line", verdict)
 	}
 }
