@@ -32,7 +32,9 @@
 // the user bus (`--user`). A system-scoped install creates its scopes on
 // the system bus and needs the manager to permit them there. A host whose
 // manager refuses the scope on every reachable bus reports no backend, so
-// launches are refused up front with the missing backend named; a scope
+// launches are refused up front with the missing backend named; the verdict
+// caches per process, so after fixing lingering or scope rights restart the
+// daemon for the probe to run again. A scope
 // that still fails at launch surfaces the manager's own message on the
 // accept error.
 //

@@ -254,7 +254,9 @@ answers without an active session), or system-scope rights where the manager
 permits it. The launch gate verifies creation permission up front — a host
 whose manager refuses the scope on every reachable bus reports no backend,
 so the launch is refused with the missing backend named instead of dying
-past the gate. A scope that still fails at launch surfaces the manager's own
+past the gate. The probe runs once per daemon start and caches its verdict,
+so after fixing lingering or scope rights, restart the daemon before launching
+again. A scope that still fails at launch surfaces the manager's own
 message (for example "Interactive authentication required") on the accept
 error through the launch's preserved child log. Without a usable systemd there is
 no enforcement backend, so the seat runs unconfined and reports `none`

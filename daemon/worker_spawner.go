@@ -1210,7 +1210,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// only under an enforced mode with a systemd placement. A disabled
 	// budget leaves command and env exactly as before.
 	seatBudget, seatBudgetOK := s.seatBudgetForSpawn()
-	command = applySeatBudgetToCmdForBus(command, spec.SessionID, seatBudget, seatBudgetOK, seatBudgetLaunchPlacement(), seatBudgetLaunchUserScope())
+	launchScope := seatBudgetLaunchScope()
+	command = applySeatBudgetToCmdForBus(command, spec.SessionID, seatBudget, seatBudgetOK, launchScope.Backend, launchScope.UserScope())
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
 	cmd.Env = applySeatBudgetToEnv(s.sessionEnv(spec, project), seatBudget, seatBudgetOK)

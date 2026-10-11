@@ -32,12 +32,14 @@ func TestVerifyScopePlacementPrefersTheUserManager(t *testing.T) {
 		refuseUser bool
 		refuseSys  bool
 		want       bool
+		wantBus    bool
 		wantBuses  []bool
 	}{
 		{
 			name:       "user manager accepts: the system bus is never asked",
 			hasUserBus: true,
 			want:       true,
+			wantBus:    true,
 			wantBuses:  []bool{true},
 		},
 		{
@@ -96,6 +98,13 @@ func TestVerifyScopePlacementPrefersTheUserManager(t *testing.T) {
 			verdict := probeScopeBuses(run, unit, func() bool { return tc.hasUserBus })
 			if verdict.permitted != tc.want {
 				t.Fatalf("verify = %v; want %v", verdict.permitted, tc.want)
+			}
+			// The verdict records the bus it validated, so the launch
+			// scopes on the bus the probe asked — a user-bus win reads
+			// user scope, a system-bus-only win reads system scope, and
+			// a denied verdict carries no bus at all.
+			if verdict.userScope != tc.wantBus {
+				t.Fatalf("verdict bus = user scope %v; want %v", verdict.userScope, tc.wantBus)
 			}
 			if len(asked) != len(tc.wantBuses) {
 				t.Fatalf("probed buses = %v; want %v", asked, tc.wantBuses)
@@ -309,5 +318,52 @@ func TestProbeScopeBusesReportsTheFirstRefusal(t *testing.T) {
 	collide := refuse("Failed to start transient scope unit: Unit test-replay.scope already exists.")
 	if verdict := probeScopeBuses(collide, unit, func() bool { return false }); verdict.permitted || verdict.reason != "" {
 		t.Fatalf("collision-only verdict = %+v; want denied with no refusal line", verdict)
+	}
+}
+
+// TestScopePlacementResolvesOnePlacementForProbeAndLaunch pins the single
+// resolved placement: the bus the probe validates is the bus the launch
+// takes, from the same cached verdict — never a sibling derivation. A
+// user-bus win resolves user scope, a system-bus win resolves system scope,
+// and the denied placement carries no bus. Reverting the launch to a fresh
+// bus derivation (rather than the verdict's bus) breaks the agreement this
+// test pins: the probe could pass on one bus while the launch scopes on
+// the other.
+func TestScopePlacementResolvesOnePlacementForProbeAndLaunch(t *testing.T) {
+	unit := func() string { return "test-placement.scope" }
+	acceptOn := func(wantBus bool) func(userScope bool, unit string) error {
+		return func(userScope bool, _ string) error {
+			if userScope == wantBus {
+				return nil
+			}
+			return errors.New("exit status 1")
+		}
+	}
+	// The user manager accepts: user bus, from the same verdict that
+	// permitted the placement — the launch never asks the system bus.
+	if verdict := probeScopeBuses(acceptOn(true), unit, func() bool { return true }); !verdict.permitted || !verdict.userScope {
+		t.Fatalf("user-accepts verdict = %+v; want permitted on the user bus", verdict)
+	}
+	// Only the system bus accepts: system bus, the bus just validated.
+	if verdict := probeScopeBuses(acceptOn(false), unit, func() bool { return true }); !verdict.permitted || verdict.userScope {
+		t.Fatalf("system-accepts verdict = %+v; want permitted on the system bus", verdict)
+	}
+	// The resolved pair renders through the constructor the daemon reads:
+	// backend systemd with the verdict's bus flag.
+	placed := ScopePlacementFor(PlacementSystemd, true)
+	if placed.Backend != PlacementSystemd || !placed.UserScope() {
+		t.Fatalf("resolved placement = %+v; want the systemd backend on the user bus", placed)
+	}
+	// The production pair agrees across calls in one process: backend and
+	// bus from the same cached pass, so no two reads can disagree the way
+	// two sibling derivations could.
+	first := HostScopePlacement()
+	for range 3 {
+		if got := HostScopePlacement(); got != first {
+			t.Fatalf("HostScopePlacement = %+v then %+v; want one resolved placement per process", first, got)
+		}
+	}
+	if first.Backend != HostPlacement() {
+		t.Fatalf("HostScopePlacement backend = %q but HostPlacement = %q; want one backend for probe and launch", first.Backend, HostPlacement())
 	}
 }

@@ -181,15 +181,20 @@ func (d *Daemon) SessionShimOwnsSession(spec SessionSpec) bool { return d.shimOw
 // reachable bus, the placement probe already reports none — so this refusal
 // is also what a permission-denied host reads, up front, instead of a
 // launch that dies past the gate with only "exited without publishing one".
+// The scope probe verdict caches per process (see hostScopeProbe), so a
+// refusal sticks until the daemon restarts: after fixing the host
+// (lingering, scope rights), restart the daemon so the probe runs again -
+// the refusal names this.
 // reason carries the probe's own refusal line (see
 // seatbudget.ScopeRefusalReason): empty when the backend is merely absent,
 // the manager's message when permission was denied, so the accept error
 // names the reason instead of only the placement.
 func shimScopeGateError(placement seatbudget.Placement, reason string) error {
+	const restartNote = "A scope probe that already refused stays refused until the daemon restarts: after fixing the host, restart the daemon so the probe runs again."
 	if reason == "" {
-		return fmt.Errorf("session shim: no transient-scope backend on this host (%s): shim launches need systemd %d or newer with permission to create a transient scope (a reachable user manager, or system-scope rights); nothing launches unscoped", placement, seatbudget.MinScopeSystemd)
+		return fmt.Errorf("session shim: no transient-scope backend on this host (%s): shim launches need systemd %d or newer with permission to create a transient scope (a reachable user manager, or system-scope rights); nothing launches unscoped. %s", placement, seatbudget.MinScopeSystemd, restartNote)
 	}
-	return fmt.Errorf("session shim: no transient-scope backend on this host (%s): %s; shim launches need systemd %d or newer with permission to create a transient scope (a reachable user manager, or system-scope rights); nothing launches unscoped", placement, reason, seatbudget.MinScopeSystemd)
+	return fmt.Errorf("session shim: no transient-scope backend on this host (%s): %s; shim launches need systemd %d or newer with permission to create a transient scope (a reachable user manager, or system-scope rights); nothing launches unscoped. %s", placement, reason, seatbudget.MinScopeSystemd, restartNote)
 }
 
 // launchSessionShim is the spawner's shim launch path (SpawnerOptions.ShimSpawn).
@@ -1350,12 +1355,16 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	}
 	shimBudget, shimBudgetOK := d.shimSeatBudget()
 	goos := d.shimScope.hostGOOS()
-	placement := d.shimScope.hostPlacement()
+	// One resolved placement for probe and launch: the backend the gate
+	// checks and the bus the seat scopes on come from the same value, so
+	// the launch can never scope on a sibling bus the probe never asked.
+	resolved := d.shimScope.hostScope()
+	placement := resolved.Backend
 	scope := ""
 	if goos == "linux" {
 		scope = seatBudgetShimScopeName(launch.Identity.OrgID, launch.Identity.SessionID, launch.ProcessEpoch)
 	}
-	command, scopeOK := seatBudgetShimCommandForLaunch(worker, scope, shimBudget, shimBudgetOK, placement, d.shimScope.hostUserScope(), goos)
+	command, scopeOK := seatBudgetShimCommandForLaunch(worker, scope, shimBudget, shimBudgetOK, placement, resolved.UserScope(), goos)
 	if !scopeOK {
 		return sessionshim.ProcessIdentity{}, shimScopeGateError(placement, d.shimScope.hostScopeReason())
 	}

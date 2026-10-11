@@ -31,7 +31,9 @@ import (
 //     or newer) as PID 1, the systemd-run helper is available, AND the
 //     manager permits this user to create a transient scope (the cached
 //     scope probe asks the user bus first when a user manager is
-//     reachable, then the system bus). The seat launches wrapped in
+//     reachable, then the system bus, and records which bus accepted —
+//     the seat launches on that same validated bus, never on a sibling
+//     bus the probe never asked). The seat launches wrapped in
 //     `systemd-run --scope --collect` with CPUQuota=, CPUWeight=,
 //     MemoryMax=/MemoryHigh=, IOWeight= and OOMPolicy=continue properties.
 //     systemd owns the cgroup lifetime, so no cleanup path can leak it.
@@ -432,6 +434,41 @@ func SelectPlacement(hasSystemd, cgroupWritable bool) Placement {
 	}
 }
 
+// scopeBusSpelling is the systemd bus a validated placement launches on:
+// the user manager when the permission probe accepted there, else the
+// system bus. It rides beside Placement (not inside it) so the resolved
+// pair stays one value: the probe records the bus it asked, and the launch
+// uses that same bus instead of re-deriving one the probe never validated.
+type scopeBusSpelling struct {
+	// userScope renders the --user flag: true creates the scope on the
+	// user bus, false on the system bus.
+	userScope bool
+}
+
+// ScopePlacement is the one resolved transient-scope placement for probe
+// and launch: the backend plus the bus flag. The probe and the launch both
+// read it (the launch never re-derives the bus), so on a system-service
+// install the bus the probe validated is the bus the seat scopes on — a
+// probe that passed can no longer fail at launch on a sibling bus, or the
+// reverse. The zero value is the denied placement: no backend, system-bus
+// spelling.
+type ScopePlacement struct {
+	Backend Placement
+	Bus     scopeBusSpelling
+}
+
+// UserScope reports whether seats on this placement scope via
+// `systemd-run --user` (the user manager) rather than the system bus.
+func (p ScopePlacement) UserScope() bool { return p.Bus.userScope }
+
+// ScopePlacementFor renders one resolved placement from its backend and
+// bus flag: the test seam behind the shim probe's injected halves (see
+// worker_spawner_seatbudget.go), so a test that stubs the backend and the
+// bus independently still drives the production pair shape.
+func ScopePlacementFor(backend Placement, userScope bool) ScopePlacement {
+	return ScopePlacement{Backend: backend, Bus: scopeBusSpelling{userScope: userScope}}
+}
+
 // HostPlacement probes this host and picks the placement. On Linux with a
 // new-enough systemd it additionally verifies that this user may create a
 // transient scope (user bus first, then the system bus): presence without
@@ -440,7 +477,26 @@ func SelectPlacement(hasSystemd, cgroupWritable bool) Placement {
 // permission verdict is cached per process, so every spawn and status read
 // in a process agrees with every other.
 func HostPlacement() Placement {
-	return selectPlacementWithScopeProbe(HasSystemd(), CgroupV2Writable(), hostScopePermitted)
+	return HostScopePlacement().Backend
+}
+
+// HostScopePlacement resolves the one transient-scope placement for this
+// process: the backend plus the bus the permission probe validated. The
+// cached permission pass answers both halves from the same execution, so
+// the placement verdict and the launch bus can never disagree the way two
+// sibling derivations could. Callers that need only the bus read it
+// through HostScopeUserBus; callers that need only the backend keep
+// calling HostPlacement.
+func HostScopePlacement() ScopePlacement {
+	return hostScopePlacement()
+}
+
+// HostScopeUserBus reports whether seats on this host scope via
+// `systemd-run --user`: the bus the cached permission pass validated, not
+// a fresh bus derivation — so the launch bus is the probed bus. False on
+// the denied placement (no seat scopes there at all).
+func HostScopeUserBus() bool {
+	return HostScopePlacement().UserScope()
 }
 
 // hostScopePermitted answers the cached transient-scope
@@ -464,12 +520,14 @@ func selectPlacementWithScopeProbe(hasSystemd, cgroupWritable bool, verifyScope 
 }
 
 // scopeProbeVerdict is the outcome of one creation-permission pass: whether
-// any reachable bus accepted a throwaway scope, and the first real refusal
-// line when none did. Both halves come from the same execution, so the
-// placement verdict and the reason the launch gate reports can never
-// disagree with each other the way two probes beside each other could.
+// any reachable bus accepted a throwaway scope, which bus accepted, and the
+// first real refusal line when none did. All three halves come from the same
+// execution, so the placement verdict, the launch bus and the reason the
+// launch gate reports can never disagree with each other the way sibling
+// derivations beside each other could.
 type scopeProbeVerdict struct {
 	permitted bool
+	userScope bool
 	reason    string
 }
 
@@ -502,12 +560,18 @@ func probeScopeBuses(run func(userScope bool, unit string) error, unit func() st
 	if hasUserBus() {
 		err := verifyScopeBusRefusal(func(name string) error { return run(true, name) }, unit)
 		if err == nil {
-			return scopeProbeVerdict{permitted: true}
+			// The user manager accepted: the seat scopes on the user
+			// bus, the bus just validated — never on the system bus
+			// a later derivation might prefer instead.
+			return scopeProbeVerdict{permitted: true, userScope: true}
 		}
 		firstReason = scopeRefusalLine(err)
 	}
 	err := verifyScopeBusRefusal(func(name string) error { return run(false, name) }, unit)
 	if err == nil {
+		// Either the system bus accepted after a user-bus refusal (or
+		// with no user manager at all): the seat scopes on the system
+		// bus, the bus just validated.
 		return scopeProbeVerdict{permitted: true}
 	}
 	if firstReason == "" {
@@ -534,13 +598,29 @@ const scopeProbeAttemptsPerBus = 3
 // The prefix never collides with a seat scope's digest name.
 const scopeProbePrefix = "donmai-scope-probe"
 
-// hostScopeProbe is the single cached creation-permission pass behind both
-// hostScopePermitted and ScopeRefusalReason. HostPlacement's presence
-// probes stay live on every call; only the permission pass caches, the
-// same way hostSystemdVersion caches only the manager version — so every
-// spawn, status read and launch-gate refusal in a process agrees, and the
-// probe cost is paid once.
+// hostScopeProbe is the single cached creation-permission pass behind
+// hostScopePermitted, HostScopeUserBus and ScopeRefusalReason.
+// HostPlacement's presence probes stay live on every call; only the
+// permission pass caches, the same way hostSystemdVersion caches only the
+// manager version — so every spawn, status read and launch-gate refusal in
+// a process agrees, and the probe cost is paid once.
 var hostScopeProbe = sync.OnceValue(verifyScopeProbe)
+
+// hostScopePlacement resolves the one cached ScopePlacement from the
+// presence probes and the single cached permission pass: a systemd host
+// whose manager refused this user a scope on every reachable bus resolves
+// to none, never to a backend a launch cannot use.
+func hostScopePlacement() ScopePlacement {
+	hasSystemd, cgroupWritable := HasSystemd(), CgroupV2Writable()
+	if hasSystemd && !hostScopePermitted() {
+		return ScopePlacement{Backend: PlacementNone}
+	}
+	backend := SelectPlacement(hasSystemd, cgroupWritable)
+	if backend != PlacementSystemd {
+		return ScopePlacement{Backend: backend}
+	}
+	return ScopePlacement{Backend: backend, Bus: scopeBusSpelling{userScope: hostScopeProbe().userScope}}
+}
 
 // ScopeRefusalReason reports why the scope placement is unavailable: the
 // cached pass's own refusal line when the manager denied the scope,

@@ -284,18 +284,27 @@ func (p shimScopeProbe) hostGOOS() string {
 	return runtime.GOOS
 }
 
-func (p shimScopeProbe) hostPlacement() seatbudget.Placement {
-	if p.placement != nil {
-		return p.placement()
+func (p shimScopeProbe) hostScope() seatbudget.ScopePlacement {
+	if p.placement != nil || p.userScope != nil {
+		backend := seatbudget.PlacementNone
+		if p.placement != nil {
+			backend = p.placement()
+		}
+		userScope := false
+		if p.userScope != nil {
+			userScope = p.userScope()
+		}
+		return seatbudget.ScopePlacementFor(backend, userScope)
 	}
-	return seatBudgetLaunchPlacement()
+	return seatBudgetLaunchScope()
+}
+
+func (p shimScopeProbe) hostPlacement() seatbudget.Placement {
+	return p.hostScope().Backend
 }
 
 func (p shimScopeProbe) hostUserScope() bool {
-	if p.userScope != nil {
-		return p.userScope()
-	}
-	return seatBudgetLaunchUserScope()
+	return p.hostScope().UserScope()
 }
 
 // hostScopeReason reports why the scope placement is unavailable: the
@@ -433,11 +442,12 @@ func (d *Daemon) readShimSeatReport(registry *sessionshim.Registry, id sessionsh
 // AcceptWork (the real spawn path) and assert on the wrapped command via
 // WorkerCommand capture, not this helper directly.
 //
-// seatBudgetLaunchPlacement and seatBudgetLaunchUserScope resolve the Linux
-// enforcement placement for a fresh direct spawn, and are the production
+// seatBudgetLaunchPlacement and seatBudgetLaunchScope resolve the Linux
+// enforcement placement for a fresh direct spawn — the backend and the one
+// resolved probe+launch placement respectively — and are the production
 // default behind shimScopeProbe for a shim launch. They default to the live
 // probes; a test that overrides them must restore the defaults (no parallel
 // use while stubbed) — a shim test sets its daemon's shimScope instead.
 var seatBudgetLaunchPlacement = seatbudget.HostPlacement
 
-var seatBudgetLaunchUserScope = seatbudget.UserScopeForBus
+var seatBudgetLaunchScope = seatbudget.HostScopePlacement
