@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // runGitT runs git in dir for fixture setup and assertions only. It is
@@ -795,5 +796,240 @@ func TestEnsureMirrorLocalInsteadOfFailsClosed(t *testing.T) {
 
 	if _, err := store.Ensure(context.Background(), srcB, ""); !errors.Is(err, ErrOriginMismatch) {
 		t.Fatalf("Ensure(srcB with a mirror-local rewrite) error = %v, want ErrOriginMismatch", err)
+	}
+}
+
+// TestMirrorDigestJoinsCanonicalAndScope proves the daemon layer's choke
+// point names exactly the directory Ensure serves: one (source, scope)
+// pair resolves through MirrorDigest to the digest Ensure published.
+func TestMirrorDigestJoinsCanonicalAndScope(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	dir, err := store.Ensure(context.Background(), srcDir, "scope-a")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	digest, err := MirrorDigest(srcDir, "scope-a")
+	if err != nil {
+		t.Fatalf("MirrorDigest() error = %v", err)
+	}
+	if filepath.Base(dir) != digest {
+		t.Errorf("Ensure dir = %q, want digest %q", filepath.Base(dir), digest)
+	}
+	if _, err := MirrorDigest("file://user:secret@localhost/x%zz", ""); err == nil {
+		t.Error("MirrorDigest(unparseable URL source) error = nil, want a refusal")
+	}
+	if _, err := MirrorDigest("   ", ""); err == nil {
+		t.Error("MirrorDigest(empty source) error = nil, want a refusal")
+	}
+}
+
+// TestRecordFetchReplacesRowState proves RecordFetch advances last-fetch,
+// replaces bytes and revoked state, and advances the use marker so a
+// freshly fetched mirror is not the next eviction victim.
+func TestRecordFetchReplacesRowState(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	if _, err := store.Ensure(context.Background(), srcDir, ""); err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	digest := mirrorDigestFor(t, srcDir, "")
+	at := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	if err := store.RecordFetch(digest, at, 42, true); err != nil {
+		t.Fatalf("RecordFetch() error = %v", err)
+	}
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	found := false
+	for _, entry := range entries {
+		if entry.Digest != digest {
+			continue
+		}
+		found = true
+		if !entry.LastFetch.Equal(at) {
+			t.Errorf("LastFetch = %v, want %v", entry.LastFetch, at)
+		}
+		if !entry.LastUse.Equal(at) {
+			t.Errorf("LastUse = %v, want %v", entry.LastUse, at)
+		}
+		if entry.Bytes != 42 {
+			t.Errorf("Bytes = %d, want 42", entry.Bytes)
+		}
+		if !entry.Revoked {
+			t.Error("Revoked = false, want true")
+		}
+	}
+	if !found {
+		t.Fatalf("no catalog row for digest %q", digest)
+	}
+	// A second fetch replaces the revoked flag without losing the row.
+	if err := store.RecordFetch(digest, at.Add(time.Hour), 7, false); err != nil {
+		t.Fatalf("RecordFetch() error = %v", err)
+	}
+	entries, err = store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Digest != digest {
+			continue
+		}
+		if entry.Revoked {
+			t.Error("Revoked still true after a clearing fetch")
+		}
+		if entry.Bytes != 7 {
+			t.Errorf("Bytes = %d, want 7", entry.Bytes)
+		}
+	}
+}
+
+// TestRemoveDeletesDirectoryAndDropsRow proves Remove deletes the mirror
+// directory outside the per-mirror lock and drops its catalog row, and
+// that removing a missing mirror still converges the row away.
+func TestRemoveDeletesDirectoryAndDropsRow(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	dir, err := store.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	digest := mirrorDigestFor(t, srcDir, "")
+	if err := store.Remove(digest); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("removed mirror still on disk: err = %v", err)
+	}
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Digest == digest {
+			t.Errorf("removed digest %q still listed", digest)
+		}
+	}
+	leftovers, err := os.ReadDir(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read mirrors dir: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("Remove left %d entries behind, want none", len(leftovers))
+	}
+	// Removing again converges instead of failing: the row is already
+	// gone and the directory is already gone.
+	if err := store.Remove(digest); err != nil {
+		t.Errorf("Remove(missing) error = %v, want nil", err)
+	}
+	if err := store.Remove("short"); err == nil {
+		t.Error("Remove(path-shaped digest) error = nil, want a refusal")
+	}
+}
+
+// TestEnsureWithAuthFailureAbortsClone proves a failing auth resolver
+// aborts a fresh clone before git starts and publishes nothing.
+func TestEnsureWithAuthFailureAbortsClone(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+	boom := errors.New("auth unavailable")
+
+	_, err := store.EnsureWithAuth(context.Background(), srcDir, "", func(context.Context, string) (string, bool, error) {
+		return "", false, boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("EnsureWithAuth(auth error) error = %v, want the resolver error", err)
+	}
+	leftovers, err := os.ReadDir(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read mirrors dir: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("aborted clone left %d entries behind, want none", len(leftovers))
+	}
+}
+
+// TestEnsureWithAuthSuccessClonesLocalSource proves a resolving auth
+// callback still clones through the production path: the header travels
+// in-memory (gitexec scopes it), and the published mirror verifies.
+func TestEnsureWithAuthSuccessClonesLocalSource(t *testing.T) {
+	t.Parallel()
+	srcDir, sha := newSourceRepo(t)
+	store := newTestStore(t)
+
+	dir, err := store.EnsureWithAuth(context.Background(), srcDir, "", func(context.Context, string) (string, bool, error) {
+		return "Authorization: Bearer token", true, nil
+	})
+	if err != nil {
+		t.Fatalf("EnsureWithAuth() error = %v", err)
+	}
+	if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
+		t.Errorf("cat-file output = %q, want empty on success", got)
+	}
+	// The resolver runs only for a fresh clone: serving the existing
+	// mirror with a failing resolver still succeeds without the network.
+	dir2, err := store.EnsureWithAuth(context.Background(), srcDir, "", func(context.Context, string) (string, bool, error) {
+		return "", false, errors.New("must not run for an existing mirror")
+	})
+	if err != nil {
+		t.Fatalf("EnsureWithAuth(existing) error = %v", err)
+	}
+	if dir2 != dir {
+		t.Errorf("existing mirror dir = %q, want %q", dir2, dir)
+	}
+}
+
+// TestTouchUseAdvancesMarker proves TouchUse advances one row's LastUse
+// marker without changing its fetch time, bytes, or revoked flag.
+func TestTouchUseAdvancesMarker(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	if _, err := store.Ensure(context.Background(), srcDir, ""); err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	digest := mirrorDigestFor(t, srcDir, "")
+	fetchAt := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	if err := store.RecordFetch(digest, fetchAt, 42, true); err != nil {
+		t.Fatalf("RecordFetch() error = %v", err)
+	}
+	useAt := fetchAt.Add(2 * time.Hour)
+	if err := store.TouchUse(digest, useAt); err != nil {
+		t.Fatalf("TouchUse() error = %v", err)
+	}
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	found := false
+	for _, entry := range entries {
+		if entry.Digest != digest {
+			continue
+		}
+		found = true
+		if !entry.LastUse.Equal(useAt) {
+			t.Errorf("LastUse = %v, want %v", entry.LastUse, useAt)
+		}
+		if !entry.LastFetch.Equal(fetchAt) {
+			t.Errorf("LastFetch = %v, want %v (TouchUse must not move it)", entry.LastFetch, fetchAt)
+		}
+		if entry.Bytes != 42 {
+			t.Errorf("Bytes = %d, want 42 (TouchUse must not change it)", entry.Bytes)
+		}
+		if !entry.Revoked {
+			t.Error("Revoked = false, want true (TouchUse must not clear it)")
+		}
+	}
+	if !found {
+		t.Fatalf("no catalog row for digest %q", digest)
 	}
 }
