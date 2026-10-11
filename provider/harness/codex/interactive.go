@@ -504,6 +504,14 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	if model := strings.TrimSpace(spec.Model); model != "" {
 		args = append(args, "--config", "model="+tomlBasicString(model))
 	}
+	// A gateway-routed cell restates its provider block through CLI
+	// overrides (see gatewayProviderConfigOverride): the private config
+	// file carries the primary route, and these ride the CLI layer above
+	// every file layer, so repo-checked-in provider config cannot redirect
+	// the bearer. Non-routed sessions render nothing and keep their argv.
+	if baseURL, _, routed, routeErr := gatewayBinding(spec); routeErr == nil && routed {
+		args = append(args, gatewayProviderConfigOverride(baseURL)...)
+	}
 	// Reasoning effort rides the same process-local override as model:
 	// model_reasoning_effort is codex's own config.toml key, and the headless
 	// lane already sends the identical value as turn/start reasoningEffort
