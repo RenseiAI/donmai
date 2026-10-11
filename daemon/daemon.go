@@ -1101,6 +1101,23 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if d.sessionShimEnabled() {
 			return errors.New("local file runtime supports direct headless execution only")
 		}
+		if cfg.LocalRuntime == nil || cfg.LocalRuntime.Harness == "" || cfg.LocalRuntime.Model == "" || len(cfg.LocalRuntime.Repositories) == 0 {
+			// A fresh-host seed (file queue URL with an explicit policy
+			// but no harness or repository profile yet) reaches Start
+			// without the profile the composition could not serve.
+			// Refuse with the operator action before any runtime,
+			// heartbeat, or poller starts, not an internal wiring
+			// complaint. The typed refusal maps to the no-restart
+			// setup exit at the entry point.
+			return afclient.ErrNeedsSetup
+		}
+		if d.opts.LocalRuntime == nil || d.opts.LocalRuntime.NewCompiler == nil {
+			// The shipped composition is missing — an embedder wiring
+			// fault, not an unconfigured host. Its own message keeps
+			// the journal grep for the setup action from
+			// misdiagnosing a misbuilt composition as "not set up yet".
+			return errors.New("local runtime composition missing: reinstall or report a bug")
+		}
 		local, err = newLocalRuntime(ctx, d, cfg)
 		if err != nil {
 			return err

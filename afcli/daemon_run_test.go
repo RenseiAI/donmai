@@ -221,6 +221,10 @@ func TestDaemonRunSkippedWizardStartsDefaultStub(t *testing.T) {
 			t.Setenv("HOME", home)
 			t.Setenv("DONMAI_STATE_HOME", home)
 			t.Setenv("DONMAI_DAEMON_FORCE_STUB", "1")
+			// No orchestrator URL, as the OSS live-daemon smoke harness
+			// spawns it: the explicit stub opt-in above keeps the plain
+			// default instead of the fresh-host seed, so a forced-stub
+			// start with no config still serves.
 			t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
 			t.Setenv("DONMAI_DAEMON_SKIP_WIZARD", "")
 			t.Setenv(afclient.ControlTokenEnv, "")

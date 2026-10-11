@@ -48,6 +48,11 @@ func TestGenerateUnitFile_User(t *testing.T) {
 		t.Fatalf("GenerateUnitFile: %v", err)
 	}
 
+	// TestGenerateUnitFile_SetupRefusalHoldsFailed pins the fresh-host
+	// restart contract: the setup refusal exits with the status the
+	// unit names in RestartPreventExitStatus, so the unit waits for its
+	// config instead of restarting every RestartSec. Dropping the
+	// directive (or changing the refusal's exit) must fail this test.
 	for _, want := range []string{
 		"[Unit]",
 		"Description=Rensei local daemon — worker pool",
@@ -57,6 +62,7 @@ func TestGenerateUnitFile_User(t *testing.T) {
 		"ExecStart=/usr/local/bin/af host run",
 		"Restart=on-failure",
 		"SuccessExitStatus=3",
+		"RestartPreventExitStatus=4",
 		"StandardOutput=journal",
 		"StandardError=journal",
 		"SyslogIdentifier=rensei-daemon",
