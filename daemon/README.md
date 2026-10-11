@@ -248,7 +248,15 @@ bus for system installs; the quota is the binding CPU limit (no core
 pinning: identical pin ranges across seats shared 2 cores of 6 budgeted,
 and user services never get the cpuset controller delegated). The scope
 needs systemd 252 or newer (249 rejects it and delegates no CPU controller
-to user managers). Without a usable systemd there is
+to user managers) plus permission for the daemon user to create a transient
+scope: a reachable user manager (enable lingering for the daemon user so it
+answers without an active session), or system-scope rights where the manager
+permits it. The launch gate verifies creation permission up front — a host
+whose manager refuses the scope on every reachable bus reports no backend,
+so the launch is refused with the missing backend named instead of dying
+past the gate. A scope that still fails at launch surfaces the manager's own
+message (for example "Interactive authentication required") on the accept
+error through the launch's preserved child log. Without a usable systemd there is
 no enforcement backend, so the seat runs unconfined and reports `none`
 with the backend named as the reason. On macOS the seat carries
 worker-cap environment (`GOMAXPROCS`, `MAKEFLAGS`,

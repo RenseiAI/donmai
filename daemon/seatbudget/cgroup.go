@@ -27,13 +27,23 @@ import (
 // seat-survives-OOM policy. Exactly one placement exists:
 //
 //  1. systemd transient scope: when the host runs systemd (MinScopeSystemd
-//     or newer) as PID 1 and the systemd-run helper is available, the seat
-//     launches wrapped in
+//     or newer) as PID 1, the systemd-run helper is available, AND the
+//     manager permits this user to create a transient scope (see
+//     VerifyScopePlacement: the user bus first when a user manager is
+//     reachable, then the system bus). The seat launches wrapped in
 //     `systemd-run --scope --collect` with CPUQuota=, CPUWeight=,
 //     MemoryMax=/MemoryHigh=, IOWeight= and OOMPolicy=continue properties.
 //     systemd owns the cgroup lifetime, so no cleanup path can leak it.
 //     When the daemon runs without the system bus (a per-user service),
 //     the scope is created on the user bus (--user).
+//
+//     Presence alone is not enough: a manager that answers the version
+//     probe may still refuse this user a scope (no user manager without
+//     lingering, or polkit denying a system scope), and a launch gated
+//     only on presence dies opaquely past the gate. The shim launch gate
+//     therefore verifies creation permission up front and reports none
+//     when neither bus permits it, so the launch is refused with the
+//     missing backend named instead of failing after it starts.
 //
 // There is deliberately no core pinning: the quota is the binding
 // throughput limit (identical pin ranges across seats shared 2 cores of 6
@@ -421,7 +431,121 @@ func SelectPlacement(hasSystemd, cgroupWritable bool) Placement {
 	}
 }
 
-// HostPlacement probes this host and picks the placement.
+// HostPlacement probes this host and picks the placement. On Linux with a
+// new-enough systemd it additionally verifies that this user may create a
+// transient scope (user bus first, then the system bus): presence without
+// permission reports none, so the shim launch gate refuses up front with
+// the missing backend named instead of dying opaquely after it starts.
 func HostPlacement() Placement {
-	return SelectPlacement(HasSystemd(), CgroupV2Writable())
+	return hostedPlacement()
+}
+
+// hostedPlacement is HostPlacement with the scope-permission probe
+// injectable, so tests pin the whole gate on any host without a real
+// systemd. hasSystemd and cgroupWritable answer the presence probes;
+// verifyScope runs the creation-permission check only when presence
+// holds, and reports whether any reachable bus permits this user a
+// transient scope.
+func hostedPlacement() Placement {
+	return selectPlacementWithScopeProbe(HasSystemd(), CgroupV2Writable(), verifyScopePlacement)
+}
+
+// selectPlacementWithScopeProbe extends SelectPlacement with the
+// creation-permission gate: a systemd host whose manager refuses this
+// user a transient scope on every reachable bus selects none, never a
+// backend a launch cannot use.
+func selectPlacementWithScopeProbe(hasSystemd, cgroupWritable bool, verifyScope func() bool) Placement {
+	if hasSystemd && !verifyScope() {
+		return PlacementNone
+	}
+	return SelectPlacement(hasSystemd, cgroupWritable)
+}
+
+// VerifyScopePlacement reports whether this user may create a transient
+// scope on this host: the user bus when a user manager is reachable,
+// else confirmation of system-scope permission. False means neither
+// works, so the shim launch gate reports no backend and refuses up
+// front. The probe runs synchronously and stays bounded (one short
+// systemd-run per reachable bus); production backs hostPlacement with
+// it, and the launch path consults hostPlacement rather than re-probing.
+func VerifyScopePlacement() bool {
+	return verifyScopePlacement()
+}
+
+// verifyScopePlacement is VerifyScopePlacement with the runner
+// injectable, so tests stage the polkit-denied matrix (a user manager
+// that answers but refuses the scope, then a system bus that refuses
+// too) without a real systemd.
+func verifyScopePlacement() bool {
+	return verifyScopePlacementWithRunner(runScopeProbe)
+}
+
+// verifyScopePlacementWithRunner checks creation permission bus by bus:
+// the user manager first when its bus is reachable, then the system bus.
+// The first bus that accepts a throwaway scope wins; a host where
+// neither does has no usable scope backend. run names the
+// systemd-run-shaped probe each bus needs. hasUserBus answers the
+// user-manager reachability probe, injected so tests pin the preference
+// order (user manager first, system fallback, neither) on any host:
+// production passes HasUserBus, which gates the --user attempt the same
+// way UserScopeForBus resolves the launch's own bus.
+func verifyScopePlacementWithRunner(run func(userScope bool) error) bool {
+	return verifyScopePlacementWithBusProbe(run, HasUserBus)
+}
+
+// verifyScopePlacementWithBusProbe is verifyScopePlacementWithRunner
+// with the user-bus reachability probe injected. The preference order
+// is load-bearing: the user bus is the preferred home — a per-user
+// daemon reaches only its user manager, and a scope created there never
+// needs polkit — so an absent user manager (no lingering, no session)
+// answers at dial time rather than with the manager's own refusal, and
+// there is nothing to confirm there. Only a manager that answers gets
+// asked.
+func verifyScopePlacementWithBusProbe(run func(userScope bool) error, hasUserBus func() bool) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	if hasUserBus() {
+		if run(true) == nil {
+			return true
+		}
+	}
+	if run(false) == nil {
+		return true
+	}
+	return false
+}
+
+// scopeProbeTimeout bounds one creation-permission probe.
+const scopeProbeTimeout = 10 * time.Second
+
+// scopeProbeUnit names the throwaway unit the creation-permission probe
+// creates. The --collect flag reaps it the moment its child exits, so no
+// probe leaves a unit behind; the name is fixed because only one probe
+// runs at a time per process and it never collides with a seat scope's
+// digest name.
+const scopeProbeUnit = "donmai-scope-probe.scope"
+
+// runScopeProbe asks systemd for a throwaway scope on one bus, so the
+// manager itself answers whether this user may create one. The child is
+// true(1): it exits at once, and --collect reaps the unit behind it.
+// userScope selects the bus the same way a launch does (--user for the
+// user manager, the system bus otherwise), so the answer matches what a
+// launch on that bus would get. The combined output is folded into the
+// error, so a refusal carries the manager's own message (for example
+// "Interactive authentication required") to the caller that reports it.
+func runScopeProbe(userScope bool) error {
+	args := []string{"--scope", "--collect", "--unit", scopeProbeUnit}
+	if userScope {
+		args = append([]string{"--user"}, args...)
+	}
+	args = append(args, "true")
+	ctx, cancel := context.WithTimeout(context.Background(), scopeProbeTimeout)
+	defer cancel()
+	//nolint:gosec // G204: fixed systemd-run binary; every argument is a fixed literal
+	out, err := exec.CommandContext(ctx, "systemd-run", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemd-run --scope probe: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

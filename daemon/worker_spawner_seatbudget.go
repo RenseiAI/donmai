@@ -265,9 +265,9 @@ func shimSeatLaunchRecord(id sessionshim.Identity, processEpoch uint64, scope st
 
 // shimScopeProbe is the host facts the shim launch gate and the seat
 // read-back consult. The zero value is production: runtime.GOOS, the live
-// placement and bus probes, and the systemctl read-back. A test sets the
-// fields it needs on its own daemon, so suites that run in parallel never
-// share a stub.
+// placement (presence plus creation-permission) and bus probes, and the
+// systemctl read-back. A test sets the fields it needs on its own daemon,
+// so suites that run in parallel never share a stub.
 type shimScopeProbe struct {
 	goos       string
 	placement  func() seatbudget.Placement
