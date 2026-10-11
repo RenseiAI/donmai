@@ -299,10 +299,6 @@ func (p shimScopeProbe) hostScope() seatbudget.ScopePlacement {
 	return seatBudgetLaunchScope()
 }
 
-func (p shimScopeProbe) hostPlacement() seatbudget.Placement {
-	return p.hostScope().Backend
-}
-
 func (p shimScopeProbe) hostUserScope() bool {
 	return p.hostScope().UserScope()
 }
@@ -442,12 +438,10 @@ func (d *Daemon) readShimSeatReport(registry *sessionshim.Registry, id sessionsh
 // AcceptWork (the real spawn path) and assert on the wrapped command via
 // WorkerCommand capture, not this helper directly.
 //
-// seatBudgetLaunchPlacement and seatBudgetLaunchScope resolve the Linux
-// enforcement placement for a fresh direct spawn — the backend and the one
-// resolved probe+launch placement respectively — and are the production
-// default behind shimScopeProbe for a shim launch. They default to the live
-// probes; a test that overrides them must restore the defaults (no parallel
-// use while stubbed) — a shim test sets its daemon's shimScope instead.
-var seatBudgetLaunchPlacement = seatbudget.HostPlacement
-
+// seatBudgetLaunchScope resolves the Linux enforcement placement for a
+// fresh direct spawn — the one resolved probe+launch placement — and is
+// the production default behind shimScopeProbe for a shim launch. It
+// defaults to the live probe; a test that overrides it must restore the
+// default (no parallel use while stubbed) — a shim test sets its daemon's
+// shimScope instead.
 var seatBudgetLaunchScope = seatbudget.HostScopePlacement
