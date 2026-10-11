@@ -94,11 +94,20 @@ var pinnedFallbackRoutingEnv = []string{
 	"CLAUDE_CODE_USE_BEDROCK",
 	"CLAUDE_CODE_USE_VERTEX",
 	"CLAUDE_CODE_USE_FOUNDRY",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"CLAUDE_CODE_USE_MANTLE",
+	"CLAUDE_CODE_USE_GATEWAY",
 	// Alternate base URLs for those hosts: pinned empty so a repo cannot
 	// arm a redirect the switches would then use.
 	"ANTHROPIC_BEDROCK_BASE_URL",
 	"ANTHROPIC_VERTEX_BASE_URL",
 	"ANTHROPIC_FOUNDRY_BASE_URL",
+	"ANTHROPIC_AWS_BASE_URL",
+	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+	// A local socket the CLI would dial instead of the base URL.
+	"ANTHROPIC_UNIX_SOCKET",
 	// Plaintext request proxies: pinned empty so a repo cannot observe the
 	// session bearer in transit by naming an attacker listener.
 	"HTTP_PROXY",

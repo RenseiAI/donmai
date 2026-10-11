@@ -106,7 +106,7 @@ func TestIsRoutingPinJSON(t *testing.T) {
 		// own routing: a blank holds the ambient default on the winning
 		// layer so a repo naming a proxy or flipping a provider switch
 		// loses to it.
-		`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1","CLAUDE_CODE_USE_BEDROCK":"","CLAUDE_CODE_USE_VERTEX":"","CLAUDE_CODE_USE_FOUNDRY":"","ANTHROPIC_BEDROCK_BASE_URL":"","ANTHROPIC_VERTEX_BASE_URL":"","ANTHROPIC_FOUNDRY_BASE_URL":"","HTTP_PROXY":"","HTTPS_PROXY":"","ALL_PROXY":"","http_proxy":"","https_proxy":"","all_proxy":""}}`,
+		`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1","CLAUDE_CODE_USE_BEDROCK":"","CLAUDE_CODE_USE_VERTEX":"","CLAUDE_CODE_USE_FOUNDRY":"","ANTHROPIC_BEDROCK_BASE_URL":"","ANTHROPIC_VERTEX_BASE_URL":"","ANTHROPIC_FOUNDRY_BASE_URL":"","CLAUDE_CODE_USE_ANTHROPIC_AWS":"","CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD":"","CLAUDE_CODE_USE_MANTLE":"","CLAUDE_CODE_USE_GATEWAY":"","ANTHROPIC_AWS_BASE_URL":"","ANTHROPIC_GOOGLE_CLOUD_BASE_URL":"","ANTHROPIC_BEDROCK_MANTLE_BASE_URL":"","ANTHROPIC_UNIX_SOCKET":"","HTTP_PROXY":"","HTTPS_PROXY":"","ALL_PROXY":"","http_proxy":"","https_proxy":"","all_proxy":""}}`,
 		`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1","HTTPS_PROXY":"http://proxy.internal:8080"}}`,
 	}
 	for _, raw := range good {
