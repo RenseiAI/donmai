@@ -103,10 +103,16 @@ type Handle struct {
 	// env is the fully composed, runner-control-free environment used by the
 	// parent process. Inject reuses the same snapshot for every resume child so
 	// it cannot fall back to the host's unsanitized inherited environment.
-	env    []string
-	cmd    *exec.Cmd
-	events chan agent.Event
-	logger *slog.Logger
+	env []string
+	// resumeExtraArgs are harness-supplied argv fragments prepended to every
+	// --resume invocation by Inject. The claude harness uses them to carry
+	// its routing pin (--settings {"env": ...}), whose CLI layer sits
+	// above a repo-local settings file that could otherwise redirect the
+	// session bearer on follow-up turns. Empty for harnesses without one.
+	resumeExtraArgs []string
+	cmd             *exec.Cmd
+	events          chan agent.Event
+	logger          *slog.Logger
 
 	stdoutPipe io.ReadCloser
 	stderrPipe io.ReadCloser
@@ -216,6 +222,9 @@ func (h *Handle) closeEvents() {
 //   - mcpConfigPath: absolute path to an MCP config tmpfile written by
 //     the caller, or "" if no MCP servers are configured. The Handle's
 //     Stop() method removes this file.
+//   - resumeExtraArgs: harness-supplied argv fragments prepended to every
+//     Inject --resume invocation (for example a routing pin the CLI
+//     resolves above repo-local settings). Nil when the harness has none.
 //   - cwd: working directory for the subprocess; sets cmd.Dir when
 //     non-empty.
 //   - env: spec.Env passed to composeEnv (merged onto os.Environ()).
@@ -229,11 +238,12 @@ func SpawnBinary(
 	argv []string,
 	stdinPrompt string,
 	mcpConfigPath string,
+	resumeExtraArgs []string,
 	cwd string,
 	env map[string]string,
 	onProcessSpawned func(pid int),
 ) (*Handle, error) {
-	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, cwd, env, onProcessSpawned)
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned)
 }
 
 // spawnRaw is the low-level subprocess spawn shared by the claude
@@ -250,6 +260,7 @@ func spawnRaw(
 	argv []string,
 	stdinPrompt string,
 	mcpConfigPath string,
+	resumeExtraArgs []string,
 	cwd string,
 	env map[string]string,
 	onProcessSpawned func(pid int),
@@ -312,18 +323,19 @@ func spawnRaw(
 	stderrBuf := newBoundedBuffer(stderrBufferSize)
 
 	h := &Handle{
-		binary:        binary,
-		mcpConfigPath: mcpConfigPath,
-		cwd:           cwd,
-		env:           append([]string(nil), childEnv...),
-		cmd:           cmd,
-		events:        make(chan agent.Event, eventBufferSize),
-		logger:        slog.With("provider", "claude", "pid", cmd.Process.Pid),
-		stdoutPipe:    stdout,
-		stderrPipe:    stderr,
-		stderrBuf:     stderrBuf,
-		shutdown:      make(chan struct{}),
-		done:          make(chan struct{}),
+		binary:          binary,
+		mcpConfigPath:   mcpConfigPath,
+		cwd:             cwd,
+		env:             append([]string(nil), childEnv...),
+		resumeExtraArgs: append([]string(nil), resumeExtraArgs...),
+		cmd:             cmd,
+		events:          make(chan agent.Event, eventBufferSize),
+		logger:          slog.With("provider", "claude", "pid", cmd.Process.Pid),
+		stdoutPipe:      stdout,
+		stderrPipe:      stderr,
+		stderrBuf:       stderrBuf,
+		shutdown:        make(chan struct{}),
+		done:            make(chan struct{}),
 	}
 
 	// Launch the prompt-writer in a goroutine. The CLI consumes the
@@ -456,7 +468,12 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	// resume id. This is the fixed argv form that the claude provider's
 	// buildArgs emits for an inject-spec (Prompt-only, empty MCP path):
 	// the required headless flags + --resume <id>.
-	argv, stdinPrompt := resumeArgv(sid, text)
+	argv, stdinPrompt := resumeArgv(sid, text, h.resumeExtraArgs)
+	// The pin rides a --settings string THIS process passes, so it cannot
+	// be widened by callee-controlled input: the extras come from the
+	// harness's own post-projection pin (never text or repo state), and
+	// resumeArgv vetoes anything but the exact pin pair rather than
+	// passing a second settings layer through.
 
 	// nolint:gosec // h.binary was resolved via exec.LookPath at
 	// provider construction; argv values come from a closed set of CLI
@@ -833,16 +850,53 @@ func (b *boundedBuffer) String() string {
 // Keeping this builder in the driver (rather than calling back into a
 // harness) lets the Handle drive the resume turn without importing any
 // harness package. The byte sequence matches the pre-extraction
-// `buildArgs(agent.Spec{Prompt: text}, "", sid)` output exactly.
-func resumeArgv(sessionID, prompt string) (argv []string, stdinPrompt string) {
+// `buildArgs(agent.Spec{Prompt: text}, "", sid)` output exactly when
+// resumeExtraArgs is empty.
+//
+// resumeExtraArgs is the harness-supplied --settings pin pair — the
+// headless stream-json flags come first, then the pin, then
+// --resume <id> — so the pin sits on the same layer the parent spawn's
+// --settings occupies and a repo-local settings file cannot redirect
+// the follow-up turn's bearer (B1: an unpinned --resume in the session
+// cwd re-reads repo config over the parent env). Because the extras
+// cross a trust boundary into this process, they must be EXACTLY the
+// pair (--settings <json whose env names the session's own routing
+// destinations>); anything else — a foreign flag anywhere, a second
+// pair, a non-pin envelope — vetoes the whole thing, so callee input
+// can never smuggle a tool, model, or second settings layer onto the
+// resume turn.
+func resumeArgv(sessionID, prompt string, resumeExtraArgs []string) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--dangerously-skip-permissions",
-		"--resume", sessionID,
 	}
+	argv = append(argv, filterRoutingPinArgs(resumeExtraArgs)...)
+	argv = append(argv, "--resume", sessionID)
 	return argv, prompt
+}
+
+// filterRoutingPinArgs admits only a well-formed routing pin pair:
+// a `--settings` flag immediately followed by a JSON envelope whose env
+// names are exactly the session's own routing destinations and whose
+// values are non-empty. Anything else — a dangling flag, a non-pin flag,
+// a second value, unparseable JSON — vetoes the whole thing rather than
+// passing anything through. The whitelist is syntactic (shape + known
+// destination names); the harness renders the values from its own
+// post-projection spec, never from callee input.
+func filterRoutingPinArgs(extra []string) []string {
+	// The extras must be EXACTLY the pin pair: a foreign fragment
+	// anywhere in the slice vetoes the whole thing rather than being
+	// skipped, so a smuggled tool, model, or second settings layer can
+	// never ride alongside the pin.
+	if len(extra) != 2 || extra[0] != "--settings" {
+		return nil
+	}
+	if !isRoutingPinJSON(extra[1]) {
+		return nil
+	}
+	return []string{"--settings", extra[1]}
 }
 
 // composeEnv builds the child process environment by merging parentEnv

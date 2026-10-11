@@ -223,6 +223,24 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 	return argv, stdinPrompt
 }
 
+// resumePinArgs renders the session's routing pin as the --resume argv
+// fragment handed to the driver (see spawn): --settings <pin JSON> when
+// the session carries routing of its own, nil otherwise. It reuses the
+// headless pin rendering verbatim, so every --resume in the session cwd
+// resolves on the same pinned layer as the initial spawn. The pin holds
+// only destinations — the driver's syntactic guard admits nothing else.
+func resumePinArgs(spec agent.Spec) []string {
+	pin := pinnedRoutingEnv(spec)
+	if len(pin) == 0 {
+		return nil
+	}
+	pinJSON, err := marshalRoutingPin(pin)
+	if err != nil || pinJSON == "" {
+		return nil
+	}
+	return []string{"--settings", pinJSON}
+}
+
 // marshalRoutingPin renders the routing pin as the --settings JSON string
 // the headless lane passes. Only routingPinEnvNames members are honored —
 // anything else is dropped rather than passed through, so a caller cannot
