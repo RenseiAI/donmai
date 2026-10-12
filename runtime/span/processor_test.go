@@ -305,6 +305,7 @@ func TestProviderSystem_AllRuntimeHarnesses(t *testing.T) {
 		{agent.ProviderClaude, "anthropic"},
 		{agent.ProviderCodex, "openai"},
 		{agent.ProviderGemini, "gcp.gemini"},
+		{agent.ProviderAGYCLI, "gcp.gemini"},
 		{agent.ProviderOllama, "ollama"},
 		{agent.ProviderOpenCode, "opencode"},
 		{agent.ProviderStub, "stub"},

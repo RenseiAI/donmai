@@ -752,7 +752,7 @@ func ProviderSystem(provider agent.ProviderName) string {
 		return "anthropic"
 	case agent.ProviderCodex:
 		return "openai"
-	case agent.ProviderGemini:
+	case agent.ProviderGemini, agent.ProviderAGYCLI:
 		return "gcp.gemini"
 	case agent.ProviderOllama:
 		return "ollama"
