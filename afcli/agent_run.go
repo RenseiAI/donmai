@@ -101,16 +101,23 @@ var buildRegistryForAgentRun = func(logger *slog.Logger, hints agentRunCtorHints
 	return buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
 }
 
+// shimTerminalAttempt is the session-scoped terminal sequence every
+// shim-owned seat persists its terminal body under. It is 1: the runner
+// writes exactly one terminal body per session, and the key must stay fixed
+// across shim resumes — the launch contract's monotonic process epoch
+// advances on resume and so must never key the outbox, or the resumed
+// incarnation would orphan the record the previous one persisted.
+const shimTerminalAttempt = 1
+
 // shimSeatFromEnv reports this worker's shim-owned seat, or nil when this
 // process was not launched under the per-session shim launch contract. It is
 // a var so tests can drive the shim-owned runner path without mutating the
 // process environment.
 var shimSeatFromEnv = func() *runner.ShimSeatConfig {
-	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
-	if err != nil {
+	if _, err := sessionshim.LaunchFromEnv(os.Getenv); err != nil {
 		return nil
 	}
-	return &runner.ShimSeatConfig{Attempt: launch.ProcessEpoch}
+	return &runner.ShimSeatConfig{Attempt: shimTerminalAttempt}
 }
 
 // gatewayHarnessIdentity projects the canonical loop-driver identity already

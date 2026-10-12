@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -306,5 +307,107 @@ func TestSaveStandaloneOutboxRejectsInvalidSaveSpec(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("refused saves left %d records behind", len(entries))
+	}
+}
+
+func TestStandaloneOutboxQuarantinesBadFileAndReplaysGood(t *testing.T) {
+	t.Parallel()
+	store, clock := standaloneOutboxStore(t)
+	session := "11111111-1111-4111-8111-111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"failed"}`)
+	deadline := clock.now.Add(MaximumLeaseDuration)
+	if _, err := store.SaveStandaloneOutbox(context.Background(), standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, deadline)); err != nil {
+		t.Fatal(err)
+	}
+	// A stray file, a truncated record, and an unknown-kind record land in
+	// the outbox directory. Before quarantining, any one of them failed the
+	// whole scan: good records sent 0 times and the store open failed.
+	dir := store.standaloneOutboxDir()
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{
+		"stray.json":     `{"hello":"world"}`,
+		"truncated.json": `{"schemaVersion":`,
+		"txo_bad.json":   `{"schemaVersion":"donmai.terminal-status-outbox.v1","outboxKey":"txo_bad","kind":"future-kind"}`,
+	} {
+		path := dir + "/" + name
+		if strings.HasSuffix(name, ".json") {
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var sent [][]byte
+	considered, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, func(_ context.Context, _ string, payload []byte) error {
+		sent = append(sent, append([]byte(nil), payload...))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("replay with bad files: %v", err)
+	}
+	if considered != 1 || len(sent) != 1 || !bytes.Equal(sent[0], body) {
+		t.Fatalf("considered=%d sent=%d, want the good record delivered", considered, len(sent))
+	}
+	entries, err := os.ReadDir(store.standaloneOutboxQuarantineDir())
+	if err != nil {
+		t.Fatalf("quarantine dir: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("quarantined=%d, want 3", len(entries))
+	}
+	// A reopened store also survives the bad files: the open used to fail.
+	reopened, err := NewLeaseStore(StoreOptions{Dir: store.Dir(), Now: clock.Now})
+	if err != nil {
+		t.Fatalf("reopen with bad files: %v", err)
+	}
+	if _, err := reopened.LoadStandaloneOutbox(context.Background(), session, 1); err != nil {
+		t.Fatalf("good record missing after reopen: %v", err)
+	}
+}
+
+func TestStandaloneOutboxPrunesDeliveredPastRetention(t *testing.T) {
+	t.Parallel()
+	store, clock := standaloneOutboxStore(t)
+	session := "11111111-1111-4111-8111-111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"completed"}`)
+	deadline := clock.now.Add(MaximumLeaseDuration)
+	if _, err := store.SaveStandaloneOutbox(context.Background(), standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, deadline)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStandaloneOutboxDelivered(context.Background(), session, 1); err != nil {
+		t.Fatal(err)
+	}
+	// Inside the retention window the delivered record still decodes: a
+	// second replay pass considers nothing but the file remains for
+	// post-mortem reads.
+	considered, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, func(_ context.Context, _ string, _ []byte) error {
+		t.Fatal("delivered record must not send again")
+		return nil
+	})
+	if err != nil || considered != 0 {
+		t.Fatalf("considered=%d err=%v", considered, err)
+	}
+	if _, err := store.LoadStandaloneOutbox(context.Background(), session, 1); err != nil {
+		t.Fatalf("delivered record pruned too early: %v", err)
+	}
+	// Past the retention window the next replay pass removes the file so
+	// the 5s scan stays bounded.
+	clock.now = clock.now.Add(StandaloneOutboxRetention + time.Hour)
+	considered, err = store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, func(_ context.Context, _ string, _ []byte) error {
+		t.Fatal("pruned record must not send")
+		return nil
+	})
+	if err != nil || considered != 0 {
+		t.Fatalf("considered=%d err=%v", considered, err)
+	}
+	if _, err := store.LoadStandaloneOutbox(context.Background(), session, 1); !errors.Is(err, ErrTerminalStatusNotFound) {
+		t.Fatalf("delivered record not pruned: %v", err)
 	}
 }

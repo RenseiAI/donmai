@@ -476,13 +476,12 @@ type KitSkillDetector func(repoRoot, targetOS string) ([]kit.KitSkillSource, err
 type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error)
 
 // ShimSeatConfig identifies one shim-owned seat to the runner: the attempt
-// is the launch contract's monotonic per-session incarnation counter, and it
-// disambiguates repeated runs of the same session in the standalone outbox
-// key. Zero is a valid first attempt; the zero value of the POINTER (nil)
-// is what disables the behaviour.
+// is the session-scoped terminal sequence the runner assigns to its terminal
+// body — 1 for the runner's own terminal status — so the key stays fixed
+// across shim resumes. Zero is never a valid attempt; the zero value of the
+// POINTER (nil) is what disables the behaviour.
 type ShimSeatConfig struct {
-	// Attempt is the per-session incarnation counter from the shim launch
-	// contract (sessionshim Launch.ProcessEpoch).
+	// Attempt is the session-scoped terminal sequence for the outbox key.
 	Attempt uint64
 }
 

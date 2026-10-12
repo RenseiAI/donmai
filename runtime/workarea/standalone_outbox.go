@@ -28,11 +28,15 @@ import (
 // failed, or cancelled — whether or not any lease was acquired. The daemon
 // replayer drains exactly the records that have no terminal workarea lease.
 //
-// The attempt is the runner's per-session incarnation counter: the shim
-// launch contract's monotonic process epoch. Both writers — the runner's
-// terminal record and the worker_exited_without_result fallback — derive the
-// same key from (session, attempt), and the first writer wins atomically; the
-// runner record and the fallback record never both exist.
+// The attempt is the session-scoped terminal sequence the runner assigns to
+// its terminal body: 1 for the runner's own terminal status. Both writers —
+// the runner's terminal record and the worker_exited_without_result
+// fallback — derive the same key from (session, attempt), and the first
+// writer wins atomically; the runner record and the fallback record never
+// both exist. The key deliberately does NOT track the shim launch contract's
+// monotonic process epoch: a resume that stops one incarnation and starts
+// another must replay the same terminal record rather than orphan it under a
+// new key.
 
 // StandaloneOutboxKind names which writer produced a standalone outbox record.
 type StandaloneOutboxKind string
@@ -49,9 +53,12 @@ const (
 // lease-independent terminal-status record.
 type StandaloneOutboxSaveSpec struct {
 	SessionID string
-	// Attempt is the per-session incarnation counter (the shim launch
-	// contract's monotonic process epoch). It disambiguates repeated runs
-	// of the same session so a stale record can never shadow a fresh run.
+	// Attempt is the session-scoped terminal sequence the runner assigns to
+	// its terminal body: 1 for the runner's own terminal status. It
+	// disambiguates repeated terminal writes of the same session so a stale
+	// record can never shadow a fresh run, and it stays fixed across shim
+	// resumes: a resume must not change the key, or the replay would orphan
+	// the record the previous incarnation persisted.
 	Attempt uint64
 	// TerminalResultID carries the body digest (the runner's stable terminal
 	// result identity): it binds the record to the exact bytes it replays.
@@ -70,7 +77,10 @@ type StandaloneOutboxSaveSpec struct {
 // StandaloneOutboxKey derives the durable key for one (session, attempt).
 // The key is a pure function of its inputs so the runner, the daemon
 // replayer, and the fallback writer all address the same record without a
-// separate link: the tombstone-side link lands separately.
+// separate link: the tombstone-side link lands separately. The attempt is
+// the session-scoped terminal sequence, not the shim launch contract's
+// process epoch: a resume advances the epoch but must keep addressing the
+// same record.
 func StandaloneOutboxKey(sessionID string, attempt uint64) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x1f%d", sessionID, attempt)))
 	return "txo_" + hex.EncodeToString(sum[:16])
@@ -129,6 +139,57 @@ type standaloneOutboxEnvelope struct {
 	Kind             StandaloneOutboxKind `json:"kind"`
 	TerminalResultID string               `json:"terminalResultId"`
 	Record           TerminalStatusOutbox `json:"record"`
+}
+
+// StandaloneOutboxRetention bounds how long a terminal record stays on
+// disk after it stops needing replay. Delivered and dead-letter records
+// carry no further work: the receiver already accepted the bytes (or the
+// delivery policy gave up on them), so they are pruned rather than decoded
+// on every replay pass and every store open. The bound is deliberately
+// generous — a delivered record remains available for post-mortem reads for
+// a full day before the next replay pass removes its file.
+const StandaloneOutboxRetention = 24 * time.Hour
+
+// standaloneOutboxQuarantineDir names the sibling directory that holds
+// outbox files which failed to decode. A stray, truncated, or unknown-kind
+// file quarantines there instead of failing the whole scan: without it one
+// bad file blocks every good record (no sends at all) and fails the store
+// open, which fails daemon start and worker preflight.
+func (s *LeaseStore) standaloneOutboxQuarantineDir() string {
+	return filepath.Join(s.dir, "standalone-outbox-quarantine")
+}
+
+func (s *LeaseStore) standaloneOutboxQuarantinePath(name string) string {
+	return filepath.Join(s.standaloneOutboxQuarantineDir(), name)
+}
+
+func (s *LeaseStore) ensureStandaloneOutboxQuarantineDir() error {
+	dir := s.standaloneOutboxQuarantineDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("runtime/workarea: create standalone outbox quarantine: %w", err)
+	}
+	return syncDir(dir)
+}
+
+// quarantineStandaloneOutboxFile moves one undecodable outbox file aside so
+// the remaining records keep replaying. The quarantined name keeps the
+// original filename plus a millisecond timestamp so two bad files with the
+// same name never collide, and the move is a rename inside the same parent
+// so it is atomic. Best-effort: a quarantine failure is returned so the
+// caller can fail closed rather than silently dropping the record.
+func (s *LeaseStore) quarantineStandaloneOutboxFile(name, reason string) error {
+	if err := s.ensureStandaloneOutboxQuarantineDir(); err != nil {
+		return err
+	}
+	src := filepath.Join(s.standaloneOutboxDir(), name)
+	dst := s.standaloneOutboxQuarantinePath(fmt.Sprintf("%s.%d.quarantined", name, s.now().UnixMilli()))
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("runtime/workarea: quarantine standalone outbox %s (%s): %w", name, reason, err)
+	}
+	if err := syncDir(s.standaloneOutboxDir()); err != nil {
+		return err
+	}
+	return syncDir(s.standaloneOutboxQuarantineDir())
 }
 
 func (s *LeaseStore) standaloneOutboxDir() string {
@@ -510,6 +571,20 @@ func (s *LeaseStore) listStandaloneOutbox() ([]standaloneOutboxEnvelope, error) 
 	if err := s.Ready(); err != nil {
 		return nil, err
 	}
+	return s.scanStandaloneOutbox(true)
+}
+
+// scanStandaloneOutbox reads every outbox file, quarantining the ones that
+// fail to decode instead of failing the whole scan. Quarantining is what
+// keeps one bad file from blocking every good record: the scan decodes all
+// of them today, and without this a stray, truncated, or unknown-kind file
+// means good records send 0 times. When prune is true, delivered and
+// dead-letter records older than StandaloneOutboxRetention are removed
+// instead of decoded on every 5s replay pass and every store open — those
+// terminal records carry no further work, and decoding all of them costs
+// ~390ms per pass at 10k records (1.2s at 30k). Records still inside the
+// retention window decode normally so post-mortem reads keep working.
+func (s *LeaseStore) scanStandaloneOutbox(prune bool) ([]standaloneOutboxEnvelope, error) {
 	dir := s.standaloneOutboxDir()
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -518,6 +593,7 @@ func (s *LeaseStore) listStandaloneOutbox() ([]standaloneOutboxEnvelope, error) 
 	if err != nil {
 		return nil, err
 	}
+	nowMS := s.now().UnixMilli()
 	envelopes := make([]standaloneOutboxEnvelope, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -526,18 +602,49 @@ func (s *LeaseStore) listStandaloneOutbox() ([]standaloneOutboxEnvelope, error) 
 		key := strings.TrimSuffix(entry.Name(), ".json")
 		envelope, err := s.loadStandaloneOutbox(key)
 		if err != nil {
-			return nil, err
+			if errors.Is(err, ErrTerminalStatusNotFound) {
+				// A filename that is not an outbox key (a stray file
+				// dropped in the directory) quarantines like a
+				// corrupt record: it is not addressable, so no
+				// sender will ever drain it.
+				if qErr := s.quarantineStandaloneOutboxFile(entry.Name(), err.Error()); qErr != nil {
+					return nil, qErr
+				}
+				continue
+			}
+			if qErr := s.quarantineStandaloneOutboxFile(entry.Name(), err.Error()); qErr != nil {
+				return nil, qErr
+			}
+			continue
+		}
+		if prune && (envelope.Record.DeliveryState == TerminalStatusDelivered ||
+			envelope.Record.DeliveryState == TerminalStatusDeadLetter) {
+			settledMS := envelope.Record.NextAttemptAt.UnixMilli()
+			if nowMS-settledMS >= StandaloneOutboxRetention.Milliseconds() {
+				if err := os.Remove(s.standaloneOutboxPath(envelope.OutboxKey)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return nil, fmt.Errorf("runtime/workarea: prune standalone outbox %s: %w", envelope.OutboxKey, err)
+				}
+				continue
+			}
 		}
 		envelopes = append(envelopes, *envelope)
+	}
+	if prune {
+		if err := syncDir(dir); err != nil {
+			return nil, err
+		}
 	}
 	return envelopes, nil
 }
 
 // reconcileStandaloneOutbox returns interrupted in-flight sends to pending so
 // a daemon restart replays rather than strands them. It runs at store open,
-// before the store reports ready.
+// before the store reports ready. It shares the quarantine-and-prune scan
+// with the replay path so a bad file cannot fail the open (which would fail
+// daemon start and worker preflight), and terminal records past retention
+// are pruned before the store reports ready.
 func (s *LeaseStore) reconcileStandaloneOutbox() error {
-	envelopes, err := s.listStandaloneOutboxForReconcile()
+	envelopes, err := s.scanStandaloneOutbox(true)
 	if err != nil {
 		return err
 	}
@@ -550,28 +657,4 @@ func (s *LeaseStore) reconcileStandaloneOutbox() error {
 		}
 	}
 	return nil
-}
-
-func (s *LeaseStore) listStandaloneOutboxForReconcile() ([]standaloneOutboxEnvelope, error) {
-	dir := s.standaloneOutboxDir()
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	envelopes := make([]standaloneOutboxEnvelope, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		key := strings.TrimSuffix(entry.Name(), ".json")
-		envelope, err := s.loadStandaloneOutbox(key)
-		if err != nil {
-			return nil, err
-		}
-		envelopes = append(envelopes, *envelope)
-	}
-	return envelopes, nil
 }
