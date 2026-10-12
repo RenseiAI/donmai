@@ -146,7 +146,7 @@ func TestWorkerCapEnv(t *testing.T) {
 		"NINJAFLAGS":                 "-j4",
 		"CARGO_BUILD_JOBS":           "4",
 		"UV_THREADPOOL_SIZE":         "4",
-		SeatCPUsEnv:                    "4",
+		SeatCPUsEnv:                  "4",
 	}
 	for k, v := range want {
 		if env[k] != v {

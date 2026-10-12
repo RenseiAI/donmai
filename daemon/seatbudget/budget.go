@@ -208,7 +208,7 @@ func WorkerCapEnv(cpus int) map[string]string {
 		"NINJAFLAGS":                 "-j" + n,
 		"CARGO_BUILD_JOBS":           n,
 		"UV_THREADPOOL_SIZE":         n,
-		SeatCPUsEnv:                    n,
+		SeatCPUsEnv:                  n,
 	}
 }
 

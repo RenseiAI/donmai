@@ -260,8 +260,8 @@ type WorkerSpawner struct {
 	// read it unlocked, so sharing mu would either race or serialize
 	// every spawn on admission. A struct value races under -race even
 	// when both sides hold no common lock — hence the dedicated RWMutex.
-	seatBudgetMu           sync.RWMutex
-	seatBudget             SeatBudget
+	seatBudgetMu sync.RWMutex
+	seatBudget   SeatBudget
 	// seatQoSMu guards seatQoS separately from mu for the same reason
 	// the budget has its own lock: SetSeatQoS swaps it from the config
 	// watcher while AcceptWork/spawn run unlocked.
