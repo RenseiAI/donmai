@@ -590,3 +590,93 @@ func TestTranslateSpec_NilEndpointRemainsNil(t *testing.T) {
 		t.Errorf("Endpoint = %+v, want nil", spec.Endpoint)
 	}
 }
+
+// TestTranslateSpec_SubAgentCapZeroWithholdsDelegationTools pins the
+// gentler cap-0 behaviour: when the stage budget's sub-agent cap is an
+// explicit 0 (no delegations allowed), the Task/Agent delegation tools
+// are withheld on the DisallowedTools channel so the harness never offers
+// them, instead of the session stopping on the first delegation call.
+// A nil budget, a nil (absent) cap, or a positive cap withholds nothing.
+func TestTranslateSpec_SubAgentCapZeroWithholdsDelegationTools(t *testing.T) {
+	t.Parallel()
+	zero := 0
+	negative := -1
+	two := 2
+	tests := []struct {
+		name       string
+		budget     *prompt.StageBudget
+		wantDenied []string // delegation entries that must appear in DisallowedTools; nil = none
+	}{
+		{name: "nil budget withholds nothing"},
+		{name: "absent cap withholds nothing", budget: &prompt.StageBudget{MaxTokens: 8_000}},
+		{name: "positive cap withholds nothing", budget: &prompt.StageBudget{MaxSubAgents: &two}},
+		{name: "explicit zero withholds delegation", budget: &prompt.StageBudget{MaxSubAgents: &zero}, wantDenied: []string{"Task", "Agent"}},
+		{name: "negative cap withholds delegation", budget: &prompt.StageBudget{MaxSubAgents: &negative}, wantDenied: []string{"Task", "Agent"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			caps := agent.Capabilities{AcceptsAllowedToolsList: true}
+			in := SpecInputs{Cwd: "/tmp/wt", Prompt: "do"}
+			qw := QueuedWork{}
+			qw.StageBudget = tt.budget
+			spec := translateSpec(qw, caps, in)
+			for _, want := range tt.wantDenied {
+				if !slices.Contains(spec.DisallowedTools, want) {
+					t.Errorf("DisallowedTools = %v, want withheld delegation tool %q", spec.DisallowedTools, want)
+				}
+			}
+			if len(tt.wantDenied) == 0 {
+				for _, withheld := range []string{"Task", "Agent"} {
+					if slices.Contains(spec.DisallowedTools, withheld) {
+						t.Errorf("DisallowedTools = %v, must not withhold %q without a zero cap", spec.DisallowedTools, withheld)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestTranslateSpec_SubAgentCapZeroAddsToPlatformDisallows verifies the
+// withholding is additive: platform-supplied DisallowedTools entries and
+// the baseline survive alongside the withheld delegation tools.
+func TestTranslateSpec_SubAgentCapZeroAddsToPlatformDisallows(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{AcceptsAllowedToolsList: true}
+	in := SpecInputs{Cwd: "/tmp/wt", Prompt: "do"}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		DisallowedTools: []string{"WebFetch(http://169.254.169.254/*)"},
+	}}
+	zero := 0
+	qw.StageBudget = &prompt.StageBudget{MaxSubAgents: &zero}
+	spec := translateSpec(qw, caps, in)
+	for _, want := range append(defaultDisallowedTools(), "WebFetch(http://169.254.169.254/*)", "Task", "Agent") {
+		if !slices.Contains(spec.DisallowedTools, want) {
+			t.Errorf("DisallowedTools = %v, want %q", spec.DisallowedTools, want)
+		}
+	}
+}
+
+// TestTranslateSpec_SubAgentCapZeroReachesCodexDisallowPatterns verifies
+// the codex bridge carries the withheld delegation tools: codex consumes
+// tool policy through PermissionConfig, so the entries must land in
+// DisallowPatterns rather than being dropped with the flat lists.
+func TestTranslateSpec_SubAgentCapZeroReachesCodexDisallowPatterns(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{NeedsPermissionConfig: true, AcceptsAllowedToolsList: false}
+	zero := 0
+	qw := QueuedWork{}
+	qw.StageBudget = &prompt.StageBudget{MaxSubAgents: &zero}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
+	if spec.PermissionConfig == nil {
+		t.Fatal("PermissionConfig must be set for codex when the zero cap withholds delegation tools")
+	}
+	for _, want := range []string{"Task", "Agent"} {
+		if !slices.Contains(spec.PermissionConfig.DisallowPatterns, want) {
+			t.Errorf("DisallowPatterns = %v, want withheld delegation tool %q", spec.PermissionConfig.DisallowPatterns, want)
+		}
+	}
+	if spec.DisallowedTools != nil {
+		t.Errorf("DisallowedTools must be zeroed for codex (routed to PermissionConfig); got %v", spec.DisallowedTools)
+	}
+}

@@ -95,7 +95,40 @@ func legacySpecToolPolicy(qw QueuedWork) specToolPolicy {
 	if len(qw.DisallowedTools) > 0 {
 		disallowedTools = append(disallowedTools, qw.DisallowedTools...)
 	}
+	if subAgentCapAllowsNone(qw) {
+		disallowedTools = append(disallowedTools, subAgentDelegationTools...)
+	}
 	return specToolPolicy{AllowedTools: allowedTools, DisallowedTools: disallowedTools}
+}
+
+// subAgentDelegationTools are the runner-counted delegation tool names
+// withheld from the harness when the stage budget allows no sub-agents.
+// They mirror the delegation core names every adapter's event mapper
+// counts as a sub-agent start ("Task" and "Agent", case-insensitive):
+// withholding both leaves no shaped hole for the agent to delegate
+// through while the cap refuses every delegation.
+var subAgentDelegationTools = []string{"Task", "Agent"}
+
+// subAgentCapAllowsNone reports whether the session's stage budget refuses
+// every sub-agent delegation: an explicit MaxSubAgents cap below 1. This
+// mirrors BudgetEnforcer.ObserveEvent, which breaches on the first counted
+// start whenever the cap is < 1 — withholding the delegation tools is the
+// gentler form of the same refusal: the harness never offers Task/Agent,
+// so the agent plans without delegation instead of the session stopping
+// on its first delegation call. A nil budget or a nil cap (not enforced)
+// withholds nothing, and the enforcer stays the backstop wherever a
+// harness does not honor the disallow channel.
+//
+// The entries ride the standard DisallowedTools channel, so harnesses
+// that route it into a regex list (codex PermissionConfig.DisallowPatterns)
+// match them as substring patterns — the channel's documented semantic,
+// shared with every platform-supplied entry — rather than as exact tool
+// names.
+func subAgentCapAllowsNone(qw QueuedWork) bool {
+	if qw.StageBudget == nil || qw.StageBudget.MaxSubAgents == nil {
+		return false
+	}
+	return *qw.StageBudget.MaxSubAgents <= 0
 }
 
 func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in SpecInputs, policy specToolPolicy) agent.Spec {
