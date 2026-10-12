@@ -436,3 +436,31 @@ exited:
 	}
 	assertLiveGatewayConfig(t, seen, tokenPath)
 }
+
+// TestInteractiveHandle_ExposesSessionSidecarPath pins the claude
+// interactive leg of the typed context notice: the spawned handle reports
+// the session's own sidecar path through the runner's session-scoped seam,
+// so the watcher polls this session's file — never a process-wide
+// variable. A handle without a channel reports none and runs without
+// context notices.
+func TestInteractiveHandle_ExposesSessionSidecarPath(t *testing.T) {
+	hook := newTestStopHookChannel(t)
+	h := &interactiveHandle{notices: hook}
+	got := h.ContextUsageSidecarPath()
+	if got == "" {
+		t.Fatal("sidecar path is empty for a session with a channel")
+	}
+	if got != hook.sidecarPath() {
+		t.Fatalf("sidecar path = %q, want the session channel's %q", got, hook.sidecarPath())
+	}
+	bare := &interactiveHandle{}
+	if path := bare.ContextUsageSidecarPath(); path != "" {
+		t.Fatalf("channel-less handle reported %q, want empty", path)
+	}
+	var nilHandle *interactiveHandle
+	if path := nilHandle.ContextUsageSidecarPath(); path != "" {
+		t.Fatalf("nil handle reported %q, want empty", path)
+	}
+	// The seam assertion: the runner resolves through this interface.
+	var _ agent.ContextUsageSourcer = h
+}

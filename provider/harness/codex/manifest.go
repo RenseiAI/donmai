@@ -60,9 +60,14 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// declared here; driving it is a separate lane.
 			NoticeDelivery: agent.NoticeDeliveryMCPRPC,
 			// token_count events in the rollout JSONL are the
-			// harness-native context signal, read by the runner's
-			// context watcher (runner/context_usage.go) and delivered
-			// as a typed ContextUsageEvent.
+			// harness-native context signal: the event_msg envelope
+			// carrying cumulative totals beside the model window (plus
+			// top-level compacted markers). The headless handle tails
+			// its own session file (rollout_context_tail.go: spawn-known
+			// home and thread, never the environment) and the
+			// interactive watcher polls the handle's own rollout home
+			// (runner/context_usage.go); both deliver crossings as a
+			// typed ContextUsageEvent.
 			ContextUsageSource: agent.ContextUsageSourceRolloutTokenCount,
 			Drives:             []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},
 			DrivesHosts:        []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},

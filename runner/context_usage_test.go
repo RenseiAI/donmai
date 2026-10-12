@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/executionevent"
 )
 
 func writeSidecar(t *testing.T, dir, body string) string {
@@ -22,9 +24,14 @@ func writeSidecar(t *testing.T, dir, body string) string {
 	return path
 }
 
-func writeRollout(t *testing.T, dir string, lines []string) string {
+func writeRollout(t *testing.T, dir string, lines []string) (home, path string) {
 	t.Helper()
-	path := filepath.Join(dir, "rollout.jsonl")
+	home = filepath.Join(dir, "codex-home")
+	sub := filepath.Join(home, "sessions", "2026", "10", "09")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(sub, "rollout-2026-10-09T00-00-00-thread-test.jsonl")
 	body := ""
 	for _, line := range lines {
 		body += line + "\n"
@@ -32,7 +39,20 @@ func writeRollout(t *testing.T, dir string, lines []string) string {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return path
+	return home, path
+}
+
+// appendRollout appends raw bytes to the fixture rollout at path.
+func appendRollout(t *testing.T, path, body string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
 }
 
 func drainNotices(w *contextUsageWatcher) []agent.Event {
@@ -133,13 +153,19 @@ func TestContextWatcher_SidecarCompactionMarker(t *testing.T) {
 func TestContextWatcher_RolloutTokenCounts(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	path := writeRollout(t, dir, []string{
+	// Fixture lines in the real event_msg/token_count shape: the window
+	// share derives as 100*total/window (55, 80 — one bound crossing
+	// each), beside unrelated line shapes the watcher skips.
+	home, path := writeRollout(t, dir, []string{
 		`{"type":"session_meta","payload":{"id":"thread-1"}}`,
-		`{"type":"token_count","payload":{"total_input_tokens": 60000, "used_percentage": 55}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"model_context_window":200000}}}`,
 		`{"type":"event_msg","payload":{"message":"done"}}`,
-		`{"type":"token_count","payload":{"total_input_tokens": 95000, "used_percentage": 80}}`,
+		`{"type":"token_usage_record","payload":{"thread_id":"thread-1"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160000,"output_tokens":0,"total_tokens":160000},"model_context_window":200000}}}`,
 	})
-	w := newContextUsageWatcher(contextUsageSource{harness: "codex", rolloutPath: path})
+	// The source carries the session home + thread — never a planted file
+	// path — so this test proves the production resolve→poll→notice loop.
+	w := newContextUsageWatcher(contextUsageSource{harness: "codex", rolloutHome: home, rolloutThread: "thread-test"})
 
 	got := drainNotices(w)
 	if len(got) != 2 {
@@ -162,27 +188,76 @@ func TestContextWatcher_RolloutTokenCounts(t *testing.T) {
 		t.Fatalf("drained rollout yielded %d notices, want none", len(got))
 	}
 	// A torn trailing line stays unread until completed.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(`{"type":"token_count","payload":{"total_input_tokens": 99`); err != nil {
-		t.Fatal(err)
-	}
-	_ = f.Close()
+	appendRollout(t, path, `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens": 99`)
 	if got := drainNotices(w); len(got) != 0 {
 		t.Fatalf("torn tail yielded %d notices, want none", len(got))
 	}
-	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(`000, "used_percentage": 95}}` + "\n"); err != nil {
-		t.Fatal(err)
-	}
-	_ = f.Close()
+	appendRollout(t, path, `000, "output_tokens":0, "total_tokens":199000},"model_context_window":200000}}}`+"\n")
 	if got := drainNotices(w); len(got) != 1 {
 		t.Fatalf("completed tail yielded %d notices, want 1", len(got))
+	}
+}
+
+// TestContextWatcher_RolloutPathReResolves pins the late-file posture: a
+// session whose rollout file does not exist yet emits nothing, then tails
+// it once the harness creates it — the path is re-resolved every poll,
+// never once at start.
+func TestContextWatcher_RolloutPathReResolves(t *testing.T) {
+	t.Parallel()
+	home := filepath.Join(t.TempDir(), "codex-home")
+	w := newContextUsageWatcher(contextUsageSource{harness: "codex", rolloutHome: home, rolloutThread: "thread-late"})
+	if got := drainNotices(w); len(got) != 0 {
+		t.Fatalf("absent rollout yielded %d notices, want none", len(got))
+	}
+	sub := filepath.Join(home, "sessions", "2026", "10", "09")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	late := filepath.Join(sub, "rollout-2026-10-09T00-00-00-thread-late.jsonl")
+	body := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"model_context_window":200000}}}` + "\n"
+	if err := os.WriteFile(late, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainNotices(w); len(got) != 1 {
+		t.Fatalf("late rollout yielded %d notices, want 1", len(got))
+	}
+}
+
+// TestContextWatcher_RolloutNewestFileWins pins the unnamed-session
+// posture: with a home but no thread, the watcher tails the home's newest
+// rollout — the home is session-private, so the newest file is this
+// session's.
+func TestContextWatcher_RolloutNewestFileWins(t *testing.T) {
+	t.Parallel()
+	home, _ := writeRollout(t, t.TempDir(), []string{
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"model_context_window":200000}}}`,
+	})
+	w := newContextUsageWatcher(contextUsageSource{harness: "codex", rolloutHome: home})
+	if got := drainNotices(w); len(got) != 1 {
+		t.Fatalf("threadless rollout yielded %d notices, want 1", len(got))
+	}
+}
+
+// TestContextWatcher_RolloutCompactionMarker pins the compaction leg: a
+// top-level compacted line in the real rollout shape emits one compaction
+// notice, exactly as a live session file carries it.
+func TestContextWatcher_RolloutCompactionMarker(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	home, _ := writeRollout(t, dir, []string{
+		`{"type":"compacted","payload":{"message":""}}`,
+	})
+	w := newContextUsageWatcher(contextUsageSource{harness: "codex", rolloutHome: home, rolloutThread: "thread-test"})
+	got := drainNotices(w)
+	if len(got) != 1 {
+		t.Fatalf("compacted marker yielded %d notices, want 1", len(got))
+	}
+	if notice := got[0].(agent.ContextUsageEvent); notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Fatalf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	// Fully read: the marker reports once.
+	if got := drainNotices(w); len(got) != 0 {
+		t.Fatalf("drained rollout yielded %d notices, want none", len(got))
 	}
 }
 
@@ -194,7 +269,7 @@ func TestContextWatcher_MissingFilesAreSilent(t *testing.T) {
 	w := newContextUsageWatcher(contextUsageSource{
 		harness:     "claude-code",
 		sidecarPath: filepath.Join(dir, "nope.json"),
-		rolloutPath: filepath.Join(dir, "nope.jsonl"),
+		rolloutHome: filepath.Join(dir, "nope-home"),
 	})
 	if got := drainNotices(w); len(got) != 0 {
 		t.Fatalf("missing files yielded %d notices, want none", len(got))
@@ -316,5 +391,104 @@ func TestContextUsageWatchStopJoinsInFlightEmit(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("stop did not return after the in-flight emit finished")
+	}
+}
+
+// contextUsageTestHandle is a production-seam test double: it implements
+// agent.ContextUsageSourcer the way the claude interactive handle and the
+// codex interactive wrapper do — session-scoped paths, no environment.
+type contextUsageTestHandle struct {
+	agent.Handle
+	sidecar string
+	home    string
+	thread  string
+}
+
+func (h *contextUsageTestHandle) ContextUsageSidecarPath() string { return h.sidecar }
+func (h *contextUsageTestHandle) ContextUsageRollout() (string, string) {
+	return h.home, h.thread
+}
+
+// TestResolveContextUsageSource_ReadsTheHandleNotTheProcess pins the gate's
+// core finding: the watcher resolves its paths from the spawned handle's
+// own session-scoped seam. A process-wide variable can never fan one
+// session's readings out to another session, because no variable is read.
+func TestResolveContextUsageSource_ReadsTheHandleNotTheProcess(t *testing.T) {
+	// No t.Parallel: this test asserts process-wide variables are never
+	// consulted, so it sets them to decoy values.
+	t.Setenv("CLAUDE_STATUSLINE_SIDECAR", "/tmp/process-wide-sidecar.json")
+	t.Setenv("CODEX_HOME", "/tmp/process-wide-home")
+	t.Setenv("CODEX_THREAD_ID", "thread-process-wide")
+
+	// A handle with no seam reports no source even with the process
+	// variables set: there is deliberately no environment fallback.
+	if got := resolveContextUsageSource(nil); got.harness != "" {
+		t.Fatalf("nil handle resolved %+v; want empty", got)
+	}
+	// The claude leg: the handle's own sidecar path wins; the process
+	// variable is never consulted.
+	claude := &contextUsageTestHandle{sidecar: "/tmp/session-a/sidecar.json"}
+	got := resolveContextUsageSource(claude)
+	if got.harness != string(agent.HarnessClaudeCode) || got.sidecarPath != "/tmp/session-a/sidecar.json" {
+		t.Fatalf("claude resolved %+v; want the handle's sidecar", got)
+	}
+	// The codex leg: the handle's own home + thread.
+	codex := &contextUsageTestHandle{home: "/tmp/session-b/home", thread: "thread-b"}
+	got = resolveContextUsageSource(codex)
+	if got.harness != string(agent.HarnessCodex) || got.rolloutHome != "/tmp/session-b/home" || got.rolloutThread != "thread-b" {
+		t.Fatalf("codex resolved %+v; want the handle's home+thread", got)
+	}
+}
+
+// TestContextWatcher_EndToEndHandleToSeries pins the whole claude leg: a
+// sidecar file at the handle's own path (as the session's statusLine
+// command maintains it) polls into a typed notice that normalizes to the
+// usage.recorded series record with unknown measurements absent, never
+// zero. It drives the production resolve→poll→normalize chain, not a
+// helper.
+func TestContextWatcher_EndToEndHandleToSeries(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecar := writeSidecar(t, dir, `{"used_percentage": 62.5, "total_input_tokens": 125000}`)
+	handle := &contextUsageTestHandle{sidecar: sidecar}
+	source := resolveContextUsageSource(handle)
+	if source.harness == "" {
+		t.Fatal("no source for a handle with a sidecar")
+	}
+	w := newContextUsageWatcher(source)
+	notices := drainNotices(w)
+	if len(notices) != 1 {
+		t.Fatalf("sidecar yielded %d notices, want 1", len(notices))
+	}
+	notice, ok := notices[0].(agent.ContextUsageEvent)
+	if !ok {
+		t.Fatalf("notice type = %T, want ContextUsageEvent", notices[0])
+	}
+	record, emitted, err := executionevent.NormalizeEvent("session_e2e", 7, time.Now(), notice)
+	if err != nil {
+		t.Fatalf("NormalizeEvent: %v", err)
+	}
+	if !emitted {
+		t.Fatal("notice did not emit a series record")
+	}
+	raw, _ := json.Marshal(record)
+	var wire struct {
+		EventType string         `json:"eventType"`
+		Payload   map[string]any `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("decode series record: %v", err)
+	}
+	if wire.EventType != "usage.recorded" {
+		t.Fatalf("eventType = %q, want usage.recorded (in %s)", wire.EventType, raw)
+	}
+	payload := wire.Payload
+	if payload["usedPercent"] != 62.5 {
+		t.Errorf("usedPercent = %v, want 62.5", payload["usedPercent"])
+	}
+	for _, absent := range []string{"outputTokens", "contextWindowSize"} {
+		if _, present := payload[absent]; present {
+			t.Errorf("series stores %q for an unknown measurement; want absent (never zero)", absent)
+		}
 	}
 }

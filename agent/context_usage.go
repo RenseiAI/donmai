@@ -200,81 +200,112 @@ func sidecarInt64(n json.Number, field string) (int64, error) {
 }
 
 // codexTokenCountLine is the narrow slice of the rollout JSONL schema the
-// context notice reads: a token_count event carrying the thread's token
-// totals. Every other line shape is skipped by the caller before decoding
-// reaches here; every count is optional so a partial event stays partial,
-// never zero-filled.
+// context notice reads: an event_msg envelope whose payload carries a
+// token_count event with the thread's cumulative token totals and the
+// model's context window (verified against live rollout files: 1044
+// token_count events, all in this shape). A top-level "compacted" line
+// marks a compaction the harness performed. Every other line shape is
+// skipped by the caller before decoding reaches here; every count is
+// optional so a partial event stays partial, never zero-filled.
 type codexTokenCountLine struct {
 	Type    string `json:"type"`
 	Payload *struct {
-		ThreadID          string   `json:"thread_id"`
-		TotalInputTokens  *int64   `json:"total_input_tokens"`
-		TotalOutputTokens *int64   `json:"total_output_tokens"`
-		ContextWindowSize *int64   `json:"context_window_size"`
-		UsedPercentage    *float64 `json:"used_percentage"`
-		Compacted         *bool    `json:"compacted"`
-		TokenCount        *int64   `json:"token_count"`
+		// TokenCountType is the nested event_msg discriminant: only
+		// "token_count" carries this signal.
+		TokenCountType string `json:"type"`
+		Info           *struct {
+			TotalTokenUsage *struct {
+				InputTokens  *int64 `json:"input_tokens"`
+				OutputTokens *int64 `json:"output_tokens"`
+				TotalTokens  *int64 `json:"total_tokens"`
+			} `json:"total_token_usage"`
+			ModelContextWindow *int64 `json:"model_context_window"`
+		} `json:"info"`
 	} `json:"payload"`
 }
 
 // ParseCodexTokenCountNotice reads one rollout JSONL line and returns the
-// typed context notice when the line is a token_count event. Non-token_count
-// lines return (nil, nil) — not this signal, not an error. A token_count
-// event with no measurement still yields a compaction notice when it marks
-// one; otherwise it returns (nil, nil). Negative counts are an error,
-// never a reading.
+// typed context notice when the line is an event_msg/token_count event. A
+// top-level "compacted" line returns a compaction notice (the marker
+// itself is the signal). Every other line returns (nil, nil) — not this
+// signal, not an error. Negative counts are an error, never a reading.
+//
+// The context-window share is DERIVED, not parsed: the rollout carries the
+// cumulative total and the model window but no percentage, so UsedPercent
+// is 100*total/window. It is a computed measurement from two reported
+// numbers, never a fabricated one: either input missing means no notice
+// (a threshold notice with no percentage carries only token counts the
+// per-turn usage events already meter).
 func ParseCodexTokenCountNotice(line []byte, harness string) (*ContextUsageEvent, error) {
 	var decoded codexTokenCountLine
 	if err := json.Unmarshal(line, &decoded); err != nil {
 		return nil, nil
 	}
-	if decoded.Type != "token_count" || decoded.Payload == nil {
+	if decoded.Type == "compacted" {
+		return &ContextUsageEvent{
+			Harness:    harness,
+			Source:     ContextUsageSourceRolloutTokenCount,
+			NoticeKind: ContextUsageCompaction,
+			Raw:        string(line),
+		}, nil
+	}
+	if decoded.Type != "event_msg" || decoded.Payload == nil ||
+		decoded.Payload.TokenCountType != "token_count" || decoded.Payload.Info == nil {
 		return nil, nil
 	}
-	p := decoded.Payload
+	info := decoded.Payload.Info
 	out := &ContextUsageEvent{
 		Harness:    harness,
 		Source:     ContextUsageSourceRolloutTokenCount,
 		NoticeKind: ContextUsageThreshold,
 		Raw:        string(line),
 	}
-	if p.UsedPercentage != nil {
-		f := *p.UsedPercentage
-		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 100 {
-			return nil, fmt.Errorf("agent: rollout token_count used_percentage %v is not a 0-100 percent", f)
+	if totals := info.TotalTokenUsage; totals != nil {
+		if totals.InputTokens != nil {
+			if *totals.InputTokens < 0 {
+				return nil, fmt.Errorf("agent: rollout token_count input_tokens %d is negative", *totals.InputTokens)
+			}
+			if *totals.InputTokens > 0 {
+				out.InputTokens = totals.InputTokens
+			}
 		}
-		out.UsedPercent = &f
-	}
-	if p.TotalInputTokens != nil {
-		if *p.TotalInputTokens < 0 {
-			return nil, fmt.Errorf("agent: rollout token_count total_input_tokens %d is negative", *p.TotalInputTokens)
+		if totals.OutputTokens != nil {
+			if *totals.OutputTokens < 0 {
+				return nil, fmt.Errorf("agent: rollout token_count output_tokens %d is negative", *totals.OutputTokens)
+			}
+			if *totals.OutputTokens > 0 {
+				out.OutputTokens = totals.OutputTokens
+			}
 		}
-		out.InputTokens = p.TotalInputTokens
-	} else if p.TokenCount != nil {
-		// Some emitters report a single combined total without splitting
-		// input from output: it reads as input-side context consumption,
-		// never as both.
-		if *p.TokenCount < 0 {
-			return nil, fmt.Errorf("agent: rollout token_count token_count %d is negative", *p.TokenCount)
+		if totals.TotalTokens != nil {
+			if *totals.TotalTokens < 0 {
+				return nil, fmt.Errorf("agent: rollout token_count total_tokens %d is negative", *totals.TotalTokens)
+			}
+			if info.ModelContextWindow != nil {
+				if *info.ModelContextWindow <= 0 {
+					return nil, fmt.Errorf("agent: rollout token_count model_context_window %d is not positive", *info.ModelContextWindow)
+				}
+				window := *info.ModelContextWindow
+				out.ContextWindowSize = &window
+				pct := 100 * float64(*totals.TotalTokens) / float64(window)
+				if math.IsNaN(pct) || math.IsInf(pct, 0) || pct < 0 {
+					return nil, fmt.Errorf("agent: rollout token_count total %d over window %d is not a share", *totals.TotalTokens, window)
+				}
+				if pct > 100 {
+					pct = 100
+				}
+				out.UsedPercent = &pct
+			}
 		}
-		out.InputTokens = p.TokenCount
 	}
-	if p.TotalOutputTokens != nil {
-		if *p.TotalOutputTokens < 0 {
-			return nil, fmt.Errorf("agent: rollout token_count total_output_tokens %d is negative", *p.TotalOutputTokens)
-		}
-		out.OutputTokens = p.TotalOutputTokens
+	if !out.HasMeasurements() {
+		return nil, nil
 	}
-	if p.ContextWindowSize != nil {
-		if *p.ContextWindowSize <= 0 {
-			return nil, fmt.Errorf("agent: rollout token_count context_window_size %d is not positive", *p.ContextWindowSize)
-		}
-		out.ContextWindowSize = p.ContextWindowSize
-	}
-	if p.Compacted != nil && *p.Compacted {
-		out.NoticeKind = ContextUsageCompaction
-	}
-	if !out.HasMeasurements() && out.NoticeKind != ContextUsageCompaction {
+	if out.NoticeKind == ContextUsageThreshold && out.UsedPercent == nil {
+		// A threshold notice with no percentage carries only token counts
+		// the per-turn usage events already meter: nothing new to report.
+		// The watcher applies the same rule (classify); the parser holds
+		// it too so a direct caller never emits a percent-less threshold.
 		return nil, nil
 	}
 	return out, nil

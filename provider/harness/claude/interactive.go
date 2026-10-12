@@ -259,6 +259,26 @@ var (
 // NoticeChannel returns this session's Stop-hook channel.
 func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notices }
 
+// ContextUsageSidecarPath returns the session's statusline sidecar path:
+// the file the session's own statusLine command maintains with the live
+// context_window numbers. It implements the runner's session-scoped
+// context-source seam (agent.ContextUsageSourcer): the interactive watcher
+// polls this file — never a process-wide variable — so one session's
+// readings can never land in another session's series. Empty when the
+// session has no channel (a spawn without the hook still runs, without
+// context notices).
+func (h *interactiveHandle) ContextUsageSidecarPath() string {
+	if h == nil || h.notices == nil {
+		return ""
+	}
+	return h.notices.sidecarPath()
+}
+
+// ContextUsageRollout reports no rollout: the claude leg is the sidecar,
+// never a rollout file. It satisfies the runner's session-scoped seam
+// (agent.ContextUsageSourcer) alongside ContextUsageSidecarPath.
+func (h *interactiveHandle) ContextUsageRollout() (string, string) { return "", "" }
+
 // Events overrides ptycli.Handle.Events with the coarse Init/Result contract
 // plus per-turn usage tailed from the session's own transcript (the runner
 // forwards LlmCallEvents through its activity sink) and, after Done, the

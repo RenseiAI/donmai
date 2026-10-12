@@ -97,6 +97,14 @@ const (
 	stopHookTimeoutSeconds = 10
 )
 
+// statusLineSidecarFile is the statusline sidecar JSON the session's own
+// statusLine command maintains: the harness-native context signal the
+// runner's context watcher polls (see runner/context_usage.go). It lives in
+// the channel's private drop directory — never in the worktree — for the
+// same reason as the hook script: a file inside the tree is a file the
+// agent can read, edit, or commit by accident.
+const statusLineSidecarFile = "statusline-sidecar.json"
+
 // stopHookChannel is one interactive session's Stop-hook notice channel. It
 // owns a private directory containing the hook script and the drop; the
 // directory is removed when the session's handle cleans up.
@@ -154,10 +162,89 @@ func newStopHookChannel() (*stopHookChannel, error) {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("stop-hook channel: write hook script: %w", err)
 	}
+	// The statusLine sidecar producer: the session's own context-signal
+	// writer, invoked by the CLI with the live context_window numbers on
+	// every status-line render. A writer that cannot be installed still
+	// yields a session — the transcript usage tail is unaffected — so this
+	// is best-effort exactly like the Stop-hook channel above.
+	if err := os.WriteFile(c.path(statusLineSidecarScriptFile), []byte(statusLineSidecarScript(c.path(statusLineSidecarFile))), 0o700); err != nil { //nolint:gosec // the hook is executed by the CLI; it is owner-only
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("stop-hook channel: write statusline script: %w", err)
+	}
 	return c, nil
 }
 
 func (c *stopHookChannel) path(name string) string { return filepath.Join(c.dir, name) }
+
+// sidecarPath returns the session's statusline sidecar path: the file the
+// session's own statusLine command maintains with the live context_window
+// numbers. It exists from channel creation (the writer is installed with
+// the channel), so the runner's context watcher can poll it for the whole
+// session; before the CLI's first status-line render it is simply absent
+// and the watcher stays silent.
+func (c *stopHookChannel) sidecarPath() string {
+	if c == nil {
+		return ""
+	}
+	return c.path(statusLineSidecarFile)
+}
+
+// statusLineSidecarScriptFile is the statusLine command the CLI invokes
+// with the live session status on stdin (see the statusLine input schema:
+// context_window.used_percentage, total_input_tokens, total_output_tokens,
+// context_window_size). It renders nothing to the terminal — the status
+// line keeps whatever the operator configured — and maintains the sidecar
+// file the runner's context watcher polls, translating the CLI's nested
+// context_window object into the flat sidecar document the parser reads
+// (agent.ParseClaudeSidecarNotice).
+const statusLineSidecarScriptFile = "statusline-sidecar.sh"
+
+// statusLineSidecarScript renders the sidecar writer. It takes the sidecar
+// path by value and bakes it in, so the command needs no environment —
+// hook processes inherit whatever the CLI hands them. The writer reads
+// only the four context_window numbers; any other input shape (or a
+// missing context_window, before the first model call) leaves the previous
+// sidecar in place and never affects the terminal. The write rides a
+// temp-file rename so a concurrent reader never sees a half-written
+// document.
+func statusLineSidecarScript(sidecar string) string {
+	s := shellQuote(sidecar)
+	return `#!/bin/sh
+# donmai statusline sidecar writer. Generated per session; do not edit.
+#
+# The CLI invokes this as the session's statusLine command with the live
+# session status on stdin and reads the terminal line from stdout. This
+# writer emits no terminal line (the operator's own status line is
+# untouched) and maintains the sidecar file the runner's context watcher
+# polls for the harness-native context signal.
+set -u
+s=` + s + `
+tmp="$s.$$.tmp"
+if command -v python3 >/dev/null 2>&1; then
+  if python3 -c 'import sys,json
+raw = sys.stdin.read()
+try:
+    doc = json.loads(raw)
+except Exception:
+    sys.exit(1)
+cw = doc.get("context_window") or {}
+out = {}
+for key in ("used_percentage", "total_input_tokens", "total_output_tokens", "context_window_size"):
+    if cw.get(key) is not None:
+        out[key] = cw[key]
+if not out:
+    sys.exit(1)
+with open(sys.argv[1], "w") as f:
+    json.dump(out, f)
+' "$tmp"; then
+    mv -f "$tmp" "$s" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+fi
+exit 0
+`
+}
 
 // close removes the drop directory. Idempotent; wired into the handle's
 // per-session cleanup so a notice still outstanding when the session ends dies
@@ -218,6 +305,20 @@ func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, er
 		// harness already passes (additive, beside hooks), so no extra
 		// flag or file is introduced.
 		"skipDangerousModePermissionPrompt": true,
+		// statusLine names the session's own sidecar writer: the CLI
+		// invokes it with the live context_window numbers on every
+		// status-line render, and it maintains the sidecar file the
+		// runner's context watcher polls. It renders no terminal line —
+		// the operator's own status line is untouched — and it rides the
+		// same additive --settings layer as the Stop hook, so the
+		// operator's own statusLine configuration in the base layer is
+		// replaced for this session only, exactly as the hooks are added
+		// for it. A session whose writer cannot be installed still runs:
+		// settingsJSONWithPin callers treat this channel as best-effort.
+		"statusLine": map[string]any{
+			"type":    "command",
+			"command": "/bin/sh " + shellQuote(c.path(statusLineSidecarScriptFile)),
+		},
 		"hooks": map[string]any{
 			"Stop": []any{
 				map[string]any{

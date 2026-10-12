@@ -444,7 +444,7 @@ func (r *Runner) dispatchInteractive(
 	// best-effort and never blocks the PTY: drops on a slow consumer,
 	// silence when the harness reports no signal. The pi leg reports
 	// through ObservePiRPCUsage on its RPC stream instead of a file poll.
-	stopContextWatch := r.startContextUsageWatch(interactiveCtx, worktreePath, res.ProviderName, sink)
+	stopContextWatch := r.startContextUsageWatch(interactiveCtx, worktreePath, handle, sink)
 	defer stopContextWatch()
 	handleEvents := handle.Events()
 	for {
@@ -696,8 +696,8 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 // without a quota harness runs without quota reports. Emission rides
 // postInteractiveEvent so notices reach both the activity sink and the
 // events.jsonl audit leg.
-func (r *Runner) startContextUsageWatch(ctx context.Context, worktreePath string, provider agent.ProviderName, sink activitySink) func() {
-	source := resolveContextUsageSource(provider)
+func (r *Runner) startContextUsageWatch(ctx context.Context, worktreePath string, handle agent.Handle, sink activitySink) func() {
+	source := resolveContextUsageSource(handle)
 	if source.harness == "" {
 		return func() {}
 	}
@@ -736,59 +736,32 @@ func (r *Runner) runContextUsageWatch(ctx context.Context, w *contextUsageWatche
 // empty harness means no pollable signal — pi reports through
 // ObservePiRPCUsage on its RPC stream, and every other harness reports
 // none.
-func resolveContextUsageSource(provider agent.ProviderName) contextUsageSource {
-	switch provider {
-	case agent.ProviderClaude:
-		if path := strings.TrimSpace(os.Getenv("CLAUDE_STATUSLINE_SIDECAR")); path != "" {
-			return contextUsageSource{harness: string(agent.HarnessClaudeCode), sidecarPath: path}
-		}
-	case agent.ProviderCodex:
-		if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
-			if thread := strings.TrimSpace(os.Getenv("CODEX_THREAD_ID")); thread != "" {
-				return contextUsageSource{
-					harness:     string(agent.HarnessCodex),
-					rolloutPath: findThreadRolloutPath(home, thread),
-				}
-			}
+// resolveContextUsageSource maps the spawned handle onto the
+// harness-native context signal the watcher polls. Paths come from the
+// handle's own session-scoped seam (agent.ContextUsageSourcer): the
+// statusline sidecar the claude session's own statusLine command
+// maintains, or the session-state subtree of the codex session's own
+// home. An empty harness means no pollable signal — pi reports through
+// its RPC stream (see the pi handle's compaction mapping), and every
+// other harness reports none. There is deliberately no environment
+// fallback: a process-wide variable fans one session's readings out to
+// every session sharing the process.
+func resolveContextUsageSource(handle agent.Handle) contextUsageSource {
+	sourcer, ok := handle.(agent.ContextUsageSourcer)
+	if !ok || sourcer == nil {
+		return contextUsageSource{}
+	}
+	if path := strings.TrimSpace(sourcer.ContextUsageSidecarPath()); path != "" {
+		return contextUsageSource{harness: string(agent.HarnessClaudeCode), sidecarPath: path}
+	}
+	if home, thread := sourcer.ContextUsageRollout(); strings.TrimSpace(home) != "" {
+		return contextUsageSource{
+			harness:       string(agent.HarnessCodex),
+			rolloutHome:   strings.TrimSpace(home),
+			rolloutThread: strings.TrimSpace(thread),
 		}
 	}
 	return contextUsageSource{}
-}
-
-// findThreadRolloutPath locates the session file for one thread under the
-// harness home without importing the harness package: the newest
-// rollout-*-<threadID>.jsonl entry under the sessions subtree. Empty when
-// none exists yet — the watcher polls again next tick.
-func findThreadRolloutPath(home, threadID string) string {
-	if home == "" || threadID == "" {
-		return ""
-	}
-	root := filepath.Join(home, "sessions")
-	var best string
-	var bestMtime int64
-	//nolint:gosec // G703: root is the harness-owned sessions dir; threadID is matched as a filename suffix, never joined unsanitized.
-	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() {
-			return nil
-		}
-		name := entry.Name()
-		if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
-			return nil
-		}
-		if !strings.HasSuffix(strings.TrimSuffix(name, ".jsonl"), "-"+threadID) {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() {
-			return nil
-		}
-		mtime := info.ModTime().UnixNano()
-		if best == "" || mtime > bestMtime || (mtime == bestMtime && path > best) {
-			best, bestMtime = path, mtime
-		}
-		return nil
-	})
-	return best
 }
 
 // drainInteractiveActivity runs once the PTY session is Done. A handle that

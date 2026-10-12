@@ -130,9 +130,11 @@ func TestParseClaudeSidecarNotice_RejectsImpossible(t *testing.T) {
 	}
 }
 
-// Fixture: rollout JSONL lines in the shape a session file takes — one
-// token_count event per model call beside unrelated line shapes.
-const rolloutTokenCountFixture = `{"type":"token_count","payload":{"thread_id":"thread-1","total_input_tokens":90000,"total_output_tokens":4000,"context_window_size":200000,"used_percentage":47.0}}`
+// Fixture: rollout JSONL lines in the shape real session files take — an
+// event_msg envelope carrying a token_count event with the thread's
+// cumulative totals and the model window, beside unrelated line shapes.
+// Captured from a live rollout file (1044 token_count events, one shape).
+const rolloutTokenCountFixture = `{"timestamp":"2026-09-28T12:39:11.334Z","ordinal":14,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":90000,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":4000,"reasoning_output_tokens":0,"total_tokens":94000},"last_token_usage":{"input_tokens":90000,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":4000,"reasoning_output_tokens":0,"total_tokens":94000},"model_context_window":200000}}}`
 
 func TestParseCodexTokenCountNotice_FixtureLine(t *testing.T) {
 	t.Parallel()
@@ -158,8 +160,26 @@ func TestParseCodexTokenCountNotice_FixtureLine(t *testing.T) {
 	if notice.ContextWindowSize == nil || *notice.ContextWindowSize != 200000 {
 		t.Errorf("contextWindowSize = %v, want 200000", notice.ContextWindowSize)
 	}
+	// The rollout carries no percentage: it is derived as 100*total/window.
 	if notice.UsedPercent == nil || *notice.UsedPercent != 47 {
-		t.Errorf("usedPercent = %v, want 47", notice.UsedPercent)
+		t.Errorf("usedPercent = %v, want 47 (100*94000/200000)", notice.UsedPercent)
+	}
+}
+
+func TestParseCodexTokenCountNotice_CompactedMarker(t *testing.T) {
+	t.Parallel()
+	notice, err := agent.ParseCodexTokenCountNotice([]byte(`{"type":"compacted","payload":{"message":""}}`), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for the compacted marker")
+	}
+	if notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Errorf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	if notice.HasMeasurements() {
+		t.Errorf("marker carries measurements: %+v", notice)
 	}
 }
 
@@ -170,6 +190,8 @@ func TestParseCodexTokenCountNotice_SkipsOtherLines(t *testing.T) {
 		`{"type":"token_usage_record","payload":{"thread_id":"thread-1"}}`,
 		`not json at all`,
 		`{"type":"event_msg","payload":{"message":"done"}}`,
+		`{"type":"event_msg","payload":{"type":"item_completed"}}`,
+		`{"type":"response_item","payload":{"type":"message"}}`,
 	}
 	for _, line := range lines {
 		notice, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex")
@@ -182,29 +204,26 @@ func TestParseCodexTokenCountNotice_SkipsOtherLines(t *testing.T) {
 	}
 }
 
-func TestParseCodexTokenCountNotice_CombinedTotalReadsAsInput(t *testing.T) {
+func TestParseCodexTokenCountNotice_TotalWithoutWindowIsNoSignal(t *testing.T) {
 	t.Parallel()
-	notice, err := agent.ParseCodexTokenCountNotice([]byte(`{"type":"token_count","payload":{"token_count": 5000}}`), "codex")
+	// A token_count event with totals but no model window cannot derive the
+	// window share; without a percentage a threshold notice carries only
+	// token counts the per-turn usage events already meter.
+	line := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"output_tokens":100,"total_tokens":5100}}}}`
+	notice, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex")
 	if err != nil {
 		t.Fatalf("ParseCodexTokenCountNotice: %v", err)
 	}
-	if notice == nil {
-		t.Fatal("no notice for a combined-total token_count")
-	}
-	if notice.InputTokens == nil || *notice.InputTokens != 5000 {
-		t.Errorf("inputTokens = %v, want 5000", notice.InputTokens)
-	}
-	if notice.OutputTokens != nil {
-		t.Errorf("outputTokens = %v for a combined total; want nil", notice.OutputTokens)
+	if notice != nil {
+		t.Fatalf("windowless token_count yielded %+v, want nil", notice)
 	}
 }
 
 func TestParseCodexTokenCountNotice_RejectsImpossible(t *testing.T) {
 	t.Parallel()
 	cases := []string{
-		`{"type":"token_count","payload":{"total_input_tokens": -1}}`,
-		`{"type":"token_count","payload":{"used_percentage": 120}}`,
-		`{"type":"token_count","payload":{"context_window_size": 0}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":-1,"total_tokens":-1},"model_context_window":200000}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100},"model_context_window":0}}}`,
 	}
 	for _, line := range cases {
 		if _, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex"); err == nil {

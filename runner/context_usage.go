@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,9 +54,16 @@ type contextUsageSource struct {
 	harness string
 	// sidecarPath is the statusline sidecar JSON file (claude).
 	sidecarPath string
-	// rolloutPath is the rollout JSONL file tailed for token_count
-	// events (codex).
-	rolloutPath string
+	// rolloutHome and rolloutThread locate the session file tailed for
+	// token_count events (codex). The path is re-resolved every poll:
+	// the file appears after thread start (the rollout-flush race), the
+	// thread id may arrive late (an unnamed interactive session names
+	// its thread after spawn), and a replaced file re-tails from zero.
+	// An empty thread with a non-empty home tails the home's newest
+	// rollout — the home is session-private, so the newest file is this
+	// session's.
+	rolloutHome   string
+	rolloutThread string
 }
 
 // contextUsageWatcher polls the harness-native context signals for one
@@ -68,6 +76,10 @@ type contextUsageWatcher struct {
 	// lastSidecar holds the last sidecar bytes read, so an unchanged
 	// file emits nothing.
 	lastSidecar string
+	// rolloutFile is the rollout path the offset belongs to. A
+	// re-resolved path restarts the offset at zero rather than at the
+	// old file's offset.
+	rolloutFile string
 	// rolloutOffset is the rollout read offset; lines already read never
 	// re-emit.
 	rolloutOffset int64
@@ -118,7 +130,7 @@ func (w *contextUsageWatcher) poll() []agent.Event {
 			out = append(out, *ev)
 		}
 	}
-	if w.source.rolloutPath != "" {
+	if w.source.rolloutHome != "" {
 		out = append(out, w.pollRollout()...)
 	}
 	return out
@@ -148,8 +160,17 @@ func (w *contextUsageWatcher) pollSidecar() *agent.Event {
 // trailing line stays unread until the writer completes it; the offset does
 // not advance past it. Malformed lines are skipped, not fatal.
 func (w *contextUsageWatcher) pollRollout() []agent.Event {
+	// The path is re-resolved every poll: the file appears after thread
+	// start (the rollout-flush race), the thread id may arrive late, and
+	// a replaced file re-tails from zero. An empty thread with a
+	// non-empty home tails the home's newest rollout — the home is
+	// session-private, so the newest file is this session's.
+	path := w.resolveRolloutPath()
+	if path == "" {
+		return nil
+	}
 	//nolint:gosec // G304: path is the harness's own rollout file, resolved from the session's trusted config.
-	f, err := os.Open(w.source.rolloutPath)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
@@ -157,6 +178,9 @@ func (w *contextUsageWatcher) pollRollout() []agent.Event {
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return nil
+	}
+	if path != w.rolloutFile {
+		w.rolloutFile, w.rolloutOffset = path, 0
 	}
 	if info.Size() < w.rolloutOffset {
 		w.rolloutOffset = 0
@@ -283,4 +307,86 @@ func ObservePiRPCUsage(usage *agent.PiRPCUsage, harness string, state *contextUs
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return state.classify(notice)
+}
+
+// resolveRolloutPath re-resolves the session file every poll from the
+// session-scoped home and thread. An empty thread with a non-empty home
+// resolves to the home's newest rollout — the home is session-private, so
+// the newest file is this session's — which covers an unnamed session
+// whose thread the harness creates after spawn.
+func (w *contextUsageWatcher) resolveRolloutPath() string {
+	if w.source.rolloutHome == "" {
+		return ""
+	}
+	if w.source.rolloutThread == "" {
+		return newestRolloutPath(w.source.rolloutHome)
+	}
+	return findThreadRolloutPath(w.source.rolloutHome, w.source.rolloutThread)
+}
+
+// newestRolloutPath locates the newest rollout-*.jsonl entry anywhere under
+// home's sessions subtree. Empty when none exists yet.
+func newestRolloutPath(home string) string {
+	if home == "" {
+		return ""
+	}
+	root := filepath.Join(home, "sessions")
+	var best string
+	var bestMtime int64
+	//nolint:gosec // G703: root is the harness-owned sessions dir; names are matched, never joined unsanitized.
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		mtime := info.ModTime().UnixNano()
+		if best == "" || mtime > bestMtime || (mtime == bestMtime && path > best) {
+			best, bestMtime = path, mtime
+		}
+		return nil
+	})
+	return best
+}
+
+// findThreadRolloutPath locates the session file for one thread under the
+// harness home without importing the harness package: the newest
+// rollout-*-<threadID>.jsonl entry under the sessions subtree. Empty when
+// none exists yet — the watcher polls again next tick.
+func findThreadRolloutPath(home, threadID string) string {
+	if home == "" || threadID == "" {
+		return ""
+	}
+	root := filepath.Join(home, "sessions")
+	var best string
+	var bestMtime int64
+	//nolint:gosec // G703: root is the harness-owned sessions dir; threadID is matched as a filename suffix, never joined unsanitized.
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+		if !strings.HasSuffix(strings.TrimSuffix(name, ".jsonl"), "-"+threadID) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		mtime := info.ModTime().UnixNano()
+		if best == "" || mtime > bestMtime || (mtime == bestMtime && path > best) {
+			best, bestMtime = path, mtime
+		}
+		return nil
+	})
+	return best
 }

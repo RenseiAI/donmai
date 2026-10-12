@@ -81,9 +81,13 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NoticeDelivery: agent.NoticeDeliveryHook,
 			// The statusline sidecar JSON is the harness-native context
 			// signal: used_percentage, total_input_tokens,
-			// total_output_tokens and context_window_size, read by the
-			// runner's context watcher (runner/context_usage.go) and
-			// delivered as a typed ContextUsageEvent.
+			// total_output_tokens and context_window_size. The session's
+			// own statusLine command maintains it (stophook.go): the CLI
+			// invokes the generated writer with the live context_window
+			// numbers on every render, and the runner's context watcher
+			// (runner/context_usage.go) polls the session handle's own
+			// sidecar path — never a process-wide variable — delivering
+			// crossings as a typed ContextUsageEvent.
 			ContextUsageSource: agent.ContextUsageSourceStatuslineSidecar,
 			Drives:             []agent.WireProtocol{agent.ProtoAnthropicMessages},
 			DrivesHosts: []agent.ServingHost{
