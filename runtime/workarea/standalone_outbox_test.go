@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -334,15 +333,8 @@ func TestStandaloneOutboxQuarantinesBadFileAndReplaysGood(t *testing.T) {
 		"truncated.json": `{"schemaVersion":`,
 		"txo_bad.json":   `{"schemaVersion":"donmai.terminal-status-outbox.v1","outboxKey":"txo_bad","kind":"future-kind"}`,
 	} {
-		path := dir + "/" + name
-		if strings.HasSuffix(name, ".json") {
-			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		} else {
-			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-				t.Fatal(err)
-			}
+		if err := os.WriteFile(dir+"/"+name, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
 	var sent [][]byte
