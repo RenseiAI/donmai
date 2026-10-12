@@ -28,12 +28,14 @@ func newTestDaemonForSweep(t *testing.T, opts Options) *Daemon {
 }
 
 // TestDaemonStartRunsCodexOrphanSweep pins the missing-caller half of the
-// fix: daemon Start actually invokes the configured orphan sweeper exactly
-// once, so crash/SIGKILL/restart leftovers are reclaimed instead of
-// accumulating in the temp dir forever. The fake sweeper is supplied through
-// Options.CodexOrphanSweeper — the same seam the production entry point
-// configures with the real providercodex.SweepOrphans — so this test never
-// touches a real temp dir or signals a real process.
+// fix: daemon Start actually invokes the configured orphan sweeper, so
+// crash/SIGKILL/restart leftovers are reclaimed instead of accumulating
+// forever. One invocation per default root (see
+// TestDaemonSweepCodexOrphansCoversEveryDefaultRoot) — the count is
+// asserted there; here Start must produce at least one. The fake sweeper
+// is supplied through Options.CodexOrphanSweeper — the same seam the
+// production entry point configures with the real providercodex.SweepOrphans
+// — so this test never touches a real temp dir or signals a real process.
 func TestDaemonStartRunsCodexOrphanSweep(t *testing.T) {
 	calls := 0
 	d := newTestDaemonForSweep(t, Options{
@@ -45,8 +47,8 @@ func TestDaemonStartRunsCodexOrphanSweep(t *testing.T) {
 	if err := d.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if calls != 1 {
-		t.Fatalf("sweep calls = %d, want exactly 1 per Start", calls)
+	if calls < 1 {
+		t.Fatalf("sweep calls = %d, want at least 1 per Start", calls)
 	}
 }
 
@@ -104,5 +106,117 @@ func TestDaemonStartWithoutConfiguredSweeperNeverTouchesATempCodexRoot(t *testin
 
 	if _, err := os.Stat(canary); err != nil {
 		t.Fatalf("canary codex-home directory was touched by Start with no configured sweeper: %v", err)
+	}
+}
+
+// TestDaemonSweepCodexOrphansCoversEveryDefaultRoot pins the multi-root fan
+// out: one sweep pass calls the configured sweeper once per default root,
+// each with that root set, so persistent-Codex-home orphans are swept —
+// not just system-temp ones. The fixture HOME makes temp and persistent
+// roots distinct (in this package's TestMain isolation the temp home sits
+// under TMPDIR, which would otherwise collapse the two). The fake records
+// the roots it was asked to sweep; the assertion is on that record, not
+// on the merged report.
+//
+// RED proof: replace the fan-out loop with a single sweep call over the
+// first deduped default root and this test fails — the second root is
+// never presented to the sweeper.
+func TestDaemonSweepCodexOrphansCoversEveryDefaultRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+	want := providercodex.DedupeCodexHomeRoots(providercodex.DefaultCodexHomeRoots())
+	if len(want) < 2 {
+		t.Skipf("fixture HOME %q collapses the default roots to %q", home, want)
+	}
+	var roots []string
+	d := newTestDaemonForSweep(t, Options{
+		CodexOrphanSweeper: func(_ context.Context, opts providercodex.SweepOptions) providercodex.SweepReport {
+			roots = append(roots, opts.Root)
+			return providercodex.SweepReport{}
+		},
+	})
+	_ = d.sweepCodexOrphans(context.Background())
+	if len(roots) != len(want) {
+		t.Fatalf("sweep roots = %q, want one call per default root %q", roots, want)
+	}
+	for i := range want {
+		if roots[i] != want[i] {
+			t.Fatalf("sweep roots = %q, want %q in order", roots, want)
+		}
+	}
+}
+
+// TestDaemonSweepCodexOrphansMergesPerRootReports pins the merged-report
+// contract: per-root counts add, so the pass log line and any future
+// metric consumer see the whole pass, not just the last root.
+func TestDaemonSweepCodexOrphansMergesPerRootReports(t *testing.T) {
+	d := newTestDaemonForSweep(t, Options{
+		CodexOrphanSweeper: func(_ context.Context, _ providercodex.SweepOptions) providercodex.SweepReport {
+			return providercodex.SweepReport{Scanned: 3, Reclaimed: 1, PartiallyReclaimed: 1, Acted: 1, Errors: 1}
+		},
+	})
+	report := d.sweepCodexOrphans(context.Background())
+	roots := len(providercodex.DedupeCodexHomeRoots(providercodex.DefaultCodexHomeRoots()))
+	if report.Scanned != 3*roots || report.Reclaimed != roots || report.Errors != roots {
+		t.Fatalf("merged report = %+v, want each per-root count times %d roots", report, roots)
+	}
+}
+
+// TestDaemonSweepCodexOrphansProtectsLiveAdoptionOnEveryRoot pins that the
+// adoption-protection set computed once per pass reaches every root's call:
+// a home referenced by a live adopted session must be presented as
+// protected on each root, not just the first.
+func TestDaemonSweepCodexOrphansProtectsLiveAdoptionOnEveryRoot(t *testing.T) {
+	var protected []map[string]struct{}
+	d := newTestDaemonForSweep(t, Options{
+		CodexOrphanSweeper: func(_ context.Context, opts providercodex.SweepOptions) providercodex.SweepReport {
+			protected = append(protected, opts.ProtectedHomes)
+			return providercodex.SweepReport{}
+		},
+	})
+	_ = d.sweepCodexOrphans(context.Background())
+	roots := len(providercodex.DedupeCodexHomeRoots(providercodex.DefaultCodexHomeRoots()))
+	if len(protected) != roots {
+		t.Fatalf("sweeper calls = %d, want one per deduped default root (%d)", len(protected), roots)
+	}
+	first := protected[0]
+	for i, got := range protected[1:] {
+		if len(got) != len(first) {
+			t.Fatalf("call %d protected set differs from call 0: %v vs %v", i+1, got, first)
+		}
+		for home := range first {
+			if _, ok := got[home]; !ok {
+				t.Fatalf("call %d missing protected home %s present on call 0", i+1, home)
+			}
+		}
+	}
+}
+
+// TestDaemonSweepCodexOrphansSkipsAnUnresolvablePersistentRoot pins the
+// never-materialise rule at the fan-out: when the persistent root does not
+// resolve, the pass still sweeps system temp exactly once and never asks
+// the sweeper to look at an empty root.
+func TestDaemonSweepCodexOrphansSkipsAnUnresolvablePersistentRoot(t *testing.T) {
+	// CODEX_HOME pointed at a path that cannot resolve, and a HOME that
+	// cannot resolve either, leave the fallback root empty — but this
+	// package's TestMain isolation already pointed HOME at a temp dir,
+	// so override both explicitly for this test.
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "missing", "codex"))
+	var roots []string
+	d := newTestDaemonForSweep(t, Options{
+		CodexOrphanSweeper: func(_ context.Context, opts providercodex.SweepOptions) providercodex.SweepReport {
+			roots = append(roots, opts.Root)
+			return providercodex.SweepReport{}
+		},
+	})
+	_ = d.sweepCodexOrphans(context.Background())
+	for _, root := range roots {
+		if root == "" {
+			t.Fatalf("sweeper was called with an empty root: %q", roots)
+		}
+	}
+	if len(roots) == 0 {
+		t.Fatal("sweeper was never called")
 	}
 }

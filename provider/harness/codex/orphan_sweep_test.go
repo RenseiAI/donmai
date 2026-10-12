@@ -1617,3 +1617,80 @@ func TestSweepOrphans_ReapsRetainedHomePastTTL(t *testing.T) {
 		t.Fatalf("expired retained home survived: err=%v", err)
 	}
 }
+
+// TestDedupeCodexHomeRoots pins the fan-out dedupe: empties and repeats
+// collapse (first-seen order kept) so one directory is never swept twice
+// per pass — each pass is idempotent but not free, and the merged report
+// would otherwise double-count one root's entries.
+//
+// RED proof: return roots unchanged and the duplicate case below reports
+// two entries instead of one.
+func TestDedupeCodexHomeRoots(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{name: "empty in, empty out", in: nil, want: []string{}},
+		{name: "empties dropped", in: []string{"", "  ", "/tmp/x"}, want: []string{"/tmp/x"}},
+		{name: "repeats collapse", in: []string{"/tmp/a", "/tmp/a", "/tmp/b"}, want: []string{"/tmp/a", "/tmp/b"}},
+		{name: "cleaned spellings collapse", in: []string{"/tmp/a/", "/tmp/a"}, want: []string{"/tmp/a"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := DedupeCodexHomeRoots(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("DedupeCodexHomeRoots(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("DedupeCodexHomeRoots(%q) = %q, want %q", tc.in, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultCodexHomeRoots_NamesTempAndPersistentCodexHome pins that the
+// default root set covers both places homes live: the system temp
+// directory and the operator's persistent Codex home — and that the second
+// entry follows the same resolution the interactive boundary falls back to
+// when a hard link cannot cross filesystems.
+func TestDefaultCodexHomeRoots_NamesTempAndPersistentCodexHome(t *testing.T) {
+	roots := DefaultCodexHomeRoots()
+	if len(roots) != 2 {
+		t.Fatalf("DefaultCodexHomeRoots() = %q, want exactly two roots", roots)
+	}
+	if roots[0] != filepath.Clean(os.TempDir()) {
+		t.Fatalf("DefaultCodexHomeRoots()[0] = %q, want system temp %q", roots[0], filepath.Clean(os.TempDir()))
+	}
+	if roots[1] != codexFallbackHomeRoot() {
+		t.Fatalf("DefaultCodexHomeRoots()[1] = %q, want fallback home root %q", roots[1], codexFallbackHomeRoot())
+	}
+	if codexFallbackHomeRoot() == "" {
+		t.Skip("persistent Codex home does not resolve in this environment")
+	}
+}
+
+// TestSweepOrphans_ReclaimsPersistentCodexHomeOrphan pins the second-root
+// coverage at the unit level: a reclaimable legacy orphan sitting under a
+// non-temp root (the persistent-Codex-home shape) is reclaimed by an
+// ordinary single-root call pointed at that root. The daemon fans the same
+// call out over every default root, so this plus the fan-out test closes
+// the "persistent homes are never swept" gap end to end.
+func TestSweepOrphans_ReclaimsPersistentCodexHomeOrphan(t *testing.T) {
+	requireManifestVerification(t)
+	persistent := filepath.Join(ownedFixtureDir(t), ".codex")
+	if err := os.Mkdir(persistent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := legacyHome(t, persistent, "stale-interactive", 48*time.Hour)
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: persistent, PluginCacheDir: t.TempDir()})
+
+	if report.Reclaimed != 1 {
+		t.Fatalf("report = %+v, want Reclaimed=1 under the persistent root", report)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("persistent-Codex-home orphan survived: err=%v", err)
+	}
+}

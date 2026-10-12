@@ -204,6 +204,16 @@ func (opts SweepOptions) readVerifiedDonmaiOwnerManifest(dir string) (donmaiOwne
 
 // SweepOptions configures SweepOrphans. The zero value is a usable, fully
 // production-shaped configuration.
+//
+// A note on the per-call budgets for callers that sweep more than one root
+// (the daemon fans out over DefaultCodexHomeRoots, and re-runs the pass
+// hourly): MaxEntries, MaxScan
+// and MaxDuration bound ONE SweepOrphans call — one root — not the whole
+// multi-root pass. Each root carries its own backlog, so sharing one action
+// budget across roots would let the first root's unreclaimable population
+// starve the second root's scan the same way one sorted prefix once
+// starved a single root (see MaxEntries). One call per root keeps every
+// root independently reachable.
 type SweepOptions struct {
 	// Root is the directory to scan for donmai-owned artifacts. Empty means
 	// os.TempDir() — the same parent newCodexConfigBoundaryWithAuthMode and
@@ -573,6 +583,59 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 		"errors", report.Errors,
 	)
 	return report
+}
+
+// DefaultCodexHomeRoots returns every root where this package creates
+// codex-home and app-socket artifacts: the system temp directory (the
+// default parent newCodexConfigBoundaryWithAuthMode and
+// startNamedInteractiveAppServer use) and the operator's persistent Codex
+// home (~/.codex, or CODEX_HOME when set — the parent
+// newInteractiveCodexConfigBoundary falls back to when a hard link cannot
+// cross filesystems). Either entry may be empty when its location cannot
+// be resolved; callers skip empties. Both entries are cleaned (not symlink-
+// resolved): two spellings of the same directory would otherwise double-
+// sweep it, and each pass is idempotent but not free.
+//
+// The two entries may name the SAME directory — when CODEX_HOME points at
+// system temp, or in a test binary whose isolated HOME sits under TMPDIR
+// — so callers that fan out must dedupe before sweeping (see
+// DedupeCodexHomeRoots), or one directory is swept twice per pass.
+func DefaultCodexHomeRoots() []string {
+	return []string{filepath.Clean(os.TempDir()), codexFallbackHomeRoot()}
+}
+
+// DedupeCodexHomeRoots drops empty roots and collapses repeats, preserving
+// first-seen order. Two spellings of the same directory (exact-string
+// equal after Clean) sweep once: each pass is idempotent but not free,
+// and the merged report would otherwise double-count one root's entries.
+func DedupeCodexHomeRoots(roots []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		clean := filepath.Clean(strings.TrimSpace(root))
+		if clean == "" || clean == "." {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
+}
+
+// codexFallbackHomeRoot names the persistent Codex home newInteractive-
+// CodexConfigBoundary falls back to when a hard link cannot cross
+// filesystems: CODEX_HOME when set, else ~/.codex. Empty when neither
+// resolves — the caller skips it. Shared with DefaultCodexHomeRoots so
+// the sweep's second root and the boundary's fallback parent use the
+// exact same resolution.
+func codexFallbackHomeRoot() string {
+	if home, err := ambientCodexHome(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Clean(home)
+	}
+	return ""
 }
 
 // sweepOne resolves one in-scope entry. It reports whether the entry
