@@ -886,16 +886,17 @@ func (d *Daemon) RepoKeeper() *RepoKeeper {
 	return d.repoKeeper
 }
 
-// RepoKeeperMirror degrades a clone through the keeper: it returns the
-// mirror directory when the keeper can serve this remote, and ok=false when
+// RepoKeeperMirror degrades a clone through the keeper: it returns a lease
+// on the mirror when the keeper can serve this remote, and ok=false when
 // the caller must fall back to a plain clone (disabled, reconciling,
-// over budget, or scope failure).
-func (d *Daemon) RepoKeeperMirror(ctx context.Context, remote string) (dir string, ok bool) {
+// over budget, or scope failure). The lease holds the mirror's shared
+// maintenance lock until the caller releases it.
+func (d *Daemon) RepoKeeperMirror(ctx context.Context, remote string) (lease *repokeeper.Lease, ok bool) {
 	d.mu.RLock()
 	keeper := d.repoKeeper
 	d.mu.RUnlock()
 	if keeper == nil {
-		return "", false
+		return nil, false
 	}
 	return keeper.Acquire(ctx, remote)
 }

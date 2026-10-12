@@ -183,36 +183,40 @@ func (k *RepoKeeper) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-// Acquire resolves remote to its mirror directory. ok=false means the caller
-// must degrade to a plain clone: the keeper is disabled, still reconciling,
-// the scope did not resolve, the mirror is revoked or fails verification,
-// or the budget is exhausted. An existing verified mirror is always served;
-// the budget gates creation of new mirrors only.
+// Acquire resolves remote to a lease on its mirror. ok=false means the
+// caller must degrade to a plain clone: the keeper is disabled, still
+// reconciling, the scope did not resolve, the mirror is revoked or fails
+// verification, or the budget is exhausted. An existing verified mirror is
+// always served; the budget gates creation of new mirrors only.
+//
+// The lease holds the mirror's shared maintenance lock until Release, so
+// the verify-then-use window stays closed while the caller seeds from the
+// directory. The caller must Release; a nil lease degrades like ok=false.
 //
 // The daemon lock is held only for the ready/budget/revoked checks: the
 // store call below may clone over the network and must never run under it.
-func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok bool) {
+func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (lease *repokeeper.Lease, ok bool) {
 	if k == nil || !k.settings.Enabled || k.store == nil {
-		return "", false
+		return nil, false
 	}
 	scope, err := k.scope(ctx, remote)
 	if err != nil {
 		slog.Warn("repo keeper: scope resolution failed; degrading to plain clone", "err", err)
-		return "", false
+		return nil, false
 	}
 	if scope == "" {
 		slog.Warn("repo keeper: empty scope; degrading to plain clone")
-		return "", false
+		return nil, false
 	}
 	digest, err := repokeeper.MirrorDigest(remote, scope)
 	if err != nil {
-		return "", false
+		return nil, false
 	}
 
 	k.mu.Lock()
 	if !k.ready {
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	// One catalog snapshot drives every gate below: a revoked row, an
 	// unreadable catalog, or an over-budget new mirror all degrade. The
@@ -223,7 +227,7 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 		// Revocation and usage are unknown: degrade rather than serve a
 		// possibly-revoked mirror or admit past an unknown budget.
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	var self *repokeeper.MirrorEntry
 	var total int64
@@ -235,7 +239,7 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 	}
 	if self != nil && self.Revoked {
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	if self == nil && k.settings.MaxBytes > 0 && total >= k.settings.MaxBytes {
 		// At the budget the keeper stops creating mirrors: evict the
@@ -243,20 +247,22 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 		// clone even after evicting. Existing mirrors keep serving.
 		k.evictLocked(entries)
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	k.mu.Unlock()
 
 	// A revoked row or an unreadable catalog degrades above; the store
 	// re-verifies identity, scope, and live origin before serving, and
-	// refuses symlinks, foreign content, and empty non-repositories.
+	// refuses symlinks, foreign content, and empty non-repositories. The
+	// returned lease holds the shared maintenance lock until the caller
+	// releases it.
 	var storeAuth repokeeper.GitAuth
 	if k.auth != nil {
 		storeAuth = repokeeper.GitAuth(k.auth)
 	}
-	dir, err = k.store.EnsureWithAuth(ctx, remote, scope, storeAuth)
+	lease, err = k.store.EnsureWithAuth(ctx, remote, scope, storeAuth)
 	if err != nil {
-		return "", false
+		return nil, false
 	}
 
 	k.mu.Lock()
@@ -266,7 +272,7 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 	if err := k.store.TouchUse(digest, now); err != nil {
 		slog.Warn("repo keeper: record mirror use failed", "err", err)
 	}
-	return dir, true
+	return lease, true
 }
 
 // RecordFetch notes a completed mirror fetch: last-fetch advances, bytes and

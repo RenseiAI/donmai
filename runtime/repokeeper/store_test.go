@@ -139,26 +139,61 @@ func mirrorDigestFor(t *testing.T, source, scope string) string {
 	return digest
 }
 
-func TestCanonicalRemoteStripsCredentialBearingParts(t *testing.T) {
+func TestCanonicalRemoteIdentityMatrix(t *testing.T) {
 	t.Parallel()
+	// Query and fragment never change identity; a credential-bearing
+	// https URL is refused (its digest would otherwise name a mirror the
+	// clone could never populate without leaking the credential).
 	plain := "https://example.com/org/repo.git"
-	decorated := "https://user:token@example.com/org/repo.git?ref=main#fragment"
 	plainCanonical, plainDigest, err := CanonicalRemote(plain)
 	if err != nil {
 		t.Fatalf("CanonicalRemote(plain) error = %v", err)
 	}
-	decoratedCanonical, decoratedDigest, err := CanonicalRemote(decorated)
+	decoratedCanonical, decoratedDigest, err := CanonicalRemote(plain + "?ref=main#fragment")
 	if err != nil {
 		t.Fatalf("CanonicalRemote(decorated) error = %v", err)
 	}
 	if decoratedCanonical != plainCanonical {
-		t.Errorf("canonical = %q, want %q (userinfo/query/fragment must not change identity)", decoratedCanonical, plainCanonical)
+		t.Errorf("canonical = %q, want %q (query/fragment must not change identity)", decoratedCanonical, plainCanonical)
 	}
 	if decoratedDigest != plainDigest {
-		t.Errorf("digest = %q, want %q (credential-bearing parts must not change the key)", decoratedDigest, plainDigest)
+		t.Errorf("digest = %q, want %q (query/fragment must not change the key)", decoratedDigest, plainDigest)
 	}
-	if strings.Contains(plainCanonical, "user") || strings.Contains(plainCanonical, "token") {
-		t.Errorf("canonical = %q, must not carry userinfo", plainCanonical)
+	if _, _, err := CanonicalRemote("https://user:token@example.com/org/repo.git?ref=main#fragment"); err == nil {
+		t.Error("CanonicalRemote(credential-bearing https) error = nil, want a refusal")
+	}
+	// ssh keeps its login user: the clone must connect as the recorded
+	// user, and distinct users address distinct mirrors.
+	sshCanonical, sshDigest, err := CanonicalRemote("ssh://git@example.com/org/repo.git")
+	if err != nil {
+		t.Fatalf("CanonicalRemote(ssh) error = %v", err)
+	}
+	if sshCanonical != "ssh://git@example.com/org/repo.git" {
+		t.Errorf("canonical = %q, want the login-user-preserving form", sshCanonical)
+	}
+	otherDigest, err := MirrorDigest("ssh://other@example.com/org/repo.git", "scope-a")
+	if err != nil {
+		t.Fatalf("MirrorDigest(ssh other user) error = %v", err)
+	}
+	thisDigest, err := MirrorDigest("ssh://git@example.com/org/repo.git", "scope-a")
+	if err != nil {
+		t.Fatalf("MirrorDigest(ssh) error = %v", err)
+	}
+	wantDigest, err := ScopeDigest(sshDigest, "scope-a")
+	if err != nil {
+		t.Fatalf("ScopeDigest() error = %v", err)
+	}
+	if thisDigest != wantDigest {
+		t.Errorf("MirrorDigest = %q, want the scope-joined digest %q", thisDigest, wantDigest)
+	}
+	if otherDigest == thisDigest {
+		t.Error("two ssh login users share one mirror digest, want one mirror each")
+	}
+	// Unsupported transports are refused before git starts.
+	for _, source := range []string{"git://example.com/org/repo.git", "ext::sh -c echo", "file://user:secret@localhost/x", "https://user@example.com/org/repo.git"} {
+		if _, _, err := CanonicalRemote(source); err == nil {
+			t.Errorf("CanonicalRemote(%q) error = nil, want a refusal", source)
+		}
 	}
 }
 
@@ -196,11 +231,13 @@ func TestEnsureTwoScopesProduceTwoDirectories(t *testing.T) {
 	srcDir, _ := newSourceRepo(t)
 	store := newTestStore(t)
 
-	dirA, err := store.Ensure(context.Background(), srcDir, "scope-a")
+	dirALease, err := store.Ensure(context.Background(), srcDir, "scope-a")
+	dirA := dirALease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure(scope-a) error = %v", err)
 	}
-	dirB, err := store.Ensure(context.Background(), srcDir, "scope-b")
+	dirBLease, err := store.Ensure(context.Background(), srcDir, "scope-b")
+	dirB := dirBLease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure(scope-b) error = %v", err)
 	}
@@ -311,7 +348,8 @@ func TestEnsureLiveOriginMismatchFailsClosed(t *testing.T) {
 	srcB, _ := newSourceRepo(t)
 	store := newTestStore(t)
 
-	dirB, err := store.Ensure(context.Background(), srcB, "")
+	dirBLease, err := store.Ensure(context.Background(), srcB, "")
+	dirB := dirBLease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure(srcB) error = %v", err)
 	}
@@ -338,7 +376,8 @@ func TestEnsureMirrorLayoutModeAndFilesystem(t *testing.T) {
 	srcDir, sha := newSourceRepo(t)
 	store := newTestStore(t)
 
-	dir, err := store.Ensure(context.Background(), srcDir, "")
+	dirLease, err := store.Ensure(context.Background(), srcDir, "")
+	dir := dirLease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
 	}
@@ -388,9 +427,10 @@ func TestEnsureNoCredentialInConfigCatalogOrLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	// The remote is unreachable (no such host): Ensure must fail at clone
-	// time, but the sweep below proves the failure left no credential
-	// behind in anything the store wrote.
+	// The remote is unreachable and credential-bearing: Ensure must fail
+	// (at resolve time, before anything is written), but the sweep below
+	// proves the failure left no credential behind in anything the store
+	// wrote.
 	_, cloneErr := store.Ensure(context.Background(), remote, "scope-a")
 	if cloneErr == nil {
 		t.Fatal("Ensure(unreachable remote) error = nil, want a clone failure")
@@ -432,7 +472,8 @@ func TestEnsureNoCredentialInConfigCatalogOrLogs(t *testing.T) {
 	// The reachable half: a local source's mirror config must carry no
 	// auth material either (clone with ambient auth only).
 	store2 := newTestStore(t)
-	dir, err := store2.Ensure(context.Background(), srcDir, "")
+	dirLease, err := store2.Ensure(context.Background(), srcDir, "")
+	dir := dirLease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure(local) error = %v", err)
 	}
@@ -454,12 +495,13 @@ func TestEnsureNoCredentialInConfigCatalogOrLogs(t *testing.T) {
 	}
 }
 
-// TestEnsureCredentialBearingSourceLeavesNoCredential drives the production
-// Ensure entry point with a credential-bearing source that still clones
-// successfully (file transport ignores URL userinfo): the published mirror
-// must serve the cloned content while its config, identity sidecar,
-// catalog row, and captured logs carry no trace of the credential.
-func TestEnsureCredentialBearingSourceLeavesNoCredential(t *testing.T) {
+// TestEnsureCredentialBearingSourceRefused drives the production Ensure
+// entry point with a credential-bearing file source: it must be refused
+// before anything is written — the credential would otherwise reach git's
+// argv (visible via ps) and the persisted origin — and the refusal must
+// neither echo the credential nor leave it behind in anything the store
+// wrote. The userinfo-free form of the same source still serves.
+func TestEnsureCredentialBearingSourceRefused(t *testing.T) {
 	t.Parallel()
 	srcDir, sha := newSourceRepo(t)
 	const secret = "s3cr3t-token-ABC123"
@@ -485,44 +527,34 @@ func TestEnsureCredentialBearingSourceLeavesNoCredential(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	dir, err := store.Ensure(context.Background(), source, "scope-a")
-	if err != nil {
-		t.Fatalf("Ensure(credential-bearing file source) error = %v", err)
-	}
-	if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
-		t.Errorf("cat-file output = %q, want empty on success", got)
-	}
-	// The persisted origin must be the canonical remote, which carries no
-	// userinfo: a clone records the exact source URL otherwise.
-	origin := runGitT(t, dir, "config", "--get", "remote.origin.url")
-	canonical, _, err := CanonicalRemote(source)
-	if err != nil {
-		t.Fatalf("CanonicalRemote() error = %v", err)
-	}
-	if origin != canonical {
-		t.Errorf("persisted origin = %q, want canonical %q", origin, canonical)
+	if _, err := store.Ensure(context.Background(), source, "scope-a"); err == nil {
+		t.Fatal("Ensure(credential-bearing file source) error = nil, want a refusal")
+	} else if strings.Contains(err.Error(), secret) {
+		t.Errorf("refusal error = %q, must not echo the credential", err.Error())
 	}
 
+	// Anything the store may have written, plus the captured logs: the
+	// walk only reads regular files the store itself wrote under TempDir.
 	var sweep strings.Builder
-	config, err := os.ReadFile(filepath.Join(dir, "config")) //nolint:gosec // G304: constant config name under the test's own TempDir.
-	if err != nil {
-		t.Fatalf("read mirror config: %v", err)
-	}
-	sweep.Write(config)
-	sweep.WriteByte('\n')
-	sidecar, err := os.ReadFile(filepath.Join(dir, identityFileName)) //nolint:gosec // G304: constant sidecar name under the test's own TempDir.
-	if err != nil {
-		t.Fatalf("read mirror identity: %v", err)
-	}
-	sweep.Write(sidecar)
-	sweep.WriteByte('\n')
-	entries, err := store.List()
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
-	}
-	for _, entry := range entries {
-		sweep.WriteString(entry.Digest)
+	_ = filepath.Walk(stateDir, func(sweepPath string, info os.FileInfo, err error) error { //nolint:gosec // G122: secret sweep over the test's own TempDir; no writes.
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(sweepPath) //nolint:gosec // G304: files enumerated from the test's own TempDir walk.
+		if err != nil {
+			return nil
+		}
+		sweep.Write(data)
 		sweep.WriteByte('\n')
+		return nil
+	})
+	if entries, err := store.List(); err != nil {
+		t.Fatalf("List() error = %v", err)
+	} else {
+		for _, entry := range entries {
+			sweep.WriteString(entry.Digest)
+			sweep.WriteByte('\n')
+		}
 	}
 	logsMu.Lock()
 	for _, line := range logged {
@@ -531,7 +563,25 @@ func TestEnsureCredentialBearingSourceLeavesNoCredential(t *testing.T) {
 	}
 	logsMu.Unlock()
 	if strings.Contains(sweep.String(), secret) {
-		t.Error("credential reached the published mirror config, sidecar, catalog, or logs")
+		t.Error("credential reached mirror state, catalog, or logs")
+	}
+	if entries, err := store.List(); err != nil {
+		t.Fatalf("List() error = %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("catalog after refusal has %d rows, want none", len(entries))
+	}
+
+	// The userinfo-free form of the same source still serves through the
+	// production path.
+	plain := "file://localhost" + srcDir
+	lease, err := store.Ensure(context.Background(), plain, "scope-a")
+	if err != nil {
+		t.Fatalf("Ensure(userinfo-free source) error = %v", err)
+	}
+	dir := lease.Dir()
+	lease.Release()
+	if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
+		t.Errorf("cat-file output = %q, want empty on success", got)
 	}
 }
 
@@ -549,11 +599,23 @@ func TestEnsureConcurrentSameMirrorDoesNotCorrupt(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		dir1, err1 = store.Ensure(context.Background(), srcDir, "scope-a")
+		lease, err := store.Ensure(context.Background(), srcDir, "scope-a")
+		if err == nil {
+			dir1 = lease.Dir()
+			lease.Release()
+		} else {
+			err1 = err
+		}
 	}()
 	go func() {
 		defer wg.Done()
-		dir2, err2 = store.Ensure(context.Background(), srcDir, "scope-a")
+		lease, err := store.Ensure(context.Background(), srcDir, "scope-a")
+		if err == nil {
+			dir2 = lease.Dir()
+			lease.Release()
+		} else {
+			err2 = err
+		}
 	}()
 	wg.Wait()
 
@@ -674,7 +736,8 @@ func TestEnsureClonesTheRemoteItsIdentityRecords(t *testing.T) {
 			if _, err := store.Ensure(context.Background(), tt.crafted, "scope-a"); err != nil {
 				t.Fatalf("Ensure(crafted) error = %v", err)
 			}
-			dir, err := store.Ensure(context.Background(), genuine, "scope-a")
+			dirLease, err := store.Ensure(context.Background(), genuine, "scope-a")
+			dir := dirLease.Dir()
 			if err != nil {
 				t.Fatalf("Ensure(genuine) error = %v", err)
 			}
@@ -722,9 +785,10 @@ func TestEnsureRefusesUnparseableURLSource(t *testing.T) {
 
 // TestEnsureIgnoresAmbientGitConfig drives the production entry point under
 // a global git config of the kind a developer host carries. A template
-// directory must not seed hooks into the mirror, and an insteadOf rewrite
-// of the remote must not make the store refuse its own fresh mirror. These
-// cases set process environment, so they do not run in parallel.
+// directory must not seed hooks into the mirror: keeper git runs
+// hermetically (no system or global config, empty template), so ambient
+// settings never reach the clone. This case sets process environment, so
+// it does not run in parallel.
 func TestEnsureIgnoresAmbientGitConfig(t *testing.T) {
 	srcDir, sha := newSourceRepo(t)
 	templateDir := t.TempDir()
@@ -735,47 +799,56 @@ func TestEnsureIgnoresAmbientGitConfig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(templateDir, "hooks", "reference-transaction"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write template hook: %v", err)
 	}
-	const rewritten = "https://forge.invalid/org/repo.git"
-
-	tests := []struct {
-		name   string
-		config string
-		source string
-	}{
-		{
-			name:   "template directory with an executable hook",
-			config: "[init]\n\ttemplateDir = " + templateDir + "\n",
-			source: srcDir,
-		},
-		{
-			name:   "insteadOf rewrite of the remote",
-			config: "[url \"file://" + srcDir + "\"]\n\tinsteadOf = " + rewritten + "\n",
-			source: rewritten,
-		},
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(globalConfig, []byte("[init]\n\ttemplateDir = "+templateDir+"\n"), 0o600); err != nil {
+		t.Fatalf("write global config: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			globalConfig := filepath.Join(t.TempDir(), "gitconfig")
-			if err := os.WriteFile(globalConfig, []byte(tt.config), 0o600); err != nil {
-				t.Fatalf("write global config: %v", err)
-			}
-			t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
-			store := newTestStore(t)
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+	store := newTestStore(t)
 
-			dir, err := store.Ensure(context.Background(), tt.source, "")
-			if err != nil {
-				t.Fatalf("Ensure() error = %v", err)
-			}
-			if _, err := store.Ensure(context.Background(), tt.source, ""); err != nil {
-				t.Fatalf("second Ensure() error = %v", err)
-			}
-			if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
-				t.Errorf("cat-file output = %q, want empty on success", got)
-			}
-			if _, err := os.Lstat(filepath.Join(dir, "hooks", "reference-transaction")); !os.IsNotExist(err) {
-				t.Errorf("mirror carries the template hook (err = %v)", err)
-			}
-		})
+	lease, err := store.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	dir := lease.Dir()
+	lease.Release()
+	if _, err := store.Ensure(context.Background(), srcDir, ""); err != nil {
+		t.Fatalf("second Ensure() error = %v", err)
+	}
+	if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
+		t.Errorf("cat-file output = %q, want empty on success", got)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "hooks", "reference-transaction")); !os.IsNotExist(err) {
+		t.Errorf("mirror carries the template hook (err = %v)", err)
+	}
+}
+
+// TestEnsureIgnoresAmbientInsteadOfRewrite pins the hermetic half of the
+// ambient-config rule: a global url.insteadOf rewrite that would redirect
+// the clone at another repository is ignored — keeper git reads no system
+// or global config — so cloning the literal (unreachable) source fails
+// and publishes nothing. Without the hermetic environment the rewrite
+// would steer the clone while the identity still recorded the requested
+// remote.
+func TestEnsureIgnoresAmbientInsteadOfRewrite(t *testing.T) {
+	srcDir, _ := newSourceRepo(t)
+	const rewritten = "https://forge.invalid/org/repo.git"
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(globalConfig, []byte("[url \"file://"+srcDir+"\"]\n\tinsteadOf = "+rewritten+"\n"), 0o600); err != nil {
+		t.Fatalf("write global config: %v", err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+	store := newTestStore(t)
+
+	if _, err := store.Ensure(context.Background(), rewritten, ""); err == nil {
+		t.Fatal("Ensure(rewritten remote) error = nil, want a clone failure against the literal source")
+	}
+	leftovers, err := os.ReadDir(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read mirrors dir: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("refused clone left %d entries behind, want none", len(leftovers))
 	}
 }
 
@@ -788,7 +861,8 @@ func TestEnsureMirrorLocalInsteadOfFailsClosed(t *testing.T) {
 	srcB, _ := newSourceRepo(t)
 	store := newTestStore(t)
 
-	dirB, err := store.Ensure(context.Background(), srcB, "")
+	dirBLease, err := store.Ensure(context.Background(), srcB, "")
+	dirB := dirBLease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure(srcB) error = %v", err)
 	}
@@ -807,7 +881,8 @@ func TestMirrorDigestJoinsCanonicalAndScope(t *testing.T) {
 	srcDir, _ := newSourceRepo(t)
 	store := newTestStore(t)
 
-	dir, err := store.Ensure(context.Background(), srcDir, "scope-a")
+	dirLease, err := store.Ensure(context.Background(), srcDir, "scope-a")
+	dir := dirLease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
 	}
@@ -897,7 +972,8 @@ func TestRemoveDeletesDirectoryAndDropsRow(t *testing.T) {
 	srcDir, _ := newSourceRepo(t)
 	store := newTestStore(t)
 
-	dir, err := store.Ensure(context.Background(), srcDir, "")
+	dirLease, err := store.Ensure(context.Background(), srcDir, "")
+	dir := dirLease.Dir()
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
 	}
@@ -965,23 +1041,27 @@ func TestEnsureWithAuthSuccessClonesLocalSource(t *testing.T) {
 	srcDir, sha := newSourceRepo(t)
 	store := newTestStore(t)
 
-	dir, err := store.EnsureWithAuth(context.Background(), srcDir, "", func(context.Context, string) (string, bool, error) {
+	lease, err := store.EnsureWithAuth(context.Background(), srcDir, "", func(context.Context, string) (string, bool, error) {
 		return "Authorization: Bearer token", true, nil
 	})
 	if err != nil {
 		t.Fatalf("EnsureWithAuth() error = %v", err)
 	}
+	dir := lease.Dir()
+	lease.Release()
 	if got := runGitT(t, dir, "cat-file", "-e", sha+"^{commit}"); got != "" {
 		t.Errorf("cat-file output = %q, want empty on success", got)
 	}
 	// The resolver runs only for a fresh clone: serving the existing
 	// mirror with a failing resolver still succeeds without the network.
-	dir2, err := store.EnsureWithAuth(context.Background(), srcDir, "", func(context.Context, string) (string, bool, error) {
+	lease2, err := store.EnsureWithAuth(context.Background(), srcDir, "", func(context.Context, string) (string, bool, error) {
 		return "", false, errors.New("must not run for an existing mirror")
 	})
 	if err != nil {
 		t.Fatalf("EnsureWithAuth(existing) error = %v", err)
 	}
+	dir2 := lease2.Dir()
+	lease2.Release()
 	if dir2 != dir {
 		t.Errorf("existing mirror dir = %q, want %q", dir2, dir)
 	}
