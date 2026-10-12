@@ -59,13 +59,17 @@ func TestConcreteInBoxCellsPreserveEvidenceLevels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build(): %v", err)
 	}
+	// The in-box loop cells name no proving lane, so all three derive the
+	// unproven default — experimental and not smoked. This test pins that
+	// the derivation reaches cells it was never hand-tuned for: no typed
+	// value survives anywhere, including here.
 	want := map[CellKey]struct {
 		stability string
 		smoked    bool
 	}{
-		{Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostDirect}: {stability: "stable", smoked: true},
-		{Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostVertex}: {stability: "beta", smoked: false},
-		{Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: agent.HostLocal}:         {stability: "beta", smoked: false},
+		{Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostDirect}: {stability: UnprovenStability, smoked: false},
+		{Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostVertex}: {stability: UnprovenStability, smoked: false},
+		{Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: agent.HostLocal}:         {stability: UnprovenStability, smoked: false},
 	}
 	for _, cell := range built.Matrix.Cells {
 		expected, ok := want[cell.Key()]
