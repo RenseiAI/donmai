@@ -48,7 +48,7 @@ const (
 	// It deliberately does NOT end in the record suffix: Scan must never
 	// enumerate it as a discovery record, the same trap the seat launch
 	// record and the absence sidecar avoid.
-	seatEpochFloorSuffix   = ".seatfloor"
+	seatEpochFloorSuffix    = ".seatfloor"
 	seatLaunchSchemaVersion = 1
 	// seatLaunchSuffix deliberately does NOT end in the record suffix: a name
 	// ending in `.json` would be enumerated by Scan as a discovery record.

@@ -434,18 +434,6 @@ func (c *shimSeatReportCache) retain(live map[shimSeatReportKey]struct{}) {
 	}
 }
 
-// shimSeatReport is the handle evidence for one adopted or quarantined
-// shim-owned seat, read once per launch incarnation and cached (see
-// shimSeatReportCache).
-func (d *Daemon) shimSeatReport(registry *sessionshim.Registry, key shimSeatReportKey) *SessionSeatBudget {
-	if rep, ok := d.shimSeatReports.get(key); ok {
-		return &rep
-	}
-	rep := d.readShimSeatReport(registry, key.id, key.epoch)
-	d.shimSeatReports.put(key, *rep)
-	return rep
-}
-
 // shimSeatReportsBatch is the batched twin of shimSeatReport: every
 // uncached seat in keys is read with one systemctl call, then cached per
 // incarnation exactly as the single path caches. Cached seats never reach
