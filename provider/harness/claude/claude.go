@@ -82,9 +82,10 @@ func (*Provider) Name() agent.ProviderName { return agent.ProviderClaude }
 //     (which replaces the subprocess shell-out with the
 //     Anthropic Go SDK + a Go-native agent loop for true mid-turn
 //     injection without subprocess overhead).
-//   - SupportsSessionResume=false. The Provider.Resume entrypoint is
-//     wired but not exercised by the v0.5.0 runner; flips to true when
-//     the resume code path lands.
+//   - SupportsSessionResume=true. The harness owns its resume token: a
+//     fresh Spawn mints a session id and passes it as `--session-id`, so
+//     the token is known before the first turn; Provider.Resume
+//     continues that conversation via `--resume <session-id>`.
 //
 // All other flags follow the legacy claude-provider.ts capability
 // table verbatim, except SupportsCodeIntelligenceEnforcement which is
@@ -92,7 +93,7 @@ func (*Provider) Name() agent.ProviderName { return agent.ProviderClaude }
 func (*Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
 		SupportsMessageInjection:            true,  // between-turn injection via --resume
-		SupportsSessionResume:               false, // v0.5.0 runner limitation
+		SupportsSessionResume:               true,  // owned --session-id at launch, --resume to continue
 		SupportsToolPlugins:                 true,
 		NeedsBaseInstructions:               false,
 		NeedsPermissionConfig:               false,
@@ -162,13 +163,20 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
 		return p.spawnInteractive(ctx, spec)
 	}
-	return p.spawn(ctx, spec, "")
+	// Own the resume token at launch: mint the session id here so it is
+	// known before the first turn (no InitEvent wait, no transcript read)
+	// and pass it as `--session-id` on the fresh spawn. The CLI echoes it
+	// on the init line, which the handle captures as confirmation.
+	ownedSessionID, err := generateOwnedSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	return p.spawn(ctx, spec, "", ownedSessionID)
 }
 
-// spawn is the internal Provider.Spawn implementation shared with
-// (the future) Resume. It writes the MCP config tmpfile, builds the
-// CLI args, and starts the subprocess via the shared clijsonl driver,
-// returning a fully-wired Handle.
+// spawn is the internal Provider.Spawn/Resume implementation. It writes
+// the MCP config tmpfile, builds the CLI args, and starts the subprocess
+// via the shared clijsonl driver, returning a fully-wired Handle.
 //
 // The endpoint-binding projection (applyEndpoint) already ran in Spawn,
 // before the interactive/headless split — spec arrives here with it applied.
@@ -176,26 +184,64 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // On any failure prior to the subprocess being started, the driver
 // cleans up the MCP tmpfile and returns an error wrapping
 // agent.ErrSpawnFailed.
-func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
+func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID, ownedSessionID string) (agent.Handle, error) {
 	mcpPath, err := clijsonl.WriteMCPConfigWithEnv(spec.MCPServers, spec.Env)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 
-	argv, stdinPrompt := buildArgs(spec, mcpPath, resumeSessionID)
+	argv, stdinPrompt := buildArgs(spec, mcpPath, resumeSessionID, ownedSessionID)
 	// Between-turn Inject re-enters the session cwd, where a repo-local
 	// settings file could redirect the follow-up turn's bearer: hand the
 	// driver the same routing pin this spawn carries so every --resume
 	// resolves on the pinned layer. Host-login sessions pin nothing and
 	// keep the resume argv byte-identical.
-	return clijsonl.SpawnBinary(ctx, p.binary, argv, stdinPrompt, mcpPath, resumePinArgs(spec), spec.Cwd, spec.Env, spec.OnProcessSpawned)
+	//
+	// The owned id rides into the handle ahead of the CLI's own init line
+	// (see SpawnBinaryWithOwnedSessionID): SessionID() is the resume token
+	// from the moment Spawn/Resume returns, not from the first event.
+	return clijsonl.SpawnBinaryWithOwnedSessionID(ctx, p.binary, argv, stdinPrompt, mcpPath, resumePinArgs(spec), spec.Cwd, spec.Env, spec.OnProcessSpawned, ownedSessionIDForHandle(resumeSessionID, ownedSessionID))
 }
 
-// Resume returns agent.ErrUnsupported on v0.5.0 per the locked
-// capability matrix. When the runner gains resume support this method
-// will dispatch to spawn(ctx, spec, sessionID).
-func (*Provider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.Handle, error) {
-	return nil, fmt.Errorf("provider/claude: Resume: %w (SupportsSessionResume=false in v0.5.0)", agent.ErrUnsupported)
+// ownedSessionIDForHandle resolves the resume token the handle owns from
+// spawn time: the resumed id on the restore path, the minted id on a fresh
+// launch. Empty only for callers that own no token (never in production;
+// Spawn always mints, Resume always names one).
+func ownedSessionIDForHandle(resumeSessionID, ownedSessionID string) string {
+	if resumeSessionID != "" {
+		return resumeSessionID
+	}
+	return ownedSessionID
+}
+
+// Resume continues the conversation owned by sessionID via
+// `claude --resume <session-id>`. An empty id is not a fresh spawn — it
+// is a caller bug — and fails with agent.ErrSessionNotFound so the
+// restore state machine (agent.DecideRestore) can tell "no token" from
+// "token gone": only the latter admits fresh_primed without an explicit
+// flag.
+//
+// Resume validates synchronously only this far: the CLI accepts --resume
+// optimistically and a conversation that vanished since reports "No
+// conversation found" on the handle's event stream, not here. That turn's
+// error feeds the NEXT restore decision; see agent/restore.go.
+func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("provider/claude: Resume: %w: empty session id is not a fresh spawn", agent.ErrSessionNotFound)
+	}
+	var err error
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	spec, err = applyEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	if forceEffortEnv(spec) {
+		spec.Env = withEffortEnv(spec.Env, spec.Effort)
+	}
+	return p.spawn(ctx, spec, sessionID, "")
 }
 
 // Shutdown is a no-op for the CLI shell-out provider. Each session is
