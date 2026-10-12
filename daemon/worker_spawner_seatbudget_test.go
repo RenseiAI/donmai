@@ -1232,14 +1232,21 @@ func TestStartShimProcess_FloorsTheEpochPastDisposal(t *testing.T) {
 func TestFinishAdoptedShim_StopsTheSeatScope(t *testing.T) {
 	d, registry := newSeatReportDaemon(t, noLiveScope)
 	var stopped []string
+	id := sessionshim.Identity{OrgID: "o", SessionID: "stopping-seat"}
 	d.shimScope.stopScope = func(scope string, userScope bool) error {
 		stopped = append(stopped, scope)
 		if !userScope {
 			t.Error("scope stop used the system bus; want the launch's bus decision")
 		}
+		// A relaunch racing the stop must advance past the disposed epoch
+		// even with no epoch floor on disk (this test writes none): the
+		// tombstone still reserves epoch 4 until the stop has returned, so
+		// the stop can never target a successor that reused its name.
+		if got := d.nextShimProcessEpoch(id, registry); got <= 4 {
+			t.Errorf("nextShimProcessEpoch during the scope stop = %d; want > 4 (the disposed epoch is still reserved)", got)
+		}
 		return nil
 	}
-	id := sessionshim.Identity{OrgID: "o", SessionID: "stopping-seat"}
 	tombstone := sessionshim.Tombstone{
 		SchemaVersion: sessionshim.RecordSchemaVersion,
 		OrgID:         id.OrgID, SessionID: id.SessionID,

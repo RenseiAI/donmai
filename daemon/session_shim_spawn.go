@@ -3250,16 +3250,18 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 		slog.Warn("session shim: withdraw discovery record", "session", id.String(), "error", err)
 		return
 	}
+	// The scope goes before the proof. A stray process that left the
+	// worker's process group keeps an otherwise-finished scope loaded, so
+	// the stop reaps it. It runs while the tombstone still sits on disk:
+	// the tombstone alone reserves this epoch, so a relaunch racing this
+	// cleanup advances past it even when its best-effort epoch floor could
+	// not be written, and the stop can never end a successor's seat.
+	d.stopShimSeatScope(registry, id, tombstone.ProcessEpoch)
 	// Audited disposal: the outcome is durably recorded above and no liveness
 	// claim survives it, so the tombstone has done its job and may go.
 	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
 		slog.Warn("session shim: dispose tombstone", "session", id.String(), "error", err)
 	}
-	// The scope goes with the proof. A stray process that left the worker's
-	// process group keeps an otherwise-finished scope loaded, and the epoch
-	// floor below guarantees the next launch names a fresh unit — so the
-	// stop only reaps strays; it can never end a successor's seat.
-	d.stopShimSeatScope(registry, id, tombstone.ProcessEpoch)
 	// The captured stdout/stderr file is disposed alongside the record/
 	// tombstone above — see removeShimChildLog's doc comment.
 	removeShimChildLog(registry.Dir(), id)
