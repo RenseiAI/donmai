@@ -18,12 +18,17 @@ var recordProbePath = flag.String("acceptance.record-probe", "",
 	"write the container record probe (JSON) to this path")
 
 // recordProbe is what the container driver decides its record from: the
-// N+1 build's own selection-rule answers and the live matrix rows it
-// records. Nothing in it is read from configuration.
+// N+1 build's own selection-rule answers, the live matrix rows it
+// records, and the live halves of the adoption-gated local rows. The
+// halves travel as named slots with their own status — pending until the
+// driver grows the live-seat assertions that record them — so a gated
+// live half is listed in every record instead of silently absent from it.
+// Nothing in it is read from configuration.
 type recordProbe struct {
 	HeadlessOwned    bool              `json:"headlessOwned"`
 	InteractiveOwned bool              `json:"interactiveOwned"`
 	LiveCases        []recordProbeCase `json:"liveCases"`
+	LiveHalves       []recordProbeHalf `json:"liveHalves"`
 }
 
 type recordProbeCase struct {
@@ -32,11 +37,30 @@ type recordProbeCase struct {
 	RequiresAdoption bool   `json:"requiresAdoption"`
 }
 
+// recordProbeHalf is one gated live half: the matrix row it belongs to,
+// the slot the container records it under, and its status. "pending" is
+// the only status this build emits: the live-seat assertions do not exist
+// yet, so the driver lists each half without recording it. "recorded" is
+// reserved for the green slices, which flip the driver's half assertions
+// from listing to recording.
+type recordProbeHalf struct {
+	Row    string `json:"row"`
+	Slot   string `json:"slot"`
+	Status string `json:"status"`
+}
+
+// pendingLiveHalfStatus is the status every live half carries until the
+// adoption slices land and the container driver records it.
+const pendingLiveHalfStatus = "pending"
+
 // TestRecordProbe is the container driver's probe and, in-repo, its
 // contract: the probe asks the production selection rule (with ownership
 // and adoption enabled — the posture the green slices land) about a
-// headless spec and an interactive control, and carries the live matrix
-// rows so the record lists exactly the cases this revision defines.
+// headless spec and an interactive control, carries the live matrix rows
+// so the record lists exactly the cases this revision defines, and carries
+// the live halves of the adoption-gated local rows as pending slots so
+// the record lists them too. A row whose live half the probe omits is a
+// row the container silently stops recording.
 func TestRecordProbe(t *testing.T) {
 	t.Parallel()
 	probe := adoptionProbeForHeadlessSpec(defaultAdoptionProbeDaemon())
@@ -44,6 +68,9 @@ func TestRecordProbe(t *testing.T) {
 	for _, c := range failureMatrix {
 		if !c.local {
 			rec.LiveCases = append(rec.LiveCases, recordProbeCase{Name: c.name, Want: c.want, RequiresAdoption: c.requiresAdoption})
+		}
+		if c.liveHalf != "" {
+			rec.LiveHalves = append(rec.LiveHalves, recordProbeHalf{Row: c.name, Slot: c.liveHalf, Status: pendingLiveHalfStatus})
 		}
 	}
 	if *recordProbePath != "" {
@@ -60,6 +87,15 @@ func TestRecordProbe(t *testing.T) {
 	}
 	if len(rec.LiveCases) == 0 || rec.LiveCases[0].Name != "seat-survives-upgrade" {
 		t.Fatalf("live cases = %+v, want seat-survives-upgrade first: the container records it as the red case", rec.LiveCases)
+	}
+	wantHalves := matrixLiveHalves()
+	if len(rec.LiveHalves) != len(wantHalves) {
+		t.Fatalf("live halves = %+v, want the %d gated slots %+v: every gated live half must ride the probe", rec.LiveHalves, len(wantHalves), wantHalves)
+	}
+	for i, slot := range wantHalves {
+		if rec.LiveHalves[i].Slot != slot || rec.LiveHalves[i].Status != pendingLiveHalfStatus {
+			t.Fatalf("live halves = %+v, want slot %q pending at index %d", rec.LiveHalves, slot, i)
+		}
 	}
 }
 

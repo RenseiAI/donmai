@@ -12,6 +12,14 @@ package upgradeacceptance
 //     TestFailureMatrixRegistered fails a local row with no driver, and
 //     TestSuiteDefinesEveryNamedDriver fails a driver name the package's
 //     test files do not define.
+//   - Three adoption-gated local rows also carry a live half: the in-repo
+//     half is driven today while the live-seat half waits on the adoption
+//     slices. liveHalf names the record-probe slot for that half; the
+//     probe carries every slot (recorded or pending) and the container
+//     driver records only the slots the probe lists, so a gated live half
+//     cannot silently drop out of the record. Today all three slots are
+//     pending: the restart still ends the seat, so the container has no
+//     live seat to observe them on.
 //   - Every live case is recorded by the container driver
 //     (container/upgrade-acceptance.sh), which reads this list from the
 //     record probe built from the same revision, so the two cannot drift.
@@ -36,11 +44,17 @@ type failureCase struct {
 	// shim adoption (slices after this one). A live row so marked fails on
 	// current main; a local row so marked is driven in-repo for the half
 	// that does not (receiver, lease and heartbeat semantics), and its live
-	// half waits on the adoption slices.
+	// half waits on the adoption slices. liveHalf, when set, names the
+	// record-probe slot that live half waits on.
 	requiresAdoption bool
 	// driver names the in-repo test that drives a local case. Empty for a
 	// live case, which only the container driver records.
 	driver string
+	// liveHalf names the record-probe slot carrying this row's live half.
+	// Set only on local rows that also require adoption: their in-repo
+	// half is driven today while their live-seat half waits on the
+	// adoption slices. Empty on every other row.
+	liveHalf string
 }
 
 // failureMatrix is the D6 failure matrix: every row the acceptance flow
@@ -82,6 +96,7 @@ var failureMatrix = []failureCase{
 		want:  "outbox pending and the new daemon replays the exact bytes once and a forced second replay returns the original receipt",
 		local: true, requiresAdoption: true,
 		driver: "TestReceiverPendingReplay",
+		liveHalf: "pending-replay-behind-outage",
 	},
 	{
 		name:  "old-daemon-meets-headless-shim",
@@ -118,12 +133,14 @@ var failureMatrix = []failureCase{
 		want:  "the lease fuse ends the seat as lost-ownership with its outbox record and tombstone and nothing released without terminal evidence",
 		local: true, requiresAdoption: true,
 		driver: "TestBearerExpiresWhileNoDaemonRuns",
+		liveHalf: "lease-fuse-behind-outage",
 	},
 	{
 		name:  "daemon-returns-before-bearer-expires",
 		want:  "the pushed credential update arrives before the old bearer lapses and the lease never misses a tick",
 		local: true, requiresAdoption: true,
 		driver: "TestDaemonReturnsBeforeBearerExpires",
+		liveHalf: "credential-push-behind-outage",
 	},
 	{
 		name:  "host-reboot",
@@ -191,6 +208,21 @@ func matrixLiveNames() []string {
 	for _, c := range failureMatrix {
 		if !c.local {
 			out = append(out, c.name)
+		}
+	}
+	return out
+}
+
+// matrixLiveHalves returns the live-half slots of the adoption-gated local
+// rows: the live-seat halves only the container lane can observe. The
+// record probe hands the same slots to the container driver, so a gated
+// live half cannot silently drop out of the record the way the three
+// ungated halves did before this slot existed.
+func matrixLiveHalves() []string {
+	var out []string
+	for _, c := range failureMatrix {
+		if c.liveHalf != "" {
+			out = append(out, c.liveHalf)
 		}
 	}
 	return out

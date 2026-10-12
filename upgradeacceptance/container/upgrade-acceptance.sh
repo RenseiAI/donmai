@@ -265,7 +265,14 @@ checkpoint ownership_mode "$(jq -r '.sessionShim.ownershipMode // "absent"' <<<"
   -acceptance.record-probe="${WORK}/probe.json" >"${WORK}/probe.log" 2>&1) \
   || infra probe_failed "$(tail -20 "${WORK}/probe.log")"
 PROBE="$(jq -c . "${WORK}/probe.json")" || infra probe_failed "unreadable probe output"
-CASES="$(jq -c '[.liveCases[] | {name, status: (if .name == "seat-survives-upgrade" then "red" else "blocked" end)}]' <<<"${PROBE}")"
+# The gated live halves ride the probe as named pending slots, and the
+# record embeds the probe whole — so every record lists them. A probe
+# that names no slots means a gated half silently dropped out; fail the
+# lane under its own name instead of writing a record without them.
+[ "$(jq -r '[.liveHalves[] | .slot] | length' <<<"${PROBE}")" -gt 0 ] \
+  || infra probe_failed "probe lists no live-half slots; a gated live half dropped out"
+CASES="$(jq -c '[.liveCases[] | {name, status: (if .name == "seat-survives-upgrade" then "red" else "blocked" end)}]' <<<"${PROBE}")" \
+  || infra probe_failed "unreadable live cases"
 [ "$(jq -r '.interactiveOwned' <<<"${PROBE}")" = "true" ] \
   || infra probe_not_reading_rule "the N+1 selection rule does not own the interactive control spec"
 if [ "$(jq -r '.headlessOwned' <<<"${PROBE}")" = "true" ]; then
