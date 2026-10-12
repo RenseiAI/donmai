@@ -687,7 +687,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		PreparationSeconds: r.PreparationSeconds,
-		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
+		BudgetBreach:       r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 	}
