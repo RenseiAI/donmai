@@ -83,6 +83,37 @@ func TestSpawner_SeatQoS_DefaultSpawnsUnwrapped(t *testing.T) {
 	}
 }
 
+// TestSpawner_SeatQoS_OptsClassGovernsSpawn pins the constructor wiring:
+// an embedder-composed SpawnerOptions.SeatQoS governs spawns without a
+// SetSeatQoS call. Reverting the constructor to drop the opts class
+// leaves this spawn unwrapped and fails here.
+func TestSpawner_SeatQoS_OptsClassGovernsSpawn(t *testing.T) {
+	var gotCmd []string
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/worker"},
+		SeatQoS:               string(seatqos.Utility),
+		StdoutPrefixWriter:    PrefixWriterFunc(func(_, _ string) {}),
+		StderrPrefixWriter:    PrefixWriterFunc(func(_, _ string) {}),
+	})
+	s.startCommand = func(cmd *exec.Cmd) error {
+		gotCmd = append([]string(nil), cmd.Args...)
+		return errSeatQoSCaptureStop
+	}
+	_, err := s.AcceptWork(SessionSpec{SessionID: "seat-qos-opts", Repository: "github.com/a/b"})
+	if err == nil || !strings.Contains(err.Error(), "seat QoS capture") {
+		t.Fatalf("accept = %v; want the capture stop", err)
+	}
+	want := seatQoSCommandPrefixForGOOS(seatqos.Utility, runtime.GOOS)
+	if len(want) == 0 {
+		return
+	}
+	if !strings.HasPrefix(strings.Join(gotCmd, " "), strings.Join(want, " ")+" ") {
+		t.Errorf("command = %v; want the opts-composed utility prefix", gotCmd)
+	}
+}
+
 // TestSpawner_SeatQoS_SetRejectsUnknown pins the fail-closed setter: an
 // unknown class is rejected and the previous class keeps governing
 // spawns, so a bad config can never silently downgrade to default.

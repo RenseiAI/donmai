@@ -340,6 +340,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	return &WorkerSpawner{
 		opts:                   opts,
 		seatBudget:             opts.SeatBudget,
+		seatQoS:                opts.SeatQoS,
 		sessions:               make(map[string]*spawnedSession),
 		spawnReservations:      make(map[string]struct{}),
 		sessionHistory:         make(map[string]struct{}),
@@ -716,7 +717,12 @@ func (s *WorkerSpawner) SetSeatQoS(raw string) error {
 
 // seatQoSForSpawn resolves the scheduling class one spawn applies: the
 // spawner's configured class. Empty reads as default (no wrapper) — the
-// same opt-in default the config layer promises.
+// same opt-in default the config layer promises. The fast path reads the
+// dedicated field SetSeatQoS maintains; the constructor seeds it from
+// SpawnerOptions, so the fallback below only fires for a zero-value
+// spawner no constructor built (never in production). The mu read nests
+// inside the QoS read lock: no other path takes the two locks in the
+// opposite order, so nesting here cannot deadlock.
 func (s *WorkerSpawner) seatQoSForSpawn() seatqos.Class {
 	s.seatQoSMu.RLock()
 	defer s.seatQoSMu.RUnlock()
