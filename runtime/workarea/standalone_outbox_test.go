@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -441,5 +443,81 @@ func TestStandaloneOutboxAcceptsLocalSessionID(t *testing.T) {
 	})
 	if err != nil || considered != 1 || len(sent) != 1 || !bytes.Equal(sent[0], body) {
 		t.Fatalf("considered=%d sent=%d err=%v", considered, len(sent), err)
+	}
+}
+
+func TestStandaloneOutboxReopenLeavesLiveAttemptAlone(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	clock := &standaloneManualClock{now: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)}
+	store, err := NewLeaseStore(StoreOptions{Dir: dir, Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := "11111111-1111-4111-8111-111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"failed"}`)
+	if _, err := store.SaveStandaloneOutbox(context.Background(), standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, clock.now.Add(MaximumLeaseDuration))); err != nil {
+		t.Fatal(err)
+	}
+	// Drive the record into attempting the way a live replay does: flip
+	// the state under the record lock, then hold the lock (on a separate
+	// file description, the way a live sender in another process would)
+	// while a second store handle opens the same directory. The open
+	// must not rewind the live attempt to pending — that rewind is what
+	// duplicated the send.
+	key := StandaloneOutboxKey(session, 1)
+	if err := store.withLocks(context.Background(), []string{"standalone-outbox:" + key}, func() error {
+		envelope, err := store.loadStandaloneOutbox(key)
+		if err != nil {
+			return err
+		}
+		envelope.Record.DeliveryState = TerminalStatusAttempting
+		return store.writeStandaloneOutbox(*envelope)
+	}); err != nil {
+		t.Fatalf("arm attempting: %v", err)
+	}
+	release := holdOutboxRecordLock(t, store, key)
+	defer release()
+	reopened, err := NewLeaseStore(StoreOptions{Dir: dir, Now: clock.Now})
+	if err != nil {
+		t.Fatalf("reopen with live attempt: %v", err)
+	}
+	// The assertion must not take the record lock: the live send still
+	// holds it. Read the file directly and decode it instead.
+	raw, err := os.ReadFile(dir + "/standalone-outbox/" + key + ".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope standaloneOutboxEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Record.DeliveryState != TerminalStatusAttempting {
+		t.Fatalf("delivery=%q, want attempting (live send still owns it)", envelope.Record.DeliveryState)
+	}
+	_ = reopened
+}
+
+// holdOutboxRecordLock takes the record's lock file the way withLocks does
+// and holds it until release is called, modelling a live sender mid-attempt.
+// Flock locks are per-open-file-description: the same process must hold the
+// lock on a SEPARATE file description for the contention to be real, so
+// this opens the lock file directly rather than reusing the store handle.
+func holdOutboxRecordLock(t *testing.T, store *LeaseStore, key string) func() {
+	t.Helper()
+	sum := sha256.Sum256([]byte("standalone-outbox:" + key))
+	name := hex.EncodeToString(sum[:]) + ".lock"
+	f, err := os.OpenFile(store.Dir()+"/locks/"+name, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		t.Fatalf("take record lock: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
 	}
 }

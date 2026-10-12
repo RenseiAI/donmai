@@ -658,18 +658,34 @@ func (s *LeaseStore) scanStandaloneOutbox(prune bool) ([]standaloneOutboxEnvelop
 // with the replay path so a bad file cannot fail the open (which would fail
 // daemon start and worker preflight), and terminal records past retention
 // are pruned before the store reports ready.
+//
+// The reset takes each record's lock first: opening a second store handle
+// while a live sender holds a record in attempting must not silently rewind
+// it to pending — without the lock the open undoes the live send and the
+// record sends twice. When the lock is held elsewhere the record is left
+// alone: its owner will finish the attempt, and the next replay pass (or a
+// later open) reconciles whatever state remains.
 func (s *LeaseStore) reconcileStandaloneOutbox() error {
 	envelopes, err := s.scanStandaloneOutbox(true)
 	if err != nil {
 		return err
 	}
 	for i := range envelopes {
-		if envelopes[i].Record.DeliveryState == TerminalStatusAttempting {
-			envelopes[i].Record.DeliveryState = TerminalStatusPending
-			if err := s.writeStandaloneOutbox(envelopes[i]); err != nil {
+		if envelopes[i].Record.DeliveryState != TerminalStatusAttempting {
+			continue
+		}
+		key := envelopes[i].OutboxKey
+		_ = s.withLocksOrSkip(context.Background(), []string{"standalone-outbox:" + key}, func() error {
+			envelope, err := s.loadStandaloneOutbox(key)
+			if err != nil {
 				return err
 			}
-		}
+			if envelope.Record.DeliveryState != TerminalStatusAttempting {
+				return nil
+			}
+			envelope.Record.DeliveryState = TerminalStatusPending
+			return s.writeStandaloneOutbox(*envelope)
+		})
 	}
 	return nil
 }

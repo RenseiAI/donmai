@@ -1335,11 +1335,32 @@ func (s *LeaseStore) reconcile() error {
 	}
 	for i := range leases {
 		lease := leases[i]
+		// The attempting reset takes the record locks first, for the same
+		// reason the standalone reconcile does: opening a second store
+		// handle while a live sender holds a lease record in attempting
+		// must not silently rewind it to pending and duplicate the
+		// send. A lock held elsewhere leaves the record alone; its
+		// owner finishes the attempt and a later pass reconciles it.
+		// The in-memory copy tracks the same decision so the actionable
+		// markers below reflect what the reconcile attempted.
 		if lease.TerminalStatus != nil && lease.TerminalStatus.DeliveryState == TerminalStatusAttempting {
-			lease.TerminalStatus.DeliveryState = TerminalStatusPending
-			if err := s.writeRecord(lease); err != nil {
+			leaseID := lease.LeaseID
+			resultID := lease.TerminalResultID
+			workareaID := lease.WorkareaID
+			if err := s.withLocksOrSkip(context.Background(), []string{"result:" + resultID, "workarea:" + workareaID}, func() error {
+				live, err := s.load(leaseID)
+				if err != nil {
+					return err
+				}
+				if live.TerminalStatus == nil || live.TerminalStatus.DeliveryState != TerminalStatusAttempting {
+					return nil
+				}
+				live.TerminalStatus.DeliveryState = TerminalStatusPending
+				return s.writeRecord(*live)
+			}); err != nil && !errors.Is(err, errRecordLockHeld) {
 				return err
 			}
+			lease.TerminalStatus.DeliveryState = TerminalStatusPending
 		}
 		if lease.RetainsWorkarea() {
 			if err := s.writeActionableMarker(lease.LeaseID); err != nil {
@@ -2015,4 +2036,60 @@ func releaseLocks(locks []heldLock) {
 		_ = syscall.Flock(locks[i].fd, syscall.LOCK_UN)
 		_ = locks[i].file.Close()
 	}
+}
+
+// errRecordLockHeld reports a record lock owned by a live sender.
+// The open-time reconcile uses it to leave in-flight records alone rather
+// than rewinding them: only a record no sender holds may return to pending.
+var errRecordLockHeld = errors.New("runtime/workarea: standalone outbox record lock held")
+
+// withLocksOrSkip runs fn under the named locks when they are immediately
+// available and returns errRecordLockHeld without blocking when
+// another process holds one. It never waits: the caller is the open-time
+// reconcile, which must not stall daemon start behind a live send.
+func (s *LeaseStore) withLocksOrSkip(ctx context.Context, keys []string, fn func() error) error {
+	unique := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key != "" {
+			unique[fileKey(key)] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for key := range unique {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	lockRoot, err := os.OpenRoot(s.locks)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lockRoot.Close() }()
+	held := make([]heldLock, 0, len(ordered))
+	for _, key := range ordered {
+		lock, err := openLockFile(lockRoot, key+".lock")
+		if err != nil {
+			releaseLocks(held)
+			return err
+		}
+		fd, err := intFileDescriptor(lock.Fd())
+		if err != nil {
+			_ = lock.Close()
+			releaseLocks(held)
+			return err
+		}
+		if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = lock.Close()
+			releaseLocks(held)
+			if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+				return errRecordLockHeld
+			}
+			return err
+		}
+		held = append(held, heldLock{file: lock, fd: fd})
+	}
+	defer releaseLocks(held)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn()
 }
