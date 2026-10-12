@@ -552,7 +552,7 @@ func TestMapEvent_TurnEndToolResultsUsage(t *testing.T) {
 		"message": map[string]any{"role": "assistant", "usage": map[string]any{
 			"input": float64(100), "output": float64(10),
 			"cacheRead": float64(1000), "cacheWrite": float64(50),
-			"cost":      map[string]any{"total": 0.01},
+			"cost": map[string]any{"total": 0.01},
 		}},
 		"toolResults": []any{
 			map[string]any{
@@ -560,7 +560,7 @@ func TestMapEvent_TurnEndToolResultsUsage(t *testing.T) {
 				"usage": map[string]any{
 					"input": float64(20), "output": float64(5),
 					"cacheRead": float64(9000), "cacheWrite": float64(400),
-					"cost":      map[string]any{"total": 0.005},
+					"cost": map[string]any{"total": 0.005},
 				},
 			},
 			map[string]any{
