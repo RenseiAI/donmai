@@ -6,10 +6,12 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +19,8 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/runtime/statehome"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 func TestDaemonRunControlBindPreflight(t *testing.T) {
@@ -691,4 +695,55 @@ func TestDaemonRunControlAuth_FailsClosedEndToEnd(t *testing.T) {
 	if _, err := client.GetStatus(); err != nil {
 		t.Fatalf("GetStatus on a daemon without a control token: %v, want read-only routes to keep working", err)
 	}
+}
+
+func TestStartTerminalReplayLoopsDrainsBothKinds(t *testing.T) {
+	t.Parallel()
+	// The daemon wiring must start BOTH replay loops: the lease loop for
+	// lease-bound terminal records and the standalone loop for leaseless
+	// ones. A dropped loop strands every terminal of its kind with no
+	// error anywhere, so this pins the wiring behaviorally: a seeded
+	// standalone record must send on the loops' immediate first pass.
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := workarea.NewGeneratedID("rcv_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sent.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	if err := manager.RegisterTerminalReceiver(receiver, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	session := "11111111-1111-4111-8111-111111111111"
+	digest := "tr_11111111111111111111111111111111"
+	body := []byte(`{"workerId":"worker-1","status":"failed"}`)
+	if _, err := manager.SaveStandaloneTerminalOutbox(context.Background(), workarea.StandaloneOutboxSaveSpec{
+		SessionID: session, Attempt: 1, TerminalResultID: digest,
+		ReceiverKey: receiver, Body: body,
+		DeadlineAt: time.Now().Add(time.Hour).UTC().Truncate(time.Millisecond),
+		Kind:       workarea.StandaloneOutboxTerminal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	auth := workarea.ReceiverAuthorizationResolver(func(context.Context, string) (string, error) { return "", nil })
+	startTerminalReplayLoops(ctx, manager, auth)
+	// Both loops replay immediately on start; the standalone record must
+	// send on that first pass, well before the 5s interval matters.
+	deadline := time.Now().Add(10 * time.Second)
+	for sent.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sent.Load() != 1 {
+		t.Fatalf("standalone sends=%d, want 1 on the loops' first pass", sent.Load())
+	}
+	cancel()
 }
