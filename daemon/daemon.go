@@ -1549,6 +1549,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 		spawnerOpts.ShimSpawn = d.launchSessionShim
 	}
+	// Admission must see shim-held sessions too, not just their slot count:
+	// the spawner's duplicate-accept guard cannot see shim-owned ids, so
+	// without this a re-dispatched session id already live under a shim
+	// would be accepted a second time. The supplier runs under the spawner
+	// mutex and must not reenter any spawner API; adopted and quarantined
+	// snapshots take the shim-state lock only, so this composes safely.
+	priorShimIDs := spawnerOpts.ExternalSessionIDs
+	spawnerOpts.ExternalSessionIDs = func() []string {
+		var ids []string
+		if priorShimIDs != nil {
+			ids = append(ids, priorShimIDs()...)
+		}
+		ids = append(ids, d.shimOwnedSessionIDs()...)
+		return ids
+	}
 	// Admission must see shim-held slots too, or a restarted daemon would accept
 	// against cores its surviving shims are already using.
 	if spawnerOpts.ExternalOccupancy == nil {

@@ -158,6 +158,32 @@ func TestActiveSessionsDedupesBySessionID(t *testing.T) {
 	}
 }
 
+// TestSpawnerSeesShimOwnedSessionIDs pins the admission half of the dedupe:
+// the spawner's external session ids include adopted and quarantined shim
+// sessions, so re-dispatching a session id already live under a shim is
+// refused (and capacity-charged) rather than accepted a second time.
+func TestSpawnerSeesShimOwnedSessionIDs(t *testing.T) {
+	d := New(Options{SkipRegistration: true})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 8})
+	d.spawner.Resume()
+	d.spawner.opts.ExternalSessionIDs = func() []string { return d.shimOwnedSessionIDs() }
+	id := sessionshim.Identity{OrgID: "org-guard", SessionID: "guarded"}
+	d.shims.mu.Lock()
+	d.shims.adopted[id] = adoptedShim{shimID: "shim-adopted"}
+	d.shims.quarantined = []sessionshim.QuarantinedSession{{
+			OrgID: "org-guard", SessionID: "held",
+			ShimID: "shim-quarantined", ProcessEpoch: 1,
+			Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+		}}
+	d.shims.mu.Unlock()
+	d.spawner.mu.Lock()
+	count := d.spawner.externalSessionOccupancyLocked()
+	d.spawner.mu.Unlock()
+	if count != 2 {
+		t.Fatalf("external session occupancy = %d, want 2 (one adopted, one quarantined)", count)
+	}
+}
+
 // TestActiveSessionsAdoptedBeatsQuarantined pins the precedence inside the
 // shim projection: with no direct child, the adopted handle (which has a
 // controller) wins over the quarantined row for the same session.
