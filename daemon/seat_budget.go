@@ -23,9 +23,11 @@ func validateSeatBudget(b SeatBudgetConfig) error {
 
 // validateSeatQoS enforces the authored per-seat scheduling class. Empty
 // is valid and reads as default (opt-in only — seats spawn exactly as
-// before unless the operator names a class).
+// before unless the operator names a class). Surrounding space and case
+// are ignored, matching the Parse normalisation operators use.
 func validateSeatQoS(raw string) error {
-	return seatqos.Validate(seatqos.Class(raw))
+	_, err := seatqos.Parse(raw)
+	return err
 }
 
 // resolveSeatQoS normalises the authored per-seat scheduling class for
