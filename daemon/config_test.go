@@ -1591,3 +1591,22 @@ func TestDaemonStart_KeepFailedWorktreesStatesWorkerEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveRetentionSettings_ResolvesDefaults pins the retention
+// budget resolution: zero values resolve to the 24-hour default, and a
+// negative age classifies only without removing.
+func TestEffectiveRetentionSettings_ResolvesDefaults(t *testing.T) {
+	t.Parallel()
+	if got := (&Config{}).EffectiveRetentionSettings(); got.DehydrationAgeHours != DefaultDehydrationAgeHours {
+		t.Fatalf("default age = %d, want %d", got.DehydrationAgeHours, DefaultDehydrationAgeHours)
+	}
+	cfg := &Config{}
+	cfg.Workarea.Retention.DehydrationAgeHours = 48
+	if got := cfg.EffectiveRetentionSettings(); got.DehydrationAgeHours != 48 {
+		t.Fatalf("authored age = %d, want 48", got.DehydrationAgeHours)
+	}
+	cfg.Workarea.Retention.DehydrationAgeHours = -1
+	if got := cfg.EffectiveRetentionSettings(); got.DehydrationAgeHours != 0 {
+		t.Fatalf("disabled age = %d, want 0 (classify only)", got.DehydrationAgeHours)
+	}
+}

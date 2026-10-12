@@ -507,6 +507,54 @@ type WorkareaConfig struct {
 	// endpoint switches from a single JSON envelope to NDJSON streaming.
 	// Default 1000 per ADR D4a.
 	DiffStreamingThreshold int `yaml:"diffStreamingThreshold,omitempty" json:"diffStreamingThreshold,omitempty"`
+	// Retention holds the retention budget for retained work areas:
+	// classify and dehydrate installed trees after 24 hours. Optional;
+	// zero values resolve to the policy defaults (see
+	// EffectiveRetentionSettings).
+	Retention RetentionConfig `yaml:"retention,omitempty" json:"retention,omitempty"`
+}
+
+// RetentionConfig configures the retention budget for retained work areas
+// (classify and dehydrate). A retained root is a session directory left
+// behind after its session ended through preservation; a root holding
+// only regenerable installed trees is dehydrated after the dehydration
+// age, with each removal carrying a receipt naming the policy and the
+// measured free-space change.
+type RetentionConfig struct {
+	// DehydrationAgeHours waits this long after classification before
+	// removing the recorded installed paths. Default 24; 0 means the
+	// default, negative classifies only and never removes.
+	DehydrationAgeHours int `yaml:"dehydrationAgeHours,omitempty" json:"dehydrationAgeHours,omitempty"`
+}
+
+// DefaultDehydrationAgeHours waits 24 hours after classification before
+// removing the recorded installed paths.
+const DefaultDehydrationAgeHours = 24
+
+// EffectiveRetentionSettings resolves the authored config to the
+// process-level retention settings. Zero values resolve to defaults;
+// negative values classify only and never remove.
+func (c *Config) EffectiveRetentionSettings() RetentionSettings {
+	var cfg RetentionConfig
+	if c != nil {
+		cfg = c.Workarea.Retention
+	}
+	ageHours := cfg.DehydrationAgeHours
+	if ageHours == 0 {
+		ageHours = DefaultDehydrationAgeHours
+	} else if ageHours < 0 {
+		ageHours = 0
+	}
+	return RetentionSettings{
+		DehydrationAgeHours: ageHours,
+	}
+}
+
+// RetentionSettings is the resolved retention budget for one pass.
+type RetentionSettings struct {
+	// DehydrationAgeHours waits this long after classification before
+	// removing the recorded installed paths. Zero classifies only.
+	DehydrationAgeHours int
 }
 
 // KitConfig configures the Layer-4 kit operator surface — the scan paths
