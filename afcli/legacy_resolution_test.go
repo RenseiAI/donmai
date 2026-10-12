@@ -26,10 +26,11 @@ func TestLegacyAlias_ProvidersResolveToTheirHarness(t *testing.T) {
 	reg := runner.NewRegistry()
 	providers := matrix.HarnessProvidersForParity()
 	// 7 legacy-aliased providers (pi joined as the R2/DEC-3 addition) + the
-	// interactive-only shell harness (W4; no legacy alias by definition — it
-	// is not a back-compat name).
-	if len(providers) != 8 {
-		t.Fatalf("expected 8 harness providers, got %d", len(providers))
+	// muse harness (no legacy alias by definition — it postdates the P2
+	// back-compat split) + the interactive-only shell harness (W4; no
+	// legacy alias by definition — it is not a back-compat name).
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if err := reg.Register(p); err != nil {

@@ -50,11 +50,11 @@ const (
 	ToolDeliveryClaudeMCPConfig     ToolDeliveryKind = "claude_cli_mcp_config"
 	ToolDeliveryCodexApprovalBridge ToolDeliveryKind = "codex_approval_bridge"
 	ToolDeliveryCodexAppServerMCP   ToolDeliveryKind = "codex_app_server_mcp"
-	// ToolDeliveryMuseInlineMCP is the muse harness's session/start
+	// ToolDeliveryMuseSessionMCP is the muse harness's session/start
 	// config.mcpServers mount: inline streamableHttp/stdio servers added
 	// only to the session runtime (gated on the granted sessionMcp
 	// capability).
-	ToolDeliveryMuseInlineMCP ToolDeliveryKind = "muse_inline_mcp"
+	ToolDeliveryMuseSessionMCP ToolDeliveryKind = "muse_session_mcp"
 	// ToolDeliveryMuseApprovalBridge is the muse harness's
 	// approval/requested → approval/decide round trip driven by the
 	// provider's own adjudication (decline maps to abort), never a human.
@@ -1161,7 +1161,7 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge,
 		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
 		ToolDeliveryPiAdditionalExtension, ToolDeliveryPiInteractiveLocalToolPolicy,
-		ToolDeliveryMuseInlineMCP, ToolDeliveryMuseApprovalBridge,
+		ToolDeliveryMuseSessionMCP, ToolDeliveryMuseApprovalBridge,
 		ToolDeliveryNoToolSurface,
 		ToolDeliveryStructuredProviderEvents, ToolDeliveryCoarsePTYEvents, ToolDeliveryStructuredEventReplay,
 		ToolDeliveryTerminalCastReplay, ToolDeliveryHandleCleanup:

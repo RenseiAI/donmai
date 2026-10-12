@@ -107,13 +107,15 @@ const (
 	// no system-prompt channel on MSP, so session-constant instructions
 	// ride a leading text part ahead of the prompt on the same array.
 	PromptDeliveryMuseTurnInput PromptDeliveryKind = "muse_turn_input"
-	// PromptDeliveryMuseLeadText names the leading-text-part projection
+	// PromptDeliveryMuseTurnSteer uses the MSP turn/steer input array.
+	PromptDeliveryMuseTurnSteer PromptDeliveryKind = "muse_turn_steer_input"
+	// PromptDeliveryMuseLeadingText names the leading-text-part projection
 	// of session-constant instructions onto the MSP turn input array
 	// (BaseInstructions, SystemPromptAppend, InitialContext). It is a
 	// distinct kind from MuseTurnInput (the user task itself) so the
 	// receipt distinguishes "instruction folded into the turn" from
 	// "the turn".
-	PromptDeliveryMuseLeadText PromptDeliveryKind = "muse_lead_text_part"
+	PromptDeliveryMuseLeadingText PromptDeliveryKind = "muse_leading_text_part"
 	// PromptDeliveryPiSystemAppend uses pi's append-system flag.
 	PromptDeliveryPiSystemAppend PromptDeliveryKind = "pi_cli_append_system_prompt"
 	// PromptDeliveryPiRPCPrompt uses pi's RPC prompt message.
@@ -443,7 +445,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 			continue
 		}
 		switch profile.ContextDelivery {
-		case PromptDeliveryCodexTurnInput, PromptDeliveryMuseLeadText:
+		case PromptDeliveryCodexTurnInput, PromptDeliveryMuseLeadingText:
 			contextParts = append(contextParts, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
 		case PromptDeliveryCodexPTYSeed, PromptDeliveryPiPTYSeed, PromptDeliveryStubPTYSeed:
@@ -510,7 +512,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 	// input here (via InitialContext, which promptInput emits ahead of
 	// the prompt) only when every system part rode a muse lead-text
 	// delivery — otherwise the generic SystemPromptAppend path stands.
-	if profile.SystemDelivery == PromptDeliveryMuseLeadText && len(systemParts) > 0 {
+	if profile.SystemDelivery == PromptDeliveryMuseLeadingText && len(systemParts) > 0 {
 		contextParts = append(systemParts, contextParts...)
 		systemParts = nil
 	}
@@ -596,8 +598,9 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryOllamaSystemMessage,
 		PromptDeliveryOllamaUserMessage,
 		PromptDeliveryOpenCodePrompt,
+		PromptDeliveryMuseLeadingText,
 		PromptDeliveryMuseTurnInput,
-		PromptDeliveryMuseLeadText,
+		PromptDeliveryMuseTurnSteer,
 		PromptDeliveryPiSystemAppend,
 		PromptDeliveryPiRPCPrompt,
 		PromptDeliveryPiPTYSeed,

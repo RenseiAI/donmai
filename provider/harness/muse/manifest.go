@@ -41,7 +41,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// counted-once counters plus the cumulative block; the
 			// handle folds it and emits typed ContextUsageEvents from
 			// session/contextUsage.
-			ContextUsageSource: agent.ContextUsageSourceRPCUsage,
+			ContextUsageSource: agent.ContextUsageSourceMuseTokenUsage,
 			Drives:             []agent.WireProtocol{agent.ProtoMuseMSP},
 			DrivesHosts:        []agent.ServingHost{agent.HostOAuthCLI},
 			Transport:          agent.TransportSubprocessRPC,
@@ -49,15 +49,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		PromptDelivery: []agent.PromptDeliveryProfile{
 			{
 				ID: "muse/headless/prompt-v1", Mode: agent.PromptModeAutonomous,
-				SystemDelivery: agent.PromptDeliveryMuseLeadText, BaseAppendDelivery: agent.PromptDeliveryMuseLeadText,
-				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryMuseLeadText,
+				SystemDelivery: agent.PromptDeliveryMuseLeadingText, BaseAppendDelivery: agent.PromptDeliveryMuseLeadingText,
+				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryMuseLeadingText,
 				UserDelivery: agent.PromptDeliveryMuseTurnInput, AmendmentDelivery: agent.PromptDeliveryMuseTurnInput,
 			},
 		},
 		ToolLifecycle: []agent.ToolLifecycleProfile{
 			{
 				ID: "muse/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
-				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryMuseInlineMCP,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryMuseSessionMCP,
 				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryMuseApprovalBridge,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 				LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: headlessEvents,

@@ -387,7 +387,7 @@ func mapContextUsage(params json.RawMessage, state *mapperState, _ any) []agent.
 	foldCursor(state, &p.ViewCursor)
 	notice := agent.ContextUsageEvent{
 		Harness:    "muse",
-		Source:     agent.ContextUsageSourceRPCUsage,
+		Source:     agent.ContextUsageSourceMuseTokenUsage,
 		NoticeKind: agent.ContextUsageThreshold,
 	}
 	used := p.UsedTokens
