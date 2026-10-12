@@ -504,12 +504,17 @@ func holdOutboxRecordLock(t *testing.T, store *LeaseStore, key string) func() {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	fd, err := intFileDescriptor(f.Fd())
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("record lock descriptor out of range: %v", err)
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		t.Fatalf("take record lock: %v", err)
 	}
 	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = syscall.Flock(fd, syscall.LOCK_UN)
 		_ = f.Close()
 	}
 }
@@ -518,5 +523,103 @@ func TestStandaloneOutboxDeadlineIsNotABorrowedLease(t *testing.T) {
 	t.Parallel()
 	if StandaloneOutboxDeadline <= MaximumLeaseDuration {
 		t.Fatalf("deadline=%v, want longer than the lease maximum %v", StandaloneOutboxDeadline, MaximumLeaseDuration)
+	}
+}
+
+// TestLeaseOutboxReopenLeavesLiveAttemptAlone is the lease-side twin of
+// TestStandaloneOutboxReopenLeavesLiveAttemptAlone: flip a lease-bound
+// terminal record to attempting under its result/workarea locks, hold one
+// of those locks on a separate file description the way a live sender in
+// another process would, then reopen. The open must not rewind the live
+// attempt to pending — emptying the reconcile's withLocksOrSkip key list
+// would take no lock, always run the reset, and silently reinstate the
+// duplicate send this guards.
+func TestLeaseOutboxReopenLeavesLiveAttemptAlone(t *testing.T) {
+	t.Parallel()
+	clock := &standaloneManualClock{now: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)}
+	dir := t.TempDir()
+	store, err := NewLeaseStore(StoreOptions{Dir: dir, Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := "11111111-1111-4111-8111-111111111111"
+	resultID := "tr_11111111111111111111111111111111"
+	workareaID := "wa_11111111111111111111111111111111"
+	receiver := standaloneReceiverKey(t)
+	lease, err := store.Acquire(context.Background(), AcquireSpec{
+		SessionID: session, TerminalResultID: resultID, WorkareaID: workareaID,
+		WorkareaPath: dir + "/" + workareaID, Policy: DefaultLeasePolicy(),
+		ReleaseRequested: true, ReleaseDisposition: "destroy",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"workerId":"worker-1","status":"failed"}`)
+	if _, err := store.SaveTerminalStatus(context.Background(), TerminalStatusSaveSpec{
+		LeaseID: lease.LeaseID, SessionID: session, TerminalResultID: resultID,
+		WorkareaID: workareaID, ReceiverKey: receiver, Body: body,
+		ExpectedExpiresAt: lease.ExpiresAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Arm attempting the way a live replay does: flip the state under the
+	// record locks, so the flip itself cannot race a concurrent sender.
+	if err := store.withLocks(context.Background(), []string{"result:" + resultID, "workarea:" + workareaID}, func() error {
+		live, err := store.load(lease.LeaseID)
+		if err != nil {
+			return err
+		}
+		if live.TerminalStatus == nil {
+			return errors.New("terminal status missing after save")
+		}
+		live.TerminalStatus.DeliveryState = TerminalStatusAttempting
+		return store.writeRecord(*live)
+	}); err != nil {
+		t.Fatalf("arm attempting: %v", err)
+	}
+	release := holdLeaseRecordLock(t, store, "result:"+resultID)
+	defer release()
+	reopened, err := NewLeaseStore(StoreOptions{Dir: dir, Now: clock.Now})
+	if err != nil {
+		t.Fatalf("reopen with live attempt: %v", err)
+	}
+	// The assertion must not take the record locks: the live send still
+	// holds one. The in-memory listing reflects the reconcile decision and
+	// the record file below is decoded directly.
+	persisted, err := reopened.load(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.TerminalStatus == nil || persisted.TerminalStatus.DeliveryState != TerminalStatusAttempting {
+		t.Fatalf("delivery=%+v, want attempting (live send still owns it)", persisted.TerminalStatus)
+	}
+}
+
+// holdLeaseRecordLock takes one of the lease record's lock files the way
+// withLocks does and holds it until release is called, modelling a live
+// sender mid-attempt. Flock locks are per-open-file-description: the same
+// process must hold the lock on a SEPARATE file description for the
+// contention to be real, so this opens the lock file directly rather than
+// reusing the store handle.
+func holdLeaseRecordLock(t *testing.T, store *LeaseStore, key string) func() {
+	t.Helper()
+	sum := sha256.Sum256([]byte(key))
+	name := hex.EncodeToString(sum[:]) + ".lock"
+	f, err := os.OpenFile(store.Dir()+"/locks/"+name, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := intFileDescriptor(f.Fd())
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("record lock descriptor out of range: %v", err)
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		t.Fatalf("take record lock: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(fd, syscall.LOCK_UN)
+		_ = f.Close()
 	}
 }

@@ -1360,7 +1360,12 @@ func (s *LeaseStore) reconcile() error {
 			}); err != nil && !errors.Is(err, errRecordLockHeld) {
 				return err
 			}
-			lease.TerminalStatus.DeliveryState = TerminalStatusPending
+			// A skipped record stays attempting on disk: its owner still
+			// holds the lock and will finish the attempt. Only mirror the
+			// reset when the locked closure actually ran it.
+			if err == nil {
+				lease.TerminalStatus.DeliveryState = TerminalStatusPending
+			}
 		}
 		if lease.RetainsWorkarea() {
 			if err := s.writeActionableMarker(lease.LeaseID); err != nil {

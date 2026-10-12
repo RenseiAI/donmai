@@ -148,6 +148,15 @@ func TestShimSeatPersistsTerminalBodyBeforeFirstSend(t *testing.T) {
 	if loaded.Record.DeliveryState != workarea.TerminalStatusPending {
 		t.Fatalf("delivery=%q, want pending", loaded.Record.DeliveryState)
 	}
+	// The record carries its own delivery bound, not a borrowed lease
+	// duration: a daemon back after the lease window must still replay an
+	// unsent terminal instead of dead-lettering it on arrival. now is the
+	// frozen clock the save read, so the bound must clear it by the
+	// standalone deadline's own margin, not just the lease maximum.
+	now := r.now()
+	if horizon := loaded.Record.DeadlineAt.Sub(now); horizon <= workarea.MaximumLeaseDuration {
+		t.Fatalf("deadline horizon=%v, want more than the lease maximum %v", horizon, workarea.MaximumLeaseDuration)
+	}
 }
 
 // TestShimSeatKilledAfterPersistReplaysExactBytesOnce is the Done-when
