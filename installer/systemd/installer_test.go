@@ -634,12 +634,13 @@ func TestInstall_MigratesLegacyUnit(t *testing.T) {
 	t.Setenv("HOME", tmp)
 
 	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
 	legacyContent := "[Unit]\nDescription=legacy\n[Service]\nExecStart=/usr/local/bin/af host run\n[Install]\nWantedBy=default.target\n"
-	if err := os.WriteFile(legacyPath, []byte(legacyContent), 0o644); err != nil {
+	if err := os.WriteFile(legacyPath, []byte(legacyContent), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
 		t.Fatalf("seed legacy unit: %v", err)
 	}
 
@@ -690,10 +691,11 @@ func TestInstall_MigrationPreservesConfig(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(unitDir, LegacyUnitFilename()), []byte("[Unit]\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(unitDir, LegacyUnitFilename()), []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
 		t.Fatalf("seed legacy unit: %v", err)
 	}
 
@@ -722,11 +724,12 @@ func TestInstall_MigrationSkipsSystemctlRemovesFileOnly(t *testing.T) {
 	t.Setenv("HOME", tmp)
 
 	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
-	if err := os.WriteFile(legacyPath, []byte("[Unit]\n"), 0o644); err != nil {
+	if err := os.WriteFile(legacyPath, []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
 		t.Fatalf("seed legacy unit: %v", err)
 	}
 
@@ -785,13 +788,14 @@ func TestUninstall_RemovesBothUnits(t *testing.T) {
 	t.Setenv("HOME", tmp)
 
 	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	currentPath := filepath.Join(unitDir, DefaultUnitName+".service")
 	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
 	for _, p := range []string{currentPath, legacyPath} {
-		if err := os.WriteFile(p, []byte("[Unit]\n"), 0o644); err != nil {
+		if err := os.WriteFile(p, []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
 			t.Fatalf("seed %s: %v", p, err)
 		}
 	}
@@ -825,11 +829,12 @@ func TestDoctor_ReportsPendingMigration(t *testing.T) {
 	t.Setenv("HOME", tmp)
 
 	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
-	if err := os.WriteFile(legacyPath, []byte("[Unit]\n"), 0o644); err != nil {
+	if err := os.WriteFile(legacyPath, []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
 		t.Fatalf("seed legacy unit: %v", err)
 	}
 
@@ -856,7 +861,7 @@ func TestDoctor_ReportsLegacyActive(t *testing.T) {
 		t.Fatalf("Install: %v", err)
 	}
 	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
-	if err := os.WriteFile(filepath.Join(unitDir, LegacyUnitFilename()), []byte("[Unit]\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(unitDir, LegacyUnitFilename()), []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
 		t.Fatalf("seed legacy unit: %v", err)
 	}
 
