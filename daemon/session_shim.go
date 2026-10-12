@@ -4663,6 +4663,23 @@ func (d *Daemon) SessionShimAdoptionComplete() bool {
 	return d.shims.adoptionComplete
 }
 
+// SessionShimOwnershipEnabled reports whether this daemon's resolved
+// session-shim configuration enables ownership of new sessions (§D11 step
+// 2). The upgrade acceptance probe reads the posture its selection-rule
+// answer was taken under through this, rather than trusting the two flags
+// it configured: a probe daemon whose composition never settled must read
+// stale, never red.
+func (d *Daemon) SessionShimOwnershipEnabled() bool {
+	return d.sessionShimConfig().EnableOwnership
+}
+
+// SessionShimAdoptionEnabled reports whether this daemon's resolved
+// session-shim configuration enables the startup adoption pass (§D11 step
+// 3). It is the ownership flag's companion in the probe posture above.
+func (d *Daemon) SessionShimAdoptionEnabled() bool {
+	return d.sessionShimConfig().EnableAdoption
+}
+
 // SessionShimCarrierActivationComplete reports remote D13 exact-set completion.
 // It does not mean local viewer-mutation authority has been released: hosted
 // composers do that per scope from OnCarrierActivationAcknowledged after the

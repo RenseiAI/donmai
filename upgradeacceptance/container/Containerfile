@@ -62,8 +62,24 @@ RUN go version && go mod download
 # The repo with its history, owned by the acceptance user so the driver can
 # read the earlier revision artifact N is built from without a
 # dubious-ownership refusal.
+#
+# A build from a linked worktree lands a `.git` POINTER file (gitdir: ...)
+# whose target lives outside the build context, not the history — so `git
+# archive` inside the image cannot resolve artifact N. The repair below
+# detects the pointer and re-clones the full history from the common dir
+# it names: the common dir holds the shared objects, so the clone carries
+# the whole history the driver archives from. A build from a full checkout
+# skips the repair (`.git` is already a directory), and a repair that
+# cannot reach the common dir fails the build loudly instead of shipping
+# an image whose N half silently builds the wrong tree.
 USER root
 COPY --chown=acceptance:acceptance . /src
-
+RUN if [ -f /src/.git ] && grep -q '^gitdir:' /src/.git; then \
+      COMMON="$(dirname "$(dirname "$(sed -n 's/^gitdir: //p' /src/.git | head -1)")")" && \
+      rm /src/.git && \
+      git clone --shared "${COMMON}" /tmp/full-history && \
+      mv /tmp/full-history/.git /src/.git && rm -rf /tmp/full-history && \
+      chown -R acceptance:acceptance /src/.git; \
+    fi
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/lib/systemd/systemd"]

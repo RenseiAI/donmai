@@ -26,11 +26,13 @@
 #   1 red    the acceptance case is red for the recorded cause and every
 #            infrastructure checkpoint passed. On this build the cause is
 #            headless_shim_launch_off: the N+1 selection rule launches only
-#            interactive seats under shim ownership, so a headless seat is a
-#            direct-owned child of the daemon unit and the restart above kills
-#            it. No standalone path admits a long-lived headless seat yet (the
-#            local runtime refuses the shim; the control-API accept path
-#            carries no session detail), so the seat itself is not dispatched.
+#            interactive seats under shim ownership, so a headless seat
+#            would be a direct-owned child of the daemon unit and the
+#            restart above would end it. No standalone path admits a
+#            long-lived headless seat yet (the local runtime refuses the
+#            shim; the control-API accept path carries no session detail),
+#            so the driver dispatches no seat: the red is read from the
+#            selection rule, not from a seat the restart ended.
 #   2 infra  a prerequisite failed: boot, user manager, toolchain, build,
 #            install, status, preflight, upgrade, or the probe. The record
 #            names the failed checkpoint; an infrastructure failure is never
@@ -265,13 +267,31 @@ checkpoint ownership_mode "$(jq -r '.sessionShim.ownershipMode // "absent"' <<<"
   -acceptance.record-probe="${WORK}/probe.json" >"${WORK}/probe.log" 2>&1) \
   || infra probe_failed "$(tail -20 "${WORK}/probe.log")"
 PROBE="$(jq -c . "${WORK}/probe.json")" || infra probe_failed "unreadable probe output"
-CASES="$(jq -c '[.liveCases[] | {name, status: (if .name == "seat-survives-upgrade" then "red" else "blocked" end)}]' <<<"${PROBE}")"
+# The gated live halves ride the probe as named pending slots, and the
+# record embeds the probe whole — so every record lists them. A probe
+# that names no slots means a gated half silently dropped out; fail the
+# lane under its own name instead of writing a record without them.
+[ "$(jq -r '[.liveHalves[] | .slot] | length' <<<"${PROBE}")" -gt 0 ] \
+  || infra probe_failed "probe lists no live-half slots; a gated live half dropped out"
+CASES="$(jq -c '[.liveCases[] | {name, status: (if .name == "seat-survives-upgrade" then "red" else "blocked" end)}]' <<<"${PROBE}")" \
+  || infra probe_failed "unreadable live cases"
 [ "$(jq -r '.interactiveOwned' <<<"${PROBE}")" = "true" ] \
   || infra probe_not_reading_rule "the N+1 selection rule does not own the interactive control spec"
+# The stale check reads the posture the probe answer was taken under, not
+# just the rule: the green slices settle ownership plus adoption with no
+# pending composition. A reading from any other posture has not proven the
+# rule still refuses headless seats, so the record goes stale instead of
+# red. The in-repo probe contract pins the same posture.
+if [ "$(jq -r '.compositionPending' <<<"${PROBE}")" = "true" ] || \
+   [ "$(jq -r '.ownershipEnabled' <<<"${PROBE}")" != "true" ] || \
+   [ "$(jq -r '.adoptionEnabled' <<<"${PROBE}")" != "true" ]; then
+  write_record stale probe_posture_unsettled "the N+1 probe did not settle in the ownership-plus-adoption posture; the selection-rule reading proves nothing about this build"
+  exit 3
+fi
 if [ "$(jq -r '.headlessOwned' <<<"${PROBE}")" = "true" ]; then
   write_record stale headless_rule_flipped "the N+1 selection rule owns headless seats; replace this red record with the live-seat assertions"
   exit 3
 fi
 write_record red headless_shim_launch_off \
-  "the N+1 selection rule launches only interactive seats under shim ownership, so a headless seat is a direct-owned child of ${UNIT} and the restart kills it"
+  "the N+1 selection rule launches only interactive seats under shim ownership, so a headless seat would be a direct-owned child of ${UNIT} and the restart would end it; no seat is dispatched, so the red is read from the rule"
 exit 1
