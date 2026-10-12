@@ -158,10 +158,10 @@ func TestContextWatcher_RolloutTokenCounts(t *testing.T) {
 	// each), beside unrelated line shapes the watcher skips.
 	home, path := writeRollout(t, dir, []string{
 		`{"type":"session_meta","payload":{"id":"thread-1"}}`,
-		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"model_context_window":200000}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"last_token_usage":{"total_tokens":110000},"model_context_window":200000}}}`,
 		`{"type":"event_msg","payload":{"message":"done"}}`,
 		`{"type":"token_usage_record","payload":{"thread_id":"thread-1"}}`,
-		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160000,"output_tokens":0,"total_tokens":160000},"model_context_window":200000}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160000,"output_tokens":0,"total_tokens":160000},"last_token_usage":{"total_tokens":160000},"model_context_window":200000}}}`,
 	})
 	// The source carries the session home + thread — never a planted file
 	// path — so this test proves the production resolve→poll→notice loop.
@@ -192,7 +192,7 @@ func TestContextWatcher_RolloutTokenCounts(t *testing.T) {
 	if got := drainNotices(w); len(got) != 0 {
 		t.Fatalf("torn tail yielded %d notices, want none", len(got))
 	}
-	appendRollout(t, path, `000, "output_tokens":0, "total_tokens":199000},"model_context_window":200000}}}`+"\n")
+	appendRollout(t, path, `000, "output_tokens":0, "total_tokens":199000},"last_token_usage":{"total_tokens":199000},"model_context_window":200000}}}`+"\n")
 	if got := drainNotices(w); len(got) != 1 {
 		t.Fatalf("completed tail yielded %d notices, want 1", len(got))
 	}
@@ -234,7 +234,7 @@ func TestContextWatcher_RolloutPathReResolves(t *testing.T) {
 		t.Fatal(err)
 	}
 	late := filepath.Join(sub, "rollout-2026-10-09T00-00-00-thread-late.jsonl")
-	body := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"model_context_window":200000}}}` + "\n"
+	body := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"last_token_usage":{"total_tokens":110000},"model_context_window":200000}}}` + "\n"
 	if err := os.WriteFile(late, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestContextWatcher_RolloutPathReResolves(t *testing.T) {
 func TestContextWatcher_RolloutNewestFileWins(t *testing.T) {
 	t.Parallel()
 	home, _ := writeRollout(t, t.TempDir(), []string{
-		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"model_context_window":200000}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":0,"total_tokens":110000},"last_token_usage":{"total_tokens":110000},"model_context_window":200000}}}`,
 	})
 	w := newContextUsageWatcher(contextUsageSource{harness: "codex", rolloutHome: home})
 	if got := drainNotices(w); len(got) != 1 {

@@ -219,6 +219,14 @@ type codexTokenCountLine struct {
 				OutputTokens *int64 `json:"output_tokens"`
 				TotalTokens  *int64 `json:"total_tokens"`
 			} `json:"total_token_usage"`
+			// LastTokenUsage is the most recent model call's usage: its
+			// total is what currently occupies the context window.
+			// total_token_usage is the thread's running sum across every
+			// call (it passes the window within a few turns), so it is
+			// never a window share.
+			LastTokenUsage *struct {
+				TotalTokens *int64 `json:"total_tokens"`
+			} `json:"last_token_usage"`
 			ModelContextWindow *int64 `json:"model_context_window"`
 		} `json:"info"`
 	} `json:"payload"`
@@ -231,11 +239,15 @@ type codexTokenCountLine struct {
 // signal, not an error. Negative counts are an error, never a reading.
 //
 // The context-window share is DERIVED, not parsed: the rollout carries the
-// cumulative total and the model window but no percentage, so UsedPercent
-// is 100*total/window. It is a computed measurement from two reported
-// numbers, never a fabricated one: either input missing means no notice
-// (a threshold notice with no percentage carries only token counts the
-// per-turn usage events already meter).
+// last call's usage and the model window but no percentage, so UsedPercent
+// is 100*last_token_usage.total_tokens/window, the same occupancy the
+// harness's own context indicator reads. It is never derived from
+// total_token_usage: that is the thread's cumulative sum across every
+// call, which passes the window within a few turns and would report a
+// full window for a session that is not close to one. Either input
+// missing means no notice (a threshold notice with no percentage carries
+// only token counts the per-turn usage events already meter). The
+// cumulative input/output totals still ride the notice as measurements.
 func ParseCodexTokenCountNotice(line []byte, harness string) (*ContextUsageEvent, error) {
 	var decoded codexTokenCountLine
 	if err := json.Unmarshal(line, &decoded); err != nil {
@@ -277,25 +289,28 @@ func ParseCodexTokenCountNotice(line []byte, harness string) (*ContextUsageEvent
 				out.OutputTokens = totals.OutputTokens
 			}
 		}
-		if totals.TotalTokens != nil {
-			if *totals.TotalTokens < 0 {
-				return nil, fmt.Errorf("agent: rollout token_count total_tokens %d is negative", *totals.TotalTokens)
+		if totals.TotalTokens != nil && *totals.TotalTokens < 0 {
+			return nil, fmt.Errorf("agent: rollout token_count total_tokens %d is negative", *totals.TotalTokens)
+		}
+	}
+	if info.ModelContextWindow != nil {
+		if *info.ModelContextWindow <= 0 {
+			return nil, fmt.Errorf("agent: rollout token_count model_context_window %d is not positive", *info.ModelContextWindow)
+		}
+		window := *info.ModelContextWindow
+		out.ContextWindowSize = &window
+		if last := info.LastTokenUsage; last != nil && last.TotalTokens != nil {
+			if *last.TotalTokens < 0 {
+				return nil, fmt.Errorf("agent: rollout token_count last total_tokens %d is negative", *last.TotalTokens)
 			}
-			if info.ModelContextWindow != nil {
-				if *info.ModelContextWindow <= 0 {
-					return nil, fmt.Errorf("agent: rollout token_count model_context_window %d is not positive", *info.ModelContextWindow)
-				}
-				window := *info.ModelContextWindow
-				out.ContextWindowSize = &window
-				pct := 100 * float64(*totals.TotalTokens) / float64(window)
-				if math.IsNaN(pct) || math.IsInf(pct, 0) || pct < 0 {
-					return nil, fmt.Errorf("agent: rollout token_count total %d over window %d is not a share", *totals.TotalTokens, window)
-				}
-				if pct > 100 {
-					pct = 100
-				}
-				out.UsedPercent = &pct
+			pct := 100 * float64(*last.TotalTokens) / float64(window)
+			if math.IsNaN(pct) || math.IsInf(pct, 0) || pct < 0 {
+				return nil, fmt.Errorf("agent: rollout token_count last total %d over window %d is not a share", *last.TotalTokens, window)
 			}
+			if pct > 100 {
+				pct = 100
+			}
+			out.UsedPercent = &pct
 		}
 	}
 	if !out.HasMeasurements() {

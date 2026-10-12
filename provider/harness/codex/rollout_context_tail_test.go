@@ -18,7 +18,7 @@ import (
 func tokenCountLine(in, out, total, window int64) string {
 	return `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{` +
 		`"input_tokens":` + itoa64(in) + `,"output_tokens":` + itoa64(out) + `,"total_tokens":` + itoa64(total) +
-		`},"model_context_window":` + itoa64(window) + `}}}`
+		`},"last_token_usage":{"total_tokens":` + itoa64(total) + `},"model_context_window":` + itoa64(window) + `}}}`
 }
 
 func writeTailRollout(t *testing.T, home, thread string, lines []string) {

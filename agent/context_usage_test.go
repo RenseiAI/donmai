@@ -160,9 +160,46 @@ func TestParseCodexTokenCountNotice_FixtureLine(t *testing.T) {
 	if notice.ContextWindowSize == nil || *notice.ContextWindowSize != 200000 {
 		t.Errorf("contextWindowSize = %v, want 200000", notice.ContextWindowSize)
 	}
-	// The rollout carries no percentage: it is derived as 100*total/window.
+	// The rollout carries no percentage: it is derived as
+	// 100*last_token_usage.total_tokens/window.
 	if notice.UsedPercent == nil || *notice.UsedPercent != 47 {
 		t.Errorf("usedPercent = %v, want 47 (100*94000/200000)", notice.UsedPercent)
+	}
+}
+
+// TestParseCodexTokenCountNotice_ShareIsTheLastCallNotTheCumulativeSum pins
+// the window share to what occupies the window now. total_token_usage is
+// the thread's running sum across every model call: a long live session
+// carries a cumulative total thousands of times the window while its last
+// call sits under half of it (the numbers below are a live session's
+// shape). Deriving the share from the cumulative sum reports a full window
+// after a few turns and fires every threshold at once.
+func TestParseCodexTokenCountNotice_ShareIsTheLastCallNotTheCumulativeSum(t *testing.T) {
+	t.Parallel()
+	line := `{"type":"event_msg","payload":{"type":"token_count","info":{` +
+		`"total_token_usage":{"input_tokens":2650000000,"output_tokens":6000000,"total_tokens":2656000000},` +
+		`"last_token_usage":{"input_tokens":372550,"output_tokens":833,"total_tokens":373383},` +
+		`"model_context_window":828400}}}`
+	notice, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice: %v", err)
+	}
+	if notice == nil || notice.UsedPercent == nil {
+		t.Fatalf("no window share for a token_count with a last call: %+v", notice)
+	}
+	want := 100 * float64(373383) / float64(828400)
+	if *notice.UsedPercent != want {
+		t.Fatalf("usedPercent = %v, want %v (last call over window, not the cumulative sum)", *notice.UsedPercent, want)
+	}
+	// Totals without a last call carry no occupancy: no share, no notice.
+	cumulativeOnly := `{"type":"event_msg","payload":{"type":"token_count","info":{` +
+		`"total_token_usage":{"input_tokens":150000,"output_tokens":0,"total_tokens":150000},"model_context_window":200000}}}`
+	notice, err = agent.ParseCodexTokenCountNotice([]byte(cumulativeOnly), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice(cumulative only): %v", err)
+	}
+	if notice != nil {
+		t.Fatalf("cumulative-only token_count yielded %+v, want nil", notice)
 	}
 }
 
@@ -224,6 +261,7 @@ func TestParseCodexTokenCountNotice_RejectsImpossible(t *testing.T) {
 	cases := []string{
 		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":-1,"total_tokens":-1},"model_context_window":200000}}}`,
 		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100},"model_context_window":0}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100},"last_token_usage":{"total_tokens":-5},"model_context_window":200000}}}`,
 	}
 	for _, line := range cases {
 		if _, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex"); err == nil {

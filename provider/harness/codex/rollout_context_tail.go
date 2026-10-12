@@ -11,8 +11,8 @@ import (
 
 // Live rollout context-notice tail for headless sessions.
 //
-// The app-server writes token_count events (cumulative totals + model
-// window) and top-level compacted markers to the thread's rollout file
+// The app-server writes token_count events (the last call's usage, the
+// cumulative totals, and the model window) and top-level compacted markers to the thread's rollout file
 // while the session runs. The JSON-RPC stream carries neither, so the
 // handle tails its OWN session file — home and thread id are spawn-known,
 // never environment — and emits each new signal as the typed

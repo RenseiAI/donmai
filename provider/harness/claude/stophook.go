@@ -192,8 +192,9 @@ func (c *stopHookChannel) sidecarPath() string {
 // statusLineSidecarScriptFile is the statusLine command the CLI invokes
 // with the live session status on stdin (see the statusLine input schema:
 // context_window.used_percentage, total_input_tokens, total_output_tokens,
-// context_window_size). It renders nothing to the terminal — the status
-// line keeps whatever the operator configured — and maintains the sidecar
+// context_window_size). It renders nothing to the terminal — the session's
+// status line is blank, because this command replaces any statusLine the
+// operator configured for this session only — and maintains the sidecar
 // file the runner's context watcher polls, translating the CLI's nested
 // context_window object into the flat sidecar document the parser reads
 // (agent.ParseClaudeSidecarNotice).
@@ -214,8 +215,8 @@ func statusLineSidecarScript(sidecar string) string {
 #
 # The CLI invokes this as the session's statusLine command with the live
 # session status on stdin and reads the terminal line from stdout. This
-# writer emits no terminal line (the operator's own status line is
-# untouched) and maintains the sidecar file the runner's context watcher
+# writer emits no terminal line (it replaces any configured status line for
+# this session only) and maintains the sidecar file the runner's context watcher
 # polls for the harness-native context signal.
 set -u
 s=` + s + `
@@ -308,8 +309,8 @@ func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, er
 		// statusLine names the session's own sidecar writer: the CLI
 		// invokes it with the live context_window numbers on every
 		// status-line render, and it maintains the sidecar file the
-		// runner's context watcher polls. It renders no terminal line —
-		// the operator's own status line is untouched — and it rides the
+		// runner's context watcher polls. It renders no terminal line, so
+		// the session's status line is blank, and it rides the
 		// same additive --settings layer as the Stop hook, so the
 		// operator's own statusLine configuration in the base layer is
 		// replaced for this session only, exactly as the hooks are added
