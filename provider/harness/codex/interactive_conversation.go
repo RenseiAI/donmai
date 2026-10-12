@@ -46,6 +46,7 @@ package codex
 
 import (
 	"bufio"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -307,7 +308,7 @@ func (t *interactiveConversationTailer) tail(path string, st *interactiveConvers
 	if info.Size() == st.offset {
 		return nil, false
 	}
-	if _, err := f.Seek(st.offset, os.SEEK_SET); err != nil {
+	if _, err := f.Seek(st.offset, io.SeekStart); err != nil {
 		return nil, false
 	}
 	scanner := bufio.NewScanner(f)
@@ -336,16 +337,10 @@ func (t *interactiveConversationTailer) tail(path string, st *interactiveConvers
 		// past it; the skipped record is lost, the live conversation
 		// is not.
 		if err == bufio.ErrTooLong {
-			if _, seekErr := f.Seek(st.offset, os.SEEK_SET); seekErr == nil {
+			if _, seekErr := f.Seek(st.offset, io.SeekStart); seekErr == nil {
 				skip := bufio.NewReader(f)
-				for {
-					b, readErr := skip.ReadBytes('\n')
-					st.offset += int64(len(b))
-					if readErr != nil {
-						break
-					}
-					break
-				}
+				b, _ := skip.ReadBytes('\n')
+				st.offset += int64(len(b))
 			}
 			// Follower lines past the skipped record are still unread:
 			// report pending so the flush loop sweeps again.

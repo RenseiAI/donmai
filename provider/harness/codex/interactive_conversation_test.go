@@ -512,11 +512,11 @@ func TestInteractiveConversationTailer_OrderedIncrementalDelivery(t *testing.T) 
 		t.Fatalf("second sweep = %v; want %v in order", kinds, want)
 	}
 	// A shrink + rewrite (rotation) emits nothing twice.
-	body, err := os.ReadFile(path) //nolint:gosec // test-owned fixture
+	body, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, body, 0o600); err != nil {
+	if err := os.WriteFile(path, body, 0o600); err != nil { //nolint:gosec // G703: path is findThreadRollout's own return under the test's temp home, never wire input.
 		t.Fatal(err)
 	}
 	if again, _ := tailer.sweepCapped(); len(again) != 0 {

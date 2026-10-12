@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -73,14 +72,6 @@ import (
 // arguments, which carry an encrypted payload, not readable text: the
 // ToolUseEvent records the tool name with no input rather than an opaque
 // blob.
-
-// conversationToolCallKeys pairs the two halves of one tool call: the
-// response_item half (callID) and the event_msg half (itemID). Either may
-// be empty when only one half has arrived.
-type conversationToolCallKeys struct {
-	callID string
-	itemID string
-}
 
 // mapLine maps one rollout line to zero or more conversation events,
 // pairing tool halves by content across lines. Lines already in seen map
@@ -213,7 +204,10 @@ func (t *interactiveConversationTailer) mapResponseItem(payload json.RawMessage,
 	case "custom_tool_call":
 		return t.mapCustomCall(payload, raw)
 	case "custom_tool_call_output":
-		return t.mapCustomCallOutput(payload, raw)
+		// The exec output half carries the call id but no command to
+		// pair with; the CommandExecution completion delivers the same
+		// call with its output, so this half maps to nothing on its own.
+		return nil
 	case "function_call":
 		return t.mapFunctionCall(payload, raw)
 	case "function_call_output":
@@ -341,22 +335,6 @@ func (t *interactiveConversationTailer) mapCustomCall(payload json.RawMessage, r
 	return nil
 }
 
-// mapCustomCallOutput delivers the exec output half: when the staged start
-// is present the paired ToolUseEvent is emitted first (stable identity
-// through the call id), then the ToolResultEvent. The output completion
-// alone never emits — it carries no command to pair with — but the
-// CommandExecution completion below delivers the same call from its own
-// half, so no output is lost when halves arrive out of order.
-func (t *interactiveConversationTailer) mapCustomCallOutput(payload json.RawMessage, raw string) []agentEvent {
-	var out rolloutCustomCallPayload
-	if err := json.Unmarshal(payload, &out); err != nil || out.CallID == "" {
-		return nil
-	}
-	key := "shell:" + rolloutExecOutputCommand(raw, out.Output)
-	_ = key
-	return nil
-}
-
 // mapFunctionCall stages a namespaced tool call until its output
 // arrives. Clock-namespace pacing calls (sleep/wait) are session pacing,
 // not work, and never map. Collaboration send_message arguments carry an
@@ -448,7 +426,7 @@ func (t *interactiveConversationTailer) mapEventMsg(payload json.RawMessage, raw
 	case "task_complete":
 		return t.mapTaskComplete(msg, raw)
 	case "token_count":
-		return t.mapTokenCount(msg.Info, raw)
+		return t.mapTokenCount(msg.Info)
 	default:
 		// item_started (a started-but-never-completed item emits
 		// nothing), task_started, thread_settings_applied, and unknown
@@ -664,7 +642,7 @@ func (t *interactiveConversationTailer) mapTaskComplete(msg rolloutEventPayload,
 // excludes both cache buckets, floored at zero. The thread cumulative
 // (total_token_usage) never maps per-turn. A nil or empty last-call usage
 // maps to nothing.
-func (t *interactiveConversationTailer) mapTokenCount(info *rolloutTokenInfo, raw string) []agentEvent {
+func (t *interactiveConversationTailer) mapTokenCount(info *rolloutTokenInfo) []agentEvent {
 	if info == nil || info.Last == nil {
 		return nil
 	}
@@ -736,15 +714,6 @@ func rolloutExecCommandFromArgv(argv []string) string {
 	return strings.Join(argv, " ")
 }
 
-// rolloutExecOutputCommand pairs an output-only completion back to its
-// command. The output record carries no command, so this reports "" and
-// the completion delivers from its own half.
-func rolloutExecOutputCommand(raw string, output []rolloutMessageContent) string {
-	_ = raw
-	_ = output
-	return ""
-}
-
 // rolloutCommandOutput renders a CommandExecution completion's output:
 // the aggregated output when present, else stdout plus stderr.
 func rolloutCommandOutput(item *rolloutEventItem) string {
@@ -800,7 +769,3 @@ func decodeRolloutArguments(raw string) map[string]any {
 	}
 	return m
 }
-
-// mapConversationLineTime renders the tailer's poll cadence for tests
-// that pin backpressure without sleeping the full interval.
-func mapConversationLineTime() time.Duration { return interactiveConversationPollInterval }
