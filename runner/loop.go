@@ -1,12 +1,14 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -35,6 +37,36 @@ import (
 // loop. It delegates to internal/kit.LoadSkills; isolated here so tests
 // can verify integration without a real KitRegistry on disk.
 var kitLoadSkills = kit.LoadSkills
+
+// goModCache reports where the host's Go toolchain keeps downloaded module
+// sources (the value `go env GOMODCACHE` prints). A package-level seam so
+// tests can stub it without a toolchain on PATH. The empty string means the
+// lookup failed and the caller must omit the key rather than export a lie.
+var goModCache = func(ctx context.Context) string {
+	out, err := goEnvGomodcache(ctx)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// goEnvGomodcache runs the host toolchain's own `go env GOMODCACHE` probe.
+// A named helper (rather than an inline exec) so the probe's argv is pinned
+// in one place. The caller passes a bounded context; a missing toolchain or
+// a probe failure is an error, never an empty path that reads as unset.
+func goEnvGomodcache(ctx context.Context) (string, error) {
+	//nolint:gosec // G204: fixed tool and fixed key; no session input reaches argv.
+	cmd := exec.CommandContext(ctx, "go", "env", "GOMODCACHE")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("runner: go env GOMODCACHE: %w", err)
+	}
+	if out := strings.TrimSpace(stdout.String()); out != "" {
+		return out, nil
+	}
+	return "", errors.New("runner: go env GOMODCACHE printed empty output")
+}
 
 // termCastPath returns the on-disk asciinema-v2 cast location for a
 // session's workarea (spec § 16), next to events.jsonl in the
@@ -983,7 +1015,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		r.logger.Warn("event journal boundary unavailable", "sessionId", qw.SessionID)
 	}
 
-	// 8. Spawn provider.
+	// 8. Spawn provider. Preparation ends here: everything above (provider
+	// resolution, worktree provisioning, kit toolchain, dependency installs,
+	// MCP config, prompt assembly and spec translation) ran before the agent
+	// started, and its whole-second duration is recorded on the result so
+	// the terminal status carries how long preparation took. A spawn
+	// failure still records it — the phase ran even when the agent did not.
+	// The clock is the runner's injectable now (not wall time read inline)
+	// so tests drive it deterministically; a non-positive delta (a skewed
+	// test clock) omits the field rather than posting a lie.
+	res.PreparationSeconds = preparationSeconds(r.now, time.UnixMilli(startedAt))
 	handle, err := provider.Spawn(ctx, spec)
 	if err != nil {
 		res.Status = "failed"
@@ -3279,6 +3320,21 @@ func envToMap(in []string) map[string]string {
 	return out
 }
 
+// preparationSeconds is the whole-second preparation duration the terminal
+// result carries: session start (Run's startedAt) to provider spawn. Zero or
+// negative means the clock went backwards or stood still — omit the field
+// rather than post a duration the phase did not take.
+func preparationSeconds(now func() time.Time, startedAt time.Time) int64 {
+	if now == nil {
+		return 0
+	}
+	secs := int64(now().Sub(startedAt).Seconds())
+	if secs <= 0 {
+		return 0
+	}
+	return secs
+}
+
 // envOrDefault returns the process env value for key when it is set and
 // non-empty, otherwise def. Used to let a provisioner-stamped value win over
 // a locally-derived fallback.
@@ -3371,6 +3427,19 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	if qw.StageID != "" {
 		envMap["DONMAI_STAGE_ID"] = qw.StageID
 	}
+	// Point seats at the host's Go module cache so dependency sources are
+	// found without a whole-disk search. Resolved from the host toolchain's
+	// own `go env GOMODCACHE` (never inherited blindly: the worker that
+	// composed this env may itself run under a per-session cache override
+	// that must not leak into the seat). A failed probe omits the key — the
+	// seat builds exactly as before, without a stale or empty pointer.
+	// The probe inherits the worker's environment and is bounded: a wedged
+	// toolchain omits the key instead of stalling session start.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if cache := goModCache(probeCtx); cache != "" {
+		envMap["GOMODCACHE"] = cache
+	}
+	probeCancel()
 	if b := qw.StageBudget; b != nil {
 		if b.MaxDurationSeconds > 0 {
 			v := fmt.Sprintf("%d", b.MaxDurationSeconds)
