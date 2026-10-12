@@ -175,12 +175,43 @@ type EndpointBinding struct {
 	// an explicit zero price, not an absent one. Additive + omitempty;
 	// absent on every dispatch that predates it.
 	UnitPrices    *UnitPrices `json:"unitPrices,omitempty"`
-	BringsOwnAuth bool        `json:"bringsOwnAuth"`
+	// RoutingPreference carries an optional provider routing preference
+	// (ordered candidate providers and an exclusive allow-list) the
+	// dispatch resolved for a gateway-routed binding. The harness
+	// applies it to its gateway chat calls: the pi harness exports it
+	// to its policy extension for openai-completions cells, which
+	// registers it as the injected provider model's routing option.
+	// Nil means no preference is bound: the harness applies no routing
+	// option of its own. Additive + omitempty; absent on every dispatch
+	// that predates it.
+	RoutingPreference *RoutingPreference `json:"routingPreference,omitempty"`
+	BringsOwnAuth     bool               `json:"bringsOwnAuth"`
 	// Env carries the resolved credential/config VALUES for the cell's
 	// declared EnvKeys. json:"-" — values never cross the wire; bindings
 	// that travel (QueuedWork payloads) deliver credentials via Spec.Env,
 	// so harness read sites consult Endpoint.Env first, then Spec.Env.
 	Env map[string]string `json:"-"`
+}
+
+// RoutingPreference is an optional provider routing preference carried
+// on an EndpointBinding. Order lists candidate provider slugs in try
+// order; Only lists the slugs exclusively allowed for the request.
+// Either may be empty, but at least one must be non-empty for the
+// preference to be set — an empty preference is unset, never exported.
+// The pi harness applies it only on openai-completions cells, where the
+// serving gateway honors it as the chat request's provider routing
+// option (provider.order / provider.only on the wire). It is
+// brand-neutral by construction: slugs are the gateway's own provider
+// names, never platform identifiers.
+type RoutingPreference struct {
+	Order []string `json:"order,omitempty"`
+	Only  []string `json:"only,omitempty"`
+}
+
+// IsZero reports whether no routing preference is set: nil, or both
+// lists empty.
+func (r *RoutingPreference) IsZero() bool {
+	return r == nil || (len(r.Order) == 0 && len(r.Only) == 0)
 }
 
 // IsZero reports whether the binding is unset (today's behavior). Used by

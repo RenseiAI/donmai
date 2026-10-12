@@ -269,6 +269,12 @@ func copyEndpointBinding(in *agent.EndpointBinding) *agent.EndpointBinding {
 		prices := *in.UnitPrices
 		out.UnitPrices = &prices
 	}
+	if in.RoutingPreference != nil {
+		pref := *in.RoutingPreference
+		pref.Order = append([]string(nil), in.RoutingPreference.Order...)
+		pref.Only = append([]string(nil), in.RoutingPreference.Only...)
+		out.RoutingPreference = &pref
+	}
 	return &out
 }
 

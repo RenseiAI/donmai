@@ -148,3 +148,109 @@ func TestReconcileResolvedProfile_PreservesUnitPrices(t *testing.T) {
 		t.Errorf("UnitPrices = %+v, want %+v", qw.ResolvedProfile.Endpoint.UnitPrices, want)
 	}
 }
+
+// TestCopyEndpointBinding_PreservesRoutingPreference pins that a bound
+// routing preference survives the queued-work → Spec copy as a deep copy:
+// dropping it would reach the harness with no preference and the session
+// would run unpinned instead of routed.
+func TestCopyEndpointBinding_PreservesRoutingPreference(t *testing.T) {
+	t.Parallel()
+	in := &agent.EndpointBinding{
+		Company:           agent.CompanyOpenAI,
+		Model:             "model-a",
+		RoutingPreference: &agent.RoutingPreference{Order: []string{"anthropic", "openai"}, Only: []string{"anthropic"}},
+	}
+
+	got := copyEndpointBinding(in)
+	if got == nil {
+		t.Fatal("copyEndpointBinding returned nil for non-nil input")
+	}
+	if got.RoutingPreference == nil {
+		t.Fatal("copyEndpointBinding dropped RoutingPreference")
+	}
+	if got.RoutingPreference == in.RoutingPreference {
+		t.Fatal("copyEndpointBinding aliases RoutingPreference")
+	}
+	if len(got.RoutingPreference.Order) != 2 || len(got.RoutingPreference.Only) != 1 {
+		t.Errorf("RoutingPreference = %+v, want order x2 + only x1", got.RoutingPreference)
+	}
+
+	// Deep-copy proof down to the slug slices: mutating the copy must not
+	// touch the queued work.
+	got.RoutingPreference.Order[0] = "mutated"
+	got.RoutingPreference.Only = append(got.RoutingPreference.Only, "mutated")
+	if in.RoutingPreference.Order[0] != "anthropic" || len(in.RoutingPreference.Only) != 1 {
+		t.Errorf("queued RoutingPreference mutated through copy: %+v", in.RoutingPreference)
+	}
+}
+
+// TestCopyEndpointBinding_NilRoutingPreferenceStaysNil pins that
+// unpreferred bindings stay unpreferred through the copy.
+func TestCopyEndpointBinding_NilRoutingPreferenceStaysNil(t *testing.T) {
+	t.Parallel()
+	got := copyEndpointBinding(&agent.EndpointBinding{Model: "model-a"})
+	if got == nil {
+		t.Fatal("copyEndpointBinding returned nil for non-nil input")
+	}
+	if got.RoutingPreference != nil {
+		t.Errorf("RoutingPreference = %+v, want nil", got.RoutingPreference)
+	}
+}
+
+// TestReconciledEndpointBinding_PreservesRoutingPreference pins that a
+// bound preference survives preflight reconciliation into the resolved
+// profile.
+func TestReconciledEndpointBinding_PreservesRoutingPreference(t *testing.T) {
+	t.Parallel()
+	in := &agent.EndpointBinding{
+		Company:           agent.CompanyOpenAI,
+		Model:             "model-a",
+		BaseURL:           "https://gateway.example.test/v1",
+		RoutingPreference: &agent.RoutingPreference{Order: []string{"anthropic"}},
+	}
+
+	got, err := reconciledEndpointBinding(in)
+	if err != nil {
+		t.Fatalf("reconciledEndpointBinding: %v", err)
+	}
+	if got.RoutingPreference == nil {
+		t.Fatal("reconciledEndpointBinding dropped RoutingPreference")
+	}
+	if got.RoutingPreference == in.RoutingPreference {
+		t.Fatal("reconciledEndpointBinding aliases RoutingPreference")
+	}
+	if len(got.RoutingPreference.Order) != 1 || len(got.RoutingPreference.Only) != 0 {
+		t.Errorf("RoutingPreference = %+v, want order x1", got.RoutingPreference)
+	}
+
+	got.RoutingPreference.Order[0] = "mutated"
+	if in.RoutingPreference.Order[0] != "anthropic" {
+		t.Errorf("queued RoutingPreference mutated through reconciled copy: %+v", in.RoutingPreference)
+	}
+}
+
+// TestReconcileResolvedProfile_PreservesRoutingPreference drives the
+// production entry point: a preference on the resolved-profile wire JSON
+// must reach the reconciled queued work.
+func TestReconcileResolvedProfile_PreservesRoutingPreference(t *testing.T) {
+	t.Parallel()
+	rp := marshalFixture(t, map[string]any{
+		"provider": "pi",
+		"model":    "m",
+		"endpoint": map[string]any{
+			"company": "openai", "model": "m",
+			"routingPreference": map[string]any{"order": []string{"anthropic", "openai"}, "only": []string{"anthropic"}},
+		},
+	})
+	qw, err := ReconcileResolvedProfile(QueuedWork{}, nil, rp)
+	if err != nil {
+		t.Fatalf("ReconcileResolvedProfile: %v", err)
+	}
+	pref := qw.ResolvedProfile.Endpoint.RoutingPreference
+	if pref == nil {
+		t.Fatal("reconciled Endpoint.RoutingPreference missing for preferred binding")
+	}
+	if len(pref.Order) != 2 || len(pref.Only) != 1 {
+		t.Errorf("RoutingPreference = %+v, want order x2 + only x1", pref)
+	}
+}
