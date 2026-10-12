@@ -1558,7 +1558,12 @@ tailRecovery:
 			continue
 		}
 
-		prompt := continuationPrompt(reviewWork, followUps.undelivered)
+		// Every continuation restates the session's goal as dispatched
+		// (identifier, title, directive): a bare "continue the task"
+		// arrives without the goal and the seat can decline it, losing
+		// the verdict the prior turn reached. The retry and wrap-up
+		// prompts replace the base text wholesale below, as before.
+		prompt := continuationPrompt(reviewWork, followUps.undelivered, continueGoalBlock(qw))
 		wrapUp := enforcer.wrapUpDue()
 		if step == tailRetry {
 			prompt = retryPrompt

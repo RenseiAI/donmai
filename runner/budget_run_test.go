@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -216,7 +217,11 @@ func TestRun_WrapUpAsTheNextFollowUpPrompt(t *testing.T) {
 	if res.Status != "completed" || res.BudgetBreach != nil {
 		t.Fatalf("Status=%q BudgetBreach=%+v (%s: %s); want completed within budget", res.Status, res.BudgetBreach, res.FailureMode, res.Error)
 	}
-	wantPrompts(t, provider.prompts, wrapUpPrompt, continuePrompt)
+	if len(provider.prompts) != 2 || provider.prompts[0] != wrapUpPrompt ||
+		!strings.HasSuffix(provider.prompts[1], "\n\n"+continuationGoalForTest) ||
+		strings.TrimSuffix(provider.prompts[1], "\n\n"+continuationGoalForTest) != continuePrompt {
+		t.Fatalf("prompts = %q; want the wrap-up, then a goal-restated continuation", provider.prompts)
+	}
 	wantMetered(t, res, nil, 920)
 }
 
