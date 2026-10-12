@@ -44,12 +44,21 @@ type ToolDeliveryKind string
 // Tool delivery kinds identify exact native, injected, or unsupported boundaries.
 const (
 	// ToolDeliveryUnsupported denies requirements on an unavailable boundary.
-	ToolDeliveryUnsupported           ToolDeliveryKind = "unsupported"
-	ToolDeliveryStubOracle            ToolDeliveryKind = "stub_oracle"
-	ToolDeliveryClaudeCLIAllowDeny    ToolDeliveryKind = "claude_cli_allow_deny"
-	ToolDeliveryClaudeMCPConfig       ToolDeliveryKind = "claude_cli_mcp_config"
-	ToolDeliveryCodexApprovalBridge   ToolDeliveryKind = "codex_approval_bridge"
-	ToolDeliveryCodexAppServerMCP     ToolDeliveryKind = "codex_app_server_mcp"
+	ToolDeliveryUnsupported         ToolDeliveryKind = "unsupported"
+	ToolDeliveryStubOracle          ToolDeliveryKind = "stub_oracle"
+	ToolDeliveryClaudeCLIAllowDeny  ToolDeliveryKind = "claude_cli_allow_deny"
+	ToolDeliveryClaudeMCPConfig     ToolDeliveryKind = "claude_cli_mcp_config"
+	ToolDeliveryCodexApprovalBridge ToolDeliveryKind = "codex_approval_bridge"
+	ToolDeliveryCodexAppServerMCP   ToolDeliveryKind = "codex_app_server_mcp"
+	// ToolDeliveryMuseInlineMCP is the muse harness's session/start
+	// config.mcpServers mount: inline streamableHttp/stdio servers added
+	// only to the session runtime (gated on the granted sessionMcp
+	// capability).
+	ToolDeliveryMuseInlineMCP ToolDeliveryKind = "muse_inline_mcp"
+	// ToolDeliveryMuseApprovalBridge is the muse harness's
+	// approval/requested → approval/decide round trip driven by the
+	// provider's own adjudication (decline maps to abort), never a human.
+	ToolDeliveryMuseApprovalBridge    ToolDeliveryKind = "muse_approval_bridge"
 	ToolDeliveryCodexCLIMCPConfig     ToolDeliveryKind = "codex_cli_mcp_config"
 	ToolDeliveryGeminiNativeBoundary  ToolDeliveryKind = "gemini_in_box_native_boundary"
 	ToolDeliveryGeminiMCPBridge       ToolDeliveryKind = "gemini_in_box_mcp_bridge"
@@ -1055,7 +1064,7 @@ func validEventSet(events []EventKind) bool {
 
 func isKnownEvent(event EventKind) bool {
 	switch event {
-	case EventInit, EventSystem, EventAssistantText, EventLlmCall, EventToolUse, EventToolResult, EventToolProgress, EventUsage, EventSubagent, EventResult, EventError:
+	case EventInit, EventSystem, EventAssistantText, EventLlmCall, EventToolUse, EventToolResult, EventToolProgress, EventUsage, EventContextUsage, EventSubagent, EventResult, EventError:
 		return true
 	default:
 		return false
@@ -1152,6 +1161,7 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge,
 		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
 		ToolDeliveryPiAdditionalExtension, ToolDeliveryPiInteractiveLocalToolPolicy,
+		ToolDeliveryMuseInlineMCP, ToolDeliveryMuseApprovalBridge,
 		ToolDeliveryNoToolSurface,
 		ToolDeliveryStructuredProviderEvents, ToolDeliveryCoarsePTYEvents, ToolDeliveryStructuredEventReplay,
 		ToolDeliveryTerminalCastReplay, ToolDeliveryHandleCleanup:

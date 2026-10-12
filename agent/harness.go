@@ -42,6 +42,12 @@ const (
 	// donmai-owned — see provider/harness/pi/doc.go §5. R2/DEC-3; cells start
 	// experimental/untested until the donmai-smokes gate passes.
 	HarnessPi HarnessName = "pi"
+	// HarnessMuse is the Muse harness (provider/harness/muse): a
+	// `muse serve` MSP JSON-RPC-over-stdio subprocess, one child per
+	// session. The host owns the session set per process, so sessions
+	// never multiplex across one host the way codex threads do — one
+	// host per Handle, many turns per host.
+	HarnessMuse HarnessName = "muse"
 	// HarnessShell is the bare interactive-only PTY spawn mode
 	// (provider/harness/shell): it drives no model endpoint at all, so it
 	// anchors no matrix cell (matrix/cells.go) — it exists purely as an

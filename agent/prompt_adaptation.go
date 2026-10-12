@@ -103,6 +103,17 @@ const (
 	PromptDeliveryOllamaUserMessage PromptDeliveryKind = "ollama_user_message"
 	// PromptDeliveryOpenCodePrompt uses OpenCode's prompt request.
 	PromptDeliveryOpenCodePrompt PromptDeliveryKind = "opencode_prompt"
+	// PromptDeliveryMuseTurnInput uses the MSP turn input array. There is
+	// no system-prompt channel on MSP, so session-constant instructions
+	// ride a leading text part ahead of the prompt on the same array.
+	PromptDeliveryMuseTurnInput PromptDeliveryKind = "muse_turn_input"
+	// PromptDeliveryMuseLeadText names the leading-text-part projection
+	// of session-constant instructions onto the MSP turn input array
+	// (BaseInstructions, SystemPromptAppend, InitialContext). It is a
+	// distinct kind from MuseTurnInput (the user task itself) so the
+	// receipt distinguishes "instruction folded into the turn" from
+	// "the turn".
+	PromptDeliveryMuseLeadText PromptDeliveryKind = "muse_lead_text_part"
 	// PromptDeliveryPiSystemAppend uses pi's append-system flag.
 	PromptDeliveryPiSystemAppend PromptDeliveryKind = "pi_cli_append_system_prompt"
 	// PromptDeliveryPiRPCPrompt uses pi's RPC prompt message.
@@ -432,7 +443,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 			continue
 		}
 		switch profile.ContextDelivery {
-		case PromptDeliveryCodexTurnInput:
+		case PromptDeliveryCodexTurnInput, PromptDeliveryMuseLeadText:
 			contextParts = append(contextParts, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
 		case PromptDeliveryCodexPTYSeed, PromptDeliveryPiPTYSeed, PromptDeliveryStubPTYSeed:
@@ -491,6 +502,18 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 
 	prepends = append(downgradedPrepend, prepends...)
 	userText := joinUserPromptParts(prepends, plan.UserPrompt.Text, appends)
+
+	// MSP has no system-prompt channel: the generic compiler folds
+	// system/role content into SystemPromptAppend, but a muse profile
+	// delivers that content as leading text parts on the turn input
+	// array instead. Fold the compiled system parts back into the turn
+	// input here (via InitialContext, which promptInput emits ahead of
+	// the prompt) only when every system part rode a muse lead-text
+	// delivery — otherwise the generic SystemPromptAppend path stands.
+	if profile.SystemDelivery == PromptDeliveryMuseLeadText && len(systemParts) > 0 {
+		contextParts = append(systemParts, contextParts...)
+		systemParts = nil
+	}
 
 	if len(contextParts) > 0 {
 		spec.InitialContext = joinPromptParts(contextParts)
@@ -573,6 +596,8 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryOllamaSystemMessage,
 		PromptDeliveryOllamaUserMessage,
 		PromptDeliveryOpenCodePrompt,
+		PromptDeliveryMuseTurnInput,
+		PromptDeliveryMuseLeadText,
 		PromptDeliveryPiSystemAppend,
 		PromptDeliveryPiRPCPrompt,
 		PromptDeliveryPiPTYSeed,

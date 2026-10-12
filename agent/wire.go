@@ -22,6 +22,11 @@ const (
 	ProtoOpenAIResponses   WireProtocol = "openai-responses" // Codex app-server / Responses API
 	ProtoGeminiGenerate    WireProtocol = "gemini-generate"  // :generateContent, SSE
 	ProtoOllama            WireProtocol = "ollama"           // /api/chat NDJSON (bare surface)
+	// ProtoMuseMSP backs the Muse harness's `muse serve` host channel:
+	// MSP JSON-RPC 2.0 over stdio JSONL (session/turn lifecycle). It is
+	// a harness-transport protocol, not a model-endpoint dialect — the
+	// host routes to the model behind providerId "meta".
+	ProtoMuseMSP WireProtocol = "muse-msp"
 	// ProtoAntigravityOAuth backs the Google endpoint's subscription-login
 	// host cell only; the harness that drove it is retired. The sibling
 	// endpoint-host removal deletes this constant with that host.

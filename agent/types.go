@@ -40,7 +40,12 @@ const (
 	// Required because the runner registry (runner/model_profile.go
 	// SelectProvider) and matrix.LegacyProviderID key on ProviderName, so the
 	// pi × anthropic × direct anchor cell needs a real ProviderName to alias.
-	ProviderPi    ProviderName = "pi"
+	ProviderPi ProviderName = "pi"
+	// ProviderMuse is the legacy wire enum for the Muse harness
+	// (HarnessMuse). Same registry/matrix aliasing requirement as pi:
+	// the muse × meta × host-session anchor cell needs a real
+	// ProviderName to alias.
+	ProviderMuse  ProviderName = "muse"
 	ProviderJules ProviderName = "jules"
 	// ProviderShell is the bare interactive-only PTY harness
 	// (provider/harness/shell, W4). It drives no model endpoint and so is
