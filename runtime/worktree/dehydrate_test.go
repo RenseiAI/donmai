@@ -461,3 +461,157 @@ func TestDehydrateKeepsUnprovableRoot(t *testing.T) {
 		t.Fatalf("unprovable root touched: %v", err)
 	}
 }
+
+// Glob installed patterns expand without following symlinks and without
+// descending into .git: a `**` pattern finds nested installed trees, a
+// `*` pattern matches one level, and a symlink carrying an installed
+// name is removed as a link, never followed to its target.
+func TestDehydrateGlobPatternsExpandSafely(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	seed := filepath.Join(root, "seed")
+	dehydrateGit(t, "", "init", "--bare", "--quiet", remote)
+	dehydrateGit(t, "", "init", "--quiet", "-b", "main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "tracked.txt"), []byte("published bytes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seed, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seed, ".gitignore"), []byte("packages/*/*.deps/\nlinked-deps\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dehydrateGit(t, seed, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "add", "tracked.txt", "pnpm-lock.yaml", ".gitignore")
+	dehydrateGit(t, seed, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "initial")
+	dehydrateGit(t, seed, "remote", "add", "origin", remote)
+	dehydrateGit(t, seed, "push", "--quiet", "-u", "origin", "main")
+	dehydrateGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	parent := t.TempDir()
+	now := time.Now()
+	path := dehydrateProvisionAbandoned(t, parent, remote, dehydrateSessionID, func() time.Time { return now }, func(path string) {
+		if err := os.MkdirAll(filepath.Join(path, "packages", "a", "x.deps"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "packages", "a", "x.deps", "blob.bin"), []byte("installed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(path, "real-deps"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(path, "real-deps"), filepath.Join(path, "linked-deps")); err != nil {
+			t.Fatal(err)
+		}
+	})
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: parent, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := dehydrateNodeKit()
+	store.Snapshot.Installed = []string{"packages/*/*.deps", "linked-deps"}
+	first, err := manager.DehydratePreservedRoots(context.Background(), worktree.DehydratePolicy{
+		Stores: dehydrateStores([]kit.DependencyStoreView{store}),
+		Now:    now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Classified != 1 {
+		t.Fatalf("classified = %d, want 1", first.Classified)
+	}
+	record, err := manager.DehydrateInstallRecord(path)
+	if err != nil {
+		t.Fatalf("install record missing: %v", err)
+	}
+	if len(record.Paths) != 2 || record.Paths[0] != "linked-deps" || record.Paths[1] != "packages/a/x.deps" {
+		t.Fatalf("install record = %+v, want [linked-deps packages/a/x.deps]", record)
+	}
+	later, err := manager.DehydratePreservedRoots(context.Background(), worktree.DehydratePolicy{
+		Stores: dehydrateStores([]kit.DependencyStoreView{store}),
+		Now:    now.Add(25 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(later.Receipts) != 1 || len(later.Receipts[0].Paths) != 2 {
+		t.Fatalf("receipts = %+v, want both recorded paths", later.Receipts)
+	}
+	if _, err := os.Lstat(filepath.Join(path, "linked-deps")); !os.IsNotExist(err) {
+		t.Fatalf("symlinked installed path survives: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "real-deps")); err != nil {
+		t.Fatalf("symlink target followed by dehydration: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "packages", "a", "x.deps")); !os.IsNotExist(err) {
+		t.Fatalf("glob-matched installed tree survives: %v", err)
+	}
+}
+
+// A `**` installed pattern finds deeply nested installed trees.
+func TestDehydrateStarStarPatternFindsNestedTrees(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	seed := filepath.Join(root, "seed")
+	dehydrateGit(t, "", "init", "--bare", "--quiet", remote)
+	dehydrateGit(t, "", "init", "--quiet", "-b", "main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "tracked.txt"), []byte("published bytes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seed, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seed, ".gitignore"), []byte("**/node_modules/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dehydrateGit(t, seed, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "add", "tracked.txt", "pnpm-lock.yaml", ".gitignore")
+	dehydrateGit(t, seed, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "initial")
+	dehydrateGit(t, seed, "remote", "add", "origin", remote)
+	dehydrateGit(t, seed, "push", "--quiet", "-u", "origin", "main")
+	dehydrateGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	parent := t.TempDir()
+	now := time.Now()
+	path := dehydrateProvisionAbandoned(t, parent, remote, dehydrateSessionID, func() time.Time { return now }, func(path string) {
+		if err := os.MkdirAll(filepath.Join(path, "packages", "a", "node_modules"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "packages", "a", "node_modules", "blob.bin"), []byte("installed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	})
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: parent, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := dehydrateNodeKit()
+	store.Snapshot.Installed = []string{"**/node_modules"}
+	first, err := manager.DehydratePreservedRoots(context.Background(), worktree.DehydratePolicy{
+		Stores: dehydrateStores([]kit.DependencyStoreView{store}),
+		Now:    now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Classified != 1 {
+		t.Fatalf("classified = %d, want 1", first.Classified)
+	}
+	report, err := manager.DehydratePreservedRoots(context.Background(), worktree.DehydratePolicy{
+		Stores: dehydrateStores([]kit.DependencyStoreView{store}),
+		Now:    now.Add(25 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Receipts) != 1 || len(report.Receipts[0].Paths) != 1 || report.Receipts[0].Paths[0] != "packages/a/node_modules" {
+		t.Fatalf("receipts = %+v, want [packages/a/node_modules]", report.Receipts)
+	}
+	if _, err := os.Stat(filepath.Join(path, "packages", "a", "node_modules")); !os.IsNotExist(err) {
+		t.Fatalf("star-star matched tree survives: %v", err)
+	}
+}
