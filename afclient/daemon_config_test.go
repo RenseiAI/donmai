@@ -547,7 +547,7 @@ func TestWriteDaemonYAML_AnchoredCapacityOmission(t *testing.T) {
 }
 
 // slogWarningCapture holds the log output emitted through the default
-// slog logger while a test runs. warnIfRetiredCloneStrategyPresent logs via
+// slog logger while a test runs. warnOnceRetiredCloneStrategy logs via
 // the package-level slog.Warn, so tests swap the default handler.
 type slogWarningCapture struct {
 	buf *bytes.Buffer
@@ -560,9 +560,12 @@ func (c *slogWarningCapture) count() int {
 }
 
 // captureSlogWarnings swaps the default slog logger for a text handler over
-// a buffer and restores it when the test ends.
+// a buffer and restores it when the test ends. It also re-arms the
+// once-per-process retired-key notice so each test observes the emission
+// in isolation from read order.
 func captureSlogWarnings(t *testing.T) *slogWarningCapture {
 	t.Helper()
+	ResetRetiredCloneStrategyWarningForTest()
 	capture := &slogWarningCapture{buf: &bytes.Buffer{}}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(capture.buf, nil)))
@@ -574,8 +577,8 @@ func captureSlogWarnings(t *testing.T) *slogWarningCapture {
 // retirement test for the dead per-repository clone override: a file that
 // still carries the key on many entries loads successfully, the value is
 // ignored (the typed schema no longer models it), the writer never emits
-// it, and exactly one deprecation warning is logged per read no matter how
-// many entries carry the key.
+// it, and exactly one deprecation warning is logged per process no matter how
+// many entries carry the key or how often the file is read.
 func TestReadDaemonYAML_RetiredCloneStrategyKeyLoadsWithOneWarning(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
@@ -656,5 +659,62 @@ projects:
 	}
 	if got := warnings.count(); got != 0 {
 		t.Errorf("warnings = %d, want 0", got)
+	}
+}
+
+// TestReadDaemonYAML_RetiredCloneStrategyWarnsOncePerProcess proves the
+// deprecation notice fires at most once per process no matter how many
+// times the config is read, and that the single emission names the file
+// and the count of affected entries.
+func TestReadDaemonYAML_RetiredCloneStrategyWarnsOncePerProcess(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`machine:
+  id: m
+orchestrator:
+  url: https://platform.example.com
+projects:
+  - id: one
+    repository: github.com/foo/one
+    cloneStrategy: shallow
+  - id: two
+    repository: github.com/foo/two
+    cloneStrategy: full
+repositories:
+  - id: repo-one
+    projectId: one
+    source: github.com/foo/one
+    cloneStrategy: shallow
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureSlogWarnings(t)
+	for i := 0; i < 5; i++ {
+		if _, err := ReadDaemonYAML(path); err != nil {
+			t.Fatalf("ReadDaemonYAML #%d: %v", i, err)
+		}
+	}
+	if got := warnings.count(); got != 1 {
+		t.Fatalf("deprecation warnings across 5 reads = %d, want exactly 1", got)
+	}
+	text := warnings.text()
+	if !strings.Contains(text, path) {
+		t.Errorf("warning should name the file %q, got:\n%s", path, text)
+	}
+	if !strings.Contains(text, "entries=3") {
+		t.Errorf("warning should report the entry count (entries=3), got:\n%s", text)
+	}
+	// A second file with the key still warns only once per process: the
+	// first emission already fired above.
+	other := filepath.Join(dir, "daemon-other.yaml")
+	if err := os.WriteFile(other, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadDaemonYAML(other); err != nil {
+		t.Fatalf("ReadDaemonYAML(other): %v", err)
+	}
+	if got := warnings.count(); got != 1 {
+		t.Errorf("deprecation warnings after second file = %d, want still 1", got)
 	}
 }
