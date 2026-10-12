@@ -688,6 +688,11 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 			var sweep daemonRuntime.RetiredKeySweepSummary
 			var sweepErr error
 			if fix {
+				if configPath != "" {
+					if _, err := os.Stat(configPath); err != nil {
+						return fmt.Errorf("daemon doctor: config %q: %w", configPath, err)
+					}
+				}
 				sweep, sweepErr = daemonRuntime.SweepRetiredKeys(daemonRuntime.DefaultSweepPaths(configPath))
 				if sweepErr != nil {
 					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: retired-key sweep: %v\n", sweepErr)
@@ -855,6 +860,11 @@ func newDaemonUpdateCmd(factory daemonClientFactory) *cobra.Command {
 			"summary line before contacting the daemon.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if configPath != "" {
+				if _, err := os.Stat(configPath); err != nil {
+					return fmt.Errorf("daemon update: config %q: %w", configPath, err)
+				}
+			}
 			summary, sweepErr := daemonRuntime.SweepRetiredKeys(daemonRuntime.DefaultSweepPaths(configPath))
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), summary.Line())
 			if sweepErr != nil {

@@ -258,6 +258,7 @@ func countRetiredCloneStrategyKeys(data []byte) int {
 		return 0
 	}
 	count := 0
+	seen := make(map[int]struct{})
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		key := root.Content[i]
 		if key.Kind != yaml.ScalarNode {
@@ -283,7 +284,12 @@ func countRetiredCloneStrategyKeys(data []byte) int {
 			}
 			for j := 0; j+1 < len(item.Content); j += 2 {
 				if item.Content[j].Kind == yaml.ScalarNode && item.Content[j].Value == "cloneStrategy" {
-					count++
+					// One entry counts once even when reached through a
+					// YAML alias that appears several times.
+					if _, ok := seen[item.Content[j].Line]; !ok {
+						seen[item.Content[j].Line] = struct{}{}
+						count++
+					}
 					break
 				}
 			}

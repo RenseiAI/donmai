@@ -84,9 +84,10 @@ func (s RetiredKeySweepSummary) Line() string {
 }
 
 // DefaultSweepPaths returns the candidate config files a sweep examines:
-// every daemon*.yaml sibling in the canonical config directory, plus the
-// explicit path when set. Missing files are filtered out by the sweep
-// itself; the result is sorted and deduplicated.
+// every daemon*.yaml sibling in the canonical config directory (and in the
+// explicit path's directory when one is given), plus the explicit path
+// itself. Missing files are filtered out by the sweep itself; the result
+// is sorted and deduplicated.
 func DefaultSweepPaths(explicit string) []string {
 	seen := make(map[string]struct{})
 	var out []string
@@ -104,17 +105,21 @@ func DefaultSweepPaths(explicit string) []string {
 		seen[abs] = struct{}{}
 		out = append(out, path)
 	}
+	addSiblingConfigs := func(dir string) {
+		if matches, err := filepath.Glob(filepath.Join(dir, "daemon*.yaml")); err == nil {
+			sort.Strings(matches)
+			for _, m := range matches {
+				add(m)
+			}
+		}
+	}
 	if explicit != "" {
 		add(explicit)
+		addSiblingConfigs(filepath.Dir(explicit))
 	}
 	canonical := DefaultConfigPath()
 	add(canonical)
-	if matches, err := filepath.Glob(filepath.Join(filepath.Dir(canonical), "daemon*.yaml")); err == nil {
-		sort.Strings(matches)
-		for _, m := range matches {
-			add(m)
-		}
-	}
+	addSiblingConfigs(filepath.Dir(canonical))
 	sort.Strings(out)
 	return out
 }
@@ -153,13 +158,9 @@ func SweepRetiredKeys(paths []string) (RetiredKeySweepSummary, error) {
 }
 
 // sweepRetiredKeysInFile examines one file. It returns (nil, nil) when the
-// file is absent (a globbed or default candidate that simply does not
-// exist), (result, nil) for examined files, and (nil, err) when an
-// explicitly requested file is missing — the caller cannot tell those
-// apart, so absence of a path that was passed explicitly is reported as an
-// error while every other absence is a silent skip. In practice the sweep
-// passes its candidates uniformly, so: absent files are silent skips, and
-// callers that need a missing explicit path to fail check existence first.
+// file is absent — globbed and default candidates that simply do not exist
+// are silent skips. Callers that pass an explicit path check its existence
+// first so a mistyped flag fails loudly instead of sweeping nothing.
 func sweepRetiredKeysInFile(path string) (*RetiredKeySweepFile, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -226,6 +227,14 @@ func retiredKeyLines(data []byte) (lines []int, unsafe bool, err error) {
 	if root.Kind != yaml.MappingNode {
 		return nil, false, nil
 	}
+	seen := make(map[int]struct{})
+	addLine := func(line int) {
+		if _, ok := seen[line]; ok {
+			return
+		}
+		seen[line] = struct{}{}
+		lines = append(lines, line)
+	}
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		key := root.Content[i]
 		if key.Kind != yaml.ScalarNode {
@@ -265,7 +274,7 @@ func retiredKeyLines(data []byte) (lines []int, unsafe bool, err error) {
 				if strings.Contains(v.Value, "\n") {
 					return nil, true, nil
 				}
-				lines = append(lines, k.Line)
+				addLine(k.Line)
 			}
 		}
 	}
