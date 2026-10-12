@@ -760,8 +760,11 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
-		// command_progress, diff_updated, compaction, and unknown values) stays
-		// runner-internal and is dropped.
+		// command_progress, diff_updated, compaction, stream progress, and
+		// unknown values) stays runner-internal and is dropped. Stream
+		// progress in particular must never reach the activity stream:
+		// one event per streamed token would spam it exactly the way
+		// per-token assistant text once did.
 		return payload{}, false
 
 	case agent.InitEvent, agent.ToolProgressEvent:

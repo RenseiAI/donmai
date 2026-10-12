@@ -130,17 +130,19 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 
 	// ─── Streaming deltas ─────────────────────────────────────────
 	//
-	// Partial-message frames (one token per notification) are dropped,
-	// mirroring the Claude provider's `stream_event` drop in
-	// ../claude/jsonl.go: high-frequency, low value to the orchestrator.
-	// Forwarding them turned every token into its own AssistantTextEvent,
-	// which the activity poster (runtime/activity) posts as a separate
-	// "thought" activity — surfacing as one-token-per-line spam on the
-	// platform topology view. The full text arrives on the matching
-	// `item/completed` notification (see mapItem: agentMessage → the
-	// complete AssistantTextEvent; reasoning → the complete summary
-	// SystemEvent), so dropping the deltas loses no content and also
-	// keeps the WORK_RESULT marker scan from splitting across tokens.
+	// Partial-message frames (one token per notification) carry no
+	// content for the orchestrator: they map to the content-free
+	// stream-progress liveness signal, not to AssistantTextEvent — each
+	// streamed token as its own AssistantTextEvent turned into a separate
+	// "thought" activity on the platform topology view (one-token-per-line
+	// spam). The full text still arrives on the matching `item/completed`
+	// notification (see mapItem: agentMessage → the complete
+	// AssistantTextEvent; reasoning → the complete summary SystemEvent),
+	// so the progress signal loses no content and keeps the WORK_RESULT
+	// marker scan from splitting across tokens. The runner's stall
+	// detector disarms on the signal: deltas arriving means the model
+	// request is alive, so a healthy long generation never reads as a
+	// stall, while a hung request (no deltas) still trips it.
 	//
 	// Live, incremental rendering (the interview token-delta stream) has
 	// its own dedicated transport in runtime/tokendelta — it does not and
@@ -148,7 +150,7 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 	case "item/agentMessage/delta",
 		"item/reasoning/textDelta",
 		"item/reasoning/summaryTextDelta":
-		return nil
+		return []agent.Event{agent.StreamProgressEvent()}
 
 	case "item/commandExecution/outputDelta":
 		var p struct {

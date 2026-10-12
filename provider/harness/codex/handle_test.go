@@ -172,8 +172,9 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 				"method":  "turn/started",
 				"params":  map[string]any{"threadId": threadID, "turn": map[string]any{"id": "t1"}},
 			})
-			// Streamed delta is dropped by the mapper; the full text is
-			// carried by the matching item/completed below.
+			// Streamed delta maps to the content-free stream-progress
+			// liveness signal; the full text is carried by the matching
+			// item/completed below.
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "item/agentMessage/delta",
@@ -257,9 +258,11 @@ func TestHandle_SpawnEventsTerminalResult(t *testing.T) {
 	got := drainEvents(t, h.Events(), 5*time.Second)
 
 	// Expect the canned sequence: init, system (turn_started),
-	// assistant_text, per-call usage, result.
+	// system (stream progress from the streamed delta), assistant_text,
+	// per-call usage, result.
 	wantKinds := []agent.EventKind{
 		agent.EventInit,
+		agent.EventSystem,
 		agent.EventSystem,
 		agent.EventAssistantText,
 		agent.EventLlmCall,
@@ -612,7 +615,8 @@ func TestHandle_EventChannelCloseRace(t *testing.T) {
 						// the forwarder is reliably executing emit
 						// when Provider.Shutdown lands. Use completed
 						// agentMessage items (each maps to one event);
-						// streamed deltas are dropped by the mapper.
+						// streamed deltas map to the stream-progress
+						// signal, not to content events.
 						for n := 0; n < 32; n++ {
 							fs.write(t, map[string]any{
 								"jsonrpc": "2.0",

@@ -114,15 +114,19 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 	case "message_update":
 		// The streaming delta lives under assistantMessageEvent. Buffer
 		// text_delta parts; drop thinking_delta unless debug. Emit nothing until
-		// message_end (anti-spam).
+		// message_end (anti-spam) — but surface the content-free
+		// stream-progress liveness signal per delta, so the runner can
+		// tell a live generation (deltas arriving) from a hung request.
 		ame := mapField(f, "assistantMessageEvent")
 		switch stringField(ame, "type") {
 		case "text_delta":
 			st.textBuf.WriteString(stringField(ame, "delta"))
+			return []agent.Event{agent.StreamProgressEvent()}, false
 		case "thinking_delta":
 			if st.debug {
 				st.textBuf.WriteString(stringField(ame, "delta"))
 			}
+			return []agent.Event{agent.StreamProgressEvent()}, false
 		}
 		return nil, false
 
