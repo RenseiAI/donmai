@@ -153,6 +153,32 @@ func ReasoningEffortEvent(effort EffortLevel) SystemEvent {
 // bound it ran at.
 const SystemSubtypeToolCallBounds = "tool_call_bounds"
 
+// SystemSubtypeHarnessLifecycle is the SystemEvent subtype a harness emits
+// when one of its per-launch activity hooks fires: the CLI's own
+// session-start, prompt-submit, stop, and permission-request moments,
+// relayed observe-only (the hook prints nothing, so the session proceeds
+// exactly as it would with no hooks installed). Message carries the moment
+// in fixed vocabulary — one of the HarnessLifecycleMoment constants — so
+// the activity poster can forward it as a context marker without ever
+// carrying free-form hook output.
+const SystemSubtypeHarnessLifecycle = "harness_lifecycle"
+
+// Harness lifecycle moments, in the snake_case vocabulary the CLIs use on
+// the wire for these events.
+const (
+	HarnessLifecycleSessionStart      = "session_start"
+	HarnessLifecycleUserPromptSubmit  = "user_prompt_submit"
+	HarnessLifecycleStop              = "stop"
+	HarnessLifecyclePermissionRequest = "permission_request"
+)
+
+// HarnessLifecycleEvent builds the SystemSubtypeHarnessLifecycle event for
+// one relayed hook fire. moment must be one of the HarnessLifecycleMoment
+// constants; the relay parser allowlists them before this is ever called.
+func HarnessLifecycleEvent(moment string) SystemEvent {
+	return SystemEvent{Subtype: SystemSubtypeHarnessLifecycle, Message: moment}
+}
+
 // ToolCallBoundsEvent builds the SystemSubtypeToolCallBounds event for the
 // per-tool-call timeout bound a session was spawned with, in seconds.
 // A non-positive bound means no bound is enforced.
