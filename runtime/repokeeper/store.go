@@ -381,15 +381,15 @@ func (s *Store) cloneAndPublish(ctx context.Context, dir, digest, canonical, sco
 		if os.IsExist(err) {
 			// Lost the create race: another process published first.
 			// Discard the staging and report the loss; the caller
-				// drops its exclusive lock (a shared lock on the same
-				// file would deadlock against it) and re-verifies
-				// the winner under a shared lock instead of failing
-				// closed on a mirror that is, by construction,
-				// exactly what was requested.
-				staged = true
-				_ = os.RemoveAll(tmp)
-				return errMirrorRaceLost
-			}
+			// drops its exclusive lock (a shared lock on the same
+			// file would deadlock against it) and re-verifies
+			// the winner under a shared lock instead of failing
+			// closed on a mirror that is, by construction,
+			// exactly what was requested.
+			staged = true
+			_ = os.RemoveAll(tmp)
+			return errMirrorRaceLost
+		}
 		return fmt.Errorf("repo keeper: publish mirror: %w", err)
 	}
 	staged = true
@@ -498,6 +498,27 @@ func (s *Store) verifyMirror(mirrorDir, digest, canonical, scope string) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("repo keeper: inspect mirror alternates: %w", err)
 	}
+	// A planted hooks directory would hand executable hooks to any
+	// non-hermetic consumer of the mirror. A hermetic clone writes no
+	// hooks at all, so any executable non-sample hook file fails closed.
+	// (Samples are mode 644; a sample path overwritten with an
+	// executable plant loses its suffix exemption by its mode.)
+	if entries, err := os.ReadDir(filepath.Join(mirrorDir, "hooks")); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return fmt.Errorf("repo keeper: inspect mirror hooks: %w", err)
+			}
+			if info.Mode()&0o111 != 0 && !strings.HasSuffix(entry.Name(), ".sample") {
+				return fmt.Errorf("%w: mirror carries an executable hook", ErrOriginMismatch)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("repo keeper: inspect mirror hooks: %w", err)
+	}
 	for _, control := range []string{"config", "HEAD", "objects", "refs"} {
 		if info, err := os.Lstat(filepath.Join(mirrorDir, control)); err != nil {
 			return fmt.Errorf("%w: mirror control file is missing", ErrOriginMismatch)
@@ -523,9 +544,11 @@ func (s *Store) verifyMirror(mirrorDir, digest, canonical, scope string) error {
 // keys a fresh `git clone --mirror` writes on its own, lowercased (git
 // matches key names case-insensitively). Anything else — a planted hook
 // path, filesystem monitor, ssh command, uploadpack, credential helper,
-// auth header, include directive, or URL rewrite — fails closed. Values
-// are checked only for remote.origin.url, which must equal the canonical
-// remote; the remaining keys are inert provenance git maintains itself.
+// auth header, include directive, or URL rewrite — fails closed. The
+// remote.origin.url value must equal the canonical remote, and the
+// pinnedMirrorConfigValues keys must carry exactly the values a hermetic
+// clone writes; the remaining keys vary by platform or git version and
+// are checked by name only.
 var allowedMirrorConfigKeys = map[string]bool{
 	"core.repositoryformatversion": true,
 	"core.filemode":                true,
@@ -536,6 +559,18 @@ var allowedMirrorConfigKeys = map[string]bool{
 	"remote.origin.fetch":          true,
 	"remote.origin.tagopt":         true,
 	"remote.origin.mirror":         true,
+}
+
+// pinnedMirrorConfigValues pins the values of allowlisted keys whose
+// meaning a plant could flip: the mirrors are always bare format-zero
+// mirrors fetched with the mirror refspec, so anything else fails
+// closed.
+var pinnedMirrorConfigValues = map[string]string{
+	"core.repositoryformatversion": "0",
+	"core.bare":                    "true",
+	"remote.origin.fetch":          "+refs/*:refs/*",
+	"remote.origin.tagopt":         "--no-tags",
+	"remote.origin.mirror":         "true",
 }
 
 // verifyMirrorConfig refuses any mirror config key outside
@@ -565,6 +600,9 @@ func verifyMirrorConfig(mirrorDir, canonical string) error {
 		}
 		if !allowedMirrorConfigKeys[name] {
 			return fmt.Errorf("%w: existing mirror config carries an unexpected key", ErrOriginMismatch)
+		}
+		if pinned, ok := pinnedMirrorConfigValues[name]; ok && value != pinned {
+			return fmt.Errorf("%w: existing mirror config value changed", ErrOriginMismatch)
 		}
 	}
 	return nil

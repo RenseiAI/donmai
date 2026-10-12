@@ -51,20 +51,29 @@ func lockFileNameFor(digest string) (string, error) {
 // openMirrorLock opens (creating owner-only) the flock file for digest,
 // confined under the store root. The locks directory is created first so
 // the first Ensure on a fresh state home can lock before it publishes.
+// The create-then-open retries on ENOENT: two creators racing first use
+// can both pass MkdirAll yet resolve the parent before the other's
+// commit lands, and the lock must survive that race, not fail it.
 // The caller owns the returned file and must unlockAndClose it.
 func (s *Store) openMirrorLock(digest string) (*os.File, error) {
 	name, err := lockFileNameFor(digest)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.root.MkdirAll(filepath.Join(keeperDirName, locksDirName), 0o700); err != nil {
-		return nil, fmt.Errorf("repo keeper: create lock dir: %w", err)
+	var lock *os.File
+	for attempt := 0; ; attempt++ {
+		if err := s.root.MkdirAll(filepath.Join(keeperDirName, locksDirName), 0o700); err != nil {
+			return nil, fmt.Errorf("repo keeper: create lock dir: %w", err)
+		}
+		lock, err = s.root.OpenFile(locksRelPath(name), os.O_CREATE|os.O_RDWR, 0o600)
+		if err == nil {
+			return lock, nil
+		}
+		if !os.IsNotExist(err) || attempt >= 20 {
+			return nil, fmt.Errorf("repo keeper: open mirror lock: %w", err)
+		}
+		time.Sleep(time.Millisecond)
 	}
-	lock, err := s.root.OpenFile(locksRelPath(name), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("repo keeper: open mirror lock: %w", err)
-	}
-	return lock, nil
 }
 
 // lockSharedCtx takes a shared (reader) flock, retrying until ctx lapses.
