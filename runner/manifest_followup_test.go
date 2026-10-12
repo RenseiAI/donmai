@@ -344,6 +344,13 @@ type scriptedSession struct {
 	// scripted session. Zero keeps the 15s production default. Tests only:
 	// production leaves this at zero.
 	stepHeartbeatInterval time.Duration
+	// statusBeaconInterval, when non-zero, sets the runner's status-beacon
+	// cadence for tests that need beacons inside a fast scripted session.
+	// Zero keeps the 30s production default — longer than any scripted
+	// session, so beacon assertions set a millisecond interval to observe
+	// the spawning/streaming/terminal sequence. Negative disables beacons.
+	// Tests only: production leaves this at zero.
+	statusBeaconInterval time.Duration
 	// teardown lets Run tear the worktree down on success (the default keeps
 	// it for inspection); rescueDir is where unpublished work is archived.
 	teardown  bool
@@ -430,6 +437,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.KitComposer = cfg.kitComposer
 	})
 	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
+	r.statusBeaconInterval = cfg.statusBeaconInterval
 	r.skipSteering = cfg.skipSteering
 	if cfg.teardown {
 		r.preserveAlways = false

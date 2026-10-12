@@ -938,7 +938,7 @@ func TestObserveEvent_ProviderErrorClearsOnRecovery(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var obs streamObservation
 			for _, ev := range tc.events {
-				r.observeEvent(ev, &obs, dir, QueuedWork{})
+				r.observeEvent(ev, &obs, dir, QueuedWork{}, nil)
 			}
 			if obs.providerError != tc.want {
 				t.Fatalf("providerError = %q; want %q", obs.providerError, tc.want)

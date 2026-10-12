@@ -237,7 +237,7 @@ func TestConsumeEvents_StallDetectorFiresWithoutToolCallInFlight(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 	if !obs.providerStall {
 		t.Fatalf("obs.providerStall = false; want true (silence with no tool in flight is a stall)")
 	}
@@ -275,7 +275,7 @@ func TestConsumeEvents_SlowToolDoesNotTripStallDetector(t *testing.T) {
 	defer cancel()
 	go func() {
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 		done <- consumeResult{obs: obs, err: err}
 	}()
 
@@ -346,7 +346,7 @@ func TestConsumeEvents_PreToolSilenceNeverTripsStallDetector(t *testing.T) {
 	defer cancel()
 	go func() {
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 		done <- consumeResult{obs: obs, err: err}
 	}()
 
@@ -412,7 +412,7 @@ func TestConsumeEvents_ModelOutputAfterToolResultDisarmsStallDetector(t *testing
 	defer cancel()
 	go func() {
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 		done <- consumeResult{obs: obs, err: err}
 	}()
 
@@ -616,7 +616,7 @@ func (h *startedHandle) Stop(context.Context) error           { return nil }
 // drainWithoutStallDetector runs a follow-up drain on h until ctx ends.
 func drainWithoutStallDetector(ctx context.Context, t *testing.T, r *Runner, h *startedHandle, done chan<- struct{}) {
 	defer close(done)
-	_, _ = r.consumeEventsWithoutStallDetector(ctx, h, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("STALL-TAIL")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
+	_, _ = r.consumeEventsWithoutStallDetector(ctx, h, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("STALL-TAIL")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil, nil)
 }
 
 // TestConsumeEvents_TailDrainLeavesOtherSessionsArmed pins that disarming
@@ -638,7 +638,7 @@ func TestConsumeEvents_TailDrainLeavesOtherSessionsArmed(t *testing.T) {
 	firstTurn := func(key string) streamObservation {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		obs, _ := r.consumeEvents(ctx, postToolHang(), t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase(key)}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
+		obs, _ := r.consumeEvents(ctx, postToolHang(), t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase(key)}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil, nil)
 		return obs
 	}
 
