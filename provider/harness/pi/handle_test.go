@@ -6,6 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -810,5 +814,442 @@ func TestRPCResponseModelIsObservedWithoutConfiguredIdentityFallback(t *testing.
 				t.Fatal("RPC command surface was not exercised")
 			}
 		})
+	}
+}
+
+// --- Repeated output-limit cut-offs: N consecutive cut-off turns end the
+// session with a typed failure instead of retrying without bound; a normal
+// turn in between resets the streak. The reversal check: neutralizing the
+// streak counter (foldCutoffTurn never tripping) turns the bound-trip test
+// red — the session runs to its own ResultEvent instead of stopping. ---
+
+// cutoffTurnFixture builds one turn cut off at the output-token limit in the
+// runtime's recorded shape: the assistant message_end with stopReason
+// "length" naming the call, the hook-less refused start/end pair, and the
+// turn_end that closes the turn. The monitor records the refusal (not a miss)
+// and foldCutoffTurn counts the turn toward the consecutive-cutoff streak.
+func cutoffTurnFixture(callID string) string {
+	return assistantMessageEnd("length", [2]string{callID, "edit"}) +
+		truncatedCallPair("edit", callID) +
+		event(map[string]any{"type": "turn_end"})
+}
+
+// normalTurnFixture builds one ordinary turn: an assistant message that
+// stopped normally and no refused calls. Its turn_end resets the cut-off
+// streak.
+func normalTurnFixture() string {
+	return assistantMessageEnd("stop") +
+		event(map[string]any{"type": "turn_end"})
+}
+
+// drainCutoffSession collects events until the session's terminal event — a
+// ResultEvent on a session that ran to its own end, or the typed ErrorEvent
+// that ends a session stuck on the output limit — or the channel closes.
+func drainCutoffSession(t *testing.T, h agent.Handle) []agent.Event {
+	t.Helper()
+	var out []agent.Event
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+			if _, done := ev.(agent.ResultEvent); done {
+				return out
+			}
+			if ee, ok := ev.(agent.ErrorEvent); ok && ee.Code == repeatedOutputLimitCode {
+				return out
+			}
+		case <-timeout:
+			t.Fatalf("timed out draining events; got %d so far: %+v", len(out), out)
+			return out
+		}
+	}
+}
+
+// drainCutoffTurn collects events until one turn's usage event (LlmCallEvent
+// with TurnCompleted) or the session's terminal — the per-turn seam a real
+// subprocess needs, where a mid-streak turn ends with turn_end alone and no
+// terminal of its own. It never fails on timeout: a turn that produced no
+// usage event yet simply yields what arrived, so the caller can Inject the
+// next turn and keep driving.
+func drainCutoffTurn(t *testing.T, h agent.Handle) []agent.Event {
+	t.Helper()
+	var out []agent.Event
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+			if call, ok := ev.(agent.LlmCallEvent); ok && call.TurnCompleted {
+				return out
+			}
+			if _, done := ev.(agent.ResultEvent); done {
+				return out
+			}
+			if ee, ok := ev.(agent.ErrorEvent); ok && ee.Code == repeatedOutputLimitCode {
+				return out
+			}
+		case <-timeout:
+			t.Fatalf("timed out draining one turn; got %d so far: %+v", len(out), out)
+			return out
+		}
+	}
+}
+
+// cutoffOutcome splits a drained session into its terminal shape: whether
+// the typed cut-off failure fired (and whether it wrongly claims the session
+// continues), whether a ResultEvent closed the session, and how many
+// output-limit refusal observations the monitor surfaced.
+func cutoffOutcome(t *testing.T, evs []agent.Event) (failed, completed, refusals int) {
+	t.Helper()
+	for _, e := range evs {
+		switch value := e.(type) {
+		case agent.ErrorEvent:
+			if value.Code == repeatedOutputLimitCode {
+				failed++
+				if value.SessionContinues {
+					t.Errorf("typed %q failure must be terminal, but SessionContinues is set: %+v", repeatedOutputLimitCode, value)
+				}
+				if value.Message == "" {
+					t.Errorf("typed %q failure carried no message", repeatedOutputLimitCode)
+				}
+			}
+		case agent.ResultEvent:
+			completed++
+		case agent.SystemEvent:
+			if value.Subtype == outputLimitRefusalSubtype {
+				refusals++
+			}
+		}
+	}
+	return failed, completed, refusals
+}
+
+func TestOutputLimitCutoff_ConsecutiveCutoffsEndSession(t *testing.T) {
+	t.Parallel()
+	var body string
+	for i := 0; i < defaultMaxConsecutiveOutputLimitCutoffs; i++ {
+		body += cutoffTurnFixture("c-cutoff")
+	}
+	body += event(map[string]any{"type": "agent_settled"})
+
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+		handshakeEvent("h1"), getStateResponse("ses_cutoff")+event(map[string]any{"type": "agent_start"})+body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainCutoffSession(t, h)
+
+	failed, completed, refusals := cutoffOutcome(t, evs)
+	if failed != 1 {
+		t.Errorf("typed %q failures = %d, want exactly 1 (terminal, carrying a message): %+v", repeatedOutputLimitCode, failed, evs)
+	}
+	if completed != 0 {
+		t.Errorf("session reached a ResultEvent after %d consecutive cut-off turns: %+v", defaultMaxConsecutiveOutputLimitCutoffs, evs)
+	}
+	if refusals != defaultMaxConsecutiveOutputLimitCutoffs {
+		t.Errorf("output-limit refusal observations = %d, want %d (one per cut-off turn)", refusals, defaultMaxConsecutiveOutputLimitCutoffs)
+	}
+	if err := checkTerminalLast(evs); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestOutputLimitCutoff_FewerThanLimitDoesNotEndSession(t *testing.T) {
+	t.Parallel()
+	var body string
+	for i := 0; i < defaultMaxConsecutiveOutputLimitCutoffs-1; i++ {
+		body += cutoffTurnFixture("c-cutoff")
+	}
+	body += event(map[string]any{"type": "agent_settled"})
+
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+		handshakeEvent("h1"), getStateResponse("ses_cutoff_short")+event(map[string]any{"type": "agent_start"})+body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainCutoffSession(t, h)
+
+	failed, completed, _ := cutoffOutcome(t, evs)
+	if failed != 0 {
+		t.Errorf("session failed before the streak reached the bound: %+v", evs)
+	}
+	if completed != 1 {
+		t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+	}
+}
+
+func TestOutputLimitCutoff_NormalTurnResetsStreak(t *testing.T) {
+	t.Parallel()
+	// One fewer than the bound, then a normal turn, then one more cut-off:
+	// the streak never reaches the bound, so the session completes.
+	var body string
+	for i := 0; i < defaultMaxConsecutiveOutputLimitCutoffs-1; i++ {
+		body += cutoffTurnFixture("c-cutoff")
+	}
+	body += normalTurnFixture() + cutoffTurnFixture("c-cutoff") +
+		event(map[string]any{"type": "agent_settled"})
+
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+		handshakeEvent("h1"), getStateResponse("ses_cutoff_reset")+event(map[string]any{"type": "agent_start"})+body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainCutoffSession(t, h)
+
+	failed, completed, refusals := cutoffOutcome(t, evs)
+	if failed != 0 {
+		t.Errorf("a normal turn between cut-offs must reset the streak; session failed anyway: %+v", evs)
+	}
+	if completed != 1 {
+		t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+	}
+	if refusals != defaultMaxConsecutiveOutputLimitCutoffs {
+		t.Errorf("output-limit refusal observations = %d, want %d (one per cut-off turn)", refusals, defaultMaxConsecutiveOutputLimitCutoffs)
+	}
+}
+
+func TestOutputLimitCutoff_LimitIsConfigurable(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		limit int
+		turns int
+		// wantFatal is true when the scripted streak must end the session.
+		wantFatal bool
+	}{
+		{name: "custom limit of one trips on one", limit: 1, turns: 1, wantFatal: true},
+		{name: "custom limit of two trips on two", limit: 2, turns: 2, wantFatal: true},
+		{name: "custom limit of two survives one", limit: 2, turns: 1, wantFatal: false},
+		{name: "raised limit survives the default streak", limit: defaultMaxConsecutiveOutputLimitCutoffs + 2, turns: defaultMaxConsecutiveOutputLimitCutoffs, wantFatal: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var body string
+			for i := 0; i < tc.turns; i++ {
+				body += cutoffTurnFixture("c-cutoff")
+			}
+			body += event(map[string]any{"type": "agent_settled"})
+
+			spec := agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true}
+			spec.ProviderConfig = map[string]any{"maxConsecutiveOutputLimitCutoffs": tc.limit}
+			_, h, err := spawnScripted(t, spec,
+				handshakeEvent("h1"), getStateResponse("ses_cutoff_cfg")+event(map[string]any{"type": "agent_start"})+body)
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			evs := drainCutoffSession(t, h)
+
+			failed, completed, _ := cutoffOutcome(t, evs)
+			if tc.wantFatal {
+				if failed != 1 {
+					t.Errorf("streak of %d with limit %d must end the session: %+v", tc.turns, tc.limit, evs)
+				}
+				if completed != 0 {
+					t.Errorf("session reached a ResultEvent after tripping the cut-off bound: %+v", evs)
+				}
+			} else {
+				if failed != 0 {
+					t.Errorf("streak of %d with limit %d must not end the session: %+v", tc.turns, tc.limit, evs)
+				}
+				if completed != 1 {
+					t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+				}
+			}
+		})
+	}
+}
+
+func TestConsecutiveOutputLimitCutoffs_ResolvesTheBound(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		config map[string]any
+		want   int
+	}{
+		{name: "unset is the default", config: nil, want: defaultMaxConsecutiveOutputLimitCutoffs},
+		{name: "positive wins", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": 5}, want: 5},
+		{name: "float64 from JSON decode wins", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": float64(2)}, want: 2},
+		{name: "zero is the default", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": 0}, want: defaultMaxConsecutiveOutputLimitCutoffs},
+		{name: "negative is the default", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": -1}, want: defaultMaxConsecutiveOutputLimitCutoffs},
+		{name: "fractional is the default, never truncated", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": 2.5}, want: defaultMaxConsecutiveOutputLimitCutoffs},
+		{name: "non-numeric is the default", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": "5"}, want: defaultMaxConsecutiveOutputLimitCutoffs},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := consecutiveOutputLimitCutoffs(agent.Spec{ProviderConfig: tc.config}); got != tc.want {
+				t.Errorf("consecutiveOutputLimitCutoffs(%v) = %d, want %d", tc.config, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- Real-subprocess cut-off sessions: the same streak through a forked
+// fakepi binary instead of the scripted pipe seam. The task's acceptance
+// names a fakepi script explicitly, so this file carries it: a fakepi whose
+// every turn is cut off at the output-token limit ends the session with the
+// typed failure, while one that serves a normal turn in between does not.
+// ---
+
+// buildCutoffFakePi compiles testdata/fakepi exactly once per test binary
+// run and returns its path. Skips cleanly when the go toolchain is
+// unavailable — the stub binary is a convenience, not a hard dependency.
+var (
+	cutoffFakePiOnce sync.Once
+	cutoffFakePiPath string
+	cutoffFakePiErr  error
+)
+
+func buildCutoffFakePi(t *testing.T) string {
+	t.Helper()
+	cutoffFakePiOnce.Do(func() {
+		goBin, err := exec.LookPath("go")
+		if err != nil {
+			cutoffFakePiErr = fmt.Errorf("go toolchain not on PATH: %w", err)
+			return
+		}
+		dir, err := os.MkdirTemp("", "donmai-fakepi-cutoff-*")
+		if err != nil {
+			cutoffFakePiErr = fmt.Errorf("mkdir temp: %w", err)
+			return
+		}
+		out := filepath.Join(dir, "fakepi")
+		// #nosec G204 -- goBin resolved from PATH above; args are fixed.
+		cmd := exec.Command(goBin, "build", "-o", out, "./testdata/fakepi")
+		if combined, buildErr := cmd.CombinedOutput(); buildErr != nil {
+			cutoffFakePiErr = fmt.Errorf("go build testdata/fakepi: %w: %s", buildErr, combined)
+			return
+		}
+		cutoffFakePiPath = out
+	})
+	if cutoffFakePiErr != nil {
+		t.Skipf("fakepi stub binary unavailable, skipping real-subprocess cut-off session: %v", cutoffFakePiErr)
+	}
+	return cutoffFakePiPath
+}
+
+// spawnCutoffFakePi starts one real-subprocess session against fakepi with
+// the given turn mode ("cutoff" for every turn cut off at the output-token
+// limit, "" for ordinary text turns) and limit override. It waits for
+// Spawn's own handshake gate, then for the session's terminal event.
+func spawnCutoffFakePi(t *testing.T, binPath, mode string, limit int) agent.Handle {
+	t.Helper()
+	p, err := New(Options{
+		PiBin:            binPath,
+		HandshakeTimeout: 20 * time.Second,
+		VersionProbe:     func(context.Context, string) (string, error) { return PinnedVersion, nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	spec := agent.Spec{
+		Prompt:     "cut-off probe",
+		Cwd:        t.TempDir(),
+		Autonomous: true,
+		// FAKEPI_CUTOFF_TURNS budgets more cut-off turns than any bound
+		// under test, so the handle — not the stub — decides the
+		// session: only the last budgeted turn would settle on its own.
+		Env: map[string]string{"FAKEPI_TURN_MODE": mode, "FAKEPI_CUTOFF_TURNS": "10"},
+	}
+	if limit > 0 {
+		spec.ProviderConfig = map[string]any{"maxConsecutiveOutputLimitCutoffs": limit}
+	}
+	h, err := p.Spawn(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	return h
+}
+
+// TestOutputLimitCutoff_FakePiConsecutiveCutoffsEndSession drives a real
+// fakepi subprocess whose every turn is cut off at the output-token limit:
+// the session must end with the typed failure instead of retrying without
+// bound. Neutralizing the streak counter turns this red (the session runs
+// to its own terminal ResultEvent instead). Each turn is driven by an
+// Inject (the post-terminal prompt route): a real pi child serves one turn
+// per command and never retries on its own, so consecutive turns only exist
+// when the caller keeps asking for them — which is exactly the retry
+// without bound this guard stops.
+func TestOutputLimitCutoff_FakePiConsecutiveCutoffsEndSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fakepi subprocess test is unix-only")
+	}
+	binPath := buildCutoffFakePi(t)
+	h := spawnCutoffFakePi(t, binPath, "cutoff", 2)
+	// Spawn's own prompt serves the first cut-off turn; each Inject serves
+	// the next. The budget (10) is above the bound (2), so the handle —
+	// not the stub — decides the session. Mid-streak turns end with
+	// turn_end alone (no terminal), so each turn is drained per-turn and
+	// the next is driven with an Inject.
+	var evs []agent.Event
+	evs = append(evs, drainCutoffTurn(t, h)...)
+	for i := 0; i < 10; i++ {
+		if hasCutoffTerminal(evs) {
+			break
+		}
+		if err := h.Inject(context.Background(), "keep going"); err != nil {
+			break
+		}
+		evs = append(evs, drainCutoffTurn(t, h)...)
+	}
+
+	failed, completed, refusals := cutoffOutcome(t, evs)
+	if failed != 1 {
+		t.Errorf("typed %q failures = %d, want exactly 1 (terminal, carrying a message): %+v", repeatedOutputLimitCode, failed, evs)
+	}
+	if completed != 0 {
+		t.Errorf("fakepi session reached a ResultEvent despite every turn cut off at the output-token limit: %+v", evs)
+	}
+	if refusals < 2 {
+		t.Errorf("fakepi session surfaced %d %s observations; want one per cut-off turn (at least the bound)", refusals, outputLimitRefusalSubtype)
+	}
+	if err := checkTerminalLast(evs); err != nil {
+		t.Error(err)
+	}
+}
+
+// hasCutoffTerminal reports whether the drained events already carry the
+// session's terminal: the typed cut-off failure or a ResultEvent.
+func hasCutoffTerminal(evs []agent.Event) bool {
+	for _, e := range evs {
+		switch v := e.(type) {
+		case agent.ErrorEvent:
+			if v.Code == repeatedOutputLimitCode {
+				return true
+			}
+		case agent.ResultEvent:
+			return true
+		}
+	}
+	return false
+}
+
+// TestOutputLimitCutoff_FakePiNormalTurnDoesNotStop drives a real fakepi
+// subprocess serving ordinary text turns: below any cut-off streak, the
+// session must run to its own terminal instead of stopping.
+func TestOutputLimitCutoff_FakePiNormalTurnDoesNotStop(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fakepi subprocess test is unix-only")
+	}
+	binPath := buildCutoffFakePi(t)
+	h := spawnCutoffFakePi(t, binPath, "", 2)
+	evs := drainCutoffSession(t, h)
+
+	failed, completed, _ := cutoffOutcome(t, evs)
+	if failed != 0 {
+		t.Errorf("fakepi session serving normal turns stopped on %q anyway: %+v", repeatedOutputLimitCode, evs)
+	}
+	if completed != 1 {
+		t.Errorf("fakepi session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
 	}
 }
