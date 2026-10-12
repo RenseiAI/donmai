@@ -19,7 +19,7 @@ func unansweringProbeCommand(t *testing.T) []string {
 	t.Helper()
 	script := filepath.Join(t.TempDir(), "embedder-main")
 	body := "#!/bin/sh\nsleep 120\n"
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil { //nolint:gosec // G306: a stand-in executable the launcher runs.
 		t.Fatalf("write fake embedder main: %v", err)
 	}
 	return []string{script}

@@ -209,6 +209,7 @@ func probeHandshakePath(planPath string) string {
 // writeProbeHandshake announces a serving probe. Existence is the signal;
 // the content is a fixed token for a human reading the scratch directory.
 func writeProbeHandshake(planPath string) error {
+	//nolint:gosec // G304: the plan path is the probe's own input, as with the plan read below.
 	return os.WriteFile(probeHandshakePath(planPath), []byte("ready\n"), 0o600)
 }
 
