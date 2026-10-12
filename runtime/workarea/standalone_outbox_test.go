@@ -623,3 +623,141 @@ func holdLeaseRecordLock(t *testing.T, store *LeaseStore, key string) func() {
 		_ = f.Close()
 	}
 }
+
+// TestStandaloneOutboxNeverPrunesUndeliveredPastRetention pins the prune
+// guard: retention applies only to records that need no further send. An
+// undelivered record older than the retention window is still the only copy
+// of its terminal, so the pass must replay it, not remove it.
+func TestStandaloneOutboxNeverPrunesUndeliveredPastRetention(t *testing.T) {
+	t.Parallel()
+	store, clock := standaloneOutboxStore(t)
+	session := "11111111-1111-4111-8111-111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"completed"}`)
+	deadline := clock.now.Add(StandaloneOutboxDeadline)
+	if _, err := store.SaveStandaloneOutbox(context.Background(), standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, deadline)); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = clock.now.Add(StandaloneOutboxRetention + time.Hour)
+	var sent int
+	considered, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, func(_ context.Context, _ string, payload []byte) error {
+		if !bytes.Equal(payload, body) {
+			t.Fatalf("payload=%s, want the persisted bytes", payload)
+		}
+		sent++
+		return nil
+	})
+	if err != nil || considered != 1 || sent != 1 {
+		t.Fatalf("considered=%d sent=%d err=%v, want the undelivered record replayed once", considered, sent, err)
+	}
+}
+
+// TestStandaloneOutboxReadFailureNeverQuarantines pins that only bytes that
+// fail to decode quarantine. A read failure says nothing about the record —
+// it may be a valid undelivered terminal — so the pass skips it and a later
+// pass delivers it once the read succeeds.
+func TestStandaloneOutboxReadFailureNeverQuarantines(t *testing.T) {
+	t.Parallel()
+	store, clock := standaloneOutboxStore(t)
+	session := "11111111-1111-4111-8111-111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"failed"}`)
+	deadline := clock.now.Add(StandaloneOutboxDeadline)
+	key, err := store.SaveStandaloneOutbox(context.Background(), standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, deadline))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failing atomic.Bool
+	failing.Store(true)
+	outboxPath := store.standaloneOutboxPath(key)
+	store.readFile = func(path string) ([]byte, error) {
+		if failing.Load() && path == outboxPath {
+			return nil, &fs.PathError{Op: "open", Path: path, Err: syscall.EIO}
+		}
+		return os.ReadFile(path)
+	}
+	considered, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, func(_ context.Context, _ string, _ []byte) error {
+		t.Fatal("an unreadable record must not send")
+		return nil
+	})
+	if err != nil || considered != 0 {
+		t.Fatalf("considered=%d err=%v, want the unreadable record skipped", considered, err)
+	}
+	if entries, err := os.ReadDir(store.standaloneOutboxQuarantineDir()); err == nil && len(entries) != 0 {
+		t.Fatalf("quarantined=%d, want an unreadable record left in place", len(entries))
+	}
+	if _, err := os.Stat(outboxPath); err != nil {
+		t.Fatalf("record moved after a read failure: %v", err)
+	}
+	failing.Store(false)
+	var sent int
+	considered, err = store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, func(_ context.Context, _ string, payload []byte) error {
+		if !bytes.Equal(payload, body) {
+			t.Fatalf("payload=%s, want the persisted bytes", payload)
+		}
+		sent++
+		return nil
+	})
+	if err != nil || considered != 1 || sent != 1 {
+		t.Fatalf("considered=%d sent=%d err=%v, want the record delivered once readable", considered, sent, err)
+	}
+}
+
+// TestStandaloneOutboxQuarantineToleratesVanishedFile pins that a file a
+// concurrent scan already moved or pruned is not an error: otherwise two
+// store handles scanning the same directory could fail a replay pass or a
+// store open.
+func TestStandaloneOutboxQuarantineToleratesVanishedFile(t *testing.T) {
+	t.Parallel()
+	store, _ := standaloneOutboxStore(t)
+	if err := os.MkdirAll(store.standaloneOutboxDir(), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.quarantineStandaloneOutboxFile("txo_00000000000000000000000000000000.json", "vanished"); err != nil {
+		t.Fatalf("quarantine of a vanished file: %v", err)
+	}
+}
+
+// TestStandaloneOutboxDeadLetterKeepsRetentionWindow pins that a
+// dead-lettered record — the only trace of a terminal that was never
+// delivered — stays readable for the retention window measured from its
+// deadline, not from a NextAttemptAt that can sit days in the past.
+func TestStandaloneOutboxDeadLetterKeepsRetentionWindow(t *testing.T) {
+	t.Parallel()
+	store, clock := standaloneOutboxStore(t)
+	session := "11111111-1111-4111-8111-111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"failed"}`)
+	deadline := clock.now.Add(StandaloneOutboxDeadline)
+	if _, err := store.SaveStandaloneOutbox(context.Background(), standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, deadline)); err != nil {
+		t.Fatal(err)
+	}
+	noSend := func(_ context.Context, _ string, _ []byte) error {
+		t.Fatal("a record past its deadline must not send")
+		return nil
+	}
+	clock.now = deadline.Add(time.Minute)
+	if _, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, noSend); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadStandaloneOutbox(context.Background(), session, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Record.DeliveryState != TerminalStatusDeadLetter {
+		t.Fatalf("delivery=%q, want dead_letter", loaded.Record.DeliveryState)
+	}
+	if _, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, noSend); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadStandaloneOutbox(context.Background(), session, 1); err != nil {
+		t.Fatalf("dead-letter record pruned inside its retention window: %v", err)
+	}
+	clock.now = clock.now.Add(StandaloneOutboxRetention + time.Hour)
+	if _, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, noSend); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadStandaloneOutbox(context.Background(), session, 1); !errors.Is(err, ErrTerminalStatusNotFound) {
+		t.Fatalf("dead-letter record not pruned past retention: %v", err)
+	}
+}

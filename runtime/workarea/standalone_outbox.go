@@ -177,6 +177,12 @@ const StandaloneOutboxDeadline = 7 * 24 * time.Hour
 // file quarantines there instead of failing the whole scan: without it one
 // bad file blocks every good record (no sends at all) and fails the store
 // open, which fails daemon start and worker preflight.
+// errStandaloneOutboxUnreadable marks a record whose bytes could not be
+// read at all (a permission, descriptor, or I/O failure). Nothing is known
+// about its contents, so the scan skips it for this pass and retries on the
+// next one; only bytes that were read and failed to decode quarantine.
+var errStandaloneOutboxUnreadable = errors.New("standalone outbox record unreadable")
+
 func (s *LeaseStore) standaloneOutboxQuarantineDir() string {
 	return filepath.Join(s.dir, "standalone-outbox-quarantine")
 }
@@ -206,6 +212,11 @@ func (s *LeaseStore) quarantineStandaloneOutboxFile(name, reason string) error {
 	src := filepath.Join(s.standaloneOutboxDir(), name)
 	dst := s.standaloneOutboxQuarantinePath(fmt.Sprintf("%s.%d.quarantined", name, s.now().UnixMilli()))
 	if err := os.Rename(src, dst); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// A concurrent scan in another store handle already moved
+			// or pruned the file: nothing is left to quarantine.
+			return nil
+		}
 		return fmt.Errorf("runtime/workarea: quarantine standalone outbox %s (%s): %w", name, reason, err)
 	}
 	if err := syncDir(s.standaloneOutboxDir()); err != nil {
@@ -552,8 +563,14 @@ func (s *LeaseStore) markStandaloneOutboxDeadLetter(ctx context.Context, key, me
 	})
 }
 
+// isStandaloneOutboxKey reports whether key has the shape
+// StandaloneOutboxKey produces.
+func isStandaloneOutboxKey(key string) bool {
+	return strings.HasPrefix(key, "txo_") && len(key) == len("txo_")+32
+}
+
 func (s *LeaseStore) loadStandaloneOutbox(key string) (*standaloneOutboxEnvelope, error) {
-	if !strings.HasPrefix(key, "txo_") || len(key) != len("txo_")+32 {
+	if !isStandaloneOutboxKey(key) {
 		return nil, ErrTerminalStatusNotFound
 	}
 	data, err := s.readFile(s.standaloneOutboxPath(key))
@@ -561,7 +578,7 @@ func (s *LeaseStore) loadStandaloneOutbox(key string) (*standaloneOutboxEnvelope
 		return nil, ErrTerminalStatusNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("runtime/workarea: read standalone outbox %s: %w", key, err)
+		return nil, fmt.Errorf("runtime/workarea: read standalone outbox %s: %w: %w", key, errStandaloneOutboxUnreadable, err)
 	}
 	var envelope standaloneOutboxEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
@@ -631,16 +648,23 @@ func (s *LeaseStore) scanStandaloneOutbox(prune bool) ([]standaloneOutboxEnvelop
 		key := strings.TrimSuffix(entry.Name(), ".json")
 		envelope, err := s.loadStandaloneOutbox(key)
 		if err != nil {
-			if errors.Is(err, ErrTerminalStatusNotFound) {
-				// A filename that is not an outbox key (a stray file
-				// dropped in the directory) quarantines like a
-				// corrupt record: it is not addressable, so no
-				// sender will ever drain it.
-				if qErr := s.quarantineStandaloneOutboxFile(entry.Name(), err.Error()); qErr != nil {
-					return nil, qErr
-				}
+			if errors.Is(err, errStandaloneOutboxUnreadable) {
+				// A read failure says nothing about the record: it
+				// may be a valid undelivered terminal. Quarantining
+				// it would strand that terminal for good, so skip it
+				// this pass and let the next pass read it again.
 				continue
 			}
+			if errors.Is(err, ErrTerminalStatusNotFound) && isStandaloneOutboxKey(key) {
+				// The file vanished between the directory read and
+				// the load (a concurrent prune or quarantine in
+				// another store handle): nothing to do.
+				continue
+			}
+			// Bytes that fail to decode, and a filename that is not
+			// an outbox key (a stray file dropped in the directory),
+			// quarantine: neither is addressable, so no sender will
+			// ever drain them.
 			if qErr := s.quarantineStandaloneOutboxFile(entry.Name(), err.Error()); qErr != nil {
 				return nil, qErr
 			}
@@ -649,6 +673,14 @@ func (s *LeaseStore) scanStandaloneOutbox(prune bool) ([]standaloneOutboxEnvelop
 		if prune && (envelope.Record.DeliveryState == TerminalStatusDelivered ||
 			envelope.Record.DeliveryState == TerminalStatusDeadLetter) {
 			settledMS := envelope.Record.NextAttemptAt.UnixMilli()
+			if envelope.Record.DeliveryState == TerminalStatusDeadLetter {
+				// A dead-letter transition does not advance
+				// NextAttemptAt, which can sit days in the past.
+				// Measure its retention from the deadline that
+				// dead-lettered it, so the record of an undelivered
+				// terminal stays readable for the full window.
+				settledMS = max(settledMS, envelope.Record.DeadlineAt.UnixMilli())
+			}
 			if nowMS-settledMS >= StandaloneOutboxRetention.Milliseconds() {
 				if err := os.Remove(s.standaloneOutboxPath(envelope.OutboxKey)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return nil, fmt.Errorf("runtime/workarea: prune standalone outbox %s: %w", envelope.OutboxKey, err)
