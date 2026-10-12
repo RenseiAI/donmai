@@ -166,5 +166,3 @@ func (d *Daemon) shimResumeEvidence(sessionID string) (*bool, bool) {
 func (d *Daemon) seatStateSummary() seatstate.Summary {
 	return seatstate.Summarize(d.seatStates())
 }
-
-var _ = time.Now

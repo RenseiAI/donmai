@@ -64,7 +64,10 @@ type SeatReport struct {
 //     a dead identity without terminal proof is still exited (the identity
 //     proof is positive: pid + start time gone); a readable registry with
 //     no record is absent. Anything else is unknown.
-//   - Activity axis: DecideActivity over the ranked evidence.
+//   - Activity axis: DecideActivity over the ranked evidence — unless the
+//     session axis proves the seat exited or absent. A seat with no live
+//     process has no current activity: any vote describes an earlier
+//     incarnation, so the evidence is dropped and the report says unknown.
 //   - Resumability axis: a readable artifact is resumable; positive
 //     absence is fresh_only; anything else is unknown.
 func Report(sessionID string, in ProbeInput) SeatReport {
@@ -73,7 +76,11 @@ func Report(sessionID string, in ProbeInput) SeatReport {
 		Resumability: decideResumability(in),
 		NeedsInput:   in.NeedsInput,
 	}
-	verdict := DecideActivity(in.Activity)
+	evidence := in.Activity
+	if state.Session == SessionExited || state.Session == SessionAbsent {
+		evidence = nil
+	}
+	verdict := DecideActivity(evidence)
 	state.Activity = verdict.Activity
 	state.DecidedBy = string(verdict.DecidedBy)
 	out := SeatReport{SessionID: strings.TrimSpace(sessionID), State: state}

@@ -1,6 +1,7 @@
 package seatstate
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -166,5 +167,78 @@ func TestSummarize_CountsEverySeat(t *testing.T) {
 	}
 	if empty.Session != (SessionSummary{}) || empty.Activity != (ActivitySummary{}) || empty.Resumability != (ResumeSummary{}) {
 		t.Fatalf("empty summarize buckets = %+v %+v %+v, want zero", empty.Session, empty.Activity, empty.Resumability)
+	}
+}
+
+// TestReport_DeadOrAbsentSeatReportsNoActivity pins the staleness rule: a
+// seat whose process is proved gone (dead identity or terminal proof) or
+// that was never on this host carries no current activity, whatever the
+// evidence says — the vote describes an earlier incarnation. A live seat,
+// or one whose liveness is merely unknown, keeps its arbitrated vote.
+func TestReport_DeadOrAbsentSeatReportsNoActivity(t *testing.T) {
+	alive, dead := true, false
+	bound, unbound := true, false
+	idle := []ActivityEvidence{ConclusiveVote(RungVisiblePrompt, ActivityIdleAtPrompt)}
+	working := []ActivityEvidence{ConclusiveVote(RungHarnessReport, ActivityWorking)}
+	cases := []struct {
+		name         string
+		input        ProbeInput
+		wantActivity ActivityState
+		wantRung     EvidenceRung
+	}{
+		{"dead identity drops a prompt vote", ProbeInput{ProcessAlive: &dead, SupervisorBound: &dead, Activity: idle}, ActivityUnknown, RungNone},
+		{"terminal proof drops a self-report", ProbeInput{TerminalProof: true, Activity: working}, ActivityUnknown, RungNone},
+		{"terminal proof over a live read drops the vote", ProbeInput{ProcessAlive: &alive, SupervisorBound: &bound, TerminalProof: true, Activity: working}, ActivityUnknown, RungNone},
+		{"absent seat drops the vote", ProbeInput{RegistryReadable: true, Activity: idle}, ActivityUnknown, RungNone},
+		{"present seat keeps its vote", ProbeInput{ProcessAlive: &alive, SupervisorBound: &bound, Activity: working}, ActivityWorking, RungHarnessReport},
+		{"detached seat keeps its vote", ProbeInput{ProcessAlive: &alive, SupervisorBound: &unbound, Activity: idle}, ActivityIdleAtPrompt, RungVisiblePrompt},
+		{"unknown liveness keeps its vote", ProbeInput{RegistryReadable: true, SeatKnown: true, Activity: idle}, ActivityIdleAtPrompt, RungVisiblePrompt},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Report("sess", tc.input)
+			if got.State.Activity != tc.wantActivity || got.State.DecidedBy != string(tc.wantRung) {
+				t.Fatalf("activity = %q decidedBy = %q, want %q / %q", got.State.Activity, got.State.DecidedBy, tc.wantActivity, tc.wantRung)
+			}
+			if !got.State.Valid() {
+				t.Fatalf("report %+v is not valid", got.State)
+			}
+		})
+	}
+}
+
+// TestSeatReport_WireGolden pins the heartbeat wire bytes for one seat and
+// its summary fold. Round-tripping through the same Go type cannot catch a
+// renamed tag; these literals can.
+func TestSeatReport_WireGolden(t *testing.T) {
+	alive, bound := true, true
+	when := time.Date(2026, 10, 12, 7, 0, 0, 0, time.UTC)
+	full := Report("sess-a", ProbeInput{
+		ProcessAlive: &alive, SupervisorBound: &bound, RegistryReadable: true, SeatKnown: true,
+		Activity:               []ActivityEvidence{ConclusiveVote(RungHarnessReport, ActivityWorking)},
+		NeedsInput:             NeedsInput{Count: 1, Reason: "approval"},
+		ResumeArtifactReadable: &alive,
+		ObservedAt:             when,
+	})
+	bare := Report("sess-b", ProbeInput{})
+	cases := []struct {
+		name string
+		v    any
+		want string
+	}{
+		{"full seat", full, `{"sessionId":"sess-a","state":{"session":"present","activity":"working","decidedBy":"harness_report","resumability":"resumable","needsInput":{"count":1,"reason":"approval"}},"observedAt":"2026-10-12T07:00:00Z"}`},
+		{"bare seat", bare, `{"sessionId":"sess-b","state":{"session":"unknown","activity":"unknown","decidedBy":"none","resumability":"unknown","needsInput":{}}}`},
+		{"summary", Summarize([]SeatReport{full, bare}), `{"total":2,"session":{"present":1,"detached":0,"exited":0,"absent":0,"unknown":1},"activity":{"working":1,"idleAtPrompt":0,"unknown":1},"resumability":{"resumable":1,"freshOnly":0,"unknown":1},"needsInput":1}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := json.Marshal(tc.v)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("wire bytes drifted\n got: %s\nwant: %s", got, tc.want)
+			}
+		})
 	}
 }
