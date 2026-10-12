@@ -349,8 +349,12 @@ const stubPi = {
     providers.push({ name, config });
   },
   registerTool() {},
+  // pi's real loader APPENDS every handler per event (a list per event
+  // name), so the stub records the same list shape instead of keeping only
+  // the last handler — the trim rail registers its tool_result handler in
+  // every lane before the lane-specific tool_call handler.
   on(event, handler) {
-    handlers[event] = handler;
+    handlers[event] = [...(handlers[event] ?? []), handler];
   },
 };
 
@@ -369,7 +373,12 @@ for (const name of (process.env.HARNESS_REPORT_ENV ?? "").split(",")) {
   if (name) environment[name] = process.env[name] ?? null;
 }
 
-const handler = handlers["tool_call"];
+// The lane's tool_call fence is its LAST tool_call handler (the trim rail
+// registers its tool_result handler first, then the lane-specific tool_call
+// handler); drive exactly that one, so the verdict below observes the
+// fence rather than an unrelated earlier registration.
+const toolCallHandlers = handlers["tool_call"] ?? [];
+const handler = toolCallHandlers[toolCallHandlers.length - 1];
 if (!handler) {
   console.log(JSON.stringify({ registered: false, verdict: null, providers, environment }));
   process.exit(0);

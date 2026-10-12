@@ -190,11 +190,20 @@ func runExtensionFixtureWithCtx(t *testing.T, env []string, toolName, inputJSON,
 		args = append(args, ctxJSON)
 	}
 	cmd := exec.Command("node", args...) //nolint:gosec // G204: fixed test-only harness path + node binary resolved from PATH; args are constants and this test's own JSON literals.
-	cmd.Env = append(os.Environ(), env...)
-	// DONMAI_PI_HANDSHAKE deliberately absent from cmd.Env beyond whatever the
-	// test process itself has (none, in CI) — the interactive lane never sets
-	// it, and this harness's job is to prove behavior under that exact
-	// absence.
+	// The interactive lane never sets the handshake token, and this harness's
+	// job is to prove behavior under that exact absence — so scrub it from
+	// the inherited environment rather than appending to it: a seat running
+	// these tests may itself carry the token, which would flip the extension
+	// into its RPC lane and fail every interactive expectation closed.
+	filtered := make([]string, 0, len(os.Environ())+len(env))
+	for _, entry := range os.Environ() {
+		if entry == piHandshakeEnvVar || strings.HasPrefix(entry, piHandshakeEnvVar+"=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	filtered = append(filtered, env...)
+	cmd.Env = filtered
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

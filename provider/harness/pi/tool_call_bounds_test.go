@@ -31,6 +31,22 @@ import (
 	"testing"
 )
 
+// scrubHandshakeTokenFromEnv returns env without the harness handshake token:
+// these scripted fixtures drive the extension's lanes directly, and a token
+// inherited from the seat running the tests would flip the activation into
+// the wrong lane. Shared by this file's fixture and the tool-result-trim
+// fixture.
+func scrubHandshakeTokenFromEnv(env []string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		if entry == piHandshakeEnvVar || strings.HasPrefix(entry, piHandshakeEnvVar+"=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
 // toolCallBoundsFixture runs testdata/tool-call-bounds-harness.mjs against
 // the REAL production extensions/donmai-policy.ts and returns the harness's
 // JSON report (timeout cases + prelude cases).
@@ -48,7 +64,7 @@ func toolCallBoundsFixture(t *testing.T) map[string]any {
 	}
 
 	cmd := exec.Command("node", harness, extPath) //nolint:gosec // G204: fixed test-only harness path + node binary resolved from PATH; args are constants.
-	cmd.Env = os.Environ()
+	cmd.Env = scrubHandshakeTokenFromEnv(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -211,7 +227,7 @@ func TestToolCallBounds_SequentialOverridesLayerUnderTheFence(t *testing.T) {
 	if len(report.UnresolvedHost.Tools) != 0 {
 		t.Errorf("unresolved host package still registered tools: %+v", report.UnresolvedHost.Tools)
 	}
-	if want := []string{"on:session_start", "on:tool_call"}; !slices.Equal(report.UnresolvedHost.Sequence, want) {
+	if want := []string{"on:tool_result", "on:session_start", "on:tool_call"}; !slices.Equal(report.UnresolvedHost.Sequence, want) {
 		t.Errorf("unresolved host package: handlers %q, want the fence %q", report.UnresolvedHost.Sequence, want)
 	}
 

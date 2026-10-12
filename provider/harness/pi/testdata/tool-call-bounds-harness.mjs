@@ -361,9 +361,13 @@ async function activateLane(module, handshakeToken) {
       sequence.push("tool:" + definition.name);
       tools.push(definition);
     },
+    // pi's real loader APPENDS every handler per event (loader.js: a list
+    // per event name), so the stub records the same list shape instead of
+    // keeping only the last handler — otherwise a second registration for
+    // an already-covered event would silently drop the first.
     on(event, handler) {
       sequence.push("on:" + event);
-      handlers[event] = handler;
+      handlers[event] = [...(handlers[event] ?? []), handler];
     },
   };
   await module.default(stubPi);
@@ -426,7 +430,11 @@ const sequential = {
 // { block: boolean, reason: string|null }.
 async function probeFenceWhileUnverified(lane) {
   const out = {};
-  const handler = lane.handlers["tool_call"];
+  const handlers = lane.handlers["tool_call"] ?? [];
+  // The adjudication fence is the lane's LAST tool_call handler (the trim
+  // rail registers its tool_result handler first, then the lane-specific
+  // tool_call handler); drive exactly that one.
+  const handler = handlers[handlers.length - 1];
   for (const tool of ["bash", "write", "edit"]) {
     if (typeof handler !== "function") {
       out[tool] = { block: false, reason: "no tool_call handler registered" };
