@@ -95,7 +95,7 @@ var failureMatrix = []failureCase{
 		name:  "harness-finishes-while-daemon-down-post-fails",
 		want:  "outbox pending and the new daemon replays the exact bytes once and a forced second replay returns the original receipt",
 		local: true, requiresAdoption: true,
-		driver: "TestReceiverPendingReplay",
+		driver:   "TestReceiverPendingReplay",
 		liveHalf: "pending-replay-behind-outage",
 	},
 	{
@@ -132,14 +132,14 @@ var failureMatrix = []failureCase{
 		name:  "bearer-expires-while-no-daemon-runs",
 		want:  "the lease fuse ends the seat as lost-ownership with its outbox record and tombstone and nothing released without terminal evidence",
 		local: true, requiresAdoption: true,
-		driver: "TestBearerExpiresWhileNoDaemonRuns",
+		driver:   "TestBearerExpiresWhileNoDaemonRuns",
 		liveHalf: "lease-fuse-behind-outage",
 	},
 	{
 		name:  "daemon-returns-before-bearer-expires",
 		want:  "the pushed credential update arrives before the old bearer lapses and the lease never misses a tick",
 		local: true, requiresAdoption: true,
-		driver: "TestDaemonReturnsBeforeBearerExpires",
+		driver:   "TestDaemonReturnsBeforeBearerExpires",
 		liveHalf: "credential-push-behind-outage",
 	},
 	{

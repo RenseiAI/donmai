@@ -98,8 +98,8 @@ func resumeFakeHarness(ctx context.Context, provider *pi.Provider, dir, sessionI
 // headless seats, and the lane must hear that as loudly as a flipped
 // rule.
 type adoptionProbeResult struct {
-	ownsHeadless      bool
-	ownsControl       bool
+	ownsHeadless       bool
+	ownsControl        bool
 	compositionPending bool
 	ownershipEnabled   bool
 	adoptionEnabled    bool
