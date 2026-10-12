@@ -123,6 +123,53 @@ func TestInteractiveTranscriptTailSweep_MapsTurnsToolsAndResultsInOrder(t *testi
 	}
 }
 
+// TestInteractiveTranscriptTail_ToolResultNestedUsage pins the
+// ToolResultMessage.usage shape on the interactive tail: a toolResult line
+// carrying nested LLM usage (a subagent run the tool performed) surfaces
+// that spend as its own per-call event behind the ToolResultEvent, with
+// cache reads and writes in their own buckets. A result without usage, or
+// with all-zero usage, maps to the tool result alone.
+func TestInteractiveTranscriptTail_ToolResultNestedUsage(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tailer := newInteractiveTranscriptTailer(dir)
+	path := filepath.Join(dir, "sess.jsonl")
+	writeTranscriptLine(t, path, transcriptMessage("m-res-nested", map[string]any{
+		"role": "toolResult", "toolCallId": "call-9", "toolName": "task",
+		"content": []any{map[string]any{"type": "text", "text": "subagent done"}},
+		"isError": false,
+		"usage":   map[string]any{"input": 20, "output": 5, "cacheRead": 9000, "cacheWrite": 400, "cost": map[string]any{"total": 0.005}},
+	}))
+	writeTranscriptLine(t, path, transcriptMessage("m-res-plain", map[string]any{
+		"role": "toolResult", "toolCallId": "call-10", "toolName": "bash",
+		"content": []any{map[string]any{"type": "text", "text": "ok"}}, "isError": false,
+	}))
+
+	events, _ := tailer.sweep()
+	if len(events) != 3 {
+		t.Fatalf("events = %d; want ToolResult + LlmCall + ToolResult", len(events))
+	}
+	if _, ok := events[0].(agent.ToolResultEvent); !ok {
+		t.Fatalf("events[0] = %T; want ToolResultEvent", events[0])
+	}
+	llm, ok := events[1].(agent.LlmCallEvent)
+	if !ok {
+		t.Fatalf("events[1] = %T; want the nested-usage LlmCallEvent", events[1])
+	}
+	if llm.InputTokens != 20 || llm.OutputTokens != 5 || llm.CachedInputTokens != 9000 || llm.CacheWriteTokens != 400 {
+		t.Errorf("nested usage = %+v; want 20/5/9000/400", llm)
+	}
+	if llm.ObservedCostUsd == nil || *llm.ObservedCostUsd != 0.005 {
+		t.Errorf("nested cost = %+v; want 0.005", llm.ObservedCostUsd)
+	}
+	if llm.TurnCompleted {
+		t.Error("nested call TurnCompleted=true; only the turn's own call completes it")
+	}
+	if _, ok := events[2].(agent.ToolResultEvent); !ok {
+		t.Fatalf("events[2] = %T; want ToolResultEvent", events[2])
+	}
+}
+
 // TestInteractiveTranscriptTail_IgnoresNonMessageLines pins the negative
 // space: session metadata, unknown types, and malformed lines map to nothing.
 func TestInteractiveTranscriptTail_IgnoresNonMessageLines(t *testing.T) {

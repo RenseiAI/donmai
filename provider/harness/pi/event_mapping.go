@@ -163,13 +163,24 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		}}, false
 
 	case "tool_execution_end":
-		return []agent.Event{agent.ToolResultEvent{
+		out := []agent.Event{agent.ToolResultEvent{
 			ToolName:  stringField(f, "toolName", "tool", "name"),
 			ToolUseID: toolCallID(f),
 			Content:   toolResultContent(f),
 			IsError:   boolField(f, "isError", "error"),
 			Raw:       raw(ev),
-		}}, false
+		}}
+		// A tool result can carry nested LLM usage of its own
+		// (ToolResultMessage.usage — e.g. a subagent run, a compaction
+		// or branch summary the tool performed). pi's own session totals
+		// (get_session_stats) count it alongside the turn's assistant
+		// usage, so the mapper must too: fold it into the session
+		// accumulators and surface it as its own per-call event, or the
+		// session's reported spend silently drops it.
+		if call, ok := toolResultUsage(f, st); ok {
+			out = append(out, call)
+		}
+		return out, false
 
 	case "turn_end":
 		// Per-turn usage rides message.usage (AssistantMessage). Accumulate it
@@ -183,10 +194,6 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		outTok := intField(usage, "output", "outputTokens")
 		cacheRead := intField(usage, "cacheRead", "cacheReadTokens")
 		cacheWrite := intField(usage, "cacheWrite", "cacheWriteTokens")
-		st.accInputTokens += in
-		st.accOutputTokens += outTok
-		st.accCachedInputTokens += cacheRead
-		st.accCacheWriteTokens += cacheWrite
 		cost := observedPiCost(mapField(usage, "cost"))
 		// On an unpriced injected lane the zero cost pi reports comes
 		// from the registered zero cost table, not a real price: drop it
@@ -194,21 +201,8 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		if st.suppressCost {
 			cost = nil
 		}
-		if st.accTurns == 0 {
-			st.allTurnCostsObserved = true
-		}
-		if cost == nil {
-			st.allTurnCostsObserved = false
-		} else {
-			next := st.accCostUSD + *cost
-			if math.IsInf(next, 0) {
-				st.allTurnCostsObserved = false
-			} else {
-				st.accCostUSD = next
-			}
-		}
-		st.accTurns++
-		return []agent.Event{agent.LlmCallEvent{
+		st.accumulateUsage(in, outTok, cacheRead, cacheWrite, cost)
+		out := []agent.Event{agent.LlmCallEvent{
 			System: stringField(msg, "provider", "system"),
 			Model:  stringField(msg, "model"),
 			// Pi pre-fills provider/model from its selected catalog entry.
@@ -221,7 +215,23 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			UsageSource:       agent.LlmUsageProvider,
 			ObservedCostUsd:   cost,
 			TurnCompleted:     true,
-		}}, false
+		}}
+		// A turn's tool results can carry nested LLM usage of their own
+		// (ToolResultMessage.usage — e.g. a subagent run the tool
+		// performed). pi's own session totals (get_session_stats) count it
+		// alongside the assistant usage, so each one surfaces as its own
+		// per-call event and folds into the session accumulators; without
+		// this the session's reported spend silently drops it.
+		if results, ok := f["toolResults"].([]any); ok {
+			for _, r := range results {
+				if m, ok := r.(map[string]any); ok {
+					if call, ok := nestedToolUsage(m, st); ok {
+						out = append(out, call)
+					}
+				}
+			}
+		}
+		return out, false
 
 	case "agent_end":
 		// NOT terminal in the real protocol: a low-level run completed but retry,
@@ -322,6 +332,79 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		}
 		return []agent.Event{agent.SystemEvent{Subtype: ev.Type, Raw: raw(ev)}}, false
 	}
+}
+
+// accumulateUsage folds one usage observation into the session accumulators:
+// every token class pi reports (input, output, cache reads, cache writes)
+// plus the observed dollar cost. A nil cost marks the session's dollar
+// total as unobserved without touching the token counts. Every call counts
+// as one turn of spend; turn_end callers pass the turn's own usage while
+// nested-usage callers pass one tool result's.
+func (st *mapperState) accumulateUsage(in, outTok, cacheRead, cacheWrite int64, cost *float64) {
+	st.accInputTokens += in
+	st.accOutputTokens += outTok
+	st.accCachedInputTokens += cacheRead
+	st.accCacheWriteTokens += cacheWrite
+	if st.accTurns == 0 {
+		st.allTurnCostsObserved = true
+	}
+	if cost == nil {
+		st.allTurnCostsObserved = false
+	} else {
+		next := st.accCostUSD + *cost
+		if math.IsInf(next, 0) {
+			st.allTurnCostsObserved = false
+		} else {
+			st.accCostUSD = next
+		}
+	}
+	st.accTurns++
+}
+
+// toolResultUsage maps the nested LLM usage a tool_execution_end result can
+// carry (ToolResultMessage.usage — e.g. a subagent run, a compaction or
+// branch summary the tool performed) onto a per-call LlmCallEvent and folds
+// it into the session accumulators. ok is false when the result carries no
+// usage: an ordinary tool result with no nested model work contributes no
+// spend and maps to nothing. A nested usage that is all zero likewise maps
+// to nothing — there is no spend to report.
+func toolResultUsage(f map[string]any, st *mapperState) (agent.LlmCallEvent, bool) {
+	result := mapField(f, "result")
+	usage, ok := result["usage"].(map[string]any)
+	if !ok || len(usage) == 0 {
+		return agent.LlmCallEvent{}, false
+	}
+	return nestedToolUsage(map[string]any{"usage": usage}, st)
+}
+
+// nestedToolUsage maps one tool-result-shaped object carrying a "usage"
+// member in pi's own shape ({input, output, cacheRead, cacheWrite} with
+// input already excluding both cache classes — the same shape the turn_end
+// mapper reads) onto a per-call LlmCallEvent, folding it into the session
+// accumulators. ok is false when the object carries no usage or its usage
+// is all zero: there is no spend to report.
+func nestedToolUsage(obj map[string]any, st *mapperState) (agent.LlmCallEvent, bool) {
+	usage := mapField(obj, "usage")
+	in := intField(usage, "input", "inputTokens")
+	outTok := intField(usage, "output", "outputTokens")
+	cacheRead := intField(usage, "cacheRead", "cacheReadTokens")
+	cacheWrite := intField(usage, "cacheWrite", "cacheWriteTokens")
+	if in == 0 && outTok == 0 && cacheRead == 0 && cacheWrite == 0 {
+		return agent.LlmCallEvent{}, false
+	}
+	cost := observedPiCost(mapField(usage, "cost"))
+	if st.suppressCost {
+		cost = nil
+	}
+	st.accumulateUsage(in, outTok, cacheRead, cacheWrite, cost)
+	return agent.LlmCallEvent{
+		InputTokens:       in,
+		OutputTokens:      outTok,
+		CachedInputTokens: cacheRead,
+		CacheWriteTokens:  cacheWrite,
+		UsageSource:       agent.LlmUsageProvider,
+		ObservedCostUsd:   cost,
+	}, true
 }
 
 func observedPiCost(cost map[string]any) *float64 {

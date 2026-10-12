@@ -417,6 +417,196 @@ func TestMapEvent_TurnEndCacheBuckets(t *testing.T) {
 	}
 }
 
+// TestMapEvent_ToolResultNestedUsage pins the ToolResultMessage.usage shape:
+// a tool_execution_end whose result carries nested LLM usage (a subagent
+// run, a compaction or branch summary the tool performed) surfaces that
+// spend as its own per-call LlmCallEvent behind the ToolResultEvent, and
+// folds it into the terminal Cost. pi's own session totals
+// (get_session_stats) count this usage alongside the turn's assistant
+// usage; before this mapping the result's usage was never read, so every
+// cache token a nested run spent — reads and writes alike — was dropped
+// before the runner, the budget meter and the status post.
+func TestMapEvent_ToolResultNestedUsage(t *testing.T) {
+	t.Parallel()
+
+	toolEnd := func(result map[string]any) rawEvent {
+		return rawEvent{Type: "tool_execution_end", Fields: map[string]any{
+			"toolName": "task", "toolCallId": "call-1", "result": result,
+		}}
+	}
+	turnEnd := func(usage map[string]any) rawEvent {
+		return rawEvent{Type: "turn_end", Fields: map[string]any{
+			"message": map[string]any{"role": "assistant", "usage": usage},
+		}}
+	}
+	type usage = map[string]any
+	tests := []struct {
+		name string
+		// events fed through one mapperState, in order
+		feeds []rawEvent
+		// wantCalls are the LlmCallEvents in emitted order (turn usage
+		// first, then one per nested result usage)
+		wantCalls []agent.LlmCallEvent
+		wantCost  agent.CostData
+	}{
+		{
+			name: "nested cache reads and writes ride their own buckets",
+			feeds: []rawEvent{
+				turnEnd(usage{"input": float64(100), "output": float64(10), "cacheRead": float64(1000), "cacheWrite": float64(50), "cost": usage{"total": 0.01}}),
+				toolEnd(map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "done"}},
+					"usage":   usage{"input": float64(20), "output": float64(5), "cacheRead": float64(9000), "cacheWrite": float64(400), "cost": usage{"total": 0.005}},
+				}),
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 100, OutputTokens: 10, CachedInputTokens: 1000, CacheWriteTokens: 50},
+				{InputTokens: 20, OutputTokens: 5, CachedInputTokens: 9000, CacheWriteTokens: 400},
+			},
+			wantCost: agent.CostData{InputTokens: 120, OutputTokens: 15, CachedInputTokens: 10000, CacheWriteTokens: 450, TotalCostUsd: 0.015, NumTurns: 2},
+		},
+		{
+			name: "a result without nested usage emits no call",
+			feeds: []rawEvent{
+				turnEnd(usage{"input": float64(3), "output": float64(2)}),
+				toolEnd(map[string]any{"content": []any{map[string]any{"type": "text", "text": "ok"}}}),
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 3, OutputTokens: 2},
+			},
+			wantCost: agent.CostData{InputTokens: 3, OutputTokens: 2, NumTurns: 1},
+		},
+		{
+			name: "an all-zero nested usage emits no call",
+			feeds: []rawEvent{
+				turnEnd(usage{"input": float64(3), "output": float64(2)}),
+				toolEnd(map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "ok"}},
+					"usage":   usage{"input": float64(0), "output": float64(0), "cacheRead": float64(0), "cacheWrite": float64(0)},
+				}),
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 3, OutputTokens: 2},
+			},
+			wantCost: agent.CostData{InputTokens: 3, OutputTokens: 2, NumTurns: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st := &mapperState{}
+			var calls []agent.LlmCallEvent
+			for i, feed := range tt.feeds {
+				events, terminal := mapEvent(feed, st)
+				if terminal {
+					t.Fatalf("feed %d: terminal=true; neither turn_end nor tool_execution_end ends the turn", i)
+				}
+				for _, ev := range events {
+					if call, ok := ev.(agent.LlmCallEvent); ok {
+						calls = append(calls, call)
+					}
+				}
+			}
+			if len(calls) != len(tt.wantCalls) {
+				t.Fatalf("calls = %+v; want %+v", calls, tt.wantCalls)
+			}
+			for i := range calls {
+				want := tt.wantCalls[i]
+				got := calls[i]
+				if got.InputTokens != want.InputTokens || got.OutputTokens != want.OutputTokens ||
+					got.CachedInputTokens != want.CachedInputTokens || got.CacheWriteTokens != want.CacheWriteTokens {
+					t.Errorf("call %d = %+v; want %+v", i, got, want)
+				}
+			}
+			events, terminal := mapEvent(rawEvent{Type: "agent_settled", Fields: map[string]any{}}, st)
+			if !terminal || len(events) != 1 {
+				t.Fatalf("settle: terminal=%v events=%d; want one terminal event", terminal, len(events))
+			}
+			res, ok := events[0].(agent.ResultEvent)
+			if !ok || res.Cost == nil {
+				t.Fatalf("settle: %#v; want a ResultEvent carrying Cost", events[0])
+			}
+			got := *res.Cost
+			if diff := got.TotalCostUsd - tt.wantCost.TotalCostUsd; diff > 1e-12 || diff < -1e-12 {
+				t.Errorf("terminal TotalCostUsd = %v; want %v", got.TotalCostUsd, tt.wantCost.TotalCostUsd)
+			}
+			got.TotalCostUsd = tt.wantCost.TotalCostUsd
+			if got != tt.wantCost {
+				t.Errorf("terminal Cost = %+v; want %+v", got, tt.wantCost)
+			}
+		})
+	}
+}
+
+// TestMapEvent_TurnEndToolResultsUsage pins the turn_end.toolResults shape:
+// the turn_end event carries the turn's tool results alongside the assistant
+// message, and any result carrying nested LLM usage (ToolResultMessage.usage
+// — a subagent run the tool performed) surfaces as its own per-call event
+// and folds into the terminal Cost. Same spend class as
+// TestMapEvent_ToolResultNestedUsage, observed on the turn envelope rather
+// than the live tool_execution_end line.
+func TestMapEvent_TurnEndToolResultsUsage(t *testing.T) {
+	t.Parallel()
+
+	st := &mapperState{}
+	events, terminal := mapEvent(rawEvent{Type: "turn_end", Fields: map[string]any{
+		"message": map[string]any{"role": "assistant", "usage": map[string]any{
+			"input": float64(100), "output": float64(10),
+			"cacheRead": float64(1000), "cacheWrite": float64(50),
+			"cost":      map[string]any{"total": 0.01},
+		}},
+		"toolResults": []any{
+			map[string]any{
+				"role": "toolResult", "toolCallId": "call-1", "toolName": "task",
+				"usage": map[string]any{
+					"input": float64(20), "output": float64(5),
+					"cacheRead": float64(9000), "cacheWrite": float64(400),
+					"cost":      map[string]any{"total": 0.005},
+				},
+			},
+			map[string]any{
+				"role": "toolResult", "toolCallId": "call-2", "toolName": "bash",
+				"content": []any{map[string]any{"type": "text", "text": "ok"}},
+				// No usage: an ordinary result contributes no spend.
+			},
+		},
+	}}, st)
+	if terminal {
+		t.Fatal("terminal=true; turn_end never ends the turn")
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %d; want the turn call plus one nested-usage call", len(events))
+	}
+	turn, ok := events[0].(agent.LlmCallEvent)
+	if !ok || turn.InputTokens != 100 || turn.CachedInputTokens != 1000 || turn.CacheWriteTokens != 50 {
+		t.Fatalf("turn call = %+v; want the assistant usage", events[0])
+	}
+	nested, ok := events[1].(agent.LlmCallEvent)
+	if !ok || nested.InputTokens != 20 || nested.CachedInputTokens != 9000 || nested.CacheWriteTokens != 400 {
+		t.Fatalf("nested call = %+v; want the tool result usage", events[1])
+	}
+	if nested.TurnCompleted {
+		t.Error("nested call TurnCompleted=true; only the turn's own call completes it")
+	}
+
+	settled, terminal := mapEvent(rawEvent{Type: "agent_settled", Fields: map[string]any{}}, st)
+	if !terminal || len(settled) != 1 {
+		t.Fatalf("settle: terminal=%v events=%d; want one terminal event", terminal, len(settled))
+	}
+	res, ok := settled[0].(agent.ResultEvent)
+	if !ok || res.Cost == nil {
+		t.Fatalf("settle: %#v; want a ResultEvent carrying Cost", settled[0])
+	}
+	want := agent.CostData{InputTokens: 120, OutputTokens: 15, CachedInputTokens: 10000, CacheWriteTokens: 450, TotalCostUsd: 0.015, NumTurns: 2}
+	got := *res.Cost
+	if diff := got.TotalCostUsd - want.TotalCostUsd; diff > 1e-12 || diff < -1e-12 {
+		t.Fatalf("terminal TotalCostUsd = %v; want %v", got.TotalCostUsd, want.TotalCostUsd)
+	}
+	got.TotalCostUsd = want.TotalCostUsd
+	if got != want {
+		t.Fatalf("terminal Cost = %+v; want %+v", got, want)
+	}
+}
+
 // TestMapEvent_CompactionEndEmitsContextUsageNotice pins the pi leg of the
 // typed context notice: a native compaction_end event (real RPC shape, per
 // the RPC reference) emits the observability SystemEvent AND the
