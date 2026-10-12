@@ -142,3 +142,106 @@ func TestWriteDaemonYAMLWithCapacity_RepoKeeperKeys(t *testing.T) {
 		})
 	}
 }
+
+// TestDependencyKeeperYAML_RoundTrip proves the dependencyKeeper.* and
+// retention.* settings travel from daemon.yaml through ReadDaemonYAML
+// into the struct and back through WriteDaemonYAML with no loss.
+func TestDependencyKeeperYAML_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	original := "machine:\n    id: depkeeper-test\n" +
+		"capacity:\n    maxConcurrentSessions: 2\n" +
+		"dependencyKeeper:\n    enabled: true\n    maxDiskGb: 5\n    compactionWindowDays: 21\n" +
+		"retention:\n    maxDiskGb: 9\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML: %v", err)
+	}
+	if !cfg.DependencyKeeper.Enabled || cfg.DependencyKeeper.MaxDiskGb != 5 ||
+		cfg.DependencyKeeper.CompactionWindowDays != 21 {
+		t.Fatalf("dependencyKeeper = %+v, want the seeded values", cfg.DependencyKeeper)
+	}
+	if cfg.Retention.MaxDiskGb != 9 {
+		t.Fatalf("retention = %+v, want the seeded values", cfg.Retention)
+	}
+	if err := WriteDaemonYAML(path, cfg); err != nil {
+		t.Fatalf("WriteDaemonYAML: %v", err)
+	}
+	reloaded, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML(reload): %v", err)
+	}
+	if reloaded.DependencyKeeper != cfg.DependencyKeeper {
+		t.Errorf("reload dependencyKeeper = %+v, want %+v", reloaded.DependencyKeeper, cfg.DependencyKeeper)
+	}
+	if reloaded.Retention != cfg.Retention {
+		t.Errorf("reload retention = %+v, want %+v", reloaded.Retention, cfg.Retention)
+	}
+}
+
+// TestWriteDaemonYAMLWithCapacity_DependencyKeeperKeys drives the
+// production WriteDaemonYAMLWithCapacity entry point for each
+// dependencyKeeper.* and retention.* key and proves the value lands in
+// its own block without disturbing the capacity block.
+func TestWriteDaemonYAMLWithCapacity_DependencyKeeperKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		key   string
+		value int
+	}{
+		{"dependencyKeeper.enabled", 1},
+		{"dependencyKeeper.maxDiskGb", 5},
+		{"dependencyKeeper.compactionWindowDays", 21},
+		{"retention.maxDiskGb", 9},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.yaml")
+			if err := os.WriteFile(path, []byte("capacity:\n    maxConcurrentSessions: 2\n"), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			cfg, err := ReadDaemonYAML(path)
+			if err != nil {
+				t.Fatalf("ReadDaemonYAML: %v", err)
+			}
+			if err := WriteDaemonYAMLWithCapacity(path, cfg, tc.key, tc.value); err != nil {
+				t.Fatalf("WriteDaemonYAMLWithCapacity: %v", err)
+			}
+			reloaded, err := ReadDaemonYAML(path)
+			if err != nil {
+				t.Fatalf("ReadDaemonYAML(reload): %v", err)
+			}
+			if reloaded.Capacity.MaxConcurrentSessions != 2 {
+				t.Errorf("capacity.maxConcurrentSessions = %d, want 2 (undisturbed)", reloaded.Capacity.MaxConcurrentSessions)
+			}
+			var got int64
+			var enabled bool
+			switch tc.key {
+			case "dependencyKeeper.enabled":
+				enabled = reloaded.DependencyKeeper.Enabled
+			case "dependencyKeeper.maxDiskGb":
+				got = reloaded.DependencyKeeper.MaxDiskGb
+			case "dependencyKeeper.compactionWindowDays":
+				got = reloaded.DependencyKeeper.CompactionWindowDays
+			case "retention.maxDiskGb":
+				got = reloaded.Retention.MaxDiskGb
+			}
+			if tc.key == "dependencyKeeper.enabled" {
+				if !enabled {
+					t.Errorf("dependencyKeeper.enabled not set by %s=%d", tc.key, tc.value)
+				}
+				return
+			}
+			if got != int64(tc.value) {
+				t.Errorf("%s = %d, want %d", tc.key, got, tc.value)
+			}
+		})
+	}
+}

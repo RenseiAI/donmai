@@ -115,3 +115,125 @@ func TestFormatRepoKeeperStat(t *testing.T) {
 		}
 	}
 }
+
+// TestHostSetDependencyKeeperKeys drives the production `host set` entry
+// point for each dependencyKeeper.* and retention.* key and proves the
+// value persists to daemon.yaml with a drain-aware-restart notice.
+func TestHostSetDependencyKeeperKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ key, value string }{
+		{"dependencyKeeper.enabled", "1"},
+		{"dependencyKeeper.maxDiskGb", "5"},
+		{"dependencyKeeper.compactionWindowDays", "21"},
+		{"retention.maxDiskGb", "9"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			t.Parallel()
+			mock := &mockDaemon{setCapResp: &afclient.SetCapacityResponse{OK: true, Key: tc.key, Value: tc.value, Message: "persisted"}}
+			tmpDir := t.TempDir()
+			buf, err := newTestHostCmd(mock, []string{"set", tc.key, tc.value, "--config", tmpDir + "/daemon.yaml"})
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if !strings.Contains(buf.String(), "restart") {
+				t.Errorf("output %q does not say a restart is needed", buf.String())
+			}
+			cfg, readErr := afclient.ReadDaemonYAML(tmpDir + "/daemon.yaml")
+			if readErr != nil {
+				t.Fatalf("ReadDaemonYAML: %v", readErr)
+			}
+			switch tc.key {
+			case "dependencyKeeper.enabled":
+				if !cfg.DependencyKeeper.Enabled {
+					t.Errorf("dependencyKeeper.enabled not persisted")
+				}
+			case "dependencyKeeper.maxDiskGb":
+				if cfg.DependencyKeeper.MaxDiskGb != 5 {
+					t.Errorf("maxDiskGb = %d, want 5", cfg.DependencyKeeper.MaxDiskGb)
+				}
+			case "dependencyKeeper.compactionWindowDays":
+				if cfg.DependencyKeeper.CompactionWindowDays != 21 {
+					t.Errorf("compactionWindowDays = %d, want 21", cfg.DependencyKeeper.CompactionWindowDays)
+				}
+			case "retention.maxDiskGb":
+				if cfg.Retention.MaxDiskGb != 9 {
+					t.Errorf("retention.maxDiskGb = %d, want 9", cfg.Retention.MaxDiskGb)
+				}
+			}
+		})
+	}
+}
+
+// TestApplyDependencyKeeperSet proves the in-memory mapping behind `host
+// set`: each dependencyKeeper.* and retention.* key lands on its own
+// field and nowhere else.
+func TestApplyDependencyKeeperSet(t *testing.T) {
+	t.Parallel()
+
+	cfg := &afclient.DaemonYAML{}
+	applyRepoKeeperSet(cfg, "dependencyKeeper.enabled", 1)
+	if !cfg.DependencyKeeper.Enabled {
+		t.Error("enabled not applied")
+	}
+	if cfg.Capacity.MaxConcurrentSessions != 0 || cfg.RepoKeeper.MaxDiskGb != 0 {
+		t.Errorf("enabled leaked outside dependencyKeeper: %+v", cfg)
+	}
+	applyRepoKeeperSet(cfg, "dependencyKeeper.maxDiskGb", 5)
+	if cfg.DependencyKeeper.MaxDiskGb != 5 {
+		t.Errorf("maxDiskGb = %d, want 5", cfg.DependencyKeeper.MaxDiskGb)
+	}
+	applyRepoKeeperSet(cfg, "dependencyKeeper.compactionWindowDays", 21)
+	if cfg.DependencyKeeper.CompactionWindowDays != 21 {
+		t.Errorf("compactionWindowDays = %d, want 21", cfg.DependencyKeeper.CompactionWindowDays)
+	}
+	applyRepoKeeperSet(cfg, "retention.maxDiskGb", 9)
+	if cfg.Retention.MaxDiskGb != 9 {
+		t.Errorf("retention.maxDiskGb = %d, want 9", cfg.Retention.MaxDiskGb)
+	}
+}
+
+// TestHostSetDependencyKeeperEnabledRejectsOutOfRange proves `host set
+// dependencyKeeper.enabled 2` fails loudly instead of persisting a
+// meaningless value.
+func TestHostSetDependencyKeeperEnabledRejectsOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	if _, err := newTestHostCmd(mock, []string{"set", "dependencyKeeper.enabled", "2"}); err == nil {
+		t.Fatal("expected error for dependencyKeeper.enabled=2")
+	}
+	if _, err := newTestHostCmd(mock, []string{"set", "dependencyKeeper.maxDiskGb", "-1"}); err == nil {
+		t.Fatal("expected error for negative dependencyKeeper.maxDiskGb")
+	}
+}
+
+// TestFormatDependencyKeeperStat proves the stats renderer carries the
+// hit, the miss reason, time saved, bytes, and pressure with no scope
+// values, URLs, or credentials.
+func TestFormatDependencyKeeperStat(t *testing.T) {
+	t.Parallel()
+
+	got := formatDependencyKeeperStat(fixtureStatsResp())
+	if got != "disabled" {
+		t.Errorf("nil keeper renders %q, want disabled", got)
+	}
+	resp := fixtureStatsResp()
+	resp.DependencyKeeper = &afclient.DependencyKeeperStats{
+		Hour: &afclient.DependencyKeeperWindow{Hits: []afclient.DependencyKeeperHit{
+			{Manager: "pnpm", Path: ".", Hits: 3, Misses: 1, MissReasons: map[string]int64{"no_store": 1}},
+		}},
+		Day:                      &afclient.DependencyKeeperWindow{},
+		Week:                     &afclient.DependencyKeeperWindow{},
+		ColdBaselineSamples:      4,
+		EstimatedTimeSavedSeconds: 12.5,
+		Bytes:                    42,
+		BudgetPressure:           0.85,
+	}
+	got = formatDependencyKeeperStat(resp)
+	for _, want := range []string{"3", "1", "no_store", "12.5", "42", "85%"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("render %q missing %q", got, want)
+		}
+	}
+}
