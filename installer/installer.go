@@ -384,12 +384,23 @@ func Doctor(opts DoctorOptions) (DoctorReport, error) {
 			val := *res.IsActive
 			active = &val
 		}
+		detail := res.StatusOutput
+		if res.LegacyUnit != "" {
+			legacy := "pre-rename unit still present at " + res.LegacyUnit + " — re-run `host install` to migrate"
+			if res.LegacyActive != nil && *res.LegacyActive {
+				legacy += " (it is still running)"
+			}
+			if detail != "" {
+				detail += "\n"
+			}
+			detail += legacy
+		}
 		return DoctorReport{
 			OS:          "linux",
 			ServicePath: res.UnitPath,
 			Installed:   res.UnitExists,
 			Active:      active,
-			Detail:      res.StatusOutput,
+			Detail:      detail,
 		}, nil
 
 	default:
