@@ -525,11 +525,13 @@ Loop:
 
 // TestUpgradeAcceptanceRed records the acceptance case red on current main:
 // headless seats are direct-owned children of the daemon, so a daemon
-// restart kills the seat instead of adopting it. The failure cause is the
-// selection rule: shimOwnsSession covers interactive sessions only, and the
-// local runtime holds (rather than adopts) a recovered session whose shim
-// it adopted. This test goes green once those slices land; until then it
-// pins the red with the cause attached.
+// restart would end a headless seat instead of adopting it. No seat is
+// dispatched yet — the red is read from the selection rule, never from a
+// seat the restart ended. The failure cause is the selection rule:
+// shimOwnsSession covers interactive sessions only, and the local runtime
+// holds (rather than adopts) a recovered session whose shim it adopted.
+// This test goes green once those slices land; until then it pins the red
+// with the cause attached.
 //
 // The gate follows the production selection predicate (headlessShimLaunch-
 // Enabled asks the daemon's own SessionShimOwnsSession about a headless

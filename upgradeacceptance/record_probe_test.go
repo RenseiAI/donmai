@@ -129,8 +129,8 @@ func TestRecordProbe(t *testing.T) {
 // configuration flags alone, so a daemon configured for adoption and
 // ownership reports adoption_and_ownership while its selection rule still
 // refuses headless seats. A driver that branched on the projection would
-// record the live cases green on a build where the restart still kills the
-// headless seat.
+// record the live cases green on a build where the restart would still
+// end the headless seat.
 func TestOwnershipModeIsNotAHeadlessLaunchSignal(t *testing.T) {
 	t.Parallel()
 	d := defaultAdoptionProbeDaemon()

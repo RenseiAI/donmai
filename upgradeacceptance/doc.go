@@ -18,9 +18,11 @@
 //     after the trigger is touched.
 //
 // Today the flow goes red: headless seats are direct-owned children of the
-// daemon, so the restart kills the seat. It goes green once the adoption
-// slices land (headless shim ownership, credential push, outbox-before-send,
-// and the local runtime adopting rather than holding a recovered session).
+// daemon, so a restart would end a headless seat instead of adopting it.
+// No seat is dispatched yet — the red is read from the selection rule —
+// and it goes green once the adoption slices land (headless shim
+// ownership, credential push, outbox-before-send, and the local runtime
+// adopting rather than holding a recovered session).
 //
 // Layout:
 //

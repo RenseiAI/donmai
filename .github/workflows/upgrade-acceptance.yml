@@ -9,8 +9,10 @@ name: upgrade-acceptance
 #
 # On this build the required record is the red one: the N+1 selection rule
 # launches only interactive seats under shim ownership, so a headless seat
-# dies with its daemon (cause headless_shim_launch_off) — the same red
-# TestUpgradeAcceptanceRed pins in-repo. Everything the red stands on is
+# would be a direct-owned child of the daemon and the restart would end it
+# (cause headless_shim_launch_off) — the same red TestUpgradeAcceptanceRed
+# pins in-repo. No seat is dispatched yet: the red is read from the
+# selection rule, never from a seat the restart ended. Everything the red stands on is
 # asserted for real first (boot, user manager, delegated controllers, the
 # toolchain go.mod requires, both artifacts, the generated unit, the restart
 # preflight, and the upgrade served from a new PID), so an infrastructure

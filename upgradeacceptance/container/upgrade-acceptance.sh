@@ -26,11 +26,13 @@
 #   1 red    the acceptance case is red for the recorded cause and every
 #            infrastructure checkpoint passed. On this build the cause is
 #            headless_shim_launch_off: the N+1 selection rule launches only
-#            interactive seats under shim ownership, so a headless seat is a
-#            direct-owned child of the daemon unit and the restart above kills
-#            it. No standalone path admits a long-lived headless seat yet (the
-#            local runtime refuses the shim; the control-API accept path
-#            carries no session detail), so the seat itself is not dispatched.
+#            interactive seats under shim ownership, so a headless seat
+#            would be a direct-owned child of the daemon unit and the
+#            restart above would end it. No standalone path admits a
+#            long-lived headless seat yet (the local runtime refuses the
+#            shim; the control-API accept path carries no session detail),
+#            so the driver dispatches no seat: the red is read from the
+#            selection rule, not from a seat the restart ended.
 #   2 infra  a prerequisite failed: boot, user manager, toolchain, build,
 #            install, status, preflight, upgrade, or the probe. The record
 #            names the failed checkpoint; an infrastructure failure is never
@@ -291,5 +293,5 @@ if [ "$(jq -r '.headlessOwned' <<<"${PROBE}")" = "true" ]; then
   exit 3
 fi
 write_record red headless_shim_launch_off \
-  "the N+1 selection rule launches only interactive seats under shim ownership, so a headless seat is a direct-owned child of ${UNIT} and the restart kills it"
+  "the N+1 selection rule launches only interactive seats under shim ownership, so a headless seat would be a direct-owned child of ${UNIT} and the restart would end it; no seat is dispatched, so the red is read from the rule"
 exit 1
