@@ -116,6 +116,10 @@ func ConclusiveVote(rung EvidenceRung, activity ActivityState) ActivityEvidence 
 	return ActivityEvidence{Rung: rung, Observed: true, Conclusive: true, Activity: activity}
 }
 
+// BoolPtr boxes a probe boolean so call sites can distinguish "probed
+// true/false" from "probe never ran" (nil).
+func BoolPtr(b bool) *bool { return &b }
+
 // InconclusiveProbe is a test-and-call-site helper: a probe that ran but
 // reached no verdict (ambiguous reading), or never ran at all. Observed
 // distinguishes the two in the record; both are inconclusive to the

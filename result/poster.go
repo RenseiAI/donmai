@@ -332,6 +332,37 @@ type statusRequest struct {
 	// in-session retries. Always serialized (no omitempty) so a zero
 	// reads as "did nothing" rather than unknown.
 	ToolCalls int `json:"toolCalls"`
+
+	// SeatState is the seat's final three-axis report: session presence,
+	// activity with its decided-by rung, resumability, plus the
+	// orthogonal needs-input count and reason. Additive; omitted when
+	// nil so a runner that does not track seat state stays
+	// byte-identical — old platforms ignore it.
+	SeatState *SeatStateReport `json:"seatState,omitempty"`
+
+	// SeatSummary folds the session's seat report into heartbeat-sized
+	// axis counts. Present exactly when SeatState is; currently always
+	// the single-seat fold, kept as a summary so heartbeat and receipt
+	// readers share one shape.
+	SeatSummary *SeatStateSummary `json:"seatSummary,omitempty"`
+}
+
+// SeatStateSummary is the single-seat fold of a terminal seat report:
+// each axis count is 0 or 1, summing to Total 1.
+type SeatStateSummary struct {
+	Total               int `json:"total"`
+	SessionPresent      int `json:"sessionPresent,omitempty"`
+	SessionDetached     int `json:"sessionDetached,omitempty"`
+	SessionExited       int `json:"sessionExited,omitempty"`
+	SessionAbsent       int `json:"sessionAbsent,omitempty"`
+	SessionUnknown      int `json:"sessionUnknown,omitempty"`
+	ActivityWorking     int `json:"activityWorking,omitempty"`
+	ActivityIdle        int `json:"activityIdleAtPrompt,omitempty"`
+	ActivityUnknown     int `json:"activityUnknown,omitempty"`
+	Resumable           int `json:"resumable,omitempty"`
+	FreshOnly           int `json:"freshOnly,omitempty"`
+	ResumabilityUnknown int `json:"resumabilityUnknown,omitempty"`
+	NeedsInput          int `json:"needsInput,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -345,6 +376,32 @@ type errorEnvelope struct {
 // provider-owned agent.Result.
 type PostOptions struct {
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection
+	// SeatState is the seat's final three-axis report (session presence,
+	// activity with its decided-by rung, resumability, plus the
+	// orthogonal needs-input signal). Nil omits the receipt keys so a
+	// runner that does not track seat state stays byte-identical.
+	SeatState *SeatStateReport `json:"-"`
+}
+
+// SeatStateReport is the result package's wire mirror of one seat's
+// three-axis report. It duplicates the vocabulary (not the type) so this
+// package stays free of the daemon import: the daemon-side collector maps
+// its own report onto this shape when it posts a terminal receipt.
+type SeatStateReport struct {
+	// Session is the presence axis: present | detached | exited | absent |
+	// unknown.
+	Session string `json:"session"`
+	// Activity is the liveness axis: working | idle_at_prompt | unknown.
+	Activity string `json:"activity"`
+	// DecidedBy names the evidence rung that decided Activity.
+	DecidedBy string `json:"decidedBy,omitempty"`
+	// Resumability is the continuation axis: resumable | fresh_only |
+	// unknown.
+	Resumability string `json:"resumability"`
+	// NeedsInputCount is the orthogonal input count; NeedsInputReason
+	// names why. Both omitted when zero/empty — never a state.
+	NeedsInputCount  int    `json:"needsInputCount,omitempty"`
+	NeedsInputReason string `json:"needsInputReason,omitempty"`
 }
 
 // PostOutcome preserves which half of the completion/status exchange failed.
@@ -564,6 +621,51 @@ func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Resul
 	})
 }
 
+// summarizeSeatState maps the runner-owned terminal record onto the
+// receipt's seat-state mirror. The session axis is terminal by
+// construction: the receipt exists because the harness published its last
+// word, so the seat reports exited. Activity is unknown — the terminal
+// record carries no arbiter evidence, and an inconclusive probe reports
+// unknown rather than reconstructing one. Resumability follows the
+// checkpoint evidence the runner already owns: a preserved checkpoint is
+// resumable, an explicitly non-resumable failure with nothing preserved is
+// fresh_only, and anything else is unknown.
+func summarizeSeatState(r agent.Result) *SeatStateReport {
+	if r.Status == "" {
+		return nil
+	}
+	resumability := "unknown"
+	switch {
+	case r.ResumeCheckpoint != nil || r.Resumable:
+		resumability = "resumable"
+	case r.Status == "failed" && !r.Resumable && r.ResumeCheckpoint == nil:
+		resumability = "fresh_only"
+	}
+	return &SeatStateReport{
+		Session: "exited", Activity: "unknown", DecidedBy: "none",
+		Resumability: resumability,
+	}
+}
+
+// summarizeSeatSummary folds the terminal seat report into the shared
+// single-seat summary shape. Nil exactly when summarizeSeatState is nil.
+func summarizeSeatSummary(r agent.Result) *SeatStateSummary {
+	report := summarizeSeatState(r)
+	if report == nil {
+		return nil
+	}
+	out := &SeatStateSummary{Total: 1, SessionExited: 1, ActivityUnknown: 1}
+	switch report.Resumability {
+	case "resumable":
+		out.Resumable = 1
+	case "fresh_only":
+		out.FreshOnly = 1
+	default:
+		out.ResumabilityUnknown = 1
+	}
+	return out
+}
+
 func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *workarea.TerminalLeaseProjection) statusRequest {
 	worktreePath := r.WorktreePath
 	if projection != nil {
@@ -580,6 +682,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
+		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

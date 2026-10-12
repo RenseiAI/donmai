@@ -5,8 +5,6 @@ import (
 	"time"
 )
 
-func boolPtr(b bool) *bool { return &b }
-
 // TestReport_SessionAxis pins the presence ladder: terminal proof wins, then
 // the live identity plus binding, then the registry record — and every
 // inconclusive shape reports unknown.
