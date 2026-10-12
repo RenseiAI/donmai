@@ -7,6 +7,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/daemon/seatqos"
 )
 
 // validateSeatBudget enforces the authored per-seat budget ranges. Zero
@@ -18,6 +19,24 @@ func validateSeatBudget(b SeatBudgetConfig) error {
 		IOWeight: b.IOWeight,
 		Mode:     seatbudget.Mode(b.Mode),
 	}.Validate()
+}
+
+// validateSeatQoS enforces the authored per-seat scheduling class. Empty
+// is valid and reads as default (opt-in only — seats spawn exactly as
+// before unless the operator names a class).
+func validateSeatQoS(raw string) error {
+	return seatqos.Validate(seatqos.Class(raw))
+}
+
+// resolveSeatQoS normalises the authored per-seat scheduling class for
+// spawn and status: empty reads as default, anything else is validated
+// verbatim (fail-closed at the config gate, never silent).
+func resolveSeatQoS(raw string) seatqos.Class {
+	class, err := seatqos.Parse(raw)
+	if err != nil {
+		return seatqos.Default
+	}
+	return seatqos.Effective(class)
 }
 
 // resolveSeatBudget returns the per-seat budget the daemon applies: the
@@ -58,6 +77,28 @@ func resolveSeatBudget(authored SeatBudgetConfig, maxSeats, hostCPUs, hostMemory
 // unwrapped.
 func seatBudgetReport(b seatbudget.Budget) *afclient.SeatBudgetStatus {
 	return seatBudgetReportFor(b, seatBudgetStatusPlacement(), runtime.GOOS)
+}
+
+// seatBudgetReportWithQoS is seatBudgetReport plus the opt-in per-seat
+// scheduling class the status route publishes: the configured class
+// verbatim (default when unauthored), so an operator reading status can
+// tell whether seats spawn wrapped without inspecting the config file.
+// The class is reported, never validated here — validation lives at the
+// config gate, and status must render whatever the daemon runs with.
+func seatBudgetReportWithQoS(b seatbudget.Budget, qos seatqos.Class) *afclient.SeatBudgetStatus {
+	rep := seatBudgetReport(b)
+	rep.QoS = string(seatqos.Effective(qos))
+	return rep
+}
+
+// daemonSeatQoS resolves the daemon's configured per-seat scheduling
+// class. Nil config reads as default (opt-in only).
+func (d *Daemon) daemonSeatQoS() seatqos.Class {
+	cfg := d.Config()
+	if cfg == nil {
+		return seatqos.Default
+	}
+	return resolveSeatQoS(cfg.Capacity.SeatQoS)
 }
 
 // seatBudgetStatusPlacement resolves the placement the status path

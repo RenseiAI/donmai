@@ -1421,6 +1421,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Mode:     string(resolved.Mode),
 		}
 	}
+	// Per-seat scheduling class: opt-in only, default when unauthored.
+	// Only set what the operator authored: an embedder that composed
+	// its own SpawnerOptions.SeatQoS keeps it.
+	if spawnerOpts.SeatQoS == "" && cfg.Capacity.SeatQoS != "" {
+		spawnerOpts.SeatQoS = string(resolveSeatQoS(cfg.Capacity.SeatQoS))
+	}
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
 	}
@@ -1989,7 +1995,8 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
 	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
-	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged {
+	seatQoSChanged := d.config.Capacity.SeatQoS != cfg.Capacity.SeatQoS
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -2031,6 +2038,25 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			})
 		}
 		d.config.Capacity.SeatBudget = cfg.Capacity.SeatBudget
+	}
+	if seatQoSChanged {
+		if err := validateSeatQoS(cfg.Capacity.SeatQoS); err != nil {
+			d.mu.Unlock()
+			releasePolicy()
+			slog.Warn("[yaml-watcher] rejected seat scheduling class", "error", err)
+			return
+		}
+		// Seats already running keep the class they started with;
+		// only new spawns see the new class.
+		if d.spawner != nil {
+			if err := d.spawner.SetSeatQoS(cfg.Capacity.SeatQoS); err != nil {
+				d.mu.Unlock()
+				releasePolicy()
+				slog.Warn("[yaml-watcher] rejected seat scheduling class", "error", err)
+				return
+			}
+		}
+		d.config.Capacity.SeatQoS = cfg.Capacity.SeatQoS
 	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {

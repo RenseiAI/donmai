@@ -130,18 +130,23 @@ func TestWorkerCapEnv(t *testing.T) {
 	env := WorkerCapEnv(4)
 	// Every knob is a control the named tool actually reads: the Go
 	// runtime (GOMAXPROCS), make (MAKEFLAGS -j), cmake --build
-	// (CMAKE_BUILD_PARALLEL_LEVEL), ninja (NINJAFLAGS -j) and cargo
-	// (CARGO_BUILD_JOBS). JS runners take no seat env entry: vitest reads
-	// --maxWorkers/maxWorkers config (not an env knob) and Next.js
-	// build parallelism is a config/CLI flag (not an env knob), so
-	// injecting a same-shaped variable for them would claim a cap the
-	// tool ignores.
+	// (CMAKE_BUILD_PARALLEL_LEVEL), ninja (NINJAFLAGS -j), cargo
+	// (CARGO_BUILD_JOBS) and libuv (UV_THREADPOOL_SIZE, which Node
+	// reads for its thread pool). JS runners take no per-tool seat env
+	// entry: vitest reads poolOptions config/CLI, jest reads
+	// --maxWorkers, Next.js reads its config — so injecting a
+	// same-shaped variable for them would claim a cap the tool
+	// ignores. The seat instead publishes its raw share
+	// (DONMAI_SEAT_CPUS) for each repo's config to derive its own
+	// worker limit from.
 	want := map[string]string{
 		"GOMAXPROCS":                 "4",
 		"MAKEFLAGS":                  "-j4",
 		"CMAKE_BUILD_PARALLEL_LEVEL": "4",
 		"NINJAFLAGS":                 "-j4",
 		"CARGO_BUILD_JOBS":           "4",
+		"UV_THREADPOOL_SIZE":         "4",
+		SeatCPUsEnv:                    "4",
 	}
 	for k, v := range want {
 		if env[k] != v {

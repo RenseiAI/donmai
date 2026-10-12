@@ -465,14 +465,21 @@ func formatProcessPriorityStatus(status *afclient.DaemonProcessPriorityStatus) s
 }
 
 // formatSeatBudgetStatus renders the per-seat budget for the status table:
-// the posture with the values, or "not reported" against an older daemon.
-// A host with budgeting off reads as "none" — the honest shape, not an
-// omission an operator could misread as a missing probe.
+// the posture with the values, plus the opt-in scheduling class when it
+// is not the default, or "not reported" against an older daemon. A host
+// with budgeting off reads as "none" — the honest shape, not an omission
+// an operator could misread as a missing probe. A non-default scheduling
+// class appends even to a none budget: the class governs the spawn
+// wrapper, not the budget, so it is real with budgeting off.
 func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 	if status == nil || strings.TrimSpace(status.Mode) == "" {
 		return "not reported"
 	}
+	qos := strings.TrimSpace(status.QoS)
 	if status.Mode == "none" {
+		if qos != "" && qos != "default" {
+			return "none (seat QoS: " + qos + ")"
+		}
 		return "none"
 	}
 	value := status.Mode
@@ -481,6 +488,9 @@ func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 	}
 	if status.MemoryMB > 0 {
 		value += fmt.Sprintf(", %d MB", status.MemoryMB)
+	}
+	if qos != "" && qos != "default" {
+		value += ", seat QoS: " + qos
 	}
 	if status.Detail != "" {
 		value += " — " + status.Detail

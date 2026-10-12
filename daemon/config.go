@@ -288,6 +288,13 @@ type CapacityConfig struct {
 	// MaxConcurrentSessions when fields are omitted. Zero value means
 	// budgeting is off (report mode "none").
 	SeatBudget SeatBudgetConfig `yaml:"seatBudget,omitempty" json:"seatBudget,omitempty"`
+	// SeatQoS is the opt-in per-seat scheduling class: default, utility
+	// or background. Empty reads as default — seats spawn exactly as
+	// before. Non-default classes wrap the seat worker on macOS (the
+	// only OS with the primitive) so seats prefer efficiency cores
+	// (utility) or run at the lowest band (background); the daemon
+	// itself always stays at default. Reported in status verbatim.
+	SeatQoS string `yaml:"seatQoS,omitempty" json:"seatQoS,omitempty"`
 }
 
 // SeatBudgetConfig is the authored per-seat resource budget in daemon.yaml.
@@ -1074,6 +1081,9 @@ func validateConfig(c *Config) error {
 		return errors.New("repoKeeper.authorizationWindowSeconds must be >= 0")
 	}
 	if err := validateSeatBudget(c.Capacity.SeatBudget); err != nil {
+		return err
+	}
+	if err := validateSeatQoS(c.Capacity.SeatQoS); err != nil {
 		return err
 	}
 	if c.ProjectAdmissionVersion != 0 && c.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {

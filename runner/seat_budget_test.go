@@ -28,16 +28,22 @@ func TestApplySeatBudget(t *testing.T) {
 	})
 	t.Run("caps land at the seat share", func(t *testing.T) {
 		got := applySeatBudget(map[string]string{}, &SeatBudget{Mode: "best-effort", CPUs: 2})
-		// Five verified knobs only: JS runners take no seat env entry
-		// (vitest reads config/CLI, Next.js reads config/CLI), so both
+		// Seven verified knobs only: JS runners take no per-tool seat
+		// env entry (vitest reads poolOptions config/CLI, jest reads
+		// --maxWorkers, Next.js reads its config), so those spellings
 		// must stay absent — an entry the tool ignores would claim a
-		// cap that does nothing.
+		// cap that does nothing. Node is capped through libuv
+		// (UV_THREADPOOL_SIZE, which Node reads) and the raw share
+		// (DONMAI_SEAT_CPUS, which each repo's config derives its
+		// worker limit from).
 		want := map[string]string{
 			"GOMAXPROCS":                 "2",
 			"MAKEFLAGS":                  "-j2",
 			"CMAKE_BUILD_PARALLEL_LEVEL": "2",
 			"NINJAFLAGS":                 "-j2",
 			"CARGO_BUILD_JOBS":           "2",
+			"UV_THREADPOOL_SIZE":         "2",
+			"DONMAI_SEAT_CPUS":           "2",
 		}
 		for k, v := range want {
 			if got[k] != v {
@@ -122,7 +128,8 @@ func TestWorkerCapEnvMatchesDaemonKnobs(t *testing.T) {
 	env := workerCapEnv(3)
 	wantKeys := []string{
 		"GOMAXPROCS", "MAKEFLAGS", "CMAKE_BUILD_PARALLEL_LEVEL",
-		"NINJAFLAGS", "CARGO_BUILD_JOBS",
+		"NINJAFLAGS", "CARGO_BUILD_JOBS", "UV_THREADPOOL_SIZE",
+		"DONMAI_SEAT_CPUS",
 	}
 	if len(env) != len(wantKeys) {
 		t.Fatalf("workerCapEnv has %d knobs; want %d", len(env), len(wantKeys))

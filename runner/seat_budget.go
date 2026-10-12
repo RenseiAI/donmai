@@ -47,12 +47,19 @@ func (b *SeatBudget) disabled() bool {
 	return false
 }
 
+// seatCPUsEnv names the seat-share knob the repository configs read.
+// No core-fanning JS tool honours a worker-count env var directly, so
+// the seat exports its raw share under this one name and each repo's
+// vitest/jest/Next config derives its own limit from it.
+const seatCPUsEnv = "DONMAI_SEAT_CPUS"
+
 // workerCapEnv returns the cooperative worker-cap entries for cpus: the env
 // knobs core-fanning tools actually read (Go runtime, make, cmake, ninja,
-// cargo). The set mirrors the daemon's enforcement package; the runner
-// re-renders it here (rather than importing the daemon) because the daemon
-// package must stay independent of the runner — `donmai agent run`
-// constructs its runner from the opaque SessionDetail payload.
+// cargo, libuv) plus the raw seat share for repo configs. The set mirrors
+// the daemon's enforcement package; the runner re-renders it here (rather
+// than importing the daemon) because the daemon package must stay
+// independent of the runner — `donmai agent run` constructs its runner
+// from the opaque SessionDetail payload.
 func workerCapEnv(cpus int) map[string]string {
 	if cpus < 1 {
 		cpus = 1
@@ -64,6 +71,8 @@ func workerCapEnv(cpus int) map[string]string {
 		"CMAKE_BUILD_PARALLEL_LEVEL": n,
 		"NINJAFLAGS":                 "-j" + n,
 		"CARGO_BUILD_JOBS":           n,
+		"UV_THREADPOOL_SIZE":         n,
+		seatCPUsEnv:                    n,
 	}
 }
 
