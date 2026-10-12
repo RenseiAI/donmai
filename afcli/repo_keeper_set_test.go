@@ -223,12 +223,12 @@ func TestFormatDependencyKeeperStat(t *testing.T) {
 		Hour: &afclient.DependencyKeeperWindow{Hits: []afclient.DependencyKeeperHit{
 			{Manager: "pnpm", Path: ".", Hits: 3, Misses: 1, MissReasons: map[string]int64{"no_store": 1}},
 		}},
-		Day:                      &afclient.DependencyKeeperWindow{},
-		Week:                     &afclient.DependencyKeeperWindow{},
-		ColdBaselineSamples:      4,
+		Day:                       &afclient.DependencyKeeperWindow{},
+		Week:                      &afclient.DependencyKeeperWindow{},
+		ColdBaselineSamples:       4,
 		EstimatedTimeSavedSeconds: 12.5,
-		Bytes:                    42,
-		BudgetPressure:           0.85,
+		Bytes:                     42,
+		BudgetPressure:            0.85,
 	}
 	got = formatDependencyKeeperStat(resp)
 	for _, want := range []string{"3", "1", "no_store", "12.5", "42", "85%"} {

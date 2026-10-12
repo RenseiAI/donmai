@@ -91,17 +91,8 @@ const (
 	DependencyMissConflict = "manager_ambiguous"
 )
 
-// dependencyMissReasons is the closed miss-reason vocabulary. Stats keys
-// and events name exactly these tokens.
-var dependencyMissReasons = []string{
-	DependencyMissDisabled,
-	DependencyMissReconciling,
-	DependencyMissNoStore,
-	DependencyMissSessionOnly,
-	DependencyMissOverBudget,
-	DependencyMissUnverified,
-	DependencyMissConflict,
-}
+// Closed miss-reason vocabulary: stats keys and events name exactly the
+// DependencyMiss* tokens above.
 
 // DependencyKeeperScopeFunc resolves the credential scope for one manager.
 // It sits beside the install path the way RepoKeeperScopeFunc sits beside

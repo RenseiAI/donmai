@@ -1571,11 +1571,12 @@ func formatDependencyKeeperStat(r *afclient.DaemonStatsResponse) string {
 	}
 	// Windows overlap (hour ⊂ day ⊂ week): report the widest non-empty
 	// window instead of summing them.
-	if k.Week != nil && len(k.Week.Hits) > 0 {
+	switch {
+	case k.Week != nil && len(k.Week.Hits) > 0:
 		hits, misses, reasons = sumDependencyWindow(k.Week)
-	} else if k.Day != nil && len(k.Day.Hits) > 0 {
+	case k.Day != nil && len(k.Day.Hits) > 0:
 		hits, misses, reasons = sumDependencyWindow(k.Day)
-	} else if k.Hour != nil && len(k.Hour.Hits) > 0 {
+	case k.Hour != nil && len(k.Hour.Hits) > 0:
 		hits, misses, reasons = sumDependencyWindow(k.Hour)
 	}
 	top := ""
