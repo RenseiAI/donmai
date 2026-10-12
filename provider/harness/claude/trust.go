@@ -39,19 +39,111 @@ import (
 // leaves the session to the modal rather than failing the spawn — the modal
 // is the honest signal, a spawn failure would be a lie about what happened.
 
+// seededTrust records what one seedWorkspaceTrust call changed, so the
+// session-end cleanup can undo exactly that and nothing else. A directory
+// that was already trusted before the seed is in neither list: that trust
+// belongs to someone else (the operator, or another live session).
+type seededTrust struct {
+	// path is the trust record the seed wrote.
+	path string
+	// dirs are the entries the seed CREATED (absent before the seed); the
+	// cleanup removes them whole.
+	dirs []string
+	// flipped are entries that existed before the seed WITHOUT trust (for
+	// example the operator's own per-project settings for that directory).
+	// The cleanup puts only the trust key back to its prior state — prior
+	// holds the previous value; a directory missing from prior had no key —
+	// and leaves every other field on the entry as found.
+	flipped []string
+	prior   map[string]any
+}
+
 // seedWorkspaceTrust records trust for exactly the session's authorized
 // boundary. It never returns an error: every failure mode is silent, and
 // the session proceeds to the modal it would have seen without the seed.
-func seedWorkspaceTrust(spec agent.Spec) {
+// The returned record names what was seeded so the caller can remove those
+// entries — and only those — at session end (see removeSeededTrust); nil
+// means nothing was seeded and there is nothing to clean up.
+func seedWorkspaceTrust(spec agent.Spec) *seededTrust {
 	dirs := trustBoundaryDirs(spec)
 	if len(dirs) == 0 {
-		return
+		return nil
 	}
 	home, err := claudeConfigHome(spec.Env)
 	if err != nil {
+		return nil
+	}
+	return seedTrustFile(filepath.Join(home, claudeTrustFileName), dirs)
+}
+
+// removeSeededTrust undoes what seed changed at session end: entries the
+// seed created are removed whole, and entries it flipped get only their
+// trust key put back to its prior state. Pre-existing trust — the
+// operator's own, other sessions' seeds, even at the session's own path —
+// is never in the seed record and is left untouched, as is a record that can no longer be read or parsed
+// (it is not ours to rewrite) or whose projects field has an unexpected
+// shape. Every failure is silent: cleanup must never fail a session that
+// already ran. A nil seed is a no-op.
+func removeSeededTrust(seed *seededTrust) {
+	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
 		return
 	}
-	seedTrustFile(filepath.Join(home, claudeTrustFileName), dirs)
+	release, ok := acquireTrustLock(seed.path)
+	if !ok {
+		return
+	}
+	defer release()
+	data, err := os.ReadFile(seed.path) //nolint:gosec // config path, not session input
+	if err != nil {
+		return
+	}
+	var record map[string]any
+	if json.Unmarshal(data, &record) != nil {
+		return
+	}
+	raw := record[claudeTrustProjectsKey]
+	if raw == nil {
+		return
+	}
+	projects, ok := raw.(map[string]any)
+	if !ok {
+		return
+	}
+	for _, dir := range seed.dirs {
+		delete(projects, dir)
+	}
+	for _, dir := range seed.flipped {
+		entry, ok := projects[dir].(map[string]any)
+		if !ok {
+			continue
+		}
+		if prev, had := seed.prior[dir]; had {
+			entry[claudeTrustAcceptedKey] = prev
+		} else {
+			delete(entry, claudeTrustAcceptedKey)
+		}
+	}
+	body, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(seed.path), ".claude.json.tmp-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, seed.path); err != nil {
+		_ = os.Remove(tmpName)
+	}
 }
 
 // trustBoundaryDirs returns the exact directories trust may be seeded for:
@@ -178,7 +270,9 @@ const claudeTrustFileName = ".claude.json"
 // seedTrustFile adds dirs to the trust record at path, creating the file
 // when absent. A record that cannot be read or parsed is left untouched (no
 // seed); unknown fields are preserved; existing trust entries are kept.
-// Every failure is silent.
+// Every failure is silent. The returned record names exactly the entries
+// this call created or flipped (nil when it wrote nothing), so the session-
+// end cleanup never removes trust the seed did not add.
 //
 // The read-modify-write merges under a sibling lock directory, so
 // concurrent sessions sharing one config home cannot lose each other's
@@ -186,13 +280,13 @@ const claudeTrustFileName = ".claude.json"
 // seed away and parks on the workspace-trust modal. The final write rides
 // a temp-file rename, so a concurrent reader never sees a half-written
 // record.
-func seedTrustFile(path string, dirs []string) {
+func seedTrustFile(path string, dirs []string) *seededTrust {
 	if path == "" || len(dirs) == 0 {
-		return
+		return nil
 	}
 	release, ok := acquireTrustLock(path)
 	if !ok {
-		return
+		return nil
 	}
 	defer release()
 	var record map[string]any
@@ -204,12 +298,12 @@ func seedTrustFile(path string, dirs []string) {
 		// as found rather than replaced by a trust-only record that would
 		// drop every other field. The session meets the modal instead.
 		if json.Unmarshal(data, &record) != nil {
-			return
+			return nil
 		}
 	case errors.Is(err, os.ErrNotExist):
 		// absent → create below
 	default:
-		return // unreadable: never overwrite what cannot be read
+		return nil // unreadable: never overwrite what cannot be read
 	}
 	if record == nil {
 		record = make(map[string]any)
@@ -217,48 +311,66 @@ func seedTrustFile(path string, dirs []string) {
 	var projects map[string]any
 	if raw, ok := record[claudeTrustProjectsKey]; ok && raw != nil {
 		if projects, ok = raw.(map[string]any); !ok {
-			return // an unexpected shape is not ours to replace
+			return nil // an unexpected shape is not ours to replace
 		}
 	}
 	if projects == nil {
 		projects = make(map[string]any)
 	}
+	seed := &seededTrust{path: path}
 	for _, dir := range dirs {
-		var entry map[string]any
-		if raw, ok := projects[dir]; ok {
-			entry, _ = raw.(map[string]any)
-		}
-		if entry == nil {
+		raw, existed := projects[dir]
+		entry, isMap := raw.(map[string]any)
+		switch {
+		case !existed || raw == nil:
 			entry = make(map[string]any)
+			seed.dirs = append(seed.dirs, dir)
+		case !isMap:
+			continue // an unexpected shape is not ours to replace
+		case entry[claudeTrustAcceptedKey] == true:
+			continue // already trusted: someone else's trust, never ours to remove
+		default:
+			if prev, had := entry[claudeTrustAcceptedKey]; had {
+				if seed.prior == nil {
+					seed.prior = make(map[string]any)
+				}
+				seed.prior[dir] = prev
+			}
+			seed.flipped = append(seed.flipped, dir)
 		}
 		entry[claudeTrustAcceptedKey] = true
 		projects[dir] = entry
 	}
+	if len(seed.dirs) == 0 && len(seed.flipped) == 0 {
+		return nil // nothing to add, nothing to write, nothing to clean up
+	}
 	record[claudeTrustProjectsKey] = projects
 	body, err := json.Marshal(record)
 	if err != nil {
-		return
+		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return
+		return nil
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".claude.json.tmp-*")
 	if err != nil {
-		return
+		return nil
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(body); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return
+		return nil
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return
+		return nil
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
+		return nil
 	}
+	return seed
 }
 
 // Trust-lock tuning: the seed holds the lock for one small read plus one

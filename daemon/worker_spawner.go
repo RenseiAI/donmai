@@ -422,6 +422,29 @@ func (s *WorkerSpawner) ActiveSessions() []SessionHandle {
 	return out
 }
 
+// ActiveSeat is one in-flight spawner seat with the admitted run mode the
+// handle alone does not carry. The mode is the fact the seat-state activity
+// ladder votes from — never inferred from the handle.
+type ActiveSeat struct {
+	Handle SessionHandle
+	// Mode is the admitted SessionSpec.Mode ("", "interactive",
+	// "interview", ...).
+	Mode string
+}
+
+// ActiveSeats returns a snapshot of the in-flight seats with their admitted
+// run modes, sampled under one lock so the mode always belongs to the
+// handle it rides with.
+func (s *WorkerSpawner) ActiveSeats() []ActiveSeat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ActiveSeat, 0, len(s.sessions))
+	for _, ss := range s.sessions {
+		out = append(out, ActiveSeat{Handle: ss.handle, Mode: ss.spec.Mode})
+	}
+	return out
+}
+
 // ActiveWorkareas projects the spawner's in-flight sessions onto the
 // canonical afclient.WorkareaSummary wire shape so the WorkareaArchiveRegistry
 // can union live-pool members with on-disk archives in the GET

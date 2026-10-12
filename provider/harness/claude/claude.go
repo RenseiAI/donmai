@@ -183,7 +183,12 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID s
 	}
 
 	argv, stdinPrompt := buildArgs(spec, mcpPath, resumeSessionID)
-	return clijsonl.SpawnBinary(ctx, p.binary, argv, stdinPrompt, mcpPath, spec.Cwd, spec.Env, spec.OnProcessSpawned)
+	// Between-turn Inject re-enters the session cwd, where a repo-local
+	// settings file could redirect the follow-up turn's bearer: hand the
+	// driver the same routing pin this spawn carries so every --resume
+	// resolves on the pinned layer. Host-login sessions pin nothing and
+	// keep the resume argv byte-identical.
+	return clijsonl.SpawnBinary(ctx, p.binary, argv, stdinPrompt, mcpPath, resumePinArgs(spec), spec.Cwd, spec.Env, spec.OnProcessSpawned)
 }
 
 // Resume returns agent.ErrUnsupported on v0.5.0 per the locked

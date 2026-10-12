@@ -77,10 +77,12 @@ func seatBudgetReportFor(b seatbudget.Budget, placement seatbudget.Placement, go
 	}
 	mode := seatbudget.EffectiveModeFor(b.Mode, goos)
 	if mode == seatbudget.ModeEnforced && placement != seatbudget.PlacementSystemd {
-		// Downgrade ONLY on Linux, where EffectiveMode promised enforced.
-		// Off Linux the mode already resolved to best-effort (macOS
-		// cooperative caps) and the report below renders the knob line;
-		// collapsing that to none would erase a real best-effort budget.
+		// An explicit enforced budget off Linux is the operator's own
+		// ask: the seat still runs on its cooperative caps, and the
+		// report says best-effort — the degradation the budget package
+		// promises — never none, which would erase a real best-effort
+		// budget. Only on Linux did EffectiveMode promise enforced, so
+		// only there does a missing backend downgrade to none.
 		if goos == "linux" {
 			return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone), Detail: seatBudgetNoBackendDetailFor(placement)}
 		}

@@ -10,6 +10,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.73 — 2026-10-12
+
+### Chores
+
+- Report host interactive token totals from the native session file at exit
+- Seed workspace trust and route gateway bearer for unattended interactive sessions
+- Stop the service-mode first-run wizard from crash-looping fresh hosts
+- Wire the per-host repository keeper into the daemon
+- Probe that the shim's transient scope is creatable; surface scope failures
+
 ## v0.72.72 — 2026-10-11
 
 ### Features

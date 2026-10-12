@@ -320,6 +320,12 @@ func TestTrustBoundaryDirs_NeverSeedsHomeRootOrAncestors(t *testing.T) {
 // under an isolated config home for exactly the session's cwd — and for no
 // unrelated path. RED proof: remove the seedWorkspaceTrust call from
 // spawnInteractive and the record stays absent.
+//
+// The fake CLI blocks on a gate file until the test has observed the seed,
+// so the seed is asserted DURING the session: by the time the child exits,
+// the session-end cleanup (see removeSeededTrust) has already removed the
+// session's entries again — asserting presence after exit would assert the
+// cleanup never ran.
 func TestSpawn_Interactive_SeedsWorkspaceTrustFromTheAuthorizedBoundary(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("pty spawn tests are unix-only")
@@ -327,8 +333,9 @@ func TestSpawn_Interactive_SeedsWorkspaceTrustFromTheAuthorizedBoundary(t *testi
 	workdir := t.TempDir()
 	cfgHome := t.TempDir()
 	t.Setenv(claudeConfigDirEnv, cfgHome)
+	gate := filepath.Join(t.TempDir(), "gate")
 
-	p := newFakeInteractiveProvider(t, captureEnvArgvScript)
+	p := newFakeInteractiveProvider(t, "while [ ! -e "+shellQuote(gate)+" ]; do sleep 0.05; done\n"+captureEnvArgvScript)
 	h, err := p.Spawn(context.Background(), agent.Spec{
 		Cwd:         workdir,
 		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
@@ -337,41 +344,50 @@ func TestSpawn_Interactive_SeedsWorkspaceTrustFromTheAuthorizedBoundary(t *testi
 		t.Fatalf("Spawn: %v", err)
 	}
 	t.Cleanup(func() { _ = h.Stop(context.Background()) })
-	awaitPTYExit(t, h)
 
-	raw, err := os.ReadFile(filepath.Join(cfgHome, claudeTrustFileName))
-	if err != nil {
-		t.Fatalf("trust record was not seeded under the isolated config home: %v", err)
+	seeded := trustSeededFor(t, cfgHome, workdir)
+	if !seeded {
+		t.Fatalf("session cwd was not trusted DURING the interactive session (gate closed, seed missing)")
 	}
-	var record map[string]any
-	if err := json.Unmarshal(raw, &record); err != nil {
-		t.Fatalf("seeded trust record is unparseable: %v", err)
+	// Release the child; the session-end cleanup must then remove the
+	// session's entries again (asserted below by the cleanup tests — here
+	// the gate simply lets the child exit).
+	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	projects, _ := record["projects"].(map[string]any)
-	if projects == nil {
-		t.Fatalf("seeded record carries no projects: %v", record)
-	}
-	trusted := func(dir string) bool {
-		entry, _ := projects[dir].(map[string]any)
-		accepted, _ := entry["hasTrustDialogAccepted"].(bool)
-		return accepted
-	}
-	cleanWorkdir := filepath.Clean(workdir)
-	if !trusted(cleanWorkdir) {
-		t.Errorf("session cwd %q not trusted after interactive Spawn; record: %v", cleanWorkdir, projects)
-	}
-	if resolved, err := filepath.EvalSymlinks(cleanWorkdir); err == nil && resolved != cleanWorkdir && !trusted(resolved) {
-		t.Errorf("resolved cwd %q not trusted after interactive Spawn; record: %v", resolved, projects)
-	}
-	// The seed must not have trusted anything else: every recorded entry
-	// must be the cwd in one of its two spellings.
-	for dir := range projects {
-		if dir != cleanWorkdir {
-			if resolved, err := filepath.EvalSymlinks(cleanWorkdir); err != nil || dir != resolved {
-				t.Errorf("seed trusted an unrelated path %q; record: %v", dir, projects)
+	awaitPTYExit(t, h)
+}
+
+// trustSeededFor reports whether the trust record under cfgHome currently
+// trusts dir in either of its spellings (unresolved or resolved).
+func trustSeededFor(t *testing.T, cfgHome, dir string) bool {
+	t.Helper()
+	// The seed lands milliseconds after Spawn returns; poll briefly rather
+	// than asserting on a single read.
+	deadline := time.Now().Add(10 * time.Second)
+	clean := filepath.Clean(dir)
+	resolved, _ := filepath.EvalSymlinks(clean)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(filepath.Join(cfgHome, claudeTrustFileName))
+		if err == nil {
+			var record map[string]any
+			if json.Unmarshal(raw, &record) == nil {
+				projects, _ := record["projects"].(map[string]any)
+				if trustedEntry(projects, clean) || (resolved != "" && resolved != clean && trustedEntry(projects, resolved)) {
+					return true
+				}
 			}
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
+	return false
+}
+
+// trustedEntry reports whether projects records dir as trust-accepted.
+func trustedEntry(projects map[string]any, dir string) bool {
+	entry, _ := projects[dir].(map[string]any)
+	accepted, _ := entry["hasTrustDialogAccepted"].(bool)
+	return accepted
 }
 
 // TestSpawn_Interactive_GatewayBearerRidesTheUnattendedTokenPair drives the

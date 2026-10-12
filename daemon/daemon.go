@@ -1726,6 +1726,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// to af daemon stats. The latest observed status is stored
 			// in d.hostStatus; callers read via Daemon.HostStatus().
 			OnHostStatus: d.setLastHostStatus,
+			// Three-axis seat state rides every beat: one report per
+			// in-flight seat plus the axis-count fold.
+			GetSeatStates: d.seatStates,
 		}
 		if d.sessionShimEnabled() {
 			primaryScope := d.sessionShimConfig().orgID()
