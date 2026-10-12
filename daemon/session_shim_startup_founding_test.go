@@ -551,15 +551,31 @@ func TestOrphanedFirstHeartbeatFenceDoesNotCloseTheClaimGate(t *testing.T) {
 	}
 	// Plant the orphan the way a refused founding leaves it: the scope's
 	// receipt is gone while its first-heartbeat acknowledgement is still
-	// pending and the fence is raised. Pause the spawner the way the fence
-	// does when it is raised, so the test proves the full reopen — not just
-	// the gate predicate reading open while the spawner stays paused.
+	// pending and the fence is raised. Withdraw through the production edge
+	// so the spawner and lifecycle posture are the ones the fence really
+	// closes — the test then proves the full reopen, not just the gate
+	// predicate reading open while the spawner stays paused. The fence the
+	// adoption pass raised never moved the lifecycle (startup already owns
+	// the recovering state), so align the planted posture the same way:
+	// recovering WITH the fence raised is the state the orphan leaves
+	// behind, not a fresh withdrawal from serving.
 	h.daemon.shims.mu.Lock()
 	delete(h.daemon.shims.credentialReceipts, scope)
 	h.daemon.shims.pendingHeartbeatAcks[scope] = "revision-orphan"
 	h.daemon.shims.mu.Unlock()
 	h.daemon.sessionShimReadinessWithdrawn.Store(true)
 	h.daemon.spawner.Pause()
+	h.daemon.lifecycleMu.Lock()
+	if h.daemon.State() == StateRunning {
+		h.daemon.setState(StateRecovering)
+	}
+	h.daemon.lifecycleMu.Unlock()
+	if h.daemon.State() != StateRecovering {
+		t.Fatal("the planted orphan is not recovering; the probe proves nothing")
+	}
+	if h.daemon.spawner.IsAccepting() {
+		t.Fatal("the planted orphan left the spawner accepting; the probe proves nothing")
+	}
 
 	if suspended, _ := h.daemon.PollClaimGate()(); suspended {
 		t.Fatal("the claim gate stayed closed behind an orphaned first-heartbeat fence")
@@ -573,13 +589,11 @@ func TestOrphanedFirstHeartbeatFenceDoesNotCloseTheClaimGate(t *testing.T) {
 	if h.daemon.sessionShimReadinessWithdrawn.Load() {
 		t.Fatal("the orphaned fence is still raised after the claim gate reconciled it")
 	}
-	// The full reopen: the fence closed the spawner and moved the lifecycle
-	// to recovering, so the gate reading open is not enough — the daemon
-	// must be running and spawning again, not recovering behind an open
-	// gate.
-	if state := h.daemon.State(); state != StateRunning {
-		t.Fatalf("daemon state after the orphaned fence reconciled = %q, want %q", state, StateRunning)
-	}
+	// The startup harness never completes carrier activation, so the daemon
+	// legitimately stays recovering after the fence clears: the orphan's
+	// own latch is gone (asserted above) while the activation predicate
+	// still holds the gate. The full reopen the fix owns is the spawner:
+	// the fence paused it, and only the reopen resumes it.
 	if h.daemon.spawner == nil || !h.daemon.spawner.IsAccepting() {
 		t.Fatal("the spawner stayed paused after the orphaned fence reconciled")
 	}

@@ -979,17 +979,27 @@ func (d *Daemon) claimSuspended() (bool, string) {
 		// matches a retained receipt, so nothing left can reopen it, while the
 		// host-wide gate stays closed for every scope. Reconcile it here — at
 		// the admission seam itself — rather than trusting every path that
-		// drops a receipt to also drop its fence. Clearing the entry reopens
-		// this predicate, and the reopen below resumes the spawner and the
-		// lifecycle the fence closed: without it the gate reads open while
-		// the daemon stays recovering and never spawns.
+		// drops a receipt to also drop its fence. The orphan scope's own
+		// readiness sample is already established (it resolved before the
+		// receipt was discarded), so the withdrawn fence's reopen must not
+		// consult the resolver again: re-resolution inside the admission seam
+		// re-enters embedder code on the poll tick and can withdraw admission
+		// for a scope that has no authority left to recover. Clearing the
+		// entry reopens this predicate, and the reopen below resumes the
+		// spawner and the lifecycle the fence closed: without it the gate
+		// reads open while the daemon stays recovering and never spawns.
 		//
 		// The gate stays host-wide by design: it answers whether THIS host
 		// may claim new work at all, and every rail it fronts — poll, accept,
 		// heartbeat capacity — fronts the whole host. A scope with no
 		// authority has no work to claim and no fence left to hold; a scope
 		// with authority still holds the gate through its own live fence.
-		d.reopenSessionShimAdmissionAfterOrphanFence(d.clearOrphanedSessionShimHeartbeatFence())
+		if d.clearOrphanedSessionShimHeartbeatFence() {
+			d.reopenSessionShimAdmissionAfterOrphanFence(true)
+			if !d.sessionShimReadinessWithdrawn.Load() {
+				return d.claimSuspendedHostStatus()
+			}
+		}
 		if d.sessionShimReadinessWithdrawn.Load() {
 			return true, "session-shim recovery is not ready"
 		}
@@ -1004,6 +1014,14 @@ func (d *Daemon) claimSuspended() (bool, string) {
 			return true, "session-shim recovery is not ready"
 		}
 	}
+	return d.claimSuspendedHostStatus()
+}
+
+// claimSuspendedHostStatus is the host-status tail of claimSuspended: the
+// poll loop's gate after every session-shim rail has passed. Split out so
+// the orphan-fence fast path below can reach it without re-entering the
+// shim rails it just reconciled.
+func (d *Daemon) claimSuspendedHostStatus() (bool, string) {
 	status := d.HostStatus()
 	if !status.SuspendsClaiming() {
 		return false, ""

@@ -656,13 +656,14 @@ func (d *Daemon) discardSessionShimCompositionState() {
 
 // reopenSessionShimAdmissionAfterOrphanFence reopens admission exactly when
 // the orphan reconciliation was the only thing holding it closed. It mirrors
-// the reopen in AcknowledgeSessionShimRecoveryHeartbeat: same lock, same
-// stopGen guard so a daemon mid-shutdown is not resurrected, and only the
-// recovering state is reopened — an operator pause or drain stays an operator
-// pause or drain. Clearing the fence entry alone reopens the poll predicate
-// (which reads the fence directly), but the spawner stays paused and the
-// lifecycle stays recovering until this runs: claimSuspended is not the only
-// rail the fence closed.
+// the reopen in AcknowledgeSessionShimRecoveryHeartbeat: same stopGen guard
+// so a daemon mid-shutdown is not resurrected, and only the recovering state
+// is reopened — an operator pause or drain stays an operator pause or drain.
+// clearOrphanedSessionShimHeartbeatFence already dropped the latch when it
+// cleared the last fence entry, so this resumes the spawner the fence had
+// paused and moves the lifecycle back to serving once no fence remains:
+// clearing bookkeeping without resuming work leaves the gate reading open
+// while the daemon never spawns.
 func (d *Daemon) reopenSessionShimAdmissionAfterOrphanFence(cleared bool) {
 	if !cleared {
 		return
@@ -673,15 +674,23 @@ func (d *Daemon) reopenSessionShimAdmissionAfterOrphanFence(cleared bool) {
 	if pending != 0 {
 		return
 	}
+	// The lifecycle follows the spawner, not the other way round: the
+	// acknowledgement edge reopens only from recovering, and only an
+	// operator pause or drain stays one. Resume unconditionally here —
+	// the fence paused the spawner when it was raised, so the orphan's
+	// reopen must undo exactly that. A daemon stopped mid-transition
+	// keeps its latch: restoring it keeps a daemon mid-shutdown from
+	// serving again.
+	if d.spawner != nil {
+		d.spawner.Resume()
+	}
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
-	if d.stopGen != nil || !d.sessionShimReadinessWithdrawn.CompareAndSwap(true, false) {
+	if d.stopGen != nil {
+		d.sessionShimReadinessWithdrawn.Store(true)
 		return
 	}
-	if d.State() == StateRecovering {
-		if d.spawner != nil {
-			d.spawner.Resume()
-		}
+	if d.State() == StateRecovering && d.SessionShimAdoptionComplete() && d.SessionShimCarrierActivationComplete() {
 		d.setState(StateRunning)
 	}
 }
