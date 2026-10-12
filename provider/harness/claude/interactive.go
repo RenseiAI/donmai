@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 )
@@ -55,6 +57,18 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// against a declared-but-absent channel, so the producer learns), rather
 	// than killing a session over a latency optimisation.
 	hook, hookErr := newStopHookChannel()
+	// The activity relay is best effort like the notice channel: a relay
+	// that cannot be created is a session without hook telemetry, not a
+	// failed session. It shares nothing with the notice drop — either may
+	// exist without the other — but both ride the one --settings string.
+	relay, relayErr := activityrelay.New()
+	if relayErr != nil {
+		relay = nil
+	}
+	var activity map[string]any
+	if relay != nil {
+		activity = activitySettingsEntries(relay)
+	}
 	settings := ""
 	if hookErr == nil {
 		// The routing pin rides this same --settings string (see
@@ -69,26 +83,20 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		// session environment once the repo path is trusted, exactly as on
 		// the headless lane — that execution surface is the accepted model
 		// for a trusted repo, not something the pin closes.
-		if settings, err = hook.settingsJSONWithPin(pinnedRoutingEnv(spec)); err != nil {
+		if settings, err = hook.settingsJSONWithPinAndActivity(pinnedRoutingEnv(spec), activity); err != nil {
 			// Fail closed: the Stop-hook channel is best-effort, but the
 			// routing pin is not. A session that spawned without the pin
 			// would let a repo-local settings file redirect its bearer,
-			// so fall back to a pin-only --settings rather than none.
+			// so fall back to pin plus telemetry rather than none.
 			_ = hook.close()
 			hook = nil
-			if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
-				settings = pinOnly
-			} else {
-				settings = ""
-			}
+			settings = pinActivitySettings(pinnedRoutingEnv(spec), activity)
 		}
 	} else {
 		hook = nil
-		// Fail closed without the hook channel too: carry the pin alone
-		// rather than spawning unpinned.
-		if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
-			settings = pinOnly
-		}
+		// Fail closed without the hook channel too: carry the pin (and
+		// any telemetry) rather than spawning unpinned.
+		settings = pinActivitySettings(pinnedRoutingEnv(spec), activity)
 	}
 
 	cleanup := func() error {
@@ -108,18 +116,24 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		if hook != nil {
 			errs = append(errs, hook.close())
 		}
+		if relay != nil {
+			errs = append(errs, relay.Close())
+		}
 		return errors.Join(errs...)
 	}
 
 	h, err := ptycli.SpawnWithCleanup(ctx, p.binary,
 		interactiveArgsWith(spec, mcpPath, settings), spec, p.Manifest(), cleanup)
 	if err != nil {
+		if relay != nil {
+			_ = relay.Close()
+		}
 		return nil, err
 	}
-	if hook == nil {
+	if hook == nil && relay == nil {
 		return h, nil
 	}
-	return wrapInteractiveHandle(h, hook), nil
+	return wrapInteractiveHandle(h, hook, relayTailer(relay)), nil
 }
 
 // interactiveEventSlots sizes the wrapped handle's event channel. The coarse
@@ -147,7 +161,16 @@ const (
 // Teardown: every helper goroutine returns at session end whether or not the
 // caller drains Events — the tailer stops on Done and never blocks, and the
 // coarse sends always fit the reserved slots — after which Events closes.
-func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactiveHandle {
+// relayTailer returns the activity tailer for relay, or nil when the
+// session runs without hook telemetry.
+func relayTailer(relay *activityrelay.Relay) *activityrelay.Tailer {
+	if relay == nil {
+		return nil
+	}
+	return activityrelay.NewTailer(relay.EventsPath())
+}
+
+func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel, activity *activityrelay.Tailer) *interactiveHandle {
 	w := &interactiveHandle{
 		Handle:          h,
 		notices:         hook,
@@ -189,14 +212,38 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 	// Transcript usage tail: while the session runs, its JSONL transcript is
 	// tailed and each new assistant message.usage is forwarded as the same
 	// LlmCallEvent the headless lane emits, so an interactive session's
-	// spend reaches the session activity stream. Best-effort and
-	// rate-limited (see interactive_usage.go). It stops when the PTY child
-	// has exited and drained, after one final flush of trailing writes.
+	// spend reaches the session activity stream. The same goroutine sweeps
+	// the activity relay beside it: hook fires become harness-lifecycle
+	// events on the same channel. Best-effort and rate-limited (see
+	// interactive_usage.go). Both stop when the PTY child has exited and
+	// drained, after one final flush of trailing writes.
 	go func() {
 		defer wg.Done()
 		defer close(w.activityFlushed)
 		tailer := newInteractiveUsageTailer(hook)
-		tailer.run(session.Done(), emit)
+		sweepBoth := func() {
+			for _, ev := range sweepActivityRelay(activity) {
+				emit(ev)
+			}
+			for _, ev := range tailer.sweep() {
+				emit(ev)
+			}
+		}
+		flushBoth := func() {
+			tailer.flush(emit)
+			sweepBoth()
+		}
+		ticker := time.NewTicker(interactiveUsagePollInterval)
+		defer ticker.Stop()
+		for {
+			sweepBoth()
+			select {
+			case <-session.Done():
+				flushBoth()
+				return
+			case <-ticker.C:
+			}
+		}
 	}()
 	go func() {
 		wg.Wait()
