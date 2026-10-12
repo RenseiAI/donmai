@@ -10,8 +10,10 @@ import (
 // runner path: without the launch contract the seat is nil and the runner
 // behaves exactly as before; a malformed contract is also nil (never a
 // half-read seat with a zero attempt that could shadow a fresh run); a valid
-// contract carries the contract's monotonic process epoch as the outbox
-// attempt.
+// contract arms the seat at the fixed session-scoped terminal sequence — the
+// launch contract's monotonic process epoch advances on resume and must
+// never key the outbox, or the resumed incarnation would orphan the record
+// the previous one persisted.
 func TestShimSeatFromEnv(t *testing.T) {
 	// The seam reads the real process environment, so cases run
 	// sequentially and each one states the full contract explicitly.
@@ -36,8 +38,23 @@ func TestShimSeatFromEnv(t *testing.T) {
 	if got == nil {
 		t.Fatal("valid contract produced no seat")
 	}
-	if got.Attempt != valid.ProcessEpoch {
-		t.Fatalf("attempt = %d, want process epoch %d", got.Attempt, valid.ProcessEpoch)
+	if got.Attempt != shimTerminalAttempt {
+		t.Fatalf("attempt = %d, want fixed terminal sequence %d", got.Attempt, shimTerminalAttempt)
+	}
+
+	// A resumed incarnation carries a different process epoch but must
+	// still address the same terminal record.
+	resumed := valid
+	resumed.ProcessEpoch = 8
+	for key, value := range resumed.Env() {
+		t.Setenv(key, value)
+	}
+	regot := shimSeatFromEnv()
+	if regot == nil {
+		t.Fatal("resumed contract produced no seat")
+	}
+	if regot.Attempt != got.Attempt {
+		t.Fatalf("resumed attempt = %d, want %d", regot.Attempt, got.Attempt)
 	}
 
 	t.Setenv(sessionshim.EnvProcessEpoch, "not-a-number")
