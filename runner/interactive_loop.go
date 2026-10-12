@@ -444,9 +444,8 @@ func (r *Runner) dispatchInteractive(
 	// best-effort and never blocks the PTY: drops on a slow consumer,
 	// silence when the harness reports no signal. The pi leg reports
 	// through ObservePiRPCUsage on its RPC stream instead of a file poll.
-	contextWatch, contextWatchCancel := r.startContextUsageWatch(interactiveCtx, worktreePath, res.ProviderName, sink)
-	defer contextWatchCancel()
-	_ = contextWatch
+	stopContextWatch := r.startContextUsageWatch(interactiveCtx, worktreePath, res.ProviderName, sink)
+	defer stopContextWatch()
 	handleEvents := handle.Events()
 	for {
 		// A nil source parks the inject case while a notice is held.
@@ -691,23 +690,43 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 // startContextUsageWatch starts the harness context/compaction watcher
 // for one interactive session. It resolves the harness-native signal paths
 // from the provider identity and the session environment, starts the
-// watcher goroutine, and returns the watcher plus a cancel func the caller
-// defers. A nil watcher means the harness reports no pollable signal (or
-// the paths cannot be resolved) — the session runs without context
-// notices, exactly as a headless session without a quota harness runs
-// without quota reports. Emission rides postInteractiveEvent so notices
-// reach both the activity sink and the events.jsonl audit leg.
-func (r *Runner) startContextUsageWatch(ctx context.Context, worktreePath string, provider agent.ProviderName, sink activitySink) (*contextUsageWatcher, context.CancelFunc) {
-	watchCtx, cancel := context.WithCancel(ctx)
+// watcher goroutine, and returns the stop func the caller defers. A harness
+// with no pollable signal (or unresolvable paths) gets a no-op stop — the
+// session runs without context notices, exactly as a headless session
+// without a quota harness runs without quota reports. Emission rides
+// postInteractiveEvent so notices reach both the activity sink and the
+// events.jsonl audit leg.
+func (r *Runner) startContextUsageWatch(ctx context.Context, worktreePath string, provider agent.ProviderName, sink activitySink) func() {
 	source := resolveContextUsageSource(provider)
 	if source.harness == "" {
-		return nil, cancel
+		return func() {}
 	}
-	w := newContextUsageWatcher(source)
-	go w.run(watchCtx, func(ev agent.Event) {
-		r.postInteractiveEvent(watchCtx, worktreePath, sink, ev)
-	})
-	return w, cancel
+	return r.runContextUsageWatch(ctx, newContextUsageWatcher(source), worktreePath, sink)
+}
+
+// runContextUsageWatch runs w on its own goroutine and returns a stop func
+// that cancels the watcher AND waits for the goroutine to exit. The join is
+// load-bearing: the dispatch's caller stops the activity poster and closes
+// the execution-event journal right after the dispatch returns, so a notice
+// still in flight would race the poster's queue close (a send on a closed
+// channel panics the process) or append after the terminal journal record.
+// Waiting is bounded because every sink leg is non-blocking or local.
+func (r *Runner) runContextUsageWatch(ctx context.Context, w *contextUsageWatcher, worktreePath string, sink activitySink) func() {
+	watchCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.run(watchCtx, func(ev agent.Event) {
+			if watchCtx.Err() != nil {
+				return
+			}
+			r.postInteractiveEvent(watchCtx, worktreePath, sink, ev)
+		})
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // resolveContextUsageSource maps the spawned provider onto the
@@ -772,6 +791,7 @@ func findThreadRolloutPath(home, threadID string) string {
 	return best
 }
 
+// drainInteractiveActivity runs once the PTY session is Done. A handle that
 // implements agent.InteractiveActivityFlusher enqueues its final activity
 // after Done, so keep forwarding events until it signals the flush (bounded
 // by interactiveActivityFlushGrace); then forward whatever is already

@@ -2,8 +2,11 @@ package runner
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -254,5 +257,64 @@ func TestContextWatcher_RunStopsOnCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("run did not return after cancel")
+	}
+}
+
+// blockingContextSink parks the first Send until released, standing in for
+// a notice that is mid-delivery when the session tears down.
+type blockingContextSink struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingContextSink) Send(context.Context, agent.Event) {
+	first := false
+	s.once.Do(func() { first = true })
+	if first {
+		close(s.entered)
+		<-s.release
+	}
+}
+
+// TestContextUsageWatchStopJoinsInFlightEmit pins the teardown contract:
+// the stop func the interactive dispatch defers must not return while a
+// notice is still in flight to the sink. The dispatch's caller stops the
+// activity poster (closing its queue) and closes the execution-event
+// journal right after the dispatch returns, so an emit that outlives stop
+// would race the queue close or append after the terminal record.
+func TestContextUsageWatchStopJoinsInFlightEmit(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := writeSidecar(t, dir, `{"used_percentage": 60}`)
+	w := newContextUsageWatcher(contextUsageSource{harness: "claude-code", sidecarPath: path})
+	sink := &blockingContextSink{entered: make(chan struct{}), release: make(chan struct{})}
+	r := &Runner{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	stop := r.runContextUsageWatch(context.Background(), w, dir, sink)
+	select {
+	case <-sink.entered:
+	case <-time.After(5 * time.Second):
+		close(sink.release)
+		stop()
+		t.Fatal("watcher never emitted the 60% crossing")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		close(sink.release)
+		t.Fatal("stop returned while a notice was still in flight to the sink")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(sink.release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not return after the in-flight emit finished")
 	}
 }
