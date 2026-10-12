@@ -915,6 +915,183 @@ func TestPolicyFence_TokenMismatchIsAnsweredWithAReasonedDenial(t *testing.T) {
 	}
 }
 
+// TestOutputLimitCutoff_StopsAfterConsecutiveCutoffTurns pins the
+// repeated-cut-off rail: N consecutive cut-off turns (assistant message_end
+// with stopReason "length", one per turn) end the session with the typed
+// outputLimitCutoffCode failure instead of retrying without bound. Each
+// cut-off turn scripts the recorded refusal shape (length-stopped message +
+// hook-less start/end pair + turn_end), so removing the counter — never
+// folding the streak, or never returning fatal — turns this red: the session
+// would run to its own terminal ResultEvent instead.
+func TestOutputLimitCutoff_StopsAfterConsecutiveCutoffTurns(t *testing.T) {
+	t.Parallel()
+	cutoffTurn := func(callID string) string {
+		return assistantMessageEnd("length", [2]string{callID, "edit"}) +
+			truncatedCallPair("edit", callID) +
+			event(map[string]any{"type": "turn_end"})
+	}
+	body := getStateResponse("ses_cutoff") +
+		event(map[string]any{"type": "agent_start"}) +
+		cutoffTurn("c-cut-1") +
+		cutoffTurn("c-cut-2") +
+		cutoffTurn("c-cut-3") +
+		event(map[string]any{"type": "agent_settled"})
+
+	spec := agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true}
+	spec.ProviderConfig = map[string]any{"maxConsecutiveOutputLimitCutoffs": 3}
+	_, h, err := spawnScripted(t, spec, handshakeEvent("h1"), body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainToResultOrClose(t, h)
+
+	var fatal, completed, refused int
+	for _, e := range evs {
+		switch value := e.(type) {
+		case agent.ErrorEvent:
+			if value.Code == outputLimitCutoffCode {
+				fatal++
+				if value.SessionContinues {
+					t.Errorf("cut-off failure says the session continues: %+v", value)
+				}
+				if value.Message == "" {
+					t.Error("cut-off failure carried no message")
+				}
+				continue
+			}
+			t.Errorf("unexpected ErrorEvent code %q: %s", value.Code, value.Message)
+		case agent.ResultEvent:
+			completed++
+		case agent.SystemEvent:
+			if value.Subtype == outputLimitRefusalSubtype {
+				refused++
+			}
+		}
+	}
+	if fatal != 1 {
+		t.Errorf("cut-off ErrorEvents = %d, want exactly 1: %+v", fatal, evs)
+	}
+	if completed != 0 {
+		t.Errorf("session reached a ResultEvent after %d consecutive cut-offs: %+v", 3, evs)
+	}
+	if refused != 3 {
+		t.Errorf("%s SystemEvents = %d, want 3 (one per cut-off turn)", outputLimitRefusalSubtype, refused)
+	}
+	if err := h.(*Handle).Stop(t.Context()); err != nil {
+		t.Errorf("Stop: %v", err)
+	}
+}
+
+// TestOutputLimitCutoff_NormalTurnResetsTheStreak pins the other half: a
+// normal turn between cut-offs resets the count, so the session runs to its
+// own terminal instead of stopping. Removing the reset — never clearing the
+// streak on a normal turn — turns this red.
+func TestOutputLimitCutoff_NormalTurnResetsTheStreak(t *testing.T) {
+	t.Parallel()
+	cutoffTurn := func(callID string) string {
+		return assistantMessageEnd("length", [2]string{callID, "edit"}) +
+			truncatedCallPair("edit", callID) +
+			event(map[string]any{"type": "turn_end"})
+	}
+	normalTurn := event(map[string]any{"type": "turn_end"})
+	body := getStateResponse("ses_cutoff_reset") +
+		event(map[string]any{"type": "agent_start"}) +
+		cutoffTurn("c-cut-1") +
+		cutoffTurn("c-cut-2") +
+		normalTurn +
+		cutoffTurn("c-cut-3") +
+		cutoffTurn("c-cut-4") +
+		event(map[string]any{"type": "agent_settled"})
+
+	spec := agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true}
+	spec.ProviderConfig = map[string]any{"maxConsecutiveOutputLimitCutoffs": 3}
+	_, h, err := spawnScripted(t, spec, handshakeEvent("h1"), body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainToResultOrClose(t, h)
+
+	var completed int
+	for _, e := range evs {
+		switch value := e.(type) {
+		case agent.ErrorEvent:
+			t.Errorf("session stopped on %q after a normal turn reset the streak: %s", value.Code, value.Message)
+		case agent.ResultEvent:
+			completed++
+		}
+	}
+	if completed != 1 {
+		t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+	}
+}
+
+// TestOutputLimitCutoff_BelowBoundDoesNotStop pins the boundary: fewer than
+// N cut-off turns is not a failure — the session runs to its own terminal.
+func TestOutputLimitCutoff_BelowBoundDoesNotStop(t *testing.T) {
+	t.Parallel()
+	cutoffTurn := func(callID string) string {
+		return assistantMessageEnd("length", [2]string{callID, "edit"}) +
+			truncatedCallPair("edit", callID) +
+			event(map[string]any{"type": "turn_end"})
+	}
+	body := getStateResponse("ses_cutoff_below") +
+		event(map[string]any{"type": "agent_start"}) +
+		cutoffTurn("c-cut-1") +
+		cutoffTurn("c-cut-2") +
+		event(map[string]any{"type": "agent_settled"})
+
+	spec := agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true}
+	spec.ProviderConfig = map[string]any{"maxConsecutiveOutputLimitCutoffs": 3}
+	_, h, err := spawnScripted(t, spec, handshakeEvent("h1"), body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainToResultOrClose(t, h)
+
+	var completed int
+	for _, e := range evs {
+		switch value := e.(type) {
+		case agent.ErrorEvent:
+			t.Errorf("session stopped below its bound on %q: %s", value.Code, value.Message)
+		case agent.ResultEvent:
+			completed++
+		}
+	}
+	if completed != 1 {
+		t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+	}
+}
+
+// TestConsecutiveOutputLimitCutoffs_ResolvesTheBound pins the configuration
+// rule: a positive ProviderConfig["maxConsecutiveOutputLimitCutoffs"] wins;
+// anything else — missing, non-numeric, fractional, zero, negative — is the
+// production default, so a misconfigured bound can never disable or zero the
+// guard.
+func TestConsecutiveOutputLimitCutoffs_ResolvesTheBound(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		config map[string]any
+		want   int
+	}{
+		{name: "unset is the default", config: nil, want: maxConsecutiveOutputLimitCutoffs},
+		{name: "positive wins", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": 5}, want: 5},
+		{name: "float64 from JSON decode wins", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": float64(2)}, want: 2},
+		{name: "zero is the default", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": 0}, want: maxConsecutiveOutputLimitCutoffs},
+		{name: "negative is the default", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": -1}, want: maxConsecutiveOutputLimitCutoffs},
+		{name: "fractional is the default, never truncated", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": 2.5}, want: maxConsecutiveOutputLimitCutoffs},
+		{name: "non-numeric is the default", config: map[string]any{"maxConsecutiveOutputLimitCutoffs": "5"}, want: maxConsecutiveOutputLimitCutoffs},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := consecutiveOutputLimitCutoffs(agent.Spec{ProviderConfig: tc.config}); got != tc.want {
+				t.Errorf("consecutiveOutputLimitCutoffs(%v) = %d, want %d", tc.config, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestToolCallID_AcceptsEveryWireSpelling pins the shared call-id rule both
 // sides of the boundary read through (policy.go callIDFieldNames; the
 // extension's toolCallIdOf mirrors the same order).

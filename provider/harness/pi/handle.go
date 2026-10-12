@@ -74,6 +74,21 @@ type outputLimitRefusal struct {
 // an outputLimitRefusal: an observation, never an error, because nothing ran.
 const outputLimitRefusalSubtype = agent.SystemSubtypeToolCallRefusedOutputLimit
 
+// outputLimitCutoffCode is the typed failure the session ends with after
+// maxConsecutiveOutputLimitCutoffs cut-off turns in a row: the model keeps
+// hitting the output-token limit without making progress, so retrying
+// without bound only burns budget. Like policy_extension_failed — and
+// unlike adjudicationMissingCode — it says the session must stop, which the
+// event itself says structurally (agent.ErrorEvent with SessionContinues
+// unset, dispatched as the session's fatal terminal).
+const outputLimitCutoffCode = "pi_output_limit_cutoff"
+
+// maxConsecutiveOutputLimitCutoffs is how many consecutive cut-off turns
+// end the session with outputLimitCutoffCode. A normal turn in between
+// resets the count. Read through consecutiveOutputLimitCutoffs so tests can
+// pin a smaller bound without changing the production default.
+const maxConsecutiveOutputLimitCutoffs = 3
+
 // argumentRejection is one guarded call the RUNTIME rejected before execution
 // because its arguments failed the tool's schema validation. Validation runs
 // before the tool_call hook, so no ruling can exist for such a call. Kept
@@ -199,6 +214,23 @@ type Handle struct {
 	lengthStopped       map[string]string
 	outputLimitRefusals []outputLimitRefusal
 
+	// consecutiveCutoffs counts consecutive cut-off turns: turns whose
+	// assistant message stopped on the output-token limit (stopReason
+	// "length", marked by noteLengthStoppedToolCalls). A turn with no
+	// such message resets it. At the session's bound the session ends with
+	// outputLimitCutoffCode instead of retrying without bound. Guarded by
+	// adjMu; dispatch alone mutates it, single-goroutine.
+	consecutiveCutoffs int
+	// turnCutOff marks the current turn as cut off: set when an assistant
+	// message_end with stopReason "length" arrives, consumed (and cleared)
+	// by the turn's turn_end when it folds the streak. Guarded by adjMu.
+	turnCutOff bool
+	// cutoffLimit overrides maxConsecutiveOutputLimitCutoffs when positive:
+	// the small-constant bound of the issue scope, configurable per
+	// session. Zero is the production default. Set at construction, read
+	// only from dispatch's goroutine.
+	cutoffLimit int
+
 	// startedCalls maps the call id of every guarded tool_execution_start in
 	// the current turn to the tool and arguments it named. The runtime emits
 	// the start BEFORE it validates the arguments, so the entry is in place
@@ -297,9 +329,24 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 		adjudications:   make(map[string]adjudicationOutcome),
 		lengthStopped:   make(map[string]string),
 		startedCalls:    make(map[string]startedCall),
+		cutoffLimit:     consecutiveOutputLimitCutoffs(spec),
 		events:          make(chan agent.Event, 256),
 		closed:          make(chan struct{}),
 	}
+}
+
+// consecutiveOutputLimitCutoffs resolves the cut-off bound for one session:
+// a positive ProviderConfig["maxConsecutiveOutputLimitCutoffs"] wins, so
+// the small-constant bound stays configurable per session; anything else is
+// the production default. Missing, non-numeric, fractional, or
+// non-positive reads as unset — the same rule positiveProviderConfigInt
+// applies to the token counts — so a misconfigured bound can never disable
+// or zero the guard.
+func consecutiveOutputLimitCutoffs(spec agent.Spec) int {
+	if n := positiveProviderConfigInt(spec, "maxConsecutiveOutputLimitCutoffs"); n > 0 {
+		return n
+	}
+	return maxConsecutiveOutputLimitCutoffs
 }
 
 // SessionID returns the pi session id once the get_state response has resolved
@@ -497,6 +544,19 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		// that can legitimately follow — drop it rather than let it excuse a
 		// later end that reuses the id.
 		h.clearTurnNotes()
+		// Fold the turn's cut-off mark into the streak BEFORE mapping the
+		// event: a cut-off turn advances the streak, a normal turn resets
+		// it. At the bound the session ends here with the typed failure
+		// instead of retrying without bound.
+		if h.foldCutoffTurn() {
+			h.signalClosed()
+			h.emit(agent.ErrorEvent{
+				Message: fmt.Sprintf("pi session stopped after %d consecutive turns cut off at the output-token limit without a normal turn in between", h.cutoffBound()),
+				Code:    outputLimitCutoffCode,
+				Raw:     raw(ev),
+			})
+			return true
+		}
 	}
 
 	// Integrity monitor: every guarded tool_execution_END is matched against
@@ -683,6 +743,12 @@ func (h *Handle) noteLengthStoppedToolCalls(ev rawEvent) {
 	parts, _ := msg["content"].([]any)
 	h.adjMu.Lock()
 	defer h.adjMu.Unlock()
+	// The turn is cut off however many toolCall parts it carries: even a
+	// part-less (or part-corrupted) length stop means the model hit the
+	// output-token limit on this turn, and the streak counts TURNS, not
+	// calls. Only assistant text never establishes anything — the
+	// stopReason above does.
+	h.turnCutOff = true
 	for _, p := range parts {
 		part, ok := p.(map[string]any)
 		if !ok || stringField(part, "type") != "toolCall" {
@@ -697,8 +763,43 @@ func (h *Handle) noteLengthStoppedToolCalls(ev rawEvent) {
 	}
 }
 
+// foldCutoffTurn folds the current turn's cut-off mark into the streak and
+// reports whether the session has hit its bound. A cut-off turn advances
+// the streak; a normal turn resets it. The mark is consumed either way, so
+// one message_end explains one turn_end and nothing else. Call only from
+// dispatch's turn_end branch (single-goroutine with every other adjMu
+// mutation here).
+func (h *Handle) foldCutoffTurn() bool {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	if h.turnCutOff {
+		h.turnCutOff = false
+		h.consecutiveCutoffs++
+		return h.consecutiveCutoffs >= h.cutoffBoundLocked()
+	}
+	h.consecutiveCutoffs = 0
+	return false
+}
+
+// cutoffBound returns the session's cut-off bound: the configured limit
+// when positive, else the production default.
+func (h *Handle) cutoffBound() int {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	return h.cutoffBoundLocked()
+}
+
+func (h *Handle) cutoffBoundLocked() int {
+	if h.cutoffLimit > 0 {
+		return h.cutoffLimit
+	}
+	return maxConsecutiveOutputLimitCutoffs
+}
+
 // clearTurnNotes drops every length-stop and started-call note at a turn
-// boundary.
+// boundary. The cut-off streak lives outside the per-turn notes: turnCutOff
+// was already folded by foldCutoffTurn before this runs, and the streak
+// itself spans turns by design.
 func (h *Handle) clearTurnNotes() {
 	h.adjMu.Lock()
 	defer h.adjMu.Unlock()
