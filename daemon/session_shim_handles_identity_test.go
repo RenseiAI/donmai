@@ -33,7 +33,7 @@ func TestAdoptedHandleCarriesSessionIdentityAfterRestart(t *testing.T) {
 			RegistryDir:    f.registry,
 			HostID:         "host-restart-identity",
 			OrgID:          orgID,
-			OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			OnAdoptionBatch: func(_ context.Context, _ SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 				return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("restart-identity-batch")}, nil
 			},
 			OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
@@ -171,10 +171,10 @@ func TestSpawnerSeesShimOwnedSessionIDs(t *testing.T) {
 	d.shims.mu.Lock()
 	d.shims.adopted[id] = adoptedShim{shimID: "shim-adopted"}
 	d.shims.quarantined = []sessionshim.QuarantinedSession{{
-			OrgID: "org-guard", SessionID: "held",
-			ShimID: "shim-quarantined", ProcessEpoch: 1,
-			Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
-		}}
+		OrgID: "org-guard", SessionID: "held",
+		ShimID: "shim-quarantined", ProcessEpoch: 1,
+		Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+	}}
 	d.shims.mu.Unlock()
 	d.spawner.mu.Lock()
 	count := d.spawner.externalSessionOccupancyLocked()
