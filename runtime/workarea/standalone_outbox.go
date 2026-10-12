@@ -165,6 +165,13 @@ type standaloneOutboxEnvelope struct {
 // a full day before the next replay pass removes its file.
 const StandaloneOutboxRetention = 24 * time.Hour
 
+// StandaloneOutboxDeadline is the delivery bound for a terminal record
+// that carries no lease expiry of its own. It is deliberately longer than
+// the fixed v1 lease maximum: the deadline is the record's own policy, not
+// a borrowed lease duration, so a daemon back after the lease window still
+// replays an unsent terminal instead of dead-lettering it on arrival.
+const StandaloneOutboxDeadline = 7 * 24 * time.Hour
+
 // standaloneOutboxQuarantineDir names the sibling directory that holds
 // outbox files which failed to decode. A stray, truncated, or unknown-kind
 // file quarantines there instead of failing the whole scan: without it one

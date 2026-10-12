@@ -521,3 +521,10 @@ func holdOutboxRecordLock(t *testing.T, store *LeaseStore, key string) func() {
 		_ = f.Close()
 	}
 }
+
+func TestStandaloneOutboxDeadlineIsNotABorrowedLease(t *testing.T) {
+	t.Parallel()
+	if StandaloneOutboxDeadline <= MaximumLeaseDuration {
+		t.Fatalf("deadline=%v, want longer than the lease maximum %v", StandaloneOutboxDeadline, MaximumLeaseDuration)
+	}
+}

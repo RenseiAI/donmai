@@ -931,7 +931,11 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 			} else if _, saveErr := r.wt.SaveStandaloneTerminalOutbox(context.Background(), workarea.StandaloneOutboxSaveSpec{
 				SessionID: qw.SessionID, Attempt: r.shimSeat.Attempt, TerminalResultID: standaloneDigest,
 				ReceiverKey: r.poster.ReceiverKey(), Body: standaloneBody,
-				DeadlineAt: r.now().Add(workarea.MaximumLeaseDuration).UTC().Truncate(time.Millisecond),
+				// The record's own delivery bound, not a borrowed lease
+				// duration: a daemon back after the lease window must
+				// still replay an unsent terminal rather than
+				// dead-letter it on arrival.
+				DeadlineAt: r.now().Add(workarea.StandaloneOutboxDeadline).UTC().Truncate(time.Millisecond),
 				Kind:       workarea.StandaloneOutboxTerminal,
 			}); saveErr != nil {
 				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
