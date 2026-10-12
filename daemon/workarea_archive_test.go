@@ -827,6 +827,42 @@ func TestWorkareaArchiveRegistry_Restore_PoolSaturation(t *testing.T) {
 	}
 }
 
+func TestWorkareaArchiveRegistry_DropArchive_RemovesDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureArchive(t, root, fixtureArchive{
+		id: "wa-drop", manifest: archiveManifest{SessionID: "sess-drop"},
+		tree: map[string]string{"retained.txt": "retained"},
+	})
+	writeFixtureArchive(t, root, fixtureArchive{
+		id: "wa-keep", manifest: archiveManifest{SessionID: "sess-keep"},
+		tree: map[string]string{"retained.txt": "retained"},
+	})
+	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := reg.DropArchive("wa-drop"); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "wa-drop")); !os.IsNotExist(err) {
+		t.Fatalf("dropped archive still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "wa-keep", "tree", "retained.txt")); err != nil {
+		t.Fatalf("sibling archive disturbed: %v", err)
+	}
+	if err := reg.DropArchive("wa-drop"); !errors.Is(err, ErrArchiveNotFound) {
+		t.Fatalf("second drop error = %v, want ErrArchiveNotFound", err)
+	}
+}
+
+func TestWorkareaArchiveRegistry_DropArchive_RejectsTraversal(t *testing.T) {
+	root := t.TempDir()
+	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := reg.DropArchive("../escape"); !errors.Is(err, ErrArchiveNotFound) {
+		t.Fatalf("traversal drop error = %v, want ErrArchiveNotFound", err)
+	}
+	if err := reg.DropArchive("wa-missing"); !errors.Is(err, ErrArchiveNotFound) {
+		t.Fatalf("missing drop error = %v, want ErrArchiveNotFound", err)
+	}
+}
+
 func TestWorkareaArchiveRegistry_Restore_NotFound(t *testing.T) {
 	root := t.TempDir()
 	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})

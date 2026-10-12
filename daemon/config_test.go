@@ -358,6 +358,21 @@ func TestDefaultConfig_HasSaneDefaults(t *testing.T) {
 	}
 }
 
+func TestEffectiveRetentionSettings_DefaultsAndDisables(t *testing.T) {
+	defaults := (&Config{}).EffectiveRetentionSettings()
+	if defaults.MaxAgeDays != DefaultRetentionMaxAgeDays || defaults.ArchiveMaxAgeDays != DefaultRetentionArchiveMaxAgeDays || defaults.MaxBytes != 0 {
+		t.Fatalf("defaults = %+v, want 14 days / no disk limit / 30 days", defaults)
+	}
+	disabled := (&Config{Workarea: WorkareaConfig{Retention: RetentionConfig{MaxAgeDays: -1, MaxDiskGb: -1, ArchiveMaxAgeDays: -1}}}).EffectiveRetentionSettings()
+	if disabled.MaxAgeDays != 0 || disabled.MaxBytes != 0 || disabled.ArchiveMaxAgeDays != 0 {
+		t.Fatalf("disabled = %+v, want all zero", disabled)
+	}
+	custom := (&Config{Workarea: WorkareaConfig{Retention: RetentionConfig{MaxAgeDays: 7, MaxDiskGb: 10, ArchiveMaxAgeDays: 60}}}).EffectiveRetentionSettings()
+	if custom.MaxAgeDays != 7 || custom.MaxBytes != 10*1024*1024*1024 || custom.ArchiveMaxAgeDays != 60 {
+		t.Fatalf("custom = %+v, want 7 days / 10 GiB / 60 days", custom)
+	}
+}
+
 func TestProjectContractMigration(t *testing.T) {
 	tests := []struct {
 		name     string

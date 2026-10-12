@@ -242,26 +242,27 @@ type ProvisionResult struct {
 // Concurrency: the Manager serializes Provision/Teardown for the
 // same session id but allows different sessions to run in parallel.
 type Manager struct {
-	parentDir               string
-	logger                  *slog.Logger
-	prober                  OwnershipProber
-	runner                  CommandRunner
-	publicationCustomRunner bool
-	publicationGitPath      string
-	envRunner               EnvCommandRunner
-	gitAuth                 GitAuth
-	baseFetchTimeout        time.Duration
-	delay                   time.Duration
-	credentialRetryDelays   []time.Duration
-	leases                  *workarea.LeaseStore
-	acquisitions            *workarea.AcquisitionStore
-	seeds                   *workarea.SeedStore
-	provisionHook           ProvisionHook
-	archiveRoot             ArchiveRootFunc
-	restoreSessionID        string
-	authorityMu             sync.Mutex
-	now                     func() time.Time
-	lifecycleHook           func(string)
+	parentDir                    string
+	logger                       *slog.Logger
+	prober                       OwnershipProber
+	runner                       CommandRunner
+	publicationCustomRunner      bool
+	publicationGitPath           string
+	envRunner                    EnvCommandRunner
+	gitAuth                      GitAuth
+	baseFetchTimeout             time.Duration
+	delay                        time.Duration
+	credentialRetryDelays        []time.Duration
+	leases                       *workarea.LeaseStore
+	acquisitions                 *workarea.AcquisitionStore
+	seeds                        *workarea.SeedStore
+	provisionHook                ProvisionHook
+	archiveRoot                  ArchiveRootFunc
+	restoreSessionID             string
+	retentionArchiveRootOverride string
+	authorityMu                  sync.Mutex
+	now                          func() time.Time
+	lifecycleHook                func(string)
 
 	mu           sync.Mutex
 	sessions     map[string]*ProvisionResult
@@ -354,6 +355,11 @@ type Options struct {
 	RestoreSessionID string
 	// LifecycleHook is a deterministic V16 seam inside the cross-process root transaction.
 	LifecycleHook func(stage string)
+	// RetentionArchiveRoot overrides the archive root the retention
+	// archive-drop pass scans. Empty defaults beside ParentDir,
+	// mirroring the daemon's default archive layout. Tests set it to a
+	// scratch directory.
+	RetentionArchiveRoot string
 	// BaseFetchTimeout bounds refreshing a base ref. Zero uses one minute.
 	BaseFetchTimeout time.Duration
 }
@@ -424,27 +430,28 @@ func NewManager(opts Options) (*Manager, error) {
 		}
 	}
 	manager := &Manager{
-		parentDir:               abs,
-		logger:                  logger,
-		prober:                  opts.OwnershipProber,
-		runner:                  runner,
-		publicationCustomRunner: opts.CommandRunner != nil,
-		publicationGitPath:      publicationGitPath,
-		envRunner:               envRunner,
-		gitAuth:                 opts.GitAuth,
-		baseFetchTimeout:        baseFetchTimeout,
-		delay:                   delay,
-		credentialRetryDelays:   opts.CredentialPropagationRetryDelays,
-		leases:                  leases,
-		acquisitions:            acquisitions,
-		seeds:                   seeds,
-		provisionHook:           opts.ProvisionHook,
-		archiveRoot:             opts.ArchiveRoot,
-		restoreSessionID:        opts.RestoreSessionID,
-		now:                     opts.Now,
-		lifecycleHook:           opts.LifecycleHook,
-		sessions:                make(map[string]*ProvisionResult),
-		sessionLocks:            make(map[string]*sync.Mutex),
+		parentDir:                    abs,
+		logger:                       logger,
+		prober:                       opts.OwnershipProber,
+		runner:                       runner,
+		publicationCustomRunner:      opts.CommandRunner != nil,
+		publicationGitPath:           publicationGitPath,
+		envRunner:                    envRunner,
+		gitAuth:                      opts.GitAuth,
+		baseFetchTimeout:             baseFetchTimeout,
+		delay:                        delay,
+		credentialRetryDelays:        opts.CredentialPropagationRetryDelays,
+		leases:                       leases,
+		acquisitions:                 acquisitions,
+		seeds:                        seeds,
+		provisionHook:                opts.ProvisionHook,
+		archiveRoot:                  opts.ArchiveRoot,
+		restoreSessionID:             opts.RestoreSessionID,
+		retentionArchiveRootOverride: opts.RetentionArchiveRoot,
+		now:                          opts.Now,
+		lifecycleHook:                opts.LifecycleHook,
+		sessions:                     make(map[string]*ProvisionResult),
+		sessionLocks:                 make(map[string]*sync.Mutex),
 	}
 	if acquisitions != nil {
 		if err := manager.restoreReadyAcquisitions(); err != nil {

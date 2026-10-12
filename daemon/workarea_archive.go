@@ -1351,6 +1351,52 @@ func (r *WorkareaArchiveRegistry) RestoreV1(
 	return &wa, 0, nil
 }
 
+// DropArchive removes one archive directory past its retention age. It is
+// the only path by which unpushed work leaves the host: the archive holds
+// a root's unpushed work, and dropping it after the archive maximum age is
+// an explicit transition with its own receipt (reported by the caller).
+//
+// The drop re-reads the manifest under the registry lock and only removes
+// the exact directory the validated id names: an id that fails validation
+// reports not-found, and a manifest that cannot be read reports corruption
+// rather than removing an unproven directory.
+func (r *WorkareaArchiveRegistry) DropArchive(archiveID string) error {
+	if err := requireValidArchiveID("drop", archiveID); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	archiveRoot, exists, err := r.openExistingArchiveRoot()
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("drop: archive %q: %w", archiveID, ErrArchiveNotFound)
+	}
+	defer func() { _ = archiveRoot.Close() }()
+	manifest, err := readArchiveManifestRoot(archiveRoot, archiveID, r.archiveHook)
+	if err != nil {
+		return fmt.Errorf("drop: %w", err)
+	}
+	if manifest.ID != "" && manifest.ID != archiveID {
+		return fmt.Errorf("drop: archive %q manifest identity %q: %w", archiveID, manifest.ID, ErrArchiveCorrupted)
+	}
+	entry, err := archiveRoot.Lstat(archiveID)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("drop: archive %q: %w", archiveID, ErrArchiveNotFound)
+		}
+		return fmt.Errorf("drop: inspect archive %q: %w", archiveID, err)
+	}
+	if !entry.IsDir() || entry.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("drop: archive %q is not a real directory: %w", archiveID, ErrArchiveCorrupted)
+	}
+	if err := archiveRoot.RemoveAll(archiveID); err != nil {
+		return fmt.Errorf("drop: remove archive %q: %w", archiveID, err)
+	}
+	return syncArchiveRoot(archiveRoot)
+}
+
 func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, manifest *archiveManifest) (*afclient.WorkareaV1, error) {
 	if manifest.AcquisitionID == "" || manifest.WorkareaID == "" || manifest.SessionID == "" || manifest.StoreID == "" || manifest.TreeDigest == "" {
 		return nil, fmt.Errorf("restore: incomplete session-root archive identity: %w", ErrArchiveCorrupted)
