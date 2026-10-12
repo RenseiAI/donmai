@@ -135,7 +135,13 @@ type continueRangeInspection struct {
 	// allowance (see deliversUnder); without one, merges alone never
 	// deliver.
 	hasMergeChange bool
-	scratchPaths   []string
+	// mergeOnly reports that every commit in the range is a merge: no
+	// non-merge commit of the session's own. A clean merge of the base
+	// branch lands here — the merge changed nothing against every
+	// parent by construction — and only a dispatch-declared clean-merge
+	// intent lets it deliver.
+	mergeOnly    bool
+	scratchPaths []string
 }
 
 func (i continueRangeInspection) delivers() bool {
@@ -143,13 +149,17 @@ func (i continueRangeInspection) delivers() bool {
 }
 
 // deliversUnder reports whether the inspected range delivers the work
-// under the dispatch-declared delivery policy. Without the merge
-// allowance this is delivers: at least one non-merge code change and
-// no scratch path. With it, a merge that carries the run's own
+// under the dispatch-declared delivery policy. Without an allowance
+// this is delivers: at least one non-merge code change and no scratch
+// path. With the merge allowance, a merge that carries the run's own
 // resolution also delivers — the merge commit itself changed a
 // non-scratch path against every parent — while the scratch rule
 // still applies, so a merge that only carries runner scratch stays
-// undelivered. Nil is today's behaviour.
+// undelivered. With the clean-merge intent, a pushed merge-only range
+// delivers even when the merge is clean: merging IS the task, so the
+// merge commit itself is the delivery — while the commit-count,
+// no-new-commit and scratch rules still apply, so an empty range or a
+// non-merge no-op commit never rides it. Nil is today's behaviour.
 func (i continueRangeInspection) deliversUnder(policy *prompt.DeliveryPolicy) bool {
 	if len(i.scratchPaths) > 0 {
 		return false
@@ -157,7 +167,10 @@ func (i continueRangeInspection) deliversUnder(policy *prompt.DeliveryPolicy) bo
 	if i.hasCodeChange {
 		return true
 	}
-	return policy.AllowsMerges() && i.hasMergeChange
+	if policy.AllowsMerges() && i.hasMergeChange {
+		return true
+	}
+	return policy.AllowsCleanMerge() && i.mergeOnly && i.commitCount > 0
 }
 
 // inspectContinueRange classifies the commits the session added between from
@@ -192,7 +205,7 @@ func inspectContinueRange(ctx context.Context, worktreePath, branch, from, to st
 	for _, commit := range nonMerges {
 		nonMergeSet[commit] = struct{}{}
 	}
-	inspection := continueRangeInspection{commitCount: len(commits)}
+	inspection := continueRangeInspection{commitCount: len(commits), mergeOnly: len(nonMerges) == 0}
 	scratchSet := map[string]struct{}{}
 	for _, commit := range commits {
 		changes, pathErr := continueCommitChanges(ctx, worktreePath, commit)

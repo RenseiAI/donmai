@@ -478,6 +478,15 @@ func TestOperationalPayloadDeliveryPolicyIsDigestBound(t *testing.T) {
 	if withMergesDigest == withoutPolicy || withMergesDigest == withDraftDigest {
 		t.Fatal("delivery policy values did not change the admission digest")
 	}
+	withClean := base
+	withClean.Delivery = &prompt.DeliveryPolicy{AllowCleanMerge: true}
+	withCleanDigest, err := DigestOperationalPayload(withClean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withCleanDigest == withoutPolicy || withCleanDigest == withDraftDigest || withCleanDigest == withMergesDigest {
+		t.Fatal("clean-merge intent did not change the admission digest")
+	}
 	projected := ProjectOperationalPayload(withDraft)
 	if projected.Delivery == nil || !projected.Delivery.AllowDraft || projected.Delivery.AllowMergeCommits {
 		t.Fatalf("projected delivery = %+v; want the stamped policy", projected.Delivery)

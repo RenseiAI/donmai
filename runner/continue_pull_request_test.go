@@ -1098,6 +1098,98 @@ func TestRun_ContinueModeMergeAllowedByPolicyDelivers(t *testing.T) {
 	}
 }
 
+// TestRun_ContinueModeCleanMergeAllowedByPolicyDelivers proves the
+// clean-merge intent through the production entry point: a run whose
+// only change since dispatch is a CLEAN merge of the base branch —
+// merging origin/main IS the task, so the merge carries no resolution —
+// counts as delivered when the dispatch declared it. Without the flag
+// the same head fails as merge-only (see
+// TestRun_ContinueModeMergeOnlyHeadHasNoCodeChange).
+func TestRun_ContinueModeCleanMergeAllowedByPolicyDelivers(t *testing.T) {
+	cleanMerge := func(t *testing.T, cwd string) {
+		advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12", "refs/pull/12/head")
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		delivery:       &prompt.DeliveryPolicy{AllowCleanMerge: true},
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during:   cleanMerge,
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed for a clean merge allowed by policy", res.Status, res.FailureMode, res.Error)
+	}
+	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("PullRequestURL = %q; want the continued pull request", res.PullRequestURL)
+	}
+	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+		t.Fatalf("continued head %q does not carry the pushed merge", remoteHead)
+	}
+}
+
+// TestRun_ContinueModeCleanMergeWithoutPolicyStillFails proves the
+// clean-merge intent is opt-in: the same clean merge that delivers under
+// the flag fails as merge-only without it.
+func TestRun_ContinueModeCleanMergeWithoutPolicyStillFails(t *testing.T) {
+	cleanMerge := func(t *testing.T, cwd string) {
+		advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12", "refs/pull/12/head")
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during:   cleanMerge,
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	}
+	if want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"; res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+}
+
+// TestRun_ContinueModeCleanMergeStillNeedsAPush proves the intent is
+// narrow: a clean merge the run never pushed still ends not delivered.
+// The merge moved the local head past dispatch, but the remote head
+// does not carry it, so the no-new-commit rule — not the code-change
+// rule — fails the run.
+func TestRun_ContinueModeCleanMergeStillNeedsAPush(t *testing.T) {
+	cleanMergeUnpushed := func(t *testing.T, cwd string) {
+		advanceMainAndMerge(t, cwd)
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		delivery:       &prompt.DeliveryPolicy{AllowCleanMerge: true},
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during:   cleanMergeUnpushed,
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	}
+	if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+}
+
 // TestRun_ContinueModeMergeWithoutPolicyStillFails proves the merge
 // allowance is opt-in: the same merge-with-resolution head that delivers
 // under the flag fails as merge-only without it.
@@ -1136,13 +1228,16 @@ func TestRun_ContinueModeMergeWithoutPolicyStillFails(t *testing.T) {
 func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
 	const branch = "continued/pr-12"
 	allowMerges := &prompt.DeliveryPolicy{AllowMergeCommits: true}
+	allowClean := &prompt.DeliveryPolicy{AllowCleanMerge: true}
 	cases := []struct {
 		name    string
 		arrange func(t *testing.T) (repo, startHead, newHead string)
 		// wantWithout is delivers() (today's behaviour); wantWith is
-		// deliversUnder with the merge allowance.
+		// deliversUnder with the merge allowance; wantClean is
+		// deliversUnder with the clean-merge intent.
 		wantWithout bool
 		wantWith    bool
+		wantClean   bool
 	}{
 		{
 			name: "merge with its own resolution",
@@ -1156,7 +1251,8 @@ func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
 				gitRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
 				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
 			},
-			wantWith: true,
+			wantWith:  true,
+			wantClean: true,
 		},
 		{
 			name: "merge only absorbing the base",
@@ -1166,6 +1262,7 @@ func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
 				gitRun(t, repo, "merge", "--no-ff", "-m", "merge develop", "origin/develop")
 				return repo, startHead, gitRun(t, repo, "rev-parse", "HEAD")
 			},
+			wantClean: true,
 		},
 		{
 			name: "code commit still delivers either way",
@@ -1177,6 +1274,7 @@ func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
 			},
 			wantWithout: true,
 			wantWith:    true,
+			wantClean:   true,
 		},
 		{
 			name: "merge resolution plus scratch still blocked",
@@ -1208,6 +1306,36 @@ func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
 			if got.deliversUnder(allowMerges) != tc.wantWith {
 				t.Errorf("deliversUnder(allow-merges) = %v; want %v (%+v)", got.deliversUnder(allowMerges), tc.wantWith, got)
 			}
+			if got.deliversUnder(allowClean) != tc.wantClean {
+				t.Errorf("deliversUnder(allow-clean-merge) = %v; want %v (%+v)", got.deliversUnder(allowClean), tc.wantClean, got)
+			}
+			if got.deliversUnder(nil) && tc.wantWithout == false && tc.wantClean == false && tc.wantWith == false {
+				t.Errorf("deliversUnder(nil) delivered an undelivered range (%+v)", got)
+			}
 		})
 	}
+
+	// A non-merge no-op commit never rides the clean-merge intent: the
+	// flag declares merging as the task, not empty commits.
+	t.Run("empty non-merge commit does not ride the clean-merge intent", func(t *testing.T) {
+		_, repo := backstopRemoteFixture(t)
+		startHead := continueFixtureBranch(t, repo, branch)
+		gitRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "no-op")
+		newHead := gitRun(t, repo, "rev-parse", "HEAD")
+		got, err := inspectContinueRange(context.Background(), repo, branch, startHead, newHead)
+		if err != nil {
+			t.Fatalf("inspectContinueRange: %v", err)
+		}
+		if got.deliversUnder(allowClean) {
+			t.Fatalf("deliversUnder(allow-clean-merge) = true for an empty non-merge commit (%+v); want false", got)
+		}
+	})
+
+	// An empty range never rides the clean-merge intent either.
+	t.Run("empty range does not ride the clean-merge intent", func(t *testing.T) {
+		got := continueRangeInspection{}
+		if got.deliversUnder(allowClean) {
+			t.Fatalf("deliversUnder(allow-clean-merge) = true for an empty range; want false")
+		}
+	})
 }

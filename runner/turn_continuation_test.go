@@ -1127,6 +1127,36 @@ func TestRun_ReworkMergeAllowedByPolicyIsDelivered(t *testing.T) {
 	wantContinuations(t, res, 0, 0, false)
 }
 
+// TestRun_ReworkCleanMergeAllowedByPolicyIsDelivered proves the
+// clean-merge intent through the production entry point on the rework
+// path: a rework run whose pull request gained only a CLEAN merge of
+// the base branch — merging IS the task — is delivered when the
+// dispatch declared it, with no continuation prompt. Without the flag
+// the same head is continued as merge-only (see
+// TestRun_ReworkMergeOnlyHeadIsContinuedAsNoNewCommit).
+func TestRun_ReworkCleanMergeAllowedByPolicyIsDelivered(t *testing.T) {
+	note := verdictScriptTurn{
+		text: "Merged the base branch into " + followUpPR + ".",
+		during: func(t *testing.T, cwd string) {
+			advanceMainAndMerge(t, cwd, "refs/heads/"+reworkBranch, "refs/pull/7/head")
+		},
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      githubPullRequestDraft,
+		delivery:   &prompt.DeliveryPolicy{AllowCleanMerge: true},
+		turns:      []verdictScriptTurn{note, {text: "never reached"}},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+}
+
 // for a draft pull request early, and the turn ended on a progress note with
 // that draft as its only result. The turn is continued with a prompt that
 // names the draft, and once the pull request is ready the work is delivered.

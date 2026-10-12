@@ -392,6 +392,7 @@ type PollContinuePullRequest struct {
 type PollDeliveryPolicy struct {
 	AllowDraft        bool `json:"allowDraft,omitempty"`
 	AllowMergeCommits bool `json:"allowMergeCommits,omitempty"`
+	AllowCleanMerge   bool `json:"allowCleanMerge,omitempty"`
 }
 
 // PollSkill mirrors prompt.SkillSpec for the daemon package so the daemon can

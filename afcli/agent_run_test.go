@@ -2622,14 +2622,14 @@ func TestDetailToQueuedWork_DeliveryPolicyForwarded(t *testing.T) {
 
 	queued, err := detailToQueuedWork(&daemon.SessionDetail{
 		SessionID:       "sess-delivery",
-		Delivery:        &daemon.PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true},
+		Delivery:        &daemon.PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true, AllowCleanMerge: true},
 		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
 	})
 	if err != nil {
 		t.Fatalf("detailToQueuedWork: %v", err)
 	}
-	if queued.Delivery == nil || !queued.Delivery.AllowDraft || !queued.Delivery.AllowMergeCommits {
-		t.Fatalf("Delivery = %+v; want both flags set", queued.Delivery)
+	if queued.Delivery == nil || !queued.Delivery.AllowDraft || !queued.Delivery.AllowMergeCommits || !queued.Delivery.AllowCleanMerge {
+		t.Fatalf("Delivery = %+v; want all flags set", queued.Delivery)
 	}
 }
 
