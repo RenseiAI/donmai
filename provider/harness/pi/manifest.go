@@ -79,6 +79,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// steer while a turn is in flight and follow_up while idle
 			// (handle.go). Shipped and driven.
 			NoticeDelivery: agent.NoticeDeliveryRPCSteer,
+			// The RPC usage object is the harness-native context signal
+			// when the session's RPC stream carries one, read by the
+			// runner's context watcher (runner/context_usage.go) and
+			// delivered as a typed ContextUsageEvent.
+			ContextUsageSource: agent.ContextUsageSourceRPCUsage,
 			Drives: []agent.WireProtocol{
 				agent.ProtoAnthropicMessages,
 				agent.ProtoOpenAIChat,

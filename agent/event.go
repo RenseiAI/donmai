@@ -25,6 +25,7 @@ const (
 	EventToolResult    EventKind = "tool_result"
 	EventToolProgress  EventKind = "tool_progress"
 	EventUsage         EventKind = "usage"
+	EventContextUsage  EventKind = "context_usage"
 	EventSubagent      EventKind = "subagent"
 	EventResult        EventKind = "result"
 	EventError         EventKind = "error"
@@ -34,7 +35,7 @@ const (
 //
 // Implementations: InitEvent, SystemEvent, AssistantTextEvent,
 // LlmCallEvent, ToolUseEvent, ToolResultEvent, ToolProgressEvent,
-// SubagentEvent, ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
+// ContextUsageEvent, SubagentEvent, ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
 // packages from satisfying the interface, keeping the discriminated
 // union closed.
 //
@@ -586,6 +587,12 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		var ev UsageEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, fmt.Errorf("agent: decode UsageEvent: %w", err)
+		}
+		return ev, nil
+	case EventContextUsage:
+		var ev ContextUsageEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode ContextUsageEvent: %w", err)
 		}
 		return ev, nil
 	case EventSubagent:

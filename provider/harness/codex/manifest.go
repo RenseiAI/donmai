@@ -59,6 +59,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// returns ErrUnsupported today (handle.go) — the CHANNEL is
 			// declared here; driving it is a separate lane.
 			NoticeDelivery: agent.NoticeDeliveryMCPRPC,
+			// token_count events in the rollout JSONL are the
+			// harness-native context signal, read by the runner's
+			// context watcher (runner/context_usage.go) and delivered
+			// as a typed ContextUsageEvent.
+			ContextUsageSource: agent.ContextUsageSourceRolloutTokenCount,
 			Drives:         []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},
 			DrivesHosts:    []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},
 			Transport:      agent.TransportSubprocessRPC,

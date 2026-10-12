@@ -435,6 +435,18 @@ func (r *Runner) dispatchInteractive(
 	usage := &interactiveUsageTotals{}
 	r.registerInteractiveUsage(qw.SessionID, usage)
 	defer r.releaseInteractiveUsage(qw.SessionID)
+
+	// Harness context/compaction notices: the interactive lane's equivalent
+	// of the headless lane's UsageEvent quota hook above. The watcher polls
+	// each harness's native context signal (statusline sidecar, rollout
+	// token_count) and delivers crossings as typed ContextUsageEvents on
+	// the same sink + JSONL legs as every other interactive event. It is
+	// best-effort and never blocks the PTY: drops on a slow consumer,
+	// silence when the harness reports no signal. The pi leg reports
+	// through ObservePiRPCUsage on its RPC stream instead of a file poll.
+	contextWatch, contextWatchCancel := r.startContextUsageWatch(interactiveCtx, worktreePath, res.ProviderName, sink)
+	defer contextWatchCancel()
+	_ = contextWatch
 	handleEvents := handle.Events()
 	for {
 		// A nil source parks the inject case while a notice is held.
@@ -676,7 +688,88 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 	}
 }
 
-// drainInteractiveActivity runs once the PTY session is Done. A handle that
+// startContextUsageWatch starts the harness context/compaction watcher
+// for one interactive session. It resolves the harness-native signal paths
+// from the provider identity and the session environment, starts the
+// watcher goroutine, and returns the watcher plus a cancel func the caller
+// defers. A nil watcher means the harness reports no pollable signal (or
+// the paths cannot be resolved) — the session runs without context
+// notices, exactly as a headless session without a quota harness runs
+// without quota reports. Emission rides postInteractiveEvent so notices
+// reach both the activity sink and the events.jsonl audit leg.
+func (r *Runner) startContextUsageWatch(ctx context.Context, worktreePath string, provider agent.ProviderName, sink activitySink) (*contextUsageWatcher, context.CancelFunc) {
+	watchCtx, cancel := context.WithCancel(ctx)
+	source := resolveContextUsageSource(provider)
+	if source.harness == "" {
+		return nil, cancel
+	}
+	w := newContextUsageWatcher(source)
+	go w.run(watchCtx, func(ev agent.Event) {
+		r.postInteractiveEvent(watchCtx, worktreePath, sink, ev)
+	})
+	return w, cancel
+}
+
+// resolveContextUsageSource maps the spawned provider onto the
+// harness-native context signal the watcher polls. Paths come from the
+// session environment the harness itself honors: the statusline sidecar
+// path for claude, the session-state subtree of CODEX_HOME for codex. An
+// empty harness means no pollable signal — pi reports through
+// ObservePiRPCUsage on its RPC stream, and every other harness reports
+// none.
+func resolveContextUsageSource(provider agent.ProviderName) contextUsageSource {
+	switch provider {
+	case agent.ProviderClaude:
+		if path := strings.TrimSpace(os.Getenv("CLAUDE_STATUSLINE_SIDECAR")); path != "" {
+			return contextUsageSource{harness: string(agent.HarnessClaudeCode), sidecarPath: path}
+		}
+	case agent.ProviderCodex:
+		if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+			if thread := strings.TrimSpace(os.Getenv("CODEX_THREAD_ID")); thread != "" {
+				return contextUsageSource{
+					harness:     string(agent.HarnessCodex),
+					rolloutPath: findThreadRolloutPath(home, thread),
+				}
+			}
+		}
+	}
+	return contextUsageSource{}
+}
+
+// findThreadRolloutPath locates the session file for one thread under the
+// harness home without importing the harness package: the newest
+// rollout-*-<threadID>.jsonl entry under the sessions subtree. Empty when
+// none exists yet — the watcher polls again next tick.
+func findThreadRolloutPath(home, threadID string) string {
+	if home == "" || threadID == "" {
+		return ""
+	}
+	root := filepath.Join(home, "sessions")
+	var best string
+	var bestMtime int64
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+		if !strings.HasSuffix(strings.TrimSuffix(name, ".jsonl"), "-"+threadID) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		mtime := info.ModTime().UnixNano()
+		if best == "" || mtime > bestMtime || (mtime == bestMtime && path > best) {
+			best, bestMtime = path, mtime
+		}
+		return nil
+	})
+	return best
+}
 // implements agent.InteractiveActivityFlusher enqueues its final activity
 // after Done, so keep forwarding events until it signals the flush (bounded
 // by interactiveActivityFlushGrace); then forward whatever is already

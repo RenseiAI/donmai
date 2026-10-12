@@ -1127,3 +1127,71 @@ func TestToolResultWithoutPairedUseHasZeroDuration(t *testing.T) {
 		t.Fatalf("orphan ToolResult durationMs: want 0, got %d", *got)
 	}
 }
+
+func TestContextUsageNoticePostsContextWithoutZeroFill(t *testing.T) {
+	t.Parallel()
+	used, in := 62.5, int64(125000)
+	requestBody := make(chan []byte, 1)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/activity") {
+			body, _ := io.ReadAll(r.Body)
+			requestBody <- body
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	p, err := activity.New(activity.Config{
+		SessionID: "s-usage", WorkerID: "w1",
+		BaseURL: srv.URL, HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	p.Send(context.Background(), agent.ContextUsageEvent{
+		Harness: "claude-code", Source: agent.ContextUsageSourceStatuslineSidecar,
+		NoticeKind: agent.ContextUsageThreshold,
+		UsedPercent: &used, InputTokens: &in,
+		// OutputTokens + ContextWindowSize unknown: absent, never zero.
+	})
+
+	var body []byte
+	select {
+	case body = <-requestBody:
+	case <-time.After(2 * time.Second):
+		t.Fatal("activity request was not received")
+	}
+	var wire struct {
+		Activity struct {
+			Type         string `json:"type"`
+			Content      string `json:"content"`
+			ContextKey   string `json:"contextKey"`
+			ContextValue string `json:"contextValue"`
+		} `json:"activity"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("decode: %v\n%s", err, body)
+	}
+	if wire.Activity.Type != "context" {
+		t.Errorf("type = %q, want context", wire.Activity.Type)
+	}
+	if wire.Activity.ContextKey != "contextUsage" {
+		t.Errorf("contextKey = %q, want contextUsage", wire.Activity.ContextKey)
+	}
+	for _, want := range []string{"usedPercent=62.5", "inputTokens=125000"} {
+		if !strings.Contains(wire.Activity.ContextValue, want) {
+			t.Errorf("contextValue = %q, want substring %q", wire.Activity.ContextValue, want)
+		}
+	}
+	for _, absent := range []string{"outputTokens", "contextWindowSize"} {
+		if strings.Contains(wire.Activity.ContextValue, absent) {
+			t.Errorf("contextValue = %q, must not contain %q (unknown, never zero)", wire.Activity.ContextValue, absent)
+		}
+	}
+	if strings.Contains(string(body), `"outputTokens":0`) || strings.Contains(string(body), `"contextWindowSize":0`) {
+		t.Fatalf("wire stores unknown as zero: %s", body)
+	}
+}

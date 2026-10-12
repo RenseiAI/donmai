@@ -109,6 +109,14 @@ type HarnessCaps struct {
 	// for the whole contract and for why the zero value is not "none".
 	NoticeDelivery NoticeDelivery `json:"noticeDelivery"`
 
+	// ContextUsageSource names the harness-native source a context notice
+	// was read from (statusline sidecar, rollout token_count, RPC usage).
+	// Empty means the harness reports no native context signal. It is a
+	// DOCUMENTATION axis for the generated capability matrix: the runner
+	// reads each harness's native files directly, so this declares where
+	// the signal lives, not a behavior the runner switches on.
+	ContextUsageSource string `json:"contextUsageSource,omitempty"`
+
 	// the DRIVE surface (the axis link)
 	Drives      []WireProtocol `json:"drives"`
 	DrivesHosts []ServingHost  `json:"drivesHosts"`

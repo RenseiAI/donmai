@@ -79,6 +79,12 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// runs, and every message aimed at it is dead-lettered rather than
 			// accepted into a door that does not exist.
 			NoticeDelivery: agent.NoticeDeliveryHook,
+			// The statusline sidecar JSON is the harness-native context
+			// signal: used_percentage, total_input_tokens,
+			// total_output_tokens and context_window_size, read by the
+			// runner's context watcher (runner/context_usage.go) and
+			// delivered as a typed ContextUsageEvent.
+			ContextUsageSource: agent.ContextUsageSourceStatuslineSidecar,
 			Drives:         []agent.WireProtocol{agent.ProtoAnthropicMessages},
 			DrivesHosts: []agent.ServingHost{
 				agent.HostOAuthCLI, agent.HostDirect, agent.HostBedrock, agent.HostVertex,
