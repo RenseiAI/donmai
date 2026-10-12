@@ -596,6 +596,126 @@ func TestFoundingRetryLoopFoundsWithAnotherHealthyFounder(t *testing.T) {
 	}
 }
 
+// TestFailedInstallRedeclaresTheStandDownWhenTheFirstAttemptFails pins the
+// sticky stand-down: when the stand-down re-declaration's first round trip
+// fails, the install retries it instead of leaving the refresher restored
+// to the composed attestation the daemon just stood down from. The harness
+// refuses the next stand-down refresh once; the install must still roll
+// back to stand-down on every surface, and the lane must end presenting
+// the stand-down — never the refused founder.
+func TestFailedInstallRedeclaresTheStandDownWhenTheFirstAttemptFails(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	embedder := &foundingEmbedder{refuseScopes: errors.New("satellite scope unavailable")}
+	cfg := h.composedConfig(acceptingBatch)
+	cfg.AcquireRecoveryScopes = embedder.acquireRecoveryScopes
+	// Refuse the next refresh that presents the stand-down exactly once: the
+	// first re-declaration round trip fails while the local posture is
+	// already stood down.
+	h.mu.Lock()
+	h.refuseStandDownRefreshOnce = true
+	h.mu.Unlock()
+
+	installErr := h.daemon.InstallSessionShimComposition(ctx, cfg)
+	if installErr == nil {
+		t.Fatal("a composition whose scopes were refused reported success")
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.StandsDown() {
+		t.Fatalf("attestation after the failed install = %#v, want the stand-down", got)
+	}
+	if state := h.daemon.State(); state != StateRunning {
+		t.Fatalf("daemon state after the failed install = %q, want %q", state, StateRunning)
+	}
+	if suspended, reason := h.daemon.PollClaimGate()(); suspended {
+		t.Fatalf("claim gate closed after the failed install: %s", reason)
+	}
+	if got := h.daemon.credentials.SessionShimAttestation(); !got.StandsDown() {
+		t.Fatalf("credential lane attestation after the failed install = %#v, want the stand-down", got)
+	}
+
+	composed, standDowns, last := compositionRefreshCounts(t, h)
+	if composed != 1 {
+		t.Fatalf("composed declarations = %d, want exactly the one the control plane accepted", composed)
+	}
+	if standDowns != 2 {
+		t.Fatalf("stand-down re-declarations = %d, want the failed first attempt plus its retry", standDowns)
+	}
+	if last["sessionShimSupported"] != false {
+		t.Fatalf("the last refresh presented %#v, want the stand-down", last)
+	}
+}
+
+// TestFoundingRetryLoopReturnsAConcurrentInstallUnretried pins the typed
+// single-flight error against the retry loop. A composition install running
+// beside the loop is not this loop's attempt failing — the loop must return
+// it immediately, without sleeping and without spending another attempt on
+// it. An untyped refusal would be retried as a refused founder; the typed
+// error is how the loop tells the two apart.
+func TestFoundingRetryLoopReturnsAConcurrentInstallUnretried(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var enterOnce sync.Once
+	installDone := make(chan error, 1)
+	go func() {
+		installDone <- h.daemon.InstallSessionShimComposition(ctx, h.composedConfig(
+			func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+				enterOnce.Do(func() { close(entered) })
+				<-release
+				return SessionShimAdoptionBatchReceipt{
+					DurableCorrelation: []byte("composition"), AdoptionRevision: "revision-batch",
+				}, nil
+			}))
+	}()
+	select {
+	case <-entered:
+	case err := <-installDone:
+		t.Fatalf("composition install returned before reaching adoption: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("composition install never reached the adoption pass")
+	}
+	defer func() {
+		close(release)
+		if err := <-installDone; err != nil {
+			t.Fatalf("background composition install: %v", err)
+		}
+	}()
+
+	// While that install holds the single flight, the retry loop's own
+	// attempt meets the typed refusal — not a founding refusal — and must
+	// return it without a single backoff wait.
+	var waits []time.Duration
+	policy := SessionShimFoundingRetryPolicy{
+		Configs:        []SessionShimConfig{h.composedConfig(acceptingBatch)},
+		MaxAttempts:    3,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		},
+	}
+	err := h.daemon.InstallSessionShimCompositionRetrying(ctx, h.composedConfig(acceptingBatch), policy)
+	var inFlight *ErrSessionShimCompositionInstallInFlight
+	if !errors.As(err, &inFlight) {
+		t.Fatalf("retrying install beside a live install = %v, want the typed single-flight error", err)
+	}
+	var refused *SessionShimFoundingRefused
+	if errors.As(err, &refused) {
+		t.Fatalf("retrying install beside a live install = %v, want no founding refusal", err)
+	}
+	if len(waits) != 0 {
+		t.Fatalf("backoff waits beside a live install = %v, want none: the loop must not retry another install", waits)
+	}
+}
+
 // TestFoundingRetryLoopRetriesTheSameFounderWithBackoff is the no-other-founder
 // half: with no further configuration listed, the loop retries the same
 // founder with doubling backoff instead of staying off until restart, and

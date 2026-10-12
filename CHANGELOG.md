@@ -8,7 +8,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- A refused startup founding no longer risks leaving the host believing in a composition it stood down from: the claim gate's orphan clean-up now fully reopens admission (spawner resumed, lifecycle back to serving) instead of only dropping the shared fence flag, the install's state check stays closed while the install's own recovering posture is live, the concurrent-install refusal is typed so the founding retry loop returns it instead of retrying a refused founder, and the stand-down re-declaration is retried with the local stand-down held sticky when its first round trip fails. Startup still succeeds stood down on a definite founding refusal; embedders that found at startup must drive the retry.
 
 ## v0.72.73 — 2026-10-12
 

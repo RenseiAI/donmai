@@ -72,6 +72,17 @@ import (
 // reading the [runtime-token] line can tell a declaration from a recovery.
 const sessionShimCompositionRefreshReason = "session-shim-composition"
 
+// sessionShimStandDownRedeclareAttempts bounds the stand-down re-declaration
+// retries after a failed install that had already presented the composed
+// attestation. The install itself is already failing, so the budget is small:
+// enough to ride out a transport blip without holding the install's rollback
+// — or startup — on a feature that was meant to be optional.
+const sessionShimStandDownRedeclareAttempts = 3
+
+// sessionShimStandDownRedeclareBackoff is the first wait between stand-down
+// re-declaration attempts; each later wait doubles.
+const sessionShimStandDownRedeclareBackoff = 200 * time.Millisecond
+
 // sessionShimIdentity is one coherent generation of the durable-session facts a
 // daemon presents: the configuration it was given and the controller id and
 // host attestation derived from it. Resolution errors are carried in the tuple
@@ -209,6 +220,19 @@ func (d *Daemon) SessionShimCompositionPending() bool {
 // SessionShimDurabilityRefusal() and the diagnostics surface, so an operator
 // who sees `off` can see why without the process log.
 //
+// ErrSessionShimCompositionInstallInFlight reports that a durable-session
+// composition install is already running. InstallSessionShimComposition
+// admits one install at a time; the retry entry point serializes its attempts
+// through the same single-flight check, so this error means "another attempt
+// is running" — the retry loop must not treat it as a refused founder.
+// errors.As against this type is how InstallSessionShimCompositionRetrying
+// tells a concurrent install from its own attempt's failure.
+type ErrSessionShimCompositionInstallInFlight struct{}
+
+func (e *ErrSessionShimCompositionInstallInFlight) Error() string {
+	return "session shim: a composition install is already in flight"
+}
+
 // It is safe to call from a goroutine started after Start returned. It admits
 // one install at a time and refuses a second composition outright.
 func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionShimConfig) error {
@@ -216,7 +240,7 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 		ctx = context.Background()
 	}
 	if !d.installingComposition.CompareAndSwap(false, true) {
-		return errors.New("session shim: a composition install is already in flight")
+		return &ErrSessionShimCompositionInstallInFlight{}
 	}
 	defer d.installingComposition.Store(false)
 
@@ -259,6 +283,11 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 		d.discardSessionShimCompositionState()
 		// Before the stand-down goes back on the wire: admission is local and
 		// must not wait on a network round trip that is itself best-effort.
+		// The install ran with the composed configuration live, so a state
+		// check opened mid-install (before the rollback restores the
+		// stand-down) must not see the install's own recovering posture as
+		// readiness. Restore first, then let the reopen below read the
+		// restored posture.
 		d.restoreSessionShimAdmissionAfterFailedInstall()
 		if declared {
 			d.redeclareSessionShimStandDown(ctx, prior.attestation)
@@ -448,6 +477,14 @@ func (d *Daemon) InstallSessionShimCompositionRetrying(ctx context.Context, cfg 
 		if err == nil {
 			return nil
 		}
+		// The loop serializes its own attempts, so a single-flight refusal
+		// names a concurrent install this loop did not start — never this
+		// attempt's outcome. Returning it keeps the caller from mistaking
+		// "someone else is installing" for "the founder was refused".
+		var inFlight *ErrSessionShimCompositionInstallInFlight
+		if errors.As(err, &inFlight) {
+			return err
+		}
 		var refused *SessionShimFoundingRefused
 		if !errors.As(err, &refused) {
 			return err
@@ -520,6 +557,16 @@ func (d *Daemon) declareSessionShimComposition(ctx context.Context) (declared bo
 // meant to be optional. The next ordinary refresh re-presents the stand-down
 // anyway, because the refresher's attestation is restored here regardless of
 // whether the round trip lands.
+//
+// The re-declaration is retried with a short bounded backoff: a single
+// attempt that fails on a transport blip would otherwise leave the control
+// plane believing in a composition the daemon has abandoned, while the
+// refresher's failure restore puts the refused founder back on the next
+// refresh — the composition the host just stood down from, presented again
+// with nobody watching. The daemon itself stays stood down throughout: the
+// local stand-down posture is already restored before this runs (and stays
+// restored when every attempt fails), so a failed re-declaration never
+// re-arms the refused founder locally, only delays the wire withdrawal.
 func (d *Daemon) redeclareSessionShimStandDown(ctx context.Context, attestation SessionShimHostAttestation) {
 	d.mu.RLock()
 	credentials := d.credentials
@@ -527,12 +574,31 @@ func (d *Daemon) redeclareSessionShimStandDown(ctx context.Context, attestation 
 	if credentials == nil {
 		return
 	}
-	if _, err := credentials.DeclareSessionShim(
-		ctx, attestation, sessionShimCompositionRefreshReason+"-withdrawn",
-	); err != nil {
-		slog.Warn("session shim: could not re-declare stand-down after a failed composition install",
-			"err", err.Error())
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	var err error
+	for attempt := 0; attempt < sessionShimStandDownRedeclareAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := sessionShimStandDownRedeclareBackoff << (attempt - 1)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				slog.Warn("session shim: could not re-declare stand-down after a failed composition install",
+					"err", ctx.Err().Error())
+				return
+			case <-timer.C:
+			}
+		}
+		if _, err = credentials.DeclareSessionShim(
+			ctx, attestation, sessionShimCompositionRefreshReason+"-withdrawn",
+		); err == nil {
+			return
+		}
+	}
+	slog.Warn("session shim: could not re-declare stand-down after a failed composition install",
+		"err", err.Error())
 }
 
 // restoreSessionShimAdmissionAfterFailedInstall clears a proof-v2 readiness
@@ -588,6 +654,38 @@ func (d *Daemon) discardSessionShimCompositionState() {
 	}
 }
 
+// reopenSessionShimAdmissionAfterOrphanFence reopens admission exactly when
+// the orphan reconciliation was the only thing holding it closed. It mirrors
+// the reopen in AcknowledgeSessionShimRecoveryHeartbeat: same lock, same
+// stopGen guard so a daemon mid-shutdown is not resurrected, and only the
+// recovering state is reopened — an operator pause or drain stays an operator
+// pause or drain. Clearing the fence entry alone reopens the poll predicate
+// (which reads the fence directly), but the spawner stays paused and the
+// lifecycle stays recovering until this runs: claimSuspended is not the only
+// rail the fence closed.
+func (d *Daemon) reopenSessionShimAdmissionAfterOrphanFence(cleared bool) {
+	if !cleared {
+		return
+	}
+	d.shims.mu.RLock()
+	pending := len(d.shims.pendingHeartbeatAcks)
+	d.shims.mu.RUnlock()
+	if pending != 0 {
+		return
+	}
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopGen != nil || !d.sessionShimReadinessWithdrawn.CompareAndSwap(true, false) {
+		return
+	}
+	if d.State() == StateRecovering {
+		if d.spawner != nil {
+			d.spawner.Resume()
+		}
+		d.setState(StateRunning)
+	}
+}
+
 // clearOrphanedSessionShimHeartbeatFence drops a first-heartbeat admission
 // fence no heartbeat can clear: a pending acknowledgement for a scope this
 // daemon holds no retained authority receipt for. The fence and its
@@ -600,6 +698,14 @@ func (d *Daemon) discardSessionShimCompositionState() {
 // paused. Clearing the orphan reopens admission; anything durable that
 // actually advanced keeps its own state, because only the fence entry is
 // dropped, never a receipt.
+//
+// Dropping the entry reopens the poll predicate, which reads the fence
+// directly — but nothing else. The spawner stays paused and the lifecycle
+// stays recovering until reopenSessionShimAdmissionAfterOrphanFence (or the
+// acknowledgement edge) runs: clearing bookkeeping is not resuming work.
+// The acknowledgement edge still guards on a retained receipt, so a scope
+// whose receipt is discarded after this cleared its fence keeps no fence to
+// clear — its withdrawal is terminal until something re-founds it.
 //
 // Callers hold no locks; it takes d.shims.mu. It reports whether it cleared
 // anything, so call sites that also own the lifecycle transition can reopen

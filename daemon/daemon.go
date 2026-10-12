@@ -979,8 +979,17 @@ func (d *Daemon) claimSuspended() (bool, string) {
 		// matches a retained receipt, so nothing left can reopen it, while the
 		// host-wide gate stays closed for every scope. Reconcile it here — at
 		// the admission seam itself — rather than trusting every path that
-		// drops a receipt to also drop its fence.
-		d.clearOrphanedSessionShimHeartbeatFence()
+		// drops a receipt to also drop its fence. Clearing the entry reopens
+		// this predicate, and the reopen below resumes the spawner and the
+		// lifecycle the fence closed: without it the gate reads open while
+		// the daemon stays recovering and never spawns.
+		//
+		// The gate stays host-wide by design: it answers whether THIS host
+		// may claim new work at all, and every rail it fronts — poll, accept,
+		// heartbeat capacity — fronts the whole host. A scope with no
+		// authority has no work to claim and no fence left to hold; a scope
+		// with authority still holds the gate through its own live fence.
+		d.reopenSessionShimAdmissionAfterOrphanFence(d.clearOrphanedSessionShimHeartbeatFence())
 		if d.sessionShimReadinessWithdrawn.Load() {
 			return true, "session-shim recovery is not ready"
 		}

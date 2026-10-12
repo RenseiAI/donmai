@@ -551,12 +551,15 @@ func TestOrphanedFirstHeartbeatFenceDoesNotCloseTheClaimGate(t *testing.T) {
 	}
 	// Plant the orphan the way a refused founding leaves it: the scope's
 	// receipt is gone while its first-heartbeat acknowledgement is still
-	// pending and the fence is raised.
+	// pending and the fence is raised. Pause the spawner the way the fence
+	// does when it is raised, so the test proves the full reopen — not just
+	// the gate predicate reading open while the spawner stays paused.
 	h.daemon.shims.mu.Lock()
 	delete(h.daemon.shims.credentialReceipts, scope)
 	h.daemon.shims.pendingHeartbeatAcks[scope] = "revision-orphan"
 	h.daemon.shims.mu.Unlock()
 	h.daemon.sessionShimReadinessWithdrawn.Store(true)
+	h.daemon.spawner.Pause()
 
 	if suspended, _ := h.daemon.PollClaimGate()(); suspended {
 		t.Fatal("the claim gate stayed closed behind an orphaned first-heartbeat fence")
@@ -569,6 +572,16 @@ func TestOrphanedFirstHeartbeatFenceDoesNotCloseTheClaimGate(t *testing.T) {
 	}
 	if h.daemon.sessionShimReadinessWithdrawn.Load() {
 		t.Fatal("the orphaned fence is still raised after the claim gate reconciled it")
+	}
+	// The full reopen: the fence closed the spawner and moved the lifecycle
+	// to recovering, so the gate reading open is not enough — the daemon
+	// must be running and spawning again, not recovering behind an open
+	// gate.
+	if state := h.daemon.State(); state != StateRunning {
+		t.Fatalf("daemon state after the orphaned fence reconciled = %q, want %q", state, StateRunning)
+	}
+	if h.daemon.spawner == nil || !h.daemon.spawner.IsAccepting() {
+		t.Fatal("the spawner stayed paused after the orphaned fence reconciled")
 	}
 	if _, err := h.daemon.AcceptWorkWithDetail(SessionSpec{}, &SessionDetail{}); err == nil ||
 		containsWithdrawn(err.Error()) {

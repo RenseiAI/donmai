@@ -380,6 +380,19 @@ func (r *CredentialRefresher) SessionShimAttestation() SessionShimHostAttestatio
 // A failed round trip restores the previous attestation before returning. The
 // refresher must never be left presenting a claim the control plane refused —
 // the next ordinary expiry refresh would present it again, unattended.
+//
+// The restore is best-effort against the one window this doc names: while the
+// re-declaration's round trip is in flight, the refresher presents the new
+// (stand-down) attestation, and the refresher's lock is released, so a
+// concurrent ordinary refresh in that window can also present the stand-down
+// before the round trip answers. If the round trip then fails, this restore
+// returns the lane to the composed attestation the daemon had stood down
+// from — the original refused founder. The stand-down stays sticky only on
+// the daemon: InstallSessionShimComposition's rollback restores it locally
+// through redeclareSessionShimStandDown, which retries the re-declaration, so
+// a failed first attempt does not silently re-arm the refused founder on the
+// next refresh. Callers that need the lane itself to stay stood down across
+// a failed round trip must re-declare rather than rely on this restore.
 func (r *CredentialRefresher) DeclareSessionShim(
 	ctx context.Context,
 	attestation SessionShimHostAttestation,

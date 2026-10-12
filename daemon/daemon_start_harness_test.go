@@ -65,6 +65,13 @@ type compositionHarness struct {
 	// then disarms. It models the platform refusing one founder's first
 	// projected heartbeat while still accepting another's.
 	refuseFirstProjectedHeartbeat bool
+	// refuseStandDownRefreshOnce, when set, makes the refresh endpoint refuse
+	// (HTTP 500) exactly the next refresh that presents the stand-down
+	// attestation, then disarms. It models the stand-down re-declaration's
+	// round trip failing while the local posture is already stood down, so
+	// the retry of the re-declaration — not the refresher's failure restore
+	// to the composed attestation — is what keeps the lane stood down.
+	refuseStandDownRefreshOnce bool
 }
 
 // setRefreshReceiptState changes what the control plane answers to later
@@ -201,6 +208,10 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			if refuseOnce != "" && presented.ControllerID == refuseOnce {
 				h.refuseRefreshOnceForController = ""
 			}
+			refuseStandDownOnce := h.refuseStandDownRefreshOnce && !presented.Supports()
+			if refuseStandDownOnce {
+				h.refuseStandDownRefreshOnce = false
+			}
 			h.refreshBodies = append(h.refreshBodies, append([]byte(nil), raw...))
 			// Every refresh mints a DISTINCT token, so a test can tell a refresh
 			// that was adopted from one that was refused before adoption.
@@ -208,6 +219,10 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			state := h.refreshReceiptState
 			revision := h.refreshReceiptRevision
 			h.mu.Unlock()
+			if refuseStandDownOnce {
+				http.Error(w, "stand-down re-declaration unavailable", http.StatusBadGateway)
+				return
+			}
 			if presented.Supports() && refuseOnce != "" && presented.ControllerID == refuseOnce {
 				http.Error(w, "founding declaration refused", http.StatusForbidden)
 				return
