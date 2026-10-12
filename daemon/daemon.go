@@ -1045,22 +1045,31 @@ func (d *Daemon) runtimeJWT() string {
 // the direct children would make a freshly restarted daemon report an empty host
 // while every pre-restart terminal is still live — the same lie the capacity
 // path refuses to tell, told on the surface an operator actually reads.
+//
+// The union is deduped by session id: the shim projection already contains
+// both the adopted and the quarantined row for one lineage, and a stale
+// spawner entry can name the same session a shim owns. The first row wins —
+// direct children first, then the shim projection in the order it serves
+// (adopted before quarantined), then held sessions — so an adopted handle
+// always takes precedence over a quarantined row for the same session.
 func (d *Daemon) ActiveSessions() []SessionHandle {
 	var out []SessionHandle
-	if d.spawner != nil {
-		out = d.spawner.ActiveSessions()
-	}
-	out = append(out, d.sessionShimHandles()...)
-	if local := d.localRuntime.Load(); local != nil {
-		owned := map[string]bool{}
-		for _, handle := range out {
-			owned[handle.SessionID] = true
-		}
-		for _, handle := range local.heldSessions() {
-			if !owned[handle.SessionID] {
-				out = append(out, handle)
+	seen := map[string]bool{}
+	appendDeduped := func(handles []SessionHandle) {
+		for _, handle := range handles {
+			if handle.SessionID == "" || seen[handle.SessionID] {
+				continue
 			}
+			seen[handle.SessionID] = true
+			out = append(out, handle)
 		}
+	}
+	if d.spawner != nil {
+		appendDeduped(d.spawner.ActiveSessions())
+	}
+	appendDeduped(d.sessionShimHandles())
+	if local := d.localRuntime.Load(); local != nil {
+		appendDeduped(local.heldSessions())
 	}
 	return out
 }
