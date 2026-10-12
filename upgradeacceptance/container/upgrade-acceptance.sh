@@ -275,6 +275,17 @@ CASES="$(jq -c '[.liveCases[] | {name, status: (if .name == "seat-survives-upgra
   || infra probe_failed "unreadable live cases"
 [ "$(jq -r '.interactiveOwned' <<<"${PROBE}")" = "true" ] \
   || infra probe_not_reading_rule "the N+1 selection rule does not own the interactive control spec"
+# The stale check reads the posture the probe answer was taken under, not
+# just the rule: the green slices settle ownership plus adoption with no
+# pending composition. A reading from any other posture has not proven the
+# rule still refuses headless seats, so the record goes stale instead of
+# red. The in-repo probe contract pins the same posture.
+if [ "$(jq -r '.compositionPending' <<<"${PROBE}")" = "true" ] || \
+   [ "$(jq -r '.ownershipEnabled' <<<"${PROBE}")" != "true" ] || \
+   [ "$(jq -r '.adoptionEnabled' <<<"${PROBE}")" != "true" ]; then
+  write_record stale probe_posture_unsettled "the N+1 probe did not settle in the ownership-plus-adoption posture; the selection-rule reading proves nothing about this build"
+  exit 3
+fi
 if [ "$(jq -r '.headlessOwned' <<<"${PROBE}")" = "true" ]; then
   write_record stale headless_rule_flipped "the N+1 selection rule owns headless seats; replace this red record with the live-seat assertions"
   exit 3

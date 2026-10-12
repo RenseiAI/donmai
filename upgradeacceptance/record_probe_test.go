@@ -18,17 +18,23 @@ var recordProbePath = flag.String("acceptance.record-probe", "",
 	"write the container record probe (JSON) to this path")
 
 // recordProbe is what the container driver decides its record from: the
-// N+1 build's own selection-rule answers, the live matrix rows it
-// records, and the live halves of the adoption-gated local rows. The
-// halves travel as named slots with their own status — pending until the
-// driver grows the live-seat assertions that record them — so a gated
-// live half is listed in every record instead of silently absent from it.
-// Nothing in it is read from configuration.
+// N+1 build's own selection-rule answers, the posture those answers were
+// read under, the live matrix rows it records, and the live halves of the
+// adoption-gated local rows. The halves travel as named slots with their
+// own status — pending until the driver grows the live-seat assertions
+// that record them — so a gated live half is listed in every record
+// instead of silently absent from it. Nothing in it is read from
+// configuration: the posture fields report the probe daemon's own resolved
+// configuration, which the driver cross-checks against the posture the
+// green slices would settle in.
 type recordProbe struct {
-	HeadlessOwned    bool              `json:"headlessOwned"`
-	InteractiveOwned bool              `json:"interactiveOwned"`
-	LiveCases        []recordProbeCase `json:"liveCases"`
-	LiveHalves       []recordProbeHalf `json:"liveHalves"`
+	HeadlessOwned      bool              `json:"headlessOwned"`
+	InteractiveOwned   bool              `json:"interactiveOwned"`
+	CompositionPending bool              `json:"compositionPending"`
+	OwnershipEnabled   bool              `json:"ownershipEnabled"`
+	AdoptionEnabled    bool              `json:"adoptionEnabled"`
+	LiveCases          []recordProbeCase `json:"liveCases"`
+	LiveHalves         []recordProbeHalf `json:"liveHalves"`
 }
 
 type recordProbeCase struct {
@@ -64,7 +70,13 @@ const pendingLiveHalfStatus = "pending"
 func TestRecordProbe(t *testing.T) {
 	t.Parallel()
 	probe := adoptionProbeForHeadlessSpec(defaultAdoptionProbeDaemon())
-	rec := recordProbe{HeadlessOwned: probe.ownsHeadless, InteractiveOwned: probe.ownsControl}
+	rec := recordProbe{
+		HeadlessOwned:      probe.ownsHeadless,
+		InteractiveOwned:   probe.ownsControl,
+		CompositionPending: probe.compositionPending,
+		OwnershipEnabled:   probe.ownershipEnabled,
+		AdoptionEnabled:    probe.adoptionEnabled,
+	}
 	for _, c := range failureMatrix {
 		if !c.local {
 			rec.LiveCases = append(rec.LiveCases, recordProbeCase{Name: c.name, Want: c.want, RequiresAdoption: c.requiresAdoption})
@@ -84,6 +96,18 @@ func TestRecordProbe(t *testing.T) {
 	}
 	if !rec.InteractiveOwned {
 		t.Fatal("the selection rule does not own the interactive control spec; the probe is not reading the rule")
+	}
+	// The green posture is settled ownership plus adoption: a probe that
+	// answers from any other posture — a composition still pending, or
+	// either flag off — has not proven the rule still refuses headless
+	// seats. The container driver reports that record stale; this pins
+	// the probe end of the contract so a posture regression fails
+	// in-repo instead of passing as the red.
+	if rec.CompositionPending {
+		t.Fatal("the probe daemon's composition is pending; the selection-rule reading was taken under a posture the green slices would never settle in")
+	}
+	if !rec.OwnershipEnabled || !rec.AdoptionEnabled {
+		t.Fatalf("probe posture ownership=%v adoption=%v, want both enabled: the stale check must read the posture, not just the rule", rec.OwnershipEnabled, rec.AdoptionEnabled)
 	}
 	if len(rec.LiveCases) == 0 || rec.LiveCases[0].Name != "seat-survives-upgrade" {
 		t.Fatalf("live cases = %+v, want seat-survives-upgrade first: the container records it as the red case", rec.LiveCases)
