@@ -301,6 +301,24 @@ func resolveAgentRunDaemonURL(flagValue string, lookupEnv func(string) string) (
 	return DefaultAgentRunDaemonURL, daemonURLSourceBuiltinDefault
 }
 
+// localPosterAuthToken resolves the Poster construction-default bearer: the
+// detail's controller credential on the platform path, or the attempt bearer
+// from the spawn environment on the local path. A local detail carries no
+// controller credential by design, so without this the default is empty and
+// the Poster falls back to it whenever a credential re-read fails — the
+// send then carries no Authorization header and the local receiver answers
+// 401. The credential provider still re-resolves per attempt; this default
+// only covers the fallback.
+func localPosterAuthToken(detail *daemon.SessionDetail, daemonToken string, localRuntime bool) string {
+	if localRuntime {
+		return daemonToken
+	}
+	if detail == nil {
+		return ""
+	}
+	return detail.AuthToken
+}
+
 // runAgentRun is the testable entry point for the `agent run` command.
 // Cobra-free; takes opts directly so tests can drive it with a fake
 // daemon HTTP server.
@@ -441,6 +459,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	if opts.localRuntime {
 		credentialCache.localRuntime = true
+		// A local detail carries no controller credential by design
+		// (validateLocalAgentDetail refuses one): the worker's only
+		// credential is the attempt bearer from its spawn environment.
+		// Seed the cache with it so the first send carries a bearer
+		// before any re-read runs — without this the first replay sends
+		// no Authorization header and the receiver answers 401.
 		credentialCache.authToken = daemonToken
 	}
 
@@ -511,10 +535,11 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if opts.localRuntime {
 		callbackClient = localCallbackClient(30 * time.Second)
 	}
+	posterAuthToken := localPosterAuthToken(detail, daemonToken, opts.localRuntime)
 	poster, err := result.NewPoster(result.Options{
 		HTTPClient:         callbackClient,
 		PlatformURL:        detail.PlatformURL,
-		AuthToken:          detail.AuthToken,
+		AuthToken:          posterAuthToken,
 		WorkerID:           detail.WorkerID,
 		CredentialProvider: credentialCache.resultCredentials,
 	})

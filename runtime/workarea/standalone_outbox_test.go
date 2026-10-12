@@ -411,3 +411,35 @@ func TestStandaloneOutboxPrunesDeliveredPastRetention(t *testing.T) {
 		t.Fatalf("delivered record not pruned: %v", err)
 	}
 }
+
+func TestStandaloneOutboxAcceptsLocalSessionID(t *testing.T) {
+	t.Parallel()
+	store, clock := standaloneOutboxStore(t)
+	session := "session_11111111111111111111111111111111"
+	receiver := standaloneReceiverKey(t)
+	body := []byte(`{"workerId":"worker-1","status":"completed"}`)
+	deadline := clock.now.Add(MaximumLeaseDuration)
+	key, err := store.SaveStandaloneOutbox(context.Background(), standaloneOutboxSpec(session, 1, standaloneTerminalDigest(), receiver, body, deadline))
+	if err != nil {
+		t.Fatalf("local session save: %v", err)
+	}
+	if key != StandaloneOutboxKey(session, 1) {
+		t.Fatalf("key=%q, want %q", key, StandaloneOutboxKey(session, 1))
+	}
+	loaded, err := store.LoadStandaloneOutbox(context.Background(), session, 1)
+	if err != nil {
+		t.Fatalf("local session load: %v", err)
+	}
+	retained, err := loaded.Record.Body()
+	if err != nil || !bytes.Equal(retained, body) {
+		t.Fatalf("retained=%q err=%v", retained, err)
+	}
+	var sent [][]byte
+	considered, err := store.ReplayStandaloneOutbox(context.Background(), 32, time.Second, func(_ context.Context, _ string, payload []byte) error {
+		sent = append(sent, append([]byte(nil), payload...))
+		return nil
+	})
+	if err != nil || considered != 1 || len(sent) != 1 || !bytes.Equal(sent[0], body) {
+		t.Fatalf("considered=%d sent=%d err=%v", considered, len(sent), err)
+	}
+}

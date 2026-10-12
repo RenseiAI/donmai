@@ -86,8 +86,23 @@ func StandaloneOutboxKey(sessionID string, attempt uint64) string {
 	return "txo_" + hex.EncodeToString(sum[:16])
 }
 
+// validateOutboxSessionID accepts the session identities the outbox keys:
+// canonical platform UUIDs and the shipped local runtime's session_<hex>
+// references. Both are opaque key material here — the key derivation hashes
+// them, so neither shape can alias the other — but anything else (empty, a
+// path, an overlong string) is refused before it can key a record.
+func validateOutboxSessionID(value string) error {
+	if err := validateCanonicalUUID(value); err == nil {
+		return nil
+	}
+	if len(value) == len("session_")+32 && strings.HasPrefix(value, "session_") && validLowerHex(value[len("session_"):], 32) {
+		return nil
+	}
+	return errors.New("identity must be a canonical lowercase hyphenated UUID or session_<32 lowercase hex>")
+}
+
 func validateStandaloneOutboxSaveSpec(spec StandaloneOutboxSaveSpec) error {
-	if err := validateCanonicalUUID(spec.SessionID); err != nil {
+	if err := validateOutboxSessionID(spec.SessionID); err != nil {
 		return fmt.Errorf("runtime/workarea: sessionId: %w", err)
 	}
 	if err := validateGeneratedID(spec.TerminalResultID, "tr_"); err != nil {
@@ -266,7 +281,7 @@ func (s *LeaseStore) LoadStandaloneOutbox(ctx context.Context, sessionID string,
 	if err := s.Ready(); err != nil {
 		return nil, err
 	}
-	if err := validateCanonicalUUID(sessionID); err != nil {
+	if err := validateOutboxSessionID(sessionID); err != nil {
 		return nil, fmt.Errorf("runtime/workarea: sessionId: %w", err)
 	}
 	key := StandaloneOutboxKey(sessionID, attempt)
@@ -294,7 +309,7 @@ func (s *LeaseStore) MarkStandaloneOutboxDelivered(ctx context.Context, sessionI
 	if err := s.Ready(); err != nil {
 		return nil, err
 	}
-	if err := validateCanonicalUUID(sessionID); err != nil {
+	if err := validateOutboxSessionID(sessionID); err != nil {
 		return nil, fmt.Errorf("runtime/workarea: sessionId: %w", err)
 	}
 	key := StandaloneOutboxKey(sessionID, attempt)
@@ -541,7 +556,7 @@ func (s *LeaseStore) loadStandaloneOutbox(key string) (*standaloneOutboxEnvelope
 	if envelope.OutboxKey != key || envelope.SchemaVersion != TerminalStatusOutboxSchemaV1 {
 		return nil, fmt.Errorf("runtime/workarea: invalid standalone outbox %s", key)
 	}
-	if err := validateCanonicalUUID(envelope.SessionID); err != nil {
+	if err := validateOutboxSessionID(envelope.SessionID); err != nil {
 		return nil, fmt.Errorf("runtime/workarea: invalid standalone outbox %s: %w", key, err)
 	}
 	if envelope.Kind != StandaloneOutboxTerminal && envelope.Kind != StandaloneOutboxWorkerExited {
