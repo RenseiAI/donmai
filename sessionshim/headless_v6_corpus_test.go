@@ -734,6 +734,7 @@ func TestV6CorpusShimSendsHeadlessExitAndTheAckEndsTheWaitEarly(t *testing.T) {
 		t.Fatalf("tombstone = %+v, want the completed observation the frame carried", tomb)
 	}
 }
+
 // acknowledgement column: the shim's finalize wait returns (rather than
 // parking forever) when the ackedSeq=1 receipt never arrives, leaving the
 // tombstone for the next adoption. It drives waitForDurableAck — the exact
