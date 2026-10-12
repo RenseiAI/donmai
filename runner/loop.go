@@ -1159,7 +1159,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// failure still records it — the phase ran even when the agent did not.
 	// The clock is the runner's injectable now (not wall time read inline)
 	// so tests drive it deterministically; a non-positive delta (a skewed
-	// test clock) omits the field rather than posting a lie.
+	// test clock) omits the field rather than posting a lie. startedAt was
+	// read from the same clock at Run entry, so the two reads bracket the
+	// preparation phase exactly.
 	res.PreparationSeconds = preparationSeconds(r.now, time.UnixMilli(startedAt))
 	handle, err := provider.Spawn(ctx, spec)
 	if err != nil {
@@ -3519,6 +3521,16 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	// seat builds exactly as before, without a stale or empty pointer.
 	// The probe inherits the worker's environment and is bounded: a wedged
 	// toolchain omits the key instead of stalling session start.
+	//
+	// Sandboxed seats cannot read this path: the seat's own confinement
+	// rebinds GOMODCACHE to the per-session cache (provider/harness/pi's
+	// confinePiSession declares GOMODCACHE under the session cache root
+	// and the plan's environment bindings win last-entry-wins), which the
+	// macOS profile allows while the host cache stays outside the read
+	// allowlist (probed live: host cache reads refuse with Operation not
+	// permitted). The export still matters: it is the only channel that
+	// tells an UNSANDBOXED seat — and every tool the seat spawns outside
+	// the sandbox — where the shared module sources live.
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if cache := goModCache(probeCtx); cache != "" {
 		envMap["GOMODCACHE"] = cache

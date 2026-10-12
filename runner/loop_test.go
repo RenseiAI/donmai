@@ -1095,6 +1095,111 @@ func TestSessionEnv_ComposerPreservesHostGHToken(t *testing.T) {
 	}
 }
 
+// TestBuildSessionEnv_ExportsGoModuleCache pins the module-cache export:
+// the seat env carries GOMODCACHE resolved from the host toolchain's own
+// `go env` probe, so seats find dependency sources without a whole-disk
+// search. The probe is stubbed through the package seam (no toolchain
+// needed); reverting the export line leaves the key absent and fails it.
+func TestBuildSessionEnv_ExportsGoModuleCache(t *testing.T) {
+	orig := goModCache
+	goModCache = func(context.Context) string { return "/host/go/pkg/mod" }
+	t.Cleanup(func() { goModCache = orig })
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-MODCACHE-1"),
+		WorkerID:    "w1",
+		AuthToken:   "tok",
+		PlatformURL: "https://example.test",
+	}
+	if got := buildSessionEnv(qw)["GOMODCACHE"]; got != "/host/go/pkg/mod" {
+		t.Fatalf("GOMODCACHE = %q; want the probed host module cache", got)
+	}
+}
+
+// TestBuildSessionEnv_OmitsGoModuleCacheWhenProbeFails pins the additive
+// contract: a toolchain the probe cannot read (no `go` on PATH, a wedged
+// probe) omits the key instead of exporting an empty or stale pointer, so
+// the seat builds exactly as before.
+func TestBuildSessionEnv_OmitsGoModuleCacheWhenProbeFails(t *testing.T) {
+	orig := goModCache
+	goModCache = func(context.Context) string { return "" }
+	t.Cleanup(func() { goModCache = orig })
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-MODCACHE-2"),
+		WorkerID:    "w1",
+		AuthToken:   "tok",
+		PlatformURL: "https://example.test",
+	}
+	if _, ok := buildSessionEnv(qw)["GOMODCACHE"]; ok {
+		t.Fatal("GOMODCACHE is set; a failed probe must omit the key")
+	}
+}
+
+// TestRun_RecordsPreparationSeconds drives the PRODUCTION Run path with a
+// clock that reads the base instant at Run entry and +90s at the pre-spawn
+// stamp, and asserts the duration lands on the terminal result. The two
+// reads bracket the preparation phase (provider resolution, worktree
+// provisioning, dependency installs, prompt assembly); reverting the stamp
+// line leaves the field zero and fails it.
+func TestRun_RecordsPreparationSeconds(t *testing.T) {
+	base := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	reads := 0
+	now := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		reads++
+		if reads == 1 {
+			return base
+		}
+		return base.Add(90 * time.Second)
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development",
+		now:      now,
+		turns: []verdictScriptTurn{
+			{text: "Opened " + followUpPR + "\nWORK_RESULT: passed"},
+		},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	if res.PreparationSeconds != 90 {
+		t.Fatalf("PreparationSeconds = %d; want 90", res.PreparationSeconds)
+	}
+}
+
+// TestPreparationSeconds pins the preparation-duration helper: session
+// start to provider spawn in whole seconds, with a skewed or frozen test
+// clock omitting the field instead of posting a duration the phase did
+// not take.
+func TestPreparationSeconds(t *testing.T) {
+	t.Parallel()
+	start := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		now  time.Time
+		want int64
+	}{
+		{name: "ninety seconds", now: start.Add(90 * time.Second), want: 90},
+		{name: "truncates sub-second", now: start.Add(1500 * time.Millisecond), want: 1},
+		{name: "frozen clock omits", now: start, want: 0},
+		{name: "skewed clock omits", now: start.Add(-time.Second), want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := preparationSeconds(func() time.Time { return tc.now }, start); got != tc.want {
+				t.Fatalf("preparationSeconds = %d; want %d", got, tc.want)
+			}
+		})
+	}
+	if got := preparationSeconds(nil, start); got != 0 {
+		t.Fatalf("preparationSeconds(nil clock) = %d; want 0", got)
+	}
+}
+
 // TestRunLoop_PostsActivityToplatform asserts the runner streams every
 // non-skipped agent.Event through to /api/sessions/<id>/activity, and
 // that the first such post triggers a single status=running nudge.
