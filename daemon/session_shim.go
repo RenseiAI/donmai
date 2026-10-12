@@ -4538,12 +4538,35 @@ func (d *Daemon) SessionShimOccupancy() int {
 	return len(d.shims.adopted) + len(d.shims.quarantined)
 }
 
+// wireShimAdmission makes spawner admission see shim-held sessions: their
+// slots through ExternalOccupancy, so a restarted daemon does not accept
+// against cores its surviving shims already use, and their ids through
+// ExternalOwnedSessionIDs, so a re-dispatched session id already live under a
+// shim is refused instead of launched a second time. The ids deliberately do
+// NOT go through ExternalSessionIDs: that hook is also charged as capacity,
+// and ExternalOccupancy already charges every shim, so one shim would hold two
+// slots. Both suppliers run under the spawner mutex and take only the
+// shim-state lock, so neither reenters the spawner.
+func (d *Daemon) wireShimAdmission(opts *SpawnerOptions) {
+	priorOwned := opts.ExternalOwnedSessionIDs
+	opts.ExternalOwnedSessionIDs = func() []string {
+		var ids []string
+		if priorOwned != nil {
+			ids = append(ids, priorOwned()...)
+		}
+		return append(ids, d.shimOwnedSessionIDs()...)
+	}
+	if opts.ExternalOccupancy == nil {
+		opts.ExternalOccupancy = d.SessionShimOccupancy
+	}
+}
+
 // shimOwnedSessionIDs reports the session ids currently held under
 // per-session shim ownership — adopted and quarantined alike — so the
-// spawner's duplicate-accept guard and capacity accounting see the ids the
-// spawner's own registry never holds. A quarantined lineage still owns its
-// session id: its harness is running, and re-dispatching that id would run
-// the session twice.
+// spawner's duplicate-accept guard sees the ids the spawner's own registry
+// never holds (their slots are charged by SessionShimOccupancy). A
+// quarantined lineage still owns its session id: its harness is running, and
+// re-dispatching that id would run the session twice.
 func (d *Daemon) shimOwnedSessionIDs() []string {
 	if d.shims == nil {
 		return nil

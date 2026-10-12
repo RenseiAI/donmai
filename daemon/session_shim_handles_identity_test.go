@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -158,30 +159,49 @@ func TestActiveSessionsDedupesBySessionID(t *testing.T) {
 	}
 }
 
-// TestSpawnerSeesShimOwnedSessionIDs pins the admission half of the dedupe:
-// the spawner's external session ids include adopted and quarantined shim
-// sessions, so re-dispatching a session id already live under a shim is
-// refused (and capacity-charged) rather than accepted a second time.
+// TestSpawnerSeesShimOwnedSessionIDs pins the admission half of the dedupe
+// through the daemon's own wiring: a session id already live under a shim —
+// adopted or quarantined — is refused as a duplicate rather than accepted a
+// second time, and each shim session holds exactly one admission slot, not
+// one through occupancy and a second through its id.
 func TestSpawnerSeesShimOwnedSessionIDs(t *testing.T) {
-	d := New(Options{SkipRegistration: true})
-	d.spawner = NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 8})
-	d.spawner.Resume()
-	d.spawner.opts.ExternalSessionIDs = func() []string { return d.shimOwnedSessionIDs() }
-	id := sessionshim.Identity{OrgID: "org-guard", SessionID: "guarded"}
-	d.shims.mu.Lock()
-	d.shims.adopted[id] = adoptedShim{shimID: "shim-adopted"}
-	d.shims.quarantined = []sessionshim.QuarantinedSession{{
-		OrgID: "org-guard", SessionID: "held",
-		ShimID: "shim-quarantined", ProcessEpoch: 1,
-		Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
-	}}
-	d.shims.mu.Unlock()
-	d.spawner.mu.Lock()
-	count := d.spawner.externalSessionOccupancyLocked()
-	d.spawner.mu.Unlock()
-	if count != 2 {
-		t.Fatalf("external session occupancy = %d, want 2 (one adopted, one quarantined)", count)
+	newDaemon := func(t *testing.T, maxSessions int) *Daemon {
+		t.Helper()
+		d := New(Options{SkipRegistration: true})
+		opts := SpawnerOptions{MaxConcurrentSessions: maxSessions}
+		d.wireShimAdmission(&opts)
+		d.spawner = NewWorkerSpawner(opts)
+		d.spawner.Resume()
+		d.shims.mu.Lock()
+		d.shims.adopted[sessionshim.Identity{OrgID: "org-guard", SessionID: "guarded"}] = adoptedShim{shimID: "shim-adopted"}
+		d.shims.quarantined = []sessionshim.QuarantinedSession{{
+			OrgID: "org-guard", SessionID: "held",
+			ShimID: "shim-quarantined", ProcessEpoch: 1,
+			Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+		}}
+		d.shims.mu.Unlock()
+		return d
 	}
+
+	t.Run("duplicate of a shim-owned id is refused", func(t *testing.T) {
+		d := newDaemon(t, 8)
+		for _, id := range []string{"guarded", "held"} {
+			_, err := d.spawner.AcceptWork(SessionSpec{SessionID: id})
+			if err == nil || !strings.Contains(err.Error(), "already active") {
+				t.Errorf("AcceptWork(%q) = %v, want the duplicate-accept refusal", id, err)
+			}
+		}
+	})
+
+	t.Run("each shim session holds one slot", func(t *testing.T) {
+		// Two shim sessions on a three-slot host leave one slot free; a
+		// double charge would refuse the fresh session at capacity.
+		d := newDaemon(t, 3)
+		_, err := d.spawner.AcceptWork(SessionSpec{SessionID: "fresh"})
+		if err != nil && strings.Contains(err.Error(), "at capacity") {
+			t.Fatalf("AcceptWork(fresh) = %v; two shim sessions must hold two of three slots, not all of them", err)
+		}
+	})
 }
 
 // TestActiveSessionsAdoptedBeatsQuarantined pins the precedence inside the
