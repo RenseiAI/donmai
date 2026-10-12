@@ -83,6 +83,17 @@ const sessionShimStandDownRedeclareAttempts = 3
 // re-declaration attempts; each later wait doubles.
 const sessionShimStandDownRedeclareBackoff = 200 * time.Millisecond
 
+// ErrSessionShimCompositionInstallInFlight is the single-flight refusal
+// InstallSessionShimComposition returns while another install holds the
+// slot. The retry entry point serializes its attempts through the same
+// check, so this error means another install is running: the loop returns it
+// instead of retrying it as a refused founder. Match it with errors.As.
+type ErrSessionShimCompositionInstallInFlight struct{}
+
+func (e *ErrSessionShimCompositionInstallInFlight) Error() string {
+	return "session shim: a composition install is already in flight"
+}
+
 // sessionShimIdentity is one coherent generation of the durable-session facts a
 // daemon presents: the configuration it was given and the controller id and
 // host attestation derived from it. Resolution errors are carried in the tuple
@@ -220,19 +231,12 @@ func (d *Daemon) SessionShimCompositionPending() bool {
 // SessionShimDurabilityRefusal() and the diagnostics surface, so an operator
 // who sees `off` can see why without the process log.
 //
-// ErrSessionShimCompositionInstallInFlight reports that a durable-session
-// composition install is already running. InstallSessionShimComposition
-// admits one install at a time; the retry entry point serializes its attempts
-// through the same single-flight check, so this error means "another attempt
-// is running" — the retry loop must not treat it as a refused founder.
-// errors.As against this type is how InstallSessionShimCompositionRetrying
-// tells a concurrent install from its own attempt's failure.
-type ErrSessionShimCompositionInstallInFlight struct{}
-
-func (e *ErrSessionShimCompositionInstallInFlight) Error() string {
-	return "session shim: a composition install is already in flight"
-}
-
+// A concurrent call while another install holds the slot fails with
+// ErrSessionShimCompositionInstallInFlight, matched with errors.As: the
+// retry entry point serializes its attempts through the same check, so that
+// error means "another install is running" and is returned, never retried
+// as a refused founder.
+//
 // It is safe to call from a goroutine started after Start returned. It admits
 // one install at a time and refuses a second composition outright.
 func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionShimConfig) error {
