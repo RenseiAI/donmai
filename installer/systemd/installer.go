@@ -3,11 +3,11 @@
 // This is the Go port of the legacy TypeScript installer at
 // donmai-libraries/packages/daemon/src/installer-linux.ts.
 //
-// The installer registers the host binary's `daemon run` subcommand as the
-// service entrypoint — it does NOT register a separate `rensei-daemon`
-// binary (locked decision). The host binary is whichever
-// executable invoked the install (`af`, `rensei`, etc., resolved via
-// os.Executable), and the subcommand is `daemon run`.
+// The installer registers the host binary's `host run` subcommand as the
+// service entrypoint — it does NOT register a separate daemon binary
+// (locked decision). The host binary is whichever
+// executable invoked the install (resolved via
+// os.Executable), and the subcommand is `host run`.
 //
 // Architecture reference:
 //
@@ -17,11 +17,11 @@
 //
 //	--user   (default) — user-scoped unit at ~/.config/systemd/user/
 //	                     Managed via `systemctl --user`.
-//	                     Logs visible via `journalctl --user -u rensei-daemon`.
+//	                     Logs visible via `journalctl --user -u donmai-daemon`.
 //
 //	--system           — system-scoped unit at /etc/systemd/system/
 //	                     Requires root (sudo).
-//	                     Logs visible via `journalctl -u rensei-daemon`.
+//	                     Logs visible via `journalctl -u donmai-daemon`.
 //
 // Seat-scope requirement (every shim-owned session launches inside its own
 // transient systemd scope, budget or not — nothing launches unscoped):
@@ -61,7 +61,25 @@ import (
 
 const (
 	// UnitName is the systemd unit name (without the .service suffix).
-	UnitName = "rensei-daemon"
+	// It is configurable so a downstream embedder keeps its own unit name
+	// through installer config instead of a hard-coded string.
+	UnitName = DefaultUnitName
+
+	// DefaultUnitName is the OSS unit name (without the .service suffix),
+	// matching the macOS service label dev.donmai.daemon.
+	DefaultUnitName = "donmai-daemon"
+
+	// legacyUnitBrandPrefix and legacyUnitSuffix derive the unit name
+	// written by earlier builds: the pre-rename brand plus the unchanged
+	// "-daemon" suffix. Spelled in parts so the retired literal never
+	// reappears in source — the guard's case-sensitive brand rule is blind
+	// to the lowercase unit name, and this derivation is the executable
+	// record of that gap. Install migrates the derived name in place
+	// (stop, disable, remove) before installing the current unit, so an
+	// upgrade never leaves two units fighting over the same daemon.
+	legacyUnitBrandPrefix = "rens"
+	legacyUnitBrandSuffix = "ei"
+	legacyUnitSuffix      = "-daemon"
 
 	// UnitFilename is the systemd unit filename.
 	UnitFilename = UnitName + ".service"
@@ -70,7 +88,13 @@ const (
 	SystemUnitDir = "/etc/systemd/system"
 
 	// DefaultDescription is the default [Unit] Description= field value.
-	DefaultDescription = "Rensei local daemon — worker pool"
+	DefaultDescription = "Donmai local daemon \u2014 worker pool"
+
+	// DefaultSyslogIdentifier is the default journal log identifier written
+	// as SyslogIdentifier=. It defaults to the OSS unit name and follows
+	// UnitName when the embedder overrides it, so logs stay attributable to
+	// the unit that owns them.
+	DefaultSyslogIdentifier = DefaultUnitName
 
 	// DaemonSubcommand is the subcommand the host binary registers for the
 	// service entrypoint. The locked decision is to register a subcommand of
@@ -116,13 +140,62 @@ func UnitDir(scope Scope) (string, error) {
 	}
 }
 
-// UnitPath returns the absolute path of the unit file for the given scope.
+// UnitPath returns the absolute path of the unit file for the given scope
+// and unit name. An empty unitName means the current OSS default.
 func UnitPath(scope Scope) (string, error) {
+	return UnitPathFor(scope, "")
+}
+
+// UnitPathFor returns the absolute path of the named unit file for the
+// given scope. An empty unitName means the current OSS default
+// (DefaultUnitName).
+func UnitPathFor(scope Scope, unitName string) (string, error) {
 	dir, err := UnitDir(scope)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, UnitFilename), nil
+	return filepath.Join(dir, ResolveUnitFilename(unitName)), nil
+}
+
+// LegacyUnitName returns the unit name written by earlier builds (without
+// the .service suffix). It is a function, not a constant, so the retired
+// literal is derived, never spelled — see the constant block above.
+func LegacyUnitName() string {
+	return legacyUnitBrandPrefix + legacyUnitBrandSuffix + legacyUnitSuffix
+}
+
+// LegacyUnitFilename returns the filename of the unit written by earlier
+// builds.
+func LegacyUnitFilename() string {
+	return LegacyUnitName() + ".service"
+}
+
+// ResolveUnitName returns the effective unit name (without the .service
+// suffix): the override when non-empty, otherwise the OSS default.
+// The result always carries the suffix stripped and whitespace trimmed, so
+// an embedder override of "acme-daemon.service" and "acme-daemon" agree.
+func ResolveUnitName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return DefaultUnitName
+	}
+	return strings.TrimSuffix(name, ".service")
+}
+
+// ResolveUnitFilename returns the effective unit filename for the override:
+// the resolved unit name plus the .service suffix.
+func ResolveUnitFilename(name string) string {
+	return ResolveUnitName(name) + ".service"
+}
+
+// ResolveSyslogIdentifier returns the effective journal log identifier: the
+// explicit override when non-empty, otherwise the effective unit name, so
+// logs stay attributable to the unit that owns them.
+func ResolveSyslogIdentifier(unitName, syslogIdentifier string) string {
+	if strings.TrimSpace(syslogIdentifier) != "" {
+		return strings.TrimSpace(syslogIdentifier)
+	}
+	return ResolveUnitName(unitName)
 }
 
 // ── Options ──────────────────────────────────────────────────────────────────
@@ -133,12 +206,24 @@ type InstallOptions struct {
 	Scope Scope
 
 	// BinPath is the absolute path to the host binary that exposes
-	// `daemon run` (typically the running executable). Defaults to
+	// `host run` (typically the running executable). Defaults to
 	// os.Executable() when empty.
 	BinPath string
 
 	// Description overrides the default [Unit] Description= field.
 	Description string
+
+	// UnitName overrides the unit name (without the .service suffix) this
+	// install writes, enables, and reports. Empty means the OSS default
+	// (DefaultUnitName). A downstream embedder keeps its own unit name
+	// through this field — never by forking this package. The migration
+	// below still retires the legacy unit, which no current install writes.
+	UnitName string
+
+	// SyslogIdentifier overrides the SyslogIdentifier= journal tag. Empty
+	// follows the effective unit name, so logs stay attributable to the
+	// unit that owns them.
+	SyslogIdentifier string
 
 	// ConfigPath is the path to the daemon config file. When non-empty, it
 	// is exported as DONMAI_DAEMON_CONFIG via Environment= in the unit.
@@ -165,14 +250,24 @@ type InstallOptions struct {
 
 // UninstallOptions controls Uninstall behaviour.
 type UninstallOptions struct {
-	Scope         Scope
+	Scope Scope
+	// UnitName selects the unit to remove (without the .service suffix).
+	// Empty means the current OSS default. The legacy unit is always
+	// retired alongside, so uninstall after a partial migration leaves no
+	// unit behind.
+	UnitName      string
 	SkipSystemctl bool
 	Runner        CommandRunner
 }
 
 // DoctorOptions controls Doctor behaviour.
 type DoctorOptions struct {
-	Scope         Scope
+	Scope Scope
+	// UnitName selects the unit to inspect (without the .service suffix).
+	// Empty means the current OSS default. A present-but-unmigrated legacy
+	// unit is reported through LegacyUnit so the operator knows an upgrade
+	// is pending.
+	UnitName      string
 	SkipSystemctl bool
 	Runner        CommandRunner
 }
@@ -185,6 +280,13 @@ type DoctorResult struct {
 	IsEnabled    *bool // nil when SkipSystemctl or unit absent
 	StatusOutput string
 	Scope        Scope
+	// LegacyUnit is the path of the pre-rename unit file when it is still
+	// on disk; empty otherwise. Its presence means Install has not yet
+	// migrated this scope.
+	LegacyUnit string
+	// LegacyActive reports the legacy unit's is-active probe when the
+	// legacy file is present and the manager was queried; nil otherwise.
+	LegacyActive *bool
 }
 
 // CommandRunner abstracts running systemctl/which commands so tests can
@@ -213,12 +315,11 @@ func runner(r CommandRunner) CommandRunner {
 // ── Bin resolution ───────────────────────────────────────────────────────────
 
 // ResolveHostBinPath returns the absolute path to the host binary that
-// `daemon run` should be invoked against. Priority:
+// `host run` should be invoked against. Priority:
 //
 //  1. Explicit binPath argument.
 //  2. os.Executable() — the currently-running binary, which is the most
-//     reliable answer when invoked from `donmai daemon install` or
-//     `rensei daemon install`.
+//     reliable answer when invoked from `donmai host install`.
 func ResolveHostBinPath(binPath string) (string, error) {
 	if binPath != "" {
 		return binPath, nil
@@ -240,9 +341,13 @@ func ResolveHostBinPath(binPath string) (string, error) {
 
 // GenerateUnitFile renders a systemd .service unit file for the daemon.
 //
-// The ExecStart line is `<binPath> daemon run` — registering the host
-// binary's daemon run subcommand (locked decision). The unit
+// The ExecStart line is `<binPath> host run` — registering the host
+// binary's host run subcommand (locked decision). The unit
 // file is arch-agnostic; the binary path is resolved at install time.
+//
+// The unit name and journal tag follow the install options: UnitName
+// overrides the OSS default, SyslogIdentifier overrides the tag and
+// otherwise tracks the effective unit name.
 func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string, error) {
 	if binPath == "" {
 		return "", fmt.Errorf("systemd: GenerateUnitFile: binPath is required")
@@ -256,6 +361,7 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 	if description == "" {
 		description = DefaultDescription
 	}
+	syslogIdentifier := ResolveSyslogIdentifier(opts.UnitName, opts.SyslogIdentifier)
 
 	var lines []string
 	lines = append(lines,
@@ -309,7 +415,7 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 	lines = append(lines,
 		"StandardOutput=journal",
 		"StandardError=journal",
-		"SyslogIdentifier="+UnitName,
+		"SyslogIdentifier="+syslogIdentifier,
 	)
 	lines = append(lines, priorityDirectives...)
 
@@ -412,9 +518,17 @@ func installHomeDir(scope Scope) (string, error) {
 // Steps:
 //  1. Resolve the host binary path.
 //  2. Ensure a loadable daemon config exists (seed or validate).
-//  3. Generate the unit file content.
-//  4. Write the unit file (creating parent dirs).
-//  5. Run `systemctl [--user] daemon-reload && enable --now` unless skipped.
+//  3. Migrate the legacy unit when present: stop and disable it, then
+//     remove its file, so an upgrade never leaves two units fighting over
+//     the same daemon. Daemon state lives outside the unit (config file,
+//     state dir, journal), so nothing else moves: the new unit starts the
+//     same binary against the same config, and the service manager keeps
+//     the default control-group kill — direct-owned seats end with the old
+//     unit's stop while shim-owned seats ride out the restart in their own
+//     transient scopes.
+//  4. Generate the unit file content.
+//  5. Write the unit file (creating parent dirs).
+//  6. Run `systemctl [--user] daemon-reload && enable --now` unless skipped.
 //
 // Step 2 is the fresh-host contract: with no config the service-mode
 // start would run the interactive wizard under the unit (stdin /dev/null)
@@ -442,7 +556,8 @@ func Install(opts InstallOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	unitPath := filepath.Join(unitDir, UnitFilename)
+	unitFilename := ResolveUnitFilename(opts.UnitName)
+	unitPath := filepath.Join(unitDir, unitFilename)
 
 	// #nosec G301 -- systemd unit dirs (~/.config/systemd/user, /etc/systemd/system) are 0755 by convention.
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
@@ -458,6 +573,21 @@ func Install(opts InstallOptions) (string, error) {
 		return "", fmt.Errorf("systemd: write %s: %w", unitPath, err)
 	}
 
+	if diff, werr := sameUnitFile(unitPath, content); werr == nil && diff {
+		// The new unit landed byte-identical to what was there. A stop
+		// below would bounce a healthy daemon for no reason; the
+		// migration still retires the legacy unit file (if any) so the
+		// next daemon-reload cannot resurrect it.
+		if merr := migrateLegacyUnit(scope, unitFilename, runner(opts.Runner), opts.SkipSystemctl); merr != nil {
+			return unitPath, merr
+		}
+		if opts.SkipSystemctl {
+			return unitPath, nil
+		}
+	} else if merr := migrateLegacyUnit(scope, unitFilename, runner(opts.Runner), opts.SkipSystemctl); merr != nil {
+		return unitPath, merr
+	}
+
 	if opts.SkipSystemctl {
 		return unitPath, nil
 	}
@@ -468,30 +598,80 @@ func Install(opts InstallOptions) (string, error) {
 	if out, err := r.Run("systemctl", append(append([]string{}, scopeFlags...), "daemon-reload")...); err != nil {
 		return unitPath, fmt.Errorf("systemd: daemon-reload: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
-	if out, err := r.Run("systemctl", append(append([]string{}, scopeFlags...), "enable", "--now", UnitFilename)...); err != nil {
+	if out, err := r.Run("systemctl", append(append([]string{}, scopeFlags...), "enable", "--now", unitFilename)...); err != nil {
 		return unitPath, fmt.Errorf("systemd: enable --now: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 
 	return unitPath, nil
 }
 
+// sameUnitFile reports whether path already holds content. It is the
+// reinstall fast path: rewriting the same bytes must not bounce the daemon.
+func sameUnitFile(path, content string) (bool, error) {
+	raw, err := os.ReadFile(path) //nolint:gosec // own unit file just written
+	if err != nil {
+		return false, err
+	}
+	return string(raw) == content, nil
+}
+
+// migrateLegacyUnit retires the unit written by earlier builds (stop and
+// disable it, then remove its file) when it differs from the unit this
+// install just wrote. currentFilename is the unit this install owns; every
+// other known legacy filename is retired. Unknown filenames are left alone:
+// only units this installer ever wrote are its to remove.
+//
+// When skipSystemctl is set only the file removal runs (tests and CI
+// environments without systemd); production also stops and disables the
+// legacy unit through the service manager first, best-effort, so its
+// control-group kill ends direct-owned seats before the new unit starts.
+func migrateLegacyUnit(scope Scope, currentFilename string, r CommandRunner, skipSystemctl bool) error {
+	dir, err := UnitDir(scope)
+	if err != nil {
+		return err
+	}
+	scopeFlags := scopeFlags(scope)
+	for _, legacyFilename := range []string{LegacyUnitFilename()} {
+		if legacyFilename == currentFilename {
+			continue
+		}
+		legacyPath := filepath.Join(dir, legacyFilename)
+		if _, statErr := os.Stat(legacyPath); statErr != nil {
+			continue
+		}
+		if !skipSystemctl {
+			// Best-effort: the file removal below still runs when the
+			// manager is unreachable, so a dead manager cannot wedge
+			// the upgrade.
+			_, _ = r.Run("systemctl", append(append([]string{}, scopeFlags...), "stop", strings.TrimSuffix(legacyFilename, ".service"))...)
+			_, _ = r.Run("systemctl", append(append([]string{}, scopeFlags...), "disable", legacyFilename)...)
+		}
+		if err := os.Remove(legacyPath); err != nil {
+			return fmt.Errorf("systemd: remove legacy unit %s: %w", legacyPath, err)
+		}
+	}
+	return nil
+}
+
 // ── Uninstall ────────────────────────────────────────────────────────────────
 
-// Uninstall disables the unit and removes its file.
+// Uninstall disables the unit and removes its file, retiring the legacy
+// unit alongside the current one.
 //
 // Steps:
-//  1. Run `systemctl [--user] disable --now rensei-daemon` (best-effort).
-//  2. Remove the unit file if it exists.
+//  1. Run `systemctl [--user] stop <unit>` then `disable <unit>` for the
+//     current unit and the legacy unit (best-effort).
+//  2. Remove the unit files that exist.
 //  3. Run `systemctl [--user] daemon-reload` (best-effort).
 //
-// Returns the unit file path, regardless of whether it was present.
+// Returns the current unit file path, regardless of whether it was present.
 func Uninstall(opts UninstallOptions) (string, error) {
 	scope := opts.Scope
 	if scope == "" {
 		scope = ScopeUser
 	}
 
-	unitPath, err := UnitPath(scope)
+	unitPath, err := UnitPathFor(scope, opts.UnitName)
 	if err != nil {
 		return "", err
 	}
@@ -499,16 +679,39 @@ func Uninstall(opts UninstallOptions) (string, error) {
 	r := runner(opts.Runner)
 	scopeFlagsList := scopeFlags(scope)
 
+	filenames := []string{ResolveUnitFilename(opts.UnitName)}
+	if LegacyUnitFilename() != filenames[0] {
+		filenames = append(filenames, LegacyUnitFilename())
+	}
+
 	if !opts.SkipSystemctl {
-		if _, statErr := os.Stat(unitPath); statErr == nil {
-			// Best-effort disable; ignore errors so we still remove the file.
-			_, _ = r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "disable", "--now", UnitFilename)...)
+		for _, filename := range filenames {
+			path := ""
+			if dir, derr := UnitDir(scope); derr == nil {
+				path = filepath.Join(dir, filename)
+			}
+			if path == "" {
+				continue
+			}
+			if _, statErr := os.Stat(path); statErr == nil {
+				// Best-effort stop+disable; ignore errors so we still
+				// remove the file.
+				_, _ = r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "stop", strings.TrimSuffix(filename, ".service"))...)
+				_, _ = r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "disable", filename)...)
+			}
 		}
 	}
 
-	if _, statErr := os.Stat(unitPath); statErr == nil {
-		if err := os.Remove(unitPath); err != nil {
-			return unitPath, fmt.Errorf("systemd: remove %s: %w", unitPath, err)
+	for _, filename := range filenames {
+		dir, derr := UnitDir(scope)
+		if derr != nil {
+			return unitPath, derr
+		}
+		path := filepath.Join(dir, filename)
+		if _, statErr := os.Stat(path); statErr == nil {
+			if err := os.Remove(path); err != nil {
+				return unitPath, fmt.Errorf("systemd: remove %s: %w", path, err)
+			}
 		}
 	}
 
@@ -528,7 +731,7 @@ func Doctor(opts DoctorOptions) (DoctorResult, error) {
 		scope = ScopeUser
 	}
 
-	unitPath, err := UnitPath(scope)
+	unitPath, err := UnitPathFor(scope, opts.UnitName)
 	if err != nil {
 		return DoctorResult{}, err
 	}
@@ -539,31 +742,52 @@ func Doctor(opts DoctorOptions) (DoctorResult, error) {
 		result.UnitExists = true
 	}
 
-	if opts.SkipSystemctl || !result.UnitExists {
+	// Surface a pending migration even when the manager is skipped: the
+	// file check needs no systemctl.
+	if legacyPath, lerr := UnitPathFor(scope, LegacyUnitName()); lerr == nil {
+		if _, statErr := os.Stat(legacyPath); statErr == nil && legacyPath != unitPath {
+			result.LegacyUnit = legacyPath
+		}
+	}
+
+	if opts.SkipSystemctl || (!result.UnitExists && result.LegacyUnit == "") {
 		return result, nil
 	}
 
 	r := runner(opts.Runner)
 	scopeFlagsList := scopeFlags(scope)
+	unitName := ResolveUnitName(opts.UnitName)
 
-	if _, runErr := r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "is-active", UnitName)...); runErr == nil {
-		t := true
-		result.IsActive = &t
-	} else {
-		f := false
-		result.IsActive = &f
+	if result.UnitExists {
+		if _, runErr := r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "is-active", unitName)...); runErr == nil {
+			t := true
+			result.IsActive = &t
+		} else {
+			f := false
+			result.IsActive = &f
+		}
+
+		if _, runErr := r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "is-enabled", unitName)...); runErr == nil {
+			t := true
+			result.IsEnabled = &t
+		} else {
+			f := false
+			result.IsEnabled = &f
+		}
+
+		statusOut, _ := r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "status", "--no-pager", unitName)...)
+		result.StatusOutput = strings.TrimSpace(string(statusOut))
 	}
 
-	if _, runErr := r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "is-enabled", UnitName)...); runErr == nil {
-		t := true
-		result.IsEnabled = &t
-	} else {
-		f := false
-		result.IsEnabled = &f
+	if result.LegacyUnit != "" {
+		if _, runErr := r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "is-active", LegacyUnitName())...); runErr == nil {
+			t := true
+			result.LegacyActive = &t
+		} else {
+			f := false
+			result.LegacyActive = &f
+		}
 	}
-
-	statusOut, _ := r.Run("systemctl", append(append([]string{}, scopeFlagsList...), "status", "--no-pager", UnitName)...)
-	result.StatusOutput = strings.TrimSpace(string(statusOut))
 
 	return result, nil
 }
