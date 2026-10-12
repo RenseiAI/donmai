@@ -25,11 +25,12 @@ func TestLegacyAlias_ProvidersResolveToTheirHarness(t *testing.T) {
 
 	reg := runner.NewRegistry()
 	providers := matrix.HarnessProvidersForParity()
-	// 7 legacy-aliased providers (pi joined as the R2/DEC-3 addition) + the
+	// 8 legacy-aliased providers (pi joined as the R2/DEC-3 addition,
+	// agy-cli rejoined in API-key mode) + the
 	// interactive-only shell harness (W4; no legacy alias by definition — it
 	// is not a back-compat name).
-	if len(providers) != 8 {
-		t.Fatalf("expected 8 harness providers, got %d", len(providers))
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if err := reg.Register(p); err != nil {
@@ -38,8 +39,9 @@ func TestLegacyAlias_ProvidersResolveToTheirHarness(t *testing.T) {
 	}
 
 	// The back-compat ProviderNames that must keep resolving (the six P2
-	// names + pi).
+	// names + pi + the rejoined agy-cli keyed cell).
 	wantNames := []agent.ProviderName{
+		agent.ProviderAGYCLI,
 		agent.ProviderClaude,
 		agent.ProviderCodex,
 		agent.ProviderGemini,
@@ -97,6 +99,7 @@ func TestLegacyAliasMap_ExactlyTheLegacyNames(t *testing.T) {
 		agent.ProviderClaude:   {Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: "oauth-cli"},
 		agent.ProviderCodex:    {Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: "oauth-cli"},
 		agent.ProviderGemini:   {Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: "direct"},
+		agent.ProviderAGYCLI:   {Harness: agent.HarnessAntigravity, Endpoint: agent.CompanyGoogle, Host: "direct"},
 		agent.ProviderOllama:   {Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: "local"},
 		agent.ProviderOpenCode: {Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: "direct"},
 		agent.ProviderPi:       {Harness: agent.HarnessPi, Endpoint: agent.CompanyAnthropic, Host: "direct"},
@@ -148,8 +151,8 @@ func TestAssertLegacyAlias_NoMismatchForRealProviders(t *testing.T) {
 		}
 	}
 	// The back-compat guarantee itself must not shrink: the six P2 legacy
-	// names plus pi (R2/DEC-3) carry cells.
-	if legacyCells != 7 {
-		t.Errorf("legacy-aliased shipped providers = %d; want 7", legacyCells)
+	// names plus pi (R2/DEC-3) plus the rejoined agy-cli keyed cell carry cells.
+	if legacyCells != 8 {
+		t.Errorf("legacy-aliased shipped providers = %d; want 8", legacyCells)
 	}
 }

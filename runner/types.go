@@ -238,7 +238,7 @@ const (
 // by the daemon poll handler).
 type ResolvedProfile struct {
 	// Harness is the loop-driver attribute the platform catalog models on
-	// the model identity (e.g. "gemini-direct" or "ollama";
+	// the model identity (e.g. "antigravity", "gemini-direct", or "ollama";
 	// legacy wire aliases such as "native" and "raw" remain accepted).
 	// When present it is AUTHORITATIVE for binary/provider selection: the
 	// runner maps the harness token onto its concrete provider impl

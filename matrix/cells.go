@@ -217,6 +217,27 @@ var validCells = []HarnessEndpointCell{
 		Stability: "beta", Smoked: false,
 	},
 
+	// antigravity × Google (direct, API-key mode) -----------------------------
+	// The keyed cell: agy runs with GEMINI_API_KEY from Spec.Env under a
+	// per-session HOME holding the API-key-mode settings.json
+	// (provider/harness/agycli/keymode.go). AuthModes [byok, metered],
+	// NeedsAPIKey true (the key comes from the resolved cell credential via
+	// Spec.Env/Endpoint.Env). Experimental and unsmoked until the smoke
+	// gate proves a real keyed run. Anchors ProviderName "agy-cli" (the
+	// legacy alias map requires one anchor per real provider).
+	//
+	// The host-session matrix path (antigravity × google × oauth-cli) is
+	// deliberately NOT re-added: removing the Google oauth-cli host is a
+	// separate slice, and this adapter drives direct only.
+	{
+		Harness: agent.HarnessAntigravity, Endpoint: agent.CompanyGoogle, Host: agent.HostDirect,
+		Protocol: agent.ProtoGeminiGenerate, Transport: agent.TransportPTY,
+		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderAGYCLI),
+		Stability: "experimental", Smoked: false,
+	},
+
 	// ollama × Local --------------------------------------------------------
 	{
 		Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: agent.HostLocal,

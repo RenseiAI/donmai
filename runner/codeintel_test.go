@@ -11,6 +11,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/harness/agycli"
 	claudeprovider "github.com/RenseiAI/donmai/provider/harness/claude"
 	codexprovider "github.com/RenseiAI/donmai/provider/harness/codex"
 	geminiprovider "github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -298,6 +299,7 @@ func harnessMCPCases(t *testing.T) []harnessMCPCase {
 		{"opencode", &opencodeprovider.Provider{}, agent.PromptModeAutonomous, true},
 		{"stub", stubProvider, agent.PromptModeAutonomous, true},
 		{"pi", &piprovider.Provider{}, agent.PromptModeAutonomous, false},
+		{"agy-cli", &agycli.Provider{}, agent.PromptModeAutonomous, false},
 		{"ollama", &ollamaprovider.Provider{}, agent.PromptModeAutonomous, false},
 		{"shell", &shellprovider.Provider{}, agent.PromptModeHumanControlled, false},
 	}

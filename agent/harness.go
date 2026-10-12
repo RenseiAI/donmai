@@ -22,9 +22,15 @@ type HarnessName string
 
 // HarnessName constants name each loop-driver identity.
 const (
-	HarnessClaudeCode   HarnessName = "claude-code"
-	HarnessCodex        HarnessName = "codex"
-	HarnessOpenCode     HarnessName = "opencode"
+	HarnessClaudeCode HarnessName = "claude-code"
+	HarnessCodex      HarnessName = "codex"
+	HarnessOpenCode   HarnessName = "opencode"
+	// HarnessAntigravity is the Antigravity `agy` CLI-wrap loop-driver
+	// (provider/harness/agycli): `agy -p` under a pty. Keyed spawns run
+	// API-key mode (GEMINI_API_KEY + per-session HOME); host-session
+	// spawns run under the operator's own agy login. Cells start
+	// experimental/untested until the smoke gate passes.
+	HarnessAntigravity  HarnessName = "antigravity"
 	HarnessGeminiDirect HarnessName = "gemini-direct" // in-box Gemini generateContent loop
 	HarnessOllama       HarnessName = "ollama"        // in-box Ollama /api/chat loop
 	// HarnessRaw is the deprecated pre-split wire token for the two in-box

@@ -4,6 +4,26 @@
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "cells": [
     {
+      "harness": "antigravity",
+      "endpoint": "google",
+      "host": "direct",
+      "protocol": "gemini-generate",
+      "transport": "pty",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "agy-cli",
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
       "harness": "claude-code",
       "endpoint": "anthropic",
       "host": "bedrock",
@@ -321,6 +341,14 @@
   ],
   "denylist": [],
   "legacyAliases": [
+    {
+      "providerName": "agy-cli",
+      "cell": {
+        "harness": "antigravity",
+        "endpoint": "google",
+        "host": "direct"
+      }
+    },
     {
       "providerName": "claude",
       "cell": {

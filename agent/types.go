@@ -19,7 +19,7 @@ import (
 // ProviderName is the stable identifier for an agent provider family.
 //
 // It mirrors AgentProviderName from the legacy TS port. v0.5.0 ships
-// claude, codex, and stub. Additional families (gemini,
+// claude, codex, and stub. Additional families (gemini, agy-cli,
 // ollama, opencode, jules) extend this enum without breaking the
 // contract.
 //
@@ -34,6 +34,7 @@ const (
 	ProviderCodex    ProviderName = "codex"
 	ProviderStub     ProviderName = "stub" // test-only; deterministic
 	ProviderGemini   ProviderName = "gemini"
+	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; keyed (API-key mode) or host-session, pty.
 	ProviderOllama   ProviderName = "ollama"
 	ProviderOpenCode ProviderName = "opencode"
 	// ProviderPi is the legacy wire enum for the pi harness (HarnessPi).

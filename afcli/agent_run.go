@@ -28,6 +28,7 @@ import (
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
+	provideragycli "github.com/RenseiAI/donmai/provider/harness/agycli"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -1369,6 +1370,15 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 	}
 	return []providerCtor{
 		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
+		// agy-cli wraps the Antigravity `agy` CLI under a pty. Keyed
+		// sessions run API-key mode (GEMINI_API_KEY + per-session HOME);
+		// host sessions run under the operator's own agy login. The
+		// constructor probes the binary + API-key-mode support and
+		// warns-and-skips when absent/too old
+		// (provider/harness/agycli/probe.go). Cells stay
+		// experimental/untested/smoked:false until the smoke gate proves
+		// a real keyed run.
+		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
 		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
 		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(codexCtorOptions(h)) }},
 		// Ollama is local-first: probe is a quick GET /api/tags against

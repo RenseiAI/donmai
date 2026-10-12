@@ -621,6 +621,9 @@ func recognizedHarnessToken(token string) (agent.HarnessName, bool) {
 		return agent.HarnessCodex, true
 	case string(agent.HarnessOpenCode):
 		return agent.HarnessOpenCode, true
+	case string(agent.HarnessAntigravity):
+		return agent.HarnessAntigravity, true
+
 	case string(agent.HarnessGeminiDirect):
 		return agent.HarnessGeminiDirect, true
 	case string(agent.HarnessOllama):
@@ -672,6 +675,8 @@ func legacyHarnessNameForProvider(name agent.ProviderName) agent.HarnessName {
 		return agent.HarnessCodex
 	case agent.ProviderOpenCode:
 		return agent.HarnessOpenCode
+	case agent.ProviderAGYCLI:
+		return agent.HarnessAntigravity
 	case agent.ProviderGemini:
 		return agent.HarnessGeminiDirect
 	case agent.ProviderOllama:

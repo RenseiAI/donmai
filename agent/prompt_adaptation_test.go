@@ -234,25 +234,30 @@ func TestRetiredAmpPromptDeliveryKindStaysUnknown(t *testing.T) {
 	}
 }
 
-// TestRetiredAgyPromptDeliveryKindStaysUnknown is the retirement guard for
-// the removed subscription-CLI harness's prompt delivery kind.
-// "agy_prompt_flag" is the literal former PromptDeliveryAgyPromptFlag wire
-// value; a generic "invented" string (as used above) would pass this test
-// whether or not that constant and its knownPromptDelivery case were ever
-// restored, so this pins the exact retired string. Re-adding
-// PromptDeliveryAgyPromptFlag = "agy_prompt_flag" and its case in
-// knownPromptDelivery flips this test red.
-func TestRetiredAgyPromptDeliveryKindStaysUnknown(t *testing.T) {
+// TestAgyPromptDeliveryKindIsKnown pins the restored Antigravity prompt
+// delivery kind: "agy_prompt_flag" is the live PromptDeliveryAgyPromptFlag
+// wire value the keyed adapter's manifest declares, so a profile carrying
+// it adapts (here: user text delivered onto the prompt flag) instead of
+// failing as a malformed plan. This replaces the retirement guard
+// TestRetiredAgyPromptDeliveryKindStaysUnknown, which pinned the same
+// string as unknown while the harness was removed.
+//
+// RED proof: drop the PromptDeliveryAgyPromptFlag case from
+// knownPromptDelivery and this test fails with a malformed-plan denial.
+func TestAgyPromptDeliveryKindIsKnown(t *testing.T) {
 	t.Parallel()
 	profile, ok := (&claude.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)
 	if !ok {
 		t.Fatal("claude manifest has no autonomous prompt profile")
 	}
-	profile.UserDelivery = agent.PromptDeliveryKind("agy_prompt_flag")
+	profile.UserDelivery = agent.PromptDeliveryAgyPromptFlag
+	if agent.PromptDeliveryAgyPromptFlag != agent.PromptDeliveryKind("agy_prompt_flag") {
+		t.Fatalf("PromptDeliveryAgyPromptFlag = %q, want the pinned wire value", agent.PromptDeliveryAgyPromptFlag)
+	}
 	plan := fullPromptPlan()
 	_, _, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
-	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
-		t.Fatalf("retired agy_prompt_flag delivery error = %v, want malformed-plan denial", err)
+	if err != nil {
+		t.Fatalf("agy_prompt_flag delivery error = %v, want successful adaptation", err)
 	}
 }
 

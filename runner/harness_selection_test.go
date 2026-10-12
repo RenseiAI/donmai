@@ -109,6 +109,39 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 	}
 }
 
+// TestExplicitHarnessSelection_Antigravity pins the restored canonical
+// token: an explicit "antigravity" harness selector resolves to the
+// registered agy-cli provider, carrying the canonical harness identity —
+// even when the Provider hint names another family (canonical ids are
+// authoritative). The retired "agy" short alias stays unknown (see
+// TestRetiredHarnessTokenIsUnknown).
+//
+// RED proof: drop the antigravity case from recognizedHarnessToken and
+// this test fails with DenialUnknownHarness.
+func TestExplicitHarnessSelection_Antigravity(t *testing.T) {
+	t.Parallel()
+	registry := selectorRegistry(t,
+		&selectorFakeProvider{name: agent.ProviderAGYCLI, harness: agent.HarnessAntigravity},
+		&selectorFakeProvider{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect},
+	)
+	for _, profile := range []ResolvedProfile{
+		{Harness: "antigravity"},
+		{Harness: "antigravity", Provider: agent.ProviderGemini},
+		{Harness: "antigravity", Provider: agent.ProviderAGYCLI},
+	} {
+		selection, err := registry.selectExplicitHarness(profile)
+		if err != nil {
+			t.Fatalf("selectExplicitHarness(%+v): %v", profile, err)
+		}
+		if selection.Provider.Name() != agent.ProviderAGYCLI {
+			t.Fatalf("selectExplicitHarness(%+v) provider = %q, want %q", profile, selection.Provider.Name(), agent.ProviderAGYCLI)
+		}
+		if selection.Harness.ID != string(agent.HarnessAntigravity) {
+			t.Fatalf("selectExplicitHarness(%+v) harness = %q, want %q", profile, selection.Harness.ID, agent.HarnessAntigravity)
+		}
+	}
+}
+
 func TestExplicitHarnessSelectionTypedDenials(t *testing.T) {
 	t.Parallel()
 	registry := selectorRegistry(t,
@@ -361,12 +394,15 @@ func TestExplicitHarnessDenialPrecedesAllSideEffects(t *testing.T) {
 
 // TestRetiredHarnessTokenIsUnknown is the retirement guard: each removed
 // harness token must fail closed as an unknown harness rather than
-// resolving to any registered runtime. "amp" and "agy"/"antigravity" are
-// the literal wire tokens recognizedHarnessToken used to accept; a generic
-// placeholder token would pass this test whether or not those cases were
-// ever restored, so this pins the exact retired strings. Restoring any token
-// (or its provider mapping) flips this test red — see the retirement guard
-// revert proof in the PR description.
+// resolving to any registered runtime. "amp" is a literal wire token
+// recognizedHarnessToken used to accept, and "agy" is the retired short
+// alias of the Antigravity CLI (the canonical "antigravity" token is LIVE
+// again — API-key mode — so it is asserted in
+// TestExplicitHarnessSelection_Antigravity, not here). A generic placeholder
+// token would pass this test whether or not those cases were ever restored,
+// so this pins the exact retired strings. Restoring any token (or its
+// provider mapping) flips this test red — see the retirement guard revert
+// proof in the PR description.
 func TestRetiredHarnessTokenIsUnknown(t *testing.T) {
 	t.Parallel()
 	registry := selectorRegistry(t,
@@ -378,8 +414,6 @@ func TestRetiredHarnessTokenIsUnknown(t *testing.T) {
 		{Harness: "amp", Provider: agent.ProviderName("amp")},
 		{Harness: "agy"},
 		{Harness: "agy", Provider: agent.ProviderGemini},
-		{Harness: "antigravity"},
-		{Harness: "antigravity", Provider: agent.ProviderName("agy-cli")},
 		{Harness: "retired-harness"},
 		{Harness: "retired-harness", Provider: "retired-harness"},
 	} {

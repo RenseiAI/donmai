@@ -282,13 +282,13 @@ func TestParity_CapsNarrowingOnly(t *testing.T) {
 }
 
 // TestParity_ManifestAgreesWithCapabilities is rule 7 (the P1 additive-safety
-// guard): for each of the 8 harness providers, the Manifest().Caps agent-loop
+// guard): for each of the 9 harness providers, the Manifest().Caps agent-loop
 // fields equal the corresponding Capabilities() fields — proving the manifest
 // is a faithful additive projection, not a divergent second source of truth.
 func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 	providers := HarnessProvidersForParity()
-	if len(providers) != 8 {
-		t.Fatalf("expected 8 harness providers, got %d", len(providers))
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if p == nil {
@@ -433,30 +433,54 @@ func TestParity_NoCrossProtocolOpencodeAnthropic(t *testing.T) {
 	}
 }
 
-// TestParity_NoRetiredAntigravityCell is the retirement guard: the removed
-// harness must not reappear as a harvested row, a valid cell, or a legacy
-// alias. Re-adding the harvest entry, the cell, or the provider anchor flips
-// this test red — see the retirement revert proof in the PR description.
-func TestParity_NoRetiredAntigravityCell(t *testing.T) {
+// TestParity_KeyedAntigravityCellIsDirectOnly is the keyed-cell guard: the
+// Antigravity harness must appear as a harvested row and MUST resolve only
+// to the API-key-mode cell (antigravity × google × direct, NeedsAPIKey) —
+// never to the retired host-session cell (antigravity × google × oauth-cli),
+// whose removal is a separate slice — and the agy-cli legacy alias must
+// anchor exactly that direct cell. Re-adding an oauth-cli cell, dropping
+// the direct cell, or moving the alias flips this test red.
+func TestParity_KeyedAntigravityCell(t *testing.T) {
 	t.Parallel()
 	built, err := Build()
 	if err != nil {
 		t.Fatalf("Build(): %v", err)
 	}
+	foundHarness := false
 	for _, h := range built.Harnesses {
-		if h.Name == agent.HarnessName("antigravity") {
-			t.Errorf("retired antigravity harness present in generated harnesses")
+		if h.Name == agent.HarnessAntigravity {
+			foundHarness = true
 		}
 	}
+	if !foundHarness {
+		t.Errorf("antigravity harness missing from generated harnesses")
+	}
+	foundDirect := false
 	for _, c := range built.Matrix.Cells {
-		if c.Harness == agent.HarnessName("antigravity") {
-			t.Errorf("retired antigravity cell present: %+v", c.Key())
+		if c.Harness != agent.HarnessAntigravity {
+			continue
+		}
+		if c.Endpoint == agent.CompanyGoogle && c.Host == agent.HostOAuthCLI {
+			t.Errorf("retired host-session cell present: %+v", c.Key())
+		}
+		if c.Endpoint == agent.CompanyGoogle && c.Host == agent.HostDirect {
+			foundDirect = true
+			if !c.NeedsAPIKey || c.BringsOwnAuth {
+				t.Errorf("keyed cell %+v must need an API key and bring no auth", c.Key())
+			}
+			if c.Stability != "experimental" || c.Smoked {
+				t.Errorf("keyed cell %+v must be experimental/unsmoked", c.Key())
+			}
 		}
 	}
-	for _, a := range built.AliasMap {
-		if a.ProviderName == agent.ProviderName("agy-cli") {
-			t.Errorf("retired agy-cli legacy alias present: %+v", a.Cell)
-		}
+	if !foundDirect {
+		t.Errorf("keyed antigravity × google × direct cell missing")
+	}
+	alias, ok := LegacyAliasMap[agent.ProviderAGYCLI]
+	if !ok {
+		t.Errorf("agy-cli legacy alias missing (the keyed cell must anchor it)")
+	} else if alias.Harness != agent.HarnessAntigravity || alias.Host != agent.HostDirect {
+		t.Errorf("agy-cli alias = %+v, want antigravity × google × direct", alias)
 	}
 }
 

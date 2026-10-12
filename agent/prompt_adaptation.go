@@ -103,6 +103,10 @@ const (
 	PromptDeliveryOllamaUserMessage PromptDeliveryKind = "ollama_user_message"
 	// PromptDeliveryOpenCodePrompt uses OpenCode's prompt request.
 	PromptDeliveryOpenCodePrompt PromptDeliveryKind = "opencode_prompt"
+	// PromptDeliveryAgyPromptFlag uses agy's prompt flag (`agy -p`). The
+	// prompt rides the flag VALUE (agy has no stdin-prompt mode); the
+	// harness-owned result envelope is appended to that value.
+	PromptDeliveryAgyPromptFlag PromptDeliveryKind = "agy_prompt_flag"
 	// PromptDeliveryPiSystemAppend uses pi's append-system flag.
 	PromptDeliveryPiSystemAppend PromptDeliveryKind = "pi_cli_append_system_prompt"
 	// PromptDeliveryPiRPCPrompt uses pi's RPC prompt message.
@@ -573,6 +577,7 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryOllamaSystemMessage,
 		PromptDeliveryOllamaUserMessage,
 		PromptDeliveryOpenCodePrompt,
+		PromptDeliveryAgyPromptFlag,
 		PromptDeliveryPiSystemAppend,
 		PromptDeliveryPiRPCPrompt,
 		PromptDeliveryPiPTYSeed,

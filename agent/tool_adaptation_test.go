@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/agycli"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -33,6 +34,7 @@ func TestToolLifecycleAdapterMatrix(t *testing.T) {
 		{"codex", (&codex.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}, true, false, true},
 		{"gemini", (&gemini.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, true, true},
 		{"ollama", (&ollama.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, false, true},
+		{"agy-cli", (&agycli.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, false, false},
 		{"opencode", (&opencode.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, true, true},
 		{"pi", (&pi.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}, false, true, true},
 		{"shell", (&shell.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeHumanControlled}, false, false, false},
@@ -136,6 +138,7 @@ func TestToolLifecycleAdapterUnsupportedPoliciesDeny(t *testing.T) {
 		mode     agent.PromptSessionMode
 	}{
 		{"codex-flat-list", (&codex.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
+		{"agy-cli", (&agycli.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
 		{"ollama", (&ollama.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
 		{"shell", (&shell.Provider{}).Manifest(), agent.Spec{Interactive: &agent.InteractiveSpec{}, AllowedTools: []string{"Read"}}, agent.PromptModeHumanControlled},
 	}
@@ -208,6 +211,11 @@ func TestToolLifecycleRuntimeEvidenceIsPerHarness(t *testing.T) {
 		// interactive profile does not inherit pi's structured headless evidence.
 		{(&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"pi-interactive", coarse, cast, cleanup, ""}},
 		{(&shell.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"shell", coarse, cast, cleanup, ""}},
+		// Antigravity drives a PTY with no replay adapter at all: coarse
+		// lifecycle evidence is deliverable, replay is not, and neither is a
+		// structured claim over the same bytes.
+		{(&agycli.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceCoarse, runtimeEvidenceCase{"agy-cli-coarse", coarse, "", cleanup, coarse}},
+		{(&agycli.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"agy-cli-structured", "", "", cleanup, ""}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
