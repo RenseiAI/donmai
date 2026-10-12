@@ -344,6 +344,7 @@ const dataURL = "data:text/javascript;base64," + Buffer.from(stripped, "utf8").t
 
 const handlers = {};
 const providers = [];
+const notifications = [];
 const stubPi = {
   registerProvider(name, config) {
     providers.push({ name, config });
@@ -370,8 +371,19 @@ for (const name of (process.env.HARNESS_REPORT_ENV ?? "").split(",")) {
 }
 
 const handler = handlers["tool_call"];
+// Surface a session_start notification the extension may have registered
+// when it refuses to register the provider (no context window): the harness
+// reports notifications so the Go test can assert the refusal is surfaced,
+// not silent. The stub ctx carries a notify capture plus hasUI so the
+// refusal path runs exactly as it would in the real runtime.
+const sessionStart = handlers["session_start"];
+if (sessionStart) {
+  try {
+    await sessionStart({}, { hasUI: true, ui: { notify: (message, level) => notifications.push({ message, level }) } });
+  } catch {}
+}
 if (!handler) {
-  console.log(JSON.stringify({ registered: false, verdict: null, providers, environment }));
+  console.log(JSON.stringify({ registered: false, verdict: null, providers, environment, notifications }));
   process.exit(0);
 }
 
@@ -394,4 +406,4 @@ if (ctxJSON) {
 }
 
 const verdict = await handler({ toolName, input }, ctx);
-console.log(JSON.stringify({ registered: true, verdict: verdict ?? null, providers, environment }));
+console.log(JSON.stringify({ registered: true, verdict: verdict ?? null, providers, environment, notifications }));
