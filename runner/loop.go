@@ -1,12 +1,14 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -35,6 +37,36 @@ import (
 // loop. It delegates to internal/kit.LoadSkills; isolated here so tests
 // can verify integration without a real KitRegistry on disk.
 var kitLoadSkills = kit.LoadSkills
+
+// goModCache reports where the host's Go toolchain keeps downloaded module
+// sources (the value `go env GOMODCACHE` prints). A package-level seam so
+// tests can stub it without a toolchain on PATH. The empty string means the
+// lookup failed and the caller must omit the key rather than export a lie.
+var goModCache = func(ctx context.Context) string {
+	out, err := goEnvGomodcache(ctx)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// goEnvGomodcache runs the host toolchain's own `go env GOMODCACHE` probe.
+// A named helper (rather than an inline exec) so the probe's argv is pinned
+// in one place. The caller passes a bounded context; a missing toolchain or
+// a probe failure is an error, never an empty path that reads as unset.
+func goEnvGomodcache(ctx context.Context) (string, error) {
+	//nolint:gosec // G204: fixed tool and fixed key; no session input reaches argv.
+	cmd := exec.CommandContext(ctx, "go", "env", "GOMODCACHE")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("runner: go env GOMODCACHE: %w", err)
+	}
+	if out := strings.TrimSpace(stdout.String()); out != "" {
+		return out, nil
+	}
+	return "", errors.New("runner: go env GOMODCACHE printed empty output")
+}
 
 // termCastPath returns the on-disk asciinema-v2 cast location for a
 // session's workarea (spec § 16), next to events.jsonl in the
@@ -1119,7 +1151,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
-	// 8. Spawn provider.
+	// 8. Spawn provider. Preparation ends here: everything above (provider
+	// resolution, worktree provisioning, kit toolchain, dependency installs,
+	// MCP config, prompt assembly and spec translation) ran before the agent
+	// started, and its whole-second duration is recorded on the result so
+	// the terminal status carries how long preparation took. A spawn
+	// failure still records it — the phase ran even when the agent did not.
+	// The clock is the runner's injectable now (not wall time read inline)
+	// so tests drive it deterministically; a non-positive delta (a skewed
+	// test clock) omits the field rather than posting a lie.
+	res.PreparationSeconds = preparationSeconds(r.now, time.UnixMilli(startedAt))
 	handle, err := provider.Spawn(ctx, spec)
 	if err != nil {
 		res.Status = "failed"
@@ -1545,149 +1586,149 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	continuable := (RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
 	tailRecoverable := selectedRepositoryMutable || reviewWork
 tailRecovery:
-	for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
-		steerView := streamRes
-		steerView.terminalSuccess = lastTurn.terminalSuccess
-		reportedPR := prVerifier.reportsOwnRepository(lastTurn)
-		ending := classifyTurnEnding(res, streamRes, lastTurn, reportedPR, reviewWork)
-		followUps.undelivered = ""
-		if pullRequestIsTheOnlyResult(res, streamRes, lastTurn, reportedPR, reviewWork) {
-			// The session's pull request is all this turn left: it counts
-			// only when it delivers the work (not a draft; on a rework, a
-			// new commit since the run started).
-			undelivered, moved, readErr := prVerifier.undelivered(verifyCtx)
-			if readErr != nil {
-				r.logger.Warn("could not fully re-read the session's pull request; an unread part counts as delivered",
-					"sessionId", qw.SessionID, "url", res.PullRequestURL, "err", readErr)
-			}
-			if undelivered != "" {
-				followUps.noteUndelivered(undelivered, moved)
-				ending = turnStoppedEarly
-			}
-		}
-		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
-		switch step {
-		case tailDone:
-			break tailRecovery
-		case tailExhausted:
-			if ending == turnProviderError || ending == turnProviderErrorFatal {
-				followUps.providerError = lastTurn.providerError
-				if res.Upstream == nil && lastTurn.upstream != nil {
-					res.Upstream = agent.CanonicalUpstreamError(lastTurn.upstream)
+		for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
+			steerView := streamRes
+			steerView.terminalSuccess = lastTurn.terminalSuccess
+			reportedPR := prVerifier.reportsOwnRepository(lastTurn)
+			ending := classifyTurnEnding(res, streamRes, lastTurn, reportedPR, reviewWork)
+			followUps.undelivered = ""
+			if pullRequestIsTheOnlyResult(res, streamRes, lastTurn, reportedPR, reviewWork) {
+				// The session's pull request is all this turn left: it counts
+				// only when it delivers the work (not a draft; on a rework, a
+				// new commit since the run started).
+				undelivered, moved, readErr := prVerifier.undelivered(verifyCtx)
+				if readErr != nil {
+					r.logger.Warn("could not fully re-read the session's pull request; an unread part counts as delivered",
+						"sessionId", qw.SessionID, "url", res.PullRequestURL, "err", readErr)
+				}
+				if undelivered != "" {
+					followUps.noteUndelivered(undelivered, moved)
+					ending = turnStoppedEarly
 				}
 			}
-			followUps.fail(res)
-			r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
-				"sessionId", qw.SessionID,
-				"failureMode", res.FailureMode,
-				"undelivered", followUps.undelivered,
-				"continued", followUps.continued,
-				"unproductive", followUps.unproductive,
-				"retried", followUps.retried,
-				"limit", followUps.limit,
-				"ceiling", followUps.ceiling,
-			)
-			break tailRecovery
-		case tailSteer:
-			followUps.steered = true
-			res.SteeringTriggered = true
-			newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, steerView, res)
-			if err != nil {
-				r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
+			step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
+			switch step {
+			case tailDone:
 				break tailRecovery
+			case tailExhausted:
+				if ending == turnProviderError || ending == turnProviderErrorFatal {
+					followUps.providerError = lastTurn.providerError
+					if res.Upstream == nil && lastTurn.upstream != nil {
+						res.Upstream = agent.CanonicalUpstreamError(lastTurn.upstream)
+					}
+				}
+				followUps.fail(res)
+				r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
+					"sessionId", qw.SessionID,
+					"failureMode", res.FailureMode,
+					"undelivered", followUps.undelivered,
+					"continued", followUps.continued,
+					"unproductive", followUps.unproductive,
+					"retried", followUps.retried,
+					"limit", followUps.limit,
+					"ceiling", followUps.ceiling,
+				)
+				break tailRecovery
+			case tailSteer:
+				followUps.steered = true
+				res.SteeringTriggered = true
+				newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, steerView, res)
+				if err != nil {
+					r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
+					break tailRecovery
+				}
+				// attemptSteering returns the handle to keep draining: unchanged
+				// on inject success/soft-fail, or the new Handle Provider.Resume
+				// returned on the stop-and-resume fallback. The deferred Stop
+				// above closes over this variable, so reassigning it here also
+				// makes teardown target whichever handle is now live.
+				handle = newHandle
+				// Re-consume any events the steering inject/resume produced.
+				// The stall detector stays disarmed here for the same reason
+				// as the inject drain above: tail recovery owns follow-up
+				// liveness.
+				tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+				tailRes.applyTo(res, provider.Name())
+				applyFollowUp(tailRes)
+				lastTurn = tailRes
+				if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
+					break tailRecovery
+				}
+				continue
 			}
-			// attemptSteering returns the handle to keep draining: unchanged
-			// on inject success/soft-fail, or the new Handle Provider.Resume
-			// returned on the stop-and-resume fallback. The deferred Stop
-			// above closes over this variable, so reassigning it here also
-			// makes teardown target whichever handle is now live.
+	
+			// Every continuation restates the session's goal as dispatched
+			// (identifier, title, directive): a bare "continue the task"
+			// arrives without the goal and the seat can decline it, losing
+			// the verdict the prior turn reached. The retry and wrap-up
+			// prompts replace the base text wholesale below, as before.
+			prompt := continuationPrompt(reviewWork, followUps.undelivered, continueGoalBlock(qw))
+			wrapUp := enforcer.wrapUpDue()
+			if step == tailRetry {
+				prompt = retryPrompt
+				r.logger.Warn("turn ended on a model provider error; retrying",
+					"sessionId", qw.SessionID,
+					"attempt", followUps.retried+1,
+					"limit", followUps.limit,
+					"providerError", lastTurn.providerError,
+				)
+				if err := r.waitRetryBackoff(streamCtx, followUps.retried+1); err != nil {
+					stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err)
+					if stopped {
+						res.TurnContinuations = followUps.report()
+						res.Cost = enforcer.cost()
+						return res, stopErr
+					}
+					budgetStop = budget
+					break tailRecovery
+				}
+			} else {
+				r.logger.Info("turn ended before the work was finished; continuing",
+					"sessionId", qw.SessionID,
+					"undelivered", followUps.undelivered,
+					"continuation", followUps.continued+1,
+					"unproductive", followUps.unproductive,
+					"limit", followUps.limit,
+					"ceiling", followUps.ceiling,
+				)
+			}
+			if wrapUp {
+				// The token meter passed the wrap-up point and the agent has
+				// not been asked yet: this follow-up asks it to finish.
+				prompt = wrapUpPrompt
+				r.logger.Info("token budget nearly spent; asking the agent to wrap up",
+					"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
+			}
+			newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
 			handle = newHandle
-			// Re-consume any events the steering inject/resume produced.
-			// The stall detector stays disarmed here for the same reason
-			// as the inject drain above: tail recovery owns follow-up
-			// liveness.
-			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
-			tailRes.applyTo(res, provider.Name())
-			applyFollowUp(tailRes)
-			lastTurn = tailRes
-			if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
+			if err != nil || !delivered {
+				r.logger.Warn("follow-up prompt not delivered; ending tail recovery",
+					"sessionId", qw.SessionID, "err", err)
 				break tailRecovery
 			}
-			continue
-		}
-
-		// Every continuation restates the session's goal as dispatched
-		// (identifier, title, directive): a bare "continue the task"
-		// arrives without the goal and the seat can decline it, losing
-		// the verdict the prior turn reached. The retry and wrap-up
-		// prompts replace the base text wholesale below, as before.
-		prompt := continuationPrompt(reviewWork, followUps.undelivered, continueGoalBlock(qw))
-		wrapUp := enforcer.wrapUpDue()
-		if step == tailRetry {
-			prompt = retryPrompt
-			r.logger.Warn("turn ended on a model provider error; retrying",
-				"sessionId", qw.SessionID,
-				"attempt", followUps.retried+1,
-				"limit", followUps.limit,
-				"providerError", lastTurn.providerError,
-			)
-			if err := r.waitRetryBackoff(streamCtx, followUps.retried+1); err != nil {
-				stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err)
-				if stopped {
-					res.TurnContinuations = followUps.report()
-					res.Cost = enforcer.cost()
-					return res, stopErr
-				}
+			if wrapUp {
+				enforcer.wrapUpSent()
+			}
+			if step == tailRetry {
+				followUps.retried++
+			} else {
+				followUps.sentContinuation()
+			}
+			tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+			stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
+			if stopped {
+				res.TurnContinuations = followUps.report()
+				res.Cost = enforcer.cost()
+				return res, stopErr
+			}
+			tail.applyTo(res, provider.Name())
+			applyFollowUp(tail)
+			lastTurn = tail
+			if budget != nil {
 				budgetStop = budget
 				break tailRecovery
 			}
-		} else {
-			r.logger.Info("turn ended before the work was finished; continuing",
-				"sessionId", qw.SessionID,
-				"undelivered", followUps.undelivered,
-				"continuation", followUps.continued+1,
-				"unproductive", followUps.unproductive,
-				"limit", followUps.limit,
-				"ceiling", followUps.ceiling,
-			)
 		}
-		if wrapUp {
-			// The token meter passed the wrap-up point and the agent has
-			// not been asked yet: this follow-up asks it to finish.
-			prompt = wrapUpPrompt
-			r.logger.Info("token budget nearly spent; asking the agent to wrap up",
-				"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
-		}
-		newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
-		handle = newHandle
-		if err != nil || !delivered {
-			r.logger.Warn("follow-up prompt not delivered; ending tail recovery",
-				"sessionId", qw.SessionID, "err", err)
-			break tailRecovery
-		}
-		if wrapUp {
-			enforcer.wrapUpSent()
-		}
-		if step == tailRetry {
-			followUps.retried++
-		} else {
-			followUps.sentContinuation()
-		}
-		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
-		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
-		if stopped {
-			res.TurnContinuations = followUps.report()
-			res.Cost = enforcer.cost()
-			return res, stopErr
-		}
-		tail.applyTo(res, provider.Name())
-		applyFollowUp(tail)
-		lastTurn = tail
-		if budget != nil {
-			budgetStop = budget
-			break tailRecovery
-		}
-	}
 	res.TurnContinuations = followUps.report()
 	res.Cost = enforcer.cost()
 
@@ -3363,6 +3404,21 @@ func envToMap(in []string) map[string]string {
 	return out
 }
 
+// preparationSeconds is the whole-second preparation duration the terminal
+// result carries: session start (Run's startedAt) to provider spawn. Zero or
+// negative means the clock went backwards or stood still — omit the field
+// rather than post a duration the phase did not take.
+func preparationSeconds(now func() time.Time, startedAt time.Time) int64 {
+	if now == nil {
+		return 0
+	}
+	secs := int64(now().Sub(startedAt).Seconds())
+	if secs <= 0 {
+		return 0
+	}
+	return secs
+}
+
 // envOrDefault returns the process env value for key when it is set and
 // non-empty, otherwise def. Used to let a provisioner-stamped value win over
 // a locally-derived fallback.
@@ -3455,6 +3511,19 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	if qw.StageID != "" {
 		envMap["DONMAI_STAGE_ID"] = qw.StageID
 	}
+	// Point seats at the host's Go module cache so dependency sources are
+	// found without a whole-disk search. Resolved from the host toolchain's
+	// own `go env GOMODCACHE` (never inherited blindly: the worker that
+	// composed this env may itself run under a per-session cache override
+	// that must not leak into the seat). A failed probe omits the key — the
+	// seat builds exactly as before, without a stale or empty pointer.
+	// The probe inherits the worker's environment and is bounded: a wedged
+	// toolchain omits the key instead of stalling session start.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if cache := goModCache(probeCtx); cache != "" {
+		envMap["GOMODCACHE"] = cache
+	}
+	probeCancel()
 	if b := qw.StageBudget; b != nil {
 		if b.MaxDurationSeconds > 0 {
 			v := fmt.Sprintf("%d", b.MaxDurationSeconds)
