@@ -1,0 +1,18 @@
+--user
+--scope
+--collect
+-p
+CPUQuota=200%
+-p
+CPUWeight=200
+-p
+OOMPolicy=continue
+-p
+MemoryMax=268435456
+-p
+MemoryHigh=268435456
+--unit
+donmai-seat-034e30fb39a402983ad226c679c24add-1.scope
+/bin/sh
+-c
+exit 0

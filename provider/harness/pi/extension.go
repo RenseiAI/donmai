@@ -596,21 +596,21 @@ func unitPricePinEnv(spec agent.Spec) []string {
 // session runs unpinned rather than routing on a value the dispatch did
 // not carry in a usable shape.
 func routingPreferencePinEnv(spec agent.Spec) []string {
-	clear := []string{piRoutingOrderEnvVar + "=", piRoutingOnlyEnvVar + "="}
+	cleared := []string{piRoutingOrderEnvVar + "=", piRoutingOnlyEnvVar + "="}
 	if spec.Endpoint == nil || piAPIForProtocol(spec.Endpoint.Protocol) != "openai-completions" {
-		return clear
+		return cleared
 	}
 	pref := spec.Endpoint.RoutingPreference
 	if pref.IsZero() {
-		return clear
+		return cleared
 	}
 	order, ok := encodeRoutingSlugs(pref.Order)
 	if !ok {
-		return clear
+		return cleared
 	}
 	only, ok := encodeRoutingSlugs(pref.Only)
 	if !ok {
-		return clear
+		return cleared
 	}
 	return []string{piRoutingOrderEnvVar + "=" + order, piRoutingOnlyEnvVar + "=" + only}
 }

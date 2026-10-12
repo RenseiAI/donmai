@@ -174,7 +174,7 @@ type EndpointBinding struct {
 	// cost as absent rather than zero. A non-nil but all-zero value is
 	// an explicit zero price, not an absent one. Additive + omitempty;
 	// absent on every dispatch that predates it.
-	UnitPrices    *UnitPrices `json:"unitPrices,omitempty"`
+	UnitPrices *UnitPrices `json:"unitPrices,omitempty"`
 	// RoutingPreference carries an optional provider routing preference
 	// (ordered candidate providers and an exclusive allow-list) the
 	// dispatch resolved for a gateway-routed binding. The harness
