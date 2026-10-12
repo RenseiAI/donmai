@@ -678,9 +678,9 @@ func TestBeatsNeverDecreaseUsage(t *testing.T) {
 		BaseURL:   srv.URL,
 		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
 			if second.Load() {
-				return stepheartbeat.UsageSnapshot{InputTokens: 100}
+				return stepheartbeat.UsageSnapshot{InputTokens: 100, TotalCostUsd: 0.005}
 			}
-			return stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 50}
+			return stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 50, TotalCostUsd: 0.02}
 		},
 		HTTPClient: srv.Client(),
 		Interval:   5 * time.Millisecond,
@@ -711,14 +711,15 @@ func TestBeatsNeverDecreaseUsage(t *testing.T) {
 	}
 	var last struct {
 		Usage *struct {
-			Input  int64 `json:"inputTokens"`
-			Output int64 `json:"outputTokens"`
+			Input  int64   `json:"inputTokens"`
+			Output int64   `json:"outputTokens"`
+			Cost   float64 `json:"totalCostUsd"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(bodies[len(bodies)-1]), &last); err != nil {
 		t.Fatalf("beat body is not JSON: %v", err)
 	}
-	if last.Usage == nil || last.Usage.Input != 300 || last.Usage.Output != 50 {
-		t.Fatalf("regressed snapshot reported as %+v; want the clamped {300 50}", last.Usage)
+	if last.Usage == nil || last.Usage.Input != 300 || last.Usage.Output != 50 || last.Usage.Cost != 0.02 {
+		t.Fatalf("regressed snapshot reported as %+v; want the clamped {300 50 0.02}", last.Usage)
 	}
 }
