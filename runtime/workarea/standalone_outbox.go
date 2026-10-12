@@ -408,6 +408,13 @@ func (s *LeaseStore) replayStandaloneOutbox(ctx context.Context, batchSize, conc
 // until ctx is cancelled. The sender must resolve the stored receiver key on
 // every attempt. Pair it with RunTerminalResultReplayer: that loop drains
 // lease-bound records, this one drains the records that have no lease.
+//
+// The two loops are disjoint by construction: a terminal body lives in
+// exactly one record. A shim-owned seat with a lease persists its body in
+// the lease-bound record only; without a lease it persists the standalone
+// record only — never both. Without that, a killed runner would leave two
+// records for one session and the two loops would send the same terminal
+// twice.
 func (s *LeaseStore) RunStandaloneOutboxReplayer(ctx context.Context, opts TerminalResultReplayOptions, sender TerminalStatusSender) {
 	if opts.Interval <= 0 {
 		opts.Interval = DefaultTerminalResultReplayInterval

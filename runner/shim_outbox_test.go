@@ -424,3 +424,63 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 		t.Fatalf("delivery=%q, want pending", loaded.Record.DeliveryState)
 	}
 }
+
+// TestShimSeatWithLeasePersistsExactlyOneRecord is the duplicate-send guard:
+// a shim-owned seat whose lease path prepared the body must not also persist
+// a standalone record. Two records for one session would be drained by two
+// loops (lease-bound and standalone) and send the same terminal twice if the
+// runner died before the first send. The run below completes with a lease
+// and a shim seat; afterwards exactly one of the two authorities may hold
+// the session's terminal body.
+func TestShimSeatWithLeasePersistsExactlyOneRecord(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := NewRegistry()
+	provider, _ := stub.New()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster,
+		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		ShimSeat: &ShimSeatConfig{Attempt: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := QueuedWork{QueuedWork: queuedWorkBase("SHIM-OUTBOX-ONE-RECORD"), WorkerID: "worker", PlatformURL: srv.URL, TerminalWorkareaLease: terminalLeaseRequest(), ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub}}
+	queued.SessionID = runnerLeaseSessionID
+	queued.Repository = bareRepo
+	res, err := r.Run(context.Background(), queued)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "completed" || res.TerminalWorkareaLease == nil {
+		t.Fatalf("result=%+v, want a completed lease hold", res)
+	}
+	lease, err := manager.TerminalLease(res.TerminalWorkareaLease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.TerminalStatus == nil || lease.TerminalStatus.DeliveryState != workarea.TerminalStatusDelivered {
+		t.Fatalf("lease outbox=%+v, want delivered", lease.TerminalStatus)
+	}
+	if _, err := manager.LoadStandaloneTerminalOutbox(context.Background(), queued.SessionID, 1); err == nil {
+		t.Fatal("standalone record exists beside the lease record: one terminal would send twice")
+	}
+}

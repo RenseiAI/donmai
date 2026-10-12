@@ -909,16 +909,18 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// unlike the lease path, where a missing hold means the successful
 	// workarea cannot be proved retained and the seat must fail.
 	standalonePrepared := false
-	if r.shimSeat != nil && res.Status != "" {
-		standaloneBody := preparedStatusBody
-		if !leasePrepared {
-			var bodyErr error
-			standaloneBody, bodyErr = r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
-			if bodyErr != nil {
-				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
-					"sessionId", qw.SessionID, "err", bodyErr)
-				standaloneBody = nil
-			}
+	// A terminal body lives in exactly one record. When the lease path
+	// already prepared the body, the standalone outbox stays empty: the
+	// lease-bound record owns the replay. Persisting both would leave two
+	// records for one session, and the lease loop plus the standalone
+	// loop would send the same terminal twice if the runner died before
+	// the first send.
+	if r.shimSeat != nil && res.Status != "" && !leasePrepared {
+		standaloneBody, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+		if bodyErr != nil {
+			r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+				"sessionId", qw.SessionID, "err", bodyErr)
+			standaloneBody = nil
 		}
 		if standaloneBody != nil {
 			standaloneDigest, identityErr := stableTerminalResultID(qw.SessionID, res.Result)
