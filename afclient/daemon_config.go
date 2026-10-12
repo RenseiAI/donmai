@@ -159,6 +159,31 @@ type CapacityConfig struct {
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
 }
 
+// RetentionYAML is the in-memory representation of the daemon.yaml
+// `retention` block: the cross-keeper disk budget both the repository
+// keeper and the dependency keeper budget against (see the daemon-side
+// EffectiveRetentionSettings in daemon/config.go). Process-level: a change
+// needs a drain-aware restart.
+type RetentionYAML struct {
+	// MaxDiskGb caps total retained bytes in GiB across keepers.
+	// 0 means no limit.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+}
+
+// DependencyKeeperYAML is the in-memory representation of the daemon.yaml
+// `dependencyKeeper` block. Process-level: a change needs a drain-aware
+// restart.
+type DependencyKeeperYAML struct {
+	// Enabled gates keeper construction. Default off.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxDiskGb caps total dependency-store disk usage in GiB. 0 means no
+	// limit; the shared `retention` budget still applies.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+	// CompactionWindowDays bounds how long one store compaction may run
+	// before it yields. 0 means the keeper default.
+	CompactionWindowDays int64 `yaml:"compactionWindowDays,omitempty" json:"compactionWindowDays,omitempty"`
+}
+
 // RepoKeeperYAML is the in-memory representation of the daemon.yaml
 // `repoKeeper` block. Process-level: a change needs a drain-aware restart.
 type RepoKeeperYAML struct {
@@ -199,6 +224,12 @@ type DaemonYAML struct {
 	// RepoKeeper holds the per-host repository-keeper tunables. Process-level:
 	// a change needs a drain-aware restart.
 	RepoKeeper RepoKeeperYAML `yaml:"repoKeeper,omitempty"`
+	// DependencyKeeper holds the per-host dependency-keeper tunables.
+	// Process-level: a change needs a drain-aware restart.
+	DependencyKeeper DependencyKeeperYAML `yaml:"dependencyKeeper,omitempty"`
+	// Retention holds the cross-keeper disk budget both keepers budget
+	// against. Process-level: a change needs a drain-aware restart.
+	Retention RetentionYAML `yaml:"retention,omitempty"`
 }
 
 // ProjectAdmissionVersionV2 marks enabledProjectIds as authoritative.
@@ -358,6 +389,10 @@ func WriteDaemonYAMLWithCapacity(path string, cfg *DaemonYAML, key string, value
 		block, field = "capacity", "poolMaxDiskGb"
 	case "repoKeeper.enabled", "repoKeeper.maxDiskGb", "repoKeeper.fetchIntervalSeconds", "repoKeeper.authorizationWindowSeconds":
 		block, field = "repoKeeper", strings.TrimPrefix(key, "repoKeeper.")
+	case "dependencyKeeper.enabled", "dependencyKeeper.maxDiskGb", "dependencyKeeper.compactionWindowDays":
+		block, field = "dependencyKeeper", strings.TrimPrefix(key, "dependencyKeeper.")
+	case "retention.maxDiskGb":
+		block, field = "retention", strings.TrimPrefix(key, "retention.")
 	default:
 		return fmt.Errorf("unsupported capacity key %q", key)
 	}
@@ -461,6 +496,14 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 	if err != nil {
 		return nil, fmt.Errorf("encode repoKeeper: %w", err)
 	}
+	dependencyKeeperNode, err := encodeYAMLNode(cfg.DependencyKeeper)
+	if err != nil {
+		return nil, fmt.Errorf("encode dependencyKeeper: %w", err)
+	}
+	retentionNode, err := encodeYAMLNode(cfg.Retention)
+	if err != nil {
+		return nil, fmt.Errorf("encode retention: %w", err)
+	}
 
 	if cfg.ProjectAdmissionVersion != 0 {
 		projectAdmissionVersionNode, versionErr := encodeYAMLNode(cfg.ProjectAdmissionVersion)
@@ -490,11 +533,18 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 	// The merge splices cfg-owned keys wholesale, so only unowned leftovers
 	// can still hold the key — drop it wherever it remains.
 	stripRetiredCloneStrategyKey(doc)
-	// Capacity and repoKeeper are preserved as partial overlays — only the
-	// cfg-modelled fields are merged into the existing mappings. If a block
-	// key does not exist yet a new one is added.
+	// Capacity, repoKeeper, dependencyKeeper and retention are preserved
+	// as partial overlays — only the cfg-modelled fields are merged into
+	// the existing mappings. If a block key does not exist yet a new one
+	// is added.
 	if intent != nil && intent.block == "repoKeeper" {
 		upsertMappingKey(repoKeeperNode, intent.key, capacityIntentNode(intent))
+	}
+	if intent != nil && intent.block == "dependencyKeeper" {
+		upsertMappingKey(dependencyKeeperNode, intent.key, capacityIntentNode(intent))
+	}
+	if intent != nil && intent.block == "retention" {
+		upsertMappingKey(retentionNode, intent.key, capacityIntentNode(intent))
 	}
 	if intent != nil && intent.block == "capacity" {
 		upsertMappingKey(capacityNode, intent.key, capacityIntentNode(intent))
@@ -512,6 +562,8 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 	}
 	mergeMappingKey(doc, "capacity", capacityNode)
 	mergeMappingKey(doc, "repoKeeper", repoKeeperNode)
+	mergeMappingKey(doc, "dependencyKeeper", dependencyKeeperNode)
+	mergeMappingKey(doc, "retention", retentionNode)
 
 	out, err := yaml.Marshal(&root)
 	if err != nil {
@@ -558,9 +610,10 @@ func stripRetiredCloneStrategyKey(doc *yaml.Node) {
 }
 
 func capacityIntentNode(intent *capacityWriteIntent) *yaml.Node {
-	// repoKeeper.enabled is a boolean: author true/false so the daemon reader
-	// decodes it. Every other key is an integer.
-	if intent.block == "repoKeeper" && intent.key == "enabled" {
+	// repoKeeper.enabled and dependencyKeeper.enabled are booleans: author
+	// true/false so the daemon reader decodes them. Every other key is an
+	// integer.
+	if intent.key == "enabled" && (intent.block == "repoKeeper" || intent.block == "dependencyKeeper") {
 		value := "false"
 		if intent.value != 0 {
 			value = "true"
@@ -578,13 +631,13 @@ func marshalDaemonYAML(cfg *DaemonYAML, intent *capacityWriteIntent) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	if intent.block == "repoKeeper" {
-		repoKeeper, err := encodeYAMLNode(cfg.RepoKeeper)
+	if intent.block == "repoKeeper" || intent.block == "dependencyKeeper" || intent.block == "retention" {
+		block, err := encodeYAMLNode(blockForIntent(cfg, intent.block))
 		if err != nil {
 			return nil, err
 		}
-		upsertMappingKey(repoKeeper, intent.key, capacityIntentNode(intent))
-		upsertMappingKey(root, "repoKeeper", repoKeeper)
+		upsertMappingKey(block, intent.key, capacityIntentNode(intent))
+		upsertMappingKey(root, intent.block, block)
 		return yaml.Marshal(root)
 	}
 	capacity, err := encodeYAMLNode(cfg.Capacity)
@@ -594,6 +647,22 @@ func marshalDaemonYAML(cfg *DaemonYAML, intent *capacityWriteIntent) ([]byte, er
 	upsertMappingKey(capacity, intent.key, capacityIntentNode(intent))
 	upsertMappingKey(root, "capacity", capacity)
 	return yaml.Marshal(root)
+}
+
+// blockForIntent returns the config block a capacity write intent
+// addresses, so the fresh-document path overlays the intent onto the right
+// mapping. Unknown blocks fall back to capacity.
+func blockForIntent(cfg *DaemonYAML, block string) any {
+	switch block {
+	case "repoKeeper":
+		return cfg.RepoKeeper
+	case "dependencyKeeper":
+		return cfg.DependencyKeeper
+	case "retention":
+		return cfg.Retention
+	default:
+		return cfg.Capacity
+	}
 }
 
 // encodeYAMLNode marshals v through yaml.v3 and returns the resulting node

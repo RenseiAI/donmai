@@ -337,6 +337,16 @@ type Options struct {
 	// resolver; the keeper still records only the scope digest, never the
 	// scope value or the remote URL.
 	RepoKeeperScope RepoKeeperScopeFunc
+
+	// DependencyKeeperScope resolves the credential scope for one manager
+	// for the per-host dependency keeper (see dependency_keeper.go): it
+	// names the isolation boundary the resulting store belongs to. Nil
+	// means DefaultDependencyKeeperScope (one host-wide scope), so one
+	// manager maps to exactly one store on this machine. An embedder that
+	// isolates stores per tenant supplies its own resolver; the keeper
+	// still records only the scope digest, never the scope value, and no
+	// content crosses a credential scope.
+	DependencyKeeperScope DependencyKeeperScopeFunc
 }
 
 // GitAuth is the per-invocation git auth resolver an embedder supplies via
@@ -530,6 +540,15 @@ type Daemon struct {
 	// Options.RepoKeeperScope seam; nil until then. Callers degrade to a plain
 	// clone while it is nil, disabled, or still reconciling.
 	repoKeeper *RepoKeeper
+
+	// dependencyKeeper is the per-host dependency keeper (see
+	// dependency_keeper.go). It is constructed in Start from the
+	// process-level DependencyKeeper settings, the shared Retention
+	// budget, and the Options.DependencyKeeperScope seam; nil until
+	// then. Callers degrade to today's plain install while it is nil,
+	// disabled, or still reconciling — no path makes a session wait for
+	// the keeper.
+	dependencyKeeper *DependencyKeeper
 
 	// quota is the subscription quota-snapshot cache behind the
 	// heartbeat quota field: one entry per signed-in account. Probes
@@ -875,6 +894,64 @@ func (d *Daemon) reconcileRepoKeeper(ctx context.Context, worktreeParentDir stri
 	if err := keeper.Reconcile(ctx); err != nil {
 		slog.Warn("repo keeper: reconcile failed; degrading to plain clone", "err", err)
 	}
+}
+
+// dependencyKeeperFor constructs this daemon's dependency keeper from
+// its process-level settings, the shared retention budget, and the
+// Options.DependencyKeeperScope seam, or nil when the keeper is disabled.
+// Callers degrade to a plain install on nil.
+func (d *Daemon) dependencyKeeperFor() *DependencyKeeper {
+	settings := d.Config().EffectiveDependencyKeeperSettings()
+	if !settings.Enabled {
+		return nil
+	}
+	var scope DependencyKeeperScopeFunc
+	if d.opts.DependencyKeeperScope != nil {
+		scope = d.opts.DependencyKeeperScope
+	}
+	return NewDependencyKeeper(settings, d.Config().EffectiveRetentionSettings(), scope)
+}
+
+// reconcileDependencyKeeper builds the keeper (when enabled) and
+// reconciles it after the repository keeper and before workarea-cache
+// admission. A reconcile failure degrades: callers fall back to a plain
+// install and startup continues. With the keeper disabled this is a no-op
+// and nothing is created under dependency-keeper/. While it reconciles,
+// callers degrade; session-only and online installs keep serving.
+func (d *Daemon) reconcileDependencyKeeper(ctx context.Context) {
+	keeper := d.dependencyKeeperFor()
+	d.mu.Lock()
+	d.dependencyKeeper = keeper
+	d.mu.Unlock()
+	if keeper == nil {
+		return
+	}
+	if err := keeper.Reconcile(ctx); err != nil {
+		slog.Warn("dependency keeper: reconcile failed; degrading to plain install", "err", err)
+	}
+}
+
+// DependencyKeeper returns the daemon's dependency keeper, or nil when it
+// is disabled or not yet constructed. The returned pointer is safe for
+// concurrent use.
+func (d *Daemon) DependencyKeeper() *DependencyKeeper {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.dependencyKeeper
+}
+
+// DependencyKeeperInstall degrades an install through the keeper: it
+// returns the store directory when the keeper can serve this manager,
+// and ok=false when the caller must fall back to today's plain install
+// (disabled, reconciling, over budget, or scope failure).
+func (d *Daemon) DependencyKeeperInstall(ctx context.Context, manager, path string) (dir string, ok bool) {
+	d.mu.RLock()
+	keeper := d.dependencyKeeper
+	d.mu.RUnlock()
+	if keeper == nil {
+		return "", false
+	}
+	return keeper.Install(ctx, manager, path)
 }
 
 // RepoKeeper returns the daemon's repository keeper, or nil when it is
@@ -1472,6 +1549,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// plain clone. While it reconciles, callers degrade; with the keeper
 	// disabled this is a no-op and nothing is created under repo-keeper/.
 	d.reconcileRepoKeeper(ctx, spawnerOpts.WorktreeParentDir)
+	// Reconcile the dependency keeper after the repository keeper and
+	// before workarea-cache admission. While it reconciles, callers
+	// degrade to a plain install and session-only installs keep serving;
+	// with the keeper disabled this is a no-op and nothing is created
+	// under dependency-keeper/.
+	d.reconcileDependencyKeeper(ctx)
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.

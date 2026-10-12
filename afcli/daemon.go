@@ -971,6 +971,17 @@ func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse, bin str
 		}
 	}
 
+	// Dependency-keeper section (secret-free: hits, misses, bytes,
+	// budget pressure only).
+	if r.DependencyKeeper != nil {
+		if _, err := fmt.Fprintf(tw, "  %s\t%s\n", "Dependency keeper:", formatDependencyKeeperStat(r)); err != nil {
+			return fmt.Errorf("write row: %w", err)
+		}
+		if err := tw.Flush(); err != nil {
+			return fmt.Errorf("flush table: %w", err)
+		}
+	}
+
 	// Pool section.
 	if r.Pool != nil {
 		if err := writePoolStatsSection(w, r.Pool); err != nil {
@@ -1203,6 +1214,10 @@ var allowedCapacityKeys = map[string]struct{}{
 	"repoKeeper.maxDiskGb":                  {},
 	"repoKeeper.fetchIntervalSeconds":       {},
 	"repoKeeper.authorizationWindowSeconds": {},
+	"dependencyKeeper.enabled":              {},
+	"dependencyKeeper.maxDiskGb":            {},
+	"dependencyKeeper.compactionWindowDays": {},
+	"retention.maxDiskGb":                   {},
 }
 
 // repoKeeperRestartKeys are the process-level keeper keys: the running daemon
@@ -1213,6 +1228,10 @@ var repoKeeperRestartKeys = map[string]struct{}{
 	"repoKeeper.maxDiskGb":                  {},
 	"repoKeeper.fetchIntervalSeconds":       {},
 	"repoKeeper.authorizationWindowSeconds": {},
+	"dependencyKeeper.enabled":              {},
+	"dependencyKeeper.maxDiskGb":            {},
+	"dependencyKeeper.compactionWindowDays": {},
+	"retention.maxDiskGb":                   {},
 }
 
 // newDaemonSetCmd returns the `donmai host set` command.
@@ -1240,10 +1259,19 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"                                  before eviction (0 = no limit).\n" +
 			"  repoKeeper.fetchIntervalSeconds Bound on how often a mirror is re-fetched.\n" +
 			"  repoKeeper.authorizationWindowSeconds  Bound on how long a resolved\n" +
-			"                                  authorization is honored.\n\n" +
+			"                                  authorization is honored.\n" +
+			"  dependencyKeeper.enabled        Enable the per-host dependency keeper\n" +
+			"                                  (0 or 1; default off).\n" +
+			"  dependencyKeeper.maxDiskGb      Maximum total dependency-store disk usage\n" +
+			"                                  in GiB before eviction (0 = no local limit).\n" +
+			"  dependencyKeeper.compactionWindowDays  Bound on how long one store\n" +
+			"                                  compaction may run before it yields.\n" +
+			"  retention.maxDiskGb             Maximum total retained bytes in GiB\n" +
+			"                                  across keepers (0 = no shared limit).\n\n" +
 			"The change is written atomically to ~/.donmai/daemon.yaml. Capacity keys\n" +
-			"reload the affected subsystem without a restart; repoKeeper.* keys are\n" +
-			"process-level and need a drain-aware restart to take effect.",
+			"reload the affected subsystem without a restart; repoKeeper.*,\n" +
+			"dependencyKeeper.* and retention.* keys are process-level and need\n" +
+			"a drain-aware restart to take effect.",
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1251,14 +1279,14 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			value := args[1]
 
 			if _, ok := allowedCapacityKeys[key]; !ok {
-				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds", key)
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds, dependencyKeeper.enabled, dependencyKeeper.maxDiskGb, dependencyKeeper.compactionWindowDays, retention.maxDiskGb", key)
 			}
 
 			// Validate integer capacity keys locally so we give a clear error
 			// before hitting the daemon.
 			if _, ok := repoKeeperRestartKeys[key]; ok {
 				n, err := strconv.Atoi(value)
-				if err != nil || n < 0 || (key == "repoKeeper.enabled" && n > 1) {
+				if err != nil || n < 0 || ((key == "repoKeeper.enabled" || key == "dependencyKeeper.enabled") && n > 1) {
 					return fmt.Errorf("%s must be a non-negative integer%s, got %q", key, boolRangeHint(key), value)
 				}
 				yamlPath := cfgPath
@@ -1347,13 +1375,14 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 
 // boolRangeHint names the 0-or-1 range for boolean keeper keys.
 func boolRangeHint(key string) string {
-	if key == "repoKeeper.enabled" {
+	if key == "repoKeeper.enabled" || key == "dependencyKeeper.enabled" {
 		return " (0 or 1)"
 	}
 	return ""
 }
 
-// applyRepoKeeperSet records one repoKeeper.* set into the in-memory YAML.
+// applyRepoKeeperSet records one repoKeeper.*, dependencyKeeper.* or
+// retention.* set into the in-memory YAML.
 func applyRepoKeeperSet(cfg *afclient.DaemonYAML, key string, n int64) {
 	switch key {
 	case "repoKeeper.enabled":
@@ -1364,6 +1393,14 @@ func applyRepoKeeperSet(cfg *afclient.DaemonYAML, key string, n int64) {
 		cfg.RepoKeeper.FetchIntervalSeconds = n
 	case "repoKeeper.authorizationWindowSeconds":
 		cfg.RepoKeeper.AuthorizationWindowSeconds = n
+	case "dependencyKeeper.enabled":
+		cfg.DependencyKeeper.Enabled = n == 1
+	case "dependencyKeeper.maxDiskGb":
+		cfg.DependencyKeeper.MaxDiskGb = n
+	case "dependencyKeeper.compactionWindowDays":
+		cfg.DependencyKeeper.CompactionWindowDays = n
+	case "retention.maxDiskGb":
+		cfg.Retention.MaxDiskGb = n
 	}
 }
 
@@ -1508,6 +1545,68 @@ func formatRepoKeeperStat(r *afclient.DaemonStatsResponse) string {
 		last = "never"
 	}
 	return fmt.Sprintf("%d mirror(s), last fetch %s, %d revoked, %d bytes", k.MirrorCount, last, k.RevokedCount, k.Bytes)
+}
+
+// formatDependencyKeeperStat renders the secret-free dependency-keeper
+// snapshot: hit/miss totals, miss reasons, estimated time saved, bytes,
+// and budget pressure. No scope values, URLs, or credentials.
+func formatDependencyKeeperStat(r *afclient.DaemonStatsResponse) string {
+	if r == nil || r.DependencyKeeper == nil {
+		return "disabled"
+	}
+	k := r.DependencyKeeper
+	var hits, misses int64
+	reasons := map[string]int64{}
+	for _, window := range []*afclient.DependencyKeeperWindow{k.Hour, k.Day, k.Week} {
+		if window == nil {
+			continue
+		}
+		for _, bucket := range window.Hits {
+			hits += bucket.Hits
+			misses += bucket.Misses
+			for reason, n := range bucket.MissReasons {
+				reasons[reason] += n
+			}
+		}
+	}
+	// Windows overlap (hour ⊂ day ⊂ week): report the widest non-empty
+	// window instead of summing them.
+	if k.Week != nil && len(k.Week.Hits) > 0 {
+		hits, misses, reasons = sumDependencyWindow(k.Week)
+	} else if k.Day != nil && len(k.Day.Hits) > 0 {
+		hits, misses, reasons = sumDependencyWindow(k.Day)
+	} else if k.Hour != nil && len(k.Hour.Hits) > 0 {
+		hits, misses, reasons = sumDependencyWindow(k.Hour)
+	}
+	top := ""
+	var topN int64
+	for _, reason := range []string{"disabled", "reconciling", "no_store", "session_only", "over_budget", "unverified", "manager_ambiguous"} {
+		if n := reasons[reason]; n > topN {
+			top, topN = reason, n
+		}
+	}
+	miss := "none"
+	if top != "" {
+		miss = top
+	}
+	return fmt.Sprintf("%d hit(s), %d miss(es) (top miss: %s), %.1fs saved, %d bytes, pressure %.0f%%",
+		hits, misses, miss, k.EstimatedTimeSavedSeconds, k.Bytes, k.BudgetPressure*100)
+}
+
+// sumDependencyWindow totals one stats window.
+func sumDependencyWindow(window *afclient.DependencyKeeperWindow) (hits, misses int64, reasons map[string]int64) {
+	reasons = map[string]int64{}
+	if window == nil {
+		return 0, 0, reasons
+	}
+	for _, bucket := range window.Hits {
+		hits += bucket.Hits
+		misses += bucket.Misses
+		for reason, n := range bucket.MissReasons {
+			reasons[reason] += n
+		}
+	}
+	return hits, misses, reasons
 }
 
 func formatWorkerStat(r *afclient.DaemonStatsResponse) string {

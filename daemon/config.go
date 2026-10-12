@@ -103,6 +103,17 @@ type Config struct {
 	// these needs a drain-aware restart — the running keeper never re-reads
 	// them, and `daemon set` persists the value and says so.
 	RepoKeeper RepoKeeperConfig `yaml:"repoKeeper,omitempty" json:"repoKeeper,omitempty"`
+	// DependencyKeeper holds the per-host dependency-keeper tunables (see
+	// dependency_keeper.go). Optional; all zero means the keeper stays off
+	// and nothing is created under dependency-keeper/. Process-level:
+	// changing any of these needs a drain-aware restart — the running
+	// keeper never re-reads them, and `daemon set` persists the value and
+	// says so.
+	DependencyKeeper DependencyKeeperConfig `yaml:"dependencyKeeper,omitempty" json:"dependencyKeeper,omitempty"`
+	// Retention holds the cross-keeper disk budget both keepers budget
+	// against. Optional; zero means no shared limit. Process-level: the
+	// running keepers never re-read it.
+	Retention RetentionConfig `yaml:"retention,omitempty" json:"retention,omitempty"`
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
 	// actor). Optional; applyDefaults seeds Mode via
@@ -572,6 +583,70 @@ func (c *Config) EffectiveRepoKeeperSettings() RepoKeeperSettings {
 		FetchInterval:       time.Duration(fetchInterval) * time.Second,
 		AuthorizationWindow: time.Duration(authorizationWindow) * time.Second,
 	}
+}
+
+// DependencyKeeperConfig configures the per-host dependency keeper. The
+// zero value keeps the keeper disabled: nothing is created under
+// dependency-keeper/.
+type DependencyKeeperConfig struct {
+	// Enabled gates keeper construction. Default off.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxDiskGb caps total dependency-store disk usage in GiB before budget
+	// eviction. 0 means no keeper-local limit; the shared retention budget
+	// still applies.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+	// CompactionWindowDays bounds how long one store compaction may run
+	// before it yields. 0 means the keeper default.
+	CompactionWindowDays int64 `yaml:"compactionWindowDays,omitempty" json:"compactionWindowDays,omitempty"`
+}
+
+// DefaultDependencyKeeperCompactionWindowDays is the keeper default when
+// compactionWindowDays is unset.
+const DefaultDependencyKeeperCompactionWindowDays = 14
+
+// EffectiveDependencyKeeperSettings resolves the authored config to the
+// process-level settings the keeper constructs with.
+func (c *Config) EffectiveDependencyKeeperSettings() DependencyKeeperSettings {
+	var cfg DependencyKeeperConfig
+	if c != nil {
+		cfg = c.DependencyKeeper
+	}
+	compactionWindow := cfg.CompactionWindowDays
+	if compactionWindow <= 0 {
+		compactionWindow = DefaultDependencyKeeperCompactionWindowDays
+	}
+	return DependencyKeeperSettings{
+		Enabled:          cfg.Enabled,
+		MaxBytes:         cfg.MaxDiskGb * 1024 * 1024 * 1024,
+		CompactionWindow: time.Duration(compactionWindow) * 24 * time.Hour,
+	}
+}
+
+// RetentionConfig configures the cross-keeper disk budget both the
+// repository keeper and the dependency keeper budget against.
+type RetentionConfig struct {
+	// MaxDiskGb caps total retained bytes in GiB across keepers. 0 means
+	// no shared limit.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+}
+
+// EffectiveRetentionSettings resolves the authored config to the
+// process-level cross-keeper budget both keepers budget against.
+func (c *Config) EffectiveRetentionSettings() RetentionSettings {
+	var cfg RetentionConfig
+	if c != nil {
+		cfg = c.Retention
+	}
+	return RetentionSettings{
+		MaxBytes: cfg.MaxDiskGb * 1024 * 1024 * 1024,
+	}
+}
+
+// RetentionSettings is the resolved cross-keeper disk budget.
+type RetentionSettings struct {
+	// MaxBytes caps total retained bytes across keepers. Zero means no
+	// shared limit.
+	MaxBytes int64
 }
 
 // DefaultJWTPath returns the path to the cached JWT under ~/.donmai/.
@@ -1072,6 +1147,15 @@ func validateConfig(c *Config) error {
 	}
 	if c.RepoKeeper.AuthorizationWindowSeconds < 0 {
 		return errors.New("repoKeeper.authorizationWindowSeconds must be >= 0")
+	}
+	if c.DependencyKeeper.MaxDiskGb < 0 {
+		return errors.New("dependencyKeeper.maxDiskGb must be >= 0")
+	}
+	if c.DependencyKeeper.CompactionWindowDays < 0 {
+		return errors.New("dependencyKeeper.compactionWindowDays must be >= 0")
+	}
+	if c.Retention.MaxDiskGb < 0 {
+		return errors.New("retention.maxDiskGb must be >= 0")
 	}
 	if err := validateSeatBudget(c.Capacity.SeatBudget); err != nil {
 		return err

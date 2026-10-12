@@ -619,6 +619,53 @@ type RepoKeeperStats struct {
 	Bytes int64 `json:"bytes"`
 }
 
+// DependencyKeeperHit is one per-manager, per-path hit/miss bucket: hit
+// and miss counts with misses broken down by closed miss-reason token.
+// It never carries a scope value, URL, or credential.
+type DependencyKeeperHit struct {
+	// Manager is the composed store's package-manager identity.
+	Manager string `json:"manager"`
+	// Path is the leaf-relative path the observation was recorded for.
+	Path string `json:"path,omitempty"`
+	// Hits counts served installs in the window.
+	Hits int64 `json:"hits"`
+	// Misses counts degraded installs in the window.
+	Misses int64 `json:"misses"`
+	// MissReasons counts misses by closed miss-reason token.
+	MissReasons map[string]int64 `json:"missReasons,omitempty"`
+}
+
+// DependencyKeeperWindow is one stats window of per-manager, per-path
+// hit/miss buckets.
+type DependencyKeeperWindow struct {
+	Hits []DependencyKeeperHit `json:"hits,omitempty"`
+}
+
+// DependencyKeeperStats is the secret-free dependency-keeper snapshot on
+// daemon stats: hit and miss rates per manager and path (1 h, 24 h, 7 d),
+// miss reasons, estimated time saved from a rolling cold baseline with
+// its sample count, bytes, and budget pressure. It never carries scope
+// values, URLs, or credentials.
+type DependencyKeeperStats struct {
+	// Hour carries the trailing 1-hour buckets.
+	Hour *DependencyKeeperWindow `json:"hour,omitempty"`
+	// Day carries the trailing 24-hour buckets.
+	Day *DependencyKeeperWindow `json:"day,omitempty"`
+	// Week carries the trailing 7-day buckets.
+	Week *DependencyKeeperWindow `json:"week,omitempty"`
+	// ColdBaselineSamples is the rolling cold-baseline sample count the
+	// estimated time saved derives from.
+	ColdBaselineSamples int64 `json:"coldBaselineSamples,omitempty"`
+	// EstimatedTimeSavedSeconds is the estimated session time saved by
+	// keeper hits, derived from the rolling cold baseline.
+	EstimatedTimeSavedSeconds float64 `json:"estimatedTimeSavedSeconds,omitempty"`
+	// Bytes is the sum of recorded store bytes.
+	Bytes int64 `json:"bytes"`
+	// BudgetPressure is the fraction of the budget currently used, in
+	// [0, 1]. Zero when no budget is configured.
+	BudgetPressure float64 `json:"budgetPressure,omitempty"`
+}
+
 // SetCapacityResponse is the response from POST /api/daemon/capacity.
 type SetCapacityResponse struct {
 	// OK is true when the config key was accepted and written to daemon.yaml.
