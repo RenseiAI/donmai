@@ -1588,149 +1588,149 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	continuable := (RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
 	tailRecoverable := selectedRepositoryMutable || reviewWork
 tailRecovery:
-		for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
-			steerView := streamRes
-			steerView.terminalSuccess = lastTurn.terminalSuccess
-			reportedPR := prVerifier.reportsOwnRepository(lastTurn)
-			ending := classifyTurnEnding(res, streamRes, lastTurn, reportedPR, reviewWork)
-			followUps.undelivered = ""
-			if pullRequestIsTheOnlyResult(res, streamRes, lastTurn, reportedPR, reviewWork) {
-				// The session's pull request is all this turn left: it counts
-				// only when it delivers the work (not a draft; on a rework, a
-				// new commit since the run started).
-				undelivered, moved, readErr := prVerifier.undelivered(verifyCtx)
-				if readErr != nil {
-					r.logger.Warn("could not fully re-read the session's pull request; an unread part counts as delivered",
-						"sessionId", qw.SessionID, "url", res.PullRequestURL, "err", readErr)
-				}
-				if undelivered != "" {
-					followUps.noteUndelivered(undelivered, moved)
-					ending = turnStoppedEarly
+	for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
+		steerView := streamRes
+		steerView.terminalSuccess = lastTurn.terminalSuccess
+		reportedPR := prVerifier.reportsOwnRepository(lastTurn)
+		ending := classifyTurnEnding(res, streamRes, lastTurn, reportedPR, reviewWork)
+		followUps.undelivered = ""
+		if pullRequestIsTheOnlyResult(res, streamRes, lastTurn, reportedPR, reviewWork) {
+			// The session's pull request is all this turn left: it counts
+			// only when it delivers the work (not a draft; on a rework, a
+			// new commit since the run started).
+			undelivered, moved, readErr := prVerifier.undelivered(verifyCtx)
+			if readErr != nil {
+				r.logger.Warn("could not fully re-read the session's pull request; an unread part counts as delivered",
+					"sessionId", qw.SessionID, "url", res.PullRequestURL, "err", readErr)
+			}
+			if undelivered != "" {
+				followUps.noteUndelivered(undelivered, moved)
+				ending = turnStoppedEarly
+			}
+		}
+		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
+		switch step {
+		case tailDone:
+			break tailRecovery
+		case tailExhausted:
+			if ending == turnProviderError || ending == turnProviderErrorFatal {
+				followUps.providerError = lastTurn.providerError
+				if res.Upstream == nil && lastTurn.upstream != nil {
+					res.Upstream = agent.CanonicalUpstreamError(lastTurn.upstream)
 				}
 			}
-			step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
-			switch step {
-			case tailDone:
+			followUps.fail(res)
+			r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
+				"sessionId", qw.SessionID,
+				"failureMode", res.FailureMode,
+				"undelivered", followUps.undelivered,
+				"continued", followUps.continued,
+				"unproductive", followUps.unproductive,
+				"retried", followUps.retried,
+				"limit", followUps.limit,
+				"ceiling", followUps.ceiling,
+			)
+			break tailRecovery
+		case tailSteer:
+			followUps.steered = true
+			res.SteeringTriggered = true
+			newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, steerView, res)
+			if err != nil {
+				r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
 				break tailRecovery
-			case tailExhausted:
-				if ending == turnProviderError || ending == turnProviderErrorFatal {
-					followUps.providerError = lastTurn.providerError
-					if res.Upstream == nil && lastTurn.upstream != nil {
-						res.Upstream = agent.CanonicalUpstreamError(lastTurn.upstream)
-					}
-				}
-				followUps.fail(res)
-				r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
-					"sessionId", qw.SessionID,
-					"failureMode", res.FailureMode,
-					"undelivered", followUps.undelivered,
-					"continued", followUps.continued,
-					"unproductive", followUps.unproductive,
-					"retried", followUps.retried,
-					"limit", followUps.limit,
-					"ceiling", followUps.ceiling,
-				)
-				break tailRecovery
-			case tailSteer:
-				followUps.steered = true
-				res.SteeringTriggered = true
-				newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, steerView, res)
-				if err != nil {
-					r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
-					break tailRecovery
-				}
-				// attemptSteering returns the handle to keep draining: unchanged
-				// on inject success/soft-fail, or the new Handle Provider.Resume
-				// returned on the stop-and-resume fallback. The deferred Stop
-				// above closes over this variable, so reassigning it here also
-				// makes teardown target whichever handle is now live.
-				handle = newHandle
-				// Re-consume any events the steering inject/resume produced.
-				// The stall detector stays disarmed here for the same reason
-				// as the inject drain above: tail recovery owns follow-up
-				// liveness.
-				tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
-				tailRes.applyTo(res, provider.Name())
-				applyFollowUp(tailRes)
-				lastTurn = tailRes
-				if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
-					break tailRecovery
-				}
-				continue
 			}
-	
-			// Every continuation restates the session's goal as dispatched
-			// (identifier, title, directive): a bare "continue the task"
-			// arrives without the goal and the seat can decline it, losing
-			// the verdict the prior turn reached. The retry and wrap-up
-			// prompts replace the base text wholesale below, as before.
-			prompt := continuationPrompt(reviewWork, followUps.undelivered, continueGoalBlock(qw))
-			wrapUp := enforcer.wrapUpDue()
-			if step == tailRetry {
-				prompt = retryPrompt
-				r.logger.Warn("turn ended on a model provider error; retrying",
-					"sessionId", qw.SessionID,
-					"attempt", followUps.retried+1,
-					"limit", followUps.limit,
-					"providerError", lastTurn.providerError,
-				)
-				if err := r.waitRetryBackoff(streamCtx, followUps.retried+1); err != nil {
-					stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err)
-					if stopped {
-						res.TurnContinuations = followUps.report()
-						res.Cost = enforcer.cost()
-						return res, stopErr
-					}
-					budgetStop = budget
-					break tailRecovery
-				}
-			} else {
-				r.logger.Info("turn ended before the work was finished; continuing",
-					"sessionId", qw.SessionID,
-					"undelivered", followUps.undelivered,
-					"continuation", followUps.continued+1,
-					"unproductive", followUps.unproductive,
-					"limit", followUps.limit,
-					"ceiling", followUps.ceiling,
-				)
-			}
-			if wrapUp {
-				// The token meter passed the wrap-up point and the agent has
-				// not been asked yet: this follow-up asks it to finish.
-				prompt = wrapUpPrompt
-				r.logger.Info("token budget nearly spent; asking the agent to wrap up",
-					"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
-			}
-			newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
+			// attemptSteering returns the handle to keep draining: unchanged
+			// on inject success/soft-fail, or the new Handle Provider.Resume
+			// returned on the stop-and-resume fallback. The deferred Stop
+			// above closes over this variable, so reassigning it here also
+			// makes teardown target whichever handle is now live.
 			handle = newHandle
-			if err != nil || !delivered {
-				r.logger.Warn("follow-up prompt not delivered; ending tail recovery",
-					"sessionId", qw.SessionID, "err", err)
+			// Re-consume any events the steering inject/resume produced.
+			// The stall detector stays disarmed here for the same reason
+			// as the inject drain above: tail recovery owns follow-up
+			// liveness.
+			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+			tailRes.applyTo(res, provider.Name())
+			applyFollowUp(tailRes)
+			lastTurn = tailRes
+			if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
 				break tailRecovery
 			}
-			if wrapUp {
-				enforcer.wrapUpSent()
-			}
-			if step == tailRetry {
-				followUps.retried++
-			} else {
-				followUps.sentContinuation()
-			}
-			tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
-			stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
-			if stopped {
-				res.TurnContinuations = followUps.report()
-				res.Cost = enforcer.cost()
-				return res, stopErr
-			}
-			tail.applyTo(res, provider.Name())
-			applyFollowUp(tail)
-			lastTurn = tail
-			if budget != nil {
+			continue
+		}
+
+		// Every continuation restates the session's goal as dispatched
+		// (identifier, title, directive): a bare "continue the task"
+		// arrives without the goal and the seat can decline it, losing
+		// the verdict the prior turn reached. The retry and wrap-up
+		// prompts replace the base text wholesale below, as before.
+		prompt := continuationPrompt(reviewWork, followUps.undelivered, continueGoalBlock(qw))
+		wrapUp := enforcer.wrapUpDue()
+		if step == tailRetry {
+			prompt = retryPrompt
+			r.logger.Warn("turn ended on a model provider error; retrying",
+				"sessionId", qw.SessionID,
+				"attempt", followUps.retried+1,
+				"limit", followUps.limit,
+				"providerError", lastTurn.providerError,
+			)
+			if err := r.waitRetryBackoff(streamCtx, followUps.retried+1); err != nil {
+				stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err)
+				if stopped {
+					res.TurnContinuations = followUps.report()
+					res.Cost = enforcer.cost()
+					return res, stopErr
+				}
 				budgetStop = budget
 				break tailRecovery
 			}
+		} else {
+			r.logger.Info("turn ended before the work was finished; continuing",
+				"sessionId", qw.SessionID,
+				"undelivered", followUps.undelivered,
+				"continuation", followUps.continued+1,
+				"unproductive", followUps.unproductive,
+				"limit", followUps.limit,
+				"ceiling", followUps.ceiling,
+			)
 		}
+		if wrapUp {
+			// The token meter passed the wrap-up point and the agent has
+			// not been asked yet: this follow-up asks it to finish.
+			prompt = wrapUpPrompt
+			r.logger.Info("token budget nearly spent; asking the agent to wrap up",
+				"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
+		}
+		newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
+		handle = newHandle
+		if err != nil || !delivered {
+			r.logger.Warn("follow-up prompt not delivered; ending tail recovery",
+				"sessionId", qw.SessionID, "err", err)
+			break tailRecovery
+		}
+		if wrapUp {
+			enforcer.wrapUpSent()
+		}
+		if step == tailRetry {
+			followUps.retried++
+		} else {
+			followUps.sentContinuation()
+		}
+		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
+		if stopped {
+			res.TurnContinuations = followUps.report()
+			res.Cost = enforcer.cost()
+			return res, stopErr
+		}
+		tail.applyTo(res, provider.Name())
+		applyFollowUp(tail)
+		lastTurn = tail
+		if budget != nil {
+			budgetStop = budget
+			break tailRecovery
+		}
+	}
 	res.TurnContinuations = followUps.report()
 	res.Cost = enforcer.cost()
 
