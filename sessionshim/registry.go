@@ -275,7 +275,15 @@ func (r *Registry) RemoveIncarnation(id Identity, shimID string, processEpoch ui
 	// publisher is driven by that shim's own gate and knows nothing about a
 	// daemon-side withdrawal. Nothing reads the sidecar, so that is cosmetic
 	// today; a reader would have to check the record beside it.
-	return r.RemoveStreamFlow(id, shimID, processEpoch)
+	if err := r.RemoveStreamFlow(id, shimID, processEpoch); err != nil {
+		return err
+	}
+	// The session-identity sidecar names the same incarnation (same identity
+	// plus epoch), so it must share the withdrawal: a withdrawn-then-relaunched
+	// incarnation at the same epoch would otherwise serve the PREVIOUS
+	// incarnation's Repository/ProjectName/Harness to a scoped reader after
+	// the record that proved the lineage moved is gone.
+	return r.RemoveSessionSidecar(id, processEpoch)
 }
 
 // HasIncarnation reports whether an exact live discovery record remains.

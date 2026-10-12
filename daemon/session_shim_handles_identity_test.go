@@ -238,3 +238,75 @@ func TestActiveSessionsAdoptedBeatsQuarantined(t *testing.T) {
 		t.Fatalf("ActiveSessions lists session %q %d times (%+v), want exactly once", "dup", count, got)
 	}
 }
+
+// TestActiveSessionsKeepsEmptyIDRows pins the empty-id contract: shim rows
+// that carry no session id are still listed — under no dedupe key they
+// cannot collide with anything, and dropping them would report an idle host
+// while their harness is running.
+func TestActiveSessionsKeepsEmptyIDRows(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{SkipRegistration: true})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 8})
+	d.spawner.Resume()
+	t.Cleanup(d.ReleaseAdoptedSessionShims)
+	d.shims.mu.Lock()
+	d.shims.adopted[sessionshim.Identity{OrgID: "org-empty-id", SessionID: ""}] = adoptedShim{
+		shimID: "shim-empty-id",
+		handle: SessionHandle{SessionID: "", State: SessionRunning},
+	}
+	d.shims.mu.Unlock()
+
+	got := d.ActiveSessions()
+	for _, h := range got {
+		if h.SessionID == "" && h.State == SessionRunning {
+			return
+		}
+	}
+	t.Fatalf("ActiveSessions = %+v, want the empty-id shim row still listed", got)
+}
+
+// TestFillShimSessionIdentityNeverOverwrites pins the never-overwrite half of
+// the fill through the production entry point: a handle that already carries
+// its admitted Repository keeps it byte-for-byte even when the sidecar
+// disagrees, while the empty fields still fill from the sidecar. The sidecar
+// is a fallback for the post-restart population, not a second authority over
+// an identity this daemon admitted itself.
+func TestFillShimSessionIdentityNeverOverwrites(t *testing.T) {
+	t.Parallel()
+
+	f := newShimSpawnFixture(t)
+	const orgID = "org-no-clobber"
+	spec := f.interactiveSpec("lineage-no-clobber")
+	spec.OrganizationID = orgID
+	spec.ProjectName = "p1"
+	spec.Harness = "stub-harness"
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("launch %s: %v", spec.SessionID, err)
+	}
+	id := sessionshim.Identity{OrgID: orgID, SessionID: spec.SessionID}
+	reg, err := sessionshim.NewRegistry(f.registry)
+	if err != nil {
+		t.Fatalf("open registry: %v", err)
+	}
+	// A sidecar that disagrees on every field: nothing present may change.
+	disagree := sessionshim.NewSessionSidecar(id, 1, "https://example.invalid/other.git", "other-project", "other-harness")
+	if err := reg.PutSessionSidecar(disagree); err != nil {
+		t.Fatalf("PutSessionSidecar: %v", err)
+	}
+	// A partial handle: Repository was admitted locally, the other two are
+	// still empty. The disagreeing sidecar may fill the empties but must
+	// not touch the present field — this exercises the per-field guards
+	// past the full-handle early return.
+	handle := SessionHandle{
+		SessionID: spec.SessionID, State: SessionRunning,
+		Repository: spec.Repository,
+	}
+	f.daemon.fillShimSessionIdentity(reg, &handle, id, 1)
+	if handle.Repository != spec.Repository {
+		t.Fatalf("fill overwrote a present Repository: %+v, want the admitted identity kept", handle)
+	}
+	if handle.ProjectName != disagree.ProjectName || handle.Harness != disagree.Harness {
+		t.Fatalf("fill did not fill the empty fields from the sidecar: %+v", handle)
+	}
+}

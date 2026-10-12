@@ -1054,10 +1054,19 @@ func (d *Daemon) runtimeJWT() string {
 // always takes precedence over a quarantined row for the same session.
 func (d *Daemon) ActiveSessions() []SessionHandle {
 	var out []SessionHandle
+	// seen tracks session ids already listed so one session reports once.
+	// Handles whose id is empty carry no identity to dedupe on: they are
+	// listed unconditionally, never merged and never merged into. Dropping
+	// them would report an idle host while their harness is running — the
+	// exact lie the union above exists to not tell.
 	seen := map[string]bool{}
 	appendDeduped := func(handles []SessionHandle) {
 		for _, handle := range handles {
-			if handle.SessionID == "" || seen[handle.SessionID] {
+			if handle.SessionID == "" {
+				out = append(out, handle)
+				continue
+			}
+			if seen[handle.SessionID] {
 				continue
 			}
 			seen[handle.SessionID] = true

@@ -78,6 +78,28 @@ func TestSessionSidecarRefusesMalformed(t *testing.T) {
 	}
 }
 
+// TestSessionSidecarAcceptedAtTheFieldBoundary pins the 512-byte per-field
+// bound at its edge: a 512-byte field writes and reads back unchanged, while
+// the malformed suite pins 513 as refused. Three full 512-byte fields still
+// exceed the 1 KiB whole-sidecar bound, so the acceptance case uses one full
+// field beside two short ones.
+func TestSessionSidecarAcceptedAtTheFieldBoundary(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	want := testSessionSidecar(id, 1)
+	// Literal 512: the test must not follow the constant if the bound moves.
+	want.Repository = strings.Repeat("r", 512)
+	if err := reg.PutSessionSidecar(want); err != nil {
+		t.Fatalf("PutSessionSidecar with a 512-byte field: %v", err)
+	}
+	got, found, err := reg.SessionSidecar(id, 1)
+	if err != nil || !found || got != want {
+		t.Fatalf("SessionSidecar = %+v, %v, %v; want %+v", got, found, err, want)
+	}
+}
+
 // TestSessionSidecarAbsentIsNotAnError pins the pre-sidecar case: a seat
 // launched before sidecars existed reports found=false with no error, so an
 // adopting daemon keeps listing it — just without the identity fields a
@@ -117,5 +139,33 @@ func TestSessionSidecarSurvivesTombstoneDisposal(t *testing.T) {
 	}
 	if _, found, err := reg.SessionSidecar(id, 1); err != nil || found {
 		t.Fatalf("SessionSidecar after tombstone disposal = found %v, err %v; want it gone", found, err)
+	}
+}
+
+// TestSessionSidecarWithdrawnWithTheIncarnation pins the withdrawal lifecycle:
+// withdrawing the discovery record takes the session sidecar with it, the way
+// it takes the back-pressure state. A withdrawn-then-relaunched incarnation at
+// the same epoch must not serve the previous incarnation's identity to a
+// scoped reader.
+func TestSessionSidecarWithdrawnWithTheIncarnation(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	if err := reg.Put(testRecord(t, id, reg)); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := reg.PutSessionSidecar(testSessionSidecar(id, 1)); err != nil {
+		t.Fatalf("PutSessionSidecar: %v", err)
+	}
+	if err := reg.RemoveIncarnation(id, "shim-1", 1); err != nil {
+		t.Fatalf("RemoveIncarnation: %v", err)
+	}
+	if _, found, err := reg.SessionSidecar(id, 1); err != nil || found {
+		t.Fatalf("SessionSidecar after withdrawal = found %v, err %v; want it gone", found, err)
+	}
+	// Idempotent: both the shim's teardown and a daemon janitor reach it.
+	if err := reg.RemoveIncarnation(id, "shim-1", 1); err != nil {
+		t.Fatalf("second RemoveIncarnation was not idempotent: %v", err)
 	}
 }
