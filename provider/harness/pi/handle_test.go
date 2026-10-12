@@ -863,19 +863,21 @@ func drainCutoffSession(t *testing.T, h agent.Handle) []agent.Event {
 }
 
 // cutoffOutcome splits a drained session into its terminal shape: whether the
-// typed cut-off failure fired, whether a ResultEvent closed the session, and
-// how many output-limit refusal observations the monitor surfaced.
-func cutoffOutcome(evs []agent.Event) (failed, completed, refusals int) {
+// typed cut-off failure fired (and whether it wrongly claims the session
+// continues), whether a ResultEvent closed the session, and how many
+// output-limit refusal observations the monitor surfaced.
+func cutoffOutcome(t *testing.T, evs []agent.Event) (failed, completed, refusals int) {
+	t.Helper()
 	for _, e := range evs {
 		switch value := e.(type) {
 		case agent.ErrorEvent:
 			if value.Code == repeatedOutputLimitCode {
 				failed++
 				if value.SessionContinues {
-					failed++ // defeat: counted twice so the assert below fires
+					t.Errorf("typed %q failure must be terminal, but SessionContinues is set: %+v", repeatedOutputLimitCode, value)
 				}
 				if value.Message == "" {
-					failed++
+					t.Errorf("typed %q failure carried no message", repeatedOutputLimitCode)
 				}
 			}
 		case agent.ResultEvent:
@@ -904,7 +906,7 @@ func TestOutputLimitCutoff_ConsecutiveCutoffsEndSession(t *testing.T) {
 	}
 	evs := drainCutoffSession(t, h)
 
-	failed, completed, refusals := cutoffOutcome(evs)
+	failed, completed, refusals := cutoffOutcome(t, evs)
 	if failed != 1 {
 		t.Errorf("typed %q failures = %d, want exactly 1 (terminal, carrying a message): %+v", repeatedOutputLimitCode, failed, evs)
 	}
@@ -934,7 +936,7 @@ func TestOutputLimitCutoff_FewerThanLimitDoesNotEndSession(t *testing.T) {
 	}
 	evs := drainCutoffSession(t, h)
 
-	failed, completed, _ := cutoffOutcome(evs)
+	failed, completed, _ := cutoffOutcome(t, evs)
 	if failed != 0 {
 		t.Errorf("session failed before the streak reached the bound: %+v", evs)
 	}
@@ -961,7 +963,7 @@ func TestOutputLimitCutoff_NormalTurnResetsStreak(t *testing.T) {
 	}
 	evs := drainCutoffSession(t, h)
 
-	failed, completed, refusals := cutoffOutcome(evs)
+	failed, completed, refusals := cutoffOutcome(t, evs)
 	if failed != 0 {
 		t.Errorf("a normal turn between cut-offs must reset the streak; session failed anyway: %+v", evs)
 	}
@@ -1008,7 +1010,7 @@ func TestOutputLimitCutoff_LimitIsConfigurable(t *testing.T) {
 			}
 			evs := drainCutoffSession(t, h)
 
-			failed, completed, _ := cutoffOutcome(evs)
+			failed, completed, _ := cutoffOutcome(t, evs)
 			if tc.wantFatal {
 				if failed != 1 {
 					t.Errorf("streak of %d with limit %d must end the session: %+v", tc.turns, tc.limit, evs)
