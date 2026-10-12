@@ -226,3 +226,138 @@ func TestReportSeatLimitsLiveThenRecord(t *testing.T) {
 		t.Errorf("enforced record without a scope = %+v; want no enforced claim", got)
 	}
 }
+
+// TestReadSeatLimitsBatchReadsManyScopesInOneCall pins the batched
+// read-back: one systemctl call for many scopes, keyed by the caller's
+// opaque key. An unobservable scope (collected, never created) leaves its
+// key absent — never present-with-zero — so the caller falls back to that
+// seat's launch record; a name this package did not render never reaches
+// the call. A failed call reads as nothing observed.
+func TestReadSeatLimitsBatchReadsManyScopesInOneCall(t *testing.T) {
+	t.Parallel()
+
+	first := ScopeNameForIncarnation("org", "first", 1)
+	second := ScopeNameForIncarnation("org", "second", 2)
+	gone := ScopeNameForIncarnation("org", "gone", 3)
+	calls := 0
+	var gotUnits []string
+	var gotUserScope bool
+	// The fixture answers per unit, keyed by the argv order the batch
+	// passes: map iteration order is random, so the answer is composed
+	// from the received units rather than a fixed concatenation.
+	blocks := map[string]string{first: showEnforced200, second: showNoLimits, gone: showNotFound}
+	run := func(scopes []string, userScope bool) ([]byte, error) {
+		calls++
+		gotUnits = append([]string(nil), scopes...)
+		gotUserScope = userScope
+		var raw strings.Builder
+		for _, unit := range scopes {
+			raw.WriteString(blocks[unit])
+			raw.WriteString("\n")
+		}
+		return []byte(raw.String()), nil
+	}
+	scopes := map[string]string{"a": first, "b": second, "c": gone, "hostile": "other.service"}
+	got := readSeatLimitsBatchWithRunner(scopes, true, run, "linux")
+	if calls != 1 {
+		t.Fatalf("batched read ran %d calls; want one systemctl call", calls)
+	}
+	if !gotUserScope {
+		t.Error("batched read used the system bus; want the launch's bus decision")
+	}
+	if len(gotUnits) != 3 {
+		t.Fatalf("batched read queried %v; want the three rendered scopes (never the hostile name)", gotUnits)
+	}
+	for _, unit := range gotUnits {
+		if !ValidScopeName(unit) {
+			t.Fatalf("batched read queried %q; only rendered names may reach systemctl", unit)
+		}
+	}
+	if got["a"] != (SeatLimits{CPUs: 2, MemoryMB: 256, IOWeight: 200}) {
+		t.Errorf("seat a = %+v; want the live 2 cpu / 256MiB / io 200", got["a"])
+	}
+	if limits, ok := got["b"]; !ok || limits.HasLimits() {
+		t.Errorf("seat b = %+v, %v; want present with no limits (a live limit-free scope)", limits, ok)
+	}
+	if _, ok := got["c"]; ok {
+		t.Error("collected seat c is present; want the key absent so the caller falls back to its record")
+	}
+	if _, ok := got["hostile"]; ok {
+		t.Error("hostile key is present; want refusal before systemctl")
+	}
+	if got := readSeatLimitsBatchWithRunner(scopes, true, run, "darwin"); got["a"] != (SeatLimits{}) {
+		t.Error("off-Linux batch reports a seat; want nothing observed")
+	}
+	if got := readSeatLimitsBatchWithRunner(scopes, true, func([]string, bool) ([]byte, error) {
+		return nil, errors.New("bus refused")
+	}, "linux"); len(got) != 0 {
+		t.Errorf("failed batch = %+v; want nothing observed", got)
+	}
+}
+
+// TestStopSeatScopeGatesBeforeSystemctl pins the disposal stop: a rendered
+// scope name reaches systemctl stop on the launch's bus; off Linux and for
+// an empty scope the stop is a no-op (nothing exists to reap); a name this
+// package did not render is refused rather than stopped.
+func TestStopSeatScopeGatesBeforeSystemctl(t *testing.T) {
+	t.Parallel()
+
+	scope := ScopeNameForIncarnation("org", "seat", 1)
+	var gotScope string
+	var gotUserScope bool
+	run := func(s string, userScope bool) error {
+		gotScope, gotUserScope = s, userScope
+		return nil
+	}
+	if err := stopSeatScopeWithRunner(scope, true, run, "linux"); err != nil {
+		t.Fatalf("stop = %v; want nil", err)
+	}
+	if gotScope != scope || !gotUserScope {
+		t.Errorf("stop reached %q userScope=%v; want the seat's own scope on the launch's bus", gotScope, gotUserScope)
+	}
+	if err := stopSeatScopeWithRunner(scope, true, run, "darwin"); err != nil {
+		t.Errorf("off-Linux stop = %v; want nil (nothing exists to reap)", err)
+	}
+	if err := stopSeatScopeWithRunner("", true, run, "linux"); err != nil {
+		t.Errorf("empty stop = %v; want nil", err)
+	}
+	if err := stopSeatScopeWithRunner("other.service", true, run, "linux"); err == nil {
+		t.Error("hostile stop succeeded; want a refusal before systemctl")
+	}
+}
+
+// TestClassifyCgroupBusOwner pins the manager-side classification: a cgroup
+// inside the per-user subtree belongs to the user manager, everything else
+// to the system manager, and an unreadable self cgroup reads as unknown —
+// never as a bus the launch would then address.
+func TestClassifyCgroupBusOwner(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"/user.slice/user-1000.slice/session-3.scope",
+		"/user.slice/user-1000.slice/user@1000.service/app.slice/donmai.service",
+		"user.slice/user-1000.slice/session-3.scope",
+		"/user.slice",
+	} {
+		if got := ClassifyCgroupBusOwner(path); got != "user" {
+			t.Errorf("ClassifyCgroupBusOwner(%q) = %q; want user", path, got)
+		}
+	}
+	for _, path := range []string{
+		"/system.slice/donmai.service",
+		"/init.scope",
+		"/",
+		"/user.slice.evil/session.scope",
+		"/system.slice/user.slice",
+	} {
+		if got := ClassifyCgroupBusOwner(path); got != "system" {
+			t.Errorf("ClassifyCgroupBusOwner(%q) = %q; want system", path, got)
+		}
+	}
+	if got := DetectOwnBusCgroupClass(func() (string, error) { return "", errors.New("no unified entry") }); got != "unknown" {
+		t.Errorf("DetectOwnBusCgroupClass(unreadable) = %q; want unknown", got)
+	}
+	if got := DetectOwnBusCgroupClass(func() (string, error) { return "/system.slice/donmai.service", nil }); got != "system" {
+		t.Errorf("DetectOwnBusCgroupClass(system path) = %q; want system", got)
+	}
+}

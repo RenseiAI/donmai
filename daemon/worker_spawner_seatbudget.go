@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"fmt"
 	"log/slog"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -275,6 +277,9 @@ type shimScopeProbe struct {
 	userScope   func() bool
 	scopeReason func() string
 	readLimits  func(scope string, userScope bool) (seatbudget.SeatLimits, bool)
+	readBatch   func(scopes map[string]string, userScope bool) map[string]seatbudget.SeatLimits
+	stopScope   func(scope string, userScope bool) error
+	ownBusClass func() string
 }
 
 func (p shimScopeProbe) hostGOOS() string {
@@ -314,6 +319,73 @@ func (p shimScopeProbe) readSeatLimits(scope string, userScope bool) (seatbudget
 		return p.readLimits(scope, userScope)
 	}
 	return seatbudget.ReadSeatLimits(scope, userScope)
+}
+
+// readSeatLimitsBatch reads many seats' limits with one systemctl call. A
+// nil readBatch (older tests that stub only readLimits) falls back to one
+// read per seat through readSeatLimits, so every existing stub keeps
+// working; production always sets readBatch.
+func (p shimScopeProbe) readSeatLimitsBatch(scopes map[string]string, userScope bool) map[string]seatbudget.SeatLimits {
+	if p.readBatch != nil {
+		return p.readBatch(scopes, userScope)
+	}
+	out := make(map[string]seatbudget.SeatLimits, len(scopes))
+	for key, scope := range scopes {
+		if limits, ok := p.readSeatLimits(scope, userScope); ok {
+			out[key] = limits
+		}
+	}
+	return out
+}
+
+// stopSeatScope releases one finished seat's transient scope. The zero value
+// is production; a test that stubs the stop asserts on the disposed unit.
+func (p shimScopeProbe) stopSeatScope(scope string, userScope bool) error {
+	if p.stopScope != nil {
+		return p.stopScope(scope, userScope)
+	}
+	return seatbudget.StopSeatScope(scope, userScope)
+}
+
+// hostOwnBusClass reports which manager owns this daemon's own cgroup: the
+// user manager or the system manager. The zero value reads the live path;
+// a test pins it without touching /proc.
+func (p shimScopeProbe) hostOwnBusClass() string {
+	if p.ownBusClass != nil {
+		return p.ownBusClass()
+	}
+	return seatbudget.DetectOwnBusCgroupClass(seatbudget.SelfCgroupPath)
+}
+
+// checkShimScopeBus is the pre-spawn bus half of the launch gate: it picks
+// the bus from the manager owning this daemon's own cgroup and refuses the
+// launch when that manager cannot host a scope. A system-installed daemon
+// with no user manager reads class "system": the scope is created on the
+// system bus, and the launch is refused only when that bus is unusable.
+// A daemon under a per-user manager reads class "user" and needs the user
+// bus. An unreadable cgroup ("unknown") keeps the cached placement
+// verdict: the probe already answered, and an unknown own-cgroup must not
+// overrule it.
+func (d *Daemon) checkShimScopeBus(placement seatbudget.Placement) error {
+	if placement != seatbudget.PlacementSystemd {
+		return nil
+	}
+	wantUserBus := d.shimScope.hostUserScope()
+	if d.shimScope.hostGOOS() != "linux" {
+		return nil
+	}
+	class := d.shimScope.hostOwnBusClass()
+	switch class {
+	case "user":
+		if !wantUserBus {
+			return fmt.Errorf("session shim: this daemon runs under a per-user manager but its scope would be created on the system bus: refusing the launch before spawn")
+		}
+	case "system":
+		if wantUserBus {
+			return fmt.Errorf("session shim: this daemon runs as a system install with no user manager: the user bus is unreachable, refusing the launch before spawn")
+		}
+	}
+	return nil
 }
 
 // shimSeatReportKey names one launch incarnation: the lifecycle identity, the
@@ -362,16 +434,110 @@ func (c *shimSeatReportCache) retain(live map[shimSeatReportKey]struct{}) {
 	}
 }
 
-// shimSeatReport is the handle evidence for one adopted or quarantined
-// shim-owned seat, read once per launch incarnation and cached (see
-// shimSeatReportCache).
-func (d *Daemon) shimSeatReport(registry *sessionshim.Registry, key shimSeatReportKey) *SessionSeatBudget {
-	if rep, ok := d.shimSeatReports.get(key); ok {
-		return &rep
+// shimSeatReportsBatch is the batched twin of shimSeatReport: every
+// uncached seat in keys is read with one systemctl call, then cached per
+// incarnation exactly as the single path caches. Cached seats never reach
+// the bus. liveOK maps a key to whether its scope was observed; the caller
+// threads it into the record fallback the same way readShimSeatReport
+// does for a single seat.
+func (d *Daemon) shimSeatReportsBatch(registry *sessionshim.Registry, keys []shimSeatReportKey) map[shimSeatReportKey]*SessionSeatBudget {
+	out := make(map[shimSeatReportKey]*SessionSeatBudget, len(keys))
+	var scopes map[string]string
+	var order []shimSeatReportKey
+	for _, key := range keys {
+		if rep, ok := d.shimSeatReports.get(key); ok {
+			cached := rep
+			out[key] = &cached
+			continue
+		}
+		scope := d.shimSeatScopeForReport(registry, key.id, key.epoch)
+		if scope == "" {
+			rep := d.readShimSeatReport(registry, key.id, key.epoch)
+			d.shimSeatReports.put(key, *rep)
+			out[key] = rep
+			continue
+		}
+		if scopes == nil {
+			scopes = make(map[string]string)
+		}
+		tag := string(key.id.OrgID) + "\x1f" + string(key.id.SessionID) + "\x1f" + strconv.FormatUint(key.epoch, 10) + "\x1f" + key.shimID
+		scopes[tag] = scope
+		order = append(order, key)
 	}
-	rep := d.readShimSeatReport(registry, key.id, key.epoch)
-	d.shimSeatReports.put(key, *rep)
-	return rep
+	var live map[string]seatbudget.SeatLimits
+	if len(scopes) > 0 {
+		live = d.shimScope.readSeatLimitsBatch(scopes, d.shimScope.hostUserScope())
+	}
+	for _, key := range order {
+		tag := string(key.id.OrgID) + "\x1f" + string(key.id.SessionID) + "\x1f" + strconv.FormatUint(key.epoch, 10) + "\x1f" + key.shimID
+		limits, ok := live[tag]
+		rep := d.reportShimSeatFromLive(registry, key.id, key.epoch, limits, ok)
+		d.shimSeatReports.put(key, *rep)
+		out[key] = rep
+	}
+	return out
+}
+
+// shimSeatScopeForReport resolves the only scope the read-back may query
+// for one seat — the unit the launch identity names — without reading it.
+// Empty means no scope exists to read (invalid identity), and the caller
+// falls back to the record path that reports none.
+func (d *Daemon) shimSeatScopeForReport(registry *sessionshim.Registry, id sessionshim.Identity, epoch uint64) string {
+	derived := ""
+	if id.Validate() == nil {
+		derived = seatBudgetShimScopeName(id.OrgID, id.SessionID, epoch)
+	}
+	if derived == "" {
+		return ""
+	}
+	if registry != nil {
+		if rec, found, err := registry.SeatLaunch(id, epoch); err == nil && found && rec.Scope != "" && rec.Scope != derived {
+			return derived
+		}
+	}
+	return derived
+}
+
+// reportShimSeatFromLive builds one seat's handle evidence from an observed
+// (or unobserved) scope plus its launch record: the same rule
+// readShimSeatReport applies to a single seat, with the live outcome
+// supplied by the batched call instead of a per-seat exec.
+func (d *Daemon) reportShimSeatFromLive(registry *sessionshim.Registry, id sessionshim.Identity, epoch uint64, live seatbudget.SeatLimits, liveOK bool) *SessionSeatBudget {
+	derived := ""
+	if id.Validate() == nil {
+		derived = seatBudgetShimScopeName(id.OrgID, id.SessionID, epoch)
+	}
+	var seat seatbudget.LaunchedSeat
+	if registry != nil {
+		rec, found, err := registry.SeatLaunch(id, epoch)
+		if err != nil {
+			slog.Warn("session shim: seat launch record unreadable; reporting from the live scope only",
+				"session", id.String(), "error", err)
+		}
+		if found && rec.Scope != "" && rec.Scope != derived {
+			slog.Warn("session shim: seat launch record names a scope its launch identity does not; reporting from the live scope only",
+				"session", id.String(), "recorded_scope", rec.Scope, "scope", derived)
+			found = false
+		}
+		if found {
+			seat = seatbudget.LaunchedSeat{
+				Scope:    rec.Scope,
+				Mode:     seatbudget.Mode(rec.Mode),
+				CPUs:     rec.CPUs,
+				MemoryMB: rec.MemoryMB,
+				IOWeight: rec.IOWeight,
+			}
+		}
+	}
+	scope := seat.Scope
+	if scope == "" && seat.Mode == "" {
+		scope = derived
+	}
+	if liveOK {
+		seat.Scope = scope
+	}
+	rep := seatbudget.ReportSeatLimits(seat, live, liveOK)
+	return &SessionSeatBudget{Mode: string(rep.Mode), CPUs: rep.CPUs, MemoryMB: rep.MemoryMB, Detail: rep.Detail}
 }
 
 // readShimSeatReport builds one shim-owned seat's handle evidence: the limits

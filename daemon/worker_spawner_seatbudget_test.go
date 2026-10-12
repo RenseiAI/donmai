@@ -12,6 +12,7 @@ import (
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/internal/localqueue"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // TestSpawner_SeatBudget_EnvCapsThroughAcceptWork drives the PRODUCTION spawn
@@ -1047,5 +1048,226 @@ func TestStartShimProcess_FailedStartRemovesTheLaunchRecord(t *testing.T) {
 	}
 	if _, found, err := registry.SeatLaunch(launch.Identity, 1); err != nil || found {
 		t.Errorf("seat launch record after a failed start = found %v, err %v; want it removed", found, err)
+	}
+}
+
+// TestShimSeatReportsBatchReadsOncePerStatusRead pins the F4 fix through the
+// handle path: the first status read after adoption runs ONE systemctl call
+// for every uncached seat, each incarnation is read once across polls, and
+// a seat that leaves the live sets leaves the cache with it. Cached seats
+// never reach the bus again; an unobserved scope falls back to its launch
+// record rather than vanishing.
+func TestShimSeatReportsBatchReadsOncePerStatusRead(t *testing.T) {
+	calls := 0
+	var batches [][]string
+	readBatch := func(scopes map[string]string, userScope bool) map[string]seatbudget.SeatLimits {
+		calls++
+		if !userScope {
+			t.Error("batched read used the system bus; want the launch's bus decision")
+		}
+		var units []string
+		for _, scope := range scopes {
+			units = append(units, scope)
+		}
+		batches = append(batches, units)
+		return map[string]seatbudget.SeatLimits{}
+	}
+	d, registry := newSeatReportDaemon(t, noLiveScope)
+	d.shimScope.readBatch = readBatch
+	first := sessionshim.Identity{OrgID: "o", SessionID: "batch-first"}
+	second := sessionshim.Identity{OrgID: "o", SessionID: "batch-second"}
+	putSeatLaunch(t, registry, first, 1, sessionshim.SeatModeEnforced, 2, 1024)
+	putSeatLaunch(t, registry, second, 1, sessionshim.SeatModeBestEffort, 3, 0)
+	d.shims.quarantined = append(d.shims.quarantined,
+		sessionshim.QuarantinedSession{OrgID: first.OrgID, SessionID: first.SessionID, ShimID: "shim-1", ProcessEpoch: 1},
+		sessionshim.QuarantinedSession{OrgID: second.OrgID, SessionID: second.SessionID, ShimID: "shim-2", ProcessEpoch: 1},
+	)
+	handles := d.sessionShimHandles()
+	if len(handles) != 2 {
+		t.Fatalf("handles = %d; want the two quarantined seats", len(handles))
+	}
+	if calls != 1 {
+		t.Fatalf("batched read ran %d calls for two uncached seats; want one", calls)
+	}
+	if len(batches[0]) != 2 {
+		t.Fatalf("batched read queried %v; want both uncached scopes in one call", batches)
+	}
+	byID := map[string]SessionHandle{}
+	for _, h := range handles {
+		byID[h.SessionID] = h
+	}
+	if got := byID["batch-first"].SeatBudget; got == nil || got.Mode != "enforced" || got.CPUs != 2 {
+		t.Errorf("first SeatBudget = %+v; want the record's enforced 2 cpu fallback (scope unobserved)", got)
+	}
+	if got := byID["batch-second"].SeatBudget; got == nil || got.Mode != "best-effort" || got.CPUs != 3 {
+		t.Errorf("second SeatBudget = %+v; want the record's best-effort 3 cpu fallback", got)
+	}
+	// Second poll: cached incarnations never reach the bus again.
+	_ = d.sessionShimHandles()
+	if calls != 1 {
+		t.Errorf("batched read ran %d calls across two polls; want one (incarnations cache)", calls)
+	}
+	// A seat that leaves the live sets leaves the cache with it.
+	d.shims.quarantined = d.shims.quarantined[:1]
+	_ = d.sessionShimHandles()
+	d.shimSeatReports.mu.Lock()
+	cached := len(d.shimSeatReports.reports)
+	d.shimSeatReports.mu.Unlock()
+	if cached != 1 {
+		t.Errorf("cache holds %d reports after a seat left; want one", cached)
+	}
+}
+
+// TestCheckShimScopeBusRefusesBeforeSpawn pins the F2 fix at the production
+// launch entry: a system-installed daemon with no user manager refuses the
+// launch BEFORE the worker starts — with the install named — instead of
+// spawning into the manager's "Access denied". A daemon under its own user
+// manager launches.
+func TestCheckShimScopeBusRefusesBeforeSpawn(t *testing.T) {
+	newBusDaemon := func(ownClass string, userScope bool) *Daemon {
+		dir := t.TempDir()
+		d := &Daemon{shimScope: shimScopeProbe{
+			goos:        "linux",
+			placement:   func() seatbudget.Placement { return seatbudget.PlacementSystemd },
+			userScope:   func() bool { return userScope },
+			readLimits:  noLiveScope,
+			ownBusClass: func() string { return ownClass },
+		}}
+		d.spawner = NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
+			EnabledProjectIDs:     []string{"p1"},
+			MaxConcurrentSessions: 2,
+			SeatBudget:            SeatBudget{CPUs: 2, MemoryMB: 256, Mode: "enforced"},
+			WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+			WorktreeParentDir:     dir,
+		})
+		return d
+	}
+	// System install (daemon owned by the system manager) with no user
+	// manager: the launch is refused before spawn, with the install named.
+	system := newBusDaemon("system", true)
+	launch := newScopeProbeLaunch(t.TempDir(), "system-install-seat")
+	if _, err := system.startShimProcess(SessionSpec{SessionID: "system-install-seat"}, launch, nil); err == nil {
+		t.Fatal("startShimProcess on a system install with no user manager succeeded; want the pre-spawn refusal")
+	} else if !strings.Contains(err.Error(), "system install") || !strings.Contains(err.Error(), "before spawn") {
+		t.Errorf("refusal %q does not name the system install and the pre-spawn refusal", err)
+	}
+	// User install under its own manager: launches (through the fake
+	// scope binary, so the test never needs a real systemd).
+	dir := t.TempDir()
+	installFakeSystemdRun(t, dir)
+	user := newBusDaemon("user", true)
+	userLaunch := sessionshim.Launch{
+		Identity:     sessionshim.Identity{OrgID: "test-org", SessionID: "user-install-seat"},
+		RegistryDir:  t.TempDir() + "/registry",
+		Orphan:       sessionshim.DefaultOrphanPolicy(),
+		ProcessEpoch: 1,
+	}
+	if _, err := user.startShimProcess(SessionSpec{SessionID: "user-install-seat"}, userLaunch, []string{"PATH=" + os.Getenv("PATH")}); err != nil {
+		t.Fatalf("startShimProcess under a user manager: %v", err)
+	}
+	// Unknown own-cgroup keeps the cached placement verdict: no refusal.
+	// The worker is the bare shell (no scope wrap asserts here — the bus
+	// check is what this leg pins), so it runs without the fake binary.
+	unknown := newBusDaemon("unknown", true)
+	unknown.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
+		EnabledProjectIDs:     []string{"p1"},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		WorktreeParentDir:     t.TempDir(),
+	})
+	unknown.shimScope.goos = "darwin"
+	unknownLaunch := sessionshim.Launch{
+		Identity:     sessionshim.Identity{OrgID: "test-org", SessionID: "unknown-bus-seat"},
+		RegistryDir:  t.TempDir() + "/registry",
+		Orphan:       sessionshim.DefaultOrphanPolicy(),
+		ProcessEpoch: 1,
+	}
+	if _, err := unknown.startShimProcess(SessionSpec{SessionID: "unknown-bus-seat"}, unknownLaunch, nil); err != nil {
+		t.Fatalf("startShimProcess with an unreadable own cgroup: %v", err)
+	}
+}
+
+// TestStartShimProcess_FloorsTheEpochPastDisposal pins the F1 epoch half
+// through the production launch entry: a launch floors its epoch, so a
+// relaunch after terminal disposal — seat record, tombstone and all —
+// advances past it instead of reusing scope name 1. Reverting the floor
+// write lets the next launch fall back to 1, which a stray process may
+// still hold.
+func TestStartShimProcess_FloorsTheEpochPastDisposal(t *testing.T) {
+	dir := t.TempDir()
+	probe := shimScopeProbe{goos: "darwin", placement: func() seatbudget.Placement { return seatbudget.PlacementNone }, readLimits: noLiveScope}
+	d := &Daemon{shimScope: probe}
+	d.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
+		EnabledProjectIDs:     []string{"p1"},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		WorktreeParentDir:     dir,
+	})
+	id := sessionshim.Identity{OrgID: "test-org", SessionID: "floored-seat"}
+	registryDir := dir + "/registry"
+	launch := sessionshim.Launch{Identity: id, RegistryDir: registryDir, Orphan: sessionshim.DefaultOrphanPolicy(), ProcessEpoch: 1}
+	if _, err := d.startShimProcess(SessionSpec{SessionID: id.SessionID}, launch, nil); err != nil {
+		t.Fatalf("startShimProcess: %v", err)
+	}
+	registry, err := sessionshim.NewRegistry(registryDir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	// Terminal disposal: the seat record goes with the tombstone.
+	if err := registry.RemoveSeatLaunch(id, 1); err != nil {
+		t.Fatalf("RemoveSeatLaunch: %v", err)
+	}
+	if got := d.nextShimProcessEpoch(id, registry); got != 2 {
+		t.Errorf("nextShimProcessEpoch after disposal = %d; want 2 (the floor survives the record)", got)
+	}
+}
+
+// TestFinishAdoptedShim_StopsTheSeatScope pins the F1 disposal half: the
+// terminal cleanup stops the seat's own transient scope, so a stray process
+// that left the worker's process group cannot keep the unit loaded for the
+// next launch to collide with. A stop failure never fails the cleanup.
+func TestFinishAdoptedShim_StopsTheSeatScope(t *testing.T) {
+	d, registry := newSeatReportDaemon(t, noLiveScope)
+	var stopped []string
+	id := sessionshim.Identity{OrgID: "o", SessionID: "stopping-seat"}
+	d.shimScope.stopScope = func(scope string, userScope bool) error {
+		stopped = append(stopped, scope)
+		if !userScope {
+			t.Error("scope stop used the system bus; want the launch's bus decision")
+		}
+		// A relaunch racing the stop must advance past the disposed epoch
+		// even with no epoch floor on disk (this test writes none): the
+		// tombstone still reserves epoch 4 until the stop has returned, so
+		// the stop can never target a successor that reused its name.
+		if got := d.nextShimProcessEpoch(id, registry); got <= 4 {
+			t.Errorf("nextShimProcessEpoch during the scope stop = %d; want > 4 (the disposed epoch is still reserved)", got)
+		}
+		return nil
+	}
+	tombstone := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-stop", ProcessEpoch: 4,
+		HarnessPID: 1, HarnessStartedAt: 2,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(tombstone); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	// finishAdoptedShim needs the adopted entry, the controller-free path,
+	// and a releasable claim; seed it through the production state the
+	// function reads. The durable handoff is stubbed by leaving the claim
+	// releasable: the release decision for an unknown session allows
+	// release, so the cleanup reaches the scope stop.
+	d.shims.adopted[id] = adoptedShim{
+		shimID:   "shim-stop",
+		adoption: SessionShimAdoptionEvidence{Identity: id, ShimID: "shim-stop", ProcessEpoch: 4},
+	}
+	d.finishAdoptedShim(id, shimwire.ExitMsg{})
+	if len(stopped) != 1 || stopped[0] != seatBudgetShimScopeName(id.OrgID, id.SessionID, 4) {
+		t.Errorf("stopped scopes = %v; want exactly the seat's own scope at epoch 4", stopped)
 	}
 }
