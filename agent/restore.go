@@ -1,4 +1,6 @@
-// Package agent's restore state machine: re-entering a prior harness
+package agent
+
+// restore.go — the restore state machine: re-entering a prior harness
 // conversation without ever silently starting fresh.
 //
 // A seat that comes back — daemon restart, runner retry, operator re-attach —
@@ -26,12 +28,6 @@
 //	                   would orphan the prior conversation's work, so the
 //	                   caller escalates instead of spawning.
 //
-// DecideRestore is pure: harnesses and the runner share it, and tests drive
-// it with fake resume functions. A harness whose resume validates
-// asynchronously (a CLI that accepts --resume and fails later on its event
-// stream) reports resumed here; the later stream failure is that turn's
-// error, and the NEXT restore decides again from the recorded receipt.
-package agent
 
 import (
 	"errors"

@@ -92,8 +92,8 @@ func (*Provider) Name() agent.ProviderName { return agent.ProviderClaude }
 // gated on the canUseTool callback the CLI does not yet expose.
 func (*Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
-		SupportsMessageInjection:            true,  // between-turn injection via --resume
-		SupportsSessionResume:               true,  // owned --session-id at launch, --resume to continue
+		SupportsMessageInjection:            true, // between-turn injection via --resume
+		SupportsSessionResume:               true, // owned --session-id at launch, --resume to continue
 		SupportsToolPlugins:                 true,
 		NeedsBaseInstructions:               false,
 		NeedsPermissionConfig:               false,

@@ -39,17 +39,17 @@ func resumeScriptServer(t *testing.T, fs *fakeServer, knownThread string) {
 		case method == "config/read" && hasID:
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0", "id": idRaw,
-				"result":  map[string]any{"config": map[string]any{codexMCPConfigKeyPath: map[string]any{}}, "origins": map[string]any{}},
+				"result": map[string]any{"config": map[string]any{codexMCPConfigKeyPath: map[string]any{}}, "origins": map[string]any{}},
 			})
 		case method == "mcpServerStatus/list" && hasID:
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0", "id": idRaw,
-				"result":  map[string]any{"data": []any{}},
+				"result": map[string]any{"data": []any{}},
 			})
 		case method == "thread/start" && hasID:
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0", "id": idRaw,
-				"result":  map[string]any{"thread": map[string]any{"id": knownThread}},
+				"result": map[string]any{"thread": map[string]any{"id": knownThread}},
 			})
 		case method == "thread/resume" && hasID:
 			threadID, _ := params["threadId"].(string)
