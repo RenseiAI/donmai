@@ -276,7 +276,7 @@ func (s *Store) EnsureWithAuth(ctx context.Context, source, scope string, auth G
 	// the directory is already there. The exclusive lock is dropped
 	// before taking the shared one: flock conflicts across file
 	// descriptions even within one process.
-	publishErr := s.cloneAndPublish(ctx, dir, digest, canonical, scope, auth)
+	publishErr := s.cloneAndPublish(ctx, dir, canonical, scope, auth)
 	_ = unlockAndClose(excl)
 	if publishErr != nil {
 		if errors.Is(publishErr, errMirrorRaceLost) {
@@ -332,7 +332,7 @@ func (s *Store) openVerifiedLease(ctx context.Context, dir, digest, canonical, s
 // reports "file exists"), the staging is discarded and errMirrorRaceLost
 // is returned; the caller drops its exclusive lock and re-verifies the
 // winner under a shared lock instead of failing.
-func (s *Store) cloneAndPublish(ctx context.Context, dir, digest, canonical, scope string, auth GitAuth) error {
+func (s *Store) cloneAndPublish(ctx context.Context, dir, canonical, scope string, auth GitAuth) error {
 	if err := s.root.MkdirAll(filepath.Join(keeperDirName, mirrorsDirName), 0o700); err != nil {
 		return fmt.Errorf("repo keeper: create mirror parent dir: %w", err)
 	}

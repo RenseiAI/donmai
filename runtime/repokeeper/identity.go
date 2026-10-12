@@ -62,7 +62,7 @@ func resolveSource(source string) (canonical, digest string, err error) {
 			// No credential may reach git's argv or the persisted
 			// origin. Per-invocation HTTP auth travels via gitexec.Auth;
 			// anything else userinfo-shaped is refused, never stripped
-				// and cloned.
+			// and cloned.
 			return "", "", fmt.Errorf("repo keeper: repository source carries userinfo")
 		}
 		canonical = parsed.String()

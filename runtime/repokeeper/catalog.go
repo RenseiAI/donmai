@@ -216,8 +216,8 @@ func (s *Store) Remove(digest string) error {
 			return "", err
 		}
 		// Maintenance exclusion against lease holders: no ctx here,
-			// like the catalog publish — the section is short and a
-			// dead holder releases its lock with its file description.
+		// like the catalog publish — the section is short and a
+		// dead holder releases its lock with its file description.
 		if fd, ferr := intFileDescriptor(excl.Fd()); ferr != nil {
 			_ = excl.Close()
 			return "", ferr

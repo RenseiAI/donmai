@@ -3,13 +3,14 @@ package repokeeper
 import (
 	"context"
 	"errors"
-	"github.com/RenseiAI/donmai/internal/gitexec"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/gitexec"
 )
 
 // Hardening coverage: poisoned-mirror refusal, cross-process create races,
@@ -300,7 +301,7 @@ func TestPublishRaceLoserReverifiesWinner(t *testing.T) {
 		t.Fatalf("ScopeDigest() error = %v", err)
 	}
 	dir := filepath.Join(stateDir, keeperDirName, mirrorsDirName, digest)
-	if err := second.cloneAndPublish(context.Background(), dir, digest, canonical, "", nil); !errors.Is(err, errMirrorRaceLost) {
+	if err := second.cloneAndPublish(context.Background(), dir, canonical, "", nil); !errors.Is(err, errMirrorRaceLost) {
 		t.Fatalf("cloneAndPublish over a published winner error = %v, want the race loss", err)
 	}
 	loser, err := second.Ensure(context.Background(), srcDir, "")
