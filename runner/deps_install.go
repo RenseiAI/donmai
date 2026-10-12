@@ -363,7 +363,9 @@ func (e depsInstallExecer) Exec(ctx context.Context, dir, command string, env ma
 			e.logger.Warn("repository dependency install output",
 				"dir", dir, "command", command, "output", tail)
 		}
+		var exitErr *exec.ExitError
 		if asErr := asExitError(runErr); asErr != nil {
+			_ = exitErr
 			return asErr.ExitCode(), nil
 		}
 		return -1, runErr
