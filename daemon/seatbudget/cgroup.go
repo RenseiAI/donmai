@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -541,6 +542,44 @@ const scopeProbePrefix = "donmai-scope-probe"
 // spawn, status read and launch-gate refusal in a process agrees, and the
 // probe cost is paid once.
 var hostScopeProbe = sync.OnceValue(verifyScopeProbe)
+
+// SelfCgroupPath is DetectOwnBusCgroupClass's production reader: this
+// process's own v2 cgroup path from /proc/self/cgroup.
+func SelfCgroupPath() (string, error) {
+	if runtime.GOOS != "linux" {
+		return "", errors.New("seatbudget: no cgroup path off Linux")
+	}
+	return selfCgroupPath()
+}
+
+// DetectOwnBusCgroupClass reads this process's own v2 cgroup path and
+// reports which manager owns it: "system" when the path sits outside the
+// per-user subtree, "user" when it sits inside one, "unknown" when the
+// path cannot be read. The launch gate consults it before spawning:
+// a system-installed daemon with no user manager must not attempt a
+// user-bus scope creation that the manager will refuse after spawn.
+// selfCgroup is injected so tests pin the classification on any host;
+// production reads /proc/self/cgroup through selfCgroupPath.
+func DetectOwnBusCgroupClass(selfCgroup func() (string, error)) string {
+	path, err := selfCgroup()
+	if err != nil {
+		return "unknown"
+	}
+	return ClassifyCgroupBusOwner(path)
+}
+
+// ClassifyCgroupBusOwner maps a v2 cgroup path to its owning manager: a
+// path inside the per-user subtree belongs to the user manager, anything
+// else to the system manager. The check is textual, on the kernel's own
+// path — no bus dial, no exec — so the launch gate can consult it on every
+// spawn without paying a probe.
+func ClassifyCgroupBusOwner(path string) string {
+	normalized := "/" + strings.Trim(path, "/")
+	if normalized == "/user.slice" || strings.HasPrefix(normalized, "/user.slice/") {
+		return "user"
+	}
+	return "system"
+}
 
 // ScopeRefusalReason reports why the scope placement is unavailable: the
 // cached pass's own refusal line when the manager denied the scope,
