@@ -129,14 +129,21 @@ func losslessOperationalValue(value reflect.Value) (any, error) {
 		// worker-local delivery material — so it is bound here: drift
 		// between the admitted payload and the live binding must read as
 		// drift.
-		return map[string]any{
+		doc := map[string]any{
 			"company": endpoint.Company, "model": endpoint.Model, "protocol": endpoint.Protocol, "host": endpoint.Host,
 			"endpointId": endpoint.EndpointID, "endpointOperator": endpoint.EndpointOperator, "endpointRevision": endpoint.EndpointRevision,
 			"modelAuthor": endpoint.ModelAuthor, "authBindingId": endpoint.AuthBindingID, "authAuthority": endpoint.AuthAuthority,
 			"authCommercialMode": endpoint.AuthCommercialMode, "authBindingScope": endpoint.AuthBindingScope,
 			"authPortability": endpoint.AuthPortability, "authDelivery": endpoint.AuthDelivery, "mechanism": endpoint.Mechanism,
-			"routingPreference": routingPreferenceDocument(endpoint.RoutingPreference),
-		}, nil
+		}
+		// The routing preference joins the document only when set: an
+		// unpreferred binding keeps its pre-field document
+		// byte-identically (the same additive-field doctrine the wire tags
+		// follow).
+		if pref := routingPreferenceDocument(endpoint.RoutingPreference); pref != nil {
+			doc["routingPreference"] = pref
+		}
+		return doc, nil
 	}
 
 	switch value.Kind() {

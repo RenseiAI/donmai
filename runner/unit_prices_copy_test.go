@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -252,5 +253,45 @@ func TestReconcileResolvedProfile_PreservesRoutingPreference(t *testing.T) {
 	}
 	if len(pref.Order) != 2 || len(pref.Only) != 1 {
 		t.Errorf("RoutingPreference = %+v, want order x2 + only x1", pref)
+	}
+}
+
+// TestOperationalPayload_BindsRoutingPreference pins that a set preference
+// joins the canonical operational document (so preflight-to-spawn drift in
+// it denies), while an unset preference leaves the document byte-identical
+// to its pre-field shape (the golden architecture digest still holds).
+func TestOperationalPayload_BindsRoutingPreference(t *testing.T) {
+	t.Parallel()
+	base := QueuedWork{
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderPi,
+			Model:    "model-a",
+			Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "model-a"},
+		},
+	}
+	base.SessionID = "session_routing_pref_digest"
+	plain, err := CanonicalOperationalPayload(base)
+	if err != nil {
+		t.Fatalf("CanonicalOperationalPayload: %v", err)
+	}
+	if strings.Contains(string(plain), "routingPreference") {
+		t.Fatalf("unset preference leaked into the canonical document: %s", plain)
+	}
+
+	preferred := base
+	preferred.ResolvedProfile.Endpoint = &agent.EndpointBinding{
+		Company:           agent.CompanyOpenAI,
+		Model:             "model-a",
+		RoutingPreference: &agent.RoutingPreference{Order: []string{"anthropic"}},
+	}
+	withPref, err := CanonicalOperationalPayload(preferred)
+	if err != nil {
+		t.Fatalf("CanonicalOperationalPayload: %v", err)
+	}
+	if !strings.Contains(string(withPref), `"routingPreference":{"only":null,"order":["anthropic"]}`) {
+		t.Fatalf("set preference missing from the canonical document: %s", withPref)
+	}
+	if string(plain) == string(withPref) {
+		t.Error("canonical document identical with and without a set preference: drift would go undetected")
 	}
 }

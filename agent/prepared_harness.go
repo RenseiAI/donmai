@@ -459,14 +459,20 @@ func stableEndpointAuthority(endpoint *EndpointBinding) any {
 	if endpoint == nil {
 		return nil
 	}
-	return map[string]any{
+	doc := map[string]any{
 		"company": endpoint.Company, "model": endpoint.Model, "protocol": endpoint.Protocol, "host": endpoint.Host,
 		"endpointId": endpoint.EndpointID, "endpointOperator": endpoint.EndpointOperator, "endpointRevision": endpoint.EndpointRevision,
 		"modelAuthor": endpoint.ModelAuthor, "authBindingId": endpoint.AuthBindingID, "authAuthority": endpoint.AuthAuthority,
 		"authCommercialMode": endpoint.AuthCommercialMode, "authBindingScope": endpoint.AuthBindingScope,
 		"authPortability": endpoint.AuthPortability, "authDelivery": endpoint.AuthDelivery, "mechanism": endpoint.Mechanism,
-		"routingPreference": stableRoutingPreferenceAuthority(endpoint.RoutingPreference),
 	}
+	// The routing preference joins the digest only when set: unpreferred
+	// bindings keep their pre-field digest byte-identically (the same
+	// additive-field doctrine the wire tags follow).
+	if pref := stableRoutingPreferenceAuthority(endpoint.RoutingPreference); pref != nil {
+		doc["routingPreference"] = pref
+	}
+	return doc
 }
 
 // stableRoutingPreferenceAuthority projects the optional routing preference
