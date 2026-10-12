@@ -26,6 +26,7 @@
           "session-root-v1"
         ],
         "noticeDelivery": "hook",
+        "contextUsageSource": "statusline-sidecar",
         "drives": [
           "anthropic-messages"
         ],
@@ -175,6 +176,7 @@
         ],
         "repositoryAuthorityEnforcement": "isolated-read-only-v1",
         "noticeDelivery": "mcp-rpc",
+        "contextUsageSource": "rollout-token-count",
         "drives": [
           "openai-chat",
           "openai-responses"
@@ -626,6 +628,7 @@
         "streamingTransport": "ndjson",
         "interactivePty": true,
         "noticeDelivery": "rpc-steer",
+        "contextUsageSource": "rpc-usage",
         "drives": [
           "anthropic-messages",
           "gemini-generate",

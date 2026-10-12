@@ -1,10 +1,13 @@
 package pi
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/executionevent"
 )
 
 // TestMapEvent_ResponseCommand is table-driven over the "response" event
@@ -411,5 +414,135 @@ func TestMapEvent_TurnEndCacheBuckets(t *testing.T) {
 				t.Errorf("terminal Cost = %+v; want %+v", got, tt.wantCost)
 			}
 		})
+	}
+}
+
+// TestMapEvent_CompactionEndEmitsContextUsageNotice pins the pi leg of the
+// typed context notice: a native compaction_end event (real RPC shape, per
+// the RPC reference) emits the observability SystemEvent AND the
+// ContextUsageEvent the usage series appends. The pre-compaction token
+// count rides as input-side consumption; the post-compaction estimate is a
+// heuristic, never a window measurement.
+func TestMapEvent_CompactionEndEmitsContextUsageNotice(t *testing.T) {
+	t.Parallel()
+	st := &mapperState{}
+	ev := rawEvent{Type: "compaction_end", Fields: map[string]any{
+		"reason": "threshold",
+		"result": map[string]any{
+			"summary":              "Summary of conversation...",
+			"firstKeptEntryId":     "abc123",
+			"tokensBefore":         float64(150000),
+			"estimatedTokensAfter": float64(32000),
+			"usage": map[string]any{
+				"input":  float64(32000),
+				"output": float64(1200),
+			},
+		},
+	}, Line: []byte("line")}
+	got, terminal := mapEvent(ev, st)
+	if terminal {
+		t.Fatal("compaction_end is not terminal")
+	}
+	if len(got) != 2 {
+		t.Fatalf("compaction_end emitted %d events, want 2 (system + context usage)", len(got))
+	}
+	system, ok := got[0].(agent.SystemEvent)
+	if !ok || system.Subtype != "compaction_end" {
+		t.Fatalf("first event = %#v, want the compaction_end SystemEvent", got[0])
+	}
+	notice, ok := got[1].(agent.ContextUsageEvent)
+	if !ok {
+		t.Fatalf("second event = %T, want ContextUsageEvent", got[1])
+	}
+	if notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Errorf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	if notice.Harness != string(agent.HarnessPi) {
+		t.Errorf("harness = %q, want pi", notice.Harness)
+	}
+	if notice.Source != agent.ContextUsageSourceRPCUsage {
+		t.Errorf("source = %q, want rpc-usage", notice.Source)
+	}
+	if notice.InputTokens == nil || *notice.InputTokens != 150000 {
+		t.Errorf("inputTokens = %v, want 150000 (tokensBefore)", notice.InputTokens)
+	}
+	if notice.OutputTokens == nil || *notice.OutputTokens != 1200 {
+		t.Errorf("outputTokens = %v, want 1200", notice.OutputTokens)
+	}
+	if notice.ContextWindowSize != nil {
+		t.Errorf("contextWindowSize = %v; the post-compaction estimate is a heuristic, never a window", notice.ContextWindowSize)
+	}
+}
+
+// TestMapEvent_AbortedCompactionEndStillMarks pins that a failed or aborted
+// compaction (null result) still emits the compaction marker with no
+// measurements: the marker itself is the signal.
+func TestMapEvent_AbortedCompactionEndStillMarks(t *testing.T) {
+	t.Parallel()
+	st := &mapperState{}
+	ev := rawEvent{Type: "compaction_end", Fields: map[string]any{
+		"reason": "overflow", "aborted": true,
+	}, Line: []byte("line")}
+	got, _ := mapEvent(ev, st)
+	if len(got) != 2 {
+		t.Fatalf("aborted compaction_end emitted %d events, want 2", len(got))
+	}
+	notice, ok := got[1].(agent.ContextUsageEvent)
+	if !ok {
+		t.Fatalf("second event = %T, want ContextUsageEvent", got[1])
+	}
+	if notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Errorf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	if notice.HasMeasurements() {
+		t.Errorf("aborted compaction fabricated measurements: %+v", notice)
+	}
+}
+
+// TestMapEvent_CompactionEndToSeries pins the whole pi headless leg: a
+// native compaction_end event in the real RPC shape maps to a typed
+// notice that normalizes to the usage.recorded series record. It drives
+// the production map→normalize chain, not a helper.
+func TestMapEvent_CompactionEndToSeries(t *testing.T) {
+	t.Parallel()
+	st := &mapperState{}
+	ev := rawEvent{Type: "compaction_end", Fields: map[string]any{
+		"reason": "threshold",
+		"result": map[string]any{
+			"tokensBefore":         float64(150000),
+			"estimatedTokensAfter": float64(32000),
+		},
+	}, Line: []byte("line")}
+	got, _ := mapEvent(ev, st)
+	if len(got) != 2 {
+		t.Fatalf("compaction_end emitted %d events, want 2", len(got))
+	}
+	notice, ok := got[1].(agent.ContextUsageEvent)
+	if !ok {
+		t.Fatalf("second event = %T, want ContextUsageEvent", got[1])
+	}
+	record, emitted, err := executionevent.NormalizeEvent("session_pi", 5, time.Now(), notice)
+	if err != nil {
+		t.Fatalf("NormalizeEvent: %v", err)
+	}
+	if !emitted {
+		t.Fatal("notice did not emit a series record")
+	}
+	raw, _ := json.Marshal(record)
+	var wire struct {
+		EventType string         `json:"eventType"`
+		Payload   map[string]any `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("decode series record: %v", err)
+	}
+	if wire.EventType != "usage.recorded" {
+		t.Fatalf("eventType = %q, want usage.recorded (in %s)", wire.EventType, raw)
+	}
+	if wire.Payload["kind"] != "compaction" {
+		t.Errorf("kind = %v, want compaction", wire.Payload["kind"])
+	}
+	if wire.Payload["harness"] != "pi" || wire.Payload["source"] != "rpc-usage" {
+		t.Errorf("payload identity = %v; want pi/rpc-usage", wire.Payload)
 	}
 }

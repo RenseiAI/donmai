@@ -1,0 +1,361 @@
+package agent_test
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
+)
+
+func floatPtr(f float64) *float64 { return &f }
+func intPtr(n int64) *int64       { return &n }
+
+// Fixture: a statusline sidecar JSON document in the shape the Claude
+// harness reports — context-window observation beside session token
+// totals.
+const sidecarFixture = `{
+  "used_percentage": 62.5,
+  "total_input_tokens": 125000,
+  "total_output_tokens": 8000,
+  "context_window_size": 200000
+}`
+
+func TestParseClaudeSidecarNotice_FixtureDocument(t *testing.T) {
+	t.Parallel()
+	notice, err := agent.ParseClaudeSidecarNotice([]byte(sidecarFixture), "claude-code")
+	if err != nil {
+		t.Fatalf("ParseClaudeSidecarNotice: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for the fixture sidecar")
+	}
+	if notice.Harness != "claude-code" {
+		t.Errorf("harness = %q, want claude-code", notice.Harness)
+	}
+	if notice.Source != agent.ContextUsageSourceStatuslineSidecar {
+		t.Errorf("source = %q, want statusline-sidecar", notice.Source)
+	}
+	if notice.NoticeKind != agent.ContextUsageThreshold {
+		t.Errorf("kind = %q, want threshold", notice.NoticeKind)
+	}
+	if notice.UsedPercent == nil || *notice.UsedPercent != 62.5 {
+		t.Errorf("usedPercent = %v, want 62.5", notice.UsedPercent)
+	}
+	if notice.InputTokens == nil || *notice.InputTokens != 125000 {
+		t.Errorf("inputTokens = %v, want 125000", notice.InputTokens)
+	}
+	if notice.OutputTokens == nil || *notice.OutputTokens != 8000 {
+		t.Errorf("outputTokens = %v, want 8000", notice.OutputTokens)
+	}
+	if notice.ContextWindowSize == nil || *notice.ContextWindowSize != 200000 {
+		t.Errorf("contextWindowSize = %v, want 200000", notice.ContextWindowSize)
+	}
+}
+
+func TestParseClaudeSidecarNotice_PartialStaysPartial(t *testing.T) {
+	t.Parallel()
+	// A sidecar carrying only a percentage must not fabricate token
+	// counts: absent stays nil, never zero.
+	notice, err := agent.ParseClaudeSidecarNotice([]byte(`{"used_percentage": 10}`), "claude-code")
+	if err != nil {
+		t.Fatalf("ParseClaudeSidecarNotice: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for a percentage-only sidecar")
+	}
+	if notice.InputTokens != nil || notice.OutputTokens != nil || notice.ContextWindowSize != nil {
+		t.Fatalf("partial sidecar fabricated counts: %+v", notice)
+	}
+	if notice.UsedPercent == nil || *notice.UsedPercent != 10 {
+		t.Errorf("usedPercent = %v, want 10", notice.UsedPercent)
+	}
+	// Round-trip: unknown stays absent on the wire, never zero.
+	raw, err := agent.MarshalEvent(*notice)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("decode wire: %v", err)
+	}
+	for _, key := range []string{"inputTokens", "outputTokens", "contextWindowSize"} {
+		if _, present := wire[key]; present {
+			t.Errorf("wire carries %q for an unknown measurement; want absent", key)
+		}
+	}
+}
+
+func TestParseClaudeSidecarNotice_CompactionMarker(t *testing.T) {
+	t.Parallel()
+	notice, err := agent.ParseClaudeSidecarNotice([]byte(`{"compacted": true}`), "claude-code")
+	if err != nil {
+		t.Fatalf("ParseClaudeSidecarNotice: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for a measurement-less compaction marker")
+	}
+	if notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Errorf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	if notice.HasMeasurements() {
+		t.Errorf("marker carries measurements: %+v", notice)
+	}
+}
+
+func TestParseClaudeSidecarNotice_EmptyIsNoSignal(t *testing.T) {
+	t.Parallel()
+	notice, err := agent.ParseClaudeSidecarNotice([]byte(`{}`), "claude-code")
+	if err != nil {
+		t.Fatalf("ParseClaudeSidecarNotice: %v", err)
+	}
+	if notice != nil {
+		t.Fatalf("empty sidecar yielded %+v, want nil", notice)
+	}
+}
+
+func TestParseClaudeSidecarNotice_RejectsImpossible(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"negative tokens":   `{"total_input_tokens": -1}`,
+		"percent over 100":  `{"used_percentage": 101}`,
+		"negative percent":  `{"used_percentage": -2}`,
+		"zero window":       `{"context_window_size": 0}`,
+		"fractional tokens": `{"total_input_tokens": 1.5}`,
+		"malformed":         `not json`,
+	}
+	for name, doc := range cases {
+		if _, err := agent.ParseClaudeSidecarNotice([]byte(doc), "claude-code"); err == nil {
+			t.Errorf("%s: want error, got nil", name)
+		}
+	}
+}
+
+// Fixture: rollout JSONL lines in the shape real session files take — an
+// event_msg envelope carrying a token_count event with the thread's
+// cumulative totals and the model window, beside unrelated line shapes.
+// Captured from a live rollout file (1044 token_count events, one shape).
+const rolloutTokenCountFixture = `{"timestamp":"2026-09-28T12:39:11.334Z","ordinal":14,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":90000,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":4000,"reasoning_output_tokens":0,"total_tokens":94000},"last_token_usage":{"input_tokens":90000,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":4000,"reasoning_output_tokens":0,"total_tokens":94000},"model_context_window":200000}}}`
+
+func TestParseCodexTokenCountNotice_FixtureLine(t *testing.T) {
+	t.Parallel()
+	notice, err := agent.ParseCodexTokenCountNotice([]byte(rolloutTokenCountFixture), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for the fixture token_count line")
+	}
+	if notice.Source != agent.ContextUsageSourceRolloutTokenCount {
+		t.Errorf("source = %q, want rollout-token-count", notice.Source)
+	}
+	if notice.NoticeKind != agent.ContextUsageThreshold {
+		t.Errorf("kind = %q, want threshold", notice.NoticeKind)
+	}
+	if notice.InputTokens == nil || *notice.InputTokens != 90000 {
+		t.Errorf("inputTokens = %v, want 90000", notice.InputTokens)
+	}
+	if notice.OutputTokens == nil || *notice.OutputTokens != 4000 {
+		t.Errorf("outputTokens = %v, want 4000", notice.OutputTokens)
+	}
+	if notice.ContextWindowSize == nil || *notice.ContextWindowSize != 200000 {
+		t.Errorf("contextWindowSize = %v, want 200000", notice.ContextWindowSize)
+	}
+	// The rollout carries no percentage: it is derived as
+	// 100*last_token_usage.total_tokens/window.
+	if notice.UsedPercent == nil || *notice.UsedPercent != 47 {
+		t.Errorf("usedPercent = %v, want 47 (100*94000/200000)", notice.UsedPercent)
+	}
+}
+
+// TestParseCodexTokenCountNotice_ShareIsTheLastCallNotTheCumulativeSum pins
+// the window share to what occupies the window now. total_token_usage is
+// the thread's running sum across every model call: a long live session
+// carries a cumulative total thousands of times the window while its last
+// call sits under half of it (the numbers below are a live session's
+// shape). Deriving the share from the cumulative sum reports a full window
+// after a few turns and fires every threshold at once.
+func TestParseCodexTokenCountNotice_ShareIsTheLastCallNotTheCumulativeSum(t *testing.T) {
+	t.Parallel()
+	line := `{"type":"event_msg","payload":{"type":"token_count","info":{` +
+		`"total_token_usage":{"input_tokens":2650000000,"output_tokens":6000000,"total_tokens":2656000000},` +
+		`"last_token_usage":{"input_tokens":372550,"output_tokens":833,"total_tokens":373383},` +
+		`"model_context_window":828400}}}`
+	notice, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice: %v", err)
+	}
+	if notice == nil || notice.UsedPercent == nil {
+		t.Fatalf("no window share for a token_count with a last call: %+v", notice)
+	}
+	want := 100 * float64(373383) / float64(828400)
+	if *notice.UsedPercent != want {
+		t.Fatalf("usedPercent = %v, want %v (last call over window, not the cumulative sum)", *notice.UsedPercent, want)
+	}
+	// Totals without a last call carry no occupancy: no share, no notice.
+	cumulativeOnly := `{"type":"event_msg","payload":{"type":"token_count","info":{` +
+		`"total_token_usage":{"input_tokens":150000,"output_tokens":0,"total_tokens":150000},"model_context_window":200000}}}`
+	notice, err = agent.ParseCodexTokenCountNotice([]byte(cumulativeOnly), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice(cumulative only): %v", err)
+	}
+	if notice != nil {
+		t.Fatalf("cumulative-only token_count yielded %+v, want nil", notice)
+	}
+}
+
+func TestParseCodexTokenCountNotice_CompactedMarker(t *testing.T) {
+	t.Parallel()
+	notice, err := agent.ParseCodexTokenCountNotice([]byte(`{"type":"compacted","payload":{"message":""}}`), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for the compacted marker")
+	}
+	if notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Errorf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	if notice.HasMeasurements() {
+		t.Errorf("marker carries measurements: %+v", notice)
+	}
+}
+
+func TestParseCodexTokenCountNotice_SkipsOtherLines(t *testing.T) {
+	t.Parallel()
+	lines := []string{
+		`{"type":"session_meta","payload":{"id":"thread-1"}}`,
+		`{"type":"token_usage_record","payload":{"thread_id":"thread-1"}}`,
+		`not json at all`,
+		`{"type":"event_msg","payload":{"message":"done"}}`,
+		`{"type":"event_msg","payload":{"type":"item_completed"}}`,
+		`{"type":"response_item","payload":{"type":"message"}}`,
+	}
+	for _, line := range lines {
+		notice, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex")
+		if err != nil {
+			t.Fatalf("line %q: %v", line, err)
+		}
+		if notice != nil {
+			t.Fatalf("line %q yielded %+v, want nil", line, notice)
+		}
+	}
+}
+
+func TestParseCodexTokenCountNotice_TotalWithoutWindowIsNoSignal(t *testing.T) {
+	t.Parallel()
+	// A token_count event with totals but no model window cannot derive the
+	// window share; without a percentage a threshold notice carries only
+	// token counts the per-turn usage events already meter.
+	line := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"output_tokens":100,"total_tokens":5100}}}}`
+	notice, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex")
+	if err != nil {
+		t.Fatalf("ParseCodexTokenCountNotice: %v", err)
+	}
+	if notice != nil {
+		t.Fatalf("windowless token_count yielded %+v, want nil", notice)
+	}
+}
+
+func TestParseCodexTokenCountNotice_RejectsImpossible(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":-1,"total_tokens":-1},"model_context_window":200000}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100},"model_context_window":0}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100},"last_token_usage":{"total_tokens":-5},"model_context_window":200000}}}`,
+	}
+	for _, line := range cases {
+		if _, err := agent.ParseCodexTokenCountNotice([]byte(line), "codex"); err == nil {
+			t.Errorf("line %q: want error, got nil", line)
+		}
+	}
+}
+
+func TestParsePiRPCUsageNotice_FixtureObject(t *testing.T) {
+	t.Parallel()
+	usage := &agent.PiRPCUsage{
+		InputTokens: intPtr(60000), OutputTokens: intPtr(3000),
+		ContextWindowSize: intPtr(1000000), UsedPercentage: floatPtr(6.3),
+	}
+	notice, err := agent.ParsePiRPCUsageNotice(usage, "pi")
+	if err != nil {
+		t.Fatalf("ParsePiRPCUsageNotice: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for the fixture usage object")
+	}
+	if notice.Source != agent.ContextUsageSourceRPCUsage {
+		t.Errorf("source = %q, want rpc-usage", notice.Source)
+	}
+	if notice.UsedPercent == nil || *notice.UsedPercent != 6.3 {
+		t.Errorf("usedPercent = %v, want 6.3", notice.UsedPercent)
+	}
+	if notice.InputTokens == nil || *notice.InputTokens != 60000 {
+		t.Errorf("inputTokens = %v, want 60000", notice.InputTokens)
+	}
+}
+
+func TestParsePiRPCUsageNotice_RejectsImpossible(t *testing.T) {
+	t.Parallel()
+	neg := int64(-1)
+	pct := 101.0
+	negPct := -2.0
+	zero := int64(0)
+	cases := map[string]*agent.PiRPCUsage{
+		"negative inputTokens":     {InputTokens: &neg},
+		"negative input":           {Input: &neg},
+		"negative outputTokens":    {OutputTokens: &neg},
+		"negative output":          {Output: &neg},
+		"percent over 100":         {UsedPercentage: &pct},
+		"negative percent":         {UsedPercentage: &negPct},
+		"zero window":              {ContextWindowSize: &zero},
+		"zero window alt spelling": {ContextWindow: &zero},
+	}
+	for name, usage := range cases {
+		if _, err := agent.ParsePiRPCUsageNotice(usage, "pi"); err == nil {
+			t.Errorf("%s: want error, got nil", name)
+		}
+	}
+}
+
+func TestParsePiRPCUsageNotice_NilAndEmptyAreNoSignal(t *testing.T) {
+	t.Parallel()
+	if notice, err := agent.ParsePiRPCUsageNotice(nil, "pi"); err != nil || notice != nil {
+		t.Fatalf("nil usage = %+v, %v; want nil, nil", notice, err)
+	}
+	if notice, err := agent.ParsePiRPCUsageNotice(&agent.PiRPCUsage{}, "pi"); err != nil || notice != nil {
+		t.Fatalf("empty usage = %+v, %v; want nil, nil", notice, err)
+	}
+}
+
+func TestContextUsageEvent_RoundTripsThroughEventCodec(t *testing.T) {
+	t.Parallel()
+	original := agent.ContextUsageEvent{
+		Harness: "codex", Source: agent.ContextUsageSourceRolloutTokenCount,
+		NoticeKind:  agent.ContextUsageCompaction,
+		UsedPercent: floatPtr(88), InputTokens: intPtr(176000),
+	}
+	raw, err := agent.MarshalEvent(original)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	decoded, err := agent.UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent: %v", err)
+	}
+	got, ok := decoded.(agent.ContextUsageEvent)
+	if !ok {
+		t.Fatalf("decoded type = %T, want ContextUsageEvent", decoded)
+	}
+	if got.NoticeKind != agent.ContextUsageCompaction || got.Harness != "codex" {
+		t.Fatalf("decoded = %+v", got)
+	}
+	if got.UsedPercent == nil || *got.UsedPercent != 88 {
+		t.Errorf("usedPercent = %v, want 88", got.UsedPercent)
+	}
+	if got.OutputTokens != nil || got.ContextWindowSize != nil {
+		t.Errorf("round trip fabricated unknowns: %+v", got)
+	}
+	if decoded.Kind() != agent.EventContextUsage {
+		t.Errorf("Kind() = %q, want context_usage", decoded.Kind())
+	}
+}

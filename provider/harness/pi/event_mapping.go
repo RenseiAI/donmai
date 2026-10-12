@@ -266,13 +266,53 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		}}, true
 
 	case "auto_retry_start", "auto_retry_end",
-		"compaction_start", "compaction_end",
+		"compaction_start",
 		"queue_update", "turn_start", "message_start":
 		return []agent.Event{agent.SystemEvent{
 			Subtype: ev.Type,
 			Message: stringField(f, "message"),
 			Raw:     raw(ev),
 		}}, false
+
+	case "compaction_end":
+		// A compaction the harness performed is the pi leg of the typed
+		// context notice: it emits BOTH the observability SystemEvent the
+		// lane has always carried AND the ContextUsageEvent the usage
+		// series appends. The notice carries the pre-compaction token
+		// count as the session's input-side consumption when the result
+		// reports one; the post-compaction estimate is a heuristic over
+		// the rebuilt context (per the RPC reference), not a window
+		// measurement, so it never rides ContextWindowSize. An aborted or
+		// failed compaction (null result) still emits the marker — the
+		// marker itself is the signal — with no measurements.
+		out := []agent.Event{agent.SystemEvent{
+			Subtype: ev.Type,
+			Message: stringField(f, "message"),
+			Raw:     raw(ev),
+		}}
+		notice := agent.ContextUsageEvent{
+			Harness:    string(agent.HarnessPi),
+			Source:     agent.ContextUsageSourceRPCUsage,
+			NoticeKind: agent.ContextUsageCompaction,
+			Raw:        raw(ev),
+		}
+		result := mapField(f, "result")
+		if before := intField(result, "tokensBefore"); before > 0 {
+			n := before
+			notice.InputTokens = &n
+		}
+		if usage := mapField(result, "usage"); len(usage) > 0 {
+			if in := intField(usage, "input"); in > 0 && notice.InputTokens == nil {
+				n := in
+				notice.InputTokens = &n
+			}
+			if outTok := intField(usage, "output"); outTok > 0 {
+				n := outTok
+				notice.OutputTokens = &n
+			}
+		}
+		out = append(out, notice)
+		return out, false
 
 	default:
 		// Unknown/typeless events become observability SystemEvents; never
