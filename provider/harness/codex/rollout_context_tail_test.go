@@ -37,6 +37,80 @@ func writeTailRollout(t *testing.T, home, thread string, lines []string) {
 	}
 }
 
+// TestHandle_StartLaunchesContextTail pins the headless wiring: start()
+// launches the rollout context-notice tail against the fixture home and
+// the thread start() just resolved. It drives the production start()
+// entry point against the fake app-server, then reads the notice off the
+// handle's own Events channel — so deleting the tail wiring in start()
+// leaves the notice undelivered and the test RED. A handle with no
+// provider home runs without notices.
+func TestHandle_StartLaunchesContextTail(t *testing.T) {
+	p, _ := newTestProvider(t)
+	home := p.config.home
+	thread := "thread-context-tail-start"
+	// 110000/200000 = 55%: fires the 50 bound on the first poll. The
+	// rollout file must exist BEFORE start() so the tail's first tick
+	// (one second out) is not the only read: the test also seeds one
+	// token_count line after start and waits for the live tail to deliver
+	// it on the handle's own Events channel.
+	writeTailRollout(t, home, thread, []string{
+		`{"type":"session_meta","payload":{"id":"` + thread + `"}}`,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "x", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	ch, ok := h.(*Handle)
+	if !ok {
+		t.Fatalf("Spawn returned %T, want *Handle", h)
+	}
+	sessionThread := ch.SessionID()
+	if sessionThread == "" {
+		t.Fatal("Spawn resolved no thread id; the tail has no session file to read")
+	}
+	// 160000/200000 = 80%: fires the 75 bound. Written after start so
+	// only a live tail launched by start() can deliver it.
+	writeTailRollout(t, home, sessionThread, []string{
+		tokenCountLine(160000, 5000, 165000, 200000),
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				t.Fatal("events closed before the tail delivered the fixture notice")
+			}
+			notice, ok := ev.(agent.ContextUsageEvent)
+			if !ok {
+				continue
+			}
+			if notice.Source != agent.ContextUsageSourceRolloutTokenCount {
+				t.Fatalf("source = %q, want rollout-token-count", notice.Source)
+			}
+			if notice.UsedPercent == nil || *notice.UsedPercent != 82.5 {
+				t.Fatalf("usedPercent = %v, want 82.5 (100*165000/200000)", notice.UsedPercent)
+			}
+			// A handle with no provider home runs without notices.
+			bare := newHandle(nil, nil, agent.Spec{Prompt: "x", Cwd: t.TempDir()}, HandleOptions{})
+			if tail := bare.startContextTail(context.Background()); tail != nil {
+				t.Fatalf("startContextTail on a provider-less handle = %+v; want nil (no notices)", tail)
+			}
+			return
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("timed out waiting for the headless tail to deliver the fixture notice on the handle's Events channel")
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for the headless tail to deliver the fixture notice on the handle's Events channel")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
 // TestRolloutContextTail_ThresholdCrossingsAreRealNotices pins the codex
 // headless leg end to end: a session file in the real rollout shape tails
 // into typed threshold notices whose window share derives from the

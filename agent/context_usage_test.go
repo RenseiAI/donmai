@@ -256,6 +256,29 @@ func TestParsePiRPCUsageNotice_FixtureObject(t *testing.T) {
 	}
 }
 
+func TestParsePiRPCUsageNotice_RejectsImpossible(t *testing.T) {
+	t.Parallel()
+	neg := int64(-1)
+	pct := 101.0
+	negPct := -2.0
+	zero := int64(0)
+	cases := map[string]*agent.PiRPCUsage{
+		"negative inputTokens":     {InputTokens: &neg},
+		"negative input":           {Input: &neg},
+		"negative outputTokens":    {OutputTokens: &neg},
+		"negative output":          {Output: &neg},
+		"percent over 100":         {UsedPercentage: &pct},
+		"negative percent":         {UsedPercentage: &negPct},
+		"zero window":              {ContextWindowSize: &zero},
+		"zero window alt spelling": {ContextWindow: &zero},
+	}
+	for name, usage := range cases {
+		if _, err := agent.ParsePiRPCUsageNotice(usage, "pi"); err == nil {
+			t.Errorf("%s: want error, got nil", name)
+		}
+	}
+}
+
 func TestParsePiRPCUsageNotice_NilAndEmptyAreNoSignal(t *testing.T) {
 	t.Parallel()
 	if notice, err := agent.ParsePiRPCUsageNotice(nil, "pi"); err != nil || notice != nil {

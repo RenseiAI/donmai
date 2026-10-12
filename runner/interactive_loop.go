@@ -443,7 +443,7 @@ func (r *Runner) dispatchInteractive(
 	// the same sink + JSONL legs as every other interactive event. It is
 	// best-effort and never blocks the PTY: drops on a slow consumer,
 	// silence when the harness reports no signal. The pi leg reports
-	// through ObservePiRPCUsage on its RPC stream instead of a file poll.
+	// compaction markers through its RPC stream instead of a file poll.
 	stopContextWatch := r.startContextUsageWatch(interactiveCtx, worktreePath, handle, sink)
 	defer stopContextWatch()
 	handleEvents := handle.Events()
@@ -729,13 +729,6 @@ func (r *Runner) runContextUsageWatch(ctx context.Context, w *contextUsageWatche
 	}
 }
 
-// resolveContextUsageSource maps the spawned provider onto the
-// harness-native context signal the watcher polls. Paths come from the
-// session environment the harness itself honors: the statusline sidecar
-// path for claude, the session-state subtree of CODEX_HOME for codex. An
-// empty harness means no pollable signal — pi reports through
-// ObservePiRPCUsage on its RPC stream, and every other harness reports
-// none.
 // resolveContextUsageSource maps the spawned handle onto the
 // harness-native context signal the watcher polls. Paths come from the
 // handle's own session-scoped seam (agent.ContextUsageSourcer): the

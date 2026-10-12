@@ -59,6 +59,23 @@ func newRolloutContextTail(home, threadID string) *rolloutContextTail {
 	return &rolloutContextTail{home: home, threadID: threadID, armed: armed}
 }
 
+// startContextTail launches the session's rollout context-notice tail.
+// It returns the tail so tests can assert the wiring, or nil when the
+// session has no known home/thread and runs without notices (a unit-test
+// handle with no provider). A non-nil tail is already running on its own
+// goroutine, polling the thread's own rollout file and emitting notices
+// via h.emit.
+func (h *Handle) startContextTail(ctx context.Context) *rolloutContextTail {
+	home := h.codexHome()
+	threadID := h.SessionID()
+	if home == "" || threadID == "" {
+		return nil
+	}
+	tail := newRolloutContextTail(home, threadID)
+	go tail.run(ctx, h.emit) //nolint:gosec // G118: session-lifetime goroutine, ctx is honored
+	return tail
+}
+
 // run tails until ctx ends, emitting notices via emit. Every emit must be
 // non-blocking — this goroutine never slows the session — and it returns
 // when ctx ends whether or not anyone reads the events.

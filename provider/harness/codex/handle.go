@@ -292,10 +292,7 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 	// is the provider's own isolated home (never the ambient environment)
 	// and the thread id is the one just started or resumed above; either
 	// unknown (a unit-test handle with no provider) runs without notices.
-	if home := h.codexHome(); home != "" {
-		tail := newRolloutContextTail(home, h.SessionID())
-		go tail.run(ctx, h.emit)
-	}
+	h.startContextTail(ctx)
 
 	// The forwarder is intentionally long-lived: it must survive
 	// Spawn() returning and run for the duration of the session.

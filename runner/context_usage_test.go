@@ -198,6 +198,26 @@ func TestContextWatcher_RolloutTokenCounts(t *testing.T) {
 	}
 }
 
+// TestContextWatcher_PercentLessThresholdIsSilent pins the watcher's own
+// percent-less gate: a threshold notice that carries only token counts the
+// per-turn usage events already meter reports nothing, even though the
+// parsers independently hold the same rule. A future caller of classify
+// that bypasses the parser stays silent.
+func TestContextWatcher_PercentLessThresholdIsSilent(t *testing.T) {
+	t.Parallel()
+	w := newContextUsageWatcher(contextUsageSource{harness: "codex"})
+	in := int64(5000)
+	notice := &agent.ContextUsageEvent{
+		Harness:     "codex",
+		Source:      agent.ContextUsageSourceRolloutTokenCount,
+		NoticeKind:  agent.ContextUsageThreshold,
+		InputTokens: &in,
+	}
+	if ev := w.classify(notice); ev != nil {
+		t.Fatalf("percent-less threshold yielded %+v, want nil", *ev)
+	}
+}
+
 // TestContextWatcher_RolloutPathReResolves pins the late-file posture: a
 // session whose rollout file does not exist yet emits nothing, then tails
 // it once the harness creates it — the path is re-resolved every poll,
@@ -276,13 +296,17 @@ func TestContextWatcher_MissingFilesAreSilent(t *testing.T) {
 	}
 }
 
-// TestObservePiRPCUsage_ThresholdGating pins the pi leg: the first crossing
-// reports, a repeat does not, and an unknown-only object stays silent.
+// TestObservePiRPCUsage_ThresholdGating pins the pi threshold-gating
+// helper: the first crossing reports, a repeat does not, and an
+// unknown-only object stays silent. The pi stream carries only compaction
+// markers today, so this helper is not wired to a production caller; the
+// test pins its gating so a future wired caller reports like the file
+// legs.
 func TestObservePiRPCUsage_ThresholdGating(t *testing.T) {
 	t.Parallel()
 	in, out, window, pct := int64(60000), int64(3000), int64(1000000), 82.0
 	state := newContextUsageWatcher(contextUsageSource{harness: "pi"})
-	ev := ObservePiRPCUsage(&agent.PiRPCUsage{
+	ev := observePiRPCUsage(&agent.PiRPCUsage{
 		InputTokens: &in, OutputTokens: &out,
 		ContextWindowSize: &window, UsedPercentage: &pct,
 	}, "pi", state)
@@ -300,11 +324,11 @@ func TestObservePiRPCUsage_ThresholdGating(t *testing.T) {
 		t.Errorf("inputTokens = %v, want 60000", notice.InputTokens)
 	}
 	// Same reading again: disarmed bounds stay silent.
-	if ev := ObservePiRPCUsage(&agent.PiRPCUsage{UsedPercentage: &pct}, "pi", state); ev != nil {
+	if ev := observePiRPCUsage(&agent.PiRPCUsage{UsedPercentage: &pct}, "pi", state); ev != nil {
 		t.Fatalf("repeat reading yielded %+v, want nil", *ev)
 	}
 	// Nil usage carries no signal.
-	if ev := ObservePiRPCUsage(nil, "pi", state); ev != nil {
+	if ev := observePiRPCUsage(nil, "pi", state); ev != nil {
 		t.Fatalf("nil usage yielded %+v, want nil", *ev)
 	}
 }

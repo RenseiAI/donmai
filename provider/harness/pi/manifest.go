@@ -84,9 +84,9 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// each compaction_end to a typed ContextUsageEvent
 			// (event_mapping.go) on its own Events channel, which the
 			// runner's headless loop already forwards to the usage
-			// series. The typed RPC usage object
-			// (agent.PiRPCUsage, via ObservePiRPCUsage) covers turns
-			// whose stream usage carries a window share.
+			// series. Compaction-only: per-turn stream usage carries
+			// input/output/cache/cost keys with no window share, so no
+			// threshold leg is wired.
 			ContextUsageSource: agent.ContextUsageSourceRPCUsage,
 			Drives: []agent.WireProtocol{
 				agent.ProtoAnthropicMessages,

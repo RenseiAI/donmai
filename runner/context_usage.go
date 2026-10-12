@@ -26,15 +26,18 @@ import (
 //     total_input_tokens, total_output_tokens, context_window_size) at
 //     sidecarPath;
 //   - codex tails token_count events in the rollout JSONL at rolloutPath;
-//   - pi converts its RPC usage object, when the session's RPC stream
-//     carries one (see ObservePiRPCUsage), rather than polling a file.
+//   - pi emits only compaction markers: each native compaction_end on
+//     the session's RPC stream maps to a typed ContextUsageEvent
+//     (provider/harness/pi/event_mapping.go), rather than polling a file.
+//     Per-turn stream usage carries input/output/cache/cost keys with no
+//     window share, so no pi threshold leg is wired.
 //
 // Every path is best-effort and rate-limited, never blocking the PTY. The
 // watcher runs on its own goroutine, polls on a 1s ticker, and emits via a
 // non-blocking send — when the consumer is slow, notices are dropped, never
 // queued behind the terminal. Unknown measurements stay absent on every
 // emitted notice, never zero: the parsers (agent.ParseClaudeSidecarNotice,
-// agent.ParseCodexTokenCountNotice, agent.ParsePiRPCUsageNotice) omit what
+// agent.ParseCodexTokenCountNotice) omit what
 // the harness did not report.
 //
 // Dedupe is structural: a sidecar whose bytes are unchanged since the last
@@ -286,13 +289,15 @@ func compactionIdentity(notice *agent.ContextUsageEvent) string {
 	return b.String()
 }
 
-// ObservePiRPCUsage converts one pi RPC usage object into the typed context
-// notice for the session, or nil when the object carries no signal. It is
-// the pi leg of the watcher: pi reports usage on its RPC stream rather than
-// in a file, so the pi handle calls this per turn_end instead of polling.
-// Threshold gating matches the file legs (classify), so all three harnesses
-// report crossings the same way.
-func ObservePiRPCUsage(usage *agent.PiRPCUsage, harness string, state *contextUsageWatcher) *agent.Event {
+// observePiRPCUsage converts one pi RPC usage object into the typed
+// context notice for the session, or nil when the object carries no
+// signal. The pi stream carries only compaction markers today (see the
+// compaction_end mapping in provider/harness/pi/event_mapping.go), so this
+// stays a testable threshold-gating helper: it is not wired to a
+// production caller on the RPC stream, and the pi leg claims
+// compaction-only. Threshold gating matches the file legs (classify), so
+// every caller reports crossings the same way.
+func observePiRPCUsage(usage *agent.PiRPCUsage, harness string, state *contextUsageWatcher) *agent.Event {
 	if usage == nil {
 		return nil
 	}
