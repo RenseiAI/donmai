@@ -101,6 +101,20 @@ type startedCall struct {
 // so no consumer makes it the session's failure.
 const adjudicationMissingCode = "policy_adjudication_missing"
 
+// repeatedOutputLimitCode is the typed failure code the handle emits when the
+// session ends after too many consecutive output-limit cut-off turns. Unlike
+// adjudicationMissingCode it is terminal (SessionContinues is unset): the
+// session will not make progress by retrying, so it stops instead of looping
+// without bound.
+const repeatedOutputLimitCode = "repeated_output_limit"
+
+// DefaultMaxConsecutiveOutputLimitCutoffs is the streak of consecutive
+// output-limit cut-off turns a session tolerates before the handle ends it
+// with repeatedOutputLimitCode. Any turn without a length-stopped tool call
+// resets the streak. Override per provider via
+// Options.MaxConsecutiveOutputLimitCutoffs.
+const DefaultMaxConsecutiveOutputLimitCutoffs = 3
+
 // Pieces of the runtime's own argument-validation rejection text for a tool
 // call: `Validation failed for tool "<name>":` + "\n", the failed checks, then
 // the marker and the call's arguments as indented JSON. See
@@ -199,6 +213,25 @@ type Handle struct {
 	lengthStopped       map[string]string
 	outputLimitRefusals []outputLimitRefusal
 
+	// cutOffTurn is true once the current turn has noted at least one
+	// length-stopped tool call (noteLengthStoppedToolCalls): the turn's
+	// assistant message was cut off at the output-token limit and the runtime
+	// refused that call before execution. A length-stopped message carrying no
+	// tool calls sets nothing — truncated text alone is not evidence the
+	// session is stuck, so it never counts toward the streak. Read and cleared
+	// by observeTurnEnd at the turn's turn_end. Guarded by adjMu.
+	cutOffTurn bool
+	// consecutiveCutoffs counts consecutive cut-off turns: incremented when a
+	// turn ends with cutOffTurn set, reset to zero by any other turn_end.
+	// Guarded by adjMu; mutated only on the pump goroutine (dispatch).
+	consecutiveCutoffs int
+	// maxConsecutiveOutputLimitCutoffs is the streak length that ends the
+	// session: when observeTurnEnd returns a streak at or above it, dispatch
+	// emits the typed repeatedOutputLimitCode failure. Set to
+	// DefaultMaxConsecutiveOutputLimitCutoffs by newHandle and overridden from
+	// Options by launch before the pump starts; never mutated after.
+	maxConsecutiveOutputLimitCutoffs int
+
 	// startedCalls maps the call id of every guarded tool_execution_start in
 	// the current turn to the tool and arguments it named. The runtime emits
 	// the start BEFORE it validates the arguments, so the entry is in place
@@ -286,19 +319,20 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 		receipt = admissions[0]
 	}
 	return &Handle{
-		client:          client,
-		cmd:             cmd,
-		policy:          NewPolicyEngine(spec),
-		spec:            spec,
-		state:           &mapperState{suppressCost: suppressInjectedCost(spec)},
-		token:           token,
-		receipt:         receipt,
-		handshakeResult: make(chan error, 1),
-		adjudications:   make(map[string]adjudicationOutcome),
-		lengthStopped:   make(map[string]string),
-		startedCalls:    make(map[string]startedCall),
-		events:          make(chan agent.Event, 256),
-		closed:          make(chan struct{}),
+		client:                           client,
+		cmd:                              cmd,
+		policy:                           NewPolicyEngine(spec),
+		spec:                             spec,
+		state:                            &mapperState{suppressCost: suppressInjectedCost(spec)},
+		token:                            token,
+		receipt:                          receipt,
+		handshakeResult:                  make(chan error, 1),
+		adjudications:                    make(map[string]adjudicationOutcome),
+		lengthStopped:                    make(map[string]string),
+		startedCalls:                     make(map[string]startedCall),
+		maxConsecutiveOutputLimitCutoffs: DefaultMaxConsecutiveOutputLimitCutoffs,
+		events:                           make(chan agent.Event, 256),
+		closed:                           make(chan struct{}),
 	}
 }
 
@@ -486,6 +520,11 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		h.handleExtensionRequest(ev)
 		return false
 	}
+	// cutoffStreak is the consecutive output-limit cut-off streak including
+	// the turn a turn_end closes, or -1 when this event closes no turn. The
+	// turn_end branch below sets it via observeTurnEnd; the fatal check after
+	// the emit loop reads it.
+	cutoffStreak := -1
 	switch ev.Type {
 	case "message_end":
 		h.noteLengthStoppedToolCalls(ev)
@@ -495,8 +534,13 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		// pi emits the refused start/end pairs before the turn_end that
 		// closes their turn, so any note still standing here explains nothing
 		// that can legitimately follow — drop it rather than let it excuse a
-		// later end that reuses the id.
-		h.clearTurnNotes()
+		// later end that reuses the id. The returned streak counts this turn
+		// too: a turn that noted a length-stopped call increments the
+		// consecutive cut-off streak, any other turn resets it. The fatal
+		// check itself runs after mapEvent below, so the turn's own usage
+		// event is still emitted before the typed failure that ends the
+		// session.
+		cutoffStreak = h.observeTurnEnd()
 	}
 
 	// Integrity monitor: every guarded tool_execution_END is matched against
@@ -617,6 +661,21 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 			h.emitLaunchNotices()
 		}
 	}
+	// Repeated output-limit cut-offs: a session whose turns keep ending cut
+	// off at the output-token limit is not making progress — every refused
+	// call never ran — so after the streak reaches the bound the session ends
+	// with the typed repeatedOutputLimitCode failure instead of retrying
+	// without bound. A normal turn in between resets the streak (observeTurnEnd
+	// above), so only genuinely consecutive cut-offs trip this.
+	if ev.Type == "turn_end" && cutoffStreak >= h.cutoffLimit() {
+		h.signalClosed()
+		h.emit(agent.ErrorEvent{
+			Message: fmt.Sprintf("%d consecutive turns cut off at the output-token limit (limit %d) — ending the session instead of retrying without bound", cutoffStreak, h.cutoffLimit()),
+			Code:    repeatedOutputLimitCode,
+			Raw:     raw(ev),
+		})
+		return true
+	}
 	return fatal
 }
 
@@ -683,6 +742,7 @@ func (h *Handle) noteLengthStoppedToolCalls(ev rawEvent) {
 	parts, _ := msg["content"].([]any)
 	h.adjMu.Lock()
 	defer h.adjMu.Unlock()
+	noted := false
 	for _, p := range parts {
 		part, ok := p.(map[string]any)
 		if !ok || stringField(part, "type") != "toolCall" {
@@ -694,16 +754,49 @@ func (h *Handle) noteLengthStoppedToolCalls(ev rawEvent) {
 			continue
 		}
 		h.lengthStopped[callID] = tool
+		noted = true
+	}
+	// A turn that noted at least one length-stopped call is a cut-off turn:
+	// observeTurnEnd counts it toward the consecutive-cutoff streak. A
+	// length-stopped message carrying no tool calls notes nothing and counts
+	// as a normal turn — truncated text alone is not evidence the session is
+	// stuck retrying.
+	if noted {
+		h.cutOffTurn = true
 	}
 }
 
-// clearTurnNotes drops every length-stop and started-call note at a turn
-// boundary.
-func (h *Handle) clearTurnNotes() {
+// observeTurnEnd closes the turn: it drops every length-stop and started-call
+// note like clearTurnNotes, and additionally folds the turn into the
+// consecutive output-limit cut-off streak — a turn that noted at least one
+// length-stopped tool call increments it, any other turn resets it to zero.
+// It returns the updated streak. The caller compares it against the cutoff
+// limit (cutoffLimit) to decide whether the session ends.
+func (h *Handle) observeTurnEnd() int {
 	h.adjMu.Lock()
 	defer h.adjMu.Unlock()
 	clear(h.lengthStopped)
 	clear(h.startedCalls)
+	if h.cutOffTurn {
+		h.cutOffTurn = false
+		h.consecutiveCutoffs++
+	} else {
+		h.consecutiveCutoffs = 0
+	}
+	return h.consecutiveCutoffs
+}
+
+// cutoffLimit reports the consecutive cut-off streak length that ends the
+// session. A non-positive bound (possible only on a zero-value Handle, which
+// newHandle never produces) selects the default rather than ending the
+// session on the first cut-off turn or never ending it.
+func (h *Handle) cutoffLimit() int {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	if h.maxConsecutiveOutputLimitCutoffs <= 0 {
+		return DefaultMaxConsecutiveOutputLimitCutoffs
+	}
+	return h.maxConsecutiveOutputLimitCutoffs
 }
 
 // noteStartedToolCall records the tool and arguments of a guarded

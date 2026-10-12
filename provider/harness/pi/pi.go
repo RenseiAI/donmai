@@ -98,6 +98,13 @@ type Options struct {
 	// handshake before failing closed. Defaults to 10s (design §2 step 3).
 	HandshakeTimeout time.Duration
 
+	// MaxConsecutiveOutputLimitCutoffs caps how many consecutive turns cut
+	// off at the output-token limit a session tolerates before the handle
+	// ends it with a typed failure instead of retrying without bound. A turn
+	// without a length-stopped tool call resets the streak. Zero or negative
+	// selects DefaultMaxConsecutiveOutputLimitCutoffs.
+	MaxConsecutiveOutputLimitCutoffs int
+
 	// VersionProbeTimeout caps the construction-time version probe.
 	VersionProbeTimeout time.Duration
 
@@ -532,6 +539,12 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	client := newRPCClient(stdin, stdout)
 	h := newHandle(client, cmd, spec, token, receipt)
 	h.setConfinement(plan)
+	// The consecutive output-limit cut-off bound rides the handle: an explicit
+	// provider option wins, otherwise newHandle's default stands. Set before
+	// the pump starts (same ordering as launchNotices below).
+	if p.opts.MaxConsecutiveOutputLimitCutoffs > 0 {
+		h.maxConsecutiveOutputLimitCutoffs = p.opts.MaxConsecutiveOutputLimitCutoffs
+	}
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the
 	// worktree lifecycle that removes the state root is the backstop.

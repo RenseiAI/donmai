@@ -176,7 +176,12 @@
 //     the end positively reports an error result. The evidence is the
 //     runtime's own message_end, never result text; a length-stopped id whose
 //     end claims SUCCESS is not excused and falls to case 3, and every note is
-//     dropped at its turn's turn_end.
+//     dropped at its turn's turn_end. A turn that notes at least one such
+//     call is a cut-off turn: cut-off turns in a row are counted, and the
+//     streak reaching the bound (handle.go cutoffLimit,
+//     DefaultMaxConsecutiveOutputLimitCutoffs) ends the session with a typed
+//     failure instead of retrying without bound. A turn with no noted call
+//     resets the streak, so only genuinely consecutive cut-offs trip it.
 //     A call the runtime rejected on its arguments is recorded as that
 //     rejection (rejectedForInvalidArguments), not as a miss, and nothing more
 //     is emitted: the agent reads the rejection as the call's error result and

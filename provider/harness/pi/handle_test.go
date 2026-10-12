@@ -812,3 +812,218 @@ func TestRPCResponseModelIsObservedWithoutConfiguredIdentityFallback(t *testing.
 		})
 	}
 }
+
+// --- Repeated output-limit cut-offs: N consecutive cut-off turns end the
+// session with a typed failure instead of retrying without bound; a normal
+// turn in between resets the streak. ---
+
+// cutoffTurn builds one turn cut off at the output-token limit in the
+// runtime's recorded shape: the assistant message_end with stopReason
+// "length" naming the call, the hook-less refused start/end pair, and the
+// turn_end that closes the turn. The monitor records the refusal (not a miss)
+// and observeTurnEnd counts the turn toward the consecutive-cutoff streak.
+func cutoffTurn(callID string) string {
+	return assistantMessageEnd("length", [2]string{callID, "edit"}) +
+		truncatedCallPair("edit", callID) +
+		event(map[string]any{"type": "turn_end"})
+}
+
+// normalTurn builds one ordinary turn: an assistant message that stopped
+// normally and no refused calls. Its turn_end resets the cut-off streak.
+func normalTurn() string {
+	return assistantMessageEnd("stop") +
+		event(map[string]any{"type": "turn_end"})
+}
+
+// drainCutoffSession collects events until the session's terminal event — a
+// ResultEvent on a session that ran to its own end, or the typed ErrorEvent
+// that ends a session stuck on the output limit — or the channel closes.
+func drainCutoffSession(t *testing.T, h agent.Handle) []agent.Event {
+	t.Helper()
+	var out []agent.Event
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+			if _, done := ev.(agent.ResultEvent); done {
+				return out
+			}
+			if ee, ok := ev.(agent.ErrorEvent); ok && ee.Code == repeatedOutputLimitCode {
+				return out
+			}
+		case <-timeout:
+			t.Fatalf("timed out draining events; got %d so far: %+v", len(out), out)
+			return out
+		}
+	}
+}
+
+// cutoffOutcome splits a drained session into its terminal shape: whether the
+// typed cut-off failure fired, whether a ResultEvent closed the session, and
+// how many output-limit refusal observations the monitor surfaced.
+func cutoffOutcome(evs []agent.Event) (failed, completed, refusals int) {
+	for _, e := range evs {
+		switch value := e.(type) {
+		case agent.ErrorEvent:
+			if value.Code == repeatedOutputLimitCode {
+				failed++
+				if value.SessionContinues {
+					failed++ // defeat: counted twice so the assert below fires
+				}
+				if value.Message == "" {
+					failed++
+				}
+			}
+		case agent.ResultEvent:
+			completed++
+		case agent.SystemEvent:
+			if value.Subtype == outputLimitRefusalSubtype {
+				refusals++
+			}
+		}
+	}
+	return failed, completed, refusals
+}
+
+func TestOutputLimitCutoff_ConsecutiveCutoffsEndSession(t *testing.T) {
+	t.Parallel()
+	var body string
+	for i := 0; i < DefaultMaxConsecutiveOutputLimitCutoffs; i++ {
+		body += cutoffTurn("c-cutoff")
+	}
+	body += event(map[string]any{"type": "agent_settled"})
+
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+		handshakeEvent("h1"), getStateResponse("ses_cutoff")+event(map[string]any{"type": "agent_start"})+body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainCutoffSession(t, h)
+
+	failed, completed, refusals := cutoffOutcome(evs)
+	if failed != 1 {
+		t.Errorf("typed %q failures = %d, want exactly 1 (terminal, carrying a message): %+v", repeatedOutputLimitCode, failed, evs)
+	}
+	if completed != 0 {
+		t.Errorf("session reached a ResultEvent after %d consecutive cut-off turns: %+v", DefaultMaxConsecutiveOutputLimitCutoffs, evs)
+	}
+	if refusals != DefaultMaxConsecutiveOutputLimitCutoffs {
+		t.Errorf("output-limit refusal observations = %d, want %d (one per cut-off turn)", refusals, DefaultMaxConsecutiveOutputLimitCutoffs)
+	}
+	if err := checkTerminalLast(evs); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestOutputLimitCutoff_FewerThanLimitDoesNotEndSession(t *testing.T) {
+	t.Parallel()
+	var body string
+	for i := 0; i < DefaultMaxConsecutiveOutputLimitCutoffs-1; i++ {
+		body += cutoffTurn("c-cutoff")
+	}
+	body += event(map[string]any{"type": "agent_settled"})
+
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+		handshakeEvent("h1"), getStateResponse("ses_cutoff_short")+event(map[string]any{"type": "agent_start"})+body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainCutoffSession(t, h)
+
+	failed, completed, _ := cutoffOutcome(evs)
+	if failed != 0 {
+		t.Errorf("session failed before the streak reached the bound: %+v", evs)
+	}
+	if completed != 1 {
+		t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+	}
+}
+
+func TestOutputLimitCutoff_NormalTurnResetsStreak(t *testing.T) {
+	t.Parallel()
+	// One fewer than the bound, then a normal turn, then one more cut-off:
+	// the streak never reaches the bound, so the session completes.
+	var body string
+	for i := 0; i < DefaultMaxConsecutiveOutputLimitCutoffs-1; i++ {
+		body += cutoffTurn("c-cutoff")
+	}
+	body += normalTurn() + cutoffTurn("c-cutoff") +
+		event(map[string]any{"type": "agent_settled"})
+
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+		handshakeEvent("h1"), getStateResponse("ses_cutoff_reset")+event(map[string]any{"type": "agent_start"})+body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drainCutoffSession(t, h)
+
+	failed, completed, refusals := cutoffOutcome(evs)
+	if failed != 0 {
+		t.Errorf("a normal turn between cut-offs must reset the streak; session failed anyway: %+v", evs)
+	}
+	if completed != 1 {
+		t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+	}
+	if refusals != DefaultMaxConsecutiveOutputLimitCutoffs {
+		t.Errorf("output-limit refusal observations = %d, want %d (one per cut-off turn)", refusals, DefaultMaxConsecutiveOutputLimitCutoffs)
+	}
+}
+
+func TestOutputLimitCutoff_LimitIsConfigurable(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		limit int
+		turns int
+		// wantFatal is true when the scripted streak must end the session.
+		wantFatal bool
+	}{
+		{name: "custom limit of two trips on two", limit: 2, turns: 2, wantFatal: true},
+		{name: "custom limit of two survives one", limit: 2, turns: 1, wantFatal: false},
+		{name: "raised limit survives the default streak", limit: DefaultMaxConsecutiveOutputLimitCutoffs + 2, turns: DefaultMaxConsecutiveOutputLimitCutoffs, wantFatal: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var body string
+			for i := 0; i < tc.turns; i++ {
+				body += cutoffTurn("c-cutoff")
+			}
+			body += event(map[string]any{"type": "agent_settled"})
+
+			_, h, _, err := launchScripted(t, scriptedLaunch{
+				spec:     agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+				preSpawn: handshakeEvent("h1"),
+				body:     getStateResponse("ses_cutoff_cfg") + event(map[string]any{"type": "agent_start"}) + body,
+				configure: func(p *Provider) {
+					p.opts.MaxConsecutiveOutputLimitCutoffs = tc.limit
+				},
+			})
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			evs := drainCutoffSession(t, h)
+
+			failed, completed, _ := cutoffOutcome(evs)
+			if tc.wantFatal {
+				if failed != 1 {
+					t.Errorf("streak of %d with limit %d must end the session: %+v", tc.turns, tc.limit, evs)
+				}
+				if completed != 0 {
+					t.Errorf("session reached a ResultEvent after tripping the cut-off bound: %+v", evs)
+				}
+			} else {
+				if failed != 0 {
+					t.Errorf("streak of %d with limit %d must not end the session: %+v", tc.turns, tc.limit, evs)
+				}
+				if completed != 1 {
+					t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+				}
+			}
+		})
+	}
+}
