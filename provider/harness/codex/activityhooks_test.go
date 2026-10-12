@@ -96,6 +96,25 @@ func TestActivityHookHashMatchesLiveCLI(t *testing.T) {
 	}
 }
 
+// TestActivityHookHashProductShape pins the product wrapper — the exact
+// call the state renderer makes — against the live CLI readback for that
+// shape. The fixture table above pins the normalization algorithm across
+// shapes; this pins the product's own defaults (timeout, sync, no
+// matcher) to the wire. Drift the constant and this goes red while the
+// self-consistency test stays green — which is precisely the failure
+// that would park a seat on the review modal.
+func TestActivityHookHashProductShape(t *testing.T) {
+	t.Parallel()
+	got, err := activityHookHash("session_start", "/bin/sh '/tmp/fake dir/activity-relay.sh' session_start")
+	if err != nil {
+		t.Fatalf("activityHookHash: %v", err)
+	}
+	want := "sha256:261f84607039612fcee9c0fcd86c63d4be845496c5174ed23f507d9715d62c5b"
+	if got != want {
+		t.Fatalf("product hash = %q, want the live CLI readback %q", got, want)
+	}
+}
+
 // decodeActivityConfig parses a rendered hooks fragment as real TOML and
 // returns the hooks table plus the state table, so the test asserts
 // semantics rather than string-matching.

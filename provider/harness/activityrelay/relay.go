@@ -19,9 +19,9 @@ import (
 // on the wire (codex hook_event_name values; claude matches them
 // case-insensitively through the same four moments).
 const (
-	EventSessionStart     = "session_start"
-	EventUserPromptSubmit = "user_prompt_submit"
-	EventStop             = "stop"
+	EventSessionStart      = "session_start"
+	EventUserPromptSubmit  = "user_prompt_submit"
+	EventStop              = "stop"
 	EventPermissionRequest = "permission_request"
 )
 

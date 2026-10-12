@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
 )
 
 // Live transcript usage tail for interactive sessions.
@@ -65,6 +66,10 @@ const (
 // single tailer goroutine owns it.
 type interactiveUsageTailer struct {
 	hook *stopHookChannel
+	// activity is the session's hook-telemetry relay, or nil when the
+	// session runs without it. Swept beside the transcript on every tick
+	// so lifecycle markers share the usage tail's cadence and flush.
+	activity *activityrelay.Tailer
 	// path is the transcript offset belongs to. Clearing the conversation
 	// moves the session to a new transcript; the read restarts at its first
 	// byte rather than at the old file's offset.
@@ -77,6 +82,12 @@ func newInteractiveUsageTailer(hook *stopHookChannel) *interactiveUsageTailer {
 	return &interactiveUsageTailer{hook: hook, seen: make(map[string]struct{})}
 }
 
+// newInteractiveUsageTailerWithActivity is newInteractiveUsageTailer with
+// the session's activity relay attached.
+func newInteractiveUsageTailerWithActivity(hook *stopHookChannel, activity *activityrelay.Tailer) *interactiveUsageTailer {
+	return &interactiveUsageTailer{hook: hook, activity: activity, seen: make(map[string]struct{})}
+}
+
 // run polls until sessionDone closes, emitting newly mapped usage events via
 // emit, then flushes whatever the child wrote on its way out. Every emit
 // must be non-blocking — this goroutine never slows the PTY, and it returns
@@ -85,15 +96,31 @@ func (t *interactiveUsageTailer) run(sessionDone <-chan struct{}, emit func(agen
 	ticker := time.NewTicker(interactiveUsagePollInterval)
 	defer ticker.Stop()
 	for {
-		for _, ev := range t.sweep() {
+		for _, ev := range t.sweepBoth() {
 			emit(ev)
 		}
 		select {
 		case <-sessionDone:
-			t.flush(emit)
+			t.flushBoth(emit)
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// sweepBoth sweeps the activity relay beside the transcript: hook fires
+// become harness-lifecycle events on the same channel as the usage meter.
+func (t *interactiveUsageTailer) sweepBoth() []agent.Event {
+	events := sweepActivityRelay(t.activity)
+	return append(events, t.sweep()...)
+}
+
+// flushBoth flushes trailing transcript writes, then trailing relay
+// lines, so activity the child wrote on its way out is still delivered.
+func (t *interactiveUsageTailer) flushBoth(emit func(agent.Event)) {
+	t.flush(emit)
+	for _, ev := range sweepActivityRelay(t.activity) {
+		emit(ev)
 	}
 }
 

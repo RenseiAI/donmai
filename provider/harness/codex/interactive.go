@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -218,11 +219,19 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	// launch already omits the hooks kill-switch, but with nothing
 	// configured there is nothing for the review to park on.
 	var relay *activityrelay.Relay
+	// closeRelay removes the relay directory exactly once. It runs on
+	// error paths and in the PTY cleanup, which ptycli may invoke from
+	// its own goroutine while this function still reads relay below —
+	// so it must not mutate relay itself. Relay.Close is idempotent
+	// (RemoveAll on a missing path succeeds), and a wrapped handle over
+	// an already-closed relay simply sweeps nothing.
+	var relayClose sync.Once
 	closeRelay := func() {
-		if relay != nil {
-			_ = relay.Close()
-			relay = nil
-		}
+		relayClose.Do(func() {
+			if relay != nil {
+				_ = relay.Close()
+			}
+		})
 	}
 	if installActivityHooks(spec) {
 		if newRelay, relayErr := activityrelay.New(); relayErr != nil {

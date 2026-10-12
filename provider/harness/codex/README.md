@@ -260,6 +260,41 @@ exception because Codex does not expose it on that bridge. Each requested
 server receives only the scoped `default_tools_approval_mode = "approve"` key
 inside the Provider-owned config.
 
+## Activity-hook telemetry (platform seats)
+
+A platform seat (private `CODEX_HOME`, untrusted project, no repository
+authority) additionally installs four observe-only lifecycle hooks —
+`SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `Stop` — that
+append one JSON line per fire to a per-session relay file the harness
+tails into `harness_lifecycle` activity events (see
+`../activityrelay/`). Each hook invokes the shared relay script with its
+moment on argv and prints nothing, so codex treats every fire as an
+abstention and the session proceeds exactly as it would with no hooks
+installed.
+
+The hooks block is appended to the private `config.toml` (`[[hooks.*]]`
+tables, `activityhooks.go`), and the trust the TUI would otherwise stop
+and ask for is pre-seeded beside it under `[hooks.state]`, keyed
+`<config-path>:<event>:<group>:<handler>` with a `trusted_hash` the
+harness computes the same way codex does (sha256 over the canonical JSON
+of the normalized hook identity). The pre-seeded hash equals the current
+hash the CLI computes at startup, so the hooks report `trusted` and no
+review modal appears. Any divergence would mark the hook modified and
+park the seat — the hash fixture test pins the normalization against
+live CLI readbacks to catch that before it ships.
+
+Because the seat's project is untrusted, codex skips project hooks on
+its own; the private home carries no other hooks. The feature therefore
+stays enabled for these seats (the launch omits `features.hooks=false`)
+with nothing unreviewed to run. Repository-authority seats keep the
+feature off entirely — hooks execute outside the sandbox — and so carry
+no telemetry. The `--dangerously-bypass-hook-trust` flag is deliberately
+not used: it prints a warning into every session and waives review for
+all hooks, not just the platform's own.
+
+Verified against codex-cli 0.162.0 (`codex app-server` hooks/list
+readback: four hooks, `trustStatus: trusted`).
+
 ## Approvals (interactive and headless spawn modes)
 
 Getting past the startup reviews is not enough: a *running* session raises

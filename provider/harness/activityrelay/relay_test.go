@@ -18,7 +18,7 @@ func TestRelayScriptAppendsOneLineAndPrintsNothing(t *testing.T) {
 	t.Cleanup(func() { _ = r.Close() })
 
 	payload := `{"session_id":"sess-1","hook_event_name":"SessionStart","source":"startup"}`
-	cmd := exec.Command("/bin/sh", r.ScriptPath(), "session_start")
+	cmd := exec.Command("/bin/sh", r.ScriptPath(), "session_start") //nolint:gosec // test re-executes the relay script the test itself just rendered into its own temp dir
 	cmd.Stdin = strings.NewReader(payload)
 	out, err := cmd.Output()
 	if err != nil {
@@ -65,7 +65,7 @@ func TestRelayScriptExitsZeroWithNoStdin(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Close() })
 
-	cmd := exec.Command("/bin/sh", r.ScriptPath(), "stop")
+	cmd := exec.Command("/bin/sh", r.ScriptPath(), "stop") //nolint:gosec // test re-executes the relay script the test itself just rendered into its own temp dir
 	cmd.Stdin = strings.NewReader("")
 	if out, err := cmd.Output(); err != nil {
 		t.Fatalf("relay script with empty stdin: %v (output %q)", err, out)

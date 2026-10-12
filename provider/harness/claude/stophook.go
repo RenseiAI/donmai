@@ -241,7 +241,7 @@ func (c *stopHookChannel) settingsJSONWithPinAndActivity(pin map[string]string, 
 		// harness already passes (additive, beside hooks), so no extra
 		// flag or file is introduced.
 		"skipDangerousModePermissionPrompt": true,
-		"hooks": hooks,
+		"hooks":                             hooks,
 	}
 	if len(env) > 0 {
 		settings["env"] = env

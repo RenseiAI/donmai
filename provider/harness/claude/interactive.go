@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
@@ -212,38 +211,14 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel, activity *ac
 	// Transcript usage tail: while the session runs, its JSONL transcript is
 	// tailed and each new assistant message.usage is forwarded as the same
 	// LlmCallEvent the headless lane emits, so an interactive session's
-	// spend reaches the session activity stream. The same goroutine sweeps
-	// the activity relay beside it: hook fires become harness-lifecycle
-	// events on the same channel. Best-effort and rate-limited (see
-	// interactive_usage.go). Both stop when the PTY child has exited and
-	// drained, after one final flush of trailing writes.
+	// spend reaches the session activity stream. Best-effort and
+	// rate-limited (see interactive_usage.go). It stops when the PTY child
+	// has exited and drained, after one final flush of trailing writes.
 	go func() {
 		defer wg.Done()
 		defer close(w.activityFlushed)
-		tailer := newInteractiveUsageTailer(hook)
-		sweepBoth := func() {
-			for _, ev := range sweepActivityRelay(activity) {
-				emit(ev)
-			}
-			for _, ev := range tailer.sweep() {
-				emit(ev)
-			}
-		}
-		flushBoth := func() {
-			tailer.flush(emit)
-			sweepBoth()
-		}
-		ticker := time.NewTicker(interactiveUsagePollInterval)
-		defer ticker.Stop()
-		for {
-			sweepBoth()
-			select {
-			case <-session.Done():
-				flushBoth()
-				return
-			case <-ticker.C:
-			}
-		}
+		tailer := newInteractiveUsageTailerWithActivity(hook, activity)
+		tailer.run(session.Done(), emit)
 	}()
 	go func() {
 		wg.Wait()
