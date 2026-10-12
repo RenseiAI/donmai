@@ -175,6 +175,14 @@ func (p *Provider) Complete(ctx context.Context, req agent.OneShotRequest) (agen
 // <tools...>`); keeping it in final position means its empty-string value can
 // never swallow a following flag, whatever the CLI's parser does with an empty
 // variadic.
+//
+// --settings carries ONLY the routing pin (see pinnedRoutingEnv), stated on
+// the layer the CLI resolves above the process environment and above repo
+// settings files — the same guard the agent lanes carry (see buildArgs),
+// because this lane runs with the worktree's repo config in scope. Absent
+// when the request carries no routing of its own, so host-login completions
+// keep their exact argv. It precedes the variadic --tools for the same
+// swallowing reason.
 func buildOneShotArgs(req agent.OneShotRequest) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
@@ -182,6 +190,14 @@ func buildOneShotArgs(req agent.OneShotRequest) (argv []string, stdinPrompt stri
 		"--max-turns", strconv.Itoa(1),
 		"--strict-mcp-config",
 		"--no-session-persistence",
+	}
+	if pin := pinnedRoutingEnv(agent.Spec{Env: oneShotEnv(req)}); len(pin) > 0 {
+		if pinJSON, err := marshalRoutingPin(pin); err == nil && pinJSON != "" {
+			argv = append(argv, "--settings", pinJSON)
+		}
+		// A pin that cannot be marshalled still runs: the process
+		// environment the pin mirrors remains, and failing the completion
+		// would lie about what happened.
 	}
 	if req.System != "" {
 		argv = append(argv, "--system-prompt", req.System)

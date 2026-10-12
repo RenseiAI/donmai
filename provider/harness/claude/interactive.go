@@ -41,8 +41,10 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// unattended path. Seed exactly the platform-authorized boundary
 	// (the session cwd plus its declared mutable paths, resolved) before
 	// the child starts. Best-effort: a seed that cannot be written still
-	// spawns, and the modal — not a spawn failure — says so.
-	seedWorkspaceTrust(spec)
+	// spawns, and the modal — not a spawn failure — says so. The seed record
+	// is kept so the session-end cleanup removes exactly these entries and
+	// leaves pre-existing trust untouched (see removeSeededTrust).
+	seed := seedWorkspaceTrust(spec)
 
 	// The Stop-hook notice channel is BEST EFFORT at spawn time and load-
 	// bearing at delivery time. A drop directory that cannot be created is a
@@ -55,15 +57,47 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	hook, hookErr := newStopHookChannel()
 	settings := ""
 	if hookErr == nil {
-		if settings, err = hook.settingsJSON(); err != nil {
+		// The routing pin rides this same --settings string (see
+		// pinnedRoutingEnv): the CLI resolves that layer above the process
+		// environment and above repo settings files, so the session bearer
+		// goes where the resolved binding says no matter what repo-local
+		// harness config names.
+		//
+		// Only the declarative routing destinations are pinned here. Repo
+		// config that runs code (hooks, apiKeyHelper and other helpers,
+		// stdio MCP servers, the agent's own tools) still runs with the
+		// session environment once the repo path is trusted, exactly as on
+		// the headless lane — that execution surface is the accepted model
+		// for a trusted repo, not something the pin closes.
+		if settings, err = hook.settingsJSONWithPin(pinnedRoutingEnv(spec)); err != nil {
+			// Fail closed: the Stop-hook channel is best-effort, but the
+			// routing pin is not. A session that spawned without the pin
+			// would let a repo-local settings file redirect its bearer,
+			// so fall back to a pin-only --settings rather than none.
 			_ = hook.close()
-			hook, settings = nil, ""
+			hook = nil
+			if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
+				settings = pinOnly
+			} else {
+				settings = ""
+			}
 		}
 	} else {
 		hook = nil
+		// Fail closed without the hook channel too: carry the pin alone
+		// rather than spawning unpinned.
+		if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
+			settings = pinOnly
+		}
 	}
 
 	cleanup := func() error {
+		// Remove the trust entries this session seeded, first: the record
+		// is still present at cleanup time, and leaving the seed behind
+		// would trust the worktree for every later session on the host.
+		// Best-effort and silent — cleanup never fails a session that
+		// already ran.
+		removeSeededTrust(seed)
 		// Pin the transcript path BEFORE the drop is removed: the terminal
 		// event fires after this cleanup, and the exit usage accounting
 		// reads the transcript file through the pinned path.
