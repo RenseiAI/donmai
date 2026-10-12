@@ -3,10 +3,12 @@ package codex
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
 )
 
@@ -209,6 +211,76 @@ func TestActivityHookStateTrustsExactlyWhatRuns(t *testing.T) {
 		if trusted != recomputed {
 			t.Fatalf("%s trusted_hash = %q, recomputed from the rendered command = %q", event, trusted, recomputed)
 		}
+	}
+}
+
+func TestInstallActivityHooksGating(t *testing.T) {
+	t.Parallel()
+	platform := []agent.MCPServerConfig{{Name: "seat-platform", Type: "http", URL: "https://platform.example/api/mcp/session"}}
+	tests := []struct {
+		name string
+		spec agent.Spec
+		want bool
+	}{
+		{
+			name: "platform seat without repository authority installs",
+			spec: agent.Spec{Cwd: t.TempDir(), MCPServers: platform},
+			want: true,
+		},
+		{
+			name: "platform seat with repository authority keeps hooks off",
+			spec: agent.Spec{Cwd: t.TempDir(), MCPServers: platform, RepositoryAuthority: &agent.RepositoryAuthorityPolicy{
+				MutablePaths: []string{t.TempDir()},
+			}},
+		},
+		{
+			name: "standalone seat keeps ambient posture",
+			spec: agent.Spec{Cwd: t.TempDir()},
+		},
+		{
+			name: "non-platform MCP seat keeps ambient posture",
+			spec: agent.Spec{Cwd: t.TempDir(), MCPServers: []agent.MCPServerConfig{{Name: "tools", Type: "stdio", Command: "/bin/true"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := installActivityHooks(tt.spec); got != tt.want {
+				t.Fatalf("installActivityHooks = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildInteractiveLaunch_ActivitySeatKeepsHooksFeature(t *testing.T) {
+	t.Parallel()
+	platform := []agent.MCPServerConfig{{Name: "seat-platform", Type: "http", URL: "https://platform.example/api/mcp/session"}}
+	launch, err := buildInteractiveLaunchEnv(agent.Spec{
+		Cwd:        t.TempDir(),
+		MCPServers: platform,
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(launch.argv, "features.hooks=false") {
+		t.Fatalf("activity seat still carries the hooks kill-switch: %q", launch.argv)
+	}
+	trust := decodeTrustOverride(t, launch.argv)
+	if len(trust) == 0 {
+		t.Fatalf("activity seat carries no workspace trust: %q", launch.argv)
+	}
+	for dir, level := range trust {
+		if level != codexTrustLevelUntrusted {
+			t.Fatalf("activity seat trusts %q as %q, want the untrusted platform posture", dir, level)
+		}
+	}
+
+	plain, err := buildInteractiveLaunchEnv(agent.Spec{Cwd: t.TempDir()}, func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(plain.argv, "features.hooks=false") {
+		t.Fatalf("standalone launch lost the hooks kill-switch: %q", plain.argv)
 	}
 }
 

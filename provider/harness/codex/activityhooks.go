@@ -9,8 +9,12 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
+	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 )
 
 // Activity-hook telemetry for platform seats.
@@ -236,6 +240,90 @@ func normalizeHookJSONValue(v any) (any, error) {
 		return nil, fmt.Errorf("codex: unsupported hook identity value %T", v)
 	}
 }
+
+// installActivityHooks reports whether this seat carries hook telemetry:
+// a platform session (private home, untrusted project, so project hooks
+// stay unloaded on their own) without repository authority (hooks execute
+// outside the sandbox, so authority seats keep the feature off). Every
+// other seat keeps today's posture exactly.
+func installActivityHooks(spec agent.Spec) bool {
+	return hasPlatformSessionMCPAuthority(spec.MCPServers) && spec.RepositoryAuthority == nil
+}
+
+// activityHandleEvents sizes the wrapped handle's event channel: the
+// coarse Init/Result contract always fits, and relay sweeps drop (never
+// queue) once the remainder is taken.
+const (
+	activityCoarseEventSlots = 2
+	activityRelayEventSlots  = 64
+)
+
+// activityHandle wraps an interactive PTY handle with the activity-relay
+// tail. Hook fires become harness-lifecycle events on Events beside the
+// coarse Init/Result contract; the terminal ResultEvent passes through
+// untouched. Embedding the concrete PTY handle keeps the
+// InteractiveCapable surface (and every other handle behaviour)
+// byte-identical; only Events is overridden. Every helper goroutine
+// returns at session end whether or not the caller drains Events.
+type activityHandle struct {
+	*ptycli.Handle
+	events chan agent.Event
+}
+
+var _ agent.InteractiveCapable = (*activityHandle)(nil)
+
+func wrapActivityHandle(h *ptycli.Handle, relay *activityrelay.Relay) *activityHandle {
+	w := &activityHandle{
+		Handle: h,
+		events: make(chan agent.Event, activityCoarseEventSlots+activityRelayEventSlots),
+	}
+	tailer := activityrelay.NewTailer(relay.EventsPath())
+	emit := func(ev agent.Event) {
+		if len(w.events) >= cap(w.events)-activityCoarseEventSlots {
+			return
+		}
+		select {
+		case w.events <- ev:
+		default:
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(activityrelay.RelayPollInterval)
+		defer ticker.Stop()
+		for {
+			for _, ev := range tailer.Sweep(activityrelay.MaxLinesPerSweep, activityrelay.MaxEventsPerSweep) {
+				emit(ev)
+			}
+			select {
+			case event, ok := <-h.Events():
+				if !ok {
+					for _, ev := range tailer.Sweep(activityrelay.MaxLinesPerSweep, activityrelay.MaxEventsPerSweep) {
+						emit(ev)
+					}
+					return
+				}
+				// Coarse sends always fit the reserved slots: at most
+				// activityCoarseEventSlots cross this handle's life,
+				// and relay sweeps above never take them. The send
+				// blocks rather than dropping the terminal contract.
+				w.events <- event
+			case <-ticker.C:
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(w.events)
+	}()
+	return w
+}
+
+// Events overrides the embedded handle's channel with the coarse
+// contract plus relayed harness-lifecycle events.
+func (h *activityHandle) Events() <-chan agent.Event { return h.events }
 
 // appendActivityHooks installs the activity hooks block and its trust
 // state into the boundary's private config.toml. It validates the

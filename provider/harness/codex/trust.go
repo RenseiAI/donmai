@@ -144,17 +144,21 @@ func codexHooksPolicy(getenv func(string) string) (string, error) {
 // sit on it forever — so the session is refused with a message that names the
 // missing trust instead.
 func interactiveTrustArgs(cwd string, hooksPolicy string, getwd func() (string, error)) ([]string, error) {
-	return interactiveTrustArgsWithLevel(cwd, hooksPolicy, codexTrustLevelTrusted, getwd)
+	return interactiveTrustArgsWithLevel(cwd, hooksPolicy, codexTrustLevelTrusted, false, getwd)
 }
 
-func interactiveTrustArgsWithLevel(cwd, hooksPolicy, trustLevel string, getwd func() (string, error)) ([]string, error) {
+func interactiveTrustArgsWithLevel(cwd, hooksPolicy, trustLevel string, activityHooks bool, getwd func() (string, error)) ([]string, error) {
 	dirs, err := sessionWorkspaceTrustDirs(cwd, getwd)
 	if err != nil {
 		return nil, err
 	}
 
 	args := []string{"--config", projectsTrustOverride(dirs, trustLevel)}
-	if hooksPolicy == codexHooksOff {
+	// Activity-hook seats keep the hooks feature enabled for the
+	// platform's own pre-trusted hooks (see activityhooks.go): no other
+	// hooks exist in the private home, and the untrusted project layer
+	// stays unloaded on its own. Every other seat keeps the feature off.
+	if hooksPolicy == codexHooksOff && !activityHooks {
 		// Disables codex's hooks feature for this process only. Expressed as a
 		// dotted config path rather than the `--disable <feature>` flag on
 		// purpose: an unknown feature NAME is fatal to that flag ("Error:
