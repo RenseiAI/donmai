@@ -64,9 +64,9 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// context watcher (runner/context_usage.go) and delivered
 			// as a typed ContextUsageEvent.
 			ContextUsageSource: agent.ContextUsageSourceRolloutTokenCount,
-			Drives:         []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},
-			DrivesHosts:    []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},
-			Transport:      agent.TransportSubprocessRPC,
+			Drives:             []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},
+			DrivesHosts:        []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},
+			Transport:          agent.TransportSubprocessRPC,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{
 			{

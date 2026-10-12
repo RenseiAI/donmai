@@ -9,7 +9,6 @@ import (
 
 func floatPtr(f float64) *float64 { return &f }
 func intPtr(n int64) *int64       { return &n }
-func boolPtr(b bool) *bool        { return &b }
 
 // Fixture: a statusline sidecar JSON document in the shape the Claude
 // harness reports — context-window observation beside session token
@@ -252,7 +251,7 @@ func TestContextUsageEvent_RoundTripsThroughEventCodec(t *testing.T) {
 	t.Parallel()
 	original := agent.ContextUsageEvent{
 		Harness: "codex", Source: agent.ContextUsageSourceRolloutTokenCount,
-		NoticeKind: agent.ContextUsageCompaction,
+		NoticeKind:  agent.ContextUsageCompaction,
 		UsedPercent: floatPtr(88), InputTokens: intPtr(176000),
 	}
 	raw, err := agent.MarshalEvent(original)

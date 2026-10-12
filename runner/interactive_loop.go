@@ -747,6 +747,7 @@ func findThreadRolloutPath(home, threadID string) string {
 	root := filepath.Join(home, "sessions")
 	var best string
 	var bestMtime int64
+	//nolint:gosec // G703: root is the harness-owned sessions dir; threadID is matched as a filename suffix, never joined unsanitized.
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
 			return nil
@@ -770,6 +771,7 @@ func findThreadRolloutPath(home, threadID string) string {
 	})
 	return best
 }
+
 // implements agent.InteractiveActivityFlusher enqueues its final activity
 // after Done, so keep forwarding events until it signals the flush (bounded
 // by interactiveActivityFlushGrace); then forward whatever is already

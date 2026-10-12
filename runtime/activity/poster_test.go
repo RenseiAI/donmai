@@ -1153,7 +1153,7 @@ func TestContextUsageNoticePostsContextWithoutZeroFill(t *testing.T) {
 
 	p.Send(context.Background(), agent.ContextUsageEvent{
 		Harness: "claude-code", Source: agent.ContextUsageSourceStatuslineSidecar,
-		NoticeKind: agent.ContextUsageThreshold,
+		NoticeKind:  agent.ContextUsageThreshold,
 		UsedPercent: &used, InputTokens: &in,
 		// OutputTokens + ContextWindowSize unknown: absent, never zero.
 	})

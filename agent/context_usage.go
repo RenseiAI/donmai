@@ -45,6 +45,7 @@ const (
 	ContextUsageSourceStatuslineSidecar = "statusline-sidecar"
 	// ContextUsageSourceRolloutTokenCount is a token_count event in the
 	// Codex rollout JSONL.
+	//nolint:gosec // G101: source identifier containing "token", not a credential.
 	ContextUsageSourceRolloutTokenCount = "rollout-token-count"
 	// ContextUsageSourceRPCUsage is the pi RPC usage object, when the
 	// session's RPC stream carries one.
@@ -110,18 +111,6 @@ func (e ContextUsageEvent) HasMeasurements() bool {
 		e.OutputTokens != nil || e.ContextWindowSize != nil
 }
 
-// claudeSidecarJSON is the statusline sidecar shape the Claude harness
-// reports: the context-window observation beside the session's token
-// totals. Every field is optional — the sidecar reports what it knows,
-// and absent fields stay unknown (nil), never zero.
-type claudeSidecarJSON struct {
-	UsedPercentage   *float64 `json:"used_percentage"`
-	TotalInputTokens *int64   `json:"total_input_tokens"`
-	TotalOutputTokens *int64  `json:"total_output_tokens"`
-	ContextWindowSize *int64  `json:"context_window_size"`
-	Compacted         *bool   `json:"compacted"`
-}
-
 // ParseClaudeSidecarNotice reads one statusline sidecar JSON document and
 // returns the typed context notice it carries. Harness and source are
 // stamped by the caller (the harness identity is runner-owned, not parsed
@@ -148,10 +137,10 @@ func ParseClaudeSidecarNotice(raw []byte, harness string) (*ContextUsageEvent, e
 		return nil, fmt.Errorf("agent: decode statusline sidecar: %w", err)
 	}
 	out := &ContextUsageEvent{
-		Harness: harness,
-		Source:  ContextUsageSourceStatuslineSidecar,
+		Harness:    harness,
+		Source:     ContextUsageSourceStatuslineSidecar,
 		NoticeKind: ContextUsageThreshold,
-		Raw:     string(raw),
+		Raw:        string(raw),
 	}
 	if doc.UsedPercentage != nil {
 		f, err := doc.UsedPercentage.Float64()
@@ -218,13 +207,13 @@ func sidecarInt64(n json.Number, field string) (int64, error) {
 type codexTokenCountLine struct {
 	Type    string `json:"type"`
 	Payload *struct {
-		ThreadID          string  `json:"thread_id"`
-		TotalInputTokens  *int64  `json:"total_input_tokens"`
-		TotalOutputTokens *int64  `json:"total_output_tokens"`
-		ContextWindowSize *int64  `json:"context_window_size"`
+		ThreadID          string   `json:"thread_id"`
+		TotalInputTokens  *int64   `json:"total_input_tokens"`
+		TotalOutputTokens *int64   `json:"total_output_tokens"`
+		ContextWindowSize *int64   `json:"context_window_size"`
 		UsedPercentage    *float64 `json:"used_percentage"`
-		Compacted         *bool   `json:"compacted"`
-		TokenCount        *int64  `json:"token_count"`
+		Compacted         *bool    `json:"compacted"`
+		TokenCount        *int64   `json:"token_count"`
 	} `json:"payload"`
 }
 
@@ -244,10 +233,10 @@ func ParseCodexTokenCountNotice(line []byte, harness string) (*ContextUsageEvent
 	}
 	p := decoded.Payload
 	out := &ContextUsageEvent{
-		Harness: harness,
-		Source:  ContextUsageSourceRolloutTokenCount,
+		Harness:    harness,
+		Source:     ContextUsageSourceRolloutTokenCount,
 		NoticeKind: ContextUsageThreshold,
-		Raw:     string(line),
+		Raw:        string(line),
 	}
 	if p.UsedPercentage != nil {
 		f := *p.UsedPercentage
@@ -316,8 +305,8 @@ func ParsePiRPCUsageNotice(usage *PiRPCUsage, harness string) (*ContextUsageEven
 		return nil, nil
 	}
 	out := &ContextUsageEvent{
-		Harness: harness,
-		Source:  ContextUsageSourceRPCUsage,
+		Harness:    harness,
+		Source:     ContextUsageSourceRPCUsage,
 		NoticeKind: ContextUsageThreshold,
 	}
 	if usage.UsedPercentage != nil {

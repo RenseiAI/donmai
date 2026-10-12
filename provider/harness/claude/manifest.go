@@ -85,7 +85,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// runner's context watcher (runner/context_usage.go) and
 			// delivered as a typed ContextUsageEvent.
 			ContextUsageSource: agent.ContextUsageSourceStatuslineSidecar,
-			Drives:         []agent.WireProtocol{agent.ProtoAnthropicMessages},
+			Drives:             []agent.WireProtocol{agent.ProtoAnthropicMessages},
 			DrivesHosts: []agent.ServingHost{
 				agent.HostOAuthCLI, agent.HostDirect, agent.HostBedrock, agent.HostVertex,
 			},

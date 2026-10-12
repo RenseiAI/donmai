@@ -438,7 +438,7 @@ func TestNormalizeContextUsageNoticeMapsToUsageRecorded(t *testing.T) {
 	used, in, window := 62.5, int64(125000), int64(200000)
 	r, emitted, err := NormalizeEvent("session_1", 1, time.Now(), agent.ContextUsageEvent{
 		Harness: "claude-code", Source: agent.ContextUsageSourceStatuslineSidecar,
-		NoticeKind: agent.ContextUsageCompaction,
+		NoticeKind:  agent.ContextUsageCompaction,
 		UsedPercent: &used, InputTokens: &in, ContextWindowSize: &window,
 		// OutputTokens unknown: stays absent, never zero.
 	})
