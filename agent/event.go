@@ -242,6 +242,13 @@ type LlmCallEvent struct {
 	// Synthetic usage, tool results and text output never set it.
 	TurnCompleted bool `json:"turnCompleted,omitempty"`
 
+	// Attempts counts the serving attempts behind this call: 1 plus the
+	// harness's auto-retries since the turn's last boundary. Zero means
+	// the harness did not report (unknown) — never "zero attempts" —
+	// so consumers sum only positive values and omit an all-unknown
+	// session total.
+	Attempts int `json:"attempts,omitempty"`
+
 	// StartTimeUnixNano and EndTimeUnixNano use decimal strings so JSON
 	// consumers do not lose fixed64 precision. Empty values are stamped by the
 	// runner at the nearest observable call boundary.

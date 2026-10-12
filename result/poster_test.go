@@ -1464,3 +1464,66 @@ func TestPosterPost_StatusUpstreamErrorSerialized(t *testing.T) {
 		})
 	}
 }
+
+// TestPosterPost_StatusServingReportSerialized asserts the observed serving
+// report on the /status body: finalProvider/finalModel/providerAttempts ride
+// the wire when the runner observed them and are omitted entirely when
+// empty/zero (backward-compatible additive fields — old platforms ignore
+// them). A zero attempt total reads as "no call reported" (unknown), never
+// as a count, so it is omitted like any other absent observation.
+func TestPosterPost_StatusServingReportSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		provider string
+		model    string
+		attempts int
+		want     map[string]any // nil value = field absent
+	}{
+		{
+			name:     "gateway turn with retries",
+			provider: "donmai", model: "served-model-id", attempts: 4,
+			want: map[string]any{"finalProvider": "donmai", "finalModel": "served-model-id", "providerAttempts": float64(4)},
+		},
+		{
+			name:     "direct turn, single attempt",
+			provider: "anthropic", model: "requested-alias", attempts: 1,
+			want: map[string]any{"finalProvider": "anthropic", "finalModel": "requested-alias", "providerAttempts": float64(1)},
+		},
+		{
+			name: "nothing observed omitted",
+			want: map[string]any{"finalProvider": nil, "finalModel": nil, "providerAttempts": nil},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.FinalProvider = tc.provider
+			r.FinalModel = tc.model
+			r.ProviderAttempts = tc.attempts
+			if err := p.Post(context.Background(), "sess-serving", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v", err)
+			}
+			for key, want := range tc.want {
+				if got := body[key]; got != want {
+					t.Errorf("%s = %v, want %v", key, got, want)
+				}
+			}
+		})
+	}
+}

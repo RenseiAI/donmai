@@ -1669,3 +1669,79 @@ func TestLoop_SpawnsOnHarnessDeclaringNoMCPDelivery(t *testing.T) {
 			res.Status, res.FailureMode, res.Error)
 	}
 }
+
+// TestObserveEvent_LlmCallServingReport pins the per-call serving report:
+// a native model call records its serving provider (System), its served
+// model (ResponseModel, else Model) and its attempts onto the observation,
+// mirrors them onto the session record, and folds them onto the terminal
+// envelope. Synthetic aggregate fallbacks carry no serving identity and
+// never clobber a native report; an unreported (zero) attempt count adds
+// nothing, so an all-unknown stream totals zero (unknown).
+func TestObserveEvent_LlmCallServingReport(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	wt := t.TempDir()
+	obs := &streamObservation{}
+
+	native := func(system, model, responseModel string, attempts int) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			System: system, Model: model, ResponseModel: responseModel,
+			InputTokens: 5, OutputTokens: 3,
+			UsageSource: agent.LlmUsageProvider, TurnCompleted: true, Attempts: attempts,
+		}
+	}
+	h.runner.observeEvent(native("donmai", "requested-model", "served-model-id", 3), obs, wt, QueuedWork{})
+	if obs.finalProvider != "donmai" || obs.finalModel != "served-model-id" || obs.providerAttempts != 3 {
+		t.Fatalf("obs = %+v; want finalProvider donmai, finalModel served-model-id, providerAttempts 3", obs)
+	}
+
+	// A later direct-lane call replaces the earlier fact (last wins); a
+	// call without a served id falls back to the requested id.
+	h.runner.observeEvent(native("anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{})
+	if obs.finalProvider != "anthropic" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
+		t.Fatalf("obs = %+v; want anthropic/requested-alias/4 after the second call", obs)
+	}
+
+	// A synthetic aggregate fallback (the span processor's terminal-cost
+	// synthesis when a harness exposed only rolled-up usage) changes
+	// nothing: no serving identity, no attempts.
+	h.runner.observeEvent(agent.LlmCallEvent{
+		System: "anthropic", Model: "requested-alias",
+		InputTokens: 100, UsageSource: agent.LlmUsageAggregate, Synthetic: true,
+	}, obs, wt, QueuedWork{})
+	if obs.finalProvider != "anthropic" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
+		t.Fatalf("obs = %+v; want the synthetic fallback to leave the report untouched", obs)
+	}
+
+	// An empty serving identity never clobbers a recorded one, and an
+	// unreported attempt count adds nothing.
+	h.runner.observeEvent(agent.LlmCallEvent{
+		InputTokens: 1, UsageSource: agent.LlmUsageProvider, TurnCompleted: true,
+	}, obs, wt, QueuedWork{})
+	if obs.finalProvider != "anthropic" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
+		t.Fatalf("obs = %+v; want an empty call to leave the report untouched", obs)
+	}
+
+	res := &Result{}
+	obs.applyTo(res, agent.ProviderStub)
+	if res.FinalProvider != "anthropic" || res.FinalModel != "requested-alias" {
+		t.Errorf("envelope serving report = %q/%q; want anthropic/requested-alias (last wins)",
+			res.FinalProvider, res.FinalModel)
+	}
+	if res.ProviderAttempts != 0 {
+		t.Errorf("res.ProviderAttempts = %d; want 0 (attempt totals ride the per-stream accumulation, not applyTo)", res.ProviderAttempts)
+	}
+
+	// The session record mirrors the observed report next to the admitted
+	// binding axes, which stay as dispatched (empty here).
+	st, err := h.runner.store.Read(wt)
+	if err != nil {
+		t.Fatalf("store.Read: %v", err)
+	}
+	if st.FinalProvider != "anthropic" || st.FinalModel != "requested-alias" || st.ProviderAttempts != 4 {
+		t.Errorf("state serving report = %+v; want anthropic/requested-alias/4", st)
+	}
+	if st.ModelProvider != "" || st.ModelAuthor != "" || st.EndpointOperator != "" || st.Protocol != "" {
+		t.Errorf("admitted axes mutated by the serving mirror: %+v", st)
+	}
+}
