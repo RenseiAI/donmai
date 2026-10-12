@@ -661,7 +661,7 @@ const interactiveActivityFlushGrace = 5 * time.Second
 // carry it. A nil usage leaves the total untouched, so callers that only
 // forward (and never report) may pass nil.
 func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath string, sink activitySink, event agent.Event, usage *interactiveUsageTotals) {
-	if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
+	if system, ok := event.(agent.SystemEvent); ok && (system.Subtype == "harness_state_lost" || system.Subtype == agent.SystemSubtypeHarnessLifecycle) {
 		r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
 		return
 	}

@@ -51,6 +51,34 @@ The subprocess runs in its own process group (`Setpgid=true`) so
 once — necessary because `claude` may fork shell helpers and stdio
 MCP children that inherit stdout.
 
+## Activity-hook telemetry (interactive seats)
+
+An interactive seat additionally declares four observe-only lifecycle
+hooks — `SessionStart`, `UserPromptSubmit`, `Stop`, `PermissionRequest`
+— in the per-launch `--settings` JSON string (`activityhooks.go`),
+beside the notice channel's `Stop` entry and the routing pin. Each hook
+invokes the shared relay script (`../activityrelay/`) with its moment
+on argv, appends one JSON line to the session's relay file, and prints
+nothing, so the CLI treats every fire as an abstention and the session
+proceeds exactly as it would with no hooks installed. The harness tails
+the relay file into `harness_lifecycle` activity events on the handle's
+Events channel.
+
+Delivery is per launch, never by writing the user's settings: the
+`--settings` string is additive over the operator's own configuration,
+and the relay lives in a temp dir outside the worktree, so the agent
+can neither read its own telemetry nor commit the hook definition. The
+headless lane carries no hooks — its argv is byte-identical to before
+telemetry existed. `PermissionRequest` fires only in sessions that
+actually raise permission prompts; bypass-permission seats never
+request, so they never emit it.
+
+Verified against claude 2.1.296 (`--settings` hooks accepted per
+launch; `SessionStart` observed firing from the stream-json session
+start; unknown event names silently ignored, so a harness version
+without one of these moments loses that telemetry line rather than
+failing the spawn).
+
 ## v0.5.0 capability matrix
 
 | Capability | v0.5.0 | Notes |

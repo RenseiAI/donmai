@@ -14,10 +14,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/runtime/mcp"
 )
@@ -211,8 +213,41 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			config.remove(),
 		)
 	}
+	// Activity-hook telemetry installs after the MCP inventory readback
+	// so the fixture seam above observes the same private config as
+	// before. A relay or append failure degrades to no telemetry — the
+	// launch already omits the hooks kill-switch, but with nothing
+	// configured there is nothing for the review to park on.
+	var relay *activityrelay.Relay
+	// closeRelay removes the relay directory exactly once. It runs on
+	// error paths and in the PTY cleanup, which ptycli may invoke from
+	// its own goroutine while this function still reads relay below —
+	// so it must not mutate relay itself. Relay.Close is idempotent
+	// (RemoveAll on a missing path succeeds), and a wrapped handle over
+	// an already-closed relay simply sweeps nothing.
+	var relayClose sync.Once
+	closeRelay := func() {
+		relayClose.Do(func() {
+			if relay != nil {
+				_ = relay.Close()
+			}
+		})
+	}
+	if installActivityHooks(spec) {
+		if newRelay, relayErr := activityrelay.New(); relayErr != nil {
+			slog.Warn("codex: activity relay unavailable; continuing without hook telemetry",
+				"session", spec.SessionName, "err", relayErr)
+		} else if appendErr := config.appendActivityHooks(newRelay); appendErr != nil {
+			slog.Warn("codex: activity hooks not installed; continuing without hook telemetry",
+				"session", spec.SessionName, "err", appendErr)
+			_ = newRelay.Close()
+		} else {
+			relay = newRelay
+		}
+	}
 	if opts.interactiveBeforePTYSpawn != nil {
 		if err := opts.interactiveBeforePTYSpawn(ctx, bin, spec, launch, config.home); err != nil {
+			closeRelay()
 			return nil, errors.Join(
 				fmt.Errorf("%w: interactive pre-PTY fixture: %w", agent.ErrSpawnFailed, err),
 				config.remove(),
@@ -222,6 +257,7 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	if spec.SessionName != "" {
 		server, err := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, config.home)
 		if err != nil {
+			closeRelay()
 			return nil, errors.Join(
 				fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, err),
 				config.remove(),
@@ -230,20 +266,42 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		if attachToExistingNamedSession(spec) {
 			recordResumeKey(config.home, spec.SessionName)
 		}
-		cleanup := func() error { return errors.Join(server.close(), config.remove()) }
-		return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
+		cleanup := func() error {
+			closeRelay()
+			return errors.Join(server.close(), config.remove())
+		}
+		handle, err := spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
+		if err != nil {
+			closeRelay()
+			return nil, err
+		}
+		if relay != nil {
+			return wrapActivityHandle(handle, relay), nil
+		}
+		return handle, nil
 	}
-	return ptycli.SpawnWithOptions(
+	handle, err := ptycli.SpawnWithOptions(
 		ctx,
 		bin,
 		launch.argv,
 		spec,
 		(&Provider{}).Manifest(),
 		ptycli.SpawnOptions{
-			Cleanup:      config.remove,
+			Cleanup: func() error {
+				closeRelay()
+				return config.remove()
+			},
 			TerminalCost: interactiveTerminalCost(config.home, nil),
 		},
 	)
+	if err != nil {
+		closeRelay()
+		return nil, err
+	}
+	if relay != nil {
+		return wrapActivityHandle(handle, relay), nil
+	}
+	return handle, nil
 }
 
 // interactiveTerminalCost returns the TerminalCost closure for one
@@ -285,7 +343,7 @@ func spawnNamedInteractivePTY(
 	launch interactiveLaunch,
 	server *namedInteractiveAppServer,
 	cleanup func() error,
-) (agent.Handle, error) {
+) (*ptycli.Handle, error) {
 	launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
 	home := spec.Env["CODEX_HOME"]
 	var currentThreadID atomic.Value
@@ -484,7 +542,7 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 		// modal. The fleet upgrades the binary out of band.
 		args = append(args, "--config", "check_for_update_on_startup=false")
 	}
-	trustArgs, err := interactiveTrustArgsWithLevel(spec.Cwd, hooks, trustLevel, os.Getwd)
+	trustArgs, err := interactiveTrustArgsWithLevel(spec.Cwd, hooks, trustLevel, installActivityHooks(spec), os.Getwd)
 	if err != nil {
 		return interactiveLaunch{}, err
 	}
