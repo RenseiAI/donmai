@@ -341,7 +341,9 @@ func TestHandle_InjectWithoutTurnFails(t *testing.T) {
 // foregrounded: it must send turn/steer carrying the expectedTurnId
 // race guard plus the injected text.
 func TestHandle_InjectSteersRunningTurn(t *testing.T) {
-	p, fh := newTestProvider(t, "single-turn")
+	// "steer" holds the turn open until turn/steer arrives; a turn that
+	// completes on its own races the steer against handle teardown.
+	p, fh := newTestProvider(t, "steer")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

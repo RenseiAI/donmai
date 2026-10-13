@@ -25,6 +25,8 @@ type fakeHost struct {
 	params     []map[string]any
 	decided    chan struct{}
 	decideOnce sync.Once
+	steered    chan struct{}
+	steerOnce  sync.Once
 
 	// script selects the event sequence emitted after turn/start.
 	script string
@@ -39,19 +41,22 @@ type fakeHost struct {
 func newFakeHost() (*fakeHost, *io.PipeWriter, *io.PipeReader) {
 	stdinReader, stdinWriter := io.Pipe()
 	stdoutReader, stdoutWriter := io.Pipe()
-	fh := &fakeHost{stdin: stdinReader, stdout: stdoutWriter, sessionID: "11111111-1111-7111-8111-111111111111", decided: make(chan struct{})}
+	fh := &fakeHost{stdin: stdinReader, stdout: stdoutWriter, sessionID: "11111111-1111-7111-8111-111111111111", decided: make(chan struct{}), steered: make(chan struct{})}
 	return fh, stdinWriter, stdoutReader
 }
 
+// write sends one JSONL message to the handle. It runs on the host's
+// goroutines, never the test goroutine, so it must not FailNow; a write
+// after the handle tore its pipes down is expected at teardown and is
+// dropped.
 func (fh *fakeHost) write(t *testing.T, body any) {
 	t.Helper()
 	buf, err := json.Marshal(body)
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Errorf("marshal: %v", err)
+		return
 	}
-	if _, err := fh.stdout.Write(append(buf, '\n')); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	_, _ = fh.stdout.Write(append(buf, '\n'))
 }
 
 func (fh *fakeHost) close() {
@@ -158,6 +163,7 @@ func (fh *fakeHost) run(t *testing.T) {
 			fh.replyOK(t, idRaw)
 		case method == "turn/steer" && hasID:
 			fh.replyOK(t, idRaw)
+			fh.steerOnce.Do(func() { close(fh.steered) })
 		case method == "approval/decide" && hasID:
 			fh.decideOnce.Do(func() { close(fh.decided) })
 			params, _ := msg["params"].(map[string]any)
@@ -304,6 +310,22 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string) {
 		go func() {
 			fh.waitDecided(t)
 			agentMsg("item-2", "approved and done", 1)
+			completed("completed")
+		}()
+	case "steer":
+		// The turn stays running until the client steers it, so a
+		// steer can never race the turn's completion.
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/started",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
+		})
+		go func() {
+			select {
+			case <-fh.steered:
+			case <-time.After(10 * time.Second):
+				return
+			}
+			agentMsg("item-2", "steered and done", 1)
 			completed("completed")
 		}()
 	case "gap":
