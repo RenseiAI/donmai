@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 // This file declares the additional-extension delivery seam for harnesses
@@ -87,6 +88,10 @@ type ExtensionDelivery struct {
 	// denies before any child process starts (D1.2 fail-closed).
 	Digest string `json:"digest"`
 
+	// DelegationTools names tools that start child sessions. The lifecycle
+	// input digest binds these declarations alongside the source digest.
+	DelegationTools []string `json:"delegationTools,omitempty"`
+
 	// Required marks the delivery load-bearing: per D1.2, a required
 	// delivery that cannot be materialized, verified, or loaded denies spawn
 	// closed, before credential delivery, with no warn-and-strip path. The
@@ -119,6 +124,16 @@ func ValidateExtensionDelivery(d ExtensionDelivery) error {
 	}
 	if !sha256HexPattern.MatchString(d.Digest) {
 		return fmt.Errorf("extension delivery %q: digest must be a lowercase sha256 hex string", d.ID)
+	}
+	seen := make(map[string]bool, len(d.DelegationTools))
+	for _, name := range d.DelegationTools {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("extension delivery %q: delegation tool name is required", d.ID)
+		}
+		if seen[name] {
+			return fmt.Errorf("extension delivery %q: duplicate delegation tool %q", d.ID, name)
+		}
+		seen[name] = true
 	}
 	switch d.Kind {
 	case ExtensionDeliveryPath:
