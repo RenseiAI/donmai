@@ -191,31 +191,51 @@ func TestPerOrgClaimGateLetsTheHealthyOrgClaimWhileOneOrgIsStuckPending(t *testi
 // TestPerOrgClaimGateHoldsTheRefusedOrgWhileTheHealthyOrgClaims pins the
 // other half: a scope whose founding the platform refused does not claim,
 // while the healthy scope keeps claiming. The refusal is retained on the
-// diagnostics surface exactly as a refused founding leaves it.
+// diagnostics surface exactly as a refused founding leaves it; the fence
+// itself is gone (a refused install rolls back), so what holds the scope is
+// the retained refusal alone. Built on a lightweight daemon rather than the
+// full two-scope install so no first-heartbeat fence is outstanding anywhere
+// — the pending-fence half is TestPerOrgClaimGateLetsTheHealthyOrgClaim...'s
+// remit, and the two must not cover for each other.
 func TestPerOrgClaimGateHoldsTheRefusedOrgWhileTheHealthyOrgClaims(t *testing.T) {
-	f := installTwoOrgClaimComposition(t)
-	d := f.harness.daemon
-
+	const healthy, stuck = "org-healthy-claim", "org-refused-claim"
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, RequireCredentialAttestation: true,
+		ControllerID: "controller-refused-claim", AttestationCapabilities: RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		OrgID: healthy,
+	}})
+	if err := d.refreshSessionShimIdentity().attestationErr; err != nil {
+		t.Fatalf("resolve test attestation: %v", err)
+	}
+	// Adoption and activation read complete so the host-wide gate is open
+	// and only the per-org refusal can hold the refused scope.
+	d.shims.mu.Lock()
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+	d.shims.mu.Unlock()
+	// Both scopes hold authority receipts with no fence outstanding — the
+	// posture a refused founding rolls back to, minus the refusal.
+	if err := d.retainSessionShimCredentialReceipts([]SessionShimScopeCredentialReceipt{
+		{Scope: healthy, WorkerHostID: "stable-host-healthy", AdoptionRevision: "revision-healthy"},
+		{Scope: stuck, WorkerHostID: "stable-host-stuck", AdoptionRevision: "revision-stuck"},
+	}); err != nil {
+		t.Fatalf("retain test receipts: %v", err)
+	}
 	d.retainSessionShimDurabilityRefusal(&SessionShimDurabilityRefused{
-		Scope: f.stuck, Err: errors.New("first projected heartbeat refused"),
+		Scope: stuck, Err: errors.New("first projected heartbeat refused"),
 	})
 
-	if suspended, _ := d.PollClaimGateForOrg()(f.stuck); !suspended {
-		t.Fatalf("refused scope %q claims", f.stuck)
-	} else if reason := refusedReasonForTest(t, d, f.stuck); reason == "" {
+	if suspended, reason := d.PollClaimGate()(); suspended {
+		t.Fatalf("host-wide claim gate closed with no fence outstanding: %s", reason)
+	}
+	if suspended, _ := d.PollClaimGateForOrg()(stuck); !suspended {
+		t.Fatalf("refused scope %q claims", stuck)
+	} else if reason := refusedReasonForTest(t, d, stuck); reason == "" {
 		t.Fatal("refused scope holds with no reason for the operator line")
 	}
-	if suspended, reason := d.PollClaimGateForOrg()(f.healthy); suspended {
-		t.Fatalf("healthy scope %q does not claim beside a refused one: %s", f.healthy, reason)
-	}
-	if suspended, reason := d.PollClaimGate()(); suspended {
-		t.Fatalf("host-wide claim gate closed behind one refused scope: %s", reason)
-	}
-
-	srv := f.pollServer(t)
-	f.pollOnce(t, srv)
-	if got := f.claimedSessions(); len(got) != 1 || got[0] != "session-healthy" {
-		t.Fatalf("claimed sessions = %v, want exactly [session-healthy]", got)
+	if suspended, reason := d.PollClaimGateForOrg()(healthy); suspended {
+		t.Fatalf("healthy scope %q does not claim beside a refused one: %s", healthy, reason)
 	}
 }
 
