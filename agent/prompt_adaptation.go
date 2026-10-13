@@ -121,6 +121,14 @@ const (
 	PromptDeliveryStubPTYSeed PromptDeliveryKind = "stub_pty_seed"
 	// PromptDeliveryAuthorizedUserDowngrade records explicit user fallback.
 	PromptDeliveryAuthorizedUserDowngrade PromptDeliveryKind = "authorized_user_prompt_downgrade"
+	// PromptDeliveryMuseLeadingText uses the MSP leading text part: the
+	// host has no system-prompt channel, so instructions ride ahead of
+	// the prompt in turn/start input.
+	PromptDeliveryMuseLeadingText PromptDeliveryKind = "muse_leading_text_part"
+	// PromptDeliveryMuseTurnInput uses the MSP turn/start input array.
+	PromptDeliveryMuseTurnInput PromptDeliveryKind = "muse_turn_input"
+	// PromptDeliveryMuseTurnSteer uses the MSP turn/steer input array.
+	PromptDeliveryMuseTurnSteer PromptDeliveryKind = "muse_turn_steer_input"
 )
 
 // PromptContent is one source-addressed semantic contribution. Text is the
@@ -578,6 +586,9 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryPiPTYSeed,
 		PromptDeliveryShellPTYSeed,
 		PromptDeliveryStubPTYSeed,
+		PromptDeliveryMuseLeadingText,
+		PromptDeliveryMuseTurnInput,
+		PromptDeliveryMuseTurnSteer,
 		PromptDeliveryAuthorizedUserDowngrade:
 		return true
 	default:

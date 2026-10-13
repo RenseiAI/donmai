@@ -50,6 +50,9 @@ const (
 	// ContextUsageSourceRPCUsage is the pi RPC usage object, when the
 	// session's RPC stream carries one.
 	ContextUsageSourceRPCUsage = "rpc-usage"
+	// ContextUsageSourceMuseTokenUsage is the muse session/tokenUsage
+	// cumulative block plus session/contextUsage window pressure.
+	ContextUsageSourceMuseTokenUsage = "muse-token-usage"
 )
 
 // ContextUsageEvent is the typed harness notice for a compaction or a
