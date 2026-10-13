@@ -1129,6 +1129,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: actCredentialProvider,
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		HTTPClient:         r.httpClient,
 		Logger:             r.logger,
 		// ProviderName flows onto the wire payload so the platform's
