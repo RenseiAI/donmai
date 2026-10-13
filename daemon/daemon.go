@@ -960,28 +960,58 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 	return &cp
 }
 
-// claimSuspended is the PollOptions.ClaimSuspended callback: it translates the
-// most recent host status the control plane reported into the poll loop's
-// claim gate. True means "do not claim new work this tick"; the reason is used
-// once, on the suspend transition, in the poll loop's log line.
+// The host-wide new-work claim gate stays closed only for genuinely
+// host-wide conditions, each named below: an operator drain or pause, and a
+// full host stop claims for every scope at once. A first heartbeat that is
+// still pending — or a founding the platform refused — for ONE scope is
+// deliberately not here: that fence is per organization (see
+// claimSuspendedForOrg), so one slow or refused scope never stalls new work
+// for the healthy ones.
+const (
+	// claimSuspendedReasonDraining suspends every scope while the operator
+	// drains this host.
+	claimSuspendedReasonDraining = "daemon is draining"
+	// claimSuspendedReasonPaused suspends every scope while the operator
+	// pauses this host.
+	claimSuspendedReasonPaused = "daemon is paused"
+	// claimSuspendedReasonAtCapacity is the prefix of the suspension reason
+	// while this host holds no free session slot; the exact occupancy
+	// follows it.
+	claimSuspendedReasonAtCapacity = "host is at capacity"
+)
+
+// claimSuspended is the PollOptions.ClaimSuspended callback: it translates
+// the host-wide claim posture into the poll loop's claim gate. True means
+// "do not claim new work this tick"; the reason is used once, on the
+// suspend transition, in the poll loop's log line.
 //
-// Absent status (no beat has carried one yet, or the server never sends the
-// field) reads as NOT suspended — see HostStatusDetail.SuspendsClaiming.
+// It answers for the host, never for one organization: per-scope fences (a
+// pending first heartbeat, a refused founding) are claimSuspendedForOrg's
+// remit. Absent host status (no beat has carried one yet, or the server
+// never sends the field) reads as NOT suspended — see
+// HostStatusDetail.SuspendsClaiming.
 //
-// Locking: HostStatus() takes and releases d.mu (read side) and returns a copy,
-// so nothing is held while the poll loop latches its own state, and the
-// heartbeat goroutine's setLastHostStatus (write side) can always make
+// Locking: HostStatus() takes and releases d.mu (read side) and returns a
+// copy, so nothing is held while the poll loop latches its own state, and
+// the heartbeat goroutine's setLastHostStatus (write side) can always make
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
 	if d.sessionShimEnabled() {
 		// A first-heartbeat fence for a scope this daemon holds no authority
 		// for is an orphan: the acknowledgement edge that would clear it
 		// matches a retained receipt, so nothing left can reopen it, while the
-		// host-wide gate stays closed for every scope. Reconcile it here — at
-		// the admission seam itself — rather than trusting every path that
-		// drops a receipt to also drop its fence.
+		// per-org gate stays closed for every scope that names it.
+		// Reconcile it here — at the admission seam itself — rather than
+		// trusting every path that drops a receipt to also drop its fence.
 		d.clearOrphanedSessionShimHeartbeatFence()
-		if d.sessionShimReadinessWithdrawn.Load() {
+		// The readiness latch below is host-wide ONLY while no scope fence is
+		// outstanding. A pending first heartbeat raises the latch for its own
+		// scope; while one is pending the per-org gate (claimSuspendedForOrg)
+		// decides per organization, and consulting the latch here would stall
+		// every healthy scope behind the stuck one. With no scope fence the
+		// latch can only be the proof-v2 withdrawal (or a stale one), which
+		// is genuinely host-wide.
+		if d.sessionShimReadinessWithdrawn.Load() && !d.sessionShimHeartbeatFencePending() {
 			return true, "session-shim recovery is not ready"
 		}
 		// A transient resolver failure reads as unknown and keeps this gate
@@ -991,9 +1021,23 @@ func (d *Daemon) claimSuspended() (bool, string) {
 			d.withdrawSessionShimProofV2Readiness()
 			return true, "session-shim proof-v2 readiness is unavailable"
 		}
-		if d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
-			return true, "session-shim recovery is not ready"
+		if !d.SessionShimAdoptionComplete() {
+			return true, "session-shim adoption is not complete"
 		}
+		if !d.SessionShimCarrierActivationComplete() {
+			return true, "session-shim carrier activation is not complete"
+		}
+	}
+	// Operator pause and drain stop claims for every scope at once. They are
+	// checked before the platform signal so the reason names the local cause.
+	switch d.State() {
+	case StateDraining:
+		return true, claimSuspendedReasonDraining
+	case StatePaused:
+		return true, claimSuspendedReasonPaused
+	}
+	if atCapacity, reason := d.hostAtCapacity(); atCapacity {
+		return true, reason
 	}
 	status := d.HostStatus()
 	if !status.SuspendsClaiming() {
@@ -1017,6 +1061,100 @@ type PollClaimGate func() (suspended bool, reason string)
 // does not snapshot, cache, or duplicate claim-suspension semantics.
 func (d *Daemon) PollClaimGate() PollClaimGate {
 	return d.claimSuspended
+}
+
+// PollOrgClaimGate is the per-organization new-work admission predicate
+// consumed by PollOptions.ClaimSuspendedForOrg. A true result skips only the
+// work items of that organization on a tick that still claims every other
+// ready organization; reason names the scope fence that held it.
+type PollOrgClaimGate func(orgID string) (suspended bool, reason string)
+
+// PollClaimGateForOrg returns the daemon's exact concurrency-safe per-org
+// new-work claim predicate for an independently composed PollService. Like
+// PollClaimGate it delegates to the same internal authority as the daemon's
+// primary poller. An empty organization resolves to this daemon's configured
+// scope, so legacy items that carry none are gated by the primary scope's
+// fence.
+func (d *Daemon) PollClaimGateForOrg() PollOrgClaimGate {
+	return d.claimSuspendedForOrg
+}
+
+// claimSuspendedForOrg is the per-organization new-work claim gate: an
+// organization whose first heartbeat is still pending, or whose founding the
+// platform refused, does not claim, while every other ready organization
+// keeps claiming. The host-wide gate (claimSuspended) runs first, so a
+// drain, a pause, a full host, a pool signal, or a proof-v2 outage still
+// stops every scope at once.
+//
+// The callback MUST NOT block: it runs on the poll goroutine.
+func (d *Daemon) claimSuspendedForOrg(orgID string) (bool, string) {
+	if suspended, reason := d.claimSuspended(); suspended {
+		return true, reason
+	}
+	if !d.sessionShimEnabled() || d.shims == nil {
+		return false, ""
+	}
+	// Same orphan reconciliation as the host-wide seam: a fence for a scope
+	// with no retained authority is closable by nothing, so it must not gate
+	// even its own organization, let alone any other.
+	d.clearOrphanedSessionShimHeartbeatFence()
+	scope := orgID
+	if scope == "" {
+		scope = d.sessionShimConfig().orgID()
+	}
+	d.shims.mu.RLock()
+	_, pending := d.shims.pendingHeartbeatAcks[scope]
+	d.shims.mu.RUnlock()
+	if pending {
+		return true, "session-shim first heartbeat for organization " + scope + " is pending"
+	}
+	if refused := d.SessionShimDurabilityRefusal(); refused != nil && refused.Scope == scope {
+		reason := "session-shim founding for organization " + scope + " was refused"
+		if refused.Reason != "" {
+			reason += ": " + refused.Reason
+		}
+		return true, reason
+	}
+	return false, ""
+}
+
+// sessionShimHeartbeatFencePending reports whether any scope's first
+// heartbeat acknowledgement is still outstanding. The host-wide claim gate
+// consults it — never the readiness latch alone — so a pending scope fence
+// suspends only its own organization while every other ready one keeps
+// claiming.
+func (d *Daemon) sessionShimHeartbeatFencePending() bool {
+	if d.shims == nil {
+		return false
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return len(d.shims.pendingHeartbeatAcks) > 0
+}
+
+// hostAtCapacity reports whether this host holds no free session slot. The
+// occupancy is the daemon's coherent snapshot — spawner children plus
+// adopted and quarantined shims — so a restarted daemon that has not yet
+// finished adopting does not advertise room it cannot prove. The ceiling is
+// the spawner's live one while a spawner is published (the authority runtime
+// capacity edits and AcceptWork itself consult), falling back to the loaded
+// configuration before Start publishes it. With neither, nothing has been
+// admitted against a capacity that was never set, which reads as not full.
+func (d *Daemon) hostAtCapacity() (bool, string) {
+	max := -1
+	if d.spawner != nil {
+		max = d.spawner.MaxConcurrentSessions()
+	} else if cfg := d.Config(); cfg != nil {
+		max = cfg.Capacity.MaxConcurrentSessions
+	}
+	if max < 0 {
+		return false, ""
+	}
+	active, _ := d.spawnerActiveSessionCounts()
+	if active < max {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%s (%d/%d sessions)", claimSuspendedReasonAtCapacity, active, max)
 }
 
 // setLastHostStatus is the OnHostStatus callback wired into HeartbeatService.
@@ -1851,6 +1989,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 				// draining, or disabled, stop claiming new work while
 				// leaving in-flight sessions alone.
 				ClaimSuspended: d.claimSuspended,
+				// Per-organization admission inside the tick: a scope
+				// whose first heartbeat is still pending — or whose
+				// founding the platform refused — holds only its own
+				// work items while every other ready scope keeps
+				// claiming.
+				ClaimSuspendedForOrg: d.claimSuspendedForOrg,
 			})
 			credentials.Attach(poller)
 			d.lifecycleMu.Lock()
@@ -2660,9 +2804,22 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 		}
 	}()
 	if d.sessionShimReadinessWithdrawn.Load() {
-		return nil, errors.New("session-shim proof-v2 readiness is withdrawn")
-	}
-	if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
+		// The host-wide readiness latch stays fail-closed: a proof-v2
+		// withdrawal (or a stale latch) stops every scope at once. A pending
+		// first heartbeat raises the same latch for its own scope only, and
+		// that fence is per organization — see claimSuspendedForOrg — so the
+		// per-org admission check below decides for its scope. The detail's
+		// organization wins over the spec's when both name one; the merge
+		// below enforces the same precedence, so the check answers for the
+		// scope this admission would actually join.
+		orgID := spec.OrganizationID
+		if detail != nil && detail.OrganizationID != "" {
+			orgID = detail.OrganizationID
+		}
+		if suspended, reason := d.claimSuspendedForOrg(orgID); suspended {
+			return nil, fmt.Errorf("new-work claim suspended: %s", reason)
+		}
+	} else if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return nil, fmt.Errorf("session-shim proof-v2 readiness: %w", err)
 	}
