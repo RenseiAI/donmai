@@ -1218,19 +1218,6 @@
           ]
         },
         {
-          "host": "oauth-cli",
-          "protocol": "antigravity-oauth",
-          "authModes": [
-            "host-session",
-            "local"
-          ],
-          "bringsOwnAuth": true,
-          "needsApiKey": false,
-          "costModel": "host-subscription",
-          "baseUrlTmpl": "",
-          "envKeys": []
-        },
-        {
           "host": "local",
           "protocol": "openai-chat",
           "authModes": [
