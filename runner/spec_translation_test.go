@@ -7,6 +7,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	codexbridge "github.com/RenseiAI/donmai/provider/harness/codex"
 	piprovider "github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
@@ -658,9 +659,14 @@ func TestTranslateSpec_SubAgentCapZeroAddsToPlatformDisallows(t *testing.T) {
 }
 
 // TestTranslateSpec_SubAgentCapZeroReachesCodexDisallowPatterns verifies
-// the codex bridge carries the withheld delegation tools: codex consumes
-// tool policy through PermissionConfig, so the entries must land in
-// DisallowPatterns rather than being dropped with the flat lists.
+// the codex bridge does NOT carry the withheld delegation tools: codex
+// routes DisallowedTools into PermissionConfig.DisallowPatterns, which the
+// approval bridge compiles as regexes matched against the shell command
+// line — so bare "Task"/"Agent" entries would decline ordinary commands
+// that merely mention them ("go test -run TestAgentLoop", "grep -rn
+// Agent") while adding no protection on a channel that carries no
+// Task/Agent delegation tool. The budget enforcer remains the backstop
+// there instead.
 func TestTranslateSpec_SubAgentCapZeroReachesCodexDisallowPatterns(t *testing.T) {
 	t.Parallel()
 	caps := agent.Capabilities{NeedsPermissionConfig: true, AcceptsAllowedToolsList: false}
@@ -668,15 +674,39 @@ func TestTranslateSpec_SubAgentCapZeroReachesCodexDisallowPatterns(t *testing.T)
 	qw := QueuedWork{}
 	qw.StageBudget = &prompt.StageBudget{MaxSubAgents: &zero}
 	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
-	if spec.PermissionConfig == nil {
-		t.Fatal("PermissionConfig must be set for codex when the zero cap withholds delegation tools")
-	}
-	for _, want := range []string{"Task", "Agent"} {
-		if !slices.Contains(spec.PermissionConfig.DisallowPatterns, want) {
-			t.Errorf("DisallowPatterns = %v, want withheld delegation tool %q", spec.PermissionConfig.DisallowPatterns, want)
+	if spec.PermissionConfig != nil {
+		for _, withheld := range []string{"Task", "Agent"} {
+			if slices.Contains(spec.PermissionConfig.DisallowPatterns, withheld) {
+				t.Errorf("DisallowPatterns = %v, must not contain delegation tool %q: the patterns match shell command lines, not tool names", spec.PermissionConfig.DisallowPatterns, withheld)
+			}
 		}
 	}
 	if spec.DisallowedTools != nil {
-		t.Errorf("DisallowedTools must be zeroed for codex (routed to PermissionConfig); got %v", spec.DisallowedTools)
+		t.Errorf("DisallowedTools must stay empty for codex (no flat channel to withhold on); got %v", spec.DisallowedTools)
+	}
+}
+
+// TestTranslateSpec_SubAgentCapZeroStillApprovesAgentMentioningCommands
+// is the translate-plus-bridge pin for the codex zero-cap regression:
+// the translated spec for a zero-cap session, fed through the codex
+// approval bridge exactly as the harness consumes it, must still approve
+// ordinary shell commands that merely mention the delegation tool names.
+func TestTranslateSpec_SubAgentCapZeroStillApprovesAgentMentioningCommands(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{NeedsPermissionConfig: true, AcceptsAllowedToolsList: false}
+	zero := 0
+	qw := QueuedWork{}
+	qw.StageBudget = &prompt.StageBudget{MaxSubAgents: &zero}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
+	br := codexbridge.NewApprovalBridge(spec.PermissionConfig)
+	for _, cmd := range []string{
+		"go test -run TestAgentLoop ./...",
+		"grep -rn Agent .",
+		"cat src/TaskList.tsx",
+		"git commit -m \"ship Task list\"",
+	} {
+		if d := br.Evaluate(codexbridge.ApprovalRequest{Kind: codexbridge.ApprovalKindCommand, Command: cmd}); d.Action != codexbridge.ActionAcceptForSession {
+			t.Errorf("zero-cap codex session declined %q: action %s (%s)", cmd, d.Action, d.Reason)
+		}
 	}
 }

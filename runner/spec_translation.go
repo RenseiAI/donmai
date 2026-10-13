@@ -66,7 +66,7 @@ type SpecInputs struct {
 // fields are never zeroed: the exact harness adaptation profile either applies
 // them or returns a typed pre-spawn denial.
 func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.Spec {
-	return translateSpecWithToolPolicy(qw, caps, in, legacySpecToolPolicy(qw))
+	return translateSpecWithToolPolicy(qw, caps, in, legacySpecToolPolicy(qw, caps))
 }
 
 type specToolPolicy struct {
@@ -74,7 +74,7 @@ type specToolPolicy struct {
 	DisallowedTools []string
 }
 
-func legacySpecToolPolicy(qw QueuedWork) specToolPolicy {
+func legacySpecToolPolicy(qw QueuedWork, caps agent.Capabilities) specToolPolicy {
 	// AllowedTools resolution: only an explicitly configured allow list — the
 	// agent card's or the queued work's — ever reaches the Spec, verbatim.
 	// The runner imposes no allow list of its own: an earlier hardcoded
@@ -95,7 +95,7 @@ func legacySpecToolPolicy(qw QueuedWork) specToolPolicy {
 	if len(qw.DisallowedTools) > 0 {
 		disallowedTools = append(disallowedTools, qw.DisallowedTools...)
 	}
-	if subAgentCapAllowsNone(qw) {
+	if subAgentCapAllowsNone(qw) && caps.AcceptsAllowedToolsList {
 		disallowedTools = append(disallowedTools, subAgentDelegationTools...)
 	}
 	return specToolPolicy{AllowedTools: allowedTools, DisallowedTools: disallowedTools}
@@ -119,11 +119,15 @@ var subAgentDelegationTools = []string{"Task", "Agent"}
 // withholds nothing, and the enforcer stays the backstop wherever a
 // harness does not honor the disallow channel.
 //
-// The entries ride the standard DisallowedTools channel, so harnesses
-// that route it into a regex list (codex PermissionConfig.DisallowPatterns)
-// match them as substring patterns — the channel's documented semantic,
-// shared with every platform-supplied entry — rather than as exact tool
-// names.
+// The withholding applies only where the harness honors the flat tool-name
+// list (caps.AcceptsAllowedToolsList). On channels that compile the
+// DisallowedTools entries as substring patterns (for example the codex
+// approval bridge's DisallowPatterns, matched against the shell command
+// line), the bare delegation names would decline ordinary commands that
+// merely mention them ("go test -run TestAgentLoop", "grep -rn Agent"),
+// while adding no protection on a channel that carries no Task/Agent
+// delegation tool — so nothing is withheld there and the budget enforcer
+// remains the backstop.
 func subAgentCapAllowsNone(qw QueuedWork) bool {
 	if qw.StageBudget == nil || qw.StageBudget.MaxSubAgents == nil {
 		return false
