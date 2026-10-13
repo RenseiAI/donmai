@@ -8,11 +8,12 @@ import (
 	endpAnthropic "github.com/RenseiAI/donmai/provider/endpoint/anthropic"
 	endpGoogle "github.com/RenseiAI/donmai/provider/endpoint/google"
 	endpLocal "github.com/RenseiAI/donmai/provider/endpoint/local"
+	endpMeta "github.com/RenseiAI/donmai/provider/endpoint/meta"
 	endpOpenAI "github.com/RenseiAI/donmai/provider/endpoint/openai"
 	endpStub "github.com/RenseiAI/donmai/provider/endpoint/stub"
 )
 
-// endpointProvidersForParity returns the 5 model-endpoint providers as
+// endpointProvidersForParity returns the 6 model-endpoint providers as
 // constructed instances for the bridge-adapter rule. Each New() is state-free.
 func endpointProvidersForParity() []agent.ModelEndpointProvider {
 	return []agent.ModelEndpointProvider{
@@ -20,6 +21,7 @@ func endpointProvidersForParity() []agent.ModelEndpointProvider {
 		endpOpenAI.New(),
 		endpGoogle.New(),
 		endpLocal.New(),
+		endpMeta.New(),
 		endpStub.New(),
 	}
 }
