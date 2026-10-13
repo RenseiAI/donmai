@@ -15,8 +15,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -330,6 +335,7 @@ func TestHostWideClaimGateNamesEveryNonRunningState(t *testing.T) {
 	d.shims.mu.Unlock()
 
 	want := map[State]string{
+		StateRunning:    "",
 		StateStarting:   claimSuspendedReasonStarting,
 		StateUpdating:   claimSuspendedReasonUpdating,
 		StateStopped:    claimSuspendedReasonStopped,
@@ -337,13 +343,70 @@ func TestHostWideClaimGateNamesEveryNonRunningState(t *testing.T) {
 		StatePaused:     claimSuspendedReasonPaused,
 		StateRecovering: claimSuspendedReasonRecovering,
 	}
+	// Discover declarations independently of the decision table: adding a state
+	// anywhere in this package must require an explicit admission decision.
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := make(map[State]bool)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), entry.Name(), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range file.Decls {
+			group, ok := decl.(*ast.GenDecl)
+			if !ok || group.Tok != token.CONST {
+				continue
+			}
+			var stateType bool
+			var values []ast.Expr
+			for _, spec := range group.Specs {
+				value := spec.(*ast.ValueSpec)
+				if len(value.Values) != 0 {
+					typ, ok := value.Type.(*ast.Ident)
+					stateType = ok && typ.Name == "State"
+					values = value.Values
+				}
+				if !stateType {
+					continue
+				}
+				for _, expr := range values {
+					literal, ok := expr.(*ast.BasicLit)
+					if !ok || literal.Kind != token.STRING {
+						t.Fatalf("%s: lifecycle state must be enumerated in this test", entry.Name())
+					}
+					text, err := strconv.Unquote(literal.Value)
+					if err != nil {
+						t.Fatal(err)
+					}
+					state := State(text)
+					declared[state] = true
+					if _, decided := want[state]; !decided {
+						t.Errorf("declared lifecycle state %q has no claim-gate decision", state)
+					}
+				}
+			}
+		}
+	}
+	for state := range want {
+		if !declared[state] {
+			t.Errorf("decision for lifecycle state %q has no declaration", state)
+		}
+	}
+	want[State("future-state")] = "daemon lifecycle state is unrecognized"
+	want[State("")] = "daemon lifecycle state is unrecognized"
 	for state, reason := range want {
 		d.lifecycleMu.Lock()
 		d.setState(state)
 		d.lifecycleMu.Unlock()
 		suspended, got := d.PollClaimGate()()
-		if !suspended {
-			t.Errorf("host-wide claim gate open in state %q", state)
+		if suspended != (reason != "") {
+			t.Errorf("host-wide claim gate suspended = %v in state %q, want %v", suspended, state, reason != "")
 			continue
 		}
 		if got != reason {
@@ -352,8 +415,8 @@ func TestHostWideClaimGateNamesEveryNonRunningState(t *testing.T) {
 		// The host-wide closure fans out: every organization's per-org
 		// gate inherits it, so no scope can claim around the lifecycle.
 		for _, scope := range []string{"org-lifecycle-table", "org-unrelated"} {
-			if held, _ := d.PollClaimGateForOrg()(scope); !held {
-				t.Errorf("scope %q claims while the host is %q", scope, state)
+			if held, _ := d.PollClaimGateForOrg()(scope); held != (reason != "") {
+				t.Errorf("scope %q held = %v while the host is %q, want %v", scope, held, state, reason != "")
 			}
 		}
 	}
