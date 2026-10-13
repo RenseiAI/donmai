@@ -334,19 +334,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		HTTPClient: r.httpClient,
 		Logger:     r.logger,
 		OnInject:   onInject,
-		}, nil)
-		if err != nil {
-			// Heartbeat is non-fatal at construction time only when
-			// PlatformURL is missing; that's caught by validateQueuedWork.
-			r.logger.Warn("heartbeat construct failed", "err", err)
-			pulser = nil
-		} else if startErr := pulser.Start(ctx); startErr != nil {
-			r.logger.Warn("heartbeat start failed", "err", startErr)
-			_ = pulser.Stop()
-			pulser = nil
-		} else {
-			defer func() { _ = pulser.Stop() }()
-		}
+	}, nil)
+	if err != nil {
+		// Heartbeat is non-fatal at construction time only when
+		// PlatformURL is missing; that's caught by validateQueuedWork.
+		r.logger.Warn("heartbeat construct failed", "err", err)
+		pulser = nil
+	} else if startErr := pulser.Start(ctx); startErr != nil {
+		r.logger.Warn("heartbeat start failed", "err", startErr)
+		_ = pulser.Stop()
+		pulser = nil
+	} else {
+		defer func() { _ = pulser.Stop() }()
+	}
 
 	// 2. Provision worktree. We clone at the remote default branch
 	// (typically main) and create the per-session work branch on

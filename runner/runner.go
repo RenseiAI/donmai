@@ -664,7 +664,7 @@ func New(opts Options) (*Runner, error) {
 		skipSteering:                     opts.SkipSteering,
 		skipPostSession:                  opts.SkipPostSession,
 		hbInterval:                       opts.HeartbeatInterval,
-		stepHeartbeatInterval:          opts.StepHeartbeatInterval,
+		stepHeartbeatInterval:            opts.StepHeartbeatInterval,
 		spanEmissionEnabled:              opts.SpanEmissionEnabled,
 		spanEndpointPath:                 opts.SpanEndpointPath,
 		kitSkillSources:                  opts.KitSkillSources,
