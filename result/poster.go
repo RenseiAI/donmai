@@ -327,6 +327,18 @@ type statusRequest struct {
 	// without an endpoint error — old platforms ignore it.
 	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
 
+	// FinalProvider names the serving provider the session's model calls
+	// last reported (the gateway on a gateway-routed session, the direct
+	// provider otherwise) — the answer to "which upstream provider
+	// served". FinalModel is the served model id paired with it, and
+	// ProviderAttempts totals the serving attempts behind the session's
+	// calls (1 plus harness auto-retries per call, summed over calls
+	// that reported; zero means no call reported). Additive;
+	// omitted when empty/zero — old platforms ignore them.
+	FinalProvider    string `json:"finalProvider,omitempty"`
+	FinalModel       string `json:"finalModel,omitempty"`
+	ProviderAttempts int    `json:"providerAttempts,omitempty"`
+
 	// ToolCalls counts the tool calls the session made across every
 	// stream: the initial turn, injected turns, continuations and
 	// in-session retries. Always serialized (no omitempty) so a zero
@@ -682,6 +694,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
+		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 	}
 	if r.Cost != nil {
