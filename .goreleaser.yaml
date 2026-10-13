@@ -153,6 +153,12 @@ homebrew_casks:
     description: "Donmai CLI — terminal dashboard and CLI for AI agent fleets"
     binaries:
       - donmai
+    # Clear the quarantine flag on the installed binary so the first launch
+    # after `brew install` or `brew upgrade` does not hang on an approval
+    # prompt. The hook is brand-neutral and runs only on the installed copy.
+    hooks:
+      post:
+        install: 'system_command "/usr/bin/xattr", args: ["-d", "com.apple.quarantine", "#{staged_path}/donmai"]'
 
 checksum:
   name_template: "checksums.txt"
