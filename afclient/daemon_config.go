@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -83,7 +84,7 @@ type CredentialHelper struct {
 //
 // The retired per-repository clone override is not modelled here. Files that
 // still carry the key keep loading; ReadDaemonYAML logs one deprecation
-// warning per file and the value is ignored. Writers never emit the key.
+// warning per process and the value is ignored. Writers never emit the key.
 type ProjectEntry struct {
 	// ID is the daemon-side project identifier. The daemon reader requires
 	// projects[i].id (see daemon/config.go validateConfig); DeriveProjectID
@@ -121,7 +122,7 @@ type RepositoryEntry struct {
 //
 // The retired `cloneStrategy` key is not decoded: files that still carry it
 // keep loading and the value is ignored. ReadDaemonYAML logs one deprecation
-// warning per file, so this decoder stays silent.
+// warning per process, so this decoder stays silent.
 func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
 		ID               string            `yaml:"id"`
@@ -226,26 +227,38 @@ func NormalizeProjectAdmissionMode(mode string) string {
 	return ProjectAdmissionModeEnumerated
 }
 
-// retiredCloneStrategyWarning is the single deprecation notice logged when
-// a read encounters the retired per-repository clone override. The key is
-// ignored; the warning tells operators to drop it.
-const retiredCloneStrategyWarning = "daemon.yaml: 'cloneStrategy' is retired and ignored; remove the key"
+// retiredCloneStrategyWarning names the retired per-repository clone
+// override. The key is ignored; the warning tells operators to drop it.
+// The message is composed per emission (see
+// warnOnceRetiredCloneStrategy) so it can name the file and the count of
+// affected entries.
+const retiredCloneStrategyWarning = "'cloneStrategy' is retired and ignored; remove the key"
 
-// warnIfRetiredCloneStrategyPresent logs exactly one deprecation warning
-// when the raw file still carries the retired key on any entry. The typed
-// decoder ignores the key, so detection runs on the raw mapping tree.
-func warnIfRetiredCloneStrategyPresent(data []byte) {
+// retiredCloneStrategyWarnOnce guards the deprecation notice so a single
+// process emits it at most once, no matter how many times the config is
+// read (a status-style command may parse the file many times per run).
+// Tests that need a fresh emission reset it via
+// ResetRetiredCloneStrategyWarningForTest.
+var retiredCloneStrategyWarnOnce sync.Once
+
+// countRetiredCloneStrategyKeys reports how many entries under the
+// projects and repositories sequences still carry the retired key. The
+// typed decoder ignores the key, so detection runs on the raw mapping
+// tree.
+func countRetiredCloneStrategyKeys(data []byte) int {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return
+		return 0
 	}
 	root := &doc
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		root = root.Content[0]
 	}
 	if root.Kind != yaml.MappingNode {
-		return
+		return 0
 	}
+	count := 0
+	seen := make(map[int]struct{})
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		key := root.Content[i]
 		if key.Kind != yaml.ScalarNode {
@@ -271,12 +284,39 @@ func warnIfRetiredCloneStrategyPresent(data []byte) {
 			}
 			for j := 0; j+1 < len(item.Content); j += 2 {
 				if item.Content[j].Kind == yaml.ScalarNode && item.Content[j].Value == "cloneStrategy" {
-					slog.Warn(retiredCloneStrategyWarning)
-					return
+					// One entry counts once even when reached through a
+					// YAML alias that appears several times.
+					if _, ok := seen[item.Content[j].Line]; !ok {
+						seen[item.Content[j].Line] = struct{}{}
+						count++
+					}
+					break
 				}
 			}
 		}
 	}
+	return count
+}
+
+// warnOnceRetiredCloneStrategy logs the deprecation notice at most once
+// per process, naming the file and the count of affected entries.
+func warnOnceRetiredCloneStrategy(path string, count int) {
+	if count <= 0 {
+		return
+	}
+	retiredCloneStrategyWarnOnce.Do(func() {
+		slog.Warn("daemon.yaml: "+retiredCloneStrategyWarning,
+			"path", path,
+			"entries", count,
+		)
+	})
+}
+
+// ResetRetiredCloneStrategyWarningForTest re-arms the once-per-process
+// deprecation notice so tests can observe the emission in isolation from
+// one another and from read order. Production code must not call it.
+func ResetRetiredCloneStrategyWarningForTest() {
+	retiredCloneStrategyWarnOnce = sync.Once{}
 }
 
 // ── default path ─────────────────────────────────────────────────────────────
@@ -308,9 +348,10 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 		return nil, fmt.Errorf("parse daemon config %q: %w", path, err)
 	}
 	// The retired clone override is not part of the typed schema, so its
-	// presence is detected on the raw document: one warning per read no
-	// matter how many entries still carry the key.
-	warnIfRetiredCloneStrategyPresent(data)
+	// presence is detected on the raw document: one warning per process no
+	// matter how many entries still carry the key or how often the file
+	// is read.
+	warnOnceRetiredCloneStrategy(path, countRetiredCloneStrategyKeys(data))
 	cfg.normalizeProjectContract()
 	return &cfg, nil
 }
