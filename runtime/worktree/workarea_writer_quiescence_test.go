@@ -57,7 +57,7 @@ func claimAndAcknowledge(t *testing.T, manager *worktree.Manager, lease *workare
 	claim, err := manager.ClaimTerminalLeaseExecution(context.Background(), workarea.ExecutionClaimSpec{
 		LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
 		WorkareaID: lease.WorkareaID, InvocationID: "22222222-2222-4222-8222-222222222222",
-		ClaimID:    "33333333-3333-4333-8333-333333333333",
+		ClaimID: "33333333-3333-4333-8333-333333333333",
 	})
 	if err != nil {
 		t.Fatal(err)

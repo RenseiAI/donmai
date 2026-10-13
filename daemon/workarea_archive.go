@@ -2315,7 +2315,7 @@ func walkFilteredSourceRoot(source *os.Root, prefix string, out *[]archiveEntry,
 				candidate := relative
 				if !isArchiveGitMetadataPath(candidate) && guard.skippable(candidate) {
 					continue
-			}
+				}
 			}
 			child, err := source.OpenRoot(name)
 			if err != nil {
@@ -3177,7 +3177,8 @@ func isArchiveCopyChangedError(err error) bool {
 	return strings.Contains(err.Error(), errArchiveCopyChanged)
 }
 
-func copyRootFile(source, destination *os.Root, name string, expected os.FileInfo) error {	in, err := source.Open(name)
+func copyRootFile(source, destination *os.Root, name string, expected os.FileInfo) error {
+	in, err := source.Open(name)
 	if err != nil {
 		return err
 	}
