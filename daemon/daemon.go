@@ -1144,13 +1144,17 @@ func (d *Daemon) sessionShimHeartbeatFencePending() bool {
 }
 
 // hostAtCapacity reports whether this host holds no free session slot. The
-// occupancy is the daemon's coherent snapshot — spawner children plus
-// adopted and quarantined shims — so a restarted daemon that has not yet
-// finished adopting does not advertise room it cannot prove. The ceiling is
-// the spawner's live one while a spawner is published (the authority runtime
-// capacity edits and AcceptWork itself consult), falling back to the loaded
-// configuration before Start publishes it. With neither, nothing has been
-// admitted against a capacity that was never set, which reads as not full.
+// occupancy is spawner children plus adopted and quarantined shims — the
+// same populations as the coherent snapshot, read here WITHOUT the
+// tombstone-reconciliation sweep: that sweep can round-trip the control
+// plane, and this gate runs on the poll goroutine, which must never block.
+// A lineage whose tombstone has landed but not yet been reconciled counts
+// until the next heartbeat surface sweeps it, which errs fail-closed and
+// heals on its own. The ceiling is the spawner's live one while a spawner
+// is published (the authority runtime capacity edits and AcceptWork itself
+// consult), falling back to the loaded configuration before Start publishes
+// it. With neither, nothing has been admitted against a capacity that was
+// never set, which reads as not full.
 func (d *Daemon) hostAtCapacity() (bool, string) {
 	ceiling := -1
 	if d.spawner != nil {
@@ -1161,11 +1165,30 @@ func (d *Daemon) hostAtCapacity() (bool, string) {
 	if ceiling < 0 {
 		return false, ""
 	}
-	active, _ := d.spawnerActiveSessionCounts()
+	active := d.claimGateOccupancy()
 	if active < ceiling {
 		return false, ""
 	}
 	return true, fmt.Sprintf("%s (%d/%d sessions)", claimSuspendedReasonAtCapacity, active, ceiling)
+}
+
+// claimGateOccupancy counts the sessions occupying this host without running
+// the quarantined-tombstone reconciliation sweep. See hostAtCapacity for why
+// the sweep stays off the poll goroutine.
+func (d *Daemon) claimGateOccupancy() int {
+	active := 0
+	if d.localRuntime.Load() != nil {
+		return len(d.ActiveSessions())
+	}
+	if d.spawner != nil {
+		active, _ = d.spawner.ActiveSessionCounts()
+	}
+	if d.shims != nil {
+		d.shims.mu.RLock()
+		active += len(d.shims.adopted) + len(d.shims.quarantined)
+		d.shims.mu.RUnlock()
+	}
+	return active
 }
 
 // setLastHostStatus is the OnHostStatus callback wired into HeartbeatService.
