@@ -1544,3 +1544,77 @@ func TestTickLogsGenericStatusForNonAuthFailures(t *testing.T) {
 		t.Fatalf("a 500 must not be classified as an auth rejection: %s", logs)
 	}
 }
+
+// TestPulser_SetAckObserverRebinds covers the pre-provision liveness seam:
+// a pulser started with no observer reports ticks nowhere; rebinding an
+// observer mid-run delivers subsequent ticks to it. Nil clears the binding.
+// Each phase uses a short interval plus a poll deadline instead of calling
+// the unexported tick, so the test only exercises the public surface.
+func TestPulser_SetAckObserverRebinds(t *testing.T) {
+	t.Parallel()
+
+	var nilPulser *heartbeat.Pulser
+	nilPulser.SetAckObserver(func(int64) {}) // must not panic
+
+	var posts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		posts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := heartbeat.NewWithAckObserver(heartbeat.Config{
+		SessionID:  "sess-rebind",
+		BaseURL:    srv.URL,
+		Interval:   20 * time.Millisecond,
+		HTTPClient: srv.Client(),
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewWithAckObserver: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Stop() }()
+
+	// Phase 1: ticks fire with no observer — posts accumulate, nothing observed.
+	if !waitFor(t, 5*time.Second, func() bool { return posts.Load() >= 2 }) {
+		t.Fatal("no lock-refresh posts with nil observer")
+	}
+
+	// Phase 2: rebind — the next ticks reach the new observer. A superseded
+	// observer bound then immediately replaced must never fire.
+	firstFired := make(chan int64, 8)
+	secondFired := make(chan int64, 8)
+	p.SetAckObserver(func(tick int64) { firstFired <- tick })
+	p.SetAckObserver(func(tick int64) { secondFired <- tick })
+	select {
+	case tick := <-secondFired:
+		if tick <= 0 {
+			t.Fatalf("rebound observer got non-positive tick %d", tick)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rebound observer never fired")
+	}
+	select {
+	case tick := <-firstFired:
+		t.Fatalf("superseded observer fired with tick %d; want no call", tick)
+	default:
+	}
+
+	// Phase 3: nil clears the binding — ticks continue (posts accumulate)
+	// but no further observation fires.
+	before := posts.Load()
+	p.SetAckObserver(nil)
+	if !waitFor(t, 5*time.Second, func() bool { return posts.Load() > before }) {
+		t.Fatal("no lock-refresh posts after clearing observer")
+	}
+	select {
+	case tick := <-secondFired:
+		t.Fatalf("cleared observer fired with tick %d; want no call", tick)
+	default:
+	}
+}
