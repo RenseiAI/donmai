@@ -14,6 +14,12 @@ func TestReconcileStageBudgetPreservesOperationalAuthority(t *testing.T) {
 	budget := prompt.StageBudget{MaxDurationSeconds: 1800, MaxSubAgents: subAgentCap(3), MaxTokens: 24_000}
 	different := budget
 	different.MaxTokens++
+	// unsetCap omits MaxSubAgents (nil: not enforced) while zeroCap sets
+	// it explicitly to 0 (no sub-agents allowed). The two must never
+	// compare equal: an explicit 0 is a refusal of every delegation,
+	// an absent cap refuses none.
+	unsetCap := prompt.StageBudget{MaxDurationSeconds: 1800, MaxTokens: 24_000}
+	zeroCap := prompt.StageBudget{MaxDurationSeconds: 1800, MaxSubAgents: subAgentCap(0), MaxTokens: 24_000}
 	tests := []struct {
 		name               string
 		hasOperational     bool
@@ -28,6 +34,8 @@ func TestReconcileStageBudgetPreservesOperationalAuthority(t *testing.T) {
 		{name: "receipt budget missing from sibling", hasOperational: true, admitted: &budget, wantErr: true},
 		{name: "sibling budget absent from receipt", hasOperational: true, sibling: &budget, siblingPresent: true, wantErr: true},
 		{name: "sibling budget differs from receipt", hasOperational: true, admitted: &budget, sibling: &different, siblingPresent: true, wantErr: true},
+		{name: "explicit zero cap differs from unset cap", hasOperational: true, admitted: &unsetCap, sibling: &zeroCap, siblingPresent: true, wantErr: true},
+		{name: "unset cap differs from explicit zero cap", hasOperational: true, admitted: &zeroCap, sibling: &unsetCap, siblingPresent: true, wantErr: true},
 		{name: "both receipt and sibling omit budget", hasOperational: true},
 	}
 
