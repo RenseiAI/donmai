@@ -15,10 +15,10 @@ func TestRecordArchiveReferencePersistsAndReplays(t *testing.T) {
 	lease := acquireArchiveReferenceLease(t, store)
 	reference := workarea.TerminalArchiveReference{
 		SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: lease.WorkareaID,
-		ArchiveDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		SessionID:       lease.SessionID, WorkareaID: lease.WorkareaID,
+		ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SessionID:     lease.SessionID, WorkareaID: lease.WorkareaID,
 		TerminalResultID: lease.TerminalResultID,
-		CommittedAt:     time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
+		CommittedAt:      time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
 	}
 	recorded, err := store.RecordArchiveReference(context.Background(), lease.LeaseID, reference)
 	if err != nil {
@@ -56,10 +56,10 @@ func TestRecordArchiveReferenceRefusesConflict(t *testing.T) {
 	lease := acquireArchiveReferenceLease(t, store)
 	first := workarea.TerminalArchiveReference{
 		SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: lease.WorkareaID,
-		ArchiveDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		SessionID:       lease.SessionID, WorkareaID: lease.WorkareaID,
+		ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SessionID:     lease.SessionID, WorkareaID: lease.WorkareaID,
 		TerminalResultID: lease.TerminalResultID,
-		CommittedAt:     time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
+		CommittedAt:      time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
 	}
 	if _, err := store.RecordArchiveReference(context.Background(), lease.LeaseID, first); err != nil {
 		t.Fatal(err)
@@ -93,10 +93,10 @@ func TestRecordArchiveReferenceFailsClosedOnUnknownSchema(t *testing.T) {
 	lease := acquireArchiveReferenceLease(t, store)
 	reference := workarea.TerminalArchiveReference{
 		SchemaVersion: "donmai.terminal-archive-reference.v0", ArchiveID: lease.WorkareaID,
-		ArchiveDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		SessionID:       lease.SessionID, WorkareaID: lease.WorkareaID,
+		ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SessionID:     lease.SessionID, WorkareaID: lease.WorkareaID,
 		TerminalResultID: lease.TerminalResultID,
-		CommittedAt:     time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
+		CommittedAt:      time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
 	}
 	if _, err := store.RecordArchiveReference(context.Background(), lease.LeaseID, reference); err == nil {
 		t.Fatal("unknown schema accepted")

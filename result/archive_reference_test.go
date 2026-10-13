@@ -39,11 +39,11 @@ func TestPostWithOptionsAttachesArchiveReferenceBesideFourFieldLease(t *testing.
 	}
 	reference := &workarea.TerminalArchiveReference{
 		SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: "wa_11111111111111111111111111111111",
-		ArchiveDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		SessionID:       "11111111-1111-4111-8111-111111111111",
-		WorkareaID:      "wa_11111111111111111111111111111111",
+		ArchiveDigest:    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SessionID:        "11111111-1111-4111-8111-111111111111",
+		WorkareaID:       "wa_11111111111111111111111111111111",
 		TerminalResultID: "tr_11111111111111111111111111111111",
-		CommittedAt:     now,
+		CommittedAt:      now,
 	}
 	if err := poster.PostWithOptions(context.Background(), "session-1", goodResult(), result.PostOptions{
 		TerminalWorkareaLease: lease, TerminalArchiveReference: reference,
@@ -71,7 +71,7 @@ func TestPostWithOptionsAttachesArchiveReferenceBesideFourFieldLease(t *testing.
 
 func TestPrepareTerminalStatusBodyWithoutReferenceStaysByteIdentical(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)

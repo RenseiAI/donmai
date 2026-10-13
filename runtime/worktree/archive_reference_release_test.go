@@ -21,8 +21,8 @@ func TestArchiveReleaseRecordsReferenceOnLease(t *testing.T) {
 			}
 			return &workarea.TerminalArchiveReference{
 				SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: spec.WorkareaID,
-				ArchiveDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-				SessionID:       spec.SessionID, WorkareaID: spec.WorkareaID,
+				ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				SessionID:     spec.SessionID, WorkareaID: spec.WorkareaID,
 				TerminalResultID: spec.TerminalResultID, CommittedAt: committedAt,
 			}, nil
 		},
@@ -92,7 +92,7 @@ func TestArchiveReleaseWithoutReferenceStillReleases(t *testing.T) {
 	parent := t.TempDir()
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: sessionID,
-		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+		ArchiveRoot: func(_ context.Context, _ worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
 			return nil, nil
 		},
 	})

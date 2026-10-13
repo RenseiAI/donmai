@@ -17,28 +17,28 @@ import (
 // workareaDaemonClient. Per AGENTS.md: no testify, no httptest
 // reach-throughs.
 type fakeWorkareaClient struct {
-	listResp     *afclient.ListWorkareasResponse
-	listErr      error
-	getResp      *afclient.WorkareaEnvelope
-	getErr       error
-	getV1Resp    *afclient.WorkareaV1Envelope
-	getV1Err     error
-	gotID        string
-	restoreResp  *afclient.WorkareaRestoreResult
-	restoreErr   error
+	listResp      *afclient.ListWorkareasResponse
+	listErr       error
+	getResp       *afclient.WorkareaEnvelope
+	getErr        error
+	getV1Resp     *afclient.WorkareaV1Envelope
+	getV1Err      error
+	gotID         string
+	restoreResp   *afclient.WorkareaRestoreResult
+	restoreErr    error
 	restoreV1Resp *afclient.WorkareaRestoreV1Result
 	restoreV1Err  error
-	gotArchive   string
-	gotRestore   afclient.WorkareaRestoreRequest
-	diffResp     *afclient.WorkareaDiffResult
-	diffErr      error
-	gotIDA       string
-	gotIDB       string
-	listCalls    int
-	getCalls     int
-	restoreCalls int
-	restoreCtx   context.Context
-	diffCalls    int
+	gotArchive    string
+	gotRestore    afclient.WorkareaRestoreRequest
+	diffResp      *afclient.WorkareaDiffResult
+	diffErr       error
+	gotIDA        string
+	gotIDB        string
+	listCalls     int
+	getCalls      int
+	restoreCalls  int
+	restoreCtx    context.Context
+	diffCalls     int
 }
 
 func (f *fakeWorkareaClient) ListWorkareas() (*afclient.ListWorkareasResponse, error) {

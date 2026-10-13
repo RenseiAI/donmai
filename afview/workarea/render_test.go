@@ -312,7 +312,7 @@ func TestRenderInspectV1_RendersReferenceAndNilSafe(t *testing.T) {
 		ArchiveReference: &afclient.ArchiveReference{
 			SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: "wa-ref",
 			ArchiveDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-			SessionID: "11111111-1111-4111-8111-111111111111", WorkareaID: "wa-ref",
+			SessionID:     "11111111-1111-4111-8111-111111111111", WorkareaID: "wa-ref",
 			TerminalResultID: "tr_11111111111111111111111111111111",
 			CommittedAt:      "2026-07-18T12:30:00.123456789Z",
 		},
@@ -343,7 +343,7 @@ func TestRenderRestoreV1_SurfacesSourceReference(t *testing.T) {
 		ArchiveReference: &afclient.ArchiveReference{
 			SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: "wa-src",
 			ArchiveDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			SessionID: "11111111-1111-4111-8111-111111111111", WorkareaID: "wa-src",
+			SessionID:     "11111111-1111-4111-8111-111111111111", WorkareaID: "wa-src",
 		},
 	}}
 	if err := workarea.PlainRestoreV1(&out, res); err != nil {

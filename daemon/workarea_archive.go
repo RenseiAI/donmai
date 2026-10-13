@@ -549,14 +549,14 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 	}
 	if _, err := manifestFile.Write(body); err != nil {
 		_ = manifestFile.Close()
-	return nil, fmt.Errorf("archive root: write manifest: %w", err)
+		return nil, fmt.Errorf("archive root: write manifest: %w", err)
 	}
 	if err := manifestFile.Sync(); err != nil {
 		_ = manifestFile.Close()
-	return nil, fmt.Errorf("archive root: sync manifest: %w", err)
+		return nil, fmt.Errorf("archive root: sync manifest: %w", err)
 	}
 	if err := manifestFile.Close(); err != nil {
-	return nil, fmt.Errorf("archive root: close manifest: %w", err)
+		return nil, fmt.Errorf("archive root: close manifest: %w", err)
 	}
 	if err := syncArchiveRoot(stageRoot); err != nil {
 		return nil, err
@@ -567,7 +567,7 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 		}
 	}
 	if err := archiveRootRenameNoReplace(archiveRoot, stage, final); err != nil {
-	return nil, fmt.Errorf("archive root: publish archive: %w", err)
+		return nil, fmt.Errorf("archive root: publish archive: %w", err)
 	}
 	if r.archiveHook != nil {
 		if err := r.archiveHook("after-publish-archive"); err != nil {

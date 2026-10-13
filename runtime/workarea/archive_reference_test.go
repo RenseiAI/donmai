@@ -57,14 +57,14 @@ func TestTerminalArchiveReferenceRejectsBadShapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := map[string][]byte{
-		"unknown field":     []byte(strings.Replace(string(valid), "}", `,"extra":0}`, 1)),
-		"missing digest":    []byte(strings.Replace(string(valid), `"archiveDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111",`, "", 1)),
-		"bad digest":        []byte(strings.Replace(string(valid), "sha256:1111", "sha256:XXXX", 1)),
-		"relative archive":  []byte(strings.Replace(string(valid), `"archiveId":"wa_`, `"archiveId":"../wa_`, 1)),
-		"bad session":       []byte(strings.Replace(string(valid), testSessionID, "not-a-uuid", 1)),
-		"bad timestamp":     []byte(strings.Replace(string(valid), "2026-07-18T12:00:00.123Z", "2026-07-18T12:00:00Z", 1)),
-		"wrong schema":      []byte(strings.Replace(string(valid), TerminalArchiveReferenceSchemaV1, "donmai.terminal-archive-reference.v0", 1)),
-		"duplicate member":  []byte(strings.Replace(string(valid), `"archiveId"`, `"archiveId","archiveId"`, 1)),
+		"unknown field":    []byte(strings.Replace(string(valid), "}", `,"extra":0}`, 1)),
+		"missing digest":   []byte(strings.Replace(string(valid), `"archiveDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111",`, "", 1)),
+		"bad digest":       []byte(strings.Replace(string(valid), "sha256:1111", "sha256:XXXX", 1)),
+		"relative archive": []byte(strings.Replace(string(valid), `"archiveId":"wa_`, `"archiveId":"../wa_`, 1)),
+		"bad session":      []byte(strings.Replace(string(valid), testSessionID, "not-a-uuid", 1)),
+		"bad timestamp":    []byte(strings.Replace(string(valid), "2026-07-18T12:00:00.123Z", "2026-07-18T12:00:00Z", 1)),
+		"wrong schema":     []byte(strings.Replace(string(valid), TerminalArchiveReferenceSchemaV1, "donmai.terminal-archive-reference.v0", 1)),
+		"duplicate member": []byte(strings.Replace(string(valid), `"archiveId"`, `"archiveId","archiveId"`, 1)),
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {

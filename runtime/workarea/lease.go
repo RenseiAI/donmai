@@ -188,21 +188,21 @@ type TerminalStatusSaveSpec struct {
 
 // TerminalLease implements the documented terminal-workarea contract.
 type TerminalLease struct {
-	LeaseID                string                          `json:"leaseId"`
-	SessionID              string                          `json:"sessionId"`
-	TerminalResultID       string                          `json:"terminalResultId"`
-	WorkareaID             string                          `json:"workareaId"`
-	WorkareaPath           string                          `json:"workareaPath"`
-	AcquiredAt             time.Time                       `json:"acquiredAt"`
-	ExpiresAt              time.Time                       `json:"expiresAt"`
-	MaxExpiresAt           time.Time                       `json:"maxExpiresAt"`
-	SettlementBudget       time.Duration                   `json:"settlementBudget"`
-	Policy                 LeasePolicy                     `json:"policy"`
-	RequestBytes           []byte                          `json:"requestBytes"`
-	ClockHighWatermarkMS   int64                           `json:"clockHighWatermarkMs"`
-	State                  LeaseState                      `json:"state"`
-	ExecutionClaim         *LeaseExecutionClaim            `json:"executionClaim,omitempty"`
-	TerminalStatus         *TerminalStatusOutbox           `json:"terminalStatus,omitempty"`
+	LeaseID              string                `json:"leaseId"`
+	SessionID            string                `json:"sessionId"`
+	TerminalResultID     string                `json:"terminalResultId"`
+	WorkareaID           string                `json:"workareaId"`
+	WorkareaPath         string                `json:"workareaPath"`
+	AcquiredAt           time.Time             `json:"acquiredAt"`
+	ExpiresAt            time.Time             `json:"expiresAt"`
+	MaxExpiresAt         time.Time             `json:"maxExpiresAt"`
+	SettlementBudget     time.Duration         `json:"settlementBudget"`
+	Policy               LeasePolicy           `json:"policy"`
+	RequestBytes         []byte                `json:"requestBytes"`
+	ClockHighWatermarkMS int64                 `json:"clockHighWatermarkMs"`
+	State                LeaseState            `json:"state"`
+	ExecutionClaim       *LeaseExecutionClaim  `json:"executionClaim,omitempty"`
+	TerminalStatus       *TerminalStatusOutbox `json:"terminalStatus,omitempty"`
 	// ArchiveReference is the separately versioned committed-archive recovery
 	// reference, recorded only after the archive bytes and manifest commit
 	// and are independently re-read. Exact duplicate delivery is idempotent;
