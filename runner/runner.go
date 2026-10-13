@@ -297,6 +297,12 @@ type Options struct {
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
 
+	// StepHeartbeatInterval overrides the per-session step-heartbeat
+	// cadence. Zero falls back to runtime/stepheartbeat.DefaultInterval.
+	// Tests use it to compress liveness timing without touching the
+	// ownership pulse.
+	StepHeartbeatInterval time.Duration
+
 	// SpanEmissionEnabled explicitly enables the additive per-call span
 	// pipeline. Platform dispatchers may instead advertise
 	// CapabilitySpanIngest per session; either signal enables it. Default false
@@ -658,6 +664,7 @@ func New(opts Options) (*Runner, error) {
 		skipSteering:                     opts.SkipSteering,
 		skipPostSession:                  opts.SkipPostSession,
 		hbInterval:                       opts.HeartbeatInterval,
+		stepHeartbeatInterval:          opts.StepHeartbeatInterval,
 		spanEmissionEnabled:              opts.SpanEmissionEnabled,
 		spanEndpointPath:                 opts.SpanEndpointPath,
 		kitSkillSources:                  opts.KitSkillSources,
