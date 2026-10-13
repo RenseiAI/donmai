@@ -447,7 +447,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
 					return archiveRegistry.ArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
 						AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
-						WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath,
+						WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath, Quiesced: spec.Quiesced,
 					})
 				},
 			})

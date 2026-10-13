@@ -194,6 +194,15 @@ type ProvisionResult struct {
 	OwnerSessionID string
 	// CacheSeedID is correlation only; it never becomes session identity.
 	CacheSeedID string
+	// WriterQuiesced records the caller-side no-writer gate outcome for
+	// this session (see RequireWriterQuiescence): true when the embedder
+	// stopped the owning terminal/PTY generation and confirmed its reap
+	// before lease settlement drove toward an archive-disposition
+	// release. Carried into the archive spec at release time; false or
+	// unset records an unquiesced capture without refusing it — the
+	// provider's capture-stability check still fails closed on any
+	// mid-capture mutation with the source retained.
+	WriterQuiesced bool
 	// Reentered reports that this Provision adopted an existing session
 	// generation instead of materializing a fresh checkout: the working
 	// tree already holds a prior attempt's commits. The runner uses it
@@ -302,6 +311,18 @@ type ArchiveRootSpec struct {
 	SessionID     string
 	WorkareaRoot  string
 	SelectedPath  string
+	// Quiesced records that the caller stopped the owning terminal/PTY
+	// generation and confirmed its reap before invoking the archive
+	// provider — the ordinary-writer half of the writer-quiescence
+	// boundary (terminal stop precedes publication disposition, lease
+	// settlement, archive production, and source disposal; see the
+	// boundary documented on the archive spec type). The manager sets
+	// it on every leased archive-disposition release it drives; the
+	// archive provider carries it into the committed manifest as
+	// producer evidence. It never overrides the capture-stability
+	// check: an escaped or external writer that mutates mid-capture
+	// still fails closed with the source retained.
+	Quiesced bool
 }
 
 // Options configures NewManager. ParentDir is required.
@@ -1428,9 +1449,26 @@ func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease worka
 		if m.archiveRoot == nil {
 			return errors.New("runtime/worktree: archive disposition has no whole-root archive provider")
 		}
+		// Writer-quiescence boundary, archive-production step: the
+		// leased release runs only after the owning terminal/PTY
+		// generation was stopped and its reap confirmed upstream of
+		// lease settlement, so the ordinary owned writers are gone
+		// before this capture runs. The release callback carries
+		// that evidence into the archive manifest (Quiesced) while
+		// the provider's own capture-stability check still fails
+		// closed on any escaped or external writer that mutates
+		// mid-capture — retaining the source through the existing
+		// release-pending retry instead of publishing a
+		// mixed-generation archive or deleting the only complete
+		// copy. Disposal below runs only after the archive commits.
+		// Quiesced carries the caller-side no-writer gate outcome
+		// recorded via RequireWriterQuiescence (false when the caller
+		// could not prove the ordinary writers gone, e.g. a restart
+		// path reaping an unsupervised generation); the stability
+		// check fails closed either way.
 		if err := m.archiveRoot(ctx, ArchiveRootSpec{
 			AcquisitionID: res.AcquisitionID, WorkareaID: lease.WorkareaID, SessionID: lease.SessionID,
-			WorkareaRoot: lease.WorkareaPath, SelectedPath: repositoryPath,
+			WorkareaRoot: lease.WorkareaPath, SelectedPath: repositoryPath, Quiesced: m.writerQuiesced(lease.SessionID),
 		}); err != nil {
 			return fmt.Errorf("runtime/worktree: archive whole workarea root: %w", err)
 		}
@@ -2285,6 +2323,53 @@ func (m *Manager) runGit(ctx context.Context, repoURL string, args ...string) ([
 
 func (m *Manager) retainedPath(path string) (bool, error) {
 	return m.leases.RetainedPath(path)
+}
+
+// RequireWriterQuiescence is the caller-side no-writer gate of the
+// writer-quiescence boundary (terminal stop precedes publication
+// disposition, lease settlement, archive production, and source
+// disposal). The manager itself owns no process handle: the embedder
+// that owns the terminal/PTY generation stops it and confirms its reap
+// through whatever handle it holds (process-group wait, shim reap
+// proof, harness join), then records the outcome here before driving
+// lease settlement toward an archive-disposition release.
+//
+// A nil stopper means the caller could not prove the ordinary writers
+// gone — for example a restart path that reaps a generation it never
+// supervised. That is not a refusal: the release still proceeds, but
+// the capture is recorded unquiesced (Quiesced=false on the archive
+// spec and manifest) so operators can distinguish it, and any writer
+// that actually mutates mid-capture still fails closed in the
+// provider's capture-stability check with the source retained.
+//
+// Same-user external writers are a cooperation trust policy, not a
+// fenced set: they are expected to stay quiet once the owning
+// generation is gone, and nothing here — or in the archive provider —
+// inventories live processes to prove it. The guarantee this gate plus
+// the stability check jointly provide is narrower and exact: the
+// archive either captures one stable source generation or fails closed
+// while retaining the source; it never publishes a mixed-generation
+// archive and never deletes the only complete copy.
+func (m *Manager) RequireWriterQuiescence(sessionID string, quiesced bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if res, ok := m.sessions[sessionID]; ok {
+		out := *res
+		out.WriterQuiesced = quiesced
+		m.sessions[sessionID] = &out
+	}
+}
+
+// writerQuiesced reports the caller-side no-writer gate outcome recorded
+// via RequireWriterQuiescence for the session that owns the leased root.
+// The release path (not the in-memory session table) is authoritative
+// for disposal — a restart that never saw the session still releases
+// through the same archive-then-dispose order — so an unknown session
+// reads as unquiesced evidence, never as a refusal.
+func (m *Manager) writerQuiesced(sessionID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sessions[sessionID] != nil && m.sessions[sessionID].WriterQuiesced
 }
 
 func (m *Manager) requestReleasePath(ctx context.Context, path string) (bool, error) {
