@@ -136,7 +136,7 @@ func (s *Store) refreshCatalogEntry(digest string, fetchedAt time.Time, numBytes
 	if !found {
 		entries = append(entries, MirrorEntry{Digest: digest, LastFetch: fetchedAt, Bytes: numBytes})
 	}
-	return writeCatalog(s.catalogPath(), entries)
+	return s.writeCatalogLocked(entries)
 }
 
 // RecordFetch notes a completed mirror fetch: last-fetch advances, bytes
@@ -168,7 +168,7 @@ func (s *Store) RecordFetch(digest string, at time.Time, numBytes int64, revoked
 	if !found {
 		entries = append(entries, MirrorEntry{Digest: digest, LastFetch: at, LastUse: at, Bytes: numBytes, Revoked: revoked})
 	}
-	return writeCatalog(s.catalogPath(), entries)
+	return s.writeCatalogLocked(entries)
 }
 
 // TouchUse advances one mirror's LastUse marker to at (now when zero)
@@ -190,16 +190,19 @@ func (s *Store) TouchUse(digest string, at time.Time) error {
 			continue
 		}
 		entries[i].LastUse = at
-		return writeCatalog(s.catalogPath(), entries)
+		return s.writeCatalogLocked(entries)
 	}
-	return writeCatalog(s.catalogPath(), append(entries, MirrorEntry{Digest: digest, LastUse: at}))
+	return s.writeCatalogLocked(append(entries, MirrorEntry{Digest: digest, LastUse: at}))
 }
 
 // Remove deletes one mirror's directory and drops its catalog row. The
 // per-mirror lock is held only for the rename into a trash sibling; the
 // recursive delete runs outside the lock so one large mirror cannot stall
-// every caller for another. A missing directory still drops the row, so
-// Remove repairs a half-evicted state instead of failing it.
+// every caller for another. The rename runs under the exclusive
+// cross-process lock, so it waits for outstanding leases to release
+// rather than deleting a mirror another process is using. A missing
+// directory still drops the row, so Remove repairs a half-evicted state
+// instead of failing it.
 func (s *Store) Remove(digest string) error {
 	dir := filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)
 	if len(digest) != 64 {
@@ -208,7 +211,22 @@ func (s *Store) Remove(digest string) error {
 	unlock := s.lockMirror(digest)
 	trash, err := func() (string, error) {
 		defer unlock()
-		if _, err := os.Lstat(dir); err != nil {
+		excl, err := s.openMirrorLock(digest)
+		if err != nil {
+			return "", err
+		}
+		// Maintenance exclusion against lease holders: no ctx here,
+		// like the catalog publish — the section is short and a
+		// dead holder releases its lock with its file description.
+		if fd, ferr := intFileDescriptor(excl.Fd()); ferr != nil {
+			_ = excl.Close()
+			return "", ferr
+		} else if ferr = syscallFlockExclusive(fd); ferr != nil {
+			_ = excl.Close()
+			return "", ferr
+		}
+		defer func() { _ = unlockAndClose(excl) }()
+		if _, err := s.root.Lstat(mirrorsRelPath(digest)); err != nil {
 			if os.IsNotExist(err) {
 				return "", nil
 			}
@@ -254,7 +272,7 @@ func (s *Store) Remove(digest string) error {
 	}
 	// Write even when nothing changed: a half-evicted state (directory
 	// gone, row present) converges to no row either way.
-	return writeCatalog(s.catalogPath(), kept)
+	return s.writeCatalogLocked(kept)
 }
 
 // Reconcile drops catalog rows whose mirror directory is gone and adopts
@@ -331,7 +349,7 @@ func (s *Store) Reconcile(candidates []ReconcileCandidate) (verified []MirrorEnt
 		verified = append(verified, entry)
 		entries = append(entries, entry)
 	}
-	if err := writeCatalog(s.catalogPath(), entries); err != nil {
+	if err := s.writeCatalogLocked(entries); err != nil {
 		return nil, nil, err
 	}
 	return verified, unverified, nil
