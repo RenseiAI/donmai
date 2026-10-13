@@ -238,6 +238,137 @@ func TestSweepRetiredKeys_SkipsUnsafeFileUntouched(t *testing.T) {
 	}
 }
 
+// sweepRefusalHeader is the shared top-level block every refusal fixture
+// carries so the post-skip LoadConfig assertion exercises a valid file.
+const sweepRefusalHeader = "machine:\n  id: sweep-fixture\norchestrator:\n  url: https://platform.example.com\n"
+
+// TestSweepRetiredKeys_RefusesWholeEntryRemoval pins the safe shapes for
+// line deletion: a retired key that shares its source line with any other
+// key cannot be removed by deleting that line, so the whole file is skipped
+// and left byte-identical. That covers a flow-style entry such as
+// `- {id: alpha, cloneStrategy: full}` (deleting its line would drop the
+// whole entry, not just the key) and a block entry whose key sits on the
+// `- ` line. One table, one decision function, no shape left unpinned.
+func TestSweepRetiredKeys_RefusesWholeEntryRemoval(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		body string
+	}{
+		"flow-style entry": {
+			body: sweepRefusalHeader +
+				"projects:\n" +
+				"  - {id: alpha, repository: github.com/o/a, cloneStrategy: full}\n" +
+				"  - id: beta\n" +
+				"    repository: github.com/o/b\n",
+		},
+		"flow-style sequence": {
+			body: sweepRefusalHeader +
+				"projects: [{id: alpha, repository: github.com/o/a, cloneStrategy: full}]\n",
+		},
+		"key first on the dash line": {
+			body: sweepRefusalHeader +
+				"projects:\n" +
+				"  - cloneStrategy: full\n" +
+				"    id: alpha\n" +
+				"    repository: github.com/o/a\n" +
+				"  - id: beta\n" +
+				"    repository: github.com/o/b\n",
+		},
+		// A quoted flow fragment on its own line would be the entry's
+		// only line for that mapping, so the dash-line rule refuses it.
+		// Any other same-line key sharing needs flow braces (already
+		// refused above), so this pins the degenerate survivor: an
+		// entry whose retired key IS its only content.
+		"entry holding only the retired key": {
+			body: sweepRefusalHeader +
+				"projects:\n" +
+				"  - cloneStrategy: full\n" +
+				"  - id: beta\n" +
+				"    repository: github.com/o/b\n",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.yaml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := SweepRetiredKeys([]string{path})
+			if err == nil {
+				t.Fatal("expected a skip error for the unsafe shape, got nil")
+			}
+			if summary.KeysRemoved() != 0 {
+				t.Errorf("KeysRemoved = %d, want 0 (file must be skipped)", summary.KeysRemoved())
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw) != tc.body {
+				t.Errorf("unsafe file was modified.\n got:\n%s\nwant:\n%s", raw, tc.body)
+			}
+			if matches, _ := filepath.Glob(path + ".sweep-backup-*"); len(matches) != 0 {
+				t.Errorf("unsafe file gained a backup: %v", matches)
+			}
+			// The entries still decode with every field intact: the raw
+			// tree must hold the same projects entry count and the
+			// same non-retired keys per entry as before the sweep ran.
+			// (LoadConfig itself rejects some of these fixtures — an
+			// id-less entry is invalid — so the pin is on the raw
+			// shape, which is what the sweep reasons about.)
+			before, err := retiredEntryShapes([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("retiredEntryShapes(before): %v", err)
+			}
+			after, err := retiredEntryShapes(raw)
+			if err != nil {
+				t.Fatalf("retiredEntryShapes(after): %v", err)
+			}
+			if len(after) != len(before) {
+				t.Errorf("entry count changed: %d before, %d after", len(before), len(after))
+			}
+			if !strings.Contains(string(raw), "cloneStrategy") {
+				t.Errorf("refused sweep should leave the retired key in place for a hand edit:\n%s", raw)
+			}
+		})
+	}
+}
+
+// TestSweepRetiredKeys_UnsafeMixedWithSafeSkipsWholeFile proves the skip is
+// per file, not per entry: one unsafe occurrence holds the entire file back
+// (leaving even the safe entries' keys in place) rather than rewriting a
+// file the sweep cannot verify end to end.
+func TestSweepRetiredKeys_UnsafeMixedWithSafeSkipsWholeFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := sweepRefusalHeader +
+		"projects:\n" +
+		"  - id: safe\n" +
+		"    repository: github.com/o/safe\n" +
+		"    cloneStrategy: shallow\n" +
+		"  - {id: flowed, repository: github.com/o/flowed, cloneStrategy: full}\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := SweepRetiredKeys([]string{path})
+	if err == nil {
+		t.Fatal("expected a skip error when any occurrence is unsafe, got nil")
+	}
+	if summary.KeysRemoved() != 0 {
+		t.Errorf("KeysRemoved = %d, want 0", summary.KeysRemoved())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != body {
+		t.Errorf("mixed file was modified.\n got:\n%s\nwant:\n%s", raw, body)
+	}
+}
+
 func TestDefaultSweepPaths_CoversSiblings(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)

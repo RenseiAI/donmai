@@ -180,30 +180,29 @@ func sweepRetiredKeysInFile(path string) (*RetiredKeySweepFile, error) {
 	if err != nil {
 		return &RetiredKeySweepFile{Path: path, Skipped: true, SkippedReason: err.Error()}, nil
 	}
-	lines, unsafe, err := retiredKeyLines(original)
+	plan, err := planRetiredKeyStrip(original)
 	if err != nil {
 		return &RetiredKeySweepFile{Path: path, Skipped: true, SkippedReason: err.Error()}, nil
 	}
-	if len(lines) == 0 && !unsafe {
+	if len(plan.lines) == 0 && !plan.unsafe {
 		return &RetiredKeySweepFile{Path: path, Untouched: true}, nil
 	}
-	if unsafe {
+	if plan.unsafe {
 		return &RetiredKeySweepFile{
 			Path:          path,
 			Skipped:       true,
-			SkippedReason: "non-inline retired key value needs a hand edit",
+			SkippedReason: plan.reason + "; file left as found",
 		}, nil
 	}
-	stripped := deleteSourceLines(original, lines)
-	recount, _, err := retiredKeyLines(stripped)
-	if err != nil || len(recount) != 0 {
+	stripped := deleteSourceLines(original, plan.lines)
+	if err := verifyRetiredKeyStrip(original, stripped); err != nil {
 		return &RetiredKeySweepFile{
 			Path:          path,
 			Skipped:       true,
-			SkippedReason: "post-strip verification failed; file left as found",
+			SkippedReason: "post-strip verification failed (" + err.Error() + "); file left as found",
 		}, nil
 	}
-	removed := len(lines)
+	removed := len(plan.lines)
 	backupPath, err := writeRetiredKeySweep(path, info.Mode().Perm(), original, stripped)
 	if err != nil {
 		return &RetiredKeySweepFile{Path: path, Skipped: true, SkippedReason: err.Error()}, nil
@@ -211,30 +210,120 @@ func sweepRetiredKeysInFile(path string) (*RetiredKeySweepFile, error) {
 	return &RetiredKeySweepFile{Path: path, Removed: removed, BackupPath: backupPath}, nil
 }
 
-// retiredKeyLines locates the retired key's source lines (1-based) under
-// the projects and repositories entry sequences. It returns unsafe=true
-// when an occurrence cannot be removed by deleting its own line (a
-// multi-line value), in which case the caller must leave the file alone.
-func retiredKeyLines(data []byte) (lines []int, unsafe bool, err error) {
+// retiredStripPlan is the verified set of 1-based source lines whose
+// deletion removes exactly the retired key and nothing else. unsafe with a
+// reason means the file must be left as found ("needs a hand edit").
+type retiredStripPlan struct {
+	lines  []int
+	unsafe bool
+	reason string
+}
+
+// retiredEntryShape snapshots one projects/repositories entry from the
+// parse tree so the post-strip check can prove nothing but the retired key
+// was removed: the same entry count, and per entry the same non-retired
+// keys. A bare key count is not enough — deleting a whole flow-style line
+// would zero the retired keys while silently dropping a sibling field.
+type retiredEntryShape struct {
+	count int
+	keys  []string
+}
+
+// planRetiredKeyStrip locates the retired key's source lines (1-based)
+// under the projects and repositories entry sequences. An occurrence is
+// safe to strip only when its `key: value` pair owns its source line: a
+// scalar value on the same line as the key, no other key on that line, and
+// a block-style mapping. Anything else (multi-line value, flow-style
+// mapping, or a line shared with another key — including the key sitting on
+// the `- ` item line) marks the whole file unsafe so the caller leaves it
+// alone for a hand edit.
+func planRetiredKeyStrip(data []byte) (retiredStripPlan, error) {
+	var plan retiredStripPlan
+	occurrences, err := retiredKeyOccurrences(data)
+	if err != nil {
+		return plan, err
+	}
+	seen := make(map[int]struct{})
+	for _, occ := range occurrences {
+		if occ.item.Style&yaml.FlowStyle != 0 {
+			plan.unsafe = true
+			plan.reason = "flow-style entry needs a hand edit"
+			return plan, nil
+		}
+		// A key on the entry's opening line sits on the `- ` item
+		// marker: deleting that line would drop the sequence marker
+		// (and the whole entry when it is the entry's only key) along
+		// with the retired key.
+		if occ.key.Line == occ.item.Line {
+			plan.unsafe = true
+			plan.reason = "retired key is on the entry's `- ` line; needs a hand edit"
+			return plan, nil
+		}
+		if occ.key.Line <= 0 || occ.value.Kind != yaml.ScalarNode || occ.value.Line != occ.key.Line {
+			plan.unsafe = true
+			plan.reason = "non-inline retired key value needs a hand edit"
+			return plan, nil
+		}
+		// A block scalar (or any multi-line value) reports the
+		// key's line but spans more: deleting one line would
+		// orphan its continuation. Only a single-line value is
+		// safe to strip by line.
+		if strings.Contains(occ.value.Value, "\n") {
+			plan.unsafe = true
+			plan.reason = "non-inline retired key value needs a hand edit"
+			return plan, nil
+		}
+		// The `key: value` pair must own its source line. When the
+		// retired key shares the line with any other key of the same
+		// mapping — the flow case above, or a block entry whose first
+		// key sits on the `- ` item line — deleting the line would
+		// drop a sibling field along with the key.
+		for j := 0; j < len(occ.item.Content); j += 2 {
+			other := occ.item.Content[j]
+			if other == occ.key {
+				continue
+			}
+			if other.Kind == yaml.ScalarNode && other.Line == occ.key.Line {
+				plan.unsafe = true
+				plan.reason = "retired key shares its line with another key; needs a hand edit"
+				return plan, nil
+			}
+		}
+		if _, ok := seen[occ.key.Line]; !ok {
+			seen[occ.key.Line] = struct{}{}
+			plan.lines = append(plan.lines, occ.key.Line)
+		}
+	}
+	sort.Ints(plan.lines)
+	return plan, nil
+}
+
+// retiredOccurrence ties a retired key node to its value node and the
+// entry mapping that owns them, so the planner can judge whether the key's
+// source line holds anything else.
+type retiredOccurrence struct {
+	key   *yaml.Node
+	value *yaml.Node
+	item  *yaml.Node
+}
+
+// retiredKeyOccurrences lists every retired key occurrence under the
+// projects and repositories entry sequences. Entries reached twice through
+// a repeated YAML alias are reported once, keyed by the key node's line.
+func retiredKeyOccurrences(data []byte) ([]retiredOccurrence, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return nil, false, fmt.Errorf("parse config: %w", err)
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	root := &doc
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		root = root.Content[0]
 	}
 	if root.Kind != yaml.MappingNode {
-		return nil, false, nil
+		return nil, nil
 	}
+	var out []retiredOccurrence
 	seen := make(map[int]struct{})
-	addLine := func(line int) {
-		if _, ok := seen[line]; ok {
-			return
-		}
-		seen[line] = struct{}{}
-		lines = append(lines, line)
-	}
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		key := root.Content[i]
 		if key.Kind != yaml.ScalarNode {
@@ -263,23 +352,111 @@ func retiredKeyLines(data []byte) (lines []int, unsafe bool, err error) {
 				if k.Kind != yaml.ScalarNode || k.Value != retiredKeyName {
 					continue
 				}
-				v := item.Content[j+1]
-				if k.Line <= 0 || v.Kind != yaml.ScalarNode || v.Line != k.Line {
-					return nil, true, nil
+				// One entry counts once even when reached through a
+				// YAML alias that appears several times.
+				if _, ok := seen[k.Line]; ok {
+					break
 				}
-				// A block scalar (or any multi-line value) reports the
-				// key's line but spans more: deleting one line would
-				// orphan its continuation. Only a single-line value is
-				// safe to strip by line.
-				if strings.Contains(v.Value, "\n") {
-					return nil, true, nil
-				}
-				addLine(k.Line)
+				seen[k.Line] = struct{}{}
+				out = append(out, retiredOccurrence{key: k, value: item.Content[j+1], item: item})
+				break
 			}
 		}
 	}
-	sort.Ints(lines)
-	return lines, false, nil
+	return out, nil
+}
+
+// retiredEntryShapes snapshots the projects and repositories entry shapes
+// of a config document: per sequence, one fingerprint per entry listing
+// its non-retired keys. Aliased entries are fingerprinted once per
+// appearance (the sweep treats each appearance's line independently).
+func retiredEntryShapes(data []byte) ([]retiredEntryShape, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil, nil
+	}
+	var out []retiredEntryShape
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := root.Content[i]
+		if key.Kind != yaml.ScalarNode {
+			continue
+		}
+		if key.Value != "projects" && key.Value != "repositories" {
+			continue
+		}
+		entries := root.Content[i+1]
+		if entries.Kind == yaml.AliasNode && entries.Alias != nil {
+			entries = entries.Alias
+		}
+		if entries.Kind != yaml.SequenceNode {
+			continue
+		}
+		for _, entry := range entries.Content {
+			item := entry
+			if item.Kind == yaml.AliasNode && item.Alias != nil {
+				item = item.Alias
+			}
+			if item.Kind != yaml.MappingNode {
+				out = append(out, retiredEntryShape{count: 1})
+				continue
+			}
+			var keys []string
+			for j := 0; j+1 < len(item.Content); j += 2 {
+				k := item.Content[j]
+				if k.Kind != yaml.ScalarNode || k.Value == retiredKeyName {
+					continue
+				}
+				keys = append(keys, k.Value)
+			}
+			out = append(out, retiredEntryShape{count: 1, keys: keys})
+		}
+	}
+	return out, nil
+}
+
+// verifyRetiredKeyStrip proves the stripped document differs from the
+// original by exactly the retired key: no retired occurrences remain, the
+// projects/repositories entry count is unchanged, and every entry keeps
+// the same non-retired keys in the same order. A "zero retired keys
+// remain" check alone is not enough: deleting a whole flow-style line
+// would pass it while silently dropping an entry.
+func verifyRetiredKeyStrip(original, stripped []byte) error {
+	occurrences, err := retiredKeyOccurrences(stripped)
+	if err != nil {
+		return err
+	}
+	if len(occurrences) != 0 {
+		return fmt.Errorf("%d retired key(s) remain", len(occurrences))
+	}
+	before, err := retiredEntryShapes(original)
+	if err != nil {
+		return err
+	}
+	after, err := retiredEntryShapes(stripped)
+	if err != nil {
+		return err
+	}
+	if len(after) != len(before) {
+		return fmt.Errorf("entry count changed: %d before, %d after", len(before), len(after))
+	}
+	for i := range before {
+		if len(after[i].keys) != len(before[i].keys) {
+			return fmt.Errorf("entry %d key count changed: %q before, %q after", i, before[i].keys, after[i].keys)
+		}
+		for j := range before[i].keys {
+			if after[i].keys[j] != before[i].keys[j] {
+				return fmt.Errorf("entry %d keys changed: %q before, %q after", i, before[i].keys, after[i].keys)
+			}
+		}
+	}
+	return nil
 }
 
 // deleteSourceLines removes exactly the given 1-based source lines,
