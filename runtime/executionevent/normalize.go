@@ -54,6 +54,9 @@ func NormalizeEvent(sessionID string, seq uint64, observedAt time.Time, event ag
 		if ev.ChildSessionID != "" {
 			payload["childSessionId"] = ev.ChildSessionID
 		}
+		if ev.ChildSessionTransport != "" {
+			payload["childSessionTransport"] = ev.ChildSessionTransport
+		}
 	case agent.ErrorEvent:
 		eventType = "error.raised"
 		// Provider error text can contain prompt/tool/credential material.
