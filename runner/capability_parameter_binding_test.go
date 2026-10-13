@@ -228,8 +228,8 @@ func TestCallerAuthoredParameterBindingIsNotAdmissionAuthority(t *testing.T) {
 
 func TestResolveAndBindClonesDelegationDeclarations(t *testing.T) {
 	source := []byte("export default function activate(pi) {}\n")
-	sum := sha256.Sum256(source)
-	delivery := agent.ExtensionDelivery{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", Digest: hex.EncodeToString(sum[:]), Required: true, DelegationTools: []string{"dispatch_child"}}
+	delivery := agent.ExtensionDelivery{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", Required: true, DelegationTools: []string{"dispatch_child"}}
+	delivery.Digest = delivery.ComputeDigest(source)
 	realizations, binder := syntheticParameterizedRegistry(t, agent.HarnessPi, "pi/headless/tool-lifecycle-v1", agent.PromptModeAutonomous, delivery)
 	registry, err := NewCapabilityParameterBinderRegistry(binder)
 	if err != nil {

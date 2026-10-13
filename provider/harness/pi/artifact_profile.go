@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 const (
@@ -89,6 +91,7 @@ type artifactLease struct {
 
 type extensionFileLease struct {
 	id, path, digest string
+	delegationTools  []string
 	info             os.FileInfo
 	size             int64
 	mode             os.FileMode
@@ -100,7 +103,10 @@ type receiptAdmission struct {
 	startup    *startupLease
 }
 
-type agentExtensionIdentity struct{ id, digest, path string }
+type agentExtensionIdentity struct {
+	id, digest, path string
+	delegationTools  []string
+}
 
 var receiptUnsafeStartupEnv = map[string]bool{
 	"BUN_OPTIONS":  true,
@@ -501,7 +507,7 @@ func trustedExtensionsMatch(trusted []TrustedExtensionIdentity, actual []agentEx
 	return true
 }
 
-func measureExtensionFile(id, path, digest string) (extensionFileLease, error) {
+func measureExtensionFile(id, path, digest string, delegationTools []string) (extensionFileLease, error) {
 	before, err := os.Lstat(path)
 	if err != nil || !before.Mode().IsRegular() {
 		return extensionFileLease{}, fmt.Errorf("pi extension %q is not a regular file", id)
@@ -511,27 +517,27 @@ func measureExtensionFile(id, path, digest string) (extensionFileLease, error) {
 		return extensionFileLease{}, fmt.Errorf("pi extension %q open: %w", id, err)
 	}
 	opened, statErr := f.Stat()
-	got, hashErr := sha256Reader(f)
+	got, hashErr := (agent.ExtensionDelivery{DelegationTools: delegationTools}).ComputeDigestReader(f)
 	closeErr := f.Close()
 	after, afterErr := os.Lstat(path)
 	if statErr != nil || hashErr != nil || closeErr != nil || afterErr != nil ||
 		!os.SameFile(before, opened) || !os.SameFile(opened, after) || got != digest {
 		return extensionFileLease{}, fmt.Errorf("pi extension %q measurement mismatch", id)
 	}
-	return extensionFileLease{id: id, path: path, digest: digest, info: before, size: before.Size(), mode: before.Mode()}, nil
+	return extensionFileLease{id: id, path: path, digest: digest, delegationTools: append([]string(nil), delegationTools...), info: before, size: before.Size(), mode: before.Mode()}, nil
 }
 
 func newReceiptAdmission(artifact *artifactLease, layout sessionLayout, actual []agentExtensionIdentity, trusted []TrustedExtensionIdentity, startup *startupLease) (*receiptAdmission, error) {
 	if artifact == nil || startup == nil || !trustedExtensionsMatch(trusted, actual) {
 		return nil, nil
 	}
-	policy, err := measureExtensionFile("donmai-policy", layout.extension, extensionSHA())
+	policy, err := measureExtensionFile("donmai-policy", layout.extension, extensionSHA(), nil)
 	if err != nil {
 		return nil, err
 	}
 	extensions := []extensionFileLease{policy}
 	for _, id := range actual {
-		lease, err := measureExtensionFile(id.id, id.path, id.digest)
+		lease, err := measureExtensionFile(id.id, id.path, id.digest, id.delegationTools)
 		if err != nil {
 			return nil, err
 		}
@@ -551,7 +557,7 @@ func (a *receiptAdmission) revalidate() error {
 		return err
 	}
 	for _, ext := range a.extensions {
-		measured, err := measureExtensionFile(ext.id, ext.path, ext.digest)
+		measured, err := measureExtensionFile(ext.id, ext.path, ext.digest, ext.delegationTools)
 		if err != nil || !os.SameFile(ext.info, measured.info) || measured.size != ext.size || measured.mode != ext.mode {
 			return fmt.Errorf("pi extension %q changed", ext.id)
 		}

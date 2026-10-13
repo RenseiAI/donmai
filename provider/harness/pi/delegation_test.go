@@ -2,6 +2,7 @@ package pi
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -33,7 +34,11 @@ func TestSpawnDelegationJSONFixture(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			source := []byte("export default function activate(pi) {}\n")
-			delivery := agent.ExtensionDelivery{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", Digest: sha256Hex(source), DelegationTools: tc.tools}
+			delivery := agent.ExtensionDelivery{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", DelegationTools: tc.tools}
+			delivery.Digest = delivery.ComputeDigest(source)
+			if len(tc.tools) == 0 && delivery.Digest != sha256Hex(source) {
+				t.Fatal("empty declarations changed legacy source digest")
+			}
 			var receipt agent.ToolLifecycleReceipt
 			spec := agent.Spec{AdditionalExtensions: []agent.ExtensionDelivery{delivery}, OnToolLifecycleAdapted: func(r agent.ToolLifecycleReceipt) error { receipt = r; return nil }}
 			body := string(fixture)
@@ -149,7 +154,8 @@ func TestSpawnRejectsMalformedDelegationTools(t *testing.T) {
 		t.Run(strings.Join(tools, "/"), func(t *testing.T) {
 			t.Parallel()
 			source := []byte("export default function activate(pi) {}\n")
-			spec := agent.Spec{AdditionalExtensions: []agent.ExtensionDelivery{{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", Digest: sha256Hex(source), DelegationTools: tools}}}
+			spec := agent.Spec{AdditionalExtensions: []agent.ExtensionDelivery{{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", DelegationTools: tools}}}
+			spec.AdditionalExtensions[0].Digest = spec.AdditionalExtensions[0].ComputeDigest(source)
 			_, h, err := spawnScripted(t, spec, handshakeEvent("h1"), event(map[string]any{"type": "agent_settled"}))
 			if err == nil {
 				drain(t, h)
@@ -158,5 +164,84 @@ func TestSpawnRejectsMalformedDelegationTools(t *testing.T) {
 				t.Fatalf("Spawn error = %v, want delegation tool denial", err)
 			}
 		})
+	}
+}
+
+func TestSpawnDelegationDigestBindsDeclarations(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		tools        []string
+		path         bool
+		tamperSource bool
+	}{
+		{name: "removed"},
+		{name: "renamed", tools: []string{"other_child"}},
+		{name: "added", tools: []string{"dispatch_child", "other_child"}},
+		{name: "source", tools: []string{"dispatch_child"}, tamperSource: true},
+		{name: "path-declaration", path: true},
+		{name: "path-source", tools: []string{"dispatch_child"}, path: true, tamperSource: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(piExtCacheDirEnvVar, t.TempDir())
+			source := []byte("export default function activate(pi) {}\n")
+			delivery := agent.ExtensionDelivery{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", DelegationTools: []string{"dispatch_child"}}
+			delivery.Digest = delivery.ComputeDigest(source)
+			delivery.DelegationTools = tc.tools
+			if tc.tamperSource {
+				delivery.Source = []byte("tampered source")
+			}
+			if tc.path {
+				delivery.Kind = agent.ExtensionDeliveryPath
+				delivery.Path = filepath.Join(t.TempDir(), "delegation.ts")
+				if err := os.WriteFile(delivery.Path, delivery.Source, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				delivery.Source = nil
+			}
+			_, h, err := spawnScripted(t, agent.Spec{AdditionalExtensions: []agent.ExtensionDelivery{delivery}}, handshakeEvent("h1"), event(map[string]any{"type": "agent_settled"}))
+			if err == nil {
+				drain(t, h)
+			}
+			if err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+				t.Fatalf("Spawn error = %v, want digest mismatch after delivery change", err)
+			}
+		})
+	}
+}
+
+func TestSpawnDelegationDigestReceiptAdmission(t *testing.T) {
+	base, _, _ := testReceiptAdmission(t)
+	source := []byte("export default function activate(pi) {}\n")
+	path := filepath.Join(t.TempDir(), "delegation.ts")
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	delivery := agent.ExtensionDelivery{ID: "delegation", Kind: agent.ExtensionDeliveryPath, Path: path, DelegationTools: []string{"dispatch_child"}, Required: true}
+	delivery.Digest = delivery.ComputeDigest(source)
+	_, h, _, err := launchScripted(t, scriptedLaunch{
+		spec:     agent.Spec{Autonomous: true, AdditionalExtensions: []agent.ExtensionDelivery{delivery}},
+		preSpawn: handshakeEvent("h1"), body: event(map[string]any{"type": "agent_settled"}),
+		configure: func(p *Provider) {
+			p.artifact = base.artifact
+			p.trustedExtensions = []TrustedExtensionIdentity{{ID: delivery.ID, Digest: delivery.Digest}}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, h)
+	receipt := h.(*Handle).receipt
+	if receipt == nil {
+		t.Fatal("declared extension lost receipt admission")
+	}
+	delivery.DelegationTools[0] = "caller_mutation"
+	if err := receipt.revalidate(); err != nil {
+		t.Fatalf("receipt declaration was not independently owned: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := receipt.revalidate(); err == nil {
+		t.Fatal("changed declared extension retained receipt trust")
 	}
 }
