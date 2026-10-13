@@ -1362,9 +1362,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// stream observation already scraped (streamRes.applyTo above), then the
 	// deterministic backstop further down. The manifest WINS when present —
 	// a structured file the agent wrote is more reliable than a marker scraped
-	// out of free-form prose. Best-effort: a missing manifest is the common
-	// case (ErrNoManifest) and a no-op; a malformed one logs + falls through
-	// to the scraped marker. A manifest verdict of "blocked" feeds the same
+	// out of free-form prose; a written file governs even against the turn's
+	// own marker, which is only the backstop. Best-effort: a missing manifest
+	// is the common case (ErrNoManifest) and recovers an `Intended manifest`
+	// block the agent printed inline when its stage could not write the file;
+	// a malformed one logs + falls through to the scraped marker. A printed
+	// block never raises the turn's own marker verdict, but the envelope
+	// remembers its printed source so a later turn's anchored marker can
+	// raise it (see 11·M). A manifest verdict of "blocked" feeds the same
 	// streamRes.blocked signal the marker scan produces, so the blocked
 	// classification fork below treats both channels identically.
 	r.applyTurnManifest(runnerStatePath, qw, res, &streamRes)
@@ -1429,8 +1434,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// then steering) re-resolve the turn verdict against it: the agent may
 	// write its manifest during the follow-up, the follow-up's terminal
 	// message (often just the PR URL steering asked for) has replaced
-	// res.Summary, and its own anchored marker may lower — or, with no
-	// manifest, replace — the verdict (see reapplyTurnManifest). Applying it
+	// res.Summary, and its own anchored marker may lower a filed verdict —
+	// or raise or lower a printed one, or, with no manifest, replace — the
+	// verdict (see reapplyTurnManifest). Applying it
 	// per turn lets a memory-inject follow-up that declines suppress steering.
 	followUpRan := false
 	applyFollowUp := func(tail streamObservation) {
