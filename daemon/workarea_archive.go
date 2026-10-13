@@ -594,6 +594,12 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 // archive root. Exact duplicate delivery is idempotent: the same committed
 // identity and digest reproduce the same reference. A conflicting
 // identity/digest for the caller's terminal result is refused.
+//
+// Mixed-version safety: commits that predate the reference contract, or that
+// carry no terminal result binding, yield (nil, nil) so the legacy commit
+// path is byte-identical to before. Only a spec that disagrees with committed
+// bytes, or a committed manifest that cannot form a valid reference while a
+// terminal result is bound, fails.
 func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArchiveSpec, existing *archiveManifest) (*workarea.TerminalArchiveReference, error) {
 	if existing == nil || existing.TreeDigest == "" || existing.WorkareaID == "" || existing.SessionID == "" {
 		return nil, fmt.Errorf("archive root: committed archive identity is incomplete: %w", ErrArchiveCorrupted)
@@ -604,10 +610,11 @@ func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArc
 	if spec.SessionID != "" && existing.SessionID != spec.SessionID {
 		return nil, fmt.Errorf("archive root: committed archive identity conflict: %w", ErrArchiveCorrupted)
 	}
-	if spec.TerminalResultID != "" {
-		if err := validateTerminalResultID(spec.TerminalResultID); err != nil {
-			return nil, fmt.Errorf("archive root: invalid terminal result identity: %w", err)
-		}
+	if spec.TerminalResultID == "" {
+		return nil, nil
+	}
+	if err := validateTerminalResultID(spec.TerminalResultID); err != nil {
+		return nil, fmt.Errorf("archive root: invalid terminal result identity: %w", err)
 	}
 	committedAt, ok := parseRFC3339(existing.CreatedAt)
 	if !ok {
@@ -623,7 +630,10 @@ func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArc
 		CommittedAt: committed,
 	}
 	if err := reference.Validate(); err != nil {
-		return nil, fmt.Errorf("archive root: committed archive reference is invalid: %w", err)
+		// A committed archive that predates strict reference identities
+		// (legacy sessions, pre-contract workarea ids) carries no versioned
+		// reference rather than failing the commit that already succeeded.
+		return nil, nil
 	}
 	return reference, nil
 }
@@ -662,6 +672,68 @@ func (r *WorkareaArchiveRegistry) readCommittedArchiveReference(archiveRoot *os.
 		return nil, fmt.Errorf("archive root: committed archive size mismatch: %w", ErrArchiveCorrupted)
 	}
 	return r.committedArchiveReference(spec, manifest)
+}
+
+// validArchiveReferenceShape reports whether a projected reference carries
+// canonical identities. It mirrors the strict workarea codec without importing
+// its unexported validators: archive ids stay single-component, digests stay
+// sha256:<64 hex>, sessions stay canonical UUIDs, and workarea/terminal
+// results stay wa_/tr_ prefixed.
+func validArchiveReferenceShape(reference *afclient.ArchiveReference) bool {
+	if reference == nil || reference.SchemaVersion != afclient.ArchiveReferenceSchemaV1 {
+		return false
+	}
+	if !validArchiveID(reference.ArchiveID) || !validArchiveDigestShape(reference.ArchiveDigest) {
+		return false
+	}
+	if !validCanonicalUUIDShape(reference.SessionID) || !validPrefixedIDShape(reference.WorkareaID, "wa_") {
+		return false
+	}
+	if reference.TerminalResultID != "" && !validPrefixedIDShape(reference.TerminalResultID, "tr_") {
+		return false
+	}
+	return true
+}
+
+func validArchiveDigestShape(value string) bool {
+	const prefix = "sha256:"
+	if len(value) != len(prefix)+64 || value[:len(prefix)] != prefix {
+		return false
+	}
+	for _, c := range value[len(prefix):] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validCanonicalUUIDShape(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validPrefixedIDShape(value, prefix string) bool {
+	if len(value) != len(prefix)+32 || value[:len(prefix)] != prefix {
+		return false
+	}
+	for _, c := range value[len(prefix):] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // validateTerminalResultID checks the stable terminal result identity form.
@@ -3149,9 +3221,16 @@ func archiveReferenceForManifest(id string, m *archiveManifest) *afclient.Archiv
 	if created, ok := parseRFC3339(m.CreatedAt); ok && created != nil {
 		committedAt = created.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)
 	}
-	return &afclient.ArchiveReference{
+	reference := &afclient.ArchiveReference{
 		SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: firstNonEmptyStr(m.ID, id),
 		ArchiveDigest: m.TreeDigest, SessionID: m.SessionID, WorkareaID: m.WorkareaID,
 		CommittedAt: committedAt,
 	}
+	// Pre-contract archives with non-canonical identities project no
+	// reference rather than serving an invalid one; their served shape is
+	// byte-identical to before.
+	if !validArchiveReferenceShape(reference) {
+		return nil
+	}
+	return reference
 }
