@@ -546,3 +546,48 @@ func TestMapEvent_CompactionEndToSeries(t *testing.T) {
 		t.Errorf("payload identity = %v; want pi/rpc-usage", wire.Payload)
 	}
 }
+
+// TestMapEvent_MessageUpdateEmitsStreamProgress pins the pi leg of the
+// stream liveness signal: every message_update delta — text or thinking —
+// emits the content-free stream-progress signal alongside buffering the
+// text for the message_end flush. The runner's stall detector disarms on
+// the signal, so a healthy long generation (deltas arriving) never reads
+// as a hung request, while a hung request (no deltas) still trips it. An
+// unknown delta shape stays silent.
+func TestMapEvent_MessageUpdateEmitsStreamProgress(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []string{"text_delta", "thinking_delta"} {
+		st := &mapperState{}
+		ev := rawEvent{Type: "message_update", Fields: map[string]any{
+			"assistantMessageEvent": map[string]any{"type": typ, "delta": "Hello "},
+		}, Line: []byte("line")}
+		got, terminal := mapEvent(ev, st)
+		if terminal {
+			t.Fatalf("%s: terminal = true; a delta never ends the turn", typ)
+		}
+		if len(got) != 1 {
+			t.Fatalf("%s: events = %#v, want 1 stream-progress signal", typ, got)
+		}
+		sys, ok := got[0].(agent.SystemEvent)
+		if !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
+			t.Fatalf("%s: event = %#v, want the stream-progress signal", typ, got[0])
+		}
+		if sys.Message != "" {
+			t.Errorf("%s: message = %q, want empty (the signal carries no content)", typ, sys.Message)
+		}
+	}
+	// Text still buffers for the message_end flush.
+	st := &mapperState{}
+	if _, _ = mapEvent(rawEvent{Type: "message_update", Fields: map[string]any{
+		"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello "},
+	}}, st); st.textBuf.String() != "Hello " {
+		t.Fatalf("textBuf = %q, want the buffered delta", st.textBuf.String())
+	}
+	// An unknown delta shape stays silent.
+	st = &mapperState{}
+	if got, _ := mapEvent(rawEvent{Type: "message_update", Fields: map[string]any{
+		"assistantMessageEvent": map[string]any{"type": "something_new"},
+	}}, st); len(got) != 0 {
+		t.Fatalf("unknown delta produced %#v, want silence", got)
+	}
+}

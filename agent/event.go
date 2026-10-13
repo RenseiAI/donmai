@@ -127,6 +127,24 @@ const SystemSubtypeProviderError = "provider_error"
 // the error text, so the receipt keeps the provider's own message.
 const ProviderErrorNotRetryableSuffix = "; isRetryable=false"
 
+// SystemSubtypeStreamProgress is the SystemEvent subtype a harness emits
+// while a model response is still being generated: a streaming delta
+// arrived from the model endpoint. It carries no content — the complete
+// message still arrives on the harness's usual completion event — and
+// exists only as a liveness signal so the runner can tell a healthy long
+// generation or reasoning pass (deltas keep arriving) from a hung model
+// request (no deltas arrive). Harnesses that expose no streaming signal
+// simply never emit it. The runner's stall detector disarms on it; the
+// activity poster drops it like other runner-internal lifecycle signals.
+const SystemSubtypeStreamProgress = "stream_progress"
+
+// StreamProgressEvent builds the SystemSubtypeStreamProgress liveness
+// signal: one streaming delta arrived from the model endpoint while a
+// response streams. Content-free by design; Message is always empty.
+func StreamProgressEvent() SystemEvent {
+	return SystemEvent{Subtype: SystemSubtypeStreamProgress}
+}
+
 // SystemSubtypeReasoningEffort is the SystemEvent subtype the runner emits
 // once per session, after spawn and before any turn output, recording the
 // reasoning effort it requested from the harness. Message carries the

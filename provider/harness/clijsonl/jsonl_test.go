@@ -342,12 +342,22 @@ func TestMapLine_AuthStatus_Error(t *testing.T) {
 	}
 }
 
-func TestMapLine_StreamEvent_Dropped(t *testing.T) {
+func TestMapLine_StreamEvent_StreamProgress(t *testing.T) {
 	t.Parallel()
 
 	events := mapLine(readFixture(t, "stream_event.jsonl"))
-	if len(events) != 0 {
-		t.Errorf("stream_event should produce 0 events, got %d", len(events))
+	if len(events) != 1 {
+		t.Fatalf("stream_event should produce 1 stream-progress event, got %d", len(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("event %T, want SystemEvent", events[0])
+	}
+	if sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Errorf("Subtype = %q, want %q", sys.Subtype, agent.SystemSubtypeStreamProgress)
+	}
+	if sys.Message != "" {
+		t.Errorf("Message = %q, want empty (the signal carries no content)", sys.Message)
 	}
 }
 
@@ -377,9 +387,12 @@ func TestMapLine_StreamEvent_APIError_ProviderError(t *testing.T) {
 	if sys.Upstream.ProviderCode != "overloaded_error" {
 		t.Errorf("Upstream.ProviderCode = %q, want overloaded_error", sys.Upstream.ProviderCode)
 	}
-	// A non-error frame still maps to nothing.
-	if events := mapLine([]byte(`{"type":"stream_event","event":{"type":"content_block_delta"}}`)); len(events) != 0 {
-		t.Errorf("non-error stream_event produced %d events, want 0", len(events))
+	// A non-error frame still maps to the content-free stream-progress
+	// signal, never to content.
+	if events := mapLine([]byte(`{"type":"stream_event","event":{"type":"content_block_delta"}}`)); len(events) != 1 {
+		t.Errorf("non-error stream_event produced %d events, want 1 (stream progress)", len(events))
+	} else if sys, ok := events[0].(agent.SystemEvent); !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Errorf("non-error stream_event produced %T %+v, want the stream-progress signal", events[0], events[0])
 	}
 }
 

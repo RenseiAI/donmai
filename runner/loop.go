@@ -2843,10 +2843,14 @@ func (r *Runner) consumeEventsWithin(
 			// ANSWERED with an error: the request is not hung, and
 			// the turn ends on that error through the normal
 			// provider-error path. Disarm so the detector cannot
-			// race it. All other system chatter (compaction,
-			// rate-limit notices, harness lifecycle) is not model
-			// output and leaves the window armed.
-			if e.Subtype == agent.SystemSubtypeProviderError {
+			// race it. A stream-progress signal means response bytes
+			// are still arriving: the request is alive, so a healthy
+			// long generation never reads as a stall. All other
+			// system chatter (compaction, rate-limit notices,
+			// harness lifecycle) is not model output and leaves the
+			// window armed.
+			if e.Subtype == agent.SystemSubtypeProviderError ||
+				e.Subtype == agent.SystemSubtypeStreamProgress {
 				sawToolResult = false
 				disarmStall()
 			}
