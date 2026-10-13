@@ -293,7 +293,10 @@ var baseFetchFlights = struct {
 type ProvisionHook func(stage string, acquisition workarea.AcquisitionRecord) error
 
 // ArchiveRootFunc captures one complete session-owned root before disposal.
-type ArchiveRootFunc func(context.Context, ArchiveRootSpec) error
+// It returns the separately versioned committed-archive recovery reference
+// when the provider commits one; a nil reference with a nil error preserves
+// the legacy fire-and-forget commit.
+type ArchiveRootFunc func(context.Context, ArchiveRootSpec) (*workarea.TerminalArchiveReference, error)
 
 // ArchiveRootSpec is the provider-neutral whole-root archive input.
 type ArchiveRootSpec struct {
@@ -302,6 +305,9 @@ type ArchiveRootSpec struct {
 	SessionID     string
 	WorkareaRoot  string
 	SelectedPath  string
+	// TerminalResultID is the stable terminal result identity the committed
+	// archive retains. Empty preserves the legacy commit without a reference.
+	TerminalResultID string
 }
 
 // Options configures NewManager. ParentDir is required.
@@ -1276,6 +1282,34 @@ func (m *Manager) TerminalLease(leaseID string) (*workarea.TerminalLease, error)
 	return m.leases.Get(leaseID)
 }
 
+// CommittedArchiveReference resolves the separately versioned recovery
+// reference for a lease whose archive disposition already committed. It
+// returns (nil, nil) when the archive provider has not committed an archive
+// for the lease's workarea yet, so callers emit no reference rather than a
+// predicted one. A committed archive whose manifest disagrees on identity or
+// digest is refused with an error.
+func (m *Manager) CommittedArchiveReference(ctx context.Context, lease workarea.TerminalLease) (*workarea.TerminalArchiveReference, error) {
+	if m.archiveRoot == nil || lease.ReleaseDisposition != "archive" {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// The commit path is idempotent on the committed bytes: re-committing
+	// the already-committed archive re-reads its manifest and tree and
+	// returns the same reference, or refuses on conflict. It never
+	// synthesizes a digest for bytes that were not read back.
+	repositoryPath := lease.ReleaseMetadata["repositoryWorktreePath"]
+	if repositoryPath == "" {
+		repositoryPath = lease.WorkareaPath
+	}
+	return m.archiveRoot(ctx, ArchiveRootSpec{
+		AcquisitionID: lease.ReleaseMetadata["acquisitionID"], WorkareaID: lease.WorkareaID,
+		SessionID: lease.SessionID, WorkareaRoot: lease.WorkareaPath,
+		SelectedPath: repositoryPath, TerminalResultID: lease.TerminalResultID,
+	})
+}
+
 // ClaimTerminalLeaseExecution durably binds one invocation/claim pair as the
 // exclusive workarea-backed verifier for a lease and returns the committed
 // transaction clock sample as claimNowMs operation metadata.
@@ -1287,6 +1321,13 @@ func (m *Manager) ClaimTerminalLeaseExecution(ctx context.Context, claim workare
 // a compare-and-set against the authoritative lease expiry.
 func (m *Manager) SaveTerminalStatus(ctx context.Context, spec workarea.TerminalStatusSaveSpec) (*workarea.TerminalLease, error) {
 	return m.leases.SaveTerminalStatus(ctx, spec)
+}
+
+// RecordArchiveReference durably binds the committed-archive recovery reference
+// to its lease. Exact duplicate delivery is idempotent; conflicting
+// identity/digest is refused.
+func (m *Manager) RecordArchiveReference(ctx context.Context, leaseID string, reference workarea.TerminalArchiveReference) (*workarea.TerminalLease, error) {
+	return m.leases.RecordArchiveReference(ctx, leaseID, reference)
 }
 
 // RegisterTerminalReceiver implements the documented terminal-workarea contract.
@@ -1428,11 +1469,24 @@ func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease worka
 		if m.archiveRoot == nil {
 			return errors.New("runtime/worktree: archive disposition has no whole-root archive provider")
 		}
-		if err := m.archiveRoot(ctx, ArchiveRootSpec{
+		reference, err := m.archiveRoot(ctx, ArchiveRootSpec{
 			AcquisitionID: res.AcquisitionID, WorkareaID: lease.WorkareaID, SessionID: lease.SessionID,
 			WorkareaRoot: lease.WorkareaPath, SelectedPath: repositoryPath,
-		}); err != nil {
+			TerminalResultID: lease.TerminalResultID,
+		})
+		if err != nil {
 			return fmt.Errorf("runtime/worktree: archive whole workarea root: %w", err)
+		}
+		// The archive provider returns the reference only after the archive
+		// bytes and manifest commit and are independently re-read. Recording
+		// it on the lease before teardown makes the lease record the durable
+		// lifecycle-state binding recovery clients replay. A provider that
+		// commits without a reference (legacy fire-and-forget) records
+		// nothing; teardown still proceeds.
+		if reference != nil {
+			if _, err := m.leases.RecordArchiveReference(ctx, lease.LeaseID, *reference); err != nil {
+				return fmt.Errorf("runtime/worktree: record committed archive reference: %w", err)
+			}
 		}
 	}
 	if lease.ReleaseDisposition != "destroy" && lease.ReleaseDisposition != "archive" && lease.ReleaseDisposition != "return-to-pool" {

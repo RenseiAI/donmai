@@ -395,6 +395,12 @@ type Result struct {
 	// after the full descriptor and host-local path are durable.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
 
+	// TerminalArchiveReference is the separately versioned committed-archive
+	// recovery reference, emitted only after the archive bytes and manifest
+	// are committed and independently re-read. Nil when no archive committed
+	// for this result; old receivers ignore the key.
+	TerminalArchiveReference *workarea.TerminalArchiveReference `json:"terminalArchiveReference,omitempty"`
+
 	// rescueTargets are the session's git checkouts, each with the commit it
 	// was provisioned at. Run reads them before teardown to preserve any work
 	// that exists nowhere else (see preserveUnpublishedWork).

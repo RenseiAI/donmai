@@ -205,12 +205,12 @@ func TestRequestedLeaseSurvivesPreserveAlwaysAndArchivesOnRelease(t *testing.T) 
 	var archived atomic.Bool
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: wtParent,
-		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) error {
+		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
 			if _, err := os.Stat(spec.WorkareaRoot); err != nil {
-				return err
+				return nil, err
 			}
 			archived.Store(true)
-			return nil
+			return nil, nil
 		},
 	})
 	if err != nil {

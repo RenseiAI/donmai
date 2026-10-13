@@ -84,6 +84,9 @@ var (
 	ErrLeaseConflict = errors.New("runtime/workarea: terminal lease identity conflict")
 	// ErrLeaseNotFound reports an unknown terminal lease identity.
 	ErrLeaseNotFound = errors.New("runtime/workarea: terminal lease not found")
+	// ErrArchiveReferenceConflict reports a conflicting committed-archive
+	// identity or digest delivered for a lease that already binds one.
+	ErrArchiveReferenceConflict = errors.New("runtime/workarea: terminal archive reference conflict")
 	// ErrAcknowledgementRequired reports a non-semantic acknowledgement.
 	ErrAcknowledgementRequired = errors.New("runtime/workarea: explicit terminal result acknowledgement required")
 	// ErrLeaseExpired reports a lease that cannot accept the requested operation.
@@ -200,6 +203,12 @@ type TerminalLease struct {
 	State                  LeaseState                      `json:"state"`
 	ExecutionClaim         *LeaseExecutionClaim            `json:"executionClaim,omitempty"`
 	TerminalStatus         *TerminalStatusOutbox           `json:"terminalStatus,omitempty"`
+	// ArchiveReference is the separately versioned committed-archive recovery
+	// reference, recorded only after the archive bytes and manifest commit
+	// and are independently re-read. Exact duplicate delivery is idempotent;
+	// a conflicting identity/digest is refused. Nil until the archive
+	// disposition commits.
+	ArchiveReference       *TerminalArchiveReference       `json:"archiveReference,omitempty"`
 	AcknowledgementBytes   []byte                          `json:"acknowledgementBytes,omitempty"`
 	AcknowledgementOutcome *TerminalAcknowledgementOutcome `json:"acknowledgementOutcome,omitempty"`
 	ReleaseRequested       bool                            `json:"releaseRequested"`
@@ -644,6 +653,51 @@ func (s *LeaseStore) SaveTerminalStatus(ctx context.Context, spec TerminalStatus
 			return nil
 		}
 		lease.TerminalStatus = &candidate
+		lease.ClockHighWatermarkMS = nowMS
+		if err := s.saveUnlocked(*lease); err != nil {
+			return s.failClosed(err)
+		}
+		out = lease
+		return nil
+	})
+	return out, err
+}
+
+// RecordArchiveReference durably binds the separately versioned committed-archive
+// recovery reference to a lease after the archive bytes and manifest commit.
+// Exact duplicate delivery is idempotent; a conflicting identity or digest is
+// refused with ErrArchiveReferenceConflict. The reference is validated closed,
+// so mixed-version writers that cannot produce the versioned shape fail closed
+// here without touching the lease's immediate loss-prevention behavior.
+func (s *LeaseStore) RecordArchiveReference(ctx context.Context, leaseID string, reference TerminalArchiveReference) (*TerminalLease, error) {
+	if err := s.Ready(); err != nil {
+		return nil, err
+	}
+	if err := reference.Validate(); err != nil {
+		return nil, err
+	}
+	var out *TerminalLease
+	err := s.withLocks(ctx, []string{"result:" + reference.TerminalResultID, "workarea:" + reference.WorkareaID, clockLockKey}, func() error {
+		lease, err := s.load(leaseID)
+		if err != nil {
+			return err
+		}
+		if err := validateIdentity(*lease, reference.SessionID, reference.TerminalResultID, reference.WorkareaID); err != nil {
+			return err
+		}
+		if lease.ArchiveReference != nil {
+			if lease.ArchiveReference.IdentityEqual(reference) {
+				out = lease
+				return nil
+			}
+			return fmt.Errorf("%w: lease %s already binds archive %s digest %s", ErrArchiveReferenceConflict, lease.LeaseID, lease.ArchiveReference.ArchiveID, lease.ArchiveReference.ArchiveDigest)
+		}
+		nowMS, err := s.sampleClockLocked()
+		if err != nil {
+			return s.failClosed(err)
+		}
+		committed := reference
+		lease.ArchiveReference = &committed
 		lease.ClockHighWatermarkMS = nowMS
 		if err := s.saveUnlocked(*lease); err != nil {
 			return s.failClosed(err)

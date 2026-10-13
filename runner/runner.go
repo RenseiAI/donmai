@@ -814,6 +814,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	leaseRequested := qw.TerminalWorkareaLease != nil
 	var terminalResultID string
 	var leaseProjection *workarea.TerminalLeaseProjection
+	var archiveReference *workarea.TerminalArchiveReference
 	var preparedStatusBody []byte
 
 	// A requested successful hold, or the local loss-prevention hold for an
@@ -870,7 +871,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 					leaseAcquired = true
 					projection := lease.Descriptor().Projection()
 					leaseProjection = &projection
-					body, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+					body, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, TerminalArchiveReference: archiveReference})
 					if bodyErr != nil {
 						leaseErr := fmt.Errorf("runner: encode immutable terminal status body: %w", bodyErr)
 						markTerminalLeaseFailure(res, leaseErr)
