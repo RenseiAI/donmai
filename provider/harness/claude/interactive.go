@@ -404,6 +404,16 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 		argv = append(argv, "--permission-mode", "bypassPermissions")
 	}
 
+	// An operator-driven session whose control plane granted toolApproval
+	// "bypass" may still choose bypassPermissions from the REPL (Shift+Tab).
+	// The CLI only offers that mode when it was started with this flag; the
+	// session itself starts in the CLI default mode. This matches the adapter's
+	// declared rendering (execution_security.go: index 0, prompts skipped).
+	if !spec.Autonomous && spec.ExecutionSecurity != nil &&
+		spec.ExecutionSecurity.Levels.ToolApproval == agent.ToolApprovalBypass {
+		argv = append(argv, "--allow-dangerously-skip-permissions")
+	}
+
 	// SystemPromptAppend carries the composed session instructions assembled
 	// by the runner. The Claude REPL accepts the same flag as the headless CLI;
 	// omit it when empty so a bare interactive session stays bare.
