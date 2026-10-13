@@ -57,6 +57,13 @@ func TestWraps(t *testing.T) {
 	if !Wraps(Utility) || !Wraps(Background) {
 		t.Error("Wraps reports no wrap for a non-default class; the spawn would silently drop the operator's ask")
 	}
+	// Values that bypassed Parse never wrap: they read as default instead
+	// of reaching the wrapper as a clamp nobody validated.
+	for _, unvetted := range []Class{"nice", "maintenance", "Utility", " background", "-x"} {
+		if Wraps(unvetted) {
+			t.Errorf("Wraps(%q) = true; an unvetted class must never wrap", unvetted)
+		}
+	}
 }
 
 func TestClasses(t *testing.T) {

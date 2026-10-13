@@ -2,12 +2,16 @@ package daemon
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/daemon/seatqos"
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // errSeatQoSCaptureStop ends an AcceptWork capture test at the start
@@ -151,6 +155,8 @@ func TestSeatQoSCommandPrefix(t *testing.T) {
 		{name: "background wraps on macOS", class: seatqos.Background, goos: "darwin", want: []string{"/usr/sbin/taskpolicy", "-c", "background"}},
 		{name: "utility does not wrap on Linux", class: seatqos.Utility, goos: "linux", want: nil},
 		{name: "background does not wrap on Linux", class: seatqos.Background, goos: "linux", want: nil},
+		{name: "unvetted class never wraps on macOS", class: "maintenance", goos: "darwin", want: nil},
+		{name: "unnormalised class never wraps on macOS", class: "Utility", goos: "darwin", want: nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -178,5 +184,71 @@ func TestWrapSeatCommandWithQoS(t *testing.T) {
 	}
 	if plain := wrapSeatCommandWithQoS(cmd, nil); strings.Join(plain, " ") != strings.Join(cmd, " ") {
 		t.Errorf("unwrapped = %v; want the command unchanged", plain)
+	}
+}
+
+// TestStartShimProcess_SeatQoS_ClampsTheLaunchedWorker drives the PRODUCTION
+// shim launch (startShimProcess, the interactive-seat path) on macOS with a
+// real worker and asserts the scheduling class reaches the launched process
+// itself: the worker reports its own scheduling priority, and a utility
+// launch must run below a default launch. The task-policy tool execs the
+// worker in place, so the pid the launch pins is the worker's and the clamp
+// is observable from inside it. Reverting the shim-path wrap leaves both
+// launches at the same priority and fails here.
+func TestStartShimProcess_SeatQoS_ClampsTheLaunchedWorker(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("the scheduling-class wrapper renders only on macOS")
+	}
+	if _, err := os.Stat("/usr/sbin/taskpolicy"); err != nil {
+		t.Skipf("task-policy tool unavailable: %v", err)
+	}
+	t.Parallel()
+	launchPriority := func(t *testing.T, class seatqos.Class) int {
+		t.Helper()
+		dir := t.TempDir()
+		registryDir := dir + "/registry"
+		sessionID := "sess-qos-" + string(seatqos.Effective(class))
+		d := &Daemon{shimScope: hermeticShimScope()}
+		d.spawner = NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
+			EnabledProjectIDs:     []string{"p1"},
+			MaxConcurrentSessions: 2,
+			WorkerCommand:         []string{"/bin/sh", "-c", "/bin/ps -o pri= -p $$"},
+			WorktreeParentDir:     dir,
+			SeatQoS:               string(class),
+		})
+		identity := sessionshim.Identity{OrgID: "test-org", SessionID: sessionID}
+		launch := sessionshim.Launch{
+			Identity:     identity,
+			RegistryDir:  registryDir,
+			Orphan:       sessionshim.DefaultOrphanPolicy(),
+			ProcessEpoch: 1,
+		}
+		started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, nil)
+		if err != nil {
+			t.Fatalf("startShimProcess(%s): %v", class, err)
+		}
+		if started.PID == 0 {
+			t.Fatalf("startShimProcess(%s) returned pid 0", class)
+		}
+		logPath := shimChildLogPath(registryDir, identity)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			content, readErr := os.ReadFile(logPath)
+			if readErr == nil {
+				if pri, convErr := strconv.Atoi(strings.TrimSpace(string(content))); convErr == nil {
+					return pri
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("shim child log %q never reported a priority (read err=%v)", string(content), readErr)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	baseline := launchPriority(t, seatqos.Default)
+	clamped := launchPriority(t, seatqos.Utility)
+	if clamped >= baseline {
+		t.Errorf("utility shim worker priority = %d; want below the default launch's %d (the class never reached the worker)", clamped, baseline)
 	}
 }

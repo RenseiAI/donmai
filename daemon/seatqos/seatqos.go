@@ -71,8 +71,16 @@ func Effective(class Class) Class {
 }
 
 // Wraps reports whether spawning under class changes the child command at
-// all: only the non-default classes wrap. Callers gate wrapper rendering
-// on this so the default path stays byte-identical to unwrapped spawns.
+// all: only the selectable non-default classes wrap. Callers gate wrapper
+// rendering on this so the default path stays byte-identical to unwrapped
+// spawns. A value outside the selectable set (one that bypassed Parse, as
+// an embedder composing spawner options directly can) never wraps: it
+// reads as default rather than reaching the wrapper as an unvetted clamp.
 func Wraps(class Class) bool {
-	return Effective(class) != Default
+	switch class {
+	case Utility, Background:
+		return true
+	default:
+		return false
+	}
 }
