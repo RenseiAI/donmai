@@ -639,6 +639,13 @@ commands for older scripts; each names its removal release in `--help`.
 Embedders leave those optional commands disabled
 by default.
 
+A composing binary's `main` must serve the confinement probe first (via
+`confinement.RunProbeFromEnv`), before any interface of its own: confined
+sessions prove the host by re-executing the host binary and waiting for the
+probe's handshake, so a `main` that does not serve it fails every confined
+start fast with the named `probe_unserved` cause and the harness is never
+attested.
+
 See `AGENTS.md` for the full package layout and contributor guide. The
 authoritative architecture corpus lives in
 [donmai-architecture](https://github.com/RenseiAI/donmai-architecture) —

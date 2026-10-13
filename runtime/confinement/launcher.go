@@ -30,6 +30,12 @@ func DefaultLaunchers() map[agent.PromptSessionMode]Launcher {
 	}
 }
 
+// headlessWaitDelay backstops a canceled headless launch: after the group
+// kill below, Wait gives captured output this long to drain before it
+// forcibly closes the pipes. It only ever caps a stuck wait — a healthy
+// run whose output drains returns without touching it.
+const headlessWaitDelay = 5 * time.Second
+
 // HeadlessLauncher starts argv as a plain child with piped output in its own
 // process group, as the headless harness spawn does.
 func HeadlessLauncher() Launcher {
@@ -41,6 +47,17 @@ func HeadlessLauncher() Launcher {
 		cmd.Dir = dir
 		cmd.Env = overlayEnv(os.Environ(), env)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		// Cancel kills the whole process group, not just the direct child:
+		// the child may have forked (a shell wrapper, a daemonizing
+		// interface), and a surviving grandchild holding the captured
+		// stdout/stderr pipes open would wedge Wait in awaitGoroutines
+		// forever — the stall an unserved probe must fail fast instead
+		// of. This mirrors the production headless spawn's group kill.
+		cmd.Cancel = func() error { return killHeadlessGroup(cmd) }
+		// Backstop for a grandchild that escaped the group (setsid): Wait
+		// can never outlive this after a cancel, so stopping an unserved
+		// probe always terminates.
+		cmd.WaitDelay = headlessWaitDelay
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		cmd.Stderr = &out
@@ -54,6 +71,20 @@ func HeadlessLauncher() Launcher {
 		}
 		return 0, nil
 	}
+}
+
+// killHeadlessGroup SIGKILLs the process group the headless child leads
+// (Setpgid above makes the child its own group leader). A group that is
+// already gone reads as success; any other kill failure is reported so the
+// WaitDelay backstop above is the only silence.
+func killHeadlessGroup(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		return nil
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
 }
 
 // InteractiveLauncher starts argv under a pseudo-terminal through the PTY
