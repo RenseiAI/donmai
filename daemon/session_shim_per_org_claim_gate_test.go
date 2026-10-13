@@ -203,7 +203,7 @@ func TestPerOrgClaimGateHoldsTheRefusedOrgWhileTheHealthyOrgClaims(t *testing.T)
 		EnableAdoption: true, RequireCredentialAttestation: true,
 		ControllerID: "controller-refused-claim", AttestationCapabilities: RequiredSessionShimHostCapabilities(),
 		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
-		OrgID: healthy,
+		OrgID:                      healthy,
 	}})
 	if err := d.refreshSessionShimIdentity().attestationErr; err != nil {
 		t.Fatalf("resolve test attestation: %v", err)
@@ -305,9 +305,9 @@ func TestPerOrgClaimGateNamesFullCapacity(t *testing.T) {
 	h.start(ctx)
 	d := h.daemon
 
-	max := d.Config().Capacity.MaxConcurrentSessions
-	if max <= 0 {
-		t.Fatalf("fixture capacity = %d, want a positive ceiling to fill", max)
+	ceiling := d.Config().Capacity.MaxConcurrentSessions
+	if ceiling <= 0 {
+		t.Fatalf("fixture capacity = %d, want a positive ceiling to fill", ceiling)
 	}
 	// The deterministic "no free slot" seam: shrink the ceiling to zero.
 	// Occupancy (empty spawner, no adopted shims) then meets the ceiling,

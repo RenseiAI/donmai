@@ -1152,20 +1152,20 @@ func (d *Daemon) sessionShimHeartbeatFencePending() bool {
 // configuration before Start publishes it. With neither, nothing has been
 // admitted against a capacity that was never set, which reads as not full.
 func (d *Daemon) hostAtCapacity() (bool, string) {
-	max := -1
+	ceiling := -1
 	if d.spawner != nil {
-		max = d.spawner.MaxConcurrentSessions()
+		ceiling = d.spawner.MaxConcurrentSessions()
 	} else if cfg := d.Config(); cfg != nil {
-		max = cfg.Capacity.MaxConcurrentSessions
+		ceiling = cfg.Capacity.MaxConcurrentSessions
 	}
-	if max < 0 {
+	if ceiling < 0 {
 		return false, ""
 	}
 	active, _ := d.spawnerActiveSessionCounts()
-	if active < max {
+	if active < ceiling {
 		return false, ""
 	}
-	return true, fmt.Sprintf("%s (%d/%d sessions)", claimSuspendedReasonAtCapacity, active, max)
+	return true, fmt.Sprintf("%s (%d/%d sessions)", claimSuspendedReasonAtCapacity, active, ceiling)
 }
 
 // setLastHostStatus is the OnHostStatus callback wired into HeartbeatService.

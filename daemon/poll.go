@@ -914,7 +914,7 @@ func (p *PollService) pollOnce(ctx context.Context) {
 			if p.claimOrgGateBlocks(ctx, &item, workerID, jwt) {
 				continue
 			}
-		if herr := p.opts.OnWork(item); herr != nil {
+			if herr := p.opts.OnWork(item); herr != nil {
 				p.opts.LogWarn("poll handler error for session %s: %v", item.SessionID, herr)
 			}
 		}
