@@ -315,6 +315,11 @@ func TestRealBinary_SequentialToolOverride_KeepsPolicyFence(t *testing.T) {
 	realBinaryAvailable(t)
 
 	workdir := t.TempDir()
+	// Session state is relocated; plant the legacy directory this call
+	// targets so the final assertion proves a refused deletion had no effect.
+	if err := os.MkdirAll(filepath.Join(workdir, piStateDir), 0o750); err != nil {
+		t.Fatal(err)
+	}
 	inside := filepath.Join(workdir, "inside.txt")
 	outside := filepath.Join(t.TempDir(), "must-not-exist.txt")
 	marshal := func(v map[string]any) string {

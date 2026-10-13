@@ -222,9 +222,11 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			OutputTokens:      outTok,
 			CachedInputTokens: cacheRead,
 			CacheWriteTokens:  cacheWrite,
-			UsageSource:       agent.LlmUsageProvider,
-			ObservedCostUsd:   cost,
-			TurnCompleted:     true,
+			// Anthropic-messages includes thinking in output but does not
+			// report its token count. Leave ReasoningTokens omitted (unknown).
+			UsageSource:     agent.LlmUsageProvider,
+			ObservedCostUsd: cost,
+			TurnCompleted:   true,
 		}}, false
 
 	case "agent_end":
@@ -348,7 +350,8 @@ func (st *mapperState) accumulatedCost() *agent.CostData {
 		OutputTokens:      st.accOutputTokens,
 		CachedInputTokens: st.accCachedInputTokens,
 		CacheWriteTokens:  st.accCacheWriteTokens,
-		NumTurns:          st.accTurns,
+		// No separate reasoning count is reported by pi's usage protocol.
+		NumTurns: st.accTurns,
 	}
 	if !st.suppressCost {
 		tokens.TotalCostUsd = st.accCostUSD
