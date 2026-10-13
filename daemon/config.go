@@ -507,6 +507,83 @@ type WorkareaConfig struct {
 	// endpoint switches from a single JSON envelope to NDJSON streaming.
 	// Default 1000 per ADR D4a.
 	DiffStreamingThreshold int `yaml:"diffStreamingThreshold,omitempty" json:"diffStreamingThreshold,omitempty"`
+	// Retention holds the retention budget for retained work areas:
+	// expire roots after a maximum age (or least recently used first
+	// over a disk budget) and drop archives after their own maximum
+	// age. Optional; zero values resolve to the policy defaults (see
+	// EffectiveRetentionSettings) and negative values disable the rule.
+	Retention RetentionConfig `yaml:"retention,omitempty" json:"retention,omitempty"`
+}
+
+// RetentionConfig configures the retention budget for retained work areas
+// (expire roots, drop archives). A retained root is a session directory
+// left behind after its session ended; a root holding unpushed work is
+// archived, never destroyed, and dropping an archive past its maximum age
+// is the only path by which unpushed work leaves the host.
+type RetentionConfig struct {
+	// MaxAgeDays expires retained roots older than this many days.
+	// Default 14; 0 means the default, negative disables age expiry.
+	MaxAgeDays int `yaml:"maxAgeDays,omitempty" json:"maxAgeDays,omitempty"`
+	// MaxDiskGb expires least recently used retained roots first while
+	// retained roots exceed this many GiB. Default 0 (no limit);
+	// negative disables disk-pressure expiry.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+	// ArchiveMaxAgeDays drops archives older than this many days.
+	// Default 30; 0 means the default, negative disables archive drops.
+	ArchiveMaxAgeDays int `yaml:"archiveMaxAgeDays,omitempty" json:"archiveMaxAgeDays,omitempty"`
+}
+
+// Retention defaults follow the founder's 2026-10-08 rulings: roots expire
+// after 14 days, archives drop after 30 days.
+const (
+	// DefaultRetentionMaxAgeDays expires retained roots after 14 days.
+	DefaultRetentionMaxAgeDays = 14
+	// DefaultRetentionArchiveMaxAgeDays drops archives after 30 days.
+	DefaultRetentionArchiveMaxAgeDays = 30
+)
+
+// EffectiveRetentionSettings resolves the authored config to the
+// process-level retention settings. Zero values resolve to defaults;
+// negative values disable the corresponding rule.
+func (c *Config) EffectiveRetentionSettings() RetentionSettings {
+	var cfg RetentionConfig
+	if c != nil {
+		cfg = c.Workarea.Retention
+	}
+	maxAgeDays := cfg.MaxAgeDays
+	if maxAgeDays == 0 {
+		maxAgeDays = DefaultRetentionMaxAgeDays
+	} else if maxAgeDays < 0 {
+		maxAgeDays = 0
+	}
+	archiveMaxAgeDays := cfg.ArchiveMaxAgeDays
+	if archiveMaxAgeDays == 0 {
+		archiveMaxAgeDays = DefaultRetentionArchiveMaxAgeDays
+	} else if archiveMaxAgeDays < 0 {
+		archiveMaxAgeDays = 0
+	}
+	maxBytes := cfg.MaxDiskGb * 1024 * 1024 * 1024
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	return RetentionSettings{
+		MaxAgeDays:        maxAgeDays,
+		MaxBytes:          maxBytes,
+		ArchiveMaxAgeDays: archiveMaxAgeDays,
+	}
+}
+
+// RetentionSettings is the resolved retention budget for one pass.
+type RetentionSettings struct {
+	// MaxAgeDays expires retained roots older than this many days.
+	// Zero disables age expiry.
+	MaxAgeDays int
+	// MaxBytes expires least recently used retained roots first while
+	// retained roots exceed this many bytes. Zero disables disk pressure.
+	MaxBytes int64
+	// ArchiveMaxAgeDays drops archives older than this many days.
+	// Zero disables archive drops.
+	ArchiveMaxAgeDays int
 }
 
 // KitConfig configures the Layer-4 kit operator surface — the scan paths
