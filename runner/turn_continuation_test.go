@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
@@ -84,6 +85,78 @@ func wantContinuationsWithGoal(t *testing.T, prompts []string, want ...string) {
 // TestContinuationPromptRestatesTheGoal pins the lost-goal remedy at the
 // prompt level: every continuation variant carries the goal block, and an
 // empty goal keeps the bare prompt byte for byte.
+func TestContinuationPromptRestatesTheGoal(t *testing.T) {
+	long := strings.Repeat("目", 600)
+	cases := []struct {
+		name string
+		qw   QueuedWork
+		want string
+	}{
+		{
+			name: "nothing goal-like",
+			want: "",
+		},
+		{
+			name: "identifier and title only",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{IssueIdentifier: " ISS-1 ", Title: " Fix it "}},
+			want: "The goal is ISS-1: Fix it. ",
+		},
+		{
+			name: "stage prompt wins over body and context",
+			qw: QueuedWork{QueuedWork: prompt.QueuedWork{
+				IssueIdentifier: "ISS-1", StagePrompt: " stage directive ", Body: "body", PromptContext: "context",
+			}},
+			want: "The goal is ISS-1. Goal directive: stage directive",
+		},
+		{
+			name: "body wins over context",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{Body: "body", PromptContext: "context"}},
+			want: "Goal directive: body",
+		},
+		{
+			name: "context is the last fallback",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{PromptContext: "context"}},
+			want: "Goal directive: context",
+		},
+		{
+			name: "directive capped at 500 runes",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{Body: long}},
+			want: "Goal directive: " + strings.Repeat("目", 500) + "…",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := continueGoalBlock(tc.qw)
+			if got != tc.want {
+				t.Fatalf("continueGoalBlock = %q; want %q", got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("continueGoalBlock = %q; want valid UTF-8", got)
+			}
+		})
+	}
+
+	bases := []struct {
+		reviewWork  bool
+		undelivered string
+		want        string
+	}{
+		{want: continuePrompt},
+		{reviewWork: true, want: continueReviewPrompt},
+		{undelivered: undeliveredDraft, want: continueDraftPrompt},
+		{undelivered: undeliveredNoNewCommit, want: continueNoNewCommitPrompt},
+	}
+	for _, base := range bases {
+		for _, empty := range []string{"", " \n\t "} {
+			if got := continuationPrompt(base.reviewWork, base.undelivered, empty); got != base.want {
+				t.Errorf("continuationPrompt(%v, %q, %q) = %q; want the bare prompt %q", base.reviewWork, base.undelivered, empty, got, base.want)
+			}
+		}
+		if got := continuationPrompt(base.reviewWork, base.undelivered, " The goal is ISS-1. "); got != base.want+"\n\nThe goal is ISS-1." {
+			t.Errorf("continuationPrompt(%v, %q, goal) = %q; want the base prompt plus the goal block", base.reviewWork, base.undelivered, got)
+		}
+	}
+}
 
 // continuationGoalForTest is the goal restatement a scripted session
 // carries: queuedWorkBase dispatches identifier MANIFEST-FOLLOWUP with

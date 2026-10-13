@@ -1331,6 +1331,30 @@ func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
 		}
 	})
 
+	// A merge that absorbed nothing never rides the clean-merge intent:
+	// built with plumbing so its second parent was already merged, it is
+	// merge-shaped but brings in no history, the merge analogue of an
+	// empty commit. A real merge of a published branch (the cases
+	// above) absorbs that branch's commits.
+	t.Run("merge that absorbed nothing does not ride the clean-merge intent", func(t *testing.T) {
+		_, repo := backstopRemoteFixture(t)
+		continueFixtureBranch(t, repo, branch)
+		startHead := commitFixtureFiles(t, repo, map[string]string{"work.go": "package work\n"}, "work before dispatch")
+		noop := gitRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com",
+			"commit-tree", "HEAD^{tree}", "-p", "HEAD", "-p", "HEAD~1", "-m", "merge nothing")
+		gitRun(t, repo, "merge", "-q", "--ff-only", noop)
+		got, err := inspectContinueRange(context.Background(), repo, branch, startHead, noop)
+		if err != nil {
+			t.Fatalf("inspectContinueRange: %v", err)
+		}
+		if !got.mergeOnly || got.commitCount != 1 {
+			t.Fatalf("inspection = %+v; want one merge-only commit", got)
+		}
+		if got.deliversUnder(allowClean) {
+			t.Fatalf("deliversUnder(allow-clean-merge) = true for a merge that absorbed nothing (%+v); want false", got)
+		}
+	})
+
 	// An empty range never rides the clean-merge intent either.
 	t.Run("empty range does not ride the clean-merge intent", func(t *testing.T) {
 		got := continueRangeInspection{}
