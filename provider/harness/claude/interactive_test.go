@@ -464,3 +464,40 @@ func TestInteractiveHandle_ExposesSessionSidecarPath(t *testing.T) {
 	// The seam assertion: the runner resolves through this interface.
 	var _ agent.ContextUsageSourcer = h
 }
+
+// TestInteractiveArgs_BypassGrantAllowsOperatorBypass pins that an interactive
+// session granted toolApproval "bypass" starts with the flag that lets the
+// operator enter bypassPermissions, without starting in that mode, and that
+// any narrower grant or a missing section leaves the flag off.
+func TestInteractiveArgs_BypassGrantAllowsOperatorBypass(t *testing.T) {
+	t.Parallel()
+
+	const allow = "--allow-dangerously-skip-permissions"
+	grant := func(level agent.ExecutionSecurityLevel) *agent.ExecutionSecurity {
+		return &agent.ExecutionSecurity{Version: 1, Levels: agent.ExecutionSecurityLevels{ToolApproval: level}}
+	}
+
+	cases := []struct {
+		name      string
+		spec      agent.Spec
+		wantAllow bool
+	}{
+		{"bypass grant", agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalBypass)}, true},
+		{"deny-list grant", agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalDenyList)}, false},
+		{"allow-list grant", agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalAllowList)}, false},
+		{"no section", agent.Spec{Prompt: "hi"}, false},
+		{"autonomous bypass", agent.Spec{Prompt: "hi", Autonomous: true, ExecutionSecurity: grant(agent.ToolApprovalBypass)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(tc.spec)
+			if slices.Contains(got, allow) != tc.wantAllow {
+				t.Fatalf("%s present = %v, want %v: %q", allow, !tc.wantAllow, tc.wantAllow, got)
+			}
+			if !tc.spec.Autonomous && slices.Contains(got, "--permission-mode") {
+				t.Errorf("non-autonomous session must start in the CLI default mode, got %q", got)
+			}
+		})
+	}
+}
