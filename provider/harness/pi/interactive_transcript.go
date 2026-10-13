@@ -419,13 +419,37 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 			}
 			b.WriteString(part.Text)
 		}
-		return []agent.Event{agent.ToolResultEvent{
+		out := []agent.Event{agent.ToolResultEvent{
 			ToolName:  msg.ToolName,
 			ToolUseID: msg.ToolCallID,
 			Content:   b.String(),
 			IsError:   msg.IsError,
 			Raw:       raw,
 		}}
+		// A tool result can carry nested LLM usage of its own
+		// (ToolResultMessage.usage — e.g. a subagent run the tool
+		// performed). The headless mapper folds the same shape into the
+		// session totals; the tail must too, or an interactive session's
+		// reported spend silently drops it. Only well-formed, non-zero
+		// usage maps: impossible counts stay unreported, never wrong.
+		if msg.Usage != nil {
+			in := transcriptTokens(msg.Usage.Input)
+			outTok := transcriptTokens(msg.Usage.Output)
+			cacheRead := transcriptTokens(msg.Usage.CacheRead)
+			cacheWrite := transcriptTokens(msg.Usage.CacheWrite)
+			if in != -1 && outTok != -1 && cacheRead != -1 && cacheWrite != -1 &&
+				(in != 0 || outTok != 0 || cacheRead != 0 || cacheWrite != 0) {
+				out = append(out, agent.LlmCallEvent{
+					InputTokens:       in,
+					OutputTokens:      outTok,
+					CachedInputTokens: cacheRead,
+					CacheWriteTokens:  cacheWrite,
+					UsageSource:       agent.LlmUsageProvider,
+					ObservedCostUsd:   transcriptCost(msg.Usage.Cost.Total),
+				})
+			}
+		}
+		return out
 	default:
 		return nil
 	}
