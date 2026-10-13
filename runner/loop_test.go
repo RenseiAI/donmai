@@ -584,7 +584,7 @@ func TestObserveEvent_SetsBlockedFlag(t *testing.T) {
 	obs := &streamObservation{}
 	h.runner.observeEvent(
 		agent.AssistantTextEvent{Text: "AGENT_BLOCKED: no acceptance criteria on the issue"},
-		obs, t.TempDir(), QueuedWork{},
+		obs, t.TempDir(), QueuedWork{}, nil,
 	)
 	if !obs.blocked {
 		t.Fatal("observeEvent did not set obs.blocked")
@@ -604,7 +604,7 @@ func TestObserveEvent_LaterVerdictClearsEarlierBlocked(t *testing.T) {
 
 	obs := &streamObservation{}
 	for _, text := range []string{"AGENT_BLOCKED: waiting on a decision", "Decision arrived; done.\nWORK_RESULT: passed"} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if obs.blocked || obs.blockedReason != "" || obs.workResult != "passed" {
 		t.Errorf("after blocked then passed: blocked=%v reason=%q workResult=%q; want false, \"\", passed", obs.blocked, obs.blockedReason, obs.workResult)
@@ -612,7 +612,7 @@ func TestObserveEvent_LaterVerdictClearsEarlierBlocked(t *testing.T) {
 
 	obs = &streamObservation{}
 	for _, text := range []string{"WORK_RESULT: passed", "Second thoughts.\nAGENT_BLOCKED: the spec contradicts itself"} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if !obs.blocked || obs.blockedReason != "the spec contradicts itself" || obs.workResult != "" {
 		t.Errorf("after passed then blocked: blocked=%v reason=%q workResult=%q; want true, reason, \"\"", obs.blocked, obs.blockedReason, obs.workResult)
@@ -629,7 +629,7 @@ func TestObserveEvent_CapturesLastAssistantText(t *testing.T) {
 	obs := &streamObservation{}
 	wt := t.TempDir()
 	for _, text := range []string{"first message", "  \n\t", "final message\n<!-- WORK_RESULT:passed -->"} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if want := "final message\n<!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
 		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
@@ -656,7 +656,7 @@ func TestObserveEvent_MarkerInPenultimateMessage(t *testing.T) {
 		"<!-- WORK_RESULT:passed -->",
 		"Here is the final report body.",
 	} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if obs.workResult != "passed" {
 		t.Errorf("obs.workResult = %q; want passed (penultimate-message marker dropped)", obs.workResult)
@@ -1268,7 +1268,7 @@ func TestConsumeEvents_DispatchesToSink(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
-	if _, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, rec, nil); err != nil {
+	if _, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, rec, nil, nil); err != nil {
 		t.Fatalf("consumeEvents: %v", err)
 	}
 
@@ -1291,7 +1291,7 @@ func TestConsumeEvents_PersistsSyntheticCorrelatedEvents(t *testing.T) {
 	wpath := t.TempDir()
 	qw := QueuedWork{QueuedWork: queuedWorkBase("TEST-SPAN-EVENT-1")}
 	enforcer := NewBudgetEnforcer(nil, time.Now())
-	if _, err := r.consumeEvents(t.Context(), &fakeHandle{events: events}, wpath, qw, nil, enforcer, rec, processor); err != nil {
+	if _, err := r.consumeEvents(t.Context(), &fakeHandle{events: events}, wpath, qw, nil, enforcer, rec, processor, nil); err != nil {
 		t.Fatalf("consumeEvents: %v", err)
 	}
 
@@ -1344,7 +1344,7 @@ func TestConsumeEvents_IdleWatchdogFires(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 	if !obs.noProgress {
 		t.Fatalf("obs.noProgress = false; want true (watchdog should have fired)")
 	}
@@ -1386,7 +1386,7 @@ func TestConsumeEvents_IdleWatchdogResetsOnEvent(t *testing.T) {
 	defer cancel()
 	go func() {
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 		done <- consumeResult{obs: obs, err: err}
 	}()
 
@@ -1434,7 +1434,7 @@ func TestConsumeEvents_IdleWatchdogDisabled(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 	if obs.noProgress {
 		t.Fatalf("obs.noProgress = true; want false (watchdog disabled)")
 	}
@@ -1476,7 +1476,7 @@ func TestConsumeEvents_IdleWatchdogRearmsWhileToolCallInFlight(t *testing.T) {
 	defer cancel()
 	go func() {
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 		done <- consumeResult{obs: obs, err: err}
 	}()
 
@@ -1543,7 +1543,7 @@ func TestConsumeEvents_IdleWatchdogFiresAfterToolResult(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 	if !obs.noProgress {
 		t.Fatalf("obs.noProgress = false; want true (completed call must not suppress the watchdog forever)")
 	}

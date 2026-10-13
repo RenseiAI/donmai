@@ -113,6 +113,27 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	provider := selection.Provider
+	// Current-step status beacons ride the session progress endpoint for
+	// the whole run: Report on every step change, Close with the terminal
+	// step when the run ends. Best-effort — a construct failure or a
+	// refused/unavailable endpoint never fails the run. The Close posts
+	// the terminal beacon even when the interval gate would swallow it,
+	// so the descriptor never keeps a mid-run phase after the session
+	// ends; background ctx so teardown races cannot lose it.
+	beacons := newStatusBeaconReporter(qw, r.statusBeaconInterval, r.now, r)
+	if beacons == nil {
+		r.logger.Warn("status-beacon reporter unavailable; running without step beacons",
+			"sessionId", qw.SessionID)
+	} else {
+		beacons.Report(ctx, StatusBeaconSpawning)
+	}
+	closeBeacons := func() {
+		if beacons == nil {
+			return
+		}
+		beacons.Close(context.Background(), terminalBeaconStep(res))
+	}
+	defer closeBeacons()
 	// Register the session's quota reporter before any harness side
 	// effect: live quota updates stream from the first turn, and the
 	// reporter must already be held so the consecutive-update dedup
@@ -1342,7 +1363,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	stallFollowUps := r.newTurnFollowUps()
 	stallFollowUps.limit = r.stallRetryLimit()
-	streamRes, streamErr := r.consumeEventsWithStallRetries(ctx, streamCtx, provider, &handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, spec, stallFollowUps)
+	streamRes, streamErr := r.consumeEventsWithStallRetries(ctx, streamCtx, provider, &handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, spec, stallFollowUps, beacons)
 	// budgetStop is the budget cap that ended the session, once one did: the
 	// provider is stopped and no further turn starts. The turn it ended is
 	// still resolved below (its manifest, verdict and pull request) so the
@@ -1443,7 +1464,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// it ended.
 	lastTurn := streamRes
 	if runtimeInjectEnabled && !streamRes.blocked && budgetStop == nil {
-		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
+		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh, beacons)
 		injRes.applyTo(res, provider.Name())
 		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
 			applyFollowUp(injRes)
@@ -1533,6 +1554,7 @@ tailRecovery:
 		case tailSteer:
 			followUps.steered = true
 			res.SteeringTriggered = true
+			beacons.Report(ctx, StatusBeaconSteering)
 			newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, steerView, res)
 			if err != nil {
 				r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
@@ -1548,7 +1570,7 @@ tailRecovery:
 			// The stall detector stays disarmed here for the same reason
 			// as the inject drain above: tail recovery owns follow-up
 			// liveness.
-			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, beacons)
 			tailRes.applyTo(res, provider.Name())
 			applyFollowUp(tailRes)
 			lastTurn = tailRes
@@ -1610,7 +1632,7 @@ tailRecovery:
 		} else {
 			followUps.sentContinuation()
 		}
-		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, beacons)
 		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
 		if stopped {
 			res.TurnContinuations = followUps.report()
@@ -1686,6 +1708,7 @@ tailRecovery:
 		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType)
 	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
+		beacons.Report(ctx, StatusBeaconBackstop)
 		switch {
 		// Continue+ref runs take the push lane below: the ref names the
 		// continued head branch, which IS the push target.
@@ -1961,10 +1984,11 @@ func (r *Runner) consumeEventsWithStallRetries(
 	traceProcessor spanEventProcessor,
 	spec agent.Spec,
 	followUps *turnFollowUps,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
 	limit := followUps.limit
 	for attempt := 0; ; attempt++ {
-		obs, err := r.consumeEvents(streamCtx, *handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+		obs, err := r.consumeEvents(streamCtx, *handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 		if !obs.providerStall || obs.terminalEvent != nil {
 			if followUps.retried > 0 || followUps.exhausted {
 				res.TurnContinuations = followUps.report()
@@ -2330,6 +2354,7 @@ func (r *Runner) drainMemoryInjects(
 	sink activitySink,
 	traceProcessor spanEventProcessor,
 	injectCh <-chan heartbeat.InjectPayload,
+	beacons *statusBeaconReporter,
 ) streamObservation {
 	var merged streamObservation
 	for {
@@ -2367,7 +2392,7 @@ func (r *Runner) drainMemoryInjects(
 			// follow-up liveness through its continuation bound, and a
 			// post-tool silence on a follow-up turn is an unfinished
 			// turn — never a provider error to retry outside that bound.
-			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 			injRes.applyTo(res, res.ProviderName)
 			merged = injRes
 			if enforcer != nil && enforcer.breached() != nil {
@@ -2579,8 +2604,9 @@ func (r *Runner) consumeEvents(
 	enforcer *BudgetEnforcer,
 	sink activitySink,
 	traceProcessor spanEventProcessor,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
-	return r.consumeEventsWithin(ctx, r.providerStallTimeout, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+	return r.consumeEventsWithin(ctx, r.providerStallTimeout, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 }
 
 // consumeEventsWithoutStallDetector drains a follow-up turn's events with
@@ -2601,8 +2627,9 @@ func (r *Runner) consumeEventsWithoutStallDetector(
 	enforcer *BudgetEnforcer,
 	sink activitySink,
 	traceProcessor spanEventProcessor,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
-	return r.consumeEventsWithin(ctx, 0, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+	return r.consumeEventsWithin(ctx, 0, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 }
 
 // consumeEventsWithin drains the handle's events channel, mirrors each
@@ -2637,6 +2664,7 @@ func (r *Runner) consumeEventsWithin(
 	enforcer *BudgetEnforcer,
 	sink activitySink,
 	traceProcessor spanEventProcessor,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
 	if sink == nil {
 		sink = noopSink{}
@@ -2899,7 +2927,7 @@ func (r *Runner) consumeEventsWithin(
 			for _, correlatedEvent := range traceProcessor.Process(ev) {
 				trackToolEvent(correlatedEvent)
 				appendJSONL(correlatedEvent)
-				r.observeEvent(correlatedEvent, &obs, worktreePath, qw)
+				r.observeEvent(correlatedEvent, &obs, worktreePath, qw, beacons)
 				// Forward sparse quota updates to the admitting daemon:
 				// a codex `account/rateLimits/updated` notification or
 				// a claude `rate_limit_event` arrives here as a
@@ -2983,7 +3011,8 @@ func (r *Runner) wrapUpMidTurn(ctx context.Context, handle agent.Handle, enforce
 
 // observeEvent applies a single event to the observation accumulator.
 // Side effects:
-//   - InitEvent → captures provider session id; mirrors to state.json.
+//   - InitEvent → captures provider session id; mirrors to state.json;
+//     reports the streaming step beacon.
 //   - ToolUseEvent → tracks comment/issue/sub-issue flags and
 //     extracts a PR URL when the agent invokes `gh pr create`.
 //   - AssistantTextEvent → scans for the WORK_RESULT marker and
@@ -2991,7 +3020,12 @@ func (r *Runner) wrapUpMidTurn(ctx context.Context, handle agent.Handle, enforce
 //   - ResultEvent → captures terminal cost/success.
 //   - ErrorEvent → records for FailureProviderError classification,
 //     unless it says the session continues (SessionContinues).
-func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePath string, _ QueuedWork) {
+//
+// The optional beacons reporter receives the streaming step on the first
+// InitEvent. It is a best-effort status post (step change + bounded rate
+// inside the reporter); a refused or unavailable endpoint never affects
+// the stream. Nil is the common case in unit tests.
+func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePath string, _ QueuedWork, beacons *statusBeaconReporter) {
 	switch e := ev.(type) {
 	case agent.InitEvent:
 		obs.providerID = e.SessionID
@@ -3001,6 +3035,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			s.CurrentStep = "streaming"
 			return nil
 		})
+		beacons.Report(context.Background(), StatusBeaconStreaming)
 	case agent.AssistantTextEvent:
 		if strings.TrimSpace(e.Text) != "" {
 			obs.lastAssistantText = e.Text
