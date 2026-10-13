@@ -613,11 +613,14 @@ func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArc
 	if !ok {
 		return nil, fmt.Errorf("archive root: committed archive timestamp is invalid: %w", ErrArchiveCorrupted)
 	}
+	// The manifest timestamp carries nanosecond precision; the versioned
+	// reference uses canonical millisecond precision.
+	committed := committedAt.UTC().Truncate(time.Millisecond)
 	reference := &workarea.TerminalArchiveReference{
 		SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: spec.WorkareaID,
 		ArchiveDigest: existing.TreeDigest, SessionID: existing.SessionID,
 		WorkareaID: existing.WorkareaID, TerminalResultID: spec.TerminalResultID,
-		CommittedAt: (*committedAt).UTC(),
+		CommittedAt: committed,
 	}
 	if err := reference.Validate(); err != nil {
 		return nil, fmt.Errorf("archive root: committed archive reference is invalid: %w", err)
@@ -3144,7 +3147,7 @@ func archiveReferenceForManifest(id string, m *archiveManifest) *afclient.Archiv
 	}
 	committedAt := m.CreatedAt
 	if created, ok := parseRFC3339(m.CreatedAt); ok && created != nil {
-		committedAt = created.UTC().Format(time.RFC3339Nano)
+		committedAt = created.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)
 	}
 	return &afclient.ArchiveReference{
 		SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: firstNonEmptyStr(m.ID, id),

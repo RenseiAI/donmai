@@ -21,9 +21,13 @@ type fakeWorkareaClient struct {
 	listErr      error
 	getResp      *afclient.WorkareaEnvelope
 	getErr       error
+	getV1Resp    *afclient.WorkareaV1Envelope
+	getV1Err     error
 	gotID        string
 	restoreResp  *afclient.WorkareaRestoreResult
 	restoreErr   error
+	restoreV1Resp *afclient.WorkareaRestoreV1Result
+	restoreV1Err  error
 	gotArchive   string
 	gotRestore   afclient.WorkareaRestoreRequest
 	diffResp     *afclient.WorkareaDiffResult
@@ -46,6 +50,23 @@ func (f *fakeWorkareaClient) GetWorkarea(id string) (*afclient.WorkareaEnvelope,
 	f.getCalls++
 	f.gotID = id
 	return f.getResp, f.getErr
+}
+
+func (f *fakeWorkareaClient) GetWorkareaV1(id string) (*afclient.WorkareaV1Envelope, error) {
+	f.getCalls++
+	f.gotID = id
+	if f.getV1Resp == nil && f.getV1Err == nil {
+		return nil, afclient.ErrNotFound
+	}
+	return f.getV1Resp, f.getV1Err
+}
+
+func (f *fakeWorkareaClient) RestoreWorkareaV1Context(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreV1Result, error) {
+	f.restoreCalls++
+	f.restoreCtx = ctx
+	f.gotArchive = archiveID
+	f.gotRestore = req
+	return f.restoreV1Resp, f.restoreV1Err
 }
 
 func (f *fakeWorkareaClient) RestoreWorkareaContext(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error) {
@@ -398,5 +419,54 @@ func TestDefaultWorkareaClientFactory(t *testing.T) {
 	c := defaultWorkareaClientFactory(afclient.DefaultDaemonConfig())
 	if c == nil {
 		t.Fatal("default factory returned nil")
+	}
+}
+
+func TestWorkareaCmd_Show_RendersArchiveReference(t *testing.T) {
+	client := &fakeWorkareaClient{getV1Resp: &afclient.WorkareaV1Envelope{
+		Workarea: afclient.WorkareaV1{
+			ID: "wa-detail", Kind: afclient.WorkareaKindArchived,
+			Status:    afclient.WorkareaStatusArchived,
+			SessionID: "11111111-1111-4111-8111-111111111111",
+			ArchiveReference: &afclient.ArchiveReference{
+				SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: "wa-detail",
+				ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				SessionID:     "11111111-1111-4111-8111-111111111111",
+				WorkareaID:    "wa-detail",
+			},
+		},
+	}}
+	root := newWorkareaRootForTest(client)
+	out, err := runRootCmd(t, root, "workarea", "show", "wa-detail")
+	if err != nil {
+		t.Fatalf("show: %v", err)
+	}
+	for _, want := range []string{"Archive reference:", "wa-detail", "sha256:aaaa"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestWorkareaCmd_Show_FallsBackToLegacyWithoutReference(t *testing.T) {
+	client := &fakeWorkareaClient{
+		getV1Err: errors.New("v1 unavailable"),
+		getResp: &afclient.WorkareaEnvelope{
+			Workarea: afclient.Workarea{
+				ID: "wa-legacy", Kind: afclient.WorkareaKindArchived,
+				Status: afclient.WorkareaStatusArchived,
+			},
+		},
+	}
+	root := newWorkareaRootForTest(client)
+	out, err := runRootCmd(t, root, "workarea", "show", "wa-legacy")
+	if err != nil {
+		t.Fatalf("show: %v", err)
+	}
+	if !strings.Contains(out, "wa-legacy") {
+		t.Errorf("output missing id:\n%s", out)
+	}
+	if strings.Contains(out, "Archive reference:") {
+		t.Errorf("legacy fallback must not invent a reference:\n%s", out)
 	}
 }

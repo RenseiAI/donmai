@@ -26,7 +26,9 @@ import (
 type workareaDaemonClient interface {
 	ListWorkareas() (*afclient.ListWorkareasResponse, error)
 	GetWorkarea(id string) (*afclient.WorkareaEnvelope, error)
+	GetWorkareaV1(id string) (*afclient.WorkareaV1Envelope, error)
 	RestoreWorkareaContext(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error)
+	RestoreWorkareaV1Context(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreV1Result, error)
 	DiffWorkareas(idA, idB string) (*afclient.WorkareaDiffResult, error)
 }
 
@@ -152,6 +154,13 @@ and the resolved toolchain map.`,
 }
 
 func runWorkareaShow(out io.Writer, client workareaDaemonClient, id string, jsonOut bool) error {
+	if env, err := client.GetWorkareaV1(id); err == nil {
+		if jsonOut {
+			return encodeWorkareaJSON(out, &env.Workarea)
+		}
+		noColor := workareaview.NoColorEnv()
+		return workareaview.RenderInspectV1(out, &env.Workarea, noColor)
+	}
 	env, err := client.GetWorkarea(id)
 	if err != nil {
 		if errors.Is(err, afclient.ErrNotFound) {
