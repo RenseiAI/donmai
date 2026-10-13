@@ -344,6 +344,19 @@ func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 	previous := e.lastResult.InputTokens + e.lastResult.OutputTokens
 	callTokens := e.pending.InputTokens + e.pending.OutputTokens
 	increment := *cost
+	// An empty terminal usage object is not evidence that the calls spent
+	// zero tokens. Keep their disjoint buckets, while retaining any terminal
+	// dollar amount and turn count instead of adding them twice.
+	if cost.InputTokens == 0 && cost.OutputTokens == 0 && cost.CachedInputTokens == 0 && cost.CacheWriteTokens == 0 && cost.ReasoningTokens == 0 {
+		increment.InputTokens = e.pending.InputTokens
+		increment.OutputTokens = e.pending.OutputTokens
+		increment.CachedInputTokens = e.pending.CachedInputTokens
+		increment.CacheWriteTokens = e.pending.CacheWriteTokens
+		increment.ReasoningTokens = e.pending.ReasoningTokens
+		if increment.NumTurns == 0 {
+			increment.NumTurns = e.pending.NumTurns
+		}
+	}
 	if previous > 0 && e.pending.NumTurns > 0 && total == previous+callTokens {
 		increment = costDifference(*cost, e.lastResult)
 	}
@@ -401,7 +414,7 @@ func (e *BudgetEnforcer) cost() *agent.CostData {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	total := addCost(e.metered, e.pending)
-	if total == (agent.CostData{}) {
+	if total.InputTokens == 0 && total.OutputTokens == 0 && total.CachedInputTokens == 0 && total.CacheWriteTokens == 0 && total.ReasoningTokens == 0 && total.TotalCostUsd == 0 {
 		return nil
 	}
 	return &total
