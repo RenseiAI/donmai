@@ -2003,7 +2003,14 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
 	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
-	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged {
+	// A rotated registration token rides alongside project changes: the new
+	// key must be adopted before the re-registration below, or the reload
+	// presents the revoked generation. Adoption is validated inside (a token
+	// for a different orchestrator or with a foreign shape is refused and
+	// the previous generation stays), so checking for the change here only
+	// decides whether the reload path runs at all.
+	registrationTokenChanged := d.credentials != nil && cfg.Orchestrator.AuthToken != "" && cfg.Orchestrator.AuthToken != d.config.Orchestrator.AuthToken
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !registrationTokenChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -2067,7 +2074,18 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
 			d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
 		}
+		_ = d.adoptRotatedRegistrationTokenLocked(cfg)
 		d.refreshRegistrationProjectsLocked()
+	} else if registrationTokenChanged {
+		// A pure rotation: the project declaration is unchanged, so there
+		// is nothing to publish — but the new generation must still be
+		// adopted before the re-registration presents it. A refused token
+		// leaves the registration exactly as it was, so there is nothing
+		// to re-present: re-registering anyway would mint a fresh worker
+		// identity on every later write of the same refused file.
+		if d.adoptRotatedRegistrationTokenLocked(cfg) && d.registrationReloadCtx != nil {
+			d.credentials.RequestReregister(d.registrationReloadCtx)
+		}
 	}
 	d.mu.Unlock()
 	releasePolicy()
@@ -2097,6 +2115,60 @@ func (d *Daemon) refreshRegistrationProjectsLocked() {
 	if d.registrationReloadCtx != nil {
 		d.credentials.RequestReregister(d.registrationReloadCtx)
 	}
+}
+
+// adoptRotatedRegistrationTokenLocked swaps the registration token the
+// credential refresher presents on the next refresh or re-registration, so a
+// token rotated alongside a config change takes effect without a restart.
+// The reloaded config value wins over the previous generation only when it
+// still names the running registration: the orchestrator URL must be
+// unchanged (a re-home is a restart-level change the watcher never applies)
+// and the token must keep the platform's registration-token shape (a blank
+// or foreign credential is never adopted mid-flight). The running
+// registration must itself be a platform registration: a daemon that booted
+// on the stub path never started its poll loop, so switching it to a real
+// registration live would leave a worker that heartbeats but never claims
+// work — promoting it is a restart. A refused token leaves the previous
+// generation in place. Reports whether the token was adopted. Caller holds
+// d.mu.
+func (d *Daemon) adoptRotatedRegistrationTokenLocked(cfg *Config) bool {
+	if d.credentials == nil || d.config == nil || cfg == nil {
+		return false
+	}
+	previousToken, runningURL := d.credentials.Registration()
+	nextToken := cfg.Orchestrator.AuthToken
+	if nextToken == "" || nextToken == previousToken {
+		return false
+	}
+	if normalizeOrchestratorURL(cfg.Orchestrator.URL) != normalizeOrchestratorURL(runningURL) {
+		slog.Warn("[yaml-watcher] refused rotated registration token for a different orchestrator")
+		return false
+	}
+	if !looksLikeRegistrationToken(nextToken) {
+		slog.Warn("[yaml-watcher] refused rotated registration token with an unrecognized shape")
+		return false
+	}
+	if !looksLikeRegistrationToken(previousToken) {
+		slog.Warn("[yaml-watcher] refused registration token: the running daemon is not platform-registered; restart to register")
+		return false
+	}
+	d.credentials.UpdateRegistrationToken(nextToken)
+	d.config.Orchestrator.AuthToken = nextToken
+	slog.Info("[yaml-watcher] adopted rotated registration token")
+	return true
+}
+
+// normalizeOrchestratorURL canonicalizes an orchestrator URL for identity
+// comparison: a trailing slash is a serialization detail, not a re-home.
+func normalizeOrchestratorURL(url string) string {
+	if url == "" {
+		return ""
+	}
+	trimmed := url
+	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	return trimmed
 }
 
 // Stop begins a one-way terminal transition. An incomplete drain leaves the
