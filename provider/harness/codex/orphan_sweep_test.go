@@ -1694,3 +1694,42 @@ func TestSweepOrphans_ReclaimsPersistentCodexHomeOrphan(t *testing.T) {
 		t.Fatalf("persistent-Codex-home orphan survived: err=%v", err)
 	}
 }
+
+// TestSweepOrphans_ProtectsAdoptedHomeThroughSymlinkedRoot pins the
+// protected-home match across root spellings. A boundary creates its home
+// under the symlink-resolved parent, so a resume key records the resolved
+// path, while the sweep joins entries onto Root as given. On macOS the
+// default root (os.TempDir(), /var/folders/...) is itself a symlinked
+// spelling of /private/var/folders/..., so this is the production shape there.
+//
+// RED proof: compare only filepath.Clean(path) against ProtectedHomes and
+// the adopted home is reclaimed.
+func TestSweepOrphans_ProtectsAdoptedHomeThroughSymlinkedRoot(t *testing.T) {
+	requireManifestVerification(t)
+	realRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkRoot := filepath.Join(t.TempDir(), "linked-root")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	home := filepath.Join(realRoot, codexHomePrefix+"adopted-via-link")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexConfigFileName), []byte("mcp_servers = {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
+	ageTree(t, home, time.Now(), 48*time.Hour)
+
+	protected := map[string]struct{}{filepath.Clean(home): {}}
+	report := SweepOrphans(context.Background(), SweepOptions{Root: linkRoot, MinAge: time.Hour, ProtectedHomes: protected})
+	if report.SkippedProtected != 1 || report.Reclaimed != 0 {
+		t.Fatalf("report = %+v, want one skipped-protected and zero reclaimed", report)
+	}
+	if _, err := os.Stat(filepath.Join(home, codexConfigFileName)); err != nil {
+		t.Fatalf("protected adopted home reached through a symlinked root was reclaimed: %v", err)
+	}
+}

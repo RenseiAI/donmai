@@ -309,7 +309,9 @@ type SweepOptions struct {
 	// A restarted daemon's owner manifest names a dead process for those
 	// homes, so the ordinary owner-liveness gate cannot protect them — yet
 	// their app-server may have been re-adopted and be serving. Entries are
-	// compared after filepath.Clean; an empty set protects nothing.
+	// compared after filepath.Clean, against both the Root-joined and the
+	// symlink-resolved spelling of each candidate (see isProtectedHome); an
+	// empty set protects nothing.
 	ProtectedHomes map[string]struct{}
 
 	// processAlive / processLooksLikeCodex / identityAlive / now / startAt
@@ -654,7 +656,7 @@ func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report
 	// daemon generation that is definitionally dead. The manifest liveness
 	// gate below cannot protect those homes, so the caller's explicit set
 	// does — before any signal, delete, or manifest read.
-	if _, ok := opts.ProtectedHomes[filepath.Clean(path)]; ok {
+	if opts.isProtectedHome(path) {
 		report.SkippedProtected++
 		opts.Logger.Debug("codex: orphan sweep left an artifact directory referenced by a live adopted session",
 			"path", path, "kind", kind)
@@ -686,6 +688,30 @@ func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report
 		return false
 	}
 	return opts.reclaim(path, kind, info, report)
+}
+
+// isProtectedHome reports whether path names a home in ProtectedHomes under
+// either spelling: as joined from Root, or with Root's symlinks resolved.
+// Both spellings occur in production. A boundary creates its home under the
+// symlink-resolved parent (see newCodexConfigBoundaryWithAuthMode), so a
+// resume key records that resolved path, while the sweep joins entries onto
+// Root as given. On macOS os.TempDir() is /var/folders/..., a symlink into
+// /private/var/folders/..., so an exact-string match alone would never
+// protect a temp-rooted adopted home there. path itself was already Lstat'd
+// as a real directory, so resolving it only rewrites Root's own spelling.
+func (opts SweepOptions) isProtectedHome(path string) bool {
+	if len(opts.ProtectedHomes) == 0 {
+		return false
+	}
+	if _, ok := opts.ProtectedHomes[filepath.Clean(path)]; ok {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	_, ok := opts.ProtectedHomes[filepath.Clean(resolved)]
+	return ok
 }
 
 // sweepManifested handles an entry whose owner manifest this process proved

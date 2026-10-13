@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,5 +219,51 @@ func TestDaemonSweepCodexOrphansSkipsAnUnresolvablePersistentRoot(t *testing.T) 
 	}
 	if len(roots) == 0 {
 		t.Fatal("sweeper was never called")
+	}
+}
+
+// TestDaemonCodexOrphanSweepLoopTicksAndStopsWithContext pins the periodic
+// half: the loop re-runs a full multi-root pass on every tick, and returns
+// once its context ends with no further passes. The production interval is
+// an hour; the loop body takes the interval as a parameter so this runs in
+// milliseconds.
+//
+// RED proof: make runCodexOrphanSweepLoop return without ticking and the
+// pass count never grows; drop the ctx.Done case and the loop never returns.
+func TestDaemonCodexOrphanSweepLoopTicksAndStopsWithContext(t *testing.T) {
+	var calls atomic.Int64
+	d := newTestDaemonForSweep(t, Options{
+		CodexOrphanSweeper: func(_ context.Context, _ providercodex.SweepOptions) providercodex.SweepReport {
+			calls.Add(1)
+			return providercodex.SweepReport{}
+		},
+	})
+	roots := int64(len(providercodex.DedupeCodexHomeRoots(providercodex.DefaultCodexHomeRoots())))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.runCodexOrphanSweepLoop(ctx, 5*time.Millisecond)
+	}()
+
+	deadline := time.After(10 * time.Second)
+	for calls.Load() < 2*roots {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("sweeper calls = %d after 10s, want at least two passes over %d roots", calls.Load(), roots)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sweep loop did not return after its context was cancelled")
+	}
+	settled := calls.Load()
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != settled {
+		t.Fatalf("sweeper calls grew from %d to %d after the loop returned", settled, got)
 	}
 }

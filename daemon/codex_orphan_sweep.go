@@ -28,10 +28,10 @@ const codexOrphanSweepTimeout = 45 * time.Second
 const codexOrphanSweepInterval = time.Hour
 
 // CodexOrphanSweepFunc is the shape of a sweep pass: the one the real
-// providercodex.SweepCodexHomes has, and the one Options.CodexOrphanSweeper
+// providercodex.SweepOrphans has, and the one Options.CodexOrphanSweeper
 // is typed as. Keeping it a named type (rather than inlining the signature
 // at both the field and the real function) is what lets a test assign
-// providercodex.SweepCodexHomes itself to it without a wrapper closure.
+// providercodex.SweepOrphans itself to it without a wrapper closure.
 type CodexOrphanSweepFunc func(context.Context, providercodex.SweepOptions) providercodex.SweepReport
 
 // sweepCodexOrphans runs one codex-harness orphan sweep pass over every
@@ -57,7 +57,7 @@ type CodexOrphanSweepFunc func(context.Context, providercodex.SweepOptions) prov
 // d.opts.CodexOrphanSweeper is nil unless a caller explicitly configures it,
 // which makes this a no-op — no root read, no delete, no signal — for
 // every Start call that does not ask for it. Only the production entry
-// point (afcli/daemon_run.go) sets it, to providercodex.SweepCodexHomes, so
+// point (afcli/daemon_run.go) sets it, to providercodex.SweepOrphans, so
 // operator behaviour is unchanged; a test that wants to observe or exercise
 // the sweep sets Options.CodexOrphanSweeper itself instead of relying on (or
 // fighting) a package-wide default.
@@ -114,18 +114,25 @@ func (d *Daemon) startCodexOrphanSweepLoop(ctx context.Context) {
 	if d.opts.CodexOrphanSweeper == nil {
 		return
 	}
-	go func() {
-		ticker := time.NewTicker(codexOrphanSweepInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				d.sweepCodexOrphans(ctx)
-			}
+	go d.runCodexOrphanSweepLoop(ctx, codexOrphanSweepInterval)
+}
+
+// runCodexOrphanSweepLoop is the blocking body of startCodexOrphanSweepLoop:
+// one sweep pass per interval tick, passes strictly sequential (a pass
+// still running when the next tick lands delays it rather than overlapping
+// it), returning as soon as ctx ends. The interval is a parameter so a test
+// can observe ticks and shutdown without waiting an hour.
+func (d *Daemon) runCodexOrphanSweepLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.sweepCodexOrphans(ctx)
 		}
-	}()
+	}
 }
 
 // liveAdoptedCodexHomes collects the absolute codex-home paths still
