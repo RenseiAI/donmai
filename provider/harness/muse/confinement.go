@@ -420,7 +420,12 @@ func confineMuseSession(spec agent.Spec, workspaceRoot, sessionDir string, confi
 			return nil, fmt.Errorf("%w: muse confinement session cache: %v", agent.ErrSpawnFailed, err)
 		}
 	}
+	loopbackPorts, err := endpointLoopbackPorts(spec)
+	if err != nil {
+		return nil, err
+	}
 	cspec := museSeatSpec(spec, workspaceRoot, tmpDir, caches, reads, tokenPath)
+	cspec.LoopbackTCPPorts = loopbackPorts
 	plan, err := confiner.Prepare(cspec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
@@ -433,7 +438,11 @@ func confineMuseSession(spec agent.Spec, workspaceRoot, sessionDir string, confi
 // tokenPath is the spawner-stated daemon token path (Options, threaded
 // from the daemon that minted the token): it reaches the daemon-private
 // deny explicitly, never through the inherited environment the spawner
-// strips.
+// strips. The caller (confineMuseSession) sets LoopbackTCPPorts from
+// endpointLoopbackPorts before preparing: a model endpoint on this
+// machine has its port declared so model calls keep working, and an
+// endpoint naming the daemon control API or the credential socket is
+// refused first.
 func museSeatSpec(spec agent.Spec, workspaceRoot, tmpDir string, caches []confinement.Cache, reads museReadScope, tokenPath string) confinement.Spec {
 	cspec := confinement.Spec{
 		SessionID:   "muse-" + sanitizeMuseSessionKey(workspaceRoot),

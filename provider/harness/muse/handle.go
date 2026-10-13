@@ -94,7 +94,7 @@ type Handle struct {
 	// caller-owned per-session scratch directory holding the tmp and
 	// cache subdirectories; removed when the session stops.
 	confinement     confinementPlan
-	sessionDir       string
+	sessionDir      string
 	confinementOnce sync.Once
 
 	state *mapperState

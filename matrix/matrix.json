@@ -452,6 +452,12 @@
   ],
   "binaryPins": [
     {
+      "harness": "muse",
+      "minVersion": "1.4.6",
+      "pinnedVersion": "1.4.6",
+      "verifiedAgainst": "1.4.6"
+    },
+    {
       "harness": "opencode",
       "minVersion": "1.17.18",
       "pinnedVersion": "1.17.18",

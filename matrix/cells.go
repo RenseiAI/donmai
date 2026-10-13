@@ -19,6 +19,7 @@ package matrix
 
 import (
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
@@ -388,6 +389,13 @@ var harnessBinaryPins = map[agent.HarnessName]HarnessBinaryPin{
 		MinVersion:      pi.MinVersion,
 		PinnedVersion:   pi.PinnedVersion,
 		VerifiedAgainst: pi.VerifiedAgainst,
+	},
+	// The serve host drifts independently of donmai releases; the pin is
+	// enforced probe-time in provider/harness/muse (checkMuseVersion).
+	agent.HarnessMuse: {
+		MinVersion:      muse.MinVersion,
+		PinnedVersion:   muse.PinnedVersion,
+		VerifiedAgainst: muse.VerifiedAgainst,
 	},
 }
 

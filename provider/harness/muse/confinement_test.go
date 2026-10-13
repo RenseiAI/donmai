@@ -175,6 +175,27 @@ func TestServeArgsUnderConfinement_LaneFlagsSurvive(t *testing.T) {
 	}
 }
 
+// TestEndpointLoopbackPorts_RefusesSupervisorChannels pins the
+// fail-closed port declaration: a remote endpoint or none declares
+// nothing, a loopback endpoint declares its port, and an endpoint naming
+// the daemon control API is refused rather than opened.
+func TestEndpointLoopbackPorts_RefusesSupervisorChannels(t *testing.T) {
+	t.Parallel()
+	if ports, err := endpointLoopbackPorts(agent.Spec{}); err != nil || len(ports) != 0 {
+		t.Errorf("no endpoint = %v,%v, want no ports", ports, err)
+	}
+	if ports, err := endpointLoopbackPorts(agent.Spec{Endpoint: &agent.EndpointBinding{BaseURL: "https://models.example.invalid/v1"}}); err != nil || len(ports) != 0 {
+		t.Errorf("remote endpoint = %v,%v, want no ports", ports, err)
+	}
+	ports, err := endpointLoopbackPorts(agent.Spec{Endpoint: &agent.EndpointBinding{BaseURL: "http://127.0.0.1:11434/v1"}})
+	if err != nil || len(ports) != 1 || ports[0] != 11434 {
+		t.Errorf("loopback endpoint = %v,%v, want [11434]", ports, err)
+	}
+	if _, err := endpointLoopbackPorts(agent.Spec{Endpoint: &agent.EndpointBinding{BaseURL: "http://127.0.0.1:7734/v1"}}); err == nil {
+		t.Error("control-API endpoint accepted, want refusal")
+	}
+}
+
 // TestConfineMuseSeatSpecForTest_SharesProductionLines pins that the test
 // seam builds the same workarea + daemon-private lines the production
 // entry point builds (shared through museSeatSpec, not copied): the
