@@ -380,8 +380,8 @@ All subcommands output JSON.
 
 ```bash
 donmai linear get-issue <id>
-donmai linear create-issue --title "..." --team "..."
-donmai linear update-issue <id> [--project "<name|slug|uuid>"] [--status "..."]
+donmai linear create-issue --title "..." --team "..." [--assignee "<id|name|email|me>"] [--priority 2]
+donmai linear update-issue <id> [--project "<name|slug|uuid>"] [--status "..."] [--assignee "<id|name|email|me|null>"]
 donmai linear list-issues [--project "..."] [--status "..."]
 donmai linear create-comment <issue-id> --body "..."
 donmai linear list-comments <issue-id>
@@ -403,6 +403,14 @@ default `--parents-only` filter excludes sub-issues.
 
 `get-issue` always includes `parentId` and `parentIdentifier`. Both are JSON
 strings for a child issue and explicit `null` values for a root issue.
+
+`create-issue` accepts `--assignee <user ID|name|email|me>` to assign the new
+issue in the same mutation, plus `--priority 0-4`. `update-issue` accepts the
+same `--assignee` spellings, with `--assignee null` clearing the assignment
+(explicit GraphQL null, matching the `--parentId null` clear contract).
+Assignee names, emails, and `me` (the authenticated viewer) resolve through
+the configured transport, so the flags work over the hosted proxy as well as
+with a direct API key; unknown values fail before any mutation runs.
 
 **Authentication**: set `LINEAR_API_KEY` (or `LINEAR_ACCESS_TOKEN`).
 
