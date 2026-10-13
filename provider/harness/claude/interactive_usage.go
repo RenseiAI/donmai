@@ -20,10 +20,9 @@ import (
 // the exit sum is the reconciled total, and the runner's own budget meter
 // already reconciles the two without double counting.
 //
-// The transcript is located through the Stop hook's durable locator — the
-// latest stdin the hook kept — so no out-of-band state is needed. Polling
-// starts once the locator exists; before the hook's first fire there is
-// nothing to read.
+// The transcript is located through the Stop hook's durable locator, falling
+// back to the conversation id pinned on the CLI argv before the first Stop.
+// Both the live tail and exit sum use the same session-scoped locator.
 //
 // Posture: best-effort and rate-limited, never blocking the PTY. The tailer
 // runs on its own goroutine, polls on a 1s ticker, caps lines and events per
