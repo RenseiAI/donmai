@@ -626,3 +626,90 @@ func TestOnYamlChanged_IgnoresUnchangedToken(t *testing.T) {
 		t.Errorf("refresher token = %q, want the unchanged generation", token)
 	}
 }
+
+// TestOnYamlChanged_RefusedTokenLeavesRegistrationUntouched pins that a
+// refused token is a full no-op for the registration half of a reload: the
+// refresher and the stored config keep the previous generation, and no
+// re-registration runs. Re-registering against an unchanged registration
+// would mint a fresh worker identity on every later write of the same
+// refused file. The stub case pins that a daemon running on the stub path
+// (no platform registration, so no poll loop) is never promoted to a real
+// registration live: that switch would heartbeat without ever claiming work.
+func TestOnYamlChanged_RefusedTokenLeavesRegistrationUntouched(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		runningToken string
+		nextURL      func(srvURL string) string
+		nextToken    string
+	}{
+		{
+			name:         "foreign shape",
+			runningToken: "rsp_live_before",
+			nextURL:      func(srvURL string) string { return srvURL },
+			nextToken:    "operator-pasted-wrong-value",
+		},
+		{
+			name:         "different orchestrator",
+			runningToken: "rsp_live_before",
+			nextURL:      func(string) string { return "https://elsewhere.example.test" },
+			nextToken:    "rsp_live_foreign",
+		},
+		{
+			name:         "running on the stub path",
+			runningToken: "local-stub-no-token",
+			nextURL:      func(srvURL string) string { return srvURL },
+			nextToken:    "rsk_live_promoted",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			t.Cleanup(cancel)
+			var mu sync.Mutex
+			requests := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				mu.Lock()
+				requests++
+				mu.Unlock()
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_churned", "runtimeToken": "churned.jwt"})
+			}))
+			t.Cleanup(srv.Close)
+
+			opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+			opts.Registration.RegistrationToken = tc.runningToken
+			credentials := NewCredentialRefresher(opts)
+			d := &Daemon{
+				config: &Config{
+					Orchestrator: OrchestratorConfig{URL: srv.URL, AuthToken: tc.runningToken},
+				},
+				credentials:           credentials,
+				registrationReloadCtx: ctx,
+			}
+			d.onYamlChanged(&Config{
+				Orchestrator: OrchestratorConfig{URL: tc.nextURL(srv.URL), AuthToken: tc.nextToken},
+			})
+			if err := credentials.WaitReregister(ctx); err != nil {
+				t.Fatalf("wait for reload registration: %v", err)
+			}
+			if token, _ := credentials.Registration(); token != tc.runningToken {
+				t.Errorf("refresher token = %q, want the previous generation kept", token)
+			}
+			if d.config.Orchestrator.AuthToken != tc.runningToken {
+				t.Errorf("stored config token = %q, want the previous generation kept", d.config.Orchestrator.AuthToken)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if requests != 0 {
+				t.Errorf("refused token made %d registration request(s), want none", requests)
+			}
+			if workerID, _ := credentials.Current(); workerID != "wkr_before" {
+				t.Errorf("worker id = %q, want the running identity kept", workerID)
+			}
+		})
+	}
+}

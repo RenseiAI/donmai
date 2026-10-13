@@ -2057,16 +2057,16 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
 			d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
 		}
-		d.adoptRotatedRegistrationTokenLocked(cfg)
+		_ = d.adoptRotatedRegistrationTokenLocked(cfg)
 		d.refreshRegistrationProjectsLocked()
 	} else if registrationTokenChanged {
 		// A pure rotation: the project declaration is unchanged, so there
 		// is nothing to publish — but the new generation must still be
-		// adopted before the re-registration presents it. Adoption runs
-		// before the request; a refused token keeps the previous
-		// generation and the re-register still runs against it.
-		d.adoptRotatedRegistrationTokenLocked(cfg)
-		if d.credentials != nil && d.registrationReloadCtx != nil {
+		// adopted before the re-registration presents it. A refused token
+		// leaves the registration exactly as it was, so there is nothing
+		// to re-present: re-registering anyway would mint a fresh worker
+		// identity on every later write of the same refused file.
+		if d.adoptRotatedRegistrationTokenLocked(cfg) && d.registrationReloadCtx != nil {
 			d.credentials.RequestReregister(d.registrationReloadCtx)
 		}
 	}
@@ -2107,28 +2107,38 @@ func (d *Daemon) refreshRegistrationProjectsLocked() {
 // still names the running registration: the orchestrator URL must be
 // unchanged (a re-home is a restart-level change the watcher never applies)
 // and the token must keep the platform's registration-token shape (a blank
-// or foreign credential is never adopted mid-flight). A refused token leaves
-// the previous generation in place. Caller holds d.mu.
-func (d *Daemon) adoptRotatedRegistrationTokenLocked(cfg *Config) {
+// or foreign credential is never adopted mid-flight). The running
+// registration must itself be a platform registration: a daemon that booted
+// on the stub path never started its poll loop, so switching it to a real
+// registration live would leave a worker that heartbeats but never claims
+// work — promoting it is a restart. A refused token leaves the previous
+// generation in place. Reports whether the token was adopted. Caller holds
+// d.mu.
+func (d *Daemon) adoptRotatedRegistrationTokenLocked(cfg *Config) bool {
 	if d.credentials == nil || d.config == nil || cfg == nil {
-		return
+		return false
 	}
 	previousToken, runningURL := d.credentials.Registration()
 	nextToken := cfg.Orchestrator.AuthToken
 	if nextToken == "" || nextToken == previousToken {
-		return
+		return false
 	}
 	if normalizeOrchestratorURL(cfg.Orchestrator.URL) != normalizeOrchestratorURL(runningURL) {
 		slog.Warn("[yaml-watcher] refused rotated registration token for a different orchestrator")
-		return
+		return false
 	}
 	if !looksLikeRegistrationToken(nextToken) {
 		slog.Warn("[yaml-watcher] refused rotated registration token with an unrecognized shape")
-		return
+		return false
+	}
+	if !looksLikeRegistrationToken(previousToken) {
+		slog.Warn("[yaml-watcher] refused registration token: the running daemon is not platform-registered; restart to register")
+		return false
 	}
 	d.credentials.UpdateRegistrationToken(nextToken)
 	d.config.Orchestrator.AuthToken = nextToken
 	slog.Info("[yaml-watcher] adopted rotated registration token")
+	return true
 }
 
 // normalizeOrchestratorURL canonicalizes an orchestrator URL for identity
