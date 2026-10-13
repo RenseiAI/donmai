@@ -297,6 +297,7 @@ func TestArchiveQuiescence_EscapedDescendantMutationFailsClosed(t *testing.T) {
 		<-releaseCopy
 		return nil
 	}})
+	//nolint:gosec // G204: re-executes the test binary with a fixed test selector.
 	helper := exec.Command(os.Args[0], "-test.run", "TestArchiveQuiescence_EscapedDescendantMutationFailsClosed")
 	helper.Env = append(os.Environ(),
 		"DONMAI_TEST_ARCHIVE_ESCAPED_WRITER=1",
@@ -432,6 +433,7 @@ func runArchiveEscapedWriter() {
 	}
 	// First fork: re-execute as the grandchild, then exit the middle.
 	if os.Getenv("DONMAI_TEST_ARCHIVE_ESCAPED_GRANDCHILD") != "1" {
+		//nolint:gosec // G204: re-executes the test binary with a fixed test selector.
 		cmd := exec.Command(os.Args[0], "-test.run", "TestArchiveQuiescence_EscapedDescendantMutationFailsClosed")
 		cmd.Env = append(os.Environ(), "DONMAI_TEST_ARCHIVE_ESCAPED_GRANDCHILD=1")
 		_ = cmd.Start()
@@ -446,7 +448,7 @@ func runArchiveEscapedWriter() {
 	// wall-clock time) bounds the loop so short test timeouts cannot
 	// truncate the escape mid-proof.
 	for i := 0; i < 10000; i++ {
-		f, err := os.OpenFile(filepath.Join(dir, "escaped.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(filepath.Join(dir, "escaped.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G703: dir is the test-owned escaped-writer directory.
 		if err != nil {
 			os.Exit(1)
 		}

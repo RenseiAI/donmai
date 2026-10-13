@@ -3037,11 +3037,6 @@ func archiveFirstLine(s string) string {
 // Restore paths keep using copyRootContents so an already-committed
 // archive always reproduces byte for byte, including archives written
 // before the exclusion existed.
-func copyRootContentsExcluding(source, destination *os.Root, sourceRootName string) ([]string, error) {
-	excluded, _, err := copyRootContentsExcludingGuarded(source, destination, sourceRootName)
-	return excluded, err
-}
-
 // copyRootContentsExcludingGuarded copies like copyRootContentsExcluding
 // and additionally returns the guard that decided the exclusions, so the
 // capture-stability witness can reuse the same inspection instead of
@@ -3200,7 +3195,7 @@ func copyRootFile(source, destination *os.Root, name string, expected os.FileInf
 	if current, statErr := in.Stat(); statErr != nil || current.Size() != expected.Size() {
 		_ = out.Close()
 		_ = destination.Remove(name)
-		return fmt.Errorf(errArchiveCopyChanged)
+		return errors.New(errArchiveCopyChanged)
 	}
 	if err := copySparseData(in, out, expected.Size()); err != nil {
 		_ = out.Close()
@@ -3216,7 +3211,7 @@ func copyRootFile(source, destination *os.Root, name string, expected os.FileInf
 	if current, statErr := in.Stat(); statErr != nil || current.Size() != expected.Size() {
 		_ = out.Close()
 		_ = destination.Remove(name)
-		return fmt.Errorf(errArchiveCopyChanged)
+		return errors.New(errArchiveCopyChanged)
 	}
 	if err := out.Sync(); err != nil {
 		_ = out.Close()

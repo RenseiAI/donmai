@@ -160,7 +160,7 @@ func TestWriterQuiescence_OrdinaryQuiescedReleaseArchivesBeforeDisposal(t *testi
 // recorded unquiesced so operators can distinguish it.
 func TestWriterQuiescence_UnquiescedReleaseProceedsAsUnquiescedEvidence(t *testing.T) {
 	parent := t.TempDir()
-	var archivedQuiesced = true
+	archivedQuiesced := true
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: quiescenceSessionID,
 		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) error {
