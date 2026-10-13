@@ -315,6 +315,10 @@ func TestRealBinary_SequentialToolOverride_KeepsPolicyFence(t *testing.T) {
 	realBinaryAvailable(t)
 
 	workdir := t.TempDir()
+	// Give the refused deletion a real target whose preservation is observable.
+	if err := os.Mkdir(filepath.Join(workdir, piStateDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	inside := filepath.Join(workdir, "inside.txt")
 	outside := filepath.Join(t.TempDir(), "must-not-exist.txt")
 	marshal := func(v map[string]any) string {

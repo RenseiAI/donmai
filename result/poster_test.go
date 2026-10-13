@@ -1464,3 +1464,34 @@ func TestPosterPost_StatusUpstreamErrorSerialized(t *testing.T) {
 		})
 	}
 }
+
+func TestPoster_GenerationIDs(t *testing.T) {
+	t.Parallel()
+	for _, ids := range [][]string{nil, {}, {"response-one", "response-two"}} {
+		t.Run(strings.Join(ids, ","), func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				got, present := body["generationIds"]
+				if strings.HasSuffix(req.URL.Path, "/status") && len(ids) > 0 {
+					want, _ := json.Marshal(ids)
+					if string(got) != string(want) {
+						t.Errorf("generationIds = %s; want %s", got, want)
+					}
+				} else if present {
+					t.Errorf("unexpected generationIds = %s", got)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			r := goodResult()
+			r.GenerationIDs = ids
+			if err := newPoster(t, srv.URL, 0).Post(t.Context(), "session", r); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

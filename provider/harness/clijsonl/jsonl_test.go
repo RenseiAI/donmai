@@ -80,7 +80,7 @@ func TestMapLine_AssistantText(t *testing.T) {
 
 func TestMapLine_AssistantPerCallUsage(t *testing.T) {
 	t.Parallel()
-	line := []byte(`{"type":"assistant","message":{"model":"claude-opus-4","stop_reason":"tool_use","usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80},"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]}}`)
+	line := []byte(`{"type":"assistant","message":{"id":"response-one","model":"claude-opus-4","stop_reason":"tool_use","usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80},"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]}}`)
 	events := mapLine(line)
 	if len(events) != 2 {
 		t.Fatalf("got %d events, want LlmCallEvent + ToolUseEvent", len(events))
@@ -89,7 +89,7 @@ func TestMapLine_AssistantPerCallUsage(t *testing.T) {
 	if !ok {
 		t.Fatalf("event[0] %T, want LlmCallEvent", events[0])
 	}
-	if llm.Model != "claude-opus-4" || llm.ResponseModel != "claude-opus-4" || llm.InputTokens != 120 || llm.OutputTokens != 30 || llm.CachedInputTokens != 80 {
+	if llm.GenerationID != "response-one" || llm.Model != "claude-opus-4" || llm.ResponseModel != "claude-opus-4" || llm.InputTokens != 120 || llm.OutputTokens != 30 || llm.CachedInputTokens != 80 {
 		t.Fatalf("unexpected usage event: %+v", llm)
 	}
 	if llm.UsageSource != agent.LlmUsageProvider || llm.Synthetic {
@@ -652,7 +652,7 @@ func TestDecodeInput_MalformedReturnsNil(t *testing.T) {
 
 func TestResponseModelFromNativeMessageWithoutUsage(t *testing.T) {
 	t.Parallel()
-	events := mapLine([]byte(`{"type":"assistant","message":{"model":"native-response-id","content":[]}}`))
+	events := mapLine([]byte(`{"type":"assistant","message":{"id":"response-one","model":"native-response-id","content":[]}}`))
 	if len(events) != 1 {
 		t.Fatalf("response identity was dropped without usage: %+v", events)
 	}
@@ -684,9 +684,12 @@ func TestNativeModelObservationPreservesTerminalAggregateUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	var observation *agent.ObservedModelIdentity
-	for _, ev := range mapLine([]byte(`{"type":"assistant","message":{"model":"native-response-id","content":[{"type":"text","text":"done"}]}}`)) {
+	for _, ev := range mapLine([]byte(`{"type":"assistant","message":{"id":"response-one","model":"native-response-id","content":[{"type":"text","text":"done"}]}}`)) {
 		for _, processed := range processor.Process(ev) {
 			if status, ok := processed.(agent.SystemEvent); ok && status.ObservedModel != nil {
+				if status.GenerationID != "response-one" {
+					t.Fatalf("generation id = %q; want response-one", status.GenerationID)
+				}
 				observation = status.ObservedModel
 			}
 			if call, ok := processed.(agent.LlmCallEvent); ok && call.ResponseModel != "" {
@@ -1004,5 +1007,33 @@ func TestMapLine_CacheWriteTokens(t *testing.T) {
 				t.Errorf("usage = %+v; want %+v", *got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMapLine_GenerationIDWithoutUsage(t *testing.T) {
+	t.Parallel()
+	events := mapLine([]byte(`{"type":"assistant","message":{"id":"response-one","content":[]}}`))
+	if len(events) != 1 {
+		t.Fatalf("events = %v; want response id observation", events)
+	}
+	ev, ok := events[0].(agent.SystemEvent)
+	if !ok || ev.GenerationID != "response-one" || ev.Subtype != agent.SystemSubtypeGenerationID {
+		t.Fatalf("event = %+v; want response-one observation", events[0])
+	}
+}
+
+func TestMapLine_StreamingGenerationID(t *testing.T) {
+	t.Parallel()
+	events := (&LineMapper{}).MapLine([]byte(`{"type":"stream_event","event":{"type":"message_start","message":{"id":"response-one"}}}`))
+	if len(events) != 2 {
+		t.Fatalf("events = %v; want response id and stream progress", events)
+	}
+	ev, ok := events[0].(agent.SystemEvent)
+	if !ok || ev.GenerationID != "response-one" {
+		t.Fatalf("event = %+v; want response-one", events[0])
+	}
+	progress, ok := events[1].(agent.SystemEvent)
+	if !ok || progress.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Fatalf("event = %+v; want stream progress", events[1])
 	}
 }

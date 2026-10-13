@@ -74,9 +74,14 @@ type ObservedModelIdentity struct {
 // not a model call or usage measurement and must not suppress aggregate usage.
 const SystemSubtypeModelIdentity = "model_identity"
 
+// SystemSubtypeGenerationID identifies a metadata-only response-id observation.
+const SystemSubtypeGenerationID = "generation_id"
+
 // SystemEvent is a provider-emitted lifecycle/status event (compaction,
 // rate-limit notice, etc.). Verbatim port of AgentSystemEvent.
 type SystemEvent struct {
+	// GenerationID is a native per-request response id, independent of usage.
+	GenerationID string `json:"generationId,omitempty"`
 	// ObservedModel is native response metadata, independent of configured
 	// model/provider and ordinary status Message. Nil means not observed.
 	ObservedModel *ObservedModelIdentity `json:"observedModel,omitempty"`
@@ -224,6 +229,8 @@ const (
 // only aggregate usage is available. Prompt and completion bodies are never
 // carried on this event: optional prompt/context correlation is digest-only.
 type LlmCallEvent struct {
+	// GenerationID is the native response id when the harness exposes it.
+	GenerationID string `json:"generationId,omitempty"`
 	// TraceID, SpanID, and ParentSpanID are populated by the runner's session
 	// correlator. Provider adapters may leave them empty.
 	TraceID      string `json:"traceId,omitempty"`
