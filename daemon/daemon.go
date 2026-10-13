@@ -974,6 +974,14 @@ const (
 	// claimSuspendedReasonPaused suspends every scope while the operator
 	// pauses this host.
 	claimSuspendedReasonPaused = "daemon is paused"
+	// claimSuspendedReasonRecovering suspends every scope while the host is
+	// between revisions: a dynamic adoption publication, a re-adoption, or
+	// a proof-v2 withdrawal pauses the shared spawner and moves the
+	// lifecycle out of Running until the exact acknowledged beat reopens
+	// admission. The pause is on the host-wide spawner, so the suspension
+	// is host-wide too — unlike a first-heartbeat fence on a host that is
+	// otherwise serving, which is per organization.
+	claimSuspendedReasonRecovering = "daemon is recovering"
 	// claimSuspendedReasonAtCapacity is the prefix of the suspension reason
 	// while this host holds no free session slot; the exact occupancy
 	// follows it.
@@ -1028,13 +1036,16 @@ func (d *Daemon) claimSuspended() (bool, string) {
 			return true, "session-shim carrier activation is not complete"
 		}
 	}
-	// Operator pause and drain stop claims for every scope at once. They are
-	// checked before the platform signal so the reason names the local cause.
+	// Operator pause, drain, and recovery stop claims for every scope at
+	// once. They are checked before the platform signal so the reason names
+	// the local cause.
 	switch d.State() {
 	case StateDraining:
 		return true, claimSuspendedReasonDraining
 	case StatePaused:
 		return true, claimSuspendedReasonPaused
+	case StateRecovering:
+		return true, claimSuspendedReasonRecovering
 	}
 	if atCapacity, reason := d.hostAtCapacity(); atCapacity {
 		return true, reason
