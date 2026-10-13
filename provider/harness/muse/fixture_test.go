@@ -32,6 +32,8 @@ type fakeHost struct {
 	sessionID string
 	// resumeErr, when non-nil, is the JSON-RPC error session/resume answers.
 	resumeErr *rpcError
+	// schemaVersion overrides the handshake schema version (0 = 1).
+	schemaVersion int
 }
 
 func newFakeHost() (*fakeHost, *io.PipeWriter, *io.PipeReader) {
@@ -77,7 +79,11 @@ func (fh *fakeHost) run(t *testing.T) {
 		fh.params = append(fh.params, params)
 		script := fh.script
 		sessionID := fh.sessionID
+		schemaVersion := fh.schemaVersion
 		fh.mu.Unlock()
+		if schemaVersion == 0 {
+			schemaVersion = 1
+		}
 		switch {
 		case method == "initialize" && hasID:
 			fh.write(t, map[string]any{
@@ -88,7 +94,7 @@ func (fh *fakeHost) run(t *testing.T) {
 					"museHome":            "/tmp/fake-muse-home",
 					"platformFamily":      "unix",
 					"platformOs":          "linux",
-					"schema":              map[string]any{"fingerprint": schemaExportFingerprint, "version": 1},
+					"schema":              map[string]any{"fingerprint": schemaExportFingerprint, "version": schemaVersion},
 					"serverInfo":          map[string]any{"name": "fake", "version": "1.4.6"},
 					"userAgent":           "fake",
 					"sessionDurability":   "durable",

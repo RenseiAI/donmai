@@ -195,9 +195,13 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		var p ViewGapParams
 		_ = json.Unmarshal(params, &p)
 		state.gap = &p
+		// SessionContinues: the handle re-anchors via session/resume
+		// and the session ends on its own terminal, so the gap is on
+		// the record but never the run's failure.
 		return []agent.Event{agent.ErrorEvent{
-			Message: fmt.Sprintf("muse view gap: events (%s, %s] were dropped; session must recover", p.After, p.Next),
-			Code:    "view_gap",
+			Message:          fmt.Sprintf("muse view gap: events (%s, %s] were dropped; session must recover", p.After, p.Next),
+			Code:             "view_gap",
+			SessionContinues: true,
 		}}
 
 	default:

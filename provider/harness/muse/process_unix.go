@@ -20,15 +20,20 @@ func configureProcessGroup(cmd *exec.Cmd) {
 
 // signalProcessGroup sends sig to the entire process group whose
 // leader is cmd.Process, falling back to the leader alone.
+//
+// configureProcessGroup sets Setpgid, so the group id is the leader's
+// pid. Signal -pid directly instead of looking the group up: once the
+// leader has been reaped, Getpgid fails while the helpers it forked
+// still live in the group.
 func signalProcessGroup(cmd *exec.Cmd, sig syscall.Signal) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	pid := cmd.Process.Pid
-	pgid, err := syscall.Getpgid(pid)
-	if err != nil {
-		_ = cmd.Process.Signal(sig)
-		return
+	if cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid && pid > 0 {
+		if err := syscall.Kill(-pid, sig); err == nil {
+			return
+		}
 	}
-	_ = syscall.Kill(-pgid, sig)
+	_ = cmd.Process.Signal(sig)
 }

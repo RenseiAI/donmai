@@ -77,8 +77,14 @@ type Handle struct {
 	closed       chan struct{}
 	eventsMu     sync.RWMutex
 	eventsClosed atomic.Bool
-	childOnce    sync.Once
-	childStopped bool
+	// childStopping guards shutdownChild. It is a CAS flag, not a
+	// sync.Once: shutdownChild stops the client, whose close hook
+	// (failNow → closeEvents) re-enters shutdownChild on the same
+	// goroutine, and a re-entrant Once.Do deadlocks.
+	childStopping atomic.Bool
+	// exited closes once watchExit has reaped the serve child. Nil
+	// when no real process was started.
+	exited chan struct{}
 
 	state *mapperState
 }
@@ -178,8 +184,15 @@ func (h *Handle) Stop(ctx context.Context) error {
 
 // failNow marks the handle terminal with an ErrorEvent and closes the
 // events channel. Used when the serve child crashes. Safe to call
-// concurrently with Stop / forward.
+// concurrently with Stop / forward. A client close caused by our own
+// shutdownChild is not a crash: it closes the stream without the
+// serve_crashed error.
 func (h *Handle) failNow(err error) {
+	if h.childStopping.Load() {
+		h.signalClosed()
+		h.closeEvents()
+		return
+	}
 	msg := fmt.Sprintf("muse provider failure: %s", err.Error())
 	if excerpt := h.stderrExcerpt(); excerpt != "" {
 		msg += " (serve stderr: " + excerpt + ")"
@@ -267,6 +280,7 @@ func (h *Handle) spawnChild(workspaceRoot string, spec agent.Spec) error {
 	h.stdout = stdout
 	h.stderr = stderr
 	h.stderrBuf = newBoundedBuffer(stderrRetentionBytes)
+	h.exited = make(chan struct{})
 	go func() {
 		defer func() { _ = stderr.Close() }()
 		_, _ = io.Copy(h.stderrBuf, stderr)
@@ -377,13 +391,14 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 	return nil
 }
 
-// deliver routes one inbound notification to the forwarder without
-// blocking the client's read goroutine.
+// deliver routes one inbound notification to the forwarder. It blocks
+// (applying backpressure to the read loop) rather than dropping: a
+// dropped turn/completed or server-request would stall the session
+// forever. It only gives up once the handle is closed.
 func (h *Handle) deliver(n notification) {
 	select {
 	case h.notifyCh <- n:
 	case <-h.closed:
-	default:
 	}
 }
 
@@ -401,10 +416,11 @@ func (h *Handle) forward(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Emit before Stop: Stop closes the events channel.
+			h.emit(agent.ErrorEvent{Message: "session cancelled: " + ctx.Err().Error(), Code: "context_cancelled"})
 			ctxStop, cancel := context.WithTimeout(context.Background(), h.rpcTimeout)
 			_ = h.Stop(ctxStop)
 			cancel()
-			h.emit(agent.ErrorEvent{Message: "session cancelled: " + ctx.Err().Error(), Code: "context_cancelled"})
 			return
 		case <-h.closed:
 			return
@@ -632,6 +648,7 @@ func (h *Handle) watchExit() {
 		return
 	}
 	err := h.cmd.Wait()
+	close(h.exited)
 	cause := err
 	if cause == nil {
 		cause = errors.New("muse serve exited")
@@ -642,37 +659,33 @@ func (h *Handle) watchExit() {
 	}
 }
 
-// shutdownChild stops the serve child (SIGTERM, then SIGKILL after the
-// grace period) and closes its pipes. Idempotent.
+// shutdownChild stops the serve child's whole process group (SIGTERM,
+// then SIGKILL after the grace period) and closes its pipes. Idempotent
+// and re-entrant: only the first caller does the work.
 func (h *Handle) shutdownChild(reason string) error {
-	var err error
-	h.childOnce.Do(func() {
-		h.childStopped = true
-		if h.client != nil {
-			h.client.Stop(errors.New("muse handle shutdown: " + reason))
+	if !h.childStopping.CompareAndSwap(false, true) {
+		return nil
+	}
+	if h.client != nil {
+		h.client.Stop(errors.New("muse handle shutdown: " + reason))
+	}
+	if h.cmd != nil && h.cmd.Process != nil && h.exited != nil {
+		signalProcessGroup(h.cmd, sigTERM())
+		select {
+		case <-h.exited:
+		case <-time.After(stopGracePeriod):
 		}
-		if h.cmd != nil && h.cmd.Process != nil {
-			signalProcessGroup(h.cmd, sigTERM())
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				if h.cmd.ProcessState == nil {
-					_, _ = h.cmd.Process.Wait()
-				}
-			}()
-			select {
-			case <-done:
-			case <-time.After(stopGracePeriod):
-				signalProcessGroup(h.cmd, sigKILL())
-			}
+		// Sweep the group even when the leader exited on SIGTERM:
+		// helpers it forked (MCP servers, tool shells) share the
+		// group and may outlive it.
+		signalProcessGroup(h.cmd, sigKILL())
+	}
+	for _, pipe := range []io.Closer{h.stdin, h.stdout, h.stderr} {
+		if pipe != nil {
+			_ = pipe.Close()
 		}
-		for _, pipe := range []io.Closer{h.stdin, h.stdout, h.stderr} {
-			if pipe != nil {
-				_ = pipe.Close()
-			}
-		}
-	})
-	return err
+	}
+	return nil
 }
 
 func (h *Handle) stderrExcerpt() string {

@@ -328,7 +328,9 @@ func (c *Client) RespondToServerRequestWithError(id json.RawMessage, code int, m
 // After Stop, no new Request calls succeed. Pending requests fail with
 // the supplied cause (or "client stopped" when nil).
 func (c *Client) Stop(cause error) {
+	fired := false
 	c.closeOnce.Do(func() {
+		fired = true
 		if cause == nil {
 			cause = errors.New("muse jsonrpc: client stopped")
 		}
@@ -344,14 +346,19 @@ func (c *Client) Stop(cause error) {
 			}
 		}
 		c.pendingMu.Unlock()
-
-		c.subsMu.RLock()
-		hook := c.onClose
-		c.subsMu.RUnlock()
-		if hook != nil {
-			hook(cause)
-		}
 	})
+	if !fired {
+		return
+	}
+	// The hook runs outside closeOnce: it may tear the handle down,
+	// which stops this client again, and a re-entrant Once.Do
+	// deadlocks.
+	c.subsMu.RLock()
+	hook := c.onClose
+	c.subsMu.RUnlock()
+	if hook != nil {
+		hook(c.closeErr)
+	}
 }
 
 // Done returns a channel that's closed when the client has stopped.

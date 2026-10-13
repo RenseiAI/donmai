@@ -73,11 +73,18 @@ func resolveEffort(spec agent.Spec) *ReasoningEffort {
 }
 
 // resolveApprovalMode maps the session posture to the MSP approval mode.
-// Autonomous sessions run allowAll only when the Spec carries no
+// The read-only lane always runs denyUnmatched. Autonomous sessions run
+// allowAll only when the Spec carries no
 // permission policy; an explicit PermissionConfig selects
 // promptUnmatched so the approval bridge sees every unmatched call.
 // Non-autonomous sessions default to promptUnmatched.
 func resolveApprovalMode(spec agent.Spec) ApprovalMode {
+	// The read-only lane is tighten-only: no other Spec field (an
+	// autonomous posture, a permissive policy) widens it past
+	// denyUnmatched.
+	if spec.SandboxLevel == agent.SandboxReadOnly {
+		return ApprovalModeDenyUnmatched
+	}
 	if spec.Autonomous && spec.PermissionConfig == nil {
 		return ApprovalModeAllowAll
 	}

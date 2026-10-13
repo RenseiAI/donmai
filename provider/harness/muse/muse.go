@@ -417,10 +417,12 @@ func serveArgs(spec agent.Spec, trustWorkspace, disableSandbox bool) []string {
 	if trustWorkspace {
 		args = append(args, "--trust-workspace")
 	}
-	if disableSandbox {
-		args = append(args, "--disable-sandbox")
-	} else if spec.SandboxLevel == agent.SandboxReadOnly {
+	// The read-only lane wins over a provider-level DisableSandbox:
+	// a Spec that asks for read-only is never widened.
+	if spec.SandboxLevel == agent.SandboxReadOnly {
 		args = append(args, "--disable-shell", "--disable-write")
+	} else if disableSandbox {
+		args = append(args, "--disable-sandbox")
 	}
 	return args
 }

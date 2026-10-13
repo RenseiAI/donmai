@@ -21,7 +21,8 @@ mismatch warns); the version is enforced.
 ## Spawn
 
 `muse serve [--trust-workspace] [--disable-sandbox]`; the read-only lane
-is `--disable-shell --disable-write`. Env: `META_API_KEY` is stripped
+is `--disable-shell --disable-write` with approval mode `denyUnmatched`,
+and no other Spec or provider option widens it. Env: `META_API_KEY` is stripped
 unless the Spec sets it; `MUSE_NO_AUTO_UPDATE=1` is always set. The cwd
 is the realpath of the workspace (the host rejects non-canonical roots).
 
