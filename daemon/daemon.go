@@ -961,12 +961,16 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 }
 
 // The host-wide new-work claim gate stays closed only for genuinely
-// host-wide conditions, each named below: an operator drain or pause, and a
-// full host stop claims for every scope at once. A first heartbeat that is
+// host-wide conditions, each named below: an operator drain or pause, a
+// lifecycle recovery that paused the shared spawner, or the platform's own
+// pool signal stop claims for every scope at once. A first heartbeat that is
 // still pending — or a founding the platform refused — for ONE scope is
 // deliberately not here: that fence is per organization (see
 // claimSuspendedForOrg), so one slow or refused scope never stalls new work
-// for the healthy ones.
+// for the healthy ones. A full host is not here either: capacity is a
+// per-item hold in claimSuspendedForOrg, so the poll request still goes out
+// and the non-session lanes on the same response (kg extraction, landing
+// triggers, inbox) keep flowing while session items are held and released.
 const (
 	// claimSuspendedReasonDraining suspends every scope while the operator
 	// drains this host.
@@ -982,6 +986,16 @@ const (
 	// is host-wide too — unlike a first-heartbeat fence on a host that is
 	// otherwise serving, which is per organization.
 	claimSuspendedReasonRecovering = "daemon is recovering"
+	// claimSuspendedReasonStarting suspends every scope while a shim-composed
+	// host is still starting: no adoption or carrier rail serves there.
+	claimSuspendedReasonStarting = "daemon is starting"
+	// claimSuspendedReasonUpdating suspends every scope while the host applies
+	// a self-update: the poll response would bind work to a host about to
+	// exec into a new binary, so the tick is skipped and the item stays queued.
+	claimSuspendedReasonUpdating = "daemon is updating"
+	// claimSuspendedReasonStopped suspends every scope while the host is
+	// stopped: no spawner, no heartbeat, no admission.
+	claimSuspendedReasonStopped = "daemon is stopped"
 	// claimSuspendedReasonAtCapacity is the prefix of the suspension reason
 	// while this host holds no free session slot; the exact occupancy
 	// follows it.
@@ -1019,6 +1033,19 @@ func (d *Daemon) claimSuspended() (bool, string) {
 		// every healthy scope behind the stuck one. With no scope fence the
 		// latch can only be the proof-v2 withdrawal (or a stale one), which
 		// is genuinely host-wide.
+		//
+		// Known relaxation while a scope fence IS pending: the live
+		// sessionShimReadinessGate probe below runs instead of the latch,
+		// and a proof-v2 withdrawal that lands in that window cannot raise
+		// its own latch (the CompareAndSwap fails while the fence holds
+		// it). Healthy scopes therefore resume on one passing live probe
+		// rather than waiting for the exact acknowledged beat. The window
+		// closes with the fence: the next tick after the last scope fence
+		// clears re-consults the latch, and a still-withdrawn proof-v2
+		// rail holds the host-wide gate again until its own acknowledgement
+		// reopens it. AcceptWork never takes this shortcut — its latch
+		// branch consults claimSuspendedForOrg unconditionally — so the
+		// relaxation is poll-side only.
 		if d.sessionShimReadinessWithdrawn.Load() && !d.sessionShimHeartbeatFencePending() {
 			return true, "session-shim recovery is not ready"
 		}
@@ -1036,19 +1063,41 @@ func (d *Daemon) claimSuspended() (bool, string) {
 			return true, "session-shim carrier activation is not complete"
 		}
 	}
-	// Operator pause, drain, and recovery stop claims for every scope at
-	// once. They are checked before the platform signal so the reason names
-	// the local cause.
-	switch d.State() {
-	case StateDraining:
-		return true, claimSuspendedReasonDraining
-	case StatePaused:
-		return true, claimSuspendedReasonPaused
-	case StateRecovering:
-		return true, claimSuspendedReasonRecovering
-	}
-	if atCapacity, reason := d.hostAtCapacity(); atCapacity {
-		return true, reason
+	// Operator pause, drain, non-serving lifecycle phases, and recovery stop
+	// claims for every scope at once. They are checked before the platform
+	// signal so the reason names the local cause. With the shim enabled the
+	// old seam suspended on every state other than Running; that coverage is
+	// preserved here under a named reason per state, so a self-update
+	// (Updating) or a start/stop edge cannot turn a skipped poll into
+	// claim-then-NACK churn. Without the shim only the operator-driven
+	// terminal phases (draining, paused) close the poll gate; Starting,
+	// Updating and Stopped there are a plain unstarted or transient daemon
+	// whose admission seam (AcceptWork) already refuses non-Running, and
+	// closing the poll gate there would hide its ticks.
+	if d.sessionShimEnabled() {
+		switch d.State() {
+		case StateStarting:
+			return true, claimSuspendedReasonStarting
+		case StateUpdating:
+			return true, claimSuspendedReasonUpdating
+		case StateStopped:
+			return true, claimSuspendedReasonStopped
+		case StateDraining:
+			return true, claimSuspendedReasonDraining
+		case StatePaused:
+			return true, claimSuspendedReasonPaused
+		case StateRecovering:
+			return true, claimSuspendedReasonRecovering
+		}
+	} else {
+		switch d.State() {
+		case StateDraining:
+			return true, claimSuspendedReasonDraining
+		case StatePaused:
+			return true, claimSuspendedReasonPaused
+		case StateRecovering:
+			return true, claimSuspendedReasonRecovering
+		}
 	}
 	status := d.HostStatus()
 	if !status.SuspendsClaiming() {
@@ -1091,15 +1140,28 @@ func (d *Daemon) PollClaimGateForOrg() PollOrgClaimGate {
 }
 
 // claimSuspendedForOrg is the per-organization new-work claim gate: an
-// organization whose first heartbeat is still pending, or whose founding the
-// platform refused, does not claim, while every other ready organization
-// keeps claiming. The host-wide gate (claimSuspended) runs first, so a
-// drain, a pause, a full host, a pool signal, or a proof-v2 outage still
-// stops every scope at once.
+// organization whose first heartbeat is still pending, whose founding the
+// platform refused, or that would overfill a host with no free session slot
+// does not claim, while every other ready organization keeps claiming. The
+// host-wide gate (claimSuspended) runs first, so a drain, a pause, a
+// lifecycle stop, a pool signal, or a proof-v2 outage still stops every
+// scope at once.
 //
+// Capacity is deliberately per item rather than host-wide: AcceptWork
+// already refuses a full host (and the per-org gate's own capacity hold
+// NACKs the held item), so closing the whole poll request at capacity
+// would also starve the non-session lanes riding the same response —
+// kg extraction, landing triggers, and inbox — which use no session slot.
 // The callback MUST NOT block: it runs on the poll goroutine.
 func (d *Daemon) claimSuspendedForOrg(orgID string) (bool, string) {
 	if suspended, reason := d.claimSuspended(); suspended {
+		return true, reason
+	}
+	// A full host holds this organization's session item while the poll
+	// request still goes out, so the non-session lanes on the same response
+	// keep flowing. Session items only: kg extraction, landing triggers and
+	// inbox use no session slot and must not be fenced by occupancy.
+	if atCapacity, reason := d.hostAtCapacity(); atCapacity {
 		return true, reason
 	}
 	if !d.sessionShimEnabled() || d.shims == nil {
@@ -2856,6 +2918,29 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 	} else if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return nil, fmt.Errorf("session-shim proof-v2 readiness: %w", err)
+	}
+	// A retained founding refusal fences its scope on the direct admission
+	// path too — not only behind the readiness latch above. A refusal that
+	// arrives at startup (or rolls back a deferred install) clears the latch
+	// and strands no pending heartbeat, so the latch branch is skipped while
+	// the scope it names must still not admit: the local daemon API and an
+	// embedder OnWork that calls AcceptWork directly are the other claim
+	// path, and the issue's "a refused scope does not claim" holds there.
+	if d.sessionShimEnabled() {
+		refusalScope := spec.OrganizationID
+		if detail != nil && detail.OrganizationID != "" {
+			refusalScope = detail.OrganizationID
+		}
+		if refusalScope == "" {
+			refusalScope = d.sessionShimConfig().orgID()
+		}
+		if refused := d.SessionShimDurabilityRefusal(); refused != nil && refused.Scope == refusalScope {
+			reason := "session-shim founding for organization " + refusalScope + " was refused"
+			if refused.Reason != "" {
+				reason += ": " + refused.Reason
+			}
+			return nil, fmt.Errorf("new-work claim suspended: %s", reason)
+		}
 	}
 	if d.State() != StateRunning {
 		return nil, fmt.Errorf("daemon is not running (state %q)", d.State())

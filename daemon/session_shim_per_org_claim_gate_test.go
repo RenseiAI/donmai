@@ -17,9 +17,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/RenseiAI/donmai/kgextract"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 // twoOrgClaimFixture is a composition whose adoption publishes two scopes:
@@ -209,11 +213,14 @@ func TestPerOrgClaimGateHoldsTheRefusedOrgWhileTheHealthyOrgClaims(t *testing.T)
 		t.Fatalf("resolve test attestation: %v", err)
 	}
 	// Adoption and activation read complete so the host-wide gate is open
-	// and only the per-org refusal can hold the refused scope.
+	// and only the per-org refusal can hold the refused scope. The daemon is
+	// shim-enabled and Running — the posture a refused founding rolls back
+	// to — so no lifecycle state holds the host-wide lane.
 	d.shims.mu.Lock()
 	d.shims.adoptionComplete = true
 	d.shims.carrierActivationComplete = true
 	d.shims.mu.Unlock()
+	d.setState(StateRunning)
 	// Both scopes hold authority receipts with no fence outstanding — the
 	// posture a refused founding rolls back to, minus the refusal.
 	if err := d.retainSessionShimCredentialReceipts([]SessionShimScopeCredentialReceipt{
@@ -246,9 +253,12 @@ func refusedReasonForTest(t *testing.T, d *Daemon, scope string) string {
 }
 
 // TestPerOrgClaimGateStillSuspendsEveryScopeForHostWideConditions pins what
-// did NOT move: an operator drain, an operator pause, and a full host keep
-// the host-wide gate — and therefore every scope — closed, each under its own
-// named reason.
+// did NOT move: an operator drain, an operator pause, and a recovering host
+// keep the host-wide gate — and therefore every scope — closed, each under
+// its own named reason. Capacity is deliberately NOT host-wide: a full host
+// holds session items per organization while the poll request still goes out,
+// so the non-session lanes keep flowing (see
+// TestCapacityHoldKeepsNonSessionLanesFlowing).
 func TestPerOrgClaimGateStillSuspendsEveryScopeForHostWideConditions(t *testing.T) {
 	f := installTwoOrgClaimComposition(t)
 	d := f.harness.daemon
@@ -295,10 +305,73 @@ func TestPerOrgClaimGateStillSuspendsEveryScopeForHostWideConditions(t *testing.
 	}
 }
 
-// TestPerOrgClaimGateNamesFullCapacity pins the third host-wide condition: a
-// host with no free slot suspends every scope under the named capacity
-// reason.
-func TestPerOrgClaimGateNamesFullCapacity(t *testing.T) {
+// TestHostWideClaimGateNamesEveryNonRunningState pins the shim seam the
+// per-org split must not widen: with the shim enabled, every state other
+// than Running suspends the host-wide gate under its own named reason, as
+// before. Without this a self-update (Updating) would turn a skipped poll
+// into claim-then-NACK churn — the host binding work to itself and handing
+// it straight back — and Starting/Stopped would poll with no rail serving.
+func TestHostWideClaimGateNamesEveryNonRunningState(t *testing.T) {
+	// A shim-enabled daemon in Running, with adoption and activation
+	// complete: the only thing that may close the host-wide gate in this
+	// test is the lifecycle state under the table.
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, RequireCredentialAttestation: true,
+		ControllerID: "controller-lifecycle-table", AttestationCapabilities: RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		OrgID:                      "org-lifecycle-table",
+	}})
+	if err := d.refreshSessionShimIdentity().attestationErr; err != nil {
+		t.Fatalf("resolve test attestation: %v", err)
+	}
+	d.shims.mu.Lock()
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+	d.shims.mu.Unlock()
+
+	want := map[State]string{
+		StateStarting:   claimSuspendedReasonStarting,
+		StateUpdating:   claimSuspendedReasonUpdating,
+		StateStopped:    claimSuspendedReasonStopped,
+		StateDraining:   claimSuspendedReasonDraining,
+		StatePaused:     claimSuspendedReasonPaused,
+		StateRecovering: claimSuspendedReasonRecovering,
+	}
+	for state, reason := range want {
+		d.lifecycleMu.Lock()
+		d.setState(state)
+		d.lifecycleMu.Unlock()
+		suspended, got := d.PollClaimGate()()
+		if !suspended {
+			t.Errorf("host-wide claim gate open in state %q", state)
+			continue
+		}
+		if got != reason {
+			t.Errorf("state %q reason = %q, want the named reason %q", state, got, reason)
+		}
+		// The host-wide closure fans out: every organization's per-org
+		// gate inherits it, so no scope can claim around the lifecycle.
+		for _, scope := range []string{"org-lifecycle-table", "org-unrelated"} {
+			if held, _ := d.PollClaimGateForOrg()(scope); !held {
+				t.Errorf("scope %q claims while the host is %q", scope, state)
+			}
+		}
+	}
+	d.lifecycleMu.Lock()
+	d.setState(StateRunning)
+	d.lifecycleMu.Unlock()
+	if suspended, reason := d.PollClaimGate()(); suspended {
+		t.Fatalf("host-wide claim gate closed in state running: %s", reason)
+	}
+}
+
+// TestPerOrgClaimGateHoldsSessionItemsAtCapacity pins the capacity hold
+// where it now lives: per organization, not host-wide. A host with no free
+// slot keeps its host-wide gate OPEN — the poll request still goes out —
+// while every scope's session items are held under the named capacity
+// reason. Holding capacity host-wide would also starve the non-session
+// lanes riding the same response, which use no session slot.
+func TestPerOrgClaimGateHoldsSessionItemsAtCapacity(t *testing.T) {
 	h := newCompositionHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -311,13 +384,181 @@ func TestPerOrgClaimGateNamesFullCapacity(t *testing.T) {
 	}
 	// The deterministic "no free slot" seam: shrink the ceiling to zero.
 	// Occupancy (empty spawner, no adopted shims) then meets the ceiling,
-	// which is exactly the boundary the gate enforces.
+	// which is exactly the boundary the hold enforces.
 	if err := d.spawner.SetMaxConcurrentSessions(0); err != nil {
 		t.Fatalf("shrink session ceiling: %v", err)
 	}
-	if suspended, reason := d.PollClaimGate()(); !suspended {
-		t.Fatal("host-wide claim gate open with no free session slot")
-	} else if reason != "host is at capacity (0/0 sessions)" {
-		t.Fatalf("capacity reason = %q, want the named capacity reason", reason)
+	// The host-wide gate stays open at capacity: the request still goes out.
+	if suspended, reason := d.PollClaimGate()(); suspended {
+		t.Fatalf("host-wide claim gate closed at capacity: %s", reason)
 	}
+	// …while every scope's session items are held under the named reason.
+	for _, scope := range []string{h.orgID, "org-unrelated"} {
+		suspended, reason := d.PollClaimGateForOrg()(scope)
+		if !suspended {
+			t.Fatalf("scope %q claims with no free session slot", scope)
+		} else if reason != "host is at capacity (0/0 sessions)" {
+			t.Fatalf("capacity reason = %q, want the named capacity reason", reason)
+		}
+	}
+}
+
+// TestCapacityHoldKeepsNonSessionLanesFlowing is F1's regression pin: a poll
+// at capacity still dispatches a kgExtractWork item while the work[] session
+// item is held. Capacity only ever holds session items per organization —
+// AcceptWork already refuses a full host — so closing the whole poll request
+// at capacity would starve the kg-extraction lane (its own goroutines, its
+// own bound, no session slot) on a host that sits at capacity most of the
+// time. Revert proof: with the capacity check back in claimSuspended the
+// request never goes out, so no kg item dispatches.
+func TestCapacityHoldKeepsNonSessionLanesFlowing(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+	d := h.daemon
+
+	if err := d.spawner.SetMaxConcurrentSessions(0); err != nil {
+		t.Fatalf("shrink session ceiling: %v", err)
+	}
+
+	kgItem := kgextract.KgExtractWorkItem{
+		BatchJobID:      "batch:kg_extract:capacity-lane",
+		WorkType:        kgextract.WorkTypeKGExtraction,
+		ContractVersion: kgextract.KGExtractionContractVersion,
+		OrgID:           h.orgID,
+		ProjectID:       "proj-capacity",
+		Observations:    []kgextract.Observation{{ID: "obs-capacity", Content: "hello"}},
+	}
+	kgRaw, err := json.Marshal(kgItem)
+	if err != nil {
+		t.Fatalf("marshal kg item: %v", err)
+	}
+	var pollCalls, nacks atomic.Int64
+	kgRan := make(chan worker.BatchWorkItem, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			pollCalls.Add(1)
+			// One response carrying both lanes: a session item the
+			// capacity hold must skip, and a kg item it must run.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"work":[{"sessionId":"session-at-capacity","organizationId":"` +
+				h.orgID + `","repository":"github.com/foo/capped","ref":"main"}],` +
+				`"kgExtractWork":[` + string(kgRaw) + `]}`))
+		case http.MethodPost:
+			nacks.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "unexpected method", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	var mu sync.Mutex
+	var claimed []string
+	poller := NewPollService(PollOptions{
+		WorkerID: "worker-capacity-lanes", RuntimeJWT: "runtime-capacity-lanes",
+		OrchestratorURL: srv.URL, HTTPClient: srv.Client(),
+		ClaimSuspended:       d.PollClaimGate(),
+		ClaimSuspendedForOrg: d.PollClaimGateForOrg(),
+		OnWork: func(item PollWorkItem) error {
+			mu.Lock()
+			defer mu.Unlock()
+			claimed = append(claimed, item.SessionID)
+			return nil
+		},
+		OnKgExtractWork: func(_ context.Context, bi worker.BatchWorkItem) error {
+			select {
+			case kgRan <- bi:
+			default:
+			}
+			return nil
+		},
+	})
+	poller.pollOnce(context.Background())
+	poller.kgWG.Wait()
+
+	if got := pollCalls.Load(); got != 1 {
+		t.Fatalf("poll endpoint hits = %d, want 1 (capacity must not close the request)", got)
+	}
+	mu.Lock()
+	held := len(claimed) == 0
+	mu.Unlock()
+	if !held {
+		t.Fatalf("claimed sessions = %v, want none (the session item is held at capacity)", claimed)
+	}
+	if got := nacks.Load(); got != 1 {
+		t.Fatalf("NACK releases = %d, want 1 (the held session item handed back)", got)
+	}
+	select {
+	case bi := <-kgRan:
+		if bi.BatchJobID != kgItem.BatchJobID {
+			t.Fatalf("kg batchJobId = %q, want %q", bi.BatchJobID, kgItem.BatchJobID)
+		}
+	default:
+		t.Fatal("kg-extraction item never dispatched on a poll at capacity")
+	}
+}
+
+// TestRefusedScopeAdmissionRefusedDirectly is F3's regression pin: with the
+// shim enabled, AcceptWorkWithDetail refuses the refused scope whether or
+// not the readiness latch is set, while the healthy scope is admitted. The
+// poll-layer per-org fence alone leaves the direct admission path — the
+// local daemon API, an embedder OnWork calling AcceptWork — open for the
+// scope the issue says does not claim.
+func TestRefusedScopeAdmissionRefusedDirectly(t *testing.T) {
+	const healthy, refused = "org-healthy-direct", "org-refused-direct"
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, RequireCredentialAttestation: true,
+		ControllerID: "controller-refused-direct", AttestationCapabilities: RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		OrgID:                      healthy,
+	}})
+	if err := d.refreshSessionShimIdentity().attestationErr; err != nil {
+		t.Fatalf("resolve test attestation: %v", err)
+	}
+	d.shims.mu.Lock()
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+	d.shims.mu.Unlock()
+	if err := d.retainSessionShimCredentialReceipts([]SessionShimScopeCredentialReceipt{
+		{Scope: healthy, WorkerHostID: "stable-host-healthy", AdoptionRevision: "revision-healthy"},
+		{Scope: refused, WorkerHostID: "stable-host-refused", AdoptionRevision: "revision-refused"},
+	}); err != nil {
+		t.Fatalf("retain test receipts: %v", err)
+	}
+	d.retainSessionShimDurabilityRefusal(&SessionShimDurabilityRefused{
+		Scope: refused, Err: errors.New("first projected heartbeat refused"),
+	})
+	// No latch outstanding anywhere: the posture a refused founding rolls
+	// back to. The fence under test must hold WITHOUT it.
+	if d.sessionShimReadinessWithdrawn.Load() {
+		t.Fatal("fixture raised the readiness latch; the fence must hold without it")
+	}
+	d.setState(StateRunning)
+	d.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "p1", Repository: "github.com/foo/bar"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+	})
+	d.spawner.Resume()
+
+	if _, err := d.AcceptWorkWithDetail(
+		SessionSpec{SessionID: "refused-direct", OrganizationID: refused, Repository: "github.com/foo/bar"},
+		nil,
+	); err == nil {
+		t.Fatalf("direct admission for refused scope %q succeeded with no latch set", refused)
+	} else if got := err.Error(); !strings.Contains(got, "new-work claim suspended") || !strings.Contains(got, refused) {
+		t.Fatalf("refused-scope admission error = %q, want the per-org refusal fence", got)
+	}
+	if _, err := d.AcceptWorkWithDetail(
+		SessionSpec{SessionID: "healthy-direct", OrganizationID: healthy, Repository: "github.com/foo/bar"},
+		nil,
+	); err != nil {
+		t.Fatalf("direct admission for healthy scope %q refused beside a refused one: %v", healthy, err)
+	}
+	t.Cleanup(func() {
+		_ = d.spawner.ForceKillSession("healthy-direct")
+	})
 }
