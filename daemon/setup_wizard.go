@@ -17,6 +17,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/internal/usageping"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -65,6 +66,11 @@ type WizardOptions struct {
 	// SkipWizard, when true, returns DefaultConfig (or Existing) without
 	// prompting. Mirrors the DONMAI_DAEMON_SKIP_WIZARD env var.
 	SkipWizard bool
+	// SkipPing, when true, leaves the anonymous usage ping disabled
+	// without prompting. Mirrors the `host setup --no-ping` flag: the
+	// wizard asks exactly one default-no question, and this skips it.
+	// Tests inject it directly.
+	SkipPing bool
 	// CPUCount overrides runtime.NumCPU() (test injection).
 	CPUCount int
 	// MemoryMB overrides total-memory detection (test injection). 0 means
@@ -144,8 +150,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 
 	wln("\nLet's get your machine working.")
 
-	// [1/5] Machine identity
-	wln("\n[1/5] Machine identity")
+	// [1/6] Machine identity
+	wln("\n[1/6] Machine identity")
 	defaultID := DeriveDefaultMachineID()
 	defaultRegion := "home-network"
 	if opts.Existing != nil {
@@ -168,8 +174,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
 
-	// [2/5] Capacity
-	wln("\n[2/5] Capacity")
+	// [2/6] Capacity
+	wln("\n[2/6] Capacity")
 	wf("  Detected: %d cores, %d MB RAM\n", cpu, mem)
 	defaultReservedCores := minOf(4, cpu/4)
 	defaultReservedMem := minOf(16384, mem/4)
@@ -201,8 +207,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
 
-	// [3/5] Orchestrator
-	wln("\n[3/5] Orchestrator")
+	// [3/6] Orchestrator
+	wln("\n[3/6] Orchestrator")
 	wln("  Where do work assignments come from?")
 	wln("  > 1. Remote orchestrator           — register with a platform you configure")
 	wln("    2. Local file queue (single-user) — for solo dev, no network")
@@ -278,8 +284,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		}
 	}
 
-	// [4/5] Project allowlist
-	wln("\n[4/5] Project allowlist")
+	// [4/6] Project allowlist
+	wln("\n[4/6] Project allowlist")
 	projects := []ProjectConfig{}
 	if opts.Existing != nil {
 		projects = append(projects, opts.Existing.EffectiveProjectConfigs()...)
@@ -347,8 +353,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
 
-	// [5/5] Auto-update
-	wln("\n[5/5] Auto-update")
+	// [5/6] Auto-update
+	wln("\n[5/6] Auto-update")
 	defChannel := string(ChannelStable)
 	defSchedule := string(ScheduleNightly)
 	defDrain := 600
@@ -388,6 +394,50 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	default:
 		schedule = ScheduleNightly
 	}
+	if !confirmYes(r, out, "  Continue?", true) {
+		return nil, errors.New("setup wizard cancelled by user")
+	}
+
+	// [6/6] Anonymous usage count — the one default-no question. An
+	// opt-in mints a cryptographically random installation id (not a
+	// machine or organization identifier) and records it with the
+	// version and OS only. No hostnames, no repository names, no IPs
+	// stored. The receiver endpoint is an operations decision: until
+	// the operator configures one, consent alone sends nothing.
+	usagePing := UsagePingConfig{}
+	if opts.Existing != nil {
+		usagePing = opts.Existing.UsagePing
+	}
+	if !opts.SkipPing {
+		wln("\n[6/6] Anonymous usage count")
+		wln("  Count this installation in the public usage numbers?")
+		wln("  Sends a random installation id and the version once a week, nothing else.")
+		if confirmYes(r, out, "  Count this installation?", usagePing.Enabled) {
+			id := usagePing.InstallationID
+			if !usageping.ValidateInstallationID(id) {
+				var err error
+				id, err = usageping.MintInstallationID()
+				if err != nil {
+					return nil, err
+				}
+			}
+			def := strings.TrimSpace(usagePing.Endpoint)
+			endpoint, err := promptDefault(r, out, "Usage-count endpoint (https URL, empty disables sending)", def)
+			if err != nil {
+				return nil, err
+			}
+			endpoint = strings.TrimSpace(endpoint)
+			if endpoint != "" && !strings.HasPrefix(endpoint, "https://") {
+				return nil, errors.New("usage-count endpoint must be https")
+			}
+			usagePing = UsagePingConfig{Enabled: true, InstallationID: id, Endpoint: endpoint}
+		} else {
+			// Opting out clears the id and the endpoint: a disabled ping
+			// keeps no identifier and no destination at all, and
+			// re-enabling mints a fresh one.
+			usagePing = UsagePingConfig{}
+		}
+	}
 
 	cfg := &Config{
 		APIVersion:              "donmai.dev/v1",
@@ -412,6 +462,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			Schedule:            schedule,
 			DrainTimeoutSeconds: drain,
 		},
+		UsagePing: usagePing,
 	}
 	if choice == 2 {
 		cfg.APIVersion = LocalRuntimeConfigAPIVersion
