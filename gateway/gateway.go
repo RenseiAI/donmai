@@ -100,6 +100,8 @@ func (g *Gateway) Start(_ context.Context) error {
 	mux := http.NewServeMux()
 	chat := surface.NewOpenAIChat(g)
 	mux.Handle("/v1/chat/completions", chat)
+	responses := surface.NewOpenAIResponses(g)
+	mux.Handle("/v1/responses", responses)
 	mux.HandleFunc("/v1/models", g.handleModels)
 
 	g.listener = ln
@@ -159,8 +161,9 @@ type BindConfig struct {
 	Source pool.CredentialSource
 	// PoolOpts tunes the rotation state machine (optional).
 	PoolOpts pool.Options
-	// Surface is the inbound wire protocol the harness will drive. M1 supports
-	// agent.ProtoOpenAIChat only.
+	// Surface is the inbound wire protocol the harness will drive. Bind serves
+	// agent.ProtoOpenAIChat only; BindProtocol additionally serves
+	// agent.ProtoOpenAIResponses.
 	Surface agent.WireProtocol
 }
 
@@ -170,10 +173,39 @@ type BindConfig struct {
 // api key / bearer; the gateway looks the session up by exact token match, so
 // a request bearing session A's token can only ever reach session A's
 // credential scope (the cross-session isolation guarantee, 08 §5).
+//
+// Bind is the Chat-only legacy path: cfg.Surface must name openai-chat (an
+// empty Surface is rejected — callers select explicitly). BindProtocol is the
+// explicit opt-in for any implemented inbound protocol.
 func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 	if cfg.Surface != agent.ProtoOpenAIChat {
-		return agent.EndpointBinding{}, fmt.Errorf("gateway: unsupported inbound surface %q (M1 = openai-chat only)", cfg.Surface)
+		return agent.EndpointBinding{}, fmt.Errorf("gateway: unsupported inbound surface %q (Bind serves openai-chat only; use BindProtocol for an explicit protocol)", cfg.Surface)
 	}
+	return g.bind(cfg, agent.ProtoOpenAIChat)
+}
+
+// BindProtocol registers a session route exactly like Bind but presents the
+// explicitly requested inbound wire protocol: the protocol is required and
+// must be implemented (openai-chat or openai-responses), a nonempty
+// conflicting cfg.Surface refuses, and the returned binding carries the exact
+// selected protocol — no implicit fallback, no relabeling, and no mutation of
+// the caller's configuration. Routing, credential pooling, metering,
+// cancellation, cleanup, and cost attribution are identical across surfaces:
+// every surface decodes into the same canonical IR and dispatches through the
+// same route table.
+func (g *Gateway) BindProtocol(cfg BindConfig, protocol agent.WireProtocol) (agent.EndpointBinding, error) {
+	switch protocol {
+	case agent.ProtoOpenAIChat, agent.ProtoOpenAIResponses:
+	default:
+		return agent.EndpointBinding{}, fmt.Errorf("gateway: unsupported inbound protocol %q (implemented: openai-chat, openai-responses)", protocol)
+	}
+	if cfg.Surface != "" && cfg.Surface != protocol {
+		return agent.EndpointBinding{}, fmt.Errorf("gateway: bind config surface %q conflicts with requested protocol %q", cfg.Surface, protocol)
+	}
+	return g.bind(cfg, protocol)
+}
+
+func (g *Gateway) bind(cfg BindConfig, surface agent.WireProtocol) (agent.EndpointBinding, error) {
 	if cfg.Upstream == nil || cfg.Source == nil {
 		return agent.EndpointBinding{}, errors.New("gateway: bind requires an upstream and a credential source")
 	}
@@ -208,7 +240,7 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 		Company:   cfg.Company,
 		Model:     cfg.Model,
 		BaseURL:   fmt.Sprintf("http://%s/v1", addr),
-		Protocol:  agent.ProtoOpenAIChat,
+		Protocol:  surface,
 		Host:      agent.HostGateway,
 		Mechanism: agent.AuthAPIKey,
 		Auth:      cfg.AuthMode,
@@ -318,10 +350,13 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// SupportedSurfaces lists the inbound wire surfaces the gateway presents at
-// this milestone (M1: openai-chat only). Exposed so a caller rendering a
+// SupportedSurfaces lists the inbound wire surfaces the gateway presents:
+// openai-chat (the legacy path) and openai-responses (served through the same
+// canonical IR onto a real Chat upstream). Exposed so a caller rendering a
 // disabled-gateway status need not import the agent package.
-func SupportedSurfaces() []string { return []string{string(agent.ProtoOpenAIChat)} }
+func SupportedSurfaces() []string {
+	return []string{string(agent.ProtoOpenAIChat), string(agent.ProtoOpenAIResponses)}
+}
 
 // Status is the snapshot the daemon /api/daemon/gateway surface renders.
 type Status struct {
