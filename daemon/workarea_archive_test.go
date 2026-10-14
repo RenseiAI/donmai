@@ -1374,3 +1374,81 @@ type fakePoolGuard struct {
 func (f *fakePoolGuard) CheckCapacity() (time.Duration, error) {
 	return f.retryAfter, f.err
 }
+
+func TestWorkareaArchiveRegistry_RestoreSidecarWriteRefusesPlantedLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks unreliable on Windows CI")
+	}
+	root := t.TempDir()
+	writeFixtureArchive(t, root, fixtureArchive{id: "wa-sidecar-write"})
+	restoredDir := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-restored")
+	if err := os.MkdirAll(restoredDir, 0o700); err != nil {
+		t.Fatalf("mkdir restored: %v", err)
+	}
+	restoredRoot, err := os.OpenRoot(restoredDir)
+	if err != nil {
+		t.Fatalf("open restored: %v", err)
+	}
+	defer func() { _ = restoredRoot.Close() }()
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write outside: %v", err)
+	}
+	// A planted link at the fresh sidecar name must fail creation, and
+	// the outside target must be left untouched.
+	if err := os.Symlink(outside, filepath.Join(restoredDir, "fresh.json")); err != nil {
+		t.Fatalf("plant link: %v", err)
+	}
+	if err := writeRestoreSidecar(restoredRoot, "fresh", "fresh.json", []byte(`{"restoreId":"fresh"}`)); err == nil {
+		t.Fatal("sidecar commit followed a planted link; want creation refused")
+	}
+	if body, err := os.ReadFile(outside); err != nil || string(body) != `{}` {
+		t.Fatalf("outside target disturbed: %q, %v", body, err)
+	}
+	// A genuine fresh name still commits and reads back.
+	if err := writeRestoreSidecar(restoredRoot, "genuine", "genuine.json", []byte(`{"restoreId":"genuine"}`)); err != nil {
+		t.Fatalf("genuine commit: %v", err)
+	}
+	if _, err := readRestoreSidecar(restoredRoot, "genuine", "genuine.json"); err != nil {
+		t.Fatalf("genuine readback: %v", err)
+	}
+}
+
+func TestWorkareaArchiveRegistry_IntoSessionIDSkipsPlantedLinkAndFifo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks/fifos unreliable on Windows CI")
+	}
+	root := t.TempDir()
+	writeFixtureArchive(t, root, fixtureArchive{id: "wa-sidecar-scan"})
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if _, _, err := registry.Restore("wa-sidecar-scan", afclient.WorkareaRestoreRequest{IntoSessionID: "sess-real"}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	restoredDir := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-restored")
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte(`{"restoreId":"evil","archiveId":"wa-sidecar-scan","intoSessionId":"sess-evil"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(restoredDir, "evil.json")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan bool, 1)
+	go func() {
+		inUse, err := registry.intoSessionIDInUse("sess-evil")
+		if err != nil {
+			t.Errorf("scan: %v", err)
+		}
+		done <- inUse
+	}()
+	select {
+	case inUse := <-done:
+		if inUse {
+			t.Errorf("linked sidecar content reported as in use")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("scan blocked on planted entry")
+	}
+	if inUse, err := registry.intoSessionIDInUse("sess-real"); err != nil || !inUse {
+		t.Fatalf("genuine sidecar lost: inUse=%v err=%v", inUse, err)
+	}
+}
