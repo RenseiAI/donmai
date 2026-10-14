@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -135,7 +136,20 @@ type continueRangeInspection struct {
 	// allowance (see deliversUnder); without one, merges alone never
 	// deliver.
 	hasMergeChange bool
-	scratchPaths   []string
+	// mergeOnly reports that every commit in the range is a merge: no
+	// non-merge commit of the session's own. A clean merge of the base
+	// branch lands here — the merge changed nothing against every
+	// parent by construction — and only a dispatch-declared clean-merge
+	// intent lets it deliver.
+	mergeOnly bool
+	// mergeAbsorbs reports that a merge-only range brought in history
+	// the from commit did not already reach: some commit reachable from
+	// to but not from from lies outside the session's own range. A real
+	// merge of the base does; a merge built so that every parent was
+	// already merged absorbs nothing and is a no-op, like an empty
+	// commit.
+	mergeAbsorbs bool
+	scratchPaths []string
 }
 
 func (i continueRangeInspection) delivers() bool {
@@ -143,13 +157,18 @@ func (i continueRangeInspection) delivers() bool {
 }
 
 // deliversUnder reports whether the inspected range delivers the work
-// under the dispatch-declared delivery policy. Without the merge
-// allowance this is delivers: at least one non-merge code change and
-// no scratch path. With it, a merge that carries the run's own
+// under the dispatch-declared delivery policy. Without an allowance
+// this is delivers: at least one non-merge code change and no scratch
+// path. With the merge allowance, a merge that carries the run's own
 // resolution also delivers — the merge commit itself changed a
 // non-scratch path against every parent — while the scratch rule
 // still applies, so a merge that only carries runner scratch stays
-// undelivered. Nil is today's behaviour.
+// undelivered. With the clean-merge intent, a pushed merge-only range
+// delivers even when the merge is clean: merging IS the task, so the
+// merge commit itself is the delivery — while the commit-count,
+// no-new-commit and scratch rules still apply, so an empty range, a
+// non-merge no-op commit, or a merge that absorbed nothing never rides
+// it. Nil is today's behaviour.
 func (i continueRangeInspection) deliversUnder(policy *prompt.DeliveryPolicy) bool {
 	if len(i.scratchPaths) > 0 {
 		return false
@@ -157,7 +176,10 @@ func (i continueRangeInspection) deliversUnder(policy *prompt.DeliveryPolicy) bo
 	if i.hasCodeChange {
 		return true
 	}
-	return policy.AllowsMerges() && i.hasMergeChange
+	if policy.AllowsMerges() && i.hasMergeChange {
+		return true
+	}
+	return policy.AllowsCleanMerge() && i.mergeOnly && i.mergeAbsorbs && i.commitCount > 0
 }
 
 // inspectContinueRange classifies the commits the session added between from
@@ -192,7 +214,22 @@ func inspectContinueRange(ctx context.Context, worktreePath, branch, from, to st
 	for _, commit := range nonMerges {
 		nonMergeSet[commit] = struct{}{}
 	}
-	inspection := continueRangeInspection{commitCount: len(commits)}
+	inspection := continueRangeInspection{commitCount: len(commits), mergeOnly: len(nonMerges) == 0}
+	if inspection.mergeOnly {
+		// Every commit reachable from to but not from from, published
+		// or not: more than the session's own range means the merges
+		// brought in history from elsewhere. Equal means they absorbed
+		// nothing, so the range is a no-op.
+		reachable, countErr := gitStdout(ctx, worktreePath, nil, "rev-list", "--count", to, "--not", from)
+		if countErr != nil {
+			return continueRangeInspection{}, fmt.Errorf("runner: count continued pull request history: %w", countErr)
+		}
+		total, parseErr := strconv.Atoi(strings.TrimSpace(reachable))
+		if parseErr != nil {
+			return continueRangeInspection{}, fmt.Errorf("runner: count continued pull request history: %w", parseErr)
+		}
+		inspection.mergeAbsorbs = total > len(commits)
+	}
 	scratchSet := map[string]struct{}{}
 	for _, commit := range commits {
 		changes, pathErr := continueCommitChanges(ctx, worktreePath, commit)

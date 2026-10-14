@@ -1808,6 +1808,7 @@ func detailDeliveryPolicy(in *daemon.PollDeliveryPolicy) *prompt.DeliveryPolicy 
 	return &prompt.DeliveryPolicy{
 		AllowDraft:        in.AllowDraft,
 		AllowMergeCommits: in.AllowMergeCommits,
+		AllowCleanMerge:   in.AllowCleanMerge,
 	}
 }
 
