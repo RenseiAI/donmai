@@ -102,15 +102,17 @@ func TestPollItemToSessionSpec_PreP3Identity(t *testing.T) {
 	got := PollItemToSessionSpec(preP3, projects)
 
 	// The exact spec a pre-P3 daemon would have produced: existing fields
-	// populated, every P3 gate field at its zero value.
+	// populated, every P3 gate field at its zero value. The top-level
+	// maxDurationSeconds is intentionally NOT mirrored onto the spec — it is
+	// wired into the stage budget at the detail boundary instead, and the
+	// spec carries no duration surface at all.
 	want := SessionSpec{
-		SessionID:          "sess-legacy",
-		Repository:         "https://github.com/acme/alpha",
-		Ref:                "main",
-		Resources:          &SessionResources{VCpu: 2, MemoryMB: 4096},
-		Env:                map[string]string{"FOO": "bar"},
-		MaxDurationSeconds: 1800,
-		ProjectName:        "alpha",
+		SessionID:   "sess-legacy",
+		Repository:  "https://github.com/acme/alpha",
+		Ref:         "main",
+		Resources:   &SessionResources{VCpu: 2, MemoryMB: 4096},
+		Env:         map[string]string{"FOO": "bar"},
+		ProjectName: "alpha",
 		// PlatformAllowed/AuthMode/WorkType/Mode/Company/Model/Workload all zero.
 	}
 
