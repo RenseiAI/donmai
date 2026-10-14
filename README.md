@@ -15,6 +15,7 @@ agent sessions, and exposes code intelligence without a hosted control plane.
 
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Showcase workflows](#showcase-workflows)
 - [Standalone credentials](#standalone-credentials)
 - [Local execution model](#local-execution-model)
 - [Command catalog](#command-catalog)
@@ -151,6 +152,24 @@ is admitted once per local queue: relabeling a failed issue does not retry it.
 Keep the failed issue and its receipt for diagnosis. An unresolved recovered
 session appears as **held**, with no claim of live work; completed or failed
 results and verified publication receipts remain in the local session record.
+
+## Showcase workflows
+
+Three end-to-end workflows, each runnable from its own README alone on
+the shipping release, each with a recorded run (asciicast v2):
+
+- [examples/backlog-sweep](./examples/backlog-sweep/) — issues carrying
+  the watched label are picked up, worked in parallel in isolated
+  workareas, and returned as pull requests with session logs, watched
+  from the terminal dashboard.
+- [examples/second-opinion](./examples/second-opinion/) — the same
+  issue dispatched to two harnesses, two pull requests side by side:
+  the cross-vendor comparison no single harness can ship.
+- [examples/drift-check-pr](./examples/drift-check-pr/) — `donmai arch`
+  run against a pull request, drift summary posted as a PR comment
+  (manual invocation; the scheduled Action form is tracked separately).
+
+Start with the quick start above, then pick a workflow.
 
 ### Persistent host
 
