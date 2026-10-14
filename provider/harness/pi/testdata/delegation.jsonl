@@ -1,0 +1,4 @@
+{"type":"agent_start"}
+{"type":"tool_execution_start","toolName":"dispatch_child","toolCallId":"call-1","args":{}}
+{"type":"tool_execution_end","toolName":"dispatch_child","toolCallId":"call-1","isError":false,"result":{"content":[{"type":"text","text":"childSessionRef: sessionId=prose-decoy transport=prose-decoy"}],"details":{"childSessionRef":{"sessionId":"child-1","transport":"host_cli"}}}}
+{"type":"agent_settled"}

@@ -4,9 +4,12 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 // This file declares the additional-extension delivery seam for harnesses
@@ -76,8 +79,9 @@ type ExtensionDelivery struct {
 	// bare filename (no path separators) when Kind == ExtensionDeliveryInline.
 	Basename string `json:"basename,omitempty"`
 
-	// Digest is the REQUIRED lowercase-hex sha256 of the extension's exact
-	// on-disk bytes. Per D2(b), the runner verifies this AFTER
+	// Digest is the REQUIRED lowercase-hex sha256 binding the extension's
+	// exact on-disk bytes and DelegationTools (see ComputeDigest). Per D2(b),
+	// the runner verifies this AFTER
 	// materialization — reading back whatever actually landed at the load
 	// path, never Source or a caller's in-memory copy — so a mismatch always
 	// reflects what is actually loadable rather than what was merely
@@ -86,6 +90,10 @@ type ExtensionDelivery struct {
 	// caught here. Never optional: an empty Digest is malformed input and
 	// denies before any child process starts (D1.2 fail-closed).
 	Digest string `json:"digest"`
+
+	// DelegationTools names tools that start child sessions. The source
+	// and lifecycle input digests both bind these declarations.
+	DelegationTools []string `json:"delegationTools,omitempty"`
 
 	// Required marks the delivery load-bearing: per D1.2, a required
 	// delivery that cannot be materialized, verified, or loaded denies spawn
@@ -112,13 +120,23 @@ var sha256HexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // when d is well-formed. It inspects shape only — never file contents or
 // Source bytes against Digest — so callers can validate before any
 // filesystem or subprocess work; the exact harness adapter still verifies
-// Digest against what actually lands on disk (VerifyExtensionDigest).
+// Digest against what actually lands on disk (ExtensionDelivery.VerifyDigest).
 func ValidateExtensionDelivery(d ExtensionDelivery) error {
 	if d.ID == "" {
 		return fmt.Errorf("extension delivery: id is required")
 	}
 	if !sha256HexPattern.MatchString(d.Digest) {
 		return fmt.Errorf("extension delivery %q: digest must be a lowercase sha256 hex string", d.ID)
+	}
+	seen := make(map[string]bool, len(d.DelegationTools))
+	for _, name := range d.DelegationTools {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("extension delivery %q: delegation tool name is required", d.ID)
+		}
+		if seen[name] {
+			return fmt.Errorf("extension delivery %q: duplicate delegation tool %q", d.ID, name)
+		}
+		seen[name] = true
 	}
 	switch d.Kind {
 	case ExtensionDeliveryPath:
@@ -167,4 +185,46 @@ func VerifyExtensionDigest(loaded []byte, want string) bool {
 	sum := sha256.Sum256(loaded)
 	got := hex.EncodeToString(sum[:])
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// ComputeDigest binds loaded source bytes and the ordered delegation tool
+// declarations. Callers use Source for inline deliveries or read Path for path
+// deliveries; adapters must use bytes read back after materialization.
+// With no declarations this is the original byte-only sha256. Otherwise it is
+// the sha256 of the JSON object {"sourceDigest":<byte-only sha256>,
+// "delegationTools":<ordered names>}, in that field order and without whitespace.
+func (d ExtensionDelivery) ComputeDigest(loaded []byte) string {
+	sum := sha256.Sum256(loaded)
+	return d.digestFromSourceSHA256(hex.EncodeToString(sum[:]))
+}
+
+// ComputeDigestReader is the streaming equivalent of ComputeDigest. The caller
+// retains ownership of loaded, including closing any file it opened.
+func (d ExtensionDelivery) ComputeDigestReader(loaded io.Reader) (string, error) {
+	h := sha256.New()
+	if _, err := io.Copy(h, loaded); err != nil {
+		return "", fmt.Errorf("hash extension source: %w", err)
+	}
+	return d.digestFromSourceSHA256(hex.EncodeToString(h.Sum(nil))), nil
+}
+
+func (d ExtensionDelivery) digestFromSourceSHA256(sourceDigest string) string {
+	if len(d.DelegationTools) == 0 {
+		return sourceDigest
+	}
+	metadata, _ := json.Marshal(struct {
+		SourceDigest    string   `json:"sourceDigest"`
+		DelegationTools []string `json:"delegationTools"`
+	}{SourceDigest: sourceDigest, DelegationTools: d.DelegationTools})
+	sum := sha256.Sum256(metadata)
+	return hex.EncodeToString(sum[:])
+}
+
+// VerifyDigest checks the loaded bytes and delegation declarations against
+// this delivery's digest in constant time. An empty digest never matches.
+func (d ExtensionDelivery) VerifyDigest(loaded []byte) bool {
+	if d.Digest == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(d.ComputeDigest(loaded)), []byte(d.Digest)) == 1
 }
