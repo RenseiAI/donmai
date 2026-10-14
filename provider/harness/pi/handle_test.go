@@ -59,6 +59,126 @@ func event(fields map[string]any) string {
 	return string(b) + "\n"
 }
 
+// outputLimitTurn scripts the SDK's completed assistant message and turn,
+// including usage on the turn that may trip the limit.
+func outputLimitTurn(reason string) string {
+	msg := map[string]any{
+		"role": "assistant", "stopReason": reason,
+		"content": []any{map[string]any{"type": "text", "text": "reply"}},
+		"usage":   map[string]any{"input": 7, "output": 11, "cost": map[string]any{"total": 0.25}},
+	}
+	return event(map[string]any{"type": "turn_start"}) +
+		event(map[string]any{"type": "message_end", "message": msg}) +
+		event(map[string]any{"type": "turn_end", "message": msg})
+}
+
+func TestOutputLimitTurns(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		limit   int
+		reasons []string
+		fatal   bool
+	}{
+		{"default bound", 0, []string{"length", "length", "length"}, true},
+		{"below bound", 0, []string{"length", "length"}, false},
+		{"normal turn resets", 0, []string{"length", "length", "stop", "length", "length"}, false},
+		{"reset then reaches bound", 0, []string{"length", "stop", "length", "length", "length"}, true},
+		{"configured bound", 2, []string{"length", "length"}, true},
+		{"configured higher bound", 4, []string{"length", "length", "length"}, false},
+		{"single turn bound", 1, []string{"length"}, true},
+		{"negative uses default", -1, []string{"length", "length"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mode := range []string{"scripted spawn", "scripted resume", "fakepi"} {
+				t.Run(mode, func(t *testing.T) {
+					var body strings.Builder
+					for _, reason := range tc.reasons {
+						body.WriteString(outputLimitTurn(reason))
+					}
+					// A fatal guard must stop before this successful settlement.
+					body.WriteString(event(map[string]any{"type": "agent_end"}))
+					body.WriteString(event(map[string]any{"type": "agent_settled"}))
+					var h agent.Handle
+					var err error
+					if mode == "fakepi" {
+						// Use a real child that answers the handshake and only emits
+						// the transcript once the production Spawn sends its prompt.
+						bin := newFakeCatalogProbeBinary(t, "cat <<'HANDSHAKE'\n"+handshakeEvent("h1")+"HANDSHAKE\n"+`
+while IFS= read -r command; do
+  case "$command" in
+    *'"type":"prompt"'*)
+      cat <<'TRANSCRIPT'
+`+body.String()+`TRANSCRIPT
+      ;;
+    *'"type":"abort"'*) exit 0 ;;
+  esac
+done
+`)
+						p, newErr := New(Options{
+							PiBin: bin, handshakeToken: testHandshakeToken,
+							VersionProbe:                   func(context.Context, string) (string, error) { return PinnedVersion, nil },
+							MaxConsecutiveOutputLimitTurns: tc.limit,
+						})
+						if newErr != nil {
+							t.Fatal(newErr)
+						}
+						h, err = p.Spawn(context.Background(), agent.Spec{Cwd: t.TempDir(), Prompt: "go"})
+					} else {
+						sl := scriptedLaunch{
+							spec: agent.Spec{Prompt: "go"}, preSpawn: handshakeEvent("h1"), body: body.String(),
+							configure: func(p *Provider) { p.opts.MaxConsecutiveOutputLimitTurns = tc.limit },
+						}
+						if mode == "scripted resume" {
+							sl.resumeSessionID = "existing-session"
+						}
+						_, h, _, err = launchScripted(t, sl)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = h.Stop(context.Background()) })
+					events := drain(t, h)
+					calls := 0
+					for _, ev := range events {
+						if call, ok := ev.(agent.LlmCallEvent); ok && call.TurnCompleted {
+							calls++
+							if call.InputTokens != 7 || call.OutputTokens != 11 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.25 {
+								t.Fatalf("turn usage lost: %+v", call)
+							}
+						}
+					}
+					if calls != len(tc.reasons) {
+						t.Fatalf("completed LLM calls = %d, want %d", calls, len(tc.reasons))
+					}
+					last := events[len(events)-1]
+					if tc.fatal {
+						failure, ok := last.(agent.ErrorEvent)
+						if !ok || failure.Code != RepeatedOutputLimitCode || failure.SessionContinues {
+							t.Fatalf("terminal = %#v, want fatal repeated_output_limit", last)
+						}
+						if call, ok := events[len(events)-2].(agent.LlmCallEvent); !ok || !call.TurnCompleted {
+							t.Fatal("failure must follow final turn usage")
+						}
+						if err := h.Inject(context.Background(), "continue"); err == nil {
+							t.Fatal("Inject accepted after fatal cutoff")
+						}
+						select {
+						case ev, open := <-h.Events():
+							if open {
+								t.Fatalf("event after terminal: %#v", ev)
+							}
+						case <-time.After(3 * time.Second):
+							t.Fatal("event stream stayed open after fatal cutoff")
+						}
+					} else if result, ok := last.(agent.ResultEvent); !ok || !result.Success {
+						t.Fatalf("terminal = %#v, want success", last)
+					}
+				})
+			}
+		})
+	}
+}
+
 // uiRequest builds a real extension_ui_request (method:"input") carrying the
 // donmai marker placeholder and a JSON payload in `title` — the exact shape the
 // policy extension emits over `ctx.ui.input(payload, DONMAI_UI_MARKER)`.
