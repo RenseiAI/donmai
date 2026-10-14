@@ -49,6 +49,18 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	switch ep.Host {
 	case "", agent.HostDirect, agent.HostLocal, agent.HostOAuthCLI:
 		// routable
+	case agent.HostGateway:
+		// Translating-gateway cell: the harness drives the gateway's
+		// loopback surface over the openai-chat dialect, presenting the
+		// short-TTL per-session bearer as the injected provider's key.
+		// The manifest's DrivesHosts gates admission upstream
+		// (validateReceiptCell); this read site only projects. The base
+		// URL is the worker-local listener's own address (loopback by
+		// construction); the dispatch-wire shape check below keeps a
+		// mis-bound non-loopback surface from reaching the child.
+		if err := agent.ValidateEndpointBindingBaseURL(ep.BaseURL); err != nil {
+			return spec, fmt.Errorf("gateway endpoint: %w", err)
+		}
 	default:
 		return spec, fmt.Errorf("serving host %q is not routable by the opencode harness", ep.Host)
 	}

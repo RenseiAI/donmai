@@ -45,8 +45,21 @@ type Gateway struct {
 	started  bool
 }
 
+// BearerTTL caps how long a bound session bearer stays usable. A stolen
+// bearer is then worthless off-host (the gateway listens on loopback only)
+// and expires quickly: Unbind at session teardown releases the route
+// immediately, and expiry closes the window a teardown that never runs
+// (a crashed worker, a leaked token file) would otherwise leave open.
+// The bound is deliberately short — well inside any session duration — so
+// the bearer is a per-session capability, not a long-lived credential.
+// Exported so the worker-local producer and tests name the same bound the
+// gateway enforces, rather than restating it.
+const BearerTTL = 15 * time.Minute
+
 // route is one bound session: the upstream to dial and the credential scope to
 // dial it with, plus the attribution facts stamped onto every cost row.
+// expiresAt is the instant the bearer stops authorizing the route, enforced
+// on every Dispatch alongside the exact-token match.
 type route struct {
 	sessionID  string
 	dispatchID string
@@ -56,6 +69,7 @@ type route struct {
 	model      string
 	upstream   upstream.Upstream
 	pool       *pool.Pool
+	expiresAt  time.Time
 }
 
 // Options configures a Gateway.
@@ -200,6 +214,7 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 		model:      cfg.Model,
 		upstream:   cfg.Upstream,
 		pool:       pool.New(cfg.Source, cfg.PoolOpts),
+		expiresAt:  g.now().Add(BearerTTL),
 	}
 	addr := g.addr
 	g.mu.Unlock()
@@ -238,8 +253,9 @@ func (g *Gateway) Routes() int {
 func (g *Gateway) Dispatch(ctx context.Context, tok token.Token, req ir.Request) (surface.Outcome, error) {
 	g.mu.RLock()
 	rt := g.routes[tok]
+	now := g.now()
 	g.mu.RUnlock()
-	if rt == nil {
+	if rt == nil || !now.Before(rt.expiresAt) {
 		return surface.Outcome{}, &surface.HTTPError{Status: http.StatusUnauthorized, Code: "invalid_token", Message: "unknown or expired session token"}
 	}
 
@@ -305,9 +321,10 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	tok := token.FromBearer(r.Header.Get("Authorization"))
 	g.mu.RLock()
 	rt := g.routes[tok]
+	now := g.now()
 	g.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	if rt == nil {
+	if rt == nil || !now.Before(rt.expiresAt) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": "unknown session token"}})
 		return

@@ -94,6 +94,14 @@ const (
 // run` process. The zero value and a nil pointer are both valid no-ops, so
 // callers need no branch: a session whose cell is not gateway-served gets a nil
 // workerGateway and Close is a no-op.
+//
+// The bound bearer is short-TTL and loopback-only: the harness child reaches
+// the model only through the worker-local gateway surface, and the bearer
+// dies with the session (Unbind at Close) or at expiry, whichever comes
+// first — so a bearer a repo hook, helper, or MCP server exfiltrates is
+// useless off-host and expires quickly. The harness MUST therefore never see
+// the upstream credential: only the bearer rides Endpoint.Env, and the route
+// (base URL + bearer as API key) is the only model path it is given.
 type workerGateway struct {
 	gw  *gateway.Gateway
 	tok token.Token
