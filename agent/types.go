@@ -799,6 +799,28 @@ type Result struct {
 	// every other run. Additive — old platforms ignore it.
 	Upstream *UpstreamError `json:"upstream,omitempty"`
 
+	// FinalProvider names the serving provider the session's model calls
+	// last reported (LlmCallEvent.System): the gateway on a
+	// gateway-routed session, the direct provider otherwise. It is the
+	// answer to "which upstream provider served" — observed per call,
+	// last report wins — never the admitted binding's company, which
+	// stays on the session record's configured axes. Empty when no call
+	// reported a serving provider. Additive — old platforms ignore it.
+	FinalProvider string `json:"finalProvider,omitempty"`
+
+	// FinalModel is the served model id paired with FinalProvider: the
+	// native served id (LlmCallEvent.ResponseModel) when the wire served
+	// a different id than requested, else the requested id. Empty when
+	// no call reported one. Additive — old platforms ignore it.
+	FinalModel string `json:"finalModel,omitempty"`
+
+	// ProviderAttempts totals the serving attempts behind the session's
+	// model calls (LlmCallEvent.Attempts: 1 plus harness auto-retries
+	// per call). Only calls that reported a positive count contribute;
+	// zero means no call reported (unknown) — never "zero attempts".
+	// Additive — old platforms ignore it.
+	ProviderAttempts int `json:"providerAttempts,omitempty"`
+
 	// Manifest is the structured turn-result manifest the agent wrote to
 	// `.agent/turn-result.json`, when one was present + valid (W3 —
 	// deterministic turn outcome). The runner parses + validates it
