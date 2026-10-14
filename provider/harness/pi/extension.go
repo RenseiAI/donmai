@@ -324,7 +324,7 @@ func materializeAdditionalExtensions(layout sessionLayout, deliveries []agent.Ex
 		if err != nil {
 			return nil, fmt.Errorf("pi: additional extension %q: read for verification: %w", d.ID, err)
 		}
-		if !agent.VerifyExtensionDigest(loaded, d.Digest) {
+		if !d.VerifyDigest(loaded) {
 			return nil, fmt.Errorf("pi: additional extension %q: digest mismatch — refusing to load unverified content", d.ID)
 		}
 		paths = append(paths, loadPath)

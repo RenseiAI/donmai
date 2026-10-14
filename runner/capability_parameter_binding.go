@@ -178,6 +178,7 @@ func cloneExtensionDeliveries(in []agent.ExtensionDelivery) []agent.ExtensionDel
 	out := append([]agent.ExtensionDelivery(nil), in...)
 	for i := range out {
 		out[i].Source = append([]byte(nil), in[i].Source...)
+		out[i].DelegationTools = append([]string(nil), in[i].DelegationTools...)
 	}
 	return out
 }

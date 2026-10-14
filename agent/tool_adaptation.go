@@ -992,7 +992,7 @@ func dropDeniedAdvisoryExtensions(spec Spec, entries []ToolLifecycleEntry) Spec 
 }
 
 // additionalExtensionDigestInput reduces spec.AdditionalExtensions to
-// (id, kind, digest) triples before hashing for the receipt's input digest.
+// source digests and delegation declarations before hashing for the receipt's input digest.
 // Each delivery's own Digest already commits to its exact on-disk bytes
 // (ExtensionDelivery.Digest, verified after materialization by the exact
 // harness adapter), so the plan/receipt layer never needs — and must not
@@ -1000,13 +1000,14 @@ func dropDeniedAdvisoryExtensions(spec Spec, entries []ToolLifecycleEntry) Spec 
 // out of plan/receipt evidence.
 func additionalExtensionDigestInput(deliveries []ExtensionDelivery) any {
 	type extensionDigestEntry struct {
-		ID     string                `json:"id"`
-		Kind   ExtensionDeliveryKind `json:"kind"`
-		Digest string                `json:"digest"`
+		ID              string                `json:"id"`
+		Kind            ExtensionDeliveryKind `json:"kind"`
+		Digest          string                `json:"digest"`
+		DelegationTools []string              `json:"delegationTools,omitempty"`
 	}
 	out := make([]extensionDigestEntry, len(deliveries))
 	for i, d := range deliveries {
-		out[i] = extensionDigestEntry{ID: d.ID, Kind: d.Kind, Digest: d.Digest}
+		out[i] = extensionDigestEntry{ID: d.ID, Kind: d.Kind, Digest: d.Digest, DelegationTools: d.DelegationTools}
 	}
 	return out
 }

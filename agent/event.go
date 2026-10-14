@@ -432,6 +432,9 @@ type SubagentEvent struct {
 	// ChildSessionID is the sub-agent's session ref when known.
 	ChildSessionID string `json:"childSessionId,omitempty"`
 
+	// ChildSessionTransport is the transport reported by the delegation result.
+	ChildSessionTransport string `json:"childSessionTransport,omitempty"`
+
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
 }
