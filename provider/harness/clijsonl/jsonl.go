@@ -434,6 +434,7 @@ func mapAssistant(line []byte) []agent.Event {
 		a.Message.Usage.CacheReadInputTokens != 0 || a.Message.Usage.CacheCreationInputTokens != 0 ||
 		a.Message.StopReason != "" {
 		out = append(out, agent.LlmCallEvent{
+			GenerationID:      a.Message.ID,
 			Model:             a.Message.Model,
 			ResponseModel:     a.Message.Model,
 			InputTokens:       a.Message.Usage.InputTokens,
@@ -448,9 +449,13 @@ func mapAssistant(line []byte) []agent.Event {
 		// A response model is not usage. Keep older emitters' terminal
 		// aggregate fallback intact by observing it as status metadata.
 		out = append(out, agent.SystemEvent{
+			GenerationID:  a.Message.ID,
 			Subtype:       agent.SystemSubtypeModelIdentity,
 			ObservedModel: &agent.ObservedModelIdentity{Model: a.Message.Model},
 		})
+	}
+	if len(out) == 0 && a.Message.ID != "" {
+		out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeGenerationID, GenerationID: a.Message.ID})
 	}
 	for _, block := range a.Message.Content {
 		switch block.Type {
@@ -651,6 +656,9 @@ func mapAuthStatus(line []byte) []agent.Event {
 func mapStreamEvent(line []byte) []agent.Event {
 	var head struct {
 		Event struct {
+			Message struct {
+				ID string `json:"id"`
+			} `json:"message"`
 			Type  string `json:"type"`
 			Error *struct {
 				Type    string `json:"type,omitempty"`
@@ -666,6 +674,9 @@ func mapStreamEvent(line []byte) []agent.Event {
 			Code:    "decode_stream_event",
 			Raw:     json.RawMessage(line),
 		}}
+	}
+	if head.Event.Type == "message_start" && head.Event.Message.ID != "" {
+		return []agent.Event{agent.SystemEvent{Subtype: agent.SystemSubtypeGenerationID, GenerationID: head.Event.Message.ID}, agent.StreamProgressEvent()}
 	}
 	apiErr := head.Event.Error
 	if head.Event.Type == "message_stop" && apiErr != nil {

@@ -766,6 +766,10 @@ type Result struct {
 	// reads as "did nothing" rather than unknown.
 	ToolCalls int `json:"toolCalls"`
 
+	// GenerationIDs are the bounded, distinct native response ids observed
+	// during an endpoint-bound session, in first-observed order.
+	GenerationIDs []string `json:"generationIds,omitempty"`
+
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
 

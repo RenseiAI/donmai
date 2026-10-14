@@ -205,6 +205,7 @@ func mapTranscriptUsageEvent(line []byte, seen map[string]struct{}, since time.T
 	}
 	seen[key] = struct{}{}
 	return agent.LlmCallEvent{
+		GenerationID:      parsed.Message.ID,
 		InputTokens:       u.InputTokens,
 		OutputTokens:      u.OutputTokens,
 		CachedInputTokens: u.CacheReadInputTokens,

@@ -112,7 +112,13 @@ func (p *verdictScriptProvider) Manifest() agent.HarnessManifest {
 }
 
 func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
-	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts, specEnv: spec.Env}
+	// The script plays synchronously before Spawn/Inject returns. Size the
+	// buffer for the largest turn so large fixture streams cannot deadlock.
+	capacity := 64
+	for _, turn := range p.turns {
+		capacity = max(capacity, len(turn.events)+2*turn.toolCalls+4)
+	}
+	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, capacity), prompts: &p.prompts, specEnv: spec.Env}
 	p.lastHandle = h
 	h.events <- agent.InitEvent{SessionID: "scripted-session"}
 	h.play()
@@ -301,6 +307,7 @@ const followUpRepository = "https://github.com/example/repo"
 
 // scriptedSession configures runScriptedSession.
 type scriptedSession struct {
+	endpoint     *agent.EndpointBinding
 	workType     string
 	skipSteering bool
 	inject       string
@@ -451,7 +458,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		WorkerID:        "worker-1",
 		AuthToken:       "tok",
 		PlatformURL:     platform.URL,
-		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub, Endpoint: cfg.endpoint},
 	}
 	qw.WorkType = cfg.workType
 	qw.StageBudget = cfg.budget

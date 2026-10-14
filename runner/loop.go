@@ -2941,6 +2941,9 @@ func (r *Runner) consumeEventsWithin(
 			resetIdle()
 			resetStall()
 			for _, correlatedEvent := range traceProcessor.Process(ev) {
+				if res != nil && qw.ResolvedProfile.Endpoint != nil {
+					res.GenerationIDs = collectGenerationID(res.GenerationIDs, correlatedEvent)
+				}
 				trackToolEvent(correlatedEvent)
 				appendJSONL(correlatedEvent)
 				r.observeEvent(correlatedEvent, &obs, worktreePath, qw)

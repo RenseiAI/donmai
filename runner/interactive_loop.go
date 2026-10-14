@@ -432,7 +432,7 @@ func (r *Runner) dispatchInteractive(
 	// the terminal report (so the existing cost-event writer records it) and
 	// is visible to the step-heartbeat emitter wired below through
 	// usageSnapshot.
-	usage := &interactiveUsageTotals{}
+	usage := &interactiveUsageTotals{collectIDs: qw.ResolvedProfile.Endpoint != nil}
 	r.registerInteractiveUsage(qw.SessionID, usage)
 	defer r.releaseInteractiveUsage(qw.SessionID)
 
@@ -672,6 +672,11 @@ const interactiveActivityFlushGrace = 5 * time.Second
 // carry it. A nil usage leaves the total untouched, so callers that only
 // forward (and never report) may pass nil.
 func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath string, sink activitySink, event agent.Event, usage *interactiveUsageTotals) {
+	if usage != nil && usage.collectIDs {
+		usage.mu.Lock()
+		usage.generationIDs = collectGenerationID(usage.generationIDs, event)
+		usage.mu.Unlock()
+	}
 	if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
 		r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
 		return

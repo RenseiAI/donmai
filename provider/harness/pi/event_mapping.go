@@ -133,6 +133,10 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		return nil, false
 
 	case "message_end":
+		msg := mapField(f, "message")
+		if id := stringField(msg, "responseId"); stringField(msg, "role") == "assistant" && id != "" {
+			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeGenerationID, GenerationID: id})
+		}
 		text := st.textBuf.String()
 		st.textBuf.Reset()
 		if text != "" {

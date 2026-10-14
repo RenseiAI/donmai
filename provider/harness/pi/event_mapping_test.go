@@ -594,6 +594,34 @@ func TestMapEvent_MessageUpdateEmitsStreamProgress(t *testing.T) {
 	}
 }
 
+func TestSpawn_GenerationIDs(t *testing.T) {
+	t.Parallel()
+	for _, role := range []string{"assistant", "user", "toolResult"} {
+		t.Run(role, func(t *testing.T) {
+			t.Parallel()
+			body := getStateResponse("session") + event(map[string]any{"type": "message_end", "message": map[string]any{"role": role, "responseId": "response-one"}}) + event(map[string]any{"type": "agent_settled"})
+			_, h, _, err := launchScripted(t, scriptedLaunch{spec: agent.Spec{Prompt: "hi"}, preSpawn: handshakeEvent("h1"), body: body})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = h.Stop(t.Context()) })
+			var ids []string
+			for _, ev := range drain(t, h) {
+				if e, ok := ev.(agent.SystemEvent); ok && e.GenerationID != "" {
+					ids = append(ids, e.GenerationID)
+				}
+			}
+			if role == "assistant" {
+				if len(ids) != 1 || ids[0] != "response-one" {
+					t.Fatalf("generation ids = %v; want response-one", ids)
+				}
+			} else if len(ids) != 0 {
+				t.Fatalf("non-assistant generation ids = %v", ids)
+			}
+		})
+	}
+}
+
 func TestUsageFixture_AnthropicReasoningNotReported(t *testing.T) {
 	t.Parallel()
 	body, err := os.ReadFile("testdata/anthropic-messages-usage.jsonl")

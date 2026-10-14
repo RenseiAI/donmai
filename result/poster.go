@@ -204,6 +204,7 @@ type completionRequest struct {
 // the handler could add strict StatusRequestBody validation without ever
 // seeing failureMode/summary.
 type statusRequest struct {
+	GenerationIDs     []string       `json:"generationIds,omitempty"`
 	WorkerID          string         `json:"workerId"`
 	Status            string         `json:"status"`
 	ProviderSessionID string         `json:"providerSessionId,omitempty"`
@@ -685,6 +686,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
+		GenerationIDs: r.GenerationIDs,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd
