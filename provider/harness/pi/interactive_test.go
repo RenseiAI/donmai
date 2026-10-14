@@ -3,6 +3,7 @@ package pi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,26 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 )
+
+func TestSpawn_Interactive_InjectRequiresTrustedDurableReceipt(t *testing.T) {
+	p := newFakeInteractivePiProvider(t, "sleep 60\n")
+	h, err := p.Spawn(t.Context(), agent.Spec{
+		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	for _, text := range []string{"queued peer input", "queued peer input", "different delivery"} {
+		err := h.Inject(t.Context(), text)
+		if !errors.Is(err, agent.ErrUnsupported) || !errors.Is(err, ErrInteractiveReceiptUnavailable) {
+			t.Fatalf("Inject must classify the missing durable receipt and remain unsupported; got %v", err)
+		}
+	}
+	if _, ok := h.(agent.NoticeChannelCapable); ok {
+		t.Fatal("interactive activity must not expose an applied-receipt channel")
+	}
+}
 
 // captureArgvEnvScript is the fake-pi body the fixture tests use. It dumps its
 // own argv (one element per line so an argument containing spaces still lands on

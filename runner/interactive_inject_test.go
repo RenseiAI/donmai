@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -871,6 +873,7 @@ func runInteractiveInjectViaRunLoop(t *testing.T, supportsInjection bool, channe
 		Poster:             poster,
 		HTTPClient:         platform.Client(),
 		HeartbeatInterval:  50 * time.Millisecond,
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxSessionDuration: -1,
 		SkipBackstop:       true,
 		SkipSteering:       true,
@@ -1008,6 +1011,10 @@ func waitFor(t *testing.T, d time.Duration, msg string, cond func() bool) {
 // crosses all three catches a change to any one of them.
 func TestInteractive_RunLoopNeverAcksAnUndeliverableInject(t *testing.T) {
 	runInteractiveInjectViaRunLoop(t, true, agent.NoticeDeliveryMCPRPC, noticeDeadChannelNotDriven)
+}
+
+func TestInteractive_RunLoopRPCSteerDeadLettersWithoutAck(t *testing.T) {
+	runInteractiveInjectViaRunLoop(t, true, agent.NoticeDeliveryRPCSteer, noticeDeadChannelNotDriven)
 }
 
 // TestInteractive_RunLoopDeadLettersAChannelThisSessionLacks is the FALLBACK
