@@ -258,7 +258,41 @@ func (bogusDecisionReporter) SubmitExecutionSecurityReport(context.Context, Exec
 	return ExecutionSecurityReportAcceptance{ContractVersion: ExecutionSecurityReportContractVersion, Decision: "maybe"}, nil
 }
 
-// TestSubmitExecutionSecurityReportFailureIsTyped pins the fail-closed
+// TestSubmitExecutionSecurityReportRejectsOpenSubmission pins the closed
+// envelope floor: a submission that fails validation never reaches the
+// reporter at all.
+func TestSubmitExecutionSecurityReportRejectsOpenSubmission(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	submissions := 0
+	h.runner.executionSecurityReporterOverride = roundTripReporter{onSubmit: func(ExecutionSecurityReportSubmission) (ExecutionSecurityReportAcceptance, error) {
+		submissions++
+		return ExecutionSecurityReportAcceptance{ContractVersion: ExecutionSecurityReportContractVersion, Decision: "accepted"}, nil
+	}}
+	report, err := agent.RenderExecutionSecurity(agent.Spec{ExecutionSecurity: executionSecuritySection(nil)}, agent.HarnessManifest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.runner.submitExecutionSecurityReport(context.Background(), QueuedWork{}, report); err == nil {
+		t.Fatal("open submission accepted")
+	}
+	if submissions != 0 {
+		t.Fatalf("submissions = %d, want zero: an invalid submission never posts", submissions)
+	}
+	if _, err := invalidExecutionSecurityReporter(nil).SubmitExecutionSecurityReport(context.Background(), indexZeroSubmissionReport(t)); err == nil {
+		t.Fatal("unconfigured reporter submitted")
+	}
+}
+
+// roundTripReporter is a function reporter for submission-floor tests.
+type roundTripReporter struct {
+	onSubmit func(ExecutionSecurityReportSubmission) (ExecutionSecurityReportAcceptance, error)
+}
+
+func (r roundTripReporter) SubmitExecutionSecurityReport(_ context.Context, submission ExecutionSecurityReportSubmission) (ExecutionSecurityReportAcceptance, error) {
+	return r.onSubmit(submission)
+}
+
 // projection: a failed post is execution_security_receipt_unmet, so the
 // caller records a typed refusal rather than an untyped spawn failure.
 // A decision outside the closed envelope fails the same way.
