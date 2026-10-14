@@ -213,6 +213,7 @@ type statusRequest struct {
 	TotalCostUsd      float64        `json:"totalCostUsd,omitempty"`
 	InputTokens       int64          `json:"inputTokens,omitempty"`
 	OutputTokens      int64          `json:"outputTokens,omitempty"`
+	Model             string         `json:"model,omitempty"`
 	// CacheReadTokens is the cache-read token count carried from
 	// CostData.CachedInputTokens. Additive and backward-compatible:
 	// omitted when zero, so an old receiver that ignores the key still
@@ -676,6 +677,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 	}
 	body := statusRequest{
 		WorkerID: creds.WorkerID, Status: r.Status, ProviderSessionID: r.ProviderSessionID,
+		Model:        r.Model,
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,

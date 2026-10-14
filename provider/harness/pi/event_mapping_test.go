@@ -2,7 +2,9 @@ package pi
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -617,5 +619,51 @@ func TestSpawn_GenerationIDs(t *testing.T) {
 				t.Fatalf("non-assistant generation ids = %v", ids)
 			}
 		})
+	}
+}
+
+func TestUsageFixture_AnthropicReasoningNotReported(t *testing.T) {
+	t.Parallel()
+	body, err := os.ReadFile("testdata/anthropic-messages-usage.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), string(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, results := 0, 0
+	for _, ev := range drain(t, h) {
+		var wireValue any
+		switch v := ev.(type) {
+		case agent.LlmCallEvent:
+			calls++
+			if v.InputTokens != 40 || v.CachedInputTokens != 60 || v.CacheWriteTokens != 10 || v.OutputTokens != 50 || v.ReasoningTokens != 0 {
+				t.Errorf("unexpected call usage: %+v", v)
+			}
+			wireValue = v
+		case agent.ResultEvent:
+			results++
+			if v.Cost == nil {
+				t.Fatal("missing terminal usage")
+			}
+			want := agent.CostData{InputTokens: 40, CachedInputTokens: 60, CacheWriteTokens: 10, OutputTokens: 50, NumTurns: 1}
+			if *v.Cost != want {
+				t.Errorf("terminal usage = %+v; want %+v", *v.Cost, want)
+			}
+			wireValue = v.Cost
+		default:
+			continue
+		}
+		wire, err := json.Marshal(wireValue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(wire), "reasoningTokens") {
+			t.Errorf("protocol does not report reasoning; field must be omitted: %s", wire)
+		}
+	}
+	if calls != 1 || results != 1 {
+		t.Errorf("calls/results = %d/%d; want 1/1", calls, results)
 	}
 }
