@@ -209,8 +209,8 @@ func TestHeadlessReapProofIsNeverAssumed(t *testing.T) {
 // refused rather than answered.
 //
 // The EPERM branch is driven with an injected probe, because the kernel state
-// behind it is a race: darwin answers EPERM, not ESRCH, for a group that still
-// exists with no live member while it is torn down (seen under parallel load
+// behind it is a race: darwin answers EPERM, not ESRCH, for a group whose
+// table entry still exists while it is torn down (seen under parallel load
 // right after the harness was killed and waited). There the members are
 // counted, so an emptied group is gone and a populated one is not; on Linux
 // EPERM already means a live member owned by another user.
@@ -246,6 +246,15 @@ func TestProcessGroupGone(t *testing.T) {
 	wantEmptied := runtime.GOOS == "darwin"
 	if gone, err := processGroupGone(pgid, eperm); err != nil || gone != wantEmptied {
 		t.Fatalf("processGroupGone(emptied group, EPERM) on %s = (%v,%v), want (%v,nil)", runtime.GOOS, gone, err, wantEmptied)
+	}
+	// A zombie-only group is unproved on darwin, never gone: the member
+	// exited but its parent has not waited it, so the reap has not happened.
+	// Linux never reaches this branch — a zombie still answers kill there,
+	// so the group reads as alive at the probe — which is exactly the
+	// cross-platform agreement: neither platform reports a zombie-only group
+	// as reaped.
+	if runtime.GOOS == "darwin" {
+		assertZombieGroupUnproved(t, eperm)
 	}
 	//nolint:gosec // G204: fixed test-only argv
 	live := exec.Command("/bin/sleep", "60")
