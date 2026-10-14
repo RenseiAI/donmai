@@ -62,10 +62,32 @@ const (
 	turnUsageCacheWrite = 512
 )
 
+// cutoffModeEnvVar selects the per-turn wire shape runTurn emits. The
+// default (empty) is one minimal complete text turn. "cutoff" emits a turn
+// cut off at the output-token limit in the runtime's recorded shape: an
+// assistant message_end with stopReason "length" naming one tool call,
+// then the hook-less start/end refusal pair for that call (no tool_call
+// hook ever runs for it), then turn_end. "normal" emits an ordinary
+// assistant turn that stopped normally with no refused calls. A test that
+// needs N consecutive cut-off turns followed by a normal turn drives one
+// fakepi per turn script, or switches the mode between sessions.
+const cutoffModeEnvVar = "FAKEPI_TURN_MODE"
+
 // replyEnvVar overrides the assistant text every turn replies with (default
 // "ok"), so a runner test can end a session on the verdict its work type
 // needs.
 const replyEnvVar = "FAKEPI_REPLY"
+
+// cutoffTurnsEnvVar overrides how many consecutive cut-off turns fakepi
+// serves before it goes quiet: each prompt/follow_up/steer command answers
+// one runCutoffTurn and only the LAST such turn closes with agent_settled.
+// Earlier cut-off turns close with turn_end alone, the way a real session
+// that keeps retrying looks on the wire — turn after turn with no terminal
+// until the handle itself stops it. Zero or unset means every turn closes
+// with agent_settled (the legacy single-turn shape the load harness relies
+// on). A test that needs N consecutive cut-offs sets this above the
+// handle's bound and asserts the handle's typed failure arrives first.
+const cutoffTurnsEnvVar = "FAKEPI_CUTOFF_TURNS"
 
 // restoreSessionEnvironment does what the real boundary extension does at
 // load (extensions/donmai-policy.ts restoreSessionEnvironment): the harness
@@ -137,6 +159,8 @@ func main() {
 	})
 
 	sessionID := "fakepi-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	cutoffTurns := cutoffTurnBudget()
+	cutoffServed := 0
 	for in.Scan() {
 		var cmd map[string]any
 		if err := json.Unmarshal(in.Bytes(), &cmd); err != nil {
@@ -159,6 +183,16 @@ func main() {
 			if sessionDelay > 0 {
 				time.Sleep(sessionDelay)
 			}
+			if os.Getenv(cutoffModeEnvVar) == "cutoff" && cutoffTurns > 0 {
+				cutoffServed++
+				// Only the last budgeted turn settles: earlier ones
+				// end with turn_end alone so the handle observes
+				// consecutive cut-off turns with no terminal of its
+				// own — the shape a session that keeps retrying has
+				// until the handle stops it.
+				runCutoffTurn(out, cutoffServed >= cutoffTurns)
+				continue
+			}
 			runTurn(out)
 		case "abort":
 			return
@@ -170,8 +204,14 @@ func main() {
 // turn_end carrying the fixture usage, and the terminal agent_settled —
 // enough for handle.go's mapEvent to produce an AssistantTextEvent, an
 // LlmCallEvent and a ResultEvent, which is what the load harness's
-// consumeEvents-equivalent and the runner wait on.
+// consumeEvents-equivalent and the runner wait on. In "cutoff" mode it
+// emits a turn cut off at the output-token limit instead (see
+// cutoffModeEnvVar and cutoffTurnsEnvVar).
 func runTurn(out *bufio.Writer) {
+	if os.Getenv(cutoffModeEnvVar) == "cutoff" {
+		runCutoffTurn(out, true)
+		return
+	}
 	reply := os.Getenv(replyEnvVar)
 	if reply == "" {
 		reply = "ok"
@@ -192,6 +232,72 @@ func runTurn(out *bufio.Writer) {
 		},
 	}})
 	writeEvent(out, map[string]any{"type": "agent_settled"})
+}
+
+// runCutoffTurn emits one turn cut off at the output-token limit in the
+// runtime's recorded shape: agent_start, an assistant message_end with
+// stopReason "length" naming one edit call, the hook-less
+// tool_execution_start/end pair pi emits for a call it refuses before
+// execution on that stop (isError:true, the runtime's "was not executed"
+// text), then turn_end carrying the fixture usage. The call id is
+// namespaced per turn so consecutive turns never reuse one. Only when
+// settle is true does the turn close with the terminal agent_settled —
+// earlier turns of a budgeted run end with turn_end alone, the way a real
+// session that keeps retrying looks until the handle stops it.
+func runCutoffTurn(out *bufio.Writer, settle bool) {
+	callID := "fakepi-cutoff-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	writeEvent(out, map[string]any{"type": "agent_start"})
+	writeEvent(out, map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "thinking", "thinking": "planning the edit"},
+				map[string]any{"type": "toolCall", "id": callID, "name": "edit", "arguments": map[string]any{}},
+			},
+			"api":        "openai-completions",
+			"provider":   "donmai",
+			"model":      "served-model",
+			"stopReason": "length",
+		},
+	})
+	writeEvent(out, map[string]any{
+		"type": "tool_execution_start", "toolCallId": callID, "toolName": "edit", "args": map[string]any{},
+	})
+	writeEvent(out, map[string]any{
+		"type":       "tool_execution_end",
+		"toolCallId": callID,
+		"toolName":   "edit",
+		"result": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "Tool call \"edit\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments."}},
+			"details": map[string]any{},
+		},
+		"isError": true,
+	})
+	writeEvent(out, map[string]any{"type": "turn_end", "message": map[string]any{
+		"role": "assistant",
+		"usage": map[string]any{
+			"input":      turnUsageInput,
+			"output":     turnUsageOutput,
+			"cacheRead":  turnUsageCacheRead,
+			"cacheWrite": turnUsageCacheWrite,
+		},
+	}})
+	if settle {
+		writeEvent(out, map[string]any{"type": "agent_settled"})
+	}
+}
+
+// cutoffTurnBudget reads how many consecutive cut-off turns fakepi serves
+// before going quiet (cutoffTurnsEnvVar). Zero or unset keeps the legacy
+// single-turn shape: every turn settles on its own.
+func cutoffTurnBudget() int {
+	if raw := os.Getenv(cutoffTurnsEnvVar); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // parseArgs pulls the first `-e` path (the boundary extension always loads
