@@ -50,11 +50,12 @@ On Linux, use Go installation or a release archive below.
 ### go install (requires Go 1.26.6+)
 
 ```bash
-go install github.com/RenseiAI/donmai/cmd/donmai@v0.72.52
+go install github.com/RenseiAI/donmai/cmd/donmai@v0.72.74
 ```
 
-Use the explicit release pin: the public Go proxy currently resolves `@latest`
-to the historical `v1.0.0` module. This source-install command records the pinned
+Use an explicit release pin: the public Go proxy currently resolves `@latest`
+to the historical `v1.0.0` module (May 2026, Go 1.25), which predates the
+current command surface. This source-install command records the pinned
 module version in Go build information and reports `dev` for `donmai --version`.
 
 ### GitHub release download
@@ -63,12 +64,12 @@ Pre-built binaries for macOS (arm64, amd64) and Linux (arm64, amd64) are
 attached to every release on the
 [releases page](https://github.com/RenseiAI/donmai/releases).
 
-Example for macOS arm64, pinned to v0.72.52. See the releases page for newer
+Example for macOS arm64, pinned to v0.72.74. See the releases page for newer
 versions:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.72.52/donmai_0.72.52_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.72.74/donmai_0.72.74_darwin_arm64.tar.gz \
   | tar -xz -C "$HOME/.local/bin" donmai
 "$HOME/.local/bin/donmai" --version
 ```
@@ -269,8 +270,12 @@ projects it admits work for, and the live dashboard of sessions running on it.
 The daemon installs as a launchd agent (macOS) or systemd user unit (Linux) and
 manages the workarea pool and session lifecycle.
 
-`donmai daemon …` still resolves in v0.72.47 as a hidden deprecated lifecycle
-alias. It prints a notice on stderr when invoked; use `host` for new scripts.
+`donmai daemon …` is a hidden deprecated lifecycle alias of `host` and still
+resolves in current releases. It prints a notice on stderr when invoked;
+use `host` for new scripts. The alias and the legacy `worker` / `fleet`
+commands below each name their removal release in their own `--help` text;
+that text is authoritative — this README does not restate version numbers
+for them.
 
 ```bash
 donmai host install                       # macOS launchd or Linux user service
@@ -328,9 +333,10 @@ donmai governor status
 
 ### Legacy worker and fleet aliases
 
-`donmai worker` and `donmai fleet` still resolve in v0.72.47 for older local
+`donmai worker` and `donmai fleet` still resolve for older local
 process-manager scripts. Both are deprecated and omitted from top-level help;
 new setups should use `donmai host`. The old `fleet scale` stub is absent.
+Each command's `--help` text names the release it is removed in.
 
 ### `donmai orchestrator`
 
@@ -374,8 +380,8 @@ All subcommands output JSON.
 
 ```bash
 donmai linear get-issue <id>
-donmai linear create-issue --title "..." --team "..."
-donmai linear update-issue <id> [--project "<name|slug|uuid>"] [--status "..."]
+donmai linear create-issue --title "..." --team "..." [--assignee "<id|name|email|me>"] [--priority 2]
+donmai linear update-issue <id> [--project "<name|slug|uuid>"] [--status "..."] [--assignee "<id|name|email|me|null>"]
 donmai linear list-issues [--project "..."] [--status "..."]
 donmai linear create-comment <issue-id> --body "..."
 donmai linear list-comments <issue-id>
@@ -397,6 +403,14 @@ default `--parents-only` filter excludes sub-issues.
 
 `get-issue` always includes `parentId` and `parentIdentifier`. Both are JSON
 strings for a child issue and explicit `null` values for a root issue.
+
+`create-issue` accepts `--assignee <user ID|name|email|me>` to assign the new
+issue in the same mutation, plus `--priority 0-4`. `update-issue` accepts the
+same `--assignee` spellings, with `--assignee null` clearing the assignment
+(explicit GraphQL null, matching the `--parentId null` clear contract).
+Assignee names, emails, and `me` (the authenticated viewer) resolve through
+the configured transport, so the flags work over the hosted proxy as well as
+with a direct API key; unknown values fail before any mutation runs.
 
 **Authentication**: set `LINEAR_API_KEY` (or `LINEAR_ACCESS_TOKEN`).
 
@@ -620,10 +634,17 @@ make run-status-mock # Run status with mock data
 
 The public library surface (`afclient`, `afcli`, `worker`) is designed to be
 imported by downstream consumers. Embedders use `afcli.RegisterCommands` and
-extend the generic OSS command set with their own subcommands. The standalone
-`donmai` binary retains hidden, deprecated worker/fleet process-manager
-commands for older scripts. Embedders leave those optional commands disabled
+extend the generic OSS command set with their own subcommands. The standalone `donmai` binary retains hidden, deprecated worker/fleet process-manager
+commands for older scripts; each names its removal release in `--help`.
+Embedders leave those optional commands disabled
 by default.
+
+A composing binary's `main` must serve the confinement probe first (via
+`confinement.RunProbeFromEnv`), before any interface of its own: confined
+sessions prove the host by re-executing the host binary and waiting for the
+probe's handshake, so a `main` that does not serve it fails every confined
+start fast with the named `probe_unserved` cause and the harness is never
+attested.
 
 See `AGENTS.md` for the full package layout and contributor guide. The
 authoritative architecture corpus lives in

@@ -5,11 +5,13 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -84,6 +86,17 @@ const (
 	piPriceOutputEnvVar     = "DONMAI_PI_PRICE_OUTPUT"
 	piPriceCacheReadEnvVar  = "DONMAI_PI_PRICE_CACHE_READ"
 	piPriceCacheWriteEnvVar = "DONMAI_PI_PRICE_CACHE_WRITE"
+
+	// Provider routing-preference pins (JSON-encoded string arrays) the
+	// child extension reads to register the injected model's gateway
+	// routing option (extensions/donmai-policy.ts). Each is exported only
+	// for an openai-completions cell whose endpoint binding carries a
+	// set preference; otherwise explicit clearing entries are exported
+	// (each key present but empty) so a value inherited from the
+	// spawning environment can never survive as a stale routing option
+	// — the same clearing discipline unitPricePinEnv applies.
+	piRoutingOrderEnvVar = "DONMAI_PI_ROUTING_ORDER"
+	piRoutingOnlyEnvVar  = "DONMAI_PI_ROUTING_ONLY"
 
 	// injectedExtensionsDir holds materialized agent.ExtensionDelivery
 	// (Kind == ExtensionDeliveryInline) artifacts, one level under piStateDir
@@ -523,6 +536,7 @@ func providerPinEnv(spec agent.Spec) []string {
 	// inherited from the spawning environment can never stand in for one.
 	out = append(out, piThinkingLevelEnvVar+"="+thinkingLevelForEffort(spec.Effort))
 	out = append(out, unitPricePinEnv(spec)...)
+	out = append(out, routingPreferencePinEnv(spec)...)
 	return out
 }
 
@@ -558,6 +572,87 @@ func unitPricePinEnv(spec agent.Spec) []string {
 		piPriceCacheReadEnvVar + "=" + strconv.FormatFloat(prices.CacheRead, 'g', -1, 64),
 		piPriceCacheWriteEnvVar + "=" + strconv.FormatFloat(prices.CacheWrite, 'g', -1, 64),
 	}
+}
+
+// routingPreferencePinEnv exports the endpoint binding's optional
+// provider routing preference (ordered candidates and an exclusive
+// allow-list) to the child extension as JSON-encoded string arrays. It is
+// exported only for an openai-completions cell whose binding carries a set
+// preference: the serving gateway honors the routing option on chat
+// requests, and pi's request builder applies it only on that protocol — on
+// any other protocol (anthropic-messages, openai-responses,
+// google-generative-ai) the extension would have no routing option to
+// register against, so exporting it would promise a routing the session
+// cannot keep. On every other cell the pin exports explicit clearing
+// entries (each routing key present but empty): child env composes by
+// layering overrides over the inherited parent (spec_translation.go
+// composeChildEnv appends this pin last; the interactive lane layers it as
+// PTY overrides), so omitting the keys here would let a
+// DONMAI_PI_ROUTING_* value inherited from the spawning environment
+// survive and route as a stale preference.
+//
+// An entry that is not a JSON array of non-empty strings — including a
+// list with a blank or over-long slug — fails closed to clearing: the
+// session runs unpinned rather than routing on a value the dispatch did
+// not carry in a usable shape.
+func routingPreferencePinEnv(spec agent.Spec) []string {
+	cleared := []string{piRoutingOrderEnvVar + "=", piRoutingOnlyEnvVar + "="}
+	if spec.Endpoint == nil || piAPIForProtocol(spec.Endpoint.Protocol) != "openai-completions" {
+		return cleared
+	}
+	pref := spec.Endpoint.RoutingPreference
+	if pref.IsZero() {
+		return cleared
+	}
+	order, ok := encodeRoutingSlugs(pref.Order)
+	if !ok {
+		return cleared
+	}
+	only, ok := encodeRoutingSlugs(pref.Only)
+	if !ok {
+		return cleared
+	}
+	return []string{piRoutingOrderEnvVar + "=" + order, piRoutingOnlyEnvVar + "=" + only}
+}
+
+// encodeRoutingSlugs renders slugs as a JSON array, or ok=false when any
+// entry is unusable: empty/blank, over-long, or carrying characters
+// outside the gateway's slug alphabet. A nil or empty list encodes as an
+// empty array (the other list still constrains the request); callers
+// reject a preference whose lists are BOTH empty before reaching here
+// (RoutingPreference.IsZero).
+func encodeRoutingSlugs(slugs []string) (string, bool) {
+	cleaned := make([]string, 0, len(slugs))
+	for _, slug := range slugs {
+		slug = strings.TrimSpace(slug)
+		if slug == "" || len(slug) > 64 || !isRoutingSlug(slug) {
+			return "", false
+		}
+		cleaned = append(cleaned, slug)
+	}
+	if len(cleaned) == 0 {
+		return "[]", true
+	}
+	raw, err := json.Marshal(cleaned)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+// isRoutingSlug reports whether slug uses only the gateway provider-name
+// alphabet: letters, digits, hyphen, underscore, dot, and slash (slugs
+// may be plain names or "author/name" shapes).
+func isRoutingSlug(slug string) bool {
+	for _, r := range slug {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.', r == '/':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // endpointUnitPrices returns the endpoint binding's per-token prices, or

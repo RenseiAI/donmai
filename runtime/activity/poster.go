@@ -760,12 +760,27 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
-		// command_progress, diff_updated, compaction, and unknown values) stays
-		// runner-internal and is dropped.
+		// command_progress, diff_updated, compaction, stream progress, and
+		// unknown values) stays runner-internal and is dropped. Stream
+		// progress in particular must never reach the activity stream:
+		// one event per streamed token would spam it exactly the way
+		// per-token assistant text once did.
 		return payload{}, false
 
 	case agent.InitEvent, agent.ToolProgressEvent:
 		return payload{}, false
+
+	case agent.ContextUsageEvent:
+		// The typed harness notice for a compaction or a context-window
+		// threshold crossing. It maps to a context marker whose structured
+		// value carries only the measurements the harness reported: unknown
+		// stays ABSENT, never zero, so the usage series stores a real data
+		// point rather than a fabricated one.
+		out.Type = "context"
+		out.Content = ContextUsageContent(e)
+		out.ContextKey = ContextUsageContextKey
+		out.ContextValue = ContextUsageContextValue(e)
+		return out, true
 	}
 	return payload{}, false
 }
@@ -850,6 +865,78 @@ func ToolCallBoundsContent(message string) string {
 		return toolCallBoundsContentPrefix + strconv.Itoa(n) + "s (a call that runs past it fails back to the agent; the session continues)"
 	}
 	return toolCallBoundsInvalidContent
+}
+
+// ContextUsageContextKey is the contextKey a harness context notice
+// carries, so the usage series can append the session event without
+// parsing Content.
+const ContextUsageContextKey = "contextUsage"
+
+// ContextUsageContent is the fixed-vocabulary activity content for an
+// agent.ContextUsageEvent. It names the harness, the source and the kind,
+// then the measurements the harness reported — and only those. Unknown
+// measurements are omitted from the sentence, never rendered as zero.
+func ContextUsageContent(e agent.ContextUsageEvent) string {
+	kind := string(e.NoticeKind)
+	if kind == "" {
+		kind = "threshold"
+	}
+	harness := e.Harness
+	if harness == "" {
+		harness = "harness"
+	}
+	var parts []string
+	if e.UsedPercent != nil {
+		parts = append(parts, fmt.Sprintf("%.1f%% of context used", *e.UsedPercent))
+	}
+	if e.InputTokens != nil {
+		parts = append(parts, fmt.Sprintf("%d input tokens", *e.InputTokens))
+	}
+	if e.OutputTokens != nil {
+		parts = append(parts, fmt.Sprintf("%d output tokens", *e.OutputTokens))
+	}
+	if e.ContextWindowSize != nil {
+		parts = append(parts, fmt.Sprintf("%d-token window", *e.ContextWindowSize))
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%s %s (%s)", harness, kind, sourceOrUnknown(e.Source))
+	}
+	return fmt.Sprintf("%s %s (%s): %s", harness, kind, sourceOrUnknown(e.Source), strings.Join(parts, ", "))
+}
+
+func sourceOrUnknown(source string) string {
+	if strings.TrimSpace(source) == "" {
+		return "unknown source"
+	}
+	return source
+}
+
+// ContextUsageContextValue is the structured value of a harness context
+// notice: kind plus only the reported measurements, formatted without
+// units so the series can parse it. Unknown measurements are absent from
+// the value, never zero.
+func ContextUsageContextValue(e agent.ContextUsageEvent) string {
+	kind := string(e.NoticeKind)
+	if kind == "" {
+		kind = "threshold"
+	}
+	parts := []string{"kind=" + kind}
+	if e.Harness != "" {
+		parts = append(parts, "harness="+e.Harness)
+	}
+	if e.UsedPercent != nil {
+		parts = append(parts, "usedPercent="+strconv.FormatFloat(*e.UsedPercent, 'f', -1, 64))
+	}
+	if e.InputTokens != nil {
+		parts = append(parts, "inputTokens="+strconv.FormatInt(*e.InputTokens, 10))
+	}
+	if e.OutputTokens != nil {
+		parts = append(parts, "outputTokens="+strconv.FormatInt(*e.OutputTokens, 10))
+	}
+	if e.ContextWindowSize != nil {
+		parts = append(parts, "contextWindowSize="+strconv.FormatInt(*e.ContextWindowSize, 10))
+	}
+	return strings.Join(parts, ";")
 }
 
 // summarizeToolUse produces a short one-line summary of a tool call,

@@ -22,13 +22,29 @@ import (
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
-// runnerHarness bundles the collaborators a Run-level test needs.
-// Tests that exercise full Run() build one via newRunnerHarness so
+// runnerHarness bundles the collaborators a Run-level test needs.// Tests that exercise full Run() build one via newRunnerHarness so
 // the wire-up cost is paid once.
 type runnerHarness struct {
 	runner   *Runner
 	server   *httptest.Server
 	bareRepo string
+}
+
+// spawnGatedStubProvider wraps the stub harness so a test can gate on
+// Spawn: it closes spawned exactly once on the first Spawn call, proving
+// provisioning finished and the provider is genuinely running. Used by
+// cancellation tests whose server signal moved: the ownership pulse now
+// starts before provisioning, so the first lock-refresh lands while the
+// session is still cloning and can no longer serve as the gate.
+type spawnGatedStubProvider struct {
+	agent.HarnessProvider
+	spawned chan struct{}
+	once    *sync.Once
+}
+
+func (p *spawnGatedStubProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.once.Do(func() { close(p.spawned) })
+	return p.HarnessProvider.Spawn(ctx, spec)
 }
 
 // newRunnerHarness wires a Runner against the stub provider and a
@@ -395,7 +411,11 @@ func TestRun_CancellationStillPostsTerminalResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/lock-refresh"):
-			startedOnce.Do(func() { close(started) })
+			// No gate here: the ownership pulse starts before
+			// provisioning, so the first lock-refresh lands while
+			// the session is still cloning. Cancellation is gated
+			// on Spawn below, which proves provisioning finished.
+			fallthrough
 		case strings.HasSuffix(req.URL.Path, "/completion"):
 			completionHits.Add(1)
 		case strings.HasSuffix(req.URL.Path, "/status"):
@@ -446,10 +466,17 @@ func TestRun_CancellationStillPostsTerminalResult(t *testing.T) {
 		t.Fatalf("worktree.NewManager: %v", err)
 	}
 	reg := NewRegistry()
-	provider, err := stub.New()
+	// Gate cancellation on Spawn: the ownership pulse starts before
+	// provisioning, so the first lock-refresh lands while the session is
+	// still cloning — cancelling on it would abort the clone and yield a
+	// worktree-provision failure instead of the stopped interview this
+	// test exercises. The Spawn gate proves provisioning finished and the
+	// interview turn is genuinely hanging.
+	baseProvider, err := stub.New()
 	if err != nil {
 		t.Fatalf("stub.New: %v", err)
 	}
+	provider := &spawnGatedStubProvider{HarnessProvider: baseProvider.(agent.HarnessProvider), spawned: started, once: &startedOnce}
 	if err := reg.Register(provider); err != nil {
 		t.Fatalf("Register: %v", err)
 	}

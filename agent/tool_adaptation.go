@@ -55,7 +55,14 @@ const (
 	ToolDeliveryGeminiMCPBridge       ToolDeliveryKind = "gemini_in_box_mcp_bridge"
 	ToolDeliveryOpenCodePermissionMap ToolDeliveryKind = "opencode_permission_map"
 	ToolDeliveryOpenCodeProjectMCP    ToolDeliveryKind = "opencode_project_mcp_config"
-	ToolDeliveryPiInjectedBoundary    ToolDeliveryKind = "pi_handshake_policy_extension"
+	// ToolDeliveryMuseApprovalBridge is the muse MSP approval bridge:
+	// approval/request server-requests evaluated against
+	// Spec.PermissionConfig, answered via approval/decide.
+	ToolDeliveryMuseApprovalBridge ToolDeliveryKind = "muse_approval_bridge"
+	// ToolDeliveryMuseSessionMCP is the muse inline session MCP surface:
+	// config.mcpServers on session/start and session/resume.
+	ToolDeliveryMuseSessionMCP     ToolDeliveryKind = "muse_session_mcp"
+	ToolDeliveryPiInjectedBoundary ToolDeliveryKind = "pi_handshake_policy_extension"
 	// ToolDeliveryPiAdditionalExtension is pi's tool_plugin channel: one or
 	// more Spec.AdditionalExtensions (ADR-2026-08-12 D1) materialized into
 	// the per-session state directory, digest-verified after materialization,
@@ -1150,7 +1157,8 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 		ToolDeliveryClaudeMCPConfig, ToolDeliveryCodexApprovalBridge, ToolDeliveryCodexAppServerMCP,
 		ToolDeliveryCodexCLIMCPConfig,
 		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge,
-		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
+		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryMuseApprovalBridge,
+		ToolDeliveryMuseSessionMCP, ToolDeliveryPiInjectedBoundary,
 		ToolDeliveryPiAdditionalExtension, ToolDeliveryPiInteractiveLocalToolPolicy,
 		ToolDeliveryNoToolSurface,
 		ToolDeliveryStructuredProviderEvents, ToolDeliveryCoarsePTYEvents, ToolDeliveryStructuredEventReplay,

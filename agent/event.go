@@ -25,6 +25,7 @@ const (
 	EventToolResult    EventKind = "tool_result"
 	EventToolProgress  EventKind = "tool_progress"
 	EventUsage         EventKind = "usage"
+	EventContextUsage  EventKind = "context_usage"
 	EventSubagent      EventKind = "subagent"
 	EventResult        EventKind = "result"
 	EventError         EventKind = "error"
@@ -34,7 +35,7 @@ const (
 //
 // Implementations: InitEvent, SystemEvent, AssistantTextEvent,
 // LlmCallEvent, ToolUseEvent, ToolResultEvent, ToolProgressEvent,
-// SubagentEvent, ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
+// ContextUsageEvent, SubagentEvent, ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
 // packages from satisfying the interface, keeping the discriminated
 // union closed.
 //
@@ -125,6 +126,24 @@ const SystemSubtypeProviderError = "provider_error"
 // harness reports as not retryable. The runner strips it before recording
 // the error text, so the receipt keeps the provider's own message.
 const ProviderErrorNotRetryableSuffix = "; isRetryable=false"
+
+// SystemSubtypeStreamProgress is the SystemEvent subtype a harness emits
+// while a model response is still being generated: a streaming delta
+// arrived from the model endpoint. It carries no content — the complete
+// message still arrives on the harness's usual completion event — and
+// exists only as a liveness signal so the runner can tell a healthy long
+// generation or reasoning pass (deltas keep arriving) from a hung model
+// request (no deltas arrive). Harnesses that expose no streaming signal
+// simply never emit it. The runner's stall detector disarms on it; the
+// activity poster drops it like other runner-internal lifecycle signals.
+const SystemSubtypeStreamProgress = "stream_progress"
+
+// StreamProgressEvent builds the SystemSubtypeStreamProgress liveness
+// signal: one streaming delta arrived from the model endpoint while a
+// response streams. Content-free by design; Message is always empty.
+func StreamProgressEvent() SystemEvent {
+	return SystemEvent{Subtype: SystemSubtypeStreamProgress}
+}
 
 // SystemSubtypeReasoningEffort is the SystemEvent subtype the runner emits
 // once per session, after spawn and before any turn output, recording the
@@ -586,6 +605,12 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		var ev UsageEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, fmt.Errorf("agent: decode UsageEvent: %w", err)
+		}
+		return ev, nil
+	case EventContextUsage:
+		var ev ContextUsageEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode ContextUsageEvent: %w", err)
 		}
 		return ev, nil
 	case EventSubagent:

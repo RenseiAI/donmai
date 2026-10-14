@@ -1124,7 +1124,7 @@ func TestDaemonDoctorHelp(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"--json", "--user", "--system"} {
+	for _, want := range []string{"--json", "--user", "--system", "--fix", "--config"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor --help missing flag %q; got:\n%s", want, out)
 		}

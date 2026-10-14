@@ -114,6 +114,17 @@ func (h *Handle) SessionID() string {
 	return h.threadID
 }
 
+// codexHome returns the isolated home the session's rollout file lives
+// under, or "" when unknown (a unit-test handle with no provider). It is
+// the provider's own boundary home — never the ambient environment — so
+// the context-notice tail reads exactly this session's file.
+func (h *Handle) codexHome() string {
+	if h == nil || h.provider == nil || h.provider.config == nil {
+		return ""
+	}
+	return h.provider.config.home
+}
+
 // Events returns the read-only event channel. Closes after the
 // terminal event.
 func (h *Handle) Events() <-chan agent.Event { return h.events }
@@ -275,6 +286,13 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 	if _, err := h.client.RequestWithRetry(ctx, "turn/start", turnParams, h.rpcTimeout); err != nil {
 		return fmt.Errorf("turn/start: %w", err)
 	}
+
+	// Context-notice tail: the thread's rollout file carries the token_count
+	// events and compacted markers the RPC stream never surfaces. The home
+	// is the provider's own isolated home (never the ambient environment)
+	// and the thread id is the one just started or resumed above; either
+	// unknown (a unit-test handle with no provider) runs without notices.
+	h.startContextTail(ctx)
 
 	// The forwarder is intentionally long-lived: it must survive
 	// Spawn() returning and run for the duration of the session.

@@ -137,6 +137,13 @@ type SpawnerOptions struct {
 	// Returned IDs are deduplicated against owned sessions and reservations.
 	ExternalSessionIDs func() []string
 
+	// ExternalOwnedSessionIDs reports session identities held outside this
+	// spawner whose slots ExternalOccupancy ALREADY charges — per-session
+	// shims it launched, adopted or quarantined. The duplicate-accept guard
+	// refuses them; capacity admission does not count them a second time.
+	// Same locking contract as ExternalSessionIDs.
+	ExternalOwnedSessionIDs func() []string
+
 	// ShimOwns, when non-nil, is the stable ownership selector consulted before
 	// ShimSpawn or OnPreSpawn. False goes directly to the ordinary child path;
 	// true requires ShimSpawn to return a handle or error and may never silently
@@ -682,6 +689,16 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 	return nil
 }
 
+// MaxConcurrentSessions returns the live session capacity future AcceptWork
+// decisions are admitted against. It mirrors the ceiling SetMaxConcurrentSessions
+// last installed — the constructor default until the first set — so a claim
+// gate consulting it agrees with the spawner about what "full" means.
+func (s *WorkerSpawner) MaxConcurrentSessions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opts.MaxConcurrentSessions
+}
+
 // SetSeatBudget swaps the per-seat budget future spawns apply. Seats
 // already running keep the budget they started with — like capacity, the
 // new share governs only future AcceptWork calls. The share lives behind
@@ -913,6 +930,10 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("session %q is already being started", spec.SessionID)
 	}
+	if s.externallyOwnedLocked(spec.SessionID) {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session %q is already active", spec.SessionID)
+	}
 	if active, capacity := len(s.sessions)+len(s.spawnReservations)+s.externalOccupancy()+s.externalSessionOccupancyLocked(), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
@@ -952,6 +973,20 @@ func (s *WorkerSpawner) externalOccupancy() int {
 		return n
 	}
 	return 0
+}
+
+// externallyOwnedLocked reports whether sessionID is already held outside this
+// spawner (a shim-owned session). Caller holds s.mu.
+func (s *WorkerSpawner) externallyOwnedLocked(sessionID string) bool {
+	if s.opts.ExternalOwnedSessionIDs == nil || sessionID == "" {
+		return false
+	}
+	for _, id := range s.opts.ExternalOwnedSessionIDs() {
+		if id == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *WorkerSpawner) externalSessionOccupancyLocked() int {

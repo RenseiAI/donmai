@@ -2049,6 +2049,9 @@ func (c *Client) CreateIssue(ctx context.Context, input CreateIssueInput) (*Issu
 	if input.AssigneeID != "" {
 		inp["assigneeId"] = input.AssigneeID
 	}
+	if input.Priority != 0 {
+		inp["priority"] = input.Priority
+	}
 
 	vars := map[string]any{"input": inp}
 	var data createIssueData
@@ -2087,8 +2090,12 @@ func (c *Client) UpdateIssue(ctx context.Context, id string, input UpdateIssueIn
 			inp["parentId"] = *input.ParentID
 		}
 	}
-	if input.AssigneeID != "" {
-		inp["assigneeId"] = input.AssigneeID
+	if input.AssigneeID != nil {
+		if *input.AssigneeID == "" {
+			inp["assigneeId"] = nil
+		} else {
+			inp["assigneeId"] = *input.AssigneeID
+		}
 	}
 	if input.Priority != nil {
 		inp["priority"] = *input.Priority

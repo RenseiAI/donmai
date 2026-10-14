@@ -161,10 +161,18 @@ type DependencyStoreComposition struct {
 }
 
 // LockedDependencyBinding is one operator-approved manager selection: for
-// the enclosing lock target, manager resolves to the named kit's entry.
+// the enclosing lock target, manager resolves to the named kit's entry at
+// the pinned digest. The digest pin matches command bindings: the lock
+// reader refuses a binding whose kit digest moved.
 type LockedDependencyBinding struct {
-	Manager       string `json:"manager"`
+	Manager string `json:"manager"`
+	// SelectedKitID names the kit whose entry resolves the manager.
 	SelectedKitID string `json:"selectedKitId"`
+	// SelectedDigestKind and SelectedDigest pin the kit digest the
+	// operator approved, matching command bindings. The lock reader
+	// refuses a binding whose kit digest moved.
+	SelectedDigestKind string `json:"selectedDigestKind"`
+	SelectedDigest     string `json:"selectedDigest"`
 }
 
 // LeafDependencyFacts are the mutable-leaf facts selection needs: which
@@ -551,23 +559,27 @@ type storeClaimant struct {
 }
 
 // resolveManagerClaimants selects one claimant: the sole entry, or the
-// lock-selected kit when several kits declare the manager.
+// lock-selected kit when several kits declare the manager. The lock
+// selection pins the kit digest, matching command bindings: a binding
+// whose kit digest moved is refused, even when the kit still declares
+// the manager.
 func resolveManagerClaimants(manager string, claimants []storeClaimant, target CompositionTarget, lock *CompositionLock) (storeClaimant, error) {
-	if len(claimants) == 1 {
-		if selected, ok := lockedDependencySelection(lock, target, manager); ok && selected != claimants[0].kitID {
-			return storeClaimant{}, fmt.Errorf("%w: binding for manager %q selects kit %q which does not declare it",
-				ErrCompositionLockInvalid, manager, selected)
-		}
-		return claimants[0], nil
-	}
-	if selected, ok := lockedDependencySelection(lock, target, manager); ok {
+	if locked, ok := lockedDependencySelection(lock, target, manager); ok {
 		for _, claimant := range claimants {
-			if claimant.kitID == selected {
-				return claimant, nil
+			if claimant.kitID != locked.SelectedKitID {
+				continue
 			}
+			if claimant.digestKind != locked.SelectedDigestKind || claimant.digest != locked.SelectedDigest {
+				return storeClaimant{}, fmt.Errorf("%w: binding for manager %q pins kit %q at digest %s:%s which no longer matches",
+					ErrCompositionLockInvalid, manager, locked.SelectedKitID, locked.SelectedDigestKind, locked.SelectedDigest)
+			}
+			return claimant, nil
 		}
 		return storeClaimant{}, fmt.Errorf("%w: binding for manager %q selects kit %q which does not declare it",
-			ErrCompositionLockInvalid, manager, selected)
+			ErrCompositionLockInvalid, manager, locked.SelectedKitID)
+	}
+	if len(claimants) == 1 {
+		return claimants[0], nil
 	}
 	owners := make([]string, 0, len(claimants))
 	for _, claimant := range claimants {
@@ -578,11 +590,11 @@ func resolveManagerClaimants(manager string, claimants []storeClaimant, target C
 		ErrDependencyStoreConflict, manager, strings.Join(owners, ", "), target.OS, target.WorkType, target.PathScope)
 }
 
-// lockedDependencySelection returns the lock-selected kit for a manager
-// under the exact composition target.
-func lockedDependencySelection(lock *CompositionLock, target CompositionTarget, manager string) (string, bool) {
+// lockedDependencySelection returns the lock-selected kit pin for a
+// manager under the exact composition target.
+func lockedDependencySelection(lock *CompositionLock, target CompositionTarget, manager string) (LockedDependencyBinding, bool) {
 	if lock == nil {
-		return "", false
+		return LockedDependencyBinding{}, false
 	}
 	for _, entry := range lock.Targets {
 		if targetKey(entry.Target) != targetKey(target) {
@@ -590,22 +602,23 @@ func lockedDependencySelection(lock *CompositionLock, target CompositionTarget, 
 		}
 		for _, binding := range entry.Dependencies {
 			if binding.Manager == manager {
-				return binding.SelectedKitID, true
+				return binding, true
 			}
 		}
 	}
-	return "", false
+	return LockedDependencyBinding{}, false
 }
 
 // validateAppliedDependencyLock rejects lock rows for the composition
-// target that selected nothing: a stale or unused manager binding.
+// target that selected nothing: a stale or unused manager binding, or a
+// binding whose pinned kit digest moved.
 func validateAppliedDependencyLock(stores []ComposedDependencyStore, target CompositionTarget, lock *CompositionLock) error {
 	if lock == nil {
 		return nil
 	}
-	resolved := make(map[string]string, len(stores))
+	resolved := make(map[string]ComposedDependencyStore, len(stores))
 	for _, store := range stores {
-		resolved[store.Manager] = store.KitID
+		resolved[store.Manager] = store
 	}
 	for _, entry := range lock.Targets {
 		if targetKey(entry.Target) != targetKey(target) {
@@ -613,7 +626,8 @@ func validateAppliedDependencyLock(stores []ComposedDependencyStore, target Comp
 		}
 		for _, binding := range entry.Dependencies {
 			selected, ok := resolved[binding.Manager]
-			if !ok || selected != binding.SelectedKitID {
+			if !ok || selected.KitID != binding.SelectedKitID ||
+				selected.DigestKind != binding.SelectedDigestKind || selected.Digest != binding.SelectedDigest {
 				return fmt.Errorf("%w: stale or unused binding for manager %q",
 					ErrCompositionLockInvalid, binding.Manager)
 			}
