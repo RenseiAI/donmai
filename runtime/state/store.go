@@ -150,6 +150,21 @@ type State struct {
 	ModelAuthor      string `json:"modelAuthor,omitempty"`
 	EndpointOperator string `json:"endpointOperator,omitempty"`
 	Protocol         string `json:"protocol,omitempty"`
+
+	// Observed serving report. FinalProvider names the serving provider
+	// the session's model calls last reported (the gateway on a
+	// gateway-routed session, the direct provider otherwise);
+	// FinalModel is the served model id paired with it (the native
+	// served id when the wire served a different id than requested,
+	// else the requested id); ProviderAttempts totals the serving
+	// attempts behind the session's model calls (1 plus harness
+	// auto-retries per call, summed over calls that reported). These
+	// are OBSERVED per-call facts, last report wins — never the
+	// admitted binding above, which stays as dispatched. Empty/zero
+	// when no call has reported yet.
+	FinalProvider    string `json:"finalProvider,omitempty"`
+	FinalModel       string `json:"finalModel,omitempty"`
+	ProviderAttempts int    `json:"providerAttempts,omitempty"`
 }
 
 // AppendToolLifecycleReceipt appends a digest-only admission decision and

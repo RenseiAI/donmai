@@ -2479,6 +2479,24 @@ type streamObservation struct {
 	// carried. Tail recovery reads a turn with at least one as productive
 	// (turn_continuation.go).
 	toolCalls int
+	// finalProvider names the serving provider the stream's model calls
+	// last reported (LlmCallEvent.System): the gateway on a
+	// gateway-routed session, the direct provider otherwise. Last
+	// non-empty report wins; synthetic aggregate fallbacks carry no
+	// serving identity and never clobber it. Empty when no call
+	// reported one.
+	finalProvider string
+	// finalModel is the served model id paired with finalProvider: the
+	// native served id (LlmCallEvent.ResponseModel) when the wire served
+	// a different id than requested, else the requested id. Same
+	// last-non-empty-wins rule.
+	finalModel string
+	// providerAttempts sums the serving attempts the stream's model
+	// calls reported (LlmCallEvent.Attempts). Only positive counts
+	// contribute; a call that did not report (zero) adds nothing, so an
+	// all-unknown stream totals zero (unknown), never a fabricated
+	// count.
+	providerAttempts int
 	// noProgress is set when the idle/no-progress watchdog fired — the
 	// event stream produced no agent.Event for longer than the runner's
 	// IdleTimeout window. The runner reads it in the post-stream
@@ -2549,6 +2567,18 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	}
 	if o.reviewVerdict != "" {
 		res.ReviewVerdict = o.reviewVerdict
+	}
+	// The serving report is last-non-empty-wins: a later turn served
+	// elsewhere (a fallback, a rebind) replaces the earlier fact, and
+	// re-consuming the same events is a no-op — the same idempotency
+	// the terminal summary relies on. Like the tool-call count, the
+	// attempt total is NOT applied here: consumeEvents meters it onto
+	// the envelope per stream (a sum is not idempotent).
+	if o.finalProvider != "" {
+		res.FinalProvider = o.finalProvider
+	}
+	if o.finalModel != "" {
+		res.FinalModel = o.finalModel
 	}
 	// Cost is not taken from the stream: the session's usage meter (the
 	// budget enforcer) counts every turn, and runLoop reports its total.
@@ -2646,10 +2676,10 @@ func (r *Runner) consumeEventsWithoutStallDetector(
 // wrap-up point, on a harness that takes a message into a running turn, the
 // agent is asked to wrap up at its next tool call (wrapUpMidTurn).
 //
-// The stream's tool calls are added to res.ToolCalls (res may be nil) on
-// every return: each stream counts exactly once, including a turn the
-// caller stops on (no progress, timeout, lost ownership, cancel) before
-// applying its observation.
+// The stream's tool calls AND serving attempts are added to res.ToolCalls
+// and res.ProviderAttempts (res may be nil) on every return: each stream
+// counts exactly once, including a turn the caller stops on (no progress,
+// timeout, lost ownership, cancel) before applying its observation.
 //
 // stallTimeout is the stalled-model-request window for this drain; zero
 // or negative disarms the detector.
@@ -2672,7 +2702,10 @@ func (r *Runner) consumeEventsWithin(
 	}
 	obs := streamObservation{}
 	if res != nil {
-		defer func() { res.ToolCalls += obs.toolCalls }()
+		// Like the tool-call count, the serving-attempt total is
+		// metered per stream on every return: each stream counts exactly
+		// once (a sum is not idempotent, so it stays out of applyTo).
+		defer func() { res.ToolCalls += obs.toolCalls; res.ProviderAttempts += obs.providerAttempts }()
 	}
 
 	// Open the events.jsonl audit file under <worktree>/.agent/.
@@ -3121,6 +3154,33 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			obs.pullRequestURL = u
 		}
 		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Content)
+	case agent.LlmCallEvent:
+		// The per-call serving report: which provider served this call
+		// and what it served, plus how many attempts the call took.
+		// Synthetic aggregate fallbacks carry no serving identity — the
+		// span processor synthesizes them from the terminal cost when a
+		// harness exposed only rolled-up usage — so they never clobber
+		// the last native report, and their zero attempt count adds
+		// nothing to the total. Last-non-empty-wins: a later turn served
+		// elsewhere replaces the earlier fact.
+		if e.Synthetic || e.UsageSource == agent.LlmUsageAggregate {
+			break
+		}
+		if e.System != "" {
+			obs.finalProvider = e.System
+		}
+		switch {
+		case e.ResponseModel != "":
+			obs.finalModel = e.ResponseModel
+		case e.Model != "":
+			obs.finalModel = e.Model
+		}
+		if e.Attempts > 0 {
+			obs.providerAttempts += e.Attempts
+		}
+		if e.System != "" || e.ResponseModel != "" || e.Model != "" || e.Attempts > 0 {
+			r.mirrorServingReport(worktreePath, obs)
+		}
 	case agent.ResultEvent:
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success
@@ -3137,6 +3197,28 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 				obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
 			}
 		}
+	}
+}
+
+// mirrorServingReport persists the stream's observed serving report onto
+// the session record (state.json), next to the admitted endpoint axes it
+// never touches: the admitted binding stays as dispatched, while these
+// fields say what actually served. Best-effort like the InitEvent mirror
+// above — a persistence failure is logged and dropped, never fatal to
+// the run. Attempts accumulate across calls within the observation, so
+// the stored total only grows within a stream.
+func (r *Runner) mirrorServingReport(worktreePath string, obs *streamObservation) {
+	if r == nil || r.store == nil || worktreePath == "" {
+		return
+	}
+	_, err := r.store.Update(worktreePath, func(s *state.State) error {
+		s.FinalProvider = obs.finalProvider
+		s.FinalModel = obs.finalModel
+		s.ProviderAttempts = obs.providerAttempts
+		return nil
+	})
+	if err != nil && r.logger != nil {
+		r.logger.Debug("serving report mirror failed", "err", err)
 	}
 }
 
