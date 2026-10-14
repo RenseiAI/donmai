@@ -1090,6 +1090,10 @@ func (d *Daemon) claimSuspended() (bool, string) {
 			return true, claimSuspendedReasonPaused
 		case StateRecovering:
 			return true, claimSuspendedReasonRecovering
+		case StateRunning:
+			// Only the serving state may proceed to the remaining gates.
+		default:
+			return true, "daemon lifecycle state is unrecognized"
 		}
 	} else {
 		switch d.State() {
