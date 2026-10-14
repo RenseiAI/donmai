@@ -101,14 +101,16 @@ var childEnvProxyNames = map[string]struct{}{
 }
 
 // childEnvHarnessPrefixes are the namespaces this harness owns on the child:
-// the policy extension's own controls (DONMAI_PI_*) and pi's configuration
+// the policy extension's own controls (DONMAI_PI_*), the applied-receipt
+// trust verdict (DONMAI_NOTICE_*, stamped by the spawn only — never by the
+// caller), and pi's configuration
 // (PI_*). The harness composes every entry it means the child to see under
 // them (providerPinEnv, the config-home redirect, the credential-file path,
 // the tool-policy lists), so an inherited or snapshot copy never rides
 // along — in the exec environment or the credential file — where it could
 // steer the extension or pi's config. The two allowlisted offline-posture
 // names are the one exception, by design.
-var childEnvHarnessPrefixes = []string{"DONMAI_PI_", "PI_"}
+var childEnvHarnessPrefixes = []string{"DONMAI_PI_", "PI_", "DONMAI_NOTICE_"}
 
 // childEnvAllowed reports whether name=value may ride the pi child's exec
 // environment.

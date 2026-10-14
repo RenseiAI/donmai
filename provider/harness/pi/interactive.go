@@ -76,7 +76,19 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	extensionPaths := append([]string{layout.extension}, extraPaths...)
+	// The host-owned applied-receipt extension loads second — after the
+	// boundary, before caller deliveries — by explicit `-e` path, never by
+	// discovery. It is effective only when its measured identity matches
+	// the compiled embedder's trusted set: without that match the claim
+	// command refuses every delivery (see the extension's own header), so
+	// a session that cannot prove the receipt boundary runs without one
+	// rather than with a forged one.
+	noticeClaimPath, err := materializeNoticeClaimExtension(layout, confiner != nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	claimTrusted := noticeClaimTrusted(p.trustedExtensions, spec.AdditionalExtensions)
+	extensionPaths := append([]string{layout.extension, noticeClaimPath}, extraPaths...)
 
 	// Deliver session credentials through files, never the child env — the
 	// same posture as the headless lane (pi.go launch): the exec environment
@@ -110,7 +122,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// name needs an empty shadow to mask an inherited value. The resolved
 	// cell's credentials ride the files above; only the credential file's
 	// path is added here.
-	spec.Env = interactiveExecEnv(childEnvParts.exec, spec, layout)
+	spec.Env = interactiveExecEnvWithTrust(childEnvParts.exec, spec, layout, claimTrusted)
 	if strings.TrimSpace(credentialPath) != "" {
 		if spec.Env == nil {
 			spec.Env = map[string]string{}
@@ -168,6 +180,33 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		return nil, err
 	}
 	return newInteractiveStateLossHandle(handle, layout.root, tailer), nil
+}
+
+// noticeClaimDeliveryID is the AdditionalExtensions ID under which a
+// caller-supplied pack may carry the applied-receipt extension. The host
+// loads its own embedded copy regardless; this ID exists so the trust
+// check below can tell a caller pack that SHADOWS the claim command from
+// the host copy.
+const noticeClaimDeliveryID = "donmai-notice-claim"
+
+// noticeClaimTrusted reports whether the compiled embedder trusts the
+// applied-receipt extension to share receipt authority in this session.
+// The answer is true only when Options.TrustedExtensions names the exact
+// embedded digest AND no caller delivery shadows the claim ID: a peer pack
+// carrying the same command name would otherwise race the host copy for
+// the `/donmai-claim` invocation name.
+func noticeClaimTrusted(trusted []TrustedExtensionIdentity, deliveries []agent.ExtensionDelivery) bool {
+	for _, d := range deliveries {
+		if d.ID == noticeClaimDeliveryID {
+			return false
+		}
+	}
+	for _, id := range trusted {
+		if id.ID == noticeClaimDeliveryID && id.Digest == noticeClaimSHA() {
+			return true
+		}
+	}
+	return false
 }
 
 // releaseInteractiveSession turns the plan release plus the session
@@ -239,6 +278,16 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []str
 // The headless lane needs no equivalent: its guard runs in-process in
 // policy.go against engine.stateRoot, not via the child env.
 const piStateDirEnvVar = "DONMAI_PI_STATE_DIR"
+
+// noticeClaimTrustEnvVar carries the host's trusted-set verdict for the
+// applied-receipt extension onto the interactive child. It is stamped "1"
+// only after noticeClaimTrusted passes (exact embedded digest in
+// Options.TrustedExtensions, no caller shadow); otherwise absent. The
+// extension refuses every claim without it. It rides the spawn's complete
+// environment (interactiveExecEnvWithTrust below, ExactEnv), so a
+// same-process peer extension cannot set it for the session — it can only
+// read it, and reading it confers no authority.
+const noticeClaimTrustEnvVar = "DONMAI_NOTICE_CLAIM_TRUST"
 
 // piAllowedToolsEnvVar / piDisallowedToolsEnvVar carry a JSON-encoded
 // Spec.AllowedTools / Spec.DisallowedTools array onto the interactive PTY
@@ -318,6 +367,17 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 // artifact renders in the TUI. That is the one difference from headless
 // composeChildEnv, and it is the whole point of the interactive posture.
 func interactiveExecEnv(allowed []string, spec agent.Spec, layout sessionLayout) map[string]string {
+	return interactiveExecEnvWithTrust(allowed, spec, layout, false)
+}
+
+// interactiveExecEnvWithTrust is interactiveExecEnv plus the spawn's
+// applied-receipt trust verdict. The verdict is a spawn parameter, never
+// caller input: interactiveExecEnv (and interactiveChildEnv, which drives
+// the unit-level tests) keeps it absent, and spawnInteractive passes the
+// measured answer. Splitting it this way keeps the trust bit out of any
+// caller-reachable env composition — a Spec-carried copy is dropped by
+// childEnvRefused before it ever gets here.
+func interactiveExecEnvWithTrust(allowed []string, spec agent.Spec, layout sessionLayout, claimTrusted bool) map[string]string {
 	// No capacity hint: a Go map grows on demand, so pre-sizing it buys nothing
 	// here, and summing len()s as an allocation size is exactly the shape a
 	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
@@ -330,6 +390,13 @@ func interactiveExecEnv(allowed []string, spec agent.Spec, layout sessionLayout)
 	env[piCodingAgentDirEnvVar] = layout.agentHome
 	env[piCodingAgentSessionDirEnvVar] = layout.root
 	env[piStateDirEnvVar] = layout.root
+	// The applied-receipt trust verdict. Stamped by the spawn, never by the
+	// caller: childEnvRefused drops any inherited or Spec-carried copy (it
+	// sits under the harness-owned DONMAI_NOTICE_ prefix), so only the value
+	// set here — after the partition — can reach the child.
+	if claimTrusted {
+		env[noticeClaimTrustEnvVar] = "1"
+	}
 	for _, kv := range offlinePostureEnv(spec) {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			env[kv[:i]] = kv[i+1:]

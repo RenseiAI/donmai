@@ -36,6 +36,100 @@ func TestSpawn_Interactive_InjectRequiresTrustedDurableReceipt(t *testing.T) {
 	}
 }
 
+// TestSpawn_Interactive_ClaimExtensionLoadsSecondByExplicitPath proves the
+// host-owned applied-receipt extension rides the interactive spawn on its
+// own explicit `-e` path — boundary first, receipt extension second, caller
+// deliveries after — and never by workspace discovery. The fake pi records
+// its argv; the assertion reads the recorded load order off it.
+//
+// RED proof: drop noticeClaimPath from the extensionPaths list in
+// spawnInteractive and the claim path vanishes from the argv.
+func TestSpawn_Interactive_ClaimExtensionLoadsSecondByExplicitPath(t *testing.T) {
+	workdir := t.TempDir()
+	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+	argv := argvLines(readCapturedFile(t, workdir, "argv.txt"))
+	var loads []string
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "-e" {
+			loads = append(loads, argv[i+1])
+		}
+	}
+	if len(loads) != 2 {
+		t.Fatalf("-e load paths = %q, want exactly [boundary, notice-claim]", loads)
+	}
+	if filepath.Base(loads[0]) != extensionFileName {
+		t.Errorf("first -e load = %q, want the boundary extension %q", loads[0], extensionFileName)
+	}
+	if filepath.Base(loads[1]) != noticeClaimFileName {
+		t.Errorf("second -e load = %q, want the applied-receipt extension %q", loads[1], noticeClaimFileName)
+	}
+	if !slices.Contains(argv, "--no-extensions") {
+		t.Errorf("interactive argv missing --no-extensions; workspace discovery must stay off: %q", argv)
+	}
+}
+
+// TestSpawn_Interactive_UntrustedClaimExtensionRefusesDelivery proves the
+// spawn-stamped trust verdict defaults to ABSENT: without an embedder that
+// trusts the receipt extension, the child env carries no trust bit — so the
+// claim command refuses every delivery (the fixture proof) rather than
+// minting receipts no host verified.
+//
+// RED proof: stamp the trust bit unconditionally in interactiveExecEnv and
+// this test fails.
+func TestSpawn_Interactive_UntrustedClaimExtensionRefusesDelivery(t *testing.T) {
+	t.Parallel()
+	layout := newSessionLayout(t.TempDir())
+	env := interactiveChildEnv(agent.Spec{Cwd: t.TempDir()}, layout)
+	if _, present := env[noticeClaimTrustEnvVar]; present {
+		t.Errorf("unstamped interactive child env carries %s; the trust verdict belongs to the spawn, not the caller", noticeClaimTrustEnvVar)
+	}
+	// A caller-supplied copy is dropped by the partition before it ever
+	// reaches the child: childEnvRefused owns the harness prefix.
+	spec := agent.Spec{Cwd: t.TempDir(), Env: map[string]string{noticeClaimTrustEnvVar: "1"}}
+	parts := interactiveChildEnvParts(spec)
+	for _, kv := range parts.exec {
+		if strings.HasPrefix(kv, noticeClaimTrustEnvVar+"=") {
+			t.Errorf("caller-stamped %s survived the partition: %q", noticeClaimTrustEnvVar, kv)
+		}
+	}
+	for _, b := range parts.deferred {
+		if b.Env == noticeClaimTrustEnvVar {
+			t.Errorf("caller-stamped %s survived into the credential file: %+v", noticeClaimTrustEnvVar, b)
+		}
+	}
+}
+
+// TestNoticeClaimTrusted_RequiresExactDigestAndNoShadow pins the spawn's
+// trust verdict: true only when the compiled embedder's trusted set names
+// the exact embedded digest AND no caller delivery shadows the claim ID.
+// A peer pack carrying the same command name races the host copy for the
+// invocation, so the verdict fails closed.
+func TestNoticeClaimTrusted_RequiresExactDigestAndNoShadow(t *testing.T) {
+	t.Parallel()
+	trusted := []TrustedExtensionIdentity{{ID: noticeClaimDeliveryID, Digest: noticeClaimSHA()}}
+	if !noticeClaimTrusted(trusted, nil) {
+		t.Error("exact embedded digest in the trusted set must verify")
+	}
+	if noticeClaimTrusted(nil, nil) {
+		t.Error("empty trusted set must not verify")
+	}
+	if noticeClaimTrusted([]TrustedExtensionIdentity{{ID: noticeClaimDeliveryID, Digest: strings.Repeat("0", 64)}}, nil) {
+		t.Error("stale digest in the trusted set must not verify")
+	}
+	if noticeClaimTrusted(trusted, []agent.ExtensionDelivery{{ID: noticeClaimDeliveryID}}) {
+		t.Error("caller delivery shadowing the claim ID must fail the verdict closed")
+	}
+}
+
 // captureArgvEnvScript is the fake-pi body the fixture tests use. It dumps its
 // own argv (one element per line so an argument containing spaces still lands on
 // one line) and the provider-pin / handshake / home env vars to files in the

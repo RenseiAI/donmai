@@ -23,12 +23,20 @@ import (
 // copy's SHA is verified against these bytes at handshake time.
 //
 //go:embed extensions/donmai-policy.ts
+//go:embed extensions/donmai-notice-claim.ts
 var embeddedExtensions embed.FS
 
 const (
 	// extensionFileName is the extension source file name, both embedded and
 	// materialized.
 	extensionFileName = "donmai-policy.ts"
+
+	// noticeClaimFileName is the host-owned applied-receipt extension for
+	// interactive sessions (extensions/donmai-notice-claim.ts). It loads by
+	// explicit `-e` path exactly like the boundary extension — never by
+	// workspace discovery — and only when its measured identity matches the
+	// compiled embedder's trusted set.
+	noticeClaimFileName = "donmai-notice-claim.ts"
 
 	// piStateDir is the per-session pi state directory materialized inside the
 	// worktree so the runner's worktree lifecycle owns it (design §2 step 1,
@@ -131,6 +139,26 @@ func extensionSource() []byte {
 // on-disk source (import.meta.url) and reports it; the two must agree.
 func extensionSHA() string {
 	sum := sha256.Sum256(extensionSource())
+	return hex.EncodeToString(sum[:])
+}
+
+// noticeClaimSource returns the embedded applied-receipt extension bytes.
+// Same fail-closed shape as extensionSource: a read error yields nil so
+// noticeClaimSHA can never match a real file.
+func noticeClaimSource() []byte {
+	b, err := embeddedExtensions.ReadFile("extensions/" + noticeClaimFileName)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// noticeClaimSHA returns the lowercase hex sha256 of the embedded
+// applied-receipt extension. This is the digest the trusted-extension set
+// binds: a session loads this file only when its measured identity matches
+// the compiled embedder's Options.TrustedExtensions entry.
+func noticeClaimSHA() string {
+	sum := sha256.Sum256(noticeClaimSource())
 	return hex.EncodeToString(sum[:])
 }
 

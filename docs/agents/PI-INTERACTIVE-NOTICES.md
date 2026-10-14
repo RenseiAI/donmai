@@ -43,6 +43,48 @@ The implementation must satisfy all of these conditions:
    restart, duplicate-offer, and malicious-peer-extension controls.
 
 These are enablement requirements, not capabilities supplied by the current
-adapter. No receipt bridge or success canary is claimed here. A Pi upstream
-implementation and a verified isolation boundary remain necessary before the
-interactive runner can drive this channel.
+adapter. The receipt bridge below is implemented; the live success canary
+is not claimed here. A Pi upstream awaited-entry API remains the cleaner
+long-term primitive — until it exists, the host-owned claim channel is the
+boundary.
+
+## Host-owned claim channel (implemented)
+
+The interactive spawn loads a second host-owned extension by explicit `-e`
+path, immediately after the boundary extension and before caller
+\deliveries (`extensions/donmai-notice-claim.ts`, embedded and measured
+like the boundary). It exposes `/donmai-claim <deliveryId> <text>`:
+
+* The command persists a `donmai-notice-offer` custom entry FIRST, then
+  applies the notice as a `donmai-notice` custom message through
+  `pi.sendMessage` — which pi persists through SessionManager before it
+  emits the `message_end` the Go transcript tailer observes — and the
+  `message_end` handler then persists the `donmai-notice-applied` receipt.
+  The receipt therefore exists only after durable conversation
+  persistence (conditions 1–2).
+* A repeated claim for an applied ID reports "already applied" and writes
+  nothing; a conflicting payload under the same ID is refused (conditions
+  1, 4). An offer with no applied marker is unapplied work and replays;
+  a crash after persistence re-reports the identical receipt without a
+  duplicate turn (condition 4). Offers and receipts live in the session
+  file, so reload preserves unapplied work and history never acknowledges
+  new deliveries (condition 5).
+* The command runs only when the spawn stamped the trust verdict
+  (`DONMAI_NOTICE_CLAIM_TRUST=1`), which the spawn sets only after the
+  compiled embedder's trusted set names the exact embedded digest AND no
+  caller delivery shadows the claim ID. The verdict rides the spawn's
+  complete environment, and any caller-carried copy is dropped by the
+  harness-owned env prefix — so an arbitrary peer extension cannot mint,
+  replay, or forge the receipt, and no proof is ever read out of a
+  transcript or mailbox file (condition 3).
+* Direct `Handle.Inject` still refuses (`ErrInteractiveReceiptUnavailable`)
+  and the runtime-inject rail still dead-letters `channel-not-driven`:
+  the receipt path is claimed through the session's own channel, never
+  pushed over the PTY (condition 6).
+
+Condition 7 (the real interactive canary with crash, restart,
+duplicate-offer, and malicious-peer controls) remains future work and is
+tracked separately; the scripted fixture
+(`testdata/notice-claim-harness.mjs`, always run, no `pi` binary needed)
+proves the ordering, idempotence, conflict-refusal, and trust properties
+against the real production extension.
