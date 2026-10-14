@@ -305,7 +305,7 @@ func (h *Handle) handshake(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("muse initialize handshake: %w", err)
 	}
-	if _, err := checkHandshakeResult(raw); err != nil {
+	if _, err := checkHandshakeResultForPlan(raw, len(h.plan.MCPServers) > 0); err != nil {
 		return err
 	}
 	if err := h.client.Notify("initialized", map[string]any{}); err != nil {
