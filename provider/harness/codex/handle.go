@@ -74,6 +74,11 @@ type Handle struct {
 	mcpErr       error
 
 	state *mapperState
+
+	// tail is the rollout context-notice tail start() launched, or nil
+	// when the session runs without notices. Set before the forwarder
+	// starts; the forwarder drains it on the terminal event.
+	tail *rolloutContextTail
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -292,7 +297,7 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 	// is the provider's own isolated home (never the ambient environment)
 	// and the thread id is the one just started or resumed above; either
 	// unknown (a unit-test handle with no provider) runs without notices.
-	h.startContextTail(ctx)
+	h.tail = h.startContextTail(ctx)
 
 	// The forwarder is intentionally long-lived: it must survive
 	// Spawn() returning and run for the duration of the session.
@@ -371,6 +376,9 @@ func (h *Handle) handleNotification(n notification) bool {
 	for _, ev := range events {
 		switch ev.Kind() {
 		case agent.EventResult, agent.EventError:
+			// The turn's last token_count lands in the rollout moments
+			// before this notification; read it before Events closes.
+			h.tail.drain(h.emit)
 			if err := h.releaseMCPConfig(); err != nil {
 				h.emit(mcpCleanupErrorEvent())
 			} else {
