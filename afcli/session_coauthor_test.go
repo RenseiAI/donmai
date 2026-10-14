@@ -20,7 +20,22 @@ func TestSessionCoAuthorDetailRouteToQueuedWork(t *testing.T) {
 		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
 	}))
 	t.Cleanup(srv.Close)
+	email := "contributor" + "@" + "example.invalid"
+	cases := []struct {
+		name, author, email string
+		valid               bool
+	}{
+		{"valid", "Sample Contributor", email, true},
+		{"absent", "", "", true},
+		{"invalid", "Sample\nContributor", email, false},
+		{"incomplete", "Sample Contributor", "", false},
+	}
 	cfg := daemon.DefaultConfig()
+	// Admit one session per case below (plus the direct-detail check):
+	// DefaultConfig derives capacity from host CPUs (as low as 2 on small
+	// runners), which would refuse the later admissions there. Mirror the
+	// bootstrap-test precedent and pin room for every case.
+	cfg.Capacity.MaxConcurrentSessions = len(cases) + 1
 	cfg.Orchestrator.URL = srv.URL
 	cfg.Projects = projects
 	configPath := filepath.Join(t.TempDir(), "daemon.yaml")
@@ -39,16 +54,6 @@ func TestSessionCoAuthorDetailRouteToQueuedWork(t *testing.T) {
 	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
 	daemonURL := "http://" + server.Addr()
 
-	email := "contributor" + "@" + "example.invalid"
-	cases := []struct {
-		name, author, email string
-		valid               bool
-	}{
-		{"valid", "Sample Contributor", email, true},
-		{"absent", "", "", true},
-		{"invalid", "Sample\nContributor", email, false},
-		{"incomplete", "Sample Contributor", "", false},
-	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			raw, err := json.Marshal(map[string]any{"sessionId": "credit-" + tc.name, "projectId": "local", "coAuthorName": tc.author, "coAuthorEmail": tc.email})
