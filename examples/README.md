@@ -23,6 +23,11 @@ produce the full live evidence when an operator supplies their own demo reposito
 and vendor logins. Review recordings for credentials, personal data and private
 repository content before sharing them.
 
+The drift example also includes a [live release run](drift-check-pr/live.cast)
+using v0.72.74, with its [published PR comment](https://github.com/RenseiAI/donmai/pull/943#issuecomment-6169929675)
+read back from GitHub. Backlog and second opinion still need operator-supplied live
+vendor recordings.
+
 Replay with `asciinema play examples/backlog-sweep/rehearsal.cast` (and similarly
 for the other two). Regenerate the fixture recordings and run the script tests:
 

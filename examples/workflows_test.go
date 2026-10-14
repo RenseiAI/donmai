@@ -261,3 +261,42 @@ func TestRecordedRehearsals(t *testing.T) {
 		})
 	}
 }
+
+// Validate the live artifact offline; this test does not repeat publication.
+func TestLiveDriftRecording(t *testing.T) {
+	data, err := os.ReadFile("drift-check-pr/live.cast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 2 {
+		t.Fatal("asciicast has no output events")
+	}
+	var header struct {
+		Version int `json:"version"`
+		Width   int `json:"width"`
+		Height  int `json:"height"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &header); err != nil {
+		t.Fatal(err)
+	}
+	if header.Version != 2 || header.Width <= 0 || header.Height <= 0 {
+		t.Fatalf("invalid asciicast dimensions or version: %+v", header)
+	}
+	last := 0.0
+	for _, line := range lines[1:] {
+		var frame []any
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if len(frame) != 3 {
+			t.Fatalf("event must have timestamp, type, data: %v", frame)
+		}
+		at, validTime := frame[0].(float64)
+		output, validOutput := frame[2].(string)
+		if !validTime || at < last || frame[1] != "o" || !validOutput || output == "" {
+			t.Fatalf("event cannot be replayed in order: %v", frame)
+		}
+		last = at
+	}
+}

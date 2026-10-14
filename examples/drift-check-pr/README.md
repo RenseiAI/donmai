@@ -47,6 +47,14 @@ or blocks the PR by itself. Review the summary and PR diff manually.
 
 ## Recorded run
 
+[live.cast](live.cast) records an actual run of the published v0.72.74 binary
+against [the examples PR](https://github.com/RenseiAI/donmai/pull/943), including
+[comment publication](https://github.com/RenseiAI/donmai/pull/943#issuecomment-6169929675)
+and reading the comment back. It completed with exit 0 and one convention signal.
+This recording assesses the initial examples commit; later changes to that PR are
+not part of the recorded assessment. Replay it with `asciinema play live.cast`
+from this directory.
+
 [rehearsal.cast](rehearsal.cast) records a gated summary being published through
 the actual script with offline command fixtures, not a live GitHub comment.
 Record the live run after previewing the target PR:
