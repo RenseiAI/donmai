@@ -22,11 +22,19 @@ import (
 
 // shimSeatRunner builds a Runner with the standalone outbox enabled for
 // attempt 1, posting to srv. The caller owns the worktree manager so the
-// test can reopen the authority the way a restarted daemon does.
-func shimSeatRunner(t *testing.T, manager *worktree.Manager, poster *result.Poster) *Runner {
+// test can reopen the authority the way a restarted daemon does. The
+// optional spawnGate, when non-nil, is closed exactly once on the first
+// Spawn call so cancellation tests can gate on provisioning having
+// finished (the ownership pulse starts before provisioning, so the first
+// lock-refresh no longer serves as that gate).
+func shimSeatRunner(t *testing.T, manager *worktree.Manager, poster *result.Poster, spawnGate ...*spawnGate) *Runner {
 	t.Helper()
 	registry := NewRegistry()
-	provider, _ := stub.New()
+	base, _ := stub.New()
+	var provider agent.Provider = base
+	if len(spawnGate) > 0 && spawnGate[0] != nil {
+		provider = &spawnGatedStubProvider{HarnessProvider: base.(agent.HarnessProvider), spawned: spawnGate[0].ch, once: &spawnGate[0].once}
+	}
 	if err := registry.Register(provider); err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +47,19 @@ func shimSeatRunner(t *testing.T, manager *worktree.Manager, poster *result.Post
 		t.Fatal(err)
 	}
 	return r
+}
+
+// spawnGate is the shared first-Spawn signal for shim-seat cancellation
+// tests. The gate lives in shim_outbox_test.go so runner_test.go's
+// spawnGatedStubProvider can be reused without an import cycle within the
+// package's test files.
+type spawnGate struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func newSpawnGate() *spawnGate {
+	return &spawnGate{ch: make(chan struct{})}
 }
 
 // TestShimSeatPersistsTerminalBodyBeforeFirstSend drives the production Run
@@ -365,13 +386,15 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := make(chan struct{})
-	var startedOnce atomic.Bool
+	gate := newSpawnGate()
+	// Gate cancellation on Spawn, not on the first lock-refresh: the
+	// ownership pulse starts before provisioning, so the first refresh
+	// lands while the session is still cloning — cancelling on it aborts
+	// the clone instead of the hanging interview turn. Spawn proves
+	// provisioning finished. The refresh handler stays (answering 200)
+	// so the pre-provision pulse never trips the loss fuse mid-test.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if strings.HasSuffix(req.URL.Path, "/lock-refresh") {
-			if startedOnce.CompareAndSwap(false, true) {
-				close(started)
-			}
 			_, _ = w.Write([]byte(`{"refreshed":true}`))
 			return
 		}
@@ -382,7 +405,7 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := shimSeatRunner(t, manager, poster)
+	r := shimSeatRunner(t, manager, poster, gate)
 	queued := QueuedWork{QueuedWork: queuedWorkBase("SHIM-OUTBOX-STOPPED"), WorkerID: "worker", PlatformURL: srv.URL, ResolvedProfile: ResolvedProfile{
 		Provider:       agent.ProviderStub,
 		ProviderConfig: map[string]any{"stub.behavior": string(stub.BehaviorHangThenTimeout)},
@@ -402,11 +425,11 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 		done <- runResult{res: res, err: runErr}
 	}()
 	select {
-	case <-started:
+	case <-gate.ch:
 		cancel()
 	case <-time.After(30 * time.Second):
 		cancel()
-		t.Fatal("Run did not reach lock refresh before cancellation")
+		t.Fatal("Run did not reach provider spawn before cancellation")
 	}
 	var got runResult
 	select {

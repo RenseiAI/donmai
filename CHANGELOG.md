@@ -8,7 +8,24 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- `linear create-issue` accepts `--assignee <user ID|name|email|me>` and `--priority 0-4`, and `linear update-issue` accepts the same `--assignee` spellings with `--assignee null` clearing the assignment. Assignee names, emails, and `me` resolve through the configured transport (direct API key or hosted proxy) and unknown values fail before any mutation runs.
+
+## v0.72.74 — 2026-10-13
+
+### Chores
+
+- Pin provider routing env after repo config; clean up seeded trust at session end
+- Rename systemd unit to brand-neutral default with in-place migration
+- Terminal outbox hardening: resume-stable key, prune, quarantine, local delivery, exactly-once
+- Upgrade acceptance follow-ups: live halves, posture stale check, wider triggers, worktree image
+- Stop finished seat scopes at disposal; monotonic launch epochs; pre-spawn bus check; batched read-back
+- Three-axis seat state in heartbeats and terminal receipts
+- Harness context and compaction notices feed the usage series
+- Carry session identity on adopted and quarantined shim handles; dedupe the session list by id
+- Add MSP harness over serve host (generated types, session and turn lifecycle, event mapping)
+- Keep the fake scope binary from writing .tmp into the package directory
 
 ## v0.72.73 — 2026-10-12
 

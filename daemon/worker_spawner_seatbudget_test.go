@@ -755,9 +755,14 @@ func installFakeSystemdRun(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	argvPath := filepath.Join(dir, "systemd-run-argv")
+	// The record is skipped when the launch env carries no destination: an
+	// unset variable would otherwise resolve to ".tmp" in the working
+	// directory, which is the package source tree under `go test`.
 	fake := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$@\" > \"$FAKE_SYSTEMD_RUN_ARGV.tmp\"\n" +
-		"mv \"$FAKE_SYSTEMD_RUN_ARGV.tmp\" \"$FAKE_SYSTEMD_RUN_ARGV\"\n" +
+		"if [ -n \"$FAKE_SYSTEMD_RUN_ARGV\" ]; then\n" +
+		"  printf '%s\\n' \"$@\" > \"$FAKE_SYSTEMD_RUN_ARGV.tmp\"\n" +
+		"  mv \"$FAKE_SYSTEMD_RUN_ARGV.tmp\" \"$FAKE_SYSTEMD_RUN_ARGV\"\n" +
+		"fi\n" +
 		"while [ $# -gt 0 ]; do\n" +
 		"  if [ \"$1\" = \"--unit\" ]; then shift 2; break; fi\n" +
 		"  shift\n" +
@@ -1155,7 +1160,7 @@ func TestCheckShimScopeBusRefusesBeforeSpawn(t *testing.T) {
 	// User install under its own manager: launches (through the fake
 	// scope binary, so the test never needs a real systemd).
 	dir := t.TempDir()
-	installFakeSystemdRun(t, dir)
+	argvPath := installFakeSystemdRun(t, dir)
 	user := newBusDaemon("user", true)
 	userLaunch := sessionshim.Launch{
 		Identity:     sessionshim.Identity{OrgID: "test-org", SessionID: "user-install-seat"},
@@ -1163,9 +1168,12 @@ func TestCheckShimScopeBusRefusesBeforeSpawn(t *testing.T) {
 		Orphan:       sessionshim.DefaultOrphanPolicy(),
 		ProcessEpoch: 1,
 	}
-	if _, err := user.startShimProcess(SessionSpec{SessionID: "user-install-seat"}, userLaunch, []string{"PATH=" + os.Getenv("PATH")}); err != nil {
+	// The launch env is explicit, so the fake's argv destination rides in it
+	// too; the wait keeps the fake's write inside the test's temp dir.
+	if _, err := user.startShimProcess(SessionSpec{SessionID: "user-install-seat"}, userLaunch, []string{"PATH=" + os.Getenv("PATH"), "FAKE_SYSTEMD_RUN_ARGV=" + argvPath}); err != nil {
 		t.Fatalf("startShimProcess under a user manager: %v", err)
 	}
+	waitForFile(t, argvPath, "fake systemd-run argv")
 	// Unknown own-cgroup keeps the cached placement verdict: no refusal.
 	// The worker is the bare shell (no scope wrap asserts here — the bus
 	// check is what this leg pins), so it runs without the fake binary.

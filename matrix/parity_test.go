@@ -287,8 +287,8 @@ func TestParity_CapsNarrowingOnly(t *testing.T) {
 // is a faithful additive projection, not a divergent second source of truth.
 func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 	providers := HarnessProvidersForParity()
-	if len(providers) != 8 {
-		t.Fatalf("expected 8 harness providers, got %d", len(providers))
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if p == nil {

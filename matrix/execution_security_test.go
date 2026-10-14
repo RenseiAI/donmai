@@ -42,6 +42,7 @@ func TestExecutionSecurityRenderMatrix(t *testing.T) {
 		agent.HarnessClaudeCode:   {auto: best, human: none},
 		agent.HarnessCodex:        {auto: best, human: none},
 		agent.HarnessGeminiDirect: {auto: best},
+		agent.HarnessMuse:         {auto: best},
 		agent.HarnessOpenCode:     {auto: best},
 		agent.HarnessPi:           {auto: best, human: best},
 		agent.HarnessOllama:       {auto: none},

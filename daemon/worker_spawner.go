@@ -673,6 +673,16 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 	return nil
 }
 
+// MaxConcurrentSessions returns the live session capacity future AcceptWork
+// decisions are admitted against. It mirrors the ceiling SetMaxConcurrentSessions
+// last installed — the constructor default until the first set — so a claim
+// gate consulting it agrees with the spawner about what "full" means.
+func (s *WorkerSpawner) MaxConcurrentSessions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opts.MaxConcurrentSessions
+}
+
 // SetSeatBudget swaps the per-seat budget future spawns apply. Seats
 // already running keep the budget they started with — like capacity, the
 // new share governs only future AcceptWork calls. The share lives behind

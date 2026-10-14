@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -428,5 +430,98 @@ func TestDefaultCatalogProbe_BuildsMinimalEnv_BlocklistedVarNeverReachesChild(t 
 	// resolved credential does not.
 	if !strings.Contains(raw, piCodingAgentDirEnvVar+"=") {
 		t.Fatalf("probe env missing %s: %q", piCodingAgentDirEnvVar, raw)
+	}
+}
+
+// TestSpawn_AggregatorEndpoint_RoutingPreferenceSkipsPromotion proves the
+// promotion rule follows the chosen routing option: a gateway binding that
+// carries a set routing preference is NEVER promoted onto pi's built-in
+// aggregator provider — even when pi's catalog lists the exact slug —
+// because the native provider carries no routing option and promoting
+// would silently drop the dispatch's routing. The session stays on the
+// injected provider (whole slug, gateway key only), no catalog probe runs,
+// and no aggregator credential is mirrored. The control (same binding, no
+// preference) keeps today's native promotion.
+func TestSpawn_AggregatorEndpoint_RoutingPreferenceSkipsPromotion(t *testing.T) {
+	t.Parallel()
+	pref := &agent.RoutingPreference{Order: []string{"anthropic", "openai"}, Only: []string{"anthropic"}}
+	cases := []struct {
+		name       string
+		pref       *agent.RoutingPreference
+		wantProbe  bool
+		wantArgs   []string
+		wantPinAPI string // "" = the injected provider is not selected
+	}{
+		{
+			name:       "preference present skips promotion, stays injected with the routing option",
+			pref:       pref,
+			wantArgs:   []string{"--provider", pinnedProviderName, "--model", aggregatorGatewayModel},
+			wantPinAPI: "openai-completions",
+		},
+		{
+			name:      "empty preference promotes as before",
+			pref:      &agent.RoutingPreference{},
+			wantProbe: true,
+			wantArgs:  []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel},
+		},
+		{
+			name:      "no preference promotes as before",
+			pref:      nil,
+			wantProbe: true,
+			wantArgs:  []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			probed := false
+			p := &Provider{binary: "pi", opts: Options{
+				CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+					probed = true
+					return realVercelGatewayCatalogListing, nil
+				},
+			}}
+			ep := aggregatorGatewayBinding()
+			ep.RoutingPreference = tc.pref
+			spec, err := p.prepare(context.Background(), agent.Spec{
+				Prompt:   "hi",
+				Cwd:      t.TempDir(),
+				Model:    aggregatorGatewayModel,
+				Env:      map[string]string{PiKeyEnvVar: "gw-key"},
+				Endpoint: ep,
+			})
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			if probed != tc.wantProbe {
+				t.Errorf("catalog probe ran = %v; want %v", probed, tc.wantProbe)
+			}
+			if args := modelPinArgs(spec); !reflect.DeepEqual(args, tc.wantArgs) {
+				t.Errorf("modelPinArgs = %q; want %q", args, tc.wantArgs)
+			}
+			if got := injectedProviderSelected(spec); got != (tc.wantPinAPI != "") {
+				t.Errorf("injectedProviderSelected = %v; want %v", got, tc.wantPinAPI != "")
+			}
+			if tc.wantPinAPI == "" {
+				if spec.Env["AI_GATEWAY_API_KEY"] != "gw-key" {
+					t.Errorf("AI_GATEWAY_API_KEY = %q; want the cell key mirrored for the native route", spec.Env["AI_GATEWAY_API_KEY"])
+				}
+				return
+			}
+			env := providerPinEnv(spec)
+			for _, want := range []string{
+				piAPIEnvVar + "=" + tc.wantPinAPI,
+				piModelEnvVar + "=" + aggregatorGatewayModel,
+				piRoutingOrderEnvVar + `=["anthropic","openai"]`,
+				piRoutingOnlyEnvVar + `=["anthropic"]`,
+			} {
+				if !slices.Contains(env, want) {
+					t.Errorf("providerPinEnv = %v; want it to contain %q", env, want)
+				}
+			}
+			if spec.Env["AI_GATEWAY_API_KEY"] != "" {
+				t.Errorf("AI_GATEWAY_API_KEY = %q; want unset: the native aggregator route must not get a credential mirror", spec.Env["AI_GATEWAY_API_KEY"])
+			}
+		})
 	}
 }

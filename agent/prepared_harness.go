@@ -459,13 +459,33 @@ func stableEndpointAuthority(endpoint *EndpointBinding) any {
 	if endpoint == nil {
 		return nil
 	}
-	return map[string]any{
+	doc := map[string]any{
 		"company": endpoint.Company, "model": endpoint.Model, "protocol": endpoint.Protocol, "host": endpoint.Host,
 		"endpointId": endpoint.EndpointID, "endpointOperator": endpoint.EndpointOperator, "endpointRevision": endpoint.EndpointRevision,
 		"modelAuthor": endpoint.ModelAuthor, "authBindingId": endpoint.AuthBindingID, "authAuthority": endpoint.AuthAuthority,
 		"authCommercialMode": endpoint.AuthCommercialMode, "authBindingScope": endpoint.AuthBindingScope,
 		"authPortability": endpoint.AuthPortability, "authDelivery": endpoint.AuthDelivery, "mechanism": endpoint.Mechanism,
 	}
+	// The routing preference joins the digest only when set: unpreferred
+	// bindings keep their pre-field digest byte-identically (the same
+	// additive-field doctrine the wire tags follow).
+	if pref := stableRoutingPreferenceAuthority(endpoint.RoutingPreference); pref != nil {
+		doc["routingPreference"] = pref
+	}
+	return doc
+}
+
+// stableRoutingPreferenceAuthority projects the optional routing preference
+// into the harness-authority digest. A set preference changes where the
+// gateway routes, so preflight-to-spawn drift in it must read as drift —
+// the same reason company/model/protocol/host are bound. Nil projects as
+// nil (never an empty object) so unpreferred bindings keep their
+// pre-field digest byte-identically.
+func stableRoutingPreferenceAuthority(pref *RoutingPreference) any {
+	if pref.IsZero() {
+		return nil
+	}
+	return map[string]any{"order": pref.Order, "only": pref.Only}
 }
 
 func equalJSON(left, right any) bool {

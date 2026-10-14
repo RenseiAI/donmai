@@ -345,11 +345,15 @@ func mapLineWithNames(line []byte, names scopedUsageNames) []agent.Event {
 	case "auth_status":
 		return mapAuthStatus(line)
 	case "stream_event":
-		// Partial-message frames: high-frequency, low value to the
-		// orchestrator. Drop per the legacy port — unless the frame
-		// carries the endpoint's API error, which surfaces as the
-		// provider-error observation so the runner can record the
-		// structured cause.
+		// Partial-message frames: high-frequency, low value as content.
+		// Unless the frame carries the endpoint's API error (surfaced as
+		// the provider-error observation so the runner can record the
+		// structured cause), each delta maps to the content-free
+		// stream-progress liveness signal, not to AssistantTextEvent —
+		// per-token text events spammed the activity stream. The full
+		// message still arrives on the `assistant` line, so the signal
+		// loses no content. The runner's stall detector disarms on it:
+		// deltas arriving means the model request is alive.
 		return mapStreamEvent(line)
 	case "rate_limit_event":
 		// Map onto the shared quota-window type so the daemon can
@@ -638,9 +642,12 @@ func mapAuthStatus(line []byte) []agent.Event {
 
 // mapStreamEvent surfaces the endpoint's API error carried inside a
 // stream_event frame as the provider-error observation. Any other frame
-// stays dropped per the legacy port. The structured cause rides Upstream;
-// only small fixed-shape fields travel — never request bodies, headers,
-// or credentials.
+// is a streaming delta from a live model request and maps to the
+// content-free stream-progress liveness signal — never to
+// AssistantTextEvent, so per-token text never spams the activity stream.
+// The structured cause rides Upstream on the error path only; only small
+// fixed-shape fields travel — never request bodies, headers, or
+// credentials.
 func mapStreamEvent(line []byte) []agent.Event {
 	var head struct {
 		Event struct {
@@ -661,27 +668,27 @@ func mapStreamEvent(line []byte) []agent.Event {
 		}}
 	}
 	apiErr := head.Event.Error
-	if head.Event.Type != "message_stop" || apiErr == nil {
-		return nil
+	if head.Event.Type == "message_stop" && apiErr != nil {
+		message := apiErr.Message
+		if message == "" {
+			message = "model provider error"
+		}
+		status := 0
+		if apiErr.Status != nil {
+			status = *apiErr.Status
+		}
+		code := apiErr.Code
+		if code == "" {
+			code = apiErr.Type
+		}
+		return []agent.Event{agent.SystemEvent{
+			Subtype:  agent.SystemSubtypeProviderError,
+			Message:  message,
+			Upstream: agent.NormalizeUpstreamError(status, code, message, ""),
+			Raw:      json.RawMessage(line),
+		}}
 	}
-	message := apiErr.Message
-	if message == "" {
-		message = "model provider error"
-	}
-	status := 0
-	if apiErr.Status != nil {
-		status = *apiErr.Status
-	}
-	code := apiErr.Code
-	if code == "" {
-		code = apiErr.Type
-	}
-	return []agent.Event{agent.SystemEvent{
-		Subtype:  agent.SystemSubtypeProviderError,
-		Message:  message,
-		Upstream: agent.NormalizeUpstreamError(status, code, message, ""),
-		Raw:      json.RawMessage(line),
-	}}
+	return []agent.Event{agent.StreamProgressEvent()}
 }
 
 // rawRateLimitEnvelope decodes the streamed rate-limit line. The streamed

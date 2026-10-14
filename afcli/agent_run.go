@@ -31,6 +31,7 @@ import (
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
+	providermuse "github.com/RenseiAI/donmai/provider/harness/muse"
 	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
 	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
 	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
@@ -1385,6 +1386,10 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// comment for how PreferServer routes between them. Gemini is a
 		// full streaming impl against generativelanguage.googleapis.com.
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
+		// muse is registration-only until the harness proves a live
+		// turn: the constructor probes the binary + minimum version
+		// and warns-and-skips when absent, mirroring pi.
+		{name: "muse", new: func() (agent.Provider, error) { return providermuse.New(providermuse.Options{}) }},
 		// opencode's PreferServer threads the resolved profile's Lane-B
 		// signal (opencodeCtorHints above) so a `donmai agent run` session
 		// can select the serve/HTTP adapter (07 §2 Lane B) instead of
