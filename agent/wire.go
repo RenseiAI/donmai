@@ -23,11 +23,7 @@ const (
 	ProtoGeminiGenerate    WireProtocol = "gemini-generate"  // :generateContent, SSE
 	ProtoOllama            WireProtocol = "ollama"           // /api/chat NDJSON (bare surface)
 	ProtoMuseMSP           WireProtocol = "muse-msp"         // muse serve MSP session host over stdio JSONL
-	// ProtoAntigravityOAuth backs the Google endpoint's subscription-login
-	// host cell only; the harness that drove it is retired. The sibling
-	// endpoint-host removal deletes this constant with that host.
-	ProtoAntigravityOAuth WireProtocol = "antigravity-oauth" // subscription-login host channel (pty)
-	ProtoStub             WireProtocol = "stub"              // test-only sentinel protocol
+	ProtoStub              WireProtocol = "stub"             // test-only sentinel protocol
 )
 
 // ServingHost — WHERE the model is served, orthogonal to the wire protocol.
@@ -40,7 +36,7 @@ const (
 	HostVertex   ServingHost = "vertex"
 	HostAzure    ServingHost = "azure"
 	HostLocal    ServingHost = "local"     // ollama / on-box
-	HostOAuthCLI ServingHost = "oauth-cli" // host login (agy / claude-sub / codex-sub) — BringsOwnAuth
+	HostOAuthCLI ServingHost = "oauth-cli" // host login (claude-sub / codex-sub) — BringsOwnAuth
 	// HostGateway is the translating-gateway serving host: a company's model
 	// served from the local loopback gateway, which presents an existing wire
 	// protocol and translates to the chosen upstream (ADR-2026-07-24). A cell

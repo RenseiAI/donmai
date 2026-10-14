@@ -175,7 +175,9 @@ type Built struct {
 }
 
 // Build harvests the manifests, validates every hand-authored cell against
-// them, assembles the deterministic matrix, and returns the artifacts. It is
+// them, derives each cell's smoke/stability evidence from the smoke-lane
+// registry plus the last gate outcomes, assembles the deterministic matrix,
+// and returns the artifacts. It is
 // pure (no network, no filesystem) and deterministic (sorted everywhere).
 // Returns an error for any invalid hand-authored cell so `go generate` fails
 // loudly.
@@ -198,6 +200,15 @@ func BuildWithCapabilityRealizations(
 	endpoints, endpointByCompany := buildEndpoints()
 
 	cells, err := buildCells(validCells, harnessByName, endpointByCompany)
+	if err != nil {
+		return nil, err
+	}
+
+	// The hand-authored literals carry routing data only; smoke/stability
+	// evidence is derived here, after validation, from the smoke-lane
+	// registry plus the last gate outcomes. A registry or gate error fails
+	// the build loudly rather than emitting an un-evidenced matrix.
+	cells, err = applySmokeEvidence(cells, cellSmokeProofs, lastSmokeGateOutcomes)
 	if err != nil {
 		return nil, err
 	}
@@ -338,6 +349,9 @@ func buildEndpoints() ([]EndpointRow, map[agent.Company]EndpointRow) {
 //   - authMode subset: cell.authModes ⊆ endpoint.host(cell.host).authModes
 //   - caps narrowing-only: any override only narrows (false where harness=true)
 //   - not denylisted
+//   - no hand-authored smoke evidence: the input literals must leave
+//     ProvingLanes, Stability, and Smoked unset — those are DERIVED by
+//     applySmokeEvidence after validation, never typed.
 func buildCells(
 	cells []HarnessEndpointCell,
 	harnessByName map[agent.HarnessName]HarnessRow,
@@ -351,6 +365,9 @@ func buildCells(
 	out := make([]HarnessEndpointCell, 0, len(cells))
 	for _, c := range cells {
 		key := c.Key()
+		if len(c.ProvingLanes) != 0 || c.Stability != "" || c.Smoked {
+			return nil, fmt.Errorf("cell %+v: smoke evidence is derived, not hand-authored (ProvingLanes/Stability/Smoked must be unset)", key)
+		}
 		if denied[key] {
 			return nil, fmt.Errorf("cell %+v is on the denylist", key)
 		}

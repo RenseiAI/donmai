@@ -341,6 +341,15 @@ func (s *Shim) finalizeHeadlessTerminal(cause HeadlessExitCause) error {
 	// everything below is best-effort delivery to a controller that may
 	// already be gone.
 	if ctrl != nil {
+		// The terminal observation rides the wire once per connection,
+		// after the tombstone carrying the same members is durable: the
+		// controller acknowledges it with a generation-fenced
+		// Heartbeat(ackedSeq=1) after durably recording it, and the wait
+		// below ends early on that receipt. A missing acknowledgement
+		// leaves the tombstone for the next adoption. A frame the codec
+		// refuses (no outbox record names the observation yet) is skipped
+		// the same way: the tombstone stays the authority either way.
+		s.sendHeadlessExit(ctrl, t)
 		// The courtesy wait is the same bound the interactive profile spends:
 		// the controller acknowledges the terminal observation with a
 		// generation-fenced Heartbeat(1) after durably recording it, and a
@@ -348,6 +357,40 @@ func (s *Shim) finalizeHeadlessTerminal(cause HeadlessExitCause) error {
 		s.waitForDurableAck(headlessTerminalSeq, s.finalizeWaitBound())
 	}
 	return nil
+}
+
+// sendHeadlessExit delivers the immutable terminal observation to one
+// adopted controller, after the tombstone carrying the same members is
+// durable. It is best-effort: a controller that is already gone, a stale
+// selected version, or an observation the codec refuses (no outbox record
+// names it yet) leaves the tombstone as the authority for the next
+// adoption. The frame is sent at most once per connection; the controller's
+// generation-fenced Heartbeat(ackedSeq=1) receipt ends the finalize wait
+// early.
+func (s *Shim) sendHeadlessExit(ctrl *controllerConn, tomb Tombstone) {
+	if ctrl.selected < shimwire.V6 {
+		return
+	}
+	body, err := shimwire.EncodeHeadlessExit(shimwire.HeadlessExit{
+		Seq:          headlessTerminalSeq,
+		ProcessEpoch: tomb.ProcessEpoch,
+		ExitCode:     tomb.ExitCode,
+		Signal:       tomb.Signal,
+		GroupReaped:  tomb.GroupReaped,
+		Cause:        tomb.Cause,
+		OutboxKey:    tomb.OutboxKey,
+		OutboxState:  tomb.OutboxState,
+		ObservedAt:   tomb.ObservedAtUnixNano,
+	})
+	if err != nil {
+		s.logger.Warn("sessionshim: headless terminal observation is not wire-legal; the tombstone stays the authority",
+			"session", s.id.String(), "error", err)
+		return
+	}
+	if err := ctrl.w.WriteVersion(ctrl.selected, shimwire.TypeHeadlessExit, body); err != nil {
+		s.logger.Warn("sessionshim: deliver headless terminal observation",
+			"session", s.id.String(), "error", err)
+	}
 }
 
 // serveHeadlessController runs one adopted headless controller connection:

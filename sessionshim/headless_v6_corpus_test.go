@@ -607,7 +607,134 @@ func TestV6CorpusHeadlessExitAcknowledgementWait(t *testing.T) {
 	_ = controller.Close()
 }
 
-// TestV6CorpusFinalizeWaitTimesOut pins the timeout half of the
+// TestV6CorpusShimSendsHeadlessExitAndTheAckEndsTheWaitEarly drives the
+// delivery half of the acknowledgement column through production entries
+// only: a real headless shim with an adopted controller, a fenced Stop that
+// ends the run, the HeadlessExit frame arriving as the controller's terminal
+// event, and the generation-fenced Heartbeat(ackedSeq=1) acknowledgement
+// ending the shim's finalize wait before its bound. The sibling timeout test
+// below pins the other half: without the ack, the same wait runs its full
+// bound.
+func TestV6CorpusShimSendsHeadlessExitAndTheAckEndsTheWaitEarly(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeRunner(t)
+	dir := shortTempDir(t)
+	registry, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{OrgID: "org-v6-corpus", SessionID: "sess-exit-delivery"}
+	// The finalize bound follows the termination grace; keep it short so the
+	// test fails fast if the ack stops ending the wait early, and assert
+	// against it rather than a second number picked beside it.
+	const grace = 8 * time.Second
+	shim, err := StartHeadless(HeadlessOptions{
+		Identity: id, Registry: registry, Runner: runner,
+		WorkareaPath: dir + "/workarea",
+		OutboxKey:    "org-v6-corpus/sess-exit-delivery/attempt-1",
+		OutboxState:  HeadlessOutboxPending,
+		Orphan: OrphanPolicy{
+			Deadline:          30 * time.Second,
+			TerminationGrace:  grace,
+			PropagationMargin: 0,
+		},
+		ProcessEpoch: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartHeadless: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+		_ = shim.Close()
+	})
+
+	rec, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ctrl, err := Dial(ctx, rec, ControllerOptions{Workload: WorkloadHeadless, ControllerID: "controller-exit-delivery"})
+	if err != nil {
+		t.Fatalf("Dial headless record: %v", err)
+	}
+	defer func() { _ = ctrl.Close() }()
+
+	// The run ends the way a controller asks it to: a generation-fenced
+	// Stop, after which the shim writes the tombstone and sends the
+	// terminal observation on this connection.
+	if err := ctrl.Stop(shimwire.StopOperator); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case ev := <-ctrl.Events():
+		if ev.Kind != EventHeadlessExit {
+			t.Fatalf("terminal event kind = %q, want headless_exit", ev.Kind)
+		}
+		if ev.Seq != headlessTerminalSeq {
+			t.Fatalf("terminal event seq = %d, want %d", ev.Seq, headlessTerminalSeq)
+		}
+		if ev.HeadlessExit.Cause != shimwire.HeadlessExitCompleted {
+			t.Fatalf("terminal cause = %q, want completed", ev.HeadlessExit.Cause)
+		}
+		if ev.HeadlessExit.OutboxKey != "org-v6-corpus/sess-exit-delivery/attempt-1" ||
+			ev.HeadlessExit.OutboxState != shimwire.HeadlessExitPending {
+			t.Fatalf("terminal outbox = %q/%q, want the record the tombstone names",
+				ev.HeadlessExit.OutboxKey, ev.HeadlessExit.OutboxState)
+		}
+		if !ev.HeadlessExit.GroupReaped {
+			t.Fatal("terminal observation does not prove the harness group reaped")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("HeadlessExit never arrived after a fenced Stop")
+	}
+
+	// The acknowledgement is the generation-fenced Heartbeat the
+	// controller sends after durably recording the terminal evidence —
+	// here the observation itself is the evidence. The shim's finalize
+	// wait is waitForDurableAck(1), which returns exactly when the
+	// shim-side cursor reaches 1; the heartbeat path advances that cursor
+	// synchronously before answering, so a wait that still runs its full
+	// bound after this ack means the receipt never landed. The bound to
+	// beat is the finalize wait's own: 2s here against its 8s.
+	started := time.Now()
+	if err := ctrl.AcknowledgeHeadlessExit(ctx); err != nil {
+		t.Fatalf("AcknowledgeHeadlessExit: %v", err)
+	}
+	select {
+	case <-shim.TerminalDone():
+	case <-time.After(15 * time.Second):
+		t.Fatal("no terminal observation after a fenced Stop")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		shim.recordMu.Lock()
+		acked := shim.ackedSeq
+		shim.recordMu.Unlock()
+		if acked >= headlessTerminalSeq {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the controller ack did not advance the shim's acknowledgement cursor; the finalize wait runs its full bound")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if waited := time.Since(started); waited >= grace {
+		t.Fatalf("ack wait ran %s, want earlier than the %s finalize bound", waited, grace)
+	}
+
+	tomb, err := registry.GetTombstone(id)
+	if err != nil {
+		t.Fatalf("GetTombstone: %v", err)
+	}
+	if tomb.Cause != HeadlessExitCompleted || tomb.OutboxKey != "org-v6-corpus/sess-exit-delivery/attempt-1" {
+		t.Fatalf("tombstone = %+v, want the completed observation the frame carried", tomb)
+	}
+}
+
 // acknowledgement column: the shim's finalize wait returns (rather than
 // parking forever) when the ackedSeq=1 receipt never arrives, leaving the
 // tombstone for the next adoption. It drives waitForDurableAck — the exact

@@ -233,4 +233,11 @@ func TestDeliveryPolicyHelpers(t *testing.T) {
 	if merges.AllowsDraft() || !merges.AllowsMerges() {
 		t.Errorf("merge policy = %+v; want only merges allowed", merges)
 	}
+	clean := &DeliveryPolicy{AllowCleanMerge: true}
+	if clean.AllowsDraft() || clean.AllowsMerges() || !clean.AllowsCleanMerge() {
+		t.Errorf("clean-merge policy = %+v; want only clean merges allowed", clean)
+	}
+	if zero.AllowsCleanMerge() || nilPolicy.AllowsCleanMerge() {
+		t.Error("absent clean-merge intent allows clean merges; want today's behaviour")
+	}
 }

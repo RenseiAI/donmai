@@ -315,7 +315,8 @@ func TestRealBinary_SequentialToolOverride_KeepsPolicyFence(t *testing.T) {
 	realBinaryAvailable(t)
 
 	workdir := t.TempDir()
-	// Give the refused deletion a real target whose preservation is observable.
+	// State now lives outside the checkout. Seed the legacy directory so
+	// the refused legacy-path deletion has a real directory to protect.
 	if err := os.Mkdir(filepath.Join(workdir, piStateDir), 0o700); err != nil {
 		t.Fatal(err)
 	}

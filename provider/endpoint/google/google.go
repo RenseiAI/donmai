@@ -1,9 +1,7 @@
 // Package google declares the Google model-endpoint family (Family B) for the
-// two-axis provider model. This is where gemini (direct/vertex,
-// gemini-generate), agy-cli (oauth-cli, antigravity-oauth), and the north-star
-// opencode×google cell (local /v1, openai-chat) COLLAPSE into one company with
-// four distinct host cells. Resolve() is pure (no network). No vendor SDK is
-// imported. PURELY ADDITIVE; no Phase-1 consumer.
+// two-axis provider model. Gemini (direct/vertex, gemini-generate) and the
+// opencode×google cell (local /v1, openai-chat) share one company with three
+// distinct host cells. Resolve is pure (no network); no vendor SDK is imported.
 package google
 
 import (
