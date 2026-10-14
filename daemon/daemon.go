@@ -155,8 +155,10 @@ type Options struct {
 	ProtectedRuntimeMCPHelperCommandBuilder ProtectedRuntimeMCPHelperCommandBuilder
 
 	// CodexOrphanSweeper reclaims crash/SIGKILL/restart leftovers under the
-	// donmai-codex-home-*/donmai-codex-app-* naming fence once per Start,
-	// after shim adoption and before registration — see sweepCodexOrphans.
+	// donmai-codex-home-*/donmai-codex-app-* naming fence, over every root
+	// providercodex.DefaultCodexHomeRoots names — once per Start, after shim
+	// adoption and before registration, then hourly via
+	// startCodexOrphanSweepLoop — see sweepCodexOrphans.
 	// Nil (the default every Start call gets unless a caller sets this field)
 	// makes the sweep step a no-op: no os.TempDir() read, no delete inside a
 	// session directory, no signal to a process. Only the production entry
@@ -2043,6 +2045,24 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// the probes are the authoritative refresh.
 		d.quotaPoller = newQuotaPoller(d.quota, d.quotaProbes())
 		d.quotaPoller.Start()
+
+		// Hourly orphan-sweep loop — the startup pass in sweepCodexOrphans
+		// covers restart leftovers; this covers everything that lands
+		// mid-uptime and everything a budget-capped startup pass never
+		// reached. Nil sweeper is a no-op (see startCodexOrphanSweepLoop);
+		// otherwise the loop is a plain ctx-bound goroutine like the
+		// quota poller above — except the poller is explicitly stopped
+		// and this loop is not. That asymmetry is deliberate: the poller
+		// shells out to live harness CLIs on a 5-minute cadence, so a
+		// lingering tick after drain starts spends real process spawns
+		// against a daemon that is shutting down. The sweep loop ticks
+		// hourly, each pass independently bounded by
+		// codexOrphanSweepTimeout, and its next tick after Stop begins
+		// is at most one stale pass — the same posture as the
+		// log-rotation and quarantine-cleanup tickers the production
+		// entry point runs (see afcli/daemon_run.go), which likewise
+		// end with their parent context rather than with Stop.
+		d.startCodexOrphanSweepLoop(ctx)
 
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar
