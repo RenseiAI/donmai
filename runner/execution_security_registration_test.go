@@ -81,6 +81,9 @@ func TestHTTPExecutionSecurityReporterValidation(t *testing.T) {
 	if _, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{BaseURL: "https://controller.example", Token: func() string { return "t" }}); err == nil {
 		t.Fatal("missing worker source accepted")
 	}
+	if _, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{BaseURL: "://bad-origin", Token: func() string { return "t" }, WorkerID: func() string { return "w" }}); err == nil {
+		t.Fatal("malformed origin accepted")
+	}
 	var nilReporter *HTTPExecutionSecurityReporter
 	if _, err := nilReporter.SubmitExecutionSecurityReport(context.Background(), indexZeroSubmissionReport(t)); err == nil {
 		t.Fatal("nil reporter submitted")
@@ -148,7 +151,39 @@ func TestHTTPExecutionSecurityReporterRoundTrip(t *testing.T) {
 	}
 }
 
-// TestHTTPExecutionSecurityReporterRefusesWithoutAuth pins the fail-closed
+// TestHTTPExecutionSecurityReporterStatusHandling pins the fail-closed
+// status map: a non-2xx carrying a refused envelope is returned as a
+// refusal; a bare non-2xx is a submission failure, never an acceptance.
+func TestHTTPExecutionSecurityReporterStatusHandling(t *testing.T) {
+	t.Parallel()
+	status := http.StatusForbidden
+	answer := `{"contractVersion":"execution-security-report/v1","decision":"refused","code":"report_below_stamp"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(answer))
+	}))
+	t.Cleanup(srv.Close)
+	reporter, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{
+		BaseURL:  srv.URL,
+		Client:   srv.Client(),
+		Token:    func() string { return "worker-token" },
+		WorkerID: func() string { return "worker-1" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := indexZeroSubmissionReport(t)
+	acceptance, err := reporter.SubmitExecutionSecurityReport(context.Background(), submission)
+	if err != nil || acceptance.Decision != "refused" {
+		t.Fatalf("non-2xx refused envelope = %+v err=%v, want the refusal", acceptance, err)
+	}
+	answer = `not a decision envelope`
+	if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), submission); err == nil {
+		t.Fatal("bare non-2xx accepted as a submission result")
+	}
+}
+
 // credential floor: no bearer means no post at all.
 func TestHTTPExecutionSecurityReporterRefusesWithoutAuth(t *testing.T) {
 	t.Parallel()
@@ -215,9 +250,18 @@ func TestExecutionSecurityReportCredentials(t *testing.T) {
 	}
 }
 
+// bogusDecisionReporter answers with a decision outside the closed
+// accepted/refused envelope, proving the caller fails closed on it.
+type bogusDecisionReporter struct{}
+
+func (bogusDecisionReporter) SubmitExecutionSecurityReport(context.Context, ExecutionSecurityReportSubmission) (ExecutionSecurityReportAcceptance, error) {
+	return ExecutionSecurityReportAcceptance{ContractVersion: ExecutionSecurityReportContractVersion, Decision: "maybe"}, nil
+}
+
 // TestSubmitExecutionSecurityReportFailureIsTyped pins the fail-closed
 // projection: a failed post is execution_security_receipt_unmet, so the
 // caller records a typed refusal rather than an untyped spawn failure.
+// A decision outside the closed envelope fails the same way.
 func TestSubmitExecutionSecurityReportFailureIsTyped(t *testing.T) {
 	t.Parallel()
 	h := newRunnerHarness(t)
@@ -234,7 +278,8 @@ func TestSubmitExecutionSecurityReportFailureIsTyped(t *testing.T) {
 	if !strings.Contains(err.Error(), "controller unreachable") {
 		t.Fatalf("err = %v, want the submission cause", err)
 	}
-	if h.runner.executionSecurityReporterOverride == nil {
-		t.Fatal("test override was not retained")
+	h.runner.executionSecurityReporterOverride = bogusDecisionReporter{}
+	if err := h.runner.submitExecutionSecurityReport(context.Background(), qw, report); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityReceiptUnmet {
+		t.Fatalf("bogus decision err = %v, want execution_security_receipt_unmet", err)
 	}
 }
