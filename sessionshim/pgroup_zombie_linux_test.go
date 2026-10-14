@@ -12,6 +12,6 @@ import (
 // and never reaches the member count. The cross-platform agreement —
 // neither platform reports a zombie-only group as reaped — holds without a
 // branch to pin.
-func assertZombieGroupUnproved(t *testing.T, eperm func(int, syscall.Signal) error) {
+func assertZombieGroupUnproved(t *testing.T, _ func(int, syscall.Signal) error) {
 	t.Helper()
 }
