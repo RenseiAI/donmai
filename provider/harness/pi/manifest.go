@@ -10,6 +10,9 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // Capabilities() (parity-tested in matrix/parity_test.go). pi runs
 // `pi --mode rpc` as a subprocess and drives it over LF-delimited JSONL, so
 // Transport is subprocess-jsonrpc and StreamingTransport is "ndjson".
+// On a host requiring confinement, ExecutionSecurity derives its write and
+// isolation claims from the current per-harness self-test. The zero-value
+// provider remains probe-free and declares only index-zero security levels.
 //
 // pi's pi-ai layer natively speaks anthropic-messages, openai-chat,
 // openai-responses, and gemini-generate (research/pi.md §3), making pi the
@@ -26,7 +29,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // only speaks ProtoOllama (provider/endpoint/local), which pi does not drive
 // — a local openai-compat pi cell needs either a local-openai host on the
 // local endpoint or routing via google × local, deferred as a follow-up.
-func (*Provider) Manifest() agent.HarnessManifest {
+func (p *Provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
 	// The interactive PTY spawn mode observes only the coarse Init/terminal
 	// boundary the shared ptycli driver emits (byte-accurate terminal stream is
@@ -38,7 +41,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		HumanLabel:        "pi",
 		Family:            agent.FamilyHarness,
 		ContractABI:       "harness/v2",
-		ExecutionSecurity: piExecutionSecurity,
+		ExecutionSecurity: p.executionSecurity(),
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true, // steer / follow_up
 			SupportsSessionResume:    true, // session file + cursor replay (get_entries since=<id>)
