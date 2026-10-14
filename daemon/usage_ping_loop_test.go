@@ -34,7 +34,7 @@ func TestUsagePingLoop_DisabledSendsNothing(t *testing.T) {
 	loop := &usagePingLoop{
 		statePath: filepath.Join(t.TempDir(), "usage-ping.json"),
 		version:   func() string { return "v0.0-test" },
-		config:    func() *Config { return DefaultConfig() }, // disabled
+		config:    DefaultConfig, // disabled
 		sender:    func(endpoint string) *usageping.Sender { return &usageping.Sender{Endpoint: endpoint, AllowHTTP: true} },
 		now:       time.Now,
 	}

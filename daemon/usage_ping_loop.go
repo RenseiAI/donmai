@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/internal/usageping"
@@ -37,7 +36,6 @@ type usagePingState struct {
 // usagePingLoop owns the background goroutine. Nil-safe: a daemon that
 // never starts the loop stops nothing.
 type usagePingLoop struct {
-	mu        sync.Mutex
 	statePath string
 	version   func() string
 	config    func() *Config
@@ -173,5 +171,5 @@ func (l *usagePingLoop) storeState(state usagePingState) error {
 // cancelUsagePing clears any queued attempt state. Called when the
 // operator disables the ping so no stale schedule survives.
 func cancelUsagePing(statePath string) {
-	_ = os.Remove(statePath)
+	_ = os.Remove(statePath) //nolint:gosec // state path is daemon-owned under the brand state dir
 }

@@ -111,7 +111,7 @@ func TestDecodeRejectsUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := `{"installationId":` + strconv_quote(id) + `,"version":"v0.1.0","os":"linux","hostname":"evil"}`
+	body := `{"installationId":` + quoteForTest(id) + `,"version":"v0.1.0","os":"linux","hostname":"evil"}`
 	if _, err := Decode([]byte(body)); err == nil {
 		t.Fatal("unknown field accepted")
 	}
@@ -228,6 +228,6 @@ func TestDue_WeeklyMaximum(t *testing.T) {
 	}
 }
 
-func strconv_quote(s string) string {
+func quoteForTest(s string) string {
 	return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\""
 }
