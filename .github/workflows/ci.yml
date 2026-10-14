@@ -327,3 +327,46 @@ jobs:
             fi
           done
           echo "Gate-liveness OK: live bubblewrap + Landlock tests ran and passed, no SKIPs."
+
+      # The pi harness wraps its seats in that boundary on both spawn paths.
+      # Its live Linux tests drive Provider.Spawn and Resume (headless and
+      # interactive) through the production gate under the real backend, and
+      # pin the clean refusal of a read-only declaration on a host whose
+      # startup check fails.
+      - name: pi confinement suite (live bubblewrap + Landlock)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 15m -v -run 'TestPiConfinementLinux_' ./provider/harness/pi/ 2>&1 | tee "${RUNNER_TEMP}/pi-linux-confinement.log"
+
+      - name: Guard — the live Linux pi confinement tests must RUN, not skip
+        run: |
+          LOG="${RUNNER_TEMP}/pi-linux-confinement.log"
+          REFUSAL='TestPiConfinementLinux_UnsupportedHostRefusesReadOnlyDeclaration'
+          if grep -Eq '^\s*--- SKIP: ' "$LOG"; then
+            if ! grep -Eq "^\s*--- SKIP: ${REFUSAL} " "$LOG"; then
+              echo "::error::a Linux pi confinement test SKIPPED"
+              grep -E '^\s*--- SKIP: ' "$LOG"
+              exit 1
+            fi
+            echo "Note: ${REFUSAL} skipped — this runner can confine, so the refusal has no failing host to pin."
+          fi
+          LIVE=$(grep -oE '^func (TestPiConfinementLinux_[A-Za-z0-9_]+)' provider/harness/pi/confinement_live_linux_test.go | awk '{print $2}')
+          if [ -z "$LIVE" ]; then
+            echo "::error::no live Linux pi confinement tests found"
+            exit 1
+          fi
+          for TEST in $LIVE; do
+            if [ "$TEST" = "$REFUSAL" ]; then
+              continue
+            fi
+            if ! grep -Eq "^--- PASS: ${TEST} " "$LOG"; then
+              echo "::error::${TEST} did not report PASS"
+              exit 1
+            fi
+          done
+          if grep -Eq "^--- (PASS|SKIP): ${REFUSAL} " "$LOG"; then
+            echo "Gate-liveness OK: live Linux pi confinement tests ran (refusal holds where the host cannot confine), no unexpected SKIPs."
+          else
+            echo "::error::${REFUSAL} did not report PASS or SKIP"
+            exit 1
+          fi
