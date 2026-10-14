@@ -383,7 +383,7 @@ func assertLinuxNoLeakedDescriptors(t *testing.T, w linuxLiveWorld) {
 		// listing's own output redirect.
 		if _, perr := strconv.Atoi(strings.TrimSpace(name)); perr == nil ||
 			strings.HasPrefix(name, "/dev/fd") ||
-		(strings.HasPrefix(name, "/proc/") && strings.HasSuffix(name, "/fd")) ||
+			(strings.HasPrefix(name, "/proc/") && strings.HasSuffix(name, "/fd")) ||
 			strings.HasPrefix(name, w.mut+"/") {
 			continue
 		}
