@@ -8,10 +8,11 @@
 // effective only when its measured identity matches the compiled embedder's
 // trusted set (Options.TrustedExtensions). An arbitrary peer
 // AdditionalExtension cannot mint its receipts: the applied marker is
-// accepted only for a delivery this extension's own claim command applied,
-// and the session file is read through the extension runtime's own
-// session manager, not through a transcript or mailbox file the peer can
-// write.
+// written only when the same session holds this extension's own persisted
+// offer for that delivery (same ID, same text) AND the spawn proved the
+// trust verdict for that event — and the session file is read through the
+// extension runtime's own session manager, not through a transcript or
+// mailbox file the peer can write.
 //
 // Mechanism (verified against the real pinned binary):
 //
@@ -69,8 +70,13 @@ function entriesOf(ctx: any) {
 }
 
 function findEntry(entries: any, customType: string, deliveryId: string) {
+  // Entries are same-user writable session state: a malformed entry (no
+  // .data, non-object .data) is skipped, never trusted and never fatal.
+  // A peer that wedges a dataless entry into the session file gets the
+  // normal claim/refusal path, not a TypeError that wedges the channel.
   return entries.find(
-    (e: any) => e.type === "custom" && e.customType === customType && e.data.delivery === deliveryId,
+    (e: any) =>
+      e && e.type === "custom" && e.customType === customType && e.data && e.data.delivery === deliveryId,
   );
 }
 
@@ -88,14 +94,22 @@ export default function activate(pi: ExtensionAPI) {
   // DONMAI_NOTICE_CLAIM_TRUST env the Go spawn stamps only after the
   // trusted-set check passes; a peer extension cannot set it for the
   // session because the child env is the spawn's complete environment.
-  const trusted = process.env.DONMAI_NOTICE_CLAIM_TRUST === "1";
+  // The trust verdict is read per event, never cached at activation: every
+  // AdditionalExtension shares this process, so a peer can mutate
+  // process.env after load, and a session activated before the spawn
+  // stamped the verdict must not inherit authority it never proved. Both
+  // halves below — the claim command and the receipt writer — consult it
+  // on every invocation.
+  function isTrusted() {
+    return process.env.DONMAI_NOTICE_CLAIM_TRUST === "1";
+  }
   function claim(deliveryId: string, text: string, ctx: any) {
     const entries = entriesOf(ctx);
     const already = appliedReceipt(entries, deliveryId);
     if (already) return Promise.resolve("already applied " + deliveryId);
     const offer = findEntry(entries, OFFER_TYPE, deliveryId);
     if (offer) {
-      const offeredText = String(offer.data.text ?? "");
+      const offeredText = String((offer.data && offer.data.text) ?? "");
       if (offeredText !== text) {
         return Promise.reject(new Error("delivery " + deliveryId + " already offered with a different payload"));
       }
@@ -118,7 +132,7 @@ export default function activate(pi: ExtensionAPI) {
   pi.registerCommand("donmai-claim", {
     description: "Claim a queued peer notice: /donmai-claim <deliveryId> <text>",
     handler: async (args: string, ctx: any) => {
-      if (!trusted) {
+      if (!isTrusted()) {
         ctx.ui.notify("notice-claim channel not trusted in this session", "error");
         return;
       }
@@ -142,11 +156,38 @@ export default function activate(pi: ExtensionAPI) {
   // replays the receipt without a duplicate turn: the message is already in
   // the conversation, so reclaiming finds the applied marker missing but
   // the message present and re-reports it instead of re-applying.
+  //
+  // The receipt half consults the same trust verdict per event AND requires
+  // a matching offer this extension's own claim step persisted (same
+  // delivery ID; same text when the persisted message carries one): a
+  // peer sharing this process and the pi.sendMessage surface can emit its
+  // own donmai-notice message, but without an offer for that delivery the
+  // persistence event mints nothing — and without the verdict (or with a
+  // mismatched payload) it mints nothing either. A redelivered message_end
+  // for an already-applied delivery replays the existing receipt instead
+  // of stamping a second, so the receipt stream stays exactly-one per
+  // delivery. The receipt therefore attests persistence of an offered
+  // (delivery, text), not authorship identity: a peer sharing this
+  // process can still invoke the claim command itself while the verdict
+  // holds, so per-action authorship binding awaits a pi upstream
+  // primitive. What this fence does prove — and the fixtures pin — is
+  // that no peer can mint or replay the receipt WITHOUT the persisted
+  // offer and the spawn-stamped verdict: the receipt never precedes the
+  // offer, never exceeds one per delivery, and never issues untrusted.
   pi.on("message_end", async (event: any, ctx: any) => {
-    const m = event.message;
+    if (!isTrusted()) return;
+    const m = (event && event.message) || null;
     if (!m || m.role !== "custom" || m.customType !== MESSAGE_TYPE) return;
-    const deliveryId = String(m.details.deliveryId ?? "");
+    const details = m.details || {};
+    const deliveryId = String(details.deliveryId ?? "");
     if (!deliveryId) return;
+    const entries = entriesOf(ctx);
+    const offer = findEntry(entries, OFFER_TYPE, deliveryId);
+    if (!offer) return;
+    const offeredText = String((offer.data && offer.data.text) ?? "");
+    const messageText = typeof m.content === "string" ? m.content : "";
+    if (offeredText && messageText && offeredText !== messageText) return;
+    if (appliedReceipt(entries, deliveryId)) return;
     pi.appendEntry(APPLIED_TYPE, { delivery: deliveryId, kind: "applied" });
   });
 }

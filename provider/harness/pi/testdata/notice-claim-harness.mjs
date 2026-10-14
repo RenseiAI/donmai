@@ -99,6 +99,118 @@ const stubPi = {
 const mod = await import(dataURL);
 await mod.default(stubPi);
 
+const mode = process.env.DONMAI_NOTICE_CLAIM_HARNESS_MODE ?? "claim";
+
+if (mode === "message-end") {
+  // Raw event probe: fire the captured message_end handler for a
+  // caller-supplied custom message — a peer's own donmai-notice emission,
+  // a redelivery of an existing one, or an event with a mangled shape —
+  // and report what the receipt half did. Argv: <extensionPath>
+  // <entriesJSON> <messageJSON>. No claim is issued.
+  const endHandler = handlers["message_end"];
+  let injected = null;
+  try {
+    injected = JSON.parse(claimArgs ?? "null");
+  } catch {
+    injected = null;
+  }
+  const ctx = {
+    ui: {
+      notify(msg, kind) {
+        notified.push({ msg: String(msg), kind: String(kind ?? "") });
+      },
+    },
+    sessionManager: {
+      getEntries() {
+        return entries;
+      },
+    },
+  };
+  if (endHandler && injected) {
+    // Null-prototype message objects model a peer passing an exotic shape
+    // through the shared event surface; the handler must still not throw.
+    const event = { message: injected };
+    await endHandler(event, ctx);
+    // Second fire models pi redelivering the same persistence event
+    // (crash between application and marker, transport replay): the
+    // receipt stream must stay exactly-one per delivery.
+    await endHandler(event, ctx);
+  }
+  console.log(JSON.stringify({ registered: true, appended, sent, notified }));
+  process.exit(0);
+}
+
+if (mode === "trust-transition") {
+  // Trust-transition probe: issue the SAME claim twice in one process,
+  // flipping the verdict between them. The verdict is read per event,
+  // never cached at activation — so the transition, in either direction,
+  // must take effect on the second claim.
+  const claim = handlers["command:donmai-claim"];
+  if (!claim) {
+    console.log(JSON.stringify({ registered: false }));
+    process.exit(0);
+  }
+  const ctx = {
+    ui: {
+      notify(msg, kind) {
+        notified.push({ msg: String(msg), kind: String(kind ?? "") });
+      },
+    },
+    sessionManager: {
+      getEntries() {
+        return entries;
+      },
+    },
+  };
+  const flipTo = process.env.DONMAI_NOTICE_CLAIM_HARNESS_FLIP ?? "0";
+  await claim(claimArgs ?? "", ctx);
+  const endHandler = handlers["message_end"];
+  if (endHandler) {
+    for (const s of sent) {
+      const m = s.message;
+      if (m && m.customType === "donmai-notice") {
+        await endHandler(
+          { message: { role: "custom", customType: "donmai-notice", details: m.details } },
+          ctx,
+        );
+      }
+    }
+  }
+  // Flip the verdict mid-process: a peer mutating shared-process env, or
+  // a session whose activation predates the stamp, must not keep stale
+  // authority — and a late stamp must enable a previously refused channel.
+  if (flipTo === "1") {
+    process.env.DONMAI_NOTICE_CLAIM_TRUST = "1";
+  } else {
+    delete process.env.DONMAI_NOTICE_CLAIM_TRUST;
+  }
+  const appendedBefore = appended.length;
+  const sentBefore = sent.length;
+  await claim(claimArgs ?? "", ctx);
+  if (endHandler) {
+    for (const s of sent.slice(sentBefore)) {
+      const m = s.message;
+      if (m && m.customType === "donmai-notice") {
+        await endHandler(
+          { message: { role: "custom", customType: "donmai-notice", details: m.details } },
+          ctx,
+        );
+      }
+    }
+  }
+  console.log(
+    JSON.stringify({
+      registered: true,
+      appended,
+      sent,
+      notified,
+      appendedBefore,
+      sentBefore,
+    }),
+  );
+  process.exit(0);
+}
+
 const claim = handlers["command:donmai-claim"];
 if (!claim) {
   console.log(JSON.stringify({ registered: false }));
@@ -120,6 +232,9 @@ await claim(claimArgs ?? "", ctx);
 
 // Fire the captured message_end handler for every applied custom message
 // the claim sent, modelling pi persisting the message and reporting it.
+// The message is forwarded WITH its content: the receipt half binds the
+// persisted text against the offer, so the fixture must carry it through
+// exactly as the runtime would.
 const endHandler = handlers["message_end"];
 const appliedMarkers = [];
 if (endHandler) {
@@ -128,7 +243,7 @@ if (endHandler) {
     if (m && m.customType === "donmai-notice") {
       const before = appended.length;
       await endHandler(
-        { message: { role: "custom", customType: "donmai-notice", details: m.details } },
+        { message: { role: "custom", customType: "donmai-notice", content: m.content, details: m.details } },
         ctx,
       );
       appliedMarkers.push(appended.slice(before));

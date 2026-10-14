@@ -738,6 +738,47 @@ func TestSpawn_Interactive_StopTerminatesChildOrphanFree(t *testing.T) {
 	}
 }
 
+// TestSpawn_Interactive_ManifestDeclaresRPCSteerOnlyForHeadlessLane pins
+// the manifest/declaration seam against silent drift: the harness manifest
+// declares rpc-steer for the headless `--mode rpc` lane (a live Inject
+// rail exists on the headless handle), while the interactive spawn mode
+// drives NO inject rail — its handle refuses and exposes no receipt
+// channel, and the runner dead-letters instead of acking. If the manifest
+// ever stops declaring rpc-steer, or the headless lane loses its rail, or
+// the interactive lane gains a channel, this test names the exact half
+// that moved.
+//
+// RED proof: change the manifest's NoticeDelivery to `none` and the
+// headless-declaration assertion fails; assert the interactive handle
+// satisfies NoticeChannelCapable and the interactive assertion fails.
+func TestSpawn_Interactive_ManifestDeclaresRPCSteerOnlyForHeadlessLane(t *testing.T) {
+	t.Parallel()
+	m := (&Provider{}).Manifest()
+	if m.Caps.NoticeDelivery != agent.NoticeDeliveryRPCSteer {
+		t.Fatalf("manifest NoticeDelivery = %q, want rpc-steer for the headless lane; "+
+			"if the headless lane lost its rail, update the manifest and the headless Inject path together", m.Caps.NoticeDelivery)
+	}
+	// The interactive spawn mode drives no inject rail: its handle refuses
+	// with the typed unavailable-receipt error and exposes no receipt
+	// channel — the seam the runner's channel-not-driven dead letter
+	// reports truthfully.
+	p := newFakeInteractivePiProvider(t, "sleep 60\n")
+	h, err := p.Spawn(t.Context(), agent.Spec{
+		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	if err := h.Inject(t.Context(), "undeclared-channel probe"); !errors.Is(err, agent.ErrUnsupported) {
+		t.Fatalf("interactive Inject = %v, want the ErrUnsupported refusal: "+
+			"this spawn mode drives no inject rail", err)
+	}
+	if _, ok := h.(agent.NoticeChannelCapable); ok {
+		t.Fatal("interactive handle exposes a notice channel: this spawn mode drives none")
+	}
+}
+
 // TestSpawn_Interactive_RealBinary_NoUIArtifact is the real-`pi` evidence that
 // the embedded extension renders NO handshake UI artifact in TUI mode and that
 // bare `pi` actually accepts the interactive argv this package builds. It is

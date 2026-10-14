@@ -72,11 +72,18 @@ like the boundary). It exposes `/donmai-claim <deliveryId> <text>`:
 * The command runs only when the spawn stamped the trust verdict
   (`DONMAI_NOTICE_CLAIM_TRUST=1`), which the spawn sets only after the
   compiled embedder's trusted set names the exact embedded digest AND no
-  caller delivery shadows the claim ID. The verdict rides the spawn's
-  complete environment, and any caller-carried copy is dropped by the
-  harness-owned env prefix — so an arbitrary peer extension cannot mint,
-  replay, or forge the receipt, and no proof is ever read out of a
-  transcript or mailbox file (condition 3).
+  caller delivery shadows the claim ID — re-checked per event, never
+  cached. The verdict rides the spawn's complete environment, and any
+  caller-carried copy is dropped by the harness-owned env prefix. The
+  `message_end` handler mints the receipt only with the verdict AND a
+  matching persisted offer for that delivery (same ID, same text), and
+  replays — never duplicates — when one already exists. So an arbitrary
+  peer extension cannot mint the receipt without the offer, replay it
+  past one per delivery, or forge it in an untrusted session (condition
+  3); no proof is ever read out of a transcript or mailbox file. Exact
+  authorship binding (which copy of the command acted) still awaits a pi
+  upstream primitive — the fence proves the receipt never precedes the
+  offer and never exceeds one per delivery, not per-action identity.
 * Direct `Handle.Inject` still refuses (`ErrInteractiveReceiptUnavailable`)
   and the runtime-inject rail still dead-letters `channel-not-driven`:
   the receipt path is claimed through the session's own channel, never
