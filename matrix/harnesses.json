@@ -110,11 +110,11 @@
           "productionEligible": false
         },
         {
-          "id": "claude-code/interactive/tool-lifecycle-v1",
+          "id": "claude-code/interactive/tool-lifecycle-v2",
           "mode": "human_controlled",
           "toolPluginDelivery": "unsupported",
           "mcpDelivery": "claude_cli_mcp_config",
-          "nativeToolPolicyDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "claude_cli_allow_deny",
           "permissionConfigDelivery": "unsupported",
           "mcpToolPolicyDelivery": "unsupported",
           "toolHookDelivery": "unsupported",
@@ -147,7 +147,7 @@
         },
         {
           "mode": "human_controlled",
-          "toolDenyBaseline": "unavailable",
+          "toolDenyBaseline": "best_effort",
           "networkDenyBaseline": "unavailable"
         }
       ]

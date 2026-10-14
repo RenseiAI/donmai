@@ -120,9 +120,24 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 			},
 			{
-				ID: "claude-code/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+				// The interactive lane delivers the stamped allow/deny lists
+				// through the CLI's own flags (interactiveArgsWith), proven on
+				// the live binary: the REPL's permission panel renders a
+				// stamped allow entry under Allow and a stamped deny entry
+				// under Deny. The same claude_cli_allow_deny value the
+				// headless profile declares names that identical mechanism —
+				// no second delivery kind, because there is no second
+				// mechanism. Bumped tool-lifecycle-v1 -> v2 per the
+				// adapter-version rule: the declared surface moved, so a
+				// receipt pinned to v1 denies rather than silently acquiring
+				// the new claim. MCPToolPolicyDelivery stays Unsupported:
+				// MCPToolNames are not merged into the interactive
+				// --allowedTools flag, and PermissionConfigDelivery stays
+				// Unsupported: the CLI exposes no permission-config grammar
+				// on either lane.
+				ID: "claude-code/interactive/tool-lifecycle-v2", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryClaudeMCPConfig,
-				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				NativeToolPolicyDelivery: agent.ToolDeliveryClaudeCLIAllowDeny, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
 				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
