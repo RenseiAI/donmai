@@ -433,7 +433,7 @@
         "tools": true,
         "mcp": true,
         "allowedToolsList": false,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -618,7 +618,7 @@
         "tools": false,
         "mcp": true,
         "allowedToolsList": true,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -948,7 +948,7 @@
         "tools": true,
         "mcp": true,
         "allowedToolsList": true,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -1416,7 +1416,8 @@
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -1436,7 +1437,8 @@
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -1455,7 +1457,8 @@
       "structuredVia": "spawn-collect",
       "legacyProviderId": "claude",
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -1475,7 +1478,8 @@
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "codex",
@@ -1495,7 +1499,8 @@
       "structuredVia": "output-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "codex",
@@ -1515,7 +1520,8 @@
       "structuredVia": "output-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "codex",
@@ -1534,7 +1540,8 @@
       "structuredVia": "output-schema",
       "legacyProviderId": "codex",
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "gemini-direct",
@@ -1554,7 +1561,8 @@
       "structuredVia": "response-schema",
       "legacyProviderId": "gemini",
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "gemini-direct",
@@ -1574,7 +1582,8 @@
       "structuredVia": "response-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "ollama",
@@ -1593,7 +1602,8 @@
       "structuredVia": "format-json",
       "legacyProviderId": "ollama",
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -1612,7 +1622,8 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -1636,7 +1647,8 @@
         "TestOpenCodeHarnessSmoke_RealBinary_Teardown"
       ],
       "stability": "beta",
-      "smoked": true
+      "smoked": true,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -1656,7 +1668,8 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "pi",
@@ -1676,7 +1689,8 @@
       "structuredVia": "spawn-collect",
       "legacyProviderId": "pi",
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "pi",
@@ -1696,7 +1710,8 @@
       "structuredVia": "spawn-collect",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "stub",
@@ -1718,7 +1733,8 @@
         "TestSiblingContextReposSmoke"
       ],
       "stability": "stable",
-      "smoked": true
+      "smoked": true,
+      "emitsSubagentEvents": false
     }
   ],
   "denylist": [],
@@ -1885,6 +1901,48 @@
       "adapterVersion": "stub/tool-lifecycle-v1",
       "mode": "autonomous",
       "resumeQualified": false
+    }
+  ],
+  "subagentQualification": [
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "bedrock"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "direct"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "oauth-cli"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "vertex"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
     }
   ]
 }

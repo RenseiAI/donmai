@@ -3,7 +3,8 @@
 // which legacy ProviderName each maps to, and the generated artifacts that
 // downstream embedders consume. The matrix is grounded in the live
 // provider/endpoint Manifest() declarations (harvested by the generator), not
-// a re-typed copy — keeping the manifests the single SoT.
+// a re-typed copy. Subagent-event bits are derived from adapter fixtures,
+// never copied from manifest claims.
 //
 // This file holds the ONLY hand-authored capability data (per 03 §1):
 //   - the harvest lists (which providers/endpoints to call Manifest() on),
@@ -66,8 +67,10 @@ type CapsOverride struct {
 	SupportsToolPlugins      *bool `json:"tools,omitempty"`
 	AcceptsMcpServerSpec     *bool `json:"mcp,omitempty"`
 	AcceptsAllowedToolsList  *bool `json:"allowedToolsList,omitempty"`
-	EmitsSubagentEvents      *bool `json:"subagents,omitempty"`
-	SupportsReasoningEffort  *bool `json:"reasoningEffort,omitempty"`
+	// EmitsSubagentEvents is retained for decoding older artifacts. Authored
+	// overrides are rejected: subagent evidence is computed by the generator.
+	EmitsSubagentEvents     *bool `json:"subagents,omitempty"`
+	SupportsReasoningEffort *bool `json:"reasoningEffort,omitempty"`
 }
 
 // HarnessEndpointCell is one hand-authored valid cell — a (harness × endpoint
@@ -110,6 +113,10 @@ type HarnessEndpointCell struct {
 	// Smoked is true only when every proving lane passed in the last gate.
 	// DERIVED by the generator; a cell with no proving lane reads false.
 	Smoked bool `json:"smoked"`
+	// EmitsSubagentEvents is computed from executed fixtures, never authored.
+	// SubagentQualification identifies the adapter version and loaded delivery
+	// behind a true value; missing evidence leaves the cell false.
+	EmitsSubagentEvents bool `json:"emitsSubagentEvents"`
 }
 
 // Key returns the cell's (harness, endpoint, host) identity.
