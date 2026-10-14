@@ -3,8 +3,10 @@ package runner
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,12 +27,13 @@ type recordingDepsExecer struct {
 type depsCall struct {
 	dir     string
 	command string
+	env     map[string]string
 }
 
-func (f *recordingDepsExecer) Exec(_ context.Context, dir, command string, _ map[string]string) (int, error) {
+func (f *recordingDepsExecer) Exec(_ context.Context, dir, command string, env map[string]string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, depsCall{dir: dir, command: command})
+	f.calls = append(f.calls, depsCall{dir: dir, command: command, env: env})
 	return f.exitCode, f.err
 }
 
@@ -47,6 +50,23 @@ func depsTestRunner(t *testing.T, execer DepsExecer) *Runner {
 	return h.runner
 }
 
+// depsTestLevels stamps the levels the Run-level tests carry so the
+// install gate exercises its stamp-reading path end to end: network
+// open and fileWrite host are the unstamped-equivalent open surface the
+// stub harness renders, so the run passes the pre-spawn refusal and the
+// install still runs. The gate's skip halves (a withheld fileWrite,
+// network none) are covered by the unit tests below, which call the
+// step directly without a harness.
+func depsTestLevels() *agent.ExecutionSecurity {
+	return &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
+}
+
+func depsTestQueuedWork(identifier string) QueuedWork {
+	qw := QueuedWork{QueuedWork: queuedWorkBase(identifier)}
+	qw.ExecutionSecurity = depsTestLevels()
+	return qw
+}
+
 func TestInstallSessionDependencies_PnpmBeforeGo(t *testing.T) {
 	t.Parallel()
 	execer := &recordingDepsExecer{}
@@ -56,7 +76,7 @@ func TestInstallSessionDependencies_PnpmBeforeGo(t *testing.T) {
 	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-ORDER")}, wpath, false)
+	r.installSessionDependencies(context.Background(), depsTestQueuedWork("DEPS-ORDER"), wpath, false)
 
 	calls := execer.recorded()
 	if len(calls) != 2 {
@@ -84,7 +104,7 @@ func TestInstallSessionDependencies_SkipsPnpmWhenNodeModulesPresent(t *testing.T
 	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
 	writeFile(t, wpath, filepath.Join("node_modules", ".bin", "keep"), "")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-SKIP")}, wpath, false)
+	r.installSessionDependencies(context.Background(), depsTestQueuedWork("DEPS-SKIP"), wpath, false)
 
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none (kit hook already installed)", calls)
@@ -101,7 +121,7 @@ func TestInstallSessionDependencies_SkipsOnlyInstalledEcosystem(t *testing.T) {
 	writeFile(t, wpath, filepath.Join("node_modules", ".bin", "keep"), "")
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-PARTIAL")}, wpath, false)
+	r.installSessionDependencies(context.Background(), depsTestQueuedWork("DEPS-PARTIAL"), wpath, false)
 
 	calls := execer.recorded()
 	if len(calls) != 1 {
@@ -120,7 +140,7 @@ func TestInstallSessionDependencies_NoManifestsRunsNothing(t *testing.T) {
 	wpath := t.TempDir()
 	writeFile(t, wpath, "README.md", "# no manifests here\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-NONE")}, wpath, false)
+	r.installSessionDependencies(context.Background(), depsTestQueuedWork("DEPS-NONE"), wpath, false)
 
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none", calls)
@@ -136,7 +156,7 @@ func TestInstallSessionDependencies_ReadOnlyCheckoutSkips(t *testing.T) {
 	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-RO")}, wpath, true)
+	r.installSessionDependencies(context.Background(), depsTestQueuedWork("DEPS-RO"), wpath, true)
 
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none on a read-only checkout", calls)
@@ -154,7 +174,7 @@ func TestInstallSessionDependencies_FailureContinuesToNextEcosystem(t *testing.T
 
 	// Must not panic, abort, or return an error: a failed install is
 	// logged and the run continues with whatever is on disk.
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-FAIL")}, wpath, false)
+	r.installSessionDependencies(context.Background(), depsTestQueuedWork("DEPS-FAIL"), wpath, false)
 
 	calls := execer.recorded()
 	if len(calls) != 2 {
@@ -170,10 +190,145 @@ func TestInstallSessionDependencies_ExecErrorContinues(t *testing.T) {
 	wpath := t.TempDir()
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-ERR")}, wpath, false)
+	r.installSessionDependencies(context.Background(), depsTestQueuedWork("DEPS-ERR"), wpath, false)
 
 	if calls := execer.recorded(); len(calls) != 1 {
 		t.Fatalf("install calls = %d; want 1", len(calls))
+	}
+}
+
+// TestInstallSessionDependencies_SkipsWhenNetworkNone pins the level
+// gate's network half: a stamp that withholds the network skips the
+// install without invoking the execer, even with both manifests on
+// disk. Reverting the gate to run unconditionally turns this red (2
+// calls instead of 0).
+func TestInstallSessionDependencies_SkipsWhenNetworkNone(t *testing.T) {
+	t.Parallel()
+	execer := &recordingDepsExecer{}
+	r := depsTestRunner(t, execer)
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	qw := depsTestQueuedWork("DEPS-NET-NONE")
+	qw.ExecutionSecurity.Levels.Network = agent.NetworkNone
+	r.installSessionDependencies(context.Background(), qw, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none (network none withholds the fetch)", calls)
+	}
+}
+
+// TestInstallSessionDependencies_SkipsWhenFileWriteUnknown pins the
+// level gate's closed shape: a level off the ladder refuses the step
+// instead of running it on a guess. Reverting the gate to permit
+// unknown levels turns this red.
+func TestInstallSessionDependencies_SkipsWhenFileWriteUnknown(t *testing.T) {
+	t.Parallel()
+	execer := &recordingDepsExecer{}
+	r := depsTestRunner(t, execer)
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	qw := depsTestQueuedWork("DEPS-BAD-LEVEL")
+	qw.ExecutionSecurity.Levels.FileWrite = agent.ExecutionSecurityLevel("everywhere")
+	r.installSessionDependencies(context.Background(), qw, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none (unknown level refuses the step)", calls)
+	}
+}
+
+// TestInstallSessionDependencies_PnpmDisablesScripts pins the script
+// hardening: the pnpm step carries --ignore-scripts and
+// --ignore-pnpmfile so repository lifecycle hooks and hooks files never
+// execute during the fetch. Removing either flag turns this red.
+func TestInstallSessionDependencies_PnpmDisablesScripts(t *testing.T) {
+	t.Parallel()
+	for _, flag := range []string{"--ignore-scripts", "--ignore-pnpmfile"} {
+		if !strings.Contains(pnpmDepsInstallCommand, flag) {
+			t.Errorf("pnpm install command = %q; want flag %q", pnpmDepsInstallCommand, flag)
+		}
+		found := false
+		for _, arg := range pnpmDepsInstallArgv {
+			if arg == flag {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("pnpm install argv = %q; want flag %q", pnpmDepsInstallArgv, flag)
+		}
+	}
+}
+
+// TestInstallSessionDependencies_MinimalEnvDropsCredentials pins the
+// minimal-env boundary: the install env carries PATH/HOME and the
+// caches but never the worker bearer, session identifiers, or provider
+// credentials, even when the session env is saturated with them.
+// Widening the allow list to pass a credential through turns this red.
+func TestInstallSessionDependencies_MinimalEnvDropsCredentials(t *testing.T) {
+	t.Parallel()
+	seatCaps := map[string]string{
+		"PATH":                "/tool/bin:/usr/bin:/bin",
+		"WORKER_AUTH_TOKEN":   "worker-bearer",
+		"GOMAXPROCS":          "4",
+		"DONMAI_SESSION_ID":   "session-123",
+		"ANTHROPIC_API_KEY":   "provider-key",
+		"OPENAI_API_KEY":      "provider-key-2",
+		"HTTP_PROXY":          "http://proxy.internal:8080",
+		"NPM_CONFIG_REGISTRY": "https://mirror.internal/",
+	}
+	host := map[string]string{"PATH": "/usr/bin:/bin", "HOME": "/home/daemon"}
+	env := depsInstallEnv("/home/daemon", seatCaps, host, nil)
+	for _, leaked := range []string{
+		"WORKER_AUTH_TOKEN", "DONMAI_SESSION_ID", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+		"HTTP_PROXY", "NPM_CONFIG_REGISTRY",
+	} {
+		if value, ok := env[leaked]; ok {
+			t.Errorf("install env carries %s=%q; want it dropped", leaked, value)
+		}
+	}
+	if env["PATH"] != "/tool/bin:/usr/bin:/bin" {
+		t.Errorf("install PATH = %q; want the seat PATH", env["PATH"])
+	}
+	if env["HOME"] != "/home/daemon" {
+		t.Errorf("install HOME = %q; want the daemon home", env["HOME"])
+	}
+	if env["GOMAXPROCS"] != "4" {
+		t.Errorf("install GOMAXPROCS = %q; want the seat share", env["GOMAXPROCS"])
+	}
+}
+
+// TestInstallSessionDependencies_FakeSeesMinimalEnv pins the boundary
+// at the execer seam: the env map the step hands the execer carries no
+// credential, so a fake asserting on it proves the wiring, not just
+// the helper.
+func TestInstallSessionDependencies_FakeSeesMinimalEnv(t *testing.T) {
+	t.Parallel()
+	execer := &recordingDepsExecer{}
+	r := depsTestRunner(t, execer)
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	qw := depsTestQueuedWork("DEPS-ENV-SEAM")
+	qw.AuthToken = "worker-bearer-should-not-propagate"
+	r.installSessionDependencies(context.Background(), qw, wpath, false)
+
+	calls := execer.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("install calls = %d; want 1", len(calls))
+	}
+	for _, leaked := range []string{"WORKER_AUTH_TOKEN", "DONMAI_SESSION_ID", "ANTHROPIC_API_KEY"} {
+		if value, ok := calls[0].env[leaked]; ok {
+			t.Errorf("execer env carries %s=%q; want it dropped", leaked, value)
+		}
+	}
+	if calls[0].command != goDepsInstallCommand {
+		t.Errorf("call command = %q; want %q", calls[0].command, goDepsInstallCommand)
 	}
 }
 
@@ -241,6 +396,7 @@ func TestRun_InstallsDependenciesBeforeSpawn(t *testing.T) {
 	}
 
 	qw := h.queuedWork("DEPS-BEFORE-SPAWN")
+	qw.ExecutionSecurity = depsTestLevels()
 	seedManifestsInBareRepo(t, h.bareRepo)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -279,6 +435,7 @@ func TestRun_DependencyInstallFailureStillSpawns(t *testing.T) {
 	h.runner.depsExecer = &recordingDepsExecer{exitCode: 1}
 
 	qw := h.queuedWork("DEPS-FAIL-SPAWNS")
+	qw.ExecutionSecurity = depsTestLevels()
 	seedManifestsInBareRepo(t, h.bareRepo)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -289,6 +446,142 @@ func TestRun_DependencyInstallFailureStillSpawns(t *testing.T) {
 	}
 	if res.Status != "completed" {
 		t.Errorf("Status = %q; want completed (install failure must not fail the session)", res.Status)
+	}
+}
+
+// TestDepsInstallExecerRunsNoShell pins the direct-exec shape: the
+// production execer resolves the binary on the call env's PATH and
+// passes the remaining words as argv, never through a shell — so a
+// repository file can only feed arguments, never a command of its
+// own. The fake pnpm records the argv it received; --ignore-scripts
+// and --ignore-pnpmfile ride along so repository lifecycle hooks stay
+// disabled even where the binary would otherwise run them.
+func TestDepsInstallExecerRunsNoShell(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fakes := t.TempDir()
+	report := filepath.Join(t.TempDir(), "argv")
+	fakePnpm := "#!/bin/sh\nprintf '%s' \"$*\" > \"$REPORT_PATH\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakes, "pnpm"), []byte(fakePnpm), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
+		t.Fatal(err)
+	}
+
+	execer := depsInstallExecer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	code, err := execer.Exec(ctx, dir, pnpmDepsInstallCommand, map[string]string{
+		"PATH": fakes + ":/usr/bin:/bin", "HOME": t.TempDir(), "REPORT_PATH": report,
+	})
+	if err != nil || code != 0 {
+		t.Fatalf("Exec = (%d, %v); want (0, nil)", code, err)
+	}
+	raw, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("fake pnpm never ran (no argv record): %v", err)
+	}
+	want := "install --prefer-offline --frozen-lockfile --ignore-scripts --ignore-pnpmfile"
+	if strings.TrimSpace(string(raw)) != want {
+		t.Errorf("pnpm argv = %q; want %q (no shell, scripts disabled)", raw, want)
+	}
+}
+
+// TestDepsInstallExecerCapturesOutputOnFailure pins the bounded-output
+// contract: a failing install's combined output tail reaches the log
+// so a failure is diagnosable without failing the session. The fake
+// exits non-zero after printing a marker; reverting the capture to
+// discard the output leaves the log without it and turns this red.
+func TestDepsInstallExecerCapturesOutputOnFailure(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fakes := t.TempDir()
+	fakeGo := "#!/bin/sh\necho 'marker-fetch-failed-timeline'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(fakes, "go"), []byte(fakeGo), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
+		t.Fatal(err)
+	}
+
+	rec := &sliceWarnLogger{}
+	execer := depsInstallExecer{logger: rec}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	code, err := execer.Exec(ctx, dir, goDepsInstallCommand, map[string]string{
+		"PATH": fakes + ":/usr/bin:/bin", "HOME": t.TempDir(),
+	})
+	if err != nil || code != 1 {
+		t.Fatalf("Exec = (%d, %v); want (1, nil)", code, err)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, line := range rec.lines {
+		if strings.Contains(line, "marker-fetch-failed-timeline") {
+			return
+		}
+	}
+	t.Errorf("failure log = %q; want the install output tail", rec.lines)
+}
+
+// sliceWarnLogger is a depsInstallExecer logger fake that records Warn lines.
+type sliceWarnLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *sliceWarnLogger) Warn(_ string, args ...any) {
+	joined := make([]string, 0, len(args))
+	for _, arg := range args {
+		joined = append(joined, sprintWarnArg(arg))
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, strings.Join(joined, " "))
+}
+
+func sprintWarnArg(v any) string {
+	switch typed := v.(type) {
+	case string:
+		return typed
+	case error:
+		return typed.Error()
+	case interface{ String() string }:
+		return typed.String()
+	default:
+		return ""
+	}
+}
+
+// TestDepsInstallExecerDecodesOnlyKnownSteps pins the closed argv
+// decode: only the two runner-owned steps execute; anything else —
+// including a shell metacharacter smuggled into the command string —
+// is refused before any process starts. Reverting to a shell split
+// (strings.Fields) lets `go mod download; touch PWNED` resolve to a
+// `go` binary and turns the second half of this red.
+func TestDepsInstallExecerDecodesOnlyKnownSteps(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	execer := depsInstallExecer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// PATH carries only the test fakes plus the shell: even a
+	// shell-split decode can only resolve what is on PATH, so the
+	// fake `go` (which records its argv) proves exactly what would
+	// have executed.
+	fakes := t.TempDir()
+	argvRecord := filepath.Join(t.TempDir(), "decode-argv")
+	fakeGo := "#!/bin/sh\nprintf '%s' \"$*\" > \"$DECODE_ARGV\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakes, "go"), []byte(fakeGo), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
+		t.Fatal(err)
+	}
+	callEnv := map[string]string{"PATH": fakes + ":/usr/bin:/bin", "HOME": t.TempDir(), "DECODE_ARGV": argvRecord}
+	if _, err := execer.Exec(ctx, dir, "go mod download; touch PWNED", callEnv); err == nil {
+		t.Errorf("injected command ran without an error; want a decode refusal")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "PWNED")); statErr == nil {
+		t.Errorf("injected side effect executed; the decode must refuse before starting anything")
+	}
+	if raw, readErr := os.ReadFile(argvRecord); readErr == nil {
+		t.Errorf("fake go ran with argv %q; the decode must refuse before starting anything", raw)
+	}
+	if _, err := execer.Exec(ctx, dir, "pnpm install --prefer-offline", callEnv); err == nil {
+		t.Errorf("prefix-shortened pnpm command ran without an error; want a decode refusal")
 	}
 }
 
