@@ -18,14 +18,6 @@ func confinedSecurityStamp() *agent.ExecutionSecurity {
 	return &agent.ExecutionSecurity{Version: agent.ExecutionSecurityWireVersion, Levels: levels}
 }
 
-func securityMaterializations(digest string) []agent.HarnessMaterialization {
-	var entries []agent.HarnessMaterialization
-	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
-		entries = append(entries, agent.HarnessMaterialization{Channel: channel, SourceDigest: digest, Required: true})
-	}
-	return entries
-}
-
 func TestExecutionSecurityUnattestedPiRefusesBeforeSpawn(t *testing.T) {
 	old := piConfinementBackend
 	piConfinementBackend = func() confinement.Backend { return nil }

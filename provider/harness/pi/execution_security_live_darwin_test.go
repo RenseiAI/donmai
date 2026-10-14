@@ -12,6 +12,14 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
+func securityMaterializations(digest string) []agent.HarnessMaterialization {
+	var entries []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		entries = append(entries, agent.HarnessMaterialization{Channel: channel, SourceDigest: digest, Required: true})
+	}
+	return entries
+}
+
 func TestExecutionSecurityConfinedPiReportsAndRefusesOutsideWrites(t *testing.T) {
 	for _, prepared := range []bool{false, true} {
 		for _, mode := range []string{"spawn", "resume", "interactive"} {
