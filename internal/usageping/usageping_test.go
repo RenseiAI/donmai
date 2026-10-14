@@ -35,10 +35,10 @@ func TestValidateInstallationID_Table(t *testing.T) {
 	}{
 		{"", false},
 		{"abc", false},
-		{"0123456789abcdef0123456789ABCDEF", false}, // uppercase rejected
-		{"0123456789abcdef0123456789abcde", false},  // 31 chars
+		{"0123456789abcdef0123456789ABCDEF", false},  // uppercase rejected
+		{"0123456789abcdef0123456789abcde", false},   // 31 chars
 		{"0123456789abcdef0123456789abcdef0", false}, // 33 chars
-		{"0123456789abcdef0123456789abcdeg", false}, // non-hex
+		{"0123456789abcdef0123456789abcdeg", false},  // non-hex
 		{"0123456789abcdef0123456789abcdef", true},
 	}
 	for _, tc := range cases {
@@ -55,11 +55,11 @@ func TestBuild_DisabledSendsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, consent := range []Consent{
-		{},                                        // everything off
-		{Enabled: false, InstallationID: id},      // explicitly off
-		{Enabled: true},                           // on but no id
-		{Enabled: true, InstallationID: "bogus"},  // on but bad id
-		{Enabled: true, InstallationID: id},       // on, id, but no endpoint
+		{},                                       // everything off
+		{Enabled: false, InstallationID: id},     // explicitly off
+		{Enabled: true},                          // on but no id
+		{Enabled: true, InstallationID: "bogus"}, // on but bad id
+		{Enabled: true, InstallationID: id},      // on, id, but no endpoint
 	} {
 		if got := Build(consent, "v0.1.0"); got != nil {
 			t.Fatalf("Build(%+v) = %+v, want nil (no request)", consent, got)
