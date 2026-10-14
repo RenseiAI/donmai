@@ -175,10 +175,16 @@ func (w linuxLiveWorld) spec() agent.Spec {
 }
 
 // writeLinuxLiveHarness writes the fake harness and its per-test inputs
-// into a fresh directory outside the set and returns the harness path.
+// into the session tmp — inside the writable set, where the boundary
+// grants full access — and returns the harness path. A script outside the
+// set would need its interpreter resolved through Landlock grants the
+// boundary never gives; inside, the seat reads and executes its own tree.
 func writeLinuxLiveHarness(t *testing.T, w linuxLiveWorld) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := filepath.Join(w.mut, ".pi-probe-"+sanitizeStateKey(t.Name()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	bin := filepath.Join(dir, "fake-pi")
 	if err := os.WriteFile(bin, []byte(fakeLinuxHarnessScript), 0o755); err != nil { //nolint:gosec // G306: test fixture needs the exec bit.
 		t.Fatal(err)
@@ -370,9 +376,18 @@ func assertLinuxNoLeakedDescriptors(t *testing.T, w linuxLiveWorld) {
 			continue
 		}
 		name := fields[len(fields)-1]
-		if _, perr := strconv.Atoi(strings.TrimSpace(name)); perr != nil && !strings.HasPrefix(name, "/dev/fd") && !strings.HasPrefix(name, w.mut+"/") {
-			t.Errorf("confined child holds descriptor open on %q (full list %q): only stdio may be inherited", name, list)
+		// A bare number is a standard stream or a pipe the listing
+		// itself holds; /dev/fd and /proc/<pid>/fd are the descriptor
+		// directory the listing reads (on Linux ls shows its target,
+		// /proc/self/fd); anything under the mutable leaf is the
+		// listing's own output redirect.
+		if _, perr := strconv.Atoi(strings.TrimSpace(name)); perr == nil ||
+			strings.HasPrefix(name, "/dev/fd") ||
+		(strings.HasPrefix(name, "/proc/") && strings.HasSuffix(name, "/fd")) ||
+			strings.HasPrefix(name, w.mut+"/") {
+			continue
 		}
+		t.Errorf("confined child holds descriptor open on %q (full list %q): only stdio may be inherited", name, list)
 	}
 }
 
