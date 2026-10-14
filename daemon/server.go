@@ -454,6 +454,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		AppliedProjectIDs:    appliedIDs,
 		ProjectAdmissionMode: cfg.EffectiveProjectAdmissionMode(),
 		RepoKeeper:           s.daemon.repoKeeperStats(),
+		DependencyKeeper:     s.daemon.dependencyKeeperStats(),
 	}
 	if withPool {
 		stats, err := s.poolStats(r.Context())
@@ -487,6 +488,17 @@ var repoKeeperSetKeys = map[string]struct{}{
 	"repoKeeper.authorizationWindowSeconds": {},
 }
 
+// dependencyKeeperSetKeys are the process-level dependency-keeper and
+// shared-retention keys accepted by POST /api/daemon/capacity. They
+// persist to daemon.yaml and need a drain-aware restart; the daemon
+// acknowledges but does not hot-reload them.
+var dependencyKeeperSetKeys = map[string]struct{}{
+	"dependencyKeeper.enabled":              {},
+	"dependencyKeeper.maxDiskGb":            {},
+	"dependencyKeeper.compactionWindowDays": {},
+	"retention.maxDiskGb":                   {},
+}
+
 // applyRepoKeeperSet persists one repoKeeper.* key to the in-memory config.
 // It reports false when no config is loaded. The running keeper never
 // re-reads these — they take effect on a drain-aware restart.
@@ -511,12 +523,50 @@ func (d *Daemon) applyRepoKeeperSet(key string, n int64) bool {
 	return true
 }
 
+// applyDependencyKeeperSet persists one dependencyKeeper.* or
+// retention.* key to the in-memory config. It reports false when no
+// config is loaded. The running keeper never re-reads these — they take
+// effect on a drain-aware restart.
+func (d *Daemon) applyDependencyKeeperSet(key string, n int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.config == nil {
+		return false
+	}
+	switch key {
+	case "dependencyKeeper.enabled":
+		d.config.DependencyKeeper.Enabled = n == 1
+	case "dependencyKeeper.maxDiskGb":
+		d.config.DependencyKeeper.MaxDiskGb = n
+	case "dependencyKeeper.compactionWindowDays":
+		d.config.DependencyKeeper.CompactionWindowDays = n
+	case "retention.maxDiskGb":
+		d.config.Retention.MaxDiskGb = n
+	default:
+		return false
+	}
+	return true
+}
+
 // repoKeeperStats returns the daemon's secret-free keeper snapshot for
 // daemon stats, or nil when the keeper is disabled. No scope values or
 // remote URLs ever appear here.
 func (d *Daemon) repoKeeperStats() *afclient.RepoKeeperStats {
 	d.mu.RLock()
 	keeper := d.repoKeeper
+	d.mu.RUnlock()
+	if keeper == nil {
+		return nil
+	}
+	return keeper.Stats()
+}
+
+// dependencyKeeperStats returns the daemon's secret-free dependency-keeper
+// snapshot for daemon stats, or nil when the keeper is disabled. No scope
+// values, URLs, or credentials ever appear here.
+func (d *Daemon) dependencyKeeperStats() *afclient.DependencyKeeperStats {
+	d.mu.RLock()
+	keeper := d.dependencyKeeper
 	d.mu.RUnlock()
 	if keeper == nil {
 		return nil
@@ -687,6 +737,24 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 	if err != nil || n < 0 {
 		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
 			OK: false, Key: body.Key, Value: body.Value, Message: "value must be non-negative integer",
+		})
+		return
+	}
+	if _, ok := dependencyKeeperSetKeys[body.Key]; ok {
+		if body.Key == "dependencyKeeper.enabled" && n > 1 {
+			writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+				OK: false, Key: body.Key, Value: body.Value, Message: "dependencyKeeper.enabled must be 0 or 1",
+			})
+			return
+		}
+		if !s.daemon.applyDependencyKeeperSet(body.Key, int64(n)) {
+			writeJSON(w, http.StatusInternalServerError, &afclient.SetCapacityResponse{
+				OK: false, Key: body.Key, Value: body.Value, Message: "daemon has no loaded config",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
+			OK: true, Key: body.Key, Value: body.Value, Message: "persisted; restart the daemon with drained work for it to take effect",
 		})
 		return
 	}

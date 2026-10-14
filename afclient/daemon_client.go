@@ -300,6 +300,10 @@ type DaemonStatsResponse struct {
 	// RepoKeeper is the secret-free repository-keeper snapshot (mirror count,
 	// last fetch, revoked count, bytes). Nil when the keeper is disabled.
 	RepoKeeper *RepoKeeperStats `json:"repoKeeper,omitempty"`
+	// DependencyKeeper is the secret-free dependency-keeper snapshot (hit
+	// and miss rates, miss reasons, time saved, bytes, budget pressure).
+	// Nil when the keeper is disabled.
+	DependencyKeeper *DependencyKeeperStats `json:"dependencyKeeper,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
 
