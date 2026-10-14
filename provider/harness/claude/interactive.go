@@ -9,6 +9,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	"github.com/google/uuid"
 )
 
 // spawnInteractive opens the claude CLI's OWN interactive REPL — bare
@@ -55,6 +56,13 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// against a declared-but-absent channel, so the producer learns), rather
 	// than killing a session over a latency optimisation.
 	hook, hookErr := newStopHookChannel()
+	// Pin a fresh Claude conversation identity before spawn, so its transcript
+	// can be found even if the process dies before invoking its first Stop hook.
+	sessionID := uuid.NewString()
+	if hookErr == nil {
+		hook.usageSessionID = sessionID
+		hook.usageConfigDir = interactiveUsageConfigDir(spec.Env)
+	}
 	settings := ""
 	if hookErr == nil {
 		// The routing pin rides this same --settings string (see
@@ -111,8 +119,8 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		return errors.Join(errs...)
 	}
 
-	h, err := ptycli.SpawnWithCleanup(ctx, p.binary,
-		interactiveArgsWith(spec, mcpPath, settings), spec, p.Manifest(), cleanup)
+	argv := append([]string{"--session-id", sessionID}, interactiveArgsWith(spec, mcpPath, settings)...)
+	h, err := ptycli.SpawnWithCleanup(ctx, p.binary, argv, spec, p.Manifest(), cleanup)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +142,7 @@ const (
 
 // wrapInteractiveHandle adds the Stop-hook pull channel and the transcript
 // usage tail to a spawned PTY handle. The usage tail reads the session's own
-// transcript — located through the hook's durable locator — and maps each new
+// transcript — located through the hook or pinned conversation id — and maps each new
 // assistant message.usage to an LlmCallEvent, so per-turn usage reaches the
 // runner's activity sink live; the terminal ResultEvent carries the deduped
 // session totals instead of the PTY's costless one.
@@ -207,9 +215,9 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 }
 
 // withTranscriptCost replaces a costless terminal ResultEvent with one
-// carrying the session's deduped transcript totals. A transcript that cannot
-// be read — the hook never fired, the file never materialized — leaves the
-// event untouched: no usage is reported, never a failure.
+// carrying the session's deduped transcript totals, or its saved statusline
+// token counts when no transcript usage is available. Unknown or untrusted
+// usage leaves the event untouched: no fabricated zero, never a failure.
 func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.Event {
 	if result.Cost != nil || hook == nil {
 		return result
