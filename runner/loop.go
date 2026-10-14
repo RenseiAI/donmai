@@ -2922,6 +2922,20 @@ func (r *Runner) consumeEventsWithin(
 			if !ok {
 				return obs, nil
 			}
+			// Capture native response evidence before correlation can synthesize
+			// aggregate calls, and before any budget or terminal early return.
+			if res != nil {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					if !e.Synthetic && e.UsageSource != agent.LlmUsageAggregate && e.ResponseModel != "" {
+						res.Model = e.ResponseModel
+					}
+				case agent.SystemEvent:
+					if e.Subtype == agent.SystemSubtypeModelIdentity && e.ObservedModel != nil && e.ObservedModel.Model != "" {
+						res.Model = e.ObservedModel.Model
+					}
+				}
+			}
 			// Forward progress observed — re-arm the idle watchdog, and
 			// the stall detector while its post-tool window is armed.
 			resetIdle()

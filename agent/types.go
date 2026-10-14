@@ -769,6 +769,10 @@ type Result struct {
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
 
+	// Model is the last model observed in native response metadata, independent
+	// of the requested model. Empty when the harness did not report one.
+	Model string `json:"model,omitempty"`
+
 	// FailureMode classifies why a non-completed session failed.
 	// Enum values are owned by runner/failure.go.
 	FailureMode string `json:"failureMode,omitempty"`
