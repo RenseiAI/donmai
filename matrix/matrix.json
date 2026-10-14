@@ -20,7 +20,7 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "beta",
+      "stability": "experimental",
       "smoked": false
     },
     {
@@ -40,7 +40,7 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "stable",
+      "stability": "experimental",
       "smoked": false
     },
     {
@@ -59,8 +59,8 @@
       "nativeJsonMode": false,
       "structuredVia": "spawn-collect",
       "legacyProviderId": "claude",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false
     },
     {
       "harness": "claude-code",
@@ -79,7 +79,7 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "beta",
+      "stability": "experimental",
       "smoked": false
     },
     {
@@ -99,7 +99,7 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": null,
-      "stability": "beta",
+      "stability": "experimental",
       "smoked": false
     },
     {
@@ -119,7 +119,7 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": null,
-      "stability": "beta",
+      "stability": "experimental",
       "smoked": false
     },
     {
@@ -138,8 +138,8 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": "codex",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false
     },
     {
       "harness": "gemini-direct",
@@ -158,8 +158,8 @@
       "nativeJsonMode": true,
       "structuredVia": "response-schema",
       "legacyProviderId": "gemini",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false
     },
     {
       "harness": "gemini-direct",
@@ -178,7 +178,7 @@
       "nativeJsonMode": true,
       "structuredVia": "response-schema",
       "legacyProviderId": null,
-      "stability": "beta",
+      "stability": "experimental",
       "smoked": false
     },
     {
@@ -197,7 +197,7 @@
       "nativeJsonMode": true,
       "structuredVia": "format-json",
       "legacyProviderId": "ollama",
-      "stability": "beta",
+      "stability": "experimental",
       "smoked": false
     },
     {
@@ -236,6 +236,10 @@
       "nativeJsonMode": true,
       "structuredVia": "json-schema",
       "legacyProviderId": "opencode",
+      "provingLanes": [
+        "TestOpenCodeHarnessSmoke_RealBinary_SpawnEventStreamTerminal",
+        "TestOpenCodeHarnessSmoke_RealBinary_Teardown"
+      ],
       "stability": "beta",
       "smoked": true
     },
@@ -257,7 +261,7 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": true
+      "smoked": false
     },
     {
       "harness": "pi",
@@ -315,6 +319,9 @@
       "nativeJsonMode": true,
       "structuredVia": "stub",
       "legacyProviderId": "stub",
+      "provingLanes": [
+        "TestSiblingContextReposSmoke"
+      ],
       "stability": "stable",
       "smoked": true
     }
