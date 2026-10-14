@@ -216,7 +216,7 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 
 // withTranscriptCost replaces a costless terminal ResultEvent with one
 // carrying the session's deduped transcript totals, or its saved statusline
-// token counts when no transcript usage is available. Unknown or untrusted
+// cumulative USD cost when no transcript usage is available. Unknown or untrusted
 // usage leaves the event untouched: no fabricated zero, never a failure.
 func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.Event {
 	if result.Cost != nil || hook == nil {
@@ -232,6 +232,7 @@ func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.E
 		CachedInputTokens: total.CachedInputTokens,
 		CacheWriteTokens:  total.CacheWriteTokens,
 		NumTurns:          total.NumTurns,
+		TotalCostUsd:      total.TotalCostUsd,
 	}
 	return result
 }
