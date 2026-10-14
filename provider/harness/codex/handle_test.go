@@ -27,6 +27,10 @@ type fakeServer struct {
 	params    []map[string]any
 	mcpWrites []string
 	activeMCP map[string]any
+
+	// turnHold, when non-nil, holds turn/completed back until it is
+	// closed (see holdTurnCompletion).
+	turnHold chan struct{}
 }
 
 func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
@@ -57,6 +61,23 @@ func (fs *fakeServer) write(t *testing.T, body any) {
 func (fs *fakeServer) close() {
 	_ = fs.stdin.Close()
 	_ = fs.stdout.Close()
+}
+
+// holdTurnCompletion makes the next turn/start keep its turn open: the
+// fake streams everything up to turn/completed and sends turn/completed
+// only once release is called, so a test can act inside a live turn the
+// way the real app-server writes rollout lines before it completes the
+// turn. Release is idempotent and also runs at cleanup.
+func (fs *fakeServer) holdTurnCompletion(t *testing.T) (release func()) {
+	t.Helper()
+	hold := make(chan struct{})
+	fs.mu.Lock()
+	fs.turnHold = hold
+	fs.mu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	return release
 }
 
 func fakeMCPStatusData(active map[string]any) []map[string]any {
@@ -188,7 +209,7 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 					"item":     map[string]any{"id": "m1", "type": "agentMessage", "text": "hello world"},
 				},
 			})
-			fs.write(t, map[string]any{
+			completed := map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "turn/completed",
 				"params": map[string]any{
@@ -198,7 +219,20 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 						"usage":  map[string]any{"input_tokens": 100, "output_tokens": 50},
 					},
 				},
-			})
+			}
+			fs.mu.Lock()
+			hold := fs.turnHold
+			fs.mu.Unlock()
+			if hold == nil {
+				fs.write(t, completed)
+				continue
+			}
+			// Held turn: complete it off this loop so the fake keeps
+			// answering requests (Stop's turn/interrupt) meanwhile.
+			go func() {
+				<-hold
+				fs.write(t, completed)
+			}()
 		case hasID:
 			fs.replyOK(t, idRaw)
 		}
