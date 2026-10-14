@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.75 — 2026-10-14
+
 ### Features
 
 - `linear create-issue` accepts `--assignee <user ID|name|email|me>` and `--priority 0-4`, and `linear update-issue` accepts the same `--assignee` spellings with `--assignee null` clearing the assignment. Assignee names, emails, and `me` resolve through the configured transport (direct API key or hosted proxy) and unknown values fail before any mutation runs.
