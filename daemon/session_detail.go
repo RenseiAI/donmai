@@ -176,6 +176,11 @@ type SessionDetail struct {
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is an opaque platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for nothing else. The daemon never parses,
 	// validates, or logs its value — it forwards the string from PollWorkItem

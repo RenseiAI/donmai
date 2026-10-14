@@ -1535,6 +1535,7 @@ func kitScanPaths() []string {
 // runner.ReconcileResolvedProfile below) rather than reaching the runner's
 // Spec.
 func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(d.SessionID, d.CoAuthorName, d.CoAuthorEmail)
 	qw := runner.QueuedWork{
 		AdmissionReceipt:        bytes.Clone(d.AdmissionReceipt),
 		ClaimReceipt:            bytes.Clone(d.ClaimReceipt),
@@ -1594,6 +1595,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		Branch:                d.Branch,
 		WorkerID:              d.WorkerID,
 		AuthToken:             d.AuthToken,
+		CoAuthorName:          coAuthorName,
+		CoAuthorEmail:         coAuthorEmail,
 		McpAuthToken:          d.McpAuthToken,
 		McpAuthTokenExpiresAt: d.McpAuthTokenExpiresAt,
 		PlatformURL:           d.PlatformURL,
@@ -1649,6 +1652,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		// line a no-op — it is the tag change, not the decoder, that this
 		// guards against, exactly as for AuthToken/PlatformURL above.
 		qw.McpAuthToken, qw.McpAuthTokenExpiresAt = d.McpAuthToken, d.McpAuthTokenExpiresAt
+		qw.CoAuthorName, qw.CoAuthorEmail = coAuthorName, coAuthorEmail
 		qw.Capabilities = d.Capabilities
 	}
 	stageBudgetJSON, err := marshalOptional(d.StageBudget)
