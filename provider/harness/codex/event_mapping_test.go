@@ -596,12 +596,8 @@ func TestMapItem_MCPToolCall_NormalizedName(t *testing.T) {
 func TestMapNotification_Unknown(t *testing.T) {
 	t.Parallel()
 	got := mapNotification("totally/new", mustJSON(t, map[string]any{}), &mapperState{}, nil)
-	se, ok := got[0].(agent.SystemEvent)
-	if !ok {
-		t.Fatalf("expected SystemEvent for unknown method, got %T", got[0])
-	}
-	if se.Subtype != "unknown" {
-		t.Fatalf("expected subtype=unknown, got %q", se.Subtype)
+	if len(got) != 0 {
+		t.Fatalf("unrecognized method emitted activities: %+v", got)
 	}
 }
 
