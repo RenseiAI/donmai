@@ -276,7 +276,11 @@ type graphqlRequest struct {
 
 // graphqlError is a single error entry in a GraphQL response.
 type graphqlError struct {
-	Message string `json:"message"`
+	Message    string `json:"message"`
+	Code       string `json:"code"`
+	Extensions struct {
+		Code string `json:"code"`
+	} `json:"extensions"`
 }
 
 // issueNode is the JSON structure for a single issue node inside a connection.
