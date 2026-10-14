@@ -1679,6 +1679,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Mode:     string(resolved.Mode),
 		}
 	}
+	// Per-seat scheduling class: opt-in only, default when unauthored.
+	// Only set what the operator authored: an embedder that composed
+	// its own SpawnerOptions.SeatQoS keeps it.
+	if spawnerOpts.SeatQoS == "" && cfg.Capacity.SeatQoS != "" {
+		spawnerOpts.SeatQoS = string(resolveSeatQoS(cfg.Capacity.SeatQoS))
+	}
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
 	}
@@ -2267,6 +2273,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
 	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
+	seatQoSChanged := d.config.Capacity.SeatQoS != cfg.Capacity.SeatQoS
 	// A rotated registration token rides alongside project changes: the new
 	// key must be adopted before the re-registration below, or the reload
 	// presents the revoked generation. Adoption is validated inside (a token
@@ -2274,7 +2281,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// the previous generation stays), so checking for the change here only
 	// decides whether the reload path runs at all.
 	registrationTokenChanged := d.credentials != nil && cfg.Orchestrator.AuthToken != "" && cfg.Orchestrator.AuthToken != d.config.Orchestrator.AuthToken
-	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !registrationTokenChanged {
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -2316,6 +2323,25 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			})
 		}
 		d.config.Capacity.SeatBudget = cfg.Capacity.SeatBudget
+	}
+	if seatQoSChanged {
+		if err := validateSeatQoS(cfg.Capacity.SeatQoS); err != nil {
+			d.mu.Unlock()
+			releasePolicy()
+			slog.Warn("[yaml-watcher] rejected seat scheduling class", "error", err)
+			return
+		}
+		// Seats already running keep the class they started with;
+		// only new spawns see the new class.
+		if d.spawner != nil {
+			if err := d.spawner.SetSeatQoS(cfg.Capacity.SeatQoS); err != nil {
+				d.mu.Unlock()
+				releasePolicy()
+				slog.Warn("[yaml-watcher] rejected seat scheduling class", "error", err)
+				return
+			}
+		}
+		d.config.Capacity.SeatQoS = cfg.Capacity.SeatQoS
 	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {
