@@ -68,11 +68,19 @@ func minimalRunner(t *testing.T) *Runner {
 // /api/sessions/<id>/{completion,status,lock-refresh} call and
 // responds 200 OK with `{"refreshed":true}` (for lock-refresh). The
 // returned URL is suitable for both result.Poster and heartbeat.Pulser.
+//
+// It also accepts the pre-spawn execution-security report on the preflight
+// registration route with the closed accepted envelope, so stamped runs
+// spawn as before unless a test substitutes its own reporter.
 func mockPlatformServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// All endpoints accept POST and return JSON.
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/execution-preflight-registration") {
+			_, _ = w.Write([]byte(`{"contractVersion":"execution-security-report/v1","decision":"accepted"}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
 	}))
 	return srv
