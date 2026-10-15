@@ -74,6 +74,12 @@ type outputLimitRefusal struct {
 // an outputLimitRefusal: an observation, never an error, because nothing ran.
 const outputLimitRefusalSubtype = agent.SystemSubtypeToolCallRefusedOutputLimit
 
+// DefaultMaxConsecutiveOutputLimitTurns bounds repeated truncated RPC turns.
+const DefaultMaxConsecutiveOutputLimitTurns = 3
+
+// RepeatedOutputLimitCode identifies the terminal failure for a cutoff streak.
+const RepeatedOutputLimitCode = "repeated_output_limit"
+
 // argumentRejection is one guarded call the RUNTIME rejected before execution
 // because its arguments failed the tool's schema validation. Validation runs
 // before the tool_call hook, so no ruling can exist for such a call. Kept
@@ -217,6 +223,11 @@ type Handle struct {
 	// alone reads and clears it afterwards, so it needs no lock.
 	launchNotices []agent.Event
 
+	// Only the event pump reads or writes the cutoff streak. Count completed
+	// turns, not message_end events or refused tool calls within a turn.
+	consecutiveOutputLimitTurns    int
+	maxConsecutiveOutputLimitTurns int
+
 	// turnInFlight is true between the first streaming event of a turn and its
 	// turn_end/agent_end — Inject routes to steer while in flight, follow_up
 	// while idle.
@@ -286,19 +297,20 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 		receipt = admissions[0]
 	}
 	return &Handle{
-		client:          client,
-		cmd:             cmd,
-		policy:          NewPolicyEngine(spec),
-		spec:            spec,
-		state:           &mapperState{suppressCost: suppressInjectedCost(spec), delegationTools: declaredDelegationTools(spec.AdditionalExtensions)},
-		token:           token,
-		receipt:         receipt,
-		handshakeResult: make(chan error, 1),
-		adjudications:   make(map[string]adjudicationOutcome),
-		lengthStopped:   make(map[string]string),
-		startedCalls:    make(map[string]startedCall),
-		events:          make(chan agent.Event, 256),
-		closed:          make(chan struct{}),
+		client:                         client,
+		cmd:                            cmd,
+		policy:                         NewPolicyEngine(spec),
+		spec:                           spec,
+		state:                          &mapperState{suppressCost: suppressInjectedCost(spec), delegationTools: declaredDelegationTools(spec.AdditionalExtensions)},
+		token:                          token,
+		receipt:                        receipt,
+		handshakeResult:                make(chan error, 1),
+		adjudications:                  make(map[string]adjudicationOutcome),
+		lengthStopped:                  make(map[string]string),
+		startedCalls:                   make(map[string]startedCall),
+		events:                         make(chan agent.Event, 256),
+		closed:                         make(chan struct{}),
+		maxConsecutiveOutputLimitTurns: DefaultMaxConsecutiveOutputLimitTurns,
 	}
 }
 
@@ -615,6 +627,25 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		h.emit(e)
 		if e.Kind() == agent.EventInit {
 			h.emitLaunchNotices()
+		}
+	}
+	if !fatal && ev.Type == "turn_end" {
+		msg := mapField(ev.Fields, "message")
+		if stringField(msg, "role") == "assistant" && stringField(msg, "stopReason") == "length" {
+			h.consecutiveOutputLimitTurns++
+		} else {
+			h.consecutiveOutputLimitTurns = 0
+		}
+		if h.consecutiveOutputLimitTurns >= h.maxConsecutiveOutputLimitTurns {
+			// Map and emit this turn's usage first. Close before publishing the
+			// fatal event so a consumer cannot inject another continuation.
+			h.signalClosed()
+			h.emit(agent.ErrorEvent{
+				Code:    RepeatedOutputLimitCode,
+				Message: fmt.Sprintf("pi: %d consecutive turns reached the output-token limit", h.consecutiveOutputLimitTurns),
+				Raw:     raw(ev),
+			})
+			return true
 		}
 	}
 	return fatal
