@@ -142,8 +142,82 @@ func TestFileExecutionPreflightStoreIsDurableAndAppendOnly(t *testing.T) {
 	if string(got) != string(receipt) {
 		t.Fatalf("stored receipt = %s, want %s", got, receipt)
 	}
-	if err := store.Persist("session-1", receipt); err == nil {
+	changed := json.RawMessage(`{"contractVersion":"host-adaptation/v1","requestId":"session-1","workerId":"worker-1","placementId":"host-local","decision":"denied","denial":"changed"}`)
+	if err := store.Persist("session-1", changed); err == nil {
 		t.Fatal("immutable receipt was overwritten")
+	}
+	got, err = os.ReadFile(filepath.Join(dir, executionPreflightReceiptName("session-1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(receipt) {
+		t.Fatalf("stored receipt after refused overwrite = %s, want %s", got, receipt)
+	}
+}
+
+// A redelivered claim recompiles the same receipt. Persisting identical bytes
+// again must succeed without touching the stored receipt; anything else for
+// the same session is refused with an error that wraps os.ErrExist.
+func TestFileExecutionPreflightStorePersistIsIdempotentForIdenticalBytes(t *testing.T) {
+	const sessionID = "session-retry"
+	first := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	changed := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-2",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	tests := []struct {
+		name    string
+		second  json.RawMessage
+		wantErr bool
+	}{
+		{name: "identical bytes", second: first, wantErr: false},
+		{name: "same session, different receipt", second: changed, wantErr: true},
+		{name: "same receipt, extra trailing byte", second: append(append(json.RawMessage(nil), first...), '\n'), wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store := NewFileExecutionPreflightStore(dir)
+			if err := store.Persist(sessionID, first); err != nil {
+				t.Fatalf("first persist: %v", err)
+			}
+			err := store.Persist(sessionID, tc.second)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("second persist with a different receipt succeeded")
+				}
+				if !errors.Is(err, os.ErrExist) {
+					t.Fatalf("second persist error = %v, want it to wrap os.ErrExist", err)
+				}
+			} else if err != nil {
+				t.Fatalf("second persist with identical bytes: %v", err)
+			}
+			got, err := store.Load(sessionID)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if string(got) != string(first) {
+				t.Fatalf("stored receipt = %s, want %s", got, first)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("receipt dir entries = %d, want 1 (no leftover pending files)", len(entries))
+			}
+		})
 	}
 }
 
