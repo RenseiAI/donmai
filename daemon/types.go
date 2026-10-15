@@ -233,6 +233,11 @@ type SessionSpec struct {
 	// from WorkType/Mode.
 	Workload string `json:"workload,omitempty"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is the platform-minted per-session MCP gateway bearer.
 	// Carried opaquely so the embedder's pre-spawn rail can atomically seed
 	// the token file before env injection. Absent on pre-fix dispatches.
