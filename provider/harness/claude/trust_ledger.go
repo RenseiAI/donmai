@@ -166,13 +166,16 @@ func parseTrustLedgerPidOwner(session string) (int, bool) {
 // daemon-start sweep would never enumerate that home — isolation would
 // hide the crash debris forever. So the seed ALSO leaves a discovery
 // pointer behind the daemon's own process home: a ledger row with no
-// directory (see sweepTrustLedger: empty-dir rows drain without touching
-// the record), carrying only the owning session and the override home it
-// names. The process-home sweep then follows that pointer to the isolated
-// home (see daemon/trust_ledger_sweep.go). Skipped exactly when there is
-// no override to name — the seed wrote beside the process home itself —
-// or when the process home is not absolute; discovery-link failure never
-// disturbs the seed itself.
+// directory carrying only the owning session and the override home it
+// names. A live session's pointer survives that home's own sweep passes
+// (see sweepTrustLedger: directory-less rows drain only with their own
+// dead session) while still naming the isolated home for discovery, so a
+// restart mid-run keeps the pointer and a later crash still drains. The
+// process-home sweep then follows that pointer to the isolated home (see
+// daemon/trust_ledger_sweep.go). Skipped exactly when there is no override
+// to name — the seed wrote beside the process home itself — or when the
+// process home is not absolute; discovery-link failure never disturbs the
+// seed itself.
 func recordSeededTrustLedger(seed *seededTrust) {
 	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
 		return
@@ -209,10 +212,11 @@ func recordSeededTrustLedger(seed *seededTrust) {
 // wrote beside — so the daemon-start sweep visits the isolated home even
 // though the process enumeration can never name it (see
 // daemon/trust_ledger_sweep.go). The pointer row carries the seed's owning
-// session and home: sweepTrustLedger drains empty-dir rows unconditionally
-// (they can never apply to the record), and forgetSeededTrustLedger drops
-// the link on the live path exactly like any other row the seed wrote —
-// so a live session's link never strands the override home open for a
+// session and home: sweepTrustLedger keeps a live session's directory-less
+// row (it never applies to the record) while still following it to the
+// isolated home, and forgetSeededTrustLedger drops the link on the live
+// path exactly like any other row the seed wrote — so a live session's
+// link survives restarts without stranding the override home open for a
 // later sweep to misread, and a crashed session's link drains with its
 // own sweep pass.
 //
@@ -470,11 +474,16 @@ type SweepTrustLedgerOptions struct {
 // sweepTrustLedger undoes every ledger entry whose session is no longer
 // live: entries the dead session's seed created are removed whole, flipped
 // entries are put back to their prior value — the same ownership rule the
-// live-path cleanup applies. The ledger rows themselves are dropped only
-// for entries the sweep actually undid; an entry the record no longer
-// honours (already cleaned, already re-trusted by its owner) still drops
-// its row, but a row the sweep could not apply — the record is unparseable,
-// the lock is held — stays for the next start to retry.
+// live-path cleanup applies. A directory-less discovery row drains only
+// with its own owning session: while that session is still live the row is
+// this sweep's pointer to the isolated home, so dropping it early would
+// strand that home's debris at the next start — a live restart must keep
+// the pointer and a dead session's pointer drains with its own pass. The
+// ledger rows themselves are dropped only for entries the sweep actually
+// undid; an entry the record no longer honours (already cleaned, already
+// re-trusted by its owner) still drops its row, but a row the sweep could
+// not apply — the record is unparseable, the lock is held — stays for the
+// next start to retry.
 //
 // It returns the number of ledger rows dropped. Every failure is silent:
 // the sweep must never fail a start.
@@ -499,6 +508,16 @@ func sweepTrustLedger(opts SweepTrustLedgerOptions) (dropped int) {
 	var dead []trustLedgerEntry
 	for _, e := range entries {
 		if e.Dir == "" {
+			// A directory-less row is a discovery pointer, not trust
+			// to undo: it names the isolated home for the daemon's
+			// discovery pass. A live session's pointer must survive
+			// this pass — the sweep still follows it to the isolated
+			// home (see LedgerConfigHomes) while the rows beside that
+			// home stay protected — so that a restart mid-run never
+			// strands the debris a later crash leaves behind.
+			if live(e.Session) {
+				continue
+			}
 			dropped++
 			continue
 		}
@@ -518,14 +537,22 @@ func sweepTrustLedger(opts SweepTrustLedgerOptions) (dropped int) {
 		if !applyTrustLedgerSweep(path, dead) {
 			// The record could not be rewritten (unparseable, not ours to
 			// replace, lock lost): keep every row so the next start
-			// retries, but still drop rows with no directory — they can
-			// never apply to anything.
+			// retries, but still drop dead sessions' directory-less
+			// discovery rows — they name no trust to apply. A live
+			// session's discovery row stays: it is still that
+			// session's pointer to its isolated home.
 			if dropped > 0 {
 				var keep []trustLedgerEntry
 				for _, e := range entries {
-					if e.Dir != "" {
-						keep = append(keep, e)
+					if e.Dir == "" {
+						// Dead sessions' discovery rows drained with
+						// this pass; a live session's row stays.
+						if live(e.Session) {
+							keep = append(keep, e)
+						}
+						continue
 					}
+					keep = append(keep, e)
 				}
 				_ = writeTrustLedger(path, keep)
 			}
@@ -539,6 +566,13 @@ func sweepTrustLedger(opts SweepTrustLedgerOptions) (dropped int) {
 deadLoop:
 	for _, e := range entries {
 		if e.Dir == "" {
+			// A live session's discovery row survived the liveness
+			// gate above; keep it so the next start still finds the
+			// isolated home. Dead sessions' discovery rows drained
+			// with this pass.
+			if live(e.Session) {
+				keep = append(keep, e)
+			}
 			continue
 		}
 		for _, d := range dead {

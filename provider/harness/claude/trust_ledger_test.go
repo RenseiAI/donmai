@@ -210,6 +210,64 @@ func TestSweepTrustLedger_NeverRewritesAForeignRecord(t *testing.T) {
 	}
 }
 
+// TestSweepTrustLedger_KeepsLiveDiscoveryLinksDrainsDeadOnes proves a
+// directory-less discovery row drains only with its own dead session. A
+// live session's pointer survives its home's own sweep pass — while the
+// rows beside the isolated home it names stay protected too — so a daemon
+// restart mid-run keeps the pointer and a later crash still drains. Once
+// the session is gone, the pointer drains with its own pass. RED proof:
+// drain directory-less rows unconditionally and the live pointer is gone
+// after the first sweep, stranding the isolated home's debris.
+func TestSweepTrustLedger_KeepsLiveDiscoveryLinksDrainsDeadOnes(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	if err := os.WriteFile(path, []byte(`{"projects":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	override := t.TempDir()
+	linkHome := override
+	// Plant the rows by hand: the point here is the sweep's liveness gate
+	// on directory-less rows, not the seed. The trust row and the
+	// directory-less pointer carry the same owning session, the way the
+	// production seed writes them.
+	rewriteLedgerForTest(t, path, []trustLedgerEntry{
+		{Dir: "/live/created", Created: true, Session: "session:uuid-live-link", ConfigHome: linkHome},
+		{Session: "session:uuid-live-link", ConfigHome: linkHome},
+	})
+	live := func(s string) bool { return s == "session:uuid-live-link" }
+	if dropped := sweepTrustLedger(SweepTrustLedgerOptions{TrustRecordPath: path, Live: live}); dropped != 0 {
+		t.Errorf("sweep with the session live dropped %d rows, want 0 — the pointer must survive restarts", dropped)
+	}
+	entries, ok := readTrustLedger(path)
+	if !ok {
+		t.Fatal("ledger unreadable after the live sweep")
+	}
+	links := 0
+	for _, e := range entries {
+		if e.Dir == "" {
+			links++
+			if e.Session != "session:uuid-live-link" || e.ConfigHome != linkHome {
+				t.Errorf("live sweep rewrote the discovery pointer: %+v", e)
+			}
+		}
+	}
+	if links != 1 {
+		t.Errorf("live sweep left %d discovery rows, want the session's pointer kept: %v", links, entries)
+	}
+	// The discovery pointer still names the isolated home while the
+	// session is live — the daemon follows it without draining it.
+	visited := map[string]struct{}{filepath.Dir(path): {}}
+	if got := LedgerConfigHomes(path, visited); len(got) != 1 || got[0] != linkHome {
+		t.Errorf("LedgerConfigHomes after the live sweep = %q, want [%q]", got, linkHome)
+	}
+	if dropped := sweepTrustLedger(SweepTrustLedgerOptions{TrustRecordPath: path, Live: liveNone}); dropped != 2 {
+		t.Errorf("sweep with the session dead dropped %d rows, want 2 (the trust row + its pointer)", dropped)
+	}
+	if entries, ok := readTrustLedger(path); ok && len(entries) != 0 {
+		t.Errorf("dead session's rows survive the sweep: %v", entries)
+	}
+}
+
 // TestSweepSeededTrustForConfigHome_SweepsOnlyTheLedger proves the config-
 // home entry point sweeps the ledger beside the trust record: a dead
 // session's entry goes away, and a home with no ledger — or a relative

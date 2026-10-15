@@ -17,6 +17,18 @@ import (
 // startup either way — see sweepSeededTrustLedger.
 const trustLedgerSweepTimeout = 30 * time.Second
 
+// trustLedgerMaxDiscoveredHomes caps how many ledger-named override homes
+// one sweep pass visits beyond the process-enumerated homes. The ledger
+// names its own debris — each row records the home its seed wrote beside
+// — so discovery follows rows wherever they point; without a cap a ledger
+// naming many distinct homes would walk and lock every one of them on
+// every daemon start, stalling startup up to the sweep-wide timeout. Past
+// the cap the sweep stops visiting new homes and logs how many it left
+// undiscovered; those homes wait for the next start. The cap is generous
+// by construction: one override home per isolated session, and isolated
+// sessions are the rare shape, not the common one.
+const trustLedgerMaxDiscoveredHomes = 64
+
 // TrustLedgerSweepFunc is the shape of the startup sweep call: the one the
 // real providerclaude.SweepSeededTrustForConfigHome has, and the one
 // Options.TrustLedgerSweeper is typed as. Keeping it a named type (rather
@@ -65,6 +77,8 @@ func (d *Daemon) sweepSeededTrustLedger(ctx context.Context) {
 	defer cancel()
 	total := 0
 	perHome := make([]int, 0, len(homes))
+	discovered := 0
+	discoveryCapped := false
 	visited := make(map[string]struct{}, len(homes))
 	for _, home := range homes {
 		visited[home] = struct{}{}
@@ -75,7 +89,9 @@ func (d *Daemon) sweepSeededTrustLedger(ctx context.Context) {
 	// enumeration above could never reach. The loop revisits until no
 	// visited home names a new one; every iteration holds the trust lock
 	// only for one small read plus one small write per home, so the
-	// sweep-wide timeout still bounds the whole pass.
+	// sweep-wide timeout still bounds the whole pass — and the discovery
+	// cap below bounds how many ledger-named homes one start visits, so a
+	// ledger naming hundreds of homes cannot stall startup.
 	for i := 0; i < len(homes); i++ {
 		home := homes[i]
 		select {
@@ -88,14 +104,32 @@ func (d *Daemon) sweepSeededTrustLedger(ctx context.Context) {
 		// names its own debris even when its rows are live (a live
 		// session's rows name its isolated home while staying protected
 		// themselves), so discovery must not wait for the naming home's
-		// own sweep to drain first.
-		homes = append(homes, providerclaude.LedgerConfigHomes(
-			filepath.Join(home, providerclaude.TrustRecordFileName),
-			visited,
-		)...)
+		// own sweep to drain first. A live session's discovery pointer
+		// survives its home's own sweep for exactly this reason (see
+		// sweepTrustLedger), so a restart mid-run still finds the
+		// isolated home at the next start.
+		if !discoveryCapped {
+			for _, next := range providerclaude.LedgerConfigHomes(
+				filepath.Join(home, providerclaude.TrustRecordFileName),
+				visited,
+			) {
+				if discovered >= trustLedgerMaxDiscoveredHomes {
+					discoveryCapped = true
+					break
+				}
+				discovered++
+				homes = append(homes, next)
+			}
+		}
 		dropped := sweep(home, live)
 		total += dropped
 		perHome = append(perHome, dropped)
+	}
+	if discoveryCapped {
+		slog.Info("daemon: seeded-trust sweep complete",
+			"configHomes", len(homes), "rowsDropped", total, "perHome", perHome,
+			"discoveryCapped", true, "discoveryCap", trustLedgerMaxDiscoveredHomes)
+		return
 	}
 	slog.Info("daemon: seeded-trust sweep complete",
 		"configHomes", len(homes), "rowsDropped", total, "perHome", perHome)
