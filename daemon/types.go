@@ -158,7 +158,14 @@ type SessionSpec struct {
 	Ref                string            `json:"ref"`
 	Resources          *SessionResources `json:"resources,omitempty"`
 	Env                map[string]string `json:"env,omitempty"`
-	MaxDurationSeconds int               `json:"maxDurationSeconds,omitempty"`
+	// NOTE: the poll wire's top-level maxDurationSeconds is intentionally NOT
+	// mirrored here. It was decoded and never read — a field that looks
+	// authoritative while taking effect nowhere. The enforced duration cap
+	// is the nested stageBudget.maxDurationSeconds, which PollWorkItem
+	// carries as StageBudget and PollItemToSessionDetail backfills from the
+	// top-level value when no explicit nested duration is stamped. A
+	// duration on this spec would have no consumer: the spawner admits
+	// sessions, the runner owns timeouts.
 	// ProjectName is the allowlist-resolved ProjectConfig.ID for this session,
 	// populated by PollItemToSessionSpec when the work item matches a daemon
 	// allowlist entry. Empty when no allowlist entry matched (spec accepted on
