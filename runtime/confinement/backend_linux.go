@@ -5,6 +5,7 @@ package confinement
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -302,7 +303,9 @@ func (b *mountNamespaceBackend) Apply(req ApplyRequest) (Applied, error) {
 // landlockProbe returns the running kernel's Landlock ABI version, 0 where
 // Landlock is absent or disabled. A package variable so tests pin both
 // branches of the gate without a capable kernel; production always probes
-// the running kernel.
+// the running kernel. ScopesAvailable reads through scopesProbe (see
+// stage_linux.go); checkLandlock reads landlockProbe directly, and both
+// default to the running kernel.
 var landlockProbe = landlockABI
 
 // checkLandlock refuses with backend_absent unless the running kernel's
@@ -940,8 +943,10 @@ func isWritableRoot(writable []WritableRoot, path string) bool {
 
 // emptyPlaceholder returns a path whose bind hides the denied target: an
 // empty directory for a directory target, an empty file otherwise, plus
-// whether the target is a directory. The placeholder lives under the OS
-// temporary directory, outside every session root. Callers skip targets
+// whether the target is a directory. The placeholder lives under a
+// per-user directory in the OS temporary directory (0700, so one user's
+// denied listing never shows through another user's placeholder), outside
+// every session root. Callers skip targets
 // that do not exist — the tmpfs root already hides those — so a missing
 // target never reaches this function; it stays a caller-side decision,
 // documented at each call site.
@@ -950,7 +955,10 @@ func emptyPlaceholder(target string) (string, bool, error) {
 	if err != nil {
 		return "", false, refuse(ReasonWritableSetUnrepresentable, "deny target is not reachable: %v", errnoText(err))
 	}
-	base := filepath.Join(os.TempDir(), "donmai-confine-empty")
+	base, err := emptyPlaceholderBase()
+	if err != nil {
+		return "", false, err
+	}
 	if info.IsDir() {
 		dir := filepath.Join(base, "dir")
 		// The placeholder is an empty directory by construction; 0700 keeps it owner-only.
@@ -971,4 +979,18 @@ func emptyPlaceholder(target string) (string, bool, error) {
 	}
 	_ = f.Close()
 	return file, false, nil
+}
+
+// emptyPlaceholderBase is the per-user directory holding the empty overlay
+// paths: the OS temporary directory plus the caller's user id, created
+// owner-only, so placeholders staged by one user are never listed through
+// another user's denied bind. The suffix is numeric (never a name), so the
+// path carries no identity.
+func emptyPlaceholderBase() (string, error) {
+	base := filepath.Join(os.TempDir(), fmt.Sprintf("donmai-confine-empty-%d", os.Getuid()))
+	// The placeholder parent holds only the empty overlays below; 0700 keeps it owner-only.
+	if err := os.MkdirAll(base, 0o700); err != nil { //nolint:gosec // G301: the empty overlay parent.
+		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
+	}
+	return base, nil
 }
