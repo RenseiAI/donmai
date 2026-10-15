@@ -43,7 +43,8 @@ type Spec struct {
 	// Env is applied on top of the parent process environment as KEY=VALUE
 	// overrides (last-wins). TERM=xterm-256color and COLORTERM=truecolor are
 	// the interactive defaults even when the parent carries different values;
-	// explicit entries in Env override those defaults.
+	// explicit entries in Env override those defaults. LANG=C.UTF-8 is added
+	// only when neither layer sets LC_ALL, LC_CTYPE or LANG.
 	Env []string
 
 	// ExactEnv makes Env the child's complete environment: the parent process
@@ -203,7 +204,33 @@ func composeEnv(parent, overrides []string) []string {
 	for _, kv := range overrides {
 		put(kv, false)
 	}
+	if !localeSet(out, idx) {
+		put("LANG="+defaultLocale, false)
+	}
 	return out
+}
+
+// defaultLocale is the locale an interactive child gets when neither the
+// parent nor the request names one. A daemon started by launchd or systemd
+// has no LANG, which leaves the child in the C locale, whose codeset is not
+// UTF-8. The PTY carries UTF-8, but tools the child runs decode bytes through
+// the locale: macOS pbcopy reads its input as Mac Roman, so a harness copying
+// "┌—" to the clipboard puts "‚îå‚Äî" there instead. C.UTF-8 changes only
+// the codeset; every other category keeps its C behaviour.
+const defaultLocale = "C.UTF-8"
+
+// localeSet reports whether env names a locale for the character type
+// (LC_ALL, LC_CTYPE or LANG, non-empty). A locale the parent or the request
+// sets, UTF-8 or not, is kept as is.
+func localeSet(env []string, idx map[string]int) bool {
+	for _, key := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
+		if at, ok := idx[key]; ok {
+			if _, value, _ := strings.Cut(env[at], "="); value != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // parentEnv returns the environment the child inherits beneath Env: this

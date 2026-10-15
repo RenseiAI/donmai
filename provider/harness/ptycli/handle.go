@@ -54,8 +54,8 @@ type Handle struct {
 //
 // spec.Env is passed through to ptyhost.Spec.Env, which layers it onto the
 // parent process environment, applies TERM=xterm-256color /
-// COLORTERM=truecolor as interactive defaults, and then honors explicit
-// per-request overrides
+// COLORTERM=truecolor as interactive defaults, honors explicit per-request
+// overrides, and adds LANG=C.UTF-8 when no layer names a locale
 // (ptyhost/spec.go composeEnv) — the harness-layer callers of this package
 // never need to set those themselves. spec.Cwd is passed through verbatim.
 //

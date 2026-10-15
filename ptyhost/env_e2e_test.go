@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +179,50 @@ func TestSpawnE2E_SessionReadTokenSurvivesNoPTYChild(t *testing.T) {
 	}
 	if string(got) != "clean" {
 		t.Fatal("PTY child observed the per-session read credential")
+	}
+}
+
+// TestSpawnE2E_ChildDecodesUTF8WithoutALocaleFromTheDaemon spawns a real PTY
+// child with the environment a launchd daemon hands it (no LANG, LC_ALL or
+// LC_CTYPE) and has it count the characters of "┌─┬│—’“…" with `wc -m`, which
+// decodes through the locale the way macOS pbcopy does. Eight characters
+// means the child decodes UTF-8; 24 means it read bytes, which is how a
+// harness's clipboard copy turned "┌" into "‚îå". The LC_ALL=C control proves
+// the count follows the locale, so the assertion discriminates.
+func TestSpawnE2E_ChildDecodesUTF8WithoutALocaleFromTheDaemon(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+	count := func(env ...string) string {
+		resultPath := filepath.Join(t.TempDir(), "wc-result")
+		sess, err := Spawn(Spec{
+			Command: []string{
+				"/bin/sh", "-c", `printf '%s' '┌─┬│—’“…' | wc -m > "$1"`,
+				"sh", resultPath,
+			},
+			Env:      append([]string{"PATH=/usr/bin:/bin"}, env...),
+			ExactEnv: true,
+		})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		t.Cleanup(func() { _ = sess.Stop(context.Background()) })
+		select {
+		case <-sess.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("PTY child did not exit")
+		}
+		got, err := os.ReadFile(resultPath)
+		if err != nil {
+			t.Fatalf("read child result: %v", err)
+		}
+		return strings.TrimSpace(string(got))
+	}
+
+	if got := count(); got != "8" {
+		t.Errorf("child with no locale counted %s characters in an 8-character UTF-8 string, want 8", got)
+	}
+	if got := count("LC_ALL=C"); got != "24" {
+		t.Errorf("control: child with LC_ALL=C counted %s, want 24 bytes; the count does not follow the locale", got)
 	}
 }
