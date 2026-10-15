@@ -179,8 +179,9 @@ type Options struct {
 	TrustLedgerSweeper TrustLedgerSweepFunc
 
 	// QuotaProbeBinaries names the harness CLIs the live quota probes
-	// shell out to, keyed by harness ("codex", "claude" — see
-	// agent.UsageHarnessCodex / agent.UsageHarnessClaude). Empty (the
+	// shell out to, keyed by harness ("codex", "claude", "muse" —
+	// see agent.UsageHarnessCodex / agent.UsageHarnessClaude /
+	// agent.UsageHarnessMuse). Empty (the
 	// default every Start call gets unless a caller sets this field)
 	// disables that harness's probe: the quota cache then moves only
 	// on worker-reported stream updates. Only the production entry

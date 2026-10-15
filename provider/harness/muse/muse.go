@@ -475,8 +475,23 @@ func museConfinementEnabled(spec agent.Spec, hostRequires bool) bool {
 	return spec.RepositoryAuthority != nil && strings.TrimSpace(spec.RepositoryAuthority.WorkareaRoot) != ""
 }
 
-// resolveMuseBinary applies the Options → $MUSE_BIN → "muse" fallback
-// chain and resolves the result via exec.LookPath.
+// ResolveMuseBinary applies the shared Options → $MUSE_BIN → "muse"
+// on PATH → $HOME/.local/bin/muse fallback chain and resolves the
+// result to an absolute path. The harness constructor and the daemon
+// quota probe both go through here, so the two never disagree about
+// which binary or version they see.
+func ResolveMuseBinary(bin string) (string, error) {
+	return resolveMuseBinary(bin)
+}
+
+// resolveMuseBinary applies the Options → $MUSE_BIN → "muse" on PATH →
+// $HOME/.local/bin/muse fallback chain and resolves the result to an
+// absolute path. The installer's default location trails the PATH
+// lookup: a service PATH usually lacks it, but an operator-installed
+// host still carries the CLI there. An explicit absolute path is
+// returned as given; a relative explicit path still resolves via PATH
+// so a bare name behaves the same whether it arrived as the default
+// or through $MUSE_BIN.
 func resolveMuseBinary(bin string) (string, error) {
 	if bin == "" {
 		bin = os.Getenv("MUSE_BIN")
@@ -484,11 +499,26 @@ func resolveMuseBinary(bin string) (string, error) {
 	if bin == "" {
 		bin = MuseBinaryDefault
 	}
-	full, err := exec.LookPath(bin)
-	if err != nil {
-		return "", fmt.Errorf("muse binary %q not on PATH: %w", bin, err)
+	if filepath.IsAbs(bin) {
+		return bin, nil
 	}
-	return full, nil
+	if full, err := exec.LookPath(bin); err == nil && filepath.IsAbs(full) {
+		return full, nil
+	}
+	// The installer's default location is a fallback for the default
+	// binary name only: an explicit name that PATH cannot resolve is
+	// an error, never a redirect to an unrelated file.
+	if bin == MuseBinaryDefault {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if candidate := filepath.Join(home, ".local", "bin", "muse"); candidate != bin {
+				if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+					return candidate, nil
+				}
+			}
+		}
+	}
+	_, err := exec.LookPath(bin)
+	return "", fmt.Errorf("muse binary %q not on PATH: %w", bin, err)
 }
 
 // checkMuseVersion probes "<binary> --version" and enforces the
