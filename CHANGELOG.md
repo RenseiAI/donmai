@@ -10,6 +10,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.76 — 2026-10-15
+
+### Chores
+
+- Map Codex app-server notifications and guard protocol drift
+- Use cumulative statusline cost for Claude session spend
+- Derive subagent event capabilities from executed fixtures
+- Preserve usage evidence across empty final results
+- Test dependent git calls in a single pi response
+- Preserve Linear proxy errors and bound Retry-After retries
+- Carry optional commit co-author metadata through session contracts
+- Confine the serve harness, add its host-session matrix cells, map the effort ladder
+- Forward dispatch trace context in session heartbeats
+- Refuse multiline retired config values before line deletion
+- Include redacted output tails in interactive PTY failures
+- Forward dispatch trace context in activity and token-delta posts
+- Own the harness resume token; restore as a state machine that never silently starts fresh
+- Stabilize parallel harness readiness under spawn churn
+- Add opt-in anonymous weekly usage count at host setup
+
 ## v0.72.75 — 2026-10-14
 
 ### Features
