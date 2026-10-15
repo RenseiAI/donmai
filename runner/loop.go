@@ -704,6 +704,24 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// process that actually spawns the fan-out — carries them. Explicit
 	// values win; a disabled budget changes nothing.
 	specEnv := cappedSessionEnv(qw)
+	// 3b. Install the session-scoped pkill/killall guards into the
+	// worktree and lead PATH with them. Host-mode sessions run as the
+	// operator's OS user, so an agent's pattern kill would otherwise
+	// match other sessions' and the operator's own processes. The
+	// guards ship with the runner (go:embed) and only signal processes
+	// inside this session's worktree (or workarea root); the rest are
+	// refused and reported as typed activity events at teardown.
+	// Best-effort: an install failure is logged and the run continues
+	// with an unguarded PATH rather than failing the session.
+	signalGuard, guardErr := installSignalGuard(wpath)
+	if guardErr != nil {
+		r.logger.Warn("signal guard install failed; pattern kills are unscoped",
+			"sessionId", qw.SessionID,
+			"err", guardErr,
+		)
+		signalGuard = signalGuardLayout{}
+	}
+	specEnv = signalGuardEnv(specEnv, signalGuard, res.WorkareaRoot, 0)
 	effectiveMCPBearerFile, err := prepareSessionMCPBearerEnv(
 		qw,
 		specEnv,
@@ -882,6 +900,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// no-op when the block is absent (byte-identical prompt to today).
 	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
+	composition.HarnessProtocol = injectSignalGuardProtocolPartial(composition.HarnessProtocol)
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
 	if qw.isInteractive() {
@@ -1000,6 +1019,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return err
 		}
 	}
+	// Each host session's processes run in their own process group
+	// (every harness spawns with Setpgid), recorded here from the
+	// spawned harness pid. The pkill/killall guards consult it as the
+	// second scope leg alongside the worktree: a session process running
+	// outside the worktree (a daemon child, a tmp tool) is still in
+	// scope via its group, while another session's identical command
+	// line is not. The group id is refreshed into the session env the
+	// guards read; the best-effort state.json record keeps the group
+	// visible for forensics.
+	spec.OnProcessSpawned = chainOnProcessSpawned(spec.OnProcessSpawned, func(pid int) {
+		r.recordSessionProcessGroup(runnerStatePath, qw.SessionID, pid, specEnv)
+	})
 	if repositoryDeclaration != nil {
 		policy, policyErr := repositoryAuthorityPolicy(*repositoryDeclaration, declaredRepositoryPaths, skippedRepositories,
 			res.WorkareaRoot, wpath, string(executorWorkareaCapabilities.RepositoryAuthorityEnforcement))
@@ -1926,6 +1957,13 @@ tailRecovery:
 	// platform updates the donmai provider×workType posterior store. Self-gates
 	// on ROUTING_RECORDER_ENABLED + required fields; best-effort, never fatal.
 	r.recordRoutingFeedback(ctx, qw, res)
+
+	// 11d. Drain the session's signal-guard refusal log into typed
+	// activity events. The pkill/killall guards appended one line per
+	// refused pattern kill; each becomes a signal_guard_refused event
+	// on the activity stream (and in events.jsonl) so both sides can see
+	// what the session attempted and what the guard spared. Best-effort.
+	r.reportSignalGuardRefusals(ctx, wpath, sink)
 
 	// Update state.json terminal snapshot (best-effort).
 	if _, err := r.store.Update(runnerStatePath, func(s *state.State) error {

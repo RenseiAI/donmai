@@ -83,6 +83,13 @@ const (
 	reasoningEffortContentPrefix        = "reasoning effort: "
 	reasoningEffortNotConfiguredContent = "reasoning effort: not configured; none was requested, so the harness or model default applies"
 	reasoningEffortUnknownContent       = "reasoning effort: the configured value is not a recognized level (low, medium, high, xhigh, max)"
+
+	// signalGuardRefusedContentPrefix prefixes the guard's refusal line
+	// forwarded for a signal-guard refusal marker. The line itself names
+	// the attempted pattern and the spared pids; the prefix states the
+	// verdict. (The subtype constant lives in runner to avoid an
+	// activity→runner import; the literal is pinned by test.)
+	signalGuardRefusedContentPrefix = "pattern kill refused: "
 )
 
 // RuntimeCredentials are the bearer-token credentials needed for an
@@ -768,6 +775,19 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.ContextKey = ToolCallBoundsContextKey
 			out.ContextValue = ToolCallBoundsContextValue(e.Message)
 			return out, true
+		case signalGuardRefusedSubtype:
+			// A pattern kill the session's pkill/killall guards refused:
+			// the agent asked to signal processes outside its session
+			// scope and the guard declined. The Message is the guard's
+			// own refusal line (pattern + spared pids), so it is safe
+			// to forward verbatim behind the fixed verdict prefix.
+			if msg := strings.TrimSpace(e.Message); msg != "" {
+				out.Type = "context"
+				out.Content = signalGuardRefusedContentPrefix + msg
+				out.ContextKey = SignalGuardRefusedContextKey
+				out.ContextValue = SignalGuardRefusedContextValue
+				return out, true
+			}
 		}
 		// Every other subtype (including interactive start/end, turn_started,
 		// command_progress, diff_updated, compaction, stream progress, and
@@ -839,6 +859,22 @@ func ReasoningEffortContent(effort agent.EffortLevel) string {
 // carries, so a control plane can read the per-call bound a session ran at
 // without parsing Content.
 const ToolCallBoundsContextKey = "toolCallTimeoutSeconds"
+
+// signalGuardRefusedSubtype mirrors runner.SystemSubtypeSignalGuardRefused
+// as a literal: runtime/activity cannot import runner (runner imports this
+// package for the Poster), so the subtype string is pinned here and in
+// runner/signal_guard_events.go. The mapping-table test case above uses the
+// literal; if the runner constant ever changes, update both together.
+const signalGuardRefusedSubtype = "signal_guard_refused"
+
+// SignalGuardRefusedContextKey is the contextKey a signal-guard refusal
+// marker carries; the value is a fixed sentinel since the distinguishing
+// detail (pattern + spared pids) already rides Content.
+const SignalGuardRefusedContextKey = "signalGuardRefused"
+
+// SignalGuardRefusedContextValue is the fixed contextValue of a
+// signal-guard refusal marker.
+const SignalGuardRefusedContextValue = "refused"
 
 // toolCallBoundsNotConfiguredContent is the fixed text forwarded when the
 // session carries no per-call bound; toolCallBoundsContentPrefix prefixes
