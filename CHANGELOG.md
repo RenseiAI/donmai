@@ -10,6 +10,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.78 — 2026-10-15
+
+### Chores
+
+- Declare interactive native tool-policy delivery for the claude harness
+- Seeded-trust hardening: crash sweep, lock interop, pi/codex checks, live-CLI smoke
+- Backstop: b257b597-8def-4587-8ad5-f8528d3b46a1
+- Serve harness: inline MCP grant policy, approval decline path, read-only proof, usage and auth typing
+- Revert the pre-spawn execution security report gate until the controller accepts it
+
 ## v0.72.77 — 2026-10-15
 
 ### Chores
