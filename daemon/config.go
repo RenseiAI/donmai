@@ -542,6 +542,18 @@ const (
 	DefaultRetentionArchiveMaxAgeDays = 30
 )
 
+// LoadRetentionSettings resolves the authored retention budget for the
+// daemon run path: it loads the config file and returns the effective
+// retention settings. A missing or unreadable config resolves to the
+// policy defaults rather than disabling the sweep.
+func LoadRetentionSettings(configPath string) RetentionSettings {
+	cfg, err := LoadConfig(configPath)
+	if err != nil || cfg == nil {
+		return (&Config{}).EffectiveRetentionSettings()
+	}
+	return cfg.EffectiveRetentionSettings()
+}
+
 // EffectiveRetentionSettings resolves the authored config to the
 // process-level retention settings. Zero values resolve to defaults;
 // negative values disable the corresponding rule.

@@ -596,6 +596,13 @@ func (m *Manager) AcquisitionRecord(workareaID string) (workarea.AcquisitionReco
 	return acquisitions.RecordForWorkareaID(workareaID)
 }
 
+// AcquisitionStoreForTest exposes the durable generation authority so
+// retention tests can stage abandoned generations without provisioning.
+// Production code uses Provision and the recovery path instead.
+func (m *Manager) AcquisitionStoreForTest() (*workarea.AcquisitionStore, error) {
+	return m.acquisitionStore()
+}
+
 func (m *Manager) acquisitionStore() (*workarea.AcquisitionStore, error) {
 	m.authorityMu.Lock()
 	defer m.authorityMu.Unlock()

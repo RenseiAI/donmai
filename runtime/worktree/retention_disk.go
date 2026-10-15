@@ -9,6 +9,7 @@
 package worktree
 
 import (
+	"math"
 	"syscall"
 )
 
@@ -21,7 +22,19 @@ func freeSpace(path string) (uint64, error) {
 	if err := syscall.Statfs(path, &stat); err != nil {
 		return 0, err
 	}
-	return stat.Bavail * uint64(stat.Bsize), nil
+	// Clamp the block size into the int64 domain before widening:
+	// Statfs_t.Bsize is a fixed-width unsigned field whose width varies
+	// by platform, and the G115 overflow check flags a direct widening
+	// to uint64 on narrow platforms. The clamp keeps the product in
+	// the int64 domain the receipt reports.
+	bsize := uint64(stat.Bsize)
+	if bsize > uint64(math.MaxInt64) {
+		bsize = uint64(math.MaxInt64)
+	}
+	if stat.Bavail > 0 && bsize > uint64(math.MaxInt64)/stat.Bavail {
+		return uint64(math.MaxInt64), nil
+	}
+	return stat.Bavail * bsize, nil
 }
 
 // reclaimedBytes returns the free-space change across a transition: the

@@ -373,6 +373,26 @@ func TestEffectiveRetentionSettings_DefaultsAndDisables(t *testing.T) {
 	}
 }
 
+func TestLoadRetentionSettings_MissingConfigResolvesDefaults(t *testing.T) {
+	settings := LoadRetentionSettings(filepath.Join(t.TempDir(), "missing.yaml"))
+	if settings.MaxAgeDays != DefaultRetentionMaxAgeDays || settings.ArchiveMaxAgeDays != DefaultRetentionArchiveMaxAgeDays || settings.MaxBytes != 0 {
+		t.Fatalf("missing config = %+v, want defaults", settings)
+	}
+}
+
+func TestLoadRetentionSettings_ReadsAuthoredConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	body := "machine:\n  id: test-machine\norchestrator:\n  url: file:///tmp/queue\n" +
+		"workarea:\n  retention:\n    maxAgeDays: 7\n    maxDiskGb: 10\n    archiveMaxAgeDays: 60\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings := LoadRetentionSettings(path)
+	if settings.MaxAgeDays != 7 || settings.MaxBytes != 10*1024*1024*1024 || settings.ArchiveMaxAgeDays != 60 {
+		t.Fatalf("authored config = %+v, want 7 days / 10 GiB / 60 days", settings)
+	}
+}
+
 func TestProjectContractMigration(t *testing.T) {
 	tests := []struct {
 		name     string

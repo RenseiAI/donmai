@@ -1195,6 +1195,45 @@ func (s *AcquisitionStore) ReadyRecords() ([]AcquisitionRecord, error) {
 	return records, nil
 }
 
+// QuarantinedRecords returns durable generations the acquisition
+// authority quarantined — ownership could not be proved and no cleanup
+// is authorized — in stable order. Unlike ReadyRecords it performs no
+// final-root verification: a quarantined generation authorizes no
+// cleanup at all, so a root that fails verification is still reported.
+// The scan never runs recovery, mutates records, or creates
+// directories: it takes the store lock, reads each generation's record,
+// and returns the quarantined ones. A read failure fails closed with an
+// error so the caller keeps the root rather than expiring on an
+// unreadable authority.
+func (s *AcquisitionStore) QuarantinedRecords() ([]AcquisitionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	releaseStore, err := s.lockStore()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseStore()
+	entries, err := s.readDirRoot()
+	if err != nil {
+		return nil, err
+	}
+	var records []AcquisitionRecord
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "wac_") {
+			continue
+		}
+		record, err := s.readRecord(entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		if record.State == AcquisitionQuarantined {
+			records = append(records, record)
+		}
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].AcquisitionID < records[j].AcquisitionID })
+	return records, nil
+}
+
 // RecordForWorkareaID resolves a durable workarea identity without walking the
 // session-root filesystem. The index is rebuilt from the acquisition journal
 // before admission on every manager restart.

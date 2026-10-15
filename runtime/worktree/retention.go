@@ -479,6 +479,31 @@ func (m *Manager) expireRetainedRoot(ctx context.Context, root retainedRoot, rea
 	return receipt, false, nil
 }
 
+// retentionQuarantinedRoot reports whether the acquisition authority holds
+// the root in the quarantined state: ownership could not be proved and no
+// cleanup is authorized. ReadyRecords (used below for live ready roots)
+// never returns quarantined generations, so this path scans the store
+// directory directly and reads each generation's record without running
+// recovery or mutating anything: a quarantined record whose final root is
+// the candidate path keeps the root. A read failure fails closed — the
+// caller keeps the root rather than expiring on an unreadable authority.
+func (m *Manager) retentionQuarantinedRoot(rootPath string) (bool, error) {
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return false, fmt.Errorf("runtime/worktree: retention quarantine acquisition check: %w", err)
+	}
+	records, err := acquisitions.QuarantinedRecords()
+	if err != nil {
+		return false, fmt.Errorf("runtime/worktree: retention quarantine acquisition read: %w", err)
+	}
+	for _, record := range records {
+		if filepath.Clean(record.FinalRoot) == filepath.Clean(rootPath) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // retainedRootLive reports whether a root is still live and must not
 // expire: leased (an active or release-pending terminal lease retains the
 // exact path), adopted (the manager tracks a live session at the root),
@@ -505,6 +530,13 @@ func (m *Manager) retainedRootLive(rootPath string) (bool, error) {
 		}
 	}
 	m.mu.Unlock()
+	quarantined, err := m.retentionQuarantinedRoot(rootPath)
+	if err != nil {
+		return false, err
+	}
+	if quarantined {
+		return true, nil
+	}
 	acquisitions, err := m.acquisitionStore()
 	if err != nil {
 		return false, fmt.Errorf("runtime/worktree: retention liveness acquisition check: %w", err)
@@ -793,6 +825,16 @@ func bytesTrimSpace(out []byte) []byte {
 // root archive provider, then removes the source root. The archive call
 // must succeed before the root is released: an archive failure keeps the
 // only source, exactly like the terminal-lease release path.
+//
+// The provider captures through ExportWorkarea plus the registry's
+// identity-continuous ArchiveRoot, which releases the published root
+// itself. The manager must not also release the record or remove the
+// directory underneath it: RemovePublishedRoot on a released generation
+// reconciles a lingering directory as QUARANTINED, and os.RemoveAll on
+// the archived source races the provider's own source removal. Both
+// sides return release-authority errors when the record is already
+// gone, so the legacy-flat fallback (no record matched) is the only
+// path that removes the source directly.
 func (m *Manager) archiveRetainedRoot(ctx context.Context, rootPath string) error {
 	acquisitions, err := m.acquisitionStore()
 	if err != nil {
@@ -917,7 +959,7 @@ func (m *Manager) dropExpiredArchives(ctx context.Context, policy RetentionPolic
 			skipped++
 			continue
 		}
-		before, beforeErr := freeSpace(m.parentDir)
+		before, beforeErr := freeSpace(m.retentionArchiveRoot())
 		if err := dropper(ctx, archive.ID, archive.Dir); err != nil {
 			return receipts, skipped, fmt.Errorf("runtime/worktree: drop archive %q: %w", archive.ID, err)
 		}
@@ -925,7 +967,7 @@ func (m *Manager) dropExpiredArchives(ctx context.Context, policy RetentionPolic
 			Root:           archive.Dir,
 			Disposition:    RetentionArchiveDropped,
 			Reason:         RetentionReasonArchiveAge,
-			BytesReclaimed: reclaimedBytes(m.parentDir, before, beforeErr),
+			BytesReclaimed: reclaimedBytes(m.retentionArchiveRoot(), before, beforeErr),
 			At:             m.clock(),
 		})
 	}

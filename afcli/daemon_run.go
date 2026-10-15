@@ -411,8 +411,9 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			worktreeParent := statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 			archiveRegistry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot, WorktreeParent: worktreeParent})
 			leaseManager, err := worktree.NewManager(worktree.Options{
-				ParentDir: worktreeParent,
-				Logger:    slog.Default(),
+				ParentDir:            worktreeParent,
+				Logger:               slog.Default(),
+				RetentionArchiveRoot: archiveRoot,
 				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
 					return archiveRegistry.ArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
 						AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
@@ -441,6 +442,14 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			go leaseManager.RunTerminalLeaseReaper(ctx, workarea.ReaperOptions{
 				OnError: func(err error) { slog.Warn("terminal lease reaping failed", "err", err) },
 			})
+			// The retention sweep expires retained roots and drops
+			// archives past their maximum age. It runs on the same
+			// daemon lifecycle as the lease reaper above: one pass at
+			// startup, then on the retention interval. A sweep failure
+			// never stops the loop — the next interval retries.
+			go daemon.RunRetentionSweeper(ctx, leaseManager, archiveRegistry,
+				daemon.LoadRetentionSettings(configPath), daemon.RetentionSweepInterval,
+				func(err error) { slog.Warn("retention sweep failed", "err", err) })
 			go func() {
 				cleanup := func() {
 					if _, err := leaseManager.CleanupTerminalQuarantines(ctx, workarea.SchedulerOptions{

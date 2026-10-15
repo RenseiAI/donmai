@@ -852,6 +852,40 @@ func TestWorkareaArchiveRegistry_DropArchive_RemovesDirectory(t *testing.T) {
 	}
 }
 
+func TestWorkareaArchiveRegistry_DropArchive_RejectsMismatchedManifestIdentity(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureArchive(t, root, fixtureArchive{
+		id: "wa-mismatch", manifest: archiveManifest{SessionID: "sess-mismatch"},
+		tree: map[string]string{"retained.txt": "retained"},
+	})
+	// Rewrite the manifest with a mismatched identity: the guard must
+	// refuse rather than remove a directory the manifest does not name.
+	dir := filepath.Join(root, "wa-mismatch")
+	manifestData, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest["id"] = "wa-other"
+	rewritten, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := reg.DropArchive("wa-mismatch"); !errors.Is(err, ErrArchiveCorrupted) {
+		t.Fatalf("mismatched drop error = %v, want ErrArchiveCorrupted", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tree", "retained.txt")); err != nil {
+		t.Fatalf("mismatched archive removed: %v", err)
+	}
+}
+
 func TestWorkareaArchiveRegistry_DropArchive_RejectsTraversal(t *testing.T) {
 	root := t.TempDir()
 	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})

@@ -299,14 +299,63 @@ func TestRetentionKeepsUnprovableRoot(t *testing.T) {
 
 // A quarantined root is untouched under pressure: the acquisition
 // authority proved no cleanup is authorized, so the pass must not dispose
-// of it. The fixture leaves an unproven directory at an abandoned
-// generation's final root: recovery quarantines the record, and the
-// quarantined root stays even though no lease retains it.
+// of it. The fixture abandons a generation mid-provision and plants a
+// clean clone at its final root: recovery quarantines the record (the
+// unproven directory fails identity verification), and the quarantined
+// root stays even though no lease retains it and the checkout is clean.
 func TestRetentionLeavesQuarantinedRootUntouched(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git unavailable")
 	}
-	t.Skip("quarantine fixture needs an acquisition-level record reader; tracked for the keeper follow-up")
+	remote := retentionBareRemote(t)
+	parent := t.TempDir()
+	now := time.Now()
+	owner, err := worktree.NewManager(worktree.Options{ParentDir: parent, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisitions, err := owner.AcquisitionStoreForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := workarea.RootPath(filepath.Join(parent, "wa-quarantined"))
+	acquisition, err := acquisitions.Begin(
+		"99999999-9999-4999-8999-999999999999", "wa_quarantined", final, "repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate process loss mid-provision: release the owner lock
+	// without committing, then plant an unproven checkout at the final
+	// root. The expiry manager is a fresh process: its acquisition
+	// store runs recovery on open, which quarantines the generation —
+	// the directory proves no authorized identity.
+	if err := acquisitions.Abandon(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	retentionGit(t, "", "clone", "--quiet", remote, final.String())
+	fresh, _, err := workarea.OpenExistingAcquisitionStore(parent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh == nil {
+		t.Fatal("existing acquisition store not found after abandon")
+	}
+	quarantined, err := fresh.RecordForAcquisitionID(acquisition.Record.AcquisitionID)
+	if err != nil || quarantined.State != workarea.AcquisitionQuarantined {
+		t.Fatalf("recovery classification = %+v, %v, want quarantined", quarantined, err)
+	}
+	retentionAgeRoot(t, final.String(), now)
+	manager := retentionExpiryManager(t, parent, func() time.Time { return now })
+	report, err := manager.ExpireRetainedRoots(context.Background(), retentionAgePolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Receipts) != 0 {
+		t.Fatalf("receipts = %+v, want none: quarantined roots are untouched", report.Receipts)
+	}
+	if _, err := os.Stat(final.String()); err != nil {
+		t.Fatalf("quarantined root expired: %v", err)
+	}
 }
 
 // A parked root is untouched under pressure: a release-pending terminal
@@ -379,6 +428,9 @@ func TestRetentionDropsExpiredArchives(t *testing.T) {
 	}
 	writeArchive("old-archive", now.Add(-31*24*time.Hour))
 	writeArchive("fresh-archive", now.Add(-time.Hour))
+	// The exact-boundary archive (age == maxAge) stays: the drop fires
+	// only past the maximum age, not on it.
+	writeArchive("boundary-archive", now.Add(-30*24*time.Hour))
 	var dropped []string
 	dropper := func(_ context.Context, id, dir string) error {
 		dropped = append(dropped, id)
@@ -399,6 +451,58 @@ func TestRetentionDropsExpiredArchives(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(archiveRoot, "fresh-archive")); err != nil {
 		t.Fatalf("fresh archive dropped: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(archiveRoot, "boundary-archive")); err != nil {
+		t.Fatalf("exact-boundary archive dropped: %v", err)
+	}
+}
+
+// The drop scan resolves against the configured archive root: with
+// divergent roots the pass drops from the configured directory, never
+// the default beside the worktree parent.
+func TestRetentionDropsFromConfiguredArchiveRoot(t *testing.T) {
+	parent := t.TempDir()
+	now := time.Now()
+	configured := t.TempDir()
+	decoy := filepath.Join(filepath.Dir(filepath.Clean(parent)), "workareas")
+	manager, err := worktree.NewManager(worktree.Options{
+		ParentDir: parent, Now: func() time.Time { return now },
+		RetentionArchiveRoot: configured,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRetentionArchive := func(root, id string, created time.Time) {
+		t.Helper()
+		dir := filepath.Join(root, id)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		body := `{"id":"` + id + `","createdAt":"` + created.UTC().Format(time.RFC3339Nano) + `"}`
+		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeRetentionArchive(configured, "configured-old", now.Add(-31*24*time.Hour))
+	var dropped []string
+	dropper := func(_ context.Context, id, dir string) error {
+		dropped = append(dropped, id+"="+dir)
+		return os.RemoveAll(dir)
+	}
+	report, err := manager.ExpireRetainedRoots(context.Background(), worktree.RetentionPolicy{
+		MaxAgeDays: -1, ArchiveMaxAgeDays: 30,
+	}, dropper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dropped) != 1 || dropped[0] != "configured-old="+filepath.Join(configured, "configured-old") {
+		t.Fatalf("dropped = %v, want the configured-root archive with its directory", dropped)
+	}
+	if len(report.Receipts) != 1 || report.Receipts[0].Disposition != worktree.RetentionArchiveDropped {
+		t.Fatalf("receipts = %+v, want one archive-dropped receipt", report.Receipts)
+	}
+	if _, err := os.Stat(decoy); !os.IsNotExist(err) {
+		t.Fatalf("drop scan touched the default archive root %q: %v", decoy, err)
 	}
 }
 
