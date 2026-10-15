@@ -14,7 +14,7 @@ func TestPromptAdaptation_ExactCLIWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	argv, stdin := buildArgs(headless, "", "")
+	argv, stdin := buildArgs(headless, "", "", "")
 	wantSystem := "protocol\n\nbase\n\nrole\n\ncontext"
 	if !containsPair(argv, "--append-system-prompt", wantSystem) {
 		t.Fatalf("headless argv does not carry exact system append: %q", argv)

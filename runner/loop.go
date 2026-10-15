@@ -309,9 +309,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		// and rejects the request with 400 when this is empty.
 		// Sourced from prompt.QueuedWork.IssueID (camelCase
 		// "issueId" on the wire).
-		IssueID:   qw.IssueID,
-		BaseURL:   qw.PlatformURL,
-		AuthToken: qw.AuthToken,
+		IssueID:     qw.IssueID,
+		BaseURL:     qw.PlatformURL,
+		AuthToken:   qw.AuthToken,
+		Traceparent: qw.Traceparent,
+		Tracestate:  qw.Tracestate,
 		// SessionClass stamps every lock-refresh body with the runtime
 		// session class so the platform's activity-stall reaper exempts an
 		// interactive session during human think-time (W4 amendment 4 —
@@ -1129,6 +1131,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: actCredentialProvider,
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		HTTPClient:         r.httpClient,
 		Logger:             r.logger,
 		// ProviderName flows onto the wire payload so the platform's
@@ -1261,6 +1265,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 	stepEmitter, stepErr := stepheartbeat.New(stepheartbeat.Config{
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		SessionID:          qw.SessionID,
 		WorkerID:           qw.WorkerID,
 		BaseURL:            qw.PlatformURL,

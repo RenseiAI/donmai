@@ -213,6 +213,11 @@ type PollWorkItem struct {
 	// the accounting sentinel rides the queue.
 	InjectedPoolID string `json:"injectedPoolId,omitempty"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is an opaque platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for nothing else. The daemon never parses,
 	// validates, or logs its value — it forwards the string onto SessionDetail
@@ -1383,6 +1388,7 @@ func pollItemCredentialMetadata(item PollWorkItem) (requirements []CredentialEnv
 // downstream embedder that builds a SessionSpec from its own poll
 // loop before calling a shared daemon's AcceptWorkWithDetail).
 func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(item.SessionID, item.CoAuthorName, item.CoAuthorEmail)
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
 	modelAuthor, endpointOperator, protocol, endpointSurface := pollItemDisplayAxes(item)
@@ -1419,6 +1425,8 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		// so the spec stays byte-identical for the existing fields (identity).
 		WorkType:              item.WorkType,
 		Mode:                  item.Mode,
+		CoAuthorName:          coAuthorName,
+		CoAuthorEmail:         coAuthorEmail,
 		McpAuthToken:          item.McpAuthToken,
 		McpAuthTokenExpiresAt: item.McpAuthTokenExpiresAt,
 	}
@@ -1667,6 +1675,7 @@ func WithSeatBudget(b *SessionSeatBudget) SessionDetailOption {
 // SessionDetailOption args customise the result without breaking existing
 // callers (the donmai-internal loop passes none).
 func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string, opts ...SessionDetailOption) *SessionDetail {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(item.SessionID, item.CoAuthorName, item.CoAuthorEmail)
 	if len(item.OperationalPayload) == 0 {
 		type pollWorkItemAlias PollWorkItem
 		if raw, err := json.Marshal(pollWorkItemAlias(item)); err == nil {
@@ -1737,6 +1746,8 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		WorkerID:                workerID,
 		AuthToken:               authToken,
 		PlatformURL:             platformURL,
+		CoAuthorName:            coAuthorName,
+		CoAuthorEmail:           coAuthorEmail,
 		McpAuthToken:            item.McpAuthToken,
 		McpAuthTokenExpiresAt:   item.McpAuthTokenExpiresAt,
 		CredentialPoolID:        item.InjectedPoolID,
