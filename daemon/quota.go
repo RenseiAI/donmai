@@ -161,21 +161,21 @@ func (q *quotaState) noteClaudeUpdate(update agent.UsageLimitsUpdate, at time.Ti
 // noteMuseProbe records one muse login-check outcome: the check
 // proves a supported CLI is installed, never usage windows, so the
 // muse entry always carries an empty window set beside its verdict.
-// Every attempt advances the probe clock, so retries stay inside the
-// 5-minute cadence even when the read fails.
+// A verdict — ok or refused — publishes the entry outright; only a
+// read that never reached the CLI leaves the previous entry
+// untouched. Every attempt advances the probe clock, so retries stay
+// inside the 5-minute cadence even when the read fails.
 func (q *quotaState) noteMuseProbe(accountID string, probed agent.UsageLimits, at time.Time) {
 	if q == nil {
 		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.muse = agent.ResolveUsageLimitsAfterProbe(q.muse, &probed)
 	q.museAt = at
 	if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessMuse, &probed, at); check != nil {
 		q.museAuth = check
-	}
-	if q.muse != nil && q.muse.Unavailable == nil {
 		q.museID = accountID
+		q.muse = &agent.UsageLimits{CheckedAt: agent.ISOTime(at), Windows: []agent.UsageWindow{}}
 	}
 }
 
