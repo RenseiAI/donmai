@@ -57,6 +57,14 @@ func TestResumeArgv_DropsNonPinFragments(t *testing.T) {
 		"two settings":         {"--settings", pin, "--settings", pin},
 		"empty settings value": {"--settings", ""},
 		"non-JSON value":       {"--settings", "not-json"},
+		// A pin whose session base URL is blank is not the pin: the
+		// driver's guard cannot tell it from a caller smuggling an empty
+		// override, so it vetoes. (Fallback blanks ride only beside a
+		// non-empty session destination; see TestIsRoutingPinJSON.)
+		"blank base URL with fallback blanks": {
+			"--settings",
+			`{"env":{"ANTHROPIC_BASE_URL":"","HTTPS_PROXY":""}}`,
+		},
 		"hooks envelope": {
 			"--settings",
 			`{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/bin/evil"}]}]},"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1"}}`,
@@ -94,6 +102,12 @@ func TestIsRoutingPinJSON(t *testing.T) {
 		`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1"}}`,
 		`{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1"}}`,
 		`{"env":{"CLAUDE_CODE_USE_VERTEX":"1","CLOUD_ML_REGION":"us-central1"}}`,
+		// The widened pin states fallback blanks alongside the session's
+		// own routing: a blank holds the ambient default on the winning
+		// layer so a repo naming a proxy or flipping a provider switch
+		// loses to it.
+		`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1","CLAUDE_CODE_USE_BEDROCK":"","CLAUDE_CODE_USE_VERTEX":"","CLAUDE_CODE_USE_FOUNDRY":"","ANTHROPIC_BEDROCK_BASE_URL":"","ANTHROPIC_VERTEX_BASE_URL":"","ANTHROPIC_FOUNDRY_BASE_URL":"","CLAUDE_CODE_USE_ANTHROPIC_AWS":"","CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD":"","CLAUDE_CODE_USE_MANTLE":"","CLAUDE_CODE_USE_GATEWAY":"","ANTHROPIC_AWS_BASE_URL":"","ANTHROPIC_GOOGLE_CLOUD_BASE_URL":"","ANTHROPIC_BEDROCK_MANTLE_BASE_URL":"","ANTHROPIC_UNIX_SOCKET":"","HTTP_PROXY":"","HTTPS_PROXY":"","ALL_PROXY":"","http_proxy":"","https_proxy":"","all_proxy":""}}`,
+		`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1","HTTPS_PROXY":"http://proxy.internal:8080"}}`,
 	}
 	for _, raw := range good {
 		if !isRoutingPinJSON(raw) {
@@ -109,6 +123,8 @@ func TestIsRoutingPinJSON(t *testing.T) {
 		`{"env":{"ANTHROPIC_AUTH_TOKEN":"sess-bearer"}}`,
 		`{"env":{"ANTHROPIC_API_KEY":"sess-bearer"}}`,
 		`{"env":{"ANTHROPIC_BASE_URL":""}}`,
+		`{"env":{"AWS_REGION":""}}`,
+		`{"env":{"CLOUD_ML_REGION":""}}`,
 		`{"env":{"UNRELATED":"x"}}`,
 		`{"env":"http://127.0.0.1:1/v1"}`,
 		`[]`,

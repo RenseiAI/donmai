@@ -11,10 +11,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestProcessGroupMemberCountSkipsZombies pins darwin's member count: a group
-// whose only member has exited but not been waited (a zombie) has no live
-// member, and the same group with a running member does.
-func TestProcessGroupMemberCountSkipsZombies(t *testing.T) {
+// TestProcessGroupMemberCountTreatsZombiesAsUnproved pins darwin's member
+// count: a group whose only member has exited but not been waited (a
+// zombie) is unproved — neither live nor gone — and the same group with a
+// running member is live. A zombie still exists in the kernel's table; its
+// parent, the runner, must wait it before the reap proof can pass. Linux
+// agrees: there a zombie still answers kill, so the group reads as alive.
+// The platforms diverge only if darwin reports such a group as gone, which
+// is the disagreement this test forbids.
+func TestProcessGroupMemberCountTreatsZombiesAsUnproved(t *testing.T) {
 	t.Parallel()
 
 	//nolint:gosec // G204: fixed test-only argv
@@ -50,8 +55,17 @@ func TestProcessGroupMemberCountSkipsZombies(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if live, err := processGroupHasLiveMember(pid); err != nil || live {
-		t.Fatalf("processGroupHasLiveMember(zombie-only group) = (%v,%v), want (false,nil)", live, err)
+	if live, err := processGroupHasLiveMember(pid); live || err == nil {
+		t.Fatalf("processGroupHasLiveMember(zombie-only group) = (%v,%v), want (false,unproved)", live, err)
+	}
+	// Once the parent waits its harness, the zombie is reaped and the same
+	// group proves gone: the runner's wait is what moves the proof, not the
+	// exit alone.
+	if err := exited.Wait(); err != nil {
+		t.Fatalf("wait the zombie harness: %v", err)
+	}
+	if gone, err := ProcessGroupGone(pid); err != nil || !gone {
+		t.Fatalf("ProcessGroupGone(waited group) = (%v,%v), want (true,nil)", gone, err)
 	}
 }
 

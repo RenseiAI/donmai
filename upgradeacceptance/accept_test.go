@@ -525,11 +525,13 @@ Loop:
 
 // TestUpgradeAcceptanceRed records the acceptance case red on current main:
 // headless seats are direct-owned children of the daemon, so a daemon
-// restart kills the seat instead of adopting it. The failure cause is the
-// selection rule: shimOwnsSession covers interactive sessions only, and the
-// local runtime holds (rather than adopts) a recovered session whose shim
-// it adopted. This test goes green once those slices land; until then it
-// pins the red with the cause attached.
+// restart would end a headless seat instead of adopting it. No seat is
+// dispatched yet — the red is read from the selection rule, never from a
+// seat the restart ended. The failure cause is the selection rule:
+// shimOwnsSession covers interactive sessions only, and the local runtime
+// holds (rather than adopts) a recovered session whose shim it adopted.
+// This test goes green once those slices land; until then it pins the red
+// with the cause attached.
 //
 // The gate follows the production selection predicate (headlessShimLaunch-
 // Enabled asks the daemon's own SessionShimOwnsSession about a headless
@@ -610,7 +612,11 @@ func TestHeadlessLaunchProbeTurnsGreenWithTheRule(t *testing.T) {
 // TestFailureMatrixRegistered pins the matrix shape: the row count, the
 // local/live split, and that every local row names the in-repo test that
 // drives it while no live row claims one (only the container records live
-// rows). The matrix is a harness, not a list: a new local row cannot land
+// rows). An adoption-gated local row additionally carries its live half:
+// the slot the container records once the adoption slices land. A live
+// half anywhere else — on a live row, or on a row that needs no adoption
+// — fails here, so a gated half cannot land where no gate exists. The
+// matrix is a harness, not a list: a new local row cannot land
 // without its driver, and TestSuiteDefinesEveryNamedDriver proves each
 // named driver exists.
 func TestFailureMatrixRegistered(t *testing.T) {
@@ -633,6 +639,7 @@ func TestFailureMatrixRegistered(t *testing.T) {
 		t.Fatal("matrix lists no live-seat cases; the container record would carry nothing")
 	}
 	local := 0
+	halves := 0
 	for _, c := range failureMatrix {
 		switch {
 		case c.local && c.driver == "":
@@ -642,10 +649,25 @@ func TestFailureMatrixRegistered(t *testing.T) {
 		case c.local:
 			local++
 		}
+		if c.liveHalf != "" {
+			if !c.local || !c.requiresAdoption {
+				t.Fatalf("matrix case %q carries live half %q but is not a local adoption-gated row; gated live halves ride local adoption-gated rows only", c.name, c.liveHalf)
+			}
+			halves++
+		}
 	}
 	const wantLocal = 9
 	if local != wantLocal {
 		t.Fatalf("matrix has %d local cases, want %d", local, wantLocal)
+	}
+	// The three adoption-gated local halves the record used to omit: the
+	// pending-replay row, the lease-fuse row, and the credential-push row.
+	const wantLiveHalves = 3
+	if halves != wantLiveHalves {
+		t.Fatalf("matrix has %d gated live halves, want %d", halves, wantLiveHalves)
+	}
+	if got := matrixLiveHalves(); len(got) != wantLiveHalves {
+		t.Fatalf("matrixLiveHalves = %+v, want %d slots", got, wantLiveHalves)
 	}
 }
 

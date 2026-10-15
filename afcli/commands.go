@@ -211,6 +211,14 @@ func (c Config) resolveURL() string {
 // This is the primary integration point for downstream CLIs that want
 // to embed Donmai functionality under their own root command
 // (e.g. `mycli agent list`, `mycli host status`, etc.).
+//
+// A composing binary's main must serve the confinement probe first, via
+// confinement.RunProbeFromEnv, before any interface of its own. Confined
+// sessions prove the host by re-executing the host binary (os.Executable in
+// the worker is the binary the embedder shipped) under both spawn paths and
+// waiting for the probe's handshake; a main that opens its own interface
+// instead is never answered, and every confined start fails fast with the
+// named probe_unserved cause instead of attesting the harness.
 func RegisterCommands(root *cobra.Command, cfg Config) {
 	// Wrap ClientFactory so every produced client carries the active
 	// org/project scope as `X-Rensei-Org` / `X-Rensei-Project` headers.

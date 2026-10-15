@@ -74,6 +74,11 @@ type Handle struct {
 	mcpErr       error
 
 	state *mapperState
+
+	// tail is the rollout context-notice tail start() launched, or nil
+	// when the session runs without notices. Set before the forwarder
+	// starts; the forwarder drains it on the terminal event.
+	tail *rolloutContextTail
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -112,6 +117,17 @@ func (h *Handle) SessionID() string {
 	h.idMu.RLock()
 	defer h.idMu.RUnlock()
 	return h.threadID
+}
+
+// codexHome returns the isolated home the session's rollout file lives
+// under, or "" when unknown (a unit-test handle with no provider). It is
+// the provider's own boundary home — never the ambient environment — so
+// the context-notice tail reads exactly this session's file.
+func (h *Handle) codexHome() string {
+	if h == nil || h.provider == nil || h.provider.config == nil {
+		return ""
+	}
+	return h.provider.config.home
 }
 
 // Events returns the read-only event channel. Closes after the
@@ -218,6 +234,36 @@ func (h *Handle) releaseMCPConfig() error {
 	return h.mcpErr
 }
 
+// isThreadNotFoundResumeError reports whether a thread/resume rejection
+// proves the thread is gone (or has no resumable history) rather than a
+// transient or authorization backend failure. The backend rejects two ways:
+// a typed JSON-RPC error whose message names the missing rollout/session
+// (verified against a real CLI: "no rollout found for thread id ..."),
+// or a plain-text rejection in the same shape. Matching is
+// case-insensitive and scoped to those shapes so an unrelated failure that
+// happens to mention a thread is never misread as gone — misreading it
+// would let the restore machine take fresh and orphan the prior work.
+func isThreadNotFoundResumeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, agent.ErrSessionNotFound) {
+		return true
+	}
+	lowered := strings.ToLower(err.Error())
+	for _, shape := range []string{
+		"no rollout found",
+		"no saved session found",
+		"no conversation found",
+		"thread not found",
+	} {
+		if strings.Contains(lowered, shape) {
+			return true
+		}
+	}
+	return false
+}
+
 // start performs the JSON-RPC bring-up: optional MCP config push,
 // thread/start (or thread/resume), subscribe, first turn/start.
 func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID string) error {
@@ -236,6 +282,17 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		}
 		if _, err := h.client.RequestWithRetry(ctx, "thread/resume", params, h.rpcTimeout); err != nil {
 			h.client.Unsubscribe(resumeThreadID)
+			// A rejected resume is not a fresh spawn: when the backend
+			// proves the thread is gone (no persisted rollout, no saved
+			// session) fail typed-not-found so the restore state
+			// machine (agent.DecideRestore / IsNoConversationFound)
+			// can admit fresh_primed; any other failure stays a plain
+			// resume error and escalates to attention_required. This
+			// mirrors the interactive attach path's
+			// resumeExistingNamedThreadWithRequest contract.
+			if isThreadNotFoundResumeError(err) {
+				return fmt.Errorf("%w: codex thread %q does not exist or has no resumable history: %w", agent.ErrSessionNotFound, resumeThreadID, err)
+			}
 			return fmt.Errorf("thread/resume: %w", err)
 		}
 	} else {
@@ -275,6 +332,13 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 	if _, err := h.client.RequestWithRetry(ctx, "turn/start", turnParams, h.rpcTimeout); err != nil {
 		return fmt.Errorf("turn/start: %w", err)
 	}
+
+	// Context-notice tail: the thread's rollout file carries the token_count
+	// events and compacted markers the RPC stream never surfaces. The home
+	// is the provider's own isolated home (never the ambient environment)
+	// and the thread id is the one just started or resumed above; either
+	// unknown (a unit-test handle with no provider) runs without notices.
+	h.tail = h.startContextTail(ctx)
 
 	// The forwarder is intentionally long-lived: it must survive
 	// Spawn() returning and run for the duration of the session.
@@ -353,6 +417,9 @@ func (h *Handle) handleNotification(n notification) bool {
 	for _, ev := range events {
 		switch ev.Kind() {
 		case agent.EventResult, agent.EventError:
+			// The turn's last token_count lands in the rollout moments
+			// before this notification; read it before Events closes.
+			h.tail.drain(h.emit)
 			if err := h.releaseMCPConfig(); err != nil {
 				h.emit(mcpCleanupErrorEvent())
 			} else {

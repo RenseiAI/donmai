@@ -3738,3 +3738,302 @@ func TestLinearListUnblockedBacklogEnvDefaults(t *testing.T) {
 func TestLinearClientImplementsInterface(_ *testing.T) {
 	var _ linear.Linear = (*linear.Client)(nil)
 }
+
+// ─── create-issue / update-issue --assignee ───────────────────────────────────
+
+// assigneeTestServer routes the user-resolution queries used by --assignee
+// (Viewer for "me", ListUsers for name/email) plus the issue mutations, and
+// records every resolution request and mutation input it sees.
+type assigneeTestServer struct {
+	t              *testing.T
+	viewerID       string
+	userID         string
+	userRequests   *int
+	viewerRequests *int
+	createInputs   []map[string]any
+	updateInputs   []map[string]any
+	teamJSON       string
+	issueJSON      string
+}
+
+func (s *assigneeTestServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Query     string         `json:"query"`
+		Variables map[string]any `json:"variables"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.t.Errorf("decode request: %v", err)
+		return
+	}
+	switch {
+	case strings.Contains(req.Query, "ListTeams"):
+		writeLinearGQLData(w, s.teamJSON)
+	case strings.Contains(req.Query, "GetIssue"):
+		writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, s.issueJSON))
+	case strings.Contains(req.Query, "Viewer"):
+		*s.viewerRequests++
+		writeLinearGQLData(w, fmt.Sprintf(`{"viewer":{"id":%q,"name":"Self","email":"self@example.com"}}`, s.viewerID))
+	case strings.Contains(req.Query, "ListUsers"):
+		*s.userRequests++
+		writeLinearGQLData(w, fmt.Sprintf(`{"users":{"nodes":[{"id":%q,"name":"Assignee","email":"assignee@example.com"}]}}`, s.userID))
+	case strings.Contains(req.Query, "CreateIssue"):
+		inp, _ := req.Variables["input"].(map[string]any)
+		s.createInputs = append(s.createInputs, inp)
+		writeLinearGQLData(w, fmt.Sprintf(`{"issueCreate":{"success":true,"issue":%s}}`, s.issueJSON))
+	case strings.Contains(req.Query, "UpdateIssue"):
+		inp, _ := req.Variables["input"].(map[string]any)
+		s.updateInputs = append(s.updateInputs, inp)
+		writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, s.issueJSON))
+	default:
+		s.t.Errorf("unexpected query: %s", req.Query)
+		writeLinearGQLData(w, `{}`)
+	}
+}
+
+func setupAssigneeTest(t *testing.T, issueJSON string) *assigneeTestServer {
+	t.Helper()
+	srv := &assigneeTestServer{
+		t:              t,
+		viewerID:       "viewer-user-id",
+		userID:         "assignee-user-id",
+		userRequests:   new(int),
+		viewerRequests: new(int),
+		teamJSON:       `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`,
+		issueJSON:      issueJSON,
+	}
+	setupLinearTest(t, srv.ServeHTTP)
+	return srv
+}
+
+func TestLinearCreateIssueAssignee(t *testing.T) {
+	tests := []struct {
+		name       string
+		flag       string
+		wantID     string
+		wantUsers  int
+		wantViewer int
+	}{
+		{name: "by email", flag: "assignee@example.com", wantID: "assignee-user-id", wantUsers: 1},
+		{name: "by name", flag: "Assignee", wantID: "assignee-user-id", wantUsers: 1},
+		{name: "me resolves viewer", flag: "me", wantID: "viewer-user-id", wantViewer: 1},
+		{name: "id passes through without lookup", flag: "11111111-2222-3333-4444-555555555555", wantID: "11111111-2222-3333-4444-555555555555"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issueJSON := issueNodeJSON("issue-new", "ENG-100", "Assigned Issue", "Backlog", "team-1", "ENG", "Engineering")
+			srv := setupAssigneeTest(t, issueJSON)
+
+			out, err := runLinearCmd(t, "", "create-issue", "--title", "Assigned Issue", "--team", "ENG", "--assignee", tt.flag)
+			if err != nil {
+				t.Fatalf("create-issue --assignee failed: %v\nout: %s", err, out)
+			}
+			if len(srv.createInputs) != 1 {
+				t.Fatalf("CreateIssue calls = %d, want 1", len(srv.createInputs))
+			}
+			if got := srv.createInputs[0]["assigneeId"]; got != tt.wantID {
+				t.Errorf("create assigneeId = %v, want %q", got, tt.wantID)
+			}
+			if *srv.userRequests != tt.wantUsers {
+				t.Errorf("ListUsers requests = %d, want %d", *srv.userRequests, tt.wantUsers)
+			}
+			if *srv.viewerRequests != tt.wantViewer {
+				t.Errorf("Viewer requests = %d, want %d", *srv.viewerRequests, tt.wantViewer)
+			}
+		})
+	}
+}
+
+func TestLinearCreateIssueAssigneeUnknownFailsBeforeMutate(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-new", "ENG-100", "Assigned Issue", "Backlog", "team-1", "ENG", "Engineering")
+	srv := setupAssigneeTest(t, issueJSON)
+	// Override resolution: no matching user.
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, srv.teamJSON)
+		case strings.Contains(req.Query, "ListUsers"):
+			writeLinearGQLData(w, `{"users":{"nodes":[]}}`)
+		case strings.Contains(req.Query, "CreateIssue"):
+			t.Error("CreateIssue must not run after failed assignee resolution")
+			writeLinearGQLData(w, `{}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "create-issue", "--title", "Assigned Issue", "--team", "ENG", "--assignee", "ghost@example.com")
+	if err == nil || !strings.Contains(err.Error(), "ghost@example.com") {
+		t.Fatalf("create-issue error = %v, want assignee resolution failure (out: %q)", err, out)
+	}
+	if out != "" {
+		t.Fatalf("create-issue wrote output after failed assignee resolution: %q", out)
+	}
+}
+
+func TestLinearUpdateIssueAssignee(t *testing.T) {
+	tests := []struct {
+		name       string
+		flag       string
+		wantID     any
+		wantUsers  int
+		wantViewer int
+	}{
+		{name: "by email", flag: "assignee@example.com", wantID: "assignee-user-id", wantUsers: 1},
+		{name: "me resolves viewer", flag: "me", wantID: "viewer-user-id", wantViewer: 1},
+		{name: "id passes through without lookup", flag: "11111111-2222-3333-4444-555555555555", wantID: "11111111-2222-3333-4444-555555555555"},
+		{name: "null clears", flag: "null", wantID: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+			srv := setupAssigneeTest(t, issueJSON)
+
+			out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--assignee", tt.flag)
+			if err != nil {
+				t.Fatalf("update-issue --assignee failed: %v\nout: %s", err, out)
+			}
+			if len(srv.updateInputs) != 1 {
+				t.Fatalf("UpdateIssue calls = %d, want 1", len(srv.updateInputs))
+			}
+			inp := srv.updateInputs[0]
+			got, present := inp["assigneeId"]
+			if tt.wantID == nil {
+				// Explicit null must be present as a JSON null (nil map value),
+				// not omitted like an unchanged field.
+				if !present || got != nil {
+					t.Errorf("update assigneeId = %#v (present %v), want explicit null", got, present)
+				}
+			} else if !present || got != tt.wantID {
+				t.Errorf("update assigneeId = %v (present %v), want %q", got, present, tt.wantID)
+			}
+			if len(inp) != 1 {
+				t.Errorf("update input = %#v, want only assigneeId", inp)
+			}
+			if *srv.userRequests != tt.wantUsers {
+				t.Errorf("ListUsers requests = %d, want %d", *srv.userRequests, tt.wantUsers)
+			}
+			if *srv.viewerRequests != tt.wantViewer {
+				t.Errorf("Viewer requests = %d, want %d", *srv.viewerRequests, tt.wantViewer)
+			}
+		})
+	}
+}
+
+func TestLinearUpdateIssueAssigneeOmittedWhenFlagAbsent(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	srv := setupAssigneeTest(t, issueJSON)
+
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--title", "Renamed")
+	if err != nil {
+		t.Fatalf("update-issue: %v\nout: %s", err, out)
+	}
+	if len(srv.updateInputs) != 1 {
+		t.Fatalf("UpdateIssue calls = %d, want 1", len(srv.updateInputs))
+	}
+	if _, present := srv.updateInputs[0]["assigneeId"]; present {
+		t.Errorf("update input carries assigneeId without --assignee: %#v", srv.updateInputs[0])
+	}
+	if *srv.userRequests != 0 || *srv.viewerRequests != 0 {
+		t.Errorf("user lookups ran without --assignee: users=%d viewer=%d", *srv.userRequests, *srv.viewerRequests)
+	}
+}
+
+func TestLinearUpdateIssueAssigneeUnknownFailsBeforeMutate(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListUsers"):
+			writeLinearGQLData(w, `{"users":{"nodes":[]}}`)
+		case strings.Contains(req.Query, "UpdateIssue"):
+			t.Error("UpdateIssue must not run after failed assignee resolution")
+			writeLinearGQLData(w, `{}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--assignee", "ghost@example.com")
+	if err == nil || !strings.Contains(err.Error(), "ghost@example.com") {
+		t.Fatalf("update-issue error = %v, want assignee resolution failure (out: %q)", err, out)
+	}
+	if out != "" {
+		t.Fatalf("update-issue wrote output after failed assignee resolution: %q", out)
+	}
+}
+
+func TestLinearCreateIssuePriority(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-new", "ENG-100", "Prioritised Issue", "Backlog", "team-1", "ENG", "Engineering")
+	srv := setupAssigneeTest(t, issueJSON)
+
+	out, err := runLinearCmd(t, "", "create-issue", "--title", "Prioritised Issue", "--team", "ENG", "--priority", "2")
+	if err != nil {
+		t.Fatalf("create-issue --priority failed: %v\nout: %s", err, out)
+	}
+	if len(srv.createInputs) != 1 {
+		t.Fatalf("CreateIssue calls = %d, want 1", len(srv.createInputs))
+	}
+	if p, ok := srv.createInputs[0]["priority"].(float64); !ok || int(p) != 2 {
+		t.Errorf("create priority = %v; want 2", srv.createInputs[0]["priority"])
+	}
+}
+
+func TestResolveAssigneeID(t *testing.T) {
+	stub := assigneeResolverStub{
+		users:  map[string]*linear.User{"ops@example.com": {ID: "user-1", Name: "Ops"}},
+		viewer: &linear.User{ID: "viewer-1", Name: "Self"},
+	}
+	for _, tt := range []struct {
+		name    string
+		raw     string
+		wantID  string
+		wantErr string
+	}{
+		{name: "uuid passes through", raw: "11111111-2222-3333-4444-555555555555", wantID: "11111111-2222-3333-4444-555555555555"},
+		{name: "me resolves viewer", raw: "me", wantID: "viewer-1"},
+		{name: "email resolves user", raw: "ops@example.com", wantID: "user-1"},
+		{name: "empty fails", raw: "  ", wantErr: "assignee must not be empty"},
+		{name: "unknown fails", raw: "ghost@example.com", wantErr: `resolve assignee "ghost@example.com"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveAssigneeID(context.Background(), stub, tt.raw)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("resolveAssigneeID error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveAssigneeID: %v", err)
+			}
+			if got != tt.wantID {
+				t.Errorf("resolved ID = %q, want %q", got, tt.wantID)
+			}
+		})
+	}
+}
+
+type assigneeResolverStub struct {
+	users  map[string]*linear.User
+	viewer *linear.User
+}
+
+func (s assigneeResolverStub) GetUserByNameOrEmail(_ context.Context, nameOrEmail string) (*linear.User, error) {
+	if u, ok := s.users[nameOrEmail]; ok {
+		return u, nil
+	}
+	return nil, errors.New("user not found")
+}
+
+func (s assigneeResolverStub) GetViewer(context.Context) (*linear.User, error) {
+	return s.viewer, nil
+}

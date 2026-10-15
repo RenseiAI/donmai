@@ -678,9 +678,9 @@ func TestBeatsNeverDecreaseUsage(t *testing.T) {
 		BaseURL:   srv.URL,
 		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
 			if second.Load() {
-				return stepheartbeat.UsageSnapshot{InputTokens: 100}
+				return stepheartbeat.UsageSnapshot{InputTokens: 100, TotalCostUsd: 0.005}
 			}
-			return stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 50}
+			return stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 50, TotalCostUsd: 0.02}
 		},
 		HTTPClient: srv.Client(),
 		Interval:   5 * time.Millisecond,
@@ -711,14 +711,55 @@ func TestBeatsNeverDecreaseUsage(t *testing.T) {
 	}
 	var last struct {
 		Usage *struct {
-			Input  int64 `json:"inputTokens"`
-			Output int64 `json:"outputTokens"`
+			Input  int64   `json:"inputTokens"`
+			Output int64   `json:"outputTokens"`
+			Cost   float64 `json:"totalCostUsd"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(bodies[len(bodies)-1]), &last); err != nil {
 		t.Fatalf("beat body is not JSON: %v", err)
 	}
-	if last.Usage == nil || last.Usage.Input != 300 || last.Usage.Output != 50 {
-		t.Fatalf("regressed snapshot reported as %+v; want the clamped {300 50}", last.Usage)
+	if last.Usage == nil || last.Usage.Input != 300 || last.Usage.Output != 50 || last.Usage.Cost != 0.02 {
+		t.Fatalf("regressed snapshot reported as %+v; want the clamped {300 50 0.02}", last.Usage)
+	}
+}
+
+func TestDispatchTraceHeaders(t *testing.T) {
+	t.Parallel()
+	const parent = "00-11111111111111111111111111111111-2222222222222222-01"
+	for _, tc := range []struct{ name, parent, state string }{
+		{name: "both", parent: parent, state: "vendor=value"},
+		{name: "parent-only", parent: parent},
+		{name: "state-only", state: "vendor=value"},
+		{name: "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var hits atomic.Int64
+			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+					if got := r.Header.Values(name); (want == "" && len(got) != 0) || (want != "" && (len(got) != 1 || got[0] != want)) {
+						t.Errorf("%s = %q, want %q (absent when empty)", name, got, want)
+					}
+				}
+				_, _ = w.Write([]byte(`{"refreshed":true}`))
+			})
+			e, err := stepheartbeat.New(stepheartbeat.Config{
+				SessionID: "session", WorkerID: "worker", BaseURL: srv.URL,
+				Traceparent: tc.parent, Tracestate: tc.state,
+				Interval: time.Hour, HTTPClient: srv.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.Stop() })
+			if err := e.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("requests = %d, want 1", got)
+			}
+		})
 	}
 }

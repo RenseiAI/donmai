@@ -218,3 +218,92 @@ func TestInteractiveRecordKeepsTheReleasedSchema(t *testing.T) {
 		t.Fatalf("interactive record encodes a workload member: %s; released readers refuse it", raw)
 	}
 }
+
+// TestSeatEpochFloorSurvivesDisposal pins the monotonic launch number: the
+// floor records the highest epoch launched, and raising it survives disposal
+// of the launch's seat record — so a relaunch after terminal cleanup names a
+// fresh scope instead of reusing one a stray process may still hold.
+// Reverting nextShimProcessEpoch to records-and-tombstones-only (or dropping
+// the floor write at launch) lets the next launch fall back to 1.
+func TestSeatEpochFloorSurvivesDisposal(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	if _, found, err := reg.SeatEpochFloor(id); err != nil || found {
+		t.Fatalf("SeatEpochFloor on a new identity = found %v, err %v; want absent", found, err)
+	}
+	if err := reg.RaiseSeatEpochFloor(id, 1); err != nil {
+		t.Fatalf("RaiseSeatEpochFloor: %v", err)
+	}
+	if floor, found, err := reg.SeatEpochFloor(id); err != nil || !found || floor != 1 {
+		t.Fatalf("SeatEpochFloor = %d, %v, %v; want 1, true, nil", floor, found, err)
+	}
+	// Monotonic: raising below the floor is a no-op, never a regression.
+	if err := reg.RaiseSeatEpochFloor(id, 1); err != nil {
+		t.Fatalf("RaiseSeatEpochFloor idempotent: %v", err)
+	}
+	if err := reg.RaiseSeatEpochFloor(id, 3); err != nil {
+		t.Fatalf("RaiseSeatEpochFloor: %v", err)
+	}
+	if floor, _, _ := reg.SeatEpochFloor(id); floor != 3 {
+		t.Fatalf("SeatEpochFloor = %d; want 3", floor)
+	}
+	// Disposal of the launch's seat record and tombstone leaves the floor:
+	// the sidecar is per identity, not per incarnation.
+	if err := reg.PutSeatLaunch(testSeatLaunch(id, 3)); err != nil {
+		t.Fatalf("PutSeatLaunch: %v", err)
+	}
+	if err := reg.RemoveSeatLaunch(id, 3); err != nil {
+		t.Fatalf("RemoveSeatLaunch: %v", err)
+	}
+	if floor, found, err := reg.SeatEpochFloor(id); err != nil || !found || floor != 3 {
+		t.Fatalf("SeatEpochFloor after disposal = %d, %v, %v; want 3, true, nil", floor, found, err)
+	}
+	// The floor file is not a discovery record: Scan never enumerates it.
+	entries, err := reg.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("Scan = %d entries; want none (the floor is not a record)", len(entries))
+	}
+	if strings.HasSuffix(seatEpochFloorName(id), recordSuffix) {
+		t.Errorf("floor name %q ends in the record suffix; Scan would read it as a discovery record", seatEpochFloorName(id))
+	}
+	// A sibling identity is unaffected.
+	sibling := Identity{OrgID: id.OrgID, SessionID: "sess-other"}
+	if _, found, _ := reg.SeatEpochFloor(sibling); found {
+		t.Error("sibling identity has a floor; want none")
+	}
+}
+
+// TestSeatEpochFloorRefusesMalformed pins the failure mode: a floor file
+// that carries a scope, posture or limit — or names another identity —
+// fails closed rather than reading as a floor a relaunch would trust.
+func TestSeatEpochFloorRefusesMalformed(t *testing.T) {
+	t.Parallel()
+
+	id := testIdentity()
+	reg := newTestRegistry(t)
+	if err := reg.RaiseSeatEpochFloor(Identity{}, 1); err == nil {
+		t.Error("RaiseSeatEpochFloor with an invalid identity succeeded; want a refusal")
+	}
+	// A floor file carrying a scope is not a floor.
+	scoped := testSeatLaunch(id, 2)
+	if err := reg.publish(seatEpochFloorName(id), mustEncodeSeatLaunch(t, scoped)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, _, err := reg.SeatEpochFloor(id); err == nil {
+		t.Error("SeatEpochFloor over a scoped file succeeded; want a refusal")
+	}
+}
+
+func mustEncodeSeatLaunch(t *testing.T, s SeatLaunch) []byte {
+	t.Helper()
+	raw, err := s.encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return raw
+}

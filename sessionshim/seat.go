@@ -43,6 +43,12 @@ import (
 )
 
 const (
+	// seatEpochFloorSuffix names the per-identity epoch-floor sidecar: the
+	// highest process epoch this identity has ever launched on this host.
+	// It deliberately does NOT end in the record suffix: Scan must never
+	// enumerate it as a discovery record, the same trap the seat launch
+	// record and the absence sidecar avoid.
+	seatEpochFloorSuffix    = ".seatfloor"
 	seatLaunchSchemaVersion = 1
 	// seatLaunchSuffix deliberately does NOT end in the record suffix: a name
 	// ending in `.json` would be enumerated by Scan as a discovery record.
@@ -207,6 +213,90 @@ func seatLaunchName(id Identity, processEpoch uint64) string {
 	correlation := id.Key() + "\x1f" + strconv.FormatUint(processEpoch, 10)
 	sum := sha256.Sum256([]byte(correlation))
 	return hex.EncodeToString(sum[:]) + seatLaunchSuffix
+}
+
+// seatEpochFloorName is the per-identity epoch-floor filename, digested from
+// the lifecycle identity the same way every other incarnation sidecar is.
+// One file per identity: the floor is per lifecycle identity, never per
+// incarnation.
+func seatEpochFloorName(id Identity) string {
+	sum := sha256.Sum256([]byte(id.Key()))
+	return hex.EncodeToString(sum[:]) + seatEpochFloorSuffix
+}
+
+// SeatEpochFloor reads the highest process epoch this identity has ever
+// launched: the floor the next launch must exceed. ok=false with a nil
+// error means no launch was ever recorded — the floor is zero and the next
+// epoch is 1. A file that exists but fails the size or schema bounds is an
+// error, never a silent zero: guessing low reuses a scope name the lineage
+// already burned.
+func (r *Registry) SeatEpochFloor(id Identity) (uint64, bool, error) {
+	raw, err := r.readEntry(seatEpochFloorName(id))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	floor, err := decodeSeatEpochFloor(raw)
+	if err != nil {
+		return 0, false, err
+	}
+	if floor.Identity() != id {
+		return 0, false, errors.New("sessionshim: seat epoch floor does not match the requested identity")
+	}
+	return floor.ProcessEpoch, true, nil
+}
+
+// RaiseSeatEpochFloor records that identity launched at processEpoch: the
+// floor moves to the higher of its current value and processEpoch, and is
+// written only when it moves. The write is monotonic — it never lowers the
+// floor — so disposal of the launch's seat record and tombstone cannot drag
+// the next launch back onto a scope name its lineage already used.
+func (r *Registry) RaiseSeatEpochFloor(id Identity, processEpoch uint64) error {
+	if err := id.Validate(); err != nil {
+		return err
+	}
+	floor, found, err := r.SeatEpochFloor(id)
+	if err != nil {
+		return err
+	}
+	if found && floor >= processEpoch {
+		return nil
+	}
+	floor = processEpoch
+	rec := SeatLaunch{
+		SchemaVersion:     seatLaunchSchemaVersion,
+		OrgID:             id.OrgID,
+		SessionID:         id.SessionID,
+		ProcessEpoch:      floor,
+		Mode:              SeatModeNone,
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("sessionshim: encode seat epoch floor: %w", err)
+	}
+	if len(raw) > maxSeatLaunchBytes {
+		return fmt.Errorf("sessionshim: seat epoch floor is %d bytes, max %d", len(raw), maxSeatLaunchBytes)
+	}
+	return r.publish(seatEpochFloorName(id), raw)
+}
+
+// decodeSeatEpochFloor decodes one epoch-floor file: the same closed schema
+// as a launch record, reusing its decoder and bounds. The floor carries no
+// scope and no limits — only the identity and the epoch — so a mode other
+// than none, or any scope, limit or timestamp the decoder bounds, is
+// refused rather than read as a floor.
+func decodeSeatEpochFloor(data []byte) (SeatLaunch, error) {
+	s, err := decodeSeatLaunch(data)
+	if err != nil {
+		return SeatLaunch{}, err
+	}
+	if s.Mode != SeatModeNone || s.Scope != "" || s.CPUs != 0 || s.MemoryMB != 0 || s.IOWeight != 0 {
+		return SeatLaunch{}, errors.New("sessionshim: seat epoch floor carries a scope, posture or limit")
+	}
+	return s, nil
 }
 
 // PutSeatLaunch durably publishes one launch's seat facts, replacing any

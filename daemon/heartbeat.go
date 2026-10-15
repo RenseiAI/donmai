@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon/seatstate"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -158,6 +159,13 @@ type HeartbeatOptions struct {
 	//
 	// Optional — leave nil to ignore. Phase 2e.
 	OnHostStatus func(detail HostStatusDetail)
+
+	// GetSeatStates returns one three-axis report per in-flight seat for
+	// this beat (session presence, activity with its decided-by rung,
+	// resumability, plus the orthogonal needs-input count). Called once
+	// per beat. Optional — leave nil to omit the seat keys entirely,
+	// matching the GetLoad convention.
+	GetSeatStates func() []seatstate.SeatReport
 
 	// HTTPClient is the client used for the real-endpoint call.
 	HTTPClient *http.Client
@@ -532,6 +540,20 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		}
 	}
 
+	// Three-axis seat state rides every beat when configured. A nil
+	// callback omits the seat keys entirely (a host that does not track
+	// seat state stays byte-identical). A non-nil return populates the
+	// per-seat projection and its summary fold; an empty return still
+	// reports the zero summary, so a zero-seat beat is distinguishable
+	// from an untracked one even though the empty seats slice itself is
+	// omitted per the omitempty contract.
+	if h.opts.GetSeatStates != nil {
+		reports := h.opts.GetSeatStates()
+		payload.Seats = append([]seatstate.SeatReport(nil), reports...)
+		summary := seatstate.Summarize(payload.Seats)
+		payload.SeatSummary = &summary
+	}
+
 	// Item 8: sample per-beat CPU/mem load when a sampler is configured.
 	// ok=false leaves payload.Load nil so the wire body omits the key
 	// entirely (best-effort — a sampling miss must never fail a beat).
@@ -722,7 +744,7 @@ func (h *HeartbeatService) projectAdmissionReport() (ProjectAdmissionReport, boo
 //
 //	{ status?, activeCount, activeInteractiveCount?, maxSessions?, load?,
 //	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures?,
-//	  quota? }
+//	  quota?, seats?, seatSummary? }
 //
 // activeInteractiveCount is the interactive-occupancy split of activeCount:
 // live Mode == "interactive" or legacy Mode == "interview" sessions count,
@@ -765,6 +787,18 @@ type heartbeatRequestBody struct {
 	// accounts. Omitted when the daemon reports no quota state; account
 	// IDs ride as opaque values the platform hashes.
 	Quota []agent.UsageAccount `json:"quota,omitempty"`
+	// Seats is the per-seat three-axis report (session presence, activity
+	// with its decided-by rung, resumability, plus needs-input). Nil
+	// omits the key: a host that does not track seat state sends no key
+	// at all. (An empty seat set omits the slice per the omitempty
+	// contract; the zero summary below is what distinguishes a zero-seat
+	// beat from an untracked one.)
+	Seats []seatstate.SeatReport `json:"seats,omitempty"`
+	// SeatSummary is the heartbeat-sized fold of Seats: axis counts plus
+	// the total needs-input count. Present whenever the seat callback is
+	// configured — including the zero summary of an empty seat set — and
+	// absent when seat state is untracked.
+	SeatSummary *seatstate.Summary `json:"seatSummary,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -892,6 +926,8 @@ func (h *HeartbeatService) callEndpoint(
 		QuarantinedSessions:    payload.QuarantinedSessions,
 		SessionShim:            payload.SessionShim,
 		Quota:                  payload.Quota,
+		Seats:                  payload.Seats,
+		SeatSummary:            payload.SeatSummary,
 	}
 	// NB: region is deliberately NOT sent on the heartbeat leg. The platform's
 	// heartbeat route parses no `region` key — region is a register-time-only

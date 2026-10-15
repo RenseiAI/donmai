@@ -287,8 +287,8 @@ func TestParity_CapsNarrowingOnly(t *testing.T) {
 // is a faithful additive projection, not a divergent second source of truth.
 func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 	providers := HarnessProvidersForParity()
-	if len(providers) != 8 {
-		t.Fatalf("expected 8 harness providers, got %d", len(providers))
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if p == nil {
@@ -470,6 +470,43 @@ func TestParity_GenericCostHonesty(t *testing.T) {
 	for _, c := range built.Matrix.Cells {
 		if c.NeedsAPIKey && c.BringsOwnAuth {
 			t.Errorf("cell %+v violates cost honesty: needsApiKey && bringsOwnAuth", c.Key())
+		}
+	}
+}
+
+// TestParity_SmokeEvidenceDerivedNotAuthored is the parity-gate half of the
+// computed-evidence rule: every generated cell's ProvingLanes/Stability/
+// Smoked must equal what the registry plus the gate outcomes derive — the
+// committed JSON carries no independent claim. It additionally pins that
+// every generated proving lane is actually registered (a stale committed
+// artifact carrying a renamed lane fails here, not just in the smoke
+// suite's own existence check).
+func TestParity_SmokeEvidenceDerivedNotAuthored(t *testing.T) {
+	t.Parallel()
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	byCell := SmokeProofsByCell()
+	for _, c := range built.Matrix.Cells {
+		stability, smoked, proving, err := deriveCellSmokeEvidence(c.Key(), byCell[c.Key()], lastSmokeGateOutcomes)
+		if err != nil {
+			t.Errorf("cell %+v: derive: %v", c.Key(), err)
+			continue
+		}
+		if c.Stability != stability || c.Smoked != smoked {
+			t.Errorf("cell %+v = stability %q smoked %v; derived %q/%v (evidence must be derived, not authored)",
+				c.Key(), c.Stability, c.Smoked, stability, smoked)
+		}
+		if len(c.ProvingLanes) != len(proving) {
+			t.Errorf("cell %+v provingLanes = %v; derived %v", c.Key(), c.ProvingLanes, proving)
+			continue
+		}
+		for i := range proving {
+			if c.ProvingLanes[i] != proving[i] {
+				t.Errorf("cell %+v provingLanes = %v; derived %v", c.Key(), c.ProvingLanes, proving)
+				break
+			}
 		}
 	}
 }

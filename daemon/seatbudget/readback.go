@@ -101,6 +101,138 @@ func readSeatLimitsWithRunner(scope string, userScope bool, run func(scope strin
 	return parseSeatShow(out)
 }
 
+// seatShowBatchTimeout bounds one batched status read: the whole batch
+// shares it, so a stalled bus cannot multiply one timeout per seat.
+const seatShowBatchTimeout = 5 * time.Second
+
+// ReadSeatLimitsBatch reads the limits of many scopes with one systemctl
+// invocation. scopes maps an opaque caller key to a scope unit; the result
+// carries the same keys. A key is absent (never present-with-zero) when its
+// scope could not be observed — same per-scope contract as ReadSeatLimits.
+// The caller key lets a status read fan many seats into one call without
+// coupling their cache identities to unit names.
+func ReadSeatLimitsBatch(scopes map[string]string, userScope bool) map[string]SeatLimits {
+	return readSeatLimitsBatchWithRunner(scopes, userScope, runSystemctlShowMany, runtime.GOOS)
+}
+
+// runSystemctlShowMany runs one `systemctl [--user] show` for many units.
+// systemctl answers one `\n`-separated block per unit in argv order; a
+// missing unit answers its defaults with exit 0, exactly as the single
+// read — LoadState separates it from a live scope.
+func runSystemctlShowMany(scopes []string, userScope bool) ([]byte, error) {
+	args := make([]string, 0, len(scopes)+2)
+	if userScope {
+		args = append(args, "--user")
+	}
+	args = append(args, "show")
+	args = append(args, scopes...)
+	args = append(args, "--property="+seatShowProperties)
+	ctx, cancel := context.WithTimeout(context.Background(), seatShowBatchTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "systemctl", args...).Output() //nolint:gosec // G204: fixed binary and property names; every unit name is validated against the digest shape before it gets here
+}
+
+// readSeatLimitsBatchWithRunner is ReadSeatLimitsBatch with the systemctl
+// call and the platform injected so tests pin the gate and the split on
+// any host.
+func readSeatLimitsBatchWithRunner(scopes map[string]string, userScope bool, run func(scopes []string, userScope bool) ([]byte, error), goos string) map[string]SeatLimits {
+	out := map[string]SeatLimits{}
+	if goos != "linux" || len(scopes) == 0 {
+		return out
+	}
+	keys := make([]string, 0, len(scopes))
+	units := make([]string, 0, len(scopes))
+	for key, scope := range scopes {
+		if !ValidScopeName(scope) {
+			continue
+		}
+		keys = append(keys, key)
+		units = append(units, scope)
+	}
+	if len(units) == 0 {
+		return out
+	}
+	raw, err := run(units, userScope)
+	if err != nil {
+		return out
+	}
+	for i, block := range splitSeatShowBlocks(string(raw), len(units)) {
+		if limits, ok := parseSeatShow([]byte(block)); ok {
+			out[keys[i]] = limits
+		}
+	}
+	return out
+}
+
+// splitSeatShowBlocks cuts multi-unit `systemctl show` output into one
+// block per unit. Every unit's block ends at its blank separator line:
+// blocks are split on empty lines, and a block missing LoadState (a
+// truncated tail) parses as nothing — parseSeatShow refuses it.
+func splitSeatShowBlocks(raw string, want int) []string {
+	var blocks []string
+	var current []string
+	flush := func() {
+		if len(current) > 0 {
+			blocks = append(blocks, strings.Join(current, "\n")+"\n")
+			current = nil
+		}
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.TrimSpace(line) == "" {
+			flush()
+			continue
+		}
+		current = append(current, line)
+	}
+	flush()
+	for len(blocks) < want {
+		blocks = append(blocks, "")
+	}
+	return blocks[:want]
+}
+
+// StopSeatScope releases one finished seat's transient scope: `systemctl
+// [--user] stop` against the seat's own unit. A stray process that left
+// the worker's process group keeps an otherwise-finished scope loaded; the
+// stop reaps it so a later relaunch never meets its predecessor's name.
+// The stop is best-effort: a scope that already collected is gone, which
+// is the outcome wanted — only a transport failure is an error.
+func StopSeatScope(scope string, userScope bool) error {
+	return stopSeatScopeWithRunner(scope, userScope, runSystemctlStop, runtime.GOOS)
+}
+
+// runSystemctlStop runs `systemctl [--user] stop <scope>`. The binary is
+// fixed; only the scope unit (validated against the digest shape) and the
+// bus flag vary.
+func runSystemctlStop(scope string, userScope bool) error {
+	args := []string{"stop", scope}
+	if userScope {
+		args = append([]string{"--user"}, args...)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	//nolint:gosec // G204: fixed binary; the unit name is validated against the digest shape before it gets here
+	if out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("seatbudget: stop scope %s: %w: %s", scope, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// stopSeatScopeWithRunner is StopSeatScope with the systemctl call and the
+// platform injected so tests pin the gate on any host.
+func stopSeatScopeWithRunner(scope string, userScope bool, run func(scope string, userScope bool) error, goos string) error {
+	if goos != "linux" {
+		return nil
+	}
+	if scope == "" {
+		return nil
+	}
+	if !ValidScopeName(scope) {
+		return fmt.Errorf("seatbudget: stop scope %q: not a seat scope unit", scope)
+	}
+	return run(scope, userScope)
+}
+
 // parseSeatShow parses `systemctl show` output for the seat properties. The
 // output order is not the requested order, so it parses by key. Every
 // property must be present: a partial answer is not an observation.

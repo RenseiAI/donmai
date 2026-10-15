@@ -17,10 +17,16 @@ import (
 // has a member. ESRCH proves that none exists, and a nil answer proves one
 // does. EPERM means no member could be signalled, which is ambiguous: on
 // Linux it means a live member owned by another user, but darwin also answers
-// EPERM for a group that still exists with no live member left while it is
-// being torn down. So on EPERM the members are counted directly
-// (processGroupHasLiveMember) rather than guessed. Any other error, or a count
-// that cannot be read, is unproved and returned.
+// EPERM for a group whose table entry still exists while it is being torn
+// down — including a group whose only member is a zombie the parent has not
+// yet waited. So on EPERM the members are counted directly
+// (processGroupHasLiveMember) rather than guessed. Any other error, a count
+// that cannot be read, or a zombie-only membership is unproved and returned:
+// an exited-but-unwaited member still exists, and the runner must wait its
+// harness before the proof can pass. That is also what keeps the platforms
+// in agreement: Linux reports the same zombie-only group as alive (a zombie
+// still answers kill), so a darwin "gone" there would be a cross-platform
+// disagreement about one kernel state.
 //
 // A runner waits its harness before it asks, so "gone" means reaped rather
 // than merely exited. The caller's own process group can never be proved gone,

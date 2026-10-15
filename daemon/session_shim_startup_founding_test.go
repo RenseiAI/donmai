@@ -27,7 +27,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 // startupFoundingHarness is one fake control plane plus a daemon constructed
@@ -576,12 +575,13 @@ func TestOrphanedFirstHeartbeatFenceDoesNotCloseTheClaimGate(t *testing.T) {
 	}
 }
 
-// TestHealthyFirstHeartbeatFenceStillClosesTheClaimGate is the control: a
-// pending first-heartbeat acknowledgement for a scope the daemon DOES hold
-// authority for keeps the host-wide claim gate closed until the exact
-// heartbeat is acknowledged. The orphan rule above must not loosen the live
-// fence.
-func TestHealthyFirstHeartbeatFenceStillClosesTheClaimGate(t *testing.T) {
+// TestHealthyFirstHeartbeatFenceClosesOnlyThatOrgIsClaimGate is the
+// per-organization control: a pending first-heartbeat acknowledgement for a
+// scope the daemon DOES hold authority for keeps THAT scope from claiming
+// until the exact heartbeat is acknowledged — while the host-wide gate stays
+// open and every other scope keeps claiming. The orphan rule above must not
+// loosen the live fence, and the live fence must not stall the host.
+func TestHealthyFirstHeartbeatFenceClosesOnlyThatOrgIsClaimGate(t *testing.T) {
 	h := newStartupFoundingHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -602,15 +602,17 @@ func TestHealthyFirstHeartbeatFenceStillClosesTheClaimGate(t *testing.T) {
 	h.daemon.shims.mu.Unlock()
 	h.daemon.sessionShimReadinessWithdrawn.Store(true)
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if suspended, _ := h.daemon.PollClaimGate()(); suspended {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the claim gate opened behind a live first-heartbeat fence")
-		}
-		time.Sleep(time.Millisecond)
+	// The fenced scope does not claim.
+	if suspended, _ := h.daemon.PollClaimGateForOrg()(scope); !suspended {
+		t.Fatal("the per-org claim gate opened behind a live first-heartbeat fence")
+	}
+	// But the host-wide gate stays open: one pending scope stalls nothing.
+	if suspended, reason := h.daemon.PollClaimGate()(); suspended {
+		t.Fatalf("the host-wide claim gate closed behind one live first-heartbeat fence: %s", reason)
+	}
+	// And an unrelated scope keeps claiming.
+	if suspended, reason := h.daemon.PollClaimGateForOrg()("org-never-fenced"); suspended {
+		t.Fatalf("an unfenced scope does not claim behind another scope's fence: %s", reason)
 	}
 }
 

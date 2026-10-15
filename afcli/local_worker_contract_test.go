@@ -12,7 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/result"
 	"github.com/spf13/cobra"
 )
 
@@ -180,5 +182,73 @@ func TestRunAgentRunLocalV2ConstructsOnlyAdmittedHostAuthProvider(t *testing.T) 
 	})
 	if err == nil || !strings.Contains(err.Error(), "no available provider") {
 		t.Fatalf("invalid host login home reached an unauthenticated worker provider: %v", err)
+	}
+}
+
+func TestLocalPosterAuthTokenUsesAttemptBearer(t *testing.T) {
+	t.Parallel()
+	// A local detail carries no controller credential by design, so the
+	// Poster construction default must be the attempt bearer from the
+	// spawn environment — without it a failed credential re-read falls
+	// back to an empty default and the local receiver answers 401.
+	if got := localPosterAuthToken(&daemon.SessionDetail{AuthToken: ""}, "attempt-bearer", true); got != "attempt-bearer" {
+		t.Fatalf("local poster token=%q, want the attempt bearer", got)
+	}
+	if got := localPosterAuthToken(&daemon.SessionDetail{AuthToken: "controller-token"}, "attempt-bearer", false); got != "controller-token" {
+		t.Fatalf("platform poster token=%q, want the detail credential", got)
+	}
+	if got := localPosterAuthToken(nil, "attempt-bearer", false); got != "" {
+		t.Fatalf("nil detail poster token=%q, want empty", got)
+	}
+}
+
+func TestLocalWorkerCredentialCacheSeedsAttemptBearer(t *testing.T) {
+	t.Parallel()
+	// A local detail carries no controller credential by design, so the
+	// worker's only credential is the attempt bearer from its spawn
+	// environment. The first terminal send happens before any re-read
+	// (and re-reads can fail transiently); without the bearer as the
+	// Poster construction default the send carries no Authorization
+	// header and the local receiver answers 401. This mirrors the
+	// production wiring in runAgentRun: the cache re-read fails here
+	// (no daemon serves the detail route), so the Poster default is
+	// what authenticates the first replay.
+	var firstAuth atomic.Value
+	var statusRequests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/status") {
+			statusRequests.Add(1)
+			if firstAuth.Load() == nil {
+				firstAuth.Store(r.Header.Get("Authorization"))
+			}
+		}
+		if r.Header.Get("Authorization") != "Bearer attempt-bearer" {
+			http.Error(w, "attempt authentication required", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	cache := newAgentRunCredentialCache(srv.Client(), srv.URL, "session_x", "attempt-bearer", &daemon.SessionDetail{SessionID: "session_x", WorkerID: "worker-x"})
+	cache.localRuntime = true
+	cache.authToken = "attempt-bearer"
+	poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker-x", AuthToken: "attempt-bearer", HTTPClient: srv.Client(), BaseDelay: 0, CredentialProvider: cache.resultCredentials})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := poster.PrepareTerminalStatusBody(context.Background(), "session_x", agent.Result{Status: "completed", Summary: "done"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := poster.ReplayTerminalStatus(context.Background(), "session_x", poster.ReceiverKey(), body); err != nil {
+		got, _ := firstAuth.Load().(string)
+		t.Fatalf("first replay: %v (first status Authorization=%q)", err, got)
+	}
+	got, _ := firstAuth.Load().(string)
+	if got != "Bearer attempt-bearer" {
+		t.Fatalf("first status Authorization=%q, want the attempt bearer", got)
+	}
+	if statusRequests.Load() != 1 {
+		t.Fatalf("status requests=%d, want exactly 1 (no bearerless retry storm)", statusRequests.Load())
 	}
 }

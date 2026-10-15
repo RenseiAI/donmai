@@ -20,7 +20,12 @@ import (
 
 // ProbeEnv names the environment variable that turns an executable into the
 // self-test probe. Its value is the path of the probe plan. An executable
-// that can serve as the probe calls RunProbeFromEnv first thing in main.
+// that can serve as the probe calls RunProbeFromEnv first thing in main,
+// before any UI, flag parsing or other startup: the self-test re-executes
+// the host binary under both spawn paths (headless and PTY) and waits for
+// the probe's handshake, so a main that opens its own interface instead of
+// serving the probe is never answered and the self-test fails fast with
+// probe_unserved instead of stalling on the proof budget.
 const ProbeEnv = "DONMAI_CONFINEMENT_PROBE"
 
 // landlockStageEnv marks a harness-process execution as the Linux backend's
@@ -123,7 +128,10 @@ type stepResult struct {
 
 // RunProbeFromEnv runs the self-test probe when ProbeEnv is set and reports
 // whether it did, with the exit code the process should end with. The
-// caller exits; a library never does.
+// caller exits; a library never does. Serving starts with a handshake file
+// beside the plan (see probeHandshakePath), written before the plan is even
+// read, so the parent can tell a serving probe from an executable whose
+// main never reached the probe.
 func RunProbeFromEnv() (handled bool, exitCode int) {
 	if handled, code := RunLandlockStageFromEnv(); handled {
 		return true, code
@@ -153,6 +161,14 @@ func RunProbeFromEnv() (handled bool, exitCode int) {
 }
 
 func runProbe(planPath string) error {
+	// The handshake comes first, before the plan is read: it proves this
+	// process serves the probe at all, independent of whether the boundary
+	// lets it read the plan back. A main that never reaches the probe (an
+	// embedder interface opened under the PTY instead) emits nothing, and
+	// the parent fails the pass fast with probe_unserved.
+	if err := writeProbeHandshake(planPath); err != nil {
+		return fmt.Errorf("write handshake: %w", err)
+	}
 	raw, err := os.ReadFile(planPath) //nolint:gosec // G304: the plan path is the probe's own input.
 	if err != nil {
 		return fmt.Errorf("read plan: %w", err)
@@ -177,6 +193,24 @@ func runProbe(planPath string) error {
 		return fmt.Errorf("write results: %w", err)
 	}
 	return nil
+}
+
+// probeHandshakePath is where the probe announces it is serving: beside the
+// plan, inside the session tmp the boundary leaves writable. The parent
+// polls for it under its own short bound (SelfTestOptions.
+// ProbeHandshakeTimeout), separate from the proof budget that bounds the
+// whole pass: a child that never serves the probe — an executable whose
+// main opened its own interface instead of running it — emits nothing and
+// fails the pass with probe_unserved instead of burning the proof budget.
+func probeHandshakePath(planPath string) string {
+	return planPath + ".handshake"
+}
+
+// writeProbeHandshake announces a serving probe. Existence is the signal;
+// the content is a fixed token for a human reading the scratch directory.
+func writeProbeHandshake(planPath string) error {
+	//nolint:gosec // G304: the plan path is the probe's own input, as with the plan read below.
+	return os.WriteFile(probeHandshakePath(planPath), []byte("ready\n"), 0o600)
 }
 
 func runStep(step probeStep) stepResult {

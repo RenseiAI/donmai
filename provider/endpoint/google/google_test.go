@@ -2,6 +2,7 @@ package google
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -97,5 +98,32 @@ func TestResolve_UnknownHost(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Resolve(unknown host) = nil error, want loud failure")
+	}
+}
+
+func TestManifest_Hosts(t *testing.T) {
+	var got []agent.ServingHost
+	for _, host := range New().Manifest().Hosts {
+		got = append(got, host.Host)
+	}
+	want := []agent.ServingHost{agent.HostDirect, agent.HostVertex, agent.HostLocal}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("declared hosts = %v, want %v", got, want)
+	}
+}
+
+func TestResolve_SubscriptionHostRejected(t *testing.T) {
+	for _, auth := range []agent.AuthMode{agent.AuthHostSession, agent.AuthLocal} {
+		t.Run(string(auth), func(t *testing.T) {
+			got, err := New().Resolve(context.Background(), agent.EndpointRequest{
+				Model: "gemini-2.5-pro", Host: agent.HostOAuthCLI, Auth: auth,
+			})
+			if err == nil || !strings.Contains(err.Error(), `unknown serving host "oauth-cli"`) {
+				t.Fatalf("Resolve(subscription host) error = %v, want unknown serving host", err)
+			}
+			if !got.IsZero() {
+				t.Fatalf("Resolve(subscription host) returned binding = %+v, want zero", got)
+			}
+		})
 	}
 }

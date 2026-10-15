@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon/seatstate"
 	"github.com/RenseiAI/donmai/runner/access"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -232,6 +233,11 @@ type SessionSpec struct {
 	// from WorkType/Mode.
 	Workload string `json:"workload,omitempty"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is the platform-minted per-session MCP gateway bearer.
 	// Carried opaquely so the embedder's pre-spawn rail can atomically seed
 	// the token file before env injection. Absent on pre-fix dispatches.
@@ -424,6 +430,18 @@ type HeartbeatPayload struct {
 	// from the wire body) otherwise. Account IDs ride as opaque values
 	// the platform hashes — the payload never carries an address.
 	Quota []agent.UsageAccount `json:"quota,omitempty"`
+
+	// Seats is the per-seat three-axis report for this beat: session
+	// presence, activity with its decided-by rung, resumability, plus
+	// the orthogonal needs-input signal. Populated from
+	// HeartbeatOptions.GetSeatStates when configured; nil (and thus
+	// omitted from the wire body) otherwise, so a host that does not
+	// track seat state stays byte-identical.
+	Seats []seatstate.SeatReport `json:"seats,omitempty"`
+
+	// SeatSummary folds Seats into heartbeat-sized axis counts plus the
+	// total needs-input count. Present exactly when Seats is.
+	SeatSummary *seatstate.Summary `json:"seatSummary,omitempty"`
 }
 
 // ── Auto-update channel/schedule ───────────────────────────────────────────

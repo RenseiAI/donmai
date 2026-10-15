@@ -469,8 +469,9 @@ func TestRun_PullRefThatLagsAPushIsReverified(t *testing.T) {
 		t.Fatalf("PullRequestURL=%q Status=%q (%s: %s); want the session's own PR accepted once its ref caught up",
 			res.PullRequestURL, res.Status, res.FailureMode, res.Error)
 	}
-	if len(provider.prompts) != 1 || provider.prompts[0] != continuePrompt {
-		t.Errorf("prompts = %q; want one continuation, then acceptance", provider.prompts)
+	if len(provider.prompts) != 1 || !strings.HasSuffix(provider.prompts[0], "\n\n"+continuationGoalForTest) ||
+		strings.TrimSuffix(provider.prompts[0], "\n\n"+continuationGoalForTest) != continuePrompt {
+		t.Errorf("prompts = %q; want one goal-restated continuation, then acceptance", provider.prompts)
 	}
 }
 

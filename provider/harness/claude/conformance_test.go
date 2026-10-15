@@ -98,3 +98,44 @@ func TestProvider_Spawn_ConformsToTerminalEventContract(t *testing.T) {
 		t.Errorf("terminal-event contract violated: %v", err)
 	}
 }
+
+func TestSpawn_GenerationIDWithoutUsage(t *testing.T) {
+	t.Parallel()
+	for _, line := range []string{
+		`{"type":"assistant","message":{"id":"response-one","content":[]}}`,
+		`{"type":"stream_event","event":{"type":"message_start","message":{"id":"response-one"}}}`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			t.Parallel()
+			cli := writeFakeCLI(t, "fake-response-id.sh", "#!/bin/sh\n"+
+				`printf '{"type":"system","subtype":"init","session_id":"session"}\n'`+"\n"+
+				"printf '%s\\n' '"+line+"'\n"+
+				`printf '{"type":"result","subtype":"success","is_error":false}\n'`+"\n")
+			p, err := New(Options{Binary: cli, LookPath: func(name string) (string, error) { return name, nil }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "hi"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = h.Stop(t.Context()) })
+			for {
+				select {
+				case event, ok := <-h.Events():
+					if !ok {
+						t.Fatal("stream closed without response id")
+					}
+					if ev, ok := event.(agent.SystemEvent); ok && ev.GenerationID == "response-one" {
+						return
+					}
+					if _, ok := event.(agent.ResultEvent); ok {
+						t.Fatal("terminal event arrived without response id")
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("response id did not arrive")
+				}
+			}
+		})
+	}
+}

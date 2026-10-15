@@ -297,6 +297,12 @@ type Options struct {
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
 
+	// StepHeartbeatInterval overrides the per-session step-heartbeat
+	// cadence. Zero falls back to runtime/stepheartbeat.DefaultInterval.
+	// Tests use it to compress liveness timing without touching the
+	// ownership pulse.
+	StepHeartbeatInterval time.Duration
+
 	// SpanEmissionEnabled explicitly enables the additive per-call span
 	// pipeline. Platform dispatchers may instead advertise
 	// CapabilitySpanIngest per session; either signal enables it. Default false
@@ -476,13 +482,12 @@ type KitSkillDetector func(repoRoot, targetOS string) ([]kit.KitSkillSource, err
 type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error)
 
 // ShimSeatConfig identifies one shim-owned seat to the runner: the attempt
-// is the launch contract's monotonic per-session incarnation counter, and it
-// disambiguates repeated runs of the same session in the standalone outbox
-// key. Zero is a valid first attempt; the zero value of the POINTER (nil)
-// is what disables the behaviour.
+// is the session-scoped terminal sequence the runner assigns to its terminal
+// body — 1 for the runner's own terminal status — so the key stays fixed
+// across shim resumes. Zero is never a valid attempt; the zero value of the
+// POINTER (nil) is what disables the behaviour.
 type ShimSeatConfig struct {
-	// Attempt is the per-session incarnation counter from the shim launch
-	// contract (sessionshim Launch.ProcessEpoch).
+	// Attempt is the session-scoped terminal sequence for the outbox key.
 	Attempt uint64
 }
 
@@ -659,6 +664,7 @@ func New(opts Options) (*Runner, error) {
 		skipSteering:                     opts.SkipSteering,
 		skipPostSession:                  opts.SkipPostSession,
 		hbInterval:                       opts.HeartbeatInterval,
+		stepHeartbeatInterval:            opts.StepHeartbeatInterval,
 		spanEmissionEnabled:              opts.SpanEmissionEnabled,
 		spanEndpointPath:                 opts.SpanEndpointPath,
 		kitSkillSources:                  opts.KitSkillSources,
@@ -910,16 +916,18 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// unlike the lease path, where a missing hold means the successful
 	// workarea cannot be proved retained and the seat must fail.
 	standalonePrepared := false
-	if r.shimSeat != nil && res.Status != "" {
-		standaloneBody := preparedStatusBody
-		if !leasePrepared {
-			var bodyErr error
-			standaloneBody, bodyErr = r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
-			if bodyErr != nil {
-				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
-					"sessionId", qw.SessionID, "err", bodyErr)
-				standaloneBody = nil
-			}
+	// A terminal body lives in exactly one record. When the lease path
+	// already prepared the body, the standalone outbox stays empty: the
+	// lease-bound record owns the replay. Persisting both would leave two
+	// records for one session, and the lease loop plus the standalone
+	// loop would send the same terminal twice if the runner died before
+	// the first send.
+	if r.shimSeat != nil && res.Status != "" && !leasePrepared {
+		standaloneBody, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+		if bodyErr != nil {
+			r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+				"sessionId", qw.SessionID, "err", bodyErr)
+			standaloneBody = nil
 		}
 		if standaloneBody != nil {
 			standaloneDigest, identityErr := stableTerminalResultID(qw.SessionID, res.Result)
@@ -932,7 +940,11 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 			} else if _, saveErr := r.wt.SaveStandaloneTerminalOutbox(context.Background(), workarea.StandaloneOutboxSaveSpec{
 				SessionID: qw.SessionID, Attempt: r.shimSeat.Attempt, TerminalResultID: standaloneDigest,
 				ReceiverKey: r.poster.ReceiverKey(), Body: standaloneBody,
-				DeadlineAt: r.now().Add(workarea.MaximumLeaseDuration).UTC().Truncate(time.Millisecond),
+				// The record's own delivery bound, not a borrowed lease
+				// duration: a daemon back after the lease window must
+				// still replay an unsent terminal rather than
+				// dead-letter it on arrival.
+				DeadlineAt: r.now().Add(workarea.StandaloneOutboxDeadline).UTC().Truncate(time.Millisecond),
 				Kind:       workarea.StandaloneOutboxTerminal,
 			}); saveErr != nil {
 				r.logger.Warn("standalone terminal status body not persisted; sending without replay",

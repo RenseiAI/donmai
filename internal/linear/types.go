@@ -188,6 +188,7 @@ type CreateIssueInput struct {
 	ParentID    string   `json:"parentId,omitempty"`
 	LabelIDs    []string `json:"labelIds,omitempty"`
 	AssigneeID  string   `json:"assigneeId,omitempty"`
+	Priority    int      `json:"priority,omitempty"` // 0=no priority,1=urgent,2=high,3=medium,4=low; 0 omits the field (Linear defaults to no priority)
 }
 
 // UpdateIssueInput is the input for updating a Linear issue.
@@ -197,10 +198,10 @@ type UpdateIssueInput struct {
 	StateID     string   `json:"stateId,omitempty"`
 	ProjectID   string   `json:"projectId,omitempty"`
 	LabelIDs    []string `json:"labelIds,omitempty"`
-	ParentID    *string  `json:"parentId,omitempty"` // pointer so null can be sent
-	AssigneeID  string   `json:"assigneeId,omitempty"`
-	Priority    *int     `json:"priority,omitempty"` // 0=no priority,1=urgent,2=high,3=medium,4=low
-	Estimate    *int     `json:"estimate,omitempty"` // story points / t-shirt size value
+	ParentID    *string  `json:"parentId,omitempty"`   // pointer so null can be sent
+	AssigneeID  *string  `json:"assigneeId,omitempty"` // pointer so null can be sent; nil omits, pointer-to-empty clears
+	Priority    *int     `json:"priority,omitempty"`   // 0=no priority,1=urgent,2=high,3=medium,4=low
+	Estimate    *int     `json:"estimate,omitempty"`   // story points / t-shirt size value
 }
 
 // CreateDocumentInput is the current native Linear DocumentCreateInput. The
@@ -275,7 +276,11 @@ type graphqlRequest struct {
 
 // graphqlError is a single error entry in a GraphQL response.
 type graphqlError struct {
-	Message string `json:"message"`
+	Message    string `json:"message"`
+	Code       string `json:"code"`
+	Extensions struct {
+		Code string `json:"code"`
+	} `json:"extensions"`
 }
 
 // issueNode is the JSON structure for a single issue node inside a connection.

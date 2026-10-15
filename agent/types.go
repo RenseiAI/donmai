@@ -40,7 +40,11 @@ const (
 	// Required because the runner registry (runner/model_profile.go
 	// SelectProvider) and matrix.LegacyProviderID key on ProviderName, so the
 	// pi × anthropic × direct anchor cell needs a real ProviderName to alias.
-	ProviderPi    ProviderName = "pi"
+	ProviderPi ProviderName = "pi"
+	// ProviderMuse is the legacy wire enum for the muse harness
+	// (HarnessMuse). Required because the runner registry and matrix
+	// key on ProviderName.
+	ProviderMuse  ProviderName = "muse"
 	ProviderJules ProviderName = "jules"
 	// ProviderShell is the bare interactive-only PTY harness
 	// (provider/harness/shell, W4). It drives no model endpoint and so is
@@ -771,8 +775,16 @@ type Result struct {
 	// reads as "did nothing" rather than unknown.
 	ToolCalls int `json:"toolCalls"`
 
+	// GenerationIDs are the bounded, distinct native response ids observed
+	// during an endpoint-bound session, in first-observed order.
+	GenerationIDs []string `json:"generationIds,omitempty"`
+
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
+
+	// Model is the last model observed in native response metadata, independent
+	// of the requested model. Empty when the harness did not report one.
+	Model string `json:"model,omitempty"`
 
 	// FailureMode classifies why a non-completed session failed.
 	// Enum values are owned by runner/failure.go.

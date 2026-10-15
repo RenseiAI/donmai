@@ -127,18 +127,22 @@ func (d *Daemon) shimOwnsSession(spec SessionSpec) bool {
 
 // nextShimProcessEpoch resolves the launch contract's process epoch for one
 // new shim incarnation: one past the highest epoch this identity already
-// holds on disk — live records and tombstones alike — or 1 when the identity
-// is new to this host.
+// holds on disk — live records, tombstones, withdrawn absences, and the
+// per-identity epoch floor alike — or 1 when the identity is new to this
+// host.
 //
 // The epoch is per-session monotonic across relaunches, never across
 // adoptions: a replacement daemon that adopts a live shim keeps its epoch,
 // while a fresh launch after the lineage ended advances it. Deriving it from
 // the registry is what makes a relaunch after a crash distinct from the
 // incarnation it replaces, so the discovery match and the tombstone
-// correlation never alias two launches. A registry that cannot be read maps
-// to 1 rather than failing the launch: the incarnation is still pinned by
-// PID and start identity beside the epoch, so a defaulted epoch cannot alias
-// two launches either.
+// correlation never alias two launches. The floor half is what keeps it
+// monotonic past disposal: terminal cleanup disposes the launch's seat
+// record, tombstone and absence sidecar, and without the floor the next
+// launch would fall back to 1 and reuse a scope name a stray process may
+// still hold. A registry that cannot be read maps to 1 rather than failing
+// the launch: the incarnation is still pinned by PID and start identity
+// beside the epoch, so a defaulted epoch cannot alias two launches either.
 func (d *Daemon) nextShimProcessEpoch(id sessionshim.Identity, registry *sessionshim.Registry) uint64 {
 	var highest uint64
 	if registry == nil {
@@ -158,7 +162,33 @@ func (d *Daemon) nextShimProcessEpoch(id sessionshim.Identity, registry *session
 			}
 		}
 	}
+	if absences, err := registry.ScanWithdrawnAbsences(); err == nil {
+		for _, rec := range absences {
+			if rec.Identity() == id && rec.ProcessEpoch > highest {
+				highest = rec.ProcessEpoch
+			}
+		}
+	}
+	if floor, found, err := registry.SeatEpochFloor(id); err == nil && found && floor > highest {
+		highest = floor
+	}
 	return highest + 1
+}
+
+// raiseShimSeatEpochFloor records that identity launched at processEpoch,
+// so the next launch advances past it even after terminal cleanup disposes
+// every per-incarnation artifact. Best-effort: a floor that cannot be
+// written is logged, never fatal to the launch it floors — the scope name
+// still differs from every live incarnation, which is what the discovery
+// match needs; the floor only guards the disposed past.
+func (d *Daemon) raiseShimSeatEpochFloor(registry *sessionshim.Registry, id sessionshim.Identity, processEpoch uint64) {
+	if registry == nil {
+		return
+	}
+	if err := registry.RaiseSeatEpochFloor(id, processEpoch); err != nil {
+		slog.Warn("session shim: record the seat epoch floor",
+			"session", id.String(), "epoch", processEpoch, "error", err)
+	}
 }
 
 // SessionShimOwnsSession reports whether this daemon will launch spec under
@@ -320,9 +350,13 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		}
 		// No discovery record means no lineage any later pass can adopt,
 		// quarantine or tombstone, so nothing else will ever dispose of this
-		// launch's seat record.
+		// launch's seat record or its session sidecar.
 		if removeErr := registry.RemoveSeatLaunch(id, launch.ProcessEpoch); removeErr != nil {
 			slog.Warn("session shim: remove the seat launch record of a launch that never announced itself",
+				"session", id.String(), "error", removeErr)
+		}
+		if removeErr := registry.RemoveSessionSidecar(id, launch.ProcessEpoch); removeErr != nil {
+			slog.Warn("session shim: remove the session sidecar of a launch that never announced itself",
 				"session", id.String(), "error", removeErr)
 		}
 		return nil, fmt.Errorf("session shim: %s: %w", id, err)
@@ -1351,6 +1385,16 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	shimBudget, shimBudgetOK := d.shimSeatBudget()
 	goos := d.shimScope.hostGOOS()
 	placement := d.shimScope.hostPlacement()
+	// Pre-spawn bus check: the bus the scope will be created on is the one
+	// the manager owning this daemon's own cgroup answers, not a cached
+	// probe that may describe a different install. A system-installed
+	// daemon with no user manager refuses here — before the worker starts —
+	// instead of dying past spawn with the manager's "Access denied".
+	if goos == "linux" && placement == seatbudget.PlacementSystemd {
+		if err := d.checkShimScopeBus(placement); err != nil {
+			return sessionshim.ProcessIdentity{}, err
+		}
+	}
 	scope := ""
 	if goos == "linux" {
 		scope = seatBudgetShimScopeName(launch.Identity.OrgID, launch.Identity.SessionID, launch.ProcessEpoch)
@@ -1367,6 +1411,20 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	if err := registry.PutSeatLaunch(seat); err != nil {
 		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: write the seat launch record for %s: %w", launch.Identity, err)
 	}
+	// Floor the epoch before the shim starts: from here on a relaunch
+	// advances past this launch even after terminal cleanup disposes the
+	// record just written, so a disposed scope's name is never reused.
+	d.raiseShimSeatEpochFloor(registry, launch.Identity, launch.ProcessEpoch)
+	// The session-identity sidecar is this launch's admitted Repository,
+	// ProjectName and Harness, read back by a later daemon generation's
+	// adoption pass to fill the operator-facing handle. Without it a
+	// restarted daemon lists the re-adopted session with empty identity
+	// fields and a repo-scoped reader drops it. Written beside the seat
+	// record so both share the incarnation's lifecycle.
+	if err := registry.PutSessionSidecar(sessionshim.NewSessionSidecar(
+		launch.Identity, launch.ProcessEpoch, spec.Repository, spec.ProjectName, spec.Harness)); err != nil {
+		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: write the session sidecar for %s: %w", launch.Identity, err)
+	}
 	started := false
 	defer func() {
 		if started {
@@ -1376,7 +1434,16 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 			slog.Warn("session shim: remove the seat launch record of a launch that never started",
 				"session", launch.Identity.String(), "error", err)
 		}
+		if err := registry.RemoveSessionSidecar(launch.Identity, launch.ProcessEpoch); err != nil {
+			slog.Warn("session shim: remove the session sidecar of a launch that never started",
+				"session", launch.Identity.String(), "error", err)
+		}
 	}()
+	// Per-seat scheduling class: the same opt-in wrapper the direct
+	// lane applies, inside the scope wrap (the scope tool owns argv[0]
+	// on Linux; the QoS tool wraps the worker it names). Default leaves
+	// the command exactly as the scope path left it.
+	command = wrapSeatCommandWithQoS(command, seatQoSCommandPrefix(d.seatQoSForShimSpawn()))
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec // G204: operator-configured worker command, same source as the direct-spawn path
 	configureShimProcess(cmd)
 	cmd.Env = append(append([]string(nil), env...), envPairs(launch.Env())...)
@@ -3206,6 +3273,13 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 		slog.Warn("session shim: withdraw discovery record", "session", id.String(), "error", err)
 		return
 	}
+	// The scope goes before the proof. A stray process that left the
+	// worker's process group keeps an otherwise-finished scope loaded, so
+	// the stop reaps it. It runs while the tombstone still sits on disk:
+	// the tombstone alone reserves this epoch, so a relaunch racing this
+	// cleanup advances past it even when its best-effort epoch floor could
+	// not be written, and the stop can never end a successor's seat.
+	d.stopShimSeatScope(registry, id, tombstone.ProcessEpoch)
 	// Audited disposal: the outcome is durably recorded above and no liveness
 	// claim survives it, so the tombstone has done its job and may go.
 	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
@@ -3214,6 +3288,24 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	// The captured stdout/stderr file is disposed alongside the record/
 	// tombstone above — see removeShimChildLog's doc comment.
 	removeShimChildLog(registry.Dir(), id)
+}
+
+// stopShimSeatScope releases one finished seat's transient scope: the unit
+// the launch identity names, on the launch's bus. Best-effort — a scope
+// that already collected is gone, which is the outcome wanted — so only a
+// transport failure is logged, never fatal to the terminal cleanup.
+func (d *Daemon) stopShimSeatScope(registry *sessionshim.Registry, id sessionshim.Identity, processEpoch uint64) {
+	if d.shimScope.hostGOOS() != "linux" || registry == nil {
+		return
+	}
+	if id.Validate() != nil {
+		return
+	}
+	scope := seatBudgetShimScopeName(id.OrgID, id.SessionID, processEpoch)
+	if err := d.shimScope.stopSeatScope(scope, d.shimScope.hostUserScope()); err != nil {
+		slog.Warn("session shim: stop the finished seat's transient scope",
+			"session", id.String(), "scope", scope, "error", err)
+	}
 }
 
 // tombstoneSettleWindow bounds the wait for a shim's tombstone after its Exit
@@ -4144,20 +4236,31 @@ func (d *Daemon) stopSessionShimByID(sessionID string) sessionShimStopResult {
 // daemon cannot control, and a session list that omitted it would show an
 // occupied host as idle. Their state is "running" — because it is — with a PID
 // of 0, since this daemon never negotiated with them and does not know one.
+//
+// Adopted-at-startup and quarantined handles carry the session identity the
+// launching daemon wrote beside the discovery record (the session sidecar):
+// Repository, ProjectName and Harness. Without them a repo-scoped reader
+// drops exactly the interactive sessions every restart re-adopts.
 func (d *Daemon) sessionShimHandles() []SessionHandle {
 	if d.shims == nil {
 		return nil
 	}
 	d.reconcileQuarantinedTombstones()
 	registry := d.openedShimRegistry()
-	// The seat reports for adopted-at-startup and quarantined seats are
-	// filled in AFTER the shim-state lock is released: a first read of a
-	// seat execs systemctl, which must never hold that lock.
+	// The seat reports and session sidecars for adopted-at-startup and
+	// quarantined seats are filled in AFTER the shim-state lock is released:
+	// a first seat read execs systemctl, which must never hold that lock.
 	type pendingSeatReport struct {
 		index int
 		key   shimSeatReportKey
 	}
 	var pending []pendingSeatReport
+	type pendingSessionIdentity struct {
+		index int
+		id    sessionshim.Identity
+		epoch uint64
+	}
+	var pendingIdentity []pendingSessionIdentity
 	d.shims.mu.RLock()
 	out := make([]SessionHandle, 0, len(d.shims.adopted)+len(d.shims.quarantined))
 	for id, entry := range d.shims.adopted {
@@ -4168,7 +4271,9 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 			// limits come from the seat's own cgroup read back through its
 			// scope, falling back to the launch record written beside the
 			// discovery record — never this daemon's current configuration,
-			// which may have changed since the launch.
+			// which may have changed since the launch. The admitted
+			// Repository, ProjectName and Harness come from the session
+			// sidecar the launching daemon wrote beside the same record.
 			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning}
 			key := shimSeatReportKey{id: id, epoch: entry.adoption.ProcessEpoch, shimID: entry.shimID}
 			if entry.controller != nil {
@@ -4187,6 +4292,7 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 				}
 			}
 			pending = append(pending, pendingSeatReport{index: len(out), key: key})
+			pendingIdentity = append(pendingIdentity, pendingSessionIdentity{index: len(out), id: id, epoch: key.epoch})
 		}
 		out = append(out, handle)
 	}
@@ -4194,22 +4300,67 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 		// A quarantined lineage has no controller this daemon trusts, but its
 		// scope and launch record are still the seat's own facts, so the
 		// handle reports those rather than this daemon's current
-		// configuration.
+		// configuration. The admitted identity comes from the same place:
+		// the session sidecar, not this daemon's configuration.
 		pending = append(pending, pendingSeatReport{
 			index: len(out),
 			key:   shimSeatReportKey{id: q.Identity(), epoch: q.ProcessEpoch, shimID: q.ShimID},
+		})
+		pendingIdentity = append(pendingIdentity, pendingSessionIdentity{
+			index: len(out), id: q.Identity(), epoch: q.ProcessEpoch,
 		})
 		out = append(out, SessionHandle{SessionID: q.SessionID, State: SessionRunning})
 	}
 	d.shims.mu.RUnlock()
 
 	live := make(map[shimSeatReportKey]struct{}, len(pending))
+	keys := make([]shimSeatReportKey, 0, len(pending))
 	for _, p := range pending {
-		out[p.index].SeatBudget = d.shimSeatReport(registry, p.key)
+		keys = append(keys, p.key)
 		live[p.key] = struct{}{}
 	}
+	// One systemctl call for every uncached seat: the first status read
+	// after adoption used to run one serial `systemctl show` per seat,
+	// each bounded at 5s. Cached incarnations never reach the bus.
+	reports := d.shimSeatReportsBatch(registry, keys)
+	for _, p := range pending {
+		out[p.index].SeatBudget = reports[p.key]
+	}
 	d.shimSeatReports.retain(live)
+	for _, p := range pendingIdentity {
+		d.fillShimSessionIdentity(registry, &out[p.index], p.id, p.epoch)
+	}
 	return out
+}
+
+// fillShimSessionIdentity fills an adopted-at-startup or quarantined handle's
+// admitted Repository, ProjectName and Harness from the session sidecar the
+// launching daemon wrote beside the discovery record. Fields already present
+// (a handle this daemon launched itself) are never overwritten: the sidecar
+// is a fallback for the post-restart population, not a second authority. A
+// missing or unreadable sidecar leaves the handle as-is — a seat launched
+// before sidecars existed still reports, just without the identity fields a
+// scoped reader filters on.
+func (d *Daemon) fillShimSessionIdentity(registry *sessionshim.Registry, handle *SessionHandle, id sessionshim.Identity, epoch uint64) {
+	if registry == nil || handle == nil {
+		return
+	}
+	if handle.Repository != "" && handle.ProjectName != "" && handle.Harness != "" {
+		return
+	}
+	sidecar, found, err := registry.SessionSidecar(id, epoch)
+	if err != nil || !found {
+		return
+	}
+	if handle.Repository == "" {
+		handle.Repository = sidecar.Repository
+	}
+	if handle.ProjectName == "" {
+		handle.ProjectName = sidecar.ProjectName
+	}
+	if handle.Harness == "" {
+		handle.Harness = sidecar.Harness
+	}
 }
 
 // shimNow is the daemon's clock for shim bookkeeping, routed through the

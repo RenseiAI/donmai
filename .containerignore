@@ -1,0 +1,52 @@
+# .containerignore — build context for the upgrade-acceptance image
+# (upgradeacceptance/container/Containerfile).
+#
+# The image builds from the repo root so the driver sees the whole module
+# and its git history (artifact N is built from an earlier revision), but
+# the context must not carry the working tree's byproducts: per-session
+# state, caches, editor droppings, and build outputs. Two worktree facts
+# make this load-bearing rather than hygiene:
+#
+#   - In a linked worktree `.git` is a pointer file whose target lives
+#     outside the context, so without this exclusion the image's copy of
+#     the history — the tree artifact N is built from — may not resolve.
+#   - The driver builds N with `git archive` from the image's own `.git`.
+#     An image built from a worktree must therefore carry a full clone:
+#     see the Containerfile's worktree repair below.
+#
+# The engine reads `.containerignore` (and `.dockerignore`) at the context
+# root — not beside the Containerfile — for `-f` builds; verified against
+# the local engine (an ignore file beside the Containerfile is silently
+# not read).
+
+# Per-session and per-worktree state: never source, and in a linked
+# worktree `.git` is a pointer outside the context.
+.git
+.agent/
+.pi/
+.pi-*/
+.donmai/
+.claude/
+
+# Caches and build outputs.
+.cache/
+**/.gocache/
+**/go-build/
+**/.golangci-lint-cache/
+**/.golangci-cache/
+bin/
+dist/
+coverage.out
+acceptance-results/
+
+# Editor and OS droppings.
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Secrets by accident, never by design.
+.env
+.env.*
+.envrc
+!.env.example

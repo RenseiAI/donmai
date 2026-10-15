@@ -31,6 +31,7 @@ import (
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
+	providermuse "github.com/RenseiAI/donmai/provider/harness/muse"
 	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
 	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
 	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
@@ -101,16 +102,23 @@ var buildRegistryForAgentRun = func(logger *slog.Logger, hints agentRunCtorHints
 	return buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
 }
 
+// shimTerminalAttempt is the session-scoped terminal sequence every
+// shim-owned seat persists its terminal body under. It is 1: the runner
+// writes exactly one terminal body per session, and the key must stay fixed
+// across shim resumes — the launch contract's monotonic process epoch
+// advances on resume and so must never key the outbox, or the resumed
+// incarnation would orphan the record the previous one persisted.
+const shimTerminalAttempt = 1
+
 // shimSeatFromEnv reports this worker's shim-owned seat, or nil when this
 // process was not launched under the per-session shim launch contract. It is
 // a var so tests can drive the shim-owned runner path without mutating the
 // process environment.
 var shimSeatFromEnv = func() *runner.ShimSeatConfig {
-	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
-	if err != nil {
+	if _, err := sessionshim.LaunchFromEnv(os.Getenv); err != nil {
 		return nil
 	}
-	return &runner.ShimSeatConfig{Attempt: launch.ProcessEpoch}
+	return &runner.ShimSeatConfig{Attempt: shimTerminalAttempt}
 }
 
 // gatewayHarnessIdentity projects the canonical loop-driver identity already
@@ -294,6 +302,24 @@ func resolveAgentRunDaemonURL(flagValue string, lookupEnv func(string) string) (
 	return DefaultAgentRunDaemonURL, daemonURLSourceBuiltinDefault
 }
 
+// localPosterAuthToken resolves the Poster construction-default bearer: the
+// detail's controller credential on the platform path, or the attempt bearer
+// from the spawn environment on the local path. A local detail carries no
+// controller credential by design, so without this the default is empty and
+// the Poster falls back to it whenever a credential re-read fails — the
+// send then carries no Authorization header and the local receiver answers
+// 401. The credential provider still re-resolves per attempt; this default
+// only covers the fallback.
+func localPosterAuthToken(detail *daemon.SessionDetail, daemonToken string, localRuntime bool) string {
+	if localRuntime {
+		return daemonToken
+	}
+	if detail == nil {
+		return ""
+	}
+	return detail.AuthToken
+}
+
 // runAgentRun is the testable entry point for the `agent run` command.
 // Cobra-free; takes opts directly so tests can drive it with a fake
 // daemon HTTP server.
@@ -434,6 +460,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	if opts.localRuntime {
 		credentialCache.localRuntime = true
+		// A local detail carries no controller credential by design
+		// (validateLocalAgentDetail refuses one): the worker's only
+		// credential is the attempt bearer from its spawn environment.
+		// Seed the cache with it so the first send carries a bearer
+		// before any re-read runs — without this the first replay sends
+		// no Authorization header and the receiver answers 401.
 		credentialCache.authToken = daemonToken
 	}
 
@@ -504,10 +536,11 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if opts.localRuntime {
 		callbackClient = localCallbackClient(30 * time.Second)
 	}
+	posterAuthToken := localPosterAuthToken(detail, daemonToken, opts.localRuntime)
 	poster, err := result.NewPoster(result.Options{
 		HTTPClient:         callbackClient,
 		PlatformURL:        detail.PlatformURL,
-		AuthToken:          detail.AuthToken,
+		AuthToken:          posterAuthToken,
 		WorkerID:           detail.WorkerID,
 		CredentialProvider: credentialCache.resultCredentials,
 	})
@@ -1353,6 +1386,10 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// comment for how PreferServer routes between them. Gemini is a
 		// full streaming impl against generativelanguage.googleapis.com.
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
+		// muse is registration-only until the harness proves a live
+		// turn: the constructor probes the binary + minimum version
+		// and warns-and-skips when absent, mirroring pi.
+		{name: "muse", new: func() (agent.Provider, error) { return providermuse.New(providermuse.Options{}) }},
 		// opencode's PreferServer threads the resolved profile's Lane-B
 		// signal (opencodeCtorHints above) so a `donmai agent run` session
 		// can select the serve/HTTP adapter (07 §2 Lane B) instead of
@@ -1498,6 +1535,7 @@ func kitScanPaths() []string {
 // runner.ReconcileResolvedProfile below) rather than reaching the runner's
 // Spec.
 func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(d.SessionID, d.CoAuthorName, d.CoAuthorEmail)
 	qw := runner.QueuedWork{
 		AdmissionReceipt:        bytes.Clone(d.AdmissionReceipt),
 		ClaimReceipt:            bytes.Clone(d.ClaimReceipt),
@@ -1557,6 +1595,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		Branch:                d.Branch,
 		WorkerID:              d.WorkerID,
 		AuthToken:             d.AuthToken,
+		CoAuthorName:          coAuthorName,
+		CoAuthorEmail:         coAuthorEmail,
 		McpAuthToken:          d.McpAuthToken,
 		McpAuthTokenExpiresAt: d.McpAuthTokenExpiresAt,
 		PlatformURL:           d.PlatformURL,
@@ -1612,6 +1652,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		// line a no-op — it is the tag change, not the decoder, that this
 		// guards against, exactly as for AuthToken/PlatformURL above.
 		qw.McpAuthToken, qw.McpAuthTokenExpiresAt = d.McpAuthToken, d.McpAuthTokenExpiresAt
+		qw.CoAuthorName, qw.CoAuthorEmail = coAuthorName, coAuthorEmail
 		qw.Capabilities = d.Capabilities
 	}
 	stageBudgetJSON, err := marshalOptional(d.StageBudget)
@@ -1771,6 +1812,7 @@ func detailDeliveryPolicy(in *daemon.PollDeliveryPolicy) *prompt.DeliveryPolicy 
 	return &prompt.DeliveryPolicy{
 		AllowDraft:        in.AllowDraft,
 		AllowMergeCommits: in.AllowMergeCommits,
+		AllowCleanMerge:   in.AllowCleanMerge,
 	}
 }
 

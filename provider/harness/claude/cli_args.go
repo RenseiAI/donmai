@@ -66,16 +66,25 @@ var linearMCPDisallowList = []string{
 //
 // --settings carries ONLY the routing pin (see pinnedRoutingEnv), stated on
 // the layer the CLI resolves above the process environment and above repo
-// settings files: a repo-local harness setting naming a routing var (for
-// example env.ANTHROPIC_BASE_URL) must never redirect the session bearer.
+// settings files: a repo-local harness setting naming a routing destination
+// (for example env.ANTHROPIC_BASE_URL) or flipping an alternate serving
+// host or naming a proxy is overridden by the pin, so the session bearer
+// stays on the session's own route. The pin cannot close repo config that
+// runs code (hooks, helpers, stdio MCP servers) — that execution surface is
+// the accepted model for a trusted repo, matching the headless lane.
 // The JSON holds no hooks — the headless lane has no notice channel — and
 // is absent entirely when the session carries no routing of its own, so a
 // host-login spawn's argv is byte-identical to before the pin existed.
 //
 // resumeSessionID is empty for fresh spawns; when non-empty it is
-// rendered as `--resume <id>`. v0.5.0 does not exercise this path
-// because SupportsSessionResume=false, but the implementation is in
-// place for the F.5 capability flip.
+// rendered as `--resume <id>` (Provider.Resume, the restore path).
+//
+// ownedSessionID is the harness-owned resume token minted at launch
+// (see session_id.go). When non-empty AND resumeSessionID is empty the
+// spawn is fresh and the token is rendered as `--session-id <id>`, so
+// the resume token is known before the first turn. A resume spawn
+// carries only `--resume`; the CLI resolves the conversation from it
+// and `--session-id` alongside would be a conflicting second identity.
 //
 // Spec → CLI mapping accounts for every Spec field. Fields the CLI cannot
 // honor are silently dropped per the capability-gating contract:
@@ -108,7 +117,7 @@ var linearMCPDisallowList = []string{
 // The mcpConfigPath argument is the path to the per-session
 // `--mcp-config` JSON tmpfile prepared by writeMCPConfig (see mcp.go).
 // When empty (no MCP servers configured) the flag is omitted.
-func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []string, stdinPrompt string) {
+func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID string) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -151,6 +160,8 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 
 	if resumeSessionID != "" {
 		argv = append(argv, "--resume", resumeSessionID)
+	} else if ownedSessionID != "" {
+		argv = append(argv, "--session-id", ownedSessionID)
 	}
 
 	// The interactive spawn mode applies the SAME mapping — see
@@ -242,13 +253,26 @@ func resumePinArgs(spec agent.Spec) []string {
 }
 
 // marshalRoutingPin renders the routing pin as the --settings JSON string
-// the headless lane passes. Only routingPinEnvNames members are honored —
-// anything else is dropped rather than passed through, so a caller cannot
-// smuggle an unrelated variable onto the CLI's winning layer. The envelope
-// holds no hooks: the headless lane has no notice channel to declare.
+// the headless lane passes. Both the session's own routing names AND the
+// pinnedFallbackRoutingEnv names (including their "" blanks) are honored —
+// a blank explicitly states the ambient default on the winning layer, which
+// is what keeps a repo naming a proxy or an alternate provider surface from
+// taking effect. Anything outside that set is dropped rather than passed
+// through, so a caller cannot smuggle an unrelated variable onto the CLI's
+// winning layer. The envelope holds no hooks: the headless lane has no
+// notice channel to declare.
 func marshalRoutingPin(pin map[string]string) (string, error) {
 	env := make(map[string]string, len(pin))
 	for k, v := range pin {
+		// Fallback names first: their "" blanks ride the pin (a blank
+		// states the ambient default on the winning layer). Two session
+		// routing names (the bedrock/vertex switches) are also fallback
+		// names, and their blanks must ride too — checking the session
+		// set first would drop them as "empty session values".
+		if isFallbackRoutingName(k) {
+			env[k] = v
+			continue
+		}
 		if _, ok := routingPinEnvNames[k]; !ok || v == "" {
 			continue
 		}
@@ -262,6 +286,17 @@ func marshalRoutingPin(pin map[string]string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// isFallbackRoutingName reports whether name is one of the
+// pinnedFallbackRoutingEnv entries, whose "" blanks ride the pin.
+func isFallbackRoutingName(name string) bool {
+	for _, n := range pinnedFallbackRoutingEnv {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // additionalWorkdirs returns the ordered --add-dir list for a spawn: the

@@ -44,7 +44,7 @@ func TestRun_ContinueModeSiblingPullRequestURLStillContinues(t *testing.T) {
 			append(slices.Repeat([]verdictScriptTurn{note}, DefaultTurnContinuationLimit+1), verdictScriptTurn{text: "never reached"})...,
 		),
 	})
-	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, wantContinued)...)
+	wantContinuationsWithGoal(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, wantContinued)...)
 	wantContinuations(t, res, wantContinued, 0, true)
 	if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
 		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsUnproductive)

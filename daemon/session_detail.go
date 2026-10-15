@@ -176,6 +176,11 @@ type SessionDetail struct {
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is an opaque platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for nothing else. The daemon never parses,
 	// validates, or logs its value — it forwards the string from PollWorkItem
@@ -510,6 +515,21 @@ type SessionEndpointBinding struct {
 	// the runner reports cost as absent rather than zero. Additive +
 	// omitempty; absent on every dispatch that predates it.
 	UnitPrices *SessionUnitPrices `json:"unitPrices,omitempty"`
+	// RoutingPreference carries an optional provider routing preference
+	// (ordered candidate providers and an exclusive allow-list),
+	// mirroring agent.RoutingPreference. Nil means no preference is
+	// bound. Additive + omitempty; absent on every dispatch that
+	// predates it.
+	RoutingPreference *SessionRoutingPreference `json:"routingPreference,omitempty"`
+}
+
+// SessionRoutingPreference mirrors agent.RoutingPreference without
+// importing the agent package (this wire package stays agent-free).
+// Order lists candidate provider slugs in try order; Only lists the
+// slugs exclusively allowed for the request.
+type SessionRoutingPreference struct {
+	Order []string `json:"order,omitempty"`
+	Only  []string `json:"only,omitempty"`
 }
 
 // SessionModelProfile mirrors runner.ResolvedModelProfile but lives in

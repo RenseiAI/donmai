@@ -9,6 +9,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	"github.com/google/uuid"
 )
 
 // spawnInteractive opens the claude CLI's OWN interactive REPL — bare
@@ -55,6 +56,13 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// against a declared-but-absent channel, so the producer learns), rather
 	// than killing a session over a latency optimisation.
 	hook, hookErr := newStopHookChannel()
+	// Pin a fresh Claude conversation identity before spawn, so its transcript
+	// can be found even if the process dies before invoking its first Stop hook.
+	sessionID := uuid.NewString()
+	if hookErr == nil {
+		hook.usageSessionID = sessionID
+		hook.usageConfigDir = interactiveUsageConfigDir(spec.Env)
+	}
 	settings := ""
 	if hookErr == nil {
 		// The routing pin rides this same --settings string (see
@@ -62,12 +70,33 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		// environment and above repo settings files, so the session bearer
 		// goes where the resolved binding says no matter what repo-local
 		// harness config names.
+		//
+		// Only the declarative routing destinations are pinned here. Repo
+		// config that runs code (hooks, apiKeyHelper and other helpers,
+		// stdio MCP servers, the agent's own tools) still runs with the
+		// session environment once the repo path is trusted, exactly as on
+		// the headless lane — that execution surface is the accepted model
+		// for a trusted repo, not something the pin closes.
 		if settings, err = hook.settingsJSONWithPin(pinnedRoutingEnv(spec)); err != nil {
+			// Fail closed: the Stop-hook channel is best-effort, but the
+			// routing pin is not. A session that spawned without the pin
+			// would let a repo-local settings file redirect its bearer,
+			// so fall back to a pin-only --settings rather than none.
 			_ = hook.close()
-			hook, settings = nil, ""
+			hook = nil
+			if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
+				settings = pinOnly
+			} else {
+				settings = ""
+			}
 		}
 	} else {
 		hook = nil
+		// Fail closed without the hook channel too: carry the pin alone
+		// rather than spawning unpinned.
+		if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
+			settings = pinOnly
+		}
 	}
 
 	cleanup := func() error {
@@ -75,10 +104,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		// is still present at cleanup time, and leaving the seed behind
 		// would trust the worktree for every later session on the host.
 		// Best-effort and silent — cleanup never fails a session that
-		// already ran. The CLI's own writes to the same record ride the
-		// same lock (see trust_ledger.go's interop note): the seed, the
-		// CLI, and this cleanup all serialize through acquireTrustLock,
-		// so no party's merge loses another's entries.
+		// already ran.
 		removeSeededTrust(seed)
 		// Pin the transcript path BEFORE the drop is removed: the terminal
 		// event fires after this cleanup, and the exit usage accounting
@@ -93,8 +119,8 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		return errors.Join(errs...)
 	}
 
-	h, err := ptycli.SpawnWithCleanup(ctx, p.binary,
-		interactiveArgsWith(spec, mcpPath, settings), spec, p.Manifest(), cleanup)
+	argv := append([]string{"--session-id", sessionID}, interactiveArgsWith(spec, mcpPath, settings)...)
+	h, err := ptycli.SpawnWithCleanup(ctx, p.binary, argv, spec, p.Manifest(), cleanup)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +142,7 @@ const (
 
 // wrapInteractiveHandle adds the Stop-hook pull channel and the transcript
 // usage tail to a spawned PTY handle. The usage tail reads the session's own
-// transcript — located through the hook's durable locator — and maps each new
+// transcript — located through the hook or pinned conversation id — and maps each new
 // assistant message.usage to an LlmCallEvent, so per-turn usage reaches the
 // runner's activity sink live; the terminal ResultEvent carries the deduped
 // session totals instead of the PTY's costless one.
@@ -189,9 +215,9 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 }
 
 // withTranscriptCost replaces a costless terminal ResultEvent with one
-// carrying the session's deduped transcript totals. A transcript that cannot
-// be read — the hook never fired, the file never materialized — leaves the
-// event untouched: no usage is reported, never a failure.
+// carrying the session's deduped transcript totals, or its saved statusline
+// cumulative USD cost when no transcript usage is available. Unknown or untrusted
+// usage leaves the event untouched: no fabricated zero, never a failure.
 func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.Event {
 	if result.Cost != nil || hook == nil {
 		return result
@@ -206,6 +232,7 @@ func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.E
 		CachedInputTokens: total.CachedInputTokens,
 		CacheWriteTokens:  total.CacheWriteTokens,
 		NumTurns:          total.NumTurns,
+		TotalCostUsd:      total.TotalCostUsd,
 	}
 	return result
 }
@@ -240,6 +267,26 @@ var (
 
 // NoticeChannel returns this session's Stop-hook channel.
 func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notices }
+
+// ContextUsageSidecarPath returns the session's statusline sidecar path:
+// the file the session's own statusLine command maintains with the live
+// context_window numbers. It implements the runner's session-scoped
+// context-source seam (agent.ContextUsageSourcer): the interactive watcher
+// polls this file — never a process-wide variable — so one session's
+// readings can never land in another session's series. Empty when the
+// session has no channel (a spawn without the hook still runs, without
+// context notices).
+func (h *interactiveHandle) ContextUsageSidecarPath() string {
+	if h == nil || h.notices == nil {
+		return ""
+	}
+	return h.notices.sidecarPath()
+}
+
+// ContextUsageRollout reports no rollout: the claude leg is the sidecar,
+// never a rollout file. It satisfies the runner's session-scoped seam
+// (agent.ContextUsageSourcer) alongside ContextUsageSidecarPath.
+func (h *interactiveHandle) ContextUsageRollout() (string, string) { return "", "" }
 
 // Events overrides ptycli.Handle.Events with the coarse Init/Result contract
 // plus per-turn usage tailed from the session's own transcript (the runner
@@ -364,6 +411,16 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// buildArgs' identical branch.
 	if spec.Autonomous {
 		argv = append(argv, "--permission-mode", "bypassPermissions")
+	}
+
+	// An operator-driven session whose control plane granted toolApproval
+	// "bypass" may still choose bypassPermissions from the REPL (Shift+Tab).
+	// The CLI only offers that mode when it was started with this flag; the
+	// session itself starts in the CLI default mode. This matches the adapter's
+	// declared rendering (execution_security.go: index 0, prompts skipped).
+	if !spec.Autonomous && spec.ExecutionSecurity != nil &&
+		spec.ExecutionSecurity.Levels.ToolApproval == agent.ToolApprovalBypass {
+		argv = append(argv, "--allow-dangerously-skip-permissions")
 	}
 
 	// SystemPromptAppend carries the composed session instructions assembled

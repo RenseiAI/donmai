@@ -486,6 +486,7 @@ func TestSpawn_Interactive_TranscriptFinalFlushPrecedesResult(t *testing.T) {
 	p := newFakeInteractivePiProvider(t, fakePiTranscriptPrelude+`
 sleep 0.3
 tool_line final FINAL_TOOL
+printf '{"type":"message","id":"response-entry","message":{"role":"assistant","responseId":"response-final","content":[]}}\n' >> "$live"
 `)
 	h, err := p.Spawn(context.Background(), agent.Spec{
 		Cwd:         workdir,
@@ -523,6 +524,15 @@ read:
 	}
 	if names := transcriptToolNames(events); !slices.Equal(names, []string{"FINAL_TOOL"}) {
 		t.Fatalf("tool calls = %v, want [FINAL_TOOL] delivered by the final flush", names)
+	}
+	var ids []string
+	for _, event := range events {
+		if ev, ok := event.(agent.SystemEvent); ok && ev.GenerationID != "" {
+			ids = append(ids, ev.GenerationID)
+		}
+	}
+	if !slices.Equal(ids, []string{"response-final"}) {
+		t.Fatalf("generation ids = %v; want response-final", ids)
 	}
 	if _, ok := events[len(events)-1].(agent.ResultEvent); !ok {
 		t.Fatalf("last event = %#v, want the terminal ResultEvent", events[len(events)-1])
@@ -709,5 +719,20 @@ func TestInteractiveTranscriptTail_RefusesPathSwappedAfterWalk(t *testing.T) {
 				t.Fatalf("tail read %d events (offset %d) through the swapped path; want nothing read", len(events), st.offset)
 			}
 		})
+	}
+}
+
+func TestInteractiveTranscript_GenerationIDWithoutUsage(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tailer := newInteractiveTranscriptTailer(dir)
+	writeTranscriptLine(t, filepath.Join(dir, "session.jsonl"), transcriptMessage("entry-one", map[string]any{"role": "assistant", "responseId": "response-one", "content": []any{}}))
+	events, _ := tailer.sweep()
+	if len(events) != 1 {
+		t.Fatalf("events = %v; want response id observation", events)
+	}
+	ev, ok := events[0].(agent.SystemEvent)
+	if !ok || ev.GenerationID != "response-one" {
+		t.Fatalf("event = %+v; want response-one", events[0])
 	}
 }

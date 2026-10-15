@@ -231,7 +231,7 @@ func TestSeedPinCleanup_HeadlessParity(t *testing.T) {
 	if _, present := pin[EnvAuthToken]; present {
 		t.Errorf("pin carries the bearer; only destinations may ride the --settings layer: %v", pin)
 	}
-	argv, _ := buildArgs(projected, "", "")
+	argv, _ := buildArgs(projected, "", "", "")
 	settingsIdx := -1
 	for i, arg := range argv {
 		if arg == "--settings" {

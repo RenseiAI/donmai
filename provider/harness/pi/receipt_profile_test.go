@@ -45,7 +45,7 @@ func testReceiptAdmission(t *testing.T) (*receiptAdmission, string, string) {
 	if err := os.WriteFile(extensionPath, extensionSource(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	extension, err := measureExtensionFile("donmai-policy", extensionPath, extensionSHA())
+	extension, err := measureExtensionFile("donmai-policy", extensionPath, extensionSHA(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

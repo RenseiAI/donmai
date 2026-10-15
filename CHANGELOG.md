@@ -10,6 +10,37 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.75 — 2026-10-14
+
+### Features
+
+- `linear create-issue` accepts `--assignee <user ID|name|email|me>` and `--priority 0-4`, and `linear update-issue` accepts the same `--assignee` spellings with `--assignee null` clearing the assignment. Assignee names, emails, and `me` resolve through the configured transport (direct API key or hosted proxy) and unknown values fail before any mutation runs.
+
+## v0.72.74 — 2026-10-13
+
+### Chores
+
+- Pin provider routing env after repo config; clean up seeded trust at session end
+- Rename systemd unit to brand-neutral default with in-place migration
+- Terminal outbox hardening: resume-stable key, prune, quarantine, local delivery, exactly-once
+- Upgrade acceptance follow-ups: live halves, posture stale check, wider triggers, worktree image
+- Stop finished seat scopes at disposal; monotonic launch epochs; pre-spawn bus check; batched read-back
+- Three-axis seat state in heartbeats and terminal receipts
+- Harness context and compaction notices feed the usage series
+- Carry session identity on adopted and quarantined shim handles; dedupe the session list by id
+- Add MSP harness over serve host (generated types, session and turn lifecycle, event mapping)
+- Keep the fake scope binary from writing .tmp into the package directory
+
+## v0.72.73 — 2026-10-12
+
+### Chores
+
+- Report host interactive token totals from the native session file at exit
+- Seed workspace trust and route gateway bearer for unattended interactive sessions
+- Stop the service-mode first-run wizard from crash-looping fresh hosts
+- Wire the per-host repository keeper into the daemon
+- Probe that the shim's transient scope is creatable; surface scope failures
+
 ## v0.72.72 — 2026-10-11
 
 ### Features
