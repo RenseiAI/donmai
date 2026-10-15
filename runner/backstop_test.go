@@ -1285,6 +1285,161 @@ func TestRunBackstop_VisibilityGatesPublicSurfaces(t *testing.T) {
 	}
 }
 
+// TestRunBackstop_PinsConfiguredRepository pins the reported defect through
+// the production entry point: the backstop's `gh pr create` names the work
+// item's configured repository with --repo, so a host whose local git user
+// differs from the repository owner still targets the configured
+// owner/name. The fixture sets the checkout's git user to someone else's
+// name — the identity the old inference would have resolved — and the fake
+// gh refuses exactly like the reported failure unless --repo names the
+// configured slug. The readback (`gh pr view`) must pin the same slug.
+func TestRunBackstop_PinsConfiguredRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	const wantSlug = "acme/widgets"
+	const wantURL = "https://github.com/acme/widgets/pull/77"
+	remote, repo := backstopRemoteFixture(t)
+	const session = "agent/configured-repo"
+	gitRun(t, repo, "checkout", "-q", "-b", session)
+	// A host whose local git identity differs from the repository owner.
+	gitRun(t, repo, "config", "user.name", "someone-else")
+	gitRun(t, repo, "config", "user.email", "someone-else@example.invalid")
+	writeFile(t, repo, "src/fix.go", "package fix\n")
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "gh-args.txt")
+	viewFile := filepath.Join(dir, "gh-view.txt")
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "repo" ]; then echo PRIVATE; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  { echo; printf '%%s\n' "$@"; } > %[1]q
+  want="--repo"; slug=%[2]q
+  prev=""; got=""
+  for a in "$@"; do
+    if [ "$prev" = "$want" ]; then got="$a"; fi
+    prev="$a"
+  done
+  if [ "$got" != "$slug" ]; then
+    echo "Could not resolve to a Repository with the name 'someone-else/widgets'" 1>&2
+    exit 1
+  fi
+  echo %[3]q; exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  { printf '%%s\n' "$@"; } > %[4]q
+  echo '{"number":77,"url":%[3]q,"baseRefName":"main","headRefName":%[5]q}'
+  exit 0
+fi
+echo "unexpected gh argv: $*" 1>&2
+exit 1
+`, argsFile, wantSlug, wantURL, viewFile, session)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REPO-PIN")}
+	qw.Repository = "https://github.com/acme/widgets.git"
+	res := &Result{}
+	res.WorktreePath = repo
+	report := minimalRunner(t).runBackstop(context.Background(), qw, session, res, map[string]struct{}{wantSlug: {}})
+	if report.Diagnostics != "" {
+		t.Fatalf("backstop diagnostics = %q, want none", report.Diagnostics)
+	}
+	if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+		t.Fatalf("report = %+v, want pushed + PR %s", report, wantURL)
+	}
+	if report.PullRequest == nil || report.PullRequest.Repository != "acme/widgets" || report.PullRequest.Number != 77 {
+		t.Fatalf("report.PullRequest = %+v, want the readback fact on %s#77", report.PullRequest, wantSlug)
+	}
+	if got := gitRun(t, remote, "rev-parse", "refs/heads/"+session); got != gitRun(t, repo, "rev-parse", "HEAD") {
+		t.Errorf("remote %s is not the committed work", session)
+	}
+	args := readGhArgs(t, argsFile)
+	if len(args) < 2 || args[0] != "pr" || args[1] != "create" {
+		t.Fatalf("gh argv = %q, want pr create", args)
+	}
+	found := ""
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--repo" {
+			found = args[i+1]
+		}
+	}
+	if found != wantSlug {
+		t.Errorf("gh pr create --repo = %q, want %q (the work item's configured repository, not the host identity)", found, wantSlug)
+	}
+	viewArgs, err := os.ReadFile(viewFile) //nolint:gosec // G304: path created by this test.
+	if err != nil {
+		t.Fatalf("read gh view args: %v", err)
+	}
+	if !strings.Contains(string(viewArgs), "--repo\n"+wantSlug) {
+		t.Errorf("gh pr view argv = %q, want --repo %s", viewArgs, wantSlug)
+	}
+}
+
+// TestRunBackstop_PushBackFailureReportsDeliveryFailure pins the second half
+// of the defect through the production entry point: when the work was pushed
+// but `gh pr create` still fails, the report keeps Pushed, leaves the PR
+// empty, and names the failure as a delivery failure in Diagnostics — the
+// pushed work is not lost, only its pull request.
+func TestRunBackstop_PushBackFailureReportsDeliveryFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	remote, repo := backstopRemoteFixture(t)
+	const session = "agent/delivery-failed"
+	gitRun(t, repo, "checkout", "-q", "-b", session)
+	writeFile(t, repo, "src/fix.go", "package fix\n")
+	dir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = \"repo\" ]; then echo PRIVATE; exit 0; fi\necho 'push-back failed' 1>&2\nexit 1\n"
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REPO-DELIVERY")}
+	qw.Repository = "https://github.com/acme/widgets.git"
+	res := &Result{}
+	res.WorktreePath = repo
+	report := minimalRunner(t).runBackstop(context.Background(), qw, session, res, nil)
+	if !report.Pushed {
+		t.Fatalf("report = %+v, want the pushed work kept", report)
+	}
+	if report.PRCreated || report.PRURL != "" {
+		t.Fatalf("report = %+v, want no pull request on a failed push-back", report)
+	}
+	if !strings.Contains(report.Diagnostics, "delivery failed") {
+		t.Errorf("diagnostics = %q, want it to name the push-back as a delivery failure", report.Diagnostics)
+	}
+	if got := gitRun(t, remote, "rev-parse", "refs/heads/"+session); got != gitRun(t, repo, "rev-parse", "HEAD") {
+		t.Errorf("remote %s is not the committed work", session)
+	}
+}
+
+// TestBackstopGhPRCreateArgs table-tests the argv builder: the configured
+// repository is pinned with --repo only when it resolves to a slug, and the
+// base ref is preserved alongside it.
+func TestBackstopGhPRCreateArgs(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REPO-ARGS")}
+	qw.Repository = "https://github.com/acme/widgets.git"
+	qw.BaseRef = "main"
+	got := backstopGhPRCreateArgs(qw, "agent/session", "title", "body")
+	want := []string{"pr", "create", "--head", "agent/session", "--title", "title", "--body", "body", "--base", "main", "--repo", "acme/widgets"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("backstopGhPRCreateArgs() = %q, want %q", got, want)
+	}
+	qw.Repository = "../local/path"
+	got = backstopGhPRCreateArgs(qw, "agent/session", "title", "body")
+	for _, arg := range got {
+		if arg == "--repo" {
+			t.Fatalf("backstopGhPRCreateArgs() = %q, want no --repo for a non-GitHub source", got)
+		}
+	}
+}
+
 // stubGhOnPath writes a fake `gh` executable that echoes output to stderr
 // and exits with exitCode, then prepends its directory to PATH for the
 // test's duration so runGh resolves the stub instead of a real gh. The

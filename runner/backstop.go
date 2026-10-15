@@ -347,6 +347,29 @@ func backstopPRBody(qw QueuedWork) string {
 	)
 }
 
+// backstopRepositorySlug resolves the owner/name the backstop's gh calls
+// target: the work item's configured repository, never the host's git or
+// gh identity. The empty string keeps the legacy inference (a checkout
+// whose source is not a GitHub address); callers pass --repo only when
+// non-empty so non-GitHub flows are byte-for-byte unchanged.
+func backstopRepositorySlug(qw QueuedWork) string {
+	return githubRepositorySlug(qw.Repository)
+}
+
+// backstopGhPRCreateArgs builds the backstop's `gh pr create` argv,
+// pinning the repository the work item configured so gh never infers the
+// owner from the host's user. The slug is appended only when known.
+func backstopGhPRCreateArgs(qw QueuedWork, branch, title, body string) []string {
+	args := []string{"pr", "create", "--head", branch, "--title", title, "--body", body}
+	if qw.BaseRef != "" {
+		args = append(args, "--base", qw.BaseRef)
+	}
+	if slug := backstopRepositorySlug(qw); slug != "" {
+		args = append(args, "--repo", slug)
+	}
+	return args
+}
+
 //nolint:gocyclo,funlen // step ordering is the package's contract; splitting hides intent
 func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result, allowedRepositories map[string]struct{}) agent.BackstopReport {
 	// Keep the completion contract at the mutation boundary too. Normal callers
@@ -523,12 +546,11 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	prBody := backstopPRBody(qw)
 	// --head names the session branch just pushed, so gh never infers the
 	// head from the checked-out branch — which may be one this session does
-	// not own. An "already exists" PR recovered below is therefore always the
-	// session branch's own PR.
-	prArgs := []string{"pr", "create", "--head", branch, "--title", prTitle, "--body", prBody}
-	if qw.BaseRef != "" {
-		prArgs = append(prArgs, "--base", qw.BaseRef)
-	}
+	// not own. --repo pins the work item's configured repository so gh never
+	// infers the owner from the host's git/gh identity either. An
+	// "already exists" PR recovered below is therefore always the session
+	// branch's own PR on the session's repository.
+	prArgs := backstopGhPRCreateArgs(qw, branch, prTitle, prBody)
 	prOut, err := runGh(ctx, worktreePath, prArgs...)
 	if err != nil {
 		// `gh pr create` fails ("a pull request for branch ... already
@@ -539,13 +561,17 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		// so stderr is in prOut). An existing PR satisfies the completion
 		// contract, so recover the URL and report success rather than a
 		// pushed-but-no-PR failure that would reclassify the session failed.
+		repoSlug := backstopRepositorySlug(qw)
 		if u := scanPRURL(prOut); u != "" {
 			report.PRURL = u
 			report.PRCreated = true
-			report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories)
+			report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories, repoSlug)
 			return report
 		}
 		report.Diagnostics = fmt.Sprintf("gh pr create failed: %v\noutput: %s", err, prOut)
+		if report.Pushed {
+			report.Diagnostics = "delivery failed after the work was pushed: " + report.Diagnostics
+		}
 		return report
 	}
 	if u := scanPRURL(prOut); u != "" {
@@ -557,7 +583,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		report.PRURL = strings.TrimSpace(prOut)
 		report.PRCreated = true
 	}
-	report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories)
+	report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories, backstopRepositorySlug(qw))
 	return report
 }
 
@@ -589,10 +615,19 @@ func (r *Runner) runDeclaredBackstops(
 			repositoryResult.PullRequestURL = res.PullRequestURL
 		}
 		report := agent.BackstopReport{PRURL: repositoryResult.PullRequestURL}
+		// Resolve the push-back repository from the declared mutable source —
+		// the configured repository for this checkout — so the backstop's gh
+		// calls pin it instead of inferring the owner from the host. The
+		// legacy singular path derives the same slug from qw.Repository
+		// inside runBackstop; here the declaration overrides it per
+		// repository by shadowing the work item's configured address.
+		repositoryQW := qw
+		repositoryQW.Repository = repository.Source.Repository
+		repoSlug := githubRepositorySlug(repository.Source.Repository)
 		if shouldBackstop(&repositoryResult, qw.WorkType) {
-			report = r.runBackstop(ctx, qw, branch, &repositoryResult, allowedRepositories)
+			report = r.runBackstop(ctx, repositoryQW, branch, &repositoryResult, allowedRepositories)
 		} else if report.PRURL != "" {
-			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories)
+			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories, repoSlug)
 		}
 		aggregate.Repositories = append(aggregate.Repositories, agent.RepositoryBackstopReport{Name: repository.Name, Report: report})
 		aggregate.Triggered = aggregate.Triggered || report.Triggered
@@ -632,11 +667,20 @@ type ghPullRequestView struct {
 const ghPullRequestViewFields = "number,url,baseRefName,headRefName,isDraft"
 
 // viewGitHubPullRequest runs the runner's `gh pr view` query for prURL in
-// the checkout.
-func viewGitHubPullRequest(ctx context.Context, worktreePath, prURL string) (ghPullRequestView, error) {
+// the checkout. Callers that know the session's repository pass it so the
+// readback runs against the work item's configured repository rather than
+// whatever the host resolves; the empty string keeps the legacy inference.
+func viewGitHubPullRequest(ctx context.Context, worktreePath, prURL string, repoSlugs ...string) (ghPullRequestView, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL, "--json", ghPullRequestViewFields)
+	args := []string{"pr", "view", prURL, "--json", ghPullRequestViewFields}
+	for _, slug := range repoSlugs {
+		if strings.TrimSpace(slug) != "" {
+			args = append(args, "--repo", strings.TrimSpace(slug))
+			break
+		}
+	}
+	out, err := runGh(lookupCtx, worktreePath, args...)
 	if err != nil {
 		return ghPullRequestView{}, fmt.Errorf("gh pr view: %w: %s", err, firstLine(out))
 	}
@@ -650,12 +694,13 @@ func viewGitHubPullRequest(ctx context.Context, worktreePath, prURL string) (ghP
 // lookupGitHubPullRequest reads the complete PR projection after gh created
 // or detected a URL. The URL-only completion contract remains valid when this
 // best-effort metadata query cannot run; only the normalized pr.opened fact is
-// omitted in that case.
-func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, allowedRepositories map[string]struct{}) *agent.PullRequestFact {
+// omitted in that case. Callers that know the session's repository pass it
+// so the readback runs against the work item's configured repository.
+func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, allowedRepositories map[string]struct{}, repoSlugs ...string) *agent.PullRequestFact {
 	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" || len(allowedRepositories) == 0 {
 		return nil
 	}
-	view, err := viewGitHubPullRequest(ctx, worktreePath, prURL)
+	view, err := viewGitHubPullRequest(ctx, worktreePath, prURL, repoSlugs...)
 	if err != nil {
 		return nil
 	}
