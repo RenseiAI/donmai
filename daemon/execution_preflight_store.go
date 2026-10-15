@@ -57,6 +57,12 @@ func (s *FileExecutionPreflightStore) reaffirmRoot(root *os.Root) error {
 }
 
 // Persist fsyncs the one immutable initial receipt for sessionID.
+//
+// Persist is idempotent for identical bytes: when the session already has a
+// receipt whose content is byte-identical to receipt, it reaffirms the
+// directory and returns nil, so a redelivered claim that compiles the same
+// receipt can be accepted again. A different receipt for the same session is
+// still refused, and that error wraps os.ErrExist.
 func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.RawMessage) error {
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return errors.New("execution preflight receipt directory is required")
@@ -106,9 +112,32 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 	// rename, cannot replace an existing receipt or follow a destination
 	// symlink. Both names are constrained by os.Root.
 	if err := root.Link(pendingName, finalName); err != nil {
+		if errors.Is(err, os.ErrExist) && storedReceiptEquals(root, finalName, receipt) {
+			return s.reaffirmRoot(root)
+		}
 		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
 	}
 	return s.reaffirmRoot(root)
+}
+
+// storedReceiptEquals reports whether name is a regular file inside root whose
+// content is exactly want. A symlink, a non-regular file, or any read error
+// reports false, so the caller keeps refusing.
+func storedReceiptEquals(root *os.Root, name string, want []byte) bool {
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(want)) {
+		return false
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = file.Close() }()
+	got, err := io.ReadAll(io.LimitReader(file, int64(len(want))+1))
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(got, want)
 }
 
 func executionPreflightReceiptName(sessionID string) string {
