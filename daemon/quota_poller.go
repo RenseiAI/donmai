@@ -166,8 +166,8 @@ func museQuotaProbe(binary string) quotaProbeFunc {
 		probed := agent.MakeUsageLimits(agent.ISOTime(at), nil)
 		if err := providermuse.CheckHostSessionLogin(context.Background(), binary); err != nil {
 			out := agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
-		out.Unavailable.Answered = true
-		probed = out
+			out.Unavailable.Answered = true
+			probed = out
 		}
 		q.noteMuseProbe(museHostSessionAccountID, probed, at)
 	}

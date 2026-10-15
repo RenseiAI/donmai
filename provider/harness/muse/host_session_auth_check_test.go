@@ -80,8 +80,10 @@ func TestCheckHostSessionLogin_RequiresAbsoluteBinary(t *testing.T) {
 	if err := CheckHostSessionLogin(context.Background(), "muse"); !errors.Is(err, agent.ErrProviderUnavailable) {
 		t.Fatalf("relative binary accepted: %v", err)
 	}
-	if err := CheckHostSessionLogin(nil, "/usr/bin/muse"); !errors.Is(err, agent.ErrProviderUnavailable) {
-		t.Fatalf("nil context accepted: %v", err)
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+	if err := CheckHostSessionLogin(cancelled, "/usr/bin/muse"); !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Fatalf("cancelled context accepted: %v", err)
 	}
 }
 
@@ -144,7 +146,7 @@ func TestResolveMuseBinary_Chain(t *testing.T) {
 	}
 	home := t.TempDir()
 	localBin := filepath.Join(home, ".local", "bin")
-	if err := os.MkdirAll(localBin, 0o755); err != nil {
+	if err := os.MkdirAll(localBin, 0o750); err != nil {
 		t.Fatalf("make local bin: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(localBin, "muse"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // test fixture script
