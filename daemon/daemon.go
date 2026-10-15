@@ -2161,6 +2161,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	// Opt-in anonymous usage count — the weekly scheduler for the
+	// operator-consented installation count. The loop reads the live
+	// config each tick so `host set` takes effect without a restart;
+	// disabled or unconfigured sends nothing at all.
+	d.startUsagePingLoop(ctx)
+
 	// Phase 3b: hot-reload daemon.yaml on direct edits. Without this,
 	// `vim ~/.donmai/daemon.yaml` then :w leaves the running daemon with
 	// stale in-memory state until restart — a real silent-staleness gap
@@ -2286,6 +2292,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
+	usagePingChanged := d.config.UsagePing != cfg.UsagePing
 	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
 	seatQoSChanged := d.config.Capacity.SeatQoS != cfg.Capacity.SeatQoS
 	// A rotated registration token rides alongside project changes: the new
@@ -2295,7 +2302,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// the previous generation stays), so checking for the change here only
 	// decides whether the reload path runs at all.
 	registrationTokenChanged := d.credentials != nil && cfg.Orchestrator.AuthToken != "" && cfg.Orchestrator.AuthToken != d.config.Orchestrator.AuthToken
-	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged {
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged && !usagePingChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -2356,6 +2363,15 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			}
 		}
 		d.config.Capacity.SeatQoS = cfg.Capacity.SeatQoS
+	}
+	if usagePingChanged {
+		d.config.UsagePing = cfg.UsagePing
+		if !cfg.UsagePingEnabled() {
+			// Disabling cancels queued work: no stale schedule
+			// survives the opt-out, and no future transmission
+			// is attempted until the operator opts back in.
+			cancelUsagePing(DefaultUsagePingStatePath())
+		}
 	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {

@@ -104,6 +104,12 @@ type Config struct {
 	// these needs a drain-aware restart — the running keeper never re-reads
 	// them, and `daemon set` persists the value and says so.
 	RepoKeeper RepoKeeperConfig `yaml:"repoKeeper,omitempty" json:"repoKeeper,omitempty"`
+	// UsagePing holds the opt-in anonymous usage-count consent (see
+	// usage_ping.go). Optional; the zero value keeps the ping disabled:
+	// nothing is sent unless the operator explicitly opts in and
+	// configures an endpoint. Consent state is separate from daemon
+	// registration, credentials, and auto-update configuration.
+	UsagePing UsagePingConfig `yaml:"usagePing,omitempty" json:"usagePing,omitempty"`
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
 	// actor). Optional; applyDefaults seeds Mode via
@@ -1128,6 +1134,9 @@ func validateConfig(c *Config) error {
 		return err
 	}
 	if err := validateSeatQoS(c.Capacity.SeatQoS); err != nil {
+		return err
+	}
+	if err := validateUsagePing(c.UsagePing); err != nil {
 		return err
 	}
 	if c.ProjectAdmissionVersion != 0 && c.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
