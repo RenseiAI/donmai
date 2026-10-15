@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 )
 
 // trustLedgerSweepTimeout bounds the whole daemon-startup trust-ledger
@@ -55,22 +57,56 @@ func (d *Daemon) sweepSeededTrustLedger(ctx context.Context) {
 	sweepCtx, cancel := context.WithTimeout(ctx, trustLedgerSweepTimeout)
 	defer cancel()
 	total := 0
+	perHome := make([]int, 0, len(homes))
+	visited := make(map[string]struct{}, len(homes))
 	for _, home := range homes {
+		visited[home] = struct{}{}
+	}
+	// The ledger names its own debris: each row records the absolute
+	// config home the seed wrote it beside, so one pass over the process
+	// homes discovers session-scoped override homes the process
+	// enumeration above could never reach. The loop revisits until no
+	// visited home names a new one; every iteration holds the trust lock
+	// only for one small read plus one small write per home, so the
+	// sweep-wide timeout still bounds the whole pass.
+	for i := 0; i < len(homes); i++ {
+		home := homes[i]
 		select {
 		case <-sweepCtx.Done():
 			slog.Info("daemon: seeded-trust sweep timed out", "swept", total)
 			return
 		default:
 		}
-		total += sweep(home, live)
+		// Discover override homes BEFORE sweeping this home: the ledger
+		// names its own debris even when its rows are live (a live
+		// session's rows name its isolated home while staying protected
+		// themselves), so discovery must not wait for the naming home's
+		// own sweep to drain first.
+		homes = append(homes, providerclaude.LedgerConfigHomes(
+			filepath.Join(home, providerclaude.TrustRecordFileName),
+			visited,
+		)...)
+		dropped := sweep(home, live)
+		total += dropped
+		perHome = append(perHome, dropped)
 	}
-	slog.Info("daemon: seeded-trust sweep complete", "configHomes", len(homes), "rowsDropped", total)
+	slog.Info("daemon: seeded-trust sweep complete",
+		"configHomes", len(homes), "rowsDropped", total, "perHome", perHome)
 }
 
 // trustLedgerConfigHomes returns the config homes that may carry a seeded-
-// trust ledger: the process config home plus every live adopted session's
-// own session-scoped override. Best-effort: any failure sweeps just the
-// process home rather than blocking startup.
+// trust ledger: the process config home (the operator home, plus the
+// daemon-process CLAUDE_CONFIG_DIR override when set). Best-effort: any
+// failure sweeps just the process home rather than blocking startup.
+//
+// Session-scoped override homes — a session whose own env layer sets
+// CLAUDE_CONFIG_DIR to a home the daemon process never ran with — are NOT
+// enumerated here. Each ledger row records the absolute home its seed wrote
+// beside (see provider/harness/claude.trustLedgerEntry.ConfigHome), and
+// the sweep loop above follows those rows: visiting the process homes
+// discovers every override home that carries rows. A home whose ledger is
+// gone (or that holds only rows predating the per-row field) needs no
+// visit — there is nothing recorded there to drain.
 func (d *Daemon) trustLedgerConfigHomes() []string {
 	seen := map[string]struct{}{}
 	var homes []string
@@ -95,9 +131,10 @@ func (d *Daemon) trustLedgerConfigHomes() []string {
 
 // liveTrustLedgerSessions returns the liveness predicate the sweep consults:
 // a ledger session identity reads as live when this daemon adopted it and
-// has not observed its exit. Ledger rows carry "session:<name>" for named
-// sessions and "pid:<pid>" for unnamed ones (see
-// provider/harness/claude.trustLedgerOwner): the pid form names a process
+// has not observed its exit. Ledger rows carry "session:<SessionID>" — the
+// platform lifecycle UUID the runner threads through agent.Spec.SessionID
+// (see provider/harness/claude.trustLedgerOwner) — and "pid:<pid>" for
+// sessions that carried no lifecycle id: the pid form names a process
 // that died with the crash, so it never reads as live here — only an
 // adopted session identity does.
 func (d *Daemon) liveTrustLedgerSessions() func(session string) bool {

@@ -101,6 +101,10 @@ func TestRemoveSeededTrust_ForgetsLedgerRows(t *testing.T) {
 // entry is put back to its prior value, a live session's entries are
 // untouched, and the drained rows leave the ledger. RED proof: sweep with a
 // live-set that reads every session as live and nothing is undone.
+//
+// The live row deliberately carries a display name that differs from its
+// lifecycle UUID: the sweep keys liveness on the UUID (the daemon's adopted
+// identity), so a same-string fixture would mask a namespace mismatch.
 func TestSweepTrustLedger_UndoesDeadSessionsKeepsLiveOnes(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), ".claude.json")
@@ -115,7 +119,7 @@ func TestSweepTrustLedger_UndoesDeadSessionsKeepsLiveOnes(t *testing.T) {
 		prior:   map[string]any{"/operator/flipped": false},
 		session: "session:dead",
 	}
-	live := &seededTrust{path: path, dirs: []string{"/live/created"}, session: "session:live"}
+	live := &seededTrust{path: path, dirs: []string{"/live/created"}, session: "session:uuid-live"}
 	// Land the rows by hand: seedTrustFile would refuse to flip an entry
 	// that is already trusted, and the point here is the sweep, not the
 	// seed. The record itself is seeded the same way.
@@ -140,7 +144,7 @@ func TestSweepTrustLedger_UndoesDeadSessionsKeepsLiveOnes(t *testing.T) {
 
 	dropped := sweepTrustLedger(SweepTrustLedgerOptions{
 		TrustRecordPath: path,
-		Live:            func(s string) bool { return s == "session:live" },
+		Live:            func(s string) bool { return s == "session:uuid-live" },
 	})
 	if dropped != 2 {
 		t.Errorf("sweep dropped %d rows, want 2 (the dead session's created + flipped rows)", dropped)
@@ -162,7 +166,7 @@ func TestSweepTrustLedger_UndoesDeadSessionsKeepsLiveOnes(t *testing.T) {
 		t.Errorf("unrelated entry disturbed by the sweep: %v", projects)
 	}
 	entries := readLedgerEntries(t, path)
-	if len(entries) != 1 || entries[0].Session != "session:live" {
+	if len(entries) != 1 || entries[0].Session != "session:uuid-live" {
 		t.Errorf("ledger after sweep = %v, want only the live session's row", entries)
 	}
 }
@@ -240,9 +244,73 @@ func TestSweepSeededTrustForConfigHome_SweepsOnlyTheLedger(t *testing.T) {
 	}
 }
 
-// TestSeedWorkspaceTrust_RecordsLedgerWithOwningSession drives the
+// TestLedgerConfigHomes_NamesSessionScopedOverrideHomes proves the sweep
+// can find a crashed session's isolated home: a ledger wrote beside one
+// home names a second absolute home in its rows, and LedgerConfigHomes
+// returns exactly the unvisited ones. Rows that predate the per-row field
+// — or name a relative home — list nothing, so the sweep never chases a
+// path the seed could not have written.
+func TestLedgerConfigHomes_NamesSessionScopedOverrideHomes(t *testing.T) {
+	t.Parallel()
+	override := t.TempDir()
+	path := filepath.Join(t.TempDir(), claudeTrustFileName)
+	seed := &seededTrust{
+		path:    path,
+		dirs:    []string{"/dead/created"},
+		session: "session:dead",
+	}
+	recordSeededTrustLedger(seed)
+	// Rewrite the row with an explicit override home, as a seed under a
+	// session-scoped CLAUDE_CONFIG_DIR would have recorded it.
+	entries, ok := readTrustLedger(path)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("ledger rows = %v, want the one recorded row", entries)
+	}
+	entries[0].ConfigHome = override
+	rewriteLedgerForTest(t, path, entries)
+
+	visited := map[string]struct{}{filepath.Dir(path): {}}
+	got := LedgerConfigHomes(path, visited)
+	if len(got) != 1 || got[0] != override {
+		t.Errorf("LedgerConfigHomes = %q, want [%q]", got, override)
+	}
+	// A second call names nothing new: the home is now visited.
+	if again := LedgerConfigHomes(path, visited); len(again) != 0 {
+		t.Errorf("LedgerConfigHomes revisit = %q, want nothing new", again)
+	}
+
+	// Rows without a home — or with a relative one — list nothing.
+	bare := filepath.Join(t.TempDir(), claudeTrustFileName)
+	bareSeed := &seededTrust{path: bare, dirs: []string{"/dead/created"}, session: "session:dead"}
+	recordSeededTrustLedger(bareSeed)
+	bareEntries, ok := readTrustLedger(bare)
+	if !ok || len(bareEntries) != 1 {
+		t.Fatalf("bare ledger rows = %v, want one", bareEntries)
+	}
+	bareEntries[0].ConfigHome = ""
+	rewriteLedgerForTest(t, bare, bareEntries)
+	if got := LedgerConfigHomes(bare, map[string]struct{}{}); len(got) != 0 {
+		t.Errorf("LedgerConfigHomes for a home-less row = %q, want nothing", got)
+	}
+}
+
+// rewriteLedgerForTest replaces the ledger beside path under the trust
+// lock. Test-only helper for hand-editing rows the seed wrote.
+func rewriteLedgerForTest(t *testing.T, path string, entries []trustLedgerEntry) {
+	t.Helper()
+	release, ok := acquireTrustLock(path)
+	if !ok {
+		t.Fatal("could not take the trust lock for the test rewrite")
+	}
+	defer release()
+	if err := writeTrustLedger(path, entries); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // PRODUCTION seed entry point: seedWorkspaceTrust records the ledger rows
-// under the isolated config home with the session's own name as owner, so
+// under the isolated config home with the session's lifecycle UUID as
+// owner — the same namespace the daemon sweep's liveness set keys on — so
 // the daemon sweep can tell this live session's entries from a crashed
 // one's. RED proof: drop the ledger write from seedWorkspaceTrust and the
 // ledger stays absent.
@@ -254,19 +322,23 @@ func TestSeedWorkspaceTrust_RecordsLedgerWithOwningSession(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	seed := seedWorkspaceTrust(agent.Spec{
+		SessionID:   "uuid-ledger-owner-prod",
 		Cwd:         workdir,
 		SessionName: "ledger-owner-prod",
 	})
 	if seed == nil {
 		t.Fatal("seedWorkspaceTrust seeded nothing")
 	}
-	if seed.session != "session:ledger-owner-prod" {
-		t.Errorf("seed owner = %q, want the session name so the sweep can re-home it", seed.session)
+	if seed.session != "session:uuid-ledger-owner-prod" {
+		t.Errorf("seed owner = %q, want the lifecycle UUID so the sweep can re-home it", seed.session)
 	}
 	entries := readLedgerEntries(t, filepath.Join(cfgHome, claudeTrustFileName))
 	for _, e := range entries {
-		if e.Session != "session:ledger-owner-prod" {
+		if e.Session != "session:uuid-ledger-owner-prod" {
 			t.Errorf("ledger row carries the wrong owner: %+v", e)
+		}
+		if e.ConfigHome != cfgHome {
+			t.Errorf("ledger row names config home %q, want the home the seed wrote %q", e.ConfigHome, cfgHome)
 		}
 	}
 	if len(entries) == 0 {
@@ -296,24 +368,26 @@ func TestSweepTrustLedger_AbsentRecordDrainsRows(t *testing.T) {
 	}
 }
 
-// TestTrustLedgerOwner_FallsBackToProcessIdentity proves an unnamed session
-// still gets a ledger owner — the process identity — so its rows are swept
-// only when no live session in this process claims them.
-func TestTrustLedgerOwner_FallsBackToProcessIdentity(t *testing.T) {
+// TestTrustLedgerOwner_KeysOnTheLifecycleUUID proves the ledger owner is
+// the session's lifecycle UUID — the same namespace the daemon sweep's
+// liveness set keys on — never the user-facing display name. A session
+// without a lifecycle id still gets a ledger owner — the process identity
+// — so its rows are swept only when no live session claims them.
+func TestTrustLedgerOwner_KeysOnTheLifecycleUUID(t *testing.T) {
 	t.Parallel()
+	if got := trustLedgerOwner(agent.Spec{SessionID: "uuid-1", SessionName: "different-name"}); got != "session:uuid-1" {
+		t.Errorf("ledger owner = %q, want session:uuid-1: the display name is a different namespace", got)
+	}
 	owner := trustLedgerOwner(agent.Spec{})
 	if owner == "" {
-		t.Fatal("unnamed session has no ledger owner; its rows could never be swept")
+		t.Fatal("session without a lifecycle id has no ledger owner; its rows could never be swept")
 	}
-	if got := trustLedgerOwner(agent.Spec{SessionName: "named"}); got != "session:named" {
-		t.Errorf("named session owner = %q, want session:named", got)
-	}
-	raw, err := json.Marshal(trustLedgerEntry{Dir: "/x", Session: owner})
+	raw, err := json.Marshal(trustLedgerEntry{Dir: "/x", Session: owner, ConfigHome: "/cfg"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var roundTrip trustLedgerEntry
-	if err := json.Unmarshal(raw, &roundTrip); err != nil || roundTrip.Session != owner {
+	if err := json.Unmarshal(raw, &roundTrip); err != nil || roundTrip.Session != owner || roundTrip.ConfigHome != "/cfg" {
 		t.Errorf("ledger owner does not survive a ledger round trip: %q", raw)
 	}
 }

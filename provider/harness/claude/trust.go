@@ -61,8 +61,9 @@ type seededTrust struct {
 	// and leaves every other field on the entry as found.
 	flipped []string
 	prior   map[string]any
-	// session identifies the owning session (agent.Spec.SessionName, or a
-	// process-scoped fallback when the session is unnamed). Empty means the
+	// session identifies the owning session (agent.Spec.SessionID, or a
+	// process-scoped fallback when the session carries no lifecycle id).
+	// Empty means the
 	// seed predates the ledger, or the session declined ownership — the
 	// cleanup still removes exactly dirs/flipped, but the daemon crash
 	// sweep cannot re-home the entry to a live session.

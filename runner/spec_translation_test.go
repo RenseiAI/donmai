@@ -13,12 +13,15 @@ import (
 func TestTranslateSpec_ProjectsSessionName(t *testing.T) {
 	t.Parallel()
 	got := translateSpec(
-		QueuedWork{QueuedWork: prompt.QueuedWork{SessionName: "chief-of-staff"}},
+		QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "uuid-1", SessionName: "chief-of-staff"}},
 		agent.Capabilities{},
 		SpecInputs{},
 	)
 	if got.SessionName != "chief-of-staff" {
 		t.Fatalf("Spec.SessionName = %q; want %q", got.SessionName, "chief-of-staff")
+	}
+	if got.SessionID != "uuid-1" {
+		t.Fatalf("Spec.SessionID = %q; want %q (the lifecycle UUID the trust ledger keys on)", got.SessionID, "uuid-1")
 	}
 }
 

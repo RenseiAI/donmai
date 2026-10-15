@@ -403,6 +403,15 @@ type Spec struct {
 	// PrepareHarness calls become idempotent application/equality checks.
 	PreparedHarness *PreparedHarness `json:"-"`
 
+	// SessionID is the platform lifecycle UUID for this session
+	// (prompt.QueuedWork.SessionID): the same namespace the daemon adopts
+	// shims under (sessionshim.Identity.SessionID) and the trust ledger
+	// keys its owning-session rows on (provider/harness/claude
+	// trustLedgerOwner). It is NOT the display name (SessionName) and NOT
+	// the provider-native id (ProviderSessionID). Empty on legacy
+	// dispatches; additive and omitempty so the wire round-trip is
+	// unchanged for existing producers.
+	SessionID string `json:"sessionId,omitempty"`
 	// SessionName is the canonical user-facing name for the session. Harnesses
 	// with a native naming surface project it at fresh startup; empty preserves
 	// the harness's generated-name behavior.

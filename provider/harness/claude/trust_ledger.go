@@ -44,6 +44,14 @@ import (
 // the same config home.
 const trustLedgerFileName = ".claude.json.seeded-trust-ledger"
 
+// TrustRecordFileName is the CLI trust-record basename, exported so the
+// daemon sweep can resolve a visited home to the ledger beside it.
+const TrustRecordFileName = claudeTrustFileName
+
+// TrustLedgerFileName is the ledger basename beside the trust record,
+// exported alongside TrustRecordFileName for the same sweep path.
+const TrustLedgerFileName = trustLedgerFileName
+
 // trustLedgerMaxEntries bounds the ledger file: each entry is one seeded
 // directory of one session, so this is generous by construction. Past the
 // bound the ledger stops recording new seeds (the seed itself still lands —
@@ -65,20 +73,34 @@ type trustLedgerEntry struct {
 	HadKey bool `json:"hadKey,omitempty"`
 	// Session identifies the owning session (see seededTrust.session).
 	Session string `json:"session,omitempty"`
+	// ConfigHome is the absolute config home the seed wrote this row
+	// beside, recorded so the daemon sweep can visit exactly the homes
+	// that carry rows — including a session-scoped CLAUDE_CONFIG_DIR
+	// override the daemon process itself never ran with (see
+	// daemon/trust_ledger_sweep.go). Empty on rows that predate the
+	// field; those rows sweep under the process home as before.
+	ConfigHome string `json:"configHome,omitempty"`
 	// SeededAt is when the seed landed, for operator diagnosis.
 	SeededAt time.Time `json:"seededAt,omitempty"`
 }
 
 // trustLedgerOwner returns the ledger's owning-session identity for a
-// spawn: the session's own name when it carries one, else a process-scoped
-// fallback. The fallback still distinguishes this process's entries from
-// another process's (and from a crashed process's): two unnamed sessions in
-// one process share it, but the live-session set the sweep consults is
-// per-process too, so a live process's unnamed entries are never swept
-// while it lives.
+// spawn. The sweep's liveness set (daemon/liveTrustLedgerSessions) keys on
+// the daemon's adopted lifecycle identities — sessionshim.Identity SessionIDs,
+// the platform UUIDs daemon/launchSessionShim adopts — so the owner MUST be
+// that same SessionID, threaded through agent.Spec.SessionID by the runner
+// (runner/spec_translation.go). It MUST NOT be Spec.SessionName: that is the
+// user-facing display handle (prompt/queued_work.go: "never derived from
+// the provider-native session id"), and keying rows on it would let the
+// sweep undo a still-running session's trust at the next daemon restart —
+// the live rows would never match the SessionID-keyed live set. An empty
+// SessionID falls back to a process-scoped pid identity, which the sweep
+// reads as dead-by-design once the process is gone (see
+// daemon/trust_ledger_sweep.go); a live process's unnamed entries are still
+// protected because the daemon's own sweep consults only adopted sessions.
 func trustLedgerOwner(spec agent.Spec) string {
-	if name := strings.TrimSpace(spec.SessionName); name != "" {
-		return "session:" + name
+	if id := strings.TrimSpace(spec.SessionID); id != "" {
+		return "session:" + id
 	}
 	return fmt.Sprintf("pid:%d", os.Getpid())
 }
@@ -101,8 +123,9 @@ func recordSeededTrustLedger(seed *seededTrust) {
 		return
 	}
 	now := time.Now().UTC()
+	configHome := filepath.Dir(seed.path)
 	for _, dir := range seed.dirs {
-		entries = append(entries, trustLedgerEntry{Dir: dir, Created: true, Session: seed.session, SeededAt: now})
+		entries = append(entries, trustLedgerEntry{Dir: dir, Created: true, Session: seed.session, ConfigHome: configHome, SeededAt: now})
 	}
 	for _, dir := range seed.flipped {
 		var prior any
@@ -110,7 +133,7 @@ func recordSeededTrustLedger(seed *seededTrust) {
 		if seed.prior != nil {
 			prior, hadKey = seed.prior[dir]
 		}
-		entries = append(entries, trustLedgerEntry{Dir: dir, Prior: prior, HadKey: hadKey, Session: seed.session, SeededAt: now})
+		entries = append(entries, trustLedgerEntry{Dir: dir, Prior: prior, HadKey: hadKey, Session: seed.session, ConfigHome: configHome, SeededAt: now})
 	}
 	_ = writeTrustLedger(seed.path, entries)
 }
@@ -385,6 +408,38 @@ func applyTrustLedgerSweep(path string, dead []trustLedgerEntry) bool {
 		return false
 	}
 	return true
+}
+
+// LedgerConfigHomes lists every absolute config home named by the ledger
+// beside the trust record at trustRecordPath — even when that ledger's own
+// rows are still live, or its trust record needs no rewrite. Discovery must
+// not depend on the sweep draining the naming home first: a live session's
+// rows name its isolated home while staying protected themselves, and the
+// sweep still has to visit that home for OTHER (dead) sessions' rows.
+// Rows that predate the per-row config-home field name no home; the daemon
+// sweep covers those under the home it is already visiting (the caller
+// passes visited=true for that home). It returns the homes the sweep has
+// not visited yet, so the daemon can drain session-scoped override homes
+// the process home enumeration would never reach. Best-effort: an absent
+// or unparseable ledger lists nothing.
+func LedgerConfigHomes(trustRecordPath string, visited map[string]struct{}) []string {
+	entries, ok := readTrustLedger(trustRecordPath)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		home := strings.TrimSpace(e.ConfigHome)
+		if home == "" || !filepath.IsAbs(home) {
+			continue
+		}
+		if _, seen := visited[home]; seen {
+			continue
+		}
+		visited[home] = struct{}{}
+		out = append(out, home)
+	}
+	return out
 }
 
 // SweepSeededTrustForConfigHome sweeps the ledger beside the trust record
