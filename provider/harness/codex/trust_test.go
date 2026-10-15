@@ -346,3 +346,58 @@ func TestTrustedProjectsOverride_QuotesExoticPaths(t *testing.T) {
 		t.Fatalf("decoded keys = %#v, want %#v", got, want)
 	}
 }
+
+// TestGatewayProviderConfigOverride_RestatesFileBlockOnTheCLILayer proves
+// the gateway defense-in-depth restatement: a routed cell renders the same
+// provider route the private config file carries (provider id, base URL,
+// env key, wire API) as process-local --config overrides — and a
+// non-routed session renders nothing, keeping its argv byte-identical.
+// RED proof: drop the restatement from buildInteractiveLaunchEnv and the
+// routed argv carries no provider block.
+func TestGatewayProviderConfigOverride_RestatesFileBlockOnTheCLILayer(t *testing.T) {
+	t.Parallel()
+	routed := gatewayCellSpec("https://gateway.example/codex/v1", "cell-key", "")
+	launch, err := buildInteractiveLaunch(routed)
+	if err != nil {
+		t.Fatalf("buildInteractiveLaunch(routed): %v", err)
+	}
+	joined := strings.Join(launch.argv, "\n")
+	for _, want := range []string{
+		`model_provider="donmai-gateway"`,
+		`model_providers.donmai-gateway.base_url="https://gateway.example/codex/v1"`,
+		`model_providers.donmai-gateway.env_key="AI_GATEWAY_API_KEY"`,
+		`model_providers.donmai-gateway.wire_api="responses"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("routed launch argv missing %q; argv: %q", want, launch.argv)
+		}
+	}
+	for _, arg := range launch.argv {
+		if strings.Contains(arg, "cell-key") {
+			t.Errorf("session key rides argv (visible to every same-user process): %q", arg)
+		}
+	}
+
+	plain, err := buildInteractiveLaunch(agent.Spec{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("buildInteractiveLaunch(plain): %v", err)
+	}
+	for _, arg := range plain.argv {
+		if strings.Contains(arg, "donmai-gateway") {
+			t.Errorf("non-routed launch restates a provider block it has no route for: %q", arg)
+		}
+	}
+
+	if got := gatewayProviderConfigOverride(""); len(got) != 0 {
+		t.Errorf("gatewayProviderConfigOverride(empty) = %q, want nothing", got)
+	}
+	if got := gatewayProviderConfigOverride("https://gateway.example/codex/v1"); len(got)%2 != 0 {
+		t.Errorf("gatewayProviderConfigOverride renders %d args, want --config pairs", len(got))
+	} else {
+		for i := 0; i < len(got); i += 2 {
+			if got[i] != "--config" {
+				t.Errorf("gatewayProviderConfigOverride arg %d = %q, want --config", i, got[i])
+			}
+		}
+	}
+}
