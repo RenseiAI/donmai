@@ -79,3 +79,24 @@ func TestDispatchedPullRequestCannotDivergeFromTheReceiptedPayload(t *testing.T)
 		t.Fatal("a mirror that dropped the receipted pull request was accepted")
 	}
 }
+
+// TestDetailToQueuedWork_DeferFailureTransitionSurvives pins the per-work
+// deferral flag across the daemon→runner bridge, including the receipted
+// path where the detail stays authoritative for this policy flag.
+func TestDetailToQueuedWork_DeferFailureTransitionSurvives(t *testing.T) {
+	queued, err := detailToQueuedWork(&daemon.SessionDetail{SessionID: "sess-defer", DeferFailureTransition: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued.DeferFailureTransition {
+		t.Errorf("DeferFailureTransition = false; want true")
+	}
+
+	queued, err = detailToQueuedWork(&daemon.SessionDetail{SessionID: "sess-defer-off"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.DeferFailureTransition {
+		t.Errorf("DeferFailureTransition = true; want false (absent defaults to prior behaviour)")
+	}
+}

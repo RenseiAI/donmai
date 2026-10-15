@@ -417,3 +417,53 @@ func TestIsKnownWorkType(t *testing.T) {
 		}
 	}
 }
+
+// TestShouldDeferFailureTransition pins the retry-eligible gate: only the
+// combination of the per-work opt-in, a provider-error failure, and zero
+// tool calls defers the failure-side transition. Every other combination
+// keeps the prior behaviour.
+func TestShouldDeferFailureTransition(t *testing.T) {
+	cases := []struct {
+		name    string
+		deferIn bool
+		mode    string
+		calls   int
+		want    bool
+	}{
+		{name: "flag off", deferIn: false, mode: FailureProviderError, calls: 0, want: false},
+		{name: "non provider failure", deferIn: true, mode: FailureSilentExit, calls: 0, want: false},
+		{name: "tool call ran", deferIn: true, mode: FailureProviderError, calls: 1, want: false},
+		{name: "retry eligible", deferIn: true, mode: FailureProviderError, calls: 0, want: true},
+		{name: "empty mode", deferIn: true, mode: "", calls: 0, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldDeferFailureTransition(tc.deferIn, tc.mode, tc.calls); got != tc.want {
+				t.Errorf("shouldDeferFailureTransition(%v,%q,%d) = %v; want %v",
+					tc.deferIn, tc.mode, tc.calls, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResultSessionToolCalls pins the session-total counter backing the
+// deferral gate: observations accumulate, non-positive inputs are ignored,
+// and a nil result reads zero.
+func TestResultSessionToolCalls(t *testing.T) {
+	var nilRes *Result
+	if got := nilRes.sessionToolCalls(); got != 0 {
+		t.Fatalf("nil sessionToolCalls = %d; want 0", got)
+	}
+	res := &Result{}
+	nilRes.noteToolCalls(3) // must not panic on a nil receiver
+	res.noteToolCalls(0)
+	res.noteToolCalls(-1)
+	if got := res.sessionToolCalls(); got != 0 {
+		t.Fatalf("sessionToolCalls after non-positive notes = %d; want 0", got)
+	}
+	res.noteToolCalls(2)
+	res.noteToolCalls(3)
+	if got := res.sessionToolCalls(); got != 5 {
+		t.Errorf("sessionToolCalls = %d; want 5", got)
+	}
+}
