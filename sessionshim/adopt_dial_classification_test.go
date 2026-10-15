@@ -176,12 +176,18 @@ type postWelcomeAdoptedLossProxy struct {
 	connections                 atomic.Int32
 	retryHelloPreparedBeforeEOF atomic.Bool
 	retryAcceptArmedBeforeEOF   atomic.Bool
-	mu                          sync.Mutex
-	conns                       []net.Conn
-	closed                      bool
-	exchanges                   []postWelcomeExchange
-	err                         error
-	wg                          sync.WaitGroup
+	// stallFirstRetryHello delays the retry loop's first Hello forward by the
+	// configured span. It models one scheduling stall between the retry dial's
+	// accept and the Hello write, so a test can deterministically reproduce the
+	// signature of a retry attempt whose budget expired mid-exchange. Only the
+	// first served retry stalls; recovery attempts are served promptly.
+	stallFirstRetryHello time.Duration
+	mu                   sync.Mutex
+	conns                []net.Conn
+	closed               bool
+	exchanges            []postWelcomeExchange
+	err                  error
+	wg                   sync.WaitGroup
 }
 
 func (p *postWelcomeAdoptedLossProxy) track(conn net.Conn) {
@@ -215,12 +221,22 @@ func (p *postWelcomeAdoptedLossProxy) observations() ([]postWelcomeExchange, err
 }
 
 func startPostWelcomeAdoptedLossProxy(ctx context.Context, t *testing.T, path, target string, dropFirst bool) *postWelcomeAdoptedLossProxy {
+	return startPostWelcomeAdoptedLossProxyWithStall(ctx, t, path, target, dropFirst, 0)
+}
+
+// startPostWelcomeAdoptedLossProxyWithStall fronts a real shim like
+// startPostWelcomeAdoptedLossProxy, and additionally stalls the retry loop's
+// first Hello forward by stallFirstRetryHello. A stalled first retry expires
+// that attempt's dial budget exactly as a scheduling stall under suite
+// contention does; the loop then serves the next attempt with a freshly
+// prepared Hello, so the test can tell an abandoned dial from a lost cause.
+func startPostWelcomeAdoptedLossProxyWithStall(ctx context.Context, t *testing.T, path, target string, dropFirst bool, stallFirstRetryHello time.Duration) *postWelcomeAdoptedLossProxy {
 	t.Helper()
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("listen on interposing socket: %v", err)
 	}
-	proxy := &postWelcomeAdoptedLossProxy{}
+	proxy := &postWelcomeAdoptedLossProxy{stallFirstRetryHello: stallFirstRetryHello}
 	t.Cleanup(func() {
 		_ = listener.Close()
 		proxy.mu.Lock()
@@ -295,38 +311,68 @@ func startPostWelcomeAdoptedLossProxy(ctx context.Context, t *testing.T, path, t
 			}
 			proxy.retryHelloPreparedBeforeEOF.Store(proxy.connections.Load() == 1)
 
-			// The goroutine that will ACCEPT and immediately forward the prepared
-			// Hello is running before EOF starts the controller's retry deadline.
+			// The retry loop below ACCEPTs every connection after the first
+			// and serves each with an authentic Hello. It tolerates a retry
+			// attempt the controller abandoned mid-exchange — a budget that
+			// expired while this loop was stalled reads, to the loop, exactly
+			// like the lost Adopted reads to the controller — and serves the
+			// next attempt with a freshly prepared Hello instead of poisoning
+			// the proxy. A real shim behaves the same way: a dead handshake
+			// ends one connection, and the accept loop keeps serving.
 			retryAcceptArmed := make(chan struct{})
 			proxy.wg.Add(1)
 			go func() {
 				defer proxy.wg.Done()
 				close(retryAcceptArmed)
-				retryClient, retryAcceptErr := listener.Accept()
-				if retryAcceptErr != nil {
-					_ = readyUpstream.Close()
-					return
-				}
-				proxy.track(retryClient)
-				if deadline, ok := ctx.Deadline(); ok {
-					_ = retryClient.SetDeadline(deadline)
-				}
-				retryNumber := proxy.connections.Add(1)
-				retryClientReader := shimwire.NewReader(retryClient)
-				if exchangeErr := proxy.exchange(retryClient, readyUpstream, retryClientReader, readyReader, readyHello, false); exchangeErr != nil {
-					proxy.fail(fmt.Errorf("exchange %d: %w", retryNumber, exchangeErr))
+				upstream, reader, hello := readyUpstream, readyReader, readyHello
+				stalled := false
+				for {
+					retryClient, retryAcceptErr := listener.Accept()
+					if retryAcceptErr != nil {
+						_ = upstream.Close()
+						return
+					}
+					proxy.track(retryClient)
+					if deadline, ok := ctx.Deadline(); ok {
+						_ = retryClient.SetDeadline(deadline)
+					}
+					retryNumber := proxy.connections.Add(1)
+					retryClientReader := shimwire.NewReader(retryClient)
+					if !stalled && proxy.stallFirstRetryHello > 0 {
+						stalled = true
+						time.Sleep(proxy.stallFirstRetryHello)
+					}
+					if exchangeErr := proxy.exchange(retryClient, upstream, retryClientReader, reader, hello, false); exchangeErr != nil {
+						_ = retryClient.Close()
+						_ = upstream.Close()
+						if isAbandonedRetryExchange(exchangeErr) {
+							// The controller gave up on this attempt and hung
+							// up: its dial budget expired while the loop was
+							// stalled. Close the parked shim handshake — it
+							// still holds the shim's serialized Hello gate —
+							// and serve the next attempt with a freshly
+							// prepared Hello.
+							fresh, freshReader, freshHello, prepareErr := proxy.prepareRetryHello(t, dial)
+							if prepareErr != nil {
+								proxy.fail(prepareErr)
+								return
+							}
+							upstream, reader, hello = fresh, freshReader, freshHello
+							continue
+						}
+						proxy.fail(fmt.Errorf("exchange %d: %w", retryNumber, exchangeErr))
+						return
+					}
+					defer retryClient.Close() //nolint:errcheck
+					defer upstream.Close()    //nolint:errcheck
+					copied := make(chan struct{})
+					go func() { defer close(copied); forwardObservedShimMessages(upstream, retryClientReader) }()
+					forwardObservedShimMessages(retryClient, reader)
 					_ = retryClient.Close()
-					_ = readyUpstream.Close()
+					_ = upstream.Close()
+					<-copied
 					return
 				}
-				defer retryClient.Close()   //nolint:errcheck
-				defer readyUpstream.Close() //nolint:errcheck
-				copied := make(chan struct{})
-				go func() { defer close(copied); forwardObservedShimMessages(readyUpstream, retryClientReader) }()
-				forwardObservedShimMessages(retryClient, readyReader)
-				_ = retryClient.Close()
-				_ = readyUpstream.Close()
-				<-copied
 			}()
 			<-retryAcceptArmed
 			proxy.retryAcceptArmedBeforeEOF.Store(true)
@@ -348,6 +394,46 @@ func startPostWelcomeAdoptedLossProxy(ctx context.Context, t *testing.T, path, t
 	}()
 	<-firstAcceptArmed
 	return proxy
+}
+
+// prepareRetryHello dials the real shim and reads one authentic Hello for a
+// retry attempt served after an abandoned one. It runs only on the recovery
+// path: the first retry's Hello is prepared before the first controller's EOF
+// so the healthy retry's budget measures its own handshake.
+func (p *postWelcomeAdoptedLossProxy) prepareRetryHello(t *testing.T, dial func() (net.Conn, error)) (net.Conn, *shimwire.Reader, shimwire.Message, error) {
+	t.Helper()
+	upstream, err := dial()
+	if err != nil {
+		return nil, nil, shimwire.Message{}, fmt.Errorf("prepare retry upstream: %w", err)
+	}
+	reader := shimwire.NewReader(upstream)
+	hello, err := reader.Read()
+	if err != nil {
+		_ = upstream.Close()
+		return nil, nil, shimwire.Message{}, fmt.Errorf("prepare retry Hello: %w", err)
+	}
+	if hello.Type != shimwire.TypeHello {
+		_ = upstream.Close()
+		return nil, nil, shimwire.Message{}, fmt.Errorf("prepare retry Hello: expected Hello, got %s", hello.Type)
+	}
+	return upstream, reader, hello, nil
+}
+
+// isAbandonedRetryExchange reports the errors a retry exchange ends with when
+// the controller hung up first: its dial budget expired while the loop was
+// stalled, so the loop is writing to, or reading from, a peer that already
+// left. Anything else — a wrong frame, a refused generation, a shim-side
+// failure — is a protocol violation and still fails the proxy.
+func isAbandonedRetryExchange(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrClosed)
 }
 
 func (p *postWelcomeAdoptedLossProxy) exchange(client, upstream net.Conn, clientReader, reader *shimwire.Reader, hello shimwire.Message, drop bool) error {
@@ -749,8 +835,119 @@ func TestPostWelcomeTransientRetryRepreparesAgainstAdvancedGeneration(t *testing
 	if len(result.Adopted) != 1 {
 		t.Fatalf("adopted = %d controller(s), want the retried lineage", len(result.Adopted))
 	}
-	if got := proxy.connections.Load(); got != 2 {
-		t.Fatalf("adoption made %d connection(s), want exactly one retry after the observed lost Adopted reply", got)
+	if got := proxy.connections.Load(); got < 2 || got > 3 {
+		t.Fatalf("adoption made %d connection(s), want one retry after the observed lost Adopted reply, plus at most one abandoned dial whose budget expired while the interposer was stalled", got)
+	}
+	prepareMu.Lock()
+	gotFloors := append([]shimwire.Generation(nil), floors...)
+	prepareMu.Unlock()
+	if len(gotFloors) != 2 {
+		t.Fatalf("preparation floors = %v, want exactly the first and advanced Hello floors", gotFloors)
+	}
+	t.Logf("observed lost ACK generation=%d; retry Hello=%d; preparations=%v; final generation=%d", exchanges[0].Adopted.Generation, exchanges[1].Hello.Generation, gotFloors, result.Adopted[0].Generation())
+	if gotFloors[0] != exchanges[0].Hello.Generation || gotFloors[1] != exchanges[1].Hello.Generation {
+		t.Fatalf("Prepare floors %v disagree with real Hello exchanges %+v", gotFloors, exchanges)
+	}
+	if gotFloors[1] != gotFloors[0]+1 {
+		t.Fatalf("second preparation floor = %d, want the committed first candidate floor %d", gotFloors[1], gotFloors[0]+1)
+	}
+	if got := result.Adopted[0].Generation(); got != gotFloors[1]+1 {
+		t.Fatalf("adopted generation = %d, want a candidate prepared from the second authenticated floor %d", got, gotFloors[1]+1)
+	}
+}
+
+// TestPostWelcomeStalledRetryIsAbandonedAndServedAgain deterministically
+// reproduces the scheduling segment that exhausts a retry attempt's dial
+// budget: the interposer accepts the retry dial and then stalls before
+// forwarding the prepared Hello. The stalled attempt expires its budget and
+// hangs up — the broken-pipe write and the read-hello timeout the full suite
+// once reported — while the loop serves the next attempt with a freshly
+// prepared Hello. Exactly one Adopted reply is dropped, exactly one lineage is
+// adopted, and the abandoned dial leaves no preparation behind: it never lived
+// long enough to see a Hello.
+func TestPostWelcomeStalledRetryIsAbandonedAndServedAgain(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := Identity{OrgID: "org-reprepare", SessionID: "sess-post-welcome-stall"}
+	shim := startInProcessShim(t, reg, dir, id, 1)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if err := shim.Terminate(cleanupCtx); err != nil {
+			t.Errorf("terminate post-Welcome stall fixture shim: %v", err)
+		}
+	})
+
+	record, err := reg.Get(id)
+	if err != nil {
+		t.Fatalf("read the published record: %v", err)
+	}
+	proxyPath := dir + "/adopted-loss-stall.sock"
+	// The stall sits strictly inside the second attempt's budget: longer than
+	// its 300 ms dial timeout past the ~100 ms backoff, and short enough that
+	// the third attempt still owns a full budget when the loop recovers.
+	proxy := startPostWelcomeAdoptedLossProxyWithStall(ctx, t, proxyPath, record.SocketPath, true, 500*time.Millisecond)
+	repointRecordAtSocket(t, reg, id, proxyPath)
+
+	var (
+		prepareMu sync.Mutex
+		floors    []shimwire.Generation
+	)
+	result, err := Adopt(ctx, AdoptOptions{
+		Registry:     reg,
+		ControllerID: "controller-post-welcome-stall",
+		Filter:       func(candidate Identity) bool { return candidate == id },
+		DialTimeout:  300 * time.Millisecond,
+		Prepare: func(_ context.Context, evidence AdoptionPreparation) (PreparedAdoption, error) {
+			prepareMu.Lock()
+			defer prepareMu.Unlock()
+			floors = append(floors, evidence.CurrentControllerGeneration)
+			return PreparedAdoption{
+				ControllerGeneration: evidence.CurrentControllerGeneration + 1,
+				Correlation:          []byte(fmt.Sprintf("candidate-from-%d", evidence.CurrentControllerGeneration)),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	defer result.Close()
+
+	if !proxy.retryHelloPreparedBeforeEOF.Load() {
+		t.Fatal("retry Hello was not prepared before the first controller received EOF")
+	}
+	if !proxy.retryAcceptArmedBeforeEOF.Load() {
+		t.Fatal("retry client accept was not armed before the first controller received EOF")
+	}
+	exchanges, proxyErr := proxy.observations()
+	if proxyErr != nil {
+		t.Fatalf("proxy phase failed: %v; exchanges=%+v; quarantined=%+v", proxyErr, exchanges, result.Quarantined)
+	}
+	if len(exchanges) != 2 || !exchanges[0].Dropped || exchanges[1].Dropped {
+		t.Fatalf("expected one observed lost ACK and one delivered ACK: %+v", exchanges)
+	}
+	if exchanges[1].Hello.Generation != exchanges[0].Adopted.Generation {
+		t.Fatalf("retry Hello did not report committed first generation: %+v", exchanges)
+	}
+	if len(result.Quarantined) != 0 {
+		q := result.Quarantined[0]
+		t.Fatalf("a shim whose first Welcome committed was quarantined %q: %s", q.Reason, q.Detail)
+	}
+	if len(result.Adopted) != 1 {
+		t.Fatalf("adopted = %d controller(s), want the retried lineage", len(result.Adopted))
+	}
+	// The stalled second attempt hung up without ever seeing a Hello, so the
+	// third attempt is the one that completes the single re-adoption.
+	if got := proxy.connections.Load(); got != 3 {
+		t.Fatalf("adoption made %d connection(s), want the first dial, one abandoned retry, and the retry that completes it", got)
 	}
 	prepareMu.Lock()
 	gotFloors := append([]shimwire.Generation(nil), floors...)
