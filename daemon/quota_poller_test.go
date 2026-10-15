@@ -197,6 +197,122 @@ func TestQuotaPoller_FailedAttemptStillAdvancesClock(t *testing.T) {
 	}
 }
 
+// writeFakeMuseProbeCLI writes a stand-in muse binary for poller
+// tests: it answers `--version` with versionLine, or exits non-zero
+// when fail is set.
+func writeFakeMuseProbeCLI(t *testing.T, versionLine string, fail bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := dir + "/muse"
+	var script string
+	if fail {
+		script = "#!/bin/sh\nexit 3\n"
+	} else {
+		script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '" + versionLine + "'; exit 0; fi\nexit 3\n"
+	}
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+		t.Fatalf("write fake muse probe CLI: %v", err)
+	}
+	return path
+}
+
+// TestQuotaPoller_MuseProbeToHeartbeatSnapshot is the production-path
+// proof for the muse half of the wiring: the poller's muse probe runs
+// a fake binary into the quota cache, and the heartbeat quota field
+// the daemon sends carries the exact muse entry.
+func TestQuotaPoller_MuseProbeToHeartbeatSnapshot(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		version string
+		fail    bool
+		wantOK  bool
+	}{
+		{name: "supported version is ok", version: "Muse Code 1.4.9 (1.4.9-R6297.1)", wantOK: true},
+		{name: "too-old version is not ok", version: "Muse Code 1.4.2 (1.4.2-R5000.1)", wantOK: false},
+		{name: "non-zero exit is not ok", fail: true, wantOK: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessMuse: writeFakeMuseProbeCLI(t, tc.version, tc.fail)}})
+			probes := d.quotaProbes()
+			if probes[agent.UsageHarnessMuse] == nil {
+				t.Fatal("no muse probe registered for a configured binary")
+			}
+			// Drive the production entry point (the poller probe
+			// func), not the cache note, then read the heartbeat
+			// field shape the daemon sends.
+			probes[agent.UsageHarnessMuse](context.Background(), d.quota)
+			got := d.quotaSnapshot()
+			if len(got) != 1 {
+				t.Fatalf("snapshot = %+v, want the one muse entry", got)
+			}
+			acct := got[0]
+			if acct.ID != "muse-host-session" || acct.Provider != agent.UsageHarnessMuse {
+				t.Errorf("account = %+v, want the host-session muse entry", acct)
+			}
+			if len(acct.Limits.Windows) != 0 {
+				t.Errorf("limits = %+v, want no windows on a muse entry", acct.Limits)
+			}
+			if acct.AuthCheck == nil || acct.AuthCheck.Harness != agent.UsageHarnessMuse || acct.AuthCheck.OK != tc.wantOK {
+				t.Errorf("authCheck = %+v, want ok:%v for muse", acct.AuthCheck, tc.wantOK)
+			}
+			if acct.AuthCheck != nil && (acct.AuthCheck.CheckedAt == "" || acct.AuthCheck.CheckedAt != acct.Limits.CheckedAt) {
+				t.Errorf("authCheck = %+v, want the probe time on both", acct.AuthCheck)
+			}
+		})
+	}
+}
+
+// TestQuotaPoller_MuseProbeMissingBinaryOmitsEntry pins the absent
+// half: no configured binary means no probe and no muse entry at
+// all, never a false verdict.
+func TestQuotaPoller_MuseProbeMissingBinaryOmitsEntry(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{})
+	if probes := d.quotaProbes(); probes[agent.UsageHarnessMuse] != nil {
+		t.Fatal("muse probe registered without a configured binary")
+	}
+	if got := d.quotaSnapshot(); len(got) != 0 {
+		t.Fatalf("snapshot = %+v, want no muse entry", got)
+	}
+	// A configured-but-gone binary records a refusal, not an entry
+	// without a verdict: the probe ran and the login is not proven.
+	dGone := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessMuse: "/nonexistent-muse-binary"}})
+	probes := dGone.quotaProbes()
+	if probes[agent.UsageHarnessMuse] == nil {
+		t.Fatal("no muse probe registered for a configured binary")
+	}
+	probes[agent.UsageHarnessMuse](context.Background(), dGone.quota)
+	got := dGone.quotaSnapshot()
+	if len(got) != 1 || got[0].AuthCheck == nil || got[0].AuthCheck.OK {
+		t.Fatalf("snapshot = %+v, want one muse entry with ok:false", got)
+	}
+}
+
+// TestQuotaProbeDueAt_MuseReadsTheMuseClock pins the explicit muse
+// case: the muse next-due time follows the muse probe clock, never
+// the claude one.
+func TestQuotaProbeDueAt_MuseReadsTheMuseClock(t *testing.T) {
+	t.Parallel()
+
+	q := &quotaState{}
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	q.noteClaudeProbe("opaque-2", agent.MakeUsageLimits(agent.ISOTime(base), nil), base)
+	if due := q.quotaProbeDueAt(agent.UsageHarnessMuse, base); !due.IsZero() {
+		t.Fatalf("muse due = %v, want due now with no muse probe yet", due)
+	}
+	q.noteMuseProbe("muse-host-session", agent.MakeUsageLimits(agent.ISOTime(base), nil), base)
+	if due := q.quotaProbeDueAt(agent.UsageHarnessMuse, base); !due.Equal(base.Add(providercodex.RateLimitsProbeInterval)) {
+		t.Errorf("muse due = %v, want one interval past the muse probe", due)
+	}
+	if due := q.quotaProbeDueAt(agent.UsageHarnessMuse, base.Add(providercodex.RateLimitsProbeInterval)); !due.IsZero() {
+		t.Errorf("muse due = %v, want due at the interval", due)
+	}
+}
+
 // TestQuotaProbeBounds pins the timing contract the consumer relies
 // on: one probe attempt never runs longer than the per-attempt
 // ceiling, the probe interval stays below that ceiling's reach, and
