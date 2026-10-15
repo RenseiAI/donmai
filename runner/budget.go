@@ -152,6 +152,24 @@ type budgetBreach struct {
 	detail string
 }
 
+// BudgetDuration converts a dispatched budget seconds value to a bounded
+// time.Duration. It is the single clamp every seconds-to-duration
+// conversion goes through: values at or below zero yield zero (no cap),
+// values at or above the ceiling yield MaxSessionDurationCeiling. The
+// comparison runs in int64 seconds BEFORE multiplying, so a value near
+// the overflow boundary can neither wrap negative through
+// time.Duration nor drop the enforcer's cap while the run context keeps
+// its ceiling.
+func BudgetDuration(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	if int64(seconds) >= maxSessionDurationCeilingSeconds {
+		return MaxSessionDurationCeiling
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // NewBudgetEnforcer constructs an enforcer for the given budget. A nil
 // budget produces a disabled enforcer (no caps, no enforcement) so
 // callers can use one code path for legacy + stage dispatch.
@@ -185,7 +203,7 @@ func (e *BudgetEnforcer) WithDurationCap(parent context.Context) (context.Contex
 		ctx, cancel := context.WithCancel(parent)
 		return ctx, cancel
 	}
-	d := time.Duration(e.limits.MaxDurationSeconds) * time.Second
+	d := BudgetDuration(e.limits.MaxDurationSeconds)
 	return context.WithDeadline(parent, e.startedAt.Add(d))
 }
 
@@ -459,7 +477,7 @@ func (e *BudgetEnforcer) CheckDuration(now time.Time) *BudgetExceededError {
 		return nil
 	}
 	elapsed := now.Sub(e.startedAt)
-	limit := time.Duration(e.limits.MaxDurationSeconds) * time.Second
+	limit := BudgetDuration(e.limits.MaxDurationSeconds)
 	if elapsed >= limit {
 		return e.recordBreach(CapDuration,
 			fmt.Sprintf("max-duration-seconds exceeded: observed=%ds limit=%ds",
