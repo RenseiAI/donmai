@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -76,6 +77,14 @@ const (
 	// needs without out-of-band state.
 	stopHookStdinFile = "claim-stdin.json"
 
+	// stopHookTranscriptFile is the durable transcript locator: the hook's
+	// latest stdin, kept verbatim on every fire whether or not a notice was
+	// claimed. Consumed's claim receipt answers the delivery question; this
+	// file answers the session question (which transcript is mine) so a
+	// session that ends with nothing outstanding still has its usage source
+	// at exit. The hook parses nothing — Go reads transcript_path out of it.
+	stopHookTranscriptFile = "last-stdin.json"
+
 	// stopHookScriptFile is the POSIX script the CLI invokes.
 	stopHookScriptFile = "stop-hook.sh"
 
@@ -88,6 +97,14 @@ const (
 	stopHookTimeoutSeconds = 10
 )
 
+// statusLineSidecarFile is the statusline sidecar JSON the session's own
+// statusLine command maintains: the harness-native context signal the
+// runner's context watcher polls (see runner/context_usage.go). It lives in
+// the channel's private drop directory — never in the worktree — for the
+// same reason as the hook script: a file inside the tree is a file the
+// agent can read, edit, or commit by accident.
+const statusLineSidecarFile = "statusline-sidecar.json"
+
 // stopHookChannel is one interactive session's Stop-hook notice channel. It
 // owns a private directory containing the hook script and the drop; the
 // directory is removed when the session's handle cleans up.
@@ -95,6 +112,10 @@ type stopHookChannel struct {
 	dir string
 
 	mu sync.Mutex
+	// transcriptsMu guards transcripts on its own: the usage tailer notes
+	// paths while a notice operation may hold mu, and exitUsage reads them
+	// while holding mu.
+	transcriptsMu sync.Mutex
 	// text is the outstanding offer's message body, empty when nothing is
 	// outstanding.
 	text string
@@ -106,6 +127,24 @@ type stopHookChannel struct {
 	// and credited. It only ever advances, which is what stops a repeated
 	// message from acking itself against the record of its predecessor.
 	scanned int64
+	// snapshotPath pins the session's transcript path in memory once the
+	// drop directory is about to be removed (see snapshotTranscriptPath).
+	snapshotPath string
+	// transcripts is every distinct transcript path the hook has named this
+	// session, in first-seen order. Clearing the conversation moves the
+	// session to a new transcript, so the exit totals sum all of them.
+	transcripts []string
+	// createdAt is when the channel — and so the session — began. Transcript
+	// lines stamped earlier belong to a conversation this session resumed,
+	// not to this session's spend.
+	createdAt time.Time
+	// usageSessionID is pinned on the CLI argv. Its transcript can be located
+	// independently of Stop; these fields are immutable after spawn.
+	usageSessionID string
+	usageConfigDir string
+	// sidecarUsage survives cleanup of the session-owned drop directory.
+	// Access is guarded by mu, like snapshotPath.
+	sidecarUsage agent.CostData
 }
 
 // Compile-time assertion: the drop implements the pull seam the runner drives.
@@ -124,16 +163,99 @@ func newStopHookChannel() (*stopHookChannel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stop-hook channel: create drop dir: %w", err)
 	}
-	c := &stopHookChannel{dir: dir}
+	c := &stopHookChannel{dir: dir, createdAt: time.Now()}
 	script := stopHookScript(dir)
 	if err := os.WriteFile(c.path(stopHookScriptFile), []byte(script), 0o700); err != nil { //nolint:gosec // the hook is executed by the CLI; it is owner-only
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("stop-hook channel: write hook script: %w", err)
 	}
+	// The statusLine sidecar producer: the session's own context-signal
+	// writer, invoked by the CLI with the live context_window numbers on
+	// every status-line render. A writer that cannot be installed still
+	// yields a session — the transcript usage tail is unaffected — so this
+	// is best-effort exactly like the Stop-hook channel above.
+	if err := os.WriteFile(c.path(statusLineSidecarScriptFile), []byte(statusLineSidecarScript(c.path(statusLineSidecarFile))), 0o700); err != nil { //nolint:gosec // the hook is executed by the CLI; it is owner-only
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("stop-hook channel: write statusline script: %w", err)
+	}
 	return c, nil
 }
 
 func (c *stopHookChannel) path(name string) string { return filepath.Join(c.dir, name) }
+
+// sidecarPath returns the session's statusline sidecar path: the file the
+// session's own statusLine command maintains with the live context_window
+// numbers. It exists from channel creation (the writer is installed with
+// the channel), so the runner's context watcher can poll it for the whole
+// session; before the CLI's first status-line render it is simply absent
+// and the watcher stays silent.
+func (c *stopHookChannel) sidecarPath() string {
+	if c == nil {
+		return ""
+	}
+	return c.path(statusLineSidecarFile)
+}
+
+// statusLineSidecarScriptFile is the statusLine command the CLI invokes
+// with the live session status on stdin (see the statusLine input schema:
+// context_window.used_percentage, total_input_tokens, total_output_tokens,
+// context_window_size). It renders nothing to the terminal — the session's
+// status line is blank, because this command replaces any statusLine the
+// operator configured for this session only — and maintains the sidecar
+// file the runner's context watcher polls, translating the CLI's nested
+// context_window object into the flat sidecar document the parser reads
+// (agent.ParseClaudeSidecarNotice).
+const statusLineSidecarScriptFile = "statusline-sidecar.sh"
+
+// statusLineSidecarScript renders the sidecar writer. It takes the sidecar
+// path by value and bakes it in, so the command needs no environment —
+// hook processes inherit whatever the CLI hands them. The writer reads
+// the context_window numbers and cumulative cost.total_cost_usd. Input
+// missing both sources (before the first model call) leaves the previous
+// sidecar in place and never affects the terminal. The write rides a
+// temp-file rename so a concurrent reader never sees a half-written
+// document.
+func statusLineSidecarScript(sidecar string) string {
+	s := shellQuote(sidecar)
+	return `#!/bin/sh
+# donmai statusline sidecar writer. Generated per session; do not edit.
+#
+# The CLI invokes this as the session's statusLine command with the live
+# session status on stdin and reads the terminal line from stdout. This
+# writer emits no terminal line (it replaces any configured status line for
+# this session only) and maintains the sidecar file the runner's context watcher
+# polls for the harness-native context signal.
+set -u
+s=` + s + `
+tmp="$s.$$.tmp"
+if command -v python3 >/dev/null 2>&1; then
+  if python3 -c 'import sys,json
+raw = sys.stdin.read()
+try:
+    doc = json.loads(raw)
+except Exception:
+    sys.exit(1)
+cw = doc.get("context_window") or {}
+out = {}
+for key in ("used_percentage", "total_input_tokens", "total_output_tokens", "context_window_size"):
+    if cw.get(key) is not None:
+        out[key] = cw[key]
+cost = doc.get("cost") or {}
+if cost.get("total_cost_usd") is not None:
+    out["total_cost_usd"] = cost["total_cost_usd"]
+if not out:
+    sys.exit(1)
+with open(sys.argv[1], "w") as f:
+    json.dump(out, f)
+' "$tmp"; then
+    mv -f "$tmp" "$s" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+fi
+exit 0
+`
+}
 
 // close removes the drop directory. Idempotent; wired into the handle's
 // per-session cleanup so a notice still outstanding when the session ends dies
@@ -149,8 +271,65 @@ func (c *stopHookChannel) close() error {
 // "a settings JSON file OR a JSON string" and applies ADDITIVELY on top of
 // whichever base layer --setting-sources selects. Declaring only `hooks` here
 // therefore adds this Stop hook without disturbing any other setting.
+//
+// pin carries the session's own routing knobs (see pinnedRoutingEnv), stated
+// on this highest-precedence layer AFTER repo-local harness config is
+// applied: a repo settings file naming a routing destination, flipping an
+// alternate serving host, or naming a proxy is overridden by the pin, so the
+// session bearer stays on the session's own route. It cannot close repo
+// config that runs code (hooks, helpers, stdio MCP servers) — that
+// execution surface is the accepted model for a trusted repo. Nil/empty
+// pins nothing — a host-login session's settings stay exactly hooks plus
+// the modal answer.
 func (c *stopHookChannel) settingsJSON() (string, error) {
+	return c.settingsJSONWithPin(nil)
+}
+
+// settingsJSONWithPin renders settingsJSON with pin stated under the `env`
+// key. Both the session's own routing names AND the pinnedFallbackRoutingEnv
+// names (including their "" blanks) are honored — a blank explicitly states
+// the ambient default on the winning layer, which is what keeps a repo
+// naming a proxy or an alternate provider surface from taking effect.
+// Anything outside that set is dropped rather than passed through, so a
+// caller cannot smuggle an unrelated variable onto the CLI's winning layer.
+func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, error) {
+	env := make(map[string]string)
+	for k, v := range pin {
+		// Fallback names first, for the same reason as marshalRoutingPin:
+		// the bedrock/vertex switches sit in both sets, and their ""
+		// blanks must ride the pin rather than be dropped as empty
+		// session values.
+		if isFallbackRoutingName(k) {
+			env[k] = v
+			continue
+		}
+		if _, ok := routingPinEnvNames[k]; !ok || v == "" {
+			continue
+		}
+		env[k] = v
+	}
 	settings := map[string]any{
+		// skipDangerousModePermissionPrompt answers the bypass-permissions
+		// acceptance the CLI raises on an interactive TTY before the first
+		// turn — the same modal class as workspace trust, and equally
+		// unanswerable by an unattended session. It rides the settings the
+		// harness already passes (additive, beside hooks), so no extra
+		// flag or file is introduced.
+		"skipDangerousModePermissionPrompt": true,
+		// statusLine names the session's own sidecar writer: the CLI
+		// invokes it with the live context_window numbers on every
+		// status-line render, and it maintains the sidecar file the
+		// runner's context watcher polls. It renders no terminal line, so
+		// the session's status line is blank, and it rides the
+		// same additive --settings layer as the Stop hook, so the
+		// operator's own statusLine configuration in the base layer is
+		// replaced for this session only, exactly as the hooks are added
+		// for it. A session whose writer cannot be installed still runs:
+		// settingsJSONWithPin callers treat this channel as best-effort.
+		"statusLine": map[string]any{
+			"type":    "command",
+			"command": "/bin/sh " + shellQuote(c.path(statusLineSidecarScriptFile)),
+		},
 		"hooks": map[string]any{
 			"Stop": []any{
 				map[string]any{
@@ -164,6 +343,9 @@ func (c *stopHookChannel) settingsJSON() (string, error) {
 				},
 			},
 		},
+	}
+	if len(env) > 0 {
+		settings["env"] = env
 	}
 	b, err := json.Marshal(settings)
 	if err != nil {
@@ -237,6 +419,11 @@ func (c *stopHookChannel) Retract() (bool, error) {
 // the conversation. Only the second fact is consumption. A claim receipt with
 // no transcript record is precisely the discarded-output case the CLI reports
 // nowhere else, and it must read as NOT delivered.
+//
+// Every hook fire refreshes the durable transcript locator (see
+// stopHookTranscriptFile): the transcript path is session state, not just
+// delivery evidence, so a session that ends with no notice outstanding still
+// knows which file its usage accounting reads at exit.
 func (c *stopHookChannel) Consumed() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -268,7 +455,102 @@ func (c *stopHookChannel) Consumed() (bool, error) {
 // ok is false while the hook has not fired for this offer yet, which is the
 // ordinary waiting state and not an error.
 func (c *stopHookChannel) claimedTranscriptPath() (string, bool, error) {
-	b, err := os.ReadFile(c.path(stopHookStdinFile))
+	return transcriptPathFromStdinFile(c.path(stopHookStdinFile))
+}
+
+// transcriptPath returns the session's durable transcript locator: the
+// transcript_path from the latest hook stdin, kept on every fire whether or
+// not a notice was claimed. Before the first fire it looks up the pinned
+// conversation id in the CLI transcript store. ok is false when neither
+// source locates a transcript. Both live and exit accounting read this path.
+func (c *stopHookChannel) transcriptPath() (string, bool, error) {
+	path, ok, err := transcriptPathFromStdinFile(c.path(stopHookTranscriptFile))
+	if err == nil && !ok {
+		path, ok = c.usageTranscriptPath()
+	}
+	if err == nil && ok {
+		c.noteTranscript(path)
+	}
+	return path, ok, err
+}
+
+// noteTranscript records a transcript path the hook named, once.
+func (c *stopHookChannel) noteTranscript(path string) {
+	c.transcriptsMu.Lock()
+	defer c.transcriptsMu.Unlock()
+	for _, seen := range c.transcripts {
+		if seen == path {
+			return
+		}
+	}
+	c.transcripts = append(c.transcripts, path)
+}
+
+// namedTranscripts returns every transcript path the hook has named.
+func (c *stopHookChannel) namedTranscripts() []string {
+	c.transcriptsMu.Lock()
+	defer c.transcriptsMu.Unlock()
+	return append([]string(nil), c.transcripts...)
+}
+
+// snapshotTranscriptPath pins the session's transcript path in memory. The
+// drop directory is removed by the session cleanup before the terminal event
+// is emitted, so a locator read at exit would find nothing; the path itself
+// is stable for the session's life, so pinning it early keeps the exit
+// accounting able to read the transcript file (which survives the cleanup).
+// Called from the session cleanup, which runs before the terminal event.
+func (c *stopHookChannel) snapshotTranscriptPath() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sidecarUsage = c.readSidecarUsage()
+	if c.snapshotPath != "" {
+		return
+	}
+	path, ok, err := c.transcriptPath()
+	if err != nil || !ok {
+		return
+	}
+	c.snapshotPath = path
+}
+
+// exitUsage sums the session's token totals from every transcript it named,
+// with the subagent transcripts beside each, deduplicated by message id so
+// repeated content blocks, re-reads and copies count once, and counting only
+// lines stamped after the session began (see transcript_usage.go). The
+// pinned snapshot path stands in for the locator once the drop is gone (the
+// terminal event fires after the session cleanup). When no transcript usage
+// materialized, the saved cumulative statusline USD cost is the last resort.
+// No source reports no usage; a transcript that cannot be trusted reports an
+// error, so the session's usage reads as unreported.
+func (c *stopHookChannel) exitUsage() (agent.CostData, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshotPath == "" {
+		if _, _, err := c.transcriptPath(); err != nil {
+			return agent.CostData{}, err
+		}
+	}
+	paths := c.namedTranscripts()
+	if len(paths) == 0 {
+		return c.sidecarUsage, nil
+	}
+	sum := newTranscriptUsageSum(c.createdAt)
+	for _, path := range paths {
+		if err := sum.addTranscript(path); err != nil {
+			return agent.CostData{}, err
+		}
+	}
+	total, err := sum.result()
+	if err == nil && total == (agent.CostData{}) {
+		return c.sidecarUsage, nil
+	}
+	return total, err
+}
+
+// transcriptPathFromStdinFile reads transcript_path out of one verbatim hook
+// stdin file. ok is false when the file does not exist yet.
+func transcriptPathFromStdinFile(path string) (string, bool, error) {
+	b, err := os.ReadFile(path) //nolint:gosec // path is the harness's own drop dir
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return "", false, nil
@@ -397,6 +679,14 @@ func transcriptContentText(raw json.RawMessage) string {
 // bakes the absolute paths in, so the hook needs no environment: hook processes
 // inherit whatever the CLI hands them, and a channel that depends on a variable
 // surviving that is a channel that fails silently on the day it does not.
+//
+// The hook keeps the transcript locator on EVERY fire, before the claim
+// branch: transcript_path arrives on stdin whether or not a notice is
+// outstanding, and the session's usage accounting needs it in exactly the
+// case the claim never happens. The locator write is best-effort — a failure
+// leaves the previous locator in place and never affects the claim — and it
+// rides a temp-file rename so a concurrent reader never sees a half-written
+// path.
 func stopHookScript(dir string) string {
 	d := shellQuote(dir)
 	return `#!/bin/sh
@@ -410,6 +700,12 @@ set -u
 d=` + d + `
 tmp="$d/claim-stdin.$$.tmp"
 cat > "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 0; }
+# Durable transcript locator: the latest stdin, kept verbatim on every fire
+# whether or not a notice is claimed, so the session knows its transcript at
+# exit even when the claim never happens. It parses nothing — Go reads
+# transcript_path out of it. Best-effort and never affecting the claim: a
+# failed copy leaves the previous locator in place.
+cp "$tmp" "$d/` + stopHookTranscriptFile + `" 2>/dev/null || true
 if mv "$d/` + stopHookPendingFile + `" "$d/` + stopHookClaimedFile + `" 2>/dev/null; then
   mv "$tmp" "$d/` + stopHookStdinFile + `" 2>/dev/null
   cat "$d/` + stopHookClaimedFile + `"

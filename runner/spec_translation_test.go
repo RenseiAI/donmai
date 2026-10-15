@@ -7,18 +7,22 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	codexbridge "github.com/RenseiAI/donmai/provider/harness/codex"
 	piprovider "github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
 func TestTranslateSpec_ProjectsSessionName(t *testing.T) {
 	t.Parallel()
 	got := translateSpec(
-		QueuedWork{QueuedWork: prompt.QueuedWork{SessionName: "chief-of-staff"}},
+		QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "uuid-1", SessionName: "chief-of-staff"}},
 		agent.Capabilities{},
 		SpecInputs{},
 	)
 	if got.SessionName != "chief-of-staff" {
 		t.Fatalf("Spec.SessionName = %q; want %q", got.SessionName, "chief-of-staff")
+	}
+	if got.SessionID != "uuid-1" {
+		t.Fatalf("Spec.SessionID = %q; want %q (the lifecycle UUID the trust ledger keys on)", got.SessionID, "uuid-1")
 	}
 }
 
@@ -364,26 +368,22 @@ func TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig(t *testing.T) 
 	}
 }
 
-// TestTranslateSpec_AgyCli_RetainsUnsupportedPolicy verifies a requested
+// TestTranslateSpec_Ollama_RetainsUnsupportedPolicy verifies a requested
 // policy is preserved for the exact adapter's typed pre-spawn denial.
-func TestTranslateSpec_AgyCli_RetainsUnsupportedPolicy(t *testing.T) {
+func TestTranslateSpec_Ollama_RetainsUnsupportedPolicy(t *testing.T) {
 	t.Parallel()
-	for _, provider := range []string{"agy-cli"} {
-		t.Run(provider, func(t *testing.T) {
-			t.Parallel()
-			caps := agent.Capabilities{
-				NeedsPermissionConfig:   false,
-				AcceptsAllowedToolsList: false,
-			}
-			qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Bash(cargo:*)"}}}
-			spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do", ProviderName: provider})
-			if !slices.Equal(spec.AllowedTools, []string{"Bash(cargo:*)"}) {
-				t.Errorf("AllowedTools must remain for %s adapter denial; got %v", provider, spec.AllowedTools)
-			}
-			if spec.PermissionConfig != nil {
-				t.Errorf("%s must NOT get a PermissionConfig; got %+v", provider, spec.PermissionConfig)
-			}
-		})
+	provider := "ollama"
+	caps := agent.Capabilities{
+		NeedsPermissionConfig:   false,
+		AcceptsAllowedToolsList: false,
+	}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Bash(cargo:*)"}}}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do", ProviderName: provider})
+	if !slices.Equal(spec.AllowedTools, []string{"Bash(cargo:*)"}) {
+		t.Errorf("AllowedTools must remain for %s adapter denial; got %v", provider, spec.AllowedTools)
+	}
+	if spec.PermissionConfig != nil {
+		t.Errorf("%s must NOT get a PermissionConfig; got %+v", provider, spec.PermissionConfig)
 	}
 }
 
@@ -592,5 +592,124 @@ func TestTranslateSpec_NilEndpointRemainsNil(t *testing.T) {
 	spec := translateSpec(QueuedWork{}, agent.Capabilities{}, SpecInputs{})
 	if spec.Endpoint != nil {
 		t.Errorf("Endpoint = %+v, want nil", spec.Endpoint)
+	}
+}
+
+// TestTranslateSpec_SubAgentCapZeroWithholdsDelegationTools pins the
+// gentler cap-0 behaviour: when the stage budget's sub-agent cap is an
+// explicit 0 (no delegations allowed), the Task/Agent delegation tools
+// are withheld on the DisallowedTools channel so the harness never offers
+// them, instead of the session stopping on the first delegation call.
+// A nil budget, a nil (absent) cap, or a positive cap withholds nothing.
+func TestTranslateSpec_SubAgentCapZeroWithholdsDelegationTools(t *testing.T) {
+	t.Parallel()
+	zero := 0
+	negative := -1
+	two := 2
+	tests := []struct {
+		name       string
+		budget     *prompt.StageBudget
+		wantDenied []string // delegation entries that must appear in DisallowedTools; nil = none
+	}{
+		{name: "nil budget withholds nothing"},
+		{name: "absent cap withholds nothing", budget: &prompt.StageBudget{MaxTokens: 8_000}},
+		{name: "positive cap withholds nothing", budget: &prompt.StageBudget{MaxSubAgents: &two}},
+		{name: "explicit zero withholds delegation", budget: &prompt.StageBudget{MaxSubAgents: &zero}, wantDenied: []string{"Task", "Agent"}},
+		{name: "negative cap withholds delegation", budget: &prompt.StageBudget{MaxSubAgents: &negative}, wantDenied: []string{"Task", "Agent"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			caps := agent.Capabilities{AcceptsAllowedToolsList: true}
+			in := SpecInputs{Cwd: "/tmp/wt", Prompt: "do"}
+			qw := QueuedWork{}
+			qw.StageBudget = tt.budget
+			spec := translateSpec(qw, caps, in)
+			for _, want := range tt.wantDenied {
+				if !slices.Contains(spec.DisallowedTools, want) {
+					t.Errorf("DisallowedTools = %v, want withheld delegation tool %q", spec.DisallowedTools, want)
+				}
+			}
+			if len(tt.wantDenied) == 0 {
+				for _, withheld := range []string{"Task", "Agent"} {
+					if slices.Contains(spec.DisallowedTools, withheld) {
+						t.Errorf("DisallowedTools = %v, must not withhold %q without a zero cap", spec.DisallowedTools, withheld)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestTranslateSpec_SubAgentCapZeroAddsToPlatformDisallows verifies the
+// withholding is additive: platform-supplied DisallowedTools entries and
+// the baseline survive alongside the withheld delegation tools.
+func TestTranslateSpec_SubAgentCapZeroAddsToPlatformDisallows(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{AcceptsAllowedToolsList: true}
+	in := SpecInputs{Cwd: "/tmp/wt", Prompt: "do"}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		DisallowedTools: []string{"WebFetch(http://169.254.169.254/*)"},
+	}}
+	zero := 0
+	qw.StageBudget = &prompt.StageBudget{MaxSubAgents: &zero}
+	spec := translateSpec(qw, caps, in)
+	for _, want := range append(defaultDisallowedTools(), "WebFetch(http://169.254.169.254/*)", "Task", "Agent") {
+		if !slices.Contains(spec.DisallowedTools, want) {
+			t.Errorf("DisallowedTools = %v, want %q", spec.DisallowedTools, want)
+		}
+	}
+}
+
+// TestTranslateSpec_SubAgentCapZeroReachesCodexDisallowPatterns verifies
+// the codex bridge does NOT carry the withheld delegation tools: codex
+// routes DisallowedTools into PermissionConfig.DisallowPatterns, which the
+// approval bridge compiles as regexes matched against the shell command
+// line — so bare "Task"/"Agent" entries would decline ordinary commands
+// that merely mention them ("go test -run TestAgentLoop", "grep -rn
+// Agent") while adding no protection on a channel that carries no
+// Task/Agent delegation tool. The budget enforcer remains the backstop
+// there instead.
+func TestTranslateSpec_SubAgentCapZeroReachesCodexDisallowPatterns(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{NeedsPermissionConfig: true, AcceptsAllowedToolsList: false}
+	zero := 0
+	qw := QueuedWork{}
+	qw.StageBudget = &prompt.StageBudget{MaxSubAgents: &zero}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
+	if spec.PermissionConfig != nil {
+		for _, withheld := range []string{"Task", "Agent"} {
+			if slices.Contains(spec.PermissionConfig.DisallowPatterns, withheld) {
+				t.Errorf("DisallowPatterns = %v, must not contain delegation tool %q: the patterns match shell command lines, not tool names", spec.PermissionConfig.DisallowPatterns, withheld)
+			}
+		}
+	}
+	if spec.DisallowedTools != nil {
+		t.Errorf("DisallowedTools must stay empty for codex (no flat channel to withhold on); got %v", spec.DisallowedTools)
+	}
+}
+
+// TestTranslateSpec_SubAgentCapZeroStillApprovesAgentMentioningCommands
+// is the translate-plus-bridge pin for the codex zero-cap regression:
+// the translated spec for a zero-cap session, fed through the codex
+// approval bridge exactly as the harness consumes it, must still approve
+// ordinary shell commands that merely mention the delegation tool names.
+func TestTranslateSpec_SubAgentCapZeroStillApprovesAgentMentioningCommands(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{NeedsPermissionConfig: true, AcceptsAllowedToolsList: false}
+	zero := 0
+	qw := QueuedWork{}
+	qw.StageBudget = &prompt.StageBudget{MaxSubAgents: &zero}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
+	br := codexbridge.NewApprovalBridge(spec.PermissionConfig)
+	for _, cmd := range []string{
+		"go test -run TestAgentLoop ./...",
+		"grep -rn Agent .",
+		"cat src/TaskList.tsx",
+		"git commit -m \"ship Task list\"",
+	} {
+		if d := br.Evaluate(codexbridge.ApprovalRequest{Kind: codexbridge.ApprovalKindCommand, Command: cmd}); d.Action != codexbridge.ActionAcceptForSession {
+			t.Errorf("zero-cap codex session declined %q: action %s (%s)", cmd, d.Action, d.Reason)
+		}
 	}
 }

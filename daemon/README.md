@@ -248,7 +248,15 @@ bus for system installs; the quota is the binding CPU limit (no core
 pinning: identical pin ranges across seats shared 2 cores of 6 budgeted,
 and user services never get the cpuset controller delegated). The scope
 needs systemd 252 or newer (249 rejects it and delegates no CPU controller
-to user managers). Without a usable systemd there is
+to user managers) plus permission for the daemon user to create a transient
+scope: a reachable user manager (enable lingering for the daemon user so it
+answers without an active session), or system-scope rights where the manager
+permits it. The launch gate verifies creation permission up front — a host
+whose manager refuses the scope on every reachable bus reports no backend,
+so the launch is refused with the missing backend named instead of dying
+past the gate. A scope that still fails at launch surfaces the manager's own
+message (for example "Interactive authentication required") on the accept
+error through the launch's preserved child log. Without a usable systemd there is
 no enforcement backend, so the seat runs unconfined and reports `none`
 with the backend named as the reason. On macOS the seat carries
 worker-cap environment (`GOMAXPROCS`, `MAKEFLAGS`,
@@ -325,6 +333,51 @@ autoUpdate:
     - sanRegex: ^https://github\.com/<org>/<repo>/\.github/workflows/release\.yml@refs/tags/v.+$
       issuer: https://token.actions.githubusercontent.com
 ```
+
+## Anonymous usage count (opt-in)
+
+The weekly installation count is **opt-in and off by default**: the
+binary ships with no receiver endpoint, and with none configured the
+ping is inert — consent alone never dials any default infrastructure.
+The update checker gains no new traffic.
+
+`host setup` asks one default-no question: "Count this installation
+in the public usage numbers? Sends a random installation id and the
+version once a week, nothing else." Answering yes mints a
+cryptographically random installation id (not a machine, host, or
+organization identifier) and records it with the binary version and
+OS only. No hostnames, no repository names, no IPs stored. Pass
+`host setup --no-ping` to skip the question and leave the count off.
+
+The payload is exactly `{installationId, version, os}` over HTTPS
+POST to the operator-configured endpoint; unknown fields and
+oversize/invalid values are rejected, and repeated reports from the
+same installation in the counting window are idempotent. At most one
+attempt runs per seven days; the next eligible time is persisted
+before transmission so response loss or a restart cannot cause a
+retry storm. No request at all runs when disabled; disabling cancels
+queued work and prevents future transmission.
+
+`daemon.yaml` reference:
+
+```yaml
+usagePing:
+  enabled: true             # default false — no request runs when false
+  installationId: <32 hex> # random id minted at opt-in, cleared on opt-out
+  endpoint: https://example.invalid/usage  # empty disables sending
+```
+
+Manage it without the wizard:
+
+```bash
+donmai host set usagePing.enabled 1   # opt in (mints an id); 0 clears it and stops sending
+donmai host set usagePing.endpoint https://example.invalid/usage
+donmai host set usagePing.endpoint ""  # clear the endpoint; no ping is sent
+```
+
+The count reports opted-in installations per week, not organizations
+or people: the random id can count reporting installations but
+cannot deduplicate them further.
 
 ## Kit install trust gate
 
@@ -425,8 +478,17 @@ When a session appears wedged in the dashboard:
    platform's view (already terminal) usually indicates a missed
    `result.Post` — re-run `donmai host stats` to see whether the
    poller has retried.
-6. **Worktree state** — `~/.donmai/worktrees/<sessionId>/.agent/`
-   contains the per-session `state.json` snapshot and the
+6. **Worktree state** — by default a failed session's worktree is torn
+   down once the rescue has archived its unpublished work as a patch
+   under the sibling `rescue/` directory (`<session>/<stamp>/…patch` plus
+   a JSON sidecar describing how to re-apply it). Apply the patch onto a
+   fresh checkout of the recorded base to recover the work. Sessions
+   without a repository have no checkout for the rescue to archive, so
+   their worktrees are torn down with nothing preserved. Set
+   `keepFailedWorktrees: true` in `daemon.yaml` to keep failed sessions'
+   worktrees on disk instead (read at daemon start, so restart the daemon
+   after changing it): `~/.donmai/worktrees/<sessionId>/.agent/`
+   then still contains the per-session `state.json` snapshot and the
    `events.jsonl` audit log. Look here when the agent emitted no
    visible output but the session is marked failed.
 

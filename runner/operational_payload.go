@@ -44,7 +44,7 @@ type OperationalPayload struct {
 // receipt producers and the runner verifier. It is never persisted as evidence;
 // only its canonical digest belongs in an AdmissionReceipt.
 func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
-	return OperationalPayload{
+	projected := OperationalPayload{
 		QueuedWork:            qw.QueuedWork,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
 		WorkareaMode:          qw.WorkareaMode,
@@ -61,6 +61,15 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		PermissionProfile:     qw.PermissionProfile,
 		ExecutionSecurity:     qw.ExecutionSecurity.Clone(),
 	}
+	// The embedded QueuedWork copy aliases the dispatch-declared
+	// delivery policy pointer: clone it so mutating the projection
+	// cannot move the queued work it was projected from (the SeatBudget
+	// Clone above exists for the same reason).
+	if qw.Delivery != nil {
+		cloned := *qw.Delivery
+		projected.Delivery = &cloned
+	}
+	return projected
 }
 
 var (
@@ -115,14 +124,26 @@ func losslessOperationalValue(value reflect.Value) (any, error) {
 		// Delivery material is resolved after admission (for example a
 		// worker-local gateway URL and bearer). Bind only stable cell identity
 		// here; the complete effective-cell/live-binding comparison below owns
-		// the execution axes and forbids ambient substitution.
-		return map[string]any{
+		// the execution axes and forbids ambient substitution. The routing
+		// preference is admission identity — stamped at dispatch, not
+		// worker-local delivery material — so it is bound here: drift
+		// between the admitted payload and the live binding must read as
+		// drift.
+		doc := map[string]any{
 			"company": endpoint.Company, "model": endpoint.Model, "protocol": endpoint.Protocol, "host": endpoint.Host,
 			"endpointId": endpoint.EndpointID, "endpointOperator": endpoint.EndpointOperator, "endpointRevision": endpoint.EndpointRevision,
 			"modelAuthor": endpoint.ModelAuthor, "authBindingId": endpoint.AuthBindingID, "authAuthority": endpoint.AuthAuthority,
 			"authCommercialMode": endpoint.AuthCommercialMode, "authBindingScope": endpoint.AuthBindingScope,
 			"authPortability": endpoint.AuthPortability, "authDelivery": endpoint.AuthDelivery, "mechanism": endpoint.Mechanism,
-		}, nil
+		}
+		// The routing preference joins the document only when set: an
+		// unpreferred binding keeps its pre-field document
+		// byte-identically (the same additive-field doctrine the wire tags
+		// follow).
+		if pref := routingPreferenceDocument(endpoint.RoutingPreference); pref != nil {
+			doc["routingPreference"] = pref
+		}
+		return doc, nil
 	}
 
 	switch value.Kind() {
@@ -254,4 +275,15 @@ func DigestOperationalPayload(qw QueuedWork) (string, error) {
 	}
 	digest := sha256.Sum256(canonical)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+// routingPreferenceDocument projects the optional routing preference into
+// the operational-payload digest document. Nil or empty projects as nil
+// (never an empty object) so unpreferred bindings keep their pre-field
+// document byte-identically.
+func routingPreferenceDocument(pref *agent.RoutingPreference) any {
+	if pref.IsZero() {
+		return nil
+	}
+	return map[string]any{"order": pref.Order, "only": pref.Only}
 }

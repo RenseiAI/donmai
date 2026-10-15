@@ -37,14 +37,14 @@ func TestInteractiveArgs(t *testing.T) {
 			want: []string{"--name", "chief-of-staff", "coordinate"},
 		},
 		{
-			name: "autonomous adds bypassPermissions before the prompt",
+			name: "autonomous adds bypassPermissions and the Linear MCP deny list before the prompt",
 			spec: agent.Spec{Prompt: "fix the bug", Autonomous: true},
-			want: []string{"--permission-mode", "bypassPermissions", "fix the bug"},
+			want: append([]string{"--permission-mode", "bypassPermissions", "--disallowedTools", strings.Join(linearMCPDisallowList, ",")}, "fix the bug"),
 		},
 		{
 			name: "autonomous with empty prompt is still a valid flag-only argv",
 			spec: agent.Spec{Autonomous: true},
-			want: []string{"--permission-mode", "bypassPermissions"},
+			want: []string{"--permission-mode", "bypassPermissions", "--disallowedTools", strings.Join(linearMCPDisallowList, ",")},
 		},
 		{
 			name: "system prompt append precedes the positional prompt",
@@ -131,7 +131,7 @@ func TestInteractiveArgs_SystemPromptAppendMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it", SystemPromptAppend: "follow local conventions"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		headlessAppend, ok := flagValueOf(headless)
 		if !ok {
 			t.Fatalf("headless buildArgs dropped %s", flag)
@@ -150,7 +150,7 @@ func TestInteractiveArgs_SystemPromptAppendMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		if _, ok := flagValueOf(headless); ok {
 			t.Errorf("headless buildArgs emitted %s for an empty append", flag)
 		}
@@ -184,7 +184,7 @@ func TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it", Autonomous: true}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		headlessMode, ok := permissionModeOf(headless)
 		if !ok {
 			t.Fatalf("headless buildArgs dropped %s for an autonomous spec: %q", flag, headless)
@@ -206,7 +206,7 @@ func TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		if _, ok := permissionModeOf(headless); ok {
 			t.Errorf("headless buildArgs emitted %s for a non-autonomous spec: %q", flag, headless)
 		}
@@ -250,7 +250,7 @@ func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it", Model: "gpt-5.6-sol"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		headlessModel, ok := modelOf(headless)
 		if !ok {
 			t.Fatalf("headless buildArgs dropped %s", flag)
@@ -269,7 +269,7 @@ func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		if _, ok := modelOf(headless); ok {
 			t.Errorf("headless buildArgs emitted %s with no model selected: %q", flag, headless)
 		}
@@ -310,7 +310,7 @@ func TestInteractiveArgs_PromptIsAlwaysLast(t *testing.T) {
 
 // newFakeInteractiveProvider builds a Provider whose binary is a fake-claude
 // script, run under a real PTY by ptycli. Mirrors the PATH-shim technique in
-// provider/harness/agycli's handle_test.go newFakeProvider.
+// provider/harness/clijsonl's handle_test.go.
 func newFakeInteractiveProvider(t *testing.T, script string) *Provider {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -332,6 +332,176 @@ func newFakeInteractiveProvider(t *testing.T, script string) *Provider {
 		t.Fatalf("New(fake): %v", err)
 	}
 	return p
+}
+
+// TestInteractiveArgs_ToolPolicyMatchesHeadless is the regression guard for
+// the defect this mapping fixes: Spec.AllowedTools/Spec.DisallowedTools used
+// to be DROPPED on the interactive path, so a stamped session adapted cleanly
+// on the headless lane and denied closed on the interactive lane even though
+// the CLI honors the same --allowedTools/--disallowedTools flags in both
+// spawn modes (proven on the live binary: the REPL's permission panel renders
+// a stamped allow entry under Allow and a stamped deny entry under Deny).
+// It asserts the two spawn modes agree by comparing against buildArgs' own
+// output rather than a hard-coded string, so a future edit to the headless
+// flag pair cannot silently re-open the divergence — mirroring
+// TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode above.
+func TestInteractiveArgs_ToolPolicyMatchesHeadless(t *testing.T) {
+	t.Parallel()
+
+	flagValueOf := func(argv []string, flag string) (string, bool) {
+		i := slices.Index(argv, flag)
+		if i < 0 || i+1 >= len(argv) {
+			return "", false
+		}
+		return argv[i+1], true
+	}
+
+	t.Run("stamped lists", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it", AllowedTools: []string{"Read", "Bash(git:*)"}, DisallowedTools: []string{"Write"}}
+
+		headless, _ := buildArgs(spec, "", "", "")
+		wantAllow, ok := flagValueOf(headless, "--allowedTools")
+		if !ok {
+			t.Fatalf("headless buildArgs dropped --allowedTools: %q", headless)
+		}
+		wantDeny, ok := flagValueOf(headless, "--disallowedTools")
+		if !ok {
+			t.Fatalf("headless buildArgs dropped --disallowedTools: %q", headless)
+		}
+
+		got := interactiveArgs(spec)
+		gotAllow, ok := flagValueOf(got, "--allowedTools")
+		if !ok {
+			t.Fatalf("interactiveArgs dropped --allowedTools for a stamped spec: %q", got)
+		}
+		gotDeny, ok := flagValueOf(got, "--disallowedTools")
+		if !ok {
+			t.Fatalf("interactiveArgs dropped --disallowedTools for a stamped spec: %q", got)
+		}
+		if gotAllow != wantAllow {
+			t.Errorf("allowedTools divergence: interactive=%q headless=%q", gotAllow, wantAllow)
+		}
+		if gotDeny != wantDeny {
+			t.Errorf("disallowedTools divergence: interactive=%q headless=%q", gotDeny, wantDeny)
+		}
+		if last := got[len(got)-1]; last != "ship it" {
+			t.Errorf("prompt must stay last: %q", got)
+		}
+	})
+
+	t.Run("unstamped", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it"}
+
+		headless, _ := buildArgs(spec, "", "", "")
+		if _, ok := flagValueOf(headless, "--allowedTools"); ok {
+			t.Errorf("headless buildArgs emitted --allowedTools with nothing stamped: %q", headless)
+		}
+		if _, ok := flagValueOf(headless, "--disallowedTools"); ok {
+			t.Errorf("headless buildArgs emitted --disallowedTools with nothing stamped: %q", headless)
+		}
+		got := interactiveArgs(spec)
+		if _, ok := flagValueOf(got, "--allowedTools"); ok {
+			t.Errorf("interactiveArgs emitted --allowedTools with nothing stamped: %q", got)
+		}
+		if _, ok := flagValueOf(got, "--disallowedTools"); ok {
+			t.Errorf("interactiveArgs emitted --disallowedTools with nothing stamped: %q", got)
+		}
+	})
+
+	t.Run("autonomous merges the Linear MCP block list on both lanes", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it", Autonomous: true, DisallowedTools: []string{"Write"}}
+
+		headless, _ := buildArgs(spec, "", "", "")
+		wantDeny, ok := flagValueOf(headless, "--disallowedTools")
+		if !ok {
+			t.Fatalf("headless buildArgs dropped --disallowedTools for an autonomous spec: %q", headless)
+		}
+		if !strings.Contains(wantDeny, "mcp__claude_ai_Linear__list_issues") {
+			t.Fatalf("headless --disallowedTools missing the Linear MCP block list: %q", wantDeny)
+		}
+
+		gotDeny, ok := flagValueOf(interactiveArgs(spec), "--disallowedTools")
+		if !ok {
+			t.Fatalf("interactiveArgs dropped --disallowedTools for an autonomous spec")
+		}
+		if gotDeny != wantDeny {
+			t.Errorf("disallowedTools divergence: interactive=%q headless=%q", gotDeny, wantDeny)
+		}
+	})
+
+	t.Run("mcp tool names merge into allowedTools on both lanes", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it", AllowedTools: []string{"Read"}, MCPToolNames: []string{"mcp__tools__read"}}
+
+		headless, _ := buildArgs(spec, "", "", "")
+		wantAllow, ok := flagValueOf(headless, "--allowedTools")
+		if !ok {
+			t.Fatalf("headless buildArgs dropped --allowedTools for an MCP-name spec: %q", headless)
+		}
+		if !strings.Contains(wantAllow, "mcp__tools__read") {
+			t.Fatalf("headless --allowedTools missing the MCP tool name: %q", wantAllow)
+		}
+
+		gotAllow, ok := flagValueOf(interactiveArgs(spec), "--allowedTools")
+		if !ok {
+			t.Fatalf("interactiveArgs dropped --allowedTools for an MCP-name spec")
+		}
+		if gotAllow != wantAllow {
+			t.Errorf("allowedTools divergence: interactive=%q headless=%q", gotAllow, wantAllow)
+		}
+	})
+}
+
+// TestSpawn_Interactive_ToolPolicyReachesChildArgv is the load-bearing proof
+// that a stamped Spec.AllowedTools/DisallowedTools list reaches the PTY
+// child's argv: the fake binary echoes its own argv to a file, and the test
+// asserts the --allowedTools/--disallowedTools flags blend in beside the
+// session flags. RED proof: revert the allow/deny block in
+// interactiveArgsWith and both flags vanish from the child's argv.
+func TestSpawn_Interactive_ToolPolicyReachesChildArgv(t *testing.T) {
+	t.Parallel()
+	workdir := t.TempDir()
+	p := newFakeInteractiveProvider(t, `echo "argv: $@" > "$PWD/argv.txt"`)
+
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:          "hello",
+		Cwd:             workdir,
+		Interactive:     &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		AllowedTools:    []string{"Read"},
+		DisallowedTools: []string{"Bash"},
+		MCPToolNames:    []string{"mcp__tools__read"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake Claude exit")
+		}
+	}
+exited:
+	body, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read echoed argv: %v", err)
+	}
+	argv := string(body)
+	if !strings.Contains(argv, "--allowedTools") || !strings.Contains(argv, "Read") || !strings.Contains(argv, "mcp__tools__read") {
+		t.Errorf("child argv missing the stamped allowed-tools list with the MCP tool name; got:\n%s", argv)
+	}
+	if !strings.Contains(argv, "--disallowedTools Bash") {
+		t.Errorf("child argv missing the stamped disallowed-tools list; got:\n%s", argv)
+	}
 }
 
 // TestSpawn_Interactive_RoutesThroughPTYNotHeadlessJSONL proves
@@ -435,4 +605,69 @@ exited:
 		t.Fatalf("read copied MCP config: %v", err)
 	}
 	assertLiveGatewayConfig(t, seen, tokenPath)
+}
+
+// TestInteractiveHandle_ExposesSessionSidecarPath pins the claude
+// interactive leg of the typed context notice: the spawned handle reports
+// the session's own sidecar path through the runner's session-scoped seam,
+// so the watcher polls this session's file — never a process-wide
+// variable. A handle without a channel reports none and runs without
+// context notices.
+func TestInteractiveHandle_ExposesSessionSidecarPath(t *testing.T) {
+	hook := newTestStopHookChannel(t)
+	h := &interactiveHandle{notices: hook}
+	got := h.ContextUsageSidecarPath()
+	if got == "" {
+		t.Fatal("sidecar path is empty for a session with a channel")
+	}
+	if got != hook.sidecarPath() {
+		t.Fatalf("sidecar path = %q, want the session channel's %q", got, hook.sidecarPath())
+	}
+	bare := &interactiveHandle{}
+	if path := bare.ContextUsageSidecarPath(); path != "" {
+		t.Fatalf("channel-less handle reported %q, want empty", path)
+	}
+	var nilHandle *interactiveHandle
+	if path := nilHandle.ContextUsageSidecarPath(); path != "" {
+		t.Fatalf("nil handle reported %q, want empty", path)
+	}
+	// The seam assertion: the runner resolves through this interface.
+	var _ agent.ContextUsageSourcer = h
+}
+
+// TestInteractiveArgs_BypassGrantAllowsOperatorBypass pins that an interactive
+// session granted toolApproval "bypass" starts with the flag that lets the
+// operator enter bypassPermissions, without starting in that mode, and that
+// any narrower grant or a missing section leaves the flag off.
+func TestInteractiveArgs_BypassGrantAllowsOperatorBypass(t *testing.T) {
+	t.Parallel()
+
+	const allow = "--allow-dangerously-skip-permissions"
+	grant := func(level agent.ExecutionSecurityLevel) *agent.ExecutionSecurity {
+		return &agent.ExecutionSecurity{Version: 1, Levels: agent.ExecutionSecurityLevels{ToolApproval: level}}
+	}
+
+	cases := []struct {
+		name      string
+		spec      agent.Spec
+		wantAllow bool
+	}{
+		{"bypass grant", agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalBypass)}, true},
+		{"deny-list grant", agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalDenyList)}, false},
+		{"allow-list grant", agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalAllowList)}, false},
+		{"no section", agent.Spec{Prompt: "hi"}, false},
+		{"autonomous bypass", agent.Spec{Prompt: "hi", Autonomous: true, ExecutionSecurity: grant(agent.ToolApprovalBypass)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(tc.spec)
+			if slices.Contains(got, allow) != tc.wantAllow {
+				t.Fatalf("%s present = %v, want %v: %q", allow, !tc.wantAllow, tc.wantAllow, got)
+			}
+			if !tc.spec.Autonomous && slices.Contains(got, "--permission-mode") {
+				t.Errorf("non-autonomous session must start in the CLI default mode, got %q", got)
+			}
+		})
+	}
 }

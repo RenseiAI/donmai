@@ -430,9 +430,13 @@ func TestStopHookSettings_DeclareTheStopHookAndNothingElse(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
 		t.Fatalf("settings is not a JSON string the CLI can parse: %v (%q)", err, raw)
 	}
-	if keys := sortedKeys(settings); !slices.Equal(keys, []string{"hooks"}) {
-		t.Fatalf("settings declares %v; want only [hooks] — --settings merges, so anything "+
-			"else here overrides the operator's own configuration", keys)
+	if keys := sortedKeys(settings); !slices.Equal(keys, []string{"hooks", "skipDangerousModePermissionPrompt", "statusLine"}) {
+		t.Fatalf("settings declares %v; want only [hooks skipDangerousModePermissionPrompt statusLine] — "+
+			"--settings merges, so anything else here overrides the operator's own configuration", keys)
+	}
+	if skip, _ := settings["skipDangerousModePermissionPrompt"].(bool); !skip {
+		t.Fatalf("skipDangerousModePermissionPrompt = %v; want true — without it an interactive "+
+			"session parks on the bypass-permissions acceptance no unattended session can answer", settings["skipDangerousModePermissionPrompt"])
 	}
 
 	hooks, _ := settings["hooks"].(map[string]any)
@@ -538,6 +542,7 @@ func TestInteractiveArgs_NoticeSettingsPrecedeThePositionalPrompt(t *testing.T) 
 	want := []string{
 		"--settings", settings,
 		"--permission-mode", "bypassPermissions",
+		"--disallowedTools", strings.Join(linearMCPDisallowList, ","),
 		"fix the bug",
 	}
 	if !slices.Equal(got, want) {
@@ -599,4 +604,116 @@ func sortedKeys(m map[string]any) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// TestStopHookSettings_DeclaresTheSidecarWriter pins the claude leg of the
+// typed context notice: the --settings string names a statusLine command
+// that maintains the session's sidecar file. The command must invoke the
+// generated script on disk (not an inline body the test cannot execute),
+// and the script it points at must exist and be executable.
+func TestStopHookSettings_DeclaresTheSidecarWriter(t *testing.T) {
+	c := newTestStopHookChannel(t)
+	raw, err := c.settingsJSON()
+	if err != nil {
+		t.Fatalf("settingsJSON: %v", err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
+		t.Fatalf("settings is not JSON: %v", err)
+	}
+	line, _ := settings["statusLine"].(map[string]any)
+	if line["type"] != "command" {
+		t.Fatalf("statusLine type = %v; want command", line["type"])
+	}
+	cmd, _ := line["command"].(string)
+	if !strings.Contains(cmd, statusLineSidecarScriptFile) {
+		t.Fatalf("statusLine command %q does not invoke the generated sidecar script", cmd)
+	}
+	info, err := os.Stat(c.path(statusLineSidecarScriptFile))
+	if err != nil {
+		t.Fatalf("the statusLine command points at a script that is not on disk: %v", err)
+	}
+	if info.Mode().Perm()&0o100 == 0 {
+		t.Fatalf("sidecar script is not executable: %v", info.Mode())
+	}
+	// The sidecar file itself is absent until the CLI's first render: the
+	// watcher polls it best-effort and stays silent, never an error.
+	if _, err := os.Stat(c.sidecarPath()); !os.IsNotExist(err) {
+		t.Fatalf("sidecar exists before the first render: %v", err)
+	}
+}
+
+// TestSidecarWriter_RealStatuslineInputMaintainsTheSidecar runs the
+// GENERATED sidecar script through a real /bin/sh with a realistic
+// statusLine stdin (the context_window shape the CLI feeds it), exactly as
+// the CLI invokes it. It pins the producer half of the claude leg: live
+// CLI input becomes the flat sidecar document the parser reads, and the
+// parser reads what the script wrote — not a hand-built fixture.
+func TestSidecarWriter_RealStatuslineInputMaintainsTheSidecar(t *testing.T) {
+	c := newTestStopHookChannel(t)
+	stdin := `{
+	  "session_id": "a0fe5c03-fd5c-4113-849c-4f7a81d73ee4",
+	  "transcript_path": "/tmp/t.jsonl",
+	  "cwd": "/tmp/ws",
+	  "model": {"id": "claude-opus-4-6", "display_name": "Opus"},
+	  "workspace": {"current_dir": "/tmp/ws", "project_dir": "/tmp/ws"},
+	  "version": "2.1.296",
+	  "context_window": {
+	    "total_input_tokens": 125000,
+	    "total_output_tokens": 8000,
+	    "context_window_size": 200000,
+	    "current_usage": {"input_tokens": 125000, "output_tokens": 8000,
+	      "cache_creation_input_tokens": 1200, "cache_read_input_tokens": 16526},
+	    "used_percentage": 62.5,
+	    "remaining_percentage": 37.5
+	  }
+	}`
+	cmd := exec.Command("/bin/sh", c.path(statusLineSidecarScriptFile)) //nolint:gosec // the script is this test's own fixture
+	cmd.Stdin = strings.NewReader(stdin)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("sidecar script exited non-zero (%v); stderr=%q", err, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("sidecar script emitted %q on stdout; it must render no terminal line", stdout.String())
+	}
+	raw, err := os.ReadFile(c.sidecarPath())
+	if err != nil {
+		t.Fatalf("sidecar was not written: %v", err)
+	}
+	// The parser reads what the script wrote: the loop closes through the
+	// production entry point, not a hand-built document.
+	notice, err := agent.ParseClaudeSidecarNotice(raw, "claude-code")
+	if err != nil {
+		t.Fatalf("ParseClaudeSidecarNotice on the produced sidecar: %v", err)
+	}
+	if notice == nil {
+		t.Fatal("no notice for the produced sidecar")
+	}
+	if notice.UsedPercent == nil || *notice.UsedPercent != 62.5 {
+		t.Errorf("usedPercent = %v, want 62.5", notice.UsedPercent)
+	}
+	if notice.InputTokens == nil || *notice.InputTokens != 125000 {
+		t.Errorf("inputTokens = %v, want 125000", notice.InputTokens)
+	}
+	if notice.OutputTokens == nil || *notice.OutputTokens != 8000 {
+		t.Errorf("outputTokens = %v, want 8000", notice.OutputTokens)
+	}
+	if notice.ContextWindowSize == nil || *notice.ContextWindowSize != 200000 {
+		t.Errorf("contextWindowSize = %v, want 200000", notice.ContextWindowSize)
+	}
+	// A statusline input with no context_window (before the first model
+	// call) leaves the previous sidecar untouched and exits zero — the
+	// terminal never sees a failure.
+	before, _ := os.ReadFile(c.sidecarPath())
+	cmd = exec.Command("/bin/sh", c.path(statusLineSidecarScriptFile)) //nolint:gosec // the script is this test's own fixture
+	cmd.Stdin = strings.NewReader(`{"session_id": "x", "cwd": "/tmp/ws"}`)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("sidecar script failed on windowless input: %v", err)
+	}
+	after, _ := os.ReadFile(c.sidecarPath())
+	if string(before) != string(after) {
+		t.Fatalf("windowless input rewrote the sidecar: %q -> %q", before, after)
+	}
 }

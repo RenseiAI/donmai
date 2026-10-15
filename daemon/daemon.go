@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -24,6 +25,8 @@ import (
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/rulesetsnapshot"
 	"github.com/RenseiAI/donmai/runner"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/repokeeper"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -152,8 +155,10 @@ type Options struct {
 	ProtectedRuntimeMCPHelperCommandBuilder ProtectedRuntimeMCPHelperCommandBuilder
 
 	// CodexOrphanSweeper reclaims crash/SIGKILL/restart leftovers under the
-	// donmai-codex-home-*/donmai-codex-app-* naming fence once per Start,
-	// after shim adoption and before registration — see sweepCodexOrphans.
+	// donmai-codex-home-*/donmai-codex-app-* naming fence, over every root
+	// providercodex.DefaultCodexHomeRoots names — once per Start, after shim
+	// adoption and before registration, then hourly via
+	// startCodexOrphanSweepLoop — see sweepCodexOrphans.
 	// Nil (the default every Start call gets unless a caller sets this field)
 	// makes the sweep step a no-op: no os.TempDir() read, no delete inside a
 	// session directory, no signal to a process. Only the production entry
@@ -162,6 +167,16 @@ type Options struct {
 	// a test — including every test that predates this field and never
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
+
+	// TrustLedgerSweeper undoes seeded workspace-trust entries whose owning
+	// session is no longer live, once per Start, after shim adoption and
+	// before registration — see sweepSeededTrustLedger. Nil (the default
+	// every Start call gets unless a caller sets this field) makes the
+	// sweep step a no-op. Only the production entry point
+	// (afcli/daemon_run.go) sets it, to
+	// providerclaude.SweepSeededTrustForConfigHome, so a daemon built for
+	// real operator use always sweeps; a daemon built for a test never does.
+	TrustLedgerSweeper TrustLedgerSweepFunc
 
 	// QuotaProbeBinaries names the harness CLIs the live quota probes
 	// shell out to, keyed by harness ("codex", "claude" — see
@@ -324,6 +339,16 @@ type Options struct {
 	// The OSS binary leaves this nil, the worktree seam stays inert, and
 	// standalone behaviour is byte-identical to before.
 	GitAuth GitAuth
+
+	// RepoKeeperScope resolves the credential scope for one remote for the
+	// per-host repository keeper (see repo_keeper.go), beside GitAuth: GitAuth
+	// mints the per-invocation credential, this seam names the isolation
+	// boundary the resulting mirror belongs to. Nil means DefaultRepoKeeperScope
+	// (one host-wide scope), so one remote maps to exactly one mirror on this
+	// machine. An embedder that isolates mirrors per tenant supplies its own
+	// resolver; the keeper still records only the scope digest, never the
+	// scope value or the remote URL.
+	RepoKeeperScope RepoKeeperScopeFunc
 }
 
 // GitAuth is the per-invocation git auth resolver an embedder supplies via
@@ -511,6 +536,12 @@ type Daemon struct {
 	heartbeat *HeartbeatService
 	poller    *PollService
 	spawner   *WorkerSpawner
+
+	// repoKeeper is the per-host repository keeper (see repo_keeper.go). It is
+	// constructed in Start from the process-level RepoKeeper settings and the
+	// Options.RepoKeeperScope seam; nil until then. Callers degrade to a plain
+	// clone while it is nil, disabled, or still reconciling.
+	repoKeeper *RepoKeeper
 
 	// quota is the subscription quota-snapshot cache behind the
 	// heartbeat quota field: one entry per signed-in account. Probes
@@ -802,6 +833,85 @@ func (d *Daemon) workerCapabilitiesFunc() func() map[string]bool {
 	return d.opts.WorkerCapabilitiesFunc
 }
 
+// repoKeeperRoot resolves the keeper's state-directory root: repo-keeper/
+// under the state home. It is a function so tests can point a Daemon at a
+// temp dir by swapping the config-independent state home.
+func repoKeeperRoot() string {
+	return repoKeeperStateDir()
+}
+
+// repoKeeperFor constructs this daemon's keeper from its process-level
+// settings and the Options.RepoKeeperScope seam, or nil when the keeper is
+// disabled. Callers degrade to a plain clone on nil. The store is built
+// with the same worktree parent Start gives the spawner, and a store that
+// refuses to start (including a cross-filesystem state/worktree layout)
+// yields a nil keeper, which degrades.
+func (d *Daemon) repoKeeperFor(worktreeParentDir string) *RepoKeeper {
+	settings := d.Config().EffectiveRepoKeeperSettings()
+	if !settings.Enabled {
+		return nil
+	}
+	var scope RepoKeeperScopeFunc
+	if d.opts.RepoKeeperScope != nil {
+		scope = d.opts.RepoKeeperScope
+	}
+	var auth RepoKeeperGitAuth
+	if d.opts.GitAuth != nil {
+		auth = RepoKeeperGitAuth(d.opts.GitAuth)
+	}
+	// The store appends repo-keeper/ to the state dir it is given, so it is
+	// handed the state home itself: mirrors and catalog land at
+	// <state-home>/repo-keeper/{mirrors,catalog.json}, the root repoKeeperRoot
+	// names, never one level deeper.
+	store, err := repokeeper.New(filepath.Dir(repoKeeperRoot()), worktreeParentDir, nil)
+	if err != nil {
+		slog.Warn("repo keeper: store unavailable; degrading to plain clone", "err", err)
+		return nil
+	}
+	return NewRepoKeeper(store, settings, scope, auth)
+}
+
+// reconcileRepoKeeper builds the keeper (when enabled) and reconciles its
+// catalog after session and catalog reconciliation and before
+// workarea-cache admission. A reconcile failure degrades: callers fall back
+// to a plain clone and startup continues. With the keeper disabled this is
+// a no-op and nothing is created under repo-keeper/.
+func (d *Daemon) reconcileRepoKeeper(ctx context.Context, worktreeParentDir string) {
+	keeper := d.repoKeeperFor(worktreeParentDir)
+	d.mu.Lock()
+	d.repoKeeper = keeper
+	d.mu.Unlock()
+	if keeper == nil {
+		return
+	}
+	if err := keeper.Reconcile(ctx); err != nil {
+		slog.Warn("repo keeper: reconcile failed; degrading to plain clone", "err", err)
+	}
+}
+
+// RepoKeeper returns the daemon's repository keeper, or nil when it is
+// disabled or not yet constructed. The returned pointer is safe for
+// concurrent use.
+func (d *Daemon) RepoKeeper() *RepoKeeper {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.repoKeeper
+}
+
+// RepoKeeperMirror degrades a clone through the keeper: it returns the
+// mirror directory when the keeper can serve this remote, and ok=false when
+// the caller must fall back to a plain clone (disabled, reconciling,
+// over budget, or scope failure).
+func (d *Daemon) RepoKeeperMirror(ctx context.Context, remote string) (dir string, ok bool) {
+	d.mu.RLock()
+	keeper := d.repoKeeper
+	d.mu.RUnlock()
+	if keeper == nil {
+		return "", false
+	}
+	return keeper.Acquire(ctx, remote)
+}
+
 // onLandingWork returns the configured landing-run handler, or nil when none
 // was supplied. Accessor so the poll closure (and tests) read the hook through
 // one seam.
@@ -862,28 +972,93 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 	return &cp
 }
 
-// claimSuspended is the PollOptions.ClaimSuspended callback: it translates the
-// most recent host status the control plane reported into the poll loop's
-// claim gate. True means "do not claim new work this tick"; the reason is used
-// once, on the suspend transition, in the poll loop's log line.
+// The host-wide new-work claim gate stays closed only for genuinely
+// host-wide conditions, each named below: an operator drain or pause, a
+// lifecycle recovery that paused the shared spawner, or the platform's own
+// pool signal stop claims for every scope at once. A first heartbeat that is
+// still pending — or a founding the platform refused — for ONE scope is
+// deliberately not here: that fence is per organization (see
+// claimSuspendedForOrg), so one slow or refused scope never stalls new work
+// for the healthy ones. A full host is not here either: capacity is a
+// per-item hold in claimSuspendedForOrg, so the poll request still goes out
+// and the non-session lanes on the same response (kg extraction, landing
+// triggers, inbox) keep flowing while session items are held and released.
+const (
+	// claimSuspendedReasonDraining suspends every scope while the operator
+	// drains this host.
+	claimSuspendedReasonDraining = "daemon is draining"
+	// claimSuspendedReasonPaused suspends every scope while the operator
+	// pauses this host.
+	claimSuspendedReasonPaused = "daemon is paused"
+	// claimSuspendedReasonRecovering suspends every scope while the host is
+	// between revisions: a dynamic adoption publication, a re-adoption, or
+	// a proof-v2 withdrawal pauses the shared spawner and moves the
+	// lifecycle out of Running until the exact acknowledged beat reopens
+	// admission. The pause is on the host-wide spawner, so the suspension
+	// is host-wide too — unlike a first-heartbeat fence on a host that is
+	// otherwise serving, which is per organization.
+	claimSuspendedReasonRecovering = "daemon is recovering"
+	// claimSuspendedReasonStarting suspends every scope while a shim-composed
+	// host is still starting: no adoption or carrier rail serves there.
+	claimSuspendedReasonStarting = "daemon is starting"
+	// claimSuspendedReasonUpdating suspends every scope while the host applies
+	// a self-update: the poll response would bind work to a host about to
+	// exec into a new binary, so the tick is skipped and the item stays queued.
+	claimSuspendedReasonUpdating = "daemon is updating"
+	// claimSuspendedReasonStopped suspends every scope while the host is
+	// stopped: no spawner, no heartbeat, no admission.
+	claimSuspendedReasonStopped = "daemon is stopped"
+	// claimSuspendedReasonAtCapacity is the prefix of the suspension reason
+	// while this host holds no free session slot; the exact occupancy
+	// follows it.
+	claimSuspendedReasonAtCapacity = "host is at capacity"
+)
+
+// claimSuspended is the PollOptions.ClaimSuspended callback: it translates
+// the host-wide claim posture into the poll loop's claim gate. True means
+// "do not claim new work this tick"; the reason is used once, on the
+// suspend transition, in the poll loop's log line.
 //
-// Absent status (no beat has carried one yet, or the server never sends the
-// field) reads as NOT suspended — see HostStatusDetail.SuspendsClaiming.
+// It answers for the host, never for one organization: per-scope fences (a
+// pending first heartbeat, a refused founding) are claimSuspendedForOrg's
+// remit. Absent host status (no beat has carried one yet, or the server
+// never sends the field) reads as NOT suspended — see
+// HostStatusDetail.SuspendsClaiming.
 //
-// Locking: HostStatus() takes and releases d.mu (read side) and returns a copy,
-// so nothing is held while the poll loop latches its own state, and the
-// heartbeat goroutine's setLastHostStatus (write side) can always make
+// Locking: HostStatus() takes and releases d.mu (read side) and returns a
+// copy, so nothing is held while the poll loop latches its own state, and
+// the heartbeat goroutine's setLastHostStatus (write side) can always make
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
 	if d.sessionShimEnabled() {
 		// A first-heartbeat fence for a scope this daemon holds no authority
 		// for is an orphan: the acknowledgement edge that would clear it
 		// matches a retained receipt, so nothing left can reopen it, while the
-		// host-wide gate stays closed for every scope. Reconcile it here — at
-		// the admission seam itself — rather than trusting every path that
-		// drops a receipt to also drop its fence.
+		// per-org gate stays closed for every scope that names it.
+		// Reconcile it here — at the admission seam itself — rather than
+		// trusting every path that drops a receipt to also drop its fence.
 		d.clearOrphanedSessionShimHeartbeatFence()
-		if d.sessionShimReadinessWithdrawn.Load() {
+		// The readiness latch below is host-wide ONLY while no scope fence is
+		// outstanding. A pending first heartbeat raises the latch for its own
+		// scope; while one is pending the per-org gate (claimSuspendedForOrg)
+		// decides per organization, and consulting the latch here would stall
+		// every healthy scope behind the stuck one. With no scope fence the
+		// latch can only be the proof-v2 withdrawal (or a stale one), which
+		// is genuinely host-wide.
+		//
+		// Known relaxation while a scope fence IS pending: the live
+		// sessionShimReadinessGate probe below runs instead of the latch,
+		// and a proof-v2 withdrawal that lands in that window cannot raise
+		// its own latch (the CompareAndSwap fails while the fence holds
+		// it). Healthy scopes therefore resume on one passing live probe
+		// rather than waiting for the exact acknowledged beat. The window
+		// closes with the fence: the next tick after the last scope fence
+		// clears re-consults the latch, and a still-withdrawn proof-v2
+		// rail holds the host-wide gate again until its own acknowledgement
+		// reopens it. AcceptWork never takes this shortcut — its latch
+		// branch consults claimSuspendedForOrg unconditionally — so the
+		// relaxation is poll-side only.
+		if d.sessionShimReadinessWithdrawn.Load() && !d.sessionShimHeartbeatFencePending() {
 			return true, "session-shim recovery is not ready"
 		}
 		// A transient resolver failure reads as unknown and keeps this gate
@@ -893,8 +1068,51 @@ func (d *Daemon) claimSuspended() (bool, string) {
 			d.withdrawSessionShimProofV2Readiness()
 			return true, "session-shim proof-v2 readiness is unavailable"
 		}
-		if d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
-			return true, "session-shim recovery is not ready"
+		if !d.SessionShimAdoptionComplete() {
+			return true, "session-shim adoption is not complete"
+		}
+		if !d.SessionShimCarrierActivationComplete() {
+			return true, "session-shim carrier activation is not complete"
+		}
+	}
+	// Operator pause, drain, non-serving lifecycle phases, and recovery stop
+	// claims for every scope at once. They are checked before the platform
+	// signal so the reason names the local cause. With the shim enabled the
+	// old seam suspended on every state other than Running; that coverage is
+	// preserved here under a named reason per state, so a self-update
+	// (Updating) or a start/stop edge cannot turn a skipped poll into
+	// claim-then-NACK churn. Without the shim only the operator-driven
+	// terminal phases (draining, paused) close the poll gate; Starting,
+	// Updating and Stopped there are a plain unstarted or transient daemon
+	// whose admission seam (AcceptWork) already refuses non-Running, and
+	// closing the poll gate there would hide its ticks.
+	if d.sessionShimEnabled() {
+		switch d.State() {
+		case StateStarting:
+			return true, claimSuspendedReasonStarting
+		case StateUpdating:
+			return true, claimSuspendedReasonUpdating
+		case StateStopped:
+			return true, claimSuspendedReasonStopped
+		case StateDraining:
+			return true, claimSuspendedReasonDraining
+		case StatePaused:
+			return true, claimSuspendedReasonPaused
+		case StateRecovering:
+			return true, claimSuspendedReasonRecovering
+		case StateRunning:
+			// Only the serving state may proceed to the remaining gates.
+		default:
+			return true, "daemon lifecycle state is unrecognized"
+		}
+	} else {
+		switch d.State() {
+		case StateDraining:
+			return true, claimSuspendedReasonDraining
+		case StatePaused:
+			return true, claimSuspendedReasonPaused
+		case StateRecovering:
+			return true, claimSuspendedReasonRecovering
 		}
 	}
 	status := d.HostStatus()
@@ -919,6 +1137,136 @@ type PollClaimGate func() (suspended bool, reason string)
 // does not snapshot, cache, or duplicate claim-suspension semantics.
 func (d *Daemon) PollClaimGate() PollClaimGate {
 	return d.claimSuspended
+}
+
+// PollOrgClaimGate is the per-organization new-work admission predicate
+// consumed by PollOptions.ClaimSuspendedForOrg. A true result skips only the
+// work items of that organization on a tick that still claims every other
+// ready organization; reason names the scope fence that held it.
+type PollOrgClaimGate func(orgID string) (suspended bool, reason string)
+
+// PollClaimGateForOrg returns the daemon's exact concurrency-safe per-org
+// new-work claim predicate for an independently composed PollService. Like
+// PollClaimGate it delegates to the same internal authority as the daemon's
+// primary poller. An empty organization resolves to this daemon's configured
+// scope, so legacy items that carry none are gated by the primary scope's
+// fence.
+func (d *Daemon) PollClaimGateForOrg() PollOrgClaimGate {
+	return d.claimSuspendedForOrg
+}
+
+// claimSuspendedForOrg is the per-organization new-work claim gate: an
+// organization whose first heartbeat is still pending, whose founding the
+// platform refused, or that would overfill a host with no free session slot
+// does not claim, while every other ready organization keeps claiming. The
+// host-wide gate (claimSuspended) runs first, so a drain, a pause, a
+// lifecycle stop, a pool signal, or a proof-v2 outage still stops every
+// scope at once.
+//
+// Capacity is deliberately per item rather than host-wide: AcceptWork
+// already refuses a full host (and the per-org gate's own capacity hold
+// NACKs the held item), so closing the whole poll request at capacity
+// would also starve the non-session lanes riding the same response —
+// kg extraction, landing triggers, and inbox — which use no session slot.
+// The callback MUST NOT block: it runs on the poll goroutine.
+func (d *Daemon) claimSuspendedForOrg(orgID string) (bool, string) {
+	if suspended, reason := d.claimSuspended(); suspended {
+		return true, reason
+	}
+	// A full host holds this organization's session item while the poll
+	// request still goes out, so the non-session lanes on the same response
+	// keep flowing. Session items only: kg extraction, landing triggers and
+	// inbox use no session slot and must not be fenced by occupancy.
+	if atCapacity, reason := d.hostAtCapacity(); atCapacity {
+		return true, reason
+	}
+	if !d.sessionShimEnabled() || d.shims == nil {
+		return false, ""
+	}
+	// Same orphan reconciliation as the host-wide seam: a fence for a scope
+	// with no retained authority is closable by nothing, so it must not gate
+	// even its own organization, let alone any other.
+	d.clearOrphanedSessionShimHeartbeatFence()
+	scope := orgID
+	if scope == "" {
+		scope = d.sessionShimConfig().orgID()
+	}
+	d.shims.mu.RLock()
+	_, pending := d.shims.pendingHeartbeatAcks[scope]
+	d.shims.mu.RUnlock()
+	if pending {
+		return true, "session-shim first heartbeat for organization " + scope + " is pending"
+	}
+	if refused := d.SessionShimDurabilityRefusal(); refused != nil && refused.Scope == scope {
+		reason := "session-shim founding for organization " + scope + " was refused"
+		if refused.Reason != "" {
+			reason += ": " + refused.Reason
+		}
+		return true, reason
+	}
+	return false, ""
+}
+
+// sessionShimHeartbeatFencePending reports whether any scope's first
+// heartbeat acknowledgement is still outstanding. The host-wide claim gate
+// consults it — never the readiness latch alone — so a pending scope fence
+// suspends only its own organization while every other ready one keeps
+// claiming.
+func (d *Daemon) sessionShimHeartbeatFencePending() bool {
+	if d.shims == nil {
+		return false
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return len(d.shims.pendingHeartbeatAcks) > 0
+}
+
+// hostAtCapacity reports whether this host holds no free session slot. The
+// occupancy is spawner children plus adopted and quarantined shims — the
+// same populations as the coherent snapshot, read here WITHOUT the
+// tombstone-reconciliation sweep: that sweep can round-trip the control
+// plane, and this gate runs on the poll goroutine, which must never block.
+// A lineage whose tombstone has landed but not yet been reconciled counts
+// until the next heartbeat surface sweeps it, which errs fail-closed and
+// heals on its own. The ceiling is the spawner's live one while a spawner
+// is published (the authority runtime capacity edits and AcceptWork itself
+// consult), falling back to the loaded configuration before Start publishes
+// it. With neither, nothing has been admitted against a capacity that was
+// never set, which reads as not full.
+func (d *Daemon) hostAtCapacity() (bool, string) {
+	ceiling := -1
+	if d.spawner != nil {
+		ceiling = d.spawner.MaxConcurrentSessions()
+	} else if cfg := d.Config(); cfg != nil {
+		ceiling = cfg.Capacity.MaxConcurrentSessions
+	}
+	if ceiling < 0 {
+		return false, ""
+	}
+	active := d.claimGateOccupancy()
+	if active < ceiling {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%s (%d/%d sessions)", claimSuspendedReasonAtCapacity, active, ceiling)
+}
+
+// claimGateOccupancy counts the sessions occupying this host without running
+// the quarantined-tombstone reconciliation sweep. See hostAtCapacity for why
+// the sweep stays off the poll goroutine.
+func (d *Daemon) claimGateOccupancy() int {
+	active := 0
+	if d.localRuntime.Load() != nil {
+		return len(d.ActiveSessions())
+	}
+	if d.spawner != nil {
+		active, _ = d.spawner.ActiveSessionCounts()
+	}
+	if d.shims != nil {
+		d.shims.mu.RLock()
+		active += len(d.shims.adopted) + len(d.shims.quarantined)
+		d.shims.mu.RUnlock()
+	}
+	return active
 }
 
 // setLastHostStatus is the OnHostStatus callback wired into HeartbeatService.
@@ -947,22 +1295,40 @@ func (d *Daemon) runtimeJWT() string {
 // the direct children would make a freshly restarted daemon report an empty host
 // while every pre-restart terminal is still live — the same lie the capacity
 // path refuses to tell, told on the surface an operator actually reads.
+//
+// The union is deduped by session id: the shim projection already contains
+// both the adopted and the quarantined row for one lineage, and a stale
+// spawner entry can name the same session a shim owns. The first row wins —
+// direct children first, then the shim projection in the order it serves
+// (adopted before quarantined), then held sessions — so an adopted handle
+// always takes precedence over a quarantined row for the same session.
 func (d *Daemon) ActiveSessions() []SessionHandle {
 	var out []SessionHandle
-	if d.spawner != nil {
-		out = d.spawner.ActiveSessions()
-	}
-	out = append(out, d.sessionShimHandles()...)
-	if local := d.localRuntime.Load(); local != nil {
-		owned := map[string]bool{}
-		for _, handle := range out {
-			owned[handle.SessionID] = true
-		}
-		for _, handle := range local.heldSessions() {
-			if !owned[handle.SessionID] {
+	// seen tracks session ids already listed so one session reports once.
+	// Handles whose id is empty carry no identity to dedupe on: they are
+	// listed unconditionally, never merged and never merged into. Dropping
+	// them would report an idle host while their harness is running — the
+	// exact lie the union above exists to not tell.
+	seen := map[string]bool{}
+	appendDeduped := func(handles []SessionHandle) {
+		for _, handle := range handles {
+			if handle.SessionID == "" {
 				out = append(out, handle)
+				continue
 			}
+			if seen[handle.SessionID] {
+				continue
+			}
+			seen[handle.SessionID] = true
+			out = append(out, handle)
 		}
+	}
+	if d.spawner != nil {
+		appendDeduped(d.spawner.ActiveSessions())
+	}
+	appendDeduped(d.sessionShimHandles())
+	if local := d.localRuntime.Load(); local != nil {
+		appendDeduped(local.heldSessions())
 	}
 	return out
 }
@@ -1099,6 +1465,23 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if localRuntimeRequested(cfg) && !d.opts.SkipRegistration {
 		if d.sessionShimEnabled() {
 			return errors.New("local file runtime supports direct headless execution only")
+		}
+		if cfg.LocalRuntime == nil || cfg.LocalRuntime.Harness == "" || cfg.LocalRuntime.Model == "" || len(cfg.LocalRuntime.Repositories) == 0 {
+			// A fresh-host seed (file queue URL with an explicit policy
+			// but no harness or repository profile yet) reaches Start
+			// without the profile the composition could not serve.
+			// Refuse with the operator action before any runtime,
+			// heartbeat, or poller starts, not an internal wiring
+			// complaint. The typed refusal maps to the no-restart
+			// setup exit at the entry point.
+			return afclient.ErrNeedsSetup
+		}
+		if d.opts.LocalRuntime == nil || d.opts.LocalRuntime.NewCompiler == nil {
+			// The shipped composition is missing — an embedder wiring
+			// fault, not an unconfigured host. Its own message keeps
+			// the journal grep for the setup action from
+			// misdiagnosing a misbuilt composition as "not set up yet".
+			return errors.New("local runtime composition missing: reinstall or report a bug")
 		}
 		local, err = newLocalRuntime(ctx, d, cfg)
 		if err != nil {
@@ -1273,6 +1656,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
+	// Undo seeded workspace trust whose owning session died before its
+	// cleanup ran. Runs after adoption so live sessions' ledger rows are
+	// protected, and never fails startup — see sweepSeededTrustLedger.
+	d.sweepSeededTrustLedger(ctx)
 	// A refused startup founding stands the composition down above, so this
 	// second registration runs exactly when the daemon presents no composed
 	// attestation: either it never did, or its founder was refused and it
@@ -1306,6 +1693,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Mode:     string(resolved.Mode),
 		}
 	}
+	// Per-seat scheduling class: opt-in only, default when unauthored.
+	// Only set what the operator authored: an embedder that composed
+	// its own SpawnerOptions.SeatQoS keeps it.
+	if spawnerOpts.SeatQoS == "" && cfg.Capacity.SeatQoS != "" {
+		spawnerOpts.SeatQoS = string(resolveSeatQoS(cfg.Capacity.SeatQoS))
+	}
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
 	}
@@ -1313,6 +1706,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.BaseEnv["DONMAI_WORKER_ID"] = d.workerID
 	}
 	spawnerOpts.BaseEnv["DONMAI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
+	// Carry the operator's failed-worktree recovery policy to every worker.
+	// keepFailedWorktrees states DONMAI_KEEP_FAILED_WORKTREE so `agent run`
+	// preserves a failed session's worktree instead of tearing it down
+	// after the rescue. An embedder-composed BaseEnv keeps priority — the
+	// daemon only fills the gap it would otherwise leave — and a work item
+	// cannot override it (the name is host-owned).
+	if cfg.KeepFailedWorktrees {
+		if _, ok := spawnerOpts.BaseEnv[runtimeenv.KeepFailedWorktreeEnv]; !ok {
+			spawnerOpts.BaseEnv[runtimeenv.KeepFailedWorktreeEnv] = "1"
+		}
+	}
 	// Tell every worker this daemon spawns where this daemon actually lives.
 	// Resolved per spawn rather than snapshotted here: the control listener may
 	// still be binding an ephemeral port at this point, and ControlURL is the
@@ -1339,6 +1743,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.WorktreeParentDir == "" {
 		spawnerOpts.WorktreeParentDir = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 	}
+	// Reconcile the repository keeper after session and catalog
+	// reconciliation and before workarea-cache admission, with the same
+	// worktree parent the spawner serves from above: the store refuses a
+	// cross-filesystem state/worktree layout, and a refusal degrades to a
+	// plain clone. While it reconciles, callers degrade; with the keeper
+	// disabled this is a no-op and nothing is created under repo-keeper/.
+	d.reconcileRepoKeeper(ctx, spawnerOpts.WorktreeParentDir)
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.
@@ -1407,11 +1818,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 		spawnerOpts.ShimSpawn = d.launchSessionShim
 	}
-	// Admission must see shim-held slots too, or a restarted daemon would accept
-	// against cores its surviving shims are already using.
-	if spawnerOpts.ExternalOccupancy == nil {
-		spawnerOpts.ExternalOccupancy = d.SessionShimOccupancy
-	}
+	d.wireShimAdmission(&spawnerOpts)
 	spawner := NewWorkerSpawner(spawnerOpts)
 	// Constructor zero retains its default semantics; loaded zero is an exact
 	// admission limit and must take effect before the spawner is published.
@@ -1579,6 +1986,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// to af daemon stats. The latest observed status is stored
 			// in d.hostStatus; callers read via Daemon.HostStatus().
 			OnHostStatus: d.setLastHostStatus,
+			// Three-axis seat state rides every beat: one report per
+			// in-flight seat plus the axis-count fold.
+			GetSeatStates: d.seatStates,
 		}
 		if d.sessionShimEnabled() {
 			primaryScope := d.sessionShimConfig().orgID()
@@ -1660,6 +2070,24 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.quotaPoller = newQuotaPoller(d.quota, d.quotaProbes())
 		d.quotaPoller.Start()
 
+		// Hourly orphan-sweep loop — the startup pass in sweepCodexOrphans
+		// covers restart leftovers; this covers everything that lands
+		// mid-uptime and everything a budget-capped startup pass never
+		// reached. Nil sweeper is a no-op (see startCodexOrphanSweepLoop);
+		// otherwise the loop is a plain ctx-bound goroutine like the
+		// quota poller above — except the poller is explicitly stopped
+		// and this loop is not. That asymmetry is deliberate: the poller
+		// shells out to live harness CLIs on a 5-minute cadence, so a
+		// lingering tick after drain starts spends real process spawns
+		// against a daemon that is shutting down. The sweep loop ticks
+		// hourly, each pass independently bounded by
+		// codexOrphanSweepTimeout, and its next tick after Stop begins
+		// is at most one stale pass — the same posture as the
+		// log-rotation and quarantine-cleanup tickers the production
+		// entry point runs (see afcli/daemon_run.go), which likewise
+		// end with their parent context rather than with Stop.
+		d.startCodexOrphanSweepLoop(ctx)
+
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar
 		// behaviour holds: the worker shows "active" but never picks up
@@ -1701,6 +2129,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 				// draining, or disabled, stop claiming new work while
 				// leaving in-flight sessions alone.
 				ClaimSuspended: d.claimSuspended,
+				// Per-organization admission inside the tick: a scope
+				// whose first heartbeat is still pending — or whose
+				// founding the platform refused — holds only its own
+				// work items while every other ready scope keeps
+				// claiming.
+				ClaimSuspendedForOrg: d.claimSuspendedForOrg,
 			})
 			credentials.Attach(poller)
 			d.lifecycleMu.Lock()
@@ -1726,6 +2160,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 			d.tokenRefresher.Start()
 		}
 	}
+
+	// Opt-in anonymous usage count — the weekly scheduler for the
+	// operator-consented installation count. The loop reads the live
+	// config each tick so `host set` takes effect without a restart;
+	// disabled or unconfigured sends nothing at all.
+	d.startUsagePingLoop(ctx)
 
 	// Phase 3b: hot-reload daemon.yaml on direct edits. Without this,
 	// `vim ~/.donmai/daemon.yaml` then :w leaves the running daemon with
@@ -1852,8 +2292,17 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
+	usagePingChanged := d.config.UsagePing != cfg.UsagePing
 	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
-	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged {
+	seatQoSChanged := d.config.Capacity.SeatQoS != cfg.Capacity.SeatQoS
+	// A rotated registration token rides alongside project changes: the new
+	// key must be adopted before the re-registration below, or the reload
+	// presents the revoked generation. Adoption is validated inside (a token
+	// for a different orchestrator or with a foreign shape is refused and
+	// the previous generation stays), so checking for the change here only
+	// decides whether the reload path runs at all.
+	registrationTokenChanged := d.credentials != nil && cfg.Orchestrator.AuthToken != "" && cfg.Orchestrator.AuthToken != d.config.Orchestrator.AuthToken
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged && !usagePingChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -1896,6 +2345,34 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		}
 		d.config.Capacity.SeatBudget = cfg.Capacity.SeatBudget
 	}
+	if seatQoSChanged {
+		if err := validateSeatQoS(cfg.Capacity.SeatQoS); err != nil {
+			d.mu.Unlock()
+			releasePolicy()
+			slog.Warn("[yaml-watcher] rejected seat scheduling class", "error", err)
+			return
+		}
+		// Seats already running keep the class they started with;
+		// only new spawns see the new class.
+		if d.spawner != nil {
+			if err := d.spawner.SetSeatQoS(cfg.Capacity.SeatQoS); err != nil {
+				d.mu.Unlock()
+				releasePolicy()
+				slog.Warn("[yaml-watcher] rejected seat scheduling class", "error", err)
+				return
+			}
+		}
+		d.config.Capacity.SeatQoS = cfg.Capacity.SeatQoS
+	}
+	if usagePingChanged {
+		d.config.UsagePing = cfg.UsagePing
+		if !cfg.UsagePingEnabled() {
+			// Disabling cancels queued work: no stale schedule
+			// survives the opt-out, and no future transmission
+			// is attempted until the operator opts back in.
+			cancelUsagePing(DefaultUsagePingStatePath())
+		}
+	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {
 			d.config.LocalRuntime = nil
@@ -1917,7 +2394,18 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
 			d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
 		}
+		_ = d.adoptRotatedRegistrationTokenLocked(cfg)
 		d.refreshRegistrationProjectsLocked()
+	} else if registrationTokenChanged {
+		// A pure rotation: the project declaration is unchanged, so there
+		// is nothing to publish — but the new generation must still be
+		// adopted before the re-registration presents it. A refused token
+		// leaves the registration exactly as it was, so there is nothing
+		// to re-present: re-registering anyway would mint a fresh worker
+		// identity on every later write of the same refused file.
+		if d.adoptRotatedRegistrationTokenLocked(cfg) && d.registrationReloadCtx != nil {
+			d.credentials.RequestReregister(d.registrationReloadCtx)
+		}
 	}
 	d.mu.Unlock()
 	releasePolicy()
@@ -1947,6 +2435,60 @@ func (d *Daemon) refreshRegistrationProjectsLocked() {
 	if d.registrationReloadCtx != nil {
 		d.credentials.RequestReregister(d.registrationReloadCtx)
 	}
+}
+
+// adoptRotatedRegistrationTokenLocked swaps the registration token the
+// credential refresher presents on the next refresh or re-registration, so a
+// token rotated alongside a config change takes effect without a restart.
+// The reloaded config value wins over the previous generation only when it
+// still names the running registration: the orchestrator URL must be
+// unchanged (a re-home is a restart-level change the watcher never applies)
+// and the token must keep the platform's registration-token shape (a blank
+// or foreign credential is never adopted mid-flight). The running
+// registration must itself be a platform registration: a daemon that booted
+// on the stub path never started its poll loop, so switching it to a real
+// registration live would leave a worker that heartbeats but never claims
+// work — promoting it is a restart. A refused token leaves the previous
+// generation in place. Reports whether the token was adopted. Caller holds
+// d.mu.
+func (d *Daemon) adoptRotatedRegistrationTokenLocked(cfg *Config) bool {
+	if d.credentials == nil || d.config == nil || cfg == nil {
+		return false
+	}
+	previousToken, runningURL := d.credentials.Registration()
+	nextToken := cfg.Orchestrator.AuthToken
+	if nextToken == "" || nextToken == previousToken {
+		return false
+	}
+	if normalizeOrchestratorURL(cfg.Orchestrator.URL) != normalizeOrchestratorURL(runningURL) {
+		slog.Warn("[yaml-watcher] refused rotated registration token for a different orchestrator")
+		return false
+	}
+	if !looksLikeRegistrationToken(nextToken) {
+		slog.Warn("[yaml-watcher] refused rotated registration token with an unrecognized shape")
+		return false
+	}
+	if !looksLikeRegistrationToken(previousToken) {
+		slog.Warn("[yaml-watcher] refused registration token: the running daemon is not platform-registered; restart to register")
+		return false
+	}
+	d.credentials.UpdateRegistrationToken(nextToken)
+	d.config.Orchestrator.AuthToken = nextToken
+	slog.Info("[yaml-watcher] adopted rotated registration token")
+	return true
+}
+
+// normalizeOrchestratorURL canonicalizes an orchestrator URL for identity
+// comparison: a trailing slash is a serialization detail, not a re-home.
+func normalizeOrchestratorURL(url string) string {
+	if url == "" {
+		return ""
+	}
+	trimmed := url
+	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	return trimmed
 }
 
 // Stop begins a one-way terminal transition. An incomplete drain leaves the
@@ -2510,11 +3052,47 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 		}
 	}()
 	if d.sessionShimReadinessWithdrawn.Load() {
-		return nil, errors.New("session-shim proof-v2 readiness is withdrawn")
-	}
-	if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
+		// The host-wide readiness latch stays fail-closed: a proof-v2
+		// withdrawal (or a stale latch) stops every scope at once. A pending
+		// first heartbeat raises the same latch for its own scope only, and
+		// that fence is per organization — see claimSuspendedForOrg — so the
+		// per-org admission check below decides for its scope. The detail's
+		// organization wins over the spec's when both name one; the merge
+		// below enforces the same precedence, so the check answers for the
+		// scope this admission would actually join.
+		orgID := spec.OrganizationID
+		if detail != nil && detail.OrganizationID != "" {
+			orgID = detail.OrganizationID
+		}
+		if suspended, reason := d.claimSuspendedForOrg(orgID); suspended {
+			return nil, fmt.Errorf("new-work claim suspended: %s", reason)
+		}
+	} else if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return nil, fmt.Errorf("session-shim proof-v2 readiness: %w", err)
+	}
+	// A retained founding refusal fences its scope on the direct admission
+	// path too — not only behind the readiness latch above. A refusal that
+	// arrives at startup (or rolls back a deferred install) clears the latch
+	// and strands no pending heartbeat, so the latch branch is skipped while
+	// the scope it names must still not admit: the local daemon API and an
+	// embedder OnWork that calls AcceptWork directly are the other claim
+	// path, and the issue's "a refused scope does not claim" holds there.
+	if d.sessionShimEnabled() {
+		refusalScope := spec.OrganizationID
+		if detail != nil && detail.OrganizationID != "" {
+			refusalScope = detail.OrganizationID
+		}
+		if refusalScope == "" {
+			refusalScope = d.sessionShimConfig().orgID()
+		}
+		if refused := d.SessionShimDurabilityRefusal(); refused != nil && refused.Scope == refusalScope {
+			reason := "session-shim founding for organization " + refusalScope + " was refused"
+			if refused.Reason != "" {
+				reason += ": " + refused.Reason
+			}
+			return nil, fmt.Errorf("new-work claim suspended: %s", reason)
+		}
 	}
 	if d.State() != StateRunning {
 		return nil, fmt.Errorf("daemon is not running (state %q)", d.State())

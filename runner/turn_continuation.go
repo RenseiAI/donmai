@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -39,7 +40,12 @@ import (
 // continuation prompt that names the reason, under the same bounds. A
 // session still in that state when its continuations run out, or that
 // cannot be continued at all, ends not delivered: failed, with the reason
-// in Result.Error.
+// in Result.Error. A dispatch-declared delivery policy
+// (QueuedWork.Delivery) widens what counts as delivered — allowing
+// drafts skips the draft check, allowing merges counts a merge carrying
+// the run's own resolution — while every other check still applies; and
+// without the policy the draft continuation prompt names the remedy
+// (gh pr ready).
 //
 // Continuations are bounded by progress, not by count alone. A turn is
 // productive when its event stream carried at least one tool call
@@ -414,6 +420,44 @@ func (f *turnFollowUps) report() *agent.TurnContinuations {
 	}
 }
 
+// continueGoalBlock renders the goal restatement a continuation turn
+// carries: the session's own goal as dispatched, never a bare "continue".
+// A continuation that arrives without the goal reads as a new task and
+// the seat can decline it ("no goal or task specified"), losing the
+// verdict the prior turn reached. The block names the work item's
+// identifier and title plus the dispatched directive itself — the stage
+// prompt when staged, else the issue body, else the issue context —
+// trimmed so the prompt stays short while always naming the goal. Empty
+// when the dispatch carried nothing goal-like: the caller falls back to
+// the bare prompt, which is today's behaviour byte for byte.
+func continueGoalBlock(qw QueuedWork) string {
+	var b strings.Builder
+	if id := strings.TrimSpace(qw.IssueIdentifier); id != "" {
+		b.WriteString("The goal is " + id)
+		if title := strings.TrimSpace(qw.Title); title != "" {
+			b.WriteString(": " + title)
+		}
+		b.WriteString(". ")
+	}
+	directive := strings.TrimSpace(qw.StagePrompt)
+	if directive == "" {
+		directive = strings.TrimSpace(qw.Body)
+	}
+	if directive == "" {
+		directive = strings.TrimSpace(qw.PromptContext)
+	}
+	if directive == "" {
+		return b.String()
+	}
+	const maxGoalRunes = 500
+	runes := []rune(directive)
+	if len(runes) > maxGoalRunes {
+		directive = string(runes[:maxGoalRunes]) + "\u2026"
+	}
+	b.WriteString("Goal directive: " + directive)
+	return b.String()
+}
+
 // continuePrompt is the short prompt sent after a turn that stopped early.
 const continuePrompt = "Your previous turn ended before the task was finished: it left no turn result, " +
 	"no pull request, and no blocked or failed verdict. Continue the task from where you stopped. " +
@@ -421,10 +465,13 @@ const continuePrompt = "Your previous turn ended before the task was finished: i
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
 
 // continueDraftPrompt is the continuation prompt after a turn that stopped
-// early while the session's pull request is still a draft.
+// early while the session's pull request is still a draft. It names the
+// remedy: without a dispatch-declared draft allowance the run counts as
+// delivered only once the pull request is marked ready for review, so the
+// prompt tells the seat to run exactly that step.
 const continueDraftPrompt = "Your previous turn ended before the task was finished: your pull request is still a draft, " +
 	"and the turn left no turn result and no blocked or failed verdict. Continue the task from where you stopped. " +
-	"When the work is done, commit it, push the branch, mark the pull request ready for review and report the result. " +
+	"When the work is done, commit it, push the branch, mark the pull request ready for review (gh pr ready) and report the result. " +
 	"If the task deliberately needs the pull request to stay a draft, say so and report your turn result (WORK_RESULT). " +
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
 
@@ -438,18 +485,23 @@ const continueNoNewCommitPrompt = "Your previous turn ended before the task was 
 
 // continuationPrompt is the continuation prompt for a turn that stopped
 // early: undelivered is why the session's pull request did not deliver the
-// work, "" when the turn left none.
-func continuationPrompt(reviewWork bool, undelivered string) string {
+// work, "" when the turn left none. goal restates the session's goal as
+// dispatched; when non-empty it is appended so the continuation never
+// arrives as a bare "continue" the seat can decline for lack of a goal.
+func continuationPrompt(reviewWork bool, undelivered, goal string) string {
+	base := continuePrompt
 	switch {
 	case undelivered == undeliveredDraft:
-		return continueDraftPrompt
+		base = continueDraftPrompt
 	case undelivered == undeliveredNoNewCommit:
-		return continueNoNewCommitPrompt
+		base = continueNoNewCommitPrompt
 	case reviewWork:
-		return continueReviewPrompt
-	default:
-		return continuePrompt
+		base = continueReviewPrompt
 	}
+	if strings.TrimSpace(goal) == "" {
+		return base
+	}
+	return base + "\n\n" + strings.TrimSpace(goal)
 }
 
 // continueReviewPrompt is the short prompt sent after a review turn that

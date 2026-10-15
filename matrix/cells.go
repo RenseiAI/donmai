@@ -3,7 +3,8 @@
 // which legacy ProviderName each maps to, and the generated artifacts that
 // downstream embedders consume. The matrix is grounded in the live
 // provider/endpoint Manifest() declarations (harvested by the generator), not
-// a re-typed copy — keeping the manifests the single SoT.
+// a re-typed copy. Subagent-event bits are derived from adapter fixtures,
+// never copied from manifest claims.
 //
 // This file holds the ONLY hand-authored capability data (per 03 §1):
 //   - the harvest lists (which providers/endpoints to call Manifest() on),
@@ -18,6 +19,7 @@ package matrix
 
 import (
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
@@ -66,13 +68,23 @@ type CapsOverride struct {
 	SupportsToolPlugins      *bool `json:"tools,omitempty"`
 	AcceptsMcpServerSpec     *bool `json:"mcp,omitempty"`
 	AcceptsAllowedToolsList  *bool `json:"allowedToolsList,omitempty"`
-	EmitsSubagentEvents      *bool `json:"subagents,omitempty"`
-	SupportsReasoningEffort  *bool `json:"reasoningEffort,omitempty"`
+	// EmitsSubagentEvents is retained for decoding older artifacts. Authored
+	// overrides are rejected: subagent evidence is computed by the generator.
+	EmitsSubagentEvents     *bool `json:"subagents,omitempty"`
+	SupportsReasoningEffort *bool `json:"reasoningEffort,omitempty"`
 }
 
 // HarnessEndpointCell is one hand-authored valid cell — a (harness × endpoint
 // × host) combination that the runtime may legally bind. The generator
 // validates each against the harvested manifests before emitting it.
+//
+// The smoke/stability evidence is NOT hand-authored here: ProvingLanes,
+// Stability, and Smoked are left unset on every literal and DERIVED by the
+// generator from the smoke-lane registry (smoke_lanes.go) plus the last
+// gate outcomes (smoke_gate.go). A cell that names no proving lane reads
+// as experimental/not smoked; a named lane that did not pass un-smokes its
+// cell. The hand-authored literals naming routing-relevant data only is
+// what keeps a typed claim from ever certifying itself.
 type HarnessEndpointCell struct {
 	Harness        agent.HarnessName   `json:"harness"`
 	Endpoint       agent.Company       `json:"endpoint"`
@@ -91,8 +103,21 @@ type HarnessEndpointCell struct {
 	// nil when no single legacy id owns the cell (the north-star opencode×google
 	// cell). Pointer so the JSON emits null, not "".
 	LegacyProviderID *agent.ProviderName `json:"legacyProviderId"`
-	Stability        string              `json:"stability"`
-	Smoked           bool                `json:"smoked"`
+	// ProvingLanes names the smoke tests that prove this cell, drawn from
+	// the smoke-lane registry. DERIVED by the generator — never set on the
+	// hand-authored literal. Omitted (not null) when no lane proves the cell,
+	// so the generated JSON stays byte-identical to the un-proven shape.
+	ProvingLanes []SmokeLaneName `json:"provingLanes,omitempty"`
+	// Stability is the cell's derived tier (experimental/beta/stable).
+	// DERIVED by the generator from the proving lanes' gate outcomes.
+	Stability string `json:"stability"`
+	// Smoked is true only when every proving lane passed in the last gate.
+	// DERIVED by the generator; a cell with no proving lane reads false.
+	Smoked bool `json:"smoked"`
+	// EmitsSubagentEvents is computed from executed fixtures, never authored.
+	// SubagentQualification identifies the adapter version and loaded delivery
+	// behind a true value; missing evidence leaves the cell false.
+	EmitsSubagentEvents bool `json:"emitsSubagentEvents"`
 }
 
 // Key returns the cell's (harness, endpoint, host) identity.
@@ -143,7 +168,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderClaude),
-		Stability: "stable", Smoked: true,
 	},
 	{
 		Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: agent.HostDirect,
@@ -151,7 +175,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "forced-tool", LegacyProviderID: nil,
-		Stability: "stable", Smoked: false,
 	},
 	{
 		Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: agent.HostBedrock,
@@ -159,7 +182,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "forced-tool", LegacyProviderID: nil,
-		Stability: "beta", Smoked: false,
 	},
 	{
 		Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: agent.HostVertex,
@@ -167,7 +189,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "forced-tool", LegacyProviderID: nil,
-		Stability: "beta", Smoked: false,
 	},
 
 	// codex × OpenAI ---------------------------------------------------------
@@ -180,7 +201,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "output-schema", LegacyProviderID: pn(agent.ProviderCodex),
-		Stability: "stable", Smoked: true,
 	},
 	{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostDirect,
@@ -188,7 +208,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "output-schema", LegacyProviderID: nil,
-		Stability: "beta", Smoked: false,
 	},
 	{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostAzure,
@@ -196,7 +215,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "output-schema", LegacyProviderID: nil,
-		Stability: "beta", Smoked: false,
 	},
 
 	// gemini-direct × Google -----------------------------------------------
@@ -206,7 +224,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "response-schema", LegacyProviderID: pn(agent.ProviderGemini),
-		Stability: "stable", Smoked: true,
 	},
 	{
 		Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostVertex,
@@ -214,17 +231,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "response-schema", LegacyProviderID: nil,
-		Stability: "beta", Smoked: false,
-	},
-
-	// antigravity × Google (agy host login) ---------------------------------
-	{
-		Harness: agent.HarnessAntigravity, Endpoint: agent.CompanyGoogle, Host: agent.HostOAuthCLI,
-		Protocol: agent.ProtoAntigravityOAuth, Transport: agent.TransportPTY,
-		AuthModes: []agent.AuthMode{agent.AuthHostSession, agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
-		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
-		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderAGYCLI),
-		Stability: "stable", Smoked: true,
 	},
 
 	// ollama × Local --------------------------------------------------------
@@ -234,7 +240,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostLocalFree, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "format-json", LegacyProviderID: pn(agent.ProviderOllama),
-		Stability: "beta", Smoked: false,
 	},
 
 	// opencode × OpenAI (direct) — legacy default for ProviderName "opencode"
@@ -244,15 +249,16 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "json-schema", LegacyProviderID: pn(agent.ProviderOpenCode),
-		Stability: "beta", Smoked: true,
 	},
 
 	// opencode × OpenAI on the gateway (openai-chat surface) — the first
 	// gateway cell (M1; ADR-2026-07-24 / 08 §9). opencode drives openai-chat and
 	// the OpenAI gateway HostDesc PRESENTS openai-chat, so the D2 intersection
 	// rule passes unchanged. Same-protocol in M1 (the gateway's cross-protocol
-	// value proves out in M2). Smoked per DEC-2/DEC-3: donmai-smokes step19
-	// gateway lane green 3 consecutive main runs (2026-07-25 → 2026-07-26).
+	// value proves out in M2). Unsmoked: the gateway completed-turn lane drives
+	// the pi harness, not opencode, so it proves no opencode cell (see the
+	// smoke-lane registry) — the earlier claim that it smoked this cell was
+	// the misattribution this derivation exists to end.
 	// Not a legacy anchor — the opencode default stays the direct cell above.
 	{
 		Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: agent.HostGateway,
@@ -260,7 +266,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "json-schema", LegacyProviderID: nil,
-		Stability: "experimental", Smoked: true,
 	},
 
 	// opencode × Google on local (/v1 openai-chat) — THE NORTH-STAR CELL ----
@@ -270,7 +275,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostLocalFree, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "json-schema", LegacyProviderID: nil,
-		Stability: "experimental", Smoked: false,
 	},
 
 	// pi × Anthropic (direct) — deliberately narrow (09 §3): pi's Drive
@@ -283,7 +287,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderPi),
-		Stability: "experimental", Smoked: false,
 	},
 
 	// pi × OpenAI (direct) --------------------------------------------------
@@ -293,7 +296,32 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "spawn-collect", LegacyProviderID: nil,
-		Stability: "experimental", Smoked: false,
+	},
+
+	// muse × Meta -----------------------------------------------------------
+	// The MSP serve host drives muse-msp on both the subscriber login
+	// (oauth-cli, host-session — the serve child inherits the login) and
+	// the keyed API route (direct, BYOK/metered via META_API_KEY). The
+	// oauth-cli cell anchors ProviderName "muse" (the host-session
+	// default, mirroring codex × openai × oauth-cli); the direct cell is
+	// the keyed sibling. Both are experimental/untested until the smoke
+	// lane proves a live turn: the adapter reports no native structured
+	// output (spawn-collect) and no plan/fork/rollback surface (the MSP
+	// host exposes none — see provider/harness/muse README "Out of
+	// scope").
+	{
+		Harness: agent.HarnessMuse, Endpoint: agent.CompanyMeta, Host: agent.HostOAuthCLI,
+		Protocol: agent.ProtoMuseMSP, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
+		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderMuse),
+	},
+	{
+		Harness: agent.HarnessMuse, Endpoint: agent.CompanyMeta, Host: agent.HostDirect,
+		Protocol: agent.ProtoMuseMSP, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: nil,
 	},
 
 	// stub × stub -----------------------------------------------------------
@@ -303,7 +331,6 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostLocalFree, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "stub", LegacyProviderID: pn(agent.ProviderStub),
-		Stability: "stable", Smoked: true,
 	},
 }
 
@@ -362,6 +389,13 @@ var harnessBinaryPins = map[agent.HarnessName]HarnessBinaryPin{
 		MinVersion:      pi.MinVersion,
 		PinnedVersion:   pi.PinnedVersion,
 		VerifiedAgainst: pi.VerifiedAgainst,
+	},
+	// The serve host drifts independently of donmai releases; the pin is
+	// enforced probe-time in provider/harness/muse (checkMuseVersion).
+	agent.HarnessMuse: {
+		MinVersion:      muse.MinVersion,
+		PinnedVersion:   muse.PinnedVersion,
+		VerifiedAgainst: muse.VerifiedAgainst,
 	},
 }
 

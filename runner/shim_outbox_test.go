@@ -22,11 +22,19 @@ import (
 
 // shimSeatRunner builds a Runner with the standalone outbox enabled for
 // attempt 1, posting to srv. The caller owns the worktree manager so the
-// test can reopen the authority the way a restarted daemon does.
-func shimSeatRunner(t *testing.T, manager *worktree.Manager, poster *result.Poster) *Runner {
+// test can reopen the authority the way a restarted daemon does. The
+// optional spawnGate, when non-nil, is closed exactly once on the first
+// Spawn call so cancellation tests can gate on provisioning having
+// finished (the ownership pulse starts before provisioning, so the first
+// lock-refresh no longer serves as that gate).
+func shimSeatRunner(t *testing.T, manager *worktree.Manager, poster *result.Poster, spawnGate ...*spawnGate) *Runner {
 	t.Helper()
 	registry := NewRegistry()
-	provider, _ := stub.New()
+	base, _ := stub.New()
+	var provider agent.Provider = base
+	if len(spawnGate) > 0 && spawnGate[0] != nil {
+		provider = &spawnGatedStubProvider{HarnessProvider: base.(agent.HarnessProvider), spawned: spawnGate[0].ch, once: &spawnGate[0].once}
+	}
 	if err := registry.Register(provider); err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +47,19 @@ func shimSeatRunner(t *testing.T, manager *worktree.Manager, poster *result.Post
 		t.Fatal(err)
 	}
 	return r
+}
+
+// spawnGate is the shared first-Spawn signal for shim-seat cancellation
+// tests. The gate lives in shim_outbox_test.go so runner_test.go's
+// spawnGatedStubProvider can be reused without an import cycle within the
+// package's test files.
+type spawnGate struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func newSpawnGate() *spawnGate {
+	return &spawnGate{ch: make(chan struct{})}
 }
 
 // TestShimSeatPersistsTerminalBodyBeforeFirstSend drives the production Run
@@ -147,6 +168,15 @@ func TestShimSeatPersistsTerminalBodyBeforeFirstSend(t *testing.T) {
 	}
 	if loaded.Record.DeliveryState != workarea.TerminalStatusPending {
 		t.Fatalf("delivery=%q, want pending", loaded.Record.DeliveryState)
+	}
+	// The record carries its own delivery bound, not a borrowed lease
+	// duration: a daemon back after the lease window must still replay an
+	// unsent terminal instead of dead-lettering it on arrival. now is the
+	// frozen clock the save read, so the bound must clear it by the
+	// standalone deadline's own margin, not just the lease maximum.
+	now := r.now()
+	if horizon := loaded.Record.DeadlineAt.Sub(now); horizon <= workarea.MaximumLeaseDuration {
+		t.Fatalf("deadline horizon=%v, want more than the lease maximum %v", horizon, workarea.MaximumLeaseDuration)
 	}
 }
 
@@ -356,13 +386,15 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := make(chan struct{})
-	var startedOnce atomic.Bool
+	gate := newSpawnGate()
+	// Gate cancellation on Spawn, not on the first lock-refresh: the
+	// ownership pulse starts before provisioning, so the first refresh
+	// lands while the session is still cloning — cancelling on it aborts
+	// the clone instead of the hanging interview turn. Spawn proves
+	// provisioning finished. The refresh handler stays (answering 200)
+	// so the pre-provision pulse never trips the loss fuse mid-test.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if strings.HasSuffix(req.URL.Path, "/lock-refresh") {
-			if startedOnce.CompareAndSwap(false, true) {
-				close(started)
-			}
 			_, _ = w.Write([]byte(`{"refreshed":true}`))
 			return
 		}
@@ -373,7 +405,7 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := shimSeatRunner(t, manager, poster)
+	r := shimSeatRunner(t, manager, poster, gate)
 	queued := QueuedWork{QueuedWork: queuedWorkBase("SHIM-OUTBOX-STOPPED"), WorkerID: "worker", PlatformURL: srv.URL, ResolvedProfile: ResolvedProfile{
 		Provider:       agent.ProviderStub,
 		ProviderConfig: map[string]any{"stub.behavior": string(stub.BehaviorHangThenTimeout)},
@@ -393,11 +425,11 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 		done <- runResult{res: res, err: runErr}
 	}()
 	select {
-	case <-started:
+	case <-gate.ch:
 		cancel()
 	case <-time.After(30 * time.Second):
 		cancel()
-		t.Fatal("Run did not reach lock refresh before cancellation")
+		t.Fatal("Run did not reach provider spawn before cancellation")
 	}
 	var got runResult
 	select {
@@ -422,5 +454,65 @@ func TestShimSeatPersistsStoppedTerminalStatus(t *testing.T) {
 	}
 	if loaded.Record.DeliveryState != workarea.TerminalStatusPending {
 		t.Fatalf("delivery=%q, want pending", loaded.Record.DeliveryState)
+	}
+}
+
+// TestShimSeatWithLeasePersistsExactlyOneRecord is the duplicate-send guard:
+// a shim-owned seat whose lease path prepared the body must not also persist
+// a standalone record. Two records for one session would be drained by two
+// loops (lease-bound and standalone) and send the same terminal twice if the
+// runner died before the first send. The run below completes with a lease
+// and a shim seat; afterwards exactly one of the two authorities may hold
+// the session's terminal body.
+func TestShimSeatWithLeasePersistsExactlyOneRecord(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := NewRegistry()
+	provider, _ := stub.New()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster,
+		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		ShimSeat: &ShimSeatConfig{Attempt: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := QueuedWork{QueuedWork: queuedWorkBase("SHIM-OUTBOX-ONE-RECORD"), WorkerID: "worker", PlatformURL: srv.URL, TerminalWorkareaLease: terminalLeaseRequest(), ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub}}
+	queued.SessionID = runnerLeaseSessionID
+	queued.Repository = bareRepo
+	res, err := r.Run(context.Background(), queued)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "completed" || res.TerminalWorkareaLease == nil {
+		t.Fatalf("result=%+v, want a completed lease hold", res)
+	}
+	lease, err := manager.TerminalLease(res.TerminalWorkareaLease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.TerminalStatus == nil || lease.TerminalStatus.DeliveryState != workarea.TerminalStatusDelivered {
+		t.Fatalf("lease outbox=%+v, want delivered", lease.TerminalStatus)
+	}
+	if _, err := manager.LoadStandaloneTerminalOutbox(context.Background(), queued.SessionID, 1); err == nil {
+		t.Fatal("standalone record exists beside the lease record: one terminal would send twice")
 	}
 }

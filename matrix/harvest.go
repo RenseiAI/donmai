@@ -6,12 +6,13 @@ import (
 	endpAnthropic "github.com/RenseiAI/donmai/provider/endpoint/anthropic"
 	endpGoogle "github.com/RenseiAI/donmai/provider/endpoint/google"
 	endpLocal "github.com/RenseiAI/donmai/provider/endpoint/local"
+	endpMeta "github.com/RenseiAI/donmai/provider/endpoint/meta"
 	endpOpenAI "github.com/RenseiAI/donmai/provider/endpoint/openai"
 	endpStub "github.com/RenseiAI/donmai/provider/endpoint/stub"
-	"github.com/RenseiAI/donmai/provider/harness/agycli"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
+	"github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/provider/harness/ollama"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
@@ -41,7 +42,7 @@ func HarnessHarvestList() []HarnessHarvest {
 		{Name: agent.HarnessClaudeCode, Manifest: func() agent.HarnessManifest { return (&claude.Provider{}).Manifest() }},
 		{Name: agent.HarnessCodex, Manifest: func() agent.HarnessManifest { return (&codex.Provider{}).Manifest() }},
 		{Name: agent.HarnessGeminiDirect, Manifest: func() agent.HarnessManifest { return (&gemini.Provider{}).Manifest() }},
-		{Name: agent.HarnessAntigravity, Manifest: func() agent.HarnessManifest { return (&agycli.Provider{}).Manifest() }},
+		{Name: agent.HarnessMuse, Manifest: func() agent.HarnessManifest { return (&muse.Provider{}).Manifest() }},
 		{Name: agent.HarnessOllama, Manifest: func() agent.HarnessManifest { return (&ollama.Provider{}).Manifest() }},
 		{Name: agent.HarnessOpenCode, Manifest: func() agent.HarnessManifest { return (&opencode.Provider{}).Manifest() }},
 		{Name: agent.HarnessPi, Manifest: func() agent.HarnessManifest { return (&pi.Provider{}).Manifest() }},
@@ -63,7 +64,7 @@ func stubManifest() agent.HarnessManifest {
 	return agent.HarnessManifest{Name: agent.HarnessStub, Family: agent.FamilyHarness, ContractABI: "harness/v2"}
 }
 
-// EndpointHarvestList is the harvest list of the 5 model-endpoint providers.
+// EndpointHarvestList is the harvest list of the 6 model-endpoint providers.
 // Each Manifest() is state-free; constructed via New() for clarity.
 func EndpointHarvestList() []EndpointHarvest {
 	return []EndpointHarvest{
@@ -71,6 +72,7 @@ func EndpointHarvestList() []EndpointHarvest {
 		{Company: agent.CompanyOpenAI, Manifest: func() agent.ModelEndpointManifest { return endpOpenAI.New().Manifest() }},
 		{Company: agent.CompanyGoogle, Manifest: func() agent.ModelEndpointManifest { return endpGoogle.New().Manifest() }},
 		{Company: agent.CompanyLocal, Manifest: func() agent.ModelEndpointManifest { return endpLocal.New().Manifest() }},
+		{Company: agent.CompanyMeta, Manifest: func() agent.ModelEndpointManifest { return endpMeta.New().Manifest() }},
 		{Company: agent.CompanyStub, Manifest: func() agent.ModelEndpointManifest { return endpStub.New().Manifest() }},
 	}
 }
@@ -86,7 +88,7 @@ func HarnessProvidersForParity() []agent.HarnessProvider {
 		&claude.Provider{},
 		&codex.Provider{},
 		&gemini.Provider{},
-		&agycli.Provider{},
+		&muse.Provider{},
 		&ollama.Provider{},
 		&opencode.Provider{},
 		&pi.Provider{},

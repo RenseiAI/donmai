@@ -19,10 +19,12 @@ func TestEvent_AllVariantsRoundTrip(t *testing.T) {
 	}{
 		{"init", InitEvent{SessionID: "sess-1", Raw: map[string]any{"foo": "bar"}}, EventInit},
 		{"system", SystemEvent{Subtype: "compaction", Message: "compacted", Raw: nil}, EventSystem},
+		{"generation_id", SystemEvent{Subtype: SystemSubtypeGenerationID, GenerationID: "response-one"}, EventSystem},
 		{"assistant_text", AssistantTextEvent{Text: "hello world"}, EventAssistantText},
 		{
 			"llm_call",
 			LlmCallEvent{
+				GenerationID:    "response-two",
 				TraceID:         "00112233445566778899aabbccddeeff",
 				SpanID:          "0011223344556677",
 				ParentSpanID:    "8899aabbccddeeff",
@@ -271,6 +273,57 @@ func TestObservedUsageFieldsRoundTripWithReportedZero(t *testing.T) {
 		decoded, err := UnmarshalEvent(body)
 		if err != nil || !reflect.DeepEqual(input, decoded) {
 			t.Fatalf("observed zero lost for %T: decoded=%+v error=%v", input, decoded, err)
+		}
+	}
+}
+
+func TestEvent_GenerationIDWire(t *testing.T) {
+	t.Parallel()
+	for _, event := range []Event{SystemEvent{Subtype: SystemSubtypeGenerationID, GenerationID: "response-one"}, LlmCallEvent{GenerationID: "response-one", UsageSource: LlmUsageProvider}} {
+		data, err := MarshalEvent(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(data, &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["generationId"] != "response-one" {
+			t.Fatalf("wire generationId = %v; want response-one", body["generationId"])
+		}
+		decoded, err := UnmarshalEvent(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch e := decoded.(type) {
+		case SystemEvent:
+			if e.GenerationID != "response-one" {
+				t.Fatalf("decoded generationId = %q", e.GenerationID)
+			}
+		case LlmCallEvent:
+			if e.GenerationID != "response-one" {
+				t.Fatalf("decoded generationId = %q", e.GenerationID)
+			}
+		default:
+			t.Fatalf("decoded event = %T", decoded)
+		}
+	}
+	for _, ids := range [][]string{nil, {}, {"response-one"}} {
+		data, err := json.Marshal(Result{GenerationIDs: ids})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(data, &body); err != nil {
+			t.Fatal(err)
+		}
+		got, present := body["generationIds"]
+		if len(ids) == 0 {
+			if present {
+				t.Fatalf("empty ids serialized: %s", got)
+			}
+		} else if string(got) != `["response-one"]` {
+			t.Fatalf("wire generationIds = %s; want response-one", got)
 		}
 	}
 }

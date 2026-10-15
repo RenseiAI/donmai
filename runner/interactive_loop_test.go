@@ -130,11 +130,22 @@ func (h *interactivePTYHandle) InteractiveSession() agent.InteractiveSession {
 type testInteractiveHandle struct {
 	agent.Handle
 	session agent.InteractiveSession
+	// terminalCost declares that this handle's terminal ResultEvent
+	// carries a harness-accounted cost, like a production ptycli.Handle
+	// spawned with a TerminalCost hook. The runner's post-exit wait keys
+	// off it (interactiveTerminalCostWait), so tests that assert a late
+	// terminal is observed must set it — and tests that assert costless
+	// sessions finish immediately must not.
+	terminalCost bool
 }
 
 func (h *testInteractiveHandle) InteractiveSession() agent.InteractiveSession {
 	return h.session
 }
+
+func (h *testInteractiveHandle) HasTerminalCost() bool { return h.terminalCost }
+
+var _ agent.InteractiveTerminalCostSource = (*testInteractiveHandle)(nil)
 
 // recordingInteractiveSession records every accepted input byte. It embeds the
 // remaining interface methods from an optional real session; focused local-only
@@ -876,6 +887,75 @@ func TestInteractive_LocalOnlyCompletes(t *testing.T) {
 	}
 	if out.Status != "completed" {
 		t.Fatalf("status=%q error=%q; want completed", out.Status, out.Error)
+	}
+}
+
+// costTerminalHandle is an interactive PTY handle whose Events channel
+// carries a harness-accounted terminal ResultEvent, as a harness that sums
+// its own transcript at exit emits.
+type costTerminalHandle struct {
+	*interactivePTYHandle
+	events chan agent.Event
+}
+
+func (h *costTerminalHandle) Events() <-chan agent.Event { return h.events }
+
+// TestInteractive_TerminalCostReachesTheSessionResult drives the production
+// exit path: a handle whose terminal ResultEvent carries session totals
+// (accounted by the harness from its own transcript) lands those totals on
+// the session result, so an interactive session ends with its real usage
+// instead of no cost. A costless terminal leaves the result untouched.
+func TestInteractive_TerminalCostReachesTheSessionResult(t *testing.T) {
+	requireSh(t)
+
+	for _, tc := range []struct {
+		name string
+		cost *agent.CostData
+	}{
+		{name: "cost accounted by the harness", cost: &agent.CostData{InputTokens: 300, OutputTokens: 60, CachedInputTokens: 1000, CacheWriteTokens: 50, NumTurns: 2}},
+		{name: "costless terminal", cost: nil},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envAttachURL, "")
+			t.Setenv(envAttachToken, "")
+
+			r := minimalRunner(t)
+			sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", "exit 0"}})
+			if err != nil {
+				t.Fatalf("ptyhost.Spawn: %v", err)
+			}
+			events := make(chan agent.Event, 2)
+			events <- agent.InitEvent{}
+			events <- agent.ResultEvent{Success: true, Cost: tc.cost}
+			close(events)
+			h := &costTerminalHandle{interactivePTYHandle: newInteractivePTYHandle(sess), events: events}
+
+			res := &Result{SessionID: "s"}
+			qw := QueuedWork{}
+			qw.SessionID = "s"
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+			if err != nil {
+				t.Fatalf("dispatchInteractive: unexpected err %v", err)
+			}
+			if out.Status != "completed" {
+				t.Fatalf("status=%q error=%q; want completed", out.Status, out.Error)
+			}
+			if tc.cost == nil {
+				if out.Cost != nil {
+					t.Fatalf("Cost = %+v; want nil — a costless terminal must not invent usage", out.Cost)
+				}
+				return
+			}
+			if out.Cost == nil {
+				t.Fatal("Cost is nil; want the harness-accounted session totals — the session ends with no cost")
+			}
+			if *out.Cost != *tc.cost {
+				t.Fatalf("Cost = %+v; want %+v", out.Cost, tc.cost)
+			}
+		})
 	}
 }
 
@@ -1765,5 +1845,253 @@ func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
 	callConcurrently("static-tok", nil)
 	if got := strings.Count(logs.String(), "attach token file unreadable"); got != 2 {
 		t.Fatalf("unreadable warning count=%d; want 2 after recovery and recurrence\nlogs:\n%s", got, logs.String())
+	}
+}
+
+// TestInteractive_TerminalCostReachesSessionResult drives the production
+// dispatchInteractive entry point with a handle whose terminal ResultEvent
+// carries session-file totals: the drain must apply them to the session
+// result even though the terminal status (completed, from the exit payload)
+// is decided by the PTY lifecycle. Removing the apply call from the drain
+// leaves the result costless and turns this red. The handle declares a
+// terminal cost (like a production ptycli.Handle spawned with a TerminalCost
+// hook), so the post-exit wait runs for it.
+func TestInteractive_TerminalCostReachesSessionResult(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{}
+	events <- agent.ResultEvent{Success: true, Cost: &agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}}
+	close(events)
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session, terminalCost: true}
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "terminal-cost"}}
+	res := &Result{SessionID: qw.SessionID}
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil {
+		t.Fatalf("dispatchInteractive: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", out.Status)
+	}
+	if out.Cost == nil {
+		t.Fatal("session result carries no cost; want the handle's terminal totals")
+	}
+	want := agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}
+	if *out.Cost != want {
+		t.Fatalf("session cost = %+v, want %+v", out.Cost, want)
+	}
+}
+
+// TestInteractive_LateTerminalEventStillCostsSessionResult reproduces the
+// production timing the drain must survive: the PTY session is Done (so the
+// supervisor takes the Done branch) but the handle's terminal ResultEvent
+// only arrives later — after the post-exit work that strictly follows Done
+// (shim finalize wait, exit read, session-file cost read, cleanup). A
+// non-blocking drain returns on the still-empty channel and the cost is
+// lost; the bounded wait observes the late event and applies it. The handle
+// declares a terminal cost, so the long interactiveTerminalEventGrace bounds
+// the wait; the terminal lands AFTER the short interactiveTerminalCostGrace
+// an undeclared handle gets, so keying the wait off the declaration is what
+// keeps this green.
+func TestInteractive_LateTerminalEventStillCostsSessionResult(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{}
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session, terminalCost: true}
+	go func() {
+		// run()'s post-exit delay before the terminal send: past the
+		// short grace, well inside the declared one.
+		time.Sleep(interactiveTerminalCostGrace + 500*time.Millisecond)
+		events <- agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+		}}
+		close(events)
+	}()
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "late-terminal-cost"}}
+	res := &Result{SessionID: qw.SessionID}
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil {
+		t.Fatalf("dispatchInteractive: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", out.Status)
+	}
+	if out.Cost == nil {
+		t.Fatal("session result carries no cost; the late terminal ResultEvent was lost")
+	}
+	want := agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}
+	if *out.Cost != want {
+		t.Fatalf("session cost = %+v, want %+v", out.Cost, want)
+	}
+}
+
+// TestInteractive_SteadyStateTerminalEventStillCostsSessionResult pins the
+// other arrival path: the supervisor's steady-state select consumes the
+// terminal ResultEvent BEFORE Done is observed (a select win while both are
+// ready). The cost must still reach the session result — the steady-state
+// branch applies it exactly like the drain does. The declaration is set so
+// the post-Done tail behaves like production; the cost here arrives via the
+// supervisor, not the wait.
+func TestInteractive_SteadyStateTerminalEventStillCostsSessionResult(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	// The session stays alive until the terminal event has been consumed on
+	// the steady-state branch; Done then fires and the drain sees only the
+	// channel close. Without the steady-state apply, the result stays
+	// costless even though the event was observed.
+	session := liveRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	release := make(chan struct{})
+	consumed := make(chan struct{})
+	go func() {
+		events <- agent.InitEvent{}
+		events <- agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+		}}
+		close(consumed)
+		<-release
+		close(session.done)
+		close(events)
+	}()
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session, terminalCost: true}
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "steady-terminal-cost"}}
+	res := &Result{SessionID: qw.SessionID}
+	type outcome struct {
+		out *Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		out, err := minimalRunner(t).dispatchInteractive(
+			context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+		)
+		done <- outcome{out: out, err: err}
+	}()
+	select {
+	case <-consumed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal event was not consumed on the steady-state branch")
+	}
+	// Give the supervisor a scheduling window to process the consumed event
+	// before Done fires; the drain path (channel already closed of the
+	// terminal event) must not be what carries the cost.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("dispatchInteractive did not finish after Done")
+	}
+	if got.err != nil {
+		t.Fatalf("dispatchInteractive: %v", got.err)
+	}
+	if got.out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", got.out.Status)
+	}
+	if got.out.Cost == nil {
+		t.Fatal("session result carries no cost; the steady-state terminal ResultEvent was dropped")
+	}
+	want := agent.CostData{
+		InputTokens: 530, OutputTokens: 240, CachedInputTokens: 3000, CacheWriteTokens: 70, ReasoningTokens: 20,
+	}
+	if *got.out.Cost != want {
+		t.Fatalf("session cost = %+v, want %+v", got.out.Cost, want)
+	}
+}
+
+// TestInteractive_BareTerminalKeepsResultCostless is the companion: a handle
+// whose terminal ResultEvent carries no cost leaves the session result
+// costless instead of fabricating a zero.
+func TestInteractive_BareTerminalKeepsResultCostless(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	events := make(chan agent.Event, 2)
+	events <- agent.InitEvent{}
+	events <- agent.ResultEvent{Success: true}
+	close(events)
+	base := &fakeHandle{events: events}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "bare-terminal"}}
+	res := &Result{SessionID: qw.SessionID}
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil {
+		t.Fatalf("dispatchInteractive: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", out.Status)
+	}
+	if out.Cost != nil {
+		t.Fatalf("session cost = %+v with a bare terminal, want nil", out.Cost)
+	}
+}
+
+// TestInteractive_CostlessSessionEndsWithoutWaiting pins the conditional
+// side of the post-exit terminal wait: a handle that declares NO
+// harness-accounted cost (a bare terminal, like every non-costing harness's
+// ptycli.Handle) waits at most the short interactiveTerminalCostGrace for
+// its terminal instead of stalling out interactiveTerminalEventGrace for one
+// that will never come, and the session result stays costless. Without the
+// declaration gate (an unconditional long wait) this test takes the full
+// long grace; with the long grace dropped,
+// TestInteractive_LateTerminalEventStillCostsSessionResult goes red.
+func TestInteractive_CostlessSessionEndsWithoutWaiting(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	events := make(chan agent.Event, 1)
+	events <- agent.InitEvent{}
+	base := &fakeHandle{events: events}
+	// No terminalCost declaration: no harness-accounted cost is coming.
+	handle := &testInteractiveHandle{Handle: base, session: session}
+
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "costless-no-wait"}}
+	res := &Result{SessionID: qw.SessionID}
+	start := time.Now()
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("dispatchInteractive: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q, want completed", out.Status)
+	}
+	if out.Cost != nil {
+		t.Fatalf("session cost = %+v with no declared terminal cost, want nil", out.Cost)
+	}
+	// The drain must not have waited out the long grace: the channel
+	// stayed open with no terminal and nothing declared a cost.
+	if elapsed >= interactiveTerminalEventGrace {
+		t.Fatalf("costless session took %v to finish; want well under the %v terminal grace", elapsed, interactiveTerminalEventGrace)
 	}
 }

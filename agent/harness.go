@@ -25,7 +25,6 @@ const (
 	HarnessClaudeCode   HarnessName = "claude-code"
 	HarnessCodex        HarnessName = "codex"
 	HarnessOpenCode     HarnessName = "opencode"
-	HarnessAntigravity  HarnessName = "antigravity"
 	HarnessGeminiDirect HarnessName = "gemini-direct" // in-box Gemini generateContent loop
 	HarnessOllama       HarnessName = "ollama"        // in-box Ollama /api/chat loop
 	// HarnessRaw is the deprecated pre-split wire token for the two in-box
@@ -43,6 +42,10 @@ const (
 	// donmai-owned — see provider/harness/pi/doc.go §5. R2/DEC-3; cells start
 	// experimental/untested until the donmai-smokes gate passes.
 	HarnessPi HarnessName = "pi"
+	// HarnessMuse is the muse harness (provider/harness/muse): a
+	// `muse serve` MSP session host over stdio JSONL, one child per
+	// session.
+	HarnessMuse HarnessName = "muse"
 	// HarnessShell is the bare interactive-only PTY spawn mode
 	// (provider/harness/shell): it drives no model endpoint at all, so it
 	// anchors no matrix cell (matrix/cells.go) — it exists purely as an
@@ -109,6 +112,14 @@ type HarnessCaps struct {
 	// It is a DECLARATION, never an assumption: see the NoticeDelivery type
 	// for the whole contract and for why the zero value is not "none".
 	NoticeDelivery NoticeDelivery `json:"noticeDelivery"`
+
+	// ContextUsageSource names the harness-native source a context notice
+	// was read from (statusline sidecar, rollout token_count, RPC usage).
+	// Empty means the harness reports no native context signal. It is a
+	// DOCUMENTATION axis for the generated capability matrix: the runner
+	// reads each harness's native files directly, so this declares where
+	// the signal lives, not a behavior the runner switches on.
+	ContextUsageSource string `json:"contextUsageSource,omitempty"`
 
 	// the DRIVE surface (the axis link)
 	Drives      []WireProtocol `json:"drives"`

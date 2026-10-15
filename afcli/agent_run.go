@@ -28,10 +28,10 @@ import (
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
-	provideragycli "github.com/RenseiAI/donmai/provider/harness/agycli"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
+	providermuse "github.com/RenseiAI/donmai/provider/harness/muse"
 	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
 	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
 	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
@@ -102,16 +102,23 @@ var buildRegistryForAgentRun = func(logger *slog.Logger, hints agentRunCtorHints
 	return buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
 }
 
+// shimTerminalAttempt is the session-scoped terminal sequence every
+// shim-owned seat persists its terminal body under. It is 1: the runner
+// writes exactly one terminal body per session, and the key must stay fixed
+// across shim resumes — the launch contract's monotonic process epoch
+// advances on resume and so must never key the outbox, or the resumed
+// incarnation would orphan the record the previous one persisted.
+const shimTerminalAttempt = 1
+
 // shimSeatFromEnv reports this worker's shim-owned seat, or nil when this
 // process was not launched under the per-session shim launch contract. It is
 // a var so tests can drive the shim-owned runner path without mutating the
 // process environment.
 var shimSeatFromEnv = func() *runner.ShimSeatConfig {
-	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
-	if err != nil {
+	if _, err := sessionshim.LaunchFromEnv(os.Getenv); err != nil {
 		return nil
 	}
-	return &runner.ShimSeatConfig{Attempt: launch.ProcessEpoch}
+	return &runner.ShimSeatConfig{Attempt: shimTerminalAttempt}
 }
 
 // gatewayHarnessIdentity projects the canonical loop-driver identity already
@@ -192,8 +199,8 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 		"Daemon control URL (default: $DONMAI_DAEMON_URL, which the spawning daemon sets, or http://127.0.0.1:7734)")
 	cmd.Flags().StringVar(&opts.worktree, "worktree-dir", "",
 		"Per-session worktree parent directory (default: ~/.donmai/worktrees)")
-	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", true,
-		"Preserve the worktree on disk after the session ends (debugging)")
+	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", keepFailedWorktreeFromEnv(os.Getenv),
+		"Keep a failed session's worktree on disk for post-mortem recovery (default false; the daemon's keepFailedWorktrees setting answers yes for every worker it spawns; unpublished work is archived to the rescue directory before teardown either way)")
 	cmd.Flags().BoolVar(&opts.jsonOut, "json", true,
 		"Emit a single JSON line describing the terminal Result (default true)")
 	cmd.Flags().BoolVar(&opts.keepRecording, "keep-recording", false,
@@ -293,6 +300,24 @@ func resolveAgentRunDaemonURL(flagValue string, lookupEnv func(string) string) (
 		}
 	}
 	return DefaultAgentRunDaemonURL, daemonURLSourceBuiltinDefault
+}
+
+// localPosterAuthToken resolves the Poster construction-default bearer: the
+// detail's controller credential on the platform path, or the attempt bearer
+// from the spawn environment on the local path. A local detail carries no
+// controller credential by design, so without this the default is empty and
+// the Poster falls back to it whenever a credential re-read fails — the
+// send then carries no Authorization header and the local receiver answers
+// 401. The credential provider still re-resolves per attempt; this default
+// only covers the fallback.
+func localPosterAuthToken(detail *daemon.SessionDetail, daemonToken string, localRuntime bool) string {
+	if localRuntime {
+		return daemonToken
+	}
+	if detail == nil {
+		return ""
+	}
+	return detail.AuthToken
 }
 
 // runAgentRun is the testable entry point for the `agent run` command.
@@ -435,6 +460,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	if opts.localRuntime {
 		credentialCache.localRuntime = true
+		// A local detail carries no controller credential by design
+		// (validateLocalAgentDetail refuses one): the worker's only
+		// credential is the attempt bearer from its spawn environment.
+		// Seed the cache with it so the first send carries a bearer
+		// before any re-read runs — without this the first replay sends
+		// no Authorization header and the receiver answers 401.
 		credentialCache.authToken = daemonToken
 	}
 
@@ -505,10 +536,11 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if opts.localRuntime {
 		callbackClient = localCallbackClient(30 * time.Second)
 	}
+	posterAuthToken := localPosterAuthToken(detail, daemonToken, opts.localRuntime)
 	poster, err := result.NewPoster(result.Options{
 		HTTPClient:         callbackClient,
 		PlatformURL:        detail.PlatformURL,
-		AuthToken:          detail.AuthToken,
+		AuthToken:          posterAuthToken,
 		WorkerID:           detail.WorkerID,
 		CredentialProvider: credentialCache.resultCredentials,
 	})
@@ -692,6 +724,22 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 func donmaiSpanTracingEnabled() bool {
 	v := strings.TrimSpace(os.Getenv("DONMAI_OTEL_TRACES"))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// keepFailedWorktreeFromEnv reports whether this worker should keep a
+// failed session's worktree on disk: the --preserve-worktree default when
+// the flag is not passed explicitly. The spawning daemon states
+// DONMAI_KEEP_FAILED_WORKTREE from its keepFailedWorktrees setting; an
+// operator-exported value reaches the worker the same way. Anything else —
+// including unset — tears the worktree down once the rescue has archived
+// its unpublished work, so idle disk use stays bounded to live sessions.
+// getenv is os.Getenv in production and a test double under test.
+func keepFailedWorktreeFromEnv(getenv func(string) string) bool {
+	if getenv == nil {
+		return false
+	}
+	v := strings.TrimSpace(getenv(runtimeenv.KeepFailedWorktreeEnv))
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
@@ -1338,11 +1386,10 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// comment for how PreferServer routes between them. Gemini is a
 		// full streaming impl against generativelanguage.googleapis.com.
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
-		// agy-cli is a LOCAL/HOST-SESSION/OAUTH provider wrapping the Antigravity `agy` CLI under a pty.
-		// It is the SUBSCRIPTION/no-key local-Gemini path (the user's own OAuth-authed agy on the user's
-		// own machine). Distinct from the API-direct "gemini" provider. Requires `agy` installed AND
-		// logged in on the host PATH. NOT for cloud sandboxes.
-		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
+		// muse is registration-only until the harness proves a live
+		// turn: the constructor probes the binary + minimum version
+		// and warns-and-skips when absent, mirroring pi.
+		{name: "muse", new: func() (agent.Provider, error) { return providermuse.New(providermuse.Options{}) }},
 		// opencode's PreferServer threads the resolved profile's Lane-B
 		// signal (opencodeCtorHints above) so a `donmai agent run` session
 		// can select the serve/HTTP adapter (07 §2 Lane B) instead of
@@ -1488,6 +1535,7 @@ func kitScanPaths() []string {
 // runner.ReconcileResolvedProfile below) rather than reaching the runner's
 // Spec.
 func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(d.SessionID, d.CoAuthorName, d.CoAuthorEmail)
 	qw := runner.QueuedWork{
 		AdmissionReceipt:        bytes.Clone(d.AdmissionReceipt),
 		ClaimReceipt:            bytes.Clone(d.ClaimReceipt),
@@ -1533,6 +1581,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			Skills:               detailSkills(d.Skills),
 			MemoryBlock:          d.MemoryBlock,
 			ContinuePullRequest:  detailContinuePullRequest(d.ContinuePullRequest),
+			Delivery:             detailDeliveryPolicy(d.Delivery),
 			Mode:                 d.Mode,
 			InitialPrompt:        d.InitialPrompt,
 			RecordingEnabled:     d.RecordingEnabled,
@@ -1546,6 +1595,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		Branch:                d.Branch,
 		WorkerID:              d.WorkerID,
 		AuthToken:             d.AuthToken,
+		CoAuthorName:          coAuthorName,
+		CoAuthorEmail:         coAuthorEmail,
 		McpAuthToken:          d.McpAuthToken,
 		McpAuthTokenExpiresAt: d.McpAuthTokenExpiresAt,
 		PlatformURL:           d.PlatformURL,
@@ -1580,7 +1631,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID ||
 			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) ||
-			!reflect.DeepEqual(detailContinuePullRequest(d.ContinuePullRequest), admitted.ContinuePullRequest) {
+			!reflect.DeepEqual(detailContinuePullRequest(d.ContinuePullRequest), admitted.ContinuePullRequest) ||
+			!reflect.DeepEqual(detailDeliveryPolicy(d.Delivery), admitted.Delivery) {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
 		}
 		if d.AgentCardID != admitted.AgentCardID || d.AgentCardName != admitted.AgentCardName {
@@ -1604,6 +1656,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		// line a no-op — it is the tag change, not the decoder, that this
 		// guards against, exactly as for AuthToken/PlatformURL above.
 		qw.McpAuthToken, qw.McpAuthTokenExpiresAt = d.McpAuthToken, d.McpAuthTokenExpiresAt
+		qw.CoAuthorName, qw.CoAuthorEmail = coAuthorName, coAuthorEmail
 		qw.Capabilities = d.Capabilities
 		// The detail is authoritative for this per-work policy flag just as
 		// it is for credentials: the receipted payload wins only when it
@@ -1757,6 +1810,21 @@ func detailContinuePullRequest(in *daemon.PollContinuePullRequest) *prompt.Conti
 	}
 }
 
+// detailDeliveryPolicy re-types the daemon's PollDeliveryPolicy mirror
+// into the runner-consumable prompt.DeliveryPolicy. Nil in returns nil
+// so the omitempty round-trip is faithful: absent stays absent and the
+// runner keeps today's delivery behaviour.
+func detailDeliveryPolicy(in *daemon.PollDeliveryPolicy) *prompt.DeliveryPolicy {
+	if in == nil {
+		return nil
+	}
+	return &prompt.DeliveryPolicy{
+		AllowDraft:        in.AllowDraft,
+		AllowMergeCommits: in.AllowMergeCommits,
+		AllowCleanMerge:   in.AllowCleanMerge,
+	}
+}
+
 // detailSeatBudget re-types the daemon's per-seat budget mirror into the
 // runner-consumable shape. Nil stays nil: budgeting off means the seat
 // spawns exactly as before.
@@ -1794,7 +1862,7 @@ func detailSkills(in []daemon.PollSkill) []prompt.SkillSpec {
 // pre-run display and gateway metadata. The runner's harness admission remains
 // the only authoritative runtime selection.
 //
-// Display order: ModelProfile.ProviderID → the historical `agy` projection →
+// Display order: ModelProfile.ProviderID → the historical harness projection →
 // ResolvedProfile.Provider → ResolvedProfile.Runner → default claude. Unknown
 // explicit harnesses may fall through here for display only; runner admission
 // still denies them and never follows this compatibility chain.
@@ -1805,9 +1873,6 @@ func providerNameFromDetail(d *daemon.SessionDetail) string {
 	if d.ResolvedProfile == nil {
 		return string(agent.ProviderClaude)
 	}
-	if name, ok := harnessToProviderName(d.ResolvedProfile.Harness); ok {
-		return name
-	}
 	if d.ResolvedProfile.Provider != "" {
 		return d.ResolvedProfile.Provider
 	}
@@ -1815,19 +1880,6 @@ func providerNameFromDetail(d *daemon.SessionDetail) string {
 		return d.ResolvedProfile.Runner
 	}
 	return string(agent.ProviderClaude)
-}
-
-// harnessToProviderName handles the one historical pre-run projection needed
-// for Antigravity logs/gateway metadata. It is not an admission selector: an
-// unrecognized token returns ("", false), while the runner independently
-// denies unknown explicit harness intent instead of following this fallback.
-func harnessToProviderName(harness string) (string, bool) {
-	switch harness {
-	case "agy":
-		return string(agent.ProviderAGYCLI), true
-	default:
-		return "", false
-	}
 }
 
 // emitResultJSON writes the runner.Result as a single newline-

@@ -265,8 +265,11 @@ type Options struct {
 	ProviderStallRetries int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
-	// failed Run for debugging. Defaults to true in v0.5.0 per F.1.1
-	// §10 Q7 — flip to false after smoke-harness confidence is high.
+	// failed Run for debugging. The operator surface is opt-in: `agent run
+	// --preserve-worktree` defaults to false and the daemon's
+	// keepFailedWorktrees setting answers it per worker. Either way, a
+	// failed teardown first archives unpublished work to the rescue
+	// directory (see preserveUnpublishedWork).
 	PreserveWorktreeOnFailure bool
 
 	// PreserveWorktreeAlways keeps the worktree on disk after every
@@ -293,6 +296,12 @@ type Options struct {
 	// HeartbeatInterval overrides the per-session heartbeat cadence.
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
+
+	// StepHeartbeatInterval overrides the per-session step-heartbeat
+	// cadence. Zero falls back to runtime/stepheartbeat.DefaultInterval.
+	// Tests use it to compress liveness timing without touching the
+	// ownership pulse.
+	StepHeartbeatInterval time.Duration
 
 	// SpanEmissionEnabled explicitly enables the additive per-call span
 	// pipeline. Platform dispatchers may instead advertise
@@ -421,9 +430,9 @@ type Options struct {
 	RescueDir string
 
 	// DepsExecer runs the post-acquire repository dependency install
-	// step (loop.go step 2b-bis). Nil uses the same local in-box shell
-	// executor as kit provisioning. Tests substitute a fake to assert
-	// the install command, working directory and order without
+	// step (loop.go step 2b-bis). Nil uses direct execution with a minimal
+	// environment and bounded process-group cleanup. Tests substitute a fake
+	// to assert the install command, working directory and order without
 	// running real installs.
 	DepsExecer DepsExecer
 
@@ -473,21 +482,19 @@ type KitSkillDetector func(repoRoot, targetOS string) ([]kit.KitSkillSource, err
 type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error)
 
 // ShimSeatConfig identifies one shim-owned seat to the runner: the attempt
-// is the launch contract's monotonic per-session incarnation counter, and it
-// disambiguates repeated runs of the same session in the standalone outbox
-// key. Zero is a valid first attempt; the zero value of the POINTER (nil)
-// is what disables the behaviour.
+// is the session-scoped terminal sequence the runner assigns to its terminal
+// body — 1 for the runner's own terminal status — so the key stays fixed
+// across shim resumes. Zero is never a valid attempt; the zero value of the
+// POINTER (nil) is what disables the behaviour.
 type ShimSeatConfig struct {
-	// Attempt is the per-session incarnation counter from the shim launch
-	// contract (sessionshim Launch.ProcessEpoch).
+	// Attempt is the session-scoped terminal sequence for the outbox key.
 	Attempt uint64
 }
 
 // DepsExecer runs repository dependency install commands against
 // the acquired worktree. It mirrors kit.Execer so the dependency
-// install step reuses the same local in-box shell execution as kit
-// provisioning. Production code leaves Options.DepsExecer nil and
-// gets shellExecer; tests substitute a fake.
+// install step can use the existing test seam. Production code leaves
+// Options.DepsExecer nil and gets the direct dependency installer.
 type DepsExecer = kit.Execer
 
 // Runner is the long-lived per-daemon orchestrator. Build one via
@@ -587,6 +594,16 @@ type Runner struct {
 	quotaReportersMu sync.Mutex
 	quotaReporters   map[string]*QuotaReporter
 
+	// interactiveUsage holds the live per-session transcript-tail usage
+	// totals, keyed by session id. An interactive dispatch registers its
+	// totals before supervising the PTY so the step-heartbeat emitter
+	// (wired in runLoop before the dispatch) reads the same running
+	// total the terminal report carries; the entry is released when the
+	// dispatch returns. Guarded by interactiveUsageMu; the totals value
+	// itself is concurrency-safe.
+	interactiveUsageMu sync.Mutex
+	interactiveUsage   map[string]*interactiveUsageTotals
+
 	// shimSeat is Options.ShimSeat (see its doc comment). Nil disables
 	// the standalone outbox persist; non-nil persists every terminal
 	// status body before the first send.
@@ -646,6 +663,7 @@ func New(opts Options) (*Runner, error) {
 		skipSteering:                     opts.SkipSteering,
 		skipPostSession:                  opts.SkipPostSession,
 		hbInterval:                       opts.HeartbeatInterval,
+		stepHeartbeatInterval:            opts.StepHeartbeatInterval,
 		spanEmissionEnabled:              opts.SpanEmissionEnabled,
 		spanEndpointPath:                 opts.SpanEndpointPath,
 		kitSkillSources:                  opts.KitSkillSources,
@@ -669,6 +687,7 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
 		quotaReporterForSession:          opts.QuotaReporterForSession,
 		quotaReporters:                   map[string]*QuotaReporter{},
+		interactiveUsage:                 map[string]*interactiveUsageTotals{},
 		shimSeat:                         opts.ShimSeat,
 	}
 	if r.envc == nil {
@@ -785,10 +804,13 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
 	r.checkpointProviderError(qw, res)
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
-	// Never delete work that exists nowhere else. An interactive session has
-	// its own publication check below, which retains an unpublished workarea.
+	// Never delete work that exists nowhere else: a teardown first archives
+	// every checkout's unpublished work under the rescue directory, and keeps
+	// the workarea when the archive cannot be written. Interactive sessions
+	// take the same path except on the completed path, where the publication
+	// hold below already retains an unpublished workarea.
 	retainUnpreserved := false
-	if teardownRequired && !qw.isInteractive() && !r.preserveUnpublishedWork(qw, res) {
+	if teardownRequired && (!qw.isInteractive() || res == nil || res.Status != "completed") && !r.preserveUnpublishedWork(qw, res) {
 		teardownRequired = false
 		retainUnpreserved = true
 	}
@@ -893,16 +915,18 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// unlike the lease path, where a missing hold means the successful
 	// workarea cannot be proved retained and the seat must fail.
 	standalonePrepared := false
-	if r.shimSeat != nil && res.Status != "" {
-		standaloneBody := preparedStatusBody
-		if !leasePrepared {
-			var bodyErr error
-			standaloneBody, bodyErr = r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
-			if bodyErr != nil {
-				r.logger.Warn("standalone terminal status body not persisted; sending without replay",
-					"sessionId", qw.SessionID, "err", bodyErr)
-				standaloneBody = nil
-			}
+	// A terminal body lives in exactly one record. When the lease path
+	// already prepared the body, the standalone outbox stays empty: the
+	// lease-bound record owns the replay. Persisting both would leave two
+	// records for one session, and the lease loop plus the standalone
+	// loop would send the same terminal twice if the runner died before
+	// the first send.
+	if r.shimSeat != nil && res.Status != "" && !leasePrepared {
+		standaloneBody, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+		if bodyErr != nil {
+			r.logger.Warn("standalone terminal status body not persisted; sending without replay",
+				"sessionId", qw.SessionID, "err", bodyErr)
+			standaloneBody = nil
 		}
 		if standaloneBody != nil {
 			standaloneDigest, identityErr := stableTerminalResultID(qw.SessionID, res.Result)
@@ -915,7 +939,11 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 			} else if _, saveErr := r.wt.SaveStandaloneTerminalOutbox(context.Background(), workarea.StandaloneOutboxSaveSpec{
 				SessionID: qw.SessionID, Attempt: r.shimSeat.Attempt, TerminalResultID: standaloneDigest,
 				ReceiverKey: r.poster.ReceiverKey(), Body: standaloneBody,
-				DeadlineAt: r.now().Add(workarea.MaximumLeaseDuration).UTC().Truncate(time.Millisecond),
+				// The record's own delivery bound, not a borrowed lease
+				// duration: a daemon back after the lease window must
+				// still replay an unsent terminal rather than
+				// dead-letter it on arrival.
+				DeadlineAt: r.now().Add(workarea.StandaloneOutboxDeadline).UTC().Truncate(time.Millisecond),
 				Kind:       workarea.StandaloneOutboxTerminal,
 			}); saveErr != nil {
 				r.logger.Warn("standalone terminal status body not persisted; sending without replay",

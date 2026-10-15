@@ -39,12 +39,12 @@ func TestExecutionSecurityRenderMatrix(t *testing.T) {
 	)
 	best, none := agent.DenyBaselineBestEffort, agent.DenyBaselineUnavailable
 	wantDenyBaseline := map[agent.HarnessName]map[agent.PromptSessionMode]agent.DenyBaselineStatus{
-		agent.HarnessClaudeCode:   {auto: best, human: none},
+		agent.HarnessClaudeCode:   {auto: best, human: best},
 		agent.HarnessCodex:        {auto: best, human: none},
 		agent.HarnessGeminiDirect: {auto: best},
+		agent.HarnessMuse:         {auto: best},
 		agent.HarnessOpenCode:     {auto: best},
 		agent.HarnessPi:           {auto: best, human: best},
-		agent.HarnessAntigravity:  {auto: none},
 		agent.HarnessOllama:       {auto: none},
 		agent.HarnessShell:        {human: none},
 		agent.HarnessStub:         {auto: none, human: none},

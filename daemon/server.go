@@ -366,7 +366,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
 		SessionShim:             s.daemon.SessionShimDiagnostics(),
 		ProcessPriority:         daemonProcessPriorityStatus(),
-		SeatBudget:              seatBudgetReport(s.daemon.daemonSeatBudget()),
+		SeatBudget:              seatBudgetReportWithQoS(s.daemon.daemonSeatBudget(), s.daemon.daemonSeatQoS()),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)
@@ -453,6 +453,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		EnabledProjectIDs:    enabledProjectIDs,
 		AppliedProjectIDs:    appliedIDs,
 		ProjectAdmissionMode: cfg.EffectiveProjectAdmissionMode(),
+		RepoKeeper:           s.daemon.repoKeeperStats(),
 	}
 	if withPool {
 		stats, err := s.poolStats(r.Context())
@@ -474,6 +475,83 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		}}
 	}
 	writeJSON(w, http.StatusOK, &resp)
+}
+
+// repoKeeperSetKeys are the process-level keeper keys accepted by POST
+// /api/daemon/capacity. They persist to daemon.yaml and need a drain-aware
+// restart; the daemon acknowledges but does not hot-reload them.
+var repoKeeperSetKeys = map[string]struct{}{
+	"repoKeeper.enabled":                    {},
+	"repoKeeper.maxDiskGb":                  {},
+	"repoKeeper.fetchIntervalSeconds":       {},
+	"repoKeeper.authorizationWindowSeconds": {},
+}
+
+// applyRepoKeeperSet persists one repoKeeper.* key to the in-memory config.
+// It reports false when no config is loaded. The running keeper never
+// re-reads these — they take effect on a drain-aware restart.
+func (d *Daemon) applyRepoKeeperSet(key string, n int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.config == nil {
+		return false
+	}
+	switch key {
+	case "repoKeeper.enabled":
+		d.config.RepoKeeper.Enabled = n == 1
+	case "repoKeeper.maxDiskGb":
+		d.config.RepoKeeper.MaxDiskGb = n
+	case "repoKeeper.fetchIntervalSeconds":
+		d.config.RepoKeeper.FetchIntervalSeconds = n
+	case "repoKeeper.authorizationWindowSeconds":
+		d.config.RepoKeeper.AuthorizationWindowSeconds = n
+	default:
+		return false
+	}
+	return true
+}
+
+// applyUsagePingEnabled mirrors a `host set usagePing.enabled` change
+// into the live config. Enabling never mints here — the id comes from
+// daemon.yaml (minted by setup or by the CLI's set path). Reports
+// false when no config is loaded.
+func (d *Daemon) applyUsagePingEnabled(enabled bool) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.config == nil {
+		return false
+	}
+	d.config.UsagePing.Enabled = enabled
+	if !enabled {
+		d.config.UsagePing.InstallationID = ""
+		d.config.UsagePing.Endpoint = ""
+	}
+	return true
+}
+
+// applyUsagePingEndpoint mirrors a `host set usagePing.endpoint`
+// change into the live config. Reports false when no config is loaded.
+func (d *Daemon) applyUsagePingEndpoint(endpoint string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.config == nil {
+		return false
+	}
+	d.config.UsagePing.Endpoint = endpoint
+	return true
+}
+
+// repoKeeperStats returns the daemon's secret-free keeper snapshot for
+// daemon stats, or nil when the keeper is disabled. No scope values or
+// remote URLs ever appear here.
+func (d *Daemon) repoKeeperStats() *afclient.RepoKeeperStats {
+	d.mu.RLock()
+	keeper := d.repoKeeper
+	d.mu.RUnlock()
+	if keeper == nil {
+		return nil
+	}
+	return keeper.Stats()
 }
 
 func (s *Server) handlePause(w http.ResponseWriter, _ *http.Request) {
@@ -635,10 +713,37 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The usage-count consent rides the same endpoint: `host set
+	// usagePing.*` persists to daemon.yaml in the CLI and notifies the
+	// running daemon here so the change takes effect without a
+	// restart. The endpoint is a free-form string (not an integer),
+	// so this branch runs before integer parsing.
+	if strings.HasPrefix(body.Key, "usagePing.") {
+		s.handleSetUsagePing(w, body.Key, body.Value)
+		return
+	}
 	n, err := strconv.Atoi(body.Value)
 	if err != nil || n < 0 {
 		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
 			OK: false, Key: body.Key, Value: body.Value, Message: "value must be non-negative integer",
+		})
+		return
+	}
+	if _, ok := repoKeeperSetKeys[body.Key]; ok {
+		if body.Key == "repoKeeper.enabled" && n > 1 {
+			writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+				OK: false, Key: body.Key, Value: body.Value, Message: "repoKeeper.enabled must be 0 or 1",
+			})
+			return
+		}
+		if !s.daemon.applyRepoKeeperSet(body.Key, int64(n)) {
+			writeJSON(w, http.StatusInternalServerError, &afclient.SetCapacityResponse{
+				OK: false, Key: body.Key, Value: body.Value, Message: "daemon has no loaded config",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
+			OK: true, Key: body.Key, Value: body.Value, Message: "persisted; restart the daemon with drained work for it to take effect",
 		})
 		return
 	}
@@ -676,6 +781,56 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
 		OK: true, Key: body.Key, Value: body.Value, Message: "applied",
 	})
+}
+
+// handleSetUsagePing applies one usagePing.* key to the live config.
+// The CLI already persisted the change to daemon.yaml; this mirrors it
+// into memory so the scheduler loop picks it up without a restart.
+// Disabling additionally cancels any queued attempt state.
+func (s *Server) handleSetUsagePing(w http.ResponseWriter, key, value string) {
+	switch key {
+	case "usagePing.enabled":
+		n, err := strconv.Atoi(value)
+		if err != nil || (n != 0 && n != 1) {
+			writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "usagePing.enabled must be 0 or 1",
+			})
+			return
+		}
+		if !s.daemon.applyUsagePingEnabled(n == 1) {
+			writeJSON(w, http.StatusInternalServerError, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "daemon has no loaded config",
+			})
+			return
+		}
+		if n == 0 {
+			cancelUsagePing(DefaultUsagePingStatePath())
+		}
+		writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
+			OK: true, Key: key, Value: value, Message: "applied",
+		})
+	case "usagePing.endpoint":
+		endpoint := strings.TrimSpace(value)
+		if endpoint != "" && !strings.HasPrefix(endpoint, "https://") {
+			writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "usagePing.endpoint must be an https URL or empty",
+			})
+			return
+		}
+		if !s.daemon.applyUsagePingEndpoint(endpoint) {
+			writeJSON(w, http.StatusInternalServerError, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "daemon has no loaded config",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
+			OK: true, Key: key, Value: value, Message: "applied",
+		})
+	default:
+		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+			OK: false, Key: key, Value: value, Message: "unknown key",
+		})
+	}
 }
 
 func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {

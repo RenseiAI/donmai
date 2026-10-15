@@ -26,7 +26,10 @@
 //	The plist sets KeepAlive=<dict><SuccessfulExit><false/><Crashed><true/></dict>:
 //	launchd restarts on a non-zero exit (crash, OOM, panic) but NOT after a
 //	clean `daemon run` returning 0 (operator-initiated stops stick). A 30s
-//	ThrottleInterval prevents rapid-restart storms on crash loops.
+//	ThrottleInterval prevents rapid-restart storms on crash loops. The
+//	unconfigured first run is not a crash: the setup refusal exits clean on
+//	macOS, so KeepAlive parks the job until the operator runs setup and
+//	reloads it instead of respawning it about every ThrottleInterval.
 //
 // Durability contract (session-hosting daemons):
 //
@@ -62,17 +65,15 @@ import (
 // ── Constants ────────────────────────────────────────────────────────────────
 
 // LaunchdLabel is the OSS daemon's launchd label — used in the plist and as
-// the launchctl service ID for the `donmai` binary.
-//
-// Closed-source rensei-tui keeps its own label (dev.rensei.daemon) so that
-// `donmai daemon install` and `rensei daemon install` never clobber each
-// other's service registrations.
+// the launchctl service ID for the `donmai` binary. Downstream binaries
+// keep their own labels so parallel installs never clobber each other's
+// service registrations; this installer only ever writes its own label.
 const LaunchdLabel = "dev.donmai.daemon"
 
-// RenseiDaemonLabel is the launchd label used by the closed-source `rensei`
-// binary (rensei-tui). Exported so rensei-tui can reference the canonical
-// value without duplicating the string literal. Must never be used by the
-// OSS donmai installer — keep the two registrations disjoint.
+// RenseiDaemonLabel is the launchd label used by a downstream embedding
+// binary. Exported so embedders can reference the canonical value without
+// duplicating the string literal. Must never be used by the OSS donmai
+// installer — keep the two registrations disjoint.
 const RenseiDaemonLabel = "dev.rensei.daemon"
 
 // ExitTimeOutSeconds is the launchd ExitTimeOut written into the generated
@@ -159,6 +160,13 @@ type InstallOptions struct {
 	// SkipLaunchctl skips the `launchctl bootstrap` call after writing the
 	// plist (useful for tests / CI).
 	SkipLaunchctl bool
+
+	// ConfigPath is the daemon config path to ensure before writing the
+	// plist: the fresh-host config is seeded when absent, an existing
+	// config is validated and left untouched. Empty means the daemon
+	// default (~/.donmai/daemon.yaml). Without it the agent-mode start
+	// would run the interactive wizard and crash-loop on a fresh host.
+	ConfigPath string
 
 	// Runner is an optional command runner for tests; nil means run real
 	// commands via os/exec.
@@ -248,6 +256,9 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 //   - KeepAlive (dict)       — SuccessfulExit=false. See restart-contract
 //     note at the top of the file.
 //   - ThrottleInterval = 30  — crash restart throttle (prevents storms).
+//     The unconfigured first run does NOT spin on it: the setup refusal
+//     exits clean on macOS, which SuccessfulExit=false parks instead of
+//     respawning (see the restart contract above).
 //   - StandardOutPath / Err  — routes stdio to ~/Library/Logs/<brand>/.
 //   - EnvironmentVariables   — sets HOME and PATH.
 func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
@@ -448,15 +459,20 @@ type InstallResult struct {
 //
 // Steps:
 //  1. Resolve the host binary path.
-//  2. Create ~/Library/Logs/<brand>/ if missing.
-//  3. Write the plist.
-//  4. Run `launchctl bootstrap gui/<uid> <plist>` unless skipped.
+//  2. Ensure a loadable daemon config exists (seed or validate).
+//  3. Create ~/Library/Logs/<brand>/ if missing.
+//  4. Write the plist.
+//  5. Run `launchctl bootstrap gui/<uid> <plist>` unless skipped.
 //
 // Note: we use `launchctl bootstrap` (modern, supported on macOS 10.10+)
 // instead of the deprecated `launchctl load -w`.
 func Install(opts InstallOptions) (InstallResult, error) {
 	hostBin, err := ResolveHostBinPath(opts.HostBinPath)
 	if err != nil {
+		return InstallResult{}, err
+	}
+
+	if _, err := EnsureFreshHostConfig(opts.ConfigPath); err != nil {
 		return InstallResult{}, err
 	}
 

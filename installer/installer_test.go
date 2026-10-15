@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/installer/servicepriority"
+	"github.com/RenseiAI/donmai/installer/systemd"
 )
 
 func TestInstall_SkipServiceManager(t *testing.T) {
@@ -287,5 +288,52 @@ func TestDoctor_NoServiceInstalled(t *testing.T) {
 	}
 	if res.Installed {
 		t.Errorf("expected Installed=false on a fresh tmp HOME")
+	}
+}
+
+// TestDoctor_ReportSurfacesPendingMigration pins the dispatcher half: the
+// Linux report forwards the systemd pending-migration detail instead of
+// reading healthy. systemd.Doctor is OS-independent (HOME-scoped paths plus
+// an injected runner), so this runs on every host even though the
+// dispatcher itself dispatches on runtime.GOOS.
+func TestDoctor_ReportSurfacesPendingMigration(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Seed through the systemd package's own legacy filename so the test
+	// tracks the production constant without spelling the retired literal.
+	legacySeeded := filepath.Join(unitDir, systemd.LegacyUnitFilename())
+	if err := os.WriteFile(legacySeeded, []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
+		t.Fatalf("seed legacy unit: %v", err)
+	}
+	res, err := systemd.Doctor(systemd.DoctorOptions{Scope: systemd.ScopeUser, SkipSystemctl: true})
+	if err != nil {
+		t.Fatalf("systemd.Doctor: %v", err)
+	}
+	if res.UnitExists {
+		t.Errorf("UnitExists must be false with only the legacy unit on disk")
+	}
+	if res.LegacyUnit != legacySeeded {
+		t.Errorf("LegacyUnit = %q, want %q", res.LegacyUnit, legacySeeded)
+	}
+	rep, err := Doctor(DoctorOptions{Scope: ScopeUser, SkipServiceManager: true})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if runtime.GOOS == "linux" {
+		if rep.Installed {
+			t.Errorf("Installed must be false with only the legacy unit on disk")
+		}
+		if !strings.Contains(rep.Detail, legacySeeded) {
+			t.Errorf("Detail must name the pending migration %q, got %q", legacySeeded, rep.Detail)
+		}
+		if !strings.Contains(rep.Detail, "host install") {
+			t.Errorf("Detail must point at the migration command, got %q", rep.Detail)
+		}
 	}
 }

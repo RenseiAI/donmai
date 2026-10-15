@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -83,7 +84,7 @@ type CredentialHelper struct {
 //
 // The retired per-repository clone override is not modelled here. Files that
 // still carry the key keep loading; ReadDaemonYAML logs one deprecation
-// warning per file and the value is ignored. Writers never emit the key.
+// warning per process and the value is ignored. Writers never emit the key.
 type ProjectEntry struct {
 	// ID is the daemon-side project identifier. The daemon reader requires
 	// projects[i].id (see daemon/config.go validateConfig); DeriveProjectID
@@ -121,7 +122,7 @@ type RepositoryEntry struct {
 //
 // The retired `cloneStrategy` key is not decoded: files that still carry it
 // keep loading and the value is ignored. ReadDaemonYAML logs one deprecation
-// warning per file, so this decoder stays silent.
+// warning per process, so this decoder stays silent.
 func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
 		ID               string            `yaml:"id"`
@@ -159,6 +160,20 @@ type CapacityConfig struct {
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
 }
 
+// RepoKeeperYAML is the in-memory representation of the daemon.yaml
+// `repoKeeper` block. Process-level: a change needs a drain-aware restart.
+type RepoKeeperYAML struct {
+	// Enabled gates keeper construction. Default off.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxDiskGb caps total mirror disk usage in GiB. 0 means no limit.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+	// FetchIntervalSeconds bounds how often a mirror is re-fetched.
+	FetchIntervalSeconds int64 `yaml:"fetchIntervalSeconds,omitempty" json:"fetchIntervalSeconds,omitempty"`
+	// AuthorizationWindowSeconds bounds how long a resolved authorization
+	// is honored.
+	AuthorizationWindowSeconds int64 `yaml:"authorizationWindowSeconds,omitempty" json:"authorizationWindowSeconds,omitempty"`
+}
+
 // DaemonYAML is the in-memory representation of ~/.donmai/daemon.yaml.
 // Only the fields relevant to the project command tree are modelled here;
 // unknown top-level keys are preserved via the yaml decoder's pass-through.
@@ -182,6 +197,9 @@ type DaemonYAML struct {
 	Projects []ProjectEntry `yaml:"projects,omitempty"`
 	// Capacity holds the configurable resource limits for the daemon.
 	Capacity CapacityConfig `yaml:"capacity,omitempty"`
+	// RepoKeeper holds the per-host repository-keeper tunables. Process-level:
+	// a change needs a drain-aware restart.
+	RepoKeeper RepoKeeperYAML `yaml:"repoKeeper,omitempty"`
 }
 
 // ProjectAdmissionVersionV2 marks enabledProjectIds as authoritative.
@@ -209,26 +227,38 @@ func NormalizeProjectAdmissionMode(mode string) string {
 	return ProjectAdmissionModeEnumerated
 }
 
-// retiredCloneStrategyWarning is the single deprecation notice logged when
-// a read encounters the retired per-repository clone override. The key is
-// ignored; the warning tells operators to drop it.
-const retiredCloneStrategyWarning = "daemon.yaml: 'cloneStrategy' is retired and ignored; remove the key"
+// retiredCloneStrategyWarning names the retired per-repository clone
+// override. The key is ignored; the warning tells operators to drop it.
+// The message is composed per emission (see
+// warnOnceRetiredCloneStrategy) so it can name the file and the count of
+// affected entries.
+const retiredCloneStrategyWarning = "'cloneStrategy' is retired and ignored; remove the key"
 
-// warnIfRetiredCloneStrategyPresent logs exactly one deprecation warning
-// when the raw file still carries the retired key on any entry. The typed
-// decoder ignores the key, so detection runs on the raw mapping tree.
-func warnIfRetiredCloneStrategyPresent(data []byte) {
+// retiredCloneStrategyWarnOnce guards the deprecation notice so a single
+// process emits it at most once, no matter how many times the config is
+// read (a status-style command may parse the file many times per run).
+// Tests that need a fresh emission reset it via
+// ResetRetiredCloneStrategyWarningForTest.
+var retiredCloneStrategyWarnOnce sync.Once
+
+// countRetiredCloneStrategyKeys reports how many entries under the
+// projects and repositories sequences still carry the retired key. The
+// typed decoder ignores the key, so detection runs on the raw mapping
+// tree.
+func countRetiredCloneStrategyKeys(data []byte) int {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return
+		return 0
 	}
 	root := &doc
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		root = root.Content[0]
 	}
 	if root.Kind != yaml.MappingNode {
-		return
+		return 0
 	}
+	count := 0
+	seen := make(map[int]struct{})
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		key := root.Content[i]
 		if key.Kind != yaml.ScalarNode {
@@ -254,12 +284,39 @@ func warnIfRetiredCloneStrategyPresent(data []byte) {
 			}
 			for j := 0; j+1 < len(item.Content); j += 2 {
 				if item.Content[j].Kind == yaml.ScalarNode && item.Content[j].Value == "cloneStrategy" {
-					slog.Warn(retiredCloneStrategyWarning)
-					return
+					// One entry counts once even when reached through a
+					// YAML alias that appears several times.
+					if _, ok := seen[item.Content[j].Line]; !ok {
+						seen[item.Content[j].Line] = struct{}{}
+						count++
+					}
+					break
 				}
 			}
 		}
 	}
+	return count
+}
+
+// warnOnceRetiredCloneStrategy logs the deprecation notice at most once
+// per process, naming the file and the count of affected entries.
+func warnOnceRetiredCloneStrategy(path string, count int) {
+	if count <= 0 {
+		return
+	}
+	retiredCloneStrategyWarnOnce.Do(func() {
+		slog.Warn("daemon.yaml: "+retiredCloneStrategyWarning,
+			"path", path,
+			"entries", count,
+		)
+	})
+}
+
+// ResetRetiredCloneStrategyWarningForTest re-arms the once-per-process
+// deprecation notice so tests can observe the emission in isolation from
+// one another and from read order. Production code must not call it.
+func ResetRetiredCloneStrategyWarningForTest() {
+	retiredCloneStrategyWarnOnce = sync.Once{}
 }
 
 // ── default path ─────────────────────────────────────────────────────────────
@@ -291,9 +348,10 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 		return nil, fmt.Errorf("parse daemon config %q: %w", path, err)
 	}
 	// The retired clone override is not part of the typed schema, so its
-	// presence is detected on the raw document: one warning per read no
-	// matter how many entries still carry the key.
-	warnIfRetiredCloneStrategyPresent(data)
+	// presence is detected on the raw document: one warning per process no
+	// matter how many entries still carry the key or how often the file
+	// is read.
+	warnOnceRetiredCloneStrategy(path, countRetiredCloneStrategyKeys(data))
 	cfg.normalizeProjectContract()
 	return &cfg, nil
 }
@@ -319,6 +377,7 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 }
 
 type capacityWriteIntent struct {
+	block string
 	key   string
 	value int
 }
@@ -332,18 +391,21 @@ func WriteDaemonYAMLWithCapacity(path string, cfg *DaemonYAML, key string, value
 		return fmt.Errorf("daemon config is required")
 	}
 	var field string
+	var block string
 	switch key {
 	case "capacity.maxConcurrentSessions":
-		field = "maxConcurrentSessions"
+		block, field = "capacity", "maxConcurrentSessions"
 	case "capacity.poolMaxDiskGb":
-		field = "poolMaxDiskGb"
+		block, field = "capacity", "poolMaxDiskGb"
+	case "repoKeeper.enabled", "repoKeeper.maxDiskGb", "repoKeeper.fetchIntervalSeconds", "repoKeeper.authorizationWindowSeconds":
+		block, field = "repoKeeper", strings.TrimPrefix(key, "repoKeeper.")
 	default:
 		return fmt.Errorf("unsupported capacity key %q", key)
 	}
 	if value < 0 {
 		return fmt.Errorf("%s must be >= 0", key)
 	}
-	return writeDaemonYAML(path, cfg, &capacityWriteIntent{key: field, value: value})
+	return writeDaemonYAML(path, cfg, &capacityWriteIntent{block: block, key: field, value: value})
 }
 
 func writeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) error {
@@ -436,6 +498,10 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 	if err != nil {
 		return nil, fmt.Errorf("encode capacity: %w", err)
 	}
+	repoKeeperNode, err := encodeYAMLNode(cfg.RepoKeeper)
+	if err != nil {
+		return nil, fmt.Errorf("encode repoKeeper: %w", err)
+	}
 
 	if cfg.ProjectAdmissionVersion != 0 {
 		projectAdmissionVersionNode, versionErr := encodeYAMLNode(cfg.ProjectAdmissionVersion)
@@ -465,10 +531,13 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 	// The merge splices cfg-owned keys wholesale, so only unowned leftovers
 	// can still hold the key — drop it wherever it remains.
 	stripRetiredCloneStrategyKey(doc)
-	// Capacity is preserved as a partial overlay — only the cfg-modelled
-	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
-	// mapping. If no capacity key exists yet a new one is added.
-	if intent != nil {
+	// Capacity and repoKeeper are preserved as partial overlays — only the
+	// cfg-modelled fields are merged into the existing mappings. If a block
+	// key does not exist yet a new one is added.
+	if intent != nil && intent.block == "repoKeeper" {
+		upsertMappingKey(repoKeeperNode, intent.key, capacityIntentNode(intent))
+	}
+	if intent != nil && intent.block == "capacity" {
 		upsertMappingKey(capacityNode, intent.key, capacityIntentNode(intent))
 		// Preserve alias inheritance without mutating the shared anchor. The
 		// new local mapping overrides only the explicitly authored capacity.
@@ -483,6 +552,7 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) 
 		}
 	}
 	mergeMappingKey(doc, "capacity", capacityNode)
+	mergeMappingKey(doc, "repoKeeper", repoKeeperNode)
 
 	out, err := yaml.Marshal(&root)
 	if err != nil {
@@ -529,6 +599,15 @@ func stripRetiredCloneStrategyKey(doc *yaml.Node) {
 }
 
 func capacityIntentNode(intent *capacityWriteIntent) *yaml.Node {
+	// repoKeeper.enabled is a boolean: author true/false so the daemon reader
+	// decodes it. Every other key is an integer.
+	if intent.block == "repoKeeper" && intent.key == "enabled" {
+		value := "false"
+		if intent.value != 0 {
+			value = "true"
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: value}
+	}
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(intent.value)}
 }
 
@@ -539,6 +618,15 @@ func marshalDaemonYAML(cfg *DaemonYAML, intent *capacityWriteIntent) ([]byte, er
 	root, err := encodeYAMLNode(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if intent.block == "repoKeeper" {
+		repoKeeper, err := encodeYAMLNode(cfg.RepoKeeper)
+		if err != nil {
+			return nil, err
+		}
+		upsertMappingKey(repoKeeper, intent.key, capacityIntentNode(intent))
+		upsertMappingKey(root, "repoKeeper", repoKeeper)
+		return yaml.Marshal(root)
 	}
 	capacity, err := encodeYAMLNode(cfg.Capacity)
 	if err != nil {

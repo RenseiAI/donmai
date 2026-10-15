@@ -53,8 +53,8 @@ func TestSemanticFixtureCellsDecode(t *testing.T) {
 	t.Parallel()
 	fixtures := loadFixtures(t)
 	wantNames := []string{
-		"claudeSubscription", "codexSubscription", "antigravityGemini",
-		"antigravityAnthropic", "openCodeSubscription", "ollamaSubscription",
+		"claudeSubscription", "codexSubscription",
+		"openCodeSubscription", "ollamaSubscription",
 		"lmStudioNoAuth", "lmStudioApiKey", "claimBoundPool",
 	}
 	if len(fixtures.Cells) != len(wantNames) {

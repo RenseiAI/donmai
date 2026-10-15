@@ -9,8 +9,10 @@ name: upgrade-acceptance
 #
 # On this build the required record is the red one: the N+1 selection rule
 # launches only interactive seats under shim ownership, so a headless seat
-# dies with its daemon (cause headless_shim_launch_off) — the same red
-# TestUpgradeAcceptanceRed pins in-repo. Everything the red stands on is
+# would be a direct-owned child of the daemon and the restart would end it
+# (cause headless_shim_launch_off) — the same red TestUpgradeAcceptanceRed
+# pins in-repo. No seat is dispatched yet: the red is read from the
+# selection rule, never from a seat the restart ended. Everything the red stands on is
 # asserted for real first (boot, user manager, delegated controllers, the
 # toolchain go.mod requires, both artifacts, the generated unit, the restart
 # preflight, and the upgrade served from a new PID), so an infrastructure
@@ -20,6 +22,14 @@ name: upgrade-acceptance
 #
 # This job never runs on the release-train host: it builds and runs its own
 # container on the CI runner.
+#
+# The lane watches the upgrade surface, not just the harness: the driver
+# installs the daemon from the generated unit, restarts it through the
+# installer-owned unit, upgrades a live seat the runner owns, and reads
+# the shim selection rule — so a change to any of those trees can flip
+# the record without touching the harness. The nightly schedule covers
+# the orthogonal drift: a toolchain or base-image move that no file in
+# the watched trees names.
 
 on:
   push:
@@ -27,11 +37,25 @@ on:
     paths:
       - "upgradeacceptance/**"
       - ".github/workflows/upgrade-acceptance.yml"
+      - "daemon/**"
+      - "installer/**"
+      - "sessionshim/**"
+      - "runner/**"
+      - "go.mod"
+      - "go.sum"
   pull_request:
     branches: [main]
     paths:
       - "upgradeacceptance/**"
       - ".github/workflows/upgrade-acceptance.yml"
+      - "daemon/**"
+      - "installer/**"
+      - "sessionshim/**"
+      - "runner/**"
+      - "go.mod"
+      - "go.sum"
+  # Nightly: toolchain and base-image drift the file watch cannot see.
+  schedule: [{ cron: "0 6 * * *" }]
   workflow_dispatch:
 
 permissions:

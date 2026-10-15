@@ -30,6 +30,17 @@ type SelfTestOptions struct {
 	Launchers map[agent.PromptSessionMode]Launcher
 	// Timeout bounds each mode's probe run. Zero means two minutes.
 	Timeout time.Duration
+	// ProbeHandshakeTimeout bounds how long each probe pass waits for the
+	// probe child's handshake (the file the probe writes beside its plan
+	// before running any step) before failing the pass with probe_unserved.
+	// Zero means DefaultProbeHandshakeTimeout. It is deliberately separate
+	// from Timeout: a child that never serves the probe — an executable
+	// whose main opened its own interface instead of running it — must fail
+	// in seconds, not burn the whole cold-proof budget waiting for results
+	// that can never arrive. A child that exits before the bound keeps the
+	// existing accounting (its exit code and missing results), not this
+	// reason: only a child still running past the bound is unserved.
+	ProbeHandshakeTimeout time.Duration
 	// CacheDir, when set, keeps a passing self-test record on disk, so the
 	// next process on this host reuses it instead of probing again while
 	// nothing it proved has changed: the backend and its version (the
@@ -48,6 +59,19 @@ type SelfTestOptions struct {
 // DefaultSelfTestCacheTTL is how long a cached passing self-test is reused
 // when SelfTestOptions.CacheTTL is zero.
 const DefaultSelfTestCacheTTL = 24 * time.Hour
+
+// DefaultProbeHandshakeTimeout is how long each probe pass waits for the
+// probe child's handshake when SelfTestOptions.ProbeHandshakeTimeout is
+// zero. Thirty seconds is orders of magnitude above a healthy probe's
+// startup (process spawn plus one file write, even under sandbox-exec on a
+// loaded host) and four times below the per-mode proof budget, so an
+// executable that never serves the probe fails fast instead of stalling
+// every start on the full budget.
+const DefaultProbeHandshakeTimeout = 30 * time.Second
+
+// probeHandshakePollInterval is how often a probe pass checks for the
+// probe child's handshake file while the launcher runs.
+const probeHandshakePollInterval = 50 * time.Millisecond
 
 // ProbeOutcome is one probe's result in one session mode.
 type ProbeOutcome struct {
@@ -208,6 +232,13 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
+	// Resolve the handshake bound once, here, so every pass and the decoy
+	// wait on the same value. opts is this call's own copy; the cache key
+	// above was already computed from the caller's values, and the bound is
+	// not part of what a cached record proves.
+	if opts.ProbeHandshakeTimeout <= 0 {
+		opts.ProbeHandshakeTimeout = DefaultProbeHandshakeTimeout
+	}
 	if err := os.MkdirAll(opts.ScratchDir, 0o700); err != nil {
 		return SelfTestRecord{}, fmt.Errorf("confinement: self-test scratch: %w", err)
 	}
@@ -275,8 +306,9 @@ func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMod
 	fx, err := newFixture(dir, mode, fixtureHost{
 		home: c.opts.Home, stateHome: c.opts.StateHome,
 		diskImage: diskImage, diskImageErr: diskImageErr,
-		loopbackOpen: leavesLoopbackEgressOpen(c.opts.Backend),
-		probeCommand: opts.ProbeCommand,
+		loopbackOpen:   leavesLoopbackEgressOpen(c.opts.Backend),
+		probeCommand:   opts.ProbeCommand,
+		probeHandshake: opts.ProbeHandshakeTimeout,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -356,7 +388,10 @@ func (c *Confiner) probePass(ctx context.Context, in passInput) ([]ProbeOutcome,
 	}
 	env := append(plan.Environment(), in.opts.ProbeEnv...)
 	env = append(env, ProbeEnv+"="+in.planPath)
-	exitCode, launchErr := in.launcher(ctx, argv, env, in.fx.mut)
+	exitCode, launchErr, unserved := c.launchProbe(ctx, in, argv, env)
+	if unserved != nil {
+		return nil, unserved
+	}
 	if in.settle != nil {
 		in.settle()
 	}
@@ -415,6 +450,83 @@ func (c *Confiner) probePass(ctx context.Context, in passInput) ([]ProbeOutcome,
 		outcomes = append(outcomes, outcome)
 	}
 	return outcomes, nil
+}
+
+// launchOutcome is one launcher run: the child's exit code, or the launch
+// error when the child never ran to completion.
+type launchOutcome struct {
+	exit int
+	err  error
+}
+
+// launchProbe runs one probe pass's child and waits for its handshake. It
+// returns the child's exit code and launch error for the existing
+// result accounting, or a typed probe_unserved refusal when the child is
+// still running past the handshake bound without serving the probe.
+//
+// A child that exits before the bound keeps the existing accounting (its
+// exit code and missing results): only a child still running past the
+// bound is unserved. That distinction keeps a broken probe command a
+// judged failure while an executable whose main never reaches the probe —
+// an embedder interface opened under the PTY instead — fails fast instead
+// of burning the whole proof budget. The refusal surfaces as the mode's
+// setup outcome with the typed reason, so the self-test returns promptly
+// with no attestation instead of stalling.
+func (c *Confiner) launchProbe(ctx context.Context, in passInput, argv, env []string) (exitCode int, launchErr error, unserved error) {
+	bound := in.opts.ProbeHandshakeTimeout
+	if bound <= 0 {
+		bound = DefaultProbeHandshakeTimeout
+	}
+	handshake := probeHandshakePath(in.planPath)
+	// A crashed earlier pass must not satisfy this one: the handshake is
+	// per plan path, and the plan is rewritten every pass, but remove a
+	// leftover anyway so only this child can answer.
+	_ = os.Remove(handshake)
+
+	launchCtx, stopLaunch := context.WithCancel(ctx)
+	defer stopLaunch()
+	launched := make(chan launchOutcome, 1)
+	go func() {
+		exit, err := in.launcher(launchCtx, argv, env, in.fx.mut)
+		launched <- launchOutcome{exit: exit, err: err}
+	}()
+
+	deadline := time.Now().Add(bound)
+	for {
+		if _, err := os.Stat(handshake); err == nil {
+			break
+		}
+		select {
+		case out := <-launched:
+			// The child is gone before serving: account for it below
+			// exactly as before, exit code and missing results.
+			return out.exit, out.err, nil
+		case <-time.After(probeHandshakePollInterval):
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+	}
+	if _, err := os.Stat(handshake); err == nil {
+		// Served: wait out the child under the proof budget. The launch
+		// context is a child of the mode context, so its deadline still
+		// bounds this wait; stop it explicitly so a wedged launcher
+		// cannot outlive the return.
+		select {
+		case out := <-launched:
+			return out.exit, out.err, nil
+		case <-ctx.Done():
+			stopLaunch()
+			out := <-launched
+			return out.exit, out.err, nil
+		}
+	}
+	// Still running past the bound without serving: stop it and fail fast.
+	// Nothing ran, so there is nothing to settle and no result to judge.
+	stopLaunch()
+	<-launched
+	return -1, nil, refuse(ReasonProbeUnserved,
+		"the probe child emitted no handshake within %s; the executable likely does not serve the confinement probe from main", bound)
 }
 
 // toolOps run an external tool; whether the tool ran says nothing about

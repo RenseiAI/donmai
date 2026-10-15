@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,15 +58,33 @@ var linearMCPDisallowList = []string{
 //	   --output-format stream-json --verbose \
 //	   --dangerously-skip-permissions \
 //	   --add-dir <cwd> \
+//	   [--settings <routing-pin>] \
 //	   [optional flags...]
 //
 // (--print, --output-format, --verbose are required to enable the JSONL
 // stream that the JSONL parser consumes.)
 //
+// --settings carries ONLY the routing pin (see pinnedRoutingEnv), stated on
+// the layer the CLI resolves above the process environment and above repo
+// settings files: a repo-local harness setting naming a routing destination
+// (for example env.ANTHROPIC_BASE_URL) or flipping an alternate serving
+// host or naming a proxy is overridden by the pin, so the session bearer
+// stays on the session's own route. The pin cannot close repo config that
+// runs code (hooks, helpers, stdio MCP servers) — that execution surface is
+// the accepted model for a trusted repo, matching the headless lane.
+// The JSON holds no hooks — the headless lane has no notice channel — and
+// is absent entirely when the session carries no routing of its own, so a
+// host-login spawn's argv is byte-identical to before the pin existed.
+//
 // resumeSessionID is empty for fresh spawns; when non-empty it is
-// rendered as `--resume <id>`. v0.5.0 does not exercise this path
-// because SupportsSessionResume=false, but the implementation is in
-// place for the F.5 capability flip.
+// rendered as `--resume <id>` (Provider.Resume, the restore path).
+//
+// ownedSessionID is the harness-owned resume token minted at launch
+// (see session_id.go). When non-empty AND resumeSessionID is empty the
+// spawn is fresh and the token is rendered as `--session-id <id>`, so
+// the resume token is known before the first turn. A resume spawn
+// carries only `--resume`; the CLI resolves the conversation from it
+// and `--session-id` alongside would be a conflicting second identity.
 //
 // Spec → CLI mapping accounts for every Spec field. Fields the CLI cannot
 // honor are silently dropped per the capability-gating contract:
@@ -98,12 +117,24 @@ var linearMCPDisallowList = []string{
 // The mcpConfigPath argument is the path to the per-session
 // `--mcp-config` JSON tmpfile prepared by writeMCPConfig (see mcp.go).
 // When empty (no MCP servers configured) the flag is omitted.
-func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []string, stdinPrompt string) {
+func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID string) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--dangerously-skip-permissions",
+	}
+	// Routing pin first among the optional flags: it must be present
+	// whenever the session carries routing of its own, on this lane exactly
+	// as on the interactive lane (see spawnInteractive). Host-login sessions
+	// pin nothing and skip the flag entirely.
+	if pin := pinnedRoutingEnv(spec); len(pin) > 0 {
+		if pinJSON, err := marshalRoutingPin(pin); err == nil && pinJSON != "" {
+			argv = append(argv, "--settings", pinJSON)
+		}
+		// A pin that cannot be marshalled (string maps never fail in
+		// practice) still spawns: the process environment the pin mirrors
+		// remains, and failing the spawn would lie about what happened.
 	}
 	if spec.SessionName != "" && resumeSessionID == "" {
 		argv = append(argv, "--name", spec.SessionName)
@@ -129,6 +160,8 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 
 	if resumeSessionID != "" {
 		argv = append(argv, "--resume", resumeSessionID)
+	} else if ownedSessionID != "" {
+		argv = append(argv, "--session-id", ownedSessionID)
 	}
 
 	// The interactive spawn mode applies the SAME mapping — see
@@ -199,6 +232,71 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 	// this into cmd.Stdin in handle.go.
 	stdinPrompt = spec.Prompt
 	return argv, stdinPrompt
+}
+
+// resumePinArgs renders the session's routing pin as the --resume argv
+// fragment handed to the driver (see spawn): --settings <pin JSON> when
+// the session carries routing of its own, nil otherwise. It reuses the
+// headless pin rendering verbatim, so every --resume in the session cwd
+// resolves on the same pinned layer as the initial spawn. The pin holds
+// only destinations — the driver's syntactic guard admits nothing else.
+func resumePinArgs(spec agent.Spec) []string {
+	pin := pinnedRoutingEnv(spec)
+	if len(pin) == 0 {
+		return nil
+	}
+	pinJSON, err := marshalRoutingPin(pin)
+	if err != nil || pinJSON == "" {
+		return nil
+	}
+	return []string{"--settings", pinJSON}
+}
+
+// marshalRoutingPin renders the routing pin as the --settings JSON string
+// the headless lane passes. Both the session's own routing names AND the
+// pinnedFallbackRoutingEnv names (including their "" blanks) are honored —
+// a blank explicitly states the ambient default on the winning layer, which
+// is what keeps a repo naming a proxy or an alternate provider surface from
+// taking effect. Anything outside that set is dropped rather than passed
+// through, so a caller cannot smuggle an unrelated variable onto the CLI's
+// winning layer. The envelope holds no hooks: the headless lane has no
+// notice channel to declare.
+func marshalRoutingPin(pin map[string]string) (string, error) {
+	env := make(map[string]string, len(pin))
+	for k, v := range pin {
+		// Fallback names first: their "" blanks ride the pin (a blank
+		// states the ambient default on the winning layer). Two session
+		// routing names (the bedrock/vertex switches) are also fallback
+		// names, and their blanks must ride too — checking the session
+		// set first would drop them as "empty session values".
+		if isFallbackRoutingName(k) {
+			env[k] = v
+			continue
+		}
+		if _, ok := routingPinEnvNames[k]; !ok || v == "" {
+			continue
+		}
+		env[k] = v
+	}
+	if len(env) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(map[string]any{"env": env})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// isFallbackRoutingName reports whether name is one of the
+// pinnedFallbackRoutingEnv entries, whose "" blanks ride the pin.
+func isFallbackRoutingName(name string) bool {
+	for _, n := range pinnedFallbackRoutingEnv {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // additionalWorkdirs returns the ordered --add-dir list for a spawn: the

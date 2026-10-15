@@ -11,10 +11,10 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
-	agycliprovider "github.com/RenseiAI/donmai/provider/harness/agycli"
 	claudeprovider "github.com/RenseiAI/donmai/provider/harness/claude"
 	codexprovider "github.com/RenseiAI/donmai/provider/harness/codex"
 	geminiprovider "github.com/RenseiAI/donmai/provider/harness/gemini"
+	museprovider "github.com/RenseiAI/donmai/provider/harness/muse"
 	ollamaprovider "github.com/RenseiAI/donmai/provider/harness/ollama"
 	opencodeprovider "github.com/RenseiAI/donmai/provider/harness/opencode"
 	piprovider "github.com/RenseiAI/donmai/provider/harness/pi"
@@ -30,7 +30,7 @@ func mcpDeliveringHarness() agent.Provider { return &claudeprovider.Provider{} }
 
 // mcpCaps / cliCaps model the two provider families the code-intel prompt
 // partial branches on: MCP-capable (claude/codex/gemini) vs providers that
-// ignore MCP specs (ollama/opencode/agycli), which get the Bash-CLI fallback.
+// ignore MCP specs (ollama/opencode), which get the Bash-CLI fallback.
 func mcpCaps() agent.Capabilities {
 	return agent.Capabilities{SupportsToolPlugins: true, AcceptsMcpServerSpec: true}
 }
@@ -296,11 +296,11 @@ func harnessMCPCases(t *testing.T) []harnessMCPCase {
 		{"claude", &claudeprovider.Provider{}, agent.PromptModeAutonomous, true},
 		{"codex", &codexprovider.Provider{}, agent.PromptModeAutonomous, true},
 		{"gemini", &geminiprovider.Provider{}, agent.PromptModeAutonomous, true},
+		{"muse", &museprovider.Provider{}, agent.PromptModeAutonomous, true},
 		{"opencode", &opencodeprovider.Provider{}, agent.PromptModeAutonomous, true},
 		{"stub", stubProvider, agent.PromptModeAutonomous, true},
 		{"pi", &piprovider.Provider{}, agent.PromptModeAutonomous, false},
 		{"ollama", &ollamaprovider.Provider{}, agent.PromptModeAutonomous, false},
-		{"agy-cli", &agycliprovider.Provider{}, agent.PromptModeAutonomous, false},
 		{"shell", &shellprovider.Provider{}, agent.PromptModeHumanControlled, false},
 	}
 }
@@ -317,7 +317,7 @@ func mcpServerNames(servers []agent.MCPServerConfig) []string {
 // TestDefaultMCPServersForHarness_ImplicitGatewayFollowsDeclaredMCPDelivery is
 // the regression guard for the spawn-denial defect: the runner used to exempt
 // its own implicit platform MCP gateway by hardcoded provider NAME (shell), so
-// every OTHER harness that declares no MCP delivery — pi, ollama, agy-cli —
+// every OTHER harness that declares no MCP delivery — pi, ollama —
 // was handed a gateway its adapter could never mount and denied the spawn
 // outright ("cannot apply required entry \"mcp-servers\"") for a capability the
 // caller never requested.

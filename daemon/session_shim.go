@@ -4538,6 +4538,55 @@ func (d *Daemon) SessionShimOccupancy() int {
 	return len(d.shims.adopted) + len(d.shims.quarantined)
 }
 
+// wireShimAdmission makes spawner admission see shim-held sessions: their
+// slots through ExternalOccupancy, so a restarted daemon does not accept
+// against cores its surviving shims already use, and their ids through
+// ExternalOwnedSessionIDs, so a re-dispatched session id already live under a
+// shim is refused instead of launched a second time. The ids deliberately do
+// NOT go through ExternalSessionIDs: that hook is also charged as capacity,
+// and ExternalOccupancy already charges every shim, so one shim would hold two
+// slots. Both suppliers run under the spawner mutex and take only the
+// shim-state lock, so neither reenters the spawner.
+func (d *Daemon) wireShimAdmission(opts *SpawnerOptions) {
+	priorOwned := opts.ExternalOwnedSessionIDs
+	opts.ExternalOwnedSessionIDs = func() []string {
+		var ids []string
+		if priorOwned != nil {
+			ids = append(ids, priorOwned()...)
+		}
+		return append(ids, d.shimOwnedSessionIDs()...)
+	}
+	if opts.ExternalOccupancy == nil {
+		opts.ExternalOccupancy = d.SessionShimOccupancy
+	}
+}
+
+// shimOwnedSessionIDs reports the session ids currently held under
+// per-session shim ownership — adopted and quarantined alike — so the
+// spawner's duplicate-accept guard sees the ids the spawner's own registry
+// never holds (their slots are charged by SessionShimOccupancy). A
+// quarantined lineage still owns its session id: its harness is running, and
+// re-dispatching that id would run the session twice.
+func (d *Daemon) shimOwnedSessionIDs() []string {
+	if d.shims == nil {
+		return nil
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	seen := make(map[string]struct{}, len(d.shims.adopted)+len(d.shims.quarantined))
+	for id := range d.shims.adopted {
+		seen[id.SessionID] = struct{}{}
+	}
+	for _, q := range d.shims.quarantined {
+		seen[q.SessionID] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	return out
+}
+
 // AdoptedSessionShims returns the identities currently under this daemon's
 // control, for host diagnostics.
 func (d *Daemon) AdoptedSessionShims() []sessionshim.Identity {
@@ -4661,6 +4710,23 @@ func (d *Daemon) SessionShimAdoptionComplete() bool {
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	return d.shims.adoptionComplete
+}
+
+// SessionShimOwnershipEnabled reports whether this daemon's resolved
+// session-shim configuration enables ownership of new sessions (§D11 step
+// 2). The upgrade acceptance probe reads the posture its selection-rule
+// answer was taken under through this, rather than trusting the two flags
+// it configured: a probe daemon whose composition never settled must read
+// stale, never red.
+func (d *Daemon) SessionShimOwnershipEnabled() bool {
+	return d.sessionShimConfig().EnableOwnership
+}
+
+// SessionShimAdoptionEnabled reports whether this daemon's resolved
+// session-shim configuration enables the startup adoption pass (§D11 step
+// 3). It is the ownership flag's companion in the probe posture above.
+func (d *Daemon) SessionShimAdoptionEnabled() bool {
+	return d.sessionShimConfig().EnableAdoption
 }
 
 // SessionShimCarrierActivationComplete reports remote D13 exact-set completion.

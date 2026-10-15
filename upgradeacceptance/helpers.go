@@ -88,11 +88,21 @@ func resumeFakeHarness(ctx context.Context, provider *pi.Provider, dir, sessionI
 }
 
 // adoptionProbeResult is the production selection-rule reading for one
-// headless candidate spec. ownsHeadless is true once the adoption slices
-// let the daemon launch headless seats under shim ownership.
+// headless candidate spec, plus the inputs that reading depends on.
+// ownsHeadless is true once the adoption slices let the daemon launch
+// headless seats under shim ownership; compositionPending reports a
+// mid-install posture where even an enabled rule answers false until the
+// adoption pass completes. Recording the posture beside the answer is
+// what keeps the staleness signal honest: a build whose probe daemon
+// never reaches a settled posture has not proven the rule still refuses
+// headless seats, and the lane must hear that as loudly as a flipped
+// rule.
 type adoptionProbeResult struct {
-	ownsHeadless bool
-	ownsControl  bool
+	ownsHeadless       bool
+	ownsControl        bool
+	compositionPending bool
+	ownershipEnabled   bool
+	adoptionEnabled    bool
 }
 
 // defaultAdoptionProbeDaemon builds the daemon the acceptance probe asks
@@ -109,14 +119,21 @@ func defaultAdoptionProbeDaemon() *daemon.Daemon {
 // adoptionProbeForHeadlessSpec asks the production §D11 selection rule
 // whether a headless seat — the seat class the N→N+1 driver upgrades —
 // launches under shim ownership, with an interactive control alongside so
-// a blanket-false rule cannot pass as the red record. The container
-// driver's green/red branch and the in-repo red record both follow this
-// probe: flipping the production rule flips the record, never an edit.
+// a blanket-false rule cannot pass as the red record. It also reports the
+// posture the answer was read under: whether the probe daemon's
+// composition is still pending and whether ownership and adoption are
+// enabled. The container driver's green/red branch and the in-repo red
+// record both follow this probe: flipping the production rule flips the
+// record, never an edit — and a reading taken under a posture the green
+// slices would never settle in is reported stale, never red.
 func adoptionProbeForHeadlessSpec(d *daemon.Daemon) adoptionProbeResult {
 	headless := daemon.SessionSpec{SessionID: "acceptance-probe-headless"}
 	control := daemon.SessionSpec{SessionID: "acceptance-probe-interactive", Mode: "interactive"}
 	return adoptionProbeResult{
-		ownsHeadless: d.SessionShimOwnsSession(headless),
-		ownsControl:  d.SessionShimOwnsSession(control),
+		ownsHeadless:       d.SessionShimOwnsSession(headless),
+		ownsControl:        d.SessionShimOwnsSession(control),
+		compositionPending: d.SessionShimCompositionPending(),
+		ownershipEnabled:   d.SessionShimOwnershipEnabled(),
+		adoptionEnabled:    d.SessionShimAdoptionEnabled(),
 	}
 }

@@ -12,7 +12,7 @@ import (
 // signalProcessGroup sends sig to the entire process group whose leader is
 // cmd.Process. pty.StartWithSize sets Setsid=true, so the child is a session +
 // process-group leader (pgid == pid); signalling the group reaches any tool
-// subprocesses it forked (generalized from the agycli PTY precedent). Falls
+// subprocesses it forked (generalized from the PTY-harness precedent). Falls
 // back to the leader alone when the pgid cannot be resolved.
 func signalProcessGroup(cmd *exec.Cmd, sig syscall.Signal) {
 	if cmd == nil || cmd.Process == nil {

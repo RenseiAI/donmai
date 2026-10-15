@@ -146,7 +146,11 @@ harness-specific.
   deliver the work (still a draft, or a rework with no new commit) and gains no
   commit of the session's own. A turn that pushes to the pull request starts
   the count again; continuations for any other reason never count. Exhausted:
-  `continuations-ceiling`.
+  `continuations-ceiling`. A dispatch-declared delivery policy
+  (`QueuedWork.Delivery`) widens what counts as delivered: allowing drafts
+  skips the draft check, and allowing merges counts a merge carrying the
+  run's own resolution; every other check still applies. Without the policy
+  the continuation prompt names the remedy (`gh pr ready`).
 - Provider-error retries keep a total bound of `TurnContinuationLimit` with no
   progress reset. Exhausted: `provider-error`.
 

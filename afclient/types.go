@@ -604,6 +604,21 @@ type EvictPoolResponse struct {
 	CorrelationID string `json:"correlationId,omitempty"`
 }
 
+// RepoKeeperStats is the secret-free repository-keeper snapshot on daemon
+// stats: mirror count, last fetch, revoked count, and bytes. It never
+// carries scope values or remote URLs.
+type RepoKeeperStats struct {
+	// MirrorCount is the number of mirrors in the keeper catalog.
+	MirrorCount int `json:"mirrorCount"`
+	// LastFetchAt is the RFC3339 timestamp of the most recent recorded
+	// fetch across all mirrors. Empty when no fetch has been recorded.
+	LastFetchAt string `json:"lastFetchAt,omitempty"`
+	// RevokedCount is the number of mirrors currently marked revoked.
+	RevokedCount int `json:"revokedCount"`
+	// Bytes is the sum of recorded mirror bytes across the catalog.
+	Bytes int64 `json:"bytes"`
+}
+
 // SetCapacityResponse is the response from POST /api/daemon/capacity.
 type SetCapacityResponse struct {
 	// OK is true when the config key was accepted and written to daemon.yaml.

@@ -14,7 +14,10 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/term"
+
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/internal/usageping"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -63,6 +66,11 @@ type WizardOptions struct {
 	// SkipWizard, when true, returns DefaultConfig (or Existing) without
 	// prompting. Mirrors the DONMAI_DAEMON_SKIP_WIZARD env var.
 	SkipWizard bool
+	// SkipPing, when true, leaves the anonymous usage ping disabled
+	// without prompting. Mirrors the `host setup --no-ping` flag: the
+	// wizard asks exactly one default-no question, and this skips it.
+	// Tests inject it directly.
+	SkipPing bool
 	// CPUCount overrides runtime.NumCPU() (test injection).
 	CPUCount int
 	// MemoryMB overrides total-memory detection (test injection). 0 means
@@ -73,21 +81,26 @@ type WizardOptions struct {
 	DetectGitRemote func() string
 }
 
+// ServiceModeStdin reports whether the process runs under a service manager
+// with no terminal attached: stdin is /dev/null (a character device that is
+// not a terminal) or is otherwise not a terminal at all. A mode-bit test
+// alone reads /dev/null as a terminal because /dev/null IS a character
+// device, so a service-mode start whose stdin is /dev/null ran the
+// interactive wizard and failed on its first required answer instead of
+// taking the non-interactive path.
+func ServiceModeStdin() bool {
+	return !term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: a file descriptor fits in int on every supported platform.
+}
+
 // ShouldSkipWizard returns true when the wizard should be bypassed:
-//   - stdin is not a TTY, OR
+//   - stdin is not a terminal (including the service-mode /dev/null
+//     case — see ServiceModeStdin), OR
 //   - DONMAI_DAEMON_SKIP_WIZARD is set.
 func ShouldSkipWizard() bool {
 	if os.Getenv("DONMAI_DAEMON_SKIP_WIZARD") != "" {
 		return true
 	}
-	// We treat non-TTY stdin as "skip the wizard". We use a coarse fallback
-	// — we don't pull in golang.org/x/term to keep the dependency surface
-	// minimal — instead we Stat() stdin and check the mode.
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return true
-	}
-	return (fi.Mode() & os.ModeCharDevice) == 0
+	return ServiceModeStdin()
 }
 
 // RunSetupWizard runs the interactive first-run wizard (or returns the
@@ -137,8 +150,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 
 	wln("\nLet's get your machine working.")
 
-	// [1/5] Machine identity
-	wln("\n[1/5] Machine identity")
+	// [1/6] Machine identity
+	wln("\n[1/6] Machine identity")
 	defaultID := DeriveDefaultMachineID()
 	defaultRegion := "home-network"
 	if opts.Existing != nil {
@@ -161,8 +174,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
 
-	// [2/5] Capacity
-	wln("\n[2/5] Capacity")
+	// [2/6] Capacity
+	wln("\n[2/6] Capacity")
 	wf("  Detected: %d cores, %d MB RAM\n", cpu, mem)
 	defaultReservedCores := minOf(4, cpu/4)
 	defaultReservedMem := minOf(16384, mem/4)
@@ -194,8 +207,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
 
-	// [3/5] Orchestrator
-	wln("\n[3/5] Orchestrator")
+	// [3/6] Orchestrator
+	wln("\n[3/6] Orchestrator")
 	wln("  Where do work assignments come from?")
 	wln("  > 1. Remote orchestrator           — register with a platform you configure")
 	wln("    2. Local file queue (single-user) — for solo dev, no network")
@@ -271,8 +284,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		}
 	}
 
-	// [4/5] Project allowlist
-	wln("\n[4/5] Project allowlist")
+	// [4/6] Project allowlist
+	wln("\n[4/6] Project allowlist")
 	projects := []ProjectConfig{}
 	if opts.Existing != nil {
 		projects = append(projects, opts.Existing.EffectiveProjectConfigs()...)
@@ -340,8 +353,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
 
-	// [5/5] Auto-update
-	wln("\n[5/5] Auto-update")
+	// [5/6] Auto-update
+	wln("\n[5/6] Auto-update")
 	defChannel := string(ChannelStable)
 	defSchedule := string(ScheduleNightly)
 	defDrain := 600
@@ -381,6 +394,58 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	default:
 		schedule = ScheduleNightly
 	}
+	if !confirmYes(r, out, "  Continue?", true) {
+		return nil, errors.New("setup wizard cancelled by user")
+	}
+
+	// [6/6] Anonymous usage count — the one default-no question. An
+	// opt-in mints a cryptographically random installation id (not a
+	// machine or organization identifier) and records it with the
+	// version and OS only. No hostnames, no repository names, no IPs
+	// stored. The receiver endpoint is an operations decision: until
+	// the operator configures one, consent alone sends nothing.
+	usagePing := UsagePingConfig{}
+	if opts.Existing != nil {
+		usagePing = opts.Existing.UsagePing
+	}
+	if !opts.SkipPing {
+		wln("\n[6/6] Anonymous usage count")
+		wln("  Count this installation in the public usage numbers?")
+		wln("  Sends a random installation id and the version once a week, nothing else.")
+		if confirmYes(r, out, "  Count this installation?", usagePing.Enabled) {
+			id := usagePing.InstallationID
+			if !usageping.ValidateInstallationID(id) {
+				var err error
+				id, err = usageping.MintInstallationID()
+				if err != nil {
+					return nil, err
+				}
+			}
+			def := strings.TrimSpace(usagePing.Endpoint)
+			endpoint, err := promptDefault(r, out, "Usage-count endpoint (https URL, empty disables sending)", def)
+			if err != nil {
+				return nil, err
+			}
+			endpoint = strings.TrimSpace(endpoint)
+			if endpoint != "" && !strings.HasPrefix(endpoint, "https://") {
+				return nil, errors.New("usage-count endpoint must be https")
+			}
+			if endpoint == "" {
+				wln("  No endpoint configured: consent is recorded but no ping will be sent.")
+			}
+			usagePing = UsagePingConfig{Enabled: true, InstallationID: id, Endpoint: endpoint}
+		} else {
+			// Opting out clears the id and the endpoint: a disabled ping
+			// keeps no identifier and no destination at all, and
+			// re-enabling mints a fresh one. A previously configured
+			// endpoint-only record is dropped with notice so the
+			// operator knows a later opt-in needs the URL again.
+			if strings.TrimSpace(usagePing.Endpoint) != "" {
+				wln("  Previously configured usage-count endpoint cleared.")
+			}
+			usagePing = UsagePingConfig{}
+		}
+	}
 
 	cfg := &Config{
 		APIVersion:              "donmai.dev/v1",
@@ -405,6 +470,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			Schedule:            schedule,
 			DrainTimeoutSeconds: drain,
 		},
+		UsagePing: usagePing,
 	}
 	if choice == 2 {
 		cfg.APIVersion = LocalRuntimeConfigAPIVersion
@@ -607,12 +673,61 @@ func configureLocalRuntime(ctx context.Context, r *bufio.Reader, out io.Writer, 
 	return &LocalRuntimeConfig{ExecutionSecurity: policy, Harness: selected.Harness, Model: selected.Model, ModelAuthor: selected.ModelAuthor, ModelCatalogRevision: selected.ModelCatalogRevision, Repositories: repositories}, nil
 }
 
+// FreshHostQueueURL is the file-queue URL a fresh host seeds when the
+// operator never authored a config: the local file-queue root under the
+// host state home. Exported so `host install` seeds the same URL the
+// non-interactive first-run path does.
+func FreshHostQueueURL() string {
+	return "file://" + statepath.Resolve("queue", "/tmp/.donmai/queue")
+}
+
+// FreshHostConfig returns the seed config a fresh host starts from: the
+// local file queue plus the explicit execution-security seed the startup
+// migration would apply. No harness or repository profile — `host setup`
+// adds those. The seed loads under validateConfig and starts without the
+// interactive wizard; composition refuses with the operator action until
+// setup completes.
+func FreshHostConfig() *Config {
+	cfg := DefaultConfig()
+	cfg.APIVersion = LocalRuntimeConfigAPIVersion
+	cfg.Orchestrator.URL = FreshHostQueueURL()
+	cfg.LocalRuntime = &LocalRuntimeConfig{ExecutionSecurity: InitialLocalExecutionSecurity()}
+	applyDefaults(cfg)
+	return cfg
+}
+
 // BuildDefaultConfigFromExisting returns a default Config (or the existing
 // one) and optionally persists it to configPath.
+//
+// A fresh host whose operator never authored a config gets a config the
+// daemon can actually load: DefaultConfig carries an empty orchestrator URL
+// (no vendor default — the operator configures it explicitly), which
+// validateConfig refuses. Seeding the local file-queue URL plus the
+// explicit execution-security seed the startup migration would apply keeps
+// a service-mode start on a fresh host out of the crash loop: with no
+// harness or repository profile the file queue still refuses at
+// composition time, but with a typed error the operator can act on, not a
+// reopened prompt.
 func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Config, error) {
 	cfg := existing
 	if cfg == nil {
-		cfg = DefaultConfig()
+		// No config file on disk and no explicit non-file orchestrator
+		// URL (env or otherwise): seed the fresh-host file queue (with
+		// its explicit execution policy) instead of an empty URL no
+		// authored config could ever load. An explicit URL keeps the
+		// plain default so stub and platform paths behave as before —
+		// the seed decision reads the operator's URL, never a bare
+		// env-empty default, so ambient process env alone cannot flip
+		// a fresh host back to an in-memory default the next restart
+		// cannot see. An explicit stub-mode opt-in (stubModeRequested)
+		// also keeps the plain default: the operator asked for the stub
+		// daemon, which needs no queue profile, and a service unit
+		// never sets it — so a fresh unit still takes the seed.
+		if explicitOrchestratorURL() == "" && !stubModeRequested() {
+			cfg = FreshHostConfig()
+		} else {
+			cfg = DefaultConfig()
+		}
 	} else {
 		applyDefaults(cfg)
 	}
@@ -627,6 +742,20 @@ func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Confi
 		}
 	}
 	return cfg, nil
+}
+
+// explicitOrchestratorURL reports the operator's explicit non-file
+// orchestrator URL from the process environment, or "" when none is
+// configured. Empty (or a file: URL, which selects the local queue,
+// never the stub/platform path) means the non-interactive first run
+// seeds the fresh-host file queue. A remote URL keeps the plain default
+// so stub registration and platform polling behave as before.
+func explicitOrchestratorURL() string {
+	raw := strings.TrimSpace(os.Getenv("DONMAI_ORCHESTRATOR_URL"))
+	if raw == "" || strings.HasPrefix(raw, "file:") {
+		return ""
+	}
+	return raw
 }
 
 // ── prompt helpers ───────────────────────────────────────────────────────

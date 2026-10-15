@@ -1510,3 +1510,51 @@ func TestProvisionFetchRetriesFreshCredentialRejection(t *testing.T) {
 		t.Fatalf("expected 3 fetch attempts, got %d", got)
 	}
 }
+
+// TestProvisionPreProvisionDelayHoldsMaterialization covers the liveness
+// timing seam: a positive PreProvisionDelay holds Provision open for at
+// least the delay before any git call runs, and a cancelled context aborts
+// the wait with no materialization.
+func TestProvisionPreProvisionDelayHoldsMaterialization(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	runner := newStubRunner()
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir:         dir,
+		CommandRunner:     runner.run,
+		PreProvisionDelay: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "delayed",
+		Strategy:  worktree.StrategyEmpty,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+		t.Fatalf("Provision returned after %v; want >= 300ms hold", elapsed)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("provisioned path missing: %v", statErr)
+	}
+
+	// Cancellation during the hold aborts before materialization.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := m.Provision(ctx, worktree.ProvisionSpec{
+		SessionID: "delayed-cancelled",
+		Strategy:  worktree.StrategyEmpty,
+	}); err == nil {
+		t.Fatal("cancelled-delay Provision succeeded; want ctx error")
+	} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Provision err = %v; want context cancellation", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "delayed-cancelled")); !os.IsNotExist(statErr) {
+		t.Fatal("cancelled provision materialized a workarea; want none")
+	}
+}

@@ -282,7 +282,7 @@ func TestParity_CapsNarrowingOnly(t *testing.T) {
 }
 
 // TestParity_ManifestAgreesWithCapabilities is rule 7 (the P1 additive-safety
-// guard): for each of the 9 harness providers, the Manifest().Caps agent-loop
+// guard): for each of the 8 harness providers, the Manifest().Caps agent-loop
 // fields equal the corresponding Capabilities() fields — proving the manifest
 // is a faithful additive projection, not a divergent second source of truth.
 func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
@@ -433,6 +433,33 @@ func TestParity_NoCrossProtocolOpencodeAnthropic(t *testing.T) {
 	}
 }
 
+// TestParity_NoRetiredAntigravityCell is the retirement guard: the removed
+// harness must not reappear as a harvested row, a valid cell, or a legacy
+// alias. Re-adding the harvest entry, the cell, or the provider anchor flips
+// this test red — see the retirement revert proof in the PR description.
+func TestParity_NoRetiredAntigravityCell(t *testing.T) {
+	t.Parallel()
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	for _, h := range built.Harnesses {
+		if h.Name == agent.HarnessName("antigravity") {
+			t.Errorf("retired antigravity harness present in generated harnesses")
+		}
+	}
+	for _, c := range built.Matrix.Cells {
+		if c.Harness == agent.HarnessName("antigravity") {
+			t.Errorf("retired antigravity cell present: %+v", c.Key())
+		}
+	}
+	for _, a := range built.AliasMap {
+		if a.ProviderName == agent.ProviderName("agy-cli") {
+			t.Errorf("retired agy-cli legacy alias present: %+v", a.Cell)
+		}
+	}
+}
+
 // TestParity_GenericCostHonesty asserts the structural invariant across ALL
 // cells: a cell that needs an API key can never bring its own auth.
 func TestParity_GenericCostHonesty(t *testing.T) {
@@ -443,6 +470,43 @@ func TestParity_GenericCostHonesty(t *testing.T) {
 	for _, c := range built.Matrix.Cells {
 		if c.NeedsAPIKey && c.BringsOwnAuth {
 			t.Errorf("cell %+v violates cost honesty: needsApiKey && bringsOwnAuth", c.Key())
+		}
+	}
+}
+
+// TestParity_SmokeEvidenceDerivedNotAuthored is the parity-gate half of the
+// computed-evidence rule: every generated cell's ProvingLanes/Stability/
+// Smoked must equal what the registry plus the gate outcomes derive — the
+// committed JSON carries no independent claim. It additionally pins that
+// every generated proving lane is actually registered (a stale committed
+// artifact carrying a renamed lane fails here, not just in the smoke
+// suite's own existence check).
+func TestParity_SmokeEvidenceDerivedNotAuthored(t *testing.T) {
+	t.Parallel()
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	byCell := SmokeProofsByCell()
+	for _, c := range built.Matrix.Cells {
+		stability, smoked, proving, err := deriveCellSmokeEvidence(c.Key(), byCell[c.Key()], lastSmokeGateOutcomes)
+		if err != nil {
+			t.Errorf("cell %+v: derive: %v", c.Key(), err)
+			continue
+		}
+		if c.Stability != stability || c.Smoked != smoked {
+			t.Errorf("cell %+v = stability %q smoked %v; derived %q/%v (evidence must be derived, not authored)",
+				c.Key(), c.Stability, c.Smoked, stability, smoked)
+		}
+		if len(c.ProvingLanes) != len(proving) {
+			t.Errorf("cell %+v provingLanes = %v; derived %v", c.Key(), c.ProvingLanes, proving)
+			continue
+		}
+		for i := range proving {
+			if c.ProvingLanes[i] != proving[i] {
+				t.Errorf("cell %+v provingLanes = %v; derived %v", c.Key(), c.ProvingLanes, proving)
+				break
+			}
 		}
 	}
 }

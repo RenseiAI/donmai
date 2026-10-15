@@ -328,11 +328,16 @@ func newDaemonUninstallCmd(bin string) *cobra.Command {
 
 func newDaemonSetupCmd(bin string) *cobra.Command {
 	var configPath string
+	var noPing bool
 	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Interactive first-run wizard",
 		Long: "Run the interactive first-run setup wizard that captures machine identity, capacity,\n" +
 			"orchestrator config, project allowlist, and auto-update preferences.\n\n" +
+			"The wizard asks one default-no question about counting this\n" +
+			"installation in the public usage numbers (a random installation\n" +
+			"id and the version, sent at most once a week, nothing else).\n" +
+			"Pass --no-ping to skip that question and leave the count off.\n\n" +
 			"In-process Go implementation: the wizard reads stdin/stdout\n" +
 			"directly so prompts work correctly when stdin is a TTY.",
 		SilenceUsage: true,
@@ -354,6 +359,7 @@ func newDaemonSetupCmd(bin string) *cobra.Command {
 				Context:              cmd.Context(),
 				LocalRuntimeResolver: localSetupResolverFactory(),
 				IsTTY:                setupWizardTTYOverride,
+				SkipPing:             noPing,
 			})
 			if err != nil {
 				return fmt.Errorf("daemon setup: %w", err)
@@ -363,6 +369,7 @@ func newDaemonSetupCmd(bin string) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
+	cmd.Flags().BoolVar(&noPing, "no-ping", false, "Skip the anonymous usage-count question and leave the count off")
 	return cmd
 }
 
@@ -465,14 +472,21 @@ func formatProcessPriorityStatus(status *afclient.DaemonProcessPriorityStatus) s
 }
 
 // formatSeatBudgetStatus renders the per-seat budget for the status table:
-// the posture with the values, or "not reported" against an older daemon.
-// A host with budgeting off reads as "none" — the honest shape, not an
-// omission an operator could misread as a missing probe.
+// the posture with the values, plus the opt-in scheduling class when it
+// is not the default, or "not reported" against an older daemon. A host
+// with budgeting off reads as "none" — the honest shape, not an omission
+// an operator could misread as a missing probe. A non-default scheduling
+// class appends even to a none budget: the class governs the spawn
+// wrapper, not the budget, so it is real with budgeting off.
 func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 	if status == nil || strings.TrimSpace(status.Mode) == "" {
 		return "not reported"
 	}
+	qos := strings.TrimSpace(status.QoS)
 	if status.Mode == "none" {
+		if qos != "" && qos != "default" {
+			return "none (seat QoS: " + qos + ")"
+		}
 		return "none"
 	}
 	value := status.Mode
@@ -481,6 +495,9 @@ func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 	}
 	if status.MemoryMB > 0 {
 		value += fmt.Sprintf(", %d MB", status.MemoryMB)
+	}
+	if qos != "" && qos != "default" {
+		value += ", seat QoS: " + qos
 	}
 	if status.Detail != "" {
 		value += " — " + status.Detail
@@ -659,6 +676,8 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 		jsonOut     bool
 		scopeUser   bool
 		scopeSystem bool
+		fix         bool
+		configPath  string
 	)
 
 	cmd := &cobra.Command{
@@ -669,6 +688,9 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 			"installed launchd plist (macOS) or systemd unit (Linux) directly and\n" +
 			"reports whether the service is registered, active, and pointing at the\n" +
 			"current host binary.\n\n" +
+			"With --fix, doctor also strips retired config keys from every daemon\n" +
+			"config file (atomic rewrite, mode preserved, backup kept) and prints\n" +
+			"one summary line.\n\n" +
 			"Exits 0 when the unit is installed and healthy, non-zero otherwise.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -680,6 +702,20 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 				scope = installer.ScopeSystem
 			}
 
+			var sweep daemonRuntime.RetiredKeySweepSummary
+			var sweepErr error
+			if fix {
+				if configPath != "" {
+					if _, err := os.Stat(configPath); err != nil {
+						return fmt.Errorf("daemon doctor: config %q: %w", configPath, err)
+					}
+				}
+				sweep, sweepErr = daemonRuntime.SweepRetiredKeys(daemonRuntime.DefaultSweepPaths(configPath))
+				if sweepErr != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: retired-key sweep: %v\n", sweepErr)
+				}
+			}
+
 			report, err := installer.Doctor(installer.DoctorOptions{Scope: scope})
 			if err != nil {
 				return fmt.Errorf("daemon doctor: %w", err)
@@ -687,9 +723,16 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 
 			out := cmd.OutOrStdout()
 			if jsonOut {
-				enc := json.NewEncoder(out)
-				enc.SetIndent("", "  ")
-				return enc.Encode(report)
+				if !fix {
+					enc := json.NewEncoder(out)
+					enc.SetIndent("", "  ")
+					return enc.Encode(report)
+				}
+				return encodeDoctorReportWithSweep(out, report, sweep)
+			}
+
+			if fix {
+				_, _ = fmt.Fprintln(out, sweep.Line())
 			}
 
 			binPath := resolveCurrentBinPath()
@@ -719,8 +762,33 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output the doctor report as JSON")
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Inspect user-scoped systemd unit (Linux, default)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Inspect system-scoped systemd unit (Linux)")
+	cmd.Flags().BoolVar(&fix, "fix", false, "Strip retired config keys from every daemon config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml; siblings are swept too)")
 
 	return cmd
+}
+
+// encodeDoctorReportWithSweep renders the doctor report as JSON with the
+// retired-key sweep outcome merged in, keeping the report's own fields at
+// the top level so existing JSON consumers keep parsing.
+func encodeDoctorReportWithSweep(out io.Writer, report installer.DoctorReport, sweep daemonRuntime.RetiredKeySweepSummary) error {
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	doc["retiredKeySweep"] = map[string]any{
+		"filesChecked": len(sweep.Files),
+		"filesCleaned": sweep.FilesCleaned(),
+		"keysRemoved":  sweep.KeysRemoved(),
+		"summary":      sweep.Line(),
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(doc)
 }
 
 // resolveCurrentBinPath returns the absolute path of the currently running
@@ -794,23 +862,40 @@ func newDaemonResumeCmd(factory daemonClientFactory) *cobra.Command {
 
 func newDaemonUpdateCmd(factory daemonClientFactory) *cobra.Command {
 	var (
-		port int
-		host string
+		port       int
+		host       string
+		configPath string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "Trigger a manual daemon update check",
 		Long: "Prompt the daemon to check for a new binary version immediately.\n" +
-			"The daemon drains in-flight work before restarting if an update is available.",
+			"The daemon drains in-flight work before restarting if an update is available.\n\n" +
+			"The upgrade path also strips retired config keys from every daemon config\n" +
+			"file (atomic rewrite, mode preserved, backup kept) and prints one\n" +
+			"summary line before contacting the daemon.",
 		SilenceUsage: true,
-		RunE: daemonActionRunE("update", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
-			return c.Update()
-		}),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if configPath != "" {
+				if _, err := os.Stat(configPath); err != nil {
+					return fmt.Errorf("daemon update: config %q: %w", configPath, err)
+				}
+			}
+			summary, sweepErr := daemonRuntime.SweepRetiredKeys(daemonRuntime.DefaultSweepPaths(configPath))
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), summary.Line())
+			if sweepErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: retired-key sweep: %v\n", sweepErr)
+			}
+			return daemonActionRunE("update", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
+				return c.Update()
+			})(cmd, nil)
+		},
 	}
 
 	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
 	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml; siblings are swept too)")
 
 	return cmd
 }
@@ -959,6 +1044,16 @@ func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse, bin str
 	}
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("flush table: %w", err)
+	}
+
+	// Repository-keeper section (secret-free: counts and bytes only).
+	if r.RepoKeeper != nil {
+		if _, err := fmt.Fprintf(tw, "  %s\t%s\n", "Repository keeper:", formatRepoKeeperStat(r)); err != nil {
+			return fmt.Errorf("write row: %w", err)
+		}
+		if err := tw.Flush(); err != nil {
+			return fmt.Errorf("flush table: %w", err)
+		}
 	}
 
 	// Pool section.
@@ -1187,8 +1282,24 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 
 // allowedCapacityKeys is the set of dotted config keys accepted by `donmai host set`.
 var allowedCapacityKeys = map[string]struct{}{
-	"capacity.maxConcurrentSessions": {},
-	"capacity.poolMaxDiskGb":         {},
+	"capacity.maxConcurrentSessions":        {},
+	"capacity.poolMaxDiskGb":                {},
+	"repoKeeper.enabled":                    {},
+	"repoKeeper.maxDiskGb":                  {},
+	"repoKeeper.fetchIntervalSeconds":       {},
+	"repoKeeper.authorizationWindowSeconds": {},
+	"usagePing.enabled":                     {},
+	"usagePing.endpoint":                    {},
+}
+
+// repoKeeperRestartKeys are the process-level keeper keys: the running daemon
+// never re-reads them, so `host set` persists the value and tells the operator
+// a drain-aware restart is needed.
+var repoKeeperRestartKeys = map[string]struct{}{
+	"repoKeeper.enabled":                    {},
+	"repoKeeper.maxDiskGb":                  {},
+	"repoKeeper.fetchIntervalSeconds":       {},
+	"repoKeeper.authorizationWindowSeconds": {},
 }
 
 // newDaemonSetCmd returns the `donmai host set` command.
@@ -1209,9 +1320,23 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"  capacity.maxConcurrentSessions  Maximum concurrently accepted sessions\n" +
 			"                                  for this local daemon (0 = accept none).\n" +
 			"  capacity.poolMaxDiskGb          Maximum total pool disk usage in GiB before\n" +
-			"                                  LRU eviction triggers (0 = no limit).\n\n" +
-			"The change is written atomically to ~/.donmai/daemon.yaml and the daemon\n" +
-			"reloads the affected subsystem without a restart.",
+			"                                  LRU eviction triggers (0 = no limit).\n" +
+			"  repoKeeper.enabled              Enable the per-host repository keeper\n" +
+			"                                  (0 or 1; default off).\n" +
+			"  repoKeeper.maxDiskGb            Maximum total keeper disk usage in GiB\n" +
+			"                                  before eviction (0 = no limit).\n" +
+			"  repoKeeper.fetchIntervalSeconds Bound on how often a mirror is re-fetched.\n" +
+			"  repoKeeper.authorizationWindowSeconds  Bound on how long a resolved\n" +
+			"                                  authorization is honored.\n" +
+			"  usagePing.enabled               Count this installation in the public\n" +
+			"                                  usage numbers (0 or 1; default off).\n" +
+			"                                  1 mints a random installation id; 0 clears\n" +
+			"                                  it and stops all sending.\n" +
+			"  usagePing.endpoint              HTTPS receiver URL for the weekly\n" +
+			"                                  usage ping (empty disables sending).\n\n" +
+			"The change is written atomically to ~/.donmai/daemon.yaml. Capacity keys\n" +
+			"reload the affected subsystem without a restart; repoKeeper.* keys are\n" +
+			"process-level and need a drain-aware restart to take effect.",
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1219,11 +1344,52 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			value := args[1]
 
 			if _, ok := allowedCapacityKeys[key]; !ok {
-				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb", key)
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds, usagePing.enabled, usagePing.endpoint", key)
+			}
+
+			// The usage-count consent lives in daemon.yaml under
+			// `usagePing`, which the project-tree YAML model does not
+			// carry. Handle it here with a raw-node edit so the rest
+			// of the file is preserved byte-for-byte outside that
+			// block, then notify the running daemon best-effort.
+			if strings.HasPrefix(key, "usagePing.") {
+				yamlPath := cfgPath
+				if yamlPath == "" {
+					yamlPath = afclient.DefaultDaemonYAMLPath()
+				}
+				msg, err := applyUsagePingSet(yamlPath, key, value)
+				if err != nil {
+					return err
+				}
+				notifyUsagePingSet(cmd, factory, host, port, jsonOut, key, value, msg)
+				return nil
 			}
 
 			// Validate integer capacity keys locally so we give a clear error
 			// before hitting the daemon.
+			if _, ok := repoKeeperRestartKeys[key]; ok {
+				n, err := strconv.Atoi(value)
+				if err != nil || n < 0 || (key == "repoKeeper.enabled" && n > 1) {
+					return fmt.Errorf("%s must be a non-negative integer%s, got %q", key, boolRangeHint(key), value)
+				}
+				yamlPath := cfgPath
+				if yamlPath == "" {
+					yamlPath = afclient.DefaultDaemonYAMLPath()
+				}
+				cfg, readErr := afclient.ReadDaemonYAML(yamlPath)
+				if readErr != nil {
+					return fmt.Errorf("read daemon config: %w", readErr)
+				}
+				applyRepoKeeperSet(cfg, key, int64(n))
+				if writeErr := afclient.WriteDaemonYAMLWithCapacity(yamlPath, cfg, key, n); writeErr != nil {
+					return fmt.Errorf("write daemon config: %w", writeErr)
+				}
+				// Process-level: persist the value, then tell the operator a
+				// drain-aware restart is needed. Still notify the daemon
+				// best-effort below so a live daemon can report its view.
+				notifyRepoKeeperRestartKey(cmd, factory, host, port, jsonOut, key, value)
+				return nil
+			}
 			if key == "capacity.poolMaxDiskGb" || key == "capacity.maxConcurrentSessions" {
 				n, err := strconv.Atoi(value)
 				if err != nil || n < 0 {
@@ -1288,6 +1454,135 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
 
 	return cmd
+}
+
+// boolRangeHint names the 0-or-1 range for boolean keeper keys.
+func boolRangeHint(key string) string {
+	if key == "repoKeeper.enabled" || key == "usagePing.enabled" {
+		return " (0 or 1)"
+	}
+	return ""
+}
+
+// applyUsagePingSet records one usagePing.* set into daemon.yaml via a
+// raw-node edit (the project-tree YAML model does not carry the block),
+// preserving every other key. Enabling with no valid id mints a fresh
+// random one; disabling clears the id and the endpoint so a disabled
+// ping keeps no identifier and no destination. It returns the human
+// summary line for the notify step.
+func applyUsagePingSet(yamlPath, key, value string) (string, error) {
+	switch key {
+	case "usagePing.enabled":
+		n, err := strconv.Atoi(value)
+		if err != nil || (n != 0 && n != 1) {
+			return "", fmt.Errorf("usagePing.enabled must be 0 or 1, got %q", value)
+		}
+		if n == 1 {
+			id, err := readUsagePingField(yamlPath, "installationId")
+			if err != nil {
+				return "", err
+			}
+			if !validUsagePingID(id) {
+				id, err = mintUsagePingID()
+				if err != nil {
+					return "", err
+				}
+			}
+			if err := writeUsagePingField(yamlPath, "installationId", id); err != nil {
+				return "", err
+			}
+			if err := writeUsagePingField(yamlPath, "enabled", "true"); err != nil {
+				return "", err
+			}
+			return "counting this installation (weekly anonymous ping)", nil
+		}
+		if err := deleteUsagePingBlock(yamlPath); err != nil {
+			return "", err
+		}
+		return "usage count off; identifier cleared, no ping will be sent", nil
+	case "usagePing.endpoint":
+		endpoint := strings.TrimSpace(value)
+		if endpoint != "" && !strings.HasPrefix(endpoint, "https://") {
+			return "", fmt.Errorf("usagePing.endpoint must be an https URL or empty, got %q", value)
+		}
+		if err := writeUsagePingField(yamlPath, "endpoint", endpoint); err != nil {
+			return "", err
+		}
+		if endpoint == "" {
+			return "endpoint cleared; no ping will be sent", nil
+		}
+		return "endpoint recorded", nil
+	default:
+		return "", fmt.Errorf("unknown config key %q", key)
+	}
+}
+
+// notifyUsagePingSet tells the running daemon about a usage-count change
+// best-effort, then reports the outcome. The daemon hot-reloads the
+// block; disabling additionally cancels any queued attempt.
+func notifyUsagePingSet(cmd *cobra.Command, factory daemonClientFactory, host string, port int, jsonOut bool, key, value, msg string) {
+	httpCfg := afclient.DefaultDaemonConfig()
+	if host != "" {
+		httpCfg.Host = host
+	}
+	if port != 0 {
+		httpCfg.Port = port
+	}
+	client := factory(httpCfg)
+	if _, err := client.SetCapacityConfig(key, value); err != nil {
+		out := cmd.OutOrStdout()
+		_, _ = fmt.Fprintf(out, "set %s=%s (%s; daemon not reachable; config written to disk)\n", key, value, msg)
+		return
+	}
+	out := cmd.OutOrStdout()
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]string{"key": key, "value": value, "message": msg})
+		return
+	}
+	_, _ = fmt.Fprintf(out, "set %s=%s: %s\n", key, value, msg)
+}
+
+// applyRepoKeeperSet records one repoKeeper.* set into the in-memory YAML.
+func applyRepoKeeperSet(cfg *afclient.DaemonYAML, key string, n int64) {
+	switch key {
+	case "repoKeeper.enabled":
+		cfg.RepoKeeper.Enabled = n == 1
+	case "repoKeeper.maxDiskGb":
+		cfg.RepoKeeper.MaxDiskGb = n
+	case "repoKeeper.fetchIntervalSeconds":
+		cfg.RepoKeeper.FetchIntervalSeconds = n
+	case "repoKeeper.authorizationWindowSeconds":
+		cfg.RepoKeeper.AuthorizationWindowSeconds = n
+	}
+}
+
+// notifyRepoKeeperRestartKey tells the running daemon about a process-level
+// keeper change best-effort, then reports that a drain-aware restart is
+// needed for it to take effect.
+func notifyRepoKeeperRestartKey(cmd *cobra.Command, factory daemonClientFactory, host string, port int, jsonOut bool, key, value string) {
+	httpCfg := afclient.DefaultDaemonConfig()
+	if host != "" {
+		httpCfg.Host = host
+	}
+	if port != 0 {
+		httpCfg.Port = port
+	}
+	client := factory(httpCfg)
+	if _, err := client.SetCapacityConfig(key, value); err != nil {
+		out := cmd.OutOrStdout()
+		_, _ = fmt.Fprintf(out, "set %s=%s (daemon not reachable; config written to disk; restart the daemon with drained work for it to take effect)\n", key, value)
+		return
+	}
+	out := cmd.OutOrStdout()
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]string{"key": key, "value": value, "message": "config written to disk; restart the daemon with drained work for it to take effect"})
+		return
+	}
+	_, _ = fmt.Fprintf(out, "set %s=%s: config written to disk; restart the daemon with drained work for it to take effect\n", key, value)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1392,6 +1687,20 @@ func padRight(s string, w int) string {
 
 // formatWorkerStat renders the "Worker:" row of `host stats`. Returns a
 // short description of the worker id with stub annotation when applicable.
+// formatRepoKeeperStat renders the secret-free keeper snapshot: mirror
+// count, last fetch, revoked count, and bytes. No scope values or URLs.
+func formatRepoKeeperStat(r *afclient.DaemonStatsResponse) string {
+	if r == nil || r.RepoKeeper == nil {
+		return "disabled"
+	}
+	k := r.RepoKeeper
+	last := k.LastFetchAt
+	if last == "" {
+		last = "never"
+	}
+	return fmt.Sprintf("%d mirror(s), last fetch %s, %d revoked, %d bytes", k.MirrorCount, last, k.RevokedCount, k.Bytes)
+}
+
 func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.WorkerID == "" {
 		return "(unregistered)"

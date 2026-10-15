@@ -55,7 +55,14 @@ const (
 	ToolDeliveryGeminiMCPBridge       ToolDeliveryKind = "gemini_in_box_mcp_bridge"
 	ToolDeliveryOpenCodePermissionMap ToolDeliveryKind = "opencode_permission_map"
 	ToolDeliveryOpenCodeProjectMCP    ToolDeliveryKind = "opencode_project_mcp_config"
-	ToolDeliveryPiInjectedBoundary    ToolDeliveryKind = "pi_handshake_policy_extension"
+	// ToolDeliveryMuseApprovalBridge is the muse MSP approval bridge:
+	// approval/request server-requests evaluated against
+	// Spec.PermissionConfig, answered via approval/decide.
+	ToolDeliveryMuseApprovalBridge ToolDeliveryKind = "muse_approval_bridge"
+	// ToolDeliveryMuseSessionMCP is the muse inline session MCP surface:
+	// config.mcpServers on session/start and session/resume.
+	ToolDeliveryMuseSessionMCP     ToolDeliveryKind = "muse_session_mcp"
+	ToolDeliveryPiInjectedBoundary ToolDeliveryKind = "pi_handshake_policy_extension"
 	// ToolDeliveryPiAdditionalExtension is pi's tool_plugin channel: one or
 	// more Spec.AdditionalExtensions (ADR-2026-08-12 D1) materialized into
 	// the per-session state directory, digest-verified after materialization,
@@ -985,7 +992,7 @@ func dropDeniedAdvisoryExtensions(spec Spec, entries []ToolLifecycleEntry) Spec 
 }
 
 // additionalExtensionDigestInput reduces spec.AdditionalExtensions to
-// (id, kind, digest) triples before hashing for the receipt's input digest.
+// source digests and delegation declarations before hashing for the receipt's input digest.
 // Each delivery's own Digest already commits to its exact on-disk bytes
 // (ExtensionDelivery.Digest, verified after materialization by the exact
 // harness adapter), so the plan/receipt layer never needs — and must not
@@ -993,13 +1000,14 @@ func dropDeniedAdvisoryExtensions(spec Spec, entries []ToolLifecycleEntry) Spec 
 // out of plan/receipt evidence.
 func additionalExtensionDigestInput(deliveries []ExtensionDelivery) any {
 	type extensionDigestEntry struct {
-		ID     string                `json:"id"`
-		Kind   ExtensionDeliveryKind `json:"kind"`
-		Digest string                `json:"digest"`
+		ID              string                `json:"id"`
+		Kind            ExtensionDeliveryKind `json:"kind"`
+		Digest          string                `json:"digest"`
+		DelegationTools []string              `json:"delegationTools,omitempty"`
 	}
 	out := make([]extensionDigestEntry, len(deliveries))
 	for i, d := range deliveries {
-		out[i] = extensionDigestEntry{ID: d.ID, Kind: d.Kind, Digest: d.Digest}
+		out[i] = extensionDigestEntry{ID: d.ID, Kind: d.Kind, Digest: d.Digest, DelegationTools: d.DelegationTools}
 	}
 	return out
 }
@@ -1150,7 +1158,8 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 		ToolDeliveryClaudeMCPConfig, ToolDeliveryCodexApprovalBridge, ToolDeliveryCodexAppServerMCP,
 		ToolDeliveryCodexCLIMCPConfig,
 		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge,
-		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
+		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryMuseApprovalBridge,
+		ToolDeliveryMuseSessionMCP, ToolDeliveryPiInjectedBoundary,
 		ToolDeliveryPiAdditionalExtension, ToolDeliveryPiInteractiveLocalToolPolicy,
 		ToolDeliveryNoToolSurface,
 		ToolDeliveryStructuredProviderEvents, ToolDeliveryCoarsePTYEvents, ToolDeliveryStructuredEventReplay,

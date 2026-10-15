@@ -1,14 +1,13 @@
 // Package installer provides the OS-aware daemon-installer dispatcher.
 //
 // On macOS, calls flow through installer/launchd. On Linux, calls flow
-// through installer/systemd. The host binary's `daemon run` subcommand is
+// through installer/systemd. The host binary's `host run` subcommand is
 // what gets registered as the service entrypoint (locked
-// decision — no separate rensei-daemon binary).
+// decision — no separate daemon binary).
 //
 // This package is the single import surface for `donmai daemon install`,
 // `rensei daemon install`, etc. It is exported so downstream binaries
-// (rensei-tui, etc.) can drive the same in-process install flow without
-// reimplementing it.
+// can drive the same in-process install flow without reimplementing it.
 package installer
 
 import (
@@ -72,13 +71,25 @@ type InstallOptions struct {
 	// Scope is the systemd unit scope (Linux only). Ignored on macOS.
 	Scope Scope
 
-	// ConfigPath is the daemon config path; sets DONMAI_DAEMON_CONFIG on
-	// Linux. Currently unused on macOS.
+	// ConfigPath is the daemon config path to ensure before installing:
+	// the fresh-host config is seeded when absent, an existing config
+	// is validated and left untouched. On Linux it is also exported as
+	// DONMAI_DAEMON_CONFIG via Environment= in the unit. Empty means the
+	// daemon default (~/.donmai/daemon.yaml).
 	ConfigPath string
 
 	// Description overrides the systemd [Unit] Description= field. Ignored
 	// on macOS.
 	Description string
+
+	// UnitName overrides the systemd unit name (Linux only). Empty means
+	// the OSS default. A downstream embedder keeps its own unit name
+	// through this field — never by forking the installer. Ignored on macOS.
+	UnitName string
+
+	// SyslogIdentifier overrides the systemd SyslogIdentifier= journal tag
+	// (Linux only). Empty follows the effective unit name. Ignored on macOS.
+	SyslogIdentifier string
 
 	// ProcessPriority is the daemon service's process-priority mode. Only an
 	// explicit value changes the mode: the empty value keeps the mode saved by
@@ -118,7 +129,11 @@ type InstallResult struct {
 
 // UninstallOptions are the OS-agnostic options for Uninstall.
 type UninstallOptions struct {
-	Scope              Scope
+	Scope Scope
+	// UnitName selects the systemd unit to remove (Linux only). Empty
+	// means the current default; the pre-rename unit is always retired
+	// alongside. Ignored on macOS.
+	UnitName           string
 	SkipServiceManager bool
 }
 
@@ -131,7 +146,10 @@ type UninstallResult struct {
 
 // DoctorOptions are the OS-agnostic options for Doctor.
 type DoctorOptions struct {
-	Scope              Scope
+	Scope Scope
+	// UnitName selects the systemd unit to inspect (Linux only). Empty
+	// means the current default. Ignored on macOS.
+	UnitName           string
 	SkipServiceManager bool
 }
 
@@ -225,6 +243,7 @@ func installDarwin(opts InstallOptions, priority ProcessPriority, source Process
 		HostBinPath:     opts.HostBinPath,
 		ProcessPriority: priority,
 		SkipLaunchctl:   opts.SkipServiceManager,
+		ConfigPath:      opts.ConfigPath,
 	})
 	if err != nil {
 		return InstallResult{}, err
@@ -247,12 +266,14 @@ func installLinux(opts InstallOptions, priority ProcessPriority, source ProcessP
 		return InstallResult{}, err
 	}
 	unitPath, err := systemd.Install(systemd.InstallOptions{
-		Scope:           scope,
-		BinPath:         opts.HostBinPath,
-		Description:     opts.Description,
-		ConfigPath:      opts.ConfigPath,
-		ProcessPriority: priority,
-		SkipSystemctl:   opts.SkipServiceManager,
+		Scope:            scope,
+		BinPath:          opts.HostBinPath,
+		Description:      opts.Description,
+		UnitName:         opts.UnitName,
+		SyslogIdentifier: opts.SyslogIdentifier,
+		ConfigPath:       opts.ConfigPath,
+		ProcessPriority:  priority,
+		SkipSystemctl:    opts.SkipServiceManager,
 	})
 	if err != nil {
 		return InstallResult{}, err
@@ -289,6 +310,7 @@ func Uninstall(opts UninstallOptions) (UninstallResult, error) {
 		}
 		unitPath, err := systemd.Uninstall(systemd.UninstallOptions{
 			Scope:         scope,
+			UnitName:      opts.UnitName,
 			SkipSystemctl: opts.SkipServiceManager,
 		})
 		if err != nil {
@@ -351,6 +373,7 @@ func Doctor(opts DoctorOptions) (DoctorReport, error) {
 		}
 		res, err := systemd.Doctor(systemd.DoctorOptions{
 			Scope:         scope,
+			UnitName:      opts.UnitName,
 			SkipSystemctl: opts.SkipServiceManager,
 		})
 		if err != nil {
@@ -361,12 +384,23 @@ func Doctor(opts DoctorOptions) (DoctorReport, error) {
 			val := *res.IsActive
 			active = &val
 		}
+		detail := res.StatusOutput
+		if res.LegacyUnit != "" {
+			legacy := "pre-rename unit still present at " + res.LegacyUnit + " — re-run `host install` to migrate"
+			if res.LegacyActive != nil && *res.LegacyActive {
+				legacy += " (it is still running)"
+			}
+			if detail != "" {
+				detail += "\n"
+			}
+			detail += legacy
+		}
 		return DoctorReport{
 			OS:          "linux",
 			ServicePath: res.UnitPath,
 			Installed:   res.UnitExists,
 			Active:      active,
-			Detail:      res.StatusOutput,
+			Detail:      detail,
 		}, nil
 
 	default:

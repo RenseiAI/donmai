@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -79,6 +81,15 @@ type Config struct {
 	// daemon read the same struct (daemon -> runner/access, one-way; no
 	// cycle). Mirrors the Observability optional-block slot above.
 	ModelAccess *access.ModelAccessConfig `yaml:"modelAccess,omitempty" json:"modelAccess,omitempty"`
+	// KeepFailedWorktrees lets an operator keep failed sessions' worktrees
+	// on disk for post-mortem recovery. Absent or false (the default), a
+	// failed, stopped or timed-out session's worktree is torn down once
+	// the rescue has archived its unpublished work as a patch; true states
+	// DONMAI_KEEP_FAILED_WORKTREE in every spawned worker's environment so
+	// `agent run` preserves the worktree instead. Successful sessions are
+	// always torn down; interactive sessions keep their own publication
+	// hold regardless of this setting.
+	KeepFailedWorktrees bool `yaml:"keepFailedWorktrees,omitempty" json:"keepFailedWorktrees,omitempty"`
 	// Workarea holds Layer-3 workarea-surface tunables (archive root,
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.
@@ -87,6 +98,18 @@ type Config struct {
 	// applyDefaults seeds ScanPaths to [DefaultKitScanPath()] when
 	// absent. Per ADR-2026-05-07 § D4.
 	Kit KitConfig `yaml:"kit,omitempty"          json:"kit,omitempty"`
+	// RepoKeeper holds the per-host repository-keeper tunables (see
+	// repo_keeper.go). Optional; all zero means the keeper stays off and
+	// nothing is created under repo-keeper/. Process-level: changing any of
+	// these needs a drain-aware restart — the running keeper never re-reads
+	// them, and `daemon set` persists the value and says so.
+	RepoKeeper RepoKeeperConfig `yaml:"repoKeeper,omitempty" json:"repoKeeper,omitempty"`
+	// UsagePing holds the opt-in anonymous usage-count consent (see
+	// usage_ping.go). Optional; the zero value keeps the ping disabled:
+	// nothing is sent unless the operator explicitly opts in and
+	// configures an endpoint. Consent state is separate from daemon
+	// registration, credentials, and auto-update configuration.
+	UsagePing UsagePingConfig `yaml:"usagePing,omitempty" json:"usagePing,omitempty"`
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
 	// actor). Optional; applyDefaults seeds Mode via
@@ -272,6 +295,13 @@ type CapacityConfig struct {
 	// MaxConcurrentSessions when fields are omitted. Zero value means
 	// budgeting is off (report mode "none").
 	SeatBudget SeatBudgetConfig `yaml:"seatBudget,omitempty" json:"seatBudget,omitempty"`
+	// SeatQoS is the opt-in per-seat scheduling class: default, utility
+	// or background. Empty reads as default — seats spawn exactly as
+	// before. Non-default classes wrap the seat worker on macOS (the
+	// only OS with the primitive) so seats prefer efficiency cores
+	// (utility) or run at the lowest band (background); the daemon
+	// itself always stays at default. Reported in status verbatim.
+	SeatQoS string `yaml:"seatQoS,omitempty" json:"seatQoS,omitempty"`
 }
 
 // SeatBudgetConfig is the authored per-seat resource budget in daemon.yaml.
@@ -307,7 +337,7 @@ type ReservedSystemSpec struct {
 //
 // The retired per-repository clone override is not modelled here. A file
 // that still carries the key keeps loading; the loader logs one deprecation
-// warning per file (see warnIfRetiredCloneStrategyPresent), and writers
+// warning per process (see warnOnceRetiredCloneStrategy), and writers
 // never emit the key.
 type ProjectConfig struct {
 	RepositoryID string      `yaml:"-"                        json:"repositoryId,omitempty"`
@@ -322,6 +352,10 @@ type ProjectConfig struct {
 //
 // The retired per-repository clone override is not modelled here; see
 // ProjectConfig.
+//
+// A file that still carries the key keeps loading; the loader logs one
+// deprecation warning per process (see warnOnceRetiredCloneStrategy).
+// Writers never emit the key.
 type RepositoryConfig struct {
 	ID        string      `yaml:"id"                      json:"id"`
 	ProjectID string      `yaml:"projectId"               json:"projectId"`
@@ -338,7 +372,7 @@ type RepositoryConfig struct {
 //
 // The retired per-repository clone override is not decoded: files that still
 // carry the key keep loading and the value is ignored. LoadConfig logs one
-// deprecation warning per file (see warnIfRetiredCloneStrategyPresent), so
+// deprecation warning per process (see warnOnceRetiredCloneStrategy), so
 // this decoder stays silent.
 func (p *ProjectConfig) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
@@ -366,27 +400,38 @@ func (p *ProjectConfig) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// retiredCloneStrategyWarning is the single deprecation notice logged when
-// a load encounters the retired per-repository clone override. The key is
-// ignored; the warning tells operators to drop it.
-const retiredCloneStrategyWarning = "daemon.yaml: 'cloneStrategy' is retired and ignored; remove the key"
+// retiredCloneStrategyWarning names the retired per-repository clone
+// override. The key is ignored; the warning tells operators to drop it.
+// The message is composed per emission (see
+// warnOnceRetiredCloneStrategy) so it can name the file and the count of
+// affected entries.
+const retiredCloneStrategyWarning = "'cloneStrategy' is retired and ignored; remove the key"
 
-// warnIfRetiredCloneStrategyPresent scans the raw file for the retired key
-// and logs exactly one deprecation warning when any entry still carries it.
-// The typed decoder ignores the key, so detection runs on the raw mapping
+// retiredCloneStrategyWarnOnce guards the deprecation notice so a single
+// process emits it at most once, no matter how many times the config is
+// loaded (the daemon and its watchers may parse the file many times per
+// run). Tests that need a fresh emission reset it via
+// ResetRetiredCloneStrategyWarningForTest.
+var retiredCloneStrategyWarnOnce sync.Once
+
+// countRetiredCloneStrategyKeys reports how many entries under the
+// projects and repositories sequences still carry the retired key. The
+// typed decoder ignores the key, so detection runs on the raw mapping
 // tree: the typed structs no longer name the key at all.
-func warnIfRetiredCloneStrategyPresent(data []byte) {
+func countRetiredCloneStrategyKeys(data []byte) int {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return
+		return 0
 	}
 	root := &doc
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		root = root.Content[0]
 	}
 	if root.Kind != yaml.MappingNode {
-		return
+		return 0
 	}
+	count := 0
+	seen := make(map[int]struct{})
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		key := root.Content[i]
 		if key.Kind != yaml.ScalarNode {
@@ -412,12 +457,39 @@ func warnIfRetiredCloneStrategyPresent(data []byte) {
 			}
 			for j := 0; j+1 < len(item.Content); j += 2 {
 				if item.Content[j].Kind == yaml.ScalarNode && item.Content[j].Value == "cloneStrategy" {
-					slog.Warn(retiredCloneStrategyWarning)
-					return
+					// One entry counts once even when reached through a
+					// YAML alias that appears several times.
+					if _, ok := seen[item.Content[j].Line]; !ok {
+						seen[item.Content[j].Line] = struct{}{}
+						count++
+					}
+					break
 				}
 			}
 		}
 	}
+	return count
+}
+
+// warnOnceRetiredCloneStrategy logs the deprecation notice at most once
+// per process, naming the file and the count of affected entries.
+func warnOnceRetiredCloneStrategy(path string, count int) {
+	if count <= 0 {
+		return
+	}
+	retiredCloneStrategyWarnOnce.Do(func() {
+		slog.Warn("daemon.yaml: "+retiredCloneStrategyWarning,
+			"path", path,
+			"entries", count,
+		)
+	})
+}
+
+// ResetRetiredCloneStrategyWarningForTest re-arms the once-per-process
+// deprecation notice so tests can observe the emission in isolation from
+// one another and from load order. Production code must not call it.
+func ResetRetiredCloneStrategyWarningForTest() {
+	retiredCloneStrategyWarnOnce = sync.Once{}
 }
 
 // ProjectGit captures per-project credential helper / SSH key hints.
@@ -511,6 +583,53 @@ func DefaultConfigPath() string {
 	return statepath.Resolve("daemon.yaml", "/tmp/.donmai/daemon.yaml")
 }
 
+// RepoKeeperConfig configures the per-host repository keeper. The zero value
+// keeps the keeper disabled: nothing is created under repo-keeper/.
+type RepoKeeperConfig struct {
+	// Enabled gates keeper construction. Default off.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxDiskGb caps total mirror disk usage in GiB before budget eviction.
+	// 0 means no limit.
+	MaxDiskGb int64 `yaml:"maxDiskGb,omitempty" json:"maxDiskGb,omitempty"`
+	// FetchIntervalSeconds bounds how often a mirror is re-fetched.
+	// 0 means the keeper default.
+	FetchIntervalSeconds int64 `yaml:"fetchIntervalSeconds,omitempty" json:"fetchIntervalSeconds,omitempty"`
+	// AuthorizationWindowSeconds bounds how long a resolved authorization
+	// is honored. 0 means the keeper default.
+	AuthorizationWindowSeconds int64 `yaml:"authorizationWindowSeconds,omitempty" json:"authorizationWindowSeconds,omitempty"`
+}
+
+// DefaultRepoKeeperFetchIntervalSeconds is the keeper default when
+// fetchIntervalSeconds is unset.
+const DefaultRepoKeeperFetchIntervalSeconds = 30
+
+// DefaultRepoKeeperAuthorizationWindowSeconds is the keeper default when
+// authorizationWindowSeconds is unset.
+const DefaultRepoKeeperAuthorizationWindowSeconds = 300
+
+// EffectiveRepoKeeperSettings resolves the authored config to the
+// process-level settings the keeper constructs with.
+func (c *Config) EffectiveRepoKeeperSettings() RepoKeeperSettings {
+	var cfg RepoKeeperConfig
+	if c != nil {
+		cfg = c.RepoKeeper
+	}
+	fetchInterval := cfg.FetchIntervalSeconds
+	if fetchInterval <= 0 {
+		fetchInterval = DefaultRepoKeeperFetchIntervalSeconds
+	}
+	authorizationWindow := cfg.AuthorizationWindowSeconds
+	if authorizationWindow <= 0 {
+		authorizationWindow = DefaultRepoKeeperAuthorizationWindowSeconds
+	}
+	return RepoKeeperSettings{
+		Enabled:             cfg.Enabled,
+		MaxBytes:            cfg.MaxDiskGb * 1024 * 1024 * 1024,
+		FetchInterval:       time.Duration(fetchInterval) * time.Second,
+		AuthorizationWindow: time.Duration(authorizationWindow) * time.Second,
+	}
+}
+
 // DefaultJWTPath returns the path to the cached JWT under ~/.donmai/.
 func DefaultJWTPath() string {
 	return statepath.Resolve("daemon.jwt", "/tmp/.donmai/daemon.jwt")
@@ -532,9 +651,10 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse daemon config %q: %w", path, err)
 	}
 	// The retired clone override is not part of the typed schema, so its
-	// presence is detected on the raw document: one warning per load no
-	// matter how many entries still carry the key.
-	warnIfRetiredCloneStrategyPresent(data)
+	// presence is detected on the raw document: one warning per process no
+	// matter how many entries still carry the key or how often the file
+	// is loaded.
+	warnOnceRetiredCloneStrategy(path, countRetiredCloneStrategyKeys(data))
 
 	// Decode authored presence with the same YAML rules as Config, including
 	// aliases and merge keys. Null, like omission, requests the default.
@@ -1001,7 +1121,22 @@ func validateConfig(c *Config) error {
 	if c.Capacity.MaxConcurrentSessions < 0 {
 		return errors.New("capacity.maxConcurrentSessions must be >= 0")
 	}
+	if c.RepoKeeper.MaxDiskGb < 0 {
+		return errors.New("repoKeeper.maxDiskGb must be >= 0")
+	}
+	if c.RepoKeeper.FetchIntervalSeconds < 0 {
+		return errors.New("repoKeeper.fetchIntervalSeconds must be >= 0")
+	}
+	if c.RepoKeeper.AuthorizationWindowSeconds < 0 {
+		return errors.New("repoKeeper.authorizationWindowSeconds must be >= 0")
+	}
 	if err := validateSeatBudget(c.Capacity.SeatBudget); err != nil {
+		return err
+	}
+	if err := validateSeatQoS(c.Capacity.SeatQoS); err != nil {
+		return err
+	}
+	if err := validateUsagePing(c.UsagePing); err != nil {
 		return err
 	}
 	if c.ProjectAdmissionVersion != 0 && c.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {

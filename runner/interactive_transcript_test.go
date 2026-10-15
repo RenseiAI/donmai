@@ -223,8 +223,8 @@ func TestInteractive_TranscriptActivityForwardsContentVerbatim(t *testing.T) {
 	ctx := context.Background()
 	text := strings.Repeat("é", 3000) + " end-of-thought"
 	output := strings.Repeat("日本", 2000) + "\nhttps://example.invalid/pull/1"
-	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.AssistantTextEvent{Text: text})
-	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.ToolResultEvent{ToolName: "bash", Content: output})
+	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.AssistantTextEvent{Text: text}, nil)
+	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.ToolResultEvent{ToolName: "bash", Content: output}, nil)
 	if len(sink.events) != 2 {
 		t.Fatalf("sink got %d events, want 2", len(sink.events))
 	}

@@ -212,3 +212,32 @@ func TestQueuedWork_CodeIntel_UnknownFieldTolerance(t *testing.T) {
 		t.Errorf("absent block must decode to a nil pointer, got %+v", fresh.CodeIntel)
 	}
 }
+
+func TestDeliveryPolicyHelpers(t *testing.T) {
+	var nilPolicy *DeliveryPolicy
+	if nilPolicy.AllowsDraft() {
+		t.Error("nil policy AllowsDraft = true; want false (today's behaviour)")
+	}
+	if nilPolicy.AllowsMerges() {
+		t.Error("nil policy AllowsMerges = true; want false (today's behaviour)")
+	}
+	zero := &DeliveryPolicy{}
+	if zero.AllowsDraft() || zero.AllowsMerges() {
+		t.Error("zero policy allows something; want today's behaviour")
+	}
+	draft := &DeliveryPolicy{AllowDraft: true}
+	if !draft.AllowsDraft() || draft.AllowsMerges() {
+		t.Errorf("draft policy = %+v; want only drafts allowed", draft)
+	}
+	merges := &DeliveryPolicy{AllowMergeCommits: true}
+	if merges.AllowsDraft() || !merges.AllowsMerges() {
+		t.Errorf("merge policy = %+v; want only merges allowed", merges)
+	}
+	clean := &DeliveryPolicy{AllowCleanMerge: true}
+	if clean.AllowsDraft() || clean.AllowsMerges() || !clean.AllowsCleanMerge() {
+		t.Errorf("clean-merge policy = %+v; want only clean merges allowed", clean)
+	}
+	if zero.AllowsCleanMerge() || nilPolicy.AllowsCleanMerge() {
+		t.Error("absent clean-merge intent allows clean merges; want today's behaviour")
+	}
+}

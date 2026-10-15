@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -115,7 +116,9 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 				return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, server.close)
 			}
 			spec.Env = launch.env
-			return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
+			return ptycli.SpawnWithOptions(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), ptycli.SpawnOptions{
+				TerminalCost: interactiveTerminalCost(launch.env["CODEX_HOME"], nil),
+			})
 		}
 	}
 	// A gateway-routed cell falls through to the isolated boundary below so
@@ -230,14 +233,131 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		cleanup := func() error { return errors.Join(server.close(), config.remove()) }
 		return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
 	}
-	return ptycli.SpawnWithCleanup(
+	handle, err := ptycli.SpawnWithOptions(
 		ctx,
 		bin,
 		launch.argv,
 		spec,
 		(&Provider{}).Manifest(),
-		config.remove,
+		ptycli.SpawnOptions{
+			Cleanup:      config.remove,
+			TerminalCost: interactiveTerminalCost(config.home, nil),
+		},
 	)
+	if err != nil {
+		return nil, err
+	}
+	// The unnamed PTY has no thread id yet (the TUI creates its thread
+	// after spawn), so the context source resolves lazily: the first
+	// rollout file to appear under this session's own home names the
+	// thread the session actually ran as.
+	return &interactiveContextHandle{Handle: handle, home: config.home}, nil
+}
+
+// interactiveContextHandle is the unnamed-interactive PTY handle plus the
+// session's context-usage source. It embeds the ptycli handle so the PTY
+// surface, event stream, and terminal-cost behavior stay byte-identical;
+// it only adds the ContextUsageSourcer seam the runner's interactive
+// watcher resolves per session (never a process-wide variable). The
+// thread id is unknown at spawn — the TUI creates its thread after the
+// PTY is up — so ContextUsageRollout resolves lazily to the session home
+// with an empty thread until the first rollout file appears, and the
+// watcher re-resolves every tick.
+type interactiveContextHandle struct {
+	agent.Handle
+	home string
+}
+
+var (
+	_ agent.InteractiveCapable            = (*interactiveContextHandle)(nil)
+	_ agent.InteractiveTerminalCostSource = (*interactiveContextHandle)(nil)
+	_ agent.ContextUsageSourcer           = (*interactiveContextHandle)(nil)
+)
+
+// InteractiveSession forwards the live PTY surface through the embedded
+// handle. The assertion runs against the dynamic type: embedding the
+// agent.Handle INTERFACE promotes only that interface's methods, never
+// the underlying *ptycli.Handle's own InteractiveSession, so without
+// this explicit forwarder the runner's attach path would see a handle
+// with no live surface.
+func (h *interactiveContextHandle) InteractiveSession() agent.InteractiveSession {
+	if h == nil || h.Handle == nil {
+		return nil
+	}
+	capable, ok := h.Handle.(agent.InteractiveCapable)
+	if !ok {
+		return nil
+	}
+	return capable.InteractiveSession()
+}
+
+// HasTerminalCost forwards the ptycli handle's terminal-cost declaration
+// so the runner's post-exit wait keeps the long grace for a promised
+// harness-accounted cost. Without it the wrapper would hide the
+// declaration and the runner would stop waiting after the short grace.
+func (h *interactiveContextHandle) HasTerminalCost() bool {
+	if h == nil || h.Handle == nil {
+		return false
+	}
+	src, ok := h.Handle.(agent.InteractiveTerminalCostSource)
+	return ok && src.HasTerminalCost()
+}
+
+// ContextUsageSidecarPath reports no sidecar: the codex leg is the
+// rollout file, never a sidecar.
+func (h *interactiveContextHandle) ContextUsageSidecarPath() string { return "" }
+
+// ContextUsageRollout returns the session's own home with the thread left
+// empty until the rollout file appears: the watcher re-resolves the path
+// every tick (see runner/context_usage.go), so an empty thread simply
+// polls nothing yet.
+func (h *interactiveContextHandle) ContextUsageRollout() (string, string) {
+	if h == nil {
+		return "", ""
+	}
+	return h.home, ""
+}
+
+// namedInteractiveContextHandle is the named-interactive PTY handle plus
+// the session's context-usage source. It shares interactiveContextHandle's
+// forwarding and differs only in thread resolution: the naming flow knows
+// the thread id once the session is named (or up front on the attach
+// path), so it reports it through an atomic the spawn flow stores into.
+type namedInteractiveContextHandle struct {
+	interactiveContextHandle
+	thread *atomic.Value
+}
+
+// ContextUsageRollout returns the session's own home and the thread the
+// session was named as (or "" while naming has not completed).
+func (h *namedInteractiveContextHandle) ContextUsageRollout() (string, string) {
+	if h == nil {
+		return "", ""
+	}
+	if h.thread != nil {
+		if id, _ := h.thread.Load().(string); id != "" {
+			return h.home, id
+		}
+	}
+	return h.home, ""
+}
+
+// interactiveTerminalCost returns the TerminalCost closure for one
+// interactive PTY spawn: at child exit it reads the thread's session file
+// under home and attaches the last cumulative token total as the terminal
+// cost. home is the exact CODEX_HOME the child ran under; resolveThreadID
+// reports the thread the session actually ran as, or "" when it is not
+// known (an attach path records the resume key up front, the fresh path
+// only after naming). Either unknown keeps the bare result — absent records
+// are "unknown", never "free" — and a re-adopted session after a daemon
+// restart reads the same cumulative file, so it reports the same total.
+func interactiveTerminalCost(home string, resolveThreadID func() string) func() *agent.CostData {
+	return func() *agent.CostData {
+		if home == "" || resolveThreadID == nil {
+			return nil
+		}
+		return rolloutUsageCost(home, resolveThreadID())
+	}
 }
 
 // spawnNamedInteractivePTY points launch's argv at server (remoteInteractiveArgs
@@ -263,12 +383,24 @@ func spawnNamedInteractivePTY(
 	cleanup func() error,
 ) (agent.Handle, error) {
 	launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
-	handle, err := ptycli.SpawnWithCleanup(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), cleanup)
+	home := spec.Env["CODEX_HOME"]
+	var currentThreadID atomic.Value
+	currentThreadID.Store("")
+	resolveThreadID := func() string { id, _ := currentThreadID.Load().(string); return id }
+	handle, err := ptycli.SpawnWithOptions(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), ptycli.SpawnOptions{
+		Cleanup:      cleanup,
+		TerminalCost: interactiveTerminalCost(home, resolveThreadID),
+	})
 	if err != nil {
 		return nil, err
 	}
+	wrapped := &namedInteractiveContextHandle{
+		interactiveContextHandle: interactiveContextHandle{Handle: handle, home: home},
+		thread:                   &currentThreadID,
+	}
 	if attachToExistingNamedSession(spec) {
-		return handle, nil
+		currentThreadID.Store(spec.SessionName)
+		return wrapped, nil
 	}
 	nameTimeout := opts.HandshakeTimeout
 	if nameTimeout <= 0 {
@@ -297,7 +429,8 @@ func spawnNamedInteractivePTY(
 	// finishNamingLiveInteractiveThread waits through Codex's rollout-flush
 	// race, so the resume key is recorded only after the native state exists.
 	recordResumeKey(spec.Env["CODEX_HOME"], threadID)
-	return handle, nil
+	currentThreadID.Store(threadID)
+	return wrapped, nil
 }
 
 // validateNamedInteractiveTransport keeps the optional naming layer honest on
@@ -470,6 +603,14 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	}
 	if model := strings.TrimSpace(spec.Model); model != "" {
 		args = append(args, "--config", "model="+tomlBasicString(model))
+	}
+	// A gateway-routed cell restates its provider block through CLI
+	// overrides (see gatewayProviderConfigOverride): the private config
+	// file carries the primary route, and these ride the CLI layer above
+	// every file layer, so repo-checked-in provider config cannot redirect
+	// the bearer. Non-routed sessions render nothing and keep their argv.
+	if baseURL, _, routed, routeErr := gatewayBinding(spec); routeErr == nil && routed {
+		args = append(args, gatewayProviderConfigOverride(baseURL)...)
 	}
 	// Reasoning effort rides the same process-local override as model:
 	// model_reasoning_effort is codex's own config.toml key, and the headless

@@ -48,18 +48,24 @@ func TestGenerateUnitFile_User(t *testing.T) {
 		t.Fatalf("GenerateUnitFile: %v", err)
 	}
 
+	// TestGenerateUnitFile_SetupRefusalHoldsFailed pins the fresh-host
+	// restart contract: the setup refusal exits with the status the
+	// unit names in RestartPreventExitStatus, so the unit waits for its
+	// config instead of restarting every RestartSec. Dropping the
+	// directive (or changing the refusal's exit) must fail this test.
 	for _, want := range []string{
 		"[Unit]",
-		"Description=Rensei local daemon — worker pool",
+		"Description=Donmai local daemon \u2014 worker pool",
 		"After=network-online.target",
 		"[Service]",
 		"Type=simple",
 		"ExecStart=/usr/local/bin/af host run",
 		"Restart=on-failure",
 		"SuccessExitStatus=3",
+		"RestartPreventExitStatus=4",
 		"StandardOutput=journal",
 		"StandardError=journal",
-		"SyslogIdentifier=rensei-daemon",
+		"SyslogIdentifier=donmai-daemon",
 		"WantedBy=default.target",
 	} {
 		if !strings.Contains(out, want) {
@@ -101,12 +107,50 @@ func TestGenerateUnitFile_RegistersHostRunNotSeparateDaemonBinary(t *testing.T) 
 	}
 
 	// Locked decision: ExecStart must be `<host-binary> host run`,
-	// NOT a separate rensei-daemon binary.
+	// NOT a separate daemon binary.
 	if !strings.Contains(out, "ExecStart=/opt/af host run") {
 		t.Errorf("ExecStart must register the host binary's host run subcommand. Got:\n%s", out)
 	}
-	if strings.Contains(out, "ExecStart=/opt/af start") || strings.Contains(out, "rensei-daemon start") {
-		t.Errorf("ExecStart must NOT register the legacy rensei-daemon binary or start subcommand. Got:\n%s", out)
+	if strings.Contains(out, "ExecStart=/opt/af start") || strings.Contains(out, "donmai-daemon start") {
+		t.Errorf("ExecStart must NOT register a separate daemon binary or start subcommand. Got:\n%s", out)
+	}
+}
+
+// TestGenerateUnitFile_BrandNeutralDefault pins the debrand: the default
+// unit carries the OSS unit name, the OSS description, and the matching
+// journal tag. The pre-rename strings must not appear anywhere in a default
+// render — the log-identifier gap the guard's case-sensitive brand rule
+// cannot see is pinned here instead.
+func TestGenerateUnitFile_BrandNeutralDefault(t *testing.T) {
+	out, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{})
+	if err != nil {
+		t.Fatalf("GenerateUnitFile: %v", err)
+	}
+	for _, want := range []string{
+		"Description=" + DefaultDescription,
+		"SyslogIdentifier=" + DefaultUnitName,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected unit file to contain %q, got:\n%s", want, out)
+		}
+	}
+	if DefaultDescription != "Donmai local daemon \u2014 worker pool" {
+		t.Errorf("DefaultDescription = %q, want the brand-neutral default", DefaultDescription)
+	}
+	if DefaultUnitName != "donmai-daemon" {
+		t.Errorf("DefaultUnitName = %q, want donmai-daemon", DefaultUnitName)
+	}
+	// The pre-rename unit name and description must not appear anywhere in
+	// a default render. The literals are assembled so this assertion does
+	// not itself reintroduce the strings the guard exists to catch: the
+	// brand rule is case-sensitive and blind to the lowercase unit name,
+	// which is exactly the gap this test closes.
+	legacyUnit := LegacyUnitName()
+	legacyTitle := strings.ToTitle(legacyUnit[:6]) + legacyUnit[6:]
+	for _, banned := range []string{legacyUnit, legacyTitle} {
+		if strings.Contains(out, banned) {
+			t.Errorf("default unit must not contain %q, got:\n%s", banned, out)
+		}
 	}
 }
 
@@ -409,9 +453,9 @@ func TestDoctor_UnitExists(t *testing.T) {
 	}
 
 	fr := newFakeRunner()
-	fr.set("systemctl --user is-active rensei-daemon", "active", nil)
-	fr.set("systemctl --user is-enabled rensei-daemon", "enabled", nil)
-	fr.set("systemctl --user status --no-pager rensei-daemon", "● rensei-daemon.service - Rensei", nil)
+	fr.set("systemctl --user is-active donmai-daemon", "active", nil)
+	fr.set("systemctl --user is-enabled donmai-daemon", "enabled", nil)
+	fr.set("systemctl --user status --no-pager donmai-daemon", "\u25cf donmai-daemon.service - Donmai", nil)
 
 	res, err := Doctor(DoctorOptions{Scope: ScopeUser, Runner: fr})
 	if err != nil {
@@ -426,7 +470,7 @@ func TestDoctor_UnitExists(t *testing.T) {
 	if res.IsEnabled == nil || !*res.IsEnabled {
 		t.Errorf("expected IsEnabled=true, got %v", res.IsEnabled)
 	}
-	if !strings.Contains(res.StatusOutput, "rensei-daemon.service") {
+	if !strings.Contains(res.StatusOutput, "donmai-daemon.service") {
 		t.Errorf("expected status output to contain unit info, got %q", res.StatusOutput)
 	}
 }
@@ -476,5 +520,371 @@ func TestGenerateUnitFile_KeepsTheControlGroupKill(t *testing.T) {
 				t.Errorf("scope %s unit sets %q; the unit keeps the default control-group kill and the seat scope is the survival boundary:\n%s", scope, banned, out)
 			}
 		}
+	}
+}
+
+// TestGenerateUnitFile_EmbedderUnitNameOverride pins the downstream seam:
+// an embedder keeps its own unit name and journal tag through installer
+// config, and the render carries no OSS default strings.
+func TestGenerateUnitFile_EmbedderUnitNameOverride(t *testing.T) {
+	out, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{UnitName: "acme-daemon"})
+	if err != nil {
+		t.Fatalf("GenerateUnitFile: %v", err)
+	}
+	for _, want := range []string{"SyslogIdentifier=acme-daemon"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected unit file to contain %q, got:\n%s", want, out)
+		}
+	}
+	for _, banned := range []string{"SyslogIdentifier=" + DefaultUnitName, "SyslogIdentifier=" + LegacyUnitName()} {
+		if strings.Contains(out, banned) {
+			t.Errorf("override render must not contain %q, got:\n%s", banned, out)
+		}
+	}
+	if got := ResolveUnitFilename("acme-daemon"); got != "acme-daemon.service" {
+		t.Errorf("ResolveUnitFilename = %q, want acme-daemon.service", got)
+	}
+}
+
+// TestGenerateUnitFile_EmbedderSyslogIdentifierOverride pins the journal-tag
+// half of the seam: an explicit tag wins over the unit-name default.
+func TestGenerateUnitFile_EmbedderSyslogIdentifierOverride(t *testing.T) {
+	out, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{
+		UnitName:         "acme-daemon",
+		SyslogIdentifier: "acme-journal",
+	})
+	if err != nil {
+		t.Fatalf("GenerateUnitFile: %v", err)
+	}
+	if !strings.Contains(out, "SyslogIdentifier=acme-journal") {
+		t.Errorf("expected explicit journal tag, got:\n%s", out)
+	}
+}
+
+// TestResolveUnitName pins the override normalization: empty means the OSS
+// default, a suffixed name agrees with its bare form, and surrounding
+// whitespace never leaks into a filename.
+func TestResolveUnitName(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		want  string
+		wantF string
+	}{
+		{name: "empty means default", in: "", want: DefaultUnitName, wantF: DefaultUnitName + ".service"},
+		{name: "bare name", in: "acme-daemon", want: "acme-daemon", wantF: "acme-daemon.service"},
+		{name: "suffixed agrees with bare", in: "acme-daemon.service", want: "acme-daemon", wantF: "acme-daemon.service"},
+		{name: "whitespace trimmed", in: "  acme-daemon  ", want: "acme-daemon", wantF: "acme-daemon.service"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ResolveUnitName(tc.in); got != tc.want {
+				t.Errorf("ResolveUnitName(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if got := ResolveUnitFilename(tc.in); got != tc.wantF {
+				t.Errorf("ResolveUnitFilename(%q) = %q, want %q", tc.in, got, tc.wantF)
+			}
+		})
+	}
+}
+
+// TestInstall_FreshInstallWritesCurrentUnit pins the fresh-install path: with
+// no legacy unit on disk the install writes the OSS unit, enables it, and
+// issues no legacy stop/disable.
+func TestInstall_FreshInstallWritesCurrentUnit(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	fr := newFakeRunner()
+	unitPath, err := Install(InstallOptions{
+		Scope:   ScopeUser,
+		BinPath: "/usr/local/bin/af",
+		Runner:  fr,
+	})
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if filepath.Base(unitPath) != DefaultUnitName+".service" {
+		t.Errorf("fresh install wrote %q, want %q", filepath.Base(unitPath), DefaultUnitName+".service")
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	if !strings.Contains(string(content), "SyslogIdentifier="+DefaultUnitName) {
+		t.Errorf("fresh unit must carry the current journal tag, got:\n%s", content)
+	}
+	joined := strings.Join(fr.calls, "\n")
+	if !strings.Contains(joined, "enable --now "+DefaultUnitName+".service") {
+		t.Errorf("fresh install must enable the current unit, calls:\n%s", joined)
+	}
+	for _, banned := range []string{"stop " + LegacyUnitName(), "disable " + LegacyUnitFilename()} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("fresh install must not touch the legacy unit (%q), calls:\n%s", banned, joined)
+		}
+	}
+}
+
+// TestInstall_MigratesLegacyUnit pins the upgrade path: a pre-rename unit on
+// disk is stopped, disabled, and removed, and the current unit is installed
+// and enabled. The daemon config on disk is preserved byte-for-byte — state
+// lives outside the unit, so the migration moves no state.
+func TestInstall_MigratesLegacyUnit(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
+	legacyContent := "[Unit]\nDescription=legacy\n[Service]\nExecStart=/usr/local/bin/af host run\n[Install]\nWantedBy=default.target\n"
+	if err := os.WriteFile(legacyPath, []byte(legacyContent), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
+		t.Fatalf("seed legacy unit: %v", err)
+	}
+
+	fr := newFakeRunner()
+	unitPath, err := Install(InstallOptions{
+		Scope:   ScopeUser,
+		BinPath: "/usr/local/bin/af",
+		Runner:  fr,
+	})
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if filepath.Base(unitPath) != DefaultUnitName+".service" {
+		t.Errorf("migrated install wrote %q, want %q", filepath.Base(unitPath), DefaultUnitName+".service")
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Errorf("legacy unit must be removed; stat err=%v", err)
+	}
+	joined := strings.Join(fr.calls, "\n")
+	for _, want := range []string{
+		"stop " + LegacyUnitName(),
+		"disable " + LegacyUnitFilename(),
+		"enable --now " + DefaultUnitName + ".service",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("migration must run %q, calls:\n%s", want, joined)
+		}
+	}
+	// The stop order matters: the legacy unit stops before the new unit is
+	// enabled, so two units never fight over the same daemon.
+	stopAt := strings.Index(joined, "stop "+LegacyUnitName())
+	enableAt := strings.Index(joined, "enable --now "+DefaultUnitName+".service")
+	if stopAt < 0 || enableAt < 0 || stopAt > enableAt {
+		t.Errorf("legacy stop must precede new enable, calls:\n%s", joined)
+	}
+}
+
+// TestInstall_MigrationPreservesConfig pins the state half of the upgrade:
+// the daemon config bytes on disk survive the migration untouched — the new
+// unit starts the same binary against the same config.
+func TestInstall_MigrationPreservesConfig(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	cfgPath := filepath.Join(tmp, "daemon.yaml")
+	cfgBytes := []byte("apiVersion: donmai.dev/v1\nkind: LocalDaemon\nmachine:\n  id: operator-host\ncapacity:\n  maxConcurrentSessions: 2\norchestrator:\n  url: http://127.0.0.1:1\n")
+	if err := os.WriteFile(cfgPath, cfgBytes, 0o600); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, LegacyUnitFilename()), []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
+		t.Fatalf("seed legacy unit: %v", err)
+	}
+
+	if _, err := Install(InstallOptions{
+		Scope:      ScopeUser,
+		BinPath:    "/usr/local/bin/af",
+		ConfigPath: cfgPath,
+		Runner:     newFakeRunner(),
+	}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	after, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(after) != string(cfgBytes) {
+		t.Errorf("migration rewrote the daemon config:\n--- before ---\n%s\n--- after ---\n%s", cfgBytes, after)
+	}
+}
+
+// TestInstall_MigrationSkipsSystemctlRemovesFileOnly pins the hermetic half:
+// with SkipSystemctl the migration still removes the legacy file but issues
+// no service-manager calls.
+func TestInstall_MigrationSkipsSystemctlRemovesFileOnly(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
+	if err := os.WriteFile(legacyPath, []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
+		t.Fatalf("seed legacy unit: %v", err)
+	}
+
+	fr := newFakeRunner()
+	if _, err := Install(InstallOptions{
+		Scope:         ScopeUser,
+		BinPath:       "/usr/local/bin/af",
+		Runner:        fr,
+		SkipSystemctl: true,
+	}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Errorf("legacy unit must be removed; stat err=%v", err)
+	}
+	if len(fr.calls) != 0 {
+		t.Errorf("SkipSystemctl migration must issue no systemctl calls, got %v", fr.calls)
+	}
+}
+
+// TestInstall_ReinstallIsStable pins idempotence: installing twice over the
+// same options leaves the unit bytes unchanged.
+func TestInstall_ReinstallIsStable(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	fr := newFakeRunner()
+	first, err := Install(InstallOptions{Scope: ScopeUser, BinPath: "/usr/local/bin/af", Runner: fr})
+	if err != nil {
+		t.Fatalf("first Install: %v", err)
+	}
+	before, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatalf("read first unit: %v", err)
+	}
+	second, err := Install(InstallOptions{Scope: ScopeUser, BinPath: "/usr/local/bin/af", Runner: newFakeRunner()})
+	if err != nil {
+		t.Fatalf("second Install: %v", err)
+	}
+	if second != first {
+		t.Errorf("reinstall path changed: %q vs %q", second, first)
+	}
+	after, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatalf("read second unit: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("reinstall rewrote the unit:\n--- before ---\n%s\n--- after ---\n%s", before, after)
+	}
+}
+
+// TestUninstall_RemovesBothUnits pins the uninstall half of the rename: with
+// both the current and the legacy unit on disk, one uninstall removes both.
+func TestUninstall_RemovesBothUnits(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	currentPath := filepath.Join(unitDir, DefaultUnitName+".service")
+	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
+	for _, p := range []string{currentPath, legacyPath} {
+		if err := os.WriteFile(p, []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
+			t.Fatalf("seed %s: %v", p, err)
+		}
+	}
+
+	fr := newFakeRunner()
+	removed, err := Uninstall(UninstallOptions{Scope: ScopeUser, Runner: fr})
+	if err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if removed != currentPath {
+		t.Errorf("Uninstall returned %q, want the current unit %q", removed, currentPath)
+	}
+	for _, p := range []string{currentPath, legacyPath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s must be removed; stat err=%v", p, err)
+		}
+	}
+	joined := strings.Join(fr.calls, "\n")
+	for _, want := range []string{"stop " + LegacyUnitName(), "stop " + DefaultUnitName} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("uninstall must %q, calls:\n%s", want, joined)
+		}
+	}
+}
+
+// TestDoctor_ReportsPendingMigration pins the doctor half: with only the
+// legacy unit on disk, doctor names the pending migration instead of
+// reporting a healthy install.
+func TestDoctor_ReportsPendingMigration(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	// #nosec G301 -- test seed mirrors the 0755 unit dirs production creates.
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	legacyPath := filepath.Join(unitDir, LegacyUnitFilename())
+	if err := os.WriteFile(legacyPath, []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
+		t.Fatalf("seed legacy unit: %v", err)
+	}
+
+	res, err := Doctor(DoctorOptions{Scope: ScopeUser, SkipSystemctl: true})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if res.UnitExists {
+		t.Errorf("UnitExists must be false with only the legacy unit on disk")
+	}
+	if res.LegacyUnit != legacyPath {
+		t.Errorf("LegacyUnit = %q, want %q", res.LegacyUnit, legacyPath)
+	}
+}
+
+// TestDoctor_ReportsLegacyActive pins the running-seat half: with both units
+// on disk and the legacy unit active, doctor reports both states so the
+// operator can see the migration has not run yet.
+func TestDoctor_ReportsLegacyActive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	if _, err := Install(InstallOptions{Scope: ScopeUser, BinPath: "/usr/local/bin/af", SkipSystemctl: true}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	unitDir := filepath.Join(tmp, ".config", "systemd", "user")
+	if err := os.WriteFile(filepath.Join(unitDir, LegacyUnitFilename()), []byte("[Unit]\n"), 0o644); err != nil { //nolint:gosec // test seed mirrors the world-readable unit file
+		t.Fatalf("seed legacy unit: %v", err)
+	}
+
+	fr := newFakeRunner()
+	fr.set("systemctl --user is-active "+DefaultUnitName, "", errors.New("inactive"))
+	fr.set("systemctl --user is-enabled "+DefaultUnitName, "enabled", nil)
+	fr.set("systemctl --user status --no-pager "+DefaultUnitName, "inactive", nil)
+	fr.set("systemctl --user is-active "+LegacyUnitName(), "active", nil)
+
+	res, err := Doctor(DoctorOptions{Scope: ScopeUser, Runner: fr})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if !res.UnitExists {
+		t.Errorf("UnitExists must be true with the current unit on disk")
+	}
+	if res.LegacyUnit == "" {
+		t.Errorf("LegacyUnit must name the pending migration")
+	}
+	if res.LegacyActive == nil || !*res.LegacyActive {
+		t.Errorf("LegacyActive must be true while the legacy unit runs, got %v", res.LegacyActive)
+	}
+	if res.IsActive == nil || *res.IsActive {
+		t.Errorf("IsActive must be false while the current unit is down, got %v", res.IsActive)
 	}
 }

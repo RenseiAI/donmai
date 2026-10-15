@@ -10,8 +10,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -59,6 +61,108 @@ func wantPrompts(t *testing.T, prompts []string, want ...string) {
 	}
 }
 
+// wantContinuationsWithGoal asserts the follow-up prompts of a scripted
+// session: each must carry the session's goal restatement (the dispatched
+// identifier and title plus the issue-body directive), and stripping that
+// block must leave exactly the want prompt sequence. The goal block is
+// derived from queuedWorkBase, so the expected restatement is fixed.
+func wantContinuationsWithGoal(t *testing.T, prompts []string, want ...string) {
+	t.Helper()
+	goal := continuationGoalForTest
+	if len(prompts) != len(want) {
+		t.Fatalf("follow-up prompts = %d %q; want %d", len(prompts), prompts, len(want))
+	}
+	for i := range want {
+		if !strings.HasSuffix(prompts[i], "\n\n"+goal) {
+			t.Errorf("prompt %d = %q; want it to end with the goal restatement %q", i, prompts[i], goal)
+		}
+		if base := strings.TrimSuffix(prompts[i], "\n\n"+goal); base != want[i] {
+			t.Errorf("prompt %d base = %q; want %q", i, base, want[i])
+		}
+	}
+}
+
+// TestContinuationPromptRestatesTheGoal pins the lost-goal remedy at the
+// prompt level: every continuation variant carries the goal block, and an
+// empty goal keeps the bare prompt byte for byte.
+func TestContinuationPromptRestatesTheGoal(t *testing.T) {
+	long := strings.Repeat("目", 600)
+	cases := []struct {
+		name string
+		qw   QueuedWork
+		want string
+	}{
+		{
+			name: "nothing goal-like",
+			want: "",
+		},
+		{
+			name: "identifier and title only",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{IssueIdentifier: " ISS-1 ", Title: " Fix it "}},
+			want: "The goal is ISS-1: Fix it. ",
+		},
+		{
+			name: "stage prompt wins over body and context",
+			qw: QueuedWork{QueuedWork: prompt.QueuedWork{
+				IssueIdentifier: "ISS-1", StagePrompt: " stage directive ", Body: "body", PromptContext: "context",
+			}},
+			want: "The goal is ISS-1. Goal directive: stage directive",
+		},
+		{
+			name: "body wins over context",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{Body: "body", PromptContext: "context"}},
+			want: "Goal directive: body",
+		},
+		{
+			name: "context is the last fallback",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{PromptContext: "context"}},
+			want: "Goal directive: context",
+		},
+		{
+			name: "directive capped at 500 runes",
+			qw:   QueuedWork{QueuedWork: prompt.QueuedWork{Body: long}},
+			want: "Goal directive: " + strings.Repeat("目", 500) + "…",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := continueGoalBlock(tc.qw)
+			if got != tc.want {
+				t.Fatalf("continueGoalBlock = %q; want %q", got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("continueGoalBlock = %q; want valid UTF-8", got)
+			}
+		})
+	}
+
+	bases := []struct {
+		reviewWork  bool
+		undelivered string
+		want        string
+	}{
+		{want: continuePrompt},
+		{reviewWork: true, want: continueReviewPrompt},
+		{undelivered: undeliveredDraft, want: continueDraftPrompt},
+		{undelivered: undeliveredNoNewCommit, want: continueNoNewCommitPrompt},
+	}
+	for _, base := range bases {
+		for _, empty := range []string{"", " \n\t "} {
+			if got := continuationPrompt(base.reviewWork, base.undelivered, empty); got != base.want {
+				t.Errorf("continuationPrompt(%v, %q, %q) = %q; want the bare prompt %q", base.reviewWork, base.undelivered, empty, got, base.want)
+			}
+		}
+		if got := continuationPrompt(base.reviewWork, base.undelivered, " The goal is ISS-1. "); got != base.want+"\n\nThe goal is ISS-1." {
+			t.Errorf("continuationPrompt(%v, %q, goal) = %q; want the base prompt plus the goal block", base.reviewWork, base.undelivered, got)
+		}
+	}
+}
+
+// continuationGoalForTest is the goal restatement a scripted session
+// carries: queuedWorkBase dispatches identifier MANIFEST-FOLLOWUP with
+// that title and issue body, so every continuation prompt ends with it.
+const continuationGoalForTest = "The goal is MANIFEST-FOLLOWUP: Test issue MANIFEST-FOLLOWUP. Goal directive: This is a test issue body."
+
 // TestRun_EarlyStopIsContinuedUntilTheWorkIsDone is the pi pattern: turns that
 // end on a one-line progress note with no result are continued, not nudged to
 // open a pull request, until a turn delivers the pull request.
@@ -74,7 +178,7 @@ func TestRun_EarlyStopIsContinuedUntilTheWorkIsDone(t *testing.T) {
 	if res.SteeringTriggered {
 		t.Errorf("SteeringTriggered = true; an early stop is continued, not nudged to open a pull request")
 	}
-	wantPrompts(t, prompts, continuePrompt, continuePrompt)
+	wantContinuationsWithGoal(t, prompts, continuePrompt, continuePrompt)
 	wantContinuations(t, res, 2, 0, false)
 	if res.TurnContinuations.Limit != DefaultTurnContinuationLimit {
 		t.Errorf("Limit = %d; want the default %d", res.TurnContinuations.Limit, DefaultTurnContinuationLimit)
@@ -118,7 +222,7 @@ func TestRun_ContinuationLimitReachedFailsWithTheCount(t *testing.T) {
 	if res.SteeringTriggered || res.PullRequestURL != "" {
 		t.Errorf("SteeringTriggered=%v PullRequestURL=%q; unfinished work gets no nudge and no pull request", res.SteeringTriggered, res.PullRequestURL)
 	}
-	wantPrompts(t, prompts, continuePrompt, continuePrompt)
+	wantContinuationsWithGoal(t, prompts, continuePrompt, continuePrompt)
 	wantContinuations(t, res, 2, 0, true)
 }
 
@@ -247,7 +351,29 @@ func TestRun_ContinuationBoundsFollowProgress(t *testing.T) {
 			if res.SteeringTriggered {
 				t.Errorf("SteeringTriggered = true; an early stop is continued, not nudged")
 			}
-			wantPrompts(t, provider.prompts, tc.wantPrompts...)
+			// The retry prompt carries no goal block (it replaces the
+			// continuation wholesale); continuation prompts do. Assert
+			// the two shapes separately so the table keeps one list.
+			if slices.Contains(tc.wantPrompts, retryPrompt) {
+				if len(provider.prompts) != len(tc.wantPrompts) {
+					t.Fatalf("follow-up prompts = %d %q; want %d", len(provider.prompts), provider.prompts, len(tc.wantPrompts))
+				}
+				for i, want := range tc.wantPrompts {
+					got := provider.prompts[i]
+					if want == retryPrompt {
+						if got != retryPrompt {
+							t.Errorf("prompt %d = %q; want the bare retry prompt", i, got)
+						}
+						continue
+					}
+					if !strings.HasSuffix(got, "\n\n"+continuationGoalForTest) ||
+						strings.TrimSuffix(got, "\n\n"+continuationGoalForTest) != want {
+						t.Errorf("prompt %d = %q; want %q plus the goal restatement", i, got, want)
+					}
+				}
+			} else {
+				wantContinuationsWithGoal(t, provider.prompts, tc.wantPrompts...)
+			}
 			if res.TurnContinuations == nil || *res.TurnContinuations != tc.want {
 				t.Fatalf("TurnContinuations = %+v; want %+v", res.TurnContinuations, tc.want)
 			}
@@ -567,8 +693,8 @@ func TestRun_EarlyStopAfterThePullRequestNudgeIsContinued(t *testing.T) {
 	if !res.SteeringTriggered {
 		t.Errorf("SteeringTriggered = false; the passed verdict without a pull request gets the nudge first")
 	}
-	if len(prompts) != 2 || prompts[1] != continuePrompt {
-		t.Fatalf("prompts = %q; want the nudge, then one continuation", prompts)
+	if len(prompts) != 2 || strings.TrimSuffix(prompts[1], "\n\n"+continuationGoalForTest) != continuePrompt {
+		t.Fatalf("prompts = %q; want the nudge, then one goal-restated continuation", prompts)
 	}
 	wantContinuations(t, res, 1, 0, false)
 }
@@ -629,7 +755,7 @@ func TestRun_OtherOwnRepositoryPullRequestThenEarlyStopIsContinued(t *testing.T)
 	if res.SteeringTriggered {
 		t.Errorf("SteeringTriggered = true; a turn citing someone else's pull request stopped early")
 	}
-	wantPrompts(t, provider.prompts, continuePrompt)
+	wantContinuationsWithGoal(t, provider.prompts, continuePrompt)
 	wantContinuations(t, res, 1, 0, false)
 	if res.PullRequestURL != followUpPR {
 		t.Errorf("PullRequestURL = %q; want %q", res.PullRequestURL, followUpPR)
@@ -688,7 +814,7 @@ func TestRun_ContinuationExhaustedStillRunsTheBackstop(t *testing.T) {
 			if res.SteeringTriggered {
 				t.Errorf("SteeringTriggered = true; unfinished work gets no pull request nudge")
 			}
-			wantPrompts(t, provider.prompts, continuePrompt)
+			wantContinuationsWithGoal(t, provider.prompts, continuePrompt)
 			if res.BackstopReport == nil || !res.BackstopReport.Pushed || !res.BackstopReport.PRCreated {
 				t.Fatalf("BackstopReport = %+v; want the work pushed and a pull request opened", res.BackstopReport)
 			}
@@ -732,7 +858,7 @@ func TestRun_ReviewTurnWithoutVerdictIsContinued(t *testing.T) {
 			{text: "Findings complete.\nWORK_RESULT: passed\nREVIEW_VERDICT: REQUEST_CHANGES"},
 		},
 	})
-	wantPrompts(t, provider.prompts, continueReviewPrompt)
+	wantContinuationsWithGoal(t, provider.prompts, continueReviewPrompt)
 	wantContinuations(t, res, 1, 0, false)
 	if res.WorkResult != "passed" {
 		t.Fatalf("WorkResult = %q; want passed", res.WorkResult)
@@ -768,7 +894,7 @@ func TestRun_ReviewTurnWithoutVerdictIsContinuedOnReadOnlyCheckout(t *testing.T)
 			{text: "Findings complete.\nWORK_RESULT: passed\nREVIEW_VERDICT: APPROVE"},
 		},
 	})
-	wantPrompts(t, provider.prompts, continueReviewPrompt)
+	wantContinuationsWithGoal(t, provider.prompts, continueReviewPrompt)
 	wantContinuations(t, res, 1, 0, false)
 	if res.WorkResult != "passed" {
 		t.Fatalf("WorkResult = %q; want passed", res.WorkResult)
@@ -975,7 +1101,135 @@ func (d *scriptedDraft) reads() []string {
 // session's pull request (followUpPR) has it as its head.
 const reworkBranch = "feature/rework"
 
-// TestRun_DraftPullRequestIsContinued is the reported failure: the brief asked
+// TestRun_DraftAllowedByPolicyIsDelivered is the reported failure's
+// remedy through the production entry point: under a dispatch-declared
+// draft allowance a draft pull request carrying the run's new commit is
+// delivered — the turn that left only the draft ends the session
+// completed, with no continuation prompt and no draft lookup at all.
+// The new-commit check still applies (see the no-new-commit case
+// below), and without the flag the same draft is continued (see
+// TestRun_DraftPullRequestIsContinued).
+func TestRun_DraftAllowedByPolicyIsDelivered(t *testing.T) {
+	draft := &scriptedDraft{states: []bool{true}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		draft:      draft.lookup,
+		delivery:   &prompt.DeliveryPolicy{AllowDraft: true},
+		turns: []verdictScriptTurn{
+			{
+				files: map[string]string{"fix.txt": "review comments addressed\n"},
+				push:  []string{"refs/heads/" + scriptedSessionBranch, "refs/pull/7/head"},
+				text:  "Pushed the fix to " + followUpPR + ".",
+			},
+			{text: "never reached"},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+	if res.SteeringTriggered {
+		t.Errorf("SteeringTriggered = true; a delivered draft is not nudged")
+	}
+	if got := draft.reads(); len(got) != 0 {
+		t.Errorf("draft reads = %q; want none under a draft allowance", got)
+	}
+}
+
+// TestRun_DraftAllowedByPolicyStillNeedsANewCommit proves the allowance
+// is narrow through the production entry point: a rework run under a
+// draft allowance whose pull request has no new commit since the run
+// started is still continued as undelivered, naming the missing commit.
+func TestRun_DraftAllowedByPolicyStillNeedsANewCommit(t *testing.T) {
+	draft := &scriptedDraft{states: []bool{true}}
+	note := verdictScriptTurn{text: "Read the review on " + followUpPR + "; I will fix the comments next."}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      draft.lookup,
+		delivery:   &prompt.DeliveryPolicy{AllowDraft: true},
+		turns:      append(slices.Repeat([]verdictScriptTurn{note}, 4), verdictScriptTurn{text: "never reached"}),
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
+		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsUnproductive)
+	}
+	if !strings.HasSuffix(res.Error, "the pull request does not deliver the work: no new commit") {
+		t.Errorf("Error = %q; want it to end with the reason, no new commit", res.Error)
+	}
+	wantContinuationsWithGoal(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
+	wantContinuations(t, res, DefaultTurnContinuationLimit, 0, true)
+	if got := draft.reads(); len(got) != 0 {
+		t.Errorf("draft reads = %q; want none under a draft allowance", got)
+	}
+}
+
+// TestRun_ReworkMergeAllowedByPolicyIsDelivered proves the merge
+// allowance through the production entry point on the rework path: a
+// rework run whose pull request gained only a merge carrying the run's
+// own resolution is delivered when the dispatch declared it, with no
+// continuation prompt.
+func TestRun_ReworkMergeAllowedByPolicyIsDelivered(t *testing.T) {
+	note := verdictScriptTurn{
+		text: "Merged the base branch into " + followUpPR + ".",
+		during: func(t *testing.T, cwd string) {
+			advanceMainAndMerge(t, cwd, "refs/heads/"+reworkBranch, "refs/pull/7/head")
+			writeFile(t, cwd, "resolved.txt", "resolution\n")
+			gitRun(t, cwd, "add", "resolved.txt")
+			gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
+			gitRun(t, cwd, "push", "-q", "-f", "origin", "HEAD:refs/heads/"+reworkBranch, "HEAD:refs/pull/7/head")
+		},
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      githubPullRequestDraft,
+		delivery:   &prompt.DeliveryPolicy{AllowMergeCommits: true},
+		turns:      []verdictScriptTurn{note, {text: "never reached"}},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+}
+
+// TestRun_ReworkCleanMergeAllowedByPolicyIsDelivered proves the
+// clean-merge intent through the production entry point on the rework
+// path: a rework run whose pull request gained only a CLEAN merge of
+// the base branch — merging IS the task — is delivered when the
+// dispatch declared it, with no continuation prompt. Without the flag
+// the same head is continued as merge-only (see
+// TestRun_ReworkMergeOnlyHeadIsContinuedAsNoNewCommit).
+func TestRun_ReworkCleanMergeAllowedByPolicyIsDelivered(t *testing.T) {
+	note := verdictScriptTurn{
+		text: "Merged the base branch into " + followUpPR + ".",
+		during: func(t *testing.T, cwd string) {
+			advanceMainAndMerge(t, cwd, "refs/heads/"+reworkBranch, "refs/pull/7/head")
+		},
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      githubPullRequestDraft,
+		delivery:   &prompt.DeliveryPolicy{AllowCleanMerge: true},
+		turns:      []verdictScriptTurn{note, {text: "never reached"}},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+}
+
 // for a draft pull request early, and the turn ended on a progress note with
 // that draft as its only result. The turn is continued with a prompt that
 // names the draft, and once the pull request is ready the work is delivered.
@@ -994,7 +1248,7 @@ func TestRun_DraftPullRequestIsContinued(t *testing.T) {
 	if res.Status != "completed" || res.PullRequestURL != followUpPR {
 		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
 	}
-	wantPrompts(t, provider.prompts, continueDraftPrompt)
+	wantContinuationsWithGoal(t, provider.prompts, continueDraftPrompt)
 	wantContinuations(t, res, 1, 0, false)
 	if res.SteeringTriggered {
 		t.Errorf("SteeringTriggered = true; a draft is continued, not nudged to open a pull request")
@@ -1056,7 +1310,7 @@ func TestRun_DraftPullRequestStillDraftIsNotDelivered(t *testing.T) {
 			if res.SteeringTriggered {
 				t.Errorf("SteeringTriggered = true; a draft gets no pull request nudge")
 			}
-			wantPrompts(t, provider.prompts, tc.wantPrompts...)
+			wantContinuationsWithGoal(t, provider.prompts, tc.wantPrompts...)
 			if res.TurnContinuations == nil || *res.TurnContinuations != tc.want {
 				t.Fatalf("TurnContinuations = %+v; want %+v", res.TurnContinuations, tc.want)
 			}
@@ -1122,7 +1376,7 @@ func TestRun_ReworkWithoutANewCommitIsContinuedThenNotDelivered(t *testing.T) {
 	if !strings.HasSuffix(res.Error, "the pull request does not deliver the work: no new commit") {
 		t.Errorf("Error = %q; want it to end with the reason, no new commit", res.Error)
 	}
-	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
+	wantContinuationsWithGoal(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
 	wantContinuations(t, res, DefaultTurnContinuationLimit, 0, true)
 	if _, err := os.Stat(ghCalls); !os.IsNotExist(err) {
 		t.Errorf("gh was called (%s): the new-commit check must not need it", readFile(t, ghCalls))
@@ -1151,7 +1405,7 @@ func TestRun_ReworkMergeOnlyHeadIsContinuedAsNoNewCommit(t *testing.T) {
 	if !strings.HasSuffix(res.Error, "the pull request does not deliver the work: no new commit") {
 		t.Fatalf("Error = %q; want it to end with the merge-only no-new-commit reason", res.Error)
 	}
-	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
+	wantContinuationsWithGoal(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
 	wantContinuations(t, res, DefaultTurnContinuationLimit, 0, true)
 	if _, err := os.Stat(ghCalls); !os.IsNotExist(err) {
 		t.Errorf("gh was called (%s): the merge-only delivery check must not need it", readFile(t, ghCalls))
@@ -1190,7 +1444,7 @@ func TestRun_UndeliveredContinuationsHaveTheirOwnLimit(t *testing.T) {
 	if res.PullRequestURL != followUpPR {
 		t.Errorf("PullRequestURL = %q; want the session's draft %s kept on the receipt", res.PullRequestURL, followUpPR)
 	}
-	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, undeliveredLimit)...)
+	wantContinuationsWithGoal(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, undeliveredLimit)...)
 	wantContinuations(t, res, undeliveredLimit, 0, true)
 }
 
@@ -1225,7 +1479,7 @@ func TestRun_DraftThatKeepsPushingIsNotCapped(t *testing.T) {
 	if res.Status != "completed" || res.PullRequestURL != followUpPR {
 		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
 	}
-	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, pushes+1)...)
+	wantContinuationsWithGoal(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, pushes+1)...)
 	wantContinuations(t, res, pushes+1, 0, false)
 }
 
@@ -1253,7 +1507,7 @@ func TestRun_DraftThatNeverMovesHitsTheUndeliveredBound(t *testing.T) {
 	if res.Error != wantErr {
 		t.Errorf("Error = %q; want %q", res.Error, wantErr)
 	}
-	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, DefaultTurnContinuationUndeliveredLimit)...)
+	wantContinuationsWithGoal(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, DefaultTurnContinuationUndeliveredLimit)...)
 	wantContinuations(t, res, DefaultTurnContinuationUndeliveredLimit, 0, true)
 }
 
@@ -1280,7 +1534,7 @@ func TestRun_OnlyUndeliveredContinuationsCountTowardTheirBound(t *testing.T) {
 	if res.Status != "completed" || res.PullRequestURL != followUpPR {
 		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
 	}
-	wantPrompts(t, provider.prompts, append(slices.Repeat([]string{continuePrompt}, undeliveredLimit+1), continueDraftPrompt)...)
+	wantContinuationsWithGoal(t, provider.prompts, append(slices.Repeat([]string{continuePrompt}, undeliveredLimit+1), continueDraftPrompt)...)
 	wantContinuations(t, res, undeliveredLimit+2, 0, false)
 }
 
@@ -1365,8 +1619,8 @@ func TestRun_ReworkHeadMovedBySomeoneElseIsNotDelivered(t *testing.T) {
 		t.Errorf("Error = %q; want it to end with the reason, no new commit", res.Error)
 	}
 	for _, prompt := range provider.prompts {
-		if prompt != continueNoNewCommitPrompt {
-			t.Errorf("prompt = %q; want only the no-new-commit continuation", prompt)
+		if strings.TrimSuffix(prompt, "\n\n"+continuationGoalForTest) != continueNoNewCommitPrompt {
+			t.Errorf("prompt = %q; want only the goal-restated no-new-commit continuation", prompt)
 		}
 	}
 }
@@ -1473,7 +1727,7 @@ func TestRun_SessionVerdictEndsThePullRequestReRead(t *testing.T) {
 // request a draft says so and reports its turn result, and the session
 // completes instead of being continued to its bound.
 func TestRun_IntentionalDraftVerdictAfterTheDraftPromptCompletes(t *testing.T) {
-	for _, want := range []string{"deliberately needs the pull request to stay a draft", "report your turn result (WORK_RESULT)"} {
+	for _, want := range []string{"deliberately needs the pull request to stay a draft", "report your turn result (WORK_RESULT)", "gh pr ready"} {
 		if !strings.Contains(continueDraftPrompt, want) {
 			t.Fatalf("continueDraftPrompt does not offer the intentional-draft way out (%q):\n%s", want, continueDraftPrompt)
 		}
@@ -1494,7 +1748,7 @@ func TestRun_IntentionalDraftVerdictAfterTheDraftPromptCompletes(t *testing.T) {
 		t.Fatalf("Status=%q PullRequestURL=%q WorkResult=%q (%s: %s); want completed and passed with %s",
 			res.Status, res.PullRequestURL, res.WorkResult, res.FailureMode, res.Error, followUpPR)
 	}
-	wantPrompts(t, provider.prompts, continueDraftPrompt)
+	wantContinuationsWithGoal(t, provider.prompts, continueDraftPrompt)
 	wantContinuations(t, res, 1, 0, false)
 }
 

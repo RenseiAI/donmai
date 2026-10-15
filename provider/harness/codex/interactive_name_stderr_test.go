@@ -185,6 +185,28 @@ func runCodexFakeNamedAppServer() {
 				if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
 					return
 				}
+			case "thread/resume":
+				// Attach-path existence check (resumeExistingNamedThreadWithRequest):
+				// the re-adoption fixture resumes a thread-id-shaped name
+				// whose rollout the test pre-plants, so acknowledge it.
+				resumeID := os.Getenv(codexFakeNamedAppServerResumeThreadEnv)
+				if resumeID == "" {
+					resumeID = fakeNamedAppServerThreadID
+				}
+				var resumeParams struct {
+					ThreadID string `json:"threadId"`
+				}
+				_ = json.Unmarshal(inbound.Params, &resumeParams)
+				if resumeParams.ThreadID != resumeID {
+					errBody, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: inbound.ID, Error: &rpcError{Code: -32600, Message: "no rollout found for thread id " + resumeParams.ThreadID}})
+					_ = conn.Write(ctx, websocket.MessageText, errBody)
+					return
+				}
+				resumeResult, _ := json.Marshal(map[string]any{"thread": map[string]any{"id": resumeID}})
+				resumeBody, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: inbound.ID, Result: resumeResult})
+				if err := conn.Write(ctx, websocket.MessageText, resumeBody); err != nil {
+					return
+				}
 			}
 		}
 	})
@@ -194,6 +216,12 @@ func runCodexFakeNamedAppServer() {
 // fakeNamedAppServerThreadID is the fixed thread id runCodexFakeNamedAppServer
 // hands out for the one thread its "thread/start" case ever creates.
 const fakeNamedAppServerThreadID = "thread-fresh-fixture"
+
+// codexFakeNamedAppServerResumeThreadEnv overrides which thread id the fake
+// bootstrap app-server's thread/resume case acknowledges. The re-adoption
+// test sets it to its thread-id-shaped session name so the attach-path
+// existence check passes for exactly that thread.
+const codexFakeNamedAppServerResumeThreadEnv = "DONMAI_CODEX_FAKE_NAMED_APP_SERVER_RESUME_THREAD"
 
 // fakeNamedAppServerHub broadcasts to every websocket connection currently
 // open on one fake bootstrap app-server process — standing in for the real

@@ -21,6 +21,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/mcpheaders"
@@ -114,6 +115,30 @@ func terminalReceiverAuthorization(source terminalRuntimeCredentialSource) worka
 		}
 		return "Bearer " + token, nil
 	}
+}
+
+// terminalReplayLoops is the daemon side of the exactly-one-record
+// contract: the lease loop drains lease-bound terminal records and the
+// standalone loop drains leaseless ones, through one sender that resolves
+// each record's own receiver key per attempt. Extracted so the wiring test
+// pins that both loops run (a dropped loop strands every terminal of its
+// kind with no error anywhere).
+func startTerminalReplayLoops(ctx context.Context, leaseManager *worktree.Manager, auth workarea.ReceiverAuthorizationResolver) {
+	leaseSender := leaseManager.TerminalStatusHTTPSender(
+		&http.Client{Timeout: workarea.DefaultTerminalResultReplayTimeout},
+		auth,
+	)
+	go leaseManager.RunTerminalResultReplayer(ctx, workarea.TerminalResultReplayOptions{
+		OnError: func(err error) { slog.Warn("terminal status replay failed", "err", err) },
+	}, leaseSender)
+	// The standalone loop drains the records that have no terminal
+	// workarea lease: every terminal status a shim-owned seat
+	// persisted before its first send, plus the
+	// worker_exited_without_result fallback. Same sender — each
+	// record resolves its own receiver key per attempt.
+	go leaseManager.RunStandaloneOutboxReplayer(ctx, workarea.TerminalResultReplayOptions{
+		OnError: func(err error) { slog.Warn("standalone terminal status replay failed", "err", err) },
+	}, leaseSender)
 }
 
 // rotateDaemonLogs size-checks the launchd-managed daemon log files
@@ -347,12 +372,23 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("construct local runtime: %w", err)
 			}
-			if localProviders != nil {
+			switch {
+			case localProviders != nil:
 				if cfg.AgentSpecExtensionDecorator != nil {
 					return errors.New("local runtime does not yet admit additional extension decorators")
 				}
 				providerView = localProviders
-			} else {
+			case localOptions != nil:
+				// A fresh-host seed (file queue URL with an explicit
+				// policy but no harness or repository profile yet)
+				// reaches composition before any operator ran setup.
+				// Refuse with the operator action before the daemon
+				// starts any runtime, heartbeat, or poller — Daemon.Start
+				// repeats the same refusal for callers that bypass this
+				// entry point. The typed refusal maps to the
+				// no-restart setup exit below.
+				return afclient.ErrNeedsSetup
+			default:
 				providerView, err = daemonProviderView(cfg, slog.Default())
 				if err != nil {
 					return fmt.Errorf("construct daemon provider view: %w", err)
@@ -380,6 +416,10 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// only the production entry point configures this seam; see
 				// Options.CodexOrphanSweeper's doc comment.
 				CodexOrphanSweeper: providercodex.SweepOrphans,
+				// The real seeded-trust crash sweep — only the production
+				// entry point configures this seam; see
+				// Options.TrustLedgerSweeper's doc comment.
+				TrustLedgerSweeper: providerclaude.SweepSeededTrustForConfigHome,
 				// The live quota probes — resolved from PATH so a host
 				// without an installed harness simply leaves that
 				// harness unprobed. See Options.QuotaProbeBinaries.
@@ -393,6 +433,13 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			// Reconcile terminal authorities before the daemon admits work. Receiver
 			// endpoints are resolved from the separate registry on every replay;
 			// no bearer is persisted by this public implementation.
+			// The two replay loops below are the daemon side of the
+			// exactly-one-record contract (see the runner's standalone
+			// persist and the standalone replayer's doc comment): the
+			// lease loop drains lease-bound records, the standalone loop
+			// drains leaseless ones, and each terminal body lives in
+			// exactly one of them. startTerminalReplayLoops owns the
+			// wiring so the replay-loop test pins it.
 			archiveRoot, err := workareaArchiveRoot(configPath)
 			if err != nil {
 				return fmt.Errorf("load workarea archive configuration: %w", err)
@@ -412,21 +459,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("terminal lease recovery authority: %w", err)
 			}
-			leaseSender := leaseManager.TerminalStatusHTTPSender(
-				&http.Client{Timeout: workarea.DefaultTerminalResultReplayTimeout},
-				terminalReceiverAuthorization(d),
-			)
-			go leaseManager.RunTerminalResultReplayer(ctx, workarea.TerminalResultReplayOptions{
-				OnError: func(err error) { slog.Warn("terminal status replay failed", "err", err) },
-			}, leaseSender)
-			// The standalone loop drains the records that have no terminal
-			// workarea lease: every terminal status a shim-owned seat
-			// persisted before its first send, plus the
-			// worker_exited_without_result fallback. Same sender — each
-			// record resolves its own receiver key per attempt.
-			go leaseManager.RunStandaloneOutboxReplayer(ctx, workarea.TerminalResultReplayOptions{
-				OnError: func(err error) { slog.Warn("standalone terminal status replay failed", "err", err) },
-			}, leaseSender)
+			startTerminalReplayLoops(ctx, leaseManager, terminalReceiverAuthorization(d))
 			go leaseManager.RunTerminalLeaseReaper(ctx, workarea.ReaperOptions{
 				OnError: func(err error) { slog.Warn("terminal lease reaping failed", "err", err) },
 			})

@@ -76,6 +76,10 @@ type Config struct {
 	// Optional — when empty no auth header is set (test paths use
 	// httptest.Server without auth).
 	AuthToken string
+	// Traceparent and Tracestate carry the dispatch W3C trace context.
+	// Empty values omit the corresponding request headers.
+	Traceparent string
+	Tracestate  string
 	// SessionClass is the runtime session-class discriminator stamped on
 	// every lock-refresh request body (wire field "sessionClass"). The
 	// runner sets it to "interactive" for a PTY-hosted interactive session
@@ -460,6 +464,22 @@ func NewWithAckObserver(cfg Config, observer func(int64)) (*Pulser, error) {
 	return p, nil
 }
 
+// SetAckObserver replaces the successful-tick acknowledgement callback
+// (see NewWithAckObserver). It exists so a caller that starts the pulser
+// before its observation target exists — the runner starts liveness before
+// provisioning yields a workarea — can rebind the observer once the target
+// materialises, without rebuilding the pulser or dropping a beat. A nil
+// observer disables observation. Safe to call from any goroutine; a tick
+// in flight observes either the old or the new callback, never a mix.
+func (p *Pulser) SetAckObserver(observer func(int64)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.onHeartbeatAck = observer
+	p.mu.Unlock()
+}
+
 // LostOwnership returns a channel that closes when the platform has
 // stopped accepting heartbeats (3 consecutive ticks failed). The
 // runner selects on this to abort the session early.
@@ -728,6 +748,26 @@ func (p *Pulser) loseOwnershipNow() {
 	}
 }
 
+// AckObserver returns the current successful-tick acknowledgement
+// callback (see NewWithAckObserver and SetAckObserver). A nil return
+// means observation is disabled. Safe to call from any goroutine.
+func (p *Pulser) AckObserver() func(int64) {
+	if p == nil {
+		return nil
+	}
+	return p.ackObserver()
+}
+
+// ackObserver returns the current successful-tick acknowledgement
+// callback under the pulser mutex. The observer is set at construction
+// and may be rebound later via SetAckObserver; a tick in flight
+// observes either the old or the new callback, never a mix.
+func (p *Pulser) ackObserver() func(int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.onHeartbeatAck
+}
+
 // tick performs one heartbeat attempt — including up to maxAttempts
 // inner HTTP retries — and updates the strike counter. Returns no
 // error: state is observed via Strikes / LostOwnership.
@@ -740,8 +780,8 @@ func (p *Pulser) tick(ctx context.Context) {
 			prev := p.strikes.Swap(0)
 			tick := p.cfg.now().UnixMilli()
 			p.lastTick.Store(tick)
-			if p.onHeartbeatAck != nil {
-				p.onHeartbeatAck(tick)
+			if observer := p.ackObserver(); observer != nil {
+				observer(tick)
 			}
 			if p.degraded.CompareAndSwap(true, false) {
 				// Interactive degraded → healthy transition: connectivity
@@ -864,6 +904,12 @@ func (p *Pulser) postRefresh(ctx context.Context, ack string, dead []DeadLettere
 		return nil, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}

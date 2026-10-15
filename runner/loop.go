@@ -62,6 +62,9 @@ func worktreeProvisionStrategy(qw QueuedWork) worktree.CloneStrategy {
 // Step ordering matches the design doc verbatim:
 //
 //  1. Resolve provider
+//     1b. Start heartbeat pulser (before provisioning so a session that is
+//     still cloning keeps sending liveness and is never reclaimed as stale;
+//     stopped cleanly on any provisioning failure)
 //  2. Provision worktree
 //  3. Compose env (after credential injection — runner-side cred
 //     resolution is a daemon responsibility today; this step takes
@@ -262,6 +265,91 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		)
 	}
 
+	// 1b. Start the heartbeat pulser BEFORE provisioning (step 2) so a
+	// session that is still cloning and installing keeps sending liveness
+	// and is never reclaimed as stale, while a worker that goes silent
+	// still is. Pulser.Start fires the first tick synchronously, then runs
+	// the loop in its own goroutine; the deferred Stop below releases it on
+	// every exit path, including provisioning failure. Best-effort like the
+	// later per-session rails: a construction or start error is logged and
+	// the run continues without liveness.
+	//
+	// OnInject is wired here rather than at the post-spawn pulse site
+	// because the pulser is constructed once: the inject rail needs the
+	// channel + dedup set owned by this Run, so they are created up front
+	// and shared with the post-spawn consumer below.
+	injectCh := make(chan heartbeat.InjectPayload, 8)
+	seenInject := map[string]struct{}{}
+	runtimeInjectEnabled := caps.SupportsMessageInjection || qw.isInteractive()
+	var hbCredentialProvider heartbeat.CredentialProvider
+	if r.credentialProvider != nil {
+		hbCredentialProvider = func(ctx context.Context) (heartbeat.RuntimeCredentials, error) {
+			creds, err := r.credentialProvider(ctx)
+			return heartbeat.RuntimeCredentials{
+				WorkerID:  creds.WorkerID,
+				AuthToken: creds.AuthToken,
+			}, err
+		}
+	}
+	// Wave 3 runtime memory-inject: wire OnInject only when a consumer exists.
+	// See newInjectAcceptor for the dedup + ack-or-requeue contract, and for
+	// why the interactive mode acks on DELIVERY rather than on buffer.
+	var onInject func(heartbeat.InjectPayload) bool
+	if runtimeInjectEnabled {
+		onInject = newInjectAcceptor(
+			injectCh, seenInject, r.logger, qw.SessionID, !qw.isInteractive(),
+		)
+	}
+	var pulser *heartbeat.Pulser
+	pulser, err = heartbeat.NewWithAckObserver(heartbeat.Config{
+		SessionID: qw.SessionID,
+		WorkerID:  qw.WorkerID,
+		// IssueID is the Linear issue UUID — the platform's
+		// /lock-refresh handler keys the lock on issue:lock:{id}
+		// and rejects the request with 400 when this is empty.
+		// Sourced from prompt.QueuedWork.IssueID (camelCase
+		// "issueId" on the wire).
+		IssueID:     qw.IssueID,
+		BaseURL:     qw.PlatformURL,
+		AuthToken:   qw.AuthToken,
+		Traceparent: qw.Traceparent,
+		Tracestate:  qw.Tracestate,
+		// SessionClass stamps every lock-refresh body with the runtime
+		// session class so the platform's activity-stall reaper exempts an
+		// interactive session during human think-time (W4 amendment 4 —
+		// the named cross-repo dependency W3 reads). "interactive" for the
+		// PTY-hosted interactive dispatch; empty for every other mode
+		// (omitempty keeps the wire byte-identical for headless/interview).
+		SessionClass:       interactiveSessionClass(qw),
+		CredentialProvider: hbCredentialProvider,
+		// Persist the actual successful session-heartbeat acknowledgement
+		// into state.State.LastHeartbeat (the field host-watch reads),
+		// fenced to this exact session and run. Failed refreshes, replay
+		// ingestion and output-only activity never fire this callback.
+		// The observer is bound lazily below (step 7): until provisioning
+		// yields a workarea the pulser reports liveness with no local
+		// state observation, exactly like every other pre-state.json tick.
+		// The runner rebinds it via Pulser.SetAckObserver once the
+		// workarea exists, so a nil observer here is the normal
+		// pre-provision state, not a misconfiguration.
+		Interval:   r.hbInterval,
+		HTTPClient: r.httpClient,
+		Logger:     r.logger,
+		OnInject:   onInject,
+	}, nil)
+	if err != nil {
+		// Heartbeat is non-fatal at construction time only when
+		// PlatformURL is missing; that's caught by validateQueuedWork.
+		r.logger.Warn("heartbeat construct failed", "err", err)
+		pulser = nil
+	} else if startErr := pulser.Start(ctx); startErr != nil {
+		r.logger.Warn("heartbeat start failed", "err", startErr)
+		_ = pulser.Stop()
+		pulser = nil
+	} else {
+		defer func() { _ = pulser.Stop() }()
+	}
+
 	// 2. Provision worktree. We clone at the remote default branch
 	// (typically main) and create the per-session work branch on
 	// top inside the worktree afterward — passing a non-existent
@@ -456,7 +544,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Record every mutable checkout with the commit it starts at, so teardown
 	// can tell the session's own unpublished work from the base and preserve
-	// it before deleting the workarea (Run → preserveUnpublishedWork).
+	// it before deleting the workarea (Run → preserveUnpublishedWork). A
+	// re-entered generation already holds the earlier attempt's commits at
+	// HEAD, so its base is reseeded from the generation's declared
+	// resolved ref below; without that the rescue would miss work
+	// committed before the re-entry.
 	switch {
 	case repositoryFree:
 	case repositoryDeclaration != nil:
@@ -469,6 +561,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}
 		}
 		recordRescueTargets(ctx, res, targets)
+		reseedRescueBasesFromDeclaration(ctx, res, res.WorkareaRoot, r.wt, qw.SessionID, r.logger)
 	case selectedRepositoryMutable:
 		recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
 	}
@@ -978,6 +1071,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		r.logger.Warn("event journal boundary unavailable", "sessionId", qw.SessionID)
 	}
 
+	// The pre-provisioning pulser (step 1b) reports liveness with no local
+	// state observation until the workarea exists. Now that it does, rebind
+	// the ack observer to the provisioned state path so subsequent ticks
+	// persist LastHeartbeat for host-watch; earlier ticks already served
+	// their purpose (platform-side liveness) without a local write. The
+	// rebind replays the pulser's latest acknowledged tick through the new
+	// observer so a session whose ticks all landed before the workarea
+	// existed still records its most recent liveness locally.
+	if pulser != nil {
+		pulser.SetAckObserver(r.heartbeatAckObserver(runnerStatePath, qw.SessionID, startedAt))
+		if lastTick := pulser.LastTick(); lastTick > 0 {
+			if observer := pulser.AckObserver(); observer != nil {
+				observer(lastTick)
+			}
+		}
+	}
+
 	// 8. Spawn provider.
 	handle, err := provider.Spawn(ctx, spec)
 	if err != nil {
@@ -993,98 +1103,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		_ = handle.Stop(stopCtx)
 	}()
 
-	// 8b. Wave 3 runtime memory-inject (v2) channel + per-Run dedup.
-	//
-	// injectCh carries platform-queued memory blocks delivered via the
-	// heartbeat lock-refresh transport (see step 9 OnInject wiring). It is
-	// drained between turns at the post-terminal seam (step 11) so claude's
-	// single-in-flight Inject contract is respected on the single runner
-	// goroutine. seenInject dedupes by DeliveryID within this Run (the
-	// platform also acks to stop re-sending, but a re-delivery in the
-	// heartbeat-interval window before the ack lands must not double-inject).
-	//
-	// Whether any block is actually delivered is decided ENTIRELY by the
-	// platform (it only returns an `inject` on the lock-refresh response when
-	// the project's memory config has runtime-inject enabled) — so the worker
-	// needs no env var or local config.
-	//
-	// The rail is wired when a CONSUMER EXISTS, which is not the same question
-	// as "does the provider support message injection":
-	//
-	//   - Headless and interview runs deliver through Handle.Inject, so they
-	//     genuinely need caps.SupportsMessageInjection. Providers without it
-	//     rely on the dispatch-time fold (v1).
-	//   - An INTERACTIVE run never calls Handle.Inject at all — its delivery
-	//     surface is whatever the harness DECLARES (agent.NoticeDelivery), so
-	//     the provider's message-injection capability is simply the wrong
-	//     question here. The rail is wired for every interactive run, including
-	//     the ones whose declared channel this build cannot drive, because the
-	//     consumer's job is not only to deliver: it is also to say truthfully
-	//     that it could not, by dead-lettering with a reason instead of letting
-	//     the payload rot in a buffer nobody reads. Nothing on that path acks.
-	injectCh := make(chan heartbeat.InjectPayload, 8)
-	seenInject := map[string]struct{}{}
-	runtimeInjectEnabled := caps.SupportsMessageInjection || qw.isInteractive()
-
-	// 9. Start heartbeat pulser (in a goroutine — Pulser.Start fires
-	// the first tick synchronously then runs the loop in its own
-	// goroutine).
-	var hbCredentialProvider heartbeat.CredentialProvider
-	if r.credentialProvider != nil {
-		hbCredentialProvider = func(ctx context.Context) (heartbeat.RuntimeCredentials, error) {
-			creds, err := r.credentialProvider(ctx)
-			return heartbeat.RuntimeCredentials{
-				WorkerID:  creds.WorkerID,
-				AuthToken: creds.AuthToken,
-			}, err
-		}
-	}
-	// Wave 3 runtime memory-inject: wire OnInject only when a consumer exists.
-	// See newInjectAcceptor for the dedup + ack-or-requeue contract, and for
-	// why the interactive mode acks on DELIVERY rather than on buffer.
-	var onInject func(heartbeat.InjectPayload) bool
-	if runtimeInjectEnabled {
-		onInject = newInjectAcceptor(
-			injectCh, seenInject, r.logger, qw.SessionID, !qw.isInteractive(),
-		)
-	}
-	pulser, err := heartbeat.NewWithAckObserver(heartbeat.Config{
-		SessionID: qw.SessionID,
-		WorkerID:  qw.WorkerID,
-		// IssueID is the Linear issue UUID — the platform's
-		// /lock-refresh handler keys the lock on issue:lock:{id}
-		// and rejects the request with 400 when this is empty.
-		// Sourced from prompt.QueuedWork.IssueID (camelCase
-		// "issueId" on the wire).
-		IssueID:   qw.IssueID,
-		BaseURL:   qw.PlatformURL,
-		AuthToken: qw.AuthToken,
-		// SessionClass stamps every lock-refresh body with the runtime
-		// session class so the platform's activity-stall reaper exempts an
-		// interactive session during human think-time (W4 amendment 4 —
-		// the named cross-repo dependency W3 reads). "interactive" for the
-		// PTY-hosted interactive dispatch; empty for every other mode
-		// (omitempty keeps the wire byte-identical for headless/interview).
-		SessionClass:       interactiveSessionClass(qw),
-		CredentialProvider: hbCredentialProvider,
-		// Persist the actual successful session-heartbeat acknowledgement
-		// into state.State.LastHeartbeat (the field host-watch reads),
-		// fenced to this exact session and run. Failed refreshes, replay
-		// ingestion and output-only activity never fire this callback.
-		Interval:   r.hbInterval,
-		HTTPClient: r.httpClient,
-		Logger:     r.logger,
-		OnInject:   onInject,
-	}, r.heartbeatAckObserver(runnerStatePath, qw.SessionID, startedAt))
-	if err != nil {
-		// Heartbeat is non-fatal at construction time only when
-		// PlatformURL is missing; that's caught by validateQueuedWork.
-		r.logger.Warn("heartbeat construct failed", "err", err)
-	} else if startErr := pulser.Start(ctx); startErr != nil {
-		r.logger.Warn("heartbeat start failed", "err", startErr)
-	} else {
-		defer func() { _ = pulser.Stop() }()
-	}
+	// The inject channel, dedup set and OnInject consumer above (step 1b)
+	// are shared with the pre-provisioning pulser, which owns them for the
+	// life of this Run. The pulser keeps beating with that wiring; nothing
+	// is rebuilt here.
 
 	// 9b. Start the activity poster (mirrors the heartbeat pulser's
 	// per-session lifecycle). Pushes every runner-observed agent.Event
@@ -1109,6 +1131,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: actCredentialProvider,
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		HTTPClient:         r.httpClient,
 		Logger:             r.logger,
 		// ProviderName flows onto the wire payload so the platform's
@@ -1222,6 +1246,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// (including a 404 from a platform build without the companion route)
 	// is swallowed inside the emitter — a step-heartbeat outage must never
 	// fail the run. Wave 3 item 1.
+	//
+	// The usage behind the beat depends on the lane: headless sessions read
+	// the budget enforcer's meter, while interactive sessions read the
+	// transcript-tail totals the interactive supervisor accumulates (an
+	// interactive session never constructs an enforcer reading). The totals
+	// live on the Runner for the session so both the emitter wiring here
+	// and the supervisor below share them; the heartbeat carries the
+	// running totals, clamped non-decreasing by the emitter.
 	var stepCredentialProvider stepheartbeat.CredentialProvider
 	if r.credentialProvider != nil {
 		stepCredentialProvider = func(ctx context.Context) (stepheartbeat.RuntimeCredentials, error) {
@@ -1233,23 +1265,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 	stepEmitter, stepErr := stepheartbeat.New(stepheartbeat.Config{
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		SessionID:          qw.SessionID,
 		WorkerID:           qw.WorkerID,
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: stepCredentialProvider,
-		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
-			in, out, cached, usd := enforcer.usageSnapshot()
-			return stepheartbeat.UsageSnapshot{
-				InputTokens:       in,
-				OutputTokens:      out,
-				CachedInputTokens: cached,
-				TotalCostUsd:      usd,
-			}
-		},
-		HTTPClient: r.httpClient,
-		Logger:     r.logger,
-		Interval:   r.stepHeartbeatInterval,
+		UsageProvider:      r.stepHeartbeatUsage(qw, enforcer),
+		HTTPClient:         r.httpClient,
+		Logger:             r.logger,
+		Interval:           r.stepHeartbeatInterval,
 		// Interval is zero in production, keeping the 15s default —
 		// calibrated against the platform's 60s SESSION_STALE_THRESHOLD_MS.
 	})
@@ -1358,9 +1384,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// stream observation already scraped (streamRes.applyTo above), then the
 	// deterministic backstop further down. The manifest WINS when present —
 	// a structured file the agent wrote is more reliable than a marker scraped
-	// out of free-form prose. Best-effort: a missing manifest is the common
-	// case (ErrNoManifest) and a no-op; a malformed one logs + falls through
-	// to the scraped marker. A manifest verdict of "blocked" feeds the same
+	// out of free-form prose; a written file governs even against the turn's
+	// own marker, which is only the backstop. Best-effort: a missing manifest
+	// is the common case (ErrNoManifest) and recovers an `Intended manifest`
+	// block the agent printed inline when its stage could not write the file;
+	// a malformed one logs + falls through to the scraped marker. A printed
+	// block never raises the turn's own marker verdict, but the envelope
+	// remembers its printed source so a later turn's anchored marker can
+	// raise it (see 11·M). A manifest verdict of "blocked" feeds the same
 	// streamRes.blocked signal the marker scan produces, so the blocked
 	// classification fork below treats both channels identically.
 	r.applyTurnManifest(runnerStatePath, qw, res, &streamRes)
@@ -1425,8 +1456,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// then steering) re-resolve the turn verdict against it: the agent may
 	// write its manifest during the follow-up, the follow-up's terminal
 	// message (often just the PR URL steering asked for) has replaced
-	// res.Summary, and its own anchored marker may lower — or, with no
-	// manifest, replace — the verdict (see reapplyTurnManifest). Applying it
+	// res.Summary, and its own anchored marker may lower a filed verdict —
+	// or raise or lower a printed one, or, with no manifest, replace — the
+	// verdict (see reapplyTurnManifest). Applying it
 	// per turn lets a memory-inject follow-up that declines suppress steering.
 	followUpRan := false
 	applyFollowUp := func(tail streamObservation) {
@@ -1556,7 +1588,12 @@ tailRecovery:
 			continue
 		}
 
-		prompt := continuationPrompt(reviewWork, followUps.undelivered)
+		// Every continuation restates the session's goal as dispatched
+		// (identifier, title, directive): a bare "continue the task"
+		// arrives without the goal and the seat can decline it, losing
+		// the verdict the prior turn reached. The retry and wrap-up
+		// prompts replace the base text wholesale below, as before.
+		prompt := continuationPrompt(reviewWork, followUps.undelivered, continueGoalBlock(qw))
 		wrapUp := enforcer.wrapUpDue()
 		if step == tailRetry {
 			prompt = retryPrompt
@@ -1725,8 +1762,12 @@ tailRecovery:
 	// draft. A no-new-commit continue run (and a draft) must NOT read as
 	// delivered: fail the session instead of ending completed against an
 	// unchanged head, mirroring the verifier's no-new-commit/draft rules.
-	// Runs only when no failure was already recorded, so a runner-authored
-	// refusal (divergence, provision) keeps its own typed reason.
+	// Under a dispatch-declared delivery policy the draft check is
+	// skipped when the policy allows drafts, and the code-change check
+	// counts merge resolutions when the policy allows merges; every
+	// other check still applies. Runs only when no failure was already
+	// recorded, so a runner-authored refusal (divergence, provision)
+	// keeps its own typed reason.
 	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType) && res.FailureMode == "" && budgetStop == nil {
 		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
@@ -1753,6 +1794,7 @@ tailRecovery:
 				if headMoved {
 					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, continuePullRequestBranch(qw.ContinuePullRequest), startHead, localHead)
 				}
+				draftBlocks := draftErr == nil && draft && !qw.Delivery.AllowsDraft()
 				switch {
 				case inspectErr != nil:
 					res.Status = "failed"
@@ -1762,7 +1804,7 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d commits scratch paths since dispatch: %s", qw.ContinuePullRequest.Number, strings.Join(inspection.scratchPaths, ", "))
-				case draftErr == nil && draft:
+				case draftBlocks:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
@@ -1774,7 +1816,7 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
-				case !inspection.delivers():
+				case !inspection.deliversUnder(qw.Delivery):
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
@@ -2817,10 +2859,14 @@ func (r *Runner) consumeEventsWithin(
 			// ANSWERED with an error: the request is not hung, and
 			// the turn ends on that error through the normal
 			// provider-error path. Disarm so the detector cannot
-			// race it. All other system chatter (compaction,
-			// rate-limit notices, harness lifecycle) is not model
-			// output and leaves the window armed.
-			if e.Subtype == agent.SystemSubtypeProviderError {
+			// race it. A stream-progress signal means response bytes
+			// are still arriving: the request is alive, so a healthy
+			// long generation never reads as a stall. All other
+			// system chatter (compaction, rate-limit notices,
+			// harness lifecycle) is not model output and leaves the
+			// window armed.
+			if e.Subtype == agent.SystemSubtypeProviderError ||
+				e.Subtype == agent.SystemSubtypeStreamProgress {
 				sawToolResult = false
 				disarmStall()
 			}
@@ -2887,11 +2933,28 @@ func (r *Runner) consumeEventsWithin(
 			if !ok {
 				return obs, nil
 			}
+			// Capture native response evidence before correlation can synthesize
+			// aggregate calls, and before any budget or terminal early return.
+			if res != nil {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					if !e.Synthetic && e.UsageSource != agent.LlmUsageAggregate && e.ResponseModel != "" {
+						res.Model = e.ResponseModel
+					}
+				case agent.SystemEvent:
+					if e.Subtype == agent.SystemSubtypeModelIdentity && e.ObservedModel != nil && e.ObservedModel.Model != "" {
+						res.Model = e.ObservedModel.Model
+					}
+				}
+			}
 			// Forward progress observed — re-arm the idle watchdog, and
 			// the stall detector while its post-tool window is armed.
 			resetIdle()
 			resetStall()
 			for _, correlatedEvent := range traceProcessor.Process(ev) {
+				if res != nil && qw.ResolvedProfile.Endpoint != nil {
+					res.GenerationIDs = collectGenerationID(res.GenerationIDs, correlatedEvent)
+				}
 				trackToolEvent(correlatedEvent)
 				appendJSONL(correlatedEvent)
 				r.observeEvent(correlatedEvent, &obs, worktreePath, qw)

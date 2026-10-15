@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/provider/harness/stub/stubagent"
 	"github.com/spf13/cobra"
 )
@@ -40,6 +42,42 @@ func StubAgentExitCode(err error) (int, bool) {
 		return exit.Code, true
 	}
 	return 0, false
+}
+
+// NeedsSetupExitCode reports the process exit status for the fresh-host
+// setup refusal, and whether err is that refusal at all. The refusal
+// carries the operator action (`host setup`) as its message; the status
+// is what the supervisor reads. On Linux the systemd unit names the
+// setup status in RestartPreventExitStatus so the unit waits for its
+// config instead of restarting every RestartSec; on macOS launchd has no
+// per-status hold, so the refusal exits with the clean status the
+// plist's KeepAlive (SuccessfulExit=false) does not respawn — the same
+// wait, through the supervisor's own idiom. A binary's main uses this so
+// the status reaches the supervisor instead of being flattened to 1.
+func NeedsSetupExitCode(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	if errors.Is(err, afclient.ErrNeedsSetup) {
+		return setupHoldExitCode(runtime.GOOS), true
+	}
+	return 0, false
+}
+
+// setupHoldExitCode is the supervisor hold status for the fresh-host
+// setup refusal on the named GOOS. Linux keeps the setup status the
+// systemd unit names in RestartPreventExitStatus (the unit waits failed);
+// macOS (launchd) exits clean because KeepAlive with SuccessfulExit=false
+// respawns every non-zero exit about every ThrottleInterval — a fresh
+// host would spin until setup completes — while a clean exit parks the
+// job until the operator runs setup and reloads it. It takes the GOOS as
+// a parameter (rather than reading runtime.GOOS itself) so tests pin
+// both supervisors' contracts on any host.
+func setupHoldExitCode(goos string) int {
+	if goos == "darwin" {
+		return 0
+	}
+	return afclient.ExitCodeNeedsSetup
 }
 
 // newStubAgentCmd constructs the hidden `stub-agent` command: the child half

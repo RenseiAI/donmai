@@ -421,15 +421,44 @@ func TestNormalizeEventSubagentLifecycleTopics(t *testing.T) {
 		{agent.SubagentFailed, "subagent.failed"},
 	}
 	for _, tc := range cases {
-		r, emitted, err := NormalizeEvent("session_1", 1, time.Now(), agent.SubagentEvent{ToolName: "Agent", ToolUseID: "toolu_1", Phase: tc.phase, ChildSessionID: "child-1"})
+		r, emitted, err := NormalizeEvent("session_1", 1, time.Now(), agent.SubagentEvent{ToolName: "Agent", ToolUseID: "toolu_1", Phase: tc.phase, ChildSessionID: "child-1", ChildSessionTransport: "host_cli"})
 		if err != nil || !emitted {
 			t.Fatalf("phase %s emitted=%v err=%v", tc.phase, emitted, err)
 		}
 		if r.EventType != tc.topic {
 			t.Fatalf("phase %s topic = %q, want %q", tc.phase, r.EventType, tc.topic)
 		}
-		if r.Payload["toolUseId"] != "toolu_1" || r.Payload["childSessionId"] != "child-1" {
+		if r.Payload["toolUseId"] != "toolu_1" || r.Payload["childSessionId"] != "child-1" || r.Payload["childSessionTransport"] != "host_cli" {
 			t.Fatalf("phase %s payload lost ids: %+v", tc.phase, r.Payload)
 		}
+	}
+}
+
+func TestNormalizeContextUsageNoticeMapsToUsageRecorded(t *testing.T) {
+	used, in, window := 62.5, int64(125000), int64(200000)
+	r, emitted, err := NormalizeEvent("session_1", 1, time.Now(), agent.ContextUsageEvent{
+		Harness: "claude-code", Source: agent.ContextUsageSourceStatuslineSidecar,
+		NoticeKind:  agent.ContextUsageCompaction,
+		UsedPercent: &used, InputTokens: &in, ContextWindowSize: &window,
+		// OutputTokens unknown: stays absent, never zero.
+	})
+	if err != nil || !emitted {
+		t.Fatalf("normalize emitted=%v err=%v", emitted, err)
+	}
+	if r.EventType != "usage.recorded" {
+		t.Fatalf("eventType = %q, want usage.recorded", r.EventType)
+	}
+	if r.Payload["scope"] != "session" || r.Payload["kind"] != "compaction" {
+		t.Fatalf("payload scope/kind = %+v", r.Payload)
+	}
+	if r.Payload["usedPercent"] != 62.5 || r.Payload["inputTokens"] != int64(125000) || r.Payload["contextWindowSize"] != int64(200000) {
+		t.Fatalf("payload measurements = %+v", r.Payload)
+	}
+	if _, present := r.Payload["outputTokens"]; present {
+		t.Fatalf("payload carries outputTokens for an unknown measurement: %+v", r.Payload)
+	}
+	b, _ := MarshalCompact(r)
+	if bytes.Contains(b, []byte(`"outputTokens":0`)) {
+		t.Fatalf("wire stores unknown as zero: %s", b)
 	}
 }

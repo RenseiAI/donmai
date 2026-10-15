@@ -117,6 +117,11 @@ type QueuedWork struct {
 	// the registration store; the runner just forwards it.
 	AuthToken string `json:"-"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is the platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for NOTHING else. AuthToken remains the
 	// bearer for heartbeat, result-post, activity-post, and the session
@@ -251,13 +256,11 @@ const (
 // by the daemon poll handler).
 type ResolvedProfile struct {
 	// Harness is the loop-driver attribute the platform catalog models on
-	// the model identity (e.g. "antigravity", "gemini-direct", or "ollama";
-	// legacy wire aliases such as "agy", "native", and "raw" remain accepted).
+	// the model identity (e.g. "gemini-direct" or "ollama";
+	// legacy wire aliases such as "native" and "raw" remain accepted).
 	// When present it is AUTHORITATIVE for binary/provider selection: the
 	// runner maps the harness token onto its concrete provider impl
-	// regardless of the Provider value (so a catalog that models the
-	// model as Provider="gemini" with Harness="agy" still resolves to the
-	// agy-cli provider). Empty is handled only by the named legacy harness
+	// regardless of the Provider value. Empty is handled only by the named legacy harness
 	// adapter. A non-empty value never falls through to Provider, Runner, a
 	// default, or posterior routing.
 	Harness string `json:"harness,omitempty"`
@@ -409,6 +412,16 @@ type Result struct {
 	// TerminalWorkareaLease is the exact four-field external projection attached
 	// after the full descriptor and host-local path are durable.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
+
+	// manifestPrinted records that the envelope's Manifest was recovered
+	// from a printed `Intended manifest:` block rather than read from the
+	// manifest file on disk. A printed block is the tool-restricted
+	// stage's backstop, not the agent's authoritative structured word, so
+	// a later turn's anchored marker may raise it (reapplyTurnManifest)
+	// while a file-backed manifest may only be lowered. Unexported:
+	// runner-internal resolution state, never on the wire (encoding/json
+	// ignores it, and the poster carries only the embedded agent.Result).
+	manifestPrinted bool
 
 	// toolCallsTotal counts the tool calls (agent.ToolUseEvent) observed
 	// across every consumed event stream of this session. The post-session

@@ -7,6 +7,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/daemon/seatqos"
 )
 
 // validateSeatBudget enforces the authored per-seat budget ranges. Zero
@@ -18,6 +19,26 @@ func validateSeatBudget(b SeatBudgetConfig) error {
 		IOWeight: b.IOWeight,
 		Mode:     seatbudget.Mode(b.Mode),
 	}.Validate()
+}
+
+// validateSeatQoS enforces the authored per-seat scheduling class. Empty
+// is valid and reads as default (opt-in only — seats spawn exactly as
+// before unless the operator names a class). Surrounding space and case
+// are ignored, matching the Parse normalisation operators use.
+func validateSeatQoS(raw string) error {
+	_, err := seatqos.Parse(raw)
+	return err
+}
+
+// resolveSeatQoS normalises the authored per-seat scheduling class for
+// spawn and status: empty reads as default, anything else is validated
+// verbatim (fail-closed at the config gate, never silent).
+func resolveSeatQoS(raw string) seatqos.Class {
+	class, err := seatqos.Parse(raw)
+	if err != nil {
+		return seatqos.Default
+	}
+	return seatqos.Effective(class)
 }
 
 // resolveSeatBudget returns the per-seat budget the daemon applies: the
@@ -57,8 +78,37 @@ func resolveSeatBudget(authored SeatBudgetConfig, maxSeats, hostCPUs, hostMemory
 // mode "none" with the reason — never enforced for a seat that runs
 // unwrapped.
 func seatBudgetReport(b seatbudget.Budget) *afclient.SeatBudgetStatus {
-	return seatBudgetReportFor(b, seatbudget.HostPlacement(), runtime.GOOS)
+	return seatBudgetReportFor(b, seatBudgetStatusPlacement(), runtime.GOOS)
 }
+
+// seatBudgetReportWithQoS is seatBudgetReport plus the opt-in per-seat
+// scheduling class the status route publishes: the configured class
+// verbatim (default when unauthored), so an operator reading status can
+// tell whether seats spawn wrapped without inspecting the config file.
+// The class is reported, never validated here — validation lives at the
+// config gate, and status must render whatever the daemon runs with.
+func seatBudgetReportWithQoS(b seatbudget.Budget, qos seatqos.Class) *afclient.SeatBudgetStatus {
+	rep := seatBudgetReport(b)
+	rep.QoS = string(seatqos.Effective(qos))
+	return rep
+}
+
+// daemonSeatQoS resolves the daemon's configured per-seat scheduling
+// class. Nil config reads as default (opt-in only).
+func (d *Daemon) daemonSeatQoS() seatqos.Class {
+	cfg := d.Config()
+	if cfg == nil {
+		return seatqos.Default
+	}
+	return resolveSeatQoS(cfg.Capacity.SeatQoS)
+}
+
+// seatBudgetStatusPlacement resolves the placement the status path
+// publishes: the single cached HostPlacement verdict for this process, so
+// every status read in a process agrees with every launch gate. Tests pin
+// the downgrade through seatBudgetReportFor with an explicit placement and
+// never stub this.
+var seatBudgetStatusPlacement = seatbudget.HostPlacement
 
 // seatBudgetReportFor is seatBudgetReport parametrised by placement and
 // GOOS so tests pin the systemd-less Linux downgrade on any host. The mode
@@ -70,10 +120,12 @@ func seatBudgetReportFor(b seatbudget.Budget, placement seatbudget.Placement, go
 	}
 	mode := seatbudget.EffectiveModeFor(b.Mode, goos)
 	if mode == seatbudget.ModeEnforced && placement != seatbudget.PlacementSystemd {
-		// Downgrade ONLY on Linux, where EffectiveMode promised enforced.
-		// Off Linux the mode already resolved to best-effort (macOS
-		// cooperative caps) and the report below renders the knob line;
-		// collapsing that to none would erase a real best-effort budget.
+		// An explicit enforced budget off Linux is the operator's own
+		// ask: the seat still runs on its cooperative caps, and the
+		// report says best-effort — the degradation the budget package
+		// promises — never none, which would erase a real best-effort
+		// budget. Only on Linux did EffectiveMode promise enforced, so
+		// only there does a missing backend downgrade to none.
 		if goos == "linux" {
 			return &afclient.SeatBudgetStatus{Mode: string(seatbudget.ModeNone), Detail: seatBudgetNoBackendDetailFor(placement)}
 		}

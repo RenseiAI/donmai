@@ -194,6 +194,13 @@ type ProvisionResult struct {
 	OwnerSessionID string
 	// CacheSeedID is correlation only; it never becomes session identity.
 	CacheSeedID string
+	// Reentered reports that this Provision adopted an existing session
+	// generation instead of materializing a fresh checkout: the working
+	// tree already holds a prior attempt's commits. The runner uses it
+	// to seed the rescue base from the generation's declared resolved
+	// ref, so a failed re-entered session's teardown still preserves
+	// work committed before the re-entry.
+	Reentered bool
 	// Repositories maps normalized declared names to their repository paths.
 	// Legacy flat workareas contain only the selected repository when known.
 	// Repositories that were skipped after a failed clone (see
@@ -250,6 +257,7 @@ type Manager struct {
 	acquisitions            *workarea.AcquisitionStore
 	seeds                   *workarea.SeedStore
 	provisionHook           ProvisionHook
+	preProvisionDelay       time.Duration
 	archiveRoot             ArchiveRootFunc
 	restoreSessionID        string
 	authorityMu             sync.Mutex
@@ -340,6 +348,13 @@ type Options struct {
 	SeedStore *workarea.SeedStore
 	// ProvisionHook injects deterministic crash boundaries in tests.
 	ProvisionHook ProvisionHook
+	// PreProvisionDelay, when positive, pauses Provision after session
+	// validation and before any materialization, holding the passed context
+	// so cancellation still aborts the wait. It is a test seam for liveness
+	// timing: a test slows provisioning past a shortened stale window and
+	// asserts the session keeps posting lock-refreshes while the clone is
+	// still in flight. Production code leaves it zero (no pause).
+	PreProvisionDelay time.Duration
 	// ArchiveRoot must succeed before an archive disposition may release a root.
 	ArchiveRoot ArchiveRootFunc
 	// RestoreSessionID limits restart bookkeeping to one owner or participant.
@@ -432,6 +447,7 @@ func NewManager(opts Options) (*Manager, error) {
 		acquisitions:            acquisitions,
 		seeds:                   seeds,
 		provisionHook:           opts.ProvisionHook,
+		preProvisionDelay:       opts.PreProvisionDelay,
 		archiveRoot:             opts.ArchiveRoot,
 		restoreSessionID:        opts.RestoreSessionID,
 		now:                     opts.Now,
@@ -685,6 +701,19 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	if spec.SessionID == "" {
 		return "", errors.New("runtime/worktree: SessionID required")
 	}
+	// Test seam: hold the provision open (cancellable) so a liveness
+	// timing test can keep the session inside provisioning past a
+	// shortened stale window. Runs before any materialization, so a
+	// cancelled wait provisions nothing and leaves no residue.
+	if m.preProvisionDelay > 0 {
+		timer := time.NewTimer(m.preProvisionDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
 	unlock := m.lockSession(spec.SessionID)
 	defer unlock()
 	mode := spec.Mode
@@ -702,7 +731,19 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 		if retained {
 			return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, existing.workareaRootOrPath())
 		}
-		return m.reenterProvision(spec, mode, *existing)
+		path, err := m.reenterProvision(spec, mode, *existing)
+		if err != nil {
+			return "", err
+		}
+		// Mark the adopted generation so the runner can seed its
+		// rescue base from the declared resolved ref: HEAD already
+		// holds the earlier attempt's commits.
+		m.mu.Lock()
+		if current := m.sessions[spec.SessionID]; current != nil {
+			current.Reentered = true
+		}
+		m.mu.Unlock()
+		return path, nil
 	}
 	if spec.RepositoryDeclaration != nil {
 		restored, found, err := m.restoredSessionResult(spec.SessionID)
@@ -721,6 +762,10 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			if err != nil {
 				return "", err
 			}
+			// Mark the adopted generation so the runner can seed its
+			// rescue base from the declared resolved ref: HEAD already
+			// holds the earlier attempt's commits.
+			restored.Reentered = true
 			m.mu.Lock()
 			m.sessions[spec.SessionID] = restored
 			m.mu.Unlock()

@@ -87,7 +87,7 @@ func spawnFakeCtx(ctx context.Context, t *testing.T, binary string, spec agent.S
 	}
 	var h *Handle
 	for attempt := 0; ; attempt++ {
-		h, err = SpawnBinary(ctx, binary, claudeArgs(), spec.Prompt, mcpPath, spec.Cwd, spec.Env, spec.OnProcessSpawned)
+		h, err = SpawnBinary(ctx, binary, claudeArgs(), spec.Prompt, mcpPath, nil, spec.Cwd, spec.Env, spec.OnProcessSpawned)
 		if err == nil {
 			return h
 		}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/daemon/seatqos"
 )
 
 // TestServer_Status_SeatBudget drives the PRODUCTION status route
@@ -59,20 +60,15 @@ func TestServer_Status_SeatBudget(t *testing.T) {
 // TestServer_Status_SeatBudget_CgroupfsReportsNone pins the honest-fallback
 // rule on the PRODUCTION status route: an enforced budget on a host whose
 // placement cannot confine the seat reports mode none with the backend
-// named. This host (darwin CI, or any systemd-less Linux) is exactly that
-// host whenever the placement probe is not systemd: the test asserts the
-// downgrade shape — mode none plus a reason — without pinning which
-// backend this particular machine lacks.
+// named. The downgrade pins through the hermetic report helpers with an
+// explicit systemd-less placement — never through the live host probe — so
+// no two sequential live probes in one test can disagree with each other
+// (and no live systemd-run exec runs here at all).
 func TestServer_Status_SeatBudget_CgroupfsReportsNone(t *testing.T) {
 	// A systemd-less Linux host runs an enforced seat unconfined: the
-	// report must be mode none with the backend named. This host is
-	// darwin, so the suite pins the downgrade through the report helper
-	// with the systemd-less placement simulated by the cgroupfs branch:
-	// sessionSeatBudgetReport is the per-spawn half of the same rule, and
-	// this host's own placement is likewise not systemd.
-	if seatbudget.HostPlacement() == seatbudget.PlacementSystemd {
-		t.Skip("systemd host confines the seat; the none-downgrade needs a systemd-less host")
-	}
+	// report must be mode none with the backend named. The per-spawn half
+	// pins through the report helper with the systemd-less placement as
+	// the parameter, the same rule the launch path applies.
 	rep := sessionSeatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced}, true, seatbudget.PlacementCgroupFS)
 	if rep.Mode != "none" {
 		t.Errorf("SeatBudget.Mode = %q; want none (no systemd backend on this host)", rep.Mode)
@@ -83,11 +79,25 @@ func TestServer_Status_SeatBudget_CgroupfsReportsNone(t *testing.T) {
 	if rep.CPUs != 0 || rep.MemoryMB != 0 {
 		t.Errorf("SeatBudget = %+v; want no values on an unconfined seat", rep)
 	}
-	// And the status half: this host's effective posture for an enforced
-	// budget is best-effort at most — never enforced without systemd.
-	status := seatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced})
-	if seatbudget.HostPlacement() != seatbudget.PlacementSystemd && status.Mode == string(seatbudget.ModeEnforced) {
-		t.Errorf("status mode = enforced on a systemd-less host; want the downgrade")
+	// And the status half: an enforced budget under the systemd-less
+	// placement downgrades to none with the backend named — the published
+	// posture, pinned through the hermetic placement parameter rather
+	// than the live host probe.
+	status := seatBudgetReportFor(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced}, seatbudget.PlacementCgroupFS, "linux")
+	if status.Mode != string(seatbudget.ModeNone) {
+		t.Errorf("status mode = %q on a systemd-less placement; want the downgrade to none", status.Mode)
+	}
+	if status.Detail == "" {
+		t.Error("status detail is empty; want the missing backend named")
+	}
+	// The agreement half: the production status entry consults the same
+	// cached placement the launch gate does, so every status read in a
+	// process agrees with every launch — pinned here by calling the
+	// production entry twice and requiring the same answer.
+	first := seatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced})
+	second := seatBudgetReport(seatbudget.Budget{CPUs: 2, MemoryMB: 1024, Mode: seatbudget.ModeEnforced})
+	if first.Mode != second.Mode || first.Detail != second.Detail {
+		t.Errorf("status report = %+v then %+v; want every read in a process to agree", first, second)
 	}
 }
 
@@ -163,6 +173,71 @@ func TestPollItemToSessionDetail_SeatBudget(t *testing.T) {
 	mut.CPUs = 99
 	if stamped2.SeatBudget.CPUs != 4 {
 		t.Errorf("SeatBudget.CPUs = %d; want defensive copy 4", stamped2.SeatBudget.CPUs)
+	}
+}
+
+// TestServer_Status_SeatBudget_ReportsQoS drives the PRODUCTION status
+// route with a configured scheduling class and asserts the seat budget
+// block carries it verbatim alongside the posture. Reverting the status
+// route to the class-less report fails here.
+func TestServer_Status_SeatBudget_ReportsQoS(t *testing.T) {
+	_, srv, cleanup := mustStartDaemonWith(t, func(opts *Options) {
+		cfg, err := LoadConfig(opts.ConfigPath)
+		if err != nil {
+			t.Fatalf("load config: %v", err)
+		}
+		cfg.Capacity.SeatBudget = SeatBudgetConfig{CPUs: 2, Mode: "best-effort"}
+		cfg.Capacity.SeatQoS = "utility"
+		if err := WriteConfig(opts.ConfigPath, cfg); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	})
+	defer cleanup()
+	var resp afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &resp)
+	if resp.SeatBudget == nil {
+		t.Fatal("SeatBudget is nil; want the configured share with its class")
+	}
+	if resp.SeatBudget.QoS != "utility" {
+		t.Errorf("SeatBudget.QoS = %q; want utility", resp.SeatBudget.QoS)
+	}
+	if resp.SeatBudget.Mode != "best-effort" {
+		t.Errorf("SeatBudget.Mode = %q; want best-effort", resp.SeatBudget.Mode)
+	}
+}
+
+// TestServer_Status_SeatBudget_DefaultQoS pins the opt-in default on the
+// PRODUCTION status route: an unauthored class reports default, never
+// empty — status always names the class seats spawn under.
+func TestServer_Status_SeatBudget_DefaultQoS(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+	var resp afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &resp)
+	if resp.SeatBudget == nil {
+		t.Fatal("SeatBudget is nil; want mode none with the default class")
+	}
+	if resp.SeatBudget.QoS != "default" {
+		t.Errorf("SeatBudget.QoS = %q; want default", resp.SeatBudget.QoS)
+	}
+}
+
+// TestValidateSeatQoS pins the fail-closed config gate: unknown classes
+// are rejected at load, while empty and every selectable class pass.
+func TestValidateSeatQoS(t *testing.T) {
+	for _, ok := range []string{"", "default", "utility", "background", " Utility "} {
+		if err := validateSeatQoS(ok); err != nil {
+			t.Errorf("validateSeatQoS(%q) = %v; want nil", ok, err)
+		}
+	}
+	if err := validateSeatQoS("nice"); err == nil {
+		t.Error("validateSeatQoS(nice) = nil; want a rejection")
+	}
+	if got := resolveSeatQoS(""); got != seatqos.Default {
+		t.Errorf("resolveSeatQoS(%q) = %q; want default", "", got)
+	}
+	if got := resolveSeatQoS("utility"); got != seatqos.Utility {
+		t.Errorf("resolveSeatQoS(utility) = %q; want utility", got)
 	}
 }
 
