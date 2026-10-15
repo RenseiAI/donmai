@@ -29,6 +29,13 @@ const trustLedgerSweepTimeout = 30 * time.Second
 // sessions are the rare shape, not the common one.
 const trustLedgerMaxDiscoveredHomes = 64
 
+// trustLedgerDeferredLogMax bounds how many deferred (over-cap,
+// unvisited) home names the capped completion line carries. The full
+// deferred set can be large; the first few plus the deferred count are
+// enough for an operator to tell whether their home was visited or
+// deferred.
+const trustLedgerDeferredLogMax = 5
+
 // TrustLedgerSweepFunc is the shape of the startup sweep call: the one the
 // real providerclaude.SweepSeededTrustForConfigHome has, and the one
 // Options.TrustLedgerSweeper is typed as. Keeping it a named type (rather
@@ -79,6 +86,14 @@ func (d *Daemon) sweepSeededTrustLedger(ctx context.Context) {
 	perHome := make([]int, 0, len(homes))
 	discovered := 0
 	discoveryCapped := false
+	// deferredHomes names the ledger-named override homes the cap left
+	// unvisited this start (first few, so the completion line stays small),
+	// with deferredCount carrying the full total. An operator whose isolated
+	// home waits for "the next start" can tell whether their home was
+	// visited or deferred; without the names the counts alone cannot
+	// diagnose stranded trust across boots.
+	var deferredHomes []string
+	deferredCount := 0
 	visited := make(map[string]struct{}, len(homes))
 	for _, home := range homes {
 		visited[home] = struct{}{}
@@ -107,19 +122,28 @@ func (d *Daemon) sweepSeededTrustLedger(ctx context.Context) {
 		// own sweep to drain first. A live session's discovery pointer
 		// survives its home's own sweep for exactly this reason (see
 		// sweepTrustLedger), so a restart mid-run still finds the
-		// isolated home at the next start.
-		if !discoveryCapped {
-			for _, next := range providerclaude.LedgerConfigHomes(
-				filepath.Join(home, providerclaude.TrustRecordFileName),
-				visited,
-			) {
-				if discovered >= trustLedgerMaxDiscoveredHomes {
-					discoveryCapped = true
-					break
+		// isolated home at the next start. Past the cap the sweep keeps
+		// LISTING (naming deferred homes for the completion line) but
+		// stops VISITING: only the sweep callback takes the trust lock
+		// per home, so a bounded visit set is what keeps startup prompt.
+		for _, next := range providerclaude.LedgerConfigHomes(
+			filepath.Join(home, providerclaude.TrustRecordFileName),
+			visited,
+		) {
+			if discovered >= trustLedgerMaxDiscoveredHomes {
+				discoveryCapped = true
+				// LedgerConfigHomes marked the whole listing visited,
+				// so every home at and past the cap is deferred to a
+				// later start. Keep the first few for the completion
+				// line; the count below carries the full total.
+				deferredCount++
+				if len(deferredHomes) < trustLedgerDeferredLogMax {
+					deferredHomes = append(deferredHomes, next)
 				}
-				discovered++
-				homes = append(homes, next)
+				continue
 			}
+			discovered++
+			homes = append(homes, next)
 		}
 		dropped := sweep(home, live)
 		total += dropped
@@ -128,7 +152,8 @@ func (d *Daemon) sweepSeededTrustLedger(ctx context.Context) {
 	if discoveryCapped {
 		slog.Info("daemon: seeded-trust sweep complete",
 			"configHomes", len(homes), "rowsDropped", total, "perHome", perHome,
-			"discoveryCapped", true, "discoveryCap", trustLedgerMaxDiscoveredHomes)
+			"discoveryCapped", true, "discoveryCap", trustLedgerMaxDiscoveredHomes,
+			"deferred", deferredCount, "deferredHomes", deferredHomes)
 		return
 	}
 	slog.Info("daemon: seeded-trust sweep complete",

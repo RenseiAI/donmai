@@ -60,6 +60,18 @@ const TrustLedgerFileName = trustLedgerFileName
 // what is recorded.
 const trustLedgerMaxEntries = 4096
 
+// trustLedgerMaxForeignRetries bounds how many sweep passes keep dead
+// sessions' rows beside a record the sweep cannot rewrite (unparseable, not
+// ours to replace). Such a record can never change — the owning session is
+// dead, so nothing will ever rewrite it into a shape the sweep can apply —
+// and an unbounded keep would pile inert rows retried every boot. Past the
+// bound the rows drain: the sweep never rewrites the foreign record itself
+// (byte-for-byte as found, fail-closed for the CLI too), it only stops
+// carrying the ledger rows that could never apply. Malformed records are
+// fail-closed for the CLI, and never rewriting foreign records is
+// deliberate; this bound only retires the sweep's own retry residue.
+const trustLedgerMaxForeignRetries = 10
+
 // trustLedgerEntry is one seeded directory's ledger row.
 type trustLedgerEntry struct {
 	// Dir is the trust-record key the seed wrote.
@@ -83,6 +95,13 @@ type trustLedgerEntry struct {
 	// daemon/trust_ledger_sweep.go). Empty on rows that predate the
 	// field; those rows sweep under the process home as before.
 	ConfigHome string `json:"configHome,omitempty"`
+	// ForeignRetries counts how many sweep passes have kept this row beside
+	// a record the sweep could not rewrite (unparseable, not ours to
+	// replace). Zero on rows the seed writes; incremented by each sweep
+	// that retries them against the still-foreign record, so the rows drain
+	// past trustLedgerMaxForeignRetries instead of accumulating as inert
+	// residue retried every boot.
+	ForeignRetries int `json:"foreignRetries,omitempty"`
 	// SeededAt is when the seed landed, for operator diagnosis.
 	SeededAt time.Time `json:"seededAt,omitempty"`
 }
@@ -536,11 +555,28 @@ func sweepTrustLedger(opts SweepTrustLedgerOptions) (dropped int) {
 		// rows for the next start.
 		if !applyTrustLedgerSweep(path, dead) {
 			// The record could not be rewritten (unparseable, not ours to
-			// replace, lock lost): keep every row so the next start
+			// replace, write failure): keep every row so the next start
 			// retries, but still drop dead sessions' directory-less
 			// discovery rows — they name no trust to apply. A live
 			// session's discovery row stays: it is still that
-			// session's pointer to its isolated home.
+			// session's pointer to its isolated home. A structurally
+			// foreign record (unparseable, unexpected projects shape)
+			// can never change — the owning session is dead — so the
+			// retry is bounded: each kept row's ForeignRetries
+			// increments and rows past trustLedgerMaxForeignRetries
+			// drain instead of accumulating as inert residue retried
+			// every boot. The foreign record itself is never rewritten
+			// (byte-for-byte as found, fail-closed for the CLI too).
+			// A lost lock is transient — the next start may hold it —
+			// so rows kept for that reason do not count against the
+			// bound; they retry until the record resolves.
+			if recordStructurallyForeign(path) {
+				return dropForeignBounded(path, entries, live)
+			}
+			// A mid-pass write failure (rename race, disk error) is transient
+			// — the next start may succeed — so rows kept for that reason
+			// do not count against the foreign-retry bound; they retry
+			// until the record resolves.
 			if dropped > 0 {
 				var keep []trustLedgerEntry
 				for _, e := range entries {
@@ -580,6 +616,65 @@ deadLoop:
 				continue deadLoop
 			}
 		}
+		keep = append(keep, e)
+	}
+	_ = writeTrustLedger(path, keep)
+	return dropped
+}
+
+// recordStructurallyForeign reports whether the trust record at path is
+// one the sweep can never rewrite no matter how many starts retry it:
+// absent-but-accounted (handled by the caller), unparseable, or carrying
+// an unexpected projects shape. A lost lock reads as NOT foreign — the
+// next start may hold the lock, so those rows retry unbounded until the
+// record resolves. The caller holds the trust lock.
+func recordStructurallyForeign(path string) bool {
+	data, err := os.ReadFile(path) //nolint:gosec // config path, not session input
+	if err != nil {
+		return false
+	}
+	var record map[string]any
+	if json.Unmarshal(data, &record) != nil {
+		return true
+	}
+	raw := record[claudeTrustProjectsKey]
+	if raw == nil {
+		return false
+	}
+	_, ok := raw.(map[string]any)
+	return !ok
+}
+
+// dropForeignBounded retires dead sessions' rows beside a structurally
+// foreign record (see recordStructurallyForeign): each kept row's
+// ForeignRetries increments, rows past trustLedgerMaxForeignRetries drain,
+// and dead sessions' directory-less discovery rows drain with the pass
+// (they name no trust to apply). A live session's discovery row stays — it
+// is still that session's pointer to its isolated home. The foreign record
+// itself is never rewritten. It returns the number of ledger rows dropped.
+// The caller holds the trust lock.
+func dropForeignBounded(path string, entries []trustLedgerEntry, live func(session string) bool) (dropped int) {
+	keep := make([]trustLedgerEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.Dir == "" {
+			// Dead sessions' discovery rows drained with this pass; a
+			// live session's row stays.
+			if live(e.Session) {
+				keep = append(keep, e)
+				continue
+			}
+			dropped++
+			continue
+		}
+		if live(e.Session) {
+			keep = append(keep, e)
+			continue
+		}
+		if e.ForeignRetries+1 > trustLedgerMaxForeignRetries {
+			dropped++
+			continue
+		}
+		e.ForeignRetries++
 		keep = append(keep, e)
 	}
 	_ = writeTrustLedger(path, keep)

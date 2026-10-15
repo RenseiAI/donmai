@@ -175,7 +175,10 @@ func TestSweepTrustLedger_UndoesDeadSessionsKeepsLiveOnes(t *testing.T) {
 // TestSweepTrustLedger_NeverRewritesAForeignRecord proves the sweep leaves
 // a record it cannot parse — or whose projects field has an unexpected
 // shape — byte-for-byte as found, and keeps the rows for the next start to
-// retry.
+// retry. The retry is bounded: repeated passes against a record that can
+// never change increment each row's foreign-retry count and drain past the
+// bound, so un-appliable rows retire instead of accumulating as residue
+// retried every boot.
 func TestSweepTrustLedger_NeverRewritesAForeignRecord(t *testing.T) {
 	t.Parallel()
 	for name, body := range map[string]string{
@@ -205,6 +208,25 @@ func TestSweepTrustLedger_NeverRewritesAForeignRecord(t *testing.T) {
 			}
 			if entries := readLedgerEntries(t, path); len(entries) != 1 {
 				t.Errorf("sweep drained rows it did not apply: %v", entries)
+			}
+			// The retry is bounded, not forever: repeated passes against
+			// a record that can never change retire the row instead of
+			// carrying it every boot, and the foreign record itself is
+			// never rewritten. RED proof: keep the rows unconditionally
+			// and the ledger still carries the dead session's row past
+			// the bound.
+			for i := 0; i < trustLedgerMaxForeignRetries; i++ {
+				sweepTrustLedger(SweepTrustLedgerOptions{TrustRecordPath: path, Live: liveNone})
+			}
+			if entries, ok := readTrustLedger(path); ok && len(entries) != 0 {
+				t.Errorf("foreign-record rows survive %d retries; the retry must be bounded: %v", trustLedgerMaxForeignRetries+1, entries)
+			}
+			raw2, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw2) != body {
+				t.Errorf("bounded foreign retry rewrote the record: got %q, want it untouched %q", raw2, body)
 			}
 		})
 	}

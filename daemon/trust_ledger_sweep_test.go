@@ -126,6 +126,19 @@ func TestSweepSeededTrustLedger_CapsLedgerNamedDiscovery(t *testing.T) {
 	if got := logs.String(); !strings.Contains(got, "discoveryCapped=true") {
 		t.Errorf("completion line does not report the engaged discovery cap: %q", got)
 	}
+	// The capped line names which homes were deferred, so an operator can
+	// tell whether their isolated home was visited or waits for the next
+	// start. RED proof: log only the counts and the deferred homes are
+	// invisible on the completion line.
+	if got := logs.String(); !strings.Contains(got, "deferredHomes=") {
+		t.Errorf("capped completion line names no deferred homes: %q", got)
+	}
+	// The deferred count covers every over-cap home, not just the named
+	// few: with 84 ledger-named homes and a 64-visit cap, 20 wait for the
+	// next start.
+	if got := logs.String(); !strings.Contains(got, "deferred=20") {
+		t.Errorf("capped completion line defers no count of waiting homes: %q", got)
+	}
 }
 
 // plantDiscoveryRow appends one directory-less discovery row naming home
