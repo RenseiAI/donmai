@@ -190,6 +190,12 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 	case "approval/updated":
 		return []agent.Event{agent.SystemEvent{Subtype: "approval_updated", Raw: raw}}
 
+	case "session/approvalModeChanged":
+		// Observed live: the host announces approval-mode transitions
+		// (e.g. after session/start applies the requested mode).
+		// Recorded, never terminal.
+		return []agent.Event{agent.SystemEvent{Subtype: "approval_mode_changed", Message: "Muse approval mode changed", Raw: raw}}
+
 	// ─── Gap: fatal, the handle must recover ────────────────
 	case "view/gap":
 		var p ViewGapParams

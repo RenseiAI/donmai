@@ -34,6 +34,40 @@ func TestMapNotification_UnknownMethodSurfacesUnknown(t *testing.T) {
 	}
 }
 
+func TestMapNotification_ApprovalModeChanged(t *testing.T) {
+	// Seen live after session/start applies the requested mode: it
+	// must surface as a named system event, never as unknown and
+	// never terminal.
+	state := newMapperState("m")
+	events := mapNotification("session/approvalModeChanged", json.RawMessage(`{"sessionId":"s","viewCursor":"c"}`), state, nil)
+	if len(events) != 1 {
+		t.Fatalf("events=%v", kindsOf(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok || sys.Subtype != "approval_mode_changed" {
+		t.Errorf("event=%+v, want approval_mode_changed SystemEvent", events[0])
+	}
+}
+
+func TestMapNotification_UsageChangedIsRecordOnly(t *testing.T) {
+	// usage/changed is the subscription-meter companion to
+	// session/tokenUsage: recorded on the stream, never terminal,
+	// carrying no counters of its own (cost still comes from the
+	// cumulative.cost.usd folded out of session/tokenUsage).
+	state := newMapperState("m")
+	events := mapNotification("usage/changed", json.RawMessage(`{"sessionId":"s","viewCursor":"c"}`), state, nil)
+	if len(events) != 1 {
+		t.Fatalf("events=%v", kindsOf(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok || sys.Subtype != "subscription_usage_changed" {
+		t.Errorf("event=%+v, want subscription_usage_changed SystemEvent", events[0])
+	}
+	if state.hasCost {
+		t.Error("usage/changed must not fabricate cost; only session/tokenUsage folds cost")
+	}
+}
+
 func TestMapTurnCompleted_CompletedFailedCancelled(t *testing.T) {
 	cases := []struct {
 		name       string

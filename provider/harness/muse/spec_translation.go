@@ -222,6 +222,16 @@ func turnStartParams(sessionID, commandID string, spec agent.Spec, input []TurnI
 // mode:"optional", url, headers}; stdio servers pass through
 // {transport:"stdio", command, args, env, mode:"optional"}.
 //
+// Soft-fail vs hard-deny policy: config-time validation soft-fails
+// (a malformed entry — empty Name, missing Command/URL, unknown
+// transport — is skipped with a warning so one bad entry cannot sink
+// the session's other servers), while a missing sessionMcp capability
+// grant hard-denies the session at handshake when the session carries
+// MCP servers: without the grant the host would silently run with no
+// MCP tools, which is worse than refusing to start. Every admitted
+// server rides mode:"optional" so a single unreachable server at
+// runtime degrades that server, not the turn.
+//
 // Servers that fail validation (empty Name, missing Command/URL) are
 // skipped with a warning rather than aborting the whole map.
 func mcpServersConfig(servers []agent.MCPServerConfig) map[string]SessionMCPServerConfig {
