@@ -143,7 +143,7 @@ func TestComposeEnv_InheritedBlocklistHonoursTheInjectionDeclaration(t *testing.
 func TestComposeEnv_NoParentYieldsDefaultsAndOverridesOnly(t *testing.T) {
 	t.Parallel()
 	got := envMap(composeEnv(nil, []string{"KEEP=request", "ATTACH_TOKEN=request-secret"}))
-	want := map[string]string{"TERM": "xterm-256color", "COLORTERM": "truecolor", "KEEP": "request"}
+	want := map[string]string{"TERM": "xterm-256color", "COLORTERM": "truecolor", "LANG": "C.UTF-8", "KEEP": "request"}
 	if len(got) != len(want) {
 		t.Fatalf("exact environment = %v, want exactly %v", got, want)
 	}
@@ -205,6 +205,66 @@ func TestSpawn_ExactEnvInheritsNothingFromParent(t *testing.T) {
 	}
 }
 
+// TestComposeEnv_UTF8LocaleOnlyWhenNoneIsSet pins the locale default: a
+// parent with no locale (a launchd or systemd daemon) gets LANG=C.UTF-8, and
+// any locale the parent or the request names is left alone.
+func TestComposeEnv_UTF8LocaleOnlyWhenNoneIsSet(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		parent    []string
+		overrides []string
+		want      map[string]string // "" means the key must be absent
+	}{
+		{
+			name:   "no locale anywhere gets the UTF-8 default",
+			parent: []string{"PATH=/usr/bin:/bin", "HOME=/h"},
+			want:   map[string]string{"LANG": "C.UTF-8", "LC_ALL": "", "LC_CTYPE": ""},
+		},
+		{
+			name:   "an empty LANG counts as unset",
+			parent: []string{"LANG="},
+			want:   map[string]string{"LANG": "C.UTF-8"},
+		},
+		{
+			name:   "parent LANG is kept",
+			parent: []string{"LANG=en_US.UTF-8"},
+			want:   map[string]string{"LANG": "en_US.UTF-8"},
+		},
+		{
+			name:   "parent LC_CTYPE suppresses the default",
+			parent: []string{"LC_CTYPE=UTF-8"},
+			want:   map[string]string{"LC_CTYPE": "UTF-8", "LANG": ""},
+		},
+		{
+			name:   "an explicit C locale is respected",
+			parent: []string{"LC_ALL=C"},
+			want:   map[string]string{"LC_ALL": "C", "LANG": ""},
+		},
+		{
+			name:      "a request locale wins over the default",
+			overrides: []string{"LANG=ja_JP.UTF-8"},
+			want:      map[string]string{"LANG": "ja_JP.UTF-8"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := envMap(composeEnv(tt.parent, tt.overrides))
+			for key, want := range tt.want {
+				value, ok := got[key]
+				if want == "" && ok {
+					t.Errorf("%s = %q, want it absent", key, value)
+				} else if want != "" && value != want {
+					t.Errorf("%s = %q, want %q", key, value, want)
+				}
+			}
+		})
+	}
+}
+
 func TestComposeEnv_ManyOverridesGrowWithoutCapacitySum(t *testing.T) {
 	t.Parallel()
 	overrides := make([]string, 4096)
@@ -212,7 +272,7 @@ func TestComposeEnv_ManyOverridesGrowWithoutCapacitySum(t *testing.T) {
 		overrides[i] = fmt.Sprintf("KEY_%04d=value", i)
 	}
 	got := envMap(composeEnv([]string{"PATH=/bin"}, overrides))
-	if len(got) != 4099 || got["PATH"] != "/bin" || got["KEY_4095"] != "value" {
+	if len(got) != 4100 || got["PATH"] != "/bin" || got["KEY_4095"] != "value" {
 		t.Fatalf("large composed environment boundaries: len=%d PATH=%q last=%q", len(got), got["PATH"], got["KEY_4095"])
 	}
 }
