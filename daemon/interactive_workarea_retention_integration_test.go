@@ -20,6 +20,7 @@ import (
 	providershell "github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -407,13 +408,14 @@ func interactiveRetentionManager(
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent,
 		Now:       now,
-		ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
-			return registry.ArchiveRoot(ctx, WorkareaRootArchiveSpec{
-				AcquisitionID: spec.AcquisitionID,
-				WorkareaID:    spec.WorkareaID,
-				SessionID:     spec.SessionID,
-				WorkareaRoot:  spec.WorkareaRoot,
-				SelectedPath:  spec.SelectedPath,
+		ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+			return registry.CommitArchiveRoot(ctx, WorkareaRootArchiveSpec{
+				AcquisitionID:    spec.AcquisitionID,
+				WorkareaID:       spec.WorkareaID,
+				SessionID:        spec.SessionID,
+				WorkareaRoot:     spec.WorkareaRoot,
+				SelectedPath:     spec.SelectedPath,
+				TerminalResultID: spec.TerminalResultID,
 			})
 		},
 	})

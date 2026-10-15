@@ -400,6 +400,12 @@ type Result struct {
 	// after the full descriptor and host-local path are durable.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
 
+	// TerminalArchiveReference is the separately versioned committed-archive
+	// recovery reference, emitted only after the archive bytes and manifest
+	// are committed and independently re-read. Nil when no archive committed
+	// for this result; old receivers ignore the key.
+	TerminalArchiveReference *workarea.TerminalArchiveReference `json:"terminalArchiveReference,omitempty"`
+
 	// manifestPrinted records that the envelope's Manifest was recovered
 	// from a printed `Intended manifest:` block rather than read from the
 	// manifest file on disk. A printed block is the tool-restricted
