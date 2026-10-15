@@ -156,7 +156,11 @@ func responsesRequestToIR(rr ResponsesRequest) (ir.Request, error) {
 		},
 	}
 	if rr.Reasoning != nil && rr.Reasoning.Effort != "" {
-		req.Thinking = ir.ThinkingSpec{Level: ir.LevelFromEffort(rr.Reasoning.Effort), Emit: ir.EmitFull}
+		level, err := ir.LevelFromEffort(rr.Reasoning.Effort)
+		if err != nil {
+			return ir.Request{}, fmt.Errorf("gateway/translate: decode responses request: %w", err)
+		}
+		req.Thinking = ir.ThinkingSpec{Level: level, Emit: ir.EmitFull}
 	}
 	for _, t := range rr.Tools {
 		req.Tools = append(req.Tools, ir.ToolDef{

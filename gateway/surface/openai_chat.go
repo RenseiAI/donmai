@@ -97,7 +97,7 @@ func (h *OpenAIChat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := translate.DecodeRequest(body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed chat completions request")
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 
