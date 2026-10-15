@@ -19,6 +19,7 @@ package matrix
 
 import (
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
@@ -297,6 +298,32 @@ var validCells = []HarnessEndpointCell{
 		StructuredVia: "spawn-collect", LegacyProviderID: nil,
 	},
 
+	// muse × Meta -----------------------------------------------------------
+	// The MSP serve host drives muse-msp on both the subscriber login
+	// (oauth-cli, host-session — the serve child inherits the login) and
+	// the keyed API route (direct, BYOK/metered via META_API_KEY). The
+	// oauth-cli cell anchors ProviderName "muse" (the host-session
+	// default, mirroring codex × openai × oauth-cli); the direct cell is
+	// the keyed sibling. Both are experimental/untested until the smoke
+	// lane proves a live turn: the adapter reports no native structured
+	// output (spawn-collect) and no plan/fork/rollback surface (the MSP
+	// host exposes none — see provider/harness/muse README "Out of
+	// scope").
+	{
+		Harness: agent.HarnessMuse, Endpoint: agent.CompanyMeta, Host: agent.HostOAuthCLI,
+		Protocol: agent.ProtoMuseMSP, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
+		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderMuse),
+	},
+	{
+		Harness: agent.HarnessMuse, Endpoint: agent.CompanyMeta, Host: agent.HostDirect,
+		Protocol: agent.ProtoMuseMSP, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: nil,
+	},
+
 	// stub × stub -----------------------------------------------------------
 	{
 		Harness: agent.HarnessStub, Endpoint: agent.CompanyStub, Host: agent.HostLocal,
@@ -362,6 +389,13 @@ var harnessBinaryPins = map[agent.HarnessName]HarnessBinaryPin{
 		MinVersion:      pi.MinVersion,
 		PinnedVersion:   pi.PinnedVersion,
 		VerifiedAgainst: pi.VerifiedAgainst,
+	},
+	// The serve host drifts independently of donmai releases; the pin is
+	// enforced probe-time in provider/harness/muse (checkMuseVersion).
+	agent.HarnessMuse: {
+		MinVersion:      muse.MinVersion,
+		PinnedVersion:   muse.PinnedVersion,
+		VerifiedAgainst: muse.VerifiedAgainst,
 	},
 }
 

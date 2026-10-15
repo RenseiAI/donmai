@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/google/uuid"
 )
@@ -92,12 +93,68 @@ type Options struct {
 	// over disabling the sandbox outright.
 	DisableSandbox bool
 
+	// RequireConfinement is the host's own requirement that every muse
+	// session run inside the executor OS confinement (the placement-owned
+	// trigger). It only tightens: when set, a session the host cannot
+	// confine is refused, never run unconfined. New also sets it when
+	// the host environment carries DONMAI_MUSE_CONFINEMENT=required.
+	RequireConfinement bool
+
+	// ConfinementReadScope is the host's fileRead level for confined
+	// sessions. agent.FileReadWorkarea confines reads to the session's
+	// workarea, the runtime and toolchain paths, the serve binary's own
+	// install, git's user configuration and ConfinementReadPaths, and
+	// implies RequireConfinement; empty or agent.FileReadHost leaves
+	// reads open. New refuses any other level, and tightens it to
+	// workarea when the host environment carries
+	// DONMAI_MUSE_CONFINEMENT_READ=workarea.
+	ConfinementReadScope agent.ExecutionSecurityLevel
+
+	// ConfinementReadPaths are further absolute paths confined sessions
+	// may read under a read scope. New appends the entries of
+	// DONMAI_MUSE_CONFINEMENT_READ_PATHS.
+	ConfinementReadPaths []string
+
+	// ControlTokenPath is the daemon-resolved control-token file path the
+	// seat confinement denies outright. The daemon states it per session
+	// (it strips the path-override variable from every worker it spawns,
+	// so the worker cannot resolve the override from its own environment
+	// and would otherwise deny the default path while the live token sits
+	// elsewhere). Empty falls back to the process environment. It never
+	// reaches a spawned session's environment: confineMuseSession passes
+	// it to the confinement spec in-process, and no child-env composition
+	// reads it.
+	ControlTokenPath string
+
 	// stdoutOverride / stdinOverride / stderrOverride are test seams.
 	stdoutOverride io.ReadCloser
 	stdinOverride  io.WriteCloser
 	stderrOverride io.ReadCloser
 	skipProcess    bool // when true, no real host is spawned (tests)
+
+	// confinementDirs points the confiner's host directories (profiles,
+	// operator home, host state home, self-test scratch) at throwaway
+	// paths in tests. Nil resolves them from the host
+	// (productionMuseConfinementDirs). It never decides WHETHER a session
+	// is confined — the gate does.
+	confinementDirs *museConfinementDirs
 }
+
+// museConfinementEnvVar is the host-level switch that makes every muse
+// session on this host request confinement. The only recognized value is
+// "required"; anything else leaves Options.RequireConfinement as the
+// caller set it. It can only tighten. It is host-owned
+// (runtimeenv.IsHostOwned): the daemon drops a work item's copy, so the
+// worker sees only the host's value.
+const museConfinementEnvVar = runtimeenv.MuseConfinementEnv
+
+// museConfinementReadEnvVar and museConfinementReadPathsEnvVar are the
+// host-level read scope and its declared read paths (host-owned, like the
+// requirement): the read scope can only tighten.
+const (
+	museConfinementReadEnvVar      = runtimeenv.MuseConfinementReadEnv
+	museConfinementReadPathsEnvVar = runtimeenv.MuseConfinementReadPathsEnv
+)
 
 // New constructs the Provider. Binary availability and the minimum
 // version are probed here — a missing or too-old binary returns
@@ -113,6 +170,12 @@ func New(opts Options) (*Provider, error) {
 	}
 	if len(opts.Args) == 0 {
 		opts.Args = []string{"serve"}
+	}
+	if strings.TrimSpace(os.Getenv(museConfinementEnvVar)) == "required" {
+		opts.RequireConfinement = true
+	}
+	if err := applyHostReadScope(&opts); err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
 	if opts.skipProcess {
 		return &Provider{opts: opts, museBin: "muse-test", verified: true, handles: make(map[*Handle]struct{})}, nil
@@ -200,22 +263,76 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	return h, nil
 }
 
-// spawnHandle owns the full per-session bring-up: canonical cwd, child
-// env, process start, handshake, session start/resume, first turn.
+// spawnHandle owns the full per-session bring-up: canonical cwd,
+// confinement plan, child env, process start, handshake, session
+// start/resume, first turn.
 func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessionID string) (*Handle, error) {
 	workspaceRoot, err := canonicalWorkspaceRoot(spec.Cwd)
 	if err != nil {
 		return nil, fmt.Errorf("%w: muse workspace root: %v", agent.ErrSpawnFailed, err)
 	}
+	// Decide confinement FIRST, before the child starts: a requested
+	// confinement that cannot be met refuses the spawn, never runs
+	// unconfined. Process-less (skipProcess) launches spawn nothing and
+	// are never confined.
+	var confiner *confinement.Confiner
+	if !p.opts.skipProcess {
+		var cerr error
+		confiner, cerr = p.confinerForSession(ctx, spec)
+		if cerr != nil {
+			return nil, cerr
+		}
+	}
+	// The per-session scratch directory holds the confinement tmp and
+	// caches for a confined session; unconfined sessions never create
+	// it. Removed when the session stops (Handle.stopScratch).
+	var sessionDir string
+	if confiner != nil {
+		var derr error
+		sessionDir, derr = os.MkdirTemp("", "muse-session-")
+		if derr != nil {
+			return nil, fmt.Errorf("%w: muse session scratch: %v", agent.ErrSpawnFailed, derr)
+		}
+	}
+	cleanupSessionDir := func() {
+		if sessionDir != "" {
+			_ = os.RemoveAll(sessionDir)
+		}
+	}
+	var cplan *confinement.Plan
+	if confiner != nil {
+		var perr error
+		cplan, perr = p.confineSession(spec, workspaceRoot, sessionDir, confiner)
+		if perr != nil {
+			cleanupSessionDir()
+			return nil, perr
+		}
+	}
+	releasePlan := func() {
+		if cplan != nil {
+			_ = cplan.Release()
+		}
+	}
 	plan := NewSpawnPlan(spec, workspaceRoot)
 
 	h := newHandle(p, spec, plan, HandleOptions{RPCTimeout: p.opts.RPCTimeout})
+	h.setConfinement(cplan, sessionDir)
 
 	if err := h.spawnChild(workspaceRoot, spec); err != nil {
+		releasePlan()
+		cleanupSessionDir()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	// From here on the child is live; failures must stop it.
+	// From here on the child is live; failures must stop it. The
+	// confinement plan stays applied until the child has exited: the
+	// release runs in Handle shutdown (releaseConfinement), not here.
+	// Handle shutdown runs through closeEvents, which also releases the
+	// plan — so every post-spawn failure path below funnels through
+	// closeEvents before returning, and no path leaks the rendered
+	// profile or the per-session scratch directory.
 	if err := h.handshake(ctx); err != nil {
+		h.signalClosed()
+		h.closeEvents()
 		_ = h.shutdownChild("handshake failed")
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
@@ -301,6 +418,61 @@ func (p *Provider) unregisterHandle(h *Handle) {
 	p.mu.Lock()
 	delete(p.handles, h)
 	p.mu.Unlock()
+}
+
+// confinerForSession returns the shared, self-tested confiner for a session
+// that requested confinement, and nil for one that did not. The probe is
+// this process: the main entrypoint answers the confinement probe, so the
+// self-test drives the probe through the exact production spawn binding. A
+// request that cannot be met — no working directory, no backend, a failed
+// self-test — refuses the spawn.
+func (p *Provider) confinerForSession(ctx context.Context, spec agent.Spec) (*confinement.Confiner, error) {
+	if !museConfinementEnabled(spec, p.opts.RequireConfinement) {
+		return nil, nil
+	}
+	if strings.TrimSpace(spec.Cwd) == "" {
+		return nil, fmt.Errorf("%w: muse confinement requested for a session with no working directory", agent.ErrSpawnFailed)
+	}
+	probe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("%w: muse confinement probe executable: %v", agent.ErrSpawnFailed, err)
+	}
+	return ensureMuseConfiner(ctx, p.museBin, p.hostConfinementDirs(), []string{probe})
+}
+
+// hostConfinementDirs returns the confiner's host directories: the test
+// seam's when set, else the host's own.
+func (p *Provider) hostConfinementDirs() museConfinementDirs {
+	if p.opts.confinementDirs != nil {
+		return *p.opts.confinementDirs
+	}
+	return productionMuseConfinementDirs()
+}
+
+// confineSession prepares a confined session's plan under the host's read
+// scope. The daemon-stated token path rides the spec explicitly: the
+// worker's environment never carries the override variable, so resolving
+// it there would deny the wrong file.
+func (p *Provider) confineSession(spec agent.Spec, workspaceRoot, sessionDir string, confiner *confinement.Confiner) (*confinement.Plan, error) {
+	reads, err := p.sessionReadScope(p.hostConfinementDirs().home)
+	if err != nil {
+		return nil, err
+	}
+	return confineMuseSession(spec, workspaceRoot, sessionDir, confiner, reads, p.opts.ControlTokenPath)
+}
+
+// museConfinementEnabled reports whether the session requested OS
+// confinement: the host's own configuration requires it for this harness
+// (hostRequires — Options.RequireConfinement), or the session declares a
+// repository authority, whose read-only leaves need the executor boundary.
+// Confinement applies exactly when requested, never opportunistically, so
+// the answer does not depend on whether this host has a backend: a request
+// on a host without one is refused, not dropped (ensureMuseConfiner).
+func museConfinementEnabled(spec agent.Spec, hostRequires bool) bool {
+	if hostRequires {
+		return true
+	}
+	return spec.RepositoryAuthority != nil && strings.TrimSpace(spec.RepositoryAuthority.WorkareaRoot) != ""
 }
 
 // resolveMuseBinary applies the Options → $MUSE_BIN → "muse" fallback

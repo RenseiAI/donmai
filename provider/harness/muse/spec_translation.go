@@ -49,9 +49,21 @@ func resolveModel(spec agent.Spec) string {
 }
 
 // resolveEffort maps Spec.Effort to the MSP reasoning tier. Empty (not
-// configured) leaves the tier unset so the host default applies.
+// configured) leaves the tier unset so the host default applies. The
+// "minimal" tier has no agent.EffortLevel constant (the shared ladder
+// runs low..max) but the host catalog lists it, so it is matched by its
+// wire spelling. The "default" and "none" sentinels are never
+// forwarded: an unset tier and a default tier are the same request to the
+// host (run at its default), and "none" is not a selectable tier.
+// "ultra" is a declared wire value (types.go) the shared ladder does
+// not name: it is refused loudly rather than silently degraded to the
+// host default, so a caller asking for the top tier never unknowingly
+// runs at a lower one.
 func resolveEffort(spec agent.Spec) *ReasoningEffort {
 	switch spec.Effort {
+	case agent.EffortLevel("minimal"):
+		e := ReasoningEffortMinimal
+		return &e
 	case agent.EffortLow:
 		e := ReasoningEffortLow
 		return &e

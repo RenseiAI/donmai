@@ -26,6 +26,20 @@ and no other Spec or provider option widens it. Env: `META_API_KEY` is stripped
 unless the Spec sets it; `MUSE_NO_AUTO_UPDATE=1` is always set. The cwd
 is the realpath of the workspace (the host rejects non-canonical roots).
 
+## Confinement
+
+The serve child runs under the executor OS confinement (seatbelt on
+macOS, mount-namespace on Linux) exactly when requested: the host
+requires it (`DONMAI_MUSE_CONFINEMENT=required` or
+`Options.RequireConfinement`) or the session declares a repository
+authority. A request that cannot be met (no backend, no working
+directory, failed self-test) refuses the spawn — never runs unconfined.
+The confinement wraps the whole serve argv after the lane flags, so it
+composes with the host's own sandbox: on the read-only lane both apply;
+with `--disable-sandbox` the OS profile is the only boundary. Effort
+rides `turn/start.reasoningEffort` (`minimal`..`max`; unset, `default`
+and `none` all leave the tier off so the host default applies).
+
 Handshake: `initialize{clientInfo:{name: "donmai", version},
 capabilities:{requestedCapabilities:["sessionMcp"]}}`, then the
 `initialized` notification. Nothing is sent before the handshake

@@ -19,6 +19,52 @@ func TestResolveModel_DefaultAndSentinel(t *testing.T) {
 	}
 }
 
+// TestResolveEffort_MinimalToMax pins the full host tier ladder: the
+// catalog lists minimal..max, so every tier maps to its wire spelling —
+// including minimal, which has no agent.EffortLevel constant and arrives
+// by its wire spelling. Empty, "default" and "none" all leave the
+// tier unset so the host default applies; no sentinel is ever forwarded.
+func TestResolveEffort_MinimalToMax(t *testing.T) {
+	for _, tc := range []struct {
+		effort agent.EffortLevel
+		want   ReasoningEffort
+	}{
+		{agent.EffortLevel("minimal"), ReasoningEffortMinimal},
+		{agent.EffortLow, ReasoningEffortLow},
+		{agent.EffortMedium, ReasoningEffortMedium},
+		{agent.EffortHigh, ReasoningEffortHigh},
+		{agent.EffortXHigh, ReasoningEffortXHigh},
+		{agent.EffortMax, ReasoningEffortMax},
+	} {
+		got := resolveEffort(agent.Spec{Effort: tc.effort})
+		if got == nil || *got != tc.want {
+			t.Errorf("effort %q = %v, want %q", tc.effort, got, tc.want)
+		}
+	}
+	for _, sentinel := range []agent.EffortLevel{"", "default", "none"} {
+		if got := resolveEffort(agent.Spec{Effort: sentinel}); got != nil {
+			t.Errorf("effort %q = %v, want unset (never forward a sentinel)", sentinel, *got)
+		}
+	}
+}
+
+// TestTurnStartParams_EffortSentinelOmitted pins the wire rule: a
+// sentinel effort leaves reasoningEffort off the turn/start params
+// entirely — the host default applies — while a configured tier rides
+// the params by its wire spelling.
+func TestTurnStartParams_EffortSentinelOmitted(t *testing.T) {
+	minimal := turnStartParams("s", "c", agent.Spec{Effort: agent.EffortLevel("minimal")}, nil, nil)
+	if minimal["reasoningEffort"] != string(ReasoningEffortMinimal) {
+		t.Errorf("minimal reasoningEffort = %v, want %q", minimal["reasoningEffort"], ReasoningEffortMinimal)
+	}
+	for _, sentinel := range []agent.EffortLevel{"", "default", "none"} {
+		params := turnStartParams("s", "c", agent.Spec{Effort: sentinel}, []TurnInputPart{{Type: "text"}}, nil)
+		if _, present := params["reasoningEffort"]; present {
+			t.Errorf("effort %q sent reasoningEffort=%v, want omitted", sentinel, params["reasoningEffort"])
+		}
+	}
+}
+
 func TestResolveApprovalMode(t *testing.T) {
 	if got := resolveApprovalMode(agent.Spec{Autonomous: true}); got != ApprovalModeAllowAll {
 		t.Errorf("autonomous without policy=%q, want allowAll", got)

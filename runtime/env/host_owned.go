@@ -35,6 +35,26 @@ const PiConfinementReadEnv = "DONMAI_PI_CONFINEMENT_READ"
 // embedder can set it per session from its pre-spawn hook.
 const PiConfinementReadPathsEnv = "DONMAI_PI_CONFINEMENT_READ_PATHS"
 
+// MuseConfinementEnv is the host-level switch that makes every muse
+// session on this host request the executor OS confinement. The only
+// recognized value is "required"; the muse provider reads it at
+// construction and it can only tighten.
+const MuseConfinementEnv = "DONMAI_MUSE_CONFINEMENT"
+
+// MuseConfinementReadEnv is the host-level read scope for confined muse
+// sessions, a fileRead level on the execution-security ladder: "workarea"
+// confines reads to the session's workarea plus the runtime, toolchain and
+// declared paths, and implies DONMAI_MUSE_CONFINEMENT=required; "host" or
+// unset leaves reads open. Any other value refuses the provider at
+// construction. It can only tighten.
+const MuseConfinementReadEnv = "DONMAI_MUSE_CONFINEMENT_READ"
+
+// MuseConfinementReadPathsEnv lists further absolute paths, separated like
+// PATH, that confined muse sessions may read under a read scope: host
+// configuration or per-session credential files outside the workarea. An
+// embedder can set it per session from its pre-spawn hook.
+const MuseConfinementReadPathsEnv = "DONMAI_MUSE_CONFINEMENT_READ_PATHS"
+
 // DaemonControlURLEnv is the variable the daemon sets on every worker it
 // spawns to name its own control API (daemon.EnvDaemonControlURL is this
 // constant). It is daemon-owned already: the daemon composes it last.
@@ -79,6 +99,7 @@ const DefaultDaemonControlPort = 7734
 func IsHostOwned(key string) bool {
 	switch key {
 	case PiConfinementEnv, PiConfinementReadEnv, PiConfinementReadPathsEnv,
+		MuseConfinementEnv, MuseConfinementReadEnv, MuseConfinementReadPathsEnv,
 		KeepFailedWorktreeEnv:
 		return true
 	default:
