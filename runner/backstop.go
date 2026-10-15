@@ -347,8 +347,12 @@ func backstopPRBody(qw QueuedWork) string {
 	)
 }
 
-//nolint:gocyclo,funlen // step ordering is the package's contract; splitting hides intent
 func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result, allowedRepositories map[string]struct{}) agent.BackstopReport {
+	return r.runBackstopForRepository(ctx, qw, branch, res, allowedRepositories, githubRepositorySlug(qw.Repository))
+}
+
+//nolint:gocyclo,funlen // step ordering is the package's contract; splitting hides intent
+func (r *Runner) runBackstopForRepository(ctx context.Context, qw QueuedWork, branch string, res *Result, allowedRepositories map[string]struct{}, repositorySlug string) agent.BackstopReport {
 	// Keep the completion contract at the mutation boundary too. Normal callers
 	// use shouldBackstop, but a future direct caller must not turn verdict-only
 	// review output into a commit, push, or PR.
@@ -526,6 +530,11 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	// not own. An "already exists" PR recovered below is therefore always the
 	// session branch's own PR.
 	prArgs := []string{"pr", "create", "--head", branch, "--title", prTitle, "--body", prBody}
+	// The dispatched repository owns the PR; the host's gh identity and
+	// local checkout context must not choose a different owner.
+	if repositorySlug != "" {
+		prArgs = append(prArgs, "--repo", repositorySlug)
+	}
 	if qw.BaseRef != "" {
 		prArgs = append(prArgs, "--base", qw.BaseRef)
 	}
@@ -545,7 +554,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 			report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories)
 			return report
 		}
-		report.Diagnostics = fmt.Sprintf("gh pr create failed: %v\noutput: %s", err, prOut)
+		report.Diagnostics = fmt.Sprintf("delivery failed after successful push: gh pr create failed: %v\noutput: %s", err, prOut)
 		return report
 	}
 	if u := scanPRURL(prOut); u != "" {
@@ -590,7 +599,7 @@ func (r *Runner) runDeclaredBackstops(
 		}
 		report := agent.BackstopReport{PRURL: repositoryResult.PullRequestURL}
 		if shouldBackstop(&repositoryResult, qw.WorkType) {
-			report = r.runBackstop(ctx, qw, branch, &repositoryResult, allowedRepositories)
+			report = r.runBackstopForRepository(ctx, qw, branch, &repositoryResult, allowedRepositories, githubRepositorySlug(repository.Source.Repository))
 		} else if report.PRURL != "" {
 			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories)
 		}
@@ -636,7 +645,11 @@ const ghPullRequestViewFields = "number,url,baseRefName,headRefName,isDraft"
 func viewGitHubPullRequest(ctx context.Context, worktreePath, prURL string) (ghPullRequestView, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL, "--json", ghPullRequestViewFields)
+	args := []string{"pr", "view", prURL, "--json", ghPullRequestViewFields}
+	if repository, _, err := parseCanonicalGitHubPullRequestURL(prURL); err == nil {
+		args = append(args, "--repo", repository)
+	}
+	out, err := runGh(lookupCtx, worktreePath, args...)
 	if err != nil {
 		return ghPullRequestView{}, fmt.Errorf("gh pr view: %w: %s", err, firstLine(out))
 	}
