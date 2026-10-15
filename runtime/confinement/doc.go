@@ -69,6 +69,25 @@
 // same-identity permission bits, turns it red; so does dropping only the
 // read rules, for exactly the read-scope probes.
 //
+// A probe child announces itself with a handshake file beside its plan the
+// moment it starts serving, before running any step. Each pass waits for
+// that handshake under its own short bound (SelfTestOptions.
+// ProbeHandshakeTimeout), separate from the per-mode proof budget: a child
+// that is still running past the bound without serving — an executable
+// whose main opened its own interface instead of running the probe — fails
+// the pass fast with the typed probe_unserved reason instead of burning the
+// whole budget waiting for results that can never arrive. The self-test
+// then returns promptly with no attested mode, and the caller continues
+// without attesting the harness instead of blocking.
+//
+// Composing binaries take note: the self-test re-executes the host binary
+// (os.Executable in the worker is the binary the embedder shipped), so an
+// embedder's main must serve the confinement probe first, via
+// RunProbeFromEnv, before any interface of its own. A main that does not
+// is never answered and fails every confined start fast with
+// probe_unserved — the session is refused with that named cause, never
+// attested, never stalled.
+//
 // A spawn site that wraps a harness must not hand it a descriptor open on a
 // file outside the writable set: the boundary judges an open, not a write
 // through a descriptor the process inherited.

@@ -257,6 +257,7 @@ type Manager struct {
 	acquisitions            *workarea.AcquisitionStore
 	seeds                   *workarea.SeedStore
 	provisionHook           ProvisionHook
+	preProvisionDelay       time.Duration
 	archiveRoot             ArchiveRootFunc
 	restoreSessionID        string
 	authorityMu             sync.Mutex
@@ -353,6 +354,13 @@ type Options struct {
 	SeedStore *workarea.SeedStore
 	// ProvisionHook injects deterministic crash boundaries in tests.
 	ProvisionHook ProvisionHook
+	// PreProvisionDelay, when positive, pauses Provision after session
+	// validation and before any materialization, holding the passed context
+	// so cancellation still aborts the wait. It is a test seam for liveness
+	// timing: a test slows provisioning past a shortened stale window and
+	// asserts the session keeps posting lock-refreshes while the clone is
+	// still in flight. Production code leaves it zero (no pause).
+	PreProvisionDelay time.Duration
 	// ArchiveRoot must succeed before an archive disposition may release a root.
 	ArchiveRoot ArchiveRootFunc
 	// RestoreSessionID limits restart bookkeeping to one owner or participant.
@@ -445,6 +453,7 @@ func NewManager(opts Options) (*Manager, error) {
 		acquisitions:            acquisitions,
 		seeds:                   seeds,
 		provisionHook:           opts.ProvisionHook,
+		preProvisionDelay:       opts.PreProvisionDelay,
 		archiveRoot:             opts.ArchiveRoot,
 		restoreSessionID:        opts.RestoreSessionID,
 		now:                     opts.Now,
@@ -697,6 +706,19 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	}
 	if spec.SessionID == "" {
 		return "", errors.New("runtime/worktree: SessionID required")
+	}
+	// Test seam: hold the provision open (cancellable) so a liveness
+	// timing test can keep the session inside provisioning past a
+	// shortened stale window. Runs before any materialization, so a
+	// cancelled wait provisions nothing and leaves no residue.
+	if m.preProvisionDelay > 0 {
+		timer := time.NewTimer(m.preProvisionDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
 	}
 	unlock := m.lockSession(spec.SessionID)
 	defer unlock()

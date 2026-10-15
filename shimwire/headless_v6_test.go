@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -365,6 +366,37 @@ func TestCredentialBodiesValidateTheFenceAndTheSecret(t *testing.T) {
 	}
 	if CredentialStatus("exited").Known() || CredentialStatus("teapot").Known() {
 		t.Error("unassigned credential status reported known; the registry is closed")
+	}
+}
+
+// TestCredentialUpdateFormattingRedactsTheBearer pins the secret-hygiene
+// half of the bearer contract: the bearer is a control secret that never
+// reaches disk, logs, the discovery record or the tombstone, so formatting
+// a CredentialUpdate with %v, %+v or %#v must never print it, while the
+// correlation beside it stays readable.
+func TestCredentialUpdateFormattingRedactsTheBearer(t *testing.T) {
+	t.Parallel()
+
+	update := CredentialUpdate{RequestID: 7, Generation: 9, WorkerID: "worker-2", Bearer: "bearer-2", ExpiresAt: 1700003600000000000}
+	for _, formatted := range []string{
+		fmt.Sprintf("%v", update),
+		fmt.Sprintf("%+v", update),
+		fmt.Sprintf("%#v", update),
+	} {
+		if strings.Contains(formatted, "bearer-2") {
+			t.Fatalf("formatted CredentialUpdate leaks the bearer: %s", formatted)
+		}
+		for _, correlation := range []string{"7", "9", "worker-2"} {
+			if !strings.Contains(formatted, correlation) {
+				t.Fatalf("formatted CredentialUpdate = %s, want correlation %q readable", formatted, correlation)
+			}
+		}
+	}
+	if got := update.String(); strings.Contains(got, "bearer-2") {
+		t.Fatalf("CredentialUpdate.String leaks the bearer: %s", got)
+	}
+	if got := update.GoString(); strings.Contains(got, "bearer-2") {
+		t.Fatalf("CredentialUpdate.GoString leaks the bearer: %s", got)
 	}
 }
 

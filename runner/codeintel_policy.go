@@ -25,7 +25,7 @@ func translateSpecForCodeIntelDelivery(qw QueuedWork, caps agent.Capabilities, i
 	if err := validateSelectedNativePolicyTools(selection.Tools); err != nil {
 		return agent.Spec{}, fmt.Errorf("runner: project native code-intelligence policy: %w", err)
 	}
-	policy := legacySpecToolPolicy(qw)
+	policy := legacySpecToolPolicy(qw, caps)
 	policy.DisallowedTools = append(policy.DisallowedTools, additionalDisallowed...)
 	if qw.isInterview() {
 		policy.DisallowedTools = append(policy.DisallowedTools, "AskUserQuestion", "Write", "Edit", "Task", "Bash")

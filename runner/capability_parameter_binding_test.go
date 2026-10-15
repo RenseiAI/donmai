@@ -17,6 +17,7 @@ type syntheticParameterBinder struct {
 	sourceDigest string
 	calls        int
 	mutate       func(*agent.CapabilityParameterBindingV1)
+	deliveries   []agent.ExtensionDelivery
 }
 
 func (b *syntheticParameterBinder) ContractID() string   { return b.contractID }
@@ -48,10 +49,10 @@ func (b *syntheticParameterBinder) Bind(context CapabilityParameterBindingContex
 	if err != nil {
 		return CapabilityParameterBindResult{}, err
 	}
-	return CapabilityParameterBindResult{Binding: binding, Materialization: agent.CapabilityRuntimeMaterializationV1{ContractVersion: agent.CapabilityRuntimeMaterializationContractVersionV1, CapabilityID: binding.CapabilityID, ParameterContractID: binding.ParameterContractID, BindingDigest: binding.BindingDigest, ConfigDigest: configDigest, Config: config}}, nil
+	return CapabilityParameterBindResult{Binding: binding, AdditionalExtensions: b.deliveries, Materialization: agent.CapabilityRuntimeMaterializationV1{ContractVersion: agent.CapabilityRuntimeMaterializationContractVersionV1, CapabilityID: binding.CapabilityID, ParameterContractID: binding.ParameterContractID, BindingDigest: binding.BindingDigest, ConfigDigest: configDigest, Config: config}}, nil
 }
 
-func syntheticParameterizedRegistry(t *testing.T, harness agent.HarnessName, adapter string, mode agent.PromptSessionMode) (*agent.CapabilityRealizationRegistry, *syntheticParameterBinder) {
+func syntheticParameterizedRegistry(t *testing.T, harness agent.HarnessName, adapter string, mode agent.PromptSessionMode, deliveries ...agent.ExtensionDelivery) (*agent.CapabilityRealizationRegistry, *syntheticParameterBinder) {
 	t.Helper()
 	binderSource := []byte("synthetic process-owned binder")
 	binderDigest := sha256.Sum256(binderSource)
@@ -61,11 +62,21 @@ func syntheticParameterizedRegistry(t *testing.T, harness agent.HarnessName, ada
 		t.Fatal(err)
 	}
 	contract := &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: "example.parameter-binder/v1", BinderSourceDigest: hex.EncodeToString(binderDigest[:]), SurfaceProjection: "subset", RuntimeObservation: "none"}
-	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.parameterized/v1", HarnessID: harness, AdapterVersion: adapter, Mode: mode, RecipeID: "example/parameterized/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})
+	entryID := "mcp-servers"
+	channel := agent.ToolChannelMCPServer
+	if len(deliveries) > 0 {
+		entryID, err = agent.AdditionalExtensionCapabilityEntryID(deliveries[0].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel = agent.ToolChannelToolPlugin
+		inputDigest = agent.CapabilityExtensionInputDigest(deliveries)
+	}
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.parameterized/v1", HarnessID: harness, AdapterVersion: adapter, Mode: mode, RecipeID: "example/parameterized/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID, Channel: channel, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "synthetic-real-binary", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "mcp-servers", Channel: agent.ToolChannelMCPServer, InputDigest: inputDigest}}, ObservedSurface: surface})
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "synthetic-real-binary", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: entryID, Channel: channel, InputDigest: inputDigest}}, ObservedSurface: surface})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +88,7 @@ func syntheticParameterizedRegistry(t *testing.T, harness agent.HarnessName, ada
 	if err != nil {
 		t.Fatal(err)
 	}
-	binder := &syntheticParameterBinder{contractID: contract.ID, sourceDigest: contract.BinderSourceDigest}
+	binder := &syntheticParameterBinder{contractID: contract.ID, sourceDigest: contract.BinderSourceDigest, deliveries: deliveries}
 	return registry, binder
 }
 
@@ -212,5 +223,34 @@ func TestCallerAuthoredParameterBindingIsNotAdmissionAuthority(t *testing.T) {
 	spec := agent.Spec{Autonomous: true, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{clone}}}
 	if _, err := bindAdmissionToolLifecyclePlan(spec, admission, executioncell.ImmutableClaimReceipt{}, realizations); err == nil {
 		t.Fatal("caller-authored realization binding became admission authority")
+	}
+}
+
+func TestResolveAndBindClonesDelegationDeclarations(t *testing.T) {
+	source := []byte("export default function activate(pi) {}\n")
+	delivery := agent.ExtensionDelivery{ID: "delegation", Kind: agent.ExtensionDeliveryInline, Source: source, Basename: "delegation.ts", Required: true, DelegationTools: []string{"dispatch_child"}}
+	delivery.Digest = delivery.ComputeDigest(source)
+	realizations, binder := syntheticParameterizedRegistry(t, agent.HarnessPi, "pi/headless/tool-lifecycle-v1", agent.PromptModeAutonomous, delivery)
+	registry, err := NewCapabilityParameterBinderRegistry(binder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{}`)
+	digest, err := executioncell.DigestOperationalPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirement := agent.CapabilityParameterRequirementFacts{CapabilityID: "example.parameterized/v1", ParametersDigest: strings.Repeat("b", 64), OperationalPayloadDigest: digest}
+	first, err := registry.ResolveAndBind(realizations, requirement, payload, agent.HarnessPi, "pi/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.AdditionalExtensions[0].DelegationTools[0] = "caller_mutation"
+	again, err := registry.ResolveAndBind(realizations, requirement, payload, agent.HarnessPi, "pi/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
+	if err != nil {
+		t.Fatalf("caller mutation corrupted trusted delivery: %v", err)
+	}
+	if again.AdditionalExtensions[0].DelegationTools[0] != "dispatch_child" {
+		t.Fatalf("declaration not independently owned: %+v", again.AdditionalExtensions)
 	}
 }

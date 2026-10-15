@@ -213,6 +213,11 @@ type PollWorkItem struct {
 	// the accounting sentinel rides the queue.
 	InjectedPoolID string `json:"injectedPoolId,omitempty"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is an opaque platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for nothing else. The daemon never parses,
 	// validates, or logs its value — it forwards the string onto SessionDetail
@@ -392,6 +397,7 @@ type PollContinuePullRequest struct {
 type PollDeliveryPolicy struct {
 	AllowDraft        bool `json:"allowDraft,omitempty"`
 	AllowMergeCommits bool `json:"allowMergeCommits,omitempty"`
+	AllowCleanMerge   bool `json:"allowCleanMerge,omitempty"`
 }
 
 // PollSkill mirrors prompt.SkillSpec for the daemon package so the daemon can
@@ -566,6 +572,24 @@ type PollOptions struct {
 	// Nil ⇒ never suspended, byte-identical to the pre-gate behaviour. The
 	// callback MUST NOT block: it runs on the poll goroutine.
 	ClaimSuspended func() (suspended bool, reason string)
+
+	// ClaimSuspendedForOrg reports whether NEW work for one organization must
+	// currently stop being claimed, plus a short human-readable reason for
+	// the skip log line. It is consulted once per work[] item, after the poll
+	// request — the host-wide ClaimSuspended gate above still decides whether
+	// the request goes out at all — so a true result holds only that
+	// organization's items while every other ready organization keeps
+	// claiming on the same tick.
+	//
+	// A skipped item is released back to the coordinator with a best-effort
+	// NACK so another host serving that organization can take it immediately
+	// instead of waiting out this host's claim lease; NACK delivery failure
+	// only adds latency. Suspension is claim-side only, exactly like the
+	// host-wide gate.
+	//
+	// Nil ⇒ every organization claims, byte-identical to the pre-gate
+	// behaviour. The callback MUST NOT block: it runs on the poll goroutine.
+	ClaimSuspendedForOrg func(orgID string) (suspended bool, reason string)
 
 	// OnKgExtractWork executes ONE claimed kgExtractWork[] item. It runs on its
 	// own goroutine (bounded by maxConcurrentKgExtract), never on the poll
@@ -814,6 +838,57 @@ func (p *PollService) claimGateBlocks() bool {
 	return suspended
 }
 
+// claimOrgGateBlocks consults the per-organization claim gate for one work
+// item and returns true when this tick must not claim it. A gated item is
+// held, never dispatched: it is released back to the coordinator with a
+// best-effort NACK so another host serving that organization can take it
+// immediately instead of waiting out this host's claim lease. NACK delivery
+// failure only adds latency; the skip itself never fails.
+//
+// Lock discipline mirrors claimGateBlocks: the callback is invoked with NO
+// PollService lock held. workerID and jwt are the credentials this tick is
+// polling with, read once by the caller.
+func (p *PollService) claimOrgGateBlocks(ctx context.Context, item *PollWorkItem, workerID, jwt string) bool {
+	if p.opts.ClaimSuspendedForOrg == nil || item == nil {
+		return false
+	}
+	suspended, reason := p.opts.ClaimSuspendedForOrg(item.OrganizationID)
+	if !suspended {
+		return false
+	}
+	if reason == "" {
+		reason = "the organization is not currently claiming new work"
+	}
+	p.opts.LogInfo(
+		"daemon poll: holding new-work claim for organization %q (session %s): %s",
+		item.OrganizationID, item.SessionID, reason,
+	)
+	// Release the claim the poll response bound to this host, the way the
+	// daemon's accept path releases a locally refused session: the
+	// orchestrator re-queues immediately instead of waiting for the
+	// stale-claim sweep, so the organization's work is not hostage to this
+	// host's fence.
+	skipped := *item
+	nackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if nackErr := NackRejectedWork(
+		nackCtx,
+		p.opts.HTTPClient,
+		p.opts.OrchestratorURL,
+		workerID,
+		jwt,
+		&skipped,
+		fmt.Errorf("organization %q is not claiming: %s", item.OrganizationID, reason),
+	); nackErr != nil {
+		p.opts.LogWarn(
+			"daemon poll: nack failed for held organization %q session %s; orchestrator will reclaim via stale-claim sweep",
+			item.OrganizationID,
+			item.SessionID,
+		)
+	}
+	return true
+}
+
 func (p *PollService) pollOnce(ctx context.Context) {
 	p.mu.Lock()
 	workerID := p.workerID
@@ -842,6 +917,9 @@ func (p *PollService) pollOnce(ctx context.Context) {
 			p.opts.LogInfo("daemon poll: %d work item(s) received", len(resp.Work))
 		}
 		for _, item := range resp.Work {
+			if p.claimOrgGateBlocks(ctx, &item, workerID, jwt) {
+				continue
+			}
 			if herr := p.opts.OnWork(item); herr != nil {
 				p.opts.LogWarn("poll handler error for session %s: %v", item.SessionID, herr)
 			}
@@ -1310,6 +1388,7 @@ func pollItemCredentialMetadata(item PollWorkItem) (requirements []CredentialEnv
 // downstream embedder that builds a SessionSpec from its own poll
 // loop before calling a shared daemon's AcceptWorkWithDetail).
 func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(item.SessionID, item.CoAuthorName, item.CoAuthorEmail)
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
 	modelAuthor, endpointOperator, protocol, endpointSurface := pollItemDisplayAxes(item)
@@ -1346,6 +1425,8 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		// so the spec stays byte-identical for the existing fields (identity).
 		WorkType:              item.WorkType,
 		Mode:                  item.Mode,
+		CoAuthorName:          coAuthorName,
+		CoAuthorEmail:         coAuthorEmail,
 		McpAuthToken:          item.McpAuthToken,
 		McpAuthTokenExpiresAt: item.McpAuthTokenExpiresAt,
 	}
@@ -1594,6 +1675,7 @@ func WithSeatBudget(b *SessionSeatBudget) SessionDetailOption {
 // SessionDetailOption args customise the result without breaking existing
 // callers (the donmai-internal loop passes none).
 func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string, opts ...SessionDetailOption) *SessionDetail {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(item.SessionID, item.CoAuthorName, item.CoAuthorEmail)
 	if len(item.OperationalPayload) == 0 {
 		type pollWorkItemAlias PollWorkItem
 		if raw, err := json.Marshal(pollWorkItemAlias(item)); err == nil {
@@ -1664,6 +1746,8 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		WorkerID:                workerID,
 		AuthToken:               authToken,
 		PlatformURL:             platformURL,
+		CoAuthorName:            coAuthorName,
+		CoAuthorEmail:           coAuthorEmail,
 		McpAuthToken:            item.McpAuthToken,
 		McpAuthTokenExpiresAt:   item.McpAuthTokenExpiresAt,
 		CredentialPoolID:        item.InjectedPoolID,

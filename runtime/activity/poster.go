@@ -626,13 +626,15 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // mapEvent translates an agent.Event into the platform activity shape.
 // Returns ok=false for events that should not be forwarded
 // (Init / most System / ToolProgress) — those are runner-internal lifecycle
-// signals the platform doesn't render. Four SystemEvent subtypes are
+// signals the platform doesn't render. Selected SystemEvent subtypes are
 // forwarded: "reasoning" becomes a thought, and
 // "interactive-initial-prompt-delivered",
 // agent.SystemSubtypeToolCallRefusedOutputLimit, and
 // agent.SystemSubtypeReasoningEffort become context markers with fixed
 // content (never the event's free-form Message; the effort marker names a
-// level only when it is a known agent.EffortLevel).
+// level only when it is a known agent.EffortLevel). Codex rerouting,
+// moderation and safety buffering become warnings; file/plan deltas become
+// progress activities.
 //
 // timestamp is the wall-clock time at which the event was observed; the
 // platform server defaults to "now" when omitted, but emitting it here
@@ -728,6 +730,14 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 
 	case agent.SystemEvent:
 		switch e.Subtype {
+		case "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+			out.Type = "warning"
+			out.Content = e.Message
+			return out, true
+		case "codex_progress":
+			out.Type = "progress"
+			out.Content = e.Message
+			return out, true
 		case "reasoning":
 			if msg := strings.TrimSpace(e.Message); msg != "" {
 				out.Type = "thought"
@@ -760,8 +770,11 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
-		// command_progress, diff_updated, compaction, and unknown values) stays
-		// runner-internal and is dropped.
+		// command_progress, diff_updated, compaction, stream progress, and
+		// unknown values) stays runner-internal and is dropped. Stream
+		// progress in particular must never reach the activity stream:
+		// one event per streamed token would spam it exactly the way
+		// per-token assistant text once did.
 		return payload{}, false
 
 	case agent.InitEvent, agent.ToolProgressEvent:

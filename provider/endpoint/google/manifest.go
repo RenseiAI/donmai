@@ -2,12 +2,9 @@ package google
 
 import "github.com/RenseiAI/donmai/agent"
 
-// Manifest returns the Google company endpoint declaration (§3.3) — the
-// collapse cell. Google SPEAKS gemini-generate (direct/vertex) AND openai-chat
-// (the local /v1 host that serves the north-star opencode×google cell), plus
-// antigravity-oauth on the agy host-login cell. nativeJsonMode is per-host:
-// true on direct/vertex/local (json mode honored), false on oauth-cli (no json
-// surface over the pty channel). All EnvKeys are env-var NAMES only.
+// Manifest returns the Google company endpoint declaration: gemini-generate
+// on direct/vertex and openai-chat on the local /v1 host. All EnvKeys are
+// env-var names only.
 func (*Endpoint) Manifest() agent.ModelEndpointManifest {
 	return agent.ModelEndpointManifest{
 		Company:     agent.CompanyGoogle,
@@ -35,16 +32,6 @@ func (*Endpoint) Manifest() agent.ModelEndpointManifest {
 				CostModel:     agent.CostMeteredPerToken,
 				BaseURLTmpl:   "https://{region}-aiplatform.googleapis.com",
 				EnvKeys:       []string{"GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_VERTEX_PROJECT_ID"},
-			},
-			{
-				Host:          agent.HostOAuthCLI,
-				Protocol:      agent.ProtoAntigravityOAuth,
-				AuthModes:     []agent.AuthMode{agent.AuthHostSession, agent.AuthLocal},
-				BringsOwnAuth: true,
-				NeedsAPIKey:   false,
-				CostModel:     agent.CostHostSubscription,
-				BaseURLTmpl:   "", // agy host login
-				EnvKeys:       []string{},
 			},
 			{
 				Host:          agent.HostLocal,

@@ -122,6 +122,10 @@ type SeatBudgetStatus struct {
 	// Detail is a short human line: which placement enforces the budget
 	// on Linux, which knobs carry it on macOS.
 	Detail string `json:"detail,omitempty"`
+	// QoS is the opt-in per-seat scheduling class seats spawn under:
+	// default, utility or background. Empty against a daemon older than
+	// this field.
+	QoS string `json:"qos,omitempty"`
 }
 
 // DaemonProcessPriorityStatus is the daemon's self-observed process-priority

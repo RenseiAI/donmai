@@ -630,6 +630,28 @@ type CredentialUpdate struct {
 	ExpiresAt  int64      `json:"expiresAt"`
 }
 
+// String formats a CredentialUpdate without its bearer: the bearer is a
+// control secret that is never written to disk, logs, the discovery record
+// or the tombstone, so the default struct formatting — which would print
+// every field — must never be the way one reaches a log line. The field
+// width mirrors %+v so greps for the familiar shape still land.
+func (u CredentialUpdate) String() string {
+	return fmt.Sprintf(
+		"{RequestID:%d Generation:%d WorkerID:%s Bearer:[redacted] ExpiresAt:%d}",
+		u.RequestID, u.Generation, u.WorkerID, u.ExpiresAt,
+	)
+}
+
+// GoString formats a CredentialUpdate for %#v without its bearer, for the
+// same reason as String: a bearer must never reach a log line through a
+// formatting verb.
+func (u CredentialUpdate) GoString() string {
+	return fmt.Sprintf(
+		"shimwire.CredentialUpdate{RequestID:%d, Generation:%d, WorkerID:%q, Bearer:\"[redacted]\", ExpiresAt:%d}",
+		u.RequestID, u.Generation, u.WorkerID, u.ExpiresAt,
+	)
+}
+
 // CredentialResult is the shim's correlated answer to one CredentialUpdate,
 // keyed by the request's own id so an exact retry returns its first result
 // and a reused id with changed content is duplicate_changed. Status uses the

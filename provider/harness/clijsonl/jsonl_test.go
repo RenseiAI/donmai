@@ -80,7 +80,7 @@ func TestMapLine_AssistantText(t *testing.T) {
 
 func TestMapLine_AssistantPerCallUsage(t *testing.T) {
 	t.Parallel()
-	line := []byte(`{"type":"assistant","message":{"model":"claude-opus-4","stop_reason":"tool_use","usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80},"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]}}`)
+	line := []byte(`{"type":"assistant","message":{"id":"response-one","model":"claude-opus-4","stop_reason":"tool_use","usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80},"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]}}`)
 	events := mapLine(line)
 	if len(events) != 2 {
 		t.Fatalf("got %d events, want LlmCallEvent + ToolUseEvent", len(events))
@@ -89,7 +89,7 @@ func TestMapLine_AssistantPerCallUsage(t *testing.T) {
 	if !ok {
 		t.Fatalf("event[0] %T, want LlmCallEvent", events[0])
 	}
-	if llm.Model != "claude-opus-4" || llm.ResponseModel != "claude-opus-4" || llm.InputTokens != 120 || llm.OutputTokens != 30 || llm.CachedInputTokens != 80 {
+	if llm.GenerationID != "response-one" || llm.Model != "claude-opus-4" || llm.ResponseModel != "claude-opus-4" || llm.InputTokens != 120 || llm.OutputTokens != 30 || llm.CachedInputTokens != 80 {
 		t.Fatalf("unexpected usage event: %+v", llm)
 	}
 	if llm.UsageSource != agent.LlmUsageProvider || llm.Synthetic {
@@ -342,12 +342,22 @@ func TestMapLine_AuthStatus_Error(t *testing.T) {
 	}
 }
 
-func TestMapLine_StreamEvent_Dropped(t *testing.T) {
+func TestMapLine_StreamEvent_StreamProgress(t *testing.T) {
 	t.Parallel()
 
 	events := mapLine(readFixture(t, "stream_event.jsonl"))
-	if len(events) != 0 {
-		t.Errorf("stream_event should produce 0 events, got %d", len(events))
+	if len(events) != 1 {
+		t.Fatalf("stream_event should produce 1 stream-progress event, got %d", len(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("event %T, want SystemEvent", events[0])
+	}
+	if sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Errorf("Subtype = %q, want %q", sys.Subtype, agent.SystemSubtypeStreamProgress)
+	}
+	if sys.Message != "" {
+		t.Errorf("Message = %q, want empty (the signal carries no content)", sys.Message)
 	}
 }
 
@@ -377,9 +387,12 @@ func TestMapLine_StreamEvent_APIError_ProviderError(t *testing.T) {
 	if sys.Upstream.ProviderCode != "overloaded_error" {
 		t.Errorf("Upstream.ProviderCode = %q, want overloaded_error", sys.Upstream.ProviderCode)
 	}
-	// A non-error frame still maps to nothing.
-	if events := mapLine([]byte(`{"type":"stream_event","event":{"type":"content_block_delta"}}`)); len(events) != 0 {
-		t.Errorf("non-error stream_event produced %d events, want 0", len(events))
+	// A non-error frame still maps to the content-free stream-progress
+	// signal, never to content.
+	if events := mapLine([]byte(`{"type":"stream_event","event":{"type":"content_block_delta"}}`)); len(events) != 1 {
+		t.Errorf("non-error stream_event produced %d events, want 1 (stream progress)", len(events))
+	} else if sys, ok := events[0].(agent.SystemEvent); !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Errorf("non-error stream_event produced %T %+v, want the stream-progress signal", events[0], events[0])
 	}
 }
 
@@ -639,7 +652,7 @@ func TestDecodeInput_MalformedReturnsNil(t *testing.T) {
 
 func TestResponseModelFromNativeMessageWithoutUsage(t *testing.T) {
 	t.Parallel()
-	events := mapLine([]byte(`{"type":"assistant","message":{"model":"native-response-id","content":[]}}`))
+	events := mapLine([]byte(`{"type":"assistant","message":{"id":"response-one","model":"native-response-id","content":[]}}`))
 	if len(events) != 1 {
 		t.Fatalf("response identity was dropped without usage: %+v", events)
 	}
@@ -671,9 +684,12 @@ func TestNativeModelObservationPreservesTerminalAggregateUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	var observation *agent.ObservedModelIdentity
-	for _, ev := range mapLine([]byte(`{"type":"assistant","message":{"model":"native-response-id","content":[{"type":"text","text":"done"}]}}`)) {
+	for _, ev := range mapLine([]byte(`{"type":"assistant","message":{"id":"response-one","model":"native-response-id","content":[{"type":"text","text":"done"}]}}`)) {
 		for _, processed := range processor.Process(ev) {
 			if status, ok := processed.(agent.SystemEvent); ok && status.ObservedModel != nil {
+				if status.GenerationID != "response-one" {
+					t.Fatalf("generation id = %q; want response-one", status.GenerationID)
+				}
 				observation = status.ObservedModel
 			}
 			if call, ok := processed.(agent.LlmCallEvent); ok && call.ResponseModel != "" {
@@ -991,5 +1007,33 @@ func TestMapLine_CacheWriteTokens(t *testing.T) {
 				t.Errorf("usage = %+v; want %+v", *got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMapLine_GenerationIDWithoutUsage(t *testing.T) {
+	t.Parallel()
+	events := mapLine([]byte(`{"type":"assistant","message":{"id":"response-one","content":[]}}`))
+	if len(events) != 1 {
+		t.Fatalf("events = %v; want response id observation", events)
+	}
+	ev, ok := events[0].(agent.SystemEvent)
+	if !ok || ev.GenerationID != "response-one" || ev.Subtype != agent.SystemSubtypeGenerationID {
+		t.Fatalf("event = %+v; want response-one observation", events[0])
+	}
+}
+
+func TestMapLine_StreamingGenerationID(t *testing.T) {
+	t.Parallel()
+	events := (&LineMapper{}).MapLine([]byte(`{"type":"stream_event","event":{"type":"message_start","message":{"id":"response-one"}}}`))
+	if len(events) != 2 {
+		t.Fatalf("events = %v; want response id and stream progress", events)
+	}
+	ev, ok := events[0].(agent.SystemEvent)
+	if !ok || ev.GenerationID != "response-one" {
+		t.Fatalf("event = %+v; want response-one", events[0])
+	}
+	progress, ok := events[1].(agent.SystemEvent)
+	if !ok || progress.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Fatalf("event = %+v; want stream progress", events[1])
 	}
 }

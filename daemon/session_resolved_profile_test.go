@@ -126,3 +126,64 @@ func TestSessionEndpointBinding_BaseURLOmitemptyAbsent(t *testing.T) {
 		t.Errorf("BaseURL = %q, want empty on a pre-baseUrl payload", out.BaseURL)
 	}
 }
+
+// TestSessionEndpointBinding_RoutingPreferenceRoundTrips verifies the
+// additive RoutingPreference mirror survives marshal/unmarshal under its
+// camelCase wire tag, and is omitted when unset so pre-preference
+// dispatches round-trip byte-identically (mixed-version-safe both
+// directions).
+func TestSessionEndpointBinding_RoutingPreferenceRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	in := SessionEndpointBinding{
+		Company:  "openai",
+		Model:    "served-model",
+		Protocol: "openai-chat",
+		Host:     "gateway",
+		RoutingPreference: &SessionRoutingPreference{
+			Order: []string{"anthropic", "openai"},
+			Only:  []string{"anthropic"},
+		},
+	}
+
+	buf, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal SessionEndpointBinding: %v", err)
+	}
+	if !strings.Contains(string(buf), `"routingPreference":{"order":["anthropic","openai"],"only":["anthropic"]}`) {
+		t.Fatalf("marshalled JSON missing routingPreference key: %s", buf)
+	}
+
+	var out SessionEndpointBinding
+	if err := json.Unmarshal(buf, &out); err != nil {
+		t.Fatalf("unmarshal SessionEndpointBinding: %v", err)
+	}
+	if out.RoutingPreference == nil {
+		t.Fatal("RoutingPreference missing after round-trip")
+	}
+	if len(out.RoutingPreference.Order) != 2 || len(out.RoutingPreference.Only) != 1 {
+		t.Errorf("RoutingPreference round-trip = %+v, want order x2 + only x1", out.RoutingPreference)
+	}
+}
+
+// TestSessionEndpointBinding_RoutingPreferenceOmitemptyAbsent verifies the
+// additive mirror field is omitted when unset.
+func TestSessionEndpointBinding_RoutingPreferenceOmitemptyAbsent(t *testing.T) {
+	t.Parallel()
+
+	buf, err := json.Marshal(&SessionEndpointBinding{Company: "anthropic", Model: "claude-sonnet-4-5"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(buf), "routingPreference") {
+		t.Errorf("empty RoutingPreference leaked into wire shape: %s", buf)
+	}
+
+	var out SessionEndpointBinding
+	if err := json.Unmarshal(buf, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.RoutingPreference != nil {
+		t.Errorf("RoutingPreference = %+v, want nil on a pre-preference payload", out.RoutingPreference)
+	}
+}
