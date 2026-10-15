@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -309,8 +310,21 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 //	Model              → --model <id>
 //	Effort             → --effort <level>
 //	Autonomous         → --permission-mode bypassPermissions
+//	AllowedTools       → --allowedTools <comma-separated>
+//	DisallowedTools    → --disallowedTools <comma-separated>
 //	SystemPromptAppend → --append-system-prompt <text>
 //	Prompt             → positional argument, ALWAYS LAST
+//
+// The allow/deny mapping is byte-identical to buildArgs' (see
+// cli_args.go) — one convention, two spawn modes. Before it existed the
+// interactive REPL silently DROPPED Spec.AllowedTools/Spec.DisallowedTools
+// and fell back to the CLI's own default permission set, so a stamped
+// session that adapted cleanly on the headless lane denied closed on the
+// interactive lane even though the CLI honors the same flags there: the
+// flags are global session options (not --print-gated), feed the same
+// permission context the REPL's /permissions panel renders, and a live
+// interactive probe shows a stamped allow entry under Allow and a stamped
+// deny entry under Deny. The CLI simply was not being asked.
 //
 // The Autonomous mapping is deliberately byte-identical to buildArgs' (see
 // cli_args.go) — one convention, two spawn modes. Before it existed the
@@ -428,6 +442,34 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// omit it when empty so a bare interactive session stays bare.
 	if spec.SystemPromptAppend != "" {
 		argv = append(argv, "--append-system-prompt", spec.SystemPromptAppend)
+	}
+
+	// Tool policy: mirrors buildArgs' identical block (cli_args.go) so a
+	// stamped allow/deny list reaches the interactive REPL the same way it
+	// reaches a headless run of the same Spec. The REPL honors --allowedTools
+	// / --disallowedTools exactly as the headless CLI does (same permission
+	// context; the REPL's own permission panel renders the stamped entries),
+	// so this mapping is a pure pass-through of the CLI's native grammar,
+	// including the MCPToolNames merge into --allowedTools: the interactive
+	// profile declares the same MCP tool-policy delivery as headless, and a
+	// name filter stamped for one lane must reach the other.
+	allowed := make([]string, 0)
+	allowed = append(allowed, spec.AllowedTools...)
+	allowed = append(allowed, spec.MCPToolNames...)
+	allowed = dedupAndSort(allowed)
+	if len(allowed) > 0 {
+		argv = append(argv, "--allowedTools", strings.Join(allowed, ","))
+	}
+
+	// Disallowed tools always include the Linear MCP block list when
+	// the session is autonomous (matches the legacy provider and buildArgs).
+	disallowed := append([]string(nil), spec.DisallowedTools...)
+	if spec.Autonomous {
+		disallowed = append(disallowed, linearMCPDisallowList...)
+	}
+	disallowed = dedupAndSort(disallowed)
+	if len(disallowed) > 0 {
+		argv = append(argv, "--disallowedTools", strings.Join(disallowed, ","))
 	}
 
 	// Claude's interactive REPL accepts the same exact per-session MCP file as
