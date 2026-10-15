@@ -171,16 +171,6 @@ type Options struct {
 	// they can pick up daemon-side runtime-token refreshes.
 	CredentialProvider CredentialProvider
 
-	// ExecutionSecurityReporter submits the pre-spawn execution-security
-	// report through the preflight registration call and waits for
-	// acceptance before the provider spawns. Nil uses the HTTP reporter
-	// posting to the session's own controller origin with the run's worker
-	// credential. Tests substitute a fake to accept or refuse without a
-	// controller. The gate applies to stamped controller-transport work
-	// only: unstamped work has no report to send, and local-transport work
-	// has no controller registration endpoint.
-	ExecutionSecurityReporter ExecutionSecurityReporter
-
 	// EnvComposer builds the agent subprocess env. Defaults to
 	// env.NewComposer().
 	EnvComposer *env.Composer
@@ -516,44 +506,43 @@ type DepsExecer = kit.Execer
 // WorktreeManager, etc.) are documented as concurrency-safe by their
 // own packages.
 type Runner struct {
-	registry                          *Registry
-	wt                                *worktree.Manager
-	poster                            *result.Poster
-	credentialProvider                CredentialProvider
-	executionSecurityReporterOverride ExecutionSecurityReporter
-	envc                              *env.Composer
-	mcpb                              *mcp.Builder
-	store                             *state.Store
-	promptBuilder                     *prompt.Builder
-	httpClient                        *http.Client
-	logger                            *slog.Logger
-	now                               func() time.Time
-	maxDuration                       time.Duration
-	idleTimeout                       time.Duration
-	providerStallTimeout              time.Duration
-	providerStallRetries              int
-	preserveOnFail                    bool
-	preserveAlways                    bool
-	skipBackstop                      bool
-	skipSteering                      bool
-	skipPostSession                   bool
-	hbInterval                        time.Duration
-	stepHeartbeatInterval             time.Duration
-	spanEmissionEnabled               bool
-	spanEndpointPath                  string
-	kitSkillSources                   []kit.KitSkillSource
-	kitSkillDetector                  KitSkillDetector
-	kitPromptFragDetector             KitPromptFragmentDetector
-	kitDetector                       KitDetector
-	kitComposer                       KitComposer
-	kitTargetOS                       string
-	additionalExtensionDecorator      agent.ExtensionDecorator
-	capabilityRealizations            *agent.CapabilityRealizationRegistry
-	capabilityParameterBinders        *CapabilityParameterBinderRegistry
-	preparedCapabilities              capabilityRealizationResolver
-	protectedRuntimeMCPSelector       ProtectedRuntimeMCPSelector
-	protectedRuntimeMCPV2Selector     ProtectedRuntimeMCPV2Selector
-	selectionPolicy                   protectedRuntimeMCPSelectionPolicy
+	registry                      *Registry
+	wt                            *worktree.Manager
+	poster                        *result.Poster
+	credentialProvider            CredentialProvider
+	envc                          *env.Composer
+	mcpb                          *mcp.Builder
+	store                         *state.Store
+	promptBuilder                 *prompt.Builder
+	httpClient                    *http.Client
+	logger                        *slog.Logger
+	now                           func() time.Time
+	maxDuration                   time.Duration
+	idleTimeout                   time.Duration
+	providerStallTimeout          time.Duration
+	providerStallRetries          int
+	preserveOnFail                bool
+	preserveAlways                bool
+	skipBackstop                  bool
+	skipSteering                  bool
+	skipPostSession               bool
+	hbInterval                    time.Duration
+	stepHeartbeatInterval         time.Duration
+	spanEmissionEnabled           bool
+	spanEndpointPath              string
+	kitSkillSources               []kit.KitSkillSource
+	kitSkillDetector              KitSkillDetector
+	kitPromptFragDetector         KitPromptFragmentDetector
+	kitDetector                   KitDetector
+	kitComposer                   KitComposer
+	kitTargetOS                   string
+	additionalExtensionDecorator  agent.ExtensionDecorator
+	capabilityRealizations        *agent.CapabilityRealizationRegistry
+	capabilityParameterBinders    *CapabilityParameterBinderRegistry
+	preparedCapabilities          capabilityRealizationResolver
+	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
+	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
+	selectionPolicy               protectedRuntimeMCPSelectionPolicy
 
 	// rescueDir is Options.RescueDir (see rescueRoot for the default).
 	rescueDir string
@@ -653,54 +642,53 @@ func New(opts Options) (*Runner, error) {
 		return nil, err
 	}
 	r := &Runner{
-		registry:                          opts.Registry,
-		wt:                                opts.WorktreeManager,
-		poster:                            opts.Poster,
-		credentialProvider:                opts.CredentialProvider,
-		executionSecurityReporterOverride: opts.ExecutionSecurityReporter,
-		envc:                              opts.EnvComposer,
-		mcpb:                              opts.MCPBuilder,
-		store:                             opts.StateStore,
-		promptBuilder:                     opts.PromptBuilder,
-		httpClient:                        opts.HTTPClient,
-		logger:                            opts.Logger,
-		now:                               opts.Now,
-		maxDuration:                       opts.MaxSessionDuration,
-		idleTimeout:                       opts.IdleTimeout,
-		providerStallTimeout:              opts.ProviderStallTimeout,
-		providerStallRetries:              opts.ProviderStallRetries,
-		preserveOnFail:                    opts.PreserveWorktreeOnFailure,
-		preserveAlways:                    opts.PreserveWorktreeAlways,
-		skipBackstop:                      opts.SkipBackstop,
-		skipSteering:                      opts.SkipSteering,
-		skipPostSession:                   opts.SkipPostSession,
-		hbInterval:                        opts.HeartbeatInterval,
-		stepHeartbeatInterval:             opts.StepHeartbeatInterval,
-		spanEmissionEnabled:               opts.SpanEmissionEnabled,
-		spanEndpointPath:                  opts.SpanEndpointPath,
-		kitSkillSources:                   opts.KitSkillSources,
-		kitSkillDetector:                  opts.KitSkillDetector,
-		kitPromptFragDetector:             opts.KitPromptFragmentDetector,
-		kitDetector:                       opts.KitDetector,
-		kitComposer:                       opts.KitComposer,
-		kitTargetOS:                       opts.KitTargetOS,
-		additionalExtensionDecorator:      opts.AdditionalExtensionDecorator,
-		capabilityRealizations:            opts.CapabilityRealizations,
-		capabilityParameterBinders:        opts.CapabilityParameterBinders,
-		preparedCapabilities:              preparedCapabilities,
-		protectedRuntimeMCPSelector:       selectionPolicy.v1,
-		protectedRuntimeMCPV2Selector:     selectionPolicy.v2,
-		selectionPolicy:                   selectionPolicy,
-		rescueDir:                         opts.RescueDir,
-		depsExecer:                        opts.DepsExecer,
-		depsInstallTimeout:                opts.DepsInstallTimeout,
-		turnContinuationLimit:             opts.TurnContinuationLimit,
-		turnContinuationCeiling:           opts.TurnContinuationCeiling,
-		turnContinuationUndeliveredLimit:  opts.TurnContinuationUndeliveredLimit,
-		quotaReporterForSession:           opts.QuotaReporterForSession,
-		quotaReporters:                    map[string]*QuotaReporter{},
-		interactiveUsage:                  map[string]*interactiveUsageTotals{},
-		shimSeat:                          opts.ShimSeat,
+		registry:                         opts.Registry,
+		wt:                               opts.WorktreeManager,
+		poster:                           opts.Poster,
+		credentialProvider:               opts.CredentialProvider,
+		envc:                             opts.EnvComposer,
+		mcpb:                             opts.MCPBuilder,
+		store:                            opts.StateStore,
+		promptBuilder:                    opts.PromptBuilder,
+		httpClient:                       opts.HTTPClient,
+		logger:                           opts.Logger,
+		now:                              opts.Now,
+		maxDuration:                      opts.MaxSessionDuration,
+		idleTimeout:                      opts.IdleTimeout,
+		providerStallTimeout:             opts.ProviderStallTimeout,
+		providerStallRetries:             opts.ProviderStallRetries,
+		preserveOnFail:                   opts.PreserveWorktreeOnFailure,
+		preserveAlways:                   opts.PreserveWorktreeAlways,
+		skipBackstop:                     opts.SkipBackstop,
+		skipSteering:                     opts.SkipSteering,
+		skipPostSession:                  opts.SkipPostSession,
+		hbInterval:                       opts.HeartbeatInterval,
+		stepHeartbeatInterval:            opts.StepHeartbeatInterval,
+		spanEmissionEnabled:              opts.SpanEmissionEnabled,
+		spanEndpointPath:                 opts.SpanEndpointPath,
+		kitSkillSources:                  opts.KitSkillSources,
+		kitSkillDetector:                 opts.KitSkillDetector,
+		kitPromptFragDetector:            opts.KitPromptFragmentDetector,
+		kitDetector:                      opts.KitDetector,
+		kitComposer:                      opts.KitComposer,
+		kitTargetOS:                      opts.KitTargetOS,
+		additionalExtensionDecorator:     opts.AdditionalExtensionDecorator,
+		capabilityRealizations:           opts.CapabilityRealizations,
+		capabilityParameterBinders:       opts.CapabilityParameterBinders,
+		preparedCapabilities:             preparedCapabilities,
+		protectedRuntimeMCPSelector:      selectionPolicy.v1,
+		protectedRuntimeMCPV2Selector:    selectionPolicy.v2,
+		selectionPolicy:                  selectionPolicy,
+		rescueDir:                        opts.RescueDir,
+		depsExecer:                       opts.DepsExecer,
+		depsInstallTimeout:               opts.DepsInstallTimeout,
+		turnContinuationLimit:            opts.TurnContinuationLimit,
+		turnContinuationCeiling:          opts.TurnContinuationCeiling,
+		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
+		quotaReporterForSession:          opts.QuotaReporterForSession,
+		quotaReporters:                   map[string]*QuotaReporter{},
+		interactiveUsage:                 map[string]*interactiveUsageTotals{},
+		shimSeat:                         opts.ShimSeat,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
