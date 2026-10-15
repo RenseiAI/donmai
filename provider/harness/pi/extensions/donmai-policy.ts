@@ -156,6 +156,64 @@ export function withPipefailPrelude(command: unknown): string {
   return PIPEFAIL_PRELUDE + text;
 }
 
+// --- Bounded error tool results (an oversized error result must not end the session) ---
+//
+// A provider on the anthropic-messages path rejected a request replaying a
+// ~46 KB error tool result with a 400 for invalid parameters, ending the
+// whole session on a failure no retry can fix — the offending bytes re-enter
+// the context on every attempt. Smaller results (including a 33 KB one the
+// same session replayed repeatedly) passed, so the rail below trims only
+// what is plausibly offending: text the tool reported as an ERROR, past a
+// bound well above the largest result known to pass. Success results are
+// never touched: trimming those would silently discard work output the agent
+// still needs.
+//
+// The trim keeps the TAIL: for a failing command the actionable signal (the
+// failing assertion, the error summary) is at the end, matching the
+// harness's own tail-biased tool-output truncation. The marker states what
+// was dropped so the agent can ask for more rather than assume the result
+// was small. Exported for the scripted conformance fixture
+// (testdata/tool-result-trim-harness.mjs), which invokes it against this
+// exact source without a running pi process.
+//
+// Bounds: MAX_ERROR_RESULT_CHARS caps the replayed text of one error
+// result; a result at or under the bound passes through byte-identical.
+// The bound sits above the largest error result observed to replay cleanly
+// (~33 KB) with headroom, and below the smallest observed rejection
+// (~46 KB).
+export const MAX_ERROR_RESULT_CHARS = 40 * 1024;
+
+export const ERROR_RESULT_TRIM_MARKER =
+  "\n\n[trimmed by policy: showing the last 40 KB of the error output; the full output is in the session log]";
+
+export function trimErrorResultText(text: unknown): string {
+  const body = String(text ?? "");
+  if (body.length <= MAX_ERROR_RESULT_CHARS) {
+    return body;
+  }
+  return body.slice(body.length - MAX_ERROR_RESULT_CHARS) + ERROR_RESULT_TRIM_MARKER;
+}
+
+// trimErrorToolResult is the `tool_result` handler the policy extension
+// registers in both lanes (see activate below): it bounds an oversized
+// ERROR tool result before pi persists it into the session transcript the
+// next provider request replays. Success results and small errors pass
+// through untouched (undefined = no patch). Exported for the scripted
+// conformance fixture (testdata/tool-result-trim-harness.mjs).
+export function trimErrorToolResult(event: any): { content: any } | undefined {
+  if (event?.isError !== true || !Array.isArray(event?.content)) return undefined;
+  let trimmed = false;
+  const content = event.content.map((block: any) => {
+    if (block?.type === "text" && typeof block?.text === "string" && block.text.length > MAX_ERROR_RESULT_CHARS) {
+      trimmed = true;
+      return { ...block, text: trimErrorResultText(block.text) };
+    }
+    return block;
+  });
+  if (trimmed) return { content };
+  return undefined;
+}
+
 // Built-in tools this extension guards. Every one routes through the Go-side
 // policy engine before it may execute (RPC mode) or the local matcher below
 // (interactive PTY mode, allowed/disallowed-tools channel only).
@@ -889,6 +947,24 @@ export default async function activate(pi: ExtensionAPI) {
       // until verified.
     }
   }
+
+  // Oversized error tool results never reach the provider: a `tool_result`
+  // handler trims the text of an ERROR result past MAX_ERROR_RESULT_CHARS
+  // (tail-kept, marker-stamped — trimErrorResultText above) before pi
+  // persists it into the session transcript the next request replays. The
+  // bound sits above the largest error result observed to replay cleanly
+  // and below the smallest observed rejection on the anthropic-messages
+  // path, so ordinary results pass through byte-identical. Success results
+  // are never touched. Registered in BOTH lanes (the PTY lane replays the
+  // same transcript shape through the same provider path), before the
+  // lane-specific handlers below, so every error result is bounded no
+  // matter which lane runs.
+  // trimErrorToolResult is the `tool_result` handler body, extracted so the
+  // scripted conformance fixture can drive it directly and so both lanes
+  // share one implementation. It trims the text of an ERROR result past
+  // MAX_ERROR_RESULT_CHARS (tail-kept, marker-stamped) and returns a patch;
+  // anything else returns undefined (no patch — pi keeps the result as-is).
+  pi.on("tool_result", trimErrorToolResult);
 
   // Interactive PTY mode: no handshake, no RPC-backed blocking adjudication
   // (see above) — but the allowed/disallowed-tools channel is still real
