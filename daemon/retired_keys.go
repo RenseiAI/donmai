@@ -244,6 +244,7 @@ func planRetiredKeyStrip(data []byte) (retiredStripPlan, error) {
 		return plan, err
 	}
 	seen := make(map[int]struct{})
+	sourceLines := strings.Split(string(data), "\n")
 	for _, occ := range occurrences {
 		if occ.item.Style&yaml.FlowStyle != 0 {
 			plan.unsafe = true
@@ -259,16 +260,19 @@ func planRetiredKeyStrip(data []byte) (retiredStripPlan, error) {
 			plan.reason = "retired key is on the entry's `- ` line; needs a hand edit"
 			return plan, nil
 		}
-		if occ.key.Line <= 0 || occ.value.Kind != yaml.ScalarNode || occ.value.Line != occ.key.Line {
+		if occ.key.Line <= 0 || occ.key.Line > len(sourceLines) || occ.value.Kind != yaml.ScalarNode || occ.value.Line != occ.key.Line {
 			plan.unsafe = true
 			plan.reason = "non-inline retired key value needs a hand edit"
 			return plan, nil
 		}
-		// A block scalar (or any multi-line value) reports the
-		// key's line but spans more: deleting one line would
-		// orphan its continuation. Only a single-line value is
-		// safe to strip by line.
-		if strings.Contains(occ.value.Value, "\n") {
+		// Decoded values lose source line breaks through YAML folding and
+		// chomping. Parse the source line alone to prove it holds the whole
+		// scalar; block scalars always require a hand edit, even when empty.
+		var inline map[string]yaml.Node
+		if occ.value.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0 ||
+			yaml.Unmarshal([]byte(sourceLines[occ.key.Line-1]), &inline) != nil ||
+			inline[retiredKeyName].Kind != yaml.ScalarNode ||
+			inline[retiredKeyName].Value != occ.value.Value {
 			plan.unsafe = true
 			plan.reason = "non-inline retired key value needs a hand edit"
 			return plan, nil
