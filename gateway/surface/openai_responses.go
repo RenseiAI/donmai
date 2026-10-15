@@ -68,7 +68,7 @@ func (h *OpenAIResponses) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := translate.DecodeResponsesRequest(body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed responses request")
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 

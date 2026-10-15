@@ -55,6 +55,36 @@ func TestResponses_MalformedBody(t *testing.T) {
 	}
 }
 
+func TestResponses_UnknownEffortIsBadRequestNamingValue(t *testing.T) {
+	h := NewOpenAIResponses(&fakeDispatcher{})
+	rec := postResponses(t, h, "Bearer t", `{"model":"m","input":"hi","reasoning":{"effort":"ultra"}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown effort status = %d, want 400", rec.Code)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body: %v", err)
+	}
+	if !strings.Contains(env.Error.Message, "ultra") {
+		t.Errorf("error message %q should name the rejected value", env.Error.Message)
+	}
+}
+
+func TestResponses_XHighEffortReachesDispatcher(t *testing.T) {
+	fd := &fakeDispatcher{outcome: Outcome{
+		Response: &ir.Response{Model: "m", FinishReason: ir.FinishStop},
+		Model:    "m",
+	}}
+	h := NewOpenAIResponses(fd)
+	rec := postResponses(t, h, "Bearer t", `{"model":"m","input":"hi","reasoning":{"effort":"xhigh"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("xhigh effort status = %d, want 200", rec.Code)
+	}
+	if fd.gotReq.Thinking.Level != ir.ThinkingMax {
+		t.Errorf("dispatch level = %q, want max", fd.gotReq.Thinking.Level)
+	}
+}
+
 func TestResponses_DispatchHTTPError(t *testing.T) {
 	fd := &fakeDispatcher{err: &HTTPError{Status: http.StatusUnauthorized, Code: "invalid_token", Message: "none"}}
 	h := NewOpenAIResponses(fd)
