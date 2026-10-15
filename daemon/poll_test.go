@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -384,6 +385,53 @@ func TestPollResponse_DecodesLiveWireShape(t *testing.T) {
 	if len(resp.ClaimedSessionIDs) != 1 {
 		t.Fatalf("ClaimedSessionIDs len = %d, want 1", len(resp.ClaimedSessionIDs))
 	}
+}
+
+// TestPollResponse_IgnoresLegacyInbox checks that retired inbox keys remain
+// unknown fields and cannot prevent ordinary work from being dispatched.
+func TestPollResponse_IgnoresLegacyInbox(t *testing.T) {
+	t.Run("response fields", func(t *testing.T) {
+		for _, name := range []string{"InboxMessages", "HasInboxMessages"} {
+			if _, ok := reflect.TypeFor[PollResponse]().FieldByName(name); ok {
+				t.Errorf("PollResponse still declares %s", name)
+			}
+		}
+	})
+
+	t.Run("poll dispatch", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{
+				"work": [{"sessionId": "legacy-inbox-work", "queuedAt": 1777658441780}],
+				"inboxMessages": {"running-session": [{"text": "legacy message", "kind": "user"}]},
+				"hasInboxMessages": true
+			}`)
+		}))
+		t.Cleanup(srv.Close)
+
+		var dispatched []PollWorkItem
+		var warnings []string
+		p := NewPollService(PollOptions{
+			WorkerID:        "wkr_test",
+			OrchestratorURL: srv.URL,
+			OnWork: func(item PollWorkItem) error {
+				dispatched = append(dispatched, item)
+				return nil
+			},
+			LogWarn: func(format string, args ...any) {
+				warnings = append(warnings, fmt.Sprintf(format, args...))
+			},
+		})
+		p.pollOnce(context.Background())
+		if len(warnings) != 0 {
+			t.Fatalf("poll warnings: %v", warnings)
+		}
+		if len(dispatched) != 1 {
+			t.Fatalf("dispatched %d work items, want 1", len(dispatched))
+		}
+		if got := dispatched[0]; got.SessionID != "legacy-inbox-work" || got.QueuedAt != 1777658441780 {
+			t.Fatalf("dispatched work = %+v", got)
+		}
+	})
 }
 
 // TestPollService_DaemonIntegration covers the end-to-end wiring through
