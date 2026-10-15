@@ -437,8 +437,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	})
 	if err != nil {
 		res.Status = "failed"
-		res.FailureMode = classifyWorktreeErr(err)
-		res.Error = err.Error()
+		// A budget that lapsed while the workarea was still being
+		// provisioned reports as budget-exceeded, not as a
+		// provisioning failure: the workarea never materialized because
+		// the session ran out of time, not because the clone failed.
+		// Mirrors the post-stream stopAtBudget/classifyStreamStop fork.
+		if budget := enforcer.CheckDuration(r.now()); budget != nil {
+			res.FailureMode = FailureBudgetExceeded
+			res.Error = budget.Error()
+			res.Cost = enforcer.cost()
+			res.BudgetReport = enforcer.Report(r.now())
+			res.BudgetBreach = &agent.BudgetBreach{Cap: string(budget.Cap), Detail: budget.Detail}
+		} else {
+			res.FailureMode = classifyWorktreeErr(err)
+			res.Error = err.Error()
+		}
 		return res, err
 	}
 	res.WorktreePath = wpath

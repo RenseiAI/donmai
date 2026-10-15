@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 	spanruntime "github.com/RenseiAI/donmai/runtime/span"
 )
 
@@ -698,4 +701,162 @@ func TestBudgetEnforcer_CacheReadsMeterAtATenth(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBudgetDuration_Boundary pins the shared seconds-to-duration clamp
+// every budget path converts through: non-positive values yield no cap,
+// values up to the ceiling pass through, and values at or past the
+// ceiling — including ones that would overflow time.Duration — clamp to
+// the ceiling instead of wrapping negative (unbounded).
+func TestBudgetDuration_Boundary(t *testing.T) {
+	t.Parallel()
+	ceilingSeconds := int(MaxSessionDurationCeiling / time.Second)
+	cases := []struct {
+		name    string
+		seconds int
+		want    time.Duration
+	}{
+		{name: "zero is no cap", seconds: 0, want: 0},
+		{name: "negative is no cap", seconds: -1, want: 0},
+		{name: "one second passes through", seconds: 1, want: time.Second},
+		{name: "ceiling minus one passes through", seconds: ceilingSeconds - 1, want: time.Duration(ceilingSeconds-1) * time.Second},
+		{name: "ceiling clamps", seconds: ceilingSeconds, want: MaxSessionDurationCeiling},
+		{name: "ceiling plus one clamps", seconds: ceilingSeconds + 1, want: MaxSessionDurationCeiling},
+		{name: "max int clamps", seconds: math.MaxInt, want: MaxSessionDurationCeiling},
+		{name: "max int32 clamps", seconds: math.MaxInt32, want: MaxSessionDurationCeiling},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := BudgetDuration(tc.seconds); got != tc.want {
+				t.Fatalf("BudgetDuration(%d) = %s, want %s", tc.seconds, got, tc.want)
+			}
+			if got := BudgetDuration(tc.seconds); got < 0 {
+				t.Fatalf("BudgetDuration(%d) = %s; must never wrap negative", tc.seconds, got)
+			}
+		})
+	}
+}
+
+// TestBudgetEnforcer_OverflowBoundaryStaysBounded pins that both
+// duration paths — the derived stream context and the wall-clock
+// classification — agree on a bounded session at the overflow boundary.
+// Before the shared clamp, the enforcer multiplied the raw seconds and
+// wrapped: a value near the boundary died immediately as
+// budget-exceeded, and one past it dropped the cap while the run context
+// kept its ceiling.
+func TestBudgetEnforcer_OverflowBoundaryStaysBounded(t *testing.T) {
+	t.Parallel()
+	ceilingSeconds := int(MaxSessionDurationCeiling / time.Second)
+	for _, seconds := range []int{ceilingSeconds - 1, ceilingSeconds, ceilingSeconds + 1, math.MaxInt32, math.MaxInt} {
+		startedAt := time.Now()
+		enf := NewBudgetEnforcer(&prompt.StageBudget{MaxDurationSeconds: seconds}, startedAt)
+		// The stream cap fires at the bounded deadline, never in the past
+		// and never unbounded: within the session at the ceiling.
+		ctx, cancel := enf.WithDurationCap(context.Background())
+		deadline, ok := ctx.Deadline()
+		cancel()
+		if !ok {
+			t.Fatalf("seconds=%d: derived context carries no deadline; want the bounded cap", seconds)
+		}
+		if want := startedAt.Add(MaxSessionDurationCeiling); deadline.After(want.Add(time.Second)) || deadline.Before(startedAt) {
+			t.Fatalf("seconds=%d: derived deadline %s, want within [%s, %s]", seconds, deadline, startedAt, want)
+		}
+		// Classification agrees: not breached at half the ceiling,
+		// breached as the duration cap past it.
+		if err := enf.CheckDuration(startedAt.Add(MaxSessionDurationCeiling / 2)); err != nil {
+			t.Fatalf("seconds=%d: breached at half the ceiling: %v", seconds, err)
+		}
+		err := enf.CheckDuration(startedAt.Add(MaxSessionDurationCeiling).Add(time.Second))
+		if err == nil || err.Cap != CapDuration {
+			t.Fatalf("seconds=%d: CheckDuration past the ceiling = %v; want the duration-cap breach", seconds, err)
+		}
+	}
+}
+
+// TestRun_PreStreamBudgetExpiryReportsBudgetExceeded pins that a budget
+// already elapsed before the agent stream starts maps to the
+// budget-exceeded failure, not a provisioning failure. The provision is
+// forced to fail (an unclonable repository) while the runner clock reads
+// past a one-second budget, so the pre-stream expiry branch — not the
+// clone error — classifies the session. A provision failure with time
+// still on the budget keeps the provisioning classification.
+func TestRun_PreStreamBudgetExpiryReportsBudgetExceeded(t *testing.T) {
+	// A budget that lapses before provisioning finishes must still report
+	// budget-exceeded even though the clone itself also fails: the
+	// session ran out of time, it did not mis-provision.
+	t.Run("expired budget on a failed provision", func(t *testing.T) {
+		start := time.Now()
+		platform := newRecordingPlatformServer(t)
+		base, err := stub.New()
+		if err != nil {
+			t.Fatalf("stub.New: %v", err)
+		}
+		r := newFollowUpRunner(t, platform.URL, platform.Client(), base, nil)
+		// Advance the clock past the one-second budget for every read
+		// after the run's own start stamp: the enforcer starts at run
+		// start and the provision branch reads the advanced clock.
+		calls := 0
+		r.now = func() time.Time {
+			calls++
+			if calls == 1 {
+				return start
+			}
+			return start.Add(2 * time.Second)
+		}
+		qw := QueuedWork{
+			QueuedWork:      queuedWorkBase("PRESTREAM-EXPIRED"),
+			WorkerID:        "worker-1",
+			AuthToken:       "tok",
+			PlatformURL:     platform.URL,
+			ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+		}
+		qw.StageBudget = &prompt.StageBudget{MaxDurationSeconds: 1}
+		// Unclonable: fails fast without network.
+		qw.Repository = filepath.Join(t.TempDir(), "does-not-exist.git")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, _ := r.Run(ctx, qw)
+		if res.Status != "failed" || res.FailureMode != FailureBudgetExceeded {
+			t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureBudgetExceeded)
+		}
+		if res.BudgetBreach == nil || res.BudgetBreach.Cap != string(CapDuration) {
+			t.Fatalf("BudgetBreach = %+v; want the duration-cap breach", res.BudgetBreach)
+		}
+		if res.BudgetReport == nil || res.BudgetReport.CapBreached != CapDuration {
+			t.Fatalf("BudgetReport = %+v; want CapBreached %s", res.BudgetReport, CapDuration)
+		}
+		if res.WorktreePath != "" {
+			t.Errorf("WorktreePath = %q; the workarea never materialized", res.WorktreePath)
+		}
+	})
+
+	// The control: the same failed provision with time left on the
+	// budget keeps the provisioning classification.
+	t.Run("live budget on a failed provision", func(t *testing.T) {
+		platform := newRecordingPlatformServer(t)
+		base, err := stub.New()
+		if err != nil {
+			t.Fatalf("stub.New: %v", err)
+		}
+		r := newFollowUpRunner(t, platform.URL, platform.Client(), base, nil)
+		qw := QueuedWork{
+			QueuedWork:      queuedWorkBase("PRESTREAM-LIVE"),
+			WorkerID:        "worker-1",
+			AuthToken:       "tok",
+			PlatformURL:     platform.URL,
+			ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+		}
+		qw.StageBudget = &prompt.StageBudget{MaxDurationSeconds: 3600}
+		qw.Repository = filepath.Join(t.TempDir(), "does-not-exist.git")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, _ := r.Run(ctx, qw)
+		if res.Status != "failed" || res.FailureMode != FailureWorktreeProvision {
+			t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureWorktreeProvision)
+		}
+		if res.BudgetBreach != nil {
+			t.Fatalf("BudgetBreach = %+v; a live budget must not record a breach", res.BudgetBreach)
+		}
+	})
 }
