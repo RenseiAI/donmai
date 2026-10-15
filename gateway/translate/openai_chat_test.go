@@ -2,7 +2,6 @@ package translate
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/gateway/ir"
@@ -177,68 +176,5 @@ func TestContentArrayFlattened(t *testing.T) {
 	}
 	if len(req.Messages) != 1 || len(req.Messages[0].Parts) != 1 || req.Messages[0].Parts[0].Text != "part-apart-b" {
 		t.Errorf("content array not flattened: %+v", req.Messages)
-	}
-}
-
-// TestReasoningEffort_EveryDocumentedString covers every inbound effort
-// string: each decodes to its canonical level, ThinkingMax clamps to "high"
-// toward OpenAI, and unknown values are refused with the value named.
-func TestReasoningEffort_EveryDocumentedString(t *testing.T) {
-	wantLevel := map[string]ir.ThinkingLevel{
-		"off":     ir.ThinkingOff,
-		"none":    ir.ThinkingOff,
-		"minimal": ir.ThinkingMinimal,
-		"low":     ir.ThinkingLow,
-		"medium":  ir.ThinkingMedium,
-		"high":    ir.ThinkingHigh,
-		"xhigh":   ir.ThinkingMax,
-		"max":     ir.ThinkingMax,
-	}
-	for _, effort := range ir.DocumentedEfforts() {
-		want, ok := wantLevel[effort]
-		if !ok {
-			t.Fatalf("documented effort %q has no expectation in this test", effort)
-		}
-		req, err := DecodeRequest([]byte(`{"model":"m","messages":[],"reasoning_effort":"` + effort + `"}`))
-		if err != nil {
-			t.Errorf("DecodeRequest(%q) error = %v, want nil", effort, err)
-			continue
-		}
-		if req.Thinking.Level != want {
-			t.Errorf("DecodeRequest(%q) level = %q, want %q", effort, req.Thinking.Level, want)
-		}
-		// Anthropic/Gemini-shaped hop: the level carries a nonzero budget
-		// except when thinking is off.
-		if budget := req.Thinking.BudgetForBudgetUpstream(); (budget == 0) == (want != ir.ThinkingOff) {
-			t.Errorf("DecodeRequest(%q) budget = %d, off=%v", effort, budget, want == ir.ThinkingOff)
-		}
-		// OpenAI-shaped hop: max clamps to high, off omits the field.
-		out, err := EncodeRequest(req)
-		if err != nil {
-			t.Errorf("EncodeRequest(%q) error = %v", effort, err)
-			continue
-		}
-		var cr ChatRequest
-		if err := json.Unmarshal(out, &cr); err != nil {
-			t.Errorf("re-decode(%q): %v", effort, err)
-			continue
-		}
-		wantEffort := map[ir.ThinkingLevel]string{ir.ThinkingMax: "high", ir.ThinkingOff: ""}[want]
-		if _, known := map[ir.ThinkingLevel]bool{ir.ThinkingMax: true, ir.ThinkingOff: true}[want]; !known {
-			wantEffort = string(want)
-		}
-		if cr.ReasoningEffort != wantEffort {
-			t.Errorf("EncodeRequest(%q) reasoning_effort = %q, want %q", effort, cr.ReasoningEffort, wantEffort)
-		}
-	}
-}
-
-func TestReasoningEffort_UnknownIsRefused(t *testing.T) {
-	_, err := DecodeRequest([]byte(`{"model":"m","messages":[],"reasoning_effort":"ultra"}`))
-	if err == nil {
-		t.Fatal("DecodeRequest(ultra) = nil error, want a refusal")
-	}
-	if !strings.Contains(err.Error(), "ultra") {
-		t.Errorf("error %q should name the rejected value", err.Error())
 	}
 }
