@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,8 @@ type trustLedgerEntry struct {
 	Prior  any  `json:"prior,omitempty"`
 	HadKey bool `json:"hadKey,omitempty"`
 	// Session identifies the owning session (see seededTrust.session).
+	// Empty on a discovery row: the row names an override home for the
+	// sweep to VISIT (see recordSeededTrustLedger), not trust to undo.
 	Session string `json:"session,omitempty"`
 	// ConfigHome is the absolute config home the seed wrote this row
 	// beside, recorded so the daemon sweep can visit exactly the homes
@@ -94,10 +97,13 @@ type trustLedgerEntry struct {
 // the provider-native session id"), and keying rows on it would let the
 // sweep undo a still-running session's trust at the next daemon restart —
 // the live rows would never match the SessionID-keyed live set. An empty
-// SessionID falls back to a process-scoped pid identity, which the sweep
-// reads as dead-by-design once the process is gone (see
-// daemon/trust_ledger_sweep.go); a live process's unnamed entries are still
-// protected because the daemon's own sweep consults only adopted sessions.
+// SessionID falls back to a process-scoped pid identity; pid rows name the
+// process that spawned them (os.Getpid at seed time), and the sweep reads
+// the row as LIVE while that process still runs (so an id-less standalone
+// or legacy session keeps its trust across a daemon restart mid-run) and
+// as dead once the pid is gone (see daemon/trust_ledger_sweep.go) — the
+// crash-debris half. A recycled pid keeps a live read only until the
+// sweep's liveness probe fails; fail-closed on lookup error.
 func trustLedgerOwner(spec agent.Spec) string {
 	if id := strings.TrimSpace(spec.SessionID); id != "" {
 		return "session:" + id
@@ -105,10 +111,68 @@ func trustLedgerOwner(spec agent.Spec) string {
 	return fmt.Sprintf("pid:%d", os.Getpid())
 }
 
+// TrustLedgerSessionLive reports whether a ledger session identity still
+// owns a live session. "session:<id>" reads as live when the daemon
+// adopted that lifecycle identity and has not observed its exit (the live
+// set daemon/liveTrustLedgerSessions builds). "pid:<pid>" reads as live
+// while that process still runs — the seed names its own spawner, so a
+// live id-less session's rows survive a daemon restart — and dead once the
+// pid is gone. Anything else (empty, unparsable, non-positive pid) reads
+// as dead. A liveness probe that errors reads as live: failing closed
+// keeps the sweep from undoing a live session's trust on an uninspectable
+// pid. Exported so the daemon sweep and the provider sweep consult the
+// same verdict and can never disagree about one identity.
+func TrustLedgerSessionLive(session string, adopted map[string]struct{}) bool {
+	if session == "" {
+		return false
+	}
+	if _, ok := adopted[session]; ok {
+		return true
+	}
+	pid, ok := parseTrustLedgerPidOwner(session)
+	if !ok {
+		return false
+	}
+	if pid <= 0 {
+		return false
+	}
+	alive, err := trustLedgerPidAlive(pid)
+	if err != nil {
+		return true
+	}
+	return alive
+}
+
+// parseTrustLedgerPidOwner splits a "pid:<pid>" ledger identity.
+func parseTrustLedgerPidOwner(session string) (int, bool) {
+	pidText, ok := strings.CutPrefix(session, "pid:")
+	if !ok || strings.TrimSpace(pidText) == "" {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(pidText))
+	if err != nil {
+		return 0, false
+	}
+	return pid, true
+}
+
 // recordSeededTrustLedger appends seed's entries to the per-config-home
 // ledger under the trust lock. Silent and best-effort: any failure leaves
 // the seed in place (the live-path cleanup still knows exactly what to
 // remove) and the session proceeds.
+//
+// When the seed lands under a config-home override the daemon process
+// itself never ran with (spec.Env carries its own CLAUDE_CONFIG_DIR), the
+// daemon-start sweep would never enumerate that home — isolation would
+// hide the crash debris forever. So the seed ALSO leaves a discovery
+// pointer behind the daemon's own process home: a ledger row with no
+// directory (see sweepTrustLedger: empty-dir rows drain without touching
+// the record), carrying only the owning session and the override home it
+// names. The process-home sweep then follows that pointer to the isolated
+// home (see daemon/trust_ledger_sweep.go). Skipped exactly when there is
+// no override to name — the seed wrote beside the process home itself —
+// or when the process home is not absolute; discovery-link failure never
+// disturbs the seed itself.
 func recordSeededTrustLedger(seed *seededTrust) {
 	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
 		return
@@ -118,7 +182,7 @@ func recordSeededTrustLedger(seed *seededTrust) {
 		return
 	}
 	defer release()
-	entries, _ := readTrustLedger(seed.path)
+	entries, _ := readTrustLedgerLocked(seed.path, false)
 	if len(entries) >= trustLedgerMaxEntries {
 		return
 	}
@@ -136,13 +200,95 @@ func recordSeededTrustLedger(seed *seededTrust) {
 		entries = append(entries, trustLedgerEntry{Dir: dir, Prior: prior, HadKey: hadKey, Session: seed.session, ConfigHome: configHome, SeededAt: now})
 	}
 	_ = writeTrustLedger(seed.path, entries)
+	recordTrustLedgerDiscoveryLink(seed, configHome)
+}
+
+// recordTrustLedgerDiscoveryLink leaves the crash-sweep discovery pointer
+// behind the daemon process's own config home: a ledger row with no
+// directory naming overrideHome — the session-scoped config home seed
+// wrote beside — so the daemon-start sweep visits the isolated home even
+// though the process enumeration can never name it (see
+// daemon/trust_ledger_sweep.go). The pointer row carries the seed's owning
+// session and home: sweepTrustLedger drains empty-dir rows unconditionally
+// (they can never apply to the record), and forgetSeededTrustLedger drops
+// the link on the live path exactly like any other row the seed wrote —
+// so a live session's link never strands the override home open for a
+// later sweep to misread, and a crashed session's link drains with its
+// own sweep pass.
+//
+// Runs only when there is actually an override to name: overrideHome must
+// be absolute and must differ from the daemon process's own config home
+// (os.Getenv("CLAUDE_CONFIG_DIR"), else the operator home). Same-home
+// seeds are discovered by the process enumeration itself. Best-effort and
+// silent throughout: a link that cannot land leaves the seed in place.
+func recordTrustLedgerDiscoveryLink(seed *seededTrust, overrideHome string) {
+	if overrideHome == "" || !filepath.IsAbs(overrideHome) {
+		return
+	}
+	processHome := ""
+	if override := os.Getenv(claudeConfigDirEnv); override != "" {
+		if !filepath.IsAbs(override) {
+			return
+		}
+		processHome = override
+	} else if home, err := os.UserHomeDir(); err == nil {
+		processHome = home
+	}
+	if processHome == "" || !filepath.IsAbs(processHome) || processHome == overrideHome {
+		return
+	}
+	link, err := processTrustRecordPath()
+	if err != nil || link == "" || filepath.Dir(link) == overrideHome {
+		return
+	}
+	release, ok := acquireTrustLock(link)
+	if !ok {
+		return
+	}
+	defer release()
+	entries, _ := readTrustLedgerLocked(link, false)
+	for _, e := range entries {
+		if e.Dir == "" && e.ConfigHome == overrideHome && e.Session == seed.session {
+			return // link already present for this session's home
+		}
+	}
+	if len(entries) >= trustLedgerMaxEntries {
+		return
+	}
+	entries = append(entries, trustLedgerEntry{
+		Session:    seed.session,
+		ConfigHome: overrideHome,
+		SeededAt:   time.Now().UTC(),
+	})
+	_ = writeTrustLedger(link, entries)
+}
+
+// processTrustRecordPath resolves the CLI trust record path the daemon
+// process itself runs with — the process CLAUDE_CONFIG_DIR override when
+// absolute, else the operator home — or an error when neither resolves to
+// an absolute home the sweep would enumerate.
+func processTrustRecordPath() (string, error) {
+	if override := os.Getenv(claudeConfigDirEnv); override != "" {
+		if !filepath.IsAbs(override) {
+			return "", fmt.Errorf("relative %s %q: no process trust record to link", claudeConfigDirEnv, override)
+		}
+		return filepath.Join(override, claudeTrustFileName), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || !filepath.IsAbs(home) {
+		return "", fmt.Errorf("no process trust record to link: %w", err)
+	}
+	return filepath.Join(home, claudeTrustFileName), nil
 }
 
 // forgetSeededTrustLedger drops seed's entries from the ledger under the
-// trust lock. It runs deferred at the top of removeSeededTrust — before the
-// lock for the record itself is taken — so the ledger cannot retain an
-// entry the live cleanup already removed, even if that cleanup then fails
-// to take the record lock. Silent and best-effort throughout.
+// trust lock — both beside the seed's own home AND the discovery link the
+// seed left behind the daemon process home (see
+// recordTrustLedgerDiscoveryLink). It runs deferred at the top of
+// removeSeededTrust — before the lock for the record itself is taken — so
+// the ledger cannot retain an entry the live cleanup already removed, even
+// if that cleanup then fails to take the record lock. Silent and
+// best-effort throughout.
 func forgetSeededTrustLedger(seed *seededTrust) {
 	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
 		return
@@ -152,7 +298,7 @@ func forgetSeededTrustLedger(seed *seededTrust) {
 		return
 	}
 	defer release()
-	entries, ok := readTrustLedger(seed.path)
+	entries, ok := readTrustLedgerLocked(seed.path, false)
 	if !ok {
 		return
 	}
@@ -163,10 +309,51 @@ func forgetSeededTrustLedger(seed *seededTrust) {
 		}
 		keep = append(keep, e)
 	}
-	if len(keep) == len(entries) {
+	if len(keep) != len(entries) {
+		_ = writeTrustLedger(seed.path, keep)
+	}
+	// The discovery link names the seeded home but lives beside the
+	// process home: drop it by session+home, since a directory-less row
+	// is never "owned" by ledgerEntryOwnedBy's directory match. Without
+	// this the live path would strand the link and the next sweep would
+	// visit the override home for nothing.
+	forgetTrustLedgerDiscoveryLink(seed)
+}
+
+// forgetTrustLedgerDiscoveryLink drops the discovery link
+// recordTrustLedgerDiscoveryLink left behind the daemon process home for
+// seed's session and home: directory-less rows naming the home seed wrote
+// beside, owned by seed's session. Best-effort and silent; a no-op when
+// the link path resolves beside the seed itself (same-home seeds leave no
+// link) or cannot be taken under the lock.
+func forgetTrustLedgerDiscoveryLink(seed *seededTrust) {
+	if seed == nil || seed.path == "" {
 		return
 	}
-	_ = writeTrustLedger(seed.path, keep)
+	overrideHome := filepath.Dir(seed.path)
+	link, err := processTrustRecordPath()
+	if err != nil || link == "" || filepath.Dir(link) == overrideHome {
+		return
+	}
+	release, ok := acquireTrustLock(link)
+	if !ok {
+		return
+	}
+	defer release()
+	entries, ok := readTrustLedgerLocked(link, false)
+	if !ok {
+		return
+	}
+	keep := entries[:0]
+	for _, e := range entries {
+		if e.Dir == "" && e.Session == seed.session && e.ConfigHome == overrideHome {
+			continue
+		}
+		keep = append(keep, e)
+	}
+	if len(keep) != len(entries) {
+		_ = writeTrustLedger(link, keep)
+	}
 }
 
 // ledgerEntryOwnedBy reports whether ledger entry e is one seed wrote: same
@@ -202,7 +389,28 @@ func trustLedgerPath(trustRecordPath string) string {
 // trustRecordPath. ok is false when the ledger is absent, unreadable, or
 // unparseable — all three read as "no ledger", never as an error, so a
 // missing or foreign ledger never disturbs the seed.
+//
+// The read takes the trust lock: seeds, live cleanups, discovery links,
+// and the sweep all write through it, and an unlocked read at startup
+// could tear against one of them — listing no homes requires no lock to
+// lose, only one torn read to skip (see daemon/trust_ledger_sweep.go).
 func readTrustLedger(trustRecordPath string) (entries []trustLedgerEntry, ok bool) {
+	return readTrustLedgerLocked(trustRecordPath, true)
+}
+
+// readTrustLedgerLocked is readTrustLedger with the locking made explicit.
+// Callers that already hold the trust lock for trustRecordPath (every
+// in-package writer and the sweep) pass locked=false; the daemon sweep's
+// discovery pass — no lock held — passes locked=true so the discovery read
+// cannot tear against a concurrent writer.
+func readTrustLedgerLocked(trustRecordPath string, locked bool) (entries []trustLedgerEntry, ok bool) {
+	if locked {
+		release, ok := acquireTrustLock(trustRecordPath)
+		if !ok {
+			return nil, false
+		}
+		defer release()
+	}
 	data, err := os.ReadFile(trustLedgerPath(trustRecordPath)) //nolint:gosec // harness-owned ledger beside the trust record
 	if err != nil {
 		return nil, false
@@ -284,7 +492,7 @@ func sweepTrustLedger(opts SweepTrustLedgerOptions) (dropped int) {
 		return 0
 	}
 	defer release()
-	entries, ok := readTrustLedger(path)
+	entries, ok := readTrustLedgerLocked(path, false)
 	if !ok || len(entries) == 0 {
 		return 0
 	}
@@ -423,7 +631,10 @@ func applyTrustLedgerSweep(path string, dead []trustLedgerEntry) bool {
 // the process home enumeration would never reach. Best-effort: an absent
 // or unparseable ledger lists nothing.
 func LedgerConfigHomes(trustRecordPath string, visited map[string]struct{}) []string {
-	entries, ok := readTrustLedger(trustRecordPath)
+	// Locked: this is the daemon sweep's discovery pass — no lock held —
+	// and a torn read here would skip an override home for the whole boot
+	// (see readTrustLedgerLocked).
+	entries, ok := readTrustLedgerLocked(trustRecordPath, true)
 	if !ok {
 		return nil
 	}
@@ -440,6 +651,39 @@ func LedgerConfigHomes(trustRecordPath string, visited map[string]struct{}) []st
 		out = append(out, home)
 	}
 	return out
+}
+
+// SeededTrustForSweepTest is the observable half of one production seed:
+// the trust-record path it wrote. The seed record itself stays private —
+// the daemon sweep test never touches it; a crashed session has nobody
+// left to clean up, which is the shape under test. Exported for the daemon
+// sweep test: it builds an isolated-home crash through the real seed —
+// including its process-home discovery link — instead of a hand-shaped
+// ledger. The caller sets CLAUDE_CONFIG_DIR (process home) and HOME
+// before calling; workdir must be an absolute directory the seed may
+// trust. Empty when the seed wrote nothing.
+type SeededTrustForSweepTest struct {
+	// TrustRecordPath is the trust record the production seed wrote.
+	TrustRecordPath string
+}
+
+// SeedWorkspaceTrustForSweepTest runs the PRODUCTION seed with a
+// session-scoped config-home override: the session env layer names
+// overrideHome while the process env (set by the caller) names the
+// daemon's own process home. A test that wants the crashed shape simply
+// leaves the seed in place — nobody calls the live-path cleanup.
+func SeedWorkspaceTrustForSweepTest(workdir, overrideHome, sessionID string) SeededTrustForSweepTest {
+	spec := agent.Spec{
+		SessionID:   sessionID,
+		SessionName: "seed-for-test",
+		Cwd:         workdir,
+		Env:         map[string]string{claudeConfigDirEnv: overrideHome},
+	}
+	seed := seedWorkspaceTrust(spec)
+	if seed == nil {
+		return SeededTrustForSweepTest{}
+	}
+	return SeededTrustForSweepTest{TrustRecordPath: seed.path}
 }
 
 // SweepSeededTrustForConfigHome sweeps the ledger beside the trust record

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -244,6 +245,36 @@ func TestSweepSeededTrustForConfigHome_SweepsOnlyTheLedger(t *testing.T) {
 	}
 }
 
+// TestLedgerConfigHomes_TakesTheTrustLockForDiscovery proves the sweep's
+// discovery read serializes with concurrent writers: with the trust lock
+// held elsewhere, LedgerConfigHomes lists nothing rather than tearing —
+// the sweep skips the home for this boot instead of reading half a
+// ledger. The lock is the real per-home trust lock (acquireTrustLock),
+// not a test double, so this drives the production serialization.
+// RED proof: read the ledger without the lock and the homes list through
+// even while the lock is held.
+func TestLedgerConfigHomes_TakesTheTrustLockForDiscovery(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), claudeTrustFileName)
+	seed := &seededTrust{path: path, dirs: []string{"/dead/created"}, session: "session:dead"}
+	recordSeededTrustLedger(seed)
+	entries, ok := readTrustLedger(path)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("ledger rows = %v, want the one recorded row", entries)
+	}
+	entries[0].ConfigHome = t.TempDir()
+	rewriteLedgerForTest(t, path, entries)
+
+	release, ok := acquireTrustLock(path)
+	if !ok {
+		t.Fatal("could not take the trust lock for the contention probe")
+	}
+	defer release()
+	if got := LedgerConfigHomes(path, map[string]struct{}{}); len(got) != 0 {
+		t.Errorf("LedgerConfigHomes under a held lock = %q, want nothing — the discovery read must wait on the lock, not tear", got)
+	}
+}
+
 // TestLedgerConfigHomes_NamesSessionScopedOverrideHomes proves the sweep
 // can find a crashed session's isolated home: a ledger wrote beside one
 // home names a second absolute home in its rows, and LedgerConfigHomes
@@ -291,6 +322,169 @@ func TestLedgerConfigHomes_NamesSessionScopedOverrideHomes(t *testing.T) {
 	rewriteLedgerForTest(t, bare, bareEntries)
 	if got := LedgerConfigHomes(bare, map[string]struct{}{}); len(got) != 0 {
 		t.Errorf("LedgerConfigHomes for a home-less row = %q, want nothing", got)
+	}
+}
+
+// TestSeedWorkspaceTrust_LeavesADiscoveryLinkBehindTheProcessHome proves
+// the production seed under a session-scoped CLAUDE_CONFIG_DIR override
+// ALSO leaves a discovery pointer behind the daemon process's own home: a
+// directory-less ledger row naming the override home, so the daemon-start
+// sweep visits the isolated home even though the process enumeration can
+// never name it. Same-home seeds leave no link — the process enumeration
+// finds them itself. RED proof: drop the recordTrustLedgerDiscoveryLink
+// call and the process-home ledger stays absent while the isolated seed
+// still lands.
+func TestSeedWorkspaceTrust_LeavesADiscoveryLinkBehindTheProcessHome(t *testing.T) {
+	// No t.Parallel: Setenv forbids it.
+	processHome := t.TempDir()
+	t.Setenv(claudeConfigDirEnv, processHome)
+	t.Setenv("HOME", processHome)
+	overrideHome := t.TempDir()
+	workdir := t.TempDir()
+
+	seeded := SeedWorkspaceTrustForSweepTest(workdir, overrideHome, "uuid-link-prod")
+	seedPath := seeded.TrustRecordPath
+	if seedPath == "" {
+		t.Fatal("production seed under the session-scoped override wrote nothing")
+	}
+	if want := filepath.Join(overrideHome, claudeTrustFileName); seedPath != want {
+		t.Fatalf("seed path = %q, want the override home %q", seedPath, want)
+	}
+	for _, e := range readLedgerEntries(t, seedPath) {
+		if e.Session != "session:uuid-link-prod" {
+			t.Errorf("isolated row carries the wrong owner: %+v", e)
+		}
+	}
+
+	// The isolated seed landed beside the override home.
+	isolated := readLedgerEntries(t, seedPath)
+	if len(isolated) == 0 {
+		t.Fatal("isolated ledger beside the override home is empty")
+	}
+	for _, e := range isolated {
+		if e.Dir == "" {
+			t.Errorf("isolated ledger carries a directory-less row; links belong to the process home: %+v", e)
+		}
+		if e.ConfigHome != overrideHome {
+			t.Errorf("isolated row names home %q, want the override home %q", e.ConfigHome, overrideHome)
+		}
+	}
+
+	// The process home carries ONLY the discovery link: no directory, no
+	// trust to undo, just the override home to visit.
+	linkEntries, ok := readTrustLedger(filepath.Join(processHome, claudeTrustFileName))
+	if !ok || len(linkEntries) == 0 {
+		t.Fatalf("process-home ledger carries no discovery link for %q", overrideHome)
+	}
+	named := false
+	for _, e := range linkEntries {
+		if e.Dir != "" {
+			t.Errorf("process-home ledger carries a trust row %+v; it must carry only links", e)
+		}
+		if e.ConfigHome == overrideHome && e.Session == "session:uuid-link-prod" {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("process-home ledger names no link to %q: %v", overrideHome, linkEntries)
+	}
+	// The live path drops the link by session+home (see
+	// forgetTrustLedgerDiscoveryLink): forget the crashed session's link
+	// through the production forget path and prove its link drains while
+	// the isolated trust rows — owned by the same session but beside the
+	// override home — are untouched by the process-home forget.
+	forgetSeededTrustLedger(&seededTrust{path: seedPath, dirs: []string{"defunct"}, session: "session:uuid-link-prod"})
+	if entries, ok := readTrustLedger(filepath.Join(processHome, claudeTrustFileName)); !ok {
+		t.Fatal("process-home ledger unreadable after forgetting the session's link")
+	} else {
+		for _, e := range entries {
+			if e.Session == "session:uuid-link-prod" && e.ConfigHome == overrideHome {
+				t.Errorf("forgotten session's link survives: %v", entries)
+			}
+		}
+	}
+	// The isolated rows are still beside the override home — the
+	// process-home forget never touches another home's ledger — and a
+	// full live cleanup of a session that DID run drains both.
+	if entries := readLedgerEntries(t, seedPath); len(entries) == 0 {
+		t.Error("process-home forget drained the override home's ledger; homes must forget independently")
+	}
+	liveSecond := t.TempDir()
+	live := seedWorkspaceTrust(agent.Spec{
+		SessionID: "uuid-link-live",
+		Cwd:       liveSecond,
+		Env:       map[string]string{claudeConfigDirEnv: overrideHome},
+	})
+	if live == nil {
+		t.Fatal("second production seed wrote nothing")
+	}
+	removeSeededTrust(live)
+	if entries, ok := readTrustLedger(filepath.Join(processHome, claudeTrustFileName)); ok && len(entries) != 0 {
+		t.Errorf("live cleanup left the discovery link behind: %v", entries)
+	}
+}
+
+// TestSeedWorkspaceTrust_SameHomeSeedLeavesNoDiscoveryLink proves a seed
+// beside the daemon process's own home leaves no discovery pointer: the
+// process enumeration finds that home itself, so a link would only add a
+// no-op sweep pass.
+func TestSeedWorkspaceTrust_SameHomeSeedLeavesNoDiscoveryLink(t *testing.T) {
+	// No t.Parallel: Setenv forbids it.
+	processHome := t.TempDir()
+	t.Setenv(claudeConfigDirEnv, processHome)
+	t.Setenv("HOME", processHome)
+	workdir := t.TempDir()
+
+	seed := seedWorkspaceTrust(agent.Spec{SessionID: "uuid-same-home", Cwd: workdir})
+	if seed == nil {
+		t.Fatal("same-home seed wrote nothing")
+	}
+	if want := filepath.Join(processHome, claudeTrustFileName); seed.path != want {
+		t.Fatalf("seed path = %q, want the process home %q", seed.path, want)
+	}
+	for _, e := range readLedgerEntries(t, seed.path) {
+		if e.Dir == "" {
+			t.Errorf("same-home seed left a discovery link; the sweep enumerates this home itself: %+v", e)
+		}
+	}
+	removeSeededTrust(seed)
+}
+
+// TestTrustLedgerSessionLive_PidRowsFollowProcessLiveness proves the
+// id-less fallback: a ledger identity naming a RUNNING process reads as
+// live (a standalone/legacy session keeps its trust across a daemon
+// restart mid-run), while a definitely-dead pid and every malformed
+// identity read as dead (crash debris still drains). Adopted session
+// identities read as live regardless of any process. RED proof: read
+// pid rows as dead-by-design and the live id-less session's trust is
+// swept from under it.
+func TestTrustLedgerSessionLive_PidRowsFollowProcessLiveness(t *testing.T) {
+	t.Parallel()
+	adopted := map[string]struct{}{"session:uuid-live": {}}
+	if !TrustLedgerSessionLive("session:uuid-live", adopted) {
+		t.Error("adopted session reads as dead")
+	}
+	if TrustLedgerSessionLive("session:uuid-other", adopted) {
+		t.Error("non-adopted session reads as live")
+	}
+	if !TrustLedgerSessionLive("pid:1", adopted) {
+		t.Log("note: pid 1 not visible from this sandbox; live-pid half checked below")
+	}
+	liveSelf := "pid:" + strconv.Itoa(os.Getpid())
+	if !TrustLedgerSessionLive(liveSelf, nil) {
+		t.Errorf("%s (this test process) reads as dead; the daemon restart would sweep a live id-less session", liveSelf)
+	}
+	// A pid that cannot exist is dead: crash debris drains.
+	if TrustLedgerSessionLive("pid:2147483647", nil) {
+		t.Error("unallocatable pid reads as live; crash debris would never drain")
+	}
+	for _, malformed := range []string{"", "session:", "pid:", "pid:abc", "pid:-3", "pid:0", "host:1"} {
+		if TrustLedgerSessionLive(malformed, nil) {
+			t.Errorf("%q reads as live; malformed rows must sweep", malformed)
+		}
+		if TrustLedgerSessionLive(malformed, adopted) && malformed != "session:uuid-live" {
+			t.Errorf("%q reads as live against an adopted set that does not name it", malformed)
+		}
 	}
 }
 

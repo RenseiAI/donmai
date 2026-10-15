@@ -35,6 +35,13 @@ type TrustLedgerSweepFunc func(configHome string, live func(session string) bool
 // provider/harness/claude/trust_ledger.go) while a live session's entries
 // are never touched.
 //
+// Concurrency: two daemon generations can sweep at once — the old one
+// draining while the new one starts. That interleaving is benign: every
+// pass takes the trust lock per home (one small read plus one small write),
+// ledger rows are idempotent to drop (re-dropping an already-drained row
+// is a no-op against a record that no longer carries it), and a row the
+// sweep could not apply stays for the next start to retry.
+//
 // The sweep degrades, never destroys: a config home with no ledger, an
 // unparseable ledger, or a trust record the sweep must not rewrite all
 // sweep nothing, and a sweep failure never fails startup — it is logged
@@ -129,14 +136,18 @@ func (d *Daemon) trustLedgerConfigHomes() []string {
 	return homes
 }
 
-// liveTrustLedgerSessions returns the liveness predicate the sweep consults:
-// a ledger session identity reads as live when this daemon adopted it and
+// liveTrustLedgerSessions returns the liveness predicate the sweep consults.
+// A ledger session identity reads as live when this daemon adopted it and
 // has not observed its exit. Ledger rows carry "session:<SessionID>" — the
 // platform lifecycle UUID the runner threads through agent.Spec.SessionID
 // (see provider/harness/claude.trustLedgerOwner) — and "pid:<pid>" for
-// sessions that carried no lifecycle id: the pid form names a process
-// that died with the crash, so it never reads as live here — only an
-// adopted session identity does.
+// sessions that carried no lifecycle id (standalone/legacy dispatch).
+// The pid form names the spawner process, so it reads as live while that
+// process still runs — a live id-less session keeps its trust across a
+// daemon restart mid-run — and as dead once the pid is gone. Anything else
+// (empty, unparsable) reads as dead. The probe consults the SHARED verdict
+// (providerclaude.TrustLedgerSessionLive), so daemon and provider can
+// never disagree about one identity.
 func (d *Daemon) liveTrustLedgerSessions() func(session string) bool {
 	live := map[string]struct{}{}
 	if d.shims != nil {
@@ -150,8 +161,7 @@ func (d *Daemon) liveTrustLedgerSessions() func(session string) bool {
 		d.shims.mu.RUnlock()
 	}
 	return func(session string) bool {
-		_, ok := live[session]
-		return ok
+		return providerclaude.TrustLedgerSessionLive(session, live)
 	}
 }
 

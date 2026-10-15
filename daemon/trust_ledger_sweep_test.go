@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
@@ -78,13 +79,14 @@ func TestSweepSeededTrustLedger_SweepsDeadRowsThroughSweeper(t *testing.T) {
 }
 
 // TestSweepSeededTrustLedger_DrainsSessionScopedOverrideHomes drives the
-// PRODUCTION sweeper through the daemon step: a crashed session seeded its
-// trust under a session-scoped CLAUDE_CONFIG_DIR override the daemon
-// process itself never ran with, so the process-home enumeration never
-// names that home. The ledger row records the home its seed wrote beside,
-// and the sweep follows it — a crash there still drains. RED proof: sweep
-// only the process homes (skip the ledger-driven discovery) and the
-// override home keeps its seeded entry.
+// PRODUCTION sweeper through the daemon step from a PRODUCTION seed: a
+// crashed session seeded its trust under a session-scoped CLAUDE_CONFIG_DIR
+// override the daemon process itself never ran with, so the process-home
+// enumeration never names that home. The seed left a discovery link behind
+// the process home (a directory-less ledger row naming the override home),
+// and the sweep follows it — a crash there still drains. RED proof: seed
+// with the discovery link disabled and the override home keeps its seeded
+// entry while the process home drains clean.
 func TestSweepSeededTrustLedger_DrainsSessionScopedOverrideHomes(t *testing.T) {
 	// No t.Parallel: Setenv forbids it.
 	processHome := t.TempDir()
@@ -95,54 +97,33 @@ func TestSweepSeededTrustLedger_DrainsSessionScopedOverrideHomes(t *testing.T) {
 	t.Setenv("HOME", processHome)
 	overrideHome := t.TempDir()
 
-	// Land a crashed session's seed + ledger under the override home by
-	// hand: seedWorkspaceTrust reads the session env layer first, so a
-	// session-scoped override writes exactly here while the daemon
-	// process home stays empty. The process home ALSO carries a ledger
-	// whose row names the override home — that is the discovery link the
-	// sweep follows (a crashed isolated session's own home is never
-	// enumerated directly).
-	overrideRecord := filepath.Join(overrideHome, providerclaude.TrustRecordFileName)
-	raw, err := json.Marshal(map[string]any{
-		"projects": map[string]any{"/dead/created": map[string]any{"hasTrustDialogAccepted": true}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(overrideRecord, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	ledgerRaw, err := json.Marshal([]map[string]any{{
-		"dir":        "/dead/created",
-		"created":    true,
-		"session":    "session:uuid-dead",
-		"configHome": overrideHome,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(overrideHome, ".claude.json.seeded-trust-ledger"), ledgerRaw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// The discovery link: the process home's own ledger names the
-	// override home in its rows. The link row's own sweep drains
-	// independently; the override home is discovered BEFORE the naming
-	// home sweeps, so the link row may name a live session and still
-	// route the sweep to the isolated home.
-	linkRaw, err := json.Marshal([]map[string]any{{
-		"dir":        "/dead/link",
-		"created":    true,
-		"session":    "session:uuid-dead",
-		"configHome": overrideHome,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// A crashed isolated session's seed, built the way production builds
+	// it: the session env layer carries the override home, the daemon
+	// process home stays out of the picture. The disk layout — trust
+	// record, ledger rows, and the process-home discovery link — is
+	// whatever the production seed wrote; the test only supplies homes.
 	if err := os.WriteFile(filepath.Join(processHome, ".claude.json"), []byte(`{"projects":{}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(processHome, ".claude.json.seeded-trust-ledger"), linkRaw, 0o600); err != nil {
+	workdir := t.TempDir()
+	seeded := providerclaude.SeedWorkspaceTrustForSweepTest(workdir, overrideHome, "uuid-dead-isolated")
+	overrideRecord := seeded.TrustRecordPath
+	if overrideRecord == "" {
+		t.Fatal("production seed under the session-scoped override wrote nothing")
+	}
+	if want := filepath.Join(overrideHome, providerclaude.TrustRecordFileName); overrideRecord != want {
+		t.Fatalf("production seed wrote %q, want the override home %q", overrideRecord, want)
+	}
+	raw, err := os.ReadFile(overrideRecord)
+	if err != nil {
 		t.Fatal(err)
+	}
+	var before map[string]any
+	if err := json.Unmarshal(raw, &before); err != nil {
+		t.Fatal(err)
+	}
+	if projects, _ := before["projects"].(map[string]any); len(projects) == 0 {
+		t.Fatal("production seed left no trust entry under the override home to drain")
 	}
 
 	d := newTestDaemonForSweep(t, Options{})
@@ -158,19 +139,19 @@ func TestSweepSeededTrustLedger_DrainsSessionScopedOverrideHomes(t *testing.T) {
 		t.Fatal(err)
 	}
 	projects, _ := record["projects"].(map[string]any)
-	if _, present := projects["/dead/created"]; present {
-		t.Errorf("crashed session's override-home entry survives the daemon sweep: %v", projects)
+	if len(projects) != 0 {
+		t.Errorf("crashed session's override-home entries survive the daemon sweep: %v", projects)
 	}
 }
 
-// predicate protects adopted, non-terminal sessions and reads everything
-// else — crashed pid-owned rows included — as dead. The adopted identity
-// carries a lifecycle UUID while the display name differs on purpose: the
-// sweep keys liveness on the UUID the ledger rows carry, never on the
-// user-facing name, so a same-string fixture would mask a namespace
-// mismatch. RED proof: build the predicate from the registry Scan instead
-// of the adopted map and an adopted-but-not-yet-registered session reads
-// as dead.
+// predicate protects adopted, non-terminal sessions, live pid-owned rows
+// (a running spawner process behind an id-less session), and nothing
+// else. The adopted identity carries a lifecycle UUID while the display
+// name differs on purpose: the sweep keys liveness on the UUID the ledger
+// rows carry, never on the user-facing name, so a same-string fixture
+// would mask a namespace mismatch. RED proof: build the predicate from
+// the registry Scan instead of the adopted map and an
+// adopted-but-not-yet-registered session reads as dead.
 func TestLiveTrustLedgerSessions_AdoptedSessionsAreLive(t *testing.T) {
 	t.Parallel()
 	d := newTestDaemonForSweep(t, Options{})
@@ -178,8 +159,22 @@ func TestLiveTrustLedgerSessions_AdoptedSessionsAreLive(t *testing.T) {
 	if live("session:anything") {
 		t.Error("empty daemon reads a session as live; every row would be protected forever")
 	}
-	if live("pid:12345") {
-		t.Error("a crashed process's ledger rows read as live; the sweep could never drain them")
+	// A definitely-dead pid reads as dead, so crash debris still drains;
+	// the test process's own pid reads as live, so an id-less session
+	// keeps its trust across a daemon restart mid-run. Both verdicts go
+	// through the shared provider verdict, so daemon and provider can
+	// never disagree about one identity.
+	if live("pid:12345") != providerclaude.TrustLedgerSessionLive("pid:12345", nil) {
+		t.Error("dead-pid verdict disagrees with the shared provider verdict; daemon and provider must agree")
+	}
+	if live("pid:1") != providerclaude.TrustLedgerSessionLive("pid:1", nil) {
+		t.Error("pid-1 verdict disagrees with the shared provider verdict; daemon and provider must agree")
+	}
+	if myself := "pid:" + strconv.Itoa(os.Getpid()); !live(myself) {
+		t.Errorf("%s (this test process) reads as dead; a live id-less session would lose its trust", myself)
+	}
+	if live("") {
+		t.Error("empty session identity reads as live; malformed rows would escape the sweep forever")
 	}
 	d.shims.mu.Lock()
 	d.shims.adopted[sessionshim.Identity{OrgID: "org-1", SessionID: "uuid-1"}] = adoptedShim{}
