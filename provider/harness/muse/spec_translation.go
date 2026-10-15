@@ -55,6 +55,10 @@ func resolveModel(spec agent.Spec) string {
 // wire spelling. The "default" and "none" sentinels are never
 // forwarded: an unset tier and a default tier are the same request to the
 // host (run at its default), and "none" is not a selectable tier.
+// "ultra" is a declared wire value (types.go) the shared ladder does
+// not name: it is refused loudly rather than silently degraded to the
+// host default, so a caller asking for the top tier never unknowingly
+// runs at a lower one.
 func resolveEffort(spec agent.Spec) *ReasoningEffort {
 	switch spec.Effort {
 	case agent.EffortLevel("minimal"):

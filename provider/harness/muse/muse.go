@@ -326,7 +326,13 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 	// From here on the child is live; failures must stop it. The
 	// confinement plan stays applied until the child has exited: the
 	// release runs in Handle shutdown (releaseConfinement), not here.
+	// Handle shutdown runs through closeEvents, which also releases the
+	// plan — so every post-spawn failure path below funnels through
+	// closeEvents before returning, and no path leaks the rendered
+	// profile or the per-session scratch directory.
 	if err := h.handshake(ctx); err != nil {
+		h.signalClosed()
+		h.closeEvents()
 		_ = h.shutdownChild("handshake failed")
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
