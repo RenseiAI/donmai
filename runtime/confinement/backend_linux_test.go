@@ -1367,7 +1367,11 @@ func TestRenderBubblewrap_DaemonPrivate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	emptyFile := filepath.Join(os.TempDir(), "donmai-confine-empty", "file")
+	emptyBase, emptyErr := emptyPlaceholderBase()
+	if emptyErr != nil {
+		t.Fatalf("emptyPlaceholderBase: %v", emptyErr)
+	}
+	emptyFile := filepath.Join(emptyBase, "file")
 
 	t.Run("daemon-private paths hide where revealed", func(t *testing.T) {
 		r := w.resolved()
