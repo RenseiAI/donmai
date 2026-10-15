@@ -131,7 +131,7 @@ func TestInteractiveArgs_SystemPromptAppendMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it", SystemPromptAppend: "follow local conventions"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		headlessAppend, ok := flagValueOf(headless)
 		if !ok {
 			t.Fatalf("headless buildArgs dropped %s", flag)
@@ -150,7 +150,7 @@ func TestInteractiveArgs_SystemPromptAppendMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		if _, ok := flagValueOf(headless); ok {
 			t.Errorf("headless buildArgs emitted %s for an empty append", flag)
 		}
@@ -184,7 +184,7 @@ func TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it", Autonomous: true}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		headlessMode, ok := permissionModeOf(headless)
 		if !ok {
 			t.Fatalf("headless buildArgs dropped %s for an autonomous spec: %q", flag, headless)
@@ -206,7 +206,7 @@ func TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		if _, ok := permissionModeOf(headless); ok {
 			t.Errorf("headless buildArgs emitted %s for a non-autonomous spec: %q", flag, headless)
 		}
@@ -250,7 +250,7 @@ func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it", Model: "gpt-5.6-sol"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		headlessModel, ok := modelOf(headless)
 		if !ok {
 			t.Fatalf("headless buildArgs dropped %s", flag)
@@ -269,7 +269,7 @@ func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
 		t.Parallel()
 		spec := agent.Spec{Prompt: "ship it"}
 
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		if _, ok := modelOf(headless); ok {
 			t.Errorf("headless buildArgs emitted %s with no model selected: %q", flag, headless)
 		}

@@ -39,18 +39,21 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		ExecutionSecurity: claudeExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true,
-			SupportsSessionResume:    false,
-			SupportsToolPlugins:      true,
-			AcceptsMcpServerSpec:     true,
-			AcceptsAllowedToolsList:  true,
-			EmitsSubagentEvents:      true,
-			SetsParentToolUseID:      true, // stream-json parent_tool_use_id is mapped onto ParentToolUseID
-			SupportsReasoningEffort:  true,
-			SupportsOneShot:          true,
-			NativeJSONMode:           false,
-			ToolPermissionFormat:     "claude",
-			StreamingTransport:       "ndjson", // claude CLI JSONL = ndjson framing
-			SupportsInteractivePTY:   true,
+			// Owned at launch: a fresh spawn mints the session id and
+			// passes it as --session-id, so the resume token is known
+			// before the first turn; Resume continues it via --resume.
+			SupportsSessionResume:   true,
+			SupportsToolPlugins:     true,
+			AcceptsMcpServerSpec:    true,
+			AcceptsAllowedToolsList: true,
+			EmitsSubagentEvents:     true,
+			SetsParentToolUseID:     true, // stream-json parent_tool_use_id is mapped onto ParentToolUseID
+			SupportsReasoningEffort: true,
+			SupportsOneShot:         true,
+			NativeJSONMode:          false,
+			ToolPermissionFormat:    "claude",
+			StreamingTransport:      "ndjson", // claude CLI JSONL = ndjson framing
+			SupportsInteractivePTY:  true,
 			// session-root-v1 is attested for declarations whose
 			// repositories are all mutable: granting each mutable
 			// repository path as an additional writable directory

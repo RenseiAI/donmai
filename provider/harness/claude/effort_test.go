@@ -76,7 +76,7 @@ func TestInteractiveArgs_EffortMatchesHeadless(t *testing.T) {
 	}
 	for _, effort := range []agent.EffortLevel{agent.EffortHigh, agent.EffortXHigh, agent.EffortMax} {
 		spec := agent.Spec{Prompt: "ship it", Effort: effort}
-		headless, _ := buildArgs(spec, "", "")
+		headless, _ := buildArgs(spec, "", "", "")
 		headlessEffort, ok := effortOf(headless)
 		if !ok || headlessEffort != string(effort) {
 			t.Fatalf("headless buildArgs effort = %q (present=%t), want %q", headlessEffort, ok, effort)

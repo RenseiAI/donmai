@@ -243,7 +243,32 @@ func SpawnBinary(
 	env map[string]string,
 	onProcessSpawned func(pid int),
 ) (*Handle, error) {
-	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned)
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned, "")
+}
+
+// SpawnBinaryWithOwnedSessionID is SpawnBinary for a harness that owns its
+// resume token at launch (a minted `--session-id` on a fresh spawn, the
+// resumed id on a restore). The owned id is seeded into the Handle BEFORE
+// the reader goroutines start, so SessionID() is the resume token from the
+// moment spawn returns — not from the first InitEvent. The CLI echoes the
+// same id on its init line, which the reader captures as confirmation (a
+// no-op store of the identical value).
+//
+// An empty ownedSessionID keeps the historical behavior exactly: the
+// session id stays empty until the first InitEvent arrives.
+func SpawnBinaryWithOwnedSessionID(
+	ctx context.Context,
+	binary string,
+	argv []string,
+	stdinPrompt string,
+	mcpConfigPath string,
+	resumeExtraArgs []string,
+	cwd string,
+	env map[string]string,
+	onProcessSpawned func(pid int),
+	ownedSessionID string,
+) (*Handle, error) {
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned, ownedSessionID)
 }
 
 // spawnRaw is the low-level subprocess spawn shared by the claude
@@ -264,6 +289,7 @@ func spawnRaw(
 	cwd string,
 	env map[string]string,
 	onProcessSpawned func(pid int),
+	ownedSessionID string,
 ) (*Handle, error) {
 	// nolint:gosec // binary is resolved at provider construction
 	// from exec.LookPath; argv values come from a typed agent.Spec
@@ -322,6 +348,14 @@ func spawnRaw(
 
 	stderrBuf := newBoundedBuffer(stderrBufferSize)
 
+	// Seed the harness-owned resume token before any goroutine starts:
+	// SessionID() is valid from spawn return, and the CLI's own init
+	// line re-stores the identical value as confirmation.
+	var owned *string
+	if ownedSessionID != "" {
+		owned = &ownedSessionID
+	}
+
 	h := &Handle{
 		binary:          binary,
 		mcpConfigPath:   mcpConfigPath,
@@ -336,6 +370,9 @@ func spawnRaw(
 		stderrBuf:       stderrBuf,
 		shutdown:        make(chan struct{}),
 		done:            make(chan struct{}),
+	}
+	if owned != nil {
+		h.sessionID.Store(owned)
 	}
 
 	// Launch the prompt-writer in a goroutine. The CLI consumes the
