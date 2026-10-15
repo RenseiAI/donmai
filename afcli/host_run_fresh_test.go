@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -69,8 +70,12 @@ func TestHostRunFreshHostRefusesWithSetupAction(t *testing.T) {
 	if !strings.Contains(err.Error(), "host setup") {
 		t.Fatalf("fresh-host run error = %q, want the `host setup` operator action (output=%.500s)", err, output.String())
 	}
-	if code, ok := NeedsSetupExitCode(err); !ok || code != 4 {
-		t.Fatalf("NeedsSetupExitCode(%v) = (%d, %v), want (4, true): the refusal must exit with the no-restart setup status", err, code, ok)
+	// The refusal exits with the hold status for this host's
+	// supervisor: the setup status the systemd unit holds failed, the
+	// clean status the launchd plist parks. Either way the service
+	// manager waits for setup instead of respawning the refusal.
+	if code, ok := NeedsSetupExitCode(err); !ok || code != setupHoldExitCode(runtime.GOOS) {
+		t.Fatalf("NeedsSetupExitCode(%v) = (%d, %v), want (%d, true): the refusal must exit with the supervisor hold status", err, code, ok, setupHoldExitCode(runtime.GOOS))
 	}
 	if strings.Contains(err.Error(), "first-run setup") || strings.Contains(output.String(), "Machine ID") {
 		t.Fatalf("fresh-host run opened the interactive wizard: err=%q (output=%.500s)", err, output.String())
@@ -83,6 +88,70 @@ func TestHostRunFreshHostRefusesWithSetupAction(t *testing.T) {
 	}
 	if !strings.HasPrefix(loaded.Orchestrator.URL, "file://") {
 		t.Fatalf("seeded URL = %q, want the local file queue", loaded.Orchestrator.URL)
+	}
+}
+
+// TestHostRunServiceModeStdinSkipsWizardDarwinHold drives the same
+// service-mode start as the refusal test above — fresh host, stdin on
+// /dev/null as the service manager provides, no skip flag — and pins the
+// macOS half of the hold contract: the refusal must map to the clean
+// status, the one status the launchd KeepAlive (SuccessfulExit=false)
+// does not respawn. A non-zero exit restarts about every ThrottleInterval
+// and a fresh host spins until setup completes; the plist shape that
+// parks clean exits is pinned by the launchd KeepAlive test, this pins
+// the binary half. Reverting the darwin hold arm back to the setup
+// status fails this test while the Linux hold test stays green.
+func TestHostRunServiceModeStdinSkipsWizardDarwinHold(t *testing.T) {
+	home := t.TempDir()
+	priorHome := statehome.BaseHome()
+	statehome.SetBaseHome(home)
+	t.Cleanup(func() { statehome.SetBaseHome(priorHome) })
+	t.Setenv("HOME", home)
+	t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
+
+	devNull, err := os.Open("/dev/null")
+	if err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+	defer func() { _ = devNull.Close() }()
+	previousStdin := os.Stdin
+	os.Stdin = devNull
+	t.Cleanup(func() { os.Stdin = previousStdin })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(home, "daemon.yaml")
+	cmd := newDaemonRunCmd(Config{HostBinaryVersion: "test"})
+	cmd.SetArgs([]string{"--config", configPath, "--port", strconv.Itoa(port), "--standalone-creds=off"})
+	var output bytes.Buffer
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cmd.SetContext(ctx)
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatalf("fresh-host run succeeded without a harness profile; want the setup refusal. output=%.500s", output.String())
+	}
+	if strings.Contains(err.Error(), "first-run setup") || strings.Contains(output.String(), "Machine ID") {
+		t.Fatalf("fresh-host run opened the interactive wizard: err=%q (output=%.500s)", err, output.String())
+	}
+	// The macOS hold: the refusal exits clean so launchd parks the job
+	// instead of respawning it. Asserted through the hold mapping (not
+	// the host GOOS) so the macOS contract is pinned on every host.
+	if _, ok := NeedsSetupExitCode(err); !ok {
+		t.Fatalf("NeedsSetupExitCode(%v) = (_, false), want the setup refusal to map to a hold status", err)
+	} else if darwinHold := setupHoldExitCode("darwin"); darwinHold != 0 {
+		t.Fatalf("setupHoldExitCode(darwin) = %d, want 0 (the clean status launchd parks instead of respawning)", darwinHold)
 	}
 }
 

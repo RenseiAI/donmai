@@ -685,6 +685,295 @@ func TestEnsureClonesTheRemoteItsIdentityRecords(t *testing.T) {
 	}
 }
 
+// TestEnsureRefusesCredentialBearingOpaqueRemote drives the production
+// entry point with scp-like and other opaque remotes carrying
+// password-shaped userinfo ("user:password@..."). Opaque forms hash
+// verbatim, so the token would persist verbatim into the sidecar and the
+// mirror config: the remote must be refused with ErrOpaqueCredential
+// before anything is written. A bare "user@host:path" has no password
+// separator and is still served by identity (it fails later at clone time
+// only because the fixture host is unreachable — never at the refusal).
+// A password in a hierarchical URL (ssh://user:password@host/...) is not
+// opaque: canonicalization strips it, so it is pinned clean below rather
+// than refused.
+func TestEnsureRefusesCredentialBearingOpaqueRemote(t *testing.T) {
+	t.Parallel()
+	const secret = "s3cr3t-token-ABC123"
+	refused := []string{
+		"deploy:" + secret + "@forge.example:org/repo.git",
+		"user:" + secret + "@forge.example:org/repo.git",
+	}
+	for _, source := range refused {
+		store := newTestStore(t)
+		_, err := store.Ensure(context.Background(), source, "scope-a")
+		if !errors.Is(err, ErrOpaqueCredential) {
+			t.Errorf("Ensure(%q) error = %v, want ErrOpaqueCredential", source, err)
+		}
+		if err != nil && strings.Contains(err.Error(), secret) {
+			t.Errorf("refusal error = %q, must not echo the source", err.Error())
+		}
+		var leaked []string
+		_ = filepath.Walk(store.stateDir, func(sweepPath string, info os.FileInfo, err error) error { //nolint:gosec // G122: secret sweep over the test's own TempDir; no writes.
+			if err != nil || !info.Mode().IsRegular() {
+				return nil
+			}
+			data, err := os.ReadFile(sweepPath) //nolint:gosec // G304: files enumerated from the test's own TempDir walk.
+			if err == nil && strings.Contains(string(data), secret) {
+				leaked = append(leaked, sweepPath)
+			}
+			return nil
+		})
+		if len(leaked) > 0 {
+			t.Errorf("credential persisted under the state dir: %v", leaked)
+		}
+	}
+	// Hierarchical URL password forms canonicalize userinfo-free, so the
+	// password changes neither the identity nor the directory key.
+	plain := "ssh://forge.example/org/repo.git"
+	credentialed := "ssh://deploy:" + secret + "@forge.example/org/repo.git"
+	plainCanonical, plainDigest, err := CanonicalRemote(plain)
+	if err != nil {
+		t.Fatalf("CanonicalRemote(plain) error = %v", err)
+	}
+	credCanonical, credDigest, err := CanonicalRemote(credentialed)
+	if err != nil {
+		t.Fatalf("CanonicalRemote(credentialed) error = %v", err)
+	}
+	if credCanonical != plainCanonical || credDigest != plainDigest {
+		t.Errorf("ssh password changed identity: canonical %q/%q digests %q/%q", credCanonical, plainCanonical, credDigest, plainDigest)
+	}
+	if strings.Contains(credCanonical, secret) {
+		t.Errorf("canonical remote = %q, must not carry the password", credCanonical)
+	}
+}
+
+// TestResolveSourceHTTPCloneURLCarriesNoUserinfo proves the production
+// clone argv never carries http(s) userinfo: resolveSource — the single
+// function Ensure clones from — returns a userinfo-stripped clone URL
+// for http(s) sources, so a crash between clone and the origin reset
+// leaves no credential in the staging config. The credential travels
+// through the per-invocation http.extraHeader instead. file:// and
+// ssh:// userinfo is part of what those transports read, so their clone
+// URLs keep it while their canonical remotes stay stripped.
+func TestResolveSourceHTTPCloneURLCarriesNoUserinfo(t *testing.T) {
+	t.Parallel()
+	const secret = "s3cr3t-token-ABC123"
+	tests := []struct {
+		name               string
+		source             string
+		wantCloneHasSecret bool
+	}{
+		{
+			name:               "https clone URL is stripped",
+			source:             "https://user:" + secret + "@example.com/org/repo.git",
+			wantCloneHasSecret: false,
+		},
+		{
+			name:               "http clone URL is stripped",
+			source:             "http://user:" + secret + "@example.com/org/repo.git",
+			wantCloneHasSecret: false,
+		},
+		{
+			name:               "file clone URL keeps transport userinfo",
+			source:             "file://user:" + secret + "@localhost/srv/repo.git",
+			wantCloneHasSecret: true,
+		},
+		{
+			name:               "ssh clone URL keeps transport userinfo",
+			source:             "ssh://user:" + secret + "@forge.example/org/repo.git",
+			wantCloneHasSecret: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			canonical, cloneURL, _, err := resolveSource(tt.source)
+			if err != nil {
+				t.Fatalf("resolveSource() error = %v", err)
+			}
+			if strings.Contains(canonical, secret) {
+				t.Errorf("canonical remote = %q, must never carry the credential", canonical)
+			}
+			if got := strings.Contains(cloneURL, secret); got != tt.wantCloneHasSecret {
+				t.Errorf("clone URL credential present = %v, want %v (clone URL %q)", got, tt.wantCloneHasSecret, cloneURL)
+			}
+			if !tt.wantCloneHasSecret && cloneURL != canonical {
+				t.Errorf("stripped clone URL = %q, want canonical %q", cloneURL, canonical)
+			}
+		})
+	}
+}
+
+// TestTrimURLCredentials pins the clone-argv trim: http(s) userinfo is
+// stripped, while ssh/scp forms, local paths, and file:// URLs pass
+// through untouched — their userinfo is part of what those transports
+// read, not http auth material.
+func TestTrimURLCredentials(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		in        string
+		want      string
+		wantStrip bool
+	}{
+		{
+			name:      "https with userinfo is stripped",
+			in:        "https://user:s3cret@example.com/org/repo.git",
+			want:      "https://example.com/org/repo.git",
+			wantStrip: true,
+		},
+		{
+			name:      "https without userinfo unchanged",
+			in:        "https://example.com/org/repo.git",
+			want:      "https://example.com/org/repo.git",
+			wantStrip: false,
+		},
+		{
+			name:      "http with userinfo is stripped",
+			in:        "http://user:s3cret@example.com/org/repo.git",
+			want:      "http://example.com/org/repo.git",
+			wantStrip: true,
+		},
+		{
+			name:      "scp-like remote untouched",
+			in:        "deploy:s3cret@forge.example:org/repo.git",
+			want:      "deploy:s3cret@forge.example:org/repo.git",
+			wantStrip: false,
+		},
+		{
+			name:      "ssh scheme with userinfo untouched",
+			in:        "ssh://deploy:s3cret@forge.example/org/repo.git",
+			want:      "ssh://deploy:s3cret@forge.example/org/repo.git",
+			wantStrip: false,
+		},
+		{
+			name:      "local path untouched",
+			in:        "/srv/repos/repo.git",
+			want:      "/srv/repos/repo.git",
+			wantStrip: false,
+		},
+		{
+			name:      "file URL with userinfo untouched",
+			in:        "file://user:s3cret@localhost/srv/repo.git",
+			want:      "file://user:s3cret@localhost/srv/repo.git",
+			wantStrip: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, stripped := TrimURLCredentials(tt.in)
+			if got != tt.want {
+				t.Errorf("TrimURLCredentials(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if stripped != tt.wantStrip {
+				t.Errorf("TrimURLCredentials(%q) stripped = %v, want %v", tt.in, stripped, tt.wantStrip)
+			}
+		})
+	}
+}
+
+// TestEnsureBareUserOpaqueRemoteIsNotCredentialBearing pins the
+// refusal's narrowness: an scp-like remote with a bare user and no
+// password separator is still accepted by identity — it shares the
+// verbatim digest rather than failing with ErrOpaqueCredential, and only
+// fails later when the unreachable fixture host cannot be cloned.
+func TestEnsureBareUserOpaqueRemoteIsNotCredentialBearing(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+	_, err := store.Ensure(context.Background(), "deploy@forge.example:org/repo.git", "scope-a")
+	if err == nil {
+		t.Fatal("Ensure(unreachable opaque remote) error = nil, want a clone failure")
+	}
+	if errors.Is(err, ErrOpaqueCredential) {
+		t.Fatalf("Ensure(bare-user opaque remote) error = %v, want a clone failure, not the opaque-credential refusal", err)
+	}
+}
+
+// TestNewSweepsCrashLeftoverStaging is the simulated crash: a
+// credentialed clone staging sibling (.clone-*.tmp with a planted
+// credential in its git config) is left behind between clone and publish,
+// and the next keeper start (New over the same state dir) must sweep it
+// so no credential bytes remain on disk.
+func TestNewSweepsCrashLeftoverStaging(t *testing.T) {
+	t.Parallel()
+	const secret = "s3cr3t-token-ABC123"
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	// First start creates the store; the crash is simulated by planting a
+	// credentialed staging sibling the way a kill between clone and
+	// publish would leave it.
+	first, err := New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	_ = first
+	mirrors := filepath.Join(stateDir, keeperDirName, mirrorsDirName)
+	if err := os.MkdirAll(mirrors, 0o700); err != nil {
+		t.Fatalf("create mirrors dir: %v", err)
+	}
+	staging, err := os.MkdirTemp(mirrors, ".clone-*.tmp")
+	if err != nil {
+		t.Fatalf("plant crash staging: %v", err)
+	}
+	// A real interrupted clone leaves a git config recording the
+	// credentialed URL; plant the secret the same way.
+	if err := os.WriteFile(filepath.Join(staging, "config"), []byte("[remote \"origin\"]\n\turl = https://user:"+secret+"@example.com/org/repo.git\n"), 0o600); err != nil {
+		t.Fatalf("plant crash credential: %v", err)
+	}
+	evict, err := os.MkdirTemp(mirrors, ".evict-*.tmp")
+	if err != nil {
+		t.Fatalf("plant evict staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(evict, "marker"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("plant evict marker: %v", err)
+	}
+	// A live mirror beside the staging must survive the sweep.
+	srcDir, _ := newSourceRepo(t)
+	live, err := first.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure(live) error = %v", err)
+	}
+
+	// The next start sweeps the crash leftovers.
+	if _, err := New(stateDir, worktreeRoot, nil); err != nil {
+		t.Fatalf("New(after crash) error = %v", err)
+	}
+	entries, err := os.ReadDir(mirrors)
+	if err != nil {
+		t.Fatalf("read mirrors dir: %v", err)
+	}
+	for _, entry := range entries {
+		if staleStagingPrefix(entry.Name()) {
+			t.Errorf("stale staging %q survived the restart sweep", entry.Name())
+		}
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Errorf("live mirror did not survive the sweep: %v", err)
+	}
+	var leaked []string
+	_ = filepath.Walk(stateDir, func(sweepPath string, info os.FileInfo, err error) error { //nolint:gosec // G122: secret sweep over the test's own TempDir; no writes.
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(sweepPath) //nolint:gosec // G304: files enumerated from the test's own TempDir walk.
+		if err == nil && strings.Contains(string(data), secret) {
+			leaked = append(leaked, sweepPath)
+		}
+		return nil
+	})
+	if len(leaked) > 0 {
+		t.Errorf("crash credential survived the restart sweep: %v", leaked)
+	}
+}
+
 // TestEnsureRefusesUnparseableURLSource drives the production entry point
 // with a URL-shaped source that url.Parse rejects but git still clones. Its
 // verbatim form keeps the userinfo, so it must be refused before anything

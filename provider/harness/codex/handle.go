@@ -74,6 +74,11 @@ type Handle struct {
 	mcpErr       error
 
 	state *mapperState
+
+	// tail is the rollout context-notice tail start() launched, or nil
+	// when the session runs without notices. Set before the forwarder
+	// starts; the forwarder drains it on the terminal event.
+	tail *rolloutContextTail
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -112,6 +117,17 @@ func (h *Handle) SessionID() string {
 	h.idMu.RLock()
 	defer h.idMu.RUnlock()
 	return h.threadID
+}
+
+// codexHome returns the isolated home the session's rollout file lives
+// under, or "" when unknown (a unit-test handle with no provider). It is
+// the provider's own boundary home — never the ambient environment — so
+// the context-notice tail reads exactly this session's file.
+func (h *Handle) codexHome() string {
+	if h == nil || h.provider == nil || h.provider.config == nil {
+		return ""
+	}
+	return h.provider.config.home
 }
 
 // Events returns the read-only event channel. Closes after the
@@ -317,6 +333,13 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		return fmt.Errorf("turn/start: %w", err)
 	}
 
+	// Context-notice tail: the thread's rollout file carries the token_count
+	// events and compacted markers the RPC stream never surfaces. The home
+	// is the provider's own isolated home (never the ambient environment)
+	// and the thread id is the one just started or resumed above; either
+	// unknown (a unit-test handle with no provider) runs without notices.
+	h.tail = h.startContextTail(ctx)
+
 	// The forwarder is intentionally long-lived: it must survive
 	// Spawn() returning and run for the duration of the session.
 	// gosec G118 flags this; the forwarder honors ctx.Done() so the
@@ -394,6 +417,9 @@ func (h *Handle) handleNotification(n notification) bool {
 	for _, ev := range events {
 		switch ev.Kind() {
 		case agent.EventResult, agent.EventError:
+			// The turn's last token_count lands in the rollout moments
+			// before this notification; read it before Events closes.
+			h.tail.drain(h.emit)
 			if err := h.releaseMCPConfig(); err != nil {
 				h.emit(mcpCleanupErrorEvent())
 			} else {

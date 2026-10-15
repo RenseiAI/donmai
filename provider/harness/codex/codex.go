@@ -919,6 +919,9 @@ func (p *Provider) forwardRateLimitUpdates() {
 		return
 	}
 	client := p.client
+	// Global notifications have no owning thread; count them once per server,
+	// rather than fanning ignored UI/account updates out to every session.
+	ignoredState := &mapperState{}
 	client.SubscribeGlobal(func(n notification) {
 		if n.Method != "account/rateLimits/updated" {
 			// A fall-through handler replaces the client's own, which
@@ -926,6 +929,8 @@ func (p *Provider) forwardRateLimitUpdates() {
 			// does not wait on it. Keep that answer.
 			if len(n.ServerRequestID) > 0 {
 				_ = client.RespondToServerRequestWithError(n.ServerRequestID, -32601, "no handler for "+n.Method)
+			} else {
+				countIgnored(ignoredState, n.Method)
 			}
 			return
 		}

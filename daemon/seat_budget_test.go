@@ -6,6 +6,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/daemon/seatqos"
 )
 
 // TestServer_Status_SeatBudget drives the PRODUCTION status route
@@ -172,6 +173,71 @@ func TestPollItemToSessionDetail_SeatBudget(t *testing.T) {
 	mut.CPUs = 99
 	if stamped2.SeatBudget.CPUs != 4 {
 		t.Errorf("SeatBudget.CPUs = %d; want defensive copy 4", stamped2.SeatBudget.CPUs)
+	}
+}
+
+// TestServer_Status_SeatBudget_ReportsQoS drives the PRODUCTION status
+// route with a configured scheduling class and asserts the seat budget
+// block carries it verbatim alongside the posture. Reverting the status
+// route to the class-less report fails here.
+func TestServer_Status_SeatBudget_ReportsQoS(t *testing.T) {
+	_, srv, cleanup := mustStartDaemonWith(t, func(opts *Options) {
+		cfg, err := LoadConfig(opts.ConfigPath)
+		if err != nil {
+			t.Fatalf("load config: %v", err)
+		}
+		cfg.Capacity.SeatBudget = SeatBudgetConfig{CPUs: 2, Mode: "best-effort"}
+		cfg.Capacity.SeatQoS = "utility"
+		if err := WriteConfig(opts.ConfigPath, cfg); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	})
+	defer cleanup()
+	var resp afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &resp)
+	if resp.SeatBudget == nil {
+		t.Fatal("SeatBudget is nil; want the configured share with its class")
+	}
+	if resp.SeatBudget.QoS != "utility" {
+		t.Errorf("SeatBudget.QoS = %q; want utility", resp.SeatBudget.QoS)
+	}
+	if resp.SeatBudget.Mode != "best-effort" {
+		t.Errorf("SeatBudget.Mode = %q; want best-effort", resp.SeatBudget.Mode)
+	}
+}
+
+// TestServer_Status_SeatBudget_DefaultQoS pins the opt-in default on the
+// PRODUCTION status route: an unauthored class reports default, never
+// empty — status always names the class seats spawn under.
+func TestServer_Status_SeatBudget_DefaultQoS(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+	var resp afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &resp)
+	if resp.SeatBudget == nil {
+		t.Fatal("SeatBudget is nil; want mode none with the default class")
+	}
+	if resp.SeatBudget.QoS != "default" {
+		t.Errorf("SeatBudget.QoS = %q; want default", resp.SeatBudget.QoS)
+	}
+}
+
+// TestValidateSeatQoS pins the fail-closed config gate: unknown classes
+// are rejected at load, while empty and every selectable class pass.
+func TestValidateSeatQoS(t *testing.T) {
+	for _, ok := range []string{"", "default", "utility", "background", " Utility "} {
+		if err := validateSeatQoS(ok); err != nil {
+			t.Errorf("validateSeatQoS(%q) = %v; want nil", ok, err)
+		}
+	}
+	if err := validateSeatQoS("nice"); err == nil {
+		t.Error("validateSeatQoS(nice) = nil; want a rejection")
+	}
+	if got := resolveSeatQoS(""); got != seatqos.Default {
+		t.Errorf("resolveSeatQoS(%q) = %q; want default", "", got)
+	}
+	if got := resolveSeatQoS("utility"); got != seatqos.Utility {
+		t.Errorf("resolveSeatQoS(utility) = %q; want utility", got)
 	}
 }
 

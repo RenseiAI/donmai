@@ -174,6 +174,15 @@ func defaultCPUs(hostCPUs, maxSeats int) int {
 	return n
 }
 
+// SeatCPUsEnv is the seat-share knob the repository configs read. No
+// core-fanning JS tool honours a worker-count env var directly — vitest
+// reads poolOptions (config/CLI), jest reads --maxWorkers (CLI), Next.js
+// reads its config — so the seat exports its share under this one name
+// and each repo's vitest/jest/Next config derives its own limit from it
+// (falling back to the host default when unset). A knob no tool reads
+// is worse than none; this one is read by the configs that opt into it.
+const SeatCPUsEnv = "DONMAI_SEAT_CPUS"
+
 // WorkerCapEnv renders the cooperative worker caps for a seat: the
 // environment entries that keep core-fanning tools to cpus workers. Every
 // entry is a knob the named tool actually reads (see the per-key doc
@@ -183,7 +192,10 @@ func defaultCPUs(hostCPUs, maxSeats int) int {
 //
 // Keys are stable and sorted: GOMAXPROCS caps the Go runtime (go test,
 // go build); MAKEFLAGS -j caps make; CMAKE_BUILD_PARALLEL_LEVEL caps
-// cmake --build; NINJAFLAGS caps ninja; CARGO_BUILD_JOBS caps cargo.
+// cmake --build; NINJAFLAGS caps ninja; CARGO_BUILD_JOBS caps cargo;
+// UV_THREADPOOL_SIZE caps libuv's thread pool (Node file/crypto/DNS
+// work); DONMAI_SEAT_CPUS publishes the raw share for repo configs
+// (vitest/jest/Next) that derive their own worker limit from it.
 func WorkerCapEnv(cpus int) map[string]string {
 	if cpus < 1 {
 		cpus = 1
@@ -195,6 +207,8 @@ func WorkerCapEnv(cpus int) map[string]string {
 		"CMAKE_BUILD_PARALLEL_LEVEL": n,
 		"NINJAFLAGS":                 "-j" + n,
 		"CARGO_BUILD_JOBS":           n,
+		"UV_THREADPOOL_SIZE":         n,
+		SeatCPUsEnv:                  n,
 	}
 }
 

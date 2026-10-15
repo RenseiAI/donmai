@@ -73,6 +73,47 @@ func (s *Store) MirrorDir(digest string) string {
 	return filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)
 }
 
+// staleStagingPrefix names the temp-sibling prefixes the store clones,
+// evictions, and catalog writes through: a crash (or kill) between the
+// staging creation and the publish rename leaves the sibling — and any
+// credential in its git config — on disk. New sweeps them at keeper start
+// so no half-written staging outlives a restart.
+func staleStagingPrefix(name string) bool {
+	return strings.HasPrefix(name, ".clone-") ||
+		strings.HasPrefix(name, ".evict-") ||
+		strings.HasPrefix(name, ".catalog-")
+}
+
+// sweepStagingDirs removes crash-leftover staging siblings under the
+// keeper root and the mirrors directory: the clone, eviction, and catalog
+// temp prefixes the store publishes through. Only those prefixes are
+// removed; live mirror directories (64-hex digests) and the published
+// catalog are never touched. A leftover that cannot be removed is logged
+// and skipped, never fatal: the next clone renames over a free name
+// rather than reusing the leftover.
+func (s *Store) sweepStagingDirs() {
+	for _, dir := range []string{
+		filepath.Join(s.stateDir, keeperDirName, mirrorsDirName),
+		filepath.Join(s.stateDir, keeperDirName),
+	} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !staleStagingPrefix(entry.Name()) {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			if err := os.RemoveAll(path); err != nil {
+				s.logf("repo keeper: stale staging dir survived sweep")
+				continue
+			}
+			s.logf("repo keeper: swept stale staging dir")
+		}
+	}
+}
+
 // New builds a keeper Store rooted at stateDir, holding its mirrors under
 // <state-dir>/repo-keeper/mirrors/. worktreeRoot names the worktree tree
 // the mirrors will later serve: it must live on the same filesystem as
@@ -98,7 +139,12 @@ func New(stateDir, worktreeRoot string, logf func(format string, args ...any)) (
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Store{stateDir: stateDir, worktreeRoot: worktreeRoot, logf: logf}, nil
+	s := &Store{stateDir: stateDir, worktreeRoot: worktreeRoot, logf: logf}
+	// A crash (or kill) between the staging creation and the publish
+	// rename leaves the credentialed staging sibling on disk, so sweep
+	// stale staging before serving anything from this root.
+	s.sweepStagingDirs()
+	return s, nil
 }
 
 // Ensure returns the on-disk bare mirror directory for (source, scope),

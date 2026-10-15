@@ -15,6 +15,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/daemon/seatqos"
 	"github.com/RenseiAI/donmai/internal/interview"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -136,6 +137,13 @@ type SpawnerOptions struct {
 	// Returned IDs are deduplicated against owned sessions and reservations.
 	ExternalSessionIDs func() []string
 
+	// ExternalOwnedSessionIDs reports session identities held outside this
+	// spawner whose slots ExternalOccupancy ALREADY charges — per-session
+	// shims it launched, adopted or quarantined. The duplicate-accept guard
+	// refuses them; capacity admission does not count them a second time.
+	// Same locking contract as ExternalSessionIDs.
+	ExternalOwnedSessionIDs func() []string
+
 	// ShimOwns, when non-nil, is the stable ownership selector consulted before
 	// ShimSpawn or OnPreSpawn. False goes directly to the ordinary child path;
 	// true requires ShimSpawn to return a handle or error and may never silently
@@ -180,6 +188,15 @@ type SpawnerOptions struct {
 	// wires its resolved config budget here; embedders that compose
 	// their own spawner may resolve one with seatbudget.Resolve.
 	SeatBudget SeatBudget `yaml:"-" json:"-"`
+	// SeatQoS is the opt-in per-seat scheduling class applied to every
+	// session this spawner starts. Empty (or default) spawns seats
+	// exactly as before; utility or background wraps the seat worker on
+	// macOS so the seat prefers efficiency cores (utility) or runs at
+	// the lowest band (background) while the daemon itself stays at
+	// default. The daemon wires its configured class here; embedders
+	// compose the value with seatqos.Parse. Guarded by seatQoSMu beside
+	// the budget lock because SetSeatQoS swaps it while spawns read it.
+	SeatQoS string `yaml:"-" json:"-"`
 	// Stdout is where worker stdout is forwarded with a "[worker:<id>]"
 	// prefix. Defaults to os.Stdout. Set to io.Discard in tests.
 	StdoutPrefixWriter PrefixedWriter
@@ -250,8 +267,13 @@ type WorkerSpawner struct {
 	// read it unlocked, so sharing mu would either race or serialize
 	// every spawn on admission. A struct value races under -race even
 	// when both sides hold no common lock — hence the dedicated RWMutex.
-	seatBudgetMu           sync.RWMutex
-	seatBudget             SeatBudget
+	seatBudgetMu sync.RWMutex
+	seatBudget   SeatBudget
+	// seatQoSMu guards seatQoS separately from mu for the same reason
+	// the budget has its own lock: SetSeatQoS swaps it from the config
+	// watcher while AcceptWork/spawn run unlocked.
+	seatQoSMu              sync.RWMutex
+	seatQoS                string
 	sessions               map[string]*spawnedSession
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
@@ -325,6 +347,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	return &WorkerSpawner{
 		opts:                   opts,
 		seatBudget:             opts.SeatBudget,
+		seatQoS:                opts.SeatQoS,
 		sessions:               make(map[string]*spawnedSession),
 		spawnReservations:      make(map[string]struct{}),
 		sessionHistory:         make(map[string]struct{}),
@@ -666,6 +689,16 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 	return nil
 }
 
+// MaxConcurrentSessions returns the live session capacity future AcceptWork
+// decisions are admitted against. It mirrors the ceiling SetMaxConcurrentSessions
+// last installed — the constructor default until the first set — so a claim
+// gate consulting it agrees with the spawner about what "full" means.
+func (s *WorkerSpawner) MaxConcurrentSessions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opts.MaxConcurrentSessions
+}
+
 // SetSeatBudget swaps the per-seat budget future spawns apply. Seats
 // already running keep the budget they started with — like capacity, the
 // new share governs only future AcceptWork calls. The share lives behind
@@ -678,6 +711,44 @@ func (s *WorkerSpawner) SetSeatBudget(b SeatBudget) {
 	s.mu.Lock()
 	s.opts.SeatBudget = b
 	s.mu.Unlock()
+}
+
+// SetSeatQoS swaps the per-seat scheduling class future spawns apply.
+// Seats already running keep the class they started with — like the
+// budget, the new class governs only future AcceptWork calls. Invalid
+// values are rejected so a bad config can never silently downgrade to
+// default: the caller keeps the previous class and logs the refusal.
+func (s *WorkerSpawner) SetSeatQoS(raw string) error {
+	class, err := seatqos.Parse(raw)
+	if err != nil {
+		return err
+	}
+	s.seatQoSMu.Lock()
+	defer s.seatQoSMu.Unlock()
+	s.seatQoS = string(class)
+	s.mu.Lock()
+	s.opts.SeatQoS = string(class)
+	s.mu.Unlock()
+	return nil
+}
+
+// seatQoSForSpawn resolves the scheduling class one spawn applies: the
+// spawner's configured class. Empty reads as default (no wrapper) — the
+// same opt-in default the config layer promises. The fast path reads the
+// dedicated field SetSeatQoS maintains; the constructor seeds it from
+// SpawnerOptions, so the fallback below only fires for a zero-value
+// spawner no constructor built (never in production). The mu read nests
+// inside the QoS read lock: no other path takes the two locks in the
+// opposite order, so nesting here cannot deadlock.
+func (s *WorkerSpawner) seatQoSForSpawn() seatqos.Class {
+	s.seatQoSMu.RLock()
+	defer s.seatQoSMu.RUnlock()
+	if s.seatQoS != "" {
+		return seatqos.Class(s.seatQoS)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return seatqos.Class(s.opts.SeatQoS)
 }
 
 // SetProjects atomically swaps the spawner's base project allowlist used by
@@ -859,6 +930,10 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("session %q is already being started", spec.SessionID)
 	}
+	if s.externallyOwnedLocked(spec.SessionID) {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session %q is already active", spec.SessionID)
+	}
 	if active, capacity := len(s.sessions)+len(s.spawnReservations)+s.externalOccupancy()+s.externalSessionOccupancyLocked(), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
@@ -898,6 +973,20 @@ func (s *WorkerSpawner) externalOccupancy() int {
 		return n
 	}
 	return 0
+}
+
+// externallyOwnedLocked reports whether sessionID is already held outside this
+// spawner (a shim-owned session). Caller holds s.mu.
+func (s *WorkerSpawner) externallyOwnedLocked(sessionID string) bool {
+	if s.opts.ExternalOwnedSessionIDs == nil || sessionID == "" {
+		return false
+	}
+	for _, id := range s.opts.ExternalOwnedSessionIDs() {
+		if id == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *WorkerSpawner) externalSessionOccupancyLocked() int {
@@ -1234,6 +1323,11 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// budget leaves command and env exactly as before.
 	seatBudget, seatBudgetOK := s.seatBudgetForSpawn()
 	command = applySeatBudgetToCmdForBus(command, spec.SessionID, seatBudget, seatBudgetOK, seatBudgetLaunchPlacement(), seatBudgetLaunchUserScope())
+	// Per-seat scheduling class: opt-in only, macOS only. The wrapper
+	// applies to the seat worker (which inherits it into the whole
+	// seat tree); the daemon itself never runs under it. Default
+	// leaves the command exactly as the budget path left it.
+	command = wrapSeatCommandWithQoS(command, seatQoSCommandPrefix(s.seatQoSForSpawn()))
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
 	cmd.Env = applySeatBudgetToEnv(s.sessionEnv(spec, project), seatBudget, seatBudgetOK)

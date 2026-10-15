@@ -120,6 +120,16 @@ func TestComposeDependencyStoresSameManagerConflicts(t *testing.T) {
 	}
 }
 
+// dependencyPin binds one contested manager to the exact kit digest
+// the operator approved, matching how command lock bindings carry an
+// exact command identity.
+func dependencyPin(manager, kitID, digest string) LockedDependencyBinding {
+	return LockedDependencyBinding{
+		Manager: manager, SelectedKitID: kitID,
+		SelectedDigestKind: "package", SelectedDigest: digest,
+	}
+}
+
 func TestComposeDependencyStoresLockSelectsOne(t *testing.T) {
 	t.Parallel()
 	views := []ManifestView{
@@ -132,7 +142,7 @@ func TestComposeDependencyStoresLockSelectsOne(t *testing.T) {
 		Targets: []LockedCompositionTarget{{
 			Target: target,
 			Dependencies: []LockedDependencyBinding{
-				{Manager: "pnpm", SelectedKitID: "kit-b"},
+				dependencyPin("pnpm", "kit-b", storeDigestB),
 			},
 		}},
 	}
@@ -154,13 +164,109 @@ func TestComposeDependencyStoresLockSelectingMissingKitFails(t *testing.T) {
 		Targets: []LockedCompositionTarget{{
 			Target: target,
 			Dependencies: []LockedDependencyBinding{
-				{Manager: "pnpm", SelectedKitID: "kit-ghost"},
+				dependencyPin("pnpm", "kit-ghost", storeDigestA),
 			},
 		}},
 	}
 	_, err := ComposeDependencyStores(views, target, lock)
 	if !errors.Is(err, ErrCompositionLockInvalid) {
 		t.Fatalf("stale lock error = %v, want ErrCompositionLockInvalid", err)
+	}
+}
+
+// TestComposeDependencyStoresLockRefusesMovedDigest pins the core
+// requirement: a dependency binding names the exact kit digest, and the
+// lock reader refuses a binding whose kit digest moved, as command
+// bindings do. The kit still declares the manager under its same id, so
+// only the digest pin distinguishes the approval from the drift.
+func TestComposeDependencyStoresLockRefusesMovedDigest(t *testing.T) {
+	t.Parallel()
+	views := []ManifestView{
+		storeKitView("kit-a", storeDigestA, pnpmStoreView()),
+		storeKitView("kit-b", storeDigestB, pnpmStoreView()),
+	}
+	target := storeTarget()
+	lock := &CompositionLock{
+		Schema: CompositionLockSchema,
+		Targets: []LockedCompositionTarget{{
+			Target: target,
+			Dependencies: []LockedDependencyBinding{
+				dependencyPin("pnpm", "kit-b", storeDigestA),
+			},
+		}},
+	}
+	_, err := ComposeDependencyStores(views, target, lock)
+	if !errors.Is(err, ErrCompositionLockInvalid) {
+		t.Fatalf("moved-digest error = %v, want ErrCompositionLockInvalid", err)
+	}
+	for _, want := range []string{"pnpm", "kit-b"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("moved-digest error %q missing %q", err, want)
+		}
+	}
+}
+
+// TestValidateAppliedDependencyLockRefusesMovedDigest covers the second
+// reader path: a binding that resolves during selection (the sole
+// claimant carries the approved kit id) must still fail when the applied
+// lock check sees the kit digest has moved. With one entry there is no
+// conflict to force selection, so only the post-compose validation can
+// catch the drift.
+func TestValidateAppliedDependencyLockRefusesMovedDigest(t *testing.T) {
+	t.Parallel()
+	stores := []ComposedDependencyStore{{
+		Manager: "pnpm", KitID: "node-kit",
+		DigestKind: "package", Digest: storeDigestB,
+	}}
+	lock := &CompositionLock{
+		Schema: CompositionLockSchema,
+		Targets: []LockedCompositionTarget{{
+			Target: storeTarget(),
+			Dependencies: []LockedDependencyBinding{
+				dependencyPin("pnpm", "node-kit", storeDigestA),
+			},
+		}},
+	}
+	if err := validateAppliedDependencyLock(stores, storeTarget(), lock); !errors.Is(err, ErrCompositionLockInvalid) {
+		t.Fatalf("applied-lock moved-digest error = %v, want ErrCompositionLockInvalid", err)
+	}
+}
+
+// TestValidateCompositionLockRejectsUnpinnedDependencyBinding pins the
+// wire rule: a dependency binding without an exact kit digest is
+// malformed, matching command bindings that always carry an exact
+// selected identity.
+func TestValidateCompositionLockRejectsUnpinnedDependencyBinding(t *testing.T) {
+	t.Parallel()
+	for name, binding := range map[string]LockedDependencyBinding{
+		"missing digest":      {Manager: "pnpm", SelectedKitID: "kit-b", SelectedDigestKind: "package"},
+		"missing digest kind": {Manager: "pnpm", SelectedKitID: "kit-b", SelectedDigest: storeDigestB},
+		"bad digest kind": {
+			Manager: "pnpm", SelectedKitID: "kit-b",
+			SelectedDigestKind: "md5", SelectedDigest: storeDigestB,
+		},
+		"malformed digest": {
+			Manager: "pnpm", SelectedKitID: "kit-b",
+			SelectedDigestKind: "package", SelectedDigest: "not-hex",
+		},
+	} {
+		binding := binding
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			lock := &CompositionLock{
+				Schema: CompositionLockSchema,
+				Targets: []LockedCompositionTarget{{
+					Target:       storeTarget(),
+					Dependencies: []LockedDependencyBinding{binding},
+				}},
+			}
+			if err := validateCompositionLock(lock); !errors.Is(err, ErrCompositionLockInvalid) {
+				t.Fatalf("unpinned binding error = %v, want ErrCompositionLockInvalid", err)
+			}
+			if _, err := CanonicalCompositionLock(*lock); !errors.Is(err, ErrCompositionLockInvalid) {
+				t.Fatalf("canonical unpinned binding error = %v, want ErrCompositionLockInvalid", err)
+			}
+		})
 	}
 }
 
@@ -173,8 +279,8 @@ func TestComposeDependencyStoresStaleLockRowFails(t *testing.T) {
 		Targets: []LockedCompositionTarget{{
 			Target: target,
 			Dependencies: []LockedDependencyBinding{
-				{Manager: "pnpm", SelectedKitID: "node-kit"},
-				{Manager: "bun", SelectedKitID: "node-kit"},
+				dependencyPin("pnpm", "node-kit", storeDigestA),
+				dependencyPin("bun", "node-kit", storeDigestA),
 			},
 		}},
 	}

@@ -351,7 +351,7 @@ drained:
 	if len(usage) != 1 {
 		t.Fatalf("got %d usage events; want exactly 1 (the repeat must not emit)", len(usage))
 	}
-	if usage[0].InputTokens != 100 || usage[0].OutputTokens != 20 {
+	if usage[0].GenerationID != "msg-1" || usage[0].InputTokens != 100 || usage[0].OutputTokens != 20 {
 		t.Fatalf("usage event = %+v; want the transcript's usage", usage[0])
 	}
 	if terminal == nil {

@@ -396,6 +396,14 @@ grep -Fq 'publish_homebrew_cask=' "${verify_script}" || fail 'common verifier do
 grep -Fq 'GORELEASER_MAKE_LATEST' "${root_dir}/.goreleaser.yaml" || fail 'GoReleaser latest policy is not wired to the verified release policy'
 grep -Fq 'GORELEASER_PUBLISH_HOMEBREW' "${root_dir}/.goreleaser.yaml" || fail 'GoReleaser Homebrew policy is not wired to the verified release policy'
 grep -Fq 'skip_upload:' "${root_dir}/.goreleaser.yaml" || fail 'GoReleaser Homebrew publisher cannot be skipped for safe retries'
+grep -Fq 'com.apple.quarantine' "${root_dir}/.goreleaser.yaml" || fail 'Homebrew cask install hook does not clear the quarantine flag'
+ruby -ryaml - "${root_dir}/.goreleaser.yaml" <<'RUBY'
+config = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [], permitted_symbols: [], aliases: false)
+cask = config.fetch('homebrew_casks').fetch(0)
+hook = cask.fetch('hooks').fetch('post').fetch('install')
+abort 'FAIL: cask post-install hook does not clear the quarantine flag' unless hook.include?('com.apple.quarantine')
+abort 'FAIL: cask post-install hook does not target the staged binary' unless hook.include?('staged_path')
+RUBY
 grep -Fq 'runner.temp }}/goreleaser.yaml' "${root_dir}/.github/workflows/release.yml" || fail 'manual retries can fall back to an older GoReleaser publication policy'
 grep -Fq 'binary_signs:' "${root_dir}/.goreleaser.yaml" || fail 'Apple signing is not in the pre-archive binary signing pipe'
 grep -Fq 'cmd: donmai-sign-and-notarize' "${root_dir}/.goreleaser.yaml" || fail 'Apple signing does not use the staged current release script'

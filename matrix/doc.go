@@ -6,6 +6,10 @@
 // harvests the live manifests, validates every hand-authored cell against them
 // (protocol intersection, authMode subset, caps narrowing) and assembles the
 // deterministic matrix; render.go marshals the byte-stable artifacts.
+// Subagent-event bits are the exception to manifest harvesting: generation
+// executes adapter fixtures and emits per-cell/version qualification evidence.
+// BuildWithSubagentFixtures lets composing generators supply fixtures for the
+// pi deliveries they load; the bare OSS pi catalog remains unqualified.
 //
 // The generator (matrix/gen) writes the committed artifacts:
 //

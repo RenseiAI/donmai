@@ -12,11 +12,13 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 )
 
 func TestInteractiveArgs(t *testing.T) {
@@ -1024,4 +1026,69 @@ sleep 0.1`)
 			}
 		})
 	}
+}
+
+// TestInteractiveContextHandle_ForwardsAndReports pins the codex
+// interactive leg of the typed context notice: the wrapper preserves the
+// PTY surface and the terminal-cost declaration while reporting the
+// session's own home through the runner's session-scoped seam. A session
+// that reports no home runs without context notices.
+func TestInteractiveContextHandle_ForwardsAndReports(t *testing.T) {
+	inner := &ptycli.Handle{}
+	wrapped := &interactiveContextHandle{Handle: inner, home: "/tmp/codex-home-test"}
+	// A fresh ptycli handle has no live session yet; the wrapper must not
+	// invent one — it forwards whatever the inner handle reports.
+	_ = wrapped.InteractiveSession()
+	// The ptycli handle carries no TerminalCost by default: the wrapper
+	// must not invent one (the runner's wait grace keys off it).
+	if wrapped.HasTerminalCost() {
+		t.Fatal("HasTerminalCost = true for a handle with no cost hook; want false")
+	}
+	if got := wrapped.ContextUsageSidecarPath(); got != "" {
+		t.Fatalf("sidecar path = %q for the codex leg; want empty", got)
+	}
+	home, thread := wrapped.ContextUsageRollout()
+	if home != "/tmp/codex-home-test" || thread != "" {
+		t.Fatalf("rollout = (%q, %q); want (home, empty-thread)", home, thread)
+	}
+	empty := &interactiveContextHandle{}
+	if home, _ := empty.ContextUsageRollout(); home != "" {
+		t.Fatalf("homeless wrapper reported %q, want empty", home)
+	}
+	var nilHandle *interactiveContextHandle
+	if got := nilHandle.InteractiveSession(); got != nil {
+		t.Fatalf("nil handle InteractiveSession = %v; want nil", got)
+	}
+	if nilHandle.HasTerminalCost() {
+		t.Fatal("nil handle HasTerminalCost = true; want false")
+	}
+	if home, thread := nilHandle.ContextUsageRollout(); home != "" || thread != "" {
+		t.Fatalf("nil handle rollout = (%q, %q); want empties", home, thread)
+	}
+	// The seam assertions: the runner resolves and supervises through
+	// these interfaces.
+	var _ agent.InteractiveCapable = wrapped
+	var _ agent.InteractiveTerminalCostSource = wrapped
+	var _ agent.ContextUsageSourcer = wrapped
+}
+
+// TestNamedInteractiveContextHandle_ReportsItsThread pins the named-session
+// leg: once the naming flow stores the thread id, the handle reports it
+// beside the session home, so the watcher tails this session's file.
+func TestNamedInteractiveContextHandle_ReportsItsThread(t *testing.T) {
+	var current atomic.Value
+	current.Store("")
+	wrapped := &namedInteractiveContextHandle{
+		interactiveContextHandle: interactiveContextHandle{home: "/tmp/codex-home-named"},
+		thread:                   &current,
+	}
+	if _, thread := wrapped.ContextUsageRollout(); thread != "" {
+		t.Fatalf("thread = %q before naming; want empty", thread)
+	}
+	current.Store("thread-named-1")
+	home, thread := wrapped.ContextUsageRollout()
+	if home != "/tmp/codex-home-named" || thread != "thread-named-1" {
+		t.Fatalf("rollout = (%q, %q); want (home, thread-named-1)", home, thread)
+	}
+	var _ agent.ContextUsageSourcer = wrapped
 }

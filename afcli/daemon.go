@@ -465,14 +465,21 @@ func formatProcessPriorityStatus(status *afclient.DaemonProcessPriorityStatus) s
 }
 
 // formatSeatBudgetStatus renders the per-seat budget for the status table:
-// the posture with the values, or "not reported" against an older daemon.
-// A host with budgeting off reads as "none" — the honest shape, not an
-// omission an operator could misread as a missing probe.
+// the posture with the values, plus the opt-in scheduling class when it
+// is not the default, or "not reported" against an older daemon. A host
+// with budgeting off reads as "none" — the honest shape, not an omission
+// an operator could misread as a missing probe. A non-default scheduling
+// class appends even to a none budget: the class governs the spawn
+// wrapper, not the budget, so it is real with budgeting off.
 func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 	if status == nil || strings.TrimSpace(status.Mode) == "" {
 		return "not reported"
 	}
+	qos := strings.TrimSpace(status.QoS)
 	if status.Mode == "none" {
+		if qos != "" && qos != "default" {
+			return "none (seat QoS: " + qos + ")"
+		}
 		return "none"
 	}
 	value := status.Mode
@@ -481,6 +488,9 @@ func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 	}
 	if status.MemoryMB > 0 {
 		value += fmt.Sprintf(", %d MB", status.MemoryMB)
+	}
+	if qos != "" && qos != "default" {
+		value += ", seat QoS: " + qos
 	}
 	if status.Detail != "" {
 		value += " — " + status.Detail
@@ -659,6 +669,8 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 		jsonOut     bool
 		scopeUser   bool
 		scopeSystem bool
+		fix         bool
+		configPath  string
 	)
 
 	cmd := &cobra.Command{
@@ -669,6 +681,9 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 			"installed launchd plist (macOS) or systemd unit (Linux) directly and\n" +
 			"reports whether the service is registered, active, and pointing at the\n" +
 			"current host binary.\n\n" +
+			"With --fix, doctor also strips retired config keys from every daemon\n" +
+			"config file (atomic rewrite, mode preserved, backup kept) and prints\n" +
+			"one summary line.\n\n" +
 			"Exits 0 when the unit is installed and healthy, non-zero otherwise.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -680,6 +695,20 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 				scope = installer.ScopeSystem
 			}
 
+			var sweep daemonRuntime.RetiredKeySweepSummary
+			var sweepErr error
+			if fix {
+				if configPath != "" {
+					if _, err := os.Stat(configPath); err != nil {
+						return fmt.Errorf("daemon doctor: config %q: %w", configPath, err)
+					}
+				}
+				sweep, sweepErr = daemonRuntime.SweepRetiredKeys(daemonRuntime.DefaultSweepPaths(configPath))
+				if sweepErr != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: retired-key sweep: %v\n", sweepErr)
+				}
+			}
+
 			report, err := installer.Doctor(installer.DoctorOptions{Scope: scope})
 			if err != nil {
 				return fmt.Errorf("daemon doctor: %w", err)
@@ -687,9 +716,16 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 
 			out := cmd.OutOrStdout()
 			if jsonOut {
-				enc := json.NewEncoder(out)
-				enc.SetIndent("", "  ")
-				return enc.Encode(report)
+				if !fix {
+					enc := json.NewEncoder(out)
+					enc.SetIndent("", "  ")
+					return enc.Encode(report)
+				}
+				return encodeDoctorReportWithSweep(out, report, sweep)
+			}
+
+			if fix {
+				_, _ = fmt.Fprintln(out, sweep.Line())
 			}
 
 			binPath := resolveCurrentBinPath()
@@ -719,8 +755,33 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output the doctor report as JSON")
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Inspect user-scoped systemd unit (Linux, default)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Inspect system-scoped systemd unit (Linux)")
+	cmd.Flags().BoolVar(&fix, "fix", false, "Strip retired config keys from every daemon config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml; siblings are swept too)")
 
 	return cmd
+}
+
+// encodeDoctorReportWithSweep renders the doctor report as JSON with the
+// retired-key sweep outcome merged in, keeping the report's own fields at
+// the top level so existing JSON consumers keep parsing.
+func encodeDoctorReportWithSweep(out io.Writer, report installer.DoctorReport, sweep daemonRuntime.RetiredKeySweepSummary) error {
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	doc["retiredKeySweep"] = map[string]any{
+		"filesChecked": len(sweep.Files),
+		"filesCleaned": sweep.FilesCleaned(),
+		"keysRemoved":  sweep.KeysRemoved(),
+		"summary":      sweep.Line(),
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(doc)
 }
 
 // resolveCurrentBinPath returns the absolute path of the currently running
@@ -794,23 +855,40 @@ func newDaemonResumeCmd(factory daemonClientFactory) *cobra.Command {
 
 func newDaemonUpdateCmd(factory daemonClientFactory) *cobra.Command {
 	var (
-		port int
-		host string
+		port       int
+		host       string
+		configPath string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "Trigger a manual daemon update check",
 		Long: "Prompt the daemon to check for a new binary version immediately.\n" +
-			"The daemon drains in-flight work before restarting if an update is available.",
+			"The daemon drains in-flight work before restarting if an update is available.\n\n" +
+			"The upgrade path also strips retired config keys from every daemon config\n" +
+			"file (atomic rewrite, mode preserved, backup kept) and prints one\n" +
+			"summary line before contacting the daemon.",
 		SilenceUsage: true,
-		RunE: daemonActionRunE("update", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
-			return c.Update()
-		}),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if configPath != "" {
+				if _, err := os.Stat(configPath); err != nil {
+					return fmt.Errorf("daemon update: config %q: %w", configPath, err)
+				}
+			}
+			summary, sweepErr := daemonRuntime.SweepRetiredKeys(daemonRuntime.DefaultSweepPaths(configPath))
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), summary.Line())
+			if sweepErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: retired-key sweep: %v\n", sweepErr)
+			}
+			return daemonActionRunE("update", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
+				return c.Update()
+			})(cmd, nil)
+		},
 	}
 
 	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
 	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml; siblings are swept too)")
 
 	return cmd
 }

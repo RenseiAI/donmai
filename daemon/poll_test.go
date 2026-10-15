@@ -2288,7 +2288,7 @@ func TestPollResponse_DecodesDeliveryPolicy(t *testing.T) {
 		"work": [{
 			"sessionId": "delivery-sess-1",
 			"workType": "development",
-			"delivery": {"allowDraft": true, "allowMergeCommits": true}
+			"delivery": {"allowDraft": true, "allowMergeCommits": true, "allowCleanMerge": true}
 		}, {
 			"sessionId": "delivery-sess-2",
 			"workType": "development"
@@ -2303,8 +2303,8 @@ func TestPollResponse_DecodesDeliveryPolicy(t *testing.T) {
 		t.Fatalf("Work len = %d, want 2", len(resp.Work))
 	}
 	got := resp.Work[0].Delivery
-	if got == nil || !got.AllowDraft || !got.AllowMergeCommits {
-		t.Errorf("Delivery = %+v; want both flags set", got)
+	if got == nil || !got.AllowDraft || !got.AllowMergeCommits || !got.AllowCleanMerge {
+		t.Errorf("Delivery = %+v; want all flags set", got)
 	}
 	if resp.Work[1].Delivery != nil {
 		t.Errorf("Delivery = %+v; want nil when absent", resp.Work[1].Delivery)
@@ -2319,11 +2319,11 @@ func TestPollItemToSessionDetail_DeliveryPolicyForwarded(t *testing.T) {
 	t.Run("populated", func(t *testing.T) {
 		item := PollWorkItem{
 			SessionID: "sess-delivery",
-			Delivery:  &PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true},
+			Delivery:  &PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true, AllowCleanMerge: true},
 		}
 		detail := PollItemToSessionDetail(item, nil, "", "", "")
-		if detail.Delivery == nil || !detail.Delivery.AllowDraft || !detail.Delivery.AllowMergeCommits {
-			t.Errorf("Delivery = %+v; want both flags set", detail.Delivery)
+		if detail.Delivery == nil || !detail.Delivery.AllowDraft || !detail.Delivery.AllowMergeCommits || !detail.Delivery.AllowCleanMerge {
+			t.Errorf("Delivery = %+v; want all flags set", detail.Delivery)
 		}
 	})
 	t.Run("absent — omitted", func(t *testing.T) {

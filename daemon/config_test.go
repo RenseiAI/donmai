@@ -1209,7 +1209,7 @@ extraEmbeddingKey:
 }
 
 // daemonSlogWarningCapture holds the log output emitted through the default
-// slog logger while a test runs. warnIfRetiredCloneStrategyPresent logs via
+// slog logger while a test runs. warnOnceRetiredCloneStrategy logs via
 // the package-level slog.Warn, so tests swap the default handler.
 type daemonSlogWarningCapture struct {
 	buf *bytes.Buffer
@@ -1222,9 +1222,12 @@ func (c *daemonSlogWarningCapture) count() int {
 }
 
 // captureDaemonSlogWarnings swaps the default slog logger for a text handler
-// over a buffer and restores it when the test ends.
+// over a buffer and restores it when the test ends. It also re-arms the
+// once-per-process retired-key notice so each test observes the emission
+// in isolation from load order.
 func captureDaemonSlogWarnings(t *testing.T) *daemonSlogWarningCapture {
 	t.Helper()
+	ResetRetiredCloneStrategyWarningForTest()
 	capture := &daemonSlogWarningCapture{buf: &bytes.Buffer{}}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(capture.buf, nil)))
@@ -1236,8 +1239,8 @@ func captureDaemonSlogWarnings(t *testing.T) *daemonSlogWarningCapture {
 // daemon-side retirement test for the dead per-repository clone override: a
 // file that still carries the key on many entries loads successfully, the
 // value is ignored (the typed schema no longer models it), the writer never
-// emits it, and exactly one deprecation warning is logged per load no matter
-// how many entries carry the key.
+// emits it, and exactly one deprecation warning is logged per process no matter
+// how many entries carry the key or how often the file is loaded.
 func TestLoadConfig_RetiredCloneStrategyKeyLoadsWithOneWarning(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
@@ -1348,6 +1351,64 @@ autoUpdate:
 	}
 	if got := warnings.count(); got != 0 {
 		t.Errorf("warnings = %d, want 0", got)
+	}
+}
+
+// TestLoadConfig_RetiredCloneStrategyWarnsOncePerProcess proves the
+// deprecation notice fires at most once per process no matter how many
+// times the config is loaded, and that the single emission names the file
+// and the count of affected entries.
+func TestLoadConfig_RetiredCloneStrategyWarnsOncePerProcess(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: donmai.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+projects:
+  - id: one
+    repository: github.com/foo/one
+    cloneStrategy: shallow
+  - id: two
+    repository: github.com/foo/two
+    cloneStrategy: full
+repositories:
+  - id: repo-one
+    projectId: one
+    source: github.com/foo/one
+    cloneStrategy: shallow
+orchestrator:
+  url: https://platform.example.com
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureDaemonSlogWarnings(t)
+	for i := 0; i < 5; i++ {
+		if _, err := LoadConfig(path); err != nil {
+			t.Fatalf("LoadConfig #%d: %v", i, err)
+		}
+	}
+	if got := warnings.count(); got != 1 {
+		t.Fatalf("deprecation warnings across 5 loads = %d, want exactly 1", got)
+	}
+	text := warnings.text()
+	if !strings.Contains(text, path) {
+		t.Errorf("warning should name the file %q, got:\n%s", path, text)
+	}
+	if !strings.Contains(text, "entries=3") {
+		t.Errorf("warning should report the entry count (entries=3), got:\n%s", text)
 	}
 }
 

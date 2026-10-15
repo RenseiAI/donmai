@@ -20,8 +20,9 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -40,8 +41,9 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "stable",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -59,8 +61,9 @@
       "nativeJsonMode": false,
       "structuredVia": "spawn-collect",
       "legacyProviderId": "claude",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -79,8 +82,9 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "codex",
@@ -99,8 +103,9 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "codex",
@@ -119,8 +124,9 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "codex",
@@ -138,8 +144,9 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": "codex",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "gemini-direct",
@@ -158,8 +165,9 @@
       "nativeJsonMode": true,
       "structuredVia": "response-schema",
       "legacyProviderId": "gemini",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "gemini-direct",
@@ -178,8 +186,9 @@
       "nativeJsonMode": true,
       "structuredVia": "response-schema",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "ollama",
@@ -197,8 +206,9 @@
       "nativeJsonMode": true,
       "structuredVia": "format-json",
       "legacyProviderId": "ollama",
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -217,7 +227,8 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -236,8 +247,13 @@
       "nativeJsonMode": true,
       "structuredVia": "json-schema",
       "legacyProviderId": "opencode",
+      "provingLanes": [
+        "TestOpenCodeHarnessSmoke_RealBinary_SpawnEventStreamTerminal",
+        "TestOpenCodeHarnessSmoke_RealBinary_Teardown"
+      ],
       "stability": "beta",
-      "smoked": true
+      "smoked": true,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -257,7 +273,8 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": true
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "pi",
@@ -277,7 +294,8 @@
       "structuredVia": "spawn-collect",
       "legacyProviderId": "pi",
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "pi",
@@ -297,7 +315,8 @@
       "structuredVia": "spawn-collect",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "stub",
@@ -315,8 +334,12 @@
       "nativeJsonMode": true,
       "structuredVia": "stub",
       "legacyProviderId": "stub",
+      "provingLanes": [
+        "TestSiblingContextReposSmoke"
+      ],
       "stability": "stable",
-      "smoked": true
+      "smoked": true,
+      "emitsSubagentEvents": false
     }
   ],
   "denylist": [],
@@ -390,6 +413,48 @@
       "minVersion": "0.80.10",
       "pinnedVersion": "0.80.10",
       "verifiedAgainst": "0.80.10"
+    }
+  ],
+  "subagentQualification": [
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "bedrock"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "direct"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "oauth-cli"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "vertex"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
     }
   ]
 }

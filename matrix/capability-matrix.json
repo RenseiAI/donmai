@@ -26,6 +26,7 @@
           "session-root-v1"
         ],
         "noticeDelivery": "hook",
+        "contextUsageSource": "statusline-sidecar",
         "drives": [
           "anthropic-messages"
         ],
@@ -175,6 +176,7 @@
         ],
         "repositoryAuthorityEnforcement": "isolated-read-only-v1",
         "noticeDelivery": "mcp-rpc",
+        "contextUsageSource": "rollout-token-count",
         "drives": [
           "openai-chat",
           "openai-responses"
@@ -421,6 +423,106 @@
       ]
     },
     {
+      "name": "muse",
+      "humanLabel": "Muse",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": true,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": false,
+        "subagents": false,
+        "parentToolUseId": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "muse",
+        "streamingTransport": "none",
+        "interactivePty": false,
+        "multiRepositoryWorkareaProtocols": [
+          "session-root-v1"
+        ],
+        "repositoryAuthorityEnforcement": "isolated-read-only-v1",
+        "noticeDelivery": "mcp-rpc",
+        "contextUsageSource": "muse-token-usage",
+        "drives": [
+          "muse-msp"
+        ],
+        "drivesHosts": [
+          "direct",
+          "oauth-cli"
+        ],
+        "transport": "subprocess-jsonrpc"
+      },
+      "drives": [
+        "muse-msp"
+      ],
+      "drivesHosts": [
+        "direct",
+        "oauth-cli"
+      ],
+      "promptDelivery": [
+        {
+          "id": "muse/headless/serve-leading-text-v1",
+          "mode": "autonomous",
+          "systemDelivery": "muse_leading_text_part",
+          "baseAppendDelivery": "muse_leading_text_part",
+          "baseReplaceDelivery": "muse_leading_text_part",
+          "contextDelivery": "muse_turn_input",
+          "userDelivery": "muse_turn_input",
+          "amendmentDelivery": "muse_turn_steer_input"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "muse/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "muse_session_mcp",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "muse_approval_bridge",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
+        }
+      ]
+    },
+    {
       "name": "ollama",
       "humanLabel": "Ollama (local)",
       "family": "agent-runtime",
@@ -516,7 +618,7 @@
         "tools": false,
         "mcp": true,
         "allowedToolsList": true,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -626,6 +728,7 @@
         "streamingTransport": "ndjson",
         "interactivePty": true,
         "noticeDelivery": "rpc-steer",
+        "contextUsageSource": "rpc-usage",
         "drives": [
           "anthropic-messages",
           "gemini-generate",
@@ -845,7 +948,7 @@
         "tools": true,
         "mcp": true,
         "allowedToolsList": true,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -1115,19 +1218,6 @@
           ]
         },
         {
-          "host": "oauth-cli",
-          "protocol": "antigravity-oauth",
-          "authModes": [
-            "host-session",
-            "local"
-          ],
-          "bringsOwnAuth": true,
-          "needsApiKey": false,
-          "costModel": "host-subscription",
-          "baseUrlTmpl": "",
-          "envKeys": []
-        },
-        {
           "host": "local",
           "protocol": "openai-chat",
           "authModes": [
@@ -1325,8 +1415,9 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -1345,8 +1436,9 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "stable",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -1364,8 +1456,9 @@
       "nativeJsonMode": false,
       "structuredVia": "spawn-collect",
       "legacyProviderId": "claude",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "claude-code",
@@ -1384,8 +1477,9 @@
       "nativeJsonMode": false,
       "structuredVia": "forced-tool",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": true
     },
     {
       "harness": "codex",
@@ -1404,8 +1498,9 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "codex",
@@ -1424,8 +1519,9 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "codex",
@@ -1443,8 +1539,9 @@
       "nativeJsonMode": true,
       "structuredVia": "output-schema",
       "legacyProviderId": "codex",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "gemini-direct",
@@ -1463,8 +1560,9 @@
       "nativeJsonMode": true,
       "structuredVia": "response-schema",
       "legacyProviderId": "gemini",
-      "stability": "stable",
-      "smoked": true
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "gemini-direct",
@@ -1483,8 +1581,9 @@
       "nativeJsonMode": true,
       "structuredVia": "response-schema",
       "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "ollama",
@@ -1502,8 +1601,9 @@
       "nativeJsonMode": true,
       "structuredVia": "format-json",
       "legacyProviderId": "ollama",
-      "stability": "beta",
-      "smoked": false
+      "stability": "experimental",
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -1522,7 +1622,8 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -1541,8 +1642,13 @@
       "nativeJsonMode": true,
       "structuredVia": "json-schema",
       "legacyProviderId": "opencode",
+      "provingLanes": [
+        "TestOpenCodeHarnessSmoke_RealBinary_SpawnEventStreamTerminal",
+        "TestOpenCodeHarnessSmoke_RealBinary_Teardown"
+      ],
       "stability": "beta",
-      "smoked": true
+      "smoked": true,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "opencode",
@@ -1562,7 +1668,8 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": true
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "pi",
@@ -1582,7 +1689,8 @@
       "structuredVia": "spawn-collect",
       "legacyProviderId": "pi",
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "pi",
@@ -1602,7 +1710,8 @@
       "structuredVia": "spawn-collect",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": false,
+      "emitsSubagentEvents": false
     },
     {
       "harness": "stub",
@@ -1620,8 +1729,12 @@
       "nativeJsonMode": true,
       "structuredVia": "stub",
       "legacyProviderId": "stub",
+      "provingLanes": [
+        "TestSiblingContextReposSmoke"
+      ],
       "stability": "stable",
-      "smoked": true
+      "smoked": true,
+      "emitsSubagentEvents": false
     }
   ],
   "denylist": [],
@@ -1742,6 +1855,12 @@
       "resumeQualified": false
     },
     {
+      "harness": "muse",
+      "adapterVersion": "muse/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
       "harness": "ollama",
       "adapterVersion": "ollama/ollama-chat/tool-lifecycle-v1",
       "mode": "autonomous",
@@ -1782,6 +1901,48 @@
       "adapterVersion": "stub/tool-lifecycle-v1",
       "mode": "autonomous",
       "resumeQualified": false
+    }
+  ],
+  "subagentQualification": [
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "bedrock"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "direct"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "oauth-cli"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "vertex"
+      },
+      "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
+      "mode": "autonomous",
+      "emitsSubagentEvents": true
     }
   ]
 }
