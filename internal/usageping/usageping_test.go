@@ -55,8 +55,9 @@ func TestBuild_DisabledSendsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, consent := range []Consent{
-		{},                                       // everything off
-		{Enabled: false, InstallationID: id},     // explicitly off
+		{},                                   // everything off
+		{Enabled: false, InstallationID: id}, // explicitly off
+		{Enabled: false, InstallationID: id, Endpoint: "https://example.invalid/ping"}, // off but otherwise complete
 		{Enabled: true},                          // on but no id
 		{Enabled: true, InstallationID: "bogus"}, // on but bad id
 		{Enabled: true, InstallationID: id},      // on, id, but no endpoint

@@ -98,6 +98,73 @@ func TestRunSetupWizard_UsagePingOptInMintsID(t *testing.T) {
 	}
 }
 
+func TestRunSetupWizard_UsagePingOptInEmptyEndpointStaysInert(t *testing.T) {
+	tru := true
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	var out bytes.Buffer
+	// The prompt says an empty endpoint disables sending: opting in
+	// with no endpoint records consent with a minted id but keeps the
+	// scheduler inert instead of failing setup.
+	cfg, err := RunSetupWizard(WizardOptions{
+		ConfigPath:      path,
+		Stdin:           strings.NewReader(usagePingAnswers("y", "")),
+		Stdout:          &out,
+		IsTTY:           &tru,
+		CPUCount:        4,
+		MemoryMB:        8192,
+		DetectGitRemote: func() string { return "" },
+	})
+	if err != nil {
+		t.Fatalf("RunSetupWizard: %v", err)
+	}
+	if !cfg.UsagePing.Enabled {
+		t.Fatal("opt-in answer left ping disabled")
+	}
+	if !usagePingIDValidForTest(cfg.UsagePing.InstallationID) {
+		t.Fatalf("installation id not random hex: %q", cfg.UsagePing.InstallationID)
+	}
+	if cfg.UsagePing.Endpoint != "" {
+		t.Fatalf("endpoint = %q, want empty", cfg.UsagePing.Endpoint)
+	}
+	if cfg.UsagePingEnabled() {
+		t.Fatal("enabled-without-endpoint ping reports enabled")
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.UsagePing != cfg.UsagePing {
+		t.Fatalf("written ping = %+v, want %+v", loaded.UsagePing, cfg.UsagePing)
+	}
+}
+
+func TestRunSetupWizard_UsagePingOptOutNamesClearedEndpoint(t *testing.T) {
+	tru := true
+	existing := DefaultConfig()
+	existing.UsagePing = UsagePingConfig{Endpoint: "https://example.invalid/usage"}
+	var out bytes.Buffer
+	// An endpoint-only record dropped by answering "no" is surfaced,
+	// so the operator knows a later opt-in needs the URL again.
+	cfg, err := RunSetupWizard(WizardOptions{
+		Existing:        existing,
+		Stdin:           strings.NewReader(usagePingAnswers("n")),
+		Stdout:          &out,
+		IsTTY:           &tru,
+		CPUCount:        4,
+		MemoryMB:        8192,
+		DetectGitRemote: func() string { return "" },
+	})
+	if err != nil {
+		t.Fatalf("RunSetupWizard: %v", err)
+	}
+	if cfg.UsagePing != (UsagePingConfig{}) {
+		t.Fatalf("opt-out kept state: %+v", cfg.UsagePing)
+	}
+	if !strings.Contains(out.String(), "Previously configured usage-count endpoint cleared.") {
+		t.Fatalf("opt-out did not name the dropped endpoint:\n%s", out.String())
+	}
+}
+
 func TestRunSetupWizard_UsagePingRejectsNonHTTPS(t *testing.T) {
 	tru := true
 	path := filepath.Join(t.TempDir(), "daemon.yaml")
@@ -174,8 +241,8 @@ func TestValidateUsagePing(t *testing.T) {
 	if err := validateUsagePing(UsagePingConfig{Enabled: true, InstallationID: "bogus", Endpoint: "https://example.invalid"}); err == nil {
 		t.Fatal("bad id accepted")
 	}
-	if err := validateUsagePing(UsagePingConfig{Enabled: true, InstallationID: "0123456789abcdef0123456789abcdef"}); err == nil {
-		t.Fatal("missing endpoint accepted")
+	if err := validateUsagePing(UsagePingConfig{Enabled: true, InstallationID: "0123456789abcdef0123456789abcdef"}); err != nil {
+		t.Fatalf("enabled with empty endpoint rejected: %v", err)
 	}
 	if err := validateUsagePing(UsagePingConfig{Enabled: true, InstallationID: "0123456789abcdef0123456789abcdef", Endpoint: "http://example.invalid"}); err == nil {
 		t.Fatal("non-https endpoint accepted")

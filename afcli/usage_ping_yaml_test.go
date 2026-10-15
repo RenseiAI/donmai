@@ -72,6 +72,30 @@ func TestApplyUsagePingSet_EnableMintsID(t *testing.T) {
 	}
 }
 
+func TestApplyUsagePingSet_EnableReplacesNonMappingBlock(t *testing.T) {
+	// A hand edit may leave `usagePing` as a scalar: enabling must
+	// converge on a fresh block (backing the old value up) instead of
+	// erroring the whole set.
+	path := writeMinimalDaemonYAML(t, "machine:\n  id: test\nusagePing: \"yes\"\n")
+	if _, err := applyUsagePingSet(path, "usagePing.enabled", "1"); err != nil {
+		t.Fatalf("applyUsagePingSet: %v", err)
+	}
+	block := readUsagePingBlock(t, path)
+	if block["enabled"] != "true" {
+		t.Fatalf("enabled = %q", block["enabled"])
+	}
+	if !validUsagePingID(block["installationId"]) {
+		t.Fatalf("installationId = %q", block["installationId"])
+	}
+	backup, err := os.ReadFile(path + ".usageping.bak")
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if !strings.Contains(string(backup), "yes") {
+		t.Fatalf("backup lost the replaced value:\n%s", backup)
+	}
+}
+
 func TestApplyUsagePingSet_DisableClearsBlock(t *testing.T) {
 	path := writeMinimalDaemonYAML(t, "machine:\n  id: test\nusagePing:\n  enabled: true\n  installationId: 0123456789abcdef0123456789abcdef\n  endpoint: https://example.invalid/usage\n")
 	msg, err := applyUsagePingSet(path, "usagePing.enabled", "0")

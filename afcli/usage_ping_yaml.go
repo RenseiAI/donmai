@@ -81,7 +81,30 @@ func writeUsagePingField(path, field, value string) error {
 		)
 	}
 	if block.Kind != yaml.MappingNode {
-		return fmt.Errorf("daemon config: usagePing block is not a mapping")
+		// A hand edit may leave `usagePing` as a scalar or sequence
+		// (e.g. `usagePing: "yes"`). Carry the replaceable value
+		// aside to a sibling backup and converge on a fresh block so
+		// the operator can still opt in without hand-editing the file.
+		// An unreadable backup fails the set loudly rather than
+		// destroying unknown state.
+		backup := path + ".usageping.bak"
+		raw, err := yaml.Marshal(block)
+		if err != nil {
+			return fmt.Errorf("daemon config: usagePing block is not a mapping")
+		}
+		if err := os.WriteFile(backup, raw, 0o600); err != nil {
+			return fmt.Errorf("daemon config: usagePing block is not a mapping")
+		}
+		for i := 0; i+1 < len(doc.Content); i += 2 {
+			if doc.Content[i].Kind == yaml.ScalarNode && doc.Content[i].Value == "usagePing" {
+				doc.Content[i+1] = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+				block = doc.Content[i+1]
+				break
+			}
+		}
+		if block.Kind != yaml.MappingNode {
+			return fmt.Errorf("daemon config: usagePing block is not a mapping")
+		}
 	}
 	if value == "" {
 		deleteUsagePingKey(block, field)

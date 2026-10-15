@@ -81,7 +81,11 @@ func DefaultUsagePingStatePath() string {
 }
 
 // validateUsagePing enforces the consent invariants: a valid random id
-// and an https endpoint when enabled; nothing required when disabled.
+// when enabled, and an https endpoint when one is configured. Enabled
+// with an empty endpoint is valid-but-inert: the setup prompt and the
+// config reference both promise that empty disables sending, and the
+// scheduler stays inert via UsagePingEnabled. Consent alone never
+// selects a destination.
 func validateUsagePing(u UsagePingConfig) error {
 	if !u.Enabled {
 		return nil
@@ -91,7 +95,7 @@ func validateUsagePing(u UsagePingConfig) error {
 	}
 	endpoint := strings.TrimSpace(u.Endpoint)
 	if endpoint == "" {
-		return fmt.Errorf("usagePing.endpoint is required when usagePing is enabled")
+		return nil
 	}
 	if !strings.HasPrefix(endpoint, "https://") {
 		return fmt.Errorf("usagePing.endpoint must be https")

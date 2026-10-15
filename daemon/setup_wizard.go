@@ -430,11 +430,19 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			if endpoint != "" && !strings.HasPrefix(endpoint, "https://") {
 				return nil, errors.New("usage-count endpoint must be https")
 			}
+			if endpoint == "" {
+				wln("  No endpoint configured: consent is recorded but no ping will be sent.")
+			}
 			usagePing = UsagePingConfig{Enabled: true, InstallationID: id, Endpoint: endpoint}
 		} else {
 			// Opting out clears the id and the endpoint: a disabled ping
 			// keeps no identifier and no destination at all, and
-			// re-enabling mints a fresh one.
+			// re-enabling mints a fresh one. A previously configured
+			// endpoint-only record is dropped with notice so the
+			// operator knows a later opt-in needs the URL again.
+			if strings.TrimSpace(usagePing.Endpoint) != "" {
+				wln("  Previously configured usage-count endpoint cleared.")
+			}
 			usagePing = UsagePingConfig{}
 		}
 	}
