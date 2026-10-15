@@ -133,15 +133,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// mechanism. Bumped tool-lifecycle-v1 -> v2 per the
 				// adapter-version rule: the declared surface moved, so a
 				// receipt pinned to v1 denies rather than silently acquiring
-				// the new claim. MCPToolPolicyDelivery stays Unsupported:
-				// MCPToolNames are not merged into the interactive
-				// --allowedTools flag, and PermissionConfigDelivery stays
-				// Unsupported: the CLI exposes no permission-config grammar
-				// on either lane.
+				// the new claim. The MCP name filter rides the same merge
+				// the headless lane uses (MCPToolNames into --allowedTools),
+				// so MCPToolPolicyDelivery matches headless too; only
+				// PermissionConfigDelivery stays Unsupported: the CLI exposes
+				// no permission-config grammar on either lane.
 				ID: "claude-code/interactive/tool-lifecycle-v2", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryClaudeMCPConfig,
 				NativeToolPolicyDelivery: agent.ToolDeliveryClaudeCLIAllowDeny, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
-				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				MCPToolPolicyDelivery: agent.ToolDeliveryClaudeCLIAllowDeny, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
 				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
 				CleanupDelivery:    agent.ToolDeliveryHandleCleanup,

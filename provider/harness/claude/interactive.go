@@ -449,12 +449,13 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// reaches a headless run of the same Spec. The REPL honors --allowedTools
 	// / --disallowedTools exactly as the headless CLI does (same permission
 	// context; the REPL's own permission panel renders the stamped entries),
-	// so this mapping is a pure pass-through of the CLI's native grammar:
-	// MCPToolNames are NOT merged here — the interactive profile declares no
-	// MCP tool-policy delivery, and that requirement stays recorded, not fatal,
-	// only where the caller marked the surface optional.
+	// so this mapping is a pure pass-through of the CLI's native grammar,
+	// including the MCPToolNames merge into --allowedTools: the interactive
+	// profile declares the same MCP tool-policy delivery as headless, and a
+	// name filter stamped for one lane must reach the other.
 	allowed := make([]string, 0)
 	allowed = append(allowed, spec.AllowedTools...)
+	allowed = append(allowed, spec.MCPToolNames...)
 	allowed = dedupAndSort(allowed)
 	if len(allowed) > 0 {
 		argv = append(argv, "--allowedTools", strings.Join(allowed, ","))

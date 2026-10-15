@@ -1423,6 +1423,8 @@ func TestToolLifecycleClaudeInteractiveAllowedDisallowedToolsAdmitNatively(t *te
 		Interactive:     &agent.InteractiveSpec{},
 		AllowedTools:    []string{"Read"},
 		DisallowedTools: []string{"Bash"},
+		MCPServers:      []agent.MCPServerConfig{{Name: "tools", Command: "mcp-tools"}},
+		MCPToolNames:    []string{"mcp__tools__read"},
 	}
 	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeHumanControlled))
 	if err != nil {
@@ -1437,6 +1439,7 @@ func TestToolLifecycleClaudeInteractiveAllowedDisallowedToolsAdmitNatively(t *te
 	wantChannels := map[agent.ToolLifecycleChannel]bool{
 		agent.ToolChannelAllowedTools:    false,
 		agent.ToolChannelDisallowedTools: false,
+		agent.ToolChannelMCPToolNames:    false,
 	}
 	for _, entry := range receipt.Entries {
 		if _, ok := wantChannels[entry.Channel]; !ok {

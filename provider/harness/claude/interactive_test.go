@@ -431,6 +431,28 @@ func TestInteractiveArgs_ToolPolicyMatchesHeadless(t *testing.T) {
 			t.Errorf("disallowedTools divergence: interactive=%q headless=%q", gotDeny, wantDeny)
 		}
 	})
+
+	t.Run("mcp tool names merge into allowedTools on both lanes", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it", AllowedTools: []string{"Read"}, MCPToolNames: []string{"mcp__tools__read"}}
+
+		headless, _ := buildArgs(spec, "", "", "")
+		wantAllow, ok := flagValueOf(headless, "--allowedTools")
+		if !ok {
+			t.Fatalf("headless buildArgs dropped --allowedTools for an MCP-name spec: %q", headless)
+		}
+		if !strings.Contains(wantAllow, "mcp__tools__read") {
+			t.Fatalf("headless --allowedTools missing the MCP tool name: %q", wantAllow)
+		}
+
+		gotAllow, ok := flagValueOf(interactiveArgs(spec), "--allowedTools")
+		if !ok {
+			t.Fatalf("interactiveArgs dropped --allowedTools for an MCP-name spec")
+		}
+		if gotAllow != wantAllow {
+			t.Errorf("allowedTools divergence: interactive=%q headless=%q", gotAllow, wantAllow)
+		}
+	})
 }
 
 // TestSpawn_Interactive_ToolPolicyReachesChildArgv is the load-bearing proof
@@ -450,6 +472,7 @@ func TestSpawn_Interactive_ToolPolicyReachesChildArgv(t *testing.T) {
 		Interactive:     &agent.InteractiveSpec{Cols: 80, Rows: 24},
 		AllowedTools:    []string{"Read"},
 		DisallowedTools: []string{"Bash"},
+		MCPToolNames:    []string{"mcp__tools__read"},
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -473,8 +496,8 @@ exited:
 		t.Fatalf("read echoed argv: %v", err)
 	}
 	argv := string(body)
-	if !strings.Contains(argv, "--allowedTools Read") {
-		t.Errorf("child argv missing the stamped allowed-tools list; got:\n%s", argv)
+	if !strings.Contains(argv, "--allowedTools") || !strings.Contains(argv, "Read") || !strings.Contains(argv, "mcp__tools__read") {
+		t.Errorf("child argv missing the stamped allowed-tools list with the MCP tool name; got:\n%s", argv)
 	}
 	if !strings.Contains(argv, "--disallowedTools Bash") {
 		t.Errorf("child argv missing the stamped disallowed-tools list; got:\n%s", argv)
