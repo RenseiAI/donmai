@@ -87,7 +87,7 @@ func interactiveInitialPromptLimit(manifest agent.HarnessManifest) int {
 	if profile, ok := manifest.PromptProfile(agent.PromptModeHumanControlled); ok {
 		switch profile.UserDelivery {
 		case agent.PromptDeliveryClaudePTYSeed, agent.PromptDeliveryCodexPTYSeed,
-			agent.PromptDeliveryPiPTYSeed:
+			agent.PromptDeliveryPiPTYSeed, agent.PromptDeliveryMusePTYSeed:
 			return maxArgvSeedPromptBytes
 		}
 	}
