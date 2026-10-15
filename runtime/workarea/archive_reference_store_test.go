@@ -110,6 +110,36 @@ func TestRecordArchiveReferenceFailsClosedOnUnknownSchema(t *testing.T) {
 	}
 }
 
+func TestAcquireReplayPreservesRecordedReference(t *testing.T) {
+	t.Parallel()
+	store := newArchiveReferenceStore(t, time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC))
+	root := t.TempDir()
+	spec := acquireSpec(root, sessionA, resultA, workareaA)
+	lease, err := store.Acquire(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := workarea.TerminalArchiveReference{
+		SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: lease.WorkareaID,
+		ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SessionID:     lease.SessionID, WorkareaID: lease.WorkareaID,
+		TerminalResultID: lease.TerminalResultID,
+		CommittedAt:      time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
+	}
+	if _, err := store.RecordArchiveReference(context.Background(), lease.LeaseID, reference); err != nil {
+		t.Fatal(err)
+	}
+	// Idempotent re-acquire replays the recorded reference: this is the
+	// durable precondition the runner's status-prepare carry observes.
+	replayed, err := store.Acquire(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ArchiveReference == nil || !replayed.ArchiveReference.IdentityEqual(reference) {
+		t.Fatalf("re-acquired lease lost the reference: %+v", replayed.ArchiveReference)
+	}
+}
+
 func newArchiveReferenceStore(t *testing.T, now time.Time) *workarea.LeaseStore {
 	t.Helper()
 	clock := newTestClock()

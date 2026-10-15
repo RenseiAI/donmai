@@ -91,6 +91,22 @@ func TestTerminalArchiveReferenceIdentityEquality(t *testing.T) {
 	}
 }
 
+func TestTerminalArchiveReferenceRejectsZeroCommittedAt(t *testing.T) {
+	t.Parallel()
+	reference := fixtureArchiveReference()
+	reference.CommittedAt = time.Time{}
+	if err := reference.Validate(); err == nil {
+		t.Fatal("zero committedAt accepted")
+	}
+	if _, err := CanonicalBytes(reference); err == nil {
+		t.Fatal("zero committedAt encoded")
+	}
+	var decoded TerminalArchiveReference
+	if err := json.Unmarshal([]byte(`{"schemaVersion":"donmai.terminal-archive-reference.v1","archiveId":"wa_33333333333333333333333333333333","archiveDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","sessionId":"11111111-1111-4111-8111-111111111111","workareaId":"wa_33333333333333333333333333333333","terminalResultId":"tr_22222222222222222222222222222222","committedAt":"0001-01-01T00:00:00.000Z"}`), &decoded); err == nil {
+		t.Fatalf("zero committedAt decoded: %+v", decoded)
+	}
+}
+
 func TestTerminalLeaseProjectionStaysFourFields(t *testing.T) {
 	t.Parallel()
 	projection := fixtureDescriptor().Projection()

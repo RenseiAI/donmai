@@ -66,6 +66,13 @@ func (f *fakeWorkareaClient) RestoreWorkareaV1Context(ctx context.Context, archi
 	f.restoreCtx = ctx
 	f.gotArchive = archiveID
 	f.gotRestore = req
+	if f.restoreV1Resp == nil && f.restoreV1Err == nil {
+		// Unconfigured versioned response: behave like a daemon that
+		// predates the contract (non-sentinel failure) so the caller
+		// falls back to the legacy shape. Sentinel failures are set
+		// explicitly per test via restoreV1Err.
+		return nil, errors.New("v1 unavailable")
+	}
 	return f.restoreV1Resp, f.restoreV1Err
 }
 
@@ -289,7 +296,7 @@ func TestWorkareaCmd_Restore_ErrorMessages(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := &fakeWorkareaClient{restoreErr: tc.serverErr}
+			client := &fakeWorkareaClient{restoreV1Err: tc.serverErr, restoreErr: tc.serverErr}
 			root := newWorkareaRootForTest(client)
 			_, err := runRootCmd(t, root, "workarea", "restore", "wa-x",
 				"--into-session-id", "sess-x")
@@ -300,6 +307,51 @@ func TestWorkareaCmd_Restore_ErrorMessages(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubstr)
 			}
 		})
+	}
+}
+
+func TestWorkareaCmd_Restore_PrefersVersionedReference(t *testing.T) {
+	client := &fakeWorkareaClient{restoreV1Resp: &afclient.WorkareaRestoreV1Result{
+		Workarea: afclient.WorkareaV1{
+			ID: "wa-new", Kind: afclient.WorkareaKindActive,
+			Status: afclient.WorkareaStatusReady,
+			ArchiveReference: &afclient.ArchiveReference{
+				SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: "wa-src",
+				ArchiveDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+				SessionID:     "11111111-1111-4111-8111-111111111111", WorkareaID: "wa-src",
+				CommittedAt: "2026-07-18T12:30:00.000Z",
+			},
+		},
+	}}
+	root := newWorkareaRootForTest(client)
+	out, err := runRootCmd(t, root, "workarea", "restore", "wa-src")
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for _, want := range []string{"Workarea restored", "wa-new", "wa-src", "sha256:cccc"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if client.restoreCalls != 1 {
+		t.Errorf("restore calls = %d, want 1 (no legacy fallback on V1 success)", client.restoreCalls)
+	}
+}
+
+func TestWorkareaCmd_Restore_SentinelDoesNotFallBack(t *testing.T) {
+	client := &fakeWorkareaClient{
+		restoreV1Err: fmt.Errorf("x: %w", afclient.ErrNotFound),
+		restoreResp: &afclient.WorkareaRestoreResult{
+			Workarea: afclient.Workarea{ID: "wa-shadow", Kind: afclient.WorkareaKindActive},
+		},
+	}
+	root := newWorkareaRootForTest(client)
+	_, err := runRootCmd(t, root, "workarea", "restore", "wa-ghost")
+	if err == nil || !strings.Contains(err.Error(), "archive not found: wa-ghost") {
+		t.Fatalf("err = %v, want archive-not-found without fallback", err)
+	}
+	if client.restoreCalls != 1 {
+		t.Errorf("restore calls = %d, want 1 (sentinel must not trigger legacy call)", client.restoreCalls)
 	}
 }
 

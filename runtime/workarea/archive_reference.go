@@ -48,6 +48,9 @@ func (r TerminalArchiveReference) Validate() error {
 	if err := validateGeneratedID(r.TerminalResultID, "tr_"); err != nil {
 		return fmt.Errorf("runtime/workarea: terminalResultId: %w", err)
 	}
+	if r.CommittedAt.IsZero() {
+		return errors.New("runtime/workarea: committedAt must name the committed archive instant")
+	}
 	if _, err := formatCanonicalMillis(r.CommittedAt); err != nil {
 		return fmt.Errorf("runtime/workarea: committedAt: %w", err)
 	}

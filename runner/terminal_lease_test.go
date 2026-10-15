@@ -259,6 +259,155 @@ func TestRequestedLeaseSurvivesPreserveAlwaysAndArchivesOnRelease(t *testing.T) 
 	}
 }
 
+func TestRunPostsCommittedArchiveReferenceBesideLease(t *testing.T) {
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	committedAt := time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC)
+	manager, err := worktree.NewManager(worktree.Options{
+		ParentDir: wtParent,
+		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+			return &workarea.TerminalArchiveReference{
+				SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: spec.WorkareaID,
+				ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				SessionID:     spec.SessionID, WorkareaID: spec.WorkareaID,
+				TerminalResultID: spec.TerminalResultID, CommittedAt: committedAt,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statusBody map[string]any
+	var statusRaw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, "/lock-refresh") {
+			_, _ = w.Write([]byte(`{"refreshed":true}`))
+			return
+		}
+		if strings.HasSuffix(req.URL.Path, "/status") {
+			body, readErr := ioReadAll(req)
+			if readErr != nil {
+				t.Error(readErr)
+			}
+			var envelope map[string]any
+			if err := json.Unmarshal(body, &envelope); err != nil {
+				t.Error(err)
+			}
+			if envelope["status"] == "completed" {
+				statusRaw = append([]byte(nil), body...)
+				statusBody = envelope
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newLeaseRunner(t, manager, poster, true)
+	queued := QueuedWork{QueuedWork: queuedWorkBase("LEASE-ARCHIVE-REF"), WorkerID: "worker", PlatformURL: srv.URL, TerminalWorkareaLease: terminalLeaseRequest(), ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub}}
+	queued.SessionID = runnerLeaseSessionID
+	queued.Repository = bareRepo
+	res, runErr := r.Run(context.Background(), queued)
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if res.TerminalWorkareaLease == nil {
+		t.Fatal("lease projection missing")
+	}
+	if len(statusRaw) == 0 {
+		t.Fatal("no terminal status posted")
+	}
+	// The runner prepares the terminal body before the archive release
+	// commits, so the first status post carries the lease alone: the
+	// reference is never predicted.
+	if _, present := statusBody["terminalArchiveReference"]; present {
+		t.Fatalf("fresh-lease status predicted the archive reference: %s", statusRaw)
+	}
+	leaseBody, ok := statusBody["terminalWorkareaLease"].(map[string]any)
+	if !ok || len(leaseBody) != 4 {
+		t.Fatalf("lease projection changed: %#v", statusBody["terminalWorkareaLease"])
+	}
+	// The release commits the archive and records the durable binding on
+	// the lease: the lifecycle-state replay surface carries it even though
+	// the first status post could not.
+	lease, err := manager.TerminalLease(res.TerminalWorkareaLease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.ReleaseDisposition != "archive" {
+		t.Fatalf("disposition=%q, want archive", lease.ReleaseDisposition)
+	}
+	claim, err := manager.ClaimTerminalLeaseExecution(context.Background(), workarea.ExecutionClaimSpec{
+		LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+		WorkareaID: lease.WorkareaID, InvocationID: runnerLeaseInvocationID, ClaimID: runnerLeaseClaimID,
+	})
+	if err != nil || claim == nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.AcknowledgeTerminalResult(context.Background(), workarea.TerminalResultAcknowledgement{
+		SchemaVersion: workarea.TerminalLeaseAcknowledgementSchemaV1, Acknowledged: true,
+		InvocationID: runnerLeaseInvocationID, ClaimID: runnerLeaseClaimID, LeaseID: lease.LeaseID,
+		SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID, WorkareaID: lease.WorkareaID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ReapExpiredTerminalLeases(context.Background(), 1, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	released, err := manager.TerminalLease(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := released.ArchiveReference
+	if ref == nil {
+		t.Fatal("released lease carries no committed archive reference")
+	}
+	if ref.TerminalResultID != lease.TerminalResultID || ref.WorkareaID != lease.WorkareaID || ref.SessionID != runnerLeaseSessionID {
+		t.Fatalf("released reference = %+v", ref)
+	}
+	// A resumed run replays the recorded reference beside the lease: the
+	// producing caller is the durable lease record, not a prediction.
+	committed, err := manager.CommittedArchiveReference(context.Background(), *released)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed == nil || !committed.IdentityEqual(*ref) {
+		t.Fatalf("committed replay = %+v, want %+v", committed, ref)
+	}
+	// The runner carries a recorded reference onto the terminal status body
+	// beside the closed four-field lease. The second Run mints a fresh
+	// terminal result identity (content-bound), so it cannot replay the
+	// first run's lease record; instead, emulate the resumed-run producer
+	// directly: the durable lease record replays through
+	// CommittedArchiveReference, and the poster carries a recorded
+	// reference beside the closed lease on the production status path.
+	// The runner's own carry (lease.ArchiveReference at acquire time) is
+	// pinned by TestAcquireReplayPreservesRecordedReference at the store
+	// level: idempotent re-acquire replays the recorded binding the carry
+	// observes.
+	statusBody = nil
+	statusRaw = nil
+	replayProjection := released.Descriptor().Projection()
+	replayedPosterBody, replayErr := poster.PrepareTerminalStatusBodyWithOptions(context.Background(), runnerLeaseSessionID, agent.Result{Status: "completed", Summary: "done"}, result.PostOptions{
+		TerminalWorkareaLease: &replayProjection, TerminalArchiveReference: ref,
+	})
+	if replayErr != nil {
+		t.Fatal(replayErr)
+	}
+	var replayed map[string]any
+	if err := json.Unmarshal(replayedPosterBody, &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := replayed["terminalArchiveReference"]; !present {
+		t.Fatalf("replayed status omits the committed reference: %s", replayedPosterBody)
+	}
+	if leaseBody, ok := replayed["terminalWorkareaLease"].(map[string]any); !ok || len(leaseBody) != 4 {
+		t.Fatalf("replayed lease projection changed: %#v", replayed["terminalWorkareaLease"])
+	}
+}
+
 func newLeaseRunner(t *testing.T, manager *worktree.Manager, poster *result.Poster, preserveAlways bool) *Runner {
 	t.Helper()
 	registry := NewRegistry()

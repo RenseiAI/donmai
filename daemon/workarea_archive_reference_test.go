@@ -111,6 +111,12 @@ func TestArchiveInspectProjectsReference(t *testing.T) {
 		ref.SessionID != "11111111-1111-4111-8111-111111111111" || ref.WorkareaID != "wa_44444444444444444444444444444444" || ref.ArchiveDigest == "" {
 		t.Fatalf("inspect reference = %+v", ref)
 	}
+	// The committed manifest retains the terminal result binding, and the
+	// inspect projection serves it: the five-identity contract is realized
+	// on the readback surface, not just the commit return.
+	if ref.TerminalResultID != "tr_11111111111111111111111111111111" {
+		t.Fatalf("inspect reference terminal result = %q, want the committed binding", ref.TerminalResultID)
+	}
 	manifest, err := registry.readManifest("wa_44444444444444444444444444444444")
 	if err != nil {
 		t.Fatal(err)
@@ -118,9 +124,55 @@ func TestArchiveInspectProjectsReference(t *testing.T) {
 	if ref.ArchiveDigest != manifest.TreeDigest {
 		t.Fatalf("inspect digest %q != manifest %q", ref.ArchiveDigest, manifest.TreeDigest)
 	}
+	if manifest.TerminalResultID != ref.TerminalResultID {
+		t.Fatalf("manifest binding %q != served %q", manifest.TerminalResultID, ref.TerminalResultID)
+	}
 	if _, err := workarea.CanonicalBytes(struct {
 		SchemaVersion string `json:"schemaVersion"`
 	}{SchemaVersion: ref.SchemaVersion}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestArchiveInspectRefusesConflictingTerminalResult(t *testing.T) {
+	t.Parallel()
+	registry, spec := commitFlatArchiveForReference(t, "wa_55555555555555555555555555555555", "11111111-1111-4111-8111-111111111111")
+	if _, err := registry.CommitArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	// A different terminal result for the same committed bytes is refused:
+	// the archive is immutable and its binding does not move.
+	conflicting := spec
+	conflicting.TerminalResultID = "tr_22222222222222222222222222222222"
+	if _, err := registry.CommitArchiveRoot(t.Context(), conflicting); err == nil {
+		t.Fatal("conflicting terminal result accepted")
+	}
+}
+
+func TestWithArchiveReferenceTerminalResultAttachesBinding(t *testing.T) {
+	t.Parallel()
+	base := &afclient.ArchiveReference{
+		SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: "wa_66666666666666666666666666666666",
+		ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SessionID:     "11111111-1111-4111-8111-111111111111", WorkareaID: "wa_66666666666666666666666666666666",
+		CommittedAt: "2026-07-18T12:30:00.000Z",
+	}
+	if base.TerminalResultID != "" {
+		t.Fatalf("fixture carries a binding: %+v", base)
+	}
+	attached := WithArchiveReferenceTerminalResult(base, "tr_11111111111111111111111111111111")
+	if attached == nil || attached.TerminalResultID != "tr_11111111111111111111111111111111" {
+		t.Fatalf("attached = %+v", attached)
+	}
+	if base.TerminalResultID != "" {
+		t.Fatal("helper mutated its input")
+	}
+	// A conflicting binding is refused: the existing reference is returned
+	// unchanged.
+	if kept := WithArchiveReferenceTerminalResult(attached, "tr_22222222222222222222222222222222"); kept != attached {
+		t.Fatalf("conflicting attach replaced the reference: %+v", kept)
+	}
+	if got := WithArchiveReferenceTerminalResult(nil, "tr_11111111111111111111111111111111"); got != nil {
+		t.Fatalf("nil input = %+v", got)
 	}
 }

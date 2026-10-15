@@ -111,28 +111,33 @@ func archiveMetadataValidation(field, detail string, cause error) error {
 // emitted to clients is afclient.WorkareaSummary / Workarea — this is the
 // internal carrier.
 type archiveManifest struct {
-	SchemaVersion   string                        `json:"schemaVersion,omitempty"`
-	ID              string                        `json:"id"`
-	AcquisitionID   string                        `json:"acquisitionId,omitempty"`
-	WorkareaID      string                        `json:"workareaId,omitempty"`
-	SessionID       string                        `json:"sessionId,omitempty"`
-	OriginalRoot    string                        `json:"originalRoot,omitempty"`
-	SelectedLeaf    string                        `json:"selectedLeaf,omitempty"`
-	Repositories    []afclient.WorkareaRepository `json:"repositories,omitempty"`
-	ProjectID       string                        `json:"projectId,omitempty"`
-	ProviderID      string                        `json:"providerId,omitempty"`
-	SourceProvider  string                        `json:"sourceProvider,omitempty"`
-	Disposition     string                        `json:"disposition,omitempty"`
-	CreatedAt       string                        `json:"createdAt,omitempty"`
-	SizeBytes       int64                         `json:"sizeBytes,omitempty"`
-	Repository      string                        `json:"repository,omitempty"`
-	Ref             string                        `json:"ref,omitempty"`
-	Capabilities    []string                      `json:"capabilities,omitempty"`
-	Toolchain       map[string]string             `json:"toolchain,omitempty"`
-	StoreID         string                        `json:"storeId,omitempty"`
-	RootIdentity    workarea.FileIdentity         `json:"rootIdentity,omitempty"`
-	TreeDigest      string                        `json:"treeDigest,omitempty"`
-	SourceSizeBytes int64                         `json:"sourceSizeBytes,omitempty"`
+	SchemaVersion string `json:"schemaVersion,omitempty"`
+	ID            string `json:"id"`
+	AcquisitionID string `json:"acquisitionId,omitempty"`
+	WorkareaID    string `json:"workareaId,omitempty"`
+	SessionID     string `json:"sessionId,omitempty"`
+	// TerminalResultID is the stable terminal result identity that committed
+	// this archive. Empty on archives that predate the recovery-reference
+	// contract; the inspect/restore projection then serves no terminal
+	// result binding rather than an invented one.
+	TerminalResultID string                        `json:"terminalResultId,omitempty"`
+	OriginalRoot     string                        `json:"originalRoot,omitempty"`
+	SelectedLeaf     string                        `json:"selectedLeaf,omitempty"`
+	Repositories     []afclient.WorkareaRepository `json:"repositories,omitempty"`
+	ProjectID        string                        `json:"projectId,omitempty"`
+	ProviderID       string                        `json:"providerId,omitempty"`
+	SourceProvider   string                        `json:"sourceProvider,omitempty"`
+	Disposition      string                        `json:"disposition,omitempty"`
+	CreatedAt        string                        `json:"createdAt,omitempty"`
+	SizeBytes        int64                         `json:"sizeBytes,omitempty"`
+	Repository       string                        `json:"repository,omitempty"`
+	Ref              string                        `json:"ref,omitempty"`
+	Capabilities     []string                      `json:"capabilities,omitempty"`
+	Toolchain        map[string]string             `json:"toolchain,omitempty"`
+	StoreID          string                        `json:"storeId,omitempty"`
+	RootIdentity     workarea.FileIdentity         `json:"rootIdentity,omitempty"`
+	TreeDigest       string                        `json:"treeDigest,omitempty"`
+	SourceSizeBytes  int64                         `json:"sourceSizeBytes,omitempty"`
 	// Excluded lists the regenerable dependency and build-output
 	// directories the capture skipped (see archiveExcludedDirNames), as
 	// slash-separated paths relative to the archived root, sorted. The
@@ -349,7 +354,8 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 	manifest := archiveManifest{
 		SchemaVersion: schemaVersion, ID: spec.WorkareaID,
 		AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID,
-		SessionID: spec.SessionID, OriginalRoot: root.String(), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		SessionID: spec.SessionID, TerminalResultID: spec.TerminalResultID,
+		OriginalRoot: root.String(), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Disposition: "archive", SourceProvider: "local",
 		StoreID: acquisition.StoreID, RootIdentity: acquisition.RootIdentity,
 	}
@@ -408,7 +414,7 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 	final := spec.WorkareaID
 	if _, err := archiveRoot.Lstat(final); err == nil {
 		existing, readErr := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
-		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID {
+		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID && existing.TerminalResultID == spec.TerminalResultID {
 			archivedRoot, openErr := archiveRoot.OpenRoot(filepath.Join(spec.WorkareaID, "tree"))
 			if openErr != nil {
 				return nil, fmt.Errorf("archive root: open existing archive tree: %w", openErr)
@@ -610,10 +616,20 @@ func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArc
 	if spec.SessionID != "" && existing.SessionID != spec.SessionID {
 		return nil, fmt.Errorf("archive root: committed archive identity conflict: %w", ErrArchiveCorrupted)
 	}
-	if spec.TerminalResultID == "" {
+	// The committed manifest retains the terminal result binding. A caller
+	// that names a different terminal result for the same committed bytes
+	// is refused: the archive is immutable and its binding does not move.
+	if existing.TerminalResultID != "" && spec.TerminalResultID != "" && existing.TerminalResultID != spec.TerminalResultID {
+		return nil, fmt.Errorf("archive root: committed archive terminal result conflict: %w", ErrArchiveCorrupted)
+	}
+	terminalResultID := existing.TerminalResultID
+	if terminalResultID == "" {
+		terminalResultID = spec.TerminalResultID
+	}
+	if terminalResultID == "" {
 		return nil, nil
 	}
-	if err := validateTerminalResultID(spec.TerminalResultID); err != nil {
+	if err := validateTerminalResultID(terminalResultID); err != nil {
 		return nil, fmt.Errorf("archive root: invalid terminal result identity: %w", err)
 	}
 	committedAt, ok := parseRFC3339(existing.CreatedAt)
@@ -626,7 +642,7 @@ func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArc
 	reference := &workarea.TerminalArchiveReference{
 		SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: spec.WorkareaID,
 		ArchiveDigest: existing.TreeDigest, SessionID: existing.SessionID,
-		WorkareaID: existing.WorkareaID, TerminalResultID: spec.TerminalResultID,
+		WorkareaID: existing.WorkareaID, TerminalResultID: terminalResultID,
 		CommittedAt: committed,
 	}
 	if err := reference.Validate(); err != nil {
@@ -643,7 +659,36 @@ func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArc
 // the committed bytes on disk, never a future or predicted archive.
 func (r *WorkareaArchiveRegistry) readCommittedArchiveReference(archiveRoot *os.Root, spec WorkareaRootArchiveSpec) (*workarea.TerminalArchiveReference, error) {
 	if spec.TerminalResultID == "" {
-		return nil, nil
+		// A commit without a terminal result binding still validates the
+		// committed bytes; it yields no versioned reference so legacy
+		// commits stay silent.
+		manifest, err := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
+		if err != nil {
+			return nil, err
+		}
+		if manifest.SchemaVersion != workareaArchiveSchemaV1 && manifest.SchemaVersion != workareaArchiveLegacyFlatV1 {
+			return nil, fmt.Errorf("archive root: committed archive schema is unknown: %w", ErrArchiveCorrupted)
+		}
+		if manifest.ID != spec.WorkareaID || manifest.WorkareaID != spec.WorkareaID || manifest.SessionID != spec.SessionID || manifest.TreeDigest == "" {
+			return nil, fmt.Errorf("archive root: committed archive identity conflict: %w", ErrArchiveCorrupted)
+		}
+		archivedRoot, err := archiveRoot.OpenRoot(filepath.Join(spec.WorkareaID, "tree"))
+		if err != nil {
+			return nil, fmt.Errorf("archive root: open committed archive tree: %w", err)
+		}
+		digest, err := archiveTreeDigestRoot(archivedRoot)
+		physical, physicalErr := workarea.PhysicalUsageRoot(archivedRoot)
+		_ = archivedRoot.Close()
+		if err != nil {
+			return nil, fmt.Errorf("archive root: digest committed archive tree: %w", err)
+		}
+		if digest != manifest.TreeDigest {
+			return nil, fmt.Errorf("archive root: committed archive digest mismatch: %w", ErrArchiveCorrupted)
+		}
+		if physicalErr != nil || physical != manifest.SizeBytes {
+			return nil, fmt.Errorf("archive root: committed archive size mismatch: %w", ErrArchiveCorrupted)
+		}
+		return r.committedArchiveReference(spec, manifest)
 	}
 	manifest, err := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
 	if err != nil {
@@ -3208,11 +3253,37 @@ func manifestToWorkareaV1(id string, m *archiveManifest, treePath string) afclie
 	}
 }
 
+// WithArchiveReferenceTerminalResult attaches the stable terminal result
+// binding to a projected recovery reference. It is the serve-path
+// complement to the commit-time manifest binding: the manifest retains the
+// identity, and this helper projects it onto references built from
+// manifests that predate the field or from callers that resolved the
+// binding separately. A nil reference stays nil; an empty terminal result
+// id leaves the reference unchanged.
+func WithArchiveReferenceTerminalResult(reference *afclient.ArchiveReference, terminalResultID string) *afclient.ArchiveReference {
+	if reference == nil || terminalResultID == "" {
+		return reference
+	}
+	if err := validateTerminalResultID(terminalResultID); err != nil {
+		return reference
+	}
+	if reference.TerminalResultID != "" && reference.TerminalResultID != terminalResultID {
+		return reference
+	}
+	attached := *reference
+	attached.TerminalResultID = terminalResultID
+	if !validArchiveReferenceShape(&attached) {
+		return reference
+	}
+	return &attached
+}
+
 // archiveReferenceForManifest projects the committed manifest digest onto the
 // additive recovery reference. Archives that predate the reference contract
 // (no tree digest) project nil, so their served shape is byte-identical to
-// before. Callers that also know the terminal result that committed the
-// archive attach it via WithArchiveReferenceTerminalResult.
+// before. The committed manifest retains the terminal result binding, which
+// is projected here; callers that resolved the binding separately attach it
+// via WithArchiveReferenceTerminalResult.
 func archiveReferenceForManifest(id string, m *archiveManifest) *afclient.ArchiveReference {
 	if m == nil || m.TreeDigest == "" || m.WorkareaID == "" || m.SessionID == "" {
 		return nil
@@ -3224,7 +3295,7 @@ func archiveReferenceForManifest(id string, m *archiveManifest) *afclient.Archiv
 	reference := &afclient.ArchiveReference{
 		SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: firstNonEmptyStr(m.ID, id),
 		ArchiveDigest: m.TreeDigest, SessionID: m.SessionID, WorkareaID: m.WorkareaID,
-		CommittedAt: committedAt,
+		TerminalResultID: m.TerminalResultID, CommittedAt: committedAt,
 	}
 	// Pre-contract archives with non-canonical identities project no
 	// reference rather than serving an invalid one; their served shape is
