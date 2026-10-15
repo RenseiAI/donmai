@@ -334,6 +334,51 @@ autoUpdate:
       issuer: https://token.actions.githubusercontent.com
 ```
 
+## Anonymous usage count (opt-in)
+
+The weekly installation count is **opt-in and off by default**: the
+binary ships with no receiver endpoint, and with none configured the
+ping is inert — consent alone never dials any default infrastructure.
+The update checker gains no new traffic.
+
+`host setup` asks one default-no question: "Count this installation
+in the public usage numbers? Sends a random installation id and the
+version once a week, nothing else." Answering yes mints a
+cryptographically random installation id (not a machine, host, or
+organization identifier) and records it with the binary version and
+OS only. No hostnames, no repository names, no IPs stored. Pass
+`host setup --no-ping` to skip the question and leave the count off.
+
+The payload is exactly `{installationId, version, os}` over HTTPS
+POST to the operator-configured endpoint; unknown fields and
+oversize/invalid values are rejected, and repeated reports from the
+same installation in the counting window are idempotent. At most one
+attempt runs per seven days; the next eligible time is persisted
+before transmission so response loss or a restart cannot cause a
+retry storm. No request at all runs when disabled; disabling cancels
+queued work and prevents future transmission.
+
+`daemon.yaml` reference:
+
+```yaml
+usagePing:
+  enabled: true             # default false — no request runs when false
+  installationId: <32 hex> # random id minted at opt-in, cleared on opt-out
+  endpoint: https://example.invalid/usage  # empty disables sending
+```
+
+Manage it without the wizard:
+
+```bash
+donmai host set usagePing.enabled 1   # opt in (mints an id); 0 clears it and stops sending
+donmai host set usagePing.endpoint https://example.invalid/usage
+donmai host set usagePing.endpoint ""  # clear the endpoint; no ping is sent
+```
+
+The count reports opted-in installations per week, not organizations
+or people: the random id can count reporting installations but
+cannot deduplicate them further.
+
 ## Kit install trust gate
 
 Kit installs (`donmai host kit install`, `POST /api/daemon/kits/<id>/install`)
