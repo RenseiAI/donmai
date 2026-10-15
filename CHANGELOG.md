@@ -10,6 +10,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.77 — 2026-10-15
+
+### Chores
+
+- Constrain repository dependency preparation before spawn
+- Runner submits its execution security report before spawn and waits for acceptance
+- Gateway Responses inbound surface for interactive code-backed sessions
+- Serve every post-loss retry from the adoption interposer
+
 ## v0.72.76 — 2026-10-15
 
 ### Chores
