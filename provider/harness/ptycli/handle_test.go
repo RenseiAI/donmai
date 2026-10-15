@@ -2,10 +2,13 @@ package ptycli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -466,5 +469,117 @@ func TestHandle_HasTerminalCostReflectsHookPresence(t *testing.T) {
 	}
 	if got := (&Handle{terminalCost: func() *agent.CostData { return nil }}).HasTerminalCost(); !got {
 		t.Fatal("handle with a TerminalCost hook reports no terminal cost; want true")
+	}
+}
+
+func TestSpawn_FailureOutputTail(t *testing.T) {
+	requireShell(t)
+	logPath := t.TempDir() + "/child.log"
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logFile, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+		_ = logFile.Close()
+	})
+
+	secret := "sk-" + strings.Repeat("fixture", 8)
+	cases := []struct {
+		name      string
+		script    string
+		output    string
+		want      string
+		absent    string
+		success   bool
+		ringBytes int
+		marker    bool
+	}{
+		{name: "stderr", script: "echo boom >&2; exit 1", want: "boom"},
+		{name: "redacted", script: `printf '%s\n' "$OUTPUT" >&2; exit 1`, output: "fatal: " + secret, want: "fatal: [REDACTED]", absent: secret},
+		{name: "bounded", script: `printf '%s\n' "$OUTPUT"; exit 1`, output: "old diagnostic\n" + strings.Repeat(".", 8192) + "\nlast diagnostic", want: "last diagnostic", absent: "old diagnostic"},
+		{name: "secret crosses excerpt boundary", script: `printf '%s\n' "$OUTPUT"; exit 1`, output: "fatal: sk-" + strings.Repeat("fixture", 1000) + "\nboom", want: "boom", absent: "fixture"},
+		{name: "signal", script: "echo signal-boom >&2; kill -TERM $$", want: "signal-boom"},
+		{name: "marker before output", script: "read line; echo boom; exit 1", want: "boom", marker: true},
+		{name: "empty", script: "exit 1"},
+		{name: "success", script: "echo clean-output; exit 0", success: true},
+		{name: "evicted credential prefix", script: `printf '%s\n' "$OUTPUT"; exit 1`, output: "sk-" + strings.Repeat("fixture", 10000) + "\nretained diagnostic", ringBytes: 8192, want: "retained diagnostic", absent: "fixture"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, err := Spawn(context.Background(), "sh", []string{"-c", tc.script}, agent.Spec{
+				Cwd: t.TempDir(), Env: map[string]string{"OUTPUT": tc.output},
+				Interactive: &agent.InteractiveSpec{RingBytes: tc.ringBytes},
+			}, ptyNoticeManifest())
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			t.Cleanup(func() { _ = h.Stop(context.Background()) })
+			if tc.marker {
+				if err := h.EmitMarker("diagnostic-test"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.InteractiveSession().WriteInput([]byte("\n")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			events := collectEvents(t, h)
+			if len(events) != 2 {
+				t.Fatalf("got %d events, want 2", len(events))
+			}
+			res, ok := events[1].(agent.ResultEvent)
+			if !ok || res.Success != tc.success {
+				t.Fatal("unexpected terminal result")
+			}
+			if tc.success {
+				if len(res.Errors) != 0 {
+					t.Fatal("successful child gained failure diagnostics")
+				}
+				return
+			}
+			if res.ErrorSubtype != "nonzero_exit" || len(res.Errors) != 1 {
+				t.Fatal("missing exit failure detail")
+			}
+			message := res.Errors[0]
+			if tc.want != "" && !strings.Contains(message, tc.want) {
+				t.Fatalf("failure message missing %q", tc.want)
+			}
+			if tc.absent != "" && strings.Contains(message, tc.absent) {
+				t.Fatal("failure message contains discarded or unredacted output")
+			}
+			_, tail, _ := strings.Cut(message, "PTY output tail:\n")
+			if len(tail) > 4096 {
+				t.Fatalf("tail has %d bytes, want at most 4096", len(tail))
+			}
+			if tc.want == "" && tail != "" {
+				t.Fatal("empty output gained a tail")
+			}
+			logs, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want != "" {
+				matched := false
+				for _, line := range strings.Split(strings.TrimSpace(string(logs)), "\n") {
+					var record struct {
+						Error string `json:"error"`
+					}
+					if err := json.Unmarshal([]byte(line), &record); err != nil {
+						t.Fatal(err)
+					}
+					if record.Error == message {
+						matched = true
+					}
+				}
+				if !matched {
+					t.Fatal("child log missing the same bounded, redacted failure diagnostic")
+				}
+			}
+			if tc.absent != "" && strings.Contains(string(logs), tc.absent) {
+				t.Fatal("child log contains discarded or unredacted output")
+			}
+		})
 	}
 }
