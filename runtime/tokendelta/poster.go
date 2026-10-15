@@ -118,6 +118,11 @@ type Config struct {
 	// runtime token before every HTTP attempt.
 	CredentialProvider CredentialProvider
 
+	// Traceparent and Tracestate carry the optional dispatch W3C trace context.
+	// Empty values omit the corresponding request headers.
+	Traceparent string
+	Tracestate  string
+
 	// HTTPClient overrides the default client.
 	HTTPClient *http.Client
 	// Logger overrides slog.Default().
@@ -464,6 +469,12 @@ func (p *Poster) post(ctx context.Context, body requestBody) error {
 		return fmt.Errorf("build token-delta request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}
