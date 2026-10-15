@@ -242,6 +242,111 @@ func TestLinearGetIssueExposesPriorityAndManualRank(t *testing.T) {
 	}
 }
 
+func TestLinearGetIssueExposesPointEstimate(t *testing.T) {
+	tests := []struct {
+		name         string
+		estimateJSON string
+		wantEstimate any
+	}{
+		{
+			name:         "set estimate reads as a number",
+			estimateJSON: `"estimate":3,`,
+			wantEstimate: float64(3),
+		},
+		{
+			name:         "absent estimate reads as explicit null",
+			estimateJSON: `"estimate":null,`,
+			wantEstimate: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issueJSON := issueNodeJSON("issue-1", "ENG-1", "Estimated Issue", "Backlog", "team-1", "ENG", "Engineering")
+			issueJSON = strings.Replace(issueJSON, `"priority":2,`, `"priority":2,`+tt.estimateJSON, 1)
+			queryHasEstimate := false
+			setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query string `json:"query"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				queryHasEstimate = strings.Contains(req.Query, "estimate")
+				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+			})
+
+			out, err := runLinearCmd(t, "", "get-issue", "ENG-1")
+			if err != nil {
+				t.Fatalf("get-issue failed: %v\nout: %s", err, out)
+			}
+			result := decodeJSON(t, out)
+			if !queryHasEstimate {
+				t.Error("get-issue query did not request the point-estimate field")
+			}
+			got, ok := result["estimate"]
+			if !ok {
+				t.Fatalf("estimate field missing from get-issue output: %#v", result)
+			}
+			if got != tt.wantEstimate {
+				t.Errorf("estimate = %#v, want %#v", got, tt.wantEstimate)
+			}
+		})
+	}
+}
+
+func TestLinearListIssuesExposesPointEstimate(t *testing.T) {
+	estimated := issueNodeJSON("issue-2", "ENG-2", "Estimated", "Backlog", "team-1", "ENG", "Engineering")
+	estimated = strings.Replace(estimated, `"priority":2,`, `"priority":2,"estimate":5,`, 1)
+	unestimated := issueNodeJSON("issue-1", "ENG-1", "Unestimated", "Backlog", "team-1", "ENG", "Engineering")
+	unestimated = strings.Replace(unestimated, `"priority":2,`, `"priority":2,"estimate":null,`, 1)
+	queryHasEstimate := false
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		queryHasEstimate = queryHasEstimate || strings.Contains(req.Query, "estimate")
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
+		case strings.Contains(req.Query, "ListIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s,%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, estimated, unestimated))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-issues", "--project", "TestProject", "--limit", "2")
+	if err != nil {
+		t.Fatalf("list-issues failed: %v\nout: %s", err, out)
+	}
+	if !queryHasEstimate {
+		t.Error("list-issues query did not request the point-estimate field")
+	}
+	env := decodeJSON(t, out)
+	arr, _ := env["issues"].([]any)
+	if len(arr) != 2 {
+		t.Fatalf("got %d issues, want 2", len(arr))
+	}
+	byID := map[string]map[string]any{}
+	for _, entry := range arr {
+		row, _ := entry.(map[string]any)
+		id, _ := row["id"].(string)
+		byID[id] = row
+	}
+	if got, ok := byID["ENG-2"]["estimate"]; !ok || got != float64(5) {
+		t.Errorf("ENG-2 estimate = %#v (present %v), want 5", got, ok)
+	}
+	got, ok := byID["ENG-1"]["estimate"]
+	if !ok || got != nil {
+		t.Errorf("ENG-1 estimate = %#v (present %v), want explicit null", got, ok)
+	}
+}
+
 func TestLinearGetIssueParentFields(t *testing.T) {
 	tests := []struct {
 		name                 string
