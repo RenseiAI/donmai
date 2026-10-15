@@ -672,6 +672,19 @@ func TestEventMappingTable(t *testing.T) {
 			wantContext:   "toolCallTimeoutSeconds=unrecognized",
 		},
 		{
+			name:        "System signal guard refused -> context with the refusal line",
+			event:       agent.SystemEvent{Subtype: "signal_guard_refused", Message: "refused pkill -f 'x': pid(s) 11 outside session scope (worktree /w)"},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "pattern kill refused: refused pkill -f 'x': pid(s) 11 outside session scope (worktree /w)",
+			wantContext: "signalGuardRefused=refused",
+		},
+		{
+			name:     "System signal guard refused empty message -> skipped",
+			event:    agent.SystemEvent{Subtype: "signal_guard_refused", Message: "  \n\t"},
+			wantSent: false,
+		},
+		{
 			name:     "System interactive start -> skipped",
 			event:    agent.SystemEvent{Subtype: "interactive-session-started", Message: "started"},
 			wantSent: false,

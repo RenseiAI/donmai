@@ -119,6 +119,13 @@ type State struct {
 	// providers (codex app-server). Populated via Spec.OnProcessSpawned.
 	PID int `json:"pid,omitempty"`
 
+	// SessionProcessGroup is the session's recorded process-group id,
+	// resolved from the spawned harness pid (every harness spawns its
+	// child in its own process group). The session's pkill/killall
+	// guards consult it as the second scope leg alongside the worktree.
+	// Zero when the group was never observed.
+	SessionProcessGroup int `json:"sessionProcessGroup,omitempty"`
+
 	// WorkerID is the daemon worker that owns this session.
 	WorkerID string `json:"workerId,omitempty"`
 
