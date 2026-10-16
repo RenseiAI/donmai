@@ -442,6 +442,33 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	res.WorktreePath = wpath
+	// Clone workareas only: linked worktrees (worktree-add) share hooks with
+	// their parent repository and are deliberately outside this hook's scope.
+	// A directory check also protects re-entered linked worktrees.
+	gitDir := filepath.Join(wpath, ".git")
+	if provisionStrategy == worktree.StrategyClone {
+		info, statErr := os.Lstat(gitDir)
+		if statErr != nil {
+			hookErr := fmt.Errorf("inspect clone git directory for commit hook: %w", statErr)
+			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, hookErr.Error()
+			return res, hookErr
+		}
+		if info.IsDir() {
+			name, email := ValidateCoAuthorPair(qw.SessionID, qw.CoAuthorName, qw.CoAuthorEmail)
+			if name != "" {
+				if hookErr := installTrailerHook(gitDir, name, email); hookErr != nil {
+					res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, hookErr.Error()
+					return res, hookErr
+				}
+				// Remove session attribution even when the checkout is retained.
+				defer func() {
+					if hookErr := removeTrailerHook(gitDir); hookErr != nil {
+						r.logger.Warn("commit hook cleanup failed", "sessionId", qw.SessionID, "err", hookErr)
+					}
+				}()
+			}
+		}
+	}
 	layout, layoutErr := r.wt.Layout(qw.SessionID)
 	if layoutErr != nil {
 		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, layoutErr.Error()
