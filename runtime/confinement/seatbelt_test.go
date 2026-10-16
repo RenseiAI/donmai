@@ -306,8 +306,32 @@ func readSessionBlock(t *testing.T, text string) string {
 // session's own allowlist last, so a session path wins over the carve-outs;
 // a composer read deny still renders after everything and wins inside the
 // allowlist.
+// TestRenderSeatbelt_RuntimeLiteralsAreExactFiles pins that host-specific
+// runtime files render as exact literals in the read allow, never as
+// subtrees: a subtree allow would expose every sibling the temporary
+// directory may hold. The developer bundle stays a subtree, and the
+// literal joins the same allow rule. Reverting the renderer to a subtree
+// allow fails the literal assertion.
+func TestRenderSeatbelt_RuntimeLiteralsAreExactFiles(t *testing.T) {
+	host := seatbeltHost{
+		shared:          []string{"/private/tmp"},
+		runtimeReads:    []string{"/Applications/Xcode.app"},
+		runtimeLiterals: []string{"/private/var/folders/aa/xcrun_db"},
+	}
+	text := mustRenderHost(t, readScopedResolved(), host, nil)
+	if !strings.Contains(text, `(literal "/private/var/folders/aa/xcrun_db")`) {
+		t.Fatalf("profile lacks the tool cache as an exact literal:\n%s", text)
+	}
+	if strings.Contains(text, `(subpath "/private/var/folders/aa/xcrun_db")`) {
+		t.Fatalf("profile allows the tool cache as a subtree:\n%s", text)
+	}
+	if strings.Contains(text, `(subpath "/private/var/folders/aa")`) {
+		t.Fatalf("profile widens to the tool cache directory:\n%s", text)
+	}
+}
+
 func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
-	host := seatbeltHost{shared: []string{"/private/tmp"}, runtimeReads: []string{"/Applications/Xcode.app"}}
+	host := seatbeltHost{shared: []string{"/private/tmp"}, runtimeReads: []string{"/Applications/Xcode.app"}, runtimeLiterals: []string{"/private/var/folders/aa/xcrun_db"}}
 	text := mustRenderHost(t, readScopedResolved(), host, []Rule{{Kind: RuleDenyRead, Path: "/r/ws/mut/secret", Scope: ScopeSubtree}})
 	order := []string{
 		"(allow default)",
@@ -315,6 +339,7 @@ func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
 		"(allow file-read-data file-read-xattr\n  (literal \"/\")",
 		`(subpath "/opt/homebrew")`,
 		`(subpath "/Applications/Xcode.app")`,
+		`(literal "/private/var/folders/aa/xcrun_db")`,
 		"(deny file-read-data file-read-xattr\n  (subpath \"/opt/homebrew/var\")\n  (subpath \"/usr/local/var\"))",
 		`(deny file-read-data file-read-xattr (subpath "/System/Volumes"))`,
 		`(allow file-read-data file-read-xattr (subpath "/System/Volumes/Preboot/Cryptexes"))`,
@@ -512,5 +537,8 @@ func TestRenderSeatbelt_ReadScopeRefusesPathsItCannotQuote(t *testing.T) {
 	}
 	if _, err := renderSeatbelt(readScopedResolved(), seatbeltHost{runtimeReads: []string{"/A\\pp"}}, nil, identity); err == nil {
 		t.Fatal("a runtime path with a backslash rendered")
+	}
+	if _, err := renderSeatbelt(readScopedResolved(), seatbeltHost{runtimeLiterals: []string{"/cache\\db"}}, nil, identity); err == nil {
+		t.Fatal("a runtime literal with a backslash rendered")
 	}
 }
