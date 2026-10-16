@@ -162,8 +162,8 @@ func TestProviderPinEnv_UnprefixedModelUnchanged(t *testing.T) {
 // TestProviderPinEnvContextWindow pins the context-window half of the pin:
 // a positive ProviderConfig["contextWindow"] (whatever numeric type the JSON
 // decode produced) rides piContextWindowEnvVar to the child extension, and a
-// missing/zero/invalid value leaves the var UNSET so the extension keeps its
-// built-in default — the pin never invents a value the dispatch did not carry.
+// missing/zero/invalid value leaves the var UNSET so the extension registers
+// no window — the pin never invents a value the dispatch did not carry.
 func TestProviderPinEnvContextWindow(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
