@@ -232,8 +232,12 @@ func TestMapTokenUsage_AccumulatesCost(t *testing.T) {
 		"promptTokens":50,"totalTokens":70,
 		"cumulative":{"outputTokens":20,"promptTokens":50,"totalTokens":70,"cost":{"partial":false,"usd":0.5}}
 	}`), state, nil)
-	if len(events) != 0 {
-		t.Errorf("tokenUsage produced %v (must fold silently)", kindsOf(events))
+	if len(events) != 1 {
+		t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(events))
+	}
+	call, ok := events[0].(agent.LlmCallEvent)
+	if !ok || call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.ReasoningTokens != 2 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.5 || call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted {
+		t.Fatalf("step usage=%+v", events[0])
 	}
 	if !state.hasCost || state.totalCostUSD != 0.5 {
 		t.Errorf("cost not folded: %+v", state)
@@ -306,5 +310,67 @@ func TestMapTurnCompleted_UnpricedHostReportsNoCost(t *testing.T) {
 	}
 	if result.Cost.TotalCostUsd != 0 {
 		t.Errorf("TotalCostUsd=%v, want 0", result.Cost.TotalCostUsd)
+	}
+}
+
+func TestMapTokenUsage_CostDeltas(t *testing.T) {
+	floatPtr := func(v float64) *float64 { return &v }
+	state := newMapperState("m")
+	for _, tc := range []struct {
+		name string
+		cost string
+		want *float64
+	}{
+		{"unpriced", ``, nil},
+		{"first price", `,"cost":{"usd":0.5}`, floatPtr(0.5)},
+		{"repeated", `,"cost":{"usd":0.5}`, floatPtr(0)},
+		{"lower", `,"cost":{"usd":0.25}`, floatPtr(0)},
+		{"after lower", `,"cost":{"usd":0.375}`, floatPtr(0.125)},
+		{"missing price", ``, nil},
+		{"after missing", `,"cost":{"usd":0.5}`, floatPtr(0.125)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := mapNotification("session/tokenUsage", json.RawMessage(`{"usage":{"inputTokens":10,"outputTokens":2},"cumulative":{"promptTokens":10,"outputTokens":2`+tc.cost+`}}`), state, nil)
+			if len(events) != 1 {
+				t.Fatalf("events=%v, want one usage event", kindsOf(events))
+			}
+			call := events[0].(agent.LlmCallEvent)
+			if tc.want == nil {
+				if call.ObservedCostUsd != nil {
+					t.Fatalf("unpriced step has cost %v", *call.ObservedCostUsd)
+				}
+			} else if call.ObservedCostUsd == nil || *call.ObservedCostUsd != *tc.want {
+				t.Fatalf("cost=%v, want %v", call.ObservedCostUsd, *tc.want)
+			}
+		})
+	}
+}
+
+func TestMapTokenUsage_CumulativeFallback(t *testing.T) {
+	state := newMapperState("m")
+	for i := 1; i <= 2; i++ {
+		params, err := json.Marshal(map[string]any{"cumulative": map[string]any{
+			"promptTokens": 50 * i, "outputTokens": 20 * i, "cacheReadTokens": 5 * i, "cacheWriteTokens": 3 * i,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := mapNotification("session/tokenUsage", params, state, nil)
+		if len(events) != 1 {
+			t.Fatalf("events=%v", kindsOf(events))
+		}
+		call := events[0].(agent.LlmCallEvent)
+		if call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.CacheWriteTokens != 3 || call.ObservedCostUsd != nil {
+			t.Fatalf("fallback=%+v", call)
+		}
+	}
+	// Explicit zero step usage is authoritative even if totals moved.
+	events := mapNotification("session/tokenUsage", json.RawMessage(`{"usage":{},"cumulative":{"promptTokens":150,"outputTokens":60}}`), state, nil)
+	call := events[0].(agent.LlmCallEvent)
+	if call.InputTokens != 0 || call.OutputTokens != 0 {
+		t.Fatalf("explicit zero=%+v", call)
+	}
+	if events := mapNotification("session/tokenUsage", json.RawMessage(`{`), state, nil); len(events) != 0 {
+		t.Fatalf("malformed usage=%v", events)
 	}
 }
