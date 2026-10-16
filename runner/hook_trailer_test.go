@@ -13,6 +13,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -28,6 +29,29 @@ func (p *trailerCommittingProvider) Spawn(ctx context.Context, spec agent.Spec) 
 		return nil, p.spawnErr
 	}
 	return p.HarnessProvider.Spawn(ctx, spec)
+}
+
+// sharedHookBarrierProvider holds every shared participant inside Spawn until
+// the test releases them, so two participants overlap on one shared leaf.
+// It embeds the attesting gate provider so declared shared joins validate.
+type sharedHookBarrierProvider struct {
+	*workareaGateProvider
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (p *sharedHookBarrierProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	select {
+	case p.entered <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return p.workareaGateProvider.Spawn(ctx, spec)
 }
 
 func TestRunCommitTrailerHook(t *testing.T) {
@@ -227,6 +251,105 @@ func TestRunTrailerHookCleanupOnSpawnFailure(t *testing.T) {
 	for _, path := range []string{trailerDataFile, filepath.Join("hooks", "prepare-commit-msg")} {
 		if _, err := os.Stat(filepath.Join(res.WorktreePath, ".git", path)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatal("failed spawn left session attribution metadata")
+		}
+	}
+}
+
+// TestRunTrailerHookSkippedInSharedMode pins the B1 contract: two overlapping
+// shared-mode participants on one leaf must both provision (no O_EXCL conflict
+// on the parent-owned git dir), and the first to exit must not strip a hook
+// while the other still runs. The production Run entry point drives both
+// halves: an owner provisions a declared root, then two shared joins overlap
+// on its leaf behind a spawn barrier.
+func TestRunTrailerHookSkippedInSharedMode(t *testing.T) {
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	h := newRunnerHarness(t)
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := h.runner.registry.Register(&workareaGateProvider{}); err != nil {
+		t.Fatal(err)
+	}
+	declarationV1 := &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: h.bareRepo}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+		},
+	}
+	ownerQW := h.queuedWork("HOOK-SHARED-OWNER")
+	ownerQW.WorkType = "acceptance"
+	ownerQW.RepositoryDeclaration = declarationV1
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	ownerRes, err := h.runner.Run(ctx, ownerQW)
+	if err != nil || ownerRes.Status != "completed" {
+		t.Fatalf("owner Run = status %q (%s: %s), %v; want completed", ownerRes.Status, ownerRes.FailureMode, ownerRes.Error, err)
+	}
+	ownerLayout, err := h.runner.wt.Layout(ownerQW.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration, err := workarea.ReadDeclaration(ownerLayout.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Barrier only the joins: every shared Spawn blocks until the test
+	// releases both, so their hook install/cleanup windows overlap exactly
+	// as concurrent participants do. Re-registering under the same provider
+	// name is safe: the owner Run already completed.
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	if err := h.runner.registry.Register(&sharedHookBarrierProvider{
+		workareaGateProvider: &workareaGateProvider{},
+		entered:              entered,
+		release:              release,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	type runOutcome struct {
+		res *Result
+		err error
+	}
+	outcomes := make(chan runOutcome, 2)
+	for _, session := range []string{"HOOK-SHARED-FIRST", "HOOK-SHARED-SECOND"} {
+		joinQW := h.queuedWork(session)
+		joinQW.WorkType = "acceptance"
+		joinQW.CoAuthorName, joinQW.CoAuthorEmail = "Owner", "owner"+"@"+"example.test"
+		joinQW.RepositoryDeclaration = declarationV1
+		joinQW.WorkareaMode = worktree.ModeShared
+		joinQW.ParentWorkareaID = declaration.WorkareaID
+		go func(qw QueuedWork) {
+			res, runErr := h.runner.Run(ctx, qw)
+			outcomes <- runOutcome{res: res, err: runErr}
+		}(joinQW)
+	}
+	// Wait for both participants to reach Spawn (or fail fast), then
+	// release them together so one's exit cleanup overlaps the other's run.
+	for range 2 {
+		select {
+		case <-entered:
+		case outcome := <-outcomes:
+			t.Fatalf("shared Run finished before overlapping: status %q (%s: %s), %v; want both blocked in Spawn", outcome.res.Status, outcome.res.FailureMode, outcome.res.Error, outcome.err)
+		case <-ctx.Done():
+			t.Fatal("shared participants did not overlap in Spawn")
+		}
+	}
+	close(release)
+	for range 2 {
+		select {
+		case outcome := <-outcomes:
+			if outcome.err != nil || outcome.res.Status != "completed" {
+				t.Fatalf("shared Run = status %q (%s: %s), %v; want completed", outcome.res.Status, outcome.res.FailureMode, outcome.res.Error, outcome.err)
+			}
+			if outcome.res.WorktreePath != ownerRes.WorktreePath {
+				t.Fatalf("shared WorktreePath = %q; want the shared leaf %q", outcome.res.WorktreePath, ownerRes.WorktreePath)
+			}
+		case <-ctx.Done():
+			t.Fatal("shared participants did not finish")
+		}
+	}
+	for _, path := range []string{trailerDataFile, filepath.Join("hooks", "prepare-commit-msg")} {
+		if _, err := os.Stat(filepath.Join(ownerRes.WorktreePath, ".git", path)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("shared joiners left session attribution metadata: %v", path)
 		}
 	}
 }

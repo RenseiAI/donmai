@@ -445,8 +445,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Clone workareas only: linked worktrees (worktree-add) share hooks with
 	// their parent repository and are deliberately outside this hook's scope.
 	// A directory check also protects re-entered linked worktrees.
+	// Shared-mode joiners are also excluded: they work inside the
+	// parent-owned shared leaf, so a per-session install would fail on
+	// overlap (O_EXCL) and the first participant to exit would strip the
+	// hook while others still run. Shared-mode attribution is a follow-up.
 	gitDir := filepath.Join(wpath, ".git")
-	if provisionStrategy == worktree.StrategyClone {
+	if provisionStrategy == worktree.StrategyClone && qw.WorkareaMode != worktree.ModeShared {
 		info, statErr := os.Lstat(gitDir)
 		if statErr != nil {
 			hookErr := fmt.Errorf("inspect clone git directory for commit hook: %w", statErr)
