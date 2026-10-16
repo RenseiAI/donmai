@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 func TestComputeRoutingReward(t *testing.T) {
-	// Mirrors donmai-libraries/packages/core/src/routing/reward.ts.
+	// Unknown work types preserve the original formula.
 	tests := []struct {
 		name          string
 		taskCompleted bool
@@ -32,7 +36,7 @@ func TestComputeRoutingReward(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := computeRoutingReward(tt.taskCompleted, tt.prCreated, tt.qaResult, tt.cost)
+			got := computeRoutingReward("unknown-work-type", tt.taskCompleted, tt.prCreated, tt.qaResult, tt.cost)
 			if diff := got - tt.want; diff > 1e-9 || diff < -1e-9 {
 				t.Errorf("computeRoutingReward = %v, want %v", got, tt.want)
 			}
@@ -134,5 +138,111 @@ func TestRecordRoutingFeedback_Gating(t *testing.T) {
 
 	if hits.Load() != 0 {
 		t.Fatalf("expected 0 POSTs when gated, got %d", hits.Load())
+	}
+}
+
+func TestComputeRoutingReward_WorkTypes(t *testing.T) {
+	for _, workType := range AllWorkTypes {
+		t.Run(workType, func(t *testing.T) {
+			if _, ok := routingRewardByWorkType[workType]; !ok {
+				t.Fatalf("missing reward definition for %s", workType)
+			}
+			wantCompletion, wantPR, wantQA := 1.0, 0.0, 0.0
+			switch workType {
+			case WorkTypeDevelopmentStr, WorkTypeInflight, WorkTypeMerge:
+				wantCompletion, wantPR, wantQA = 0.5, 0.2, 0.3
+			case WorkTypeQAStr, WorkTypeAcceptance:
+				wantCompletion, wantQA = 0.7, 0.3
+			}
+			for _, completed := range []bool{false, true} {
+				for _, pr := range []bool{false, true} {
+					for _, qa := range []string{"unknown", "failed", "passed"} {
+						for _, cost := range []float64{0, 2.5, 5, 10} {
+							got := computeRoutingReward(workType, completed, pr, qa, cost)
+							if math.IsNaN(got) || got < 0 || got > 1 {
+								t.Errorf("reward(%t, %t, %s, %v) = %v, outside [0,1]", completed, pr, qa, cost, got)
+							}
+						}
+					}
+				}
+			}
+			for _, tc := range []struct {
+				completed bool
+				pr        bool
+				qa        string
+				want      float64
+			}{
+				{true, false, "unknown", wantCompletion},
+				{false, true, "unknown", wantPR},
+				{false, false, "passed", wantQA},
+			} {
+				if got := computeRoutingReward(workType, tc.completed, tc.pr, tc.qa, 0); math.Abs(got-tc.want) > 1e-9 {
+					t.Errorf("reward(%t, %t, %s) = %v, want %v", tc.completed, tc.pr, tc.qa, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestComputeRoutingReward_ResearchAndDevelopment(t *testing.T) {
+	if got := computeRoutingReward(WorkTypeResearch, true, false, "unknown", 0); got < 0.8 {
+		t.Errorf("completed research reward = %v, want >= 0.8", got)
+	}
+	withoutPR := computeRoutingReward(WorkTypeDevelopmentStr, true, false, "unknown", 0)
+	withPR := computeRoutingReward(WorkTypeDevelopmentStr, true, true, "unknown", 0)
+	if withPR <= withoutPR {
+		t.Errorf("development with PR = %v, must exceed without PR = %v", withPR, withoutPR)
+	}
+}
+
+func TestRecordRoutingFeedback_RunUsesWorkType(t *testing.T) {
+	t.Setenv("ROUTING_RECORDER_ENABLED", "true")
+	for _, workType := range []string{WorkTypeResearch, WorkTypeQAStr, WorkTypeDevelopmentStr, "unknown-work-type"} {
+		t.Run(workType, func(t *testing.T) {
+			h := newRunnerHarness(t)
+			observations := make(chan routingFeedbackBody, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/routing-feedback") {
+					var body routingFeedbackBody
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("decode observation: %v", err)
+					} else {
+						observations <- body
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+			}))
+			defer srv.Close()
+			qw := h.queuedWork("routing-reward")
+			qw.WorkType = workType
+			qw.PlatformURL = srv.URL
+			// This stub turn completes without a PR, verdict or cost.
+			qw.ResolvedProfile.ProviderConfig = map[string]any{"stub.behavior": string(stub.BehaviorResumeSteer)}
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			res, err := h.runner.Run(ctx, qw)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.Status != "completed" || res.PullRequestURL != "" || res.WorkResult == "passed" {
+				t.Fatalf("unexpected session result: status=%s PR=%s verdict=%s", res.Status, res.PullRequestURL, res.WorkResult)
+			}
+			select {
+			case got := <-observations:
+				want := 0.5
+				switch workType {
+				case WorkTypeResearch:
+					want = 1
+				case WorkTypeQAStr:
+					want = 0.7
+				}
+				if got.WorkType != workType || math.Abs(got.Reward-want) > 1e-9 {
+					t.Errorf("observation workType=%s reward=%v, want %s reward=%v", got.WorkType, got.Reward, workType, want)
+				}
+			default:
+				t.Fatal("Run did not post routing feedback")
+			}
+		})
 	}
 }
