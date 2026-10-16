@@ -15,6 +15,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
+	"github.com/RenseiAI/donmai/runtime/state"
 )
 
 // sinkSummary renders the recorded sink stream as kind[:detail] tokens: the
@@ -87,6 +88,81 @@ func TestInteractive_TranscriptEventsReachSink(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("events.jsonl missing %s:\n%s", want, body)
 		}
+	}
+}
+
+// TestInteractive_StepAdvancesRunningThenStopped pins the interactive lane's
+// CurrentStep lifecycle: the runner writes "spawning" at state init and the
+// headless lane advances it on its first provider event, but the interactive
+// lane consumes no event stream — so dispatchInteractive must advance it to
+// "running" once the PTY surface is live and to "stopped" when the session
+// ends. Without these transitions the local dashboard renders "spawning"
+// for the whole session.
+func TestInteractive_StepAdvancesRunningThenStopped(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	r := minimalRunner(t)
+	worktreePath := t.TempDir()
+	if _, err := r.store.Update(worktreePath, func(s *state.State) error {
+		s.CurrentStep = "spawning"
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	readStep := func() string {
+		t.Helper()
+		st, err := r.store.Read(worktreePath)
+		if err != nil {
+			t.Fatalf("read state: %v", err)
+		}
+		return st.CurrentStep
+	}
+
+	session := liveRecordingInteractiveSession()
+	base := &fakeHandle{events: make(chan agent.Event, 1)}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "interactive-step"}}
+	res := &Result{SessionID: qw.SessionID}
+
+	type outcome struct {
+		result *Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		out, err := r.dispatchInteractive(
+			context.Background(), handle, worktreePath, qw, res, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+		)
+		done <- outcome{result: out, err: err}
+	}()
+
+	// The PTY surface is live once the session-started marker lands;
+	// the step must already read "running" by then.
+	deadline := time.After(5 * time.Second)
+	for {
+		if got := readStep(); got == "running" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("CurrentStep=%q while the session runs, want running", readStep())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	close(session.done)
+	select {
+	case got := <-done:
+		if got.err != nil || got.result.Status != "completed" {
+			t.Fatalf("dispatchInteractive = status %q err %v, want completed", got.result.Status, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchInteractive did not return after the session exited")
+	}
+	if got := readStep(); got != "stopped" {
+		t.Fatalf("CurrentStep=%q after the session ended, want stopped", got)
 	}
 }
 
