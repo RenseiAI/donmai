@@ -10,6 +10,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.79 — 2026-10-16
+
+### Fixes
+
+- Expose nullable issue estimates
+- Add attribution trailers to backstop commits
+
 ## v0.72.78 — 2026-10-15
 
 ### Chores
