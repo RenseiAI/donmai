@@ -17,20 +17,30 @@
 // Mechanism (verified against the real pinned binary):
 //
 //   - Claim: the `/donmai-claim <deliveryId> <text>` slash command persists
-//     a `donmai-notice-offer` custom entry FIRST — so a crash before
-//     application replays as unapplied work — then applies the notice into
-//     the conversation as a `donmai-notice` custom message via
-//     `pi.sendMessage`, which pi persists through SessionManager before it
-//     emits the `message_end` the Go tailer observes. The `message_end`
-//     handler then persists the `donmai-notice-applied` receipt binding the
-//     delivery to the persisted entry. The receipt therefore exists only
-//     after durable conversation persistence, never before it.
+//     a `donmai-notice-offer` custom entry binding (delivery, text) FIRST —
+//     so a crash before application replays as unapplied work — then
+//     applies the notice into the conversation as a `donmai-notice` custom
+//     message via `pi.sendMessage`, which pi persists through
+//     SessionManager before it emits the `message_end` the Go tailer
+//     observes. The `message_end` handler then persists the
+//     `donmai-notice-applied` receipt binding the delivery to the
+//     persisted entry. The receipt therefore exists only after durable
+//     conversation persistence, never before it. Only a non-empty text
+//     binds: a textless offer entry — plantable through the same-user
+//     session file — is skipped by both halves, so it can neither mint a
+//     receipt nor wedge the claim into a conflicting-payload refusal.
 //   - Idempotence: a repeated claim for an already-applied delivery ID
 //     reports "already applied" and writes nothing — no duplicate turn.
-//     A conflicting payload under the same ID is refused.
-//   - Recovery: an offer with no applied marker is unapplied work (reclaim
-//     it); an offer with one is complete (replay the receipt, apply
-//     nothing).
+//     A conflicting payload under the same ID is refused. A reclaim that
+//     finds the offer AND the persisted `donmai-notice` message but no
+//     applied marker — the crash-between-apply-and-marker window —
+//     appends the receipt only and reports "already applied": the
+//     receipt still follows durable persistence, because the persisted
+//     message IS the persistence it attests.
+//   - Recovery: an offer with no applied marker and no persisted message
+//     is unapplied work (reclaim it); a persisted message with no marker
+//     replays the receipt (apply nothing); an offer with a marker is
+//     complete (replay the receipt, apply nothing).
 //
 // The extension reads session state through ctx.sessionManager (the
 // runtime's own record), never by scanning transcript files: a peer that
@@ -84,6 +94,51 @@ function appliedReceipt(entries: any, deliveryId: string) {
   return findEntry(entries, APPLIED_TYPE, deliveryId);
 }
 
+function offerTextOf(entry: any) {
+  const text = entry && entry.data && entry.data.text;
+  return typeof text === "string" ? text : "";
+}
+
+// An offer binds (delivery, text) only when the text is actually persisted.
+// A textless entry — plantable through the same-user session file or the
+// shared appendEntry surface — is inert: skipped by both halves, so it can
+// neither satisfy the receipt half nor wedge the claim half into a
+// conflicting-payload refusal that blocks the legitimate claim.
+function findValidOffer(entries: any, deliveryId: string) {
+  return entries.find(
+    (e: any) =>
+      e && e.type === "custom" && e.customType === OFFER_TYPE && e.data && e.data.delivery === deliveryId && offerTextOf(e) !== "",
+  );
+}
+
+// The persisted text of an applied message. The runtime normalizes a
+// missing/null content to [] at ingestion, so a contentless event arrives
+// as a non-string: it normalizes to "" and can never satisfy the receipt.
+function messageTextOf(m: any) {
+  if (!m) return "";
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content)) {
+    let out = "";
+    for (const part of m.content) {
+      if (part && part.type === "text" && typeof part.text === "string") out += part.text;
+    }
+    return out;
+  }
+  return "";
+}
+
+// A persisted application of (delivery, text): the custom_message entry
+// pi's own sendMessage path wrote before emitting message_end. Crash
+// recovery keys on it: offer plus message without an applied marker means
+// the application survived and only the receipt is missing — replay the
+// receipt, never re-apply.
+function findAppliedMessage(entries: any, deliveryId: string, text: string) {
+  return entries.find(
+    (e: any) =>
+      e && e.type === "custom_message" && e.customType === MESSAGE_TYPE && e.details && e.details.deliveryId === deliveryId && messageTextOf(e) === text,
+  );
+}
+
 export default function activate(pi: ExtensionAPI) {
   // The claim command is effective only when the compiled embedder
   // trusts this file to share receipt authority. The Go side loads this
@@ -107,16 +162,23 @@ export default function activate(pi: ExtensionAPI) {
     const entries = entriesOf(ctx);
     const already = appliedReceipt(entries, deliveryId);
     if (already) return Promise.resolve("already applied " + deliveryId);
-    const offer = findEntry(entries, OFFER_TYPE, deliveryId);
+    const offer = findValidOffer(entries, deliveryId);
     if (offer) {
-      const offeredText = String((offer.data && offer.data.text) ?? "");
-      if (offeredText !== text) {
+      if (offerTextOf(offer) !== text) {
         return Promise.reject(new Error("delivery " + deliveryId + " already offered with a different payload"));
       }
     } else {
       // Persist the offer BEFORE applying: a crash between the two replays
       // as unapplied work, never as a lost application.
       pi.appendEntry(OFFER_TYPE, { delivery: deliveryId, text });
+    }
+    // Crash between application and the applied marker: the message is
+    // already durably persisted, so exact-replay the receipt instead of
+    // re-applying a duplicate turn. The receipt still follows durable
+    // persistence — the persisted message IS the persistence it attests.
+    if (findAppliedMessage(entries, deliveryId, text)) {
+      pi.appendEntry(APPLIED_TYPE, { delivery: deliveryId, kind: "applied" });
+      return Promise.resolve("already applied " + deliveryId);
     }
     // Application enters the conversation through pi's own message path, so
     // SessionManager persists it before the message_end the Go tailer
@@ -151,19 +213,22 @@ export default function activate(pi: ExtensionAPI) {
   });
 
   // The applied receipt is written when pi reports the applied message as
-  // persisted (message_end for the custom message this extension sent), not
-  // when the claim was issued. A crash between application and this marker
-  // replays the receipt without a duplicate turn: the message is already in
-  // the conversation, so reclaiming finds the applied marker missing but
-  // the message present and re-reports it instead of re-applying.
+  // persisted (message_end for the custom message this extension sent),
+  // not when the claim was issued — and only when the event carries the
+  // same non-empty text the persisted offer binds, so a contentless event
+  // mints nothing. A crash between application and this marker replays
+  // the receipt without a duplicate turn: the message is already in the
+  // conversation, so reclaiming finds the applied marker missing but the
+  // message present and re-reports the receipt instead of re-applying.
   //
-  // The receipt half consults the same trust verdict per event AND requires
-  // a matching offer this extension's own claim step persisted (same
-  // delivery ID; same text when the persisted message carries one): a
-  // peer sharing this process and the pi.sendMessage surface can emit its
-  // own donmai-notice message, but without an offer for that delivery the
-  // persistence event mints nothing — and without the verdict (or with a
-  // mismatched payload) it mints nothing either. A redelivered message_end
+  // The receipt half consults the same trust verdict per event AND
+  //  requires a matching offer this extension's own claim step persisted
+  //  (same delivery ID, same non-empty text) AND non-empty text on the
+  //  event itself: a peer sharing this process and the pi.sendMessage
+  //  surface can emit its own donmai-notice message, but without an
+  //  offer for that delivery the persistence event mints nothing —
+  //  and without the verdict, with a mismatched payload, with a textless
+  //  planted offer, or with a contentless event, it mints nothing either. A redelivered message_end
   // for an already-applied delivery replays the existing receipt instead
   // of stamping a second, so the receipt stream stays exactly-one per
   // delivery. The receipt therefore attests persistence of an offered
@@ -181,12 +246,17 @@ export default function activate(pi: ExtensionAPI) {
     const details = m.details || {};
     const deliveryId = String(details.deliveryId ?? "");
     if (!deliveryId) return;
+    // Both sides must carry persisted content: the event must carry
+    // non-empty text AND a valid offer must bind the same non-empty text.
+    // A textless planted offer is never honored, and a contentless event
+    // mints nothing — the receipt attests an offered (delivery, text) the
+    // session actually persisted, on both sides of the gate.
+    const messageText = messageTextOf(m);
+    if (!messageText) return;
     const entries = entriesOf(ctx);
-    const offer = findEntry(entries, OFFER_TYPE, deliveryId);
+    const offer = findValidOffer(entries, deliveryId);
     if (!offer) return;
-    const offeredText = String((offer.data && offer.data.text) ?? "");
-    const messageText = typeof m.content === "string" ? m.content : "";
-    if (offeredText && messageText && offeredText !== messageText) return;
+    if (offerTextOf(offer) !== messageText) return;
     if (appliedReceipt(entries, deliveryId)) return;
     pi.appendEntry(APPLIED_TYPE, { delivery: deliveryId, kind: "applied" });
   });

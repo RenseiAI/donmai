@@ -64,11 +64,12 @@ like the boundary). It exposes `/donmai-claim <deliveryId> <text>`:
   persistence (conditions 1–2).
 * A repeated claim for an applied ID reports "already applied" and writes
   nothing; a conflicting payload under the same ID is refused (conditions
-  1, 4). An offer with no applied marker is unapplied work and replays;
-  a crash after persistence re-reports the identical receipt without a
-  duplicate turn (condition 4). Offers and receipts live in the session
-  file, so reload preserves unapplied work and history never acknowledges
-  new deliveries (condition 5).
+  1, 4). An offer with no applied marker and no persisted message is
+  unapplied work and replays; a persisted `donmai-notice` message with no
+  marker — the crash-between-apply-and-marker window — replays the
+  receipt without a duplicate turn (condition 4). Offers and receipts
+  live in the session file, so reload preserves unapplied work and
+  history never acknowledges new deliveries (condition 5).
 * The command runs only when the spawn stamped the trust verdict
   (`DONMAI_NOTICE_CLAIM_TRUST=1`), which the spawn sets only after the
   compiled embedder's trusted set names the exact embedded digest AND no
@@ -76,14 +77,23 @@ like the boundary). It exposes `/donmai-claim <deliveryId> <text>`:
   cached. The verdict rides the spawn's complete environment, and any
   caller-carried copy is dropped by the harness-owned env prefix. The
   `message_end` handler mints the receipt only with the verdict AND a
-  matching persisted offer for that delivery (same ID, same text), and
-  replays — never duplicates — when one already exists. So an arbitrary
-  peer extension cannot mint the receipt without the offer, replay it
-  past one per delivery, or forge it in an untrusted session (condition
-  3); no proof is ever read out of a transcript or mailbox file. Exact
-  authorship binding (which copy of the command acted) still awaits a pi
-  upstream primitive — the fence proves the receipt never precedes the
-  offer and never exceeds one per delivery, not per-action identity.
+  matching persisted offer binding the same non-empty text the event
+  itself carries, and replays — never duplicates — when one already
+  exists. Only a non-empty text binds on either side: a textless offer
+  entry planted through the same-user session file is skipped by both
+  halves, so it can neither satisfy the receipt half nor wedge the claim
+  half into a conflicting-payload refusal. A crash between application
+  and the applied marker replays the receipt without a duplicate turn:
+  the reclaim finds the persisted `donmai-notice` message entry pi's
+  send path wrote and appends only the receipt. So an arbitrary peer
+  extension cannot mint the receipt without the offer, replay it past
+  one per delivery, forge it in an untrusted session, launder a payload
+  through a textless offer, or force a duplicate re-application
+  (condition 3); no proof is ever read out of a transcript or mailbox
+  file. Exact authorship binding (which copy of the command acted)
+  still awaits a pi upstream primitive — the fence proves the receipt
+  never precedes the offer and never exceeds one per delivery, not
+  per-action identity.
 * Direct `Handle.Inject` still refuses (`ErrInteractiveReceiptUnavailable`)
   and the runtime-inject rail still dead-letters `channel-not-driven`:
   the receipt path is claimed through the session's own channel, never

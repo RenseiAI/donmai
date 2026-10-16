@@ -450,7 +450,114 @@ func TestNoticeClaimFixture_LateTrustStampEnablesClaim(t *testing.T) {
 	}
 }
 
-// TestNoticeClaimFixture_OfferWithoutAppliedIsUnappliedWork proves crash
+// TestNoticeClaimFixture_TextlessPlantedOfferMintsNothing is the B1
+// both-sides-content proof: a peer plants a textless offer entry through
+// the same-user session file, then fires a contentless persistence event
+// for it. The receipt half mints NOTHING: the event carries no text and
+// the offer binds no text, and the receipt requires both.
+//
+// RED proof: restore the one-sided gate (require text only when both
+// sides carry it) and the contentless event mints the applied receipt.
+func TestNoticeClaimFixture_TextlessPlantedOfferMintsNothing(t *testing.T) {
+	t.Parallel()
+	entries := `[{"type":"custom","customType":"donmai-notice-offer","data":{"delivery":"D1"}}]`
+	msg := `{"role":"custom","customType":"donmai-notice","details":{"deliveryId":"D1"}}`
+	out := runNoticeClaimMessageEnd(t, true, entries, msg)
+	if !out.Registered {
+		t.Fatal("donmai-notice-claim extension did not register its handlers")
+	}
+	if len(out.Appended) != 0 {
+		t.Fatalf("textless planted offer minted %+v, want no receipt", out.Appended)
+	}
+}
+
+// TestNoticeClaimFixture_TextlessPlantedOfferCannotBlockLegitimateClaim
+// is the B1 claim-half proof: the same textless planted offer must not
+// wedge the claim channel into a conflicting-payload refusal. The
+// legitimate claim proceeds down the normal offer path — persisting its
+// own binding offer and applying exactly once.
+//
+// RED proof: look up any persisted offer (including a textless one) in
+// the claim path and the legitimate claim is refused as a conflict.
+func TestNoticeClaimFixture_TextlessPlantedOfferCannotBlockLegitimateClaim(t *testing.T) {
+	t.Parallel()
+	entries := `[{"type":"custom","customType":"donmai-notice-offer","data":{"delivery":"D1"}}]`
+	out := runNoticeClaimFixture(t, true, entries, `D1 HELLO`)
+	if !out.Registered {
+		t.Fatal("donmai-claim command was not registered")
+	}
+	if len(out.Notified) != 1 || out.Notified[0].Msg != "claimed D1" {
+		t.Fatalf("notified = %+v, want exactly [claimed D1] past the textless entry", out.Notified)
+	}
+	if len(out.Sent) != 1 {
+		t.Fatalf("sent = %+v, want exactly one application", out.Sent)
+	}
+	var offers int
+	for _, a := range out.Appended {
+		if a.CustomType == "donmai-notice-offer" {
+			offers++
+			if text, _ := a.Data["text"].(string); text != "HELLO" {
+				t.Fatalf("rebound offer text = %q, want the legitimate payload HELLO", text)
+			}
+		}
+	}
+	if offers != 1 {
+		t.Fatalf("appended = %+v, want exactly one rebound binding offer", out.Appended)
+	}
+}
+
+// TestNoticeClaimFixture_ContentlessEventMintsNothing is the B1 event-half
+// proof: even with a valid persisted offer, a persistence event carrying
+// no content (the shape the runtime normalizes a null content to) mints
+// nothing. The receipt attests persisted content, not a bare delivery ID.
+//
+// RED proof: drop the non-empty-text requirement on the receipt half and
+// the contentless event mints the applied receipt.
+func TestNoticeClaimFixture_ContentlessEventMintsNothing(t *testing.T) {
+	t.Parallel()
+	offer := `{"type":"custom","customType":"donmai-notice-offer","data":{"delivery":"D1","text":"HELLO"}}`
+	msg := `{"role":"custom","customType":"donmai-notice","content":null,"details":{"deliveryId":"D1"}}`
+	out := runNoticeClaimMessageEnd(t, true, `[`+offer+`]`, msg)
+	if !out.Registered {
+		t.Fatal("donmai-notice-claim extension did not register its handlers")
+	}
+	if len(out.Appended) != 0 {
+		t.Fatalf("contentless event minted %+v, want no receipt", out.Appended)
+	}
+}
+
+// TestNoticeClaimFixture_CrashBetweenApplyAndMarkerReplaysReceipt is the
+// B2 exact-replay proof: the session holds the valid offer AND the
+// persisted donmai-notice message (what pi's sendMessage path wrote before
+// emitting message_end) but no applied marker — the crash window. The
+// reclaim appends the applied receipt ONLY and reports "already applied":
+// no duplicate turn, and the receipt still follows durable conversation
+// persistence because the persisted message IS that persistence.
+//
+// RED proof: never look for the persisted message in the claim path and
+// the reclaim re-applies a second custom message instead of replaying.
+func TestNoticeClaimFixture_CrashBetweenApplyAndMarkerReplaysReceipt(t *testing.T) {
+	t.Parallel()
+	entries := `[{"type":"custom","customType":"donmai-notice-offer","data":{"delivery":"D1","text":"HELLO"}},` +
+		`{"type":"custom_message","customType":"donmai-notice","content":"HELLO","details":{"deliveryId":"D1"},"display":true}]`
+	out := runNoticeClaimFixture(t, true, entries, `D1 HELLO`)
+	if !out.Registered {
+		t.Fatal("donmai-claim command was not registered")
+	}
+	if len(out.Sent) != 0 {
+		t.Fatalf("crash-window reclaim sent %+v, want no re-application", out.Sent)
+	}
+	if len(out.Appended) != 1 || out.Appended[0].CustomType != "donmai-notice-applied" {
+		t.Fatalf("appended = %+v, want exactly the replayed applied receipt", out.Appended)
+	}
+	if delivery, _ := out.Appended[0].Data["delivery"].(string); delivery != "D1" {
+		t.Errorf("receipt delivery = %q, want D1", delivery)
+	}
+	if len(out.Notified) != 1 || out.Notified[0].Msg != "already applied D1" {
+		t.Errorf("notified = %+v, want exactly [already applied D1]", out.Notified)
+	}
+}
+
 // recovery replays instead of losing: an offer with no applied marker is
 // still claimable — the reclaim re-offers nothing (the offer persists) and
 // re-applies exactly once.
