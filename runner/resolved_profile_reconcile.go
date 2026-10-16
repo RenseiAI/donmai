@@ -171,24 +171,72 @@ func (rp resolvedProfileWire) foldLimits(pc map[string]any, modelProfileMaxOutpu
 }
 
 // providerConfigWithPositiveInt folds a positive value into pc under key. A
-// no-op when value is not positive or pc already carries the key: an explicit
-// providerConfig entry (or a modelProfile-derived one) wins over the
-// top-level wire field. pc is never mutated; a copy is returned when the key
-// is added.
+// no-op when value is not positive. An explicit providerConfig entry (or a
+// modelProfile-derived one) wins over the top-level wire field — but only
+// when that entry is itself a positive, whole number. A stale or malformed
+// entry (non-numeric, fractional, non-positive) is dropped, so a configured
+// top-level window is never shadowed into an unexplained spawn refusal — and
+// a stale entry on its own never survives as a value no harness would honor.
+// pc is never mutated; a copy is returned when the key is added, replaced,
+// or dropped.
 func providerConfigWithPositiveInt(pc map[string]any, key string, value int) map[string]any {
-	if value <= 0 {
+	if existing, ok := pc[key]; ok && positiveProviderConfigValue(existing) > 0 {
+		if value <= 0 {
+			return pc
+		}
 		return pc
 	}
-	if _, ok := pc[key]; ok {
-		return pc
+	if value <= 0 {
+		if _, ok := pc[key]; !ok {
+			return pc
+		}
+		out := make(map[string]any, len(pc))
+		for k, v := range pc {
+			if k == key {
+				continue
+			}
+			out[k] = v
+		}
+		return out
 	}
 	// CodeQL (go/allocation-size-overflow) flags an unbounded +1 capacity hint
 	// as a possible allocation-size overflow; len(pc) alone is a safe hint and
 	// the map still grows correctly when the key is inserted.
 	out := make(map[string]any, len(pc))
 	for k, v := range pc {
+		if k == key {
+			continue
+		}
 		out[k] = v
 	}
 	out[key] = value
 	return out
+}
+
+// positiveProviderConfigValue reads a token count (context window, output
+// limit) from a provider-config entry using the same rule the harnesses
+// apply when they read it back (the pi harness's positiveProviderConfigInt
+// idiom): int/int64/float64 are accepted, JSON decoding yields float64 for
+// numbers. Missing, non-numeric, fractional, or non-positive returns 0 — so
+// only a value the harness would honor keeps the top-level wire field from
+// folding in.
+func positiveProviderConfigValue(v any) int {
+	var n int
+	switch n2 := v.(type) {
+	case int:
+		n = n2
+	case int64:
+		n = int(n2)
+	case float64:
+		if n2 != float64(int(n2)) || float64(int(n2)) != n2 {
+			return 0
+		}
+		n = int(n2)
+	default:
+		return 0
+	}
+	if n <= 0 {
+		return 0
+	}
+	return n
 }

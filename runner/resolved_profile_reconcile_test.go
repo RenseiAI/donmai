@@ -284,6 +284,52 @@ func TestReconcileResolvedProfile_Effort(t *testing.T) {
 	}
 }
 
+// TestReconcileResolvedProfile_ContextWindowPrecedence pins which value a
+// gateway session's context window carries when the dispatch holds both a
+// top-level window and a provider-config entry: a valid entry wins (explicit
+// configuration), but a stale or malformed entry (non-numeric, fractional,
+// non-positive) never shadows a valid top-level window into a spawn refusal
+// — the valid window folds in instead. RED proof: honor a present-but-bad
+// entry (the old `if _, ok := pc[key]; ok` guard) and the stale-entry rows
+// below reconcile without the window the dispatch actually carried.
+func TestReconcileResolvedProfile_ContextWindowPrecedence(t *testing.T) {
+	t.Parallel()
+	fold := func(pc map[string]any, topLevel int) map[string]any {
+		t.Helper()
+		rp := resolvedProfileWire{ContextWindow: topLevel}
+		return rp.foldLimits(pc, 0)
+	}
+	for _, tc := range []struct {
+		name string
+		pc   map[string]any
+		top  int
+		want any // nil => the key must be absent
+	}{
+		{name: "top-level window folds in when no entry", pc: nil, top: 1_000_000, want: 1_000_000},
+		{name: "valid entry wins over top-level", pc: map[string]any{"contextWindow": 500_000}, top: 1_000_000, want: 500_000},
+		{name: "non-numeric entry loses to valid top-level", pc: map[string]any{"contextWindow": "lots"}, top: 1_000_000, want: 1_000_000},
+		{name: "fractional entry loses to valid top-level", pc: map[string]any{"contextWindow": 1.5}, top: 1_000_000, want: 1_000_000},
+		{name: "zero entry loses to valid top-level", pc: map[string]any{"contextWindow": 0}, top: 1_000_000, want: 1_000_000},
+		{name: "negative entry loses to valid top-level", pc: map[string]any{"contextWindow": -1}, top: 1_000_000, want: 1_000_000},
+		{name: "stale entry alone is dropped, not folded", pc: map[string]any{"other": 1, "contextWindow": "lots"}, top: 0, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := fold(tc.pc, tc.top)
+			v, present := got["contextWindow"]
+			if tc.want == nil {
+				if present {
+					t.Errorf("contextWindow = %v, want the key absent", v)
+				}
+				return
+			}
+			if !present || v != tc.want {
+				t.Errorf("contextWindow = %v (present=%t), want %v", v, present, tc.want)
+			}
+		})
+	}
+}
+
 func marshalFixture(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	raw, err := json.Marshal(v)

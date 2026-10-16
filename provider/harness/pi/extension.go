@@ -58,10 +58,9 @@ const (
 	// window is refused at spawn instead (requireContextWindow), so an
 	// unpinned var can never reach the child — the extension also refuses a
 	// missing value rather than running on a guessed default. The output-token
-	// pin is conditional
-	// the same way (ProviderConfig["maxOutputTokens"]), but it has NO
-	// fallback: unset, the extension registers the model without an output
-	// limit, so the serving endpoint's own limit applies. The thinking-level
+	// pin is conditional the same way (ProviderConfig["maxOutputTokens"]),
+	// but it has NO fallback: unset, the extension registers the model without
+	// an output limit, so the serving endpoint's own limit applies. The thinking-level
 	// pin carries the configured reasoning effort (thinkingLevelForEffort)
 	// and is always exported, empty when none is configured, in which case
 	// the extension registers no thinking-level map.

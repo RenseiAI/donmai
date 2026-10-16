@@ -788,11 +788,29 @@ export default async function activate(pi: ExtensionAPI) {
     // spawn by the Go harness (requireContextWindow), so reaching here
     // means a non-gateway injected route with no window — still fail closed
     // rather than silently clamping (or overselling) the model's window.
-    // The refusal is registered as a session-start error notification so
-    // it surfaces instead of running silently unregistered; in RPC mode
-    // the Go handshake gate still blocks every tool until verified, and in
-    // interactive mode the session runs on pi's own provider resolution
-    // without the injected model.
+    // In RPC mode the Go handshake gate still blocks every tool until
+    // verified, so registering a refusing tool_call gate below is what
+    // keeps the session from running silently unregistered: every guarded
+    // tool is blocked with the missing-window reason until the operator
+    // fixes the configuration. In interactive mode the same gate blocks
+    // every guarded tool locally — the session can start its TUI, but it
+    // cannot run tools against a downgraded provider without the operator
+    // seeing exactly why.
+    // A refusing gate on the same guarded-tool surface the boundary below
+    // covers: every guarded tool is blocked with the missing-window reason
+    // instead of running against whatever provider pi resolves on its own.
+    // Async in RPC mode so the refusal is recorded as the call's outcome
+    // (the registered-refusal contract below); sync in interactive mode,
+    // which has no Go side to record it on.
+    pi.on("tool_call", async (event: any, ctx: any) => {
+      const tool = String(event?.toolName ?? "");
+      if (!GUARDED_TOOLS.has(tool)) return;
+      const reason = "donmai provider not registered: no context window is configured";
+      if (rpcMode) {
+        await registerRefusal(ctx, token, tool, toolCallIdOf(event), reason);
+      }
+      return { block: true, reason };
+    });
     try {
       pi.on("session_start", (_event: unknown, ctx: any) => {
         ctx?.ui?.notify?.("donmai provider not registered: no context window is configured", "error");

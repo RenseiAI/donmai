@@ -326,6 +326,7 @@ func TestExtensionRegistersSessionKeyFromCredentialFile(t *testing.T) {
 	out := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 		credentialFileEnvVar + "=" + credPath,
 	}, "read", `{"path":"README.md"}`)
 	model := registeredDonmaiModel(t, out)
@@ -341,6 +342,7 @@ func TestExtensionRegistersSessionKeyFromCredentialFile(t *testing.T) {
 	out2 := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 	}, "read", `{"path":"README.md"}`)
 	providers2, _ := out2["providers"].([]any)
 	config2, _ := providers2[0].(map[string]any)["config"].(map[string]any)
@@ -390,6 +392,7 @@ func TestExtensionRestoresSessionEnvironmentFromCredentialFile(t *testing.T) {
 	out := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 		credentialFileEnvVar + "=" + credPath,
 		"SENTINEL_EXEC_DEFINED=exec-value",
 		"HARNESS_REPORT_ENV=SENTINEL_TOOL_TOKEN,SENTINEL_EXEC_DEFINED," + piBaseURLEnvVar + ",PI_FUTURE_CONFIG,SENTINEL_BAD,SENTINEL_MODEL_KEY_RESTORE," + PiKeyEnvVar,
@@ -598,13 +601,23 @@ func TestExtensionRefusesMissingContextWindow(t *testing.T) {
 		piDisallowedToolsEnvVar + "=",
 		piStateDirEnvVar + "=",
 	}
-	t.Run("missing window registers no provider and notifies", func(t *testing.T) {
+	t.Run("missing window registers no provider, blocks tools, and notifies", func(t *testing.T) {
 		t.Parallel()
 		// Always set, even when empty, so an inherited value in the
 		// test process's own environment can never leak in.
 		out := runExtensionFixture(t, append(append([]string(nil), base...), piContextWindowEnvVar+"="), "read", `{"path":"README.md"}`)
 		if providers, _ := out["providers"].([]any); len(providers) != 0 {
 			t.Errorf("registered providers = %v, want none without a context window", out["providers"])
+		}
+		// No silent routing downgrade: the tool_call the fixture offered
+		// is refused with the missing-window reason, not run against
+		// whatever provider pi would resolve on its own.
+		verdict, _ := out["verdict"].(map[string]any)
+		if block, _ := verdict["block"].(bool); verdict == nil || !block {
+			t.Errorf("missing-window tool_call verdict = %v, want a block", out["verdict"])
+		}
+		if reason, _ := verdict["reason"].(string); !strings.Contains(reason, "context window") {
+			t.Errorf("missing-window refusal %q does not name the context window", reason)
 		}
 		notifications, _ := out["notifications"].([]any)
 		found := false
@@ -825,6 +838,7 @@ func TestExtensionRegistersConfiguredThinkingLevel(t *testing.T) {
 				piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 				piAPIEnvVar + "=" + tc.api,
 				piModelEnvVar + "=served-model",
+				piContextWindowEnvVar + "=262144",
 				piOutputLimitEnvVar + "=64000",
 				piThinkingLevelEnvVar + "=" + tc.level,
 			}, "read", `{"path":"README.md"}`)
