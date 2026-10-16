@@ -474,7 +474,12 @@ func (c *Client) doRequest(ctx context.Context, query string, vars map[string]an
 			return err
 		}
 		lastDenial = err
-		timer := time.NewTimer(denial.delay)
+		// Sleep the jittered delay, never the bare server value: denied
+		// callers bursting together must not wake in lock-step. The
+		// deadline comparison above stays on the raw server value so a
+		// retry is never attempted when even the minimum jittered sleep
+		// would overrun the request budget.
+		timer := time.NewTimer(jitteredRetryDelay(denial.delay))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
