@@ -113,27 +113,6 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	provider := selection.Provider
-	// Current-step status beacons ride the session progress endpoint for
-	// the whole run: Report on every step change, Close with the terminal
-	// step when the run ends. Best-effort — a construct failure or a
-	// refused/unavailable endpoint never fails the run. The Close posts
-	// the terminal beacon even when the interval gate would swallow it,
-	// so the descriptor never keeps a mid-run phase after the session
-	// ends; background ctx so teardown races cannot lose it.
-	beacons := newStatusBeaconReporter(qw, r.statusBeaconInterval, r.now, r)
-	if beacons == nil {
-		r.logger.Warn("status-beacon reporter unavailable; running without step beacons",
-			"sessionId", qw.SessionID)
-	} else {
-		beacons.Report(ctx, StatusBeaconSpawning)
-	}
-	closeBeacons := func() {
-		if beacons == nil {
-			return
-		}
-		beacons.Close(context.Background(), terminalBeaconStep(res))
-	}
-	defer closeBeacons()
 	// Register the session's quota reporter before any harness side
 	// effect: live quota updates stream from the first turn, and the
 	// reporter must already be held so the consecutive-update dedup
@@ -1018,6 +997,29 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		defer stopCancel()
 		_ = handle.Stop(stopCtx)
 	}()
+
+	// Current-step status beacons ride the session progress endpoint from
+	// Spawn materialization to the run's end: Report on every step change,
+	// Close with the terminal step when the run ends. The reporter starts
+	// here — after the pre-Spawn refusals above — so a run that never
+	// reaches execution emits no beacon traffic at all, and local-transport
+	// runs stay network-quiet on their stub platform URL. Best-effort: a
+	// construct failure or a refused/unavailable endpoint never fails the
+	// run. The Close posts the terminal beacon even when the interval gate
+	// would swallow it, so the descriptor never keeps a mid-run phase
+	// after the session ends; background ctx so teardown races cannot
+	// lose it.
+	beacons := newStatusBeaconReporter(qw, r.statusBeaconInterval, r.now, r)
+	if beacons != nil {
+		beacons.Report(ctx, StatusBeaconSpawning)
+	}
+	closeBeacons := func() {
+		if beacons == nil {
+			return
+		}
+		beacons.Close(context.Background(), terminalBeaconStep(res))
+	}
+	defer closeBeacons()
 
 	// 8b. Wave 3 runtime memory-inject (v2) channel + per-Run dedup.
 	//

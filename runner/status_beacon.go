@@ -76,8 +76,10 @@ type statusBeaconReporter struct {
 // newStatusBeaconReporter builds the per-session reporter. interval <= 0
 // falls back to DefaultStatusBeaconInterval; a NEGATIVE interval disables
 // beacon posts entirely (returns nil — Report/Close are no-ops on nil).
-// A nil now falls back to time.Now. Returns nil when the beacon cannot be
-// constructed — the caller logs and continues without beacons.
+// A nil now falls back to time.Now. Returns nil when beacons stay quiet
+// for this run — the local-transport mode whose stub platform URL serves
+// no progress route, or a beacon that cannot be constructed — so the
+// caller skips beacon traffic without touching the run.
 //
 // httpClient and logger ride alongside the Runner so tests can point the
 // beacon at an httptest double; production passes the runner's own.
@@ -96,6 +98,9 @@ func newStatusBeaconReporter(qw QueuedWork, interval time.Duration, now func() t
 // without a Runner.
 func newStatusBeaconReporterWith(qw QueuedWork, interval time.Duration, now func() time.Time, r *Runner, client *http.Client, logger *slog.Logger) *statusBeaconReporter {
 	if interval < 0 {
+		return nil
+	}
+	if isLocalRuntimeTransport(qw.runtimeTransport) {
 		return nil
 	}
 	if interval == 0 {
@@ -212,13 +217,13 @@ func (s *statusBeaconReporter) lastPostedLocked() string {
 	return s.beacon.LastStep()
 }
 
-// post performs one beacon POST and stamps lastPost on success. A failure
-// leaves lastPost untouched so the next step change retries promptly
-// rather than waiting out a full interval after a swallowed error.
+// post performs one beacon POST and stamps lastPost on every attempt —
+// success or failure. The interval is the beacon's backoff: a down
+// endpoint is retried at most once per interval no matter how often the
+// step changes, while the terminal Close bypasses the gate so the final
+// step still lands.
 func (s *statusBeaconReporter) post(ctx context.Context, step string) {
-	if !s.beacon.Report(ctx, step) {
-		return
-	}
+	s.beacon.Report(ctx, step)
 	s.mu.Lock()
 	s.lastPost = s.now()
 	s.mu.Unlock()

@@ -3,7 +3,11 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -289,8 +293,11 @@ func TestTerminalBeaconStep(t *testing.T) {
 
 // TestNewStatusBeaconReporter_DisabledAndDegenerate pins the constructor
 // gates: a negative interval disables beacons (nil reporter, nil-safe
-// Report/Close), and work without a session id or platform URL degrades
-// to nil rather than a reporter that can never post.
+// Report/Close), work without a session id or platform URL degrades
+// to nil rather than a reporter that can never post, and a local-transport
+// session stays quiet on its stub platform URL — the fence
+// TestLocalTransportRunLoopModeBoundary guards would otherwise see beacon
+// traffic as unexpected network.
 func TestNewStatusBeaconReporter_DisabledAndDegenerate(t *testing.T) {
 	t.Parallel()
 
@@ -306,5 +313,53 @@ func TestNewStatusBeaconReporter_DisabledAndDegenerate(t *testing.T) {
 	empty := QueuedWork{}
 	if got := newStatusBeaconReporter(empty, 0, time.Now, nil); got != nil {
 		t.Fatal("work without session/platform must degrade to nil, not an unpostable reporter")
+	}
+	local := QueuedWork{QueuedWork: queuedWorkBase("BEACON-LOCAL")}
+	local.SessionID = "sess-beacon-local"
+	local.WorkerID = "worker-1"
+	local.PlatformURL = "http://127.0.0.1:7734/api/daemon/local"
+	local.runtimeTransport = RuntimeTransportLocal
+	if got := newStatusBeaconReporter(local, 0, time.Now, nil); got != nil {
+		t.Fatal("local-transport work must stay beacon-quiet (nil reporter), not post to the stub URL")
+	}
+}
+
+// TestRun_BeaconFailedPostBacksOff pins the failure backoff: with the
+// progress endpoint answering 500, rapid step changes after the first
+// failed post emit no further POST attempts until the interval elapses —
+// a down endpoint is retried at most once per interval, not once per step.
+// The double counts every /progress attempt (success or 500) separately
+// from the successful-post bodies waitBeacons reads.
+func TestRun_BeaconFailedPostBacksOff(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int64
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/progress") {
+			attempts.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			http.Error(w, "no", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(failing.Close)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BEACON-BACKOFF")}
+	qw.SessionID = "sess-beacon-backoff"
+	qw.WorkerID = "worker-1"
+	qw.PlatformURL = failing.URL
+	r := newStatusBeaconReporterWith(qw, 24*time.Hour, time.Now, nil, failing.Client(), nil)
+	if r == nil {
+		t.Fatal("reporter is nil for valid work")
+	}
+	ctx := context.Background()
+	r.Report(ctx, "streaming") // attempt 1: fails, consumes the interval slot
+	r.Report(ctx, "steering")  // must not retry: interval not elapsed
+	r.Report(ctx, "backstop")  // must not retry: interval not elapsed
+	// The old behaviour armed a coalescing timer on the gated path; wait
+	// past any such timer so this test would catch a regression that
+	// merely defers the retry instead of dropping it.
+	time.Sleep(100 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("beacon attempts after a failed post = %d; want 1 (backoff holds the interval slot)", got)
 	}
 }
