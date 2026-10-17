@@ -890,7 +890,7 @@ export default async function activate(pi: ExtensionAPI) {
     // (the registered-refusal contract below); sync in interactive mode,
     // which has no Go side to record it on.
     pi.on("tool_call", async (event: any, ctx: any) => {
-      const tool = String(event?.toolName ?? "");
+      const tool = String(event?.toolName ?? "").toLowerCase();
       if (!GUARDED_TOOLS.has(tool)) return;
       const reason = "donmai provider not registered: no context window is configured";
       if (rpcMode) {

@@ -12,6 +12,19 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
+// flipLastHexDigit returns sha with its final hex digit replaced by a
+// different one, so the result is always a wrong SHA even when sha itself
+// ends in "f" (naively appending "f" would be a no-op there and the
+// "wrong" claim would verify).
+func flipLastHexDigit(sha string) string {
+	last := sha[len(sha)-1]
+	replacement := byte('f')
+	if last == 'f' {
+		replacement = 'e'
+	}
+	return sha[:len(sha)-1] + string(replacement)
+}
+
 // TestHandshakeSHA_Verification is the cryptographic core of smoke 1
 // (tampered-extension fixture): only the exact embedded-extension SHA
 // verifies; a wrong or empty SHA fails closed.
@@ -24,7 +37,7 @@ func TestHandshakeSHA_Verification(t *testing.T) {
 	if !verifyHandshakeSHA(realSHA) {
 		t.Errorf("verifyHandshakeSHA(realSHA) = false, want true")
 	}
-	for _, bad := range []string{"", "deadbeef", strings.Repeat("0", 64), realSHA[:63] + "f"} {
+	for _, bad := range []string{"", "deadbeef", strings.Repeat("0", 64), flipLastHexDigit(realSHA)} {
 		if verifyHandshakeSHA(bad) {
 			t.Errorf("verifyHandshakeSHA(%q) = true, want false (must fail closed)", bad)
 		}
@@ -640,6 +653,24 @@ func TestExtensionRefusesMissingContextWindow(t *testing.T) {
 			}
 		}
 	})
+	t.Run("mixed-case tool spelling is still refused", func(t *testing.T) {
+		t.Parallel()
+		// The refusal gate normalizes the tool name before matching
+		// GUARDED_TOOLS, exactly like the interactive lane's own gate:
+		// a mixed-case spelling must block, never bypass the gate and run
+		// against whatever provider pi resolves on its own.
+		out := runExtensionFixture(t, append(append([]string(nil), base...), piContextWindowEnvVar+"="), "Read", `{"path":"README.md"}`)
+		if providers, _ := out["providers"].([]any); len(providers) != 0 {
+			t.Errorf("registered providers = %v, want none without a context window", out["providers"])
+		}
+		verdict, _ := out["verdict"].(map[string]any)
+		if block, _ := verdict["block"].(bool); verdict == nil || !block {
+			t.Errorf("mixed-case tool_call verdict = %v, want a block", out["verdict"])
+		}
+		if reason, _ := verdict["reason"].(string); !strings.Contains(reason, "context window") {
+			t.Errorf("mixed-case refusal %q does not name the context window", reason)
+		}
+	})
 	t.Run("configured window registers", func(t *testing.T) {
 		t.Parallel()
 		out := runExtensionFixture(t, append(append([]string(nil), base...), piContextWindowEnvVar+"=262144", piOutputLimitEnvVar+"=64000"),
@@ -1039,6 +1070,7 @@ func TestExtensionRegistersRoutingPreferenceOnlyOnChatCompletions(t *testing.T) 
 				piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 				piAPIEnvVar + "=" + tc.api,
 				piModelEnvVar + "=served-model",
+				piContextWindowEnvVar + "=262144",
 				piOutputLimitEnvVar + "=64000",
 				piThinkingLevelEnvVar + "=max",
 				piRoutingOrderEnvVar + "=" + tc.order,
