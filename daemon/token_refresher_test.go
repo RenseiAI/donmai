@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -146,6 +147,128 @@ func TestTokenRefresher_NilRefreshNeverStarts(t *testing.T) {
 	r := newTokenRefresher(tokenRefresherOptions{ExpiresAt: time.Now()})
 	r.Start() // must not panic / spin
 	r.Stop()
+}
+
+// TestTokenRefresher_NextWaitCappedAtMaxWait pins the sleep ceiling: a
+// token far from expiry arms a short re-check wait — never one long timer
+// across the whole window — so host sleep (which freezes the monotonic
+// clock timers run on) cannot push the single wake past expiry.
+func TestTokenRefresher_NextWaitCappedAtMaxWait(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	r := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt: now.Add(60 * time.Minute), // 55 min to the lead boundary
+		Lead:      5 * time.Minute,
+		MinWait:   time.Millisecond,
+		MaxWait:   time.Minute,
+		Now:       func() time.Time { return now },
+		Refresh: func(context.Context) (time.Time, error) {
+			t.Error("Refresh must not fire while building the wait")
+			return time.Time{}, nil
+		},
+	})
+
+	if got := r.nextWait(); got > time.Minute {
+		t.Fatalf("nextWait() = %v, want <= maxWait (%v)", got, time.Minute)
+	}
+}
+
+// TestTokenRefresher_SimulatedSleepRefreshesOnNextWake drives the loop
+// through a wall-clock jump between wakes: Now leaps past expiry-lead
+// (as if the host slept) and the very next wake must call Refresh exactly
+// once — the proactive refresh fires at the wall-clock boundary, not when
+// one long monotonic timer would have elapsed.
+func TestTokenRefresher_SimulatedSleepRefreshesOnNextWake(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Now()
+	current := now
+	nowFn := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return current
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		current = current.Add(d)
+	}
+
+	var calls atomic.Int32
+	refreshed := make(chan struct{}, 8)
+	r := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt: now.Add(60 * time.Minute),
+		Lead:      5 * time.Minute,
+		MinWait:   time.Millisecond,
+		MaxWait:   20 * time.Millisecond,
+		Now:       nowFn,
+		Refresh: func(context.Context) (time.Time, error) {
+			calls.Add(1)
+			refreshed <- struct{}{}
+			return current.Add(time.Hour), nil
+		},
+	})
+	r.Start()
+	t.Cleanup(r.Stop)
+
+	// Let the loop arm on capped re-check waits, then jump the wall clock
+	// past expiry-lead in one step: the next wake must refresh.
+	time.Sleep(50 * time.Millisecond)
+	advance(56 * time.Minute)
+
+	select {
+	case <-refreshed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Refresh never fired after the wall clock jumped past expiry-lead")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("Refresh calls = %d, want exactly 1 after the jump", got)
+	}
+}
+
+// TestTokenRefresher_WakeBeforeLeadDoesNotRefresh pins the wall-clock
+// gate: a wake while now is still before expiry-lead re-arms without
+// calling Refresh — capped waits are re-checks, not refresh triggers.
+func TestTokenRefresher_WakeBeforeLeadDoesNotRefresh(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	r := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt: now.Add(time.Hour),
+		Lead:      5 * time.Minute,
+		MinWait:   time.Millisecond,
+		MaxWait:   time.Millisecond,
+		Now:       func() time.Time { return now },
+		Refresh: func(context.Context) (time.Time, error) {
+			t.Error("Refresh fired before expiry-lead")
+			return time.Time{}, nil
+		},
+	})
+
+	if r.due() {
+		t.Fatal("due() = true 55 min before expiry-lead, want false")
+	}
+
+	var calls atomic.Int32
+	r2 := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt: now.Add(time.Hour),
+		Lead:      5 * time.Minute,
+		MinWait:   time.Millisecond,
+		MaxWait:   10 * time.Millisecond,
+		Now:       func() time.Time { return now },
+		Refresh: func(context.Context) (time.Time, error) {
+			calls.Add(1)
+			return time.Now().Add(time.Hour), nil
+		},
+	})
+	r2.Start()
+	t.Cleanup(r2.Stop)
+	time.Sleep(60 * time.Millisecond) // several capped wakes, all before the lead
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("Refresh calls = %d while still before expiry-lead, want 0", got)
+	}
 }
 
 // TestSetCredentials_FansOutToServices pins the cross-service credential

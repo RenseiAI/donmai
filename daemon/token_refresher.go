@@ -41,6 +41,15 @@ const (
 	// minRefreshWait floors the scheduled wait so an already-expired (or
 	// skewed) expiry cannot hot-loop the refresher.
 	minRefreshWait = 10 * time.Second
+
+	// maxRefreshWait caps each scheduled wait so the loop re-checks the
+	// wall clock at least that often. Go timers run on the monotonic
+	// clock, which does not advance while the host sleeps; without a
+	// ceiling a host that sleeps through most of a token window would wake
+	// to an already-expired token and fall back to the reactive path. A
+	// wake is only a re-check: the refresh itself still fires solely when
+	// wall-clock now has reached expiry-lead.
+	maxRefreshWait = time.Minute
 )
 
 // tokenRefresherOptions configures a tokenRefresher. Refresh is required;
@@ -65,6 +74,8 @@ type tokenRefresherOptions struct {
 	AssumedTTL time.Duration
 	// MinWait overrides minRefreshWait (tests only).
 	MinWait time.Duration
+	// MaxWait overrides maxRefreshWait (tests only).
+	MaxWait time.Duration
 	// Now overrides time.Now (tests only).
 	Now func() time.Time
 }
@@ -95,6 +106,13 @@ func (o tokenRefresherOptions) minWait() time.Duration {
 		return o.MinWait
 	}
 	return minRefreshWait
+}
+
+func (o tokenRefresherOptions) maxWait() time.Duration {
+	if o.MaxWait > 0 {
+		return o.MaxWait
+	}
+	return maxRefreshWait
 }
 
 func (o tokenRefresherOptions) now() time.Time {
@@ -146,9 +164,14 @@ func (r *tokenRefresher) Stop() {
 	r.running = false
 }
 
-// loop schedules one refresh per expiry window: sleep until expiry−lead,
-// refresh, reschedule off the new expiry. Failures retry on the (much
-// shorter) retry interval; the reactive 401 path remains the final backstop.
+// loop schedules one refresh per expiry window: wake at least every
+// maxWait, refresh only once wall-clock now has reached expiry-lead
+// (otherwise re-arm), then reschedule off the new expiry. Capping each
+// wait re-checks the wall clock instead of trusting one long monotonic
+// timer across host sleep: timers do not advance while the host sleeps,
+// so an uncapped wait could fire after the token already expired. Failures
+// retry on the (much shorter) retry interval; the reactive 401 path remains
+// the final backstop.
 func (r *tokenRefresher) loop(ctx context.Context) {
 	for {
 		timer := time.NewTimer(r.nextWait())
@@ -157,6 +180,12 @@ func (r *tokenRefresher) loop(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-timer.C:
+		}
+
+		// Wall-clock gate: a wake before expiry-lead (a capped re-check,
+		// or a timer that fired early) re-arms without refreshing.
+		if !r.due() {
+			continue
 		}
 
 		newExp, err := r.opts.Refresh(ctx)
@@ -186,9 +215,10 @@ func (r *tokenRefresher) loop(ctx context.Context) {
 	}
 }
 
-// nextWait computes the sleep until the next proactive refresh:
-// expiry − lead, floored at minWait. An unknown expiry assumes
-// now + AssumedTTL.
+// nextWait computes the sleep until the next wall-clock re-check: the
+// wait until expiry − lead, floored at minWait and capped at maxWait. An
+// unknown expiry assumes now + AssumedTTL. The expiry-lead trigger itself
+// is evaluated by due() on each wake, so a capped wait only re-arms.
 func (r *tokenRefresher) nextWait() time.Duration {
 	r.mu.Lock()
 	exp := r.expiresAt
@@ -199,10 +229,30 @@ func (r *tokenRefresher) nextWait() time.Duration {
 		exp = now.Add(r.opts.assumedTTL())
 	}
 	wait := exp.Sub(now) - r.opts.lead()
+	if wait > r.opts.maxWait() {
+		wait = r.opts.maxWait()
+	}
 	if wait < r.opts.minWait() {
 		wait = r.opts.minWait()
 	}
 	return wait
+}
+
+// due reports whether wall-clock now has reached expiry − lead, i.e. the
+// proactive refresh is actually owed. An unknown expiry is always due: the
+// wait was scheduled off the assumed TTL, so a wake means that assumed
+// boundary was reached — mirroring nextWait, which assumes rather than
+// going dormant.
+func (r *tokenRefresher) due() bool {
+	r.mu.Lock()
+	exp := r.expiresAt
+	r.mu.Unlock()
+
+	if exp.IsZero() {
+		return true
+	}
+	now := r.opts.now()
+	return !now.Before(exp.Add(-r.opts.lead()))
 }
 
 func (r *tokenRefresher) setExpiresAt(t time.Time) {
