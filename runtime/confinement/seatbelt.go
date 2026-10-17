@@ -13,7 +13,7 @@ import (
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v7"
+const seatbeltProfileVersion = "seatbelt-profile-v8"
 
 // seatbeltHost is what a rendering needs from the host beside the session.
 type seatbeltHost struct {
@@ -23,6 +23,12 @@ type seatbeltHost struct {
 	// runtimeReads are host-specific runtime paths readable under a read
 	// scope beside the static list: the active developer directory.
 	runtimeReads []string
+	// runtimeLiterals are host-specific runtime files readable under a read
+	// scope as exact literals beside the static list: the tool lookup
+	// cache, which records earlier callers' home paths. A subtree allow
+	// would expose every sibling the temporary directory may hold, so the
+	// file is named exactly.
+	runtimeLiterals []string
 }
 
 // seatbeltReadOps are the read operations a read scope governs. Extended
@@ -247,6 +253,10 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 		if err != nil {
 			return "", err
 		}
+		runtimeLiteralFilters, err := filters("literal", host.runtimeLiterals)
+		if err != nil {
+			return "", err
+		}
 		sessionFilters, err := filters("subpath", r.ReadAllowlist())
 		if err != nil {
 			return "", err
@@ -259,7 +269,7 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 		b.WriteString("; are denied outside the allowlist. Metadata stays readable.\n")
 		fmt.Fprintf(&b, "(deny %s)\n", seatbeltReadOps)
 		b.WriteString("; Runtime and toolchain paths.\n")
-		rule("allow", seatbeltReadOps, append(append([]string{}, seatbeltRuntimeReads...), runtimeFilters...))
+		rule("allow", seatbeltReadOps, append(append(append([]string{}, seatbeltRuntimeReads...), runtimeFilters...), runtimeLiteralFilters...))
 		b.WriteString("; Package data trees (databases, keys), inside the runtime allows.\n")
 		rule("deny", seatbeltReadOps, dataFilters)
 		b.WriteString("; The system volumes, except the OS cryptexes.\n")
