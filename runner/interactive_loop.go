@@ -572,7 +572,7 @@ func (r *Runner) finishInteractiveOwnershipLoss(
 		res.Error = "operator cancelled interactive session (lock-refresh stop=true)"
 	} else {
 		res.FailureMode = FailureLostOwnership
-		res.Error = heartbeat.ErrLostOwnership.Error()
+		res.Error = heartbeat.LostOwnershipError(pulser)
 	}
 	r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
 		"interactive session ownership lost: "+res.FailureMode)

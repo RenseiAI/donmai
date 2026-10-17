@@ -1658,3 +1658,155 @@ func TestDispatchTraceHeaders(t *testing.T) {
 		})
 	}
 }
+
+// TestLastFailureStatusRetainsTheTrippingStatus drives the production tick
+// path (Start → tick → LostOwnership): three 401 ticks trip the fuse and
+// the retained status is 401; a 500 server retains 500; a server that never
+// answers (no HTTP response) retains 0.
+func TestLastFailureStatusRetainsTheTrippingStatus(t *testing.T) {
+	t.Parallel()
+
+	t.Run("auth rejection trips with 401 retained", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no", http.StatusUnauthorized)
+		})
+		p, err := heartbeat.New(heartbeat.Config{
+			SessionID:          "s1",
+			BaseURL:            srv.URL,
+			HTTPClient:         srv.Client(),
+			Interval:           5 * time.Millisecond,
+			MaxAttemptsPerTick: 1, // one attempt per tick → predictable 3-tick trip
+			StrikesUntilLost:   3,
+			Sleep:              func(time.Duration) {},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = p.Stop() })
+
+		select {
+		case <-p.LostOwnership():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("LostOwnership did not fire (strikes=%d)", p.Strikes())
+		}
+		if got := p.LastFailureStatus(); got != http.StatusUnauthorized {
+			t.Fatalf("LastFailureStatus() = %d; want %d", got, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("server error retains 500", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no", http.StatusInternalServerError)
+		})
+		p, err := heartbeat.New(heartbeat.Config{
+			SessionID:          "s1",
+			BaseURL:            srv.URL,
+			HTTPClient:         srv.Client(),
+			Interval:           5 * time.Millisecond,
+			MaxAttemptsPerTick: 1,
+			StrikesUntilLost:   3,
+			Sleep:              func(time.Duration) {},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = p.Stop() })
+
+		select {
+		case <-p.LostOwnership():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("LostOwnership did not fire (strikes=%d)", p.Strikes())
+		}
+		if got := p.LastFailureStatus(); got != http.StatusInternalServerError {
+			t.Fatalf("LastFailureStatus() = %d; want %d", got, http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("transport error retains 0", func(t *testing.T) {
+		t.Parallel()
+
+		// An unroutable address fails before any HTTP response exists.
+		p, err := heartbeat.New(heartbeat.Config{
+			SessionID:          "s1",
+			BaseURL:            "http://127.0.0.1:1",
+			Interval:           5 * time.Millisecond,
+			MaxAttemptsPerTick: 1,
+			StrikesUntilLost:   3,
+			Sleep:              func(time.Duration) {},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = p.Stop() })
+
+		select {
+		case <-p.LostOwnership():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("LostOwnership did not fire (strikes=%d)", p.Strikes())
+		}
+		if got := p.LastFailureStatus(); got != 0 {
+			t.Fatalf("LastFailureStatus() = %d; want 0 (no response)", got)
+		}
+	})
+}
+
+// TestLostOwnershipErrorText pins the terminal-result rendering: a recorded
+// status is suffixed, a zero status (or a nil pulser) keeps the bare generic
+// string.
+func TestLostOwnershipErrorText(t *testing.T) {
+	t.Parallel()
+
+	var nilPulser *heartbeat.Pulser
+	if got := heartbeat.LostOwnershipError(nilPulser); got != heartbeat.ErrLostOwnership.Error() {
+		t.Fatalf("nil pulser: got %q; want bare %q", got, heartbeat.ErrLostOwnership.Error())
+	}
+
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no", http.StatusUnauthorized)
+	})
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           24 * time.Hour, // one tick only
+		MaxAttemptsPerTick: 1,
+		Sleep:              func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	if got, want := p.LastFailureStatus(), http.StatusUnauthorized; got != want {
+		t.Fatalf("LastFailureStatus() = %d; want %d", got, want)
+	}
+	errText := heartbeat.LostOwnershipError(p)
+	if !strings.Contains(errText, "401") || !strings.Contains(errText, "last lock-refresh status") {
+		t.Fatalf("LostOwnershipError = %q; want the 401 suffix", errText)
+	}
+	if !strings.Contains(errText, heartbeat.ErrLostOwnership.Error()) {
+		t.Fatalf("LostOwnershipError = %q; want the generic text as prefix", errText)
+	}
+}
