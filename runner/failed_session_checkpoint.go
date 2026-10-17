@@ -15,14 +15,16 @@ var safeWIPSessionID = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)
 // wipRefAttemptNow and wipRefAttemptRand are the clock and entropy
 // behind per-attempt reserved refs. Variables so a test can pin both
 // and assert two failures of one session land on distinct refs.
-var wipRefAttemptNow = time.Now
-var wipRefAttemptRand = func() string {
-	var raw [4]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "fallback"
+var (
+	wipRefAttemptNow  = time.Now
+	wipRefAttemptRand = func() string {
+		var raw [4]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "fallback"
+		}
+		return hex.EncodeToString(raw[:])
 	}
-	return hex.EncodeToString(raw[:])
-}
+)
 
 // wipAttemptRef returns the reserved ref for one failed-session
 // checkpoint attempt. The ref is per-attempt

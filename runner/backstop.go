@@ -88,10 +88,10 @@ var excludePathPrefixes = []string{
 // and world-fetchable on public repositories. Exact names keep the rule
 // auditable next to the deny patterns below.
 var wipSecretBasenames = map[string]bool{
-	".envrc":          true,
-	".npmrc":          true,
-	".pypirc":         true,
-	".netrc":          true,
+	".envrc":           true,
+	".npmrc":           true,
+	".pypirc":          true,
+	".netrc":           true,
 	".git-credentials": true,
 }
 
