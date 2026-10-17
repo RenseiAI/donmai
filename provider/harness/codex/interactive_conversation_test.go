@@ -559,6 +559,111 @@ func TestInteractiveConversationTailer_UnknownThreadStaysQuiet(t *testing.T) {
 	}
 }
 
+// TestMapConversationLine_TokenCountDeliversIdenticalCountsOnDifferentTurns
+// pins the turn-identity fix: two turns with identical counters deliver
+// two usage events, because the usage key is the envelope turn id, not
+// the counters. Reverting the key to counters-only maps the second turn
+// to nothing.
+func TestMapConversationLine_TokenCountDeliversIdenticalCountsOnDifferentTurns(t *testing.T) {
+	t.Parallel()
+	tailer := newInteractiveConversationTailer("", nil)
+	mkUsage := func(turn string) string {
+		return conversationRolloutLine(t, map[string]any{
+			"type": "event_msg",
+			"payload": map[string]any{
+				"type":      "token_count",
+				"thread_id": "thread-x",
+				"turn_id":   turn,
+				"info": map[string]any{
+					"total_token_usage": map[string]any{
+						"input_tokens": 100, "cached_input_tokens": 10,
+						"cache_write_input_tokens": 5, "output_tokens": 20,
+						"reasoning_output_tokens": 0, "total_tokens": 120,
+					},
+					"last_token_usage": map[string]any{
+						"input_tokens": 100, "cached_input_tokens": 10,
+						"cache_write_input_tokens": 5, "output_tokens": 20,
+						"reasoning_output_tokens": 0, "total_tokens": 120,
+					},
+				},
+			},
+		})
+	}
+	first := tailer.mapLine([]byte(mkUsage("turn-1")))
+	if len(first) != 1 {
+		t.Fatalf("first identical-count turn mapped %d events; want 1", len(first))
+	}
+	second := tailer.mapLine([]byte(mkUsage("turn-2")))
+	if len(second) != 1 {
+		t.Fatalf("second identical-count turn mapped %d events; want 1 (different turn, different record)", len(second))
+	}
+	// A re-read of the same line still collapses: the turn id plus the
+	// counters repeat exactly.
+	if again := tailer.mapLine([]byte(mkUsage("turn-1"))); len(again) != 0 {
+		t.Fatalf("re-read of turn-1 mapped %d events; want none", len(again))
+	}
+}
+
+// TestInteractiveConversationTailer_OrphanedStartsStayBounded pins the
+// pending-eviction fix: staged exec starts that never complete age out
+// after the sweep bound instead of growing for the session's life. A
+// completion arriving after its start aged out still delivers through
+// the completion-reconstruction path. It drives the production sweep
+// path: each orphan is written to the session's real rollout and swept.
+func TestInteractiveConversationTailer_OrphanedStartsStayBounded(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	thread := "thread-orphan-bound"
+	tailer := newInteractiveConversationTailer(home, func() string { return thread })
+	// Create the rollout once, then append one orphan per sweep: every
+	// sweep stages exactly one new orphan while the bound reaps the
+	// oldest, mirroring a chatty session whose completions lag.
+	path := writeConversationRollout(t, home, thread, nil)
+	total := interactiveConversationMaxPendingAgeSweeps + 10
+	for i := range total {
+		call := "orphan-" + itoa(i)
+		appendConversationRollout(t, path, []string{
+			conversationRolloutLine(t, map[string]any{
+				"type": "response_item",
+				"payload": map[string]any{
+					"type": "custom_tool_call", "id": "ctc-" + call, "status": "running",
+					"call_id": call, "name": "exec",
+					"input": `text(await tools.exec_command({cmd:"orphan-` + call + `",` + "\"max_output_tokens\":100}));\\n",
+				},
+			}),
+		})
+		tailer.sweep()
+	}
+	if len(tailer.pending) > interactiveConversationMaxPendingAgeSweeps {
+		t.Fatalf("pending holds %d orphaned starts after %d sweeps; want at most %d", len(tailer.pending), total, interactiveConversationMaxPendingAgeSweeps)
+	}
+	for command, queue := range tailer.pendingExecByCommand {
+		for _, key := range queue {
+			if _, ok := tailer.pending[key]; !ok {
+				t.Fatalf("queue %q holds evicted key %q; want the queues pruned with the entries", command, key)
+			}
+		}
+	}
+	// A completion arriving after its start aged out still delivers
+	// through the completion-reconstruction path.
+	done := tailer.mapLine([]byte(conversationRolloutLine(t, map[string]any{
+		"type": "event_msg",
+		"payload": map[string]any{
+			"type": "item_completed", "thread_id": thread, "turn_id": "turn-late",
+			"item": map[string]any{
+				"type": "CommandExecution", "id": "exec-late",
+				"command":           []any{"/bin/zsh", "-lc", "orphan-orphan-0"},
+				"status":            "completed",
+				"exit_code":         0,
+				"aggregated_output": "late\\n",
+			},
+		},
+	})))
+	if len(done) != 2 {
+		t.Fatalf("late completion mapped %d events; want 2 (reconstructed use + result)", len(done))
+	}
+}
+
 // TestInteractiveConversationTailer_SubagentFilesDeliver pins that a
 // session that delegates streams its subagent's conversation: the
 // subagent thread's rollout (named by session_meta) is tailed alongside

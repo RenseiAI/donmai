@@ -330,6 +330,7 @@ func (t *interactiveConversationTailer) mapCustomCall(payload json.RawMessage, r
 		toolUseID: call.CallID,
 		input:     map[string]any{"command": command},
 		raw:       raw,
+		stagedAt:  t.sweeps,
 	}
 	t.pendingExecByCommand[command] = append(t.pendingExecByCommand[command], key)
 	return nil
@@ -368,6 +369,7 @@ func (t *interactiveConversationTailer) mapFunctionCall(payload json.RawMessage,
 		toolUseID: call.CallID,
 		input:     input,
 		raw:       raw,
+		stagedAt:  t.sweeps,
 	}
 	return nil
 }
@@ -426,7 +428,9 @@ func (t *interactiveConversationTailer) mapEventMsg(payload json.RawMessage, raw
 	case "task_complete":
 		return t.mapTaskComplete(msg, raw)
 	case "token_count":
-		return t.mapTokenCount(msg.Info)
+		// The envelope turn id scopes the usage record to its own turn;
+		// without it two turns with identical counters are one record.
+		return t.mapTokenCount(msg.TurnID, msg.Info, raw)
 	default:
 		// item_started (a started-but-never-completed item emits
 		// nothing), task_started, thread_settings_applied, and unknown
@@ -642,7 +646,12 @@ func (t *interactiveConversationTailer) mapTaskComplete(msg rolloutEventPayload,
 // excludes both cache buckets, floored at zero. The thread cumulative
 // (total_token_usage) never maps per-turn. A nil or empty last-call usage
 // maps to nothing.
-func (t *interactiveConversationTailer) mapTokenCount(info *rolloutTokenInfo) []agentEvent {
+//
+// The usage identity is the turn id when the envelope carries one, else
+// the raw line: identical counters on different turns are different
+// records, while a re-read of the same line collapses. Counters alone
+// are probability, not identity.
+func (t *interactiveConversationTailer) mapTokenCount(turnID string, info *rolloutTokenInfo, raw string) []agentEvent {
 	if info == nil || info.Last == nil {
 		return nil
 	}
@@ -655,15 +664,32 @@ func (t *interactiveConversationTailer) mapTokenCount(info *rolloutTokenInfo) []
 		return nil
 	}
 	// The usage identity spans both the last-call and cumulative counts:
-	// two turns rarely repeat all ten counters, while a re-read repeats
-	// them exactly.
-	key := fmt.Sprintf("turn-usage:%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d",
-		last.InputTokens, last.CachedInputTokens, last.CacheWriteInputTokens, last.OutputTokens, last.ReasoningOutputTokens,
-		info.Total.InputTokens, info.Total.CachedInputTokens, info.Total.CacheWriteInputTokens, info.Total.OutputTokens, info.Total.ReasoningOutputTokens)
-	if _, dup := t.seen[key]; dup {
+	// a re-read repeats them exactly and collapses. The turn id makes
+	// identical counters on different turns two records; a record with
+	// no turn id falls back to the raw line, which only its own re-read
+	// repeats.
+	var identity string
+	switch {
+	case turnID != "":
+		identity = "turn-usage-id:" + turnID
+	case raw != "":
+		identity = "turn-usage-line:" + raw
+	default:
+		// No turn id and no raw line (unreachable through the tail,
+		// which always passes the line): counters alone, with a nil
+		// cumulative reading as zero rather than panicking.
+		var total rolloutTokenUsage
+		if info.Total != nil {
+			total = *info.Total
+		}
+		identity = fmt.Sprintf("turn-usage-counters:%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d",
+			last.InputTokens, last.CachedInputTokens, last.CacheWriteInputTokens, last.OutputTokens, last.ReasoningOutputTokens,
+			total.InputTokens, total.CachedInputTokens, total.CacheWriteInputTokens, total.OutputTokens, total.ReasoningOutputTokens)
+	}
+	if _, dup := t.seen[identity]; dup {
 		return nil
 	}
-	t.seen[key] = struct{}{}
+	t.seen[identity] = struct{}{}
 	return []agentEvent{agent.LlmCallEvent{
 		InputTokens:       fresh,
 		OutputTokens:      last.OutputTokens,

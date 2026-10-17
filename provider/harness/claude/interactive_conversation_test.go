@@ -319,6 +319,59 @@ func TestInteractiveConversationTailer_RotationDoesNotDuplicate(t *testing.T) {
 	}
 }
 
+// TestInteractiveConversationTailer_RotationDoesNotDuplicateIdLessLines
+// pins the uuid-less rotation fix: a transcript line without a uuid
+// keys its dedupe on the line's content hash, so truncation (the file
+// losing its tail) plus a rewrite never re-emits the surviving id-less
+// line. Reverting the claim to the uuid-only no-op re-emits it on the
+// second sweep.
+func TestInteractiveConversationTailer_RotationDoesNotDuplicateIdLessLines(t *testing.T) {
+	t.Parallel()
+	c := newTestStopHookChannel(t)
+	first := conversationLine(t, map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role":    "assistant",
+			"content": []any{map[string]any{"type": "text", "text": "unidentified first"}},
+		},
+	})
+	// A second line pads the file so truncating it back to the first
+	// line is a real shrink (rotation), resetting the tail offset.
+	pad := conversationLine(t, map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role":    "assistant",
+			"content": []any{map[string]any{"type": "text", "text": "padding"}},
+		},
+	})
+	path := writeTranscript(t, []string{first, pad})
+	fireHook(t, c, hookStdin(path, false))
+	tailer := newInteractiveConversationTailer(c, time.Time{})
+	if events, _ := tailer.sweepCapped(); len(events) != 2 {
+		t.Fatalf("first sweep = %d events; want 2", len(events))
+	}
+	// Rotation: the file is truncated back to the surviving id-less
+	// line. The offset resets, but the claim holds: nothing re-emits.
+	if err := os.WriteFile(path, []byte(first+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if events, _ := tailer.sweepCapped(); len(events) != 0 {
+		t.Fatalf("post-rotation sweep = %d events; want none (the surviving id-less line must not re-emit)", len(events))
+	}
+	// Two genuinely different id-less lines keep their own identity:
+	// a new distinct line still delivers.
+	appendTranscript(t, path, conversationLine(t, map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role":    "assistant",
+			"content": []any{map[string]any{"type": "text", "text": "unidentified second"}},
+		},
+	}))
+	if events, _ := tailer.sweepCapped(); len(events) != 1 {
+		t.Fatalf("new-line sweep = %d events; want 1", len(events))
+	}
+}
+
 // TestInteractiveConversationTailer_TornTailWaitsForTheWriter pins that a
 // trailing line without its newline stays unread until the writer
 // completes it.

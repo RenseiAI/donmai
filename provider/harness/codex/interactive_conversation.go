@@ -86,6 +86,14 @@ const (
 	// one sweep's caps; the flush keeps sweeping until nothing is pending
 	// or this many sweeps have run.
 	interactiveConversationMaxFinalSweeps = 16
+
+	// interactiveConversationMaxPendingAgeSweeps bounds how long a staged
+	// tool start waits for its completion (about five minutes at the 1s
+	// poll cadence). A completion that arrives later still delivers
+	// through the completion-reconstruction path; without the bound an
+	// orphaned start (a harness that restarts mid-call, completions that
+	// lag) holds its entry for the session's life.
+	interactiveConversationMaxPendingAgeSweeps = 300
 )
 
 // interactiveConversationTailer tracks the per-file read offsets, the
@@ -105,10 +113,15 @@ type interactiveConversationTailer struct {
 	// exec/mcp/file-change result id, turn id, or usage key), so a
 	// re-read never double-emits.
 	seen map[string]struct{}
+	// sweeps counts sweepCapped runs; staged starts carry the sweep that
+	// staged them so orphaned entries age out (see evictStalePending).
+	sweeps uint64
 	// pending holds started tool calls awaiting their completion, keyed
 	// by call id ("shell-call:<id>" for exec starts, "function:<id>"
 	// for namespaced calls). A completion without a start still
 	// delivers: the call is reconstructed from the completion record.
+	// Entries older than interactiveConversationMaxPendingAgeSweeps are
+	// evicted on every sweep, so orphaned starts stay bounded.
 	pending map[string]pendingConversationCall
 	// pendingExecByCommand queues staged exec starts per shell command
 	// (oldest first), so identical consecutive commands pair in order
@@ -129,6 +142,9 @@ type pendingConversationCall struct {
 	toolUseID string
 	input     map[string]any
 	raw       string
+	// stagedAt is the sweeps count when the start was staged; the entry
+	// ages out once it exceeds interactiveConversationMaxPendingAgeSweeps.
+	stagedAt uint64
 }
 
 func newInteractiveConversationTailer(home string, resolve func() string) *interactiveConversationTailer {
@@ -192,6 +208,8 @@ func (t *interactiveConversationTailer) sweep() []agentEvent {
 // sweepCapped is sweep with a more flag reporting that a cap left input
 // pending for a later sweep.
 func (t *interactiveConversationTailer) sweepCapped() (events []agentEvent, more bool) {
+	t.sweeps++
+	t.evictStalePending()
 	paths := t.sessionRollouts()
 	if len(paths) == 0 {
 		return nil, false
@@ -216,6 +234,33 @@ func (t *interactiveConversationTailer) sweepCapped() (events []agentEvent, more
 		}
 	}
 	return events, false
+}
+
+// evictStalePending drops staged tool starts older than
+// interactiveConversationMaxPendingAgeSweeps sweeps and prunes their
+// per-command queue entries, so orphaned starts (a harness that restarts
+// mid-call, completions that lag) cannot grow the staging area for the
+// session's life. A completion arriving after its start aged out still
+// delivers through the completion-reconstruction path.
+func (t *interactiveConversationTailer) evictStalePending() {
+	for key, staged := range t.pending {
+		if t.sweeps-staged.stagedAt >= interactiveConversationMaxPendingAgeSweeps {
+			delete(t.pending, key)
+		}
+	}
+	for command, queue := range t.pendingExecByCommand {
+		kept := queue[:0]
+		for _, key := range queue {
+			if _, ok := t.pending[key]; ok {
+				kept = append(kept, key)
+			}
+		}
+		if len(kept) == 0 {
+			delete(t.pendingExecByCommand, command)
+		} else {
+			t.pendingExecByCommand[command] = kept
+		}
+	}
 }
 
 // sessionRollouts returns the rollout files this session owns: the

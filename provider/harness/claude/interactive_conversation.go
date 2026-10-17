@@ -3,6 +3,8 @@ package claude
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
@@ -60,7 +62,7 @@ import (
 //
 // Event identity and replay: every mapped event carries a stable identity
 // through its Raw line (the transcript's own uuid when present, else the
-// raw bytes), and every emitted transcript uuid is remembered for the
+// content hash), and every emitted identity is remembered for the
 // tailer's life, so a restart, rotation, or re-read never double-emits.
 // A shrunk file (rotation/rewrite) restarts from zero against that same
 // dedupe set. A torn trailing line stays unread until the writer completes
@@ -417,8 +419,15 @@ func mapConversationLine(line []byte, seen map[string]struct{}, since time.Time)
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return nil
 	}
-	if rec.UUID != "" {
-		if _, dup := seen[rec.UUID]; dup {
+	// The pre-check answers whether this exact line already delivered:
+	// uuid when the transcript carries one, else the line's content
+	// hash, WITHOUT the trailing newline (the tail offset advances
+	// past it, but the claim below sees only the mapper's line — both
+	// must hash the same bytes). The claim after mapping keys the same
+	// way, so a rotation or re-read of the same line collapses either
+	// way.
+	if key, ok := conversationDedupeKey(rec.UUID, trimConversationNewline(line)); ok {
+		if _, dup := seen[key]; dup {
 			return nil
 		}
 	}
@@ -458,7 +467,7 @@ func mapConversationLine(line []byte, seen map[string]struct{}, since time.Time)
 		if len(out) == 0 {
 			return nil
 		}
-		claimConversationUUID(seen, rec.UUID)
+		claimConversationUUID(seen, rec.UUID, trimConversationNewline(line))
 		return out
 	case "user":
 		if rec.Message == nil {
@@ -477,7 +486,7 @@ func mapConversationLine(line []byte, seen map[string]struct{}, since time.Time)
 			})
 		}
 		if len(out) > 0 {
-			claimConversationUUID(seen, rec.UUID)
+			claimConversationUUID(seen, rec.UUID, trimConversationNewline(line))
 			return out
 		}
 		// A user turn with no tool results is a provider-side message —
@@ -501,22 +510,41 @@ func mapConversationLine(line []byte, seen map[string]struct{}, since time.Time)
 		if text == "" || isStopHookFeedback(text) {
 			return nil
 		}
-		claimConversationUUID(seen, rec.UUID)
+		claimConversationUUID(seen, rec.UUID, trimConversationNewline(line))
 		return []agent.Event{agent.SystemEvent{Subtype: "user_message", Message: text, Raw: raw}}
 	default:
 		return nil
 	}
 }
 
-// claimConversationUUID remembers a mapped record's uuid so a re-read
-// never double-emits. Records without a uuid are keyed by nothing: each
-// read maps them once, and rotation dedupe still holds for every
-// identified line.
-func claimConversationUUID(seen map[string]struct{}, uuid string) {
-	if uuid == "" {
-		return
+// trimConversationNewline strips the single trailing newline the tail
+// reader leaves on the mapper's line, so the pre-check hashes the same
+// bytes the post-mapping claim hashed.
+func trimConversationNewline(line []byte) []byte {
+	return bytes.TrimSuffix(line, []byte("\n"))
+}
+
+// conversationDedupeKey returns the dedupe key for one transcript line
+// and whether the line is mappable: the transcript uuid when present,
+// else the line's content hash (mirroring the usage tail's usageLineKey),
+// so rotation or a re-read of the same id-less line collapses while
+// genuinely different id-less lines keep their own identity.
+func conversationDedupeKey(uuid string, line []byte) (string, bool) {
+	if uuid != "" {
+		return uuid, true
 	}
-	seen[uuid] = struct{}{}
+	sum := sha256.Sum256(line)
+	return "line:" + hex.EncodeToString(sum[:]), true
+}
+
+// claimConversationUUID remembers a mapped record's dedupe key so a
+// re-read never double-emits. Records with a uuid key on it; records
+// without one key on the line's content hash (mirroring the usage tail's
+// usageLineKey), so rotation or a re-read of the same line collapses
+// while genuinely different id-less lines keep their own identity.
+func claimConversationUUID(seen map[string]struct{}, uuid string, line []byte) {
+	key, _ := conversationDedupeKey(uuid, line)
+	seen[key] = struct{}{}
 }
 
 // isStopHookFeedback reports whether text is the harness's own record of a
