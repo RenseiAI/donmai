@@ -2166,7 +2166,7 @@ func (r *Runner) classifyStreamStop(
 		} else {
 			res.FailureMode = FailureLostOwnership
 			if res.Error == "" {
-				res.Error = heartbeat.ErrLostOwnership.Error()
+				res.Error = heartbeat.LostOwnershipError(pulser)
 			}
 		}
 		// Best-effort stop the provider so it doesn't keep tokens

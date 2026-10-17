@@ -41,6 +41,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -238,6 +239,13 @@ type Emitter struct {
 	// A regressed snapshot is clamped up to it so values never
 	// decrease within a session.
 	lastUsage UsageSnapshot
+	// authRejections counts consecutive step-heartbeat POSTs the platform
+	// rejected with 401/403. It increments on each auth rejection, resets
+	// to 0 on the next 2xx, and is left unchanged by every other outcome
+	// (a 404 from a build without the companion route, a network error,
+	// any other non-2xx) so the count names credential rejections only.
+	// Read via AuthRejections.
+	authRejections atomic.Int64
 }
 
 // New validates cfg and returns a non-started Emitter. Returns an error when
@@ -275,6 +283,17 @@ func (e *Emitter) Start(ctx context.Context) error {
 
 	go e.run(ctx)
 	return nil
+}
+
+// AuthRejections returns the count of consecutive step-heartbeat POSTs
+// the platform rejected with 401/403. It resets to 0 on the next 2xx;
+// every other outcome leaves it unchanged. Safe to call from any
+// goroutine; a nil receiver reports 0.
+func (e *Emitter) AuthRejections() int {
+	if e == nil {
+		return 0
+	}
+	return int(e.authRejections.Load())
 }
 
 // Stop signals the loop to exit and blocks until it has. Idempotent and safe
@@ -405,7 +424,8 @@ func (e *Emitter) beat(ctx context.Context) {
 			// fine" silence.
 			e.cfg.logger().Warn("step-heartbeat auth rejected — runtime credentials likely expired or rotated out from under this session",
 				"sessionId", e.cfg.SessionID,
-				"status", resp.StatusCode)
+				"status", resp.StatusCode,
+				"consecutiveAuthRejections", e.authRejections.Add(1))
 			return
 		}
 		// Best-effort: a 404 (platform build without the companion route
@@ -419,4 +439,5 @@ func (e *Emitter) beat(ctx context.Context) {
 	}
 	e.cfg.logger().Debug("step-heartbeat posted",
 		"sessionId", e.cfg.SessionID)
+	e.authRejections.Store(0)
 }
