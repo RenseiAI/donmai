@@ -192,6 +192,7 @@ func TestLoop_TimeoutCancelsStream(t *testing.T) {
 // Uses BehaviorHangThenTimeout so the provider does not race the
 // heartbeat to a terminal Result.
 func TestLoop_HeartbeatLostOwnership(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		// status is the lock-refresh answer on every tick.
