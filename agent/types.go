@@ -846,12 +846,26 @@ type Result struct {
 	// preserve. Additive — old platforms ignore it.
 	ResumeCheckpoint *ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
 
+	// WIPRef identifies unpublished work preserved before teardown. Additive; old platforms ignore it.
+	WIPRef *WIPRef `json:"wipRef,omitempty"`
+
+	// PostSessionWarnings records non-fatal preservation and post-session errors.
+	// Additive; old platforms ignore it.
+	PostSessionWarnings []string `json:"postSessionWarnings,omitempty"`
+
 	// SeatBudget is the per-seat resource budget this session ran under:
 	// the posture (enforced | best-effort | none) with the values. The
 	// worker reports what the seat actually got, so the platform can see
 	// it. Nil when the seat carried no budget. Additive — old platforms
 	// ignore it.
 	SeatBudget *SeatBudgetReport `json:"seatBudget,omitempty"`
+}
+
+// WIPRef identifies a reserved remote ref preserving a failed session.
+// Additive; old platforms ignore it.
+type WIPRef struct {
+	Ref       string `json:"ref"`
+	CommitSHA string `json:"commitSha"`
 }
 
 // ResumeCheckpoint identifies the branch + head commit a retryable session
