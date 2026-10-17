@@ -267,6 +267,100 @@ func TestClientStopSessionRejectsUnsafeConflictBodies(t *testing.T) {
 
 func intPtr(value int) *int { return &value }
 
+func TestClientChatSessionTypedConflictReceipt(t *testing.T) {
+	t.Parallel()
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE","error":"Historical terminal session cannot be resumed safely","delivered":false,"deliveryTier":"durable","disposition":"held","sessionId":"sess-1","sessionStatus":"held","recoveryAction":"start_new_session","missingProjectionFields":["workType","providerSessionId"]}`))
+	})
+	_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	var receipt *PromptSessionError
+	if !errors.As(err, &receipt) {
+		t.Fatalf("error did not retain typed prompt refusal: %T %v", err, err)
+	}
+	if receipt.Code != "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE" {
+		t.Errorf("Code = %q, want the continuity refusal code", receipt.Code)
+	}
+	if receipt.Reason != "Historical terminal session cannot be resumed safely" {
+		t.Errorf("Reason = %q, want the refusal reason", receipt.Reason)
+	}
+	if receipt.RecoveryAction != "start_new_session" {
+		t.Errorf("RecoveryAction = %q, want start_new_session", receipt.RecoveryAction)
+	}
+	if len(receipt.MissingFields) != 2 || receipt.MissingFields[0] != "workType" || receipt.MissingFields[1] != "providerSessionId" {
+		t.Errorf("MissingFields = %v, want [workType providerSessionId]", receipt.MissingFields)
+	}
+	if receipt.Disposition != "held" || receipt.SessionID != "sess-1" {
+		t.Errorf("receipt identity lost: %+v", receipt)
+	}
+}
+
+func TestClientChatSessionMinimalConflictReceipt(t *testing.T) {
+	t.Parallel()
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"session is busy"}`))
+	})
+	_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	var receipt *PromptSessionError
+	if !errors.As(err, &receipt) {
+		t.Fatalf("minimal refusal did not decode: %T %v", err, err)
+	}
+	if receipt.Code != "SESSION_PROMPT_ADMISSION_CONFLICT" || receipt.Reason != "session is busy" {
+		t.Fatalf("minimal receipt fields lost: %#v", receipt)
+	}
+}
+
+func TestClientChatSessionRejectsUnsafeConflictBodies(t *testing.T) {
+	t.Parallel()
+
+	validPrefix := `{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"session is busy"`
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		forbidden   string
+	}{
+		{name: "malformed", contentType: "application/json", body: `{`},
+		{name: "oversized", contentType: "application/json", body: strings.Repeat("x", maxPromptSessionErrorBodyBytes+1)},
+		{name: "non json", contentType: "text/html", body: `<html>conflict</html>`},
+		{name: "missing code", contentType: "application/json", body: `{"error":"session is busy"}`},
+		{name: "secret key", contentType: "application/json", body: validPrefix + `,"apiToken":"rsk_do_not_echo"}`, forbidden: "rsk_do_not_echo"},
+		{name: "secret value", contentType: "application/json", body: validPrefix + `,"recoveryAction":"Bearer do_not_echo"}`, forbidden: "do_not_echo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+			}
+			var receipt *PromptSessionError
+			if errors.As(err, &receipt) {
+				t.Fatalf("unsafe body became typed receipt: %#v", receipt)
+			}
+			if tc.forbidden != "" && strings.Contains(err.Error(), tc.forbidden) {
+				t.Fatalf("error leaked secret %q: %v", tc.forbidden, err)
+			}
+		})
+	}
+}
+
 func TestClientChatSessionSuccess(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/public/sessions/sess-1/prompt" {
