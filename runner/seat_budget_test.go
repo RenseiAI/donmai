@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,16 +30,22 @@ func TestApplySeatBudget(t *testing.T) {
 	})
 	t.Run("caps land at the seat share", func(t *testing.T) {
 		got := applySeatBudget(map[string]string{}, &SeatBudget{Mode: "best-effort", CPUs: 2})
-		// Five verified knobs only: JS runners take no seat env entry
-		// (vitest reads config/CLI, Next.js reads config/CLI), so both
+		// Seven verified knobs only: JS runners take no per-tool seat
+		// env entry (vitest reads poolOptions config/CLI, jest reads
+		// --maxWorkers, Next.js reads its config), so those spellings
 		// must stay absent — an entry the tool ignores would claim a
-		// cap that does nothing.
+		// cap that does nothing. Node is capped through libuv
+		// (UV_THREADPOOL_SIZE, which Node reads) and the raw share
+		// (DONMAI_SEAT_CPUS, which each repo's config derives its
+		// worker limit from).
 		want := map[string]string{
 			"GOMAXPROCS":                 "2",
 			"MAKEFLAGS":                  "-j2",
 			"CMAKE_BUILD_PARALLEL_LEVEL": "2",
 			"NINJAFLAGS":                 "-j2",
 			"CARGO_BUILD_JOBS":           "2",
+			"UV_THREADPOOL_SIZE":         "2",
+			"DONMAI_SEAT_CPUS":           "2",
 		}
 		for k, v := range want {
 			if got[k] != v {
@@ -122,7 +130,8 @@ func TestWorkerCapEnvMatchesDaemonKnobs(t *testing.T) {
 	env := workerCapEnv(3)
 	wantKeys := []string{
 		"GOMAXPROCS", "MAKEFLAGS", "CMAKE_BUILD_PARALLEL_LEVEL",
-		"NINJAFLAGS", "CARGO_BUILD_JOBS",
+		"NINJAFLAGS", "CARGO_BUILD_JOBS", "UV_THREADPOOL_SIZE",
+		"DONMAI_SEAT_CPUS",
 	}
 	if len(env) != len(wantKeys) {
 		t.Fatalf("workerCapEnv has %d knobs; want %d", len(env), len(wantKeys))
@@ -252,7 +261,7 @@ func TestRun_SeatBudgetCapsKitProvision(t *testing.T) {
 
 // TestInstallSessionDependencies_CapsSeatEnv drives the PRODUCTION
 // dependency-install path with a seat budget and the default (real)
-// shell execer, and asserts the install child observes the seat's worker
+// dependency execer, and asserts the install child observes the seat's worker
 // caps. A fake `go` on PATH records the GOMAXPROCS it observes for a
 // worktree carrying a go.mod; reverting the default execer to the
 // uncapped session env leaves that record empty.
@@ -263,15 +272,14 @@ func TestInstallSessionDependencies_CapsSeatEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	report := filepath.Join(dir, "install-gomaxprocs")
-	fakeGo := "#!/bin/sh\nprintf '%s' \"$GOMAXPROCS\" > \"$REPORT_PATH\"\nexit 0\n"
+	fakeGo := "#!/bin/sh\nprintf '%s' \"$GOMAXPROCS\" > '" + report + "'\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(fakes, "go"), []byte(fakeGo), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("REPORT_PATH", report)
-
 	h := newRunnerHarness(t)
-	qw := h.queuedWork("DEPS-SEAT-1")
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	qw := h.queuedWork("dependency-seat")
 	qw.SeatBudget = &SeatBudget{Mode: "best-effort", CPUs: 3}
 	wpath := t.TempDir()
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")

@@ -266,25 +266,43 @@ func TestMapNotification_TurnCompleted_Interrupted(t *testing.T) {
 	}
 }
 
-// Partial-message deltas are dropped (mirroring the Claude provider's
-// stream_event drop) so each streamed token does not become its own
-// "thought" activity. The full text arrives on item/completed.
-func TestMapNotification_AssistantMessageDelta_Dropped(t *testing.T) {
+// Streaming deltas map to the content-free stream-progress liveness
+// signal (mirroring the Claude provider's stream_event mapping) so each
+// streamed token does not become its own "thought" activity. The full
+// text arrives on item/completed.
+func TestMapNotification_AssistantMessageDelta_StreamProgress(t *testing.T) {
 	t.Parallel()
 	state := &mapperState{}
 	got := mapNotification("item/agentMessage/delta", mustJSON(t, map[string]any{"delta": "hello"}), state, nil)
-	if len(got) != 0 {
-		t.Fatalf("expected delta to be dropped, got %d event(s): %+v", len(got), got)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 stream-progress event, got %d", len(got))
+	}
+	sys, ok := got[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("expected SystemEvent, got %T", got[0])
+	}
+	if sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Fatalf("expected subtype %q, got %q", agent.SystemSubtypeStreamProgress, sys.Subtype)
+	}
+	if sys.Message != "" {
+		t.Fatalf("expected empty message, got %q", sys.Message)
 	}
 }
 
-func TestMapNotification_ReasoningDelta_Dropped(t *testing.T) {
+func TestMapNotification_ReasoningDelta_StreamProgress(t *testing.T) {
 	t.Parallel()
 	state := &mapperState{}
 	for _, method := range []string{"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"} {
 		got := mapNotification(method, mustJSON(t, map[string]any{"text": "thinking..."}), state, nil)
-		if len(got) != 0 {
-			t.Fatalf("%s: expected delta to be dropped, got %d event(s): %+v", method, len(got), got)
+		if len(got) != 1 {
+			t.Fatalf("%s: expected 1 stream-progress event, got %d", method, len(got))
+		}
+		sys, ok := got[0].(agent.SystemEvent)
+		if !ok {
+			t.Fatalf("%s: expected SystemEvent, got %T", method, got[0])
+		}
+		if sys.Subtype != agent.SystemSubtypeStreamProgress {
+			t.Fatalf("%s: expected subtype %q, got %q", method, agent.SystemSubtypeStreamProgress, sys.Subtype)
 		}
 	}
 }
@@ -310,9 +328,10 @@ func TestMapItem_ReasoningStarted_Dropped(t *testing.T) {
 // Chain guard: a COMPLETED reasoning item must map to
 // SystemEvent{Subtype: "reasoning"}, and the shared activity poster must
 // forward exactly that event as a type=thought payload. Companion to
-// TestMapNotification_ReasoningDelta_Dropped above, which pins the
-// complete-message discipline (per-token deltas stay dropped); together they
-// guarantee codex emits one thought per completed reasoning item, no spam.
+// TestMapNotification_ReasoningDelta_StreamProgress above, which pins that
+// per-token deltas carry no content (the content-free stream-progress
+// signal only); together they guarantee codex emits one thought per
+// completed reasoning item, no spam.
 func TestMapItem_ReasoningCompleted_PostsThoughtActivity(t *testing.T) {
 	t.Parallel()
 	params := mustJSON(t, map[string]any{
@@ -577,12 +596,8 @@ func TestMapItem_MCPToolCall_NormalizedName(t *testing.T) {
 func TestMapNotification_Unknown(t *testing.T) {
 	t.Parallel()
 	got := mapNotification("totally/new", mustJSON(t, map[string]any{}), &mapperState{}, nil)
-	se, ok := got[0].(agent.SystemEvent)
-	if !ok {
-		t.Fatalf("expected SystemEvent for unknown method, got %T", got[0])
-	}
-	if se.Subtype != "unknown" {
-		t.Fatalf("expected subtype=unknown, got %q", se.Subtype)
+	if len(got) != 0 {
+		t.Fatalf("unrecognized method emitted activities: %+v", got)
 	}
 }
 

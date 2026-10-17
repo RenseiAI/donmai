@@ -41,4 +41,18 @@ var (
 	// empty selector (rule 4 — declare what the scope applies to, or use
 	// level "global").
 	ErrInvalidScope = errors.New("agent: invalid provider scope")
+
+	// ErrNotAuthenticated is returned when a provider's first-turn
+	// failure classifies as a logged-out host (e.g. a subscriber
+	// login that lapsed). Providers whose hosts expose no
+	// login-status probe wrap this alongside ErrSpawnFailed so
+	// callers can match the auth cause without parsing prose.
+	ErrNotAuthenticated = errors.New("agent: provider host is not authenticated")
+
+	// ErrModelNotEntitled is returned when a provider's first-turn
+	// failure classifies as a model the account may not use (e.g.
+	// the host reports the model id does not exist or the account
+	// lacks access). Wrapped alongside ErrSpawnFailed like
+	// ErrNotAuthenticated.
+	ErrModelNotEntitled = errors.New("agent: model not entitled for this account")
 )

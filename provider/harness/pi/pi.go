@@ -441,7 +441,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	extensionPaths := append([]string{layout.extension}, extraExtensionPaths...)
 	actualExtensions := make([]agentExtensionIdentity, len(spec.AdditionalExtensions))
 	for i, delivery := range spec.AdditionalExtensions {
-		actualExtensions[i] = agentExtensionIdentity{id: delivery.ID, digest: delivery.Digest, path: extraExtensionPaths[i]}
+		actualExtensions[i] = agentExtensionIdentity{id: delivery.ID, digest: delivery.Digest, path: extraExtensionPaths[i], delegationTools: append([]string(nil), delivery.DelegationTools...)}
 	}
 	token := p.opts.handshakeToken
 	if token == "" {

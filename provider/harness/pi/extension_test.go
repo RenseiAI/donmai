@@ -862,3 +862,236 @@ func TestExtensionRegistersConfiguredThinkingLevel(t *testing.T) {
 		})
 	}
 }
+
+// routingCell builds an openai-chat cell (the default gateway binding
+// protocol) carrying pref, so the routing-preference pin tests share one
+// shape.
+func routingCell(pref *agent.RoutingPreference) agent.Spec {
+	return agent.Spec{
+		Prompt: "hi",
+		Model:  "served-model",
+		Endpoint: &agent.EndpointBinding{
+			Company:           agent.CompanyOpenAI,
+			Model:             "served-model",
+			BaseURL:           "http://127.0.0.1:4000/v1",
+			Protocol:          agent.ProtoOpenAIChat,
+			Host:              agent.HostGateway,
+			RoutingPreference: pref,
+			Env:               map[string]string{"ANTHROPIC_API_KEY": "k-test"},
+		},
+	}
+}
+
+// TestProviderPinEnvRoutingPreference pins the routing-preference half of
+// the pin: a set preference on an openai-completions cell rides the two
+// routing env vars as JSON-encoded string arrays; an unset preference, a
+// non-chat protocol, or an unusable slug list exports clearing entries
+// (each key present but empty) so an inherited value can never survive as
+// a stale routing option.
+func TestProviderPinEnvRoutingPreference(t *testing.T) {
+	t.Parallel()
+	set := &agent.RoutingPreference{Order: []string{"anthropic", "openai"}, Only: []string{"anthropic"}}
+	cases := []struct {
+		name  string
+		spec  agent.Spec
+		want  map[string]string // exact expected routing env entries
+		clear bool              // both keys must be present but empty
+	}{
+		{
+			name: "chat binding with a preference sets pi's routing option",
+			spec: routingCell(set),
+			want: map[string]string{
+				piRoutingOrderEnvVar: `["anthropic","openai"]`,
+				piRoutingOnlyEnvVar:  `["anthropic"]`,
+			},
+		},
+		{
+			name: "only-only preference exports an empty order array alongside it",
+			spec: routingCell(&agent.RoutingPreference{Only: []string{"anthropic"}}),
+			want: map[string]string{
+				piRoutingOrderEnvVar: `[]`,
+				piRoutingOnlyEnvVar:  `["anthropic"]`,
+			},
+		},
+		{
+			name:  "no binding clears",
+			spec:  agent.Spec{Model: "claude-x"},
+			clear: true,
+		},
+		{
+			name:  "nil preference clears",
+			spec:  routingCell(nil),
+			clear: true,
+		},
+		{
+			name:  "empty preference clears, never exports empty meaning",
+			spec:  routingCell(&agent.RoutingPreference{}),
+			clear: true,
+		},
+		{
+			name: "anthropic-messages binding gets nothing",
+			spec: func() agent.Spec {
+				spec := routingCell(set)
+				spec.Endpoint.Protocol = agent.ProtoAnthropicMessages
+				return spec
+			}(),
+			clear: true,
+		},
+		{
+			name: "responses binding gets nothing",
+			spec: func() agent.Spec {
+				spec := routingCell(set)
+				spec.Endpoint.Protocol = agent.ProtoOpenAIResponses
+				return spec
+			}(),
+			clear: true,
+		},
+		{
+			name:  "blank slug fails closed to clearing",
+			spec:  routingCell(&agent.RoutingPreference{Order: []string{"anthropic", "  "}}),
+			clear: true,
+		},
+		{
+			name:  "control characters in a slug fail closed to clearing",
+			spec:  routingCell(&agent.RoutingPreference{Only: []string{"anthropic\nX-Injected: 1"}}),
+			clear: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := providerPinEnv(tc.spec)
+			got := map[string]string{}
+			for _, e := range env {
+				for _, key := range []string{piRoutingOrderEnvVar, piRoutingOnlyEnvVar} {
+					if strings.HasPrefix(e, key+"=") {
+						got[key] = strings.TrimPrefix(e, key+"=")
+					}
+				}
+			}
+			if tc.clear {
+				for _, key := range []string{piRoutingOrderEnvVar, piRoutingOnlyEnvVar} {
+					v, present := got[key]
+					if !present {
+						t.Errorf("pin env must carry an explicit clearing entry for %s: %v", key, env)
+					} else if v != "" {
+						t.Errorf("%s = %q, want empty (clearing): %v", key, v, env)
+					}
+				}
+				return
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("routing pin env = %v, want %v (full env: %v)", got, tc.want, env)
+			}
+		})
+	}
+}
+
+// TestExtensionRegistersRoutingPreferenceOnlyOnChatCompletions activates
+// the REAL embedded extension and reads back the model it registers for
+// the "donmai" provider. A chat cell with a set preference registers the
+// routing option on the model's compat; an anthropic-messages cell — whose
+// protocol has no routing option — registers no compat routing keys even
+// when the binding carries a preference (the Go pin already clears it;
+// this proves the extension honors the protocol gate too). An unset
+// preference registers no routing keys on any protocol.
+//
+// RED proof: drop the api gate in the extension and the
+// anthropic-messages case registers the option; stop spreading
+// modelCompat and the chat case loses the thinking-level compat entry.
+func TestExtensionRegistersRoutingPreferenceOnlyOnChatCompletions(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		api       string
+		order     string
+		only      string
+		wantOrder []any
+		wantOnly  []any
+	}{
+		{
+			name: "chat cell with a preference registers the routing option",
+			api:  "openai-completions", order: `["anthropic","openai"]`, only: `["anthropic"]`,
+			wantOrder: []any{"anthropic", "openai"}, wantOnly: []any{"anthropic"},
+		},
+		{
+			name: "chat cell with only-only registers only and no order key",
+			api:  "openai-completions", order: `[]`, only: `["anthropic"]`,
+			wantOnly: []any{"anthropic"},
+		},
+		{
+			name: "anthropic-messages binding gets nothing",
+			api:  "anthropic-messages", order: `["anthropic"]`, only: `["anthropic"]`,
+		},
+		{
+			name: "chat cell without a preference registers nothing",
+			api:  "openai-completions", order: "", only: "",
+		},
+		{
+			name: "malformed pin registers nothing",
+			api:  "openai-completions", order: `not-json`, only: `["anthropic"]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out := runExtensionFixture(t, []string{
+				piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+				piAPIEnvVar + "=" + tc.api,
+				piModelEnvVar + "=served-model",
+				piOutputLimitEnvVar + "=64000",
+				piThinkingLevelEnvVar + "=max",
+				piRoutingOrderEnvVar + "=" + tc.order,
+				piRoutingOnlyEnvVar + "=" + tc.only,
+			}, "read", `{"path":"README.md"}`)
+			model := registeredDonmaiModel(t, out)
+			compat, _ := model["compat"].(map[string]any)
+			if compat == nil {
+				compat = map[string]any{}
+			}
+			for _, key := range []string{"openRouterRouting", "vercelGatewayRouting"} {
+				routing, _ := compat[key].(map[string]any)
+				if routing == nil {
+					routing = map[string]any{}
+				}
+				var wantOrder, wantOnly []any
+				if tc.api == "openai-completions" {
+					wantOrder, wantOnly = tc.wantOrder, tc.wantOnly
+				}
+				if got := routing["order"]; !reflect.DeepEqual(got, wantOrderToAny(wantOrder)) {
+					t.Errorf("%s.order = %v, want %v (compat: %v)", key, got, wantOrder, compat)
+				}
+				if got := routing["only"]; !reflect.DeepEqual(got, wantOnlyToAny(wantOnly)) {
+					t.Errorf("%s.only = %v, want %v (compat: %v)", key, got, wantOnly, compat)
+				}
+			}
+			// The thinking-level entry the same activation registers must
+			// survive the routing merge: compat layering must not displace
+			// it. It lives on the model itself, beside compat — not inside
+			// it.
+			if tc.api == "openai-completions" {
+				if got, _ := model["thinkingLevelMap"].(map[string]any); !reflect.DeepEqual(got, map[string]any{"max": "max"}) {
+					t.Errorf("thinkingLevelMap = %v, want the max entry to survive the routing merge (model: %v)", got, model)
+				}
+			}
+		})
+	}
+}
+
+// wantOrderToAny / wantOnlyToAny normalize a nil expectation to a nil
+// interface so DeepEqual distinguishes "key absent" from "key present but
+// empty": the JSON fixture decodes an absent key as nil and an explicit
+// empty array as an empty slice.
+func wantOrderToAny(want []any) any {
+	if want == nil {
+		return nil
+	}
+	return want
+}
+
+func wantOnlyToAny(want []any) any {
+	if want == nil {
+		return nil
+	}
+	return want
+}

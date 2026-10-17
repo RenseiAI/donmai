@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"encoding/json"
 	"math"
 	"strings"
 
@@ -26,10 +27,11 @@ import (
 //     emitted when agent_settled was processed, and the sawAgentEnd/
 //     endSuccess EOF-fallback below must not emit a second one.
 type mapperState struct {
-	sessionID   string
-	textBuf     strings.Builder
-	debug       bool // when true, thinking deltas are surfaced; default drops them
-	initEmitted bool
+	delegationTools map[string]bool
+	sessionID       string
+	textBuf         strings.Builder
+	debug           bool // when true, thinking deltas are surfaced; default drops them
+	initEmitted     bool
 
 	// suppressCost is set when the session runs on the injected provider
 	// with no per-token prices bound (extension.go unitPricePinEnv): pi
@@ -114,19 +116,27 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 	case "message_update":
 		// The streaming delta lives under assistantMessageEvent. Buffer
 		// text_delta parts; drop thinking_delta unless debug. Emit nothing until
-		// message_end (anti-spam).
+		// message_end (anti-spam) — but surface the content-free
+		// stream-progress liveness signal per delta, so the runner can
+		// tell a live generation (deltas arriving) from a hung request.
 		ame := mapField(f, "assistantMessageEvent")
 		switch stringField(ame, "type") {
 		case "text_delta":
 			st.textBuf.WriteString(stringField(ame, "delta"))
+			return []agent.Event{agent.StreamProgressEvent()}, false
 		case "thinking_delta":
 			if st.debug {
 				st.textBuf.WriteString(stringField(ame, "delta"))
 			}
+			return []agent.Event{agent.StreamProgressEvent()}, false
 		}
 		return nil, false
 
 	case "message_end":
+		msg := mapField(f, "message")
+		if id := stringField(msg, "responseId"); stringField(msg, "role") == "assistant" && id != "" {
+			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeGenerationID, GenerationID: id})
+		}
 		text := st.textBuf.String()
 		st.textBuf.Reset()
 		if text != "" {
@@ -163,13 +173,42 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		}}, false
 
 	case "tool_execution_end":
-		return []agent.Event{agent.ToolResultEvent{
+		result := agent.ToolResultEvent{
 			ToolName:  stringField(f, "toolName", "tool", "name"),
-			ToolUseID: toolCallID(f),
-			Content:   toolResultContent(f),
-			IsError:   boolField(f, "isError", "error"),
-			Raw:       raw(ev),
-		}}, false
+			ToolUseID: toolCallID(f), Content: toolResultContent(f),
+			IsError: boolField(f, "isError", "error"), Raw: raw(ev),
+		}
+		// The child ref first becomes available in the structured result.
+		// Emit the lifecycle before closing the delegating tool span.
+		if st.delegationTools[result.ToolName] {
+			var payload struct {
+				Result struct {
+					Details struct {
+						ChildSessionRef struct {
+							SessionID string `json:"sessionId"`
+							Transport string `json:"transport"`
+						} `json:"childSessionRef"`
+					} `json:"details"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(ev.Line, &payload); err != nil {
+				payload.Result.Details.ChildSessionRef.SessionID = ""
+				payload.Result.Details.ChildSessionRef.Transport = ""
+			}
+			ref := payload.Result.Details.ChildSessionRef
+			sub := agent.SubagentEvent{
+				ToolName: result.ToolName, ToolUseID: result.ToolUseID,
+				Phase: agent.SubagentStarted, ChildSessionID: ref.SessionID,
+				ChildSessionTransport: ref.Transport, Raw: raw(ev),
+			}
+			out = append(out, sub)
+			sub.Phase = agent.SubagentCompleted
+			if result.IsError {
+				sub.Phase = agent.SubagentFailed
+			}
+			out = append(out, sub)
+		}
+		return append(out, result), false
 
 	case "turn_end":
 		// Per-turn usage rides message.usage (AssistantMessage). Accumulate it
@@ -218,9 +257,11 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			OutputTokens:      outTok,
 			CachedInputTokens: cacheRead,
 			CacheWriteTokens:  cacheWrite,
-			UsageSource:       agent.LlmUsageProvider,
-			ObservedCostUsd:   cost,
-			TurnCompleted:     true,
+			// Anthropic-messages includes thinking in output but does not
+			// report its token count. Leave ReasoningTokens omitted (unknown).
+			UsageSource:     agent.LlmUsageProvider,
+			ObservedCostUsd: cost,
+			TurnCompleted:   true,
 		}}, false
 
 	case "agent_end":
@@ -344,7 +385,8 @@ func (st *mapperState) accumulatedCost() *agent.CostData {
 		OutputTokens:      st.accOutputTokens,
 		CachedInputTokens: st.accCachedInputTokens,
 		CacheWriteTokens:  st.accCacheWriteTokens,
-		NumTurns:          st.accTurns,
+		// No separate reasoning count is reported by pi's usage protocol.
+		NumTurns: st.accTurns,
 	}
 	if !st.suppressCost {
 		tokens.TotalCostUsd = st.accCostUSD
@@ -535,4 +577,14 @@ func floatField(f map[string]any, keys ...string) float64 {
 		}
 	}
 	return 0
+}
+
+func declaredDelegationTools(deliveries []agent.ExtensionDelivery) map[string]bool {
+	tools := make(map[string]bool)
+	for _, delivery := range deliveries {
+		for _, name := range delivery.DelegationTools {
+			tools[name] = true
+		}
+	}
+	return tools
 }

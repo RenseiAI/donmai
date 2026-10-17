@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	"github.com/google/uuid"
 )
 
 // spawnInteractive opens the claude CLI's OWN interactive REPL — bare
@@ -55,6 +57,13 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// against a declared-but-absent channel, so the producer learns), rather
 	// than killing a session over a latency optimisation.
 	hook, hookErr := newStopHookChannel()
+	// Pin a fresh Claude conversation identity before spawn, so its transcript
+	// can be found even if the process dies before invoking its first Stop hook.
+	sessionID := uuid.NewString()
+	if hookErr == nil {
+		hook.usageSessionID = sessionID
+		hook.usageConfigDir = interactiveUsageConfigDir(spec.Env)
+	}
 	settings := ""
 	if hookErr == nil {
 		// The routing pin rides this same --settings string (see
@@ -111,8 +120,8 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		return errors.Join(errs...)
 	}
 
-	h, err := ptycli.SpawnWithCleanup(ctx, p.binary,
-		interactiveArgsWith(spec, mcpPath, settings), spec, p.Manifest(), cleanup)
+	argv := append([]string{"--session-id", sessionID}, interactiveArgsWith(spec, mcpPath, settings)...)
+	h, err := ptycli.SpawnWithCleanup(ctx, p.binary, argv, spec, p.Manifest(), cleanup)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +143,7 @@ const (
 
 // wrapInteractiveHandle adds the Stop-hook pull channel and the transcript
 // usage tail to a spawned PTY handle. The usage tail reads the session's own
-// transcript — located through the hook's durable locator — and maps each new
+// transcript — located through the hook or pinned conversation id — and maps each new
 // assistant message.usage to an LlmCallEvent, so per-turn usage reaches the
 // runner's activity sink live; the terminal ResultEvent carries the deduped
 // session totals instead of the PTY's costless one.
@@ -207,9 +216,9 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 }
 
 // withTranscriptCost replaces a costless terminal ResultEvent with one
-// carrying the session's deduped transcript totals. A transcript that cannot
-// be read — the hook never fired, the file never materialized — leaves the
-// event untouched: no usage is reported, never a failure.
+// carrying the session's deduped transcript totals, or its saved statusline
+// cumulative USD cost when no transcript usage is available. Unknown or untrusted
+// usage leaves the event untouched: no fabricated zero, never a failure.
 func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.Event {
 	if result.Cost != nil || hook == nil {
 		return result
@@ -224,6 +233,7 @@ func withTranscriptCost(result agent.ResultEvent, hook *stopHookChannel) agent.E
 		CachedInputTokens: total.CachedInputTokens,
 		CacheWriteTokens:  total.CacheWriteTokens,
 		NumTurns:          total.NumTurns,
+		TotalCostUsd:      total.TotalCostUsd,
 	}
 	return result
 }
@@ -300,8 +310,21 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 //	Model              → --model <id>
 //	Effort             → --effort <level>
 //	Autonomous         → --permission-mode bypassPermissions
+//	AllowedTools       → --allowedTools <comma-separated>
+//	DisallowedTools    → --disallowedTools <comma-separated>
 //	SystemPromptAppend → --append-system-prompt <text>
 //	Prompt             → positional argument, ALWAYS LAST
+//
+// The allow/deny mapping is byte-identical to buildArgs' (see
+// cli_args.go) — one convention, two spawn modes. Before it existed the
+// interactive REPL silently DROPPED Spec.AllowedTools/Spec.DisallowedTools
+// and fell back to the CLI's own default permission set, so a stamped
+// session that adapted cleanly on the headless lane denied closed on the
+// interactive lane even though the CLI honors the same flags there: the
+// flags are global session options (not --print-gated), feed the same
+// permission context the REPL's /permissions panel renders, and a live
+// interactive probe shows a stamped allow entry under Allow and a stamped
+// deny entry under Deny. The CLI simply was not being asked.
 //
 // The Autonomous mapping is deliberately byte-identical to buildArgs' (see
 // cli_args.go) — one convention, two spawn modes. Before it existed the
@@ -404,11 +427,49 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 		argv = append(argv, "--permission-mode", "bypassPermissions")
 	}
 
+	// An operator-driven session whose control plane granted toolApproval
+	// "bypass" may still choose bypassPermissions from the REPL (Shift+Tab).
+	// The CLI only offers that mode when it was started with this flag; the
+	// session itself starts in the CLI default mode. This matches the adapter's
+	// declared rendering (execution_security.go: index 0, prompts skipped).
+	if !spec.Autonomous && spec.ExecutionSecurity != nil &&
+		spec.ExecutionSecurity.Levels.ToolApproval == agent.ToolApprovalBypass {
+		argv = append(argv, "--allow-dangerously-skip-permissions")
+	}
+
 	// SystemPromptAppend carries the composed session instructions assembled
 	// by the runner. The Claude REPL accepts the same flag as the headless CLI;
 	// omit it when empty so a bare interactive session stays bare.
 	if spec.SystemPromptAppend != "" {
 		argv = append(argv, "--append-system-prompt", spec.SystemPromptAppend)
+	}
+
+	// Tool policy: mirrors buildArgs' identical block (cli_args.go) so a
+	// stamped allow/deny list reaches the interactive REPL the same way it
+	// reaches a headless run of the same Spec. The REPL honors --allowedTools
+	// / --disallowedTools exactly as the headless CLI does (same permission
+	// context; the REPL's own permission panel renders the stamped entries),
+	// so this mapping is a pure pass-through of the CLI's native grammar,
+	// including the MCPToolNames merge into --allowedTools: the interactive
+	// profile declares the same MCP tool-policy delivery as headless, and a
+	// name filter stamped for one lane must reach the other.
+	allowed := make([]string, 0)
+	allowed = append(allowed, spec.AllowedTools...)
+	allowed = append(allowed, spec.MCPToolNames...)
+	allowed = dedupAndSort(allowed)
+	if len(allowed) > 0 {
+		argv = append(argv, "--allowedTools", strings.Join(allowed, ","))
+	}
+
+	// Disallowed tools always include the Linear MCP block list when
+	// the session is autonomous (matches the legacy provider and buildArgs).
+	disallowed := append([]string(nil), spec.DisallowedTools...)
+	if spec.Autonomous {
+		disallowed = append(disallowed, linearMCPDisallowList...)
+	}
+	disallowed = dedupAndSort(disallowed)
+	if len(disallowed) > 0 {
+		argv = append(argv, "--disallowedTools", strings.Join(disallowed, ","))
 	}
 
 	// Claude's interactive REPL accepts the same exact per-session MCP file as

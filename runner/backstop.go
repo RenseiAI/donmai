@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/gitexec"
@@ -314,6 +315,17 @@ func backstopCommitMessage(qw QueuedWork, vis backstopVisibility) string {
 	return fmt.Sprintf("Backstop: %s", qw.SessionID)
 }
 
+// backstopCommitArgs validates attribution again at the commit boundary and
+// keeps every trailer in its own argv value, without shell interpretation.
+func backstopCommitArgs(qw QueuedWork, message string) []string {
+	args := []string{"commit", "-m", message}
+	name, email := ValidateCoAuthorPair(qw.SessionID, qw.CoAuthorName, qw.CoAuthorEmail)
+	if name != "" {
+		args = append(args, "--trailer", "Co-Authored-By: "+name+" <"+email+">")
+	}
+	return append(args, "--trailer", "Agent-Session: "+qw.SessionID)
+}
+
 // backstopPRTitle composes the backstop PR title. Private repositories
 // keep the tracker identifier prefix; public or unknown-visibility
 // repositories use a neutral title with no tracker identifier — the
@@ -359,6 +371,15 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	worktreePath := res.WorktreePath
 	if worktreePath == "" {
 		report.Diagnostics = "backstop skipped — no worktree path on result"
+		return report
+	}
+
+	// Validate before constructing the session-derived git identity too: a NUL
+	// in the session id would otherwise fail subprocess environment setup first.
+	if qw.SessionID == "" || strings.ContainsFunc(qw.SessionID, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r)
+	}) {
+		report.Diagnostics = "invalid session trailer"
 		return report
 	}
 
@@ -455,7 +476,8 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	}
 	if len(stagedAfter) > 0 {
 		commitMsg := backstopCommitMessage(qw, resolveVis())
-		if _, err := runGit(ctx, worktreePath, id, "commit", "-m", commitMsg); err != nil {
+		args := backstopCommitArgs(qw, commitMsg)
+		if _, err := runGit(ctx, worktreePath, id, args...); err != nil {
 			report.Diagnostics = fmt.Sprintf("git commit failed: %v", err)
 			return report
 		}

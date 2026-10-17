@@ -40,7 +40,11 @@ const (
 	// Required because the runner registry (runner/model_profile.go
 	// SelectProvider) and matrix.LegacyProviderID key on ProviderName, so the
 	// pi × anthropic × direct anchor cell needs a real ProviderName to alias.
-	ProviderPi    ProviderName = "pi"
+	ProviderPi ProviderName = "pi"
+	// ProviderMuse is the legacy wire enum for the muse harness
+	// (HarnessMuse). Required because the runner registry and matrix
+	// key on ProviderName.
+	ProviderMuse  ProviderName = "muse"
 	ProviderJules ProviderName = "jules"
 	// ProviderShell is the bare interactive-only PTY harness
 	// (provider/harness/shell, W4). It drives no model endpoint and so is
@@ -403,6 +407,15 @@ type Spec struct {
 	// PrepareHarness calls become idempotent application/equality checks.
 	PreparedHarness *PreparedHarness `json:"-"`
 
+	// SessionID is the platform lifecycle UUID for this session
+	// (prompt.QueuedWork.SessionID): the same namespace the daemon adopts
+	// shims under (sessionshim.Identity.SessionID) and the trust ledger
+	// keys its owning-session rows on (provider/harness/claude
+	// trustLedgerOwner). It is NOT the display name (SessionName) and NOT
+	// the provider-native id (ProviderSessionID). Empty on legacy
+	// dispatches; additive and omitempty so the wire round-trip is
+	// unchanged for existing producers.
+	SessionID string `json:"sessionId,omitempty"`
 	// SessionName is the canonical user-facing name for the session. Harnesses
 	// with a native naming surface project it at fresh startup; empty preserves
 	// the harness's generated-name behavior.
@@ -762,8 +775,16 @@ type Result struct {
 	// reads as "did nothing" rather than unknown.
 	ToolCalls int `json:"toolCalls"`
 
+	// GenerationIDs are the bounded, distinct native response ids observed
+	// during an endpoint-bound session, in first-observed order.
+	GenerationIDs []string `json:"generationIds,omitempty"`
+
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
+
+	// Model is the last model observed in native response metadata, independent
+	// of the requested model. Empty when the harness did not report one.
+	Model string `json:"model,omitempty"`
 
 	// FailureMode classifies why a non-completed session failed.
 	// Enum values are owned by runner/failure.go.

@@ -135,6 +135,12 @@ func reconciledEndpointBinding(in *agent.EndpointBinding) (*agent.EndpointBindin
 		prices := *in.UnitPrices
 		out.UnitPrices = &prices
 	}
+	if in.RoutingPreference != nil {
+		pref := *in.RoutingPreference
+		pref.Order = append([]string(nil), in.RoutingPreference.Order...)
+		pref.Only = append([]string(nil), in.RoutingPreference.Only...)
+		out.RoutingPreference = &pref
+	}
 	return &out, nil
 }
 

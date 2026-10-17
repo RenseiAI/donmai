@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -511,5 +513,32 @@ func TestInterviewLoop_MemoryInjectBetweenTurns(t *testing.T) {
 	}
 	if !sawMemTurn {
 		t.Fatalf("expected a turn-mem-mem-1 SetTurn for the memory resume turn, got %v", turns)
+	}
+}
+
+func TestInterviewLoop_GenerationIDs(t *testing.T) {
+	for _, bound := range []bool{false, true} {
+		t.Run(fmt.Sprint(bound), func(t *testing.T) {
+			h := newScriptedHandle()
+			h.pushTurn(generationEvent("response-one"), generationEvent("response-one"), agent.AssistantTextEvent{Text: interview.InterviewCompleteSentinel}, agent.ResultEvent{Success: true})
+			cfg := interviewCfg(h, make(chan heartbeat.InjectPayload), newManualClock(), &recordingTokenSink{}, 0)
+			cfg.worktree = t.TempDir()
+			cfg.qw.QueuedWork = queuedWorkBase("response-ids")
+			cfg.res.SessionID = cfg.qw.SessionID
+			if bound {
+				cfg.qw.ResolvedProfile.Endpoint = &agent.EndpointBinding{}
+			}
+			res, err := minimalRunner(t).runInterviewLoop(t.Context(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bound {
+				if !slices.Equal(res.GenerationIDs, []string{"response-one"}) {
+					t.Fatalf("GenerationIDs = %v; want response-one", res.GenerationIDs)
+				}
+			} else if len(res.GenerationIDs) != 0 {
+				t.Fatalf("unbound GenerationIDs = %v", res.GenerationIDs)
+			}
+		})
 	}
 }

@@ -39,23 +39,19 @@ func writeTailRollout(t *testing.T, home, thread string, lines []string) {
 
 // TestHandle_StartLaunchesContextTail pins the headless wiring: start()
 // launches the rollout context-notice tail against the fixture home and
-// the thread start() just resolved. It drives the production start()
-// entry point against the fake app-server, then reads the notice off the
-// handle's own Events channel — so deleting the tail wiring in start()
-// leaves the notice undelivered and the test RED. A handle with no
-// provider home runs without notices.
+// the thread start() just resolved, and the tail's notices reach the
+// handle's own Events channel before the turn's result. It drives the
+// production start() entry point against the fake app-server, which holds
+// the turn open while the test writes the session's rollout (the file
+// appears after thread start, as live rollouts do) and then completes the
+// turn, as the app-server does right after writing a turn's last
+// token_count. Deleting the tail wiring in start() leaves the notice
+// undelivered and the test RED. A handle with no provider home runs
+// without notices.
 func TestHandle_StartLaunchesContextTail(t *testing.T) {
-	p, _ := newTestProvider(t)
+	p, fs := newTestProvider(t)
 	home := p.config.home
-	thread := "thread-context-tail-start"
-	// 110000/200000 = 55%: fires the 50 bound on the first poll. The
-	// rollout file must exist BEFORE start() so the tail's first tick
-	// (one second out) is not the only read: the test also seeds one
-	// token_count line after start and waits for the live tail to deliver
-	// it on the handle's own Events channel.
-	writeTailRollout(t, home, thread, []string{
-		`{"type":"session_meta","payload":{"id":"` + thread + `"}}`,
-	})
+	completeTurn := fs.holdTurnCompletion(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -72,21 +68,40 @@ func TestHandle_StartLaunchesContextTail(t *testing.T) {
 	if sessionThread == "" {
 		t.Fatal("Spawn resolved no thread id; the tail has no session file to read")
 	}
-	// 160000/200000 = 80%: fires the 75 bound. Written after start so
-	// only a live tail launched by start() can deliver it.
+	// 165000/200000 = 82.5%: crosses the 50 and 75 bounds in one notice.
+	// Written after start, inside the still-open turn, so only a tail
+	// launched by start() can deliver it.
 	writeTailRollout(t, home, sessionThread, []string{
 		tokenCountLine(160000, 5000, 165000, 200000),
 	})
-	deadline := time.Now().Add(10 * time.Second)
+	completeTurn()
+
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	var delivered bool
 	for {
 		select {
 		case ev, ok := <-h.Events():
 			if !ok {
-				t.Fatal("events closed before the tail delivered the fixture notice")
+				if !delivered {
+					t.Fatal("events closed before the tail delivered the fixture notice")
+				}
+				// A handle with no provider home runs without notices.
+				bare := newHandle(nil, nil, agent.Spec{Prompt: "x", Cwd: t.TempDir()}, HandleOptions{})
+				if tail := bare.startContextTail(context.Background()); tail != nil {
+					t.Fatalf("startContextTail on a provider-less handle = %+v; want nil (no notices)", tail)
+				}
+				return
+			}
+			if ev.Kind() == agent.EventResult && !delivered {
+				t.Fatal("turn result arrived before the tail delivered the fixture notice")
 			}
 			notice, ok := ev.(agent.ContextUsageEvent)
 			if !ok {
 				continue
+			}
+			if delivered {
+				t.Fatalf("second context notice %+v; the fixture crosses once", notice)
 			}
 			if notice.Source != agent.ContextUsageSourceRolloutTokenCount {
 				t.Fatalf("source = %q, want rollout-token-count", notice.Source)
@@ -94,21 +109,56 @@ func TestHandle_StartLaunchesContextTail(t *testing.T) {
 			if notice.UsedPercent == nil || *notice.UsedPercent != 82.5 {
 				t.Fatalf("usedPercent = %v, want 82.5 (100*165000/200000)", notice.UsedPercent)
 			}
-			// A handle with no provider home runs without notices.
-			bare := newHandle(nil, nil, agent.Spec{Prompt: "x", Cwd: t.TempDir()}, HandleOptions{})
-			if tail := bare.startContextTail(context.Background()); tail != nil {
-				t.Fatalf("startContextTail on a provider-less handle = %+v; want nil (no notices)", tail)
-			}
-			return
-		case <-time.After(time.Until(deadline)):
-			t.Fatal("timed out waiting for the headless tail to deliver the fixture notice on the handle's Events channel")
-		default:
-			if time.Now().After(deadline) {
-				t.Fatal("timed out waiting for the headless tail to deliver the fixture notice on the handle's Events channel")
-			}
-			time.Sleep(50 * time.Millisecond)
+			delivered = true
+		case <-timeout.C:
+			t.Fatal("timed out waiting for the headless session to deliver the fixture notice and close its Events channel")
 		}
 	}
+}
+
+// TestHandle_TerminalEventDrainsContextTail pins the terminal drain: a
+// token_count line already in the rollout when turn/completed arrives (the
+// app-server writes a turn's last one moments before completing it, inside
+// one poll interval) is emitted ahead of the result, before Events closes.
+// The tail here is never run, so only the forwarder's drain can read it.
+func TestHandle_TerminalEventDrainsContextTail(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	thread := "thread-context-drain"
+	writeTailRollout(t, home, thread, []string{
+		tokenCountLine(160000, 5000, 165000, 200000),
+	})
+	h := newHandle(nil, nil, agent.Spec{Prompt: "x"}, HandleOptions{})
+	h.tail = newRolloutContextTail(home, thread)
+
+	done := h.handleNotification(notification{
+		Method: "turn/completed",
+		Params: json.RawMessage(`{"threadId":"` + thread + `","turn":{"status":"completed"}}`),
+	})
+	if !done {
+		t.Fatal("turn/completed did not end the session")
+	}
+	h.closeEvents()
+	var kinds []agent.EventKind
+	noticeAt, resultAt := -1, -1
+	for ev := range h.Events() {
+		if _, ok := ev.(agent.ContextUsageEvent); ok && noticeAt < 0 {
+			noticeAt = len(kinds)
+		}
+		if ev.Kind() == agent.EventResult && resultAt < 0 {
+			resultAt = len(kinds)
+		}
+		kinds = append(kinds, ev.Kind())
+	}
+	if noticeAt < 0 {
+		t.Fatalf("terminal event did not drain the tail; events = %v", kinds)
+	}
+	if resultAt < 0 || noticeAt > resultAt {
+		t.Fatalf("notice at %d, result at %d (events %v); want the notice ahead of the result", noticeAt, resultAt, kinds)
+	}
+	// A session without a tail drains nothing.
+	var none *rolloutContextTail
+	none.drain(func(ev agent.Event) { t.Fatalf("nil tail emitted %+v", ev) })
 }
 
 // TestRolloutContextTail_ThresholdCrossingsAreRealNotices pins the codex
@@ -206,7 +256,7 @@ func TestRolloutContextTail_RunStopsOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		tail.run(ctx, func(agent.Event) {})
+		tail.run(ctx, nil, func(agent.Event) {})
 	}()
 	select {
 	case <-done:
@@ -218,6 +268,25 @@ func TestRolloutContextTail_RunStopsOnCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("run did not return after cancel")
+	}
+}
+
+// TestRolloutContextTail_RunStopsWithHandle pins the session lifetime: the
+// tail ends when its handle closes, not only when the spawn ctx ends.
+func TestRolloutContextTail_RunStopsWithHandle(t *testing.T) {
+	t.Parallel()
+	tail := newRolloutContextTail(t.TempDir(), "thread-context-closed")
+	closed := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tail.run(context.Background(), closed, func(agent.Event) {})
+	}()
+	close(closed)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return after the handle closed")
 	}
 }
 

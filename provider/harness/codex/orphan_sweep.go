@@ -204,6 +204,16 @@ func (opts SweepOptions) readVerifiedDonmaiOwnerManifest(dir string) (donmaiOwne
 
 // SweepOptions configures SweepOrphans. The zero value is a usable, fully
 // production-shaped configuration.
+//
+// A note on the per-call budgets for callers that sweep more than one root
+// (the daemon fans out over DefaultCodexHomeRoots, and re-runs the pass
+// hourly): MaxEntries, MaxScan
+// and MaxDuration bound ONE SweepOrphans call — one root — not the whole
+// multi-root pass. Each root carries its own backlog, so sharing one action
+// budget across roots would let the first root's unreclaimable population
+// starve the second root's scan the same way one sorted prefix once
+// starved a single root (see MaxEntries). One call per root keeps every
+// root independently reachable.
 type SweepOptions struct {
 	// Root is the directory to scan for donmai-owned artifacts. Empty means
 	// os.TempDir() — the same parent newCodexConfigBoundaryWithAuthMode and
@@ -299,7 +309,9 @@ type SweepOptions struct {
 	// A restarted daemon's owner manifest names a dead process for those
 	// homes, so the ordinary owner-liveness gate cannot protect them — yet
 	// their app-server may have been re-adopted and be serving. Entries are
-	// compared after filepath.Clean; an empty set protects nothing.
+	// compared after filepath.Clean, against both the Root-joined and the
+	// symlink-resolved spelling of each candidate (see isProtectedHome); an
+	// empty set protects nothing.
 	ProtectedHomes map[string]struct{}
 
 	// processAlive / processLooksLikeCodex / identityAlive / now / startAt
@@ -575,6 +587,59 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 	return report
 }
 
+// DefaultCodexHomeRoots returns every root where this package creates
+// codex-home and app-socket artifacts: the system temp directory (the
+// default parent newCodexConfigBoundaryWithAuthMode and
+// startNamedInteractiveAppServer use) and the operator's persistent Codex
+// home (~/.codex, or CODEX_HOME when set — the parent
+// newInteractiveCodexConfigBoundary falls back to when a hard link cannot
+// cross filesystems). Either entry may be empty when its location cannot
+// be resolved; callers skip empties. Both entries are cleaned (not symlink-
+// resolved): two spellings of the same directory would otherwise double-
+// sweep it, and each pass is idempotent but not free.
+//
+// The two entries may name the SAME directory — when CODEX_HOME points at
+// system temp, or in a test binary whose isolated HOME sits under TMPDIR
+// — so callers that fan out must dedupe before sweeping (see
+// DedupeCodexHomeRoots), or one directory is swept twice per pass.
+func DefaultCodexHomeRoots() []string {
+	return []string{filepath.Clean(os.TempDir()), codexFallbackHomeRoot()}
+}
+
+// DedupeCodexHomeRoots drops empty roots and collapses repeats, preserving
+// first-seen order. Two spellings of the same directory (exact-string
+// equal after Clean) sweep once: each pass is idempotent but not free,
+// and the merged report would otherwise double-count one root's entries.
+func DedupeCodexHomeRoots(roots []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		clean := filepath.Clean(strings.TrimSpace(root))
+		if clean == "" || clean == "." {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
+}
+
+// codexFallbackHomeRoot names the persistent Codex home newInteractive-
+// CodexConfigBoundary falls back to when a hard link cannot cross
+// filesystems: CODEX_HOME when set, else ~/.codex. Empty when neither
+// resolves — the caller skips it. Shared with DefaultCodexHomeRoots so
+// the sweep's second root and the boundary's fallback parent use the
+// exact same resolution.
+func codexFallbackHomeRoot() string {
+	if home, err := ambientCodexHome(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Clean(home)
+	}
+	return ""
+}
+
 // sweepOne resolves one in-scope entry. It reports whether the entry
 // consumed the MaxEntries budget — true only when the sweep actually read
 // from it, deleted inside it, or signalled a process for it. Every "resolve
@@ -591,7 +656,7 @@ func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report
 	// daemon generation that is definitionally dead. The manifest liveness
 	// gate below cannot protect those homes, so the caller's explicit set
 	// does — before any signal, delete, or manifest read.
-	if _, ok := opts.ProtectedHomes[filepath.Clean(path)]; ok {
+	if opts.isProtectedHome(path) {
 		report.SkippedProtected++
 		opts.Logger.Debug("codex: orphan sweep left an artifact directory referenced by a live adopted session",
 			"path", path, "kind", kind)
@@ -623,6 +688,30 @@ func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report
 		return false
 	}
 	return opts.reclaim(path, kind, info, report)
+}
+
+// isProtectedHome reports whether path names a home in ProtectedHomes under
+// either spelling: as joined from Root, or with Root's symlinks resolved.
+// Both spellings occur in production. A boundary creates its home under the
+// symlink-resolved parent (see newCodexConfigBoundaryWithAuthMode), so a
+// resume key records that resolved path, while the sweep joins entries onto
+// Root as given. On macOS os.TempDir() is /var/folders/..., a symlink into
+// /private/var/folders/..., so an exact-string match alone would never
+// protect a temp-rooted adopted home there. path itself was already Lstat'd
+// as a real directory, so resolving it only rewrites Root's own spelling.
+func (opts SweepOptions) isProtectedHome(path string) bool {
+	if len(opts.ProtectedHomes) == 0 {
+		return false
+	}
+	if _, ok := opts.ProtectedHomes[filepath.Clean(path)]; ok {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	_, ok := opts.ProtectedHomes[filepath.Clean(resolved)]
+	return ok
 }
 
 // sweepManifested handles an entry whose owner manifest this process proved

@@ -66,7 +66,7 @@ type SpecInputs struct {
 // fields are never zeroed: the exact harness adaptation profile either applies
 // them or returns a typed pre-spawn denial.
 func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.Spec {
-	return translateSpecWithToolPolicy(qw, caps, in, legacySpecToolPolicy(qw))
+	return translateSpecWithToolPolicy(qw, caps, in, legacySpecToolPolicy(qw, caps))
 }
 
 type specToolPolicy struct {
@@ -74,7 +74,7 @@ type specToolPolicy struct {
 	DisallowedTools []string
 }
 
-func legacySpecToolPolicy(qw QueuedWork) specToolPolicy {
+func legacySpecToolPolicy(qw QueuedWork, caps agent.Capabilities) specToolPolicy {
 	// AllowedTools resolution: only an explicitly configured allow list — the
 	// agent card's or the queued work's — ever reaches the Spec, verbatim.
 	// The runner imposes no allow list of its own: an earlier hardcoded
@@ -95,11 +95,49 @@ func legacySpecToolPolicy(qw QueuedWork) specToolPolicy {
 	if len(qw.DisallowedTools) > 0 {
 		disallowedTools = append(disallowedTools, qw.DisallowedTools...)
 	}
+	if subAgentCapAllowsNone(qw) && caps.AcceptsAllowedToolsList {
+		disallowedTools = append(disallowedTools, subAgentDelegationTools...)
+	}
 	return specToolPolicy{AllowedTools: allowedTools, DisallowedTools: disallowedTools}
+}
+
+// subAgentDelegationTools are the runner-counted delegation tool names
+// withheld from the harness when the stage budget allows no sub-agents.
+// They mirror the delegation core names every adapter's event mapper
+// counts as a sub-agent start ("Task" and "Agent", case-insensitive):
+// withholding both leaves no shaped hole for the agent to delegate
+// through while the cap refuses every delegation.
+var subAgentDelegationTools = []string{"Task", "Agent"}
+
+// subAgentCapAllowsNone reports whether the session's stage budget refuses
+// every sub-agent delegation: an explicit MaxSubAgents cap below 1. This
+// mirrors BudgetEnforcer.ObserveEvent, which breaches on the first counted
+// start whenever the cap is < 1 — withholding the delegation tools is the
+// gentler form of the same refusal: the harness never offers Task/Agent,
+// so the agent plans without delegation instead of the session stopping
+// on its first delegation call. A nil budget or a nil cap (not enforced)
+// withholds nothing, and the enforcer stays the backstop wherever a
+// harness does not honor the disallow channel.
+//
+// The withholding applies only where the harness honors the flat tool-name
+// list (caps.AcceptsAllowedToolsList). On channels that compile the
+// DisallowedTools entries as substring patterns (for example the codex
+// approval bridge's DisallowPatterns, matched against the shell command
+// line), the bare delegation names would decline ordinary commands that
+// merely mention them ("go test -run TestAgentLoop", "grep -rn Agent"),
+// while adding no protection on a channel that carries no Task/Agent
+// delegation tool — so nothing is withheld there and the budget enforcer
+// remains the backstop.
+func subAgentCapAllowsNone(qw QueuedWork) bool {
+	if qw.StageBudget == nil || qw.StageBudget.MaxSubAgents == nil {
+		return false
+	}
+	return *qw.StageBudget.MaxSubAgents <= 0
 }
 
 func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in SpecInputs, policy specToolPolicy) agent.Spec {
 	spec := agent.Spec{
+		SessionID:          strings.TrimSpace(qw.SessionID),
 		SessionName:        strings.TrimSpace(qw.SessionName),
 		Prompt:             in.Prompt,
 		Cwd:                in.Cwd,
@@ -268,6 +306,12 @@ func copyEndpointBinding(in *agent.EndpointBinding) *agent.EndpointBinding {
 	if in.UnitPrices != nil {
 		prices := *in.UnitPrices
 		out.UnitPrices = &prices
+	}
+	if in.RoutingPreference != nil {
+		pref := *in.RoutingPreference
+		pref.Order = append([]string(nil), in.RoutingPreference.Order...)
+		pref.Only = append([]string(nil), in.RoutingPreference.Only...)
+		out.RoutingPreference = &pref
 	}
 	return &out
 }

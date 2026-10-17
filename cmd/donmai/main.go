@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afcli"
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/linear"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/statehome"
@@ -261,6 +263,10 @@ func main() {
 		// the unit's wait-for-setup into a restart every RestartSec.
 		if code, ok := afcli.NeedsSetupExitCode(err); ok {
 			os.Exit(code)
+		}
+		var coded interface{ ExitCode() int }
+		if errors.Is(err, linear.ErrRateLimited) && errors.As(err, &coded) {
+			os.Exit(coded.ExitCode())
 		}
 		os.Exit(1)
 	}

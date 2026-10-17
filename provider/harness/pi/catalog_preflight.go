@@ -316,6 +316,13 @@ func fallbackToInjectedProvider(spec agent.Spec, miss *catalogMissError) (agent.
 // "<aggregator>/<slug>" — which nativeProviderPin then routes natively — and
 // the cell key is mirrored onto the aggregator's own credential env var.
 //
+// A binding that carries a set routing preference is never promoted:
+// the preference is registered on the injected provider's model
+// (providerPinEnv / the policy extension), and the native aggregator
+// provider has no routing option of its own to carry it — promoting
+// would silently drop the dispatch's routing. The session stays on the
+// injected provider, where the preference reaches the wire.
+//
 // Every other outcome leaves spec unchanged, so the session stays on the
 // injected provider with the whole slug against the bound BaseURL: a slug
 // newer than pi's bundled catalog, an unprefixed model id, no probe (no real
@@ -337,6 +344,13 @@ func (p *Provider) promoteAggregatorPin(ctx context.Context, spec agent.Spec) (a
 	// swap it for the catalog's, dropping the prompt_cache_key pi sends
 	// on every Responses request.
 	if ep.Protocol == agent.ProtoOpenAIResponses {
+		return spec, false
+	}
+	// A set routing preference keeps the injected lane: the preference
+	// is registered on the injected provider's model, and the native
+	// aggregator provider carries no routing option — promoting would
+	// silently drop it.
+	if !ep.RoutingPreference.IsZero() {
 		return spec, false
 	}
 	agg, ok := builtinAggregatorForBaseURL(ep.BaseURL)

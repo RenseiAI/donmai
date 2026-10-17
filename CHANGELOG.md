@@ -10,6 +10,73 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.79 — 2026-10-16
+
+### Fixes
+
+- Expose nullable issue estimates
+- Add attribution trailers to backstop commits
+
+## v0.72.78 — 2026-10-15
+
+### Chores
+
+- Declare interactive native tool-policy delivery for the claude harness
+- Seeded-trust hardening: crash sweep, lock interop, pi/codex checks, live-CLI smoke
+- Backstop: b257b597-8def-4587-8ad5-f8528d3b46a1
+- Serve harness: inline MCP grant policy, approval decline path, read-only proof, usage and auth typing
+- Revert the pre-spawn execution security report gate until the controller accepts it
+
+## v0.72.77 — 2026-10-15
+
+### Chores
+
+- Constrain repository dependency preparation before spawn
+- Runner submits its execution security report before spawn and waits for acceptance
+- Gateway Responses inbound surface for interactive code-backed sessions
+- Serve every post-loss retry from the adoption interposer
+
+## v0.72.76 — 2026-10-15
+
+### Chores
+
+- Map Codex app-server notifications and guard protocol drift
+- Use cumulative statusline cost for Claude session spend
+- Derive subagent event capabilities from executed fixtures
+- Preserve usage evidence across empty final results
+- Test dependent git calls in a single pi response
+- Preserve Linear proxy errors and bound Retry-After retries
+- Carry optional commit co-author metadata through session contracts
+- Confine the serve harness, add its host-session matrix cells, map the effort ladder
+- Forward dispatch trace context in session heartbeats
+- Refuse multiline retired config values before line deletion
+- Include redacted output tails in interactive PTY failures
+- Forward dispatch trace context in activity and token-delta posts
+- Own the harness resume token; restore as a state machine that never silently starts fresh
+- Stabilize parallel harness readiness under spawn churn
+- Add opt-in anonymous weekly usage count at host setup
+
+## v0.72.75 — 2026-10-14
+
+### Features
+
+- `linear create-issue` accepts `--assignee <user ID|name|email|me>` and `--priority 0-4`, and `linear update-issue` accepts the same `--assignee` spellings with `--assignee null` clearing the assignment. Assignee names, emails, and `me` resolve through the configured transport (direct API key or hosted proxy) and unknown values fail before any mutation runs.
+
+## v0.72.74 — 2026-10-13
+
+### Chores
+
+- Pin provider routing env after repo config; clean up seeded trust at session end
+- Rename systemd unit to brand-neutral default with in-place migration
+- Terminal outbox hardening: resume-stable key, prune, quarantine, local delivery, exactly-once
+- Upgrade acceptance follow-ups: live halves, posture stale check, wider triggers, worktree image
+- Stop finished seat scopes at disposal; monotonic launch epochs; pre-spawn bus check; batched read-back
+- Three-axis seat state in heartbeats and terminal receipts
+- Harness context and compaction notices feed the usage series
+- Carry session identity on adopted and quarantined shim handles; dedupe the session list by id
+- Add MSP harness over serve host (generated types, session and turn lifecycle, event mapping)
+- Keep the fake scope binary from writing .tmp into the package directory
+
 ## v0.72.73 — 2026-10-12
 
 ### Chores

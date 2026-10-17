@@ -26,7 +26,10 @@
 //	The plist sets KeepAlive=<dict><SuccessfulExit><false/><Crashed><true/></dict>:
 //	launchd restarts on a non-zero exit (crash, OOM, panic) but NOT after a
 //	clean `daemon run` returning 0 (operator-initiated stops stick). A 30s
-//	ThrottleInterval prevents rapid-restart storms on crash loops.
+//	ThrottleInterval prevents rapid-restart storms on crash loops. The
+//	unconfigured first run is not a crash: the setup refusal exits clean on
+//	macOS, so KeepAlive parks the job until the operator runs setup and
+//	reloads it instead of respawning it about every ThrottleInterval.
 //
 // Durability contract (session-hosting daemons):
 //
@@ -253,6 +256,9 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 //   - KeepAlive (dict)       — SuccessfulExit=false. See restart-contract
 //     note at the top of the file.
 //   - ThrottleInterval = 30  — crash restart throttle (prevents storms).
+//     The unconfigured first run does NOT spin on it: the setup refusal
+//     exits clean on macOS, which SuccessfulExit=false parks instead of
+//     respawning (see the restart contract above).
 //   - StandardOutPath / Err  — routes stdio to ~/Library/Logs/<brand>/.
 //   - EnvironmentVariables   — sets HOME and PATH.
 func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {

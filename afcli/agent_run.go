@@ -31,6 +31,7 @@ import (
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
+	providermuse "github.com/RenseiAI/donmai/provider/harness/muse"
 	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
 	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
 	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
@@ -1385,6 +1386,10 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// comment for how PreferServer routes between them. Gemini is a
 		// full streaming impl against generativelanguage.googleapis.com.
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
+		// muse is registration-only until the harness proves a live
+		// turn: the constructor probes the binary + minimum version
+		// and warns-and-skips when absent, mirroring pi.
+		{name: "muse", new: func() (agent.Provider, error) { return providermuse.New(providermuse.Options{}) }},
 		// opencode's PreferServer threads the resolved profile's Lane-B
 		// signal (opencodeCtorHints above) so a `donmai agent run` session
 		// can select the serve/HTTP adapter (07 §2 Lane B) instead of
@@ -1530,6 +1535,7 @@ func kitScanPaths() []string {
 // runner.ReconcileResolvedProfile below) rather than reaching the runner's
 // Spec.
 func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
+	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(d.SessionID, d.CoAuthorName, d.CoAuthorEmail)
 	qw := runner.QueuedWork{
 		AdmissionReceipt:        bytes.Clone(d.AdmissionReceipt),
 		ClaimReceipt:            bytes.Clone(d.ClaimReceipt),
@@ -1589,6 +1595,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		Branch:                d.Branch,
 		WorkerID:              d.WorkerID,
 		AuthToken:             d.AuthToken,
+		CoAuthorName:          coAuthorName,
+		CoAuthorEmail:         coAuthorEmail,
 		McpAuthToken:          d.McpAuthToken,
 		McpAuthTokenExpiresAt: d.McpAuthTokenExpiresAt,
 		PlatformURL:           d.PlatformURL,
@@ -1644,6 +1652,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		// line a no-op — it is the tag change, not the decoder, that this
 		// guards against, exactly as for AuthToken/PlatformURL above.
 		qw.McpAuthToken, qw.McpAuthTokenExpiresAt = d.McpAuthToken, d.McpAuthTokenExpiresAt
+		qw.CoAuthorName, qw.CoAuthorEmail = coAuthorName, coAuthorEmail
 		qw.Capabilities = d.Capabilities
 	}
 	stageBudgetJSON, err := marshalOptional(d.StageBudget)
@@ -1803,6 +1812,7 @@ func detailDeliveryPolicy(in *daemon.PollDeliveryPolicy) *prompt.DeliveryPolicy 
 	return &prompt.DeliveryPolicy{
 		AllowDraft:        in.AllowDraft,
 		AllowMergeCommits: in.AllowMergeCommits,
+		AllowCleanMerge:   in.AllowCleanMerge,
 	}
 }
 

@@ -85,6 +85,10 @@ type Config struct {
 	// no auth header — used by tests against unauthenticated httptest.Server
 	// instances.
 	AuthToken string
+	// Traceparent and Tracestate carry the dispatch W3C trace context.
+	// Empty values omit the corresponding request headers.
+	Traceparent string
+	Tracestate  string
 	// CredentialProvider returns the latest worker id + runtime token. When
 	// set, every tick calls it before posting so child runners pick up
 	// daemon-side runtime-token refreshes mid-session.
@@ -372,6 +376,12 @@ func (e *Emitter) beat(ctx context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if e.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", e.cfg.Traceparent)
+	}
+	if e.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", e.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}
