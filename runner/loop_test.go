@@ -192,6 +192,36 @@ func TestLoop_TimeoutCancelsStream(t *testing.T) {
 // Uses BehaviorHangThenTimeout so the provider does not race the
 // heartbeat to a terminal Result.
 func TestLoop_HeartbeatLostOwnership(t *testing.T) {
+	tests := []struct {
+		name string
+		// status is the lock-refresh answer on every tick.
+		status int
+		// wantStatus, when non-empty, must appear in res.Error — the
+		// terminal result names the HTTP status that tripped the fuse.
+		// Empty keeps the legacy tolerance (lost-ownership or timeout)
+		// without asserting on the text.
+		wantStatus string
+	}{
+		{name: "gone keeps legacy tolerance", status: http.StatusGone},
+		{name: "auth rejection names the status", status: http.StatusUnauthorized, wantStatus: "last lock-refresh status 401"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testLoopHeartbeatLostOwnership(t, tc.status, tc.wantStatus)
+		})
+	}
+}
+
+// testLoopHeartbeatLostOwnership drives one Run against a platform that
+// rejects every lock-refresh with status, so the ownership pulser trips
+// and the runner cancels the stream with FailureLostOwnership.
+//
+// Uses BehaviorHangThenTimeout so the provider does not race the
+// heartbeat to a terminal Result.
+func testLoopHeartbeatLostOwnership(t *testing.T, status int, wantStatus string) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
 	}
@@ -200,7 +230,7 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/lock-refresh") {
 			refreshes.Add(1)
-			http.Error(w, "lost", http.StatusGone)
+			http.Error(w, "lost", status)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -259,6 +289,18 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	defer cancel()
 	res, _ := r.Run(ctx, qw)
 
+	if wantStatus != "" {
+		// The 401 path is deterministic: every lock-refresh tick answers
+		// 401, so the fuse trips on the recorded status and the terminal
+		// result must name it while keeping its failure mode.
+		if res.FailureMode != FailureLostOwnership {
+			t.Fatalf("FailureMode = %q; want %q", res.FailureMode, FailureLostOwnership)
+		}
+		if !strings.Contains(res.Error, wantStatus) {
+			t.Fatalf("res.Error = %q; want it to contain %q", res.Error, wantStatus)
+		}
+		return
+	}
 	// Either lost-ownership or timeout depending on the cancellation
 	// race; lost-ownership is the expected outcome but we tolerate
 	// timeout to keep the test stable on slow CI.
