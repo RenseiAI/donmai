@@ -2,12 +2,43 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var safeWIPSessionID = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)
+
+// wipRefAttemptNow and wipRefAttemptRand are the clock and entropy
+// behind per-attempt reserved refs. Variables so a test can pin both
+// and assert two failures of one session land on distinct refs.
+var wipRefAttemptNow = time.Now
+var wipRefAttemptRand = func() string {
+	var raw [4]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "fallback"
+	}
+	return hex.EncodeToString(raw[:])
+}
+
+// wipAttemptRef returns the reserved ref for one failed-session
+// checkpoint attempt. The ref is per-attempt
+// (refs/wip/<session>/<utc-stamp>-<rand>) rather than per-session
+// (refs/wip/<session>): the WIP commit is a commit-tree outside local
+// history, so a second failure of the same session can never
+// fast-forward a per-session ref — the probe got
+// "! [rejected] (non-fast-forward)" — and a stale lost-ownership
+// worker racing the new owner would collide on it. A per-attempt leaf
+// keeps every failure's work fetchable without ever overwriting, and
+// the layout is fixed before any host pushes the per-session shape so
+// a later change cannot cause directory/file ref conflicts.
+func wipAttemptRef(sessionID string) string {
+	stamp := wipRefAttemptNow().UTC().Format("20060102T150405Z")
+	return "refs/wip/" + sessionID + "/" + stamp + "-" + wipRefAttemptRand()
+}
 
 // checkpointFailedSession supplements local rescue with a bounded remote copy.
 func (r *Runner) checkpointFailedSession(qw QueuedWork, res *Result) {
@@ -29,7 +60,7 @@ func (r *Runner) checkpointFailedSession(qw QueuedWork, res *Result) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), providerErrorCheckpointTimeout)
 	defer cancel()
-	checkpoint, err := createWIPCheckpoint(ctx, qw, target, "refs/wip/"+qw.SessionID)
+	checkpoint, err := createWIPCheckpoint(ctx, qw, target, wipAttemptRef(qw.SessionID))
 	if err != nil {
 		warn(err)
 		return

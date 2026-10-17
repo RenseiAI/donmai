@@ -81,6 +81,100 @@ var excludePathPrefixes = []string{
 	".donmai/code-index/",
 }
 
+// wipSecretBasenames are exact secret-bearing basenames that must never
+// enter a remote WIP checkpoint: the checkpoint stages the whole tree
+// (including files the agent chose not to commit) and pushes it to a
+// ref no review ever opens, so a checked-in secret there is invisible
+// and world-fetchable on public repositories. Exact names keep the rule
+// auditable next to the deny patterns below.
+var wipSecretBasenames = map[string]bool{
+	".envrc":          true,
+	".npmrc":          true,
+	".pypirc":         true,
+	".netrc":          true,
+	".git-credentials": true,
+}
+
+// wipSecretEnvExamples are safe .env siblings that must NOT be excluded:
+// example/sample/template files carry placeholders, not secrets.
+var wipSecretEnvExamples = map[string]bool{
+	".env.example":  true,
+	".env.sample":   true,
+	".env.template": true,
+}
+
+// wipSecretDirAnyDepth lists directory names that disqualify a path at
+// any depth from a WIP checkpoint: credential stores and harness-state
+// dirs. Harness state must match at ANY depth (not just the top level):
+// a nested <subdir>/.pi/ holds the spawn transcript with the full
+// environment, and the scratch-index checkpoint cannot rely on the
+// provision-time info/exclude write that covers only the checkout root.
+var wipSecretDirAnyDepth = map[string]bool{
+	".aws":   true,
+	".ssh":   true,
+	".gnupg": true,
+}
+
+// shouldExcludeFromWIPCheckpoint reports whether a staged path must be
+// dropped from a remote WIP checkpoint before it is committed and
+// pushed. It layers the secret deny-list over the shared backstop
+// excludes: everything the backstop would never commit (build output,
+// harness state at the top level) is also dropped here, and on top of
+// that the secret patterns below apply — every consumer that stages the
+// whole tree into a scratch index and pushes it (the provider-error
+// wip/<session> branch checkpoint and the failed-session reserved-ref
+// checkpoint share createWIPCheckpoint) gets both.
+//
+// `path` is relative to the worktree root, with forward slashes (git's
+// --name-only output uses forward slashes on every platform).
+func shouldExcludeFromWIPCheckpoint(path string) bool {
+	if path == "" {
+		return false
+	}
+	if shouldExcludeFromBackstop(path) {
+		return true
+	}
+	parts := strings.Split(path, "/")
+	basename := parts[len(parts)-1]
+	// Harness-state dirs at any depth: each table entry matched as a
+	// whole path component, so a directory that merely shares a prefix
+	// (".pi-cache") stays ordinary project content.
+	for _, part := range parts[:len(parts)-1] {
+		if harnessstate.IsStateDir(part) {
+			return true
+		}
+		if wipSecretDirAnyDepth[part] {
+			return true
+		}
+	}
+	if wipSecretBasenames[basename] {
+		return true
+	}
+	// .env and .env.* carry secrets; the example/sample/template
+	// siblings carry placeholders and stay committable.
+	if basename == ".env" || strings.HasPrefix(basename, ".env.") {
+		return !wipSecretEnvExamples[basename]
+	}
+	lower := strings.ToLower(basename)
+	// Private keys and credential bundles, matched case-insensitively
+	// so KEY.PEM or Credentials.JSON cannot slip through.
+	for _, ext := range []string{".pem", ".key", ".p12", ".pfx"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	if strings.HasPrefix(lower, "id_rsa") || strings.HasPrefix(lower, "id_ed25519") {
+		return true
+	}
+	if strings.HasSuffix(lower, ".json") {
+		trimmed := strings.TrimSuffix(lower, ".json")
+		if strings.HasPrefix(trimmed, "credentials") || strings.HasPrefix(trimmed, "service-account") {
+			return true
+		}
+	}
+	return false
+}
+
 // backstopMaxFiles is the upper bound on the number of files the
 // backstop will auto-commit. Beyond this we abort rather than create
 // a polluted PR. Mirrors BACKSTOP_MAX_FILES.

@@ -199,7 +199,7 @@ func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw 
 	}
 	var excluded []string
 	for _, path := range strings.Split(staged, "\x00") {
-		if path != "" && shouldExcludeFromBackstop(path) {
+		if path != "" && shouldExcludeFromWIPCheckpoint(path) {
 			excluded = append(excluded, path)
 		}
 	}

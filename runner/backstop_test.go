@@ -212,6 +212,78 @@ func TestCaptureHeadSHA(t *testing.T) {
 	}
 }
 
+// TestShouldExcludeFromWIPCheckpoint_Secrets pins the secret deny-list
+// the remote WIP checkpoint layers over the backstop excludes: every
+// secret-bearing shape plus nested harness state stays out of the pushed
+// tree, while the safe .env siblings and lookalike names stay committable.
+func TestShouldExcludeFromWIPCheckpoint_Secrets(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		path string
+		want bool
+	}{
+		// .env and .env.* are secrets ...
+		{".env", true},
+		{".env.local", true},
+		{"service/.env.production", true},
+		// ... except the placeholder siblings.
+		{".env.example", false},
+		{".env.sample", false},
+		{".env.template", false},
+		{"service/.env.example", false},
+		// Dotfile credentials by exact name.
+		{".envrc", true},
+		{".npmrc", true},
+		{"service/.npmrc", true},
+		{".pypirc", true},
+		{".netrc", true},
+		{".git-credentials", true},
+		// Private keys and credential bundles (case-insensitive).
+		{"tls/server.pem", true},
+		{"tls/SERVER.PEM", true},
+		{"deploy.key", true},
+		{"bundle.p12", true},
+		{"bundle.pfx", true},
+		{"id_rsa", true},
+		{"id_rsa.pub", true},
+		{"id_ed25519", true},
+		{"home/.ssh/id_ed25519", true},
+		{"credentials.json", true},
+		{"config/Credentials.Production.JSON", true},
+		{"credentials-backup.json", true},
+		{"service-account.json", true},
+		{"service-account-prod.json", true},
+		// Credential stores at any depth.
+		{".aws/credentials", true},
+		{"service/.aws/config", true},
+		{".ssh/known_hosts", true},
+		{"home/.gnupg/pubring.kbx", true},
+		// Harness-state dirs at any depth, not just the top level.
+		{".pi/session.jsonl", true},
+		{"sub/.pi/transcript.jsonl", true},
+		{"sub/.pi/agent-home/config.json", true},
+		{"sub/.agent/events.jsonl", true},
+		{"sub/.scratch/notes.md", true},
+		{"sub/.claude/settings.json", true},
+		{"sub/.codex/history.jsonl", true},
+		// The backstop layer still applies through the same helper.
+		{"node_modules/index.js", true},
+		{".agent/state.json", true},
+		// Lookalikes stay committable.
+		{".pi-cache/blob", false},
+		{"src/main.go", false},
+		{"README.md", false},
+		{"src/env.go", false},
+		{"docs/credentials.md", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := shouldExcludeFromWIPCheckpoint(tc.path); got != tc.want {
+			t.Errorf("shouldExcludeFromWIPCheckpoint(%q) = %v; want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 // TestShouldExcludeFromBackstop_Table table-tests the path-exclude
 // decision against the data tables. The rows cover the legacy TS cases plus
 // Donmai's Go-native code-intel cache.

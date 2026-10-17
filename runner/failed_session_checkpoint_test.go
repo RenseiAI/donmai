@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 			if scenario == "unsafe" {
 				work.SessionID = "bad..id"
 			}
-			ref := "refs/wip/" + work.SessionID
+			wipPrefix := "refs/wip/" + work.SessionID + "/"
 			work.StageBudget = &prompt.StageBudget{MaxTokens: 1}
 			turn := verdictScriptTurn{events: []agent.Event{agent.LlmCallEvent{InputTokens: 2, UsageSource: agent.LlmUsageProvider}}}
 			if scenario == "completed" {
@@ -134,15 +135,18 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 				}
 				return
 			}
-			sha := gitRun(t, bare, "rev-parse", ref)
-			if scenario == "committed" && sha != commitSHA {
-				t.Fatal("committed-only checkpoint changed HEAD")
-			}
 			var posted agent.WIPRef
 			if err := json.Unmarshal(body["wipRef"], &posted); err != nil {
 				t.Fatal(err)
 			}
-			if posted.Ref != ref || posted.CommitSHA != sha || res.WIPRef == nil || *res.WIPRef != posted {
+			if !strings.HasPrefix(posted.Ref, wipPrefix) || strings.Contains(strings.TrimPrefix(posted.Ref, wipPrefix), "/") {
+				t.Fatalf("checkpoint ref %q is not one per-attempt leaf under %q", posted.Ref, wipPrefix)
+			}
+			sha := gitRun(t, bare, "rev-parse", posted.Ref)
+			if scenario == "committed" && sha != commitSHA {
+				t.Fatal("committed-only checkpoint changed HEAD")
+			}
+			if posted.CommitSHA != sha || res.WIPRef == nil || *res.WIPRef != posted {
 				t.Fatalf("checkpoint=%+v remote=%s", posted, sha)
 			}
 			if got := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/heads"); got != heads {
@@ -150,7 +154,7 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 			}
 			restored := filepath.Join(t.TempDir(), "restored")
 			gitRun(t, filepath.Dir(restored), "clone", "-q", bare, restored)
-			gitRun(t, restored, "fetch", "-q", "origin", ref)
+			gitRun(t, restored, "fetch", "-q", "origin", posted.Ref)
 			gitRun(t, restored, "checkout", "-q", "FETCH_HEAD")
 			gitRun(t, restored, "merge-base", "--is-ancestor", commitSHA, "HEAD")
 			files := map[string]string{"committed.txt": "local commit\n"}
@@ -168,5 +172,181 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 				t.Fatalf("worktree not torn down: %v", err)
 			}
 		})
+	}
+}
+
+// TestCheckpointFailedSession_ExcludesSecretsFromWIPRef drives
+// checkpointFailedSession directly: deny-listed files plus a nested
+// harness-state dir sit next to real work with no info/exclude in
+// place, and none of them may reach the pushed reserved ref while the
+// real work does. The restore-half of workarea_rescue_test.go covers
+// the archive path; this covers the pushed ref.
+func TestCheckpointFailedSession_ExcludesSecretsFromWIPRef(t *testing.T) {
+	bare, wt, res := checkpointCheckout(t)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-SECRETS")}
+	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
+	res.FailureMode = FailureBudgetExceeded
+	res.Error = "budget exceeded: max-tokens"
+	secrets := map[string]string{
+		".env":                      "SECRET=top\n",
+		".env.local":                "SECRET=top\n",
+		".envrc":                    "export SECRET=top\n",
+		".npmrc":                    "//registry/:_authToken=top\n",
+		".netrc":                    "machine example password top\n",
+		".pypirc":                   "password = top\n",
+		".git-credentials":          "https://user:top@example.test\n",
+		"tls/server.pem":            "PRIVATE\n",
+		"deploy.key":                "PRIVATE\n",
+		"bundle.p12":                "PRIVATE\n",
+		"id_rsa":                    "PRIVATE\n",
+		"home/.ssh/id_ed25519":      "PRIVATE\n",
+		"credentials.json":          `{"secret":"top"}`,
+		"config/credentials-prod.json": `{"secret":"top"}`,
+		"config/service-account-prod.json": `{"secret":"top"}`,
+		".aws/credentials":          "[default]\naws_secret_access_key = top\n",
+		".ssh/config":               "IdentityFile top\n",
+		".gnupg/secring.gpg":        "PRIVATE\n",
+		"sub/.pi/session.jsonl":     `{"spawnEnv":{"SECRET":"top"}}`,
+		"sub/.pi/agent-home/config.json": "{}",
+		"sub/.agent/events.jsonl":   "{}",
+		"sub/.scratch/notes.md":     "scratch\n",
+		".agent/events.jsonl":       "{}",
+		"node_modules/index.js":     "// build artifact\n",
+	}
+	for path, body := range secrets {
+		writeFile(t, wt, path, body)
+	}
+	writeFile(t, wt, "feature.txt", "real work\n")
+	writeFile(t, wt, ".env.example", "PLACEHOLDER=\n")
+	writeFile(t, wt, "docs/credentials.md", "how to rotate\n")
+	(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+	if res.WIPRef == nil {
+		t.Fatalf("no WIP checkpoint: warnings %v", res.PostSessionWarnings)
+	}
+	if !strings.HasPrefix(res.WIPRef.Ref, "refs/wip/"+qw.SessionID+"/") {
+		t.Fatalf("WIP ref %q is not a per-attempt leaf", res.WIPRef.Ref)
+	}
+	tree := gitRun(t, bare, "ls-tree", "-r", "--name-only", res.WIPRef.Ref)
+	got := map[string]bool{}
+	for _, line := range strings.Split(tree, "\n") {
+		if strings.TrimSpace(line) != "" {
+			got[line] = true
+		}
+	}
+	for path := range secrets {
+		if got[path] {
+			t.Errorf("secret-bearing %q reached %s", path, res.WIPRef.Ref)
+		}
+	}
+	for _, path := range []string{"feature.txt", ".env.example", "docs/credentials.md"} {
+		if !got[path] {
+			t.Errorf("%q missing from %s (tree:\n%s)", path, res.WIPRef.Ref, tree)
+		}
+	}
+}
+
+// TestCheckpointFailedSession_NeverForcesAnExistingRef pre-creates the
+// session's reserved ref on origin pointing at an unrelated commit,
+// then pins that a repeated failure lands on its own per-attempt ref:
+// the pre-existing ref is unchanged, a warning is recorded, and the
+// second failure's work is still preserved under its own leaf. Pushing
+// with --force would move the pre-existing ref instead; adding it to
+// the push must turn this test RED.
+func TestCheckpointFailedSession_NeverForcesAnExistingRef(t *testing.T) {
+	bare, wt, res := checkpointCheckout(t)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-NOFORCE")}
+	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
+	res.FailureMode = FailureBudgetExceeded
+	res.Error = "budget exceeded: max-tokens"
+	unrelated := gitRun(t, wt, "rev-parse", "HEAD")
+	firstRef := "refs/wip/" + qw.SessionID + "/20060102T150405Z-first0000"
+	gitRun(t, wt, "update-ref", firstRef, unrelated)
+	gitRun(t, wt, "push", "origin", firstRef+":"+firstRef)
+	pinned := gitRun(t, bare, "rev-parse", firstRef)
+	if pinned != unrelated {
+		t.Fatalf("fixture ref = %s, want %s", pinned, unrelated)
+	}
+	writeFile(t, wt, "retry.txt", "second attempt work\n")
+	(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+	if res.WIPRef == nil {
+		t.Fatalf("no WIP checkpoint: warnings %v", res.PostSessionWarnings)
+	}
+	if res.WIPRef.Ref == firstRef {
+		t.Fatalf("second failure reused %s instead of its own per-attempt ref", firstRef)
+	}
+	if got := gitRun(t, bare, "rev-parse", firstRef); got != unrelated {
+		t.Fatalf("pre-existing %s moved %s -> %s: the checkpoint must never force", firstRef, unrelated, got)
+	}
+	tree := gitRun(t, bare, "ls-tree", "-r", "--name-only", res.WIPRef.Ref)
+	if !strings.Contains(tree, "retry.txt") {
+		t.Fatalf("second-attempt work missing from %s (tree:\n%s)", res.WIPRef.Ref, tree)
+	}
+}
+
+// TestCheckpointFailedSession_NeverForcesThePushedRef pins never-force
+// on the push: origin's copy of the exact per-attempt ref the
+// checkpoint will push is pointed at an UNRELATED commit (an empty
+// commit on no shared history), so the checkpoint's push is refused as
+// a non-fast-forward, the remote ref is unchanged, a warning is
+// recorded, and no WIP ref is reported. Adding --force to the push
+// turns this test RED (the push then succeeds and moves the ref). The
+// unrelated commit must differ from the checkout's HEAD: pointing the
+// ref at HEAD itself would make the push a no-op success on any code.
+func TestCheckpointFailedSession_NeverForcesThePushedRef(t *testing.T) {
+	bare, wt, res := checkpointCheckout(t)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-FORCEPIN")}
+	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
+	res.FailureMode = FailureBudgetExceeded
+	res.Error = "budget exceeded: max-tokens"
+	oldNow, oldRand := wipRefAttemptNow, wipRefAttemptRand
+	t.Cleanup(func() { wipRefAttemptNow, wipRefAttemptRand = oldNow, oldRand })
+	wipRefAttemptNow = func() time.Time { return time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC) }
+	wipRefAttemptRand = func() string { return "deadbeef" }
+	wantRef := wipAttemptRef(qw.SessionID)
+	unrelated := gitRun(t, wt, "commit-tree", gitRun(t, wt, "rev-parse", "HEAD^{tree}"), "-m", "unrelated")
+	gitRun(t, wt, "update-ref", wantRef, unrelated)
+	gitRun(t, wt, "push", "origin", wantRef+":"+wantRef)
+	if got := gitRun(t, bare, "rev-parse", wantRef); got != unrelated {
+		t.Fatalf("fixture ref = %s, want %s", got, unrelated)
+	}
+	writeFile(t, wt, "work.txt", "work\n")
+	(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+	if res.WIPRef != nil {
+		t.Fatalf("WIPRef = %+v; want nil after a refused push", res.WIPRef)
+	}
+	if len(res.PostSessionWarnings) == 0 {
+		t.Fatal("no checkpoint warning recorded for the refused push")
+	}
+	if got := gitRun(t, bare, "rev-parse", wantRef); got != unrelated {
+		t.Fatalf("%s moved %s -> %s: the checkpoint must never force", wantRef, unrelated, got)
+	}
+}
+
+// TestWipAttemptRef_PerSessionUniqueness pins the ref layout: two
+// attempts of one session land on distinct per-attempt leaves, so a
+// re-entered generation or a racing stale worker can never collide or
+// fast-forward the other's ref.
+func TestWipAttemptRef_PerSessionUniqueness(t *testing.T) {
+	t.Parallel()
+	oldNow, oldRand := wipRefAttemptNow, wipRefAttemptRand
+	t.Cleanup(func() { wipRefAttemptNow, wipRefAttemptRand = oldNow, oldRand })
+	base := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	randValues := []string{"aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"}
+	i := 0
+	wipRefAttemptNow = func() time.Time { return base.Add(time.Duration(i) * time.Second) }
+	wipRefAttemptRand = func() string {
+		v := randValues[i%len(randValues)]
+		i++
+		return v
+	}
+	first := wipAttemptRef("sess-1")
+	second := wipAttemptRef("sess-1")
+	if first == second {
+		t.Fatalf("two attempts produced the same ref %q", first)
+	}
+	for _, ref := range []string{first, second} {
+		if !strings.HasPrefix(ref, "refs/wip/sess-1/") || strings.Contains(strings.TrimPrefix(ref, "refs/wip/sess-1/"), "/") {
+			t.Errorf("ref %q is not one leaf under refs/wip/sess-1/", ref)
+		}
 	}
 }
