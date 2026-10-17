@@ -323,6 +323,12 @@ type scriptedSession struct {
 	// draft, when set, replaces the pull request draft read; otherwise the
 	// session's pull request is never a draft (and no gh is run).
 	draft pullRequestDraftLookup
+	// draftAtStart, when non-nil, replaces the draft read taken right
+	// after the continued-pull-request checkout, before the turn starts.
+	// Nil keeps the draft read: a constant draft stub reads the same at
+	// the start and at the gate, while a sequencing stub can report one
+	// value at the start and another at the gate.
+	draftAtStart *bool
 	// ref, when set, makes the session a rework run on that existing
 	// branch of repository (qw.Ref), created at main.
 	ref string
@@ -450,6 +456,18 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	r.pullRequestDraftLookup = cfg.draft
 	if r.pullRequestDraftLookup == nil {
 		r.pullRequestDraftLookup = func(context.Context, string, string) (bool, error) { return false, nil }
+	}
+	if cfg.draftAtStart != nil {
+		start := *cfg.draftAtStart
+		gate := r.pullRequestDraftLookup
+		calls := 0
+		r.pullRequestDraftLookup = func(ctx context.Context, path, url string) (bool, error) {
+			calls++
+			if calls == 1 {
+				return start, nil
+			}
+			return gate(ctx, path, url)
+		}
 	}
 	r.skipBackstop = !cfg.backstop
 	r.providerRetryBackoff = func(int) time.Duration { return 0 }

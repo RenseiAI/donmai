@@ -769,6 +769,14 @@ type Result struct {
 	// Additive — old platforms ignore it.
 	ReviewVerdict string `json:"reviewVerdict,omitempty"`
 
+	// ContinuationOutcome classifies a completed continue-mode run that
+	// delivered no new pull request work: "no_op" when a passed turn
+	// left the continued pull request unchanged (or merged only), and
+	// "fixed_in_place" when a passed turn left a pull request that was
+	// already a draft with the run's own delivered code on it. Empty on
+	// every other run. Additive — old platforms ignore it.
+	ContinuationOutcome string `json:"continuationOutcome,omitempty"`
+
 	// ToolCalls counts the tool calls the session made across every
 	// stream: the initial turn, injected turns, continuations and
 	// in-session retries. Always serialized (no omitempty) so a zero

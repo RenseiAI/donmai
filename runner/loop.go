@@ -380,6 +380,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	continueMode := qw.ContinuePullRequest != nil
+	// continueDraftAtStart records whether the continued pull request
+	// was already a draft when the run checked it out, read with the same
+	// draft lookup the delivery gate uses. known is false when the lookup
+	// errored, which keeps the gate's behaviour: only a proven
+	// pre-existing draft flips the draft outcome.
+	continueDraftAtStart := &continueDraftState{}
 	// The platform keeps sending the ref pin (older runners rely on it)
 	// alongside the continued record, so a ref that names the continued
 	// head branch is accepted; only a ref naming a DIFFERENT branch is a
@@ -538,6 +544,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return res, err
 		}
 		r.logger.Info("checked out continued pull request head", "branch", branch, "sessionId", qw.SessionID)
+		// Record whether the continued pull request was already a draft
+		// before the turn starts, with the same draft read the delivery
+		// gate uses. A lookup error records unknown, which keeps the
+		// gate's behaviour: only a proven pre-existing draft counts.
+		draft, known := readContinueDraftAtStart(ctx, r.pullRequestDraftLookup, qw, repositoryDeclaration, wpath)
+		continueDraftAtStart.draft, continueDraftAtStart.known = draft, known
 	}
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
@@ -1822,6 +1834,18 @@ tailRecovery:
 					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, continuePullRequestBranch(qw.ContinuePullRequest), startHead, localHead)
 				}
 				draftBlocks := draftErr == nil && draft && !qw.Delivery.AllowsDraft()
+				passed := res.WorkResult == "passed"
+				// completeContinueNoOp ends the run completed with the
+				// no-op continuation outcome, keeping the old failure
+				// message as a post-session warning so it stays
+				// visible wherever warnings surface.
+				completeContinueNoOp := func(message string) {
+					res.Status = "completed"
+					res.FailureMode = ""
+					res.Error = ""
+					res.ContinuationOutcome = ContinuationOutcomeNoOp
+					res.PostSessionWarnings = append(res.PostSessionWarnings, message)
+				}
 				switch {
 				case inspectErr != nil:
 					res.Status = "failed"
@@ -1831,19 +1855,50 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d commits scratch paths since dispatch: %s", qw.ContinuePullRequest.Number, strings.Join(inspection.scratchPaths, ", "))
+				case draftBlocks && passed && continueDraftAtStart.known && continueDraftAtStart.draft && inspection.deliversUnder(qw.Delivery):
+					// A passed turn that left its own delivered code
+					// on a pull request which was already a draft
+					// before the run started: completed, fixed in
+					// place. The head must have moved for the range
+					// to deliver; an unknown start draft keeps the
+					// failure.
+					res.Status = "completed"
+					res.FailureMode = ""
+					res.Error = ""
+					res.ContinuationOutcome = ContinuationOutcomeFixedInPlace
+					res.PostSessionWarnings = append(res.PostSessionWarnings,
+						fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number))
 				case draftBlocks:
+					if passed && continueDraftAtStart.known && continueDraftAtStart.draft {
+						// A passed turn on a pre-existing draft whose
+						// range delivers no code: completed, no-op.
+						completeContinueNoOp(fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number))
+						break
+					}
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
 				case localHead == "" || startHead == "" || strings.EqualFold(localHead, startHead):
+					if passed {
+						completeContinueNoOp(fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number))
+						break
+					}
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
 				case remoteHead == "" || !strings.EqualFold(remoteHead, localHead):
+					if passed {
+						completeContinueNoOp(fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number))
+						break
+					}
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
 				case !inspection.deliversUnder(qw.Delivery):
+					if passed {
+						completeContinueNoOp(fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number))
+						break
+					}
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
