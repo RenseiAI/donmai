@@ -881,10 +881,8 @@ func TestRun_ContinueModeMergeOnlyHeadHasNoCodeChange(t *testing.T) {
 				if res.Error != want {
 					t.Fatalf("Error = %q, want %q", res.Error, want)
 				}
-			} else {
-				if res.FailureMode != "" || res.Error != "" {
-					t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
-				}
+			} else if res.FailureMode != "" || res.Error != "" {
+				t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
 			}
 			remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
 			if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
@@ -1122,9 +1120,9 @@ func TestRun_ContinueModeProtectedRejectionIsNotDiverged(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			res, _ := runScriptedSession(t, scriptedSession{
 				workType:        "development",
-				skipSteering:   true,
-				repository:     "https://github.com/example/repo",
-				continueNumber: 12,
+				skipSteering:    true,
+				repository:      "https://github.com/example/repo",
+				continueNumber:  12,
 				backstop:        true,
 				protectContinue: true,
 				turns: []verdictScriptTurn{{

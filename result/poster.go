@@ -689,7 +689,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
-		ContinuationOutcome: r.ContinuationOutcome,
+		ContinuationOutcome:      r.ContinuationOutcome,
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
