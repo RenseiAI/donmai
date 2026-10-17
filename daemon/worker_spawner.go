@@ -169,6 +169,14 @@ type SpawnerOptions struct {
 	// daemon-parented child that dies with the next upgrade.
 	ShimSpawn func(spec SessionSpec, project ProjectConfig, env []string) (*SessionHandle, error)
 
+	// SessionTmpRecordDir holds the executor-side record of created
+	// per-session scratch directories (see session_tmpdir.go). When set,
+	// creations are persisted there and SweepSessionTmpDirs reclaims
+	// recorded directories of sessions that are no longer running. Empty
+	// disables persistence: claims are tracked in memory only, and the
+	// startup sweep is a no-op.
+	SessionTmpRecordDir string
+
 	// WorktreeParentDir is the directory under which the spawned worker
 	// creates each per-session worktree (<WorktreeParentDir>/<sessionID>).
 	// It MUST match the parent the worker resolves (the worker uses
@@ -275,6 +283,7 @@ type WorkerSpawner struct {
 	seatQoSMu              sync.RWMutex
 	seatQoS                string
 	sessions               map[string]*spawnedSession
+	sessionTmpDirs         map[string]sessionTmpClaim
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
 	accepting              bool
@@ -327,6 +336,7 @@ type spawnedSession struct {
 	cancel                context.CancelFunc
 	released              chan struct{}
 	spec                  SessionSpec
+	sessionTmp            sessionTmpClaim       // zero when the session carries no scratch directory
 	stopRequested         bool                  // guarded by WorkerSpawner.mu
 	forceKillRequested    bool                  // guarded by WorkerSpawner.mu
 	groupTerminationOwner groupTerminationOwner // guarded by WorkerSpawner.mu
@@ -1016,7 +1026,7 @@ func (s *WorkerSpawner) externalSessionOccupancyLocked() int {
 // spawner keeps NO process bookkeeping for it — no exec.Cmd, no pipes, no
 // reaper entry — because every one of those would be a second owner of a session
 // whose whole point is having exactly one (§D1).
-func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfig) (*SessionHandle, bool, error) {
+func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfig, sessionTmp sessionTmpClaim) (*SessionHandle, bool, error) {
 	if s.opts.ShimSpawn == nil {
 		return nil, false, nil
 	}
@@ -1036,6 +1046,12 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 		if next != nil {
 			env = next
 		}
+	}
+	// The executor's scratch binding wins over the hook, exactly as on the
+	// direct path: isolation of the session's temp files is not the hook's
+	// to relax.
+	if sessionTmp.owned() {
+		env = applySessionTmpBindings(env, sessionTmp.Dir)
 	}
 	handle, err := s.opts.ShimSpawn(spec, *project, env)
 	if err != nil {
@@ -1266,6 +1282,24 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		return nil, err
 	}
 
+	// The executor-owned per-session scratch directory is validated and
+	// created before any worker process starts, on both spawn paths. A
+	// failure fails the launch closed: the session never runs against the
+	// shared host temp.
+	sessionTmp, err := s.prepareSessionTmpDir(spec)
+	if err != nil {
+		return nil, err
+	}
+	// Until ownership transfers to the reaper (direct path) or to the
+	// session-end listener (shim path), an aborted spawn removes what was
+	// just created.
+	sessionTmpCommitted := false
+	defer func() {
+		if !sessionTmpCommitted {
+			s.cleanupSessionTmpClaim(spec.SessionID, sessionTmp)
+		}
+	}()
+
 	// §D1: shim ownership is decided before any daemon-owned process exists. Once
 	// the direct path has created a pipe or an exec.Cmd, the daemon is already
 	// the owner this design exists to stop it from being.
@@ -1281,7 +1315,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		shimSelected = s.opts.ShimSpawn != nil
 	}
 	if shimSelected {
-		handle, handled, err := s.spawnThroughShim(spec, project)
+		handle, handled, err := s.spawnThroughShim(spec, project, sessionTmp)
 		if s.opts.ShimOwns != nil && !handled && err == nil {
 			err = errors.New("session shim selector chose ownership but launcher returned no handle")
 			if s.opts.OnSpawnAborted != nil && s.opts.OnPreSpawn != nil {
@@ -1292,6 +1326,10 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			return nil, err
 		}
 		if handled {
+			// The spawner keeps no process bookkeeping for shim-owned
+			// sessions; terminal cleanup of the scratch directory rides
+			// the session-end listener via CleanupSessionTmpDir.
+			sessionTmpCommitted = true
 			return handle, nil
 		}
 		// Legacy combined-decision callback declined ownership. Continue to
@@ -1380,6 +1418,11 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			cmd.Env = next
 		}
 	}
+	// The executor's scratch binding wins over the hook: isolation of the
+	// session's temp files is not the hook's to relax.
+	if sessionTmp.owned() {
+		cmd.Env = applySessionTmpBindings(cmd.Env, sessionTmp.Dir)
+	}
 
 	if err := s.startCommand(cmd); err != nil {
 		closeWorkerPipes()
@@ -1429,11 +1472,12 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}
 
 	ss := &spawnedSession{
-		handle:   handle,
-		cmd:      cmd,
-		cancel:   cancel,
-		released: make(chan struct{}),
-		spec:     spec,
+		handle:     handle,
+		cmd:        cmd,
+		cancel:     cancel,
+		released:   make(chan struct{}),
+		spec:       spec,
+		sessionTmp: sessionTmp,
 	}
 
 	s.mu.Lock()
@@ -1445,6 +1489,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	s.rememberSessionLocked(spec.SessionID)
 	reservationTransferred = true
 	s.mu.Unlock()
+	// The reaper owns terminal cleanup of the scratch directory from here.
+	sessionTmpCommitted = true
 
 	// Stream stdout / stderr with worker-tagged prefix. The daemon owns the read
 	// ends, so cmd.Wait can observe direct-child exit without closing a pump and
@@ -1640,6 +1686,12 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			return
 		}
 		ss.cancel()
+		// Terminal scratch cleanup precedes Ended delivery on every path
+		// the reaper owns — success, failure, stop/cancel — so the
+		// session-end signal implies the directory is gone. The cleanup
+		// proves the marker still names this generation before removing
+		// anything.
+		s.cleanupSessionTmpClaim(spec.SessionID, ss.sessionTmp)
 		s.emitAndReleaseSession(spec.SessionID, ss, event)
 	}()
 
