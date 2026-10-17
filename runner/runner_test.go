@@ -43,8 +43,9 @@ type spawnGatedStubProvider struct {
 }
 
 func (p *spawnGatedStubProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	handle, err := p.HarnessProvider.Spawn(ctx, spec)
 	p.once.Do(func() { close(p.spawned) })
-	return p.HarnessProvider.Spawn(ctx, spec)
+	return handle, err
 }
 
 // newRunnerHarness wires a Runner against the stub provider and a
