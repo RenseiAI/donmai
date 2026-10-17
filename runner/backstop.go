@@ -49,6 +49,10 @@ var excludeDirAnyDepth = []string{
 	".golangci-lint-cache",
 	// General
 	".cache",
+	// Secret-bearing directories: never pushed in a WIP commit.
+	".aws",
+	".ssh",
+	".gnupg",
 }
 
 // excludeDirTopLevel lists directory names that disqualify a path
@@ -65,12 +69,96 @@ var excludeDirAnyDepth = []string{
 var excludeDirTopLevel = harnessstate.Dirs()
 
 // excludeExtensions is the set of file extensions (with leading dot)
-// that disqualify a path. Mirrors EXCLUDE_EXTENSIONS.
-var excludeExtensions = []string{".pyc", ".tmp", ".log"}
+// that disqualify a path. Mirrors EXCLUDE_EXTENSIONS, plus the secret
+// key and certificate extensions a WIP commit must never push.
+var excludeExtensions = []string{".pyc", ".tmp", ".log", ".pem", ".key", ".p12", ".pfx"}
 
 // excludeBasenamePrefixes is the set of basename prefixes that
 // disqualify a path. Mirrors EXCLUDE_BASENAME_PREFIXES.
 var excludeBasenamePrefixes = []string{"__debug_bin"}
+
+// excludeBasenamesSecret lists exact basenames that are never committed to
+// a WIP checkpoint: shell and registry credential files. Kept separate from
+// the legacy TS port tables above so the secret rule stays visible.
+var excludeBasenamesSecret = []string{
+	".envrc",
+	".npmrc",
+	".pypirc",
+	".netrc",
+	".git-credentials",
+}
+
+// excludeBasenameSecretPrefixes lists basename prefixes that are never
+// committed to a WIP checkpoint: private keys and credential bundles. Docs
+// that merely mention credentials ("docs/credentials.md") must NOT match:
+// the table matches the basename up to a separator, never a substring.
+var excludeBasenameSecretPrefixes = []string{
+	"id_rsa",
+	"id_ed25519",
+	"credentials.",
+	"credentials-",
+	"credentials_",
+	"service-account",
+	"service_account",
+}
+
+// shouldExcludeSecretPath reports whether a worktree-relative path must be
+// kept out of a failed-session WIP commit even when the backstop tables
+// allow it. It covers dotenv files (except the checked-in example/sample/
+// template variants), shell and registry credential files, private keys and
+// credential bundles, and harness-state directories at any depth: a WIP
+// commit captures exactly the files the session chose not to commit, pushes
+// them to a world-fetchable reserved ref, and skips pre-push scanners, so
+// the rule is deny-by-default for anything secret-bearing.
+func shouldExcludeSecretPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	parts := strings.Split(path, "/")
+	basename := parts[len(parts)-1]
+
+	// Harness-state directories at any depth, but only when they are a
+	// directory: every entry in the state table names a checkout-resident
+	// state dir, and a lone file that shares the name is ordinary project
+	// content. The provision-time git exclude is best-effort (its write
+	// error is discarded), so the WIP commit cannot rely on it; the
+	// transcript a nested state dir holds carries the full spawn
+	// environment, so it is as secret-bearing as a top-level one.
+	if len(parts) > 1 {
+		for _, part := range parts[:len(parts)-1] {
+			for _, ex := range excludeDirTopLevel {
+				if part == ex {
+					return true
+				}
+			}
+		}
+	}
+
+	// Dotenv files, except the checked-in example/sample/template
+	// variants that are meant to be shared.
+	if basename == ".env" || strings.HasPrefix(basename, ".env.") {
+		switch basename {
+		case ".env.example", ".env.sample", ".env.template":
+		default:
+			return true
+		}
+	}
+
+	// Exact credential basenames.
+	for _, ex := range excludeBasenamesSecret {
+		if basename == ex {
+			return true
+		}
+	}
+
+	// Private keys and credential bundles, by prefix.
+	for _, prefix := range excludeBasenameSecretPrefixes {
+		if strings.HasPrefix(basename, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // excludePathPrefixes is the set of exact path-prefixes (relative to
 // the worktree root, with trailing slash stripped) that disqualify a
@@ -93,7 +181,11 @@ const backstopUnstageBatch = 100
 
 // shouldExcludeFromBackstop reports whether a staged path should be
 // unstaged before the backstop commits. Verbatim port of
-// session-backstop.ts::shouldExcludeFromBackstop. Exported via
+// session-backstop.ts::shouldExcludeFromBackstop, plus the secret-bearing
+// deny list a WIP checkpoint shares: a failed-session WIP commit captures
+// exactly the files the session chose not to commit and pushes them to a
+// world-fetchable reserved ref while skipping pre-push scanners, so it must
+// exclude everything secret-bearing. Exported via
 // the lower-case identifier so tests in the same package can
 // exercise the decision table.
 //
@@ -153,7 +245,10 @@ func shouldExcludeFromBackstop(path string) bool {
 			return true
 		}
 	}
-	return false
+
+	// Secret-bearing files are never committed, by the WIP checkpoint or
+	// the backstop that shares this table.
+	return shouldExcludeSecretPath(path)
 }
 
 // ============================================================================
