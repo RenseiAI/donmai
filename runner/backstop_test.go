@@ -1313,14 +1313,18 @@ func stubGhOnPathExpectingPullRequestView(t *testing.T, expectedURL string, exit
 	if err := os.WriteFile(outFile, []byte(output), 0o600); err != nil {
 		t.Fatalf("write gh stub output: %v", err)
 	}
+	repository, _, err := parseCanonicalGitHubPullRequestURL(expectedURL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	script := fmt.Sprintf(`#!/bin/sh
-if [ "$#" -ne 5 ] || [ "$1" != "pr" ] || [ "$2" != "view" ] || [ "$3" != %[1]q ] || [ "$4" != "--json" ] || [ "$5" != "number,url,baseRefName,headRefName,isDraft" ]; then
+if [ "$#" -ne 7 ] || [ "$1" != "pr" ] || [ "$2" != "view" ] || [ "$3" != %[1]q ] || [ "$4" != "--json" ] || [ "$5" != "number,url,baseRefName,headRefName,isDraft" ] || [ "$6" != "--repo" ] || [ "$7" != %[4]q ]; then
   echo "unexpected gh argv: $*" 1>&2
   exit 1
 fi
 cat %[2]q 1>&2
 exit %[3]d
-`, expectedURL, outFile, exitCode)
+`, expectedURL, outFile, exitCode, repository)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
 	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
