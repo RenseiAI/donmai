@@ -56,32 +56,45 @@ func selectWork(srvURL string) QueuedWork {
 	return qw
 }
 
-func TestSelectProviderByPosterior_FlagOff_NoPost(t *testing.T) {
+func TestSelectProviderByPosterior_DefaultOn_Posts(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
 		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"selectedProvider":"codex","source":"mab-routing"}`))
 	}))
 	defer srv.Close()
 	r := selectRunner(t, srv.Client(), "claude", "codex")
 
-	// Flag unset == OFF.
-	t.Run("unset", func(t *testing.T) {
-		name, ok := r.selectProviderByPosterior(context.Background(), selectWork(srv.URL))
-		if ok || name != "" {
-			t.Fatalf("flag-off must not override: got (%q,%v)", name, ok)
-		}
-	})
-	t.Run("explicitly false", func(t *testing.T) {
-		t.Setenv("ROUTING_SELECTOR_ENABLED", "false")
-		name, ok := r.selectProviderByPosterior(context.Background(), selectWork(srv.URL))
-		if ok || name != "" {
-			t.Fatalf("flag-off must not override: got (%q,%v)", name, ok)
-		}
-	})
+	// Flag unset == ON: the platform's routing mode is the single switch.
+	name, ok := r.selectProviderByPosterior(context.Background(), selectWork(srv.URL))
+	if !ok || name != "codex" {
+		t.Fatalf("default-on must override: got (%q,%v)", name, ok)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("default-on must POST once, got %d POSTs", hits.Load())
+	}
+}
 
-	if hits.Load() != 0 {
-		t.Fatalf("flag-off must POST nothing, got %d POSTs", hits.Load())
+func TestSelectProviderByPosterior_ExplicitOptOut_NoPost(t *testing.T) {
+	for _, v := range []string{"false", "0", "no", "off", "FALSE", " Off "} {
+		t.Run("opt-out "+v, func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				w.WriteHeader(200)
+			}))
+			defer srv.Close()
+			t.Setenv("ROUTING_SELECTOR_ENABLED", v)
+			r := selectRunner(t, srv.Client(), "claude", "codex")
+			name, ok := r.selectProviderByPosterior(context.Background(), selectWork(srv.URL))
+			if ok || name != "" {
+				t.Fatalf("opt-out must not override: got (%q,%v)", name, ok)
+			}
+			if hits.Load() != 0 {
+				t.Fatalf("opt-out must POST nothing, got %d POSTs", hits.Load())
+			}
+		})
 	}
 }
 
