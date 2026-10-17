@@ -344,13 +344,18 @@ const dataURL = "data:text/javascript;base64," + Buffer.from(stripped, "utf8").t
 
 const handlers = {};
 const providers = [];
+const notifications = [];
 const stubPi = {
   registerProvider(name, config) {
     providers.push({ name, config });
   },
   registerTool() {},
   on(event, handler) {
-    handlers[event] = handler;
+    // One event may carry several handlers (the missing-window refusal
+    // gate plus the lane's own tool_call handler below): keep them all so
+    // the fixture observes the same composition the real runtime runs.
+    if (!handlers[event]) handlers[event] = [];
+    handlers[event].push(handler);
   },
 };
 
@@ -369,9 +374,19 @@ for (const name of (process.env.HARNESS_REPORT_ENV ?? "").split(",")) {
   if (name) environment[name] = process.env[name] ?? null;
 }
 
-const handler = handlers["tool_call"];
-if (!handler) {
-  console.log(JSON.stringify({ registered: false, verdict: null, providers, environment }));
+const toolCallHandlers = handlers["tool_call"] ?? [];
+// Surface every session_start notification the extension registered (the
+// missing-window refusal gate notifies there): the harness reports
+// notifications so the Go test can assert the refusal is surfaced, not
+// silent. The stub ctx carries a notify capture plus hasUI so the refusal
+// path runs exactly as it would in the real runtime.
+for (const sessionStart of handlers["session_start"] ?? []) {
+  try {
+    await sessionStart({}, { hasUI: true, ui: { notify: (message, level) => notifications.push({ message, level }) } });
+  } catch {}
+}
+if (toolCallHandlers.length === 0) {
+  console.log(JSON.stringify({ registered: false, verdict: null, providers, environment, notifications }));
   process.exit(0);
 }
 
@@ -393,5 +408,12 @@ if (ctxJSON) {
   }
 }
 
-const verdict = await handler({ toolName, input }, ctx);
-console.log(JSON.stringify({ registered: true, verdict: verdict ?? null, providers, environment }));
+// Run every registered tool_call handler in registration order, first
+// block verdict wins — the same composition the real runtime runs when two
+// gates cover one tool.
+let verdict = null;
+for (const handler of toolCallHandlers) {
+  const got = await handler({ toolName, input }, ctx);
+  if (got != null && verdict == null) verdict = got;
+}
+console.log(JSON.stringify({ registered: true, verdict, providers, environment, notifications }));

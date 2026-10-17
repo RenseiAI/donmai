@@ -12,6 +12,19 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
+// flipLastHexDigit returns sha with its final hex digit replaced by a
+// different one, so the result is always a wrong SHA even when sha itself
+// ends in "f" (naively appending "f" would be a no-op there and the
+// "wrong" claim would verify).
+func flipLastHexDigit(sha string) string {
+	last := sha[len(sha)-1]
+	replacement := byte('f')
+	if last == 'f' {
+		replacement = 'e'
+	}
+	return sha[:len(sha)-1] + string(replacement)
+}
+
 // TestHandshakeSHA_Verification is the cryptographic core of smoke 1
 // (tampered-extension fixture): only the exact embedded-extension SHA
 // verifies; a wrong or empty SHA fails closed.
@@ -24,7 +37,7 @@ func TestHandshakeSHA_Verification(t *testing.T) {
 	if !verifyHandshakeSHA(realSHA) {
 		t.Errorf("verifyHandshakeSHA(realSHA) = false, want true")
 	}
-	for _, bad := range []string{"", "deadbeef", strings.Repeat("0", 64), realSHA[:63] + "f"} {
+	for _, bad := range []string{"", "deadbeef", strings.Repeat("0", 64), flipLastHexDigit(realSHA)} {
 		if verifyHandshakeSHA(bad) {
 			t.Errorf("verifyHandshakeSHA(%q) = true, want false (must fail closed)", bad)
 		}
@@ -162,8 +175,8 @@ func TestProviderPinEnv_UnprefixedModelUnchanged(t *testing.T) {
 // TestProviderPinEnvContextWindow pins the context-window half of the pin:
 // a positive ProviderConfig["contextWindow"] (whatever numeric type the JSON
 // decode produced) rides piContextWindowEnvVar to the child extension, and a
-// missing/zero/invalid value leaves the var UNSET so the extension keeps its
-// built-in default — the pin never invents a value the dispatch did not carry.
+// missing/zero/invalid value leaves the var UNSET so the extension registers
+// no window — the pin never invents a value the dispatch did not carry.
 func TestProviderPinEnvContextWindow(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -326,6 +339,7 @@ func TestExtensionRegistersSessionKeyFromCredentialFile(t *testing.T) {
 	out := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 		credentialFileEnvVar + "=" + credPath,
 	}, "read", `{"path":"README.md"}`)
 	model := registeredDonmaiModel(t, out)
@@ -341,6 +355,7 @@ func TestExtensionRegistersSessionKeyFromCredentialFile(t *testing.T) {
 	out2 := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 	}, "read", `{"path":"README.md"}`)
 	providers2, _ := out2["providers"].([]any)
 	config2, _ := providers2[0].(map[string]any)["config"].(map[string]any)
@@ -390,6 +405,7 @@ func TestExtensionRestoresSessionEnvironmentFromCredentialFile(t *testing.T) {
 	out := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 		credentialFileEnvVar + "=" + credPath,
 		"SENTINEL_EXEC_DEFINED=exec-value",
 		"HARNESS_REPORT_ENV=SENTINEL_TOOL_TOKEN,SENTINEL_EXEC_DEFINED," + piBaseURLEnvVar + ",PI_FUTURE_CONFIG,SENTINEL_BAD,SENTINEL_MODEL_KEY_RESTORE," + PiKeyEnvVar,
@@ -425,10 +441,14 @@ func TestExtensionRestoresSessionEnvironmentFromCredentialFile(t *testing.T) {
 	}
 }
 
-// injectedCell is an endpoint binding the injected provider serves (a
-// loopback gateway speaking protocol), with the output limit, when positive,
-// on the spec's provider config.
-func injectedCell(protocol agent.WireProtocol, maxOut any) agent.Spec {
+// gatewayCell builds an endpoint binding the injected provider serves over
+// a loopback gateway speaking protocol, with the output limit (when
+// non-nil) and the context window (when non-nil) on the spec's provider
+// config. A nil window models a dispatch that carried no window: provider
+// config entries are only ever ADDED by the test (the reconciliation never
+// injects a default), so omitting the key is exactly the missing-value
+// shape.
+func gatewayCell(protocol agent.WireProtocol, maxOut, contextWindow any) agent.Spec {
 	spec := agent.Spec{
 		Prompt: "hi",
 		Model:  "claude-x",
@@ -441,10 +461,225 @@ func injectedCell(protocol agent.WireProtocol, maxOut any) agent.Spec {
 			Env:      map[string]string{"ANTHROPIC_API_KEY": "k-test"},
 		},
 	}
+	pc := map[string]any{}
 	if maxOut != nil {
-		spec.ProviderConfig = map[string]any{"maxOutputTokens": maxOut}
+		pc["maxOutputTokens"] = maxOut
+	}
+	if contextWindow != nil {
+		pc["contextWindow"] = contextWindow
+	}
+	if len(pc) > 0 {
+		spec.ProviderConfig = pc
 	}
 	return spec
+}
+
+// injectedCell is an endpoint binding the injected provider serves (a
+// loopback gateway speaking protocol), with the output limit, when positive,
+// on the spec's provider config.
+func injectedCell(protocol agent.WireProtocol, maxOut any) agent.Spec {
+	return gatewayCell(protocol, maxOut, 1_000_000)
+}
+
+// TestRequireContextWindow pins which gateway cells are refused for want of
+// a configured context window: exactly those the injected provider serves
+// over a gateway binding with no positive, whole ProviderConfig
+// ["contextWindow"]. A configured window, a non-gateway injected route
+// (pi's catalog carries no window there either, but the serving endpoint's
+// own limit applies without a translating gateway in the middle), or a
+// model pi serves natively (its own catalog carries the window) is never
+// refused, and nothing supplies a default.
+func TestRequireContextWindow(t *testing.T) {
+	t.Parallel()
+	nonGateway := gatewayCell(agent.ProtoOpenAIChat, nil, nil)
+	nonGateway.Endpoint.Host = agent.HostDirect
+	nonGateway.Endpoint.BaseURL = "https://api.openai.com/v1"
+	native := gatewayCell(agent.ProtoAnthropicMessages, nil, nil)
+	native.Endpoint = nil
+	native.Model = "anthropic/claude-x"
+	cases := []struct {
+		name string
+		spec agent.Spec
+		want bool // true => refused with *ContextWindowRequiredError
+	}{
+		{name: "gateway without a window is refused", spec: gatewayCell(agent.ProtoOpenAIChat, nil, nil), want: true},
+		{name: "gateway with a zero window is refused", spec: gatewayCell(agent.ProtoOpenAIChat, nil, 0), want: true},
+		{name: "gateway with a negative window is refused", spec: gatewayCell(agent.ProtoOpenAIChat, nil, -1), want: true},
+		{name: "gateway with a fractional window is refused", spec: gatewayCell(agent.ProtoOpenAIChat, nil, 1.5), want: true},
+		{name: "gateway with a non-numeric window is refused", spec: gatewayCell(agent.ProtoOpenAIChat, nil, "1000000"), want: true},
+		{name: "gateway with a configured window is admitted", spec: gatewayCell(agent.ProtoOpenAIChat, nil, 1_000_000)},
+		{name: "gateway with a float64 window from JSON decode is admitted", spec: gatewayCell(agent.ProtoOpenAIChat, nil, float64(1_000_000))},
+		{name: "gateway with output limit but no window is refused", spec: gatewayCell(agent.ProtoAnthropicMessages, float64(64000), nil), want: true},
+		{name: "gateway with both limits is admitted", spec: gatewayCell(agent.ProtoAnthropicMessages, float64(64000), 1_000_000)},
+		{name: "non-gateway injected route without a window is admitted", spec: nonGateway},
+		{name: "a model pi serves natively is admitted", spec: native},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := requireContextWindow(tc.spec)
+			if !tc.want {
+				if err != nil {
+					t.Fatalf("requireContextWindow = %v, want admitted", err)
+				}
+				return
+			}
+			var refused *ContextWindowRequiredError
+			if !errors.As(err, &refused) {
+				t.Fatalf("requireContextWindow = %v, want *ContextWindowRequiredError", err)
+			}
+			if !strings.Contains(err.Error(), "contextWindow") {
+				t.Errorf("refusal %q does not name contextWindow", err)
+			}
+		})
+	}
+}
+
+// TestSpawn_RefusesMissingContextWindowBeforeAnyChild drives the refusal
+// through Provider.Spawn in both spawn modes: the session fails with a typed
+// configuration error wrapped as a spawn failure, and not one command reaches
+// the child. The control spawns the same gateway cell with a configured
+// window. RED proof: restore the extension's 200000 fallback (or drop the
+// requireContextWindow call in prepare) and the refusal cases below go red —
+// the spawn succeeds on the guessed window instead of failing closed.
+func TestSpawn_RefusesMissingContextWindowBeforeAnyChild(t *testing.T) {
+	t.Parallel()
+	for _, interactive := range []bool{false, true} {
+		name := "headless"
+		if interactive {
+			name = "interactive"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			spec := gatewayCell(agent.ProtoOpenAIChat, nil, nil)
+			if interactive {
+				spec.Interactive = &agent.InteractiveSpec{}
+			}
+			cmds, _, err := spawnScripted(t, spec, "", "")
+			var refused *ContextWindowRequiredError
+			if !errors.Is(err, agent.ErrSpawnFailed) || !errors.As(err, &refused) {
+				t.Fatalf("Spawn = %v, want agent.ErrSpawnFailed wrapping *ContextWindowRequiredError", err)
+			}
+			if got := cmds.commands(); len(got) != 0 {
+				t.Errorf("commands reached the child before the refusal: %v", got)
+			}
+		})
+	}
+	t.Run("configured window spawns", func(t *testing.T) {
+		t.Parallel()
+		_, h, err := spawnScripted(t, gatewayCell(agent.ProtoOpenAIChat, nil, 1_000_000),
+			handshakeEvent("h1"), getStateResponse("ses_window")+event(map[string]any{"type": "agent_settled"}))
+		if err != nil {
+			t.Fatalf("Spawn with a configured window: %v", err)
+		}
+		drain(t, h)
+	})
+}
+
+// TestExtensionRefusesMissingContextWindow activates the REAL embedded
+// extension without the context-window pin: no provider is registered (there
+// is deliberately no default), and the refusal is surfaced as a session-start
+// notification naming the missing window — never a silent run on a guessed
+// 200000. The control registers the configured window. RED proof: restore the
+// `contextWindowEnv : 200000` fallback in the extension and the refusal case
+// below goes red — a provider registers with the guessed window.
+func TestExtensionRefusesMissingContextWindow(t *testing.T) {
+	t.Parallel()
+	// The test process itself may run with DONMAI_PI_* vars set (a session
+	// worker's own environment carries the live session's pin). Every var
+	// the extension reads for registration is set explicitly here — empty
+	// when the case means "absent" — so an inherited value can never leak
+	// in through cmd.Env layering (runExtensionFixture appends to
+	// os.Environ), exactly as TestExtensionRegistersOutputLimitOnlyWhenConfigured
+	// does for the output-limit pin.
+	base := []string{
+		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+		piModelEnvVar + "=served-model",
+		piAPIEnvVar + "=openai-completions",
+		piThinkingLevelEnvVar + "=",
+		piOutputLimitEnvVar + "=",
+		piPricesBoundEnvVar + "=",
+		piPriceInputEnvVar + "=",
+		piPriceOutputEnvVar + "=",
+		piPriceCacheReadEnvVar + "=",
+		piPriceCacheWriteEnvVar + "=",
+		// The handshake token selects the RPC lane (verified boundary);
+		// clearing it runs the fixture in the interactive lane, where the
+		// missing-window refusal surfaces as a session-start notification.
+		// Without this a worker that itself runs under a token would leak
+		// it in through os.Environ layering and flip the lane.
+		piHandshakeEnvVar + "=",
+		credentialFileEnvVar + "=",
+		piAllowedToolsEnvVar + "=",
+		piDisallowedToolsEnvVar + "=",
+		piStateDirEnvVar + "=",
+	}
+	t.Run("missing window registers no provider, blocks tools, and notifies", func(t *testing.T) {
+		t.Parallel()
+		// Always set, even when empty, so an inherited value in the
+		// test process's own environment can never leak in.
+		out := runExtensionFixture(t, append(append([]string(nil), base...), piContextWindowEnvVar+"="), "read", `{"path":"README.md"}`)
+		if providers, _ := out["providers"].([]any); len(providers) != 0 {
+			t.Errorf("registered providers = %v, want none without a context window", out["providers"])
+		}
+		// No silent routing downgrade: the tool_call the fixture offered
+		// is refused with the missing-window reason, not run against
+		// whatever provider pi would resolve on its own.
+		verdict, _ := out["verdict"].(map[string]any)
+		if block, _ := verdict["block"].(bool); verdict == nil || !block {
+			t.Errorf("missing-window tool_call verdict = %v, want a block", out["verdict"])
+		}
+		if reason, _ := verdict["reason"].(string); !strings.Contains(reason, "context window") {
+			t.Errorf("missing-window refusal %q does not name the context window", reason)
+		}
+		notifications, _ := out["notifications"].([]any)
+		found := false
+		for _, n := range notifications {
+			if msg, _ := n.(map[string]any)["message"].(string); strings.Contains(msg, "context window") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no session-start notification names the missing context window: %v", out)
+		}
+	})
+	t.Run("invalid window registers no provider", func(t *testing.T) {
+		t.Parallel()
+		for _, value := range []string{"", "0", "-5", "1.5", "lots"} {
+			out := runExtensionFixture(t, append(append([]string(nil), base...), piContextWindowEnvVar+"="+value),
+				"read", `{"path":"README.md"}`)
+			if providers, _ := out["providers"].([]any); len(providers) != 0 {
+				t.Errorf("value %q: registered providers = %v, want none", value, out["providers"])
+			}
+		}
+	})
+	t.Run("mixed-case tool spelling is still refused", func(t *testing.T) {
+		t.Parallel()
+		// The refusal gate normalizes the tool name before matching
+		// GUARDED_TOOLS, exactly like the interactive lane's own gate:
+		// a mixed-case spelling must block, never bypass the gate and run
+		// against whatever provider pi resolves on its own.
+		out := runExtensionFixture(t, append(append([]string(nil), base...), piContextWindowEnvVar+"="), "Read", `{"path":"README.md"}`)
+		if providers, _ := out["providers"].([]any); len(providers) != 0 {
+			t.Errorf("registered providers = %v, want none without a context window", out["providers"])
+		}
+		verdict, _ := out["verdict"].(map[string]any)
+		if block, _ := verdict["block"].(bool); verdict == nil || !block {
+			t.Errorf("mixed-case tool_call verdict = %v, want a block", out["verdict"])
+		}
+		if reason, _ := verdict["reason"].(string); !strings.Contains(reason, "context window") {
+			t.Errorf("mixed-case refusal %q does not name the context window", reason)
+		}
+	})
+	t.Run("configured window registers", func(t *testing.T) {
+		t.Parallel()
+		out := runExtensionFixture(t, append(append([]string(nil), base...), piContextWindowEnvVar+"=262144", piOutputLimitEnvVar+"=64000"),
+			"read", `{"path":"README.md"}`)
+		model := registeredDonmaiModel(t, out)
+		if cw, _ := model["contextWindow"].(float64); cw != 262144 {
+			t.Errorf("registered contextWindow = %v, want 262144", model["contextWindow"])
+		}
+	})
 }
 
 // TestRequireOutputLimit pins which cells are refused for want of a
@@ -634,6 +869,7 @@ func TestExtensionRegistersConfiguredThinkingLevel(t *testing.T) {
 				piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 				piAPIEnvVar + "=" + tc.api,
 				piModelEnvVar + "=served-model",
+				piContextWindowEnvVar + "=262144",
 				piOutputLimitEnvVar + "=64000",
 				piThinkingLevelEnvVar + "=" + tc.level,
 			}, "read", `{"path":"README.md"}`)
@@ -834,6 +1070,7 @@ func TestExtensionRegistersRoutingPreferenceOnlyOnChatCompletions(t *testing.T) 
 				piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 				piAPIEnvVar + "=" + tc.api,
 				piModelEnvVar + "=served-model",
+				piContextWindowEnvVar + "=262144",
 				piOutputLimitEnvVar + "=64000",
 				piThinkingLevelEnvVar + "=max",
 				piRoutingOrderEnvVar + "=" + tc.order,
