@@ -111,7 +111,152 @@ func TestRun_ProviderErrorCheckpointFailureDoesNotMaskOriginalFailure(t *testing
 	}
 }
 
-// checkpointCheckout clones a fresh remote into a session checkout and returns
+// TestCheckpointFailedSession_ExcludesSecretsFromWIPCommit pins the deny
+// list: deny-listed files plus a nested state dir (with no info/exclude)
+// next to real work must not appear in the pushed WIP tree, while the real
+// work does. Reverting the deny list turns it RED.
+func TestCheckpointFailedSession_ExcludesSecretsFromWIPCommit(t *testing.T) {
+	bare := makeBareRepo(t)
+	wt := filepath.Join(t.TempDir(), "checkout")
+	gitRun(t, filepath.Dir(wt), "clone", "--quiet", bare, wt)
+	res := &Result{}
+	res.Status = "failed"
+	res.FailureMode = FailureBudgetExceeded
+	res.WorktreePath = wt
+	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
+
+	writeFile(t, wt, "feature.txt", "real work\n")
+	secrets := map[string]string{
+		".env":                      "KEY=live\n",
+		".env.local":                "KEY=live\n",
+		"config/.env.staging":       "KEY=live\n",
+		".envrc":                    "export KEY=live\n",
+		".npmrc":                    "//registry/:_authToken=live\n",
+		".pypirc":                   "password=live\n",
+		".netrc":                    "password live\n",
+		".git-credentials":          "https://user:live@example.test\n",
+		"deploy.pem":                "private\n",
+		"tls/server.key":            "private\n",
+		"bundle.p12":                "private\n",
+		"store.pfx":                 "private\n",
+		"id_rsa":                    "private\n",
+		"keys/id_ed25519_ci":        "private\n",
+		"credentials.json":          `{"k":"live"}` + "\n",
+		"service-account-prod.json": `{"k":"live"}` + "\n",
+		".aws/credentials":          "aws_secret_access_key=live\n",
+		".ssh/config":               "IdentityFile live\n",
+		"sub/.gnupg/pubring.kbx":    "keyring\n",
+		"sub/.pi/session.jsonl":     "transcript with spawn env\n",
+		"sub/.agent/state.json":     "{}\n",
+		"sub/.scratch/notes.md":     "scratch\n",
+		"sub/.claude/settings.json": "{}\n",
+		"sub/.codex/history.jsonl":  "{}\n",
+	}
+	for path, body := range secrets {
+		writeFile(t, wt, path, body)
+	}
+	// Allowed lookalikes: the checked-in dotenv variants and ordinary
+	// project content that merely shares a name or prefix with a secret.
+	allowed := map[string]string{
+		".env.example":           "KEY=placeholder\n",
+		".env.sample":            "KEY=placeholder\n",
+		".env.template":          "KEY=placeholder\n",
+		"docs/rotate-secrets.md": "how to rotate credentials\n",
+	}
+	for path, body := range allowed {
+		writeFile(t, wt, path, body)
+	}
+
+	// Fixed stamp so the ref is exact.
+	r := &Runner{logger: noopLogger(), now: func() time.Time { return time.Date(2026, 10, 17, 13, 1, 15, 0, time.UTC) }}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-SECRETS")}
+	r.checkpointFailedSession(qw, res)
+	if len(res.PostSessionWarnings) != 0 {
+		t.Fatalf("warnings=%v; want none", res.PostSessionWarnings)
+	}
+	if res.WIPRef == nil {
+		t.Fatal("no WIP ref pushed")
+	}
+	wantRef := "refs/wip/" + qw.SessionID + "/20261017T130115Z"
+	if res.WIPRef.Ref != wantRef {
+		t.Fatalf("WIPRef.Ref = %q, want %q", res.WIPRef.Ref, wantRef)
+	}
+	tree := gitRun(t, bare, "ls-tree", "-r", "--name-only", wantRef)
+	got := map[string]bool{}
+	for _, line := range strings.Split(tree, "\n") {
+		if strings.TrimSpace(line) != "" {
+			got[line] = true
+		}
+	}
+	if !got["feature.txt"] {
+		t.Fatalf("WIP tree %q misses the real work; tree:\n%s", wantRef, tree)
+	}
+	for path := range secrets {
+		if got[path] {
+			t.Errorf("WIP tree %q contains secret-bearing %q", wantRef, path)
+		}
+	}
+	for path := range allowed {
+		if !got[path] {
+			t.Errorf("WIP tree %q misses allowed %q", wantRef, path)
+		}
+	}
+}
+
+// TestCheckpointFailedSession_NeverForcesTheWIPRef pins the never-force
+// contract: with the ref pre-created on the origin at an unrelated commit,
+// the push is refused, the remote ref is unchanged, and a warning is
+// recorded. Adding --force to the push turns it RED.
+func TestCheckpointFailedSession_NeverForcesTheWIPRef(t *testing.T) {
+	bare := makeBareRepo(t)
+	wt := filepath.Join(t.TempDir(), "checkout")
+	gitRun(t, filepath.Dir(wt), "clone", "--quiet", bare, wt)
+	res := &Result{}
+	res.Status = "failed"
+	res.FailureMode = FailureBudgetExceeded
+	res.WorktreePath = wt
+	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
+
+	// Real work so there is something to push.
+	writeFile(t, wt, "feature.txt", "real work\n")
+
+	// Pre-create the exact per-attempt ref on the origin at an unrelated
+	// commit: a second failure of the same session in the same second.
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-FORCE")}
+	stamp := time.Date(2026, 10, 17, 13, 2, 30, 0, time.UTC)
+	other := t.TempDir()
+	gitInit(t, other)
+	writeFile(t, other, "other.txt", "unrelated\n")
+	gitRun(t, other, "add", "other.txt")
+	gitRun(t, other, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "unrelated")
+	unrelated := gitRun(t, other, "rev-parse", "HEAD")
+	wantRef := "refs/wip/" + qw.SessionID + "/" + wipRefAttemptStamp(stamp)
+	gitRun(t, other, "remote", "add", "origin", bare)
+	gitRun(t, other, "push", "--quiet", "origin", unrelated+":"+wantRef)
+
+	r := &Runner{logger: noopLogger(), now: func() time.Time { return stamp }}
+	r.checkpointFailedSession(qw, res)
+	if res.WIPRef != nil {
+		t.Fatalf("WIPRef = %+v; want nil after a refused push", res.WIPRef)
+	}
+	if len(res.PostSessionWarnings) != 1 {
+		t.Fatalf("warnings=%v; want one checkpoint warning", res.PostSessionWarnings)
+	}
+	if got := gitRun(t, bare, "rev-parse", wantRef); got != unrelated {
+		t.Fatalf("remote %s moved to %s; the push must never force it", wantRef, got)
+	}
+}
+
+// TestWipRefAttemptStamp_SortsLexicographically pins the stamp layout: the
+// newest attempt is the last ref in a lexicographic listing.
+func TestWipRefAttemptStamp_SortsLexicographically(t *testing.T) {
+	earlier := wipRefAttemptStamp(time.Date(2026, 10, 17, 13, 0, 0, 0, time.UTC))
+	later := wipRefAttemptStamp(time.Date(2026, 10, 17, 14, 0, 0, 0, time.UTC))
+	if earlier >= later {
+		t.Fatalf("stamps do not sort: %q vs %q", earlier, later)
+	}
+}
+
 // the remote, the checkout, and a provider-error result whose one rescue
 // target starts at the clone's HEAD.
 func checkpointCheckout(t *testing.T) (string, string, *Result) {

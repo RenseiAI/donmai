@@ -277,6 +277,43 @@ func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 		{".donmai/code-index", true},
 		{".donmai/config.yaml", false},
 
+		// Secret-bearing files and directories: never pushed in a WIP
+		// commit (shared with the failed-session checkpoint).
+		{".env", true},
+		{".env.local", true},
+		{"config/.env.staging", true},
+		{".env.example", false},
+		{".env.sample", false},
+		{".env.template", false},
+		{".envrc", true},
+		{".npmrc", true},
+		{".pypirc", true},
+		{".netrc", true},
+		{".git-credentials", true},
+		{"deploy.pem", true},
+		{"tls/server.key", true},
+		{"bundle.p12", true},
+		{"store.pfx", true},
+		{"id_rsa", true},
+		{"keys/id_ed25519_ci", true},
+		{"credentials.json", true},
+		{"service-account-prod.json", true},
+		{"service_account.json", true},
+		{".aws/credentials", true},
+		{"sub/.ssh/config", true},
+		{"sub/.gnupg/pubring.kbx", true},
+		// Harness-state directories at any depth (transcript holds the
+		// spawn environment); a lone file sharing the name stays allowed.
+		{"sub/.pi/session.jsonl", true},
+		{"sub/.agent/state.json", true},
+		{"sub/.scratch/notes.md", true},
+		{"sub/.claude/settings.json", true},
+		{"sub/.codex/history.jsonl", true},
+		{".pi", false},
+		{"app/.pi", false},
+		{"docs/rotate-secrets.md", false},
+		{"src/main.go", false},
+
 		// Empty / safe.
 		{"", false},
 		{"src/main.go", false},

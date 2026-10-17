@@ -5,9 +5,20 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var safeWIPSessionID = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)
+
+// wipRefAttemptStamp formats the per-attempt suffix of a failed-session WIP
+// ref: a UTC stamp plus the runner's unique suffix for this teardown, so two
+// failures of one session land on distinct refs. A reused bare ref would
+// accept only its first push: the WIP commit is a commit-tree outside local
+// history, so a second push of the same ref is rejected as non-fast-forward.
+// The stamp sorts lexicographically, so the newest attempt is the last ref.
+func wipRefAttemptStamp(t time.Time) string {
+	return t.UTC().Format("20060102T150405Z")
+}
 
 // checkpointFailedSession supplements local rescue with a bounded remote copy.
 func (r *Runner) checkpointFailedSession(qw QueuedWork, res *Result) {
@@ -29,7 +40,14 @@ func (r *Runner) checkpointFailedSession(qw QueuedWork, res *Result) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), providerErrorCheckpointTimeout)
 	defer cancel()
-	checkpoint, err := createWIPCheckpoint(ctx, qw, target, "refs/wip/"+qw.SessionID)
+	// Per-attempt ref: a reused bare session ref accepts only its first
+	// push (the WIP commit sits outside local history), so a re-entered
+	// generation or a racing stale worker would be rejected. The stamp is
+	// part of the recorded ref, so the next session knows which ref to
+	// fetch. Changing the layout afterwards would cause directory/file ref
+	// conflicts, so the per-attempt shape ships before any host pushes it.
+	ref := "refs/wip/" + qw.SessionID + "/" + wipRefAttemptStamp(r.now())
+	checkpoint, err := createWIPCheckpoint(ctx, qw, target, ref)
 	if err != nil {
 		warn(err)
 		return

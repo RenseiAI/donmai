@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 			if scenario == "unsafe" {
 				work.SessionID = "bad..id"
 			}
-			ref := "refs/wip/" + work.SessionID
+			wantRefPrefix := "refs/wip/" + work.SessionID + "/"
 			work.StageBudget = &prompt.StageBudget{MaxTokens: 1}
 			turn := verdictScriptTurn{events: []agent.Event{agent.LlmCallEvent{InputTokens: 2, UsageSource: agent.LlmUsageProvider}}}
 			if scenario == "completed" {
@@ -134,7 +135,7 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 				}
 				return
 			}
-			sha := gitRun(t, bare, "rev-parse", ref)
+			sha := gitRun(t, bare, "rev-parse", res.WIPRef.Ref)
 			if scenario == "committed" && sha != commitSHA {
 				t.Fatal("committed-only checkpoint changed HEAD")
 			}
@@ -142,9 +143,10 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 			if err := json.Unmarshal(body["wipRef"], &posted); err != nil {
 				t.Fatal(err)
 			}
-			if posted.Ref != ref || posted.CommitSHA != sha || res.WIPRef == nil || *res.WIPRef != posted {
+			if !strings.HasPrefix(posted.Ref, wantRefPrefix) || posted.CommitSHA != sha || res.WIPRef == nil || *res.WIPRef != posted {
 				t.Fatalf("checkpoint=%+v remote=%s", posted, sha)
 			}
+			ref := posted.Ref
 			if got := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/heads"); got != heads {
 				t.Fatalf("new branch created: %s", got)
 			}
