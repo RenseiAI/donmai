@@ -15,8 +15,11 @@ muse schema generate-json-schema --out /tmp/muse-schema-gen
 ```
 
 Handshake requires envelope schema version 1 and the granted
-`sessionMcp` capability. The pinned export fingerprint is advisory (a
-mismatch warns); the version is enforced.
+`sessionMcp` capability — exactly when the session carries inline
+MCP servers (hard-deny: without the grant the host would silently
+run with no MCP tools). Sessions with no `mcpServers` soft-pass a
+missing grant with a warning. The pinned export fingerprint is
+advisory (a mismatch warns); the version is enforced.
 
 ## Spawn
 
@@ -72,10 +75,22 @@ Approvals arrive as `approval/requested` notifications plus
 `approval/request` server-requests. The decision is driven once per
 approvalId from the notification and sent as
 `approval/decide{approvalId, requirementId, choiceId}` (decline maps to
-the denial/abort choice); the server-request is answered `{}`. The
+the denial/abort choice — live shell subjects offer `abort`, not
+`denied`); the server-request is answered `{}`. The
 `userInput/request` server-request is answered `{}` (autonomous mode
-has no user to prompt). MCP servers ride inline
-(`config.mcpServers[<name>]`, streamableHttp + stdio).
+has no user to prompt; the prompt is recorded as a
+`user_input_requested` event). MCP servers ride inline
+(`config.mcpServers[<name>]`, streamableHttp + stdio, every server
+`mode: optional` so one unreachable server degrades that server, not
+the turn). Malformed server entries skip with a warning (soft-fail)
+rather than sinking the session's other servers.
+
+Auth: the host exposes no login-status probe (`model/list` answers
+from cache when logged out), so the first turn is the auth probe.
+First-turn failures classify into typed causes alongside the spawn
+failure: logged-out signals (unauthenticated, not logged in, login
+required) vs model-not-entitled signals (does not exist or lack
+access, unauthorized, forbidden).
 
 ## Host login check
 

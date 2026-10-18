@@ -219,7 +219,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	var err error
 	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		return nil, fmt.Errorf("muse spawn: prepare harness: %w", errors.Join(agent.ErrSpawnFailed, err))
 	}
 	p.mu.Lock()
 	if p.shutdown {
@@ -370,15 +370,38 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 // classifyStartError maps a first-turn/session failure to a typed
 // error. model/list answers from cache even when logged out, so auth
 // failures surface here: classify them loudly instead of reporting a
-// generic spawn failure.
+// generic spawn failure. There is no login-status command on the host
+// (login is a browser device-code flow and model/list answers from
+// cache when logged out), so the first turn is the auth probe:
+//
+//   - "does not exist or you lack access" (and kind-bearing
+//     unauthorized/unauthenticated failures) classify as
+//     ErrModelNotEntitled: the account may not use this model id.
+//     A logged-out subscriber login surfaces the same way (the
+//     host cannot tell a lapsed login from a missing grant), hence
+//     the typed split below on unauthenticated/logout signals.
+//   - explicit logged-out / unauthenticated signals classify as
+//     ErrNotAuthenticated.
+//
+// Both wrap ErrSpawnFailed too, so existing spawn-failure handling
+// keeps working while auth-aware callers match the typed cause with
+// errors.Is.
 func (p *Provider) classifyStartError(err error) error {
 	if err == nil {
 		return nil
 	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "does not exist") || strings.Contains(msg, "lack access") ||
-		strings.Contains(msg, "unauthorized") || strings.Contains(msg, "unauthenticated") {
-		return fmt.Errorf("%w: muse host is not authenticated for this model: %v", agent.ErrSpawnFailed, err)
+	switch {
+	case strings.Contains(msg, "unauthenticated") ||
+		strings.Contains(msg, "not logged in") ||
+		strings.Contains(msg, "logged out") ||
+		strings.Contains(msg, "login required") ||
+		strings.Contains(msg, "no login"):
+		return fmt.Errorf("muse host is not authenticated: %w: %w", errors.Join(agent.ErrSpawnFailed, agent.ErrNotAuthenticated), err)
+	case strings.Contains(msg, "does not exist") || strings.Contains(msg, "lack access") ||
+		strings.Contains(msg, "unauthorized") || strings.Contains(msg, "not entitled") ||
+		strings.Contains(msg, "forbidden"):
+		return fmt.Errorf("muse host is not entitled to this model: %w: %w", errors.Join(agent.ErrSpawnFailed, agent.ErrModelNotEntitled), err)
 	}
 	return fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 }
@@ -664,8 +687,20 @@ func handshakeParams() map[string]any {
 }
 
 // checkHandshakeResult validates the initialize result: schema
-// version 1 and the granted sessionMcp capability.
+// version 1 and the granted sessionMcp capability. The grant is
+// hard-required here: sessions that carry inline config.mcpServers
+// must never start silently tool-less. checkHandshakeResultForPlan
+// relaxes the grant for sessions that never asked for MCP.
 func checkHandshakeResult(raw json.RawMessage) (InitializeResult, error) {
+	return checkHandshakeResultForPlan(raw, true)
+}
+
+// checkHandshakeResultForPlan is checkHandshakeResult parameterized
+// by whether the session needs inline MCP: it enforces the
+// sessionMcp grant exactly when needsMCP is true (hard-deny), and
+// accepts a missing grant otherwise (soft path: the session runs
+// without MCP tools because it never asked for any).
+func checkHandshakeResultForPlan(raw json.RawMessage, needsMCP bool) (InitializeResult, error) {
 	var res InitializeResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return res, fmt.Errorf("muse initialize: decode response: %w", err)
@@ -688,6 +723,11 @@ func checkHandshakeResult(raw json.RawMessage) (InitializeResult, error) {
 		}
 	}
 	if !granted {
+		if !needsMCP {
+			slog.Warn("muse: host did not grant the sessionMcp capability; continuing without inline MCP (session carries no mcpServers)",
+				"granted", res.GrantedCapabilities)
+			return res, nil
+		}
 		return res, fmt.Errorf("muse initialize: host did not grant the sessionMcp capability (granted=%v)", res.GrantedCapabilities)
 	}
 	return res, nil

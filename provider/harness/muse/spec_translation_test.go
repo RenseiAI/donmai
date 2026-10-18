@@ -1,6 +1,7 @@
 package muse
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -211,6 +212,79 @@ func TestCheckHandshakeResult_RequiresSchemaV1AndMCP(t *testing.T) {
 	}
 }
 
+func TestClassifyStartError_AuthKinds(t *testing.T) {
+	p, err := New(Options{skipProcess: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cases := []struct {
+		name string
+		msg  string
+		want error
+	}{
+		{
+			name: "model not entitled",
+			msg:  "turn/start: model muse-wonder-full-1.0 does not exist or you lack access",
+			want: agent.ErrModelNotEntitled,
+		},
+		{
+			name: "unauthorized",
+			msg:  "session/start: unauthorized",
+			want: agent.ErrModelNotEntitled,
+		},
+		{
+			name: "logged out",
+			msg:  "turn/start: not logged in, run login first",
+			want: agent.ErrNotAuthenticated,
+		},
+		{
+			name: "unauthenticated",
+			msg:  "session/start: unauthenticated: login required",
+			want: agent.ErrNotAuthenticated,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := p.classifyStartError(errors.New(tc.msg))
+			if !errors.Is(err, agent.ErrSpawnFailed) {
+				t.Errorf("err=%v, want ErrSpawnFailed in the chain", err)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err=%v, want %v in the chain", err, tc.want)
+			}
+		})
+	}
+	// A generic first-turn failure stays a plain spawn failure:
+	// no auth cause is fabricated.
+	plain := p.classifyStartError(errors.New("turn/start: host overloaded"))
+	if !errors.Is(plain, agent.ErrSpawnFailed) {
+		t.Errorf("plain err=%v, want ErrSpawnFailed", plain)
+	}
+	if errors.Is(plain, agent.ErrNotAuthenticated) || errors.Is(plain, agent.ErrModelNotEntitled) {
+		t.Errorf("plain err=%v, want no auth cause", plain)
+	}
+}
+
+func TestCheckHandshakeResult_MCPGrantPolicy(t *testing.T) {
+	fp := schemaExportFingerprint
+	good := func(grants string) string {
+		return `{"experimentalApi":false,"grantedCapabilities":[` + grants + `],"museHome":"/h","platformFamily":"unix","platformOs":"linux","schema":{"fingerprint":"` + fp + `","version":1},"serverInfo":{"name":"m","version":"1.4.6"},"userAgent":"u"}`
+	}
+	// A session carrying inline MCP servers hard-denies a missing
+	// grant: starting silently tool-less is worse than refusing.
+	if _, err := checkHandshakeResultForPlan([]byte(good(``)), true); err == nil {
+		t.Error("MCP session accepted a missing sessionMcp grant, want rejection")
+	}
+	if _, err := checkHandshakeResultForPlan([]byte(good(`"sessionMcp"`)), true); err != nil {
+		t.Errorf("MCP session with the grant rejected: %v", err)
+	}
+	// A session with no mcpServers soft-passes the same host: it
+	// never asked for MCP tools, so there is nothing to lose.
+	if _, err := checkHandshakeResultForPlan([]byte(good(``)), false); err != nil {
+		t.Errorf("non-MCP session rejected over a grant it never needed: %v", err)
+	}
+}
+
 func TestIsSessionGone(t *testing.T) {
 	rpc := &RPCError{Method: "session/resume", Code: -32000, Message: "gone", Data: []byte(`{"kind":"sessionNotFound"}`)}
 	if !IsSessionGone(rpc) {
@@ -238,6 +312,22 @@ func TestApprovalChoiceFor(t *testing.T) {
 	c, ok = approvalChoiceFor(req, false)
 	if !ok || c.ChoiceID != "deny" {
 		t.Errorf("deny choice=%+v,%v", c, ok)
+	}
+}
+
+func TestApprovalChoiceFor_DeclineMapsToAbort(t *testing.T) {
+	// Live hosts offer the abort arm (not denied) on shell subjects:
+	// a bridge decline must still find a denial choice.
+	req := ApprovalRequestParams{AvailableChoices: []ApprovalChoice{
+		{ChoiceID: "proceed", Decision: MSPApprovalApproved},
+		{ChoiceID: "stop", Decision: MSPApprovalAbort},
+	}}
+	c, ok := approvalChoiceFor(req, false)
+	if !ok || c.ChoiceID != "stop" {
+		t.Errorf("decline choice=%+v,%v, want the abort arm", c, ok)
+	}
+	if c.Decision != MSPApprovalAbort {
+		t.Errorf("decline decision=%q, want abort", c.Decision)
 	}
 }
 

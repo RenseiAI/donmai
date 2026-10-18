@@ -32,10 +32,10 @@ import (
 // completion contract. Result sensitivity answers a different question: whether
 // a verdict controls the post-session transition. QA/review work is
 // result-sensitive but does not owe a new PR, so it must never enter this chain.
-func shouldSteer(obs streamObservation, caps agent.Capabilities, workType string) bool {
+func shouldSteer(obs streamObservation, caps agent.Capabilities, workType string, role ...string) bool {
 	// Contract gate: only work that explicitly owes a PR may be steered toward
-	// commit/push/publication. Today that is development and inflight.
-	if !RequiresPRURL(workType) {
+	// commit/push/publication, including custom inflight-role work.
+	if !RequiresPRURL(workType, role...) {
 		return false
 	}
 	// Provider must support some form of post-completion steering.
@@ -88,7 +88,7 @@ func (r *Runner) attemptSteering(
 	// Keep the completion contract at the mutation boundary too. The normal
 	// caller checks shouldSteer first, but a future direct caller must not turn a
 	// verdict-only review into repository publication.
-	if !RequiresPRURL(qw.WorkType) {
+	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		return handle, nil
 	}
 	if obs.terminalSuccess && obs.pullRequestURL != "" {
