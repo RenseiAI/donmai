@@ -1773,9 +1773,14 @@ func TestInteractiveSpawnLaunchesThroughAShimAndAdoptsIt(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	d := f.daemon
 
-	handle, err := d.spawner.AcceptWork(f.interactiveSpec("sess-launch"))
+	spec := f.interactiveSpec("sess-launch")
+	spec.WorkTypeRole = "review"
+	handle, err := d.spawner.AcceptWork(spec)
 	if err != nil {
 		t.Fatalf("AcceptWork: %v", err)
+	}
+	if handle.WorkTypeRole != "review" {
+		t.Fatal("shim session handle lost work type role")
 	}
 	id := f.identity("sess-launch")
 

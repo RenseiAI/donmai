@@ -172,13 +172,13 @@ func shouldExcludeFromBackstop(path string) bool {
 // workType gates the chain on the completion contract's PR obligation.
 // Result sensitivity is independent: QA/review work needs a verdict to drive
 // its transition but legitimately owes no commit, branch, or PR.
-func shouldBackstop(res *Result, workType string) bool {
+func shouldBackstop(res *Result, workType string, role ...string) bool {
 	if res == nil {
 		return false
 	}
 	// Contract gate: only work that explicitly owes a PR may enter the
 	// deterministic git backstop.
-	if !RequiresPRURL(workType) {
+	if !RequiresPRURL(workType, role...) {
 		return false
 	}
 	switch res.FailureMode {
@@ -364,7 +364,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	// Keep the completion contract at the mutation boundary too. Normal callers
 	// use shouldBackstop, but a future direct caller must not turn verdict-only
 	// review output into a commit, push, or PR.
-	if !RequiresPRURL(qw.WorkType) {
+	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		return agent.BackstopReport{}
 	}
 	report := agent.BackstopReport{Triggered: true}
@@ -611,7 +611,7 @@ func (r *Runner) runDeclaredBackstops(
 			repositoryResult.PullRequestURL = res.PullRequestURL
 		}
 		report := agent.BackstopReport{PRURL: repositoryResult.PullRequestURL}
-		if shouldBackstop(&repositoryResult, qw.WorkType) {
+		if shouldBackstop(&repositoryResult, qw.WorkType, qw.WorkTypeRole) {
 			report = r.runBackstop(ctx, qw, branch, &repositoryResult, allowedRepositories)
 		} else if report.PRURL != "" {
 			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories)
