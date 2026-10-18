@@ -417,8 +417,8 @@ func disableProjectID(ids *[]string, id string) bool {
 	return removed
 }
 
-// workTypeNamePattern is the open work-type name shape: lowercase kebab
-// (lowercase alphanumerics joined by single hyphens), at most 64
+// The open work-type name shape is lowercase kebab (lowercase
+// alphanumerics joined by single hyphens), at most maxWorkTypeNameLength
 // characters. The set of work-type names is open — the dispatcher may
 // assign an organisation-defined name with a valid role — so a
 // modelAccess.set workload key is accepted when it matches this pattern,
