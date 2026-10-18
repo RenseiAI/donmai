@@ -1416,6 +1416,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		EndpointOperator: sessionDisplayAxis(spec.EndpointOperator),
 		Protocol:         sessionDisplayAxis(spec.Protocol),
 		WorkType:         spec.WorkType,
+		WorkTypeRole:     spec.WorkTypeRole,
 		SeatBudget:       sessionSeatBudgetReport(seatBudget, seatBudgetOK, seatbudget.HostPlacement()),
 	}
 	// Publish the worktree path so GET /api/daemon/sessions is
