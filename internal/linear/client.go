@@ -42,7 +42,7 @@ const (
 const (
 	// Fragments
 	issueFragment = `fragment IssueFields on Issue {
-  id identifier title description url priority sortOrder createdAt updatedAt
+  id identifier title description url priority sortOrder estimate createdAt updatedAt
   state { id name }
   team { id key name }
   project { id name }
@@ -588,6 +588,7 @@ func nodeToIssue(n issueNode) Issue {
 		URL:         n.URL,
 		Priority:    n.Priority,
 		SortOrder:   n.SortOrder,
+		Estimate:    n.Estimate,
 		CreatedAt:   n.CreatedAt,
 		UpdatedAt:   n.UpdatedAt,
 	}

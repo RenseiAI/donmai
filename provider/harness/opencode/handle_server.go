@@ -111,15 +111,18 @@ func newServerHandle(child *serveChild, client serverClient, sessionID string, s
 }
 
 // start subscribes to events and launches the forwarder + permission pump.
+// The pump adjudicates once synchronously before the ticker loop starts, so
+// permissions already pending at subscribe time are replied to on the start
+// path rather than only after the first poll interval elapses.
 func (h *serverHandle) start(ctx context.Context) error {
 	ch, stop, err := h.client.Events(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: subscribe opencode events: %v", agent.ErrSpawnFailed, err)
 	}
 	h.stopSSE = stop
-	go h.forward(ch)   //nolint:gosec // G118: session-lifetime goroutine; honors h.shutdown
-	go h.pumpLoop()    //nolint:gosec // G118: session-lifetime goroutine; honors h.shutdown
-	go h.watchCtx(ctx) //nolint:gosec // G118: honors ctx + h.shutdown
+	go h.forward(ch)    //nolint:gosec // G118: session-lifetime goroutine; honors h.shutdown
+	go h.pumpLoop(true) //nolint:gosec // G118: session-lifetime goroutine; honors h.shutdown
+	go h.watchCtx(ctx)  //nolint:gosec // G118: honors ctx + h.shutdown
 	return nil
 }
 
@@ -319,12 +322,17 @@ func (h *serverHandle) terminalOnStreamEnd() []agent.Event {
 	}}
 }
 
-// pumpLoop adjudicates pending permissions on a ticker until shutdown or the
-// session terminates.
-func (h *serverHandle) pumpLoop() {
+// pumpLoop adjudicates pending permissions until shutdown or the session
+// terminates. When adjudicateFirst is set the first pass runs synchronously
+// before the ticker loop starts (see start); otherwise the first pass waits
+// for the first tick, preserving the historical poll-only cadence.
+func (h *serverHandle) pumpLoop(adjudicateFirst bool) {
 	interval := h.permInterval
 	if interval <= 0 {
 		interval = permPollInterval
+	}
+	if adjudicateFirst {
+		h.adjudicateOnce()
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -335,32 +343,38 @@ func (h *serverHandle) pumpLoop() {
 		case <-h.done:
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			records, err := h.pump.Adjudicate(ctx)
-			cancel()
-			if err != nil {
-				h.logger.Debug("provider/opencode: permission adjudicate", "err", err)
-				continue
-			}
-			h.lifecycleMu.Lock()
-			if h.stopping.Load() {
-				h.lifecycleMu.Unlock()
-				return
-			}
-			for _, rec := range records {
-				h.emit(agent.SystemEvent{
-					Subtype: "permission_request",
-					Message: fmt.Sprintf("permission requested: action=%s", rec.Request.Action),
-					Raw:     rec.Request,
-				})
-				h.emit(agent.SystemEvent{
-					Subtype: "permission_decision",
-					Message: fmt.Sprintf("permission %s: %s", rec.Decision.Reply, rec.Decision.Reason),
-					Raw:     rec.Request,
-				})
-			}
-			h.lifecycleMu.Unlock()
+			h.adjudicateOnce()
 		}
+	}
+}
+
+// adjudicateOnce runs one permission adjudication pass and surfaces the
+// observability batch. It is the single body shared by the synchronous first
+// pass and every ticker tick, so the two orderings cannot drift apart.
+func (h *serverHandle) adjudicateOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	records, err := h.pump.Adjudicate(ctx)
+	cancel()
+	if err != nil {
+		h.logger.Debug("provider/opencode: permission adjudicate", "err", err)
+		return
+	}
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if h.stopping.Load() {
+		return
+	}
+	for _, rec := range records {
+		h.emit(agent.SystemEvent{
+			Subtype: "permission_request",
+			Message: fmt.Sprintf("permission requested: action=%s", rec.Request.Action),
+			Raw:     rec.Request,
+		})
+		h.emit(agent.SystemEvent{
+			Subtype: "permission_decision",
+			Message: fmt.Sprintf("permission %s: %s", rec.Decision.Reply, rec.Decision.Reason),
+			Raw:     rec.Request,
+		})
 	}
 }
 

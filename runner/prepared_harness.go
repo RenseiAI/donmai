@@ -272,6 +272,7 @@ func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositor
 }
 
 func applyPreparedSourceAuthority(target, source agent.Spec, plan *agent.PreparedHarness) agent.Spec {
+	target.SessionID = source.SessionID
 	target.SessionName = source.SessionName
 	target.Prompt = source.Prompt
 	target.Autonomous = source.Autonomous

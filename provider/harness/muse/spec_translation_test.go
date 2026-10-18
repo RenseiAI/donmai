@@ -1,6 +1,7 @@
 package muse
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -16,6 +17,52 @@ func TestResolveModel_DefaultAndSentinel(t *testing.T) {
 	}
 	if got := resolveModel(agent.Spec{Model: "muse-wonder-full-1.0"}); got != "muse-wonder-full-1.0" {
 		t.Errorf("explicit model=%q", got)
+	}
+}
+
+// TestResolveEffort_MinimalToMax pins the full host tier ladder: the
+// catalog lists minimal..max, so every tier maps to its wire spelling —
+// including minimal, which has no agent.EffortLevel constant and arrives
+// by its wire spelling. Empty, "default" and "none" all leave the
+// tier unset so the host default applies; no sentinel is ever forwarded.
+func TestResolveEffort_MinimalToMax(t *testing.T) {
+	for _, tc := range []struct {
+		effort agent.EffortLevel
+		want   ReasoningEffort
+	}{
+		{agent.EffortLevel("minimal"), ReasoningEffortMinimal},
+		{agent.EffortLow, ReasoningEffortLow},
+		{agent.EffortMedium, ReasoningEffortMedium},
+		{agent.EffortHigh, ReasoningEffortHigh},
+		{agent.EffortXHigh, ReasoningEffortXHigh},
+		{agent.EffortMax, ReasoningEffortMax},
+	} {
+		got := resolveEffort(agent.Spec{Effort: tc.effort})
+		if got == nil || *got != tc.want {
+			t.Errorf("effort %q = %v, want %q", tc.effort, got, tc.want)
+		}
+	}
+	for _, sentinel := range []agent.EffortLevel{"", "default", "none"} {
+		if got := resolveEffort(agent.Spec{Effort: sentinel}); got != nil {
+			t.Errorf("effort %q = %v, want unset (never forward a sentinel)", sentinel, *got)
+		}
+	}
+}
+
+// TestTurnStartParams_EffortSentinelOmitted pins the wire rule: a
+// sentinel effort leaves reasoningEffort off the turn/start params
+// entirely — the host default applies — while a configured tier rides
+// the params by its wire spelling.
+func TestTurnStartParams_EffortSentinelOmitted(t *testing.T) {
+	minimal := turnStartParams("s", "c", agent.Spec{Effort: agent.EffortLevel("minimal")}, nil, nil)
+	if minimal["reasoningEffort"] != string(ReasoningEffortMinimal) {
+		t.Errorf("minimal reasoningEffort = %v, want %q", minimal["reasoningEffort"], ReasoningEffortMinimal)
+	}
+	for _, sentinel := range []agent.EffortLevel{"", "default", "none"} {
+		params := turnStartParams("s", "c", agent.Spec{Effort: sentinel}, []TurnInputPart{{Type: "text"}}, nil)
+		if _, present := params["reasoningEffort"]; present {
+			t.Errorf("effort %q sent reasoningEffort=%v, want omitted", sentinel, params["reasoningEffort"])
+		}
 	}
 }
 
@@ -165,6 +212,79 @@ func TestCheckHandshakeResult_RequiresSchemaV1AndMCP(t *testing.T) {
 	}
 }
 
+func TestClassifyStartError_AuthKinds(t *testing.T) {
+	p, err := New(Options{skipProcess: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cases := []struct {
+		name string
+		msg  string
+		want error
+	}{
+		{
+			name: "model not entitled",
+			msg:  "turn/start: model muse-wonder-full-1.0 does not exist or you lack access",
+			want: agent.ErrModelNotEntitled,
+		},
+		{
+			name: "unauthorized",
+			msg:  "session/start: unauthorized",
+			want: agent.ErrModelNotEntitled,
+		},
+		{
+			name: "logged out",
+			msg:  "turn/start: not logged in, run login first",
+			want: agent.ErrNotAuthenticated,
+		},
+		{
+			name: "unauthenticated",
+			msg:  "session/start: unauthenticated: login required",
+			want: agent.ErrNotAuthenticated,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := p.classifyStartError(errors.New(tc.msg))
+			if !errors.Is(err, agent.ErrSpawnFailed) {
+				t.Errorf("err=%v, want ErrSpawnFailed in the chain", err)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err=%v, want %v in the chain", err, tc.want)
+			}
+		})
+	}
+	// A generic first-turn failure stays a plain spawn failure:
+	// no auth cause is fabricated.
+	plain := p.classifyStartError(errors.New("turn/start: host overloaded"))
+	if !errors.Is(plain, agent.ErrSpawnFailed) {
+		t.Errorf("plain err=%v, want ErrSpawnFailed", plain)
+	}
+	if errors.Is(plain, agent.ErrNotAuthenticated) || errors.Is(plain, agent.ErrModelNotEntitled) {
+		t.Errorf("plain err=%v, want no auth cause", plain)
+	}
+}
+
+func TestCheckHandshakeResult_MCPGrantPolicy(t *testing.T) {
+	fp := schemaExportFingerprint
+	good := func(grants string) string {
+		return `{"experimentalApi":false,"grantedCapabilities":[` + grants + `],"museHome":"/h","platformFamily":"unix","platformOs":"linux","schema":{"fingerprint":"` + fp + `","version":1},"serverInfo":{"name":"m","version":"1.4.6"},"userAgent":"u"}`
+	}
+	// A session carrying inline MCP servers hard-denies a missing
+	// grant: starting silently tool-less is worse than refusing.
+	if _, err := checkHandshakeResultForPlan([]byte(good(``)), true); err == nil {
+		t.Error("MCP session accepted a missing sessionMcp grant, want rejection")
+	}
+	if _, err := checkHandshakeResultForPlan([]byte(good(`"sessionMcp"`)), true); err != nil {
+		t.Errorf("MCP session with the grant rejected: %v", err)
+	}
+	// A session with no mcpServers soft-passes the same host: it
+	// never asked for MCP tools, so there is nothing to lose.
+	if _, err := checkHandshakeResultForPlan([]byte(good(``)), false); err != nil {
+		t.Errorf("non-MCP session rejected over a grant it never needed: %v", err)
+	}
+}
+
 func TestIsSessionGone(t *testing.T) {
 	rpc := &RPCError{Method: "session/resume", Code: -32000, Message: "gone", Data: []byte(`{"kind":"sessionNotFound"}`)}
 	if !IsSessionGone(rpc) {
@@ -192,6 +312,22 @@ func TestApprovalChoiceFor(t *testing.T) {
 	c, ok = approvalChoiceFor(req, false)
 	if !ok || c.ChoiceID != "deny" {
 		t.Errorf("deny choice=%+v,%v", c, ok)
+	}
+}
+
+func TestApprovalChoiceFor_DeclineMapsToAbort(t *testing.T) {
+	// Live hosts offer the abort arm (not denied) on shell subjects:
+	// a bridge decline must still find a denial choice.
+	req := ApprovalRequestParams{AvailableChoices: []ApprovalChoice{
+		{ChoiceID: "proceed", Decision: MSPApprovalApproved},
+		{ChoiceID: "stop", Decision: MSPApprovalAbort},
+	}}
+	c, ok := approvalChoiceFor(req, false)
+	if !ok || c.ChoiceID != "stop" {
+		t.Errorf("decline choice=%+v,%v, want the abort arm", c, ok)
+	}
+	if c.Decision != MSPApprovalAbort {
+		t.Errorf("decline decision=%q, want abort", c.Decision)
 	}
 }
 

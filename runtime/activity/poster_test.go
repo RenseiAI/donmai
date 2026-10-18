@@ -1208,3 +1208,62 @@ func TestContextUsageNoticePostsContextWithoutZeroFill(t *testing.T) {
 		t.Fatalf("wire stores unknown as zero: %s", body)
 	}
 }
+
+func TestPosterDispatchTraceHeaders(t *testing.T) {
+	t.Parallel()
+	const parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+	for _, tc := range []struct {
+		name, parent, state string
+	}{
+		{name: "both", parent: parent, state: "vendor=value"},
+		{name: "parent only", parent: parent},
+		{name: "state only", state: "vendor=value"},
+		{name: "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var attempts atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/activity") {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+					values, present := r.Header[http.CanonicalHeaderKey(name)]
+					if want == "" {
+						if present {
+							t.Errorf("%s unexpectedly present: %q", name, values)
+						}
+					} else if len(values) != 1 || values[0] != want {
+						t.Errorf("%s = %q; want [%q]", name, values, want)
+					}
+				}
+				if attempts.Add(1) == 1 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p, err := activity.New(activity.Config{
+				SessionID: "session", BaseURL: srv.URL, HTTPClient: srv.Client(),
+				Traceparent: tc.parent, Tracestate: tc.state,
+				MaxRetries: 1, Sleep: func(time.Duration) {},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = p.Stop() })
+			p.Send(context.Background(), agent.AssistantTextEvent{Text: "hello"})
+			if err := p.Stop(); err != nil {
+				t.Fatal(err)
+			}
+			if got := attempts.Load(); got != 2 {
+				t.Fatalf("post attempts = %d; want 2", got)
+			}
+		})
+	}
+}

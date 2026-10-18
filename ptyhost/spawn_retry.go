@@ -40,12 +40,18 @@ const spawnRetryAttempts = 3
 const spawnRetryDelay = 25 * time.Millisecond
 
 // isTransientSpawnError reports whether a PTY start failure is worth one more
-// attempt. EPERM and EAGAIN are the two errnos a fork/exec child can carry
-// back transiently: EAGAIN is fork's documented answer to process-count and
-// RLIMIT_NPROC pressure, and EPERM is what the same pressure returns through
-// the session/controlling-terminal steps (setsid, TIOCSCTTY) and through a
-// container filter answering an otherwise-allowed call under load — states
-// of the launcher, not of the command, and usually gone on retry. The
+// attempt. EPERM, EAGAIN, and ETXTBSY are the three errnos a fork/exec child
+// can carry back transiently: EAGAIN is fork's documented answer to
+// process-count and RLIMIT_NPROC pressure, EPERM is what the same pressure
+// returns through the session/controlling-terminal steps (setsid, TIOCSCTTY)
+// and through a container filter answering an otherwise-allowed call under
+// load, and ETXTBSY is the kernel refusing to execve a file that some process
+// still holds open for writing — the fixture shape where a just-written fake
+// CLI script races its own exec under parallel spawn churn (a concurrently
+// forking sibling can inherit the not-yet-closed write fd
+// (golang.org/issue/22315), so the kernel sees a writer on the inode at
+// execve time). All three are states of the launcher, not of the command,
+// and usually gone on retry. The
 // reading is deliberately heuristic: the same EPERM is also the persistent
 // answer of a pool whose confinement profile forbids the exec (the
 // confinement hypothesis for the observed flake was never ruled out — no
@@ -58,7 +64,7 @@ const spawnRetryDelay = 25 * time.Millisecond
 // or not runnable here) never retries: retrying those would only slow down
 // an answer that cannot change.
 func isTransientSpawnError(err error) bool {
-	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EAGAIN)
+	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.ETXTBSY)
 }
 
 // startPTYWithRetry runs makeCmd under a PTY sized ws, retrying transiently

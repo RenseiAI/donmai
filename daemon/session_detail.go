@@ -116,7 +116,8 @@ type SessionDetail struct {
 
 	// WorkType is the workflow discriminant ("development", "qa",
 	// "research", ...).
-	WorkType string `json:"workType,omitempty"`
+	WorkType     string `json:"workType,omitempty"`
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher.

@@ -309,9 +309,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		// and rejects the request with 400 when this is empty.
 		// Sourced from prompt.QueuedWork.IssueID (camelCase
 		// "issueId" on the wire).
-		IssueID:   qw.IssueID,
-		BaseURL:   qw.PlatformURL,
-		AuthToken: qw.AuthToken,
+		IssueID:     qw.IssueID,
+		BaseURL:     qw.PlatformURL,
+		AuthToken:   qw.AuthToken,
+		Traceparent: qw.Traceparent,
+		Tracestate:  qw.Tracestate,
 		// SessionClass stamps every lock-refresh body with the runtime
 		// session class so the platform's activity-stall reaper exempts an
 		// interactive session during human think-time (W4 amendment 4 —
@@ -440,6 +442,37 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	res.WorktreePath = wpath
+	// Clone workareas only: linked worktrees (worktree-add) share hooks with
+	// their parent repository and are deliberately outside this hook's scope.
+	// A directory check also protects re-entered linked worktrees.
+	// Shared-mode joiners are also excluded: they work inside the
+	// parent-owned shared leaf, so a per-session install would fail on
+	// overlap (O_EXCL) and the first participant to exit would strip the
+	// hook while others still run. Shared-mode attribution is a follow-up.
+	gitDir := filepath.Join(wpath, ".git")
+	if provisionStrategy == worktree.StrategyClone && qw.WorkareaMode != worktree.ModeShared {
+		info, statErr := os.Lstat(gitDir)
+		if statErr != nil {
+			hookErr := fmt.Errorf("inspect clone git directory for commit hook: %w", statErr)
+			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, hookErr.Error()
+			return res, hookErr
+		}
+		if info.IsDir() {
+			name, email := ValidateCoAuthorPair(qw.SessionID, qw.CoAuthorName, qw.CoAuthorEmail)
+			if name != "" {
+				if hookErr := installTrailerHook(gitDir, name, email); hookErr != nil {
+					res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, hookErr.Error()
+					return res, hookErr
+				}
+				// Remove session attribution even when the checkout is retained.
+				defer func() {
+					if hookErr := removeTrailerHook(gitDir); hookErr != nil {
+						r.logger.Warn("commit hook cleanup failed", "sessionId", qw.SessionID, "err", hookErr)
+					}
+				}()
+			}
+		}
+	}
 	layout, layoutErr := r.wt.Layout(qw.SessionID)
 	if layoutErr != nil {
 		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, layoutErr.Error()
@@ -1160,6 +1193,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: actCredentialProvider,
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		HTTPClient:         r.httpClient,
 		Logger:             r.logger,
 		// ProviderName flows onto the wire payload so the platform's
@@ -1292,6 +1327,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 	stepEmitter, stepErr := stepheartbeat.New(stepheartbeat.Config{
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		SessionID:          qw.SessionID,
 		WorkerID:           qw.WorkerID,
 		BaseURL:            qw.PlatformURL,
@@ -1436,7 +1473,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// rework must have moved past.
 	verifyCtx := context.WithoutCancel(ctx)
 	var prVerifier *sessionPullRequestVerifier
-	if RequiresPRURL(qw.WorkType) {
+	if RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		prVerifier = r.newSessionPullRequestVerifier(verifyCtx, qw, repositoryDeclaration, wpath, branch, reworkStartHead(qw, res, wpath), repositoryFree)
 	}
 	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
@@ -1447,7 +1484,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// continued pull request exactly like the rework pull requests they
 	// already pin: a noop continue run keeps turning instead of ending
 	// completed against an unchanged head.
-	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
+	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		if continuedURL := continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath); continuedURL != "" {
 			r.seedContinuedPullRequest(prVerifier, continuedURL, res, &streamRes)
 		}
@@ -1525,7 +1562,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// point, the next follow-up prompt asks the agent to wrap up (unless the
 	// request already reached it mid-turn), and once a cap ends the session
 	// no follow-up turn starts.
-	publicationComplete := !RequiresPRURL(qw.WorkType) && res.WorkResult == "passed"
+	publicationComplete := !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) && res.WorkResult == "passed"
 	followUps := r.newTurnFollowUps()
 	if stallFollowUps.retried > 0 || stallFollowUps.exhausted {
 		// A stall retry already ran on the first turn: carry its count
@@ -1535,8 +1572,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		followUps.retried = stallFollowUps.retried
 		followUps.last = tailRetry
 	}
-	reviewWork := RequiresReviewVerdict(qw.WorkType)
-	continuable := (RequiresPRURL(qw.WorkType) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
+	reviewWork := RequiresReviewVerdict(qw.WorkType, qw.WorkTypeRole)
+	continuable := (RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
 	tailRecoverable := selectedRepositoryMutable || reviewWork
 tailRecovery:
 	for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
@@ -1559,7 +1596,7 @@ tailRecovery:
 				ending = turnStoppedEarly
 			}
 		}
-		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType))
+		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
 		switch step {
 		case tailDone:
 			break tailRecovery
@@ -1722,8 +1759,8 @@ tailRecovery:
 
 	// Amend-existing-branch contract: on ref-bearing runs, skip gh pr create — the
 	// fix lands on the existing branch/PR, not a new one.
-	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType)
-	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
+	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType, qw.WorkTypeRole)
+	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		switch res.FailureMode {
 		case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
 			backstopEligible = false
@@ -1740,7 +1777,7 @@ tailRecovery:
 	if qw.ContinuePullRequest != nil {
 		probe := *res
 		probe.PullRequestURL = ""
-		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType)
+		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType, qw.WorkTypeRole)
 	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
 		switch {
@@ -1789,7 +1826,7 @@ tailRecovery:
 	// other check still applies. Runs only when no failure was already
 	// recorded, so a runner-authored refusal (divergence, provision)
 	// keeps its own typed reason.
-	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType) && res.FailureMode == "" && budgetStop == nil {
+	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) && res.FailureMode == "" && budgetStop == nil {
 		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1867,7 +1904,7 @@ tailRecovery:
 	// would flip it to failed → resolveTargetStatus forces effectiveResult
 	// "failed" → the issue transitions to Rejected instead of Delivered.
 	missingPRs := []string(nil)
-	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
+	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		missingPRs = missingMutablePullRequests(res, *repositoryDeclaration)
 	}
 	// An exhausted session keeps the failure mode of the bound it ran out
@@ -1876,7 +1913,7 @@ tailRecovery:
 		res.Status = "failed"
 		res.FailureMode = FailureBackstop
 		res.Error = "completion contract missing pull requests for mutable repositories: " + strings.Join(missingPRs, ", ")
-	} else if res.BackstopReport != nil && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
+	} else if res.BackstopReport != nil && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		res.Status = "failed"
 		if res.FailureMode == "" {
 			res.FailureMode = FailureBackstop
@@ -2276,7 +2313,7 @@ func (r *Runner) stopAtBudget(qw QueuedWork, handle agent.Handle, enforcer *Budg
 // recorded. Such a session ends completed with the breach recorded, not
 // failed: the cap stopped work that was already done.
 func deliveredAtBudgetStop(qw QueuedWork, res *Result, declaration *workarea.NormalizedDeclaration) bool {
-	if !RequiresPRURL(qw.WorkType) || res.PullRequestURL == "" || res.WorkResult != "passed" {
+	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || res.PullRequestURL == "" || res.WorkResult != "passed" {
 		return false
 	}
 	if res.FailureMode != "" || res.Status == "failed" {

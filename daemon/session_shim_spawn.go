@@ -2318,6 +2318,7 @@ func (d *Daemon) trackLaunchedShim(
 		EndpointOperator: sessionDisplayAxis(spec.EndpointOperator),
 		Protocol:         sessionDisplayAxis(spec.Protocol),
 		WorkType:         spec.WorkType,
+		WorkTypeRole:     spec.WorkTypeRole,
 	}
 	entry := adoptedShim{
 		controller:      ctrl,

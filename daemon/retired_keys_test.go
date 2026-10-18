@@ -238,6 +238,78 @@ func TestSweepRetiredKeys_SkipsUnsafeFileUntouched(t *testing.T) {
 	}
 }
 
+func TestSweepRetiredKeys_RefusesMultilineValues(t *testing.T) {
+	t.Parallel()
+	for _, section := range []string{"projects", "repositories"} {
+		for name, value := range map[string]string{
+			"literal stripped": "|-\n      full\n",
+			"folded stripped":  ">-\n      full\n      clone\n",
+			"quoted folded":    "\"full\n      clone\"\n",
+			"plain folded":     "full\n      clone\n",
+			"CR line breaks":   "full\n      clone\n",
+		} {
+			t.Run(section+"/"+name, func(t *testing.T) {
+				t.Parallel()
+				path := filepath.Join(t.TempDir(), "daemon.yaml")
+				body := section + ":\n  - id: alpha\n    cloneStrategy: " + value +
+					"    description: |\n      sibling text\n      must survive\n" +
+					"  - id: beta\n    cloneStrategy: full\n"
+				if name == "CR line breaks" {
+					body = strings.ReplaceAll(body, "\n", "\r")
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				summary, sweepErr := SweepRetiredKeys([]string{path})
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(raw) != body {
+					t.Errorf("multi-line file changed, including sibling value:\n%s", raw)
+				}
+				if sweepErr == nil || len(summary.Files) != 1 || !summary.Files[0].Skipped || summary.KeysRemoved() != 0 {
+					t.Errorf("want skipped file with no removals; got %d files, %d removals, error present %t", len(summary.Files), summary.KeysRemoved(), sweepErr != nil)
+				}
+				if osFileMode(t, path) != 0o600 {
+					t.Error("skipped file mode changed")
+				}
+				matches, err := filepath.Glob(path + ".sweep-*")
+				if err != nil || len(matches) != 0 {
+					t.Errorf("skipped file gained %d artifacts, error present %t", len(matches), err != nil)
+				}
+			})
+		}
+	}
+}
+
+func TestSweepRetiredKeys_InlineValuePreservesBlockSibling(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"full", "'full'", `"full\nclone"`, "full # comment"} {
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "daemon.yaml")
+			before := "projects:\n  - id: alpha\n    description: |\n      sibling text\n      must survive\n"
+			after := "    repository: github.com/o/a\n"
+			body := before + "    cloneStrategy: " + value + "\n" + after
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := SweepRetiredKeys([]string{path})
+			if err != nil || summary.KeysRemoved() != 1 {
+				t.Fatalf("want one removal, got %d, error %v", summary.KeysRemoved(), err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw) != before+after {
+				t.Errorf("sibling bytes changed:\n%s", raw)
+			}
+		})
+	}
+}
+
 // sweepRefusalHeader is the shared top-level block every refusal fixture
 // carries so the post-skip LoadConfig assertion exercises a valid file.
 const sweepRefusalHeader = "machine:\n  id: sweep-fixture\norchestrator:\n  url: https://platform.example.com\n"
