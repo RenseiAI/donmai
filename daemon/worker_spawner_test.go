@@ -43,9 +43,12 @@ func TestSpawner_AcceptWork_ProjectAllowlist(t *testing.T) {
 		MaxConcurrentSessions: 4,
 	})
 	ended := sessionEnds(s)
-	_, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/foo/bar", Ref: "main"})
+	handle, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/foo/bar", Ref: "main", WorkTypeRole: "inflight"})
 	if err != nil {
 		t.Fatalf("expected accept, got %v", err)
+	}
+	if handle.WorkTypeRole != "inflight" {
+		t.Fatal("session handle lost work type role")
 	}
 	// Wait for terminal listener delivery and then registry release.
 	waitSessionEnd(t, ended)

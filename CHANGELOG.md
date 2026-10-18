@@ -10,6 +10,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.81 — 2026-10-18
+
+### Chores
+
+- Preserve failed session work on reserved remote refs
+- Revert "Preserve failed session work on reserved remote refs"
+
+## v0.72.80 — 2026-10-17
+
+### Fixes
+
+- Emit per-step token usage and cost deltas
+
+### Chores
+
+- Add clone commit co-author hook
+- Score routing rewards by session work type
+- Stream live conversation events from interactive harness transcripts
+
 ## v0.72.79 — 2026-10-16
 
 ### Fixes
