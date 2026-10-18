@@ -204,7 +204,7 @@ func TestComputeRoutingReward_ResearchAndDevelopment(t *testing.T) {
 func TestComputeRoutingReward_CustomNameFollowsRole(t *testing.T) {
 	t.Parallel()
 	roles := []struct {
-		role          string
+		role           string
 		representative string
 	}{
 		{"review", WorkTypeQAStr},

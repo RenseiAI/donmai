@@ -1,6 +1,6 @@
 package runner
 
-// Work-type roles: the coarse behavioural bucket a work-type name belongs
+// WorkTypeRole is the coarse behavioural bucket a work-type name belongs
 // to. The platform stamps the role next to the name on every work item so
 // the runner can serve organisation-defined names it was never compiled
 // with: the name stays the display/logging identity while every behaviour

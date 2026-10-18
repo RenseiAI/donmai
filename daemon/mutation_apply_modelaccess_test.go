@@ -303,7 +303,7 @@ func TestApplyPendingMutations_ModelAccessSet_UnknownWorkloadRejected(t *testing
 	// Default block (pinned by TestApplyPendingMutations_ModelAccessSet_Default)
 	// and never reaches the key check; knownWorkloadKey("") itself stays
 	// false, pinned by TestKnownWorkloadKey below.
-	for _, key := range []string{"Not A Name!", "-leading", "trailing-", "doub--le", "UPPER", "under_score", "has space", "dot.name", strings.Repeat("a", 65)} {
+	for _, key := range []string{"Not A Name!", "-leading", "trailing-", "double--dash", "UPPER", "under_score", "has space", "dot.name", strings.Repeat("a", 65)} {
 		t.Run("key="+key, func(t *testing.T) {
 			t.Parallel()
 			d, path := newTestDaemonWithProjects(t, nil)
@@ -362,7 +362,7 @@ func TestKnownWorkloadKey(t *testing.T) {
 		})
 	}
 	rejected := []string{
-		"", "Not A Name!", "-leading", "trailing-", "doub--le",
+		"", "Not A Name!", "-leading", "trailing-", "double--dash",
 		"UPPER", "under_score", "has space", "dot.name", "slash/x",
 		strings.Repeat("a", 65),
 	}
