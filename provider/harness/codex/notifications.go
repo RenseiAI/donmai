@@ -195,3 +195,33 @@ func reasoningText(raw json.RawMessage) string {
 	}
 	return ""
 }
+
+// Diagnostics are observations, not terminal ErrorEvents or provider-error
+// signals. Only turn/completed decides the turn outcome, even without a retry.
+func mapDiagnostic(method string, params json.RawMessage) []agent.Event {
+	var p struct {
+		Message string `json:"message"`
+		Error   struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return nil
+	}
+	message := p.Message
+	if method == "error" {
+		message = p.Error.Message
+	}
+	message = strings.Map(func(r rune) rune {
+		if (r < 32 && r != '\n' && r != '\t') || (r >= 127 && r <= 159) {
+			return -1
+		}
+		return r
+	}, stripANSI(message))
+	message = strings.TrimSpace(redactAppServerStderr(message))
+	if message == "" {
+		message = "Codex " + method
+	}
+	// Do not retain raw params: they may contain unredacted diagnostic text.
+	return []agent.Event{agent.SystemEvent{Subtype: "codex_" + method, Message: message}}
+}
