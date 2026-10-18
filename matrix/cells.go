@@ -3,7 +3,8 @@
 // which legacy ProviderName each maps to, and the generated artifacts that
 // downstream embedders consume. The matrix is grounded in the live
 // provider/endpoint Manifest() declarations (harvested by the generator), not
-// a re-typed copy — keeping the manifests the single SoT.
+// a re-typed copy. Subagent-event bits are derived from adapter fixtures,
+// never copied from manifest claims.
 //
 // This file holds the ONLY hand-authored capability data (per 03 §1):
 //   - the harvest lists (which providers/endpoints to call Manifest() on),
@@ -18,6 +19,7 @@ package matrix
 
 import (
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
@@ -66,8 +68,10 @@ type CapsOverride struct {
 	SupportsToolPlugins      *bool `json:"tools,omitempty"`
 	AcceptsMcpServerSpec     *bool `json:"mcp,omitempty"`
 	AcceptsAllowedToolsList  *bool `json:"allowedToolsList,omitempty"`
-	EmitsSubagentEvents      *bool `json:"subagents,omitempty"`
-	SupportsReasoningEffort  *bool `json:"reasoningEffort,omitempty"`
+	// EmitsSubagentEvents is retained for decoding older artifacts. Authored
+	// overrides are rejected: subagent evidence is computed by the generator.
+	EmitsSubagentEvents     *bool `json:"subagents,omitempty"`
+	SupportsReasoningEffort *bool `json:"reasoningEffort,omitempty"`
 }
 
 // HarnessEndpointCell is one hand-authored valid cell — a (harness × endpoint
@@ -110,6 +114,10 @@ type HarnessEndpointCell struct {
 	// Smoked is true only when every proving lane passed in the last gate.
 	// DERIVED by the generator; a cell with no proving lane reads false.
 	Smoked bool `json:"smoked"`
+	// EmitsSubagentEvents is computed from executed fixtures, never authored.
+	// SubagentQualification identifies the adapter version and loaded delivery
+	// behind a true value; missing evidence leaves the cell false.
+	EmitsSubagentEvents bool `json:"emitsSubagentEvents"`
 }
 
 // Key returns the cell's (harness, endpoint, host) identity.
@@ -290,6 +298,32 @@ var validCells = []HarnessEndpointCell{
 		StructuredVia: "spawn-collect", LegacyProviderID: nil,
 	},
 
+	// muse × Meta -----------------------------------------------------------
+	// The MSP serve host drives muse-msp on both the subscriber login
+	// (oauth-cli, host-session — the serve child inherits the login) and
+	// the keyed API route (direct, BYOK/metered via META_API_KEY). The
+	// oauth-cli cell anchors ProviderName "muse" (the host-session
+	// default, mirroring codex × openai × oauth-cli); the direct cell is
+	// the keyed sibling. Both are experimental/untested until the smoke
+	// lane proves a live turn: the adapter reports no native structured
+	// output (spawn-collect) and no plan/fork/rollback surface (the MSP
+	// host exposes none — see provider/harness/muse README "Out of
+	// scope").
+	{
+		Harness: agent.HarnessMuse, Endpoint: agent.CompanyMeta, Host: agent.HostOAuthCLI,
+		Protocol: agent.ProtoMuseMSP, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
+		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderMuse),
+	},
+	{
+		Harness: agent.HarnessMuse, Endpoint: agent.CompanyMeta, Host: agent.HostDirect,
+		Protocol: agent.ProtoMuseMSP, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: nil,
+	},
+
 	// stub × stub -----------------------------------------------------------
 	{
 		Harness: agent.HarnessStub, Endpoint: agent.CompanyStub, Host: agent.HostLocal,
@@ -355,6 +389,13 @@ var harnessBinaryPins = map[agent.HarnessName]HarnessBinaryPin{
 		MinVersion:      pi.MinVersion,
 		PinnedVersion:   pi.PinnedVersion,
 		VerifiedAgainst: pi.VerifiedAgainst,
+	},
+	// The serve host drifts independently of donmai releases; the pin is
+	// enforced probe-time in provider/harness/muse (checkMuseVersion).
+	agent.HarnessMuse: {
+		MinVersion:      muse.MinVersion,
+		PinnedVersion:   muse.PinnedVersion,
+		VerifiedAgainst: muse.VerifiedAgainst,
 	},
 }
 

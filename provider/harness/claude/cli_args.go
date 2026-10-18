@@ -77,9 +77,14 @@ var linearMCPDisallowList = []string{
 // host-login spawn's argv is byte-identical to before the pin existed.
 //
 // resumeSessionID is empty for fresh spawns; when non-empty it is
-// rendered as `--resume <id>`. v0.5.0 does not exercise this path
-// because SupportsSessionResume=false, but the implementation is in
-// place for the F.5 capability flip.
+// rendered as `--resume <id>` (Provider.Resume, the restore path).
+//
+// ownedSessionID is the harness-owned resume token minted at launch
+// (see session_id.go). When non-empty AND resumeSessionID is empty the
+// spawn is fresh and the token is rendered as `--session-id <id>`, so
+// the resume token is known before the first turn. A resume spawn
+// carries only `--resume`; the CLI resolves the conversation from it
+// and `--session-id` alongside would be a conflicting second identity.
 //
 // Spec → CLI mapping accounts for every Spec field. Fields the CLI cannot
 // honor are silently dropped per the capability-gating contract:
@@ -112,7 +117,7 @@ var linearMCPDisallowList = []string{
 // The mcpConfigPath argument is the path to the per-session
 // `--mcp-config` JSON tmpfile prepared by writeMCPConfig (see mcp.go).
 // When empty (no MCP servers configured) the flag is omitted.
-func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []string, stdinPrompt string) {
+func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID string) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -155,6 +160,8 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 
 	if resumeSessionID != "" {
 		argv = append(argv, "--resume", resumeSessionID)
+	} else if ownedSessionID != "" {
+		argv = append(argv, "--session-id", ownedSessionID)
 	}
 
 	// The interactive spawn mode applies the SAME mapping — see

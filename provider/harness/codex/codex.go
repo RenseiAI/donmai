@@ -529,6 +529,14 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err := h.start(ctx, plan, sessionID); err != nil {
 		p.unregisterHandle(h)
 		cleanupErr := h.releaseMCPConfig()
+		// A proven-gone thread must stay typed-not-found across the
+		// spawn-failed wrap: the restore machine (agent.DecideRestore)
+		// admits fresh_primed on errors.Is(err,
+		// agent.ErrSessionNotFound), and a %v-flattened chain would
+		// misroute it to attention_required.
+		if errors.Is(err, agent.ErrSessionNotFound) {
+			return nil, errors.Join(fmt.Errorf("%w: codex resume %q: %w", agent.ErrSpawnFailed, sessionID, err), cleanupErr)
+		}
 		return nil, errors.Join(fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err), cleanupErr)
 	}
 

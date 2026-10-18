@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -41,7 +42,7 @@ const (
 const (
 	// Fragments
 	issueFragment = `fragment IssueFields on Issue {
-  id identifier title description url priority sortOrder createdAt updatedAt
+  id identifier title description url priority sortOrder estimate createdAt updatedAt
   state { id name }
   team { id key name }
   project { id name }
@@ -456,6 +457,34 @@ func (c *Client) doMutationOnce(ctx context.Context, query string, vars map[stri
 }
 
 func (c *Client) doRequest(ctx context.Context, query string, vars map[string]any, out any, writeOnce bool) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	var lastDenial error
+	for attempt := 1; ; attempt++ {
+		err := c.doRequestOnce(ctx, query, vars, out, writeOnce)
+		if err != nil && ctx.Err() != nil && lastDenial != nil {
+			return fmt.Errorf("%w: %w", lastDenial, err)
+		}
+		var denial *retryDenial
+		if !errors.As(err, &denial) || !denial.retry || writeOnce || attempt >= 3 {
+			return err
+		}
+		deadline, _ := ctx.Deadline()
+		if denial.delay >= time.Until(deadline) {
+			return err
+		}
+		lastDenial = err
+		timer := time.NewTimer(denial.delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%w: %w", err, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Client) doRequestOnce(ctx context.Context, query string, vars map[string]any, out any, writeOnce bool) error {
 	payload := graphqlRequest{Query: query, Variables: vars}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -514,16 +543,13 @@ func (c *Client) doRequest(ctx context.Context, query string, vars map[string]an
 	}
 	decodeErr := json.Unmarshal(body, &env)
 	if statusErr := statusToError(resp.StatusCode); statusErr != nil {
-		if decodeErr == nil && len(env.Errors) > 0 {
-			return fmt.Errorf("%w: %w: %s", statusErr, ErrGraphQLError, env.Errors[0].Message)
-		}
-		return statusErr
+		return responseError(resp, body, env.Errors, decodeErr)
 	}
 	if decodeErr != nil {
 		return fmt.Errorf("linear: decode response: %w", decodeErr)
 	}
 	if len(env.Errors) > 0 {
-		return fmt.Errorf("%w: %s", ErrGraphQLError, env.Errors[0].Message)
+		return fmt.Errorf("%w: %s", ErrGraphQLError, graphQLErrorText(env.Errors))
 	}
 	if err := json.Unmarshal(env.Data, out); err != nil {
 		return fmt.Errorf("linear: decode data: %w", err)
@@ -562,6 +588,7 @@ func nodeToIssue(n issueNode) Issue {
 		URL:         n.URL,
 		Priority:    n.Priority,
 		SortOrder:   n.SortOrder,
+		Estimate:    n.Estimate,
 		CreatedAt:   n.CreatedAt,
 		UpdatedAt:   n.UpdatedAt,
 	}

@@ -59,6 +59,13 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// thread id exists and before turn/start; named interactive sessions use
 		// the same method before the TUI attaches by name.
 		"SessionName",
+		// SessionID is the platform lifecycle UUID the runner threads through
+		// agent.Spec to the trust-ledger liveness path (the claude seed keys
+		// its owning-session rows on it; the daemon sweep keys liveness on
+		// it) — never a codex JSON-RPC param: codex threads are
+		// provider-native, so the UUID has nothing to project onto, same
+		// treatment as the adjacent SessionName entry.
+		"SessionID",
 		"Env",
 		"AllowedTools",
 		"DisallowedTools",

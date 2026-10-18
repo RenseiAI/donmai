@@ -30,6 +30,7 @@ const (
 	CompanyOpenAI    Company = "openai"
 	CompanyGoogle    Company = "google"
 	CompanyLocal     Company = "local"
+	CompanyMeta      Company = "meta"
 	CompanyStub      Company = "stub" // test-only, both axes
 )
 

@@ -122,6 +122,11 @@ type Config struct {
 	// runners pick up daemon-side runtime-token refreshes mid-session.
 	CredentialProvider CredentialProvider
 
+	// Traceparent and Tracestate carry the optional dispatch W3C trace context.
+	// Empty values omit the corresponding request headers.
+	Traceparent string
+	Tracestate  string
+
 	// HTTPClient overrides http.DefaultClient.
 	HTTPClient *http.Client
 	// Logger overrides slog.Default(). The poster logs at debug for
@@ -555,6 +560,12 @@ func (p *Poster) postActivity(ctx context.Context, body payload) error {
 		return fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}

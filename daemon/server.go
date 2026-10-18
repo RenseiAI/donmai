@@ -511,6 +511,36 @@ func (d *Daemon) applyRepoKeeperSet(key string, n int64) bool {
 	return true
 }
 
+// applyUsagePingEnabled mirrors a `host set usagePing.enabled` change
+// into the live config. Enabling never mints here — the id comes from
+// daemon.yaml (minted by setup or by the CLI's set path). Reports
+// false when no config is loaded.
+func (d *Daemon) applyUsagePingEnabled(enabled bool) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.config == nil {
+		return false
+	}
+	d.config.UsagePing.Enabled = enabled
+	if !enabled {
+		d.config.UsagePing.InstallationID = ""
+		d.config.UsagePing.Endpoint = ""
+	}
+	return true
+}
+
+// applyUsagePingEndpoint mirrors a `host set usagePing.endpoint`
+// change into the live config. Reports false when no config is loaded.
+func (d *Daemon) applyUsagePingEndpoint(endpoint string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.config == nil {
+		return false
+	}
+	d.config.UsagePing.Endpoint = endpoint
+	return true
+}
+
 // repoKeeperStats returns the daemon's secret-free keeper snapshot for
 // daemon stats, or nil when the keeper is disabled. No scope values or
 // remote URLs ever appear here.
@@ -683,6 +713,15 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The usage-count consent rides the same endpoint: `host set
+	// usagePing.*` persists to daemon.yaml in the CLI and notifies the
+	// running daemon here so the change takes effect without a
+	// restart. The endpoint is a free-form string (not an integer),
+	// so this branch runs before integer parsing.
+	if strings.HasPrefix(body.Key, "usagePing.") {
+		s.handleSetUsagePing(w, body.Key, body.Value)
+		return
+	}
 	n, err := strconv.Atoi(body.Value)
 	if err != nil || n < 0 {
 		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
@@ -742,6 +781,56 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
 		OK: true, Key: body.Key, Value: body.Value, Message: "applied",
 	})
+}
+
+// handleSetUsagePing applies one usagePing.* key to the live config.
+// The CLI already persisted the change to daemon.yaml; this mirrors it
+// into memory so the scheduler loop picks it up without a restart.
+// Disabling additionally cancels any queued attempt state.
+func (s *Server) handleSetUsagePing(w http.ResponseWriter, key, value string) {
+	switch key {
+	case "usagePing.enabled":
+		n, err := strconv.Atoi(value)
+		if err != nil || (n != 0 && n != 1) {
+			writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "usagePing.enabled must be 0 or 1",
+			})
+			return
+		}
+		if !s.daemon.applyUsagePingEnabled(n == 1) {
+			writeJSON(w, http.StatusInternalServerError, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "daemon has no loaded config",
+			})
+			return
+		}
+		if n == 0 {
+			cancelUsagePing(DefaultUsagePingStatePath())
+		}
+		writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
+			OK: true, Key: key, Value: value, Message: "applied",
+		})
+	case "usagePing.endpoint":
+		endpoint := strings.TrimSpace(value)
+		if endpoint != "" && !strings.HasPrefix(endpoint, "https://") {
+			writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "usagePing.endpoint must be an https URL or empty",
+			})
+			return
+		}
+		if !s.daemon.applyUsagePingEndpoint(endpoint) {
+			writeJSON(w, http.StatusInternalServerError, &afclient.SetCapacityResponse{
+				OK: false, Key: key, Value: value, Message: "daemon has no loaded config",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
+			OK: true, Key: key, Value: value, Message: "applied",
+		})
+	default:
+		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+			OK: false, Key: key, Value: value, Message: "unknown key",
+		})
+	}
 }
 
 func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {

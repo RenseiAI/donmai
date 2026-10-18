@@ -28,7 +28,7 @@
 // Per coordinator decision #1 in F.1.1 §10 (with F.2.3-cap-flip
 // follow-up), this provider ships with
 // SupportsMessageInjection=true (between-turn) and
-// SupportsSessionResume=false.
+// SupportsSessionResume=true (owned resume token).
 //
 //   - SupportsMessageInjection=true: between-turn injection via
 //     `claude --resume <session-id> -p <text>`. Each Inject() call
@@ -39,10 +39,13 @@
 //     replaces the subprocess shell-out with the Anthropic Go SDK
 //     for true mid-turn injection without subprocess overhead.
 //
-//   - SupportsSessionResume=false: while the CLI exposes `--resume
-//     <session-id>`, the v0.5.0 runner does not yet exercise the
-//     resume code path on Provider.Resume. Flip to true in v0.5.+
-//     once F.5's option C lands.
+//   - SupportsSessionResume=true: the harness owns its resume token. A
+//     fresh Spawn mints a session id and passes it as `--session-id`,
+//     so the token a later restore needs is known before the first
+//     turn; Provider.Resume continues that conversation via
+//     `claude --resume <session-id>`. See session_id.go and
+//     agent/restore.go (the restore state machine, which never
+//     silently starts fresh).
 //
 // All other capabilities follow F.1.1 §3.1: tool plugins (true), no
 // base instructions (false), no permission config (false), code-intel

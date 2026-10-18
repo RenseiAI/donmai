@@ -328,11 +328,16 @@ func newDaemonUninstallCmd(bin string) *cobra.Command {
 
 func newDaemonSetupCmd(bin string) *cobra.Command {
 	var configPath string
+	var noPing bool
 	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Interactive first-run wizard",
 		Long: "Run the interactive first-run setup wizard that captures machine identity, capacity,\n" +
 			"orchestrator config, project allowlist, and auto-update preferences.\n\n" +
+			"The wizard asks one default-no question about counting this\n" +
+			"installation in the public usage numbers (a random installation\n" +
+			"id and the version, sent at most once a week, nothing else).\n" +
+			"Pass --no-ping to skip that question and leave the count off.\n\n" +
 			"In-process Go implementation: the wizard reads stdin/stdout\n" +
 			"directly so prompts work correctly when stdin is a TTY.",
 		SilenceUsage: true,
@@ -354,6 +359,7 @@ func newDaemonSetupCmd(bin string) *cobra.Command {
 				Context:              cmd.Context(),
 				LocalRuntimeResolver: localSetupResolverFactory(),
 				IsTTY:                setupWizardTTYOverride,
+				SkipPing:             noPing,
 			})
 			if err != nil {
 				return fmt.Errorf("daemon setup: %w", err)
@@ -363,6 +369,7 @@ func newDaemonSetupCmd(bin string) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
+	cmd.Flags().BoolVar(&noPing, "no-ping", false, "Skip the anonymous usage-count question and leave the count off")
 	return cmd
 }
 
@@ -1281,6 +1288,8 @@ var allowedCapacityKeys = map[string]struct{}{
 	"repoKeeper.maxDiskGb":                  {},
 	"repoKeeper.fetchIntervalSeconds":       {},
 	"repoKeeper.authorizationWindowSeconds": {},
+	"usagePing.enabled":                     {},
+	"usagePing.endpoint":                    {},
 }
 
 // repoKeeperRestartKeys are the process-level keeper keys: the running daemon
@@ -1318,7 +1327,13 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"                                  before eviction (0 = no limit).\n" +
 			"  repoKeeper.fetchIntervalSeconds Bound on how often a mirror is re-fetched.\n" +
 			"  repoKeeper.authorizationWindowSeconds  Bound on how long a resolved\n" +
-			"                                  authorization is honored.\n\n" +
+			"                                  authorization is honored.\n" +
+			"  usagePing.enabled               Count this installation in the public\n" +
+			"                                  usage numbers (0 or 1; default off).\n" +
+			"                                  1 mints a random installation id; 0 clears\n" +
+			"                                  it and stops all sending.\n" +
+			"  usagePing.endpoint              HTTPS receiver URL for the weekly\n" +
+			"                                  usage ping (empty disables sending).\n\n" +
 			"The change is written atomically to ~/.donmai/daemon.yaml. Capacity keys\n" +
 			"reload the affected subsystem without a restart; repoKeeper.* keys are\n" +
 			"process-level and need a drain-aware restart to take effect.",
@@ -1329,7 +1344,25 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			value := args[1]
 
 			if _, ok := allowedCapacityKeys[key]; !ok {
-				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds", key)
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds, usagePing.enabled, usagePing.endpoint", key)
+			}
+
+			// The usage-count consent lives in daemon.yaml under
+			// `usagePing`, which the project-tree YAML model does not
+			// carry. Handle it here with a raw-node edit so the rest
+			// of the file is preserved byte-for-byte outside that
+			// block, then notify the running daemon best-effort.
+			if strings.HasPrefix(key, "usagePing.") {
+				yamlPath := cfgPath
+				if yamlPath == "" {
+					yamlPath = afclient.DefaultDaemonYAMLPath()
+				}
+				msg, err := applyUsagePingSet(yamlPath, key, value)
+				if err != nil {
+					return err
+				}
+				notifyUsagePingSet(cmd, factory, host, port, jsonOut, key, value, msg)
+				return nil
 			}
 
 			// Validate integer capacity keys locally so we give a clear error
@@ -1425,10 +1458,90 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 
 // boolRangeHint names the 0-or-1 range for boolean keeper keys.
 func boolRangeHint(key string) string {
-	if key == "repoKeeper.enabled" {
+	if key == "repoKeeper.enabled" || key == "usagePing.enabled" {
 		return " (0 or 1)"
 	}
 	return ""
+}
+
+// applyUsagePingSet records one usagePing.* set into daemon.yaml via a
+// raw-node edit (the project-tree YAML model does not carry the block),
+// preserving every other key. Enabling with no valid id mints a fresh
+// random one; disabling clears the id and the endpoint so a disabled
+// ping keeps no identifier and no destination. It returns the human
+// summary line for the notify step.
+func applyUsagePingSet(yamlPath, key, value string) (string, error) {
+	switch key {
+	case "usagePing.enabled":
+		n, err := strconv.Atoi(value)
+		if err != nil || (n != 0 && n != 1) {
+			return "", fmt.Errorf("usagePing.enabled must be 0 or 1, got %q", value)
+		}
+		if n == 1 {
+			id, err := readUsagePingField(yamlPath, "installationId")
+			if err != nil {
+				return "", err
+			}
+			if !validUsagePingID(id) {
+				id, err = mintUsagePingID()
+				if err != nil {
+					return "", err
+				}
+			}
+			if err := writeUsagePingField(yamlPath, "installationId", id); err != nil {
+				return "", err
+			}
+			if err := writeUsagePingField(yamlPath, "enabled", "true"); err != nil {
+				return "", err
+			}
+			return "counting this installation (weekly anonymous ping)", nil
+		}
+		if err := deleteUsagePingBlock(yamlPath); err != nil {
+			return "", err
+		}
+		return "usage count off; identifier cleared, no ping will be sent", nil
+	case "usagePing.endpoint":
+		endpoint := strings.TrimSpace(value)
+		if endpoint != "" && !strings.HasPrefix(endpoint, "https://") {
+			return "", fmt.Errorf("usagePing.endpoint must be an https URL or empty, got %q", value)
+		}
+		if err := writeUsagePingField(yamlPath, "endpoint", endpoint); err != nil {
+			return "", err
+		}
+		if endpoint == "" {
+			return "endpoint cleared; no ping will be sent", nil
+		}
+		return "endpoint recorded", nil
+	default:
+		return "", fmt.Errorf("unknown config key %q", key)
+	}
+}
+
+// notifyUsagePingSet tells the running daemon about a usage-count change
+// best-effort, then reports the outcome. The daemon hot-reloads the
+// block; disabling additionally cancels any queued attempt.
+func notifyUsagePingSet(cmd *cobra.Command, factory daemonClientFactory, host string, port int, jsonOut bool, key, value, msg string) {
+	httpCfg := afclient.DefaultDaemonConfig()
+	if host != "" {
+		httpCfg.Host = host
+	}
+	if port != 0 {
+		httpCfg.Port = port
+	}
+	client := factory(httpCfg)
+	if _, err := client.SetCapacityConfig(key, value); err != nil {
+		out := cmd.OutOrStdout()
+		_, _ = fmt.Fprintf(out, "set %s=%s (%s; daemon not reachable; config written to disk)\n", key, value, msg)
+		return
+	}
+	out := cmd.OutOrStdout()
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]string{"key": key, "value": value, "message": msg})
+		return
+	}
+	_, _ = fmt.Fprintf(out, "set %s=%s: %s\n", key, value, msg)
 }
 
 // applyRepoKeeperSet records one repoKeeper.* set into the in-memory YAML.

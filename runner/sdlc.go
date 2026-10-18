@@ -188,8 +188,12 @@ var resultSensitiveWorkTypes = map[string]bool{
 // the WORK_RESULT marker. It does not grant repository mutation or imply that a
 // commit, branch, or PR is required; publication recovery must use
 // RequiresPRURL from the completion contract.
-func isResultSensitive(workType string) bool {
-	return resultSensitiveWorkTypes[workType]
+func isResultSensitive(workType string, role ...string) bool {
+	if IsKnownWorkType(workType) || len(role) == 0 {
+		return resultSensitiveWorkTypes[workType]
+	}
+	parsed, _ := ParseWorkTypeRole(role[0])
+	return parsed == WorkTypeRoleInflight || parsed == WorkTypeRoleReview
 }
 
 // shouldDeferAcceptanceTransition decides whether a passing acceptance
@@ -251,7 +255,7 @@ type PostSessionDecision struct {
 //
 // Returns a PostSessionDecision the caller acts on. Pure function — no
 // side effects.
-func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQueueAdapter bool) PostSessionDecision {
+func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQueueAdapter bool, role ...string) PostSessionDecision {
 	d := PostSessionDecision{
 		WorkType:   workType,
 		WorkResult: workResult,
@@ -266,7 +270,7 @@ func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQue
 		return d
 	}
 
-	resultSensitive := isResultSensitive(workType)
+	resultSensitive := isResultSensitive(workType, role...)
 
 	if resultSensitive {
 		// Per event-processor.ts:340-344: a session-level "failed"
