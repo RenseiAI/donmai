@@ -10,6 +10,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.81 — 2026-10-18
+
+### Chores
+
+- Preserve failed session work on reserved remote refs
+- Revert "Preserve failed session work on reserved remote refs"
+
 ## v0.72.80 — 2026-10-17
 
 ### Fixes
