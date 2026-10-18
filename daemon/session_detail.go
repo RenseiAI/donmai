@@ -118,6 +118,11 @@ type SessionDetail struct {
 	// "research", ...).
 	WorkType string `json:"workType,omitempty"`
 
+	// WorkTypeRole is the coarse behavioural bucket the work-type name
+	// belongs to ("inflight", "review", "intake", "terminal").
+	// Forwarded opaquely from the poll item onto the runner work item.
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
+
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher.
 	PromptContext string `json:"promptContext,omitempty"`

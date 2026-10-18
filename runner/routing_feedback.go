@@ -42,6 +42,27 @@ type routingRewardWeights struct {
 	qa        float64
 }
 
+// routingRewardRoleRepresentative maps a work-type role to the built-in
+// name whose weights row scores an organisation-defined name carrying
+// that role: inflight work earns the development row, review work the qa
+// row, intake work the research row. Terminal work and an absent or
+// unrecognised role fall through to the empty string, which has no row,
+// so the caller applies the historical 0.5 / 0.2 / 0.3 default. The
+// literals are the contract — they must match the WorkTypeRole constants
+// above.
+func routingRewardRoleRepresentative(role string) string {
+	switch WorkTypeRole(role) {
+	case WorkTypeRoleInflight:
+		return WorkTypeDevelopmentStr
+	case WorkTypeRoleReview:
+		return WorkTypeQAStr
+	case WorkTypeRoleIntake:
+		return WorkTypeResearch
+	default:
+		return ""
+	}
+}
+
 var routingRewardByWorkType = map[string]routingRewardWeights{
 	WorkTypeDevelopmentStr:           {0.5, 0.2, 0.3},
 	WorkTypeInflight:                 {0.5, 0.2, 0.3},
@@ -73,15 +94,21 @@ var routingRewardByWorkType = map[string]routingRewardWeights{
 //     ga-readiness, documentation-steward, operational-scanner-vercel,
 //     operational-scanner-audit, operational-scanner-ci, coordination,
 //     inflight-coordination: 1 / 0 / 0 (completion is the deliverable).
-//   - unknown types: 0.5 / 0.2 / 0.3 for backwards compatibility.
+//   - unknown types: the weights row of the role's representative built-in
+//     (inflight -> development, review -> qa, intake -> research,
+//     terminal or absent role -> the 0.5 / 0.2 / 0.3 default) for backwards
+//     compatibility.
 //
 // Non-PR work moves PR credit to completion; work without a QA verdict also
 // moves QA credit to completion. Subtract 0.1 * min(cost / $5, 1), then clamp
 // to [0,1], regardless of work type.
-func computeRoutingReward(workType string, taskCompleted, prCreated bool, qaResult string, totalCostUsd float64) float64 {
+func computeRoutingReward(workType, workTypeRole string, taskCompleted, prCreated bool, qaResult string, totalCostUsd float64) float64 {
 	weights, ok := routingRewardByWorkType[workType]
 	if !ok {
-		weights = routingRewardWeights{0.5, 0.2, 0.3}
+		weights, ok = routingRewardByWorkType[routingRewardRoleRepresentative(workTypeRole)]
+		if !ok {
+			weights = routingRewardWeights{0.5, 0.2, 0.3}
+		}
 	}
 	reward := 0.0
 	if taskCompleted {
@@ -133,7 +160,7 @@ func (r *Runner) recordRoutingFeedback(parentCtx context.Context, qw QueuedWork,
 	body := routingFeedbackBody{
 		Provider:        provider,
 		WorkType:        workType,
-		Reward:          computeRoutingReward(workType, taskCompleted, prCreated, qaResult, totalCost),
+		Reward:          computeRoutingReward(workType, qw.WorkTypeRole, taskCompleted, prCreated, qaResult, totalCost),
 		IssueIdentifier: res.IssueIdentifier,
 		TaskCompleted:   taskCompleted,
 		PRCreated:       prCreated,

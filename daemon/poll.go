@@ -96,6 +96,7 @@ type PollWorkItem struct {
 	ProviderSessionID string                  `json:"providerSessionId,omitempty"`
 	OrganizationID    string                  `json:"organizationId,omitempty"`
 	WorkType          string                  `json:"workType,omitempty"`
+	WorkTypeRole      string                  `json:"workTypeRole,omitempty"`
 	PromptContext     string                  `json:"promptContext,omitempty"`
 	Body              string                  `json:"body,omitempty"`
 	Title             string                  `json:"title,omitempty"`
@@ -1343,6 +1344,7 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		// ride the resolved profile. Every field is absent on a pre-P3 item,
 		// so the spec stays byte-identical for the existing fields (identity).
 		WorkType:              item.WorkType,
+		WorkTypeRole:          item.WorkTypeRole,
 		Mode:                  item.Mode,
 		CoAuthorName:          coAuthorName,
 		CoAuthorEmail:         coAuthorEmail,
@@ -1651,6 +1653,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		Ref:                     item.Ref,
 		BaseRef:                 item.BaseRef,
 		WorkType:                item.WorkType,
+		WorkTypeRole:            item.WorkTypeRole,
 		PromptContext:           item.PromptContext,
 		Body:                    item.Body,
 		Title:                   item.Title,

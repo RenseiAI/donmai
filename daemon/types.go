@@ -205,6 +205,12 @@ type SessionSpec struct {
 	// "kg-extraction", ...). One input to the embedder's workload derivation.
 	WorkType string `json:"workType,omitempty"`
 
+	// WorkTypeRole is the coarse behavioural bucket the work-type name
+	// belongs to ("inflight", "review", "intake", "terminal").
+	// Forwarded opaquely from the poll item; the embedder may consult it
+	// when deriving behaviour for an organisation-defined name.
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
+
 	// Mode is the run-mode discriminant ("" = headless, "interactive" =
 	// PTY-hosted interactive session, "interview" = turn-taking interview).
 	// The other input to workload derivation.
