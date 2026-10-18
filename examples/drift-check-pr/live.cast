@@ -1,0 +1,7 @@
+{"version": 2, "width": 120, "height": 24, "title": "Live drift assessment and PR comment using Donmai v0.72.74"}
+[0.0, "o", "$ donmai --version\r\n"]
+[0.211, "o", "donmai version 0.72.74\r\n"]
+[0.211, "o", "$ bash examples/drift-check-pr/comment.sh https://github.com/RenseiAI/donmai/pull/943\r\n"]
+[2.736, "o", "notice: running native diff/gate analysis (Layer 1: real PR diff via gh, pure regex, no LLM, no datastore). The Layer-2 LLM deviation pipeline is platform-owned. Set DONMAI_ARCH_BIN to opt into the legacy (DEPRECATED) TS shim.\r\nhttps://github.com/RenseiAI/donmai/pull/943#issuecomment-6169929675\r\n"]
+[3.352, "o", "$ gh api repos/RenseiAI/donmai/issues/comments/6169929675 --jq .body\r\n1 diff signal(s) detected (0 patterns, 1 conventions, 0 decisions). Native diff-only mode — run with DONMAI_ARCH_BIN for full LLM-backed drift assessment.\r\n"]
+[3.352, "o", "Exit status: 0 (assessment and comment publication completed)\r\n"]

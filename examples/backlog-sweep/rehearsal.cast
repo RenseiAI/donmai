@@ -1,0 +1,2 @@
+{"height":24,"title":"backlog-sweep offline script rehearsal","version":2,"width":120}
+[0.1,"o","OFFLINE REHEARSAL: external commands use fixtures; no live vendor or GitHub run.\r\n$ bash label.sh example/demo 42 43\r\n{\"issue\":42,\"labels\":[\"donmai\"]}\r\n{\"issue\":43,\"labels\":[\"donmai\"]}\r\n"]
