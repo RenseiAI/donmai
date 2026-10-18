@@ -32,6 +32,10 @@ type fakeHost struct {
 	script string
 	// sessionID is the id session/start echoes back.
 	sessionID string
+	// denyApproval, when true, drives the approval script with a
+	// deny-by-default bridge policy so the decision must carry the
+	// denial choice.
+	denyApproval bool
 	// resumeErr, when non-nil, is the JSON-RPC error session/resume answers.
 	resumeErr *rpcError
 	// schemaVersion overrides the handshake schema version (0 = 1).
@@ -85,6 +89,7 @@ func (fh *fakeHost) run(t *testing.T) {
 		script := fh.script
 		sessionID := fh.sessionID
 		schemaVersion := fh.schemaVersion
+		denyApproval := fh.denyApproval
 		fh.mu.Unlock()
 		if schemaVersion == 0 {
 			schemaVersion = 1
@@ -158,7 +163,7 @@ func (fh *fakeHost) run(t *testing.T) {
 					"startedNewTurn": true, "status": "accepted", "turnId": cmdID,
 				},
 			})
-			fh.emitScript(t, script, sid, cmdID)
+			fh.emitScript(t, script, sid, cmdID, denyApproval)
 		case method == "turn/interrupt" && hasID:
 			fh.replyOK(t, idRaw)
 		case method == "turn/steer" && hasID:
@@ -187,7 +192,9 @@ func (fh *fakeHost) run(t *testing.T) {
 }
 
 // emitScript plays the canned notification sequence for a script name.
-func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string) {
+// denyApproval switches the approval script to a deny-by-default bridge
+// policy with an abort-arm choice set (the live shell shape).
+func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApproval bool) {
 	t.Helper()
 	completed := func(terminal string) {
 		fh.write(t, map[string]any{
@@ -229,6 +236,21 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string) {
 		})
 		agentMsg("item-1", "hello world", 1)
 		completed("completed")
+	case "step-usage":
+		for i := 1; i <= 3; i++ {
+			fh.write(t, map[string]any{
+				"jsonrpc": "2.0", "method": "session/tokenUsage",
+				"params": map[string]any{
+					"sessionId": sid, "turnId": turnID, "modelId": "step-model",
+					"usage":      map[string]any{"inputTokens": 100, "outputTokens": 50, "cachedTokens": 99, "cacheReadTokens": 10, "cacheWriteTokens": 4, "reasoningTokens": 5},
+					"cumulative": map[string]any{"promptTokens": 100 * i, "outputTokens": 50 * i, "cacheReadTokens": 10 * i, "cacheWriteTokens": 4 * i, "cost": map[string]any{"usd": float64(i) * 0.25}},
+				},
+			})
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/completed",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "terminal": "completed"},
+		})
 	case "multi-turn":
 		fh.write(t, map[string]any{
 			"jsonrpc": "2.0", "method": "turn/started",
@@ -280,6 +302,13 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string) {
 			"jsonrpc": "2.0", "method": "turn/started",
 			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
 		})
+		// The live shell shape offers the abort arm (not denied):
+		// decline must find it. The allow script keeps the
+		// denied arm so both denial vocabularies are pinned.
+		denyChoice := map[string]any{"choiceId": "deny", "decision": "denied", "label": "Deny", "scope": "once"}
+		if denyApproval {
+			denyChoice = map[string]any{"choiceId": "abort", "decision": "abort", "label": "Abort", "scope": "once"}
+		}
 		// Present the approval BOTH ways the host does: the
 		// approval/requested notification (view fold, carries the
 		// subject + choices) and the approval/request server-request
@@ -292,7 +321,7 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string) {
 			"subject":              map[string]any{"kind": "shell", "command": "echo hi"},
 			"availableChoices": []any{
 				map[string]any{"choiceId": "allow", "decision": "approved", "label": "Allow", "scope": "once"},
-				map[string]any{"choiceId": "deny", "decision": "denied", "label": "Deny", "scope": "once"},
+				denyChoice,
 			},
 		}
 		fh.write(t, map[string]any{
@@ -312,6 +341,24 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string) {
 			agentMsg("item-2", "approved and done", 1)
 			completed("completed")
 		}()
+	case "user-input":
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/started",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
+		})
+		// The host asks the client for user input mid-turn. The
+		// handle answers `{}` (autonomous mode has no user to
+		// prompt) and records the prompt, then the turn completes.
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "userInput/request", "id": 777,
+			"params": map[string]any{
+				"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-2",
+				"itemId": "tool-9", "toolCallId": "call-9", "toolName": "ask_user",
+				"userInputId": "ui-1",
+			},
+		})
+		agentMsg("item-2", "answered without a user", 1)
+		completed("completed")
 	case "steer":
 		// The turn stays running until the client steers it, so a
 		// steer can never race the turn's completion.

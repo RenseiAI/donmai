@@ -42,10 +42,25 @@ if mode not in ('missing', 'transcript', 'subagents', 'ambiguous'):
     settings = json.loads(args[args.index('--settings') + 1])
     import subprocess
     cw = {'total_input_tokens':700, 'total_output_tokens':80}
+    if mode == 'cost-only': cw = {}
     if mode == 'context-only': cw = {'used_percentage':50, 'context_window_size':200000}
     if mode == 'zero': cw = {'total_input_tokens':0, 'total_output_tokens':0}
     if mode == 'negative': cw = {'total_input_tokens':-1, 'total_output_tokens':80}
-    subprocess.run(settings['statusLine']['command'], shell=True, input=json.dumps({'context_window':cw}).encode(), check=True)
+    subprocess.run(settings['statusLine']['command'], shell=True, input=json.dumps({'context_window':cw, 'cost':{'total_cost_usd':0.25}}).encode(), check=True)
+    if mode in ('context-only', 'zero', 'negative', 'cost-invalid', 'cost-missing', 'cost-string', 'cost-overflow'):
+        cost = {'total_cost_usd':0}
+        if mode == 'negative': cost = {'total_cost_usd':-1}
+        if mode == 'cost-invalid': cost = {'total_cost_usd':float('nan')}
+        if mode == 'cost-missing': cost = {}
+        if mode == 'cost-string': cost = {'total_cost_usd':'0.25'}
+        if mode == 'cost-overflow': cost = {'total_cost_usd':float('inf')}
+        subprocess.run(settings['statusLine']['command'], shell=True, input=json.dumps({'context_window':cw, 'cost':cost}).encode(), check=True)
+    if mode == 'two-turn':
+        # Second response shrinks the context; spend still grows. Repeated
+        # renders of the same response must not add its cumulative cost twice.
+        cw = {'total_input_tokens':300, 'total_output_tokens':20, 'used_percentage':12.5, 'context_window_size':200000}
+        for _ in range(2):
+            subprocess.run(settings['statusLine']['command'], shell=True, input=json.dumps({'context_window':cw, 'cost':{'total_cost_usd':0.75}}).encode(), check=True)
     if mode in ('malformed', 'fifo'):
         import shlex
         sidecar = pathlib.Path(shlex.split(settings['statusLine']['command'])[-1]).with_name('statusline-sidecar.json')
@@ -72,8 +87,14 @@ func TestSpawnInteractive_ExitUsageWithoutStop(t *testing.T) {
 		{name: "transcript wins over sidecar", mode: "both", want: &agent.CostData{InputTokens: 100, OutputTokens: 20, CachedInputTokens: 30, CacheWriteTokens: 40, NumTurns: 1}},
 		{name: "fallback includes subagent spend", mode: "subagents", want: &agent.CostData{InputTokens: 200, OutputTokens: 40, CachedInputTokens: 60, CacheWriteTokens: 80, NumTurns: 2}},
 		{name: "ambiguous transcript stays unknown", mode: "ambiguous"},
-		{name: "empty transcript falls back to sidecar", mode: "empty", want: &agent.CostData{InputTokens: 700, OutputTokens: 80}},
-		{name: "sidecar survives cleanup", mode: "sidecar", want: &agent.CostData{InputTokens: 700, OutputTokens: 80}},
+		{name: "empty transcript falls back to sidecar", mode: "empty", want: &agent.CostData{TotalCostUsd: 0.25}},
+		{name: "sidecar survives cleanup", mode: "sidecar", want: &agent.CostData{TotalCostUsd: 0.25}},
+		{name: "cost without context", mode: "cost-only", want: &agent.CostData{TotalCostUsd: 0.25}},
+		{name: "two-turn cumulative spend", mode: "two-turn", want: &agent.CostData{TotalCostUsd: 0.75}},
+		{name: "invalid cost stays unknown", mode: "cost-invalid"},
+		{name: "missing cost stays unknown", mode: "cost-missing"},
+		{name: "string cost stays unknown", mode: "cost-string"},
+		{name: "overflow cost stays unknown", mode: "cost-overflow"},
 		{name: "neither source stays unknown", mode: "missing"},
 		{name: "context size is not spend", mode: "context-only"},
 		{name: "zero reading stays unknown", mode: "zero"},
@@ -140,6 +161,22 @@ func TestSpawnInteractive_ExitUsageWithoutStop(t *testing.T) {
 			wrapper := h.(*interactiveHandle)
 			if _, err := os.Stat(wrapper.notices.path(stopHookTranscriptFile)); !os.IsNotExist(err) {
 				t.Fatalf("Stop locator unexpectedly exists: %v", err)
+			}
+			if tc.mode == "two-turn" {
+				raw, err := os.ReadFile(wrapper.ContextUsageSidecarPath())
+				if err != nil {
+					t.Fatal(err)
+				}
+				notice, err := agent.ParseClaudeSidecarNotice(raw, "claude")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if notice == nil || notice.InputTokens == nil || *notice.InputTokens != 300 ||
+					notice.OutputTokens == nil || *notice.OutputTokens != 20 ||
+					notice.UsedPercent == nil || *notice.UsedPercent != 12.5 ||
+					notice.ContextWindowSize == nil || *notice.ContextWindowSize != 200000 {
+					t.Fatalf("context notice = %+v; want latest response context", notice)
+				}
 			}
 			if err := h.Stop(t.Context()); err != nil {
 				t.Fatal(err)

@@ -210,8 +210,8 @@ const statusLineSidecarScriptFile = "statusline-sidecar.sh"
 // statusLineSidecarScript renders the sidecar writer. It takes the sidecar
 // path by value and bakes it in, so the command needs no environment —
 // hook processes inherit whatever the CLI hands them. The writer reads
-// only the four context_window numbers; any other input shape (or a
-// missing context_window, before the first model call) leaves the previous
+// the context_window numbers and cumulative cost.total_cost_usd. Input
+// missing both sources (before the first model call) leaves the previous
 // sidecar in place and never affects the terminal. The write rides a
 // temp-file rename so a concurrent reader never sees a half-written
 // document.
@@ -240,6 +240,9 @@ out = {}
 for key in ("used_percentage", "total_input_tokens", "total_output_tokens", "context_window_size"):
     if cw.get(key) is not None:
         out[key] = cw[key]
+cost = doc.get("cost") or {}
+if cost.get("total_cost_usd") is not None:
+    out["total_cost_usd"] = cost["total_cost_usd"]
 if not out:
     sys.exit(1)
 with open(sys.argv[1], "w") as f:
@@ -516,8 +519,8 @@ func (c *stopHookChannel) snapshotTranscriptPath() {
 // lines stamped after the session began (see transcript_usage.go). The
 // pinned snapshot path stands in for the locator once the drop is gone (the
 // terminal event fires after the session cleanup). When no transcript usage
-// materialized, the saved statusline token counts are the last resort. No
-// source reports no usage; a transcript that cannot be trusted reports an
+// materialized, the saved cumulative statusline USD cost is the last resort.
+// No source reports no usage; a transcript that cannot be trusted reports an
 // error, so the session's usage reads as unreported.
 func (c *stopHookChannel) exitUsage() (agent.CostData, error) {
 	c.mu.Lock()

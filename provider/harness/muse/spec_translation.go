@@ -49,9 +49,21 @@ func resolveModel(spec agent.Spec) string {
 }
 
 // resolveEffort maps Spec.Effort to the MSP reasoning tier. Empty (not
-// configured) leaves the tier unset so the host default applies.
+// configured) leaves the tier unset so the host default applies. The
+// "minimal" tier has no agent.EffortLevel constant (the shared ladder
+// runs low..max) but the host catalog lists it, so it is matched by its
+// wire spelling. The "default" and "none" sentinels are never
+// forwarded: an unset tier and a default tier are the same request to the
+// host (run at its default), and "none" is not a selectable tier.
+// "ultra" is a declared wire value (types.go) the shared ladder does
+// not name: it is refused loudly rather than silently degraded to the
+// host default, so a caller asking for the top tier never unknowingly
+// runs at a lower one.
 func resolveEffort(spec agent.Spec) *ReasoningEffort {
 	switch spec.Effort {
+	case agent.EffortLevel("minimal"):
+		e := ReasoningEffortMinimal
+		return &e
 	case agent.EffortLow:
 		e := ReasoningEffortLow
 		return &e
@@ -209,6 +221,16 @@ func turnStartParams(sessionID, commandID string, spec agent.Spec, input []TurnI
 // value. Each HTTP server becomes {transport:"streamableHttp",
 // mode:"optional", url, headers}; stdio servers pass through
 // {transport:"stdio", command, args, env, mode:"optional"}.
+//
+// Soft-fail vs hard-deny policy: config-time validation soft-fails
+// (a malformed entry — empty Name, missing Command/URL, unknown
+// transport — is skipped with a warning so one bad entry cannot sink
+// the session's other servers), while a missing sessionMcp capability
+// grant hard-denies the session at handshake when the session carries
+// MCP servers: without the grant the host would silently run with no
+// MCP tools, which is worse than refusing to start. Every admitted
+// server rides mode:"optional" so a single unreachable server at
+// runtime degrades that server, not the turn.
 //
 // Servers that fail validation (empty Name, missing Command/URL) are
 // skipped with a warning rather than aborting the whole map.

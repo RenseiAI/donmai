@@ -1,7 +1,9 @@
 package claude
 
 import (
+	"encoding/json"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -66,7 +68,8 @@ func (c *stopHookChannel) usageTranscriptPath() (string, bool) {
 	return found, found != ""
 }
 
-// readSidecarUsage snapshots only the reported cumulative token counts. A
+// readSidecarUsage snapshots the documented cumulative USD cost. The
+// context_window token counts describe the last response, not session spend. A
 // percentage or window size is context occupancy, not token spend. Missing,
 // malformed, impossible, and all-zero readings preserve unknown usage. The
 // sidecar is a last resort, never added to transcript totals or live events.
@@ -80,16 +83,12 @@ func (c *stopHookChannel) readSidecarUsage() agent.CostData {
 	if err != nil {
 		return agent.CostData{}
 	}
-	notice, err := agent.ParseClaudeSidecarNotice(raw, "claude")
-	if err != nil || notice == nil {
+	var doc struct {
+		TotalCostUSD float64 `json:"total_cost_usd"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil ||
+		doc.TotalCostUSD <= 0 || math.IsNaN(doc.TotalCostUSD) || math.IsInf(doc.TotalCostUSD, 0) {
 		return agent.CostData{}
 	}
-	var total agent.CostData
-	if notice.InputTokens != nil {
-		total.InputTokens = *notice.InputTokens
-	}
-	if notice.OutputTokens != nil {
-		total.OutputTokens = *notice.OutputTokens
-	}
-	return total
+	return agent.CostData{TotalCostUsd: doc.TotalCostUSD}
 }

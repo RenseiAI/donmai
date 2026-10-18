@@ -137,6 +137,7 @@ func subAgentCapAllowsNone(qw QueuedWork) bool {
 
 func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in SpecInputs, policy specToolPolicy) agent.Spec {
 	spec := agent.Spec{
+		SessionID:          strings.TrimSpace(qw.SessionID),
 		SessionName:        strings.TrimSpace(qw.SessionName),
 		Prompt:             in.Prompt,
 		Cwd:                in.Cwd,

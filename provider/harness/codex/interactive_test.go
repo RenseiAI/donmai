@@ -18,7 +18,6 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 )
 
 func TestInteractiveArgs(t *testing.T) {
@@ -1034,42 +1033,32 @@ sleep 0.1`)
 // session's own home through the runner's session-scoped seam. A session
 // that reports no home runs without context notices.
 func TestInteractiveContextHandle_ForwardsAndReports(t *testing.T) {
-	inner := &ptycli.Handle{}
-	wrapped := &interactiveContextHandle{Handle: inner, home: "/tmp/codex-home-test"}
-	// A fresh ptycli handle has no live session yet; the wrapper must not
-	// invent one — it forwards whatever the inner handle reports.
-	_ = wrapped.InteractiveSession()
-	// The ptycli handle carries no TerminalCost by default: the wrapper
-	// must not invent one (the runner's wait grace keys off it).
-	if wrapped.HasTerminalCost() {
-		t.Fatal("HasTerminalCost = true for a handle with no cost hook; want false")
-	}
-	if got := wrapped.ContextUsageSidecarPath(); got != "" {
+	// The session-scoped context source is a plain value: the unnamed
+	// path reports its own home with an empty thread until the first
+	// rollout file appears, and a homeless source reports nothing (the
+	// runner then runs that session without context notices).
+	src := newInteractiveConversationContextSource("/tmp/codex-home-test", nil)
+	if got := src.ContextUsageSidecarPath(); got != "" {
 		t.Fatalf("sidecar path = %q for the codex leg; want empty", got)
 	}
-	home, thread := wrapped.ContextUsageRollout()
+	home, thread := src.ContextUsageRollout()
 	if home != "/tmp/codex-home-test" || thread != "" {
 		t.Fatalf("rollout = (%q, %q); want (home, empty-thread)", home, thread)
 	}
-	empty := &interactiveContextHandle{}
+	empty := newInteractiveConversationContextSource("", nil)
 	if home, _ := empty.ContextUsageRollout(); home != "" {
 		t.Fatalf("homeless wrapper reported %q, want empty", home)
 	}
-	var nilHandle *interactiveContextHandle
-	if got := nilHandle.InteractiveSession(); got != nil {
-		t.Fatalf("nil handle InteractiveSession = %v; want nil", got)
+	var nilSrc *interactiveConversationContextSource
+	if home, thread := nilSrc.ContextUsageRollout(); home != "" || thread != "" {
+		t.Fatalf("nil source rollout = (%q, %q); want empties", home, thread)
 	}
-	if nilHandle.HasTerminalCost() {
-		t.Fatal("nil handle HasTerminalCost = true; want false")
-	}
-	if home, thread := nilHandle.ContextUsageRollout(); home != "" || thread != "" {
-		t.Fatalf("nil handle rollout = (%q, %q); want empties", home, thread)
-	}
-	// The seam assertions: the runner resolves and supervises through
-	// these interfaces.
-	var _ agent.InteractiveCapable = wrapped
-	var _ agent.InteractiveTerminalCostSource = wrapped
-	var _ agent.ContextUsageSourcer = wrapped
+	// The composed handle carries the same seam: spot-check through a
+	// live spawned wrapper below (see the conversation live test), and
+	// assert the type satisfies the runner's resolution interfaces.
+	var _ agent.ContextUsageSourcer = (*interactiveConversationHandle)(nil)
+	var _ agent.InteractiveTerminalCostSource = (*interactiveConversationHandle)(nil)
+	var _ agent.InteractiveCapable = (*interactiveConversationHandle)(nil)
 }
 
 // TestNamedInteractiveContextHandle_ReportsItsThread pins the named-session
@@ -1078,17 +1067,14 @@ func TestInteractiveContextHandle_ForwardsAndReports(t *testing.T) {
 func TestNamedInteractiveContextHandle_ReportsItsThread(t *testing.T) {
 	var current atomic.Value
 	current.Store("")
-	wrapped := &namedInteractiveContextHandle{
-		interactiveContextHandle: interactiveContextHandle{home: "/tmp/codex-home-named"},
-		thread:                   &current,
-	}
-	if _, thread := wrapped.ContextUsageRollout(); thread != "" {
+	src := &interactiveConversationContextSource{home: "/tmp/codex-home-named", thread: &current}
+	if _, thread := src.ContextUsageRollout(); thread != "" {
 		t.Fatalf("thread = %q before naming; want empty", thread)
 	}
 	current.Store("thread-named-1")
-	home, thread := wrapped.ContextUsageRollout()
+	home, thread := src.ContextUsageRollout()
 	if home != "/tmp/codex-home-named" || thread != "thread-named-1" {
 		t.Fatalf("rollout = (%q, %q); want (home, thread-named-1)", home, thread)
 	}
-	var _ agent.ContextUsageSourcer = wrapped
+	var _ agent.ContextUsageSourcer = (*interactiveConversationHandle)(nil)
 }

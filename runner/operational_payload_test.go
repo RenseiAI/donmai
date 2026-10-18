@@ -163,6 +163,9 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		// per spawn and they must stay OUT of the canonical projection, which
 		// is digested and compared across the wire.
 		"McpAuthToken": "daemon-runtime", "McpAuthTokenExpiresAt": "daemon-runtime",
+		// Commit credit is work-source metadata restored from the validated
+		// session detail, like the MCP bearer; it does not select execution.
+		"CoAuthorName": "daemon-runtime", "CoAuthorEmail": "daemon-runtime",
 		// RetainRecording is a LOCAL OPERATOR decision (the standalone
 		// --keep-recording flag) with json:"-" — it never rides the wire and
 		// must never influence admission evidence, so it stays out of the

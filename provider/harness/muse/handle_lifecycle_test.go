@@ -167,6 +167,45 @@ func TestResolveApprovalMode_ReadOnlyIsTightenOnly(t *testing.T) {
 	}
 }
 
+// TestHandle_ReadOnlyLaneThroughSpawn drives the read-only lane
+// through the production Spawn entry point: the session must start
+// with approvalMode denyUnmatched (tighten-only, whatever else the
+// Spec carries), and usage still folds into the terminal result.
+func TestHandle_ReadOnlyLaneThroughSpawn(t *testing.T) {
+	p, fh := newTestProvider(t, "single-turn")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{
+		Prompt:           "review this change",
+		Cwd:              t.TempDir(),
+		Autonomous:       true,
+		SandboxLevel:     agent.SandboxReadOnly,
+		PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	if res, ok := terminalResult(events); !ok || !res.Success {
+		t.Errorf("terminal result missing or failed: %+v", res)
+	}
+
+	fh.mu.Lock()
+	methods := append([]string(nil), fh.methods...)
+	params := append([]map[string]any(nil), fh.params...)
+	fh.mu.Unlock()
+	for i, m := range methods {
+		if m != "session/start" {
+			continue
+		}
+		if params[i]["approvalMode"] != string(ApprovalModeDenyUnmatched) {
+			t.Errorf("session/start approvalMode=%v, want denyUnmatched (read-only lane is tighten-only)", params[i]["approvalMode"])
+		}
+	}
+}
+
 // TestHandle_ViewGapIsNotTheTerminal keeps the recovered gap off the
 // run's failure path: the gap error continues the session and the
 // turn's ResultEvent is the only terminal.

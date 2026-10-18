@@ -1328,3 +1328,71 @@ exit %[3]d
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
+
+// TestRunBackstop_CommitTrailers reads trailers from real commits made by the
+// production backstop, including untrusted attribution supplied by callers.
+func TestRunBackstop_CommitTrailers(t *testing.T) {
+	cases := []struct {
+		name, session, author, email string
+		wantAuthor                   bool
+	}{
+		{name: "first owner", session: "session-first", author: "First Owner", email: "first" + "@" + "example.com", wantAuthor: true},
+		{name: "second owner", session: "session-second", author: "Second Owner", email: "second" + "@" + "example.com", wantAuthor: true},
+		{name: "no owner", session: "session-bot"},
+		{name: "incomplete pair", session: "session-incomplete", author: "Owner"},
+		{name: "injected name", session: "session-injection", author: "Owner\nInjected: value", email: "owner" + "@" + "example.com"},
+		{name: "invalid address", session: "session-address", author: "Owner", email: "invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			gitInit(t, repo)
+			checkout(t, repo, "feature/trailers")
+			writeFile(t, repo, "source.go", "package source\n")
+			stubGhVisibilityOnly(t, "PUBLIC")
+			qw := QueuedWork{QueuedWork: queuedWorkBase("trailers")}
+			qw.SessionID = tc.session
+			qw.CoAuthorName, qw.CoAuthorEmail = tc.author, tc.email
+			res := &Result{}
+			res.WorktreePath = repo
+			minimalRunner(t).runBackstop(context.Background(), qw, "feature/trailers", res, nil)
+			got := gitRun(t, repo, "log", "-1", "--format=%(trailers)")
+			want := ""
+			if tc.wantAuthor {
+				want = "Co-Authored-By: " + tc.author + " <" + tc.email + ">\n"
+			}
+			want += "Agent-Session: " + tc.session
+			if got != want {
+				t.Errorf("commit trailers do not match session attribution")
+			}
+		})
+	}
+}
+
+func TestRunBackstop_RejectsInvalidSessionTrailer(t *testing.T) {
+	for _, session := range []string{"", "session\nInjected: value", "session\rvalue", "session\x00value", "session value"} {
+		t.Run(fmt.Sprintf("session-%x", session), func(t *testing.T) {
+			repo := t.TempDir()
+			gitInit(t, repo)
+			// Exercise the default identity after the fixture's initial commit.
+			for _, key := range []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"} {
+				t.Setenv(key, "")
+			}
+			checkout(t, repo, "feature/trailers")
+			before := gitRun(t, repo, "rev-parse", "HEAD")
+			writeFile(t, repo, "source.go", "package source\n")
+			stubGhVisibilityOnly(t, "PUBLIC")
+			qw := QueuedWork{QueuedWork: queuedWorkBase("trailers")}
+			qw.SessionID = session
+			res := &Result{}
+			res.WorktreePath = repo
+			report := minimalRunner(t).runBackstop(context.Background(), qw, "feature/trailers", res, nil)
+			if !strings.Contains(report.Diagnostics, "invalid session trailer") {
+				t.Error("want invalid session trailer diagnostic")
+			}
+			if gitRun(t, repo, "rev-parse", "HEAD") != before || report.Pushed || report.PRCreated {
+				t.Error("invalid session trailer must prevent commit and publication")
+			}
+		})
+	}
+}

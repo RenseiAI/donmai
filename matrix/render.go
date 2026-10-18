@@ -39,6 +39,9 @@ func (b *Built) Render() (*Artifacts, error) {
 	if b == nil {
 		return nil, fmt.Errorf("render matrix: built matrix is nil")
 	}
+	if err := b.validateSubagentQualification(); err != nil {
+		return nil, fmt.Errorf("render matrix: %w", err)
+	}
 	capabilities, err := deriveCapabilityEligibilityRows(b.Realizations)
 	if err != nil {
 		return nil, fmt.Errorf("render matrix: %w", err)
@@ -87,14 +90,15 @@ func (b *Built) Render() (*Artifacts, error) {
 	// external consumers (platform, operators bumping a pin) rather than
 	// donmai's own runtime.
 	matrixDoc := struct {
-		SchemaVersion string                `json:"schemaVersion"`
-		ContractABI   string                `json:"contractAbi"`
-		GeneratedFrom string                `json:"generatedFrom"`
-		Cells         []HarnessEndpointCell `json:"cells"`
-		Denylist      []CellKey             `json:"denylist"`
-		LegacyAliases []LegacyAlias         `json:"legacyAliases"`
-		BinaryPins    []BinaryPinRow        `json:"binaryPins"`
-	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins}
+		SchemaVersion         string                     `json:"schemaVersion"`
+		ContractABI           string                     `json:"contractAbi"`
+		GeneratedFrom         string                     `json:"generatedFrom"`
+		Cells                 []HarnessEndpointCell      `json:"cells"`
+		Denylist              []CellKey                  `json:"denylist"`
+		LegacyAliases         []LegacyAlias              `json:"legacyAliases"`
+		BinaryPins            []BinaryPinRow             `json:"binaryPins"`
+		SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
+	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins, b.Matrix.SubagentQualification}
 	matrixJSON, err := marshalJSON(matrixDoc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal matrix: %w", err)

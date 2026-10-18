@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/gitexec"
@@ -171,13 +172,13 @@ func shouldExcludeFromBackstop(path string) bool {
 // workType gates the chain on the completion contract's PR obligation.
 // Result sensitivity is independent: QA/review work needs a verdict to drive
 // its transition but legitimately owes no commit, branch, or PR.
-func shouldBackstop(res *Result, workType string) bool {
+func shouldBackstop(res *Result, workType string, role ...string) bool {
 	if res == nil {
 		return false
 	}
 	// Contract gate: only work that explicitly owes a PR may enter the
 	// deterministic git backstop.
-	if !RequiresPRURL(workType) {
+	if !RequiresPRURL(workType, role...) {
 		return false
 	}
 	switch res.FailureMode {
@@ -314,6 +315,17 @@ func backstopCommitMessage(qw QueuedWork, vis backstopVisibility) string {
 	return fmt.Sprintf("Backstop: %s", qw.SessionID)
 }
 
+// backstopCommitArgs validates attribution again at the commit boundary and
+// keeps every trailer in its own argv value, without shell interpretation.
+func backstopCommitArgs(qw QueuedWork, message string) []string {
+	args := []string{"commit", "-m", message}
+	name, email := ValidateCoAuthorPair(qw.SessionID, qw.CoAuthorName, qw.CoAuthorEmail)
+	if name != "" {
+		args = append(args, "--trailer", "Co-Authored-By: "+name+" <"+email+">")
+	}
+	return append(args, "--trailer", "Agent-Session: "+qw.SessionID)
+}
+
 // backstopPRTitle composes the backstop PR title. Private repositories
 // keep the tracker identifier prefix; public or unknown-visibility
 // repositories use a neutral title with no tracker identifier — the
@@ -352,13 +364,22 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	// Keep the completion contract at the mutation boundary too. Normal callers
 	// use shouldBackstop, but a future direct caller must not turn verdict-only
 	// review output into a commit, push, or PR.
-	if !RequiresPRURL(qw.WorkType) {
+	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		return agent.BackstopReport{}
 	}
 	report := agent.BackstopReport{Triggered: true}
 	worktreePath := res.WorktreePath
 	if worktreePath == "" {
 		report.Diagnostics = "backstop skipped — no worktree path on result"
+		return report
+	}
+
+	// Validate before constructing the session-derived git identity too: a NUL
+	// in the session id would otherwise fail subprocess environment setup first.
+	if qw.SessionID == "" || strings.ContainsFunc(qw.SessionID, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r)
+	}) {
+		report.Diagnostics = "invalid session trailer"
 		return report
 	}
 
@@ -455,7 +476,8 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	}
 	if len(stagedAfter) > 0 {
 		commitMsg := backstopCommitMessage(qw, resolveVis())
-		if _, err := runGit(ctx, worktreePath, id, "commit", "-m", commitMsg); err != nil {
+		args := backstopCommitArgs(qw, commitMsg)
+		if _, err := runGit(ctx, worktreePath, id, args...); err != nil {
 			report.Diagnostics = fmt.Sprintf("git commit failed: %v", err)
 			return report
 		}
@@ -589,7 +611,7 @@ func (r *Runner) runDeclaredBackstops(
 			repositoryResult.PullRequestURL = res.PullRequestURL
 		}
 		report := agent.BackstopReport{PRURL: repositoryResult.PullRequestURL}
-		if shouldBackstop(&repositoryResult, qw.WorkType) {
+		if shouldBackstop(&repositoryResult, qw.WorkType, qw.WorkTypeRole) {
 			report = r.runBackstop(ctx, qw, branch, &repositoryResult, allowedRepositories)
 		} else if report.PRURL != "" {
 			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories)

@@ -10,7 +10,7 @@
       "contractAbi": "harness/v2",
       "capabilities": {
         "inject": true,
-        "resume": false,
+        "resume": true,
         "tools": true,
         "mcp": true,
         "allowedToolsList": true,
@@ -110,13 +110,13 @@
           "productionEligible": false
         },
         {
-          "id": "claude-code/interactive/tool-lifecycle-v1",
+          "id": "claude-code/interactive/tool-lifecycle-v2",
           "mode": "human_controlled",
           "toolPluginDelivery": "unsupported",
           "mcpDelivery": "claude_cli_mcp_config",
-          "nativeToolPolicyDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "claude_cli_allow_deny",
           "permissionConfigDelivery": "unsupported",
-          "mcpToolPolicyDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "claude_cli_allow_deny",
           "toolHookDelivery": "unsupported",
           "lifecycleDelivery": "coarse_pty_events",
           "lifecycleFidelity": "coarse",
@@ -147,7 +147,7 @@
         },
         {
           "mode": "human_controlled",
-          "toolDenyBaseline": "unavailable",
+          "toolDenyBaseline": "best_effort",
           "networkDenyBaseline": "unavailable"
         }
       ]
@@ -433,7 +433,7 @@
         "tools": true,
         "mcp": true,
         "allowedToolsList": false,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -618,7 +618,7 @@
         "tools": false,
         "mcp": true,
         "allowedToolsList": true,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -948,7 +948,7 @@
         "tools": true,
         "mcp": true,
         "allowedToolsList": true,
-        "subagents": true,
+        "subagents": false,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,

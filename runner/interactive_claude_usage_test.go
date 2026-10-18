@@ -29,7 +29,7 @@ python3 - "$@" <<'PY'
 import json, subprocess, sys
 args = sys.argv[1:]
 settings = json.loads(args[args.index('--settings') + 1])
-subprocess.run(settings['statusLine']['command'], shell=True, input=b'{"context_window":{"total_input_tokens":1200,"total_output_tokens":75}}', check=True)
+subprocess.run(settings['statusLine']['command'], shell=True, input=b'{"context_window":{"total_input_tokens":1200,"total_output_tokens":75},"cost":{"total_cost_usd":0.25}}', check=True)
 PY
 exit 0
 `
@@ -61,7 +61,7 @@ exit 0
 	if result.Cost == nil {
 		t.Fatal("runner terminal result lost sidecar usage without a Stop hook")
 	}
-	want := agent.CostData{InputTokens: 1200, OutputTokens: 75}
+	want := agent.CostData{TotalCostUsd: 0.25}
 	if *result.Cost != want {
 		t.Fatalf("Cost = %+v; want %+v", result.Cost, want)
 	}

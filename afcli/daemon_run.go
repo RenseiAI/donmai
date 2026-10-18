@@ -21,6 +21,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/mcpheaders"
@@ -415,6 +416,10 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// only the production entry point configures this seam; see
 				// Options.CodexOrphanSweeper's doc comment.
 				CodexOrphanSweeper: providercodex.SweepOrphans,
+				// The real seeded-trust crash sweep — only the production
+				// entry point configures this seam; see
+				// Options.TrustLedgerSweeper's doc comment.
+				TrustLedgerSweeper: providerclaude.SweepSeededTrustForConfigHome,
 				// The live quota probes — resolved from PATH so a host
 				// without an installed harness simply leaves that
 				// harness unprobed. See Options.QuotaProbeBinaries.
