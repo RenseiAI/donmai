@@ -116,7 +116,8 @@ type SessionDetail struct {
 
 	// WorkType is the workflow discriminant ("development", "qa",
 	// "research", ...).
-	WorkType string `json:"workType,omitempty"`
+	WorkType     string `json:"workType,omitempty"`
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher.
@@ -175,6 +176,11 @@ type SessionDetail struct {
 
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
+
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
 
 	// McpAuthToken is an opaque platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for nothing else. The daemon never parses,

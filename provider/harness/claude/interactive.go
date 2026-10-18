@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -141,16 +142,20 @@ const (
 )
 
 // wrapInteractiveHandle adds the Stop-hook pull channel and the transcript
-// usage tail to a spawned PTY handle. The usage tail reads the session's own
+// tails to a spawned PTY handle. The usage tail reads the session's own
 // transcript — located through the hook or pinned conversation id — and maps each new
 // assistant message.usage to an LlmCallEvent, so per-turn usage reaches the
-// runner's activity sink live; the terminal ResultEvent carries the deduped
-// session totals instead of the PTY's costless one.
+// runner's activity sink live; the conversation tail maps each new user
+// message, assistant text block, tool call, and tool result to the same
+// agent events the headless lane emits, so the live conversation reaches
+// the session activity stream in order. The terminal ResultEvent carries
+// the deduped session totals instead of the PTY's costless one.
 //
-// Ordering: usage the child wrote on its way out can only be read after
-// InteractiveSession().Done closes, so the final flush is enqueued strictly
-// after Done. ActivityFlushed closes once that flush is enqueued, and the
-// terminal ResultEvent is forwarded only after it.
+// Ordering: transcript writes the child made on its way out can only be
+// read after InteractiveSession().Done closes, so the final flush of BOTH
+// tails is enqueued strictly after Done. ActivityFlushed closes once those
+// flushes are enqueued, and the terminal ResultEvent is forwarded only
+// after it.
 //
 // Teardown: every helper goroutine returns at session end whether or not the
 // caller drains Events — the tailer stops on Done and never blocks, and the
@@ -180,7 +185,12 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 		}
 	}
 	var wg sync.WaitGroup
-	wg.Add(2)
+	// tailsWg covers the two transcript tailers only. ActivityFlushed
+	// closes on it — not on the whole wg — because the coarse forwarder
+	// below must observe it while it still ranges over h.Events().
+	var tailsWg sync.WaitGroup
+	tailsWg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		for event := range h.Events() {
@@ -202,9 +212,29 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 	// has exited and drained, after one final flush of trailing writes.
 	go func() {
 		defer wg.Done()
-		defer close(w.activityFlushed)
+		defer tailsWg.Done()
 		tailer := newInteractiveUsageTailer(hook)
 		tailer.run(session.Done(), emit)
+	}()
+	// Transcript conversation tail: while the session runs, its JSONL
+	// transcript is tailed and each new user message, assistant text
+	// block, tool call, and tool result is forwarded as the same agent
+	// event the headless lane emits for it, so an interactive session's
+	// live conversation reaches the session activity stream in order.
+	// Best-effort and rate-limited (see interactive_conversation.go). It
+	// stops when the PTY child has exited and drained, after one final
+	// flush of trailing writes; both flushes complete before
+	// ActivityFlushed closes, so the terminal ResultEvent still follows
+	// every delivered conversation event.
+	go func() {
+		defer wg.Done()
+		defer tailsWg.Done()
+		tailer := newInteractiveConversationTailer(hook, hook.createdAt)
+		tailer.run(session.Done(), emit)
+	}()
+	go func() {
+		tailsWg.Wait()
+		close(w.activityFlushed)
 	}()
 	go func() {
 		wg.Wait()
@@ -251,8 +281,8 @@ type interactiveHandle struct {
 	*ptycli.Handle
 	notices *stopHookChannel
 	events  chan agent.Event
-	// activityFlushed closes once the transcript tailer has enqueued its
-	// final flush (or given up on a full channel) and returned.
+	// activityFlushed closes once both transcript tailers have enqueued
+	// their final flushes (or given up on a full channel) and returned.
 	activityFlushed chan struct{}
 	// finished closes after events is closed, i.e. once every helper
 	// goroutine has returned.
@@ -309,8 +339,21 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 //	Model              → --model <id>
 //	Effort             → --effort <level>
 //	Autonomous         → --permission-mode bypassPermissions
+//	AllowedTools       → --allowedTools <comma-separated>
+//	DisallowedTools    → --disallowedTools <comma-separated>
 //	SystemPromptAppend → --append-system-prompt <text>
 //	Prompt             → positional argument, ALWAYS LAST
+//
+// The allow/deny mapping is byte-identical to buildArgs' (see
+// cli_args.go) — one convention, two spawn modes. Before it existed the
+// interactive REPL silently DROPPED Spec.AllowedTools/Spec.DisallowedTools
+// and fell back to the CLI's own default permission set, so a stamped
+// session that adapted cleanly on the headless lane denied closed on the
+// interactive lane even though the CLI honors the same flags there: the
+// flags are global session options (not --print-gated), feed the same
+// permission context the REPL's /permissions panel renders, and a live
+// interactive probe shows a stamped allow entry under Allow and a stamped
+// deny entry under Deny. The CLI simply was not being asked.
 //
 // The Autonomous mapping is deliberately byte-identical to buildArgs' (see
 // cli_args.go) — one convention, two spawn modes. Before it existed the
@@ -428,6 +471,34 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// omit it when empty so a bare interactive session stays bare.
 	if spec.SystemPromptAppend != "" {
 		argv = append(argv, "--append-system-prompt", spec.SystemPromptAppend)
+	}
+
+	// Tool policy: mirrors buildArgs' identical block (cli_args.go) so a
+	// stamped allow/deny list reaches the interactive REPL the same way it
+	// reaches a headless run of the same Spec. The REPL honors --allowedTools
+	// / --disallowedTools exactly as the headless CLI does (same permission
+	// context; the REPL's own permission panel renders the stamped entries),
+	// so this mapping is a pure pass-through of the CLI's native grammar,
+	// including the MCPToolNames merge into --allowedTools: the interactive
+	// profile declares the same MCP tool-policy delivery as headless, and a
+	// name filter stamped for one lane must reach the other.
+	allowed := make([]string, 0)
+	allowed = append(allowed, spec.AllowedTools...)
+	allowed = append(allowed, spec.MCPToolNames...)
+	allowed = dedupAndSort(allowed)
+	if len(allowed) > 0 {
+		argv = append(argv, "--allowedTools", strings.Join(allowed, ","))
+	}
+
+	// Disallowed tools always include the Linear MCP block list when
+	// the session is autonomous (matches the legacy provider and buildArgs).
+	disallowed := append([]string(nil), spec.DisallowedTools...)
+	if spec.Autonomous {
+		disallowed = append(disallowed, linearMCPDisallowList...)
+	}
+	disallowed = dedupAndSort(disallowed)
+	if len(disallowed) > 0 {
+		argv = append(argv, "--disallowedTools", strings.Join(disallowed, ","))
 	}
 
 	// Claude's interactive REPL accepts the same exact per-session MCP file as

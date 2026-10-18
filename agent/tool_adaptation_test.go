@@ -1404,6 +1404,62 @@ func TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally(t *testing
 	}
 }
 
+// TestToolLifecycleClaudeInteractiveAllowedDisallowedToolsAdmitNatively is the
+// generic-plan half of the interactive tool-lifecycle profile's declared
+// allowed/disallowed-tools delivery (sibling of pi's
+// TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally): a stamped
+// AllowedTools/DisallowedTools list now admits on the interactive PTY profile
+// with agent.ToolDeliveryClaudeCLIAllowDeny — the SAME CLI flags headless uses
+// (provider/harness/claude/interactive.go), proven on the live binary, where
+// the REPL's permission panel renders a stamped allow entry under Allow and a
+// stamped deny entry under Deny. RED proof: set the interactive profile's
+// NativeToolPolicyDelivery back to Unsupported and this admission fails closed
+// again, exactly like TestToolLifecycleAdapterUnsupportedPoliciesDeny's
+// shell/codex/ollama cases above.
+func TestToolLifecycleClaudeInteractiveAllowedDisallowedToolsAdmitNatively(t *testing.T) {
+	t.Parallel()
+	manifest := (&claude.Provider{}).Manifest()
+	spec := agent.Spec{
+		Interactive:     &agent.InteractiveSpec{},
+		AllowedTools:    []string{"Read"},
+		DisallowedTools: []string{"Bash"},
+		MCPServers:      []agent.MCPServerConfig{{Name: "tools", Command: "mcp-tools"}},
+		MCPToolNames:    []string{"mcp__tools__read"},
+	}
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeHumanControlled))
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+	}
+	if receipt.ProfileID != "claude-code/interactive/tool-lifecycle-v2" {
+		t.Fatalf("receipt profile = %q, want the bumped interactive adapter version", receipt.ProfileID)
+	}
+	wantChannels := map[agent.ToolLifecycleChannel]bool{
+		agent.ToolChannelAllowedTools:    false,
+		agent.ToolChannelDisallowedTools: false,
+		agent.ToolChannelMCPToolNames:    false,
+	}
+	for _, entry := range receipt.Entries {
+		if _, ok := wantChannels[entry.Channel]; !ok {
+			continue
+		}
+		wantChannels[entry.Channel] = true
+		if entry.Outcome != agent.ToolOutcomeAdmitted {
+			t.Errorf("%s outcome = %q, want admitted", entry.Channel, entry.Outcome)
+		}
+		if entry.Delivery != agent.ToolDeliveryClaudeCLIAllowDeny {
+			t.Errorf("%s delivery = %q, want %q", entry.Channel, entry.Delivery, agent.ToolDeliveryClaudeCLIAllowDeny)
+		}
+	}
+	for ch, seen := range wantChannels {
+		if !seen {
+			t.Errorf("receipt missing channel %q; entries=%+v", ch, receipt.Entries)
+		}
+	}
+}
+
 // --- toolSurfaceRequired: the platform's optional-delivery wire flag ---
 //
 // Spec.ToolSurfaceRequired governs what happens when the allowed/disallowed-

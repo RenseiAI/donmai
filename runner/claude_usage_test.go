@@ -174,3 +174,45 @@ func TestRun_ObservedModelAcrossFollowUps(t *testing.T) {
 		t.Errorf("posted model = %s; want the follow-up response model", got)
 	}
 }
+
+func TestRun_EmptyFinalUsagePreservesStreamedDeltas(t *testing.T) {
+	cases := []struct {
+		name       string
+		laterTotal bool
+	}{
+		{name: "ends with empty usage"},
+		{name: "later cumulative usage", laterTotal: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			platform := newRecordingPlatformServer(t)
+			turns := []verdictScriptTurn{
+				{events: []agent.Event{callUsage(100, 10)}, cost: &agent.CostData{InputTokens: 100, OutputTokens: 10, NumTurns: 1}, text: "Still working."},
+				{events: []agent.Event{callUsage(50, 5)}, cost: &agent.CostData{}, text: "WORK_RESULT: passed\nREVIEW_VERDICT: APPROVE"},
+			}
+			want := agent.CostData{InputTokens: 150, OutputTokens: 15, NumTurns: 2}
+			if tc.laterTotal {
+				turns[1].text = "Still working."
+				want = agent.CostData{InputTokens: 175, OutputTokens: 17, NumTurns: 3}
+				turns = append(turns, verdictScriptTurn{events: []agent.Event{callUsage(25, 2)}, cost: &want, text: "WORK_RESULT: passed\nREVIEW_VERDICT: APPROVE"})
+			}
+			res, _ := runScriptedSession(t, scriptedSession{workType: "qa", platform: platform, turns: turns})
+			if res.Status != "completed" {
+				t.Errorf("Status = %q; want completed", res.Status)
+			}
+			if res.Cost == nil || *res.Cost != want {
+				t.Errorf("Cost = %+v; want %+v", res.Cost, want)
+			}
+			status := platform.terminalStatus(t)
+			for key, expected := range map[string]int64{"inputTokens": want.InputTokens, "outputTokens": want.OutputTokens} {
+				var got int64
+				if err := json.Unmarshal(status[key], &got); err != nil {
+					t.Fatal(err)
+				}
+				if got != expected {
+					t.Errorf("posted %s = %d; want %d", key, got, expected)
+				}
+			}
+		})
+	}
+}

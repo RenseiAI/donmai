@@ -1,11 +1,19 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -43,6 +51,7 @@ func (f *recordingDepsExecer) recorded() []depsCall {
 func depsTestRunner(t *testing.T, execer DepsExecer) *Runner {
 	t.Helper()
 	h := newRunnerHarness(t)
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	h.runner.depsExecer = execer
 	return h.runner
 }
@@ -203,6 +212,11 @@ type orderRecordingDepsExecer struct {
 
 func (f *orderRecordingDepsExecer) Exec(_ context.Context, dir, command string, _ map[string]string) (int, error) {
 	f.log.add("exec:" + command + " dir=" + dir)
+	if strings.HasPrefix(command, "pnpm install ") {
+		if err := os.MkdirAll(filepath.Join(dir, "node_modules", ".bin"), 0o750); err != nil {
+			return -1, err
+		}
+	}
 	return 0, nil
 }
 
@@ -210,11 +224,17 @@ func (f *orderRecordingDepsExecer) Exec(_ context.Context, dir, command string, 
 // recording the Spawn call on the shared order log.
 type spawnRecordingProvider struct {
 	agent.Provider
-	log *orderLog
+	log         *orderLog
+	requireBins bool
 }
 
 func (p *spawnRecordingProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	p.log.add("spawn")
+	if p.requireBins {
+		if info, err := os.Stat(filepath.Join(spec.Cwd, "node_modules", ".bin")); err != nil || !info.IsDir() {
+			return nil, errors.New("dependency bins missing before spawn")
+		}
+	}
 	return p.Provider.Spawn(ctx, spec)
 }
 
@@ -229,6 +249,7 @@ func TestRun_InstallsDependenciesBeforeSpawn(t *testing.T) {
 		t.Skip("git not on PATH")
 	}
 	h := newRunnerHarness(t)
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	log := &orderLog{}
 	h.runner.depsExecer = &orderRecordingDepsExecer{log: log}
 
@@ -236,11 +257,12 @@ func TestRun_InstallsDependenciesBeforeSpawn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stub.New: %v", err)
 	}
-	if err := h.runner.registry.Register(&spawnRecordingProvider{Provider: stubProvider, log: log}); err != nil {
+	if err := h.runner.registry.Register(&spawnRecordingProvider{Provider: stubProvider, log: log, requireBins: true}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
 	qw := h.queuedWork("DEPS-BEFORE-SPAWN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
 	seedManifestsInBareRepo(t, h.bareRepo)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -254,15 +276,15 @@ func TestRun_InstallsDependenciesBeforeSpawn(t *testing.T) {
 	}
 
 	events := log.snapshot()
-	wantPnpm := "exec:" + pnpmDepsInstallCommand + " dir=" + res.WorktreePath
+	wantPnpm := "exec:pnpm install --prefer-offline --frozen-lockfile --ignore-scripts --ignore-pnpmfile dir=" + res.WorktreePath
 	wantGo := "exec:" + goDepsInstallCommand + " dir=" + res.WorktreePath
 	switch {
 	case len(events) != 3:
-		t.Fatalf("order log = %v; want [%q %q spawn]", events, wantPnpm, wantGo)
+		t.Fatalf("order log has %d events; want pnpm, go, spawn", len(events))
 	case events[0] != wantPnpm:
-		t.Errorf("first event = %q; want %q (pnpm runs before go)", events[0], wantPnpm)
+		t.Error("first event is not the expected pnpm command and worktree directory")
 	case events[1] != wantGo:
-		t.Errorf("second event = %q; want %q", events[1], wantGo)
+		t.Error("second event is not go mod download in the worktree directory")
 	case events[2] != "spawn":
 		t.Errorf("third event = %q; want spawn (install runs before spawn)", events[2])
 	}
@@ -276,6 +298,7 @@ func TestRun_DependencyInstallFailureStillSpawns(t *testing.T) {
 		t.Skip("git not on PATH")
 	}
 	h := newRunnerHarness(t)
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	h.runner.depsExecer = &recordingDepsExecer{exitCode: 1}
 
 	qw := h.queuedWork("DEPS-FAIL-SPAWNS")
@@ -319,5 +342,314 @@ func runGitFixture(t *testing.T, dir string, args ...string) {
 	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// A manifest fixture lets the harness render restricted levels so the test
+// reaches the install gate instead of stopping at runner preflight.
+type depsSecurityProvider struct {
+	agent.HarnessProvider
+	dimension agent.ExecutionSecurityDimension
+	level     agent.ExecutionSecurityLevel
+}
+
+func (p *depsSecurityProvider) Manifest() agent.HarnessManifest {
+	m := p.HarnessProvider.Manifest()
+	m.ExecutionSecurity.Levels = []agent.RenderedExecutionSecurityLevel{{Dimension: p.dimension, Level: p.level, Modes: []agent.PromptSessionMode{agent.PromptModeAutonomous}, Layers: []agent.EnforcingLayer{agent.LayerHarnessNative}, DenyBaseline: agent.DenyBaselineEnforced}}
+	return m
+}
+
+func TestRun_DependencyInstallSecurityGate(t *testing.T) {
+	for _, tc := range []struct {
+		dimension agent.ExecutionSecurityDimension
+		level     agent.ExecutionSecurityLevel
+	}{
+		{agent.ExecutionSecurityNetwork, agent.NetworkLogged},
+		{agent.ExecutionSecurityFileWrite, agent.FileWriteWorkarea},
+		{agent.ExecutionSecurityFileRead, agent.FileReadWorkarea},
+		{agent.ExecutionSecurityCredentials, agent.CredentialsInjectedOnly},
+		{agent.ExecutionSecurityIsolation, agent.IsolationOSSandbox},
+		{agent.ExecutionSecurityToolApproval, agent.ToolApprovalDenyList},
+	} {
+		t.Run(string(tc.dimension), func(t *testing.T) {
+			h := newRunnerHarness(t)
+			h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			fake := &recordingDepsExecer{}
+			h.runner.depsExecer = fake
+			p, err := stub.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.runner.registry.Register(&depsSecurityProvider{HarnessProvider: p.(agent.HarnessProvider), dimension: tc.dimension, level: tc.level}); err != nil {
+				t.Fatal(err)
+			}
+			qw := h.queuedWork("dependency-security")
+			qw.ExecutionSecurity = executionSecuritySection(nil)
+			switch tc.dimension {
+			case agent.ExecutionSecurityNetwork:
+				qw.ExecutionSecurity.Levels.Network = tc.level
+			case agent.ExecutionSecurityFileWrite:
+				qw.ExecutionSecurity.Levels.FileWrite = tc.level
+			case agent.ExecutionSecurityFileRead:
+				qw.ExecutionSecurity.Levels.FileRead = tc.level
+			case agent.ExecutionSecurityCredentials:
+				qw.ExecutionSecurity.Levels.Credentials = tc.level
+			case agent.ExecutionSecurityIsolation:
+				qw.ExecutionSecurity.Levels.Isolation = tc.level
+			case agent.ExecutionSecurityToolApproval:
+				qw.ExecutionSecurity.Levels.ToolApproval = tc.level
+			}
+			seedManifestsInBareRepo(t, h.bareRepo)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := h.runner.Run(ctx, qw)
+			if err != nil || res.Status != "completed" {
+				t.Fatalf("Run status=%s err=%v detail=%s", res.Status, err, res.Error)
+			}
+			if calls := fake.recorded(); len(calls) != 0 {
+				t.Fatalf("restricted session ran %d install commands", len(calls))
+			}
+		})
+	}
+}
+
+func fakeDepsBinary(t *testing.T, name, script string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fixture")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	chmod := exec.Command("chmod", "700", "fixture")
+	chmod.Dir = dir
+	if err := chmod.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, filepath.Join(dir, name)); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestDepsInstallExecer_MinimalEnvironment(t *testing.T) {
+	t.Setenv("INSTALL_PARENT_SENTINEL", "must-stay-in-parent")
+	dir := t.TempDir()
+	fakeDepsBinary(t, "go", "/usr/bin/env > child-env\n")
+	env := depsInstallEnv(QueuedWork{AuthToken: "session-secret"})
+	env["DONMAI_CONTROL_TOKEN"] = "runner-only"
+	code, err := (depsInstallExecer{}).Exec(context.Background(), dir, goDepsInstallCommand, env)
+	if err != nil || code != 0 {
+		t.Fatalf("Exec code=%d err=%v", code, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "child-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, entry := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			got[key] = value
+		}
+	}
+	// The shell fixture adds its own bookkeeping entries.
+	for _, key := range []string{"PWD", "SHLVL", "_"} {
+		delete(got, key)
+	}
+	delete(env, "DONMAI_CONTROL_TOKEN")
+	if !reflect.DeepEqual(got, env) {
+		t.Fatal("child environment differs from the minimal map")
+	}
+}
+
+func TestRun_DependencyInstallFailureLogsBoundedOutput(t *testing.T) {
+	fakeDepsBinary(t, "pnpm", "printf 'install-stdout\n'; printf 'install-stderr\n' >&2; i=0; while [ $i -lt 20000 ]; do printf x; i=$((i+1)); done; exit 1\n")
+	fakeDepsBinary(t, "go", "exit 0\n")
+	h := newRunnerHarness(t)
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logs bytes.Buffer
+	h.runner.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	qw := h.queuedWork("dependency-output")
+	seedManifestsInBareRepo(t, h.bareRepo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%s err=%v", res.Status, err)
+	}
+	output := logs.String()
+	for _, want := range []string{"install-stdout", "install-stderr", "repository dependency install failed"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("failure log missing %q", want)
+		}
+	}
+	if strings.Contains(output, strings.Repeat("x", 16*1024)) {
+		t.Fatal("failure output was not bounded")
+	}
+}
+
+func TestDepsInstallExecer_TimeoutKillsGroupAndBoundsPipeWait(t *testing.T) {
+	dir := t.TempDir()
+	fakeDepsBinary(t, "go", "echo $$ > leader; sleep 60 & echo $! > child; wait\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := (depsInstallExecer{}).Exec(ctx, dir, goDepsInstallCommand, depsInstallEnv(QueuedWork{}))
+		done <- err
+	}()
+	leader := waitDepsPID(t, filepath.Join(dir, "leader"))
+	child := waitDepsPID(t, filepath.Join(dir, "child"))
+	t.Cleanup(func() { _ = syscall.Kill(-leader, syscall.SIGKILL); _ = syscall.Kill(child, syscall.SIGKILL) })
+	started := time.Now()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Exec error=%v; want deadline exceeded", err)
+		}
+	case <-time.After(2 * depsInstallKillGrace):
+		t.Fatal("Exec held by a descendant output pipe past cancellation bound")
+	}
+	if time.Since(started) > 2*depsInstallKillGrace {
+		t.Fatal("Exec exceeded cancellation bound")
+	}
+	// ps includes zombies on Linux until init reaps them; those have already
+	// exited and cannot hold a pipe or execute work.
+	deadline := time.Now().Add(time.Second)
+	for {
+		out, err := exec.Command("ps", "-eo", "pgid=,stat=").Output()
+		if err != nil {
+			t.Fatalf("inspect install process group: %v", err)
+		}
+		alive := false
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 && fields[0] == strconv.Itoa(leader) && !strings.HasPrefix(fields[1], "Z") {
+				alive = true
+			}
+		}
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("install process group still has a live member after cancellation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitDepsPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("install child did not start")
+	return 0
+}
+
+func TestDepsInstallExecer_WaitDelayBoundsEscapedPipe(t *testing.T) {
+	dir := t.TempDir()
+	source := `package main
+import ("os"; "os/exec"; "strconv"; "syscall"; "time")
+func main() {
+ child := exec.Command("/bin/sleep", "60")
+ child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+ child.Stdout, child.Stderr = os.Stdout, os.Stderr
+ if err := child.Start(); err != nil { panic(err) }
+ if err := os.WriteFile("escaped", []byte(strconv.Itoa(child.Process.Pid)), 0600); err != nil { panic(err) }
+ time.Sleep(time.Minute)
+}
+`
+	path := filepath.Join(dir, "fixture.go")
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", "go", "fixture.go")
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build pipe fixture: %v: %s", err, out)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := (depsInstallExecer{}).Exec(ctx, dir, goDepsInstallCommand, depsInstallEnv(QueuedWork{}))
+		done <- err
+	}()
+	child := waitDepsPID(t, filepath.Join(dir, "escaped"))
+	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Exec error=%v; want deadline exceeded", err)
+		}
+	case <-time.After(2 * depsInstallKillGrace):
+		t.Fatal("Exec held by an escaped descendant pipe past deadline bound")
+	}
+}
+
+func TestRun_DependencyInstallMinimalEnvironment(t *testing.T) {
+	t.Setenv("INSTALL_PARENT_SENTINEL", "must-stay-in-parent")
+	fakeDepsBinary(t, "go", "if [ -n \"$INSTALL_PARENT_SENTINEL\" ] || [ -n \"$WORKER_AUTH_TOKEN\" ]; then exit 1; fi; printf clean > install-env-result\n")
+	fakeDepsBinary(t, "pnpm", `if [ "$*" != "install --prefer-offline --frozen-lockfile --ignore-scripts --ignore-pnpmfile" ]; then exit 1; fi
+printf safe > install-args-result
+`)
+	h := newRunnerHarness(t)
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	qw := h.queuedWork("dependency-environment")
+	seedManifestsInBareRepo(t, h.bareRepo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%s err=%v", res.Status, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(res.WorktreePath, "install-env-result"))
+	if err != nil || string(raw) != "clean" {
+		t.Fatal("production install inherited worker environment")
+	}
+	raw, err = os.ReadFile(filepath.Join(res.WorktreePath, "install-args-result"))
+	if err != nil || string(raw) != "safe" {
+		t.Fatal("production pnpm command omitted safety flags")
+	}
+}
+
+func TestRun_DependencyInstallTimeoutStillSpawns(t *testing.T) {
+	fakeDepsBinary(t, "pnpm", "sleep 60 & wait\n")
+	fakeDepsBinary(t, "go", "exit 0\n")
+	h := newRunnerHarness(t)
+	var logs bytes.Buffer
+	h.runner.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	h.runner.depsInstallTimeout = 100 * time.Millisecond
+	qw := h.queuedWork("dependency-timeout")
+	seedManifestsInBareRepo(t, h.bareRepo)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%s err=%v", res.Status, err)
+	}
+	if !strings.Contains(logs.String(), "context deadline exceeded") {
+		t.Fatal("expired install was not logged")
+	}
+}
+
+func TestDepsInstallExecer_RejectsShellCommands(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	code, err := (depsInstallExecer{}).Exec(context.Background(), dir, "go mod download; touch unexpected", nil)
+	if err == nil || code != -1 {
+		t.Fatal("unsupported command was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "unexpected")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("unsupported shell command ran")
 	}
 }

@@ -328,6 +328,100 @@ func TestHandle_ApprovalAllowThroughSpawn(t *testing.T) {
 	}
 }
 
+// TestHandle_ApprovalDeclineDecidesAbort drives the decline path
+// through Spawn: a deny-by-default bridge policy against the live
+// shell choice set (approved + abort) must send approval/decide
+// carrying the abort choice — the denial vocabulary live hosts
+// actually offer. The server-request presentation still gets only
+// its `{}` receipt (no second decide).
+func TestHandle_ApprovalDeclineDecidesAbort(t *testing.T) {
+	p, fh := newTestProvider(t, "approval")
+	fh.mu.Lock()
+	fh.denyApproval = true
+	fh.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{
+		Prompt:           "run echo",
+		Cwd:              t.TempDir(),
+		Autonomous:       true,
+		PermissionConfig: &agent.PermissionConfig{DefaultDecision: "deny"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	if res, ok := terminalResult(events); !ok || !res.Success {
+		t.Errorf("terminal result missing or failed: %+v", res)
+	}
+
+	fh.mu.Lock()
+	methods := append([]string(nil), fh.methods...)
+	params := append([]map[string]any(nil), fh.params...)
+	fh.mu.Unlock()
+	decides := 0
+	sawDecideAbort := false
+	for i, m := range methods {
+		if m != "approval/decide" {
+			continue
+		}
+		decides++
+		if params[i]["approvalId"] == "appr-1" && params[i]["choiceId"] == "abort" {
+			sawDecideAbort = true
+		}
+	}
+	if !sawDecideAbort {
+		t.Errorf("approval/decide with the abort choice never reached the host; methods=%v params=%v", methods, params)
+	}
+	if decides != 1 {
+		t.Errorf("approval/decide sent %d times, want exactly once (notification drives it; the server-request takes only the receipt)", decides)
+	}
+	// The decline must surface in the event stream as a denial.
+	sawDenied := false
+	for _, ev := range events {
+		if sys, ok := ev.(agent.SystemEvent); ok && sys.Subtype == "approval_denied" {
+			sawDenied = true
+		}
+	}
+	if !sawDenied {
+		t.Errorf("no approval_denied system event; kinds=%v", kindsOf(events))
+	}
+}
+
+// TestHandle_UserInputRequestAnsweredWithReceipt drives a
+// userInput/request server-request through Spawn: the handle must
+// answer `{}` (verified as a response on the wire is covered at the
+// client layer) and record the prompt as a user_input_requested
+// system event, then run to its terminal without stalling.
+func TestHandle_UserInputRequestAnsweredWithReceipt(t *testing.T) {
+	p, fh := newTestProvider(t, "user-input")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	if res, ok := terminalResult(events); !ok || !res.Success {
+		t.Errorf("terminal result missing or failed: %+v", res)
+	}
+	sawPrompt := false
+	for _, ev := range events {
+		if sys, ok := ev.(agent.SystemEvent); ok && sys.Subtype == "user_input_requested" {
+			sawPrompt = true
+		}
+	}
+	if !sawPrompt {
+		t.Errorf("no user_input_requested system event; kinds=%v", kindsOf(events))
+	}
+
+	_ = fh
+}
+
 // TestHandle_InjectWithoutTurnFails asserts Inject without a running
 // turn fails instead of hanging.
 func TestHandle_InjectWithoutTurnFails(t *testing.T) {
@@ -429,4 +523,50 @@ func isSessionGoneErr(err error) bool {
 		return false
 	}
 	return false
+}
+
+func TestHandle_StepUsage(t *testing.T) {
+	p, _ := newTestProvider(t, "step-usage")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	var total agent.CostData
+	calls, aggregates := 0, 0
+	for _, ev := range events {
+		call, ok := ev.(agent.LlmCallEvent)
+		if !ok {
+			continue
+		}
+		if call.UsageSource == agent.LlmUsageAggregate {
+			aggregates++
+			if !call.TurnCompleted || call.InputTokens != 300 || call.ReasoningTokens != 15 {
+				t.Errorf("aggregate=%+v", call)
+			}
+			continue
+		}
+		calls++
+		if call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted || call.Model != "step-model" || call.System != "muse" || call.InputTokens != 100 || call.OutputTokens != 50 || call.CachedInputTokens != 10 || call.CacheWriteTokens != 4 || call.ReasoningTokens != 5 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.25 {
+			t.Fatalf("step %d=%+v", calls, call)
+		}
+		total.InputTokens += call.InputTokens
+		total.OutputTokens += call.OutputTokens
+		total.CachedInputTokens += call.CachedInputTokens
+		total.CacheWriteTokens += call.CacheWriteTokens
+		total.ReasoningTokens += call.ReasoningTokens
+		total.TotalCostUsd += *call.ObservedCostUsd
+	}
+	if calls != 3 || aggregates != 1 {
+		t.Fatalf("calls=%d aggregates=%d, want 3 and 1", calls, aggregates)
+	}
+	res, ok := terminalResult(events)
+	if !ok || res.Cost == nil || !res.Success {
+		t.Fatalf("result=%+v", res)
+	}
+	if total != *res.Cost || total.TotalCostUsd != 0.75 {
+		t.Fatalf("step sum=%+v terminal=%+v", total, res.Cost)
+	}
 }

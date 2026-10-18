@@ -117,6 +117,11 @@ type QueuedWork struct {
 	// the registration store; the runner just forwards it.
 	AuthToken string `json:"-"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is the platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for NOTHING else. AuthToken remains the
 	// bearer for heartbeat, result-post, activity-post, and the session

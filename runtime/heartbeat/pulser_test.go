@@ -1618,3 +1618,43 @@ func TestPulser_SetAckObserverRebinds(t *testing.T) {
 	default:
 	}
 }
+
+func TestDispatchTraceHeaders(t *testing.T) {
+	t.Parallel()
+	const parent = "00-11111111111111111111111111111111-2222222222222222-01"
+	for _, tc := range []struct{ name, parent, state string }{
+		{name: "both", parent: parent, state: "vendor=value"},
+		{name: "parent-only", parent: parent},
+		{name: "state-only", state: "vendor=value"},
+		{name: "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var hits atomic.Int64
+			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+					if got := r.Header.Values(name); (want == "" && len(got) != 0) || (want != "" && (len(got) != 1 || got[0] != want)) {
+						t.Errorf("%s = %q, want %q (absent when empty)", name, got, want)
+					}
+				}
+				_, _ = w.Write([]byte(`{"refreshed":true}`))
+			})
+			p, err := heartbeat.New(heartbeat.Config{
+				SessionID: "session", WorkerID: "worker", BaseURL: srv.URL,
+				Traceparent: tc.parent, Tracestate: tc.state,
+				Interval: time.Hour, HTTPClient: srv.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = p.Stop() })
+			if err := p.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("requests = %d, want 1", got)
+			}
+		})
+	}
+}
