@@ -138,6 +138,9 @@ type CapabilityMatrix struct {
 	// until a passing fixture run says otherwise — so a declared resume
 	// claim can never promote itself.
 	ResumeQualification []ResumeQualificationRow `json:"resumeQualification"`
+	// SubagentQualification records executed fixtures for exact cells, adapter
+	// versions and delivery inputs. Manifest subagent claims are not evidence.
+	SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
 }
 
 // LegacyAlias is one (ProviderName → CellKey) row of the back-compat map,
@@ -170,8 +173,9 @@ type Built struct {
 	// canonicalRealizations and canonicalCapabilities bind Render to the rows
 	// produced by this Build invocation. Exported mirrors are inspectable but
 	// cannot be replaced, even with independently valid authored rows.
-	canonicalRealizations []CapabilityRealizationEvidenceRow
-	canonicalCapabilities []CapabilityEligibilityRow
+	canonicalRealizations          []CapabilityRealizationEvidenceRow
+	canonicalCapabilities          []CapabilityEligibilityRow
+	canonicalSubagentQualification []SubagentQualificationRow
 }
 
 // Build harvests the manifests, validates every hand-authored cell against
@@ -179,6 +183,8 @@ type Built struct {
 // registry plus the last gate outcomes, assembles the deterministic matrix,
 // and returns the artifacts. It is
 // pure (no network, no filesystem) and deterministic (sorted everywhere).
+// Subagent caps are computed by the shipped adapter fixture registry;
+// unproven manifest claims are ignored.
 // Returns an error for any invalid hand-authored cell so `go generate` fails
 // loudly.
 func Build() (*Built, error) {
@@ -193,6 +199,21 @@ func BuildWithCapabilityRealizations(
 	ctx context.Context,
 	realizationSources []CapabilityRealizationEvidenceSource,
 ) (*Built, error) {
+	return BuildWithSubagentFixtures(ctx, realizationSources, NativeSubagentFixtures())
+}
+
+// BuildWithSubagentFixtures executes the supplied subagent fixtures in addition
+// to capability realizations. Sources replace the native registry so a failed
+// fixture can withdraw evidence without changing a manifest. Bare pi cells
+// stay false; composing generators supply the delivery they actually loaded.
+func BuildWithSubagentFixtures(
+	ctx context.Context,
+	realizationSources []CapabilityRealizationEvidenceSource,
+	subagentSources []SubagentFixtureSource,
+) (*Built, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	harnesses, harnessByName, err := buildHarnesses()
 	if err != nil {
 		return nil, err
@@ -234,6 +255,11 @@ func BuildWithCapabilityRealizations(
 		return nil, err
 	}
 	resumeQualification := buildResumeQualification(harnessByName)
+	subagentQualification, err := compileSubagentFixtures(ctx, subagentSources, cells, harnessByName)
+	if err != nil {
+		return nil, err
+	}
+	applySubagentQualification(harnesses, cells, subagentQualification)
 
 	canonicalRealizations := cloneCapabilityRealizationEvidenceRows(realizations)
 	canonicalCapabilities := cloneCapabilityEligibilityRows(capabilities)
@@ -251,21 +277,23 @@ func BuildWithCapabilityRealizations(
 			IssueTracker:   []any{},
 			VersionControl: []any{},
 		},
-		BinaryPins:          pins,
-		Realizations:        cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
-		Capabilities:        cloneCapabilityEligibilityRows(canonicalCapabilities),
-		ResumeQualification: resumeQualification,
+		BinaryPins:            pins,
+		Realizations:          cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
+		Capabilities:          cloneCapabilityEligibilityRows(canonicalCapabilities),
+		ResumeQualification:   resumeQualification,
+		SubagentQualification: append([]SubagentQualificationRow{}, subagentQualification...),
 	}
 
 	return &Built{
-		Matrix:                m,
-		Harnesses:             harnesses,
-		Endpoints:             endpoints,
-		AliasMap:              aliases,
-		Realizations:          cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
-		Capabilities:          cloneCapabilityEligibilityRows(canonicalCapabilities),
-		canonicalRealizations: canonicalRealizations,
-		canonicalCapabilities: canonicalCapabilities,
+		Matrix:                         m,
+		Harnesses:                      harnesses,
+		Endpoints:                      endpoints,
+		AliasMap:                       aliases,
+		Realizations:                   cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
+		Capabilities:                   cloneCapabilityEligibilityRows(canonicalCapabilities),
+		canonicalRealizations:          canonicalRealizations,
+		canonicalCapabilities:          canonicalCapabilities,
+		canonicalSubagentQualification: append([]SubagentQualificationRow{}, subagentQualification...),
 	}, nil
 }
 
@@ -365,6 +393,9 @@ func buildCells(
 	out := make([]HarnessEndpointCell, 0, len(cells))
 	for _, c := range cells {
 		key := c.Key()
+		if c.EmitsSubagentEvents || (c.Caps != nil && c.Caps.EmitsSubagentEvents != nil) {
+			return nil, fmt.Errorf("cell %+v: subagent events are derived, not hand-authored", key)
+		}
 		if len(c.ProvingLanes) != 0 || c.Stability != "" || c.Smoked {
 			return nil, fmt.Errorf("cell %+v: smoke evidence is derived, not hand-authored (ProvingLanes/Stability/Smoked must be unset)", key)
 		}
@@ -553,13 +584,14 @@ func isCanonicalAuthMode(a agent.AuthMode) bool {
 }
 
 // realProviderNames is the set of ProviderName consts that name a real,
-// implemented provider (7 of them). The platform-reserved name (jules)
+// implemented provider (8 of them). The platform-reserved name (jules)
 // is intentionally absent.
 func realProviderNames() []agent.ProviderName {
 	return []agent.ProviderName{
 		agent.ProviderClaude,
 		agent.ProviderCodex,
 		agent.ProviderGemini,
+		agent.ProviderMuse,
 		agent.ProviderOllama,
 		agent.ProviderOpenCode,
 		agent.ProviderPi,

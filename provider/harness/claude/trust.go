@@ -43,6 +43,11 @@ import (
 // session-end cleanup can undo exactly that and nothing else. A directory
 // that was already trusted before the seed is in neither list: that trust
 // belongs to someone else (the operator, or another live session).
+//
+// session identifies the owning session for the on-disk ledger
+// (trust_ledger.go): it lets a later daemon sweep tell this live session's
+// entries from a crashed session's, and it is the only per-session identity
+// the ledger carries.
 type seededTrust struct {
 	// path is the trust record the seed wrote.
 	path string
@@ -56,6 +61,13 @@ type seededTrust struct {
 	// and leaves every other field on the entry as found.
 	flipped []string
 	prior   map[string]any
+	// session identifies the owning session (agent.Spec.SessionID, or a
+	// process-scoped fallback when the session carries no lifecycle id).
+	// Empty means the
+	// seed predates the ledger, or the session declined ownership — the
+	// cleanup still removes exactly dirs/flipped, but the daemon crash
+	// sweep cannot re-home the entry to a live session.
+	session string
 }
 
 // seedWorkspaceTrust records trust for exactly the session's authorized
@@ -73,7 +85,13 @@ func seedWorkspaceTrust(spec agent.Spec) *seededTrust {
 	if err != nil {
 		return nil
 	}
-	return seedTrustFile(filepath.Join(home, claudeTrustFileName), dirs)
+	seed := seedTrustFile(filepath.Join(home, claudeTrustFileName), dirs)
+	if seed == nil {
+		return nil
+	}
+	seed.session = trustLedgerOwner(spec)
+	recordSeededTrustLedger(seed)
+	return seed
 }
 
 // removeSeededTrust undoes what seed changed at session end: entries the
@@ -88,6 +106,7 @@ func removeSeededTrust(seed *seededTrust) {
 	if seed == nil || seed.path == "" || (len(seed.dirs) == 0 && len(seed.flipped) == 0) {
 		return
 	}
+	defer forgetSeededTrustLedger(seed)
 	release, ok := acquireTrustLock(seed.path)
 	if !ok {
 		return
@@ -373,6 +392,22 @@ func seedTrustFile(path string, dirs []string) *seededTrust {
 	return seed
 }
 
+// Lock interop: the CLI itself reads and writes this same record — it
+// records trust answers the operator gives at the terminal, and it rewrites
+// the whole file when it does. The seed cannot stop the CLI from writing
+// between the seed's own read and write, and the CLI does not take this
+// lock — so the merge is optimistic: it re-reads under the lock, applies
+// only its own entries, and writes through a temp-file rename, so the
+// worst case is a lost CLI-side update landing in the same window, never a
+// half-written record. The temp-file rename additionally keeps the CLI's
+// own concurrent reader from ever seeing a half-written record, and the
+// lock keeps every harness-side writer (concurrent seeds, live-path
+// cleanups, ledger rows, daemon crash sweeps) serialized with each other.
+// A per-session config home would remove the sharing entirely, but the CLI
+// resolves its home by its own rules (claudeConfigHome) and the child must
+// read the home the seed wrote — so the lock, not isolation, is the
+// coordination.
+//
 // Trust-lock tuning: the seed holds the lock for one small read plus one
 // small write (milliseconds), so a lock older than trustLockStaleAfter can
 // only belong to a dead holder. Bounded retries keep a contended spawn

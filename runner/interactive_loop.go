@@ -677,8 +677,20 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 		usage.generationIDs = collectGenerationID(usage.generationIDs, event)
 		usage.mu.Unlock()
 	}
-	if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
-		r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
+	if system, ok := event.(agent.SystemEvent); ok {
+		switch system.Subtype {
+		case "harness_state_lost":
+			r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
+			return
+		case "user_message", "turn_completed":
+			// Live conversation markers the harness tails from its own
+			// transcript: provider user turns (attribution-preserving —
+			// never the viewer's own input) and turn completion.
+			// They flow through the same activity sink as the headless
+			// lane's events.
+			r.postInteractiveEvent(ctx, worktreePath, sink, event)
+			return
+		}
 		return
 	}
 	switch e := event.(type) {

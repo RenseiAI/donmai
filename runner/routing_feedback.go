@@ -1,16 +1,8 @@
 package runner
 
-// Router-learning A2 (write side) — runner-in-box edition.
-//
-// The in-box runner has no Redis client (work arrives over the daemon's local
-// control API; results go out over HTTP via the result.Poster). So instead of
-// writing the donmai provider×workType posterior store directly, the runner
-// POSTs a routing observation to the platform, which owns the Redis write via
-// `@donmai/server`'s RedisPosteriorStore/observation store (see
-// platform/src/app/api/sessions/[id]/routing-feedback/route.ts).
-//
-// Best-effort by design: gated by ROUTING_RECORDER_ENABLED (default on), and a
-// failure never affects the session's terminal status.
+// The runner records provider/work-type observations over HTTP rather than
+// writing a posterior store directly. Recording is best-effort: failures never
+// affect the session's terminal status.
 
 import (
 	"bytes"
@@ -31,8 +23,7 @@ const (
 	maxExpectedCostUsd = 5.0
 )
 
-// routingFeedbackBody mirrors the platform handler's RoutingFeedbackRequest at
-// platform/src/app/api/sessions/[id]/routing-feedback/route.ts.
+// routingFeedbackBody is the routing observation sent to the feedback handler.
 type routingFeedbackBody struct {
 	Provider        string  `json:"provider"`
 	WorkType        string  `json:"workType"`
@@ -45,19 +36,62 @@ type routingFeedbackBody struct {
 	WallClockMs     int64   `json:"wallClockMs"`
 }
 
-// computeRoutingReward ports computeReward() from
-// donmai-libraries/packages/core/src/routing/reward.ts so the Go runner and the
-// legacy TS recorder produce comparable rewards in [0,1].
-func computeRoutingReward(taskCompleted, prCreated bool, qaResult string, totalCostUsd float64) float64 {
+type routingRewardWeights struct {
+	completed float64
+	pr        float64
+	qa        float64
+}
+
+var routingRewardByWorkType = map[string]routingRewardWeights{
+	WorkTypeDevelopmentStr:           {0.5, 0.2, 0.3},
+	WorkTypeInflight:                 {0.5, 0.2, 0.3},
+	WorkTypeMerge:                    {0.5, 0.2, 0.3},
+	WorkTypeQAStr:                    {0.7, 0, 0.3},
+	WorkTypeAcceptance:               {0.7, 0, 0.3},
+	WorkTypeResearch:                 {1, 0, 0},
+	WorkTypeBacklogCreation:          {1, 0, 0},
+	WorkTypeBacklogGroomer:           {1, 0, 0},
+	WorkTypeRefinement:               {1, 0, 0},
+	WorkTypeRefinementCoordination:   {1, 0, 0},
+	WorkTypeSecurity:                 {1, 0, 0},
+	WorkTypeImprovementLoop:          {1, 0, 0},
+	WorkTypeOutcomeAuditor:           {1, 0, 0},
+	WorkTypeGAReadiness:              {1, 0, 0},
+	WorkTypeDocumentationSteward:     {1, 0, 0},
+	WorkTypeOperationalScannerVercel: {1, 0, 0},
+	WorkTypeOperationalScannerAudit:  {1, 0, 0},
+	WorkTypeOperationalScannerCI:     {1, 0, 0},
+	WorkTypeCoordination:             {1, 0, 0},
+	WorkTypeInflightCoordination:     {1, 0, 0},
+}
+
+// computeRoutingReward scores a session using completion / PR / QA-pass weights:
+//   - development, inflight, merge: 0.5 / 0.2 / 0.3 (PR-producing work).
+//   - qa, acceptance: 0.7 / 0 / 0.3 (verdict work, no PR required).
+//   - research, backlog-creation, backlog-groomer, refinement,
+//     refinement-coordination, security, improvement-loop, outcome-auditor,
+//     ga-readiness, documentation-steward, operational-scanner-vercel,
+//     operational-scanner-audit, operational-scanner-ci, coordination,
+//     inflight-coordination: 1 / 0 / 0 (completion is the deliverable).
+//   - unknown types: 0.5 / 0.2 / 0.3 for backwards compatibility.
+//
+// Non-PR work moves PR credit to completion; work without a QA verdict also
+// moves QA credit to completion. Subtract 0.1 * min(cost / $5, 1), then clamp
+// to [0,1], regardless of work type.
+func computeRoutingReward(workType string, taskCompleted, prCreated bool, qaResult string, totalCostUsd float64) float64 {
+	weights, ok := routingRewardByWorkType[workType]
+	if !ok {
+		weights = routingRewardWeights{0.5, 0.2, 0.3}
+	}
 	reward := 0.0
 	if taskCompleted {
-		reward += 0.5
+		reward += weights.completed
 	}
 	if prCreated {
-		reward += 0.2
+		reward += weights.pr
 	}
 	if qaResult == "passed" {
-		reward += 0.3
+		reward += weights.qa
 	}
 	reward -= 0.1 * math.Min(totalCostUsd/maxExpectedCostUsd, 1)
 	return math.Max(0, math.Min(1, reward))
@@ -99,7 +133,7 @@ func (r *Runner) recordRoutingFeedback(parentCtx context.Context, qw QueuedWork,
 	body := routingFeedbackBody{
 		Provider:        provider,
 		WorkType:        workType,
-		Reward:          computeRoutingReward(taskCompleted, prCreated, qaResult, totalCost),
+		Reward:          computeRoutingReward(workType, taskCompleted, prCreated, qaResult, totalCost),
 		IssueIdentifier: res.IssueIdentifier,
 		TaskCompleted:   taskCompleted,
 		PRCreated:       prCreated,

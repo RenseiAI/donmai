@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 )
 
 // stopGracePeriod is the deadline between SIGTERM and SIGKILL on Stop.
@@ -86,6 +87,16 @@ type Handle struct {
 	// when no real process was started.
 	exited chan struct{}
 
+	// confinement is the plan a confined spawn runs under. The
+	// rendered profile must stay on disk until the confined child has
+	// exited, so the release runs when the session stops, not at
+	// spawn. Nil for an unconfined spawn. sessionDir is the
+	// caller-owned per-session scratch directory holding the tmp and
+	// cache subdirectories; removed when the session stops.
+	confinement     confinementPlan
+	sessionDir      string
+	confinementOnce sync.Once
+
 	state *mapperState
 }
 
@@ -99,6 +110,15 @@ type HandleOptions struct {
 	// EventBuffer sets the events channel buffer. Defaults to 256.
 	EventBuffer int
 }
+
+// confinementPlan is the narrow slice of *confinement.Plan this handle
+// needs (release only). It keeps the TAL narrow so unit-test handles
+// built without a provider never touch the OS boundary.
+type confinementPlan interface {
+	Release() error
+}
+
+var _ confinementPlan = (*confinement.Plan)(nil)
 
 func newHandle(p *Provider, spec agent.Spec, plan SpawnPlan, opts HandleOptions) *Handle {
 	if opts.RPCTimeout == 0 {
@@ -119,6 +139,36 @@ func newHandle(p *Provider, spec agent.Spec, plan SpawnPlan, opts HandleOptions)
 		state:            newMapperState(resolveModel(spec)),
 		decidedApprovals: make(map[string]struct{}),
 	}
+}
+
+// setConfinement attaches the plan a confined spawn runs under. The
+// rendered profile must stay on disk until the confined child has
+// exited, so the release runs when the session stops, not at spawn. A
+// nil plan (an unconfined spawn) leaves the interface nil — it is NOT
+// assigned, because a typed-nil *Plan in the interface would read
+// non-nil and panic on Release. Set before the pump starts.
+func (h *Handle) setConfinement(plan *confinement.Plan, sessionDir string) {
+	if plan != nil {
+		h.confinement = plan
+	}
+	h.sessionDir = sessionDir
+}
+
+// releaseConfinement releases the rendered profile and removes the
+// per-session scratch directory. It runs once, when the session stops
+// or the pump drains — after the confined child has exited (or at
+// least read the profile); a process already running under the profile
+// stays confined. Releasing early makes the start fail, never run
+// unconfined.
+func (h *Handle) releaseConfinement() {
+	h.confinementOnce.Do(func() {
+		if h.confinement != nil {
+			_ = h.confinement.Release()
+		}
+		if h.sessionDir != "" {
+			_ = os.RemoveAll(h.sessionDir)
+		}
+	})
 }
 
 // SessionID returns the MSP session id once session/start resolves.
@@ -202,8 +252,24 @@ func (h *Handle) failNow(err error) {
 	h.closeEvents()
 }
 
+// confinementPlan returns the session's OS confinement as the narrow
+// *confinement.Plan confineMuseArgv/confineMuseEnv take. h.confinement is
+// the interface-typed field (so unit-test handles never touch the OS
+// boundary); the assertion only succeeds for a real prepared plan.
+func (h *Handle) confinementPlan() *confinement.Plan {
+	if p, ok := h.confinement.(*confinement.Plan); ok {
+		return p
+	}
+	return nil
+}
+
 // spawnChild starts the `muse serve` subprocess and wires the JSON-RPC
-// client to its stdio.
+// client to its stdio. A non-nil confinement (set by the provider before
+// this call) wraps the argv in the session's OS boundary and binds the
+// session tmp and caches over their variables; the child then inherits
+// exactly three descriptors — the stdin/stdout/stderr pipes created below
+// — and never a descriptor open on an out-of-set file (ExtraFiles is
+// never set).
 func (h *Handle) spawnChild(workspaceRoot string, spec agent.Spec) error {
 	if h.provider != nil && h.provider.opts.skipProcess {
 		// Test path: caller wired stdin/stdout via overrides.
@@ -246,14 +312,23 @@ func (h *Handle) spawnChild(workspaceRoot string, spec agent.Spec) error {
 		}
 		args = append(args, flag)
 	}
+	// Wrap the whole serve argv in the session's confinement AFTER the
+	// lane flags are appended, so the OS boundary sits outside whatever
+	// the host enforces itself (--disable-shell --disable-write,
+	// --disable-sandbox stay on the inner argv). A nil confinement (an
+	// unconfined session) leaves argv unchanged.
+	argv, cerr := confineMuseArgv(h.confinementPlan(), append([]string{bin}, args...))
+	if cerr != nil {
+		return fmt.Errorf("muse confine command: %w", cerr)
+	}
 	// nolint:gosec // G204: bin is the resolved-from-PATH host binary.
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	configureProcessGroup(cmd)
 	cmd.Dir = cwd
 	if cmd.Dir == "" {
 		cmd.Dir = workspaceRoot
 	}
-	cmd.Env = serveEnv(os.Environ(), envExtra, spec.Env)
+	cmd.Env = confineMuseEnv(serveEnv(os.Environ(), envExtra, spec.Env), h.confinementPlan())
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("muse stdin pipe: %w", err)
@@ -305,7 +380,7 @@ func (h *Handle) handshake(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("muse initialize handshake: %w", err)
 	}
-	if _, err := checkHandshakeResult(raw); err != nil {
+	if _, err := checkHandshakeResultForPlan(raw, len(h.plan.MCPServers) > 0); err != nil {
 		return err
 	}
 	if err := h.client.Notify("initialized", map[string]any{}); err != nil {
@@ -735,6 +810,7 @@ func (h *Handle) closeEvents() {
 		h.provider.unregisterHandle(h)
 	}
 	_ = h.shutdownChild("events closed")
+	h.releaseConfinement()
 }
 
 // emit publishes an event on the events channel without blocking. If

@@ -81,8 +81,8 @@ func TestProvider_Capabilities_v0_5_0(t *testing.T) {
 	if !caps.SupportsMessageInjection {
 		t.Error("SupportsMessageInjection should be true in v0.5.0 (between-turn injection via --resume)")
 	}
-	if caps.SupportsSessionResume {
-		t.Error("SupportsSessionResume should be false in v0.5.0 (option C lands in v0.5.+)")
+	if !caps.SupportsSessionResume {
+		t.Error("SupportsSessionResume should be true (harness owns --session-id at launch; Resume continues via --resume)")
 	}
 	if caps.SupportsCodeIntelligenceEnforcement {
 		t.Error("SupportsCodeIntelligenceEnforcement should be false in v0.5.0 (no canUseTool callback)")
@@ -117,7 +117,7 @@ func TestProvider_Capabilities_v0_5_0(t *testing.T) {
 	}
 }
 
-func TestProvider_Resume_Unsupported(t *testing.T) {
+func TestProvider_Resume_EmptySessionIDIsNotAFreshSpawn(t *testing.T) {
 	t.Parallel()
 
 	p, err := New(Options{LookPath: func(string) (string, error) { return "/x", nil }})
@@ -125,12 +125,15 @@ func TestProvider_Resume_Unsupported(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	h, err := p.Resume(t.Context(), "any-session-id", agent.Spec{})
+	// An empty resume id must fail typed-not-found, never silently start
+	// a fresh conversation: the restore machine maps only this (or a
+	// proven no-conversation-found) onto fresh_primed.
+	h, err := p.Resume(t.Context(), "", agent.Spec{})
 	if h != nil {
 		t.Error("Resume: handle should be nil")
 	}
-	if !errors.Is(err, agent.ErrUnsupported) {
-		t.Errorf("Resume: error %v should wrap ErrUnsupported", err)
+	if !errors.Is(err, agent.ErrSessionNotFound) {
+		t.Errorf("Resume: error %v should wrap ErrSessionNotFound", err)
 	}
 }
 

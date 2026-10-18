@@ -335,9 +335,11 @@ func meteredTokens(c agent.CostData) int64 {
 // cost the runner reports counts each turn once, just as the token cap does.
 // Called with e.mu held.
 func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
-	if cost == nil {
+	if cost == nil || *cost == (agent.CostData{}) {
 		// No cost to reconcile: keep the per-call evidence for the next
-		// ResultEvent that carries one.
+		// ResultEvent that carries one. An empty usage object must not
+		// erase the previous total and make a later cumulative result
+		// count those calls again.
 		return 0
 	}
 	total := cost.InputTokens + cost.OutputTokens
