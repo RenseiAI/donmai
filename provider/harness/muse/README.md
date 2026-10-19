@@ -92,6 +92,25 @@ failure: logged-out signals (unauthenticated, not logged in, login
 required) vs model-not-entitled signals (does not exist or lack
 access, unauthorized, forbidden).
 
+## Host login check
+
+`CheckHostSessionLogin` proves a supported CLI is installed: one
+bounded `<binary> --version` run (5s timeout, owned process group,
+minimal env with `MUSE_NO_AUTO_UPDATE=1`, bounded output capture),
+parsed with the same parser and compared against the same
+`MinVersion` the constructor enforces. The binary resolves through
+the shared `ResolveMuseBinary` chain (explicit option, then
+`$MUSE_BIN`, then `muse` on PATH, then `~/.local/bin/muse`), so the
+check and the constructor never disagree. No network, no serve
+child, no model turn, no credential file reads.
+
+The CLI exposes no login-status command, so this is install
+evidence, not login entitlement: a host without a valid login is
+classified at the first turn instead. The daemon runs this check on
+its 5-minute quota-probe cadence and publishes the verdict on the
+heartbeat quota field as a windowless `muse-host-session` entry
+carrying `authCheck`.
+
 ## Live proof
 
 Verified live against Muse Code 1.4.6 on 2026-10-12: a read-only turn

@@ -20,13 +20,17 @@ type quotaState struct {
 	mu         sync.Mutex
 	codex      *agent.UsageLimits
 	claude     *agent.UsageLimits
+	muse       *agent.UsageLimits
 	codexAt    time.Time
 	claudeAt   time.Time
+	museAt     time.Time
 	codexPlan  string
 	codexID    string
 	claudeID   string
+	museID     string
 	codexAuth  *agent.UsageAuthCheck
 	claudeAuth *agent.UsageAuthCheck
+	museAuth   *agent.UsageAuthCheck
 }
 
 // quotaSnapshot composes the heartbeat quota field: one entry per
@@ -66,6 +70,14 @@ func (q *quotaState) snapshot() []agent.UsageAccount {
 			Provider:  agent.UsageHarnessClaude,
 			Limits:    *q.claude,
 			AuthCheck: copyAuthCheck(q.claudeAuth),
+		})
+	}
+	if q.muse != nil && q.muse.Unavailable == nil {
+		out = append(out, agent.UsageAccount{
+			ID:        q.museID,
+			Provider:  agent.UsageHarnessMuse,
+			Limits:    *q.muse,
+			AuthCheck: copyAuthCheck(q.museAuth),
 		})
 	}
 	return out
@@ -144,6 +156,37 @@ func (q *quotaState) noteClaudeUpdate(update agent.UsageLimitsUpdate, at time.Ti
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.claude = agent.ApplyUsageLimitsUpdate(q.claude, update, agent.ISOTime(at))
+}
+
+// noteMuseProbe records one muse login-check outcome: the check
+// proves a supported CLI is installed, never usage windows, so the
+// muse entry always carries an empty window set beside its verdict.
+// A verdict — ok or refused — publishes the entry outright; only a
+// read that never reached the CLI leaves the previous entry
+// untouched. Every attempt advances the probe clock, so retries stay
+// inside the 5-minute cadence even when the read fails.
+func (q *quotaState) noteMuseProbe(accountID string, probed agent.UsageLimits, at time.Time) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.museAt = at
+	if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessMuse, &probed, at); check != nil {
+		q.museAuth = check
+		q.museID = accountID
+		q.muse = &agent.UsageLimits{CheckedAt: agent.ISOTime(at), Windows: []agent.UsageWindow{}}
+	}
+}
+
+// museProbeDue reports whether the muse login check may fire now.
+func (q *quotaState) museProbeDue(now time.Time) bool {
+	if q == nil {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return agent.UsageProbeAllowed(q.museAt, now, providercodex.RateLimitsProbeInterval)
 }
 
 // codexProbeDue reports whether the codex quota probe may fire now.
