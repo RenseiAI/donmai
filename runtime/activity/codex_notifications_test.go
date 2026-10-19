@@ -19,6 +19,8 @@ func TestCodexNotificationsPostTypedActivities(t *testing.T) {
 		{"codex_moderation", "warning"},
 		{"codex_safety_buffering", "warning"},
 		{"codex_progress", "progress"},
+		{"codex_error", "error"},
+		{"codex_warning", "warning"},
 	} {
 		t.Run(tc.subtype, func(t *testing.T) {
 			t.Parallel()

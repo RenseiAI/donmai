@@ -26,6 +26,7 @@ type mapperState struct {
 	// host's cost member is the documented exception to
 	// accumulate-only: it may move either way on price re-adoption.
 	totalCostUSD   float64
+	lastCostUSD    float64
 	hasCost        bool
 	costPartial    bool
 	totalInputTok  int64
@@ -277,8 +278,10 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		OutputTokens:      out,
 		CachedInputTokens: cached,
 		FinishReason:      string(p.Terminal),
-		UsageSource:       agent.LlmUsageProvider,
+		UsageSource:       agent.LlmUsageAggregate,
 		TurnCompleted:     true,
+		CacheWriteTokens:  cacheWrite,
+		ReasoningTokens:   reasoning,
 	}
 
 	switch p.Terminal {
@@ -335,21 +338,57 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	}
 }
 
-// mapTokenUsage folds session/tokenUsage into the running totals. The
-// cumulative block is accumulate-only (except cost, which the host may
-// re-price); the host's cumulative.cost.usd is the session cost source.
+// mapTokenUsage emits step usage while retaining cumulative terminal totals.
+// Cost may be re-priced downward; only positive changes are new spend.
 func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Event {
-	var p SessionTokenUsageParams
-	_ = json.Unmarshal(params, &p)
-	state.totalInputTok = p.Cumulative.PromptTokens
-	state.totalOutputTok = p.Cumulative.OutputTokens
+	var p struct {
+		SessionTokenUsageParams
+		Usage *TokenUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil
+	}
+	usage := TokenUsage{
+		InputTokens:  max(p.Cumulative.PromptTokens-state.totalInputTok, 0),
+		OutputTokens: max(p.Cumulative.OutputTokens-state.totalOutputTok, 0),
+	}
+	cached, cacheWrite := state.totalCachedTok, state.cacheWriteTok
 	if p.Cumulative.CacheReadTokens != nil {
-		state.totalCachedTok = *p.Cumulative.CacheReadTokens
+		cached = *p.Cumulative.CacheReadTokens
 	}
 	if p.Cumulative.CacheWriteTokens != nil {
-		state.cacheWriteTok = *p.Cumulative.CacheWriteTokens
+		cacheWrite = *p.Cumulative.CacheWriteTokens
 	}
+	readDelta, writeDelta := max(cached-state.totalCachedTok, 0), max(cacheWrite-state.cacheWriteTok, 0)
+	usage.CachedTokens = readDelta
+	usage.CacheWriteTokens = &writeDelta
+	if p.Usage != nil {
+		usage = *p.Usage
+	}
+	read := usage.CachedTokens
+	if usage.CacheReadTokens != nil {
+		read = *usage.CacheReadTokens
+	}
+	write := int64(0)
+	if usage.CacheWriteTokens != nil {
+		write = *usage.CacheWriteTokens
+	}
+	state.totalInputTok = p.Cumulative.PromptTokens
+	state.totalOutputTok = p.Cumulative.OutputTokens
+	if p.Cumulative.CacheReadTokens == nil {
+		cached = state.totalCachedTok + read
+	}
+	if p.Cumulative.CacheWriteTokens == nil {
+		cacheWrite = state.cacheWriteTok + write
+	}
+	state.totalCachedTok = cached
+	state.cacheWriteTok = cacheWrite
+	state.reasoningTok += usage.ReasoningTokens
+	var observedCost *float64
 	if p.Cumulative.Cost != nil {
+		delta := max(p.Cumulative.Cost.USD-state.lastCostUSD, 0)
+		observedCost = &delta
+		state.lastCostUSD = p.Cumulative.Cost.USD
 		state.totalCostUSD = p.Cumulative.Cost.USD
 		state.hasCost = true
 		state.costPartial = p.Cumulative.Cost.Partial
@@ -357,7 +396,17 @@ func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Ev
 	if p.ModelID != nil && *p.ModelID != "" {
 		state.model = *p.ModelID
 	}
-	return nil
+	finishReason := ""
+	if p.FinishReason != nil {
+		finishReason = *p.FinishReason
+	}
+	return []agent.Event{agent.LlmCallEvent{
+		System: "muse", Model: state.model,
+		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
+		CachedInputTokens: read, CacheWriteTokens: write,
+		ReasoningTokens: usage.ReasoningTokens, FinishReason: finishReason,
+		UsageSource: agent.LlmUsageProvider, ObservedCostUsd: observedCost,
+	}}
 }
 
 // mapItemEvent handles item/started|updated|completed with the

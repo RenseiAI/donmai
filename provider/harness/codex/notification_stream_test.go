@@ -2,13 +2,19 @@ package codex
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/activity"
 )
 
 // Drive the production notification handler and consume its public Events
@@ -265,5 +271,128 @@ func TestNotificationStreamUsageKeepsReroutePrices(t *testing.T) {
 	want := calculateCostUSD(70, 30, 20, "gpt-5-codex") + calculateCostUSD(70, 30, 20, "gpt-5.3-codex")
 	if result.Cost.TotalCostUsd != want {
 		t.Fatalf("reroute repriced earlier usage: cost=%v want=%v", result.Cost.TotalCostUsd, want)
+	}
+}
+
+func TestNotificationStreamDiagnostics(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, method, params, want string }{
+		{"error_retry", "error", `{"threadId":"thread","turnId":"turn","willRetry":true,"error":{"message":"\u001b[31mRetrying\u001b[0m password=fixture-value\u0000"}}`, "Retrying password=[REDACTED]"},
+		{"error_no_retry", "error", `{"threadId":"thread","turnId":"turn","willRetry":false,"error":{"message":"\u001b[31mFailed\u001b[0m token=fixture-value"}}`, "Failed token=[REDACTED]"},
+		{"warning", "warning", `{"threadId":"thread","message":"\u001b[33mCaution\u001b[0m api_key=fixture-value\u0007"}`, "Caution api_key=[REDACTED]"},
+		{"empty_error", "error", `{"error":{"message":" "}}`, "Codex error"},
+		{"empty_warning", "warning", `{"message":" "}`, "Codex warning"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			received := make(chan struct{ Type, Content string }, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Activity struct{ Type, Content string }
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				received <- struct{ Type, Content string }{body.Activity.Type, body.Activity.Content}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			poster, err := activity.New(activity.Config{SessionID: "session", WorkerID: "worker", BaseURL: srv.URL, HTTPClient: srv.Client()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := poster.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = poster.Stop() })
+			h := notificationHandle()
+			if h.handleNotification(notification{Method: tc.method, Params: json.RawMessage(tc.params)}) {
+				t.Fatal("diagnostic terminated the handle")
+			}
+			var event agent.Event
+			select {
+			case event = <-h.Events():
+			default:
+				t.Fatal("diagnostic missing from event stream")
+			}
+			system, ok := event.(agent.SystemEvent)
+			if !ok || system.Subtype != "codex_"+tc.method || system.Message != tc.want || system.Raw != nil {
+				t.Fatalf("diagnostic = %+v", event)
+			}
+			select {
+			case <-h.Events():
+				t.Fatal("diagnostic emitted extra events")
+			default:
+			}
+			poster.Send(context.Background(), event)
+			select {
+			case got := <-received:
+				if got.Type != tc.method || got.Content != tc.want {
+					t.Fatalf("activity = %+v", got)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("diagnostic missing from activity POST")
+			}
+			// Both successful and failed turns must still be decided by completion.
+			for _, status := range []string{"completed", "failed", "interrupted"} {
+				completion := `{"turn":{"id":"turn","status":"` + status + `","error":{"message":"completion failure"}}}`
+				observed := notificationHandle()
+				if observed.handleNotification(notification{Method: tc.method, Params: json.RawMessage(tc.params)}) {
+					t.Fatal("diagnostic terminated turn")
+				}
+				<-observed.Events()
+				got := dispatch(t, observed, "turn/completed", completion)
+				want := dispatch(t, notificationHandle(), "turn/completed", completion)
+				if len(got) != 2 || len(want) != 2 || !reflect.DeepEqual(got[1], want[1]) {
+					t.Fatalf("%s outcome changed: got %+v, want %+v", status, got, want)
+				}
+			}
+		})
+	}
+	for _, method := range []string{"error", "warning"} {
+		for _, params := range []string{`{`, `{"message":123}`, `{"error":{"message":123}}`} {
+			if got := dispatch(t, notificationHandle(), method, params); len(got) != 0 {
+				t.Fatalf("malformed diagnostic emitted %+v", got)
+			}
+		}
+	}
+}
+
+func TestNotificationStreamGlobalWarnings(t *testing.T) {
+	t.Parallel()
+	client := NewClient(io.Discard, strings.NewReader(""))
+	first, second := notificationHandle(), notificationHandle()
+	provider := &Provider{client: client, handles: map[*Handle]struct{}{first: {}, second: {}}}
+	provider.forwardRateLimitUpdates()
+	client.Subscribe("first", func(n notification) { first.notifyCh <- n })
+	for _, params := range []string{`{"message":"global warning"}`, `{"threadId":null,"message":"global warning"}`} {
+		client.dispatchNotification(rpcInbound{Method: "warning", Params: json.RawMessage(params)}, false)
+		for _, h := range []*Handle{first, second} {
+			select {
+			case n := <-h.notifyCh:
+				got := dispatch(t, h, n.Method, string(n.Params))
+				if len(got) != 1 || got[0].(agent.SystemEvent).Message != "global warning" {
+					t.Fatalf("global warning = %+v", got)
+				}
+			default:
+				t.Fatal("global warning not delivered")
+			}
+		}
+	}
+	client.dispatchNotification(rpcInbound{Method: "warning", Params: json.RawMessage(`{"threadId":"first","message":"targeted warning"}`)}, false)
+	select {
+	case <-first.notifyCh:
+	default:
+		t.Fatal("targeted warning missing")
+	}
+	for _, method := range []string{"error", "warning"} {
+		client.dispatchNotification(rpcInbound{Method: method, Params: json.RawMessage(`{"threadId":"unknown","message":"other thread"}`)}, false)
+	}
+	for _, h := range []*Handle{first, second} {
+		select {
+		case n := <-h.notifyCh:
+			t.Fatalf("cross-thread diagnostic: %+v", n)
+		default:
+		}
 	}
 }

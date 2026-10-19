@@ -236,6 +236,21 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 		})
 		agentMsg("item-1", "hello world", 1)
 		completed("completed")
+	case "step-usage":
+		for i := 1; i <= 3; i++ {
+			fh.write(t, map[string]any{
+				"jsonrpc": "2.0", "method": "session/tokenUsage",
+				"params": map[string]any{
+					"sessionId": sid, "turnId": turnID, "modelId": "step-model",
+					"usage":      map[string]any{"inputTokens": 100, "outputTokens": 50, "cachedTokens": 99, "cacheReadTokens": 10, "cacheWriteTokens": 4, "reasoningTokens": 5},
+					"cumulative": map[string]any{"promptTokens": 100 * i, "outputTokens": 50 * i, "cacheReadTokens": 10 * i, "cacheWriteTokens": 4 * i, "cost": map[string]any{"usd": float64(i) * 0.25}},
+				},
+			})
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/completed",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "terminal": "completed"},
+		})
 	case "multi-turn":
 		fh.write(t, map[string]any{
 			"jsonrpc": "2.0", "method": "turn/started",

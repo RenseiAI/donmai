@@ -10,6 +10,59 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.82 — 2026-10-19
+
+### Features
+
+- Honor roles for custom work completion
+
+### Chores
+
+- Name the loopback live proof as the write-proxy check in its comment
+- Add three showcase workflow examples and script recordings
+- Bound consecutive pi output-limit turns
+- Redact commit identity diagnostics and verify brand rejection
+- Add structured tracker list filters and archive options
+- Surface Codex diagnostics in session activity
+- Spike alternate snapshot authority behind the terminal seam
+- Default PTY children to a UTF-8 locale when none is set
+
+## v0.72.81 — 2026-10-18
+
+### Chores
+
+- Preserve failed session work on reserved remote refs
+- Revert "Preserve failed session work on reserved remote refs"
+
+## v0.72.80 — 2026-10-17
+
+### Fixes
+
+- Emit per-step token usage and cost deltas
+
+### Chores
+
+- Add clone commit co-author hook
+- Score routing rewards by session work type
+- Stream live conversation events from interactive harness transcripts
+
+## v0.72.79 — 2026-10-16
+
+### Fixes
+
+- Expose nullable issue estimates
+- Add attribution trailers to backstop commits
+
+## v0.72.78 — 2026-10-15
+
+### Chores
+
+- Declare interactive native tool-policy delivery for the claude harness
+- Seeded-trust hardening: crash sweep, lock interop, pi/codex checks, live-CLI smoke
+- Backstop: b257b597-8def-4587-8ad5-f8528d3b46a1
+- Serve harness: inline MCP grant policy, approval decline path, read-only proof, usage and auth typing
+- Revert the pre-spawn execution security report gate until the controller accepts it
+
 ## v0.72.77 — 2026-10-15
 
 ### Chores

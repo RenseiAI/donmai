@@ -203,6 +203,8 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		_ = json.Unmarshal(params, &p)
 		return []agent.Event{agent.SystemEvent{Subtype: "plan_updated", Message: string(p.Plan), Raw: raw}}
 
+	case "error", "warning":
+		return mapDiagnostic(method, params)
 	case "thread/tokenUsage/updated":
 		return mapTokenUsageUpdated(params, state, raw)
 	case "model/rerouted", "turn/moderationMetadata", "model/safetyBuffering/updated":

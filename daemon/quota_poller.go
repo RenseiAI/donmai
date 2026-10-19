@@ -9,6 +9,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
+	providermuse "github.com/RenseiAI/donmai/provider/harness/muse"
 )
 
 // quotaProbes builds the live probes for the harnesses the operator
@@ -29,6 +30,9 @@ func (d *Daemon) quotaProbes() map[string]quotaProbeFunc {
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessClaude]; bin != "" {
 		probes[agent.UsageHarnessClaude] = claudeQuotaProbe(bin)
+	}
+	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessMuse]; bin != "" {
+		probes[agent.UsageHarnessMuse] = museQuotaProbe(bin)
 	}
 	return probes
 }
@@ -59,6 +63,10 @@ func (q *quotaState) quotaProbeDueAt(harness string, now time.Time) time.Time {
 	switch harness {
 	case agent.UsageHarnessCodex:
 		last = q.codexAt
+	case agent.UsageHarnessClaude:
+		last = q.claudeAt
+	case agent.UsageHarnessMuse:
+		last = q.museAt
 	default:
 		last = q.claudeAt
 	}
@@ -135,11 +143,46 @@ func claudeQuotaProbe(binary string) quotaProbeFunc {
 	}
 }
 
+// museHostSessionAccountID is the opaque account identity the muse
+// login check publishes. The check proves a supported CLI is
+// installed, never who signed in, so the id names the host session
+// slot rather than an account.
+const museHostSessionAccountID = "muse-host-session"
+
+// museQuotaProbe returns the probe that checks the host's muse CLI:
+// resolve the binary through the shared harness resolver, then run
+// the host login check. The CLI exposes no usage read and reports no
+// windows on a cold host, so the entry carries an empty window set
+// beside its verdict. An unresolvable binary disables the probe like
+// the codex one: the attempt records nothing and the heartbeat keeps
+// omitting the muse entry.
+//
+// The check runs under context.Background(), not the per-attempt ctx:
+// a cancelled attempt must not record a false ok:false verdict, so
+// the probe always runs to its own 5 s bound and a stopping poller
+// waits it out instead of publishing the cancellation as a refusal.
+func museQuotaProbe(binary string) quotaProbeFunc {
+	return func(_ context.Context, q *quotaState) {
+		at := time.Now()
+		if binary == "" {
+			q.noteMuseProbe("", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request."), at)
+			return
+		}
+		probed := agent.MakeUsageLimits(agent.ISOTime(at), nil)
+		if err := providermuse.CheckHostSessionLogin(context.Background(), binary); err != nil {
+			out := agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
+			out.Unavailable.Answered = true
+			probed = out
+		}
+		q.noteMuseProbe(museHostSessionAccountID, probed, at)
+	}
+}
+
 // quotaPoller runs the daemon's live quota reads: one codex
-// `account/rateLimits/read` and one claude usage read per probe
-// interval, each fed into the quota cache behind the heartbeat quota
-// field. Lifecycle mirrors the other daemon services: Start is
-// idempotent, Stop cancels the goroutine.
+// `account/rateLimits/read`, one claude usage read and one muse login
+// check per probe interval, each fed into the quota cache behind the
+// heartbeat quota field. Lifecycle mirrors the other daemon services:
+// Start is idempotent, Stop cancels the goroutine.
 type quotaPoller struct {
 	quota  *quotaState
 	probes map[string]quotaProbeFunc
@@ -257,6 +300,8 @@ func (p *quotaPoller) probeDue(ctx context.Context) {
 			due = p.quota.codexProbeDue(now)
 		case agent.UsageHarnessClaude:
 			due = p.quota.claudeProbeDue(now)
+		case agent.UsageHarnessMuse:
+			due = p.quota.museProbeDue(now)
 		default:
 			continue
 		}

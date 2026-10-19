@@ -6,6 +6,11 @@
 agent fleets. The single binary runs the local daemon, dispatches work, manages
 agent sessions, and exposes code intelligence without a hosted control plane.
 
+Try the [showcase workflows](./examples/README.md):
+[backlog sweep](./examples/backlog-sweep/README.md),
+[second opinion](./examples/second-opinion/README.md), and
+[drift check on a PR](./examples/drift-check-pr/README.md).
+
 **Binary**: `donmai`
 **Module**: `github.com/RenseiAI/donmai`
 
