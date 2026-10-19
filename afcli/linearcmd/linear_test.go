@@ -1332,7 +1332,7 @@ func TestLinearListIssuesManualOrderPreservesNativeOrder(t *testing.T) {
 		}
 	})
 
-	out, err := runLinearCmd(t, "", "list-issues", "--project", "TestProject", "--limit", "2", "--order-by", "manual")
+	out, err := runLinearCmd(t, "", "list-issues", "--project", "TestProject", "--limit", "2", "--order-by", "manual", "--full")
 	if err != nil {
 		t.Fatalf("list-issues manual failed: %v\nout: %s", err, out)
 	}
@@ -4036,4 +4036,222 @@ func (s assigneeResolverStub) GetUserByNameOrEmail(_ context.Context, nameOrEmai
 
 func (s assigneeResolverStub) GetViewer(context.Context) (*linear.User, error) {
 	return s.viewer, nil
+}
+
+// ─── cheap-default field selection ───────────────────────────────────────────
+
+// fieldSelectionFixture serves one list-issues page and one get-issue object
+// with every selectable column populated, so selection tests can distinguish
+// "column omitted by selection" from "column absent upstream".
+func fieldSelectionFixture(t *testing.T) {
+	t.Helper()
+	issue := issueNodeJSON("issue-1", "ENG-1", "First", "Backlog", "team-1", "ENG", "Engineering")
+	issue = strings.Replace(issue, `"parent":null`, `"parent":{"id":"parent-1","identifier":"ENG-0"}`, 1)
+	issue = strings.Replace(issue, `"assignee":null`, `"assignee":{"id":"user-1","name":"Assignee","email":"assignee@example.com"}`, 1)
+	issue = strings.Replace(issue, `"priority":2,`, `"priority":2,"estimate":3,`, 1)
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		switch {
+		case strings.Contains(req.Query, "ListIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, issue))
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+}
+
+func issueKeys(row map[string]any) map[string]bool {
+	keys := make(map[string]bool, len(row))
+	for key := range row {
+		keys[key] = true
+	}
+	return keys
+}
+
+func TestLinearListIssuesDefaultsToSlimFields(t *testing.T) {
+	fieldSelectionFixture(t)
+
+	out, err := runLinearCmd(t, "", "list-issues")
+	if err != nil {
+		t.Fatalf("list-issues failed: %v\nout: %s", err, out)
+	}
+	env := decodeJSON(t, out)
+	arr, _ := env["issues"].([]any)
+	if len(arr) != 1 {
+		t.Fatalf("got %d issues, want 1", len(arr))
+	}
+	row := arr[0].(map[string]any)
+	keys := issueKeys(row)
+	for _, want := range []string{"id", "title", "status", "project", "sortOrder", "labels", "parentId", "parentIdentifier"} {
+		if !keys[want] {
+			t.Errorf("slim row missing %q: %#v", want, row)
+		}
+	}
+	for _, dropped := range []string{"priority", "estimate", "assignee", "createdAt"} {
+		if keys[dropped] {
+			t.Errorf("slim row carries expensive %q: %#v", dropped, row)
+		}
+	}
+	// The parent reference arrives as the id/identifier pair.
+	if row["parentId"] != "parent-1" || row["parentIdentifier"] != "ENG-0" {
+		t.Errorf("slim parent = %v/%v, want parent-1/ENG-0", row["parentId"], row["parentIdentifier"])
+	}
+	// The envelope echoes the effective column set and the page-50 default.
+	fields, _ := env["fields"].([]any)
+	var names []string
+	for _, field := range fields {
+		names = append(names, field.(string))
+	}
+	if strings.Join(names, ",") != "id,title,status,project,sortOrder,parent,labels" {
+		t.Errorf("envelope fields = %v, want the slim set", names)
+	}
+	if env["limit"] != float64(50) {
+		t.Errorf("limit = %v, want the page-50 default", env["limit"])
+	}
+}
+
+func TestLinearListIssuesFieldSelection(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		want   []string
+		absent []string
+	}{
+		{name: "explicit subset", args: []string{"--fields", "id,assignee,createdAt"}, want: []string{"id", "assignee", "createdAt"}, absent: []string{"title", "status", "priority", "estimate", "sortOrder", "labels", "project", "parentId", "parentIdentifier"}},
+		{name: "estimate opt-in", args: []string{"--fields", "id,estimate"}, want: []string{"id", "estimate"}, absent: []string{"title", "priority"}},
+		{name: "full flag", args: []string{"--full"}, want: []string{"id", "title", "status", "priority", "sortOrder", "estimate", "labels", "project", "assignee", "createdAt", "parentId", "parentIdentifier"}, absent: nil},
+		{name: "parent expands", args: []string{"--fields", "id,parent"}, want: []string{"id", "parentId", "parentIdentifier"}, absent: []string{"title"}},
+		{name: "case tolerant", args: []string{"--fields", "ID,Title"}, want: []string{"id", "title"}, absent: []string{"status"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fieldSelectionFixture(t)
+
+			out, err := runLinearCmd(t, "", append([]string{"list-issues"}, tt.args...)...)
+			if err != nil {
+				t.Fatalf("list-issues %v failed: %v\nout: %s", tt.args, err, out)
+			}
+			env := decodeJSON(t, out)
+			arr, _ := env["issues"].([]any)
+			if len(arr) != 1 {
+				t.Fatalf("got %d issues, want 1", len(arr))
+			}
+			row := arr[0].(map[string]any)
+			keys := issueKeys(row)
+			for _, want := range tt.want {
+				if !keys[want] {
+					t.Errorf("row missing %q: %#v", want, row)
+				}
+			}
+			for _, absent := range tt.absent {
+				if keys[absent] {
+					t.Errorf("row carries unselected %q: %#v", absent, row)
+				}
+			}
+		})
+	}
+}
+
+func TestLinearListIssuesRejectsUnknownFieldsBeforeIO(t *testing.T) {
+	requests := 0
+	setupLinearTest(t, func(http.ResponseWriter, *http.Request) { requests++ })
+
+	_, err := runLinearCmd(t, "", "list-issues", "--fields", "id,nope")
+	if err == nil || !strings.Contains(err.Error(), `unknown field "nope"`) {
+		t.Fatalf("error = %v, want unknown-field error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("network requests = %d, want 0", requests)
+	}
+}
+
+func TestLinearGetIssueFieldSelection(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		want   []string
+		absent []string
+	}{
+		{name: "default stays full", args: nil, want: []string{"id", "identifier", "title", "description", "url", "status", "team", "project", "labels", "parentId", "parentIdentifier", "priority", "sortOrder", "estimate", "createdAt", "updatedAt"}, absent: nil},
+		{name: "explicit subset", args: []string{"--fields", "identifier,title,status"}, want: []string{"identifier", "title", "status"}, absent: []string{"id", "description", "url", "team", "project", "labels", "parentId", "parentIdentifier", "priority", "sortOrder", "estimate", "createdAt", "updatedAt"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fieldSelectionFixture(t)
+
+			out, err := runLinearCmd(t, "", append([]string{"get-issue", "ENG-1"}, tt.args...)...)
+			if err != nil {
+				t.Fatalf("get-issue %v failed: %v\nout: %s", tt.args, err, out)
+			}
+			result := decodeJSON(t, out)
+			keys := issueKeys(result)
+			for _, want := range tt.want {
+				if !keys[want] {
+					t.Errorf("object missing %q: %#v", want, result)
+				}
+			}
+			for _, absent := range tt.absent {
+				if keys[absent] {
+					t.Errorf("object carries unselected %q: %#v", absent, result)
+				}
+			}
+			if len(keys) != len(tt.want) {
+				t.Errorf("object keys = %v, want exactly %v", keys, tt.want)
+			}
+		})
+	}
+}
+
+func TestLinearGetIssueRejectsUnknownFieldsBeforeIO(t *testing.T) {
+	requests := 0
+	setupLinearTest(t, func(http.ResponseWriter, *http.Request) { requests++ })
+
+	_, err := runLinearCmd(t, "", "get-issue", "ENG-1", "--fields", "identifier,nope")
+	if err == nil || !strings.Contains(err.Error(), `unknown field "nope"`) {
+		t.Fatalf("error = %v, want unknown-field error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("network requests = %d, want 0", requests)
+	}
+}
+
+func TestResolveListIssueColumns(t *testing.T) {
+	tests := []struct {
+		name    string
+		fields  string
+		full    bool
+		want    string
+		wantErr string
+	}{
+		{name: "default is slim", want: "id,title,status,project,sortOrder,parent,labels"},
+		{name: "blank is slim", fields: "  ", want: "id,title,status,project,sortOrder,parent,labels"},
+		{name: "subset", fields: "id,title", want: "id,title"},
+		{name: "full flag", full: true, want: "id,title,status,priority,sortOrder,estimate,labels,project,assignee,createdAt,parent"},
+		{name: "full wins over fields", fields: "id", full: true, want: "id,title,status,priority,sortOrder,estimate,labels,project,assignee,createdAt,parent"},
+		{name: "unknown fails", fields: "id,nope", wantErr: `unknown field "nope"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveListIssueColumns(tt.fields, tt.full)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if strings.Join(got, ",") != tt.want {
+				t.Errorf("columns = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
