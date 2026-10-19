@@ -4,6 +4,7 @@ import (
 	"context"
 	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -394,40 +395,139 @@ func TestWorkTypeRoleVerifierBuilt(t *testing.T) {
 }
 
 // TestWorkTypeRoleDeclaredMissingPR pins the per-mutable-repo missing-PR
-// gate: a declared custom inflight session whose mutable repository gains
-// no pull request lists that repository as missing, while the same session
-// without a role lists none. The loop's missingPRs gate consults this list,
-// so dropping the role there skips the contract failure for role-carrying
-// work; the second assertion goes RED on that mutant.
+// gate through a full Run: a declared custom inflight session whose
+// mutable repository gains no pull request fails with FailureBackstop.
+// Dropping the role at the loop's missingPRs gate skips the contract
+// failure for role-carrying work, so this test goes RED on that mutant.
+// The session writes one file but never pushes or opens a pull request,
+// so the single mutable repository stays missing; the backstop is
+// disabled so the failure can only come from the missing-PR gate.
 func TestWorkTypeRoleDeclaredMissingPR(t *testing.T) {
-	work := queuedWorkBase("ROLE-DECLARED-MISSING")
-	work.WorkType, work.WorkTypeRole = "chief-of-staff", "inflight"
-	qw := QueuedWork{QueuedWork: work}
-	declaration, err := (workarea.RepositoryDeclarationV1{
-		Protocol: workarea.ProtocolSessionRootV1,
-		Repositories: []workarea.DeclaredRepositoryV1{
-			{Source: workarea.RepositorySource{Repository: "https://github.com/example/project.git"}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+	bare := githubRepositoryFixture(t, "https://github.com/example/project.git")
+	_ = bare
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:     "chief-of-staff",
+		workTypeRole: "inflight",
+		declaration: &workarea.RepositoryDeclarationV1{
+			Protocol: workarea.ProtocolSessionRootV1,
+			Repositories: []workarea.DeclaredRepositoryV1{
+				{Source: workarea.RepositorySource{Repository: "https://github.com/example/project.git"}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			},
 		},
-	}).Normalize()
-	if err != nil {
-		t.Fatal(err)
+		turns: []verdictScriptTurn{{
+			text:  "Work done.\nWORK_RESULT: passed",
+			files: map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
 	}
-	res := &Result{}
-	res.Status = "completed"
-	// Mirror the loop's missing-PR gate: the missing list is consulted only
-	// when the role says a pull request is owed.
-	missing := []string(nil)
-	if RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
-		missing = missingMutablePullRequests(res, declaration)
+	if !strings.Contains(res.Error, "completion contract missing pull requests") {
+		t.Fatalf("Error = %q; want the missing pull request contract failure", res.Error)
 	}
-	if len(missing) != 1 || missing[0] != declaration.Selected.Name {
-		t.Fatalf("missing pull requests = %q; want the declared mutable repository", missing)
+}
+
+// TestWorkTypeRoleDeclaredPRRelievesMissing pins the other half of the
+// missing-PR gate through a full Run: a declared custom inflight session
+// whose mutable repository gains its pull request does not fail on the
+// contract. The turn pushes to its pull request ref, so the verifier
+// confirms the envelope's pull request as the session's own.
+func TestWorkTypeRoleDeclaredPRRelievesMissing(t *testing.T) {
+	bare := githubRepositoryFixture(t, followUpRepository)
+	setPullRef(t, bare, 7, pullAtSessionCommit)
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:     "chief-of-staff",
+		workTypeRole: "inflight",
+		declaration: &workarea.RepositoryDeclarationV1{
+			Protocol: workarea.ProtocolSessionRootV1,
+			Repositories: []workarea.DeclaredRepositoryV1{
+				{Source: workarea.RepositorySource{Repository: followUpRepository}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			},
+		},
+		pulls: map[int]string{7: pullAtSessionCommit},
+		turns: []verdictScriptTurn{{
+			text:  "Opened " + followUpPR + ".\nWORK_RESULT: passed",
+			files: map[string]string{"fix.go": "package fix\n"},
+			push:  []string{"refs/pull/7/head"},
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
 	}
-	missingWithoutRole := []string(nil)
-	if RequiresPRURL(qw.WorkType) {
-		missingWithoutRole = missingMutablePullRequests(res, declaration)
+	if res.PullRequestURL != followUpPR {
+		t.Fatalf("PullRequestURL = %q; want %q", res.PullRequestURL, followUpPR)
 	}
-	if len(missingWithoutRole) != 0 {
-		t.Fatalf("missing pull requests without the role = %q; want none", missingWithoutRole)
+}
+
+// TestWorkTypeRoleContinueSeed pins the continue-mode seed gate through a
+// full Run: a custom inflight continue session seeds the continued pull
+// request before tail recovery, so a no-new-commit run still reports it.
+// Dropping the role at the seed gate leaves nothing seeded, so the
+// envelope carries no pull request and this test goes RED on that mutant.
+func TestWorkTypeRoleContinueSeed(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "chief-of-staff",
+		workTypeRole:   "inflight",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		turns:          []verdictScriptTurn{{text: "nothing to do"}},
+	})
+	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("PullRequestURL = %q; want the continued pull request under test", res.PullRequestURL)
+	}
+}
+
+// TestWorkTypeRoleContinueDelivery pins the continue-mode delivery gate
+// through a full Run: a custom inflight continue session that leaves the
+// continued head unmoved fails the no-new-commit delivery check. Dropping
+// the role at the delivery gate skips that check, so the session ends
+// completed instead of failed and this test goes RED on that mutant.
+func TestWorkTypeRoleContinueDelivery(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "chief-of-staff",
+		workTypeRole:   "inflight",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		turns:          []verdictScriptTurn{{text: "WORK_RESULT:passed"}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	}
+	if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+}
+
+// TestWorkTypeRoleContinueProbe pins the continue-mode backstop probe
+// through a full Run: a custom inflight continue session that leaves the
+// continued head unmoved still pushes its commit to the continued branch
+// via the probe-cleared eligibility. Dropping the role at the probe
+// clears eligibility, so nothing is pushed and this test goes RED on
+// that mutant.
+func TestWorkTypeRoleContinueProbe(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "chief-of-staff",
+		workTypeRole:   "inflight",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("PullRequestURL = %q; want the continued pull request", res.PullRequestURL)
+	}
+	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+		t.Fatalf("continued head %q does not carry the session commit", remoteHead)
 	}
 }
