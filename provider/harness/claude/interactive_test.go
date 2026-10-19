@@ -359,6 +359,56 @@ func TestInteractiveArgs_PromptIsAlwaysLast(t *testing.T) {
 	}
 }
 
+// TestSpawn_SeedEndingOptionParsingReachesChildArgvLast is the
+// load-bearing proof that the production Spawn path carries the seed:
+// the fake binary echoes its own argv, and the test asserts the seed
+// follows `--` as the last element through Spawn (not only the argv
+// helper). RED proof: drop the `--` in interactiveArgsWith and the
+// seed-adjacent element is no longer `--`.
+func TestSpawn_SeedEndingOptionParsingReachesChildArgvLast(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	const seed = "--model x fix the bug"
+	p := newFakeInteractiveProvider(t, `printf '%s\n' "$@" > "$PWD/argv.txt"`)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      seed,
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake claude exit")
+		}
+	}
+exited:
+	raw, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read echoed argv: %v", err)
+	}
+	// printf '%s\n' splits nothing here (the fake echoes whole args),
+	// but argv elements containing real newlines (the --settings JSON
+	// is one element) would split lines; check the raw text tail
+	// instead: it must end with the `--` line plus the seed.
+	text := strings.TrimSuffix(string(raw), "\n")
+	if !strings.HasSuffix(text, "--\n"+seed) {
+		t.Fatalf("child argv does not end with -- plus the seed: %q", text)
+	}
+}
+
 // newFakeInteractiveProvider builds a Provider whose binary is a fake-claude
 // script, run under a real PTY by ptycli. Mirrors the PATH-shim technique in
 // provider/harness/clijsonl's handle_test.go.

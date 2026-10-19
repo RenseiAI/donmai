@@ -678,6 +678,49 @@ func writeFakeCodexScript(t *testing.T, script string) string {
 	return bin
 }
 
+// TestSpawn_SeedEndingOptionParsingReachesPTYChild is the load-bearing
+// proof that the production spawn path carries the seed for a leading-dash
+// prompt: the fake PTY client role records its own argv, and the test
+// asserts the seed follows `--` as the last element. RED proof: drop the
+// `--` in buildInteractiveLaunch and the seed-adjacent element is no
+// longer `--`.
+func TestSpawn_SeedEndingOptionParsingReachesPTYChild(t *testing.T) {
+	t.Parallel()
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	const seed = "--model x fix the bug"
+	h, err := SpawnInteractive(context.Background(), Options{CodexBin: bin}, agent.Spec{
+		Cwd:    t.TempDir(),
+		Prompt: seed,
+		Env: map[string]string{
+			codexFakePTYClientEnv:                         "1",
+			codexFakePTYClientRecordArgvEnv:               t.TempDir(),
+			codexFakePTYClientWantSeedAdjacentDashDashEnv: "1",
+			codexFakePTYClientWantSeedEnv:                 seed,
+		},
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("SpawnInteractive: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake codex exit")
+		}
+	}
+exited:
+}
+
 // TestSpawnInteractive_RunsFakeCLIUnderPTY proves SpawnInteractive drives the
 // fake binary directly under a PTY WITHOUT ever touching the app-server
 // JSON-RPC machinery (no live Provider/handshake is constructed here at

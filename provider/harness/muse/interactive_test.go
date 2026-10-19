@@ -356,6 +356,51 @@ func TestSpawn_Interactive_RoutesThroughPTYNotServe(t *testing.T) {
 	}
 }
 
+// TestSpawn_SeedEndingOptionParsingReachesChildArgvLast is the
+// load-bearing proof that the production Spawn path carries the seed:
+// the fake binary echoes its full argv to a file, and the test asserts
+// the tail is `--` plus the seed through Spawn (not only the argv
+// helper). RED proof: drop the `--` in interactiveArgs and the
+// seed-adjacent element is no longer `--`.
+func TestSpawn_SeedEndingOptionParsingReachesChildArgvLast(t *testing.T) {
+	workdir := t.TempDir()
+	const seed = "--model x fix the bug"
+	p := newFakeInteractiveProvider(t, `printf '%s\n' "$@" > "$PWD/argv.txt"`)
+
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      seed,
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake TUI exit")
+		}
+	}
+exited:
+	body, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read echoed argv: %v", err)
+	}
+	// The fake writes one argv element per line; compare the raw tail:
+	// it must end with the `--` line plus the seed line.
+	text := strings.TrimSuffix(string(body), "\n")
+	if !strings.HasSuffix(text, "--\n"+seed) {
+		t.Fatalf("child argv does not end with -- plus the seed %q: %q", seed, text)
+	}
+}
+
 func lastArgvLine(body string) string {
 	var last string
 	for line := range strings.Lines(strings.TrimSpace(body)) {
