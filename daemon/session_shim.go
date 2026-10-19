@@ -1605,6 +1605,17 @@ type sessionShimState struct {
 	stagingSnapshots map[sessionshim.Identity]bool
 	pendingSnapshots map[sessionshim.Identity]sessionshim.ControllerEvent
 	activationGates  map[sessionshim.Identity]*shimAdoptionGate
+	// carrierInstall is the per-identity "carrier installed" latch one adoption
+	// attempt's event consumer waits on beside its adoption gate. The composing
+	// takeover finishes it when it stages its mandatory Snapshot — the point at
+	// which its dial has succeeded and its candidate is installed — so output
+	// batches buffered ahead of the takeover may be persisted before the
+	// adoption commits. An attempt that needs no takeover (a recovery
+	// rehydration, or any path that never stages) leaves it unfinished and its
+	// consumer is released by the adoption gate instead. Entries are replaced at
+	// every consumer start and removed when that consumer exits, so a stale
+	// finished latch can never release a later attempt's consumer early.
+	carrierInstall map[sessionshim.Identity]*shimAdoptionGate
 	// restart is the one controller-local planned-restart authorization. It is
 	// deliberately memory-only: a replacement controller resolves adoption from
 	// authenticated live correlations and never inherits this old controller's
@@ -1688,6 +1699,7 @@ func newSessionShimState() *sessionShimState {
 		stagingSnapshots:     make(map[sessionshim.Identity]bool),
 		pendingSnapshots:     make(map[sessionshim.Identity]sessionshim.ControllerEvent),
 		activationGates:      make(map[sessionshim.Identity]*shimAdoptionGate),
+		carrierInstall:       make(map[sessionshim.Identity]*shimAdoptionGate),
 		acceptanceRefusals:   make(map[sessionshim.Identity]acceptanceRefusalState),
 		acceptanceQuarantine: make(map[shimIncarnation]sessionshim.ProcessIdentity),
 		ambiguityCycles:      make(map[sessionshim.Identity]int),
@@ -4213,7 +4225,95 @@ func (d *Daemon) beginStagedSessionShimSnapshot(id sessionshim.Identity) error {
 	}
 	d.shims.stagingSnapshots[id] = true
 	d.shims.activationGates[id] = newShimAdoptionGate()
+	// The takeover's dial has succeeded and its candidate is installed: release
+	// this attempt's event consumer from the durable output-batch hold. The
+	// adoption gate still governs the commit itself; this only says the carrier
+	// the batch persists to exists. Created here when no consumer is waiting so
+	// the installed fact is observable even if the consumer starts after the
+	// staging — a later consumer start replaces it, so it can never leak one
+	// attempt's release into another.
+	d.finishSessionShimCarrierInstallLocked(id)
 	return nil
+}
+
+// finishSessionShimCarrierInstallLocked marks this identity's carrier installed.
+// The caller holds d.shims.mu.
+func (d *Daemon) finishSessionShimCarrierInstallLocked(id sessionshim.Identity) {
+	latch, ok := d.shims.carrierInstall[id]
+	if !ok {
+		latch = newShimAdoptionGate()
+		if d.shims.carrierInstall == nil {
+			d.shims.carrierInstall = make(map[sessionshim.Identity]*shimAdoptionGate)
+		}
+		d.shims.carrierInstall[id] = latch
+	}
+	latch.finish(true)
+}
+
+// beginSessionShimCarrierWait opens the carrier-install latch one adoption
+// attempt's event consumer waits on. It replaces any latch an earlier attempt
+// left behind, so a stale install can never release a new consumer early.
+func (d *Daemon) beginSessionShimCarrierWait(id sessionshim.Identity) *shimAdoptionGate {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	latch := newShimAdoptionGate()
+	if d.shims.carrierInstall == nil {
+		d.shims.carrierInstall = make(map[sessionshim.Identity]*shimAdoptionGate)
+	}
+	d.shims.carrierInstall[id] = latch
+	return latch
+}
+
+// clearSessionShimCarrierWait removes the carrier-install latch when the
+// consumer that waited on it exits. The pointer comparison keeps a replaced
+// consumer from removing its successor's latch.
+func (d *Daemon) clearSessionShimCarrierWait(id sessionshim.Identity, latch *shimAdoptionGate) {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	if current, ok := d.shims.carrierInstall[id]; ok && current == latch {
+		delete(d.shims.carrierInstall, id)
+	}
+}
+
+// awaitShimCarrierInstalled waits for the durable carrier install the adoption
+// takeover stages (carrier), or for the adoption gate, whichever resolves
+// first — bounded by the controller's own lifetime (done) so a gate that
+// never resolves cannot pin the consumer.
+//
+// A finished carrier means the takeover dialled and installed its candidate:
+// the batch may be persisted even though the adoption has not committed. A
+// committed adoption gate means the carrier is installed by construction, or
+// that no takeover was ever needed. A refused gate — or a controller that
+// ended first — means there is nothing to persist to, and the consumer stops
+// without manufacturing a carrier loss.
+func awaitShimCarrierInstalled(carrier, gate *shimAdoptionGate, done <-chan struct{}) bool {
+	if carrier == nil && gate == nil {
+		return true
+	}
+	if carrier == nil {
+		select {
+		case <-done:
+			return false
+		case <-gate.done:
+			return gate.committed
+		}
+	}
+	if gate == nil {
+		select {
+		case <-done:
+			return false
+		case <-carrier.done:
+			return true
+		}
+	}
+	select {
+	case <-done:
+		return false
+	case <-carrier.done:
+		return true
+	case <-gate.done:
+		return gate.committed
+	}
 }
 
 func (d *Daemon) cancelStagedSessionShimSnapshot(id sessionshim.Identity) {
