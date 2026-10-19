@@ -444,6 +444,71 @@ func TestEnsureRealDirRefusals(t *testing.T) {
 	}
 }
 
+// TestVerifyRefusesSymlinkedMirrorPaths drives the production Ensure entry
+// point against mirrors carrying a symlinked objects fanout (or a symlinked
+// ref) pointing at another scope's mirror: the plant must fail closed with
+// ErrOriginMismatch rather than make foreign commits reachable or confuse
+// refs. The top-level control check alone misses these deeper plants.
+func TestVerifyRefusesSymlinkedMirrorPaths(t *testing.T) {
+	t.Parallel()
+	plants := []struct {
+		name  string
+		plant func(t *testing.T, victim, donor, sha string)
+	}{
+		{
+			name: "objects fanout",
+			plant: func(t *testing.T, victim, donor, sha string) {
+				t.Helper()
+				fanout := sha[:2]
+				if err := os.RemoveAll(filepath.Join(victim, "objects", fanout)); err != nil {
+					t.Fatalf("clear victim fanout: %v", err)
+				}
+				if err := os.Symlink(filepath.Join(donor, "objects", fanout), filepath.Join(victim, "objects", fanout)); err != nil {
+					t.Fatalf("plant fanout symlink: %v", err)
+				}
+			},
+		},
+		{
+			name: "packed-refs",
+			plant: func(t *testing.T, victim, donor, _ string) {
+				t.Helper()
+				target := filepath.Join(victim, "packed-refs")
+				if err := os.Remove(target); err != nil {
+					t.Fatalf("clear victim packed-refs: %v", err)
+				}
+				if err := os.Symlink(filepath.Join(donor, "packed-refs"), target); err != nil {
+					t.Fatalf("plant packed-refs symlink: %v", err)
+				}
+			},
+		},
+	}
+	for _, tt := range plants {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srcDir, sha := newSourceRepo(t)
+			store := newTestStore(t)
+
+			leaseA, err := store.Ensure(context.Background(), srcDir, "scope-a")
+			if err != nil {
+				t.Fatalf("Ensure(scope-a) error = %v", err)
+			}
+			dirA := leaseA.Dir()
+			leaseA.Release()
+			leaseB, err := store.Ensure(context.Background(), srcDir, "scope-b")
+			if err != nil {
+				t.Fatalf("Ensure(scope-b) error = %v", err)
+			}
+			dirB := leaseB.Dir()
+			leaseB.Release()
+
+			tt.plant(t, dirB, dirA, sha)
+			if _, err := store.Ensure(context.Background(), srcDir, "scope-b"); !errors.Is(err, ErrOriginMismatch) {
+				t.Fatalf("Ensure(planted %s symlink) error = %v, want ErrOriginMismatch", tt.name, err)
+			}
+		})
+	}
+}
+
 // TestSweepReapsStaleStaging pins crash-left cleanup: a backdated temp
 // clone dir is reaped by the next Ensure while a fresh one is left alone.
 func TestSweepReapsStaleStaging(t *testing.T) {
@@ -479,6 +544,45 @@ func TestSweepReapsStaleStaging(t *testing.T) {
 	}
 	if _, err := os.Lstat(fresh); err != nil {
 		t.Errorf("fresh staging reaped: %v", err)
+	}
+}
+
+// TestSweepReapsStaleCatalogStaging pins the keeper-root half of crash-left
+// cleanup: a backdated catalog temp beside the published catalog is reaped
+// by the next Ensure, while a fresh one is left alone. Catalog temps were
+// previously swept only at New, so a long-lived store accumulated them.
+func TestSweepReapsStaleCatalogStaging(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	keeperRoot := filepath.Join(store.stateDir, keeperDirName)
+	if err := os.MkdirAll(keeperRoot, 0o700); err != nil {
+		t.Fatalf("create keeper root: %v", err)
+	}
+	stale := filepath.Join(keeperRoot, ".catalog-stale.tmp")
+	if err := os.WriteFile(stale, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("create stale catalog temp: %v", err)
+	}
+	past := time.Now().Add(-2 * stagingStaleAfter)
+	if err := os.Chtimes(stale, past, past); err != nil {
+		t.Fatalf("backdate stale catalog temp: %v", err)
+	}
+	fresh := filepath.Join(keeperRoot, ".catalog-fresh.tmp")
+	if err := os.WriteFile(fresh, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("create fresh catalog temp: %v", err)
+	}
+
+	lease, err := store.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	lease.Release()
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale catalog temp still on disk: err = %v", err)
+	}
+	if _, err := os.Lstat(fresh); err != nil {
+		t.Errorf("fresh catalog temp reaped: %v", err)
 	}
 }
 

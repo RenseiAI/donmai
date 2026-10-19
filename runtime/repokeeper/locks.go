@@ -32,18 +32,30 @@ import (
 // cancellation stays responsive while waiting on another process.
 const mirrorLockRetryInterval = 10 * time.Millisecond
 
+// validMirrorDigest reports whether digest carries the 64-lowercase-hex
+// shape of a scope digest. Mirror directories, lock files, and removal
+// requests all gate on it before any path construction, so a
+// slash-bearing input can never reach a join — even one that passes the
+// length check alone.
+func validMirrorDigest(digest string) bool {
+	if len(digest) != 64 {
+		return false
+	}
+	for _, c := range digest {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // lockFileNameFor validates the digest shape before it reaches the path so
 // a caller cannot steer the lock at an arbitrary file. It mirrors
 // MirrorDir's validation; the ".lock" suffix keeps lock files distinct
 // from mirror directories.
 func lockFileNameFor(digest string) (string, error) {
-	if len(digest) != 64 {
+	if !validMirrorDigest(digest) {
 		return "", fmt.Errorf("repo keeper: refusing to lock a path outside the mirrors directory")
-	}
-	for _, c := range digest {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return "", fmt.Errorf("repo keeper: refusing to lock a path outside the mirrors directory")
-		}
 	}
 	return digest + ".lock", nil
 }

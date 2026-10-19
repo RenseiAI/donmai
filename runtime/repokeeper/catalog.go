@@ -204,10 +204,10 @@ func (s *Store) TouchUse(digest string, at time.Time) error {
 // directory still drops the row, so Remove repairs a half-evicted state
 // instead of failing it.
 func (s *Store) Remove(digest string) error {
-	dir := filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)
-	if len(digest) != 64 {
+	if !validMirrorDigest(digest) {
 		return fmt.Errorf("repo keeper: refusing to remove a path outside the mirrors directory")
 	}
+	dir := filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)
 	unlock := s.lockMirror(digest)
 	trash, err := func() (string, error) {
 		defer unlock()

@@ -154,13 +154,8 @@ func (s *Store) Close() error {
 // reports "" for a digest outside the store's shape so callers cannot be
 // steered at an arbitrary path.
 func (s *Store) MirrorDir(digest string) string {
-	if len(digest) != 64 {
+	if !validMirrorDigest(digest) {
 		return ""
-	}
-	for _, c := range digest {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return ""
-		}
 	}
 	return filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)
 }
@@ -570,6 +565,18 @@ func (s *Store) verifyMirror(mirrorDir, digest, canonical, scope string) error {
 			return fmt.Errorf("%w: mirror control file is not a real file", ErrOriginMismatch)
 		}
 	}
+	// A symlinked objects fanout would make another scope's commits
+	// reachable from this mirror, and a symlinked ref or packed-refs
+	// would steer its reads at foreign content. Neither survives a
+	// hermetic clone — a fresh mirror has no symlinks at all — so a
+	// storage writer planting one must never be served. Walk the whole
+	// tree rather than allowlisting names: a plant under any name git
+	// reads (objects/*, refs/**, logs/**, packed-refs, FETCH_HEAD,
+	// ORIG_HEAD, shallow, the identity sidecar) is refused the same way
+	// as an alternates file.
+	if err := refuseMirrorSymlinks(mirrorDir); err != nil {
+		return err
+	}
 	if err := verifyMirrorConfig(mirrorDir, canonical); err != nil {
 		return err
 	}
@@ -580,6 +587,33 @@ func (s *Store) verifyMirror(mirrorDir, digest, canonical, scope string) error {
 	originCanonical, _, err := CanonicalRemote(strings.TrimSpace(string(out)))
 	if err != nil || originCanonical != canonical {
 		return fmt.Errorf("%w: existing mirror origin does not match requested remote", ErrOriginMismatch)
+	}
+	return nil
+}
+
+// refuseMirrorSymlinks refuses any symlink anywhere under a mirror
+// directory. A hermetic clone writes no symlinks at all, so a plant by a
+// keeper-storage writer — a symlinked objects fanout borrowing another
+// scope's commits, a symlinked packed-refs or ref, a sidecar swapped for
+// a link — fails closed with ErrOriginMismatch rather than being served.
+// The walk itself reads no link targets: Lstat reports the link, and the
+// refusal never follows it.
+func refuseMirrorSymlinks(mirrorDir string) error {
+	stop := errors.New("repo keeper: mirror carries a symlinked path")
+	err := filepath.WalkDir(mirrorDir, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return stop
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, stop) {
+			return fmt.Errorf("%w: mirror carries a symlinked path", ErrOriginMismatch)
+		}
+		return fmt.Errorf("repo keeper: inspect mirror for symlinked paths: %w", err)
 	}
 	return nil
 }
@@ -676,11 +710,12 @@ func (s *Store) hardenMirror(mirrorDir, canonical string) error {
 	return nil
 }
 
-// sweepStaleStaging removes crash-left temp clone and eviction dirs older
-// than stagingStaleAfter. Only the store's own dot-prefixed staging
-// patterns are candidates, and only under the mirrors directory. A staging
-// dir owned by a live concurrent process is at most an hour old, so it is
-// never touched; deleting a stale one cannot strand a live clone because
+// sweepStaleStaging removes crash-left temp clone, eviction, and catalog
+// dirs older than stagingStaleAfter: clone and eviction staging under the
+// mirrors directory, catalog temps under the keeper root. Only the store's
+// own dot-prefixed staging patterns are candidates. A staging dir owned by
+// a live concurrent process is at most an hour old, so it is never touched;
+// deleting a stale one cannot strand a live clone because
 // the owner already failed when its directory vanished (fail closed).
 // Best-effort: errors are logged, never returned.
 func (s *Store) sweepStaleStaging() {
@@ -692,8 +727,19 @@ func (s *Store) sweepStaleStaging() {
 const stagingStaleAfter = time.Hour
 
 func (s *Store) sweepStaleStagingAfter(olderThan time.Duration) {
-	parent := filepath.Join(s.stateDir, keeperDirName, mirrorsDirName)
-	names, err := os.ReadDir(parent)
+	s.sweepStaleStagingDirAfter(filepath.Join(s.stateDir, keeperDirName, mirrorsDirName), olderThan, true)
+	s.sweepStaleStagingDirAfter(filepath.Join(s.stateDir, keeperDirName), olderThan, false)
+}
+
+// sweepStaleStagingDirAfter reaps crash-left staging in one directory:
+// clone and eviction temps under the mirrors directory, catalog temps
+// under the keeper root (a long-lived store that never restarts would
+// otherwise accumulate them — catalog temps were previously swept only
+// at New). Only the store's own dot-prefixed staging patterns are
+// candidates. A staging dir owned by a live concurrent process is at
+// most an hour old, so it is never touched.
+func (s *Store) sweepStaleStagingDirAfter(dir string, olderThan time.Duration, mirrors bool) {
+	names, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
@@ -701,8 +747,9 @@ func (s *Store) sweepStaleStagingAfter(olderThan time.Duration) {
 	reaped := 0
 	for _, name := range names {
 		leaf := name.Name()
-		staging := strings.HasPrefix(leaf, ".clone-") && strings.HasSuffix(leaf, ".tmp") ||
-			strings.HasPrefix(leaf, ".evict-") && strings.HasSuffix(leaf, ".tmp")
+		staging := strings.HasPrefix(leaf, ".clone-") && strings.HasSuffix(leaf, ".tmp") && mirrors ||
+			strings.HasPrefix(leaf, ".evict-") && strings.HasSuffix(leaf, ".tmp") && mirrors ||
+			strings.HasPrefix(leaf, ".catalog-") && strings.HasSuffix(leaf, ".tmp") && !mirrors
 		if !staging {
 			continue
 		}
@@ -710,7 +757,13 @@ func (s *Store) sweepStaleStagingAfter(olderThan time.Duration) {
 		if err != nil || info.ModTime().After(cutoff) {
 			continue
 		}
-		if err := s.root.RemoveAll(mirrorsRelPath(leaf)); err != nil {
+		var rel string
+		if mirrors {
+			rel = mirrorsRelPath(leaf)
+		} else {
+			rel = filepath.Join(keeperDirName, leaf)
+		}
+		if err := s.root.RemoveAll(rel); err != nil {
 			s.logf("repo keeper: reap stale staging dir: %v", err)
 			continue
 		}

@@ -1313,6 +1313,21 @@ func TestRemoveDeletesDirectoryAndDropsRow(t *testing.T) {
 	if err := store.Remove(strings.Repeat("z", 64)); err == nil {
 		t.Error("Remove(non-hex digest) error = nil, want a refusal")
 	}
+	// A slash-bearing 64-char digest passes the length gate: Remove must
+	// refuse it on shape — the same rule MirrorDir applies — before any
+	// path construction, not only downstream at the lock-name gate.
+	slashy := strings.Repeat("a/", 32)
+	if got := store.MirrorDir(slashy); got != "" {
+		t.Errorf("MirrorDir(slash digest) = %q, want empty", got)
+	}
+	if _, err := lockFileNameFor(slashy); err == nil {
+		t.Error("lockFileNameFor(slash digest) error = nil, want a refusal")
+	}
+	if err := store.Remove(slashy); err == nil {
+		t.Error("Remove(slash digest) error = nil, want a shape refusal")
+	} else if !strings.Contains(err.Error(), "refusing to remove a path") {
+		t.Errorf("Remove(slash digest) error = %v, want Remove's own shape refusal (not a downstream gate)", err)
+	}
 	if got := store.MirrorDir(strings.Repeat("z", 64)); got != "" {
 		t.Errorf("MirrorDir(non-hex digest) = %q, want empty", got)
 	}
