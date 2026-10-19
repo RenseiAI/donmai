@@ -2421,25 +2421,6 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 						observe(id, event)
 					}
 				}
-				// A durable carrier is only installed by the adoption
-				// publication that resolves this consumer's gate. During
-				// re-adoption the consumer starts before that publication
-				// runs, so a batch persisted now would meet "no carrier
-				// candidate" and be classified as carrier loss while the relay
-				// dial is still in flight. Hold output batches on the gate the
-				// staged-Snapshot path already uses: a refused gate is a real
-				// carrier loss, a committed one means the carrier is installed
-				// and the buffered output may be flushed in stream order.
-				if !gate.await() {
-					// A refused gate means this adoption never committed: the
-					// controller is already closed (or being closed) by the
-					// adoption path that refused it, so there is no carrier
-					// loss to re-adopt — just stop this consumer without
-					// touching the adopted entry the lost controller still
-					// owns. The staged-Snapshot path keeps its historical
-					// early return here; this path matches it.
-					return
-				}
 				ctx, cancel := d.sessionShimCallbackContext(context.Background())
 				acked, err := cfg.OnSessionEventDurableBatch(ctx, id, batch)
 				cancel()
