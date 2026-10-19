@@ -67,6 +67,27 @@ func TestCheckHostSessionLogin_NonZeroExit(t *testing.T) {
 	}
 }
 
+// TestCheckHostSessionLogin_ValidVersionThenNonZeroExit pins the
+// fail-closed non-zero-exit guard: a CLI that prints a supported
+// version and THEN exits non-zero is still refused. Deleting the
+// `waitErr != nil` refusal would accept it, because the version
+// line alone parses fine.
+func TestCheckHostSessionLogin_ValidVersionThenNonZeroExit(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake muse CLI uses /bin/sh; skip on windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "muse")
+	script := "#!/bin/sh\nprintf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\nexit 2\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+		t.Fatalf("write fake muse CLI: %v", err)
+	}
+	if err := CheckHostSessionLogin(context.Background(), path); !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Fatalf("valid-version-then-failing CLI accepted: %v", err)
+	}
+}
+
 func TestCheckHostSessionLogin_UnparseableVersion(t *testing.T) {
 	t.Parallel()
 	bin := writeFakeMuseCLI(t, "muse", "muse: no version here", false)
@@ -84,6 +105,28 @@ func TestCheckHostSessionLogin_RequiresAbsoluteBinary(t *testing.T) {
 	stop()
 	if err := CheckHostSessionLogin(cancelled, "/usr/bin/muse"); !errors.Is(err, agent.ErrProviderUnavailable) {
 		t.Fatalf("cancelled context accepted: %v", err)
+	}
+}
+
+// TestCheckHostSessionLogin_RelativeBinaryOnPATHRefused pins the
+// absolute-path guard against a relative name that DOES resolve: a
+// fake `muse` on PATH must still be refused, because the caller's
+// PATH and the probe's minimal PATH=/usr/bin:/bin could disagree
+// about which binary answers. Without the guard this test's fake
+// would run and its version would be accepted.
+func TestCheckHostSessionLogin_RelativeBinaryOnPATHRefused(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake muse CLI uses /bin/sh; skip on windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "muse")
+	script := "#!/bin/sh\nprintf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+		t.Fatalf("write fake muse CLI: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	if err := CheckHostSessionLogin(context.Background(), "muse"); !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Fatalf("resolving relative binary accepted: %v", err)
 	}
 }
 
