@@ -2645,7 +2645,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		// preparation come back because a re-prepare mints new ones and the
 		// receipt below belongs to that pair, not to the first.
 		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithBoundedRedial(
-			ctx, c, preparations, hostByID[id], evidence, preparation,
+			ctx, c, preparations, hostByID[id], evidence, preparation, gate,
 		)
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
@@ -3486,8 +3486,9 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 // sessionShimAdoptionEvidenceForGate builds the same evidence as
 // sessionShimAdoptionEvidence and additionally arms the proxy's
 // carrier-installed release on the consumer gate of the controller under
-// adoption. adoptSessionShims passes the gate it just started the consumer
-// with; every other caller passes nil and keeps the historical proxy.
+// adoption. Every path that starts a gated consumer passes the gate it
+// started the consumer with; callers with no gated consumer pass nil and
+// keep the historical proxy.
 func (d *Daemon) sessionShimAdoptionEvidenceForGate(
 	ctx context.Context,
 	ctrl *sessionshim.Controller,
