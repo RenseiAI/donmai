@@ -39,11 +39,48 @@ const defaultShimLaunchTimeout = 30 * time.Second
 
 type shimAdoptionGate struct {
 	done      chan struct{}
+	installed chan struct{}
 	once      sync.Once
 	committed bool
 }
 
-func newShimAdoptionGate() *shimAdoptionGate { return &shimAdoptionGate{done: make(chan struct{})} }
+func newShimAdoptionGate() *shimAdoptionGate {
+	return &shimAdoptionGate{done: make(chan struct{}), installed: make(chan struct{})}
+}
+
+// finishCarrierInstalled releases a consumer parked on its first durable
+// output batch WITHOUT resolving the adoption outcome: the carrier dial has
+// landed, but whether the publication commits is still open. The adoption
+// gate still carries the verdict — this latch carries only readiness — so a
+// refused adoption still refuses the parked consumer through done.
+func (g *shimAdoptionGate) finishCarrierInstalled() {
+	if g == nil {
+		return
+	}
+	select {
+	case <-g.installed:
+	default:
+		close(g.installed)
+	}
+}
+
+// awaitCarrierOrGate holds the first durable output batch until the carrier
+// is installed, the adoption resolves, or the stream ends. True means persist
+// (installed, or done-and-committed); false means stop without persisting
+// (done-and-refused, or the stream closed underneath a still-open adoption).
+func (g *shimAdoptionGate) awaitCarrierOrGate(done <-chan struct{}) bool {
+	if g == nil {
+		return true
+	}
+	select {
+	case <-g.installed:
+		return true
+	case <-g.done:
+		return g.committed
+	case <-done:
+		return false
+	}
+}
 
 func (g *shimAdoptionGate) finish(committed bool) {
 	if g == nil {
@@ -2420,6 +2457,22 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 					if observe != nil {
 						observe(id, event)
 					}
+				}
+				// The consumer starts before the adoption publication installs
+				// the durable carrier, so persisting now would meet "no carrier
+				// candidate" and read as carrier loss while the dial is still
+				// in flight. Hold the batch until the carrier is installed OR
+				// the adoption resolves, whichever comes first: installed means
+				// the dial landed (persisting is safe and unblocks the staged
+				// Snapshot behind it), committed means the carrier was installed
+				// even where the latch never armed, refused means the adoption
+				// never committed (stop without touching the adopted entry, as
+				// the staged-Snapshot path does). The wait also ends when the
+				// stream closes, so a refused adoption that already closed the
+				// controller cannot park this consumer. One batch is held per
+				// consumer: it was already collected, never re-read.
+				if !gate.awaitCarrierOrGate(ctrl.Done()) {
+					return
 				}
 				ctx, cancel := d.sessionShimCallbackContext(context.Background())
 				acked, err := cfg.OnSessionEventDurableBatch(ctx, id, batch)
