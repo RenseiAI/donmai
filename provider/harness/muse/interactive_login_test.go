@@ -2,6 +2,7 @@ package muse
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,6 +281,33 @@ func TestSpawn_Interactive_DeniesStampedToolSpec(t *testing.T) {
 	}
 }
 
+// TestSpawn_Interactive_MissingBinarySurfacesUnavailable pins the
+// install-first ordering in spawnInteractive: a session with no usable
+// binary refuses with the install cause (ErrProviderUnavailable from
+// the version check), NOT the login refusal — missing install and
+// missing login stay separate typed causes. RED proof: drop the
+// CheckHostSessionLogin call from spawnInteractive and the spawn
+// refuses with the login cause instead.
+func TestSpawn_Interactive_MissingBinarySurfacesUnavailable(t *testing.T) {
+	p := &Provider{museBin: filepath.Join(t.TempDir(), "absent-muse")}
+	t.Setenv(museAuthPathEnv, filepath.Join(t.TempDir(), "absent-auth.json"))
+
+	_, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      "hello",
+		Cwd:         t.TempDir(),
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err == nil {
+		t.Fatal("expected spawn refusal with no binary, got nil")
+	}
+	if !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Errorf("expected the install cause (ErrProviderUnavailable), got %v", err)
+	}
+	if isNotAuthenticatedErr(err) {
+		t.Errorf("missing binary must not surface the login cause, got %v", err)
+	}
+}
+
 func isNotAuthenticatedErr(err error) bool {
 	for err != nil {
 		if err == agent.ErrNotAuthenticated {
@@ -347,6 +375,36 @@ func TestProbeHostSessionLogin_RequiresProbeModelID(t *testing.T) {
 				t.Errorf("a does-not-exist line without the probe model id %q must refuse, got nil", hostLoginProbeModel)
 			}
 		})
+	}
+}
+
+// TestProbeHostSessionLogin_ModelIDOnOtherLineRefuses pins the F3a
+// per-line verdict: when the probe's own model id appears on one line
+// (for example a startup banner naming it) and a credential-store
+// "does not exist" lands on ANOTHER line, the login is NOT proven.
+// The model id and the rejection must share a line — the host rejecting
+// the model THIS probe asked for. RED proof: match the model id against
+// the whole combined output instead of per line and this output proves
+// the login.
+func TestProbeHostSessionLogin_ModelIDOnOtherLineRefuses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("native probe test shells out to testdata scripts")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-muse")
+	script := "#!/bin/bash\n" +
+		`echo "using model ` + hostLoginProbeModel + `"` + "\n" +
+		`echo "keychain item does not exist" >&2; exit 1` + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := probeHostSessionLoginWithEnv(ctx, bin, []string{"PATH=" + os.Getenv("PATH"), "NO_COLOR=1"}); err == nil {
+		t.Errorf("model id on another line + credential-store failure must refuse, got nil")
 	}
 }
 

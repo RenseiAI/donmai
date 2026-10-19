@@ -41,9 +41,9 @@ const hostLoginProbeModel = "donmai-login-probe-nonexistent-model"
 // headless first-turn classifier in muse.go draws).
 var errHostSessionLogin = fmt.Errorf("muse host-session login is unavailable")
 
-// CheckHostSessionLogin verifies the operator login an interactive PTY
-// session inherits before it spawns. It performs no model turn and spends
-// nothing:
+// CheckInteractiveSessionLogin verifies the operator login an interactive
+// PTY session inherits before it spawns. It performs no model turn and
+// spends nothing:
 //
 //  1. File evidence (offline): the credential file the launcher itself
 //     resolves (MUSE_AUTH_PATH → XDG → HOME) must exist, parse, and carry
@@ -59,11 +59,17 @@ var errHostSessionLogin = fmt.Errorf("muse host-session login is unavailable")
 // This is local login evidence, not online model entitlement — the same
 // contract the headless lane's first-turn classifier (classifyStartError)
 // enforces online. No credential bytes are returned to callers.
-func CheckHostSessionLogin(ctx context.Context, binary string) error {
+//
+// This is the INTERACTIVE leg of the host-session auth story, distinct
+// from CheckHostSessionLogin (the install/version evidence the daemon
+// quota poller runs): spawnInteractive calls that check first, then this
+// one — an uninstalled CLI surfaces ErrProviderUnavailable, a login-less
+// host surfaces ErrNotAuthenticated.
+func CheckInteractiveSessionLogin(ctx context.Context, binary string) error {
 	return checkHostSessionLogin(ctx, binary, "")
 }
 
-// checkHostSessionLogin is CheckHostSessionLogin parameterized by the
+// checkHostSessionLogin is CheckInteractiveSessionLogin parameterized by
 // session's explicit API key: a non-empty key is the session's route and
 // the file + probe legs are skipped. An ambient META_API_KEY never
 // counts — serveEnv strips it unless the Spec sets it, so the child it
@@ -190,16 +196,28 @@ func probeHostSessionLoginWithEnv(ctx context.Context, binary string, env []stri
 		return errHostSessionLogin
 	}
 	combined := stdout.String() + "\n" + stderr.String()
-	// The login-proven verdict requires the probe's OWN model id in the
-	// matched line: the host must be rejecting the model THIS probe asked
-	// for. A bare "does not exist" (for example a credential-store
-	// "keychain item does not exist") proves nothing about the login
-	// and refuses below. The probe model id is unresolvable by
-	// construction, so the host can only name it when it got past
-	// authentication to model validation.
-	hasProbeModel := strings.Contains(combined, hostLoginProbeModel)
+	// The login-proven verdict requires the probe's OWN model id on the
+	// SAME line as the rejection: the host must be rejecting the model
+	// THIS probe asked for. A bare "does not exist" (for example a
+	// credential-store "keychain item does not exist") proves nothing
+	// about the login and refuses below — even when the model id appears
+	// on some other line (for example a startup banner naming it), which
+	// a package-wide substring match would wrongly accept. The probe
+	// model id is unresolvable by construction, so the host can only
+	// name it alongside a rejection when it got past authentication to
+	// model validation.
+	hasLoginProvenLine := false
+	for line := range strings.Lines(combined) {
+		if !strings.Contains(line, hostLoginProbeModel) {
+			continue
+		}
+		if strings.Contains(line, "does not exist") || strings.Contains(line, "lack access") {
+			hasLoginProvenLine = true
+			break
+		}
+	}
 	switch {
-	case hasProbeModel && (strings.Contains(combined, "does not exist") || strings.Contains(combined, "lack access")):
+	case hasLoginProvenLine:
 		// The host authenticated and rejected the MODEL: login proven.
 		return nil
 	case strings.Contains(combined, "missing meta credentials") || strings.Contains(combined, "no login"):
@@ -279,6 +297,15 @@ func (b *boundedProbeOutput) String() string { return b.buffer.String() }
 // byte-accurate PTY stream is the product): an InitEvent once the PTY child
 // is up and a single terminal ResultEvent when the process exits.
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	// Install evidence FIRST (cheap version check, no credential reads):
+	// a host without a usable CLI surfaces ErrProviderUnavailable, not
+	// the login refusal below.
+	if err := CheckHostSessionLogin(ctx, p.museBin); err != nil {
+		return nil, err
+	}
+	// Login evidence SECOND: the credential-file leg plus the no-cost
+	// native probe refuse a login-less host with ErrSpawnFailed +
+	// ErrNotAuthenticated before any confinement or child state.
 	if err := checkHostSessionLogin(ctx, p.museBin, spec.Env["META_API_KEY"]); err != nil {
 		return nil, fmt.Errorf("%w: %w: %v", agent.ErrSpawnFailed, agent.ErrNotAuthenticated, err)
 	}

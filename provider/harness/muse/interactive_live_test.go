@@ -35,7 +35,7 @@ func liveBinaryAvailable(t *testing.T) (*Provider, string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if err := CheckHostSessionLogin(ctx, bin); err != nil {
+	if err := CheckInteractiveSessionLogin(ctx, bin); err != nil {
 		t.Skipf("live interactive test: host login check refused (%v) — skipping", err)
 	}
 	p, err := New(Options{MuseBin: bin, TrustWorkspace: true})
