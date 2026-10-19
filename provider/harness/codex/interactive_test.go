@@ -33,7 +33,7 @@ func TestInteractiveArgs(t *testing.T) {
 		want   []string
 	}{
 		{name: "empty prompt starts bare TUI", prompt: "", want: seed},
-		{name: "non-empty prompt seeds the TUI", prompt: "fix the failing tests", want: append(slices.Clone(seed), "fix the failing tests")},
+		{name: "non-empty prompt seeds the TUI", prompt: "fix the failing tests", want: append(slices.Clone(seed), "--", "fix the failing tests")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,31 +76,31 @@ func TestInteractiveArgs_SessionNameResumeGating(t *testing.T) {
 	}{
 		{
 			name: "empty name unchanged",
-			want: append(slices.Clone(seed), "coordinate"),
+			want: append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "fresh custom name never invokes resume",
 			sessionName: "chief-of-staff",
 			interactive: &agent.InteractiveSpec{},
-			want:        append(slices.Clone(seed), "coordinate"),
+			want:        append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "fresh platform-canonical id-shaped name never invokes resume",
 			sessionName: "3105355a",
 			interactive: &agent.InteractiveSpec{},
-			want:        append(slices.Clone(seed), "coordinate"),
+			want:        append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "nil Interactive with a name still defaults to fresh, never resume",
 			sessionName: "chief-of-staff",
 			interactive: nil,
-			want:        append(slices.Clone(seed), "coordinate"),
+			want:        append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "explicit attach-to-existing resumes by name",
 			sessionName: "chief-of-staff",
 			interactive: &agent.InteractiveSpec{ResumeExisting: true},
-			want:        append(append([]string{"resume"}, seed...), "chief-of-staff", "coordinate"),
+			want:        append(append([]string{"resume"}, seed...), "--", "chief-of-staff", "coordinate"),
 		},
 	}
 	for _, tt := range tests {
@@ -114,6 +114,82 @@ func TestInteractiveArgs_SessionNameResumeGating(t *testing.T) {
 				t.Fatalf("interactiveArgs = %q; want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestInteractiveArgs_SeedEndsOptionParsing proves the seed is preceded
+// by `--` and stays the last element whatever its first characters: a
+// plain seed, a seed starting with `-`, a seed starting with `--model x`,
+// and a seed equal to a subcommand word all reach the TUI as the seed
+// instead of being parsed as a flag or starting a subcommand.
+func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	seeds := []string{
+		"fix the failing tests",
+		"-fix the failing tests",
+		"--model x fix the failing tests",
+		"resume",
+		"exec",
+		"config",
+	}
+	for _, seed := range seeds {
+		t.Run(seed, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Cwd: workspace, Prompt: seed})
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs = %q, want the seed preceded by --", got)
+			}
+			if last := got[len(got)-1]; last != seed {
+				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, seed, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+}
+
+// TestInteractiveArgs_NoSeedGainsNoEndOfOptions pins that a launch without
+// a seed carries no trailing `--`.
+func TestInteractiveArgs_NoSeedGainsNoEndOfOptions(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	for _, spec := range []agent.Spec{
+		{Cwd: workspace},
+		{Cwd: workspace, SessionName: "chief-of-staff"},
+		{Cwd: workspace, SessionName: "chief-of-staff", Interactive: &agent.InteractiveSpec{ResumeExisting: true}},
+	} {
+		got := interactiveArgs(spec)
+		if slices.Contains(got, "--") {
+			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no --", spec, got)
+		}
+	}
+}
+
+// TestInteractiveArgs_ResumeSeedEndsOptionParsingBeforeTheName pins the
+// resume argv shape `resume <flags> -- <name> <seed>`: both positionals
+// follow the `--`, and the seed stays last.
+func TestInteractiveArgs_ResumeSeedEndsOptionParsingBeforeTheName(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	spec := agent.Spec{
+		Cwd: workspace, SessionName: "chief-of-staff", Prompt: "coordinate",
+		Interactive: &agent.InteractiveSpec{ResumeExisting: true},
+	}
+	got := interactiveArgs(spec)
+	if len(got) == 0 || got[0] != "resume" {
+		t.Fatalf("resume argv = %q, want it to start with resume", got)
+	}
+	dash := slices.Index(got, "--")
+	if dash < 0 {
+		t.Fatalf("resume argv = %q, want a -- before the positionals", got)
+	}
+	if want := append([]string(nil), got[dash:]...); !reflect.DeepEqual(want, []string{"--", "chief-of-staff", "coordinate"}) {
+		t.Fatalf("resume positionals = %q, want [-- chief-of-staff coordinate] (full argv: %q)", want, got)
+	}
+	if last := got[len(got)-1]; last != "coordinate" {
+		t.Fatalf("last resume argv element = %q, want the seed (full argv: %q)", last, got)
 	}
 }
 
@@ -175,10 +251,10 @@ func TestSpawnInteractivePrepared_WindowsNameGatePrecedesBinarySideEffects(t *te
 func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T) {
 	t.Parallel()
 	got := remoteInteractiveArgs(
-		[]string{"resume", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"},
+		[]string{"resume", "--config", `model="gpt-5.6-sol"`, "--", "chief-of-staff", "coordinate"},
 		"unix:///tmp/codex.sock",
 	)
-	want := []string{"resume", "--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"}
+	want := []string{"resume", "--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "--", "chief-of-staff", "coordinate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
 	}
@@ -192,10 +268,10 @@ func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T)
 func TestRemoteInteractiveArgs_FreshSessionPrependsRemoteWithoutResume(t *testing.T) {
 	t.Parallel()
 	got := remoteInteractiveArgs(
-		[]string{"--config", `model="gpt-5.6-sol"`, "coordinate"},
+		[]string{"--config", `model="gpt-5.6-sol"`, "--", "coordinate"},
 		"unix:///tmp/codex.sock",
 	)
-	want := []string{"--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "coordinate"}
+	want := []string{"--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "--", "coordinate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
 	}
@@ -205,7 +281,7 @@ func TestAppServerConfigArgs_ProjectsOnlyConfigAuthority(t *testing.T) {
 	t.Parallel()
 	got := appServerConfigArgs([]string{
 		"resume", "--config", `model="gpt-5.6-sol"`, "--add-dir", "/work/other",
-		"--config", `mcp_servers={}`, "--strict-config", "chief-of-staff", "coordinate",
+		"--config", `mcp_servers={}`, "--strict-config", "--", "chief-of-staff", "coordinate",
 	})
 	want := []string{"--config", `model="gpt-5.6-sol"`, "--config", `mcp_servers={}`, "--strict-config"}
 	if !reflect.DeepEqual(got, want) {
@@ -433,7 +509,7 @@ func TestBuildInteractiveLaunch_EmptyMCPAddsNoOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := append(launchSeedPrefixFor(t, workspace), "hello")
+	want := append(launchSeedPrefixFor(t, workspace), "--", "hello")
 	if !slices.Equal(launch.argv, want) || slices.Contains(launch.argv, "--strict-config") {
 		t.Fatalf("empty MCP launch = %q, want %q", launch.argv, want)
 	}

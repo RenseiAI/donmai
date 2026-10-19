@@ -467,7 +467,7 @@ func serveEnvMap(env []string) map[string]string {
 //	                   delivery, so nothing is silently dropped)
 //	InitialContext     → prepended to the positional seed after the system
 //	                   append (same delivery, same receipt)
-//	Prompt             → positional argument, ALWAYS LAST
+//	Prompt             → positional argument, ALWAYS LAST, preceded by `--`
 //
 // Deliberately unmapped (admission denies them on this profile — the TUI
 // exposes no channel for them): SessionName (resume <ref> attaches to an
@@ -500,8 +500,10 @@ func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	}
 	// The positional seed is the profile's ONLY user channel: system
 	// append, initial context, then the prompt — each already recorded on
-	// the receipt under muse_cli_pty_seed. It stays LAST so it is never
-	// consumed as the value of a preceding flag.
+	// the receipt under muse_cli_pty_seed. Option parsing ends before it
+	// so a seed starting with `-` parses as the seed and a seed equal to
+	// a subcommand word does not start that subcommand: the seed stays
+	// LAST, as today. No seed means no trailing `--`.
 	seed := spec.Prompt
 	if ctxText := strings.TrimSpace(spec.InitialContext); ctxText != "" {
 		seed = ctxText + "\n\n" + seed
@@ -510,7 +512,7 @@ func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 		seed = sys + "\n\n" + seed
 	}
 	if strings.TrimSpace(seed) != "" {
-		argv = append(argv, seed)
+		argv = append(argv, "--", seed)
 	}
 	return argv
 }

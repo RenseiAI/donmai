@@ -543,7 +543,7 @@ func TestInteractiveArgs_NoticeSettingsPrecedeThePositionalPrompt(t *testing.T) 
 		"--settings", settings,
 		"--permission-mode", "bypassPermissions",
 		"--disallowedTools", strings.Join(linearMCPDisallowList, ","),
-		"fix the bug",
+		"--", "fix the bug",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("interactiveArgsWith = %q; want %q", got, want)

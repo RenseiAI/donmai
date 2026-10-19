@@ -30,17 +30,17 @@ func TestInteractiveArgs(t *testing.T) {
 		{
 			name: "non-empty prompt seeds the TUI positionally",
 			spec: agent.Spec{Prompt: "fix the bug"},
-			want: []string{"fix the bug"},
+			want: []string{"--", "fix the bug"},
 		},
 		{
 			name: "read-only lane carries the serve lane's sandbox flags",
 			spec: agent.Spec{Prompt: "fix the bug", SandboxLevel: agent.SandboxReadOnly},
-			want: []string{"--disable-shell", "--disable-write", "fix the bug"},
+			want: []string{"--disable-shell", "--disable-write", "--", "fix the bug"},
 		},
 		{
 			name: "autonomous selects never-ask approval before the prompt",
 			spec: agent.Spec{Prompt: "fix the bug", Autonomous: true},
-			want: []string{"--approval-mode", "never", "fix the bug"},
+			want: []string{"--approval-mode", "never", "--", "fix the bug"},
 		},
 		{
 			name: "autonomous with empty prompt is still a valid flag-only argv",
@@ -50,27 +50,27 @@ func TestInteractiveArgs(t *testing.T) {
 		{
 			name: "explicit model rides --model",
 			spec: agent.Spec{Prompt: "fix the bug", Model: "muse-spark-1.3"},
-			want: []string{"--model", "muse-spark-1.3", "fix the bug"},
+			want: []string{"--model", "muse-spark-1.3", "--", "fix the bug"},
 		},
 		{
 			name: "default model sentinel emits no flag",
 			spec: agent.Spec{Prompt: "fix the bug", Model: "default"},
-			want: []string{"fix the bug"},
+			want: []string{"--", "fix the bug"},
 		},
 		{
 			name: "effort rides --reasoning-effort in the host wire spelling",
 			spec: agent.Spec{Prompt: "fix the bug", Effort: agent.EffortHigh},
-			want: []string{"--reasoning-effort", "high", "fix the bug"},
+			want: []string{"--reasoning-effort", "high", "--", "fix the bug"},
 		},
 		{
 			name: "unset effort emits no flag",
 			spec: agent.Spec{Prompt: "fix the bug"},
-			want: []string{"fix the bug"},
+			want: []string{"--", "fix the bug"},
 		},
 		{
 			name: "system append and initial context prepend the seed in order",
 			spec: agent.Spec{Prompt: "fix the bug", SystemPromptAppend: "follow local conventions", InitialContext: "recall: green build"},
-			want: []string{"follow local conventions\n\nrecall: green build\n\nfix the bug"},
+			want: []string{"--", "follow local conventions\n\nrecall: green build\n\nfix the bug"},
 		},
 	}
 	for _, tt := range tests {
@@ -162,6 +162,56 @@ func TestInteractiveArgs_SandboxParityWithServeArgs(t *testing.T) {
 			t.Fatalf("trusted interactive argv missing --trust-workspace: %q", got)
 		}
 	})
+}
+
+// TestInteractiveArgs_SeedEndsOptionParsing proves the seed is preceded
+// by `--` and stays the last element whatever its first characters: a
+// plain seed, a seed starting with `-`, a seed starting with `--model x`,
+// and a seed equal to a subcommand word all reach the TUI as the seed
+// instead of being parsed as a flag or starting a subcommand.
+func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
+	t.Parallel()
+	p := &Provider{}
+	seeds := []string{
+		"fix the bug",
+		"-fix the bug",
+		"--model x fix the bug",
+		"resume",
+		"exec",
+		"config",
+	}
+	for _, seed := range seeds {
+		t.Run(seed, func(t *testing.T) {
+			t.Parallel()
+			got := p.interactiveArgs(agent.Spec{Prompt: seed, Autonomous: true})
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs = %q, want the seed preceded by --", got)
+			}
+			if last := got[len(got)-1]; last != seed {
+				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, seed, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+}
+
+// TestInteractiveArgs_NoSeedGainsNoEndOfOptions pins that an argv without
+// a seed carries no trailing `--`.
+func TestInteractiveArgs_NoSeedGainsNoEndOfOptions(t *testing.T) {
+	t.Parallel()
+	p := &Provider{opts: Options{TrustWorkspace: true}}
+	for _, spec := range []agent.Spec{
+		{},
+		{Autonomous: true},
+		{SandboxLevel: agent.SandboxReadOnly},
+	} {
+		got := p.interactiveArgs(spec)
+		if slices.Contains(got, "--") {
+			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no --", spec, got)
+		}
+	}
 }
 
 // TestInteractiveArgs_PromptIsAlwaysLast pins the positional-argument

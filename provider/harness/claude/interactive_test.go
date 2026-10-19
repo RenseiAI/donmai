@@ -29,17 +29,17 @@ func TestInteractiveArgs(t *testing.T) {
 		{
 			name: "non-empty prompt seeds the REPL",
 			spec: agent.Spec{Prompt: "fix the bug"},
-			want: []string{"fix the bug"},
+			want: []string{"--", "fix the bug"},
 		},
 		{
 			name: "session name precedes the prompt",
 			spec: agent.Spec{SessionName: "chief-of-staff", Prompt: "coordinate"},
-			want: []string{"--name", "chief-of-staff", "coordinate"},
+			want: []string{"--name", "chief-of-staff", "--", "coordinate"},
 		},
 		{
 			name: "autonomous adds bypassPermissions and the Linear MCP deny list before the prompt",
 			spec: agent.Spec{Prompt: "fix the bug", Autonomous: true},
-			want: append([]string{"--permission-mode", "bypassPermissions", "--disallowedTools", strings.Join(linearMCPDisallowList, ",")}, "fix the bug"),
+			want: append([]string{"--permission-mode", "bypassPermissions", "--disallowedTools", strings.Join(linearMCPDisallowList, ","), "--"}, "fix the bug"),
 		},
 		{
 			name: "autonomous with empty prompt is still a valid flag-only argv",
@@ -49,12 +49,12 @@ func TestInteractiveArgs(t *testing.T) {
 		{
 			name: "system prompt append precedes the positional prompt",
 			spec: agent.Spec{Prompt: "fix the bug", SystemPromptAppend: "use project conventions"},
-			want: []string{"--append-system-prompt", "use project conventions", "fix the bug"},
+			want: []string{"--append-system-prompt", "use project conventions", "--", "fix the bug"},
 		},
 		{
 			name: "empty system prompt append adds no flag",
 			spec: agent.Spec{Prompt: "fix the bug", SystemPromptAppend: ""},
-			want: []string{"fix the bug"},
+			want: []string{"--", "fix the bug"},
 		},
 	}
 	for _, tt := range tests {
@@ -106,7 +106,7 @@ func TestInteractiveArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
 func TestInteractiveArgs_MCPConfigPrecedesPositionalPrompt(t *testing.T) {
 	t.Parallel()
 	got := interactiveArgsWithMCP(agent.Spec{Prompt: "fix the bug"}, "/tmp/session-mcp.json")
-	want := []string{"--mcp-config", "/tmp/session-mcp.json", "--strict-mcp-config", "fix the bug"}
+	want := []string{"--mcp-config", "/tmp/session-mcp.json", "--strict-mcp-config", "--", "fix the bug"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("interactiveArgsWithMCP = %q, want %q", got, want)
 	}
@@ -283,6 +283,57 @@ func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
 			t.Errorf("non-selected interactive argv carries a %s flag: %q", flag, got)
 		}
 	})
+}
+
+// TestInteractiveArgs_SeedEndsOptionParsing proves the seed is preceded
+// by `--` and stays the last element whatever its first characters: a
+// plain seed, a seed starting with `-`, a seed starting with `--model x`,
+// and a seed equal to a subcommand word all reach the REPL as the seed
+// instead of being parsed as a flag or starting a subcommand.
+func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
+	t.Parallel()
+	seeds := []string{
+		"fix the bug",
+		"-fix the bug",
+		"--model x fix the bug",
+		"resume",
+		"exec",
+		"config",
+	}
+	for _, seed := range seeds {
+		t.Run(seed, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Prompt: seed, Autonomous: true})
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs = %q, want the seed preceded by --", got)
+			}
+			if last := got[len(got)-1]; last != seed {
+				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, seed, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+}
+
+// TestInteractiveArgs_NoSeedGainsNoEndOfOptions pins that an argv without
+// a seed carries no trailing `--`.
+func TestInteractiveArgs_NoSeedGainsNoEndOfOptions(t *testing.T) {
+	t.Parallel()
+	for _, spec := range []agent.Spec{
+		{},
+		{Autonomous: true},
+		{SessionName: "chief-of-staff"},
+	} {
+		got := interactiveArgs(spec)
+		if slices.Contains(got, "--") {
+			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no --", spec, got)
+		}
+	}
+	if got := interactiveArgsWith(agent.Spec{Autonomous: true}, "/tmp/session-mcp.json", `{"hooks":{}}`); slices.Contains(got, "--") {
+		t.Fatalf("seedless interactiveArgsWith = %q, want no --", got)
+	}
 }
 
 // TestInteractiveArgs_PromptIsAlwaysLast pins the positional-argument

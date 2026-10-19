@@ -342,7 +342,7 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 //	AllowedTools       → --allowedTools <comma-separated>
 //	DisallowedTools    → --disallowedTools <comma-separated>
 //	SystemPromptAppend → --append-system-prompt <text>
-//	Prompt             → positional argument, ALWAYS LAST
+//	Prompt             → positional argument, ALWAYS LAST, preceded by `--`
 //
 // The allow/deny mapping is byte-identical to buildArgs' (see
 // cli_args.go) — one convention, two spawn modes. Before it existed the
@@ -508,9 +508,13 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 		argv = append(argv, "--mcp-config", mcpConfigPath, "--strict-mcp-config")
 	}
 
-	// Positional prompt LAST — every flag-shaped argument precedes it.
+	// End option parsing before the positional seed: the REPL takes the
+	// seed positionally, so without this a seed starting with `-` parses
+	// as a flag and a seed equal to a subcommand word starts that
+	// subcommand instead of a session. The seed is still appended LAST,
+	// as today. No seed means no trailing `--`.
 	if spec.Prompt != "" {
-		argv = append(argv, spec.Prompt)
+		argv = append(argv, "--", spec.Prompt)
 	}
 	return argv
 }
