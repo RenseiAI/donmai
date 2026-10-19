@@ -1310,6 +1310,12 @@ func TestRemoveDeletesDirectoryAndDropsRow(t *testing.T) {
 	if err := store.Remove("short"); err == nil {
 		t.Error("Remove(path-shaped digest) error = nil, want a refusal")
 	}
+	if err := store.Remove(strings.Repeat("z", 64)); err == nil {
+		t.Error("Remove(non-hex digest) error = nil, want a refusal")
+	}
+	if got := store.MirrorDir(strings.Repeat("z", 64)); got != "" {
+		t.Errorf("MirrorDir(non-hex digest) = %q, want empty", got)
+	}
 }
 
 // TestEnsureWithAuthFailureAbortsClone proves a failing auth resolver
