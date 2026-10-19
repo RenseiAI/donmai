@@ -2370,10 +2370,16 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		defer d.shims.wg.Done()
 		id := ctrl.Identity()
 		// The carrier-install latch this attempt's output batches wait on
-		// beside the adoption gate. Replaced fresh for every consumer, removed
-		// when this one exits, so no attempt inherits another's release.
-		carrier := d.beginSessionShimCarrierWait(id)
-		defer d.clearSessionShimCarrierWait(id, carrier)
+		// beside the adoption gate. A nil gate means no adoption is in flight
+		// — the carrier is installed by construction — so no latch is needed
+		// and batches persist at once, exactly as before. Replaced fresh for
+		// every gated consumer and removed when this one exits, so no attempt
+		// inherits another's release.
+		var carrier *shimAdoptionGate
+		if gate != nil {
+			carrier = d.beginSessionShimCarrierWait(id)
+			defer d.clearSessionShimCarrierWait(id, carrier)
+		}
 		cfg := d.sessionShimConfig()
 		observe := cfg.OnSessionEvent
 		durable := cfg.OnSessionEventDurable

@@ -176,7 +176,7 @@ func TestReadoptedOutputBatchPersistsAfterTheCarrierInstalls(t *testing.T) {
 		if err := firstCtrl.WriteInput([]byte(token + "\r")); err != nil {
 			t.Fatalf("write exchange %d: %v", i, err)
 		}
-		want = append(want, waitForEcho(ctx, t, firstCtrl, "ack:"+token))
+		want = append(want, waitForEchoFrames(ctx, t, firstCtrl, "ack:"+token)...)
 	}
 	first.Close()
 
@@ -326,12 +326,15 @@ func TestReadoptedOutputBatchPersistsAfterTheCarrierInstalls(t *testing.T) {
 	}
 }
 
-// waitForEcho reads the first controller's stream until the harness answers
-// the written line, returning the exact output frame bytes the replacement
-// must later replay and persist.
-func waitForEcho(ctx context.Context, t *testing.T, ctrl *sessionshim.Controller, token string) []byte {
+// waitForEchoFrames reads the first controller's stream until the harness
+// answers the written line, returning every output frame that answer arrived
+// in. A line may split across several PTY reads, so the answer is a frame
+// sequence, not one frame — and the replacement must replay and persist each
+// of those frames exactly as the shim stored them.
+func waitForEchoFrames(ctx context.Context, t *testing.T, ctrl *sessionshim.Controller, token string) [][]byte {
 	t.Helper()
 	var buf strings.Builder
+	var frames [][]byte
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
@@ -343,8 +346,9 @@ func waitForEcho(ctx context.Context, t *testing.T, ctrl *sessionshim.Controller
 			}
 			if ev.Kind == sessionshim.EventHostFrame && ev.FrameType == attachwire.TypeOutput {
 				buf.Write(ev.Data)
+				frames = append(frames, append([]byte(nil), ev.FrameBytes...))
 				if strings.Contains(buf.String(), token) {
-					return append([]byte(nil), ev.FrameBytes...)
+					return frames
 				}
 			}
 		}
