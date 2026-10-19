@@ -38,3 +38,16 @@ func ParseWorkTypeRole(s string) (WorkTypeRole, bool) {
 		return "", false
 	}
 }
+
+func contractForRole(role WorkTypeRole) (CompletionContract, bool) {
+	switch role {
+	case WorkTypeRoleInflight:
+		return completionContracts[WorkTypeDevelopmentStr], true
+	case WorkTypeRoleReview:
+		return CompletionContract{Required: []CompletionField{fieldWorkResult}}, true
+	case WorkTypeRoleIntake:
+		return CompletionContract{}, true
+	default:
+		return CompletionContract{}, false
+	}
+}

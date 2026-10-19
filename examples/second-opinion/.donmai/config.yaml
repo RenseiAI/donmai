@@ -1,0 +1,4 @@
+# Optional repository metadata; host setup and arch assess do not read this file.
+# Copy to the demo repository root only for standalone orchestrator use.
+apiVersion: v1
+kind: RepositoryConfig

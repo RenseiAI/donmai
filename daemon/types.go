@@ -344,7 +344,8 @@ type SessionHandle struct {
 
 	// WorkType is the workflow discriminant ("development", "qa", ...).
 	// Mirrors SessionSpec.WorkType.
-	WorkType string `json:"workType,omitempty"`
+	WorkType     string `json:"workType,omitempty"`
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// IssueIdentifier is the work item's human-readable identifier,
 	// projected from the session's stored detail when the list is served,
