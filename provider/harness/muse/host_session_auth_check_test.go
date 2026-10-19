@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -261,4 +262,103 @@ func TestCheckHostSessionLogin_StderrDiagnosticsRefused(t *testing.T) {
 	if err := CheckHostSessionLogin(context.Background(), path); !errors.Is(err, agent.ErrProviderUnavailable) {
 		t.Fatalf("noisy CLI accepted: %v", err)
 	}
+}
+
+// heartbeatFakeMuseCLI writes a fake whose background loop keeps
+// appending ticks to a heartbeat file for as long as it lives. The
+// path derives from the script's own directory, because the probe
+// runs `<binary> --version` under a minimal env that carries no
+// test state. Requiring ticks before the verdict proves the helper
+// was alive during the probe; requiring silence after proves the
+// probe's group kill reaped it.
+func heartbeatFakeMuseCLI(t *testing.T, body string) (bin, heartbeat string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake muse CLI uses /bin/sh; skip on windows")
+	}
+	dir := t.TempDir()
+	bin = filepath.Join(dir, "muse")
+	heartbeat = filepath.Join(dir, "heartbeat.log")
+	script := "#!/bin/sh\nHB='" + heartbeat + "'\n" + body
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+		t.Fatalf("write fake muse CLI: %v", err)
+	}
+	return bin, heartbeat
+}
+
+func heartbeatTicks(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path) //nolint:gosec // test temp path
+	if err != nil {
+		t.Fatalf("read heartbeat: %v", err)
+	}
+	return len(raw)
+}
+
+// assertHeartbeatStopped requires the helper to have been alive
+// during the probe (ticks > 0) and silent afterwards: two samples
+// past the kill-delivery window must agree.
+func assertHeartbeatStopped(t *testing.T, path string) {
+	t.Helper()
+	time.Sleep(time.Second)
+	before := heartbeatTicks(t, path)
+	if before == 0 {
+		t.Fatal("helper never ticked during the probe; the leak assertion is vacuous")
+	}
+	time.Sleep(800 * time.Millisecond)
+	if after := heartbeatTicks(t, path); after != before {
+		t.Fatalf("helper ticked after the probe returned (%d -> %d bytes): the probe leaked its process group", before, after)
+	}
+}
+
+// TestCheckHostSessionLogin_HangingCLIRefusedWithinTimeout pins the
+// 5 s bound with the production default: a CLI that hangs (and
+// ignores TERM) is refused at about the timeout, and its forked
+// helper dies with the probe's process group instead of leaking.
+// Raising the timeout lets the check stay blocked past the
+// advertised bound; deleting the group kill leaves the helper
+// ticking after the return.
+func TestCheckHostSessionLogin_HangingCLIRefusedWithinTimeout(t *testing.T) {
+	t.Parallel()
+	bin, heartbeat := heartbeatFakeMuseCLI(t,
+		"( while true; do echo tick >> \"$HB\"; sleep 0.2; done ) &\n"+
+			"trap '' TERM\n"+
+			"sleep 300\n")
+	done := make(chan error, 1)
+	go func() { done <- CheckHostSessionLogin(context.Background(), bin) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, agent.ErrProviderUnavailable) {
+			t.Fatalf("hanging CLI accepted: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("hanging CLI blocked past the 5 s probe bound")
+	}
+	assertHeartbeatStopped(t, heartbeat)
+}
+
+// TestCheckHostSessionLogin_DetachedChildKeepingStdoutOpenRefused
+// pins the WaitDelay path: the leader prints a valid version and
+// exits at once, but its child keeps the stdout pipe open. The
+// check still refuses (fast, not at the probe timeout), and the
+// group kill reaps the pipe-holder.
+func TestCheckHostSessionLogin_DetachedChildKeepingStdoutOpenRefused(t *testing.T) {
+	t.Parallel()
+	bin, heartbeat := heartbeatFakeMuseCLI(t,
+		"if [ \"$1\" = \"--version\" ]; then\n"+
+			"printf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\n"+
+			"( while true; do echo tick >> \"$HB\"; sleep 0.2; done ) &\n"+
+			"exit 0\n"+
+			"fi\n"+
+			"exit 3\n")
+	start := time.Now()
+	err := CheckHostSessionLogin(context.Background(), bin)
+	elapsed := time.Since(start)
+	if !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Fatalf("detached-child CLI accepted: %v", err)
+	}
+	if elapsed >= hostSessionLoginTimeout {
+		t.Fatalf("detached-child refusal took %v, want well under the %v probe bound (the WaitDelay path)", elapsed, hostSessionLoginTimeout)
+	}
+	assertHeartbeatStopped(t, heartbeat)
 }
