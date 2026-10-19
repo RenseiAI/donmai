@@ -83,7 +83,7 @@ check_author_red() {
     fail "tracker ID in author name did not fail the wrapper (rc=$rc)"
     return
   fi
-  if ! printf '%s\n' "$out" | grep -q "rule: TRACKER_ID "; then
+  if ! printf '%s\n' "$out" | grep -q "author.name matches a guard-b rule"; then
     fail "wrapper failed, but not on TRACKER_ID for the author name"
     return
   fi
@@ -111,7 +111,7 @@ check_coauthor_red() {
     fail "tracker ID in Co-authored-by trailer did not fail the wrapper (rc=$rc)"
     return
   fi
-  if ! printf '%s\n' "$out" | grep -q "rule: TRACKER_ID "; then
+  if ! printf '%s\n' "$out" | grep -q "Co-authored-by matches a guard-b rule"; then
     fail "wrapper failed, but not on TRACKER_ID for the trailer"
     return
   fi
@@ -139,7 +139,7 @@ check_committer_red() {
     fail "tracker slug in committer email did not fail the wrapper (rc=$rc)"
     return
   fi
-  if ! printf '%s\n' "$out" | grep -q "rule: TRACKER_ID_SLUG "; then
+  if ! printf '%s\n' "$out" | grep -q "committer.email matches a guard-b rule"; then
     fail "wrapper failed, but not on TRACKER_ID_SLUG for the committer email"
     return
   fi
@@ -153,9 +153,14 @@ check_green() {
   init_repo "$d"
   (cd "$d" && git commit -q --allow-empty -m base) >/dev/null 2>&1
   (cd "$d" && git tag base) >/dev/null 2>&1
-  commit_with_ident "$d" "Clean Name" "clean@example.invalid" \
-    "Clean Name" "clean@example.invalid" "work" \
-    "Co-authored-by: Clean Name <clean@example.invalid>"
+  # Follow AGENTS.md: explicit neutral config, without inherited overrides.
+  (cd "$d" && unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    git -c user.name="Donmai Agent" -c user.email="agent@donmai.dev" \
+      commit -q --allow-empty -m work)
+  (cd "$d" && unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    GIT_AUTHOR_NAME="Donmai Agent" GIT_AUTHOR_EMAIL="agent@donmai.dev" \
+      GIT_COMMITTER_NAME="Donmai Agent" GIT_COMMITTER_EMAIL="agent@donmai.dev" \
+      "$WRAPPER" --staged)
   set +e
   out="$(cd "$d" && "$WRAPPER" --commits base..HEAD 2>&1)"
   rc=$?
@@ -241,8 +246,75 @@ check_bad_range() {
 }
 check_bad_range
 
+# Exercise each recorded field with the existing brand rule's fixture value.
+# Removing single-character brackets produces a literal from the rule table.
+brand="$(sed -n "s/^  'BRAND_NAME|[^|]*|\\\\b\\(.*\\)\\\\b|.*$/\\1/p" "$REPO_ROOT/scripts/guard-b-lint.sh" | tr -d '[]')"
+if [[ -z "$brand" ]]; then
+  fail "could not derive brand fixture from scripts/guard-b-lint.sh"
+else
+  for field in author.name author.email committer.name committer.email; do
+    d="$TMP/brand-$field"
+    init_repo "$d"
+    (cd "$d" && git commit -q --allow-empty -m base && git tag base)
+    aname="Clean Name"; aemail="agent@example.invalid"
+    cname="Clean Name"; cemail="agent@example.invalid"
+    case "$field" in
+      author.name) aname="$brand" ;;
+      author.email) aemail="$brand@example.invalid" ;;
+      committer.name) cname="$brand" ;;
+      committer.email) cemail="$brand@example.invalid" ;;
+    esac
+    commit_with_ident "$d" "$aname" "$aemail" "$cname" "$cemail" work ""
+    sha="$(cd "$d" && git rev-parse HEAD)"
+    # A clean tip must not hide the offending earlier commit.
+    commit_with_ident "$d" "Clean Name" "agent@example.invalid" \
+      "Clean Name" "agent@example.invalid" followup ""
+    rc=0
+    out="$(cd "$d" && "$WRAPPER" --commits base..HEAD 2>&1)" || rc=$?
+    if [[ $rc -ne 1 ]] || [[ "$out" != *"commit $sha $field matches a guard-b rule"* ]]; then
+      fail "brand fixture for $field must reject and name commit and field (rc=$rc)"
+    elif [[ "$out" == *"$brand"* ]] || [[ "$out" == *"$aemail"* ]] || [[ "$out" == *"rule:"* ]]; then
+      fail "brand fixture for $field exposed identity or engine diagnostics"
+    else
+      echo "brand fixture $field: rejected; commit and field named; diagnostics redacted"
+      PASS=$((PASS + 1))
+    fi
+  done
+  for field in AUTHOR_NAME AUTHOR_EMAIL COMMITTER_NAME COMMITTER_EMAIL; do
+    rc=0
+    out="$(cd "$TMP/green-repo" && env "GIT_$field=$brand" "$WRAPPER" --staged 2>&1)" || rc=$?
+    expected="staged ${field%_*}.name"
+    [[ "$field" != *_EMAIL ]] || expected="staged ${field%_*}.email"
+    if [[ $rc -ne 1 ]] || [[ "$out" == *"$brand"* ]] || [[ "$out" != *"$expected matches a guard-b rule"* ]]; then
+      fail "staged brand fixture for $field must reject with redacted field diagnostic (rc=$rc)"
+      continue
+    fi
+    echo "staged brand fixture $field: rejected; field named; diagnostics redacted"
+    PASS=$((PASS + 1))
+  done
+fi
+
+# Engine failures must fail closed without forwarding potentially private output.
+mkdir -p "$TMP/engine-error"
+cp "$WRAPPER" "$TMP/engine-error/guard-b-identity-lint.sh"
+cat > "$TMP/engine-error/guard-b-lint.sh" <<'ENGINE'
+#!/usr/bin/env bash
+echo private-diagnostic
+echo private-diagnostic >&2
+exit 2
+ENGINE
+chmod +x "$TMP/engine-error/guard-b-lint.sh"
+rc=0
+out="$(cd "$TMP/green-repo" && "$TMP/engine-error/guard-b-identity-lint.sh" --commits base..HEAD 2>&1)" || rc=$?
+if [[ $rc -ne 2 ]] || [[ "$out" != *"engine error (exit 2)"* ]] || [[ "$out" == *"private-diagnostic"* ]]; then
+  fail "engine error must fail closed with redacted diagnostics (rc=$rc)"
+else
+  echo "engine error fixture: failed closed; diagnostics redacted"
+  PASS=$((PASS + 1))
+fi
+
 # ---- Report -----------------------------------------------------------------
-N=7
+N=16
 echo ""
 if [[ $FAIL -eq 0 ]]; then
   echo "guard-b identity-lint self-test: OK — $PASS/$N checks behaved as specified."

@@ -529,6 +529,14 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err := h.start(ctx, plan, sessionID); err != nil {
 		p.unregisterHandle(h)
 		cleanupErr := h.releaseMCPConfig()
+		// A proven-gone thread must stay typed-not-found across the
+		// spawn-failed wrap: the restore machine (agent.DecideRestore)
+		// admits fresh_primed on errors.Is(err,
+		// agent.ErrSessionNotFound), and a %v-flattened chain would
+		// misroute it to attention_required.
+		if errors.Is(err, agent.ErrSessionNotFound) {
+			return nil, errors.Join(fmt.Errorf("%w: codex resume %q: %w", agent.ErrSpawnFailed, sessionID, err), cleanupErr)
+		}
 		return nil, errors.Join(fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err), cleanupErr)
 	}
 
@@ -899,11 +907,11 @@ func (p *Provider) registerHandle(h *Handle) {
 }
 
 // forwardRateLimitUpdates routes `account/rateLimits/updated`
-// notifications into every live handle's event stream. The
-// notification carries no thread id, so the client's fall-through
-// handler is the only place it surfaces; each handle maps it through
-// the shared probe mapper onto a UsageEvent carrying the sparse
-// update. Delivery is non-blocking and best-effort: a handle whose
+// notifications and untargeted warnings into every live handle's event stream.
+// These notifications carry no thread id, so the client's fall-through handler
+// is the only place they surface. Each handle maps quota updates to UsageEvents
+// and warnings to nonterminal diagnostic SystemEvents. Delivery is non-blocking
+// and best-effort: a handle whose
 // queue is full drops the update rather than stalling the client's
 // read loop, and the next probe reconciles whatever was missed.
 func (p *Provider) forwardRateLimitUpdates() {
@@ -915,7 +923,8 @@ func (p *Provider) forwardRateLimitUpdates() {
 	// rather than fanning ignored UI/account updates out to every session.
 	ignoredState := &mapperState{}
 	client.SubscribeGlobal(func(n notification) {
-		if n.Method != "account/rateLimits/updated" {
+		globalWarning := n.Method == "warning" && extractThreadID(n.Params) == "" && len(n.ServerRequestID) == 0
+		if n.Method != "account/rateLimits/updated" && !globalWarning {
 			// A fall-through handler replaces the client's own, which
 			// answers an unhandled server request with -32601 so codex
 			// does not wait on it. Keep that answer.

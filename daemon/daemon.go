@@ -168,9 +168,20 @@ type Options struct {
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
 
+	// TrustLedgerSweeper undoes seeded workspace-trust entries whose owning
+	// session is no longer live, once per Start, after shim adoption and
+	// before registration — see sweepSeededTrustLedger. Nil (the default
+	// every Start call gets unless a caller sets this field) makes the
+	// sweep step a no-op. Only the production entry point
+	// (afcli/daemon_run.go) sets it, to
+	// providerclaude.SweepSeededTrustForConfigHome, so a daemon built for
+	// real operator use always sweeps; a daemon built for a test never does.
+	TrustLedgerSweeper TrustLedgerSweepFunc
+
 	// QuotaProbeBinaries names the harness CLIs the live quota probes
-	// shell out to, keyed by harness ("codex", "claude" — see
-	// agent.UsageHarnessCodex / agent.UsageHarnessClaude). Empty (the
+	// shell out to, keyed by harness ("codex", "claude", "muse" —
+	// see agent.UsageHarnessCodex / agent.UsageHarnessClaude /
+	// agent.UsageHarnessMuse). Empty (the
 	// default every Start call gets unless a caller sets this field)
 	// disables that harness's probe: the quota cache then moves only
 	// on worker-reported stream updates. Only the production entry
@@ -1646,6 +1657,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
+	// Undo seeded workspace trust whose owning session died before its
+	// cleanup ran. Runs after adoption so live sessions' ledger rows are
+	// protected, and never fails startup — see sweepSeededTrustLedger.
+	d.sweepSeededTrustLedger(ctx)
 	// A refused startup founding stands the composition down above, so this
 	// second registration runs exactly when the daemon presents no composed
 	// attestation: either it never did, or its founder was refused and it
@@ -2147,6 +2162,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	// Opt-in anonymous usage count — the weekly scheduler for the
+	// operator-consented installation count. The loop reads the live
+	// config each tick so `host set` takes effect without a restart;
+	// disabled or unconfigured sends nothing at all.
+	d.startUsagePingLoop(ctx)
+
 	// Phase 3b: hot-reload daemon.yaml on direct edits. Without this,
 	// `vim ~/.donmai/daemon.yaml` then :w leaves the running daemon with
 	// stale in-memory state until restart — a real silent-staleness gap
@@ -2272,6 +2293,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
+	usagePingChanged := d.config.UsagePing != cfg.UsagePing
 	seatBudgetChanged := d.config.Capacity.SeatBudget != cfg.Capacity.SeatBudget
 	seatQoSChanged := d.config.Capacity.SeatQoS != cfg.Capacity.SeatQoS
 	// A rotated registration token rides alongside project changes: the new
@@ -2281,7 +2303,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// the previous generation stays), so checking for the change here only
 	// decides whether the reload path runs at all.
 	registrationTokenChanged := d.credentials != nil && cfg.Orchestrator.AuthToken != "" && cfg.Orchestrator.AuthToken != d.config.Orchestrator.AuthToken
-	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged {
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged && !usagePingChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -2342,6 +2364,15 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			}
 		}
 		d.config.Capacity.SeatQoS = cfg.Capacity.SeatQoS
+	}
+	if usagePingChanged {
+		d.config.UsagePing = cfg.UsagePing
+		if !cfg.UsagePingEnabled() {
+			// Disabling cancels queued work: no stale schedule
+			// survives the opt-out, and no future transmission
+			// is attempted until the operator opts back in.
+			cancelUsagePing(DefaultUsagePingStatePath())
+		}
 	}
 	if projectsChanged || localChanged {
 		if cfg.LocalRuntime == nil {

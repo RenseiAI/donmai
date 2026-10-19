@@ -122,6 +122,11 @@ type Config struct {
 	// runners pick up daemon-side runtime-token refreshes mid-session.
 	CredentialProvider CredentialProvider
 
+	// Traceparent and Tracestate carry the optional dispatch W3C trace context.
+	// Empty values omit the corresponding request headers.
+	Traceparent string
+	Tracestate  string
+
 	// HTTPClient overrides http.DefaultClient.
 	HTTPClient *http.Client
 	// Logger overrides slog.Default(). The poster logs at debug for
@@ -555,6 +560,12 @@ func (p *Poster) postActivity(ctx context.Context, body payload) error {
 		return fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}
@@ -633,7 +644,8 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // agent.SystemSubtypeReasoningEffort become context markers with fixed
 // content (never the event's free-form Message; the effort marker names a
 // level only when it is a known agent.EffortLevel). Codex rerouting,
-// moderation and safety buffering become warnings; file/plan deltas become
+// moderation and safety buffering become warnings; native diagnostics retain
+// their error/warning level without terminating the turn; file/plan deltas become
 // progress activities.
 //
 // timestamp is the wall-clock time at which the event was observed; the
@@ -730,7 +742,11 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 
 	case agent.SystemEvent:
 		switch e.Subtype {
-		case "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+		case "codex_error":
+			out.Type = "error"
+			out.Content = e.Message
+			return out, true
+		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
 			out.Type = "warning"
 			out.Content = e.Message
 			return out, true

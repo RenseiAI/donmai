@@ -125,6 +125,9 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 	case agent.InitEvent:
 		return "init", ""
 	case agent.SystemEvent:
+		if contentFreeSubtype(e.Subtype) {
+			return "", ""
+		}
 		s := e.Subtype
 		if e.Message != "" {
 			s = strings.TrimSpace(e.Subtype + " " + e.Message)
@@ -164,6 +167,20 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 	default:
 		return string(ev.Event.Kind()), ""
 	}
+}
+
+// contentFreeSubtype reports whether a system subtype is a runner-internal
+// signal with no text for a reader: the stream-progress liveness tick and
+// the metadata-only serving observations. The merged stream never prints
+// them; stream progress instead drives the card's streaming indicator.
+func contentFreeSubtype(subtype string) bool {
+	switch subtype {
+	case agent.SystemSubtypeStreamProgress,
+		agent.SystemSubtypeModelIdentity,
+		agent.SystemSubtypeGenerationID:
+		return true
+	}
+	return false
 }
 
 // toolUseSummary renders a tool-use event as "Tool: arg" — a local

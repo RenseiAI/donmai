@@ -23,8 +23,8 @@ func TestGateway_StatusReflectsRoutes(t *testing.T) {
 	if st.Routes != 0 {
 		t.Errorf("routes = %d, want 0", st.Routes)
 	}
-	if len(st.Surfaces) != 1 || st.Surfaces[0] != string(agent.ProtoOpenAIChat) {
-		t.Errorf("surfaces = %v, want [openai-chat]", st.Surfaces)
+	if len(st.Surfaces) != 2 || st.Surfaces[0] != string(agent.ProtoOpenAIChat) || st.Surfaces[1] != string(agent.ProtoOpenAIResponses) {
+		t.Errorf("surfaces = %v, want [openai-chat openai-responses]", st.Surfaces)
 	}
 	if st.LedgerPath == "" {
 		t.Error("ledger path should be surfaced")

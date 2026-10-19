@@ -24,7 +24,7 @@ func TestBuildArgs_MutableDeclarationGrantsEveryMutablePath(t *testing.T) {
 			ReadOnlyPaths: []string{"/work/root/context"}, Enforcement: "none",
 		},
 	}
-	argv, _ := buildArgs(spec, "", "")
+	argv, _ := buildArgs(spec, "", "", "")
 
 	var addDirs []string
 	for i, flag := range argv {
@@ -43,7 +43,7 @@ func TestBuildArgs_MutableDeclarationGrantsEveryMutablePath(t *testing.T) {
 func TestBuildArgs_NoAuthorityKeepsSingleCwdGrant(t *testing.T) {
 	t.Parallel()
 
-	argv, _ := buildArgs(agent.Spec{Prompt: "x", Cwd: "/work/leaf"}, "", "")
+	argv, _ := buildArgs(agent.Spec{Prompt: "x", Cwd: "/work/leaf"}, "", "", "")
 
 	var addDirs []string
 	for i, flag := range argv {
@@ -72,7 +72,7 @@ func TestInteractiveArgs_MutableDeclarationGrantsEveryMutablePath(t *testing.T) 
 			ReadOnlyPaths: []string{"/work/root/context"}, Enforcement: "none",
 		},
 	}
-	headless, _ := buildArgs(spec, "", "")
+	headless, _ := buildArgs(spec, "", "", "")
 	got := interactiveArgs(spec)
 
 	addDirsOf := func(argv []string) []string {

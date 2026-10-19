@@ -484,6 +484,7 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 				"parentIdentifier": parentIdentifier,
 				"priority":         issue.Priority,
 				"sortOrder":        issue.SortOrder,
+				"estimate":         issue.Estimate,
 				"createdAt":        issue.CreatedAt,
 				"updatedAt":        issue.UpdatedAt,
 			}
@@ -1271,6 +1272,7 @@ func newLinearListSubIssuesCmd(ds func() afclient.DataSource, bin string) *cobra
 					"parentId":   parent.ID,
 					"priority":   c.Priority,
 					"sortOrder":  c.SortOrder,
+					"estimate":   c.Estimate,
 					"labels":     labelNames(c.Labels),
 					"url":        c.URL,
 					"blockedBy":  []any{},
@@ -1428,6 +1430,7 @@ func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource, bin string) *cobr
 // ─── list-issues ──────────────────────────────────────────────────────────────
 
 func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
+	var structured listFilterFlags
 	var (
 		project  string
 		status   string
@@ -1445,6 +1448,10 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		Short:        "List issues with flexible filters",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			structuredFilter, err := structured.parse(cmd)
+			if err != nil {
+				return err
+			}
 			if err := linear.ValidateIssueListLimit(limit); err != nil {
 				return err
 			}
@@ -1453,7 +1460,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 			default:
 				return fmt.Errorf("--order-by must be createdAt, updatedAt, or manual")
 			}
-			client, err := newLinearClient(ds, bin)
+			client, err := newFilteredListClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -1523,7 +1530,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				}
 			}
 
-			result, err := client.ListIssues(ctx, filter, limit, orderBy)
+			result, err := client.ListIssuesWithOptions(ctx, linear.AndFilters(filter, structuredFilter), limit, orderBy, structured.includeArchived)
 			if err != nil {
 				return fmt.Errorf("list issues using %s order: %w", orderBy, err)
 			}
@@ -1561,6 +1568,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 					"status":    iss.State.Name,
 					"priority":  iss.Priority,
 					"sortOrder": iss.SortOrder,
+					"estimate":  iss.Estimate,
 					"labels":    labelNames(iss.Labels),
 					"project":   projName,
 					"assignee":  assigneeName,
@@ -1591,6 +1599,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Priority then createdAt/updatedAt, or ascending Linear manual order (flat; rank 0 valid; null last; ties keep Linear order)")
 	cmd.Flags().StringVar(&query, "query", "", "Text search query")
 
+	structured.register(cmd)
 	return cmd
 }
 
@@ -1704,6 +1713,7 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 					"url":         iss.URL,
 					"priority":    iss.Priority,
 					"sortOrder":   iss.SortOrder,
+					"estimate":    iss.Estimate,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
 					"parentID":    iss.ParentID,
@@ -1790,6 +1800,7 @@ dependency readiness does not change that selection.`,
 					"url":         iss.URL,
 					"priority":    iss.Priority,
 					"sortOrder":   iss.SortOrder,
+					"estimate":    iss.Estimate,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
 					"parentID":    iss.ParentID,
@@ -2147,6 +2158,7 @@ func newLinearListTeamsCmd(ds func() afclient.DataSource, bin string) *cobra.Com
 // project ID when needed rather than selecting an arbitrary team key.
 func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var team string
+	var structured listFilterFlags
 	type projectEntry struct {
 		ID      string `json:"id"`
 		Name    string `json:"name"`
@@ -2159,11 +2171,15 @@ func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.
 		Short:        "List accessible projects",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, err := newLinearClient(ds, bin)
+			filter, err := structured.parse(cmd)
 			if err != nil {
 				return err
 			}
-			projects, err := client.ListProjects(cmd.Context(), team)
+			client, err := newFilteredListClient(ds, bin)
+			if err != nil {
+				return err
+			}
+			projects, err := client.ListProjectsWithOptions(cmd.Context(), team, filter, structured.includeArchived)
 			if err != nil {
 				return fmt.Errorf("list projects: %w", err)
 			}
@@ -2196,6 +2212,7 @@ func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.
 		},
 	}
 	cmd.Flags().StringVar(&team, "team", "", "Canonical team key or UUID to filter projects")
+	structured.register(cmd)
 	return cmd
 }
 

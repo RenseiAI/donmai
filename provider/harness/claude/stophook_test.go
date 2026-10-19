@@ -542,6 +542,7 @@ func TestInteractiveArgs_NoticeSettingsPrecedeThePositionalPrompt(t *testing.T) 
 	want := []string{
 		"--settings", settings,
 		"--permission-mode", "bypassPermissions",
+		"--disallowedTools", strings.Join(linearMCPDisallowList, ","),
 		"fix the bug",
 	}
 	if !slices.Equal(got, want) {

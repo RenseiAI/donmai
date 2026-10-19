@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -259,7 +261,7 @@ func TestRun_SeatBudgetCapsKitProvision(t *testing.T) {
 
 // TestInstallSessionDependencies_CapsSeatEnv drives the PRODUCTION
 // dependency-install path with a seat budget and the default (real)
-// shell execer, and asserts the install child observes the seat's worker
+// dependency execer, and asserts the install child observes the seat's worker
 // caps. A fake `go` on PATH records the GOMAXPROCS it observes for a
 // worktree carrying a go.mod; reverting the default execer to the
 // uncapped session env leaves that record empty.
@@ -270,15 +272,14 @@ func TestInstallSessionDependencies_CapsSeatEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	report := filepath.Join(dir, "install-gomaxprocs")
-	fakeGo := "#!/bin/sh\nprintf '%s' \"$GOMAXPROCS\" > \"$REPORT_PATH\"\nexit 0\n"
+	fakeGo := "#!/bin/sh\nprintf '%s' \"$GOMAXPROCS\" > '" + report + "'\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(fakes, "go"), []byte(fakeGo), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("REPORT_PATH", report)
-
 	h := newRunnerHarness(t)
-	qw := h.queuedWork("DEPS-SEAT-1")
+	h.runner.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	qw := h.queuedWork("dependency-seat")
 	qw.SeatBudget = &SeatBudget{Mode: "best-effort", CPUs: 3}
 	wpath := t.TempDir()
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")

@@ -159,6 +159,52 @@ func TestServerHandle_HappyPath_Conforms(t *testing.T) {
 	}
 }
 
+// TestServerHandle_PermissionDecidedBeforeFirstTick pins the synchronous
+// first adjudication pass behind start: with the poll interval stretched far
+// past the wait bound, permissions already pending at subscribe time must
+// still be replied to and surfaced. Reverting start to a ticker-only pump
+// fails here, because the first pass would wait out the stretched interval
+// instead of running on the start path.
+func TestServerHandle_PermissionDecidedBeforeFirstTick(t *testing.T) {
+	t.Parallel()
+	fc := newFakeClient()
+	fc.pending = []permissionRequest{
+		{ID: "p-early", SessionID: "ses_it", Action: "bash", Resources: []string{"ls"}},
+	}
+	h := newServerHandle(nil, fc, fc.sessionID, agent.Spec{}, slog.Default())
+	h.permInterval = time.Hour // the first pass must not wait for a tick
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				t.Fatal("event stream closed before the pending permission was decided")
+			}
+			if decision, ok := ev.(agent.SystemEvent); ok && decision.Subtype == "permission_decision" {
+				request, ok := decision.Raw.(permissionRequest)
+				if !ok {
+					t.Fatalf("permission decision has no request identity: %#v", decision.Raw)
+				}
+				if request.ID != "p-early" {
+					t.Fatalf("permission decision for %q, want p-early", request.ID)
+				}
+				if r, _ := fc.replyOf("p-early"); r.Reply != replyOnce {
+					t.Fatalf("p-early reply = %q, want once", r.Reply)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("pending permission was not decided before the first tick")
+		}
+	}
+}
+
 func TestServerHandle_PermissionRoundTrip(t *testing.T) {
 	t.Parallel()
 	fc := newFakeClient()

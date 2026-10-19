@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/internal/diagnostic"
 	"github.com/RenseiAI/donmai/ptyhost"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -52,7 +54,8 @@ type Handle struct {
 //
 // spec.Env is passed through to ptyhost.Spec.Env, which layers it onto the
 // parent process environment, applies TERM=xterm-256color /
-// COLORTERM=truecolor as interactive defaults, and then honors explicit
+// COLORTERM=truecolor plus LANG=C.UTF-8 (only when no layer names a locale)
+// as interactive defaults, and then honors explicit
 // per-request overrides
 // (ptyhost/spec.go composeEnv) — the harness-layer callers of this package
 // never need to set those themselves. spec.Cwd is passed through verbatim.
@@ -257,6 +260,13 @@ func (h *Handle) run() {
 	h.awaitShimTerminal()
 	exit, _ := h.sess.Exit()
 	result := buildResult(exit)
+	if res, ok := result.(agent.ResultEvent); ok && !res.Success {
+		if tail := h.failureOutputTail(); tail != "" {
+			res.Errors[0] += "\nPTY output tail:\n" + tail
+			result = res
+			slog.Error("interactive pty child failed", "error", res.Errors[0])
+		}
+	}
 	if cost := h.readTerminalCost(); cost != nil {
 		if res, ok := result.(agent.ResultEvent); ok {
 			res.Cost = cost
@@ -268,6 +278,40 @@ func (h *Handle) run() {
 	}
 	h.events <- result
 	h.closeOnce.Do(func() { close(h.events) })
+}
+
+// failureOutputTail replays only output after Done has drained the PTY.
+// Redact before taking the 4 KiB tail so truncation cannot cut off a secret's
+// identifying prefix. If the ring evicted output, discard its first remaining
+// line because that line may start in the middle of a credential.
+func (h *Handle) failureOutputTail() string {
+	sub, err := h.sess.Subscribe(0)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = sub.Close() }()
+	var output strings.Builder
+	evicted := h.sess.FirstBufferedSeq() > 1
+	for frame := range sub.Frames() {
+		if frame.Type != attachwire.TypeOutput {
+			continue
+		}
+		output.Write(frame.Payload)
+	}
+	raw := output.String()
+	if evicted {
+		if newline := strings.IndexByte(raw, '\n'); newline >= 0 {
+			raw = raw[newline+1:]
+		} else {
+			return ""
+		}
+	}
+	tail := diagnostic.Redact(raw)
+	const tailBytes = 4 * 1024
+	if len(tail) > tailBytes {
+		tail = tail[len(tail)-tailBytes:]
+	}
+	return strings.TrimSpace(tail)
 }
 
 // readTerminalCost invokes the harness-supplied TerminalCost exactly once,

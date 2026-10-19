@@ -201,6 +201,8 @@ func (r *Runner) dispatchInterview(
 			BaseURL:            qw.PlatformURL,
 			AuthToken:          qw.AuthToken,
 			CredentialProvider: tdCredProvider,
+			Traceparent:        qw.Traceparent,
+			Tracestate:         qw.Tracestate,
 			HTTPClient:         r.httpClient,
 			Logger:             r.logger,
 		})

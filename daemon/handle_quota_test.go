@@ -173,6 +173,11 @@ func TestSessionUsageRoute_RejectsUnknownSessionsAndHarnesses(t *testing.T) {
 	if got := post("/api/daemon/sessions/sess-quota-2/usage", `{"harness":"mystery","update":{"checkedAt":"2026-10-06T12:00:00Z","windows":[]}}`); got != http.StatusBadRequest {
 		t.Errorf("unknown harness status = %d, want 400", got)
 	}
+	// The muse check is probe-only: a worker stream cannot move its
+	// verdict, so the route refuses it instead of merging.
+	if got := post("/api/daemon/sessions/sess-quota-2/usage", `{"harness":"muse","update":{"checkedAt":"2026-10-06T12:00:00Z","windows":[]}}`); got != http.StatusBadRequest {
+		t.Errorf("muse harness status = %d, want 400", got)
+	}
 	if got := post("/api/daemon/sessions/sess-quota-2/usage", `not json`); got != http.StatusBadRequest {
 		t.Errorf("malformed body status = %d, want 400", got)
 	}

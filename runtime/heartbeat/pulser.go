@@ -76,6 +76,10 @@ type Config struct {
 	// Optional — when empty no auth header is set (test paths use
 	// httptest.Server without auth).
 	AuthToken string
+	// Traceparent and Tracestate carry the dispatch W3C trace context.
+	// Empty values omit the corresponding request headers.
+	Traceparent string
+	Tracestate  string
 	// SessionClass is the runtime session-class discriminator stamped on
 	// every lock-refresh request body (wire field "sessionClass"). The
 	// runner sets it to "interactive" for a PTY-hosted interactive session
@@ -900,6 +904,12 @@ func (p *Pulser) postRefresh(ctx context.Context, ack string, dead []DeadLettere
 		return nil, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}

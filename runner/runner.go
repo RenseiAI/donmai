@@ -430,9 +430,9 @@ type Options struct {
 	RescueDir string
 
 	// DepsExecer runs the post-acquire repository dependency install
-	// step (loop.go step 2b-bis). Nil uses the same local in-box shell
-	// executor as kit provisioning. Tests substitute a fake to assert
-	// the install command, working directory and order without
+	// step (loop.go step 2b-bis). Nil uses direct execution with a minimal
+	// environment and bounded process-group cleanup. Tests substitute a fake
+	// to assert the install command, working directory and order without
 	// running real installs.
 	DepsExecer DepsExecer
 
@@ -493,9 +493,8 @@ type ShimSeatConfig struct {
 
 // DepsExecer runs repository dependency install commands against
 // the acquired worktree. It mirrors kit.Execer so the dependency
-// install step reuses the same local in-box shell execution as kit
-// provisioning. Production code leaves Options.DepsExecer nil and
-// gets shellExecer; tests substitute a fake.
+// install step can use the existing test seam. Production code leaves
+// Options.DepsExecer nil and gets the direct dependency installer.
 type DepsExecer = kit.Execer
 
 // Runner is the long-lived per-daemon orchestrator. Build one via

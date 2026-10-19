@@ -18,8 +18,8 @@
 #
 # The engine itself is untouched: the wrapper collects identity text and pipes
 # it to `guard-b-lint.sh --stdin` under a label naming the commit (or the
-# staged state), one invocation per commit so a failure points at the commit
-# that carries it.
+# staged state), one invocation per field so a failure names the commit and field,
+# without publishing the identity or the engine's matching text.
 #
 # Usage: guard-b-identity-lint.sh (--staged | --commits <rev-range>)
 #   --staged            scan what the NEXT commit would record: `git var
@@ -68,99 +68,69 @@ case "$MODE" in
     ;;
 esac
 
-# check_stream <label> — scan stdin under <label>; 0 clean, 1 violation.
+# Never forward engine diagnostics: they contain the identity and matched text.
+# Keep the vendored rule table in scripts/guard-b-lint.sh as the only policy.
 check_stream() {
-  local label="$1" out rc
-  set +e
-  out="$(printf '%s' "$(cat)" | "$GUARD" --stdin "$label" 2>&1)"
-  rc=$?
-  set -e
+  local label="$1" rc
+  if "$GUARD" --stdin "$label" >/dev/null 2>&1; then
+    return 0
+  else
+    rc=$?
+  fi
   if [[ $rc -eq 1 ]]; then
-    printf '%s\n' "$out"
-    return 1
+    echo "guard-b-identity-lint: BLOCKING — $label matches a guard-b rule." >&2
+    FAIL=1
+    return 0
   fi
-  if [[ $rc -ne 0 ]]; then
-    printf '%s\n' "$out" >&2
-    echo "guard-b-identity-lint ($label): engine error (exit $rc)." >&2
-    return 2
-  fi
-  return 0
+  echo "guard-b-identity-lint: $label: engine error (exit $rc)." >&2
+  exit 2
 }
 
 FAIL=0
 
 if [[ "$MODE" == "--staged" ]]; then
-  STAGED_TMP="$(mktemp)"
-  trap 'rm -f "$STAGED_TMP"' EXIT
-  {
-    git var GIT_AUTHOR_IDENT
-    git var GIT_COMMITTER_IDENT
-  } > "$STAGED_TMP"
-  set +e
-  check_stream "staged-identity" < "$STAGED_TMP"
-  rc=$?
-  set -e
-  if [[ $rc -eq 1 ]]; then
-    echo "guard-b-identity-lint: BLOCKING — the staged author/committer identity matches a guard-b rule." >&2
-    echo "Fix the identity (git config user.name/user.email, or the GIT_AUTHOR_*/GIT_COMMITTER_* env) before committing." >&2
+  for role in AUTHOR COMMITTER; do
+    ident="$(git var "GIT_${role}_IDENT")"
+    # git var appends timestamp and timezone after the closing email bracket.
+    ident="${ident%>*}"
+    name="${ident% <*}"
+    email="${ident##* <}"
+    # Use redirection rather than a pipe so FAIL persists in this shell.
+    check_stream "staged ${role}.name" <<< "$name"
+    check_stream "staged ${role}.email" <<< "$email"
+  done
+  if [[ $FAIL -ne 0 ]]; then
+    echo "Fix git user.name/user.email or GIT_AUTHOR_*/GIT_COMMITTER_* before committing." >&2
     exit 1
   fi
-  [[ $rc -eq 0 ]] || exit 2
   echo "guard-b-identity-lint (staged): OK — staged author/committer identity is clean."
   exit 0
 fi
 
-# ---- --commits: one --stdin scan per commit, labelled by short sha ---------
 SHAS_TMP="$(mktemp)"
 trap 'rm -f "$SHAS_TMP"' EXIT
-
-set +e
-git rev-list "$RANGE" > "$SHAS_TMP" 2>/tmp/guard-b-identity-revlist.err
-REV_RC=$?
-set -e
-
-if [[ $REV_RC -ne 0 ]]; then
-  cat /tmp/guard-b-identity-revlist.err >&2 || true
-  echo "guard-b-identity-lint: FAILED — could not evaluate rev-range '$RANGE' (git rev-list exited $REV_RC)." >&2
-  echo "guard-b-identity-lint: refusing to report a clean scan for a range that could not be read." >&2
+if ! git rev-list "$RANGE" > "$SHAS_TMP" 2>/dev/null; then
+  echo "guard-b-identity-lint: FAILED — could not evaluate rev-range; refusing a clean scan." >&2
   exit 2
 fi
 
-SHAS=()
+COUNT=0
 while IFS= read -r sha; do
   [[ -n "$sha" ]] || continue
-  SHAS+=("$sha")
+  COUNT=$((COUNT + 1))
+  # Lowercase placeholders read the recorded fields, ignoring mailmap rewrites.
+  for spec in 'author.name:%an' 'author.email:%ae' 'committer.name:%cn' 'committer.email:%ce'; do
+    field="${spec%%:*}"
+    value="$(git log -1 --format="${spec#*:}" "$sha")"
+    check_stream "commit $sha $field" <<< "$value"
+  done
+  body="$(git log -1 --format='%B' "$sha")"
+  trailers="$(printf '%s\n' "$body" | grep -i '^co-authored-by:' || true)"
+  check_stream "commit $sha Co-authored-by" <<< "$trailers"
 done < "$SHAS_TMP"
 
-if [[ ${#SHAS[@]} -eq 0 ]]; then
-  echo "guard-b-identity-lint: no commits in $RANGE — nothing to scan."
-  exit 0
-fi
-
-for sha in "${SHAS[@]}"; do
-  short="${sha:0:12}"
-  IDENT_TMP="$(mktemp)"
-  {
-    git log -1 --format='%an%n%ae%n%cn%n%ce' "$sha"
-    git log -1 --format='%B' "$sha" | grep -i '^co-authored-by:' || true
-  } > "$IDENT_TMP"
-  set +e
-  check_stream "commit-identity:${short}" < "$IDENT_TMP"
-  rc=$?
-  set -e
-  rm -f "$IDENT_TMP"
-  if [[ $rc -eq 1 ]]; then
-    echo "guard-b-identity-lint: BLOCKING — commit $short carries an author, committer, or Co-authored-by identity matching a guard-b rule." >&2
-    FAIL=1
-  elif [[ $rc -ne 0 ]]; then
-    exit 2
-  fi
-done
-
 if [[ $FAIL -ne 0 ]]; then
-  echo "guard-b-identity-lint: BLOCKING — identity violations found in $RANGE." >&2
   exit 1
 fi
 
-echo "guard-b-identity-lint: OK — ${#SHAS[@]} commit(s) in $RANGE, identities clean."
-exit 0
+echo "guard-b-identity-lint: OK — $COUNT commit(s), identities clean."
