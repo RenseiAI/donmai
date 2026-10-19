@@ -156,6 +156,11 @@ const museHostSessionAccountID = "muse-host-session"
 // beside its verdict. An unresolvable binary disables the probe like
 // the codex one: the attempt records nothing and the heartbeat keeps
 // omitting the muse entry.
+//
+// The check runs under context.Background(), not the per-attempt ctx:
+// a cancelled attempt must not record a false ok:false verdict, so
+// the probe always runs to its own 5 s bound and a stopping poller
+// waits it out instead of publishing the cancellation as a refusal.
 func museQuotaProbe(binary string) quotaProbeFunc {
 	return func(_ context.Context, q *quotaState) {
 		at := time.Now()

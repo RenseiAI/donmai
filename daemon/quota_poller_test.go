@@ -220,6 +220,10 @@ func writeFakeMuseProbeCLI(t *testing.T, versionLine string, fail bool) string {
 // proof for the muse half of the wiring: the poller's muse probe runs
 // a fake binary into the quota cache, and the heartbeat quota field
 // the daemon sends carries the exact muse entry.
+//
+// It calls the probe func directly, so it cannot see the poller loop
+// wiring (probeDue's muse case): TestQuotaPoller_MuseLoopPublishesEntry
+// below owns that half, through the real Start/loop path.
 func TestQuotaPoller_MuseProbeToHeartbeatSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -289,6 +293,46 @@ func TestQuotaPoller_MuseProbeMissingBinaryOmitsEntry(t *testing.T) {
 	got := dGone.quotaSnapshot()
 	if len(got) != 1 || got[0].AuthCheck == nil || got[0].AuthCheck.OK {
 		t.Fatalf("snapshot = %+v, want one muse entry with ok:false", got)
+	}
+}
+
+// TestQuotaPoller_MuseLoopPublishesEntry pins the production poller
+// loop wiring for muse: it starts the real quota poller (Start/loop,
+// not the probe func directly) with a fake muse binary and waits for
+// the muse entry to land on the heartbeat snapshot. Deleting the
+// probeDue muse case (daemon/quota_poller.go) leaves every other
+// muse test green while the entry never appears, so this test owns
+// that case.
+func TestQuotaPoller_MuseLoopPublishesEntry(t *testing.T) {
+	t.Parallel()
+
+	bin := writeFakeMuseProbeCLI(t, "Muse Code 1.4.9 (1.4.9-R6297.1)", false)
+	d := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessMuse: bin}})
+	poller := newQuotaPoller(d.quota, d.quotaProbes())
+	poller.Start()
+	t.Cleanup(poller.Stop)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, acct := range d.quotaSnapshot() {
+			if acct.Provider != agent.UsageHarnessMuse {
+				continue
+			}
+			if acct.ID != "muse-host-session" {
+				t.Fatalf("muse account = %+v, want the host-session entry", acct)
+			}
+			if acct.AuthCheck == nil || !acct.AuthCheck.OK || acct.AuthCheck.Harness != agent.UsageHarnessMuse {
+				t.Fatalf("muse authCheck = %+v, want ok:true for muse", acct.AuthCheck)
+			}
+			if len(acct.Limits.Windows) != 0 {
+				t.Fatalf("muse limits = %+v, want no windows on a muse entry", acct.Limits)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("poller loop never published the muse entry: %+v", d.quotaSnapshot())
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
