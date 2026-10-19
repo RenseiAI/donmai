@@ -2428,7 +2428,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 				}
 				// A durable carrier is installed by the adoption takeover that
 				// resolves this consumer's gate. During re-adoption the consumer
-					// starts before that takeover runs, so a batch persisted at once
+				// starts before that takeover runs, so a batch persisted at once
 				// would meet "no carrier candidate" and be classified as carrier
 				// loss while the dial is still in flight. Hold output batches until
 				// the carrier install the takeover stages, or until the adoption

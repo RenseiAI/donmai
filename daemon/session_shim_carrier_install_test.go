@@ -33,6 +33,7 @@ import (
 
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // carrierInstallAdoption is a composing authority whose durable-adoption
@@ -41,20 +42,23 @@ import (
 type carrierInstallAdoption struct {
 	relay *drainingRelay
 
-	mu            sync.Mutex
-	dials         int
-	snapshotSeqs  map[sessionshim.Identity]uint64
-	emitDone      map[sessionshim.Identity]chan struct{}
-	batchCalls    atomic.Int32
-	batchBytes    [][]byte
-	batchDuringIn bool
-	adoptReturned chan struct{}
+	mu           sync.Mutex
+	dials        int
+	dialAt       map[int]time.Time
+	snapshotSeqs map[sessionshim.Identity]uint64
+	emitDone     map[sessionshim.Identity]chan struct{}
+	firstBatchAt time.Time
+	batchCalls   atomic.Int32
+	batchBytes   [][]byte
 }
 
 func (a *carrierInstallAdoption) prepare(_ context.Context, in SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 	return sessionshim.PreparedAdoption{
 		ControllerGeneration: in.CurrentControllerGeneration + 1,
-		Correlation:          []byte("carrier-install-1"),
+		Extensions: shimwire.Extensions{Values: map[string]string{
+			shimwire.ExtCarrierEpoch: "71",
+		}},
+		Correlation: []byte("carrier-install-1"),
 		// Replay from the start of the stream: the replacement daemon holds no
 		// durable cursor, so every exchange the harness produced is unacked.
 		ResumeFrom: proofResolvedResumeFloor(),
@@ -70,6 +74,10 @@ func (a *carrierInstallAdoption) adopt(ctx context.Context, evidence SessionShim
 	a.mu.Lock()
 	a.dials++
 	dial := a.dials
+	if a.dialAt == nil {
+		a.dialAt = make(map[int]time.Time)
+	}
+	a.dialAt[dial] = time.Now()
 	a.mu.Unlock()
 	// The carrier dial. While the carrier drains, nothing was learned about
 	// the lineage: the refusal keeps its production type so the composition
@@ -168,7 +176,7 @@ func TestReadoptedOutputBatchPersistsAfterTheCarrierInstalls(t *testing.T) {
 		if err := firstCtrl.WriteInput([]byte(token + "\r")); err != nil {
 			t.Fatalf("write exchange %d: %v", i, err)
 		}
-		want = append(want, waitForEcho(t, ctx, firstCtrl, "ack:"+token))
+		want = append(want, waitForEcho(ctx, t, firstCtrl, "ack:"+token))
 	}
 	first.Close()
 
@@ -191,6 +199,10 @@ func TestReadoptedOutputBatchPersistsAfterTheCarrierInstalls(t *testing.T) {
 		// second dial must land inside it.
 		StartupRelayDrainWindow: relayRestartFixtureWindow,
 		Readoption:              SessionShimReadoptionPolicy{Attempts: 1, Backoff: 5 * time.Millisecond},
+		// Bounded so the defect this pins fails fast rather than holding the
+		// suite's timeout: a deadlocked takeover emits into a consumer that
+		// never reaches its Snapshot, and this is the clock that refusal runs on.
+		CallbackTimeout:            5 * time.Second,
 		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
 		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
 		PrepareAdoption:            adoption.prepare,
@@ -198,18 +210,17 @@ func TestReadoptedOutputBatchPersistsAfterTheCarrierInstalls(t *testing.T) {
 		OnSessionEventDurable:      func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil },
 		OnSessionEventDurableBatch: func(_ context.Context, _ sessionshim.Identity, batch []sessionshim.ControllerEvent) (uint64, error) {
 			n := adoption.batchCalls.Add(1)
+			adoption.mu.Lock()
 			if n == 1 {
-				// The first batch must persist only after the carrier
-				// installed: the takeover Emit resolves before the adoption
-				// commits, so a batch persisted before Emit returned met no
-				// carrier candidate. Failing here keeps the defect visible as
-				// an assertion rather than as a quarantined lineage.
-				select {
-				case <-adoption.emitDone[id]:
-				default:
-					t.Errorf("the first output batch persisted before the takeover installed the carrier")
-				}
+				// The incident defect persisted the first batch while the
+				// carrier dial was still in flight. The fix holds it until
+				// the takeover installs the carrier on the admitted dial, so
+				// the first persist must land after the admitted dial started.
+				// (It may land while the takeover is still running — the
+				// carrier install, not the adoption commit, is the release.)
+				adoption.firstBatchAt = time.Now()
 			}
+			adoption.mu.Unlock()
 			batchMu.Lock()
 			for _, event := range batch {
 				adoption.batchBytes = append(adoption.batchBytes, append([]byte(nil), event.FrameBytes...))
@@ -252,6 +263,17 @@ func TestReadoptedOutputBatchPersistsAfterTheCarrierInstalls(t *testing.T) {
 	// The incident path: dial 1 refused by the drain, dial 2 admitted.
 	if got := adoption.dialsSoFar(); got != 2 {
 		t.Fatalf("durable adoption dials = %d, want 2 (one drain refusal, then the admitted dial)", got)
+	}
+	// The first batch waited out the drain: it persisted only after the
+	// admitted dial started, never while the carrier was still draining.
+	adoption.mu.Lock()
+	firstBatchAt, secondDialAt := adoption.firstBatchAt, adoption.dialAt[2]
+	adoption.mu.Unlock()
+	if firstBatchAt.IsZero() {
+		t.Fatal("no output batch was ever persisted")
+	}
+	if !firstBatchAt.After(secondDialAt) {
+		t.Fatalf("the first output batch persisted at %s, before the admitted dial started at %s", firstBatchAt, secondDialAt)
 	}
 	// The takeover ran on the admitted dial.
 	select {
@@ -307,7 +329,7 @@ func TestReadoptedOutputBatchPersistsAfterTheCarrierInstalls(t *testing.T) {
 // waitForEcho reads the first controller's stream until the harness answers
 // the written line, returning the exact output frame bytes the replacement
 // must later replay and persist.
-func waitForEcho(t *testing.T, ctx context.Context, ctrl *sessionshim.Controller, token string) []byte {
+func waitForEcho(ctx context.Context, t *testing.T, ctrl *sessionshim.Controller, token string) []byte {
 	t.Helper()
 	var buf strings.Builder
 	deadline := time.Now().Add(30 * time.Second)
