@@ -228,6 +228,14 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	}
 	p.mu.Unlock()
 
+	// Interactive PTY spawn mode: capability-gated on the LIVE manifest
+	// (mirrors pi/claude/codex), so an edit that flips
+	// SupportsInteractivePTY back to false silently falls through to the
+	// headless serve lane instead of crashing.
+	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
+		return p.spawnInteractive(ctx, spec)
+	}
+
 	h, err := p.spawnHandle(ctx, spec, "")
 	if err != nil {
 		return nil, err

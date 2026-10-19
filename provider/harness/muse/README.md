@@ -29,6 +29,22 @@ and no other Spec or provider option widens it. Env: `META_API_KEY` is stripped
 unless the Spec sets it; `MUSE_NO_AUTO_UPDATE=1` is always set. The cwd
 is the realpath of the workspace (the host rejects non-canonical roots).
 
+## Interactive PTY spawn mode
+
+A session with `Spec.Interactive` set spawns the bare `muse` TUI under a
+PTY via the shared ptycli driver instead of the serve host (selected per
+Spawn call; the declared Transport is unchanged). The positional seed
+carries system append + initial context + prompt, last; model/effort pass
+through; autonomous sessions run `--approval-mode never`; the read-only
+lane keeps the serve lane's `--disable-shell --disable-write`. The TUI
+exposes no MCP, approval-bridge, or allow-list channel, so a spec stamping
+any of them denies at admission. Before any child starts, the spawn runs
+two checks in order: the install check (`CheckHostSessionLogin`, the
+version evidence the Host login check section covers) and then the
+interactive login check (`CheckInteractiveSessionLogin`: credential file
++ no-cost native probe). Events are the
+coarse Init/terminal-Result contract; the terminal stream is the product.
+
 ## Confinement
 
 The serve child runs under the executor OS confinement (seatbelt on

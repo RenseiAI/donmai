@@ -129,6 +129,9 @@ const (
 	PromptDeliveryMuseTurnInput PromptDeliveryKind = "muse_turn_input"
 	// PromptDeliveryMuseTurnSteer uses the MSP turn/steer input array.
 	PromptDeliveryMuseTurnSteer PromptDeliveryKind = "muse_turn_steer_input"
+	// PromptDeliveryMusePTYSeed seeds the muse TUI via its positional
+	// prompt argument (the bare `muse` spawn mode has no turn/start frame).
+	PromptDeliveryMusePTYSeed PromptDeliveryKind = "muse_cli_pty_seed"
 )
 
 // PromptContent is one source-addressed semantic contribution. Text is the
@@ -443,7 +446,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 		case PromptDeliveryCodexTurnInput:
 			contextParts = append(contextParts, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
-		case PromptDeliveryCodexPTYSeed, PromptDeliveryPiPTYSeed, PromptDeliveryStubPTYSeed:
+		case PromptDeliveryCodexPTYSeed, PromptDeliveryPiPTYSeed, PromptDeliveryStubPTYSeed, PromptDeliveryMusePTYSeed:
 			downgradedPrepend = append(downgradedPrepend, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
 		case PromptDeliveryUnsupported:
@@ -589,6 +592,7 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryMuseLeadingText,
 		PromptDeliveryMuseTurnInput,
 		PromptDeliveryMuseTurnSteer,
+		PromptDeliveryMusePTYSeed,
 		PromptDeliveryAuthorizedUserDowngrade:
 		return true
 	default:
