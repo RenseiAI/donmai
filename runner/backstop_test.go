@@ -234,6 +234,13 @@ func TestShouldExcludeFromWIPCheckpoint_Secrets(t *testing.T) {
 		{".env.sample", false},
 		{".env.template", false},
 		{"service/.env.example", false},
+		// Dotted copies: only a copy of a placeholder sibling stays
+		// committable; anything else fails closed to excluded, so a
+		// backup of a secret file cannot leak through the invisible ref.
+		{".env.example.backup", false},
+		{".env.example.bak", false},
+		{".env.sample.old", false},
+		{".env.local.backup", true},
 		// Dotfile credentials by exact name, in any letter case.
 		{".envrc", true},
 		{".ENVRC", true},
@@ -262,13 +269,20 @@ func TestShouldExcludeFromWIPCheckpoint_Secrets(t *testing.T) {
 		{"credentials-backup.json", true},
 		{"service-account.json", true},
 		{"service-account-prod.json", true},
-		// Credential stores at any depth.
+		// Credential stores at any depth, in any letter case: git
+		// preserves case and tools and Windows checkouts produce
+		// uppercase variants.
 		{".aws/credentials", true},
 		{"service/.aws/config", true},
 		{".ssh/known_hosts", true},
 		{"home/.gnupg/pubring.kbx", true},
-		// Harness-state dirs at any depth, not just the top level.
+		{".AWS/credentials", true},
+		{".SSH/config", true},
+		// Harness-state dirs at any depth, not just the top level,
+		// in any letter case for the same reason as above.
 		{".pi/session.jsonl", true},
+		{".PI/session.jsonl", true},
+		{"sub/.PI/x", true},
 		{"sub/.pi/transcript.jsonl", true},
 		{"sub/.pi/agent-home/config.json", true},
 		{"sub/.agent/events.jsonl", true},

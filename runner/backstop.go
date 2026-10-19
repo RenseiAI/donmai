@@ -140,14 +140,20 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 	// .ENV, .NPMRC and Credentials.JSON are handled exactly like
 	// their lowercase twins.
 	lower := strings.ToLower(basename)
-	// Harness-state dirs at any depth: each table entry matched as a
-	// whole path component, so a directory that merely shares a prefix
-	// (".pi-cache") stays ordinary project content.
+	// Harness-state and credential-store dirs at any depth: each table
+	// entry matched as a whole path component, so a directory that
+	// merely shares a prefix (".pi-cache") stays ordinary project
+	// content. Components are lowered too: git preserves case and tools
+	// and Windows checkouts produce .AWS, .SSH or .PI, which hold the
+	// same secrets and transcripts as their lowercase twins. The tables
+	// themselves stay lowercase, so lowering the component before the
+	// lookup is exactly a case-insensitive match.
 	for _, part := range parts[:len(parts)-1] {
-		if harnessstate.IsStateDir(part) {
+		lowerPart := strings.ToLower(part)
+		if harnessstate.IsStateDir(lowerPart) {
 			return true
 		}
-		if wipSecretDirAnyDepth[part] {
+		if wipSecretDirAnyDepth[lowerPart] {
 			return true
 		}
 	}
@@ -157,9 +163,18 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 	// .env and .env.* carry secrets; the example/sample/template
 	// siblings carry placeholders and stay committable. Compared on the
 	// lowered name: tools and Windows checkouts produce .ENV,
-	// .Env.local and the like, and git preserves the case.
-	if lower == ".env" || strings.HasPrefix(lower, ".env.") {
-		return !wipSecretEnvExamples[lower]
+	// .Env.local and the like, and git preserves the case. Only the
+	// first dotted segment after ".env." decides: a dotted copy of a
+	// placeholder sibling (.env.example.backup) stays committable, while
+	// anything else (.env.local.backup, .env.foo.bar) fails closed to
+	// excluded, so a backup of a secret file cannot leak through the
+	// invisible ref.
+	if lower == ".env" {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(lower, ".env."); ok {
+		name, _, _ := strings.Cut(rest, ".")
+		return !wipSecretEnvExamples[".env."+name]
 	}
 	// Private keys and credential bundles, matched case-insensitively
 	// so KEY.PEM or Credentials.JSON cannot slip through.
