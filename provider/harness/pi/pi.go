@@ -88,6 +88,11 @@ type Provider struct {
 // Options configures Provider construction. The empty value runs `pi` from
 // PATH.
 type Options struct {
+	// MaxConsecutiveOutputLimitTurns bounds consecutive RPC turns ending with
+	// stopReason "length". Non-positive values use the default of three.
+	// A normal turn resets the streak. Interactive sessions are unaffected.
+	MaxConsecutiveOutputLimitTurns int
+
 	// PiBin is the pi binary path. Defaults to $PI_BIN, then "pi" via $PATH.
 	PiBin string
 
@@ -433,7 +438,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	extensionPaths := append([]string{layout.extension}, extraExtensionPaths...)
 	actualExtensions := make([]agentExtensionIdentity, len(spec.AdditionalExtensions))
 	for i, delivery := range spec.AdditionalExtensions {
-		actualExtensions[i] = agentExtensionIdentity{id: delivery.ID, digest: delivery.Digest, path: extraExtensionPaths[i]}
+		actualExtensions[i] = agentExtensionIdentity{id: delivery.ID, digest: delivery.Digest, path: extraExtensionPaths[i], delegationTools: append([]string(nil), delivery.DelegationTools...)}
 	}
 	token := p.opts.handshakeToken
 	if token == "" {
@@ -531,6 +536,9 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 
 	client := newRPCClient(stdin, stdout)
 	h := newHandle(client, cmd, spec, token, receipt)
+	if p.opts.MaxConsecutiveOutputLimitTurns > 0 {
+		h.maxConsecutiveOutputLimitTurns = p.opts.MaxConsecutiveOutputLimitTurns
+	}
 	h.setConfinement(plan)
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the

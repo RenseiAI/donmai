@@ -16,6 +16,7 @@ func TestReasons_AreTheClosedEnum(t *testing.T) {
 	want := []string{
 		"backend_absent", "self_test_failed", "self_test_stale", "nested_sandbox",
 		"namespace_unavailable", "writable_set_unrepresentable", "rule_unrenderable", "mode_unsupported",
+		"probe_unserved",
 	}
 	var got []string
 	for _, reason := range Reasons() {

@@ -39,18 +39,21 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		ExecutionSecurity: claudeExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true,
-			SupportsSessionResume:    false,
-			SupportsToolPlugins:      true,
-			AcceptsMcpServerSpec:     true,
-			AcceptsAllowedToolsList:  true,
-			EmitsSubagentEvents:      true,
-			SetsParentToolUseID:      true, // stream-json parent_tool_use_id is mapped onto ParentToolUseID
-			SupportsReasoningEffort:  true,
-			SupportsOneShot:          true,
-			NativeJSONMode:           false,
-			ToolPermissionFormat:     "claude",
-			StreamingTransport:       "ndjson", // claude CLI JSONL = ndjson framing
-			SupportsInteractivePTY:   true,
+			// Owned at launch: a fresh spawn mints the session id and
+			// passes it as --session-id, so the resume token is known
+			// before the first turn; Resume continues it via --resume.
+			SupportsSessionResume:   true,
+			SupportsToolPlugins:     true,
+			AcceptsMcpServerSpec:    true,
+			AcceptsAllowedToolsList: true,
+			EmitsSubagentEvents:     true,
+			SetsParentToolUseID:     true, // stream-json parent_tool_use_id is mapped onto ParentToolUseID
+			SupportsReasoningEffort: true,
+			SupportsOneShot:         true,
+			NativeJSONMode:          false,
+			ToolPermissionFormat:    "claude",
+			StreamingTransport:      "ndjson", // claude CLI JSONL = ndjson framing
+			SupportsInteractivePTY:  true,
 			// session-root-v1 is attested for declarations whose
 			// repositories are all mutable: granting each mutable
 			// repository path as an additional writable directory
@@ -79,7 +82,17 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// runs, and every message aimed at it is dead-lettered rather than
 			// accepted into a door that does not exist.
 			NoticeDelivery: agent.NoticeDeliveryHook,
-			Drives:         []agent.WireProtocol{agent.ProtoAnthropicMessages},
+			// The statusline sidecar JSON is the harness-native context
+			// signal: used_percentage, total_input_tokens,
+			// total_output_tokens and context_window_size. The session's
+			// own statusLine command maintains it (stophook.go): the CLI
+			// invokes the generated writer with the live context_window
+			// numbers on every render, and the runner's context watcher
+			// (runner/context_usage.go) polls the session handle's own
+			// sidecar path — never a process-wide variable — delivering
+			// crossings as a typed ContextUsageEvent.
+			ContextUsageSource: agent.ContextUsageSourceStatuslineSidecar,
+			Drives:             []agent.WireProtocol{agent.ProtoAnthropicMessages},
 			DrivesHosts: []agent.ServingHost{
 				agent.HostOAuthCLI, agent.HostDirect, agent.HostBedrock, agent.HostVertex,
 			},
@@ -110,10 +123,25 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 			},
 			{
-				ID: "claude-code/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+				// The interactive lane delivers the stamped allow/deny lists
+				// through the CLI's own flags (interactiveArgsWith), proven on
+				// the live binary: the REPL's permission panel renders a
+				// stamped allow entry under Allow and a stamped deny entry
+				// under Deny. The same claude_cli_allow_deny value the
+				// headless profile declares names that identical mechanism —
+				// no second delivery kind, because there is no second
+				// mechanism. Bumped tool-lifecycle-v1 -> v2 per the
+				// adapter-version rule: the declared surface moved, so a
+				// receipt pinned to v1 denies rather than silently acquiring
+				// the new claim. The MCP name filter rides the same merge
+				// the headless lane uses (MCPToolNames into --allowedTools),
+				// so MCPToolPolicyDelivery matches headless too; only
+				// PermissionConfigDelivery stays Unsupported: the CLI exposes
+				// no permission-config grammar on either lane.
+				ID: "claude-code/interactive/tool-lifecycle-v2", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryClaudeMCPConfig,
-				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
-				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				NativeToolPolicyDelivery: agent.ToolDeliveryClaudeCLIAllowDeny, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				MCPToolPolicyDelivery: agent.ToolDeliveryClaudeCLIAllowDeny, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
 				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
 				CleanupDelivery:    agent.ToolDeliveryHandleCleanup,

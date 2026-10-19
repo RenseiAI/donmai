@@ -118,9 +118,13 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 				return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, server.close)
 			}
 			spec.Env = launch.env
-			return ptycli.SpawnWithOptions(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), ptycli.SpawnOptions{
+			handle, err := ptycli.SpawnWithOptions(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), ptycli.SpawnOptions{
 				TerminalCost: interactiveTerminalCost(launch.env["CODEX_HOME"], nil),
 			})
+			if err != nil {
+				return nil, err
+			}
+			return wrapInteractiveConversationHandle(handle, launch.env["CODEX_HOME"], nil, newInteractiveConversationContextSource(launch.env["CODEX_HOME"], nil)), nil
 		}
 	}
 	// A gateway-routed cell falls through to the isolated boundary below so
@@ -298,10 +302,60 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		closeRelay()
 		return nil, err
 	}
+	conversation := wrapInteractiveConversationHandle(handle, config.home, nil, newInteractiveConversationContextSource(config.home, nil))
 	if relay != nil {
-		return wrapActivityHandle(handle, relay), nil
+		return wrapActivityHandle(conversation, relay), nil
 	}
-	return handle, nil
+	return conversation, nil
+}
+
+// interactiveConversationContextSource is the session-scoped context-usage
+// source for a conversation handle: the codex leg is the rollout file,
+// never a sidecar. home is the session's own home; thread resolves the
+// thread the session actually ran as (nil on paths where the thread is
+// never known — the rollout side stays quiet). The watcher re-resolves
+// every tick, so an empty thread simply polls nothing yet.
+type interactiveConversationContextSource struct {
+	home    string
+	thread  *atomic.Value
+	resolve func() string
+}
+
+// newInteractiveConversationContextSource builds the fixed-thread source
+// for the unnamed paths: the thread is unknown at spawn (the TUI creates
+// it after the PTY is up), so the source reports the session home with an
+// empty thread until the first rollout file appears.
+func newInteractiveConversationContextSource(home string, resolve func() string) *interactiveConversationContextSource {
+	return &interactiveConversationContextSource{home: home, resolve: resolve}
+}
+
+// ContextUsageSidecarPath reports no sidecar: the codex leg is the
+// rollout file, never a sidecar.
+func (s *interactiveConversationContextSource) ContextUsageSidecarPath() string {
+	return ""
+}
+
+// ContextUsageRollout returns the session's own home and the thread the
+// session runs as (or "" while naming has not completed).
+func (s *interactiveConversationContextSource) ContextUsageRollout() (string, string) {
+	if s == nil {
+		return "", ""
+	}
+	if s.thread != nil {
+		if id, _ := s.thread.Load().(string); id != "" {
+			return s.home, id
+		}
+		return s.home, ""
+	}
+	if s.resolve != nil {
+		if id := s.resolve(); id != "" {
+			return s.home, id
+		}
+	}
+	if s.home == "" {
+		return "", ""
+	}
+	return s.home, ""
 }
 
 // interactiveTerminalCost returns the TerminalCost closure for one
@@ -320,6 +374,172 @@ func interactiveTerminalCost(home string, resolveThreadID func() string) func() 
 		}
 		return rolloutUsageCost(home, resolveThreadID())
 	}
+}
+
+// Event channel sizing for interactiveConversationHandle. The coarse
+// events — InitEvent and the terminal ResultEvent — always have a reserved
+// slot, so their blocking sends complete even when nobody drains Events.
+// Conversation activity only ever fills the remaining slots, and is
+// dropped (never queued) once they are taken.
+const (
+	interactiveConversationCoarseSlots = 2
+	interactiveConversationEventSlots  = 64
+)
+
+// wrapInteractiveConversationHandle adds the rollout conversation tail to
+// a spawned PTY handle. resolveThreadID reports the thread the session
+// actually ran as (nil on paths where the thread is never known — the
+// tailer then stays quiet). The tailer reads only the admitted session's
+// own rollout files — the thread's file plus its descendant subagent
+// files — located through the same thread identity the terminal-cost read
+// uses, and maps each new user/assistant message, tool call/result, and
+// turn marker to the same agent events the headless lane emits, so the
+// live conversation reaches the runner's activity sink in order.
+//
+// Ordering: rollout records the child wrote on its way out can only be
+// read after InteractiveSession().Done closes, so the final flush is
+// enqueued strictly after Done. ActivityFlushed closes once that flush is
+// enqueued, and the terminal ResultEvent is forwarded only after it.
+//
+// Teardown: every helper goroutine returns at session end whether or not
+// the caller drains Events — the tailer stops on Done and never blocks,
+// and the coarse sends always fit the reserved slots — after which Events
+// closes.
+func wrapInteractiveConversationHandle(handle *ptycli.Handle, home string, resolveThreadID func() string, ctxSource *interactiveConversationContextSource) *interactiveConversationHandle {
+	w := &interactiveConversationHandle{
+		Handle:          handle,
+		events:          make(chan agent.Event, interactiveConversationCoarseSlots+interactiveConversationEventSlots),
+		activityFlushed: make(chan struct{}),
+		finished:        make(chan struct{}),
+		contextSource:   ctxSource,
+	}
+	session := handle.InteractiveSession()
+	// emit forwards one conversation event best-effort. Only the tailer
+	// goroutine calls it, and it never takes a slot reserved for the
+	// coarse events: with at most interactiveConversationCoarseSlots
+	// coarse sends over the handle's life, the coarse senders below can
+	// never block on a channel conversation events filled. When the
+	// consumer is slow the event is dropped rather than blocking the
+	// tailer behind the terminal.
+	emit := func(ev agent.Event) {
+		if len(w.events) >= cap(w.events)-interactiveConversationCoarseSlots {
+			return
+		}
+		select {
+		case w.events <- ev:
+		default:
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for event := range handle.Events() {
+			if _, terminal := event.(agent.ResultEvent); terminal {
+				// ptycli sends the result strictly after Done; the
+				// tailer's final flush, which also starts at Done,
+				// goes first.
+				<-w.activityFlushed
+			}
+			w.events <- event
+		}
+	}()
+	// Rollout conversation tail: while the session runs, its rollout
+	// files are tailed and each new user/assistant message, tool
+	// call/result, and turn marker is forwarded as the same agent event
+	// the headless lane emits for it. Best-effort and rate-limited (see
+	// interactive_conversation.go). It stops when the PTY child has
+	// exited and drained, after one final flush of trailing writes. The
+	// thread id resolves late on the fresh-named path (only after the
+	// PTY's own thread is named), so the tailer polls the resolver and
+	// starts once the identity is known.
+	go func() {
+		defer wg.Done()
+		defer close(w.activityFlushed)
+		tailer := newInteractiveConversationTailer(home, resolveThreadID)
+		tailer.run(session.Done(), emit)
+	}()
+	go func() {
+		wg.Wait()
+		close(w.events)
+		close(w.finished)
+	}()
+	return w
+}
+
+// interactiveConversationHandle adds the rollout conversation tail to the
+// shared PTY handle.
+//
+// Embedding *ptycli.Handle rather than reimplementing it keeps
+// agent.Handle and agent.InteractiveCapable behaviour byte-identical to
+// every other interactive harness; the only thing this type adds is the
+// session's own live conversation on Events. The terminal ResultEvent is
+// the PTY lifecycle's own (carrying the harness-accounted cost the
+// TerminalCost hook attaches); turn completion rides a SystemEvent turn
+// marker, never a second terminal.
+type interactiveConversationHandle struct {
+	*ptycli.Handle
+	events chan agent.Event
+	// contextSource carries the session's context-usage signal for the
+	// runner's session-scoped watcher (nil on paths where the thread is
+	// never known — the watcher then stays quiet). It is separate from
+	// the conversation tailer's resolver so the watcher re-resolves
+	// every tick while the tailer polls for its own start.
+	contextSource *interactiveConversationContextSource
+	// activityFlushed closes once the conversation tailer has enqueued
+	// its final flush (or given up on a full channel) and returned.
+	activityFlushed chan struct{}
+	// finished closes after events is closed, i.e. once every helper
+	// goroutine has returned.
+	finished chan struct{}
+}
+
+var (
+	_ agent.InteractiveCapable            = (*interactiveConversationHandle)(nil)
+	_ agent.InteractiveActivityFlusher    = (*interactiveConversationHandle)(nil)
+	_ agent.InteractiveTerminalCostSource = (*interactiveConversationHandle)(nil)
+	_ agent.ContextUsageSourcer           = (*interactiveConversationHandle)(nil)
+)
+
+// Events overrides ptycli.Handle.Events with the coarse Init/Result
+// contract plus the live conversation tailed from the session's own
+// rollout files. The terminal event is forwarded only after the flush, so
+// a consumer reading to the ResultEvent (or waiting on ActivityFlushed
+// after Done) sees every delivered conversation event before the session
+// totals.
+func (h *interactiveConversationHandle) Events() <-chan agent.Event { return h.events }
+
+// ActivityFlushed implements agent.InteractiveActivityFlusher: it closes
+// once the session's final conversation activity has been enqueued on
+// Events.
+func (h *interactiveConversationHandle) ActivityFlushed() <-chan struct{} {
+	return h.activityFlushed
+}
+
+// HasTerminalCost forwards the inner PTY handle's terminal-cost
+// declaration so the runner's post-exit wait keeps the long grace for a
+// promised harness-accounted cost. Without it the wrapper would hide the
+// declaration and the runner would stop waiting after the short grace.
+func (h *interactiveConversationHandle) HasTerminalCost() bool {
+	if h == nil || h.Handle == nil {
+		return false
+	}
+	src, ok := agent.Handle(h.Handle).(agent.InteractiveTerminalCostSource)
+	return ok && src.HasTerminalCost()
+}
+
+// ContextUsageSidecarPath reports no sidecar: the codex leg is the
+// rollout file, never a sidecar.
+func (h *interactiveConversationHandle) ContextUsageSidecarPath() string { return "" }
+
+// ContextUsageRollout returns the session's own home and thread through
+// the handle's session-scoped source (empty thread until the rollout
+// file appears; empty home on paths where the thread is never known).
+func (h *interactiveConversationHandle) ContextUsageRollout() (string, string) {
+	if h == nil || h.contextSource == nil {
+		return "", ""
+	}
+	return h.contextSource.ContextUsageRollout()
 }
 
 // spawnNamedInteractivePTY points launch's argv at server (remoteInteractiveArgs
@@ -343,7 +563,7 @@ func spawnNamedInteractivePTY(
 	launch interactiveLaunch,
 	server *namedInteractiveAppServer,
 	cleanup func() error,
-) (*ptycli.Handle, error) {
+) (*interactiveConversationHandle, error) {
 	launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
 	home := spec.Env["CODEX_HOME"]
 	var currentThreadID atomic.Value
@@ -356,9 +576,10 @@ func spawnNamedInteractivePTY(
 	if err != nil {
 		return nil, err
 	}
+	ctxSource := &interactiveConversationContextSource{home: home, thread: &currentThreadID}
 	if attachToExistingNamedSession(spec) {
 		currentThreadID.Store(spec.SessionName)
-		return handle, nil
+		return wrapInteractiveConversationHandle(handle, home, resolveThreadID, ctxSource), nil
 	}
 	nameTimeout := opts.HandshakeTimeout
 	if nameTimeout <= 0 {
@@ -388,7 +609,7 @@ func spawnNamedInteractivePTY(
 	// race, so the resume key is recorded only after the native state exists.
 	recordResumeKey(spec.Env["CODEX_HOME"], threadID)
 	currentThreadID.Store(threadID)
-	return handle, nil
+	return wrapInteractiveConversationHandle(handle, home, resolveThreadID, ctxSource), nil
 }
 
 // validateNamedInteractiveTransport keeps the optional naming layer honest on
@@ -561,6 +782,14 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	}
 	if model := strings.TrimSpace(spec.Model); model != "" {
 		args = append(args, "--config", "model="+tomlBasicString(model))
+	}
+	// A gateway-routed cell restates its provider block through CLI
+	// overrides (see gatewayProviderConfigOverride): the private config
+	// file carries the primary route, and these ride the CLI layer above
+	// every file layer, so repo-checked-in provider config cannot redirect
+	// the bearer. Non-routed sessions render nothing and keep their argv.
+	if baseURL, _, routed, routeErr := gatewayBinding(spec); routeErr == nil && routed {
+		args = append(args, gatewayProviderConfigOverride(baseURL)...)
 	}
 	// Reasoning effort rides the same process-local override as model:
 	// model_reasoning_effort is codex's own config.toml key, and the headless

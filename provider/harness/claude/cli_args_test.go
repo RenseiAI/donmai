@@ -11,7 +11,7 @@ import (
 func TestBuildArgs_RequiredFlags(t *testing.T) {
 	t.Parallel()
 
-	argv, _ := buildArgs(agent.Spec{}, "", "")
+	argv, _ := buildArgs(agent.Spec{}, "", "", "")
 
 	for _, want := range []string{"-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"} {
 		if !slices.Contains(argv, want) {
@@ -23,7 +23,7 @@ func TestBuildArgs_RequiredFlags(t *testing.T) {
 func TestBuildArgs_PromptToStdin(t *testing.T) {
 	t.Parallel()
 
-	argv, stdin := buildArgs(agent.Spec{Prompt: "do the thing"}, "", "")
+	argv, stdin := buildArgs(agent.Spec{Prompt: "do the thing"}, "", "", "")
 
 	if stdin != "do the thing" {
 		t.Errorf("stdin = %q, want %q", stdin, "do the thing")
@@ -67,7 +67,7 @@ func TestBuildArgs_AllSpecFields(t *testing.T) {
 		// OnProcessSpawned is not consumed by buildArgs.
 	}
 
-	argv, stdin := buildArgs(spec, "/tmp/mcp.json", "")
+	argv, stdin := buildArgs(spec, "/tmp/mcp.json", "", "")
 
 	if stdin != "implement ENG-1" {
 		t.Errorf("stdin: got %q, want prompt", stdin)
@@ -128,7 +128,7 @@ func TestBuildArgs_NotAutonomous_NoLinearBlocklist(t *testing.T) {
 		Prompt:          "x",
 		Autonomous:      false,
 		DisallowedTools: []string{"WebSearch"},
-	}, "", "")
+	}, "", "", "")
 
 	disallowedIdx := slices.Index(argv, "--disallowedTools")
 	if disallowedIdx < 0 {
@@ -146,7 +146,7 @@ func TestBuildArgs_NotAutonomous_NoLinearBlocklist(t *testing.T) {
 func TestBuildArgs_ResumeFlag(t *testing.T) {
 	t.Parallel()
 
-	argv, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "session-uuid")
+	argv, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "session-uuid", "")
 
 	idx := slices.Index(argv, "--resume")
 	if idx < 0 || idx+1 >= len(argv) {
@@ -174,7 +174,7 @@ func TestBuildArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			argv, _ := buildArgs(agent.Spec{Effort: tt.effort}, "", "")
+			argv, _ := buildArgs(agent.Spec{Effort: tt.effort}, "", "", "")
 			idx := slices.Index(argv, "--effort")
 			if !tt.wantFlag {
 				if idx >= 0 {
@@ -192,7 +192,7 @@ func TestBuildArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
 func TestBuildArgs_NoMCPConfig(t *testing.T) {
 	t.Parallel()
 
-	argv, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "")
+	argv, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "", "")
 
 	if slices.Contains(argv, "--mcp-config") {
 		t.Errorf("argv should not include --mcp-config when path empty: %v", argv)
@@ -205,7 +205,7 @@ func TestBuildArgs_DedupAllowedTools(t *testing.T) {
 	argv, _ := buildArgs(agent.Spec{
 		AllowedTools: []string{"Edit", "Edit", "Bash"},
 		MCPToolNames: []string{"Edit"},
-	}, "", "")
+	}, "", "", "")
 
 	idx := slices.Index(argv, "--allowedTools")
 	if idx < 0 {

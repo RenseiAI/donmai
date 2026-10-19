@@ -1,6 +1,11 @@
 package gemini
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -215,5 +220,78 @@ func TestMapResponse_MaxTokens_IsNonSuccess(t *testing.T) {
 	}
 	if _, ok := turn.events[1].(agent.AssistantTextEvent); !ok {
 		t.Fatalf("events[1]: want AssistantTextEvent, got %T", turn.events[1])
+	}
+}
+
+func TestUsageFixture_ReasoningAndCache(t *testing.T) {
+	t.Parallel()
+	body, err := os.ReadFile("testdata/reasoning-cache.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drive Spawn, the HTTP driver, and the terminal projection as well as mapping.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	prices := map[string]any{"inputPricePer1M": 1.5, "cachedPricePer1M": 0.15, "outputPricePer1M": 9.0}
+	h, err := mustNew(t, srv.URL).Spawn(context.Background(), agent.Spec{Prompt: "hi", ProviderConfig: prices})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	events := drainUntilResult(t, h)
+	calls := 0
+	for _, ev := range events {
+		if call, ok := ev.(agent.LlmCallEvent); ok {
+			calls++
+			if call.InputTokens != 40 || call.CachedInputTokens != 60 || call.OutputTokens != 50 || call.ReasoningTokens != 30 {
+				t.Errorf("call tokens = %d/%d/%d/%d; want fresh/cache/output/reasoning = 40/60/50/30", call.InputTokens, call.CachedInputTokens, call.OutputTokens, call.ReasoningTokens)
+			}
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d; want 1", calls)
+	}
+	res := events[len(events)-1].(agent.ResultEvent)
+	assertUsageFixtureCost(t, res.Cost, 1)
+	// Multiple turns must retain both classes in the terminal aggregate.
+	state := &turnState{model: "gemini-3.5-flash", providerConfig: prices}
+	mapResponse(body, state)
+	turn := mapResponse(body, state)
+	assertUsageFixtureCost(t, turn.result.(agent.ResultEvent).Cost, 2)
+}
+
+func assertUsageFixtureCost(t *testing.T, cost *agent.CostData, turns int) {
+	t.Helper()
+	n := int64(turns)
+	if cost == nil {
+		t.Fatal("missing terminal cost")
+	}
+	if cost.InputTokens != 40*n || cost.CachedInputTokens != 60*n || cost.OutputTokens != 50*n || cost.ReasoningTokens != 30*n || cost.NumTurns != turns {
+		t.Errorf("terminal tokens = %d/%d/%d/%d turns=%d; want %d/%d/%d/%d turns=%d", cost.InputTokens, cost.CachedInputTokens, cost.OutputTokens, cost.ReasoningTokens, cost.NumTurns, 40*n, 60*n, 50*n, 30*n, turns)
+	}
+	want := float64(turns) * (40*1.5 + 60*0.15 + 50*9) / 1e6
+	if diff := cost.TotalCostUsd - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("cost = %g; want %g", cost.TotalCostUsd, want)
+	}
+}
+
+func TestMapResponse_UsageWithoutReasoning(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"candidates":[{"finishReason":"STOP"}]}`,
+		`{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`,
+	} {
+		turn := mapResponse([]byte(body), &turnState{})
+		for _, v := range []any{turn.events[0], turn.result.(agent.ResultEvent).Cost} {
+			wire, err := json.Marshal(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(wire), "reasoningTokens") {
+				t.Fatalf("unreported reasoning must be omitted: %s", wire)
+			}
+		}
 	}
 }

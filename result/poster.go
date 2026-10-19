@@ -204,6 +204,7 @@ type completionRequest struct {
 // the handler could add strict StatusRequestBody validation without ever
 // seeing failureMode/summary.
 type statusRequest struct {
+	GenerationIDs     []string       `json:"generationIds,omitempty"`
 	WorkerID          string         `json:"workerId"`
 	Status            string         `json:"status"`
 	ProviderSessionID string         `json:"providerSessionId,omitempty"`
@@ -212,6 +213,7 @@ type statusRequest struct {
 	TotalCostUsd      float64        `json:"totalCostUsd,omitempty"`
 	InputTokens       int64          `json:"inputTokens,omitempty"`
 	OutputTokens      int64          `json:"outputTokens,omitempty"`
+	Model             string         `json:"model,omitempty"`
 	// CacheReadTokens is the cache-read token count carried from
 	// CostData.CachedInputTokens. Additive and backward-compatible:
 	// omitted when zero, so an old receiver that ignores the key still
@@ -675,6 +677,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 	}
 	body := statusRequest{
 		WorkerID: creds.WorkerID, Status: r.Status, ProviderSessionID: r.ProviderSessionID,
+		Model:        r.Model,
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
@@ -683,6 +686,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
+		GenerationIDs: r.GenerationIDs,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

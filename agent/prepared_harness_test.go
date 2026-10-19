@@ -157,6 +157,13 @@ func TestApplyPreparedHarnessNamesDriftingFields(t *testing.T) {
 				UserPrompt:       agent.PromptContent{ID: "actual-user-task", Text: "inspect the actual input", Required: true},
 			},
 			Interactive: &agent.InteractiveSpec{},
+			Endpoint: &agent.EndpointBinding{
+				Company:           agent.CompanyOpenAI,
+				Model:             "gpt-test",
+				Protocol:          agent.ProtoOpenAIChat,
+				Host:              agent.HostDirect,
+				RoutingPreference: &agent.RoutingPreference{},
+			},
 		}
 	}
 	const operationalDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -174,6 +181,18 @@ func TestApplyPreparedHarnessNamesDriftingFields(t *testing.T) {
 			name:   "model differs (a genuine authority field, e.g. a routing swap between preflight and spawn)",
 			mutate: func(s agent.Spec) agent.Spec { s.Model = "different-model"; return s },
 			want:   []string{"model"},
+		},
+		{
+			// The base spec above carries an endpoint WITHOUT a set
+			// preference; the mutation sets one. Only the digest's
+			// routing-preference entry tells them apart — without it both
+			// projections are identical and no drift is reported.
+			name: "endpoint routing preference differs (gateway routing swapped between preflight and spawn)",
+			mutate: func(s agent.Spec) agent.Spec {
+				s.Endpoint.RoutingPreference = &agent.RoutingPreference{Order: []string{"anthropic"}}
+				return s
+			},
+			want: []string{"endpoint"},
 		},
 		{
 			name:   "system prompt append differs (prompt adaptation applied after preflight)",

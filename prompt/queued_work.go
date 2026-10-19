@@ -112,6 +112,10 @@ type QueuedWork struct {
 	//     run's own resolution as delivered work instead of requiring a
 	//     non-merge code change. The scratch-path rule still applies, so
 	//     a merge that only carries runner scratch stays undelivered.
+	//   - AllowCleanMerge, when true, declares that merging IS the task:
+	//     a pushed merge-only range counts as delivered even when the
+	//     merge is clean. The no-new-commit and scratch-path rules still
+	//     apply unchanged.
 	//
 	// The flag only ever widens what counts as delivered; it never
 	//   narrows it, and a run without the flag behaves exactly as before.
@@ -126,7 +130,8 @@ type QueuedWork struct {
 	// WorkType is the work-type discriminant (e.g. "development",
 	// "qa", "research"). Drives template selection in [Builder.Build].
 	// Unknown values fall through to the development template.
-	WorkType string `json:"workType,omitempty"`
+	WorkType     string `json:"workType,omitempty"`
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher. Includes the <issue>, <user>,
@@ -421,6 +426,15 @@ type DeliveryPolicy struct {
 	// own resolution as delivered work. The scratch-path rule still
 	// applies.
 	AllowMergeCommits bool `json:"allowMergeCommits,omitempty"`
+	// AllowCleanMerge, when true, declares that merging IS the task: a
+	// pushed merge-only range counts as delivered even when the merge
+	// is clean (no conflict resolution, so the merge changed nothing
+	// against every parent). The no-new-commit rule still applies — the
+	// merge commit itself must be on the pull request — and the
+	// scratch-path rule still applies, so a merge that only carries
+	// scratch stays undelivered. Without it a clean merge fails as
+	// "no code change since dispatch".
+	AllowCleanMerge bool `json:"allowCleanMerge,omitempty"`
 }
 
 // AllowsDraft reports whether the policy lets a draft pull request count
@@ -433,6 +447,13 @@ func (p *DeliveryPolicy) AllowsDraft() bool {
 // toward delivery. Nil is today's behaviour: merges alone do not deliver.
 func (p *DeliveryPolicy) AllowsMerges() bool {
 	return p != nil && p.AllowMergeCommits
+}
+
+// AllowsCleanMerge reports whether the policy declares merging as the
+// task: a pushed clean merge counts as delivered. Nil is today's
+// behaviour: a clean merge fails as no code change.
+func (p *DeliveryPolicy) AllowsCleanMerge() bool {
+	return p != nil && p.AllowCleanMerge
 }
 
 // CodeIntelWork is the typed code-intelligence capability block on QueuedWork.

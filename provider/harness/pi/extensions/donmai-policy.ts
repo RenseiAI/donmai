@@ -298,6 +298,61 @@ function restoreSessionEnvironment(envelope: any): void {
     process.env[name] = value;
   }
 }
+// parseRoutingSlugs reads one gateway routing-preference pin (a
+// JSON-encoded string array on DONMAI_PI_ROUTING_ORDER /
+// DONMAI_PI_ROUTING_ONLY). Only a JSON array whose every entry is a
+// non-empty string is accepted; anything else — absent, malformed, a
+// non-array, or an entry that is not a non-empty string — reads as an
+// empty list, never invented. An explicitly empty array ("[]", which the
+// harness exports for the unset side of a half-set preference) is a
+// VALID empty list; routingPinValid below distinguishes it from a
+// malformed value.
+function parseRoutingSlugs(raw: string | undefined): string[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: string[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "string" || entry === "") return [];
+    out.push(entry);
+  }
+  return out;
+}
+
+// routingPinValid reports whether one routing pin value is usable: absent
+// (the harness exports clearing entries for cells without a preference)
+// or a well-formed JSON array of non-empty strings. A present-but-mangled
+// value is unusable — the caller then registers no routing option at all
+// rather than routing on half a preference.
+function routingPinValid(raw: string | undefined): boolean {
+  if (!raw) return true;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(parsed)) return false;
+  for (const entry of parsed) {
+    if (typeof entry !== "string" || entry === "") return false;
+  }
+  return true;
+}
+
+// mergeRoutingCompat layers the gateway routing option under the
+// thinking-level compat: both are per-model compat entries and must not
+// displace each other.
+function mergeRoutingCompat(base: any, routing: any): any {
+  if (routing === undefined) return base;
+  if (base === undefined) return routing;
+  return { ...base, ...routing };
+}
+
 // DONMAI_STATE_DIR_ENV carries the relocated per-session state root
 // onto the interactive child. The Go engine guards the same root;
 // the local interactive guard must cover it too, or deleting live
@@ -752,6 +807,38 @@ export default async function activate(pi: ExtensionAPI) {
       : thinkingLevel === "" && api === "openai-completions"
         ? { supportsReasoningEffort: false }
         : undefined;
+  // Gateway routing-preference pin: the harness exports the endpoint
+  // binding's optional provider routing preference (ordered candidates
+  // and an exclusive allow-list) as JSON-encoded string arrays on
+  // DONMAI_PI_ROUTING_ORDER / DONMAI_PI_ROUTING_ONLY, for
+  // openai-completions cells only (extension.go routingPreferencePinEnv).
+  // A set preference registers as the model's routing option, which pi's
+  // request builder sends as the chat request's provider routing option;
+  // any other cell exports clearing entries that parse as no preference.
+  // parseRoutingSlugs accepts only a JSON array of non-empty strings —
+  // anything else reads as unset, never invented — and a present-but-
+  // mangled pin fails closed to no routing option at all.
+  const routingOrder = parseRoutingSlugs(process.env.DONMAI_PI_ROUTING_ORDER);
+  const routingOnly = parseRoutingSlugs(process.env.DONMAI_PI_ROUTING_ONLY);
+  const routingPinsValid =
+    routingPinValid(process.env.DONMAI_PI_ROUTING_ORDER) &&
+    routingPinValid(process.env.DONMAI_PI_ROUTING_ONLY);
+  const routingCompat =
+    routingPinsValid &&
+    api === "openai-completions" &&
+    (routingOrder.length > 0 || routingOnly.length > 0)
+      ? {
+          openRouterRouting: {
+            ...(routingOrder.length > 0 ? { order: routingOrder } : {}),
+            ...(routingOnly.length > 0 ? { only: routingOnly } : {}),
+          },
+          vercelGatewayRouting: {
+            ...(routingOrder.length > 0 ? { order: routingOrder } : {}),
+            ...(routingOnly.length > 0 ? { only: routingOnly } : {}),
+          },
+        }
+      : undefined;
+  const modelCompat = mergeRoutingCompat(compat, routingCompat);
   // Per-token price pin: the runner exports the endpoint binding's
   // optional per-token prices (USD per million tokens) on
   // DONMAI_PI_PRICE_{INPUT,OUTPUT,CACHE_READ,CACHE_WRITE} plus the
@@ -792,7 +879,7 @@ export default async function activate(pi: ExtensionAPI) {
             contextWindow,
             ...(maxTokens === undefined ? {} : { maxTokens }),
             ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
-            ...(compat === undefined ? {} : { compat }),
+            ...(modelCompat === undefined ? {} : { compat: modelCompat }),
           },
         ],
       });

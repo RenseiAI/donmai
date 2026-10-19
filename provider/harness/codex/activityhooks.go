@@ -14,7 +14,6 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
-	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 )
 
 // Activity-hook telemetry for platform seats.
@@ -261,21 +260,23 @@ const (
 // activityHandle wraps an interactive PTY handle with the activity-relay
 // tail. Hook fires become harness-lifecycle events on Events beside the
 // coarse Init/Result contract; the terminal ResultEvent passes through
-// untouched. Embedding the concrete PTY handle keeps the
+// untouched. Embedding the conversation handle keeps the
 // InteractiveCapable surface (and every other handle behaviour)
 // byte-identical; only Events is overridden. Every helper goroutine
 // returns at session end whether or not the caller drains Events.
 type activityHandle struct {
-	*ptycli.Handle
-	events chan agent.Event
+	*interactiveConversationHandle
+	events          chan agent.Event
+	activityFlushed chan struct{}
 }
 
 var _ agent.InteractiveCapable = (*activityHandle)(nil)
 
-func wrapActivityHandle(h *ptycli.Handle, relay *activityrelay.Relay) *activityHandle {
+func wrapActivityHandle(h *interactiveConversationHandle, relay *activityrelay.Relay) *activityHandle {
 	w := &activityHandle{
-		Handle: h,
-		events: make(chan agent.Event, activityCoarseEventSlots+activityRelayEventSlots),
+		interactiveConversationHandle: h,
+		events:                        make(chan agent.Event, activityCoarseEventSlots+activityRelayEventSlots),
+		activityFlushed:               make(chan struct{}),
 	}
 	tailer := activityrelay.NewTailer(relay.EventsPath())
 	emit := func(ev agent.Event) {
@@ -291,6 +292,16 @@ func wrapActivityHandle(h *ptycli.Handle, relay *activityrelay.Relay) *activityH
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		var flushed sync.Once
+		flush := func() {
+			flushed.Do(func() {
+				for _, ev := range tailer.Sweep(activityrelay.MaxLinesPerSweep, activityrelay.MaxEventsPerSweep) {
+					emit(ev)
+				}
+				close(w.activityFlushed)
+			})
+		}
+		defer flush()
 		ticker := time.NewTicker(activityrelay.RelayPollInterval)
 		defer ticker.Stop()
 		for {
@@ -305,11 +316,15 @@ func wrapActivityHandle(h *ptycli.Handle, relay *activityrelay.Relay) *activityH
 					}
 					return
 				}
-				// Coarse sends always fit the reserved slots: at most
-				// activityCoarseEventSlots cross this handle's life,
-				// and relay sweeps above never take them. The send
-				// blocks rather than dropping the terminal contract.
-				w.events <- event
+				switch event.(type) {
+				case agent.InitEvent:
+					w.events <- event
+				case agent.ResultEvent:
+					flush()
+					w.events <- event
+				default:
+					emit(event)
+				}
 			case <-ticker.C:
 			}
 		}
@@ -324,6 +339,9 @@ func wrapActivityHandle(h *ptycli.Handle, relay *activityrelay.Relay) *activityH
 // Events overrides the embedded handle's channel with the coarse
 // contract plus relayed harness-lifecycle events.
 func (h *activityHandle) Events() <-chan agent.Event { return h.events }
+
+// ActivityFlushed waits for conversation and hook activity to reach Events.
+func (h *activityHandle) ActivityFlushed() <-chan struct{} { return h.activityFlushed }
 
 // appendActivityHooks installs the activity hooks block and its trust
 // state into the boundary's private config.toml. It validates the

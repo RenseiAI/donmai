@@ -37,6 +37,47 @@ func sinkSummary(sink *recordingSink) []string {
 	return out
 }
 
+// TestInteractive_ConversationMarkersReachSink drives the real
+// dispatchInteractive supervisor with a handle whose event channel carries
+// the live-conversation markers the harness tails (a provider user turn
+// and turn completion), and asserts they reach the activity sink — in
+// order, before the session-ended marker. Other system chatter stays
+// runner-internal and never reaches the sink.
+func TestInteractive_ConversationMarkersReachSink(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	worktreePath := t.TempDir()
+	session := completedRecordingInteractiveSession()
+	base := &fakeHandle{events: make(chan agent.Event, 8)}
+	base.events <- agent.SystemEvent{Subtype: "user_message", Message: "keep going"}
+	base.events <- agent.AssistantTextEvent{Text: "on it"}
+	base.events <- agent.SystemEvent{Subtype: "turn_completed", Message: "done"}
+	base.events <- agent.SystemEvent{Subtype: "turn_started", Message: "Turn 1 started"}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "conversation-markers", Mode: interactiveRunMode}}
+	r := minimalRunner(t)
+
+	result, err := r.dispatchInteractive(
+		context.Background(), handle, worktreePath, qw, &Result{SessionID: qw.SessionID}, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil || result.Status != "completed" {
+		t.Fatalf("dispatchInteractive = status %q err %v, want completed", result.Status, err)
+	}
+
+	want := []string{
+		string(agent.EventSystem) + ":interactive-session-started",
+		string(agent.EventSystem) + ":user_message",
+		string(agent.EventAssistantText),
+		string(agent.EventSystem) + ":turn_completed",
+		string(agent.EventSystem) + ":interactive-session-ended",
+	}
+	if got := sinkSummary(sink); !slices.Equal(got, want) {
+		t.Fatalf("sink stream = %v, want %v", got, want)
+	}
+}
+
 // TestInteractive_TranscriptEventsReachSink drives the real
 // dispatchInteractive supervisor with a handle whose event channel carries
 // transcript-mapped agent events, and asserts they reach the activity sink —

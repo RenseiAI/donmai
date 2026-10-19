@@ -37,6 +37,11 @@ const (
 	// ReasonModeUnsupported: the session mode is not one the confinement
 	// declares (D4.4).
 	ReasonModeUnsupported Reason = "mode_unsupported"
+	// ReasonProbeUnserved: the probe child never served the probe: it
+	// emitted no handshake within the bound, so the self-test could not
+	// judge the boundary. The executable likely does not serve the
+	// confinement probe from main.
+	ReasonProbeUnserved Reason = "probe_unserved"
 )
 
 var knownReasons = map[Reason]bool{
@@ -48,6 +53,7 @@ var knownReasons = map[Reason]bool{
 	ReasonWritableSetUnrepresentable: true,
 	ReasonRuleUnrenderable:           true,
 	ReasonModeUnsupported:            true,
+	ReasonProbeUnserved:              true,
 }
 
 // Reasons returns the closed reason enum in declaration order.
@@ -55,7 +61,7 @@ func Reasons() []Reason {
 	return []Reason{
 		ReasonBackendAbsent, ReasonSelfTestFailed, ReasonSelfTestStale, ReasonNestedSandbox,
 		ReasonNamespaceUnavailable, ReasonWritableSetUnrepresentable, ReasonRuleUnrenderable,
-		ReasonModeUnsupported,
+		ReasonModeUnsupported, ReasonProbeUnserved,
 	}
 }
 

@@ -15,8 +15,9 @@ import (
 )
 
 // TestSpawnClassifiesTransientRefusals pins the retry decision table behind
-// Spawn: EPERM and EAGAIN are launcher-side pressure (fork/process-count and
-// the setsid/controlling-terminal steps under churn), so they retry; a
+// Spawn: EPERM, EAGAIN, and ETXTBSY are launcher-side pressure
+// (fork/process-count and the setsid/controlling-terminal steps under churn,
+// plus a just-written fixture racing its own exec), so they retry; a
 // missing binary or a permission refusal is an answer about the command that
 // cannot change, so it never retries. Reverting isTransientSpawnError to
 // treat EPERM as permanent fails here.
@@ -29,6 +30,7 @@ func TestSpawnClassifiesTransientRefusals(t *testing.T) {
 	}{
 		{err: syscall.EPERM, retry: true},
 		{err: syscall.EAGAIN, retry: true},
+		{err: syscall.ETXTBSY, retry: true},
 		{err: syscall.ENOENT, retry: false},
 		{err: syscall.EACCES, retry: false},
 		{err: syscall.ENOEXEC, retry: false},
@@ -98,8 +100,13 @@ func TestSpawnSucceedsFirstAttempt(t *testing.T) {
 
 // TestSpawnRetriesATransientRefusal drives the retry path itself through
 // the production retry core with a fault-injecting starter: attempt 1 fails
-// with a transient EPERM refusal and attempt 2 starts successfully. The
-// retry must build a FRESH *exec.Cmd per attempt — os/exec marks a Cmd
+// with a transient ETXTBSY refusal — the just-written-fixture race — and
+// attempt 2 starts successfully. The fault is parameterized so the
+// classifier table above and this retry path stay in lockstep: every errno
+// the table marks retryable must survive a refused first attempt here.
+// A table entry reverted to permanent (ETXTBSY included) fails its row
+// below, because startPTYWithStarter surfaces the refusal at once instead
+// of offering attempt 2. The retry must build a FRESH *exec.Cmd per attempt — os/exec marks a Cmd
 // started on the first Start call even when that call fails ("It is an
 // error to call Start twice even if the first call did not create a
 // process"), so a retry loop that reuses one Cmd would answer its own
@@ -113,6 +120,29 @@ func TestSpawnSucceedsFirstAttempt(t *testing.T) {
 func TestSpawnRetriesATransientRefusal(t *testing.T) {
 	t.Parallel()
 
+	for _, fault := range []struct {
+		name string
+		err  syscall.Errno
+	}{
+		{name: "eperm", err: syscall.EPERM},
+		{name: "eagain", err: syscall.EAGAIN},
+		{name: "etxtbsy", err: syscall.ETXTBSY},
+	} {
+		fault := fault
+		t.Run(fault.name, func(t *testing.T) {
+			t.Parallel()
+			spawnRetriesRefusedErrno(t, fault.err)
+		})
+	}
+}
+
+// spawnRetriesRefusedErrno drives the production retry core with a
+// fault-injecting starter: attempt 1 fails with fault and attempt 2 starts
+// successfully. Every errno the classifier table marks retryable must
+// survive a refused first attempt here — a table entry reverted to
+// permanent fails its row, because startPTYWithStarter surfaces the
+// refusal at once instead of offering attempt 2.
+func spawnRetriesRefusedErrno(t *testing.T, fault syscall.Errno) {
 	ws := &pty.Winsize{Rows: 24, Cols: 80}
 
 	// Pin the failure mode the factory exists to avoid: a second Start on
@@ -127,12 +157,12 @@ func TestSpawnRetriesATransientRefusal(t *testing.T) {
 		t.Fatalf("second Start on a reused Cmd = %q, want exec: already started", err)
 	}
 
-	// A starter that fails attempt 1 the way the observed CI refusal
-	// fails — a transient EPERM fork/exec error BEFORE any process exists
-	// (no marking, no fd) — then delegates to the real PTY start. On top
-	// of that it records every command pointer it is offered: a retry
-	// that reuses one Cmd offers the same pointer twice, which is exactly
-	// the shape os/exec answers with "exec: already started".
+	// A starter that fails attempt 1 with the row's fault — a transient
+	// fork/exec error BEFORE any process exists (no marking, no fd) — then
+	// delegates to the real PTY start. On top of that it records every
+	// command pointer it is offered: a retry that reuses one Cmd offers the
+	// same pointer twice, which is exactly the shape os/exec answers with
+	// "exec: already started".
 	var calls atomic.Int64
 	var first *exec.Cmd
 	starter := func(cmd *exec.Cmd) (*os.File, error) {
@@ -141,7 +171,7 @@ func TestSpawnRetriesATransientRefusal(t *testing.T) {
 			if cmd.Process != nil {
 				t.Fatalf("attempt-1 command already has a process; the refusal must precede the start")
 			}
-			return nil, &os.PathError{Op: "fork/exec", Path: cmd.Path, Err: syscall.EPERM}
+			return nil, &os.PathError{Op: "fork/exec", Path: cmd.Path, Err: fault}
 		}
 		if cmd == first {
 			// The reused-Cmd shape: os/exec would answer this attempt

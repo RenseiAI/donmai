@@ -1,0 +1,2 @@
+{"height":24,"title":"drift-check-pr offline script rehearsal","version":2,"width":120}
+[0.1,"o","OFFLINE REHEARSAL: external commands use fixtures; no live vendor or GitHub run.\r\n$ bash comment.sh https://github.com/example/demo/pull/44\r\nPublished fixture comment:\r\nNative drift assessment\r\nPolicy: no-severity-high\r\nGated: 1\r\nExit status: 1 (completed gated assessment; fixture comment published)\r\n"]

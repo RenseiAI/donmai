@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1024,4 +1025,56 @@ sleep 0.1`)
 			}
 		})
 	}
+}
+
+// TestInteractiveContextHandle_ForwardsAndReports pins the codex
+// interactive leg of the typed context notice: the wrapper preserves the
+// PTY surface and the terminal-cost declaration while reporting the
+// session's own home through the runner's session-scoped seam. A session
+// that reports no home runs without context notices.
+func TestInteractiveContextHandle_ForwardsAndReports(t *testing.T) {
+	// The session-scoped context source is a plain value: the unnamed
+	// path reports its own home with an empty thread until the first
+	// rollout file appears, and a homeless source reports nothing (the
+	// runner then runs that session without context notices).
+	src := newInteractiveConversationContextSource("/tmp/codex-home-test", nil)
+	if got := src.ContextUsageSidecarPath(); got != "" {
+		t.Fatalf("sidecar path = %q for the codex leg; want empty", got)
+	}
+	home, thread := src.ContextUsageRollout()
+	if home != "/tmp/codex-home-test" || thread != "" {
+		t.Fatalf("rollout = (%q, %q); want (home, empty-thread)", home, thread)
+	}
+	empty := newInteractiveConversationContextSource("", nil)
+	if home, _ := empty.ContextUsageRollout(); home != "" {
+		t.Fatalf("homeless wrapper reported %q, want empty", home)
+	}
+	var nilSrc *interactiveConversationContextSource
+	if home, thread := nilSrc.ContextUsageRollout(); home != "" || thread != "" {
+		t.Fatalf("nil source rollout = (%q, %q); want empties", home, thread)
+	}
+	// The composed handle carries the same seam: spot-check through a
+	// live spawned wrapper below (see the conversation live test), and
+	// assert the type satisfies the runner's resolution interfaces.
+	var _ agent.ContextUsageSourcer = (*interactiveConversationHandle)(nil)
+	var _ agent.InteractiveTerminalCostSource = (*interactiveConversationHandle)(nil)
+	var _ agent.InteractiveCapable = (*interactiveConversationHandle)(nil)
+}
+
+// TestNamedInteractiveContextHandle_ReportsItsThread pins the named-session
+// leg: once the naming flow stores the thread id, the handle reports it
+// beside the session home, so the watcher tails this session's file.
+func TestNamedInteractiveContextHandle_ReportsItsThread(t *testing.T) {
+	var current atomic.Value
+	current.Store("")
+	src := &interactiveConversationContextSource{home: "/tmp/codex-home-named", thread: &current}
+	if _, thread := src.ContextUsageRollout(); thread != "" {
+		t.Fatalf("thread = %q before naming; want empty", thread)
+	}
+	current.Store("thread-named-1")
+	home, thread := src.ContextUsageRollout()
+	if home != "/tmp/codex-home-named" || thread != "thread-named-1" {
+		t.Fatalf("rollout = (%q, %q); want (home, thread-named-1)", home, thread)
+	}
+	var _ agent.ContextUsageSourcer = (*interactiveConversationHandle)(nil)
 }

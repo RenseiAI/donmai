@@ -303,6 +303,68 @@ func TestRealBinary_SequentialShellTools_RunInOrder(t *testing.T) {
 	}
 }
 
+// TestRealBinary_SequentialShellTools_GitBatch exercises the dependent git
+// sequence through Spawn with all three calls in one assistant response.
+// The delayed add makes a parallel commit race deterministic; status must
+// observe the staged file and commit must include its contents.
+func TestRealBinary_SequentialShellTools_GitBatch(t *testing.T) {
+	realBinaryAvailable(t)
+	workdir := t.TempDir()
+	git := func(cmd *exec.Cmd) string {
+		t.Helper()
+		cmd.Dir = workdir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", cmd.Args, err, out)
+		}
+		return string(out)
+	}
+	git(exec.Command("git", "init", "--quiet"))
+	const content = "dependent shell calls\n"
+	if err := os.WriteFile(filepath.Join(workdir, "change.txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commands := []string{
+		"sleep 1; git add -- change.txt",
+		"git status --porcelain --untracked-files=no > staged.txt",
+		"git -c user.name=Test -c user.email=test.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --quiet -m 'Record change'",
+	}
+	var calls []stubToolCall
+	for i, command := range commands {
+		args, err := json.Marshal(map[string]any{"command": command})
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls = append(calls, stubToolCall{ID: fmt.Sprintf("call-git-%d", i), Name: "bash", Arguments: string(args)})
+	}
+	h, events := spawnRealBinaryBatch(t, workdir, calls)
+	stream, failed := toolExecutionStream(events)
+	if want := oneAtATime(calls); !slices.Equal(stream, want) {
+		t.Errorf("git tool execution stream %q, want %q", stream, want)
+	}
+	for _, call := range calls {
+		if !h.wasAdjudicated(call.ID) {
+			t.Errorf("git call %s did not reach policy adjudication", call.ID)
+		}
+		if isError, ok := failed[call.ID]; !ok || isError {
+			t.Errorf("git call %s: result present=%v, error=%v", call.ID, ok, isError)
+		}
+	}
+	staged, err := os.ReadFile(filepath.Join(workdir, "staged.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(staged) != "A  change.txt\n" {
+		t.Errorf("git status observed %q, want staged change", staged)
+	}
+	if got := git(exec.Command("git", "show", "HEAD:change.txt")); got != content {
+		t.Errorf("committed content %q, want %q", got, content)
+	}
+	if got := git(exec.Command("git", "status", "--porcelain", "--untracked-files=no")); got != "" {
+		t.Errorf("tracked changes remain after commit: %q", got)
+	}
+}
+
 // TestRealBinary_SequentialToolOverride_KeepsPolicyFence proves, against the
 // REAL binary, that the sequential overrides of bash and write sit under the
 // policy fence rather than around it. One assistant message carries an
@@ -315,6 +377,11 @@ func TestRealBinary_SequentialToolOverride_KeepsPolicyFence(t *testing.T) {
 	realBinaryAvailable(t)
 
 	workdir := t.TempDir()
+	// State now lives outside the checkout. Seed the legacy directory so
+	// the refused legacy-path deletion has a real directory to protect.
+	if err := os.Mkdir(filepath.Join(workdir, piStateDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	inside := filepath.Join(workdir, "inside.txt")
 	outside := filepath.Join(t.TempDir(), "must-not-exist.txt")
 	marshal := func(v map[string]any) string {

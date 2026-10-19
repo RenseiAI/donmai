@@ -79,6 +79,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// steer while a turn is in flight and follow_up while idle
 			// (handle.go). Shipped and driven.
 			NoticeDelivery: agent.NoticeDeliveryRPCSteer,
+			// Native compaction events on the RPC stream are the
+			// harness-native context signal: the headless handle maps
+			// each compaction_end to a typed ContextUsageEvent
+			// (event_mapping.go) on its own Events channel, which the
+			// runner's headless loop already forwards to the usage
+			// series. Compaction-only: per-turn stream usage carries
+			// input/output/cache/cost keys with no window share, so no
+			// threshold leg is wired.
+			ContextUsageSource: agent.ContextUsageSourceRPCUsage,
 			Drives: []agent.WireProtocol{
 				agent.ProtoAnthropicMessages,
 				agent.ProtoOpenAIChat,

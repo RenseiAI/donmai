@@ -112,7 +112,13 @@ func (p *verdictScriptProvider) Manifest() agent.HarnessManifest {
 }
 
 func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
-	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts, specEnv: spec.Env}
+	// The script plays synchronously before Spawn/Inject returns. Size the
+	// buffer for the largest turn so large fixture streams cannot deadlock.
+	capacity := 64
+	for _, turn := range p.turns {
+		capacity = max(capacity, len(turn.events)+2*turn.toolCalls+4)
+	}
+	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, capacity), prompts: &p.prompts, specEnv: spec.Env}
 	p.lastHandle = h
 	h.events <- agent.InitEvent{SessionID: "scripted-session"}
 	h.play()
@@ -301,6 +307,7 @@ const followUpRepository = "https://github.com/example/repo"
 
 // scriptedSession configures runScriptedSession.
 type scriptedSession struct {
+	endpoint     *agent.EndpointBinding
 	workType     string
 	skipSteering bool
 	inject       string
@@ -451,7 +458,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		WorkerID:        "worker-1",
 		AuthToken:       "tok",
 		PlatformURL:     platform.URL,
-		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub, Endpoint: cfg.endpoint},
 	}
 	qw.WorkType = cfg.workType
 	qw.StageBudget = cfg.budget
@@ -701,6 +708,82 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 			want: verdictWant{status: "completed", workResult: "failed", wantSteering: true},
 		},
 		{
+			// A verdict the runner took from a printed block is the
+			// tool-restricted stage's backstop, not a filed verdict: a
+			// later turn's anchored passed marker raises it like any
+			// marker-held verdict, and the printed block is dropped so
+			// its verdict is never posted.
+			name: "a later anchored passed marker raises a verdict taken from a printed block",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"regression reproduces"}`},
+				{text: "Re-ran against the fixed tree; all green.\nWORK_RESULT:passed"},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "Re-ran against the fixed tree; all green.\nWORK_RESULT:passed", wantSteering: true},
+		},
+		{
+			// The printed tier still cannot raise: when the follow-up
+			// prints its own passed block alongside the raising marker,
+			// the block is ignored and the marker governs.
+			name: "a follow-up printed block is ignored while its own marker raises a printed verdict",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"regression reproduces"}`},
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"optimistic"}` + "\nRe-ran against the fixed tree; all green.\nWORK_RESULT:passed"},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"optimistic"}` + "\nRe-ran against the fixed tree; all green.\nWORK_RESULT:passed", wantSteering: true},
+		},
+		{
+			// A printed verdict yields in either direction: a stale
+			// printed passed block gives way to the follow-up's anchored
+			// failed marker, like a filed passed manifest would.
+			name: "a follow-up anchored failed marker lowers a verdict taken from a printed block",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all green"}`},
+				{text: "The rebase broke the build.\nWORK_RESULT: failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "The rebase broke the build.\nWORK_RESULT: failed", wantSteering: true},
+		},
+		{
+			// Without a follow-up verdict of its own, a printed stale
+			// verdict still speaks for the turn: it is folded again and
+			// posted, beating the follow-up's bare terminal prose.
+			name: "a printed verdict with no follow-up verdict is folded again",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"regression reproduces"}`},
+				{text: followUpPR},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "regression reproduces", pr: followUpPR, manifest: "failed", wantSteering: true},
+		},
+		{
+			// A stale printed verdict is re-folded on a same-verdict
+			// follow-up marker, keeping its summary over the terminal prose.
+			name: "a same-verdict follow-up marker keeps the stale printed verdict and its summary",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"regression reproduces"}`},
+				{text: followUpPR + "\nWORK_RESULT: failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "regression reproduces", pr: followUpPR, manifest: "failed", wantSteering: true},
+		},
+		{
+			// A printed block may lower a printed stale verdict: the
+			// never-raise guard bars only raising, whatever the stale source.
+			name: "a printed failed block lowers a stale printed passed verdict",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all green"}`},
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"tests red after rebase"}`},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "tests red after rebase", manifest: "failed", wantSteering: true},
+		},
+		{
+			// A rewritten file still beats a printed stale verdict: the
+			// file tier is the agent's latest structured word either way.
+			name: "a rewritten manifest file supersedes a stale printed verdict",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"regression reproduces"}`},
+				{manifest: passedManifest, text: "Re-checked; all green."},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "all done", manifest: "passed", wantSteering: true},
+		},
+		{
 			name: "a printed passed block never raises the same turn's own anchored failed marker",
 			turns: []verdictScriptTurn{
 				{text: "Work in progress."},
@@ -846,6 +929,28 @@ func TestRun_TurnVerdictAcrossMemoryInjectFollowUp(t *testing.T) {
 				{text: "Looked again with the recalled context.\nWORK_RESULT:passed"},
 			},
 			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed"},
+		},
+		{
+			// The issue's scenario: a tool-restricted stage printed its
+			// failed verdict, and the passing re-check after the
+			// memory-inject follow-up raises it via its anchored marker.
+			// A printed verdict is the backstop, not a filed one.
+			name: "a memory-inject follow-up passed marker raises a verdict taken from a printed block",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"regression reproduces"}`},
+				{text: "Looked again with the recalled context; all green.\nWORK_RESULT:passed"},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "Looked again with the recalled context; all green.\nWORK_RESULT:passed"},
+		},
+		{
+			// A printed stale verdict with no follow-up verdict still
+			// speaks for the turn through the memory-inject follow-up.
+			name: "a printed verdict with no memory-inject verdict is folded again",
+			turns: []verdictScriptTurn{
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"regression reproduces"}`},
+				{text: "Checked the recalled context; nothing changes."},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "regression reproduces", manifest: "failed"},
 		},
 		{
 			name: "no manifest: a passed marker quoted in the memory-inject follow-up never upgrades the anchored failed verdict",

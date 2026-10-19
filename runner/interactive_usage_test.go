@@ -3,7 +3,9 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -30,18 +32,21 @@ func TestInteractive_TerminalReportCarriesTranscriptUsage(t *testing.T) {
 	turnOneCost := 0.01
 	turnTwoCost := 0.02
 	base.events <- agent.LlmCallEvent{
-		InputTokens: 1200, OutputTokens: 80,
+		GenerationID: "response-one",
+		InputTokens:  1200, OutputTokens: 80,
 		CachedInputTokens: 48000, CacheWriteTokens: 512,
 		UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &turnOneCost, TurnCompleted: true,
 	}
 	base.events <- agent.LlmCallEvent{
-		InputTokens: 300, OutputTokens: 40,
+		GenerationID: "response-two",
+		InputTokens:  300, OutputTokens: 40,
 		CachedInputTokens: 1000, CacheWriteTokens: 64,
 		UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &turnTwoCost, TurnCompleted: true,
 	}
 	handle := &testInteractiveHandle{Handle: base, session: session}
 	sink := &recordingSink{}
 	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "transcript-usage", Mode: interactiveRunMode}}
+	qw.ResolvedProfile.Endpoint = &agent.EndpointBinding{}
 	r := minimalRunner(t)
 
 	result, err := r.dispatchInteractive(
@@ -51,6 +56,9 @@ func TestInteractive_TerminalReportCarriesTranscriptUsage(t *testing.T) {
 		t.Fatalf("dispatchInteractive = status %q err %v, want completed", result.Status, err)
 	}
 
+	if !slices.Equal(result.GenerationIDs, []string{"response-one", "response-two"}) {
+		t.Fatalf("GenerationIDs = %v; want both response ids", result.GenerationIDs)
+	}
 	want := agent.CostData{
 		InputTokens:       1500,
 		OutputTokens:      120,
@@ -458,5 +466,36 @@ func TestInteractive_HarnessAccountedCostWinsOverLiveTranscriptTotals(t *testing
 	}
 	if out.Cost == nil || *out.Cost != *accounted {
 		t.Fatalf("Cost = %+v; want the harness-accounted totals %+v", out.Cost, *accounted)
+	}
+}
+
+func TestInteractive_GenerationIDs(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	for _, bound := range []bool{false, true} {
+		t.Run(fmt.Sprint(bound), func(t *testing.T) {
+			base := &fakeHandle{events: make(chan agent.Event, 8)}
+			base.events <- generationEvent("response-one")
+			base.events <- generationEvent("response-one")
+			handle := &testInteractiveHandle{Handle: base, session: completedRecordingInteractiveSession()}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "response-ids", Mode: interactiveRunMode}}
+			if bound {
+				qw.ResolvedProfile.Endpoint = &agent.EndpointBinding{}
+			}
+			res, err := minimalRunner(t).dispatchInteractive(t.Context(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, &recordingSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bound {
+				if !slices.Equal(res.GenerationIDs, []string{"response-one"}) {
+					t.Fatalf("GenerationIDs = %v; want response-one", res.GenerationIDs)
+				}
+			} else if len(res.GenerationIDs) != 0 {
+				t.Fatalf("unbound GenerationIDs = %v", res.GenerationIDs)
+			}
+			if res.Cost != nil {
+				t.Fatalf("id-only observation changed usage: %+v", res.Cost)
+			}
+		})
 	}
 }

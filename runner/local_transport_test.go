@@ -216,6 +216,15 @@ func TestLocalTransportRunLoopModeBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// The ownership pulse now starts before provisioning, so
+				// lock-refresh traffic before the intercepted Spawn is
+				// the expected pre-provision liveness — not a leak.
+				// Only non-liveness traffic is unexpected here.
+				if strings.Contains(r.URL.Path, "/lock-refresh") {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"refreshed":true}`))
+					return
+				}
 				t.Errorf("unexpected network before intercepted Spawn: %s", r.URL.Path)
 				w.WriteHeader(http.StatusInternalServerError)
 			}))

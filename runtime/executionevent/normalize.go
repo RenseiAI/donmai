@@ -54,6 +54,9 @@ func NormalizeEvent(sessionID string, seq uint64, observedAt time.Time, event ag
 		if ev.ChildSessionID != "" {
 			payload["childSessionId"] = ev.ChildSessionID
 		}
+		if ev.ChildSessionTransport != "" {
+			payload["childSessionTransport"] = ev.ChildSessionTransport
+		}
 	case agent.ErrorEvent:
 		eventType = "error.raised"
 		// Provider error text can contain prompt/tool/credential material.
@@ -67,6 +70,39 @@ func NormalizeEvent(sessionID string, seq uint64, observedAt time.Time, event ag
 		if strings.EqualFold(ev.Subtype, "blocked") {
 			eventType = "session.blocked"
 			payload = map[string]any{"reason": "session blocked by provider"}
+		}
+	case agent.ContextUsageEvent:
+		// The typed harness notice for a compaction or a context-window
+		// threshold crossing. It maps to the usage.recorded topic at
+		// session scope (the D8 mapping's usage signal for signals that
+		// are not per-call spend): only the measurements the harness
+		// reported ride the payload, so unknown stays absent, never
+		// zero. A measurement-less compaction marker still records the
+		// compaction — the marker itself is the signal.
+		eventType = "usage.recorded"
+		payload = map[string]any{"scope": "session"}
+		kind := string(ev.NoticeKind)
+		if kind == "" {
+			kind = "threshold"
+		}
+		payload["kind"] = kind
+		if ev.Harness != "" {
+			payload["harness"] = ev.Harness
+		}
+		if ev.Source != "" {
+			payload["source"] = ev.Source
+		}
+		if ev.UsedPercent != nil {
+			payload["usedPercent"] = *ev.UsedPercent
+		}
+		if ev.InputTokens != nil {
+			payload["inputTokens"] = *ev.InputTokens
+		}
+		if ev.OutputTokens != nil {
+			payload["outputTokens"] = *ev.OutputTokens
+		}
+		if ev.ContextWindowSize != nil {
+			payload["contextWindowSize"] = *ev.ContextWindowSize
 		}
 	default:
 		return Record{}, false, nil

@@ -127,6 +127,11 @@ type Config struct {
 	// runners pick up daemon-side runtime-token refreshes mid-session.
 	CredentialProvider CredentialProvider
 
+	// Traceparent and Tracestate carry the optional dispatch W3C trace context.
+	// Empty values omit the corresponding request headers.
+	Traceparent string
+	Tracestate  string
+
 	// HTTPClient overrides http.DefaultClient.
 	HTTPClient *http.Client
 	// Logger overrides slog.Default(). The poster logs at debug for
@@ -560,6 +565,12 @@ func (p *Poster) postActivity(ctx context.Context, body payload) error {
 		return fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}
@@ -631,13 +642,16 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // mapEvent translates an agent.Event into the platform activity shape.
 // Returns ok=false for events that should not be forwarded
 // (Init / most System / ToolProgress) — those are runner-internal lifecycle
-// signals the platform doesn't render. Four SystemEvent subtypes are
+// signals the platform doesn't render. Selected SystemEvent subtypes are
 // forwarded: "reasoning" becomes a thought, and
 // "interactive-initial-prompt-delivered",
 // agent.SystemSubtypeToolCallRefusedOutputLimit, and
 // agent.SystemSubtypeReasoningEffort become context markers with fixed
 // content (never the event's free-form Message; the effort marker names a
-// level only when it is a known agent.EffortLevel).
+// level only when it is a known agent.EffortLevel). Codex rerouting,
+// moderation and safety buffering become warnings; native diagnostics retain
+// their error/warning level without terminating the turn; file/plan deltas become
+// progress activities.
 //
 // timestamp is the wall-clock time at which the event was observed; the
 // platform server defaults to "now" when omitted, but emitting it here
@@ -733,6 +747,18 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 
 	case agent.SystemEvent:
 		switch e.Subtype {
+		case "codex_error":
+			out.Type = "error"
+			out.Content = e.Message
+			return out, true
+		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+			out.Type = "warning"
+			out.Content = e.Message
+			return out, true
+		case "codex_progress":
+			out.Type = "progress"
+			out.Content = e.Message
+			return out, true
 		case "reasoning":
 			if msg := strings.TrimSpace(e.Message); msg != "" {
 				out.Type = "thought"
@@ -771,12 +797,27 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
-		// command_progress, diff_updated, compaction, and unknown values) stays
-		// runner-internal and is dropped.
+		// command_progress, diff_updated, compaction, stream progress, and
+		// unknown values) stays runner-internal and is dropped. Stream
+		// progress in particular must never reach the activity stream:
+		// one event per streamed token would spam it exactly the way
+		// per-token assistant text once did.
 		return payload{}, false
 
 	case agent.InitEvent, agent.ToolProgressEvent:
 		return payload{}, false
+
+	case agent.ContextUsageEvent:
+		// The typed harness notice for a compaction or a context-window
+		// threshold crossing. It maps to a context marker whose structured
+		// value carries only the measurements the harness reported: unknown
+		// stays ABSENT, never zero, so the usage series stores a real data
+		// point rather than a fabricated one.
+		out.Type = "context"
+		out.Content = ContextUsageContent(e)
+		out.ContextKey = ContextUsageContextKey
+		out.ContextValue = ContextUsageContextValue(e)
+		return out, true
 	}
 	return payload{}, false
 }
@@ -891,6 +932,78 @@ func ToolCallBoundsContent(message string) string {
 		return toolCallBoundsContentPrefix + strconv.Itoa(n) + "s (a call that runs past it fails back to the agent; the session continues)"
 	}
 	return toolCallBoundsInvalidContent
+}
+
+// ContextUsageContextKey is the contextKey a harness context notice
+// carries, so the usage series can append the session event without
+// parsing Content.
+const ContextUsageContextKey = "contextUsage"
+
+// ContextUsageContent is the fixed-vocabulary activity content for an
+// agent.ContextUsageEvent. It names the harness, the source and the kind,
+// then the measurements the harness reported — and only those. Unknown
+// measurements are omitted from the sentence, never rendered as zero.
+func ContextUsageContent(e agent.ContextUsageEvent) string {
+	kind := string(e.NoticeKind)
+	if kind == "" {
+		kind = "threshold"
+	}
+	harness := e.Harness
+	if harness == "" {
+		harness = "harness"
+	}
+	var parts []string
+	if e.UsedPercent != nil {
+		parts = append(parts, fmt.Sprintf("%.1f%% of context used", *e.UsedPercent))
+	}
+	if e.InputTokens != nil {
+		parts = append(parts, fmt.Sprintf("%d input tokens", *e.InputTokens))
+	}
+	if e.OutputTokens != nil {
+		parts = append(parts, fmt.Sprintf("%d output tokens", *e.OutputTokens))
+	}
+	if e.ContextWindowSize != nil {
+		parts = append(parts, fmt.Sprintf("%d-token window", *e.ContextWindowSize))
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%s %s (%s)", harness, kind, sourceOrUnknown(e.Source))
+	}
+	return fmt.Sprintf("%s %s (%s): %s", harness, kind, sourceOrUnknown(e.Source), strings.Join(parts, ", "))
+}
+
+func sourceOrUnknown(source string) string {
+	if strings.TrimSpace(source) == "" {
+		return "unknown source"
+	}
+	return source
+}
+
+// ContextUsageContextValue is the structured value of a harness context
+// notice: kind plus only the reported measurements, formatted without
+// units so the series can parse it. Unknown measurements are absent from
+// the value, never zero.
+func ContextUsageContextValue(e agent.ContextUsageEvent) string {
+	kind := string(e.NoticeKind)
+	if kind == "" {
+		kind = "threshold"
+	}
+	parts := []string{"kind=" + kind}
+	if e.Harness != "" {
+		parts = append(parts, "harness="+e.Harness)
+	}
+	if e.UsedPercent != nil {
+		parts = append(parts, "usedPercent="+strconv.FormatFloat(*e.UsedPercent, 'f', -1, 64))
+	}
+	if e.InputTokens != nil {
+		parts = append(parts, "inputTokens="+strconv.FormatInt(*e.InputTokens, 10))
+	}
+	if e.OutputTokens != nil {
+		parts = append(parts, "outputTokens="+strconv.FormatInt(*e.OutputTokens, 10))
+	}
+	if e.ContextWindowSize != nil {
+		parts = append(parts, "contextWindowSize="+strconv.FormatInt(*e.ContextWindowSize, 10))
+	}
+	return strings.Join(parts, ";")
 }
 
 // summarizeToolUse produces a short one-line summary of a tool call,

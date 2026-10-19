@@ -886,6 +886,99 @@ func TestRepoKeeper_AuthResolverFailureDegrades(t *testing.T) {
 // remote still clones through the production path, and the published
 // mirror's config carries no trace of the header.
 
+// TestRepoKeeper_OpaqueCredentialRemoteDegradesToPlainClone drives the
+// production Acquire entry point with an scp-like remote carrying
+// password-shaped userinfo and proves the caller degrades: ok=false and
+// no mirror directory created, so the token never reaches keeper state.
+func TestRepoKeeper_OpaqueCredentialRemoteDegradesToPlainClone(t *testing.T) {
+	t.Parallel()
+
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	if dir, ok := k.Acquire(context.Background(), "deploy:s3cret-token@forge.example:org/repo.git"); ok || dir != "" {
+		t.Fatalf("opaque-credential Acquire = (%q, %v), want (\"\", false)", dir, ok)
+	}
+	names, err := os.ReadDir(filepath.Join(k.store.StateDir(), "repo-keeper", "mirrors"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("scan mirrors: %v", err)
+	}
+	if len(names) != 0 {
+		t.Errorf("opaque-credential Acquire created %d mirror dirs, want none", len(names))
+	}
+}
+
+// TestRepoKeeper_RestartSweepsCrashStaging is the keeper-start crash
+// acceptance case: a credentialed clone staging sibling left between
+// clone and publish is swept when the next keeper starts over the same
+// state dir, so no credential bytes remain on disk after the restart.
+func TestRepoKeeper_RestartSweepsCrashStaging(t *testing.T) {
+	t.Parallel()
+
+	const secret = "restart-sweep-secret"
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	first, err := repokeeper.New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("repokeeper.New(first) error = %v", err)
+	}
+	keeper := NewRepoKeeper(first, RepoKeeperSettings{Enabled: true}, nil, nil)
+	if err := keeper.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// Simulate the kill between clone and publish: a credentialed
+	// staging sibling under the mirrors directory.
+	mirrors := filepath.Join(stateDir, "repo-keeper", "mirrors")
+	if err := os.MkdirAll(mirrors, 0o700); err != nil {
+		t.Fatalf("create mirrors dir: %v", err)
+	}
+	staging, err := os.MkdirTemp(mirrors, ".clone-*.tmp")
+	if err != nil {
+		t.Fatalf("plant crash staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "config"), []byte("[remote \"origin\"]\n\turl = https://user:"+secret+"@example.com/org/repo.git\n"), 0o600); err != nil {
+		t.Fatalf("plant crash credential: %v", err)
+	}
+
+	// The restart builds a fresh store over the same state dir and
+	// reconciles before serving: the sweep runs inside New.
+	second, err := repokeeper.New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("repokeeper.New(second) error = %v", err)
+	}
+	restarted := NewRepoKeeper(second, RepoKeeperSettings{Enabled: true}, nil, nil)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after restart: %v", err)
+	}
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Errorf("crash staging survived the restart: err = %v", err)
+	}
+	var leaked []string
+	_ = filepath.Walk(stateDir, func(path string, info os.FileInfo, err error) error { //nolint:gosec // G122: secret sweep over the test's own TempDir; no writes.
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path) //nolint:gosec // G304: files enumerated from the test's own TempDir walk.
+		if err == nil && strings.Contains(string(data), secret) {
+			leaked = append(leaked, path)
+		}
+		return nil
+	})
+	if len(leaked) > 0 {
+		t.Errorf("crash credential survived the restart: %v", leaked)
+	}
+	// The restarted keeper still serves: the sweep removed staging
+	// only, never live state.
+	if _, ok := restarted.Acquire(context.Background(), newKeeperSourceRepo(t)); !ok {
+		t.Error("restarted keeper Acquire degraded, want a served mirror")
+	}
+}
+
 // TestRepoKeeper_CombinedRootProbe is the cross-store regression test: the
 // daemon keeper and a second store over the same state dir share one
 // catalog format, so neither corrupts the other's state — a revocation

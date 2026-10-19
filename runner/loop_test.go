@@ -1669,3 +1669,89 @@ func TestLoop_SpawnsOnHarnessDeclaringNoMCPDelivery(t *testing.T) {
 			res.Status, res.FailureMode, res.Error)
 	}
 }
+
+// TestRunLoop_HeartbeatTicksDuringProvisioning is the slow-provision
+// liveness regression: provisioning is held open past several shortened
+// heartbeat intervals, and the run must post lock-refreshes while the
+// clone is still in flight. Before the fix the pulser started only after
+// spawn, so a session stuck cloning for longer than the platform's stale
+// window was reclaimed as stale; moving the pulse start back after
+// provisioning (revert-RED) leaves zero refreshes before Run returns.
+func TestRunLoop_HeartbeatTicksDuringProvisioning(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	var refreshes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/lock-refresh") {
+			refreshes.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	// Hold provisioning open well past several 20ms heartbeat intervals.
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent, PreProvisionDelay: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL,
+		WorkerID:    "w1",
+		AuthToken:   "tok",
+		HTTPClient:  srv.Client(),
+		BaseDelay:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry()
+	p, _ := stub.New()
+	_ = reg.Register(p)
+	r, err := New(Options{
+		Registry:          reg,
+		WorktreeManager:   wtm,
+		Poster:            poster,
+		HTTPClient:        srv.Client(),
+		HeartbeatInterval: 20 * time.Millisecond,
+		SkipBackstop:      true,
+		SkipSteering:      true,
+		SkipPostSession:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("LOOP-HB-PROV"),
+		WorkerID:    "w1",
+		AuthToken:   "tok",
+		PlatformURL: srv.URL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderStub,
+		},
+	}
+	qw.Repository = bareRepo
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q; want completed (FailureMode=%q, Error=%q)",
+			res.Status, res.FailureMode, res.Error)
+	}
+	// The 500ms provision hold spans ~25 ticks at a 20ms cadence; the
+	// synchronous first tick alone proves the pulse starts before
+	// provisioning, but require several so a single stray tick cannot
+	// pass a build where the pulse starts after the hold.
+	if got := refreshes.Load(); got < 5 {
+		t.Fatalf("lock-refresh posts during provisioning = %d; want >= 5 (pulse must start before provisioning)", got)
+	}
+}

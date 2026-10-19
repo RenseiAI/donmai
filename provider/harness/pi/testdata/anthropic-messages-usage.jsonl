@@ -1,0 +1,2 @@
+{"type":"turn_end","message":{"role":"assistant","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","content":[{"type":"thinking","thinking":"Fixture thinking."},{"type":"text","text":"Done."}],"usage":{"input":40,"output":50,"cacheRead":60,"cacheWrite":10,"totalTokens":160},"stopReason":"stop"}}
+{"type":"agent_settled"}

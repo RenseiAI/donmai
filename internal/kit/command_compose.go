@@ -212,7 +212,9 @@ func validateCompositionLock(lock *CompositionLock) error {
 		}
 		seenDependencies := map[string]struct{}{}
 		for _, binding := range entry.Dependencies {
-			if binding.Manager == "" || binding.SelectedKitID == "" {
+			if binding.Manager == "" || binding.SelectedKitID == "" ||
+				(binding.SelectedDigestKind != "package" && binding.SelectedDigestKind != "legacy-manifest") ||
+				!validDigest(binding.SelectedDigest) {
 				return fmt.Errorf("%w: malformed dependency binding", ErrCompositionLockInvalid)
 			}
 			if _, ok := seenDependencies[binding.Manager]; ok {

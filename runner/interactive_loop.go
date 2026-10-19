@@ -87,7 +87,7 @@ func interactiveInitialPromptLimit(manifest agent.HarnessManifest) int {
 	if profile, ok := manifest.PromptProfile(agent.PromptModeHumanControlled); ok {
 		switch profile.UserDelivery {
 		case agent.PromptDeliveryClaudePTYSeed, agent.PromptDeliveryCodexPTYSeed,
-			agent.PromptDeliveryPiPTYSeed:
+			agent.PromptDeliveryPiPTYSeed, agent.PromptDeliveryMusePTYSeed:
 			return maxArgvSeedPromptBytes
 		}
 	}
@@ -432,9 +432,20 @@ func (r *Runner) dispatchInteractive(
 	// the terminal report (so the existing cost-event writer records it) and
 	// is visible to the step-heartbeat emitter wired below through
 	// usageSnapshot.
-	usage := &interactiveUsageTotals{}
+	usage := &interactiveUsageTotals{collectIDs: qw.ResolvedProfile.Endpoint != nil}
 	r.registerInteractiveUsage(qw.SessionID, usage)
 	defer r.releaseInteractiveUsage(qw.SessionID)
+
+	// Harness context/compaction notices: the interactive lane's equivalent
+	// of the headless lane's UsageEvent quota hook above. The watcher polls
+	// each harness's native context signal (statusline sidecar, rollout
+	// token_count) and delivers crossings as typed ContextUsageEvents on
+	// the same sink + JSONL legs as every other interactive event. It is
+	// best-effort and never blocks the PTY: drops on a slow consumer,
+	// silence when the harness reports no signal. The pi leg reports
+	// compaction markers through its RPC stream instead of a file poll.
+	stopContextWatch := r.startContextUsageWatch(interactiveCtx, worktreePath, handle, sink)
+	defer stopContextWatch()
 	handleEvents := handle.Events()
 	for {
 		// A nil source parks the inject case while a notice is held.
@@ -661,8 +672,25 @@ const interactiveActivityFlushGrace = 5 * time.Second
 // carry it. A nil usage leaves the total untouched, so callers that only
 // forward (and never report) may pass nil.
 func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath string, sink activitySink, event agent.Event, usage *interactiveUsageTotals) {
-	if system, ok := event.(agent.SystemEvent); ok && (system.Subtype == "harness_state_lost" || system.Subtype == agent.SystemSubtypeHarnessLifecycle) {
-		r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
+	if usage != nil && usage.collectIDs {
+		usage.mu.Lock()
+		usage.generationIDs = collectGenerationID(usage.generationIDs, event)
+		usage.mu.Unlock()
+	}
+	if system, ok := event.(agent.SystemEvent); ok {
+		switch system.Subtype {
+		case "harness_state_lost", agent.SystemSubtypeHarnessLifecycle:
+			r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
+			return
+		case "user_message", "turn_completed":
+			// Live conversation markers the harness tails from its own
+			// transcript: provider user turns (attribution-preserving —
+			// never the viewer's own input) and turn completion.
+			// They flow through the same activity sink as the headless
+			// lane's events.
+			r.postInteractiveEvent(ctx, worktreePath, sink, event)
+			return
+		}
 		return
 	}
 	switch e := event.(type) {
@@ -674,6 +702,76 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 			usage.add(e)
 		}
 	}
+}
+
+// startContextUsageWatch starts the harness context/compaction watcher
+// for one interactive session. It resolves the harness-native signal paths
+// from the provider identity and the session environment, starts the
+// watcher goroutine, and returns the stop func the caller defers. A harness
+// with no pollable signal (or unresolvable paths) gets a no-op stop — the
+// session runs without context notices, exactly as a headless session
+// without a quota harness runs without quota reports. Emission rides
+// postInteractiveEvent so notices reach both the activity sink and the
+// events.jsonl audit leg.
+func (r *Runner) startContextUsageWatch(ctx context.Context, worktreePath string, handle agent.Handle, sink activitySink) func() {
+	source := resolveContextUsageSource(handle)
+	if source.harness == "" {
+		return func() {}
+	}
+	return r.runContextUsageWatch(ctx, newContextUsageWatcher(source), worktreePath, sink)
+}
+
+// runContextUsageWatch runs w on its own goroutine and returns a stop func
+// that cancels the watcher AND waits for the goroutine to exit. The join is
+// load-bearing: the dispatch's caller stops the activity poster and closes
+// the execution-event journal right after the dispatch returns, so a notice
+// still in flight would race the poster's queue close (a send on a closed
+// channel panics the process) or append after the terminal journal record.
+// Waiting is bounded because every sink leg is non-blocking or local.
+func (r *Runner) runContextUsageWatch(ctx context.Context, w *contextUsageWatcher, worktreePath string, sink activitySink) func() {
+	watchCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.run(watchCtx, func(ev agent.Event) {
+			if watchCtx.Err() != nil {
+				return
+			}
+			r.postInteractiveEvent(watchCtx, worktreePath, sink, ev)
+		})
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// resolveContextUsageSource maps the spawned handle onto the
+// harness-native context signal the watcher polls. Paths come from the
+// handle's own session-scoped seam (agent.ContextUsageSourcer): the
+// statusline sidecar the claude session's own statusLine command
+// maintains, or the session-state subtree of the codex session's own
+// home. An empty harness means no pollable signal — pi reports through
+// its RPC stream (see the pi handle's compaction mapping), and every
+// other harness reports none. There is deliberately no environment
+// fallback: a process-wide variable fans one session's readings out to
+// every session sharing the process.
+func resolveContextUsageSource(handle agent.Handle) contextUsageSource {
+	sourcer, ok := handle.(agent.ContextUsageSourcer)
+	if !ok || sourcer == nil {
+		return contextUsageSource{}
+	}
+	if path := strings.TrimSpace(sourcer.ContextUsageSidecarPath()); path != "" {
+		return contextUsageSource{harness: string(agent.HarnessClaudeCode), sidecarPath: path}
+	}
+	if home, thread := sourcer.ContextUsageRollout(); strings.TrimSpace(home) != "" {
+		return contextUsageSource{
+			harness:       string(agent.HarnessCodex),
+			rolloutHome:   strings.TrimSpace(home),
+			rolloutThread: strings.TrimSpace(thread),
+		}
+	}
+	return contextUsageSource{}
 }
 
 // drainInteractiveActivity runs once the PTY session is Done. A handle that

@@ -1124,7 +1124,7 @@ func TestDaemonDoctorHelp(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"--json", "--user", "--system"} {
+	for _, want := range []string{"--json", "--user", "--system", "--fix", "--config"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor --help missing flag %q; got:\n%s", want, out)
 		}
@@ -1450,7 +1450,11 @@ func TestFormatSeatBudgetStatus(t *testing.T) {
 		{name: "daemon does not report it", status: nil, want: "not reported"},
 		{name: "empty mode", status: &afclient.SeatBudgetStatus{}, want: "not reported"},
 		{name: "off", status: &afclient.SeatBudgetStatus{Mode: "none"}, want: "none"},
+		{name: "off with a non-default class", status: &afclient.SeatBudgetStatus{Mode: "none", QoS: "utility"}, want: "none (seat QoS: utility)"},
+		{name: "off with the default class stays bare", status: &afclient.SeatBudgetStatus{Mode: "none", QoS: "default"}, want: "none"},
 		{name: "best effort", status: &afclient.SeatBudgetStatus{Mode: "best-effort", CPUs: 4, MemoryMB: 8192}, want: "best-effort, 4 CPUs, 8192 MB"},
+		{name: "best effort with a class", status: &afclient.SeatBudgetStatus{Mode: "best-effort", CPUs: 4, MemoryMB: 8192, QoS: "utility"}, want: "best-effort, 4 CPUs, 8192 MB, seat QoS: utility"},
+		{name: "best effort with a class and detail", status: &afclient.SeatBudgetStatus{Mode: "best-effort", CPUs: 4, QoS: "utility", Detail: "caps"}, want: "best-effort, 4 CPUs, seat QoS: utility — caps"},
 		{name: "enforced with detail", status: &afclient.SeatBudgetStatus{Mode: "enforced", CPUs: 2, Detail: "via transient systemd scope"}, want: "enforced, 2 CPUs — via transient systemd scope"},
 	}
 	for _, tc := range cases {

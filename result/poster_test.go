@@ -137,6 +137,40 @@ func TestPosterPost_Happy(t *testing.T) {
 	}
 }
 
+func TestPosterPost_ObservedModel(t *testing.T) {
+	t.Parallel()
+	for _, model := range []string{"", "claude-opus-4-1"} {
+		t.Run("model="+model, func(t *testing.T) {
+			t.Parallel()
+			ok := func(int) (int, string) { return http.StatusOK, `{"ok":true}` }
+			srv, state := captureServer(t, ok, ok)
+			r := goodResult()
+			r.Model = model
+			if err := newPoster(t, srv.URL, 0).Post(context.Background(), "sess-model", r); err != nil {
+				t.Fatal(err)
+			}
+			if got := state.status.Load(); got != 1 {
+				t.Fatalf("status requests = %d; want 1", got)
+			}
+			for _, raw := range state.bodies {
+				var body map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(raw), &body); err != nil {
+					t.Fatal(err)
+				}
+				if _, status := body["status"]; !status {
+					continue
+				}
+				got, present := body["model"]
+				if model == "" && present {
+					t.Errorf("unobserved model should be omitted: %s", got)
+				} else if model != "" && string(got) != `"`+model+`"` {
+					t.Errorf("posted model = %s; want %q", got, model)
+				}
+			}
+		})
+	}
+}
+
 // TestPosterPost_CompletionOutcomePrecedesStatus proves the ordinary no-retry
 // exchange through an injected transport, so its exact one completion then one
 // status assertion cannot be affected by TCP acknowledgement ambiguity.
@@ -1460,6 +1494,37 @@ func TestPosterPost_StatusUpstreamErrorSerialized(t *testing.T) {
 			}
 			if present && string(got) != tc.want {
 				t.Errorf("upstreamError = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPoster_GenerationIDs(t *testing.T) {
+	t.Parallel()
+	for _, ids := range [][]string{nil, {}, {"response-one", "response-two"}} {
+		t.Run(strings.Join(ids, ","), func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				got, present := body["generationIds"]
+				if strings.HasSuffix(req.URL.Path, "/status") && len(ids) > 0 {
+					want, _ := json.Marshal(ids)
+					if string(got) != string(want) {
+						t.Errorf("generationIds = %s; want %s", got, want)
+					}
+				} else if present {
+					t.Errorf("unexpected generationIds = %s", got)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			r := goodResult()
+			r.GenerationIDs = ids
+			if err := newPoster(t, srv.URL, 0).Post(t.Context(), "session", r); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

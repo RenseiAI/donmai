@@ -3,6 +3,7 @@ package codex
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ type mapperState struct {
 	totalInputTokens     int64
 	totalOutputTokens    int64
 	totalCachedInputTok  int64
+	totalCostUSD         float64
 	turnCount            int
 	completedTurns       int
 	seenCompletedTurnIDs map[string]struct{}
@@ -32,7 +34,11 @@ type mapperState struct {
 	// of falling back to the session default — the same merged-plan
 	// rule the probe-side subscription applies, so stream and probe
 	// rows share window ids.
-	rateLimits *RateLimitSnapshot
+	rateLimits    *RateLimitSnapshot
+	ignoredCounts map[string]uint64
+	usageTotal    *codexTokenUsage
+	usageThisTurn bool
+	reasoning     map[string]*reasoningBuffer
 }
 
 // mapNotification translates one inbound JSON-RPC notification into
@@ -43,6 +49,10 @@ type mapperState struct {
 // Returning a slice (vs. a single Event) preserves the legacy
 // item/started + item/completed emit-two-events shape for tool calls.
 func mapNotification(method string, params json.RawMessage, state *mapperState, raw any) []agent.Event {
+	if _, ignored := ignoredNotifications[method]; ignored {
+		countIgnored(state, method)
+		return nil
+	}
 	switch method {
 	// ─── Thread lifecycle ─────────────────────────────────────────
 	case "thread/started":
@@ -58,16 +68,8 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		}
 		return nil
 
-	case "thread/closed", "thread/status/changed":
+	case "thread/closed":
 		return []agent.Event{agent.SystemEvent{Subtype: subtypeFromMethod(method), Raw: raw}}
-
-	// Codex 0.147 emits settings synchronization and one startup-status
-	// notification per configured MCP server. Successful lifecycle sync is
-	// protocol bookkeeping, not agent activity. Keep terminal startup problems
-	// visible, but do not promote Codex's free-form error text into the activity
-	// stream; the raw notification remains attached for diagnostics.
-	case "thread/settings/updated":
-		return nil
 
 	case "mcpServer/startupStatus/updated":
 		var p struct {
@@ -103,6 +105,7 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 
 	// ─── Turn lifecycle ───────────────────────────────────────────
 	case "turn/started":
+		state.usageThisTurn = false
 		state.turnCount++
 		state.turnStarted = time.Now()
 		return []agent.Event{agent.SystemEvent{
@@ -112,7 +115,8 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		}}
 
 	case "turn/completed":
-		return mapTurnCompleted(params, state, raw)
+		events := flushReasoning(state, raw)
+		return append(events, mapTurnCompleted(params, state, raw)...)
 
 	// The account rate-limit notification carries the same snapshot
 	// shape as the probe's read response, so it maps through the one
@@ -126,29 +130,47 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 
 	// ─── Item lifecycle ───────────────────────────────────────────
 	case "item/started", "item/completed":
-		return mapItem(method, params, raw)
+		var item struct {
+			Item struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+			} `json:"item"`
+		}
+		_ = json.Unmarshal(params, &item)
+		if _, ignored := ignoredItems[item.Item.Type]; ignored {
+			countIgnored(state, "item/"+item.Item.Type)
+			return nil
+		}
+		events := mapItem(method, params, raw, state)
+		if method == "item/completed" && item.Item.Type == "reasoning" {
+			buffered := finishReasoning(state, item.Item.ID, raw)
+			if len(events) == 0 {
+				return buffered
+			}
+		}
+		return events
 
 	// ─── Streaming deltas ─────────────────────────────────────────
 	//
-	// Partial-message frames (one token per notification) are dropped,
-	// mirroring the Claude provider's `stream_event` drop in
-	// ../claude/jsonl.go: high-frequency, low value to the orchestrator.
-	// Forwarding them turned every token into its own AssistantTextEvent,
-	// which the activity poster (runtime/activity) posts as a separate
-	// "thought" activity — surfacing as one-token-per-line spam on the
-	// platform topology view. The full text arrives on the matching
-	// `item/completed` notification (see mapItem: agentMessage → the
-	// complete AssistantTextEvent; reasoning → the complete summary
-	// SystemEvent), so dropping the deltas loses no content and also
-	// keeps the WORK_RESULT marker scan from splitting across tokens.
+	// Partial-message frames (one token per notification) carry no
+	// content for the orchestrator: they map to the content-free
+	// stream-progress liveness signal, not to AssistantTextEvent — each
+	// streamed token as its own AssistantTextEvent turned into a separate
+	// "thought" activity on the platform topology view (one-token-per-line
+	// spam). The full text still arrives on the matching `item/completed`
+	// notification (see mapItem: agentMessage → the complete
+	// AssistantTextEvent; reasoning → the complete summary SystemEvent),
+	// so the progress signal loses no content and keeps the WORK_RESULT
+	// marker scan from splitting across tokens. The runner's stall
+	// detector disarms on the signal: deltas arriving means the model
+	// request is alive, so a healthy long generation never reads as a
+	// stall, while a hung request (no deltas) still trips it.
 	//
 	// Live, incremental rendering (the interview token-delta stream) has
 	// its own dedicated transport in runtime/tokendelta — it does not and
 	// must not ride the activity-event stream.
-	case "item/agentMessage/delta",
-		"item/reasoning/textDelta",
-		"item/reasoning/summaryTextDelta":
-		return nil
+	case "item/agentMessage/delta":
+		return []agent.Event{agent.StreamProgressEvent()}
 
 	case "item/commandExecution/outputDelta":
 		var p struct {
@@ -181,12 +203,37 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		_ = json.Unmarshal(params, &p)
 		return []agent.Event{agent.SystemEvent{Subtype: "plan_updated", Message: string(p.Plan), Raw: raw}}
 
+	case "error", "warning":
+		return mapDiagnostic(method, params)
+	case "thread/tokenUsage/updated":
+		return mapTokenUsageUpdated(params, state, raw)
+	case "model/rerouted", "turn/moderationMetadata", "model/safetyBuffering/updated":
+		return mapWarning(method, params, state, raw)
+	case "thread/compacted":
+		return []agent.Event{agent.ContextUsageEvent{Harness: "codex", Source: "app-server", NoticeKind: agent.ContextUsageCompaction, Raw: raw}}
+	case "item/reasoning/textDelta", "item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded":
+		bufferReasoning(method, params, state)
+		return []agent.Event{agent.StreamProgressEvent()}
+	case "item/fileChange/outputDelta", "item/fileChange/patchUpdated", "item/plan/delta":
+		var p struct {
+			Delta   string          `json:"delta"`
+			Changes json.RawMessage `json:"changes"`
+		}
+		if json.Unmarshal(params, &p) != nil {
+			return nil
+		}
+		text := stripANSI(p.Delta)
+		if method == "item/fileChange/patchUpdated" {
+			text = string(p.Changes)
+		}
+		if text == "" {
+			return nil
+		}
+		return []agent.Event{agent.SystemEvent{Subtype: "codex_progress", Message: text, Raw: raw}}
 	default:
-		return []agent.Event{agent.SystemEvent{
-			Subtype: "unknown",
-			Message: "Unhandled codex notification: " + method,
-			Raw:     raw,
-		}}
+		countIgnored(state, method)
+		slog.Debug("Unrecognized Codex notification", "method", method)
+		return nil
 	}
 }
 
@@ -254,15 +301,21 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	if fresh < 0 {
 		fresh = 0
 	}
-	state.totalInputTokens += fresh
-	state.totalOutputTokens += out
-	state.totalCachedInputTok += cached
+	if state.usageThisTurn {
+		// The separate usage notifications have already contributed spend.
+		fresh, out, cached = 0, 0, 0
+	} else {
+		state.totalInputTokens += fresh
+		state.totalOutputTokens += out
+		state.totalCachedInputTok += cached
+		state.totalCostUSD += calculateCostUSD(fresh, cached, out, state.model)
+	}
 
 	cost := &agent.CostData{
 		InputTokens:       state.totalInputTokens,
 		OutputTokens:      state.totalOutputTokens,
 		CachedInputTokens: state.totalCachedInputTok,
-		TotalCostUsd:      calculateCostUSD(state.totalInputTokens, state.totalCachedInputTok, state.totalOutputTokens, state.model),
+		TotalCostUsd:      state.totalCostUSD,
 		NumTurns:          state.turnCount,
 	}
 	finishReason := p.Turn.Status
@@ -356,14 +409,14 @@ func mapRateLimitsUpdated(params json.RawMessage, state *mapperState, raw any) [
 }
 
 // mapItem handles item/started and item/completed notifications.
-func mapItem(method string, params json.RawMessage, raw any) []agent.Event {
+func mapItem(method string, params json.RawMessage, raw any, states ...*mapperState) []agent.Event {
 	var p struct {
 		Item struct {
 			ID       string          `json:"id"`
 			Type     string          `json:"type"`
 			Text     string          `json:"text"`
-			Summary  string          `json:"summary"`
-			Content  string          `json:"content"`
+			Summary  json.RawMessage `json:"summary"`
+			Content  json.RawMessage `json:"content"`
 			Command  string          `json:"command"`
 			Status   string          `json:"status"`
 			ExitCode *int            `json:"exitCode"`
@@ -410,9 +463,9 @@ func mapItem(method string, params json.RawMessage, raw any) []agent.Event {
 		// activities, so a started-time emission would double-post (or post
 		// a partial summary) for every reasoning item.
 		if isCompleted {
-			if msg := p.Item.Summary; msg != "" || p.Item.Content != "" {
+			if msg := reasoningText(p.Item.Summary); msg != "" || reasoningText(p.Item.Content) != "" {
 				if msg == "" {
-					msg = p.Item.Content
+					msg = reasoningText(p.Item.Content)
 				}
 				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
 			}
@@ -500,11 +553,11 @@ func mapItem(method string, params json.RawMessage, raw any) []agent.Event {
 		return []agent.Event{agent.SystemEvent{Subtype: "context_compaction", Message: "Context history compacted", Raw: raw}}
 
 	default:
-		return []agent.Event{agent.SystemEvent{
-			Subtype: "unknown_item",
-			Message: "Unhandled codex item type: " + p.Item.Type,
-			Raw:     raw,
-		}}
+		if len(states) > 0 {
+			countIgnored(states[0], "item/"+p.Item.Type)
+		}
+		slog.Debug("Unrecognized Codex item", "type", p.Item.Type)
+		return nil
 	}
 }
 

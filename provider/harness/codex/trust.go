@@ -229,3 +229,28 @@ func projectsTrustOverride(dirs []string, trustLevel string) string {
 	body.WriteByte('}')
 	return body.String()
 }
+
+// gatewayProviderConfigOverride renders the gateway provider block as
+// process-local `--config` overrides, restating through CLI flags the same
+// route the private config file carries (see appendGatewayProviderBlock).
+// Defense in depth: the config-file block is the primary route, and these
+// overrides ride the CLI layer above every file layer — user config, project
+// config, the isolated home's own config.toml — so a repo-checked-in
+// provider stanza, or a stale file the boundary failed to write, cannot
+// redirect the session bearer. The key itself is never restated here: it
+// rides the child env under codexGatewayEnvKey (never argv — argv is visible
+// to every same-user process), and the block's env_key names that var.
+// baseURL is the already-validated gateway surface (gatewayBinding); an
+// empty baseURL renders nothing, so a non-routed session's argv is
+// byte-identical to before the restatement existed.
+func gatewayProviderConfigOverride(baseURL string) []string {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil
+	}
+	return []string{
+		"--config", "model_provider=" + tomlBasicString(codexGatewayProviderID),
+		"--config", "model_providers." + codexGatewayProviderID + ".base_url=" + tomlBasicString(strings.TrimSpace(baseURL)),
+		"--config", "model_providers." + codexGatewayProviderID + ".env_key=" + tomlBasicString(codexGatewayEnvKey),
+		"--config", "model_providers." + codexGatewayProviderID + ".wire_api=\"responses\"",
+	}
+}

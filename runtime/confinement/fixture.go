@@ -116,6 +116,10 @@ type fixture struct {
 	// probeCommand starts the probe executable; the Linux widening probes
 	// run it outside the boundary as their decoy.
 	probeCommand []string
+	// probeHandshake bounds how long the decoy wait below holds for the
+	// decoy's greeting: the same proof-of-life bound the probe passes use.
+	// Zero means DefaultProbeHandshakeTimeout.
+	probeHandshake time.Duration
 	// notProbed are the probes of the set this host cannot run, and why.
 	notProbed []NotProbed
 }
@@ -133,11 +137,14 @@ type fixtureHost struct {
 	diskImageErr    error
 	loopbackOpen    bool
 	probeCommand    []string
+	// probeHandshake bounds the decoy greeting wait; zero means
+	// DefaultProbeHandshakeTimeout.
+	probeHandshake time.Duration
 }
 
 func newFixture(dir string, mode agent.PromptSessionMode, host fixtureHost) (fx *fixture, err error) {
 	home, stateHome := host.home, host.stateHome
-	built := &fixture{dir: dir, tag: randomSuffix(), loopbackOpen: host.loopbackOpen, probeCommand: host.probeCommand}
+	built := &fixture{dir: dir, tag: randomSuffix(), loopbackOpen: host.loopbackOpen, probeCommand: host.probeCommand, probeHandshake: host.probeHandshake}
 	fx = built
 	defer func() {
 		// A failed build returns no fixture; what it already started (a
@@ -1077,7 +1084,10 @@ func (fx *fixture) wideningLinux() error {
 
 // startDecoy runs the probe executable outside the boundary as the decoy
 // and returns its pid once it reports ready. Cleanup closes its input and
-// reaps it.
+// reaps it. The greeting wait is bounded by the probe handshake bound: a
+// probe executable that never answers — an embedder interface instead of a
+// serving probe — fails the decoy probes closed instead of hanging the
+// fixture build forever.
 func (fx *fixture) startDecoy(marker string) (int, error) {
 	if len(fx.probeCommand) == 0 {
 		return 0, errors.New("confinement: fixture: no probe command to run the decoy")
@@ -1103,14 +1113,34 @@ func (fx *fixture) startDecoy(marker string) (int, error) {
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("confinement: fixture: decoy: %w", err)
 	}
-	fx.cleanups = append(fx.cleanups, func() {
+	reap := func() {
 		_ = stdin.Close()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-	})
-	ready := make([]byte, len("ready\n"))
-	if _, err := io.ReadFull(stdout, ready); err != nil || string(ready) != "ready\n" {
-		return 0, fmt.Errorf("confinement: fixture: the decoy never became ready: %v", err)
+	}
+	fx.cleanups = append(fx.cleanups, reap)
+	bound := fx.probeHandshake
+	if bound <= 0 {
+		bound = DefaultProbeHandshakeTimeout
+	}
+	greeting := make(chan error, 1)
+	go func() {
+		ready := make([]byte, len("ready\n"))
+		_, err := io.ReadFull(stdout, ready)
+		if err == nil && string(ready) != "ready\n" {
+			err = errors.New("unexpected decoy greeting")
+		}
+		greeting <- err
+	}()
+	select {
+	case err := <-greeting:
+		if err != nil {
+			reap()
+			return 0, fmt.Errorf("confinement: fixture: the decoy never became ready: %v", err)
+		}
+	case <-time.After(bound):
+		reap()
+		return 0, fmt.Errorf("confinement: fixture: the decoy never became ready within %s", bound)
 	}
 	return cmd.Process.Pid, nil
 }

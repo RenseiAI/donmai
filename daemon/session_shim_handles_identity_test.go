@@ -1,0 +1,312 @@
+package daemon
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/RenseiAI/donmai/sessionshim"
+)
+
+// TestAdoptedHandleCarriesSessionIdentityAfterRestart pins the restart
+// adoption contract: a session launched under shim ownership, then adopted
+// by a replacement daemon, keeps its admitted Repository, ProjectName and
+// Harness on the operator-facing handle. Before the session sidecar, the
+// re-adopted handle carried none of them and a repo-scoped reader dropped
+// exactly the interactive sessions every restart re-adopts.
+func TestAdoptedHandleCarriesSessionIdentityAfterRestart(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	const orgID = "org-restart-identity"
+	sessionID := "lineage-restarted"
+	spec := f.interactiveSpec(sessionID)
+	spec.OrganizationID = orgID
+	spec.ProjectName = "p1"
+	spec.Harness = "stub-harness"
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("launch %s: %v", sessionID, err)
+	}
+	f.daemon.ReleaseAdoptedSessionShims()
+
+	replacement := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			EnableAdoption: true,
+			RegistryDir:    f.registry,
+			HostID:         "host-restart-identity",
+			OrgID:          orgID,
+			OnAdoptionBatch: func(_ context.Context, _ SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+				return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("restart-identity-batch")}, nil
+			},
+			OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+				return nil
+			},
+		},
+	})
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("startup adoption: %v", err)
+	}
+
+	handles := replacement.sessionShimHandles()
+	if len(handles) != 1 {
+		t.Fatalf("sessionShimHandles = %+v, want the one re-adopted session", handles)
+	}
+	got := handles[0]
+	if got.SessionID != spec.SessionID {
+		t.Fatalf("handle SessionID = %q, want %q", got.SessionID, spec.SessionID)
+	}
+	if got.Repository == "" {
+		t.Errorf("re-adopted handle Repository is empty; a repo-scoped reader drops this session")
+	}
+	if got.ProjectName == "" {
+		t.Errorf("re-adopted handle ProjectName is empty; a project-scoped reader drops this session")
+	}
+	if got.Harness == "" {
+		t.Errorf("re-adopted handle Harness is empty")
+	}
+	if want := spec.Repository; got.Repository != want {
+		t.Errorf("re-adopted handle Repository = %q, want the launch-time %q", got.Repository, want)
+	}
+	if want := spec.ProjectName; want != "" && got.ProjectName != want {
+		t.Errorf("re-adopted handle ProjectName = %q, want the launch-time %q", got.ProjectName, want)
+	}
+}
+
+// TestQuarantinedHandleCarriesSessionIdentity pins the same contract for the
+// quarantined population: a quarantined row is a running harness an operator
+// still needs scoped, so it carries the sidecar identity too. It builds the
+// quarantined row directly against a registry holding the launch's sidecar,
+// the same shape a startup pass produces when adoption is refused.
+func TestQuarantinedHandleCarriesSessionIdentity(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	const orgID = "org-quarantine-identity"
+	spec := launchOneAdoptableLineage(t, f, orgID, "lineage-quarantined")
+	f.daemon.ReleaseAdoptedSessionShims()
+
+	reg, err := sessionshim.NewRegistry(f.registry)
+	if err != nil {
+		t.Fatalf("open registry: %v", err)
+	}
+	// The launch wrote the sidecar at process epoch 1; confirm it is there
+	// so this test pins the wire it reads, not an absence fallback.
+	id := sessionshim.Identity{OrgID: orgID, SessionID: spec.SessionID}
+	if _, found, err := reg.SessionSidecar(id, 1); err != nil || !found {
+		t.Fatalf("SessionSidecar = found %v, err %v; want the launch's sidecar", found, err)
+	}
+
+	d := New(Options{SkipRegistration: true})
+	t.Cleanup(d.ReleaseAdoptedSessionShims)
+	d.shims.mu.Lock()
+	d.shims.registry = reg
+	d.shims.quarantined = []sessionshim.QuarantinedSession{{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-quarantined", ProcessEpoch: 1,
+		Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+	}}
+	d.shims.mu.Unlock()
+
+	handles := d.sessionShimHandles()
+	if len(handles) != 1 {
+		t.Fatalf("sessionShimHandles = %+v, want the one quarantined session", handles)
+	}
+	got := handles[0]
+	if got.Repository == "" {
+		t.Errorf("quarantined handle Repository is empty; a repo-scoped reader drops this session")
+	}
+	if want := spec.Repository; got.Repository != want {
+		t.Errorf("quarantined handle Repository = %q, want the launch-time %q", got.Repository, want)
+	}
+}
+
+// TestActiveSessionsDedupesBySessionID pins the list contract: one session
+// appears exactly once even when the spawner, the adopted set and the
+// quarantine each name it. The adopted handle wins over the quarantined row
+// for the same session, so the list never shows a live session twice and
+// never prefers the row with no controller.
+func TestActiveSessionsDedupesBySessionID(t *testing.T) {
+	d := New(Options{SkipRegistration: true})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 8})
+	d.spawner.Resume()
+	d.spawner.sessions["dup"] = &spawnedSession{
+		handle: SessionHandle{SessionID: "dup", State: SessionRunning, Repository: "direct"},
+		spec:   SessionSpec{SessionID: "dup"},
+	}
+	id := sessionshim.Identity{OrgID: "org-dedupe", SessionID: "dup"}
+	d.shims.mu.Lock()
+	d.shims.adopted[id] = adoptedShim{
+		shimID: "shim-adopted",
+		handle: SessionHandle{SessionID: "dup", State: SessionRunning, Repository: "adopted", ProjectName: "p", Harness: "h"},
+	}
+	d.shims.quarantined = []sessionshim.QuarantinedSession{{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-quarantined", ProcessEpoch: 1,
+		Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+	}}
+	d.shims.mu.Unlock()
+
+	got := d.ActiveSessions()
+	count := 0
+	for _, h := range got {
+		if h.SessionID == "dup" {
+			count++
+			if h.Repository != "direct" {
+				t.Errorf("deduped handle Repository = %q, want the direct child's (first row wins)", h.Repository)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("ActiveSessions lists session %q %d times (%+v), want exactly once", "dup", count, got)
+	}
+}
+
+// TestSpawnerSeesShimOwnedSessionIDs pins the admission half of the dedupe
+// through the daemon's own wiring: a session id already live under a shim —
+// adopted or quarantined — is refused as a duplicate rather than accepted a
+// second time, and each shim session holds exactly one admission slot, not
+// one through occupancy and a second through its id.
+func TestSpawnerSeesShimOwnedSessionIDs(t *testing.T) {
+	newDaemon := func(t *testing.T, maxSessions int) *Daemon {
+		t.Helper()
+		d := New(Options{SkipRegistration: true})
+		opts := SpawnerOptions{MaxConcurrentSessions: maxSessions}
+		d.wireShimAdmission(&opts)
+		d.spawner = NewWorkerSpawner(opts)
+		d.spawner.Resume()
+		d.shims.mu.Lock()
+		d.shims.adopted[sessionshim.Identity{OrgID: "org-guard", SessionID: "guarded"}] = adoptedShim{shimID: "shim-adopted"}
+		d.shims.quarantined = []sessionshim.QuarantinedSession{{
+			OrgID: "org-guard", SessionID: "held",
+			ShimID: "shim-quarantined", ProcessEpoch: 1,
+			Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+		}}
+		d.shims.mu.Unlock()
+		return d
+	}
+
+	t.Run("duplicate of a shim-owned id is refused", func(t *testing.T) {
+		d := newDaemon(t, 8)
+		for _, id := range []string{"guarded", "held"} {
+			_, err := d.spawner.AcceptWork(SessionSpec{SessionID: id})
+			if err == nil || !strings.Contains(err.Error(), "already active") {
+				t.Errorf("AcceptWork(%q) = %v, want the duplicate-accept refusal", id, err)
+			}
+		}
+	})
+
+	t.Run("each shim session holds one slot", func(t *testing.T) {
+		// Two shim sessions on a three-slot host leave one slot free; a
+		// double charge would refuse the fresh session at capacity.
+		d := newDaemon(t, 3)
+		_, err := d.spawner.AcceptWork(SessionSpec{SessionID: "fresh"})
+		if err != nil && strings.Contains(err.Error(), "at capacity") {
+			t.Fatalf("AcceptWork(fresh) = %v; two shim sessions must hold two of three slots, not all of them", err)
+		}
+	})
+}
+
+// TestActiveSessionsAdoptedBeatsQuarantined pins the precedence inside the
+// shim projection: with no direct child, the adopted handle (which has a
+// controller) wins over the quarantined row for the same session.
+func TestActiveSessionsAdoptedBeatsQuarantined(t *testing.T) {
+	d := New(Options{SkipRegistration: true})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 8})
+	d.spawner.Resume()
+	id := sessionshim.Identity{OrgID: "org-dedupe", SessionID: "dup"}
+	d.shims.mu.Lock()
+	d.shims.adopted[id] = adoptedShim{
+		shimID: "shim-adopted",
+		handle: SessionHandle{SessionID: "dup", State: SessionRunning, Repository: "adopted", ProjectName: "p", Harness: "h"},
+	}
+	d.shims.quarantined = []sessionshim.QuarantinedSession{{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-quarantined", ProcessEpoch: 1,
+		Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+	}}
+	d.shims.mu.Unlock()
+
+	got := d.ActiveSessions()
+	count := 0
+	for _, h := range got {
+		if h.SessionID == "dup" {
+			count++
+			if h.Repository != "adopted" {
+				t.Errorf("deduped handle Repository = %q, want the adopted handle's (adopted beats quarantined)", h.Repository)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("ActiveSessions lists session %q %d times (%+v), want exactly once", "dup", count, got)
+	}
+}
+
+// TestActiveSessionsKeepsEmptyIDRows pins the empty-id contract: shim rows
+// that carry no session id are still listed — under no dedupe key they
+// cannot collide with anything, and dropping them would report an idle host
+// while their harness is running.
+func TestActiveSessionsKeepsEmptyIDRows(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{SkipRegistration: true})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 8})
+	d.spawner.Resume()
+	t.Cleanup(d.ReleaseAdoptedSessionShims)
+	d.shims.mu.Lock()
+	d.shims.adopted[sessionshim.Identity{OrgID: "org-empty-id", SessionID: ""}] = adoptedShim{
+		shimID: "shim-empty-id",
+		handle: SessionHandle{SessionID: "", State: SessionRunning},
+	}
+	d.shims.mu.Unlock()
+
+	got := d.ActiveSessions()
+	for _, h := range got {
+		if h.SessionID == "" && h.State == SessionRunning {
+			return
+		}
+	}
+	t.Fatalf("ActiveSessions = %+v, want the empty-id shim row still listed", got)
+}
+
+// TestFillShimSessionIdentityNeverOverwrites pins the never-overwrite half of
+// the fill through the production entry point: a handle that already carries
+// its admitted Repository keeps it byte-for-byte even when the sidecar
+// disagrees, while the empty fields still fill from the sidecar. The sidecar
+// is a fallback for the post-restart population, not a second authority over
+// an identity this daemon admitted itself.
+func TestFillShimSessionIdentityNeverOverwrites(t *testing.T) {
+	t.Parallel()
+
+	f := newShimSpawnFixture(t)
+	const orgID = "org-no-clobber"
+	spec := f.interactiveSpec("lineage-no-clobber")
+	spec.OrganizationID = orgID
+	spec.ProjectName = "p1"
+	spec.Harness = "stub-harness"
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("launch %s: %v", spec.SessionID, err)
+	}
+	id := sessionshim.Identity{OrgID: orgID, SessionID: spec.SessionID}
+	reg, err := sessionshim.NewRegistry(f.registry)
+	if err != nil {
+		t.Fatalf("open registry: %v", err)
+	}
+	// A sidecar that disagrees on every field: nothing present may change.
+	disagree := sessionshim.NewSessionSidecar(id, 1, "https://example.invalid/other.git", "other-project", "other-harness")
+	if err := reg.PutSessionSidecar(disagree); err != nil {
+		t.Fatalf("PutSessionSidecar: %v", err)
+	}
+	// A partial handle: Repository was admitted locally, the other two are
+	// still empty. The disagreeing sidecar may fill the empties but must
+	// not touch the present field — this exercises the per-field guards
+	// past the full-handle early return.
+	handle := SessionHandle{
+		SessionID: spec.SessionID, State: SessionRunning,
+		Repository: spec.Repository,
+	}
+	f.daemon.fillShimSessionIdentity(reg, &handle, id, 1)
+	if handle.Repository != spec.Repository {
+		t.Fatalf("fill overwrote a present Repository: %+v, want the admitted identity kept", handle)
+	}
+	if handle.ProjectName != disagree.ProjectName || handle.Harness != disagree.Harness {
+		t.Fatalf("fill did not fill the empty fields from the sidecar: %+v", handle)
+	}
+}

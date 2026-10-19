@@ -112,3 +112,55 @@ func TestEndpointBinding_LegacyAuthRetainedWithoutMechanism(t *testing.T) {
 		t.Errorf("legacy auth was not retained: %s", b)
 	}
 }
+
+// TestEndpointBinding_RoutingPreferenceRoundTrips verifies the additive
+// RoutingPreference field survives marshal/unmarshal under its camelCase
+// wire tag, and is omitted when unset so pre-preference dispatches
+// round-trip byte-identically.
+func TestEndpointBinding_RoutingPreferenceRoundTrips(t *testing.T) {
+	t.Parallel()
+	in := EndpointBinding{
+		Company:  CompanyOpenAI,
+		Model:    "served-model",
+		Protocol: ProtoOpenAIChat,
+		Host:     HostGateway,
+		RoutingPreference: &RoutingPreference{
+			Order: []string{"anthropic", "openai"},
+			Only:  []string{"anthropic"},
+		},
+	}
+	buf, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal EndpointBinding: %v", err)
+	}
+	for _, want := range []string{`"routingPreference":{"order":["anthropic","openai"],"only":["anthropic"]}`} {
+		if !strings.Contains(string(buf), want) {
+			t.Fatalf("marshalled JSON missing %s: %s", want, buf)
+		}
+	}
+	var out EndpointBinding
+	if err := json.Unmarshal(buf, &out); err != nil {
+		t.Fatalf("unmarshal EndpointBinding: %v", err)
+	}
+	if out.RoutingPreference == nil {
+		t.Fatal("RoutingPreference missing after round-trip")
+	}
+	if len(out.RoutingPreference.Order) != 2 || len(out.RoutingPreference.Only) != 1 {
+		t.Errorf("RoutingPreference round-trip = %+v, want order x2 + only x1", out.RoutingPreference)
+	}
+
+	plain, err := json.Marshal(EndpointBinding{Company: CompanyOpenAI, Model: "m"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(plain), "routingPreference") {
+		t.Errorf("empty RoutingPreference leaked into wire shape: %s", plain)
+	}
+	var back EndpointBinding
+	if err := json.Unmarshal(plain, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !back.RoutingPreference.IsZero() {
+		t.Errorf("RoutingPreference = %+v, want unset on a pre-preference payload", back.RoutingPreference)
+	}
+}

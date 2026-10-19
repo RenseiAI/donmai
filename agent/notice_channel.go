@@ -92,3 +92,26 @@ type NoticeChannelCapable interface {
 	// has none.
 	NoticeChannel() NoticeChannel
 }
+
+// ContextUsageSourcer is the OPTIONAL capability a Handle implements when
+// its session owns the file the runner's context watcher polls. It mirrors
+// NoticeChannelCapable: callers type-assert, and absence of the interface
+// (or empty paths) means this session has no session-scoped context
+// signal to poll.
+//
+// Paths are session-scoped by construction — a per-session drop directory,
+// the harness's own session file — never a process-wide variable. A
+// process-wide variable fans one session's readings out to every session
+// sharing the process, so this seam deliberately has no environment
+// fallback: a session that reports no path runs without context notices.
+type ContextUsageSourcer interface {
+	Handle
+
+	// ContextUsageSidecarPath returns the session's statusline sidecar
+	// path (the claude leg), or "" when the session maintains none.
+	ContextUsageSidecarPath() string
+
+	// ContextUsageRollout returns the session's rollout home directory
+	// and thread id (the codex leg), or ""s when the session has none.
+	ContextUsageRollout() (home, threadID string)
+}

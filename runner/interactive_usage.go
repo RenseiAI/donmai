@@ -31,10 +31,12 @@ import (
 // use (the supervisor loop and the heartbeat emitter read it from
 // different goroutines).
 type interactiveUsageTotals struct {
-	mu     sync.Mutex
-	cost   agent.CostData
-	turns  int
-	costWK bool
+	collectIDs    bool
+	generationIDs []string
+	mu            sync.Mutex
+	cost          agent.CostData
+	turns         int
+	costWK        bool
 	// costLost is set once an observed price could not be summed into a
 	// finite, non-negative dollar total; the dollars stay unreported.
 	costLost bool
@@ -135,6 +137,9 @@ func (u *interactiveUsageTotals) applyTo(res *Result) {
 	if u == nil || res == nil {
 		return
 	}
+	u.mu.Lock()
+	res.GenerationIDs = append([]string(nil), u.generationIDs...)
+	u.mu.Unlock()
 	cost, ok := u.snapshot()
 	if !ok {
 		return
