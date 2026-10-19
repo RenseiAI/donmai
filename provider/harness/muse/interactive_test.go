@@ -358,14 +358,26 @@ func TestSpawn_Interactive_RoutesThroughPTYNotServe(t *testing.T) {
 
 // TestSpawn_SeedEndingOptionParsingReachesChildArgvLast is the
 // load-bearing proof that the production Spawn path carries the seed:
-// the fake binary echoes its full argv to a file, and the test asserts
-// the tail is `--` plus the seed through Spawn (not only the argv
-// helper). RED proof: drop the `--` in interactiveArgs and the
-// seed-adjacent element is no longer `--`.
+// the fake binary echoes its full argv to a file, asserts its own argv
+// inline (non-zero exit unless the tail is `--` plus the seed), and the
+// test fails fast on that exit before reading the recorded tail through
+// Spawn (not only the argv helper). RED proof: drop the `--` in
+// interactiveArgs and the child exits 11 on its inline assertion.
 func TestSpawn_SeedEndingOptionParsingReachesChildArgvLast(t *testing.T) {
 	workdir := t.TempDir()
 	const seed = "--model x fix the bug"
-	p := newFakeInteractiveProvider(t, `printf '%s\n' "$@" > "$PWD/argv.txt"`)
+	// The fake asserts the seed contract itself, mirroring the codex
+	// Spawn pin: exit 10 when the seed is not last, 11 when it is not
+	// preceded by `--`. The seed below must stay identical to the const
+	// above — the Go side asserts the same tail from the recorded file.
+	p := newFakeInteractiveProvider(t, `args=("$@")
+printf '%s\n' "${args[@]}" > "$PWD/argv.txt"
+n=${#args[@]}
+if ((${n} == 0)); then exit 10; fi
+if [[ "${args[$((n-1))]}" != "--model x fix the bug" ]]; then exit 10; fi
+if ((${n} < 2)); then exit 11; fi
+if [[ "${args[$((n-2))]}" != "--" ]]; then exit 11; fi
+exit 0`)
 
 	h, err := p.Spawn(context.Background(), agent.Spec{
 		Prompt:      seed,
@@ -377,18 +389,32 @@ func TestSpawn_SeedEndingOptionParsingReachesChildArgvLast(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = h.Stop(context.Background()) })
 
+	var terminal *agent.ResultEvent
 	deadline := time.After(20 * time.Second)
 	for {
 		select {
-		case _, ok := <-h.Events():
+		case ev, ok := <-h.Events():
 			if !ok {
 				goto exited
+			}
+			if result, ok := ev.(agent.ResultEvent); ok {
+				terminal = &result
 			}
 		case <-deadline:
 			t.Fatal("timed out waiting for fake TUI exit")
 		}
 	}
 exited:
+	// The fake child exits non-zero when its inline seed assertion
+	// fails (seed not last, or not preceded by `--`), so a regression
+	// that drops the `--` fails here even before the recorded-argv read
+	// below.
+	if terminal == nil {
+		t.Fatal("events channel closed without a terminal ResultEvent")
+	}
+	if !terminal.Success {
+		t.Fatalf("fake muse child failed its inline seed assertion: %+v", *terminal)
+	}
 	body, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
 	if err != nil {
 		t.Fatalf("read echoed argv: %v", err)
