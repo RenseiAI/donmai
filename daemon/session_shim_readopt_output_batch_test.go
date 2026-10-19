@@ -41,7 +41,7 @@ func TestReadoptedOutputBatchWaitsForTheAdoptionGate(t *testing.T) {
 		failBatch bool
 		// wantBatchCalls is how many batch persist calls the test expects in
 		// total across both dials.
-		wantBatchCalls int
+		wantBatchCalls int32
 		// wantQuarantined reports whether the lineage must end quarantined.
 		wantQuarantined bool
 	}{
@@ -52,13 +52,13 @@ func TestReadoptedOutputBatchWaitsForTheAdoptionGate(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			f := newAdoptionGateBatchFixture(t, ctx)
+			f := newAdoptionGateBatchFixture(ctx, t)
 			d := f.daemon
 
 			var batchCalls atomic.Int32
 			var batchBeforeGate atomic.Int32
 			var gateCommitted atomic.Bool
-			var batchDone = make(chan struct{})
+			batchDone := make(chan struct{})
 			d.opts.SessionShim.OnSessionEventDurable = func(_ sessionshim.Identity, _ sessionshim.ControllerEvent) error {
 				return nil
 			}
@@ -67,7 +67,7 @@ func TestReadoptedOutputBatchWaitsForTheAdoptionGate(t *testing.T) {
 					batchBeforeGate.Add(1)
 				}
 				n := batchCalls.Add(1)
-				if n == int32(tc.wantBatchCalls) {
+				if n == tc.wantBatchCalls {
 					close(batchDone)
 				}
 				if tc.failBatch {
@@ -87,7 +87,7 @@ func TestReadoptedOutputBatchWaitsForTheAdoptionGate(t *testing.T) {
 			// Dial 1: adopt, start its consumer on a gate the test refuses —
 			// the incident's timed-out first dial. Its consumer must never
 			// persist and must leave the adopted entry alone.
-			first := f.adopt(t, ctx, "controller-gate-first")
+			first := f.adopt(ctx, t, "controller-gate-first")
 			gate1 := newShimAdoptionGate()
 			d.consumeShimEventsGated(first, gate1)
 			if tc.failFirstDial {
@@ -116,7 +116,7 @@ func TestReadoptedOutputBatchWaitsForTheAdoptionGate(t *testing.T) {
 			// here, so the waits below observe only dial 2.
 			// Dial 2: the succeeding re-adoption. Its consumer reads the same
 			// buffered harness output; the commit resolves its gate.
-			second := f.adopt(t, ctx, "controller-gate-second")
+			second := f.adopt(ctx, t, "controller-gate-second")
 			// The release path re-adopts inline on the consumer goroutine via
 			// the daemon's configured policy; disable re-adoption for this
 			// unit so the refused batch surfaces its quarantine row instead
@@ -138,7 +138,7 @@ func TestReadoptedOutputBatchWaitsForTheAdoptionGate(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("committed adoption never flushed the buffered output batch")
 			}
-			if got := batchCalls.Load(); got != int32(tc.wantBatchCalls) {
+			if got := batchCalls.Load(); got != tc.wantBatchCalls {
 				t.Fatalf("batch calls = %d, want %d", got, tc.wantBatchCalls)
 			}
 			if got := batchBeforeGate.Load(); got != 0 {
@@ -206,7 +206,7 @@ type adoptionGateBatchFixture struct {
 // fixed, barrier-terminated output prefix, and a daemon whose adopted entry is
 // intentionally left empty: each subtest seeds exactly the entry its dial
 // owns.
-func newAdoptionGateBatchFixture(t *testing.T, ctx context.Context) *adoptionGateBatchFixture {
+func newAdoptionGateBatchFixture(ctx context.Context, t *testing.T) *adoptionGateBatchFixture {
 	t.Helper()
 	// A Unix socket path has a short platform limit, and t.TempDir() bakes
 	// the test name into the path. Keep the registry short.
@@ -253,7 +253,7 @@ func newAdoptionGateBatchFixture(t *testing.T, ctx context.Context) *adoptionGat
 	return f
 }
 
-func (f *adoptionGateBatchFixture) adopt(t *testing.T, ctx context.Context, controllerID string) *sessionshim.Controller {
+func (f *adoptionGateBatchFixture) adopt(ctx context.Context, t *testing.T, controllerID string) *sessionshim.Controller {
 	t.Helper()
 	result, err := sessionshim.Adopt(ctx, sessionshim.AdoptOptions{
 		Registry: f.registry, ControllerID: controllerID, RequireFullHostFrames: true,
