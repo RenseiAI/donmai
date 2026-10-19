@@ -338,6 +338,13 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	}
 	handle, err := ptycli.SpawnWithOptions(ctx, argv[0], argv[1:], ptycliSpec(spec, workspaceRoot, childEnv), p.Manifest(), ptycli.SpawnOptions{
 		Cleanup: cleanup,
+		// childEnv is the child's COMPLETE environment (serveEnv already
+		// composed the parent allowlist, the provider/session overlays,
+		// and the confinement bindings): the PTY host must not layer it
+		// over this process's own environment, or every parent name the
+		// allowlist stripped — in particular an ambient META_API_KEY —
+		// would ride back in around it (mirrors pi's ExactEnv).
+		ExactEnv: true,
 	})
 	if err != nil {
 		_ = releasePlan()

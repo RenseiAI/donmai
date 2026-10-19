@@ -178,3 +178,53 @@ func TestSpawn_Interactive_ZeroGeometryFallsBackToDefaults(t *testing.T) {
 		}
 	}
 }
+
+// TestSpawn_Interactive_AmbientMetaKeyDoesNotReachPTYChild pins the B1
+// contract through the production Spawn entry point: with an ambient
+// META_API_KEY in the launching process, the interactive PTY child must
+// not see it — serveEnv strips the key unless the Spec sets it, and the
+// spawn asks the PTY host for an exact environment so the parent's own
+// environment cannot ride back in around that strip. The fake TUI dumps
+// its environment to a file; the test asserts no META_API_KEY line
+// survives. RED proof: drop ExactEnv from the spawn call and the ambient
+// key layers back in under the overrides (ptyhost composeEnv), failing
+// the assertion below.
+func TestSpawn_Interactive_AmbientMetaKeyDoesNotReachPTYChild(t *testing.T) {
+	t.Setenv("META_API_KEY", "ambient-operator-key")
+	workdir := t.TempDir()
+	p := newFakeInteractiveProvider(t, `env > "$PWD/child.env"; exit 0`)
+
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      "hello",
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// Drain to the terminal ResultEvent: the fake TUI writes the dump,
+	// then exits on its own.
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake TUI exit")
+		}
+	}
+exited:
+	raw, err := os.ReadFile(filepath.Join(workdir, "child.env"))
+	if err != nil {
+		t.Fatalf("read child env dump: %v", err)
+	}
+	for line := range strings.Lines(string(raw)) {
+		if strings.HasPrefix(line, "META_API_KEY=") {
+			t.Errorf("ambient META_API_KEY reached the interactive PTY child: %q", line)
+		}
+	}
+}
