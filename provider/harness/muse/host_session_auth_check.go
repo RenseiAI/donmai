@@ -14,8 +14,10 @@ import (
 )
 
 // hostSessionLoginTimeout bounds the `<binary> --version` probe the
-// host login check runs.
-const hostSessionLoginTimeout = 5 * time.Second
+// host login check runs. A package var, not a const, so tests can
+// shorten the bound for hanging-CLI cases; production always runs
+// the 5 s default.
+var hostSessionLoginTimeout = 5 * time.Second
 
 // hostSessionLoginOutputMax bounds the bytes retained from the
 // version probe's stdout and stderr. The version line is one short
@@ -28,6 +30,7 @@ const hostSessionLoginOutputMax = 16 << 10
 type boundedHostLoginOutput struct{ buffer bytes.Buffer }
 
 func (b *boundedHostLoginOutput) Write(data []byte) (int, error) {
+	n := len(data)
 	remaining := hostSessionLoginOutputMax - b.buffer.Len()
 	if remaining > 0 {
 		if len(data) > remaining {
@@ -35,7 +38,7 @@ func (b *boundedHostLoginOutput) Write(data []byte) (int, error) {
 		}
 		b.buffer.Write(data)
 	}
-	return len(data), nil
+	return n, nil
 }
 
 // CheckHostSessionLogin proves a supported host CLI is installed: one
