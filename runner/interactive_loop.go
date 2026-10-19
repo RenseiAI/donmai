@@ -87,7 +87,7 @@ func interactiveInitialPromptLimit(manifest agent.HarnessManifest) int {
 	if profile, ok := manifest.PromptProfile(agent.PromptModeHumanControlled); ok {
 		switch profile.UserDelivery {
 		case agent.PromptDeliveryClaudePTYSeed, agent.PromptDeliveryCodexPTYSeed,
-			agent.PromptDeliveryPiPTYSeed:
+			agent.PromptDeliveryPiPTYSeed, agent.PromptDeliveryMusePTYSeed:
 			return maxArgvSeedPromptBytes
 		}
 	}
@@ -432,7 +432,7 @@ func (r *Runner) dispatchInteractive(
 	// the terminal report (so the existing cost-event writer records it) and
 	// is visible to the step-heartbeat emitter wired below through
 	// usageSnapshot.
-	usage := &interactiveUsageTotals{}
+	usage := &interactiveUsageTotals{collectIDs: qw.ResolvedProfile.Endpoint != nil}
 	r.registerInteractiveUsage(qw.SessionID, usage)
 	defer r.releaseInteractiveUsage(qw.SessionID)
 
@@ -672,8 +672,25 @@ const interactiveActivityFlushGrace = 5 * time.Second
 // carry it. A nil usage leaves the total untouched, so callers that only
 // forward (and never report) may pass nil.
 func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath string, sink activitySink, event agent.Event, usage *interactiveUsageTotals) {
-	if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
-		r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
+	if usage != nil && usage.collectIDs {
+		usage.mu.Lock()
+		usage.generationIDs = collectGenerationID(usage.generationIDs, event)
+		usage.mu.Unlock()
+	}
+	if system, ok := event.(agent.SystemEvent); ok {
+		switch system.Subtype {
+		case "harness_state_lost":
+			r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
+			return
+		case "user_message", "turn_completed":
+			// Live conversation markers the harness tails from its own
+			// transcript: provider user turns (attribution-preserving —
+			// never the viewer's own input) and turn completion.
+			// They flow through the same activity sink as the headless
+			// lane's events.
+			r.postInteractiveEvent(ctx, worktreePath, sink, event)
+			return
+		}
 		return
 	}
 	switch e := event.(type) {

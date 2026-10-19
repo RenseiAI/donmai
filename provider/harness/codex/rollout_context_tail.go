@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -29,6 +30,13 @@ import (
 // interactive watcher (50/75/90 rising bounds, re-arming below) so both
 // lanes report crossings the same way; compaction markers emit once per
 // observed state.
+//
+// The app-server writes a turn's last token_count line moments before it
+// sends turn/completed, well inside one poll interval, so the ticker alone
+// would lose the final crossing of every turn (and every crossing of a
+// sub-second session). The forwarder therefore drains the tail once more
+// on the terminal event, before it emits that event and closes Events,
+// and the tail goroutine ends with the handle.
 const rolloutTailPollInterval = time.Second
 
 // rolloutTailThresholdBounds are the used-percentage bounds that emit a
@@ -37,9 +45,13 @@ const rolloutTailPollInterval = time.Second
 func rolloutTailThresholdBounds() []float64 { return []float64{50, 75, 90} }
 
 // rolloutContextTail tracks the rollout read offset, the threshold arming,
-// and the last reported compaction for one session. It is not safe for
-// concurrent use; the single tailer goroutine owns it.
+// and the last reported compaction for one session. poll and classify are
+// not safe for concurrent use; the tailer goroutine and the terminal drain
+// share the tail through emitNew, which holds mu across the read AND the
+// emission so a notice read by one is on Events before the other runs.
 type rolloutContextTail struct {
+	mu sync.Mutex
+
 	home     string
 	threadID string
 
@@ -64,7 +76,8 @@ func newRolloutContextTail(home, threadID string) *rolloutContextTail {
 // session has no known home/thread and runs without notices (a unit-test
 // handle with no provider). A non-nil tail is already running on its own
 // goroutine, polling the thread's own rollout file and emitting notices
-// via h.emit.
+// via h.emit until ctx ends or the handle closes; the caller keeps it for
+// the forwarder's terminal drain.
 func (h *Handle) startContextTail(ctx context.Context) *rolloutContextTail {
 	home := h.codexHome()
 	threadID := h.SessionID()
@@ -72,25 +85,48 @@ func (h *Handle) startContextTail(ctx context.Context) *rolloutContextTail {
 		return nil
 	}
 	tail := newRolloutContextTail(home, threadID)
-	go tail.run(ctx, h.emit) //nolint:gosec // G118: session-lifetime goroutine, ctx is honored
+	go tail.run(ctx, h.closed, h.emit) //nolint:gosec // G118: session-lifetime goroutine, ctx is honored
 	return tail
 }
 
-// run tails until ctx ends, emitting notices via emit. Every emit must be
-// non-blocking — this goroutine never slows the session — and it returns
-// when ctx ends whether or not anyone reads the events.
-func (t *rolloutContextTail) run(ctx context.Context, emit func(agent.Event)) {
+// run tails until ctx ends or done closes, emitting notices via emit.
+// Every emit must be non-blocking — this goroutine never slows the
+// session — and it returns when ctx ends or done closes whether or not
+// anyone reads the events.
+func (t *rolloutContextTail) run(ctx context.Context, done <-chan struct{}, emit func(agent.Event)) {
 	ticker := time.NewTicker(rolloutTailPollInterval)
 	defer ticker.Stop()
 	for {
-		for _, ev := range t.poll() {
-			emit(ev)
-		}
+		t.emitNew(emit)
 		select {
 		case <-ctx.Done():
 			return
+		case <-done:
+			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// drain emits every notice appended since the last read. The forwarder
+// calls it on the terminal event, before emitting that event, so the
+// turn's last token_count reaches Events ahead of the result. A nil tail
+// (a session that runs without notices) drains nothing.
+func (t *rolloutContextTail) drain(emit func(agent.Event)) {
+	if t == nil {
+		return
+	}
+	t.emitNew(emit)
+}
+
+// emitNew reads the newly appended lines and emits their notices under
+// mu, so the ticker and the terminal drain never interleave a read with
+// another's emission.
+func (t *rolloutContextTail) emitNew(emit func(agent.Event)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, ev := range t.poll() {
+		emit(ev)
 	}
 }
 

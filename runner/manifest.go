@@ -87,11 +87,14 @@ var ErrNoInlineManifest = errors.New("runner: no inline turn-result manifest")
 // `+`, `1.`, `1)`), and bold/italic/inline-code markers (`**`, `__`, `*`,
 // `_`, a backtick), also around the colon. Matched case-insensitively over
 // ASCII only (asciiLower). A match is not a verdict on its own: the block must
-// be a schema-valid manifest, and a printed block never RAISES a standing
-// verdict — whether a manifest file, an earlier turn's anchored marker or the
-// same turn's own first anchored marker set it (applyTurnManifest,
-// reapplyTurnManifest); it sets the verdict only when none exists yet.
-// Anchoring does not make prose harmless by itself — a line that starts with
+// be a schema-valid manifest, and a printed block never RAISES a verdict that
+// a manifest FILE set — whether that file was written this turn or an earlier
+// one (applyTurnManifest, reapplyTurnManifest); against a file it only lowers
+// or, when no verdict exists yet, sets. A verdict the runner itself took from
+// an earlier printed block is different: that block was only ever the
+// tool-restricted stage's backstop, so a later turn's anchored marker raises
+// it like any marker-held verdict. Anchoring does not make prose harmless by
+// itself — a line that starts with
 // the label and carries a valid manifest object is read as one.
 var inlineManifestLabelRE = regexp.MustCompile(lineStartPrefix +
 	`(?:>[ \t]*)*(?:(?:[-*+]|[0-9]+[.)])[ \t]+)?[*_` + "`" + `]*` +
@@ -400,6 +403,14 @@ func validateManifestSchema(raw json.RawMessage) bool {
 // stream-observed values). It is the FIRST tier of the verdict resolution
 // order (manifest → marker scrape → backstop); see runner/loop.go step 10·M.
 //
+// Same-turn precedence is file-wins: a turn that writes a manifest file while
+// its own marker says otherwise is governed by the file — the prompts declare
+// the file authoritative and the marker only the backstop, and the structured
+// channel exists precisely because the scrape is fragile. Only a PRINTED
+// block yields to the turn's own marker, and only to avoid RAISING it: a
+// printed passed block never upgrades the turn's own anchored failed marker,
+// while a printed failed block still lowers (or sets) it.
+//
 // The merge:
 //   - Verdict → res.WorkResult and obs.workResult. "blocked" maps to
 //     obs.blocked (+ obs.blockedReason) so the existing classifyBlocked fork
@@ -439,6 +450,10 @@ func (r *Runner) applyTurnManifest(worktreePath string, qw QueuedWork, res *Resu
 		return
 	}
 	foldTurnManifest(m, res, obs)
+	// Record which channel the envelope's manifest came from: a later turn's
+	// anchored marker may raise a printed verdict but never a filed one
+	// (reapplyTurnManifest).
+	res.manifestPrinted = !fromFile
 }
 
 // manifestStamp identifies the manifest file's bytes at one moment so the runner
@@ -483,8 +498,8 @@ func stampManifest(worktreePath string) manifestStamp {
 // just before that follow-up turn started; followUp is its observation.
 //
 // A follow-up turn changes the picture the earlier resolution saw, and the
-// verdict follows the NEWEST signal, with one guard — an earlier manifest can
-// be lowered by the follow-up but never raised:
+// verdict follows the NEWEST signal, with one guard — an earlier FILE verdict
+// can be lowered by the follow-up but never raised:
 //
 //  1. The manifest FILE was (re)written during the follow-up and is present
 //     on disk: it is the agent's latest structured word and is folded like the
@@ -496,14 +511,22 @@ func stampManifest(worktreePath string) manifestStamp {
 //     (standingVerdict) — whatever set it: an earlier manifest file, an
 //     earlier turn's anchored marker, or the follow-up's own first anchored
 //     marker. A printed block sets the verdict only when none exists yet.
+//     (A printed stale verdict the follow-up's own marker raises below is
+//     the exception that proves the marker's standing: the block is ignored
+//     here, then the marker governs in step 3.)
 //  3. Otherwise any earlier manifest (res.Manifest) is STALE, but still the
 //     agent's authoritative structured verdict (the prompts say the file wins
-//     and the marker is only the backstop). The follow-up's own line-anchored
-//     marker may supersede it only to LOWER it — a stale "passed" gives way to
-//     a follow-up "failed" or "blocked" — and the stale manifest is then
-//     dropped so its "passed" is never posted. In every other case (no
-//     follow-up verdict, the same one, "unknown", an upgrade) the earlier
-//     manifest is folded again and posted.
+//     and the marker is only the backstop) — with one asymmetry by source:
+//     a FILE verdict may be superseded by the follow-up's own line-anchored
+//     marker only to LOWER it — a stale "passed" gives way to a follow-up
+//     "failed" or "blocked" — while a PRINTED verdict (res.manifestPrinted,
+//     the tool-restricted stage's backstop) yields to the follow-up's marker
+//     in EITHER direction: a later turn's anchored marker raises a printed
+//     verdict exactly as it raises a marker-held one, so a passing re-check
+//     after a memory-inject follow-up is reported as passed. The superseded
+//     manifest is dropped so its verdict is never posted. In every other case
+//     (no follow-up verdict, the same one, "unknown", or an upgrade of a
+//     file verdict) the earlier manifest is folded again and posted.
 //  4. No manifest at all: the follow-up's marker verdict is the turn's newest.
 //     passed/failed/unknown already reached the envelope through applyTo; a
 //     blocked verdict is routed to the blocked fork here.
@@ -513,11 +536,13 @@ func stampManifest(worktreePath string) manifestStamp {
 func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Result, obs *streamObservation, followUp streamObservation, before manifestStamp) {
 	rewritten := stampManifest(worktreePath) != before
 	stale := res.Manifest
+	stalePrinted := stale != nil && res.manifestPrinted
 	followUpVerdict := followUp.verdict()
 	if fresh, fromFile := r.resolveTurnManifest(worktreePath, qw, followUp.lastAssistantText, rewritten); fresh != nil {
 		standing := standingVerdict(res, obs, stale, followUpVerdict)
 		if fromFile || !raisesVerdict(standing, fresh.Verdict) {
 			foldTurnManifest(fresh, res, obs)
+			res.manifestPrinted = !fromFile
 			return
 		}
 		r.logger.Info("printed turn-result manifest in the follow-up would raise the standing verdict; ignored",
@@ -532,6 +557,18 @@ func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Re
 		}
 		return
 	}
+	if stalePrinted && raisesVerdict(stale.Verdict, followUpVerdict) {
+		r.logger.Info("printed turn-result manifest yields to the follow-up turn's own higher verdict; keeping the follow-up verdict",
+			"sessionId", qw.SessionID,
+			"manifestVerdict", stale.Verdict,
+			"followUpVerdict", followUpVerdict,
+		)
+		res.Manifest = nil
+		res.manifestPrinted = false
+		res.WorkResult = followUpVerdict
+		obs.workResult = followUpVerdict
+		return
+	}
 	if !lowersVerdict(stale.Verdict, followUpVerdict) {
 		foldTurnManifest(stale, res, obs)
 		return
@@ -542,6 +579,7 @@ func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Re
 		"followUpVerdict", followUpVerdict,
 	)
 	res.Manifest = nil
+	res.manifestPrinted = false
 	if followUpVerdict == "blocked" {
 		markFollowUpBlocked(res, obs, followUp)
 		return
@@ -558,17 +596,24 @@ func lowersVerdict(from, to string) bool {
 
 // raisesVerdict reports whether replacing the standing verdict with next would
 // raise it: a move to "passed" from any set, non-passing verdict. A printed
-// `Intended manifest` block may never do that; only an anchored marker in a
-// later turn or a manifest file rewritten on disk can raise a verdict.
+// `Intended manifest` block may never do that — only an anchored marker in a
+// later turn or a manifest file rewritten on disk can raise a verdict — so
+// the guard gates the printed-block tier in applyTurnManifest (against the
+// turn's own marker) and reapplyTurnManifest step 2 (against the standing
+// verdict). Step 3 is the marker's own tier, not the block's: there a later
+// anchored marker raises a verdict the runner took from a printed block.
 func raisesVerdict(standing, next string) bool {
 	return next == "passed" && standing != "" && standing != "passed"
 }
 
 // standingVerdict is the turn verdict that stands after a follow-up turn
 // WITHOUT any block the follow-up printed: an earlier manifest (lowered by the
-// follow-up's own anchored marker when that marker lowers it), else the
-// follow-up's own anchored marker, else the verdict earlier turns' markers
-// set.
+// follow-up's own anchored marker when that marker lowers a file verdict),
+// else the follow-up's own anchored marker, else the verdict earlier turns'
+// markers set. A printed stale verdict is deliberately NOT lowered here: the
+// follow-up's marker raises it in step 3 instead, so the standing value keeps
+// the printed verdict and the step-2 never-raise guard still ignores a fresh
+// printed block that would raise it.
 func standingVerdict(res *Result, obs *streamObservation, stale *TurnManifest, followUpVerdict string) string {
 	switch {
 	case stale != nil && lowersVerdict(stale.Verdict, followUpVerdict):

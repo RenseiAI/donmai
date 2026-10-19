@@ -244,12 +244,27 @@ func TestKitRegistry_ComposeForRepoStoreConflictFailsClosed(t *testing.T) {
 	if len(views) != 2 {
 		t.Fatalf("detected = %d kits, want 2", len(views))
 	}
+	var selected kit.LockedDependencyBinding
+	for _, view := range views {
+		if view.ID != "node/pnpm-alt" {
+			continue
+		}
+		digestKind, digest := "package", view.PackageDigest
+		if digest == "" {
+			digestKind, digest = "legacy-manifest", view.LegacyManifestDigest
+		}
+		selected = kit.LockedDependencyBinding{
+			Manager: "pnpm", SelectedKitID: view.ID,
+			SelectedDigestKind: digestKind, SelectedDigest: digest,
+		}
+	}
+	if selected.SelectedKitID == "" || selected.SelectedDigest == "" {
+		t.Fatal("pnpm-alt view carries no digest for the lock pin")
+	}
 	lockRaw, err := kit.CanonicalCompositionLock(kit.CompositionLock{
 		Targets: []kit.LockedCompositionTarget{{
-			Target: target,
-			Dependencies: []kit.LockedDependencyBinding{
-				{Manager: "pnpm", SelectedKitID: "node/pnpm-alt"},
-			},
+			Target:       target,
+			Dependencies: []kit.LockedDependencyBinding{selected},
 		}},
 	})
 	if err != nil {

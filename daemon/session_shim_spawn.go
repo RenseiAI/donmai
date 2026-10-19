@@ -1439,6 +1439,11 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 				"session", launch.Identity.String(), "error", err)
 		}
 	}()
+	// Per-seat scheduling class: the same opt-in wrapper the direct
+	// lane applies, inside the scope wrap (the scope tool owns argv[0]
+	// on Linux; the QoS tool wraps the worker it names). Default leaves
+	// the command exactly as the scope path left it.
+	command = wrapSeatCommandWithQoS(command, seatQoSCommandPrefix(d.seatQoSForShimSpawn()))
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec // G204: operator-configured worker command, same source as the direct-spawn path
 	configureShimProcess(cmd)
 	cmd.Env = append(append([]string(nil), env...), envPairs(launch.Env())...)
@@ -2313,6 +2318,7 @@ func (d *Daemon) trackLaunchedShim(
 		EndpointOperator: sessionDisplayAxis(spec.EndpointOperator),
 		Protocol:         sessionDisplayAxis(spec.Protocol),
 		WorkType:         spec.WorkType,
+		WorkTypeRole:     spec.WorkTypeRole,
 	}
 	entry := adoptedShim{
 		controller:      ctrl,

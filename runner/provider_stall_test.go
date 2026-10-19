@@ -666,3 +666,154 @@ func TestConsumeEvents_TailDrainLeavesOtherSessionsArmed(t *testing.T) {
 		t.Fatalf("providerStall = false (noProgress = %v); want the configured window to survive overlapping follow-up drains", obs.noProgress)
 	}
 }
+
+// TestConsumeEvents_StreamProgressDisarmsStallDetector pins the liveness
+// signal: a stream-progress event after the tool result — a streaming
+// delta arriving from the model endpoint — disarms the stall window the
+// same way model output does. A healthy long generation whose harnesses
+// report deltas while it streams (pi message deltas, codex item deltas,
+// stream-json partial frames) stays alive past the window end; a hung
+// request emits no deltas and still trips it. Wall-clock at millisecond
+// scale, mirroring TestConsumeEvents_ModelOutputAfterToolResultDisarmsStallDetector.
+func TestConsumeEvents_StreamProgressDisarmsStallDetector(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	r.idleTimeout = 10 * time.Second
+	r.providerStallTimeout = 100 * time.Millisecond
+
+	events := make(chan agent.Event, 8)
+	handle := &fakeHandle{events: events}
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("STALL-5")}
+
+	type consumeResult struct {
+		obs streamObservation
+		err error
+	}
+	done := make(chan consumeResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() {
+		enforcer := NewBudgetEnforcer(nil, time.Now())
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
+		done <- consumeResult{obs: obs, err: err}
+	}()
+
+	// The tool call runs, then its result arms the window.
+	events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "slow-1"}
+	events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "slow-1", Content: "ok"}
+
+	// A streaming delta arrives inside the window and disarms the
+	// detector; the turn then stays silent past the window end — a live
+	// generation still forming its answer — without flagging.
+	time.Sleep(20 * time.Millisecond)
+	events <- agent.StreamProgressEvent()
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case res := <-done:
+		t.Fatalf("consumeEvents returned early: err = %v, providerStall = %v; want stream progress to disarm the detector", res.err, res.obs.providerStall)
+	default:
+	}
+
+	events <- agent.ResultEvent{Success: true}
+	var res consumeResult
+	select {
+	case res = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("consumeEvents did not return after the terminal event")
+	}
+	if res.err != nil {
+		t.Fatalf("consumeEvents: %v; want nil (stream progress after the tool result must disarm the detector)", res.err)
+	}
+	if res.obs.providerStall {
+		t.Fatalf("obs.providerStall = true; want false (deltas are arriving; the request is alive)")
+	}
+}
+
+// TestConsumeEvents_StreamProgressKeepsSlowGenerationAlive is the
+// end-to-end shape the follow-up scope asks for: a healthy generation
+// that reports ONLY stream-progress ticks while it streams — no
+// assistant text until the finished answer — completes with no stall
+// retry. The ticks arrive once per stall window, as real streaming
+// deltas do; the finished text lands after several windows of
+// progress-only silence. It drives the PRODUCTION entry point
+// (Runner.Run).
+func TestConsumeEvents_StreamProgressKeepsSlowGenerationAlive(t *testing.T) {
+	provider := &progressTickProvider{}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:             WorkTypeQAStr,
+		repository:           followUpRepository,
+		pulls:                map[int]string{7: pullAtSessionCommit},
+		providerStallTimeout: 50 * time.Millisecond,
+		providerStallRetries: 2,
+		idleTimeout:          30 * time.Second,
+		provider: func(base agent.HarnessProvider) agent.Provider {
+			provider.HarnessProvider = base
+			return provider
+		},
+		turns: []verdictScriptTurn{},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed (streaming deltas prove the generation is alive)", res.Status, res.FailureMode, res.Error)
+	}
+	if res.WorkResult != "passed" {
+		t.Fatalf("WorkResult = %q; want passed from the slow generation", res.WorkResult)
+	}
+	if provider.resumes.Load() != 0 {
+		t.Fatalf("resumes = %d; want 0 (no stall retry for a live generation)", provider.resumes.Load())
+	}
+	if res.TurnContinuations != nil && res.TurnContinuations.Retried != 0 {
+		t.Fatalf("TurnContinuations = %+v; want no recorded stall retry", res.TurnContinuations)
+	}
+}
+
+// progressTickProvider replays a healthy generation that reports only
+// stream-progress ticks while it streams: the first turn answers its
+// tool result with a tick per stall window, then the finished text after
+// several windows of progress-only silence — the real streaming shape
+// (deltas arrive, the complete message lands once). Resumed turns answer
+// at once; the test asserts the FIRST turn is never aborted.
+type progressTickProvider struct {
+	agent.HarnessProvider
+	resumes atomic.Int32
+}
+
+func (p *progressTickProvider) Spawn(_ context.Context, _ agent.Spec) (agent.Handle, error) {
+	h := &progressTickHandle{events: make(chan agent.Event, 64)}
+	h.events <- agent.InitEvent{SessionID: "progress-tick-session"}
+	h.events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-1", Input: map[string]any{"command": "go test ./..."}}
+	h.events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-1", Content: "ok"}
+	go func() {
+		for i := 0; i < 5; i++ {
+			time.Sleep(20 * time.Millisecond)
+			h.events <- agent.StreamProgressEvent()
+		}
+		h.events <- agent.AssistantTextEvent{Text: "Done.\nWORK_RESULT: passed"}
+		h.events <- agent.ResultEvent{Success: true, Message: "Done.\nWORK_RESULT: passed"}
+	}()
+	return h, nil
+}
+
+func (p *progressTickProvider) Resume(_ context.Context, sessionID string, _ agent.Spec) (agent.Handle, error) {
+	if sessionID == "" {
+		return nil, agent.ErrSessionNotFound
+	}
+	p.resumes.Add(1)
+	h := &progressTickHandle{events: make(chan agent.Event, 64)}
+	h.events <- agent.InitEvent{SessionID: "progress-tick-session"}
+	h.events <- agent.AssistantTextEvent{Text: "Done.\nWORK_RESULT: passed"}
+	h.events <- agent.ResultEvent{Success: true, Message: "Done.\nWORK_RESULT: passed"}
+	return h, nil
+}
+
+type progressTickHandle struct {
+	events chan agent.Event
+}
+
+func (h *progressTickHandle) SessionID() string          { return "progress-tick-session" }
+func (h *progressTickHandle) Events() <-chan agent.Event { return h.events }
+func (h *progressTickHandle) Inject(_ context.Context, _ string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *progressTickHandle) Stop(_ context.Context) error { return nil }

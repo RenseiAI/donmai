@@ -23,4 +23,11 @@ var (
 	// mirrors; a cross-filesystem layout would silently change copy cost
 	// and sharing behavior, so the store refuses to start there.
 	ErrSameFilesystem = errors.New("repo keeper: keeper root and worktree root are on different filesystems")
+
+	// ErrOpaqueCredential reports that a non-URL (scp-like or other opaque)
+	// remote carries password-shaped userinfo ("user:password@...").
+	// Opaque forms hash verbatim, so the token would persist verbatim into
+	// the identity sidecar and the mirror config; the remote is refused
+	// before anything is written. Neither value is echoed in the error text.
+	ErrOpaqueCredential = errors.New("repo keeper: remote carries credential material in an opaque (non-URL) form")
 )

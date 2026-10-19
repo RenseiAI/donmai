@@ -374,6 +374,9 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 	switch msg.Role {
 	case "assistant":
 		var out []agent.Event
+		if msg.ResponseID != "" {
+			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeGenerationID, GenerationID: msg.ResponseID})
+		}
 		for _, part := range msg.Content {
 			switch part.Type {
 			case "text":
@@ -440,8 +443,9 @@ func mapInteractiveTranscriptLine(line []byte, seen map[string]struct{}) []agent
 // cacheWrite}, with input already excluding both cache buckets — the same
 // shape the headless turn_end mapper reads).
 type interactiveTranscriptMessage struct {
-	Role    string `json:"role"`
-	Content []struct {
+	ResponseID string `json:"responseId"`
+	Role       string `json:"role"`
+	Content    []struct {
 		Type      string         `json:"type"`
 		Text      string         `json:"text"`
 		ID        string         `json:"id"`

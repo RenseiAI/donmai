@@ -117,6 +117,11 @@ type QueuedWork struct {
 	// the registration store; the runner just forwards it.
 	AuthToken string `json:"-"`
 
+	// CoAuthorName and CoAuthorEmail carry optional commit credit supplied by
+	// the work source. They travel together; absent values preserve bot-only credit.
+	CoAuthorName  string `json:"coAuthorName,omitempty"`
+	CoAuthorEmail string `json:"coAuthorEmail,omitempty"`
+
 	// McpAuthToken is the platform-supplied bearer for the platform's
 	// per-session MCP gateway, and for NOTHING else. AuthToken remains the
 	// bearer for heartbeat, result-post, activity-post, and the session
@@ -394,6 +399,16 @@ type Result struct {
 	// TerminalWorkareaLease is the exact four-field external projection attached
 	// after the full descriptor and host-local path are durable.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
+
+	// manifestPrinted records that the envelope's Manifest was recovered
+	// from a printed `Intended manifest:` block rather than read from the
+	// manifest file on disk. A printed block is the tool-restricted
+	// stage's backstop, not the agent's authoritative structured word, so
+	// a later turn's anchored marker may raise it (reapplyTurnManifest)
+	// while a file-backed manifest may only be lowered. Unexported:
+	// runner-internal resolution state, never on the wire (encoding/json
+	// ignores it, and the poster carries only the embedded agent.Result).
+	manifestPrinted bool
 
 	// rescueTargets are the session's git checkouts, each with the commit it
 	// was provisioned at. Run reads them before teardown to preserve any work

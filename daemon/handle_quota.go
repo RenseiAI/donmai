@@ -90,6 +90,12 @@ func (s *Server) handleSessionUsage(w http.ResponseWriter, r *http.Request, id s
 		s.daemon.quota.noteCodexUpdate(req.Update, at)
 	case agent.UsageHarnessClaude:
 		s.daemon.quota.noteClaudeUpdate(req.Update, at)
+	case agent.UsageHarnessMuse:
+		// The muse check proves a supported CLI is installed, never
+		// usage windows: a worker stream cannot move its verdict, so
+		// the probe alone owns it.
+		http.Error(w, "muse quota is probe-only", http.StatusBadRequest)
+		return
 	default:
 		http.Error(w, "unknown harness", http.StatusBadRequest)
 		return

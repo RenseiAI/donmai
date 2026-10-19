@@ -23,6 +23,7 @@ var canonicalAgentRunProviders = []agent.ProviderName{
 	agent.ProviderCodex,
 	agent.ProviderOllama,
 	agent.ProviderGemini,
+	agent.ProviderMuse,
 	agent.ProviderOpenCode,
 	agent.ProviderPi,
 	agent.ProviderShell,
@@ -32,7 +33,7 @@ var canonicalAgentRunProviders = []agent.ProviderName{
 // no-behavior-change proof: the single-source ctor list (agentRunProviderCtors)
 // enumerates EXACTLY the canonical ProviderNames — no more, no fewer —
 // regardless of what is probe-available on this host. Every embedder that
-// calls BuildAgentRunRegistry gets the same seven providers with no forked
+// calls BuildAgentRunRegistry gets the same nine providers with no forked
 // list to drift.
 func TestBuildAgentRunRegistry_DeclaresAllCanonicalProviders(t *testing.T) {
 	t.Parallel()
@@ -91,7 +92,7 @@ func TestBuildAgentRunRegistry_PublicEqualsInternal(t *testing.T) {
 			pub, internal)
 	}
 
-	// Every resolved provider must be one of the canonical seven — the
+	// Every resolved provider must be one of the canonical nine — the
 	// registry never resolves a name outside the single-source set.
 	canon := map[agent.ProviderName]bool{}
 	for _, p := range canonicalAgentRunProviders {

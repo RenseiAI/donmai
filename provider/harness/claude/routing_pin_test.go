@@ -70,7 +70,7 @@ func TestPinnedRoutingEnv_HostLoginPinsNothing(t *testing.T) {
 		if pin := pinnedRoutingEnv(projected); len(pin) != 0 {
 			t.Errorf("pinnedRoutingEnv(%v) = %v, want nothing — host-login sessions pin nothing", spec, pin)
 		}
-		if argv, _ := buildArgs(projected, "", ""); slicesContains(argv, "--settings") {
+		if argv, _ := buildArgs(projected, "", "", ""); slicesContains(argv, "--settings") {
 			t.Errorf("host-login buildArgs emits --settings %q — the pin must not change login argv", argv)
 		}
 	}

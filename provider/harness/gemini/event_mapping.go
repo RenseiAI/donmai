@@ -44,6 +44,7 @@ type candidateFuncCall struct {
 type usageMetadata struct {
 	PromptTokenCount        int `json:"promptTokenCount,omitempty"`
 	CandidatesTokenCount    int `json:"candidatesTokenCount,omitempty"`
+	ThoughtsTokenCount      int `json:"thoughtsTokenCount,omitempty"`
 	TotalTokenCount         int `json:"totalTokenCount,omitempty"`
 	CachedContentTokenCount int `json:"cachedContentTokenCount,omitempty"`
 }
@@ -58,12 +59,13 @@ type promptFeedback struct {
 // (inputPricePer1M / cachedPricePer1M / outputPricePer1M) so cost math
 // honors them; nil means the fallback pricing table applies.
 type turnState struct {
-	model             string
-	providerConfig    map[string]any
-	totalInputTokens  int64
-	totalOutputTokens int64
-	totalCachedTokens int64
-	turnCount         int
+	model                string
+	providerConfig       map[string]any
+	totalInputTokens     int64
+	totalOutputTokens    int64
+	totalCachedTokens    int64
+	totalReasoningTokens int64
+	turnCount            int
 }
 
 // turnOutcome is the classification of a single decoded generateContent
@@ -176,10 +178,11 @@ func mapResponse(body []byte, state *turnState) decodedTurn {
 			}
 		}
 	}
-	var inputTokens, outputTokens, cachedTokens int64
+	var inputTokens, outputTokens, cachedTokens, reasoningTokens int64
 	if resp.UsageMetadata != nil {
-		inputTokens = int64(resp.UsageMetadata.PromptTokenCount)
-		outputTokens = int64(resp.UsageMetadata.CandidatesTokenCount)
+		inputTokens = int64(max(resp.UsageMetadata.PromptTokenCount-resp.UsageMetadata.CachedContentTokenCount, 0))
+		reasoningTokens = int64(resp.UsageMetadata.ThoughtsTokenCount)
+		outputTokens = int64(resp.UsageMetadata.CandidatesTokenCount) + reasoningTokens
 		cachedTokens = int64(resp.UsageMetadata.CachedContentTokenCount)
 	}
 	llm := agent.LlmCallEvent{
@@ -188,6 +191,7 @@ func mapResponse(body []byte, state *turnState) decodedTurn {
 		InputTokens:       inputTokens,
 		OutputTokens:      outputTokens,
 		CachedInputTokens: cachedTokens,
+		ReasoningTokens:   reasoningTokens,
 		FinishReason:      turn.finishReason,
 		UsageSource:       agent.LlmUsageProvider,
 	}
@@ -210,8 +214,10 @@ func accumulateUsage(u *usageMetadata, state *turnState) {
 	if u == nil {
 		return
 	}
-	state.totalInputTokens += int64(u.PromptTokenCount)
-	state.totalOutputTokens += int64(u.CandidatesTokenCount)
+	state.totalInputTokens += int64(max(u.PromptTokenCount-u.CachedContentTokenCount, 0))
+	// Gemini reports thoughts separately; shared output includes reasoning.
+	state.totalOutputTokens += int64(u.CandidatesTokenCount) + int64(u.ThoughtsTokenCount)
+	state.totalReasoningTokens += int64(u.ThoughtsTokenCount)
 	state.totalCachedTokens += int64(u.CachedContentTokenCount)
 }
 
@@ -241,14 +247,15 @@ func buildResultEvent(finishReason string, state *turnState, raw any) agent.Resu
 
 // buildCost assembles the CostData with TotalCostUsd computed from the
 // resolved per-model pricing (dispatcher-supplied prices first, the
-// fallback table second). Cached tokens ride inside the input total and
-// are priced at the cached rate.
+// fallback table second). The pricing helper expects the full prompt count,
+// while shared InputTokens excludes the cached slice.
 func buildCost(state *turnState) *agent.CostData {
 	return &agent.CostData{
 		InputTokens:       state.totalInputTokens,
 		OutputTokens:      state.totalOutputTokens,
 		CachedInputTokens: state.totalCachedTokens,
-		TotalCostUsd: calculateCostUSD(state.totalInputTokens, state.totalCachedTokens,
+		ReasoningTokens:   state.totalReasoningTokens,
+		TotalCostUsd: calculateCostUSD(state.totalInputTokens+state.totalCachedTokens, state.totalCachedTokens,
 			state.totalOutputTokens, state.model, state.providerConfig),
 		NumTurns: state.turnCount,
 	}

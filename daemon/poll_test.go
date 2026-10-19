@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -384,6 +385,53 @@ func TestPollResponse_DecodesLiveWireShape(t *testing.T) {
 	if len(resp.ClaimedSessionIDs) != 1 {
 		t.Fatalf("ClaimedSessionIDs len = %d, want 1", len(resp.ClaimedSessionIDs))
 	}
+}
+
+// TestPollResponse_IgnoresLegacyInbox checks that retired inbox keys remain
+// unknown fields and cannot prevent ordinary work from being dispatched.
+func TestPollResponse_IgnoresLegacyInbox(t *testing.T) {
+	t.Run("response fields", func(t *testing.T) {
+		for _, name := range []string{"InboxMessages", "HasInboxMessages"} {
+			if _, ok := reflect.TypeFor[PollResponse]().FieldByName(name); ok {
+				t.Errorf("PollResponse still declares %s", name)
+			}
+		}
+	})
+
+	t.Run("poll dispatch", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{
+				"work": [{"sessionId": "legacy-inbox-work", "queuedAt": 1777658441780}],
+				"inboxMessages": {"running-session": [{"text": "legacy message", "kind": "user"}]},
+				"hasInboxMessages": true
+			}`)
+		}))
+		t.Cleanup(srv.Close)
+
+		var dispatched []PollWorkItem
+		var warnings []string
+		p := NewPollService(PollOptions{
+			WorkerID:        "wkr_test",
+			OrchestratorURL: srv.URL,
+			OnWork: func(item PollWorkItem) error {
+				dispatched = append(dispatched, item)
+				return nil
+			},
+			LogWarn: func(format string, args ...any) {
+				warnings = append(warnings, fmt.Sprintf(format, args...))
+			},
+		})
+		p.pollOnce(context.Background())
+		if len(warnings) != 0 {
+			t.Fatalf("poll warnings: %v", warnings)
+		}
+		if len(dispatched) != 1 {
+			t.Fatalf("dispatched %d work items, want 1", len(dispatched))
+		}
+		if got := dispatched[0]; got.SessionID != "legacy-inbox-work" || got.QueuedAt != 1777658441780 {
+			t.Fatalf("dispatched work = %+v", got)
+		}
+	})
 }
 
 // TestPollService_DaemonIntegration covers the end-to-end wiring through
@@ -2288,7 +2336,7 @@ func TestPollResponse_DecodesDeliveryPolicy(t *testing.T) {
 		"work": [{
 			"sessionId": "delivery-sess-1",
 			"workType": "development",
-			"delivery": {"allowDraft": true, "allowMergeCommits": true}
+			"delivery": {"allowDraft": true, "allowMergeCommits": true, "allowCleanMerge": true}
 		}, {
 			"sessionId": "delivery-sess-2",
 			"workType": "development"
@@ -2303,8 +2351,8 @@ func TestPollResponse_DecodesDeliveryPolicy(t *testing.T) {
 		t.Fatalf("Work len = %d, want 2", len(resp.Work))
 	}
 	got := resp.Work[0].Delivery
-	if got == nil || !got.AllowDraft || !got.AllowMergeCommits {
-		t.Errorf("Delivery = %+v; want both flags set", got)
+	if got == nil || !got.AllowDraft || !got.AllowMergeCommits || !got.AllowCleanMerge {
+		t.Errorf("Delivery = %+v; want all flags set", got)
 	}
 	if resp.Work[1].Delivery != nil {
 		t.Errorf("Delivery = %+v; want nil when absent", resp.Work[1].Delivery)
@@ -2319,11 +2367,11 @@ func TestPollItemToSessionDetail_DeliveryPolicyForwarded(t *testing.T) {
 	t.Run("populated", func(t *testing.T) {
 		item := PollWorkItem{
 			SessionID: "sess-delivery",
-			Delivery:  &PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true},
+			Delivery:  &PollDeliveryPolicy{AllowDraft: true, AllowMergeCommits: true, AllowCleanMerge: true},
 		}
 		detail := PollItemToSessionDetail(item, nil, "", "", "")
-		if detail.Delivery == nil || !detail.Delivery.AllowDraft || !detail.Delivery.AllowMergeCommits {
-			t.Errorf("Delivery = %+v; want both flags set", detail.Delivery)
+		if detail.Delivery == nil || !detail.Delivery.AllowDraft || !detail.Delivery.AllowMergeCommits || !detail.Delivery.AllowCleanMerge {
+			t.Errorf("Delivery = %+v; want all flags set", detail.Delivery)
 		}
 	})
 	t.Run("absent — omitted", func(t *testing.T) {

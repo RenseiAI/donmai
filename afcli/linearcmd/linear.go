@@ -360,6 +360,49 @@ func resolveLabelIDs(ctx context.Context, client labelLister, names []string) ([
 	return ids, nil
 }
 
+// assigneeResolver is the narrow read contract needed for assignee
+// resolution. Keeping it narrow makes the resolver independently testable
+// while create-issue and update-issue continue to use their shared Linear
+// client. GetViewer resolves "me"; GetUserByNameOrEmail resolves a
+// user ID, name, or email; a UUID value is passed through without a lookup.
+type assigneeResolver interface {
+	GetUserByNameOrEmail(ctx context.Context, nameOrEmail string) (*linear.User, error)
+	GetViewer(ctx context.Context) (*linear.User, error)
+}
+
+// resolveAssigneeID maps a --assignee flag value to a Linear user ID. It
+// accepts a user ID (UUID, passed through without a lookup), "me" (the
+// authenticated viewer), or a name/email resolved through the client. It
+// fails closed when the value cannot be resolved so a create or update never
+// silently proceeds unassigned.
+func resolveAssigneeID(ctx context.Context, client assigneeResolver, raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", errors.New("assignee must not be empty")
+	}
+	if _, err := uuid.Parse(value); err == nil {
+		return value, nil
+	}
+	if value == "me" {
+		viewer, err := client.GetViewer(ctx)
+		if err != nil {
+			return "", fmt.Errorf("resolve assignee %q: %w", value, err)
+		}
+		if strings.TrimSpace(viewer.ID) == "" {
+			return "", fmt.Errorf("resolve assignee %q: viewer has no user ID", value)
+		}
+		return viewer.ID, nil
+	}
+	user, err := client.GetUserByNameOrEmail(ctx, value)
+	if err != nil {
+		return "", fmt.Errorf("resolve assignee %q: %w", value, err)
+	}
+	if strings.TrimSpace(user.ID) == "" {
+		return "", fmt.Errorf("resolve assignee %q: user has no user ID", value)
+	}
+	return user.ID, nil
+}
+
 // getBlockingIssues returns active blockers; Done and Accepted dependencies are ready.
 func getBlockingIssues(ctx context.Context, client linear.Linear, issueID string) ([]map[string]any, error) {
 	relations, err := client.GetIssueRelations(ctx, issueID)
@@ -441,6 +484,7 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 				"parentIdentifier": parentIdentifier,
 				"priority":         issue.Priority,
 				"sortOrder":        issue.SortOrder,
+				"estimate":         issue.Estimate,
 				"createdAt":        issue.CreatedAt,
 				"updatedAt":        issue.UpdatedAt,
 			}
@@ -650,6 +694,8 @@ func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		labels          string
 		state           string
 		parentID        string
+		assignee        string
+		priority        int
 	)
 
 	cmd := &cobra.Command{
@@ -731,6 +777,26 @@ func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				input.ParentID = parent.ID
 			}
 
+			// Optional assignee (user ID, "me", name, or email)
+			if cmd.Flags().Changed("assignee") {
+				if strings.TrimSpace(assignee) == "" || assignee == "null" {
+					return fmt.Errorf("--assignee requires a user ID, name, email, or \"me\"")
+				}
+				assigneeID, err := resolveAssigneeID(ctx, client, assignee)
+				if err != nil {
+					return err
+				}
+				input.AssigneeID = assigneeID
+			}
+
+			// Optional priority (0 = no priority is valid, so check Changed)
+			if cmd.Flags().Changed("priority") {
+				if priority < 0 || priority > 4 {
+					return fmt.Errorf("--priority must be 0-4: 0=no priority, 1=urgent, 2=high, 3=medium, 4=low")
+				}
+				input.Priority = priority
+			}
+
 			issue, err := client.CreateIssue(ctx, input)
 			if err != nil {
 				return fmt.Errorf("create issue: %w", err)
@@ -753,6 +819,8 @@ func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 	cmd.Flags().StringVar(&labels, "labels", "", "Comma-separated label names (e.g. 'Bug,Feature')")
 	cmd.Flags().StringVar(&state, "state", "", "Initial state name (e.g. 'Backlog')")
 	cmd.Flags().StringVar(&parentID, "parentId", "", "Parent issue ID or identifier")
+	cmd.Flags().StringVar(&assignee, "assignee", "", "Assignee user ID, name, email, or 'me'")
+	cmd.Flags().IntVar(&priority, "priority", 0, "Issue priority: 0=no priority, 1=urgent, 2=high, 3=medium, 4=low")
 
 	return cmd
 }
@@ -769,6 +837,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		project         string
 		labels          string
 		parentID        string
+		assignee        string
 		priority        int
 		estimate        int
 	)
@@ -860,6 +929,23 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				}
 			}
 
+			// Optional assignee: "null" clears the assignment (explicit
+			// GraphQL null, matching the parentId clear contract); any other
+			// value resolves to a user ID via UUID passthrough, "me", or
+			// name/email lookup.
+			if cmd.Flags().Changed("assignee") {
+				if assignee == "null" {
+					empty := ""
+					input.AssigneeID = &empty
+				} else {
+					assigneeID, err := resolveAssigneeID(ctx, client, assignee)
+					if err != nil {
+						return err
+					}
+					input.AssigneeID = &assigneeID
+				}
+			}
+
 			// Optional priority (0 = no priority is valid, so check Changed)
 			if cmd.Flags().Changed("priority") {
 				input.Priority = &priority
@@ -895,6 +981,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 	cmd.Flags().StringVar(&project, "project", "", "Move issue to a Linear project name, slug, or UUID (mutation, not CLI context)")
 	cmd.Flags().StringVar(&labels, "labels", "", "Comma-separated label names")
 	cmd.Flags().StringVar(&parentID, "parentId", "", "New parent issue ID ('null' to clear)")
+	cmd.Flags().StringVar(&assignee, "assignee", "", "Assignee user ID, name, email, or 'me' ('null' to clear)")
 	cmd.Flags().IntVar(&priority, "priority", 0, "Issue priority: 0=no priority, 1=urgent, 2=high, 3=medium, 4=low")
 	cmd.Flags().IntVar(&estimate, "estimate", 0, "Issue estimate (story points or t-shirt size value)")
 
@@ -1185,6 +1272,7 @@ func newLinearListSubIssuesCmd(ds func() afclient.DataSource, bin string) *cobra
 					"parentId":   parent.ID,
 					"priority":   c.Priority,
 					"sortOrder":  c.SortOrder,
+					"estimate":   c.Estimate,
 					"labels":     labelNames(c.Labels),
 					"url":        c.URL,
 					"blockedBy":  []any{},
@@ -1342,6 +1430,7 @@ func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource, bin string) *cobr
 // ─── list-issues ──────────────────────────────────────────────────────────────
 
 func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
+	var structured listFilterFlags
 	var (
 		project  string
 		status   string
@@ -1359,6 +1448,10 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		Short:        "List issues with flexible filters",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			structuredFilter, err := structured.parse(cmd)
+			if err != nil {
+				return err
+			}
 			if err := linear.ValidateIssueListLimit(limit); err != nil {
 				return err
 			}
@@ -1367,7 +1460,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 			default:
 				return fmt.Errorf("--order-by must be createdAt, updatedAt, or manual")
 			}
-			client, err := newLinearClient(ds, bin)
+			client, err := newFilteredListClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -1437,7 +1530,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				}
 			}
 
-			result, err := client.ListIssues(ctx, filter, limit, orderBy)
+			result, err := client.ListIssuesWithOptions(ctx, linear.AndFilters(filter, structuredFilter), limit, orderBy, structured.includeArchived)
 			if err != nil {
 				return fmt.Errorf("list issues using %s order: %w", orderBy, err)
 			}
@@ -1475,6 +1568,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 					"status":    iss.State.Name,
 					"priority":  iss.Priority,
 					"sortOrder": iss.SortOrder,
+					"estimate":  iss.Estimate,
 					"labels":    labelNames(iss.Labels),
 					"project":   projName,
 					"assignee":  assigneeName,
@@ -1505,6 +1599,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Priority then createdAt/updatedAt, or ascending Linear manual order (flat; rank 0 valid; null last; ties keep Linear order)")
 	cmd.Flags().StringVar(&query, "query", "", "Text search query")
 
+	structured.register(cmd)
 	return cmd
 }
 
@@ -1618,6 +1713,7 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 					"url":         iss.URL,
 					"priority":    iss.Priority,
 					"sortOrder":   iss.SortOrder,
+					"estimate":    iss.Estimate,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
 					"parentID":    iss.ParentID,
@@ -1704,6 +1800,7 @@ dependency readiness does not change that selection.`,
 					"url":         iss.URL,
 					"priority":    iss.Priority,
 					"sortOrder":   iss.SortOrder,
+					"estimate":    iss.Estimate,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
 					"parentID":    iss.ParentID,
@@ -1990,8 +2087,9 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 			if assignee != "" {
 				user, userErr := client.GetUserByNameOrEmail(ctx, assignee)
 				if userErr == nil {
+					assignID := user.ID
 					_, _ = client.UpdateIssue(ctx, blockerIssue.ID, linear.UpdateIssueInput{
-						AssigneeID: user.ID,
+						AssigneeID: &assignID,
 					})
 				}
 				// Non-critical: blocker still created without assignee
@@ -2060,6 +2158,7 @@ func newLinearListTeamsCmd(ds func() afclient.DataSource, bin string) *cobra.Com
 // project ID when needed rather than selecting an arbitrary team key.
 func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var team string
+	var structured listFilterFlags
 	type projectEntry struct {
 		ID      string `json:"id"`
 		Name    string `json:"name"`
@@ -2072,11 +2171,15 @@ func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.
 		Short:        "List accessible projects",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, err := newLinearClient(ds, bin)
+			filter, err := structured.parse(cmd)
 			if err != nil {
 				return err
 			}
-			projects, err := client.ListProjects(cmd.Context(), team)
+			client, err := newFilteredListClient(ds, bin)
+			if err != nil {
+				return err
+			}
+			projects, err := client.ListProjectsWithOptions(cmd.Context(), team, filter, structured.includeArchived)
 			if err != nil {
 				return fmt.Errorf("list projects: %w", err)
 			}
@@ -2109,6 +2212,7 @@ func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.
 		},
 	}
 	cmd.Flags().StringVar(&team, "team", "", "Canonical team key or UUID to filter projects")
+	structured.register(cmd)
 	return cmd
 }
 

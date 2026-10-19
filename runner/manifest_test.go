@@ -441,6 +441,11 @@ func TestApplyTurnManifest(t *testing.T) {
 		wantBlocked    bool
 		wantBlockedRsn string
 		wantManifest   bool // res.Manifest non-nil
+		// wantPrinted asserts the adopted manifest is remembered as printed
+		// (recovered from an inline block, not read from the file) — the
+		// source a later turn's marker may raise. Only meaningful when
+		// wantManifest is true.
+		wantPrinted bool
 	}{
 		{
 			name:           "no manifest leaves scraped marker untouched",
@@ -511,6 +516,7 @@ func TestApplyTurnManifest(t *testing.T) {
 			wantWorkResult: "failed",
 			wantSummary:    "inline summary", // the structured summary the marker lost
 			wantManifest:   true,
+			wantPrinted:    true,
 		},
 		{
 			// Resolution order: a written file WINS over an inline block — the
@@ -545,6 +551,22 @@ func TestApplyTurnManifest(t *testing.T) {
 			wantBlocked:    true,
 			wantBlockedRsn: "needs spec",
 			wantManifest:   true,
+			wantPrinted:    true,
+		},
+		{
+			// Same-turn precedence is file-wins: the turn wrote a passed
+			// manifest file while its own scraped marker says failed — the
+			// prompts declare the file authoritative and the marker only
+			// the backstop, so the file governs. (The mirror — a failed
+			// file against a passed marker — is "manifest verdict overrides
+			// scraped marker" above.)
+			name:           "written file governs over the turn's own failed marker",
+			raw:            `{"schemaVersion":1,"verdict":"passed","summary":"file summary"}`,
+			seedWorkResult: "failed", // the turn's own marker said failed
+			seedSummary:    "scraped summary",
+			wantWorkResult: "passed",
+			wantSummary:    "file summary",
+			wantManifest:   true,
 		},
 		{
 			// A malformed inline block degrades to the marker, never fails.
@@ -554,6 +576,33 @@ func TestApplyTurnManifest(t *testing.T) {
 			seedWorkResult: "passed",
 			wantWorkResult: "passed",
 			wantManifest:   false,
+		},
+		{
+			// A printed passed block never raises the turn's own anchored
+			// failed marker — the one same-turn guard on the printed tier —
+			// so the marker stands and no manifest is adopted.
+			name:           "printed passed block never raises the turn's own failed marker",
+			raw:            "",
+			inlineMessage:  `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"optimistic"}` + "\nWORK_RESULT: failed",
+			seedWorkResult: "failed",
+			seedSummary:    "scraped summary",
+			wantWorkResult: "failed",
+			wantSummary:    "scraped summary",
+			wantManifest:   false,
+		},
+		{
+			// A printed failed block still lowers the turn's own anchored
+			// passed marker: the guard bars only raising, and the adopted
+			// block is remembered as printed for later turns.
+			name:           "printed failed block lowers the turn's own passed marker",
+			raw:            "",
+			inlineMessage:  `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"inline summary"}` + "\nWORK_RESULT: passed",
+			seedWorkResult: "passed",
+			seedSummary:    "scraped summary",
+			wantWorkResult: "failed",
+			wantSummary:    "inline summary",
+			wantManifest:   true,
+			wantPrinted:    true,
 		},
 	}
 
@@ -599,6 +648,9 @@ func TestApplyTurnManifest(t *testing.T) {
 			}
 			if (res.Manifest != nil) != tt.wantManifest {
 				t.Errorf("res.Manifest set = %v, want %v", res.Manifest != nil, tt.wantManifest)
+			}
+			if tt.wantManifest && res.manifestPrinted != tt.wantPrinted {
+				t.Errorf("res.manifestPrinted = %v, want %v", res.manifestPrinted, tt.wantPrinted)
 			}
 		})
 	}

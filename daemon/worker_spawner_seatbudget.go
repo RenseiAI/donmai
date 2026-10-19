@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/daemon/seatqos"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -208,6 +209,16 @@ func (d *Daemon) shimSeatBudget() (seatbudget.Budget, bool) {
 		return seatbudget.Budget{}, false
 	}
 	return d.spawner.seatBudgetForSpawn()
+}
+
+// seatQoSForShimSpawn resolves the scheduling class one shim launch
+// applies: the spawner's configured class. Nil-safe for tests that
+// construct a daemon without a spawner — they get default (no wrapper).
+func (d *Daemon) seatQoSForShimSpawn() seatqos.Class {
+	if d == nil || d.spawner == nil {
+		return seatqos.Default
+	}
+	return d.spawner.seatQoSForSpawn()
 }
 
 // seatBudgetShimScopeName derives the transient scope unit name for one shim

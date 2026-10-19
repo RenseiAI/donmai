@@ -201,6 +201,8 @@ func (r *Runner) dispatchInterview(
 			BaseURL:            qw.PlatformURL,
 			AuthToken:          qw.AuthToken,
 			CredentialProvider: tdCredProvider,
+			Traceparent:        qw.Traceparent,
+			Tracestate:         qw.Tracestate,
 			HTTPClient:         r.httpClient,
 			Logger:             r.logger,
 		})
@@ -412,6 +414,9 @@ func (r *Runner) consumeInterviewTurn(
 				return sentinelContains(sentinelBuf.String())
 			}
 			for _, correlatedEvent := range cfg.spans.Process(ev) {
+				if cfg.res != nil && cfg.qw.ResolvedProfile.Endpoint != nil {
+					cfg.res.GenerationIDs = collectGenerationID(cfg.res.GenerationIDs, correlatedEvent)
+				}
 				r.appendInterviewJSONL(cfg.worktree, correlatedEvent)
 				sink.Send(ctx, correlatedEvent)
 				r.reportQuotaEvent(ctx, cfg.qw.SessionID, correlatedEvent)

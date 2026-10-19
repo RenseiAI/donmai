@@ -2,7 +2,9 @@ package pi
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -544,5 +546,124 @@ func TestMapEvent_CompactionEndToSeries(t *testing.T) {
 	}
 	if wire.Payload["harness"] != "pi" || wire.Payload["source"] != "rpc-usage" {
 		t.Errorf("payload identity = %v; want pi/rpc-usage", wire.Payload)
+	}
+}
+
+// TestMapEvent_MessageUpdateEmitsStreamProgress pins the pi leg of the
+// stream liveness signal: every message_update delta — text or thinking —
+// emits the content-free stream-progress signal alongside buffering the
+// text for the message_end flush. The runner's stall detector disarms on
+// the signal, so a healthy long generation (deltas arriving) never reads
+// as a hung request, while a hung request (no deltas) still trips it. An
+// unknown delta shape stays silent.
+func TestMapEvent_MessageUpdateEmitsStreamProgress(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []string{"text_delta", "thinking_delta"} {
+		st := &mapperState{}
+		ev := rawEvent{Type: "message_update", Fields: map[string]any{
+			"assistantMessageEvent": map[string]any{"type": typ, "delta": "Hello "},
+		}, Line: []byte("line")}
+		got, terminal := mapEvent(ev, st)
+		if terminal {
+			t.Fatalf("%s: terminal = true; a delta never ends the turn", typ)
+		}
+		if len(got) != 1 {
+			t.Fatalf("%s: events = %#v, want 1 stream-progress signal", typ, got)
+		}
+		sys, ok := got[0].(agent.SystemEvent)
+		if !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
+			t.Fatalf("%s: event = %#v, want the stream-progress signal", typ, got[0])
+		}
+		if sys.Message != "" {
+			t.Errorf("%s: message = %q, want empty (the signal carries no content)", typ, sys.Message)
+		}
+	}
+	// Text still buffers for the message_end flush.
+	st := &mapperState{}
+	if _, _ = mapEvent(rawEvent{Type: "message_update", Fields: map[string]any{
+		"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello "},
+	}}, st); st.textBuf.String() != "Hello " {
+		t.Fatalf("textBuf = %q, want the buffered delta", st.textBuf.String())
+	}
+	// An unknown delta shape stays silent.
+	st = &mapperState{}
+	if got, _ := mapEvent(rawEvent{Type: "message_update", Fields: map[string]any{
+		"assistantMessageEvent": map[string]any{"type": "something_new"},
+	}}, st); len(got) != 0 {
+		t.Fatalf("unknown delta produced %#v, want silence", got)
+	}
+}
+
+func TestSpawn_GenerationIDs(t *testing.T) {
+	t.Parallel()
+	for _, role := range []string{"assistant", "user", "toolResult"} {
+		t.Run(role, func(t *testing.T) {
+			t.Parallel()
+			body := getStateResponse("session") + event(map[string]any{"type": "message_end", "message": map[string]any{"role": role, "responseId": "response-one"}}) + event(map[string]any{"type": "agent_settled"})
+			_, h, _, err := launchScripted(t, scriptedLaunch{spec: agent.Spec{Prompt: "hi"}, preSpawn: handshakeEvent("h1"), body: body})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = h.Stop(t.Context()) })
+			var ids []string
+			for _, ev := range drain(t, h) {
+				if e, ok := ev.(agent.SystemEvent); ok && e.GenerationID != "" {
+					ids = append(ids, e.GenerationID)
+				}
+			}
+			if role == "assistant" {
+				if len(ids) != 1 || ids[0] != "response-one" {
+					t.Fatalf("generation ids = %v; want response-one", ids)
+				}
+			} else if len(ids) != 0 {
+				t.Fatalf("non-assistant generation ids = %v", ids)
+			}
+		})
+	}
+}
+
+func TestUsageFixture_AnthropicReasoningNotReported(t *testing.T) {
+	t.Parallel()
+	body, err := os.ReadFile("testdata/anthropic-messages-usage.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), string(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, results := 0, 0
+	for _, ev := range drain(t, h) {
+		var wireValue any
+		switch v := ev.(type) {
+		case agent.LlmCallEvent:
+			calls++
+			if v.InputTokens != 40 || v.CachedInputTokens != 60 || v.CacheWriteTokens != 10 || v.OutputTokens != 50 || v.ReasoningTokens != 0 {
+				t.Errorf("unexpected call usage: %+v", v)
+			}
+			wireValue = v
+		case agent.ResultEvent:
+			results++
+			if v.Cost == nil {
+				t.Fatal("missing terminal usage")
+			}
+			want := agent.CostData{InputTokens: 40, CachedInputTokens: 60, CacheWriteTokens: 10, OutputTokens: 50, NumTurns: 1}
+			if *v.Cost != want {
+				t.Errorf("terminal usage = %+v; want %+v", *v.Cost, want)
+			}
+			wireValue = v.Cost
+		default:
+			continue
+		}
+		wire, err := json.Marshal(wireValue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(wire), "reasoningTokens") {
+			t.Errorf("protocol does not report reasoning; field must be omitted: %s", wire)
+		}
+	}
+	if calls != 1 || results != 1 {
+		t.Errorf("calls/results = %d/%d; want 1/1", calls, results)
 	}
 }

@@ -105,6 +105,17 @@ count, and a suite that quietly starts skipping protects nothing.
   `sahilm/fuzzy`, `joho/godotenv`, `santhosh-tekuri/jsonschema/v6`. No other
   direct dependencies without stated compelling justification.
 
+## Agent commit identity
+
+Before committing here, clear inherited `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
+`GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` overrides. For every agent commit,
+set neutral Git configuration explicitly with
+`git -c user.name="Donmai Agent" -c user.email="agent@donmai.dev" commit ...`.
+Set the matching neutral `GIT_AUTHOR_*` and `GIT_COMMITTER_*` identity
+environment variables when running `make guard`. Never include seat names or
+tracker identifiers in identities.
+CI and `make guard` validate identities using `scripts/guard-b-lint.sh`'s rule table.
+
 ## Iron rules
 
 - Errors: `fmt.Errorf("context: %w", err)`; sentinel errors in

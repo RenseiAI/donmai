@@ -43,13 +43,16 @@ type Spec struct {
 	// Env is applied on top of the parent process environment as KEY=VALUE
 	// overrides (last-wins). TERM=xterm-256color and COLORTERM=truecolor are
 	// the interactive defaults even when the parent carries different values;
-	// explicit entries in Env override those defaults.
+	// explicit entries in Env override those defaults. When neither the parent
+	// nor Env names a locale (LC_ALL, LC_CTYPE or LANG), LANG=C.UTF-8 is
+	// applied; any explicit locale wins, including LC_ALL=C.
 	Env []string
 
 	// ExactEnv makes Env the child's complete environment: the parent process
-	// environment is not inherited at all. TERM=xterm-256color and
-	// COLORTERM=truecolor still apply as interactive defaults (Env entries
-	// override them), and runner-only controls are still refused. The zero
+	// environment is not inherited at all. TERM=xterm-256color,
+	// COLORTERM=truecolor and (when Env names no locale) LANG=C.UTF-8 still
+	// apply as interactive defaults (Env entries override them), and runner-only
+	// controls are still refused. The zero
 	// value inherits the parent environment as documented on Env. A caller
 	// that builds its child environment from an allowlist sets this, so no
 	// parent name rides around that allowlist.
@@ -158,7 +161,12 @@ func (s Spec) logger() *slog.Logger {
 // composeEnv layers the interactive terminal defaults over the parent
 // environment, then applies Spec.Env last. Parent TERM/COLORTERM values describe
 // the process that launched donmai, not the child PTY contract; only explicit
-// per-request overrides may replace the interactive defaults. The existing
+// per-request overrides may replace the interactive defaults. A UTF-8 locale
+// default (LANG=C.UTF-8) is applied when no layer names a locale: a daemon
+// launched without a locale (no LANG, LC_ALL or LC_CTYPE) would otherwise
+// exec children that decode multi-byte output as single bytes. Any explicit
+// locale wins, including LC_ALL=C — C.UTF-8 only changes the codeset, every
+// other category keeps its C behaviour. The existing
 // runtime blocklist also applies to the inherited parent so a previously
 // filtered runner environment cannot be undone by this final os.Environ merge —
 // except for the names the supervising daemon declared it injected on purpose
@@ -203,7 +211,30 @@ func composeEnv(parent, overrides []string) []string {
 	for _, kv := range overrides {
 		put(kv, false)
 	}
+	if !hasExplicitLocale(idx, out) {
+		put("LANG=C.UTF-8", false)
+	}
 	return out
+}
+
+// hasExplicitLocale reports whether the composed environment already names a
+// locale. LC_ALL, LC_CTYPE and LANG are the only names consulted, in that
+// precedence order at runtime; any non-empty value counts, including LC_ALL=C
+// or LANG=C. An empty or bare entry is treated as unset: the C library skips
+// empty locale variables, so leaving a bare LANG= in place would keep the
+// child on single-byte decoding while suppressing the default that fixes it.
+func hasExplicitLocale(idx map[string]int, out []string) bool {
+	for _, key := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
+		at, ok := idx[key]
+		if !ok {
+			continue
+		}
+		entry := out[at]
+		if i := strings.IndexByte(entry, '='); i >= 0 && entry[i+1:] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // parentEnv returns the environment the child inherits beneath Env: this
