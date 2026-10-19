@@ -124,7 +124,7 @@ func TestProbeHostSessionLogin(t *testing.T) {
 	}{
 		{
 			name:    "model rejection proves the login",
-			body:    `echo "agent loop failed: model failed: model ` + "`x`" + ` does not exist or you lack access" >&2; exit 1`,
+			body:    `echo "agent loop failed: model failed: model ` + hostLoginProbeModel + ` does not exist or you lack access" >&2; exit 1`,
 			wantErr: false,
 		},
 		{
@@ -301,3 +301,58 @@ func isNotAuthenticatedErr(err error) bool {
 	}
 	return false
 }
+
+// TestProbeHostSessionLogin_RequiresProbeModelID pins the F3 verdict:
+// a "does not exist" line that is NOT the probe's own model rejection
+// refuses. A credential-store failure ("keychain item does not exist")
+// or a rejection naming some other model proves nothing about the
+// login, so the check must not count it. RED proof: drop the
+// hostLoginProbeModel requirement from the verdict and both cases
+// below prove the login instead of refusing.
+func TestProbeHostSessionLogin_RequiresProbeModelID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("native probe test shells out to testdata scripts")
+	}
+	writeProbe := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "fake-muse")
+		script := "#!/bin/bash\n" + body + "\n"
+		if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+			t.Fatal(err)
+		}
+		return path
+	}
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "credential store does-not-exist refuses",
+			body: `echo "keychain item does not exist" >&2; exit 1`,
+		},
+		{
+			name: "rejection naming another model refuses",
+			body: `echo "agent loop failed: model failed: model some-other-model does not exist or you lack access" >&2; exit 1`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bin := writeProbe(t, tt.body)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := probeHostSessionLoginWithEnv(ctx, bin, []string{"PATH=" + os.Getenv("PATH"), "NO_COLOR=1"}); err == nil {
+				t.Errorf("a does-not-exist line without the probe model id %q must refuse, got nil", hostLoginProbeModel)
+			}
+		})
+	}
+}
+
+// TestProbeHostSessionLogin_OversizeOutputRefuses pins the probe's
+// output bound (M21): a child that buries the login-proven verdict past
+// 16 KiB of junk refuses instead of proving the login — the verdict
+// text is present in the child's full output, but the bound truncates
+// it away. RED proof: remove the bound and the full output carries the
+// marker, so the probe passes instead of refusing.

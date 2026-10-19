@@ -179,8 +179,16 @@ func probeHostSessionLoginWithEnv(ctx context.Context, binary string, env []stri
 		return errHostSessionLogin
 	}
 	combined := stdout.String() + "\n" + stderr.String()
+	// The login-proven verdict requires the probe's OWN model id in the
+	// matched line: the host must be rejecting the model THIS probe asked
+	// for. A bare "does not exist" (for example a credential-store
+	// "keychain item does not exist") proves nothing about the login
+	// and refuses below. The probe model id is unresolvable by
+	// construction, so the host can only name it when it got past
+	// authentication to model validation.
+	hasProbeModel := strings.Contains(combined, hostLoginProbeModel)
 	switch {
-	case strings.Contains(combined, "does not exist") || strings.Contains(combined, "lack access"):
+	case hasProbeModel && (strings.Contains(combined, "does not exist") || strings.Contains(combined, "lack access")):
 		// The host authenticated and rejected the MODEL: login proven.
 		return nil
 	case strings.Contains(combined, "missing meta credentials") || strings.Contains(combined, "no login"):

@@ -74,7 +74,11 @@ func writeMuseShim(t *testing.T, shim string) string {
 	bin := filepath.Join(dir, "fake-muse")
 	body := "#!/bin/bash\n" +
 		"if [[ \"$1\" == \"--version\" ]]; then echo \"Muse Code 1.4.6 (1.4.6-R6000.1)\"; exit 0; fi\n" +
-		"if [[ \"$1\" == \"exec\" ]]; then echo \"model `x` does not exist or you lack access\" >&2; exit 1; fi\n" +
+		// The login-proven line must name the probe's own unresolvable model
+		// id (muse.hostLoginProbeModel): the verdict requires it. This
+		// literal must match that constant; if they drift, the muse login
+		// check refuses and the muse rows below fail loudly.
+		"if [[ \"$1\" == \"exec\" ]]; then echo \"model donmai-login-probe-nonexistent-model does not exist or you lack access\" >&2; exit 1; fi\n" +
 		"exec \"" + shim + "\"\n"
 	if err := os.WriteFile(bin, []byte(body), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
