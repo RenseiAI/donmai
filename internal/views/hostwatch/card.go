@@ -194,7 +194,7 @@ func cardRows(t theme.Theme, card SessionCard, frame int, plain bool, now time.T
 		if card.Errored {
 			status = append(status, segment{" · errored", lipgloss.NewStyle().Foreground(t.StatusError)})
 		}
-		activity = card.activitySegments(now, indent, primary, tertiary)
+		activity = card.activitySegments(now, indent+card.streamingIndicator(now, plain), primary, tertiary)
 	}
 
 	rows := [][]segment{identity, context, model, status, activity}
@@ -203,6 +203,27 @@ func cardRows(t theme.Theme, card SessionCard, frame int, plain bool, now time.T
 		out[i] = truncateWidth(joinSegments(segs, plain), inner)
 	}
 	return out
+}
+
+// streamFrames is the streaming indicator's spinner; one frame per
+// stream-progress signal, so it freezes when deltas stop arriving.
+var streamFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// streamStallAfter clears the streaming indicator when no stream-progress
+// signal arrived for this long.
+const streamStallAfter = 15 * time.Second
+
+// streamingIndicator is the activity-row lead while a response streams:
+// a spinner frame advanced by each stream-progress signal, or a static
+// word in plain output so piped snapshots do not change per delta.
+func (c SessionCard) streamingIndicator(now time.Time, plain bool) string {
+	if c.streamingAt.IsZero() || now.Sub(c.streamingAt) >= streamStallAfter {
+		return ""
+	}
+	if plain {
+		return "streaming · "
+	}
+	return streamFrames[c.streamTicks%len(streamFrames)] + " streaming · "
 }
 
 // activitySegments renders the last-activity row: how long ago the session
