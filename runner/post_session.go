@@ -64,7 +64,7 @@ func (r *Runner) runPostSession(parentCtx context.Context, qw QueuedWork, res *R
 	// gate via the gate.merge workflow node regardless of this flag.
 	hasMergeQueueAdapter := qw.hasCapability(CapabilityMergeQueue)
 
-	decision := resolveTargetStatus(workType, res.Status, workResult, hasMergeQueueAdapter)
+	decision := resolveTargetStatus(workType, res.Status, workResult, hasMergeQueueAdapter, qw.WorkTypeRole)
 
 	// Mirror the decision onto the result envelope before any side
 	// effect so the caller sees the chosen branch even if the proxy

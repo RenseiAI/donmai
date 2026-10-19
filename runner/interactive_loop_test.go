@@ -24,6 +24,7 @@ import (
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
+	"github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/ptyhost"
@@ -737,6 +738,15 @@ func TestInteractiveInitialPromptLimit(t *testing.T) {
 			name:     "shell PTY seed keeps the canonical bound",
 			manifest: (&shell.Provider{}).Manifest(),
 			want:     maxInitialPromptBytes,
+		},
+		{
+			// The muse positional seed rides a spawned argv element, so
+			// it takes the wide ceiling like the other argv-seeded
+			// harnesses. RED proof: declare any other user delivery on
+			// the interactive profile and the bound collapses to 1,023.
+			name:     "muse PTY seed takes the wide argv ceiling",
+			manifest: (&muse.Provider{}).Manifest(),
+			want:     maxArgvSeedPromptBytes,
 		},
 		{
 			name: "unknown delivery falls back to the canonical bound",

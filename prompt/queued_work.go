@@ -130,7 +130,8 @@ type QueuedWork struct {
 	// WorkType is the work-type discriminant (e.g. "development",
 	// "qa", "research"). Drives template selection in [Builder.Build].
 	// Unknown values fall through to the development template.
-	WorkType string `json:"workType,omitempty"`
+	WorkType     string `json:"workType,omitempty"`
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher. Includes the <issue>, <user>,

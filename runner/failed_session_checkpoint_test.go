@@ -16,7 +16,7 @@ import (
 )
 
 func TestRun_FailedSessionWIPRef(t *testing.T) {
-	for _, scenario := range []string{"dirty", "committed", "clean", "published", "completed", "review", "provider", "reject", "hang", "unsafe"} {
+	for _, scenario := range []string{"dirty", "role", "committed", "clean", "published", "completed", "review", "provider", "reject", "hang", "unsafe"} {
 		t.Run(scenario, func(t *testing.T) {
 			if scenario == "hang" {
 				old := providerErrorCheckpointTimeout
@@ -33,6 +33,10 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 			heads := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/heads")
 			work := queuedWorkBase("checkpoint")
 			work.Repository = bare
+			if scenario == "role" {
+				work.WorkType, work.WorkTypeRole = "custom-builder", "inflight"
+				scenario = "dirty"
+			}
 			if scenario == "review" {
 				work.WorkType = WorkTypeQAStr
 			}
@@ -71,6 +75,9 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 				writeFile(t, cwd, "README.md", "modified\n")
 				writeFile(t, cwd, "new.txt", "untracked\n")
 				if scenario == "dirty" {
+					for _, path := range []string{".env", ".env.local", ".npmrc", "credentials.json", "sub/.pi/session.jsonl"} {
+						writeFile(t, cwd, path, "checkpoint must exclude this\n")
+					}
 					hooks := t.TempDir()
 					gitRun(t, cwd, "config", "core.hooksPath", hooks)
 					//nolint:gosec // Executable test hook in a temporary repository.
@@ -143,6 +150,14 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 				t.Fatalf("checkpoint ref %q is not one per-attempt leaf under %q", posted.Ref, wipPrefix)
 			}
 			sha := gitRun(t, bare, "rev-parse", posted.Ref)
+			if scenario == "dirty" {
+				tree := strings.Split(gitRun(t, bare, "ls-tree", "-r", "--name-only", posted.Ref), "\n")
+				for _, path := range []string{".env", ".env.local", ".npmrc", "credentials.json", "sub/.pi/session.jsonl"} {
+					if slices.Contains(tree, path) {
+						t.Errorf("secret-bearing %q reached checkpoint", path)
+					}
+				}
+			}
 			if scenario == "committed" && sha != commitSHA {
 				t.Fatal("committed-only checkpoint changed HEAD")
 			}

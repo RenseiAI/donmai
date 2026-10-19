@@ -397,7 +397,11 @@ func TestSeatbelt_ToolsWorkInsideTheSet(t *testing.T) {
 // loopback deny: listeners answer on an undeclared loopback port over the
 // numeric IPv4 and IPv6 loopbacks, the confined connects to each fail, and
 // the connects to a declared port succeed — including through the hostname,
-// which may resolve to either family.
+// which may resolve to either family. It also pins the write-proxy shape
+// the issue names: a shell helper reaching the loopback interface stands in
+// for a local write-capable service there, and the connects run through the
+// production spawn entry point (Confiner.prepare plus the wrapped command),
+// not a hand-rendered profile.
 func TestSeatbelt_LoopbackTCPDeclaredPortsOnly(t *testing.T) {
 	openPort := freeLoopbackPort(t)
 	closedPort := freeLoopbackPort(t)

@@ -440,7 +440,7 @@
         "nativeJsonMode": false,
         "toolPermissionFormat": "muse",
         "streamingTransport": "none",
-        "interactivePty": false,
+        "interactivePty": true,
         "multiRepositoryWorkareaProtocols": [
           "session-root-v1"
         ],
@@ -473,6 +473,16 @@
           "contextDelivery": "muse_turn_input",
           "userDelivery": "muse_turn_input",
           "amendmentDelivery": "muse_turn_steer_input"
+        },
+        {
+          "id": "muse/interactive/pty-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "muse_cli_pty_seed",
+          "baseAppendDelivery": "muse_cli_pty_seed",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "muse_cli_pty_seed",
+          "userDelivery": "muse_cli_pty_seed",
+          "amendmentDelivery": "muse_cli_pty_seed"
         }
       ],
       "toolLifecycle": [
@@ -512,12 +522,46 @@
           "cleanupDelivery": "handle_stop_and_resource_cleanup",
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        },
+        {
+          "id": "muse/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
         }
       ],
       "executionSecurity": [
         {
           "mode": "autonomous",
           "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
+        },
+        {
+          "mode": "human_controlled",
+          "toolDenyBaseline": "unavailable",
           "networkDenyBaseline": "unavailable"
         }
       ]
@@ -1997,6 +2041,12 @@
       "harness": "muse",
       "adapterVersion": "muse/headless/tool-lifecycle-v1",
       "mode": "autonomous",
+      "resumeQualified": false
+    },
+    {
+      "harness": "muse",
+      "adapterVersion": "muse/interactive/tool-lifecycle-v1",
+      "mode": "human_controlled",
       "resumeQualified": false
     },
     {

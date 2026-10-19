@@ -14,7 +14,6 @@ var ignoredNotifications = map[string]string{
 	"command/exec/outputDelta":                  "not consumed by the autonomous harness",
 	"configWarning":                             "not consumed by the autonomous harness",
 	"deprecationNotice":                         "not consumed by the autonomous harness",
-	"error":                                     "not consumed by the autonomous harness",
 	"externalAgentConfig/import/completed":      "not consumed by the autonomous harness",
 	"externalAgentConfig/import/progress":       "not consumed by the autonomous harness",
 	"fs/changed":                                "not consumed by the autonomous harness",
@@ -62,7 +61,6 @@ var ignoredNotifications = map[string]string{
 	"thread/realtime/transcript/done":           "not consumed by the autonomous harness",
 	"thread/reverted":                           "not consumed by the autonomous harness",
 	"thread/unarchived":                         "not consumed by the autonomous harness",
-	"warning":                                   "not consumed by the autonomous harness",
 	"windows/worldWritableWarning":              "not consumed by the autonomous harness",
 	"windowsSandbox/setupCompleted":             "not consumed by the autonomous harness",
 }
