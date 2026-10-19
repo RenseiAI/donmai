@@ -10,6 +10,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.82 — 2026-10-19
+
+### Features
+
+- Honor roles for custom work completion
+
+### Chores
+
+- Name the loopback live proof as the write-proxy check in its comment
+- Add three showcase workflow examples and script recordings
+- Bound consecutive pi output-limit turns
+- Redact commit identity diagnostics and verify brand rejection
+- Add structured tracker list filters and archive options
+- Surface Codex diagnostics in session activity
+- Spike alternate snapshot authority behind the terminal seam
+- Default PTY children to a UTF-8 locale when none is set
+
 ## v0.72.81 — 2026-10-18
 
 ### Chores
