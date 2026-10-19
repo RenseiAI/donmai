@@ -136,6 +136,10 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 	}
 	parts := strings.Split(path, "/")
 	basename := parts[len(parts)-1]
+	// Lower once: every rule below compares case-insensitively, so
+	// .ENV, .NPMRC and Credentials.JSON are handled exactly like
+	// their lowercase twins.
+	lower := strings.ToLower(basename)
 	// Harness-state dirs at any depth: each table entry matched as a
 	// whole path component, so a directory that merely shares a prefix
 	// (".pi-cache") stays ordinary project content.
@@ -147,15 +151,16 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 			return true
 		}
 	}
-	if wipSecretBasenames[basename] {
+	if wipSecretBasenames[lower] {
 		return true
 	}
 	// .env and .env.* carry secrets; the example/sample/template
-	// siblings carry placeholders and stay committable.
-	if basename == ".env" || strings.HasPrefix(basename, ".env.") {
-		return !wipSecretEnvExamples[basename]
+	// siblings carry placeholders and stay committable. Compared on the
+	// lowered name: tools and Windows checkouts produce .ENV,
+	// .Env.local and the like, and git preserves the case.
+	if lower == ".env" || strings.HasPrefix(lower, ".env.") {
+		return !wipSecretEnvExamples[lower]
 	}
-	lower := strings.ToLower(basename)
 	// Private keys and credential bundles, matched case-insensitively
 	// so KEY.PEM or Credentials.JSON cannot slip through.
 	for _, ext := range []string{".pem", ".key", ".p12", ".pfx"} {

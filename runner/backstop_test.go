@@ -222,22 +222,31 @@ func TestShouldExcludeFromWIPCheckpoint_Secrets(t *testing.T) {
 		path string
 		want bool
 	}{
-		// .env and .env.* are secrets ...
+		// .env and .env.* are secrets, in any letter case ...
 		{".env", true},
+		{".ENV", true},
 		{".env.local", true},
+		{".Env.local", true},
 		{"service/.env.production", true},
-		// ... except the placeholder siblings.
+		// ... except the placeholder siblings, also in any case.
 		{".env.example", false},
+		{".ENV.EXAMPLE", false},
 		{".env.sample", false},
 		{".env.template", false},
 		{"service/.env.example", false},
-		// Dotfile credentials by exact name.
+		// Dotfile credentials by exact name, in any letter case.
 		{".envrc", true},
+		{".ENVRC", true},
 		{".npmrc", true},
+		{".NPMRC", true},
 		{"service/.npmrc", true},
+		{"service/.NPMRC", true},
 		{".pypirc", true},
+		{".PYPIRC", true},
 		{".netrc", true},
+		{".NETRC", true},
 		{".git-credentials", true},
+		{".GIT-CREDENTIALS", true},
 		// Private keys and credential bundles (case-insensitive).
 		{"tls/server.pem", true},
 		{"tls/SERVER.PEM", true},

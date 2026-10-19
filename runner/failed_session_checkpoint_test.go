@@ -204,10 +204,14 @@ func TestCheckpointFailedSession_ExcludesSecretsFromWIPRef(t *testing.T) {
 	res.Error = "budget exceeded: max-tokens"
 	secrets := map[string]string{
 		".env":                             "SECRET=top\n",
+		".ENV":                             "SECRET=top\n",
 		".env.local":                       "SECRET=top\n",
+		".Env.local":                       "SECRET=top\n",
 		".envrc":                           "export SECRET=top\n",
 		".npmrc":                           "//registry/:_authToken=top\n",
+		".NPMRC":                           "//registry/:_authToken=top\n",
 		".netrc":                           "machine example password top\n",
+		".NETRC":                           "machine example password top\n",
 		".pypirc":                          "password = top\n",
 		".git-credentials":                 "https://user:top@example.test\n",
 		"tls/server.pem":                   "PRIVATE\n",
@@ -318,7 +322,7 @@ func TestCheckpointFailedSession_NeverForcesThePushedRef(t *testing.T) {
 	wipRefAttemptNow = func() time.Time { return time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC) }
 	wipRefAttemptRand = func() string { return "deadbeef" }
 	wantRef := wipAttemptRef(qw.SessionID)
-	unrelated := gitRun(t, wt, "commit-tree", gitRun(t, wt, "rev-parse", "HEAD^{tree}"), "-m", "unrelated")
+	unrelated := gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", gitRun(t, wt, "rev-parse", "HEAD^{tree}"), "-m", "unrelated")
 	gitRun(t, wt, "update-ref", wantRef, unrelated)
 	gitRun(t, wt, "push", "origin", wantRef+":"+wantRef)
 	if got := gitRun(t, bare, "rev-parse", wantRef); got != unrelated {
