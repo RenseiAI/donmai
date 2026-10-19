@@ -167,6 +167,17 @@ func probeHostSessionLoginWithEnv(ctx context.Context, binary string, env []stri
 	cmd := exec.CommandContext(probeCtx, binary, "exec", "--no-session-log", "--model", hostLoginProbeModel, "donmai login probe")
 	cmd.Dir = probeDir
 	cmd.Env = env
+	// The probe owns this child in its own process group: a wedged
+	// binary (or a wrapper that forks helpers) cannot outlive the
+	// probe bound as reparented orphans. CommandContext's default
+	// cancel signals only the leader, so override it with a group
+	// kill — the same discipline the serve child (configureProcessGroup
+	// + signalProcessGroup) already uses.
+	configureProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		signalProcessGroup(cmd, sigKILL())
+		return nil
+	}
 	cmd.WaitDelay = 200 * time.Millisecond
 	var stdout, stderr boundedProbeOutput
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

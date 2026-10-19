@@ -356,3 +356,73 @@ func TestProbeHostSessionLogin_RequiresProbeModelID(t *testing.T) {
 // text is present in the child's full output, but the bound truncates
 // it away. RED proof: remove the bound and the full output carries the
 // marker, so the probe passes instead of refusing.
+func TestProbeHostSessionLogin_OversizeOutputRefuses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("native probe test shells out to testdata scripts")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-muse")
+	script := "#!/bin/bash\n" +
+		`for ((i=0; i<2048; i++)); do echo "junk-padding-line-$i-padding-padding-padding"; done` + "\n" +
+		`echo "agent loop failed: model failed: model ` + hostLoginProbeModel + ` does not exist or you lack access" >&2; exit 1` + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := probeHostSessionLoginWithEnv(ctx, bin, []string{"PATH=" + os.Getenv("PATH"), "NO_COLOR=1"}); err == nil {
+		t.Error("oversize probe output must refuse (bound truncates the verdict away), got nil")
+	}
+}
+
+// TestProbeHostSessionLogin_ScrubsAmbientMetaKey pins the M17 guard
+// through the production probe entry point: with an ambient META_API_KEY
+// in the test process, the fake `exec` dumps the environment it
+// actually ran under, and the key must be absent — the probe inherits
+// only the config locators. The dump also pins the allowlist shape
+// (PATH and NO_COLOR ride along). RED proof: build the probe child env
+// from os.Environ() instead of hostSessionProbeEnv() and the ambient
+// key reaches the child.
+func TestProbeHostSessionLogin_ScrubsAmbientMetaKey(t *testing.T) {
+	if testing.Short() {
+		t.Skip("native probe test shells out to testdata scripts")
+	}
+	t.Setenv("META_API_KEY", "ambient-operator-key")
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "probe.env")
+	bin := filepath.Join(dir, "fake-muse")
+	script := "#!/bin/bash\n" +
+		`env > "` + dump + `"` + "\n" +
+		`echo "missing meta credentials" >&2; exit 1` + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// The probe refuses (missing credentials) — the assertion below is
+	// about the environment the child RAN under, not the verdict.
+	if err := probeHostSessionLogin(ctx, bin); err == nil {
+		t.Fatal("expected the missing-credentials refusal, got nil")
+	}
+	raw, err := os.ReadFile(dump) //nolint:gosec // test temp path
+	if err != nil {
+		t.Fatalf("read probe child env dump: %v", err)
+	}
+	for line := range strings.Lines(string(raw)) {
+		if strings.HasPrefix(line, "META_API_KEY=") {
+			t.Errorf("ambient META_API_KEY reached the probe child: %q", line)
+		}
+	}
+	if !strings.Contains(string(raw), "PATH=") {
+		t.Errorf("probe child env lost PATH (allowlist shape changed):\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "NO_COLOR=1") {
+		t.Errorf("probe child env lost NO_COLOR (allowlist shape changed):\n%s", raw)
+	}
+}
