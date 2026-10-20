@@ -33,7 +33,7 @@ func TestInteractiveArgs(t *testing.T) {
 		want   []string
 	}{
 		{name: "empty prompt starts bare TUI", prompt: "", want: seed},
-		{name: "non-empty prompt seeds the TUI", prompt: "fix the failing tests", want: append(slices.Clone(seed), "fix the failing tests")},
+		{name: "non-empty prompt seeds the TUI", prompt: "fix the failing tests", want: append(slices.Clone(seed), "--", "fix the failing tests")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,31 +76,31 @@ func TestInteractiveArgs_SessionNameResumeGating(t *testing.T) {
 	}{
 		{
 			name: "empty name unchanged",
-			want: append(slices.Clone(seed), "coordinate"),
+			want: append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "fresh custom name never invokes resume",
 			sessionName: "chief-of-staff",
 			interactive: &agent.InteractiveSpec{},
-			want:        append(slices.Clone(seed), "coordinate"),
+			want:        append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "fresh platform-canonical id-shaped name never invokes resume",
 			sessionName: "3105355a",
 			interactive: &agent.InteractiveSpec{},
-			want:        append(slices.Clone(seed), "coordinate"),
+			want:        append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "nil Interactive with a name still defaults to fresh, never resume",
 			sessionName: "chief-of-staff",
 			interactive: nil,
-			want:        append(slices.Clone(seed), "coordinate"),
+			want:        append(slices.Clone(seed), "--", "coordinate"),
 		},
 		{
 			name:        "explicit attach-to-existing resumes by name",
 			sessionName: "chief-of-staff",
 			interactive: &agent.InteractiveSpec{ResumeExisting: true},
-			want:        append(append([]string{"resume"}, seed...), "chief-of-staff", "coordinate"),
+			want:        append(append([]string{"resume"}, seed...), "--", "chief-of-staff", "coordinate"),
 		},
 	}
 	for _, tt := range tests {
@@ -114,6 +114,82 @@ func TestInteractiveArgs_SessionNameResumeGating(t *testing.T) {
 				t.Fatalf("interactiveArgs = %q; want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestInteractiveArgs_SeedEndsOptionParsing proves the seed is preceded
+// by `--` and stays the last element whatever its first characters: a
+// plain seed, a seed starting with `-`, a seed starting with `--model x`,
+// and a seed equal to a subcommand word all reach the TUI as the seed
+// instead of being parsed as a flag or starting a subcommand.
+func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	seeds := []string{
+		"fix the failing tests",
+		"-fix the failing tests",
+		"--model x fix the failing tests",
+		"resume",
+		"exec",
+		"config",
+	}
+	for _, seed := range seeds {
+		t.Run(seed, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Cwd: workspace, Prompt: seed})
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs = %q, want the seed preceded by --", got)
+			}
+			if last := got[len(got)-1]; last != seed {
+				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, seed, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+}
+
+// TestInteractiveArgs_NoSeedGainsNoEndOfOptions pins that a launch without
+// a seed carries no trailing `--`.
+func TestInteractiveArgs_NoSeedGainsNoEndOfOptions(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	for _, spec := range []agent.Spec{
+		{Cwd: workspace},
+		{Cwd: workspace, SessionName: "chief-of-staff"},
+		{Cwd: workspace, SessionName: "chief-of-staff", Interactive: &agent.InteractiveSpec{ResumeExisting: true}},
+	} {
+		got := interactiveArgs(spec)
+		if slices.Contains(got, "--") {
+			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no --", spec, got)
+		}
+	}
+}
+
+// TestInteractiveArgs_ResumeSeedEndsOptionParsingBeforeTheName pins the
+// resume argv shape `resume <flags> -- <name> <seed>`: both positionals
+// follow the `--`, and the seed stays last.
+func TestInteractiveArgs_ResumeSeedEndsOptionParsingBeforeTheName(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	spec := agent.Spec{
+		Cwd: workspace, SessionName: "chief-of-staff", Prompt: "coordinate",
+		Interactive: &agent.InteractiveSpec{ResumeExisting: true},
+	}
+	got := interactiveArgs(spec)
+	if len(got) == 0 || got[0] != "resume" {
+		t.Fatalf("resume argv = %q, want it to start with resume", got)
+	}
+	dash := slices.Index(got, "--")
+	if dash < 0 {
+		t.Fatalf("resume argv = %q, want a -- before the positionals", got)
+	}
+	if want := append([]string(nil), got[dash:]...); !reflect.DeepEqual(want, []string{"--", "chief-of-staff", "coordinate"}) {
+		t.Fatalf("resume positionals = %q, want [-- chief-of-staff coordinate] (full argv: %q)", want, got)
+	}
+	if last := got[len(got)-1]; last != "coordinate" {
+		t.Fatalf("last resume argv element = %q, want the seed (full argv: %q)", last, got)
 	}
 }
 
@@ -175,10 +251,10 @@ func TestSpawnInteractivePrepared_WindowsNameGatePrecedesBinarySideEffects(t *te
 func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T) {
 	t.Parallel()
 	got := remoteInteractiveArgs(
-		[]string{"resume", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"},
+		[]string{"resume", "--config", `model="gpt-5.6-sol"`, "--", "chief-of-staff", "coordinate"},
 		"unix:///tmp/codex.sock",
 	)
-	want := []string{"resume", "--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"}
+	want := []string{"resume", "--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "--", "chief-of-staff", "coordinate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
 	}
@@ -192,10 +268,10 @@ func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T)
 func TestRemoteInteractiveArgs_FreshSessionPrependsRemoteWithoutResume(t *testing.T) {
 	t.Parallel()
 	got := remoteInteractiveArgs(
-		[]string{"--config", `model="gpt-5.6-sol"`, "coordinate"},
+		[]string{"--config", `model="gpt-5.6-sol"`, "--", "coordinate"},
 		"unix:///tmp/codex.sock",
 	)
-	want := []string{"--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "coordinate"}
+	want := []string{"--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "--", "coordinate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
 	}
@@ -205,7 +281,7 @@ func TestAppServerConfigArgs_ProjectsOnlyConfigAuthority(t *testing.T) {
 	t.Parallel()
 	got := appServerConfigArgs([]string{
 		"resume", "--config", `model="gpt-5.6-sol"`, "--add-dir", "/work/other",
-		"--config", `mcp_servers={}`, "--strict-config", "chief-of-staff", "coordinate",
+		"--config", `mcp_servers={}`, "--strict-config", "--", "chief-of-staff", "coordinate",
 	})
 	want := []string{"--config", `model="gpt-5.6-sol"`, "--config", `mcp_servers={}`, "--strict-config"}
 	if !reflect.DeepEqual(got, want) {
@@ -433,7 +509,7 @@ func TestBuildInteractiveLaunch_EmptyMCPAddsNoOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := append(launchSeedPrefixFor(t, workspace), "hello")
+	want := append(launchSeedPrefixFor(t, workspace), "--", "hello")
 	if !slices.Equal(launch.argv, want) || slices.Contains(launch.argv, "--strict-config") {
 		t.Fatalf("empty MCP launch = %q, want %q", launch.argv, want)
 	}
@@ -600,6 +676,160 @@ func writeFakeCodexScript(t *testing.T, script string) string {
 		t.Fatal(err)
 	}
 	return bin
+}
+
+// TestSpawn_SeedEndingOptionParsingReachesPTYChild is the load-bearing
+// proof that the production spawn path carries the seed for a leading-dash
+// prompt: the fake PTY client role records its own argv, and the test
+// asserts the seed follows `--` as the last element. RED proof: drop the
+// `--` in buildInteractiveLaunch and the seed-adjacent element is no
+// longer `--`.
+func TestSpawn_SeedEndingOptionParsingReachesPTYChild(t *testing.T) {
+	t.Parallel()
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	const seed = "--model x fix the bug"
+	recordDir := t.TempDir()
+	h, err := SpawnInteractive(context.Background(), Options{CodexBin: bin}, agent.Spec{
+		Cwd:    t.TempDir(),
+		Prompt: seed,
+		Env: map[string]string{
+			codexFakePTYClientEnv:                         "1",
+			codexFakePTYClientRecordArgvEnv:               recordDir,
+			codexFakePTYClientWantSeedAdjacentDashDashEnv: "1",
+			codexFakePTYClientWantSeedEnv:                 seed,
+		},
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("SpawnInteractive: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	var terminal *agent.ResultEvent
+	deadline := time.After(15 * time.Second)
+drain:
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				break drain
+			}
+			if result, ok := ev.(agent.ResultEvent); ok {
+				terminal = &result
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake codex exit")
+		}
+	}
+	// The fake child exits non-zero when its inline seed assertion fails
+	// (seed not last, or not preceded by `--`), so a regression that drops
+	// the `--` fails here even before the recorded-argv read below.
+	if terminal == nil {
+		t.Fatal("events channel closed without a terminal ResultEvent")
+	}
+	if !terminal.Success {
+		t.Fatalf("fake codex child failed its inline seed assertion: %+v", *terminal)
+	}
+	raw, err := os.ReadFile(filepath.Join(recordDir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read recorded argv: %v", err)
+	}
+	if text := strings.TrimSuffix(string(raw), "\n"); !strings.HasSuffix(text, "--\n"+seed) {
+		t.Fatalf("child argv does not end with -- plus the seed %q: %q", seed, text)
+	}
+}
+
+// TestSpawn_ResumeSeedEndingOptionParsingReachesPTYChild pins the resume
+// argv shape through the production spawn path: the attach-path PTY child
+// must see `resume <flags> -- <name> <seed>`, with both positionals after
+// the `--` and the seed last. The fake bootstrap app-server proves the
+// attach target exists; the fake PTY client role records its own argv for
+// the parent to assert on. RED proof: drop the `--` in
+// buildInteractiveLaunch's resume branch and the recorded tail no longer
+// carries `-- <name> <seed>`.
+func TestSpawn_ResumeSeedEndingOptionParsingReachesPTYChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named interactive sessions are unix-only (validateNamedInteractiveTransport)")
+	}
+	clearInteractiveCodexAuthEnv(t)
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	root := t.TempDir()
+	boundaryRoot := filepath.Join(root, "session-boundaries")
+	workdir := filepath.Join(root, "work")
+	for _, dir := range []string{boundaryRoot, workdir} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	mcpServers := []agent.MCPServerConfig{{
+		Name: "donmai-platform",
+		Type: "http",
+		URL:  "https://platform.example.com/api/mcp/sess_project",
+		Headers: map[string]string{
+			"Authorization": "Bearer session-mcp-bearer",
+		},
+	}}
+	// A thread-id-shaped session name: the attach path requires it (the
+	// resume RPC takes a thread id, never a human-assigned name).
+	const name = testThreadUUID
+	const seed = "--model x fix the bug"
+	recordDir := t.TempDir()
+	spec := agent.Spec{
+		SessionName: name,
+		Cwd:         workdir,
+		Prompt:      seed,
+		MCPServers:  mcpServers,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24, ResumeExisting: true},
+		Env: map[string]string{
+			codexFakePTYClientEnv:           "1",
+			codexFakePTYClientRecordArgvEnv: recordDir,
+			codexFakePTYClientWantSeedEnv:   seed,
+			// No WANT_SEED_ADJACENT_DASHDASH: on the resume path the
+			// element before the seed is the session name (`-- <name>
+			// <seed>`), so the child's `--`-adjacency check does not
+			// apply; the `-- <name> <seed>` tail is asserted below.
+		},
+	}
+	h := spawnInteractiveForUsageTestWithSpec(t, self, boundaryRoot, workdir, mcpServers, map[string]string{
+		codexFakeNamedAppServerResumeThreadEnv: name,
+	}, nil, spec)
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	var terminal *agent.ResultEvent
+	deadline := time.After(30 * time.Second)
+drain:
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				break drain
+			}
+			if result, ok := ev.(agent.ResultEvent); ok {
+				terminal = &result
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake codex attach exit")
+		}
+	}
+	if terminal == nil {
+		t.Fatal("events channel closed without a terminal ResultEvent")
+	}
+	if !terminal.Success {
+		t.Fatalf("fake codex attach child failed: %+v", *terminal)
+	}
+	raw, err := os.ReadFile(filepath.Join(recordDir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read recorded argv: %v", err)
+	}
+	if text := strings.TrimSuffix(string(raw), "\n"); !strings.HasSuffix(text, "--\n"+name+"\n"+seed) {
+		t.Fatalf("attach child argv does not end with -- <name> <seed>: %q", text)
+	}
 }
 
 // TestSpawnInteractive_RunsFakeCLIUnderPTY proves SpawnInteractive drives the

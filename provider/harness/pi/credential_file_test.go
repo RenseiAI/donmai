@@ -638,6 +638,9 @@ func TestHeadlessSpawn_GatewayBearerAbsentFromChildEnv(t *testing.T) {
 		_, err := p.Spawn(ctx, agent.Spec{
 			Cwd:    workdir,
 			Prompt: "prove gateway bearer rides file not env",
+			// A gateway cell always carries its configured context window;
+			// without one the spawn gate refuses before the child starts.
+			ProviderConfig: map[string]any{"contextWindow": 1_000_000},
 			Endpoint: &agent.EndpointBinding{
 				Company:  agent.CompanyOpenAI,
 				Model:    "served-model",

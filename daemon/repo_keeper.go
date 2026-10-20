@@ -128,6 +128,17 @@ func (k *RepoKeeper) Root() string {
 	return k.store.StateDir()
 }
 
+// Close releases the keeper's store root handle. Outstanding leases stay
+// valid until their own Release; Acquire after Close degrades to a plain
+// clone. The daemon calls it when a reconcile replaces the keeper and at
+// shutdown, so each rebuilt store does not leak one root fd.
+func (k *RepoKeeper) Close() error {
+	if k == nil || k.store == nil {
+		return nil
+	}
+	return k.store.Close()
+}
+
 // Ready reports whether the catalog has reconciled and the keeper is serving
 // mirrors. While false, Acquire degrades to a plain clone.
 func (k *RepoKeeper) Ready() bool {
@@ -183,36 +194,40 @@ func (k *RepoKeeper) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-// Acquire resolves remote to its mirror directory. ok=false means the caller
-// must degrade to a plain clone: the keeper is disabled, still reconciling,
-// the scope did not resolve, the mirror is revoked or fails verification,
-// or the budget is exhausted. An existing verified mirror is always served;
-// the budget gates creation of new mirrors only.
+// Acquire resolves remote to a lease on its mirror. ok=false means the
+// caller must degrade to a plain clone: the keeper is disabled, still
+// reconciling, the scope did not resolve, the mirror is revoked or fails
+// verification, or the budget is exhausted. An existing verified mirror is
+// always served; the budget gates creation of new mirrors only.
+//
+// The lease holds the mirror's shared maintenance lock until Release, so
+// the verify-then-use window stays closed while the caller seeds from the
+// directory. The caller must Release; a nil lease degrades like ok=false.
 //
 // The daemon lock is held only for the ready/budget/revoked checks: the
 // store call below may clone over the network and must never run under it.
-func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok bool) {
+func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (lease *repokeeper.Lease, ok bool) {
 	if k == nil || !k.settings.Enabled || k.store == nil {
-		return "", false
+		return nil, false
 	}
 	scope, err := k.scope(ctx, remote)
 	if err != nil {
 		slog.Warn("repo keeper: scope resolution failed; degrading to plain clone", "err", err)
-		return "", false
+		return nil, false
 	}
 	if scope == "" {
 		slog.Warn("repo keeper: empty scope; degrading to plain clone")
-		return "", false
+		return nil, false
 	}
 	digest, err := repokeeper.MirrorDigest(remote, scope)
 	if err != nil {
-		return "", false
+		return nil, false
 	}
 
 	k.mu.Lock()
 	if !k.ready {
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	// One catalog snapshot drives every gate below: a revoked row, an
 	// unreadable catalog, or an over-budget new mirror all degrade. The
@@ -223,7 +238,7 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 		// Revocation and usage are unknown: degrade rather than serve a
 		// possibly-revoked mirror or admit past an unknown budget.
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	var self *repokeeper.MirrorEntry
 	var total int64
@@ -235,7 +250,7 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 	}
 	if self != nil && self.Revoked {
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	if self == nil && k.settings.MaxBytes > 0 && total >= k.settings.MaxBytes {
 		// At the budget the keeper stops creating mirrors: evict the
@@ -243,20 +258,22 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 		// clone even after evicting. Existing mirrors keep serving.
 		k.evictLocked(entries)
 		k.mu.Unlock()
-		return "", false
+		return nil, false
 	}
 	k.mu.Unlock()
 
 	// A revoked row or an unreadable catalog degrades above; the store
 	// re-verifies identity, scope, and live origin before serving, and
-	// refuses symlinks, foreign content, and empty non-repositories.
+	// refuses symlinks, foreign content, and empty non-repositories. The
+	// returned lease holds the shared maintenance lock until the caller
+	// releases it.
 	var storeAuth repokeeper.GitAuth
 	if k.auth != nil {
 		storeAuth = repokeeper.GitAuth(k.auth)
 	}
-	dir, err = k.store.EnsureWithAuth(ctx, remote, scope, storeAuth)
+	lease, err = k.store.EnsureWithAuth(ctx, remote, scope, storeAuth)
 	if err != nil {
-		return "", false
+		return nil, false
 	}
 
 	k.mu.Lock()
@@ -266,7 +283,7 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (dir string, ok
 	if err := k.store.TouchUse(digest, now); err != nil {
 		slog.Warn("repo keeper: record mirror use failed", "err", err)
 	}
-	return dir, true
+	return lease, true
 }
 
 // RecordFetch notes a completed mirror fetch: last-fetch advances, bytes and
@@ -374,13 +391,18 @@ func (k *RepoKeeper) Events() []RepoKeeperEvent {
 
 // evictLocked removes mirrors with no in-flight seed, least recently used
 // first, until the keeper is within budget. A zero MaxBytes evicts nothing.
-// The caller holds k.mu and passes its catalog snapshot; the store call
-// drops the catalog row and deletes outside the per-mirror lock, so
-// eviction never stalls serving mirrors.
+// The caller holds k.mu and passes its catalog snapshot. Removal is
+// non-blocking: a mirror whose lease is held (in this or another process
+// sharing the state dir) is skipped as a victim for this pass, so
+// eviction never waits on a lease while holding k.mu and never stalls
+// serving mirrors. The recursive delete runs outside the per-mirror lock.
 func (k *RepoKeeper) evictLocked(entries []repokeeper.MirrorEntry) {
 	if k.settings.MaxBytes <= 0 || k.store == nil {
 		return
 	}
+	// Victims skipped as lease-held this pass: without the set the
+	// picker would return the same oldest victim forever.
+	skipped := make(map[string]bool)
 	for {
 		var total int64
 		for _, e := range entries {
@@ -389,7 +411,7 @@ func (k *RepoKeeper) evictLocked(entries []repokeeper.MirrorEntry) {
 		if total < k.settings.MaxBytes {
 			return
 		}
-		victim := k.oldestEvictableLocked(entries)
+		victim := k.oldestEvictableLocked(entries, skipped)
 		if victim == "" {
 			return
 		}
@@ -399,9 +421,16 @@ func (k *RepoKeeper) evictLocked(entries []repokeeper.MirrorEntry) {
 				victimBytes = e.Bytes
 			}
 		}
-		if err := k.store.Remove(victim); err != nil {
+		removed, err := k.store.TryRemove(victim)
+		if err != nil {
 			slog.Warn("repo keeper: evict mirror failed", "err", err)
 			return
+		}
+		if !removed {
+			// A lease is outstanding: treat the victim as in-flight
+			// for this pass and try the next-oldest mirror.
+			skipped[victim] = true
+			continue
 		}
 		delete(k.lastUse, victim)
 		kept := entries[:0]
@@ -417,14 +446,14 @@ func (k *RepoKeeper) evictLocked(entries []repokeeper.MirrorEntry) {
 }
 
 // oldestEvictableLocked returns the least-recently-used digest with no
-// in-flight seed, or "" when every mirror is pinned by a seed. The caller
-// holds k.mu.
-func (k *RepoKeeper) oldestEvictableLocked(entries []repokeeper.MirrorEntry) string {
+// in-flight seed and not in skipped (lease-held victims from this
+// eviction pass), or "" when every mirror is pinned. The caller holds k.mu.
+func (k *RepoKeeper) oldestEvictableLocked(entries []repokeeper.MirrorEntry, skipped map[string]bool) string {
 	var victim string
 	var victimAt time.Time
 	first := true
 	for _, e := range entries {
-		if k.inflight[e.Digest] > 0 {
+		if k.inflight[e.Digest] > 0 || skipped[e.Digest] {
 			continue
 		}
 		at := e.LastUse
