@@ -56,14 +56,6 @@ type mapperState struct {
 	sawAgentEnd bool
 	endSuccess  bool
 	settled     bool
-
-	// retryStarts counts auto_retry_start events since the turn's last
-	// boundary (turn_start or the previous turn_end). The next turn_end
-	// stamps Attempts = retryStarts+1 (the initial attempt plus every
-	// harness auto-retry) and resets the count, so each call carries its
-	// own serving attempts. A retry storm that never reaches a turn_end
-	// simply dies with the state.
-	retryStarts int
 }
 
 // mapEvent translates one pi event (or command response) into zero or more
@@ -255,14 +247,12 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			}
 		}
 		st.accTurns++
-		// Attempts is always positive here: the initial serving attempt
-		// plus every auto-retry start since the turn's last boundary.
-		// A turn that needed no retry reports 1 (one attempt, observed),
-		// never 0 (unknown). The counter resets so the next turn starts
-		// clean; a retry storm that never reaches a turn_end dies with
-		// the state.
-		attempts := st.retryStarts + 1
-		st.retryStarts = 0
+		// Attempts is 1 per model request: a failed attempt emits its own
+		// turn_end (followed by agent_end{willRetry} and auto_retry_start),
+		// so the retry surfaces as its own error call and the session sum
+		// still counts every attempt. The counter-free form holds against
+		// the pinned binary's real order, where a turn_start follows each
+		// auto_retry_start and would reset any per-call accumulator.
 		return []agent.Event{agent.LlmCallEvent{
 			System: stringField(msg, "provider", "system"),
 			Model:  stringField(msg, "model"),
@@ -278,7 +268,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			UsageSource:     agent.LlmUsageProvider,
 			ObservedCostUsd: cost,
 			TurnCompleted:   true,
-			Attempts:        attempts,
+			Attempts:        1,
 		}}, false
 
 	case "agent_end":
@@ -325,25 +315,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 
 	case "auto_retry_start", "auto_retry_end",
 		"compaction_start",
-		"queue_update", "message_start":
-		if ev.Type == "auto_retry_start" {
-			// Counted per call: the next turn_end stamps Attempts =
-			// retryStarts+1. The SystemEvent still carries the attempt
-			// payload in Raw for the runner's log trail.
-			st.retryStarts++
-		}
-		return []agent.Event{agent.SystemEvent{
-			Subtype: ev.Type,
-			Message: stringField(f, "message"),
-			Raw:     raw(ev),
-		}}, false
-
-	case "turn_start":
-		// A retried low-level run opens a fresh turn: attempts counted
-		// against the failed attempt must not leak into the retry's own
-		// call. turn_end (above) is the other boundary; whichever fires,
-		// the count restarts.
-		st.retryStarts = 0
+		"queue_update", "message_start", "turn_start":
 		return []agent.Event{agent.SystemEvent{
 			Subtype: ev.Type,
 			Message: stringField(f, "message"),

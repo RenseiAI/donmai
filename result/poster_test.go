@@ -1546,14 +1546,14 @@ func TestPosterPost_StatusServingReportSerialized(t *testing.T) {
 		want     map[string]any // nil value = field absent
 	}{
 		{
-			name:     "gateway turn with retries",
-			provider: "donmai", model: "served-model-id", attempts: 4,
-			want: map[string]any{"finalProvider": "donmai", "finalModel": "served-model-id", "providerAttempts": float64(4)},
+			name:     "observed response provider with retries",
+			provider: "served-provider", model: "served-model-id", attempts: 4,
+			want: map[string]any{"finalProvider": "served-provider", "finalModel": "served-model-id", "providerAttempts": float64(4)},
 		},
 		{
-			name:     "direct turn, single attempt",
-			provider: "anthropic", model: "requested-alias", attempts: 1,
-			want: map[string]any{"finalProvider": "anthropic", "finalModel": "requested-alias", "providerAttempts": float64(1)},
+			name:     "observed response provider, single attempt",
+			provider: "other-provider", model: "requested-alias", attempts: 1,
+			want: map[string]any{"finalProvider": "other-provider", "finalModel": "requested-alias", "providerAttempts": float64(1)},
 		},
 		{
 			name: "nothing observed omitted",

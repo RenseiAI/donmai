@@ -329,14 +329,17 @@ type statusRequest struct {
 	// without an endpoint error — old platforms ignore it.
 	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
 
-	// FinalProvider names the serving provider the session's model calls
-	// last reported (the gateway on a gateway-routed session, the direct
-	// provider otherwise) — the answer to "which upstream provider
-	// served". FinalModel is the served model id paired with it, and
-	// ProviderAttempts totals the serving attempts behind the session's
-	// calls (1 plus harness auto-retries per call, summed over calls
-	// that reported; zero means no call reported). Additive;
-	// omitted when empty/zero — old platforms ignore them.
+	// FinalProvider names the provider the session's model calls last
+	// identified from native response evidence
+	// (LlmCallEvent.ResponseModelProvider) — the provider the wire
+	// response itself named. FinalModel is the served model id paired
+	// with it, and ProviderAttempts totals the serving attempts behind
+	// the session's calls (1 per model request, summed over calls that
+	// reported; zero means no call reported). Empty when no call carried
+	// response-provider evidence — never the configured selection
+	// (LlmCallEvent.System), which names the admitted entry even on a
+	// gateway-routed session. Additive; omitted when empty/zero — old
+	// platforms ignore them.
 	FinalProvider    string `json:"finalProvider,omitempty"`
 	FinalModel       string `json:"finalModel,omitempty"`
 	ProviderAttempts int    `json:"providerAttempts,omitempty"`

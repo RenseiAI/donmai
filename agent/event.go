@@ -267,11 +267,12 @@ type LlmCallEvent struct {
 	// Synthetic usage, tool results and text output never set it.
 	TurnCompleted bool `json:"turnCompleted,omitempty"`
 
-	// Attempts counts the serving attempts behind this call: 1 plus the
-	// harness's auto-retries since the turn's last boundary. Zero means
-	// the harness did not report (unknown) — never "zero attempts" —
-	// so consumers sum only positive values and omit an all-unknown
-	// session total.
+	// Attempts counts the serving attempts behind this call. Pi reports 1
+	// per model request: a harness auto-retry that fails surfaces as its
+	// own error call, so the session total (the sum over calls) still
+	// counts every attempt. Zero means the harness did not report
+	// (unknown) — never "zero attempts" — so consumers sum only positive
+	// values and omit an all-unknown session total.
 	Attempts int `json:"attempts,omitempty"`
 
 	// StartTimeUnixNano and EndTimeUnixNano use decimal strings so JSON
