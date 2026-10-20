@@ -22,6 +22,27 @@ const (
 	StatusBeaconTeardown  = "teardown"
 )
 
+// beaconPostTimeout bounds one beacon POST independent of the injected
+// HTTP client: the runner always injects its own client (30 s default),
+// so without this bound a blackholed progress endpoint would hold the
+// beacon worker — and, before the async rework, the run loop itself —
+// for the full client timeout per post. Five seconds is generous for a
+// tiny beacon body and keeps a hung endpoint from stalling teardown.
+//
+// beaconCloseTimeout bounds Close's wait for the worker to drain the
+// terminal post. Best-effort: on expiry Close returns and the run
+// proceeds — a beacon outage must never fail the session.
+const (
+	beaconPostTimeout  = 5 * time.Second
+	beaconCloseTimeout = 10 * time.Second
+)
+
+// beaconQueueSize bounds the worker mailbox. A run posts at most a
+// handful of beacons (spawning, streaming, steering, backstop, terminal),
+// so 16 never fills in practice; a full queue drops the step rather than
+// blocking the caller.
+const beaconQueueSize = 16
+
 // terminalBeaconStep maps the run's terminal Result onto its beacon step:
 // the Result Status word when set (completed/failed/stopped), "failed"
 // when the result carries a failure the status has not caught up with yet.
@@ -57,20 +78,32 @@ func terminalBeaconStep(res *Result) string {
 // step transition, or kill the session. Construction failure is likewise
 // a warn-and-continue: the run is unaffected.
 //
+// Async: Report never performs network I/O on the caller's goroutine.
+// The caller (run loop, provider event consumer) only decides the cadence
+// under a mutex and hands the step to a single worker goroutine through a
+// latest-wins mailbox. The worker serializes posts — so a mid-run step can
+// never land after the terminal step — and bounds every post with
+// beaconPostTimeout, independent of the injected client's Timeout (which
+// may be 30 s or unset entirely). Close enqueues the terminal step,
+// shuts the worker down, and waits up to beaconCloseTimeout.
+//
 // Terminal beacon: the runLoop defers Close, which posts the final step
 // (completed, failed, or stopped) even when the interval gate would
 // otherwise swallow it — the descriptor must not keep showing a mid-run
-// phase after the session ended.
+// phase after the session ends.
 type statusBeaconReporter struct {
 	beacon   *statusbeacon.Beacon
 	interval time.Duration
 	now      func() time.Time
 
 	mu       sync.Mutex
-	pending  string // latest reported step not yet posted
+	pending  string // latest reported step not yet enqueued
 	lastPost time.Time
 	timer    *time.Timer
 	closed   bool
+
+	queue      chan string
+	workerDone chan struct{}
 }
 
 // newStatusBeaconReporter builds the per-session reporter. interval <= 0
@@ -132,19 +165,50 @@ func newStatusBeaconReporterWith(qw QueuedWork, interval time.Duration, now func
 	if err != nil {
 		return nil
 	}
-	return &statusBeaconReporter{
-		beacon:   beacon,
-		interval: interval,
-		now:      now,
+	s := &statusBeaconReporter{
+		beacon:     beacon,
+		interval:   interval,
+		now:        now,
+		queue:      make(chan string, beaconQueueSize),
+		workerDone: make(chan struct{}),
+	}
+	go s.run()
+	return s
+}
+
+// run is the single beacon worker: it posts enqueued steps serially,
+// each bounded by beaconPostTimeout, until the queue closes. Serial
+// execution is the ordering guarantee — the terminal step Close enqueues
+// last is posted last, and no timer callback can slip a stale step past
+// it once Close has shut the mailbox.
+func (s *statusBeaconReporter) run() {
+	defer close(s.workerDone)
+	for step := range s.queue {
+		ctx, cancel := context.WithTimeout(context.Background(), beaconPostTimeout)
+		s.beacon.Report(ctx, step)
+		cancel()
 	}
 }
 
-// Report records a step change. When the interval has elapsed since the
-// last POST it posts synchronously on the caller's goroutine; otherwise it
-// parks the step as pending and arms a timer for the remainder, coalescing
-// further changes into the latest step. A repeat of the already-posted
-// step is a no-op. Nil-safe: a nil reporter drops the step.
-func (s *statusBeaconReporter) Report(ctx context.Context, step string) {
+// enqueueLocked hands step to the worker without blocking the caller.
+// Caller holds mu; the send never blocks because a full mailbox drops the
+// step instead — beacons are best-effort observability, never worth
+// stalling the run loop for.
+func (s *statusBeaconReporter) enqueueLocked(step string) {
+	select {
+	case s.queue <- step:
+	default:
+	}
+}
+
+// Report records a step change without blocking on the network. When the
+// interval has elapsed since the last enqueue it hands the step to the
+// worker immediately (stamping the slot first, so concurrent callers cannot
+// both see the gate open); otherwise it parks the step as pending and arms
+// a timer for the remainder, coalescing further changes into the latest
+// step. A repeat of the already-posted step is a no-op. Nil-safe: a nil
+// reporter drops the step. A Report after Close is dropped.
+func (s *statusBeaconReporter) Report(_ context.Context, step string) {
 	if s == nil {
 		return
 	}
@@ -153,17 +217,23 @@ func (s *statusBeaconReporter) Report(ctx context.Context, step string) {
 		return
 	}
 	s.mu.Lock()
-	if normalized == s.lastPostedLocked() {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.closed {
 		return
 	}
-	if s.closed {
-		s.mu.Unlock()
+	if normalized == s.beacon.LastStep() || normalized == s.pending {
+		// Already posted, or already the parked latest step: nothing new.
+		// The pending check keeps a repeat of the parked step from
+		// re-arming work; the timer already owns it.
+		if normalized == s.beacon.LastStep() {
+			return
+		}
+		s.pending = normalized
 		return
 	}
 	if s.now().Sub(s.lastPost) >= s.interval {
-		s.mu.Unlock()
-		s.post(ctx, normalized)
+		s.lastPost = s.now()
+		s.enqueueLocked(normalized)
 		return
 	}
 	s.pending = normalized
@@ -174,57 +244,91 @@ func (s *statusBeaconReporter) Report(ctx context.Context, step string) {
 		}
 		s.timer = time.AfterFunc(wait, func() {
 			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.closed {
+				s.timer = nil
+				s.pending = ""
+				return
+			}
 			step := s.pending
 			s.pending = ""
 			s.timer = nil
-			s.mu.Unlock()
-			if step != "" {
-				s.post(context.Background(), step)
+			if step == "" {
+				return
 			}
+			if step == s.beacon.LastStep() {
+				return
+			}
+			s.lastPost = s.now()
+			s.enqueueLocked(step)
 		})
 	}
-	s.mu.Unlock()
 }
 
 // Close posts the terminal step unconditionally (bypassing the interval
 // gate so the descriptor never keeps a mid-run phase after the session
-// ends), stops the coalescing timer, and drops any pending step it
-// supersedes. Nil-safe.
-func (s *statusBeaconReporter) Close(ctx context.Context, step string) {
+// ends), stops the coalescing timer, drops any pending step it
+// supersedes, shuts the worker down, and waits up to beaconCloseTimeout
+// for the terminal post to drain. Best-effort: on timeout Close returns
+// and the run proceeds. Nil-safe. Idempotent: the second call returns
+// without posting.
+func (s *statusBeaconReporter) Close(_ context.Context, step string) {
 	if s == nil {
 		return
 	}
+	normalized, ok := statusbeacon.NormalizeStep(step)
+	if !ok {
+		s.shutdown()
+		return
+	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
 	}
 	s.pending = ""
 	s.closed = true
-	s.mu.Unlock()
-	normalized, ok := statusbeacon.NormalizeStep(step)
-	if !ok {
-		return
-	}
 	if !s.beacon.ShouldPost(normalized) {
+		close(s.queue)
+		s.mu.Unlock()
+		s.wait()
 		return
 	}
-	s.post(ctx, normalized)
-}
-
-// lastPostedLocked returns the beacon's last posted step. Caller holds mu.
-func (s *statusBeaconReporter) lastPostedLocked() string {
-	return s.beacon.LastStep()
-}
-
-// post performs one beacon POST and stamps lastPost on every attempt —
-// success or failure. The interval is the beacon's backoff: a down
-// endpoint is retried at most once per interval no matter how often the
-// step changes, while the terminal Close bypasses the gate so the final
-// step still lands.
-func (s *statusBeaconReporter) post(ctx context.Context, step string) {
-	s.beacon.Report(ctx, step)
-	s.mu.Lock()
 	s.lastPost = s.now()
+	s.enqueueLocked(normalized)
+	close(s.queue)
 	s.mu.Unlock()
+	s.wait()
+}
+
+// shutdown closes a reporter that has nothing terminal to post (blank
+// step): it stops the timer, marks closed, drains the worker, and
+// returns without posting.
+func (s *statusBeaconReporter) shutdown() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+	s.pending = ""
+	s.closed = true
+	close(s.queue)
+	s.mu.Unlock()
+	s.wait()
+}
+
+// wait blocks up to beaconCloseTimeout for the worker to drain.
+func (s *statusBeaconReporter) wait() {
+	select {
+	case <-s.workerDone:
+	case <-time.After(beaconCloseTimeout):
+	}
 }

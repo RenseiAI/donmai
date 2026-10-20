@@ -197,10 +197,8 @@ func New(cfg Config) (*Beacon, error) {
 // skips the post rather than stamping an empty descriptor.
 func NormalizeStep(step string) (string, bool) {
 	single := collapseWhitespace(step)
-	if single == "" || len(single) > MaxStepLength {
-		if len(single) > MaxStepLength {
-			single = truncateStep(single)
-		}
+	if len(single) > MaxStepLength {
+		single = truncateStep(single)
 	}
 	if single == "" {
 		return "", false

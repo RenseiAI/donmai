@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
@@ -122,6 +123,11 @@ type recordingPlatformServer struct {
 	// beaconFail, when true, makes every /progress post answer 500 so a
 	// test can prove the run continues with no failure.
 	beaconFail bool
+	// beaconHang, when positive, makes every /progress post sleep that
+	// long before answering, so a test can prove beacon posts never
+	// block the run loop: the worker's own timeout bounds the wait,
+	// not the endpoint.
+	beaconHang time.Duration
 }
 
 // terminalStatus returns the last terminal /status body the double received,
@@ -199,6 +205,7 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 			body, _ := io.ReadAll(r.Body)
 			rec.mu.Lock()
 			fail := rec.beaconFail
+			hang := rec.beaconHang
 			if !fail {
 				rec.beacons = append(rec.beacons, body)
 			}
@@ -208,6 +215,12 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 				select {
 				case notify <- struct{}{}:
 				default:
+				}
+			}
+			if hang > 0 {
+				select {
+				case <-time.After(hang):
+				case <-r.Context().Done():
 				}
 			}
 			if fail {
