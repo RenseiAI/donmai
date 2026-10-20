@@ -210,6 +210,28 @@ func TestProviderPinEnvContextWindow(t *testing.T) {
 	}
 }
 
+// TestProviderPinEnvGatewayLane pins the lane mark the extension reads
+// because it cannot see the host itself: a gateway binding exports "1",
+// every other shape exports an explicit clearing entry (present but empty)
+// so an inherited value can never survive as a stale lane mark.
+// RED proof: export the mark only for gateway (omit otherwise) and the
+// clearing rows fail; stop exporting it for gateway and the gateway row fails.
+func TestProviderPinEnvGatewayLane(t *testing.T) {
+	t.Parallel()
+	gateway := gatewayCell(agent.ProtoOpenAIChat, nil, 1_000_000)
+	if got := providerPinEnv(gateway); !containsEnv(got, piGatewayEnvVar, "1") {
+		t.Errorf("gateway pin env missing %s=1: %v", piGatewayEnvVar, got)
+	}
+	direct := gatewayCell(agent.ProtoOpenAIChat, nil, 1_000_000)
+	direct.Endpoint.Host = agent.HostDirect
+	if got := providerPinEnv(direct); !containsEnv(got, piGatewayEnvVar, "") {
+		t.Errorf("direct pin env must carry an explicit clearing entry for %s: %v", piGatewayEnvVar, got)
+	}
+	if got := providerPinEnv(agent.Spec{Model: "claude-x"}); !containsEnv(got, piGatewayEnvVar, "") {
+		t.Errorf("unbound pin env must carry an explicit clearing entry for %s: %v", piGatewayEnvVar, got)
+	}
+}
+
 // TestExtensionReadsContextWindowEnv pins the Go↔extension env contract by
 // name: the embedded policy extension's source must read the exact variable
 // providerPinEnv exports (there is no TS test harness for the embedded
@@ -494,6 +516,11 @@ func TestRequireContextWindow(t *testing.T) {
 	nonGateway := gatewayCell(agent.ProtoOpenAIChat, nil, nil)
 	nonGateway.Endpoint.Host = agent.HostDirect
 	nonGateway.Endpoint.BaseURL = "https://api.openai.com/v1"
+	// A gateway binding with no BaseURL selects no injected provider
+	// (injectedProviderSelected is false), so it is admitted even without
+	// a window: pi resolves the provider from its own config.
+	unboundGateway := gatewayCell(agent.ProtoOpenAIChat, nil, nil)
+	unboundGateway.Endpoint.BaseURL = ""
 	native := gatewayCell(agent.ProtoAnthropicMessages, nil, nil)
 	native.Endpoint = nil
 	native.Model = "anthropic/claude-x"
@@ -512,6 +539,7 @@ func TestRequireContextWindow(t *testing.T) {
 		{name: "gateway with output limit but no window is refused", spec: gatewayCell(agent.ProtoAnthropicMessages, float64(64000), nil), want: true},
 		{name: "gateway with both limits is admitted", spec: gatewayCell(agent.ProtoAnthropicMessages, float64(64000), 1_000_000)},
 		{name: "non-gateway injected route without a window is admitted", spec: nonGateway},
+		{name: "gateway binding with no BaseURL selects no injected provider and is admitted", spec: unboundGateway},
 		{name: "a model pi serves natively is admitted", spec: native},
 	}
 	for _, tc := range cases {
@@ -574,15 +602,34 @@ func TestSpawn_RefusesMissingContextWindowBeforeAnyChild(t *testing.T) {
 		}
 		drain(t, h)
 	})
+	t.Run("non-gateway injected route without a window spawns", func(t *testing.T) {
+		t.Parallel()
+		// The refusal keys on the gateway lane alone: a direct injected
+		// cell with no window is admitted at spawn (the extension registers
+		// it with no window, and the serving endpoint's own limit applies).
+		// RED proof: drop the HostGateway gate in requireContextWindow and
+		// this spawn is refused.
+		spec := gatewayCell(agent.ProtoOpenAIChat, nil, nil)
+		spec.Endpoint.Host = agent.HostDirect
+		spec.Endpoint.BaseURL = "https://api.openai.com/v1"
+		_, h, err := spawnScripted(t, spec,
+			handshakeEvent("h1"), getStateResponse("ses_direct")+event(map[string]any{"type": "agent_settled"}))
+		if err != nil {
+			t.Fatalf("Spawn of a non-gateway injected route without a window: %v", err)
+		}
+		drain(t, h)
+	})
 }
 
 // TestExtensionRefusesMissingContextWindow activates the REAL embedded
-// extension without the context-window pin: no provider is registered (there
-// is deliberately no default), and the refusal is surfaced as a session-start
-// notification naming the missing window — never a silent run on a guessed
-// 200000. The control registers the configured window. RED proof: restore the
-// `contextWindowEnv : 200000` fallback in the extension and the refusal case
-// below goes red — a provider registers with the guessed window.
+// extension without the context-window pin on the gateway lane: no provider
+// is registered (there is deliberately no default), and the refusal is
+// surfaced as a session-start notification naming the missing window — never
+// a silent run on a guessed 200000. Off the gateway lane the same missing
+// value registers with no window, and the serving endpoint's own limit
+// applies. The control registers the configured window. RED proof: restore
+// the `contextWindowEnv : 200000` fallback in the extension and the refusal
+// case below goes red — a provider registers with the guessed window.
 func TestExtensionRefusesMissingContextWindow(t *testing.T) {
 	t.Parallel()
 	// The test process itself may run with DONMAI_PI_* vars set (a session
@@ -596,6 +643,11 @@ func TestExtensionRefusesMissingContextWindow(t *testing.T) {
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
 		piAPIEnvVar + "=openai-completions",
+		// The gateway lane mark selects which rule the extension applies:
+		// it cannot see the host itself. "1" refuses a missing window;
+		// empty registers with no window. Always set explicitly so an
+		// inherited value can never leak in through cmd.Env layering.
+		piGatewayEnvVar + "=1",
 		piThinkingLevelEnvVar + "=",
 		piOutputLimitEnvVar + "=",
 		piPricesBoundEnvVar + "=",
@@ -678,6 +730,68 @@ func TestExtensionRefusesMissingContextWindow(t *testing.T) {
 		model := registeredDonmaiModel(t, out)
 		if cw, _ := model["contextWindow"].(float64); cw != 262144 {
 			t.Errorf("registered contextWindow = %v, want 262144", model["contextWindow"])
+		}
+	})
+	t.Run("non-gateway lane without a window registers with no window", func(t *testing.T) {
+		t.Parallel()
+		// The same missing value off the gateway lane must NOT refuse:
+		// the session stays on the injected provider against the bound
+		// endpoint, with no window pinned, and the serving endpoint's own
+		// limit applies. RED proof: key the extension refusal on the window
+		// alone (drop the gateway-lane gate) and this registers no provider.
+		nonGateway := make([]string, 0, len(base)+1)
+		for _, e := range base {
+			if strings.HasPrefix(e, piGatewayEnvVar+"=") {
+				nonGateway = append(nonGateway, piGatewayEnvVar+"=")
+				continue
+			}
+			nonGateway = append(nonGateway, e)
+		}
+		out := runExtensionFixture(t, append(nonGateway, piContextWindowEnvVar+"="), "read", `{"path":"README.md"}`)
+		model := registeredDonmaiModel(t, out)
+		if _, present := model["contextWindow"]; present {
+			t.Errorf("registered contextWindow = %v, want the key absent off the gateway lane", model["contextWindow"])
+		}
+		// No refusing gate: the offered tool must not be blocked with the
+		// missing-window reason.
+		if verdict, _ := out["verdict"].(map[string]any); verdict != nil {
+			if reason, _ := verdict["reason"].(string); strings.Contains(reason, "context window") {
+				t.Errorf("non-gateway tool_call verdict = %v, want no missing-window refusal", verdict)
+			}
+		}
+	})
+	t.Run("rpc lane records the refusal as the call outcome", func(t *testing.T) {
+		t.Parallel()
+		// RPC mode (handshake token set): the missing-window gate records
+		// its refusal via registerRefusal before blocking, so the Go side
+		// records it as the call's outcome instead of meeting the end event
+		// with no record. RED proof: drop the registerRefusal call and no
+		// refusal reaches the recorder.
+		rpc := make([]string, 0, len(base)+1)
+		for _, e := range base {
+			if strings.HasPrefix(e, piHandshakeEnvVar+"=") {
+				rpc = append(rpc, piHandshakeEnvVar+"=test-token")
+				continue
+			}
+			rpc = append(rpc, e)
+		}
+		out := runExtensionFixture(t, append(rpc, piContextWindowEnvVar+"="), "read", `{"path":"README.md"}`)
+		if providers, _ := out["providers"].([]any); len(providers) != 0 {
+			t.Errorf("registered providers = %v, want none without a context window on the gateway lane", out["providers"])
+		}
+		verdict, _ := out["verdict"].(map[string]any)
+		if block, _ := verdict["block"].(bool); verdict == nil || !block {
+			t.Fatalf("rpc missing-window tool_call verdict = %v, want a block", out["verdict"])
+		}
+		refusals, _ := out["refusals"].([]any)
+		found := false
+		for _, r := range refusals {
+			if payload, _ := r.(map[string]any)["payload"].(string); strings.Contains(payload, "context window") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no registered refusal names the missing context window: %v", out["refusals"])
 		}
 	})
 }

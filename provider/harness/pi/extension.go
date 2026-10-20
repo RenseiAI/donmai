@@ -57,9 +57,11 @@ const (
 	// PiKeyEnvVar; these carry the non-secret routing pin. The context-window
 	// pin is conditional: set only when the resolved profile carries a
 	// positive ProviderConfig["contextWindow"]. A gateway session with no
-	// window is refused at spawn instead (requireContextWindow), so an
-	// unpinned var can never reach the child — the extension also refuses a
-	// missing value rather than running on a guessed default. The output-token
+	// window is refused at spawn instead (requireContextWindow); the gateway
+	// lane pin below tells the extension which lane it is on, since it cannot
+	// see the host itself. A non-gateway injected session without a window
+	// registers with no window (the serving endpoint's own limit applies),
+	// never on a guessed default. The output-token
 	// pin is conditional the same way (ProviderConfig["maxOutputTokens"]),
 	// but it has NO fallback: unset, the extension registers the model without
 	// an output limit, so the serving endpoint's own limit applies. The thinking-level
@@ -70,6 +72,13 @@ const (
 	piAPIEnvVar           = "DONMAI_PI_API"
 	piModelEnvVar         = "DONMAI_PI_MODEL"
 	piContextWindowEnvVar = "DONMAI_PI_CONTEXT_WINDOW"
+	// piGatewayEnvVar marks the gateway lane for the child extension: "1"
+	// when the endpoint binding names the gateway host, empty otherwise
+	// (always exported, so an inherited value can never survive as a stale
+	// lane mark — the same clearing discipline routingPreferencePinEnv
+	// applies). The extension refuses a missing context window only on the
+	// marked lane; it cannot see the host itself.
+	piGatewayEnvVar       = "DONMAI_PI_GATEWAY"
 	piOutputLimitEnvVar   = "DONMAI_PI_MAX_TOKENS"
 	piThinkingLevelEnvVar = "DONMAI_PI_THINKING_LEVEL"
 	piHandshakeEnvVar     = "DONMAI_PI_HANDSHAKE"
@@ -487,9 +496,12 @@ func writeViaCache(digest string, content []byte, destPath string, perm os.FileM
 // resolved profile carries a positive ProviderConfig["contextWindow"] — the
 // key the dispatch bridge produces for both the resolvedProfile and
 // modelProfile wire shapes. Without it the extension refuses to register
-// (extensions/donmai-policy.ts has no default): a gateway session with no
-// window is refused at spawn (requireContextWindow) before the child ever
-// starts, so the pin is never asked to cover a missing value here.
+// only on the gateway lane (piGatewayEnvVar, which it reads because it
+// cannot see the host itself): a gateway session with no window is refused
+// at spawn (requireContextWindow) before the child ever starts, so the pin
+// is never asked to cover a missing gateway value here. A non-gateway
+// injected session without a window registers with no window, and the
+// serving endpoint's own limit applies.
 //
 // The output-token pin (piOutputLimitEnvVar) follows the same rule from
 // ProviderConfig["maxOutputTokens"]. An output limit is configuration the
@@ -524,6 +536,14 @@ func providerPinEnv(spec agent.Spec) []string {
 		piAPIEnvVar + "=" + api,
 		piModelEnvVar + "=" + model,
 	}
+	// The gateway lane mark rides every spawn, set or clearing, so an
+	// inherited value can never survive as a stale lane: "1" exactly when
+	// the binding names the gateway host, empty otherwise.
+	gateway := ""
+	if ep != nil && ep.Host == agent.HostGateway {
+		gateway = "1"
+	}
+	out = append(out, piGatewayEnvVar+"="+gateway)
 	if cw := positiveProviderConfigInt(spec, "contextWindow"); cw > 0 {
 		out = append(out, piContextWindowEnvVar+"="+strconv.Itoa(cw))
 	}

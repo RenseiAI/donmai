@@ -763,14 +763,21 @@ export default async function activate(pi: ExtensionAPI) {
   // Context-window pin: the harness exports the resolved profile's
   // context-window size (tokens) as DONMAI_PI_CONTEXT_WINDOW when the
   // dispatch carried one (extension.go providerPinEnv). A missing or invalid
-  // value registers NO window: the extension refuses to run on a guessed
-  // default (a gateway spawn without one is already refused at spawn by
-  // requireContextWindow), so an unpinned session fails closed instead of
-  // silently clamping a 1M-context model — or overselling a smaller one —
-  // to a historical guess.
+  // value registers NO window. On the gateway lane (DONMAI_PI_GATEWAY, which
+  // the harness sets because this extension cannot see the host itself) a
+  // missing value refuses instead of running on a guessed default: a gateway
+  // spawn without one is already refused at spawn by requireContextWindow,
+  // so reaching here means a bypass — still fail closed rather than silently
+  // clamping a 1M-context model — or overselling a smaller one — to a
+  // historical guess. Off the gateway lane the model registers with no
+  // window, and the serving endpoint's own limit applies.
   const contextWindowEnv = Number(process.env.DONMAI_PI_CONTEXT_WINDOW ?? "");
   const contextWindow =
     Number.isInteger(contextWindowEnv) && contextWindowEnv > 0 ? contextWindowEnv : undefined;
+  // Gateway lane mark: the harness exports "1" exactly when the endpoint
+  // binding names the gateway host (extension.go providerPinEnv, always
+  // exported so an inherited value can never survive as a stale lane).
+  const gatewayLane = process.env.DONMAI_PI_GATEWAY === "1";
   // Output-token pin: the harness exports the resolved profile's per-response
   // output limit as DONMAI_PI_MAX_TOKENS only when the dispatch carried one
   // (extension.go providerPinEnv). There is deliberately NO fallback value:
@@ -869,11 +876,11 @@ export default async function activate(pi: ExtensionAPI) {
     // No endpoint bound: nothing to register the injected provider against.
     // (The harness pins `--provider donmai` only when a BaseURL is bound;
     // without one pi resolves the provider from its own config.)
-  } else if (contextWindow === undefined) {
-    // No context window configured: refuse to register the model on a
-    // guessed default. A gateway spawn without one is already refused at
-    // spawn by the Go harness (requireContextWindow), so reaching here
-    // means a non-gateway injected route with no window — still fail closed
+  } else if (contextWindow === undefined && gatewayLane) {
+    // No context window configured on the gateway lane: refuse to register
+    // the model on a guessed default. A gateway spawn without one is already
+    // refused at spawn by the Go harness (requireContextWindow, which keys
+    // on the same lane), so reaching here means a bypass — still fail closed
     // rather than silently clamping (or overselling) the model's window.
     // In RPC mode the Go handshake gate still blocks every tool until
     // verified, so registering a refusing tool_call gate below is what
@@ -919,7 +926,7 @@ export default async function activate(pi: ExtensionAPI) {
             reasoning: true,
             input: ["text"],
             cost: modelCost,
-            contextWindow,
+            ...(contextWindow === undefined ? {} : { contextWindow }),
             ...(maxTokens === undefined ? {} : { maxTokens }),
             ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
             ...(modelCompat === undefined ? {} : { compat: modelCompat }),

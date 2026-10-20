@@ -187,9 +187,6 @@ func (rp resolvedProfileWire) foldLimits(pc map[string]any, modelProfileMaxOutpu
 // or dropped.
 func providerConfigWithPositiveInt(pc map[string]any, key string, value int) map[string]any {
 	if existing, ok := pc[key]; ok && positiveProviderConfigValue(existing) > 0 {
-		if value <= 0 {
-			return pc
-		}
 		return pc
 	}
 	if value <= 0 {

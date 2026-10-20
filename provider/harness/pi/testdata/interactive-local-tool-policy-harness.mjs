@@ -345,6 +345,7 @@ const dataURL = "data:text/javascript;base64," + Buffer.from(stripped, "utf8").t
 const handlers = {};
 const providers = [];
 const notifications = [];
+const refusals = [];
 const stubPi = {
   registerProvider(name, config) {
     providers.push({ name, config });
@@ -386,7 +387,7 @@ for (const sessionStart of handlers["session_start"] ?? []) {
   } catch {}
 }
 if (toolCallHandlers.length === 0) {
-  console.log(JSON.stringify({ registered: false, verdict: null, providers, environment, notifications }));
+  console.log(JSON.stringify({ registered: false, verdict: null, providers, environment, notifications, refusals }));
   process.exit(0);
 }
 
@@ -407,6 +408,28 @@ if (ctxJSON) {
     ctx = {};
   }
 }
+// In RPC mode (handshake token set) the missing-window gate records its
+// refusal via ctx.ui.input before blocking. The parsed ctx carries no
+// functions, so synthesize the UI channel here: hasUI plus an input stub
+// that records every refusal payload, and a notify capture. In interactive
+// mode (no token) the gate is sync and records nothing — ctx stays as
+// parsed.
+if (process.env.DONMAI_PI_HANDSHAKE) {
+  ctx = {
+    ...ctx,
+    hasUI: true,
+    cwd: ctx.cwd ?? "",
+    ui: {
+      input: async (payload, marker) => {
+        try {
+          refusals.push({ payload: String(payload), marker: String(marker) });
+        } catch {}
+        return "ok";
+      },
+      notify: (message, level) => notifications.push({ message, level }),
+    },
+  };
+}
 
 // Run every registered tool_call handler in registration order, first
 // block verdict wins — the same composition the real runtime runs when two
@@ -416,4 +439,4 @@ for (const handler of toolCallHandlers) {
   const got = await handler({ toolName, input }, ctx);
   if (got != null && verdict == null) verdict = got;
 }
-console.log(JSON.stringify({ registered: true, verdict, providers, environment, notifications }));
+console.log(JSON.stringify({ registered: true, verdict, providers, environment, notifications, refusals }));

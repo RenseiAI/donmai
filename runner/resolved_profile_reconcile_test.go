@@ -330,6 +330,32 @@ func TestReconcileResolvedProfile_ContextWindowPrecedence(t *testing.T) {
 	}
 }
 
+// TestReconcileResolvedProfile_ContextWindowPublicPath drives one precedence
+// row through the public ReconcileResolvedProfile entry point from a JSON
+// wire fixture, proving the fold above is what a real dispatch reaches — not
+// only what the private foldLimits helper computes. RED proof: honor a
+// present-but-bad entry and this reconciles without the window the dispatch
+// carried.
+func TestReconcileResolvedProfile_ContextWindowPublicPath(t *testing.T) {
+	t.Parallel()
+	wire := map[string]any{
+		"harness":       "pi",
+		"provider":      "pi",
+		"model":         "served-model",
+		"contextWindow": 1_000_000,
+		"providerConfig": map[string]any{
+			"contextWindow": "lots",
+		},
+	}
+	qw, err := ReconcileResolvedProfile(QueuedWork{}, nil, marshalFixture(t, wire))
+	if err != nil {
+		t.Fatalf("ReconcileResolvedProfile: %v", err)
+	}
+	if got := qw.ResolvedProfile.ProviderConfig["contextWindow"]; got != 1_000_000 {
+		t.Errorf("reconciled contextWindow = %v, want 1000000 (stale entry must not shadow the top-level window)", got)
+	}
+}
+
 func marshalFixture(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	raw, err := json.Marshal(v)
