@@ -32,7 +32,10 @@ const (
 // beaconCloseTimeout bounds Close's wait for the worker to drain the
 // terminal post. Best-effort: on expiry Close returns and the run
 // proceeds — a beacon outage must never fail the session.
-const (
+//
+// Both are package vars (not consts) so tests can shrink them to pin
+// the bounds without waiting out the production 5s/10s values.
+var (
 	beaconPostTimeout  = 5 * time.Second
 	beaconCloseTimeout = 10 * time.Second
 )

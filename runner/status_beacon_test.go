@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -469,10 +470,14 @@ func TestRun_TerminalBeaconWithRateGateAtRunLevel(t *testing.T) {
 	})
 }
 
-// TestReporter_TerminalIsLast pins the ordering guarantee: a pending
-// mid-run step must never land after the terminal step, and a Report
-// after Close is dropped. Deleting the timer stop / pending clear or the
-// closed flag leaves this RED.
+// TestReporter_TerminalIsLast pins the pending-not-yet-fired half of the
+// ordering guarantee: a parked mid-run step whose coalescing timer has not
+// fired yet must never land after the terminal step, and a Report after
+// Close is dropped. Close stops the timer and clears the parked step, and
+// the timer callback drops its step once the reporter is closed. The
+// in-flight half — a timer post the worker already picked up when Close
+// runs — is pinned by TestReporter_TerminalOrderingWithInFlightPost, which
+// drives the serialized worker rather than the timer.
 func TestReporter_TerminalIsLast(t *testing.T) {
 	t.Parallel()
 	platform := newRecordingPlatformServer(t)
@@ -648,4 +653,228 @@ func TestRun_SteeringAndBackstopBeacons(t *testing.T) {
 			t.Fatalf("no backstop beacon in %q", steps)
 		}
 	})
+}
+
+// TestReporter_PerPostTimeoutBoundsWorkerDrain pins the per-post deadline:
+// with a never-answering endpoint and a client with no Timeout, the worker
+// must still drain (each post bounded by beaconPostTimeout) so workerDone
+// closes promptly after Close. Deleting the per-post context timeout leaves
+// the worker blocked forever and this test RED. Not parallel: it shrinks
+// the package timeout vars.
+func TestReporter_PerPostTimeoutBoundsWorkerDrain(t *testing.T) {
+	oldPost, oldClose := beaconPostTimeout, beaconCloseTimeout
+	beaconPostTimeout = 300 * time.Millisecond
+	beaconCloseTimeout = 5 * time.Second
+	defer func() { beaconPostTimeout, beaconCloseTimeout = oldPost, oldClose }()
+
+	never := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/progress") {
+			_, _ = io.ReadAll(r.Body)
+			// Never answers: the worker's per-post timeout must bound
+			// the wait. The 30s cap only bounds a mutant without that
+			// timeout, so server Cleanup cannot hang forever.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(30 * time.Second):
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(never.Close)
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BEACON-POST-BOUND")}
+	qw.SessionID = "sess-beacon-post-bound"
+	qw.WorkerID = "worker-1"
+	qw.PlatformURL = never.URL
+	// No Timeout: without the worker's own deadline this client blocks
+	// until the endpoint answers, which it never does.
+	r := newStatusBeaconReporterWith(qw, 30*time.Second, time.Now, nil, &http.Client{}, nil)
+	if r == nil {
+		t.Fatal("reporter is nil for valid work")
+	}
+	ctx := context.Background()
+	r.Report(ctx, "streaming")
+	start := time.Now()
+	r.Close(ctx, "completed")
+	if took := time.Since(start); took > beaconCloseTimeout+2*time.Second {
+		t.Fatalf("Close blocked %v; want within the bounded drain (%v)", took, beaconCloseTimeout)
+	}
+	// The worker holds at most two posts (mid-run + terminal); each is
+	// bounded by beaconPostTimeout, so the worker must exit within about
+	// twice that plus scheduling margin. Without the per-post deadline
+	// it never exits.
+	select {
+	case <-r.workerDone:
+	case <-time.After(2*beaconPostTimeout + 3*time.Second):
+		t.Fatalf("worker still blocked %v after Close; want drain within ~2x post timeout (%v)",
+			2*beaconPostTimeout+3*time.Second, beaconPostTimeout)
+	}
+}
+
+// TestReporter_CloseBoundedWithBacklog pins the Close drain deadline: with
+// a backlog longer than beaconCloseTimeout parked on a hung endpoint,
+// Close must return within the bound instead of waiting out every queued
+// post. Dropping the bound leaves Close holding teardown for the full
+// backlog and this test RED. Not parallel: it shrinks the package
+// timeout vars.
+func TestReporter_CloseBoundedWithBacklog(t *testing.T) {
+	oldPost, oldClose := beaconPostTimeout, beaconCloseTimeout
+	beaconPostTimeout = 400 * time.Millisecond
+	beaconCloseTimeout = 400 * time.Millisecond
+	defer func() { beaconPostTimeout, beaconCloseTimeout = oldPost, oldClose }()
+
+	never := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/progress") {
+			_, _ = io.ReadAll(r.Body)
+			// Same 30s Cleanup cap as above: bounds a mutant that
+			// waits the backlog out without the Close deadline.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(30 * time.Second):
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(never.Close)
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BEACON-CLOSE-BOUND")}
+	qw.SessionID = "sess-beacon-close-bound"
+	qw.WorkerID = "worker-1"
+	qw.PlatformURL = never.URL
+	r := newStatusBeaconReporterWith(qw, time.Millisecond, time.Now, nil, &http.Client{}, nil)
+	if r == nil {
+		t.Fatal("reporter is nil for valid work")
+	}
+	ctx := context.Background()
+	// Four distinct steps with the gate open between each, so all four
+	// enqueue behind the worker's hung first post; Close adds the
+	// terminal fifth. Five posts x 400ms = ~2s of work behind a 400ms
+	// bound.
+	for _, step := range []string{"alpha-one", "alpha-two", "alpha-three", "alpha-four"} {
+		r.Report(ctx, step)
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	r.Close(ctx, "completed")
+	if took := time.Since(start); took > beaconCloseTimeout+time.Second {
+		t.Fatalf("Close blocked %v with %d queued posts; want within bound (%v + 1s)",
+			took, 5, beaconCloseTimeout)
+	}
+	// Drain before restoring the package vars: Close timed out by design,
+	// so the worker is still working through the backlog — returning now
+	// would race the restore against its per-post timeout reads.
+	select {
+	case <-r.workerDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("worker did not drain the backlog after Close")
+	}
+}
+
+// TestReporter_PostCloseAndDoubleCloseNoPanic pins the panic guards: a
+// Report after Close (with the interval elapsed, so it would enqueue
+// directly rather than park on the timer) must drop without sending on
+// the closed mailbox, and a second Close must return without closing the
+// mailbox twice. Deleting either guard panics with "send on closed
+// channel".
+func TestReporter_PostCloseAndDoubleCloseNoPanic(t *testing.T) {
+	t.Parallel()
+	platform := newRecordingPlatformServer(t)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BEACON-PANIC-GUARD")}
+	qw.SessionID = "sess-beacon-panic-guard"
+	qw.WorkerID = "worker-1"
+	qw.PlatformURL = platform.URL
+	r := newTestBeaconReporter(t, qw, time.Millisecond, platform)
+	ctx := context.Background()
+	r.Report(ctx, "streaming")
+	waitBeacons(t, platform, 1)
+	r.Close(ctx, "completed")
+	bodies := waitBeacons(t, platform, 2)
+	// Let the interval elapse AFTER Close (which stamped the slot), so
+	// the post-Close Report below takes the direct-enqueue path — the
+	// path that reaches the closed mailbox — rather than parking on the
+	// timer, whose callback guard would also drop it.
+	time.Sleep(10 * time.Millisecond)
+	// Must not panic: Report after Close drops, second Close is a no-op.
+	r.Report(ctx, "steering")
+	r.Close(ctx, "completed")
+	time.Sleep(100 * time.Millisecond)
+	got := platform.beaconPosts()
+	steps := beaconSteps(t, got)
+	if len(steps) != 2 || steps[0] != "streaming" || steps[1] != "completed" {
+		t.Fatalf("steps = %q (from %d bodies, pre-close %d); want [streaming completed] with no post-Close post",
+			steps, len(got), len(bodies))
+	}
+}
+
+// TestReporter_TerminalOrderingWithInFlightPost pins the serialization
+// guarantee for the in-flight case: when the worker already picked up a
+// slow mid-run post as Close runs, the terminal step still lands last.
+// A timer callback that posts directly (bypassing the worker) races the
+// terminal post, so the slow stale step lands after it and this test RED.
+func TestReporter_TerminalOrderingWithInFlightPost(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var completedOrder []string
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/progress") {
+			body, _ := io.ReadAll(r.Body)
+			step := beaconStep(t, body)
+			if step == "steering" {
+				// Slow post already in flight when Close runs; a
+				// direct-posting timer callback would race the fast
+				// terminal post and land this step last.
+				select {
+				case <-time.After(300 * time.Millisecond):
+				case <-r.Context().Done():
+				}
+			}
+			mu.Lock()
+			completedOrder = append(completedOrder, step)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(slow.Close)
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BEACON-INFLIGHT")}
+	qw.SessionID = "sess-beacon-inflight"
+	qw.WorkerID = "worker-1"
+	qw.PlatformURL = slow.URL
+	r := newStatusBeaconReporterWith(qw, 50*time.Millisecond, time.Now, nil, slow.Client(), nil)
+	if r == nil {
+		t.Fatal("reporter is nil for valid work")
+	}
+	ctx := context.Background()
+	r.Report(ctx, "streaming") // enqueued immediately; worker starts it
+	r.Report(ctx, "steering")  // parks as pending (50ms timer)
+	// Timer (50ms) has fired and the worker picked up the slow steering
+	// post, but has not finished it yet.
+	time.Sleep(120 * time.Millisecond)
+	r.Close(ctx, "completed") // terminal enqueues behind steering
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := len(completedOrder)
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			mu.Lock()
+			got := append([]string(nil), completedOrder...)
+			mu.Unlock()
+			t.Fatalf("timed out waiting for 3 beacons; got %q", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	steps := append([]string(nil), completedOrder...)
+	mu.Unlock()
+	if len(steps) != 3 || steps[0] != "streaming" || steps[1] != "steering" || steps[2] != "completed" {
+		t.Fatalf("completion order = %q; want [streaming steering completed] (terminal last)", steps)
+	}
 }
