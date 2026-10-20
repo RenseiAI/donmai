@@ -65,9 +65,10 @@ func terminalBeaconStep(res *Result) string {
 
 // statusBeaconReporter is the runner's per-session current-step beacon:
 // it posts the orchestration phase (spawning, streaming, steering,
-// backstop, teardown, completed, failed, stopped) to the session progress
+// backstop, plus the terminal completed/failed/stopped) to the session progress
 // endpoint so operator surfaces render the agent's own words instead of a
-// derived clause.
+// derived clause. "teardown" is the terminal fallback when the result
+// carries no terminal status — it is never reported as a mid-run step.
 //
 // Cadence: the beacon fires on step CHANGE, bounded to at most one POST
 // per interval (the latest step wins the next slot). The bound keeps a
@@ -109,7 +110,7 @@ type statusBeaconReporter struct {
 	workerDone chan struct{}
 }
 
-// newStatusBeaconReporter builds the per-session reporter. interval <= 0
+// newStatusBeaconReporter builds the per-session reporter. interval == 0
 // falls back to DefaultStatusBeaconInterval; a NEGATIVE interval disables
 // beacon posts entirely (returns nil — Report/Close are no-ops on nil).
 // A nil now falls back to time.Now. Returns nil when beacons stay quiet

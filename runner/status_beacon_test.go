@@ -70,6 +70,12 @@ func newTestBeaconReporter(t *testing.T, qw QueuedWork, interval time.Duration, 
 // scripted session and asserts the beacon cadence: a spawning beacon at
 // run start, a streaming beacon once the provider's init event lands, and
 // a terminal completed beacon when the run ends.
+//
+// The interval is a nanosecond (gate always open) so both mid-run steps
+// enqueue immediately instead of parking on the coalescing timer: with a
+// millisecond interval the streaming step parks, and a fast run's deferred
+// Close drops the parked step before the timer fires — 2 beacons instead
+// of 3 under CI load.
 func TestRun_PostsSpawningStreamingAndTerminalBeacons(t *testing.T) {
 	t.Parallel()
 	platform := newRecordingPlatformServer(t)
@@ -78,7 +84,7 @@ func TestRun_PostsSpawningStreamingAndTerminalBeacons(t *testing.T) {
 	res, _ := runScriptedSession(t, scriptedSession{
 		platform:              platform,
 		workType:              "qa",
-		statusBeaconInterval:  5 * time.Millisecond,
+		statusBeaconInterval:  time.Nanosecond,
 		turns:                 []verdictScriptTurn{{text: "done\n<!-- WORK_RESULT:passed -->"}},
 		stepHeartbeatInterval: 24 * time.Hour, // silence the liveness beat; beacons only
 	})
