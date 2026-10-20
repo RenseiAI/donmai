@@ -3,6 +3,7 @@ package repokeeper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -709,16 +710,13 @@ func TestVerifyRefusesRedirectFiles(t *testing.T) {
 			leaseB.Release()
 
 			target := dirA
-			if redirect == "commondir" {
-				// A commondir file carries the target directory path.
+			switch redirect {
+			case "commondir", "gitdir":
+				// A commondir or gitdir file carries the target directory path.
 				if err := os.WriteFile(filepath.Join(dirB, redirect), []byte(target+"\n"), 0o600); err != nil {
 					t.Fatalf("plant %s: %v", redirect, err)
 				}
-			} else if redirect == "gitdir" {
-				if err := os.WriteFile(filepath.Join(dirB, redirect), []byte(target+"\n"), 0o600); err != nil {
-					t.Fatalf("plant %s: %v", redirect, err)
-				}
-			} else {
+			default:
 				if err := os.MkdirAll(filepath.Join(dirB, "objects", "info"), 0o700); err != nil {
 					t.Fatalf("create objects/info: %v", err)
 				}
@@ -874,8 +872,8 @@ func TestCatalogConcurrentStoresLoseNoUpdates(t *testing.T) {
 	const pairs = 10
 	var wg sync.WaitGroup
 	for i := 0; i < pairs; i++ {
-		digestA := strings.Repeat("a", 62) + string(rune('0'+i/10)) + string(rune('0'+i%10))
-		digestB := strings.Repeat("b", 62) + string(rune('0'+i/10)) + string(rune('0'+i%10))
+		digestA := fmt.Sprintf("%064x", 2*i+1)
+		digestB := fmt.Sprintf("%064x", 2*i+2)
 		wg.Add(2)
 		go func() {
 			defer wg.Done()

@@ -981,12 +981,22 @@ func TestNewSweepsCrashLeftoverStaging(t *testing.T) {
 	}
 	// First start creates the store; the crash is simulated by planting a
 	// credentialed staging sibling the way a kill between clone and
-	// publish would leave it.
+	// publish would leave it. The plants are backdated past the stale
+	// threshold: the restart sweep protects fresh staging, which may
+	// belong to a live concurrent Store sharing the state dir, and reaps
+	// only staging no live process can still own.
 	first, err := New(stateDir, worktreeRoot, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	_ = first
+	past := time.Now().Add(-2 * stagingStaleAfter)
+	backdate := func(path string) {
+		t.Helper()
+		if err := os.Chtimes(path, past, past); err != nil {
+			t.Fatalf("backdate crash staging: %v", err)
+		}
+	}
 	mirrors := filepath.Join(stateDir, keeperDirName, mirrorsDirName)
 	if err := os.MkdirAll(mirrors, 0o700); err != nil {
 		t.Fatalf("create mirrors dir: %v", err)
@@ -1007,6 +1017,10 @@ func TestNewSweepsCrashLeftoverStaging(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(evict, "marker"), []byte(secret), 0o600); err != nil {
 		t.Fatalf("plant evict marker: %v", err)
 	}
+	// Backdate after the contents land: writing inside refreshes the
+	// directory's own mtime, which is what the sweep's age gate reads.
+	backdate(staging)
+	backdate(evict)
 	// A live mirror beside the staging must survive the sweep.
 	srcDir, _ := newSourceRepo(t)
 	liveLease, err := first.Ensure(context.Background(), srcDir, "")

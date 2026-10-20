@@ -977,7 +977,10 @@ func TestRepoKeeper_RestartSweepsCrashStaging(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	// Simulate the kill between clone and publish: a credentialed
-	// staging sibling under the mirrors directory.
+	// staging sibling under the mirrors directory. The plant is backdated
+	// past the stale threshold: the restart sweep protects fresh staging,
+	// which may belong to a live concurrent Store sharing the state dir,
+	// and reaps only staging no live process can still own.
 	mirrors := filepath.Join(stateDir, "repo-keeper", "mirrors")
 	if err := os.MkdirAll(mirrors, 0o700); err != nil {
 		t.Fatalf("create mirrors dir: %v", err)
@@ -988,6 +991,12 @@ func TestRepoKeeper_RestartSweepsCrashStaging(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(staging, "config"), []byte("[remote \"origin\"]\n\turl = https://user:"+secret+"@example.com/org/repo.git\n"), 0o600); err != nil {
 		t.Fatalf("plant crash credential: %v", err)
+	}
+	// Backdate after the contents land: writing inside refreshes the
+	// directory's own mtime, which is what the sweep's age gate reads.
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(staging, past, past); err != nil {
+		t.Fatalf("backdate crash staging: %v", err)
 	}
 
 	// The restart builds a fresh store over the same state dir and

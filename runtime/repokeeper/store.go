@@ -976,39 +976,30 @@ func (s *Store) catalogPath() string {
 	return filepath.Join(s.stateDir, keeperDirName, catalogFileName)
 }
 
-// writeCatalogLocked persists the catalog. The caller holds catalogMu for
-// in-process serialization; the keeper-root flock serializes writers
-// across processes sharing the state dir. Readers need neither: the
-// rename-publish makes every read see the old or the new document, never
-// a torn one.
-//
-// Prefer updateCatalogLocked for read-modify-write updates: it holds the
-// cross-process flock across the read and the write, so two processes
-// cannot both read, modify, and publish with one update lost.
-func (s *Store) writeCatalogLocked(entries []MirrorEntry) error {
-	if err := s.root.MkdirAll(keeperDirName, 0o700); err != nil {
-		return fmt.Errorf("repo keeper: create keeper dir: %w", err)
-	}
-	lock, unlock, err := s.lockCatalog()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = unlock(lock) }()
-	return writeCatalog(s.catalogPath(), entries)
-}
-
 // lockCatalog opens the keeper-root catalog lock and takes the exclusive
 // flock. The caller owns the returned file until unlock runs it. The
 // critical section it guards is short (one catalog read-modify-write);
 // it blocks without a ctx, and a dead holder releases its lock with its
 // file description, so this cannot wedge on a crash.
 func (s *Store) lockCatalog() (*os.File, func(*os.File) error, error) {
-	if err := s.root.MkdirAll(keeperDirName, 0o700); err != nil {
-		return nil, nil, fmt.Errorf("repo keeper: create keeper dir: %w", err)
-	}
-	lock, err := s.root.OpenFile(filepath.Join(keeperDirName, ".catalog.lock"), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, nil, fmt.Errorf("repo keeper: open catalog lock: %w", err)
+	var lock *os.File
+	for attempt := 0; ; attempt++ {
+		if err := s.root.MkdirAll(keeperDirName, 0o700); err != nil {
+			return nil, nil, fmt.Errorf("repo keeper: create keeper dir: %w", err)
+		}
+		var err error
+		lock, err = s.root.OpenFile(filepath.Join(keeperDirName, ".catalog.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+		if err == nil {
+			break
+		}
+		// Two Stores racing first use can both pass MkdirAll yet
+		// resolve the parent before the other's commit lands — the
+		// same transient openMirrorLock retries on — so retry a
+		// bounded number of times rather than failing the update.
+		if !os.IsNotExist(err) || attempt >= 20 {
+			return nil, nil, fmt.Errorf("repo keeper: open catalog lock: %w", err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	fd, err := intFileDescriptor(lock.Fd())
 	if err != nil {

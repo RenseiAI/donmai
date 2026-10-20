@@ -141,13 +141,14 @@ func syscallFlockExclusive(fd int) error {
 // victim instead of stalling the caller (which may hold the keeper lock)
 // until the lease releases.
 func tryLockExclusiveNB(fd int) (bool, error) {
-	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+	err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
 		return true, nil
-	} else if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-		return false, nil
-	} else {
-		return false, fmt.Errorf("repo keeper: take exclusive mirror lock: %w", err)
 	}
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return false, nil
+	}
+	return false, fmt.Errorf("repo keeper: take exclusive mirror lock: %w", err)
 }
 
 // unlockAndClose releases the flock and closes the file. Either half may
