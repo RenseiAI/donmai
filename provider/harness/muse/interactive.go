@@ -467,7 +467,7 @@ func serveEnvMap(env []string) map[string]string {
 //	                   delivery, so nothing is silently dropped)
 //	InitialContext     → prepended to the positional seed after the system
 //	                   append (same delivery, same receipt)
-//	Prompt             → positional argument, ALWAYS LAST
+//	Prompt             → positional argument, ALWAYS LAST, preceded by `--`
 //
 // Deliberately unmapped (admission denies them on this profile — the TUI
 // exposes no channel for them): SessionName (resume <ref> attaches to an
@@ -475,6 +475,34 @@ func serveEnvMap(env []string) map[string]string {
 // PermissionConfig (the approval bridge has no RPC channel in PTY mode),
 // AllowedTools/DisallowedTools (no flat-list grammar on this CLI),
 // MCPServers (no inline-MCP surface outside session/start).
+// museReservedSeeds is the exact command list from `muse --help`
+// (Commands section) plus the meta flags that survive `--` (`muse --
+// --version` prints the version and exits 0, `muse -- config` fails as
+// an unknown argument instead of seeding a session). A seed that is
+// exactly one of these tokens would never run as a session, so it is
+// prefixed with a single space — the same minimal transform the pi
+// harness uses — while every other seed passes through byte for byte.
+// The list is pinned by TestInteractiveArgs_ReservedWordSeedIsNeutralised.
+var museReservedSeeds = map[string]struct{}{
+	"resume": {}, "exec": {}, "config": {}, "export": {},
+	"trace": {}, "model-profile": {}, "skills": {}, "voice": {},
+	"plugins": {}, "sandbox": {}, "schema": {}, "serve": {},
+	"session-message": {}, "mcp": {}, "auth": {}, "login": {},
+	"logout": {}, "init": {},
+	"-h": {}, "--help": {}, "-V": {}, "--version": {},
+}
+
+// museSeedMessage neutralises a positional seed the muse CLI would
+// otherwise misread as a command or meta flag. Only an exact reserved
+// token is touched; every other seed (including dash-leading seeds,
+// which `--` already protects) passes through unchanged.
+func museSeedMessage(seed string) string {
+	if _, reserved := museReservedSeeds[seed]; reserved {
+		return " " + seed
+	}
+	return seed
+}
+
 func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	var argv []string
 	trustWorkspace := p != nil && p.opts.TrustWorkspace
@@ -500,8 +528,12 @@ func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	}
 	// The positional seed is the profile's ONLY user channel: system
 	// append, initial context, then the prompt — each already recorded on
-	// the receipt under muse_cli_pty_seed. It stays LAST so it is never
-	// consumed as the value of a preceding flag.
+	// the receipt under muse_cli_pty_seed. Option parsing ends before it
+	// so a dash-leading seed parses as the seed; a seed that is exactly a
+	// reserved command or meta flag rides through museSeedMessage above
+	// (single leading space) because `--` alone does not stop those
+	// tokens. The seed stays LAST, as today. No seed means no trailing
+	// `--`.
 	seed := spec.Prompt
 	if ctxText := strings.TrimSpace(spec.InitialContext); ctxText != "" {
 		seed = ctxText + "\n\n" + seed
@@ -509,8 +541,9 @@ func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	if sys := strings.TrimSpace(spec.SystemPromptAppend); sys != "" {
 		seed = sys + "\n\n" + seed
 	}
+	seed = museSeedMessage(seed)
 	if strings.TrimSpace(seed) != "" {
-		argv = append(argv, seed)
+		argv = append(argv, "--", seed)
 	}
 	return argv
 }
