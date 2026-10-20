@@ -307,10 +307,11 @@ func systemTemplateNameRaymond(qw QueuedWork) string {
 }
 
 // userTemplateNameRaymond maps a WorkType to the raymond registry template
-// name. Names in the switch keep their legacy template byte-for-byte; a
-// name outside the switch follows its role (review -> user_qa, intake ->
-// user_research, anything else -> user_development), matching
-// [userTemplateName].
+// name. Compiled-in names keep their legacy template byte-for-byte even
+// when a role is stamped alongside them; only an organisation-defined
+// name outside the built-in vocabulary follows its role (review ->
+// user_qa, intake -> user_research, anything else -> user_development),
+// matching [userTemplateName].
 func userTemplateNameRaymond(w WorkType, role string) string {
 	switch w {
 	case WorkTypeQA, WorkTypeAcceptance:
@@ -320,6 +321,9 @@ func userTemplateNameRaymond(w WorkType, role string) string {
 	case WorkTypeDevelopment, "":
 		return "user_development"
 	default:
+		if isKnownWorkTypeName(string(w)) {
+			return "user_development"
+		}
 		return userTemplateNameForRole(role)
 	}
 }
@@ -552,10 +556,11 @@ func resolveContext(qw QueuedWork) string {
 	return strings.Join(lines, "\n")
 }
 
-// userTemplateName maps a WorkType to the user template filename. Names
-// in the switch keep their legacy template byte-for-byte; a name outside
-// the switch follows its role (review -> user_qa, intake ->
-// user_research, anything else -> user_development) so an
+// userTemplateName maps a WorkType to the user template filename.
+// Compiled-in names keep their legacy template byte-for-byte even when a
+// role is stamped alongside them; only an organisation-defined name
+// outside the built-in vocabulary follows its role (review -> user_qa,
+// intake -> user_research, anything else -> user_development) so an
 // organisation-defined review or intake type renders the prompt its role
 // needs. The runner must never crash on an unrecognised value.
 func userTemplateName(w WorkType, role string) string {
@@ -567,8 +572,49 @@ func userTemplateName(w WorkType, role string) string {
 	case WorkTypeDevelopment, "":
 		return "user_development.tmpl"
 	default:
+		if isKnownWorkTypeName(string(w)) {
+			return "user_development.tmpl"
+		}
 		return userTemplateNameForRole(role) + ".tmpl"
 	}
+}
+
+// knownWorkTypeNames is the compiled-in agent work-type vocabulary. A
+// name in this set keeps its legacy template even when the dispatcher
+// stamps a role alongside it — the role selects a template only for
+// organisation-defined names outside this set. Spelled here rather than
+// imported: the runner owns the canonical list (AllWorkTypes) and
+// already imports this package, so an import would cycle. The set must
+// stay equal to runner.AllWorkTypes; the runner-side exhaustive test
+// (every built-in name x every role renders byte-identically to the
+// role-less build) fails if a built-in is missing here.
+var knownWorkTypeNames = map[string]struct{}{
+	"research":                   {},
+	"backlog-creation":           {},
+	"backlog-groomer":            {},
+	"development":                {},
+	"inflight":                   {},
+	"qa":                         {},
+	"acceptance":                 {},
+	"refinement":                 {},
+	"refinement-coordination":    {},
+	"merge":                      {},
+	"security":                   {},
+	"improvement-loop":           {},
+	"outcome-auditor":            {},
+	"ga-readiness":               {},
+	"documentation-steward":      {},
+	"operational-scanner-vercel": {},
+	"operational-scanner-audit":  {},
+	"operational-scanner-ci":     {},
+	"coordination":               {},
+	"inflight-coordination":      {},
+}
+
+// isKnownWorkTypeName reports whether s is a compiled-in work-type name.
+func isKnownWorkTypeName(s string) bool {
+	_, ok := knownWorkTypeNames[s]
+	return ok
 }
 
 // workTypeRoleReview and workTypeRoleIntake are the wire literals of the

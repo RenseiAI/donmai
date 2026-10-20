@@ -506,8 +506,8 @@ func (d *Daemon) applyModelAccessSetLocked(m PendingMutation) error {
 	// mutation surfaces the typo platform-side via the failure ACK.
 	// modelAccess.clear stays unvalidated so legacy bad keys remain removable.
 	if params.Workload != "" && !knownWorkloadKey(params.Workload) {
-		return fmt.Errorf("unknown workload %q: not in the shared workload vocabulary (known keys: %s)",
-			params.Workload, strings.Join(knownWorkloadKeys(), ", "))
+		return fmt.Errorf("unknown workload %q: not a known workload key nor a valid work-type name (lowercase kebab, at most %d characters; known keys: %s)",
+			params.Workload, maxWorkTypeNameLength, strings.Join(knownWorkloadKeys(), ", "))
 	}
 
 	if d.config.ModelAccess == nil {

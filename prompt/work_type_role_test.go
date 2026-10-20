@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/templates"
 )
 
@@ -73,11 +74,13 @@ func TestBuilderBuild_CustomWorkTypeFollowsRole(t *testing.T) {
 	}
 }
 
-// TestBuilderBuild_NamedWorkTypeIgnoresRole proves the legacy switch is
-// authoritative for the names it knows: passing any role alongside a
-// built-in name renders byte-identically to the role-less build. A stray
-// or mismatched role must never move a built-in off its legacy prompt
-// (the RED case is a named case moving).
+// TestBuilderBuild_NamedWorkTypeIgnoresRole proves the built-in vocabulary
+// is authoritative: passing any role alongside a compiled-in name renders
+// byte-identically to the role-less build. It iterates every
+// runner.AllWorkTypes entry (not just the four switch names) so a stray or
+// mismatched role — including the platform-seeded intake/review roles on
+// scanner and auditor types — can never move a built-in off its legacy
+// prompt (the RED case is a built-in moving).
 func TestBuilderBuild_NamedWorkTypeIgnoresRole(t *testing.T) {
 	t.Parallel()
 
@@ -92,15 +95,18 @@ func TestBuilderBuild_NamedWorkTypeIgnoresRole(t *testing.T) {
 		{name: "legacy", new: prompt.NewBuilder},
 		{name: "raymond", new: func() *prompt.Builder { return &prompt.Builder{Registry: reg} }},
 	}
-	named := []string{
-		string(prompt.WorkTypeDevelopment),
-		string(prompt.WorkTypeQA),
-		string(prompt.WorkTypeAcceptance),
-		string(prompt.WorkTypeResearch),
+	// Roles are spelled through the canonical runner constants so a
+	// renamed wire literal is exercised, not a stale copy.
+	roles := []string{
+		"",
+		string(runner.WorkTypeRoleInflight),
+		string(runner.WorkTypeRoleReview),
+		string(runner.WorkTypeRoleIntake),
+		string(runner.WorkTypeRoleTerminal),
+		"not-a-role",
 	}
-	roles := []string{"", "inflight", "review", "intake", "terminal", "not-a-role"}
 	for _, builder := range builders {
-		for _, workType := range named {
+		for _, workType := range runner.AllWorkTypes {
 			for _, role := range roles {
 				t.Run(builder.name+"/"+workType+"/role="+role, func(t *testing.T) {
 					t.Parallel()
@@ -119,10 +125,67 @@ func TestBuilderBuild_NamedWorkTypeIgnoresRole(t *testing.T) {
 						t.Fatalf("Build with role: %v", err)
 					}
 					if gotUser != wantUser {
-						t.Errorf("named work type %q with role %q moved off its legacy prompt", workType, role)
+						t.Errorf("built-in work type %q with role %q moved off its legacy prompt", workType, role)
 					}
 				})
 			}
+		}
+	}
+}
+
+// TestBuilderBuild_RoleLiteralsMatchCanonicalRoles pins the prompt's role
+// wire literals equal to the runner's canonical WorkTypeRole constants: a
+// custom name carrying string(runner.WorkTypeRoleReview) renders
+// byte-identically to qa, Intake to research, and Inflight/Terminal to
+// development. Driven through the canonical constants (never re-spelled
+// literals), so renaming a constant on either side without updating the
+// other goes RED. Both rendering paths are covered.
+func TestBuilderBuild_RoleLiteralsMatchCanonicalRoles(t *testing.T) {
+	t.Parallel()
+
+	reg, err := templates.New()
+	if err != nil {
+		t.Fatalf("templates.New: %v", err)
+	}
+	builders := []struct {
+		name string
+		new  func() *prompt.Builder
+	}{
+		{name: "legacy", new: prompt.NewBuilder},
+		{name: "raymond", new: func() *prompt.Builder { return &prompt.Builder{Registry: reg} }},
+	}
+	cases := []struct {
+		name      string
+		reference string
+		role      runner.WorkTypeRole
+	}{
+		{name: "review", reference: string(prompt.WorkTypeQA), role: runner.WorkTypeRoleReview},
+		{name: "intake", reference: string(prompt.WorkTypeResearch), role: runner.WorkTypeRoleIntake},
+		{name: "inflight", reference: string(prompt.WorkTypeDevelopment), role: runner.WorkTypeRoleInflight},
+		{name: "terminal", reference: string(prompt.WorkTypeDevelopment), role: runner.WorkTypeRoleTerminal},
+	}
+	for _, builder := range builders {
+		for _, tc := range cases {
+			t.Run(builder.name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				reference := fixtureSession()
+				reference.WorkType = tc.reference
+				custom := fixtureSession()
+				custom.WorkType = "peer-review-desk"
+				custom.WorkTypeRole = string(tc.role)
+
+				_, wantUser, err := builder.new().Build(reference)
+				if err != nil {
+					t.Fatalf("Build reference: %v", err)
+				}
+				_, gotUser, err := builder.new().Build(custom)
+				if err != nil {
+					t.Fatalf("Build custom: %v", err)
+				}
+				if gotUser != wantUser {
+					t.Errorf("custom work type with canonical role %q differs from %q", string(tc.role), tc.reference)
+				}
+			})
 		}
 	}
 }

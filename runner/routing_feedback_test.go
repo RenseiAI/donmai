@@ -237,10 +237,66 @@ func TestComputeRoutingReward_CustomNameFollowsRole(t *testing.T) {
 	}
 }
 
+// TestComputeRoutingReward_BuiltinNameWinsOverRole pins the lookup order in
+// computeRoutingReward: a built-in name's own weights row wins over any
+// stamped role. For every AllWorkTypes name x every role x the input grid,
+// the reward with the role must equal the reward with no role. Without
+// this pin, looking up the role representative first would stay GREEN
+// while silently re-scoring built-ins whose role representative carries a
+// different row (for example security scored as development).
+func TestComputeRoutingReward_BuiltinNameWinsOverRole(t *testing.T) {
+	t.Parallel()
+	roles := []string{
+		"",
+		string(WorkTypeRoleInflight),
+		string(WorkTypeRoleReview),
+		string(WorkTypeRoleIntake),
+		string(WorkTypeRoleTerminal),
+		"not-a-role",
+	}
+	for _, workType := range AllWorkTypes {
+		for _, role := range roles {
+			t.Run(workType+"/role="+role, func(t *testing.T) {
+				t.Parallel()
+				for _, completed := range []bool{false, true} {
+					for _, pr := range []bool{false, true} {
+						for _, qa := range []string{"unknown", "failed", "passed"} {
+							for _, cost := range []float64{0, 2.5, 5, 10} {
+								got := computeRoutingReward(workType, role, completed, pr, qa, cost)
+								want := computeRoutingReward(workType, "", completed, pr, qa, cost)
+								if diff := got - want; diff > 1e-9 || diff < -1e-9 {
+									t.Errorf("reward(%s/%s)(%t, %t, %s, %v) = %v, want role-less %v",
+										workType, role, completed, pr, qa, cost, got, want)
+								}
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestRecordRoutingFeedback_RunUsesWorkType(t *testing.T) {
 	t.Setenv("ROUTING_RECORDER_ENABLED", "true")
-	for _, workType := range []string{WorkTypeResearch, WorkTypeQAStr, WorkTypeDevelopmentStr, "unknown-work-type"} {
-		t.Run(workType, func(t *testing.T) {
+	cases := []struct {
+		workType string
+		role     string
+		want     float64
+	}{
+		{WorkTypeResearch, "", 1},
+		{WorkTypeQAStr, "", 0.7},
+		{WorkTypeDevelopmentStr, "", 0.5},
+		{"unknown-work-type", "", 0.5},
+		// A custom review name scores exactly like the qa row: the
+		// production wiring passes the stamped role through to the
+		// reward computation. Spelled through the canonical constant
+		// so a renamed wire literal without a matching routing update
+		// goes RED.
+		{"custom-review-desk", string(WorkTypeRoleReview), 0.7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.workType, func(t *testing.T) {
 			h := newRunnerHarness(t)
 			observations := make(chan routingFeedbackBody, 1)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -257,7 +313,8 @@ func TestRecordRoutingFeedback_RunUsesWorkType(t *testing.T) {
 			}))
 			defer srv.Close()
 			qw := h.queuedWork("routing-reward")
-			qw.WorkType = workType
+			qw.WorkType = tc.workType
+			qw.WorkTypeRole = tc.role
 			qw.PlatformURL = srv.URL
 			// This stub turn completes without a PR, verdict or cost.
 			qw.ResolvedProfile.ProviderConfig = map[string]any{"stub.behavior": string(stub.BehaviorResumeSteer)}
@@ -272,15 +329,8 @@ func TestRecordRoutingFeedback_RunUsesWorkType(t *testing.T) {
 			}
 			select {
 			case got := <-observations:
-				want := 0.5
-				switch workType {
-				case WorkTypeResearch:
-					want = 1
-				case WorkTypeQAStr:
-					want = 0.7
-				}
-				if got.WorkType != workType || math.Abs(got.Reward-want) > 1e-9 {
-					t.Errorf("observation workType=%s reward=%v, want %s reward=%v", got.WorkType, got.Reward, workType, want)
+				if got.WorkType != tc.workType || math.Abs(got.Reward-tc.want) > 1e-9 {
+					t.Errorf("observation workType=%s reward=%v, want %s reward=%v", got.WorkType, got.Reward, tc.workType, tc.want)
 				}
 			default:
 				t.Fatal("Run did not post routing feedback")

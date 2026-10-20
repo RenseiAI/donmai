@@ -331,6 +331,10 @@ func TestApplyPendingMutations_ModelAccessSet_UnknownWorkloadRejected(t *testing
 			if !strings.Contains(failures[0].Error, "development") {
 				t.Errorf("failure.Error = %q, want the known-keys list included", failures[0].Error)
 			}
+			// The error must describe the accepted shape for custom names.
+			if !strings.Contains(failures[0].Error, "kebab") {
+				t.Errorf("failure.Error = %q, want the accepted name shape described", failures[0].Error)
+			}
 			if d.config.ModelAccess != nil {
 				t.Errorf("in-memory ModelAccess = %+v, want nil after rejected set", d.config.ModelAccess)
 			}
