@@ -13,7 +13,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
-// TestWorkTypeRoleUnrecognizedNames the observability branch for role
+// TestWorkTypeRoleUnrecognized covers the observability branch for role
 // vocabulary skew: a non-empty unknown role for an unknown name reports a
 // skew, while empty roles, valid roles, and any role on a known name stay
 // silent. Deleting the warn branch (always silent) fails the skew rows.
@@ -529,5 +529,69 @@ func TestWorkTypeRoleContinueProbe(t *testing.T) {
 	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
 	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
 		t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+	}
+}
+
+// TestWorkTypeRoleDeclaredSecondaryBackstop pins the declared
+// backstop-eligibility gate through a full Run: a declared custom inflight
+// session whose primary repository already carries its pull request still
+// runs the declared backstop for the secondary mutable repository without
+// one. Dropping the role at the eligibility switch skips the backstop, so
+// the secondary stays missing and the session fails on the missing-PR
+// contract instead of completing; this test goes RED on that mutant.
+func TestWorkTypeRoleDeclaredSecondaryBackstop(t *testing.T) {
+	primaryURL := "https://github.com/example/primary.git"
+	secondaryURL := "https://github.com/example/secondary.git"
+	primaryBare := githubRepositoryFixture(t, primaryURL)
+	_ = githubRepositoryFixture(t, secondaryURL)
+	setPullRef(t, primaryBare, 7, pullAtSessionCommit)
+	primaryPR := "https://github.com/example/primary/pull/7"
+	secondaryPR := "https://github.com/example/secondary/pull/8"
+	stubGhVisibilityAndPRCreate(t, "PRIVATE", secondaryPR)
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:     "chief-of-staff",
+		workTypeRole: "inflight",
+		skipSteering: true,
+		declaration: &workarea.RepositoryDeclarationV1{
+			Protocol: workarea.ProtocolSessionRootV1,
+			Repositories: []workarea.DeclaredRepositoryV1{
+				{Source: workarea.RepositorySource{Repository: primaryURL}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+				{Source: workarea.RepositorySource{Repository: secondaryURL}, Name: "secondary", Role: workarea.RepositoryRoleSecondary, Authority: workarea.RepositoryMutable},
+			},
+		},
+		backstop: true,
+		turns: []verdictScriptTurn{{
+			text:  "Opened " + primaryPR + ".\nWORK_RESULT: passed",
+			files: map[string]string{"fix.go": "package fix\n"},
+			push:  []string{"refs/pull/7/head"},
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	if strings.Contains(res.Error, "completion contract missing pull requests") {
+		t.Fatalf("Error = %q; want no missing-PR contract failure", res.Error)
+	}
+	if res.PullRequestURL != primaryPR {
+		t.Fatalf("PullRequestURL = %q; want %q", res.PullRequestURL, primaryPR)
+	}
+	if res.BackstopReport == nil {
+		t.Fatal("BackstopReport = nil; want the declared backstop to have run for the secondary")
+	}
+	var secondary *agent.RepositoryBackstopReport
+	for i := range res.BackstopReport.Repositories {
+		if res.BackstopReport.Repositories[i].Name == "secondary" {
+			secondary = &res.BackstopReport.Repositories[i]
+			break
+		}
+	}
+	if secondary == nil {
+		t.Fatalf("BackstopReport = %+v; want a secondary entry", res.BackstopReport.Repositories)
+	}
+	if !secondary.Report.Triggered {
+		t.Fatalf("secondary backstop Triggered = false (report=%+v); want the secondary recovered", secondary.Report)
+	}
+	if secondary.Report.PRURL != secondaryPR {
+		t.Fatalf("secondary backstop PRURL = %q; want %q", secondary.Report.PRURL, secondaryPR)
 	}
 }
