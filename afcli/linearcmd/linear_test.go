@@ -4222,6 +4222,19 @@ func TestLinearGetIssueRejectsUnknownFieldsBeforeIO(t *testing.T) {
 	}
 }
 
+func TestLinearListIssuesRejectsFullWithFields(t *testing.T) {
+	requests := 0
+	setupLinearTest(t, func(http.ResponseWriter, *http.Request) { requests++ })
+
+	_, err := runLinearCmd(t, "", "list-issues", "--fields", "id", "--full")
+	if err == nil || !strings.Contains(err.Error(), "--full and --fields cannot be used together") {
+		t.Fatalf("error = %v, want full/fields conflict error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("network requests = %d, want 0", requests)
+	}
+}
+
 func TestResolveListIssueColumns(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -4234,7 +4247,8 @@ func TestResolveListIssueColumns(t *testing.T) {
 		{name: "blank is slim", fields: "  ", want: "id,title,status,project,sortOrder,parent,labels"},
 		{name: "subset", fields: "id,title", want: "id,title"},
 		{name: "full flag", full: true, want: "id,title,status,priority,sortOrder,estimate,labels,project,assignee,createdAt,parent"},
-		{name: "full wins over fields", fields: "id", full: true, want: "id,title,status,priority,sortOrder,estimate,labels,project,assignee,createdAt,parent"},
+		{name: "blank fields with full is full", fields: "  ", full: true, want: "id,title,status,priority,sortOrder,estimate,labels,project,assignee,createdAt,parent"},
+		{name: "full with fields fails", fields: "id", full: true, wantErr: "--full and --fields cannot be used together"},
 		{name: "unknown fails", fields: "id,nope", wantErr: `unknown field "nope"`},
 	}
 	for _, tt := range tests {

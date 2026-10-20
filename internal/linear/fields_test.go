@@ -2,6 +2,7 @@ package linear
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -107,7 +108,7 @@ func TestSelectIssueKeys(t *testing.T) {
 	}
 }
 
-// ─── Retry-After equal jitter ─────────────────────────────────────────────────
+// ─── Retry-After upward jitter ─────────────────────────────────────────────
 
 func TestJitteredRetryDelayBounds(t *testing.T) {
 	defer func(restore func(int64) int64) { retryJitterIntn = restore }(retryJitterIntn)
@@ -118,9 +119,11 @@ func TestJitteredRetryDelayBounds(t *testing.T) {
 		lo, hi time.Duration
 	}{
 		{name: "zero stays zero", delay: 0, rand: 0, lo: 0, hi: 0},
-		{name: "tiny delay still jitters its half window", delay: time.Millisecond, rand: 0, lo: 500 * time.Microsecond, hi: 500 * time.Microsecond},
-		{name: "minimum draw hits half", delay: 10 * time.Second, rand: 0, lo: 5 * time.Second, hi: 5 * time.Second},
-		{name: "maximum draw hits deadline", delay: 10 * time.Second, rand: 5_000_000_001, lo: 10 * time.Second, hi: 10 * time.Second},
+		{name: "tiny delay minimum draw is exact", delay: time.Millisecond, rand: 0, lo: time.Millisecond, hi: time.Millisecond},
+		{name: "minimum draw hits delay", delay: 10 * time.Second, rand: 0, lo: 10 * time.Second, hi: 10 * time.Second},
+		{name: "maximum draw hits delay plus half", delay: 10 * time.Second, rand: 5_000_000_001, lo: 15 * time.Second, hi: 15 * time.Second},
+		{name: "capped spread minimum draw is exact", delay: 5 * time.Minute, rand: 0, lo: 5 * time.Minute, hi: 5 * time.Minute},
+		{name: "capped spread maximum draw hits delay plus cap", delay: 5 * time.Minute, rand: 30_000_000_001, lo: 5*time.Minute + 30*time.Second, hi: 5*time.Minute + 30*time.Second},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -132,24 +135,33 @@ func TestJitteredRetryDelayBounds(t *testing.T) {
 	}
 }
 
-func TestJitteredRetryDelayNeverExceedsServerDeadline(t *testing.T) {
+func TestJitteredRetryDelayNeverUndershootsServerDeadline(t *testing.T) {
 	defer func(restore func(int64) int64) { retryJitterIntn = restore }(retryJitterIntn)
-	// Sweep the whole draw range at 1s granularity: no draw may sleep past
-	// the server's Retry-After value.
+	// Sweep the whole draw range at 1s granularity: no draw may sleep
+	// before the server's Retry-After value, and none may pass the worst
+	// case the request-budget check compares against.
 	for _, delay := range []time.Duration{time.Second, 30 * time.Second, time.Minute} {
-		half := int64(delay / 2)
-		for _, draw := range []int64{0, 1, half / 2, half - 1, half} {
+		extra := retryJitterExtra(delay)
+		upper := retryDelayUpperBound(delay)
+		for _, draw := range []int64{0, 1, int64(extra) / 2, int64(extra) - 1, int64(extra)} {
 			retryJitterIntn = func(int64) int64 { return draw }
-			if got := jitteredRetryDelay(delay); got < delay/2 || got > delay {
-				t.Fatalf("delay %v draw %d slept %v, outside [%v, %v]", delay, draw, got, delay/2, delay)
+			if got := jitteredRetryDelay(delay); got < delay || got > upper {
+				t.Fatalf("delay %v draw %d slept %v, outside [%v, %v]", delay, draw, got, delay, upper)
 			}
 		}
 	}
 }
 
+func TestRetryDelayUpperBoundSaturates(t *testing.T) {
+	if got := retryDelayUpperBound(time.Duration(math.MaxInt64)); got != time.Duration(math.MaxInt64) {
+		t.Fatalf("upper bound = %v, want saturation at max duration", got)
+	}
+}
+
 // TestRetrySleepsJitteredDelay pins the client wiring: with the jitter seam
-// forced to its minimum draw, a 2s Retry-After must sleep ~1s (half), proving
-// the retry loop sleeps the jittered value rather than the bare server value.
+// forced to its minimum draw, a 2s Retry-After must sleep the full 2s,
+// proving the retry loop sleeps at least the server value rather than an
+// early wakeup.
 func TestRetrySleepsJitteredDelay(t *testing.T) {
 	defer func(restore func(int64) int64) { retryJitterIntn = restore }(retryJitterIntn)
 	retryJitterIntn = func(int64) int64 { return 0 }
@@ -172,7 +184,10 @@ func TestRetrySleepsJitteredDelay(t *testing.T) {
 		t.Fatalf("calls = %d, want 2", calls)
 	}
 	elapsed := time.Since(start)
-	if elapsed < time.Second || elapsed >= 2*time.Second {
-		t.Fatalf("retry slept %v, want the minimum-jitter ~1s for a 2s Retry-After", elapsed)
+	if elapsed < 2*time.Second {
+		t.Fatalf("retried before Retry-After: retry slept %v for a 2s Retry-After", elapsed)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("retry slept %v, want ~2s for a 2s Retry-After with minimum jitter draw", elapsed)
 	}
 }

@@ -1625,19 +1625,23 @@ or --full for every column including priority, assignee and createdAt.`,
 	cmd.Flags().IntVar(&limit, "limit", 50, fmt.Sprintf("Maximum number of issues to return (max %d); the output envelope reports truncated:true plus a stderr warning when the cap hides further matches", linear.MaxIssueListLimit))
 	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Priority then createdAt/updatedAt, or ascending Linear manual order (flat; rank 0 valid; null last; ties keep Linear order)")
 	cmd.Flags().StringVar(&query, "query", "", "Text search query")
-	cmd.Flags().StringVar(&fields, "fields", "", "Comma-separated columns to return (valid: "+strings.Join(linear.ListIssueFullFields, ", ")+"); defaults to the slim set")
-	cmd.Flags().BoolVar(&full, "full", false, "Return every column, including priority, assignee and createdAt")
+	cmd.Flags().StringVar(&fields, "fields", "", "Comma-separated columns to return (valid: "+strings.Join(linear.ListIssueFullFields, ", ")+"); defaults to the slim set; cannot be combined with --full")
+	cmd.Flags().BoolVar(&full, "full", false, "Return every column, including priority, assignee and createdAt; cannot be combined with --fields")
 
 	structured.register(cmd)
 	return cmd
 }
 
 // resolveListIssueColumns maps the --fields/--full selection to the column
-// set a list-issues row emits. --full wins over --fields when both are set
-// (explicit breadth beats an explicit subset); no flags means the slim
-// default. Unknown or empty field names fail before any network I/O so a
-// typo never pays for a query that returns the wrong shape.
+// set a list-issues row emits. --full and --fields are mutually exclusive:
+// silently dropping an explicit selection would return a shape the caller
+// did not ask for. No flags means the slim default. Unknown or empty field
+// names fail before any network I/O so a typo never pays for a query that
+// returns the wrong shape.
 func resolveListIssueColumns(fields string, full bool) ([]string, error) {
+	if full && strings.TrimSpace(fields) != "" {
+		return nil, fmt.Errorf("--full and --fields cannot be used together; use one or the other")
+	}
 	if full {
 		return append([]string(nil), linear.ListIssueFullFields...), nil
 	}

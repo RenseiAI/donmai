@@ -39,11 +39,8 @@ func TestRetryAfterRecovery(t *testing.T) {
 					if string(body) != firstBody {
 						t.Error("retry changed query or variables")
 					}
-					// Equal jitter sleeps in [delay/2, delay]: a Retry-After
-					// of 1s may wake at 0.5s, and never past the 1s
-					// server deadline.
-					if elapsed := time.Since(firstTime); elapsed < 500*time.Millisecond || elapsed >= 2*time.Second {
-						t.Errorf("retry delay = %v, want within the [0.5s, 1s] jitter window", elapsed)
+					if time.Since(firstTime) < time.Second {
+						t.Error("retried before Retry-After")
 					}
 					writeGQLData(w, `{"teams":{"nodes":[{"id":"team-a","key":"A","name":"Alpha"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 				})
@@ -209,15 +206,7 @@ func TestRetryAfterHTTPDateRecovery(t *testing.T) {
 					_, _ = io.WriteString(w, `{"errors":[{"message":"temporarily unavailable","code":"UNAVAILABLE"}]}`)
 					return
 				}
-				// A past HTTP date retries immediately (at/after the
-				// date). A future date sleeps the delay with equal
-				// jitter in [delay/2, delay]: the retry may wake up to
-				// half the delay early, never past the date itself.
-				now := time.Now()
-				if future && (now.Before(retryAt.Add(-2*time.Second)) || now.After(retryAt.Add(time.Second))) {
-					t.Errorf("retried at %v, want within the jitter window around HTTP date %v", now, retryAt)
-				}
-				if !future && now.Before(retryAt) {
+				if time.Now().Before(retryAt) {
 					t.Error("retried before HTTP date")
 				}
 				writeGQLData(w, `{"teams":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
