@@ -213,14 +213,24 @@ func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw 
 		return "", nil, false, fmt.Errorf("stage working state: %w", err)
 	}
 	staged, err := checkpointGitStdout(ctx, worktreePath, env,
-		"-c", "core.quotePath=false", "diff", "--cached", "--name-only", "-z", "HEAD")
+		"-c", "core.quotePath=false", "diff", "--cached", "--name-status", "--no-renames", "-z", "HEAD")
 	if err != nil {
 		return "", nil, false, fmt.Errorf("list staged working state: %w", err)
 	}
 	var excluded []string
 	var survivors []string
-	for _, path := range strings.Split(staged, "\x00") {
+	fields := strings.Split(staged, "\x00")
+	for i := 0; i+1 < len(fields); i += 2 {
+		status, path := fields[i], fields[i+1]
 		if path == "" {
+			continue
+		}
+		// A deleted tracked path removes the path from the checkpoint tree:
+		// there is no blob to scan, so deletions never skip the checkpoint.
+		// Name-denied deletions are dropped the same way: the tree omits the
+		// file either way, so resurrecting it via reset would leak the secret
+		// the deletion removes.
+		if strings.HasPrefix(status, "D") {
 			continue
 		}
 		if shouldExcludeFromWIPCheckpoint(path) {

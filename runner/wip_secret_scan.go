@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -76,6 +77,16 @@ func wipCheckpointSecretValues(qw QueuedWork) []string {
 			add(value)
 		}
 	}
+	// A session that extracts the password from a URL-style value into a
+	// config file must still fail closed: match the userinfo password
+	// component of any URL-parseable value, subject to the length floor.
+	for _, v := range append([]string{}, out...) {
+		if u, err := url.Parse(v); err == nil && u.User != nil {
+			if pw, ok := u.User.Password(); ok {
+				add(pw)
+			}
+		}
+	}
 	return out
 }
 
@@ -126,13 +137,18 @@ func stagedBlobHasSecret(ctx context.Context, dir string, env []string, path str
 	return blobContainsSecret(blob, values), nil
 }
 
+// wipHistoryGitStdout runs git for the history blob content scan. A variable
+// so tests can prove the fail-closed branches without corrupting the repo:
+// a stubbed cat-file/show failure must skip the remote checkpoint.
+var wipHistoryGitStdout = checkpointGitStdout
+
 // refBlobHasSecret reports whether the blob at rev:path carries a secret.
 // Oversize, binary and unreadable blobs ERROR so the caller fails closed on
 // the whole push. A blob that sizes fine but then fails to read errors the
 // same way. Callers only invoke it for paths present in rev (added or
 // modified in that commit); a deleted path is never scanned.
 func refBlobHasSecret(ctx context.Context, dir, rev, path string, values []string) (bool, error) {
-	sizeOut, err := checkpointGitStdout(ctx, dir, nil, "cat-file", "-s", rev+":"+path)
+	sizeOut, err := wipHistoryGitStdout(ctx, dir, nil, "cat-file", "-s", rev+":"+path)
 	if err != nil {
 		return false, fmt.Errorf("size blob at %s: %w", rev, err)
 	}
@@ -143,7 +159,7 @@ func refBlobHasSecret(ctx context.Context, dir, rev, path string, values []strin
 	if size > wipSecretScanMaxBytes {
 		return false, fmt.Errorf("unscannable blob %q at %s: %d bytes over the %d-byte scan cap", path, rev, size, wipSecretScanMaxBytes)
 	}
-	blob, err := checkpointGitStdout(ctx, dir, nil, "show", rev+":"+path)
+	blob, err := wipHistoryGitStdout(ctx, dir, nil, "show", rev+":"+path)
 	if err != nil {
 		return false, fmt.Errorf("read blob at %s: %w", rev, err)
 	}
@@ -164,6 +180,18 @@ func checkpointUnpushedSHAs(ctx context.Context, target rescueTarget, to string)
 			return nil, fmt.Errorf("list committed range for secret scan: %w", err)
 		}
 		return filterEmpty(strings.Split(strings.TrimSpace(out), "\n")), nil
+	}
+	// With no recorded base the range is HEAD --not --remotes. When the
+	// checkout holds no remote-tracking refs there is nothing to measure
+	// against, so the walk would scan zero commits while the push publishes
+	// HEAD's entire local history: fail closed instead of publishing
+	// unscanned history.
+	remotes, err := checkpointGitStdout(ctx, target.path, nil, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes")
+	if err != nil {
+		return nil, fmt.Errorf("list remote-tracking refs for secret scan: %w", err)
+	}
+	if strings.TrimSpace(remotes) == "" {
+		return nil, fmt.Errorf("cannot determine unpushed history without a recorded base or remote-tracking refs: refusing to publish unscanned history")
 	}
 	commits, err := unpushedCommits(ctx, target)
 	if err != nil {
@@ -207,7 +235,7 @@ func checkpointHistoryDenied(ctx context.Context, target rescueTarget, to string
 	}
 	for _, sha := range shas {
 		out, err := checkpointGitStdout(ctx, target.path, nil,
-			"-c", "core.quotePath=false", "diff-tree", "--no-commit-id", "--name-status", "-r", "--root", "--no-renames", "-z", sha, "--")
+			"-c", "core.quotePath=false", "diff-tree", "--no-commit-id", "--name-status", "-r", "--root", "--no-renames", "--diff-merges=first-parent", "-z", sha, "--")
 		if err != nil {
 			return nil, fmt.Errorf("list unpushed commit for secret scan: %w", err)
 		}

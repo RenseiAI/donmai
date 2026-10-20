@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -303,6 +304,7 @@ func TestCheckpointFailedSession_SkipsPushWhenDirtyHoldsSecrets(t *testing.T) {
 		big        bool
 		binary     bool
 		authToken  string
+		mcpBearer  string
 		qwEnvKey   string
 		qwEnvVal   string
 		procEnvKey string
@@ -313,6 +315,10 @@ func TestCheckpointFailedSession_SkipsPushWhenDirtyHoldsSecrets(t *testing.T) {
 		{name: "session-env-value", path: "db.txt", body: "dump: custom-session-sentinel-98765\n", qwEnvKey: "MY_CUSTOM_VAR", qwEnvVal: "custom-session-sentinel-98765"},
 		{name: "process-env-value", path: "env-dump.txt", body: "dump: sentinel-test-value-42\n", procEnvKey: "WIP_CHECKPOINT_TEST_TOKEN", procEnvVal: "sentinel-test-value-42"},
 		{name: "auth-bearer", path: "bearer.txt", body: "bearer auth-bearer-sentinel-13579\n", authToken: "auth-bearer-sentinel-13579"},
+		{name: "mcp-bearer", path: "mcp.txt", body: "gateway mcp-bearer-sentinel-24681\n", mcpBearer: "mcp-bearer-sentinel-24681"},
+		{name: "process-env-url-name", path: "urldump.txt", body: "dump: custom-url-sentinel-13579\n", procEnvKey: "WIP_CHECKPOINT_TEST_DATABASE_URL", procEnvVal: "custom-url-sentinel-13579"},
+		{name: "userinfo-shape", path: "conn.txt", body: "db https://app:custom-pw-sentinel-24680@example.test/db\n"},
+		{name: "url-password-only", path: "pwonly.txt", body: "dbpw-sentinel-98765\n", procEnvKey: "WIP_CHECKPOINT_TEST_PG_URL", procEnvVal: "postgres://app:dbpw-sentinel-98765@example.test/db"},
 		{name: "oversize", path: "big.txt", body: "tail ghp_faketoken0123456789ab\n", big: true},
 		{name: "binary", path: "utf16.txt", body: "ghp_faketoken0123456789ab\n", binary: true},
 	} {
@@ -327,6 +333,9 @@ func TestCheckpointFailedSession_SkipsPushWhenDirtyHoldsSecrets(t *testing.T) {
 			res.Error = "budget exceeded: max-tokens"
 			if tc.authToken != "" {
 				qw.AuthToken = tc.authToken
+			}
+			if tc.mcpBearer != "" {
+				qw.McpAuthToken = tc.mcpBearer
 			}
 			if tc.qwEnvKey != "" {
 				if qw.Env == nil {
@@ -355,7 +364,7 @@ func TestCheckpointFailedSession_SkipsPushWhenDirtyHoldsSecrets(t *testing.T) {
 				if strings.Contains(w, tc.path) {
 					sawPath = true
 				}
-				if strings.Contains(w, "ghs_ABCDEFGHIJKLMNOPQRSTuvwx0123") || strings.Contains(w, "custom-session-sentinel-98765") || strings.Contains(w, "auth-bearer-sentinel-13579") || strings.Contains(w, "sentinel-test-value-42") {
+				if strings.Contains(w, "ghs_ABCDEFGHIJKLMNOPQRSTuvwx0123") || strings.Contains(w, "custom-session-sentinel-98765") || strings.Contains(w, "auth-bearer-sentinel-13579") || strings.Contains(w, "sentinel-test-value-42") || strings.Contains(w, "mcp-bearer-sentinel-24681") || strings.Contains(w, "custom-url-sentinel-13579") || strings.Contains(w, "custom-pw-sentinel-24680") || strings.Contains(w, "dbpw-sentinel-98765") {
 					t.Errorf("checkpoint warning carries a secret value: %q", w)
 				}
 			}
@@ -484,6 +493,38 @@ func TestCheckpointFailedSession_SkipsPushWhenHistoryHidesSecrets(t *testing.T) 
 				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "add big")
 			},
 		},
+		{
+			name: "history-binary",
+			want: "utf16.txt",
+			setup: func(t *testing.T, wt string) {
+				writeFile(t, wt, "feature.txt", "real work\n")
+				writeFile(t, wt, "utf16.txt", "a\x00b\x00 ghp_faketoken0123456789ab\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "add binary")
+			},
+		},
+		{
+			name: "evil-merge",
+			want: "evil.txt",
+			setup: func(t *testing.T, wt string) {
+				writeFile(t, wt, "feature.txt", "real work\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base work")
+				base := gitRun(t, wt, "rev-parse", "HEAD")
+				gitRun(t, wt, "checkout", "-qb", "evil-branch")
+				writeFile(t, wt, "side.txt", "clean side\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "clean side")
+				gitRun(t, wt, "checkout", "-q", base)
+				// The secret enters only in the merge commit itself (a
+				// conflict resolution or a --no-commit add): the side
+				// branch is clean, so only the merge diff can catch it.
+				gitRun(t, wt, "merge", "--no-commit", "--no-ff", "evil-branch")
+				writeFile(t, wt, "evil.txt", "token ghp_faketoken0123456789ab\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "merge evil")
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bare, wt, res := checkpointCheckout(t)
@@ -501,10 +542,9 @@ func TestCheckpointFailedSession_SkipsPushWhenHistoryHidesSecrets(t *testing.T) 
 					sawPath = true
 				}
 			}
-			// Oversize history fails closed via the scan error path, which
-			// carries no path-filtered skip warning; the checkpoint
-			// failure warning still proves nothing was pushed.
-			if tc.name != "history-oversize" && !sawPath {
+			// Oversize and binary history fail closed via the scan error path;
+			// the checkpoint failure warning still proves nothing was pushed.
+			if tc.name != "history-oversize" && tc.name != "history-binary" && !sawPath {
 				t.Errorf("no checkpoint warning names %q (warnings %v)", tc.want, res.PostSessionWarnings)
 			}
 			if len(res.PostSessionWarnings) == 0 {
@@ -620,5 +660,189 @@ func TestWipAttemptRef_PerSessionUniqueness(t *testing.T) {
 		if !strings.HasPrefix(ref, "refs/wip/sess-1/") || strings.Contains(strings.TrimPrefix(ref, "refs/wip/sess-1/"), "/") {
 			t.Errorf("ref %q is not one leaf under refs/wip/sess-1/", ref)
 		}
+	}
+}
+
+// TestCheckpointFailedSession_DirtySecretWithBaseSkipsEntirely pins that a
+// dirty secret on top of clean committed work skips the whole remote
+// checkpoint: deleting the skipped-return still pushes HEAD (a partial
+// checkpoint without the dirty file) and must turn this RED.
+func TestCheckpointFailedSession_DirtySecretWithBaseSkipsEntirely(t *testing.T) {
+	bare, wt, res := checkpointCheckout(t)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-DIRTY-BASE")}
+	res.FailureMode = FailureBudgetExceeded
+	res.Error = "budget exceeded: max-tokens"
+	writeFile(t, wt, "feature.txt", "real work\n")
+	gitRun(t, wt, "add", "-A")
+	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "clean work")
+	// Keep the recorded base: the history range is clean, so only the staged
+	// gate can refuse the dirty secret.
+	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD~1")}}
+	writeFile(t, wt, "notes2.md", "token ghs_ABCDEFGHIJKLMNOPQRSTuvwx0123\n")
+	(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+	if res.WIPRef != nil {
+		t.Fatalf("WIPRef = %+v; want nil when dirty work holds a secret on top of a clean base", res.WIPRef)
+	}
+	if len(res.PostSessionWarnings) == 0 {
+		t.Fatal("no checkpoint warning recorded for the dirty secret")
+	}
+	if got := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/wip"); got != "" {
+		t.Errorf("reserved ref pushed despite dirty secret with base: %s", got)
+	}
+}
+
+// TestCheckpointFailedSession_DeletesStillPush pins that deletions never
+// skip the checkpoint: a deleted tracked file has no blob to scan. The dirty
+// row kills the staged fail-closed regression (deleted path treated as
+// unscannable); the committed row kills a deleted history-D skip.
+func TestCheckpointFailedSession_DeletesStillPush(t *testing.T) {
+	t.Run("dirty-delete", func(t *testing.T) {
+		bare, wt, res := checkpointCheckout(t)
+		qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-DELDIRTY")}
+		res.FailureMode = FailureBudgetExceeded
+		res.Error = "budget exceeded: max-tokens"
+		writeFile(t, wt, "tracked.txt", "tracked\n")
+		gitRun(t, wt, "add", "-A")
+		gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "track")
+		gitRun(t, wt, "push", "-q", "origin", "HEAD:refs/heads/main")
+		res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
+		if err := os.Remove(filepath.Join(wt, "tracked.txt")); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, wt, "feature.txt", "real work\n")
+		(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+		if res.WIPRef == nil {
+			t.Fatalf("no WIP checkpoint for a dirty delete: warnings %v", res.PostSessionWarnings)
+		}
+		tree := gitRun(t, bare, "ls-tree", "-r", "--name-only", res.WIPRef.Ref)
+		if strings.Contains(tree, "tracked.txt") {
+			t.Errorf("deleted tracked.txt still in %s", res.WIPRef.Ref)
+		}
+		if !strings.Contains(tree, "feature.txt") {
+			t.Errorf("feature.txt missing from %s", res.WIPRef.Ref)
+		}
+	})
+	t.Run("committed-delete", func(t *testing.T) {
+		bare, wt, res := checkpointCheckout(t)
+		qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-DELHIST")}
+		res.FailureMode = FailureBudgetExceeded
+		res.Error = "budget exceeded: max-tokens"
+		writeFile(t, wt, "tracked.txt", "tracked\n")
+		writeFile(t, wt, "feature.txt", "real work\n")
+		gitRun(t, wt, "add", "-A")
+		gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "add")
+		gitRun(t, wt, "rm", "-q", "tracked.txt")
+		gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "delete tracked")
+		(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+		if res.WIPRef == nil {
+			t.Fatalf("no WIP checkpoint for a committed delete: warnings %v", res.PostSessionWarnings)
+		}
+		tree := gitRun(t, bare, "ls-tree", "-r", "--name-only", res.WIPRef.Ref)
+		if strings.Contains(tree, "tracked.txt") {
+			t.Errorf("deleted tracked.txt still in %s", res.WIPRef.Ref)
+		}
+	})
+}
+
+// TestCheckpointFailedSession_EvilMergeNoBaseSkipsPush pins the merge scan
+// without a recorded base: a secret introduced by a merge must still deny
+// the range. Without --diff-merges=first-parent the merge lists zero paths
+// and the secret pushes.
+func TestCheckpointFailedSession_EvilMergeNoBaseSkipsPush(t *testing.T) {
+	_, wt, res := checkpointCheckout(t)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-MERGENOBASE")}
+	res.FailureMode = FailureBudgetExceeded
+	res.Error = "budget exceeded: max-tokens"
+	writeFile(t, wt, "feature.txt", "real work\n")
+	gitRun(t, wt, "add", "-A")
+	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base work")
+	base := gitRun(t, wt, "rev-parse", "HEAD")
+	gitRun(t, wt, "checkout", "-qb", "evil-branch")
+	writeFile(t, wt, "side.txt", "clean side\n")
+	gitRun(t, wt, "add", "-A")
+	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "clean side")
+	gitRun(t, wt, "checkout", "-q", base)
+	gitRun(t, wt, "merge", "--no-commit", "--no-ff", "evil-branch")
+	writeFile(t, wt, "evil.txt", "token ghp_faketoken0123456789ab\n")
+	gitRun(t, wt, "add", "-A")
+	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "merge evil")
+	res.rescueTargets = []rescueTarget{{path: wt}}
+	(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+	if res.WIPRef != nil {
+		t.Fatalf("WIPRef = %+v; want nil when a no-base merge hides evil.txt", res.WIPRef)
+	}
+	if len(res.PostSessionWarnings) == 0 {
+		t.Fatal("no checkpoint warning recorded for the evil merge")
+	}
+}
+
+// TestCheckpointFailedSession_NoBaseNoRemoteRefsKeepsLocal pins the fail-closed
+// unknown range: with no recorded base and no remote-tracking refs the walk
+// cannot determine what the push publishes, so the checkpoint stays local.
+func TestCheckpointFailedSession_NoBaseNoRemoteRefsKeepsLocal(t *testing.T) {
+	bare, wt, res := checkpointCheckout(t)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-NOBASENOREF")}
+	res.FailureMode = FailureBudgetExceeded
+	res.Error = "budget exceeded: max-tokens"
+	writeFile(t, wt, "notes.md", "rotate ghp_faketoken0123456789ab soon\n")
+	gitRun(t, wt, "add", "-A")
+	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "local secret")
+	writeFile(t, wt, "feature.txt", "dirty\n")
+	for _, ref := range strings.Split(gitRun(t, wt, "for-each-ref", "--format=%(refname)", "refs/remotes"), "\n") {
+		if strings.TrimSpace(ref) != "" {
+			gitRun(t, wt, "update-ref", "-d", strings.TrimSpace(ref))
+		}
+	}
+	res.rescueTargets = []rescueTarget{{path: wt}}
+	(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+	if res.WIPRef != nil {
+		t.Fatalf("WIPRef = %+v; want nil without a base or remote-tracking refs", res.WIPRef)
+	}
+	if len(res.PostSessionWarnings) == 0 {
+		t.Fatal("no checkpoint warning recorded for the unknown range")
+	}
+	if got := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/wip"); got != "" {
+		t.Errorf("reserved ref pushed with an unknown history range: %s", got)
+	}
+}
+
+// TestCheckpointFailedSession_HistoryReadErrorSkipsPush pins the fail-closed
+// history blob reads: any cat-file/show failure skips the remote checkpoint.
+// Each row drives the production entry point with an injected git failure and
+// goes RED when that branch fails open.
+func TestCheckpointFailedSession_HistoryReadErrorSkipsPush(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail string
+	}{
+		{name: "cat-file", fail: "cat-file"},
+		{name: "show", fail: "show"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, wt, res := checkpointCheckout(t)
+			qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-HISTERR-" + tc.name)}
+			res.FailureMode = FailureBudgetExceeded
+			res.Error = "budget exceeded: max-tokens"
+			writeFile(t, wt, "feature.txt", "real work\n")
+			gitRun(t, wt, "add", "-A")
+			gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "clean work")
+			old := wipHistoryGitStdout
+			t.Cleanup(func() { wipHistoryGitStdout = old })
+			wipHistoryGitStdout = func(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+				for _, a := range args {
+					if a == tc.fail {
+						return "", fmt.Errorf("injected %s failure", tc.fail)
+					}
+				}
+				return checkpointGitStdout(ctx, dir, env, args...)
+			}
+			(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+			if res.WIPRef != nil {
+				t.Fatalf("WIPRef = %+v; want nil when history %s fails", res.WIPRef, tc.fail)
+			}
+			if len(res.PostSessionWarnings) == 0 {
+				t.Fatal("no checkpoint warning recorded for the history read error")
+			}
+		})
 	}
 }
