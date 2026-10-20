@@ -337,6 +337,14 @@ func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, er
 			}
 		}
 	}
+	// A gateway session on the injected provider with no configured context
+	// window is refused here, before either spawn mode starts a child: the
+	// extension registers no default, so running would silently clamp (or
+	// oversell) the resolved model's window. A clear configuration error
+	// instead of a guessed 200000.
+	if err := requireContextWindow(spec); err != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// A model the injected provider would serve over a protocol that cannot
 	// omit the output limit is refused here, before either spawn mode starts
 	// a child, when no limit is configured — a clear configuration error
