@@ -1782,7 +1782,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 		}
 	}
 	// A gateway-routed call whose wire response identified its provider.
-	h.runner.observeEvent(native("served-provider", "donmai", "requested-model", "served-model-id", 3), obs, wt, QueuedWork{})
+	h.runner.observeEvent(native("served-provider", "donmai", "requested-model", "served-model-id", 3), obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "served-provider" || obs.finalModel != "served-model-id" || obs.providerAttempts != 3 {
 		t.Fatalf("obs = %+v; want finalProvider served-provider, finalModel served-model-id, providerAttempts 3", obs)
 	}
@@ -1790,7 +1790,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 	// A later call that identifies a different response provider replaces
 	// the earlier fact (last wins); a call without a served id falls back
 	// to the requested id.
-	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{})
+	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
 		t.Fatalf("obs = %+v; want other-provider/requested-alias/4 after the second call", obs)
 	}
@@ -1803,7 +1803,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 		System: "configured-system", Model: "configured-model",
 		ResponseModelProvider: "configured-provider",
 		InputTokens:           100, UsageSource: agent.LlmUsageAggregate, Synthetic: true,
-	}, obs, wt, QueuedWork{})
+	}, obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
 		t.Fatalf("obs = %+v; want the synthetic fallback to leave the report untouched", obs)
 	}
@@ -1816,7 +1816,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 		System: "openai", Model: "requested-model",
 		InputTokens: 5, OutputTokens: 3,
 		UsageSource: agent.LlmUsageProvider, TurnCompleted: true, Attempts: 1,
-	}, obs, wt, QueuedWork{})
+	}, obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.providerAttempts != 5 {
 		t.Fatalf("obs = %+v; want a System-only gateway call to leave finalProvider untouched while counting its attempt", obs)
 	}
@@ -1826,7 +1826,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 	if obs.finalModel != "requested-model" {
 		t.Fatalf("obs.finalModel = %q; want requested-model (System-only call falls back to Model)", obs.finalModel)
 	}
-	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{})
+	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 6 {
 		t.Fatalf("obs = %+v; want other-provider/requested-alias/6 after restoring", obs)
 	}
@@ -1835,7 +1835,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 	// unreported attempt count adds nothing.
 	h.runner.observeEvent(agent.LlmCallEvent{
 		InputTokens: 1, UsageSource: agent.LlmUsageProvider, TurnCompleted: true,
-	}, obs, wt, QueuedWork{})
+	}, obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 6 {
 		t.Fatalf("obs = %+v; want an empty call to leave the report untouched", obs)
 	}
@@ -1899,7 +1899,7 @@ func TestConsumeEvents_ServingAttemptsAccumulate(t *testing.T) {
 		ch <- agent.ResultEvent{Success: true}
 		close(ch)
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(context.Background(), &fakeHandle{events: ch}, wpath, qw, res, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(context.Background(), &fakeHandle{events: ch}, wpath, qw, res, enforcer, noopSink{}, nil, nil)
 		if err != nil {
 			t.Fatalf("consumeEvents: %v", err)
 		}
