@@ -289,7 +289,10 @@ func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
 // by `--` and stays the last element whatever its first characters: a
 // plain seed, a seed starting with `-`, a seed starting with `--model x`,
 // and a seed equal to a subcommand word all reach the REPL as the seed
-// instead of being parsed as a flag or starting a subcommand.
+// instead of being parsed as a flag or starting a subcommand. Exact
+// reserved words arrive neutralised (single leading space, via
+// claudeSeedMessage) because `--` alone does not stop them; every other
+// seed arrives byte for byte.
 func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
 	t.Parallel()
 	seeds := []string{
@@ -304,17 +307,63 @@ func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
 		t.Run(seed, func(t *testing.T) {
 			t.Parallel()
 			got := interactiveArgs(agent.Spec{Prompt: seed, Autonomous: true})
+			wantSeed := claudeSeedMessage(seed)
 			if len(got) < 2 {
 				t.Fatalf("interactiveArgs = %q, want the seed preceded by --", got)
 			}
-			if last := got[len(got)-1]; last != seed {
-				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, seed, got)
+			if last := got[len(got)-1]; last != wantSeed {
+				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, wantSeed, got)
 			}
 			if penultimate := got[len(got)-2]; penultimate != "--" {
 				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
 			}
 		})
 	}
+}
+
+// TestInteractiveArgs_ReservedWordSeedIsNeutralised pins every exact
+// reserved command from `claude --help`: each must reach the child as
+// `" "+word` preceded by `--` and last, so it parses as the prompt
+// instead of starting that subcommand. A plain seed and a dash-leading
+// non-reserved seed must pass through byte for byte. Recorded-CLI
+// evidence: `claude -- auth` and `claude -- mcp` dispatch to those
+// subcommands, while the single-space forms start the REPL (the child
+// times out waiting for input instead of printing subcommand usage).
+func TestInteractiveArgs_ReservedWordSeedIsNeutralised(t *testing.T) {
+	t.Parallel()
+	for word := range claudeReservedSubcommands {
+		t.Run(word, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Prompt: word})
+			want := " " + word
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs(%q) = %q, want -- plus the neutralised seed", word, got)
+			}
+			if last := got[len(got)-1]; last != want {
+				t.Fatalf("last argv element = %q, want the neutralised seed %q (full argv: %q)", last, want, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+	t.Run("plain seed unchanged", func(t *testing.T) {
+		t.Parallel()
+		got := interactiveArgs(agent.Spec{Prompt: "fix the bug"})
+		if last := got[len(got)-1]; last != "fix the bug" {
+			t.Fatalf("plain seed altered: %q", got)
+		}
+	})
+	t.Run("dash seed without exact match unchanged", func(t *testing.T) {
+		t.Parallel()
+		got := interactiveArgs(agent.Spec{Prompt: "--bogus hello"})
+		if last := got[len(got)-1]; last != "--bogus hello" {
+			t.Fatalf("dash seed altered: %q", got)
+		}
+		if penultimate := got[len(got)-2]; penultimate != "--" {
+			t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+		}
+	})
 }
 
 // TestInteractiveArgs_NoSeedGainsNoEndOfOptions pins that an argv without
@@ -406,6 +455,52 @@ exited:
 	text := strings.TrimSuffix(string(raw), "\n")
 	if !strings.HasSuffix(text, "--\n"+seed) {
 		t.Fatalf("child argv does not end with -- plus the seed: %q", text)
+	}
+}
+
+// TestSpawn_ReservedWordSeedReachesChildNeutralised is the production-path
+// pin for the reserved-word neutralisation: a seed that is exactly a
+// registered subcommand must reach the PTY child as `" "+word` preceded
+// by `--` and last, so the real CLI parses it as the prompt. RED proof:
+// drop claudeSeedMessage and the tail is `--` plus the bare word.
+func TestSpawn_ReservedWordSeedReachesChildNeutralised(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	const seed = "auth"
+	const wantSeed = " " + seed
+	p := newFakeInteractiveProvider(t, `printf '%s\n' "$@" > "$PWD/argv.txt"`)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      seed,
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake claude exit")
+		}
+	}
+exited:
+	raw, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read echoed argv: %v", err)
+	}
+	text := strings.TrimSuffix(string(raw), "\n")
+	if !strings.HasSuffix(text, "--\n"+wantSeed) {
+		t.Fatalf("child argv does not end with -- plus the neutralised seed %q: %q", wantSeed, text)
 	}
 }
 

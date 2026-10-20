@@ -168,7 +168,10 @@ func TestInteractiveArgs_SandboxParityWithServeArgs(t *testing.T) {
 // by `--` and stays the last element whatever its first characters: a
 // plain seed, a seed starting with `-`, a seed starting with `--model x`,
 // and a seed equal to a subcommand word all reach the TUI as the seed
-// instead of being parsed as a flag or starting a subcommand.
+// instead of being parsed as a flag or starting a subcommand. Exact
+// reserved words arrive neutralised (single leading space, via
+// museSeedMessage) because `--` alone does not stop them; every other
+// seed arrives byte for byte.
 func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
 	t.Parallel()
 	p := &Provider{}
@@ -184,17 +187,75 @@ func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
 		t.Run(seed, func(t *testing.T) {
 			t.Parallel()
 			got := p.interactiveArgs(agent.Spec{Prompt: seed, Autonomous: true})
+			wantSeed := museSeedMessage(seed)
 			if len(got) < 2 {
 				t.Fatalf("interactiveArgs = %q, want the seed preceded by --", got)
 			}
-			if last := got[len(got)-1]; last != seed {
-				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, seed, got)
+			if last := got[len(got)-1]; last != wantSeed {
+				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, wantSeed, got)
 			}
 			if penultimate := got[len(got)-2]; penultimate != "--" {
 				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
 			}
 		})
 	}
+}
+
+// TestInteractiveArgs_ReservedWordSeedIsNeutralised pins every exact
+// reserved token from `muse --help` (commands plus -h/--help/-V/--version):
+// each must reach the child as `" "+token` preceded by `--` and last,
+// so it parses as the prompt instead of a command or meta flag. A plain
+// seed and a dash-leading non-reserved seed must pass through byte for
+// byte. Recorded-CLI evidence: `muse -- config` fails as an unknown
+// argument, `muse -- --version` prints the version, while the
+// single-space forms reach the workspace-trust check (the TUI prompt path).
+func TestInteractiveArgs_ReservedWordSeedIsNeutralised(t *testing.T) {
+	t.Parallel()
+	p := &Provider{}
+	for token := range museReservedSeeds {
+		t.Run(token, func(t *testing.T) {
+			t.Parallel()
+			got := p.interactiveArgs(agent.Spec{Prompt: token})
+			want := " " + token
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs(%q) = %q, want -- plus the neutralised seed", token, got)
+			}
+			if last := got[len(got)-1]; last != want {
+				t.Fatalf("last argv element = %q, want the neutralised seed %q (full argv: %q)", last, want, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+	t.Run("plain seed unchanged", func(t *testing.T) {
+		t.Parallel()
+		got := p.interactiveArgs(agent.Spec{Prompt: "fix the bug"})
+		if last := got[len(got)-1]; last != "fix the bug" {
+			t.Fatalf("plain seed altered: %q", got)
+		}
+	})
+	t.Run("dash seed without exact match unchanged", func(t *testing.T) {
+		t.Parallel()
+		got := p.interactiveArgs(agent.Spec{Prompt: "--bogus hello"})
+		if last := got[len(got)-1]; last != "--bogus hello" {
+			t.Fatalf("dash seed altered: %q", got)
+		}
+		if penultimate := got[len(got)-2]; penultimate != "--" {
+			t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+		}
+	})
+	t.Run("composed seed with system layers is not an exact token", func(t *testing.T) {
+		t.Parallel()
+		got := p.interactiveArgs(agent.Spec{Prompt: "config", SystemPromptAppend: "sys"})
+		last := got[len(got)-1]
+		if last == " config" || last == "config" {
+			t.Fatalf("composed seed should carry the system layer, got %q (full argv: %q)", last, got)
+		}
+		if !strings.HasSuffix(last, "config") || !strings.HasPrefix(last, "sys\n\n") {
+			t.Fatalf("composed seed layers out of order: %q", last)
+		}
+	})
 }
 
 // TestInteractiveArgs_NoSeedGainsNoEndOfOptions pins that an argv without
@@ -424,6 +485,61 @@ exited:
 	text := strings.TrimSuffix(string(body), "\n")
 	if !strings.HasSuffix(text, "--\n"+seed) {
 		t.Fatalf("child argv does not end with -- plus the seed %q: %q", seed, text)
+	}
+}
+
+// TestSpawn_ReservedWordSeedReachesChildNeutralised is the production-path
+// pin for the reserved-token neutralisation: a seed that is exactly a
+// command or meta flag must reach the PTY child as `" "+token` preceded
+// by `--` and last, so the real CLI parses it as the prompt. RED proof:
+// drop museSeedMessage and the tail is `--` plus the bare token.
+func TestSpawn_ReservedWordSeedReachesChildNeutralised(t *testing.T) {
+	for _, seed := range []string{"config", "--version"} {
+		t.Run(seed, func(t *testing.T) {
+			workdir := t.TempDir()
+			wantSeed := " " + seed
+			p := newFakeInteractiveProvider(t, `printf '%s\n' "$@" > "$PWD/argv.txt"`)
+			h, err := p.Spawn(context.Background(), agent.Spec{
+				Prompt:      seed,
+				Cwd:         workdir,
+				Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+			})
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+			var terminal *agent.ResultEvent
+			deadline := time.After(20 * time.Second)
+			for {
+				select {
+				case ev, ok := <-h.Events():
+					if !ok {
+						goto exited
+					}
+					if result, ok := ev.(agent.ResultEvent); ok {
+						terminal = &result
+					}
+				case <-deadline:
+					t.Fatal("timed out waiting for fake TUI exit")
+				}
+			}
+		exited:
+			if terminal == nil {
+				t.Fatal("events channel closed without a terminal ResultEvent")
+			}
+			if !terminal.Success {
+				t.Fatalf("fake muse child failed: %+v", *terminal)
+			}
+			body, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
+			if err != nil {
+				t.Fatalf("read echoed argv: %v", err)
+			}
+			text := strings.TrimSuffix(string(body), "\n")
+			if !strings.HasSuffix(text, "--\n"+wantSeed) {
+				t.Fatalf("child argv does not end with -- plus the neutralised seed %q: %q", wantSeed, text)
+			}
+		})
 	}
 }
 
