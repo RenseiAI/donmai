@@ -947,3 +947,75 @@ func TestTryRemoveSkipsHeldLease(t *testing.T) {
 		t.Errorf("removed mirror still on disk: err = %v", err)
 	}
 }
+
+// TestTryRemoveSkipsInProcessBusyMirror pins the in-process half of the
+// non-blocking removal contract: while the victim's per-mirror mutex is
+// held — an in-flight Ensure cloning or verifying that mirror in this
+// process — TryRemove reports removed=false instead of waiting, and the
+// victim stays on disk and in the catalog. Budget eviction relies on it
+// so an in-flight mirror is skipped as a victim rather than stalling the
+// keeper lock. The lease is released before the mutex is held, so only
+// the in-process mutex (not the cross-process flock) is contended: the
+// companion lease test covers the flock half.
+func TestTryRemoveSkipsInProcessBusyMirror(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	lease, err := store.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	digest := lease.Digest()
+	lease.Release()
+
+	// Simulate an in-flight Ensure: hold the victim's per-mirror mutex
+	// directly, the same mutex Ensure holds end-to-end (clone, verify,
+	// harden) against the one directory it shares.
+	unlock := store.lockMirror(digest)
+
+	type outcome struct {
+		removed bool
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		removed, err := store.TryRemove(digest)
+		done <- outcome{removed, err}
+	}()
+	var out outcome
+	select {
+	case out = <-done:
+	case <-time.After(10 * time.Second):
+		unlock()
+		t.Fatal("TryRemove blocked on a held in-process mirror mutex, want prompt removed=false")
+	}
+	if out.err != nil {
+		t.Fatalf("TryRemove(busy) error = %v", out.err)
+	}
+	if out.removed {
+		t.Error("TryRemove(in-process busy) removed=true, want false while the mirror mutex is held")
+	}
+	if _, err := os.Lstat(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName, digest)); err != nil {
+		t.Errorf("busy mirror missing after skipped TryRemove: %v", err)
+	}
+	listed := false
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Digest == digest {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Error("busy mirror dropped from the catalog by a skipped TryRemove, want the row kept")
+	}
+	unlock()
+	if removed, err := store.TryRemove(digest); err != nil {
+		t.Fatalf("TryRemove(released) error = %v", err)
+	} else if !removed {
+		t.Error("TryRemove(released mutex) removed=false, want true after the mutex released")
+	}
+}

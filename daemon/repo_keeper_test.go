@@ -1204,3 +1204,97 @@ func TestRepoKeeper_CloseReleasesStoreRoot(t *testing.T) {
 		t.Error("Acquire after Close ok=true, want degradation to plain clone")
 	}
 }
+
+// TestRepoKeeper_OverBudgetAcquireSkipsInProcessBusyVictim proves the
+// in-process half of the non-blocking eviction contract through the
+// production Acquire entry point: while another goroutine holds the
+// victim's per-mirror mutex inside an in-flight Ensure (blocked resolving
+// auth for its clone), an over-budget Acquire for another remote degrades
+// promptly instead of stalling on the mutex while holding the keeper
+// lock, and the victim is skipped rather than evicted.
+func TestRepoKeeper_OverBudgetAcquireSkipsInProcessBusyVictim(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	other := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
+	lease, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("first Acquire ok=false, want a served mirror")
+	}
+	digest := filepath.Base(lease.Dir())
+	k.RecordFetch(digest, 1<<30, time.Second, false)
+	lease.Release()
+
+	scope, err := k.scope(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("scope() error = %v", err)
+	}
+	// Force the next Ensure for the victim onto the clone path (which
+	// resolves auth while holding the victim's per-mirror mutex) by
+	// removing its directory; the catalog row stays, so the victim is
+	// still the eviction candidate.
+	if err := os.RemoveAll(k.store.MirrorDir(digest)); err != nil {
+		t.Fatalf("RemoveAll(victim) error = %v", err)
+	}
+
+	authEntered := make(chan struct{})
+	releaseAuth := make(chan struct{})
+	authErr := errors.New("blocked auth released")
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, err := k.store.EnsureWithAuth(context.Background(), remote, scope, repokeeper.GitAuth(
+			func(context.Context, string) (string, bool, error) {
+				close(authEntered)
+				<-releaseAuth
+				return "", false, authErr
+			}))
+		ensureDone <- err
+	}()
+	defer func() {
+		close(releaseAuth)
+		if err := <-ensureDone; !errors.Is(err, authErr) {
+			t.Errorf("in-flight Ensure error = %v, want the released auth error", err)
+		}
+	}()
+	select {
+	case <-authEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("in-flight Ensure never reached auth resolution")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		_, ok := k.Acquire(ctx, other)
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if elapsed := time.Since(start); elapsed >= 2*time.Second {
+			t.Errorf("over-budget Acquire blocked %v on a held mirror mutex, want prompt degrade", elapsed)
+		}
+		if ok {
+			t.Error("over-budget Acquire ok=true, want degradation to plain clone")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("over-budget Acquire stalled on a held mirror mutex")
+	}
+	// A skipped victim is not an eviction: no evict event is recorded
+	// and the keeper's use marker for the victim survives the pass. A
+	// busy-as-removed bug would drop both while leaving the mirror on
+	// disk, silently shrinking the serving set.
+	for _, ev := range k.Events() {
+		if ev.Type == RepoKeeperEventEvict {
+			t.Errorf("eviction recorded an evict event for a skipped busy victim, want no eviction")
+		}
+	}
+	k.mu.Lock()
+	_, pinned := k.lastUse[digest]
+	k.mu.Unlock()
+	if !pinned {
+		t.Error("busy victim dropped from the keeper's use markers, want it kept for the pass")
+	}
+}
