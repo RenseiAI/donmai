@@ -134,6 +134,22 @@ func syscallFlockExclusive(fd int) error {
 	return nil
 }
 
+// tryLockExclusiveNB attempts an exclusive (maintenance) flock without
+// waiting: it reports held=false when another holder — a lease in this
+// or another process sharing the state dir — owns either side of the
+// lock. Budget eviction uses it so a leased mirror is skipped as a
+// victim instead of stalling the caller (which may hold the keeper lock)
+// until the lease releases.
+func tryLockExclusiveNB(fd int) (bool, error) {
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		return true, nil
+	} else if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return false, nil
+	} else {
+		return false, fmt.Errorf("repo keeper: take exclusive mirror lock: %w", err)
+	}
+}
+
 // unlockAndClose releases the flock and closes the file. Either half may
 // fail on a torn-down descriptor; the first error is reported.
 func unlockAndClose(lock *os.File) error {
@@ -158,7 +174,7 @@ func unlockAndClose(lock *os.File) error {
 
 // intFileDescriptor narrows a uintptr fd to int for syscall.Flock.
 func intFileDescriptor(fd uintptr) (int, error) {
-	intFD := int(fd)
+	intFD := int(fd) //nolint:gosec // G115: OS file descriptors are int-sized.
 	if intFD < 0 || uintptr(intFD) != fd {
 		return 0, fmt.Errorf("repo keeper: lock file descriptor out of range")
 	}

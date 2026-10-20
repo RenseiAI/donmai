@@ -207,8 +207,11 @@ func TestCanonicalRemoteIdentityMatrix(t *testing.T) {
 	if otherDigest == thisDigest {
 		t.Error("two ssh login users share one mirror digest, want one mirror each")
 	}
-	// Unsupported transports are refused before git starts.
-	for _, source := range []string{"git://example.com/org/repo.git", "ext::sh -c echo"} {
+	// Unsupported transports are refused before git starts. Plain http is
+	// refused up front too: the keeper's git environment allows only
+	// file/https/ssh, so an http source would otherwise fail inside git
+	// instead of with the typed refusal.
+	for _, source := range []string{"git://example.com/org/repo.git", "ext::sh -c echo", "http://example.com/org/repo.git"} {
 		if _, _, err := CanonicalRemote(source); err == nil {
 			t.Errorf("CanonicalRemote(%q) error = nil, want a refusal", source)
 		}

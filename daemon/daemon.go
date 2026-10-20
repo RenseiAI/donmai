@@ -880,8 +880,14 @@ func (d *Daemon) repoKeeperFor(worktreeParentDir string) *RepoKeeper {
 func (d *Daemon) reconcileRepoKeeper(ctx context.Context, worktreeParentDir string) {
 	keeper := d.repoKeeperFor(worktreeParentDir)
 	d.mu.Lock()
+	old := d.repoKeeper
 	d.repoKeeper = keeper
 	d.mu.Unlock()
+	// Each rebuilt store holds one root fd: release the replaced one.
+	// Outstanding leases from the old store stay valid until Release.
+	if old != nil && old != keeper {
+		_ = old.Close()
+	}
 	if keeper == nil {
 		return
 	}
@@ -2650,9 +2656,17 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	d.mu.Lock()
 	gw := d.gateway
 	d.gateway = nil
+	keeper := d.repoKeeper
+	d.repoKeeper = nil
 	d.mu.Unlock()
 	if gw != nil {
 		_ = gw.Stop(ctx)
+	}
+	// Release the keeper's store root handle. Outstanding leases stay
+	// valid until their own Release; no new Acquire can arrive after
+	// the state below publishes Stopped.
+	if keeper != nil {
+		_ = keeper.Close()
 	}
 
 	d.lifecycleMu.Lock()

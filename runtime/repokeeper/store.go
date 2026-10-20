@@ -175,10 +175,22 @@ func staleStagingPrefix(name string) bool {
 // keeper root and the mirrors directory: the clone, eviction, and catalog
 // temp prefixes the store publishes through. Only those prefixes are
 // removed; live mirror directories (64-hex digests) and the published
-// catalog are never touched. A leftover that cannot be removed is logged
-// and skipped, never fatal: the next clone renames over a free name
-// rather than reusing the leftover.
+// catalog are never touched. Like the per-Ensure sweeper, only entries
+// older than stagingStaleAfter are reaped: New runs at process start,
+// when another process sharing the state dir may hold a live staging
+// sibling from its own in-flight clone or catalog publish. A leftover
+// that cannot be removed is logged and skipped, never fatal: the next
+// clone renames over a free name rather than reusing the leftover.
 func (s *Store) sweepStagingDirs() {
+	s.sweepStagingDirsAfter(stagingStaleAfter)
+}
+
+// sweepStagingDirsAfter reaps staging siblings older than olderThan. The
+// age gate is what makes the sweep safe across processes sharing one
+// state dir: a live sibling owned by a concurrent Store is fresh, so it
+// is never touched.
+func (s *Store) sweepStagingDirsAfter(olderThan time.Duration) {
+	cutoff := time.Now().Add(-olderThan)
 	for _, dir := range []string{
 		filepath.Join(s.stateDir, keeperDirName, mirrorsDirName),
 		filepath.Join(s.stateDir, keeperDirName),
@@ -189,6 +201,10 @@ func (s *Store) sweepStagingDirs() {
 		}
 		for _, entry := range entries {
 			if !staleStagingPrefix(entry.Name()) {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil || info.ModTime().After(cutoff) {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
@@ -327,6 +343,9 @@ func (s *Store) EnsureWithAuth(ctx context.Context, source, scope string, auth G
 	// any existing one; a verification failure removes it again so a
 	// mirror that fails its first verification never stays on disk for a
 	// later call to trip over.
+	if afterPublishHookForTest != nil {
+		afterPublishHookForTest(dir)
+	}
 	lease, err := s.openVerifiedLease(ctx, dir, digest, canonical, scope)
 	if err != nil {
 		s.unpublishFailedMirror(digest, dir)
@@ -468,23 +487,29 @@ func (s *Store) unpublishFailedMirror(digest, dir string) {
 	_ = os.RemoveAll(staging)
 	s.catalogMu.Lock()
 	defer s.catalogMu.Unlock()
-	entries, err := readCatalog(s.catalogPath())
-	if err != nil {
-		return
-	}
-	kept := entries[:0]
-	for _, entry := range entries {
-		if entry.Digest != digest {
-			kept = append(kept, entry)
+	_ = s.updateCatalogLocked(func(entries []MirrorEntry) ([]MirrorEntry, error) {
+		kept := entries[:0]
+		for _, entry := range entries {
+			if entry.Digest != digest {
+				kept = append(kept, entry)
+			}
 		}
-	}
-	_ = s.writeCatalogLocked(kept)
+		return kept, nil
+	})
 }
 
 // errMirrorRaceLost is an internal signal: the publish rename lost to
 // another process's winner. The caller drops its exclusive lock and
 // re-verifies the winner under a shared lock; it never escapes Ensure.
 var errMirrorRaceLost = errors.New("repo keeper: lost the mirror publish race")
+
+// afterPublishHookForTest runs between the publish rename and the first
+// verification of a freshly cloned mirror. Tests set it to plant a poison
+// fixture (for example an executable hook) so Ensure's first-verification
+// path — including its unpublish cleanup — is driven through the
+// production entry point. It is nil in production and must be reset by
+// each test that sets it.
+var afterPublishHookForTest func(dir string)
 
 // mustRemoteDigest recomputes the remote digest for a canonical remote
 // the store just resolved. It cannot fail: canonical already parsed
@@ -500,8 +525,8 @@ func mustRemoteDigest(canonical string) string {
 
 // verifyMirror re-verifies an existing mirror before every use: its
 // identity sidecar must record exactly this canonical remote and scope,
-// the directory must hold no alternates file and no symlinked control
-// files, its git config must carry only keys a fresh hermetic clone
+// the directory must hold no alternates file, no commondir/gitdir
+// redirect, and no symlinked control files, its git config must carry only keys a fresh hermetic clone
 // writes, and its git origin must still equal the canonical remote. Any
 // mismatch fails closed.
 //
@@ -536,6 +561,25 @@ func (s *Store) verifyMirror(mirrorDir, digest, canonical, scope string) error {
 		return fmt.Errorf("%w: mirror carries an alternates file", ErrOriginMismatch)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("repo keeper: inspect mirror alternates: %w", err)
+	}
+	// A planted commondir or gitdir file redirects the whole mirror at
+	// another scope's directory the same way an alternates file does:
+	// git honours $GIT_DIR/commondir and takes objects, refs, and config
+	// from the target, and the identity and config checks below would
+	// then read the target's values and pass. A hermetic clone writes
+	// neither file, so either fails closed. objects/info/http-alternates
+	// is the same hole class one level down (an alternate objects store
+	// for dumb-HTTP transports).
+	for _, redirect := range []string{
+		"commondir",
+		"gitdir",
+		filepath.Join("objects", "info", "http-alternates"),
+	} {
+		if _, err := os.Lstat(filepath.Join(mirrorDir, redirect)); err == nil {
+			return fmt.Errorf("%w: mirror carries a redirect file", ErrOriginMismatch)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("repo keeper: inspect mirror redirect: %w", err)
+		}
 	}
 	// A planted hooks directory would hand executable hooks to any
 	// non-hermetic consumer of the mirror. A hermetic clone writes no
@@ -791,22 +835,20 @@ func (s *Store) List() ([]MirrorEntry, error) {
 func (s *Store) MarkRevoked(digest string, revoked bool) error {
 	s.catalogMu.Lock()
 	defer s.catalogMu.Unlock()
-	entries, err := readCatalog(s.catalogPath())
-	if err != nil {
-		return err
-	}
-	found := false
-	for i := range entries {
-		if entries[i].Digest != digest {
-			continue
+	return s.updateCatalogLocked(func(entries []MirrorEntry) ([]MirrorEntry, error) {
+		found := false
+		for i := range entries {
+			if entries[i].Digest != digest {
+				continue
+			}
+			entries[i].Revoked = revoked
+			found = true
 		}
-		entries[i].Revoked = revoked
-		found = true
-	}
-	if !found {
-		entries = append(entries, MirrorEntry{Digest: digest, Revoked: revoked})
-	}
-	return s.writeCatalogLocked(entries)
+		if !found {
+			entries = append(entries, MirrorEntry{Digest: digest, Revoked: revoked})
+		}
+		return entries, nil
+	})
 }
 
 // lockMirror returns the unlock func serializing Ensure for one mirror
@@ -827,6 +869,28 @@ func (s *Store) lockMirror(digest string) func() {
 	s.mu.Unlock()
 	mu.Lock()
 	return mu.Unlock
+}
+
+// tryLockMirror attempts the per-mirror in-process mutex without
+// waiting, for eviction paths that must never stall the keeper lock. It
+// reports ok=false when another goroutine in this process holds the
+// mirror (an in-flight Ensure or Remove). Cross-process exclusion still
+// comes from the flock side, taken inside.
+func (s *Store) tryLockMirror(digest string) (func(), bool) {
+	s.mu.Lock()
+	if s.mirrorMu == nil {
+		s.mirrorMu = make(map[string]*sync.Mutex)
+	}
+	mu, ok := s.mirrorMu[digest]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.mirrorMu[digest] = mu
+	}
+	s.mu.Unlock()
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return mu.Unlock, true
 }
 
 // cloneEnv builds the environment for the fresh-clone git invocation: the
@@ -917,27 +981,70 @@ func (s *Store) catalogPath() string {
 // across processes sharing the state dir. Readers need neither: the
 // rename-publish makes every read see the old or the new document, never
 // a torn one.
+//
+// Prefer updateCatalogLocked for read-modify-write updates: it holds the
+// cross-process flock across the read and the write, so two processes
+// cannot both read, modify, and publish with one update lost.
 func (s *Store) writeCatalogLocked(entries []MirrorEntry) error {
 	if err := s.root.MkdirAll(keeperDirName, 0o700); err != nil {
 		return fmt.Errorf("repo keeper: create keeper dir: %w", err)
 	}
+	lock, unlock, err := s.lockCatalog()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unlock(lock) }()
+	return writeCatalog(s.catalogPath(), entries)
+}
+
+// lockCatalog opens the keeper-root catalog lock and takes the exclusive
+// flock. The caller owns the returned file until unlock runs it. The
+// critical section it guards is short (one catalog read-modify-write);
+// it blocks without a ctx, and a dead holder releases its lock with its
+// file description, so this cannot wedge on a crash.
+func (s *Store) lockCatalog() (*os.File, func(*os.File) error, error) {
+	if err := s.root.MkdirAll(keeperDirName, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("repo keeper: create keeper dir: %w", err)
+	}
 	lock, err := s.root.OpenFile(filepath.Join(keeperDirName, ".catalog.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("repo keeper: open catalog lock: %w", err)
+		return nil, nil, fmt.Errorf("repo keeper: open catalog lock: %w", err)
 	}
 	fd, err := intFileDescriptor(lock.Fd())
 	if err != nil {
 		_ = lock.Close()
-		return err
+		return nil, nil, err
 	}
-	// The catalog critical section is short (one read-modify-write the
-	// caller already did, one atomic publish here); block without a ctx.
 	if err := syscallFlockExclusive(fd); err != nil {
 		_ = lock.Close()
+		return nil, nil, err
+	}
+	return lock, unlockAndClose, nil
+}
+
+// updateCatalogLocked runs fn against the catalog under both locks: the
+// caller holds catalogMu for in-process serialization, and this takes the
+// keeper-root flock before reading so the whole read-modify-write is one
+// cross-process critical section. Two processes sharing the state dir
+// cannot interleave a read between another's read and write and lose an
+// update — including the Revoked flag, which feeds Acquire's revoked
+// gate. fn may return the entries unchanged to publish nothing new;
+// returning an error aborts without writing.
+func (s *Store) updateCatalogLocked(fn func([]MirrorEntry) ([]MirrorEntry, error)) error {
+	lock, unlock, err := s.lockCatalog()
+	if err != nil {
 		return err
 	}
-	defer func() { _ = unlockAndClose(lock) }()
-	return writeCatalog(s.catalogPath(), entries)
+	defer func() { _ = unlock(lock) }()
+	entries, err := readCatalog(s.catalogPath())
+	if err != nil {
+		return err
+	}
+	next, err := fn(entries)
+	if err != nil {
+		return err
+	}
+	return writeCatalog(s.catalogPath(), next)
 }
 
 // ctxBackground detaches mirror re-verification reads from the caller's

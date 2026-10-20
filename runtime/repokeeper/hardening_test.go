@@ -174,6 +174,9 @@ func TestEnsureRefusesUnsupportedTransport(t *testing.T) {
 	if _, err := store.Ensure(context.Background(), "git://example.com/org/repo.git", ""); err == nil {
 		t.Fatal("Ensure(git transport) error = nil, want a refusal")
 	}
+	if _, err := store.Ensure(context.Background(), "http://example.com/org/repo.git", ""); err == nil {
+		t.Fatal("Ensure(http transport) error = nil, want a refusal")
+	}
 	leftovers, err := os.ReadDir(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName))
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read mirrors dir: %v", err)
@@ -671,5 +674,278 @@ func TestKeeperGitEnvIsHermetic(t *testing.T) {
 		if values[want[0]] != want[1] {
 			t.Errorf("keeper git config %q = %q, want %q", want[0], values[want[0]], want[1])
 		}
+	}
+}
+
+// TestVerifyRefusesRedirectFiles drives the production Ensure entry point
+// against mirrors carrying a commondir or gitdir redirect, or an
+// objects/info/http-alternates file: each would steer git's reads at
+// another scope's mirror the way a planted alternates file does, so each
+// must fail closed with ErrOriginMismatch rather than be served.
+func TestVerifyRefusesRedirectFiles(t *testing.T) {
+	t.Parallel()
+	redirects := []string{
+		"commondir",
+		"gitdir",
+		filepath.Join("objects", "info", "http-alternates"),
+	}
+	for _, redirect := range redirects {
+		t.Run(strings.ReplaceAll(redirect, string(filepath.Separator), "_"), func(t *testing.T) {
+			t.Parallel()
+			srcDir, _ := newSourceRepo(t)
+			store := newTestStore(t)
+
+			leaseA, err := store.Ensure(context.Background(), srcDir, "scope-a")
+			if err != nil {
+				t.Fatalf("Ensure(scope-a) error = %v", err)
+			}
+			dirA := leaseA.Dir()
+			leaseA.Release()
+			leaseB, err := store.Ensure(context.Background(), srcDir, "scope-b")
+			if err != nil {
+				t.Fatalf("Ensure(scope-b) error = %v", err)
+			}
+			dirB := leaseB.Dir()
+			leaseB.Release()
+
+			target := dirA
+			if redirect == "commondir" {
+				// A commondir file carries the target directory path.
+				if err := os.WriteFile(filepath.Join(dirB, redirect), []byte(target+"\n"), 0o600); err != nil {
+					t.Fatalf("plant %s: %v", redirect, err)
+				}
+			} else if redirect == "gitdir" {
+				if err := os.WriteFile(filepath.Join(dirB, redirect), []byte(target+"\n"), 0o600); err != nil {
+					t.Fatalf("plant %s: %v", redirect, err)
+				}
+			} else {
+				if err := os.MkdirAll(filepath.Join(dirB, "objects", "info"), 0o700); err != nil {
+					t.Fatalf("create objects/info: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dirB, redirect), []byte(filepath.Join(dirA, "objects")+"\n"), 0o600); err != nil {
+					t.Fatalf("plant %s: %v", redirect, err)
+				}
+			}
+			if _, err := store.Ensure(context.Background(), srcDir, "scope-b"); !errors.Is(err, ErrOriginMismatch) {
+				t.Fatalf("Ensure(planted %s) error = %v, want ErrOriginMismatch", redirect, err)
+			}
+		})
+	}
+}
+
+// TestVerifyRefusesPlantedQueryOrigin drives the production Ensure entry
+// point against a mirror whose recorded origin carries a query string the
+// identity drops: the exact-match guard must refuse it, because the
+// canonicalizing get-url check alone strips the query and would serve a
+// mirror that git resolves at a different repository.
+func TestVerifyRefusesPlantedQueryOrigin(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	source := "file://" + srcDir
+	store := newTestStore(t)
+
+	lease, err := store.Ensure(context.Background(), source, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	dir := lease.Dir()
+	lease.Release()
+
+	canonical, _, err := CanonicalRemote(source)
+	if err != nil {
+		t.Fatalf("CanonicalRemote() error = %v", err)
+	}
+	plantBadConfigKey(t, dir, "remote.origin.url", canonical+"?redirect")
+	if _, err := store.Ensure(context.Background(), source, ""); !errors.Is(err, ErrOriginMismatch) {
+		t.Fatalf("Ensure(planted query origin) error = %v, want ErrOriginMismatch", err)
+	}
+}
+
+// TestEnsureFirstVerificationFailureUnpublishes drives the production
+// Ensure entry point with a mirror that fails its first verification: the
+// plant lands between the publish rename and the verification read, and
+// the failed mirror must be unpublished — gone from disk — rather than
+// left for a later call to trip over. Deleting the unpublish call leaves
+// the directory behind and this test goes RED.
+func TestEnsureFirstVerificationFailureUnpublishes(t *testing.T) {
+	// Sets a package-global hook: never parallel, so no concurrent fresh
+	// Ensure in this package can observe the plant.
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	afterPublishHookForTest = func(dir string) {
+		if err := os.MkdirAll(filepath.Join(dir, "hooks"), 0o700); err != nil {
+			panic(err)
+		}
+		//nolint:gosec // G306: the fixture hook must be executable to fail verification.
+		if err := os.WriteFile(filepath.Join(dir, "hooks", "post-checkout"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			panic(err)
+		}
+	}
+	defer func() { afterPublishHookForTest = nil }()
+
+	if _, err := store.Ensure(context.Background(), srcDir, ""); !errors.Is(err, ErrOriginMismatch) {
+		t.Fatalf("Ensure(planted first verify) error = %v, want ErrOriginMismatch", err)
+	}
+	canonical, _, err := CanonicalRemote(srcDir)
+	if err != nil {
+		t.Fatalf("CanonicalRemote() error = %v", err)
+	}
+	digest, err := ScopeDigest(mustRemoteDigest(canonical), "")
+	if err != nil {
+		t.Fatalf("ScopeDigest() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName, digest)); !os.IsNotExist(err) {
+		t.Errorf("failed first-verification mirror still on disk: err = %v", err)
+	}
+}
+
+// TestNewSweepIsAgeGated pins the startup sweep's cross-process safety: a
+// second Store starting while another process holds a live staging sibling
+// must leave the fresh entry alone, while a crash-left stale entry is
+// still reaped.
+func TestNewSweepIsAgeGated(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	mirrors := filepath.Join(stateDir, keeperDirName, mirrorsDirName)
+	if err := os.MkdirAll(mirrors, 0o700); err != nil {
+		t.Fatalf("create mirrors dir: %v", err)
+	}
+	live := filepath.Join(mirrors, ".clone-live.tmp")
+	if err := os.MkdirAll(live, 0o700); err != nil {
+		t.Fatalf("create live staging: %v", err)
+	}
+	stale := filepath.Join(mirrors, ".clone-stale.tmp")
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatalf("create stale staging: %v", err)
+	}
+	past := time.Now().Add(-2 * stagingStaleAfter)
+	if err := os.Chtimes(stale, past, past); err != nil {
+		t.Fatalf("backdate stale staging: %v", err)
+	}
+
+	store, err := New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := os.Lstat(live); err != nil {
+		t.Errorf("live staging reaped at New: %v", err)
+	}
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale staging still on disk after New: err = %v", err)
+	}
+}
+
+// TestCatalogConcurrentStoresLoseNoUpdates pins the cross-process catalog
+// contract: two Store instances over one state dir publishing different
+// rows concurrently must both survive. With the flock covering only the
+// write, both readers load the same document and one update is lost.
+func TestCatalogConcurrentStoresLoseNoUpdates(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	first, err := New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("New(first) error = %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := New(stateDir, worktreeRoot, nil)
+	if err != nil {
+		t.Fatalf("New(second) error = %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	const pairs = 10
+	var wg sync.WaitGroup
+	for i := 0; i < pairs; i++ {
+		digestA := strings.Repeat("a", 62) + string(rune('0'+i/10)) + string(rune('0'+i%10))
+		digestB := strings.Repeat("b", 62) + string(rune('0'+i/10)) + string(rune('0'+i%10))
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := first.RecordFetch(digestA, time.Now(), int64(i), false); err != nil {
+				t.Errorf("first RecordFetch error = %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := second.RecordFetch(digestB, time.Now(), int64(i), false); err != nil {
+				t.Errorf("second RecordFetch error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	entries, err := first.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(entries) != 2*pairs {
+		t.Fatalf("catalog holds %d rows, want %d: concurrent updates were lost", len(entries), 2*pairs)
+	}
+}
+
+// TestEnsureCloneErrorCarriesNoSource pins the error-hygiene contract: a
+// failing clone's error must not echo the source URL (or its diagnostics),
+// so a credential-bearing value can never leak through an error string.
+func TestEnsureCloneErrorCarriesNoSource(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+
+	const marker = "nonexistent-keeper-source"
+	if _, err := store.Ensure(context.Background(), "file:///tmp/"+marker+"-repo.git", ""); err == nil {
+		t.Fatal("Ensure(missing source) error = nil, want a clone failure")
+	} else if strings.Contains(err.Error(), marker) {
+		t.Errorf("clone error echoes the source: %v", err)
+	}
+}
+
+// TestTryRemoveSkipsHeldLease pins the non-blocking removal contract:
+// TryRemove reports removed=false while a lease is outstanding instead of
+// waiting for it, and removes after the lease releases. Budget eviction
+// relies on it so a leased mirror is skipped as a victim rather than
+// stalling the keeper lock.
+func TestTryRemoveSkipsHeldLease(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	lease, err := store.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	digest := lease.Digest()
+
+	if removed, err := store.TryRemove(digest); err != nil {
+		t.Fatalf("TryRemove(held) error = %v", err)
+	} else if removed {
+		t.Error("TryRemove(held lease) removed=true, want false while the lease is outstanding")
+	}
+	if _, err := os.Lstat(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName, digest)); err != nil {
+		t.Errorf("held mirror missing after skipped TryRemove: %v", err)
+	}
+	lease.Release()
+	if removed, err := store.TryRemove(digest); err != nil {
+		t.Fatalf("TryRemove(released) error = %v", err)
+	} else if !removed {
+		t.Error("TryRemove(released lease) removed=false, want true after the lease released")
+	}
+	if _, err := os.Lstat(filepath.Join(store.stateDir, keeperDirName, mirrorsDirName, digest)); !os.IsNotExist(err) {
+		t.Errorf("removed mirror still on disk: err = %v", err)
 	}
 }

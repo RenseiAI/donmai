@@ -320,10 +320,13 @@ func TestRepoKeeper_BudgetExceededFallsBackToPlainClone(t *testing.T) {
 	k.RecordFetch(digest, 1<<30, time.Second, false)
 
 	if dir2Lease, ok := k.Acquire(context.Background(), other); ok {
-		t.Errorf("over-budget Acquire ok=true (dir %v), want degradation to plain clone", dir2Lease)
+		dir2Lease.Release()
+		t.Errorf("over-budget Acquire ok=true, want degradation to plain clone")
 	}
-	if _, ok := k.Acquire(context.Background(), remote); !ok {
+	if existing, ok := k.Acquire(context.Background(), remote); !ok {
 		t.Error("existing mirror must still serve while over budget")
+	} else {
+		existing.Release()
 	}
 }
 
@@ -356,9 +359,10 @@ func TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed(t *testing.T) {
 		digests = append(digests, filepath.Base(dirLease.Dir()))
 		leases = append(leases, dirLease)
 	}
-	// Eviction takes the exclusive maintenance lock, which waits for
-	// outstanding leases: release every acquired lease before enforcing
-	// the budget, as a seeding caller would after its clone finishes.
+	// Eviction removes non-blocking: a leased mirror is skipped as a
+	// victim for the pass, so every acquired lease is released before
+	// enforcing the budget, as a seeding caller would after its clone
+	// finishes.
 	for _, lease := range leases {
 		lease.Release()
 	}
@@ -1120,5 +1124,74 @@ func TestRepoKeeper_CombinedRootProbe(t *testing.T) {
 				t.Errorf("evicted digest %q still listed by the second store", digest)
 			}
 		}
+	}
+}
+
+// TestRepoKeeper_OverBudgetAcquireSkipsLeasedVictim proves eviction never
+// waits on a lease while holding the keeper lock: with the budget
+// exhausted and the only mirror's lease held, an over-budget Acquire for
+// another remote degrades promptly instead of blocking until the lease
+// releases, and the leased victim survives the pass. Releasing the lease
+// then lets the next enforcement evict it.
+func TestRepoKeeper_OverBudgetAcquireSkipsLeasedVictim(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	other := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
+	lease, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("first Acquire ok=false, want a served mirror")
+	}
+	defer lease.Release()
+	digest := filepath.Base(lease.Dir())
+	k.RecordFetch(digest, 1<<30, time.Second, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		_, ok := k.Acquire(ctx, other)
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if elapsed := time.Since(start); elapsed >= 2*time.Second {
+			t.Errorf("over-budget Acquire blocked %v on a held lease, want prompt degrade", elapsed)
+		}
+		if ok {
+			t.Error("over-budget Acquire ok=true, want degradation to plain clone")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("over-budget Acquire stalled on a held lease")
+	}
+	if _, err := os.Stat(k.store.MirrorDir(digest)); err != nil {
+		t.Errorf("leased victim missing after the eviction pass: %v", err)
+	}
+}
+
+// TestRepoKeeper_CloseReleasesStoreRoot pins the fd lifecycle: closing the
+// keeper releases the store's root handle without invalidating outstanding
+// leases, and a later Acquire degrades instead of serving from a closed
+// store.
+func TestRepoKeeper_CloseReleasesStoreRoot(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	lease, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("Acquire ok=false, want a served mirror")
+	}
+	defer lease.Release()
+	if err := k.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := lease.Dir(); got == "" {
+		t.Error("outstanding lease lost its directory after Close")
+	}
+	if _, ok := k.Acquire(context.Background(), remote); ok {
+		t.Error("Acquire after Close ok=true, want degradation to plain clone")
 	}
 }

@@ -82,7 +82,7 @@ func detectOpaqueCredential(trimmed string) bool {
 // an error.
 //
 // Only the file, https, and ssh transports are supported: anything else
-// (git://, ext::, remote helpers) is refused before git starts, and the
+// (plain http, git://, ext::, remote helpers) is refused before git starts, and the
 // keeper's git environment blocks it again at transport time. A non-ssh
 // URL carrying userinfo is refused before anything is written: the
 // credential would otherwise reach git's argv (visible via ps) and the
@@ -109,7 +109,7 @@ func resolveSource(source string) (canonical, digest string, err error) {
 	case parseErr == nil && parsed.Scheme != "":
 		scheme := strings.ToLower(parsed.Scheme)
 		switch scheme {
-		case "https", "http", "ssh", "file":
+		case "https", "ssh", "file":
 		default:
 			return "", "", fmt.Errorf("repo keeper: repository source uses an unsupported transport")
 		}
