@@ -20,13 +20,19 @@ import (
 
 // wipSecretContentRE matches common secret token shapes that must never
 // enter a remote WIP checkpoint: provider-issued tokens, cloud access-key
-// IDs, chat-platform tokens and PEM private-key blocks.
-var wipSecretContentRE = regexp.MustCompile(`(?:gh[pohu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)`)
+// IDs, chat-platform tokens, PEM private-key blocks and connection-string
+// userinfo. The GitHub shape is intentionally wide (gh[a-z]_): it covers
+// ghp_/gho_/ghs_/ghr_/ghu_ and any future single-letter prefix without
+// another allow-list update. The sk- shape allows - and _ so project and
+// service keys (sk-proj-, sk-svcacct-) match like plain sk- keys.
+var wipSecretContentRE = regexp.MustCompile(`(?:gh[a-z]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|://[^/\s]+:[^/\s]+@)`)
 
-// wipSecretEnvNameRE matches environment variable names whose values are
-// treated as secrets by the content gate: anything token-, key-,
-// secret- or password-shaped.
-var wipSecretEnvNameRE = regexp.MustCompile(`(?i)TOKEN|KEY|SECRET|PASSWORD`)
+// wipSecretEnvNameRE matches environment variable names whose process-env
+// values are treated as secrets by the content gate. Session env values
+// (qw.Env) are all treated as secrets without a name check: a session that
+// carries a credential under an innocuous name (DATABASE_URL, CONFIG) must
+// still fail closed.
+var wipSecretEnvNameRE = regexp.MustCompile(`(?i)TOKEN|KEY|SECRET|PASS|PAT\b|CREDENTIAL|AUTH|_URL$|DSN`)
 
 const (
 	// wipSecretMinValueLen floors secret values: short values ("top",
@@ -46,9 +52,10 @@ const (
 )
 
 // wipCheckpointSecretValues collects the secret values the checkpoint's
-// content gate scans for: the session bearers, the session env values with
-// secret-shaped names, and the process env values with secret-shaped names
-// (provider keys and credential files reach the checkout through all three).
+// content gate scans for: the session bearers, ALL session env values (a
+// credential under an innocuous name is still a credential), and the
+// process env values with secret-shaped names (provider keys and
+// credential files reach the checkout through all three).
 func wipCheckpointSecretValues(qw QueuedWork) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -61,10 +68,8 @@ func wipCheckpointSecretValues(qw QueuedWork) []string {
 	}
 	add(qw.AuthToken)
 	add(qw.McpAuthToken)
-	for name, value := range qw.Env {
-		if wipSecretEnvNameRE.MatchString(name) {
-			add(value)
-		}
+	for _, value := range qw.Env {
+		add(value)
 	}
 	for _, kv := range os.Environ() {
 		if name, value, ok := strings.Cut(kv, "="); ok && wipSecretEnvNameRE.MatchString(name) {
@@ -95,9 +100,10 @@ func blobSize(out string) (int64, error) {
 }
 
 // stagedBlobHasSecret reports whether the scratch-index blob :path carries
-// a secret. Oversize and binary blobs skip the content gate (the name rules
-// still apply to them); any git failure errors so the caller can fail
-// closed on the path.
+// a secret. Oversize, binary and unreadable blobs ERROR so the caller fails
+// closed on the whole checkpoint: the push publishes every blob it cannot
+// scan otherwise, and scanning bytes needs no text decode. Any git failure
+// errors the same way.
 func stagedBlobHasSecret(ctx context.Context, dir string, env []string, path string, values []string) (bool, error) {
 	sizeOut, err := checkpointGitStdout(ctx, dir, env, "cat-file", "-s", ":"+path)
 	if err != nil {
@@ -108,117 +114,123 @@ func stagedBlobHasSecret(ctx context.Context, dir string, env []string, path str
 		return false, err
 	}
 	if size > wipSecretScanMaxBytes {
-		return false, nil
+		return false, fmt.Errorf("unscannable staged blob %q: %d bytes over the %d-byte scan cap", path, size, wipSecretScanMaxBytes)
 	}
 	blob, err := checkpointGitStdout(ctx, dir, env, "show", ":"+path)
 	if err != nil {
 		return false, fmt.Errorf("read staged blob: %w", err)
 	}
 	if strings.IndexByte(blob, 0) >= 0 {
-		return false, nil
+		return false, fmt.Errorf("unscannable staged blob %q: binary content", path)
 	}
 	return blobContainsSecret(blob, values), nil
 }
 
 // refBlobHasSecret reports whether the blob at rev:path carries a secret.
-// A path missing from rev (deleted later in the range) is not in the
-// published tree and reports no hit; oversize and binary blobs skip the
-// content gate like the staged gate above. A blob that sizes fine but then
-// fails to read errors so the caller can fail closed on the push.
+// Oversize, binary and unreadable blobs ERROR so the caller fails closed on
+// the whole push. A blob that sizes fine but then fails to read errors the
+// same way. Callers only invoke it for paths present in rev (added or
+// modified in that commit); a deleted path is never scanned.
 func refBlobHasSecret(ctx context.Context, dir, rev, path string, values []string) (bool, error) {
 	sizeOut, err := checkpointGitStdout(ctx, dir, nil, "cat-file", "-s", rev+":"+path)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("size blob at %s: %w", rev, err)
 	}
 	size, err := blobSize(sizeOut)
 	if err != nil {
 		return false, err
 	}
 	if size > wipSecretScanMaxBytes {
-		return false, nil
+		return false, fmt.Errorf("unscannable blob %q at %s: %d bytes over the %d-byte scan cap", path, rev, size, wipSecretScanMaxBytes)
 	}
 	blob, err := checkpointGitStdout(ctx, dir, nil, "show", rev+":"+path)
 	if err != nil {
 		return false, fmt.Errorf("read blob at %s: %w", rev, err)
 	}
 	if strings.IndexByte(blob, 0) >= 0 {
-		return false, nil
+		return false, fmt.Errorf("unscannable blob %q at %s: binary content", path, rev)
 	}
 	return blobContainsSecret(blob, values), nil
 }
 
-// splitNULPaths splits one `git -z` name output into its paths.
-func splitNULPaths(out string) []string {
-	var paths []string
-	for _, p := range strings.Split(out, "\x00") {
-		if p != "" {
-			paths = append(paths, p)
-		}
-	}
-	return paths
-}
-
-// checkpointHistoryPaths lists the paths the WIP push would newly publish:
-// the provisioned-base-to-target diff, or, without a recorded base, the
-// union of files touched by the unpushed commits.
-func checkpointHistoryPaths(ctx context.Context, target rescueTarget, to string) ([]string, error) {
+// checkpointUnpushedSHAs lists every commit the WIP push would newly
+// publish, oldest first: the provisioned-base-to-target range, or, without
+// a recorded base, the unpushed commits on HEAD. One per-commit walk covers
+// both modes so the base branch cannot drift weaker than the no-base walk.
+func checkpointUnpushedSHAs(ctx context.Context, target rescueTarget, to string) ([]string, error) {
 	if target.base != "" {
-		out, err := checkpointGitStdout(ctx, target.path, nil,
-			"-c", "core.quotePath=false", "diff", "--name-only", "-z", target.base, to, "--")
+		out, err := checkpointGitStdout(ctx, target.path, nil, "rev-list", "--reverse", target.base+".."+to, "--")
 		if err != nil {
-			return nil, fmt.Errorf("diff committed range for secret scan: %w", err)
+			return nil, fmt.Errorf("list committed range for secret scan: %w", err)
 		}
-		return splitNULPaths(out), nil
+		return filterEmpty(strings.Split(strings.TrimSpace(out), "\n")), nil
 	}
 	commits, err := unpushedCommits(ctx, target)
 	if err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
-	var paths []string
+	var shas []string
 	for _, line := range commits {
 		sha, _, _ := strings.Cut(line, " ")
-		if sha == "" {
-			continue
-		}
-		out, err := checkpointGitStdout(ctx, target.path, nil,
-			"-c", "core.quotePath=false", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-z", sha, "--")
-		if err != nil {
-			return nil, fmt.Errorf("list unpushed commit for secret scan: %w", err)
-		}
-		for _, p := range splitNULPaths(out) {
-			if !seen[p] {
-				seen[p] = true
-				paths = append(paths, p)
-			}
+		if sha != "" {
+			shas = append(shas, sha)
 		}
 	}
-	return paths, nil
+	return shas, nil
 }
+
+// commitStatusPaths splits one `git diff-tree --name-status -z` output into
+// alternating status/path fields: status, path, status, path, ... Renames
+// are disabled by the caller so every entry is one status plus one path.
 
 // checkpointHistoryDenied lists the committed-but-unpublished paths the WIP
 // push would publish that the secret filter denies, by name or by content.
-// The dirty delta is scanned separately in the scratch index; this gates the
-// committed history the push carries as-is, so a secret the session
-// committed (rather than left dirty) never leaves the host through the
-// reserved ref.
+// Every unpushed commit is walked (not just the final tree): the push
+// publishes each intermediate tree, so a secret committed and then deleted
+// or scrubbed later still leaves the host in its own commit. A deleted path
+// is name-checked only; an added or modified path is content-scanned at its
+// own commit. Any content hit, unscannable blob or read error denies the
+// range so the push is skipped with a warning and the local rescue patch
+// keeps everything.
 func checkpointHistoryDenied(ctx context.Context, target rescueTarget, to string, values []string) ([]string, error) {
-	paths, err := checkpointHistoryPaths(ctx, target, to)
+	shas, err := checkpointUnpushedSHAs(ctx, target, to)
 	if err != nil {
 		return nil, err
 	}
+	seen := map[string]bool{}
 	var denied []string
-	for _, path := range paths {
-		if shouldExcludeFromWIPCheckpoint(path) {
+	deny := func(path string) {
+		if !seen[path] {
+			seen[path] = true
 			denied = append(denied, path)
-			continue
 		}
-		hit, herr := refBlobHasSecret(ctx, target.path, to, path, values)
-		if herr != nil {
-			return nil, herr
+	}
+	for _, sha := range shas {
+		out, err := checkpointGitStdout(ctx, target.path, nil,
+			"-c", "core.quotePath=false", "diff-tree", "--no-commit-id", "--name-status", "-r", "--root", "--no-renames", "-z", sha, "--")
+		if err != nil {
+			return nil, fmt.Errorf("list unpushed commit for secret scan: %w", err)
 		}
-		if hit {
-			denied = append(denied, path)
+		fields := strings.Split(out, "\x00")
+		for i := 0; i+1 < len(fields); i += 2 {
+			status, path := fields[i], fields[i+1]
+			if path == "" {
+				continue
+			}
+			if shouldExcludeFromWIPCheckpoint(path) {
+				deny(path)
+				continue
+			}
+			if strings.HasPrefix(status, "D") {
+				continue
+			}
+			hit, herr := refBlobHasSecret(ctx, target.path, sha, path, values)
+			if herr != nil {
+				return nil, herr
+			}
+			if hit {
+				deny(path)
+			}
 		}
 	}
 	return denied, nil

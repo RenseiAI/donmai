@@ -133,10 +133,13 @@ func createWIPCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget
 	}
 	changed := meaningfulPaths(porcelainPaths(status))
 	if len(changed) > 0 {
-		commitSHA, dropped, commitErr := checkpointDirtyWorktree(ctx, target.path, head, qw)
+		commitSHA, dropped, skipped, commitErr := checkpointDirtyWorktree(ctx, target.path, head, qw)
 		warnings = append(warnings, dropped...)
 		if commitErr != nil {
 			return nil, warnings, commitErr
+		}
+		if skipped {
+			return nil, warnings, nil
 		}
 		if commitSHA != "" {
 			checkpointHead = commitSHA
@@ -193,10 +196,10 @@ func sessionCommitted(ctx context.Context, target rescueTarget, head string) (bo
 	return len(unpushed) > 0, nil
 }
 
-func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw QueuedWork) (string, []string, error) {
+func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw QueuedWork) (string, []string, bool, error) {
 	indexDir, err := os.MkdirTemp("", "provider-error-checkpoint-")
 	if err != nil {
-		return "", nil, fmt.Errorf("create scratch index dir: %w", err)
+		return "", nil, false, fmt.Errorf("create scratch index dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(indexDir) }()
 	env := append([]string{
@@ -204,15 +207,15 @@ func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw 
 		"GIT_LITERAL_PATHSPECS=1",
 	}, gitIdentityEnv(qw)...)
 	if _, err := checkpointGitStdout(ctx, worktreePath, env, "read-tree", "HEAD"); err != nil {
-		return "", nil, fmt.Errorf("seed scratch index: %w", err)
+		return "", nil, false, fmt.Errorf("seed scratch index: %w", err)
 	}
 	if _, err := checkpointGitStdout(ctx, worktreePath, env, "add", "-A", "--", "."); err != nil {
-		return "", nil, fmt.Errorf("stage working state: %w", err)
+		return "", nil, false, fmt.Errorf("stage working state: %w", err)
 	}
 	staged, err := checkpointGitStdout(ctx, worktreePath, env,
 		"-c", "core.quotePath=false", "diff", "--cached", "--name-only", "-z", "HEAD")
 	if err != nil {
-		return "", nil, fmt.Errorf("list staged working state: %w", err)
+		return "", nil, false, fmt.Errorf("list staged working state: %w", err)
 	}
 	var excluded []string
 	var survivors []string
@@ -226,56 +229,60 @@ func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw 
 			survivors = append(survivors, path)
 		}
 	}
-	// Content gate: every surviving blob is scanned for the session's own
-	// secret values and for common token shapes before it may enter the
-	// pushed tree. A hit drops the file with a warning that names the
-	// path, never the value; an unscannable file fails closed the same
-	// way, so a scan failure cannot become a leak.
+	// Content gate, fail closed on the whole checkpoint: every surviving blob
+	// is scanned for the session's own secret values and for common token
+	// shapes before it may enter the pushed tree. A hit or an unscannable
+	// blob (over the size cap, binary, unreadable) skips the remote
+	// checkpoint entirely with a warning that names the path, never the
+	// value; the local rescue patch still preserves everything. Name-denied
+	// paths above are dropped from the scratch index so ordinary credential
+	// files do not block real work; content and unscannable paths are not
+	// dropped file-by-file because a partial filtered push still publishes
+	// the range the filter missed.
 	values := wipCheckpointSecretValues(qw)
 	var warnings []string
+	var blocked []string
 	for _, path := range survivors {
 		hit, serr := stagedBlobHasSecret(ctx, worktreePath, env, path, values)
-		if serr != nil {
-			excluded = append(excluded, path)
-			warnings = append(warnings, fmt.Sprintf("WIP checkpoint dropped unscannable path %q", path))
-			continue
+		if serr != nil || hit {
+			blocked = append(blocked, path)
 		}
-		if hit {
-			excluded = append(excluded, path)
-			warnings = append(warnings, fmt.Sprintf("WIP checkpoint dropped secret-bearing path %q", path))
-		}
+	}
+	if len(blocked) > 0 {
+		warnings = append(warnings, fmt.Sprintf("WIP checkpoint skipped: dirty work holds secret-bearing path %s; work preserved locally", quoteWIPPaths(blocked)))
+		return "", warnings, true, nil
 	}
 	for i := 0; i < len(excluded); i += rescueResetBatch {
 		batch := excluded[i:min(i+rescueResetBatch, len(excluded))]
 		if _, err := checkpointGitStdout(ctx, worktreePath, env, append([]string{"reset", "-q", "HEAD", "--"}, batch...)...); err != nil {
-			return "", warnings, fmt.Errorf("drop non-work paths from scratch index: %w", err)
+			return "", warnings, false, fmt.Errorf("drop non-work paths from scratch index: %w", err)
 		}
 	}
 	tree, err := checkpointGitStdout(ctx, worktreePath, env, "write-tree")
 	if err != nil {
-		return "", warnings, fmt.Errorf("write working-state tree: %w", err)
+		return "", warnings, false, fmt.Errorf("write working-state tree: %w", err)
 	}
 	tree = strings.TrimSpace(tree)
 	if tree == "" {
-		return "", warnings, fmt.Errorf("write working-state tree: empty tree id")
+		return "", warnings, false, fmt.Errorf("write working-state tree: empty tree id")
 	}
 	headTree, err := checkpointGitStdout(ctx, worktreePath, nil, "rev-parse", "HEAD^{tree}")
 	if err != nil {
-		return "", warnings, fmt.Errorf("resolve HEAD tree: %w", err)
+		return "", warnings, false, fmt.Errorf("resolve HEAD tree: %w", err)
 	}
 	if tree == strings.TrimSpace(headTree) {
-		return "", warnings, nil
+		return "", warnings, false, nil
 	}
 	commitSHA, err := checkpointGitStdout(ctx, worktreePath, env,
 		"commit-tree", tree, "-p", head, "-m", "WIP checkpoint")
 	if err != nil {
-		return "", warnings, fmt.Errorf("commit scratch tree: %w", err)
+		return "", warnings, false, fmt.Errorf("commit scratch tree: %w", err)
 	}
 	commitSHA = strings.TrimSpace(commitSHA)
 	if !headSHARE.MatchString(commitSHA) {
-		return "", warnings, fmt.Errorf("commit scratch tree: unexpected output %q", commitSHA)
+		return "", warnings, false, fmt.Errorf("commit scratch tree: unexpected output %q", commitSHA)
 	}
-	return commitSHA, warnings, nil
+	return commitSHA, warnings, false, nil
 }
 
 func gitIdentityFromSession(qw QueuedWork) gitIdentity {

@@ -191,19 +191,19 @@ func TestRun_FailedSessionWIPRef(t *testing.T) {
 }
 
 // TestCheckpointFailedSession_ExcludesSecretsFromWIPRef drives
-// checkpointFailedSession directly: deny-listed files plus a nested
+// checkpointFailedSession directly: deny-listed names plus a nested
 // harness-state dir sit next to real work with no info/exclude in
 // place, and none of them may reach the pushed reserved ref while the
-// real work does. The restore-half of workarea_rescue_test.go covers
-// the archive path; this covers the pushed ref.
+// real work does. Name-denied paths are dropped from the scratch index so
+// ordinary credential files do not block real work; secret-bearing CONTENT
+// and unscannable blobs skip the remote checkpoint entirely (pinned by
+// TestCheckpointFailedSession_SkipsPushWhenDirtyHoldsSecrets below).
 func TestCheckpointFailedSession_ExcludesSecretsFromWIPRef(t *testing.T) {
 	bare, wt, res := checkpointCheckout(t)
 	qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-SECRETS")}
 	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
 	res.FailureMode = FailureBudgetExceeded
 	res.Error = "budget exceeded: max-tokens"
-	// A session env value the content gate must treat as a secret.
-	t.Setenv("WIP_CHECKPOINT_TEST_TOKEN", "sentinel-test-value-42")
 	secrets := map[string]string{
 		".env":                                 "SECRET=top\n",
 		".ENV":                                 "SECRET=top\n",
@@ -236,25 +236,20 @@ func TestCheckpointFailedSession_ExcludesSecretsFromWIPRef(t *testing.T) {
 		".env~":                                "SECRET=faketop\n",
 		".npmrc.bak":                           "//registry/:_authToken=faketop\n",
 		"id_ecdsa":                             "PRIVATE\n",
-		// Innocent names with secret-bearing content: the content gate,
-		// not the name list, keeps these out of the pushed ref.
-		"config/secrets.yml":               "api_token: ghp_faketoken0123456789ab\n",
-		"notes.md":                         "rotate sk-ant-faketoken-0123456789 soon\n",
-		"env-dump.txt":                     "dump: sentinel-test-value-42\n",
-		"config/credentials-prod.json":     `{"secret":"top"}`,
-		"config/service-account-prod.json": `{"secret":"top"}`,
-		".aws/credentials":                 "[default]\naws_secret_access_key = top\n",
-		".AWS/credentials":                 "[default]\naws_secret_access_key = top\n",
-		".ssh/config":                      "IdentityFile top\n",
-		".SSH/config":                      "IdentityFile top\n",
-		".gnupg/secring.gpg":               "PRIVATE\n",
-		"sub/.pi/session.jsonl":            `{"spawnEnv":{"SECRET":"top"}}`,
-		"sub/.PI/session.jsonl":            `{"spawnEnv":{"SECRET":"top"}}`,
-		"sub/.pi/agent-home/config.json":   "{}",
-		"sub/.agent/events.jsonl":          "{}",
-		"sub/.scratch/notes.md":            "scratch\n",
-		".agent/events.jsonl":              "{}",
-		"node_modules/index.js":            "// build artifact\n",
+		"config/credentials-prod.json":         `{"secret":"top"}`,
+		"config/service-account-prod.json":     `{"secret":"top"}`,
+		".aws/credentials":                     "[default]\naws_secret_access_key = top\n",
+		".AWS/credentials":                     "[default]\naws_secret_access_key = top\n",
+		".ssh/config":                          "IdentityFile top\n",
+		".SSH/config":                          "IdentityFile top\n",
+		".gnupg/secring.gpg":                   "PRIVATE\n",
+		"sub/.pi/session.jsonl":                `{"spawnEnv":{"SECRET":"top"}}`,
+		"sub/.PI/session.jsonl":                `{"spawnEnv":{"SECRET":"top"}}`,
+		"sub/.pi/agent-home/config.json":       "{}",
+		"sub/.agent/events.jsonl":              "{}",
+		"sub/.scratch/notes.md":                "scratch\n",
+		".agent/events.jsonl":                  "{}",
+		"node_modules/index.js":                "// build artifact\n",
 	}
 	for path, body := range secrets {
 		writeFile(t, wt, path, body)
@@ -286,18 +281,97 @@ func TestCheckpointFailedSession_ExcludesSecretsFromWIPRef(t *testing.T) {
 			t.Errorf("%q missing from %s (tree:\n%s)", path, res.WIPRef.Ref, tree)
 		}
 	}
-	// Content-dropped files warn with the path, never the value.
-	var sawContentWarning bool
+	// No warning may carry a secret value, only paths.
 	for _, w := range res.PostSessionWarnings {
-		if strings.Contains(w, `"notes.md"`) {
-			sawContentWarning = true
-		}
-		if strings.Contains(w, "sk-ant-faketoken-0123456789") || strings.Contains(w, "sentinel-test-value-42") {
+		if strings.Contains(w, "sentinel-test-value-42") {
 			t.Errorf("checkpoint warning carries a secret value: %q", w)
 		}
 	}
-	if !sawContentWarning {
-		t.Errorf("no checkpoint warning names the content-dropped notes.md (warnings %v)", res.PostSessionWarnings)
+}
+
+// TestCheckpointFailedSession_SkipsPushWhenDirtyHoldsSecrets pins the
+// fail-closed dirty gate: secret-bearing content or an unscannable blob in
+// the dirty delta skips the remote checkpoint entirely (never a partial
+// push), with a warning naming the path and the work preserved locally.
+// Each row pins one secret source or unscannable class and goes RED when
+// that guard is deleted.
+func TestCheckpointFailedSession_SkipsPushWhenDirtyHoldsSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		path       string
+		body       string
+		big        bool
+		binary     bool
+		authToken  string
+		qwEnvKey   string
+		qwEnvVal   string
+		procEnvKey string
+		procEnvVal string
+	}{
+		{name: "ghs-token", path: "notes2.md", body: "token ghs_ABCDEFGHIJKLMNOPQRSTuvwx0123\n"},
+		{name: "sk-proj-key", path: "openai.txt", body: "key sk-proj-AbCdEfGhIjKlMnOpQrStUvWx0123456789\n"},
+		{name: "session-env-value", path: "db.txt", body: "dump: custom-session-sentinel-98765\n", qwEnvKey: "MY_CUSTOM_VAR", qwEnvVal: "custom-session-sentinel-98765"},
+		{name: "process-env-value", path: "env-dump.txt", body: "dump: sentinel-test-value-42\n", procEnvKey: "WIP_CHECKPOINT_TEST_TOKEN", procEnvVal: "sentinel-test-value-42"},
+		{name: "auth-bearer", path: "bearer.txt", body: "bearer auth-bearer-sentinel-13579\n", authToken: "auth-bearer-sentinel-13579"},
+		{name: "oversize", path: "big.txt", body: "tail ghp_faketoken0123456789ab\n", big: true},
+		{name: "binary", path: "utf16.txt", body: "ghp_faketoken0123456789ab\n", binary: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bare, wt, res := checkpointCheckout(t)
+			// No recorded base: the history walk has no range to cover the
+			// dangling dirty commit, so the staged gate is the sole guard.
+			// Deleting it must turn every row RED.
+			res.rescueTargets = []rescueTarget{{path: wt}}
+			qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-DIRTY-" + tc.name)}
+			res.FailureMode = FailureBudgetExceeded
+			res.Error = "budget exceeded: max-tokens"
+			if tc.authToken != "" {
+				qw.AuthToken = tc.authToken
+			}
+			if tc.qwEnvKey != "" {
+				if qw.Env == nil {
+					qw.Env = map[string]string{}
+				}
+				qw.Env[tc.qwEnvKey] = tc.qwEnvVal
+			}
+			if tc.procEnvKey != "" {
+				t.Setenv(tc.procEnvKey, tc.procEnvVal)
+			}
+			writeFile(t, wt, "feature.txt", "real work\n")
+			body := tc.body
+			if tc.big {
+				body = strings.Repeat("a", wipSecretScanMaxBytes+1024) + body
+			}
+			if tc.binary {
+				body = "a\x00b\x00 " + body
+			}
+			writeFile(t, wt, tc.path, body)
+			(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+			if res.WIPRef != nil {
+				t.Fatalf("WIPRef = %+v; want nil when dirty work holds %q", res.WIPRef, tc.path)
+			}
+			var sawPath bool
+			for _, w := range res.PostSessionWarnings {
+				if strings.Contains(w, tc.path) {
+					sawPath = true
+				}
+				if strings.Contains(w, "ghs_ABCDEFGHIJKLMNOPQRSTuvwx0123") || strings.Contains(w, "custom-session-sentinel-98765") || strings.Contains(w, "auth-bearer-sentinel-13579") || strings.Contains(w, "sentinel-test-value-42") {
+					t.Errorf("checkpoint warning carries a secret value: %q", w)
+				}
+			}
+			if !sawPath {
+				t.Errorf("no checkpoint warning names %q (warnings %v)", tc.path, res.PostSessionWarnings)
+			}
+			if got := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/wip"); got != "" {
+				t.Errorf("reserved ref pushed despite denied dirty work: %s", got)
+			}
+			if got := readFile(t, filepath.Join(wt, tc.path)); got != body {
+				t.Errorf("%s changed after the skipped checkpoint", tc.path)
+			}
+			if got := readFile(t, filepath.Join(wt, "feature.txt")); got != "real work\n" {
+				t.Errorf("feature.txt=%q after the skipped checkpoint", got)
+			}
+		})
 	}
 }
 
@@ -359,6 +433,85 @@ func TestCheckpointFailedSession_SkipsPushWhenUnpushedHistoryHoldsSecrets(t *tes
 				if got := readFile(t, filepath.Join(wt, path)); got != want {
 					t.Errorf("%s=%q after the skipped checkpoint, want it untouched", path, got)
 				}
+			}
+		})
+	}
+}
+
+// TestCheckpointFailedSession_SkipsPushWhenHistoryHidesSecrets pins the
+// per-commit history walk: the push publishes every intermediate commit, so
+// a secret added and then deleted or scrubbed later still leaves the host
+// in its own commit. Each row goes RED when the walk checks only the final
+// tree.
+func TestCheckpointFailedSession_SkipsPushWhenHistoryHidesSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		want  string
+		setup func(t *testing.T, wt string)
+	}{
+		{
+			name: "committed-then-deleted",
+			want: ".env.production",
+			setup: func(t *testing.T, wt string) {
+				writeFile(t, wt, "feature.txt", "real work\n")
+				writeFile(t, wt, ".env.production", "SECRET=faketop\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "add secret")
+				gitRun(t, wt, "rm", "-q", ".env.production")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "remove secret")
+			},
+		},
+		{
+			name: "content-then-scrubbed",
+			want: "notes.md",
+			setup: func(t *testing.T, wt string) {
+				writeFile(t, wt, "feature.txt", "real work\n")
+				writeFile(t, wt, "notes.md", "rotate ghp_faketoken0123456789ab soon\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "add secret")
+				writeFile(t, wt, "notes.md", "clean notes\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "scrub secret")
+			},
+		},
+		{
+			name: "history-oversize",
+			want: "big.txt",
+			setup: func(t *testing.T, wt string) {
+				writeFile(t, wt, "feature.txt", "real work\n")
+				writeFile(t, wt, "big.txt", strings.Repeat("a", wipSecretScanMaxBytes+1024)+"\n")
+				gitRun(t, wt, "add", "-A")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "add big")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bare, wt, res := checkpointCheckout(t)
+			qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-HIDDEN-" + tc.name)}
+			res.FailureMode = FailureBudgetExceeded
+			res.Error = "budget exceeded: max-tokens"
+			tc.setup(t, wt)
+			(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+			if res.WIPRef != nil {
+				t.Fatalf("WIPRef = %+v; want nil when history hides %q", res.WIPRef, tc.want)
+			}
+			var sawPath bool
+			for _, w := range res.PostSessionWarnings {
+				if strings.Contains(w, tc.want) {
+					sawPath = true
+				}
+			}
+			// Oversize history fails closed via the scan error path, which
+			// carries no path-filtered skip warning; the checkpoint
+			// failure warning still proves nothing was pushed.
+			if tc.name != "history-oversize" && !sawPath {
+				t.Errorf("no checkpoint warning names %q (warnings %v)", tc.want, res.PostSessionWarnings)
+			}
+			if len(res.PostSessionWarnings) == 0 {
+				t.Errorf("no checkpoint warning recorded (warnings %v)", res.PostSessionWarnings)
+			}
+			if got := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/wip"); got != "" {
+				t.Errorf("reserved ref pushed despite hidden history: %s", got)
 			}
 		})
 	}
