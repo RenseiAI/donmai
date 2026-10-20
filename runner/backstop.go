@@ -696,10 +696,11 @@ func firstRepoSlug(slugs []string) string {
 }
 
 // viewGitHubPullRequest runs the runner's `gh pr view` query for prURL in
-// the checkout. repoSlug optionally pins the repository explicitly
-// (--repo), so the read targets the work item's configured repository
-// rather than whatever gh infers from the host identity. Empty keeps
-// today's checkout inference.
+// the checkout. repoSlug is forwarded as --repo for argv provenance, but gh
+// resolves a pull request from its URL and ignores --repo for URL selectors,
+// so the flag is inert there; the authorization check against
+// allowedRepositories in lookupGitHubPullRequest is the load-bearing gate.
+// Empty keeps today's checkout inference.
 func viewGitHubPullRequest(ctx context.Context, worktreePath, prURL string, repoSlug ...string) (ghPullRequestView, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -721,8 +722,10 @@ func viewGitHubPullRequest(ctx context.Context, worktreePath, prURL string, repo
 // lookupGitHubPullRequest reads the complete PR projection after gh created
 // or detected a URL. The URL-only completion contract remains valid when this
 // best-effort metadata query cannot run; only the normalized pr.opened fact is
-// omitted in that case. repoSlug optionally pins the `gh pr view` read to
-// the work item's configured repository; empty keeps today's inference.
+// omitted in that case. repoSlug is forwarded to `gh pr view` for argv
+// provenance (inert for URL selectors; see viewGitHubPullRequest); the
+// allowedRepositories check is the load-bearing gate. Empty keeps today's
+// inference.
 func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, allowedRepositories map[string]struct{}, repoSlug ...string) *agent.PullRequestFact {
 	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" || len(allowedRepositories) == 0 {
 		return nil
@@ -978,6 +981,7 @@ func backstopRepoArgs(args []string, slug string) []string {
 }
 
 // filterEmpty returns in with empty / whitespace-only entries removed.
+// Used when splitting `git diff --cached --name-only` output, which
 // emits a trailing empty entry when the diff is empty.
 func filterEmpty(in []string) []string {
 	out := make([]string, 0, len(in))
