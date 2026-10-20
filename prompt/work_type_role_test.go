@@ -189,3 +189,75 @@ func TestBuilderBuild_RoleLiteralsMatchCanonicalRoles(t *testing.T) {
 		}
 	}
 }
+
+// TestBuilderBuild_BuiltinLegacyTemplateValue pins the legacy template VALUE
+// for every compiled-in work-type name: with no role stamped, qa and
+// acceptance render byte-identically to the qa prompt, research to the
+// research prompt, and every other built-in to the development prompt, on
+// both rendering paths (legacy text/template and the raymond shim). The
+// role-invariance test proves a stamped role cannot move a built-in; this
+// test proves the role-less value itself cannot move (changing the known-name
+// fallback from development to qa stays GREEN without it).
+func TestBuilderBuild_BuiltinLegacyTemplateValue(t *testing.T) {
+	t.Parallel()
+
+	reg, err := templates.New()
+	if err != nil {
+		t.Fatalf("templates.New: %v", err)
+	}
+	builders := []struct {
+		name string
+		new  func() *prompt.Builder
+	}{
+		{name: "legacy", new: prompt.NewBuilder},
+		{name: "raymond", new: func() *prompt.Builder { return &prompt.Builder{Registry: reg} }},
+	}
+	legacyReference := func(workType string) string {
+		switch workType {
+		case string(prompt.WorkTypeQA), string(prompt.WorkTypeAcceptance):
+			return string(prompt.WorkTypeQA)
+		case string(prompt.WorkTypeResearch):
+			return string(prompt.WorkTypeResearch)
+		default:
+			return string(prompt.WorkTypeDevelopment)
+		}
+	}
+	buildUser := func(t *testing.T, newBuilder func() *prompt.Builder, workType string) string {
+		t.Helper()
+		qw := fixtureSession()
+		qw.WorkType = workType
+		qw.WorkTypeRole = ""
+		_, user, err := newBuilder().Build(qw)
+		if err != nil {
+			t.Fatalf("Build %q: %v", workType, err)
+		}
+		return user
+	}
+	for _, builder := range builders {
+		t.Run(builder.name+"/representatives-distinct", func(t *testing.T) {
+			t.Parallel()
+			qa := buildUser(t, builder.new, string(prompt.WorkTypeQA))
+			research := buildUser(t, builder.new, string(prompt.WorkTypeResearch))
+			development := buildUser(t, builder.new, string(prompt.WorkTypeDevelopment))
+			if qa == development {
+				t.Errorf("qa and development user prompts are identical; legacy values collapsed")
+			}
+			if research == development {
+				t.Errorf("research and development user prompts are identical; legacy values collapsed")
+			}
+			if qa == research {
+				t.Errorf("qa and research user prompts are identical; legacy values collapsed")
+			}
+		})
+		for _, workType := range runner.AllWorkTypes {
+			t.Run(builder.name+"/"+workType, func(t *testing.T) {
+				t.Parallel()
+				got := buildUser(t, builder.new, workType)
+				want := buildUser(t, builder.new, legacyReference(workType))
+				if got != want {
+					t.Errorf("built-in work type %q renders differently from its legacy %q template", workType, legacyReference(workType))
+				}
+			})
+		}
+	}
+}
