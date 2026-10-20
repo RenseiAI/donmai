@@ -296,7 +296,7 @@ func TestReadContinueDraftAtStart(t *testing.T) {
 	qw := QueuedWork{QueuedWork: queuedWorkBase("CONT-DRAFT-START")}
 	qw.Repository = "https://github.com/example/project.git"
 	qw.ContinuePullRequest = &prompt.ContinuePullRequest{Number: 7, HeadRef: "feature/x", HeadSha: continueFixtureSHA()}
-	t.Run("nil lookup falls back without calling gh", func(t *testing.T) {
+	t.Run("nil lookup falls back to gh and reports unknown on its error", func(t *testing.T) {
 		t.Parallel()
 		// No worktree checkout exists, so the URL resolves from the
 		// dispatched repository and the fallback lookup would shell out;
@@ -1091,10 +1091,10 @@ func TestRun_ContinueModeDivergedHeadIsTyped(t *testing.T) {
 // of the session's work.
 func TestRun_ContinueModeProtectedRejectionIsNotDiverged(t *testing.T) {
 	// The server-side policy hook rejects the push, so the session's
-	// commit never reaches the remote head: a non-passed verdict fails
-	// with the backstop failure, while a passed turn ends completed with
-	// the no-op outcome. Neither reads as divergence, because the fetched
-	// head is still an ancestor of the session's work.
+	// commit never reaches the remote head: the run stays failed with
+	// the backstop failure whatever the verdict, because unpublished
+	// work is never a no-op. Neither reads as divergence, because the
+	// fetched head is still an ancestor of the session's work.
 	cases := []struct {
 		name        string
 		manifest    string
@@ -1109,11 +1109,10 @@ func TestRun_ContinueModeProtectedRejectionIsNotDiverged(t *testing.T) {
 			wantStatus: "failed",
 		},
 		{
-			name:        "passed verdict completes as no-op",
-			manifest:    passedManifest,
-			text:        "WORK_RESULT:passed",
-			wantStatus:  "completed",
-			wantOutcome: ContinuationOutcomeNoOp,
+			name:       "passed verdict with an unpushed commit stays failed",
+			manifest:   passedManifest,
+			text:       "WORK_RESULT:passed",
+			wantStatus: "failed",
 		},
 	}
 	for _, tc := range cases {
@@ -1139,6 +1138,11 @@ func TestRun_ContinueModeProtectedRejectionIsNotDiverged(t *testing.T) {
 			}
 			if tc.wantStatus == "failed" && res.FailureMode != FailureBackstop {
 				t.Fatalf("FailureMode = %q; want %s", res.FailureMode, FailureBackstop)
+			}
+			// An unpushed commit is unpublished work, never a no-op:
+			// the gate reports no new commit on the remote head.
+			if tc.wantStatus == "failed" && !strings.Contains(res.Error, "has no new commit since dispatch") {
+				t.Fatalf("Error = %q; want the unpublished-head refusal", res.Error)
 			}
 			if res.FailureMode == FailureContinuePullRequestDiverged {
 				t.Fatalf("FailureMode = %q; a policy rejection must not read as divergence", res.FailureMode)
@@ -1373,11 +1377,10 @@ func TestRun_ContinueModeCleanMergeWithoutPolicyStillFails(t *testing.T) {
 // rule — fails the run.
 func TestRun_ContinueModeCleanMergeStillNeedsAPush(t *testing.T) {
 	// The intent is narrow: a clean merge the run never pushed still ends
-	// not delivered on a non-passed verdict. The merge moved the local
+	// not delivered whatever the verdict. The merge moved the local
 	// head past dispatch, but the remote head does not carry it, so the
-	// no-new-commit rule — not the code-change rule — fails the run. A
-	// passed turn on the same unpushed head ends completed with the
-	// no-op outcome instead.
+	// no-new-commit rule — not the code-change rule — fails the run.
+	// Unpublished work is never a no-op, even for a passed turn.
 	cleanMergeUnpushed := func(t *testing.T, cwd string) {
 		advanceMainAndMerge(t, cwd)
 	}
@@ -1404,7 +1407,7 @@ func TestRun_ContinueModeCleanMergeStillNeedsAPush(t *testing.T) {
 			t.Fatalf("ContinuationOutcome = %q; want empty on a failed run", res.ContinuationOutcome)
 		}
 	})
-	t.Run("passed verdict completes as no-op", func(t *testing.T) {
+	t.Run("passed verdict with an unpushed merge stays failed", func(t *testing.T) {
 		res, _ := runScriptedSession(t, scriptedSession{
 			workType:       "development",
 			skipSteering:   true,
@@ -1417,11 +1420,14 @@ func TestRun_ContinueModeCleanMergeStillNeedsAPush(t *testing.T) {
 				during:   cleanMergeUnpushed,
 			}},
 		})
-		if res.Status != "completed" {
-			t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+		if res.Status != "failed" || res.FailureMode != FailureBackstop {
+			t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
 		}
-		if res.ContinuationOutcome != ContinuationOutcomeNoOp {
-			t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, ContinuationOutcomeNoOp)
+		if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
+			t.Fatalf("Error = %q, want %q", res.Error, want)
+		}
+		if res.ContinuationOutcome != "" {
+			t.Fatalf("ContinuationOutcome = %q; want empty on a failed run", res.ContinuationOutcome)
 		}
 	})
 }
@@ -1911,4 +1917,66 @@ func TestRun_ContinueModePassedDraftAtStartEndsCompleted(t *testing.T) {
 			t.Fatalf("Error = %q; want the scratch refusal", res.Error)
 		}
 	})
+}
+
+// TestRun_ContinueModeDraftAtStartUnpushedStaysFailed pins that a passed
+// turn whose code never reached the remote is never reported as fixed in
+// place, even on a pull request that was already a draft: the platform
+// must not be told the code is on the pull request when it is not.
+func TestRun_ContinueModeDraftAtStartUnpushedStaysFailed(t *testing.T) {
+	alwaysDraft := func(context.Context, string, string) (bool, error) { return true, nil }
+	draftTrue := true
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:        "development",
+		skipSteering:    true,
+		repository:      "https://github.com/example/repo",
+		continueNumber:  12,
+		backstop:        true,
+		protectContinue: true,
+		draft:           alwaysDraft,
+		draftAtStart:    &draftTrue,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	}
+	if res.ContinuationOutcome != "" {
+		t.Fatalf("ContinuationOutcome = %q; want empty on an unpublished draft run", res.ContinuationOutcome)
+	}
+	if res.FailureMode == FailureContinuePullRequestDiverged {
+		t.Fatalf("FailureMode = %q; a policy rejection must not read as divergence", res.FailureMode)
+	}
+	// The local head moved but the remote does not carry it, so the
+	// run fails instead of reporting the code as fixed in place.
+	if strings.Contains(string(res.ContinuationOutcome), "fixed_in_place") {
+		t.Fatalf("ContinuationOutcome = %q; an unpushed draft must never fix in place", res.ContinuationOutcome)
+	}
+}
+
+// TestRun_ContinueModePassedWithProviderErrorStaysFailed pins that a
+// WORK_RESULT marker alone never promotes the run to completed: a passed
+// marker followed by a provider error in the same turn keeps the gate's
+// failure instead of ending completed with a no-op outcome.
+func TestRun_ContinueModePassedWithProviderErrorStaysFailed(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		turns: []verdictScriptTurn{{
+			manifest:      passedManifest,
+			text:          "WORK_RESULT:passed",
+			providerError: "overloaded",
+		}},
+	})
+	if res.Status == "completed" && res.ContinuationOutcome == ContinuationOutcomeNoOp {
+		t.Fatalf("a passed marker ending on a provider error was reported completed/no_op: %+v", res)
+	}
+	if res.ContinuationOutcome != "" {
+		t.Fatalf("ContinuationOutcome = %q; want empty when the turn ended on a provider error", res.ContinuationOutcome)
+	}
 }

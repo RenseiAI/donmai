@@ -1813,8 +1813,9 @@ tailRecovery:
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			func() {
 				defer gateCancel()
-				localHead, _ := captureHeadSHA(gateCtx, wpath)
-				remoteHead, _ := gitStdout(gateCtx, wpath, nil, "ls-remote", "origin", "refs/heads/"+continuePullRequestBranch(qw.ContinuePullRequest))
+				localHead, localErr := captureHeadSHA(gateCtx, wpath)
+				remoteRaw, remoteErr := gitStdout(gateCtx, wpath, nil, "ls-remote", "origin", "refs/heads/"+continuePullRequestBranch(qw.ContinuePullRequest))
+				remoteHead := remoteRaw
 				if fields := strings.Fields(remoteHead); len(fields) > 0 {
 					remoteHead = fields[0]
 				}
@@ -1826,7 +1827,14 @@ tailRecovery:
 				if continuedURL == "" {
 					continuedURL = continuePullRequestURL(gateCtx, qw, repositoryDeclaration, wpath)
 				}
-				headMoved := !strings.EqualFold(strings.TrimSpace(localHead), startHead) && strings.TrimSpace(localHead) != "" && strings.TrimSpace(startHead) != ""
+				localReadOK := localErr == nil && strings.TrimSpace(localHead) != ""
+				headMoved := localReadOK && strings.TrimSpace(startHead) != "" && !strings.EqualFold(strings.TrimSpace(localHead), startHead)
+				// pushed proves the remote head carries the session's
+				// local head: a passed turn whose commits never
+				// reached the remote (a rejected push, or a head or
+				// remote read that errored) must never read as a
+				// successful no-op or fixed-in-place outcome.
+				pushed := localReadOK && remoteErr == nil && strings.TrimSpace(remoteHead) != "" && strings.EqualFold(strings.TrimSpace(remoteHead), strings.TrimSpace(localHead))
 				draft, draftErr := lookup(gateCtx, wpath, continuedURL)
 				var inspection continueRangeInspection
 				var inspectErr error
@@ -1834,7 +1842,11 @@ tailRecovery:
 					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, continuePullRequestBranch(qw.ContinuePullRequest), startHead, localHead)
 				}
 				draftBlocks := draftErr == nil && draft && !qw.Delivery.AllowsDraft()
-				passed := res.WorkResult == "passed"
+				// A passed turn counts only when the turn itself
+				// ended successfully: a WORK_RESULT marker alone
+				// must not promote a turn that then ended on a
+				// provider error to completed.
+				passed := res.WorkResult == "passed" && res.Status != "failed" && lastTurn.providerError == ""
 				// completeContinueNoOp ends the run completed with the
 				// no-op continuation outcome, keeping the old failure
 				// message as a post-session warning so it stays
@@ -1855,13 +1867,13 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d commits scratch paths since dispatch: %s", qw.ContinuePullRequest.Number, strings.Join(inspection.scratchPaths, ", "))
-				case draftBlocks && passed && continueDraftAtStart.known && continueDraftAtStart.draft && inspection.deliversUnder(qw.Delivery):
+				case draftBlocks && passed && continueDraftAtStart.known && continueDraftAtStart.draft && pushed && inspection.deliversUnder(qw.Delivery):
 					// A passed turn that left its own delivered code
 					// on a pull request which was already a draft
 					// before the run started: completed, fixed in
 					// place. The head must have moved for the range
-					// to deliver; an unknown start draft keeps the
-					// failure.
+					// to deliver, the remote must carry it, and an
+					// unknown start draft keeps the failure.
 					res.Status = "completed"
 					res.FailureMode = ""
 					res.Error = ""
@@ -1869,16 +1881,26 @@ tailRecovery:
 					res.PostSessionWarnings = append(res.PostSessionWarnings,
 						fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number))
 				case draftBlocks:
-					if passed && continueDraftAtStart.known && continueDraftAtStart.draft {
+					if passed && continueDraftAtStart.known && continueDraftAtStart.draft && localReadOK && strings.TrimSpace(startHead) != "" && (!headMoved || (pushed && !inspection.deliversUnder(qw.Delivery))) {
 						// A passed turn on a pre-existing draft whose
 						// range delivers no code: completed, no-op.
+						// An unpushed head stays failed: the session
+						// has local commits the remote does not carry.
 						completeContinueNoOp(fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number))
 						break
 					}
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
-				case localHead == "" || startHead == "" || strings.EqualFold(localHead, startHead):
+				case localErr != nil || strings.TrimSpace(localHead) == "" || strings.TrimSpace(startHead) == "":
+					// A head the gate cannot read — or a missing
+					// dispatch pin — keeps the failure whatever the
+					// verdict: failing open here would report an
+					// unreadable checkout as a successful no-op.
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
+				case strings.EqualFold(strings.TrimSpace(localHead), startHead):
 					if passed {
 						completeContinueNoOp(fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number))
 						break
@@ -1886,11 +1908,11 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
-				case remoteHead == "" || !strings.EqualFold(remoteHead, localHead):
-					if passed {
-						completeContinueNoOp(fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number))
-						break
-					}
+				case remoteErr != nil || strings.TrimSpace(remoteHead) == "" || !strings.EqualFold(strings.TrimSpace(remoteHead), strings.TrimSpace(localHead)):
+					// The session moved its head but the remote does
+					// not carry it — a rejected push, or a remote
+					// the gate cannot read. The work is unpublished,
+					// so the run stays failed whatever the verdict.
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
