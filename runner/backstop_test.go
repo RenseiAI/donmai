@@ -241,43 +241,79 @@ func TestShouldExcludeFromWIPCheckpoint_Secrets(t *testing.T) {
 		{".env.example.bak", false},
 		{".env.sample.old", false},
 		{".env.local.backup", true},
-		// Dotfile credentials by exact name, in any letter case.
+		// .env dash variants and editor backups carry secrets like the
+		// dotted family, without its placeholder convention.
+		{".env-prod", true},
+		{".env-production", true},
+		{".ENV-PROD", true},
+		{".env~", true},
+		{".env.local~", true},
+		// Dotfile credentials by exact name, in any letter case, plus
+		// copies of them: a backup of a secret file is a secret file.
 		{".envrc", true},
 		{".ENVRC", true},
+		{".envrc.backup", true},
 		{".npmrc", true},
 		{".NPMRC", true},
+		{".npmrc.bak", true},
+		{".NPMRC.BAK", true},
 		{"service/.npmrc", true},
 		{"service/.NPMRC", true},
 		{".pypirc", true},
 		{".PYPIRC", true},
 		{".netrc", true},
 		{".NETRC", true},
+		{".netrc.old", true},
 		{".git-credentials", true},
 		{".GIT-CREDENTIALS", true},
+		{".yarnrc.yml", true},
+		{".YARNRC.YML", true},
+		{".pgpass", true},
+		{".PGPASS", true},
 		// Private keys and credential bundles (case-insensitive).
 		{"tls/server.pem", true},
 		{"tls/SERVER.PEM", true},
 		{"deploy.key", true},
 		{"bundle.p12", true},
 		{"bundle.pfx", true},
+		// Private keys: the whole id_<type> family, plus credential
+		// bundles by name or by *credentials*.json shape.
 		{"id_rsa", true},
 		{"id_rsa.pub", true},
 		{"id_ed25519", true},
+		{"id_ecdsa", true},
+		{"id_dsa", true},
+		{"home/.ssh/id_ecdsa", true},
 		{"home/.ssh/id_ed25519", true},
+		{"credentials", true},
+		{"CREDENTIALS", true},
 		{"credentials.json", true},
 		{"config/Credentials.Production.JSON", true},
+		{"application_default_credentials.json", true},
+		{"mycredentials.json", true},
 		{"credentials-backup.json", true},
 		{"service-account.json", true},
 		{"service-account-prod.json", true},
 		// Credential stores at any depth, in any letter case: git
 		// preserves case and tools and Windows checkouts produce
-		// uppercase variants.
+		// uppercase variants. Container and cluster config dirs hold
+		// registry and API credentials the same way.
 		{".aws/credentials", true},
 		{"service/.aws/config", true},
 		{".ssh/known_hosts", true},
 		{"home/.gnupg/pubring.kbx", true},
 		{".AWS/credentials", true},
 		{".SSH/config", true},
+		{".docker/config.json", true},
+		{"svc/.docker/config.json", true},
+		{".kube/config", true},
+		{"svc/.kube/cache", true},
+		// A dotenv dir component holds the same secrets as the files.
+		{"svc/.env/production", true},
+		// Infrastructure state carries secrets by design.
+		{"prod.tfvars", true},
+		{"terraform.tfstate", true},
+		{"infra/prod.tfvars", true},
 		// Harness-state dirs at any depth, not just the top level,
 		// in any letter case for the same reason as above.
 		{".pi/session.jsonl", true},

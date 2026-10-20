@@ -202,24 +202,45 @@ func TestCheckpointFailedSession_ExcludesSecretsFromWIPRef(t *testing.T) {
 	res.rescueTargets = []rescueTarget{{path: wt, base: gitRun(t, wt, "rev-parse", "HEAD")}}
 	res.FailureMode = FailureBudgetExceeded
 	res.Error = "budget exceeded: max-tokens"
+	// A session env value the content gate must treat as a secret.
+	t.Setenv("WIP_CHECKPOINT_TEST_TOKEN", "sentinel-test-value-42")
 	secrets := map[string]string{
-		".env":                             "SECRET=top\n",
-		".ENV":                             "SECRET=top\n",
-		".env.local":                       "SECRET=top\n",
-		".Env.local":                       "SECRET=top\n",
-		".envrc":                           "export SECRET=top\n",
-		".npmrc":                           "//registry/:_authToken=top\n",
-		".NPMRC":                           "//registry/:_authToken=top\n",
-		".netrc":                           "machine example password top\n",
-		".NETRC":                           "machine example password top\n",
-		".pypirc":                          "password = top\n",
-		".git-credentials":                 "https://user:top@example.test\n",
-		"tls/server.pem":                   "PRIVATE\n",
-		"deploy.key":                       "PRIVATE\n",
-		"bundle.p12":                       "PRIVATE\n",
-		"id_rsa":                           "PRIVATE\n",
-		"home/.ssh/id_ed25519":             "PRIVATE\n",
-		"credentials.json":                 `{"secret":"top"}`,
+		".env":                                 "SECRET=top\n",
+		".ENV":                                 "SECRET=top\n",
+		".env.local":                           "SECRET=top\n",
+		".Env.local":                           "SECRET=top\n",
+		".envrc":                               "export SECRET=top\n",
+		".npmrc":                               "//registry/:_authToken=top\n",
+		".NPMRC":                               "//registry/:_authToken=top\n",
+		".netrc":                               "machine example password top\n",
+		".NETRC":                               "machine example password top\n",
+		".pypirc":                              "password = top\n",
+		".git-credentials":                     "https://user:top@example.test\n",
+		"tls/server.pem":                       "PRIVATE\n",
+		"deploy.key":                           "PRIVATE\n",
+		"bundle.p12":                           "PRIVATE\n",
+		"id_rsa":                               "PRIVATE\n",
+		"home/.ssh/id_ed25519":                 "PRIVATE\n",
+		"credentials.json":                     `{"secret":"top"}`,
+		"credentials":                          "aws_secret_access_key = faketop\n",
+		"application_default_credentials.json": `{"client_secret":"faketop"}`,
+		"mycredentials.json":                   `{"client_secret":"faketop"}`,
+		".docker/config.json":                  `{"auths":{"example.test":{"auth":"ZmFrZTp0b3A="}}}`,
+		".kube/config":                         "token: faketop\n",
+		".yarnrc.yml":                          "npmAuthToken: faketop\n",
+		".pgpass":                              "localhost:5432:db:user:faketop\n",
+		"prod.tfvars":                          "db_password = \"faketop\"\n",
+		"terraform.tfstate":                    `{"password":"faketop"}`,
+		"svc/.env/production":                  "SECRET=faketop\n",
+		".env-prod":                            "SECRET=faketop\n",
+		".env~":                                "SECRET=faketop\n",
+		".npmrc.bak":                           "//registry/:_authToken=faketop\n",
+		"id_ecdsa":                             "PRIVATE\n",
+		// Innocent names with secret-bearing content: the content gate,
+		// not the name list, keeps these out of the pushed ref.
+		"config/secrets.yml":               "api_token: ghp_faketoken0123456789ab\n",
+		"notes.md":                         "rotate sk-ant-faketoken-0123456789 soon\n",
+		"env-dump.txt":                     "dump: sentinel-test-value-42\n",
 		"config/credentials-prod.json":     `{"secret":"top"}`,
 		"config/service-account-prod.json": `{"secret":"top"}`,
 		".aws/credentials":                 "[default]\naws_secret_access_key = top\n",
@@ -264,6 +285,82 @@ func TestCheckpointFailedSession_ExcludesSecretsFromWIPRef(t *testing.T) {
 		if !got[path] {
 			t.Errorf("%q missing from %s (tree:\n%s)", path, res.WIPRef.Ref, tree)
 		}
+	}
+	// Content-dropped files warn with the path, never the value.
+	var sawContentWarning bool
+	for _, w := range res.PostSessionWarnings {
+		if strings.Contains(w, `"notes.md"`) {
+			sawContentWarning = true
+		}
+		if strings.Contains(w, "sk-ant-faketoken-0123456789") || strings.Contains(w, "sentinel-test-value-42") {
+			t.Errorf("checkpoint warning carries a secret value: %q", w)
+		}
+	}
+	if !sawContentWarning {
+		t.Errorf("no checkpoint warning names the content-dropped notes.md (warnings %v)", res.PostSessionWarnings)
+	}
+}
+
+// TestCheckpointFailedSession_SkipsPushWhenUnpushedHistoryHoldsSecrets pins
+// the committed-history gate: a secret the session committed (rather than
+// left dirty) must not leave the host through the reserved ref. The remote
+// checkpoint is skipped with a warning naming the path, while the local
+// checkout keeps everything for the local rescue patch.
+func TestCheckpointFailedSession_SkipsPushWhenUnpushedHistoryHoldsSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  string
+	}{
+		{
+			name: "name-denied",
+			files: map[string]string{
+				"feature.txt":     "real work\n",
+				".env.production": "SECRET=faketop\n",
+			},
+			want: ".env.production",
+		},
+		{
+			name: "secret-content",
+			files: map[string]string{
+				"feature.txt": "real work\n",
+				"notes.md":    "rotate ghp_faketoken0123456789ab soon\n",
+			},
+			want: "notes.md",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bare, wt, res := checkpointCheckout(t)
+			qw := QueuedWork{QueuedWork: queuedWorkBase("WIP-HISTORY-" + tc.name)}
+			res.FailureMode = FailureBudgetExceeded
+			res.Error = "budget exceeded: max-tokens"
+			for path, body := range tc.files {
+				writeFile(t, wt, path, body)
+			}
+			gitRun(t, wt, "add", "-A")
+			gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "agent commit")
+			(&Runner{logger: noopLogger()}).checkpointFailedSession(qw, res)
+			if res.WIPRef != nil {
+				t.Fatalf("WIPRef = %+v; want nil when unpushed history holds secrets", res.WIPRef)
+			}
+			var sawPath bool
+			for _, w := range res.PostSessionWarnings {
+				if strings.Contains(w, tc.want) {
+					sawPath = true
+				}
+			}
+			if !sawPath {
+				t.Errorf("no checkpoint warning names %q (warnings %v)", tc.want, res.PostSessionWarnings)
+			}
+			if got := gitRun(t, bare, "for-each-ref", "--format=%(refname)", "refs/wip"); got != "" {
+				t.Errorf("reserved ref pushed despite denied history: %s", got)
+			}
+			for path, want := range tc.files {
+				if got := readFile(t, filepath.Join(wt, path)); got != want {
+					t.Errorf("%s=%q after the skipped checkpoint, want it untouched", path, got)
+				}
+			}
+		})
 	}
 }
 

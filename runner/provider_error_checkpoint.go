@@ -45,7 +45,8 @@ func (r *Runner) checkpointProviderError(qw QueuedWork, res *Result) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), providerErrorCheckpointTimeout)
 	defer cancel()
-	checkpoint, err := createProviderErrorCheckpoint(ctx, qw, target)
+	checkpoint, warnings, err := createProviderErrorCheckpoint(ctx, qw, target)
+	res.PostSessionWarnings = append(res.PostSessionWarnings, warnings...)
 	if err != nil {
 		warning := fmt.Sprintf("provider-error WIP checkpoint failed: %v", err)
 		res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
@@ -105,35 +106,37 @@ func providerErrorCheckpointTarget(res *Result) (rescueTarget, bool) {
 // a shared repository. The push is never forced and skips repository hooks:
 // a WIP checkpoint is unverified by definition, and a pre-push hook (a test
 // suite) would outlast the timeout.
-func createProviderErrorCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget) (*agent.ResumeCheckpoint, error) {
+func createProviderErrorCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget) (*agent.ResumeCheckpoint, []string, error) {
 	branch := "wip/" + qw.SessionID
-	checkpoint, err := createWIPCheckpoint(ctx, qw, target, "refs/heads/"+branch)
+	checkpoint, warnings, err := createWIPCheckpoint(ctx, qw, target, "refs/heads/"+branch)
 	if err != nil || checkpoint == nil {
-		return nil, err
+		return nil, warnings, err
 	}
-	return &agent.ResumeCheckpoint{Branch: branch, CommitSHA: checkpoint.CommitSHA}, nil
+	return &agent.ResumeCheckpoint{Branch: branch, CommitSHA: checkpoint.CommitSHA}, warnings, nil
 }
 
-func createWIPCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget, ref string) (*agent.WIPRef, error) {
+func createWIPCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget, ref string) (*agent.WIPRef, []string, error) {
 	if _, err := os.Stat(target.path); err != nil {
-		return nil, fmt.Errorf("stat checkout: %w", err)
+		return nil, nil, fmt.Errorf("stat checkout: %w", err)
 	}
 	head, err := captureHeadSHA(ctx, target.path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	checkpointHead := head
+	var warnings []string
 
 	status, err := checkpointGitStdout(ctx, target.path, nil,
 		"-c", "core.quotePath=false", "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
-		return nil, fmt.Errorf("git status: %w", err)
+		return nil, warnings, fmt.Errorf("git status: %w", err)
 	}
 	changed := meaningfulPaths(porcelainPaths(status))
 	if len(changed) > 0 {
-		commitSHA, commitErr := checkpointDirtyWorktree(ctx, target.path, head, qw)
+		commitSHA, dropped, commitErr := checkpointDirtyWorktree(ctx, target.path, head, qw)
+		warnings = append(warnings, dropped...)
 		if commitErr != nil {
-			return nil, commitErr
+			return nil, warnings, commitErr
 		}
 		if commitSHA != "" {
 			checkpointHead = commitSHA
@@ -147,19 +150,33 @@ func createWIPCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget
 			committed = len(commits) > 0
 		}
 		if err != nil {
-			return nil, err
+			return nil, warnings, err
 		}
 		if !committed {
-			return nil, nil
+			return nil, warnings, nil
 		}
+	}
+	// The push publishes the committed history as well as any dirty delta
+	// just checkpointed on top of it: the same name+content filter gates
+	// the committed range, so a secret the session committed (rather than
+	// left dirty) never leaves the host through the reserved ref. A denied
+	// range skips the remote checkpoint with a warning; the local rescue
+	// patch still preserves everything.
+	denied, derr := checkpointHistoryDenied(ctx, target, checkpointHead, wipCheckpointSecretValues(qw))
+	if derr != nil {
+		return nil, warnings, derr
+	}
+	if len(denied) > 0 {
+		warnings = append(warnings, fmt.Sprintf("WIP checkpoint skipped: unpushed history holds secret-bearing path %s; work preserved locally", quoteWIPPaths(denied)))
+		return nil, warnings, nil
 	}
 	push := gitCommand(ctx, target.path, gitIdentityFromSession(qw),
 		"push", "--no-verify", "origin", checkpointHead+":"+ref)
 	push.WaitDelay = providerErrorCheckpointWaitDelay
 	if out, err := push.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("push WIP ref %q: %w (output: %s)", ref, err, strings.TrimSpace(string(out)))
+		return nil, warnings, fmt.Errorf("push WIP ref %q: %w (output: %s)", ref, err, strings.TrimSpace(string(out)))
 	}
-	return &agent.WIPRef{Ref: ref, CommitSHA: checkpointHead}, nil
+	return &agent.WIPRef{Ref: ref, CommitSHA: checkpointHead}, warnings, nil
 }
 
 // sessionCommitted reports whether HEAD carries commits the session made: it
@@ -176,10 +193,10 @@ func sessionCommitted(ctx context.Context, target rescueTarget, head string) (bo
 	return len(unpushed) > 0, nil
 }
 
-func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw QueuedWork) (string, error) {
+func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw QueuedWork) (string, []string, error) {
 	indexDir, err := os.MkdirTemp("", "provider-error-checkpoint-")
 	if err != nil {
-		return "", fmt.Errorf("create scratch index dir: %w", err)
+		return "", nil, fmt.Errorf("create scratch index dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(indexDir) }()
 	env := append([]string{
@@ -187,53 +204,78 @@ func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw 
 		"GIT_LITERAL_PATHSPECS=1",
 	}, gitIdentityEnv(qw)...)
 	if _, err := checkpointGitStdout(ctx, worktreePath, env, "read-tree", "HEAD"); err != nil {
-		return "", fmt.Errorf("seed scratch index: %w", err)
+		return "", nil, fmt.Errorf("seed scratch index: %w", err)
 	}
 	if _, err := checkpointGitStdout(ctx, worktreePath, env, "add", "-A", "--", "."); err != nil {
-		return "", fmt.Errorf("stage working state: %w", err)
+		return "", nil, fmt.Errorf("stage working state: %w", err)
 	}
 	staged, err := checkpointGitStdout(ctx, worktreePath, env,
 		"-c", "core.quotePath=false", "diff", "--cached", "--name-only", "-z", "HEAD")
 	if err != nil {
-		return "", fmt.Errorf("list staged working state: %w", err)
+		return "", nil, fmt.Errorf("list staged working state: %w", err)
 	}
 	var excluded []string
+	var survivors []string
 	for _, path := range strings.Split(staged, "\x00") {
-		if path != "" && shouldExcludeFromWIPCheckpoint(path) {
+		if path == "" {
+			continue
+		}
+		if shouldExcludeFromWIPCheckpoint(path) {
 			excluded = append(excluded, path)
+		} else {
+			survivors = append(survivors, path)
+		}
+	}
+	// Content gate: every surviving blob is scanned for the session's own
+	// secret values and for common token shapes before it may enter the
+	// pushed tree. A hit drops the file with a warning that names the
+	// path, never the value; an unscannable file fails closed the same
+	// way, so a scan failure cannot become a leak.
+	values := wipCheckpointSecretValues(qw)
+	var warnings []string
+	for _, path := range survivors {
+		hit, serr := stagedBlobHasSecret(ctx, worktreePath, env, path, values)
+		if serr != nil {
+			excluded = append(excluded, path)
+			warnings = append(warnings, fmt.Sprintf("WIP checkpoint dropped unscannable path %q", path))
+			continue
+		}
+		if hit {
+			excluded = append(excluded, path)
+			warnings = append(warnings, fmt.Sprintf("WIP checkpoint dropped secret-bearing path %q", path))
 		}
 	}
 	for i := 0; i < len(excluded); i += rescueResetBatch {
 		batch := excluded[i:min(i+rescueResetBatch, len(excluded))]
 		if _, err := checkpointGitStdout(ctx, worktreePath, env, append([]string{"reset", "-q", "HEAD", "--"}, batch...)...); err != nil {
-			return "", fmt.Errorf("drop non-work paths from scratch index: %w", err)
+			return "", warnings, fmt.Errorf("drop non-work paths from scratch index: %w", err)
 		}
 	}
 	tree, err := checkpointGitStdout(ctx, worktreePath, env, "write-tree")
 	if err != nil {
-		return "", fmt.Errorf("write working-state tree: %w", err)
+		return "", warnings, fmt.Errorf("write working-state tree: %w", err)
 	}
 	tree = strings.TrimSpace(tree)
 	if tree == "" {
-		return "", fmt.Errorf("write working-state tree: empty tree id")
+		return "", warnings, fmt.Errorf("write working-state tree: empty tree id")
 	}
 	headTree, err := checkpointGitStdout(ctx, worktreePath, nil, "rev-parse", "HEAD^{tree}")
 	if err != nil {
-		return "", fmt.Errorf("resolve HEAD tree: %w", err)
+		return "", warnings, fmt.Errorf("resolve HEAD tree: %w", err)
 	}
 	if tree == strings.TrimSpace(headTree) {
-		return "", nil
+		return "", warnings, nil
 	}
 	commitSHA, err := checkpointGitStdout(ctx, worktreePath, env,
 		"commit-tree", tree, "-p", head, "-m", "WIP checkpoint")
 	if err != nil {
-		return "", fmt.Errorf("commit scratch tree: %w", err)
+		return "", warnings, fmt.Errorf("commit scratch tree: %w", err)
 	}
 	commitSHA = strings.TrimSpace(commitSHA)
 	if !headSHARE.MatchString(commitSHA) {
-		return "", fmt.Errorf("commit scratch tree: unexpected output %q", commitSHA)
+		return "", warnings, fmt.Errorf("commit scratch tree: unexpected output %q", commitSHA)
 	}
-	return commitSHA, nil
+	return commitSHA, warnings, nil
 }
 
 func gitIdentityFromSession(qw QueuedWork) gitIdentity {

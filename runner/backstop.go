@@ -93,6 +93,8 @@ var wipSecretBasenames = map[string]bool{
 	".pypirc":          true,
 	".netrc":           true,
 	".git-credentials": true,
+	".yarnrc.yml":      true,
+	".pgpass":          true,
 }
 
 // wipSecretEnvExamples are safe .env siblings that must NOT be excluded:
@@ -104,15 +106,18 @@ var wipSecretEnvExamples = map[string]bool{
 }
 
 // wipSecretDirAnyDepth lists directory names that disqualify a path at
-// any depth from a WIP checkpoint: credential stores and harness-state
+// any depth from a WIP checkpoint: credential stores (cloud CLIs, SSH,
+// container and cluster config) and harness-state
 // dirs. Harness state must match at ANY depth (not just the top level):
 // a nested <subdir>/.pi/ holds the spawn transcript with the full
 // environment, and the scratch-index checkpoint cannot rely on the
 // provision-time info/exclude write that covers only the checkout root.
 var wipSecretDirAnyDepth = map[string]bool{
-	".aws":   true,
-	".ssh":   true,
-	".gnupg": true,
+	".aws":    true,
+	".ssh":    true,
+	".gnupg":  true,
+	".docker": true,
+	".kube":   true,
 }
 
 // shouldExcludeFromWIPCheckpoint reports whether a staged path must be
@@ -140,16 +145,21 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 	// .ENV, .NPMRC and Credentials.JSON are handled exactly like
 	// their lowercase twins.
 	lower := strings.ToLower(basename)
-	// Harness-state and credential-store dirs at any depth: each table
+	// Harness-state, credential-store and dotenv dirs at any depth: each table
 	// entry matched as a whole path component, so a directory that
 	// merely shares a prefix (".pi-cache") stays ordinary project
 	// content. Components are lowered too: git preserves case and tools
 	// and Windows checkouts produce .AWS, .SSH or .PI, which hold the
 	// same secrets and transcripts as their lowercase twins. The tables
 	// themselves stay lowercase, so lowering the component before the
-	// lookup is exactly a case-insensitive match.
+	// lookup is exactly a case-insensitive match. A component literally
+	// named ".env" is a dotenv dir (svc/.env/production) and is excluded
+	// for the same reason as the .env files themselves.
 	for _, part := range parts[:len(parts)-1] {
 		lowerPart := strings.ToLower(part)
+		if lowerPart == ".env" {
+			return true
+		}
 		if harnessstate.IsStateDir(lowerPart) {
 			return true
 		}
@@ -159,6 +169,13 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 	}
 	if wipSecretBasenames[lower] {
 		return true
+	}
+	// A basename that starts with a denied basename is a copy of it
+	// (.npmrc.bak, .envrc.backup): copies of secrets are secrets.
+	for denied := range wipSecretBasenames {
+		if strings.HasPrefix(lower, denied) {
+			return true
+		}
 	}
 	// .env and .env.* carry secrets; the example/sample/template
 	// siblings carry placeholders and stay committable. Compared on the
@@ -176,6 +193,17 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 		name, _, _ := strings.Cut(rest, ".")
 		return !wipSecretEnvExamples[".env."+name]
 	}
+	// .env-<name> variants (.env-prod, .env-production) carry secrets
+	// like their dotted siblings; unlike the dotted family they have no
+	// placeholder convention, so every one is excluded.
+	if strings.HasPrefix(lower, ".env-") {
+		return true
+	}
+	// Editor backup copies (.env~, .env.local~): a backup of a secret
+	// file is a secret file.
+	if strings.HasSuffix(lower, "~") && (lower == ".env~" || strings.HasPrefix(lower, ".env.") || strings.HasPrefix(lower, ".env-")) {
+		return true
+	}
 	// Private keys and credential bundles, matched case-insensitively
 	// so KEY.PEM or Credentials.JSON cannot slip through.
 	for _, ext := range []string{".pem", ".key", ".p12", ".pfx"} {
@@ -183,12 +211,27 @@ func shouldExcludeFromWIPCheckpoint(path string) bool {
 			return true
 		}
 	}
-	if strings.HasPrefix(lower, "id_rsa") || strings.HasPrefix(lower, "id_ed25519") {
+	// Private-key files are id_<type> (id_rsa, id_ed25519, id_ecdsa,
+	// id_dsa, ...): match the whole family, not just the two common
+	// types, so a less common key type cannot leak.
+	if strings.HasPrefix(lower, "id_") {
+		return true
+	}
+	// A bare "credentials" file (the AWS credentials-file format lives
+	// at exactly that name) and any *credentials*.json bundle.
+	if lower == "credentials" {
 		return true
 	}
 	if strings.HasSuffix(lower, ".json") {
 		trimmed := strings.TrimSuffix(lower, ".json")
-		if strings.HasPrefix(trimmed, "credentials") || strings.HasPrefix(trimmed, "service-account") {
+		if strings.Contains(trimmed, "credentials") || strings.HasPrefix(trimmed, "service-account") {
+			return true
+		}
+	}
+	// Infrastructure state carries secrets by design: variable files hold
+	// passwords and keys, state files hold whole resource bodies.
+	for _, ext := range []string{".tfvars", ".tfstate"} {
+		if strings.HasSuffix(lower, ext) {
 			return true
 		}
 	}

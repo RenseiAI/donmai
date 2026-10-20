@@ -62,7 +62,8 @@ func (r *Runner) checkpointFailedSession(qw QueuedWork, res *Result) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), providerErrorCheckpointTimeout)
 	defer cancel()
-	checkpoint, err := createWIPCheckpoint(ctx, qw, target, wipAttemptRef(qw.SessionID))
+	checkpoint, warnings, err := createWIPCheckpoint(ctx, qw, target, wipAttemptRef(qw.SessionID))
+	res.PostSessionWarnings = append(res.PostSessionWarnings, warnings...)
 	if err != nil {
 		warn(err)
 		return
