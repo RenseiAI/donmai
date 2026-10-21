@@ -29,6 +29,7 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 	"github.com/coder/websocket"
 )
@@ -2103,5 +2104,62 @@ func TestInteractive_CostlessSessionEndsWithoutWaiting(t *testing.T) {
 	// stayed open with no terminal and nothing declared a cost.
 	if elapsed >= interactiveTerminalEventGrace {
 		t.Fatalf("costless session took %v to finish; want well under the %v terminal grace", elapsed, interactiveTerminalEventGrace)
+	}
+}
+
+// TestInteractive_OwnershipLossNamesTheLockRefreshStatus drives the
+// production interactive supervisor (dispatchInteractive) with a pulser
+// double whose lost-ownership channel is already closed: the terminal
+// result keeps FailureLostOwnership and names the recorded lock-refresh
+// status in Error; a zero status keeps the bare generic text exactly.
+func TestInteractive_OwnershipLossNamesTheLockRefreshStatus(t *testing.T) {
+	requireSh(t)
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	for _, tc := range []struct {
+		name       string
+		lastStatus int
+		wantError  string
+		exact      bool
+	}{
+		{name: "recorded 401 is named", lastStatus: 401, wantError: "last lock-refresh status 401"},
+		{name: "zero status keeps the bare text", lastStatus: 0, wantError: heartbeat.ErrLostOwnership.Error(), exact: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", "sleep 30"}})
+			if err != nil {
+				t.Fatalf("ptyhost.Spawn: %v", err)
+			}
+			h := newInteractivePTYHandle(sess)
+			t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+			pulser := newFakeInteractivePulser()
+			pulser.lastStatus = tc.lastStatus
+			close(pulser.lost)
+
+			r := minimalRunner(t)
+			res := &Result{SessionID: "s"}
+			qw := QueuedWork{}
+			qw.SessionID = "s"
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, pulser, nil, agent.NoticeDeliveryPTYNotice)
+			if err == nil {
+				t.Fatal("expected an ownership-loss error")
+			}
+			if out.FailureMode != FailureLostOwnership {
+				t.Fatalf("FailureMode = %q; want %q", out.FailureMode, FailureLostOwnership)
+			}
+			if tc.exact {
+				if out.Error != tc.wantError {
+					t.Fatalf("Error = %q; want exactly %q", out.Error, tc.wantError)
+				}
+				return
+			}
+			if !strings.Contains(out.Error, tc.wantError) {
+				t.Fatalf("Error = %q; want it to contain %q", out.Error, tc.wantError)
+			}
+		})
 	}
 }
