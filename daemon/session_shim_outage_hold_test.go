@@ -10,6 +10,80 @@ import (
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
+// TestFixedHoldRecoveryCredentialExpiryWrapsDecisiveSentinel pins the wrapping
+// contract the hold depends on: an expired adopted-candidate recovery
+// credential validates to an error that errors.Is-matches
+// ErrSessionShimCredentialExpired, so isSessionShimDecisiveRelease classifies
+// it as positive evidence the session should end. Without the %w wrap the
+// hold would misread an expired credential as silence and spin past credential
+// expiry, holding a harness on authority its credential no longer grants.
+func TestFixedHoldRecoveryCredentialExpiryWrapsDecisiveSentinel(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	result := testAdoptedCandidateRecoveryResult(t, now)
+	result.AdoptedCandidateRecovery.CredentialExpiresAt = now.Add(-time.Hour)
+	err := validateSessionShimAdoptionPreparationResult(result, 3, now)
+	if err == nil {
+		t.Fatal("expired adopted-candidate recovery credential validated clean")
+	}
+	if !errors.Is(err, ErrSessionShimCredentialExpired) {
+		t.Fatalf("recovery credential-expiry error = %v, want it to wrap ErrSessionShimCredentialExpired", err)
+	}
+	if !isSessionShimDecisiveRelease(err) {
+		t.Fatalf("isSessionShimDecisiveRelease(%v) = false, want true — an expired recovery credential must end the hold at once", err)
+	}
+}
+
+// TestFixedHoldRecoveryCredentialExpiryEndsHoldAtOnce pins the hold-path half:
+// when the composing authority's adopted-candidate recovery carries an
+// already-expired credential, the armed fixed-attempt hold ends at once with
+// the lineage withdrawn instead of retrying through credential expiry. The
+// first attempt fails silent so the hold arms; the recovery expiry then
+// arrives while holding, and the hold must withdraw rather than grant the
+// harness time its credential no longer allows.
+func TestFixedHoldRecoveryCredentialExpiryEndsHoldAtOnce(t *testing.T) {
+	t.Parallel()
+	// ProcessEpoch 5 is the live shim this fixture starts: the recovery must
+	// bind to the authenticated live incarnation, and only the credential is
+	// expired.
+	expired := testAdoptedCandidateRecoveryResult(t, time.Now())
+	expired.AdoptedCandidateRecovery.ResumeDisposition.PTYEpoch = 5
+	expired.AdoptedCandidateRecovery.CredentialExpiresAt = time.Now().Add(-time.Hour)
+	var preparations atomic.Int64
+	held := &heldPastWindowCounter{answer: func() bool { return true }}
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy:         SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+		lineageLive:    alwaysLive,
+		heldPastWindow: held.predicate,
+		prepareV2: func(context.Context, SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			if preparations.Add(1) == 1 {
+				return SessionShimAdoptionPreparationResult{}, errors.New("injected carrier outage: timeout")
+			}
+			return cloneSessionShimAdoptionPreparationResult(expired), nil
+		},
+	})
+	lost := f.lostEntry(t)
+
+	done := make(chan sessionShimReadoptionDisposition, 1)
+	go func() {
+		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
+	}()
+	select {
+	case got := <-done:
+		if got != readoptionLineageGone {
+			t.Fatalf("disposition = %d, want readoptionLineageGone (%d) — an expired recovery credential must end the hold at once", got, readoptionLineageGone)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hold did not end within 10s of the recovery credential expiring — it is retrying past credential expiry")
+	}
+	if held.calls.Load() == 0 {
+		t.Fatal("ReadoptionHeldPastWindow was never consulted, yet the budget was exceeded")
+	}
+	if adoptions, _ := f.snapshot(); adoptions != 0 {
+		t.Fatalf("durable adoption attempted %d times, want 0 — the hold must end in preparation, before any new adoption", adoptions)
+	}
+}
+
 // TestFixedHoldRetriesPastBudgetUntilCarrierReturns pins the fixed-mode half
 // of the outage hold: spending the attempt budget with the shim still
 // observable and the composing layer holding the lineage past the bound does
