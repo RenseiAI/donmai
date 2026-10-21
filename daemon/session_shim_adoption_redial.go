@@ -300,12 +300,13 @@ func (d *Daemon) completeSessionShimAdoptionWithBoundedRedial(
 	hostID string,
 	evidence SessionShimAdoptionEvidence,
 	preparation SessionShimAdoptionPreparationResult,
+	gate *shimAdoptionGate,
 ) (SessionShimAdoptionEvidence, SessionShimAdoptionPreparationResult, SessionShimAdoptionReceipt, error) {
 	id := ctrl.Identity()
 	bound := d.sessionShimRelayDrainBound()
 	drain := &preparations.relayDrain
 	evidence, preparation, receipt, err := d.completeSessionShimAdoptionRepreparingDrift(
-		ctx, ctrl, preparations, hostID, evidence, preparation,
+		ctx, ctrl, preparations, hostID, evidence, preparation, gate,
 	)
 	redials := 0
 	lastStop := sessionShimDrainWindowSpent
@@ -359,7 +360,7 @@ func (d *Daemon) completeSessionShimAdoptionWithBoundedRedial(
 				fmt.Errorf("%w; re-dial %d abandoned: %v", err, redials, waitErr)
 		}
 		evidence, preparation, receipt, err = d.completeSessionShimAdoptionRepreparingDrift(
-			ctx, ctrl, preparations, hostID, evidence, preparation,
+			ctx, ctrl, preparations, hostID, evidence, preparation, gate,
 		)
 	}
 	// Still the operator-facing fact, so it stays wrapped rather than replaced —
@@ -603,6 +604,13 @@ func (d *Daemon) completeSessionShimAdoptionRepreparingDrift(
 	hostID string,
 	evidence SessionShimAdoptionEvidence,
 	preparation SessionShimAdoptionPreparationResult,
+	// gate is the consumer gate the adoption evidence arms its
+	// carrier-installed release on. A drift re-prepare mints a new Snapshot
+	// authority, so the refreshed evidence re-arms the release on the same
+	// gate: without it a redialled adoption parks its consumer behind the
+	// Snapshot its own takeover waits for. Nil keeps the historical proxy
+	// where no gated consumer exists.
+	gate *shimAdoptionGate,
 ) (SessionShimAdoptionEvidence, SessionShimAdoptionPreparationResult, SessionShimAdoptionReceipt, error) {
 	id := ctrl.Identity()
 	receipt, err := d.completeSessionShimAdoption(ctx, evidence, preparation)
@@ -673,7 +681,7 @@ func (d *Daemon) completeSessionShimAdoptionRepreparingDrift(
 			return evidence, preparation, SessionShimAdoptionReceipt{},
 				fmt.Errorf("%w; re-prepare %d unusable: %v", err, attempt, bindErr)
 		}
-		refreshed, evidenceErr := d.sessionShimAdoptionEvidence(ctx, ctrl, prepared, hostID)
+		refreshed, evidenceErr := d.sessionShimAdoptionEvidenceForGate(ctx, ctrl, prepared, hostID, gate)
 		if evidenceErr != nil {
 			return evidence, preparation, SessionShimAdoptionReceipt{},
 				fmt.Errorf("%w; re-prepare %d evidence failed: %v", err, attempt, evidenceErr)

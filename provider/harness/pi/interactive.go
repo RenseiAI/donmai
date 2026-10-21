@@ -208,6 +208,27 @@ func releaseInteractiveSession(plan *confinement.Plan, removeCredentials func())
 // lane uses. spec.Prompt seeds the first message as pi's positional prompt
 // argument, kept LAST so it is never consumed as the value of a preceding flag;
 // `--append-system-prompt` carries the composed session instructions.
+// piSeedMessage neutralises a positional seed the pi CLI's own parser
+// would otherwise misread as an option or a file reference. pi's parser
+// has no `--` handling — a bare `--` is read as an unknown flag and
+// swallows the next argument — so the `--` escape the other harnesses use
+// would itself reroute the prompt here. Instead a seed whose first
+// character is `-` or `@` (pi reads `@x` as a file argument) is prefixed
+// with a single space: the leading whitespace keeps the parser from
+// taking the flag/file branch while leaving the message visibly
+// unchanged, and any other seed passes through byte for byte.
+func piSeedMessage(seed string) string {
+	if seed == "" {
+		return seed
+	}
+	switch seed[0] {
+	case '-', '@':
+		return " " + seed
+	default:
+		return seed
+	}
+}
+
 func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []string) []string {
 	var args []string
 	for _, path := range extensionPaths {
@@ -226,8 +247,12 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []str
 		args = append(args, "--append-system-prompt", spec.SystemPromptAppend)
 	}
 	// Positional prompt LAST — every flag-shaped argument precedes it.
+	// A seed starting with `-` or `@` rides through piSeedMessage above
+	// (pi's parser has no `--` handling, so no end-of-options marker is
+	// emitted here): the seed stays a message, never a flag or file
+	// reference.
 	if spec.Prompt != "" {
-		args = append(args, spec.Prompt)
+		args = append(args, piSeedMessage(spec.Prompt))
 	}
 	return args
 }

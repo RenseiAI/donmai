@@ -336,6 +336,21 @@ type statusRequest struct {
 	// without an endpoint error — old platforms ignore it.
 	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
 
+	// FinalProvider names the provider the session's model calls last
+	// identified from native response evidence
+	// (LlmCallEvent.ResponseModelProvider) — the provider the wire
+	// response itself named. FinalModel is the served model id paired
+	// with it, and ProviderAttempts totals the serving attempts behind
+	// the session's calls (1 per model request, summed over calls that
+	// reported; zero means no call reported). Empty when no call carried
+	// response-provider evidence — never the configured selection
+	// (LlmCallEvent.System), which names the admitted entry even on a
+	// gateway-routed session. Additive; omitted when empty/zero — old
+	// platforms ignore them.
+	FinalProvider    string `json:"finalProvider,omitempty"`
+	FinalModel       string `json:"finalModel,omitempty"`
+	ProviderAttempts int    `json:"providerAttempts,omitempty"`
+
 	// ToolCalls counts the tool calls the session made across every
 	// stream: the initial turn, injected turns, continuations and
 	// in-session retries. Always serialized (no omitempty) so a zero
@@ -705,6 +720,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
+		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 		GenerationIDs: r.GenerationIDs,
 	}
