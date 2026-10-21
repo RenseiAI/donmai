@@ -1659,10 +1659,10 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		qw.CoAuthorName, qw.CoAuthorEmail = coAuthorName, coAuthorEmail
 		qw.Capabilities = d.Capabilities
 		// The detail is authoritative for this per-work policy flag just as
-		// it is for credentials: the receipted payload wins only when it
-		// already carries the same value, and an older payload that
-		// predates the field leaves the flag exactly as dispatched.
-		qw.DeferFailureTransition = d.DeferFailureTransition || admitted.DeferFailureTransition
+		// it is for credentials: the receipted payload never overrides it,
+		// so an older payload that predates the field and a newer one that
+		// disagrees both leave the flag exactly as dispatched.
+		qw.DeferFailureTransition = d.DeferFailureTransition
 	}
 	stageBudgetJSON, err := marshalOptional(d.StageBudget)
 	if err != nil {

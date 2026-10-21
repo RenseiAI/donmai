@@ -100,3 +100,51 @@ func TestDetailToQueuedWork_DeferFailureTransitionSurvives(t *testing.T) {
 		t.Errorf("DeferFailureTransition = true; want false (absent defaults to prior behaviour)")
 	}
 }
+
+// TestDetailToQueuedWork_DeferFailureTransitionReceiptedAuthoritative pins
+// that the dispatch detail is authoritative on the receipted path: a payload
+// that predates the field and one that disagrees both leave the flag exactly
+// as dispatched.
+func TestDetailToQueuedWork_DeferFailureTransitionReceiptedAuthoritative(t *testing.T) {
+	payloadWith := func(v bool) []byte {
+		p, err := json.Marshal(map[string]any{"sessionId": "sess-defer", "deferFailureTransition": v})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	payloadWithout := func() []byte {
+		p, err := json.Marshal(map[string]any{"sessionId": "sess-defer"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cases := []struct {
+		name    string
+		detail  bool
+		payload []byte
+		want    bool
+	}{
+		{"detail true payload absent stays true", true, payloadWithout(), true},
+		{"detail true payload true stays true", true, payloadWith(true), true},
+		{"detail true payload false stays true", true, payloadWith(false), true},
+		{"detail false payload true stays false", false, payloadWith(true), false},
+		{"detail false payload absent stays false", false, payloadWithout(), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			queued, err := detailToQueuedWork(&daemon.SessionDetail{
+				SessionID:              "sess-defer",
+				DeferFailureTransition: tc.detail,
+				OperationalPayload:     tc.payload,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if queued.DeferFailureTransition != tc.want {
+				t.Errorf("DeferFailureTransition = %v; want %v (detail authoritative)", queued.DeferFailureTransition, tc.want)
+			}
+		})
+	}
+}

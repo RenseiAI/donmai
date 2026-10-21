@@ -9,8 +9,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
@@ -635,7 +639,7 @@ func TestRunPostSession_ProviderErrorWithToolCallsTransitions(t *testing.T) {
 	res := &Result{}
 	res.Status = "failed"
 	res.FailureMode = FailureProviderError
-	res.noteToolCalls(1)
+	res.ToolCalls = 1
 
 	r.runPostSession(context.Background(), qw, res)
 
@@ -646,5 +650,194 @@ func TestRunPostSession_ProviderErrorWithToolCallsTransitions(t *testing.T) {
 	}
 	if res.LinearStatusTransition == nil || res.LinearStatusTransition.Reason != "agent-failed" {
 		t.Errorf("Reason = %v; want agent-failed", res.LinearStatusTransition)
+	}
+}
+
+// TestRunPostSession_ProviderErrorOptedInWithoutTransitionKeepsReason pins
+// the ShouldTransition guard on the deferral branch: an opted-in
+// provider-error failure on a work type whose decision carries no transition
+// (development has no failure-side target) keeps its original reason instead
+// of being relabelled as a deferral.
+func TestRunPostSession_ProviderErrorOptedInWithoutTransitionKeepsReason(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+	r := makePostSessionRunner(t, srv)
+
+	qw := QueuedWork{
+		QueuedWork:             queuedWorkBase("REN-PS-NOTRANS"),
+		WorkerID:               "wkr-post",
+		AuthToken:              "tok-post",
+		PlatformURL:            srv.URL,
+		DeferFailureTransition: true,
+	}
+	qw.WorkType = WorkTypeDevelopmentStr
+	qw.IssueID = "issue-uuid-notrans"
+
+	res := &Result{}
+	res.Status = "failed"
+	res.FailureMode = FailureProviderError
+
+	r.runPostSession(context.Background(), qw, res)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 0 {
+		t.Fatalf("expected 0 proxy calls (no mapping, no deferral); got %d (%v)", len(*calls), *calls)
+	}
+	tr := res.LinearStatusTransition
+	if tr == nil {
+		t.Fatal("expected a LinearStatusTransition; got nil")
+	}
+	if tr.Attempted {
+		t.Errorf("Attempted = true; want false (no mapping)")
+	}
+	if tr.Reason != "no-mapping" {
+		t.Errorf("Reason = %q; want no-mapping (the deferral must not relabel a no-transition decision)", tr.Reason)
+	}
+}
+
+// deferStallProvider replays the stall-then-provider-error shape the session
+// counter must survive: the first turn makes a tool call and then stalls
+// (silence after its tool result), and the resumed turn fails on a provider
+// error with no tool call. It drives the PRODUCTION entry point (Runner.Run),
+// not a helper.
+type deferStallProvider struct {
+	agent.HarnessProvider
+	resumes atomic.Int32
+}
+
+func (p *deferStallProvider) Spawn(_ context.Context, _ agent.Spec) (agent.Handle, error) {
+	h := &deferStallHandle{events: make(chan agent.Event, 64)}
+	h.events <- agent.InitEvent{SessionID: "defer-stall-session"}
+	h.events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-1", Input: map[string]any{"command": "go test ./..."}}
+	h.events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-1", Content: "ok"}
+	// Then silence: the post-tool model request never answers, so the stall
+	// detector fires and the runner resumes the turn.
+	return h, nil
+}
+
+func (p *deferStallProvider) Resume(_ context.Context, sessionID string, _ agent.Spec) (agent.Handle, error) {
+	if sessionID == "" {
+		return nil, agent.ErrSessionNotFound
+	}
+	p.resumes.Add(1)
+	h := &deferStallHandle{events: make(chan agent.Event, 64)}
+	h.events <- agent.InitEvent{SessionID: "defer-stall-session"}
+	// No tool call on the resumed turn: the provider fails at once.
+	h.events <- agent.ErrorEvent{Message: "overloaded_error: upstream 529"}
+	close(h.events)
+	return h, nil
+}
+
+type deferStallHandle struct {
+	events chan agent.Event
+}
+
+func (h *deferStallHandle) SessionID() string          { return "defer-stall-session" }
+func (h *deferStallHandle) Events() <-chan agent.Event { return h.events }
+func (h *deferStallHandle) Inject(_ context.Context, _ string) error {
+	return agent.ErrUnsupported
+}
+func (h *deferStallHandle) Stop(_ context.Context) error { return nil }
+
+// TestRun_DeferFailureTransitionStallToolCallPreventsDeferral pins the
+// session counter the deferral reads: a tool call that ran in a stalled
+// attempt still counts (res.ToolCalls covers every stream, stall-retry
+// attempts included), so an opted-in provider-error failure after that tool
+// call keeps the failure-side transition. A parallel counter fed only from
+// the returned observation would read zero here and wrongly defer.
+func TestRun_DeferFailureTransitionStallToolCallPreventsDeferral(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	harness, ok := base.(agent.HarnessProvider)
+	if !ok {
+		t.Fatal("stub provider is not a HarnessProvider")
+	}
+	provider := &deferStallProvider{HarnessProvider: harness}
+
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL,
+		WorkerID:    "wkr-defer",
+		AuthToken:   "tok-defer",
+		HTTPClient:  srv.Client(),
+		BaseDelay:   1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry:               reg,
+		WorktreeManager:        wtm,
+		Poster:                 poster,
+		HTTPClient:             srv.Client(),
+		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		SkipBackstop:           true,
+		SkipSteering:           true,
+		PreserveWorktreeAlways: true,
+		ProviderStallTimeout:   50 * time.Millisecond,
+		ProviderStallRetries:   2,
+		IdleTimeout:            30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	r.providerRetryBackoff = func(int) time.Duration { return 0 }
+	r.pullRequestDraftLookup = func(context.Context, string, string) (bool, error) { return false, nil }
+
+	qw := QueuedWork{
+		QueuedWork:             queuedWorkBase("REN-PS-STALL"),
+		WorkerID:               "wkr-defer",
+		AuthToken:              "tok-defer",
+		PlatformURL:            srv.URL,
+		DeferFailureTransition: true,
+		ResolvedProfile:        ResolvedProfile{Provider: agent.ProviderStub},
+	}
+	qw.WorkType = WorkTypeQAStr
+	qw.IssueID = "issue-uuid-stall"
+	qw.Repository = makeBareRepo(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err != nil && res == nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status = %q, FailureMode = %q; want failed/%s", res.Status, res.FailureMode, FailureProviderError)
+	}
+	if res.ToolCalls == 0 {
+		t.Fatalf("ToolCalls = 0; want >=1 (the stalled attempt ran a tool call)")
+	}
+	if provider.resumes.Load() == 0 {
+		t.Fatalf("resumes = 0; want >=1 (the stall must retry before failing)")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 proxy call (tool call ran, no deferral); got %d (%v)", len(*calls), *calls)
+	}
+	tr := res.LinearStatusTransition
+	if tr == nil {
+		t.Fatal("expected a LinearStatusTransition; got nil")
+	}
+	if !tr.Attempted {
+		t.Errorf("Attempted = false; want true (the tool call blocks the deferral)")
+	}
+	if tr.Reason == "deferred-provider-error" {
+		t.Errorf("Reason = deferred-provider-error; want the failure-side transition (a stalled attempt still ran a tool call)")
+	}
+	if tr.TargetStatus != "Rejected" {
+		t.Errorf("TargetStatus = %q; want Rejected", tr.TargetStatus)
 	}
 }

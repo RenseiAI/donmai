@@ -423,38 +423,10 @@ type Result struct {
 	// ignores it, and the poster carries only the embedded agent.Result).
 	manifestPrinted bool
 
-	// toolCallsTotal counts the tool calls (agent.ToolUseEvent) observed
-	// across every consumed event stream of this session. The post-session
-	// block reads it to recognise a provider-error failure that happened
-	// before the agent produced any side effect. Unexported so it never
-	// enters the status wire shape; the deferral itself is recorded on
-	// LinearStatusTransition, which the status post already carries.
-	toolCallsTotal int
-
 	// rescueTargets are the session's git checkouts, each with the commit it
 	// was provisioned at. Run reads them before teardown to preserve any work
 	// that exists nowhere else (see preserveUnpublishedWork).
 	rescueTargets []rescueTarget
-}
-
-// noteToolCalls adds one consumed stream's tool-call count to the
-// session total. Called once per consumeEvents return in the headless
-// path (initial turn, steering resumption, continuation/retry turns,
-// memory-inject turns) so the total covers the whole session.
-func (r *Result) noteToolCalls(n int) {
-	if r == nil || n <= 0 {
-		return
-	}
-	r.toolCallsTotal += n
-}
-
-// sessionToolCalls reports the session-total tool-call count recorded
-// via noteToolCalls. Zero when no stream reported any tool call.
-func (r *Result) sessionToolCalls() int {
-	if r == nil {
-		return 0
-	}
-	return r.toolCallsTotal
 }
 
 // LinearStatusTransition records the runner's post-session attempt to

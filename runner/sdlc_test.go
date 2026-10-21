@@ -445,25 +445,3 @@ func TestShouldDeferFailureTransition(t *testing.T) {
 		})
 	}
 }
-
-// TestResultSessionToolCalls pins the session-total counter backing the
-// deferral gate: observations accumulate, non-positive inputs are ignored,
-// and a nil result reads zero.
-func TestResultSessionToolCalls(t *testing.T) {
-	var nilRes *Result
-	if got := nilRes.sessionToolCalls(); got != 0 {
-		t.Fatalf("nil sessionToolCalls = %d; want 0", got)
-	}
-	res := &Result{}
-	nilRes.noteToolCalls(3) // must not panic on a nil receiver
-	res.noteToolCalls(0)
-	res.noteToolCalls(-1)
-	if got := res.sessionToolCalls(); got != 0 {
-		t.Fatalf("sessionToolCalls after non-positive notes = %d; want 0", got)
-	}
-	res.noteToolCalls(2)
-	res.noteToolCalls(3)
-	if got := res.sessionToolCalls(); got != 5 {
-		t.Errorf("sessionToolCalls = %d; want 5", got)
-	}
-}

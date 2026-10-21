@@ -72,7 +72,7 @@ func (r *Runner) runPostSession(parentCtx context.Context, qw QueuedWork, res *R
 	// tool calls on work that opts in. The skipped transition is
 	// recorded on the terminal result (reason "deferred-provider-error")
 	// so the control plane can complete or apply it later.
-	if decision.ShouldTransition && shouldDeferFailureTransition(qw.DeferFailureTransition, res.FailureMode, res.sessionToolCalls()) {
+	if decision.ShouldTransition && shouldDeferFailureTransition(qw.DeferFailureTransition, res.FailureMode, res.ToolCalls) {
 		decision.ShouldTransition = false
 		decision.Deferred = true
 		decision.Reason = "deferred-provider-error"
