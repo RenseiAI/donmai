@@ -1442,7 +1442,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// rework must have moved past.
 	verifyCtx := context.WithoutCancel(ctx)
 	var prVerifier *sessionPullRequestVerifier
-	if RequiresPRURL(qw.WorkType) {
+	if RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		prVerifier = r.newSessionPullRequestVerifier(verifyCtx, qw, repositoryDeclaration, wpath, branch, reworkStartHead(qw, res, wpath), repositoryFree)
 	}
 	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
@@ -1453,7 +1453,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// continued pull request exactly like the rework pull requests they
 	// already pin: a noop continue run keeps turning instead of ending
 	// completed against an unchanged head.
-	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
+	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		if continuedURL := continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath); continuedURL != "" {
 			r.seedContinuedPullRequest(prVerifier, continuedURL, res, &streamRes)
 		}
@@ -1531,7 +1531,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// point, the next follow-up prompt asks the agent to wrap up (unless the
 	// request already reached it mid-turn), and once a cap ends the session
 	// no follow-up turn starts.
-	publicationComplete := !RequiresPRURL(qw.WorkType) && res.WorkResult == "passed"
+	publicationComplete := !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) && res.WorkResult == "passed"
 	followUps := r.newTurnFollowUps()
 	if stallFollowUps.retried > 0 || stallFollowUps.exhausted {
 		// A stall retry already ran on the first turn: carry its count
@@ -1541,8 +1541,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		followUps.retried = stallFollowUps.retried
 		followUps.last = tailRetry
 	}
-	reviewWork := RequiresReviewVerdict(qw.WorkType)
-	continuable := (RequiresPRURL(qw.WorkType) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
+	reviewWork := RequiresReviewVerdict(qw.WorkType, qw.WorkTypeRole)
+	continuable := (RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
 	tailRecoverable := selectedRepositoryMutable || reviewWork
 tailRecovery:
 	for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
@@ -1565,7 +1565,7 @@ tailRecovery:
 				ending = turnStoppedEarly
 			}
 		}
-		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType))
+		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
 		switch step {
 		case tailDone:
 			break tailRecovery
@@ -1728,8 +1728,8 @@ tailRecovery:
 
 	// Amend-existing-branch contract: on ref-bearing runs, skip gh pr create — the
 	// fix lands on the existing branch/PR, not a new one.
-	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType)
-	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
+	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType, qw.WorkTypeRole)
+	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		switch res.FailureMode {
 		case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
 			backstopEligible = false
@@ -1746,7 +1746,7 @@ tailRecovery:
 	if qw.ContinuePullRequest != nil {
 		probe := *res
 		probe.PullRequestURL = ""
-		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType)
+		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType, qw.WorkTypeRole)
 	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
 		switch {
@@ -1795,7 +1795,7 @@ tailRecovery:
 	// other check still applies. Runs only when no failure was already
 	// recorded, so a runner-authored refusal (divergence, provision)
 	// keeps its own typed reason.
-	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType) && res.FailureMode == "" && budgetStop == nil {
+	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) && res.FailureMode == "" && budgetStop == nil {
 		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1873,7 +1873,7 @@ tailRecovery:
 	// would flip it to failed → resolveTargetStatus forces effectiveResult
 	// "failed" → the issue transitions to Rejected instead of Delivered.
 	missingPRs := []string(nil)
-	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
+	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		missingPRs = missingMutablePullRequests(res, *repositoryDeclaration)
 	}
 	// An exhausted session keeps the failure mode of the bound it ran out
@@ -1882,7 +1882,7 @@ tailRecovery:
 		res.Status = "failed"
 		res.FailureMode = FailureBackstop
 		res.Error = "completion contract missing pull requests for mutable repositories: " + strings.Join(missingPRs, ", ")
-	} else if res.BackstopReport != nil && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
+	} else if res.BackstopReport != nil && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		res.Status = "failed"
 		if res.FailureMode == "" {
 			res.FailureMode = FailureBackstop
@@ -2275,7 +2275,7 @@ func (r *Runner) stopAtBudget(qw QueuedWork, handle agent.Handle, enforcer *Budg
 // recorded. Such a session ends completed with the breach recorded, not
 // failed: the cap stopped work that was already done.
 func deliveredAtBudgetStop(qw QueuedWork, res *Result, declaration *workarea.NormalizedDeclaration) bool {
-	if !RequiresPRURL(qw.WorkType) || res.PullRequestURL == "" || res.WorkResult != "passed" {
+	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || res.PullRequestURL == "" || res.WorkResult != "passed" {
 		return false
 	}
 	if res.FailureMode != "" || res.Status == "failed" {
@@ -2516,6 +2516,29 @@ type streamObservation struct {
 	// carried. Tail recovery reads a turn with at least one as productive
 	// (turn_continuation.go).
 	toolCalls int
+	// finalProvider names the provider the stream's model calls last
+	// identified from native response evidence
+	// (LlmCallEvent.ResponseModelProvider): the provider the wire response
+	// itself named. Last non-empty report wins. Empty when no call
+	// carried response-provider evidence — the common case, since most
+	// harnesses report only the configured selection (System), which is
+	// never copied here: on a gateway-routed session System names the
+	// configured entry or a harness constant (codex "openai", the span
+	// fallback's configured system), not the upstream that served.
+	// Synthetic aggregate fallbacks carry no serving identity and never
+	// clobber it.
+	finalProvider string
+	// finalModel is the served model id paired with finalProvider: the
+	// native served id (LlmCallEvent.ResponseModel) when the wire served
+	// a different id than requested, else the requested id. Same
+	// last-non-empty-wins rule.
+	finalModel string
+	// providerAttempts sums the serving attempts the stream's model
+	// calls reported (LlmCallEvent.Attempts). Only positive counts
+	// contribute; a call that did not report (zero) adds nothing, so an
+	// all-unknown stream totals zero (unknown), never a fabricated
+	// count.
+	providerAttempts int
 	// noProgress is set when the idle/no-progress watchdog fired — the
 	// event stream produced no agent.Event for longer than the runner's
 	// IdleTimeout window. The runner reads it in the post-stream
@@ -2586,6 +2609,20 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	}
 	if o.reviewVerdict != "" {
 		res.ReviewVerdict = o.reviewVerdict
+	}
+	// The serving report is last-non-empty-wins: a later turn that
+	// identifies a different response provider replaces the earlier fact,
+	// and re-consuming the same events is a no-op — the same idempotency
+	// the terminal summary relies on. A later stream with no call (an
+	// injected turn, a tail recovery) keeps the earlier report: the
+	// non-empty guards below are pinned by test. Like the tool-call
+	// count, the attempt total is NOT applied here: consumeEvents meters
+	// it onto the envelope per stream (a sum is not idempotent).
+	if o.finalProvider != "" {
+		res.FinalProvider = o.finalProvider
+	}
+	if o.finalModel != "" {
+		res.FinalModel = o.finalModel
 	}
 	// Cost is not taken from the stream: the session's usage meter (the
 	// budget enforcer) counts every turn, and runLoop reports its total.
@@ -2683,10 +2720,10 @@ func (r *Runner) consumeEventsWithoutStallDetector(
 // wrap-up point, on a harness that takes a message into a running turn, the
 // agent is asked to wrap up at its next tool call (wrapUpMidTurn).
 //
-// The stream's tool calls are added to res.ToolCalls (res may be nil) on
-// every return: each stream counts exactly once, including a turn the
-// caller stops on (no progress, timeout, lost ownership, cancel) before
-// applying its observation.
+// The stream's tool calls AND serving attempts are added to res.ToolCalls
+// and res.ProviderAttempts (res may be nil) on every return: each stream
+// counts exactly once, including a turn the caller stops on (no progress,
+// timeout, lost ownership, cancel) before applying its observation.
 //
 // stallTimeout is the stalled-model-request window for this drain; zero
 // or negative disarms the detector.
@@ -2709,7 +2746,10 @@ func (r *Runner) consumeEventsWithin(
 	}
 	obs := streamObservation{}
 	if res != nil {
-		defer func() { res.ToolCalls += obs.toolCalls }()
+		// Like the tool-call count, the serving-attempt total is
+		// metered per stream on every return: each stream counts exactly
+		// once (a sum is not idempotent, so it stays out of applyTo).
+		defer func() { res.ToolCalls += obs.toolCalls; res.ProviderAttempts += obs.providerAttempts }()
 	}
 
 	// Open the events.jsonl audit file under <worktree>/.agent/.
@@ -3158,6 +3198,44 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			obs.pullRequestURL = u
 		}
 		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Content)
+	case agent.LlmCallEvent:
+		// The per-call serving report: which provider the wire response
+		// itself identified and what it served, plus how many attempts
+		// the call took. The provider comes ONLY from response evidence
+		// (ResponseModelProvider) — never from System, which names the
+		// configured selection or a harness constant even on a
+		// gateway-routed session. Synthetic aggregate fallbacks carry no
+		// serving identity — the span processor synthesizes them from the
+		// terminal cost when a harness exposed only rolled-up usage — so
+		// they never clobber the last native report, and their zero
+		// attempt count adds nothing to the total. Last-non-empty-wins:
+		// a later turn that identifies a different response provider
+		// replaces the earlier fact. A failed call still records its
+		// response identity when the harness reports one (known
+		// limitation: the last failed attempt can own the report); a
+		// stopped stream (no progress, timeout, budget, lost ownership)
+		// meters attempts via the per-stream defer but never reaches
+		// applyTo, so it may post attempts without a provider.
+		if e.Synthetic || e.UsageSource == agent.LlmUsageAggregate {
+			break
+		}
+		if e.ResponseModelProvider != "" {
+			obs.finalProvider = e.ResponseModelProvider
+		}
+		switch {
+		case e.ResponseModel != "":
+			obs.finalModel = e.ResponseModel
+		case e.Model != "":
+			obs.finalModel = e.Model
+		}
+		delta := 0
+		if e.Attempts > 0 {
+			obs.providerAttempts += e.Attempts
+			delta = e.Attempts
+		}
+		if e.ResponseModelProvider != "" || e.ResponseModel != "" || e.Model != "" || e.Attempts > 0 {
+			r.mirrorServingReport(worktreePath, obs, delta)
+		}
 	case agent.ResultEvent:
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success
@@ -3174,6 +3252,37 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 				obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
 			}
 		}
+	}
+}
+
+// mirrorServingReport persists the stream's observed serving report onto
+// the session record (state.json), next to the admitted endpoint axes it
+// never touches: the admitted binding stays as dispatched, while these
+// fields say what the wire responses identified. Best-effort like the
+// InitEvent mirror above — a persistence failure is logged and dropped,
+// never fatal to the run. Provider and model update only on non-empty
+// reports, so a later stream with no call never clears an earlier fact.
+// Attempts accumulate by delta across calls AND streams (the stored total
+// only grows), while the envelope total stays authoritative: consumeEvents
+// meters each stream's sum onto res via its per-stream defer.
+func (r *Runner) mirrorServingReport(worktreePath string, obs *streamObservation, attemptsDelta int) {
+	if r == nil || r.store == nil || worktreePath == "" {
+		return
+	}
+	_, err := r.store.Update(worktreePath, func(s *state.State) error {
+		if obs.finalProvider != "" {
+			s.FinalProvider = obs.finalProvider
+		}
+		if obs.finalModel != "" {
+			s.FinalModel = obs.finalModel
+		}
+		if attemptsDelta > 0 {
+			s.ProviderAttempts += attemptsDelta
+		}
+		return nil
+	})
+	if err != nil && r.logger != nil {
+		r.logger.Debug("serving report mirror failed", "err", err)
 	}
 }
 

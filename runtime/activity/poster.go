@@ -644,7 +644,8 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // agent.SystemSubtypeReasoningEffort become context markers with fixed
 // content (never the event's free-form Message; the effort marker names a
 // level only when it is a known agent.EffortLevel). Codex rerouting,
-// moderation and safety buffering become warnings; file/plan deltas become
+// moderation and safety buffering become warnings; native diagnostics retain
+// their error/warning level without terminating the turn; file/plan deltas become
 // progress activities.
 //
 // timestamp is the wall-clock time at which the event was observed; the
@@ -741,7 +742,11 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 
 	case agent.SystemEvent:
 		switch e.Subtype {
-		case "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+		case "codex_error":
+			out.Type = "error"
+			out.Content = e.Message
+			return out, true
+		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
 			out.Type = "warning"
 			out.Content = e.Message
 			return out, true

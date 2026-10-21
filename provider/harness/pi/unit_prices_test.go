@@ -12,6 +12,12 @@ func pricedSpec(prices *agent.UnitPrices) agent.Spec {
 	return agent.Spec{
 		Prompt: "hi",
 		Model:  "claude-x",
+		// A gateway cell always carries its configured context window: the
+		// dispatch folds the resolved profile's top-level window into
+		// ProviderConfig, and the spawn gate refuses a gateway session
+		// without one — so a windowless gateway spec is the refused shape,
+		// never a fixture for any other behavior.
+		ProviderConfig: map[string]any{"contextWindow": 1_000_000},
 		Endpoint: &agent.EndpointBinding{
 			Company:    agent.CompanyAnthropic,
 			BaseURL:    "http://127.0.0.1:4000/v1",
@@ -111,6 +117,7 @@ func TestExtensionRegistersBoundPrices(t *testing.T) {
 	bound := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 		piPricesBoundEnvVar + "=1",
 		piPriceInputEnvVar + "=3",
 		piPriceOutputEnvVar + "=15",
@@ -124,6 +131,7 @@ func TestExtensionRegistersBoundPrices(t *testing.T) {
 	unbound := runExtensionFixture(t, []string{
 		piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
 		piModelEnvVar + "=served-model",
+		piContextWindowEnvVar + "=262144",
 	}, "read", `{"path":"README.md"}`)
 	if cost, _ := registeredDonmaiModel(t, unbound)["cost"].(map[string]any); cost["input"] != float64(0) || cost["output"] != float64(0) || cost["cacheRead"] != float64(0) || cost["cacheWrite"] != float64(0) {
 		t.Errorf("unbound registered cost = %v, want the zero table", cost)

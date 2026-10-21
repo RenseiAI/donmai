@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -34,7 +36,7 @@ func TestMain(m *testing.M) {
 		// The documented bug signature this package's stderr-capture change
 		// exists to stop hiding: a --remote PTY client that only observes a
 		// dropped connection exits 0 and reports nothing wrong.
-		os.Exit(0)
+		os.Exit(runCodexFakePTYClientArgvAssertion())
 	}
 	if os.Getenv(codexFakePTYClientCreatesThreadEnv) == "1" && argvHasFlag(os.Args, "--remote") {
 		os.Exit(runCodexFakePTYClientCreatesThread())
@@ -65,6 +67,46 @@ func TestMain(m *testing.M) {
 // invocation vs. the PTY's --remote attach), since both processes inherit
 // the same session-scoped env in production and therefore the same fixture
 // env vars in these tests.
+// Env knobs the fake PTY client role reads to assert the seed argv it
+// was handed: the directory to record its argv in, and — when set — the
+// expected seed plus the requirement that it follow a `--` element.
+// Production SpawnInteractive fans Spec.Env onto the PTY child, so these
+// ride along untouched.
+const (
+	codexFakePTYClientRecordArgvEnv               = "DONMAI_CODEX_FAKE_PTY_CLIENT_RECORD_ARGV"
+	codexFakePTYClientWantSeedEnv                 = "DONMAI_CODEX_FAKE_PTY_CLIENT_WANT_SEED"
+	codexFakePTYClientWantSeedAdjacentDashDashEnv = "DONMAI_CODEX_FAKE_PTY_CLIENT_WANT_SEED_ADJACENT_DASHDASH"
+)
+
+// runCodexFakePTYClientArgvAssertion is the fake PTY client child role:
+// it records its own argv for the parent test to assert on, optionally
+// asserting inline that the expected seed rides last preceded by `--`.
+// Returning (not exiting) keeps every deferred close reachable; the
+// caller exits with the code.
+func runCodexFakePTYClientArgvAssertion() int {
+	// The record directory is a test-owned temp dir handed in through the
+	// session env (never operator input): the fake client role only ever
+	// writes its own argv capture beside it.
+	if dir := os.Getenv(codexFakePTYClientRecordArgvEnv); dir != "" {
+		var b strings.Builder
+		for _, a := range os.Args[1:] {
+			b.WriteString(a)
+			b.WriteByte('\n')
+		}
+		_ = os.WriteFile(filepath.Join(dir, "argv.txt"), []byte(b.String()), 0o600) //nolint:gosec // G703: dir is the test's own temp dir, not caller input
+	}
+	if want := os.Getenv(codexFakePTYClientWantSeedEnv); want != "" {
+		argv := os.Args[1:]
+		if len(argv) < 2 || argv[len(argv)-1] != want {
+			return 10
+		}
+		if os.Getenv(codexFakePTYClientWantSeedAdjacentDashDashEnv) != "" && argv[len(argv)-2] != "--" {
+			return 11
+		}
+	}
+	return 0
+}
+
 func argvHasFlag(argv []string, flag string) bool {
 	for _, a := range argv {
 		if a == flag {

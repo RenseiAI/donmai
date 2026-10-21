@@ -27,7 +27,7 @@ func TestQuotaState_ProbeDueFiveMinutes(t *testing.T) {
 	t.Parallel()
 	q := &quotaState{}
 	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
-	if !q.codexProbeDue(base) || !q.claudeProbeDue(base) {
+	if !q.codexProbeDue(base) || !q.claudeProbeDue(base) || !q.museProbeDue(base) {
 		t.Fatal("first probe must be due")
 	}
 	q.noteCodexProbe("opaque-1", "promax", agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows()), base)
@@ -50,12 +50,16 @@ func TestQuotaState_FailedProbeAdvancesProbeClock(t *testing.T) {
 	for name, note := range map[string]func(q *quotaState){
 		"codex":  func(q *quotaState) { q.noteCodexProbe("opaque-1", "promax", failed, attempt) },
 		"claude": func(q *quotaState) { q.noteClaudeProbe("opaque-2", failed, attempt) },
+		"muse":   func(q *quotaState) { q.noteMuseProbe("muse-host-session", failed, attempt) },
 	} {
 		q := &quotaState{}
 		note(q)
 		due := q.codexProbeDue
 		if name == "claude" {
 			due = q.claudeProbeDue
+		}
+		if name == "muse" {
+			due = q.museProbeDue
 		}
 		if due(attempt.Add(4 * time.Minute)) {
 			t.Errorf("%s probe inside the interval after a failed attempt must not be due", name)
@@ -292,6 +296,60 @@ func TestQuotaState_FailedProbeKeepsWindowsButReportsNotOK(t *testing.T) {
 	}
 	if got[0].AuthCheck == nil || got[0].AuthCheck.OK || got[0].AuthCheck.CheckedAt != agent.ISOTime(later) {
 		t.Errorf("authCheck = %+v, want not ok at the failure time", got[0].AuthCheck)
+	}
+}
+
+// TestQuotaState_MuseProbeEmitsWindowlessEntry pins the muse
+// heartbeat entry: the login check proves a supported CLI is
+// installed, never usage windows, so the entry carries an empty
+// window set beside its verdict, with the probe time on both.
+func TestQuotaState_MuseProbeEmitsWindowlessEntry(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	q := &quotaState{}
+	if got := q.snapshot(); len(got) != 0 {
+		t.Fatalf("empty snapshot = %+v, want none", got)
+	}
+	q.noteMuseProbe("muse-host-session", agent.MakeUsageLimits(agent.ISOTime(base), nil), base)
+	got := (&Daemon{quota: q}).quotaSnapshot()
+	if len(got) != 1 {
+		t.Fatalf("snapshot = %+v, want the one muse entry", got)
+	}
+	acct := got[0]
+	if acct.ID != "muse-host-session" || acct.Provider != agent.UsageHarnessMuse {
+		t.Errorf("account = %+v, want the host-session muse entry", acct)
+	}
+	if acct.Plan != "" || acct.LimitID != "" {
+		t.Errorf("account = %+v, want no plan or bucket on a windowless entry", acct)
+	}
+	if acct.Limits.CheckedAt != agent.ISOTime(base) || len(acct.Limits.Windows) != 0 {
+		t.Errorf("limits = %+v, want an empty window set at the probe time", acct.Limits)
+	}
+	if acct.AuthCheck == nil || acct.AuthCheck.Harness != agent.UsageHarnessMuse || !acct.AuthCheck.OK || acct.AuthCheck.CheckedAt != agent.ISOTime(base) {
+		t.Errorf("authCheck = %+v, want ok:true for muse at the probe time", acct.AuthCheck)
+	}
+	// A refused check keeps the verdict shape: ok:false at the new
+	// probe time, still without windows.
+	later := base.Add(5 * time.Minute)
+	refused := agent.MakeUnavailableUsageLimits(agent.ISOTime(later), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
+	refused.Unavailable.Answered = true
+	q.noteMuseProbe("muse-host-session", refused, later)
+	got = (&Daemon{quota: q}).quotaSnapshot()
+	if len(got) != 1 {
+		t.Fatalf("snapshot = %+v, want the one muse entry", got)
+	}
+	if got[0].AuthCheck == nil || got[0].AuthCheck.OK || got[0].AuthCheck.CheckedAt != agent.ISOTime(later) {
+		t.Errorf("authCheck = %+v, want not ok at the failure time", got[0].AuthCheck)
+	}
+	if len(got[0].Limits.Windows) != 0 {
+		t.Errorf("limits = %+v, want no windows after a refused check", got[0].Limits)
+	}
+	// A read that never reached the CLI keeps the previous verdict.
+	unreached := agent.MakeUnavailableUsageLimits(agent.ISOTime(later.Add(time.Minute)), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
+	q.noteMuseProbe("muse-host-session", unreached, later.Add(time.Minute))
+	got = (&Daemon{quota: q}).quotaSnapshot()
+	if len(got) != 1 || got[0].AuthCheck == nil || got[0].AuthCheck.OK || got[0].AuthCheck.CheckedAt != agent.ISOTime(later) {
+		t.Fatalf("authCheck = %+v, want the refused verdict untouched", got[0].AuthCheck)
 	}
 }
 

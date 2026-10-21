@@ -1,5 +1,7 @@
 package runner
 
+import "log/slog"
+
 // SDLC status mappings + post-session transition decision.
 //
 // This file ports the Linear status-mapping tables from the legacy TS
@@ -188,8 +190,18 @@ var resultSensitiveWorkTypes = map[string]bool{
 // the WORK_RESULT marker. It does not grant repository mutation or imply that a
 // commit, branch, or PR is required; publication recovery must use
 // RequiresPRURL from the completion contract.
-func isResultSensitive(workType string) bool {
-	return resultSensitiveWorkTypes[workType]
+func isResultSensitive(workType string, role ...string) bool {
+	if IsKnownWorkType(workType) || len(role) == 0 {
+		return resultSensitiveWorkTypes[workType]
+	}
+	parsed, valid := ParseWorkTypeRole(role[0])
+	if !valid {
+		if unrecognizedWorkTypeRole(workType, role[0]) {
+			slog.Warn("unrecognized workTypeRole", "workType", workType, "workTypeRole", role[0])
+		}
+		return false
+	}
+	return parsed == WorkTypeRoleInflight || parsed == WorkTypeRoleReview
 }
 
 // shouldDeferAcceptanceTransition decides whether a passing acceptance
@@ -251,7 +263,7 @@ type PostSessionDecision struct {
 //
 // Returns a PostSessionDecision the caller acts on. Pure function — no
 // side effects.
-func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQueueAdapter bool) PostSessionDecision {
+func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQueueAdapter bool, role ...string) PostSessionDecision {
 	d := PostSessionDecision{
 		WorkType:   workType,
 		WorkResult: workResult,
@@ -266,7 +278,7 @@ func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQue
 		return d
 	}
 
-	resultSensitive := isResultSensitive(workType)
+	resultSensitive := isResultSensitive(workType, role...)
 
 	if resultSensitive {
 		// Per event-processor.ts:340-344: a session-level "failed"

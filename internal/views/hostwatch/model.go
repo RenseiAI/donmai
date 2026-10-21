@@ -504,6 +504,8 @@ func (c *SessionCard) retainLegacyFolded(prev SessionCard) {
 	c.Observed = prev.Observed
 	c.LastWorkAt = prev.LastWorkAt
 	c.LastOutputAt = prev.LastOutputAt
+	c.streamTicks = prev.streamTicks
+	c.streamingAt = prev.streamingAt
 	c.ActualModel = prev.ActualModel
 	c.ActualModelProvider = prev.ActualModelProvider
 	c.ActualModelVersion = prev.ActualModelVersion
@@ -558,6 +560,16 @@ func (m *Model) foldMetrics(ev TailEvent) {
 		c.Observed = true
 	}
 	live := !ev.Replay
+	switch e := ev.Event.(type) {
+	case agent.SystemEvent:
+		if live && e.Subtype == agent.SystemSubtypeStreamProgress {
+			c.streamTicks++
+			c.streamingAt = ev.EventAt()
+		}
+	case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent,
+		agent.ResultEvent, agent.ErrorEvent:
+		c.streamTicks, c.streamingAt = 0, time.Time{} // content ends the stream
+	}
 	switch e := ev.Event.(type) {
 	case agent.ToolUseEvent:
 		c.ToolCalls++

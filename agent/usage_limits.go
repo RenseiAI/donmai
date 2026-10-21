@@ -144,6 +144,7 @@ type UsageAccount struct {
 const (
 	UsageHarnessCodex  = "codex"
 	UsageHarnessClaude = "claude"
+	UsageHarnessMuse   = "muse"
 )
 
 // UsageAuthCheck is the outcome of the daemon's most recent login check
@@ -152,8 +153,8 @@ const (
 // instant the check ran, not the instant a beat carrying it was sent,
 // so a consumer can judge how fresh the verdict is.
 type UsageAuthCheck struct {
-	// Harness is the harness the check ran for (UsageHarnessCodex or
-	// UsageHarnessClaude).
+	// Harness is the harness the check ran for (UsageHarnessCodex,
+	// UsageHarnessClaude or UsageHarnessMuse).
 	Harness string `json:"harness"`
 	// OK is true when the check confirmed a valid login and false when
 	// it did not.
