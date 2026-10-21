@@ -479,9 +479,14 @@ func (e *BudgetEnforcer) CheckDuration(now time.Time) *BudgetExceededError {
 	elapsed := now.Sub(e.startedAt)
 	limit := BudgetDuration(e.limits.MaxDurationSeconds)
 	if elapsed >= limit {
-		return e.recordBreach(CapDuration,
-			fmt.Sprintf("max-duration-seconds exceeded: observed=%ds limit=%ds",
-				int(elapsed.Seconds()), e.limits.MaxDurationSeconds))
+		limitSeconds := int(limit.Seconds())
+		detail := fmt.Sprintf("max-duration-seconds exceeded: observed=%ds limit=%ds",
+			int(elapsed.Seconds()), limitSeconds)
+		if limitSeconds != e.limits.MaxDurationSeconds {
+			detail += fmt.Sprintf(" (dispatched %ds clamped to the runner ceiling)",
+				e.limits.MaxDurationSeconds)
+		}
+		return e.recordBreach(CapDuration, detail)
 	}
 	return nil
 }

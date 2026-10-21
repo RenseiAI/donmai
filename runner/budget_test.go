@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	spanruntime "github.com/RenseiAI/donmai/runtime/span"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // TestBudgetEnforcer_DisabledWhenBudgetNil asserts that a nil
@@ -771,28 +773,62 @@ func TestBudgetEnforcer_OverflowBoundaryStaysBounded(t *testing.T) {
 		if err == nil || err.Cap != CapDuration {
 			t.Fatalf("seconds=%d: CheckDuration past the ceiling = %v; want the duration-cap breach", seconds, err)
 		}
+		// The breach detail reports the clamped limit, never the raw
+		// dispatched seconds: a 30 h budget breaching at 24 h must not
+		// read observed=86400s limit=108000s.
+		wantLimit := ceilingSeconds
+		if seconds < ceilingSeconds {
+			wantLimit = seconds
+		}
+		if !strings.Contains(err.Detail, fmt.Sprintf("limit=%ds", wantLimit)) {
+			t.Fatalf("seconds=%d: breach detail %q; want limit=%ds", seconds, err.Detail, wantLimit)
+		}
+		if seconds > ceilingSeconds && !strings.Contains(err.Detail, "clamped") {
+			t.Fatalf("seconds=%d: breach detail %q; want the clamp noted", seconds, err.Detail)
+		}
 	}
+}
+
+// delayProvisionRunner builds a Runner whose worktree provision blocks in
+// the manager's pre-provision delay seam, so a run context whose deadline
+// fires first fails provisioning with context.DeadlineExceeded — the same
+// shape production produces when the budget-derived run deadline lapses
+// mid-clone (the worker runs with the dispatched budget as its run-context
+// deadline). An already-expired ctx returns from the seam immediately, so
+// the test stays fast and deterministic.
+func delayProvisionRunner(t *testing.T, platformURL string, client *http.Client, p agent.Provider) *Runner {
+	t.Helper()
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir(), PreProvisionDelay: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	return newFollowUpRunner(t, platformURL, client, p, func(o *Options) {
+		o.WorktreeManager = wtm
+	})
 }
 
 // TestRun_PreStreamBudgetExpiryReportsBudgetExceeded pins that a budget
 // already elapsed before the agent stream starts maps to the
-// budget-exceeded failure, not a provisioning failure. The provision is
-// forced to fail (an unclonable repository) while the runner clock reads
-// past a one-second budget, so the pre-stream expiry branch — not the
-// clone error — classifies the session. A provision failure with time
-// still on the budget keeps the provisioning classification.
+// budget-exceeded failure, not a provisioning failure — but only when the
+// provision actually died on the deadline. The production worker runs with
+// the dispatched budget as its run-context deadline, so a budget that
+// lapses mid-provision surfaces as a context-deadline error; the delay
+// seam above reproduces that shape deterministically. A provision failure
+// with time still on the budget, a non-deadline failure (bad remote) with
+// an elapsed clock, and an interactive session (which runs with no
+// duration ceiling) all keep the provisioning classification.
 func TestRun_PreStreamBudgetExpiryReportsBudgetExceeded(t *testing.T) {
-	// A budget that lapses before provisioning finishes must still report
-	// budget-exceeded even though the clone itself also fails: the
-	// session ran out of time, it did not mis-provision.
-	t.Run("expired budget on a failed provision", func(t *testing.T) {
+	// A budget that lapses mid-provision reports budget-exceeded: the
+	// provision died on the run-context deadline while the runner clock
+	// reads past the one-second budget.
+	t.Run("expired budget on a deadline-cut provision", func(t *testing.T) {
 		start := time.Now()
 		platform := newRecordingPlatformServer(t)
 		base, err := stub.New()
 		if err != nil {
 			t.Fatalf("stub.New: %v", err)
 		}
-		r := newFollowUpRunner(t, platform.URL, platform.Client(), base, nil)
+		r := delayProvisionRunner(t, platform.URL, platform.Client(), base)
 		// Advance the clock past the one-second budget for every read
 		// after the run's own start stamp: the enforcer starts at run
 		// start and the provision branch reads the advanced clock.
@@ -812,9 +848,9 @@ func TestRun_PreStreamBudgetExpiryReportsBudgetExceeded(t *testing.T) {
 			ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
 		}
 		qw.StageBudget = &prompt.StageBudget{MaxDurationSeconds: 1}
-		// Unclonable: fails fast without network.
-		qw.Repository = filepath.Join(t.TempDir(), "does-not-exist.git")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Already expired: the delay seam returns context.DeadlineExceeded
+		// without materializing anything.
+		ctx, cancel := context.WithTimeout(context.Background(), -time.Second)
 		defer cancel()
 		res, _ := r.Run(ctx, qw)
 		if res.Status != "failed" || res.FailureMode != FailureBudgetExceeded {
@@ -831,15 +867,15 @@ func TestRun_PreStreamBudgetExpiryReportsBudgetExceeded(t *testing.T) {
 		}
 	})
 
-	// The control: the same failed provision with time left on the
+	// The control: the same deadline-cut provision with time left on the
 	// budget keeps the provisioning classification.
-	t.Run("live budget on a failed provision", func(t *testing.T) {
+	t.Run("live budget on a deadline-cut provision", func(t *testing.T) {
 		platform := newRecordingPlatformServer(t)
 		base, err := stub.New()
 		if err != nil {
 			t.Fatalf("stub.New: %v", err)
 		}
-		r := newFollowUpRunner(t, platform.URL, platform.Client(), base, nil)
+		r := delayProvisionRunner(t, platform.URL, platform.Client(), base)
 		qw := QueuedWork{
 			QueuedWork:      queuedWorkBase("PRESTREAM-LIVE"),
 			WorkerID:        "worker-1",
@@ -848,6 +884,46 @@ func TestRun_PreStreamBudgetExpiryReportsBudgetExceeded(t *testing.T) {
 			ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
 		}
 		qw.StageBudget = &prompt.StageBudget{MaxDurationSeconds: 3600}
+		ctx, cancel := context.WithTimeout(context.Background(), -time.Second)
+		defer cancel()
+		res, _ := r.Run(ctx, qw)
+		if res.Status != "failed" || res.FailureMode != FailureWorktreeProvision {
+			t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureWorktreeProvision)
+		}
+		if res.BudgetBreach != nil {
+			t.Fatalf("BudgetBreach = %+v; a live budget must not record a breach", res.BudgetBreach)
+		}
+	})
+
+	// A genuine misconfiguration that surfaces after the clock passes the
+	// budget keeps its real cause: the clone error is not a deadline, so
+	// the budget classification must not swallow it.
+	t.Run("expired budget on a non-deadline provision failure", func(t *testing.T) {
+		start := time.Now()
+		platform := newRecordingPlatformServer(t)
+		base, err := stub.New()
+		if err != nil {
+			t.Fatalf("stub.New: %v", err)
+		}
+		r := newFollowUpRunner(t, platform.URL, platform.Client(), base, nil)
+		calls := 0
+		r.now = func() time.Time {
+			calls++
+			if calls == 1 {
+				return start
+			}
+			return start.Add(2 * time.Second)
+		}
+		qw := QueuedWork{
+			QueuedWork:      queuedWorkBase("PRESTREAM-MISCONFIG"),
+			WorkerID:        "worker-1",
+			AuthToken:       "tok",
+			PlatformURL:     platform.URL,
+			ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+		}
+		qw.StageBudget = &prompt.StageBudget{MaxDurationSeconds: 1}
+		// Unclonable: fails fast without network, with a live context so
+		// the failure is a clone error rather than a deadline.
 		qw.Repository = filepath.Join(t.TempDir(), "does-not-exist.git")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -856,7 +932,49 @@ func TestRun_PreStreamBudgetExpiryReportsBudgetExceeded(t *testing.T) {
 			t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureWorktreeProvision)
 		}
 		if res.BudgetBreach != nil {
-			t.Fatalf("BudgetBreach = %+v; a live budget must not record a breach", res.BudgetBreach)
+			t.Fatalf("BudgetBreach = %+v; a non-deadline failure must not record a breach", res.BudgetBreach)
+		}
+		if !strings.Contains(res.Error, "does-not-exist") {
+			t.Fatalf("Error = %q; want the clone cause preserved, not a budget message", res.Error)
+		}
+	})
+
+	// Interactive sessions run with no duration ceiling: even a
+	// deadline-cut provision under an elapsed legacy budget keeps the
+	// provisioning classification and records no breach.
+	t.Run("interactive session with expired budget on a deadline-cut provision", func(t *testing.T) {
+		start := time.Now()
+		platform := newRecordingPlatformServer(t)
+		base, err := stub.New()
+		if err != nil {
+			t.Fatalf("stub.New: %v", err)
+		}
+		r := delayProvisionRunner(t, platform.URL, platform.Client(), base)
+		calls := 0
+		r.now = func() time.Time {
+			calls++
+			if calls == 1 {
+				return start
+			}
+			return start.Add(2 * time.Second)
+		}
+		qw := QueuedWork{
+			QueuedWork:      queuedWorkBase("PRESTREAM-INTERACTIVE"),
+			WorkerID:        "worker-1",
+			AuthToken:       "tok",
+			PlatformURL:     platform.URL,
+			ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+		}
+		qw.Mode = prompt.InteractiveRunMode
+		qw.StageBudget = &prompt.StageBudget{MaxDurationSeconds: 1}
+		ctx, cancel := context.WithTimeout(context.Background(), -time.Second)
+		defer cancel()
+		res, _ := r.Run(ctx, qw)
+		if res.Status != "failed" || res.FailureMode != FailureWorktreeProvision {
+			t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureWorktreeProvision)
+		}
+		if res.BudgetBreach != nil {
+			t.Fatalf("BudgetBreach = %+v; an interactive session must not record a budget breach", res.BudgetBreach)
 		}
 	})
 }
