@@ -175,9 +175,14 @@ func (d *Daemon) readoptSessionShimAfterCarrierLoss(
 	return d.readoptSessionShimWithinFixedAttempts(registry, cfg, policy, id, lost, hello)
 }
 
-// readoptSessionShimWithinFixedAttempts is the 2026-09-02 bound, unchanged: a
-// fixed attempt count whose worst case ends strictly inside the shim's orphan
-// deadline, with no keepalive because none is needed.
+// readoptSessionShimWithinFixedAttempts is the 2026-09-02 bound: a fixed
+// attempt count whose worst case ends strictly inside the shim's orphan
+// deadline, with no keepalive because none is needed. When the composing
+// layer holds the lineage past the bound (SessionShimConfig.
+// ReadoptionHeldPastWindow), spending the budget with the shim still
+// observable does not quarantine: the lineage stays adopted and the hold
+// retries indefinitely with the keepalive running and capped backoff instead
+// of reaping a healthy harness on silence.
 func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 	registry *sessionshim.Registry,
 	cfg SessionShimConfig,
@@ -198,6 +203,13 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 		if done {
 			return disposition
 		}
+	}
+	if d.shims.recoveryCtx.Err() == nil &&
+		sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) &&
+		d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+		slog.Warn("session shim: bounded re-adoption attempts spent with the shim still observable and held; holding past the budget",
+			"session", id.String(), "attempts", policy.Attempts)
+		return d.holdFixedAttemptsPastBudget(registry, cfg, policy, id, lost, hello, policy.Attempts+1)
 	}
 	return readoptionAttemptsSpent
 }
@@ -363,6 +375,16 @@ func (d *Daemon) readoptSessionShimAttempt(
 			"session", id.String(), "attempt", attempt, "error", err)
 		return readoptionLineageGone, true
 	}
+	if isSessionShimDecisiveRelease(err) {
+		// A decisive, authenticated released answer — or an expired credential
+		// the hold must never extend — is positive evidence the session should
+		// end, even when the shim is still observable. It ends a continued
+		// window or a fixed-attempt hold at once rather than retrying
+		// through it.
+		slog.Warn("session shim: re-adoption answered with positive evidence the lineage should end",
+			"session", id.String(), "attempt", attempt, "error", err)
+		return readoptionLineageGone, true
+	}
 	slog.Warn("session shim: re-adoption attempt after controller loss failed",
 		"session", id.String(), "attempt", attempt, "attempts", attempts, "error", err)
 	return readoptionRefused, false
@@ -451,6 +473,66 @@ func (d *Daemon) sessionShimWindowExhausted(
 		return readoptionShutdown
 	}
 	return readoptionWindowExhausted
+}
+
+// isSessionShimDecisiveRelease reports whether a re-adoption failure is positive
+// evidence the session should end rather than silence to hold through. Only a
+// decisive, authenticated released answer and an expired credential qualify: a
+// timeout, 5xx, connection refused, relay draining, or any other refusal the
+// carrier never examined carries no fact about the lineage, so a continued
+// window or a fixed-attempt hold keeps retrying through it. Recorded-evidence
+// conflicts are classified by the caller before this runs and never reach it.
+func isSessionShimDecisiveRelease(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrSessionShimLineageReleased) || errors.Is(err, ErrSessionShimCredentialExpired)
+}
+
+// holdFixedAttemptsPastBudget retries indefinitely with capped backoff and a
+// running orphan keepalive while the composing layer holds the lineage past
+// its spent attempt budget. It is the fixed-mode half of the outage hold: the
+// budgeted attempts are spent, but the harness is healthy and the control
+// plane has offered no positive evidence the session should end, so the
+// lineage stays adopted, the keepalive keeps extending the shim's clock, and
+// harness output stays buffered on the host and locally observable until the
+// carrier returns, the lineage is released, or an explicit stop, shutdown, or
+// credential expiry ends the hold. The keepalive is gated on the same held-
+// past-window conjunction as a continued window, so the moment the composing
+// layer lets go the extensions stop at once and the lineage is withdrawn.
+func (d *Daemon) holdFixedAttemptsPastBudget(registry *sessionshim.Registry, cfg SessionShimConfig, policy SessionShimReadoptionPolicy, id sessionshim.Identity, lost adoptedShim, hello shimwire.Hello, firstAttempt int) sessionShimReadoptionDisposition {
+	stopKeepalive := d.startSessionShimOrphanKeepaliveWhile(registry, cfg, id, hello, func(ctx context.Context) bool {
+		return d.sessionShimReadoptionHeldPastWindow(ctx, cfg, id)
+	})
+	defer stopKeepalive()
+	backoffCap := policy.BackoffCap
+	if backoffCap <= 0 {
+		backoffCap = defaultSessionShimReadoptionBackoffCap
+	}
+	backoff := policy.Backoff
+	if backoff <= 0 {
+		backoff = defaultSessionShimReadoptionBackoff
+	}
+	if backoff > backoffCap {
+		backoff = backoffCap
+	}
+	for attempt := firstAttempt; ; attempt++ {
+		if attempt > firstAttempt {
+			if !d.sleepSessionShimWindowBackoff(backoff) {
+				return readoptionShutdown
+			}
+			if backoff *= 2; backoff > backoffCap {
+				backoff = backoffCap
+			}
+		}
+		disposition, done := d.readoptSessionShimAttempt(registry, cfg, id, lost, hello, attempt, 0)
+		if done {
+			return disposition
+		}
+		if !d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+			return readoptionLineageGone
+		}
+	}
 }
 
 // sleepSessionShimRecoveryBackoff uses the fixed policy clock and recovery lifetime.
