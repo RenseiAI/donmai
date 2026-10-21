@@ -437,6 +437,29 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	})
 	if err != nil {
 		res.Status = "failed"
+		// A budget that lapsed while the workarea was still being
+		// provisioned reports as budget-exceeded, not as a
+		// provisioning failure: the production worker runs with the
+		// dispatched budget as its run-context deadline
+		// (Options.MaxSessionDuration), so a budget that lapses
+		// mid-provision surfaces here as a context-deadline error.
+		// Mirrors the post-stream stopAtBudget/classifyStreamStop fork,
+		// which likewise only consults CheckDuration on
+		// context.DeadlineExceeded. Any other provision error — a bad
+		// remote, refused auth — keeps the provisioning classification
+		// with its real cause, even when the clock has also passed the
+		// budget. Interactive sessions never take this branch: they run
+		// with no duration ceiling.
+		if !qw.isInteractive() && errors.Is(err, context.DeadlineExceeded) {
+			if budget := enforcer.CheckDuration(r.now()); budget != nil {
+				res.FailureMode = FailureBudgetExceeded
+				res.Error = budget.Error()
+				res.Cost = enforcer.cost()
+				res.BudgetReport = enforcer.Report(r.now())
+				res.BudgetBreach = &agent.BudgetBreach{Cap: string(budget.Cap), Detail: budget.Detail}
+				return res, err
+			}
+		}
 		res.FailureMode = classifyWorktreeErr(err)
 		res.Error = err.Error()
 		return res, err

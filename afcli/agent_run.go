@@ -262,11 +262,7 @@ func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
 	if budget == nil || budget.MaxDurationSeconds <= 0 {
 		return 0
 	}
-	const ceilingSeconds = int64(runner.MaxSessionDurationCeiling / time.Second)
-	if int64(budget.MaxDurationSeconds) >= ceilingSeconds {
-		return runner.MaxSessionDurationCeiling
-	}
-	return time.Duration(budget.MaxDurationSeconds) * time.Second
+	return runner.BudgetDuration(budget.MaxDurationSeconds)
 }
 
 // Daemon-URL provenance strings. They are part of the preflight error a
