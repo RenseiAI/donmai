@@ -97,9 +97,6 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 // action. Prompt text and retry keys are never echoed.
 func formatPromptRefusalLine(id string, promptErr *afclient.PromptSessionError) string {
 	reason := promptErr.Reason
-	if reason == "" {
-		reason = "prompt refused"
-	}
 	if promptErr.Code != "" {
 		reason = "(" + promptErr.Code + "): " + reason
 	}

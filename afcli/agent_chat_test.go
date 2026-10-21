@@ -267,8 +267,8 @@ func TestAgentChatMockJSONMode(t *testing.T) {
 	}
 }
 
-// TestAgentChatNotFoundFriendly asserts an unknown id yields a clear
-// "session not found" message and preserves the ErrNotFound sentinel.
+// TestAgentChatRefusedHumanLine asserts the human refusal line carries the
+// refusal code, the reason and the next step, and never echoes prompt text.
 func TestAgentChatRefusedHumanLine(t *testing.T) {
 	t.Parallel()
 
@@ -399,6 +399,50 @@ func TestAgentChatCodedReceiptPrintsRecovery(t *testing.T) {
 	}
 }
 
+// TestAgentChatRefusedStdoutCarriesCode pins the refusal code to the
+// formatted stdout line (not merely to cobra's stderr Error: line) and
+// pins the missing-fields suffix to refusals that actually carry missing
+// fields: a refusal without MissingFields must not print "missing:".
+func TestAgentChatRefusedStdoutCarriesCode(t *testing.T) {
+	t.Parallel()
+
+	ds := &chatStubDataSource{chatErr: &afclient.PromptSessionError{
+		HTTPStatus:     409,
+		Disposition:    "held",
+		SessionID:      "sess-1",
+		SessionStatus:  afclient.SessionStatus("held"),
+		Code:           "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE",
+		Reason:         "Historical terminal session cannot be resumed safely",
+		RecoveryAction: "start_new_session",
+	}}
+	cmd := newAgentChatCmd(func() afclient.DataSource { return ds })
+	var stdout, stderr strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"sess-1", "hello"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for refused prompt, got nil")
+	}
+	if !errors.Is(err, afclient.ErrConflict) {
+		t.Errorf("errors.Is(err, afclient.ErrConflict) = false; err = %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{"TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE", "Historical terminal session cannot be resumed safely", "start a new session"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout refusal line missing %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "missing:") {
+		t.Errorf("refusal without missing fields must not print missing:; got:\n%s", out)
+	}
+	if strings.Contains(out, "hello") {
+		t.Errorf("refusal line must not echo prompt text; got:\n%s", out)
+	}
+}
+
+// TestAgentChatNotFoundFriendly asserts an unknown id yields a clear
+// "session not found" message and preserves the ErrNotFound sentinel.
 func TestAgentChatNotFoundFriendly(t *testing.T) {
 	t.Parallel()
 
