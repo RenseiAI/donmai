@@ -1406,6 +1406,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	// Apply event-stream observations onto the result envelope.
+	// The session's tool-call count (res.ToolCalls) is metered inside
+	// consumeEventsWithin for every stream, stall-retry attempts included,
+	// so the post-session deferral gate below reads the whole session.
 	streamRes.applyTo(res, provider.Name())
 
 	// 10·M. Turn-result manifest resolution (W3 — deterministic turn outcome).

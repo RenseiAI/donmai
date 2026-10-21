@@ -1603,7 +1603,11 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		PlatformURL:           d.PlatformURL,
 		TerminalWorkareaLease: d.TerminalWorkareaLease,
 		Capabilities:          d.Capabilities,
-		SeatBudget:            detailSeatBudget(d.SeatBudget),
+		// DeferFailureTransition is a per-work opt-in carried alongside
+		// the daemon capability/lease knobs rather than inside the prompt
+		// payload: it gates a runner post-session policy, not prompt text.
+		DeferFailureTransition: d.DeferFailureTransition,
+		SeatBudget:             detailSeatBudget(d.SeatBudget),
 	}
 	if len(d.OperationalPayload) > 0 {
 		// Decode into a zero value: absent receipted fields must stay absent rather
@@ -1655,6 +1659,11 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		qw.McpAuthToken, qw.McpAuthTokenExpiresAt = d.McpAuthToken, d.McpAuthTokenExpiresAt
 		qw.CoAuthorName, qw.CoAuthorEmail = coAuthorName, coAuthorEmail
 		qw.Capabilities = d.Capabilities
+		// The detail is authoritative for this per-work policy flag just as
+		// it is for credentials: the receipted payload never overrides it,
+		// so an older payload that predates the field and a newer one that
+		// disagrees both leave the flag exactly as dispatched.
+		qw.DeferFailureTransition = d.DeferFailureTransition
 	}
 	stageBudgetJSON, err := marshalOptional(d.StageBudget)
 	if err != nil {
