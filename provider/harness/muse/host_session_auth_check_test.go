@@ -320,8 +320,12 @@ func assertHeartbeatStopped(t *testing.T, path string) {
 // ticking after the return.
 func TestCheckHostSessionLogin_HangingCLIRefusedWithinTimeout(t *testing.T) {
 	t.Parallel()
+	// One synchronous tick before forking the helper: under load the first
+	// asynchronous tick can land after the probe's group kill, and the file
+	// would not exist yet (same race as the detached-child case).
 	bin, heartbeat := heartbeatFakeMuseCLI(t,
-		"( while true; do echo tick >> \"$HB\"; sleep 0.2; done ) &\n"+
+		"echo tick >> \"$HB\"\n"+
+			"( while true; do echo tick >> \"$HB\"; sleep 0.2; done ) &\n"+
 			"trap '' TERM\n"+
 			"sleep 300\n")
 	done := make(chan error, 1)
