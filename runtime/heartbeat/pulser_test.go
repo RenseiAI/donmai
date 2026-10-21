@@ -1810,3 +1810,232 @@ func TestLostOwnershipErrorText(t *testing.T) {
 		t.Fatalf("LostOwnershipError = %q; want the generic text as prefix", errText)
 	}
 }
+
+// TestFailureStatusClearedOnRecovery pins the success-path clear: a 401
+// tick retains 401, then a 2xx refreshed=true tick recovers and the
+// retained status returns to 0. Deleting the Store(0) next to
+// strikes.Swap(0) in tick() leaves 401 behind and turns this red.
+func TestFailureStatusClearedOnRecovery(t *testing.T) {
+	t.Parallel()
+
+	var phase atomic.Int64 // 0 = 401, 1 = refreshed=true
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		if phase.Load() == 0 {
+			http.Error(w, "no", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"refreshed":true}`)
+	})
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           5 * time.Millisecond,
+		MaxAttemptsPerTick: 1,
+		StrikesUntilLost:   5, // no trip on the single failed tick
+		Sleep:              func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for p.LastFailureStatus() != http.StatusUnauthorized {
+		if time.Now().After(deadline) {
+			t.Fatalf("LastFailureStatus() = %d; want 401 after the failed tick", p.LastFailureStatus())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	phase.Store(1)
+	deadline = time.Now().Add(5 * time.Second)
+	for p.Strikes() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Strikes() = %d; want 0 after recovery", p.Strikes())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The recovery tick ran (strikes back to 0); the retained status
+	// must be cleared with it.
+	if got := p.LastFailureStatus(); got != 0 {
+		t.Fatalf("LastFailureStatus() = %d after recovery; want 0", got)
+	}
+	if got := heartbeat.LostOwnershipError(p); got != heartbeat.ErrLostOwnership.Error() {
+		t.Fatalf("LostOwnershipError = %q after recovery; want bare %q", got, heartbeat.ErrLostOwnership.Error())
+	}
+}
+
+// TestRefusedAfterFailureReportsBareText pins the refused-path clear: the
+// hand-off closes LostOwnership from inside doRefresh, before tick()'s
+// trailing store runs, so without a Store(0) before loseOwnershipNow() a
+// reader racing the close stamps the stale 401 onto the hand-off result.
+// The inner-retry sleep widens that window so the at-close read reliably
+// observes it: deleting the refused-path Store(0) turns this red.
+func TestRefusedAfterFailureReportsBareText(t *testing.T) {
+	t.Parallel()
+
+	t.Run("direct 401 then refused", func(t *testing.T) {
+		t.Parallel()
+		refusedAfterFailureReportsBare(t, false)
+	})
+	t.Run("401, recovered, then refused", func(t *testing.T) {
+		t.Parallel()
+		refusedAfterFailureReportsBare(t, true)
+	})
+}
+
+func refusedAfterFailureReportsBare(t *testing.T, recoverFirst bool) {
+	t.Helper()
+
+	var phase atomic.Int64 // 0 = 401, 1 = refreshed=true, 2 = refused
+	phase.Store(0)
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		switch phase.Load() {
+		case 0:
+			http.Error(w, "no", http.StatusUnauthorized)
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"refreshed":true}`)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"refreshed":false}`)
+		}
+	})
+	// Two attempts per tick with a real inner-retry pause: the first
+	// refused attempt closes LostOwnership while the tick is still
+	// parked in its retry sleep, so a reader woken by the close
+	// observes the pre-store value.
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           5 * time.Millisecond,
+		MaxAttemptsPerTick: 2,
+		StrikesUntilLost:   10, // never the fuse: the refused close wins
+		Sleep:              func(time.Duration) { time.Sleep(50 * time.Millisecond) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for p.LastFailureStatus() != http.StatusUnauthorized {
+		if time.Now().After(deadline) {
+			t.Fatalf("LastFailureStatus() = %d; want 401 after the failed tick", p.LastFailureStatus())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	if recoverFirst {
+		phase.Store(1)
+		deadline = time.Now().Add(5 * time.Second)
+		for p.Strikes() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("Strikes() = %d; want 0 after recovery", p.Strikes())
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	// Record the status and text at the instant LostOwnership closes,
+	// racing the tick's trailing store on purpose.
+	var atClose atomic.Int64
+	atClose.Store(-1)
+	var closeText atomic.Value
+	closeText.Store("")
+	go func() {
+		<-p.LostOwnership()
+		atClose.Store(int64(p.LastFailureStatus()))
+		closeText.Store(heartbeat.LostOwnershipError(p))
+	}()
+
+	phase.Store(2)
+	select {
+	case <-p.LostOwnership():
+	case <-time.After(10 * time.Second):
+		t.Fatalf("LostOwnership did not fire on refused refresh (strikes=%d status=%d)", p.Strikes(), p.LastFailureStatus())
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for atClose.Load() == -1 {
+		if time.Now().After(deadline) {
+			t.Fatal("at-close recorder never ran")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := int(atClose.Load()); got != 0 {
+		t.Fatalf("at-close LastFailureStatus() = %d; want 0 (bare hand-off)", got)
+	}
+	if got, _ := closeText.Load().(string); got != heartbeat.ErrLostOwnership.Error() {
+		t.Fatalf("at-close LostOwnershipError = %q; want bare %q", got, heartbeat.ErrLostOwnership.Error())
+	}
+}
+
+// TestTransportAfterAuthFailureRetainsZero pins the non-HTTP reset: one 401
+// tick retains 401, then transport-error ticks trip the fuse and the
+// retained status returns to 0 with the bare text. Deleting the else
+// Store(0) in tick() leaves the stale 401 behind and turns this red.
+func TestTransportAfterAuthFailureRetainsZero(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			http.Error(w, "no", http.StatusUnauthorized)
+			return
+		}
+		// No HTTP response: hijack and close so the client sees a
+		// transport error rather than a status.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			panic("httptest server does not support hijacking")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			panic(err.Error())
+		}
+		_ = conn.Close()
+	})
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           5 * time.Millisecond,
+		MaxAttemptsPerTick: 1,
+		StrikesUntilLost:   3,
+		Sleep:              func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	select {
+	case <-p.LostOwnership():
+	case <-time.After(10 * time.Second):
+		t.Fatalf("LostOwnership did not fire (strikes=%d status=%d hits=%d)", p.Strikes(), p.LastFailureStatus(), hits.Load())
+	}
+	if got := p.LastFailureStatus(); got != 0 {
+		t.Fatalf("LastFailureStatus() = %d after transport-error trip; want 0", got)
+	}
+	if got := heartbeat.LostOwnershipError(p); got != heartbeat.ErrLostOwnership.Error() {
+		t.Fatalf("LostOwnershipError = %q; want bare %q", got, heartbeat.ErrLostOwnership.Error())
+	}
+}

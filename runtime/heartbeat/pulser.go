@@ -815,6 +815,10 @@ func (p *Pulser) tick(ctx context.Context) {
 		err := p.doRefresh(ctx)
 		if err == nil {
 			prev := p.strikes.Swap(0)
+			// A recovered tick clears the retained failure status so a
+			// later, unrelated ownership loss (hand-off, stop) does not
+			// stamp a stale status from an already-recovered failure.
+			p.lastFailureStatus.Store(0)
 			tick := p.cfg.now().UnixMilli()
 			p.lastTick.Store(tick)
 			if observer := p.ackObserver(); observer != nil {
@@ -1032,6 +1036,10 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 		// NOT apply any piggybacked inject — the session is being torn
 		// down.
 		p.stopRequested.Store(true)
+		// Clear any retained failure status before closing: the stop
+		// verdict carries no HTTP failure, so a stale status from an
+		// earlier recovered tick must not linger on the accessor.
+		p.lastFailureStatus.Store(0)
 		p.loseOwnershipNow()
 		return errors.New("lock-refresh: platform requested stop (stop=true)")
 	}
@@ -1055,7 +1063,12 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 		// handed off; there is nothing to gain from three more failed
 		// ticks) — but leave stopRequested unset so the runner classifies
 		// this as FailureLostOwnership, the correct mode for a hand-off,
-		// not an operator cancel.
+		// not an operator cancel. Clear the retained status first: the
+		// refusal itself carried a 2xx with no failure status, and the
+		// tick's trailing store runs after this close, so without this a
+		// reader racing the close would stamp a stale status from an
+		// earlier tick onto the hand-off result.
+		p.lastFailureStatus.Store(0)
 		p.loseOwnershipNow()
 		return errors.New("lock-refresh: platform refused (refreshed=false)")
 	}
