@@ -51,6 +51,11 @@ func TestParseProcPIDStatStartTicksErrors(t *testing.T) {
 	}{
 		{name: "no comm paren", data: "1234 mycmd R 1 2 3", pid: 1234},
 		{name: "truncated after comm", data: "1234 (mycmd) R 1 2", pid: 1234},
+		// Exactly one byte after the closing paren: the truncation guard
+		// (commEnd+2) must refuse this before field counting ever runs, so a
+		// future refactor that relaxes the field-count check still fails
+		// closed here.
+		{name: "one byte after comm paren", data: "1234 (mycmd)X", pid: 1234},
 		{name: "non-numeric starttime", data: fakeProcPIDStat(1234, "mycmd", "notanumber"), pid: 1234},
 		{name: "empty", data: "", pid: 1234},
 	}
@@ -168,6 +173,88 @@ func TestProcStartTimeUnixNanoErrors(t *testing.T) {
 			if _, err := procStartTimeUnixNano(tc.ticks, tc.clkHz, tc.boot); err == nil {
 				t.Fatalf("procStartTimeUnixNano(%d, %d, %d) returned no error",
 					tc.ticks, tc.clkHz, tc.boot)
+			}
+		})
+	}
+}
+
+// TestCoerceLegacyTicksStartedAt pins the cross-version adoption rule: a
+// stored tick-magnitude start time (records written before the Linux
+// Unix-nanosecond conversion) converts through the tick rate and boot
+// wall-clock to the same nanoseconds a live reading reports, while stored
+// nanoseconds pass through untouched. It drives the pure decision behind
+// ProcessIdentity.Alive's legacy path on every platform.
+func TestCoerceLegacyTicksStartedAt(t *testing.T) {
+	t.Parallel()
+	const clkHz = 100
+	const bootSec = 1710000000
+	boot := int64(bootSec) * 1e9
+	tests := []struct {
+		name   string
+		stored int64
+		clkHz  int64
+		boot   int64
+		want   int64
+	}{
+		{
+			name:   "ticks convert like a live reading",
+			stored: 123456, clkHz: clkHz, boot: boot,
+			want: bootSec*1e9 + 1234*1e9 + 56*1e9/100,
+		},
+		{
+			name:   "single tick converts",
+			stored: 1, clkHz: clkHz, boot: boot,
+			want: bootSec*1e9 + 10*1e6,
+		},
+		{
+			name:   "nanoseconds pass through",
+			stored: bootSec * 1e9, clkHz: clkHz, boot: boot,
+			want: bootSec * 1e9,
+		},
+		{
+			name:   "threshold itself is nanoseconds",
+			stored: legacyTicksStartedAtThreshold, clkHz: clkHz, boot: boot,
+			want: legacyTicksStartedAtThreshold,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := coerceLegacyTicksStartedAt(tc.stored, tc.clkHz, tc.boot)
+			if err != nil {
+				t.Fatalf("coerceLegacyTicksStartedAt: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("coerceLegacyTicksStartedAt(%d, %d, %d) = %d, want %d",
+					tc.stored, tc.clkHz, tc.boot, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCoerceLegacyTicksStartedAtErrors(t *testing.T) {
+	t.Parallel()
+	boot := int64(1710000000) * 1e9
+	tests := []struct {
+		name   string
+		stored int64
+		clkHz  int64
+		boot   int64
+	}{
+		// Tick-magnitude values that cannot convert stay fail-closed: the
+		// caller quarantines instead of classifying the record stale.
+		{name: "zero ticks", stored: 0, clkHz: 100, boot: boot},
+		{name: "negative ticks", stored: -5, clkHz: 100, boot: boot},
+		{name: "zero tick rate", stored: 100, clkHz: 0, boot: boot},
+		{name: "zero boot", stored: 100, clkHz: 100, boot: 0},
+		{name: "just below threshold with zero boot", stored: legacyTicksStartedAtThreshold - 1, clkHz: 100, boot: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := coerceLegacyTicksStartedAt(tc.stored, tc.clkHz, tc.boot); err == nil {
+				t.Fatalf("coerceLegacyTicksStartedAt(%d, %d, %d) returned no error",
+					tc.stored, tc.clkHz, tc.boot)
 			}
 		})
 	}

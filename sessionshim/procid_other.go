@@ -13,3 +13,11 @@ import "fmt"
 func processStartTime(pid int) (int64, error) {
 	return 0, fmt.Errorf("sessionshim: process start identity is unavailable on this platform (pid %d)", pid)
 }
+
+// canonicalRecordStartTime resolves a stored ProcessStartedAt to the Unix
+// nanoseconds processStartTime reports. Adoption stays disabled on this
+// platform (processStartTime always errors), so stored values pass through:
+// Alive fails closed at the read, before any comparison runs.
+func canonicalRecordStartTime(stored int64) (int64, error) {
+	return stored, nil
+}

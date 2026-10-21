@@ -11,6 +11,20 @@ import (
 // float literal 1e9 would truncate in mixed constant expressions.
 const nanoPerSec = 1_000_000_000
 
+// legacyTicksStartedAtThreshold separates the two Linux ProcessStartedAt
+// units: values below it are raw /proc starttime clock ticks since boot
+// (written before the Unix-nanosecond conversion), values at or above it are
+// Unix nanoseconds. Ticks at 100 Hz stay under 1e12 for three centuries of
+// uptime, while real Unix nanoseconds exceed 1e18; 1e15 matches the
+// wall-clock floor the platform contract pins, so no genuine value of either
+// unit falls on the wrong side.
+const legacyTicksStartedAtThreshold = 1_000_000_000_000_000
+
+// isLegacyTicksStartedAt reports whether a stored ProcessStartedAt uses the
+// pre-conversion Linux unit (clock ticks since boot) rather than Unix
+// nanoseconds. Only Linux readers ever stored ticks; other platforms were
+// always nanoseconds, so only the Linux comparison path consults this.
+
 // parseProcPIDStatStartTicks extracts field 22 (starttime) from the raw bytes
 // of /proc/<pid>/stat: the process start time in clock ticks since boot.
 //
@@ -70,6 +84,19 @@ func parseProcStatBootTimeUnixNano(procStatData []byte) (int64, error) {
 		return secs * nanoPerSec, nil
 	}
 	return 0, fmt.Errorf("sessionshim: /proc/stat has no btime line")
+}
+
+// coerceLegacyTicksStartedAt resolves a stored ProcessStartedAt to Unix
+// nanoseconds for comparison: tick-magnitude values convert through the
+// given tick rate and boot wall-clock, nanosecond-magnitude values pass
+// through unchanged. Fail-closed on every malformed input, exactly like
+// procStartTimeUnixNano: a stored value that cannot convert is an error,
+// never a guess the caller could compare equal to a live process.
+func coerceLegacyTicksStartedAt(storedTicks, clockTicksPerSecond, bootTimeUnixNano int64) (int64, error) {
+	if storedTicks >= legacyTicksStartedAtThreshold {
+		return storedTicks, nil
+	}
+	return procStartTimeUnixNano(storedTicks, clockTicksPerSecond, bootTimeUnixNano)
 }
 
 // procStartTimeUnixNano converts a /proc starttime (clock ticks since boot)

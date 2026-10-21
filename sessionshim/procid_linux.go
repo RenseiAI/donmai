@@ -39,6 +39,23 @@ func processStartTime(pid int) (int64, error) {
 	return started, nil
 }
 
+// canonicalRecordStartTime resolves a stored ProcessStartedAt to the Unix
+// nanoseconds processStartTime reports, so Alive compares like with like.
+// Tick-magnitude records predate the conversion and scale through the current
+// boot; nanosecond records pass through. A stored value that cannot convert
+// is an error (Adopt quarantines), never a stale classification that would
+// release a claim on a live shim.
+func canonicalRecordStartTime(stored int64) (int64, error) {
+	if stored >= legacyTicksStartedAtThreshold {
+		return stored, nil
+	}
+	bootUnixNano, err := readLinuxBootTimeUnixNano()
+	if err != nil {
+		return 0, err
+	}
+	return procStartTimeUnixNano(stored, linuxClockTicksPerSecond, bootUnixNano)
+}
+
 // linuxClockTicksPerSecond is the kernel's USER_HZ tick rate used by
 // /proc/<pid>/stat field 22. It is 100 on every Linux architecture this
 // binary targets; Go offers no libc-free sysconf(_SC_CLK_TCK) wrapper, so the

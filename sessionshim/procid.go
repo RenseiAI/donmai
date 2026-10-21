@@ -68,7 +68,17 @@ func (p ProcessIdentity) Alive() (bool, error) {
 		}
 		return false, err
 	}
-	if started != p.StartedAt {
+	// A record written before the Linux start-time conversion stores raw
+	// /proc ticks; the live reading is Unix nanoseconds. Comparing them raw
+	// would report every pre-conversion shim dead. Coercing through the
+	// current boot keeps same-boot equality exact (both sides scale the same
+	// ticks by the same boot) while a genuinely dead pid still mismatches.
+	// A stored value that cannot convert is an error — quarantine, not stale.
+	expected, coerceErr := canonicalRecordStartTime(p.StartedAt)
+	if coerceErr != nil {
+		return false, coerceErr
+	}
+	if started != expected {
 		// The pid is live but it is a DIFFERENT process. Reporting "not alive"
 		// is the safe answer: the recorded process is gone.
 		return false, nil

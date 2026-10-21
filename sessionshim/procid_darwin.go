@@ -31,6 +31,14 @@ func processStartTime(pid int) (int64, error) {
 	return tv.Sec*1e9 + int64(tv.Usec)*1e3, nil
 }
 
+// canonicalRecordStartTime resolves a stored ProcessStartedAt to the Unix
+// nanoseconds processStartTime reports. The darwin reader always reported
+// nanoseconds, so no tick-magnitude records exist here: every stored value
+// passes through unchanged.
+func canonicalRecordStartTime(stored int64) (int64, error) {
+	return stored, nil
+}
+
 // isNoSuchProcess maps the several ways this sysctl reports an unknown pid onto
 // one answer.
 //
