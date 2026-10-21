@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/stub/stubagent"
 )
 
@@ -484,7 +485,7 @@ func writeNoopBinary(t *testing.T) string {
 		t.Skip("bash not available")
 	}
 	bin := filepath.Join(t.TempDir(), "noop-agent")
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\nsleep 30\n"), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte("#!/bin/bash\nsleep 30\n"), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit

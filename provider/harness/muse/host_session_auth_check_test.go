@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // writeFakeMuseCLI writes a per-test stand-in host binary and returns
@@ -30,7 +31,7 @@ func writeFakeMuseCLI(t *testing.T, name, versionLine string, failVersion bool) 
 			"if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '" + versionLine + "'; exit 0; fi\n" +
 			"exit 3\n"
 	}
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse CLI: %v", err)
 	}
 	return path
@@ -81,7 +82,7 @@ func TestCheckHostSessionLogin_ValidVersionThenNonZeroExit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "muse")
 	script := "#!/bin/sh\nprintf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\nexit 2\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse CLI: %v", err)
 	}
 	if err := CheckHostSessionLogin(context.Background(), path); !errors.Is(err, agent.ErrProviderUnavailable) {
@@ -122,7 +123,7 @@ func TestCheckHostSessionLogin_RelativeBinaryOnPATHRefused(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "muse")
 	script := "#!/bin/sh\nprintf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse CLI: %v", err)
 	}
 	t.Setenv("PATH", dir)
@@ -153,7 +154,7 @@ func TestCheckHostSessionLogin_MinimalEnv(t *testing.T) {
 		"printf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\n"
 	dir := t.TempDir()
 	path := filepath.Join(dir, "muse")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse CLI: %v", err)
 	}
 	if err := CheckHostSessionLogin(context.Background(), path); err != nil {
@@ -185,7 +186,7 @@ func TestResolveMuseBinary_Chain(t *testing.T) {
 	envBin := writeFakeMuseCLI(t, "env-muse", "Muse Code 1.4.9", false)
 	pathDir := t.TempDir()
 	pathBin := filepath.Join(pathDir, "muse")
-	if err := os.WriteFile(pathBin, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(pathBin, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write PATH muse: %v", err)
 	}
 	home := t.TempDir()
@@ -193,7 +194,7 @@ func TestResolveMuseBinary_Chain(t *testing.T) {
 	if err := os.MkdirAll(localBin, 0o750); err != nil {
 		t.Fatalf("make local bin: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(localBin, "muse"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(filepath.Join(localBin, "muse"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write home muse: %v", err)
 	}
 
@@ -256,7 +257,7 @@ func TestCheckHostSessionLogin_StderrDiagnosticsRefused(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "muse")
 	script := "#!/bin/sh\nprintf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\nprintf 'warning: noisy\\n' >&2\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse CLI: %v", err)
 	}
 	if err := CheckHostSessionLogin(context.Background(), path); !errors.Is(err, agent.ErrProviderUnavailable) {
@@ -280,7 +281,7 @@ func heartbeatFakeMuseCLI(t *testing.T, body string) (bin, heartbeat string) {
 	bin = filepath.Join(dir, "muse")
 	heartbeat = filepath.Join(dir, "heartbeat.log")
 	script := "#!/bin/sh\nHB='" + heartbeat + "'\n" + body
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(bin, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse CLI: %v", err)
 	}
 	return bin, heartbeat

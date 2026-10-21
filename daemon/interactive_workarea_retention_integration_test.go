@@ -16,6 +16,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/prompt"
 	providershell "github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/result"
@@ -501,7 +502,7 @@ func interactiveRetentionShell(t *testing.T, afterRead string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "interactive-shell")
 	body := "#!/bin/sh\nIFS= read -r _\n" + afterRead + "exit 0\n"
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture must execute

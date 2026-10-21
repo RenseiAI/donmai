@@ -2,7 +2,6 @@ package runner
 
 import (
 	"context"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 )
 
@@ -33,7 +33,7 @@ subprocess.run(settings['statusLine']['command'], shell=True, input=b'{"context_
 PY
 exit 0
 `
-	if err := os.WriteFile(binary, []byte(script), 0o600); err != nil {
+	if err := testexec.WriteFile(binary, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// Match the Unix CLI fixtures: owner read/execute only, no write access.

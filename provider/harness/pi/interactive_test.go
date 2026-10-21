@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // captureArgvEnvScript is the fake-pi body the fixture tests use. It dumps its
@@ -65,7 +66,7 @@ func newFakeInteractivePiProvider(t *testing.T, script string) *Provider {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-pi")
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+	if err := testexec.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
 		t.Fatal(err)
 	}
 	return &Provider{binary: bin}

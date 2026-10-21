@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
@@ -417,7 +418,7 @@ func fakeDepsBinary(t *testing.T, name, script string) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "fixture")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

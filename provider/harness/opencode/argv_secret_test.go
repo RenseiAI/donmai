@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // argvSecretSentinel is the canary credential this test injects on Spec.Env.
@@ -36,7 +37,7 @@ func fakeArgvEnvRecorderCLI(t *testing.T, dir string) string {
 		"env > " + argvShellQuote(envPath) + "\n" +
 		"sleep 30\n"
 	path := filepath.Join(dir, "fake-opencode-argv-recorder.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake opencode: %v", err)
 	}
 	return path

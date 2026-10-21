@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // spawnerArgvSecretSentinel is the canary credential this test stamps on a
@@ -39,7 +41,7 @@ func TestSpawner_WorkerArgvCarriesNoSessionCredential(t *testing.T) {
 		"env > '" + strings.ReplaceAll(envPath, "'", `'\''`) + "'\n" +
 		"exit 0\n"
 	recorder := filepath.Join(dir, "fake-worker.sh")
-	if err := os.WriteFile(recorder, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(recorder, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake worker: %v", err)
 	}
 

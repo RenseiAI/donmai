@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/stub/stubagent"
 )
 
@@ -234,7 +235,7 @@ func writeEnvRecorderBinary(t *testing.T, variable, path string) string {
 	t.Helper()
 	bin := writeNoopBinary(t) // skips when bash is unavailable
 	script := "#!/bin/bash\nprintf '%s' \"${" + variable + "}\" > '" + path + "'\nsleep 30\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+	if err := testexec.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
 		t.Fatal(err)
 	}
 	return bin

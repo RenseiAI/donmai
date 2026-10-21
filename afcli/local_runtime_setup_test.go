@@ -14,6 +14,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func syntheticClaudeVersionBinary(t *testing.T, version string) string {
@@ -22,7 +23,7 @@ func syntheticClaudeVersionBinary(t *testing.T, version string) string {
 		t.Skip("synthetic shell fixture requires POSIX")
 	}
 	path := filepath.Join(t.TempDir(), "claude-fixture")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n[ \"$1\" = '--version' ] || exit 7\nprintf '"+version+" (Claude Code)\\n'\n"), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte("#!/bin/sh\n[ \"$1\" = '--version' ] || exit 7\nprintf '"+version+" (Claude Code)\\n'\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Chmod(path, 0o500); err != nil {

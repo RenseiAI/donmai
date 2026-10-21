@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 )
@@ -210,7 +211,7 @@ func writeFakeMuseProbeCLI(t *testing.T, versionLine string, fail bool) string {
 	} else {
 		script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '" + versionLine + "'; exit 0; fi\nexit 3\n"
 	}
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse probe CLI: %v", err)
 	}
 	return path
