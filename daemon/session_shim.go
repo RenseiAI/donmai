@@ -2618,15 +2618,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	for _, c := range result.Adopted {
 		id := c.Identity()
 		preparation := preparedByID[id]
-		gate := newShimAdoptionGate()
-		gates[c] = gate
-		d.consumeShimEventsGated(c, gate)
-		// The evidence arms the proxy's carrier-installed release on this
-		// controller's consumer gate: staging the mandatory Snapshot inside
-		// OnAdoption releases a consumer parked on a durable output batch
-		// ahead of the Snapshot, while the gate itself still carries the
-		// adoption verdict.
-		evidence, evidenceErr := d.sessionShimAdoptionEvidenceForGate(ctx, c, preparation, hostByID[id], gate)
+		// The consumer and its carrier-installed latch start together: staging
+		// the mandatory Snapshot inside OnAdoption releases a consumer parked
+		// on a durable output batch ahead of the Snapshot, while the gate
+		// itself still carries the adoption verdict.
+		gate, evidence, evidenceErr := d.startGatedAdoptionConsumer(ctx, c, preparation, hostByID[id])
 		if evidenceErr != nil {
 			// Host authority itself could not be resolved for this
 			// controller's organization — every OTHER lineage in that same
@@ -2635,6 +2631,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
 		}
+		gates[c] = gate
 		// Two refusals are AMBIGUOUS evidence rather than a verdict on the
 		// lineage, and each gets the bounded re-dial the recovery corpus
 		// requires before any terminal consequence: carrier cursor drift (a
