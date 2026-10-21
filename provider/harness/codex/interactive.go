@@ -821,12 +821,23 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	// not interchangeable). A fresh named session's thread is instead
 	// created by the PTY itself and named post-hoc — see
 	// spawnNamedInteractivePTY.
+	//
+	// The resume path carries the session name as a second positional:
+	// option parsing ends before it so both positionals follow the `--`.
+	// Without this a seed starting with `-` parses as a flag and a seed
+	// equal to a subcommand word (for example `resume`, `exec`, `config`)
+	// starts that subcommand instead of a session. A resume with no seed
+	// keeps its shape (no trailing `--`); a fresh session's seed is still
+	// appended LAST, as today.
 	if spec.SessionName != "" && attachToExistingNamedSession(spec) {
 		args = append([]string{"resume"}, args...)
-		args = append(args, spec.SessionName)
-	}
-	if spec.Prompt != "" {
-		args = append(args, spec.Prompt)
+		if spec.Prompt != "" {
+			args = append(args, "--", spec.SessionName, spec.Prompt)
+		} else {
+			args = append(args, spec.SessionName)
+		}
+	} else if spec.Prompt != "" {
+		args = append(args, "--", spec.Prompt)
 	}
 	return interactiveLaunch{argv: args, env: env}, nil
 }

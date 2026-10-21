@@ -247,6 +247,12 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			}
 		}
 		st.accTurns++
+		// Attempts is 1 per model request: a failed attempt emits its own
+		// turn_end (followed by agent_end{willRetry} and auto_retry_start),
+		// so the retry surfaces as its own error call and the session sum
+		// still counts every attempt. The counter-free form holds against
+		// the pinned binary's real order, where a turn_start follows each
+		// auto_retry_start and would reset any per-call accumulator.
 		return []agent.Event{agent.LlmCallEvent{
 			System: stringField(msg, "provider", "system"),
 			Model:  stringField(msg, "model"),
@@ -262,6 +268,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			UsageSource:     agent.LlmUsageProvider,
 			ObservedCostUsd: cost,
 			TurnCompleted:   true,
+			Attempts:        1,
 		}}, false
 
 	case "agent_end":
@@ -308,7 +315,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 
 	case "auto_retry_start", "auto_retry_end",
 		"compaction_start",
-		"queue_update", "turn_start", "message_start":
+		"queue_update", "message_start", "turn_start":
 		return []agent.Event{agent.SystemEvent{
 			Subtype: ev.Type,
 			Message: stringField(f, "message"),

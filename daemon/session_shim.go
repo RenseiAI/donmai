@@ -62,6 +62,13 @@ type SessionShimSnapshotProxy struct {
 	daemon     *Daemon
 	identity   sessionshim.Identity
 	active     atomic.Bool
+	// carrierInstalled releases the consumer gate of the controller under
+	// adoption. It is armed when the proxy stages the mandatory Snapshot —
+	// the earliest point at which the carrier dial has landed and the staging
+	// side is armed — so a durable output batch parked ahead of the Snapshot
+	// may persist without meeting "no carrier candidate" while the dial is
+	// still in flight. Nil where the consumer gate is not wired.
+	carrierInstalled func()
 }
 
 // Inspect returns a fresh read-only shim-owned screen and atSeq.
@@ -86,6 +93,14 @@ func (p *SessionShimSnapshotProxy) Emit(ctx context.Context) (shimwire.SnapshotR
 				return shimwire.SnapshotResult{}, err
 			}
 			staged = true
+			// The carrier dial has landed and the staging side is armed, so
+			// a consumer parked on a durable output batch ahead of this
+			// Snapshot may persist: this is the earliest point at which the
+			// carrier exists in this daemon. The adoption verdict still
+			// travels on the consumer gate.
+			if p.carrierInstalled != nil {
+				p.carrierInstalled()
+			}
 		}
 	}
 	result, err := p.controller.EmitSnapshot(ctx)
@@ -2603,7 +2618,15 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	for _, c := range result.Adopted {
 		id := c.Identity()
 		preparation := preparedByID[id]
-		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparation, hostByID[id])
+		gate := newShimAdoptionGate()
+		gates[c] = gate
+		d.consumeShimEventsGated(c, gate)
+		// The evidence arms the proxy's carrier-installed release on this
+		// controller's consumer gate: staging the mandatory Snapshot inside
+		// OnAdoption releases a consumer parked on a durable output batch
+		// ahead of the Snapshot, while the gate itself still carries the
+		// adoption verdict.
+		evidence, evidenceErr := d.sessionShimAdoptionEvidenceForGate(ctx, c, preparation, hostByID[id], gate)
 		if evidenceErr != nil {
 			// Host authority itself could not be resolved for this
 			// controller's organization — every OTHER lineage in that same
@@ -2612,9 +2635,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
 		}
-		gate := newShimAdoptionGate()
-		gates[c] = gate
-		d.consumeShimEventsGated(c, gate)
 		// Two refusals are AMBIGUOUS evidence rather than a verdict on the
 		// lineage, and each gets the bounded re-dial the recovery corpus
 		// requires before any terminal consequence: carrier cursor drift (a
@@ -2625,7 +2645,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		// preparation come back because a re-prepare mints new ones and the
 		// receipt below belongs to that pair, not to the first.
 		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithBoundedRedial(
-			ctx, c, preparations, hostByID[id], evidence, preparation,
+			ctx, c, preparations, hostByID[id], evidence, preparation, gate,
 		)
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
@@ -3460,6 +3480,22 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 	preparation SessionShimAdoptionPreparationResult,
 	preparedHostID string,
 ) (SessionShimAdoptionEvidence, error) {
+	return d.sessionShimAdoptionEvidenceForGate(ctx, ctrl, preparation, preparedHostID, nil)
+}
+
+// sessionShimAdoptionEvidenceForGate builds the same evidence as
+// sessionShimAdoptionEvidence and additionally arms the proxy's
+// carrier-installed release on the consumer gate of the controller under
+// adoption. Every path that starts a gated consumer passes the gate it
+// started the consumer with; callers with no gated consumer pass nil and
+// keep the historical proxy.
+func (d *Daemon) sessionShimAdoptionEvidenceForGate(
+	ctx context.Context,
+	ctrl *sessionshim.Controller,
+	preparation SessionShimAdoptionPreparationResult,
+	preparedHostID string,
+	gate *shimAdoptionGate,
+) (SessionShimAdoptionEvidence, error) {
 	prepared := preparation.PreparedAdoption
 	lastForwarded := uint64(0)
 	if resumeFrom := ctrl.ResumeFrom(); resumeFrom > 0 {
@@ -3493,6 +3529,9 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 			if ctrl.SupportsAuthoritativeSnapshot() {
 				proxy := &SessionShimSnapshotProxy{controller: ctrl, daemon: d, identity: ctrl.Identity()}
 				proxy.active.Store(true)
+				if gate != nil {
+					proxy.carrierInstalled = gate.finishCarrierInstalled
+				}
 				return proxy
 			}
 			return nil

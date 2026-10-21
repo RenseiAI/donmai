@@ -31,7 +31,7 @@ func TestPromptAdaptation_ExactCLIWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := interactiveArgs(interactive), []string{"--append-system-prompt", wantSystem, "user\n\namend"}; !reflect.DeepEqual(got, want) {
+	if got, want := interactiveArgs(interactive), []string{"--append-system-prompt", wantSystem, "--", "user\n\namend"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("interactive argv = %#v, want %#v", got, want)
 	}
 	assertClaudeSemanticParity(t, receipt, interactiveReceipt)

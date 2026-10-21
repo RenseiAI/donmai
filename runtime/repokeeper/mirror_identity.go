@@ -18,8 +18,10 @@ const keeperDirName = "repo-keeper"
 const mirrorsDirName = "mirrors"
 
 // identityFileName is the secret-free sidecar each mirror records its
-// remote and scope in. It lives beside — never inside — the bare mirror so
-// a foreign or hand-rolled mirror directory without one fails closed.
+// remote and scope in. It lives inside the bare mirror directory, next to
+// git's own files, so it is published atomically with the mirror it
+// describes; a foreign or hand-rolled mirror directory without one fails
+// closed.
 const identityFileName = "keeper.json"
 
 // mirrorIdentityVersion is the only identity sidecar version this store
@@ -82,7 +84,7 @@ func writeMirrorIdentity(mirrorDir string, identity mirrorIdentity) error {
 	return nil
 }
 
-// readMirrorIdentity loads and validates the secret-free sidecar beside a
+// readMirrorIdentity loads and validates the secret-free sidecar inside a
 // mirror directory: the file must be a regular owner-only non-symlink
 // within its size bound, carry exactly one JSON document at the known
 // version, and be internally consistent — the recorded canonical remote

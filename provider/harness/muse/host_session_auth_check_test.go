@@ -347,6 +347,10 @@ func TestCheckHostSessionLogin_DetachedChildKeepingStdoutOpenRefused(t *testing.
 	bin, heartbeat := heartbeatFakeMuseCLI(t,
 		"if [ \"$1\" = \"--version\" ]; then\n"+
 			"printf 'Muse Code 1.4.9 (1.4.9-R6297.1)\\n'\n"+
+			// The first tick is synchronous: the probe can kill the group
+			// before the detached helper is scheduled, and a heartbeat file
+			// that never appeared is a race, not a leak.
+			"echo tick >> \"$HB\"\n"+
 			"( while true; do echo tick >> \"$HB\"; sleep 0.2; done ) &\n"+
 			"exit 0\n"+
 			"fi\n"+
