@@ -428,3 +428,130 @@ func TestAgentChatStubSentinelPropagation(t *testing.T) {
 		t.Errorf("expected 'prompt session ghost' prefix; got: %v", err)
 	}
 }
+
+func refusalStub() *chatStubDataSource {
+	return &chatStubDataSource{chatErr: &afclient.PromptSessionError{
+		HTTPStatus:     409,
+		Disposition:    "dead_lettered",
+		PromptID:       "prm-1",
+		SessionID:      "sess-1",
+		SessionStatus:  afclient.StatusStopped,
+		Code:           "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE",
+		Reason:         "Historical terminal session cannot be resumed safely.",
+		RecoveryAction: "start a new session",
+		MissingFields:  []string{"workType", "providerSessionId"},
+	}}
+}
+
+func TestAgentChatRefusalHuman(t *testing.T) {
+	t.Parallel()
+
+	ds := refusalStub()
+	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"chat", "sess-1", "hello"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for refusal, got nil")
+	}
+	if !errors.Is(err, afclient.ErrConflict) {
+		t.Errorf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE") {
+		t.Errorf("human refusal missing code; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Historical terminal session cannot be resumed safely.") {
+		t.Errorf("human refusal missing reason; got:\n%s", out)
+	}
+	if !strings.Contains(out, "start a new session") {
+		t.Errorf("human refusal missing next step; got:\n%s", out)
+	}
+	if !strings.Contains(out, "missing: workType, providerSessionId") {
+		t.Errorf("human refusal missing fields; got:\n%s", out)
+	}
+	if strings.Contains(out, "retry-1") || strings.Contains(out, "hello") {
+		t.Errorf("refusal line must not echo prompt or idempotency key; got:\n%s", out)
+	}
+}
+
+func TestAgentChatRefusalJSON(t *testing.T) {
+	t.Parallel()
+
+	ds := refusalStub()
+	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"chat", "--json", "sess-1", "hello"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for refusal, got nil")
+	}
+	if !errors.Is(err, afclient.ErrConflict) {
+		t.Errorf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	var refusal afclient.PromptSessionError
+	if err := json.NewDecoder(bytes.NewReader(buf.Bytes())).Decode(&refusal); err != nil {
+		t.Fatalf("refusal JSON invalid: %v\n%s", err, buf.String())
+	}
+	if refusal.Code != "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE" {
+		t.Errorf("Code = %q", refusal.Code)
+	}
+	if refusal.Reason != "Historical terminal session cannot be resumed safely." {
+		t.Errorf("Reason = %q", refusal.Reason)
+	}
+	if refusal.RecoveryAction != "start a new session" {
+		t.Errorf("RecoveryAction = %q", refusal.RecoveryAction)
+	}
+	if len(refusal.MissingFields) != 2 {
+		t.Errorf("MissingFields = %q", refusal.MissingFields)
+	}
+}
+
+func TestAgentChatRefusalHTTP(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE","error":"Historical terminal session cannot be resumed safely.","recoveryAction":"start a new session","sessionId":"sess-1","sessionStatus":"stopped"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewClient(srv.URL)
+	ds := func() afclient.DataSource { return client }
+	cmd, buf := newTestAgentCmd(ds, []string{"chat", "sess-1", "hello"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for HTTP 409, got nil")
+	}
+	out := buf.String()
+	for _, want := range []string{"TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE", "Historical terminal session cannot be resumed safely.", "start a new session"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("HTTP refusal output missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestAgentChatSuccessWithCodePrintsRecovery(t *testing.T) {
+	t.Parallel()
+
+	ds := &chatStubDataSource{chatResp: &afclient.ChatSessionResponse{
+		Delivered:      true,
+		PromptID:       "prm-9",
+		SessionID:      "sess-9",
+		SessionStatus:  afclient.StatusWorking,
+		Code:           "SESSION_PROMPT_ADMISSION_CONFLICT",
+		Error:          "Prompt admitted with fallback.",
+		RecoveryAction: "start a new session if this repeats",
+	}}
+	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"chat", "sess-9", "hello"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Prompt prm-9 delivered to sess-9 (status: working)") {
+		t.Errorf("missing base line; got:\n%s", out)
+	}
+	if !strings.Contains(out, "SESSION_PROMPT_ADMISSION_CONFLICT") {
+		t.Errorf("success-with-code missing code; got:\n%s", out)
+	}
+	if !strings.Contains(out, "start a new session if this repeats") {
+		t.Errorf("success-with-code missing recovery; got:\n%s", out)
+	}
+}

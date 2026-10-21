@@ -289,6 +289,111 @@ func TestClientChatSessionSuccess(t *testing.T) {
 	}
 }
 
+func TestClientChatSessionRefusalReceipt(t *testing.T) {
+	t.Parallel()
+
+	body := `{"delivered":false,"deliveryTier":"terminal","disposition":"dead_lettered","promptId":"prm-1","sessionId":"sess-1","status":"conflict","sessionStatus":"stopped","code":"TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE","error":"Historical terminal session cannot be resumed safely.","missingProjectionFields":["workType","providerSessionId"],"recoveryAction":"start a new session"}`
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(body))
+	})
+	_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+	if err == nil {
+		t.Fatal("expected refusal error, got nil")
+	}
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	var refusal *PromptSessionError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("error did not retain typed refusal: %T %v", err, err)
+	}
+	if refusal.Code != "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE" {
+		t.Errorf("Code = %q", refusal.Code)
+	}
+	if refusal.Reason != "Historical terminal session cannot be resumed safely." {
+		t.Errorf("Reason = %q", refusal.Reason)
+	}
+	if refusal.RecoveryAction != "start a new session" {
+		t.Errorf("RecoveryAction = %q", refusal.RecoveryAction)
+	}
+	if len(refusal.MissingFields) != 2 || refusal.MissingFields[0] != "workType" || refusal.MissingFields[1] != "providerSessionId" {
+		t.Errorf("MissingFields = %q", refusal.MissingFields)
+	}
+	if refusal.Disposition != "dead_lettered" {
+		t.Errorf("Disposition = %q", refusal.Disposition)
+	}
+	if refusal.SessionStatus != StatusStopped {
+		t.Errorf("SessionStatus = %q", refusal.SessionStatus)
+	}
+}
+
+func TestClientChatSessionRefusalMinimal(t *testing.T) {
+	t.Parallel()
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"Session is busy handling another prompt."}`))
+	})
+	_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	var refusal *PromptSessionError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("minimal refusal did not decode: %T %v", err, err)
+	}
+	if refusal.Code != "SESSION_PROMPT_ADMISSION_CONFLICT" {
+		t.Errorf("Code = %q", refusal.Code)
+	}
+	if refusal.Reason != "Session is busy handling another prompt." {
+		t.Errorf("Reason = %q", refusal.Reason)
+	}
+}
+
+func TestClientChatSessionRefusalFallback(t *testing.T) {
+	t.Parallel()
+
+	validPrefix := `{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"Session is busy."`
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		forbidden   string
+	}{
+		{name: "malformed", contentType: "application/json", body: `{`},
+		{name: "oversized", contentType: "application/json", body: strings.Repeat("x", maxPromptSessionErrorBodyBytes+1)},
+		{name: "non json", contentType: "text/html", body: `<html>conflict</html>`},
+		{name: "secret key", contentType: "application/json", body: validPrefix + `,"apiToken":"rsk_do_not_echo"}`, forbidden: "rsk_do_not_echo"},
+		{name: "secret value", contentType: "application/json", body: validPrefix + `,"recoveryAction":"Bearer do_not_echo"}`, forbidden: "do_not_echo"},
+		{name: "missing code", contentType: "application/json", body: `{"error":"only reason"}`},
+		{name: "bad code charset", contentType: "application/json", body: `{"code":"BAD CODE!","error":"reason"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+			}
+			var refusal *PromptSessionError
+			if errors.As(err, &refusal) {
+				t.Fatalf("unsafe body became typed refusal: %#v", refusal)
+			}
+			if tc.forbidden != "" && strings.Contains(err.Error(), tc.forbidden) {
+				t.Fatalf("error leaked secret %q: %v", tc.forbidden, err)
+			}
+		})
+	}
+}
+
 func TestClientReconnectSessionSuccess(t *testing.T) {
 	cur := "c-1"
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {

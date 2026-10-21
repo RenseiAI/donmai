@@ -41,6 +41,34 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 
 			resp, err := client.ChatSession(id, afclient.ChatSessionRequest{Prompt: message, IdempotencyKey: idempotencyKey})
 			if err != nil {
+				var promptErr *afclient.PromptSessionError
+				if errors.As(err, &promptErr) {
+					out := cmd.OutOrStdout()
+					if jsonMode {
+						enc := json.NewEncoder(out)
+						enc.SetIndent("", "  ")
+						if encodeErr := enc.Encode(promptErr); encodeErr != nil {
+							return fmt.Errorf("encode prompt refusal: %w", encodeErr)
+						}
+						return fmt.Errorf("prompt session %s: %w", id, err)
+					}
+					line := fmt.Sprintf("prompt session %s refused (%s): %s", id, promptErr.Code, promptErr.Reason)
+					if promptErr.RecoveryAction != "" {
+						recovery := promptErr.RecoveryAction
+						if !strings.HasSuffix(recovery, ".") && !strings.HasSuffix(recovery, "!") && !strings.HasSuffix(recovery, "?") {
+							recovery += "."
+						}
+						if !strings.HasSuffix(promptErr.Reason, ".") && !strings.HasSuffix(promptErr.Reason, "!") && !strings.HasSuffix(promptErr.Reason, "?") {
+							line += "."
+						}
+						line += fmt.Sprintf(" Next step: %s", recovery)
+					}
+					if len(promptErr.MissingFields) > 0 {
+						line += fmt.Sprintf(" (missing: %s)", strings.Join(promptErr.MissingFields, ", "))
+					}
+					_, _ = fmt.Fprintln(out, line)
+					return fmt.Errorf("prompt session %s: %w", id, err)
+				}
 				if errors.Is(err, afclient.ErrNotFound) {
 					return fmt.Errorf("prompt session %s: session not found: %w", id, err)
 				}
@@ -66,6 +94,18 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 			}
 			_, _ = fmt.Fprintf(out, "Prompt %s %s to %s (status: %s)\n",
 				resp.PromptID, verb, resp.SessionID, resp.SessionStatus)
+			if resp.Code != "" {
+				switch {
+				case resp.RecoveryAction != "" && resp.Error != "":
+					_, _ = fmt.Fprintf(out, "Code %s: %s Next step: %s\n", resp.Code, resp.Error, ensureTrailingPeriod(resp.RecoveryAction))
+				case resp.RecoveryAction != "":
+					_, _ = fmt.Fprintf(out, "Code %s Next step: %s\n", resp.Code, ensureTrailingPeriod(resp.RecoveryAction))
+				case resp.Error != "":
+					_, _ = fmt.Fprintf(out, "Code %s: %s\n", resp.Code, resp.Error)
+				default:
+					_, _ = fmt.Fprintf(out, "Code %s\n", resp.Code)
+				}
+			}
 			return nil
 		},
 	}
@@ -74,4 +114,14 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Stable key for safe prompt retries")
 
 	return cmd
+}
+
+func ensureTrailingPeriod(s string) string {
+	if s == "" {
+		return s
+	}
+	if strings.HasSuffix(s, ".") || strings.HasSuffix(s, "!") || strings.HasSuffix(s, "?") {
+		return s
+	}
+	return s + "."
 }

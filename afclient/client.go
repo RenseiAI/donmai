@@ -493,6 +493,99 @@ func containsSecretMaterial(value any) bool {
 	return false
 }
 
+const maxPromptSessionErrorBodyBytes = 16 << 10
+
+type promptSessionErrorWire struct {
+	Delivered      bool          `json:"delivered"`
+	DeliveryTier   string        `json:"deliveryTier"`
+	Disposition    string        `json:"disposition"`
+	IdempotencyKey string        `json:"idempotencyKey"`
+	PromptID       string        `json:"promptId"`
+	SessionID      string        `json:"sessionId"`
+	Status         string        `json:"status"`
+	SessionStatus  SessionStatus `json:"sessionStatus"`
+	Code           string        `json:"code"`
+	Error          string        `json:"error"`
+	RecoveryAction string        `json:"recoveryAction"`
+	MissingFields  []string      `json:"missingProjectionFields"`
+}
+
+func decodePromptSessionError(resp *http.Response, fallback error) error {
+	if resp.StatusCode != http.StatusConflict ||
+		!strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		return fallback
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxPromptSessionErrorBodyBytes+1))
+	if err != nil || len(raw) == 0 || len(raw) > maxPromptSessionErrorBodyBytes {
+		return fallback
+	}
+	var untrusted any
+	if err := json.Unmarshal(raw, &untrusted); err != nil || containsSecretMaterial(untrusted) {
+		return fallback
+	}
+	var wire promptSessionErrorWire
+	if err := json.Unmarshal(raw, &wire); err != nil || !validPromptSessionError(wire) {
+		return fallback
+	}
+	return &PromptSessionError{
+		HTTPStatus:     resp.StatusCode,
+		Delivered:      wire.Delivered,
+		DeliveryTier:   wire.DeliveryTier,
+		Disposition:    wire.Disposition,
+		IdempotencyKey: wire.IdempotencyKey,
+		PromptID:       wire.PromptID,
+		SessionID:      wire.SessionID,
+		SessionStatus:  wire.SessionStatus,
+		Status:         wire.Status,
+		Code:           wire.Code,
+		Reason:         wire.Error,
+		RecoveryAction: wire.RecoveryAction,
+		MissingFields:  wire.MissingFields,
+	}
+}
+
+func validPromptSessionError(wire promptSessionErrorWire) bool {
+	if !safeReceiptAtom(wire.Code, 128) {
+		return false
+	}
+	if !safeReceiptText(wire.Error, 1024) {
+		return false
+	}
+	if wire.RecoveryAction != "" && !safeReceiptText(wire.RecoveryAction, 1024) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.Disposition, 128) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.DeliveryTier, 64) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.PromptID, 256) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.SessionID, 256) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.Status, 64) {
+		return false
+	}
+	if !optionalReceiptAtom(string(wire.SessionStatus), 64) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.IdempotencyKey, 256) {
+		return false
+	}
+	if len(wire.MissingFields) > 32 {
+		return false
+	}
+	for _, field := range wire.MissingFields {
+		if !safeReceiptAtom(field, 128) {
+			return false
+		}
+	}
+	return true
+}
+
 // StopSession sends a stop request for the given session and returns the
 // coordinator's response describing the status transition.
 //
@@ -541,7 +634,7 @@ func (c *Client) StopSession(id string) (*StopSessionResponse, error) {
 // delivery confirmation.
 func (c *Client) ChatSession(id string, req ChatSessionRequest) (*ChatSessionResponse, error) {
 	var resp ChatSessionResponse
-	if err := c.post("/api/public/sessions/"+id+"/prompt", req, &resp); err != nil {
+	if err := c.postWithErrorDecoder("/api/public/sessions/"+id+"/prompt", req, &resp, decodePromptSessionError); err != nil {
 		return nil, err
 	}
 	return &resp, nil

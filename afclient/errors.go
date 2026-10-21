@@ -77,3 +77,43 @@ func (e *StopSessionError) Error() string {
 // Unwrap preserves compatibility for callers that already branch on the
 // coarse HTTP 409 sentinel.
 func (e *StopSessionError) Unwrap() error { return ErrConflict }
+
+// PromptSessionError is the bounded, whitelisted refusal receipt returned by
+// the public session-prompt endpoint (POST /api/public/sessions/:id/prompt)
+// when it answers HTTP 409. It carries the decoded receipt fields so the
+// CLI can explain why the prompt was refused and what to do next, without
+// echoing the prompt text or the idempotency key. It deliberately does not
+// retain the raw HTTP body: platform error payloads may contain fields that
+// are not safe to echo.
+type PromptSessionError struct {
+	HTTPStatus     int           `json:"httpStatus"`
+	Delivered      bool          `json:"delivered,omitempty"`
+	DeliveryTier   string        `json:"deliveryTier,omitempty"`
+	Disposition    string        `json:"disposition,omitempty"`
+	IdempotencyKey string        `json:"idempotencyKey,omitempty"`
+	PromptID       string        `json:"promptId,omitempty"`
+	SessionID      string        `json:"sessionId,omitempty"`
+	SessionStatus  SessionStatus `json:"sessionStatus,omitempty"`
+	Status         string        `json:"status,omitempty"`
+	Code           string        `json:"code,omitempty"`
+	Reason         string        `json:"error,omitempty"`
+	RecoveryAction string        `json:"recoveryAction,omitempty"`
+	MissingFields  []string      `json:"missingProjectionFields,omitempty"`
+}
+
+func (e *PromptSessionError) Error() string {
+	switch {
+	case e.Code != "" && e.Reason != "":
+		return e.Code + ": " + e.Reason
+	case e.Reason != "":
+		return e.Reason
+	case e.Code != "":
+		return e.Code
+	default:
+		return "prompt refused"
+	}
+}
+
+// Unwrap preserves compatibility for callers that already branch on the
+// coarse HTTP 409 sentinel.
+func (e *PromptSessionError) Unwrap() error { return ErrConflict }
