@@ -5,18 +5,17 @@ package sessionshim
 import (
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 )
 
-// processStartTime reads field 22 (starttime) of /proc/<pid>/stat: the process
-// start time in clock ticks since boot, straight from the kernel.
+// processStartTime reads field 22 (starttime) of /proc/<pid>/stat and reports
+// it as Unix nanoseconds, matching the ProcessIdentity contract (StartedAt is
+// Unix nanoseconds on every platform) and the darwin implementation.
 //
-// Ticks-since-boot are not wall-clock nanoseconds, and deliberately are not
-// converted to any: the value is used only for EQUALITY against a previously
-// recorded value for the same pid on the same boot, which is exactly the
-// anti-reuse question being asked. Converting through a boot-time estimate
-// would add drift to a comparison that needs none.
+// The kernel reports starttime in clock ticks since boot, so the ticks are
+// scaled by the tick rate and added to the boot wall-clock from /proc/stat's
+// btime line. Reporting raw ticks would keep same-boot equality working but
+// would alias across reboots (ticks-since-boot restarts at zero) and would
+// disagree in magnitude with the Unix-nanosecond values stored in records.
 func processStartTime(pid int) (int64, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
@@ -25,26 +24,37 @@ func processStartTime(pid int) (int64, error) {
 		}
 		return 0, fmt.Errorf("sessionshim: read /proc/%d/stat: %w", pid, err)
 	}
-	// comm (field 2) is parenthesised and may itself contain spaces and
-	// parentheses, so fields are counted from the LAST ')'.
-	commEnd := strings.LastIndexByte(string(data), ')')
-	if commEnd < 0 || commEnd+2 >= len(data) {
-		return 0, fmt.Errorf("sessionshim: malformed /proc/%d/stat", pid)
-	}
-	fields := strings.Fields(string(data[commEnd+2:]))
-	// After comm, field 3 (state) is index 0, so starttime (field 22) is index 19.
-	const startTimeIndex = 19
-	if len(fields) <= startTimeIndex {
-		return 0, fmt.Errorf("sessionshim: /proc/%d/stat has %d fields after comm, need > %d", pid, len(fields), startTimeIndex)
-	}
-	ticks, err := strconv.ParseInt(fields[startTimeIndex], 10, 64)
+	ticks, err := parseProcPIDStatStartTicks(data, pid)
 	if err != nil {
-		return 0, fmt.Errorf("sessionshim: parse /proc/%d/stat starttime: %w", pid, err)
+		return 0, err
 	}
-	if ticks <= 0 {
-		// Zero would be indistinguishable from "unknown" in a Record, whose
-		// validation requires a positive value; bias to 1 tick.
-		ticks = 1
+	bootUnixNano, err := readLinuxBootTimeUnixNano()
+	if err != nil {
+		return 0, err
 	}
-	return ticks, nil
+	started, err := procStartTimeUnixNano(ticks, linuxClockTicksPerSecond, bootUnixNano)
+	if err != nil {
+		return 0, err
+	}
+	return started, nil
+}
+
+// linuxClockTicksPerSecond is the kernel's USER_HZ tick rate used by
+// /proc/<pid>/stat field 22. It is 100 on every Linux architecture this
+// binary targets; Go offers no libc-free sysconf(_SC_CLK_TCK) wrapper, so the
+// rate is pinned here and the scaling itself stays unit-tested through
+// procStartTimeUnixNano's clockTicksPerSecond parameter.
+const linuxClockTicksPerSecond = 100
+
+// readLinuxBootTimeUnixNano reports the boot wall-clock from /proc/stat.
+func readLinuxBootTimeUnixNano() (int64, error) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, fmt.Errorf("sessionshim: read /proc/stat: %w", err)
+	}
+	bootUnixNano, err := parseProcStatBootTimeUnixNano(data)
+	if err != nil {
+		return 0, err
+	}
+	return bootUnixNano, nil
 }
