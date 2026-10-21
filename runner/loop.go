@@ -1854,7 +1854,6 @@ tailRecovery:
 				completeContinueNoOp := func(message string) {
 					res.Status = "completed"
 					res.FailureMode = ""
-					res.Error = ""
 					res.ContinuationOutcome = ContinuationOutcomeNoOp
 					res.PostSessionWarnings = append(res.PostSessionWarnings, message)
 				}
