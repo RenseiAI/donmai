@@ -134,8 +134,15 @@ type tokenRefresher struct {
 }
 
 // newTokenRefresher constructs a tokenRefresher. Refresh must be non-nil.
+// A zero ExpiresAt (platform omitted the expiry) is seeded to
+// now()+assumedTTL so the first window gates on due() exactly like a
+// known expiry instead of refreshing on the first capped wake.
 func newTokenRefresher(opts tokenRefresherOptions) *tokenRefresher {
-	return &tokenRefresher{opts: opts, expiresAt: opts.ExpiresAt}
+	exp := opts.ExpiresAt
+	if exp.IsZero() {
+		exp = opts.now().Add(opts.assumedTTL())
+	}
+	return &tokenRefresher{opts: opts, expiresAt: exp}
 }
 
 // Start launches the refresh goroutine. Subsequent calls are no-ops.
@@ -216,9 +223,11 @@ func (r *tokenRefresher) loop(ctx context.Context) {
 }
 
 // nextWait computes the sleep until the next wall-clock re-check: the
-// wait until expiry − lead, floored at minWait and capped at maxWait. An
-// unknown expiry assumes now + AssumedTTL. The expiry-lead trigger itself
-// is evaluated by due() on each wake, so a capped wait only re-arms.
+// wait until expiry − lead, floored at minWait and capped at maxWait. The
+// IsZero branch is defensive (the constructor seeds an unknown expiry, and
+// the loop never stores zero); it assumes now + AssumedTTL rather than
+// going dormant. The expiry-lead trigger itself is evaluated by due() on
+// each wake, so a capped wait only re-arms.
 func (r *tokenRefresher) nextWait() time.Duration {
 	r.mu.Lock()
 	exp := r.expiresAt
@@ -239,10 +248,11 @@ func (r *tokenRefresher) nextWait() time.Duration {
 }
 
 // due reports whether wall-clock now has reached expiry − lead, i.e. the
-// proactive refresh is actually owed. An unknown expiry is always due: the
-// wait was scheduled off the assumed TTL, so a wake means that assumed
-// boundary was reached — mirroring nextWait, which assumes rather than
-// going dormant.
+// proactive refresh is actually owed. Unknown expiries are seeded at
+// construction to now()+assumedTTL, so they gate exactly like a known
+// expiry. A zero expiry here is unreachable in normal flow (the loop never
+// stores zero); the branch fails open to a refresh rather than going
+// dormant.
 func (r *tokenRefresher) due() bool {
 	r.mu.Lock()
 	exp := r.expiresAt

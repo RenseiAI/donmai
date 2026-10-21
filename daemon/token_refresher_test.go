@@ -172,6 +172,21 @@ func TestTokenRefresher_NextWaitCappedAtMaxWait(t *testing.T) {
 	if got := r.nextWait(); got > time.Minute {
 		t.Fatalf("nextWait() = %v, want <= maxWait (%v)", got, time.Minute)
 	}
+
+	// Boundary pin: a wait of 1.5*MaxWait clamps exactly to MaxWait.
+	clamped := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt: now.Add(30*time.Millisecond + 5*time.Millisecond),
+		Lead:      5 * time.Millisecond,
+		MinWait:   time.Millisecond,
+		MaxWait:   20 * time.Millisecond,
+		Now:       func() time.Time { return now },
+		Refresh: func(context.Context) (time.Time, error) {
+			return time.Time{}, nil
+		},
+	})
+	if got := clamped.nextWait(); got != 20*time.Millisecond {
+		t.Fatalf("nextWait() = %v for a 1.5*MaxWait wait, want exactly MaxWait (%v)", got, 20*time.Millisecond)
+	}
 }
 
 // TestTokenRefresher_SimulatedSleepRefreshesOnNextWake drives the loop
@@ -231,30 +246,18 @@ func TestTokenRefresher_SimulatedSleepRefreshesOnNextWake(t *testing.T) {
 // TestTokenRefresher_WakeBeforeLeadDoesNotRefresh pins the wall-clock
 // gate: a wake while now is still before expiry-lead re-arms without
 // calling Refresh — capped waits are re-checks, not refresh triggers.
+// It also pins the exact boundary: now == expiry-lead is already due.
 func TestTokenRefresher_WakeBeforeLeadDoesNotRefresh(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	r := newTokenRefresher(tokenRefresherOptions{
-		ExpiresAt: now.Add(time.Hour),
-		Lead:      5 * time.Minute,
-		MinWait:   time.Millisecond,
-		MaxWait:   time.Millisecond,
-		Now:       func() time.Time { return now },
-		Refresh: func(context.Context) (time.Time, error) {
-			t.Error("Refresh fired before expiry-lead")
-			return time.Time{}, nil
-		},
-	})
-
-	if r.due() {
-		t.Fatal("due() = true 55 min before expiry-lead, want false")
-	}
+	expiry := now.Add(time.Hour)
+	lead := 5 * time.Minute
 
 	var calls atomic.Int32
-	r2 := newTokenRefresher(tokenRefresherOptions{
-		ExpiresAt: now.Add(time.Hour),
-		Lead:      5 * time.Minute,
+	r := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt: expiry,
+		Lead:      lead,
 		MinWait:   time.Millisecond,
 		MaxWait:   10 * time.Millisecond,
 		Now:       func() time.Time { return now },
@@ -263,11 +266,100 @@ func TestTokenRefresher_WakeBeforeLeadDoesNotRefresh(t *testing.T) {
 			return time.Now().Add(time.Hour), nil
 		},
 	})
-	r2.Start()
-	t.Cleanup(r2.Stop)
+
+	if r.due() {
+		t.Fatal("due() = true 55 min before expiry-lead, want false")
+	}
+
+	// Exact boundary: now == expiry-lead is due.
+	atBoundary := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt: expiry,
+		Lead:      lead,
+		MinWait:   time.Millisecond,
+		MaxWait:   10 * time.Millisecond,
+		Now:       func() time.Time { return expiry.Add(-lead) },
+		Refresh: func(context.Context) (time.Time, error) {
+			return time.Time{}, nil
+		},
+	})
+	if !atBoundary.due() {
+		t.Fatal("due() = false exactly at expiry-lead, want true")
+	}
+
+	r.Start()
+	t.Cleanup(r.Stop)
 	time.Sleep(60 * time.Millisecond) // several capped wakes, all before the lead
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("Refresh calls = %d while still before expiry-lead, want 0", got)
+	}
+}
+
+// TestTokenRefresher_UnknownExpiryGatedUntilAssumedBoundary covers the
+// seeded unknown-expiry window with a production-sized TTL: with no expiry
+// from the platform the refresher assumes now+AssumedTTL, re-checks on the
+// MaxWait ceiling without refreshing, and refreshes exactly once after a
+// wall-clock jump past the assumed expiry-lead — the same host-sleep shape
+// as a known expiry, not a refresh on the first capped wake.
+func TestTokenRefresher_UnknownExpiryGatedUntilAssumedBoundary(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Now()
+	current := now
+	nowFn := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return current
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		current = current.Add(d)
+	}
+
+	var calls atomic.Int32
+	refreshed := make(chan struct{}, 8)
+	r := newTokenRefresher(tokenRefresherOptions{
+		ExpiresAt:  time.Time{}, // unknown: seeded to now+AssumedTTL
+		AssumedTTL: time.Hour,
+		Lead:       5 * time.Minute,
+		MinWait:    time.Millisecond,
+		MaxWait:    20 * time.Millisecond,
+		Now:        nowFn,
+		Refresh: func(context.Context) (time.Time, error) {
+			calls.Add(1)
+			refreshed <- struct{}{}
+			return current.Add(time.Hour), nil
+		},
+	})
+
+	// Before the assumed boundary the seeded window is not due, and the
+	// capped wait only re-arms.
+	if r.due() {
+		t.Fatal("due() = true at the start of a seeded unknown-expiry window, want false")
+	}
+	if got := r.nextWait(); got != 20*time.Millisecond {
+		t.Fatalf("nextWait() = %v for a seeded 55m window, want capped MaxWait (%v)", got, 20*time.Millisecond)
+	}
+
+	r.Start()
+	t.Cleanup(r.Stop)
+	time.Sleep(60 * time.Millisecond) // several capped wakes, all before the assumed lead
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("Refresh calls = %d before the assumed expiry-lead, want 0", got)
+	}
+
+	// Jump the wall clock past the assumed expiry-lead: the next wake
+	// must refresh exactly once.
+	advance(56 * time.Minute)
+
+	select {
+	case <-refreshed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Refresh never fired after the wall clock jumped past the assumed expiry-lead")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("Refresh calls = %d after the jump, want exactly 1", got)
 	}
 }
 
