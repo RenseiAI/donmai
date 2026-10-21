@@ -238,6 +238,15 @@ type SessionDetail struct {
 	// StageBudget is the per-stage runtime budget the runner enforces.
 	StageBudget *PollStageBudget `json:"stageBudget,omitempty"`
 
+	// MaxDurationSeconds carries the legacy top-level poll duration
+	// (PollWorkItem maxDurationSeconds) onto the runner as a fallback.
+	// The enforced authority remains StageBudget: when it carries a
+	// positive maxDurationSeconds it wins; otherwise the runner falls
+	// back to this value. Additive + omitempty, so older daemons omit it
+	// and older runners ignore it (mixed-version safe). The daemon never
+	// interprets it — opaque carrier only.
+	MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
+
 	// StageLifecycle is the lifecycle config for the workflow this
 	// stage instance belongs to. Forwarded opaquely on WORK_RESULT.
 	StageLifecycle map[string]any `json:"stageLifecycle,omitempty"`

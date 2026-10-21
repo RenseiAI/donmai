@@ -251,6 +251,24 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 // wrap to a negative value, and a negative return here does not mean "very
 // long", it means "no runner-side cap at all". Clamping first is what keeps a
 // malformed budget from producing an unbounded session.
+// effectiveStageDurationSeconds resolves the wall-clock cap the runner
+// enforces: the nested stage budget wins when positive, otherwise the legacy
+// top-level poll duration (SessionDetail.MaxDurationSeconds, carried from
+// PollWorkItem maxDurationSeconds) applies as a fallback so the wire means
+// what it says. Zero means no cap from either source.
+func effectiveStageDurationSeconds(detail *daemon.SessionDetail) int {
+	if detail == nil {
+		return 0
+	}
+	if detail.StageBudget != nil && detail.StageBudget.MaxDurationSeconds > 0 {
+		return detail.StageBudget.MaxDurationSeconds
+	}
+	if detail.MaxDurationSeconds > 0 {
+		return detail.MaxDurationSeconds
+	}
+	return 0
+}
+
 func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
 	if detail == nil {
 		return 0
@@ -258,15 +276,15 @@ func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
 	if detail.Mode == prompt.InteractiveRunMode {
 		return -1
 	}
-	budget := detail.StageBudget
-	if budget == nil || budget.MaxDurationSeconds <= 0 {
+	durationSeconds := effectiveStageDurationSeconds(detail)
+	if durationSeconds <= 0 {
 		return 0
 	}
 	const ceilingSeconds = int64(runner.MaxSessionDurationCeiling / time.Second)
-	if int64(budget.MaxDurationSeconds) >= ceilingSeconds {
+	if int64(durationSeconds) >= ceilingSeconds {
 		return runner.MaxSessionDurationCeiling
 	}
-	return time.Duration(budget.MaxDurationSeconds) * time.Second
+	return time.Duration(durationSeconds) * time.Second
 }
 
 // Daemon-URL provenance strings. They are part of the preflight error a
@@ -1663,6 +1681,21 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 	qw, err = runner.ReconcileStageBudget(qw, stageBudgetJSON)
 	if err != nil {
 		return runner.QueuedWork{}, err
+	}
+	// Legacy top-level fallback: the nested stage budget remains the
+	// authority and ReconcileStageBudget above enforces that the sibling
+	// mirror matches the receipted payload exactly, so this fill runs only
+	// AFTER reconciliation. When neither source carries a positive nested
+	// duration, a positive top-level poll duration takes effect as the
+	// stage budget duration (preserving any nested sub-agent/token caps).
+	if (qw.StageBudget == nil || qw.StageBudget.MaxDurationSeconds <= 0) && d.MaxDurationSeconds > 0 {
+		if qw.StageBudget == nil {
+			qw.StageBudget = &prompt.StageBudget{MaxDurationSeconds: d.MaxDurationSeconds}
+		} else {
+			budgetCopy := *qw.StageBudget
+			budgetCopy.MaxDurationSeconds = d.MaxDurationSeconds
+			qw.StageBudget = &budgetCopy
+		}
 	}
 	if d.InterviewBudget != nil {
 		qw.InterviewBudget = &prompt.InterviewBudget{

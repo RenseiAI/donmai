@@ -81,10 +81,18 @@ type PollWorkItem struct {
 	BaseRef               string                            `json:"baseRef,omitempty"`
 	Priority              int                               `json:"priority,omitempty"`
 	Env                   map[string]string                 `json:"env,omitempty"`
-	MaxDuration           int                               `json:"maxDurationSeconds,omitempty"`
-	Resources             *SessionResources                 `json:"resources,omitempty"`
-	QueuedAt              int64                             `json:"queuedAt,omitempty"`
-	ProjectScope          string                            `json:"projectScope,omitempty"`
+	// MaxDuration is the legacy top-level wall-clock cap in seconds.
+	// It remains decoded for wire compatibility, but the enforced
+	// authority is StageBudget (stageBudget.maxDurationSeconds).
+	// At the poll boundary PollItemToSessionDetail carries this value
+	// onto SessionDetail as a fallback: when the nested stage budget
+	// carries no positive duration, the runner enforces this top-level
+	// value instead, so the wire means what it says. When both are
+	// present and positive, the nested StageBudget wins.
+	MaxDuration  int               `json:"maxDurationSeconds,omitempty"`
+	Resources    *SessionResources `json:"resources,omitempty"`
+	QueuedAt     int64             `json:"queuedAt,omitempty"`
+	ProjectScope string            `json:"projectScope,omitempty"`
 
 	// F.2.8 — enriched fields the platform may send so the
 	// `donmai agent run` worker has the runner context it needs without
@@ -1676,28 +1684,31 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		StagePrompt:             item.StagePrompt,
 		StageID:                 item.StageID,
 		StageBudget:             item.StageBudget,
-		StageLifecycle:          item.StageLifecycle,
-		StageSourceEventID:      item.StageSourceEventID,
-		SystemPromptOverride:    item.SystemPromptOverride,
-		Kits:                    item.Kits,
-		DisallowedTools:         item.DisallowedTools,
-		AllowedTools:            item.AllowedTools,
-		McpServers:              item.McpServers,
-		Skills:                  item.Skills,
-		MemoryBlock:             item.MemoryBlock,
-		ContinuePullRequest:     item.ContinuePullRequest,
-		Delivery:                item.Delivery,
-		Mode:                    item.Mode,
-		InitialPrompt:           item.InitialPrompt,
-		RecordingEnabled:        item.RecordingEnabled,
-		TerminalWorkareaLease:   item.TerminalWorkareaLease,
-		InterviewBudget:         item.InterviewBudget,
-		InterviewDefinition:     item.InterviewDefinition,
-		Traceparent:             item.Traceparent,
-		Tracestate:              item.Tracestate,
-		SessionStorageID:        item.SessionStorageID,
-		SessionPublicID:         item.SessionPublicID,
-		TrackerSessionID:        item.TrackerSessionID,
+		// Legacy top-level duration rides as a fallback carrier; the
+		// runner enforces StageBudget first and falls back to this.
+		MaxDurationSeconds:    item.MaxDuration,
+		StageLifecycle:        item.StageLifecycle,
+		StageSourceEventID:    item.StageSourceEventID,
+		SystemPromptOverride:  item.SystemPromptOverride,
+		Kits:                  item.Kits,
+		DisallowedTools:       item.DisallowedTools,
+		AllowedTools:          item.AllowedTools,
+		McpServers:            item.McpServers,
+		Skills:                item.Skills,
+		MemoryBlock:           item.MemoryBlock,
+		ContinuePullRequest:   item.ContinuePullRequest,
+		Delivery:              item.Delivery,
+		Mode:                  item.Mode,
+		InitialPrompt:         item.InitialPrompt,
+		RecordingEnabled:      item.RecordingEnabled,
+		TerminalWorkareaLease: item.TerminalWorkareaLease,
+		InterviewBudget:       item.InterviewBudget,
+		InterviewDefinition:   item.InterviewDefinition,
+		Traceparent:           item.Traceparent,
+		Tracestate:            item.Tracestate,
+		SessionStorageID:      item.SessionStorageID,
+		SessionPublicID:       item.SessionPublicID,
+		TrackerSessionID:      item.TrackerSessionID,
 	}
 	for _, opt := range opts {
 		opt(detail)
