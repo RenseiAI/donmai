@@ -396,9 +396,12 @@ func (s *Store) Reconcile(candidates []ReconcileCandidate) (verified []MirrorEnt
 		numBytes, _ := dirBytes(filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest))
 		entry := MirrorEntry{Digest: digest, LastFetch: dirModTime(filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)), Bytes: numBytes}
 		verified = append(verified, entry)
-		entries = append(entries, entry)
 	}
-	if err := writeCatalog(s.catalogPath(), entries); err != nil {
+	// Persist the filtered serving set, not the pre-scan entries: rows
+	// whose directory is gone are dropped from disk, so their bytes stop
+	// counting toward the daemon's budget total and a later row at a
+	// recycled digest cannot inherit stale fetch or revocation state.
+	if err := writeCatalog(s.catalogPath(), verified); err != nil {
 		return nil, nil, err
 	}
 	return verified, unverified, nil

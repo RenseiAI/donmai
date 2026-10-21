@@ -1019,3 +1019,61 @@ func TestTryRemoveSkipsInProcessBusyMirror(t *testing.T) {
 		t.Error("TryRemove(released mutex) removed=false, want true after the mutex released")
 	}
 }
+
+// TestReconcileDropsStaleRowsFromCatalog pins the reconcile persistence
+// contract: a catalog row whose mirror directory is gone is dropped from
+// disk, not just from the returned set, so its bytes stop counting toward
+// the budget total and a later mirror at a recycled digest cannot inherit
+// stale state. It drives the production Ensure and Reconcile entry points
+// against a real local git repository.
+func TestReconcileDropsStaleRowsFromCatalog(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	lease, err := store.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	digest := lease.Digest()
+	dir := lease.Dir()
+	lease.Release()
+
+	found := false
+	for _, entry := range mustList(t, store) {
+		if entry.Digest == digest {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("Ensure did not record a catalog row for the new mirror")
+	}
+
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove mirror dir: %v", err)
+	}
+
+	verified, _, err := store.Reconcile(nil)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	for _, entry := range verified {
+		if entry.Digest == digest {
+			t.Fatalf("Reconcile served a stale row for a removed mirror")
+		}
+	}
+	for _, entry := range mustList(t, store) {
+		if entry.Digest == digest {
+			t.Fatalf("stale catalog row survived Reconcile on disk for a removed mirror")
+		}
+	}
+}
+
+func mustList(t *testing.T, store *Store) []MirrorEntry {
+	t.Helper()
+	entries, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	return entries
+}
