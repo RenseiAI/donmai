@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // TestVerifyScopePlacementPrefersTheUserManager pins the permission gate's
@@ -164,7 +166,7 @@ func TestScopeRefusalCarriesTheManagerMessage(t *testing.T) {
 	const refusal = "Failed to start transient scope unit: Interactive authentication required"
 	dir := t.TempDir()
 	helper := filepath.Join(dir, "systemd-run")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\necho '"+refusal+"' >&2\nexit 1\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: the fake manager the refusal shape pins against
+	if err := testexec.WriteFile(helper, []byte("#!/bin/sh\necho '"+refusal+"' >&2\nexit 1\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: the fake manager the refusal shape pins against
 		t.Fatal(err)
 	}
 	oldPath := os.Getenv("PATH")

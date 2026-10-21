@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -1038,7 +1039,7 @@ func TestRunBackstop_PushBackFailureReportsDeliveryFailed(t *testing.T) {
 	}
 	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"repo\" ]; then echo PRIVATE; exit 0; fi\ncat %q 1>&2\nexit 1\n", outFile)
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1202,7 +1203,7 @@ exit 1
 `, logFile, widgetsSlug, widgetsURL, gadgetsSlug, gadgetsURL, viewWidgets, viewGadgets)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1452,7 +1453,7 @@ exit 1
 `, visFile)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1504,7 +1505,7 @@ exit 1
 `, visFile, capture.args, capture.title, capture.body, url)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1549,7 +1550,7 @@ exit 1
 `, argsFile, url, viewFile)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1803,7 +1804,7 @@ func stubGhOnPath(t *testing.T, exitCode int, output string) {
 	script := fmt.Sprintf("#!/bin/sh\ncat %q 1>&2\nexit %d\n", outFile, exitCode)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1826,7 +1827,7 @@ exit %[3]d
 `, expectedURL, outFile, exitCode)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh validating stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

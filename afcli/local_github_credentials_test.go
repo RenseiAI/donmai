@@ -20,6 +20,7 @@ import (
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/installer/launchd"
 	"github.com/RenseiAI/donmai/installer/systemd"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 type localGitHubRoundTrip func(*http.Request) (*http.Response, error)
@@ -59,7 +60,7 @@ func localGitHubFakeCLI(t *testing.T, home, body string) string {
 		"[ -z \"${GITHUB_TOKEN+x}\" ] && [ -z \"${GH_TOKEN+x}\" ] && [ -z \"${LD_PRELOAD+x}\" ] && [ -z \"${HTTP_PROXY+x}\" ] || exit 93\n" +
 		"[ \"$PWD\" = / ] || exit 94\n" +
 		"printf '%s\\n' \"$*\" >> \"$HOME/gh-args\"\n" + body + "\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Chmod(path, 0o700); err != nil {

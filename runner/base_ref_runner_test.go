@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
@@ -95,7 +96,7 @@ if [ "$1" = 'pr' ] && [ "$2" = 'create' ]; then
 fi
 exit 1
 `
-	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o600); err != nil {
+	if err := testexec.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Chmod(filepath.Join(bin, "gh"), 0o500); err != nil {

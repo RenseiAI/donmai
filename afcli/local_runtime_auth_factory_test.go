@@ -11,6 +11,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 )
 
@@ -20,7 +21,7 @@ func localFactoryBinary(t *testing.T, name, script string) string {
 	t.Helper()
 	directory := t.TempDir()
 	path := filepath.Join(directory, name)
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Chmod(path, 0o500); err != nil {

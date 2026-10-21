@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/eval/experiment"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // initTempRepo creates a throwaway git repo with a known Go file and returns its
@@ -583,7 +584,7 @@ func TestDriver_ControlArmMaxTurns_RecordedNotAborted(t *testing.T) {
 func writeExecInto(t *testing.T, dir, name string) {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte("#!/bin/sh\necho "+name+"\n"), 0o755); err != nil { // nolint:gosec // must be executable to exercise PATH resolution
+	if err := testexec.WriteFile(p, []byte("#!/bin/sh\necho "+name+"\n"), 0o755); err != nil { // nolint:gosec // must be executable to exercise PATH resolution
 		t.Fatalf("write exec %s: %v", name, err)
 	}
 }

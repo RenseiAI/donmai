@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // NewGitCheckout initializes a throwaway git repository and returns its path.
@@ -278,7 +280,7 @@ func TestEnsureExcluded_SpawnsNoGitOutsideACheckout(t *testing.T) {
 	fakeBin := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "git-was-invoked")
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + marker + "\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte(script), 0o700); err != nil { //nolint:gosec // test fixture must be executable
+	if err := testexec.WriteFile(filepath.Join(fakeBin, "git"), []byte(script), 0o700); err != nil { //nolint:gosec // test fixture must be executable
 		t.Fatalf("write fake git: %v", err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/internal/gitexec"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // Hardening coverage: poisoned-mirror refusal, cross-process create races,
@@ -154,7 +155,7 @@ func TestVerifyRefusesExecutableHooks(t *testing.T) {
 		t.Fatalf("create hooks dir: %v", err)
 	}
 	//nolint:gosec // G306: the fixture hook must be executable to prove it is refused.
-	if err := os.WriteFile(filepath.Join(dir, "hooks", "reference-transaction"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := testexec.WriteFile(filepath.Join(dir, "hooks", "reference-transaction"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("plant hook: %v", err)
 	}
 	if _, err := store.Ensure(context.Background(), srcDir, ""); !errors.Is(err, ErrOriginMismatch) {
@@ -776,7 +777,7 @@ func TestEnsureFirstVerificationFailureUnpublishes(t *testing.T) {
 			panic(err)
 		}
 		//nolint:gosec // G306: the fixture hook must be executable to fail verification.
-		if err := os.WriteFile(filepath.Join(dir, "hooks", "post-checkout"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		if err := testexec.WriteFile(filepath.Join(dir, "hooks", "post-checkout"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 			panic(err)
 		}
 	}

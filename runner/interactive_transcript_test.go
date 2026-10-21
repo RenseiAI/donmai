@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/runtime/state"
@@ -280,7 +281,7 @@ done
 sleep 0.3
 printf '{"type":"message","id":"final","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-final","name":"FINAL_TOOL","arguments":{}}]}}\n' >> "$dir/2099-01-01T00-00-00-000Z_live.jsonl"
 `
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+	if err := testexec.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
 		t.Fatal(err)
 	}
 	provider, err := pi.New(pi.Options{

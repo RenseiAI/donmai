@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
@@ -600,7 +601,7 @@ printf '%s\n' "$@" > "$PWD/codex-argv"
 env | LC_ALL=C sort | grep '^DONMAI_MCP_HEADER_' > "$PWD/codex-mcp-env" || true
 for key in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do printf '%s=%s\n' "$key" "${!key}"; done > "$PWD/codex-auth-env"
 `
-	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil {
+	if err := testexec.WriteFile(bin, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o700); err != nil { //nolint:gosec // test fixture must be executable
