@@ -236,7 +236,9 @@ func TestRepoKeeper_ProductionLayoutUnderStateHome(t *testing.T) {
 	if err := k.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	dir, ok := k.Acquire(context.Background(), newKeeperSourceRepo(t))
+	dirLease, ok := k.Acquire(context.Background(), newKeeperSourceRepo(t))
+	dir := dirLease.Dir()
+	dirLease.Release()
 	if !ok {
 		t.Fatal("Acquire degraded, want a served mirror")
 	}
@@ -265,8 +267,12 @@ func TestRepoKeeper_ScopeSeam(t *testing.T) {
 		i++
 		return s, nil
 	}, nil)
-	dirA, okA := k.Acquire(context.Background(), remote)
-	dirB, okB := k.Acquire(context.Background(), remote)
+	dirALease, okA := k.Acquire(context.Background(), remote)
+	dirA := dirALease.Dir()
+	dirALease.Release()
+	dirBLease, okB := k.Acquire(context.Background(), remote)
+	dirB := dirBLease.Dir()
+	dirBLease.Release()
 	if !okA || !okB {
 		t.Fatalf("Acquire ok = %v/%v, want true/true", okA, okB)
 	}
@@ -304,18 +310,23 @@ func TestRepoKeeper_BudgetExceededFallsBackToPlainClone(t *testing.T) {
 	remote := newKeeperSourceRepo(t)
 	other := newKeeperSourceRepo(t)
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 1}, nil, nil)
-	dir, ok := k.Acquire(context.Background(), remote)
+	dirLease, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("first Acquire ok=false, want a served mirror")
 	}
+	dir := dirLease.Dir()
 	digest := filepath.Base(dir)
+	dirLease.Release()
 	k.RecordFetch(digest, 1<<30, time.Second, false)
 
-	if dir2, ok := k.Acquire(context.Background(), other); ok {
-		t.Errorf("over-budget Acquire ok=true (dir %q), want degradation to plain clone", dir2)
+	if dir2Lease, ok := k.Acquire(context.Background(), other); ok {
+		dir2Lease.Release()
+		t.Errorf("over-budget Acquire ok=true, want degradation to plain clone")
 	}
-	if _, ok := k.Acquire(context.Background(), remote); !ok {
+	if existing, ok := k.Acquire(context.Background(), remote); !ok {
 		t.Error("existing mirror must still serve while over budget")
+	} else {
+		existing.Release()
 	}
 }
 
@@ -339,12 +350,21 @@ func TestRepoKeeper_EvictsLeastRecentlyUsedWithoutInflightSeed(t *testing.T) {
 	}
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
 	digests := make([]string, 0, len(remotes))
+	leases := make([]*repokeeper.Lease, 0, len(remotes))
 	for _, remote := range remotes {
-		dir, ok := k.Acquire(context.Background(), remote)
+		dirLease, ok := k.Acquire(context.Background(), remote)
 		if !ok {
 			t.Fatalf("acquire %s: degraded", remote)
 		}
-		digests = append(digests, filepath.Base(dir))
+		digests = append(digests, filepath.Base(dirLease.Dir()))
+		leases = append(leases, dirLease)
+	}
+	// Eviction removes non-blocking: a leased mirror is skipped as a
+	// victim for the pass, so every acquired lease is released before
+	// enforcing the budget, as a seeding caller would after its clone
+	// finishes.
+	for _, lease := range leases {
+		lease.Release()
 	}
 	// Record byte loads through the production RecordFetch path and arm the
 	// cap just before enforcement, so the admission gate stays out of the
@@ -434,10 +454,12 @@ func TestRepoKeeper_StatsCarryNoSecrets(t *testing.T) {
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
 		return "tenant-secret", nil
 	}, nil)
-	dir, ok := k.Acquire(context.Background(), remote)
+	dirLease, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("Acquire degraded")
 	}
+	dir := dirLease.Dir()
+	dirLease.Release()
 	k.RecordFetch(filepath.Base(dir), 42, 2*time.Second, true)
 
 	stats := k.Stats()
@@ -468,10 +490,12 @@ func TestRepoKeeper_EventsCarryDurationAndBytes(t *testing.T) {
 
 	remote := newKeeperSourceRepo(t)
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
-	dir, ok := k.Acquire(context.Background(), remote)
+	dirLease, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("Acquire degraded")
 	}
+	dir := dirLease.Dir()
+	dirLease.Release()
 	digest := filepath.Base(dir)
 	k.RecordFetch(digest, 7, 1500*time.Millisecond, false)
 	k.SeedBegin(digest)
@@ -576,32 +600,37 @@ func TestRepoKeeper_ReconcileRacesNoAcquire(t *testing.T) {
 
 // TestRepoKeeper_CredentialBearingRemoteStaysSecretFree drives the production
 // Acquire entry point with a userinfo-, query-, and fragment-bearing remote
-// and proves it shares the bare remote's mirror while no credential material
-// reaches the mirror config, the sidecar, or the catalog.
+// and proves the credentialed form degrades (a credential in the URL would
+// reach git's argv and the persisted origin) while the bare remote serves
+// and no credential material reaches the mirror config, the sidecar, or
+// the catalog. The query/fragment-bearing bare form still shares the bare
+// remote's mirror.
 func TestRepoKeeper_CredentialBearingRemoteStaysSecretFree(t *testing.T) {
 	t.Parallel()
 
 	srcDir := newKeeperSourceRepo(t)
-	// The file transport reads userinfo-bearing sources, so the
-	// credentialed form clones the same repository through the production
-	// path; the sweep below proves nothing of the credential survived.
-	// Both forms address the same host (localhost) so canonicalization
-	// joins them at one digest: only userinfo/query/fragment differ.
 	bare := "file://localhost" + srcDir
 	const secret = "secrettoken"
 	credentialed := "file://user:" + secret + "@localhost" + srcDir + "?token=abc123#frag"
 
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
-	bareDir, ok := k.Acquire(context.Background(), bare)
+	bareLease, ok := k.Acquire(context.Background(), bare)
 	if !ok {
 		t.Fatal("bare Acquire degraded")
 	}
-	credDir, ok := k.Acquire(context.Background(), credentialed)
+	bareDir := bareLease.Dir()
+	bareLease.Release()
+	decoratedLease, ok := k.Acquire(context.Background(), bare+"?token=abc123#frag")
 	if !ok {
-		t.Fatal("credentialed Acquire degraded")
+		t.Fatal("query/fragment Acquire degraded")
 	}
-	if bareDir != credDir {
-		t.Fatalf("credentialed remote split mirrors: %q vs %q, want one digest", credDir, bareDir)
+	decoratedDir := decoratedLease.Dir()
+	decoratedLease.Release()
+	if decoratedDir != bareDir {
+		t.Fatalf("query/fragment remote split mirrors: %q vs %q, want one digest", decoratedDir, bareDir)
+	}
+	if credLease, ok := k.Acquire(context.Background(), credentialed); ok || credLease != nil {
+		t.Fatalf("credentialed Acquire = (%v, %v), want (nil, false)", credLease, ok)
 	}
 
 	var sweep strings.Builder
@@ -651,14 +680,14 @@ func TestRepoKeeper_NonHTTPRemoteHashesTrimmedAsIs(t *testing.T) {
 	if sshDigest != paddedDigest {
 		t.Fatalf("whitespace-padded remote split digests: %q vs %q, want one digest", paddedDigest, sshDigest)
 	}
-	// The canonical strip covers every URL scheme: an ssh-scheme source
-	// with userinfo canonicalizes to the userinfo-free form.
+	// An ssh-scheme source keeps its login user: a later fetch must
+	// connect as the recorded user, not as the daemon's OS user.
 	canonical, _, err := repokeeper.CanonicalRemote("ssh://git@example.com/org/repo.git")
 	if err != nil {
 		t.Fatalf("CanonicalRemote error = %v", err)
 	}
-	if canonical != "ssh://example.com/org/repo.git" {
-		t.Errorf("canonical = %q, want the userinfo-stripped form", canonical)
+	if canonical != "ssh://git@example.com/org/repo.git" {
+		t.Errorf("canonical = %q, want the login-user-preserving form", canonical)
 	}
 }
 
@@ -673,8 +702,8 @@ func TestRepoKeeper_ScopeErrorDegradesToPlainClone(t *testing.T) {
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
 		return "", boom
 	}, nil)
-	if dir, ok := k.Acquire(context.Background(), remote); ok || dir != "" {
-		t.Fatalf("scope-error Acquire = (%q, %v), want (\"\", false)", dir, ok)
+	if dirLease, ok := k.Acquire(context.Background(), remote); ok || dirLease != nil {
+		t.Fatalf("scope-error Acquire = (%v, %v), want (nil, false)", dirLease, ok)
 	}
 	names, err := os.ReadDir(filepath.Join(k.store.StateDir(), "repo-keeper", "mirrors"))
 	if err != nil && !os.IsNotExist(err) {
@@ -695,8 +724,8 @@ func TestRepoKeeper_EmptyScopeDegradesToPlainClone(t *testing.T) {
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, func(context.Context, string) (string, error) {
 		return "", nil
 	}, nil)
-	if dir, ok := k.Acquire(context.Background(), remote); ok || dir != "" {
-		t.Fatalf("empty-scope Acquire = (%q, %v), want (\"\", false)", dir, ok)
+	if dirLease, ok := k.Acquire(context.Background(), remote); ok || dirLease != nil {
+		t.Fatalf("empty-scope Acquire = (%v, %v), want (nil, false)", dirLease, ok)
 	}
 	names, err := os.ReadDir(filepath.Join(k.store.StateDir(), "repo-keeper", "mirrors"))
 	if err != nil && !os.IsNotExist(err) {
@@ -716,10 +745,12 @@ func TestRepoKeeper_AtExactlyBudgetRefusesNewMirror(t *testing.T) {
 	remote := newKeeperSourceRepo(t)
 	other := newKeeperSourceRepo(t)
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
-	dir, ok := k.Acquire(context.Background(), remote)
+	dirLease, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("first Acquire degraded")
 	}
+	dir := dirLease.Dir()
+	dirLease.Release()
 	k.RecordFetch(filepath.Base(dir), 10, time.Millisecond, false)
 
 	if _, ok := k.Acquire(context.Background(), other); ok {
@@ -758,15 +789,17 @@ func TestRepoKeeper_RevokedMirrorDegradesToPlainClone(t *testing.T) {
 
 	remote := newKeeperSourceRepo(t)
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
-	dir, ok := k.Acquire(context.Background(), remote)
+	dirLease, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("Acquire degraded")
 	}
+	dir := dirLease.Dir()
 	digest := filepath.Base(dir)
+	dirLease.Release()
 	k.RecordFetch(digest, 42, time.Millisecond, true)
 
-	if dir2, ok := k.Acquire(context.Background(), remote); ok || dir2 != "" {
-		t.Fatalf("revoked Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	if dir2Lease, ok := k.Acquire(context.Background(), remote); ok || dir2Lease != nil {
+		t.Fatalf("revoked Acquire = (%v, %v), want (nil, false)", dir2Lease, ok)
 	}
 	stats := k.Stats()
 	if stats.RevokedCount != 1 {
@@ -782,16 +815,18 @@ func TestRepoKeeper_UnreadableCatalogDegradesToPlainClone(t *testing.T) {
 
 	remote := newKeeperSourceRepo(t)
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
-	dir, ok := k.Acquire(context.Background(), remote)
+	dirLease, ok := k.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("Acquire degraded")
 	}
+	dir := dirLease.Dir()
+	dirLease.Release()
 	catalogPath := filepath.Join(k.store.StateDir(), "repo-keeper", "catalog.json")
 	if err := os.WriteFile(catalogPath, []byte("{corrupt"), 0o600); err != nil {
 		t.Fatalf("corrupt catalog: %v", err)
 	}
-	if dir2, ok := k.Acquire(context.Background(), remote); ok || dir2 != "" {
-		t.Fatalf("corrupt-catalog Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	if dir2Lease, ok := k.Acquire(context.Background(), remote); ok || dir2Lease != nil {
+		t.Fatalf("corrupt-catalog Acquire = (%v, %v), want (nil, false)", dir2Lease, ok)
 	}
 	if err := k.Reconcile(context.Background()); err == nil {
 		t.Fatal("Reconcile(corrupt catalog) error = nil, want the decode failure")
@@ -820,19 +855,29 @@ func TestRepoKeeper_ForeignMirrorFailsClosed(t *testing.T) {
 	// Publish the genuine mirror, then swap its content for the foreign
 	// repository while keeping the genuine identity sidecar: the live
 	// origin check must fail closed on the desync.
-	genuineDir, ok := k.Acquire(context.Background(), genuine)
+	genuineDirLease, ok := k.Acquire(context.Background(), genuine)
+	genuineDir := ""
+	if ok {
+		genuineDir = genuineDirLease.Dir()
+		genuineDirLease.Release()
+	}
 	if !ok {
 		t.Fatal("genuine Acquire degraded")
 	}
-	foreignDir, ok := k.Acquire(context.Background(), foreign)
+	foreignDirLease, ok := k.Acquire(context.Background(), foreign)
+	foreignDir := ""
+	if ok {
+		foreignDir = foreignDirLease.Dir()
+		foreignDirLease.Release()
+	}
 	if !ok {
 		t.Fatal("foreign Acquire degraded")
 	}
 	_ = foreignDir
 	runKeeperGitT(t, genuineDir, "remote", "set-url", "origin", foreign)
 
-	if dir2, ok := k.Acquire(context.Background(), genuine); ok || dir2 != "" {
-		t.Fatalf("foreign-content Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	if dir2Lease, ok := k.Acquire(context.Background(), genuine); ok || dir2Lease != nil {
+		t.Fatalf("foreign-content Acquire = (%v, %v), want (nil, false)", dir2Lease, ok)
 	}
 }
 
@@ -854,8 +899,8 @@ func TestRepoKeeper_SymlinkMirrorFailsClosed(t *testing.T) {
 		t.Fatalf("plant symlink: %v", err)
 	}
 
-	if dir2, ok := k.Acquire(context.Background(), remote); ok || dir2 != "" {
-		t.Fatalf("symlink Acquire = (%q, %v), want (\"\", false)", dir2, ok)
+	if dir2Lease, ok := k.Acquire(context.Background(), remote); ok || dir2Lease != nil {
+		t.Fatalf("symlink Acquire = (%v, %v), want (nil, false)", dir2Lease, ok)
 	}
 	entries, err := os.ReadDir(outside)
 	if err != nil {
@@ -876,8 +921,8 @@ func TestRepoKeeper_AuthResolverFailureDegrades(t *testing.T) {
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, func(context.Context, string) (string, bool, error) {
 		return "", false, boom
 	})
-	if dir, ok := k.Acquire(context.Background(), remote); ok || dir != "" {
-		t.Fatalf("auth-error Acquire = (%q, %v), want (\"\", false)", dir, ok)
+	if dirLease, ok := k.Acquire(context.Background(), remote); ok || dirLease != nil {
+		t.Fatalf("auth-error Acquire = (%v, %v), want (nil, false)", dirLease, ok)
 	}
 }
 
@@ -894,8 +939,8 @@ func TestRepoKeeper_OpaqueCredentialRemoteDegradesToPlainClone(t *testing.T) {
 	t.Parallel()
 
 	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
-	if dir, ok := k.Acquire(context.Background(), "deploy:s3cret-token@forge.example:org/repo.git"); ok || dir != "" {
-		t.Fatalf("opaque-credential Acquire = (%q, %v), want (\"\", false)", dir, ok)
+	if dirLease, ok := k.Acquire(context.Background(), "deploy:s3cret-token@forge.example:org/repo.git"); ok || dirLease != nil {
+		t.Fatalf("opaque-credential Acquire = (%v, %v), want (nil, false)", dirLease, ok)
 	}
 	names, err := os.ReadDir(filepath.Join(k.store.StateDir(), "repo-keeper", "mirrors"))
 	if err != nil && !os.IsNotExist(err) {
@@ -932,7 +977,10 @@ func TestRepoKeeper_RestartSweepsCrashStaging(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	// Simulate the kill between clone and publish: a credentialed
-	// staging sibling under the mirrors directory.
+	// staging sibling under the mirrors directory. The plant is backdated
+	// past the stale threshold: the restart sweep protects fresh staging,
+	// which may belong to a live concurrent Store sharing the state dir,
+	// and reaps only staging no live process can still own.
 	mirrors := filepath.Join(stateDir, "repo-keeper", "mirrors")
 	if err := os.MkdirAll(mirrors, 0o700); err != nil {
 		t.Fatalf("create mirrors dir: %v", err)
@@ -943,6 +991,12 @@ func TestRepoKeeper_RestartSweepsCrashStaging(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(staging, "config"), []byte("[remote \"origin\"]\n\turl = https://user:"+secret+"@example.com/org/repo.git\n"), 0o600); err != nil {
 		t.Fatalf("plant crash credential: %v", err)
+	}
+	// Backdate after the contents land: writing inside refreshes the
+	// directory's own mtime, which is what the sweep's age gate reads.
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(staging, past, past); err != nil {
+		t.Fatalf("backdate crash staging: %v", err)
 	}
 
 	// The restart builds a fresh store over the same state dir and
@@ -1010,12 +1064,19 @@ func TestRepoKeeper_CombinedRootProbe(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	dir, ok := keeper.Acquire(context.Background(), remote)
+	dirLease, ok := keeper.Acquire(context.Background(), remote)
 	if !ok {
 		t.Fatal("keeper Acquire degraded")
 	}
+	dir := dirLease.Dir()
 	digest := filepath.Base(dir)
-	secondDir, err := second.Ensure(context.Background(), remote, "host")
+	dirLease.Release()
+	secondLease, err := second.Ensure(context.Background(), remote, "host")
+	secondDir := ""
+	if err == nil {
+		secondDir = secondLease.Dir()
+		secondLease.Release()
+	}
 	if err != nil {
 		t.Fatalf("second Ensure: %v", err)
 	}
@@ -1072,5 +1133,168 @@ func TestRepoKeeper_CombinedRootProbe(t *testing.T) {
 				t.Errorf("evicted digest %q still listed by the second store", digest)
 			}
 		}
+	}
+}
+
+// TestRepoKeeper_OverBudgetAcquireSkipsLeasedVictim proves eviction never
+// waits on a lease while holding the keeper lock: with the budget
+// exhausted and the only mirror's lease held, an over-budget Acquire for
+// another remote degrades promptly instead of blocking until the lease
+// releases, and the leased victim survives the pass. Releasing the lease
+// then lets the next enforcement evict it.
+func TestRepoKeeper_OverBudgetAcquireSkipsLeasedVictim(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	other := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
+	lease, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("first Acquire ok=false, want a served mirror")
+	}
+	defer lease.Release()
+	digest := filepath.Base(lease.Dir())
+	k.RecordFetch(digest, 1<<30, time.Second, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		_, ok := k.Acquire(ctx, other)
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if elapsed := time.Since(start); elapsed >= 2*time.Second {
+			t.Errorf("over-budget Acquire blocked %v on a held lease, want prompt degrade", elapsed)
+		}
+		if ok {
+			t.Error("over-budget Acquire ok=true, want degradation to plain clone")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("over-budget Acquire stalled on a held lease")
+	}
+	if _, err := os.Stat(k.store.MirrorDir(digest)); err != nil {
+		t.Errorf("leased victim missing after the eviction pass: %v", err)
+	}
+}
+
+// TestRepoKeeper_CloseReleasesStoreRoot pins the fd lifecycle: closing the
+// keeper releases the store's root handle without invalidating outstanding
+// leases, and a later Acquire degrades instead of serving from a closed
+// store.
+func TestRepoKeeper_CloseReleasesStoreRoot(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	lease, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("Acquire ok=false, want a served mirror")
+	}
+	defer lease.Release()
+	if err := k.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := lease.Dir(); got == "" {
+		t.Error("outstanding lease lost its directory after Close")
+	}
+	if _, ok := k.Acquire(context.Background(), remote); ok {
+		t.Error("Acquire after Close ok=true, want degradation to plain clone")
+	}
+}
+
+// TestRepoKeeper_OverBudgetAcquireSkipsInProcessBusyVictim proves the
+// in-process half of the non-blocking eviction contract through the
+// production Acquire entry point: while another goroutine holds the
+// victim's per-mirror mutex inside an in-flight Ensure (blocked resolving
+// auth for its clone), an over-budget Acquire for another remote degrades
+// promptly instead of stalling on the mutex while holding the keeper
+// lock, and the victim is skipped rather than evicted.
+func TestRepoKeeper_OverBudgetAcquireSkipsInProcessBusyVictim(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	other := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true, MaxBytes: 10}, nil, nil)
+	lease, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("first Acquire ok=false, want a served mirror")
+	}
+	digest := filepath.Base(lease.Dir())
+	k.RecordFetch(digest, 1<<30, time.Second, false)
+	lease.Release()
+
+	scope, err := k.scope(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("scope() error = %v", err)
+	}
+	// Force the next Ensure for the victim onto the clone path (which
+	// resolves auth while holding the victim's per-mirror mutex) by
+	// removing its directory; the catalog row stays, so the victim is
+	// still the eviction candidate.
+	if err := os.RemoveAll(k.store.MirrorDir(digest)); err != nil {
+		t.Fatalf("RemoveAll(victim) error = %v", err)
+	}
+
+	authEntered := make(chan struct{})
+	releaseAuth := make(chan struct{})
+	authErr := errors.New("blocked auth released")
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, err := k.store.EnsureWithAuth(context.Background(), remote, scope, repokeeper.GitAuth(
+			func(context.Context, string) (string, bool, error) {
+				close(authEntered)
+				<-releaseAuth
+				return "", false, authErr
+			}))
+		ensureDone <- err
+	}()
+	defer func() {
+		close(releaseAuth)
+		if err := <-ensureDone; !errors.Is(err, authErr) {
+			t.Errorf("in-flight Ensure error = %v, want the released auth error", err)
+		}
+	}()
+	select {
+	case <-authEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("in-flight Ensure never reached auth resolution")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		_, ok := k.Acquire(ctx, other)
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if elapsed := time.Since(start); elapsed >= 2*time.Second {
+			t.Errorf("over-budget Acquire blocked %v on a held mirror mutex, want prompt degrade", elapsed)
+		}
+		if ok {
+			t.Error("over-budget Acquire ok=true, want degradation to plain clone")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("over-budget Acquire stalled on a held mirror mutex")
+	}
+	// A skipped victim is not an eviction: no evict event is recorded
+	// and the keeper's use marker for the victim survives the pass. A
+	// busy-as-removed bug would drop both while leaving the mirror on
+	// disk, silently shrinking the serving set.
+	for _, ev := range k.Events() {
+		if ev.Type == RepoKeeperEventEvict {
+			t.Errorf("eviction recorded an evict event for a skipped busy victim, want no eviction")
+		}
+	}
+	k.mu.Lock()
+	_, pinned := k.lastUse[digest]
+	k.mu.Unlock()
+	if !pinned {
+		t.Error("busy victim dropped from the keeper's use markers, want it kept for the pass")
 	}
 }

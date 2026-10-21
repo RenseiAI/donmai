@@ -808,6 +808,32 @@ type Result struct {
 	// every other run. Additive — old platforms ignore it.
 	Upstream *UpstreamError `json:"upstream,omitempty"`
 
+	// FinalProvider names the provider the session's model calls last
+	// identified from native response evidence
+	// (LlmCallEvent.ResponseModelProvider): the provider the wire response
+	// itself named. It is the answer to "which upstream provider served"
+	// when the harness exposes it — never the admitted binding's company
+	// and never the harness-reported System, which names the configured
+	// selection (or a harness constant) even on a gateway-routed session.
+	// Empty when no call carried response-provider evidence — the common
+	// case today, since most harnesses report only the configured
+	// selection. Additive — old platforms ignore it.
+	FinalProvider string `json:"finalProvider,omitempty"`
+
+	// FinalModel is the served model id paired with FinalProvider: the
+	// native served id (LlmCallEvent.ResponseModel) when the wire served
+	// a different id than requested, else the requested id. Empty when
+	// no call reported one. Additive — old platforms ignore it.
+	FinalModel string `json:"finalModel,omitempty"`
+
+	// ProviderAttempts totals the serving attempts behind the session's
+	// model calls (LlmCallEvent.Attempts: 1 per model request; a failed
+	// auto-retry surfaces as its own error call, so the sum still counts
+	// every attempt). Only calls that reported a positive count
+	// contribute; zero means no call reported (unknown) — never "zero
+	// attempts". Additive — old platforms ignore it.
+	ProviderAttempts int `json:"providerAttempts,omitempty"`
+
 	// Manifest is the structured turn-result manifest the agent wrote to
 	// `.agent/turn-result.json`, when one was present + valid (W3 —
 	// deterministic turn outcome). The runner parses + validates it

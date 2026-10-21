@@ -880,8 +880,14 @@ func (d *Daemon) repoKeeperFor(worktreeParentDir string) *RepoKeeper {
 func (d *Daemon) reconcileRepoKeeper(ctx context.Context, worktreeParentDir string) {
 	keeper := d.repoKeeperFor(worktreeParentDir)
 	d.mu.Lock()
+	old := d.repoKeeper
 	d.repoKeeper = keeper
 	d.mu.Unlock()
+	// Each rebuilt store holds one root fd: release the replaced one.
+	// Outstanding leases from the old store stay valid until Release.
+	if old != nil && old != keeper {
+		_ = old.Close()
+	}
 	if keeper == nil {
 		return
 	}
@@ -899,16 +905,17 @@ func (d *Daemon) RepoKeeper() *RepoKeeper {
 	return d.repoKeeper
 }
 
-// RepoKeeperMirror degrades a clone through the keeper: it returns the
-// mirror directory when the keeper can serve this remote, and ok=false when
+// RepoKeeperMirror degrades a clone through the keeper: it returns a lease
+// on the mirror when the keeper can serve this remote, and ok=false when
 // the caller must fall back to a plain clone (disabled, reconciling,
-// over budget, or scope failure).
-func (d *Daemon) RepoKeeperMirror(ctx context.Context, remote string) (dir string, ok bool) {
+// over budget, or scope failure). The lease holds the mirror's shared
+// maintenance lock until the caller releases it.
+func (d *Daemon) RepoKeeperMirror(ctx context.Context, remote string) (lease *repokeeper.Lease, ok bool) {
 	d.mu.RLock()
 	keeper := d.repoKeeper
 	d.mu.RUnlock()
 	if keeper == nil {
-		return "", false
+		return nil, false
 	}
 	return keeper.Acquire(ctx, remote)
 }
@@ -2649,9 +2656,17 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	d.mu.Lock()
 	gw := d.gateway
 	d.gateway = nil
+	keeper := d.repoKeeper
+	d.repoKeeper = nil
 	d.mu.Unlock()
 	if gw != nil {
 		_ = gw.Stop(ctx)
+	}
+	// Release the keeper's store root handle. Outstanding leases stay
+	// valid until their own Release; no new Acquire can arrive after
+	// the state below publishes Stopped.
+	if keeper != nil {
+		_ = keeper.Close()
 	}
 
 	d.lifecycleMu.Lock()

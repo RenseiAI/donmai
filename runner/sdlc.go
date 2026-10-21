@@ -1,5 +1,7 @@
 package runner
 
+import "log/slog"
+
 // SDLC status mappings + post-session transition decision.
 //
 // This file ports the Linear status-mapping tables from the legacy TS
@@ -192,7 +194,13 @@ func isResultSensitive(workType string, role ...string) bool {
 	if IsKnownWorkType(workType) || len(role) == 0 {
 		return resultSensitiveWorkTypes[workType]
 	}
-	parsed, _ := ParseWorkTypeRole(role[0])
+	parsed, valid := ParseWorkTypeRole(role[0])
+	if !valid {
+		if unrecognizedWorkTypeRole(workType, role[0]) {
+			slog.Warn("unrecognized workTypeRole", "workType", workType, "workTypeRole", role[0])
+		}
+		return false
+	}
 	return parsed == WorkTypeRoleInflight || parsed == WorkTypeRoleReview
 }
 

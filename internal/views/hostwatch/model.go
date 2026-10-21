@@ -504,6 +504,8 @@ func (c *SessionCard) retainLegacyFolded(prev SessionCard) {
 	c.Observed = prev.Observed
 	c.LastWorkAt = prev.LastWorkAt
 	c.LastOutputAt = prev.LastOutputAt
+	c.streamTicks = prev.streamTicks
+	c.streamingAt = prev.streamingAt
 	c.ActualModel = prev.ActualModel
 	c.ActualModelProvider = prev.ActualModelProvider
 	c.ActualModelVersion = prev.ActualModelVersion
@@ -559,6 +561,16 @@ func (m *Model) foldMetrics(ev TailEvent) {
 	}
 	live := !ev.Replay
 	switch e := ev.Event.(type) {
+	case agent.SystemEvent:
+		if live && e.Subtype == agent.SystemSubtypeStreamProgress {
+			c.streamTicks++
+			c.streamingAt = ev.EventAt()
+		}
+	case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent,
+		agent.ResultEvent, agent.ErrorEvent:
+		c.streamTicks, c.streamingAt = 0, time.Time{} // content ends the stream
+	}
+	switch e := ev.Event.(type) {
 	case agent.ToolUseEvent:
 		c.ToolCalls++
 		c.LastTool = truncateRunes(cleanText(toolUseSummary(e)), maxActivityRunes)
@@ -611,6 +623,16 @@ func (m *Model) foldMetrics(ev TailEvent) {
 			c.ActualModelProvider = e.ObservedModel.Provider
 			c.ActualModelVersion = e.ObservedModel.Version
 		}
+		// An interactive terminal session's journal holds only system
+		// notices; without folding them into activity text the card's
+		// activity row falls back to the runner's CurrentStep ("spawning"
+		// until the runner advances it) for the whole session. Fold the
+		// lifecycle notices into human-readable activity, mirroring the
+		// running → stopped step transitions, so the card reflects the
+		// current state even when no agent event stream exists.
+		if text := interactiveLifecycleActivity(e); text != "" {
+			c.LastActivity = truncateRunes(text, maxActivityRunes)
+		}
 		if live {
 			c.LastOutputAt = ev.EventAt()
 		}
@@ -660,6 +682,26 @@ func (m *Model) foldMetrics(ev TailEvent) {
 		if live {
 			c.LastOutputAt = ev.EventAt()
 		}
+	}
+}
+
+// interactiveLifecycleActivity renders an interactive session's lifecycle
+// SystemEvent notice as card activity text. Empty for every other notice:
+// only the lifecycle transitions name the session state, so only they can
+// stand in for activity when the journal carries no agent event stream.
+func interactiveLifecycleActivity(e agent.SystemEvent) string {
+	switch e.Subtype {
+	case "interactive-session-started":
+		return "interactive session running"
+	case "interactive-initial-prompt-delivered":
+		return "initial prompt delivered"
+	case "interactive-session-ended":
+		if msg := cleanText(e.Message); msg != "" {
+			return truncateRunes(msg, maxActivityRunes)
+		}
+		return "interactive session ended"
+	default:
+		return ""
 	}
 }
 

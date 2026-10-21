@@ -509,7 +509,12 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 		Timeout:      piSelfTestTimeout,
 		CacheDir:     dirs.cacheDir,
 	}); err != nil {
-		return nil, fmt.Errorf("%w: pi confinement self-test: %v", agent.ErrSpawnFailed, err)
+		// %w twice: the spawn failure for errors.Is and the confinement
+		// refusal for confinement.ReasonOf. A host that cannot confine
+		// (user namespaces blocked, no launcher, no Landlock stage) must
+		// refuse with its closed reason, never with an untyped string:
+		// callers branch on the reason, and the detail is display-only.
+		return nil, fmt.Errorf("%w: pi confinement self-test: %w", agent.ErrSpawnFailed, err)
 	}
 	piConfinerCache.Lock()
 	piConfinerCache.entries[key] = &piConfinerEntry{confiner: c, digest: digest}
