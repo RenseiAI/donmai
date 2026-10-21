@@ -9,21 +9,23 @@ const (
 	signalGuardWorktreeEnv     = "DONMAI_SESSION_WORKTREE"
 	signalGuardWorkareaRootEnv = "DONMAI_SESSION_WORKAREA_ROOT"
 	signalGuardProcessGroupEnv = "DONMAI_SESSION_PGID"
+	signalGuardDirEnv          = "DONMAI_SIGNAL_GUARD_DIR"
 	signalGuardEventLogEnv     = "DONMAI_SIGNAL_GUARD_EVENT_LOG"
-	signalGuardDirName         = ".agent/signal-guard"
+	signalGuardPGIDFileName    = "session.pgid"
 )
 
 type signalGuardLayout struct {
 	dir      string
 	eventLog string
+	pgidFile string
 	pkill    string
 	killall  string
 }
 
-func installSignalGuard(worktreePath string) (signalGuardLayout, error) {
+func installSignalGuard() (signalGuardLayout, error) {
 	return signalGuardLayout{}, nil
 }
 
-func signalGuardEnv(env map[string]string, layout signalGuardLayout, workareaRoot string, pgid int) map[string]string {
+func signalGuardEnv(env map[string]string, layout signalGuardLayout, worktree string, workareaRoot string) map[string]string {
 	return env
 }

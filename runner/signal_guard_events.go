@@ -35,13 +35,15 @@ func SignalGuardRefusedEvent(line string) (agent.SystemEvent, bool) {
 // poster forwards as a context marker) and is mirrored to events.jsonl for
 // audit parity with the other runner-emitted markers. The log is removed
 // after a successful drain so a retried session does not re-report; both legs
-// are best-effort and never fail the run.
-func (r *Runner) reportSignalGuardRefusals(ctx context.Context, worktreePath string, sink activitySink) {
-	if worktreePath == "" || sink == nil {
+// are best-effort and never fail the run. eventsDir is the runner-owned
+// state directory the events.jsonl mirror lands in (never the session
+// checkout: in a read-only negotiated workarea the runner must not write
+// into the selected repository).
+func (r *Runner) reportSignalGuardRefusals(ctx context.Context, layout signalGuardLayout, eventsDir string, sink activitySink) {
+	if layout.dir == "" || layout.eventLog == "" || sink == nil {
 		return
 	}
-	logPath := filepath.Join(worktreePath, signalGuardDirName, "refusals.log")
-	body, err := os.ReadFile(logPath) //nolint:gosec // G304: runner-owned session path, never session wire input.
+	body, err := os.ReadFile(layout.eventLog) //nolint:gosec // G304: runner-owned session path, never session wire input.
 	if err != nil {
 		return
 	}
@@ -53,11 +55,11 @@ func (r *Runner) reportSignalGuardRefusals(ctx context.Context, worktreePath str
 		}
 		sink.Send(ctx, ev)
 		if encoded, merr := agent.MarshalEvent(ev); merr == nil {
-			r.appendJSONLLine(filepath.Join(worktreePath, state.AgentDirName, "events.jsonl"), encoded)
+			r.appendJSONLLine(filepath.Join(eventsDir, state.AgentDirName, "events.jsonl"), encoded)
 		}
 		reported = true
 	}
 	if reported {
-		_ = os.Remove(logPath)
+		_ = os.Remove(layout.eventLog)
 	}
 }

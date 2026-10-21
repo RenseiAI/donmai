@@ -15,5 +15,5 @@ func chainOnProcessSpawned(existing func(pid int), after func(pid int)) func(pid
 	}
 }
 
-func (r *Runner) recordSessionProcessGroup(statePath, sessionID string, pid int, specEnv map[string]string) {
+func (r *Runner) recordSessionProcessGroup(statePath, sessionID string, pid int, guardDir string) {
 }
