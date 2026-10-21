@@ -10,6 +10,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.83 — 2026-10-21
+
+### Chores
+
+- Hold durable output batches on the adoption gate during re-adoption
+- Report the host CLI login check on the heartbeat quota field
+- Revert "Hold durable output batches on the adoption gate during re-adoption"
+- Interactive terminal mode for the Muse harness
+- Render stream progress as an in-place indicator, not lines
+- Hold durable output batches on carrier install during re-adoption
+- Pin role forwarding at every completion decision point
+- Target session backstop push-back at the configured repository
+- End option parsing before the positional PTY seed prompt
+- Report the serving provider and attempts per model call
+- Refuse gateway pi sessions with no configured context window
+- Harden keeper mirror store: poison refusal, credential-free argv, cross-process locks and leases
+- Linux seat refusal proof for pi harness under mount-namespace backend
+- Runner asks the platform for the provider by default
+- Advance interactive session lifecycle past spawning
+- Encode interactive launch strings as valid TOML basic strings
+- Provision live-binary adaptation probes for the pi harness
+- Render the tool lookup cache as an exact file allow
+- Harden restore ledger sidecars against symlink redirection
+- Print prompt refusal code, reason and next step instead of bare conflict
+- Runner defers failure-side tracker transition for retry-eligible attempts
+- Clamp dispatched budget durations through one shared helper
+- Cap proactive token-refresh waits and gate refresh on wall-clock expiry
+- Name the lock-refresh status in lost-ownership results; count step-heartbeat auth rejections
+- Tick the hanging-CLI heartbeat once before forking the helper
+
 ## v0.72.82 — 2026-10-19
 
 ### Features
