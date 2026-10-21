@@ -680,6 +680,14 @@ func TestEventMappingTable(t *testing.T) {
 			wantContext: "signalGuardRefused=refused",
 		},
 		{
+			name:        "System signal guard degraded -> context with fixed content",
+			event:       agent.SystemEvent{Subtype: "signal_guard_degraded", Message: "signal guard unavailable; pattern kills are unscoped for this run. Kill by PID."},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "signal guard unavailable; pattern kills are unscoped",
+			wantContext: "signalGuardDegraded=degraded",
+		},
+		{
 			name:     "System signal guard refused empty message -> skipped",
 			event:    agent.SystemEvent{Subtype: "signal_guard_refused", Message: "  \n\t"},
 			wantSent: false,

@@ -799,6 +799,16 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 				out.ContextValue = SignalGuardRefusedContextValue
 				return out, true
 			}
+		case signalGuardDegradedSubtype:
+			// The session's guard install failed: the run proceeded with
+			// an unguarded PATH, so pattern kills were unscoped. Fixed
+			// content (never the free-form Message) keeps the marker
+			// safe to forward.
+			out.Type = "context"
+			out.Content = signalGuardDegradedContent
+			out.ContextKey = SignalGuardDegradedContextKey
+			out.ContextValue = SignalGuardDegradedContextValue
+			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
 		// command_progress, diff_updated, compaction, stream progress, and
@@ -886,6 +896,23 @@ const SignalGuardRefusedContextKey = "signalGuardRefused"
 // SignalGuardRefusedContextValue is the fixed contextValue of a
 // signal-guard refusal marker.
 const SignalGuardRefusedContextValue = "refused"
+
+// signalGuardDegradedSubtype mirrors runner.SystemSubtypeSignalGuardDegraded
+// as a literal, for the same import-cycle reason as above.
+const signalGuardDegradedSubtype = "signal_guard_degraded"
+
+// signalGuardDegradedContent is the fixed activity content for a
+// signal-guard degraded marker: the install failed, so the run proceeded
+// unguarded.
+const signalGuardDegradedContent = "signal guard unavailable; pattern kills are unscoped for this run"
+
+// SignalGuardDegradedContextKey is the contextKey a signal-guard degraded
+// marker carries.
+const SignalGuardDegradedContextKey = "signalGuardDegraded"
+
+// SignalGuardDegradedContextValue is the fixed contextValue of a
+// signal-guard degraded marker.
+const SignalGuardDegradedContextValue = "degraded"
 
 // toolCallBoundsNotConfiguredContent is the fixed text forwarded when the
 // session carries no per-call bound; toolCallBoundsContentPrefix prefixes

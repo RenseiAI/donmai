@@ -465,6 +465,10 @@ func TestKillallGuardNameForms(t *testing.T) {
 		{name: "signal name", args: func(comm string) []string { return []string{"-9", comm} }, wantOwn: "dead", wantRC: 0},
 		{name: "trailing unknown scoped", args: func(comm string) []string { return []string{comm, "nosuchproc990"} }, wantOwn: "dead", wantRC: 0},
 		{name: "all unknown no match", args: func(_ string) []string { return []string{"nosuch1", "nosuch2"} }, wantOwn: "alive", wantRC: 1},
+		// A quoted multi-word name is one operand that matches nothing: it
+		// must not split into two lookups (the first would kill the
+		// session's own process) nor glob-expand. Both stay alive.
+		{name: "spaced name matches nothing", args: func(comm string) []string { return []string{comm + " with-space"} }, wantOwn: "alive", wantRC: 1},
 		{name: "signal flag refused", args: func(comm string) []string { return []string{"-s", "KILL", comm} }, wantOwn: "alive", wantRC: 1},
 		{name: "user flag refused", args: func(comm string) []string { return []string{"-u", user, comm} }, wantOwn: "alive", wantRC: 1},
 		{name: "quiet flag refused", args: func(comm string) []string { return []string{"-q", comm} }, wantOwn: "alive", wantRC: 1},
@@ -579,6 +583,82 @@ func TestSignalGuardMissingToolsRefusesClosed(t *testing.T) {
 				t.Fatalf("refusal log missing the fail-closed line: %q", logBody)
 			}
 		})
+	}
+}
+
+// TestSignalGuardFailingPgrepRefusesClosed pins the empty-match fail-closed
+// leg against the exact B2 fallback: when the guard's own pgrep fails (not
+// merely absent), the guard must refuse closed without re-execing the real
+// tool. A stub pgrep that exits 2 reaches the empty-match leg past the
+// missing-tools check; reverting that leg to `real_tool "$@"` would kill
+// both sleepers and stay GREEN without this pin.
+func TestSignalGuardFailingPgrepRefusesClosed(t *testing.T) {
+	t.Parallel()
+	guardTestTools(t)
+
+	for _, mode := range []string{"pkill", "killall"} {
+		t.Run(mode, func(t *testing.T) {
+			worktree := t.TempDir()
+			outside := t.TempDir()
+			name := "gFp" + mode + "1"
+			own := startGuardSleeper(t, worktree, name, false)
+			outsider := startGuardSleeper(t, outside, name, false)
+
+			layout := installTestGuard(t)
+			stubDir := t.TempDir()
+			stub := "#!/bin/sh\nexit 2\n"
+			if err := os.WriteFile(stubDir+"/pgrep", []byte(stub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
+				t.Fatal(err)
+			}
+			extra := map[string]string{"DONMAI_SIGNAL_GUARD_TOOL_DIRS": stubDir + " /usr/bin /bin /usr/sbin /sbin"}
+			bin := layout.pkill
+			args := []string{"-f", name}
+			if mode == "killall" {
+				bin = layout.killall
+				args = []string{guardSleeperComm(t, own)}
+			}
+			kill := exec.Command(bin, args...) //nolint:gosec // G204: test fixture, the marker comes from our own started process.
+			kill.Dir = worktree
+			kill.Env = guardTestEnv(layout, worktree, extra)
+			out, err := kill.CombinedOutput()
+			if err == nil {
+				t.Fatalf("guard %s with failing pgrep succeeded (output %q), want refusal", mode, out)
+			}
+			assertGuardAlive(t, own, "session process")
+			assertGuardAlive(t, outsider, "outsider process")
+			if !strings.Contains(string(out), "process match lookup failed") {
+				t.Fatalf("stderr missing the fail-closed line: %q", out)
+			}
+			if logBody := readRefusals(t, layout); !strings.Contains(logBody, "process match lookup failed") {
+				t.Fatalf("refusal log missing the fail-closed line: %q", logBody)
+			}
+		})
+	}
+}
+
+// TestKillallGuardUnknownDoesNotReexec pins that an all-unknown killall
+// exits 1 without re-execing the real tool: the real killall reports "No
+// matching processes" on stderr, while the guard stays silent. Reverting
+// the empty-match leg to `real_tool "$@"` would print that line and stay
+// GREEN without this pin.
+func TestKillallGuardUnknownDoesNotReexec(t *testing.T) {
+	t.Parallel()
+	guardTestTools(t)
+
+	worktree := t.TempDir()
+	layout := installTestGuard(t)
+	kill := exec.Command(layout.killall, "nosuchA991", "nosuchB992") //nolint:gosec // G204: test fixture, names are hard-coded literals plus the installed guard path.
+	kill.Dir = worktree
+	kill.Env = guardTestEnv(layout, worktree, nil)
+	out, err := kill.CombinedOutput()
+	if err == nil {
+		t.Fatalf("guard killall with unknown names succeeded (output %q), want exit 1", out)
+	}
+	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
+		t.Fatalf("exit = %v (output %q), want 1", err, out)
+	}
+	if strings.Contains(strings.ToLower(string(out)), "matching") || strings.Contains(strings.ToLower(string(out)), "no process") {
+		t.Fatalf("guard re-execed the real tool (output %q), want silent fail-closed", out)
 	}
 }
 

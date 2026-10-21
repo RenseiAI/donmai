@@ -328,24 +328,80 @@ pgrep_flags=""
 [ "$full" = "1" ] && pgrep_flags="$pgrep_flags -f"
 [ "$exact" = "1" ] && pgrep_flags="$pgrep_flags -x"
 
+pgrep_failed=0
 if [ "$MODE" = "pkill" ]; then
   # shellcheck disable=SC2086
-  matched="$("$PGREP" $pgrep_flags -- "$pattern" 2>/dev/null)" || matched=""
+  matched="$("$PGREP" $pgrep_flags -- "$pattern" 2>/dev/null)"
+  _pgrep_rc=$?
+  if [ "$_pgrep_rc" -ne 0 ]; then
+    matched=""
+    if [ "$_pgrep_rc" -gt 1 ]; then
+      pgrep_failed=1
+    fi
+  fi
 else
   # Every name operand is scoped, not just the last: a trailing unknown
   # name must not route the invocation to the unscoped real tool.
+  # Names are re-derived from "$@" quoted (one iteration per operand,
+  # empty preserved) instead of the space-joined $operands string, which
+  # would split a quoted "a b" into two lookups and glob-expand "*".
   matched=""
-  for name in $operands; do
-    if [ -z "$name" ]; then
-      refuse_closed "an empty process name would match every process."
+  _ended2=0
+  for _a in "$@"; do
+    if [ "$_ended2" = "1" ]; then
+      _name="$_a"
+      if [ -z "$_name" ]; then
+        refuse_closed "an empty process name would match every process."
+      fi
+      _m="$("$PGREP" -x -- "$_name" 2>/dev/null)"
+      _rc=$?
+      if [ "$_rc" -ne 0 ]; then
+        _m=""
+        if [ "$_rc" -gt 1 ]; then
+          pgrep_failed=1
+        fi
+      fi
+      [ -n "$_m" ] && matched="$matched $_m"
+      continue
     fi
-    # shellcheck disable=SC2086
-    _m="$("$PGREP" -x -- "$name" 2>/dev/null)" || _m=""
-    [ -n "$_m" ] && matched="$matched $_m"
+    case "$_a" in
+      --) _ended2=1 ;;
+      -)
+        _m="$("$PGREP" -x -- "-" 2>/dev/null)"
+        _rc=$?
+        if [ "$_rc" -ne 0 ]; then
+          _m=""
+          if [ "$_rc" -gt 1 ]; then
+            pgrep_failed=1
+          fi
+        fi
+        [ -n "$_m" ] && matched="$matched $_m"
+        ;;
+      -*) ;; # Signal spec (unmodelled flags already refused above): skip.
+      *)
+        _name="$_a"
+        _m="$("$PGREP" -x -- "$_name" 2>/dev/null)"
+        _rc=$?
+        if [ "$_rc" -ne 0 ]; then
+          _m=""
+          if [ "$_rc" -gt 1 ]; then
+            pgrep_failed=1
+          fi
+        fi
+        [ -n "$_m" ] && matched="$matched $_m"
+        ;;
+    esac
   done
 fi
 
 if [ -z "$matched" ]; then
+  if [ "$pgrep_failed" = "1" ]; then
+    # The lookup itself failed (not merely no match): fail closed with a
+    # refusal rather than silently reporting no-match. Re-execing the real
+    # tool here would signal out-of-scope processes through an unscopable
+    # match.
+    refuse_closed "process match lookup failed."
+  fi
   # Nothing matched: the real tool's own no-match status, without
   # signalling anyone. Never re-exec the real tool here (see header).
   exit 1

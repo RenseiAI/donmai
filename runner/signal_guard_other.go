@@ -11,6 +11,7 @@ const (
 	signalGuardProcessGroupEnv = "DONMAI_SESSION_PGID"
 	signalGuardDirEnv          = "DONMAI_SIGNAL_GUARD_DIR"
 	signalGuardEventLogEnv     = "DONMAI_SIGNAL_GUARD_EVENT_LOG"
+	signalGuardDegradedEnv     = "DONMAI_SIGNAL_GUARD_DEGRADED"
 	signalGuardPGIDFileName    = "session.pgid"
 )
 
@@ -20,6 +21,9 @@ type signalGuardLayout struct {
 	pgidFile string
 	pkill    string
 	killall  string
+	// degraded marks a session whose guard install failed: the drain
+	// reports it as a session-visible event instead of staying silent.
+	degraded bool
 }
 
 func installSignalGuard() (signalGuardLayout, error) {
@@ -27,5 +31,11 @@ func installSignalGuard() (signalGuardLayout, error) {
 }
 
 func signalGuardEnv(env map[string]string, layout signalGuardLayout, worktree string, workareaRoot string) map[string]string {
+	if layout.degraded {
+		if env == nil {
+			env = map[string]string{}
+		}
+		env[signalGuardDegradedEnv] = "1"
+	}
 	return env
 }

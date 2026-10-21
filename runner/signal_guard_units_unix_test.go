@@ -193,6 +193,54 @@ func TestSignalGuardProtocolPartialMentionsKillByPID(t *testing.T) {
 	if got := injectSignalGuardProtocolPartial("base"); !strings.Contains(got, "base") || !strings.Contains(got, "Kill by PID") {
 		t.Fatalf("protocol partial did not append: %q", got)
 	}
+	// F3: the scoped brief names the residual bypass doors so an agent that
+	// uses one does not believe it is scoped.
+	for _, want := range []string{"/usr/bin/pkill", "login shells", "pgrep"} {
+		if !strings.Contains(injectSignalGuardProtocolPartial(""), want) {
+			t.Fatalf("scoped brief omits bypass door %q", want)
+		}
+	}
+	// F2: the degraded brief (install failure) promises nothing scoped.
+	if got := injectSignalGuardDegradedProtocolPartial(""); !strings.Contains(got, "UNSCOPED") || !strings.Contains(got, "Kill by PID") {
+		t.Fatalf("degraded brief must warn unscoped: %q", got)
+	}
+}
+
+// TestSignalGuardEnvMarksDegraded pins the F2 fail-safe: an install failure
+// stamps a degraded marker instead of leaving the session silently
+// unguarded. Deleting the stamp (or ignoring it in the brief/drain) leaves
+// the session with the scoped promise and no signal, and this test goes red.
+func TestSignalGuardEnvMarksDegraded(t *testing.T) {
+	t.Parallel()
+	env := signalGuardEnv(map[string]string{"PATH": "/usr/bin:/bin"}, signalGuardLayout{degraded: true}, t.TempDir(), "")
+	if env[signalGuardDegradedEnv] != "1" {
+		t.Fatalf("degraded layout did not stamp %s", signalGuardDegradedEnv)
+	}
+	if env["PATH"] != "/usr/bin:/bin" {
+		t.Fatalf("degraded PATH = %q, want it untouched (no guard dir to lead)", env["PATH"])
+	}
+}
+
+// TestReportSignalGuardDegradedDrainsEvent pins the F2 drain: a degraded
+// layout reports a session-visible degraded event (and mirrors it), so the
+// install-failure outage is not silent.
+func TestReportSignalGuardDegradedDrainsEvent(t *testing.T) {
+	t.Parallel()
+	eventsDir := t.TempDir()
+	sink := &recordingSink{}
+	r := minimalRunner(t)
+	r.reportSignalGuardRefusals(context.Background(), signalGuardLayout{degraded: true}, eventsDir, sink)
+	if len(sink.events) != 1 {
+		t.Fatalf("degraded drain reported %d events, want 1", len(sink.events))
+	}
+	sys, ok := sink.events[0].(agent.SystemEvent)
+	if !ok || sys.Subtype != SystemSubtypeSignalGuardDegraded {
+		t.Fatalf("event = %#v, want a signal_guard_degraded SystemEvent", sink.events[0])
+	}
+	mirror, err := os.ReadFile(filepath.Join(eventsDir, ".agent", "events.jsonl"))
+	if err != nil || !strings.Contains(string(mirror), SystemSubtypeSignalGuardDegraded) {
+		t.Fatalf("events.jsonl mirror missing the degraded event: %v %q", err, mirror)
+	}
 }
 
 func TestRecordSessionProcessGroupPersistsGroup(t *testing.T) {

@@ -35,6 +35,11 @@ const (
 	// log the guard writes each refusal to. The runner drains it into
 	// typed activity events after the session ends.
 	signalGuardEventLogEnv = "DONMAI_SIGNAL_GUARD_EVENT_LOG"
+	// signalGuardDegradedEnv marks a session whose guard install failed:
+	// the session PATH is unguarded and pattern kills are unscoped. The
+	// agent brief conditions on it and the drain reports a session-visible
+	// degraded event so the outage is not silent.
+	signalGuardDegradedEnv = "DONMAI_SIGNAL_GUARD_DEGRADED"
 	// signalGuardPGIDFileName is the file in the guard directory that
 	// carries the session's recorded process-group id, written by the
 	// runner when the harness pid is observed.
@@ -58,6 +63,11 @@ type signalGuardLayout struct {
 	// pkill and killall are the guard script installed under both names.
 	pkill   string
 	killall string
+	// degraded marks a session whose guard install failed: no guard
+	// directory leads PATH and pattern kills are unscoped. The env
+	// carries DONMAI_SIGNAL_GUARD_DEGRADED=1 and the drain reports a
+	// session-visible degraded event.
+	degraded bool
 }
 
 // installSignalGuard writes the runner-provided pkill/killall guard into
@@ -102,6 +112,10 @@ func installSignalGuard() (signalGuardLayout, error) {
 func signalGuardEnv(env map[string]string, layout signalGuardLayout, worktree string, workareaRoot string) map[string]string {
 	if env == nil {
 		env = map[string]string{}
+	}
+	if layout.degraded {
+		env[signalGuardDegradedEnv] = "1"
+		return env
 	}
 	if layout.dir == "" || worktree == "" {
 		return env

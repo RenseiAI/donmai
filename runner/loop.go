@@ -748,15 +748,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// processes. The guards ship with the runner (go:embed) and only
 	// signal processes inside this session's worktree (or workarea
 	// root); the rest are refused and reported as typed activity events
-	// at teardown. Best-effort: an install failure is logged and the run
-	// continues with an unguarded PATH rather than failing the session.
+	// at teardown. Best-effort: an install failure is logged, the session
+	// env is stamped degraded (DONMAI_SIGNAL_GUARD_DEGRADED=1), and the run
+	// continues with an unguarded PATH rather than failing the session; the
+	// drain reports a session-visible degraded event so the outage is not
+	// silent.
 	signalGuard, guardErr := installSignalGuard()
 	if guardErr != nil {
 		r.logger.Warn("signal guard install failed; pattern kills are unscoped",
 			"sessionId", qw.SessionID,
 			"err", guardErr,
 		)
-		signalGuard = signalGuardLayout{}
+		signalGuard = signalGuardLayout{degraded: true}
 	}
 	if signalGuard.dir != "" {
 		// The guard directory lives only for this run: remove it on
@@ -942,7 +945,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// no-op when the block is absent (byte-identical prompt to today).
 	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
-	composition.HarnessProtocol = injectSignalGuardProtocolPartial(composition.HarnessProtocol)
+	if signalGuard.degraded {
+		composition.HarnessProtocol = injectSignalGuardDegradedProtocolPartial(composition.HarnessProtocol)
+	} else {
+		composition.HarnessProtocol = injectSignalGuardProtocolPartial(composition.HarnessProtocol)
+	}
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
 	if qw.isInteractive() {

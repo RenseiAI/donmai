@@ -20,6 +20,18 @@ import (
 // prefix plus that line.
 const SystemSubtypeSignalGuardRefused = "signal_guard_refused"
 
+// SystemSubtypeSignalGuardDegraded is the SystemEvent subtype the runner
+// emits when the session's pkill/killall guard install failed: the session
+// ran with an unguarded PATH, so pattern kills were unscoped. It makes the
+// install-failure outage session-visible instead of silent (the agent brief
+// promises scoped kills). The activity poster forwards it as a context
+// marker with fixed content.
+const SystemSubtypeSignalGuardDegraded = "signal_guard_degraded"
+
+// SignalGuardDegradedMessage is the fixed message of the degraded event:
+// it names the outage without carrying free-form text.
+const SignalGuardDegradedMessage = "signal guard unavailable; pattern kills are unscoped for this run. Kill by PID."
+
 // SignalGuardRefusedEvent builds the refusal event for one guard refusal
 // line. Empty lines produce no event.
 func SignalGuardRefusedEvent(line string) (agent.SystemEvent, bool) {
@@ -40,7 +52,18 @@ func SignalGuardRefusedEvent(line string) (agent.SystemEvent, bool) {
 // checkout: in a read-only negotiated workarea the runner must not write
 // into the selected repository).
 func (r *Runner) reportSignalGuardRefusals(ctx context.Context, layout signalGuardLayout, eventsDir string, sink activitySink) {
-	if layout.dir == "" || layout.eventLog == "" || sink == nil {
+	if sink == nil {
+		return
+	}
+	if layout.degraded {
+		ev := agent.SystemEvent{Subtype: SystemSubtypeSignalGuardDegraded, Message: SignalGuardDegradedMessage}
+		sink.Send(ctx, ev)
+		if encoded, merr := agent.MarshalEvent(ev); merr == nil {
+			r.appendJSONLLine(filepath.Join(eventsDir, state.AgentDirName, "events.jsonl"), encoded)
+		}
+		return
+	}
+	if layout.dir == "" || layout.eventLog == "" {
 		return
 	}
 	body, err := os.ReadFile(layout.eventLog) //nolint:gosec // G304: runner-owned session path, never session wire input.
