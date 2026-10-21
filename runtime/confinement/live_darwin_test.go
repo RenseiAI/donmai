@@ -1247,7 +1247,7 @@ func TestSeatbelt_ReadScopeDeveloperShims(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, got := runRewritten(t, plan, w.mut, env, `(subpath "`+filepath.Join(dir, "xcrun_db")+`")`, "", "/usr/bin/cc", "--print-prog-name", "dsymutil")
+		_, got := runRewritten(t, plan, w.mut, env, `(literal "`+filepath.Join(dir, "xcrun_db")+`")`, "", "/usr/bin/cc", "--print-prog-name", "dsymutil")
 		if strings.TrimSpace(got) == want {
 			t.Fatalf("with the xcrun cache unreadable, cc --print-prog-name still answered cleanly; the test does not discriminate")
 		}

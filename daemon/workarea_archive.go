@@ -181,6 +181,9 @@ type WorkareaArchiveRegistry struct {
 	acquisitions   *workarea.AcquisitionStore
 	worktreeParent string
 	archiveHook    func(string) error
+	// now is the restore clock; nil means time.Now. Tests pin it so the
+	// fresh restore ID (and its sidecar name) is predictable.
+	now func() time.Time
 
 	mu          sync.Mutex
 	authorityMu sync.Mutex
@@ -260,6 +263,13 @@ func NewWorkareaArchiveRegistry(opts WorkareaArchiveOptions) *WorkareaArchiveReg
 		worktreeParent: opts.WorktreeParent,
 		archiveHook:    opts.ArchiveHook,
 	}
+}
+
+func (r *WorkareaArchiveRegistry) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 func (r *WorkareaArchiveRegistry) acquisitionAuthority() (*workarea.AcquisitionStore, error) {
@@ -913,6 +923,54 @@ func (r *WorkareaArchiveRegistry) GetV1(id string) (*afclient.WorkareaV1, error)
 	return &ready, nil
 }
 
+// readRestoreSidecar reads one restore ledger sidecar through the pinned
+// restored-dir descriptor without following symbolic links: the entry must
+// be a regular file, so a planted link (or fifo) beside a restore can
+// neither redirect the read outside the restored dir nor stall the daemon.
+// A missing entry reports fs.ErrNotExist; any other unreadable or untrusted
+// entry reports a "read restore sidecar" error the list projection skips.
+func readRestoreSidecar(restoredRoot *os.Root, restoreID, sidecarName string) ([]byte, error) {
+	info, err := restoredRoot.Lstat(sidecarName)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("read restore sidecar %q: not a regular file", restoreID)
+	}
+	data, err := restoredRoot.ReadFile(sidecarName)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// writeRestoreSidecar commits one restore ledger sidecar with exclusive
+// creation through the pinned restored-dir descriptor: the entry must not
+// already exist (a planted symlink at the fresh sidecar name fails creation
+// instead of being followed), and the write is synced before close so the
+// ledger entry is durable once reported.
+func writeRestoreSidecar(restoredRoot *os.Root, restoreID, sidecarName string, data []byte) error {
+	if !validArchiveID(restoreID) || sidecarName != restoreID+".json" {
+		return fmt.Errorf("restore: invalid sidecar name")
+	}
+	file, err := restoredRoot.OpenFile(sidecarName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("restore: create sidecar %q: %w", restoreID, err)
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("restore: write sidecar %q: %w", restoreID, err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("restore: sync sidecar %q: %w", restoreID, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("restore: close sidecar %q: %w", restoreID, err)
+	}
+	return nil
+}
+
 // restoreLedgerSidecar is the durable shape RestoreV1 commits beside each
 // legacy-flat restore at <restoredDir>/<restoreID>.json. The reader below
 // consumes exactly this shape; the writer stays inline in RestoreV1 so the
@@ -982,7 +1040,7 @@ func (r *WorkareaArchiveRegistry) restoredLegacyV1(restoreID string) (afclient.W
 		return afclient.WorkareaV1{}, nil, false, fmt.Errorf("read restore sidecar %q: %w", restoreID, err)
 	}
 	defer func() { _ = restoredRoot.Close() }()
-	data, err := restoredRoot.ReadFile(sidecarName)
+	data, err := readRestoreSidecar(restoredRoot, restoreID, sidecarName)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return afclient.WorkareaV1{}, nil, false, nil
@@ -1284,7 +1342,7 @@ func (r *WorkareaArchiveRegistry) RestoreV1(
 	// Generate a new id — derive from the archive id + timestamp so
 	// operators can see the lineage at a glance and uniqueness is
 	// guaranteed under second-resolution.
-	now := time.Now().UTC()
+	now := r.clock().UTC()
 	newID := fmt.Sprintf("%s-restore-%d", archiveID, now.UnixNano())
 	restoredDir := r.restoredDir()
 	if err := os.MkdirAll(restoredDir, 0o700); err != nil {
@@ -1326,13 +1384,19 @@ func (r *WorkareaArchiveRegistry) RestoreV1(
 		Reason:        req.Reason,
 		RestoredAt:    now,
 	}
-	sidecarPath := filepath.Join(r.restoredDir(), newID+".json")
+	sidecarName := newID + ".json"
 	if data, err := json.MarshalIndent(&sidecar, "", "  "); err == nil {
-		// sidecarPath is composed from the registry's restored dir
-		// (configured at construction time) and a newID we just
-		// generated; not externally tainted, gosec's taint analyser
-		// flags it because filepath.Join's first arg is dynamic.
-		_ = os.WriteFile(sidecarPath, data, 0o600) //nolint:gosec
+		// The sidecar is created exclusively through the pinned
+		// restored-dir descriptor: a planted symlink at the fresh
+		// sidecar name is refused instead of followed, so the commit
+		// cannot be redirected outside the restored dir. The write
+		// stays best-effort — a failed commit only hides this restore
+		// from intoSessionIDInUse lookups.
+		if restoredRoot, openErr := os.OpenRoot(r.restoredDir()); openErr == nil {
+			writeErr := writeRestoreSidecar(restoredRoot, newID, sidecarName, data)
+			_ = restoredRoot.Close()
+			_ = writeErr
+		}
 	}
 
 	wa := manifestToWorkareaV1(archiveID, manifest, dest)
@@ -1852,7 +1916,9 @@ func validateArchiveRootInfo(info os.FileInfo) error {
 
 // intoSessionIDInUse scans previously-recorded restores for a sidecar
 // matching intoSessionID. Returns true with no error when at least one
-// matches.
+// matches. Entries are read through the pinned restored-dir descriptor
+// and must be regular files: a planted symlink or fifo beside a restore
+// is skipped instead of followed (or blocked on).
 func (r *WorkareaArchiveRegistry) intoSessionIDInUse(sessionID string) (bool, error) {
 	dir := r.restoredDir()
 	entries, err := os.ReadDir(dir)
@@ -1862,6 +1928,14 @@ func (r *WorkareaArchiveRegistry) intoSessionIDInUse(sessionID string) (bool, er
 		}
 		return false, fmt.Errorf("read restored dir: %w", err)
 	}
+	restoredRoot, err := os.OpenRoot(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read restored dir: %w", err)
+	}
+	defer func() { _ = restoredRoot.Close() }()
 	for _, ent := range entries {
 		if ent.IsDir() {
 			continue
@@ -1869,7 +1943,11 @@ func (r *WorkareaArchiveRegistry) intoSessionIDInUse(sessionID string) (bool, er
 		if !strings.HasSuffix(ent.Name(), ".json") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, ent.Name())) //nolint:gosec
+		restoreID := strings.TrimSuffix(ent.Name(), ".json")
+		if !validArchiveID(restoreID) {
+			continue
+		}
+		data, err := readRestoreSidecar(restoredRoot, restoreID, ent.Name())
 		if err != nil {
 			continue
 		}

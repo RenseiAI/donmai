@@ -80,6 +80,56 @@ func TestConfinerForSession_RequestWithoutBackendRefuses(t *testing.T) {
 	}
 }
 
+// unsupportedHostBackend is a backend whose startup check always fails,
+// standing in for a host that cannot confine (user namespaces blocked, no
+// launcher, no Landlock stage). Portable, so the refusal below is proven on
+// every OS, not only where the real backend exists.
+type unsupportedHostBackend struct{}
+
+func (unsupportedHostBackend) Name() confinement.BackendName {
+	return confinement.BackendLinuxMountNamespace
+}
+func (unsupportedHostBackend) Version() (string, error) { return "unsupported-v1", nil }
+func (unsupportedHostBackend) Check() error {
+	return &confinement.Error{Reason: confinement.ReasonNamespaceUnavailable, Detail: "user namespaces blocked"}
+}
+func (unsupportedHostBackend) Canonical(path string) (string, error) { return path, nil }
+func (unsupportedHostBackend) Apply(confinement.ApplyRequest) (confinement.Applied, error) {
+	return confinement.Applied{}, &confinement.Error{Reason: confinement.ReasonNamespaceUnavailable, Detail: "user namespaces blocked"}
+}
+
+// TestConfinerForSession_UnsupportedHostRefusesWithReason pins the clean
+// refusal on a host that cannot confine: a requested session is refused
+// with a spawn failure carrying the backend's closed reason (here
+// namespace_unavailable), never run unconfined and never flattened to an
+// untyped string. Callers branch on the reason; the detail is
+// display-only.
+//
+// RED: wrap the self-test error with %v instead of %w in ensurePiConfiner
+// and ReasonOf stops finding the reason here.
+func TestConfinerForSession_UnsupportedHostRefusesWithReason(t *testing.T) {
+	old := piConfinementBackend
+	piConfinementBackend = func() confinement.Backend { return unsupportedHostBackend{} }
+	t.Cleanup(func() { piConfinementBackend = old })
+	piConfinerCache.Lock()
+	piConfinerCache.entries = nil
+	piConfinerCache.Unlock()
+	dirs := piConfinementDirs{
+		profileDir: filepath.Join(t.TempDir(), "profiles"),
+		home:       t.TempDir(),
+		stateHome:  t.TempDir(),
+		scratchDir: t.TempDir(),
+	}
+	if err := os.MkdirAll(dirs.profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := &Provider{binary: "/bin/sh", opts: Options{RequireConfinement: true, confinementDirs: &dirs}}
+	_, err := p.confinerForSession(context.Background(), agent.Spec{Cwd: t.TempDir()})
+	if reason, ok := confinement.ReasonOf(err); !ok || reason != confinement.ReasonNamespaceUnavailable || !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("confinerForSession = %v, want a spawn failure carrying %s", err, confinement.ReasonNamespaceUnavailable)
+	}
+}
+
 // TestConfinerForSession_RequestWithoutWorkdirRefuses: a requested
 // confinement has nothing to confine without a working directory, and is
 // refused rather than dropped.

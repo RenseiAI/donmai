@@ -342,7 +342,7 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 //	AllowedTools       → --allowedTools <comma-separated>
 //	DisallowedTools    → --disallowedTools <comma-separated>
 //	SystemPromptAppend → --append-system-prompt <text>
-//	Prompt             → positional argument, ALWAYS LAST
+//	Prompt             → positional argument, ALWAYS LAST, preceded by `--`
 //
 // The allow/deny mapping is byte-identical to buildArgs' (see
 // cli_args.go) — one convention, two spawn modes. Before it existed the
@@ -383,6 +383,35 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 // (headless, one-shot, no session) which buildArgs uses. An empty prompt
 // starts the REPL bare, with no seeded message. The positional prompt must
 // stay LAST so it is never consumed as the value of a preceding flag.
+// claudeReservedSubcommands is the exact command list from `claude --help`
+// (Commands section, with `a|b` aliases expanded to both words). Commander
+// still matches the first operand against registered commands even after
+// `--` (observed: `claude -- auth` and `claude -- mcp` dispatch instead of
+// seeding a session), so a seed that is exactly one of these words would
+// start that subcommand instead of a session. Such a seed is prefixed with
+// a single space — the same minimal transform the pi harness uses for its
+// dash/at seeds — so the parser takes the prompt branch while the message
+// stays visibly unchanged. Any other seed passes through byte for byte.
+var claudeReservedSubcommands = map[string]struct{}{
+	"agents": {}, "attach": {}, "auth": {}, "auto-mode": {},
+	"doctor": {}, "gateway": {}, "import": {}, "install": {},
+	"logs": {}, "mcp": {}, "plugin": {}, "plugins": {},
+	"purge": {}, "respawn": {}, "rm": {}, "setup-token": {},
+	"stop": {}, "kill": {}, "ultrareview": {}, "update": {},
+	"upgrade": {},
+}
+
+// claudeSeedMessage neutralises a positional seed the claude CLI would
+// otherwise misread as a subcommand. Only an exact reserved word is
+// touched; every other seed (including dash-leading seeds, which `--`
+// already protects) passes through unchanged.
+func claudeSeedMessage(seed string) string {
+	if _, reserved := claudeReservedSubcommands[seed]; reserved {
+		return " " + seed
+	}
+	return seed
+}
+
 func interactiveArgs(spec agent.Spec) []string {
 	return interactiveArgsWith(spec, "", "")
 }
@@ -508,9 +537,16 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 		argv = append(argv, "--mcp-config", mcpConfigPath, "--strict-mcp-config")
 	}
 
-	// Positional prompt LAST — every flag-shaped argument precedes it.
+	// End option parsing before the positional seed: the REPL takes the
+	// seed positionally, so without this a seed starting with `-` parses
+	// as a flag. The marker alone does not stop a seed that is exactly a
+	// subcommand word — Commander still dispatches some operands after
+	// `--` — so exact reserved words ride through claudeSeedMessage above
+	// (single leading space) while every other seed passes through byte
+	// for byte. The seed is still appended LAST, as today. No seed means
+	// no trailing `--`.
 	if spec.Prompt != "" {
-		argv = append(argv, spec.Prompt)
+		argv = append(argv, "--", claudeSeedMessage(spec.Prompt))
 	}
 	return argv
 }

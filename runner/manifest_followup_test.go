@@ -309,6 +309,7 @@ const followUpRepository = "https://github.com/example/repo"
 type scriptedSession struct {
 	endpoint     *agent.EndpointBinding
 	workType     string
+	workTypeRole string
 	skipSteering bool
 	inject       string
 	// now, when set, replaces the runner's wall clock: Run stamps
@@ -470,6 +471,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub, Endpoint: cfg.endpoint},
 	}
 	qw.WorkType = cfg.workType
+	qw.WorkTypeRole = cfg.workTypeRole
 	qw.StageBudget = cfg.budget
 	qw.SeatBudget = cfg.seatBudget
 	qw.Delivery = cfg.delivery

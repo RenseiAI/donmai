@@ -1,5 +1,7 @@
 package runner
 
+import "log/slog"
+
 // Completion contracts.
 //
 // Typed declaration of what each work type must produce before a session
@@ -187,7 +189,13 @@ func GetCompletionContract(workType string, role ...string) (CompletionContract,
 	if len(role) == 0 {
 		return CompletionContract{}, false
 	}
-	parsed, _ := ParseWorkTypeRole(role[0])
+	parsed, valid := ParseWorkTypeRole(role[0])
+	if !valid {
+		if unrecognizedWorkTypeRole(workType, role[0]) {
+			slog.Warn("unrecognized workTypeRole", "workType", workType, "workTypeRole", role[0])
+		}
+		return CompletionContract{}, false
+	}
 	c, ok = contractForRole(parsed)
 	if ok {
 		c.WorkType = workType
@@ -244,7 +252,13 @@ func RequiresPRURL(workType string, role ...string) bool {
 // scraping prose.
 func RequiresReviewVerdict(workType string, role ...string) bool {
 	if !IsKnownWorkType(workType) && len(role) > 0 {
-		parsed, _ := ParseWorkTypeRole(role[0])
+		parsed, valid := ParseWorkTypeRole(role[0])
+		if !valid {
+			if unrecognizedWorkTypeRole(workType, role[0]) {
+				slog.Warn("unrecognized workTypeRole", "workType", workType, "workTypeRole", role[0])
+			}
+			return false
+		}
 		return parsed == WorkTypeRoleReview
 	}
 	switch workType {

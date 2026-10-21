@@ -667,3 +667,128 @@ func TestUsageFixture_AnthropicReasoningNotReported(t *testing.T) {
 		t.Errorf("calls/results = %d/%d; want 1/1", calls, results)
 	}
 }
+
+// TestMapEvent_TurnEndGatewayFinalProviderAndAttempts pins the per-call
+// serving report for a gateway-routed turn, driven by a RECORDED gateway
+// response: the turn_end message pi emitted for a turn it served through
+// the injected gateway provider (selected entry "donmai", wire served
+// model "served-model-id" differing from the requested id). The mapped
+// call reports the served model (ResponseModel) and one serving attempt.
+// ResponseModelProvider stays empty and System stays the configured
+// selection: the message's provider names the selected catalog entry —
+// the aggregator itself on an aggregator-routed session, never the
+// upstream behind it — and the LlmCallEvent contract reserves the
+// response-provider field for a provider the native response itself
+// identifies. The runner therefore sources its serving-provider report
+// from ResponseModelProvider, never from System.
+func TestMapEvent_TurnEndGatewayFinalProviderAndAttempts(t *testing.T) {
+	t.Parallel()
+
+	// Recorded shape: pi's turn_end for a turn served through the
+	// injected gateway provider (verified against the real binary: the
+	// stub answered the requested model with wire model
+	// "served-model-id", and pi set responseModel while keeping the
+	// selected entry on provider).
+	gatewayMessage := func() map[string]any {
+		return map[string]any{
+			"role": "assistant", "provider": "donmai", "model": "requested-model",
+			"responseModel": "served-model-id",
+			"usage":         map[string]any{"input": float64(5), "output": float64(3)},
+		}
+	}
+	turnEnd := func(msg map[string]any) rawEvent {
+		return rawEvent{Type: "turn_end", Fields: map[string]any{"message": msg}, Line: []byte("line")}
+	}
+	retryStart := func(attempt int) rawEvent {
+		return rawEvent{Type: "auto_retry_start", Fields: map[string]any{
+			"attempt": float64(attempt), "maxAttempts": float64(3), "errorMessage": "overloaded",
+		}, Line: []byte("line")}
+	}
+	mapTurn := func(t *testing.T, st *mapperState, ev rawEvent) agent.LlmCallEvent {
+		t.Helper()
+		got, terminal := mapEvent(ev, st)
+		if terminal || len(got) != 1 {
+			t.Fatalf("turn mapping: terminal=%v events=%d; want one non-terminal event", terminal, len(got))
+		}
+		call, ok := got[0].(agent.LlmCallEvent)
+		if !ok {
+			t.Fatalf("event %T; want LlmCallEvent", got[0])
+		}
+		return call
+	}
+
+	t.Run("recorded gateway response yields the served model on one attempt, without provider evidence", func(t *testing.T) {
+		t.Parallel()
+		call := mapTurn(t, &mapperState{}, turnEnd(gatewayMessage()))
+		if call.System != "donmai" || call.Model != "requested-model" || call.ResponseModel != "served-model-id" {
+			t.Errorf("serving identity = system %q model %q responseModel %q; want donmai/requested-model/served-model-id",
+				call.System, call.Model, call.ResponseModel)
+		}
+		if call.ResponseModelProvider != "" {
+			t.Errorf("ResponseModelProvider = %q; want empty (the message provider is configured selection, not response evidence)", call.ResponseModelProvider)
+		}
+		// System is the configured selection, never response evidence:
+		// a downstream serving report sourced from System would misread
+		// the aggregator as the upstream that served.
+		if call.System == call.ResponseModelProvider {
+			t.Errorf("System %q equals response-provider evidence; System must never feed the serving-provider report", call.System)
+		}
+		if call.Attempts != 1 {
+			t.Errorf("Attempts = %d; want 1 (one attempt per model request)", call.Attempts)
+		}
+		if !call.TurnCompleted {
+			t.Error("TurnCompleted = false; a mapped turn is a completed model turn")
+		}
+	})
+
+	t.Run("the pinned binary's real retry order reports one attempt per call", func(t *testing.T) {
+		t.Parallel()
+		// Real order in pi 0.80.10: a failed attempt emits its own
+		// turn_end, then agent_end{willRetry}; _prepareRetry emits
+		// auto_retry_start and agent.continue() re-emits agent_start +
+		// turn_start before the retry's turn_end. Each turn_end is its
+		// own call with one attempt; the session sum still counts every
+		// attempt exactly once.
+		st := &mapperState{}
+		sequence := []rawEvent{
+			{Type: "agent_start", Fields: map[string]any{}},
+			{Type: "turn_start", Fields: map[string]any{}},
+			turnEnd(gatewayMessage()),
+			{Type: "agent_end", Fields: map[string]any{"willRetry": true}},
+			retryStart(1),
+			{Type: "agent_start", Fields: map[string]any{}},
+			{Type: "turn_start", Fields: map[string]any{}},
+			turnEnd(gatewayMessage()),
+		}
+		var calls []agent.LlmCallEvent
+		for _, ev := range sequence {
+			got, terminal := mapEvent(ev, st)
+			if terminal {
+				t.Fatalf("%s: terminal=true; want non-terminal", ev.Type)
+			}
+			for _, e := range got {
+				if call, ok := e.(agent.LlmCallEvent); ok {
+					calls = append(calls, call)
+				}
+			}
+		}
+		if len(calls) != 2 {
+			t.Fatalf("calls = %d; want 2 (the failed attempt and its retry are separate calls)", len(calls))
+		}
+		if calls[0].Attempts != 1 || calls[1].Attempts != 1 {
+			t.Errorf("per-call Attempts = [%d %d]; want [1 1] (one attempt per model request)", calls[0].Attempts, calls[1].Attempts)
+		}
+	})
+
+	t.Run("retry events still reach the runner as system observations", func(t *testing.T) {
+		t.Parallel()
+		got, terminal := mapEvent(retryStart(1), &mapperState{})
+		if terminal || len(got) != 1 {
+			t.Fatalf("retry mapping: terminal=%v events=%d; want one non-terminal event", terminal, len(got))
+		}
+		sys, ok := got[0].(agent.SystemEvent)
+		if !ok || sys.Subtype != "auto_retry_start" {
+			t.Fatalf("event = %#v; want the auto_retry_start SystemEvent", got[0])
+		}
+	})
+}

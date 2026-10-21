@@ -7,18 +7,48 @@ import (
 	"time"
 )
 
+// mirrorsRelPath joins one leaf under the mirrors directory, relative to
+// the store root. The leaf is either a validated 64-hex digest (mirror
+// directories) or one of the store's own fixed staging patterns — never
+// caller input — and os.Root confines the result to the state dir
+// regardless.
+func mirrorsRelPath(leaf string) string {
+	return filepath.Join(keeperDirName, mirrorsDirName, leaf)
+}
+
+// locksDirName is the leaf under the keeper root holding one flock file
+// per mirror digest. Locks live beside mirrors/, not in it, so directory
+// listings of mirrors/ see only mirrors and the store's own staging
+// patterns.
+const locksDirName = "locks"
+
+// locksRelPath joins one lock file name under the locks directory,
+// relative to the store root. Names come from lockFileNameFor (validated
+// digest plus suffix), never caller input.
+func locksRelPath(name string) string {
+	return filepath.Join(keeperDirName, locksDirName, name)
+}
+
 // checkSameFilesystem proves stateDir and worktreeRoot share a filesystem
 // before the store publishes any mirror: later consumers clone worktrees
 // from these mirrors, and a cross-filesystem layout would silently change
 // copy cost and sharing behavior. Missing parents are created owner-only
-// so the check can run on a fresh state home; an existing path that is not
-// a real directory fails.
+// so the check can run on a fresh state home; an existing path that is a
+// symlink or not a directory fails.
 func checkSameFilesystem(stateDir, worktreeRoot string) error {
-	stateDev, err := deviceOf(ensureRealDir(stateDir))
+	stateDir, err := ensureRealDir(stateDir)
 	if err != nil {
 		return err
 	}
-	workDev, err := deviceOf(ensureRealDir(worktreeRoot))
+	worktreeRoot, err = ensureRealDir(worktreeRoot)
+	if err != nil {
+		return err
+	}
+	stateDev, err := deviceOf(stateDir)
+	if err != nil {
+		return err
+	}
+	workDev, err := deviceOf(worktreeRoot)
 	if err != nil {
 		return err
 	}
@@ -28,13 +58,39 @@ func checkSameFilesystem(stateDir, worktreeRoot string) error {
 	return nil
 }
 
-// ensureRealDir creates path owner-only when absent and returns it,
-// refusing symlinks and non-directories.
-func ensureRealDir(path string) string {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return path
+// ensureRealDir creates path owner-only when absent and returns it. A path
+// that exists as a symlink, or as anything but a directory, is refused:
+// following a symlinked root would plant every mirror outside the state
+// dir the caller believes it owns. A symlinked parent above path is
+// followed by MkdirAll itself — confining those needs os.Root, which the
+// store holds for everything below the roots — but the roots themselves
+// are pinned here.
+func ensureRealDir(path string) (string, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("repo keeper: refusing symlinked root %q", path)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("repo keeper: root %q exists and is not a directory", path)
+		}
+		return path, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("repo keeper: stat root: %w", err)
 	}
-	return path
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return "", fmt.Errorf("repo keeper: create root: %w", err)
+	}
+	// MkdirAll follows a pre-existing symlinked parent to create the leaf
+	// elsewhere; re-check that what now exists at path is a real
+	// directory, not a symlink planted between the two calls.
+	if info, err := os.Lstat(path); err != nil {
+		return "", fmt.Errorf("repo keeper: stat created root: %w", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("repo keeper: refusing symlinked root %q", path)
+	} else if !info.IsDir() {
+		return "", fmt.Errorf("repo keeper: root %q exists and is not a directory", path)
+	}
+	return path, nil
 }
 
 // dirBytes sums the apparent sizes of every regular file under dir. It is

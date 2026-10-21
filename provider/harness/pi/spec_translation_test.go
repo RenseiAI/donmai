@@ -2,6 +2,8 @@ package pi
 
 import (
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -24,6 +26,63 @@ func TestInteractiveArgs_ProjectsSessionNameAtStartup(t *testing.T) {
 	want := []string{"--no-extensions", "--approve", "--session-dir", "/tmp/session", "--name", "chief-of-staff", "coordinate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("interactiveArgs = %q; want %q", got, want)
+	}
+}
+
+// TestInteractiveArgs_SeedStaysAMessage proves a seed starting with `-`,
+// `--` or `@` reaches pi as a message through the documented transform
+// while a plain seed passes through unchanged byte for byte — and that no
+// argv without a seed gains anything. pi's parser has no `--` handling (a
+// bare `--` is read as an unknown flag and swallows the next argument), so
+// no end-of-options marker is emitted here; instead the leading space
+// neutralises the flag/file branch of the parser.
+func TestInteractiveArgs_SeedStaysAMessage(t *testing.T) {
+	t.Parallel()
+	layout := sessionLayout{root: "/tmp/session"}
+	cases := []struct {
+		name string
+		seed string
+		want string
+	}{
+		{name: "plain seed unchanged", seed: "coordinate", want: "coordinate"},
+		{name: "dash seed neutralised", seed: "-fix the bug", want: " -fix the bug"},
+		{name: "double-dash seed neutralised", seed: "--model x fix the bug", want: " --model x fix the bug"},
+		{name: "at seed neutralised", seed: "@notes", want: " @notes"},
+		{name: "subcommand word stays a prompt", seed: "resume", want: "resume"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Prompt: tc.seed}, layout, nil)
+			if len(got) == 0 {
+				t.Fatalf("interactiveArgs returned an empty argv for seed %q", tc.seed)
+			}
+			if last := got[len(got)-1]; last != tc.want {
+				t.Fatalf("last argv element = %q, want %q (full argv: %q)", last, tc.want, got)
+			}
+			if slices.Contains(got, "--") {
+				t.Fatalf("interactive argv must not carry an end-of-options marker pi cannot parse: %q", got)
+			}
+		})
+	}
+}
+
+// TestInteractiveArgs_NoSeedGainsNoTransform pins that an argv without a
+// seed is unchanged: no transform marker, no trailing element.
+func TestInteractiveArgs_NoSeedGainsNoTransform(t *testing.T) {
+	t.Parallel()
+	layout := sessionLayout{root: "/tmp/session"}
+	for _, spec := range []agent.Spec{
+		{},
+		{SessionName: "chief-of-staff"},
+	} {
+		got := interactiveArgs(spec, layout, nil)
+		if slices.Contains(got, "--") {
+			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no --", spec, got)
+		}
+		if len(got) > 0 && strings.HasPrefix(got[len(got)-1], " ") {
+			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no transformed trailing element", spec, got)
+		}
 	}
 }
 
