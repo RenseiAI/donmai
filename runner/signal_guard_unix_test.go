@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -68,11 +69,30 @@ func guardTestEnv(layout signalGuardLayout, worktree string, extra map[string]st
 // dir, and waits until the guard's own pgrep form sees it. exec -a gives
 // the process a distinctive command line on every platform; the process
 // NAME used for name matching is calibrated per platform with
-// guardSleeperComm. trapIgnoreTERM makes the sleeper ignore SIGTERM, so a
-// test can tell TERM apart from KILL by survival.
+// guardSleeperComm. On Linux the comm stays the executed basename
+// ("sleep") regardless of argv[0], so every parallel test's sleepers
+// would share one killall name and match each other's processes: there
+// the sleep binary is copied to a uniquely named file so the comm is
+// unique per sleeper. trapIgnoreTERM makes the sleeper ignore SIGTERM,
+// so a test can tell TERM apart from KILL by survival.
 func startGuardSleeper(t *testing.T, dir, name string, trapIgnoreTERM bool) *exec.Cmd {
 	t.Helper()
-	argv := "exec -a " + name + " /bin/sleep 300"
+	sleepBin := "/bin/sleep"
+	if _, err := os.Stat(sleepBin); err != nil {
+		sleepBin = "/usr/bin/sleep"
+	}
+	if runtime.GOOS == "linux" {
+		src, err := os.ReadFile(sleepBin) //nolint:gosec // G304: test fixture reads the host sleep binary.
+		if err != nil {
+			t.Fatalf("read %s: %v", sleepBin, err)
+		}
+		uniqueBin := filepath.Join(t.TempDir(), "sleep-"+name)
+		if err := os.WriteFile(uniqueBin, src, 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
+			t.Fatalf("write unique sleep binary: %v", err)
+		}
+		sleepBin = uniqueBin
+	}
+	argv := "exec -a " + name + " " + sleepBin + " 300"
 	if trapIgnoreTERM {
 		argv = "trap '' TERM; " + argv
 	}
@@ -636,6 +656,122 @@ func TestSignalGuardFailingPgrepRefusesClosed(t *testing.T) {
 	}
 }
 
+// TestSignalGuardLsofFailureRefusesClosed pins the fail-open lookup leg:
+// when lsof returns nothing for one pid, that pid must not inherit the
+// previous pid's cwd. A pgrep stub returns the session pid then the
+// outsider (deterministic scan order) and an lsof stub fails for the
+// outsider; without the per-iteration reset the outsider inherits the
+// session cwd and is killed, and this test goes red.
+func TestSignalGuardLsofFailureRefusesClosed(t *testing.T) {
+	t.Parallel()
+	guardTestTools(t)
+
+	for _, mode := range []string{"pkill", "killall"} {
+		t.Run(mode, func(t *testing.T) {
+			worktree := t.TempDir()
+			outside := t.TempDir()
+			name := "gLs" + mode + "1"
+			own := startGuardSleeper(t, worktree, name, false)
+			outsider := startGuardSleeper(t, outside, name, false)
+
+			realLsof := ""
+			for _, d := range []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
+				if st, err := os.Stat(filepath.Join(d, "lsof")); err == nil && !st.IsDir() {
+					realLsof = filepath.Join(d, "lsof")
+					break
+				}
+			}
+			if realLsof == "" {
+				t.Skip("real lsof not in the fixed tool path")
+			}
+			stubDir := t.TempDir()
+			// Deterministic scan order: the session pid is examined
+			// first, so without the reset the outsider inherits its cwd.
+			pgrepStub := "#!/bin/sh\nprintf '%s\\n%s\\n' \"" + strconv.Itoa(own.Process.Pid) + "\" \"" + strconv.Itoa(outsider.Process.Pid) + "\"\n"
+			if err := os.WriteFile(stubDir+"/pgrep", []byte(pgrepStub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
+				t.Fatal(err)
+			}
+			stub := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"" + strconv.Itoa(outsider.Process.Pid) + "\" ]; then\n    exit 1\n  fi\ndone\nexec \"" + realLsof + "\" \"$@\"\n"
+			if err := os.WriteFile(stubDir+"/lsof", []byte(stub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
+				t.Fatal(err)
+			}
+			layout := installTestGuard(t)
+			extra := map[string]string{"DONMAI_SIGNAL_GUARD_TOOL_DIRS": stubDir + " /usr/bin /bin /usr/sbin /sbin"}
+			bin := layout.pkill
+			args := []string{"-f", name}
+			if mode == "killall" {
+				bin = layout.killall
+				args = []string{guardSleeperComm(t, own)}
+			}
+			kill := exec.Command(bin, args...) //nolint:gosec // G204: test fixture, the marker comes from our own started process.
+			kill.Dir = worktree
+			kill.Env = guardTestEnv(layout, worktree, extra)
+			out, err := kill.CombinedOutput()
+			if err != nil {
+				t.Fatalf("guard %s with failing lsof: %v (output %q), want the in-scope kill to succeed", mode, err, out)
+			}
+			waitGuardGone(t, own, "session process")
+			assertGuardAlive(t, outsider, "outsider process with failed lookup")
+			if logBody := readRefusals(t, layout); !strings.Contains(logBody, strconv.Itoa(outsider.Process.Pid)) {
+				t.Fatalf("refusal log missing the uninspectable outsider pid %d: %q", outsider.Process.Pid, logBody)
+			}
+		})
+	}
+}
+
+// TestSignalGuardPerPidKillToleratesExitedPid pins the per-pid signal leg:
+// the guard signals each in-scope pid separately and exits 0 when at least
+// one was signalled. A stubbed pgrep returns the session pid twice plus a
+// reaped pid (999999) whose stubbed lsof claims the worktree, so the scope
+// check allows all three. A single `kill $allowed` exits 1 on the ESRCH
+// for the dead pid even though the session process was signalled; the
+// per-pid loop (with dedupe) still exits 0, and this test goes red without
+// it.
+func TestSignalGuardPerPidKillToleratesExitedPid(t *testing.T) {
+	t.Parallel()
+	guardTestTools(t)
+
+	worktree := t.TempDir()
+	name := "gPerPid1"
+	own := startGuardSleeper(t, worktree, name, false)
+
+	realLsof := ""
+	for _, d := range []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
+		if st, err := os.Stat(filepath.Join(d, "lsof")); err == nil && !st.IsDir() {
+			realLsof = filepath.Join(d, "lsof")
+			break
+		}
+	}
+	if realLsof == "" {
+		t.Skip("real lsof not in the fixed tool path")
+	}
+	stubDir := t.TempDir()
+	pgrepStub := "#!/bin/sh\nprintf '%s\\n%s\\n999999\\n' \"" + strconv.Itoa(own.Process.Pid) + "\" \"" + strconv.Itoa(own.Process.Pid) + "\"\n"
+	if err := os.WriteFile(stubDir+"/pgrep", []byte(pgrepStub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
+		t.Fatal(err)
+	}
+	lsofStub := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"999999\" ]; then\n    printf 'p999999\\nn%s\\n' \"" + worktree + "\"\n    exit 0\n  fi\ndone\nexec \"" + realLsof + "\" \"$@\"\n"
+	if err := os.WriteFile(stubDir+"/lsof", []byte(lsofStub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
+		t.Fatal(err)
+	}
+	layout := installTestGuard(t)
+	extra := map[string]string{"DONMAI_SIGNAL_GUARD_TOOL_DIRS": stubDir + " /usr/bin /bin /usr/sbin /sbin"}
+	kill := exec.Command(layout.pkill, "-f", name) //nolint:gosec // G204: test fixture, the marker comes from our own started process.
+	kill.Dir = worktree
+	kill.Env = guardTestEnv(layout, worktree, extra)
+	out, err := kill.CombinedOutput()
+	if err != nil {
+		t.Fatalf("guard pkill with an exited pid in scope: %v (output %q), want exit 0", err, out)
+	}
+	// A single `kill $allowed` prints the raced pid's ESRCH noise (and on
+	// Linux exits 1 for it); the per-pid loop signals each pid separately
+	// and stays silent. Reverting to the single kill makes this fail.
+	if strings.Contains(string(out), "No such process") {
+		t.Fatalf("guard leaked the raced pid's ESRCH noise: %q", out)
+	}
+	waitGuardGone(t, own, "session process")
+}
+
 // TestKillallGuardUnknownDoesNotReexec pins that an all-unknown killall
 // exits 1 without re-execing the real tool: the real killall reports "No
 // matching processes" on stderr, while the guard stays silent. Reverting
@@ -777,6 +913,7 @@ func TestSignalGuardRefusalDrainsThroughRun(t *testing.T) {
 
 	const marker = "gE2eDrn1"
 	var spawnEnv map[string]string
+	var spawnedHarnessPid int
 	provider := func(base agent.HarnessProvider) agent.Provider {
 		scripted := &verdictScriptProvider{HarnessProvider: base, t: t, turns: []verdictScriptTurn{{
 			manifest: passedManifest,
@@ -790,6 +927,22 @@ func TestSignalGuardRefusalDrainsThroughRun(t *testing.T) {
 				worktree := spawnEnv[signalGuardWorktreeEnv]
 				if guardDir == "" || eventLog == "" || worktree == "" {
 					t.Fatalf("session env missing guard scope (dir %q log %q worktree %q)", guardDir, eventLog, worktree)
+				}
+				// The spawn wiring pin: the provider called
+				// spec.OnProcessSpawned with a Setpgid child, so the
+				// runner must have recorded its group into the guard
+				// directory file. Deleting the record call in the
+				// spawn chain leaves the file missing and this fails.
+				if spawnedHarnessPid == 0 {
+					t.Fatal("provider never reported a harness pid through OnProcessSpawned")
+				}
+				wantPGID, err := syscall.Getpgid(spawnedHarnessPid)
+				if err != nil {
+					t.Fatalf("getpgid of spawned harness pid %d: %v", spawnedHarnessPid, err)
+				}
+				pgidBody, err := os.ReadFile(filepath.Join(guardDir, signalGuardPGIDFileName))
+				if err != nil || strings.TrimSpace(string(pgidBody)) != strconv.Itoa(wantPGID) {
+					t.Fatalf("guard pgid file = %q, want %d (spawn wiring dropped)", pgidBody, wantPGID)
 				}
 				own := startGuardSleeper(t, cwd, marker, false)
 				outsider := startGuardSleeper(t, t.TempDir(), marker, false)
@@ -808,7 +961,7 @@ func TestSignalGuardRefusalDrainsThroughRun(t *testing.T) {
 				assertGuardAlive(t, outsider, "outsider process")
 			},
 		}}}
-		return &spawnEnvCaptureProvider{verdictScriptProvider: scripted, env: &spawnEnv}
+		return &spawnEnvCaptureProvider{verdictScriptProvider: scripted, env: &spawnEnv, spawnedPid: &spawnedHarnessPid}
 	}
 	res, _ := runScriptedSession(t, scriptedSession{
 		workType:     "development",
@@ -831,13 +984,36 @@ func TestSignalGuardRefusalDrainsThroughRun(t *testing.T) {
 
 // spawnEnvCaptureProvider records the harness Spec.Env at spawn and then
 // plays the wrapped script. The turn hooks read the recorded env to find
-// the session's own guard installation.
+// the session's own guard installation. It also reports a Setpgid child
+// through spec.OnProcessSpawned like a real harness spawn, so the
+// runner's spawn chain records the session process group; the turn hook
+// asserts the guard directory file holds it, pinning that wiring.
 type spawnEnvCaptureProvider struct {
 	*verdictScriptProvider
 	env *map[string]string
+	// spawnedPid, when non-nil, receives a Setpgid child pid that is
+	// reported through spec.OnProcessSpawned during Spawn and kept alive
+	// until the test ends.
+	spawnedPid *int
 }
 
 func (p *spawnEnvCaptureProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	if p.spawnedPid != nil {
+		cmd := exec.Command("sleep", "300") //nolint:gosec // G204: test fixture sleeps with no arguments.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := cmd.Start(); err != nil {
+			p.t.Errorf("start harness-pid fixture: %v", err)
+		} else {
+			*p.spawnedPid = cmd.Process.Pid
+			p.t.Cleanup(func() {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			})
+			if spec.OnProcessSpawned != nil {
+				spec.OnProcessSpawned(cmd.Process.Pid)
+			}
+		}
+	}
 	*p.env = spec.Env
 	return p.verdictScriptProvider.Spawn(ctx, spec)
 }

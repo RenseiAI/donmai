@@ -439,12 +439,24 @@ refused=""
 # mangle cwd paths containing $ or backticks).
 _nl='
 '
+deduped=""
 for pid in $matched; do
   if [ "$pid" = "1" ] || is_ancestor "$pid"; then
     continue
   fi
+  # Dedupe: repeated killall names list each pid once per name, so the
+  # same pid can appear several times in matched. Signalling it twice
+  # must not turn a success into an ESRCH failure below.
+  case " $deduped " in
+    *" $pid "*) continue ;;
+  esac
+  deduped="$deduped $pid"
   _lsof_out="$("$LSOF" -p "$pid" -a -d cwd -F n 2>/dev/null)"
+  # Reset per pid: an empty or failed lsof lookup must not inherit the
+  # previous pid's cwd (fail-open). An uninspectable pid stays out of
+  # scope unless the process-group leg proves membership.
   cwd=""
+  _nline=""
   case "$_lsof_out" in
     *"$_nl"n*) _nline="${_lsof_out##*"$_nl"n}" ;;
     n*) _nline="${_lsof_out#n}" ;;
@@ -484,6 +496,24 @@ fi
 # the real tool would re-match the out-of-scope processes just refused.
 # The signal keeps its dash form (-9 stays numeric so -2 means INT rather
 # than silently becoming TERM; names pass through as -NAME and kill
-# itself rejects the unknown).
+# itself rejects the unknown). Each pid is signalled separately so a pid
+# that exits between the scope check and the signal (a reaped sleeper, a
+# finished daemon child) cannot turn the whole invocation into a failure
+# when other in-scope targets were signalled: exit 0 when at least one
+# pid was signalled, matching pkill/killall semantics.
 # shellcheck disable=SC2086
-kill "$sig" $allowed
+signalled=0
+seen=""
+for _kp in $allowed; do
+  case " $seen " in
+    *" $_kp "*) continue ;;
+  esac
+  seen="$seen $_kp"
+  if kill "$sig" "$_kp" 2>/dev/null; then
+    signalled=1
+  fi
+done
+if [ "$signalled" = "1" ]; then
+  exit 0
+fi
+exit 1
