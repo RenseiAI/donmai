@@ -181,6 +181,9 @@ type WorkareaArchiveRegistry struct {
 	acquisitions   *workarea.AcquisitionStore
 	worktreeParent string
 	archiveHook    func(string) error
+	// now is the restore clock; nil means time.Now. Tests pin it so the
+	// fresh restore ID (and its sidecar name) is predictable.
+	now func() time.Time
 
 	mu          sync.Mutex
 	authorityMu sync.Mutex
@@ -260,6 +263,13 @@ func NewWorkareaArchiveRegistry(opts WorkareaArchiveOptions) *WorkareaArchiveReg
 		worktreeParent: opts.WorktreeParent,
 		archiveHook:    opts.ArchiveHook,
 	}
+}
+
+func (r *WorkareaArchiveRegistry) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 func (r *WorkareaArchiveRegistry) acquisitionAuthority() (*workarea.AcquisitionStore, error) {
@@ -1332,7 +1342,7 @@ func (r *WorkareaArchiveRegistry) RestoreV1(
 	// Generate a new id — derive from the archive id + timestamp so
 	// operators can see the lineage at a glance and uniqueness is
 	// guaranteed under second-resolution.
-	now := time.Now().UTC()
+	now := r.clock().UTC()
 	newID := fmt.Sprintf("%s-restore-%d", archiveID, now.UnixNano())
 	restoredDir := r.restoredDir()
 	if err := os.MkdirAll(restoredDir, 0o700); err != nil {
