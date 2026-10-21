@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -435,4 +436,182 @@ func ioReadAll(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("close request body: %w", err)
 	}
 	return buffer.Bytes(), nil
+}
+
+// sessionRootStubProvider attests the session-root workarea protocol (plus
+// the read-only enforcement the fixture declaration needs) while delegating
+// every other behaviour to the scripted stub. The stub alone never attests
+// multi-repository protocols, so without this wrapper a declared session
+// cannot provision and the resumed-run path below cannot be exercised.
+type sessionRootStubProvider struct {
+	agent.Provider
+}
+
+func (s sessionRootStubProvider) Manifest() agent.HarnessManifest {
+	manifest := s.Provider.(agent.HarnessProvider).Manifest()
+	manifest.Caps.MultiRepositoryWorkareaProtocols = []string{string(workarea.ProtocolSessionRootV1)}
+	manifest.Caps.RepositoryAuthorityEnforcement = string(workarea.RepositoryAuthorityIsolatedReadOnlyV1)
+	manifest.Caps.SupportsReadOnlySelectedCWD = true
+	return manifest
+}
+
+func TestResumedRunCarriesRecordedArchiveReference(t *testing.T) {
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	leaseDir := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: leaseDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := worktree.NewManager(worktree.Options{
+		ParentDir: wtParent, LeaseStore: store,
+		ArchiveRoot: func(_ context.Context, _ worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, "/lock-refresh") {
+			_, _ = w.Write([]byte(`{"refreshed":true}`))
+			return
+		}
+		if strings.HasSuffix(req.URL.Path, "/status") {
+			body, readErr := ioReadAll(req)
+			if readErr != nil {
+				t.Error(readErr)
+			}
+			var envelope map[string]any
+			if err := json.Unmarshal(body, &envelope); err != nil {
+				t.Error(err)
+			}
+			if envelope["status"] == "completed" {
+				bodies = append(bodies, envelope)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	// A single read-only repository keeps the completion contract satisfied
+	// (no mutable repository owes a pull request) while still exercising
+	// the session-root provision, acquire and re-entry path.
+	declaration := &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{{
+			Source: workarea.RepositorySource{Repository: bareRepo},
+			Name:   "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryReadOnly,
+		}},
+	}
+	newResumedRunner := func() *Runner {
+		poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker", HTTPClient: srv.Client(), BaseDelay: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		registry := NewRegistry()
+		stubProvider, _ := stub.New(stub.WithSessionIDFunc(func() string { return "stub-session-fixed" }))
+		if err := registry.Register(sessionRootStubProvider{Provider: stubProvider}); err != nil {
+			t.Fatal(err)
+		}
+		runner, err := New(Options{
+			Registry: registry, WorktreeManager: manager, Poster: poster, PreserveWorktreeAlways: true,
+			SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runner
+	}
+	queuedWork := func(withLease bool) QueuedWork {
+		queued := QueuedWork{QueuedWork: queuedWorkBase("LEASE-RESUMED-REF"), WorkerID: "worker", PlatformURL: srv.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub}}
+		if withLease {
+			queued.TerminalWorkareaLease = terminalLeaseRequest()
+		}
+		queued.SessionID = runnerLeaseSessionID
+		queued.Repository = bareRepo
+		queued.RepositoryDeclaration = declaration
+		return queued
+	}
+	// Observe the exact terminal result with a first run that requests no
+	// lease: it tears down cleanly and keeps no lease state, but fixes the
+	// content-bound terminal result identity the resumed acquire must replay.
+	// The stub provider session is fixed so both runs produce byte-identical
+	// results; the assertion below fails loudly if that ever changes.
+	observed, err := newResumedRunner().Run(context.Background(), queuedWork(false))
+	if err != nil || observed.Status != "completed" {
+		t.Fatalf("observed run status=%s err=%v", observed.Status, err)
+	}
+	observedRaw, _ := json.Marshal(observed.Result)
+	terminalResultID, err := stableTerminalResultID(runnerLeaseSessionID, observed.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodies = nil
+	// Record the committed reference against the observed identity before
+	// the resumed run: the lease carries the reference but no terminal
+	// status yet, exactly the state a resumed attempt must carry forward.
+	policy, err := terminalLeaseRequest().Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := manager.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
+		SessionID: runnerLeaseSessionID, TerminalResultID: terminalResultID, Policy: policy,
+		ReleaseRequested: true, ReleaseDisposition: "archive",
+	})
+	if err != nil {
+		t.Fatalf("acquire recorded lease: %v", err)
+	}
+	reference := workarea.TerminalArchiveReference{
+		SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: lease.WorkareaID,
+		ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SessionID:     lease.SessionID, WorkareaID: lease.WorkareaID,
+		TerminalResultID: lease.TerminalResultID, CommittedAt: time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
+	}
+	if _, err := manager.RecordArchiveReference(context.Background(), lease.LeaseID, reference); err != nil {
+		t.Fatalf("record archive reference: %v", err)
+	}
+	// The durable lease record (with the reference) outlives the derived
+	// actionable index — the pre-reconcile crash window — so the resumed
+	// provision re-enters the retained generation while acquire replays the
+	// recorded reference instead of refusing the workarea as leased.
+	if err := os.Remove(filepath.Join(leaseDir, "actionable", lease.LeaseID+".json")); err != nil {
+		t.Fatalf("remove actionable marker: %v", err)
+	}
+	// The resumed run through Runner.Run must carry the recorded reference
+	// onto both the terminal result and the prepared status body beside the
+	// closed four-field lease projection.
+	resumed, err := newResumedRunner().Run(context.Background(), queuedWork(true))
+	if err != nil || resumed.Status != "completed" {
+		t.Fatalf("resumed run status=%s err=%v", resumed.Status, err)
+	}
+	resumedRaw, _ := json.Marshal(resumed.Result)
+	if string(resumedRaw) != string(observedRaw) {
+		t.Fatalf("resumed result changed: was %s, now %s", observedRaw, resumedRaw)
+	}
+	if resumed.TerminalWorkareaLease == nil || resumed.TerminalWorkareaLease.LeaseID != lease.LeaseID {
+		t.Fatalf("resumed run did not replay the recorded lease: %+v", resumed.TerminalWorkareaLease)
+	}
+	if resumed.TerminalArchiveReference == nil || !resumed.TerminalArchiveReference.IdentityEqual(reference) {
+		t.Fatalf("resumed run dropped the recorded reference: %+v", resumed.TerminalArchiveReference)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("resumed run posted %d completed status bodies, want 1", len(bodies))
+	}
+	posted, ok := bodies[0]["terminalArchiveReference"].(map[string]any)
+	if !ok {
+		t.Fatalf("resumed status omits the committed reference: %#v", bodies[0]["terminalArchiveReference"])
+	}
+	for field, want := range map[string]string{
+		"archiveId": reference.ArchiveID, "archiveDigest": reference.ArchiveDigest,
+		"sessionId": reference.SessionID, "workareaId": reference.WorkareaID,
+		"terminalResultId": reference.TerminalResultID,
+	} {
+		if posted[field] != want {
+			t.Fatalf("posted reference %s = %#v, want %q", field, posted[field], want)
+		}
+	}
+	if leaseBody, ok := bodies[0]["terminalWorkareaLease"].(map[string]any); !ok || len(leaseBody) != 4 {
+		t.Fatalf("resumed lease projection changed: %#v", bodies[0]["terminalWorkareaLease"])
+	}
 }
