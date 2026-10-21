@@ -207,6 +207,100 @@ func TestInteractive_StepAdvancesRunningThenStopped(t *testing.T) {
 	}
 }
 
+// TestInteractive_EarlyFailureMarksStopped pins the terminal step for
+// interactive sessions that fail before the PTY surface is live: an oversize
+// seed, a non-interactive handle, or a half-configured relay attach all
+// return before the running transition, so without an explicit terminal
+// step the local dashboard would render "spawning" for the whole session.
+// Each failure must leave CurrentStep at "stopped" and record the
+// session-ended lifecycle notice, mirroring the clean-exit terminal path.
+func TestInteractive_EarlyFailureMarksStopped(t *testing.T) {
+	tests := []struct {
+		name            string
+		wantFailureMode string
+		attachURL       string
+		attachToken     string
+		oversizePrompt  bool
+		nonInteractive  bool
+	}{
+		{name: "oversize prompt", wantFailureMode: FailureInteractiveInput, oversizePrompt: true},
+		{name: "non-interactive handle", wantFailureMode: FailureInteractiveUnsupported, nonInteractive: true},
+		{name: "half-configured attach", wantFailureMode: FailureInteractiveConfig, attachURL: "ws://127.0.0.1:0/v1/rooms/room-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envAttachURL, tt.attachURL)
+			t.Setenv(envAttachToken, tt.attachToken)
+
+			r := minimalRunner(t)
+			worktreePath := t.TempDir()
+			if _, err := r.store.Update(worktreePath, func(s *state.State) error {
+				s.CurrentStep = "spawning"
+				return nil
+			}); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+
+			var handle agent.Handle
+			if tt.nonInteractive {
+				handle = &fakeHandle{events: make(chan agent.Event)}
+			} else {
+				handle = &testInteractiveHandle{
+					Handle:  &fakeHandle{events: make(chan agent.Event)},
+					session: completedRecordingInteractiveSession(),
+				}
+			}
+			sink := &recordingSink{}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "interactive-early-" + tt.name, Mode: interactiveRunMode}}
+			qw.SessionID = "interactive-early-stopped"
+			if tt.oversizePrompt {
+				qw.InitialPrompt = strings.Repeat("oversized-seed-", 1500)
+			}
+			res := &Result{SessionID: qw.SessionID}
+			res.ProviderName = agent.ProviderStub
+
+			out, err := r.dispatchInteractive(
+				context.Background(), handle, worktreePath, qw, res, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+			)
+			if err == nil {
+				t.Fatal("expected a terminal error for the early failure")
+			}
+			if out.Status != "failed" || out.FailureMode != tt.wantFailureMode {
+				t.Fatalf("status=%q mode=%q; want failed/%s", out.Status, out.FailureMode, tt.wantFailureMode)
+			}
+			if st, err := r.store.Read(worktreePath); err != nil {
+				t.Fatalf("read state: %v", err)
+			} else if st.CurrentStep != "stopped" {
+				t.Fatalf("CurrentStep=%q after the early failure, want stopped", st.CurrentStep)
+			}
+			var sawEnded, sawStarted bool
+			for _, ev := range sink.events {
+				if system, ok := ev.(agent.SystemEvent); ok {
+					switch system.Subtype {
+					case "interactive-session-started":
+						sawStarted = true
+					case "interactive-session-ended":
+						sawEnded = true
+					}
+				}
+			}
+			if !sawEnded {
+				t.Fatal("early failure posted no interactive-session-ended activity")
+			}
+			if sawStarted {
+				t.Fatal("early failure must not post interactive-session-started: the PTY never went live")
+			}
+			body, err := os.ReadFile(filepath.Join(worktreePath, ".agent", "events.jsonl"))
+			if err != nil {
+				t.Fatalf("read events.jsonl: %v", err)
+			}
+			if !strings.Contains(string(body), `"subtype":"interactive-session-ended"`) {
+				t.Fatalf("events.jsonl missing the session-ended notice:\n%s", body)
+			}
+		})
+	}
+}
+
 // flushingInteractiveHandle is a PTY handle that enqueues activity after its
 // session is Done and signals agent.InteractiveActivityFlusher when done.
 type flushingInteractiveHandle struct {
