@@ -205,6 +205,12 @@ const (
 	// Missing/false preserves mixed-version safety: no unknown ingest request
 	// is emitted to a server that has not shipped the route.
 	CapabilityExecutionEventIngest = "execution-event-ingest"
+	// CapabilityExecutionSecurityReportIngest is true when the dispatch target
+	// accepts the pre-spawn execution-security report on the preflight
+	// registration route. Missing/false keeps the runner on the prior
+	// behavior — it spawns stamped work without submitting the report — so a
+	// controller that has not shipped the report contract never sees it.
+	CapabilityExecutionSecurityReportIngest = "execution-security-report-ingest"
 )
 
 // hasCapability reports whether the daemon advertised the named capability as
