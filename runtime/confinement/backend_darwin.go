@@ -143,7 +143,8 @@ func (s *seatbeltBackend) Apply(req ApplyRequest) (Applied, error) {
 	}
 	host := seatbeltHost{shared: shared}
 	if req.Resolved.ReadScope != "" {
-		host.runtimeReads = append(developerReads(), xcrunCacheReads()...)
+		host.runtimeReads = developerReads()
+		host.runtimeLiterals = xcrunCacheReads()
 	}
 	text, err := renderSeatbelt(req.Resolved, host, req.Rules, s.Canonical)
 	if err != nil {
@@ -230,7 +231,8 @@ func darwinUserDir(name string) (string, error) {
 // denied) and prints an error on stderr; a shim run through cc
 // --print-prog-name, as the Go linker finds dsymutil, then returns that
 // error text as the tool's path and the link fails. The cache is read-only
-// here: writing it stays denied.
+// here: writing it stays denied. Render it as a literal: the file alone is
+// readable, never the temporary directory around it.
 func xcrunCacheReads() []string {
 	dir, err := darwinUserDir("DARWIN_USER_TEMP_DIR")
 	if err != nil {

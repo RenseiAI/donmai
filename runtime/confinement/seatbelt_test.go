@@ -307,7 +307,7 @@ func readSessionBlock(t *testing.T, text string) string {
 // a composer read deny still renders after everything and wins inside the
 // allowlist.
 func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
-	host := seatbeltHost{shared: []string{"/private/tmp"}, runtimeReads: []string{"/Applications/Xcode.app"}}
+	host := seatbeltHost{shared: []string{"/private/tmp"}, runtimeReads: []string{"/Applications/Xcode.app"}, runtimeLiterals: []string{"/private/tmp/xcrun_db"}}
 	text := mustRenderHost(t, readScopedResolved(), host, []Rule{{Kind: RuleDenyRead, Path: "/r/ws/mut/secret", Scope: ScopeSubtree}})
 	order := []string{
 		"(allow default)",
@@ -315,6 +315,7 @@ func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
 		"(allow file-read-data file-read-xattr\n  (literal \"/\")",
 		`(subpath "/opt/homebrew")`,
 		`(subpath "/Applications/Xcode.app")`,
+		`(literal "/private/tmp/xcrun_db")`,
 		"(deny file-read-data file-read-xattr\n  (subpath \"/opt/homebrew/var\")\n  (subpath \"/usr/local/var\"))",
 		`(deny file-read-data file-read-xattr (subpath "/System/Volumes"))`,
 		`(allow file-read-data file-read-xattr (subpath "/System/Volumes/Preboot/Cryptexes"))`,
@@ -512,5 +513,32 @@ func TestRenderSeatbelt_ReadScopeRefusesPathsItCannotQuote(t *testing.T) {
 	}
 	if _, err := renderSeatbelt(readScopedResolved(), seatbeltHost{runtimeReads: []string{"/A\\pp"}}, nil, identity); err == nil {
 		t.Fatal("a runtime path with a backslash rendered")
+	}
+	if _, err := renderSeatbelt(readScopedResolved(), seatbeltHost{runtimeLiterals: []string{"/T\\mp/xcrun_db"}}, nil, identity); err == nil {
+		t.Fatal("a runtime literal with a backslash rendered")
+	}
+}
+
+// TestRenderSeatbelt_XcrunCacheIsLiteral: the developer lookup cache is an
+// exact file in the read allowlist, never a subtree. A subpath would open
+// the whole user temporary directory to reads; the developer application
+// beside it stays a subtree.
+func TestRenderSeatbelt_XcrunCacheIsLiteral(t *testing.T) {
+	host := seatbeltHost{
+		runtimeReads:    []string{"/Applications/Xcode.app"},
+		runtimeLiterals: []string{"/private/tmp/xcrun_db"},
+	}
+	text := mustRenderHost(t, readScopedResolved(), host, nil)
+	if !strings.Contains(text, `(literal "/private/tmp/xcrun_db")`) {
+		t.Fatalf("read allow lacks the lookup cache as a literal:\n%s", text)
+	}
+	if strings.Contains(text, `(subpath "/private/tmp/xcrun_db")`) {
+		t.Fatalf("lookup cache rendered as a subpath; the whole temporary directory would be readable:\n%s", text)
+	}
+	if !strings.Contains(text, `(subpath "/Applications/Xcode.app")`) {
+		t.Fatalf("developer application is not a subpath read:\n%s", text)
+	}
+	if strings.Contains(text, `(literal "/Applications/Xcode.app")`) {
+		t.Fatalf("developer application rendered as a literal:\n%s", text)
 	}
 }
