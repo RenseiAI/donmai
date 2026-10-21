@@ -116,55 +116,48 @@ func TestFixedHoldKeepsLineageLocallyVisibleDuringOutage(t *testing.T) {
 	}
 }
 
-// TestFixedHoldDecisiveReleaseEndsHoldAtOnce pins the positive-evidence half:
-// a decisive, authenticated released answer ends an armed hold at once even
-// when the shim is still observable. Silence retries; a release withdraws.
-func TestFixedHoldDecisiveReleaseEndsHoldAtOnce(t *testing.T) {
+// TestFixedHoldDecisiveAnswersEndHoldAtOnce pins the positive-evidence half:
+// a decisive, authenticated released answer — or an expired credential the
+// hold must never extend — ends an armed hold at once even when the shim is
+// still observable. Silence retries; a release withdraws, and an unreachable
+// control plane never grants anything new and never extends credential
+// lifetime.
+func TestFixedHoldDecisiveAnswersEndHoldAtOnce(t *testing.T) {
 	t.Parallel()
-	held := &heldPastWindowCounter{answer: func() bool { return true }}
-	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
-		policy:         SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
-		lineageLive:    alwaysLive,
-		heldPastWindow: held.predicate,
-		adoption: func(_ context.Context, attempt int) error {
-			if attempt < 2 {
-				return errors.New("injected carrier outage: timeout")
+	for _, tc := range []struct {
+		name string
+		join func(cause error) error
+	}{
+		{name: "released lineage", join: func(cause error) error {
+			return errors.Join(cause, ErrSessionShimLineageReleased)
+		}},
+		{name: "expired credential", join: func(cause error) error {
+			return errors.Join(cause, ErrSessionShimCredentialExpired)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			held := &heldPastWindowCounter{answer: func() bool { return true }}
+			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+				policy:         SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+				lineageLive:    alwaysLive,
+				heldPastWindow: held.predicate,
+				adoption: func(_ context.Context, attempt int) error {
+					if attempt < 2 {
+						return errors.New("injected carrier outage: timeout")
+					}
+					return tc.join(errors.New("carrier refused"))
+				},
+			})
+			lost := f.lostEntry(t)
+
+			if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
+				t.Fatalf("disposition = %d, want readoptionLineageGone (%d) — a decisive answer must end the hold", got, readoptionLineageGone)
 			}
-			return errors.Join(errors.New("carrier refused"), ErrSessionShimLineageReleased)
-		},
-	})
-	lost := f.lostEntry(t)
-
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
-		t.Fatalf("disposition = %d, want readoptionLineageGone (%d) — a decisive release must end the hold", got, readoptionLineageGone)
-	}
-	if adoptions, _ := f.snapshot(); adoptions != 2 {
-		t.Fatalf("durable adoption attempted %d times, want 2 — the hold must stop at the release, not retry through it", adoptions)
-	}
-}
-
-// TestFixedHoldCredentialExpiryEndsHold pins the security half: an expired
-// credential ends an armed hold even when the shim is still observable and
-// held. An unreachable control plane never grants anything new and never
-// extends credential lifetime.
-func TestFixedHoldCredentialExpiryEndsHold(t *testing.T) {
-	t.Parallel()
-	held := &heldPastWindowCounter{answer: func() bool { return true }}
-	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
-		policy:         SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
-		lineageLive:    alwaysLive,
-		heldPastWindow: held.predicate,
-		adoption: func(_ context.Context, attempt int) error {
-			if attempt < 2 {
-				return errors.New("injected carrier outage: 503")
+			if adoptions, _ := f.snapshot(); adoptions != 2 {
+				t.Fatalf("durable adoption attempted %d times, want 2 — the hold must stop at the answer, not retry through it", adoptions)
 			}
-			return errors.Join(errors.New("proof invalid"), ErrSessionShimCredentialExpired)
-		},
-	})
-	lost := f.lostEntry(t)
-
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
-		t.Fatalf("disposition = %d, want readoptionLineageGone (%d) — expired credentials must end the hold", got, readoptionLineageGone)
+		})
 	}
 }
 
