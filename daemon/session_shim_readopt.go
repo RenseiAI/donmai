@@ -147,6 +147,11 @@ func (d *Daemon) readoptSessionShimAfterCarrierLoss(
 			}
 			slog.Warn("session shim: controller lost again inside the re-adoption window; the composing layer holds the lineage past the window, re-adopting",
 				"session", id.String(), "sinceReadoption", since, "window", window, "mode", policy.Mode)
+			// With attemptBudget > 0 (the durable-acknowledgement ambiguity
+			// path's last look) the policy below becomes fixed attempts, which
+			// run strictly inside the orphan deadline with no keepalive, so
+			// "reentered" has nothing to pace there and is dropped: the held
+			// lineage gets that bounded look instead of an outright refusal.
 			reentered = true
 		}
 	}
@@ -390,7 +395,23 @@ func (d *Daemon) sessionShimReadoptionHeldPastWindow(parent context.Context, cfg
 	}
 	ctx, cancel := context.WithTimeout(parent, cfg.callbackTimeout())
 	defer cancel()
-	return cfg.ReadoptionHeldPastWindow(ctx, id)
+	return callReadoptionHeldPastWindow(ctx, cfg.ReadoptionHeldPastWindow, id)
+}
+
+// callReadoptionHeldPastWindow runs the embedder's predicate and answers false
+// if it panics. The predicate is consulted from the keepalive goroutine, where
+// an unrecovered panic would take the whole daemon down; a predicate that
+// cannot answer has not said the lineage is held, so false is the fail-closed
+// reading.
+func callReadoptionHeldPastWindow(ctx context.Context, held func(context.Context, sessionshim.Identity) bool, id sessionshim.Identity) (answer bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("session shim: ReadoptionHeldPastWindow panicked; treating the lineage as not held past the window",
+				"session", id.String(), "panic", r)
+			answer = false
+		}
+	}()
+	return held(ctx, id)
 }
 
 // sessionShimWindowExhausted classifies the end of a lineage-live window and,

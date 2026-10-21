@@ -164,6 +164,9 @@ func TestUnheldLineageStillWithdrawsAtWindowEnd(t *testing.T) {
 		// lineageLive and heldPastWindow are built against the case's clock.
 		lineageLive    func(clock *virtualShimClock, started time.Time) func(context.Context, sessionshim.Identity) bool
 		heldPastWindow func(context.Context, sessionshim.Identity) bool
+		// slack is how far past the window the case may run. Zero for every
+		// case where the predicates answer the same all window long.
+		slack time.Duration
 	}{
 		{
 			name:        "no continuation predicate",
@@ -180,6 +183,10 @@ func TestUnheldLineageStillWithdrawsAtWindowEnd(t *testing.T) {
 				return func(context.Context, sessionshim.Identity) bool { return clock.Now().Before(started.Add(window)) }
 			},
 			heldPastWindow: func(context.Context, sessionshim.Identity) bool { return true },
+			// The window-end decision is taken when the next backoff no longer
+			// fits, one backoff BEFORE the deadline, while LineageLive still
+			// answered true here; the per-attempt re-check then ends it.
+			slack: 4 * time.Second,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,8 +209,10 @@ func TestUnheldLineageStillWithdrawsAtWindowEnd(t *testing.T) {
 			if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
 				t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
 			}
-			if elapsed := clock.elapsed(started); elapsed > window+4*time.Second {
-				t.Fatalf("the window ran %s, want it to end at its own %s bound", elapsed, window)
+			// Exactly the old bound: an unheld window must not run even one
+			// extra backoff past its own end.
+			if elapsed := clock.elapsed(started); elapsed > window+tc.slack {
+				t.Fatalf("the window ran %s, past its own %s bound", elapsed, window)
 			}
 			if n := exhausted.Load(); n != 1 {
 				t.Fatalf("OnReadoptionWindowExhausted fired %d times, want exactly once", n)
@@ -332,5 +341,132 @@ func TestHeldPastWindowValidation(t *testing.T) {
 		if tc.refused != errors.Is(err, ErrSessionShimReadoptionPolicy) {
 			t.Errorf("%s: validate = %v, refused want %t", tc.name, err, tc.refused)
 		}
+	}
+}
+
+// TestContinuedWindowEndsOnTheFirstAttemptAfterTheHoldEnds pins the
+// per-attempt re-check: a continued window ends within one backoff of the
+// composing layer letting go, not at the next window end.
+func TestContinuedWindowEndsOnTheFirstAttemptAfterTheHoldEnds(t *testing.T) {
+	t.Parallel()
+	const (
+		window = time.Minute
+		heldBy = 90 * time.Second
+	)
+	clock := newVirtualShimClock()
+	started := clock.Now()
+	var exhausted atomic.Int64
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: time.Second, BackoffCap: 4 * time.Second, Window: window,
+		},
+		adoption:          refusingCarrier(),
+		clock:             clock,
+		lineageLive:       alwaysLive,
+		heldPastWindow:    func(context.Context, sessionshim.Identity) bool { return clock.Now().Before(started.Add(heldBy)) },
+		onWindowExhausted: func(context.Context, sessionshim.Identity) { exhausted.Add(1) },
+	})
+	lost := f.lostEntry(t)
+
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
+		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
+	}
+	if elapsed := clock.elapsed(started); elapsed > heldBy+10*time.Second {
+		t.Fatalf("the continued window ended %s after the loss, want within one backoff of the hold ending at %s",
+			elapsed, heldBy)
+	}
+	if n := exhausted.Load(); n != 1 {
+		t.Fatalf("OnReadoptionWindowExhausted fired %d times, want exactly once", n)
+	}
+}
+
+// TestContinuedKeepaliveStopsOnTheFirstTickAfterTheHoldEnds pins the
+// keepalive half: once a window is continued, the keepalive stops extending on
+// the first paced tick after the hold ends — even while the window loop sleeps
+// a backoff longer than the shim's orphan deadline — so the shim reaps on its
+// own deadline and the loop finds the lineage gone. A keepalive that asked
+// LineageLive alone would hold the released harness through the whole backoff.
+//
+// Real clock, not parallel: the subject is a real shim's real orphan timer.
+func TestContinuedKeepaliveStopsOnTheFirstTickAfterTheHoldEnds(t *testing.T) {
+	const (
+		orphanDeadline = 3 * time.Second
+		window         = 2 * time.Second
+		backoff        = 9 * time.Second // > orphanDeadline: only the keepalive holds the harness
+		releaseAfter   = 2500 * time.Millisecond
+	)
+	var held atomic.Bool
+	held.Store(true)
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: backoff, BackoffCap: backoff,
+			Window: window, KeepaliveInterval: 500 * time.Millisecond,
+		},
+		orphan: sessionshim.OrphanPolicy{
+			Deadline: orphanDeadline, TerminationGrace: 200 * time.Millisecond, PropagationMargin: 0,
+		},
+		adoption:       refusingCarrier(),
+		lineageLive:    alwaysLive,
+		heldPastWindow: func(context.Context, sessionshim.Identity) bool { return held.Load() },
+	})
+	lost := f.lostEntry(t)
+	f.waitForOrphanArmed(t, 5*time.Second)
+	started := time.Now()
+	release := time.AfterFunc(releaseAfter, func() { held.Store(false) })
+	t.Cleanup(func() { release.Stop() })
+
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
+		t.Fatalf("disposition = %d after %s, want readoptionLineageGone (%d): the keepalive kept a released lineage's harness alive through the backoff",
+			got, time.Since(started), readoptionLineageGone)
+	}
+}
+
+// TestReenteredWindowEndsWhenTheHoldEnds pins that a RE-ENTERED window is
+// continued from its first instant: a stop requested 20 s in ends it within one
+// capped backoff, not when a fresh ten-minute window runs out.
+func TestReenteredWindowEndsWhenTheHoldEnds(t *testing.T) {
+	t.Parallel()
+	const (
+		heldBy     = 20 * time.Second
+		backoffCap = 30 * time.Second
+	)
+	clock := newVirtualShimClock()
+	started := clock.Now()
+	var exhausted atomic.Int64
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: 5 * time.Second, BackoffCap: backoffCap, Window: 10 * time.Minute,
+		},
+		clock:             clock,
+		adoption:          refusingCarrier(),
+		lineageLive:       alwaysLive,
+		heldPastWindow:    func(context.Context, sessionshim.Identity) bool { return clock.Now().Before(started.Add(heldBy)) },
+		onWindowExhausted: func(context.Context, sessionshim.Identity) { exhausted.Add(1) },
+	})
+	lost := f.lostEntry(t)
+	lost.readoptedAtUnixNano = clock.Now().Add(-5 * time.Minute).UnixNano()
+
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
+		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
+	}
+	if elapsed := clock.elapsed(started); elapsed > heldBy+backoffCap+time.Second {
+		t.Fatalf("the re-entered window ran %s after the hold ended at %s, want within one capped backoff", elapsed, heldBy)
+	}
+	if n := exhausted.Load(); n != 1 {
+		t.Fatalf("OnReadoptionWindowExhausted fired %d times, want exactly once", n)
+	}
+}
+
+// TestPanickingHeldPastWindowPredicateAnswersFalse pins the fail-closed
+// contract: a predicate that panics is a lineage not held past the window.
+func TestPanickingHeldPastWindowPredicateAnswersFalse(t *testing.T) {
+	t.Parallel()
+	d := New(Options{SkipRegistration: true})
+	cfg := SessionShimConfig{
+		LineageLive:              alwaysLive,
+		ReadoptionHeldPastWindow: func(context.Context, sessionshim.Identity) bool { panic("embedder bug") },
+	}
+	if d.sessionShimReadoptionHeldPastWindow(context.Background(), cfg, sessionshim.Identity{OrgID: "o", SessionID: "s"}) {
+		t.Fatal("a panicking predicate answered held")
 	}
 }

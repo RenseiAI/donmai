@@ -798,6 +798,10 @@ type SessionShimConfig struct {
 	// per resolved keepalive interval (a third of the orphan deadline by
 	// default), whichever is more frequent. It is deliberately NOT consulted on
 	// the fast probes the keepalive makes before its first honoured exchange.
+	// Once a window has been continued under ReadoptionHeldPastWindow (or was
+	// re-entered under it), the conjunction that gates the continuation asks it
+	// again: up to three calls per attempt (window end, the per-attempt
+	// continuation check, and the attempt's own gate) plus one per paced tick.
 	// It runs off the daemon's lock, under its own bounded context.
 	LineageLive func(context.Context, sessionshim.Identity) bool
 
@@ -824,6 +828,12 @@ type SessionShimConfig struct {
 	// ends the ordinary way: OnReadoptionWindowExhausted, then the
 	// unconditional withdrawal (ADR-2026-09-03-readoption-exhaustion-withdraws,
 	// amendment 2026-10-21).
+	//
+	// It must answer FALSE on any error, timeout, or uncertainty, and must not
+	// block past its context or panic (a panic is recovered and read as false).
+	// It must also answer false for any lineage whose session class has an
+	// external release bound — a dispatched, non-interactive run is the usual
+	// one — so an embedder never wires it session-class-blind.
 	//
 	// Nil keeps the bounded window, which is the OSS default. It is consulted
 	// only together with LineageLive (configuration is refused without it, and
