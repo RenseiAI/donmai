@@ -801,6 +801,38 @@ type SessionShimConfig struct {
 	// It runs off the daemon's lock, under its own bounded context.
 	LineageLive func(context.Context, sessionshim.Identity) bool
 
+	// ReadoptionHeldPastWindow answers whether the COMPOSING layer holds this
+	// lineage on terms the lineage-live window does not bound. It is the opt-in
+	// for a session that only its owner, or a duration quota, may end — an
+	// interactive session is the shape it exists for — and a true answer is the
+	// composing layer's statement of two facts at once: no stop has been
+	// requested and no session duration quota is spent, AND nothing outside
+	// this host will release the lineage's claim while the answer stays true.
+	// The second is what keeps §D8's inequality honest once the keepalive runs
+	// past the window: the external release threshold no longer bounds a
+	// lineage this predicate holds, so the predicate is the bound.
+	//
+	// While it answers true the window CONTINUES instead of exhausting: when it
+	// ends with the shim still observable, the daemon starts another window
+	// with the keepalive still armed and the backoff still capped, and a
+	// controller lost again inside the previous window is re-adopted (after
+	// one backoff) instead of quarantined. Nothing else changes. Every attempt
+	// still runs the full prepare-and-adopt pipeline, so no carrier is ever
+	// granted without a fresh preparation, and the lineage is never more than
+	// adopted at its retained revision. The moment the predicate answers false
+	// — or LineageLive does, or the shim stops being observable — the window
+	// ends the ordinary way: OnReadoptionWindowExhausted, then the
+	// unconditional withdrawal (ADR-2026-09-03-readoption-exhaustion-withdraws,
+	// amendment 2026-10-21).
+	//
+	// Nil keeps the bounded window, which is the OSS default. It is consulted
+	// only together with LineageLive (configuration is refused without it, and
+	// outside ReadoptionLineageLive mode), at every window end, on every
+	// attempt and every paced keepalive tick once a window has been continued,
+	// and on a re-entry inside the previous window. It runs off the daemon's
+	// lock, under its own bounded context.
+	ReadoptionHeldPastWindow func(context.Context, sessionshim.Identity) bool
+
 	// OnReadoptionWindowExhausted runs exactly once when a ReadoptionLineageLive
 	// window ends with the shim STILL observable — the case the dead-shim path
 	// cannot produce. It runs BEFORE the lineage is withdrawn, off the daemon's
@@ -1925,6 +1957,14 @@ func (d *Daemon) sessionResumeKey(sessionID, organizationID string) (*sessionshi
 // reporting an adopted lineage whose shim is gone, holding its capacity
 // forever. That is a false complete-snapshot and a permanent capacity leak.
 //
+// Continuing is not keeping. SessionShimConfig.ReadoptionHeldPastWindow lets a
+// composing layer that holds a lineage without an external release bound — an
+// interactive session nobody asked to stop — start another window instead of
+// exhausting this one (amendment 2026-10-21). The keepalive, the liveness
+// gate, and the attempts all keep running, so the lineage is still under the
+// same observation that would withdraw it the instant any of them fails; it is
+// never an adopted entry nothing is watching.
+//
 // Attempts is read only in fixed mode; Window, BackoffCap and KeepaliveInterval
 // only in lineage-live mode. Validate refuses the combinations that would make
 // one policy answer two ways, and it is checked when the configuration is
@@ -2200,6 +2240,21 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 // loosest value that still leaves one whole missed exchange of slack.
 func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 	policy := c.readoption()
+	if c.ReadoptionHeldPastWindow != nil {
+		// Continuation past the window is only meaningful for a window, and it
+		// is only safe while the composing layer can also say it still holds the
+		// lineage at all: a standalone daemon's "yes, always" LineageLive would
+		// turn a continuation into a re-adoption nothing could ever release.
+		if policy.Disabled || policy.Mode != ReadoptionLineageLive {
+			return fmt.Errorf("%w: ReadoptionHeldPastWindow continues a %s window and is meaningless in %s mode (disabled=%t)",
+				ErrSessionShimReadoptionPolicy, ReadoptionLineageLive, policy.Mode, policy.Disabled)
+		}
+		if c.LineageLive == nil {
+			return fmt.Errorf("%w: ReadoptionHeldPastWindow requires SessionShimConfig.LineageLive; continuing a window "+
+				"for a lineage nothing above this daemon can release would never end while the shim lives",
+				ErrSessionShimReadoptionPolicy)
+		}
+	}
 	if policy.Disabled || policy.Mode != ReadoptionLineageLive {
 		return nil
 	}
