@@ -207,10 +207,6 @@ func checkpointUnpushedSHAs(ctx context.Context, target rescueTarget, to string)
 	return shas, nil
 }
 
-// commitStatusPaths splits one `git diff-tree --name-status -z` output into
-// alternating status/path fields: status, path, status, path, ... Renames
-// are disabled by the caller so every entry is one status plus one path.
-
 // checkpointHistoryDenied lists the committed-but-unpublished paths the WIP
 // push would publish that the secret filter denies, by name or by content.
 // Every unpushed commit is walked (not just the final tree): the push
