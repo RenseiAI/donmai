@@ -513,7 +513,7 @@ func landlockRuleset(abi int) unix.LandlockRulesetAttr {
 	if abi < 3 {
 		handled &^= landlockAccessFSTruncate
 	}
-	attr := unix.LandlockRulesetAttr{Access_fs: handled}
+	attr := unix.LandlockRulesetAttr{Handled_access_fs: handled}
 	if abi >= landlockScopeABI {
 		attr.Scoped = landlockScopes
 	}
@@ -559,7 +559,7 @@ func restrictLandlockFull(stage *landlockPolicy) error {
 	defer func() { _ = unix.Close(ruleset) }()
 	grant := func(paths []string, access uint64) error {
 		for _, path := range paths {
-			if err := landlockAddPath(ruleset, path, access&attr.Access_fs); err != nil {
+			if err := landlockAddPath(ruleset, path, access&attr.Handled_access_fs); err != nil {
 				return err
 			}
 		}

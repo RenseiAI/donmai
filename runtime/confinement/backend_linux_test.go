@@ -1204,8 +1204,8 @@ func TestCheck_ProbesTheLauncher(t *testing.T) {
 func TestLandlockRuleset_HandlesNoNetwork(t *testing.T) {
 	for abi := 1; abi <= 8; abi++ {
 		attr := landlockRuleset(abi)
-		if attr.Access_net != 0 {
-			t.Fatalf("ABI %d ruleset handles network %#x; want none", abi, attr.Access_net)
+		if attr.Handled_access_net != 0 {
+			t.Fatalf("ABI %d ruleset handles network %#x; want none", abi, attr.Handled_access_net)
 		}
 		wantScope := uint64(0)
 		if abi >= 6 {
@@ -1218,8 +1218,8 @@ func TestLandlockRuleset_HandlesNoNetwork(t *testing.T) {
 		if abi < 3 {
 			want &^= landlockAccessFSTruncate
 		}
-		if attr.Access_fs != want {
-			t.Fatalf("ABI %d ruleset handles filesystem rights %#x, want %#x", abi, attr.Access_fs, want)
+		if attr.Handled_access_fs != want {
+			t.Fatalf("ABI %d ruleset handles filesystem rights %#x, want %#x", abi, attr.Handled_access_fs, want)
 		}
 	}
 }
