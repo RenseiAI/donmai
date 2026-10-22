@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -688,6 +689,172 @@ func TestSpawner_SessionTmp_DuplicatePathRefusesSecondLaunch(t *testing.T) {
 	waitForActiveCount(t, s2, 0)
 }
 
+// TestSpawner_SessionTmp_DuplicatePathAliasRefusesSecondLaunch pins the
+// marker-identity refusal under an aliased spelling: on macOS /tmp is the
+// /private/tmp directory, so two cleaned strings name one directory and
+// the live-claim scan cannot match them. The ownership marker lives in
+// the directory itself, so both spellings read the same owner and the
+// second launch fails closed before overwriting the stamp. Driven through
+// AcceptWork with the first seat kept live by a sleeping worker.
+//
+// RED: drop the marker-identity check and the second accept succeeds,
+// rewriting the live session's ownership marker.
+func TestSpawner_SessionTmp_DuplicatePathAliasRefusesSecondLaunch(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("the /tmp alias exists only on macOS")
+	}
+	s, _, _ := seatTmpSpawner(t, "/bin/sh", "-c", "sleep 30")
+	ended := sessionEnds(s)
+	name := fmt.Sprintf("duplicate-path-alias-%d", os.Getpid())
+	a := filepath.Join("/tmp", name)
+	b := filepath.Join("/private/tmp", name)
+	_ = os.RemoveAll(a)
+	t.Cleanup(func() { _ = os.RemoveAll(a) })
+
+	if _, err := s.AcceptWork(seatTmpSpec("seat-alias-live", a)); err != nil {
+		t.Fatalf("accept live: %v", err)
+	}
+	sentinel := filepath.Join(a, "a-live.txt")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptWork(seatTmpSpec("seat-alias-second", b)); err == nil {
+		t.Fatal("second launch on the aliased path accepted; it must fail closed")
+	} else if !strings.Contains(err.Error(), "seat-alias-live") || !strings.Contains(err.Error(), "seat-alias-second") {
+		t.Fatalf("aliased-path refusal = %v, want an error naming both sessions", err)
+	}
+	if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live seat's file disturbed by the refused launch: %v %q", err, raw)
+	}
+	if _, ok := s.sessionTmpClaimFor("seat-alias-second"); ok {
+		t.Fatal("refused launch left a live claim behind")
+	}
+	if !s.StopSession("seat-alias-live") {
+		t.Fatal("StopSession refused a live session")
+	}
+	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 0)
+	if _, err := os.Lstat(a); !os.IsNotExist(err) {
+		t.Fatalf("live directory survives its terminal cleanup: %v", err)
+	}
+}
+
+// TestSpawner_SessionTmp_DuplicatePathCaseVariantRefusesSecondLaunch pins
+// the marker-identity refusal under a case variant: on the default
+// case-insensitive macOS volume two cleaned strings differing only in
+// case name one directory, which the live-claim scan cannot match. The
+// marker read refuses the second launch before the stamp is overwritten.
+//
+// RED: drop the marker-identity check and the second accept succeeds.
+func TestSpawner_SessionTmp_DuplicatePathCaseVariantRefusesSecondLaunch(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("case-insensitive tmp spellings only collide on macOS default volumes")
+	}
+	probe := fmt.Sprintf("/tmp/case-probe-%d", os.Getpid())
+	probeUpper := "/tmp/" + strings.ToUpper(fmt.Sprintf("case-probe-%d", os.Getpid()))
+	_ = os.RemoveAll(probe)
+	if err := os.Mkdir(probe, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(probeUpper); os.IsNotExist(err) {
+		_ = os.RemoveAll(probe)
+		t.Skip("volume is case-sensitive: the variant names a different directory")
+	}
+	_ = os.RemoveAll(probe)
+
+	s, _, _ := seatTmpSpawner(t, "/bin/sh", "-c", "sleep 30")
+	ended := sessionEnds(s)
+	lower := fmt.Sprintf("/tmp/duplicate-path-case-%d", os.Getpid())
+	upper := "/tmp/" + strings.ToUpper(fmt.Sprintf("duplicate-path-case-%d", os.Getpid()))
+	_ = os.RemoveAll(lower)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(lower)
+		_ = os.RemoveAll(upper)
+	})
+
+	if _, err := s.AcceptWork(seatTmpSpec("seat-case-live", lower)); err != nil {
+		t.Fatalf("accept live: %v", err)
+	}
+	sentinel := filepath.Join(lower, "a-live.txt")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptWork(seatTmpSpec("seat-case-second", upper)); err == nil {
+		t.Fatal("second launch on the case-variant path accepted; it must fail closed")
+	} else if !strings.Contains(err.Error(), "seat-case-live") || !strings.Contains(err.Error(), "seat-case-second") {
+		t.Fatalf("case-variant refusal = %v, want an error naming both sessions", err)
+	}
+	if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live seat's file disturbed by the refused launch: %v %q", err, raw)
+	}
+	if !s.StopSession("seat-case-live") {
+		t.Fatal("StopSession refused a live session")
+	}
+	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 0)
+	if _, err := os.Lstat(lower); !os.IsNotExist(err) {
+		t.Fatalf("live directory survives its terminal cleanup: %v", err)
+	}
+}
+
+// TestSpawner_SessionTmp_DuplicatePathAfterRestartRefusesSecondLaunch pins
+// the marker-identity refusal across a daemon restart: a live adopted
+// session never inserts an in-memory claim in the new process, so the
+// cleaned-string scan cannot see it — but its ownership marker still names
+// it, and a second session stamped with the same path fails closed before
+// the stamp is overwritten. The restart is simulated by a fresh spawner
+// sharing the record directory.
+//
+// RED: drop the marker-identity check and the second prepare succeeds,
+// rewriting the live session's ownership marker.
+func TestSpawner_SessionTmp_DuplicatePathAfterRestartRefusesSecondLaunch(t *testing.T) {
+	t.Parallel()
+	recordDir := t.TempDir()
+	s1 := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	dir := fmt.Sprintf("/tmp/duplicate-path-restart-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	claimA, err := s1.prepareSessionTmpDir(seatTmpSpec("seat-restart-live", dir))
+	if err != nil {
+		t.Fatalf("prepare live: %v", err)
+	}
+	sentinel := filepath.Join(dir, "a-live.txt")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh spawner shares the record directory but holds no in-memory
+	// claim, as an adopted live session would after a restart.
+	s2 := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	if _, err := s2.prepareSessionTmpDir(seatTmpSpec("seat-restart-second", dir)); err == nil {
+		t.Fatal("second prepare on an adopted session's path accepted; it must fail closed")
+	} else if !strings.Contains(err.Error(), "seat-restart-live") || !strings.Contains(err.Error(), "seat-restart-second") {
+		t.Fatalf("restart duplicate refusal = %v, want an error naming both sessions", err)
+	}
+	if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live session's file disturbed by the refused prepare: %v %q", err, raw)
+	}
+	if _, ok := s2.sessionTmpClaimFor("seat-restart-second"); ok {
+		t.Fatal("refused prepare left a live claim behind")
+	}
+	s1.cleanupSessionTmpClaim("seat-restart-live", claimA)
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("live directory survives its terminal cleanup: %v", err)
+	}
+}
+
 // TestSpawner_SessionTmp_StaleClaimCleanupKeepsLive pins the generation
 // fence in terminal cleanup: a stale generation's cleanup must not forget
 // the live generation's claim, delete its directory, or drop its record
@@ -789,22 +956,29 @@ func TestSpawner_SessionTmp_MarkerWriteFailureRefusesLaunch(t *testing.T) {
 
 // TestSpawner_SessionTmp_CreatedDirFailingVerifyIsRemoved pins that a
 // directory this launch created but which fails its own checks is removed
-// again: a failed launch leaks nothing. The forced failure stands in for
-// the TOCTOU the check guards (a swap between creation and verification).
+// again: a failed launch leaks nothing. The hook sabotages the fresh
+// directory off 0700 between creation and verification, so the production
+// verification fails on a real filesystem observation and the production
+// created-rollback beneath it runs.
 //
-// RED: drop the created-rollback and the directory survives the refused
-// launch.
+// RED: drop the production created-rollback (if created) and the
+// directory survives the refused launch; disable the hook and the
+// creation is accepted, failing the refusal assertion.
 func TestSpawner_SessionTmp_CreatedDirFailingVerifyIsRemoved(t *testing.T) {
-	// Not parallel: it sets the process-wide forced-verification hook the
+	// Not parallel: it sets the process-wide after-create hook the
 	// production ensure reads, so it must not run alongside other
 	// scratch-directory tests.
 	dir := fmt.Sprintf("/tmp/created-verify-rollback-%d", os.Getpid())
 	_ = os.RemoveAll(dir)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	sessionTmpForceVerifyFailForTest = func(want string) bool { return want == dir }
-	defer func() { sessionTmpForceVerifyFailForTest = nil }()
+	sessionTmpAfterCreateHookForTest = func(target string) {
+		if target == dir {
+			_ = os.Chmod(target, 0o755) //nolint:gosec // G302: a deliberately loosened sabotage fixture the production verification must refuse.
+		}
+	}
+	defer func() { sessionTmpAfterCreateHookForTest = nil }()
 	if _, _, err := ensureSessionTmpDirCreated(dir); err == nil {
-		t.Fatal("forced verification failure accepted; the launch must fail closed")
+		t.Fatal("sabotaged verification accepted; the launch must fail closed")
 	}
 	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
 		t.Fatalf("created directory survives its failed verification: %v", err)

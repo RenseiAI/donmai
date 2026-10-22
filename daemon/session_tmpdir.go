@@ -31,11 +31,13 @@ package daemon
 // current uid, with mode exactly 0700 — which closes the squat and symlink
 // attacks a shared /tmp invites.
 //
-// A launch whose cleaned path is already claimed by another live session
-// (a duplicated stamp, outside the contract which derives a per-session
-// path) is refused fail-closed: the newer launch never reuses a live
-// session's directory, so ending one session can never delete another
-// live session's files.
+// A launch whose cleaned path is already claimed by another live session,
+// or whose directory still carries another session's ownership marker (the
+// same directory under another spelling, or a live adopted session this
+// process never claimed after a restart), is refused fail-closed: the
+// newer launch never reuses a live session's directory, so ending one
+// session can never delete another live session's files. A duplicated
+// stamp is outside the contract, which derives a per-session path.
 
 import (
 	"encoding/json"
@@ -160,11 +162,13 @@ func ensureSessionTmpDir(raw string) (string, error) {
 // roll back only what they created: a reused directory is never removed on
 // a later bookkeeping failure.
 //
-// sessionTmpForceVerifyFailForTest, when non-nil, forces the post-creation
-// verification to fail for the named directory. Tests set it to pin the
-// created-dir rollback without racing the filesystem; it is nil in
-// production.
-var sessionTmpForceVerifyFailForTest func(dir string) bool
+// sessionTmpAfterCreateHookForTest, when non-nil, runs between creation and
+// the re-inspection below. Tests use it to sabotage the fresh directory
+// (for example chmod it off 0700) so the production verification and the
+// production created-rollback beneath it run against a real failure. It
+// must only mutate the filesystem; it never decides the verdict. It is nil
+// in production.
+var sessionTmpAfterCreateHookForTest func(dir string)
 
 func ensureSessionTmpDirCreated(raw string) (string, bool, error) {
 	dir, err := validateSessionTmpDir(raw)
@@ -184,17 +188,14 @@ func ensureSessionTmpDirCreated(raw string) (string, bool, error) {
 			_ = os.Remove(dir)
 			return "", false, fmt.Errorf("session tmpdir: secure %q: %w", dir, err)
 		}
+		if sessionTmpAfterCreateHookForTest != nil {
+			sessionTmpAfterCreateHookForTest(dir)
+		}
 		fi, err = os.Lstat(dir)
 		if err != nil {
 			return "", false, fmt.Errorf("session tmpdir: re-inspect %q: %w", dir, err)
 		}
 		created = true
-	}
-	if sessionTmpForceVerifyFailForTest != nil && sessionTmpForceVerifyFailForTest(dir) {
-		if created {
-			_ = os.Remove(dir)
-		}
-		return "", false, fmt.Errorf("session tmpdir: forced verification failure for %q", dir)
 	}
 	if err := verifySessionTmpExisting(dir, fi, os.Getuid()); err != nil {
 		if created {
@@ -222,12 +223,34 @@ func (c sessionTmpClaim) owned() bool {
 }
 
 // sessionTmpOwnerRecord is the marker file content: the owning session and
-// generation. A cleanup removes the directory only when the marker still
-// names its own claim, so generations sharing one path never delete each
-// other's files.
+// the generation. A cleanup removes the directory only when the marker still
+// names its own claim, so a stale generation never deletes its session's
+// live generation's directory. A launch stamped with another session's path
+// is refused before stamping (see prepareSessionTmpDir), so cross-session
+// sharing never reaches this fence: the marker proves same-session
+// generations, the refusal guards cross-session duplicates.
 type sessionTmpOwnerRecord struct {
 	SessionID string `json:"sessionId"`
 	Gen       uint64 `json:"gen"`
+}
+
+// readSessionTmpOwnerRecord reports the ownership marker inside dir, when
+// one is present and decodes. A missing file, an unreadable one, or one
+// that does not decode is not an owner: the caller proceeds and the later
+// stamp or removal proof decides.
+func readSessionTmpOwnerRecord(dir string) (sessionTmpOwnerRecord, bool) {
+	raw, err := os.ReadFile(filepath.Join(dir, sessionTmpOwnerFile)) //nolint:gosec // G304: dir is a validated /tmp child and the name a constant.
+	if err != nil {
+		return sessionTmpOwnerRecord{}, false
+	}
+	var record sessionTmpOwnerRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return sessionTmpOwnerRecord{}, false
+	}
+	if record.SessionID == "" {
+		return sessionTmpOwnerRecord{}, false
+	}
+	return record, true
 }
 
 // writeSessionTmpOwner stamps the ownership marker inside a directory the
@@ -411,6 +434,14 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 	// directory's marker. A duplicated stamp (outside the contract, which
 	// derives a per-session path) fails closed naming both sessions, so
 	// ending one session can never delete another live session's files.
+	// The cleaned-string scan above cannot see a live session holding the
+	// same directory under another spelling (the macOS /tmp alias, a case
+	// variant on a case-insensitive volume) or a live adopted session this
+	// process never claimed (after a restart, only the record and the
+	// marker name it). The marker lives in the directory itself, so every
+	// spelling reads the same owner: a marker naming another session
+	// refuses this launch before the stamp is overwritten. A marker naming
+	// this session (a continued turn) proceeds to a fresh generation.
 	s.mu.Lock()
 	for id, existing := range s.sessionTmpDirs {
 		if id != spec.SessionID && existing.owned() && existing.Dir == dir {
@@ -420,6 +451,13 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 			}
 			return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already claimed by live session %q (session %q refused)", dir, id, spec.SessionID)
 		}
+	}
+	if owner, ok := readSessionTmpOwnerRecord(dir); ok && owner.SessionID != spec.SessionID {
+		s.mu.Unlock()
+		if created {
+			_ = os.Remove(dir)
+		}
+		return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already owned by session %q (session %q refused)", dir, owner.SessionID, spec.SessionID)
 	}
 	if err := writeSessionTmpOwner(dir, spec.SessionID, gen); err != nil {
 		s.mu.Unlock()
