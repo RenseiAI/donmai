@@ -150,7 +150,8 @@ func scriptSource(eventsPath string) string {
 # a telemetry hook must never fail a turn, even when the disk is full.
 # Hook stdin is discarded: the moment is the telemetry, never the payload.
 set -u
-event="${1:?}"
+event="${1:-}"
+if [ -z "$event" ]; then exit 0; fi
 out=` + p + `
 ts="$(date -u +%FT%TZ 2>/dev/null || echo "")"
 printf '{"v":1,"event":"%s","ts":"%s"}\n' "$event" "$ts" >>"$out" 2>/dev/null || true

@@ -81,6 +81,35 @@ func TestRelayScriptExitsZeroWithNoStdin(t *testing.T) {
 	}
 }
 
+func TestRelayScriptExitsZeroWithNoArgv(t *testing.T) {
+	t.Parallel()
+	r, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+
+	// The harness always bakes the moment into argv, but a future caller or
+	// operator probe may invoke the script bare. The documented contract is
+	// "Exits 0 on every path", so a missing argv must abstain silently
+	// instead of failing the turn under `set -u`.
+	cmd := exec.Command("/bin/sh", r.ScriptPath()) //nolint:gosec // test re-executes the relay script the test itself just rendered into its own temp dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("relay script with no argv: %v (output %q)", err, out)
+	}
+
+	raw, err := os.ReadFile(r.EventsPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("read events: %v", err)
+	}
+	if len(raw) != 0 {
+		t.Fatalf("relay script with no argv appended %q, want nothing", raw)
+	}
+}
+
 func TestRelayCommandBakesEventAndPath(t *testing.T) {
 	t.Parallel()
 	r, err := New()
@@ -125,6 +154,12 @@ func TestParseLineFixtures(t *testing.T) {
 			name:      "permission request",
 			line:      `{"v":1,"event":"permission_request","ts":"t","payload":{"tool_name":"Bash"}}`,
 			wantEvent: "permission_request",
+			wantOK:    true,
+		},
+		{
+			name:      "padded moment trims to canonical",
+			line:      `{"v":1,"event":" session_start ","ts":"t"}`,
+			wantEvent: "session_start",
 			wantOK:    true,
 		},
 		{
