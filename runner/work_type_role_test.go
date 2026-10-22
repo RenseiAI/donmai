@@ -480,9 +480,11 @@ func TestWorkTypeRoleContinueSeed(t *testing.T) {
 
 // TestWorkTypeRoleContinueDelivery pins the continue-mode delivery gate
 // through a full Run: a custom inflight continue session that leaves the
-// continued head unmoved fails the no-new-commit delivery check. Dropping
-// the role at the delivery gate skips that check, so the session ends
-// completed instead of failed and this test goes RED on that mutant.
+// continued head unmoved ends completed with the typed no-op continuation
+// outcome on a passed turn, keeping the no-new-commit message as a
+// post-session warning. Dropping the role at the delivery gate skips that
+// check, so the session ends completed with an empty outcome instead of
+// the typed no-op and this test goes RED on that mutant.
 func TestWorkTypeRoleContinueDelivery(t *testing.T) {
 	res, _ := runScriptedSession(t, scriptedSession{
 		workType:       "chief-of-staff",
@@ -492,11 +494,20 @@ func TestWorkTypeRoleContinueDelivery(t *testing.T) {
 		continueNumber: 12,
 		turns:          []verdictScriptTurn{{text: "WORK_RESULT:passed"}},
 	})
-	if res.Status != "failed" || res.FailureMode != FailureBackstop {
-		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	if res.Status != "completed" || res.ContinuationOutcome != ContinuationOutcomeNoOp {
+		t.Fatalf("Status = %q outcome %q (%s: %s); want completed %s", res.Status, res.ContinuationOutcome, res.FailureMode, res.Error, ContinuationOutcomeNoOp)
 	}
-	if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
-		t.Fatalf("Error = %q, want %q", res.Error, want)
+	if res.FailureMode != "" || res.Error != "" {
+		t.Fatalf("FailureMode = %q Error = %q; want both empty on a completed no-op", res.FailureMode, res.Error)
+	}
+	found := false
+	for _, w := range res.PostSessionWarnings {
+		if w == "continued pull request #12 has no new commit since dispatch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("PostSessionWarnings = %q; want the no-new-commit message kept as a warning", res.PostSessionWarnings)
 	}
 }
 
