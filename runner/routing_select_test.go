@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 
@@ -57,6 +58,15 @@ func selectWork(srvURL string) QueuedWork {
 }
 
 func TestSelectProviderByPosterior_DefaultOn_Posts(t *testing.T) {
+	// Hermetic: the default-on path must not inherit an opt-out value from
+	// the outer environment. os.Unsetenv covers the truly-unset case
+	// (os.Getenv also reports "" for unset, so the empty case below matches).
+	if v, ok := os.LookupEnv("ROUTING_SELECTOR_ENABLED"); ok {
+		t.Setenv("ROUTING_SELECTOR_ENABLED", v)
+		if err := os.Unsetenv("ROUTING_SELECTOR_ENABLED"); err != nil {
+			t.Fatalf("unset ROUTING_SELECTOR_ENABLED: %v", err)
+		}
+	}
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
@@ -93,6 +103,33 @@ func TestSelectProviderByPosterior_ExplicitOptOut_NoPost(t *testing.T) {
 			}
 			if hits.Load() != 0 {
 				t.Fatalf("opt-out must POST nothing, got %d POSTs", hits.Load())
+			}
+		})
+	}
+}
+
+func TestSelectProviderByPosterior_NonOptOutValues_DefaultOn(t *testing.T) {
+	// Only an explicit false/0/no/off (case-insensitive, trimmed) opts out.
+	// Every other value — including empty, whitespace, truthy strings and
+	// unrecognised values — keeps the default-ON behaviour: the runner asks
+	// the platform and honours a posterior pick from the candidates.
+	for _, v := range []string{"", "true", "TRUE", "1", "yes", "on", "  ", "banana"} {
+		t.Run("on-value "+v, func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte(`{"selectedProvider":"codex","source":"mab-routing"}`))
+			}))
+			defer srv.Close()
+			t.Setenv("ROUTING_SELECTOR_ENABLED", v)
+			r := selectRunner(t, srv.Client(), "claude", "codex")
+			name, ok := r.selectProviderByPosterior(context.Background(), selectWork(srv.URL))
+			if !ok || name != "codex" {
+				t.Fatalf("non-opt-out %q must override: got (%q,%v)", v, name, ok)
+			}
+			if hits.Load() != 1 {
+				t.Fatalf("non-opt-out %q must POST once, got %d POSTs", v, hits.Load())
 			}
 		})
 	}

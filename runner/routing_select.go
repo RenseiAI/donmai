@@ -14,7 +14,7 @@ package runner
 //     explicit "false" (or "0", "no", "off") opts out. The platform flag
 //     is the AUTHORITATIVE switch — per-project routing mode plus the org
 //     live flag decide; this local gate only avoids a pointless round-trip
-//     when an operator hasn't opted in.
+//     when an operator has explicitly opted out.
 //   - The platform OWNS the explicit-choice guard — when a user pinned a
 //     provider the platform returns source='explicit' and we keep the static
 //     choice. We never have to reason about it here.
