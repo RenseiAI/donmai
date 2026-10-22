@@ -68,20 +68,16 @@ func (f *fakeWorkareaClient) RestoreWorkareaV1Context(ctx context.Context, archi
 	f.gotRestore = req
 	if f.restoreV1Resp == nil && f.restoreV1Err == nil {
 		// Unconfigured versioned response: behave like a daemon that
-		// predates the contract (non-sentinel failure) so the caller
-		// falls back to the legacy shape. Sentinel failures are set
-		// explicitly per test via restoreV1Err.
-		return nil, errors.New("v1 unavailable")
+		// predates the contract. The same endpoint serves both shapes, so
+		// its legacy body decodes into the versioned one with no archive
+		// reference.
+		if f.restoreResp == nil {
+			return nil, f.restoreErr
+		}
+		lifted := afclient.WorkareaRestoreV1Result{Workarea: afclient.UpgradeWorkareaV1(f.restoreResp.Workarea)}
+		return &lifted, f.restoreErr
 	}
 	return f.restoreV1Resp, f.restoreV1Err
-}
-
-func (f *fakeWorkareaClient) RestoreWorkareaContext(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error) {
-	f.restoreCalls++
-	f.restoreCtx = ctx
-	f.gotArchive = archiveID
-	f.gotRestore = req
-	return f.restoreResp, f.restoreErr
 }
 
 func (f *fakeWorkareaClient) DiffWorkareas(idA, idB string) (*afclient.WorkareaDiffResult, error) {

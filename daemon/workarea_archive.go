@@ -424,7 +424,11 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 	final := spec.WorkareaID
 	if _, err := archiveRoot.Lstat(final); err == nil {
 		existing, readErr := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
-		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID && existing.TerminalResultID == spec.TerminalResultID {
+		// A manifest with no terminal result binding was committed by a
+		// daemon that predates the field. A retry of that same release
+		// (same acquisition, workarea and session, re-verified bytes below)
+		// is idempotent; only a different non-empty binding collides.
+		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID && (existing.TerminalResultID == "" || existing.TerminalResultID == spec.TerminalResultID) {
 			archivedRoot, openErr := archiveRoot.OpenRoot(filepath.Join(spec.WorkareaID, "tree"))
 			if openErr != nil {
 				return nil, fmt.Errorf("archive root: open existing archive tree: %w", openErr)
@@ -611,11 +615,14 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 // identity and digest reproduce the same reference. A conflicting
 // identity/digest for the caller's terminal result is refused.
 //
-// Mixed-version safety: commits that predate the reference contract, or that
-// carry no terminal result binding, yield (nil, nil) so the legacy commit
-// path is byte-identical to before. Only a spec that disagrees with committed
-// bytes, or a committed manifest that cannot form a valid reference while a
-// terminal result is bound, fails.
+// Mixed-version safety: commits that predate the reference contract, or where
+// neither the manifest nor the caller carries a terminal result binding,
+// yield (nil, nil) so the legacy commit path is byte-identical to before. A
+// manifest that predates the terminal result field takes the caller's
+// binding, so a retried release over an older daemon's commit still records
+// its reference. Only a spec that disagrees with committed bytes, or a
+// committed manifest that cannot form a valid reference while a terminal
+// result is bound, fails.
 func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArchiveSpec, existing *archiveManifest) (*workarea.TerminalArchiveReference, error) {
 	if existing == nil || existing.TreeDigest == "" || existing.WorkareaID == "" || existing.SessionID == "" {
 		return nil, fmt.Errorf("archive root: committed archive identity is incomplete: %w", ErrArchiveCorrupted)

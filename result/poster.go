@@ -321,6 +321,12 @@ type statusRequest struct {
 	// many were used. Additive; omitted when none was needed.
 	TurnContinuations *agent.TurnContinuations `json:"turnContinuations,omitempty"`
 
+	// PreparationSeconds is how long the session spent preparing before
+	// the agent started: workarea provisioning, dependency installs and
+	// prompt assembly, in whole seconds. Additive; omitted when the
+	// result recorded none — old platforms ignore it.
+	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
+
 	// BudgetBreach names the session budget cap the runner stopped the
 	// session at: the failure reason on a failed session, and on a completed
 	// one the flag that the delivered work ran over its budget. Additive;
@@ -727,7 +733,8 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		TerminalWorkareaLease:    projection,
 		TerminalArchiveReference: archiveReference,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
+		PreparationSeconds: r.PreparationSeconds,
+		BudgetBreach:       r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),

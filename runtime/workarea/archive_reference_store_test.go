@@ -2,6 +2,7 @@ package workarea_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,51 @@ func TestRecordArchiveReferenceRefusesConflict(t *testing.T) {
 	}
 	if reloaded.ArchiveReference == nil || !reloaded.ArchiveReference.IdentityEqual(first) {
 		t.Fatalf("stored reference changed: %+v", reloaded.ArchiveReference)
+	}
+}
+
+// TestRecordArchiveReferenceRefusesForeignIdentity pins the identity fence:
+// a reference naming another session, workarea or terminal result is never
+// bound onto a lease that has no reference yet. Without the fence the first
+// foreign reference would be written, because no recorded reference exists
+// to conflict with.
+func TestRecordArchiveReferenceRefusesForeignIdentity(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		mutate func(*workarea.TerminalArchiveReference)
+	}{
+		{"session", func(r *workarea.TerminalArchiveReference) { r.SessionID = sessionB }},
+		{"workarea", func(r *workarea.TerminalArchiveReference) { r.WorkareaID = workareaB; r.ArchiveID = workareaB }},
+		{"terminal_result", func(r *workarea.TerminalArchiveReference) { r.TerminalResultID = resultB }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := newArchiveReferenceStore(t, time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC))
+			lease := acquireArchiveReferenceLease(t, store)
+			foreign := workarea.TerminalArchiveReference{
+				SchemaVersion: workarea.TerminalArchiveReferenceSchemaV1, ArchiveID: lease.WorkareaID,
+				ArchiveDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				SessionID:     lease.SessionID, WorkareaID: lease.WorkareaID,
+				TerminalResultID: lease.TerminalResultID,
+				CommittedAt:      time.Date(2026, 7, 18, 12, 30, 0, 123_000_000, time.UTC),
+			}
+			tc.mutate(&foreign)
+			if err := foreign.Validate(); err != nil {
+				t.Fatalf("fixture must be a valid reference so only the fence can refuse it: %v", err)
+			}
+			if _, err := store.RecordArchiveReference(context.Background(), lease.LeaseID, foreign); !errors.Is(err, workarea.ErrLeaseConflict) {
+				t.Fatalf("foreign %s reference: err = %v, want ErrLeaseConflict", tc.name, err)
+			}
+			reloaded, err := store.Get(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reloaded.ArchiveReference != nil {
+				t.Fatalf("refused write bound a reference: %+v", reloaded.ArchiveReference)
+			}
+		})
 	}
 }
 

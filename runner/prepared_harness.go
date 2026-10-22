@@ -91,6 +91,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	}
 	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, provider.Capabilities(), working.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, working.RepositoryDeclaration != nil)
+	composition.HarnessProtocol = injectSignalGuardProtocolPartial(composition.HarnessProtocol)
 	userPrompt := composition.UserPrompt
 	if working.isInteractive() {
 		userPrompt = working.InitialPrompt
