@@ -27,7 +27,6 @@ type workareaDaemonClient interface {
 	ListWorkareas() (*afclient.ListWorkareasResponse, error)
 	GetWorkarea(id string) (*afclient.WorkareaEnvelope, error)
 	GetWorkareaV1(id string) (*afclient.WorkareaV1Envelope, error)
-	RestoreWorkareaContext(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error)
 	RestoreWorkareaV1Context(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreV1Result, error)
 	DiffWorkareas(idA, idB string) (*afclient.WorkareaDiffResult, error)
 }
@@ -216,24 +215,13 @@ Pool saturation returns 503 + Retry-After.`,
 func runWorkareaRestore(ctx context.Context, out io.Writer, client workareaDaemonClient, archiveID string,
 	req afclient.WorkareaRestoreRequest, jsonOut bool,
 ) error {
-	// Prefer the versioned restore projection: it carries the committed
-	// archive recovery reference the operator readback requires. A daemon
-	// that predates the contract fails the V1 call with a non-sentinel
-	// decode error, so fall through to the legacy shape only then.
-	// Sentinel errors (not-found, conflict, saturated, corrupted) are
-	// terminal and map to operator messages without a second call.
-	if resV1, err := client.RestoreWorkareaV1Context(ctx, archiveID, req); err == nil {
-		if jsonOut {
-			return encodeWorkareaJSON(out, resV1)
-		}
-		noColor := workareaview.NoColorEnv()
-		return workareaview.RenderRestoreV1(out, resV1, noColor)
-	} else if mapped := mapWorkareaRestoreError(err, archiveID, req); mapped != nil {
-		return mapped
-	}
-	// Non-sentinel V1 failure: legacy fallback for a daemon that predates
-	// the versioned shape.
-	res, err := client.RestoreWorkareaContext(ctx, archiveID, req)
+	// Restore is mutating, so it is submitted exactly once and its body is
+	// decoded once. The versioned projection is a superset of the legacy
+	// one served by the same endpoint: an older daemon's body decodes with
+	// no archive reference and renders the legacy view unchanged. A failed
+	// call is never re-submitted, because the daemon may already have
+	// restored and a second POST would materialise a duplicate workarea.
+	res, err := client.RestoreWorkareaV1Context(ctx, archiveID, req)
 	if err != nil {
 		if mapped := mapWorkareaRestoreError(err, archiveID, req); mapped != nil {
 			return mapped
@@ -244,12 +232,12 @@ func runWorkareaRestore(ctx context.Context, out io.Writer, client workareaDaemo
 		return encodeWorkareaJSON(out, res)
 	}
 	noColor := workareaview.NoColorEnv()
-	return workareaview.RenderRestore(out, res, noColor)
+	return workareaview.RenderRestoreV1(out, res, noColor)
 }
 
 // mapWorkareaRestoreError maps sentinel restore failures to operator
-// messages. It returns nil for non-sentinel errors, which signal a
-// version-skewed daemon rather than a terminal operator failure.
+// messages. It returns nil for any other error, which the caller reports
+// as-is.
 func mapWorkareaRestoreError(err error, archiveID string, req afclient.WorkareaRestoreRequest) error {
 	switch {
 	case errors.Is(err, afclient.ErrNotFound):
