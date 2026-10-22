@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -868,5 +869,389 @@ func TestCredentialRefresher_UpdateRegistrationTokenPreservesOtherFields(t *test
 		got.JWTPath != opts.Registration.JWTPath ||
 		got.MaxAgents != 3 {
 		t.Fatal("token update replaced non-token registration fields")
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenRefusesBadShape pins that a
+// fail-open swap cannot demote the refresher: a blank, padded, or
+// foreign-shaped token is refused with an error, the previous generation
+// stays in place, and no request reaches the wire. On the pre-fix setter
+// alone each case succeeds silently and the refresher holds the bad token.
+func TestCredentialRefresher_RotateRegistrationTokenRefusesBadShape(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		token string
+	}{
+		{name: "blank", token: ""},
+		{name: "leading whitespace", token: " rsp_live_rotated"},
+		{name: "trailing whitespace", token: "rsp_live_rotated "},
+		{name: "unprefixed", token: "operator-pasted-wrong-value"},
+		{name: "stub-shaped", token: "local-stub-no-token"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var mu sync.Mutex
+			requests := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				mu.Lock()
+				requests++
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+			}))
+			defer srv.Close()
+
+			r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+			// #nosec G101 -- test fixture token
+			if _, err := r.RotateRegistrationToken(context.Background(), tc.token, "runtime-token-expired"); err == nil {
+				t.Fatalf("RotateRegistrationToken(%q) succeeded; want refusal", tc.token)
+			}
+
+			r.mu.Lock()
+			held := r.opts.Registration.RegistrationToken
+			r.mu.Unlock()
+			if held != "rsp_live_x" {
+				t.Errorf("refresher holds %q, want the previous generation kept", held)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if requests != 0 {
+				t.Errorf("refused rotation made %d wire request(s); want none", requests)
+			}
+		})
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenProvesThenAdopts pins the
+// validate-before-switching half: a new generation the control plane honours
+// is presented on the rotation's own round trip (no second refresh needed),
+// fans out to every lane, and persists as the refresher's token. Against the
+// raw setter this fails at the first assertion — nothing reaches the wire.
+func TestCredentialRefresher_RotateRegistrationTokenProvesThenAdopts(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var gotAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"runtimeToken":                "refreshed.jwt",
+			"registrationTokenExpiresAt":  "2030-06-01T00:00:00Z",
+			"registrationTokenRenewAfter": "2030-05-01T00:00:00Z",
+		})
+	}))
+	defer srv.Close()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+	lane := &recordingLane{}
+	r.Attach(lane)
+	// #nosec G101 -- test fixture token
+	result, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired")
+	if err != nil {
+		t.Fatalf("RotateRegistrationToken: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotAuth) != 1 || gotAuth[0] != "Bearer rsp_live_rotated" {
+		t.Fatalf("rotation presented auth %v, want exactly [Bearer rsp_live_rotated]", gotAuth)
+	}
+	if result.Mode != "refresh" {
+		t.Errorf("rotation mode = %q, want refresh (rotation must never mint a competing identity)", result.Mode)
+	}
+	if result.RegistrationTokenExpiresAt != "2030-06-01T00:00:00Z" || result.RegistrationTokenRenewAfter != "2030-05-01T00:00:00Z" {
+		t.Errorf("rotation result hints = (%q, %q), want the proven generation's hints", result.RegistrationTokenExpiresAt, result.RegistrationTokenRenewAfter)
+	}
+	if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "refreshed.jwt" {
+		t.Errorf("lane = (%q, %q), want the proven credentials fanned out", id, jwt)
+	}
+	if token, _ := r.Registration(); token != "rsp_live_rotated" {
+		t.Errorf("refresher holds %q, want the proven generation", token)
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenRestoresPreviousOnRefusal
+// pins the restore-on-failure half: when the control plane refuses the new
+// generation, the rotation surfaces the error and the refresher still holds
+// the previous working token, so the next ordinary refresh keeps working.
+// Against the raw setter plus a refresh the old token is already lost.
+func TestCredentialRefresher_RotateRegistrationTokenRestoresPreviousOnRefusal(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var gotAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		refused := len(gotAuth) == 1
+		mu.Unlock()
+		if refused {
+			http.Error(w, `{"error":"unknown registration"}`, http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+	lane := &recordingLane{}
+	r.Attach(lane)
+	// #nosec G101 -- test fixture token
+	if _, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rejected", "runtime-token-expired"); err == nil {
+		t.Fatal("rotation of a refused token succeeded; want the error surfaced")
+	}
+
+	if token, _ := r.Registration(); token != "rsp_live_x" {
+		t.Fatalf("refresher holds %q after refusal, want the previous generation restored", token)
+	}
+
+	result, err := r.Refresh(context.Background(), "runtime-token-expired")
+	if err != nil {
+		t.Fatalf("refresh after refused rotation: %v", err)
+	}
+	if result.RuntimeToken != "refreshed.jwt" {
+		t.Errorf("refresh after refused rotation minted %q, want the working generation's credentials", result.RuntimeToken)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"Bearer rsp_live_rejected", "Bearer rsp_live_x"}
+	if len(gotAuth) != len(want) {
+		t.Fatalf("wire auth = %v, want %v", gotAuth, want)
+	}
+	for i := range want {
+		if gotAuth[i] != want[i] {
+			t.Fatalf("wire auth = %v, want %v", gotAuth, want)
+		}
+	}
+	if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "refreshed.jwt" {
+		t.Errorf("lane = (%q, %q), want the working generation's credentials", id, jwt)
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenNeedsAnIdentity pins that
+// rotation without a current worker identity refuses and leaves the token
+// unchanged, instead of adopting a generation nothing has proven.
+func TestCredentialRefresher_RotateRegistrationTokenNeedsAnIdentity(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "", "before.jwt"))
+	// #nosec G101 -- test fixture token
+	if _, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired"); err == nil {
+		t.Fatal("rotation without an identity succeeded; want refusal")
+	}
+	if token, _ := r.Registration(); token != "rsp_live_x" {
+		t.Errorf("refresher holds %q, want the previous generation kept", token)
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenFailedKeepsConcurrentUpdate
+// pins that a failed rotation never clobbers a newer generation: when the
+// control plane refuses the rotated token AFTER a concurrent
+// UpdateRegistrationToken lands, the refresher keeps the concurrent
+// generation instead of restoring the pre-rotation one. Against an
+// unconditional restore the refresher holds the stale previous generation
+// and the test goes red.
+func TestCredentialRefresher_RotateRegistrationTokenFailedKeepsConcurrentUpdate(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		enterOnce.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		http.Error(w, `{"error":"unknown registration"}`, http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	// Unblock the handler before srv.Close waits out outstanding requests.
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+	rotateDone := make(chan error, 1)
+	go func() {
+		// #nosec G101 -- test fixture token
+		_, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired")
+		rotateDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rotation did not reach the wire")
+	}
+
+	// A newer generation lands while the prove round trip is in flight.
+	// #nosec G101 -- test fixture token
+	r.UpdateRegistrationToken("rsk_live_concurrent")
+	close(release)
+
+	select {
+	case err := <-rotateDone:
+		if err == nil {
+			t.Fatal("rotation of a refused token succeeded; want the error surfaced")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not return")
+	}
+
+	if token, _ := r.Registration(); token != "rsk_live_concurrent" {
+		t.Fatalf("refresher holds %q after a failed rotation, want the concurrent generation kept", token)
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenWaitsForInflightReregister
+// pins the operation-slot serialization the rotation doc comment claims: a
+// rotation started while a re-registration is in flight does not reach the
+// wire until the re-registration settles, then re-presents the NEW worker
+// identity the re-registration minted. Without the slot the rotation
+// presents the stale identity concurrently and the test goes red.
+func TestCredentialRefresher_RotateRegistrationTokenWaitsForInflightReregister(t *testing.T) {
+	t.Parallel()
+
+	reregisterEntered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	var mu sync.Mutex
+	var refreshPaths []string
+	var refreshAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == RegisterEndpoint {
+			enterOnce.Do(func() { close(reregisterEntered) })
+			select {
+			case <-release:
+			case <-req.Context().Done():
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workerId":     "wkr_after",
+				"runtimeToken": "after.jwt",
+			})
+			return
+		}
+		if !strings.HasSuffix(req.URL.Path, "/refresh-token") {
+			http.NotFound(w, req)
+			return
+		}
+		mu.Lock()
+		refreshPaths = append(refreshPaths, req.URL.Path)
+		refreshAuth = append(refreshAuth, req.Header.Get("Authorization"))
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+	// Unblock the handler before srv.Close waits out outstanding requests.
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+	lane := &recordingLane{}
+	r.Attach(lane)
+
+	reregDone := make(chan error, 1)
+	go func() {
+		_, err := r.Reregister(context.Background())
+		reregDone <- err
+	}()
+
+	select {
+	case <-reregisterEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-registration did not reach the wire")
+	}
+
+	rotateRes := make(chan *RefreshTokenResult, 1)
+	rotateErr := make(chan error, 1)
+	go func() {
+		// #nosec G101 -- test fixture token
+		res, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired")
+		if err != nil {
+			rotateErr <- err
+			return
+		}
+		rotateRes <- res
+	}()
+
+	// Give a slot-less rotation a chance to (incorrectly) proceed.
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	early := len(refreshPaths)
+	mu.Unlock()
+	if early != 0 {
+		t.Fatalf("rotation reached the wire while a re-registration was in flight (%d refresh requests)", early)
+	}
+	close(release)
+
+	select {
+	case err := <-reregDone:
+		if err != nil {
+			t.Fatalf("re-registration: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("re-registration did not return")
+	}
+	select {
+	case err := <-rotateErr:
+		t.Fatalf("rotation after re-registration: %v", err)
+	case res := <-rotateRes:
+		if res.WorkerID != "wkr_after" {
+			t.Errorf("rotation worker = %q, want the re-registered identity re-presented", res.WorkerID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not return")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(refreshPaths) != 1 || refreshPaths[0] != "/api/workers/wkr_after/refresh-token" {
+		t.Fatalf("rotation presented %v, want exactly [/api/workers/wkr_after/refresh-token]", refreshPaths)
+	}
+	// #nosec G101 -- test fixture token asserted, not embedded
+	if len(refreshAuth) != 1 || refreshAuth[0] != "Bearer rsp_live_rotated" {
+		t.Fatalf("rotation presented auth %v, want exactly [Bearer rsp_live_rotated]", refreshAuth)
+	}
+	if token, _ := r.Registration(); token != "rsp_live_rotated" {
+		t.Errorf("refresher holds %q, want the proven generation", token)
+	}
+	if id, jwt, _ := lane.current(); id != "wkr_after" || jwt != "refreshed.jwt" {
+		t.Errorf("lane = (%q, %q), want the proven credentials fanned out", id, jwt)
 	}
 }
