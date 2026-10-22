@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // claudeArgs mirrors the fixed headless argv the claude provider's
@@ -51,7 +52,7 @@ func fakeCLI(t *testing.T, body string) string {
 	// surfaces a stale write-handle hand-off. Writing with mode 0o600
 	// and chmodding to 0o700 post-close means the file never carries
 	// the exec bit while any writable FD exists.
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake cli: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
@@ -319,7 +320,7 @@ func TestHandle_CtxCancel_Stops(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		`echo '{"type":"system","subtype":"init","session_id":"sx"}'` + "\n" +
 		"sleep 30\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit

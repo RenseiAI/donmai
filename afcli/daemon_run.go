@@ -455,10 +455,11 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			leaseManager, err := worktree.NewManager(worktree.Options{
 				ParentDir: worktreeParent,
 				Logger:    slog.Default(),
-				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
-					return archiveRegistry.ArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
+				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+					return archiveRegistry.CommitArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
 						AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
 						WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath,
+						TerminalResultID: spec.TerminalResultID,
 					})
 				},
 			})

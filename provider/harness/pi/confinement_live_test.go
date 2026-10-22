@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -23,9 +22,9 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
-	"github.com/RenseiAI/donmai/runtime/harnessstate"
 )
 
 // This file is the Done-when evidence: tests that drive pi through the
@@ -185,15 +184,6 @@ func newLiveWorld(t *testing.T) liveWorld {
 	return w
 }
 
-func gitInit(t *testing.T, dir string) {
-	t.Helper()
-	cmd := exec.Command("git", "-c", "init.defaultBranch=main", "init", "--quiet", dir) //nolint:gosec // G204: test fixture; dir is a test temp path.
-	cmd.Env = harnessstate.GitLocationNeutralEnv(os.Environ())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git init %s: %v\n%s", dir, err, out)
-	}
-}
-
 // spec returns the session spec for the world's mutable leaf.
 func (w liveWorld) spec() agent.Spec {
 	return agent.Spec{SessionName: "live", Cwd: w.mut, Prompt: "probe"}
@@ -218,7 +208,7 @@ func writeLiveHarness(t *testing.T, w liveWorld, extra ...string) string {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-pi")
-	if err := os.WriteFile(bin, []byte(fakeHarnessScript), 0o755); err != nil { //nolint:gosec // G306: test fixture needs the exec bit.
+	if err := testexec.WriteFile(bin, []byte(fakeHarnessScript), 0o755); err != nil { //nolint:gosec // G306: test fixture needs the exec bit.
 		t.Fatal(err)
 	}
 	handshake := filepath.Join(dir, "handshake.jsonl")

@@ -236,13 +236,17 @@ interactive launch — never by writing to the operator's own codex home:
 
 | Seed | Value | Why it may be seeded |
 | --- | --- | --- |
-| `projects."<workspace>".trust_level` | `trusted` | The runner provisioned that directory. Both the given path and its symlink-resolved form are seeded, because codex matches a project entry by exact path. |
+| `projects."<workspace>".trust_level` | `trusted` for a standalone session, `untrusted` for a platform-launched session | The runner provisioned that directory. Both the given path and its symlink-resolved form are seeded, because codex matches a project entry by exact path. A platform session stays untrusted so codex skips project `.codex/` config, hooks, and rules while keeping ordinary filesystem access; only a standalone session is trusted. |
 | `features.hooks` | `false` | Hooks found in the workspace are repo content, not platform-provisioned, and trusting one grants command execution outside the sandbox. This takes codex's own third option — continue without trusting, hooks do not run — deterministically. Set `DONMAI_CODEX_HOOKS=inherit` to leave codex's hook handling alone (an attended terminal can then review them; an unattended one can block). |
 
 Requested MCP servers need no *startup* seed: codex starts every server in
 effective configuration with no approval step, and one that fails to start
 (including a `401`) degrades to a warning line rather than a prompt. Their
 per-tool-CALL approval is a separate matter — see the next section.
+
+Repository `.codex/hooks.json` hooks never run in a platform session, so
+per-session context must come through the launch (developer instructions or
+the first turn), not repo hooks.
 
 The `projects` override SHADOWS the ambient projects table for the child
 process, so a session's trusted set is exactly the workspace the platform

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // TestProbeHostSessionLogin_WedgedProbeReapsProcessGroup pins the F5
@@ -28,7 +30,7 @@ func TestProbeHostSessionLogin_WedgedProbeReapsProcessGroup(t *testing.T) {
 		"sleep 300 </dev/null >/dev/null 2>&1 &\n" +
 		"echo $! > \"" + pidFile + "\"\n" +
 		"exec sleep 300\n"
-	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write script: %v", err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit

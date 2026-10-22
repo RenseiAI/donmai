@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestGhPRCommandsSanitizeRunnerOnlyEnvironment(t *testing.T) {
@@ -31,7 +33,7 @@ case "$1 $2" in
 	*) printf 'unexpected gh arguments: %s\n' "$*" >&2; exit 99 ;;
 esac
 `
-	if err := os.WriteFile(fakeGh, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+	if err := testexec.WriteFile(fakeGh, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture must be executable
 		t.Fatalf("write fake gh: %v", err)
 	}
 
@@ -201,7 +203,7 @@ case "$1 $2" in
   *) exit 99 ;;
 esac
 `
-	if err := os.WriteFile(fakeGh, []byte(script), 0o755); err != nil { //nolint:gosec // executable fixture
+	if err := testexec.WriteFile(fakeGh, []byte(script), 0o755); err != nil { //nolint:gosec // executable fixture
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))

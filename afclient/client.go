@@ -369,8 +369,22 @@ func (c *Client) postWithErrorDecoder(
 	return nil
 }
 
-const maxStopSessionErrorBodyBytes = 16 << 10
+const (
+	maxStopSessionErrorBodyBytes   = 16 << 10
+	maxPromptSessionErrorBodyBytes = 16 << 10
+)
 
+type promptSessionErrorWire struct {
+	Delivered      *bool         `json:"delivered"`
+	DeliveryTier   string        `json:"deliveryTier"`
+	Disposition    string        `json:"disposition"`
+	SessionID      string        `json:"sessionId"`
+	SessionStatus  SessionStatus `json:"sessionStatus"`
+	Code           string        `json:"code"`
+	Reason         string        `json:"error"`
+	RecoveryAction string        `json:"recoveryAction"`
+	MissingFields  []string      `json:"missingProjectionFields"`
+}
 type stopSessionErrorWire struct {
 	Stopped        *bool         `json:"stopped"`
 	SessionID      string        `json:"sessionId"`
@@ -431,6 +445,71 @@ func validStopSessionError(wire stopSessionErrorWire) bool {
 		optionalReceiptAtom(wire.OwnerLiveness, 64) &&
 		optionalReceiptAtom(wire.MutationID, 256) &&
 		(wire.PreparedAgeMs == nil || *wire.PreparedAgeMs >= 0)
+}
+
+func decodePromptSessionError(resp *http.Response, fallback error) error {
+	if resp.StatusCode != http.StatusConflict ||
+		!strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		return fallback
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxPromptSessionErrorBodyBytes+1))
+	if err != nil || len(raw) == 0 || len(raw) > maxPromptSessionErrorBodyBytes {
+		return fallback
+	}
+	var untrusted any
+	if err := json.Unmarshal(raw, &untrusted); err != nil || containsSecretMaterial(untrusted) {
+		return fallback
+	}
+	var wire promptSessionErrorWire
+	if err := json.Unmarshal(raw, &wire); err != nil || !validPromptSessionError(wire) {
+		return fallback
+	}
+	receipt := &PromptSessionError{
+		HTTPStatus:     resp.StatusCode,
+		Delivered:      wire.Delivered != nil && *wire.Delivered,
+		DeliveryTier:   wire.DeliveryTier,
+		Disposition:    wire.Disposition,
+		SessionID:      wire.SessionID,
+		SessionStatus:  wire.SessionStatus,
+		Code:           wire.Code,
+		Reason:         wire.Reason,
+		RecoveryAction: wire.RecoveryAction,
+		MissingFields:  append([]string(nil), wire.MissingFields...),
+	}
+	return receipt
+}
+
+func validPromptSessionError(wire promptSessionErrorWire) bool {
+	if wire.Code == "" || !safeReceiptAtom(wire.Code, 128) {
+		return false
+	}
+	if !safeReceiptText(wire.Reason, 1024) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.RecoveryAction, 128) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.Disposition, 128) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.DeliveryTier, 128) {
+		return false
+	}
+	if !optionalReceiptAtom(wire.SessionID, 256) {
+		return false
+	}
+	if wire.SessionStatus != "" && !safeReceiptAtom(string(wire.SessionStatus), 64) {
+		return false
+	}
+	if len(wire.MissingFields) > 32 {
+		return false
+	}
+	for _, field := range wire.MissingFields {
+		if !safeReceiptAtom(field, 128) {
+			return false
+		}
+	}
+	return true
 }
 
 func safeReceiptAtom(value string, maxLen int) bool {
@@ -539,9 +618,13 @@ func (c *Client) StopSession(id string) (*StopSessionResponse, error) {
 
 // ChatSession forwards a prompt to the given session's agent and returns the
 // delivery confirmation.
+//
+// A 409 refusal carries a typed PromptSessionError receipt (unwrapping to
+// ErrConflict) so the command layer can print the code, reason and recovery
+// action instead of a bare conflict.
 func (c *Client) ChatSession(id string, req ChatSessionRequest) (*ChatSessionResponse, error) {
 	var resp ChatSessionResponse
-	if err := c.post("/api/public/sessions/"+id+"/prompt", req, &resp); err != nil {
+	if err := c.postWithErrorDecoder("/api/public/sessions/"+id+"/prompt", req, &resp, decodePromptSessionError); err != nil {
 		return nil, err
 	}
 	return &resp, nil

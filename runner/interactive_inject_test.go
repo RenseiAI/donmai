@@ -96,6 +96,10 @@ type fakeInteractivePulser struct {
 	acks []string
 	dead []deadLetterRecord
 	lost chan struct{}
+	// lastStatus is what LastFailureStatus reports: the HTTP status of
+	// the failed lock-refresh tick that tripped lost-ownership, or 0
+	// when the trip carried no HTTP response.
+	lastStatus int
 }
 
 func newFakeInteractivePulser() *fakeInteractivePulser {
@@ -120,6 +124,11 @@ func (p *fakeInteractivePulser) DeadLetterInject(deliveryID, reason string) {
 
 func (p *fakeInteractivePulser) LostOwnership() <-chan struct{} { return p.lost }
 func (p *fakeInteractivePulser) StopRequested() bool            { return false }
+func (p *fakeInteractivePulser) LastFailureStatus() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastStatus
+}
 
 func (p *fakeInteractivePulser) deadLettered() []deadLetterRecord {
 	p.mu.Lock()

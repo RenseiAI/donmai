@@ -115,6 +115,10 @@ func writeTestExecutable(t *testing.T, path, content string) {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	name := filepath.Base(path)
+	// Hold the fork lock across the write so no concurrently forked child can
+	// inherit the writer and make the later exec fail with ETXTBSY.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	if err := root.WriteFile(name, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

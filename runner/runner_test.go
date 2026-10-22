@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -208,7 +209,7 @@ func TestRun_RepositoryFreeDisablesVCRecovery(t *testing.T) {
 	for name, marker := range markers {
 		path := filepath.Join(fakeBin, name)
 		command := []byte(fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$0 $*\" >> %q\nexit 97\n", marker))
-		if err := os.WriteFile(path, command, 0o600); err != nil {
+		if err := testexec.WriteFile(path, command, 0o600); err != nil {
 			t.Fatalf("write fake %s: %v", name, err)
 		}
 		if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // owner-only test fixture must be executable

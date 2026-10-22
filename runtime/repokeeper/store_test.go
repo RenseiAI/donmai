@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // runGitT runs git in dir for fixture setup and assertions only. It is
@@ -1110,7 +1112,7 @@ func TestEnsureIgnoresAmbientGitConfig(t *testing.T) {
 		t.Fatalf("create template hooks dir: %v", err)
 	}
 	//nolint:gosec // G306: the fixture hook must be executable to prove it is not copied.
-	if err := os.WriteFile(filepath.Join(templateDir, "hooks", "reference-transaction"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := testexec.WriteFile(filepath.Join(templateDir, "hooks", "reference-transaction"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write template hook: %v", err)
 	}
 	globalConfig := filepath.Join(t.TempDir(), "gitconfig")

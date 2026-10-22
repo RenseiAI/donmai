@@ -3,6 +3,7 @@ package afclient
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -266,6 +267,135 @@ func TestClientStopSessionRejectsUnsafeConflictBodies(t *testing.T) {
 }
 
 func intPtr(value int) *int { return &value }
+
+func TestClientChatSessionTypedConflictReceipt(t *testing.T) {
+	t.Parallel()
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE","error":"Historical terminal session cannot be resumed safely","delivered":false,"deliveryTier":"durable","disposition":"held","sessionId":"sess-1","sessionStatus":"held","recoveryAction":"start_new_session","missingProjectionFields":["workType","providerSessionId"]}`))
+	})
+	_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	var receipt *PromptSessionError
+	if !errors.As(err, &receipt) {
+		t.Fatalf("error did not retain typed prompt refusal: %T %v", err, err)
+	}
+	if receipt.Code != "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE" {
+		t.Errorf("Code = %q, want the continuity refusal code", receipt.Code)
+	}
+	if receipt.Reason != "Historical terminal session cannot be resumed safely" {
+		t.Errorf("Reason = %q, want the refusal reason", receipt.Reason)
+	}
+	if receipt.RecoveryAction != "start_new_session" {
+		t.Errorf("RecoveryAction = %q, want start_new_session", receipt.RecoveryAction)
+	}
+	if len(receipt.MissingFields) != 2 || receipt.MissingFields[0] != "workType" || receipt.MissingFields[1] != "providerSessionId" {
+		t.Errorf("MissingFields = %v, want [workType providerSessionId]", receipt.MissingFields)
+	}
+	if receipt.Disposition != "held" || receipt.SessionID != "sess-1" {
+		t.Errorf("receipt identity lost: %+v", receipt)
+	}
+}
+
+func TestClientChatSessionMinimalConflictReceipt(t *testing.T) {
+	t.Parallel()
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"session is busy"}`))
+	})
+	_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+	}
+	var receipt *PromptSessionError
+	if !errors.As(err, &receipt) {
+		t.Fatalf("minimal refusal did not decode: %T %v", err, err)
+	}
+	if receipt.Code != "SESSION_PROMPT_ADMISSION_CONFLICT" || receipt.Reason != "session is busy" {
+		t.Fatalf("minimal receipt fields lost: %#v", receipt)
+	}
+}
+
+func TestClientChatSessionRejectsUnsafeConflictBodies(t *testing.T) {
+	t.Parallel()
+
+	validPrefix := `{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"session is busy"`
+	validBody := validPrefix + `}`
+	// Thirty-three atom-valid missing fields: one over the 32-field bound.
+	manyFields := make([]string, 0, 33)
+	for i := 0; i < 33; i++ {
+		manyFields = append(manyFields, fmt.Sprintf(`"field%02d"`, i))
+	}
+	tooManyMissing := validPrefix + `,"missingProjectionFields":[` + strings.Join(manyFields, ",") + `]}`
+	// Valid JSON that passes every atom guard but exceeds the 16 KiB cap
+	// via trailing whitespace (which the JSON parser tolerates), so only
+	// the size cap can reject it. Note the read is bounded at cap+1 bytes,
+	// so without the cap this still parses and would decode to a receipt.
+	oversizedValid := validBody + strings.Repeat(" ", maxPromptSessionErrorBodyBytes)
+	tests := []struct {
+		name        string
+		status      int // 0 means 409 Conflict
+		contentType string
+		body        string
+		forbidden   string
+		notConflict bool // non-409 statuses must not map to ErrConflict
+	}{
+		{name: "malformed", contentType: "application/json", body: `{`},
+		{name: "oversized", contentType: "application/json", body: strings.Repeat("x", maxPromptSessionErrorBodyBytes+1)},
+		{name: "oversized valid json", contentType: "application/json", body: oversizedValid},
+		{name: "non json", contentType: "text/html", body: `<html>conflict</html>`},
+		{name: "coded json as text plain", contentType: "text/plain", body: validBody},
+		{name: "forbidden status decodes nothing", status: http.StatusForbidden, contentType: "application/json", body: validBody, notConflict: true},
+		{name: "server error decodes nothing", status: http.StatusInternalServerError, contentType: "application/json", body: validBody, notConflict: true},
+		{name: "missing code", contentType: "application/json", body: `{"error":"session is busy"}`},
+		{name: "reason with ansi escape", contentType: "application/json", body: `{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"bad\u001b[31mreason"}`},
+		{name: "reason with newline", contentType: "application/json", body: `{"code":"SESSION_PROMPT_ADMISSION_CONFLICT","error":"line one\nline two"}`},
+		{name: "bad recovery action atom", contentType: "application/json", body: validPrefix + `,"recoveryAction":"start new session!"}`},
+		{name: "bad disposition atom", contentType: "application/json", body: validPrefix + `,"disposition":"held high!"}`},
+		{name: "bad delivery tier atom", contentType: "application/json", body: validPrefix + `,"deliveryTier":"durable tier!"}`},
+		{name: "bad session id atom", contentType: "application/json", body: validPrefix + `,"sessionId":"sess 1"}`},
+		{name: "bad session status atom", contentType: "application/json", body: validPrefix + `,"sessionStatus":"held now!"}`},
+		{name: "too many missing fields", contentType: "application/json", body: tooManyMissing},
+		{name: "missing field with space", contentType: "application/json", body: validPrefix + `,"missingProjectionFields":["workType","bad field"]}`},
+		{name: "secret key", contentType: "application/json", body: validPrefix + `,"apiToken":"rsk_do_not_echo"}`, forbidden: "rsk_do_not_echo"},
+		{name: "secret value", contentType: "application/json", body: validPrefix + `,"recoveryAction":"Bearer do_not_echo"}`, forbidden: "do_not_echo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			status := tc.status
+			if status == 0 {
+				status = http.StatusConflict
+			}
+			_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			_, err := c.ChatSession("sess-1", ChatSessionRequest{Prompt: "hi"})
+			if tc.notConflict {
+				if errors.Is(err, ErrConflict) {
+					t.Fatalf("non-409 status %d must not map to ErrConflict: %v", status, err)
+				}
+			} else if !errors.Is(err, ErrConflict) {
+				t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+			}
+			var receipt *PromptSessionError
+			if errors.As(err, &receipt) {
+				t.Fatalf("unsafe body became typed receipt: %#v", receipt)
+			}
+			if tc.forbidden != "" && strings.Contains(err.Error(), tc.forbidden) {
+				t.Fatalf("error leaked secret %q: %v", tc.forbidden, err)
+			}
+		})
+	}
+}
 
 func TestClientChatSessionSuccess(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {

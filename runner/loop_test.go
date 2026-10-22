@@ -192,6 +192,37 @@ func TestLoop_TimeoutCancelsStream(t *testing.T) {
 // Uses BehaviorHangThenTimeout so the provider does not race the
 // heartbeat to a terminal Result.
 func TestLoop_HeartbeatLostOwnership(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		// status is the lock-refresh answer on every tick.
+		status int
+		// wantStatus, when non-empty, must appear in res.Error — the
+		// terminal result names the HTTP status that tripped the fuse.
+		// Empty keeps the legacy tolerance (lost-ownership or timeout)
+		// without asserting on the text.
+		wantStatus string
+	}{
+		{name: "gone keeps legacy tolerance", status: http.StatusGone},
+		{name: "auth rejection names the status", status: http.StatusUnauthorized, wantStatus: "last lock-refresh status 401"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testLoopHeartbeatLostOwnership(t, tc.status, tc.wantStatus)
+		})
+	}
+}
+
+// testLoopHeartbeatLostOwnership drives one Run against a platform that
+// rejects every lock-refresh with status, so the ownership pulser trips
+// and the runner cancels the stream with FailureLostOwnership.
+//
+// Uses BehaviorHangThenTimeout so the provider does not race the
+// heartbeat to a terminal Result.
+func testLoopHeartbeatLostOwnership(t *testing.T, status int, wantStatus string) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
 	}
@@ -200,7 +231,7 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/lock-refresh") {
 			refreshes.Add(1)
-			http.Error(w, "lost", http.StatusGone)
+			http.Error(w, "lost", status)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -259,6 +290,18 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	defer cancel()
 	res, _ := r.Run(ctx, qw)
 
+	if wantStatus != "" {
+		// The 401 path is deterministic: every lock-refresh tick answers
+		// 401, so the fuse trips on the recorded status and the terminal
+		// result must name it while keeping its failure mode.
+		if res.FailureMode != FailureLostOwnership {
+			t.Fatalf("FailureMode = %q; want %q", res.FailureMode, FailureLostOwnership)
+		}
+		if !strings.Contains(res.Error, wantStatus) {
+			t.Fatalf("res.Error = %q; want it to contain %q", res.Error, wantStatus)
+		}
+		return
+	}
 	// Either lost-ownership or timeout depending on the cancellation
 	// race; lost-ownership is the expected outcome but we tolerate
 	// timeout to keep the test stable on slow CI.
@@ -584,7 +627,7 @@ func TestObserveEvent_SetsBlockedFlag(t *testing.T) {
 	obs := &streamObservation{}
 	h.runner.observeEvent(
 		agent.AssistantTextEvent{Text: "AGENT_BLOCKED: no acceptance criteria on the issue"},
-		obs, t.TempDir(), QueuedWork{},
+		obs, t.TempDir(), QueuedWork{}, nil,
 	)
 	if !obs.blocked {
 		t.Fatal("observeEvent did not set obs.blocked")
@@ -604,7 +647,7 @@ func TestObserveEvent_LaterVerdictClearsEarlierBlocked(t *testing.T) {
 
 	obs := &streamObservation{}
 	for _, text := range []string{"AGENT_BLOCKED: waiting on a decision", "Decision arrived; done.\nWORK_RESULT: passed"} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if obs.blocked || obs.blockedReason != "" || obs.workResult != "passed" {
 		t.Errorf("after blocked then passed: blocked=%v reason=%q workResult=%q; want false, \"\", passed", obs.blocked, obs.blockedReason, obs.workResult)
@@ -612,7 +655,7 @@ func TestObserveEvent_LaterVerdictClearsEarlierBlocked(t *testing.T) {
 
 	obs = &streamObservation{}
 	for _, text := range []string{"WORK_RESULT: passed", "Second thoughts.\nAGENT_BLOCKED: the spec contradicts itself"} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if !obs.blocked || obs.blockedReason != "the spec contradicts itself" || obs.workResult != "" {
 		t.Errorf("after passed then blocked: blocked=%v reason=%q workResult=%q; want true, reason, \"\"", obs.blocked, obs.blockedReason, obs.workResult)
@@ -629,7 +672,7 @@ func TestObserveEvent_CapturesLastAssistantText(t *testing.T) {
 	obs := &streamObservation{}
 	wt := t.TempDir()
 	for _, text := range []string{"first message", "  \n\t", "final message\n<!-- WORK_RESULT:passed -->"} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if want := "final message\n<!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
 		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
@@ -656,7 +699,7 @@ func TestObserveEvent_MarkerInPenultimateMessage(t *testing.T) {
 		"<!-- WORK_RESULT:passed -->",
 		"Here is the final report body.",
 	} {
-		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{}, nil)
 	}
 	if obs.workResult != "passed" {
 		t.Errorf("obs.workResult = %q; want passed (penultimate-message marker dropped)", obs.workResult)
@@ -1095,6 +1138,111 @@ func TestSessionEnv_ComposerPreservesHostGHToken(t *testing.T) {
 	}
 }
 
+// TestBuildSessionEnv_ExportsGoModuleCache pins the module-cache export:
+// the seat env carries GOMODCACHE resolved from the host toolchain's own
+// `go env` probe, so seats find dependency sources without a whole-disk
+// search. The probe is stubbed through the package seam (no toolchain
+// needed); reverting the export line leaves the key absent and fails it.
+func TestBuildSessionEnv_ExportsGoModuleCache(t *testing.T) {
+	orig := goModCache
+	goModCache = func(context.Context) string { return "/host/go/pkg/mod" }
+	t.Cleanup(func() { goModCache = orig })
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-MODCACHE-1"),
+		WorkerID:    "w1",
+		AuthToken:   "tok",
+		PlatformURL: "https://example.test",
+	}
+	if got := buildSessionEnv(qw)["GOMODCACHE"]; got != "/host/go/pkg/mod" {
+		t.Fatalf("GOMODCACHE = %q; want the probed host module cache", got)
+	}
+}
+
+// TestBuildSessionEnv_OmitsGoModuleCacheWhenProbeFails pins the additive
+// contract: a toolchain the probe cannot read (no `go` on PATH, a wedged
+// probe) omits the key instead of exporting an empty or stale pointer, so
+// the seat builds exactly as before.
+func TestBuildSessionEnv_OmitsGoModuleCacheWhenProbeFails(t *testing.T) {
+	orig := goModCache
+	goModCache = func(context.Context) string { return "" }
+	t.Cleanup(func() { goModCache = orig })
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-MODCACHE-2"),
+		WorkerID:    "w1",
+		AuthToken:   "tok",
+		PlatformURL: "https://example.test",
+	}
+	if _, ok := buildSessionEnv(qw)["GOMODCACHE"]; ok {
+		t.Fatal("GOMODCACHE is set; a failed probe must omit the key")
+	}
+}
+
+// TestRun_RecordsPreparationSeconds drives the PRODUCTION Run path with a
+// clock that reads the base instant at Run entry and +90s at the pre-spawn
+// stamp, and asserts the duration lands on the terminal result. The two
+// reads bracket the preparation phase (provider resolution, worktree
+// provisioning, dependency installs, prompt assembly); reverting the stamp
+// line leaves the field zero and fails it.
+func TestRun_RecordsPreparationSeconds(t *testing.T) {
+	base := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	reads := 0
+	now := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		reads++
+		if reads == 1 {
+			return base
+		}
+		return base.Add(90 * time.Second)
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development",
+		now:      now,
+		turns: []verdictScriptTurn{
+			{text: "Opened " + followUpPR + "\nWORK_RESULT: passed"},
+		},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	if res.PreparationSeconds != 90 {
+		t.Fatalf("PreparationSeconds = %d; want 90", res.PreparationSeconds)
+	}
+}
+
+// TestPreparationSeconds pins the preparation-duration helper: session
+// start to provider spawn in whole seconds, with a skewed or frozen test
+// clock omitting the field instead of posting a duration the phase did
+// not take.
+func TestPreparationSeconds(t *testing.T) {
+	t.Parallel()
+	start := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		now  time.Time
+		want int64
+	}{
+		{name: "ninety seconds", now: start.Add(90 * time.Second), want: 90},
+		{name: "truncates sub-second", now: start.Add(1500 * time.Millisecond), want: 1},
+		{name: "frozen clock omits", now: start, want: 0},
+		{name: "skewed clock omits", now: start.Add(-time.Second), want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := preparationSeconds(func() time.Time { return tc.now }, start); got != tc.want {
+				t.Fatalf("preparationSeconds = %d; want %d", got, tc.want)
+			}
+		})
+	}
+	if got := preparationSeconds(nil, start); got != 0 {
+		t.Fatalf("preparationSeconds(nil clock) = %d; want 0", got)
+	}
+}
+
 // TestRunLoop_PostsActivityToplatform asserts the runner streams every
 // non-skipped agent.Event through to /api/sessions/<id>/activity, and
 // that the first such post triggers a single status=running nudge.
@@ -1268,7 +1416,7 @@ func TestConsumeEvents_DispatchesToSink(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
-	if _, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, rec, nil); err != nil {
+	if _, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, rec, nil, nil); err != nil {
 		t.Fatalf("consumeEvents: %v", err)
 	}
 
@@ -1291,7 +1439,7 @@ func TestConsumeEvents_PersistsSyntheticCorrelatedEvents(t *testing.T) {
 	wpath := t.TempDir()
 	qw := QueuedWork{QueuedWork: queuedWorkBase("TEST-SPAN-EVENT-1")}
 	enforcer := NewBudgetEnforcer(nil, time.Now())
-	if _, err := r.consumeEvents(t.Context(), &fakeHandle{events: events}, wpath, qw, nil, enforcer, rec, processor); err != nil {
+	if _, err := r.consumeEvents(t.Context(), &fakeHandle{events: events}, wpath, qw, nil, enforcer, rec, processor, nil); err != nil {
 		t.Fatalf("consumeEvents: %v", err)
 	}
 
@@ -1344,7 +1492,7 @@ func TestConsumeEvents_IdleWatchdogFires(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 	if !obs.noProgress {
 		t.Fatalf("obs.noProgress = false; want true (watchdog should have fired)")
 	}
@@ -1386,7 +1534,7 @@ func TestConsumeEvents_IdleWatchdogResetsOnEvent(t *testing.T) {
 	defer cancel()
 	go func() {
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 		done <- consumeResult{obs: obs, err: err}
 	}()
 
@@ -1434,7 +1582,7 @@ func TestConsumeEvents_IdleWatchdogDisabled(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 	if obs.noProgress {
 		t.Fatalf("obs.noProgress = true; want false (watchdog disabled)")
 	}
@@ -1476,7 +1624,7 @@ func TestConsumeEvents_IdleWatchdogRearmsWhileToolCallInFlight(t *testing.T) {
 	defer cancel()
 	go func() {
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 		done <- consumeResult{obs: obs, err: err}
 	}()
 
@@ -1543,7 +1691,7 @@ func TestConsumeEvents_IdleWatchdogFiresAfterToolResult(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil, nil)
 	if !obs.noProgress {
 		t.Fatalf("obs.noProgress = false; want true (completed call must not suppress the watchdog forever)")
 	}
@@ -1782,7 +1930,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 		}
 	}
 	// A gateway-routed call whose wire response identified its provider.
-	h.runner.observeEvent(native("served-provider", "donmai", "requested-model", "served-model-id", 3), obs, wt, QueuedWork{})
+	h.runner.observeEvent(native("served-provider", "donmai", "requested-model", "served-model-id", 3), obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "served-provider" || obs.finalModel != "served-model-id" || obs.providerAttempts != 3 {
 		t.Fatalf("obs = %+v; want finalProvider served-provider, finalModel served-model-id, providerAttempts 3", obs)
 	}
@@ -1790,7 +1938,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 	// A later call that identifies a different response provider replaces
 	// the earlier fact (last wins); a call without a served id falls back
 	// to the requested id.
-	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{})
+	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
 		t.Fatalf("obs = %+v; want other-provider/requested-alias/4 after the second call", obs)
 	}
@@ -1803,7 +1951,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 		System: "configured-system", Model: "configured-model",
 		ResponseModelProvider: "configured-provider",
 		InputTokens:           100, UsageSource: agent.LlmUsageAggregate, Synthetic: true,
-	}, obs, wt, QueuedWork{})
+	}, obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
 		t.Fatalf("obs = %+v; want the synthetic fallback to leave the report untouched", obs)
 	}
@@ -1816,7 +1964,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 		System: "openai", Model: "requested-model",
 		InputTokens: 5, OutputTokens: 3,
 		UsageSource: agent.LlmUsageProvider, TurnCompleted: true, Attempts: 1,
-	}, obs, wt, QueuedWork{})
+	}, obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.providerAttempts != 5 {
 		t.Fatalf("obs = %+v; want a System-only gateway call to leave finalProvider untouched while counting its attempt", obs)
 	}
@@ -1826,7 +1974,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 	if obs.finalModel != "requested-model" {
 		t.Fatalf("obs.finalModel = %q; want requested-model (System-only call falls back to Model)", obs.finalModel)
 	}
-	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{})
+	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 6 {
 		t.Fatalf("obs = %+v; want other-provider/requested-alias/6 after restoring", obs)
 	}
@@ -1835,7 +1983,7 @@ func TestObserveEvent_LlmCallServingReport(t *testing.T) {
 	// unreported attempt count adds nothing.
 	h.runner.observeEvent(agent.LlmCallEvent{
 		InputTokens: 1, UsageSource: agent.LlmUsageProvider, TurnCompleted: true,
-	}, obs, wt, QueuedWork{})
+	}, obs, wt, QueuedWork{}, nil)
 	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 6 {
 		t.Fatalf("obs = %+v; want an empty call to leave the report untouched", obs)
 	}
@@ -1899,7 +2047,7 @@ func TestConsumeEvents_ServingAttemptsAccumulate(t *testing.T) {
 		ch <- agent.ResultEvent{Success: true}
 		close(ch)
 		enforcer := NewBudgetEnforcer(nil, time.Now())
-		obs, err := r.consumeEvents(context.Background(), &fakeHandle{events: ch}, wpath, qw, res, enforcer, noopSink{}, nil)
+		obs, err := r.consumeEvents(context.Background(), &fakeHandle{events: ch}, wpath, qw, res, enforcer, noopSink{}, nil, nil)
 		if err != nil {
 			t.Fatalf("consumeEvents: %v", err)
 		}

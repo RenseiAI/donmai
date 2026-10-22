@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestCallMCPTool_ChildEnvSanitized(t *testing.T) {
@@ -24,7 +25,7 @@ func TestCallMCPTool_ChildEnvSanitized(t *testing.T) {
 		"printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n" +
 		"IFS= read -r call\n" +
 		"printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\\n' \"$status\"\n"
-	if err := os.WriteFile(server, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(server, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake MCP server: %v", err)
 	}
 	if err := os.Chmod(server, 0o700); err != nil { //nolint:gosec // test fixture needs exec bit

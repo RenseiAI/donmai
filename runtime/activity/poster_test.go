@@ -697,6 +697,27 @@ func TestEventMappingTable(t *testing.T) {
 			wantContext:   "harnessLifecycle=unrecognized",
 		},
 		{
+			name:        "System signal guard refused -> context with the refusal line",
+			event:       agent.SystemEvent{Subtype: "signal_guard_refused", Message: "refused pkill -f 'x': pid(s) 11 outside session scope (worktree /w)"},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "pattern kill refused: refused pkill -f 'x': pid(s) 11 outside session scope (worktree /w)",
+			wantContext: "signalGuardRefused=refused",
+		},
+		{
+			name:        "System signal guard degraded -> context with fixed content",
+			event:       agent.SystemEvent{Subtype: "signal_guard_degraded", Message: "signal guard unavailable; pattern kills are unscoped for this run. Kill by PID."},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "signal guard unavailable; pattern kills are unscoped",
+			wantContext: "signalGuardDegraded=degraded",
+		},
+		{
+			name:     "System signal guard refused empty message -> skipped",
+			event:    agent.SystemEvent{Subtype: "signal_guard_refused", Message: "  \n\t"},
+			wantSent: false,
+		},
+		{
 			name:     "System interactive start -> skipped",
 			event:    agent.SystemEvent{Subtype: "interactive-session-started", Message: "started"},
 			wantSent: false,

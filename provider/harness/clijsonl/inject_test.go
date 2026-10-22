@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // fakeMultiCLI returns a /bin/sh script that emits one body for the
@@ -44,7 +45,7 @@ func fakeMultiCLI(t *testing.T, parentBody, resumeBody, traceFile string) string
 		"CLAUDE_PARENT_EOF\n" +
 		"    ;;\n" +
 		"esac\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write fake cli: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
@@ -121,7 +122,7 @@ func TestHandle_Inject_ChildEnvSanitized(t *testing.T) {
 		"printf '%s:%s\\n' \"$mode\" \"$status\" >> " + report + "\n" +
 		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-env-1\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"usage\":{}}'\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake cli: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
@@ -162,7 +163,7 @@ func TestHandle_Inject_BeforeInit_Errors(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "slow-init-claude.sh")
 	script := "#!/bin/sh\nsleep 5\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
@@ -205,7 +206,7 @@ func TestHandle_Inject_InFlightConflict_Errors(t *testing.T) {
 		"PARENT_EOF\n" +
 		"    ;;\n" +
 		"esac\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
@@ -280,7 +281,7 @@ func TestHandle_Inject_CtxCancel_KillsSubprocess(t *testing.T) {
 		"PARENT_EOF\n" +
 		"    ;;\n" +
 		"esac\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit

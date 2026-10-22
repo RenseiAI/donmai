@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestInteractiveArgs(t *testing.T) {
@@ -327,7 +328,7 @@ func newFakeInteractiveProvider(t *testing.T, tuiBody string) *Provider {
 		"if [[ \"$1\" == \"--version\" ]]; then echo \"Muse Code 1.4.6 (1.4.6-R6000.1)\"; exit 0; fi\n" +
 		"if [[ \"$1\" == \"exec\" ]]; then echo \"agent loop failed: model failed: model " + hostLoginProbeModel + " does not exist or you lack access\" >&2; exit 1; fi\n" +
 		tuiBody + "\n"
-	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
