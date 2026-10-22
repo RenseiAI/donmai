@@ -763,12 +763,21 @@ export default async function activate(pi: ExtensionAPI) {
   // Context-window pin: the harness exports the resolved profile's
   // context-window size (tokens) as DONMAI_PI_CONTEXT_WINDOW when the
   // dispatch carried one (extension.go providerPinEnv). A missing or invalid
-  // value falls back to the historical 200000 default, so an unpinned
-  // session keeps prior behaviour while a pinned 1M-context model is no
-  // longer silently clamped to it.
+  // value registers NO window. On the gateway lane (DONMAI_PI_GATEWAY, which
+  // the harness sets because this extension cannot see the host itself) a
+  // missing value refuses instead of running on a guessed default: a gateway
+  // spawn without one is already refused at spawn by requireContextWindow,
+  // so reaching here means a bypass — still fail closed rather than silently
+  // clamping a 1M-context model — or overselling a smaller one — to a
+  // historical guess. Off the gateway lane the model registers with no
+  // window, and the serving endpoint's own limit applies.
   const contextWindowEnv = Number(process.env.DONMAI_PI_CONTEXT_WINDOW ?? "");
   const contextWindow =
-    Number.isInteger(contextWindowEnv) && contextWindowEnv > 0 ? contextWindowEnv : 200000;
+    Number.isInteger(contextWindowEnv) && contextWindowEnv > 0 ? contextWindowEnv : undefined;
+  // Gateway lane mark: the harness exports "1" exactly when the endpoint
+  // binding names the gateway host (extension.go providerPinEnv, always
+  // exported so an inherited value can never survive as a stale lane).
+  const gatewayLane = process.env.DONMAI_PI_GATEWAY === "1";
   // Output-token pin: the harness exports the resolved profile's per-response
   // output limit as DONMAI_PI_MAX_TOKENS only when the dispatch carried one
   // (extension.go providerPinEnv). There is deliberately NO fallback value:
@@ -863,7 +872,48 @@ export default async function activate(pi: ExtensionAPI) {
         cacheWrite: priceEnv("DONMAI_PI_PRICE_CACHE_WRITE"),
       }
     : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  if (baseUrl && model) {
+  if (!baseUrl || !model) {
+    // No endpoint bound: nothing to register the injected provider against.
+    // (The harness pins `--provider donmai` only when a BaseURL is bound;
+    // without one pi resolves the provider from its own config.)
+  } else if (contextWindow === undefined && gatewayLane) {
+    // No context window configured on the gateway lane: refuse to register
+    // the model on a guessed default. A gateway spawn without one is already
+    // refused at spawn by the Go harness (requireContextWindow, which keys
+    // on the same lane), so reaching here means a bypass — still fail closed
+    // rather than silently clamping (or overselling) the model's window.
+    // In RPC mode the Go handshake gate still blocks every tool until
+    // verified, so registering a refusing tool_call gate below is what
+    // keeps the session from running silently unregistered: every guarded
+    // tool is blocked with the missing-window reason until the operator
+    // fixes the configuration. In interactive mode the same gate blocks
+    // every guarded tool locally — the session can start its TUI, but it
+    // cannot run tools against a downgraded provider without the operator
+    // seeing exactly why.
+    // A refusing gate on the same guarded-tool surface the boundary below
+    // covers: every guarded tool is blocked with the missing-window reason
+    // instead of running against whatever provider pi resolves on its own.
+    // Async in RPC mode so the refusal is recorded as the call's outcome
+    // (the registered-refusal contract below); sync in interactive mode,
+    // which has no Go side to record it on.
+    pi.on("tool_call", async (event: any, ctx: any) => {
+      const tool = String(event?.toolName ?? "").toLowerCase();
+      if (!GUARDED_TOOLS.has(tool)) return;
+      const reason = "donmai provider not registered: no context window is configured";
+      if (rpcMode) {
+        await registerRefusal(ctx, token, tool, toolCallIdOf(event), reason);
+      }
+      return { block: true, reason };
+    });
+    try {
+      pi.on("session_start", (_event: unknown, ctx: any) => {
+        ctx?.ui?.notify?.("donmai provider not registered: no context window is configured", "error");
+      });
+    } catch {
+      // Registration-gate failure must not run the session unguarded; the
+      // boundary posture below (handshake gate in RPC mode) still holds.
+    }
+  } else {
     try {
       pi.registerProvider("donmai", {
         baseUrl,
@@ -876,7 +926,7 @@ export default async function activate(pi: ExtensionAPI) {
             reasoning: true,
             input: ["text"],
             cost: modelCost,
-            contextWindow,
+            ...(contextWindow === undefined ? {} : { contextWindow }),
             ...(maxTokens === undefined ? {} : { maxTokens }),
             ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
             ...(modelCompat === undefined ? {} : { compat: modelCompat }),

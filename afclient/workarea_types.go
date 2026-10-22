@@ -133,6 +133,24 @@ func UpgradeWorkareaSummaryV1(w WorkareaSummary) WorkareaSummaryV1 {
 	}
 }
 
+// ArchiveReferenceSchemaV1 identifies the separately versioned committed-archive
+// recovery reference. It carries the exact archive identity and digest beside
+// the closed terminal-lease v1 projection, which stays exactly four fields.
+const ArchiveReferenceSchemaV1 = "donmai.terminal-archive-reference.v1"
+
+// ArchiveReference is the additive committed-archive recovery reference. It is
+// emitted only after the archive bytes and manifest are committed and
+// independently re-read, so ArchiveDigest always names committed bytes.
+type ArchiveReference struct {
+	SchemaVersion    string `json:"schemaVersion"`
+	ArchiveID        string `json:"archiveId"`
+	ArchiveDigest    string `json:"archiveDigest"`
+	SessionID        string `json:"sessionId"`
+	WorkareaID       string `json:"workareaId"`
+	TerminalResultID string `json:"terminalResultId"`
+	CommittedAt      string `json:"committedAt"`
+}
+
 // WorkareaV1 is the additive session-root-v1 inspect/restore projection.
 type WorkareaV1 struct {
 	ID                     string               `json:"id"`
@@ -156,6 +174,12 @@ type WorkareaV1 struct {
 	ArchiveLocation        string               `json:"archiveLocation,omitempty"`
 	OwnerSession           string               `json:"ownerSession,omitempty"`
 	Manifest               map[string]any       `json:"manifest,omitempty"`
+	// ArchiveReference is the additive committed-archive recovery reference.
+	// It is populated on archive inspect/restore projections whose manifest
+	// commits an exact tree digest. Nil when the archive predates the
+	// reference contract or carries no digest, so older archives keep
+	// serving their existing shape unchanged.
+	ArchiveReference *ArchiveReference `json:"archiveReference,omitempty"`
 }
 
 // Legacy projects the versioned workarea onto the frozen public shape.

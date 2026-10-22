@@ -35,6 +35,9 @@ type readoptFixtureOptions struct {
 	onWindowExhausted func(context.Context, sessionshim.Identity)
 	onBindLost        func(context.Context, sessionshim.Identity)
 	onRebind          func(context.Context, sessionshim.Identity) error
+	// heldPastWindow is SessionShimConfig.ReadoptionHeldPastWindow. Nil leaves
+	// the bounded window, which is what every test that predates it wants.
+	heldPastWindow func(context.Context, sessionshim.Identity) bool
 	// onTerminalEvidence receives every terminal fact the daemon hands its
 	// composer. Nil leaves the seam unconfigured, which is what every test that
 	// is not about terminal evidence wants.
@@ -135,6 +138,7 @@ func newReadoptFixtureWithOptions(t *testing.T, opts readoptFixtureOptions) *rea
 		OnReadoptionWindowExhausted:  opts.onWindowExhausted,
 		OnSessionShimCarrierBindLost: opts.onBindLost,
 		OnSessionShimRebind:          opts.onRebind,
+		ReadoptionHeldPastWindow:     opts.heldPastWindow,
 	}})
 	t.Cleanup(f.daemon.ReleaseAdoptedSessionShims)
 	if opts.clock != nil {

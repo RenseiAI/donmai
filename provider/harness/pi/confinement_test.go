@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/harnessstate"
 )
 
@@ -172,7 +173,7 @@ func TestExecutableDigest_TracksBinaryBytes(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-harness")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture needs the exec bit.
+	if err := testexec.WriteFile(bin, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture needs the exec bit.
 		t.Fatal(err)
 	}
 	first, err := executableDigestOf(bin)
@@ -182,7 +183,7 @@ func TestExecutableDigest_TracksBinaryBytes(t *testing.T) {
 	if !strings.HasPrefix(first, "sha256:") || len(first) != len("sha256:")+64 {
 		t.Errorf("executableDigestOf = %q, want sha256:<64 hex>", first)
 	}
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho yo\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture.
+	if err := testexec.WriteFile(bin, []byte("#!/bin/sh\necho yo\n"), 0o755); err != nil { //nolint:gosec // G306: test fixture.
 		t.Fatal(err)
 	}
 	second, err := executableDigestOf(bin)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestName(t *testing.T) {
@@ -164,7 +165,7 @@ func TestSpawn_Interactive_DeliversAdaptedPTYSeedExactly(t *testing.T) {
 	capture := filepath.Join(tmp, "seed.bin")
 	script := filepath.Join(tmp, "capture-shell")
 	scriptBody := "#!/bin/sh\ndd bs=1 count=\"$SEED_BYTES\" of=\"$SEED_CAPTURE\" 2>/dev/null\n"
-	if err := os.WriteFile(script, []byte(scriptBody), 0o600); err != nil {
+	if err := testexec.WriteFile(script, []byte(scriptBody), 0o600); err != nil {
 		t.Fatalf("write fake shell: %v", err)
 	}
 	if err := os.Chmod(script, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit

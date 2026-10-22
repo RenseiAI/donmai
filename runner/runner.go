@@ -93,6 +93,12 @@ const (
 	// still gets DefaultMaxSessionDuration.
 	MaxSessionDurationCeiling = 24 * time.Hour
 
+	// maxSessionDurationCeilingSeconds is the ceiling above expressed in
+	// whole seconds, the unit dispatched budgets arrive in. Comparing in
+	// seconds before multiplying keeps a malformed seconds value from
+	// overflowing time.Duration into a negative (unbounded) duration.
+	maxSessionDurationCeilingSeconds = int64(MaxSessionDurationCeiling / time.Second)
+
 	// DefaultEventBufferSize is the buffered-channel size used to
 	// decouple event mirroring from the provider goroutine. A small
 	// number keeps memory bounded; spikes block the provider for at
@@ -825,6 +831,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	leaseRequested := qw.TerminalWorkareaLease != nil
 	var terminalResultID string
 	var leaseProjection *workarea.TerminalLeaseProjection
+	var archiveReference *workarea.TerminalArchiveReference
 	var preparedStatusBody []byte
 
 	// A requested successful hold, or the local loss-prevention hold for an
@@ -881,7 +888,18 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 					leaseAcquired = true
 					projection := lease.Descriptor().Projection()
 					leaseProjection = &projection
-					body, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+					// The archive provider's release commits after this status
+					// body is persisted (teardown runs below), so the
+					// reference cannot be predicted here. When the release
+					// already recorded one — a resumed run whose earlier
+					// attempt committed the archive — carry it beside the
+					// closed four-field lease projection. A fresh lease
+					// with no committed archive posts the lease alone.
+					if lease.ArchiveReference != nil {
+						archiveReference = lease.ArchiveReference
+						res.TerminalArchiveReference = archiveReference
+					}
+					body, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, TerminalArchiveReference: archiveReference})
 					if bodyErr != nil {
 						leaseErr := fmt.Errorf("runner: encode immutable terminal status body: %w", bodyErr)
 						markTerminalLeaseFailure(res, leaseErr)

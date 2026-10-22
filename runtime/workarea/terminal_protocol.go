@@ -26,6 +26,11 @@ const (
 	TerminalLeaseAckOutcomeSchemaV1 = "donmai.terminal-workarea-lease-ack-outcome.v1"
 	// TerminalStatusOutboxSchemaV1 identifies the receiver-affine terminal outbox record.
 	TerminalStatusOutboxSchemaV1 = "donmai.terminal-status-outbox.v1"
+	// TerminalArchiveReferenceSchemaV1 identifies the separately versioned
+	// committed-archive recovery reference. It carries the exact archive
+	// identity and digest alongside the closed terminal-lease v1 projection
+	// without extending that projection's four fields.
+	TerminalArchiveReferenceSchemaV1 = "donmai.terminal-archive-reference.v1"
 	// TerminalWorkareaQuarantineSchemaV1 identifies an acquisition quarantine record.
 	TerminalWorkareaQuarantineSchemaV1 = "donmai.terminal-workarea-quarantine.v1"
 

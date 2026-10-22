@@ -13,8 +13,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
+	"github.com/RenseiAI/donmai/runtime/state"
 )
 
 // sinkSummary renders the recorded sink stream as kind[:detail] tokens: the
@@ -131,6 +133,175 @@ func TestInteractive_TranscriptEventsReachSink(t *testing.T) {
 	}
 }
 
+// TestInteractive_StepAdvancesRunningThenStopped pins the interactive lane's
+// CurrentStep lifecycle: the runner writes "spawning" at state init and the
+// headless lane advances it on its first provider event, but the interactive
+// lane consumes no event stream — so dispatchInteractive must advance it to
+// "running" once the PTY surface is live and to "stopped" when the session
+// ends. Without these transitions the local dashboard renders "spawning"
+// for the whole session.
+func TestInteractive_StepAdvancesRunningThenStopped(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	r := minimalRunner(t)
+	worktreePath := t.TempDir()
+	if _, err := r.store.Update(worktreePath, func(s *state.State) error {
+		s.CurrentStep = "spawning"
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	readStep := func() string {
+		t.Helper()
+		st, err := r.store.Read(worktreePath)
+		if err != nil {
+			t.Fatalf("read state: %v", err)
+		}
+		return st.CurrentStep
+	}
+
+	session := liveRecordingInteractiveSession()
+	base := &fakeHandle{events: make(chan agent.Event, 1)}
+	handle := &testInteractiveHandle{Handle: base, session: session}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "interactive-step"}}
+	res := &Result{SessionID: qw.SessionID}
+
+	type outcome struct {
+		result *Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		out, err := r.dispatchInteractive(
+			context.Background(), handle, worktreePath, qw, res, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+		)
+		done <- outcome{result: out, err: err}
+	}()
+
+	// The PTY surface is live once the session-started marker lands;
+	// the step must already read "running" by then.
+	deadline := time.After(5 * time.Second)
+	for {
+		if got := readStep(); got == "running" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("CurrentStep=%q while the session runs, want running", readStep())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	close(session.done)
+	select {
+	case got := <-done:
+		if got.err != nil || got.result.Status != "completed" {
+			t.Fatalf("dispatchInteractive = status %q err %v, want completed", got.result.Status, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchInteractive did not return after the session exited")
+	}
+	if got := readStep(); got != "stopped" {
+		t.Fatalf("CurrentStep=%q after the session ended, want stopped", got)
+	}
+}
+
+// TestInteractive_EarlyFailureMarksStopped pins the terminal step for
+// interactive sessions that fail before the PTY surface is live: an oversize
+// seed, a non-interactive handle, or a half-configured relay attach all
+// return before the running transition, so without an explicit terminal
+// step the local dashboard would render "spawning" for the whole session.
+// Each failure must leave CurrentStep at "stopped" and record the
+// session-ended lifecycle notice, mirroring the clean-exit terminal path.
+func TestInteractive_EarlyFailureMarksStopped(t *testing.T) {
+	tests := []struct {
+		name            string
+		wantFailureMode string
+		attachURL       string
+		attachToken     string
+		oversizePrompt  bool
+		nonInteractive  bool
+	}{
+		{name: "oversize prompt", wantFailureMode: FailureInteractiveInput, oversizePrompt: true},
+		{name: "non-interactive handle", wantFailureMode: FailureInteractiveUnsupported, nonInteractive: true},
+		{name: "half-configured attach", wantFailureMode: FailureInteractiveConfig, attachURL: "ws://127.0.0.1:0/v1/rooms/room-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envAttachURL, tt.attachURL)
+			t.Setenv(envAttachToken, tt.attachToken)
+
+			r := minimalRunner(t)
+			worktreePath := t.TempDir()
+			if _, err := r.store.Update(worktreePath, func(s *state.State) error {
+				s.CurrentStep = "spawning"
+				return nil
+			}); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+
+			var handle agent.Handle
+			if tt.nonInteractive {
+				handle = &fakeHandle{events: make(chan agent.Event)}
+			} else {
+				handle = &testInteractiveHandle{
+					Handle:  &fakeHandle{events: make(chan agent.Event)},
+					session: completedRecordingInteractiveSession(),
+				}
+			}
+			sink := &recordingSink{}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "interactive-early-" + tt.name, Mode: interactiveRunMode}}
+			qw.SessionID = "interactive-early-stopped"
+			if tt.oversizePrompt {
+				qw.InitialPrompt = strings.Repeat("oversized-seed-", 1500)
+			}
+			res := &Result{SessionID: qw.SessionID}
+			res.ProviderName = agent.ProviderStub
+
+			out, err := r.dispatchInteractive(
+				context.Background(), handle, worktreePath, qw, res, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+			)
+			if err == nil {
+				t.Fatal("expected a terminal error for the early failure")
+			}
+			if out.Status != "failed" || out.FailureMode != tt.wantFailureMode {
+				t.Fatalf("status=%q mode=%q; want failed/%s", out.Status, out.FailureMode, tt.wantFailureMode)
+			}
+			if st, err := r.store.Read(worktreePath); err != nil {
+				t.Fatalf("read state: %v", err)
+			} else if st.CurrentStep != "stopped" {
+				t.Fatalf("CurrentStep=%q after the early failure, want stopped", st.CurrentStep)
+			}
+			var sawEnded, sawStarted bool
+			for _, ev := range sink.events {
+				if system, ok := ev.(agent.SystemEvent); ok {
+					switch system.Subtype {
+					case "interactive-session-started":
+						sawStarted = true
+					case "interactive-session-ended":
+						sawEnded = true
+					}
+				}
+			}
+			if !sawEnded {
+				t.Fatal("early failure posted no interactive-session-ended activity")
+			}
+			if sawStarted {
+				t.Fatal("early failure must not post interactive-session-started: the PTY never went live")
+			}
+			body, err := os.ReadFile(filepath.Join(worktreePath, ".agent", "events.jsonl"))
+			if err != nil {
+				t.Fatalf("read events.jsonl: %v", err)
+			}
+			if !strings.Contains(string(body), `"subtype":"interactive-session-ended"`) {
+				t.Fatalf("events.jsonl missing the session-ended notice:\n%s", body)
+			}
+		})
+	}
+}
+
 // flushingInteractiveHandle is a PTY handle that enqueues activity after its
 // session is Done and signals agent.InteractiveActivityFlusher when done.
 type flushingInteractiveHandle struct {
@@ -204,7 +375,7 @@ done
 sleep 0.3
 printf '{"type":"message","id":"final","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-final","name":"FINAL_TOOL","arguments":{}}]}}\n' >> "$dir/2099-01-01T00-00-00-000Z_live.jsonl"
 `
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+	if err := testexec.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
 		t.Fatal(err)
 	}
 	provider, err := pi.New(pi.Options{

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -746,7 +744,7 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 		args = append(args, "--config", "model_reasoning_effort="+tomlBasicString(effort))
 	}
 	if spec.SystemPromptAppend != "" {
-		args = append(args, "--config", "developer_instructions="+strconv.Quote(spec.SystemPromptAppend))
+		args = append(args, "--config", "developer_instructions="+tomlBasicString(spec.SystemPromptAppend))
 	}
 	if len(spec.MCPServers) > 0 {
 		override, nextEnv, err := codexCLIMCPOverride(spec.MCPServers, env, mcpToolsApprovalMode(approvals))
@@ -767,12 +765,23 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	// not interchangeable). A fresh named session's thread is instead
 	// created by the PTY itself and named post-hoc — see
 	// spawnNamedInteractivePTY.
+	//
+	// The resume path carries the session name as a second positional:
+	// option parsing ends before it so both positionals follow the `--`.
+	// Without this a seed starting with `-` parses as a flag and a seed
+	// equal to a subcommand word (for example `resume`, `exec`, `config`)
+	// starts that subcommand instead of a session. A resume with no seed
+	// keeps its shape (no trailing `--`); a fresh session's seed is still
+	// appended LAST, as today.
 	if spec.SessionName != "" && attachToExistingNamedSession(spec) {
 		args = append([]string{"resume"}, args...)
-		args = append(args, spec.SessionName)
-	}
-	if spec.Prompt != "" {
-		args = append(args, spec.Prompt)
+		if spec.Prompt != "" {
+			args = append(args, "--", spec.SessionName, spec.Prompt)
+		} else {
+			args = append(args, spec.SessionName)
+		}
+	} else if spec.Prompt != "" {
+		args = append(args, "--", spec.Prompt)
 	}
 	return interactiveLaunch{argv: args, env: env}, nil
 }
@@ -923,9 +932,59 @@ func sortedStringKeys(values map[string]string) []string {
 	return keys
 }
 
+// tomlBasicString renders value as a TOML basic string: double-quoted, with
+// `"` and `\` escaped, `\b \t \n \f \r` for those control characters,
+// and `\uXXXX` for every other C0 control character (0x00-0x1f) and for DEL
+// (0x7f). All other runes pass through literally, so non-ASCII text stays
+// readable in argv and logs.
+//
+// A generic JSON encoder cannot serve here: it emits `\a` and `\v` (valid
+// JSON, invalid TOML) and leaves DEL raw (invalid TOML), and the CLI this
+// launch targets falls back to the raw literal when a `--config` value
+// fails to parse as TOML — so the recipient would see the quoted literal
+// (outer quotes, every newline as the two characters `\n`) instead of the
+// intended text. Encoding every control character in TOML's own vocabulary
+// keeps launch context byte-exact for any input text.
+//
+// Invalid UTF-8 bytes are replaced with U+FFFD, matching the prior encoder's
+// behavior of never emitting raw invalid bytes.
 func tomlBasicString(value string) string {
-	body, _ := json.Marshal(value)
-	return string(body)
+	var body strings.Builder
+	body.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '"':
+			body.WriteString(`\"`)
+		case '\\':
+			body.WriteString(`\\`)
+		case '\b':
+			body.WriteString(`\b`)
+		case '\t':
+			body.WriteString(`\t`)
+		case '\n':
+			body.WriteString(`\n`)
+		case '\f':
+			body.WriteString(`\f`)
+		case '\r':
+			body.WriteString(`\r`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				// Every other C0 control and DEL fits in two hex digits;
+				// emit the fixed `\u00XX` form by hand so this helper
+				// reports no error and never allocates a formatter.
+				const hexDigits = "0123456789ABCDEF"
+				var esc [6]byte
+				esc[0], esc[1], esc[2], esc[3] = '\\', 'u', '0', '0'
+				esc[4] = hexDigits[(r>>4)&0xF]
+				esc[5] = hexDigits[r&0xF]
+				body.Write(esc[:])
+				continue
+			}
+			body.WriteRune(r)
+		}
+	}
+	body.WriteByte('"')
+	return body.String()
 }
 
 func tomlStringArray(values []string) string {

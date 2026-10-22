@@ -177,6 +177,33 @@ func TestObserved_SystemNoticesAloneKeepToolsUnreported(t *testing.T) {
 	}
 }
 
+// TestInteractive_LifecycleEventsDriveCardActivity: an interactive session's
+// event sequence moves the card from spawning to running, then stopped.
+// The journal holds only system lifecycle notices, so without folding them
+// the card's activity row falls back to the runner's CurrentStep for the
+// whole session.
+func TestInteractive_LifecycleEventsDriveCardActivity(t *testing.T) {
+	m := newTestModel(t, &fakeDaemon{}, "")
+	m.cards = []SessionCard{{SessionID: "pty", DaemonState: "running", CurrentStep: "spawning"}}
+	card := func() SessionCard { return m.cards[0] }
+	if got := card().activityText(); got != "spawning" {
+		t.Fatalf("before start: activity=%q, want the spawning fallback", got)
+	}
+	m.foldMetrics(TailEvent{SessionID: "pty", Event: agent.SystemEvent{Subtype: "interactive-session-started"}})
+	if got := card().activityText(); got != "interactive session running" {
+		t.Fatalf("after start: activity=%q, want the running lifecycle text", got)
+	}
+	m.foldMetrics(TailEvent{SessionID: "pty", Event: agent.SystemEvent{Subtype: "interactive-session-ended", Message: "interactive session ended: exit 0"}})
+	if got := card().activityText(); got != "interactive session ended: exit 0" {
+		t.Fatalf("after end: activity=%q, want the terminal lifecycle text", got)
+	}
+	// Lifecycle notices describe the session but carry no agent stream:
+	// the tool count stays unreported, not a measured zero.
+	if got := detailValue(detailFields(card(), time.Now()), "Tools"); got != "not reported" {
+		t.Fatalf("system-only journal reported tools %q", got)
+	}
+}
+
 // TestStreamPane_FollowPauseAndWidth: following shows the newest rows;
 // paused holds its window while lines keep arriving; rows are cut to the
 // pane width in cells and the pane always returns exactly its height.

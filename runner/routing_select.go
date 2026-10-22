@@ -10,13 +10,15 @@ package runner
 // (see platform/src/app/api/sessions/[id]/routing-select/route.ts).
 //
 // Posture (mirrors A2 / recordRoutingFeedback):
-//   - DARK by default. Gated by ROUTING_SELECTOR_ENABLED (default OFF). The
-//     platform flag is the AUTHORITATIVE kill-switch; this local gate only
-//     avoids a pointless round-trip when an operator hasn't opted in.
+//   - ON by default. Gated by ROUTING_SELECTOR_ENABLED (default ON): an
+//     explicit "false" (or "0", "no", "off") opts out. The platform flag
+//     is the AUTHORITATIVE switch — per-project routing mode plus the org
+//     live flag decide; this local gate only avoids a pointless round-trip
+//     when an operator hasn't opted in.
 //   - The platform OWNS the explicit-choice guard — when a user pinned a
 //     provider the platform returns source='explicit' and we keep the static
 //     choice. We never have to reason about it here.
-//   - Hard static fallback on EVERY failure mode (flag-off, missing
+//   - Hard static fallback on EVERY failure mode (opt-out, missing
 //     coordinates, proxy error/timeout, empty/unknown result, returned
 //     provider not in candidates). Never errors out the run.
 //
@@ -35,6 +37,20 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 )
+
+// routingSelectorEnabled reports whether the session-start provider-selection
+// round-trip may run. Default ON: the platform's per-project routing mode is
+// the single switch, so the runner always asks unless an operator explicitly
+// opts out with ROUTING_SELECTOR_ENABLED=false (or "0", "no", "off",
+// case-insensitive). Compare recordRoutingFeedback's opt-out gate.
+func routingSelectorEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ROUTING_SELECTOR_ENABLED"))) {
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
 
 // routingSelectTimeout caps the session-start provider-selection round-trip.
 // Kept tight (3s) because it blocks step 1 of runLoop; on any slowness we fall
@@ -74,9 +90,9 @@ func (r *Runner) selectProviderByPosterior(parentCtx context.Context, qw QueuedW
 		return "", false
 	}
 
-	// Local DARK gate (default OFF). The platform flag is authoritative; this
-	// just avoids a needless round-trip when nobody opted in.
-	if os.Getenv("ROUTING_SELECTOR_ENABLED") != "true" {
+	// Local gate (default ON). The platform flag is authoritative; this just
+	// avoids a needless round-trip when an operator explicitly opted out.
+	if !routingSelectorEnabled() {
 		return "", false
 	}
 

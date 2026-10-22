@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -1006,6 +1007,493 @@ func TestRunBackstop_PublishesToTheSessionBranchOnly(t *testing.T) {
 	}
 }
 
+// TestBackstopRepositorySlug table-tests the repository resolution the
+// backstop's gh calls target: the work item's configured repository,
+// normalized to a lower-case "owner/repo" slug in every remote form git
+// accepts, and "" when the work item names no usable GitHub repository.
+// The host's local git/gh identity never participates: resolution reads
+// only the dispatched value.
+func TestBackstopRepositorySlug(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		repository string
+		want       string
+	}{
+		{name: "empty", repository: "", want: ""},
+		{name: "https remote", repository: "https://github.com/ExampleOrg/widgets.git", want: "exampleorg/widgets"},
+		{name: "https credentialed remote", repository: "https://token:x-oauth-basic@github.com/ExampleOrg/widgets.git", want: "exampleorg/widgets"},
+		{name: "ssh remote", repository: "git@github.com:ExampleOrg/widgets.git", want: "exampleorg/widgets"},
+		{name: "bare host/path", repository: "github.com/ExampleOrg/widgets", want: "exampleorg/widgets"},
+		{name: "non github remote", repository: "https://example.com/ExampleOrg/widgets.git", want: ""},
+		{name: "local path", repository: "../example/src/widgets", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			qw := QueuedWork{QueuedWork: queuedWorkBase("slug")}
+			qw.Repository = tc.repository
+			if got := backstopRepositorySlug(qw); got != tc.want {
+				t.Fatalf("backstopRepositorySlug(%q) = %q, want %q", tc.repository, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBackstopRepoArgs pins the argv seam: a non-empty slug appends the
+// explicit selector, and an empty slug leaves the argv untouched so gh
+// keeps its checkout inference.
+func TestBackstopRepoArgs(t *testing.T) {
+	t.Parallel()
+	base := []string{"pr", "create", "--head", "agent/session"}
+	got := backstopRepoArgs(append([]string(nil), base...), "exampleorg/widgets")
+	want := []string{"pr", "create", "--head", "agent/session", "--repo", "exampleorg/widgets"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("backstopRepoArgs = %q, want %q", got, want)
+	}
+	if got := backstopRepoArgs(append([]string(nil), base...), ""); strings.Join(got, "\x00") != strings.Join(base, "\x00") {
+		t.Fatalf("backstopRepoArgs(empty) = %q, want argv unchanged %q", got, base)
+	}
+}
+
+// TestRunBackstop_PushBackTargetsConfiguredRepository is the red-first
+// regression for the wrong-owner push-back: the host's local git/gh user
+// differs from the project repository's owner, so gh inferring the owner
+// from the host would address a repository that does not exist. The
+// backstop must pass the work item's configured repository explicitly:
+// the recorded `gh pr create` and `gh pr view` argv carry
+// --repo <owner/repo> resolved from the dispatched value, never from the
+// host identity. Removing --repo fails every --repo assertion below.
+func TestRunBackstop_PushBackTargetsConfiguredRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	remote, repo := backstopRemoteFixture(t)
+	const session = "agent/wrong-owner-pushback"
+	gitRun(t, repo, "checkout", "-q", "-b", session)
+	writeFile(t, repo, "src/fix.go", "package fix\n")
+
+	// The host's local user is someone else's: the checkout's git identity
+	// and any ambient gh auth name the wrong owner.
+	gitRun(t, repo, "config", "user.name", "WrongOwner")
+	gitRun(t, repo, "config", "user.email", "wrongowner@example.com")
+
+	const wantSlug = "exampleorg/widgets"
+	const wantURL = "https://github.com/ExampleOrg/widgets/pull/77"
+	viewJSON := `{"number":77,"url":"` + wantURL + `","baseRefName":"main","headRefName":"` + session + `"}`
+	argsFile := stubGhRecordingArgs(t, wantURL, viewJSON)
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIDGET-77")}
+	// Decouple the session id from the work identifier so the --repo
+	// assertions below cannot pass off an identifier-shaped session id.
+	qw.SessionID = "sess-wrong-owner"
+	// The project repository is org-owned; the host user above is not.
+	qw.Repository = "https://github.com/ExampleOrg/widgets.git"
+	res := &Result{}
+	res.WorktreePath = repo
+	report := minimalRunner(t).runBackstop(context.Background(), qw, session, res, map[string]struct{}{
+		wantSlug: {},
+	})
+	if report.Diagnostics != "" {
+		t.Fatalf("backstop diagnostics = %q, want none", report.Diagnostics)
+	}
+	if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+		t.Fatalf("report = %+v, want pushed + PR %s", report, wantURL)
+	}
+	if report.PullRequest == nil || report.PullRequest.Repository != "ExampleOrg/widgets" || report.PullRequest.Number != 77 {
+		t.Fatalf("report.PullRequest = %+v, want the ExampleOrg/widgets#77 fact", report.PullRequest)
+	}
+	if got := gitRun(t, remote, "rev-parse", "refs/heads/"+session); got != gitRun(t, repo, "rev-parse", "HEAD") {
+		t.Fatalf("remote %s is not the committed work", session)
+	}
+	args := strings.Join(readGhArgs(t, argsFile), "\n")
+	if !strings.Contains(args, "\n--repo\n"+wantSlug+"\n") {
+		t.Fatalf("gh argv = %q, want --repo %s resolved from the configured repository", args, wantSlug)
+	}
+	if strings.Contains(args, "WrongOwner") || strings.Contains(args, "wrongowner") {
+		t.Fatalf("gh argv = %q, must never carry the host identity", args)
+	}
+}
+
+// TestRunBackstop_OmitsRepoFlagWithoutConfiguredRepository pins the
+// empty-slug lane: a work item naming no usable GitHub repository keeps
+// today's checkout inference (no --repo on `gh pr create`), so non-GitHub
+// work never fabricates a github.com target.
+func TestRunBackstop_OmitsRepoFlagWithoutConfiguredRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	_, repo := backstopRemoteFixture(t)
+	const session = "agent/no-configured-repo"
+	gitRun(t, repo, "checkout", "-q", "-b", session)
+	writeFile(t, repo, "src/fix.go", "package fix\n")
+
+	const wantURL = "https://github.com/RenseiAI/donmai/pull/4343"
+	argsFile := stubGhRecordingArgs(t, wantURL)
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("NOREPO")}
+	qw.Repository = ""
+	res := &Result{}
+	res.WorktreePath = repo
+	report := minimalRunner(t).runBackstop(context.Background(), qw, session, res, nil)
+	if report.Diagnostics != "" {
+		t.Fatalf("backstop diagnostics = %q, want none", report.Diagnostics)
+	}
+	if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+		t.Fatalf("report = %+v, want pushed + PR %s", report, wantURL)
+	}
+	if args := strings.Join(readGhArgs(t, argsFile), "\n"); strings.Contains(args, "--repo") {
+		t.Fatalf("gh argv = %q, want no --repo without a configured repository", args)
+	}
+}
+
+// TestRunBackstop_PushBackFailureReportsDeliveryFailed pins the second
+// half of the contract: a push-back failure after the push succeeded
+// (gh refuses `pr create` and names no existing PR) is reported as a
+// delivery failure in BackstopReport.Diagnostics — distinguishable from
+// work that never completed — without changing the completion contract:
+// the URL-only report carries no PR URL and no created flag.
+func TestRunBackstop_PushBackFailureReportsDeliveryFailed(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	_, repo := backstopRemoteFixture(t)
+	const session = "agent/delivery-failed"
+	gitRun(t, repo, "checkout", "-q", "-b", session)
+	writeFile(t, repo, "src/fix.go", "package fix\n")
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	outFile := filepath.Join(dir, "gh-output.txt")
+	if err := os.WriteFile(outFile, []byte("Could not resolve to a Repository with the name 'WrongOwner/widgets'\n"), 0o600); err != nil {
+		t.Fatalf("write gh stub output: %v", err)
+	}
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"repo\" ]; then echo PRIVATE; exit 0; fi\ncat %q 1>&2\nexit 1\n", outFile)
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIDGET-78")}
+	qw.SessionID = "sess-delivery-failed"
+	qw.Repository = "https://github.com/ExampleOrg/widgets.git"
+	res := &Result{}
+	res.WorktreePath = repo
+	report := minimalRunner(t).runBackstop(context.Background(), qw, session, res, nil)
+	if !report.Pushed {
+		t.Fatalf("report = %+v, want the push recorded before the delivery failed", report)
+	}
+	if report.PRCreated || report.PRURL != "" {
+		t.Fatalf("report = %+v, want no PR URL when delivery failed", report)
+	}
+	if !strings.Contains(report.Diagnostics, "gh pr create failed") || !strings.Contains(report.Diagnostics, "delivery failed") {
+		t.Fatalf("diagnostics = %q, want the push-back delivery failure", report.Diagnostics)
+	}
+	if !strings.Contains(report.Diagnostics, "work completed") {
+		t.Fatalf("diagnostics = %q, want the work-completed distinction", report.Diagnostics)
+	}
+}
+
+// TestRunDeclaredBackstops_TargetDeclaredRepositorySources pins the
+// declared path: each mutable repository's backstop passes that
+// repository's own source slug explicitly, so a checkout whose origin
+// names another owner still opens the PR on the declared repository.
+// The fixture retargets the checkout's origin at a local bare remote
+// (a local path origin keeps the declared source authoritative while
+// the push itself succeeds), and the gh stub answers the visibility
+// probe plus `pr create`.
+func TestRunDeclaredBackstops_TargetDeclaredRepositorySources(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	bare := t.TempDir()
+	//nolint:gosec // G204: test fixture, args are hard-coded literals.
+	if out, err := exec.Command("git", "init", "--bare", "-b", "main", bare).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+	_, selectedPath := writeDeclaredMutableWorkarea(t, bare, []workarea.DeclaredRepositoryV1{
+		{
+			Source: workarea.RepositorySource{Repository: "https://github.com/ExampleOrg/widgets.git", Ref: "main"},
+			Name:   "widgets", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+		},
+	})
+	gitRun(t, selectedPath, "checkout", "-q", "-b", "agent/declared-repo")
+	writeFile(t, selectedPath, "src/fix.go", "package fix\n")
+
+	const wantURL = "https://github.com/ExampleOrg/widgets/pull/78"
+	argsFile := stubGhRecordingArgs(t, wantURL)
+
+	declaration, err := (workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{
+				Source: workarea.RepositorySource{Repository: "https://github.com/ExampleOrg/widgets.git", Ref: "main"},
+				Name:   "widgets", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+			},
+		},
+	}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryPaths := map[string]string{"widgets": selectedPath}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIDGET-78D")}
+	qw.SessionID = "sess-declared-repo"
+	qw.WorkType = WorkTypeDevelopmentStr
+	res := &Result{Result: agent.Result{WorktreePath: selectedPath}}
+	report := minimalRunner(t).runDeclaredBackstops(context.Background(), qw, "agent/declared-repo", res, declaration, repositoryPaths)
+	if report.Diagnostics != "" {
+		t.Fatalf("declared backstop diagnostics = %q, want none", report.Diagnostics)
+	}
+	if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+		t.Fatalf("declared report = %+v, want pushed + PR %s", report, wantURL)
+	}
+	if args := strings.Join(readGhArgs(t, argsFile), "\n"); !strings.Contains(args, "\n--repo\nexampleorg/widgets\n") {
+		t.Fatalf("gh argv = %q, want --repo exampleorg/widgets from the declared source", args)
+	}
+}
+
+// TestRunDeclaredBackstops_TargetsEachMutableRepository pins the
+// per-repository target selection in the declared multi-repo path: two
+// mutable repositories with distinct sources share one session branch, so
+// a slug taken from the wrong repository (the selected one, or the work
+// item's) would make the second `gh pr create --repo <wrong> --head
+// <branch>` hit the first repository's "already exists" PR and
+// mis-attribute its URL. The gh stub records argv and cwd per call and
+// answers each --repo with its own PR URL; the test asserts each `pr
+// create` carries its own --repo and each RepositoryBackstopReport carries
+// its own URL. Removing the per-repo threading (selected-source or
+// work-item-source mutant) fails the --repo and URL assertions below.
+func TestRunDeclaredBackstops_TargetsEachMutableRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	const branch = "agent/declared-two-repo"
+	const widgetsSlug = "exampleorg/widgets"
+	const gadgetsSlug = "exampleorg/gadgets"
+	const widgetsURL = "https://github.com/ExampleOrg/widgets/pull/101"
+	const gadgetsURL = "https://github.com/ExampleOrg/gadgets/pull/202"
+
+	initBare := func() string {
+		bare := t.TempDir()
+		//nolint:gosec // G204: test fixture, args are hard-coded literals.
+		if out, err := exec.Command("git", "init", "--bare", "-b", "main", bare).CombinedOutput(); err != nil {
+			t.Fatalf("git init --bare: %v\n%s", err, out)
+		}
+		return bare
+	}
+	initWork := func(bare string) string {
+		dir := t.TempDir()
+		gitInit(t, dir)
+		gitRun(t, dir, "remote", "add", "origin", bare)
+		gitRun(t, dir, "checkout", "-q", "-b", branch)
+		return dir
+	}
+	bareWidgets, bareGadgets := initBare(), initBare()
+	widgetsPath, gadgetsPath := initWork(bareWidgets), initWork(bareGadgets)
+	writeFile(t, widgetsPath, "src/widgets.go", "package widgets\n")
+	writeFile(t, gadgetsPath, "src/gadgets.go", "package gadgets\n")
+	// The host identity differs from both owners; only the declared
+	// sources may drive --repo.
+	gitRun(t, widgetsPath, "config", "user.name", "WrongOwner")
+	gitRun(t, gadgetsPath, "config", "user.name", "WrongOwner")
+
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "gh-calls.log")
+	viewWidgets := `{"number":101,"url":"` + widgetsURL + `","baseRefName":"main","headRefName":"` + branch + `"}`
+	viewGadgets := `{"number":202,"url":"` + gadgetsURL + `","baseRefName":"main","headRefName":"` + branch + `"}`
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "repo" ]; then echo PRIVATE; exit 0; fi
+{
+echo "CWD:$PWD"
+printf 'ARG:%%s\n' "$@"
+echo "---CALL-END---"
+} >> %q
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  repo=""
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--repo" ]; then repo="$a"; fi
+    prev="$a"
+  done
+  case "$repo" in
+    %q) echo %q; exit 0;;
+    %q) echo %q; exit 0;;
+    *) echo "unexpected --repo $repo" 1>&2; exit 1;;
+  esac
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  case "$3" in
+    *widgets/pull/101*) echo '%s'; exit 0;;
+    *gadgets/pull/202*) echo '%s'; exit 0;;
+    *) echo "unexpected view $3" 1>&2; exit 1;;
+  esac
+fi
+echo "unexpected gh argv: $*" 1>&2
+exit 1
+`, logFile, widgetsSlug, widgetsURL, gadgetsSlug, gadgetsURL, viewWidgets, viewGadgets)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	declaration, err := (workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{
+				Source: workarea.RepositorySource{Repository: "https://github.com/ExampleOrg/widgets.git", Ref: "main"},
+				Name:   "widgets", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+			},
+			{
+				Source: workarea.RepositorySource{Repository: "https://github.com/ExampleOrg/gadgets.git", Ref: "main"},
+				Name:   "gadgets", Role: workarea.RepositoryRoleSecondary, Authority: workarea.RepositoryMutable,
+			},
+		},
+	}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryPaths := map[string]string{"widgets": widgetsPath, "gadgets": gadgetsPath}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIDGET-DUAL")}
+	qw.SessionID = "sess-declared-two-repo"
+	qw.WorkType = WorkTypeDevelopmentStr
+	// Leave the work item repository empty so only the declared sources
+	// can supply --repo; a work-item-source mutant then emits no --repo.
+	qw.Repository = ""
+	res := &Result{Result: agent.Result{WorktreePath: widgetsPath}}
+	report := minimalRunner(t).runDeclaredBackstops(context.Background(), qw, branch, res, declaration, repositoryPaths)
+	if report.Diagnostics != "" {
+		t.Fatalf("declared backstop diagnostics = %q, want none", report.Diagnostics)
+	}
+	if len(report.Repositories) != 2 {
+		t.Fatalf("declared repositories = %d, want 2 (%+v)", len(report.Repositories), report)
+	}
+	byName := map[string]agent.BackstopReport{}
+	for _, entry := range report.Repositories {
+		byName[entry.Name] = entry.Report
+	}
+	if got := byName["widgets"].PRURL; got != widgetsURL {
+		t.Fatalf("widgets PRURL = %q, want %q", got, widgetsURL)
+	}
+	if got := byName["gadgets"].PRURL; got != gadgetsURL {
+		t.Fatalf("gadgets PRURL = %q, want %q", got, gadgetsURL)
+	}
+	for _, name := range []string{"widgets", "gadgets"} {
+		r := byName[name]
+		if !r.Pushed || !r.PRCreated {
+			t.Fatalf("%s report = %+v, want pushed + created", name, r)
+		}
+		if r.Diagnostics != "" {
+			t.Fatalf("%s diagnostics = %q, want none", name, r.Diagnostics)
+		}
+	}
+	if report.PRURL != widgetsURL {
+		t.Fatalf("aggregate PRURL = %q, want the selected repository's %q", report.PRURL, widgetsURL)
+	}
+	if fact := byName["widgets"].PullRequest; fact == nil || fact.Repository != "ExampleOrg/widgets" || fact.Number != 101 {
+		t.Fatalf("widgets fact = %+v, want ExampleOrg/widgets#101", byName["widgets"].PullRequest)
+	}
+	if fact := byName["gadgets"].PullRequest; fact == nil || fact.Repository != "ExampleOrg/gadgets" || fact.Number != 202 {
+		t.Fatalf("gadgets fact = %+v, want ExampleOrg/gadgets#202", byName["gadgets"].PullRequest)
+	}
+	// Each `pr create` must carry its own --repo, observed in the
+	// worktree that issued it.
+	raw, err := os.ReadFile(logFile) //nolint:gosec // G304: path created by this test.
+	if err != nil {
+		t.Fatalf("read gh calls: %v", err)
+	}
+	creates := map[string]string{}
+	for _, block := range strings.Split(string(raw), "---CALL-END---") {
+		if !strings.Contains(block, "ARG:pr") || !strings.Contains(block, "ARG:create") {
+			continue
+		}
+		var cwd, repo string
+		lines := strings.Split(block, "\n")
+		for i, line := range lines {
+			if v, ok := strings.CutPrefix(line, "CWD:"); ok {
+				cwd = v
+			}
+			if line == "ARG:--repo" && i+1 < len(lines) {
+				if v, ok := strings.CutPrefix(lines[i+1], "ARG:"); ok {
+					repo = v
+				}
+			}
+		}
+		if cwd == "" || repo == "" {
+			t.Fatalf("pr create call missing cwd or --repo: %q", block)
+		}
+		creates[cwd] = repo
+	}
+	if creates[widgetsPath] != widgetsSlug {
+		t.Fatalf("widgets pr create --repo = %q, want %q (calls: %v)", creates[widgetsPath], widgetsSlug, creates)
+	}
+	if creates[gadgetsPath] != gadgetsSlug {
+		t.Fatalf("gadgets pr create --repo = %q, want %q (calls: %v)", creates[gadgetsPath], gadgetsSlug, creates)
+	}
+	if len(creates) != 2 {
+		t.Fatalf("pr create calls = %v, want one per worktree", creates)
+	}
+}
+
+// TestRunDeclaredBackstops_CredentialedSourceStripsCredentials pins the
+// credentialed-source fallback: a declared source carrying userinfo still
+// targets its repository explicitly, and no credential ever reaches the gh
+// argv. Removing the githubRepositorySlug fallback leaves --repo absent.
+func TestRunDeclaredBackstops_CredentialedSourceStripsCredentials(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	bare := t.TempDir()
+	//nolint:gosec // G204: test fixture, args are hard-coded literals.
+	if out, err := exec.Command("git", "init", "--bare", "-b", "main", bare).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+	selectedPath := t.TempDir()
+	gitInit(t, selectedPath)
+	gitRun(t, selectedPath, "remote", "add", "origin", bare)
+	gitRun(t, selectedPath, "checkout", "-q", "-b", "agent/declared-credentialed")
+	writeFile(t, selectedPath, "src/fix.go", "package fix\n")
+
+	const wantSlug = "exampleorg/widgets"
+	const wantURL = "https://github.com/ExampleOrg/widgets/pull/103"
+	argsFile := stubGhRecordingArgs(t, wantURL)
+
+	declaration, err := (workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{
+				Source: workarea.RepositorySource{Repository: "https://user:tok@github.com/ExampleOrg/widgets.git", Ref: "main"},
+				Name:   "widgets", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+			},
+		},
+	}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryPaths := map[string]string{"widgets": selectedPath}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("WIDGET-CRED")}
+	qw.SessionID = "sess-declared-credentialed"
+	qw.WorkType = WorkTypeDevelopmentStr
+	qw.Repository = ""
+	res := &Result{Result: agent.Result{WorktreePath: selectedPath}}
+	report := minimalRunner(t).runDeclaredBackstops(context.Background(), qw, "agent/declared-credentialed", res, declaration, repositoryPaths)
+	if report.Diagnostics != "" {
+		t.Fatalf("declared backstop diagnostics = %q, want none", report.Diagnostics)
+	}
+	if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+		t.Fatalf("declared report = %+v, want pushed + PR %s", report, wantURL)
+	}
+	args := "\n" + strings.Join(readGhArgs(t, argsFile), "\n") + "\n"
+	if !strings.Contains(args, "\n--repo\n"+wantSlug+"\n") {
+		t.Fatalf("gh argv = %q, want --repo %s from the credentialed declared source", args, wantSlug)
+	}
+	if strings.Contains(args, "tok") {
+		t.Fatalf("gh argv = %q, must never carry the declared source's credentials", args)
+	}
+}
+
 // TestRunBackstop_NeverForcesTheSessionBranch pins that a session branch that
 // moved on the remote (a branch name reused across attempts) is not
 // overwritten: the push is refused as a non-fast-forward, the backstop reports
@@ -1096,7 +1584,7 @@ exit 1
 `, visFile)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1148,7 +1636,7 @@ exit 1
 `, visFile, capture.args, capture.title, capture.body, url)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1159,25 +1647,41 @@ exit 1
 // `pr create` argv (one argument per line, after a leading blank line)
 // and answers `pr create` the way the real gh does: without --head it
 // refuses exactly as the recorded failure did; with it, it prints url.
-// The backstop's read-only `repo view` visibility probe is answered
-// PRIVATE without recording, so tests asserting "gh was never invoked"
-// after a failed push only observe PR creation.
-func stubGhRecordingArgs(t *testing.T, url string) string {
+// The stub also records the `pr view` argv (same file) and answers it
+// with viewJSON, so tests asserting an explicit --repo on the readback
+// can observe it. The backstop's read-only `repo view` visibility probe
+// is answered PRIVATE without recording, so tests asserting "gh was never
+// invoked" after a failed push only observe PR creation.
+func stubGhRecordingArgs(t *testing.T, url string, viewJSON ...string) string {
 	t.Helper()
 	dir := t.TempDir()
 	argsFile := filepath.Join(dir, "gh-args.txt")
+	viewOut := ""
+	if len(viewJSON) > 0 {
+		viewOut = viewJSON[0]
+	}
+	viewFile := filepath.Join(dir, "gh-view.txt")
+	if err := os.WriteFile(viewFile, []byte(viewOut), 0o600); err != nil {
+		t.Fatalf("write gh view output: %v", err)
+	}
 	script := fmt.Sprintf(`#!/bin/sh
 if [ "$1" = "repo" ]; then echo PRIVATE; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  { echo; printf '%%s\n' "$@"; } >> %[1]q
+  v=$(cat %[3]q)
+  if [ -z "$v" ]; then echo "no view" 1>&2; exit 1; fi
+  echo "$v"; exit 0
+fi
 { echo; printf '%%s\n' "$@"; } > %[1]q
 for a in "$@"; do
   if [ "$a" = "--head" ]; then echo %[2]q; exit 0; fi
 done
 echo "aborted: you must first push the current branch to a remote, or use the --head flag" 1>&2
 exit 1
-`, argsFile, url)
+`, argsFile, url, viewFile)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1431,7 +1935,7 @@ func stubGhOnPath(t *testing.T, exitCode int, output string) {
 	script := fmt.Sprintf("#!/bin/sh\ncat %q 1>&2\nexit %d\n", outFile, exitCode)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1454,7 +1958,7 @@ exit %[3]d
 `, expectedURL, outFile, exitCode)
 	ghPath := filepath.Join(dir, "gh")
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh validating stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

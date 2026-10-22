@@ -16,10 +16,12 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/prompt"
 	providershell "github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -407,13 +409,14 @@ func interactiveRetentionManager(
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent,
 		Now:       now,
-		ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
-			return registry.ArchiveRoot(ctx, WorkareaRootArchiveSpec{
-				AcquisitionID: spec.AcquisitionID,
-				WorkareaID:    spec.WorkareaID,
-				SessionID:     spec.SessionID,
-				WorkareaRoot:  spec.WorkareaRoot,
-				SelectedPath:  spec.SelectedPath,
+		ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+			return registry.CommitArchiveRoot(ctx, WorkareaRootArchiveSpec{
+				AcquisitionID:    spec.AcquisitionID,
+				WorkareaID:       spec.WorkareaID,
+				SessionID:        spec.SessionID,
+				WorkareaRoot:     spec.WorkareaRoot,
+				SelectedPath:     spec.SelectedPath,
+				TerminalResultID: spec.TerminalResultID,
 			})
 		},
 	})
@@ -501,7 +504,7 @@ func interactiveRetentionShell(t *testing.T, afterRead string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "interactive-shell")
 	body := "#!/bin/sh\nIFS= read -r _\n" + afterRead + "exit 0\n"
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture must execute

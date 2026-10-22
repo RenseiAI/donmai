@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestInteractiveArgs(t *testing.T) {
@@ -29,17 +30,17 @@ func TestInteractiveArgs(t *testing.T) {
 		{
 			name: "non-empty prompt seeds the REPL",
 			spec: agent.Spec{Prompt: "fix the bug"},
-			want: []string{"fix the bug"},
+			want: []string{"--", "fix the bug"},
 		},
 		{
 			name: "session name precedes the prompt",
 			spec: agent.Spec{SessionName: "chief-of-staff", Prompt: "coordinate"},
-			want: []string{"--name", "chief-of-staff", "coordinate"},
+			want: []string{"--name", "chief-of-staff", "--", "coordinate"},
 		},
 		{
 			name: "autonomous adds bypassPermissions and the Linear MCP deny list before the prompt",
 			spec: agent.Spec{Prompt: "fix the bug", Autonomous: true},
-			want: append([]string{"--permission-mode", "bypassPermissions", "--disallowedTools", strings.Join(linearMCPDisallowList, ",")}, "fix the bug"),
+			want: append([]string{"--permission-mode", "bypassPermissions", "--disallowedTools", strings.Join(linearMCPDisallowList, ","), "--"}, "fix the bug"),
 		},
 		{
 			name: "autonomous with empty prompt is still a valid flag-only argv",
@@ -49,12 +50,12 @@ func TestInteractiveArgs(t *testing.T) {
 		{
 			name: "system prompt append precedes the positional prompt",
 			spec: agent.Spec{Prompt: "fix the bug", SystemPromptAppend: "use project conventions"},
-			want: []string{"--append-system-prompt", "use project conventions", "fix the bug"},
+			want: []string{"--append-system-prompt", "use project conventions", "--", "fix the bug"},
 		},
 		{
 			name: "empty system prompt append adds no flag",
 			spec: agent.Spec{Prompt: "fix the bug", SystemPromptAppend: ""},
-			want: []string{"fix the bug"},
+			want: []string{"--", "fix the bug"},
 		},
 	}
 	for _, tt := range tests {
@@ -106,7 +107,7 @@ func TestInteractiveArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
 func TestInteractiveArgs_MCPConfigPrecedesPositionalPrompt(t *testing.T) {
 	t.Parallel()
 	got := interactiveArgsWithMCP(agent.Spec{Prompt: "fix the bug"}, "/tmp/session-mcp.json")
-	want := []string{"--mcp-config", "/tmp/session-mcp.json", "--strict-mcp-config", "fix the bug"}
+	want := []string{"--mcp-config", "/tmp/session-mcp.json", "--strict-mcp-config", "--", "fix the bug"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("interactiveArgsWithMCP = %q, want %q", got, want)
 	}
@@ -285,6 +286,106 @@ func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
 	})
 }
 
+// TestInteractiveArgs_SeedEndsOptionParsing proves the seed is preceded
+// by `--` and stays the last element whatever its first characters: a
+// plain seed, a seed starting with `-`, a seed starting with `--model x`,
+// and a seed equal to a subcommand word all reach the REPL as the seed
+// instead of being parsed as a flag or starting a subcommand. Exact
+// reserved words arrive neutralised (single leading space, via
+// claudeSeedMessage) because `--` alone does not stop them; every other
+// seed arrives byte for byte.
+func TestInteractiveArgs_SeedEndsOptionParsing(t *testing.T) {
+	t.Parallel()
+	seeds := []string{
+		"fix the bug",
+		"-fix the bug",
+		"--model x fix the bug",
+		"resume",
+		"exec",
+		"config",
+	}
+	for _, seed := range seeds {
+		t.Run(seed, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Prompt: seed, Autonomous: true})
+			wantSeed := claudeSeedMessage(seed)
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs = %q, want the seed preceded by --", got)
+			}
+			if last := got[len(got)-1]; last != wantSeed {
+				t.Fatalf("last argv element = %q, want the seed %q (full argv: %q)", last, wantSeed, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+}
+
+// TestInteractiveArgs_ReservedWordSeedIsNeutralised pins every exact
+// reserved command from `claude --help`: each must reach the child as
+// `" "+word` preceded by `--` and last, so it parses as the prompt
+// instead of starting that subcommand. A plain seed and a dash-leading
+// non-reserved seed must pass through byte for byte. Recorded-CLI
+// evidence: `claude -- auth` and `claude -- mcp` dispatch to those
+// subcommands, while the single-space forms start the REPL (the child
+// times out waiting for input instead of printing subcommand usage).
+func TestInteractiveArgs_ReservedWordSeedIsNeutralised(t *testing.T) {
+	t.Parallel()
+	for word := range claudeReservedSubcommands {
+		t.Run(word, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Prompt: word})
+			want := " " + word
+			if len(got) < 2 {
+				t.Fatalf("interactiveArgs(%q) = %q, want -- plus the neutralised seed", word, got)
+			}
+			if last := got[len(got)-1]; last != want {
+				t.Fatalf("last argv element = %q, want the neutralised seed %q (full argv: %q)", last, want, got)
+			}
+			if penultimate := got[len(got)-2]; penultimate != "--" {
+				t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+			}
+		})
+	}
+	t.Run("plain seed unchanged", func(t *testing.T) {
+		t.Parallel()
+		got := interactiveArgs(agent.Spec{Prompt: "fix the bug"})
+		if last := got[len(got)-1]; last != "fix the bug" {
+			t.Fatalf("plain seed altered: %q", got)
+		}
+	})
+	t.Run("dash seed without exact match unchanged", func(t *testing.T) {
+		t.Parallel()
+		got := interactiveArgs(agent.Spec{Prompt: "--bogus hello"})
+		if last := got[len(got)-1]; last != "--bogus hello" {
+			t.Fatalf("dash seed altered: %q", got)
+		}
+		if penultimate := got[len(got)-2]; penultimate != "--" {
+			t.Fatalf("element before the seed = %q, want -- (full argv: %q)", penultimate, got)
+		}
+	})
+}
+
+// TestInteractiveArgs_NoSeedGainsNoEndOfOptions pins that an argv without
+// a seed carries no trailing `--`.
+func TestInteractiveArgs_NoSeedGainsNoEndOfOptions(t *testing.T) {
+	t.Parallel()
+	for _, spec := range []agent.Spec{
+		{},
+		{Autonomous: true},
+		{SessionName: "chief-of-staff"},
+	} {
+		got := interactiveArgs(spec)
+		if slices.Contains(got, "--") {
+			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no --", spec, got)
+		}
+	}
+	if got := interactiveArgsWith(agent.Spec{Autonomous: true}, "/tmp/session-mcp.json", `{"hooks":{}}`); slices.Contains(got, "--") {
+		t.Fatalf("seedless interactiveArgsWith = %q, want no --", got)
+	}
+}
+
 // TestInteractiveArgs_PromptIsAlwaysLast pins the positional-argument
 // invariant: claude parses a bare prompt positionally, so any flag emitted
 // after it would swallow it (or the prompt would be read as a flag value).
@@ -308,6 +409,102 @@ func TestInteractiveArgs_PromptIsAlwaysLast(t *testing.T) {
 	}
 }
 
+// TestSpawn_SeedEndingOptionParsingReachesChildArgvLast is the
+// load-bearing proof that the production Spawn path carries the seed:
+// the fake binary echoes its own argv, and the test asserts the seed
+// follows `--` as the last element through Spawn (not only the argv
+// helper). RED proof: drop the `--` in interactiveArgsWith and the
+// seed-adjacent element is no longer `--`.
+func TestSpawn_SeedEndingOptionParsingReachesChildArgvLast(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	const seed = "--model x fix the bug"
+	p := newFakeInteractiveProvider(t, `printf '%s\n' "$@" > "$PWD/argv.txt"`)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      seed,
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake claude exit")
+		}
+	}
+exited:
+	raw, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read echoed argv: %v", err)
+	}
+	// printf '%s\n' splits nothing here (the fake echoes whole args),
+	// but argv elements containing real newlines (the --settings JSON
+	// is one element) would split lines; check the raw text tail
+	// instead: it must end with the `--` line plus the seed.
+	text := strings.TrimSuffix(string(raw), "\n")
+	if !strings.HasSuffix(text, "--\n"+seed) {
+		t.Fatalf("child argv does not end with -- plus the seed: %q", text)
+	}
+}
+
+// TestSpawn_ReservedWordSeedReachesChildNeutralised is the production-path
+// pin for the reserved-word neutralisation: a seed that is exactly a
+// registered subcommand must reach the PTY child as `" "+word` preceded
+// by `--` and last, so the real CLI parses it as the prompt. RED proof:
+// drop claudeSeedMessage and the tail is `--` plus the bare word.
+func TestSpawn_ReservedWordSeedReachesChildNeutralised(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	const seed = "auth"
+	const wantSeed = " " + seed
+	p := newFakeInteractiveProvider(t, `printf '%s\n' "$@" > "$PWD/argv.txt"`)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      seed,
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake claude exit")
+		}
+	}
+exited:
+	raw, err := os.ReadFile(filepath.Join(workdir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read echoed argv: %v", err)
+	}
+	text := strings.TrimSuffix(string(raw), "\n")
+	if !strings.HasSuffix(text, "--\n"+wantSeed) {
+		t.Fatalf("child argv does not end with -- plus the neutralised seed %q: %q", wantSeed, text)
+	}
+}
+
 // newFakeInteractiveProvider builds a Provider whose binary is a fake-claude
 // script, run under a real PTY by ptycli. Mirrors the PATH-shim technique in
 // provider/harness/clijsonl's handle_test.go.
@@ -321,7 +518,7 @@ func newFakeInteractiveProvider(t *testing.T, script string) *Provider {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-claude")
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit

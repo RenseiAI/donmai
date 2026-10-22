@@ -11,6 +11,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestApplySeatBudget(t *testing.T) {
@@ -273,7 +274,7 @@ func TestInstallSessionDependencies_CapsSeatEnv(t *testing.T) {
 	}
 	report := filepath.Join(dir, "install-gomaxprocs")
 	fakeGo := "#!/bin/sh\nprintf '%s' \"$GOMAXPROCS\" > '" + report + "'\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(fakes, "go"), []byte(fakeGo), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
+	if err := testexec.WriteFile(filepath.Join(fakes, "go"), []byte(fakeGo), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (PATH lookup + exec need +x)
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))

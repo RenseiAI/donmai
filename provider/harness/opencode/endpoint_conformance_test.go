@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 const (
@@ -233,7 +234,7 @@ func writeEndpointHelperCLI(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "opencode")
 	script := "#!/bin/sh\nexec \"$DONMAI_OPENCODE_HELPER_BINARY\" -test.run '^TestEndpointBoundCLIHelperProcess$' -- \"$@\"\n"
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatalf("write helper CLI: %v", err)
 	}
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture must be owner-executable

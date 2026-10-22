@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // fakeAFCode writes a small script that echos JSON to stdout, then returns its
@@ -22,7 +24,7 @@ func fakeAFCode(t *testing.T) string {
 	content := `#!/bin/sh
 echo '{"command":"'$1'","args":"'"$*"'"}'
 `
-	if err := os.WriteFile(script, []byte(content), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+	if err := testexec.WriteFile(script, []byte(content), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
 		t.Fatalf("write fake af-code: %v", err)
 	}
 	return script
@@ -49,7 +51,7 @@ status=leaked
 if [ "${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}" = "" ]; then status=clean; fi
 printf '{"env":"%s"}\n' "$status"
 `
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+	if err := testexec.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
 		t.Fatalf("write fake af-code: %v", err)
 	}
 	t.Setenv("DONMAI_CODE_BIN", bin)
@@ -303,7 +305,7 @@ func TestValidateCrossDeps_WithPath(t *testing.T) {
 func TestResolveCodeBin_EnvOverride(t *testing.T) {
 	dir := t.TempDir()
 	fakebin := filepath.Join(dir, "my-af-code")
-	if err := os.WriteFile(fakebin, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+	if err := testexec.WriteFile(fakebin, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTFACTORY_CODE_BIN", fakebin)
@@ -335,7 +337,7 @@ func TestResolveCodeBin_CachingIdempotent(t *testing.T) {
 func TestResolveCodeBin_PrintsDeprecationWarning(t *testing.T) {
 	dir := t.TempDir()
 	fakebin := filepath.Join(dir, "my-af-code")
-	if err := os.WriteFile(fakebin, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+	if err := testexec.WriteFile(fakebin, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTFACTORY_CODE_BIN", fakebin)
@@ -445,7 +447,7 @@ func TestResolveArchBin_AfArchOnPath(t *testing.T) {
 	t.Setenv("AGENTFACTORY_ARCH_BIN", "")
 	dir := t.TempDir()
 	afArch := filepath.Join(dir, "af-arch")
-	if err := os.WriteFile(afArch, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+	if err := testexec.WriteFile(afArch, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
 		t.Fatal(err)
 	}
 	origPath := os.Getenv("PATH")
@@ -472,7 +474,7 @@ func TestResolveArchBin_NoStaleDonmaiArchProbe(t *testing.T) {
 	dir := t.TempDir()
 	// Plant a `donmai-arch` (stale name) on PATH; it must be ignored.
 	stale := filepath.Join(dir, "donmai-arch")
-	if err := os.WriteFile(stale, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+	if err := testexec.WriteFile(stale, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
 		t.Fatal(err)
 	}
 	origPath := os.Getenv("PATH")

@@ -165,6 +165,19 @@ type QueuedWork struct {
 	// daemon that does not advertise capabilities keeps the prior behaviour).
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
 
+	// DeferFailureTransition opts this work item into deferring the
+	// failure-side tracker transition when a failed attempt may be
+	// retried on another endpoint. When true, a session that fails on a
+	// provider error before any tool call leaves the tracker issue
+	// untouched so a re-dispatch starts from the same state; the
+	// skipped transition is recorded on the terminal result so the
+	// control plane can complete or apply it later. False (including
+	// every dispatch that predates this field) keeps the prior
+	// behaviour: the failure-side transition fires as decided.
+	//
+	// Wire shape: "deferFailureTransition" (camelCase, omitempty).
+	DeferFailureTransition bool `json:"deferFailureTransition,omitempty"`
+
 	// SeatBudget carries the daemon's resolved per-seat resource budget for
 	// this session: the share plus the mode. Threaded from the daemon's
 	// SessionDetail. Nil means budgeting is off — the seat spawns exactly
@@ -400,6 +413,12 @@ type Result struct {
 	// after the full descriptor and host-local path are durable.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
 
+	// TerminalArchiveReference is the separately versioned committed-archive
+	// recovery reference, emitted only after the archive bytes and manifest
+	// are committed and independently re-read. Nil when no archive committed
+	// for this result; old receivers ignore the key.
+	TerminalArchiveReference *workarea.TerminalArchiveReference `json:"terminalArchiveReference,omitempty"`
+
 	// manifestPrinted records that the envelope's Manifest was recovered
 	// from a printed `Intended manifest:` block rather than read from the
 	// manifest file on disk. A printed block is the tool-restricted
@@ -440,7 +459,7 @@ type LinearStatusTransition struct {
 
 	// Reason is a short identifier from PostSessionDecision.Reason
 	// ("passed", "failed", "unknown", "completed-non-sensitive",
-	// "deferred-merge-queue", "no-mapping", ...).
+	// "deferred-merge-queue", "deferred-provider-error", "no-mapping", ...).
 	Reason string `json:"reason,omitempty"`
 
 	// Error is the human-readable error message when the transition

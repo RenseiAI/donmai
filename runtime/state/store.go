@@ -150,6 +150,21 @@ type State struct {
 	ModelAuthor      string `json:"modelAuthor,omitempty"`
 	EndpointOperator string `json:"endpointOperator,omitempty"`
 	Protocol         string `json:"protocol,omitempty"`
+
+	// Observed serving report. FinalProvider names the provider the
+	// session's model calls last identified from native response evidence
+	// (LlmCallEvent.ResponseModelProvider) — the provider the wire response
+	// itself named; FinalModel is the served model id paired with it (the
+	// native served id when the wire served a different id than requested,
+	// else the requested id); ProviderAttempts totals the serving attempts
+	// behind the session's model calls (1 per model request, summed over
+	// calls that reported). These are OBSERVED per-call facts, last report
+	// wins — never the admitted binding above, which stays as dispatched,
+	// and never the configured selection (LlmCallEvent.System). Empty/zero
+	// when no call has carried response-provider evidence yet.
+	FinalProvider    string `json:"finalProvider,omitempty"`
+	FinalModel       string `json:"finalModel,omitempty"`
+	ProviderAttempts int    `json:"providerAttempts,omitempty"`
 }
 
 // AppendToolLifecycleReceipt appends a digest-only admission decision and
