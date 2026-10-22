@@ -1502,3 +1502,70 @@ func TestDaemon_YamlWatcherProvesRotations(t *testing.T) {
 		}
 	})
 }
+
+// TestCredentialRefresher_RotateRegistrationTokenRestoresPreviousOnAdoptRefusal
+// pins that a rotation the local validator refuses is not adopted: the
+// control plane honours the candidate (200) but ValidateRefresh rejects the
+// result, so the rotation reports the error and the refresher keeps
+// presenting the previous generation while the lanes stay on the running
+// credentials. Against store-then-adopt the refresher holds the refused
+// generation and every later refresh presents it.
+func TestCredentialRefresher_RotateRegistrationTokenRestoresPreviousOnAdoptRefusal(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var gotAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	// #nosec G101 -- test fixture token
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	opts.ValidateRefresh = func(*RefreshTokenResult) error {
+		return errors.New("controller credentials refused")
+	}
+	r := NewCredentialRefresher(opts)
+	lane := &recordingLane{}
+	r.Attach(lane)
+	// #nosec G101 -- test fixture token
+	if _, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired"); err == nil {
+		t.Fatal("rotation refused by the local validator succeeded; want the error surfaced")
+	}
+	if token, _ := r.Registration(); token != "rsp_live_before" {
+		t.Fatalf("refresher holds %q after a validator-refused rotation, want the previous generation kept", token)
+	}
+	if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "before.jwt" {
+		t.Fatalf("lane = (%q, %q), want the running credentials kept", id, jwt)
+	}
+
+	// The previous generation still works: with the refusal cleared, the
+	// next ordinary refresh presents it.
+	r.opts.ValidateRefresh = nil
+	result, err := r.Refresh(context.Background(), "runtime-token-expired")
+	if err != nil {
+		t.Fatalf("refresh after a validator-refused rotation: %v", err)
+	}
+	if result.RuntimeToken != "refreshed.jwt" {
+		t.Errorf("refresh after a validator-refused rotation minted %q, want the working generation's credentials", result.RuntimeToken)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"Bearer rsp_live_rotated", "Bearer rsp_live_before"}
+	if len(gotAuth) != len(want) {
+		t.Fatalf("wire auth = %v, want %v", gotAuth, want)
+	}
+	for i := range want {
+		if gotAuth[i] != want[i] {
+			t.Fatalf("wire auth = %v, want %v", gotAuth, want)
+		}
+	}
+}

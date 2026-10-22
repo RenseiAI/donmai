@@ -213,10 +213,12 @@ func (r *CredentialRefresher) UpdateRegistrationToken(token string) {
 // platform registration: promoting a stub-booted refresher live would leave
 // lanes on an identity the poll loop never serves — that promotion is a
 // restart. A token the control plane refuses is likewise refused: the round
-// trip fails, the held generation is left untouched, and the error is visible
-// to the caller — the refresher is never left presenting a generation the
-// control plane rejected. Only the token changes; every other registration
-// field retains its current value.
+// trip fails and the error is visible to the caller. A result the local
+// validator refuses is refused the same way: the candidate is restored to
+// the previous generation before returning, so the refresher is never left
+// presenting a generation the daemon reported as refused while the lanes
+// stay on the old runtime JWT. Only the token changes; every other
+// registration field retains its current value.
 //
 // The round trip is RepresentRuntimeToken, not Refresh: rotation must never
 // be able to mint a competing worker identity. If the control plane will not
@@ -233,8 +235,10 @@ func (r *CredentialRefresher) UpdateRegistrationToken(token string) {
 // is in flight is newer than this rotation: on success the candidate is
 // stored only when the refresher still holds the previous generation,
 // otherwise the rotation reports that it lost the race and leaves the newer
-// generation (and its lanes) alone; on failure nothing needs restoring
-// because the held generation was never mutated.
+// generation (and its lanes) alone; a round-trip failure mutates nothing so
+// nothing needs restoring, while a result the local validator refuses
+// restores the previous generation (unless a concurrent update already moved
+// on, which wins as the newer generation).
 //
 // Like UpdateRegistrationToken, the swap is memory-only: the durable token
 // stays in the operator-owned config file, so a restart reverts to the filed
@@ -284,7 +288,21 @@ func (r *CredentialRefresher) RotateRegistrationToken(ctx context.Context, token
 	r.opts.Registration.RegistrationToken = token
 	stored := r.opts.Registration
 	r.mu.Unlock()
-	return r.adopt(result, stored)
+	rotated, err := r.adopt(result, stored)
+	if err != nil {
+		// The control plane honoured the candidate but the result did not
+		// survive local validation: restore the previous working generation
+		// instead of stranding the refresher on a refused one. A
+		// concurrent update that landed during adopt is newer and wins —
+		// restore only while the held token is still this rotation's.
+		r.mu.Lock()
+		if r.opts.Registration.RegistrationToken == token {
+			r.opts.Registration.RegistrationToken = previous
+		}
+		r.mu.Unlock()
+		return nil, fmt.Errorf("rotate registration token: %w", err)
+	}
+	return rotated, nil
 }
 
 // Registration reports the registration this refresher presents on the next

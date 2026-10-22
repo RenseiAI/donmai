@@ -606,6 +606,16 @@ type Daemon struct {
 	// either ConfigPath is empty or the watcher failed to start.
 	yamlWatcherStop func()
 
+	// yamlReloadMu serializes whole onYamlChanged reloads, including the
+	// registration-token prove round trip that runs with d.mu released:
+	// without it two file writes landing inside one round trip validate
+	// against the same filed generation, and the older commit wins the
+	// filed pointer while the refresher holds the newer one (a revert
+	// landing mid-flight is lost the same way). The second reload waits,
+	// then validates against the committed state. Taken before d.mu and
+	// never held across anything that calls back into onYamlChanged.
+	yamlReloadMu sync.Mutex
+
 	// sessionDetails stores the per-session payload the spawner
 	// hands out to `donmai agent run` workers via the local control
 	// HTTP API at /api/daemon/sessions/<id>.
@@ -2271,6 +2281,11 @@ func (d *Daemon) GatewayStatus() gateway.Status {
 // project, local-source and exact session-ceiling changes while preserving
 // restart-bound capacity fields and the orchestrator URL.
 func (d *Daemon) onYamlChanged(cfg *Config) {
+	// Serialize whole reloads: the prove round trip below runs with d.mu
+	// released, so without this a second write landing mid-flight would
+	// validate against the pre-flight filed generation (see yamlReloadMu).
+	d.yamlReloadMu.Lock()
+	defer d.yamlReloadMu.Unlock()
 	// A local dispatch holds this read lease through its authority transition.
 	// Publish the new policy under the writer lease, then release it before
 	// calling source factories or other external code.
@@ -2416,14 +2431,14 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			d.refreshRegistrationProjectsLocked()
 		}
 	} else if registrationTokenChanged {
-		// A pure rotation: the project declaration is unchanged, so a
-		// proven rotation needs no re-registration — its own round trip
-		// already re-presented the identity and fanned the credentials out.
-		// A refused token leaves the registration exactly as it was, so
-		// there is nothing to re-present: re-registering anyway would mint
-		// a fresh worker identity on every later write of the same refused
-		// file. Validation happens under the lock; the proof runs outside
-		// it below.
+		// A pure rotation: the project declaration is unchanged, so there is
+		// nothing to publish — but the proven generation still needs
+		// presenting to the control plane, so the rotation below is followed
+		// by a re-registration under it. A refused token leaves the
+		// registration exactly as it was, so there is nothing to re-present:
+		// re-registering anyway would mint a fresh worker identity on every
+		// later write of the same refused file. Validation happens under the
+		// lock; the proof runs outside it below.
 		if next, _, ok := d.registrationRotationCandidateLocked(cfg); ok {
 			pendingRotation, rotationFiledPrevious, wantRotation = next, d.config.Orchestrator.AuthToken, true
 		}
