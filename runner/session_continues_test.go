@@ -82,7 +82,7 @@ func TestConsumeEvents_ErrorTheSessionContinuesPast(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		go func() {
-			obs, err := r.consumeEvents(ctx, &fakeHandle{events: events}, wpath, QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-1")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
+			obs, err := r.consumeEvents(ctx, &fakeHandle{events: events}, wpath, QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-1")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil, nil)
 			done <- consumeResult{obs: obs, err: err}
 		}()
 		// The ToolUseEvent is observed synchronously by the consumer
@@ -132,7 +132,7 @@ func TestConsumeEvents_ErrorTheSessionContinuesPast(t *testing.T) {
 		events := make(chan agent.Event, 2)
 		events <- agent.ErrorEvent{Message: "provider crashed", Code: "crashed"}
 		close(events)
-		obs, _ := r.consumeEvents(context.Background(), &fakeHandle{events: events}, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-2")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
+		obs, _ := r.consumeEvents(context.Background(), &fakeHandle{events: events}, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-2")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil, nil)
 		if obs.errorEvent == nil || obs.errorEvent.Message != "provider crashed" {
 			t.Fatalf("errorEvent = %+v; want the fatal error recorded", obs.errorEvent)
 		}

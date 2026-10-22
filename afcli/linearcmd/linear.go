@@ -442,12 +442,29 @@ func labelNames(labels []linear.Label) []string {
 // ─── get-issue ────────────────────────────────────────────────────────────────
 
 func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
-	return &cobra.Command{
-		Use:          "get-issue <id>",
-		Short:        "Get issue details",
+	var fields string
+
+	cmd := &cobra.Command{
+		Use:   "get-issue <id>",
+		Short: "Get issue details",
+		Long: `Get issue details.
+
+One issue, full detail by default. When you need many issues, prefer a
+single list-issues call and read from its rows instead of looping
+get-issue once per id — every call is its own API request. Use
+--fields a,b to return only the fields you read (e.g.
+--fields identifier,title,status).`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			var selected []string
+			if strings.TrimSpace(fields) != "" {
+				var err error
+				selected, err = linear.ParseIssueFields(fields, linear.GetIssueFields)
+				if err != nil {
+					return err
+				}
+			}
 			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
@@ -457,39 +474,53 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 				return fmt.Errorf("get issue: %w", err)
 			}
 
-			var projectName *string
-			if issue.Project.Name != "" {
-				s := issue.Project.Name
-				projectName = &s
-			}
-			var parentID, parentIdentifier any
-			if issue.ParentID != "" {
-				parentID = issue.ParentID
-			}
-			if issue.ParentIdentifier != "" {
-				parentIdentifier = issue.ParentIdentifier
-			}
-
-			out := map[string]any{
-				"id":               issue.ID,
-				"identifier":       issue.Identifier,
-				"title":            issue.Title,
-				"description":      issue.Description,
-				"url":              issue.URL,
-				"status":           issue.State.Name,
-				"team":             issue.Team.Name,
-				"project":          projectName,
-				"labels":           labelNames(issue.Labels),
-				"parentId":         parentID,
-				"parentIdentifier": parentIdentifier,
-				"priority":         issue.Priority,
-				"sortOrder":        issue.SortOrder,
-				"estimate":         issue.Estimate,
-				"createdAt":        issue.CreatedAt,
-				"updatedAt":        issue.UpdatedAt,
+			out := fullGetIssueObject(issue)
+			if selected != nil {
+				out = linear.SelectIssueKeys(out, selected)
 			}
 			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
+	}
+
+	cmd.Flags().StringVar(&fields, "fields", "", "Comma-separated fields to return (valid: "+strings.Join(linear.GetIssueFields, ", ")+
+		"), defaults to all fields")
+
+	return cmd
+}
+
+// fullGetIssueObject builds the complete selectable get-issue object.
+// Null-valued keys stay present so --fields selection never invents data.
+func fullGetIssueObject(issue *linear.Issue) map[string]any {
+	var projectName *string
+	if issue.Project.Name != "" {
+		s := issue.Project.Name
+		projectName = &s
+	}
+	var parentID, parentIdentifier any
+	if issue.ParentID != "" {
+		parentID = issue.ParentID
+	}
+	if issue.ParentIdentifier != "" {
+		parentIdentifier = issue.ParentIdentifier
+	}
+
+	return map[string]any{
+		"id":               issue.ID,
+		"identifier":       issue.Identifier,
+		"title":            issue.Title,
+		"description":      issue.Description,
+		"url":              issue.URL,
+		"status":           issue.State.Name,
+		"team":             issue.Team.Name,
+		"project":          projectName,
+		"labels":           labelNames(issue.Labels),
+		"parentId":         parentID,
+		"parentIdentifier": parentIdentifier,
+		"priority":         issue.Priority,
+		"sortOrder":        issue.SortOrder,
+		"estimate":         issue.Estimate,
+		"createdAt":        issue.CreatedAt,
+		"updatedAt":        issue.UpdatedAt,
 	}
 }
 
@@ -1441,11 +1472,21 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		limit    int
 		orderBy  string
 		query    string
+		fields   string
+		full     bool
 	)
 
 	cmd := &cobra.Command{
-		Use:          "list-issues",
-		Short:        "List issues with flexible filters",
+		Use:   "list-issues",
+		Short: "List issues with flexible filters",
+		Long: `List issues with flexible filters.
+
+Cheap by default: rows carry the slim column set (id, title, status,
+project, sortOrder, parent, labels) at page size 50, so one call returns
+everything a triage or dispatch pass usually needs. Read the list once and
+work from it — never loop get-issue once per row. Use --fields a,b to opt
+into exactly the columns you read (e.g. --fields id,assignee,createdAt),
+or --full for every column including priority, assignee and createdAt.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			structuredFilter, err := structured.parse(cmd)
@@ -1459,6 +1500,10 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 			case "createdAt", "updatedAt", "manual":
 			default:
 				return fmt.Errorf("--order-by must be createdAt, updatedAt, or manual")
+			}
+			columns, err := resolveListIssueColumns(fields, full)
+			if err != nil {
+				return err
 			}
 			client, err := newFilteredListClient(ds, bin)
 			if err != nil {
@@ -1554,26 +1599,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 
 			out := make([]map[string]any, len(issues))
 			for i, iss := range issues {
-				var projName any
-				if iss.Project.Name != "" {
-					projName = iss.Project.Name
-				}
-				var assigneeName any
-				if iss.Assignee != nil {
-					assigneeName = iss.Assignee.Name
-				}
-				out[i] = map[string]any{
-					"id":        iss.Identifier,
-					"title":     iss.Title,
-					"status":    iss.State.Name,
-					"priority":  iss.Priority,
-					"sortOrder": iss.SortOrder,
-					"estimate":  iss.Estimate,
-					"labels":    labelNames(iss.Labels),
-					"project":   projName,
-					"assignee":  assigneeName,
-					"createdAt": iss.CreatedAt,
-				}
+				out[i] = linear.SelectIssueKeys(fullListIssueRow(iss), columns)
 			}
 
 			if result.Truncated {
@@ -1584,6 +1610,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				"issues":    out,
 				"limit":     limit,
 				"truncated": result.Truncated,
+				"fields":    columns,
 			})
 		},
 	}
@@ -1598,9 +1625,67 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	cmd.Flags().IntVar(&limit, "limit", 50, fmt.Sprintf("Maximum number of issues to return (max %d); the output envelope reports truncated:true plus a stderr warning when the cap hides further matches", linear.MaxIssueListLimit))
 	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Priority then createdAt/updatedAt, or ascending Linear manual order (flat; rank 0 valid; null last; ties keep Linear order)")
 	cmd.Flags().StringVar(&query, "query", "", "Text search query")
+	cmd.Flags().StringVar(&fields, "fields", "", "Comma-separated columns to return (valid: "+strings.Join(linear.ListIssueFullFields, ", ")+"); defaults to the slim set; cannot be combined with --full")
+	cmd.Flags().BoolVar(&full, "full", false, "Return every column, including priority, assignee and createdAt; cannot be combined with --fields")
 
 	structured.register(cmd)
 	return cmd
+}
+
+// resolveListIssueColumns maps the --fields/--full selection to the column
+// set a list-issues row emits. --full and --fields are mutually exclusive:
+// silently dropping an explicit selection would return a shape the caller
+// did not ask for. No flags means the slim default. Unknown or empty field
+// names fail before any network I/O so a typo never pays for a query that
+// returns the wrong shape.
+func resolveListIssueColumns(fields string, full bool) ([]string, error) {
+	if full && strings.TrimSpace(fields) != "" {
+		return nil, fmt.Errorf("--full and --fields cannot be used together; use one or the other")
+	}
+	if full {
+		return append([]string(nil), linear.ListIssueFullFields...), nil
+	}
+	if strings.TrimSpace(fields) == "" {
+		return append([]string(nil), linear.ListIssueSlimFields...), nil
+	}
+	return linear.ParseIssueFields(fields, linear.ListIssueFullFields)
+}
+
+// fullListIssueRow builds the complete selectable row for one list-issues
+// hit. The id key carries the human-readable identifier (ENG-42 style) for
+// automation compatibility; parent is stored as its parentId/parentIdentifier
+// pair and expanded by SelectIssueKeys. Null-valued keys stay present so
+// --fields selection never invents data and every column is addressable.
+func fullListIssueRow(iss linear.Issue) map[string]any {
+	var projName any
+	if iss.Project.Name != "" {
+		projName = iss.Project.Name
+	}
+	var assigneeName any
+	if iss.Assignee != nil {
+		assigneeName = iss.Assignee.Name
+	}
+	var parentID, parentIdentifier any
+	if iss.ParentID != "" {
+		parentID = iss.ParentID
+	}
+	if iss.ParentIdentifier != "" {
+		parentIdentifier = iss.ParentIdentifier
+	}
+	return map[string]any{
+		"id":               iss.Identifier,
+		"title":            iss.Title,
+		"status":           iss.State.Name,
+		"priority":         iss.Priority,
+		"sortOrder":        iss.SortOrder,
+		"estimate":         iss.Estimate,
+		"labels":           labelNames(iss.Labels),
+		"project":          projName,
+		"assignee":         assigneeName,
+		"createdAt":        iss.CreatedAt,
+		"parentId":         parentID,
+		"parentIdentifier": parentIdentifier,
+	}
 }
 
 // ─── check-blocked ────────────────────────────────────────────────────────────

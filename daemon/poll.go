@@ -81,10 +81,16 @@ type PollWorkItem struct {
 	BaseRef               string                            `json:"baseRef,omitempty"`
 	Priority              int                               `json:"priority,omitempty"`
 	Env                   map[string]string                 `json:"env,omitempty"`
-	MaxDuration           int                               `json:"maxDurationSeconds,omitempty"`
-	Resources             *SessionResources                 `json:"resources,omitempty"`
-	QueuedAt              int64                             `json:"queuedAt,omitempty"`
-	ProjectScope          string                            `json:"projectScope,omitempty"`
+	// MaxDuration is the legacy top-level session-duration cap in seconds.
+	// It is NOT enforced directly: PollItemToSessionDetail backfills it
+	// into StageBudget (the enforced cap) when no explicit nested
+	// stageBudget.maxDurationSeconds is stamped. An explicitly stamped
+	// nested duration always wins, and receipt-bearing work is untouched —
+	// its nested budget is receipted authority.
+	MaxDuration  int               `json:"maxDurationSeconds,omitempty"`
+	Resources    *SessionResources `json:"resources,omitempty"`
+	QueuedAt     int64             `json:"queuedAt,omitempty"`
+	ProjectScope string            `json:"projectScope,omitempty"`
 
 	// F.2.8 — enriched fields the platform may send so the
 	// `donmai agent run` worker has the runner context it needs without
@@ -1338,7 +1344,6 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		Ref:                    item.Ref,
 		Resources:              item.Resources,
 		Env:                    item.Env,
-		MaxDurationSeconds:     item.MaxDuration,
 		CredentialRequirements: credentialRequirements,
 		Harness:                harness,
 		ServingHost:            servingHost,
@@ -1605,6 +1610,31 @@ func WithSeatBudget(b *SessionSeatBudget) SessionDetailOption {
 // SessionDetailOption args customise the result without breaking existing
 // callers (the donmai-internal loop passes none).
 func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string, opts ...SessionDetailOption) *SessionDetail {
+	// Wire the legacy top-level maxDurationSeconds into the enforced stage
+	// budget. The top-level field is the session-duration cap the wire shape
+	// has always carried; until now nothing read it, so a populated value
+	// took effect nowhere. An explicitly stamped nested
+	// stageBudget.maxDurationSeconds always wins — it is the more specific
+	// stage-instance cap, and for receipt-bearing work it is receipted
+	// authority the sibling mirror must match exactly.
+	//
+	// Receipt-bearing work (OperationalPayload present) is deliberately
+	// untouched: synthesising a sibling budget the payload does not carry
+	// would trip the runner's compatibility-mirror reconciliation and refuse
+	// a session the platform authored as authoritative. Legacy dispatches
+	// carry no payload, so the backfill below is projected INTO the payload
+	// (see the empty-payload branch) and the runner adopts it as its own
+	// authority — sibling and payload agree by construction.
+	if len(item.OperationalPayload) == 0 && item.MaxDuration > 0 &&
+		(item.StageBudget == nil || item.StageBudget.MaxDurationSeconds <= 0) {
+		backfilled := &PollStageBudget{MaxDurationSeconds: item.MaxDuration}
+		if item.StageBudget != nil {
+			copied := *item.StageBudget
+			copied.MaxDurationSeconds = item.MaxDuration
+			backfilled = &copied
+		}
+		item.StageBudget = backfilled
+	}
 	coAuthorName, coAuthorEmail := runner.ValidateCoAuthorPair(item.SessionID, item.CoAuthorName, item.CoAuthorEmail)
 	if len(item.OperationalPayload) == 0 {
 		type pollWorkItemAlias PollWorkItem

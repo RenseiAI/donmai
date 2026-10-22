@@ -10,6 +10,33 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.87 — 2026-10-22
+
+### Fixes
+
+- Terminal workarea archive release no longer fails on Linux with `committed archive size mismatch` and leaves the lease release-pending. The post-commit re-read, the idempotent retry over an existing archive, and session-root restore compared the tree's allocated blocks with the size sampled at commit, and allocation can change after commit without any byte changing (delayed allocation, preallocation). Integrity is now proved by the tree digest alone, which covers every entry's path, mode, size and content, so a truncated or rewritten archive is still refused. The manifest `sizeBytes` remains disk accounting.
+
+## v0.72.86 — 2026-10-22
+
+### Features
+
+- `linear list-issues` defaults to the slim row (id, title, status, project, sortOrder, parent, labels) at page size 50, with `--fields a,b` and `--full` opting into more, and `linear get-issue` takes `--fields`. The output envelope echoes the effective field set. Retry-After backoff on rate-limited (429) and temporarily unavailable (503) responses now sleeps at least the server-supplied delay, plus bounded upward jitter, at most twice, before exiting with the preserved upstream error. `--full` and `--fields` cannot be combined.
+
+## v0.72.85 — 2026-10-22
+
+### Chores
+
+- Advance interactive step to stopped on pre-PTY failures
+- Pin invalid-byte replacement in TOML launch-string tests
+- Bundle the gated consumer with its carrier-installed latch
+- Pin isolated fixture for pi live-binary adaptation probes
+- Expose committed workarea archive identity to recovery clients
+- Scope session pattern kills to the session worktree and process group
+- Runner posts current-step status beacons to the session progress endpoint
+- Pin the agent-run wiring for the interactive Muse terminal mode
+- Export Go module cache to seats; record preparation time on the session result
+- Keep archive release retries and workarea restore idempotent
+
 ## v0.72.84 — 2026-10-22
 
 ### Chores

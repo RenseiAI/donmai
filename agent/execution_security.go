@@ -637,6 +637,9 @@ type RenderedExecutionSecurityLevel struct {
 	// carries one. Where the level needs an enforced baseline and this is not
 	// enforced, the level is refused.
 	DenyBaseline DenyBaselineStatus `json:"denyBaseline,omitempty"`
+	// EvidenceDigest binds a host-attested rendering to its current self-test.
+	// Empty for renderings without host confinement evidence.
+	EvidenceDigest string `json:"evidenceDigest,omitempty"`
 }
 
 func (r ExecutionSecurityRendering) find(dimension ExecutionSecurityDimension, level ExecutionSecurityLevel, mode PromptSessionMode) (RenderedExecutionSecurityLevel, bool) {
@@ -702,6 +705,7 @@ func RenderExecutionSecurity(spec Spec, manifest HarnessManifest) (ExecutionSecu
 			continue
 		}
 		entry.EnforcingLayers = sortedLayers(declared.Layers)
+		entry.EvidenceDigest = declared.EvidenceDigest
 		report.setDimension(dimension, entry)
 	}
 	if len(unrenderable) > 0 {

@@ -1393,6 +1393,100 @@ func TestPosterPost_StatusReviewVerdictSerialized(t *testing.T) {
 	}
 }
 
+// TestPosterPost_StatusContinuationOutcomeSerialized pins that the typed
+// continue-mode outcome reaches the status body, and is omitted when empty.
+func TestPosterPost_StatusContinuationOutcomeSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "omitted when empty"},
+		{name: "no-op", in: "no_op", want: `"no_op"`},
+		{name: "fixed in place", in: "fixed_in_place", want: `"fixed_in_place"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.ContinuationOutcome = tc.in
+			if err := p.Post(context.Background(), "sess-co", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["continuationOutcome"]
+			if present != (tc.want != "") {
+				t.Fatalf("continuationOutcome present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("continuationOutcome = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPosterPost_StatusPreparationSecondsSerialized pins that the
+// preparation duration reaches the terminal status body, and is omitted
+// when the result recorded none (backward-compatible additive field an
+// old receiver ignores). Removing the buildStatusRequest line drops the
+// key and fails the populated row.
+func TestPosterPost_StatusPreparationSecondsSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   int64
+		want string
+	}{
+		{name: "omitted when none was recorded"},
+		{name: "seconds", in: 90, want: `90`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.PreparationSeconds = tc.in
+			if err := p.Post(context.Background(), "sess-prep", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["preparationSeconds"]
+			if present != (tc.want != "") {
+				t.Fatalf("preparationSeconds present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("preparationSeconds = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestPosterPost_StatusToolCallsSerialized pins that the session's tool-call
 // count reaches the status body as a plain number, with zero emitted
 // explicitly: the field has no omitempty, so "did nothing" (0) is

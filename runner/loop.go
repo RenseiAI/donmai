@@ -1,12 +1,14 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -35,6 +37,36 @@ import (
 // loop. It delegates to internal/kit.LoadSkills; isolated here so tests
 // can verify integration without a real KitRegistry on disk.
 var kitLoadSkills = kit.LoadSkills
+
+// goModCache reports where the host's Go toolchain keeps downloaded module
+// sources (the value `go env GOMODCACHE` prints). A package-level seam so
+// tests can stub it without a toolchain on PATH. The empty string means the
+// lookup failed and the caller must omit the key rather than export a lie.
+var goModCache = func(ctx context.Context) string {
+	out, err := goEnvGomodcache(ctx)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// goEnvGomodcache runs the host toolchain's own `go env GOMODCACHE` probe.
+// A named helper (rather than an inline exec) so the probe's argv is pinned
+// in one place. The caller passes a bounded context; a missing toolchain or
+// a probe failure is an error, never an empty path that reads as unset.
+func goEnvGomodcache(ctx context.Context) (string, error) {
+	//nolint:gosec // G204: fixed tool and fixed key; no session input reaches argv.
+	cmd := exec.CommandContext(ctx, "go", "env", "GOMODCACHE")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("runner: go env GOMODCACHE: %w", err)
+	}
+	if out := strings.TrimSpace(stdout.String()); out != "" {
+		return out, nil
+	}
+	return "", errors.New("runner: go env GOMODCACHE printed empty output")
+}
 
 // termCastPath returns the on-disk asciinema-v2 cast location for a
 // session's workarea (spec § 16), next to events.jsonl in the
@@ -380,6 +412,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	continueMode := qw.ContinuePullRequest != nil
+	// continueDraftAtStart records whether the continued pull request
+	// was already a draft when the run checked it out, read with the same
+	// draft lookup the delivery gate uses. known is false when the lookup
+	// errored, which keeps the gate's behaviour: only a proven
+	// pre-existing draft flips the draft outcome.
+	continueDraftAtStart := &continueDraftState{}
 	// The platform keeps sending the ref pin (older runners rely on it)
 	// alongside the continued record, so a ref that names the continued
 	// head branch is accepted; only a ref naming a DIFFERENT branch is a
@@ -561,6 +599,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return res, err
 		}
 		r.logger.Info("checked out continued pull request head", "branch", branch, "sessionId", qw.SessionID)
+		// Record whether the continued pull request was already a draft
+		// before the turn starts, with the same draft read the delivery
+		// gate uses. A lookup error records unknown, which keeps the
+		// gate's behaviour: only a proven pre-existing draft counts.
+		draft, known := readContinueDraftAtStart(ctx, r.pullRequestDraftLookup, qw, repositoryDeclaration, wpath)
+		continueDraftAtStart.draft, continueDraftAtStart.known = draft, known
 	}
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
@@ -760,6 +804,36 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// process that actually spawns the fan-out — carries them. Explicit
 	// values win; a disabled budget changes nothing.
 	specEnv := cappedSessionEnv(qw)
+	// 3b. Install the session-scoped pkill/killall guards into a fresh
+	// runner-owned directory (never inside the session checkout: a
+	// checkout-controlled PATH entry would let a tracked or
+	// agent-written executable shadow host tools, and writing into the
+	// checkout would modify read-only negotiated repositories and
+	// pollute scratch-path commits) and lead PATH with it. Host-mode
+	// sessions run as the operator's OS user, so an agent's pattern kill
+	// would otherwise match other sessions' and the operator's own
+	// processes. The guards ship with the runner (go:embed) and only
+	// signal processes inside this session's worktree (or workarea
+	// root); the rest are refused and reported as typed activity events
+	// at teardown. Best-effort: an install failure is logged, the session
+	// env is stamped degraded (DONMAI_SIGNAL_GUARD_DEGRADED=1), and the run
+	// continues with an unguarded PATH rather than failing the session; the
+	// drain reports a session-visible degraded event so the outage is not
+	// silent.
+	signalGuard, guardErr := installSignalGuard()
+	if guardErr != nil {
+		r.logger.Warn("signal guard install failed; pattern kills are unscoped",
+			"sessionId", qw.SessionID,
+			"err", guardErr,
+		)
+		signalGuard = signalGuardLayout{degraded: true}
+	}
+	if signalGuard.dir != "" {
+		// The guard directory lives only for this run: remove it on
+		// every return path below.
+		defer func() { _ = os.RemoveAll(signalGuard.dir) }()
+	}
+	specEnv = signalGuardEnv(specEnv, signalGuard, wpath, res.WorkareaRoot)
 	effectiveMCPBearerFile, err := prepareSessionMCPBearerEnv(
 		qw,
 		specEnv,
@@ -938,6 +1012,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// no-op when the block is absent (byte-identical prompt to today).
 	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
+	if signalGuard.degraded {
+		composition.HarnessProtocol = injectSignalGuardDegradedProtocolPartial(composition.HarnessProtocol)
+	} else {
+		composition.HarnessProtocol = injectSignalGuardProtocolPartial(composition.HarnessProtocol)
+	}
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
 	if qw.isInteractive() {
@@ -1056,6 +1135,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return err
 		}
 	}
+	// Each host session's processes run in their own process group
+	// (every harness spawns with Setpgid), recorded here from the
+	// spawned harness pid. The pkill/killall guards consult it as the
+	// second scope leg alongside the worktree: a session process running
+	// outside the worktree (a daemon child, a tmp tool) is still in
+	// scope via its group, while another session's identical command
+	// line is not. The group id is delivered through the guard
+	// directory's session.pgid file, which the guards read at exec time
+	// (the session env above was already composed before spawn, so
+	// stamping the env here would never reach the harness); the
+	// best-effort state.json record keeps the group visible for
+	// forensics.
+	spec.OnProcessSpawned = chainOnProcessSpawned(spec.OnProcessSpawned, func(pid int) {
+		r.recordSessionProcessGroup(runnerStatePath, qw.SessionID, pid, signalGuard.dir)
+	})
 	if repositoryDeclaration != nil {
 		policy, policyErr := repositoryAuthorityPolicy(*repositoryDeclaration, declaredRepositoryPaths, skippedRepositories,
 			res.WorkareaRoot, wpath, string(executorWorkareaCapabilities.RepositoryAuthorityEnforcement))
@@ -1088,6 +1182,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, securityErr
 	}
 	res.ExecutionSecurity = report
+
+	// 6c. Execution-security report submission: send what the rendered
+	// session will enforce through the preflight registration call and wait
+	// for acceptance before any state, credential or provider side effect
+	// beyond provisioning. A refusal or a failed post ends with a typed
+	// refusal and no spawn; an accepted post spawns as before. Stamped
+	// controller-transport work only, and only when the dispatch target
+	// advertises the report contract: unstamped work has no report to send,
+	// local-transport work has no controller registration endpoint, and work
+	// dispatched without the capability spawns as before, so a controller
+	// that has not shipped the report contract never refuses the session.
+	if report != nil && !isLocalRuntimeTransport(qw.runtimeTransport) && qw.hasCapability(CapabilityExecutionSecurityReportIngest) {
+		if submitErr := r.submitExecutionSecurityReport(ctx, qw, *report); submitErr != nil {
+			refuseForExecutionSecurity(res, submitErr)
+			return res, submitErr
+		}
+	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
@@ -1142,7 +1253,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
-	// 8. Spawn provider.
+	// 8. Spawn provider. Preparation ends here: everything above (provider
+	// resolution, worktree provisioning, kit toolchain, dependency installs,
+	// MCP config, prompt assembly and spec translation) ran before the agent
+	// started, and its whole-second duration is recorded on the result so
+	// the terminal status carries how long preparation took. A spawn
+	// failure still records it — the phase ran even when the agent did not.
+	// The clock is the runner's injectable now (not wall time read inline)
+	// so tests drive it deterministically; a non-positive delta (a skewed
+	// test clock) omits the field rather than posting a lie. startedAt was
+	// read from the same clock at Run entry, so the two reads bracket the
+	// preparation phase exactly.
+	res.PreparationSeconds = preparationSeconds(r.now, time.UnixMilli(startedAt))
 	handle, err := provider.Spawn(ctx, spec)
 	if err != nil {
 		res.Status = "failed"
@@ -1156,6 +1278,29 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		defer stopCancel()
 		_ = handle.Stop(stopCtx)
 	}()
+
+	// Current-step status beacons ride the session progress endpoint from
+	// Spawn materialization to the run's end: Report on every step change,
+	// Close with the terminal step when the run ends. The reporter starts
+	// here — after the pre-Spawn refusals above — so a run that never
+	// reaches execution emits no beacon traffic at all, and local-transport
+	// runs stay network-quiet on their stub platform URL. Best-effort: a
+	// construct failure or a refused/unavailable endpoint never fails the
+	// run. The Close posts the terminal beacon even when the interval gate
+	// would swallow it, so the descriptor never keeps a mid-run phase
+	// after the session ends; background ctx so teardown races cannot
+	// lose it.
+	beacons := newStatusBeaconReporter(qw, r.statusBeaconInterval, r.now, r)
+	if beacons != nil {
+		beacons.Report(ctx, StatusBeaconSpawning)
+	}
+	closeBeacons := func() {
+		if beacons == nil {
+			return
+		}
+		beacons.Close(context.Background(), terminalBeaconStep(res))
+	}
+	defer closeBeacons()
 
 	// The inject channel, dedup set and OnInject consumer above (step 1b)
 	// are shared with the pre-provisioning pulser, which owns them for the
@@ -1231,6 +1376,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		sink = eventSink
 		defer func() { eventSink.Close(res) }()
 	}
+
+	// 9b.2 Drain the session's signal-guard refusal log into typed
+	// activity events on every terminal path below. The pkill/killall
+	// guards appended one line per refused pattern kill; each becomes a
+	// signal_guard_refused event on the activity stream (and in
+	// events.jsonl) so both sides can see what the session attempted
+	// and what the guard spared. Best-effort. The defer runs before the
+	// sink teardowns above (LIFO), so refusals flow through the full
+	// sink chain. Terminal paths before this point (provisioning, spawn
+	// failure) cannot hold refusals: no agent code runs before spawn.
+	// The events mirror lands under runnerStatePath (never the session
+	// checkout: in a read-only negotiated workarea the runner must not
+	// write into the selected repository).
+	defer func() { r.reportSignalGuardRefusals(ctx, signalGuard, runnerStatePath, sink) }()
 
 	// 9c. Start the additive per-call span pipeline when explicitly enabled by
 	// the binary/operator or when the dispatch advertises a compatible ingest
@@ -1417,7 +1576,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	stallFollowUps := r.newTurnFollowUps()
 	stallFollowUps.limit = r.stallRetryLimit()
-	streamRes, streamErr := r.consumeEventsWithStallRetries(ctx, streamCtx, provider, &handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, spec, stallFollowUps)
+	streamRes, streamErr := r.consumeEventsWithStallRetries(ctx, streamCtx, provider, &handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, spec, stallFollowUps, beacons)
 	// budgetStop is the budget cap that ended the session, once one did: the
 	// provider is stopped and no further turn starts. The turn it ended is
 	// still resolved below (its manifest, verdict and pull request) so the
@@ -1527,7 +1686,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// it ended.
 	lastTurn := streamRes
 	if runtimeInjectEnabled && !streamRes.blocked && budgetStop == nil {
-		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
+		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh, beacons)
 		injRes.applyTo(res, provider.Name())
 		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
 			applyFollowUp(injRes)
@@ -1617,6 +1776,7 @@ tailRecovery:
 		case tailSteer:
 			followUps.steered = true
 			res.SteeringTriggered = true
+			beacons.Report(ctx, StatusBeaconSteering)
 			newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, steerView, res)
 			if err != nil {
 				r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
@@ -1632,7 +1792,7 @@ tailRecovery:
 			// The stall detector stays disarmed here for the same reason
 			// as the inject drain above: tail recovery owns follow-up
 			// liveness.
-			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+			tailRes, tailErr := r.consumeEventsWithoutStallDetector(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, beacons)
 			tailRes.applyTo(res, provider.Name())
 			applyFollowUp(tailRes)
 			lastTurn = tailRes
@@ -1699,7 +1859,7 @@ tailRecovery:
 		} else {
 			followUps.sentContinuation()
 		}
-		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, beacons)
 		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
 		if stopped {
 			res.TurnContinuations = followUps.report()
@@ -1775,6 +1935,7 @@ tailRecovery:
 		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType, qw.WorkTypeRole)
 	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
+		beacons.Report(ctx, StatusBeaconBackstop)
 		switch {
 		// Continue+ref runs take the push lane below: the ref names the
 		// continued head branch, which IS the push target.
@@ -1827,8 +1988,9 @@ tailRecovery:
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			func() {
 				defer gateCancel()
-				localHead, _ := captureHeadSHA(gateCtx, wpath)
-				remoteHead, _ := gitStdout(gateCtx, wpath, nil, "ls-remote", "origin", "refs/heads/"+continuePullRequestBranch(qw.ContinuePullRequest))
+				localHead, localErr := captureHeadSHA(gateCtx, wpath)
+				remoteRaw, remoteErr := gitStdout(gateCtx, wpath, nil, "ls-remote", "origin", "refs/heads/"+continuePullRequestBranch(qw.ContinuePullRequest))
+				remoteHead := remoteRaw
 				if fields := strings.Fields(remoteHead); len(fields) > 0 {
 					remoteHead = fields[0]
 				}
@@ -1840,7 +2002,14 @@ tailRecovery:
 				if continuedURL == "" {
 					continuedURL = continuePullRequestURL(gateCtx, qw, repositoryDeclaration, wpath)
 				}
-				headMoved := !strings.EqualFold(strings.TrimSpace(localHead), startHead) && strings.TrimSpace(localHead) != "" && strings.TrimSpace(startHead) != ""
+				localReadOK := localErr == nil && strings.TrimSpace(localHead) != ""
+				headMoved := localReadOK && strings.TrimSpace(startHead) != "" && !strings.EqualFold(strings.TrimSpace(localHead), startHead)
+				// pushed proves the remote head carries the session's
+				// local head: a passed turn whose commits never
+				// reached the remote (a rejected push, or a head or
+				// remote read that errored) must never read as a
+				// successful no-op or fixed-in-place outcome.
+				pushed := localReadOK && remoteErr == nil && strings.TrimSpace(remoteHead) != "" && strings.EqualFold(strings.TrimSpace(remoteHead), strings.TrimSpace(localHead))
 				draft, draftErr := lookup(gateCtx, wpath, continuedURL)
 				var inspection continueRangeInspection
 				var inspectErr error
@@ -1848,6 +2017,21 @@ tailRecovery:
 					inspection, inspectErr = inspectContinueRange(gateCtx, wpath, continuePullRequestBranch(qw.ContinuePullRequest), startHead, localHead)
 				}
 				draftBlocks := draftErr == nil && draft && !qw.Delivery.AllowsDraft()
+				// A passed turn counts only when the turn itself
+				// ended successfully: a WORK_RESULT marker alone
+				// must not promote a turn that then ended on a
+				// provider error to completed.
+				passed := res.WorkResult == "passed" && res.Status != "failed" && lastTurn.providerError == ""
+				// completeContinueNoOp ends the run completed with the
+				// no-op continuation outcome, keeping the old failure
+				// message as a post-session warning so it stays
+				// visible wherever warnings surface.
+				completeContinueNoOp := func(message string) {
+					res.Status = "completed"
+					res.FailureMode = ""
+					res.ContinuationOutcome = ContinuationOutcomeNoOp
+					res.PostSessionWarnings = append(res.PostSessionWarnings, message)
+				}
 				switch {
 				case inspectErr != nil:
 					res.Status = "failed"
@@ -1857,19 +2041,60 @@ tailRecovery:
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d commits scratch paths since dispatch: %s", qw.ContinuePullRequest.Number, strings.Join(inspection.scratchPaths, ", "))
+				case draftBlocks && passed && continueDraftAtStart.known && continueDraftAtStart.draft && pushed && inspection.deliversUnder(qw.Delivery):
+					// A passed turn that left its own delivered code
+					// on a pull request which was already a draft
+					// before the run started: completed, fixed in
+					// place. The head must have moved for the range
+					// to deliver, the remote must carry it, and an
+					// unknown start draft keeps the failure.
+					res.Status = "completed"
+					res.FailureMode = ""
+					res.Error = ""
+					res.ContinuationOutcome = ContinuationOutcomeFixedInPlace
+					res.PostSessionWarnings = append(res.PostSessionWarnings,
+						fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number))
 				case draftBlocks:
+					if passed && continueDraftAtStart.known && continueDraftAtStart.draft && localReadOK && strings.TrimSpace(startHead) != "" && (!headMoved || (pushed && !inspection.deliversUnder(qw.Delivery))) {
+						// A passed turn on a pre-existing draft whose
+						// range delivers no code: completed, no-op.
+						// An unpushed head stays failed: the session
+						// has local commits the remote does not carry.
+						completeContinueNoOp(fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number))
+						break
+					}
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
-				case localHead == "" || startHead == "" || strings.EqualFold(localHead, startHead):
+				case localErr != nil || strings.TrimSpace(localHead) == "" || strings.TrimSpace(startHead) == "":
+					// A head the gate cannot read — or a missing
+					// dispatch pin — keeps the failure whatever the
+					// verdict: failing open here would report an
+					// unreadable checkout as a successful no-op.
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
-				case remoteHead == "" || !strings.EqualFold(remoteHead, localHead):
+				case strings.EqualFold(strings.TrimSpace(localHead), startHead):
+					if passed {
+						completeContinueNoOp(fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number))
+						break
+					}
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
+				case remoteErr != nil || strings.TrimSpace(remoteHead) == "" || !strings.EqualFold(strings.TrimSpace(remoteHead), strings.TrimSpace(localHead)):
+					// The session moved its head but the remote does
+					// not carry it — a rejected push, or a remote
+					// the gate cannot read. The work is unpublished,
+					// so the run stays failed whatever the verdict.
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
 				case !inspection.deliversUnder(qw.Delivery):
+					if passed {
+						completeContinueNoOp(fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number))
+						break
+					}
 					res.Status = "failed"
 					res.FailureMode = FailureBackstop
 					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
@@ -2050,10 +2275,11 @@ func (r *Runner) consumeEventsWithStallRetries(
 	traceProcessor spanEventProcessor,
 	spec agent.Spec,
 	followUps *turnFollowUps,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
 	limit := followUps.limit
 	for attempt := 0; ; attempt++ {
-		obs, err := r.consumeEvents(streamCtx, *handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+		obs, err := r.consumeEvents(streamCtx, *handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 		if !obs.providerStall || obs.terminalEvent != nil {
 			if followUps.retried > 0 || followUps.exhausted {
 				res.TurnContinuations = followUps.report()
@@ -2419,6 +2645,7 @@ func (r *Runner) drainMemoryInjects(
 	sink activitySink,
 	traceProcessor spanEventProcessor,
 	injectCh <-chan heartbeat.InjectPayload,
+	beacons *statusBeaconReporter,
 ) streamObservation {
 	var merged streamObservation
 	for {
@@ -2456,7 +2683,7 @@ func (r *Runner) drainMemoryInjects(
 			// follow-up liveness through its continuation bound, and a
 			// post-tool silence on a follow-up turn is an unfinished
 			// turn — never a provider error to retry outside that bound.
-			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 			injRes.applyTo(res, res.ProviderName)
 			merged = injRes
 			if enforcer != nil && enforcer.breached() != nil {
@@ -2705,8 +2932,9 @@ func (r *Runner) consumeEvents(
 	enforcer *BudgetEnforcer,
 	sink activitySink,
 	traceProcessor spanEventProcessor,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
-	return r.consumeEventsWithin(ctx, r.providerStallTimeout, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+	return r.consumeEventsWithin(ctx, r.providerStallTimeout, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 }
 
 // consumeEventsWithoutStallDetector drains a follow-up turn's events with
@@ -2727,8 +2955,9 @@ func (r *Runner) consumeEventsWithoutStallDetector(
 	enforcer *BudgetEnforcer,
 	sink activitySink,
 	traceProcessor spanEventProcessor,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
-	return r.consumeEventsWithin(ctx, 0, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
+	return r.consumeEventsWithin(ctx, 0, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 }
 
 // consumeEventsWithin drains the handle's events channel, mirrors each
@@ -2763,6 +2992,7 @@ func (r *Runner) consumeEventsWithin(
 	enforcer *BudgetEnforcer,
 	sink activitySink,
 	traceProcessor spanEventProcessor,
+	beacons *statusBeaconReporter,
 ) (streamObservation, error) {
 	if sink == nil {
 		sink = noopSink{}
@@ -3049,7 +3279,7 @@ func (r *Runner) consumeEventsWithin(
 				}
 				trackToolEvent(correlatedEvent)
 				appendJSONL(correlatedEvent)
-				r.observeEvent(correlatedEvent, &obs, worktreePath, qw)
+				r.observeEvent(correlatedEvent, &obs, worktreePath, qw, beacons)
 				// Forward sparse quota updates to the admitting daemon:
 				// a codex `account/rateLimits/updated` notification or
 				// a claude `rate_limit_event` arrives here as a
@@ -3133,7 +3363,8 @@ func (r *Runner) wrapUpMidTurn(ctx context.Context, handle agent.Handle, enforce
 
 // observeEvent applies a single event to the observation accumulator.
 // Side effects:
-//   - InitEvent → captures provider session id; mirrors to state.json.
+//   - InitEvent → captures provider session id; mirrors to state.json;
+//     reports the streaming step beacon.
 //   - ToolUseEvent → tracks comment/issue/sub-issue flags and
 //     extracts a PR URL when the agent invokes `gh pr create`.
 //   - AssistantTextEvent → scans for the WORK_RESULT marker and
@@ -3141,7 +3372,12 @@ func (r *Runner) wrapUpMidTurn(ctx context.Context, handle agent.Handle, enforce
 //   - ResultEvent → captures terminal cost/success.
 //   - ErrorEvent → records for FailureProviderError classification,
 //     unless it says the session continues (SessionContinues).
-func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePath string, _ QueuedWork) {
+//
+// The optional beacons reporter receives the streaming step on the first
+// InitEvent. It is a best-effort status post (step change + bounded rate
+// inside the reporter); a refused or unavailable endpoint never affects
+// the stream. Nil is the common case in unit tests.
+func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePath string, _ QueuedWork, beacons *statusBeaconReporter) {
 	switch e := ev.(type) {
 	case agent.InitEvent:
 		obs.providerID = e.SessionID
@@ -3151,6 +3387,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			s.CurrentStep = "streaming"
 			return nil
 		})
+		beacons.Report(context.Background(), StatusBeaconStreaming)
 	case agent.AssistantTextEvent:
 		if strings.TrimSpace(e.Text) != "" {
 			obs.lastAssistantText = e.Text
@@ -3498,6 +3735,21 @@ func envToMap(in []string) map[string]string {
 	return out
 }
 
+// preparationSeconds is the whole-second preparation duration the terminal
+// result carries: session start (Run's startedAt) to provider spawn. Zero or
+// negative means the clock went backwards or stood still — omit the field
+// rather than post a duration the phase did not take.
+func preparationSeconds(now func() time.Time, startedAt time.Time) int64 {
+	if now == nil {
+		return 0
+	}
+	secs := int64(now().Sub(startedAt).Seconds())
+	if secs <= 0 {
+		return 0
+	}
+	return secs
+}
+
 // envOrDefault returns the process env value for key when it is set and
 // non-empty, otherwise def. Used to let a provisioner-stamped value win over
 // a locally-derived fallback.
@@ -3590,6 +3842,29 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	if qw.StageID != "" {
 		envMap["DONMAI_STAGE_ID"] = qw.StageID
 	}
+	// Point seats at the host's Go module cache so dependency sources are
+	// found without a whole-disk search. Resolved from the host toolchain's
+	// own `go env GOMODCACHE` (never inherited blindly: the worker that
+	// composed this env may itself run under a per-session cache override
+	// that must not leak into the seat). A failed probe omits the key — the
+	// seat builds exactly as before, without a stale or empty pointer.
+	// The probe inherits the worker's environment and is bounded: a wedged
+	// toolchain omits the key instead of stalling session start.
+	//
+	// Sandboxed seats cannot read this path: the seat's own confinement
+	// rebinds GOMODCACHE to the per-session cache (provider/harness/pi's
+	// confinePiSession declares GOMODCACHE under the session cache root
+	// and the plan's environment bindings win last-entry-wins), which the
+	// macOS profile allows while the host cache stays outside the read
+	// allowlist (probed live: host cache reads refuse with Operation not
+	// permitted). The export still matters: it is the only channel that
+	// tells an UNSANDBOXED seat — and every tool the seat spawns outside
+	// the sandbox — where the shared module sources live.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if cache := goModCache(probeCtx); cache != "" {
+		envMap["GOMODCACHE"] = cache
+	}
+	probeCancel()
 	if b := qw.StageBudget; b != nil {
 		if b.MaxDurationSeconds > 0 {
 			v := fmt.Sprintf("%d", b.MaxDurationSeconds)

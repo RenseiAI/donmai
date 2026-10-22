@@ -24,6 +24,36 @@ import (
 // of forcing the push.
 var ErrContinuePullRequestDiverged = errors.New("runner: continued pull request head moved after dispatch")
 
+// continueDraftState records whether the continued pull request was
+// already a draft before the run's turn started. known is false when the
+// draft lookup errored, so the delivery gate keeps today's behaviour.
+type continueDraftState struct {
+	draft bool
+	known bool
+}
+
+// readContinueDraftAtStart reads whether the continued pull request is a
+// draft right after the checkout, with the same draft lookup the delivery
+// gate uses. A lookup error returns known=false, which keeps the gate's
+// behaviour: only a proven pre-existing draft counts. callers pass the
+// runner's configured lookup so tests observe the same stubbed read.
+func readContinueDraftAtStart(ctx context.Context, lookup pullRequestDraftLookup, qw QueuedWork, declaration *workarea.NormalizedDeclaration, worktreePath string) (draft, known bool) {
+	if lookup == nil {
+		lookup = githubPullRequestDraft
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	url := continuePullRequestURL(readCtx, qw, declaration, worktreePath)
+	if url == "" {
+		return false, false
+	}
+	draft, err := lookup(readCtx, worktreePath, url)
+	if err != nil {
+		return false, false
+	}
+	return draft, true
+}
+
 // validateContinuePullRequest reports whether the session-spec record can
 // drive a continue-mode run. Nil is ordinary branch work and is valid.
 // A non-nil record requires a positive number, a usable branch name, and
@@ -91,6 +121,16 @@ func continuePullRequestURL(ctx context.Context, qw QueuedWork, declaration *wor
 	}
 	return fmt.Sprintf("https://github.com/%s/pull/%d", repository, qw.ContinuePullRequest.Number)
 }
+
+// ContinuationOutcomeNoOp marks a completed continue-mode run whose
+// passed turn left the continued pull request with no new deliverable
+// work: no new commit, or only merges or scratch files since dispatch.
+const ContinuationOutcomeNoOp = "no_op"
+
+// ContinuationOutcomeFixedInPlace marks a completed continue-mode run
+// whose passed turn left the run's own delivered code on a pull request
+// that was already a draft before the run started.
+const ContinuationOutcomeFixedInPlace = "fixed_in_place"
 
 // checkoutContinuePullRequest checks out the pull request's head branch at
 // exactly the dispatched head commit. The worktree is cloned at the remote

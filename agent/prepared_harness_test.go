@@ -11,6 +11,39 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
+func TestPreparedHarnessBindsExecutionSecurityEvidence(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	const evidence = "sha256:confinement-self-test"
+	manifest.ExecutionSecurity.Levels = []agent.RenderedExecutionSecurityLevel{{
+		Dimension: agent.ExecutionSecurityFileWrite, Level: agent.FileWriteWorkarea,
+		Layers: []agent.EnforcingLayer{agent.LayerExecutorOSSandbox}, EvidenceDigest: evidence,
+	}}
+	levels := agent.IndexZeroExecutionSecurityLevels()
+	levels.FileWrite = agent.FileWriteWorkarea
+	spec := agent.Spec{Prompt: "inspect", ExecutionSecurity: &agent.ExecutionSecurity{Version: 1, Levels: levels}}
+	digest := strings.Repeat("a", 64)
+	var materializations []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: digest, Required: true})
+	}
+	plan, err := agent.CompilePreparedHarness(spec, manifest, digest, nil, materializations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.ExecutionSecurity == nil || plan.ExecutionSecurity.FileWrite.EvidenceDigest != evidence {
+		t.Fatalf("compiled receipt lost confinement evidence: %+v", plan.ExecutionSecurity)
+	}
+	spec.PreparedHarness = plan
+	if _, err := agent.PrepareHarness(spec, manifest); err != nil {
+		t.Fatalf("apply matching confinement evidence: %v", err)
+	}
+	manifest.ExecutionSecurity.Levels[0].EvidenceDigest = "sha256:replacement-self-test"
+	if _, err := agent.PrepareHarness(spec, manifest); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityReceiptUnmet {
+		t.Fatalf("apply changed confinement evidence = %v, want receipt unmet", err)
+	}
+}
+
 func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
 	t.Parallel()
 	manifest := (&codex.Provider{}).Manifest()

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
@@ -68,11 +69,20 @@ func minimalRunner(t *testing.T) *Runner {
 // /api/sessions/<id>/{completion,status,lock-refresh} call and
 // responds 200 OK with `{"refreshed":true}` (for lock-refresh). The
 // returned URL is suitable for both result.Poster and heartbeat.Pulser.
+//
+// It also accepts the pre-spawn execution-security report on the preflight
+// registration route with the closed accepted envelope, so stamped runs
+// whose dispatch target advertises the report contract spawn as before
+// unless a test substitutes its own reporter.
 func mockPlatformServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// All endpoints accept POST and return JSON.
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/execution-preflight-registration") {
+			_, _ = w.Write([]byte(`{"contractVersion":"execution-security-report/v1","decision":"accepted"}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
 	}))
 	return srv
@@ -113,6 +123,20 @@ type recordingPlatformServer struct {
 	// polling. Buffered by the test; a full buffer coalesces wakeups and
 	// the waiter always re-scans the full history, so no beat is missed.
 	stepBeatNotify chan struct{}
+	// beacons are the bodies of every /progress beacon post, in order.
+	beacons [][]byte
+	// beaconNotify, when non-nil, gets a non-blocking send for every
+	// /progress beacon post so a test can wait for the next beacon
+	// without polling. Same coalescing contract as stepBeatNotify.
+	beaconNotify chan struct{}
+	// beaconFail, when true, makes every /progress post answer 500 so a
+	// test can prove the run continues with no failure.
+	beaconFail bool
+	// beaconHang, when positive, makes every /progress post sleep that
+	// long before answering, so a test can prove beacon posts never
+	// block the run loop: the worker's own timeout bounds the wait,
+	// not the endpoint.
+	beaconHang time.Duration
 }
 
 // terminalStatus returns the last terminal /status body the double received,
@@ -136,6 +160,13 @@ func (s *recordingPlatformServer) stepBeats() [][]byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([][]byte(nil), s.stepHeartbeats...)
+}
+
+// beaconPosts returns a copy of every /progress beacon body received.
+func (s *recordingPlatformServer) beaconPosts() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]byte(nil), s.beacons...)
 }
 
 // injectReports returns every ack and dead-letter the worker echoed.
@@ -179,6 +210,33 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 	t.Helper()
 	rec := &recordingPlatformServer{}
 	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/progress") {
+			body, _ := io.ReadAll(r.Body)
+			rec.mu.Lock()
+			fail := rec.beaconFail
+			hang := rec.beaconHang
+			if !fail {
+				rec.beacons = append(rec.beacons, body)
+			}
+			notify := rec.beaconNotify
+			rec.mu.Unlock()
+			if notify != nil {
+				select {
+				case notify <- struct{}{}:
+				default:
+				}
+			}
+			if hang > 0 {
+				select {
+				case <-time.After(hang):
+				case <-r.Context().Done():
+				}
+			}
+			if fail {
+				http.Error(w, "no", http.StatusInternalServerError)
+				return
+			}
+		}
 		if strings.HasSuffix(r.URL.Path, "/step-heartbeat") {
 			body, _ := io.ReadAll(r.Body)
 			rec.mu.Lock()

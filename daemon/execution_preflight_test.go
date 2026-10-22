@@ -142,8 +142,238 @@ func TestFileExecutionPreflightStoreIsDurableAndAppendOnly(t *testing.T) {
 	if string(got) != string(receipt) {
 		t.Fatalf("stored receipt = %s, want %s", got, receipt)
 	}
-	if err := store.Persist("session-1", receipt); err == nil {
+	changed := json.RawMessage(`{"contractVersion":"host-adaptation/v1","requestId":"session-1","workerId":"worker-1","placementId":"host-local","decision":"denied","denial":"changed"}`)
+	if err := store.Persist("session-1", changed); err == nil {
 		t.Fatal("immutable receipt was overwritten")
+	}
+	got, err = os.ReadFile(filepath.Join(dir, executionPreflightReceiptName("session-1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(receipt) {
+		t.Fatalf("stored receipt after refused overwrite = %s, want %s", got, receipt)
+	}
+}
+
+// A redelivered claim recompiles the same receipt. Persisting identical bytes
+// again must succeed without touching the stored receipt; anything else for
+// the same session is refused with an error that wraps os.ErrExist.
+func TestFileExecutionPreflightStorePersistIsIdempotentForIdenticalBytes(t *testing.T) {
+	const sessionID = "session-retry"
+	first := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	changed := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-2",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	tests := []struct {
+		name    string
+		second  json.RawMessage
+		wantErr bool
+	}{
+		{name: "identical bytes", second: first, wantErr: false},
+		{name: "same session, different receipt", second: changed, wantErr: true},
+		{name: "same receipt, extra trailing byte", second: append(append(json.RawMessage(nil), first...), '\n'), wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store := NewFileExecutionPreflightStore(dir)
+			if err := store.Persist(sessionID, first); err != nil {
+				t.Fatalf("first persist: %v", err)
+			}
+			err := store.Persist(sessionID, tc.second)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("second persist with a different receipt succeeded")
+				}
+				if !errors.Is(err, os.ErrExist) {
+					t.Fatalf("second persist error = %v, want it to wrap os.ErrExist", err)
+				}
+			} else if err != nil {
+				t.Fatalf("second persist with identical bytes: %v", err)
+			}
+			got, err := store.Load(sessionID)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if string(got) != string(first) {
+				t.Fatalf("stored receipt = %s, want %s", got, first)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("receipt dir entries = %d, want 1 (no leftover pending files)", len(entries))
+			}
+		})
+	}
+}
+
+func TestFileExecutionPreflightStorePersistIdenticalRefusesSymlinkDestination(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "session-symlink-identical"
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	// An in-root symlink to a file holding identical bytes must still be
+	// refused. The link text is padded to exactly len(receipt) so the Lstat
+	// size check passes and only the regular-file / SameFile guards refuse:
+	// deleting them makes this test go RED (accepted as identical).
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, receipt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const targetBase = "target.json"
+	prefixLen := len(receipt) - len(targetBase)
+	if prefixLen < 0 {
+		t.Fatalf("receipt shorter than link target: %d", len(receipt))
+	}
+	var linkText string
+	if prefixLen%2 == 0 {
+		linkText = strings.Repeat("./", prefixLen/2) + targetBase
+	} else {
+		if prefixLen < 5 {
+			t.Fatalf("receipt too short to pad link text: %d", len(receipt))
+		}
+		if err := os.Mkdir(filepath.Join(dir, "x"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		linkText = "x/../" + strings.Repeat("./", (prefixLen-5)/2) + targetBase
+	}
+	if len(linkText) != len(receipt) {
+		t.Fatalf("padded link text = %d bytes, want %d", len(linkText), len(receipt))
+	}
+	if err := os.Symlink(linkText, filepath.Join(dir, executionPreflightReceiptName(sessionID))); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewFileExecutionPreflightStore(dir).Persist(sessionID, receipt); err == nil {
+		t.Fatal("symlink destination with identical bytes was accepted")
+	} else if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("symlink persist error = %v, want it to wrap os.ErrExist", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != string(receipt) {
+		t.Fatalf("symlink target changed: %q err=%v", got, err)
+	}
+}
+
+// A name swapped from a regular file to a symlink (or a different inode with
+// identical bytes) between Lstat and Open must still be refused. The swap
+// hook runs in that window; without the SameFile re-stat this test goes RED
+// (identical bytes accepted), with it the retry is refused.
+func TestFileExecutionPreflightStorePersistIdenticalRefusesLstatToOpenSwap(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "session-swap-identical"
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	store := NewFileExecutionPreflightStore(dir)
+	if err := store.Persist(sessionID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	finalName := executionPreflightReceiptName(sessionID)
+	store.preOpenHook = func() {
+		finalPath := filepath.Join(dir, finalName)
+		if err := os.Rename(finalPath, finalPath+".bak"); err != nil {
+			t.Errorf("swap setup rename: %v", err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(dir, "swap-target.json"), receipt, 0o600); err != nil {
+			t.Errorf("swap setup write: %v", err)
+			return
+		}
+		if err := os.Symlink("swap-target.json", finalPath); err != nil {
+			t.Errorf("swap setup symlink: %v", err)
+		}
+	}
+	defer func() { store.preOpenHook = nil }()
+	if err := store.Persist(sessionID, receipt); err == nil {
+		t.Fatal("swapped symlink destination with identical bytes was accepted")
+	} else if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("swap persist error = %v, want it to wrap os.ErrExist", err)
+	}
+}
+
+func TestFileExecutionPreflightStorePersistIdenticalRefusesNonRegularDestination(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "session-dir-identical"
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	if err := os.Mkdir(filepath.Join(dir, executionPreflightReceiptName(sessionID)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewFileExecutionPreflightStore(dir).Persist(sessionID, receipt); err == nil {
+		t.Fatal("non-regular destination with identical length was accepted")
+	} else if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("non-regular persist error = %v, want it to wrap os.ErrExist", err)
+	}
+}
+
+func TestFileExecutionPreflightStorePersistIdenticalPropagatesReaffirmFailure(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "session-reaffirm-failure"
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	store := NewFileExecutionPreflightStore(dir)
+	if err := store.Persist(sessionID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	store.syncRoot = func(*os.Root) error { return errors.New("simulated directory sync failure") }
+	if err := store.Persist(sessionID, receipt); err == nil {
+		t.Fatal("identical retry with failing directory sync was accepted")
+	}
+}
+
+func TestFileExecutionPreflightStorePersistRefusesOversizedReceipt(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "session-oversized"
+	big := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          strings.Repeat("x", executioncell.MaxPreflightRegistrationReceiptBytes),
+	})
+	if len(big) <= executioncell.MaxPreflightRegistrationReceiptBytes {
+		t.Fatalf("fixture is not oversized: %d bytes", len(big))
+	}
+	if err := NewFileExecutionPreflightStore(dir).Persist(sessionID, big); err == nil {
+		t.Fatal("oversized receipt was accepted")
 	}
 }
 

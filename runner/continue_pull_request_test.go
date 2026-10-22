@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -289,6 +290,48 @@ func TestContinueDivergedFlag(t *testing.T) {
 	if !continueDiverged(&agent.BackstopReport{Repositories: []agent.RepositoryBackstopReport{{Name: "primary", Report: agent.BackstopReport{ContinueDiverged: true}}}}) {
 		t.Fatal("continueDiverged(aggregate) = false; want true: a declared session folds the flag")
 	}
+}
+
+func TestReadContinueDraftAtStart(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("CONT-DRAFT-START")}
+	qw.Repository = "https://github.com/example/project.git"
+	qw.ContinuePullRequest = &prompt.ContinuePullRequest{Number: 7, HeadRef: "feature/x", HeadSha: continueFixtureSHA()}
+	t.Run("nil lookup falls back to gh and reports unknown on its error", func(t *testing.T) {
+		t.Parallel()
+		// No worktree checkout exists, so the URL resolves from the
+		// dispatched repository and the fallback lookup would shell out;
+		// with no checkout the read must report unknown, never fail.
+		draft, known := readContinueDraftAtStart(context.Background(), nil, qw, nil, t.TempDir())
+		if known || draft {
+			t.Fatalf("readContinueDraftAtStart(nil lookup) = (%v, %v); want (false, false)", draft, known)
+		}
+	})
+	t.Run("lookup error records unknown", func(t *testing.T) {
+		t.Parallel()
+		lookup := func(context.Context, string, string) (bool, error) {
+			return false, errors.New("boom")
+		}
+		draft, known := readContinueDraftAtStart(context.Background(), lookup, qw, nil, t.TempDir())
+		if known || draft {
+			t.Fatalf("readContinueDraftAtStart(error) = (%v, %v); want (false, false)", draft, known)
+		}
+	})
+	t.Run("lookup result is recorded", func(t *testing.T) {
+		t.Parallel()
+		var gotURL string
+		lookup := func(_ context.Context, _ string, url string) (bool, error) {
+			gotURL = url
+			return true, nil
+		}
+		draft, known := readContinueDraftAtStart(context.Background(), lookup, qw, nil, t.TempDir())
+		if !known || !draft {
+			t.Fatalf("readContinueDraftAtStart(draft) = (%v, %v); want (true, true)", draft, known)
+		}
+		if gotURL != "https://github.com/example/project/pull/7" {
+			t.Fatalf("lookup url = %q; want the continued pull request", gotURL)
+		}
+	})
 }
 
 func TestContinuePullRequestURL(t *testing.T) {
@@ -739,48 +782,114 @@ func TestRun_ContinueModePushesToTheContinuedBranch(t *testing.T) {
 }
 
 // TestRun_ContinueModeNoNewCommitIsNotDelivered proves the delivery rule
-// through the production entry point: an agent that changes nothing ends
-// unfinished against the continued pull request instead of completed.
+// through the production entry point: a turn that changes nothing and
+// carries no verdict ends unfinished against the continued pull request
+// instead of completed. A passed turn on the same head ends completed
+// with the no-op continuation outcome instead of failed.
 func TestRun_ContinueModeNoNewCommitIsNotDelivered(t *testing.T) {
-	res, _ := runScriptedSession(t, scriptedSession{
-		workType:       "development",
-		skipSteering:   true,
-		repository:     "https://github.com/example/repo",
-		continueNumber: 12,
-		turns:          []verdictScriptTurn{{text: "nothing to do"}},
+	t.Run("no verdict is not delivered", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			turns:          []verdictScriptTurn{{text: "nothing to do"}},
+		})
+		if res.Status == "completed" && res.PullRequestURL == "https://github.com/example/repo/pull/12" {
+			t.Fatalf("a no-new-commit continue run was reported delivered: %+v", res)
+		}
+		if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+			t.Fatalf("PullRequestURL = %q; want the continued pull request under test", res.PullRequestURL)
+		}
+		if res.ContinuationOutcome != "" {
+			t.Fatalf("ContinuationOutcome = %q; want empty without a passed verdict", res.ContinuationOutcome)
+		}
 	})
-	if res.Status == "completed" && res.PullRequestURL == "https://github.com/example/repo/pull/12" {
-		t.Fatalf("a no-new-commit continue run was reported delivered: %+v", res)
-	}
-	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
-		t.Fatalf("PullRequestURL = %q; want the continued pull request under test", res.PullRequestURL)
-	}
+	t.Run("passed verdict completes as no-op", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			turns:          []verdictScriptTurn{{manifest: passedManifest, text: "WORK_RESULT:passed"}},
+		})
+		if res.Status != "completed" {
+			t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+		}
+		if res.ContinuationOutcome != ContinuationOutcomeNoOp {
+			t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, ContinuationOutcomeNoOp)
+		}
+		if res.FailureMode != "" || res.Error != "" {
+			t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
+		}
+		if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+			t.Fatalf("PullRequestURL = %q; want the continued pull request under test", res.PullRequestURL)
+		}
+	})
 }
 
 func TestRun_ContinueModeMergeOnlyHeadHasNoCodeChange(t *testing.T) {
-	res, _ := runScriptedSession(t, scriptedSession{
-		workType:       "development",
-		skipSteering:   true,
-		repository:     "https://github.com/example/repo",
-		continueNumber: 12,
-		turns: []verdictScriptTurn{{
-			manifest: passedManifest,
-			text:     "WORK_RESULT:passed",
-			during: func(t *testing.T, cwd string) {
-				advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12")
-			},
-		}},
-	})
-	if res.Status != "failed" || res.FailureMode != FailureBackstop {
-		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	// A merge-only head carries no deliverable code change. A non-passed
+	// verdict keeps the failure; a passed turn now ends completed with
+	// the no-op continuation outcome instead of failed.
+	cases := []struct {
+		name        string
+		manifest    string
+		text        string
+		wantStatus  string
+		wantOutcome string
+	}{
+		{
+			name:       "failed verdict stays failed",
+			manifest:   failedManifest,
+			text:       "WORK_RESULT:failed",
+			wantStatus: "failed",
+		},
+		{
+			name:        "passed verdict completes as no-op",
+			manifest:    passedManifest,
+			text:        "WORK_RESULT:passed",
+			wantStatus:  "completed",
+			wantOutcome: ContinuationOutcomeNoOp,
+		},
 	}
-	want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"
-	if res.Error != want {
-		t.Fatalf("Error = %q, want %q", res.Error, want)
-	}
-	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
-	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
-		t.Fatalf("continued head %q does not carry the merge-only head", remoteHead)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				skipSteering:   true,
+				repository:     "https://github.com/example/repo",
+				continueNumber: 12,
+				turns: []verdictScriptTurn{{
+					manifest: tc.manifest,
+					text:     tc.text,
+					during: func(t *testing.T, cwd string) {
+						advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12")
+					},
+				}},
+			})
+			if res.Status != tc.wantStatus {
+				t.Fatalf("Status = %q (%s: %s); want %s", res.Status, res.FailureMode, res.Error, tc.wantStatus)
+			}
+			if res.ContinuationOutcome != tc.wantOutcome {
+				t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, tc.wantOutcome)
+			}
+			if tc.wantStatus == "failed" {
+				if res.FailureMode != FailureBackstop {
+					t.Fatalf("FailureMode = %q; want %s", res.FailureMode, FailureBackstop)
+				}
+				want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"
+				if res.Error != want {
+					t.Fatalf("Error = %q, want %q", res.Error, want)
+				}
+			} else if res.FailureMode != "" || res.Error != "" {
+				t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
+			}
+			remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+			if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+				t.Fatalf("continued head %q does not carry the merge-only head", remoteHead)
+			}
+		})
 	}
 }
 
@@ -868,30 +977,51 @@ func TestRun_ContinueModeScratchCommitsFailByPath(t *testing.T) {
 // head, so the no-new-commit rule passes and only the draft rule can fail
 // the run.
 func TestRun_ContinueModeDraftIsNotDelivered(t *testing.T) {
-	res, _ := runScriptedSession(t, scriptedSession{
-		workType:       "development",
-		skipSteering:   true,
-		repository:     "https://github.com/example/repo",
-		continueNumber: 12,
-		backstop:       true,
-		draft:          func(context.Context, string, string) (bool, error) { return true, nil },
-		turns: []verdictScriptTurn{{
-			manifest: passedManifest,
-			text:     "WORK_RESULT:passed",
-			files:    map[string]string{"fix.go": "package fix\n"},
-		}},
-	})
-	if res.Status != "failed" || res.FailureMode != FailureBackstop {
-		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	// A draft continued pull request never reports the run delivered on
+	// a non-passed verdict; a passed turn on a pre-existing draft ends
+	// completed with a typed outcome instead (see
+	// TestRun_ContinueModePassedDraftAtStartEndsCompleted). The session
+	// delivers a new commit onto the continued head, so the
+	// no-new-commit rule passes and only the draft rule can fail the run.
+	cases := []struct {
+		name     string
+		manifest string
+		text     string
+	}{
+		{name: "failed verdict", manifest: failedManifest, text: "WORK_RESULT:failed"},
+		{name: "unknown verdict", text: "WORK_RESULT:unknown"},
 	}
-	if !strings.Contains(res.Error, "is still a draft") {
-		t.Fatalf("Error = %q; want the draft refusal", res.Error)
-	}
-	// The commit really landed on the continued head: the draft rule, not
-	// a missing commit, is what failed the run.
-	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
-	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
-		t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				skipSteering:   true,
+				repository:     "https://github.com/example/repo",
+				continueNumber: 12,
+				backstop:       true,
+				draft:          func(context.Context, string, string) (bool, error) { return true, nil },
+				turns: []verdictScriptTurn{{
+					manifest: tc.manifest,
+					text:     tc.text,
+					files:    map[string]string{"fix.go": "package fix\n"},
+				}},
+			})
+			if res.Status != "failed" || res.FailureMode != FailureBackstop {
+				t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+			}
+			if !strings.Contains(res.Error, "is still a draft") {
+				t.Fatalf("Error = %q; want the draft refusal", res.Error)
+			}
+			if res.ContinuationOutcome != "" {
+				t.Fatalf("ContinuationOutcome = %q; want empty on a failed run", res.ContinuationOutcome)
+			}
+			// The commit really landed on the continued head: the draft rule, not
+			// a missing commit, is what failed the run.
+			remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+			if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+				t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+			}
+		})
 	}
 }
 
@@ -961,33 +1091,73 @@ func TestRun_ContinueModeDivergedHeadIsTyped(t *testing.T) {
 // — never as divergence — because the fetched head is still an ancestor
 // of the session's work.
 func TestRun_ContinueModeProtectedRejectionIsNotDiverged(t *testing.T) {
-	res, _ := runScriptedSession(t, scriptedSession{
-		workType:        "development",
-		skipSteering:    true,
-		repository:      "https://github.com/example/repo",
-		continueNumber:  12,
-		backstop:        true,
-		protectContinue: true,
-		turns: []verdictScriptTurn{{
-			manifest: passedManifest,
-			text:     "WORK_RESULT:passed",
-			files:    map[string]string{"fix.go": "package fix\n"},
-		}},
-	})
-	if res.Status != "failed" || res.FailureMode != FailureBackstop {
-		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	// The server-side policy hook rejects the push, so the session's
+	// commit never reaches the remote head: the run stays failed with
+	// the backstop failure whatever the verdict, because unpublished
+	// work is never a no-op. Neither reads as divergence, because the
+	// fetched head is still an ancestor of the session's work.
+	cases := []struct {
+		name        string
+		manifest    string
+		text        string
+		wantStatus  string
+		wantOutcome string
+	}{
+		{
+			name:       "failed verdict stays failed",
+			manifest:   failedManifest,
+			text:       "WORK_RESULT:failed",
+			wantStatus: "failed",
+		},
+		{
+			name:       "passed verdict with an unpushed commit stays failed",
+			manifest:   passedManifest,
+			text:       "WORK_RESULT:passed",
+			wantStatus: "failed",
+		},
 	}
-	if res.FailureMode == FailureContinuePullRequestDiverged {
-		t.Fatalf("FailureMode = %q; a policy rejection must not read as divergence", res.FailureMode)
-	}
-	if res.BackstopReport == nil {
-		t.Fatal("BackstopReport is nil; want the push failure recorded")
-	}
-	if res.BackstopReport.ContinueDiverged {
-		t.Fatal("BackstopReport.ContinueDiverged = true; want false for a policy rejection")
-	}
-	if got := res.BackstopReport.Diagnostics; !strings.Contains(got, "non-fast-forward") {
-		t.Fatalf("diagnostics = %q; want the hook's wording present so the test proves text alone would mislabel it", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:        "development",
+				skipSteering:    true,
+				repository:      "https://github.com/example/repo",
+				continueNumber:  12,
+				backstop:        true,
+				protectContinue: true,
+				turns: []verdictScriptTurn{{
+					manifest: tc.manifest,
+					text:     tc.text,
+					files:    map[string]string{"fix.go": "package fix\n"},
+				}},
+			})
+			if res.Status != tc.wantStatus {
+				t.Fatalf("Status = %q (%s: %s); want %s", res.Status, res.FailureMode, res.Error, tc.wantStatus)
+			}
+			if res.ContinuationOutcome != tc.wantOutcome {
+				t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, tc.wantOutcome)
+			}
+			if tc.wantStatus == "failed" && res.FailureMode != FailureBackstop {
+				t.Fatalf("FailureMode = %q; want %s", res.FailureMode, FailureBackstop)
+			}
+			// An unpushed commit is unpublished work, never a no-op:
+			// the gate reports no new commit on the remote head.
+			if tc.wantStatus == "failed" && !strings.Contains(res.Error, "has no new commit since dispatch") {
+				t.Fatalf("Error = %q; want the unpublished-head refusal", res.Error)
+			}
+			if res.FailureMode == FailureContinuePullRequestDiverged {
+				t.Fatalf("FailureMode = %q; a policy rejection must not read as divergence", res.FailureMode)
+			}
+			if res.BackstopReport == nil {
+				t.Fatal("BackstopReport is nil; want the push failure recorded")
+			}
+			if res.BackstopReport.ContinueDiverged {
+				t.Fatal("BackstopReport.ContinueDiverged = true; want false for a policy rejection")
+			}
+			if got := res.BackstopReport.Diagnostics; !strings.Contains(got, "non-fast-forward") {
+				t.Fatalf("diagnostics = %q; want the hook's wording present so the test proves text alone would mislabel it", got)
+			}
+		})
 	}
 }
 
@@ -1139,26 +1309,65 @@ func TestRun_ContinueModeCleanMergeAllowedByPolicyDelivers(t *testing.T) {
 // clean-merge intent is opt-in: the same clean merge that delivers under
 // the flag fails as merge-only without it.
 func TestRun_ContinueModeCleanMergeWithoutPolicyStillFails(t *testing.T) {
+	// The clean-merge intent stays opt-in: only a dispatch-declared flag
+	// lets a clean merge DELIVER. Without it a non-passed verdict keeps
+	// the merge-only failure, while a passed turn ends completed with
+	// the no-op continuation outcome instead of failed.
 	cleanMerge := func(t *testing.T, cwd string) {
 		advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12", "refs/pull/12/head")
 	}
-	res, _ := runScriptedSession(t, scriptedSession{
-		workType:       "development",
-		skipSteering:   true,
-		repository:     "https://github.com/example/repo",
-		continueNumber: 12,
-		backstop:       true,
-		turns: []verdictScriptTurn{{
-			manifest: passedManifest,
-			text:     "WORK_RESULT:passed",
-			during:   cleanMerge,
-		}},
-	})
-	if res.Status != "failed" || res.FailureMode != FailureBackstop {
-		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	cases := []struct {
+		name        string
+		manifest    string
+		text        string
+		wantStatus  string
+		wantOutcome string
+	}{
+		{
+			name:       "failed verdict stays failed",
+			manifest:   failedManifest,
+			text:       "WORK_RESULT:failed",
+			wantStatus: "failed",
+		},
+		{
+			name:        "passed verdict completes as no-op",
+			manifest:    passedManifest,
+			text:        "WORK_RESULT:passed",
+			wantStatus:  "completed",
+			wantOutcome: ContinuationOutcomeNoOp,
+		},
 	}
-	if want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"; res.Error != want {
-		t.Fatalf("Error = %q, want %q", res.Error, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				skipSteering:   true,
+				repository:     "https://github.com/example/repo",
+				continueNumber: 12,
+				backstop:       true,
+				turns: []verdictScriptTurn{{
+					manifest: tc.manifest,
+					text:     tc.text,
+					during:   cleanMerge,
+				}},
+			})
+			if res.Status != tc.wantStatus {
+				t.Fatalf("Status = %q (%s: %s); want %s", res.Status, res.FailureMode, res.Error, tc.wantStatus)
+			}
+			if res.ContinuationOutcome != tc.wantOutcome {
+				t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, tc.wantOutcome)
+			}
+			if tc.wantStatus == "failed" {
+				if res.FailureMode != FailureBackstop {
+					t.Fatalf("FailureMode = %q; want failed backstop-failed", res.FailureMode)
+				}
+				if want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"; res.Error != want {
+					t.Fatalf("Error = %q, want %q", res.Error, want)
+				}
+			} else if res.FailureMode != "" || res.Error != "" {
+				t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
+			}
+		})
 	}
 }
 
@@ -1168,33 +1377,70 @@ func TestRun_ContinueModeCleanMergeWithoutPolicyStillFails(t *testing.T) {
 // does not carry it, so the no-new-commit rule — not the code-change
 // rule — fails the run.
 func TestRun_ContinueModeCleanMergeStillNeedsAPush(t *testing.T) {
+	// The intent is narrow: a clean merge the run never pushed still ends
+	// not delivered whatever the verdict. The merge moved the local
+	// head past dispatch, but the remote head does not carry it, so the
+	// no-new-commit rule — not the code-change rule — fails the run.
+	// Unpublished work is never a no-op, even for a passed turn.
 	cleanMergeUnpushed := func(t *testing.T, cwd string) {
 		advanceMainAndMerge(t, cwd)
 	}
-	res, _ := runScriptedSession(t, scriptedSession{
-		workType:       "development",
-		skipSteering:   true,
-		repository:     "https://github.com/example/repo",
-		continueNumber: 12,
-		delivery:       &prompt.DeliveryPolicy{AllowCleanMerge: true},
-		turns: []verdictScriptTurn{{
-			manifest: passedManifest,
-			text:     "WORK_RESULT:passed",
-			during:   cleanMergeUnpushed,
-		}},
+	t.Run("failed verdict stays failed", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			delivery:       &prompt.DeliveryPolicy{AllowCleanMerge: true},
+			turns: []verdictScriptTurn{{
+				manifest: failedManifest,
+				text:     "WORK_RESULT:failed",
+				during:   cleanMergeUnpushed,
+			}},
+		})
+		if res.Status != "failed" || res.FailureMode != FailureBackstop {
+			t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+		}
+		if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
+			t.Fatalf("Error = %q, want %q", res.Error, want)
+		}
+		if res.ContinuationOutcome != "" {
+			t.Fatalf("ContinuationOutcome = %q; want empty on a failed run", res.ContinuationOutcome)
+		}
 	})
-	if res.Status != "failed" || res.FailureMode != FailureBackstop {
-		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
-	}
-	if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
-		t.Fatalf("Error = %q, want %q", res.Error, want)
-	}
+	t.Run("passed verdict with an unpushed merge stays failed", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			delivery:       &prompt.DeliveryPolicy{AllowCleanMerge: true},
+			turns: []verdictScriptTurn{{
+				manifest: passedManifest,
+				text:     "WORK_RESULT:passed",
+				during:   cleanMergeUnpushed,
+			}},
+		})
+		if res.Status != "failed" || res.FailureMode != FailureBackstop {
+			t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+		}
+		if want := "continued pull request #12 has no new commit since dispatch"; res.Error != want {
+			t.Fatalf("Error = %q, want %q", res.Error, want)
+		}
+		if res.ContinuationOutcome != "" {
+			t.Fatalf("ContinuationOutcome = %q; want empty on a failed run", res.ContinuationOutcome)
+		}
+	})
 }
 
 // TestRun_ContinueModeMergeWithoutPolicyStillFails proves the merge
 // allowance is opt-in: the same merge-with-resolution head that delivers
 // under the flag fails as merge-only without it.
 func TestRun_ContinueModeMergeWithoutPolicyStillFails(t *testing.T) {
+	// The merge allowance stays opt-in: only a dispatch-declared flag
+	// lets a merge resolution DELIVER. Without it a non-passed verdict
+	// keeps the merge-only failure, while a passed turn ends completed
+	// with the no-op continuation outcome instead of failed.
 	mergeWithResolution := func(t *testing.T, cwd string) {
 		advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12", "refs/pull/12/head")
 		writeFile(t, cwd, "resolved.txt", "resolution\n")
@@ -1202,23 +1448,58 @@ func TestRun_ContinueModeMergeWithoutPolicyStillFails(t *testing.T) {
 		gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--amend", "--no-edit", "-q")
 		gitRun(t, cwd, "push", "-q", "-f", "origin", "HEAD:refs/heads/continued/pr-12", "HEAD:refs/pull/12/head")
 	}
-	res, _ := runScriptedSession(t, scriptedSession{
-		workType:       "development",
-		skipSteering:   true,
-		repository:     "https://github.com/example/repo",
-		continueNumber: 12,
-		backstop:       true,
-		turns: []verdictScriptTurn{{
-			manifest: passedManifest,
-			text:     "WORK_RESULT:passed",
-			during:   mergeWithResolution,
-		}},
-	})
-	if res.Status != "failed" || res.FailureMode != FailureBackstop {
-		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	cases := []struct {
+		name        string
+		manifest    string
+		text        string
+		wantStatus  string
+		wantOutcome string
+	}{
+		{
+			name:       "failed verdict stays failed",
+			manifest:   failedManifest,
+			text:       "WORK_RESULT:failed",
+			wantStatus: "failed",
+		},
+		{
+			name:        "passed verdict completes as no-op",
+			manifest:    passedManifest,
+			text:        "WORK_RESULT:passed",
+			wantStatus:  "completed",
+			wantOutcome: ContinuationOutcomeNoOp,
+		},
 	}
-	if want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"; res.Error != want {
-		t.Fatalf("Error = %q, want %q", res.Error, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				skipSteering:   true,
+				repository:     "https://github.com/example/repo",
+				continueNumber: 12,
+				backstop:       true,
+				turns: []verdictScriptTurn{{
+					manifest: tc.manifest,
+					text:     tc.text,
+					during:   mergeWithResolution,
+				}},
+			})
+			if res.Status != tc.wantStatus {
+				t.Fatalf("Status = %q (%s: %s); want %s", res.Status, res.FailureMode, res.Error, tc.wantStatus)
+			}
+			if res.ContinuationOutcome != tc.wantOutcome {
+				t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, tc.wantOutcome)
+			}
+			if tc.wantStatus == "failed" {
+				if res.FailureMode != FailureBackstop {
+					t.Fatalf("FailureMode = %q; want failed backstop-failed", res.FailureMode)
+				}
+				if want := "continued pull request #12 has no code change since dispatch (only merges or scratch files)"; res.Error != want {
+					t.Fatalf("Error = %q, want %q", res.Error, want)
+				}
+			} else if res.FailureMode != "" || res.Error != "" {
+				t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
+			}
+		})
 	}
 }
 
@@ -1363,4 +1644,375 @@ func TestInspectContinueRangeDeliversUnderPolicy(t *testing.T) {
 			t.Fatalf("deliversUnder(allow-clean-merge) = true for an empty range; want false")
 		}
 	})
+}
+
+// TestRun_ContinueModePassedNoOpEndsCompleted pins the rework-outcome
+// contract through the production entry point: a passed turn that leaves
+// the continued pull request untouched ends completed with the typed
+// no-op continuation outcome instead of failed, keeping the old failure
+// message as a post-session warning. A non-passed verdict on the same
+// head keeps the failure.
+func TestRun_ContinueModePassedNoOpEndsCompleted(t *testing.T) {
+	draftFalse := false
+	cases := []struct {
+		name        string
+		manifest    string
+		text        string
+		wantStatus  string
+		wantMode    string
+		wantOutcome string
+		wantErr     string
+	}{
+		{
+			name:        "passed marker with no new commit",
+			text:        "WORK_RESULT:passed",
+			wantStatus:  "completed",
+			wantOutcome: ContinuationOutcomeNoOp,
+		},
+		{
+			name:        "passed manifest with no new commit",
+			manifest:    passedManifest,
+			text:        "WORK_RESULT:passed",
+			wantStatus:  "completed",
+			wantOutcome: ContinuationOutcomeNoOp,
+		},
+		{
+			name:        "passed with merge-only head",
+			text:        "WORK_RESULT:passed",
+			wantStatus:  "completed",
+			wantOutcome: ContinuationOutcomeNoOp,
+			wantMode:    "merge-only",
+		},
+		{
+			name:       "failed verdict with no new commit stays failed",
+			manifest:   failedManifest,
+			text:       "WORK_RESULT:failed",
+			wantStatus: "failed",
+			wantMode:   FailureBackstop,
+			wantErr:    "continued pull request #12 has no new commit since dispatch",
+		},
+		{
+			name:       "unknown verdict with no new commit stays failed",
+			text:       "WORK_RESULT:unknown",
+			wantStatus: "failed",
+			wantMode:   FailureBackstop,
+			wantErr:    "continued pull request #12 has no new commit since dispatch",
+		},
+		{
+			name:       "failed verdict with merge-only head stays failed",
+			manifest:   failedManifest,
+			text:       "WORK_RESULT:failed",
+			wantStatus: "failed",
+			wantMode:   FailureBackstop,
+			wantErr:    "continued pull request #12 has no code change since dispatch (only merges or scratch files)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			turn := verdictScriptTurn{manifest: tc.manifest, text: tc.text}
+			mergeOnly := tc.wantMode == "merge-only" || strings.Contains(tc.wantErr, "no code change")
+			if mergeOnly {
+				inner := turn
+				turn = verdictScriptTurn{
+					manifest: inner.manifest,
+					text:     inner.text,
+					during: func(t *testing.T, cwd string) {
+						advanceMainAndMerge(t, cwd, "refs/heads/continued/pr-12", "refs/pull/12/head")
+					},
+				}
+			}
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				skipSteering:   true,
+				repository:     "https://github.com/example/repo",
+				continueNumber: 12,
+				draftAtStart:   &draftFalse,
+				turns:          []verdictScriptTurn{turn},
+			})
+			if res.Status != tc.wantStatus {
+				t.Fatalf("Status = %q (%s: %s); want %s", res.Status, res.FailureMode, res.Error, tc.wantStatus)
+			}
+			if res.ContinuationOutcome != tc.wantOutcome {
+				t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, tc.wantOutcome)
+			}
+			if tc.wantStatus == "completed" {
+				if res.FailureMode != "" {
+					t.Fatalf("FailureMode = %q; want empty on a completed no-op", res.FailureMode)
+				}
+				if res.Error != "" {
+					t.Fatalf("Error = %q; want empty on a completed no-op", res.Error)
+				}
+				if len(res.PostSessionWarnings) == 0 {
+					t.Fatal("PostSessionWarnings is empty; want the old failure message kept as a warning")
+				}
+				found := false
+				for _, w := range res.PostSessionWarnings {
+					if strings.Contains(w, "continued pull request #12") {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("PostSessionWarnings = %q; want the old failure message", res.PostSessionWarnings)
+				}
+				if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+					t.Fatalf("PullRequestURL = %q; want the continued pull request", res.PullRequestURL)
+				}
+				return
+			}
+			if res.FailureMode != tc.wantMode {
+				t.Fatalf("FailureMode = %q; want %q", res.FailureMode, tc.wantMode)
+			}
+			if res.Error != tc.wantErr {
+				t.Fatalf("Error = %q, want %q", res.Error, tc.wantErr)
+			}
+			if res.ContinuationOutcome != "" {
+				t.Fatalf("ContinuationOutcome = %q; want empty on a failed run", res.ContinuationOutcome)
+			}
+		})
+	}
+}
+
+// TestRun_ContinueModePassedDraftAtStartEndsCompleted pins the
+// pre-existing-draft half of the contract: a passed turn that leaves the
+// run's own delivered code on a pull request which was already a draft
+// before the run started ends completed with the fixed-in-place outcome;
+// when the range delivers no code it is the no-op outcome instead. A
+// draft the run itself created — not a draft at the start — still fails,
+// as does a non-passed verdict.
+func TestRun_ContinueModePassedDraftAtStartEndsCompleted(t *testing.T) {
+	draftTrue := true
+	draftFalse := false
+	alwaysDraft := func(context.Context, string, string) (bool, error) { return true, nil }
+	t.Run("passed with new code on a pre-existing draft is fixed in place", func(t *testing.T) {
+		platform := newRecordingPlatformServer(t)
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			backstop:       true,
+			platform:       platform,
+			draft:          alwaysDraft,
+			draftAtStart:   &draftTrue,
+			turns: []verdictScriptTurn{{
+				manifest: passedManifest,
+				text:     "WORK_RESULT:passed",
+				files:    map[string]string{"fix.go": "package fix\n"},
+			}},
+		})
+		if res.Status != "completed" {
+			t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+		}
+		if res.ContinuationOutcome != ContinuationOutcomeFixedInPlace {
+			t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, ContinuationOutcomeFixedInPlace)
+		}
+		if res.FailureMode != "" || res.Error != "" {
+			t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
+		}
+		if len(res.PostSessionWarnings) == 0 {
+			t.Fatal("PostSessionWarnings is empty; want the draft message kept as a warning")
+		}
+		status := platform.terminalStatus(t)
+		if got := string(status["status"]); got != `"completed"` {
+			t.Fatalf("posted status = %s; want completed", got)
+		}
+		if got := string(status["continuationOutcome"]); got != `"fixed_in_place"` {
+			t.Fatalf("posted continuationOutcome = %s; want fixed_in_place", got)
+		}
+		remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+		if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+			t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+		}
+	})
+	t.Run("passed with no code on a pre-existing draft is a no-op", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			draft:          alwaysDraft,
+			draftAtStart:   &draftTrue,
+			turns:          []verdictScriptTurn{{manifest: passedManifest, text: "WORK_RESULT:passed"}},
+		})
+		if res.Status != "completed" {
+			t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+		}
+		if res.ContinuationOutcome != ContinuationOutcomeNoOp {
+			t.Fatalf("ContinuationOutcome = %q; want %q", res.ContinuationOutcome, ContinuationOutcomeNoOp)
+		}
+		if res.FailureMode != "" || res.Error != "" {
+			t.Fatalf("FailureMode = %q Error = %q; want both empty on completed", res.FailureMode, res.Error)
+		}
+	})
+	t.Run("passed draft created during the run still fails", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			backstop:       true,
+			draft:          alwaysDraft,
+			draftAtStart:   &draftFalse,
+			turns: []verdictScriptTurn{{
+				manifest: passedManifest,
+				text:     "WORK_RESULT:passed",
+				files:    map[string]string{"fix.go": "package fix\n"},
+			}},
+		})
+		if res.Status != "failed" || res.FailureMode != FailureBackstop {
+			t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+		}
+		if !strings.Contains(res.Error, "is still a draft") {
+			t.Fatalf("Error = %q; want the draft refusal", res.Error)
+		}
+		if res.ContinuationOutcome != "" {
+			t.Fatalf("ContinuationOutcome = %q; want empty on a failed run", res.ContinuationOutcome)
+		}
+	})
+	t.Run("failed verdict on a pre-existing draft still fails", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			backstop:       true,
+			draft:          alwaysDraft,
+			draftAtStart:   &draftTrue,
+			turns: []verdictScriptTurn{{
+				manifest: failedManifest,
+				text:     "WORK_RESULT:failed",
+				files:    map[string]string{"fix.go": "package fix\n"},
+			}},
+		})
+		if res.Status != "failed" || res.FailureMode != FailureBackstop {
+			t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+		}
+		if !strings.Contains(res.Error, "is still a draft") {
+			t.Fatalf("Error = %q; want the draft refusal", res.Error)
+		}
+	})
+	t.Run("scratch on a pre-existing draft still fails", func(t *testing.T) {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType:       "development",
+			skipSteering:   true,
+			repository:     "https://github.com/example/repo",
+			continueNumber: 12,
+			backstop:       true,
+			draft:          alwaysDraft,
+			draftAtStart:   &draftTrue,
+			turns: []verdictScriptTurn{{
+				manifest: passedManifest,
+				text:     "WORK_RESULT:passed",
+				during: func(t *testing.T, cwd string) {
+					writeFile(t, cwd, ".scratch/comments.json", "{}\n")
+					gitRun(t, cwd, "add", "-f", "-A")
+					gitRun(t, cwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "scratch commit")
+					gitRun(t, cwd, "push", "-q", "origin", "HEAD:refs/heads/continued/pr-12")
+				},
+			}},
+		})
+		if res.Status != "failed" || res.FailureMode != FailureBackstop {
+			t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+		}
+		if !strings.Contains(res.Error, "commits scratch paths since dispatch") {
+			t.Fatalf("Error = %q; want the scratch refusal", res.Error)
+		}
+	})
+}
+
+// TestRun_ContinueModeDraftAtStartUnpushedStaysFailed pins that a passed
+// turn whose code never reached the remote is never reported as fixed in
+// place, even on a pull request that was already a draft: the platform
+// must not be told the code is on the pull request when it is not.
+func TestRun_ContinueModeDraftAtStartUnpushedStaysFailed(t *testing.T) {
+	alwaysDraft := func(context.Context, string, string) (bool, error) { return true, nil }
+	draftTrue := true
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:        "development",
+		skipSteering:    true,
+		repository:      "https://github.com/example/repo",
+		continueNumber:  12,
+		backstop:        true,
+		protectContinue: true,
+		draft:           alwaysDraft,
+		draftAtStart:    &draftTrue,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	}
+	if res.ContinuationOutcome != "" {
+		t.Fatalf("ContinuationOutcome = %q; want empty on an unpublished draft run", res.ContinuationOutcome)
+	}
+	if res.FailureMode == FailureContinuePullRequestDiverged {
+		t.Fatalf("FailureMode = %q; a policy rejection must not read as divergence", res.FailureMode)
+	}
+	// The local head moved but the remote does not carry it, so the
+	// run fails instead of reporting the code as fixed in place.
+	if strings.Contains(string(res.ContinuationOutcome), "fixed_in_place") {
+		t.Fatalf("ContinuationOutcome = %q; an unpushed draft must never fix in place", res.ContinuationOutcome)
+	}
+}
+
+// TestRun_ContinueModeDraftAtStartUnpushedMergeStaysFailed pins the draft
+// no-op branch's pushed guard through the production entry point: a passed
+// turn that leaves only an unpushed merge on a pre-existing draft stays
+// failed with the draft refusal, never completed with a no-op outcome.
+// Dropping the pushed guard at the gate reports the unpushed merge as a
+// completed no-op, so this test goes RED on that mutant.
+func TestRun_ContinueModeDraftAtStartUnpushedMergeStaysFailed(t *testing.T) {
+	alwaysDraft := func(context.Context, string, string) (bool, error) { return true, nil }
+	draftTrue := true
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		draft:          alwaysDraft,
+		draftAtStart:   &draftTrue,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during: func(t *testing.T, cwd string) {
+				advanceMainAndMerge(t, cwd)
+			},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	}
+	if want := "continued pull request #12 is still a draft"; res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+	if res.ContinuationOutcome != "" {
+		t.Fatalf("ContinuationOutcome = %q; want empty on an unpublished draft run", res.ContinuationOutcome)
+	}
+}
+
+// TestRun_ContinueModePassedWithProviderErrorStaysFailed pins that a
+// WORK_RESULT marker alone never promotes the run to completed: a passed
+// marker followed by a provider error in the same turn keeps the gate's
+// failure instead of ending completed with a no-op outcome.
+func TestRun_ContinueModePassedWithProviderErrorStaysFailed(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		turns: []verdictScriptTurn{{
+			manifest:      passedManifest,
+			text:          "WORK_RESULT:passed",
+			providerError: "overloaded",
+		}},
+	})
+	if res.Status == "completed" && res.ContinuationOutcome == ContinuationOutcomeNoOp {
+		t.Fatalf("a passed marker ending on a provider error was reported completed/no_op: %+v", res)
+	}
+	if res.ContinuationOutcome != "" {
+		t.Fatalf("ContinuationOutcome = %q; want empty when the turn ended on a provider error", res.ContinuationOutcome)
+	}
 }

@@ -312,6 +312,12 @@ type scriptedSession struct {
 	workTypeRole string
 	skipSteering bool
 	inject       string
+	// now, when set, replaces the runner's wall clock: Run stamps
+	// StartedAt from its first read and records preparation time from
+	// its read at provider spawn, so a test that answers different
+	// instants across the two reads observes the phase duration on
+	// the terminal result.
+	now func() time.Time
 	// repository, when set, is a GitHub repository address (any remote
 	// form) the session provisions, served from a local bare repository;
 	// otherwise the session repository is a plain local path.
@@ -324,6 +330,12 @@ type scriptedSession struct {
 	// draft, when set, replaces the pull request draft read; otherwise the
 	// session's pull request is never a draft (and no gh is run).
 	draft pullRequestDraftLookup
+	// draftAtStart, when non-nil, replaces the draft read taken right
+	// after the continued-pull-request checkout, before the turn starts.
+	// Nil keeps the draft read: a constant draft stub reads the same at
+	// the start and at the gate, while a sequencing stub can report one
+	// value at the start and another at the gate.
+	draftAtStart *bool
 	// ref, when set, makes the session a rework run on that existing
 	// branch of repository (qw.Ref), created at main.
 	ref string
@@ -352,6 +364,13 @@ type scriptedSession struct {
 	// scripted session. Zero keeps the 15s production default. Tests only:
 	// production leaves this at zero.
 	stepHeartbeatInterval time.Duration
+	// statusBeaconInterval, when non-zero, sets the runner's status-beacon
+	// cadence for tests that need beacons inside a fast scripted session.
+	// Zero keeps the 30s production default — longer than any scripted
+	// session, so beacon assertions set a millisecond interval to observe
+	// the spawning/streaming/terminal sequence. Negative disables beacons.
+	// Tests only: production leaves this at zero.
+	statusBeaconInterval time.Duration
 	// teardown lets Run tear the worktree down on success (the default keeps
 	// it for inspection); rescueDir is where unpublished work is archived.
 	teardown  bool
@@ -438,7 +457,11 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.KitComposer = cfg.kitComposer
 	})
 	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
+	r.statusBeaconInterval = cfg.statusBeaconInterval
 	r.skipSteering = cfg.skipSteering
+	if cfg.now != nil {
+		r.now = cfg.now
+	}
 	if cfg.teardown {
 		r.preserveAlways = false
 	}
@@ -451,6 +474,18 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	r.pullRequestDraftLookup = cfg.draft
 	if r.pullRequestDraftLookup == nil {
 		r.pullRequestDraftLookup = func(context.Context, string, string) (bool, error) { return false, nil }
+	}
+	if cfg.draftAtStart != nil {
+		start := *cfg.draftAtStart
+		gate := r.pullRequestDraftLookup
+		calls := 0
+		r.pullRequestDraftLookup = func(ctx context.Context, path, url string) (bool, error) {
+			calls++
+			if calls == 1 {
+				return start, nil
+			}
+			return gate(ctx, path, url)
+		}
 	}
 	r.skipBackstop = !cfg.backstop
 	r.providerRetryBackoff = func(int) time.Duration { return 0 }

@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/afclient"
@@ -174,5 +176,62 @@ func TestWithArchiveReferenceTerminalResultAttachesBinding(t *testing.T) {
 	}
 	if got := WithArchiveReferenceTerminalResult(nil, "tr_11111111111111111111111111111111"); got != nil {
 		t.Fatalf("nil input = %+v", got)
+	}
+}
+
+// TestCommitArchiveRootAcceptsPreContractCommitOnRetry pins the crash-retry
+// across an upgrade: an older daemon committed the archive (its manifest has
+// no terminal result field) and died before the lease release finished. The
+// upgraded daemon retries the release with the lease's terminal result. The
+// committed bytes are unchanged, so the retry is idempotent and yields the
+// reference for the committed digest instead of an identity collision that
+// would leave the lease stuck in release.
+func TestCommitArchiveRootAcceptsPreContractCommitOnRetry(t *testing.T) {
+	t.Parallel()
+	const workareaID = "wa_77777777777777777777777777777777"
+	registry, spec := commitFlatArchiveForReference(t, workareaID, "11111111-1111-4111-8111-111111111111")
+	legacy := spec
+	legacy.TerminalResultID = ""
+	if err := registry.ArchiveRoot(t.Context(), legacy); err != nil {
+		t.Fatalf("pre-contract commit: %v", err)
+	}
+	manifestPath := filepath.Join(registry.Root(), workareaID, "manifest.json")
+	before, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(before), "terminalResultId") {
+		t.Fatalf("fixture manifest is not pre-contract: %s", before)
+	}
+	reference, err := registry.CommitArchiveRoot(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("retry over a pre-contract commit: %v", err)
+	}
+	if reference == nil {
+		t.Fatal("retry returned no recovery reference")
+	}
+	if err := reference.Validate(); err != nil {
+		t.Fatalf("reference invalid: %v", err)
+	}
+	manifest, err := registry.readManifest(workareaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reference.ArchiveID != workareaID || reference.WorkareaID != workareaID || reference.SessionID != spec.SessionID ||
+		reference.TerminalResultID != spec.TerminalResultID || reference.ArchiveDigest != manifest.TreeDigest {
+		t.Fatalf("reference = %+v, manifest digest %q", reference, manifest.TreeDigest)
+	}
+	after, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("retry rewrote the immutable pre-contract manifest")
+	}
+	// A conflicting identity is still refused over a pre-contract commit.
+	conflicting := spec
+	conflicting.SessionID = "22222222-2222-4222-8222-222222222222"
+	if _, err := registry.CommitArchiveRoot(t.Context(), conflicting); !errors.Is(err, ErrArchiveExists) {
+		t.Fatalf("conflicting session over a pre-contract commit: err = %v, want ErrArchiveExists", err)
 	}
 }

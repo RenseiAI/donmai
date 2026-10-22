@@ -146,6 +146,15 @@ const (
 	// attempts, and the outer idle timeout still owns the seat.
 	DefaultProviderStallRetries = 2
 
+	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
+	// posts to the session progress endpoint: at most one POST per
+	// interval, no matter how often the step changes (the latest step
+	// wins the next slot). Thirty seconds keeps a step-change burst —
+	// spawn, streaming, steering, backstop in one fast session — from
+	// becoming one POST per transition while still refreshing the
+	// descriptor's recency well inside the platform's staleness window.
+	DefaultStatusBeaconInterval = 30 * time.Second
+
 	// terminalResultPostTimeout bounds the detached cleanup context used for
 	// terminal result delivery after the run context has expired or been
 	// cancelled. Posting remains ahead of worktree teardown.
@@ -176,6 +185,18 @@ type Options struct {
 	// for long-running child sessions. Heartbeats call it before every tick so
 	// they can pick up daemon-side runtime-token refreshes.
 	CredentialProvider CredentialProvider
+
+	// ExecutionSecurityReporter submits the pre-spawn execution-security
+	// report through the preflight registration call and waits for
+	// acceptance before the provider spawns. Nil uses the HTTP reporter
+	// posting to the session's own controller origin with the run's worker
+	// credential. Tests substitute a fake to accept or refuse without a
+	// controller. The gate applies to stamped controller-transport work
+	// only when the dispatch target advertises
+	// CapabilityExecutionSecurityReportIngest: unstamped work has no report
+	// to send, local-transport work has no controller registration endpoint,
+	// and work dispatched without the capability spawns as before.
+	ExecutionSecurityReporter ExecutionSecurityReporter
 
 	// EnvComposer builds the agent subprocess env. Defaults to
 	// env.NewComposer().
@@ -302,6 +323,15 @@ type Options struct {
 	// HeartbeatInterval overrides the per-session heartbeat cadence.
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
+
+	// StatusBeaconInterval bounds the runner's current-step beacon posts
+	// to the session progress endpoint: at most one beacon POST per
+	// interval, no matter how often the step changes underneath (the
+	// latest step wins the next slot). Zero falls back to
+	// DefaultStatusBeaconInterval. NEGATIVE disables beacon posts
+	// entirely — the run proceeds exactly as before this feature
+	// (mixed-version safe while the endpoint is unavailable).
+	StatusBeaconInterval time.Duration
 
 	// StepHeartbeatInterval overrides the per-session step-heartbeat
 	// cadence. Zero falls back to runtime/stepheartbeat.DefaultInterval.
@@ -512,43 +542,45 @@ type DepsExecer = kit.Execer
 // WorktreeManager, etc.) are documented as concurrency-safe by their
 // own packages.
 type Runner struct {
-	registry                      *Registry
-	wt                            *worktree.Manager
-	poster                        *result.Poster
-	credentialProvider            CredentialProvider
-	envc                          *env.Composer
-	mcpb                          *mcp.Builder
-	store                         *state.Store
-	promptBuilder                 *prompt.Builder
-	httpClient                    *http.Client
-	logger                        *slog.Logger
-	now                           func() time.Time
-	maxDuration                   time.Duration
-	idleTimeout                   time.Duration
-	providerStallTimeout          time.Duration
-	providerStallRetries          int
-	preserveOnFail                bool
-	preserveAlways                bool
-	skipBackstop                  bool
-	skipSteering                  bool
-	skipPostSession               bool
-	hbInterval                    time.Duration
-	stepHeartbeatInterval         time.Duration
-	spanEmissionEnabled           bool
-	spanEndpointPath              string
-	kitSkillSources               []kit.KitSkillSource
-	kitSkillDetector              KitSkillDetector
-	kitPromptFragDetector         KitPromptFragmentDetector
-	kitDetector                   KitDetector
-	kitComposer                   KitComposer
-	kitTargetOS                   string
-	additionalExtensionDecorator  agent.ExtensionDecorator
-	capabilityRealizations        *agent.CapabilityRealizationRegistry
-	capabilityParameterBinders    *CapabilityParameterBinderRegistry
-	preparedCapabilities          capabilityRealizationResolver
-	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
-	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
-	selectionPolicy               protectedRuntimeMCPSelectionPolicy
+	registry                          *Registry
+	wt                                *worktree.Manager
+	poster                            *result.Poster
+	credentialProvider                CredentialProvider
+	executionSecurityReporterOverride ExecutionSecurityReporter
+	envc                              *env.Composer
+	mcpb                              *mcp.Builder
+	store                             *state.Store
+	promptBuilder                     *prompt.Builder
+	httpClient                        *http.Client
+	logger                            *slog.Logger
+	now                               func() time.Time
+	maxDuration                       time.Duration
+	idleTimeout                       time.Duration
+	providerStallTimeout              time.Duration
+	providerStallRetries              int
+	preserveOnFail                    bool
+	preserveAlways                    bool
+	skipBackstop                      bool
+	skipSteering                      bool
+	skipPostSession                   bool
+	hbInterval                        time.Duration
+	stepHeartbeatInterval             time.Duration
+	statusBeaconInterval              time.Duration
+	spanEmissionEnabled               bool
+	spanEndpointPath                  string
+	kitSkillSources                   []kit.KitSkillSource
+	kitSkillDetector                  KitSkillDetector
+	kitPromptFragDetector             KitPromptFragmentDetector
+	kitDetector                       KitDetector
+	kitComposer                       KitComposer
+	kitTargetOS                       string
+	additionalExtensionDecorator      agent.ExtensionDecorator
+	capabilityRealizations            *agent.CapabilityRealizationRegistry
+	capabilityParameterBinders        *CapabilityParameterBinderRegistry
+	preparedCapabilities              capabilityRealizationResolver
+	protectedRuntimeMCPSelector       ProtectedRuntimeMCPSelector
+	protectedRuntimeMCPV2Selector     ProtectedRuntimeMCPV2Selector
+	selectionPolicy                   protectedRuntimeMCPSelectionPolicy
 
 	// rescueDir is Options.RescueDir (see rescueRoot for the default).
 	rescueDir string
@@ -648,53 +680,55 @@ func New(opts Options) (*Runner, error) {
 		return nil, err
 	}
 	r := &Runner{
-		registry:                         opts.Registry,
-		wt:                               opts.WorktreeManager,
-		poster:                           opts.Poster,
-		credentialProvider:               opts.CredentialProvider,
-		envc:                             opts.EnvComposer,
-		mcpb:                             opts.MCPBuilder,
-		store:                            opts.StateStore,
-		promptBuilder:                    opts.PromptBuilder,
-		httpClient:                       opts.HTTPClient,
-		logger:                           opts.Logger,
-		now:                              opts.Now,
-		maxDuration:                      opts.MaxSessionDuration,
-		idleTimeout:                      opts.IdleTimeout,
-		providerStallTimeout:             opts.ProviderStallTimeout,
-		providerStallRetries:             opts.ProviderStallRetries,
-		preserveOnFail:                   opts.PreserveWorktreeOnFailure,
-		preserveAlways:                   opts.PreserveWorktreeAlways,
-		skipBackstop:                     opts.SkipBackstop,
-		skipSteering:                     opts.SkipSteering,
-		skipPostSession:                  opts.SkipPostSession,
-		hbInterval:                       opts.HeartbeatInterval,
-		stepHeartbeatInterval:            opts.StepHeartbeatInterval,
-		spanEmissionEnabled:              opts.SpanEmissionEnabled,
-		spanEndpointPath:                 opts.SpanEndpointPath,
-		kitSkillSources:                  opts.KitSkillSources,
-		kitSkillDetector:                 opts.KitSkillDetector,
-		kitPromptFragDetector:            opts.KitPromptFragmentDetector,
-		kitDetector:                      opts.KitDetector,
-		kitComposer:                      opts.KitComposer,
-		kitTargetOS:                      opts.KitTargetOS,
-		additionalExtensionDecorator:     opts.AdditionalExtensionDecorator,
-		capabilityRealizations:           opts.CapabilityRealizations,
-		capabilityParameterBinders:       opts.CapabilityParameterBinders,
-		preparedCapabilities:             preparedCapabilities,
-		protectedRuntimeMCPSelector:      selectionPolicy.v1,
-		protectedRuntimeMCPV2Selector:    selectionPolicy.v2,
-		selectionPolicy:                  selectionPolicy,
-		rescueDir:                        opts.RescueDir,
-		depsExecer:                       opts.DepsExecer,
-		depsInstallTimeout:               opts.DepsInstallTimeout,
-		turnContinuationLimit:            opts.TurnContinuationLimit,
-		turnContinuationCeiling:          opts.TurnContinuationCeiling,
-		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
-		quotaReporterForSession:          opts.QuotaReporterForSession,
-		quotaReporters:                   map[string]*QuotaReporter{},
-		interactiveUsage:                 map[string]*interactiveUsageTotals{},
-		shimSeat:                         opts.ShimSeat,
+		registry:                          opts.Registry,
+		wt:                                opts.WorktreeManager,
+		poster:                            opts.Poster,
+		credentialProvider:                opts.CredentialProvider,
+		executionSecurityReporterOverride: opts.ExecutionSecurityReporter,
+		envc:                              opts.EnvComposer,
+		mcpb:                              opts.MCPBuilder,
+		store:                             opts.StateStore,
+		promptBuilder:                     opts.PromptBuilder,
+		httpClient:                        opts.HTTPClient,
+		logger:                            opts.Logger,
+		now:                               opts.Now,
+		maxDuration:                       opts.MaxSessionDuration,
+		idleTimeout:                       opts.IdleTimeout,
+		providerStallTimeout:              opts.ProviderStallTimeout,
+		providerStallRetries:              opts.ProviderStallRetries,
+		preserveOnFail:                    opts.PreserveWorktreeOnFailure,
+		preserveAlways:                    opts.PreserveWorktreeAlways,
+		skipBackstop:                      opts.SkipBackstop,
+		skipSteering:                      opts.SkipSteering,
+		skipPostSession:                   opts.SkipPostSession,
+		hbInterval:                        opts.HeartbeatInterval,
+		statusBeaconInterval:              opts.StatusBeaconInterval,
+		stepHeartbeatInterval:             opts.StepHeartbeatInterval,
+		spanEmissionEnabled:               opts.SpanEmissionEnabled,
+		spanEndpointPath:                  opts.SpanEndpointPath,
+		kitSkillSources:                   opts.KitSkillSources,
+		kitSkillDetector:                  opts.KitSkillDetector,
+		kitPromptFragDetector:             opts.KitPromptFragmentDetector,
+		kitDetector:                       opts.KitDetector,
+		kitComposer:                       opts.KitComposer,
+		kitTargetOS:                       opts.KitTargetOS,
+		additionalExtensionDecorator:      opts.AdditionalExtensionDecorator,
+		capabilityRealizations:            opts.CapabilityRealizations,
+		capabilityParameterBinders:        opts.CapabilityParameterBinders,
+		preparedCapabilities:              preparedCapabilities,
+		protectedRuntimeMCPSelector:       selectionPolicy.v1,
+		protectedRuntimeMCPV2Selector:     selectionPolicy.v2,
+		selectionPolicy:                   selectionPolicy,
+		rescueDir:                         opts.RescueDir,
+		depsExecer:                        opts.DepsExecer,
+		depsInstallTimeout:                opts.DepsInstallTimeout,
+		turnContinuationLimit:             opts.TurnContinuationLimit,
+		turnContinuationCeiling:           opts.TurnContinuationCeiling,
+		turnContinuationUndeliveredLimit:  opts.TurnContinuationUndeliveredLimit,
+		quotaReporterForSession:           opts.QuotaReporterForSession,
+		quotaReporters:                    map[string]*QuotaReporter{},
+		interactiveUsage:                  map[string]*interactiveUsageTotals{},
+		shimSeat:                          opts.ShimSeat,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

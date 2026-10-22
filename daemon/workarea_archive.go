@@ -110,6 +110,10 @@ func archiveMetadataValidation(field, detail string, cause error) error {
 // archiveManifest is the on-disk shape of manifest.json. The wire shape
 // emitted to clients is afclient.WorkareaSummary / Workarea — this is the
 // internal carrier.
+//
+// SizeBytes and SourceSizeBytes are physical disk accounting sampled at
+// commit time. Allocated blocks may change after commit without any byte
+// changing, so integrity checks use TreeDigest and never compare them.
 type archiveManifest struct {
 	SchemaVersion string `json:"schemaVersion,omitempty"`
 	ID            string `json:"id"`
@@ -424,17 +428,22 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 	final := spec.WorkareaID
 	if _, err := archiveRoot.Lstat(final); err == nil {
 		existing, readErr := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
-		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID && existing.TerminalResultID == spec.TerminalResultID {
+		// A manifest with no terminal result binding was committed by a
+		// daemon that predates the field. A retry of that same release
+		// (same acquisition, workarea and session, re-verified bytes below)
+		// is idempotent; only a different non-empty binding collides.
+		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID && (existing.TerminalResultID == "" || existing.TerminalResultID == spec.TerminalResultID) {
 			archivedRoot, openErr := archiveRoot.OpenRoot(filepath.Join(spec.WorkareaID, "tree"))
 			if openErr != nil {
 				return nil, fmt.Errorf("archive root: open existing archive tree: %w", openErr)
 			}
+			// The tree digest is the committed identity; physical allocation
+			// is accounting that the filesystem may revise after commit.
 			digest, digestErr := archiveTreeDigestRoot(archivedRoot)
-			physical, physicalErr := workarea.PhysicalUsageRoot(archivedRoot)
 			if existing.SchemaVersion == workareaArchiveLegacyFlatV1 && spec.AcquisitionID == "" && existing.SelectedLeaf == "" {
 				info, treeErr := archivedRoot.Stat(".")
 				_ = archivedRoot.Close()
-				if treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes {
+				if treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digest == existing.TreeDigest {
 					return r.committedArchiveReference(spec, existing)
 				}
 			} else {
@@ -444,7 +453,7 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 					validErr = workarea.ValidateDeclaredRootHandle(archivedRoot, archivedDeclaration)
 				}
 				_ = archivedRoot.Close()
-				if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && validErr == nil && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
+				if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && validErr == nil && digestErr == nil && digest == existing.TreeDigest && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
 					if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, digest); err != nil {
 						return nil, fmt.Errorf("archive root: bind existing immutable archive: %w", err)
 					}
@@ -611,11 +620,14 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 // identity and digest reproduce the same reference. A conflicting
 // identity/digest for the caller's terminal result is refused.
 //
-// Mixed-version safety: commits that predate the reference contract, or that
-// carry no terminal result binding, yield (nil, nil) so the legacy commit
-// path is byte-identical to before. Only a spec that disagrees with committed
-// bytes, or a committed manifest that cannot form a valid reference while a
-// terminal result is bound, fails.
+// Mixed-version safety: commits that predate the reference contract, or where
+// neither the manifest nor the caller carries a terminal result binding,
+// yield (nil, nil) so the legacy commit path is byte-identical to before. A
+// manifest that predates the terminal result field takes the caller's
+// binding, so a retried release over an older daemon's commit still records
+// its reference. Only a spec that disagrees with committed bytes, or a
+// committed manifest that cannot form a valid reference while a terminal
+// result is bound, fails.
 func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArchiveSpec, existing *archiveManifest) (*workarea.TerminalArchiveReference, error) {
 	if existing == nil || existing.TreeDigest == "" || existing.WorkareaID == "" || existing.SessionID == "" {
 		return nil, fmt.Errorf("archive root: committed archive identity is incomplete: %w", ErrArchiveCorrupted)
@@ -666,40 +678,18 @@ func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArc
 
 // readCommittedArchiveReference independently re-reads the committed manifest
 // and tree before emitting the recovery reference. The digest always names
-// the committed bytes on disk, never a future or predicted archive.
+// the committed bytes on disk, never a future or predicted archive. A commit
+// without a terminal result binding is validated the same way; it yields no
+// versioned reference so legacy commits stay silent.
+//
+// The tree digest is the integrity measure: it covers every entry's path,
+// mode, logical size, content hash and link target, so a truncated, extended
+// or rewritten archive is refused. The manifest's SizeBytes is physical disk
+// accounting sampled at commit time, not identity. Allocated blocks are not
+// stable after the bytes are written (delayed allocation, speculative
+// preallocation and its later trimming, copy-on-write and compressing
+// filesystems), so the re-read never compares them.
 func (r *WorkareaArchiveRegistry) readCommittedArchiveReference(archiveRoot *os.Root, spec WorkareaRootArchiveSpec) (*workarea.TerminalArchiveReference, error) {
-	if spec.TerminalResultID == "" {
-		// A commit without a terminal result binding still validates the
-		// committed bytes; it yields no versioned reference so legacy
-		// commits stay silent.
-		manifest, err := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
-		if err != nil {
-			return nil, err
-		}
-		if manifest.SchemaVersion != workareaArchiveSchemaV1 && manifest.SchemaVersion != workareaArchiveLegacyFlatV1 {
-			return nil, fmt.Errorf("archive root: committed archive schema is unknown: %w", ErrArchiveCorrupted)
-		}
-		if manifest.ID != spec.WorkareaID || manifest.WorkareaID != spec.WorkareaID || manifest.SessionID != spec.SessionID || manifest.TreeDigest == "" {
-			return nil, fmt.Errorf("archive root: committed archive identity conflict: %w", ErrArchiveCorrupted)
-		}
-		archivedRoot, err := archiveRoot.OpenRoot(filepath.Join(spec.WorkareaID, "tree"))
-		if err != nil {
-			return nil, fmt.Errorf("archive root: open committed archive tree: %w", err)
-		}
-		digest, err := archiveTreeDigestRoot(archivedRoot)
-		physical, physicalErr := workarea.PhysicalUsageRoot(archivedRoot)
-		_ = archivedRoot.Close()
-		if err != nil {
-			return nil, fmt.Errorf("archive root: digest committed archive tree: %w", err)
-		}
-		if digest != manifest.TreeDigest {
-			return nil, fmt.Errorf("archive root: committed archive digest mismatch: %w", ErrArchiveCorrupted)
-		}
-		if physicalErr != nil || physical != manifest.SizeBytes {
-			return nil, fmt.Errorf("archive root: committed archive size mismatch: %w", ErrArchiveCorrupted)
-		}
-		return r.committedArchiveReference(spec, manifest)
-	}
 	manifest, err := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
 	if err != nil {
 		return nil, err
@@ -715,16 +705,12 @@ func (r *WorkareaArchiveRegistry) readCommittedArchiveReference(archiveRoot *os.
 		return nil, fmt.Errorf("archive root: open committed archive tree: %w", err)
 	}
 	digest, err := archiveTreeDigestRoot(archivedRoot)
-	physical, physicalErr := workarea.PhysicalUsageRoot(archivedRoot)
 	_ = archivedRoot.Close()
 	if err != nil {
 		return nil, fmt.Errorf("archive root: digest committed archive tree: %w", err)
 	}
 	if digest != manifest.TreeDigest {
 		return nil, fmt.Errorf("archive root: committed archive digest mismatch: %w", ErrArchiveCorrupted)
-	}
-	if physicalErr != nil || physical != manifest.SizeBytes {
-		return nil, fmt.Errorf("archive root: committed archive size mismatch: %w", ErrArchiveCorrupted)
 	}
 	return r.committedArchiveReference(spec, manifest)
 }
@@ -1649,10 +1635,9 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 		return nil, fmt.Errorf("restore: open archive tree: %w", ErrArchiveCorrupted)
 	}
 	defer func() { _ = archiveHandle.Close() }()
-	physical, err := workarea.PhysicalUsageRoot(archiveHandle)
-	if err != nil || physical != manifest.SizeBytes {
-		return nil, fmt.Errorf("restore: archive physical accounting mismatch: %w", ErrArchiveCorrupted)
-	}
+	// Integrity is proved by the durable acquisition digest binding below and
+	// the digest of the copied tree, not by physical allocation, which the
+	// filesystem may revise after commit without changing a byte.
 	record, err := acquisitions.RecordForAcquisitionID(manifest.AcquisitionID)
 	if err != nil {
 		return nil, fmt.Errorf("restore: read acquisition authority: %w", err)

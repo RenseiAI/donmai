@@ -384,10 +384,10 @@ Linear issue-tracker operations (mirrors the legacy `pnpm af-linear` scripts).
 All subcommands output JSON.
 
 ```bash
-donmai linear get-issue <id>
+donmai linear get-issue <id> [--fields identifier,title,status]
 donmai linear create-issue --title "..." --team "..." [--assignee "<id|name|email|me>"] [--priority 2]
 donmai linear update-issue <id> [--project "<name|slug|uuid>"] [--status "..."] [--assignee "<id|name|email|me|null>"]
-donmai linear list-issues [--project "..."] [--status "..."]
+donmai linear list-issues [--project "..."] [--status "..."] [--fields id,title,status] [--full] [--limit 50]
 donmai linear create-comment <issue-id> --body "..."
 donmai linear list-comments <issue-id>
 donmai linear add-relation <issue-id> <related-id> --type <related|blocks|duplicate|similar>
@@ -406,8 +406,23 @@ The two backlog grooming helpers default to top-level `Icebox` issues. Pass
 `--statuses Backlog` to select the project's prioritized Backlog state; their
 default `--parents-only` filter excludes sub-issues.
 
-`get-issue` always includes `parentId` and `parentIdentifier`. Both are JSON
-strings for a child issue and explicit `null` values for a root issue.
+`get-issue` returns full detail and always includes `parentId` and
+`parentIdentifier`. Both are JSON strings for a child issue and explicit
+`null` values for a root issue. Pass `--fields a,b` to return only the
+fields you read.
+
+`list-issues` defaults to the slim row (`id`, `title`, `status`,
+`project`, `sortOrder`, `parent`, `labels`) at page size 50 — enough for
+a triage or dispatch pass in one call. Pass `--fields a,b` to opt into
+exactly the columns you read, or `--full` for every column; the output
+envelope echoes the effective `fields` set. List once and read from the
+rows: never loop `get-issue` once per id, since every call is its own
+API request.
+
+Rate-limited (429) and temporarily unavailable (503 with `Retry-After`)
+responses wait out the server-supplied delay with jitter and retry at
+most twice, then exit 75 with the upstream error preserved; 401 and 403
+are final and never retried.
 
 `create-issue` accepts `--assignee <user ID|name|email|me>` to assign the new
 issue in the same mutation, plus `--priority 0-4`. `update-issue` accepts the

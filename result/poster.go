@@ -289,6 +289,14 @@ type statusRequest struct {
 	// Additive; omitted when empty — old platforms ignore it.
 	ReviewVerdict string `json:"reviewVerdict,omitempty"`
 
+	// ContinuationOutcome classifies a completed continue-mode run that
+	// delivered no new pull request work: "no_op" when a passed turn left
+	// the continued pull request unchanged, "fixed_in_place" when a passed
+	// turn left the run's own delivered code on a pull request that was
+	// already a draft before the run started. Additive; omitted when
+	// empty — old platforms ignore it.
+	ContinuationOutcome string `json:"continuationOutcome,omitempty"`
+
 	// TerminalWorkareaLease is the immutable path-free descriptor proving the
 	// successful workarea is durably retained before this status can trigger
 	// downstream verification.
@@ -312,6 +320,12 @@ type statusRequest struct {
 	// stop, retries after a provider error), so the session's record shows how
 	// many were used. Additive; omitted when none was needed.
 	TurnContinuations *agent.TurnContinuations `json:"turnContinuations,omitempty"`
+
+	// PreparationSeconds is how long the session spent preparing before
+	// the agent started: workarea provisioning, dependency installs and
+	// prompt assembly, in whole seconds. Additive; omitted when the
+	// result recorded none — old platforms ignore it.
+	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
 
 	// BudgetBreach names the session budget cap the runner stopped the
 	// session at: the failure reason on a failed session, and on a completed
@@ -721,10 +735,12 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
+		ContinuationOutcome:      r.ContinuationOutcome,
 		TerminalWorkareaLease:    projection,
 		TerminalArchiveReference: archiveReference,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
+		PreparationSeconds: r.PreparationSeconds,
+		BudgetBreach:       r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
 		PostSessionWarnings: r.PostSessionWarnings,
 		UpstreamError:       agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
