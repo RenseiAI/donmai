@@ -70,7 +70,7 @@ var vtCandidateSHAs = map[string]string{
 var vtCandidateToolchain = map[string]string{
 	"go":  "go1.27.2",
 	"cgo": "CGO_ENABLED=1 for tests; release builds ship CGO_ENABLED=0 (see .goreleaser.yaml)",
-	"zig": "absent (no Zig toolchain in the dependency stack; required for any source-level upstream build)",
+	"zig": "minimum 0.15.2 at pin (build.zig.zon); measured macOS arm64: 0.15.2 links nothing (host-SDK drift), 0.17.0 cannot analyze the pin build scripts; no Zig toolchain in this repo's dependency stack",
 }
 
 // candidatePin reports the exact upstream pins this spike evaluated. It

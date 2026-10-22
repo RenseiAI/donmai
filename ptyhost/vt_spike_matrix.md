@@ -12,7 +12,7 @@ production dependency.
 
 | Role      | Revision                                   | Note                                   |
 |-----------|--------------------------------------------|----------------------------------------|
-| Candidate | `332b2aefc6e9c293c8adb6a140742649b7e42d3a` … see below | Upstream tag `v1.3.1` (release commit) |
+| Candidate | `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` | Upstream tag `v1.3.1` (release commit) |
 | Control   | `b16d026a9d2e`                             | Owned engine upstream (`x/vt` pseudo-version; `internal/terminalvt/UPSTREAM.json`, `go.mod`) |
 
 Candidate pin, full 40-hex commit (tags move; the hash does not):
@@ -22,15 +22,17 @@ Candidate pin, full 40-hex commit (tags move; the hash does not):
 ```
 
 Rerun rule: re-verify with `git rev-parse HEAD` in a checkout of that hash
-before trusting any number below. The constants `vtCandidateUpstream`,
+before trusting any number below (a `--branch v1.3.1 --depth 1` checkout
+resolves to exactly this commit). The constants `vtCandidateUpstream`,
 `vtCandidateSHAs`, and `vtCandidateToolchain` in `ptyhost/vt_candidate.go`
 record the same pins in code.
 
 Toolchain floor: Go `go1.27.2` (this repo); any source-level build of the
 upstream tree additionally requires the minimum Zig version in that tree's
-`build.zig.zon`, which is absent from PATH here and not in this repo's
-dependency stack. Release builds ship `CGO_ENABLED=0` (`.goreleaser.yaml`);
-tests run with `CGO_ENABLED=1`.
+`build.zig.zon` — `0.15.2` at the pin. Neither the pinned nor the current
+Zig toolchain can build the pin's `lib-vt` step on macOS arm64 (measured
+in the upstream build lane below). Release builds ship `CGO_ENABLED=0`
+(`.goreleaser.yaml`); tests run with `CGO_ENABLED=1`.
 
 License at pin: MIT (`LICENSE` file header in the upstream tree). No legal
 blocker found; the verdict is architectural, not legal.
@@ -94,7 +96,8 @@ fixture; the gate is the deterministic corpus above.
 
 Regression pin: `TestCandidateRegressionPin` goes RED on a deliberate
 adapter break (dropping the SGR bold bit: `FAIL` with 3 cell diffs) and
-GREEN on restore. Verified by revert → RED → restore → GREEN in-session.
+GREEN on restore. Verified by revert → RED → restore → GREEN in-session
+and re-verified on the current tree.
 
 Kitty keyboard fidelity lane (`TestCandidateKittyKeyboardFidelity`):
 push/set-or/set-not/pop/query round-trip measured on the candidate stack.
@@ -116,14 +119,48 @@ strips the Kitty keyboard query viewer-side; that behavior is unchanged.
 | Local daemon path (`Session.Spawn` construction) | Unchanged — the spike does not alter `Spawn`; the candidate is test-only and never constructed outside tests. |
 | Sandbox/in-box distribution, binary size, startup, CPU/memory | **Not measured** — no linkable candidate artifact exists at the pin (no screen model in the C ABI). Any future stateful candidate must report: static vs dynamic link, `CGO_ENABLED` impact on the `CGO_ENABLED=0` release builds, cross-builds (darwin arm64/amd64, linux arm64/amd64), sandbox/in-box delivery, binary-size delta, startup cost, steady-state CPU/memory vs control, shipped symbols, and signing/notarization consequences. |
 | Cross-builds | **Not attempted** — same reason. The Zig-toolchain requirement alone blocks the existing `CGO_ENABLED=0` release lane. |
-| C ABI / Cgo integration | Characterized from headers only: the pinned C ABI cannot host a snapshot authority (no screen model). A Cgo or static-link lane is premature until a stateful C entry point exists. |
+| C ABI / Cgo integration | Headers consumable (`cc -fsyntax-only` clean); link blocked (no artifact — see upstream build lane). The pinned C ABI cannot host a snapshot authority (no screen model). A Cgo or static-link lane is premature until a stateful C entry point exists. |
+| Upstream source build at pin (`zig build lib-vt`) | **Attempted, measured, failed on toolchain drift** — see lane below. No artifact, so binary size / startup / CPU / symbols / signing stay unmeasurable. |
 
 Unavailable lanes are reported, not passed — per the brief.
+
+## Upstream build lane (measured, macOS arm64)
+
+Checkout: `git clone --depth 1 --branch v1.3.1 <upstream>`;
+`git rev-parse HEAD` reads `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28`,
+matching the pin. Minimum Zig at the pin (`build.zig.zon`): `0.15.2`.
+
+- Pinned toolchain `0.15.2` (release tarball, checksum-verified):
+  `zig build lib-vt` fails while linking the build runner itself —
+  undefined `_fork`, `_free`, `_getenv`, `_waitpid`, and more. A minimal
+  `pub fn main() void {}` fails the same way (`_abort`, `_bzero`,
+  `__availability_version_check` from its own compiler-rt), so this is
+  toolchain/host-SDK drift, not a Ghostty source failure. Result: the
+  pinned toolchain links nothing on this host.
+- Current toolchain `0.17.0`: `zig build lib-vt` fails earlier, analyzing
+  the pin's build scripts — `src/build/Config.zig` uses
+  `std.process.EnvMap` and `@cImport`, both gone in `0.17.0`. Result: the
+  current toolchain cannot evaluate the pin's build at all.
+- Headers without a link: `cc -fsyntax-only -I include
+  example/c-vt-sgr/src/main.c` exits clean — the C surface is consumable,
+  only unbuildable here.
+- Export inventory (read from source, no link needed): the linkable root
+  `src/terminal/c/main.zig` re-exports only OSC, color, SGR, key, paste
+  (plus WASM allocator helpers). The stateful names — `Terminal`,
+  `Screen`, `PageList`, `Parser`, `Stream` — appear only in
+  `src/lib_vt.zig` for Zig-module consumers. Even a successful link would
+  yield no C-callable screen model.
+
+Consequence for the matrix: with no buildable artifact, the binary-size,
+startup, CPU/memory, symbol, signing, cross-build, and sandbox-delivery
+lanes remain unmeasurable from the pin — reported, not passed. A revisit
+needs a newer upstream revision whose C surface (or build scripts) meets a
+shippable toolchain before any of those lanes can turn green.
 
 ## Costs (measured where measurable)
 
 - Parity-harness code: ~1.5k lines test-only (`vt_candidate.go`,
-  `vt_candidate_parity_test.go`, `vt_spike_notes.go`), zero production
+  `vt_candidate_parity_test.go`), zero production
   lines changed. No new module dependencies (`go.mod` untouched).
 - Full `ptyhost` suite with `-race` on this host: green (quoted below).
 - Upstream integration cost if revisited: Zig toolchain vendoring +
