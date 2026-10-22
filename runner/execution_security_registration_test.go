@@ -67,6 +67,11 @@ func TestDecodeExecutionSecurityReportAcceptance(t *testing.T) {
 		`{"contractVersion":"execution-security-report/v1","decision":"accepted","unknown":true}`,
 		`{"contractVersion":"execution-security-report/v1","decision":"accepted"} trailing`,
 		`not json`,
+		// A newer-shape accepted envelope is not an acceptance this runner
+		// understands: deleting the acceptance version check turns this
+		// case green while letting a v2 accepted envelope authorize spawn.
+		`{"contractVersion":"execution-security-report/v2","decision":"accepted"}`,
+		`{"contractVersion":"execution-security-report/v2","decision":"refused","code":"report_below_stamp"}`,
 	} {
 		if _, err := decodeExecutionSecurityReportAcceptance([]byte(raw)); err == nil {
 			t.Fatalf("malformed acceptance accepted: %s", raw)
@@ -152,6 +157,16 @@ func TestHTTPExecutionSecurityReporterRoundTrip(t *testing.T) {
 	answer = `{"refreshed":true,"ok":true}`
 	if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), submission); err == nil {
 		t.Fatal("legacy double body accepted as an acceptance")
+	}
+
+	// A newer-shape accepted envelope is never an acceptance, even over
+	// 2xx: the runner only understands v1. Without the version check this
+	// stays green while a v2 accepted envelope authorizes the spawn.
+	answer = `{"contractVersion":"execution-security-report/v2","decision":"accepted"}`
+	if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), submission); err == nil {
+		t.Fatal("wrong-version accepted envelope accepted")
+	} else if !strings.Contains(err.Error(), "unsupported execution security report acceptance version") {
+		t.Fatalf("wrong-version err = %v, want the version refusal", err)
 	}
 }
 
