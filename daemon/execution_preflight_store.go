@@ -20,6 +20,10 @@ import (
 type FileExecutionPreflightStore struct {
 	dir      string
 	syncRoot func(*os.Root) error
+	// preOpenHook runs between Lstat and Open inside storedReceiptEquals.
+	// It is nil in production and lets tests swap the receipt name to a
+	// symlink (or a different inode) to pin the SameFile TOCTOU fence.
+	preOpenHook func()
 }
 
 // ExecutionPreflightReplayStore can recover the exact immutable receipt after
@@ -57,12 +61,21 @@ func (s *FileExecutionPreflightStore) reaffirmRoot(root *os.Root) error {
 }
 
 // Persist fsyncs the one immutable initial receipt for sessionID.
+//
+// Persist is idempotent for identical bytes: when the session already has a
+// receipt whose content is byte-identical to receipt, it reaffirms the
+// directory and returns nil, so a redelivered claim that compiles the same
+// receipt can be accepted again. A different receipt for the same session is
+// still refused, and that error wraps os.ErrExist.
 func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.RawMessage) error {
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return errors.New("execution preflight receipt directory is required")
 	}
 	if strings.TrimSpace(sessionID) == "" {
 		return errors.New("invalid execution preflight session id")
+	}
+	if len(receipt) == 0 || len(receipt) > executioncell.MaxPreflightRegistrationReceiptBytes {
+		return errors.New("execution preflight receipt size is invalid")
 	}
 	decoded, err := executioncell.DecodeHostAdaptationReceipt(receipt)
 	if err != nil {
@@ -106,9 +119,47 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 	// rename, cannot replace an existing receipt or follow a destination
 	// symlink. Both names are constrained by os.Root.
 	if err := root.Link(pendingName, finalName); err != nil {
+		if errors.Is(err, os.ErrExist) && storedReceiptEquals(root, finalName, receipt, s.preOpenHook) {
+			return s.reaffirmRoot(root)
+		}
 		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
 	}
 	return s.reaffirmRoot(root)
+}
+
+// storedReceiptEquals reports whether name is a regular file inside root whose
+// content is exactly want. A symlink, a non-regular file, a size mismatch, or
+// any read error reports false, so the caller keeps refusing. The open
+// descriptor is re-statted and required to be the same regular file the Lstat
+// observed, closing the Lstat-to-Open swap where the name is replaced with a
+// symlink (or a different inode) between the two calls. The preOpen hook runs
+// between Lstat and Open; it is nil in production and exists only so tests
+// can deterministically drive that swap window.
+func storedReceiptEquals(root *os.Root, name string, want []byte, preOpen func()) bool {
+	if len(want) == 0 || len(want) > executioncell.MaxPreflightRegistrationReceiptBytes {
+		return false
+	}
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(want)) {
+		return false
+	}
+	if preOpen != nil {
+		preOpen()
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = file.Close() }()
+	finfo, err := file.Stat()
+	if err != nil || !finfo.Mode().IsRegular() || finfo.Size() != int64(len(want)) || !os.SameFile(info, finfo) {
+		return false
+	}
+	got, err := io.ReadAll(io.LimitReader(file, int64(len(want))+1))
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(got, want)
 }
 
 func executionPreflightReceiptName(sessionID string) string {
