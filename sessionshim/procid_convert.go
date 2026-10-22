@@ -20,34 +20,48 @@ const nanoPerSec = 1_000_000_000
 // unit falls on the wrong side.
 const legacyTicksStartedAtThreshold = 1_000_000_000_000_000
 
-// linuxStartTimeSkewToleranceUnixNano bounds how far apart two Unix-nanosecond
-// start-time readings for the SAME Linux process may drift and still compare
-// equal. The kernel prints /proc/stat btime truncated to whole seconds and
-// recomputes it from the wall clock on every read, so a wall-clock step
-// (NTP/chrony step, manual date change, resume) that crosses a second boundary
-// moves every later conversion by the step even though the process never
-// restarted. The tolerance keeps a live shim verifiable across such steps.
-// It is an anti-reuse window: two DIFFERENT incarnations of one pid whose
-// start times fall inside it compare equal. Long-lived shims start far apart
-// in time, so the window only matters for pids recycled within two seconds.
-const linuxStartTimeSkewToleranceUnixNano = 2 * nanoPerSec
-
-// withinLinuxStartTimeTolerance reports whether two Unix-nanosecond start
-// times name the same instant modulo wall-clock skew: their absolute distance
-// is at most linuxStartTimeSkewToleranceUnixNano. Both inputs must already be
-// Unix nanoseconds (convert legacy ticks first); raw tick counts use exact
-// equality elsewhere because they never skew.
-func withinLinuxStartTimeTolerance(a, b int64) bool {
-	if a > b {
-		return a-b <= linuxStartTimeSkewToleranceUnixNano
-	}
-	return b-a <= linuxStartTimeSkewToleranceUnixNano
-}
-
 // isLegacyTicksStartedAt reports whether a stored ProcessStartedAt uses the
 // pre-conversion Linux unit (clock ticks since boot) rather than Unix
 // nanoseconds. Only Linux readers ever stored ticks; other platforms were
 // always nanoseconds, so only the Linux comparison path consults this.
+func isLegacyTicksValue(v int64) bool { return v < legacyTicksStartedAtThreshold }
+
+// linuxProcessIdentityEqual reports whether two Linux identities name the
+// same process incarnation, without touching the wall clock. Complete
+// identities (raw ticks plus boot ID) compare exactly; legacy
+// tick-magnitude records compare ticks exactly as the pre-conversion code
+// did. Nanosecond values without the key cannot be verified drift-free and
+// never match here. It is pure and platform-independent so the decision is
+// unit-testable everywhere; the Linux comparison path calls it, and other
+// platforms keep exact Unix-nanosecond equality.
+func linuxProcessIdentityEqual(a, b ProcessIdentity) (bool, error) {
+	aHasKey := a.StartTicks > 0 && a.BootID != ""
+	bHasKey := b.StartTicks > 0 && b.BootID != ""
+	if aHasKey && bHasKey {
+		return a.StartTicks == b.StartTicks && a.BootID == b.BootID, nil
+	}
+	if aHasKey && !bHasKey {
+		if isLegacyTicksValue(b.StartedAt) {
+			return a.StartTicks == b.StartedAt, nil
+		}
+		return false, fmt.Errorf("sessionshim: Linux process identity is missing the drift-free key")
+	}
+	if bHasKey && !aHasKey {
+		if isLegacyTicksValue(a.StartedAt) {
+			return b.StartTicks == a.StartedAt, nil
+		}
+		return false, fmt.Errorf("sessionshim: Linux process identity is missing the drift-free key")
+	}
+	if !aHasKey && !bHasKey {
+		// Both sides predate the key (two legacy records, or two fabricated
+		// test identities): fall back to exact start-time equality so old
+		// records and existing tests keep working. Production Linux
+		// identities always carry the key; mixed key/no-key comparisons
+		// above stay fail-closed.
+		return a.StartedAt == b.StartedAt, nil
+	}
+	return false, fmt.Errorf("sessionshim: Linux process identity is missing the drift-free key")
+}
 
 // parseProcPIDStatStartTicks extracts field 22 (starttime) from the raw bytes
 // of /proc/<pid>/stat: the process start time in clock ticks since boot.

@@ -84,12 +84,14 @@ func TestProcessIdentityAliveAdoptsLegacyTicksRecord(t *testing.T) {
 	}
 }
 
-// TestProcessIdentityAliveToleratesBootClockStep drives Alive with a btime
-// seam moved by one second: the stored identity is pinned with the real boot,
-// then the boot reader steps forward as a wall-clock step would. The same live
-// process must still verify; without the tolerance window the stepped reading
-// compares unequal and the live shim reads dead.
-func TestProcessIdentityAliveToleratesBootClockStep(t *testing.T) {
+// TestProcessIdentityAliveIgnoresWallClockStep drives Alive with the boot
+// wall-clock stepped by an hour: the stored identity is pinned with the real
+// boot, then the boot reader steps forward as a large wall-clock step
+// (NTP/chrony step, manual date change, resume) would. The same live process
+// must still verify, because equality uses raw ticks plus the boot ID and
+// never consults btime. Stepping only one second would also pass but would
+// not prove the wall clock dropped out.
+func TestProcessIdentityAliveIgnoresWallClockStep(t *testing.T) {
 	child := exec.Command("sleep", "60")
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
@@ -103,15 +105,51 @@ func TestProcessIdentityAliveToleratesBootClockStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessIdentityFor(%d): %v", pid, err)
 	}
+	if pinned.StartTicks <= 0 || pinned.BootID == "" {
+		t.Fatalf("pinned identity is missing the drift-free key: %+v", pinned)
+	}
 	boot, err := readLinuxBootTimeUnixNano()
 	if err != nil {
 		t.Fatalf("readLinuxBootTimeUnixNano: %v", err)
 	}
 	prev := linuxBootTimeReader
-	linuxBootTimeReader = func() (int64, error) { return boot + 1e9, nil }
+	linuxBootTimeReader = func() (int64, error) { return boot + 3600*1e9, nil }
 	t.Cleanup(func() { linuxBootTimeReader = prev })
 	if alive, err := pinned.Alive(); err != nil || !alive {
-		t.Fatalf("stepped-boot identity reported alive=%t err=%v; a 1s wall-clock step must not read a live shim dead", alive, err)
+		t.Fatalf("stepped-boot identity reported alive=%t err=%v; an hour wall-clock step must not read a live shim dead", alive, err)
+	}
+}
+
+// TestProcessIdentityAliveRejectsReusedPID drives Alive with the drift-free
+// key mutated: the same pid with a different tick count or a different boot
+// ID is a different incarnation and must report gone (no error), proving the
+// anti-reuse contract without any wall-clock tolerance window.
+func TestProcessIdentityAliveRejectsReusedPID(t *testing.T) {
+	child := exec.Command("sleep", "60")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	})
+	pid := child.Process.Pid
+	pinned, err := ProcessIdentityFor(pid)
+	if err != nil {
+		t.Fatalf("ProcessIdentityFor(%d): %v", pid, err)
+	}
+	if pinned.StartTicks <= 0 || pinned.BootID == "" {
+		t.Fatalf("pinned identity is missing the drift-free key: %+v", pinned)
+	}
+	reusedTicks := pinned
+	reusedTicks.StartTicks++
+	if alive, err := reusedTicks.Alive(); err != nil || alive {
+		t.Fatalf("reused ticks reported alive=%t err=%v; a different tick count is a different process", alive, err)
+	}
+	reusedBoot := pinned
+	reusedBoot.BootID = pinned.BootID + "-other"
+	if alive, err := reusedBoot.Alive(); err != nil || alive {
+		t.Fatalf("reused boot reported alive=%t err=%v; a different boot ID is a different boot", alive, err)
 	}
 }
 

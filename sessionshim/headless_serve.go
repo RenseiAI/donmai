@@ -153,7 +153,7 @@ func StartHeadless(opts HeadlessOptions) (*Shim, error) {
 		_ = os.Remove(socketPath)
 		return nil, fmt.Errorf("sessionshim: headless runner pid %d is not positive", pid)
 	}
-	runnerStart, startErr := processStartTime(pid)
+	runnerID, startErr := ProcessIdentityFor(pid)
 	if startErr != nil {
 		// The runner is supervised but its identity cannot be pinned, and
 		// the record, Hello and tombstone carry that identity as their
@@ -168,7 +168,7 @@ func StartHeadless(opts HeadlessOptions) (*Shim, error) {
 	s := core.finishHeadless(
 		opts.Runner,
 		ln,
-		ProcessIdentity{PID: pid, StartedAt: runnerStart},
+		runnerID,
 		headlessOutbox{key: opts.OutboxKey, state: opts.OutboxState},
 	)
 

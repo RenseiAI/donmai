@@ -22,6 +22,13 @@ var ErrProcessIdentity = errors.New("sessionshim: process identity mismatch")
 type ProcessIdentity struct {
 	PID       int
 	StartedAt int64 // Unix nanoseconds, OS-reported
+	// StartTicks and BootID carry the Linux drift-free identity beside
+	// StartedAt: raw field-22 ticks-since-boot plus the boot ID from
+	// /proc/sys/kernel/random/boot_id. They are empty on platforms without
+	// them and on records that predate them; the Linux comparison prefers
+	// them and ignores wall-clock skew entirely.
+	StartTicks int64  `json:",omitempty"`
+	BootID     string `json:",omitempty"`
 }
 
 // Self returns the running process's own identity.
@@ -48,7 +55,13 @@ func ProcessIdentityFor(pid int) (ProcessIdentity, error) {
 	if err != nil {
 		return ProcessIdentity{}, fmt.Errorf("sessionshim: process identity for pid %d: %w", pid, err)
 	}
-	return ProcessIdentity{PID: pid, StartedAt: started}, nil
+	id := ProcessIdentity{PID: pid, StartedAt: started}
+	ticks, bootID, extraErr := processIdentityExtra(pid)
+	if extraErr != nil {
+		return ProcessIdentity{}, fmt.Errorf("sessionshim: process identity for pid %d: %w", pid, extraErr)
+	}
+	id.StartTicks, id.BootID = ticks, bootID
+	return id, nil
 }
 
 // Alive reports whether the process named by p is still running AND is still the
@@ -61,28 +74,23 @@ func (p ProcessIdentity) Alive() (bool, error) {
 	if p.PID <= 0 {
 		return false, fmt.Errorf("%w: non-positive pid %d", ErrProcessIdentity, p.PID)
 	}
-	started, err := processStartTime(p.PID)
+	live, err := ProcessIdentityFor(p.PID)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 			return false, nil // gone: not an error, just not alive
 		}
 		return false, err
 	}
-	// A record written before the Linux start-time conversion stores raw
-	// /proc ticks; the live reading is Unix nanoseconds. Comparing them raw
-	// would report every pre-conversion shim dead. Coercing through the
-	// current boot keeps same-boot equality exact (both sides scale the same
-	// ticks by the same boot) while a genuinely dead pid still mismatches.
-	// A stored value that cannot convert is an error — quarantine, not stale.
-	// On Linux the Unix-nanosecond comparison tolerates wall-clock skew
-	// between the boot reading at record write and the boot reading now
-	// (btime is re-read from /proc/stat and steps with the wall clock);
-	// raw ticks still compare exactly because they never skew.
-	expected, coerceErr := canonicalRecordStartTime(p.StartedAt)
-	if coerceErr != nil {
-		return false, coerceErr
+	// Fail-closed validation for stored values that cannot name a process
+	// (Linux: a tick-magnitude value that overflows Unix nanoseconds, or a
+	// nanosecond value without the drift-free key). A stored value that
+	// cannot convert is an error — quarantine, not stale.
+	if err := validateStoredProcessIdentity(p); err != nil {
+		return false, err
 	}
-	if !processStartTimeEqual(started, expected) {
+	if equal, err := processIdentityMatches(live, p); err != nil {
+		return false, err
+	} else if !equal {
 		// The pid is live but it is a DIFFERENT process. Reporting "not alive"
 		// is the safe answer: the recorded process is gone.
 		return false, nil
@@ -92,7 +100,14 @@ func (p ProcessIdentity) Alive() (bool, error) {
 
 // Matches reports whether other names the same process incarnation.
 func (p ProcessIdentity) Matches(other ProcessIdentity) bool {
-	return p.PID == other.PID && p.PID > 0 && processStartTimeEqual(p.StartedAt, other.StartedAt)
+	if p.PID != other.PID || p.PID <= 0 {
+		return false
+	}
+	equal, err := processIdentityMatches(p, other)
+	if err != nil {
+		return false
+	}
+	return equal
 }
 
 // String renders the identity for diagnostics.

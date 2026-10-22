@@ -462,7 +462,7 @@ func Start(opts Options) (*Shim, error) {
 	}
 
 	harnessPID := sess.PID()
-	harnessStart, startErr := processStartTime(harnessPID)
+	harnessID, startErr := ProcessIdentityFor(harnessPID)
 	if startErr != nil {
 		// The harness is running but we cannot pin its identity. Continuing would
 		// leave a tombstone that cannot distinguish "reaped" from "pid reused",
@@ -478,7 +478,7 @@ func Start(opts Options) (*Shim, error) {
 	s := core.finishInteractive(
 		sess,
 		ln,
-		ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
+		harnessID,
 	)
 
 	flow.bind(s)
@@ -1167,6 +1167,8 @@ func (s *Shim) publishRecordWithDeadlineLocked(deadline time.Time) error {
 		ProcessEpoch:      s.epoch,
 		PID:               s.self.PID,
 		ProcessStartedAt:  s.self.StartedAt,
+		ProcessStartTicks: s.self.StartTicks,
+		BootID:            s.self.BootID,
 		SocketPath:        s.socketPath,
 		SocketDevice:      s.socketDev,
 		SocketInode:       s.socketIno,
@@ -1451,22 +1453,26 @@ func (s *Shim) buildHeadlessHello() shimwire.Hello {
 	gen, phase := s.gen, s.phase
 	s.mu.Unlock()
 	return shimwire.Hello{
-		Protocol:         shimwire.ProtocolName,
-		Min:              s.protocolMin,
-		Max:              s.protocolMax,
-		OrgID:            s.id.OrgID,
-		SessionID:        s.id.SessionID,
-		ShimID:           s.shimID,
-		ProcessEpoch:     s.epoch,
-		PID:              s.self.PID,
-		ProcessStartedAt: s.self.StartedAt,
-		HarnessPID:       s.harness.PID,
-		HarnessStartedAt: s.harness.StartedAt,
-		WorkareaPath:     s.workarea,
-		Phase:            phase,
-		Generation:       gen,
-		FirstSeq:         0,
-		LastSeq:          0,
+		Protocol:          shimwire.ProtocolName,
+		Min:               s.protocolMin,
+		Max:               s.protocolMax,
+		OrgID:             s.id.OrgID,
+		SessionID:         s.id.SessionID,
+		ShimID:            s.shimID,
+		ProcessEpoch:      s.epoch,
+		PID:               s.self.PID,
+		ProcessStartedAt:  s.self.StartedAt,
+		ProcessStartTicks: s.self.StartTicks,
+		ProcessBootID:     s.self.BootID,
+		HarnessPID:        s.harness.PID,
+		HarnessStartedAt:  s.harness.StartedAt,
+		HarnessStartTicks: s.harness.StartTicks,
+		HarnessBootID:     s.harness.BootID,
+		WorkareaPath:      s.workarea,
+		Phase:             phase,
+		Generation:        gen,
+		FirstSeq:          0,
+		LastSeq:           0,
 		// The codec writes the workload into the optional extension map
 		// (shimwire.EncodeHello), and refuses it on a range that includes a
 		// version below 6, so the advertisement and the range cannot drift.
@@ -1638,23 +1644,27 @@ func (s *Shim) buildHello() (shimwire.Hello, error) {
 		continuation = &shimwire.CheckpointCapability{Schema: attachwire.ContinuationSchema, HostEpoch: screen.Epoch}
 	}
 	return shimwire.Hello{
-		Continuation:     continuation,
-		Protocol:         shimwire.ProtocolName,
-		Min:              s.protocolMin,
-		Max:              s.protocolMax,
-		OrgID:            s.id.OrgID,
-		SessionID:        s.id.SessionID,
-		ShimID:           s.shimID,
-		ProcessEpoch:     s.epoch,
-		PID:              s.self.PID,
-		ProcessStartedAt: s.self.StartedAt,
-		HarnessPID:       s.harness.PID,
-		HarnessStartedAt: s.harness.StartedAt,
-		WorkareaPath:     s.workarea,
-		Phase:            phase,
-		Generation:       gen,
-		FirstSeq:         uint64(s.sess.FirstBufferedSeq()),
-		LastSeq:          uint64(lastSeq),
+		Continuation:      continuation,
+		Protocol:          shimwire.ProtocolName,
+		Min:               s.protocolMin,
+		Max:               s.protocolMax,
+		OrgID:             s.id.OrgID,
+		SessionID:         s.id.SessionID,
+		ShimID:            s.shimID,
+		ProcessEpoch:      s.epoch,
+		PID:               s.self.PID,
+		ProcessStartedAt:  s.self.StartedAt,
+		ProcessStartTicks: s.self.StartTicks,
+		ProcessBootID:     s.self.BootID,
+		HarnessPID:        s.harness.PID,
+		HarnessStartedAt:  s.harness.StartedAt,
+		HarnessStartTicks: s.harness.StartTicks,
+		HarnessBootID:     s.harness.BootID,
+		WorkareaPath:      s.workarea,
+		Phase:             phase,
+		Generation:        gen,
+		FirstSeq:          uint64(s.sess.FirstBufferedSeq()),
+		LastSeq:           uint64(lastSeq),
 	}, nil
 }
 

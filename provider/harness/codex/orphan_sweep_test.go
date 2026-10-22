@@ -472,7 +472,15 @@ func TestSweepOrphans_NeverTerminatesOnPIDReuseEvenWhenBinaryNameMatches(t *test
 	unrelated := spawnSweepFixtureProcessNamed(t, "codex", "30")
 	actual := mustProcessIdentity(t, unrelated.Process.Pid)
 	stale := actual
-	stale.StartedAt++ // a plausible-looking but WRONG start time: PID reuse, from the manifest's point of view.
+	// A reused pid is a different incarnation: mutate the drift-free key
+	// when the platform carries one, else the start time. On Linux mutating
+	// only StartedAt would leave ticks plus boot ID identical and must still
+	// verify — the wall clock is not part of the identity.
+	if stale.StartTicks > 0 && stale.BootID != "" {
+		stale.StartTicks++
+	} else {
+		stale.StartedAt++
+	}
 	persistDonmaiOwnerManifest(dir, donmaiOwnerManifest{
 		OwnerPID:      fakeDeadPID(t),
 		ChildIdentity: stale,

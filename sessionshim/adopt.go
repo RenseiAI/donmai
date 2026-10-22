@@ -413,7 +413,7 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 			continue
 		}
 
-		alive, aliveErr := ProcessIdentity{PID: rec.PID, StartedAt: rec.ProcessStartedAt}.Alive()
+		alive, aliveErr := ProcessIdentity{PID: rec.PID, StartedAt: rec.ProcessStartedAt, StartTicks: rec.ProcessStartTicks, BootID: rec.BootID}.Alive()
 		if aliveErr != nil {
 			result.Quarantined = append(result.Quarantined,
 				NewQuarantinedSession(rec, QuarantineIdentityMismatch,

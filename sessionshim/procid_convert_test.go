@@ -264,29 +264,44 @@ func TestCoerceLegacyTicksStartedAtErrors(t *testing.T) {
 	}
 }
 
-// TestWithinLinuxStartTimeTolerance pins the wall-clock skew window: readings
-// for the same process a second apart compare equal, while incarnations more
-// than the tolerance apart do not. It drives the pure decision behind
-// ProcessIdentity.Alive and the handshake on Linux, on every platform.
-func TestWithinLinuxStartTimeTolerance(t *testing.T) {
+// TestLinuxProcessIdentityEqual pins the wall-clock-independent equality:
+// identities with the same ticks and boot ID match even when their
+// Unix-nanosecond StartedAt differs by hours, while a different tick count
+// or a different boot ID never matches. It drives the pure Linux decision
+// behind ProcessIdentity.Alive and the handshake, on every platform,
+// without touching the wall clock. ProcessIdentity.Matches on darwin keeps
+// exact StartedAt equality, so this test drives the shared helper directly.
+func TestLinuxProcessIdentityEqual(t *testing.T) {
 	t.Parallel()
-	const base = int64(1710000000) * 1e9
+	const bootA = "boot-aaa"
+	const bootB = "boot-bbb"
+	base := ProcessIdentity{PID: 4242, StartedAt: 1710000000 * 1e9, StartTicks: 12345, BootID: bootA}
 	for _, tc := range []struct {
-		name string
-		a, b int64
-		want bool
+		name    string
+		a, b    ProcessIdentity
+		want    bool
+		wantErr bool
 	}{
 		{name: "identical", a: base, b: base, want: true},
-		{name: "one second skew equal", a: base, b: base + 1e9, want: true},
-		{name: "tolerance boundary equal", a: base, b: base + linuxStartTimeSkewToleranceUnixNano, want: true},
-		{name: "beyond tolerance different", a: base, b: base + linuxStartTimeSkewToleranceUnixNano + 1, want: false},
-		{name: "negative skew equal", a: base + 1e9, b: base, want: true},
-		{name: "far reuse different", a: base, b: base + 3600*1e9, want: false},
+		{name: "same incarnation different wall clock", a: base, b: ProcessIdentity{PID: 4242, StartedAt: base.StartedAt + 3600*1e9, StartTicks: 12345, BootID: bootA}, want: true},
+		{name: "different ticks", a: base, b: ProcessIdentity{PID: 4242, StartedAt: base.StartedAt, StartTicks: 12346, BootID: bootA}, want: false},
+		{name: "different boot", a: base, b: ProcessIdentity{PID: 4242, StartedAt: base.StartedAt, StartTicks: 12345, BootID: bootB}, want: false},
+		{name: "legacy ticks identical", a: ProcessIdentity{PID: 42, StartedAt: 999}, b: ProcessIdentity{PID: 42, StartedAt: 999}, want: true},
+		{name: "legacy ticks different", a: ProcessIdentity{PID: 42, StartedAt: 999}, b: ProcessIdentity{PID: 42, StartedAt: 1000}, want: false},
+		{name: "complete versus legacy same ticks", a: base, b: ProcessIdentity{PID: 4242, StartedAt: 12345}, want: true},
+		{name: "complete versus legacy different ticks", a: base, b: ProcessIdentity{PID: 4242, StartedAt: 12346}, want: false},
+		{name: "nanoseconds without key error", a: base, b: ProcessIdentity{PID: 4242, StartedAt: 1710000000 * 1e9}, want: false, wantErr: true},
+		{name: "both without key nanoseconds identical", a: ProcessIdentity{PID: 42, StartedAt: 1710000000 * 1e9}, b: ProcessIdentity{PID: 42, StartedAt: 1710000000 * 1e9}, want: true},
+		{name: "both without key nanoseconds different", a: ProcessIdentity{PID: 42, StartedAt: 1710000000 * 1e9}, b: ProcessIdentity{PID: 42, StartedAt: 1710000000*1e9 + 1}, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := withinLinuxStartTimeTolerance(tc.a, tc.b); got != tc.want {
-				t.Fatalf("withinLinuxStartTimeTolerance(%d, %d) = %t, want %t", tc.a, tc.b, got, tc.want)
+			got, err := linuxProcessIdentityEqual(tc.a, tc.b)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("linuxProcessIdentityEqual(%+v, %+v) err=%v, wantErr=%t", tc.a, tc.b, err, tc.wantErr)
+			}
+			if err == nil && got != tc.want {
+				t.Fatalf("linuxProcessIdentityEqual(%+v, %+v) = %t, want %t", tc.a, tc.b, got, tc.want)
 			}
 		})
 	}

@@ -964,12 +964,13 @@ func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea, expectedWorkare
 	if h.ShimID != rec.ShimID {
 		return fmt.Errorf("%w: shim reports id %q, record says %q", ErrAdoptionRefused, h.ShimID, rec.ShimID)
 	}
-	if h.PID != rec.PID || !processStartTimeEqual(h.ProcessStartedAt, rec.ProcessStartedAt) {
+	helloID := ProcessIdentity{PID: h.PID, StartedAt: h.ProcessStartedAt, StartTicks: h.ProcessStartTicks, BootID: h.ProcessBootID}
+	recID := ProcessIdentity{PID: rec.PID, StartedAt: rec.ProcessStartedAt, StartTicks: rec.ProcessStartTicks, BootID: rec.BootID}
+	if h.PID != rec.PID || !helloID.Matches(recID) {
 		// The live peer is a DIFFERENT process than the record describes — the
 		// PID-reuse case §D2 requires be caught rather than trusted. On Linux
-		// the nanosecond comparison tolerates wall-clock skew between the
-		// boot reading at record write and the boot reading at handshake;
-		// raw ticks still compare exactly because they never skew.
+		// the comparison uses raw ticks plus the boot ID, so wall-clock steps
+		// that move btime cannot alias or split an incarnation.
 		return fmt.Errorf("%w: shim process identity pid=%d start=%d does not match record pid=%d start=%d",
 			ErrAdoptionRefused, h.PID, h.ProcessStartedAt, rec.PID, rec.ProcessStartedAt)
 	}
@@ -1090,7 +1091,7 @@ func (c *Controller) HarnessSurvived() bool {
 // reports it. Comparing this across a daemon restart is what distinguishes "the
 // session survived" from "a new process took over the same session id".
 func (c *Controller) HarnessIdentity() ProcessIdentity {
-	return ProcessIdentity{PID: c.hello.HarnessPID, StartedAt: c.hello.HarnessStartedAt}
+	return ProcessIdentity{PID: c.hello.HarnessPID, StartedAt: c.hello.HarnessStartedAt, StartTicks: c.hello.HarnessStartTicks, BootID: c.hello.HarnessBootID}
 }
 
 // Events is the stream of everything the shim reports. Closed when the

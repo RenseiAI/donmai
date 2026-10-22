@@ -267,7 +267,7 @@ func (d *Daemon) armSessionShimAcceptanceQuarantine(id sessionshim.Identity) err
 	if candidate == nil {
 		return errors.New("no unexpected shim correlation")
 	}
-	alive, err := (sessionshim.ProcessIdentity{PID: candidate.PID, StartedAt: candidate.ProcessStartedAt}).Alive()
+	alive, err := (sessionshim.ProcessIdentity{PID: candidate.PID, StartedAt: candidate.ProcessStartedAt, StartTicks: candidate.ProcessStartTicks, BootID: candidate.BootID}).Alive()
 	if err != nil || !alive {
 		return errors.New("unexpected shim process is not live")
 	}
@@ -282,7 +282,7 @@ func (d *Daemon) armSessionShimAcceptanceQuarantine(id sessionshim.Identity) err
 		return nil
 	}
 	d.upsertShimQuarantineLocked(q)
-	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{PID: candidate.PID, StartedAt: candidate.ProcessStartedAt}
+	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{PID: candidate.PID, StartedAt: candidate.ProcessStartedAt, StartTicks: candidate.ProcessStartTicks, BootID: candidate.BootID}
 	d.shims.mu.Unlock()
 	// Simulating a quarantine means simulating all of it. A real quarantine is
 	// durably published; one that is not leaves the host arguing with the
