@@ -1040,3 +1040,198 @@ func TestSpawner_SessionTmp_ShimFinishRemovesDir(t *testing.T) {
 		t.Fatalf("shim record entry survives shim finish: %+v", record.Entries)
 	}
 }
+
+// TestSpawner_SessionTmp_UnreadableMarkerRefusesSecondPrepare pins
+// fail-closed on a marker read error: a second session stamped with a live
+// adopted session's path is refused when the ownership marker is present
+// but unreadable, instead of taking over the directory. The restart is
+// simulated by a fresh spawner sharing the record directory but holding
+// no in-memory claim, so the cleaned-string scan cannot see the live
+// session — only the marker read stands between the second launch and the
+// live seat's files. Driven through prepareSessionTmpDir, the production
+// launch gate, on the exact path (the scan-blind shape is the missing
+// in-memory claim, not the spelling).
+//
+// RED: treat an unreadable marker as "no owner" and the second prepare
+// succeeds, overwriting the live session's marker.
+func TestSpawner_SessionTmp_UnreadableMarkerRefusesSecondPrepare(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads through file permission bits: the unreadable fixture cannot fail")
+	}
+	recordDir := t.TempDir()
+	s1 := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	dir := fmt.Sprintf("/tmp/unreadable-marker-refused-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	claimA, err := s1.prepareSessionTmpDir(seatTmpSpec("seat-unreadable-live", dir))
+	if err != nil {
+		t.Fatalf("prepare live: %v", err)
+	}
+	sentinel := filepath.Join(dir, "a-live.txt")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, sessionTmpOwnerFile)
+	if err := os.Chmod(marker, 0o200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(marker); err == nil {
+		_ = os.Chmod(marker, 0o600)
+		t.Skip("ownership marker still readable after chmod 0200: cannot prove the read-error leg")
+	}
+	// A fresh spawner holds no in-memory claim, as an adopted live
+	// session would after a restart.
+	s2 := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	if _, err := s2.prepareSessionTmpDir(seatTmpSpec("seat-unreadable-second", dir)); err == nil {
+		_ = os.Chmod(marker, 0o600)
+		t.Fatal("second prepare with an unreadable ownership marker accepted; it must fail closed")
+	} else if !strings.Contains(err.Error(), "seat-unreadable-second") || !strings.Contains(err.Error(), dir) {
+		_ = os.Chmod(marker, 0o600)
+		t.Fatalf("unreadable-marker refusal = %v, want an error naming the directory and the refused session", err)
+	}
+	if _, ok := s2.sessionTmpClaimFor("seat-unreadable-second"); ok {
+		_ = os.Chmod(marker, 0o600)
+		t.Fatal("refused prepare left a live claim behind")
+	}
+	if err := os.Chmod(marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live session's file disturbed by the refused prepare: %v %q", err, raw)
+	}
+	s1.cleanupSessionTmpClaim("seat-unreadable-live", claimA)
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("live directory survives its terminal cleanup: %v", err)
+	}
+}
+
+// TestSpawner_SessionTmp_CorruptMarkerRefusesSecondPrepare pins fail-closed
+// on a marker decode error: a marker that is present but does not decode
+// to a named session refuses the second launch, instead of being treated
+// as "no owner". Unlike the unreadable-marker cell, this leg fails
+// deterministically for every uid, including root. Driven through
+// prepareSessionTmpDir on a fresh spawner, as an adopted live session
+// would appear after a restart.
+//
+// RED: treat an undecodable marker as "no owner" and the second prepare
+// succeeds, overwriting the live session's marker.
+func TestSpawner_SessionTmp_CorruptMarkerRefusesSecondPrepare(t *testing.T) {
+	t.Parallel()
+	recordDir := t.TempDir()
+	s1 := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	dir := fmt.Sprintf("/tmp/corrupt-marker-refused-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	claimA, err := s1.prepareSessionTmpDir(seatTmpSpec("seat-corrupt-live", dir))
+	if err != nil {
+		t.Fatalf("prepare live: %v", err)
+	}
+	sentinel := filepath.Join(dir, "a-live.txt")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionTmpOwnerFile), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s2 := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	if _, err := s2.prepareSessionTmpDir(seatTmpSpec("seat-corrupt-second", dir)); err == nil {
+		t.Fatal("second prepare with a corrupt ownership marker accepted; it must fail closed")
+	} else if !strings.Contains(err.Error(), "seat-corrupt-second") || !strings.Contains(err.Error(), dir) {
+		t.Fatalf("corrupt-marker refusal = %v, want an error naming the directory and the refused session", err)
+	}
+	if _, ok := s2.sessionTmpClaimFor("seat-corrupt-second"); ok {
+		t.Fatal("refused prepare left a live claim behind")
+	}
+	if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live session's file disturbed by the refused prepare: %v %q", err, raw)
+	}
+	// Restore a valid marker so the live generation's terminal cleanup
+	// can prove ownership and remove the directory.
+	if err := writeSessionTmpOwner(dir, "seat-corrupt-live", claimA.Gen); err != nil {
+		t.Fatal(err)
+	}
+	s1.cleanupSessionTmpClaim("seat-corrupt-live", claimA)
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("live directory survives its terminal cleanup: %v", err)
+	}
+}
+
+// TestSpawner_SessionTmp_MissingMarkerStillRefusesExactPath pins the
+// cleaned-string live-claim scan: a live claim with its ownership marker
+// removed still refuses an exact-path second launch. The marker check
+// alone cannot catch this cell (there is no marker to read), so only the
+// scan stands between the second launch and the live seat's files.
+// Driven through AcceptWork — the production launch entry — with the
+// first seat kept live by a sleeping worker.
+//
+// RED: delete the live-claim scan and the second accept succeeds, taking
+// over the live session's directory.
+func TestSpawner_SessionTmp_MissingMarkerStillRefusesExactPath(t *testing.T) {
+	t.Parallel()
+	s, _, _ := seatTmpSpawner(t, "/bin/sh", "-c", "sleep 30")
+	ended := sessionEnds(s)
+	dir := fmt.Sprintf("/tmp/missing-marker-scan-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	if _, err := s.AcceptWork(seatTmpSpec("seat-scan-live", dir)); err != nil {
+		t.Fatalf("accept live: %v", err)
+	}
+	sentinel := filepath.Join(dir, "a-live.txt")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The session can delete dotfiles inside its own scratch directory;
+	// the scan is the only guard left once the marker is gone.
+	if err := os.Remove(filepath.Join(dir, sessionTmpOwnerFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptWork(seatTmpSpec("seat-scan-second", dir)); err == nil {
+		t.Fatal("second launch sharing a live session's path with no marker accepted; the scan must fail closed")
+	} else if !strings.Contains(err.Error(), "seat-scan-live") || !strings.Contains(err.Error(), "seat-scan-second") {
+		t.Fatalf("missing-marker refusal = %v, want an error naming both sessions", err)
+	}
+	if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live seat's file disturbed by the refused launch: %v %q", err, raw)
+	}
+	if _, ok := s.sessionTmpClaimFor("seat-scan-live"); !ok {
+		t.Fatal("live seat's claim lost to the refused launch")
+	}
+	if _, ok := s.sessionTmpClaimFor("seat-scan-second"); ok {
+		t.Fatal("refused launch left a live claim behind")
+	}
+	if !s.StopSession("seat-scan-live") {
+		t.Fatal("StopSession refused a live session")
+	}
+	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 0)
+	// Without its marker the live generation cannot prove ownership for
+	// removal, so the directory correctly survives its own cleanup; the
+	// test owns the fixture from here.
+	if _, err := os.Lstat(dir); err != nil {
+		t.Fatalf("live directory missing before test cleanup: %v", err)
+	}
+}

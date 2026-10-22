@@ -234,23 +234,35 @@ type sessionTmpOwnerRecord struct {
 	Gen       uint64 `json:"gen"`
 }
 
-// readSessionTmpOwnerRecord reports the ownership marker inside dir, when
-// one is present and decodes. A missing file, an unreadable one, or one
-// that does not decode is not an owner: the caller proceeds and the later
-// stamp or removal proof decides.
-func readSessionTmpOwnerRecord(dir string) (sessionTmpOwnerRecord, bool) {
-	raw, err := os.ReadFile(filepath.Join(dir, sessionTmpOwnerFile)) //nolint:gosec // G304: dir is a validated /tmp child and the name a constant.
+// readSessionTmpOwnerRecord reports the ownership marker inside dir. A
+// missing marker is no owner: the caller proceeds. Any other read
+// failure, or a marker that is present but does not decode to a named
+// session, fails closed with an error: the caller refuses the launch. A
+// transient read error must never let a second session take over a live
+// directory whose marker it cannot read.
+func readSessionTmpOwnerRecord(dir string) (sessionTmpOwnerRecord, bool, error) {
+	marker := filepath.Join(dir, sessionTmpOwnerFile) //nolint:gosec // G304: dir is a validated /tmp child and the name a constant.
+	if _, err := os.Lstat(marker); err != nil {
+		if os.IsNotExist(err) {
+			return sessionTmpOwnerRecord{}, false, nil
+		}
+		return sessionTmpOwnerRecord{}, false, fmt.Errorf("session tmpdir: inspect owner for %q: %w", dir, err)
+	}
+	raw, err := os.ReadFile(marker) //nolint:gosec // G304: dir is a validated /tmp child and the name a constant.
 	if err != nil {
-		return sessionTmpOwnerRecord{}, false
+		if os.IsNotExist(err) {
+			return sessionTmpOwnerRecord{}, false, nil
+		}
+		return sessionTmpOwnerRecord{}, false, fmt.Errorf("session tmpdir: read owner for %q: %w", dir, err)
 	}
 	var record sessionTmpOwnerRecord
 	if err := json.Unmarshal(raw, &record); err != nil {
-		return sessionTmpOwnerRecord{}, false
+		return sessionTmpOwnerRecord{}, false, fmt.Errorf("session tmpdir: decode owner for %q: %w", dir, err)
 	}
 	if record.SessionID == "" {
-		return sessionTmpOwnerRecord{}, false
+		return sessionTmpOwnerRecord{}, false, fmt.Errorf("session tmpdir: owner for %q names no session (refused)", dir)
 	}
-	return record, true
+	return record, true, nil
 }
 
 // writeSessionTmpOwner stamps the ownership marker inside a directory the
@@ -441,7 +453,10 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 	// marker name it). The marker lives in the directory itself, so every
 	// spelling reads the same owner: a marker naming another session
 	// refuses this launch before the stamp is overwritten. A marker naming
-	// this session (a continued turn) proceeds to a fresh generation.
+	// this session (a continued turn) proceeds to a fresh generation. A
+	// marker that is present but unreadable or undecodable also refuses
+	// the launch fail-closed: the second session must never take over a
+	// directory whose owner it cannot prove.
 	s.mu.Lock()
 	for id, existing := range s.sessionTmpDirs {
 		if id != spec.SessionID && existing.owned() && existing.Dir == dir {
@@ -452,7 +467,13 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 			return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already claimed by live session %q (session %q refused)", dir, id, spec.SessionID)
 		}
 	}
-	if owner, ok := readSessionTmpOwnerRecord(dir); ok && owner.SessionID != spec.SessionID {
+	if owner, hasOwner, ownerErr := readSessionTmpOwnerRecord(dir); ownerErr != nil {
+		s.mu.Unlock()
+		if created {
+			_ = os.Remove(dir)
+		}
+		return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q ownership marker unreadable (session %q refused): %w", dir, spec.SessionID, ownerErr)
+	} else if hasOwner && owner.SessionID != spec.SessionID {
 		s.mu.Unlock()
 		if created {
 			_ = os.Remove(dir)
