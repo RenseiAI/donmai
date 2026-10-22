@@ -16,6 +16,11 @@ import (
 // btime line. Reporting raw ticks would keep same-boot equality working but
 // would alias across reboots (ticks-since-boot restarts at zero) and would
 // disagree in magnitude with the Unix-nanosecond values stored in records.
+// linuxBootTimeReader reports the boot wall-clock for start-time conversion.
+// Tests stub it to simulate a wall-clock step between record write and
+// liveness check; production always reads /proc/stat.
+var linuxBootTimeReader = readLinuxBootTimeUnixNano
+
 func processStartTime(pid int) (int64, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
@@ -28,7 +33,7 @@ func processStartTime(pid int) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	bootUnixNano, err := readLinuxBootTimeUnixNano()
+	bootUnixNano, err := linuxBootTimeReader()
 	if err != nil {
 		return 0, err
 	}
@@ -37,6 +42,18 @@ func processStartTime(pid int) (int64, error) {
 		return 0, err
 	}
 	return started, nil
+}
+
+// processStartTimeEqual reports whether two stored or live start times name
+// the same Linux process incarnation. Raw tick-magnitude values never skew
+// (ticks-since-boot ignore the wall clock), so they compare exactly; Unix
+// nanoseconds converted through a re-read btime skew with wall-clock steps,
+// so they compare within the documented tolerance window.
+func processStartTimeEqual(a, b int64) bool {
+	if a < legacyTicksStartedAtThreshold && b < legacyTicksStartedAtThreshold {
+		return a == b
+	}
+	return withinLinuxStartTimeTolerance(a, b)
 }
 
 // canonicalRecordStartTime resolves a stored ProcessStartedAt to the Unix
@@ -49,7 +66,7 @@ func canonicalRecordStartTime(stored int64) (int64, error) {
 	if stored >= legacyTicksStartedAtThreshold {
 		return stored, nil
 	}
-	bootUnixNano, err := readLinuxBootTimeUnixNano()
+	bootUnixNano, err := linuxBootTimeReader()
 	if err != nil {
 		return 0, err
 	}

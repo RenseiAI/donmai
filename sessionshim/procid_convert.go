@@ -20,6 +20,30 @@ const nanoPerSec = 1_000_000_000
 // unit falls on the wrong side.
 const legacyTicksStartedAtThreshold = 1_000_000_000_000_000
 
+// linuxStartTimeSkewToleranceUnixNano bounds how far apart two Unix-nanosecond
+// start-time readings for the SAME Linux process may drift and still compare
+// equal. The kernel prints /proc/stat btime truncated to whole seconds and
+// recomputes it from the wall clock on every read, so a wall-clock step
+// (NTP/chrony step, manual date change, resume) that crosses a second boundary
+// moves every later conversion by the step even though the process never
+// restarted. The tolerance keeps a live shim verifiable across such steps.
+// It is an anti-reuse window: two DIFFERENT incarnations of one pid whose
+// start times fall inside it compare equal. Long-lived shims start far apart
+// in time, so the window only matters for pids recycled within two seconds.
+const linuxStartTimeSkewToleranceUnixNano = 2 * nanoPerSec
+
+// withinLinuxStartTimeTolerance reports whether two Unix-nanosecond start
+// times name the same instant modulo wall-clock skew: their absolute distance
+// is at most linuxStartTimeSkewToleranceUnixNano. Both inputs must already be
+// Unix nanoseconds (convert legacy ticks first); raw tick counts use exact
+// equality elsewhere because they never skew.
+func withinLinuxStartTimeTolerance(a, b int64) bool {
+	if a > b {
+		return a-b <= linuxStartTimeSkewToleranceUnixNano
+	}
+	return b-a <= linuxStartTimeSkewToleranceUnixNano
+}
+
 // isLegacyTicksStartedAt reports whether a stored ProcessStartedAt uses the
 // pre-conversion Linux unit (clock ticks since boot) rather than Unix
 // nanoseconds. Only Linux readers ever stored ticks; other platforms were

@@ -166,6 +166,10 @@ func TestProcStartTimeUnixNanoErrors(t *testing.T) {
 		{name: "negative tick rate", ticks: 100, clkHz: -100, boot: 1710000000 * 1e9},
 		{name: "zero boot", ticks: 100, clkHz: 100, boot: 0},
 		{name: "negative boot", ticks: 100, clkHz: 100, boot: -1},
+		// A corrupt large tick-magnitude value that cannot fit in int64
+		// nanoseconds stays fail-closed: the caller quarantines instead of
+		// comparing a wrapped value against a live process.
+		{name: "legacy ticks overflow", ticks: 100000000000000, clkHz: 100, boot: 1700000000 * 1e9},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -255,6 +259,34 @@ func TestCoerceLegacyTicksStartedAtErrors(t *testing.T) {
 			if _, err := coerceLegacyTicksStartedAt(tc.stored, tc.clkHz, tc.boot); err == nil {
 				t.Fatalf("coerceLegacyTicksStartedAt(%d, %d, %d) returned no error",
 					tc.stored, tc.clkHz, tc.boot)
+			}
+		})
+	}
+}
+
+// TestWithinLinuxStartTimeTolerance pins the wall-clock skew window: readings
+// for the same process a second apart compare equal, while incarnations more
+// than the tolerance apart do not. It drives the pure decision behind
+// ProcessIdentity.Alive and the handshake on Linux, on every platform.
+func TestWithinLinuxStartTimeTolerance(t *testing.T) {
+	t.Parallel()
+	const base = int64(1710000000) * 1e9
+	for _, tc := range []struct {
+		name string
+		a, b int64
+		want bool
+	}{
+		{name: "identical", a: base, b: base, want: true},
+		{name: "one second skew equal", a: base, b: base + 1e9, want: true},
+		{name: "tolerance boundary equal", a: base, b: base + linuxStartTimeSkewToleranceUnixNano, want: true},
+		{name: "beyond tolerance different", a: base, b: base + linuxStartTimeSkewToleranceUnixNano + 1, want: false},
+		{name: "negative skew equal", a: base + 1e9, b: base, want: true},
+		{name: "far reuse different", a: base, b: base + 3600*1e9, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := withinLinuxStartTimeTolerance(tc.a, tc.b); got != tc.want {
+				t.Fatalf("withinLinuxStartTimeTolerance(%d, %d) = %t, want %t", tc.a, tc.b, got, tc.want)
 			}
 		})
 	}

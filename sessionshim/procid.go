@@ -74,11 +74,15 @@ func (p ProcessIdentity) Alive() (bool, error) {
 	// current boot keeps same-boot equality exact (both sides scale the same
 	// ticks by the same boot) while a genuinely dead pid still mismatches.
 	// A stored value that cannot convert is an error — quarantine, not stale.
+	// On Linux the Unix-nanosecond comparison tolerates wall-clock skew
+	// between the boot reading at record write and the boot reading now
+	// (btime is re-read from /proc/stat and steps with the wall clock);
+	// raw ticks still compare exactly because they never skew.
 	expected, coerceErr := canonicalRecordStartTime(p.StartedAt)
 	if coerceErr != nil {
 		return false, coerceErr
 	}
-	if started != expected {
+	if !processStartTimeEqual(started, expected) {
 		// The pid is live but it is a DIFFERENT process. Reporting "not alive"
 		// is the safe answer: the recorded process is gone.
 		return false, nil
@@ -88,7 +92,7 @@ func (p ProcessIdentity) Alive() (bool, error) {
 
 // Matches reports whether other names the same process incarnation.
 func (p ProcessIdentity) Matches(other ProcessIdentity) bool {
-	return p.PID == other.PID && p.StartedAt == other.StartedAt && p.PID > 0
+	return p.PID == other.PID && p.PID > 0 && processStartTimeEqual(p.StartedAt, other.StartedAt)
 }
 
 // String renders the identity for diagnostics.

@@ -964,9 +964,12 @@ func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea, expectedWorkare
 	if h.ShimID != rec.ShimID {
 		return fmt.Errorf("%w: shim reports id %q, record says %q", ErrAdoptionRefused, h.ShimID, rec.ShimID)
 	}
-	if h.PID != rec.PID || h.ProcessStartedAt != rec.ProcessStartedAt {
+	if h.PID != rec.PID || !processStartTimeEqual(h.ProcessStartedAt, rec.ProcessStartedAt) {
 		// The live peer is a DIFFERENT process than the record describes — the
-		// PID-reuse case §D2 requires be caught rather than trusted.
+		// PID-reuse case §D2 requires be caught rather than trusted. On Linux
+		// the nanosecond comparison tolerates wall-clock skew between the
+		// boot reading at record write and the boot reading at handshake;
+		// raw ticks still compare exactly because they never skew.
 		return fmt.Errorf("%w: shim process identity pid=%d start=%d does not match record pid=%d start=%d",
 			ErrAdoptionRefused, h.PID, h.ProcessStartedAt, rec.PID, rec.ProcessStartedAt)
 	}

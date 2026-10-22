@@ -39,6 +39,11 @@ func canonicalRecordStartTime(stored int64) (int64, error) {
 	return stored, nil
 }
 
+// processStartTimeEqual reports whether two start times name the same process
+// incarnation. The darwin reader is wall-clock stable (the kernel stamps the
+// start time once at fork), so identity is exact equality.
+func processStartTimeEqual(a, b int64) bool { return a == b }
+
 // isNoSuchProcess maps the several ways this sysctl reports an unknown pid onto
 // one answer.
 //

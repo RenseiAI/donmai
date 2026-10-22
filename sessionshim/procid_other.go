@@ -21,3 +21,7 @@ func processStartTime(pid int) (int64, error) {
 func canonicalRecordStartTime(stored int64) (int64, error) {
 	return stored, nil
 }
+
+// processStartTimeEqual reports whether two start times name the same process
+// incarnation. Only exact equality is meaningful where adoption is disabled.
+func processStartTimeEqual(a, b int64) bool { return a == b }
