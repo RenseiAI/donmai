@@ -8,7 +8,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- Terminal workarea archive release no longer fails on Linux with `committed archive size mismatch` and leaves the lease release-pending. The post-commit re-read, the idempotent retry over an existing archive, and session-root restore compared the tree's allocated blocks with the size sampled at commit, and allocation can change after commit without any byte changing (delayed allocation, preallocation). Integrity is now proved by the tree digest alone, which covers every entry's path, mode, size and content, so a truncated or rewritten archive is still refused. The manifest `sizeBytes` remains disk accounting.
 
 ## v0.72.86 — 2026-10-22
 
