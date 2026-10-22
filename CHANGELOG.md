@@ -10,6 +10,21 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.85 — 2026-10-22
+
+### Chores
+
+- Advance interactive step to stopped on pre-PTY failures
+- Pin invalid-byte replacement in TOML launch-string tests
+- Bundle the gated consumer with its carrier-installed latch
+- Pin isolated fixture for pi live-binary adaptation probes
+- Expose committed workarea archive identity to recovery clients
+- Scope session pattern kills to the session worktree and process group
+- Runner posts current-step status beacons to the session progress endpoint
+- Pin the agent-run wiring for the interactive Muse terminal mode
+- Export Go module cache to seats; record preparation time on the session result
+- Keep archive release retries and workarea restore idempotent
+
 ## v0.72.84 — 2026-10-22
 
 ### Chores
