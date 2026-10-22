@@ -10,6 +10,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.84 — 2026-10-22
+
+### Chores
+
+- Fix ETXTBSY flakes from executing freshly written test fixtures
+- Session shim: a lineage held past the re-adoption window continues instead of withdrawing
+
 ## v0.72.83 — 2026-10-21
 
 ### Chores
