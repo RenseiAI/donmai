@@ -15,6 +15,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// newStopHookChannelFn creates the Stop-hook notice channel. It is a var
+// so tests can force the relay-only path (hook failure with relay success)
+// without breaking the temp dir for both. It lives above spawnInteractive
+// so the spawn-mode doc comment stays attached to the function.
+var newStopHookChannelFn = newStopHookChannel
+
 // spawnInteractive opens the claude CLI's OWN interactive REPL — bare
 // `claude`, with NEITHER `-p`/`--print` NOR `--output-format stream-json`
 // (those are the headless one-shot flags buildArgs uses for the default
@@ -34,11 +40,6 @@ import (
 // is up (SessionID stays empty — claude's session id is only observable
 // through its JSONL headless-mode output, which the interactive REPL never
 // emits) and a single terminal ResultEvent when the CLI process exits.
-// newStopHookChannelFn creates the Stop-hook notice channel. It is a var
-// so tests can force the relay-only path (hook failure with relay success)
-// without breaking the temp dir for both.
-var newStopHookChannelFn = newStopHookChannel
-
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	mcpPath, err := clijsonl.WriteMCPConfigWithEnv(spec.MCPServers, spec.Env)
 	if err != nil {

@@ -300,3 +300,68 @@ func TestSpawnInteractive_UnnamedActivitySeatWrapsActivityHandle(t *testing.T) {
 		}
 	}
 }
+
+// TestWrapActivityHandle_CoarseSlotsSurviveRelayFlood pins C6b through the
+// production wrapActivityHandle: the handle's emit closure must keep the
+// coarse-slot reservation (emitActivityEvent), not a plain non-blocking
+// send. A relay holding more lines than the channel is wrapped, nothing is
+// drained, and the coarse Init must still reach Events with every helper
+// goroutine exiting. Replacing the closure with a plain send fills the two
+// reserved slots, so the Init send blocks and the channels never close.
+func TestWrapActivityHandle_CoarseSlotsSurviveRelayFlood(t *testing.T) {
+	t.Parallel()
+	relay, err := activityrelay.New()
+	if err != nil {
+		t.Fatalf("activityrelay.New: %v", err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+	var lines []string
+	for range activityCoarseEventSlots + activityRelayEventSlots + 4 {
+		lines = append(lines, `{"v":1,"event":"stop","ts":"t"}`)
+	}
+	if err := os.WriteFile(relay.EventsPath(), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inner := &interactiveConversationHandle{
+		events:          make(chan agent.Event, 8),
+		activityFlushed: make(chan struct{}),
+		finished:        make(chan struct{}),
+	}
+	w := wrapActivityHandle(inner, relay)
+	// Never drain: let the 1s sweeps run against the full relay, then give
+	// them two extra ticks past saturation and assert the reservation held.
+	deadline := time.Now().Add(20 * time.Second)
+	for len(w.events) < cap(w.events)-activityCoarseEventSlots && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	time.Sleep(2100 * time.Millisecond)
+	if got := len(w.events); got > cap(w.events)-activityCoarseEventSlots {
+		t.Fatalf("relay holds %d buffered events, want at most %d (coarse slots reserved)", got, cap(w.events)-activityCoarseEventSlots)
+	}
+	// The coarse contract still fits: Init reaches Events even with the
+	// relay saturating the remainder. Relay lines precede it in FIFO order,
+	// so drain until the Init arrives.
+	inner.events <- agent.InitEvent{}
+	initDeadline := time.After(10 * time.Second)
+	foundInit := false
+	for !foundInit {
+		select {
+		case ev := <-w.Events():
+			_, foundInit = ev.(agent.InitEvent)
+		case <-initDeadline:
+			t.Fatal("coarse InitEvent did not reach Events with a flooded relay (reservation bypassed)")
+		}
+	}
+	close(inner.events)
+	drainDeadline := time.After(10 * time.Second)
+	for {
+		select {
+		case _, ok := <-w.Events():
+			if !ok {
+				return
+			}
+		case <-drainDeadline:
+			t.Fatal("wrapped Events never closed after the inner handle ended (helper goroutine stuck)")
+		}
+	}
+}

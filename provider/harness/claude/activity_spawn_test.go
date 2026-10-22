@@ -280,3 +280,153 @@ func TestSpawnInteractive_RelayOnlyWithoutHookChannel(t *testing.T) {
 		t.Fatal("no terminal ResultEvent on the relay-only path")
 	}
 }
+
+// gateFakeScript is a fake CLI that records its argv and idles until the
+// test creates the gate file, so hook fires can be observed while the
+// session is still running (before Done and the final flush).
+const gateFakeScript = `printf '%s\n' "$@" > "$PWD/argv.txt"
+while [ ! -e "$PWD/gate" ]; do sleep 0.05; done
+`
+
+// openActivityGate releases a gateFakeScript child so the session can exit.
+func openActivityGate(t *testing.T, workdir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(workdir, "gate"), []byte{}, 0o600); err != nil { //nolint:gosec // test-owned fixture
+		t.Fatal(err)
+	}
+}
+
+// stopTelemetryCommand returns the Stop telemetry hook command from decoded
+// settings: the Stop entry carries the notice claim script first and the
+// telemetry command second.
+func stopTelemetryCommand(t *testing.T, settings map[string]any) string {
+	t.Helper()
+	hooks, ok := settings["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("settings carry no hooks map: %v", settings)
+	}
+	raw, ok := hooks["Stop"]
+	if !ok {
+		t.Fatalf("Stop missing from --settings hooks %v", hooks)
+	}
+	groups, ok := raw.([]any)
+	if !ok || len(groups) != 2 {
+		t.Fatalf("Stop has %d groups, want notice + telemetry (2 groups): %v", len(groups), raw)
+	}
+	for _, g := range groups {
+		group, _ := g.(map[string]any)
+		entries, _ := group["hooks"].([]any)
+		for _, e := range entries {
+			entry, _ := e.(map[string]any)
+			cmd, _ := entry["command"].(string)
+			if cmd != "" && !strings.Contains(cmd, stopHookScriptFile) {
+				return cmd
+			}
+		}
+	}
+	t.Fatalf("no telemetry command beside the notice entry in Stop groups: %v", raw)
+	return ""
+}
+
+// TestSpawnInteractive_ActivityTelemetryDeliveredBeforeDone pins K6: the
+// per-tick relay sweep delivers lifecycle moments while the session is
+// still running. The fake idles on its gate file, the test fires
+// SessionStart, and the moment must arrive on Events without ever opening
+// the gate — the final flush (which runs only after Done) cannot mask a
+// disconnected per-tick sweep here.
+func TestSpawnInteractive_ActivityTelemetryDeliveredBeforeDone(t *testing.T) {
+	workdir := t.TempDir()
+	p := newFakeInteractiveProvider(t, gateFakeScript)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      "hello",
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	wrapper, ok := h.(*interactiveHandle)
+	if !ok {
+		t.Fatalf("Spawn returned %T, want *interactiveHandle", h)
+	}
+	settings := readSettingsJSON(t, workdir)
+	cmd := hookCommand(t, settings, "SessionStart")
+	if out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", cmd).CombinedOutput(); err != nil { //nolint:gosec // test executes the harness's own relay command
+		t.Fatalf("fire installed SessionStart hook: %s: %v", out, err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	sawStart := false
+	for time.Now().Before(deadline) && !sawStart {
+		select {
+		case ev := <-wrapper.Events():
+			if result, isResult := ev.(agent.ResultEvent); isResult {
+				openActivityGate(t, workdir)
+				t.Fatalf("terminal ResultEvent arrived before the gate opened (fake exited early): %+v", result)
+			}
+			if sys, isSys := ev.(agent.SystemEvent); isSys &&
+				sys.Subtype == agent.SystemSubtypeHarnessLifecycle &&
+				sys.Message == agent.HarnessLifecycleSessionStart {
+				sawStart = true
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if !sawStart {
+		openActivityGate(t, workdir)
+		t.Fatal("no session_start while the child still ran: the per-tick relay sweep is disconnected (K6)")
+	}
+	openActivityGate(t, workdir)
+	moments, terminal := drainActivitySpawnResult(t, wrapper)
+	if terminal == nil {
+		t.Fatal("no terminal ResultEvent after the gate opened")
+	}
+	_ = moments
+	select {
+	case <-wrapper.ActivityFlushed():
+	default:
+		t.Fatal("terminal ResultEvent arrived before ActivityFlushed closed")
+	}
+}
+
+// TestSpawnInteractive_ActivityStopFlushReachesTerminal pins K7: the final
+// relay flush delivers moments written after the last per-tick sweep. The
+// fake idles past at least one tick, the test fires the installed Stop
+// telemetry command and releases the child immediately, and the stop moment
+// must still arrive before the terminal ResultEvent.
+func TestSpawnInteractive_ActivityStopFlushReachesTerminal(t *testing.T) {
+	workdir := t.TempDir()
+	p := newFakeInteractiveProvider(t, gateFakeScript)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      "hello",
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	wrapper, ok := h.(*interactiveHandle)
+	if !ok {
+		t.Fatalf("Spawn returned %T, want *interactiveHandle", h)
+	}
+	settings := readSettingsJSON(t, workdir)
+	cmd := stopTelemetryCommand(t, settings)
+	// Settle past at least one per-tick sweep so the fire below lands
+	// after the last tick: only the final flush can deliver it.
+	time.Sleep(1200 * time.Millisecond)
+	if out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", cmd).CombinedOutput(); err != nil { //nolint:gosec // test executes the harness's own relay command
+		t.Fatalf("fire installed Stop telemetry hook: %s: %v", out, err)
+	}
+	openActivityGate(t, workdir)
+	moments, terminal := drainActivitySpawnResult(t, wrapper)
+	if terminal == nil {
+		t.Fatal("no terminal ResultEvent")
+	}
+	for _, m := range moments {
+		if m == agent.HarnessLifecycleStop {
+			return
+		}
+	}
+	t.Fatalf("stop moment missing before the terminal: moments = %v (final relay flush dropped it, K7)", moments)
+}

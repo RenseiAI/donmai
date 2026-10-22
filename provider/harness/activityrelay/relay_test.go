@@ -382,3 +382,34 @@ func TestSweepSkipsOversizeLine(t *testing.T) {
 		t.Fatalf("resweep = %d events, want none", len(again))
 	}
 }
+
+// TestSweepDefersOversizeLinePastCap pins the cap checks inside the
+// oversize-line branch: an oversize line met while a sweep cap is already
+// reached is deferred (the offset does not advance past it), not consumed
+// early. Dropping those checks consumes it in the first sweep and delivers
+// the line after it one sweep too soon.
+func TestSweepDefersOversizeLinePastCap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	big := `{"v":1,"event":"stop","ts":"` + strings.Repeat("x", 5000) + `"}`
+	appendLines(t, path, `{"v":1,"event":"session_start","ts":"t"}`, big, `{"v":1,"event":"stop","ts":"t"}`)
+	tailer := NewTailer(path)
+	first := tailer.Sweep(1, 100)
+	if len(first) != 1 {
+		t.Fatalf("first sweep = %d events, want 1 (session_start)", len(first))
+	}
+	if sys, ok := first[0].(agent.SystemEvent); !ok || sys.Message != agent.HarnessLifecycleSessionStart {
+		t.Fatalf("first event = %#v, want harness_lifecycle/session_start", first[0])
+	}
+	if second := tailer.Sweep(1, 100); len(second) != 0 {
+		t.Fatalf("second sweep = %d events, want none (oversize deferred past the line cap)", len(second))
+	}
+	third := tailer.Sweep(1, 100)
+	if len(third) != 1 {
+		t.Fatalf("third sweep = %d events, want 1 (stop)", len(third))
+	}
+	if sys, ok := third[0].(agent.SystemEvent); !ok || sys.Message != agent.HarnessLifecycleStop {
+		t.Fatalf("third event = %#v, want harness_lifecycle/stop", third[0])
+	}
+}
