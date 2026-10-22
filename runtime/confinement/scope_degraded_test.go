@@ -58,6 +58,11 @@ func TestScopeVerdict_PartialBelowTheFloor(t *testing.T) {
 	if ok, why := scopeVerdict(landlockScopeABI); !ok || why != "" {
 		t.Fatalf("scopeVerdict(%d) = (%v, %q), want enforced", landlockScopeABI, ok, why)
 	}
+	// The ambient probe stays stubbed enforced so the check below is
+	// hermetic on every kernel: on a sub-floor host the real probe
+	// reports missing, which is the degraded path this package pins
+	// elsewhere, not the enforced branch checked here.
+	stubScopeProbe(t, landlockScopeABI)
 	if ok, _ := ScopesAvailable(); !ok {
 		t.Fatal("ScopesAvailable reports a missing scope layer on a host with no scope concept; want enforced")
 	}

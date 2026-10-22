@@ -193,6 +193,22 @@ func provenSelfTestName(digest string) string {
 // status path reads back. A record the shape cannot decode is not proof.
 const provenSelfTestFileVersion = 1
 
+// provenRecordTTL bounds how long a proven self-test record counts as
+// evidence: the same window the in-memory self-test cache reuses a
+// passing record. A proven file older than this is stale on this host,
+// so the status path reports unproven instead of attesting from it.
+const provenRecordTTL = DefaultSelfTestCacheTTL
+
+// maxProvenRecordsPerRead caps how many proven files one status read
+// scans, and maxProvenFileBytes caps how large a single proven file may
+// be: the shared proven directory is host state every seat writes, so an
+// unbounded scan would let one bloated or flooded directory stall every
+// status and doctor read.
+const (
+	maxProvenRecordsPerRead = 128
+	maxProvenFileBytes      = 1 << 20
+)
+
 // provenSelfTestFile is one proven self-test record on disk.
 type provenSelfTestFile struct {
 	Version int            `json:"version"`
@@ -201,11 +217,15 @@ type provenSelfTestFile struct {
 
 // LatestProvenRecord reports the latest proven seat self-test on this
 // host, if one was recorded: the newest passing, whole record under the
-// shared proven directory whose digest still covers it. Anything else —
-// no file, an undecodable shape, a version the binary does not read, a
-// degraded or failing record, a digest that no longer covers it — is no
-// evidence, so the status path reports the boundary unproven instead of
-// attesting from it.
+// shared proven directory whose digest still covers it and whose age is
+// within the proven window. Anything else — no file, an undecodable
+// shape, a version the binary does not read, a degraded or failing
+// record, a digest that no longer covers it, a record older than the
+// proven window or stamped in the future — is no evidence, so the status
+// path reports the boundary unproven instead of attesting from it. The
+// scan is bounded: at most maxProvenRecordsPerRead files and
+// maxProvenFileBytes per file, so a flooded or bloated directory cannot
+// stall the status path.
 func LatestProvenRecord() (SelfTestRecord, bool) {
 	dir := latestSelfTestCacheDir()
 	if dir == "" {
@@ -217,8 +237,21 @@ func LatestProvenRecord() (SelfTestRecord, bool) {
 	}
 	var latest SelfTestRecord
 	found := false
+	now := time.Now()
+	scanned := 0
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "proven-") || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if scanned >= maxProvenRecordsPerRead {
+			break
+		}
+		scanned++
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.Size() <= 0 || info.Size() > maxProvenFileBytes {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(dir, entry.Name())) //nolint:gosec // G304: entry names come from the proven-record directory listing and are filtered to the proven-*.json shape above.
@@ -237,6 +270,9 @@ func LatestProvenRecord() (SelfTestRecord, bool) {
 			continue
 		}
 		if record.Digest == "" || record.computeDigest() != record.Digest {
+			continue
+		}
+		if record.TestedAt.After(now.Add(time.Minute)) || now.Sub(record.TestedAt) >= provenRecordTTL {
 			continue
 		}
 		if !found || record.TestedAt.After(latest.TestedAt) {

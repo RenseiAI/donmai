@@ -179,6 +179,66 @@ func TestProvenRecord_StatusReadsWhatSeatsProved(t *testing.T) {
 	}
 }
 
+// TestProvenRecord_RefusesStaleRecord pins the proven-window gate: a
+// passing, whole record older than the proven TTL is no evidence, so the
+// status path reports unproven instead of attesting from it. Deleting the
+// age check in LatestProvenRecord turns this test red.
+func TestProvenRecord_RefusesStaleRecord(t *testing.T) {
+	base := t.TempDir()
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+
+	stale := SelfTestRecord{
+		Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+		ExecutableDigest: "sha256:test",
+		SessionModes:     bothModes, Passed: true,
+		Probes:   []ProbeOutcome{{ID: "p", Pass: true}},
+		TestedAt: time.Now().Add(-2 * provenRecordTTL).UTC(),
+	}
+	stale.Digest = stale.computeDigest()
+	recordProvenSelfTest(stale)
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord reads a stale record as evidence: %+v", latest)
+	}
+}
+
+// TestProvenRecord_IgnoresOversizedFile pins the read bound: a proven
+// file larger than the per-file cap is skipped, so a bloated directory
+// cannot stall the status path or smuggle evidence past the digest gate.
+// Deleting the size check in LatestProvenRecord turns this test red: the
+// oversized file would read back as evidence.
+func TestProvenRecord_IgnoresOversizedFile(t *testing.T) {
+	base := t.TempDir()
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+
+	passing := SelfTestRecord{
+		Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+		ExecutableDigest: "sha256:test",
+		SessionModes:     bothModes, Passed: true,
+		Probes: []ProbeOutcome{{ID: "p", Pass: true}}, TestedAt: time.Now().Add(-2 * time.Hour).UTC(),
+	}
+	passing.Digest = passing.computeDigest()
+	recordProvenSelfTest(passing)
+	dir := latestSelfTestCacheDir()
+	if dir == "" {
+		t.Fatal("latestSelfTestCacheDir is empty; want the shared proven directory")
+	}
+	// Pad a copy of the proven record past the per-file cap while keeping
+	// its digest valid, so only the size gate refuses it. The bloated copy
+	// is newer but still within the proven window and not in the future,
+	// so without the size gate it would win the latest-pick.
+	bloated := passing
+	pad := strings.Repeat("x", maxProvenFileBytes+1)
+	bloated.Probes = append(bloated.Probes, ProbeOutcome{ID: pad, Pass: true})
+	bloated.TestedAt = passing.TestedAt.Add(time.Hour)
+	bloated.Digest = bloated.computeDigest()
+	writeProvenFileForTest(t, dir, "proven-bloated.json", provenSelfTestFile{Version: provenSelfTestFileVersion, Record: bloated})
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != passing.Digest {
+		t.Fatalf("LatestProvenRecord with an oversized file = %+v, %v; want only the whole %s", latest, ok, passing.Digest)
+	}
+}
+
 // TestSelfTest_ReusesACachedPassingRecord: a later process on the same host
 // reuses a cached passing self-test without spawning a probe, and Prepare
 // accepts it; once the record is older than the TTL the self-test runs

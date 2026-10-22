@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 )
 
@@ -64,8 +65,15 @@ func TestConfinementStatus_NeverAttestsWithoutProof(t *testing.T) {
 		t.Skip("no confinement backend on this host; the status reports none")
 	}
 	// No self-test ever ran: the status reports the boundary unproven,
-	// never attested.
-	status := confinementStatus()
+	// never attested. The reporter is stubbed enforced with no record so
+	// the case stays hermetic on every kernel and with any host state on
+	// disk: production confinementStatus reads the running kernel and the
+	// shared proven directory, so it reports degraded below the floor and
+	// attests where a seat already proved the boundary.
+	status := (confinementStatusReporter{
+		scopesAvailable:    enforcedScopes,
+		latestProvenRecord: noProvenConfinementRecord,
+	}).status()
 	if status == nil {
 		t.Fatal("confinementStatus is nil; want the unproven posture block")
 	}
@@ -98,6 +106,75 @@ func TestConfinementStatus_NeverAttestsWithoutProof(t *testing.T) {
 // enforcedScopes answers the scope probe as a kernel at or above the
 // floor: the layer enforced with no reason.
 func enforcedScopes() (bool, string) { return true, "" }
+
+// TestConfinementStatus_NilProbeNeverAttests pins the fail-closed probe
+// gate: a reporter with no scope probe never attests, even with a current,
+// passing, whole record behind it. Deleting the nil-probe guard
+// (defaulting a missing probe to enforced) turns this test red: the
+// reporter would attest through the record gate alone.
+func TestConfinementStatus_NilProbeNeverAttests(t *testing.T) {
+	backend := confinement.DefaultBackend()
+	if backend == nil {
+		t.Skip("no confinement backend on this host; the status reports none")
+	}
+	version, err := backend.Version()
+	if err != nil {
+		t.Skipf("backend version unavailable: %v", err)
+	}
+	passing := confinement.SelfTestRecord{
+		Backend: backend.Name(), BackendVersion: version,
+		ProbeSetVersion: confinement.ProbeSetVersion,
+		Passed:          true,
+		SessionModes: []agent.PromptSessionMode{
+			agent.PromptModeAutonomous, agent.PromptModeHumanControlled,
+		},
+	}
+	reporter := confinementStatusReporter{
+		scopesAvailable: nil,
+		latestProvenRecord: func() (confinement.SelfTestRecord, bool) {
+			return passing, true
+		},
+	}
+	if got := reporter.status(); got.Attested {
+		t.Fatalf("confinement status attests with no scope probe: %+v", got)
+	}
+}
+
+// TestConfinementStatus_EmptyReasonIsDegraded pins the malformed-probe
+// gate: a missing layer with no reason still reports degraded with a
+// non-empty line, never an empty degraded marker. Deleting the generic
+// fallback (passing the empty reason through) turns this test red.
+func TestConfinementStatus_EmptyReasonIsDegraded(t *testing.T) {
+	reporter := confinementStatusReporter{
+		scopesAvailable:    func() (bool, string) { return false, "" },
+		latestProvenRecord: noProvenConfinementRecord,
+	}
+	got := reporter.status()
+	if got.Attested {
+		t.Fatalf("confinement status attests a missing layer with no reason: %+v", got)
+	}
+	if got.Degraded == "" {
+		t.Fatalf("confinement status carries an empty degraded line: %+v", got)
+	}
+}
+
+// TestConfinementStatus_InconsistentProbeIsDegraded pins the inconsistent
+// probe gate: enforced with a reason still reports degraded rather than
+// attesting. Deleting the inconsistency check (trusting the boolean
+// alone) turns this test red.
+func TestConfinementStatus_InconsistentProbeIsDegraded(t *testing.T) {
+	reporter := confinementStatusReporter{
+		scopesAvailable:    func() (bool, string) { return true, "the scope layer is unenforced" },
+		latestProvenRecord: noProvenConfinementRecord,
+	}
+	got := reporter.status()
+	if got.Attested {
+		t.Fatalf("confinement status attests an inconsistent probe: %+v", got)
+	}
+	if got.Degraded == "" {
+		t.Fatalf("confinement status carries no degraded line for an inconsistent probe: %+v", got)
+	}
+}
 
 // TestConfinementStatusShape pins the status block at the unit level: a
 // degraded host carries the reason with the floor, an unproven one carries

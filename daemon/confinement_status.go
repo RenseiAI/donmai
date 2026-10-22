@@ -60,25 +60,36 @@ func confinementStatus() *afclient.ConfinementStatus {
 }
 
 // status renders one confinement posture from the reporter's answers.
+// It fails closed: a missing scope probe never reads as enforced, and a
+// malformed probe answer (enforced with a reason, or missing with none)
+// reports degraded rather than attesting.
 func (r confinementStatusReporter) status() *afclient.ConfinementStatus {
 	backend := confinement.DefaultBackend()
 	if backend == nil {
 		return &afclient.ConfinementStatus{}
 	}
 	status := &afclient.ConfinementStatus{Backend: string(backend.Name())}
-	scopeOK, scopeWhy := true, ""
-	if r.scopesAvailable != nil {
-		scopeOK, scopeWhy = r.scopesAvailable()
+	if r.scopesAvailable == nil {
+		status.Detail = "seat boundary unproven at " + confinementKernelFloor + " or newer: scope probe unavailable on this host"
+		return status
 	}
+	scopeOK, scopeWhy := r.scopesAvailable()
 	record, recordOK := confinement.SelfTestRecord{}, false
 	if r.latestProvenRecord != nil {
 		record, recordOK = r.latestProvenRecord()
 	}
-	// The scope layer decides the degraded line wherever it is missing:
-	// a host below the floor reports the partial boundary even before
-	// any seat ran, and a proven record from one never attests.
-	if !scopeOK {
-		status.Degraded = scopeWhy
+	// The scope layer decides the degraded line wherever it is missing or
+	// the probe answers inconsistently: a host below the floor reports the
+	// partial boundary even before any seat ran, and a proven record from
+	// one never attests. An empty reason with a missing layer still
+	// reports degraded with a generic line, never an empty degraded
+	// marker a reader could misread as whole.
+	if !scopeOK || scopeWhy != "" {
+		degraded := scopeWhy
+		if degraded == "" {
+			degraded = "the scope layer is unenforced: Landlock scope probe reports the layer missing"
+		}
+		status.Degraded = degraded
 		status.Detail = "seat boundary is partial below " + confinementKernelFloor + ": same-user signals and abstract sockets outside stay reachable"
 		return status
 	}
