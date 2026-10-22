@@ -10,12 +10,13 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestSameVersionAndCopiedSidecarCannotSelectProfile(t *testing.T) {
 	root := t.TempDir()
 	binary := filepath.Join(root, "pi")
-	if err := os.WriteFile(binary, []byte("different 0.85.1 binary"), 0o600); err != nil {
+	if err := testexec.WriteFile(binary, []byte("different 0.85.1 binary"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(binary, 0o700); err != nil { //nolint:gosec // G302: executable fixture must be resolvable as the candidate binary.

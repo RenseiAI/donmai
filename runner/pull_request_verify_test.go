@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
@@ -124,7 +125,7 @@ func sentinelGh(t *testing.T) string {
 	calls := filepath.Join(dir, "gh-calls.log")
 	script := fmt.Sprintf("#!/bin/sh\necho \"$*\" >> %q\necho 'gh is not available' 1>&2\nexit 1\n", calls)
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

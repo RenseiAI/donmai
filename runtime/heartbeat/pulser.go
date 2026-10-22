@@ -45,6 +45,22 @@ const SessionClassInteractive = "interactive"
 // 1s/2s/4s exponential backoff).
 const DefaultMaxAttemptsPerTick = 3
 
+// LostOwnershipError renders the terminal result text for a lost-ownership
+// trip: the generic ErrLostOwnership string, suffixed with the HTTP status
+// of the last failed lock-refresh tick when one was recorded (for example
+// "session ownership lost (last lock-refresh status 401)"). A nil pulser
+// or a zero status keeps the bare generic string. FailureMode values are
+// untouched — this only lengthens the free-text Error.
+func LostOwnershipError(p interface{ LastFailureStatus() int }) string {
+	if p == nil {
+		return ErrLostOwnership.Error()
+	}
+	if status := p.LastFailureStatus(); status != 0 {
+		return ErrLostOwnership.Error() + fmt.Sprintf(" (last lock-refresh status %d)", status)
+	}
+	return ErrLostOwnership.Error()
+}
+
 // Sentinel errors. The runner uses errors.Is to detect a
 // LostOwnership transition without scraping log lines.
 var (
@@ -277,6 +293,15 @@ type Pulser struct {
 	lostCh   chan struct{}
 	strikes  atomic.Int64
 	lastTick atomic.Int64 // unix-millis
+	// lastFailureStatus is the HTTP status of the most recent failed
+	// lock-refresh tick (a 401/403 auth rejection, a 500, ...). Zero when
+	// the last failure carried no HTTP response (transport error, decode
+	// failure, refused refresh) or when no tick has failed yet. It is
+	// stored BEFORE the strike increment in tick() so it is already
+	// visible the moment the increment lets tripped() close LostOwnership;
+	// read via LastFailureStatus so the runner's terminal result can name
+	// the status that tripped the fuse.
+	lastFailureStatus atomic.Int64
 
 	// degraded marks the interactive non-fatal heartbeat-loss state: the
 	// strike threshold was reached (or a refresh was refused) for a
@@ -496,6 +521,18 @@ func (p *Pulser) LostOwnership() <-chan struct{} {
 // observability; the runner usually only watches LostOwnership.
 func (p *Pulser) Strikes() int {
 	return int(p.strikes.Load())
+}
+
+// LastFailureStatus returns the HTTP status of the most recent failed
+// lock-refresh tick (for example 401 when the runtime token expired out
+// from under the session). Zero when the failure had no HTTP response
+// (transport error, decode failure, refused refresh) or when no tick has
+// failed yet. Safe to call from any goroutine; a nil receiver reports 0.
+func (p *Pulser) LastFailureStatus() int {
+	if p == nil {
+		return 0
+	}
+	return int(p.lastFailureStatus.Load())
 }
 
 // StopRequested reports whether LostOwnership was closed by the platform's
@@ -778,6 +815,10 @@ func (p *Pulser) tick(ctx context.Context) {
 		err := p.doRefresh(ctx)
 		if err == nil {
 			prev := p.strikes.Swap(0)
+			// A recovered tick clears the retained failure status so a
+			// later, unrelated ownership loss (hand-off, stop) does not
+			// stamp a stale status from an already-recovered failure.
+			p.lastFailureStatus.Store(0)
 			tick := p.cfg.now().UnixMilli()
 			p.lastTick.Store(tick)
 			if observer := p.ackObserver(); observer != nil {
@@ -812,6 +853,17 @@ func (p *Pulser) tick(ctx context.Context) {
 				}
 			}
 		}
+	}
+	// Record the last attempt's HTTP status BEFORE the strike increment
+	// lets the threshold close LostOwnership: the runner reads it the
+	// moment the fuse trips, so recording after would race the reader and
+	// surface 0 on the tripping tick. A non-status failure (transport
+	// error, decode failure, refused refresh) records 0.
+	var statusErr *lockRefreshStatusError
+	if errors.As(lastErr, &statusErr) {
+		p.lastFailureStatus.Store(int64(statusErr.status))
+	} else {
+		p.lastFailureStatus.Store(0)
 	}
 	strike := p.strikes.Add(1)
 	p.cfg.logger().Warn("heartbeat tick failed",
@@ -881,6 +933,17 @@ type refreshResponse struct {
 	Inject *InjectPayload `json:"inject,omitempty"`
 }
 
+// lockRefreshStatusError carries the HTTP status of a failed lock-refresh
+// POST so tick() can retain it in LastFailureStatus without parsing the
+// error string. Both Error() texts are byte-identical to the plain errors
+// postRefresh used to return, so existing log assertions stay green.
+type lockRefreshStatusError struct {
+	status int
+	msg    string
+}
+
+func (e *lockRefreshStatusError) Error() string { return e.msg }
+
 // postRefresh issues one POST to /api/sessions/<id>/lock-refresh carrying
 // the given AckedInject echo and returns the decoded response. A nil
 // response with a nil error means the platform answered 2xx with an empty
@@ -927,9 +990,15 @@ func (p *Pulser) postRefresh(ctx context.Context, ack string, dead []DeadLettere
 			// call is unchanged; this only makes the error text an operator
 			// greps for distinct from a generic outage (network blip,
 			// platform 500) in tick()'s "heartbeat tick failed" log line.
-			return nil, fmt.Errorf("lock-refresh: auth rejected (status %d) — runtime token likely expired or rotated out from under this session", resp.StatusCode)
+			return nil, &lockRefreshStatusError{
+				status: resp.StatusCode,
+				msg:    fmt.Sprintf("lock-refresh: auth rejected (status %d) — runtime token likely expired or rotated out from under this session", resp.StatusCode),
+			}
 		}
-		return nil, fmt.Errorf("lock-refresh: status %d", resp.StatusCode)
+		return nil, &lockRefreshStatusError{
+			status: resp.StatusCode,
+			msg:    fmt.Sprintf("lock-refresh: status %d", resp.StatusCode),
+		}
 	}
 	var out refreshResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -967,6 +1036,10 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 		// NOT apply any piggybacked inject — the session is being torn
 		// down.
 		p.stopRequested.Store(true)
+		// Clear any retained failure status before closing: the stop
+		// verdict carries no HTTP failure, so a stale status from an
+		// earlier recovered tick must not linger on the accessor.
+		p.lastFailureStatus.Store(0)
 		p.loseOwnershipNow()
 		return errors.New("lock-refresh: platform requested stop (stop=true)")
 	}
@@ -990,7 +1063,12 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 		// handed off; there is nothing to gain from three more failed
 		// ticks) — but leave stopRequested unset so the runner classifies
 		// this as FailureLostOwnership, the correct mode for a hand-off,
-		// not an operator cancel.
+		// not an operator cancel. Clear the retained status first: the
+		// refusal itself carried a 2xx with no failure status, and the
+		// tick's trailing store runs after this close, so without this a
+		// reader racing the close would stamp a stale status from an
+		// earlier tick onto the hand-off result.
+		p.lastFailureStatus.Store(0)
 		p.loseOwnershipNow()
 		return errors.New("lock-refresh: platform refused (refreshed=false)")
 	}

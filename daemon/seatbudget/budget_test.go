@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestParseMode(t *testing.T) {
@@ -412,7 +414,7 @@ func TestHasSystemdAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(dir, "run-helper")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: a LookPath target whose --version prints nothing (unknown version keeps the placement)
+	if err := testexec.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: a LookPath target whose --version prints nothing (unknown version keeps the placement)
 		t.Fatal(err)
 	}
 	oldPath := os.Getenv("PATH")
@@ -480,7 +482,7 @@ func TestHasSystemdAt_VersionGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(dir, "run-helper")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: LookPath target only, the version is injected
+	if err := testexec.WriteFile(helper, []byte("#!/bin/sh\n"), 0o700); err != nil { //nolint:gosec // G306: test fixture: LookPath target only, the version is injected
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

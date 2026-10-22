@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -94,7 +95,7 @@ func TestStartShimProcess_ScopeRefusalSurfacesTheManagerMessage(t *testing.T) {
 		"echo scope-refused >&2\n" +
 		"echo \"" + refusal + "\" >&2\n" +
 		"exit 1\n"
-	if err := os.WriteFile(filepath.Join(fakes, "systemd-run"), []byte(fake), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (LookPath + exec need +x)
+	if err := testexec.WriteFile(filepath.Join(fakes, "systemd-run"), []byte(fake), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (LookPath + exec need +x)
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))

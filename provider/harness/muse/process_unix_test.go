@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // fakeServeScript writes a stand-in host binary: it answers the version
@@ -34,7 +35,7 @@ func fakeServeScript(t *testing.T, leaderExits bool) (bin, pidFile string) {
 		"echo $! > \"$MUSE_TEST_PIDFILE\"\n" +
 		tail + "\n"
 	bin = filepath.Join(dir, "muse")
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(bin, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write script: %v", err)
 	}
 	return bin, pidFile

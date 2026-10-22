@@ -62,6 +62,13 @@ type SessionShimSnapshotProxy struct {
 	daemon     *Daemon
 	identity   sessionshim.Identity
 	active     atomic.Bool
+	// carrierInstalled releases the consumer gate of the controller under
+	// adoption. It is armed when the proxy stages the mandatory Snapshot —
+	// the earliest point at which the carrier dial has landed and the staging
+	// side is armed — so a durable output batch parked ahead of the Snapshot
+	// may persist without meeting "no carrier candidate" while the dial is
+	// still in flight. Nil where the consumer gate is not wired.
+	carrierInstalled func()
 }
 
 // Inspect returns a fresh read-only shim-owned screen and atSeq.
@@ -86,6 +93,14 @@ func (p *SessionShimSnapshotProxy) Emit(ctx context.Context) (shimwire.SnapshotR
 				return shimwire.SnapshotResult{}, err
 			}
 			staged = true
+			// The carrier dial has landed and the staging side is armed, so
+			// a consumer parked on a durable output batch ahead of this
+			// Snapshot may persist: this is the earliest point at which the
+			// carrier exists in this daemon. The adoption verdict still
+			// travels on the consumer gate.
+			if p.carrierInstalled != nil {
+				p.carrierInstalled()
+			}
 		}
 	}
 	result, err := p.controller.EmitSnapshot(ctx)
@@ -783,8 +798,50 @@ type SessionShimConfig struct {
 	// per resolved keepalive interval (a third of the orphan deadline by
 	// default), whichever is more frequent. It is deliberately NOT consulted on
 	// the fast probes the keepalive makes before its first honoured exchange.
+	// Once a window has been continued under ReadoptionHeldPastWindow (or was
+	// re-entered under it), the conjunction that gates the continuation asks it
+	// again: up to three calls per attempt (window end, the per-attempt
+	// continuation check, and the attempt's own gate) plus one per paced tick.
 	// It runs off the daemon's lock, under its own bounded context.
 	LineageLive func(context.Context, sessionshim.Identity) bool
+
+	// ReadoptionHeldPastWindow answers whether the COMPOSING layer holds this
+	// lineage on terms the lineage-live window does not bound. It is the opt-in
+	// for a session that only its owner, or a duration quota, may end — an
+	// interactive session is the shape it exists for — and a true answer is the
+	// composing layer's statement of two facts at once: no stop has been
+	// requested and no session duration quota is spent, AND nothing outside
+	// this host will release the lineage's claim while the answer stays true.
+	// The second is what keeps §D8's inequality honest once the keepalive runs
+	// past the window: the external release threshold no longer bounds a
+	// lineage this predicate holds, so the predicate is the bound.
+	//
+	// While it answers true the window CONTINUES instead of exhausting: when it
+	// ends with the shim still observable, the daemon starts another window
+	// with the keepalive still armed and the backoff still capped, and a
+	// controller lost again inside the previous window is re-adopted (after
+	// one backoff) instead of quarantined. Nothing else changes. Every attempt
+	// still runs the full prepare-and-adopt pipeline, so no carrier is ever
+	// granted without a fresh preparation, and the lineage is never more than
+	// adopted at its retained revision. The moment the predicate answers false
+	// — or LineageLive does, or the shim stops being observable — the window
+	// ends the ordinary way: OnReadoptionWindowExhausted, then the
+	// unconditional withdrawal (ADR-2026-09-03-readoption-exhaustion-withdraws,
+	// amendment 2026-10-21).
+	//
+	// It must answer FALSE on any error, timeout, or uncertainty, and must not
+	// block past its context or panic (a panic is recovered and read as false).
+	// It must also answer false for any lineage whose session class has an
+	// external release bound — a dispatched, non-interactive run is the usual
+	// one — so an embedder never wires it session-class-blind.
+	//
+	// Nil keeps the bounded window, which is the OSS default. It is consulted
+	// only together with LineageLive (configuration is refused without it, and
+	// outside ReadoptionLineageLive mode), at every window end, on every
+	// attempt and every paced keepalive tick once a window has been continued,
+	// and on a re-entry inside the previous window. It runs off the daemon's
+	// lock, under its own bounded context.
+	ReadoptionHeldPastWindow func(context.Context, sessionshim.Identity) bool
 
 	// OnReadoptionWindowExhausted runs exactly once when a ReadoptionLineageLive
 	// window ends with the shim STILL observable — the case the dead-shim path
@@ -1910,6 +1967,14 @@ func (d *Daemon) sessionResumeKey(sessionID, organizationID string) (*sessionshi
 // reporting an adopted lineage whose shim is gone, holding its capacity
 // forever. That is a false complete-snapshot and a permanent capacity leak.
 //
+// Continuing is not keeping. SessionShimConfig.ReadoptionHeldPastWindow lets a
+// composing layer that holds a lineage without an external release bound — an
+// interactive session nobody asked to stop — start another window instead of
+// exhausting this one (amendment 2026-10-21). The keepalive, the liveness
+// gate, and the attempts all keep running, so the lineage is still under the
+// same observation that would withdraw it the instant any of them fails; it is
+// never an adopted entry nothing is watching.
+//
 // Attempts is read only in fixed mode; Window, BackoffCap and KeepaliveInterval
 // only in lineage-live mode. Validate refuses the combinations that would make
 // one policy answer two ways, and it is checked when the configuration is
@@ -2185,6 +2250,21 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 // loosest value that still leaves one whole missed exchange of slack.
 func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 	policy := c.readoption()
+	if c.ReadoptionHeldPastWindow != nil {
+		// Continuation past the window is only meaningful for a window, and it
+		// is only safe while the composing layer can also say it still holds the
+		// lineage at all: a standalone daemon's "yes, always" LineageLive would
+		// turn a continuation into a re-adoption nothing could ever release.
+		if policy.Disabled || policy.Mode != ReadoptionLineageLive {
+			return fmt.Errorf("%w: ReadoptionHeldPastWindow continues a %s window and is meaningless in %s mode (disabled=%t)",
+				ErrSessionShimReadoptionPolicy, ReadoptionLineageLive, policy.Mode, policy.Disabled)
+		}
+		if c.LineageLive == nil {
+			return fmt.Errorf("%w: ReadoptionHeldPastWindow requires SessionShimConfig.LineageLive; continuing a window "+
+				"for a lineage nothing above this daemon can release would never end while the shim lives",
+				ErrSessionShimReadoptionPolicy)
+		}
+	}
 	if policy.Disabled || policy.Mode != ReadoptionLineageLive {
 		return nil
 	}
@@ -2603,7 +2683,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	for _, c := range result.Adopted {
 		id := c.Identity()
 		preparation := preparedByID[id]
-		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparation, hostByID[id])
+		// The consumer and its carrier-installed latch start together: staging
+		// the mandatory Snapshot inside OnAdoption releases a consumer parked
+		// on a durable output batch ahead of the Snapshot, while the gate
+		// itself still carries the adoption verdict.
+		gate, evidence, evidenceErr := d.startGatedAdoptionConsumer(ctx, c, preparation, hostByID[id])
 		if evidenceErr != nil {
 			// Host authority itself could not be resolved for this
 			// controller's organization — every OTHER lineage in that same
@@ -2612,9 +2696,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
 		}
-		gate := newShimAdoptionGate()
 		gates[c] = gate
-		d.consumeShimEventsGated(c, gate)
 		// Two refusals are AMBIGUOUS evidence rather than a verdict on the
 		// lineage, and each gets the bounded re-dial the recovery corpus
 		// requires before any terminal consequence: carrier cursor drift (a
@@ -2625,7 +2707,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		// preparation come back because a re-prepare mints new ones and the
 		// receipt below belongs to that pair, not to the first.
 		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithBoundedRedial(
-			ctx, c, preparations, hostByID[id], evidence, preparation,
+			ctx, c, preparations, hostByID[id], evidence, preparation, gate,
 		)
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
@@ -3460,6 +3542,22 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 	preparation SessionShimAdoptionPreparationResult,
 	preparedHostID string,
 ) (SessionShimAdoptionEvidence, error) {
+	return d.sessionShimAdoptionEvidenceForGate(ctx, ctrl, preparation, preparedHostID, nil)
+}
+
+// sessionShimAdoptionEvidenceForGate builds the same evidence as
+// sessionShimAdoptionEvidence and additionally arms the proxy's
+// carrier-installed release on the consumer gate of the controller under
+// adoption. Every path that starts a gated consumer passes the gate it
+// started the consumer with; callers with no gated consumer pass nil and
+// keep the historical proxy.
+func (d *Daemon) sessionShimAdoptionEvidenceForGate(
+	ctx context.Context,
+	ctrl *sessionshim.Controller,
+	preparation SessionShimAdoptionPreparationResult,
+	preparedHostID string,
+	gate *shimAdoptionGate,
+) (SessionShimAdoptionEvidence, error) {
 	prepared := preparation.PreparedAdoption
 	lastForwarded := uint64(0)
 	if resumeFrom := ctrl.ResumeFrom(); resumeFrom > 0 {
@@ -3493,6 +3591,9 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 			if ctrl.SupportsAuthoritativeSnapshot() {
 				proxy := &SessionShimSnapshotProxy{controller: ctrl, daemon: d, identity: ctrl.Identity()}
 				proxy.active.Store(true)
+				if gate != nil {
+					proxy.carrierInstalled = gate.finishCarrierInstalled
+				}
 				return proxy
 			}
 			return nil

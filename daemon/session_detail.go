@@ -116,7 +116,8 @@ type SessionDetail struct {
 
 	// WorkType is the workflow discriminant ("development", "qa",
 	// "research", ...).
-	WorkType string `json:"workType,omitempty"`
+	WorkType     string `json:"workType,omitempty"`
+	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher.
@@ -376,6 +377,13 @@ type SessionDetail struct {
 	SessionStorageID string `json:"sessionStorageId,omitempty"`
 	SessionPublicID  string `json:"sessionPublicId,omitempty"`
 	TrackerSessionID string `json:"trackerSessionId,omitempty"`
+
+	// DeferFailureTransition forwards the per-work opt-in from PollWorkItem
+	// onto the runner's queued work. The runner skips the failure-side
+	// tracker transition only for a provider-error failure with zero tool
+	// calls, and records the deferral on the terminal result. Opaque
+	// forwarder only — same pattern as the trace-context fields above.
+	DeferFailureTransition bool `json:"deferFailureTransition,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in

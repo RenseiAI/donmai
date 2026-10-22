@@ -96,6 +96,7 @@ type PollWorkItem struct {
 	ProviderSessionID string                  `json:"providerSessionId,omitempty"`
 	OrganizationID    string                  `json:"organizationId,omitempty"`
 	WorkType          string                  `json:"workType,omitempty"`
+	WorkTypeRole      string                  `json:"workTypeRole,omitempty"`
 	PromptContext     string                  `json:"promptContext,omitempty"`
 	Body              string                  `json:"body,omitempty"`
 	Title             string                  `json:"title,omitempty"`
@@ -198,6 +199,15 @@ type PollWorkItem struct {
 	// false/absent ⇒ direct transition. *bool so absent (older coordinator) is
 	// distinguishable from explicit false, preserving the legacy capability fallback.
 	MergeQueueLanding *bool `json:"mergeQueueLanding,omitempty"`
+
+	// DeferFailureTransition opts this work item into deferring the
+	// failure-side tracker transition when a failed attempt may be
+	// retried on another endpoint. The runner skips the failure-side
+	// transition only for a provider-error failure with zero tool
+	// calls, and records the deferral on the terminal result. False
+	// (including every dispatch that predates this field) keeps the
+	// prior behaviour. Opaque forwarder only.
+	DeferFailureTransition bool `json:"deferFailureTransition,omitempty"`
 
 	// InjectedPoolID is the non-secret pool accounting sentinel the
 	// platform stamps for metered and shared auth modes:
@@ -1343,6 +1353,7 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		// ride the resolved profile. Every field is absent on a pre-P3 item,
 		// so the spec stays byte-identical for the existing fields (identity).
 		WorkType:              item.WorkType,
+		WorkTypeRole:          item.WorkTypeRole,
 		Mode:                  item.Mode,
 		CoAuthorName:          coAuthorName,
 		CoAuthorEmail:         coAuthorEmail,
@@ -1651,6 +1662,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		Ref:                     item.Ref,
 		BaseRef:                 item.BaseRef,
 		WorkType:                item.WorkType,
+		WorkTypeRole:            item.WorkTypeRole,
 		PromptContext:           item.PromptContext,
 		Body:                    item.Body,
 		Title:                   item.Title,
@@ -1695,6 +1707,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		SessionStorageID:        item.SessionStorageID,
 		SessionPublicID:         item.SessionPublicID,
 		TrackerSessionID:        item.TrackerSessionID,
+		DeferFailureTransition:  item.DeferFailureTransition,
 	}
 	for _, opt := range opts {
 		opt(detail)

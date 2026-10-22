@@ -2,13 +2,13 @@ package runner
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
@@ -204,7 +204,7 @@ func TestCheckpointProviderError_OwnsOnlyTheRemoteWIPBranch(t *testing.T) {
 	wipBranch := "wip/" + qw.SessionID
 	gitRun(t, wt, "checkout", "--quiet", "-b", wipBranch)
 	//nolint:gosec // G306: a hook stub must carry the exec bit.
-	if err := os.WriteFile(filepath.Join(wt, ".git", "hooks", "pre-push"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+	if err := testexec.WriteFile(filepath.Join(wt, ".git", "hooks", "pre-push"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
 		t.Fatalf("write pre-push hook: %v", err)
 	}
 	writeFile(t, wt, "notes.txt", "work\n")

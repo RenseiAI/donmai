@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
@@ -26,7 +28,7 @@ func fakeCodeBin(t *testing.T) string {
 	content := `#!/bin/sh
 printf '{"command":"%s","argv":"%s"}' "$1" "$*"
 `
-	if err := os.WriteFile(script, []byte(content), 0o750); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+	if err := testexec.WriteFile(script, []byte(content), 0o750); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
 		t.Fatalf("write fake af-code: %v", err)
 	}
 	t.Setenv("AGENTFACTORY_CODE_BIN", script)

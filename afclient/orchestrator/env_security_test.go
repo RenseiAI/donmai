@@ -14,6 +14,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/linear"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
@@ -62,7 +63,7 @@ func TestNativeDispatcher_ChildEnvSanitized(t *testing.T) {
 		`printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s:%s:%s"}]}}\n' "$status" "$LINEAR_ISSUE_ID" "$LINEAR_ISSUE_IDENTIFIER"` + "\n" +
 		`printf '%s:%s:%s\n' "$status" "$LINEAR_ISSUE_ID" "$LINEAR_ISSUE_IDENTIFIER" > env-report.txt` + "\n" +
 		`printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1}\n'` + "\n"
-	if err := os.WriteFile(providerBin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(providerBin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake provider: %v", err)
 	}
 	if err := os.Chmod(providerBin, 0o700); err != nil { //nolint:gosec // test fixture needs exec bit

@@ -21,9 +21,11 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
+	"github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
@@ -53,13 +55,51 @@ func writeShim(t *testing.T) string {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-interactive-cli")
-	if err := os.WriteFile(bin, []byte(shimScript), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte(shimScript), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
 		t.Fatal(err)
 	}
 	return bin
+}
+
+// writeMuseShim wraps the shared shim with the two native answers the muse
+// harness requires before PTY bring-up: `--version` (construction probe)
+// and the `exec` login probe (model-validation failure proves the login).
+// Every other invocation delegates to the shim, which prints the
+// env/geometry signals the test asserts on.
+func writeMuseShim(t *testing.T, shim string) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-muse")
+	body := "#!/bin/bash\n" +
+		"if [[ \"$1\" == \"--version\" ]]; then echo \"Muse Code 1.4.6 (1.4.6-R6000.1)\"; exit 0; fi\n" +
+		// The login-proven line must name the probe's own unresolvable model
+		// id (muse.hostLoginProbeModel): the verdict requires it. This
+		// literal must match that constant; if they drift, the muse login
+		// check refuses and the muse rows below fail loudly.
+		"if [[ \"$1\" == \"exec\" ]]; then echo \"model donmai-login-probe-nonexistent-model does not exist or you lack access\" >&2; exit 1; fi\n" +
+		"exec \"" + shim + "\"\n"
+	if err := testexec.WriteFile(bin, []byte(body), 0o600); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// writeMuseAuthFixture materializes a shape-valid login file for the muse
+// harness's file-leg login check (MUSE_AUTH_PATH override).
+func writeMuseAuthFixture(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "auth.json")
+	body := `{"schema_version":1,"providers":{"meta":{"mechanism":"oauth","storage":"keychain"}}}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 // spawnFn constructs the fake-binary-backed interactive spawn for one
@@ -157,6 +197,23 @@ func spawnTable() map[agent.HarnessName]spawnFn {
 			p, err := stub.New(stub.WithStubAgentCommand(bin))
 			if err != nil {
 				t.Fatalf("stub.New(fake): %v", err)
+			}
+			return p.Spawn(context.Background(), spec)
+		},
+		agent.HarnessMuse: func(t *testing.T, bin string, spec agent.Spec) (agent.Handle, error) {
+			// Point muse at a fake host via MuseBin. The shared shim is
+			// not a real host, so both the version probe (`--version`)
+			// and the interactive login check (`exec` probe + credential
+			// file) must be satisfied around it: this wrapper answers
+			// both and delegates the TUI invocation to the shim.
+			// muse.Spawn routes Spec.Interactive to its own
+			// spawnInteractive, which drives this same shared ptycli
+			// driver.
+			museBin := writeMuseShim(t, bin)
+			t.Setenv("MUSE_AUTH_PATH", writeMuseAuthFixture(t))
+			p, err := muse.New(muse.Options{MuseBin: museBin})
+			if err != nil {
+				t.Fatalf("muse.New(fake): %v", err)
 			}
 			return p.Spawn(context.Background(), spec)
 		},

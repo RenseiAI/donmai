@@ -18,6 +18,7 @@ import (
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -694,6 +695,32 @@ func TestDaemonRunControlAuth_FailsClosedEndToEnd(t *testing.T) {
 	}
 	if _, err := client.GetStatus(); err != nil {
 		t.Fatalf("GetStatus on a daemon without a control token: %v, want read-only routes to keep working", err)
+	}
+}
+
+// TestResolveQuotaProbeBinaries_MuseThroughSharedResolver pins the
+// muse half of the production wiring: with a fake muse binary
+// answering --version on PATH and a scrubbed HOME (so no host
+// install leaks in), the resolver reports the PATH binary — the
+// same binary the harness constructor would resolve.
+func TestResolveQuotaProbeBinaries_MuseThroughSharedResolver(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "muse")
+	if err := testexec.WriteFile(path, []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Muse Code 1.4.9\\n'; exit 0; fi\nexit 3\n"), 0o700); err != nil { //nolint:gosec // test fixture script
+		t.Fatalf("write fake muse CLI: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MUSE_BIN", "")
+	got := resolveQuotaProbeBinaries()
+	if got["muse"] != path {
+		t.Fatalf("muse probe binary = %q, want %q", got["muse"], path)
+	}
+	// With no muse anywhere, the harness stays unprobed rather than
+	// reporting a false verdict.
+	t.Setenv("PATH", t.TempDir())
+	if got := resolveQuotaProbeBinaries(); got["muse"] != "" {
+		t.Fatalf("muse probe binary = %q, want absent", got["muse"])
 	}
 }
 

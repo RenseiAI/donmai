@@ -90,6 +90,11 @@ type SessionCard struct {
 	// (assistant text, tool result, progress tick, system notice).
 	LastWorkAt   time.Time
 	LastOutputAt time.Time
+	// streamTicks counts live stream-progress signals since the last
+	// content event; it selects the streaming indicator's frame.
+	// streamingAt is the latest such signal; zero means not streaming.
+	streamTicks int
+	streamingAt time.Time
 }
 
 // EventsPath returns the absolute path to this card's events.jsonl, or ""

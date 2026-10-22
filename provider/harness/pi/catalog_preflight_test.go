@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // realCatalogListing is real `pi --list-models zai` output (captured against
@@ -280,7 +281,7 @@ func newFakeCatalogProbeBinary(t *testing.T, script string) string {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-pi")
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+	if err := testexec.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
 		t.Fatal(err)
 	}
 	return bin

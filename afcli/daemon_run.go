@@ -23,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/internal/statepath"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
+	providermuse "github.com/RenseiAI/donmai/provider/harness/muse"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/mcpheaders"
 	"github.com/RenseiAI/donmai/runtime/statehome"
@@ -173,7 +174,9 @@ var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
 // quota probes shell out to, keyed by harness. A harness with no binary
 // on PATH is absent from the map, which leaves its probe disabled: the
 // daemon reports no verdict for a harness it cannot read, rather than a
-// false one.
+// false one. The muse entry resolves through the harness's own shared
+// resolver, so the probe and the harness constructor never disagree
+// about which binary they see.
 func resolveQuotaProbeBinaries() map[string]string {
 	out := map[string]string{}
 	if path, err := exec.LookPath("codex"); err == nil && path != "" {
@@ -181,6 +184,9 @@ func resolveQuotaProbeBinaries() map[string]string {
 	}
 	if path, err := exec.LookPath("claude"); err == nil && path != "" {
 		out["claude"] = path
+	}
+	if path, err := providermuse.ResolveMuseBinary(""); err == nil && path != "" {
+		out["muse"] = path
 	}
 	return out
 }
@@ -449,10 +455,11 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			leaseManager, err := worktree.NewManager(worktree.Options{
 				ParentDir: worktreeParent,
 				Logger:    slog.Default(),
-				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
-					return archiveRegistry.ArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
+				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+					return archiveRegistry.CommitArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
 						AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
 						WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath,
+						TerminalResultID: spec.TerminalResultID,
 					})
 				},
 			})

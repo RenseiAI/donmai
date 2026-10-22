@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func copyLocalWorkerFixture(t *testing.T, source, destination string) {
@@ -86,7 +88,7 @@ func testLocalWorkerReplacementRefusesBeforeClaim(t *testing.T, replacement stri
 func TestLocalWorkerArtifactChangeRefusesBeforeClaim(t *testing.T) {
 	t.Parallel()
 	replacement := filepath.Join(t.TempDir(), "incompatible")
-	if err := os.WriteFile(replacement, []byte("#!/bin/sh\nexit 91\n"), 0o600); err != nil {
+	if err := testexec.WriteFile(replacement, []byte("#!/bin/sh\nexit 91\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	testLocalWorkerReplacementRefusesBeforeClaim(t, replacement)

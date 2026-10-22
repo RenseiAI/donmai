@@ -1,12 +1,12 @@
 package daemon
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/internal/testexec"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -50,7 +50,7 @@ func TestAcceptWork_BothSpawnPathsStripInheritedReadToken(t *testing.T) {
 		envPath := filepath.Join(dir, "child-env")
 		script := "#!/bin/sh\nenv > '" + strings.ReplaceAll(envPath, "'", `'\''`) + "'\nexit 0\n"
 		recorder := filepath.Join(dir, "fake-worker.sh")
-		if err := os.WriteFile(recorder, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
+		if err := testexec.WriteFile(recorder, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
 			t.Fatalf("write fake worker: %v", err)
 		}
 		s := NewWorkerSpawner(SpawnerOptions{

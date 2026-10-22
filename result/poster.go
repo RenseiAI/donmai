@@ -302,6 +302,13 @@ type statusRequest struct {
 	// downstream verification.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
 
+	// TerminalArchiveReference is the separately versioned committed-archive
+	// recovery reference. It carries the exact archive identity and digest
+	// beside the closed four-field lease projection above, which is never
+	// extended. Additive; omitted when the archive has not committed yet or
+	// the receiver predates the contract — old platforms ignore it.
+	TerminalArchiveReference *workarea.TerminalArchiveReference `json:"terminalArchiveReference,omitempty"`
+
 	// ExecutionSecurityRefusal is the typed pre-spawn refusal of a session
 	// refused for its stamped execution-security levels (closed code plus
 	// the dimensions it names), paired with failureMode
@@ -336,6 +343,21 @@ type statusRequest struct {
 	// rejected" from "server error". Additive; omitted on every run
 	// without an endpoint error — old platforms ignore it.
 	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
+
+	// FinalProvider names the provider the session's model calls last
+	// identified from native response evidence
+	// (LlmCallEvent.ResponseModelProvider) — the provider the wire
+	// response itself named. FinalModel is the served model id paired
+	// with it, and ProviderAttempts totals the serving attempts behind
+	// the session's calls (1 per model request, summed over calls that
+	// reported; zero means no call reported). Empty when no call carried
+	// response-provider evidence — never the configured selection
+	// (LlmCallEvent.System), which names the admitted entry even on a
+	// gateway-routed session. Additive; omitted when empty/zero — old
+	// platforms ignore them.
+	FinalProvider    string `json:"finalProvider,omitempty"`
+	FinalModel       string `json:"finalModel,omitempty"`
+	ProviderAttempts int    `json:"providerAttempts,omitempty"`
 
 	// ToolCalls counts the tool calls the session made across every
 	// stream: the initial turn, injected turns, continuations and
@@ -386,6 +408,10 @@ type errorEnvelope struct {
 // provider-owned agent.Result.
 type PostOptions struct {
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection
+	// TerminalArchiveReference is the committed-archive recovery reference,
+	// emitted only after the archive bytes and manifest commit. Nil omits
+	// the key so a run without a committed archive stays byte-identical.
+	TerminalArchiveReference *workarea.TerminalArchiveReference
 	// SeatState is the seat's final three-axis report (session presence,
 	// activity with its decided-by rung, resumability, plus the
 	// orthogonal needs-input signal). Nil omits the receipt keys so a
@@ -455,13 +481,21 @@ func (p *Poster) TerminalStatusEndpoint(sessionID string) string {
 // Header authorization remains fresh per send, but replay never reconstructs or
 // changes body fields such as workerId.
 func (p *Poster) PrepareTerminalStatusBody(ctx context.Context, sessionID string, r agent.Result, projection *workarea.TerminalLeaseProjection) ([]byte, error) {
+	return p.PrepareTerminalStatusBodyWithOptions(ctx, sessionID, r, PostOptions{TerminalWorkareaLease: projection})
+}
+
+// PrepareTerminalStatusBodyWithOptions captures the complete immutable status
+// body once, including the additive committed-archive recovery reference when
+// present. Header authorization remains fresh per send, but replay never
+// reconstructs or changes body fields such as workerId.
+func (p *Poster) PrepareTerminalStatusBodyWithOptions(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) ([]byte, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return nil, errors.New("result: sessionID is required")
 	}
 	if r.Status == "" {
 		return nil, errors.New("result: agent.Result.Status is required")
 	}
-	body := buildStatusRequest(p.credentials(ctx), r, projection)
+	body := buildStatusRequest(p.credentials(ctx), r, opts.TerminalWorkareaLease, opts.TerminalArchiveReference)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal terminal status body: %w", err)
@@ -493,7 +527,7 @@ func (p *Poster) PrepareWorkerExitedWithoutResultBody(sessionID, workerID string
 	body := buildStatusRequest(RuntimeCredentials{WorkerID: workerID}, agent.Result{
 		Status: "failed", FailureMode: WorkerExitedWithoutResultFailureMode,
 		Summary: "Worker exited without posting a terminal result.",
-	}, projection)
+	}, projection, nil)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal fallback terminal status body: %w", err)
@@ -627,7 +661,7 @@ func completionOutcome(status string) string {
 func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) error {
 	path := fmt.Sprintf("/api/sessions/%s/status", sessionID)
 	return p.doRetried(ctx, path, func(creds RuntimeCredentials) any {
-		return buildStatusRequest(creds, r, opts.TerminalWorkareaLease)
+		return buildStatusRequest(creds, r, opts.TerminalWorkareaLease, opts.TerminalArchiveReference)
 	})
 }
 
@@ -676,7 +710,7 @@ func summarizeSeatSummary(r agent.Result) *SeatStateSummary {
 	return out
 }
 
-func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *workarea.TerminalLeaseProjection) statusRequest {
+func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *workarea.TerminalLeaseProjection, archiveReference *workarea.TerminalArchiveReference) statusRequest {
 	worktreePath := r.WorktreePath
 	if projection != nil {
 		// The terminal lease projection is the only externally visible workarea
@@ -691,9 +725,11 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		ContinuationOutcome:      r.ContinuationOutcome,
 		TerminalWorkareaLease:    projection,
+		TerminalArchiveReference: archiveReference,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
 		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
+		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 		GenerationIDs: r.GenerationIDs,
 	}

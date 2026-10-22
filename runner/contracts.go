@@ -1,5 +1,7 @@
 package runner
 
+import "log/slog"
+
 // Completion contracts.
 //
 // Typed declaration of what each work type must produce before a session
@@ -176,10 +178,28 @@ var completionContracts = map[string]CompletionContract{
 
 // GetCompletionContract returns the completion contract for a work
 // type. Returns the contract and true on hit; returns the zero
-// CompletionContract and false for unknown work types (caller treats as
-// no contract — best-effort completion).
-func GetCompletionContract(workType string) (CompletionContract, bool) {
+// CompletionContract and false when neither a legacy contract nor a valid
+// fallback role defines one. Known names retain their legacy obligations.
+// The optional role preserves compatibility with callers using names alone.
+func GetCompletionContract(workType string, role ...string) (CompletionContract, bool) {
 	c, ok := completionContracts[workType]
+	if ok || IsKnownWorkType(workType) {
+		return c, ok
+	}
+	if len(role) == 0 {
+		return CompletionContract{}, false
+	}
+	parsed, valid := ParseWorkTypeRole(role[0])
+	if !valid {
+		if unrecognizedWorkTypeRole(workType, role[0]) {
+			slog.Warn("unrecognized workTypeRole", "workType", workType, "workTypeRole", role[0])
+		}
+		return CompletionContract{}, false
+	}
+	c, ok = contractForRole(parsed)
+	if ok {
+		c.WorkType = workType
+	}
 	return c, ok
 }
 
@@ -187,8 +207,8 @@ func GetCompletionContract(workType string) (CompletionContract, bool) {
 // includes FieldWorkResult as a required field. Drives the
 // diagnostic-comment branch in the post-session block when the agent
 // exits without emitting a WORK_RESULT marker.
-func RequiresWorkResult(workType string) bool {
-	c, ok := completionContracts[workType]
+func RequiresWorkResult(workType string, role ...string) bool {
+	c, ok := GetCompletionContract(workType, role...)
 	if !ok {
 		return false
 	}
@@ -201,8 +221,8 @@ func RequiresWorkResult(workType string) bool {
 }
 
 // RequiresPRURL reports whether the contract for this work type includes
-// FieldPRURL as a required field. Today only development / inflight owe a
-// PR to complete; QA / acceptance / merge / coordination are
+// FieldPRURL as a required field. Development / inflight and custom
+// inflight-role work owe a PR; QA / acceptance / merge / coordination are
 // result-sensitive yet legitimately produce NO new PR.
 //
 // This gates the pushed-but-no-PR terminal reclassification in
@@ -210,8 +230,8 @@ func RequiresWorkResult(workType string) bool {
 // CONTRACT requires a PR should be reclassified failed when the backstop
 // cannot surface one. Gating on isResultSensitive instead would flip a
 // passing QA/acceptance/merge leg (which owes no PR) to failed → Rejected.
-func RequiresPRURL(workType string) bool {
-	c, ok := completionContracts[workType]
+func RequiresPRURL(workType string, role ...string) bool {
+	c, ok := GetCompletionContract(workType, role...)
 	if !ok {
 		return false
 	}
@@ -224,12 +244,23 @@ func RequiresPRURL(workType string) bool {
 }
 
 // RequiresReviewVerdict reports whether the work type is review work that
-// closes on a structured review outcome: QA and acceptance carry one of
+// closes on a structured review outcome: QA, acceptance and custom review
+// work carry one of
 // APPROVE | APPROVE_WITH_FOLLOWUPS | REQUEST_CHANGES on the turn result
 // (agent.TurnManifest.ReviewVerdict), next to the pass/fail outcome, so
 // graders, the scorecard and reviewer calibration can read it without
 // scraping prose.
-func RequiresReviewVerdict(workType string) bool {
+func RequiresReviewVerdict(workType string, role ...string) bool {
+	if !IsKnownWorkType(workType) && len(role) > 0 {
+		parsed, valid := ParseWorkTypeRole(role[0])
+		if !valid {
+			if unrecognizedWorkTypeRole(workType, role[0]) {
+				slog.Warn("unrecognized workTypeRole", "workType", workType, "workTypeRole", role[0])
+			}
+			return false
+		}
+		return parsed == WorkTypeRoleReview
+	}
 	switch workType {
 	case WorkTypeQAStr, WorkTypeAcceptance:
 		return true

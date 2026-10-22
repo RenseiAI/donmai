@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/prompt"
 )
 
@@ -141,7 +142,7 @@ func installProtectedBranchHook(t *testing.T, bare, branch string) {
 		"done\n" +
 		"exit 0\n"
 	//nolint:gosec // G306: a hook stub must carry the exec bit.
-	if err := os.WriteFile(hook, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(hook, []byte(script), 0o700); err != nil {
 		t.Fatalf("write pre-receive hook: %v", err)
 	}
 }
@@ -620,7 +621,7 @@ func TestRunBackstop_ContinueModePushesHeadWithoutNewPR(t *testing.T) {
 	ghPath := filepath.Join(dir, "gh")
 	script := "#!/bin/sh\nif [ \"$1\" = \"repo\" ]; then echo PRIVATE; exit 0; fi\necho 'gh must not run in continue mode' 1>&2\nexit 99\n"
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
-	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+	if err := testexec.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh guard stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -29,6 +29,22 @@ and no other Spec or provider option widens it. Env: `META_API_KEY` is stripped
 unless the Spec sets it; `MUSE_NO_AUTO_UPDATE=1` is always set. The cwd
 is the realpath of the workspace (the host rejects non-canonical roots).
 
+## Interactive PTY spawn mode
+
+A session with `Spec.Interactive` set spawns the bare `muse` TUI under a
+PTY via the shared ptycli driver instead of the serve host (selected per
+Spawn call; the declared Transport is unchanged). The positional seed
+carries system append + initial context + prompt, last; model/effort pass
+through; autonomous sessions run `--approval-mode never`; the read-only
+lane keeps the serve lane's `--disable-shell --disable-write`. The TUI
+exposes no MCP, approval-bridge, or allow-list channel, so a spec stamping
+any of them denies at admission. Before any child starts, the spawn runs
+two checks in order: the install check (`CheckHostSessionLogin`, the
+version evidence the Host login check section covers) and then the
+interactive login check (`CheckInteractiveSessionLogin`: credential file
++ no-cost native probe). Events are the
+coarse Init/terminal-Result contract; the terminal stream is the product.
+
 ## Confinement
 
 The serve child runs under the executor OS confinement (seatbelt on
@@ -91,6 +107,25 @@ First-turn failures classify into typed causes alongside the spawn
 failure: logged-out signals (unauthenticated, not logged in, login
 required) vs model-not-entitled signals (does not exist or lack
 access, unauthorized, forbidden).
+
+## Host login check
+
+`CheckHostSessionLogin` proves a supported CLI is installed: one
+bounded `<binary> --version` run (5s timeout, owned process group,
+minimal env with `MUSE_NO_AUTO_UPDATE=1`, bounded output capture),
+parsed with the same parser and compared against the same
+`MinVersion` the constructor enforces. The binary resolves through
+the shared `ResolveMuseBinary` chain (explicit option, then
+`$MUSE_BIN`, then `muse` on PATH, then `~/.local/bin/muse`), so the
+check and the constructor never disagree. No network, no serve
+child, no model turn, no credential file reads.
+
+The CLI exposes no login-status command, so this is install
+evidence, not login entitlement: a host without a valid login is
+classified at the first turn instead. The daemon runs this check on
+its 5-minute quota-probe cadence and publishes the verdict on the
+heartbeat quota field as a windowless `muse-host-session` entry
+carrying `authCheck`.
 
 ## Live proof
 
