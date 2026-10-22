@@ -760,6 +760,36 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// process that actually spawns the fan-out — carries them. Explicit
 	// values win; a disabled budget changes nothing.
 	specEnv := cappedSessionEnv(qw)
+	// 3b. Install the session-scoped pkill/killall guards into a fresh
+	// runner-owned directory (never inside the session checkout: a
+	// checkout-controlled PATH entry would let a tracked or
+	// agent-written executable shadow host tools, and writing into the
+	// checkout would modify read-only negotiated repositories and
+	// pollute scratch-path commits) and lead PATH with it. Host-mode
+	// sessions run as the operator's OS user, so an agent's pattern kill
+	// would otherwise match other sessions' and the operator's own
+	// processes. The guards ship with the runner (go:embed) and only
+	// signal processes inside this session's worktree (or workarea
+	// root); the rest are refused and reported as typed activity events
+	// at teardown. Best-effort: an install failure is logged, the session
+	// env is stamped degraded (DONMAI_SIGNAL_GUARD_DEGRADED=1), and the run
+	// continues with an unguarded PATH rather than failing the session; the
+	// drain reports a session-visible degraded event so the outage is not
+	// silent.
+	signalGuard, guardErr := installSignalGuard()
+	if guardErr != nil {
+		r.logger.Warn("signal guard install failed; pattern kills are unscoped",
+			"sessionId", qw.SessionID,
+			"err", guardErr,
+		)
+		signalGuard = signalGuardLayout{degraded: true}
+	}
+	if signalGuard.dir != "" {
+		// The guard directory lives only for this run: remove it on
+		// every return path below.
+		defer func() { _ = os.RemoveAll(signalGuard.dir) }()
+	}
+	specEnv = signalGuardEnv(specEnv, signalGuard, wpath, res.WorkareaRoot)
 	effectiveMCPBearerFile, err := prepareSessionMCPBearerEnv(
 		qw,
 		specEnv,
@@ -938,6 +968,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// no-op when the block is absent (byte-identical prompt to today).
 	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
+	if signalGuard.degraded {
+		composition.HarnessProtocol = injectSignalGuardDegradedProtocolPartial(composition.HarnessProtocol)
+	} else {
+		composition.HarnessProtocol = injectSignalGuardProtocolPartial(composition.HarnessProtocol)
+	}
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
 	if qw.isInteractive() {
@@ -1056,6 +1091,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return err
 		}
 	}
+	// Each host session's processes run in their own process group
+	// (every harness spawns with Setpgid), recorded here from the
+	// spawned harness pid. The pkill/killall guards consult it as the
+	// second scope leg alongside the worktree: a session process running
+	// outside the worktree (a daemon child, a tmp tool) is still in
+	// scope via its group, while another session's identical command
+	// line is not. The group id is delivered through the guard
+	// directory's session.pgid file, which the guards read at exec time
+	// (the session env above was already composed before spawn, so
+	// stamping the env here would never reach the harness); the
+	// best-effort state.json record keeps the group visible for
+	// forensics.
+	spec.OnProcessSpawned = chainOnProcessSpawned(spec.OnProcessSpawned, func(pid int) {
+		r.recordSessionProcessGroup(runnerStatePath, qw.SessionID, pid, signalGuard.dir)
+	})
 	if repositoryDeclaration != nil {
 		policy, policyErr := repositoryAuthorityPolicy(*repositoryDeclaration, declaredRepositoryPaths, skippedRepositories,
 			res.WorkareaRoot, wpath, string(executorWorkareaCapabilities.RepositoryAuthorityEnforcement))
@@ -1231,6 +1281,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		sink = eventSink
 		defer func() { eventSink.Close(res) }()
 	}
+
+	// 9b.2 Drain the session's signal-guard refusal log into typed
+	// activity events on every terminal path below. The pkill/killall
+	// guards appended one line per refused pattern kill; each becomes a
+	// signal_guard_refused event on the activity stream (and in
+	// events.jsonl) so both sides can see what the session attempted
+	// and what the guard spared. Best-effort. The defer runs before the
+	// sink teardowns above (LIFO), so refusals flow through the full
+	// sink chain. Terminal paths before this point (provisioning, spawn
+	// failure) cannot hold refusals: no agent code runs before spawn.
+	// The events mirror lands under runnerStatePath (never the session
+	// checkout: in a read-only negotiated workarea the runner must not
+	// write into the selected repository).
+	defer func() { r.reportSignalGuardRefusals(ctx, signalGuard, runnerStatePath, sink) }()
 
 	// 9c. Start the additive per-call span pipeline when explicitly enabled by
 	// the binary/operator or when the dispatch advertises a compatible ingest
