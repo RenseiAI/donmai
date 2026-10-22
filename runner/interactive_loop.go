@@ -728,7 +728,7 @@ func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath
 	}
 	if system, ok := event.(agent.SystemEvent); ok {
 		switch system.Subtype {
-		case "harness_state_lost":
+		case "harness_state_lost", agent.SystemSubtypeHarnessLifecycle:
 			r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
 			return
 		case "user_message", "turn_completed":

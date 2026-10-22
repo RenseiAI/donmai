@@ -9,6 +9,7 @@ package codex
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -776,6 +777,20 @@ func TestWrapInteractiveConversationHandle_ForwardsRolloutConversation(t *testin
 	// The fake app-server always creates the same thread id; plant a
 	// real-shaped rollout for exactly that thread in the spawned home.
 	plant := func(home string) {
+		raw, err := os.ReadFile(filepath.Join(home, "config.toml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hooks, _ := decodeActivityConfig(t, string(raw))
+		groups := hooks["SessionStart"].([]map[string]any)
+		entries := groups[0]["hooks"].([]map[string]any)
+		command := entries[0]["command"].(string)
+		hook := exec.CommandContext(t.Context(), "/bin/sh")
+		hook.Stdin = strings.NewReader(command)
+		if out, err := hook.CombinedOutput(); err != nil {
+			t.Fatalf("fire installed hook: %s: %v", out, err)
+		}
+
 		dir := filepath.Join(home, codexSessionStateSubdir, "2026", "10", "09")
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
@@ -807,10 +822,15 @@ func TestWrapInteractiveConversationHandle_ForwardsRolloutConversation(t *testin
 		}
 	}
 	h := spawnInteractiveForUsageTest(t, self, boundaryRoot, workdir, mcpServers, nil, plant)
-	wrapper, ok := h.(*interactiveConversationHandle)
+	wrapper, ok := h.(*activityHandle)
 	if !ok {
-		t.Fatalf("SpawnInteractive returned %T; want *interactiveConversationHandle", h)
+		t.Fatalf("SpawnInteractive returned %T; want *activityHandle", h)
 	}
+	home, thread := wrapper.ContextUsageRollout()
+	if home == "" || thread != fakeNamedAppServerThreadID {
+		t.Fatalf("context source = (%q, %q); want session home and named thread", home, thread)
+	}
+	var lifecycle bool
 	var texts, tools []string
 	var terminal *agent.ResultEvent
 	timeout := time.After(20 * time.Second)
@@ -822,6 +842,8 @@ drain:
 				break drain
 			}
 			switch v := ev.(type) {
+			case agent.SystemEvent:
+				lifecycle = lifecycle || (v.Subtype == agent.SystemSubtypeHarnessLifecycle && v.Message == agent.HarnessLifecycleSessionStart)
 			case agent.AssistantTextEvent:
 				texts = append(texts, v.Text)
 			case agent.ToolUseEvent:
@@ -836,6 +858,14 @@ drain:
 		case <-timeout:
 			t.Fatal("timed out waiting for the terminal ResultEvent")
 		}
+	}
+	select {
+	case <-wrapper.ActivityFlushed():
+	default:
+		t.Fatal("terminal result arrived before combined activity flush")
+	}
+	if !lifecycle {
+		t.Fatal("installed activity hook did not reach Events alongside conversation")
 	}
 	if len(texts) != 1 || texts[0] != "live codex turn" {
 		t.Fatalf("conversation texts = %v; want [live codex turn]", texts)

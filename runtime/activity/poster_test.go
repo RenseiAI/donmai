@@ -672,6 +672,31 @@ func TestEventMappingTable(t *testing.T) {
 			wantContext:   "toolCallTimeoutSeconds=unrecognized",
 		},
 		{
+			name:        "System harness lifecycle session start -> context naming the moment",
+			event:       agent.HarnessLifecycleEvent(agent.HarnessLifecycleSessionStart),
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "harness lifecycle: session_start",
+			wantContext: "harnessLifecycle=session_start",
+		},
+		{
+			name:        "System harness lifecycle permission request -> context naming the moment",
+			event:       agent.HarnessLifecycleEvent(agent.HarnessLifecyclePermissionRequest),
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "harness lifecycle: permission_request",
+			wantContext: "harnessLifecycle=permission_request",
+		},
+		{
+			name:          "System harness lifecycle unknown moment -> fixed context, never the value",
+			event:         agent.SystemEvent{Subtype: agent.SystemSubtypeHarnessLifecycle, Message: "free-form message must not cross the wire"},
+			wantSent:      true,
+			wantType:      "context",
+			wantContent:   "harness lifecycle: unrecognized moment",
+			rejectContent: "free-form message",
+			wantContext:   "harnessLifecycle=unrecognized",
+		},
+		{
 			name:        "System signal guard refused -> context with the refusal line",
 			event:       agent.SystemEvent{Subtype: "signal_guard_refused", Message: "refused pkill -f 'x': pid(s) 11 outside session scope (worktree /w)"},
 			wantSent:    true,
@@ -1273,5 +1298,22 @@ func TestPosterDispatchTraceHeaders(t *testing.T) {
 				t.Fatalf("post attempts = %d; want 2", got)
 			}
 		})
+	}
+}
+
+// TestHarnessLifecycleUnrecognizedIsOwnConstant pins m2: the harness-lifecycle
+// family has its own unrecognized sentinel, not an alias of the
+// reasoning-effort family's. Deleting the constant (reverting to
+// ReasoningEffortUnrecognized) fails this file to compile (RED).
+func TestHarnessLifecycleUnrecognizedIsOwnConstant(t *testing.T) {
+	t.Parallel()
+	if activity.HarnessLifecycleUnrecognized != "unrecognized" {
+		t.Fatalf("HarnessLifecycleUnrecognized = %q, want unrecognized", activity.HarnessLifecycleUnrecognized)
+	}
+	if got := activity.HarnessLifecycleContextValue("bogus-moment"); got != activity.HarnessLifecycleUnrecognized {
+		t.Fatalf("unknown moment contextValue = %q, want the harness-lifecycle sentinel", got)
+	}
+	if got := activity.HarnessLifecycleContent("bogus-moment"); !strings.Contains(got, "unrecognized moment") {
+		t.Fatalf("unknown moment content = %q, want the fixed unrecognized sentence", got)
 	}
 }

@@ -48,7 +48,7 @@ import (
 //   - Hooks discovered in the workspace are NOT platform-provisioned. They are
 //     repo content — whoever wrote the checked-out tree chose them — and
 //     trusting them grants arbitrary command execution OUTSIDE the sandbox for
-//     the life of the session. This leg therefore never marks a hook trusted.
+//     the life of the session. This leg therefore never marks such a hook trusted: the only exception is the platform-provisioned activity-telemetry hooks (see activityhooks.go), which the harness itself renders alongside their pre-computed hashes.
 //     It instead takes the same answer the third option of codex's own modal
 //     offers ("Continue without trusting — hooks won't run") and takes it
 //     deterministically, by turning the hooks feature off for this process. The
@@ -144,17 +144,21 @@ func codexHooksPolicy(getenv func(string) string) (string, error) {
 // sit on it forever — so the session is refused with a message that names the
 // missing trust instead.
 func interactiveTrustArgs(cwd string, hooksPolicy string, getwd func() (string, error)) ([]string, error) {
-	return interactiveTrustArgsWithLevel(cwd, hooksPolicy, codexTrustLevelTrusted, getwd)
+	return interactiveTrustArgsWithLevel(cwd, hooksPolicy, codexTrustLevelTrusted, false, getwd)
 }
 
-func interactiveTrustArgsWithLevel(cwd, hooksPolicy, trustLevel string, getwd func() (string, error)) ([]string, error) {
+func interactiveTrustArgsWithLevel(cwd, hooksPolicy, trustLevel string, activityHooks bool, getwd func() (string, error)) ([]string, error) {
 	dirs, err := sessionWorkspaceTrustDirs(cwd, getwd)
 	if err != nil {
 		return nil, err
 	}
 
 	args := []string{"--config", projectsTrustOverride(dirs, trustLevel)}
-	if hooksPolicy == codexHooksOff {
+	// Activity-hook seats keep the hooks feature enabled for the
+	// platform's own pre-trusted hooks (see activityhooks.go): no other
+	// hooks exist in the private home, and the untrusted project layer
+	// stays unloaded on its own. Every other seat keeps the feature off.
+	if hooksPolicy == codexHooksOff && !activityHooks {
 		// Disables codex's hooks feature for this process only. Expressed as a
 		// dotted config path rather than the `--disable <feature>` flag on
 		// purpose: an unknown feature NAME is fatal to that flag ("Error:

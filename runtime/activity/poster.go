@@ -90,6 +90,11 @@ const (
 	// verdict. (The subtype constant lives in runner to avoid an
 	// activity→runner import; the literal is pinned by test.)
 	signalGuardRefusedContentPrefix = "pattern kill refused: "
+
+	// harnessLifecycleContentPrefix prefixes the fixed-vocabulary moment a
+	// harness-lifecycle marker carries (HarnessLifecycleContent). The
+	// content never carries hook output — the moment is the telemetry.
+	harnessLifecycleContentPrefix = "harness lifecycle: "
 )
 
 // RuntimeCredentials are the bearer-token credentials needed for an
@@ -791,6 +796,12 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.ContextKey = ToolCallBoundsContextKey
 			out.ContextValue = ToolCallBoundsContextValue(e.Message)
 			return out, true
+		case agent.SystemSubtypeHarnessLifecycle:
+			out.Type = "context"
+			out.Content = HarnessLifecycleContent(e.Message)
+			out.ContextKey = HarnessLifecycleContextKey
+			out.ContextValue = HarnessLifecycleContextValue(e.Message)
+			return out, true
 		case signalGuardRefusedSubtype:
 			// A pattern kill the session's pkill/killall guards refused:
 			// the agent asked to signal processes outside its session
@@ -929,6 +940,42 @@ const (
 	toolCallBoundsNotConfiguredContent = "tool call timeout: not configured; a long-running tool call may end the session"
 	toolCallBoundsInvalidContent       = "tool call timeout: the configured value is not a positive number of seconds"
 )
+
+// HarnessLifecycleContextKey is the contextKey a harness-lifecycle marker
+// carries, so a control plane can read which lifecycle moment fired
+// without parsing Content.
+const HarnessLifecycleContextKey = "harnessLifecycle"
+
+// HarnessLifecycleUnrecognized is the contextValue a harness-lifecycle
+// marker carries for a moment outside the four known ones. It has the
+// same value as ReasoningEffortUnrecognized but is a separate constant
+// so the two marker families cannot drift together.
+const HarnessLifecycleUnrecognized = "unrecognized"
+
+// HarnessLifecycleContextValue is the contextValue of a
+// harness-lifecycle marker: the moment name for the four known moments,
+// else the unrecognized sentinel. Like the Content, it never carries
+// free-form text.
+func HarnessLifecycleContextValue(moment string) string {
+	switch moment {
+	case agent.HarnessLifecycleSessionStart,
+		agent.HarnessLifecycleUserPromptSubmit,
+		agent.HarnessLifecycleStop,
+		agent.HarnessLifecyclePermissionRequest:
+		return moment
+	default:
+		return HarnessLifecycleUnrecognized
+	}
+}
+
+// HarnessLifecycleContent is the fixed-vocabulary activity content for an
+// agent.SystemSubtypeHarnessLifecycle marker.
+func HarnessLifecycleContent(moment string) string {
+	if HarnessLifecycleContextValue(moment) == HarnessLifecycleUnrecognized {
+		return harnessLifecycleContentPrefix + "unrecognized moment"
+	}
+	return harnessLifecycleContentPrefix + moment
+}
 
 // ToolCallBoundsContextValue is the contextValue of a tool-call-bounds
 // marker: the bound in seconds when Message parses as a positive integer,

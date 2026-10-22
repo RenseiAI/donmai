@@ -6,12 +6,20 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/google/uuid"
 )
+
+// newStopHookChannelFn creates the Stop-hook notice channel. It is a var
+// so tests can force the relay-only path (hook failure with relay success)
+// without breaking the temp dir for both. It lives above spawnInteractive
+// so the spawn-mode doc comment stays attached to the function.
+var newStopHookChannelFn = newStopHookChannel
 
 // spawnInteractive opens the claude CLI's OWN interactive REPL — bare
 // `claude`, with NEITHER `-p`/`--print` NOR `--output-format stream-json`
@@ -56,7 +64,19 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// and lets the runner report the absence per message (it dead-letters
 	// against a declared-but-absent channel, so the producer learns), rather
 	// than killing a session over a latency optimisation.
-	hook, hookErr := newStopHookChannel()
+	hook, hookErr := newStopHookChannelFn()
+	// The activity relay is best effort like the notice channel: a relay
+	// that cannot be created is a session without hook telemetry, not a
+	// failed session. It shares nothing with the notice drop — either may
+	// exist without the other — but both ride the one --settings string.
+	relay, relayErr := activityrelay.New()
+	if relayErr != nil {
+		relay = nil
+	}
+	var activity map[string]any
+	if relay != nil {
+		activity = activitySettingsEntries(relay)
+	}
 	// Pin a fresh Claude conversation identity before spawn, so its transcript
 	// can be found even if the process dies before invoking its first Stop hook.
 	sessionID := uuid.NewString()
@@ -64,6 +84,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		hook.usageSessionID = sessionID
 		hook.usageConfigDir = interactiveUsageConfigDir(spec.Env)
 	}
+
 	settings := ""
 	if hookErr == nil {
 		// The routing pin rides this same --settings string (see
@@ -78,26 +99,20 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		// session environment once the repo path is trusted, exactly as on
 		// the headless lane — that execution surface is the accepted model
 		// for a trusted repo, not something the pin closes.
-		if settings, err = hook.settingsJSONWithPin(pinnedRoutingEnv(spec)); err != nil {
+		if settings, err = hook.settingsJSONWithPinAndActivity(pinnedRoutingEnv(spec), activity); err != nil {
 			// Fail closed: the Stop-hook channel is best-effort, but the
 			// routing pin is not. A session that spawned without the pin
 			// would let a repo-local settings file redirect its bearer,
-			// so fall back to a pin-only --settings rather than none.
+			// so fall back to pin plus telemetry rather than none.
 			_ = hook.close()
 			hook = nil
-			if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
-				settings = pinOnly
-			} else {
-				settings = ""
-			}
+			settings = pinActivitySettings(pinnedRoutingEnv(spec), activity)
 		}
 	} else {
 		hook = nil
-		// Fail closed without the hook channel too: carry the pin alone
-		// rather than spawning unpinned.
-		if pinOnly, pinErr := marshalRoutingPin(pinnedRoutingEnv(spec)); pinErr == nil && pinOnly != "" {
-			settings = pinOnly
-		}
+		// Fail closed without the hook channel too: carry the pin (and
+		// any telemetry) rather than spawning unpinned.
+		settings = pinActivitySettings(pinnedRoutingEnv(spec), activity)
 	}
 
 	cleanup := func() error {
@@ -117,18 +132,24 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		if hook != nil {
 			errs = append(errs, hook.close())
 		}
+		if relay != nil {
+			errs = append(errs, relay.Close())
+		}
 		return errors.Join(errs...)
 	}
 
 	argv := append([]string{"--session-id", sessionID}, interactiveArgsWith(spec, mcpPath, settings)...)
 	h, err := ptycli.SpawnWithCleanup(ctx, p.binary, argv, spec, p.Manifest(), cleanup)
 	if err != nil {
+		if relay != nil {
+			_ = relay.Close()
+		}
 		return nil, err
 	}
-	if hook == nil {
+	if hook == nil && relay == nil {
 		return h, nil
 	}
-	return wrapInteractiveHandle(h, hook), nil
+	return wrapInteractiveHandle(h, hook, relayTailer(relay)), nil
 }
 
 // interactiveEventSlots sizes the wrapped handle's event channel. The coarse
@@ -160,7 +181,16 @@ const (
 // Teardown: every helper goroutine returns at session end whether or not the
 // caller drains Events — the tailer stops on Done and never blocks, and the
 // coarse sends always fit the reserved slots — after which Events closes.
-func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactiveHandle {
+// relayTailer returns the activity tailer for relay, or nil when the
+// session runs without hook telemetry.
+func relayTailer(relay *activityrelay.Relay) *activityrelay.Tailer {
+	if relay == nil {
+		return nil
+	}
+	return activityrelay.NewTailer(relay.EventsPath())
+}
+
+func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel, activity *activityrelay.Tailer) *interactiveHandle {
 	w := &interactiveHandle{
 		Handle:          h,
 		notices:         hook,
@@ -213,7 +243,7 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 	go func() {
 		defer wg.Done()
 		defer tailsWg.Done()
-		tailer := newInteractiveUsageTailer(hook)
+		tailer := newInteractiveUsageTailerWithActivity(hook, activity)
 		tailer.run(session.Done(), emit)
 	}()
 	// Transcript conversation tail: while the session runs, its JSONL
@@ -229,7 +259,11 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel) *interactive
 	go func() {
 		defer wg.Done()
 		defer tailsWg.Done()
-		tailer := newInteractiveConversationTailer(hook, hook.createdAt)
+		since := time.Now()
+		if hook != nil {
+			since = hook.createdAt
+		}
+		tailer := newInteractiveConversationTailer(hook, since)
 		tailer.run(session.Done(), emit)
 	}()
 	go func() {
@@ -295,8 +329,16 @@ var (
 	_ agent.InteractiveActivityFlusher = (*interactiveHandle)(nil)
 )
 
-// NoticeChannel returns this session's Stop-hook channel.
-func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notices }
+// NoticeChannel returns this session's Stop-hook channel, or nil when the
+// session runs without one (relay-only telemetry). A typed-nil return
+// would present a non-nil interface holding a nil receiver, which panics
+// on Offer; the runner dead-letters only on a real nil, so return one.
+func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel {
+	if h == nil || h.notices == nil {
+		return nil
+	}
+	return h.notices
+}
 
 // ContextUsageSidecarPath returns the session's statusline sidecar path:
 // the file the session's own statusLine command maintains with the live

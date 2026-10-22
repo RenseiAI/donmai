@@ -293,6 +293,15 @@ func (c *stopHookChannel) settingsJSON() (string, error) {
 // Anything outside that set is dropped rather than passed through, so a
 // caller cannot smuggle an unrelated variable onto the CLI's winning layer.
 func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, error) {
+	return c.settingsJSONWithPinAndActivity(pin, nil)
+}
+
+// settingsJSONWithPinAndActivity renders settingsJSONWithPin with the
+// session's activity-hook telemetry entries merged into the hooks map.
+// activity is nil when the relay could not be created, in which case the
+// render is exactly settingsJSONWithPin: telemetry is best-effort and
+// its absence never changes the notice channel or the routing pin.
+func (c *stopHookChannel) settingsJSONWithPinAndActivity(pin map[string]string, activity map[string]any) (string, error) {
 	env := make(map[string]string)
 	for k, v := range pin {
 		// Fallback names first, for the same reason as marshalRoutingPin:
@@ -308,6 +317,20 @@ func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, er
 		}
 		env[k] = v
 	}
+	hooks := map[string]any{
+		"Stop": []any{
+			map[string]any{
+				"hooks": []any{
+					map[string]any{
+						"type":    "command",
+						"command": "/bin/sh " + shellQuote(c.path(stopHookScriptFile)),
+						"timeout": stopHookTimeoutSeconds,
+					},
+				},
+			},
+		},
+	}
+	hooks = mergeActivityHooks(hooks, activity)
 	settings := map[string]any{
 		// skipDangerousModePermissionPrompt answers the bypass-permissions
 		// acceptance the CLI raises on an interactive TTY before the first
@@ -330,19 +353,7 @@ func (c *stopHookChannel) settingsJSONWithPin(pin map[string]string) (string, er
 			"type":    "command",
 			"command": "/bin/sh " + shellQuote(c.path(statusLineSidecarScriptFile)),
 		},
-		"hooks": map[string]any{
-			"Stop": []any{
-				map[string]any{
-					"hooks": []any{
-						map[string]any{
-							"type":    "command",
-							"command": "/bin/sh " + shellQuote(c.path(stopHookScriptFile)),
-							"timeout": stopHookTimeoutSeconds,
-						},
-					},
-				},
-			},
-		},
+		"hooks": hooks,
 	}
 	if len(env) > 0 {
 		settings["env"] = env

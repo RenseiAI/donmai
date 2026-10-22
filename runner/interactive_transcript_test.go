@@ -423,6 +423,27 @@ printf '{"type":"message","id":"final","message":{"role":"assistant","content":[
 	}
 }
 
+// TestInteractive_HarnessLifecycleReachesActivitySink pins that a
+// harness-lifecycle event off a seat's handle is forwarded to the
+// activity sink (and mirrored to events.jsonl) like the other coarse
+// lifecycle signals, while an unknown SystemEvent subtype stays
+// runner-internal.
+func TestInteractive_HarnessLifecycleReachesActivitySink(t *testing.T) {
+	r := minimalRunner(t)
+	sink := &recordingSink{}
+	dir := t.TempDir()
+	ctx := context.Background()
+	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.HarnessLifecycleEvent(agent.HarnessLifecycleStop), nil)
+	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.SystemEvent{Subtype: "some-future-subtype", Message: "x"}, nil)
+	if len(sink.events) != 1 {
+		t.Fatalf("sink got %d events, want exactly the lifecycle one", len(sink.events))
+	}
+	system, ok := sink.events[0].(agent.SystemEvent)
+	if !ok || system.Subtype != agent.SystemSubtypeHarnessLifecycle || system.Message != agent.HarnessLifecycleStop {
+		t.Fatalf("sink event = %#v, want harness_lifecycle/stop", sink.events[0])
+	}
+}
+
 // TestInteractive_TranscriptActivityForwardsContentVerbatim pins that the
 // interactive lane does not pre-cut transcript content: a byte cut here split
 // multi-byte runes and dropped the tail of tool output before the activity
