@@ -1469,8 +1469,9 @@ func TestFormatSeatBudgetStatus(t *testing.T) {
 }
 
 // TestFormatConfinementStatus pins the confinement row: attested with the
-// backend, degraded with the missing layer and the floor, none where no
-// backend exists, not reported against an older daemon.
+// backend, degraded with the missing layer and the floor, unproven with
+// the verdict word attached, none where no backend exists, not reported
+// against an older daemon.
 func TestFormatConfinementStatus(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -1491,11 +1492,11 @@ func TestFormatConfinementStatus(t *testing.T) {
 			status: &afclient.ConfinementStatus{Backend: "linux-mount-namespace", Degraded: "the scope layer is unenforced: Landlock ABI 5 has no signal or abstract-socket scope (ABI 6, Linux 6.12, needed)", Detail: "seat boundary is partial below Linux 6.12"},
 			want:   "degraded — the scope layer is unenforced: Landlock ABI 5 has no signal or abstract-socket scope (ABI 6, Linux 6.12, needed) — seat boundary is partial below Linux 6.12",
 		},
-		{name: "backend without attestation", status: &afclient.ConfinementStatus{Backend: "macos-seatbelt"}, want: "macos-seatbelt"},
+		{name: "backend without attestation", status: &afclient.ConfinementStatus{Backend: "macos-seatbelt"}, want: "macos-seatbelt (unproven)"},
 		{
 			name:   "unproven boundary",
 			status: &afclient.ConfinementStatus{Backend: "macos-seatbelt", Detail: "seat boundary unproven at Linux 6.12 (Landlock ABI 6) for the full boundary or newer: no passing self-test recorded on this host"},
-			want:   "macos-seatbelt",
+			want:   "macos-seatbelt — unproven: seat boundary unproven at Linux 6.12 (Landlock ABI 6) for the full boundary or newer: no passing self-test recorded on this host",
 		},
 	}
 	for _, tc := range cases {

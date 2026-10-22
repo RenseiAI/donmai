@@ -158,6 +158,9 @@ func TestSelfTest_MarksDegradedBelowTheFloor(t *testing.T) {
 	if backend == nil {
 		t.Skip("no confinement backend on this host; nothing to prove")
 	}
+	if err := backend.Check(); err != nil {
+		t.Skipf("confinement unavailable here: %v", err)
+	}
 	stubScopeProbe(t, landlockScopeABI-1)
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

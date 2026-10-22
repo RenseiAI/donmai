@@ -507,9 +507,12 @@ func formatSeatBudgetStatus(status *afclient.SeatBudgetStatus) string {
 }
 
 // formatConfinementStatus renders the seat-boundary posture for the status
-// table: attested, degraded with the missing layer, or "not reported"
-// against an older daemon. A host with no backend reads as "none" — the
-// honest shape, not an omission an operator could misread as confined.
+// table: attested, degraded with the missing layer, unproven with the
+// missing evidence, or "not reported" against an older daemon. A host with
+// no backend reads as "none" — the honest shape, not an omission an
+// operator could misread as confined. An unproven host never renders as a
+// bare backend name: the verdict word stays attached so it cannot be
+// misread as confined.
 func formatConfinementStatus(status *afclient.ConfinementStatus) string {
 	if status == nil {
 		return "not reported"
@@ -530,7 +533,10 @@ func formatConfinementStatus(status *afclient.ConfinementStatus) string {
 		}
 		return "attested (" + status.Backend + ")"
 	}
-	return status.Backend
+	if status.Detail != "" {
+		return status.Backend + " — unproven: " + status.Detail
+	}
+	return status.Backend + " (unproven)"
 }
 
 // formatInstalledProcessPriority is the install report line for the mode that
