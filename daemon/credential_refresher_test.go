@@ -1569,3 +1569,73 @@ func TestCredentialRefresher_RotateRegistrationTokenRestoresPreviousOnAdoptRefus
 		}
 	}
 }
+
+// TestCredentialRefresher_RotateRegistrationTokenAdoptRefusalKeepsConcurrentUpdate
+// pins the adopt-failure restore compare guard: when a concurrent
+// UpdateRegistrationToken lands while the rotation is inside adopt and the
+// local validator then refuses the result, the refresher keeps the newer
+// concurrent generation instead of restoring the pre-rotation one. Against
+// an unconditional restore the refresher reverts to the stale previous
+// generation and the newer generation is silently lost, so the next refresh
+// presents a dead token.
+func TestCredentialRefresher_RotateRegistrationTokenAdoptRefusalKeepsConcurrentUpdate(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	// #nosec G101 -- test fixture token
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	var enterOnce sync.Once
+	opts.ValidateRefresh = func(*RefreshTokenResult) error {
+		enterOnce.Do(func() { close(entered) })
+		<-proceed
+		return errors.New("controller credentials refused")
+	}
+	r := NewCredentialRefresher(opts)
+	lane := &recordingLane{}
+	r.Attach(lane)
+
+	rotateDone := make(chan error, 1)
+	go func() {
+		// #nosec G101 -- test fixture token
+		_, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired")
+		rotateDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not reach local validation")
+	}
+	// A newer generation lands while the rotation is inside adopt, before
+	// the validator refuses it.
+	// #nosec G101 -- test fixture token
+	r.UpdateRegistrationToken("rsk_live_concurrent")
+	close(proceed)
+
+	select {
+	case err := <-rotateDone:
+		if err == nil {
+			t.Fatal("rotation refused by the local validator succeeded; want the error surfaced")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not return")
+	}
+
+	if token, _ := r.Registration(); token != "rsk_live_concurrent" {
+		t.Fatalf("refresher holds %q after a validator-refused rotation raced with a concurrent update, want the concurrent generation kept", token)
+	}
+	if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "before.jwt" {
+		t.Fatalf("lane = (%q, %q), want the running credentials kept", id, jwt)
+	}
+}

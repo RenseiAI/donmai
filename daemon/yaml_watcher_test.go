@@ -611,6 +611,58 @@ func TestOnYamlChanged_RefusesTokenForADifferentOrchestrator(t *testing.T) {
 	}
 }
 
+// TestOnYamlChanged_RehomeMakesNoProveRequest pins the re-home URL guard
+// with a live recording server: the running registration points at the
+// test server and the filed config names a different orchestrator URL with
+// a valid-shape token. The candidate must be refused by the URL check
+// before any round trip, so zero prove requests reach the running server
+// and the previous generation stays. Without the guard the watcher would
+// prove (and adopt) the foreign-plane token against the running plane.
+func TestOnYamlChanged_RehomeMakesNoProveRequest(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	proveRequests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		proveRequests++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	// #nosec G101 -- test fixture token
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			Orchestrator: OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_before"},
+		},
+		credentials: credentials,
+	}
+	d.onYamlChanged(&Config{
+		// #nosec G101 -- test fixture token
+		Orchestrator: OrchestratorConfig{URL: "https://elsewhere.example.test", AuthToken: "rsp_live_foreign"},
+	})
+	if token, _ := credentials.Registration(); token != "rsp_live_before" {
+		t.Errorf("refresher token = %q, want the previous generation kept", token)
+	}
+	if d.config.Orchestrator.AuthToken != "rsp_live_before" {
+		t.Errorf("stored config token = %q, want the previous generation kept", d.config.Orchestrator.AuthToken)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if proveRequests != 0 {
+		t.Errorf("re-home attempt made %d prove request(s) against the running plane; want none", proveRequests)
+	}
+}
+
 // TestOnYamlChanged_RefusesForeignShapedToken pins the second adoption guard:
 // a non-blank value without the platform's registration-token shape is never
 // adopted mid-flight — the previous generation stays so a mis-edited file
