@@ -866,6 +866,101 @@ func TestRepoKeeper_RevokedTombstoneSurvivesReconcile(t *testing.T) {
 	}
 }
 
+// TestRepoKeeper_EvictionSkipsRevocationTombstone drives the production
+// Acquire, RecordFetch, Reconcile, and EnforceBudget entry points and
+// proves budget eviction never reaps a revocation tombstone: the tombstone
+// is the oldest row by LastUse, yet enforcement evicts the live mirror
+// instead, and the revoked digest stays degraded.
+func TestRepoKeeper_EvictionSkipsRevocationTombstone(t *testing.T) {
+	t.Parallel()
+
+	liveRemote := newKeeperSourceRepo(t)
+	revokedRemote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+
+	liveLease, ok := k.Acquire(context.Background(), liveRemote)
+	if !ok {
+		t.Fatal("live Acquire degraded")
+	}
+	liveDir := liveLease.Dir()
+	liveDigest := filepath.Base(liveDir)
+	liveLease.Release()
+
+	revokedLease, ok := k.Acquire(context.Background(), revokedRemote)
+	if !ok {
+		t.Fatal("revoked Acquire degraded")
+	}
+	revokedDir := revokedLease.Dir()
+	revokedDigest := filepath.Base(revokedDir)
+	revokedLease.Release()
+
+	k.RecordFetch(liveDigest, 42, time.Millisecond, false)
+	k.RecordFetch(revokedDigest, 42, time.Millisecond, true)
+
+	// Make the revoked row the oldest eviction candidate: its LastUse
+	// predates the live mirror's, so an LRU picker without a revocation
+	// guard would reap the tombstone first for zero budget gain.
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := k.store.TouchUse(revokedDigest, old); err != nil {
+		t.Fatalf("TouchUse(revoked, old) error = %v", err)
+	}
+	k.mu.Lock()
+	k.lastUse[revokedDigest] = old
+	fresh := time.Now().UTC()
+	k.lastUse[liveDigest] = fresh
+	k.mu.Unlock()
+	if err := k.store.TouchUse(liveDigest, fresh); err != nil {
+		t.Fatalf("TouchUse(live, fresh) error = %v", err)
+	}
+
+	if err := os.RemoveAll(revokedDir); err != nil {
+		t.Fatalf("remove revoked mirror dir: %v", err)
+	}
+	if err := k.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	// Over budget on the live mirror alone: enforcement must evict the
+	// live mirror and leave the zero-byte tombstone in place.
+	k.mu.Lock()
+	k.settings.MaxBytes = 10
+	k.mu.Unlock()
+	k.EnforceBudget()
+
+	rows, err := k.store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.Digest != revokedDigest {
+			continue
+		}
+		found = true
+		if !row.Revoked {
+			t.Error("tombstone Revoked = false, want true")
+		}
+		if row.Bytes != 0 {
+			t.Errorf("tombstone Bytes = %d, want 0", row.Bytes)
+		}
+	}
+	if !found {
+		t.Fatalf("tombstone %q deleted by eviction, want it skipped", revokedDigest)
+	}
+	if _, err := os.Stat(revokedDir); !os.IsNotExist(err) {
+		t.Errorf("tombstone directory reappeared: err = %v", err)
+	}
+	if dirLease, ok := k.Acquire(context.Background(), revokedRemote); ok || dirLease != nil {
+		if dirLease != nil {
+			dirLease.Release()
+		}
+		t.Fatalf("revoked Acquire after eviction = (%v, %v), want (nil, false)", dirLease, ok)
+	}
+	if got := k.Stats().RevokedCount; got < 1 {
+		t.Errorf("RevokedCount = %d, want >= 1 (tombstone survives eviction)", got)
+	}
+}
+
 // TestRepoKeeper_UnreadableCatalogDegradesToPlainClone proves a corrupt
 // catalog degrades every Acquire: revocation state is unknown, so no
 // mirror is served until a fetch re-establishes state.
@@ -1163,6 +1258,11 @@ func TestRepoKeeper_CombinedRootProbe(t *testing.T) {
 	if !found {
 		t.Fatalf("second store has no row for digest %q", digest)
 	}
+	// Revocation is sticky under disk pressure: revoked rows are never
+	// eviction victims, so clear the flag before exercising the shared
+	// eviction path below. The visibility check above already pinned the
+	// cross-store revocation propagation.
+	keeper.RecordFetch(digest, 42, time.Millisecond, false)
 	// Eviction through the keeper removes the directory the second store
 	// serves: both agree on the layout, so no orphan survives.
 	keeper.mu.Lock()

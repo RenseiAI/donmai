@@ -243,6 +243,16 @@ func (k *RepoKeeper) Acquire(ctx context.Context, remote string) (lease *repokee
 	var self *repokeeper.MirrorEntry
 	var total int64
 	for i := range entries {
+		// Revoked rows never count toward the budget: tombstones carry
+		// zero bytes, and a revoked live mirror's bytes stay pinned
+		// until the flag is explicitly cleared, so counting them would
+		// only evict serving mirrors for no reclaimable gain.
+		if entries[i].Revoked {
+			if entries[i].Digest == digest {
+				self = &entries[i]
+			}
+			continue
+		}
 		total += entries[i].Bytes
 		if entries[i].Digest == digest {
 			self = &entries[i]
@@ -391,6 +401,9 @@ func (k *RepoKeeper) Events() []RepoKeeperEvent {
 
 // evictLocked removes mirrors with no in-flight seed, least recently used
 // first, until the keeper is within budget. A zero MaxBytes evicts nothing.
+// Revoked rows are never victims: a tombstone holds no bytes to reclaim
+// and dropping it would lose the sticky revocation gate, so eviction skips
+// every revoked entry and its bytes stay out of the budget total.
 // The caller holds k.mu and passes its catalog snapshot. Removal is
 // non-blocking: a mirror whose lease is held (in this or another process
 // sharing the state dir) is skipped as a victim for this pass, so
@@ -406,6 +419,9 @@ func (k *RepoKeeper) evictLocked(entries []repokeeper.MirrorEntry) {
 	for {
 		var total int64
 		for _, e := range entries {
+			if e.Revoked {
+				continue
+			}
 			total += e.Bytes
 		}
 		if total < k.settings.MaxBytes {
@@ -446,14 +462,16 @@ func (k *RepoKeeper) evictLocked(entries []repokeeper.MirrorEntry) {
 }
 
 // oldestEvictableLocked returns the least-recently-used digest with no
-// in-flight seed and not in skipped (lease-held victims from this
-// eviction pass), or "" when every mirror is pinned. The caller holds k.mu.
+// in-flight seed, not revoked, and not in skipped (lease-held victims from
+// this eviction pass), or "" when every mirror is pinned. Revoked rows are
+// never victims: evicting a tombstone reaps zero bytes and deletes the
+// sticky revocation gate. The caller holds k.mu.
 func (k *RepoKeeper) oldestEvictableLocked(entries []repokeeper.MirrorEntry, skipped map[string]bool) string {
 	var victim string
 	var victimAt time.Time
 	first := true
 	for _, e := range entries {
-		if k.inflight[e.Digest] > 0 || skipped[e.Digest] {
+		if e.Revoked || k.inflight[e.Digest] > 0 || skipped[e.Digest] {
 			continue
 		}
 		at := e.LastUse
