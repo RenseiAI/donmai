@@ -745,17 +745,13 @@ func (d *Daemon) readoptSessionShimOnce(
 			got.ShimID, got.ProcessEpoch, lostHello.ShimID, lostHello.ProcessEpoch)
 	}
 	preparation := preparations.prepared[id]
-	// The consumer starts on its gate BEFORE the evidence arms the proxy's
-	// carrier-installed release on that same gate: staging the mandatory
-	// Snapshot inside OnAdoption releases a consumer parked on a durable
-	// output batch ahead of the Snapshot, while the gate itself still
-	// carries the adoption verdict. Building the evidence first would leave
-	// the latch unwired and park the consumer behind the Snapshot Emit
-	// waits for. On evidence failure the controller close below releases
-	// the parked consumer through the stream ending.
-	gate := newShimAdoptionGate()
-	d.consumeShimEventsGated(ctrl, gate)
-	evidence, err := d.sessionShimAdoptionEvidenceForGate(ctx, ctrl, preparation, preparations.hosts[id], gate)
+	// The consumer and its carrier-installed latch start together (see
+	// startGatedAdoptionConsumer): staging the mandatory Snapshot inside
+	// OnAdoption releases a consumer parked on a durable output batch ahead
+	// of the Snapshot, while the gate itself still carries the adoption
+	// verdict. On evidence failure the controller close below releases the
+	// parked consumer through the stream ending.
+	gate, evidence, err := d.startGatedAdoptionConsumer(ctx, ctrl, preparation, preparations.hosts[id])
 	if err != nil {
 		_ = ctrl.Close()
 		return fmt.Errorf("session shim: resolve re-adoption host: %w", err)

@@ -41,7 +41,11 @@ type shimAdoptionGate struct {
 	done      chan struct{}
 	installed chan struct{}
 	once      sync.Once
-	committed bool
+	// installedOnce guards the carrier-installed latch: Emit stages the
+	// mandatory Snapshot on the adoption goroutine while parked consumers
+	// wait on the latch, so concurrent firings must not race a double close.
+	installedOnce sync.Once
+	committed     bool
 }
 
 func newShimAdoptionGate() *shimAdoptionGate {
@@ -53,15 +57,16 @@ func newShimAdoptionGate() *shimAdoptionGate {
 // landed, but whether the publication commits is still open. The adoption
 // gate still carries the verdict — this latch carries only readiness — so a
 // refused adoption still refuses the parked consumer through done.
+//
+// The latch fires when the mandatory Snapshot is staged, before EmitSnapshot
+// itself succeeds: staging is the earliest point at which the carrier exists
+// in this daemon. If EmitSnapshot then fails, the adoption is failing anyway
+// and keeps the base disposition.
 func (g *shimAdoptionGate) finishCarrierInstalled() {
 	if g == nil {
 		return
 	}
-	select {
-	case <-g.installed:
-	default:
-		close(g.installed)
-	}
+	g.installedOnce.Do(func() { close(g.installed) })
 }
 
 // awaitCarrierOrGate holds the first durable output batch until the carrier
@@ -485,15 +490,12 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 	// Everything left of the handshake belongs to the attempt that won it.
 	ctx = adoptCtx
-	// The consumer starts on its gate BEFORE the evidence arms the proxy's
-	// carrier-installed release on that same gate: staging the mandatory
-	// Snapshot inside OnAdoption releases a consumer parked on a durable
-	// output batch ahead of the Snapshot, while the gate itself still
-	// carries the adoption verdict. On evidence failure the stop and close
-	// below release the parked consumer through the stream ending.
-	gate := newShimAdoptionGate()
-	d.consumeShimEventsGated(ctrl, gate)
-	evidence, err := d.sessionShimAdoptionEvidenceForGate(ctx, ctrl, prepared, preparedHostID, gate)
+	// The consumer and its carrier-installed latch start together: staging
+	// the mandatory Snapshot inside OnAdoption releases a consumer parked on
+	// a durable output batch ahead of the Snapshot, while the gate itself
+	// still carries the adoption verdict. On evidence failure the stop and
+	// close below release the parked consumer through the stream ending.
+	gate, evidence, err := d.startGatedAdoptionConsumer(ctx, ctrl, prepared, preparedHostID)
 	if err != nil {
 		// The dial won and the preparation was answered, but the evidence
 		// resolution failed — so this path OWNS a live controller. Stop the
@@ -2405,6 +2407,30 @@ func (d *Daemon) trackLaunchedShim(
 // avoidable Gap that §D5 makes the shim declare.
 func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 	d.consumeShimEventsGated(ctrl, nil)
+}
+
+// startGatedAdoptionConsumer starts the event consumer on a fresh adoption
+// gate and builds the adoption evidence arming the proxy's carrier-installed
+// release on that same gate. The two steps are bundled so a gated consumer
+// can never run on a latch the evidence did not arm: staging the mandatory
+// Snapshot inside OnAdoption releases a consumer parked on a durable output
+// batch ahead of the Snapshot, while the gate itself still carries the
+// adoption verdict. Every adoption path that starts a gated consumer goes
+// through here; callers with no gated consumer pass nil straight to
+// consumeShimEventsGated and build unwired evidence instead.
+//
+// On evidence failure the gate is refused before returning and the caller
+// closes the controller, which releases the parked consumer through the
+// stream ending.
+func (d *Daemon) startGatedAdoptionConsumer(ctx context.Context, ctrl *sessionshim.Controller, preparation SessionShimAdoptionPreparationResult, hostID string) (*shimAdoptionGate, SessionShimAdoptionEvidence, error) {
+	gate := newShimAdoptionGate()
+	d.consumeShimEventsGated(ctrl, gate)
+	evidence, err := d.sessionShimAdoptionEvidenceForGate(ctx, ctrl, preparation, hostID, gate)
+	if err != nil {
+		gate.finish(false)
+		return nil, SessionShimAdoptionEvidence{}, err
+	}
+	return gate, evidence, nil
 }
 
 func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shimAdoptionGate) {

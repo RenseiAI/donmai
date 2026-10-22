@@ -170,6 +170,40 @@ func PlainInspect(out io.Writer, wa *afclient.Workarea) error {
 	return RenderInspect(out, wa, true)
 }
 
+// RenderInspectV1 writes the full detail view for a versioned workarea,
+// including the additive committed-archive recovery reference when the
+// archive projection carries one.
+func RenderInspectV1(out io.Writer, wa *afclient.WorkareaV1, noColor bool) error {
+	if wa == nil {
+		_, _ = fmt.Fprintln(out, muted("No workarea record.", noColor))
+		return nil
+	}
+	legacy := wa.Legacy()
+	if err := RenderInspect(out, &legacy, noColor); err != nil {
+		return err
+	}
+	if ref := wa.ArchiveReference; ref != nil {
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, bold("Archive reference:", noColor))
+		label(out, "ArchiveID:     ", ref.ArchiveID, noColor)
+		label(out, "Digest:        ", ref.ArchiveDigest, noColor)
+		label(out, "Session:       ", ref.SessionID, noColor)
+		label(out, "Workarea:      ", ref.WorkareaID, noColor)
+		if ref.TerminalResultID != "" {
+			label(out, "Result:        ", ref.TerminalResultID, noColor)
+		}
+		if ref.CommittedAt != "" {
+			label(out, "Committed:     ", ref.CommittedAt, noColor)
+		}
+	}
+	return nil
+}
+
+// PlainInspectV1 is the smoke-pinning variant.
+func PlainInspectV1(out io.Writer, wa *afclient.WorkareaV1) error {
+	return RenderInspectV1(out, wa, true)
+}
+
 // RenderRestore writes the result of a workarea restore operation.
 // Per ADR D4a the restore returns a NEW active workarea distinct from
 // the source archive; the renderer emphasises the lineage.
@@ -200,6 +234,29 @@ func RenderRestore(out io.Writer, res *afclient.WorkareaRestoreResult, noColor b
 // PlainRestore is the smoke-pinning variant.
 func PlainRestore(out io.Writer, res *afclient.WorkareaRestoreResult) error {
 	return RenderRestore(out, res, true)
+}
+
+// RenderRestoreV1 writes the versioned restore result, including the source
+// archive recovery reference when the restored projection carries one.
+func RenderRestoreV1(out io.Writer, res *afclient.WorkareaRestoreV1Result, noColor bool) error {
+	if res == nil {
+		_, _ = fmt.Fprintln(out, muted("No restore result.", noColor))
+		return nil
+	}
+	legacy := res.Workarea.Legacy()
+	if err := RenderRestore(out, &afclient.WorkareaRestoreResult{Workarea: legacy}, noColor); err != nil {
+		return err
+	}
+	if ref := res.Workarea.ArchiveReference; ref != nil {
+		label(out, "ArchiveID:     ", ref.ArchiveID, noColor)
+		label(out, "Digest:        ", ref.ArchiveDigest, noColor)
+	}
+	return nil
+}
+
+// PlainRestoreV1 is the smoke-pinning variant.
+func PlainRestoreV1(out io.Writer, res *afclient.WorkareaRestoreV1Result) error {
+	return RenderRestoreV1(out, res, true)
 }
 
 // RenderDiff writes the structured per-path delta between two archived

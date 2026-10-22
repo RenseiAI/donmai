@@ -1,7 +1,11 @@
 package pi
 
 // adaptation_live_probe_test.go — live-binary adaptation probes for the
-// lifecycle/replay/cleanup + prompt-delivery paths.
+// lifecycle/replay/cleanup + prompt-delivery paths, pi harness only.
+//
+// Scope fence: this file provisions the pi harness alone. Retired and
+// deferred harnesses are out of scope and must not gain live probes here —
+// no other harness package is imported or spawned by this file.
 //
 // The scripted suites pin what the pre-spawn adaptation authority PROMISES
 // (agent/tool_adaptation_test.go TestToolLifecycleRuntimeEvidenceIsPerHarness:
@@ -35,6 +39,13 @@ package pi
 // the prompt-delivery assertions fail; resume against a wrong session id and
 // the replay assertions fail; skip Stop and the child process outlives the
 // test (cleanup assertion fails).
+//
+// Isolation: every probe runs in its own t.TempDir workarea against its own
+// loopback stub endpoint, skips cleanly when the pinned binary is absent
+// (non-blocking — the shipped fixture evidence stays the accepted tier),
+// and never touches resident sessions. TestAdaptationProbeFixtureIsolated
+// pins that fixture contract without needing the binary, so it runs in
+// hosted CI where the live probes skip.
 
 import (
 	"context"
@@ -412,5 +423,49 @@ func TestLiveBinary_Adaptation_ReceiptMatchesLiveManifest(t *testing.T) {
 	}
 	if promptProfile.ID != "pi/headless/rpc-v1" {
 		t.Fatalf("live headless prompt profile = %q, want pi/headless/rpc-v1", promptProfile.ID)
+	}
+}
+
+// TestAdaptationProbeFixtureIsolated pins the isolated, explicitly bounded
+// fixture contract without needing the real binary, so it runs in hosted CI
+// where the live probes above skip. It proves the probe Spec is an isolated
+// fixture (own TempDir workarea, own loopback stub endpoint — never a
+// resident session) and an explicitly bounded one (the headless
+// lifecycle/replay/cleanup plan plus the system/user prompt channels the
+// live assertions collect), and that the compiled receipt keeps the shipped
+// fixture evidence non-blocking (ready with pending runtime/cleanup
+// entries).
+func TestAdaptationProbeFixtureIsolated(t *testing.T) {
+	workdir := t.TempDir()
+	stub := newRealBinaryStub(t, realBinaryModel)
+	spec := adaptationProbeSpec(workdir, "fixture isolation check", stub.baseURL())
+	spec.Autonomous = true
+
+	if spec.Cwd != workdir {
+		t.Fatalf("probe fixture Cwd = %q, want the isolated workarea %q", spec.Cwd, workdir)
+	}
+	if spec.Endpoint == nil {
+		t.Fatal("probe fixture has no endpoint binding — want the isolated stub endpoint")
+	}
+	if got := spec.Endpoint.BaseURL; got != stub.baseURL() {
+		t.Fatalf("probe fixture BaseURL = %q, want the isolated stub %q", got, stub.baseURL())
+	}
+	if !strings.Contains(spec.Endpoint.BaseURL, "127.0.0.1") {
+		t.Fatalf("probe fixture BaseURL = %q, want a loopback stub endpoint", spec.Endpoint.BaseURL)
+	}
+	if spec.SystemPromptAppend == "" || spec.BaseInstructions == "" {
+		t.Fatalf("probe fixture drops a prompt channel: SystemPromptAppend=%q BaseInstructions=%q", spec.SystemPromptAppend, spec.BaseInstructions)
+	}
+	plan := spec.ToolLifecyclePlan
+	if plan == nil || len(plan.Lifecycle) != 2 || plan.Replay == nil || !plan.RequireCleanup {
+		t.Fatalf("probe fixture ToolLifecyclePlan = %+v, want 2 lifecycle entries plus replay and RequireCleanup", plan)
+	}
+
+	receipt := compileAdaptationReceipt(t, spec)
+	assertProbeReceiptPromisesRuntimeEvidence(t, receipt)
+
+	manifest := (&Provider{}).Manifest()
+	if manifest.Name != agent.HarnessPi {
+		t.Fatalf("probe manifest = %q, want the pi harness alone", manifest.Name)
 	}
 }

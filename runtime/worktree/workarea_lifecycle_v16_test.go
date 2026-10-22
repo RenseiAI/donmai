@@ -252,21 +252,21 @@ func TestNestedTerminalArchiveCapturesRootBeforeAuthorizedDisposal(t *testing.T)
 	archived := false
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: sessionID,
-		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) error {
+		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
 			for _, path := range []string{
 				filepath.Join(spec.WorkareaRoot, ".workarea", "declaration.json"),
 				filepath.Join(spec.WorkareaRoot, "web", ".git"),
 				filepath.Join(spec.WorkareaRoot, "corpus", ".git"),
 			} {
 				if _, err := os.Stat(path); err != nil {
-					return err
+					return nil, err
 				}
 			}
 			if filepath.Clean(spec.SelectedPath) != filepath.Join(spec.WorkareaRoot, "web") || spec.AcquisitionID == "" {
-				return errors.New("archive did not receive the complete root identity")
+				return nil, errors.New("archive did not receive the complete root identity")
 			}
 			archived = true
-			return nil
+			return nil, nil
 		},
 	})
 	if err != nil {
