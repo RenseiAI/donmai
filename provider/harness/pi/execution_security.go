@@ -6,7 +6,21 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 )
+
+// piSecurityAttestation returns the current per-harness attestation the
+// rendering binds its mode scope to. A variable so tests can pin a
+// single-mode attestation: both session modes pass the self-test on a real
+// confined host, so no live test can tell the mode binding from its
+// absence. Production always runs the executable-bound self-test.
+var piSecurityAttestation = func(ctx context.Context, p *Provider, probe string) (confinement.Attestation, bool) {
+	confiner, err := ensurePiConfiner(ctx, p.binary, p.hostConfinementDirs(), []string{probe})
+	if err != nil {
+		return confinement.Attestation{}, false
+	}
+	return confiner.Attestation()
+}
 
 // executionSecurity is this host's attested rendering for pi. Only a host
 // requiring confinement may declare the stronger write and isolation levels:
@@ -33,11 +47,7 @@ func (p *Provider) executionSecurity() agent.ExecutionSecurityRendering {
 	if err != nil {
 		return agent.ExecutionSecurityRendering{}
 	}
-	confiner, err := ensurePiConfiner(ctx, p.binary, p.hostConfinementDirs(), []string{probe})
-	if err != nil {
-		return agent.ExecutionSecurityRendering{}
-	}
-	attestation, ok := confiner.Attestation()
+	attestation, ok := piSecurityAttestation(ctx, p, probe)
 	if !ok || len(attestation.SessionModes) == 0 || attestation.SelfTestDigest == "" {
 		return agent.ExecutionSecurityRendering{}
 	}
