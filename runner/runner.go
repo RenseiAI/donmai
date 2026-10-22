@@ -146,6 +146,15 @@ const (
 	// attempts, and the outer idle timeout still owns the seat.
 	DefaultProviderStallRetries = 2
 
+	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
+	// posts to the session progress endpoint: at most one POST per
+	// interval, no matter how often the step changes (the latest step
+	// wins the next slot). Thirty seconds keeps a step-change burst —
+	// spawn, streaming, steering, backstop in one fast session — from
+	// becoming one POST per transition while still refreshing the
+	// descriptor's recency well inside the platform's staleness window.
+	DefaultStatusBeaconInterval = 30 * time.Second
+
 	// terminalResultPostTimeout bounds the detached cleanup context used for
 	// terminal result delivery after the run context has expired or been
 	// cancelled. Posting remains ahead of worktree teardown.
@@ -302,6 +311,15 @@ type Options struct {
 	// HeartbeatInterval overrides the per-session heartbeat cadence.
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
+
+	// StatusBeaconInterval bounds the runner's current-step beacon posts
+	// to the session progress endpoint: at most one beacon POST per
+	// interval, no matter how often the step changes underneath (the
+	// latest step wins the next slot). Zero falls back to
+	// DefaultStatusBeaconInterval. NEGATIVE disables beacon posts
+	// entirely — the run proceeds exactly as before this feature
+	// (mixed-version safe while the endpoint is unavailable).
+	StatusBeaconInterval time.Duration
 
 	// StepHeartbeatInterval overrides the per-session step-heartbeat
 	// cadence. Zero falls back to runtime/stepheartbeat.DefaultInterval.
@@ -534,6 +552,7 @@ type Runner struct {
 	skipPostSession               bool
 	hbInterval                    time.Duration
 	stepHeartbeatInterval         time.Duration
+	statusBeaconInterval          time.Duration
 	spanEmissionEnabled           bool
 	spanEndpointPath              string
 	kitSkillSources               []kit.KitSkillSource
@@ -669,6 +688,7 @@ func New(opts Options) (*Runner, error) {
 		skipSteering:                     opts.SkipSteering,
 		skipPostSession:                  opts.SkipPostSession,
 		hbInterval:                       opts.HeartbeatInterval,
+		statusBeaconInterval:             opts.StatusBeaconInterval,
 		stepHeartbeatInterval:            opts.StepHeartbeatInterval,
 		spanEmissionEnabled:              opts.SpanEmissionEnabled,
 		spanEndpointPath:                 opts.SpanEndpointPath,
