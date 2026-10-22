@@ -1,5 +1,10 @@
 package ir
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Reasoning/thinking normalization (08 §4). A harness asks for thinking in its
 // own provider-native vocabulary; the gateway parses that into ONE canonical
 // ThinkingSpec on the way in and applies the nearest upstream-native
@@ -8,7 +13,7 @@ package ir
 //
 // The three upstream vocabularies this maps between:
 //   - Anthropic: thinking.budget_tokens (an explicit token budget)
-//   - OpenAI:    reasoning_effort (minimal|low|medium|high — a coarse level)
+//   - OpenAI:    reasoning_effort (minimal|low|medium|high|xhigh|max — a coarse level)
 //   - Gemini:    thinkingConfig.thinkingBudget (a token budget, -1 = dynamic)
 //
 // Thinking CONTENT crossing protocols is handled by the codecs per Emit: a
@@ -28,6 +33,24 @@ const (
 	ThinkingHigh    ThinkingLevel = "high"
 	ThinkingMax     ThinkingLevel = "max"
 )
+
+// documentedEfforts lists every reasoning_effort string the gateway accepts
+// on the way in, from lowest to highest. "off" and "none" both disable
+// thinking; "xhigh" and "max" both map to ThinkingMax, and "max" clamps
+// to "high" on the way back out toward OpenAI because OpenAI has no "max"
+// token (see levelEffort).
+var documentedEfforts = []string{
+	"off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+}
+
+// DocumentedEfforts returns every reasoning_effort string the gateway accepts,
+// lowest first. Callers (tests, docs) enumerate this instead of duplicating
+// the list.
+func DocumentedEfforts() []string {
+	out := make([]string, len(documentedEfforts))
+	copy(out, documentedEfforts)
+	return out
+}
 
 // ThinkingEmit controls how thinking CONTENT is surfaced back to the client.
 type ThinkingEmit string
@@ -107,19 +130,25 @@ func (t ThinkingSpec) EffortForOpenAI() string {
 }
 
 // LevelFromEffort maps an inbound OpenAI reasoning_effort value onto the
-// canonical ladder. Unknown/empty yields ThinkingOff.
-func LevelFromEffort(effort string) ThinkingLevel {
+// canonical ladder. "off" and "none" yield ThinkingOff; "xhigh" and
+// "max" yield ThinkingMax. Any other value is an error naming the value —
+// unknown effort must be refused, never silently downgraded to thinking off.
+func LevelFromEffort(effort string) (ThinkingLevel, error) {
 	switch effort {
+	case "off", "none", "":
+		return ThinkingOff, nil
 	case "minimal":
-		return ThinkingMinimal
+		return ThinkingMinimal, nil
 	case "low":
-		return ThinkingLow
+		return ThinkingLow, nil
 	case "medium":
-		return ThinkingMedium
+		return ThinkingMedium, nil
 	case "high":
-		return ThinkingHigh
+		return ThinkingHigh, nil
+	case "xhigh", "max":
+		return ThinkingMax, nil
 	default:
-		return ThinkingOff
+		return "", fmt.Errorf("gateway/ir: unknown reasoning_effort %q (want one of %s)", effort, strings.Join(documentedEfforts, ", "))
 	}
 }
 

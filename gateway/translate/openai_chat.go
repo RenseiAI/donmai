@@ -145,7 +145,11 @@ func chatRequestToIR(cr ChatRequest) (ir.Request, error) {
 		},
 	}
 	if cr.ReasoningEffort != "" {
-		req.Thinking = ir.ThinkingSpec{Level: ir.LevelFromEffort(cr.ReasoningEffort), Emit: ir.EmitFull}
+		level, err := ir.LevelFromEffort(cr.ReasoningEffort)
+		if err != nil {
+			return ir.Request{}, fmt.Errorf("gateway/translate: decode openai request: %w", err)
+		}
+		req.Thinking = ir.ThinkingSpec{Level: level, Emit: ir.EmitFull}
 	}
 	for _, t := range cr.Tools {
 		req.Tools = append(req.Tools, ir.ToolDef{

@@ -63,6 +63,36 @@ func TestServeHTTP_MalformedBody(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_UnknownEffortIsBadRequestNamingValue(t *testing.T) {
+	h := NewOpenAIChat(&fakeDispatcher{})
+	rec := post(t, h, "Bearer t", `{"model":"m","messages":[],"reasoning_effort":"ultra"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown effort status = %d, want 400", rec.Code)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body: %v", err)
+	}
+	if !strings.Contains(env.Error.Message, "ultra") {
+		t.Errorf("error message %q should name the rejected value", env.Error.Message)
+	}
+}
+
+func TestServeHTTP_MaxEffortReachesDispatcher(t *testing.T) {
+	fd := &fakeDispatcher{outcome: Outcome{
+		Response: &ir.Response{Model: "m", FinishReason: ir.FinishStop},
+		Model:    "m",
+	}}
+	h := NewOpenAIChat(fd)
+	rec := post(t, h, "Bearer t", `{"model":"m","messages":[],"reasoning_effort":"max"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("max effort status = %d, want 200", rec.Code)
+	}
+	if fd.gotReq.Thinking.Level != ir.ThinkingMax {
+		t.Errorf("dispatch level = %q, want max", fd.gotReq.Thinking.Level)
+	}
+}
+
 func TestServeHTTP_DispatchHTTPError(t *testing.T) {
 	fd := &fakeDispatcher{err: &HTTPError{Status: http.StatusServiceUnavailable, Code: "no_credential", Message: "none"}}
 	h := NewOpenAIChat(fd)
