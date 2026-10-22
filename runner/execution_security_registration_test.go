@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -84,6 +85,9 @@ func TestHTTPExecutionSecurityReporterValidation(t *testing.T) {
 	if _, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{BaseURL: "://bad-origin", Token: func() string { return "t" }, WorkerID: func() string { return "w" }}); err == nil {
 		t.Fatal("malformed origin accepted")
 	}
+	if _, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{BaseURL: "https://controller.example/api", Token: func() string { return "t" }, WorkerID: func() string { return "w" }}); err == nil {
+		t.Fatal("origin with a path accepted: the reporter posts to a fixed route off the origin")
+	}
 	var nilReporter *HTTPExecutionSecurityReporter
 	if _, err := nilReporter.SubmitExecutionSecurityReport(context.Background(), indexZeroSubmissionReport(t)); err == nil {
 		t.Fatal("nil reporter submitted")
@@ -158,6 +162,7 @@ func TestHTTPExecutionSecurityReporterStatusHandling(t *testing.T) {
 	t.Parallel()
 	status := http.StatusForbidden
 	answer := `{"contractVersion":"execution-security-report/v1","decision":"refused","code":"report_below_stamp"}`
+	acceptedEnvelope := `{"contractVersion":"execution-security-report/v1","decision":"accepted"}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -181,6 +186,109 @@ func TestHTTPExecutionSecurityReporterStatusHandling(t *testing.T) {
 	answer = `not a decision envelope`
 	if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), submission); err == nil {
 		t.Fatal("bare non-2xx accepted as a submission result")
+	}
+
+	// A non-2xx status is an error, never an acceptance: even a 4xx/5xx
+	// carrying a well-formed accepted envelope must not authorize the
+	// spawn. Dropping the refused-decision check turns this case green
+	// while letting the error path spawn.
+	for _, code := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+		status = code
+		answer = acceptedEnvelope
+		if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), submission); err == nil {
+			t.Fatalf("HTTP %d with an accepted envelope accepted as a submission result", code)
+		}
+	}
+}
+
+// TestHTTPExecutionSecurityReporterRefusesRedirects pins the redirect
+// refusal: a 307 to a second server that answers accepted is a submission
+// failure, and the redirect target is never hit. Deleting the redirect
+// refusal stays green while letting the redirect target decide the spawn.
+func TestHTTPExecutionSecurityReporterRefusesRedirects(t *testing.T) {
+	t.Parallel()
+	var followed atomic.Int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		followed.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"contractVersion":"execution-security-report/v1","decision":"accepted"}`))
+	}))
+	t.Cleanup(target.Close)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/api/daemon/sessions/session-1/execution-preflight-registration")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	reporter, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{
+		BaseURL:  srv.URL,
+		Client:   srv.Client(),
+		Token:    func() string { return "worker-token" },
+		WorkerID: func() string { return "worker-1" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), indexZeroSubmissionReport(t)); err == nil {
+		t.Fatal("redirected submission accepted")
+	}
+	if followed.Load() != 0 {
+		t.Fatalf("redirect target hit %d times, want zero: the reporter never follows", followed.Load())
+	}
+}
+
+// TestHTTPExecutionSecurityReporterRefusesOversizeAcceptance pins the
+// response size limit: a complete accepted envelope followed by more than
+// 64 KiB of whitespace is rejected as too large. Without the limit the
+// truncated body still decodes to an acceptance, so dropping the check
+// stays green while accepting an unbounded body.
+func TestHTTPExecutionSecurityReporterRefusesOversizeAcceptance(t *testing.T) {
+	t.Parallel()
+	answer := `{"contractVersion":"execution-security-report/v1","decision":"accepted"}` + strings.Repeat(" ", executionSecurityReportResponseLimit+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(answer))
+	}))
+	t.Cleanup(srv.Close)
+	reporter, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{
+		BaseURL:  srv.URL,
+		Client:   srv.Client(),
+		Token:    func() string { return "worker-token" },
+		WorkerID: func() string { return "worker-1" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), indexZeroSubmissionReport(t)); err == nil {
+		t.Fatal("oversize acceptance accepted")
+	} else if !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("oversize err = %v, want the too-large refusal", err)
+	}
+}
+
+// worker-identity floor: no worker identity means no post at all, mirroring
+// the bearer floor. Dropping the check stays green while posting a report
+// with an empty worker binding.
+func TestHTTPExecutionSecurityReporterRefusesWithoutWorkerIdentity(t *testing.T) {
+	t.Parallel()
+	posted := false
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		posted = true
+	}))
+	t.Cleanup(srv.Close)
+	reporter, err := NewHTTPExecutionSecurityReporter(HTTPExecutionSecurityReporterOptions{
+		BaseURL:  srv.URL,
+		Client:   srv.Client(),
+		Token:    func() string { return "worker-token" },
+		WorkerID: func() string { return "" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reporter.SubmitExecutionSecurityReport(context.Background(), indexZeroSubmissionReport(t)); err == nil {
+		t.Fatal("submission without a worker identity succeeded")
+	}
+	if posted {
+		t.Fatal("submission without a worker identity posted")
 	}
 }
 

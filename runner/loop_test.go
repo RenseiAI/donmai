@@ -2162,4 +2162,46 @@ func TestLoop_ExecutionSecurityReportWaitsForAcceptance(t *testing.T) {
 			t.Fatalf("spawns = %d, want one", spawns.Load())
 		}
 	})
+
+	// Stamped local-transport work with the report capability spawns without
+	// a submission: local-transport work has no controller registration
+	// endpoint, so without the exclusion it would post to the local daemon
+	// and be refused. Dropping the local-transport check in step 6c turns
+	// this case red because the run posts.
+	t.Run("stamped local-transport work with the capability spawns without a submission", func(t *testing.T) {
+		h := newRunnerHarness(t)
+		var spawns, submissions atomic.Int64
+		inner, err := stub.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		localReg, err := NewRegistryWithOptions(RegistryOptions{RuntimeTransportMode: RuntimeTransportLocal})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := localReg.Register(&spawnCountingStubProvider{Provider: inner, spawns: &spawns}); err != nil {
+			t.Fatal(err)
+		}
+		h.runner.registry = localReg
+		h.runner.executionSecurityReporterOverride = &acceptingExecutionSecurityReporter{submissions: &submissions}
+
+		qw := h.queuedWork("LOOP-REPORT-LOCAL")
+		qw.ExecutionSecurity = executionSecuritySection(nil)
+		qw.Capabilities = map[string]bool{CapabilityExecutionSecurityReportIngest: true}
+		// Local transport carries no controller runtime credentials.
+		qw.AuthToken = ""
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := h.runner.Run(ctx, qw)
+		if err != nil || res.Status != "completed" {
+			t.Fatalf("status=%q err=%v (%s), want completed", res.Status, err, res.Error)
+		}
+		if submissions.Load() != 0 {
+			t.Fatalf("submissions = %d, want zero: local-transport work has no registration endpoint", submissions.Load())
+		}
+		if spawns.Load() != 1 {
+			t.Fatalf("spawns = %d, want one", spawns.Load())
+		}
+	})
 }
