@@ -136,12 +136,11 @@ func (r *Relay) Command(event string) string {
 // and bakes the absolute path in, so the hook needs no environment: hook
 // processes inherit whatever the CLI hands them.
 //
-// The script appends exactly one line — {"v":1,"harness":<argv2>,"event":
-// <argv1>,"ts":<utc>,"payload":<stdin verbatim>} — and prints nothing.
-// stdin is spliced verbatim: when it is valid JSON the line stays valid
-// JSON; when it is not (a CLI that writes a bare marker), the payload is
-// still preserved after a best-effort quote. Either way the Go reader
-// below decides what the line means; the shell never parses.
+// The script appends exactly one line — {"v":1,"event":<argv1>,"ts":<utc>}
+// — and prints nothing. Hook stdin (prompt text, tool input) is deliberately
+// discarded: the moment is the telemetry, never the payload, so no session
+// content ever lands in the relay file. Either way the Go reader below
+// decides what the line means; the shell never parses.
 func scriptSource(eventsPath string) string {
 	p := shellQuote(eventsPath)
 	return `#!/bin/sh
@@ -149,21 +148,12 @@ func scriptSource(eventsPath string) string {
 # Observe-only: appends one JSON line per hook fire and prints nothing,
 # so the CLI treats every fire as an abstention. Exits 0 on every path —
 # a telemetry hook must never fail a turn, even when the disk is full.
+# Hook stdin is discarded: the moment is the telemetry, never the payload.
 set -u
 event="${1:?}"
 out=` + p + `
-payload="$(cat 2>/dev/null || true)"
 ts="$(date -u +%FT%TZ 2>/dev/null || echo "")"
-case "$payload" in
-  ""|"{"*|"["*|'"'*|true|false|null|-|[0-9]*)
-    ;; 
-  *)
-    payload="$(printf '%s' "$payload" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')"
-    payload="\"$payload\""
-    ;;
-esac
-if [ -z "$payload" ]; then payload="null"; fi
-printf '{"v":1,"event":"%s","ts":"%s","payload":%s}\n' "$event" "$ts" "$payload" >>"$out" 2>/dev/null || true
+printf '{"v":1,"event":"%s","ts":"%s"}\n' "$event" "$ts" >>"$out" 2>/dev/null || true
 exit 0
 `
 }
@@ -253,14 +243,53 @@ func (t *Tailer) Sweep(maxLines, maxEvents int) []agent.Event {
 		return nil
 	}
 	var events []agent.Event
-	reader := bufio.NewReader(f)
+	// Bounded reader: a foreign or torn writer must never force an
+	// unbounded allocation. Lines longer than maxRelayLineBytes are
+	// skipped (offset advances past them) without emitting.
+	reader := bufio.NewReaderSize(f, maxRelayLineBytes+2)
 	lines := 0
 	for {
-		raw, err := reader.ReadBytes('\n')
+		raw, err := reader.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			// Oversize line: the buffer filled without a newline.
+			// Respect the sweep caps before consuming it, so a burst
+			// still defers to later ticks rather than flooding.
+			if maxLines > 0 && lines >= maxLines {
+				return events
+			}
+			if maxEvents > 0 && len(events) >= maxEvents {
+				return events
+			}
+			skipped := len(raw)
+			complete := false
+			for {
+				chunk, e := reader.ReadSlice('\n')
+				skipped += len(chunk)
+				if e == nil {
+					complete = true
+					break
+				}
+				if e == bufio.ErrBufferFull {
+					continue
+				}
+				// EOF or another error: the oversize line is torn
+				// (writer never finished it). Advance past the partial
+				// so the next sweep does not re-read it at full cost.
+				break
+			}
+			// Skip without emitting, whether complete or torn: an
+			// oversize line is never telemetry this version maps.
+			_ = complete
+			t.offset += int64(skipped)
+			lines++
+			continue
+		}
 		if len(raw) == 0 {
 			return events
 		}
-		if raw[len(raw)-1] != '\n' {
+		if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+			// A torn trailing line stays unread until the writer completes
+			// it; the offset does not advance past it.
 			return events
 		}
 		if maxLines > 0 && lines >= maxLines {
@@ -279,6 +308,12 @@ func (t *Tailer) Sweep(maxLines, maxEvents int) []agent.Event {
 		}
 	}
 }
+
+// maxRelayLineBytes caps one relay line. The bundled script writes under
+// 200 bytes; anything longer is a foreign writer. Oversize lines are skipped
+// (offset advances past them) without emitting, so a huge torn write never
+// forces a huge allocation on every sweep.
+const maxRelayLineBytes = 4096
 
 // RelayPollInterval is the cadence at which harness tailers re-read the
 // relay file. One second keeps lifecycle markers near-live without

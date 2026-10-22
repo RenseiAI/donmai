@@ -34,6 +34,11 @@ import (
 // is up (SessionID stays empty — claude's session id is only observable
 // through its JSONL headless-mode output, which the interactive REPL never
 // emits) and a single terminal ResultEvent when the CLI process exits.
+// newStopHookChannelFn creates the Stop-hook notice channel. It is a var
+// so tests can force the relay-only path (hook failure with relay success)
+// without breaking the temp dir for both.
+var newStopHookChannelFn = newStopHookChannel
+
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	mcpPath, err := clijsonl.WriteMCPConfigWithEnv(spec.MCPServers, spec.Env)
 	if err != nil {
@@ -58,7 +63,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// and lets the runner report the absence per message (it dead-letters
 	// against a declared-but-absent channel, so the producer learns), rather
 	// than killing a session over a latency optimisation.
-	hook, hookErr := newStopHookChannel()
+	hook, hookErr := newStopHookChannelFn()
 	// The activity relay is best effort like the notice channel: a relay
 	// that cannot be created is a session without hook telemetry, not a
 	// failed session. It shares nothing with the notice drop — either may
@@ -323,8 +328,16 @@ var (
 	_ agent.InteractiveActivityFlusher = (*interactiveHandle)(nil)
 )
 
-// NoticeChannel returns this session's Stop-hook channel.
-func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notices }
+// NoticeChannel returns this session's Stop-hook channel, or nil when the
+// session runs without one (relay-only telemetry). A typed-nil return
+// would present a non-nil interface holding a nil receiver, which panics
+// on Offer; the runner dead-letters only on a real nil, so return one.
+func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel {
+	if h == nil || h.notices == nil {
+		return nil
+	}
+	return h.notices
+}
 
 // ContextUsageSidecarPath returns the session's statusline sidecar path:
 // the file the session's own statusLine command maintains with the live

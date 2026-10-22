@@ -883,6 +883,12 @@ const (
 // without parsing Content.
 const HarnessLifecycleContextKey = "harnessLifecycle"
 
+// HarnessLifecycleUnrecognized is the contextValue a harness-lifecycle
+// marker carries for a moment outside the four known ones. It has the
+// same value as ReasoningEffortUnrecognized but is a separate constant
+// so the two marker families cannot drift together.
+const HarnessLifecycleUnrecognized = "unrecognized"
+
 // HarnessLifecycleContextValue is the contextValue of a
 // harness-lifecycle marker: the moment name for the four known moments,
 // else the unrecognized sentinel. Like the Content, it never carries
@@ -895,14 +901,14 @@ func HarnessLifecycleContextValue(moment string) string {
 		agent.HarnessLifecyclePermissionRequest:
 		return moment
 	default:
-		return ReasoningEffortUnrecognized
+		return HarnessLifecycleUnrecognized
 	}
 }
 
 // HarnessLifecycleContent is the fixed-vocabulary activity content for an
 // agent.SystemSubtypeHarnessLifecycle marker.
 func HarnessLifecycleContent(moment string) string {
-	if HarnessLifecycleContextValue(moment) == ReasoningEffortUnrecognized {
+	if HarnessLifecycleContextValue(moment) == HarnessLifecycleUnrecognized {
 		return harnessLifecycleContentPrefix + "unrecognized moment"
 	}
 	return harnessLifecycleContentPrefix + moment

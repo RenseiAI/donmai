@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func TestRelayScriptAppendsOneLineAndPrintsNothing(t *testing.T) {
@@ -17,9 +19,11 @@ func TestRelayScriptAppendsOneLineAndPrintsNothing(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Close() })
 
-	payload := `{"session_id":"sess-1","hook_event_name":"SessionStart","source":"startup"}`
+	// Hook stdin carries prompt text and tool input: it must never land in
+	// the relay file. The moment is the telemetry, never the payload.
+	secret := "prompt-secret-prompt-secret-12345"
 	cmd := exec.Command("/bin/sh", r.ScriptPath(), "session_start") //nolint:gosec // test re-executes the relay script the test itself just rendered into its own temp dir
-	cmd.Stdin = strings.NewReader(payload)
+	cmd.Stdin = strings.NewReader(`{"session_id":"sess-1","prompt":"` + secret + `"}`)
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("relay script: %v", err)
@@ -32,15 +36,17 @@ func TestRelayScriptAppendsOneLineAndPrintsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read events: %v", err)
 	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("relay file persisted hook stdin %q: %q", secret, raw)
+	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	if len(lines) != 1 {
 		t.Fatalf("events file has %d lines, want 1: %q", len(lines), raw)
 	}
 	var decoded struct {
-		V       int             `json:"v"`
-		Event   string          `json:"event"`
-		TS      string          `json:"ts"`
-		Payload json.RawMessage `json:"payload"`
+		V     int    `json:"v"`
+		Event string `json:"event"`
+		TS    string `json:"ts"`
 	}
 	if err := json.Unmarshal([]byte(lines[0]), &decoded); err != nil {
 		t.Fatalf("relay line is not JSON: %v\n%s", err, lines[0])
@@ -48,12 +54,8 @@ func TestRelayScriptAppendsOneLineAndPrintsNothing(t *testing.T) {
 	if decoded.V != 1 || decoded.Event != "session_start" || decoded.TS == "" {
 		t.Fatalf("relay envelope = %+v, want v=1 event=session_start with a timestamp", decoded)
 	}
-	var inner map[string]any
-	if err := json.Unmarshal(decoded.Payload, &inner); err != nil {
-		t.Fatalf("payload was not spliced verbatim: %v", err)
-	}
-	if inner["session_id"] != "sess-1" {
-		t.Fatalf("payload lost the session id: %v", inner)
+	if strings.Contains(lines[0], "payload") || strings.Contains(lines[0], "sess-1") {
+		t.Fatalf("relay line carries a payload, want moment only: %q", lines[0])
 	}
 }
 
@@ -248,4 +250,100 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// TestSweepRespectsEventCap pins A4: one sweep emits at most MaxEventsPerSweep,
+// deferring the rest to later ticks rather than flooding the consumer.
+func TestSweepRespectsEventCap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var lines []string
+	for range 30 {
+		lines = append(lines, `{"v":1,"event":"stop","ts":"t"}`)
+	}
+	appendLines(t, path, lines...)
+	tailer := NewTailer(path)
+	first := tailer.Sweep(100, 16)
+	if len(first) != 16 {
+		t.Fatalf("first sweep = %d events, want 16 (event cap)", len(first))
+	}
+	second := tailer.Sweep(100, 16)
+	if len(second) != 14 {
+		t.Fatalf("second sweep = %d events, want the remaining 14", len(second))
+	}
+}
+
+// TestSweepRespectsLineCap pins A5: one sweep consumes at most MaxLinesPerSweep
+// lines, deferring the rest.
+func TestSweepRespectsLineCap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var lines []string
+	for range 20 {
+		lines = append(lines, `{"v":1,"event":"stop","ts":"t"}`)
+	}
+	appendLines(t, path, lines...)
+	tailer := NewTailer(path)
+	first := tailer.Sweep(10, 100)
+	if len(first) != 10 {
+		t.Fatalf("first sweep = %d events, want 10 (line cap)", len(first))
+	}
+	second := tailer.Sweep(10, 100)
+	if len(second) != 10 {
+		t.Fatalf("second sweep = %d events, want the remaining 10", len(second))
+	}
+}
+
+// TestTailerResetsOffsetOnTruncate pins A6: when the file shrinks (rotation or
+// truncation), the tailer restarts at zero instead of reading nothing forever.
+func TestTailerResetsOffsetOnTruncate(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	tailer := NewTailer(path)
+	appendLines(t, path, `{"v":1,"event":"session_start","ts":"t"}`)
+	if got := tailer.Sweep(MaxLinesPerSweep, MaxEventsPerSweep); len(got) != 1 {
+		t.Fatalf("first sweep = %d events, want 1", len(got))
+	}
+	// Truncate to a shorter file carrying a different moment.
+	if err := os.WriteFile(path, []byte(`{"v":1,"event":"stop","ts":"t"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := tailer.Sweep(MaxLinesPerSweep, MaxEventsPerSweep)
+	if len(got) != 1 {
+		t.Fatalf("post-truncate sweep = %d events, want 1 (offset reset)", len(got))
+	}
+	sys, ok := got[0].(agent.SystemEvent)
+	if !ok || sys.Subtype != agent.SystemSubtypeHarnessLifecycle || sys.Message != agent.HarnessLifecycleStop {
+		t.Fatalf("post-truncate event = %#v, want harness_lifecycle/stop", got[0])
+	}
+}
+
+// TestSweepSkipsOversizeLine pins the M1 line cap: a line longer than
+// maxRelayLineBytes is skipped (offset advances past it) without emitting,
+// so a huge torn write never forces a huge allocation on every sweep.
+func TestSweepSkipsOversizeLine(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	// Valid-shaped but oversize: without the cap it would parse and emit.
+	big := `{"v":1,"event":"stop","ts":"` + strings.Repeat("x", 5000) + `"}`
+	appendLines(t, path, big, `{"v":1,"event":"session_start","ts":"t"}`)
+	tailer := NewTailer(path)
+	got := tailer.Sweep(MaxLinesPerSweep, MaxEventsPerSweep)
+	if len(got) != 1 {
+		t.Fatalf("sweep = %d events, want 1 (oversize skipped, valid delivered)", len(got))
+	}
+	// The valid line must be the session_start, proving the oversize was
+	// skipped rather than emitted.
+	sys, ok := got[0].(agent.SystemEvent)
+	if !ok || sys.Subtype != agent.SystemSubtypeHarnessLifecycle || sys.Message != agent.HarnessLifecycleSessionStart {
+		t.Fatalf("event = %#v, want harness_lifecycle/session_start", got[0])
+	}
+	// A second sweep is quiet: the offset advanced past both lines.
+	if again := tailer.Sweep(MaxLinesPerSweep, MaxEventsPerSweep); len(again) != 0 {
+		t.Fatalf("resweep = %d events, want none", len(again))
+	}
 }

@@ -53,10 +53,13 @@ MCP children that inherit stdout.
 
 ## Activity-hook telemetry (interactive seats)
 
-An interactive seat additionally declares four observe-only lifecycle
+Every interactive seat — standalone, platform, and repository-authority
+alike — additionally declares four observe-only lifecycle
 hooks — `SessionStart`, `UserPromptSubmit`, `Stop`, `PermissionRequest`
 — in the per-launch `--settings` JSON string (`activityhooks.go`),
-beside the notice channel's `Stop` entry and the routing pin. Each hook
+beside the notice channel's `Stop` entry and the routing pin. (The Codex
+harness, by contrast, installs telemetry only on platform seats without
+repository authority; see its README.) Each hook
 invokes the shared relay script (`../activityrelay/`) with its moment
 on argv, appends one JSON line to the session's relay file, and prints
 nothing, so the CLI treats every fire as an abstention and the session
@@ -69,7 +72,9 @@ Delivery is per launch, never by writing the user's settings: the
 and the relay lives in a temp dir outside the worktree, so the agent
 can neither read its own telemetry nor commit the hook definition. The
 headless lane carries no hooks — its argv is byte-identical to before
-telemetry existed. `PermissionRequest` fires only in sessions that
+telemetry existed. A relay that cannot be created degrades to no telemetry
+(best-effort, never a failed spawn): unlike Codex, the per-launch
+`--settings` string needs no trust dialog. `PermissionRequest` fires only in sessions that
 actually raise permission prompts; bypass-permission seats never
 request, so they never emit it.
 

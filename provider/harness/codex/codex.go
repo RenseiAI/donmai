@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/activityrelay"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -171,6 +172,10 @@ type Options struct {
 	// the interactive process starts. It is an in-package real-binary test seam;
 	// production leaves it nil and no secret-bearing state is exported.
 	interactiveBeforePTYSpawn func(context.Context, string, agent.Spec, interactiveLaunch, string) error
+	// interactiveActivityRelayNew creates the session activity relay.
+	// Production uses activityrelay.New; tests inject a failure to pin the
+	// fail-closed spawn path. Nil means activityrelay.New.
+	interactiveActivityRelayNew func() (*activityrelay.Relay, error)
 }
 
 // New constructs the Provider WITHOUT starting the codex app-server.

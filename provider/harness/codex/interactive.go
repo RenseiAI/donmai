@@ -219,9 +219,11 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	}
 	// Activity-hook telemetry installs after the MCP inventory readback
 	// so the fixture seam above observes the same private config as
-	// before. A relay or append failure degrades to no telemetry — the
-	// launch already omits the hooks kill-switch, but with nothing
-	// configured there is nothing for the review to park on.
+	// before. A relay or append failure fails the spawn closed (gateway
+	// parity): the launch omits the hooks kill-switch, so continuing with
+	// a half-written config would leave the hooks feature on over a
+	// boundary validate() rejected — exactly the review-modal hang trust.go
+	// exists to prevent.
 	var relay *activityrelay.Relay
 	// closeRelay removes the relay directory exactly once. It runs on
 	// error paths and in the PTY cleanup, which ptycli may invoke from
@@ -238,16 +240,25 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		})
 	}
 	if installActivityHooks(spec) {
-		if newRelay, relayErr := activityrelay.New(); relayErr != nil {
-			slog.Warn("codex: activity relay unavailable; continuing without hook telemetry",
-				"session", spec.SessionName, "err", relayErr)
-		} else if appendErr := config.appendActivityHooks(newRelay); appendErr != nil {
-			slog.Warn("codex: activity hooks not installed; continuing without hook telemetry",
-				"session", spec.SessionName, "err", appendErr)
-			_ = newRelay.Close()
-		} else {
-			relay = newRelay
+		newRelayFn := opts.interactiveActivityRelayNew
+		if newRelayFn == nil {
+			newRelayFn = activityrelay.New
 		}
+		newRelay, relayErr := newRelayFn()
+		if relayErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%w: install activity relay: %w", agent.ErrSpawnFailed, relayErr),
+				config.remove(),
+			)
+		}
+		if appendErr := config.appendActivityHooks(newRelay); appendErr != nil {
+			_ = newRelay.Close()
+			return nil, errors.Join(
+				fmt.Errorf("%w: install activity hooks: %w", agent.ErrSpawnFailed, appendErr),
+				config.remove(),
+			)
+		}
+		relay = newRelay
 	}
 	if opts.interactiveBeforePTYSpawn != nil {
 		if err := opts.interactiveBeforePTYSpawn(ctx, bin, spec, launch, config.home); err != nil {

@@ -292,8 +292,14 @@ no telemetry. The `--dangerously-bypass-hook-trust` flag is deliberately
 not used: it prints a warning into every session and waives review for
 all hooks, not just the platform's own.
 
-Verified against codex-cli 0.162.0 (`codex app-server` hooks/list
-readback: four hooks, `trustStatus: trusted`).
+A relay or config-append failure fails the spawn closed rather than
+launching with the hooks feature enabled but unconfigured (gateway
+parity: the same `validate()` error that fails a provider-block append
+fails the telemetry install).
+
+Verified against codex-cli 0.162.0 and 0.162.1 (`codex app-server`
+hooks/list readback: four hooks, `trustStatus: trusted`; untrusted-project
+seats list only these four as trusted while repo hooks stay unloaded).
 
 ## Approvals (interactive and headless spawn modes)
 

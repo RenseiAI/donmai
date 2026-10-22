@@ -48,7 +48,7 @@ import (
 //   - Hooks discovered in the workspace are NOT platform-provisioned. They are
 //     repo content — whoever wrote the checked-out tree chose them — and
 //     trusting them grants arbitrary command execution OUTSIDE the sandbox for
-//     the life of the session. This leg therefore never marks a hook trusted.
+//     the life of the session. This leg therefore never marks such a hook trusted: the only exception is the platform-provisioned activity-telemetry hooks (see activityhooks.go), which the harness itself renders alongside their pre-computed hashes.
 //     It instead takes the same answer the third option of codex's own modal
 //     offers ("Continue without trusting — hooks won't run") and takes it
 //     deterministically, by turning the hooks feature off for this process. The

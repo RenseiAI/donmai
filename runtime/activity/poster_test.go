@@ -1279,3 +1279,20 @@ func TestPosterDispatchTraceHeaders(t *testing.T) {
 		})
 	}
 }
+
+// TestHarnessLifecycleUnrecognizedIsOwnConstant pins m2: the harness-lifecycle
+// family has its own unrecognized sentinel, not an alias of the
+// reasoning-effort family's. Deleting the constant (reverting to
+// ReasoningEffortUnrecognized) fails this file to compile (RED).
+func TestHarnessLifecycleUnrecognizedIsOwnConstant(t *testing.T) {
+	t.Parallel()
+	if activity.HarnessLifecycleUnrecognized != "unrecognized" {
+		t.Fatalf("HarnessLifecycleUnrecognized = %q, want unrecognized", activity.HarnessLifecycleUnrecognized)
+	}
+	if got := activity.HarnessLifecycleContextValue("bogus-moment"); got != activity.HarnessLifecycleUnrecognized {
+		t.Fatalf("unknown moment contextValue = %q, want the harness-lifecycle sentinel", got)
+	}
+	if got := activity.HarnessLifecycleContent("bogus-moment"); !strings.Contains(got, "unrecognized moment") {
+		t.Fatalf("unknown moment content = %q, want the fixed unrecognized sentence", got)
+	}
+}

@@ -11,9 +11,12 @@
 // activity stream.
 //
 // The hook parses nothing and decides nothing: the event name is baked
-// into its argv, the relay path is baked into its body, and the CLI's
-// own stdin payload is forwarded verbatim as an opaque object. A hook
-// that has to render a decision or dig a field out of JSON is a hook
+// into its argv, the relay path is baked into its body, and the CLI's own
+// stdin payload is discarded — the moment is the telemetry, never the
+// content, so no prompt text or tool input ever lands in the relay file.
+// Lines are capped (see maxRelayLineBytes): an oversize line is skipped
+// without emitting, so a huge torn write never forces a huge allocation.
+// A hook that has to render a decision or dig a field out of JSON is a hook
 // that corrupts telemetry on the first quote character — and, worse, a
 // hook whose output the CLI interprets (a Stop decision, a permission
 // verdict) could steer the session. These hooks are observe-only by

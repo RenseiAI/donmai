@@ -60,7 +60,7 @@ import (
 // project hooks codex skips on its own, leaving only these trusted
 // hooks to run with no dialog.
 //
-// Verified against codex-cli 0.162.0: the hooks block shape
+// Verified against codex-cli 0.162.0 and 0.162.1: the hooks block shape
 // ([[hooks.SessionStart]] tables with matcher + hooks arrays), the
 // [hooks.state] key format, and the hash algorithm were all confirmed
 // against a live `codex app-server` hooks/list readback. The TUI
@@ -270,7 +270,26 @@ type activityHandle struct {
 	activityFlushed chan struct{}
 }
 
-var _ agent.InteractiveCapable = (*activityHandle)(nil)
+var (
+	_ agent.InteractiveCapable            = (*activityHandle)(nil)
+	_ agent.InteractiveActivityFlusher    = (*activityHandle)(nil)
+	_ agent.InteractiveTerminalCostSource = (*activityHandle)(nil)
+	_ agent.ContextUsageSourcer           = (*activityHandle)(nil)
+)
+
+// emitActivityEvent forwards one relay event best-effort, never taking a slot
+// reserved for the coarse Init/Result contract. With at most
+// activityCoarseEventSlots coarse sends over the handle's life, the coarse
+// senders below can never block on a channel relay events filled.
+func emitActivityEvent(ch chan agent.Event, ev agent.Event) {
+	if len(ch) >= cap(ch)-activityCoarseEventSlots {
+		return
+	}
+	select {
+	case ch <- ev:
+	default:
+	}
+}
 
 func wrapActivityHandle(h *interactiveConversationHandle, relay *activityrelay.Relay) *activityHandle {
 	w := &activityHandle{
@@ -280,13 +299,7 @@ func wrapActivityHandle(h *interactiveConversationHandle, relay *activityrelay.R
 	}
 	tailer := activityrelay.NewTailer(relay.EventsPath())
 	emit := func(ev agent.Event) {
-		if len(w.events) >= cap(w.events)-activityCoarseEventSlots {
-			return
-		}
-		select {
-		case w.events <- ev:
-		default:
-		}
+		emitActivityEvent(w.events, ev)
 	}
 	var wg sync.WaitGroup
 	wg.Add(1)
