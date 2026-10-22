@@ -377,9 +377,9 @@ jobs:
 
       # Must precede GoReleaser: the `signs:` blocks shell out to `cosign`.
       - name: Install cosign
-        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           # Keep the verified pipeline order fixed: binary_signs -> archives ->
           # checksums -> signs. Upgrade only with a source/docs re-verification.
@@ -392,6 +392,6 @@ jobs:
       # this commit by this workflow". Consumers verify with:
       #   gh attestation verify <archive> --repo RenseiAI/donmai
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*.tar.gz
