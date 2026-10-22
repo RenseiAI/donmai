@@ -1106,6 +1106,31 @@ func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.
 func sessionRootArchiveFixture(t *testing.T, selected string) (*WorkareaArchiveRegistry, string) {
 	t.Helper()
 	archiveRoot := t.TempDir()
+	acquisitions, spec, worktreeParent := sessionRootSourceFixture(t, "wa_archive_metadata", "archive-session", selected, map[string]string{
+		"web/source.txt": "mutable", "docs/context.txt": "readonly",
+	})
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions})
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := acquisitions.RemovePublishedRoot(spec.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	worktreeParentForReadback, err := filepath.EvalSymlinks(worktreeParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry = NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions, WorktreeParent: worktreeParentForReadback})
+	return registry, filepath.Join(archiveRoot, "wa_archive_metadata", "manifest.json")
+}
+
+// sessionRootSourceFixture publishes a declared two-repository session root
+// (web and docs) through a real acquisition store and returns the store, the
+// whole-root archive spec for it, and the worktree parent. files maps
+// slash-separated root-relative paths to contents; a value prefixed "->"
+// creates a symlink to the rest of the value instead.
+func sessionRootSourceFixture(t *testing.T, workareaID, sessionID, selected string, files map[string]string) (*workarea.AcquisitionStore, WorkareaRootArchiveSpec, string) {
+	t.Helper()
 	worktreeParent := t.TempDir()
 	sourceRoot := filepath.Join(worktreeParent, "session-root")
 	declaration := workarea.RepositoryDeclarationV1{
@@ -1124,21 +1149,13 @@ func sessionRootArchiveFixture(t *testing.T, selected string) (*WorkareaArchiveR
 	if err != nil {
 		t.Fatal(err)
 	}
-	acquisition, err := acquisitions.Begin("archive-session", "wa_archive_metadata", workarea.RootPath(sourceRoot), selected, "")
+	acquisition, err := acquisitions.Begin(sessionID, workareaID, workarea.RootPath(sourceRoot), selected, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for leaf, body := range map[string]string{"web/source.txt": "mutable", "docs/context.txt": "readonly"} {
-		path := filepath.Join(acquisition.StagingRoot.String(), leaf)
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeFixtureFiles(t, acquisition.StagingRoot.String(), files)
 	record := workarea.NewDeclarationRecord(
-		"archive-session", "wa_archive_metadata", normalized,
+		sessionID, workareaID, normalized,
 		map[string]string{"web": "aaa", "docs": "bbb"}, acquisition.Record.AcquisitionID,
 	)
 	if err := workarea.WriteDeclaration(t.Context(), acquisition.StagingRoot, record); err != nil {
@@ -1147,22 +1164,30 @@ func sessionRootArchiveFixture(t *testing.T, selected string) (*WorkareaArchiveR
 	if _, err := acquisitions.Commit(acquisition.Record.AcquisitionID); err != nil {
 		t.Fatal(err)
 	}
-	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions})
-	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
-		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: "wa_archive_metadata", SessionID: "archive-session",
+	return acquisitions, WorkareaRootArchiveSpec{
+		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: workareaID, SessionID: sessionID,
 		WorkareaRoot: sourceRoot, SelectedPath: filepath.Join(sourceRoot, selected),
-	}); err != nil {
-		t.Fatal(err)
+	}, worktreeParent
+}
+
+// writeFixtureFiles writes files (see sessionRootSourceFixture) under root.
+func writeFixtureFiles(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for relative, body := range files {
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if target, ok := strings.CutPrefix(body, "->"); ok {
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
-		t.Fatal(err)
-	}
-	worktreeParentForReadback, err := filepath.EvalSymlinks(worktreeParent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	registry = NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions, WorktreeParent: worktreeParentForReadback})
-	return registry, filepath.Join(archiveRoot, "wa_archive_metadata", "manifest.json")
 }
 
 func TestWorkareaArchiveRegistryRestoreRejectsManifestRepositoryMetadataMismatch(t *testing.T) {
