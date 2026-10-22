@@ -416,9 +416,10 @@ func TestOnYamlChanged_UpdatesProjects(t *testing.T) {
 
 // TestOnYamlChanged_AdoptsRotatedRegistrationToken pins the live-rotation
 // contract: when the config file carries a new registration token for the
-// same orchestrator, the watcher adopts it into the credential refresher
-// before the re-registration runs, so the reload presents the current
-// generation instead of the revoked boot-time one.
+// same orchestrator, the watcher proves it against the control plane and
+// adopts the proven generation into the credential refresher before the
+// re-registration runs, so the reload presents the current generation
+// instead of the revoked boot-time one.
 //
 // Against the pre-change code this test fails: nothing adopts the reloaded
 // token, so the registration request still carries the stale generation.
@@ -430,6 +431,15 @@ func TestOnYamlChanged_AdoptsRotatedRegistrationToken(t *testing.T) {
 	var mu sync.Mutex
 	var gotAuth []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			// The rotation's own prove round trip: honours the candidate
+			// generation without minting a new worker identity.
+			mu.Lock()
+			gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "rotated.jwt"})
+			return
+		}
 		if r.URL.Path != RegisterEndpoint {
 			http.NotFound(w, r)
 			return
@@ -486,10 +496,13 @@ func TestOnYamlChanged_AdoptsRotatedRegistrationToken(t *testing.T) {
 }
 
 // TestOnYamlChanged_PureTokenRotationReregisters pins that a rotation with no
-// accompanying project change still triggers a re-registration presenting the
-// new generation. Without this, a key-only file edit is swallowed by the
-// watcher's no-change early return and the daemon keeps the revoked key until
-// the next project edit or restart.
+// accompanying project change is proven and then presented: the watcher's
+// prove round trip re-presents the identity under the new generation, and the
+// re-registration presents it to the control plane. Without this, a key-only
+// file edit is swallowed by the watcher's no-change early return and the
+// daemon keeps the revoked key until the next project edit or restart. A
+// generation the control plane refuses is never adopted and triggers no
+// re-registration.
 func TestOnYamlChanged_PureTokenRotationReregisters(t *testing.T) {
 	t.Parallel()
 
@@ -497,6 +510,11 @@ func TestOnYamlChanged_PureTokenRotationReregisters(t *testing.T) {
 	defer cancel()
 	requests := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			// The rotation's own prove round trip.
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "rotated.jwt"})
+			return
+		}
 		if r.URL.Path != RegisterEndpoint {
 			http.NotFound(w, r)
 			return

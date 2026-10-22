@@ -1255,3 +1255,250 @@ func TestCredentialRefresher_RotateRegistrationTokenWaitsForInflightReregister(t
 		t.Errorf("lane = (%q, %q), want the proven credentials fanned out", id, jwt)
 	}
 }
+
+// TestCredentialRefresher_RotateRegistrationTokenHidesUnprovenGeneration pins
+// that the candidate is proven on a copy: while the prove round trip is in
+// flight, Registration() still reports the previous generation. Against the
+// mutate-before-prove shape the refresher exposes the rotated token
+// mid-flight and this test goes red.
+func TestCredentialRefresher_RotateRegistrationTokenHidesUnprovenGeneration(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		enterOnce.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+	done := make(chan error, 1)
+	go func() {
+		// #nosec G101 -- test fixture token
+		_, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired")
+		done <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rotation did not reach the wire")
+	}
+	if token, _ := r.Registration(); token != "rsp_live_x" {
+		t.Fatalf("refresher exposes %q mid-flight, want the previous generation until proven", token)
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("rotation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not return")
+	}
+	if token, _ := r.Registration(); token != "rsp_live_rotated" {
+		t.Fatalf("refresher holds %q after proof, want the proven generation", token)
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenSuccessKeepsConcurrentUpdate
+// pins the success-path race: when a concurrent UpdateRegistrationToken lands
+// while the prove round trip is in flight, the rotation reports that it lost
+// the race instead of fanning out credentials proven under the rotated
+// generation alongside the concurrent one. The refresher keeps the newer
+// generation and the lanes stay on their current credentials until the next
+// refresh presents it. Against a publish-before-prove swap the lanes move to
+// the rotated credentials while the token ends on the concurrent generation.
+func TestCredentialRefresher_RotateRegistrationTokenSuccessKeepsConcurrentUpdate(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	var mu sync.Mutex
+	var gotAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		enterOnce.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		mu.Lock()
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+	lane := &recordingLane{}
+	r.Attach(lane)
+	rotateDone := make(chan error, 1)
+	go func() {
+		// #nosec G101 -- test fixture token
+		_, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired")
+		rotateDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rotation did not reach the wire")
+	}
+	// A newer generation lands while the prove round trip is in flight.
+	// #nosec G101 -- test fixture token
+	r.UpdateRegistrationToken("rsk_live_concurrent")
+	close(release)
+
+	select {
+	case err := <-rotateDone:
+		if err == nil {
+			t.Fatal("rotation succeeded over a concurrent update; want the race reported")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not return")
+	}
+	if token, _ := r.Registration(); token != "rsk_live_concurrent" {
+		t.Fatalf("refresher holds %q, want the concurrent generation kept", token)
+	}
+	if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "before.jwt" {
+		t.Errorf("lane = (%q, %q), want the pre-rotation credentials kept — nothing proven was fanned out", id, jwt)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotAuth) != 1 || gotAuth[0] != "Bearer rsp_live_rotated" {
+		t.Fatalf("wire auth = %v, want exactly [Bearer rsp_live_rotated] — the proof ran under the candidate", gotAuth)
+	}
+}
+
+// TestCredentialRefresher_RotateRegistrationTokenRefusesStubPromotion pins
+// that rotation never promotes a stub-booted refresher live: the running
+// generation must itself be platform-shaped, sharing the watcher's
+// stub-promotion refusal through the same shape door.
+func TestCredentialRefresher_RotateRegistrationTokenRefusesStubPromotion(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	// #nosec G101 -- test fixture token
+	opts.Registration.RegistrationToken = "local-stub-no-token"
+	r := NewCredentialRefresher(opts)
+	// #nosec G101 -- test fixture token
+	if _, err := r.RotateRegistrationToken(context.Background(), "rsp_live_rotated", "runtime-token-expired"); err == nil {
+		t.Fatal("rotation promoting a stub registration succeeded; want refusal")
+	}
+	if token, _ := r.Registration(); token != "local-stub-no-token" {
+		t.Errorf("refresher holds %q, want the stub generation kept", token)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Errorf("refused promotion made %d wire request(s); want none", requests)
+	}
+}
+
+// TestDaemon_YamlWatcherProvesRotations pins that the config watcher routes a
+// reloaded registration token through the proven rotation entry point instead
+// of adopting it raw: a generation the control plane refuses leaves the
+// running generation (and the filed pointer) in place, while a generation it
+// honours is adopted and fanned out to every lane. Against the raw setter the
+// refused generation would be adopted and every later refresh would present
+// it.
+func TestDaemon_YamlWatcherProvesRotations(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer rsp_live_rejected" {
+			http.Error(w, `{"error":"unknown registration"}`, http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	newWatched := func(t *testing.T) (*Daemon, *recordingLane) {
+		t.Helper()
+		base := &Config{Orchestrator: OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_x"}}
+		d := &Daemon{config: base, credentials: NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))}
+		lane := &recordingLane{}
+		d.credentials.Attach(lane)
+		return d, lane
+	}
+
+	t.Run("refused generation stays", func(t *testing.T) {
+		d, lane := newWatched(t)
+		// #nosec G101 -- test fixture token
+		reloaded := *d.config
+		reloaded.Orchestrator.AuthToken = "rsp_live_rejected"
+		d.onYamlChanged(&reloaded)
+		if token, _ := d.credentials.Registration(); token != "rsp_live_x" {
+			t.Fatalf("refresher holds %q after a refused rotation, want the running generation kept", token)
+		}
+		if d.config.Orchestrator.AuthToken != "rsp_live_x" {
+			t.Fatalf("filed token = %q after a refused rotation, want the running generation kept", d.config.Orchestrator.AuthToken)
+		}
+		if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "before.jwt" {
+			t.Errorf("lane = (%q, %q), want the running credentials kept", id, jwt)
+		}
+	})
+
+	t.Run("proven generation adopts", func(t *testing.T) {
+		d, lane := newWatched(t)
+		// #nosec G101 -- test fixture token
+		reloaded := *d.config
+		reloaded.Orchestrator.AuthToken = "rsp_live_rotated"
+		d.onYamlChanged(&reloaded)
+		if token, _ := d.credentials.Registration(); token != "rsp_live_rotated" {
+			t.Fatalf("refresher holds %q after a proven rotation, want the rotated generation", token)
+		}
+		if d.config.Orchestrator.AuthToken != "rsp_live_rotated" {
+			t.Fatalf("filed token = %q after a proven rotation, want the rotated generation", d.config.Orchestrator.AuthToken)
+		}
+		if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "refreshed.jwt" {
+			t.Errorf("lane = (%q, %q), want the proven credentials fanned out", id, jwt)
+		}
+	})
+}

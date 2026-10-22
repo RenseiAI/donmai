@@ -161,6 +161,17 @@ func (r *CredentialRefresher) UpdateRegistrationProjects(entries []ProjectAllowl
 	r.mu.Unlock()
 }
 
+// isAdoptableRegistrationToken reports whether a token may be presented to the
+// control plane without demoting the refresher to the stub path: non-blank,
+// unpadded, and carrying the platform's registration-token shape. It is the
+// one shared refusal door for every path that adopts an outside token: the
+// rotation entry point and the config watcher's candidate check both consult
+// it, so a future prefix change cannot desync the two doors and re-open the
+// stub-demotion path for watcher-adopted tokens.
+func isAdoptableRegistrationToken(token string) bool {
+	return token != "" && strings.TrimSpace(token) == token && looksLikeRegistrationToken(token)
+}
+
 // UpdateRegistrationToken replaces the registration token presented on the
 // next refresh or re-registration, so a rotated token takes effect without a
 // restart. Only the token changes; every other registration field retains its
@@ -175,7 +186,7 @@ func (r *CredentialRefresher) UpdateRegistrationProjects(entries []ProjectAllowl
 // on a dead generation. Callers that accept a token from outside the process
 // must either apply the same checks the daemon's config watcher applies
 // (orchestrator URL unchanged, platform token shape — see
-// adoptRotatedRegistrationTokenLocked) or, preferably, use
+// registrationRotationCandidateLocked) or, preferably, use
 // RotateRegistrationToken, which refuses such tokens and proves the new
 // generation against the control plane before the swap becomes visible.
 //
@@ -195,12 +206,15 @@ func (r *CredentialRefresher) UpdateRegistrationToken(token string) {
 // before it can strand the lanes.
 //
 // The swap is refused up front when the token is blank, carries surrounding
-// whitespace, or lacks the platform's registration-token shape: adopting such
-// a token would silently demote the next refresh to the stub path, move every
-// lane onto a stub identity, and overwrite the on-disk cache. A token the
-// control plane refuses is likewise refused: the round trip fails, the
-// previous token is restored before returning, and the error is visible to
-// the caller — the refresher is never left presenting a generation the
+// whitespace, or lacks the platform's registration-token shape (see
+// isAdoptableRegistrationToken): adopting such a token would silently demote
+// the next refresh to the stub path, move every lane onto a stub identity,
+// and overwrite the on-disk cache. The running registration must itself be a
+// platform registration: promoting a stub-booted refresher live would leave
+// lanes on an identity the poll loop never serves — that promotion is a
+// restart. A token the control plane refuses is likewise refused: the round
+// trip fails, the held generation is left untouched, and the error is visible
+// to the caller — the refresher is never left presenting a generation the
 // control plane rejected. Only the token changes; every other registration
 // field retains its current value.
 //
@@ -216,15 +230,17 @@ func (r *CredentialRefresher) UpdateRegistrationToken(token string) {
 // credentials that operation settled on.
 //
 // A concurrent UpdateRegistrationToken that lands while the prove round trip
-// is in flight is newer than this rotation: on failure the previous
-// generation is restored only when the refresher still holds the rotated
-// token, so a failed rotation never clobbers a newer generation.
+// is in flight is newer than this rotation: on success the candidate is
+// stored only when the refresher still holds the previous generation,
+// otherwise the rotation reports that it lost the race and leaves the newer
+// generation (and its lanes) alone; on failure nothing needs restoring
+// because the held generation was never mutated.
 //
 // Like UpdateRegistrationToken, the swap is memory-only: the durable token
 // stays in the operator-owned config file, so a restart reverts to the filed
 // generation.
 func (r *CredentialRefresher) RotateRegistrationToken(ctx context.Context, token, reason string) (*RefreshTokenResult, error) {
-	if token == "" || strings.TrimSpace(token) != token || !looksLikeRegistrationToken(token) {
+	if !isAdoptableRegistrationToken(token) {
 		return nil, errors.New("rotate registration token: refusing token without the platform's registration-token shape (blank, padded, or foreign)")
 	}
 	if reason == "" {
@@ -237,34 +253,38 @@ func (r *CredentialRefresher) RotateRegistrationToken(ctx context.Context, token
 
 	r.mu.Lock()
 	previous := r.opts.Registration.RegistrationToken
-	r.opts.Registration.RegistrationToken = token
-	r.mu.Unlock()
-
-	r.mu.Lock()
 	current := r.workerID
+	if !looksLikeRegistrationToken(previous) {
+		r.mu.Unlock()
+		return nil, errors.New("rotate registration token: the running registration is not platform-registered; restart to register")
+	}
+	// Prove on a copy: the candidate must not become visible via
+	// Registration() before the control plane has honoured it, and a
+	// concurrent UpdateRegistrationToken landing mid-flight must win over
+	// this rotation rather than be silently mismatched with credentials
+	// proven under the rotated generation.
 	registration := r.opts.Registration
+	registration.RegistrationToken = token
 	r.mu.Unlock()
 
 	result, err := RepresentRuntimeToken(ctx, registration, current, reason)
 	if err == nil {
 		err = ctx.Err()
-		if err == nil {
-			result, err = r.adopt(result, registration)
-		}
 	}
 	if err != nil {
-		r.mu.Lock()
-		// A concurrent UpdateRegistrationToken that landed while the prove
-		// round trip was in flight is newer than this rotation: restore the
-		// previous generation only when the refresher still holds the
-		// rotated token, so a failed rotation never clobbers it.
-		if r.opts.Registration.RegistrationToken == token {
-			r.opts.Registration.RegistrationToken = previous
-		}
-		r.mu.Unlock()
+		// The held generation was never mutated, so a failed rotation
+		// cannot clobber a newer generation that landed mid-flight.
 		return nil, fmt.Errorf("rotate registration token: %w", err)
 	}
-	return result, nil
+	r.mu.Lock()
+	if r.opts.Registration.RegistrationToken != previous {
+		r.mu.Unlock()
+		return nil, errors.New("rotate registration token: a concurrent token update won the race; rotation not adopted")
+	}
+	r.opts.Registration.RegistrationToken = token
+	stored := r.opts.Registration
+	r.mu.Unlock()
+	return r.adopt(result, stored)
 }
 
 // Registration reports the registration this refresher presents on the next
