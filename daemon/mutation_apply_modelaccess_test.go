@@ -295,40 +295,117 @@ func TestApplyPendingMutations_ModelAccess_UnknownOp(t *testing.T) {
 
 func TestApplyPendingMutations_ModelAccessSet_UnknownWorkloadRejected(t *testing.T) {
 	t.Parallel()
-	// A workload key outside the shared vocabulary (e.g. a typo'd
-	// "develop-ment") can never match at enforcement time — the strict block
-	// would be stored but silently fall back to the ceiling. The mutation must
+	// A malformed workload key (outside the lowercase-kebab name shape)
+	// can never match at enforcement time — the strict block would be
+	// stored but silently fall back to the ceiling. The mutation must
 	// fail (NACK) and leave both memory and disk untouched.
+	// Note: the empty workload is not in this list — it addresses the
+	// Default block (pinned by TestApplyPendingMutations_ModelAccessSet_Default)
+	// and never reaches the key check; knownWorkloadKey("") itself stays
+	// false, pinned by TestKnownWorkloadKey below.
+	for _, key := range []string{"Not A Name!", "-leading", "trailing-", "double--dash", "UPPER", "under_score", "has space", "dot.name", strings.Repeat("a", 65)} {
+		t.Run("key="+key, func(t *testing.T) {
+			t.Parallel()
+			d, path := newTestDaemonWithProjects(t, nil)
+
+			applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+				{
+					ID: "set_typo",
+					Op: "modelAccess.set",
+					Params: mustParams(t, map[string]any{
+						"workload": key,
+						"policy":   anthropicHostSessionPolicy(),
+					}),
+				},
+			})
+			if len(applied) != 0 {
+				t.Errorf("applied = %v, want none for malformed workload %q", applied, key)
+			}
+			if len(failures) != 1 || failures[0].ID != "set_typo" {
+				t.Fatalf("failures = %v, want one for set_typo", failures)
+			}
+			if !strings.Contains(failures[0].Error, `unknown workload "`+key+`"`) {
+				t.Errorf("failure.Error = %q, want unknown-workload message", failures[0].Error)
+			}
+			// The error must teach the fix: list the valid vocabulary.
+			if !strings.Contains(failures[0].Error, "development") {
+				t.Errorf("failure.Error = %q, want the known-keys list included", failures[0].Error)
+			}
+			// The error must describe the accepted shape for custom names.
+			if !strings.Contains(failures[0].Error, "kebab") {
+				t.Errorf("failure.Error = %q, want the accepted name shape described", failures[0].Error)
+			}
+			if d.config.ModelAccess != nil {
+				t.Errorf("in-memory ModelAccess = %+v, want nil after rejected set", d.config.ModelAccess)
+			}
+			if got := readYamlModelAccess(t, path); got != nil {
+				t.Errorf("yaml ModelAccess = %+v, want nothing persisted after rejected set", got)
+			}
+		})
+	}
+}
+
+// TestKnownWorkloadKey pins the open vocabulary: built-ins and the
+// non-agent batch keys stay accepted, organisation-defined names in the
+// lowercase-kebab shape are accepted, and empty plus malformed keys stay
+// refused.
+func TestKnownWorkloadKey(t *testing.T) {
+	t.Parallel()
+	accepted := []string{
+		"development", "qa", "research", "acceptance", "inflight",
+		"code-survival-scan", "kg-extraction", "interview",
+		"chief-of-staff", "develop-ment", "a", "0abc", "a1-b2",
+		strings.Repeat("a", 64),
+	}
+	for _, key := range accepted {
+		t.Run("accept/"+key, func(t *testing.T) {
+			t.Parallel()
+			if !knownWorkloadKey(key) {
+				t.Errorf("knownWorkloadKey(%q) = false, want true", key)
+			}
+		})
+	}
+	rejected := []string{
+		"", "Not A Name!", "-leading", "trailing-", "double--dash",
+		"UPPER", "under_score", "has space", "dot.name", "slash/x",
+		strings.Repeat("a", 65),
+	}
+	for _, key := range rejected {
+		t.Run("reject/"+key, func(t *testing.T) {
+			t.Parallel()
+			if knownWorkloadKey(key) {
+				t.Errorf("knownWorkloadKey(%q) = true, want false", key)
+			}
+		})
+	}
+}
+
+func TestApplyPendingMutations_ModelAccessSet_CustomNameAccepted(t *testing.T) {
+	t.Parallel()
+	// The set of work-type names is open: an organisation-defined name
+	// matching the lowercase-kebab shape is stored like any built-in, so
+	// an operator can configure a model-access block for a custom type.
 	d, path := newTestDaemonWithProjects(t, nil)
 
 	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
 		{
-			ID: "set_typo",
+			ID: "set_custom",
 			Op: "modelAccess.set",
 			Params: mustParams(t, map[string]any{
-				"workload": "develop-ment",
+				"workload": "chief-of-staff",
 				"policy":   anthropicHostSessionPolicy(),
 			}),
 		},
 	})
-	if len(applied) != 0 {
-		t.Errorf("applied = %v, want none for unknown workload", applied)
+	if len(applied) != 1 || len(failures) != 0 {
+		t.Fatalf("applied/failures = %v/%v, want [set_custom]/[]", applied, failures)
 	}
-	if len(failures) != 1 || failures[0].ID != "set_typo" {
-		t.Fatalf("failures = %v, want one for set_typo", failures)
+	got := readYamlModelAccess(t, path)
+	if got == nil || got.Workloads == nil {
+		t.Fatalf("yaml ModelAccess.Workloads nil after custom set: %+v", got)
 	}
-	if !strings.Contains(failures[0].Error, `unknown workload "develop-ment"`) {
-		t.Errorf("failure.Error = %q, want unknown-workload message", failures[0].Error)
-	}
-	// The error must teach the fix: list the valid vocabulary.
-	if !strings.Contains(failures[0].Error, "development") {
-		t.Errorf("failure.Error = %q, want the known-keys list included", failures[0].Error)
-	}
-	if d.config.ModelAccess != nil {
-		t.Errorf("in-memory ModelAccess = %+v, want nil after rejected set", d.config.ModelAccess)
-	}
-	if got := readYamlModelAccess(t, path); got != nil {
-		t.Errorf("yaml ModelAccess = %+v, want nothing persisted after rejected set", got)
+	if _, ok := got.Workloads["chief-of-staff"]; !ok {
+		t.Errorf(`workload "chief-of-staff" absent after accepted set`)
 	}
 }
 

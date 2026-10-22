@@ -241,3 +241,43 @@ func TestDeliveryPolicyHelpers(t *testing.T) {
 		t.Error("absent clean-merge intent allows clean merges; want today's behaviour")
 	}
 }
+
+// TestQueuedWork_WorkTypeRoleWireSemantics locks the role wire contract:
+// camelCase, omitempty for absent/explicit-empty values, exact round-trip
+// when populated. An absent role is mixed-version-safe: an older platform
+// that never emits the field decodes to "" and the legacy name-keyed
+// behaviour applies unchanged.
+func TestQueuedWork_WorkTypeRoleWireSemantics(t *testing.T) {
+	t.Parallel()
+
+	qw := QueuedWork{SessionID: "role-wire", WorkType: "chief-of-staff", WorkTypeRole: "inflight"}
+	body, err := json.Marshal(qw)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"workTypeRole":"inflight"`) {
+		t.Errorf("marshaled payload missing workTypeRole: %s", body)
+	}
+	var back QueuedWork
+	if err := json.Unmarshal(body, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.WorkTypeRole != "inflight" || back.WorkType != "chief-of-staff" {
+		t.Errorf("round-trip = %+v, want name + role preserved", back)
+	}
+
+	absent, err := json.Marshal(QueuedWork{SessionID: "role-absent"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(absent), "workTypeRole") {
+		t.Errorf("empty WorkTypeRole must stay omitted, got %s", absent)
+	}
+	var explicitEmpty QueuedWork
+	if err := json.Unmarshal([]byte(`{"sessionId":"role-empty","workTypeRole":""}`), &explicitEmpty); err != nil {
+		t.Fatalf("decode explicit empty: %v", err)
+	}
+	if explicitEmpty.WorkTypeRole != "" {
+		t.Errorf("explicit empty role = %q, want \"\"", explicitEmpty.WorkTypeRole)
+	}
+}

@@ -116,7 +116,11 @@ type SessionDetail struct {
 
 	// WorkType is the workflow discriminant ("development", "qa",
 	// "research", ...).
-	WorkType     string `json:"workType,omitempty"`
+	WorkType string `json:"workType,omitempty"`
+
+	// WorkTypeRole is the coarse behavioural bucket the work-type name
+	// belongs to ("inflight", "review", "intake", "terminal").
+	// Forwarded opaquely from the poll item onto the runner work item.
 	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// PromptContext is the rendered Linear issue context block produced

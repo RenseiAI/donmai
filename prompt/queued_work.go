@@ -129,8 +129,21 @@ type QueuedWork struct {
 
 	// WorkType is the work-type discriminant (e.g. "development",
 	// "qa", "research"). Drives template selection in [Builder.Build].
-	// Unknown values fall through to the development template.
-	WorkType     string `json:"workType,omitempty"`
+	// Unknown values fall through to the development template unless
+	// WorkTypeRole names a role whose representative built-in renders
+	// a different template.
+	WorkType string `json:"workType,omitempty"`
+
+	// WorkTypeRole is the coarse behavioural bucket the work-type name
+	// belongs to ("inflight", "review", "intake", "terminal").
+	// Stamped by the dispatcher next to WorkType so organisation-defined
+	// names render the template of their role's representative built-in.
+	// Empty or unrecognised values are treated as absent (the legacy
+	// name-keyed behaviour applies unchanged).
+	//
+	// Wire shape: "workTypeRole" (camelCase, omitempty). Threaded through
+	// every wire hop so Go's strict JSON decoder never drops the platform's
+	// emit — the v0.9.3 SystemPromptOverride wire-gap precedent.
 	WorkTypeRole string `json:"workTypeRole,omitempty"`
 
 	// PromptContext is the rendered Linear issue context block produced

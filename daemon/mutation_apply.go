@@ -417,14 +417,46 @@ func disableProjectID(ids *[]string, id string) bool {
 	return removed
 }
 
-// knownWorkloadKey reports whether a modelAccess.set workload key belongs to
-// the shared workload vocabulary: the agent work types (runner.AllWorkTypes),
-// the non-agent batch work types (code-survival-scan, kg-extraction), and the
-// mode-derived "interview" workload. The embedder derives the enforcement-time
-// lookup key from exactly these sources (explicit Workload | WorkType | Mode),
-// so a key outside the vocabulary can never match a session — the strict block
-// the operator thought they configured would be stored verbatim and silently
-// fall back to the Default block / platform ceiling at enforcement time.
+// The open work-type name shape is lowercase kebab (lowercase
+// alphanumerics joined by single hyphens), at most maxWorkTypeNameLength
+// characters. The set of work-type names is open — the dispatcher may
+// assign an organisation-defined name with a valid role — so a
+// modelAccess.set workload key is accepted when it matches this pattern,
+// not only when it belongs to the compiled-in vocabulary below. Empty
+// and malformed keys are still rejected: they can never match a session
+// at enforcement time, so the strict block the operator thought they
+// configured would be stored verbatim and silently fall back to the
+// Default block / platform ceiling.
+const maxWorkTypeNameLength = 64
+
+// isWorkTypeName reports whether key matches the open work-type name
+// shape (lowercase kebab, at most 64 characters). Pure, so the boundary
+// rejections (empty, uppercase, spaces, punctuation, overlong) can be
+// pinned by tests independently of the mutation path.
+func isWorkTypeName(key string) bool {
+	if key == "" || len(key) > maxWorkTypeNameLength {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		isLowerAlnum := c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+		if !isLowerAlnum && c != '-' {
+			return false
+		}
+		if c == '-' && (i == 0 || i == len(key)-1 || key[i-1] == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// knownWorkloadKey reports whether a modelAccess.set workload key may be
+// stored: the agent work types (runner.AllWorkTypes), the non-agent batch
+// work types (code-survival-scan, kg-extraction), the mode-derived
+// "interview" workload, or any organisation-defined name matching the
+// open work-type name shape. The embedder derives the enforcement-time
+// lookup key from exactly these sources (explicit Workload | WorkType |
+// Mode), so a key outside this set can never match a session.
 func knownWorkloadKey(key string) bool {
 	if runner.IsKnownWorkType(key) {
 		return true
@@ -435,7 +467,7 @@ func knownWorkloadKey(key string) bool {
 		interview.InterviewRunMode:
 		return true
 	}
-	return false
+	return isWorkTypeName(key)
 }
 
 // knownWorkloadKeys lists the full workload vocabulary for error messages.
@@ -474,8 +506,8 @@ func (d *Daemon) applyModelAccessSetLocked(m PendingMutation) error {
 	// mutation surfaces the typo platform-side via the failure ACK.
 	// modelAccess.clear stays unvalidated so legacy bad keys remain removable.
 	if params.Workload != "" && !knownWorkloadKey(params.Workload) {
-		return fmt.Errorf("unknown workload %q: not in the shared workload vocabulary (known keys: %s)",
-			params.Workload, strings.Join(knownWorkloadKeys(), ", "))
+		return fmt.Errorf("unknown workload %q: not a known workload key nor a valid work-type name (lowercase kebab, at most %d characters; known keys: %s)",
+			params.Workload, maxWorkTypeNameLength, strings.Join(knownWorkloadKeys(), ", "))
 	}
 
 	if d.config.ModelAccess == nil {
