@@ -66,11 +66,11 @@ func readSettingsJSON(t *testing.T, workdir string) map[string]any {
 	for {
 		var err error
 		raw, err = os.ReadFile(path) //nolint:gosec // test-owned fixture
-		if err == nil {
+		if err == nil && strings.Contains(string(raw), "--settings") {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("fake child never wrote argv.txt: %v", err)
+			t.Fatalf("fake child never wrote a complete argv.txt with --settings: %v %q", err, raw)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
