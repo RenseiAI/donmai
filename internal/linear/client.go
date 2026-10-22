@@ -470,11 +470,18 @@ func (c *Client) doRequest(ctx context.Context, query string, vars map[string]an
 			return err
 		}
 		deadline, _ := ctx.Deadline()
-		if denial.delay >= time.Until(deadline) {
+		// Compare the request budget against the worst-case jittered sleep
+		// so a retry is never started that the budget cannot finish. The
+		// actual sleep draws within that bound.
+		if retryDelayUpperBound(denial.delay) >= time.Until(deadline) {
 			return err
 		}
 		lastDenial = err
-		timer := time.NewTimer(denial.delay)
+		// Sleep at least the server-supplied delay: Retry-After is a minimum
+		// wait, so the retry never lands before the server's deadline.
+		// Bounded upward jitter spreads denied callers bursting together
+		// instead of waking them in lock-step.
+		timer := time.NewTimer(jitteredRetryDelay(denial.delay))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
