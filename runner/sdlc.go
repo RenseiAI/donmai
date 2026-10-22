@@ -1,5 +1,7 @@
 package runner
 
+import "log/slog"
+
 // SDLC status mappings + post-session transition decision.
 //
 // This file ports the Linear status-mapping tables from the legacy TS
@@ -192,7 +194,13 @@ func isResultSensitive(workType string, role ...string) bool {
 	if IsKnownWorkType(workType) || len(role) == 0 {
 		return resultSensitiveWorkTypes[workType]
 	}
-	parsed, _ := ParseWorkTypeRole(role[0])
+	parsed, valid := ParseWorkTypeRole(role[0])
+	if !valid {
+		if unrecognizedWorkTypeRole(workType, role[0]) {
+			slog.Warn("unrecognized workTypeRole", "workType", workType, "workTypeRole", role[0])
+		}
+		return false
+	}
 	return parsed == WorkTypeRoleInflight || parsed == WorkTypeRoleReview
 }
 
@@ -216,6 +224,16 @@ func shouldDeferAcceptanceTransition(workType string, hasMergeQueueAdapter bool)
 	return workType == WorkTypeAcceptance
 }
 
+// shouldDeferFailureTransition reports whether the runner must skip the
+// failure-side tracker transition for this session. The deferral applies
+// only when every condition holds: the work item opts in, the session
+// failed on a provider error, and no tool call ran in any consumed stream
+// — so the failed attempt left no side effect behind and a re-dispatch
+// can start from the same state. Pure function — no side effects.
+func shouldDeferFailureTransition(deferFailure bool, failureMode string, toolCalls int) bool {
+	return deferFailure && failureMode == FailureProviderError && toolCalls == 0
+}
+
 // PostSessionDecision is the typed outcome of resolveTargetStatus.
 // Callers use it to drive the actual side effects:
 //
@@ -227,7 +245,7 @@ func shouldDeferAcceptanceTransition(workType string, hasMergeQueueAdapter bool)
 //
 // Reason is a free-form short identifier surfaced in logs ("passed",
 // "failed", "unknown", "agent-failed", "completed-non-sensitive",
-// "deferred-merge-queue", "no-mapping").
+// "deferred-merge-queue", "deferred-provider-error", "no-mapping").
 type PostSessionDecision struct {
 	WorkType         string
 	WorkResult       string // "passed" | "failed" | "unknown" | ""

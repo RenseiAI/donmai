@@ -165,6 +165,19 @@ type QueuedWork struct {
 	// daemon that does not advertise capabilities keeps the prior behaviour).
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
 
+	// DeferFailureTransition opts this work item into deferring the
+	// failure-side tracker transition when a failed attempt may be
+	// retried on another endpoint. When true, a session that fails on a
+	// provider error before any tool call leaves the tracker issue
+	// untouched so a re-dispatch starts from the same state; the
+	// skipped transition is recorded on the terminal result so the
+	// control plane can complete or apply it later. False (including
+	// every dispatch that predates this field) keeps the prior
+	// behaviour: the failure-side transition fires as decided.
+	//
+	// Wire shape: "deferFailureTransition" (camelCase, omitempty).
+	DeferFailureTransition bool `json:"deferFailureTransition,omitempty"`
+
 	// SeatBudget carries the daemon's resolved per-seat resource budget for
 	// this session: the share plus the mode. Threaded from the daemon's
 	// SessionDetail. Nil means budgeting is off — the seat spawns exactly
@@ -440,7 +453,7 @@ type LinearStatusTransition struct {
 
 	// Reason is a short identifier from PostSessionDecision.Reason
 	// ("passed", "failed", "unknown", "completed-non-sensitive",
-	// "deferred-merge-queue", "no-mapping", ...).
+	// "deferred-merge-queue", "deferred-provider-error", "no-mapping", ...).
 	Reason string `json:"reason,omitempty"`
 
 	// Error is the human-readable error message when the transition

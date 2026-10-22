@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -120,6 +121,7 @@ func (d *Daemon) readoptSessionShimAfterCarrierLoss(
 		return readoptionRefused
 	}
 	window := policy.WorstCaseWindow()
+	reentered := false
 	if !platformPersistLoss && lost.readoptedAtUnixNano != 0 {
 		if since := d.shimNow().Sub(time.Unix(0, lost.readoptedAtUnixNano)); since < window {
 			// Re-adopted inside the window and lost again: this carrier is not
@@ -127,9 +129,30 @@ func (d *Daemon) readoptSessionShimAfterCarrierLoss(
 			// adoption revision the receiver has to re-attest. The bound is the
 			// window that GOVERNED the previous re-adoption, which in
 			// lineage-live mode is ten minutes, not the fixed-mode arithmetic.
-			slog.Warn("session shim: controller lost again inside the re-adoption window; quarantining rather than re-adopting",
+			//
+			// The one exception is a lineage the composing layer holds past
+			// the window (amendment 2026-10-21): quarantining it here hands a
+			// harness its owner never asked to stop to the orphan deadline —
+			// the exact reap the continuation exists to prevent. It re-enters
+			// as an already-continued window, paced by one backoff before its
+			// first attempt, so a flapping carrier still costs at most one
+			// adoption revision per backoff.
+			if !d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+				slog.Warn("session shim: controller lost again inside the re-adoption window; quarantining rather than re-adopting",
+					"session", id.String(), "sinceReadoption", since, "window", window, "mode", policy.Mode)
+				return readoptionRefused
+			}
+			if d.shims.recoveryCtx.Err() != nil {
+				return readoptionShutdown
+			}
+			slog.Warn("session shim: controller lost again inside the re-adoption window; the composing layer holds the lineage past the window, re-adopting",
 				"session", id.String(), "sinceReadoption", since, "window", window, "mode", policy.Mode)
-			return readoptionRefused
+			// With attemptBudget > 0 (the durable-acknowledgement ambiguity
+			// path's last look) the policy below becomes fixed attempts, which
+			// run strictly inside the orphan deadline with no keepalive, so
+			// "reentered" has nothing to pace there and is dropped: the held
+			// lineage gets that bounded look instead of an outright refusal.
+			reentered = true
 		}
 	}
 	registry, err := d.sessionShimRegistry()
@@ -147,7 +170,7 @@ func (d *Daemon) readoptSessionShimAfterCarrierLoss(
 	}
 	hello := lost.controller.Hello()
 	if policy.Mode == ReadoptionLineageLive {
-		return d.readoptSessionShimWithinLivenessWindow(registry, cfg, policy, id, lost, hello)
+		return d.readoptSessionShimWithinLivenessWindow(registry, cfg, policy, id, lost, hello, reentered)
 	}
 	return d.readoptSessionShimWithinFixedAttempts(registry, cfg, policy, id, lost, hello)
 }
@@ -188,6 +211,15 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 // or a lineage that vanished — nothing is extending the shim's clock any more,
 // so a shim this daemon has stopped working on is back on its ordinary orphan
 // deadline without anyone having to remember to put it there.
+//
+// A window whose end finds the shim observable and the lineage held past the
+// window (SessionShimConfig.ReadoptionHeldPastWindow) does not end: another
+// window starts in place, with the keepalive still armed (amendment
+// 2026-10-21). From then on — and from the start, for a window re-entered
+// under that same authority — the continuation is re-asked on every attempt
+// and every paced keepalive tick, so the instant the composing layer lets go
+// (a stop was requested, a duration quota ran out) the window ends the
+// ordinary way, through sessionShimWindowExhausted and the withdrawal.
 func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 	registry *sessionshim.Registry,
 	cfg SessionShimConfig,
@@ -195,13 +227,37 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 	id sessionshim.Identity,
 	lost adoptedShim,
 	hello shimwire.Hello,
+	reentered bool,
 ) sessionShimReadoptionDisposition {
 	deadline := d.shimNow().Add(policy.Window)
-	stopKeepalive := d.startSessionShimOrphanKeepalive(registry, cfg, id, hello)
+	var pastWindow atomic.Bool
+	pastWindow.Store(reentered)
+	stopKeepalive := d.startSessionShimOrphanKeepaliveWhile(registry, cfg, id, hello, func(ctx context.Context) bool {
+		if pastWindow.Load() {
+			return d.sessionShimReadoptionHeldPastWindow(ctx, cfg, id)
+		}
+		return d.sessionShimLineageHeldContext(ctx, cfg, id)
+	})
 	defer stopKeepalive()
+	// windowEnded is the ONE place a window's end is decided: continue in place
+	// when the lineage is held past it, otherwise the exhaustion outcome.
+	windowEnded := func() (sessionShimReadoptionDisposition, bool) {
+		if d.shims.recoveryCtx.Err() != nil {
+			return readoptionShutdown, true
+		}
+		if sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) &&
+			d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+			slog.Warn("session shim: the re-adoption window ended with the shim still observable; the composing layer holds the lineage past the window, continuing",
+				"session", id.String(), "deadline", deadline)
+			pastWindow.Store(true)
+			deadline = d.shimNow().Add(policy.Window)
+			return readoptionRefused, false
+		}
+		return d.sessionShimWindowExhausted(registry, cfg, id, hello, deadline), true
+	}
 	backoff := policy.Backoff
 	for attempt := 1; ; attempt++ {
-		if attempt > 1 {
+		if attempt > 1 || reentered {
 			remaining := deadline.Sub(d.shimNow())
 			if remaining <= 0 || backoff >= remaining {
 				// Either the window is over, or the next attempt could not
@@ -210,7 +266,9 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 				// early is the DOMINANT one, and gating the outcome on a clock
 				// comparison instead of on this fact is how the exhaustion
 				// outcome came to be unreachable in the common case.
-				return d.sessionShimWindowExhausted(registry, cfg, id, hello, deadline)
+				if disposition, done := windowEnded(); done {
+					return disposition
+				}
 			}
 			if !d.sleepSessionShimWindowBackoff(backoff) {
 				return readoptionShutdown
@@ -220,6 +278,14 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 			}
 		}
 		if !d.shimNow().Before(deadline) {
+			if disposition, done := windowEnded(); done {
+				return disposition
+			}
+		}
+		if pastWindow.Load() && !d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+			// The window this attempt would run in exists only because the
+			// composing layer held the lineage past the last one, and it no
+			// longer does. That is this window ending.
 			return d.sessionShimWindowExhausted(registry, cfg, id, hello, deadline)
 		}
 		disposition, done := d.readoptSessionShimAttempt(registry, cfg, id, lost, hello, attempt, 0)
@@ -315,13 +381,48 @@ func (d *Daemon) sessionShimLineageHeldContext(parent context.Context, cfg Sessi
 	return cfg.LineageLive(ctx, id)
 }
 
+// sessionShimReadoptionHeldPastWindow is the conjunction a continued window
+// needs: the composing layer still holds the lineage at all (LineageLive) AND
+// holds it on terms the window does not bound (ReadoptionHeldPastWindow). An
+// unset continuation predicate — the OSS default — or an unset LineageLive
+// answers false, so nothing continues without both.
+func (d *Daemon) sessionShimReadoptionHeldPastWindow(parent context.Context, cfg SessionShimConfig, id sessionshim.Identity) bool {
+	if cfg.ReadoptionHeldPastWindow == nil || cfg.LineageLive == nil {
+		return false
+	}
+	if !d.sessionShimLineageHeldContext(parent, cfg, id) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(parent, cfg.callbackTimeout())
+	defer cancel()
+	return callReadoptionHeldPastWindow(ctx, cfg.ReadoptionHeldPastWindow, id)
+}
+
+// callReadoptionHeldPastWindow runs the embedder's predicate and answers false
+// if it panics. The predicate is consulted from the keepalive goroutine, where
+// an unrecovered panic would take the whole daemon down; a predicate that
+// cannot answer has not said the lineage is held, so false is the fail-closed
+// reading.
+func callReadoptionHeldPastWindow(ctx context.Context, held func(context.Context, sessionshim.Identity) bool, id sessionshim.Identity) (answer bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("session shim: ReadoptionHeldPastWindow panicked; treating the lineage as not held past the window",
+				"session", id.String(), "panic", r)
+			answer = false
+		}
+	}()
+	return held(ctx, id)
+}
+
 // sessionShimWindowExhausted classifies the end of a lineage-live window and,
 // when the shim is still observable, raises the one notification that
 // distinguishes it from a shim that died.
 //
 // The notification runs BEFORE the caller withdraws the lineage, and the
 // withdrawal that follows is unconditional
-// (ADR-2026-09-03-readoption-exhaustion-withdraws, amending rule 8).
+// (ADR-2026-09-03-readoption-exhaustion-withdraws, amending rule 8). A window
+// the composing layer holds past its end never reaches here while it does —
+// see readoptSessionShimWithinLivenessWindow.
 //
 // It is the ONLY producer of readoptionWindowExhausted, which is what makes
 // "fires exactly once per exhausted window" a property of the code shape rather
@@ -407,6 +508,21 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 	id sessionshim.Identity,
 	hello shimwire.Hello,
 ) func() {
+	return d.startSessionShimOrphanKeepaliveWhile(registry, cfg, id, hello, func(ctx context.Context) bool {
+		return d.sessionShimLineageHeldContext(ctx, cfg, id)
+	})
+}
+
+// startSessionShimOrphanKeepaliveWhile is startSessionShimOrphanKeepalive with
+// the paced-tick predicate supplied by the window: LineageLive alone inside the
+// window, and the held-past-window conjunction once it has been continued.
+func (d *Daemon) startSessionShimOrphanKeepaliveWhile(
+	registry *sessionshim.Registry,
+	cfg SessionShimConfig,
+	id sessionshim.Identity,
+	hello shimwire.Hello,
+	held func(context.Context) bool,
+) func() {
 	interval := cfg.readoptionKeepaliveInterval()
 	// The observations are per WINDOW, not per daemon lifetime: "the daemon
 	// extended this shim's clock" is a question about the window being asked
@@ -441,7 +557,7 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 				// millisecond-scale fallback comes to drive a network call at
 				// the same rate. A fast probe cannot extend anything the paced
 				// tick before it was not already allowed to extend.
-				if !d.sessionShimLineageHeldContext(d.shims.recoveryCtx, cfg, id) {
+				if !held(d.shims.recoveryCtx) {
 					// The composing layer let this lineage go. Stop extending
 					// at once: from here the shim's own deadline governs,
 					// unextended, which is what keeps the §D8 inequality true.
@@ -629,13 +745,21 @@ func (d *Daemon) readoptSessionShimOnce(
 			got.ShimID, got.ProcessEpoch, lostHello.ShimID, lostHello.ProcessEpoch)
 	}
 	preparation := preparations.prepared[id]
-	evidence, err := d.sessionShimAdoptionEvidence(ctx, ctrl, preparation, preparations.hosts[id])
+	// The consumer starts on its gate BEFORE the evidence arms the proxy's
+	// carrier-installed release on that same gate: staging the mandatory
+	// Snapshot inside OnAdoption releases a consumer parked on a durable
+	// output batch ahead of the Snapshot, while the gate itself still
+	// carries the adoption verdict. Building the evidence first would leave
+	// the latch unwired and park the consumer behind the Snapshot Emit
+	// waits for. On evidence failure the controller close below releases
+	// the parked consumer through the stream ending.
+	gate := newShimAdoptionGate()
+	d.consumeShimEventsGated(ctrl, gate)
+	evidence, err := d.sessionShimAdoptionEvidenceForGate(ctx, ctrl, preparation, preparations.hosts[id], gate)
 	if err != nil {
 		_ = ctrl.Close()
 		return fmt.Errorf("session shim: resolve re-adoption host: %w", err)
 	}
-	gate := newShimAdoptionGate()
-	d.consumeShimEventsGated(ctrl, gate)
 	// Everything below is the launch path's publication, on the same barrier,
 	// checkpoint, and heartbeat-barrier discipline — see launchSessionShim for
 	// why each step is where it is.

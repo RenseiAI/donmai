@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"gopkg.in/yaml.v3"
 )
 
@@ -236,7 +237,7 @@ func TestDaemonInstallInProcessRegistersHostRun(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	// Use a fake host binary path to make the assertions deterministic.
 	hostBin := tmp + "/af-fake"
-	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec
+	if err := testexec.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec
 		t.Fatalf("seed fake host binary: %v", err)
 	}
 
@@ -370,7 +371,7 @@ func TestDaemonInstallWipesCachedJWT(t *testing.T) {
 	}
 
 	hostBin := tmp + "/af-fake"
-	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec
+	if err := testexec.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec
 		t.Fatalf("seed fake host binary: %v", err)
 	}
 
@@ -475,7 +476,7 @@ func isolatedHostBin(t *testing.T) string {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	hostBin := filepath.Join(tmp, "af-fake")
-	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+	if err := testexec.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // test fixture must be executable
 		t.Fatalf("seed fake host binary: %v", err)
 	}
 	return hostBin

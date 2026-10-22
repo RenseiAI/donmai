@@ -18,6 +18,7 @@ import (
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -705,7 +706,7 @@ func TestDaemonRunControlAuth_FailsClosedEndToEnd(t *testing.T) {
 func TestResolveQuotaProbeBinaries_MuseThroughSharedResolver(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "muse")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Muse Code 1.4.9\\n'; exit 0; fi\nexit 3\n"), 0o700); err != nil { //nolint:gosec // test fixture script
+	if err := testexec.WriteFile(path, []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Muse Code 1.4.9\\n'; exit 0; fi\nexit 3\n"), 0o700); err != nil { //nolint:gosec // test fixture script
 		t.Fatalf("write fake muse CLI: %v", err)
 	}
 	t.Setenv("PATH", dir)

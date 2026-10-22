@@ -288,9 +288,10 @@ func TestRealBinary_CredentialFamiliesAuthenticateThroughFile(t *testing.T) {
 	realBinaryAvailable(t)
 	stub := newRealBinaryStub(t, realBinaryModel)
 	for _, family := range []struct {
-		name       string
-		endpoint   func(baseURL string) *agent.EndpointBinding
-		wantBearer string
+		name           string
+		endpoint       func(baseURL string) *agent.EndpointBinding
+		providerConfig map[string]any
+		wantBearer     string
 	}{
 		{
 			name: "BYOK key on a direct cell",
@@ -318,7 +319,11 @@ func TestRealBinary_CredentialFamiliesAuthenticateThroughFile(t *testing.T) {
 					Env:      map[string]string{gatewayBearerEnvVar: "sentinel-family-gateway-bearer"},
 				}
 			},
-			wantBearer: "sentinel-family-gateway-bearer",
+			// A gateway session with no configured context window is
+			// refused at spawn (requireContextWindow); pin one so this
+			// cell exercises the bearer-through-file path, not the refusal.
+			providerConfig: map[string]any{"contextWindow": 1_000_000},
+			wantBearer:     "sentinel-family-gateway-bearer",
 		},
 		{
 			name: "gateway key on an aggregator cell",
@@ -381,7 +386,7 @@ func TestRealBinary_CredentialFamiliesAuthenticateThroughFile(t *testing.T) {
 			}
 			stub.mu.Unlock()
 
-			spec := agent.Spec{Prompt: "authenticate", Cwd: workdir, Endpoint: family.endpoint(stub.baseURL())}
+			spec := agent.Spec{Prompt: "authenticate", Cwd: workdir, Endpoint: family.endpoint(stub.baseURL()), ProviderConfig: family.providerConfig}
 			p, err := New(Options{HandshakeTimeout: 30 * time.Second})
 			if err != nil {
 				t.Fatalf("New(real pi): %v", err)

@@ -763,3 +763,135 @@ func TestDispatchTraceHeaders(t *testing.T) {
 		})
 	}
 }
+
+// TestAuthRejectionCount drives the production beat path through Start: two
+// 401 beats raise the consecutive auth-rejection count to 2, a 2xx resets it
+// to 0, and a 404 between two 401s leaves the count accumulated at 2. The
+// handler blocks until the test arms the next scripted status, so no beat
+// ever fires on an unscripted default and each phase observes exactly the
+// beats it armed.
+func TestAuthRejectionCount(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var script []int
+	// Forward-declared so the waitCount closure below can read it; assigned
+	// after Start arms the synchronous first beat.
+	var e *stepheartbeat.Emitter
+	served := make(chan int, 64)
+	// done unblocks beats waiting for a scripted status during teardown:
+	// Stop blocks until the run loop exits, and the loop can be parked
+	// inside a beat whose handler has nothing scripted.
+	done := make(chan struct{})
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		for {
+			mu.Lock()
+			if len(script) > 0 {
+				status := script[0]
+				script = script[1:]
+				mu.Unlock()
+				w.WriteHeader(status)
+				served <- status
+				return
+			}
+			mu.Unlock()
+			select {
+			case <-done:
+				w.WriteHeader(http.StatusOK)
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	})
+	arm := func(statuses ...int) {
+		mu.Lock()
+		script = append(script, statuses...)
+		mu.Unlock()
+	}
+	nextServed := func(t *testing.T) int {
+		t.Helper()
+		select {
+		case status := <-served:
+			return status
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for the next beat")
+			return 0
+		}
+	}
+	waitCount := func(t *testing.T, want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if e.AuthRejections() == want {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		t.Fatalf("AuthRejections() = %d; want %d", e.AuthRejections(), want)
+	}
+
+	// Arm the synchronous first beat before Start so it never blocks
+	// without a script.
+	arm(http.StatusUnauthorized)
+	var err error
+	e, err = stepheartbeat.New(stepheartbeat.Config{
+		SessionID:  "s1",
+		BaseURL:    srv.URL,
+		Interval:   5 * time.Millisecond,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop() })
+	// Registered after Stop so it runs first (LIFO): release any beat
+	// parked in the handler, then Stop drains the loop.
+	t.Cleanup(func() { close(done) })
+
+	// Phase 1: two 401 beats → count 2.
+	if got := nextServed(t); got != http.StatusUnauthorized {
+		t.Fatalf("first beat status = %d; want 401", got)
+	}
+	arm(http.StatusUnauthorized)
+	if got := nextServed(t); got != http.StatusUnauthorized {
+		t.Fatalf("second beat status = %d; want 401", got)
+	}
+	waitCount(t, 2)
+
+	// Phase 2: a 2xx resets to 0.
+	arm(http.StatusOK)
+	if got := nextServed(t); got != http.StatusOK {
+		t.Fatalf("third beat status = %d; want 200", got)
+	}
+	waitCount(t, 0)
+
+	// Phase 3: 401, then 404, then 401 → a non-auth failure leaves the
+	// count alone, so the two 401s accumulate to 2. The final 401 is armed
+	// only after the 404 check, so no later beat can move the count while
+	// the 404's no-op is asserted (unscripted beats park in the handler).
+	arm(http.StatusUnauthorized, http.StatusNotFound)
+	if got := nextServed(t); got != http.StatusUnauthorized {
+		t.Fatalf("fourth beat status = %d; want 401", got)
+	}
+	waitCount(t, 1)
+	if got := nextServed(t); got != http.StatusNotFound {
+		t.Fatalf("fifth beat status = %d; want 404", got)
+	}
+	// The 404 beat must not move the count: poll across several tick
+	// intervals while the next beat stays parked for lack of script.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := e.AuthRejections(); got != 1 {
+			t.Fatalf("AuthRejections() = %d after a 404; want 1 (unchanged)", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	arm(http.StatusUnauthorized)
+	if got := nextServed(t); got != http.StatusUnauthorized {
+		t.Fatalf("sixth beat status = %d; want 401", got)
+	}
+	waitCount(t, 2)
+}

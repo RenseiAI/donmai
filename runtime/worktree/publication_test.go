@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
@@ -132,7 +133,7 @@ func TestInteractivePublicationDoesNotExecuteCheckoutCleanFilter(t *testing.T) {
 	canary := filepath.Join(t.TempDir(), "executed")
 	script := filepath.Join(t.TempDir(), "clean")
 	content := "#!/bin/sh\nprintf hit > " + fmt.Sprintf("%q", canary) + "\ncat\n"
-	if err := os.WriteFile(script, []byte(content), 0o600); err != nil {
+	if err := testexec.WriteFile(script, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Chmod(script, 0o700); err != nil {
@@ -395,7 +396,7 @@ func publicationAssessment(t *testing.T, manager *worktree.Manager, sessionID, r
 func writePublicationCanaryScript(t *testing.T, path, canary string) {
 	t.Helper()
 	content := "#!/bin/sh\nprintf touched > " + fmt.Sprintf("%q", canary) + "\nexit 1\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := testexec.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Chmod(path, 0o700); err != nil {

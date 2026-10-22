@@ -1,11 +1,12 @@
 package daemon
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // TestDefaultWorkerCommand_ReturnsNilUnderGoTest verifies the test-
@@ -51,7 +52,7 @@ func TestIsGoTestBinary_DetectsTestSuffix(t *testing.T) {
 func makeExe(t *testing.T, dir, name string) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte("#!/bin/sh\nexec \"$0\" \"$@\"\n"), 0o755); err != nil { //nolint:gosec
+	if err := testexec.WriteFile(p, []byte("#!/bin/sh\nexec \"$0\" \"$@\"\n"), 0o755); err != nil { //nolint:gosec
 		t.Fatalf("makeExe: write %q: %v", p, err)
 	}
 	return p

@@ -143,7 +143,8 @@ func (s *seatbeltBackend) Apply(req ApplyRequest) (Applied, error) {
 	}
 	host := seatbeltHost{shared: shared}
 	if req.Resolved.ReadScope != "" {
-		host.runtimeReads = append(developerReads(), xcrunCacheReads()...)
+		host.runtimeReads = developerReads()
+		host.runtimeLiterals = xcrunCacheReads()
 	}
 	text, err := renderSeatbelt(req.Resolved, host, req.Rules, s.Canonical)
 	if err != nil {

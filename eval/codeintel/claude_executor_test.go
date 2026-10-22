@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/eval/experiment"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // fakeSpawn is the hermetic exec seam: it returns a scripted stream + wait
@@ -707,7 +708,7 @@ func TestSpawnClaude_RealSubprocess(t *testing.T) {
 	// ./ran-here is relative to the child cwd, which spawnClaude must set to the
 	// workarea.
 	script := "#!/bin/sh\n: > ./ran-here\nattach=leaked\nif [ \"${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}\" = \"\" ]; then attach=clean; fi\nprintf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"marker=%s,attach=%s\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"cache_read_input_tokens\":0}}\\n' \"$CI_EVAL_MARKER\" \"$attach\"\n"
-	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil { // nolint:gosec // test fixture must be executable
+	if err := testexec.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil { // nolint:gosec // test fixture must be executable
 		t.Fatalf("write fake claude: %v", err)
 	}
 	env := []string{

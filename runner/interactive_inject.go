@@ -323,6 +323,7 @@ type interactivePulser interface {
 	noticeSink
 	LostOwnership() <-chan struct{}
 	StopRequested() bool
+	LastFailureStatus() int
 }
 
 // noticeOutcome is what one delivery attempt settled.

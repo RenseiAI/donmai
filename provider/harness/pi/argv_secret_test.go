@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // argvSecretSentinel is the canary credential every test in this file injects
@@ -42,7 +43,7 @@ func fakeArgvRecorderPi(t *testing.T, dir string) string {
 		"env > " + shQuote(envPath) + "\n" +
 		"sleep 30\n"
 	path := filepath.Join(dir, "fake-pi-argv-recorder.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake pi: %v", err)
 	}
 	return path

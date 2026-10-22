@@ -11,6 +11,7 @@ import (
 
 	"github.com/RenseiAI/donmai/daemon/seatbudget"
 	"github.com/RenseiAI/donmai/internal/localqueue"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -768,7 +769,7 @@ func installFakeSystemdRun(t *testing.T, dir string) string {
 		"  shift\n" +
 		"done\n" +
 		"exec \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(fakes, "systemd-run"), []byte(fake), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (LookPath + exec need +x)
+	if err := testexec.WriteFile(filepath.Join(fakes, "systemd-run"), []byte(fake), 0o700); err != nil { //nolint:gosec // G306: test-owned fake binary; the exec bit is the point (LookPath + exec need +x)
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakes+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 const realMCPFixtureVersion = "codex-cli 0.157.1"
@@ -246,7 +247,7 @@ func writeNoUIFixtureWrapper(t *testing.T, launcher string) (string, string) {
 	marker := filepath.Join(dir, "unexpected-pty")
 	path := filepath.Join(dir, "codex-fixture-wrapper")
 	body := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = mcp ]; then exec " + strconv.Quote(launcher) + " \"$@\"; fi\ndone\nprintf forbidden > " + strconv.Quote(marker) + "\nexit 86\n"
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+	if err := testexec.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path, marker

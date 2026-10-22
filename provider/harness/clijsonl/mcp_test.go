@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 func TestWriteMCPConfig_NoServers(t *testing.T) {
@@ -270,7 +271,7 @@ func TestWriteMCPConfig_GatewayHelperArgvCarriesNoBearer(t *testing.T) {
 		"printf '%s\\n' \"cat $*\" >> '" + record + "'\n" +
 		"ps -o args= -p \"$PPID\" >> '" + record + "' 2>/dev/null\n" +
 		"exec '" + realCat + "' \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(shimDir, "cat"), []byte(shim), 0o700); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(filepath.Join(shimDir, "cat"), []byte(shim), 0o700); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write cat shim: %v", err)
 	}
 

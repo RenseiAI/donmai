@@ -93,6 +93,12 @@ const (
 	// still gets DefaultMaxSessionDuration.
 	MaxSessionDurationCeiling = 24 * time.Hour
 
+	// maxSessionDurationCeilingSeconds is the ceiling above expressed in
+	// whole seconds, the unit dispatched budgets arrive in. Comparing in
+	// seconds before multiplying keeps a malformed seconds value from
+	// overflowing time.Duration into a negative (unbounded) duration.
+	maxSessionDurationCeilingSeconds = int64(MaxSessionDurationCeiling / time.Second)
+
 	// DefaultEventBufferSize is the buffered-channel size used to
 	// decouple event mirroring from the provider goroutine. A small
 	// number keeps memory bounded; spikes block the provider for at

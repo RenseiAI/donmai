@@ -192,6 +192,37 @@ func TestLoop_TimeoutCancelsStream(t *testing.T) {
 // Uses BehaviorHangThenTimeout so the provider does not race the
 // heartbeat to a terminal Result.
 func TestLoop_HeartbeatLostOwnership(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		// status is the lock-refresh answer on every tick.
+		status int
+		// wantStatus, when non-empty, must appear in res.Error — the
+		// terminal result names the HTTP status that tripped the fuse.
+		// Empty keeps the legacy tolerance (lost-ownership or timeout)
+		// without asserting on the text.
+		wantStatus string
+	}{
+		{name: "gone keeps legacy tolerance", status: http.StatusGone},
+		{name: "auth rejection names the status", status: http.StatusUnauthorized, wantStatus: "last lock-refresh status 401"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testLoopHeartbeatLostOwnership(t, tc.status, tc.wantStatus)
+		})
+	}
+}
+
+// testLoopHeartbeatLostOwnership drives one Run against a platform that
+// rejects every lock-refresh with status, so the ownership pulser trips
+// and the runner cancels the stream with FailureLostOwnership.
+//
+// Uses BehaviorHangThenTimeout so the provider does not race the
+// heartbeat to a terminal Result.
+func testLoopHeartbeatLostOwnership(t *testing.T, status int, wantStatus string) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
 	}
@@ -200,7 +231,7 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/lock-refresh") {
 			refreshes.Add(1)
-			http.Error(w, "lost", http.StatusGone)
+			http.Error(w, "lost", status)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -259,6 +290,18 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	defer cancel()
 	res, _ := r.Run(ctx, qw)
 
+	if wantStatus != "" {
+		// The 401 path is deterministic: every lock-refresh tick answers
+		// 401, so the fuse trips on the recorded status and the terminal
+		// result must name it while keeping its failure mode.
+		if res.FailureMode != FailureLostOwnership {
+			t.Fatalf("FailureMode = %q; want %q", res.FailureMode, FailureLostOwnership)
+		}
+		if !strings.Contains(res.Error, wantStatus) {
+			t.Fatalf("res.Error = %q; want it to contain %q", res.Error, wantStatus)
+		}
+		return
+	}
 	// Either lost-ownership or timeout depending on the cancellation
 	// race; lost-ownership is the expected outcome but we tolerate
 	// timeout to keep the test stable on slow CI.
@@ -1753,5 +1796,221 @@ func TestRunLoop_HeartbeatTicksDuringProvisioning(t *testing.T) {
 	// pass a build where the pulse starts after the hold.
 	if got := refreshes.Load(); got < 5 {
 		t.Fatalf("lock-refresh posts during provisioning = %d; want >= 5 (pulse must start before provisioning)", got)
+	}
+}
+
+// TestObserveEvent_LlmCallServingReport pins the per-call serving report:
+// a native model call records the provider the wire response itself
+// identified (ResponseModelProvider), its served model (ResponseModel,
+// else Model) and its attempts onto the observation, mirrors them onto
+// the session record, and folds provider/model onto the terminal envelope.
+// System is the configured selection — never response evidence — so a
+// gateway-routed codex call (System "openai") or a span-fallback
+// configured system never yields a serving provider. Synthetic aggregate
+// fallbacks carry no serving identity and never clobber a native report;
+// an unreported (zero) attempt count adds nothing, so an all-unknown
+// stream totals zero (unknown).
+func TestObserveEvent_LlmCallServingReport(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	wt := t.TempDir()
+	obs := &streamObservation{}
+
+	native := func(provider, system, model, responseModel string, attempts int) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			System: system, Model: model, ResponseModel: responseModel,
+			ResponseModelProvider: provider,
+			InputTokens:           5, OutputTokens: 3,
+			UsageSource: agent.LlmUsageProvider, TurnCompleted: true, Attempts: attempts,
+		}
+	}
+	// A gateway-routed call whose wire response identified its provider.
+	h.runner.observeEvent(native("served-provider", "donmai", "requested-model", "served-model-id", 3), obs, wt, QueuedWork{})
+	if obs.finalProvider != "served-provider" || obs.finalModel != "served-model-id" || obs.providerAttempts != 3 {
+		t.Fatalf("obs = %+v; want finalProvider served-provider, finalModel served-model-id, providerAttempts 3", obs)
+	}
+
+	// A later call that identifies a different response provider replaces
+	// the earlier fact (last wins); a call without a served id falls back
+	// to the requested id.
+	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{})
+	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
+		t.Fatalf("obs = %+v; want other-provider/requested-alias/4 after the second call", obs)
+	}
+
+	// A synthetic aggregate fallback with a DISTINCT configured identity
+	// (the span processor's terminal-cost synthesis carries cfg
+	// System/Model) changes nothing: without the skip guard it would
+	// overwrite the served report with the requested id.
+	h.runner.observeEvent(agent.LlmCallEvent{
+		System: "configured-system", Model: "configured-model",
+		ResponseModelProvider: "configured-provider",
+		InputTokens:           100, UsageSource: agent.LlmUsageAggregate, Synthetic: true,
+	}, obs, wt, QueuedWork{})
+	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 4 {
+		t.Fatalf("obs = %+v; want the synthetic fallback to leave the report untouched", obs)
+	}
+
+	// A gateway-routed codex call carries the harness constant as System
+	// ("openai") with no response-provider evidence: it must not yield a
+	// serving provider. Same for a span-fallback configured system with no
+	// response identity.
+	h.runner.observeEvent(agent.LlmCallEvent{
+		System: "openai", Model: "requested-model",
+		InputTokens: 5, OutputTokens: 3,
+		UsageSource: agent.LlmUsageProvider, TurnCompleted: true, Attempts: 1,
+	}, obs, wt, QueuedWork{})
+	if obs.finalProvider != "other-provider" || obs.providerAttempts != 5 {
+		t.Fatalf("obs = %+v; want a System-only gateway call to leave finalProvider untouched while counting its attempt", obs)
+	}
+	// The System-only call DID update the served model to its requested
+	// id (last-non-empty-wins on the model axis); restore the pinned
+	// report for the assertions below.
+	if obs.finalModel != "requested-model" {
+		t.Fatalf("obs.finalModel = %q; want requested-model (System-only call falls back to Model)", obs.finalModel)
+	}
+	h.runner.observeEvent(native("other-provider", "anthropic", "requested-alias", "", 1), obs, wt, QueuedWork{})
+	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 6 {
+		t.Fatalf("obs = %+v; want other-provider/requested-alias/6 after restoring", obs)
+	}
+
+	// An empty serving identity never clobbers a recorded one, and an
+	// unreported attempt count adds nothing.
+	h.runner.observeEvent(agent.LlmCallEvent{
+		InputTokens: 1, UsageSource: agent.LlmUsageProvider, TurnCompleted: true,
+	}, obs, wt, QueuedWork{})
+	if obs.finalProvider != "other-provider" || obs.finalModel != "requested-alias" || obs.providerAttempts != 6 {
+		t.Fatalf("obs = %+v; want an empty call to leave the report untouched", obs)
+	}
+
+	res := &Result{}
+	obs.applyTo(res, agent.ProviderStub)
+	if res.FinalProvider != "other-provider" || res.FinalModel != "requested-alias" {
+		t.Errorf("envelope serving report = %q/%q; want other-provider/requested-alias (last wins)",
+			res.FinalProvider, res.FinalModel)
+	}
+	if res.ProviderAttempts != 0 {
+		t.Errorf("res.ProviderAttempts = %d; want 0 (attempt totals ride the per-stream accumulation, not applyTo)", res.ProviderAttempts)
+	}
+
+	// applyTo's non-empty guards are pinned: a later stream with no call
+	// (an injected turn, a tail recovery) keeps the earlier report instead
+	// of wiping it.
+	empty := &streamObservation{}
+	empty.applyTo(res, agent.ProviderStub)
+	if res.FinalProvider != "other-provider" || res.FinalModel != "requested-alias" {
+		t.Errorf("envelope after empty applyTo = %q/%q; want the earlier report kept", res.FinalProvider, res.FinalModel)
+	}
+
+	// The session record mirrors the observed report next to the admitted
+	// binding axes, which stay as dispatched (empty here).
+	st, err := h.runner.store.Read(wt)
+	if err != nil {
+		t.Fatalf("store.Read: %v", err)
+	}
+	if st.FinalProvider != "other-provider" || st.FinalModel != "requested-alias" || st.ProviderAttempts != 6 {
+		t.Errorf("state serving report = %+v; want other-provider/requested-alias/6", st)
+	}
+	if st.ModelProvider != "" || st.ModelAuthor != "" || st.EndpointOperator != "" || st.Protocol != "" {
+		t.Errorf("admitted axes mutated by the serving mirror: %+v", st)
+	}
+}
+
+// TestConsumeEvents_ServingAttemptsAccumulate pins the only line that
+// delivers serving attempts to the wire: consumeEvents meters each
+// stream's attempt sum onto the envelope via its per-stream defer, across
+// streams (an injected turn counts exactly once alongside the first turn).
+func TestConsumeEvents_ServingAttemptsAccumulate(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-SERVING-ATTEMPTS")}
+	res := &Result{}
+
+	call := func(provider string, attempts int) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			ResponseModelProvider: provider, Model: "requested-model",
+			InputTokens: 5, OutputTokens: 3,
+			UsageSource: agent.LlmUsageProvider, TurnCompleted: true, Attempts: attempts,
+		}
+	}
+	drain := func(events ...agent.Event) streamObservation {
+		ch := make(chan agent.Event, len(events)+1)
+		for _, ev := range events {
+			ch <- ev
+		}
+		ch <- agent.ResultEvent{Success: true}
+		close(ch)
+		enforcer := NewBudgetEnforcer(nil, time.Now())
+		obs, err := r.consumeEvents(context.Background(), &fakeHandle{events: ch}, wpath, qw, res, enforcer, noopSink{}, nil)
+		if err != nil {
+			t.Fatalf("consumeEvents: %v", err)
+		}
+		return obs
+	}
+
+	// Stream one: two native calls (3 + 1 attempts).
+	obs1 := drain(call("served-provider", 3), call("served-provider", 1))
+	if obs1.providerAttempts != 4 {
+		t.Fatalf("stream one attempts = %d; want 4", obs1.providerAttempts)
+	}
+	if res.ProviderAttempts != 4 {
+		t.Fatalf("res.ProviderAttempts after stream one = %d; want 4 (per-stream defer)", res.ProviderAttempts)
+	}
+	obs1.applyTo(res, agent.ProviderStub)
+	if res.FinalProvider != "served-provider" {
+		t.Fatalf("res.FinalProvider = %q; want served-provider after applyTo", res.FinalProvider)
+	}
+
+	// Stream two (an injected turn): one more call with two attempts.
+	obs2 := drain(call("served-provider", 2))
+	if obs2.providerAttempts != 2 {
+		t.Fatalf("stream two attempts = %d; want 2", obs2.providerAttempts)
+	}
+	if res.ProviderAttempts != 6 {
+		t.Fatalf("res.ProviderAttempts after stream two = %d; want 6 (3+1+2 across streams)", res.ProviderAttempts)
+	}
+	obs2.applyTo(res, agent.ProviderStub)
+	if res.FinalProvider != "served-provider" || res.ProviderAttempts != 6 {
+		t.Fatalf("envelope = %q/%d; want served-provider/6", res.FinalProvider, res.ProviderAttempts)
+	}
+
+	// The session record accumulated the same session total by delta.
+	st, err := r.store.Read(wpath)
+	if err != nil {
+		t.Fatalf("store.Read: %v", err)
+	}
+	if st.ProviderAttempts != 6 {
+		t.Errorf("state ProviderAttempts = %d; want 6 (session total across streams)", st.ProviderAttempts)
+	}
+	if st.FinalProvider != "served-provider" {
+		t.Errorf("state FinalProvider = %q; want served-provider", st.FinalProvider)
+	}
+
+	// Stream three: a fresh stream whose first call carries no
+	// response-provider evidence (a gateway harness constant as System).
+	// The mirror keeps the earlier provider instead of clearing it,
+	// while still counting the call's attempt toward the session total.
+	obs3 := drain(agent.LlmCallEvent{
+		System: "openai", Model: "requested-model",
+		InputTokens: 5, OutputTokens: 3,
+		UsageSource: agent.LlmUsageProvider, TurnCompleted: true, Attempts: 1,
+	})
+	if obs3.finalProvider != "" {
+		t.Fatalf("stream three provider = %q; want empty (System alone is never evidence)", obs3.finalProvider)
+	}
+	if res.ProviderAttempts != 7 {
+		t.Fatalf("res.ProviderAttempts after stream three = %d; want 7", res.ProviderAttempts)
+	}
+	obs3.applyTo(res, agent.ProviderStub)
+	if res.FinalProvider != "served-provider" {
+		t.Fatalf("envelope provider after empty stream = %q; want served-provider kept", res.FinalProvider)
+	}
+	st, err = r.store.Read(wpath)
+	if err != nil {
+		t.Fatalf("store.Read: %v", err)
+	}
+	if st.FinalProvider != "served-provider" || st.ProviderAttempts != 7 {
+		t.Errorf("state after empty stream = %+v; want provider kept and attempts 7", st)
 	}
 }

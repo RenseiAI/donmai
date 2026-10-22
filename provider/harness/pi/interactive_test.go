@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // captureArgvEnvScript is the fake-pi body the fixture tests use. It dumps its
@@ -65,7 +66,7 @@ func newFakeInteractivePiProvider(t *testing.T, script string) *Provider {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-pi")
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+	if err := testexec.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
 		t.Fatal(err)
 	}
 	return &Provider{binary: bin}
@@ -114,7 +115,37 @@ func flagValue(argv []string, flag string) (string, bool) {
 	return argv[i+1], true
 }
 
-// TestSpawn_Interactive_PinArgvAndEnvFromBinding is the load-bearing proof of
+// TestSpawn_SeedTransformReachesChildArgvLast is the load-bearing proof
+// that the production Spawn path carries the seed for a leading-dash
+// prompt: the fake binary echoes its full argv to a file, and the test
+// asserts the tail is the transformed seed through Spawn (not only the
+// argv helper). RED proof: pass the seed through untransformed and the
+// tail is the raw seed instead.
+func TestSpawn_SeedTransformReachesChildArgvLast(t *testing.T) {
+	workdir := t.TempDir()
+	const seed = "-fix the bug"
+	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:      seed,
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+
+	argv := argvLines(readCapturedFile(t, workdir, "argv.txt"))
+	if len(argv) == 0 || argv[len(argv)-1] != piSeedMessage(seed) {
+		t.Fatalf("child argv does not end with the transformed seed %q: %q", piSeedMessage(seed), argv)
+	}
+	if argv[len(argv)-1] != " "+seed {
+		t.Fatalf("child argv tail = %q, want the seed neutralised with a leading space", argv[len(argv)-1])
+	}
+}
+
 // D4: a gateway-backed binding (the Host:direct + external BaseURL shape an
 // endpoint-binding producer emits for an aggregator reached directly) reaches the interactive
 // PTY child as BOTH the `--provider donmai --model <slug>` pin argv AND the

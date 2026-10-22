@@ -327,6 +327,14 @@ func (r *Runner) dispatchInteractive(
 
 	r.logger.Info("[interactive] session start",
 		"sessionId", qw.SessionID, "attach", attachURL != "", "wallCapSec", wallCapSeconds(qw))
+	// The PTY surface is live at this point: the runner wrote "spawning"
+	// at state init and the headless lane advances CurrentStep to
+	// "streaming" on its first provider event, but the interactive lane
+	// consumes no provider event stream — so without this transition the
+	// local dashboard keeps rendering the "spawning" fallback for the
+	// whole session. Best-effort: a session whose state cannot be read
+	// still runs; the card just keeps its previous step.
+	r.markInteractiveStep(worktreePath, qw.SessionID, "running")
 	r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-session-started",
 		"interactive PTY session started")
 
@@ -517,6 +525,7 @@ func (r *Runner) dispatchInteractive(
 			// The turns metered before the stop still spent tokens; the
 			// stopped report carries them exactly as the headless lane's
 			// stop paths carry the budget meter's total.
+			r.markInteractiveStep(worktreePath, qw.SessionID, "stopped")
 			usage.applyTo(res)
 			return res, interactiveCtx.Err()
 
@@ -572,14 +581,37 @@ func (r *Runner) finishInteractiveOwnershipLoss(
 		res.Error = "operator cancelled interactive session (lock-refresh stop=true)"
 	} else {
 		res.FailureMode = FailureLostOwnership
-		res.Error = heartbeat.ErrLostOwnership.Error()
+		res.Error = heartbeat.LostOwnershipError(pulser)
 	}
 	r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
 		"interactive session ownership lost: "+res.FailureMode)
 	r.logger.Info("[interactive] ownership lost — stopping session",
 		"sessionId", qw.SessionID, "failureMode", res.FailureMode)
+	r.markInteractiveStep(worktreePath, qw.SessionID, "stopped")
 	usage.applyTo(res)
 	return res, heartbeat.ErrLostOwnership
+}
+
+// markInteractiveStep advances the session's on-disk CurrentStep on the
+// interactive lane, mirroring the headless lane's spawning → streaming →
+// completed transitions. The interactive lane consumes no provider event
+// stream (observeEvent never runs), so without explicit transitions the
+// local dashboard's step fallback stays "spawning" for the whole session.
+// The terminal step is deliberately "stopped" rather than "completed":
+// a completed interactive session's workarea is retained for inspection,
+// and "stopped" reads as the lifecycle end of a human-driven session
+// rather than delivered batch work. Best-effort like every other state
+// write: failures are logged and the session continues.
+func (r *Runner) markInteractiveStep(worktreePath, sessionID, step string) {
+	if r == nil || worktreePath == "" {
+		return
+	}
+	if _, err := r.store.Update(worktreePath, func(s *state.State) error {
+		s.CurrentStep = step
+		return nil
+	}); err != nil {
+		r.logger.Debug("[interactive] step update failed", "sessionId", sessionID, "step", step, "err", err)
+	}
 }
 
 // finishInteractive builds the terminal Result from the PTY child's Exit
@@ -618,6 +650,10 @@ func (r *Runner) finishInteractive(
 			res.Error = "interactive session ended: " + detail
 		}
 	}
+	// The PTY child has exited: advance the on-disk step past "running"
+	// so the local dashboard reflects the terminal state. Best-effort;
+	// the Result already carries the status.
+	r.markInteractiveStep(worktreePath, qw.SessionID, "stopped")
 	// Summary is deliberately NOT synthesized here. It carries the AGENT's
 	// account of the work done, and consumers treat it as such — a synthesized
 	// "the process exited" line is a lifecycle fact masquerading as content,
