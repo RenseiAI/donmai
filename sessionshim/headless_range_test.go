@@ -285,6 +285,7 @@ func startScriptedPeer(t *testing.T, registry *Registry, id Identity, shape scri
 		OrgID:         id.OrgID, SessionID: id.SessionID,
 		ShimID: "shim-scripted", ProcessEpoch: 1,
 		PID: self.PID, ProcessStartedAt: self.StartedAt,
+		ProcessStartTicks: self.StartTicks, BootID: self.BootID,
 		SocketPath: socketPath, SocketDevice: dev, SocketInode: ino,
 		ProtocolMin: shape.recordMin, ProtocolMax: shape.recordMax,
 		Phase:             shimwire.PhaseRunning,
@@ -306,7 +307,9 @@ func startScriptedPeer(t *testing.T, registry *Registry, id Identity, shape scri
 		Protocol: shimwire.ProtocolName, Min: shape.helloMin, Max: shape.helloMax,
 		OrgID: id.OrgID, SessionID: id.SessionID, ShimID: rec.ShimID, ProcessEpoch: rec.ProcessEpoch,
 		PID: self.PID, ProcessStartedAt: self.StartedAt,
+		ProcessStartTicks: self.StartTicks, ProcessBootID: self.BootID,
 		HarnessPID: self.PID, HarnessStartedAt: self.StartedAt,
+		HarnessStartTicks: self.StartTicks, HarnessBootID: self.BootID,
 		WorkareaPath: rec.WorkareaPath, Phase: shimwire.PhaseRunning,
 	})
 	if err != nil {

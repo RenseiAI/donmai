@@ -76,6 +76,7 @@ func TestSessionShimAcceptanceQuarantineRequiresLiveUnexpectedRecord(t *testing.
 		OrgID:         id.OrgID, SessionID: id.SessionID,
 		ShimID: "shim-incompatible", ProcessEpoch: 7,
 		PID: process.PID, ProcessStartedAt: process.StartedAt,
+		ProcessStartTicks: process.StartTicks, BootID: process.BootID,
 		SocketPath:  filepath.Join(registryDir, "incompatible.sock"),
 		ProtocolMin: shimwire.ProtocolMax + 1, ProtocolMax: shimwire.ProtocolMax + 1,
 		Phase: shimwire.PhaseRunning, CreatedAtUnixNano: time.Now().UnixNano(),

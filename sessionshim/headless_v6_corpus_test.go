@@ -59,6 +59,7 @@ func TestV6CorpusHeadlessRangeMeetsAReleasedControllerAsMismatch(t *testing.T) {
 		OrgID: id.OrgID, SessionID: id.SessionID,
 		ShimID: "shim-headless-1", ProcessEpoch: 1,
 		PID: self.PID, ProcessStartedAt: self.StartedAt,
+		ProcessStartTicks: self.StartTicks, BootID: self.BootID,
 		SocketPath: reg.SocketPath(id), SocketDevice: 1, SocketInode: 2,
 		ProtocolMin: shimwire.HeadlessMin, ProtocolMax: shimwire.HeadlessMax,
 		Phase:             shimwire.PhaseRunning,
@@ -151,6 +152,7 @@ func TestV6CorpusHeadlessRecordOnALowerRangeIsRefused(t *testing.T) {
 	}
 	rec := testRecord(t, id, reg)
 	rec.PID, rec.ProcessStartedAt = self.PID, self.StartedAt
+	rec.ProcessStartTicks, rec.BootID = self.StartTicks, self.BootID
 	raw, err := json.Marshal(rec)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
