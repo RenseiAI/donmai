@@ -961,6 +961,80 @@ func TestRepoKeeper_EvictionSkipsRevocationTombstone(t *testing.T) {
 	}
 }
 
+// TestRepoKeeper_BudgetIgnoresRevokedLiveBytes drives the production
+// Acquire, RecordFetch, EnforceBudget, and Acquire entry points and
+// proves revoked-live bytes stay out of both budget totals: a revoked
+// mirror with its directory present and bytes counted must not force
+// eviction of serving mirrors while serving bytes are under budget.
+// The revoked row is newest by LastUse, so any eviction is a totals bug,
+// not an LRU tie-break.
+func TestRepoKeeper_BudgetIgnoresRevokedLiveBytes(t *testing.T) {
+	t.Parallel()
+
+	liveRemote := newKeeperSourceRepo(t)
+	revokedRemote := newKeeperSourceRepo(t)
+	thirdRemote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+
+	liveLease, ok := k.Acquire(context.Background(), liveRemote)
+	if !ok {
+		t.Fatal("live Acquire degraded")
+	}
+	liveDir := liveLease.Dir()
+	liveDigest := filepath.Base(liveDir)
+	liveLease.Release()
+
+	revokedLease, ok := k.Acquire(context.Background(), revokedRemote)
+	if !ok {
+		t.Fatal("revoked Acquire degraded")
+	}
+	revokedDir := revokedLease.Dir()
+	revokedDigest := filepath.Base(revokedDir)
+	revokedLease.Release()
+
+	k.RecordFetch(liveDigest, 42, time.Millisecond, false)
+	k.RecordFetch(revokedDigest, 42, time.Millisecond, true)
+
+	// Serving bytes (42) fit the budget while serving+revoked (84) does
+	// not: a totals guard that counts revoked bytes evicts the serving
+	// mirror for no reclaimable gain.
+	k.mu.Lock()
+	k.settings.MaxBytes = 50
+	k.mu.Unlock()
+
+	k.EnforceBudget()
+
+	for _, dir := range []string{liveDir, revokedDir} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("mirror dir %q missing after EnforceBudget: %v (revoked-live bytes must not count toward the budget)", dir, err)
+		}
+	}
+	rows, err := k.store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	byDigest := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		byDigest[row.Digest] = true
+	}
+	for _, digest := range []string{liveDigest, revokedDigest} {
+		if !byDigest[digest] {
+			t.Errorf("catalog row %q evicted while serving bytes under budget, want both rows to survive", digest)
+		}
+	}
+
+	// The Acquire budget gate uses the same serving-only total: creating
+	// a third mirror must not evict the serving mirror first.
+	thirdLease, ok := k.Acquire(context.Background(), thirdRemote)
+	if !ok || thirdLease == nil {
+		t.Fatalf("third Acquire = (%v, %v), want (lease, true) while serving bytes under budget", thirdLease, ok)
+	}
+	thirdLease.Release()
+	if _, err := os.Stat(liveDir); err != nil {
+		t.Errorf("serving mirror dir missing after third Acquire: %v (Acquire total must skip revoked-live bytes)", err)
+	}
+}
+
 // TestRepoKeeper_UnreadableCatalogDegradesToPlainClone proves a corrupt
 // catalog degrades every Acquire: revocation state is unknown, so no
 // mirror is served until a fetch re-establishes state.
