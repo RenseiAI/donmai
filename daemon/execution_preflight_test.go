@@ -233,13 +233,34 @@ func TestFileExecutionPreflightStorePersistIdenticalRefusesSymlinkDestination(t 
 		Denial:          "unsupported",
 	})
 	// An in-root symlink to a file holding identical bytes must still be
-	// refused: without the Lstat regular-file guard the follow-and-compare
-	// would read the target and wrongly report equality.
+	// refused. The link text is padded to exactly len(receipt) so the Lstat
+	// size check passes and only the regular-file / SameFile guards refuse:
+	// deleting them makes this test go RED (accepted as identical).
 	target := filepath.Join(dir, "target.json")
 	if err := os.WriteFile(target, receipt, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("target.json", filepath.Join(dir, executionPreflightReceiptName(sessionID))); err != nil {
+	const targetBase = "target.json"
+	prefixLen := len(receipt) - len(targetBase)
+	if prefixLen < 0 {
+		t.Fatalf("receipt shorter than link target: %d", len(receipt))
+	}
+	var linkText string
+	if prefixLen%2 == 0 {
+		linkText = strings.Repeat("./", prefixLen/2) + targetBase
+	} else {
+		if prefixLen < 5 {
+			t.Fatalf("receipt too short to pad link text: %d", len(receipt))
+		}
+		if err := os.Mkdir(filepath.Join(dir, "x"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		linkText = "x/../" + strings.Repeat("./", (prefixLen-5)/2) + targetBase
+	}
+	if len(linkText) != len(receipt) {
+		t.Fatalf("padded link text = %d bytes, want %d", len(linkText), len(receipt))
+	}
+	if err := os.Symlink(linkText, filepath.Join(dir, executionPreflightReceiptName(sessionID))); err != nil {
 		t.Fatal(err)
 	}
 	if err := NewFileExecutionPreflightStore(dir).Persist(sessionID, receipt); err == nil {
@@ -250,6 +271,48 @@ func TestFileExecutionPreflightStorePersistIdenticalRefusesSymlinkDestination(t 
 	got, err := os.ReadFile(target)
 	if err != nil || string(got) != string(receipt) {
 		t.Fatalf("symlink target changed: %q err=%v", got, err)
+	}
+}
+
+// A name swapped from a regular file to a symlink (or a different inode with
+// identical bytes) between Lstat and Open must still be refused. The swap
+// hook runs in that window; without the SameFile re-stat this test goes RED
+// (identical bytes accepted), with it the retry is refused.
+func TestFileExecutionPreflightStorePersistIdenticalRefusesLstatToOpenSwap(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "session-swap-identical"
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	store := NewFileExecutionPreflightStore(dir)
+	if err := store.Persist(sessionID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	finalName := executionPreflightReceiptName(sessionID)
+	store.preOpenHook = func() {
+		finalPath := filepath.Join(dir, finalName)
+		if err := os.Rename(finalPath, finalPath+".bak"); err != nil {
+			t.Errorf("swap setup rename: %v", err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(dir, "swap-target.json"), receipt, 0o600); err != nil {
+			t.Errorf("swap setup write: %v", err)
+			return
+		}
+		if err := os.Symlink("swap-target.json", finalPath); err != nil {
+			t.Errorf("swap setup symlink: %v", err)
+		}
+	}
+	defer func() { store.preOpenHook = nil }()
+	if err := store.Persist(sessionID, receipt); err == nil {
+		t.Fatal("swapped symlink destination with identical bytes was accepted")
+	} else if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("swap persist error = %v, want it to wrap os.ErrExist", err)
 	}
 }
 

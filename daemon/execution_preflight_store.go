@@ -20,6 +20,10 @@ import (
 type FileExecutionPreflightStore struct {
 	dir      string
 	syncRoot func(*os.Root) error
+	// preOpenHook runs between Lstat and Open inside storedReceiptEquals.
+	// It is nil in production and lets tests swap the receipt name to a
+	// symlink (or a different inode) to pin the SameFile TOCTOU fence.
+	preOpenHook func()
 }
 
 // ExecutionPreflightReplayStore can recover the exact immutable receipt after
@@ -115,7 +119,7 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 	// rename, cannot replace an existing receipt or follow a destination
 	// symlink. Both names are constrained by os.Root.
 	if err := root.Link(pendingName, finalName); err != nil {
-		if errors.Is(err, os.ErrExist) && storedReceiptEquals(root, finalName, receipt) {
+		if errors.Is(err, os.ErrExist) && storedReceiptEquals(root, finalName, receipt, s.preOpenHook) {
 			return s.reaffirmRoot(root)
 		}
 		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
@@ -128,14 +132,19 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 // any read error reports false, so the caller keeps refusing. The open
 // descriptor is re-statted and required to be the same regular file the Lstat
 // observed, closing the Lstat-to-Open swap where the name is replaced with a
-// symlink (or a different inode) between the two calls.
-func storedReceiptEquals(root *os.Root, name string, want []byte) bool {
+// symlink (or a different inode) between the two calls. The preOpen hook runs
+// between Lstat and Open; it is nil in production and exists only so tests
+// can deterministically drive that swap window.
+func storedReceiptEquals(root *os.Root, name string, want []byte, preOpen func()) bool {
 	if len(want) == 0 || len(want) > executioncell.MaxPreflightRegistrationReceiptBytes {
 		return false
 	}
 	info, err := root.Lstat(name)
 	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(want)) {
 		return false
+	}
+	if preOpen != nil {
+		preOpen()
 	}
 	file, err := root.Open(name)
 	if err != nil {
