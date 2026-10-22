@@ -1958,6 +1958,41 @@ func TestRun_ContinueModeDraftAtStartUnpushedStaysFailed(t *testing.T) {
 	}
 }
 
+// TestRun_ContinueModeDraftAtStartUnpushedMergeStaysFailed pins the draft
+// no-op branch's pushed guard through the production entry point: a passed
+// turn that leaves only an unpushed merge on a pre-existing draft stays
+// failed with the draft refusal, never completed with a no-op outcome.
+// Dropping the pushed guard at the gate reports the unpushed merge as a
+// completed no-op, so this test goes RED on that mutant.
+func TestRun_ContinueModeDraftAtStartUnpushedMergeStaysFailed(t *testing.T) {
+	alwaysDraft := func(context.Context, string, string) (bool, error) { return true, nil }
+	draftTrue := true
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		draft:          alwaysDraft,
+		draftAtStart:   &draftTrue,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			during: func(t *testing.T, cwd string) {
+				advanceMainAndMerge(t, cwd)
+			},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	}
+	if want := "continued pull request #12 is still a draft"; res.Error != want {
+		t.Fatalf("Error = %q, want %q", res.Error, want)
+	}
+	if res.ContinuationOutcome != "" {
+		t.Fatalf("ContinuationOutcome = %q; want empty on an unpublished draft run", res.ContinuationOutcome)
+	}
+}
+
 // TestRun_ContinueModePassedWithProviderErrorStaysFailed pins that a
 // WORK_RESULT marker alone never promotes the run to completed: a passed
 // marker followed by a provider error in the same turn keeps the gate's
