@@ -12,12 +12,16 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // seatTmpWorker builds a worker command that observes its scratch binding
@@ -525,4 +529,340 @@ func envToMapSessionTmpTest(entries []string) map[string]string {
 		}
 	}
 	return out
+}
+
+// TestSpawner_SessionTmp_ConcurrentRecordKeepsExactEntries pins the
+// crash-recovery record against concurrent lost updates: 24 concurrent
+// launches each record exactly one entry, and concurrent terminal cleanups
+// drop exactly their own. Without the record mutex, concurrent
+// load-modify-save cycles overwrite each other and entries leak past a
+// restart. Driven through the production prepare/cleanup the launch and
+// reaper paths use.
+//
+// RED: drop the record lock and the recorded set is short (the gate's own
+// probe saw 3 of 24) or a cleanup erases a live entry.
+func TestSpawner_SessionTmp_ConcurrentRecordKeepsExactEntries(t *testing.T) {
+	t.Parallel()
+	recordDir := t.TempDir()
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 32,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	const n = 24
+	pid := os.Getpid()
+	type prepared struct {
+		id    string
+		dir   string
+		claim sessionTmpClaim
+	}
+	got := make([]prepared, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("concurrent-%d-%d", pid, i)
+			dir := fmt.Sprintf("/tmp/concurrent-record-%d-%d", pid, i)
+			_ = os.RemoveAll(dir)
+			claim, err := s.prepareSessionTmpDir(seatTmpSpec(id, dir))
+			got[i] = prepared{id: id, dir: dir, claim: claim}
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("prepare %d: %v", i, err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(got[i].dir) })
+	}
+	record, err := loadSessionTmpRecord(recordDir)
+	if err != nil {
+		t.Fatalf("load record: %v", err)
+	}
+	if len(record.Entries) != n {
+		t.Fatalf("record entries = %d, want %d: concurrent creations lost each other's entries", len(record.Entries), n)
+	}
+	for _, p := range got {
+		entry, ok := record.Entries[p.id]
+		if !ok || entry.Path != p.dir {
+			t.Fatalf("record entry for %s = %+v, want path %q", p.id, entry, p.dir)
+		}
+	}
+	// Concurrent terminal cleanups drop exactly their own entries.
+	var cwg sync.WaitGroup
+	for i := 0; i < n/2; i++ {
+		cwg.Add(1)
+		go func(i int) {
+			defer cwg.Done()
+			s.cleanupSessionTmpClaim(got[i].id, got[i].claim)
+		}(i)
+	}
+	cwg.Wait()
+	after, err := loadSessionTmpRecord(recordDir)
+	if err != nil {
+		t.Fatalf("load record after cleanup: %v", err)
+	}
+	if len(after.Entries) != n-n/2 {
+		t.Fatalf("record entries after concurrent cleanup = %d, want %d", len(after.Entries), n-n/2)
+	}
+	for i := n / 2; i < n; i++ {
+		if _, ok := after.Entries[got[i].id]; !ok {
+			t.Fatalf("live entry %s lost to a concurrent cleanup", got[i].id)
+		}
+		if _, err := os.Lstat(got[i].dir); err != nil {
+			t.Fatalf("live directory %s removed by another session's cleanup: %v", got[i].dir, err)
+		}
+	}
+	for i := 0; i < n/2; i++ {
+		if _, ok := after.Entries[got[i].id]; ok {
+			t.Fatalf("cleaned entry %s survives its terminal cleanup", got[i].id)
+		}
+		if _, err := os.Lstat(got[i].dir); !os.IsNotExist(err) {
+			t.Fatalf("cleaned directory %s survives its terminal cleanup", got[i].dir)
+		}
+	}
+	// Release the survivors so the test leaves no scratch behind.
+	for i := n / 2; i < n; i++ {
+		s.cleanupSessionTmpClaim(got[i].id, got[i].claim)
+	}
+}
+
+// TestSpawner_SessionTmp_DuplicatePathRefusesSecondLaunch pins that a
+// launch stamped with a live session's path fails closed: the second seat
+// never reuses the directory, so ending it can never delete the live
+// seat's files. Driven through AcceptWork — the production launch entry —
+// with the first seat kept live by a sleeping worker.
+//
+// RED: drop the live-claim scan and the second accept succeeds, rewriting
+// the ownership marker.
+func TestSpawner_SessionTmp_DuplicatePathRefusesSecondLaunch(t *testing.T) {
+	t.Parallel()
+	s, _, _ := seatTmpSpawner(t, "/bin/sh", "-c", "sleep 30")
+	ended := sessionEnds(s)
+	dir := fmt.Sprintf("/tmp/duplicate-path-refused-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	if _, err := s.AcceptWork(seatTmpSpec("seat-live", dir)); err != nil {
+		t.Fatalf("accept live: %v", err)
+	}
+	sentinel := filepath.Join(dir, "a-live.txt")
+	if err := os.WriteFile(sentinel, []byte("live bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptWork(seatTmpSpec("seat-second", dir)); err == nil {
+		t.Fatal("second launch sharing a live session's path accepted; it must fail closed")
+	} else if !strings.Contains(err.Error(), "seat-live") || !strings.Contains(err.Error(), "seat-second") {
+		t.Fatalf("duplicate-path refusal = %v, want an error naming both sessions", err)
+	}
+	raw, err := os.ReadFile(sentinel)
+	if err != nil || string(raw) != "live bytes" {
+		t.Fatalf("live seat's file disturbed by the refused launch: %v %q", err, raw)
+	}
+	if _, ok := s.sessionTmpClaimFor("seat-live"); !ok {
+		t.Fatal("live seat's claim lost to the refused launch")
+	}
+	if _, ok := s.sessionTmpClaimFor("seat-second"); ok {
+		t.Fatal("refused launch left a live claim behind")
+	}
+	if !s.StopSession("seat-live") {
+		t.Fatal("StopSession refused a live session")
+	}
+	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 0)
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("live directory survives its terminal cleanup: %v", err)
+	}
+	// A continued turn on the freed path works: the refusal held only
+	// while another live session claimed it.
+	s2, _, _ := seatTmpSpawner(t)
+	ended2 := sessionEnds(s2)
+	if _, err := s2.AcceptWork(seatTmpSpec("seat-after", dir)); err != nil {
+		t.Fatalf("accept after the live session ended: %v", err)
+	}
+	waitSessionEnd(t, ended2)
+	waitForActiveCount(t, s2, 0)
+}
+
+// TestSpawner_SessionTmp_StaleClaimCleanupKeepsLive pins the generation
+// fence in terminal cleanup: a stale generation's cleanup must not forget
+// the live generation's claim, delete its directory, or drop its record
+// entry. Two generations of one session share one path (a continued turn
+// shape); the older generation's delayed cleanup runs after the newer
+// owns it.
+//
+// RED: drop the (current != claim) fence and the live claim, directory
+// and record entry are gone.
+func TestSpawner_SessionTmp_StaleClaimCleanupKeepsLive(t *testing.T) {
+	t.Parallel()
+	recordDir := t.TempDir()
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	dir := fmt.Sprintf("/tmp/stale-claim-keeps-live-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	old, err := s.prepareSessionTmpDir(seatTmpSpec("seat-stale", dir))
+	if err != nil {
+		t.Fatalf("prepare old generation: %v", err)
+	}
+	live, err := s.prepareSessionTmpDir(seatTmpSpec("seat-stale", dir))
+	if err != nil {
+		t.Fatalf("prepare live generation: %v", err)
+	}
+	if old == live {
+		t.Fatal("two prepares returned the same generation; the fence has nothing to judge")
+	}
+	sentinel := filepath.Join(dir, "live.txt")
+	if err := os.WriteFile(sentinel, []byte("live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.cleanupSessionTmpClaim("seat-stale", old)
+	if _, ok := s.sessionTmpClaimFor("seat-stale"); !ok {
+		t.Fatal("stale cleanup forgot the live generation's claim")
+	}
+	if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "live" {
+		t.Fatalf("stale cleanup deleted the live generation's directory: %v %q", err, raw)
+	}
+	record, err := loadSessionTmpRecord(recordDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := record.Entries["seat-stale"]; !ok {
+		t.Fatal("stale cleanup dropped the live generation's record entry")
+	}
+	s.cleanupSessionTmpClaim("seat-stale", live)
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("live directory survives its own terminal cleanup: %v", err)
+	}
+}
+
+// TestSpawner_SessionTmp_MarkerWriteFailureRefusesLaunch pins that a
+// launch whose ownership marker cannot be written fails closed before any
+// worker starts: without the marker, end-of-session removal would refuse
+// the directory and leak it. The fixture plants a directory at the marker
+// path inside a reused 0700 directory, so the marker write deterministically
+// fails. Driven through AcceptWork — the production launch entry.
+//
+// RED: ignore the marker-write error and the launch is accepted unmarked.
+func TestSpawner_SessionTmp_MarkerWriteFailureRefusesLaunch(t *testing.T) {
+	t.Parallel()
+	dir := fmt.Sprintf("/tmp/marker-write-refused-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, sessionTmpOwnerFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var started bool
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:      []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		WorkerCommand: []string{"/bin/sh", "-c", "exit 0"},
+		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
+			started = true
+			return nil, nil
+		},
+	})
+	if _, err := s.AcceptWork(seatTmpSpec("seat-marker-fails", dir)); err == nil {
+		t.Fatal("launch with an unwritable ownership marker accepted; it must fail closed")
+	}
+	if started {
+		t.Fatal("a worker started despite the marker failure")
+	}
+	if fi, err := os.Lstat(dir); err != nil || !fi.Mode().IsDir() {
+		t.Fatalf("reused directory disturbed by the refused launch: %v %v", fi, err)
+	}
+	if _, ok := s.sessionTmpClaimFor("seat-marker-fails"); ok {
+		t.Fatal("refused launch left a live claim behind")
+	}
+}
+
+// TestSpawner_SessionTmp_CreatedDirFailingVerifyIsRemoved pins that a
+// directory this launch created but which fails its own checks is removed
+// again: a failed launch leaks nothing. The forced failure stands in for
+// the TOCTOU the check guards (a swap between creation and verification).
+//
+// RED: drop the created-rollback and the directory survives the refused
+// launch.
+func TestSpawner_SessionTmp_CreatedDirFailingVerifyIsRemoved(t *testing.T) {
+	// Not parallel: it sets the process-wide forced-verification hook the
+	// production ensure reads, so it must not run alongside other
+	// scratch-directory tests.
+	dir := fmt.Sprintf("/tmp/created-verify-rollback-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sessionTmpForceVerifyFailForTest = func(want string) bool { return want == dir }
+	defer func() { sessionTmpForceVerifyFailForTest = nil }()
+	if _, _, err := ensureSessionTmpDirCreated(dir); err == nil {
+		t.Fatal("forced verification failure accepted; the launch must fail closed")
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("created directory survives its failed verification: %v", err)
+	}
+}
+
+// TestSpawner_SessionTmp_ShimFinishRemovesDir pins the shim terminal path:
+// a shim-launched session that holds a scratch claim and ends through
+// finishAdoptedShim removes its directory, claim and record entry. The
+// daemon carries no Ended listener here, so only the finish cleanup can
+// remove it — deleting that line leaves the directory behind.
+//
+// RED: delete the finishAdoptedShim session-tmp cleanup and the directory,
+// claim and record entry survive.
+func TestSpawner_SessionTmp_ShimFinishRemovesDir(t *testing.T) {
+	t.Parallel()
+	recordDir := t.TempDir()
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 4,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		SessionTmpRecordDir:   recordDir,
+	})
+	sessionID := fmt.Sprintf("shim-finish-%d", os.Getpid())
+	dir := fmt.Sprintf("/tmp/shim-finish-removes-%d", os.Getpid())
+	_ = os.RemoveAll(dir)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	claim, err := s.prepareSessionTmpDir(seatTmpSpec(sessionID, dir))
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	sentinel := filepath.Join(dir, "prbody.md")
+	if err := os.WriteFile(sentinel, []byte("seat bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := New(Options{SkipRegistration: true})
+	d.spawner = s
+	id := sessionshim.Identity{OrgID: "o", SessionID: sessionID}
+	d.shims.adopted[id] = adoptedShim{
+		launched:   true,
+		handle:     SessionHandle{SessionID: sessionID, State: SessionRunning},
+		spec:       SessionSpec{SessionID: sessionID, Repository: "github.com/a/b"},
+		sessionTmp: claim,
+		shimID:     "shim-finish",
+		adoption:   SessionShimAdoptionEvidence{Identity: id, ShimID: "shim-finish", ProcessEpoch: 1},
+	}
+	d.finishAdoptedShim(id, shimwire.ExitMsg{ExitCode: 0})
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("shim scratch directory survives shim finish: %v", err)
+	}
+	if _, ok := s.sessionTmpClaimFor(sessionID); ok {
+		t.Fatal("shim scratch claim survives shim finish")
+	}
+	record, err := loadSessionTmpRecord(recordDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := record.Entries[sessionID]; ok {
+		t.Fatalf("shim record entry survives shim finish: %+v", record.Entries)
+	}
 }

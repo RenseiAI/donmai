@@ -95,3 +95,26 @@ func TestPlanApplyToEnv_DropsBareKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestPlanApplyToEnv_CarriesBoundaryEnv pins that the merge carries the
+// boundary's own environment (the Linux stage policy Applied.Environ
+// holds) alongside the tmp and cache bindings: dropping it would run the
+// seat with no read policy. The marker stands in for the stage policy the
+// Linux backend renders.
+//
+// RED: append only the tmp/cache bindings (not the full Environment) and
+// the marker assertion fails.
+func TestPlanApplyToEnv_CarriesBoundaryEnv(t *testing.T) {
+	t.Parallel()
+	plan := &Plan{
+		env: []string{"TMPDIR=/plan/tmp", "TMP=/plan/tmp", "TEMP=/plan/tmp"},
+		applied: Applied{Environ: func() []string {
+			return []string{"STAGE_POLICY=x"}
+		}},
+	}
+	got := plan.ApplyToEnv([]string{"HOME=/h", "TMPDIR=/executor/seat-9"})
+	want := []string{"HOME=/h", "TMPDIR=/plan/tmp", "TMP=/plan/tmp", "TEMP=/plan/tmp", "STAGE_POLICY=x"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("ApplyToEnv = %v, want %v: the boundary env the plan carries must survive the merge", got, want)
+	}
+}

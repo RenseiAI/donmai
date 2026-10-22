@@ -280,10 +280,15 @@ type WorkerSpawner struct {
 	// seatQoSMu guards seatQoS separately from mu for the same reason
 	// the budget has its own lock: SetSeatQoS swaps it from the config
 	// watcher while AcceptWork/spawn run unlocked.
-	seatQoSMu              sync.RWMutex
-	seatQoS                string
-	sessions               map[string]*spawnedSession
-	sessionTmpDirs         map[string]sessionTmpClaim
+	seatQoSMu      sync.RWMutex
+	seatQoS        string
+	sessions       map[string]*spawnedSession
+	sessionTmpDirs map[string]sessionTmpClaim
+	// sessionTmpRecordMu serializes every crash-recovery record
+	// read-modify-save (prepare, forget, sweep) so concurrent launches
+	// or a reaper cleanup overlapping a launch cannot overwrite each
+	// other's entries and leak a directory past a restart.
+	sessionTmpRecordMu     sync.Mutex
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
 	accepting              bool

@@ -1,6 +1,6 @@
 package daemon
 
-// Per-session scratch directories (executor half of seat isolation).
+// Per-session scratch directories (executor-owned per-session scratch).
 //
 // Every seat session gets its own scratch directory on the seat host, so
 // concurrent seats cannot read or overwrite each other's temp files. The
@@ -31,11 +31,11 @@ package daemon
 // current uid, with mode exactly 0700 — which closes the squat and symlink
 // attacks a shared /tmp invites.
 //
-// Concurrent sessions stamped with the SAME path (a platform duplication,
-// never the contract) share it without deleting each other's files: every
-// cleanup proves ownership of the exact generation it removes via a marker
-// file written at creation, so an older generation never removes a newer
-// generation's directory.
+// A launch whose cleaned path is already claimed by another live session
+// (a duplicated stamp, outside the contract which derives a per-session
+// path) is refused fail-closed: the newer launch never reuses a live
+// session's directory, so ending one session can never delete another
+// live session's files.
 
 import (
 	"encoding/json"
@@ -159,6 +159,13 @@ func ensureSessionTmpDir(raw string) (string, error) {
 // additionally reports whether this call created the directory. Callers
 // roll back only what they created: a reused directory is never removed on
 // a later bookkeeping failure.
+//
+// sessionTmpForceVerifyFailForTest, when non-nil, forces the post-creation
+// verification to fail for the named directory. Tests set it to pin the
+// created-dir rollback without racing the filesystem; it is nil in
+// production.
+var sessionTmpForceVerifyFailForTest func(dir string) bool
+
 func ensureSessionTmpDirCreated(raw string) (string, bool, error) {
 	dir, err := validateSessionTmpDir(raw)
 	if err != nil {
@@ -182,6 +189,12 @@ func ensureSessionTmpDirCreated(raw string) (string, bool, error) {
 			return "", false, fmt.Errorf("session tmpdir: re-inspect %q: %w", dir, err)
 		}
 		created = true
+	}
+	if sessionTmpForceVerifyFailForTest != nil && sessionTmpForceVerifyFailForTest(dir) {
+		if created {
+			_ = os.Remove(dir)
+		}
+		return "", false, fmt.Errorf("session tmpdir: forced verification failure for %q", dir)
 	}
 	if err := verifySessionTmpExisting(dir, fi, os.Getuid()); err != nil {
 		if created {
@@ -391,11 +404,30 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 			_ = os.RemoveAll(dir)
 		}
 	}
+	// Serialize the duplicate-path check, the ownership stamp and the live
+	// claim insert under mu so two concurrent launches stamping the same
+	// path cannot both succeed: the second blocks here until the first
+	// inserts, then sees the live claim and refuses before touching the
+	// directory's marker. A duplicated stamp (outside the contract, which
+	// derives a per-session path) fails closed naming both sessions, so
+	// ending one session can never delete another live session's files.
+	s.mu.Lock()
+	for id, existing := range s.sessionTmpDirs {
+		if id != spec.SessionID && existing.owned() && existing.Dir == dir {
+			s.mu.Unlock()
+			if created {
+				_ = os.Remove(dir)
+			}
+			return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already claimed by live session %q (session %q refused)", dir, id, spec.SessionID)
+		}
+	}
 	if err := writeSessionTmpOwner(dir, spec.SessionID, gen); err != nil {
-		removeOwn()
+		s.mu.Unlock()
+		if created {
+			_ = os.RemoveAll(dir)
+		}
 		return sessionTmpClaim{}, err
 	}
-	s.mu.Lock()
 	if s.sessionTmpDirs == nil {
 		s.sessionTmpDirs = map[string]sessionTmpClaim{}
 	}
@@ -403,14 +435,18 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 	recordDir := s.opts.SessionTmpRecordDir
 	s.mu.Unlock()
 	if recordDir != "" {
+		s.sessionTmpRecordMu.Lock()
 		record, err := loadSessionTmpRecord(recordDir)
 		if err != nil {
+			s.sessionTmpRecordMu.Unlock()
 			s.forgetSessionTmpClaim(spec.SessionID, claim)
 			removeOwn()
 			return sessionTmpClaim{}, err
 		}
 		record.Entries[spec.SessionID] = sessionTmpRecordEntry{Path: dir, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
-		if err := saveSessionTmpRecord(recordDir, record); err != nil {
+		err = saveSessionTmpRecord(recordDir, record)
+		s.sessionTmpRecordMu.Unlock()
+		if err != nil {
 			s.forgetSessionTmpClaim(spec.SessionID, claim)
 			removeOwn()
 			return sessionTmpClaim{}, err
@@ -430,12 +466,16 @@ func (s *WorkerSpawner) forgetSessionTmpClaim(sessionID string, claim sessionTmp
 }
 
 // forgetSessionTmpRecordEntry drops one record entry and persists. A missing
-// record directory (memory-only mode) makes it a no-op.
+// record directory (memory-only mode) makes it a no-op. The read-modify-save
+// runs under the record mutex so a reaper cleanup overlapping a launch
+// cannot overwrite the launch's entry.
 func (s *WorkerSpawner) forgetSessionTmpRecordEntry(sessionID string) {
 	recordDir := s.opts.SessionTmpRecordDir
 	if recordDir == "" {
 		return
 	}
+	s.sessionTmpRecordMu.Lock()
+	defer s.sessionTmpRecordMu.Unlock()
 	record, err := loadSessionTmpRecord(recordDir)
 	if err != nil {
 		return
@@ -549,11 +589,11 @@ func (s *WorkerSpawner) SweepSessionTmpDirs(liveIDs map[string]struct{}) Session
 	if recordDir == "" {
 		return report
 	}
-	record, err := loadSessionTmpRecord(recordDir)
-	if err != nil {
-		slog.Warn("session scratch sweep: unreadable record, reclaiming nothing", "err", err)
-		return report
-	}
+	// Snapshot liveness before taking the record lock: prepares and
+	// cleanups take mu briefly for the claim map and the record lock only
+	// for the file, never nested, so snapshotting first keeps the lock
+	// order flat and the sweep never blocks a launch on a directory
+	// removal.
 	protected := map[string]struct{}{}
 	for id := range liveIDs {
 		protected[id] = struct{}{}
@@ -566,6 +606,13 @@ func (s *WorkerSpawner) SweepSessionTmpDirs(liveIDs map[string]struct{}) Session
 		protected[id] = struct{}{}
 	}
 	s.mu.Unlock()
+	s.sessionTmpRecordMu.Lock()
+	defer s.sessionTmpRecordMu.Unlock()
+	record, err := loadSessionTmpRecord(recordDir)
+	if err != nil {
+		slog.Warn("session scratch sweep: unreadable record, reclaiming nothing", "err", err)
+		return report
+	}
 	// Protected paths: a live entry's path is never deleted, even by a
 	// dead entry naming the same path (a duplicated stamp). A dead entry
 	// sharing a live path is dropped without deleting.

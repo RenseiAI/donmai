@@ -362,14 +362,15 @@ var sessionTmpBindingKeys = []string{"TMPDIR", "TMP", "TEMP"}
 // append; a confined run that already carries an executor-owned session
 // scratch keeps the plan's own binding.
 func (p *Plan) ApplyToEnv(childEnv []string) []string {
-	out := make([]string, 0, len(childEnv)+len(p.env))
+	full := p.Environment()
+	out := make([]string, 0, len(childEnv)+len(full))
 	for _, kv := range childEnv {
 		if isSessionTmpBindingKey(kv) {
 			continue
 		}
 		out = append(out, kv)
 	}
-	return append(out, p.env...)
+	return append(out, full...)
 }
 
 // isSessionTmpBindingKey reports whether a KEY=VALUE entry (or a bare
