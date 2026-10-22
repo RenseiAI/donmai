@@ -312,6 +312,12 @@ type scriptedSession struct {
 	workTypeRole string
 	skipSteering bool
 	inject       string
+	// now, when set, replaces the runner's wall clock: Run stamps
+	// StartedAt from its first read and records preparation time from
+	// its read at provider spawn, so a test that answers different
+	// instants across the two reads observes the phase duration on
+	// the terminal result.
+	now func() time.Time
 	// repository, when set, is a GitHub repository address (any remote
 	// form) the session provisions, served from a local bare repository;
 	// otherwise the session repository is a plain local path.
@@ -447,6 +453,9 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
 	r.statusBeaconInterval = cfg.statusBeaconInterval
 	r.skipSteering = cfg.skipSteering
+	if cfg.now != nil {
+		r.now = cfg.now
+	}
 	if cfg.teardown {
 		r.preserveAlways = false
 	}
