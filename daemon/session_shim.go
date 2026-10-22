@@ -2291,7 +2291,7 @@ func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 		// daemon holds with the keepalive running and capped backoff.
 		if policy.Disabled || (policy.Mode != ReadoptionLineageLive && policy.Mode != ReadoptionFixedAttempts) {
 			return fmt.Errorf("%w: ReadoptionHeldPastWindow holds a %s lineage past its bound and is meaningless in %s mode (disabled=%t)",
-				ErrSessionShimReadoptionPolicy, ReadoptionLineageLive, policy.Mode, policy.Disabled)
+				ErrSessionShimReadoptionPolicy, policy.Mode, policy.Mode, policy.Disabled)
 		}
 		if c.LineageLive == nil {
 			return fmt.Errorf("%w: ReadoptionHeldPastWindow requires SessionShimConfig.LineageLive; holding a lineage "+

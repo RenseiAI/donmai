@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -182,8 +183,8 @@ func TestFixedHoldKeepsLineageLocallyVisibleDuringOutage(t *testing.T) {
 	hold.Store(false)
 	select {
 	case got := <-done:
-		if got != readoptionLineageGone {
-			t.Fatalf("disposition = %d, want readoptionLineageGone (%d) once the composing layer let the lineage go", got, readoptionLineageGone)
+		if got != readoptionAttemptsSpent {
+			t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d) once the composing layer let the lineage go with the shim still observable", got, readoptionAttemptsSpent)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the hold did not end within 10s of the composing layer letting go")
@@ -257,8 +258,8 @@ func TestFixedHoldEndsWhenComposingLayerLetsGo(t *testing.T) {
 	})
 	lost := f.lostEntry(t)
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
-		t.Fatalf("disposition = %d, want readoptionLineageGone (%d) once the composing layer let the lineage go", got, readoptionLineageGone)
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionAttemptsSpent {
+		t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d) once the composing layer let the lineage go with the shim still observable", got, readoptionAttemptsSpent)
 	}
 }
 
@@ -371,5 +372,231 @@ func TestFixedHoldConfigValidation(t *testing.T) {
 	interval := SessionShimReadoptionPolicy{KeepaliveInterval: time.Second}
 	if err := interval.Validate(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
 		t.Fatalf("fixed KeepaliveInterval Validate = %v, want ErrSessionShimReadoptionPolicy", err)
+	}
+	// A fixed hold resolves its keepalive interval to a third of the orphan
+	// deadline (floored at 250ms), so a deadline the interval cannot keep
+	// re-armed with slack is refused even though the field itself is unset.
+	tight := SessionShimConfig{
+		Orphan:                   sessionshim.OrphanPolicy{Deadline: 400 * time.Millisecond, TerminationGrace: 200 * time.Millisecond},
+		Readoption:               fixed,
+		LineageLive:              alwaysLive,
+		ReadoptionHeldPastWindow: held,
+	}
+	if err := tight.validateReadoptionAgainstOrphanPolicy(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
+		t.Fatalf("fixed hold with a 400ms orphan deadline validate = %v, want ErrSessionShimReadoptionPolicy", err)
+	}
+}
+
+// TestFixedHoldDoesNotApplyToDurableAckLastLook pins that the reduced run
+// never holds: the durable-acknowledgement ambiguity path's last look
+// replaces the configured policy with one fixed attempt (attemptBudget = 1),
+// and even for a lineage-live deployment with the lineage held, that single
+// look must stay a single look. Holding past it would retry a prepare plus a
+// durable adoption plus a batch commit every backoff against a durable side
+// the ambiguity design says cannot answer them.
+func TestFixedHoldDoesNotApplyToDurableAckLastLook(t *testing.T) {
+	t.Parallel()
+	held := &heldPastWindowCounter{answer: func() bool { return true }}
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: time.Millisecond, BackoffCap: time.Second, Window: time.Minute,
+		},
+		lineageLive:    alwaysLive,
+		heldPastWindow: held.predicate,
+		adoption:       refusingCarrier(),
+	})
+	lost := f.lostEntry(t)
+
+	done := make(chan sessionShimReadoptionDisposition, 1)
+	go func() {
+		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 1)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		select {
+		case got := <-done:
+			if got != readoptionAttemptsSpent {
+				t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d) — the reduced last look held past its single attempt", got, readoptionAttemptsSpent)
+			}
+			if adoptions, _ := f.snapshot(); adoptions != 1 {
+				t.Fatalf("durable adoption attempted %d times, want exactly 1 — the last look is one look", adoptions)
+			}
+			return
+		default:
+		}
+		if n, _ := f.snapshot(); n > 1 {
+			t.Fatalf("durable adoption attempted %d times, want exactly 1 — the reduced last look held past its budget", n)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the reduced last look did not return within 10s")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestFixedHoldSkipsTheHoldWhenTheShimIsAlreadyGone pins the liveness half of
+// the hold entry: when the shim's incarnation is already gone by the time the
+// budget is spent, the hold never arms — the lineage withdraws under the
+// spent-budget outcome instead of starting a keepalive against a dead shim
+// and reporting the dead-shim detail for a budget that simply ran out.
+func TestFixedHoldSkipsTheHoldWhenTheShimIsAlreadyGone(t *testing.T) {
+	t.Parallel()
+	held := &heldPastWindowCounter{answer: func() bool { return true }}
+	var f *readoptFixture
+	f = newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy:         SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+		lineageLive:    alwaysLive,
+		heldPastWindow: held.predicate,
+		adoption: func(_ context.Context, attempt int) error {
+			if attempt == 1 {
+				hello := f.controller.Hello()
+				if err := f.registry.PutTombstone(sessionshim.Tombstone{
+					SchemaVersion: sessionshim.RecordSchemaVersion,
+					OrgID:         f.id.OrgID, SessionID: f.id.SessionID,
+					ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
+					HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+					ExitCode: 137, Signal: "SIGKILL", GroupReaped: true,
+					ObservedAtUnixNano: time.Now().UnixNano(),
+				}); err != nil {
+					t.Errorf("PutTombstone: %v", err)
+				}
+			}
+			return errors.New("injected carrier outage: connection refused")
+		},
+	})
+	lost := f.lostEntry(t)
+
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionAttemptsSpent {
+		t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d) — a shim gone by budget end never arms the hold", got, readoptionAttemptsSpent)
+	}
+	if adoptions, _ := f.snapshot(); adoptions != 1 {
+		t.Fatalf("durable adoption attempted %d times, want exactly 1 — no hold retries against a dead shim", adoptions)
+	}
+}
+
+// TestFixedHoldKeepaliveStopsOnTheFirstTickAfterTheHoldEnds pins the keepalive
+// half of the fixed hold: once the composing layer lets go, the keepalive
+// stops extending on the first paced tick after the release — even while the
+// hold loop sleeps a backoff longer than the shim's orphan deadline — so the
+// shim reaps on its own deadline and the loop finds the lineage gone. A
+// keepalive that kept extending would hold the released harness through the
+// whole backoff and withdraw it under the spent-budget outcome instead.
+//
+// Real clock, not parallel: the subject is a real shim's real orphan timer.
+func TestFixedHoldKeepaliveStopsOnTheFirstTickAfterTheHoldEnds(t *testing.T) {
+	const (
+		orphanDeadline = 3 * time.Second
+		backoff        = 9 * time.Second // > orphanDeadline: only the keepalive holds the harness
+		releaseAfter   = 2500 * time.Millisecond
+	)
+	var held atomic.Bool
+	held.Store(true)
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{Attempts: 1, Backoff: backoff},
+		orphan: sessionshim.OrphanPolicy{
+			Deadline: orphanDeadline, TerminationGrace: 200 * time.Millisecond, PropagationMargin: 0,
+		},
+		adoption:       refusingCarrier(),
+		lineageLive:    alwaysLive,
+		heldPastWindow: func(context.Context, sessionshim.Identity) bool { return held.Load() },
+	})
+	lost := f.lostEntry(t)
+	f.waitForOrphanArmed(t, 5*time.Second)
+	started := time.Now()
+	release := time.AfterFunc(releaseAfter, func() { held.Store(false) })
+	t.Cleanup(func() { release.Stop() })
+
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
+		t.Fatalf("disposition = %d after %s, want readoptionLineageGone (%d): the keepalive kept a released lineage's harness alive through the backoff",
+			got, time.Since(started), readoptionLineageGone)
+	}
+}
+
+// TestFixedHoldBackoffStaysCapped pins the backoff half of the fixed hold:
+// the inter-attempt wait doubles per attempt but never grows past the hold's
+// cap, so reattach after a long outage waits one capped backoff rather than
+// about as long as the outage lasted.
+func TestFixedHoldBackoffStaysCapped(t *testing.T) {
+	t.Parallel()
+	const backoff = 5 * time.Second
+	clock := newVirtualShimClock()
+	held := &heldPastWindowCounter{answer: func() bool { return true }}
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy:         SessionShimReadoptionPolicy{Attempts: 1, Backoff: backoff},
+		clock:          clock,
+		lineageLive:    alwaysLive,
+		heldPastWindow: held.predicate,
+		adoption:       refusingCarrier(),
+	})
+	lost := f.lostEntry(t)
+
+	done := make(chan sessionShimReadoptionDisposition, 1)
+	go func() {
+		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if waits := clock.requestedWaits(); len(waits) >= 6 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the hold did not sleep six backoffs within 10s")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	f.daemon.shims.stopRecovery()
+	select {
+	case got := <-done:
+		if got != readoptionShutdown {
+			t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hold did not stop within 10s of recovery being cancelled")
+	}
+	waits := clock.requestedWaits()
+	if len(waits) < 6 {
+		t.Fatalf("waits = %v, want at least 6 recorded backoffs", waits)
+	}
+	for i, w := range waits {
+		if w > defaultSessionShimReadoptionBackoffCap {
+			t.Fatalf("waits[%d] = %s, want no wait past the %s cap — the hold backs off without limit", i, w, defaultSessionShimReadoptionBackoffCap)
+		}
+	}
+	if waits[0] != backoff || waits[1] != 2*backoff || waits[2] != 4*backoff {
+		t.Fatalf("waits = %v, want the hold to double %s, %s, %s, ...", waits, backoff, 2*backoff, 4*backoff)
+	}
+	if waits[3] != defaultSessionShimReadoptionBackoffCap {
+		t.Fatalf("waits[3] = %s, want %s — the fourth wait must already sit on the cap", waits[3], defaultSessionShimReadoptionBackoffCap)
+	}
+}
+
+// TestFixedHoldWithdrawsSpentBudgetWhenLineageLiveLetsGoMidHold pins the
+// attempt half of the let-go outcome: when the composing layer stops holding
+// the lineage mid-hold, the attempt's own liveness gate withdraws the lineage
+// while the shim stays observable, and the hold reports the spent budget
+// rather than the dead-shim detail. Only a vanished shim, a decisive answer,
+// or recorded conflicting evidence withdraws as LineageGone.
+func TestFixedHoldWithdrawsSpentBudgetWhenLineageLiveLetsGoMidHold(t *testing.T) {
+	t.Parallel()
+	releasedAfter := 500 * time.Millisecond
+	started := time.Now()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy:      SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Second},
+		lineageLive: func(context.Context, sessionshim.Identity) bool { return time.Since(started) < releasedAfter },
+		heldPastWindow: func(context.Context, sessionshim.Identity) bool {
+			return true
+		},
+		adoption: refusingCarrier(),
+	})
+	lost := f.lostEntry(t)
+
+	// The budget is spent while the lineage is held, so the hold arms; the
+	// release lands mid-hold, and the next attempt withdraws under the
+	// spent-budget outcome with the shim still observable.
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionAttemptsSpent {
+		t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d) — letting go mid-hold is the bound ending, not a death", got, readoptionAttemptsSpent)
+	}
+	if _, err := f.registry.GetTombstoneIncarnation(f.id, lost.shimID, lost.controller.Hello().ProcessEpoch); err == nil {
+		t.Fatal("a terminal tombstone exists for a lineage that was withdrawn only because the hold ended")
 	}
 }

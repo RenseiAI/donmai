@@ -172,17 +172,26 @@ func (d *Daemon) readoptSessionShimAfterCarrierLoss(
 	if policy.Mode == ReadoptionLineageLive {
 		return d.readoptSessionShimWithinLivenessWindow(registry, cfg, policy, id, lost, hello, reentered)
 	}
-	return d.readoptSessionShimWithinFixedAttempts(registry, cfg, policy, id, lost, hello)
+	// A reduced run (attemptBudget > 0, the durable-acknowledgement ambiguity
+	// path's last look) never holds past its budget: the single look the
+	// ambiguity path buys stays a single look, even for a held lineage.
+	return d.readoptSessionShimWithinFixedAttempts(registry, cfg, policy, id, lost, hello, attemptBudget == 0)
 }
 
 // readoptSessionShimWithinFixedAttempts is the 2026-09-02 bound: a fixed
 // attempt count whose worst case ends strictly inside the shim's orphan
 // deadline, with no keepalive because none is needed. When the composing
 // layer holds the lineage past the bound (SessionShimConfig.
-// ReadoptionHeldPastWindow), spending the budget with the shim still
-// observable does not quarantine: the lineage stays adopted and the hold
-// retries indefinitely with the keepalive running and capped backoff instead
-// of reaping a healthy harness on silence.
+// ReadoptionHeldPastWindow) and this is a full configured run (allowHold),
+// spending the budget with the shim still observable does not quarantine:
+// the lineage stays adopted and the hold retries indefinitely with the
+// keepalive running and capped backoff instead of reaping a healthy harness
+// on silence. A reduced run — the durable-acknowledgement ambiguity path's
+// last look, which replaces the configured policy with one fixed attempt —
+// never holds: that look runs strictly inside the orphan deadline with no
+// keepalive, so the held lineage gets that bounded look instead of an
+// unbounded hold against a durable side the ambiguity design says cannot
+// answer it.
 func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 	registry *sessionshim.Registry,
 	cfg SessionShimConfig,
@@ -190,6 +199,7 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 	id sessionshim.Identity,
 	lost adoptedShim,
 	hello shimwire.Hello,
+	allowHold bool,
 ) sessionShimReadoptionDisposition {
 	backoff := policy.Backoff
 	for attempt := 1; attempt <= policy.Attempts; attempt++ {
@@ -204,7 +214,7 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 			return disposition
 		}
 	}
-	if d.shims.recoveryCtx.Err() == nil &&
+	if allowHold && d.shims.recoveryCtx.Err() == nil &&
 		sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) &&
 		d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
 		slog.Warn("session shim: bounded re-adoption attempts spent with the shim still observable and held; holding past the budget",
@@ -527,9 +537,29 @@ func (d *Daemon) holdFixedAttemptsPastBudget(registry *sessionshim.Registry, cfg
 		}
 		disposition, done := d.readoptSessionShimAttempt(registry, cfg, id, lost, hello, attempt, 0)
 		if done {
+			if disposition == readoptionLineageGone &&
+				sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) &&
+				!d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+				// The attempt withdrew the lineage because the composing
+				// layer let it go — not because the shim vanished and not
+				// on a decisive answer, both of which still withdraw as
+				// LineageGone — while the shim stayed observable. That is
+				// the hold ending under the ordinary bound outcome, so it
+				// reports the spent budget, the way the bounded run would.
+				return readoptionAttemptsSpent
+			}
 			return disposition
 		}
 		if !d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+			// Only the hold ended; the shim is still there. Withdrawing it
+			// under the dead-shim detail would tell the operator a carrier
+			// that never came back was a harness that died, so the hold
+			// ends the way the bounded budget would: the spent-budget
+			// outcome. A shim that vanished with the hold still withdraws
+			// as LineageGone.
+			if sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) {
+				return readoptionAttemptsSpent
+			}
 			return readoptionLineageGone
 		}
 	}

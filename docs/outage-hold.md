@@ -6,11 +6,10 @@ because the control plane could not be reached.
 
 ## Contract reference
 
-This document is the OSS-canonical text proposed for
-`donmai-architecture/ADR-2026-10-21-outage-hold.md` (status: proposed,
-boundary: shared, synchronized-mirror; platform mirror:
-`rensei-architecture/ADR-2026-10-21-outage-hold.md`, status Mirrored,
-canonical pointer to the OSS file). The ADR has not been published yet — a
+This document is the OSS-canonical text proposed for the architecture ADR
+`ADR-2026-10-21-outage-hold.md` (status: proposed, boundary: shared,
+synchronized-mirror; the platform keeps a Mirrored stub pointing at the OSS
+file as its canonical pointer). The ADR has not been published yet — a
 donmai session cannot publish to the architecture corpus — so reviewers check
 the contract here: field names, sentinel wrapping rules, and the platform
 mirror placeholder below are the exact terms the ADR will carry verbatim.
@@ -99,7 +98,6 @@ The platform extension — the composing control plane's wiring of
 `ReadoptionHeldPastWindow` (no stop requested, no duration quota spent, no
 external release while the answer stays true), the mapping of the platform's
 released/ended answer onto `ErrSessionShimLineageReleased`, and downstream
-reconciliation of the complete adoption projection — lives in
-`rensei-architecture/ADR-2026-10-21-outage-hold.md` (Mirrored stub pointing at
-the OSS-canonical ADR above). Until that stub is published, this section is
-its verbatim source.
+reconciliation of the complete adoption projection — lives in the platform's
+Mirrored stub pointing at the OSS-canonical ADR above. Until that stub is
+published, this section is its verbatim source.
