@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.86 — 2026-10-22
+
 ### Features
 
 - `linear list-issues` defaults to the slim row (id, title, status, project, sortOrder, parent, labels) at page size 50, with `--fields a,b` and `--full` opting into more, and `linear get-issue` takes `--fields`. The output envelope echoes the effective field set. Retry-After backoff on rate-limited (429) and temporarily unavailable (503) responses now sleeps at least the server-supplied delay, plus bounded upward jitter, at most twice, before exiting with the preserved upstream error. `--full` and `--fields` cannot be combined.
