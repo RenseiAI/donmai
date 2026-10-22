@@ -2119,3 +2119,237 @@ func TestConsumeEvents_ServingAttemptsAccumulate(t *testing.T) {
 		t.Errorf("state after empty stream = %+v; want provider kept and attempts 7", st)
 	}
 }
+
+// spawnCountingStubProvider wraps the stub harness and counts Spawn calls so
+// a test can prove the provider never started.
+type spawnCountingStubProvider struct {
+	agent.Provider
+	spawns *atomic.Int64
+}
+
+func (p *spawnCountingStubProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.spawns.Add(1)
+	return p.Provider.Spawn(ctx, spec)
+}
+
+// refusingExecutionSecurityReporter answers every pre-spawn report
+// submission with a refusal naming the below-stamp dimensions.
+type refusingExecutionSecurityReporter struct {
+	submissions *atomic.Int64
+}
+
+func (r *refusingExecutionSecurityReporter) SubmitExecutionSecurityReport(_ context.Context, _ ExecutionSecurityReportSubmission) (ExecutionSecurityReportAcceptance, error) {
+	r.submissions.Add(1)
+	return ExecutionSecurityReportAcceptance{
+		ContractVersion: ExecutionSecurityReportContractVersion,
+		Decision:        "refused",
+		Code:            "report_below_stamp",
+		Dimensions:      []agent.ExecutionSecurityDimension{agent.ExecutionSecurityNetwork},
+	}, nil
+}
+
+// acceptingExecutionSecurityReporter answers every pre-spawn report
+// submission with an acceptance.
+type acceptingExecutionSecurityReporter struct {
+	submissions *atomic.Int64
+}
+
+func (r *acceptingExecutionSecurityReporter) SubmitExecutionSecurityReport(_ context.Context, _ ExecutionSecurityReportSubmission) (ExecutionSecurityReportAcceptance, error) {
+	r.submissions.Add(1)
+	return ExecutionSecurityReportAcceptance{
+		ContractVersion: ExecutionSecurityReportContractVersion,
+		Decision:        "accepted",
+	}, nil
+}
+
+// TestLoop_ExecutionSecurityReportWaitsForAcceptance is the revert-RED guard
+// for the pre-spawn report gate (loop step 6c): a stamped run whose dispatch
+// target advertises the report contract submits what it will enforce through
+// the preflight registration call before spawn. A refused submission ends
+// with a typed refusal and zero spawns; an accepted one spawns as before.
+// Skipping the wait — posting without reading the acceptance, or not posting
+// at all — turns the refused case red because the provider starts.
+func TestLoop_ExecutionSecurityReportWaitsForAcceptance(t *testing.T) {
+	stamped := func(h *runnerHarness, identifier string) QueuedWork {
+		qw := h.queuedWork(identifier)
+		qw.ExecutionSecurity = executionSecuritySection(nil)
+		qw.Capabilities = map[string]bool{CapabilityExecutionSecurityReportIngest: true}
+		return qw
+	}
+
+	t.Run("refused report means no spawn and a typed refusal", func(t *testing.T) {
+		h := newRunnerHarness(t)
+		var spawns, submissions atomic.Int64
+		inner, err := stub.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg := NewRegistry()
+		if err := reg.Register(&spawnCountingStubProvider{Provider: inner, spawns: &spawns}); err != nil {
+			t.Fatal(err)
+		}
+		h.runner.registry = reg
+		h.runner.executionSecurityReporterOverride = &refusingExecutionSecurityReporter{submissions: &submissions}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := h.runner.Run(ctx, stamped(h, "LOOP-REPORT-REFUSED"))
+		if agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityReceiptUnmet {
+			t.Fatalf("err = %v, want execution_security_receipt_unmet", err)
+		}
+		if res.Status != "failed" || res.FailureMode != FailureExecutionSecurity {
+			t.Fatalf("result status=%q mode=%q error=%q, want failed/execution-security", res.Status, res.FailureMode, res.Error)
+		}
+		if res.ExecutionSecurityRefusal == nil || res.ExecutionSecurityRefusal.Code != agent.ExecutionSecurityReceiptUnmet {
+			t.Fatalf("typed refusal = %+v, want execution_security_receipt_unmet", res.ExecutionSecurityRefusal)
+		}
+		if got := len(res.ExecutionSecurityRefusal.Dimensions); got != 1 || res.ExecutionSecurityRefusal.Dimensions[0] != agent.ExecutionSecurityNetwork {
+			t.Fatalf("refusal dimensions = %+v, want the refused network dimension", res.ExecutionSecurityRefusal.Dimensions)
+		}
+		if submissions.Load() != 1 {
+			t.Fatalf("submissions = %d, want exactly one pre-spawn post", submissions.Load())
+		}
+		if spawns.Load() != 0 {
+			t.Fatalf("spawns = %d, want zero: a refused report must not start the agent", spawns.Load())
+		}
+		if res.ProviderSessionID != "" {
+			t.Fatalf("provider session %q started after a refused report", res.ProviderSessionID)
+		}
+	})
+
+	t.Run("accepted report spawns as before", func(t *testing.T) {
+		h := newRunnerHarness(t)
+		var spawns, submissions atomic.Int64
+		inner, err := stub.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg := NewRegistry()
+		if err := reg.Register(&spawnCountingStubProvider{Provider: inner, spawns: &spawns}); err != nil {
+			t.Fatal(err)
+		}
+		h.runner.registry = reg
+		h.runner.executionSecurityReporterOverride = &acceptingExecutionSecurityReporter{submissions: &submissions}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := h.runner.Run(ctx, stamped(h, "LOOP-REPORT-ACCEPTED"))
+		if err != nil || res.Status != "completed" {
+			t.Fatalf("status=%q err=%v (%s), want completed", res.Status, err, res.Error)
+		}
+		if submissions.Load() != 1 {
+			t.Fatalf("submissions = %d, want exactly one pre-spawn post", submissions.Load())
+		}
+		if spawns.Load() != 1 {
+			t.Fatalf("spawns = %d, want one: an accepted report spawns as before", spawns.Load())
+		}
+		if res.ExecutionSecurity == nil {
+			t.Fatal("accepted run recorded no report on the result")
+		}
+	})
+
+	t.Run("unstamped work spawns without a submission", func(t *testing.T) {
+		h := newRunnerHarness(t)
+		var spawns, submissions atomic.Int64
+		inner, err := stub.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg := NewRegistry()
+		if err := reg.Register(&spawnCountingStubProvider{Provider: inner, spawns: &spawns}); err != nil {
+			t.Fatal(err)
+		}
+		h.runner.registry = reg
+		h.runner.executionSecurityReporterOverride = &acceptingExecutionSecurityReporter{submissions: &submissions}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := h.runner.Run(ctx, h.queuedWork("LOOP-REPORT-UNSTAMPED"))
+		if err != nil || res.Status != "completed" {
+			t.Fatalf("status=%q err=%v (%s), want completed", res.Status, err, res.Error)
+		}
+		if submissions.Load() != 0 {
+			t.Fatalf("submissions = %d, want zero: unstamped work has no report to send", submissions.Load())
+		}
+		if spawns.Load() != 1 {
+			t.Fatalf("spawns = %d, want one", spawns.Load())
+		}
+	})
+
+	// Stamped work dispatched without the report capability spawns without a
+	// submission: a controller that has not shipped the report contract must
+	// never see it, and must never refuse the session for it. Dropping the
+	// capability check in step 6c turns this case red because the run posts.
+	t.Run("stamped work without the report capability spawns without a submission", func(t *testing.T) {
+		h := newRunnerHarness(t)
+		var spawns, submissions atomic.Int64
+		inner, err := stub.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg := NewRegistry()
+		if err := reg.Register(&spawnCountingStubProvider{Provider: inner, spawns: &spawns}); err != nil {
+			t.Fatal(err)
+		}
+		h.runner.registry = reg
+		h.runner.executionSecurityReporterOverride = &acceptingExecutionSecurityReporter{submissions: &submissions}
+
+		qw := h.queuedWork("LOOP-REPORT-NO-CAPABILITY")
+		qw.ExecutionSecurity = executionSecuritySection(nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := h.runner.Run(ctx, qw)
+		if err != nil || res.Status != "completed" {
+			t.Fatalf("status=%q err=%v (%s), want completed", res.Status, err, res.Error)
+		}
+		if submissions.Load() != 0 {
+			t.Fatalf("submissions = %d, want zero: no capability means no report post", submissions.Load())
+		}
+		if spawns.Load() != 1 {
+			t.Fatalf("spawns = %d, want one", spawns.Load())
+		}
+	})
+
+	// Stamped local-transport work with the report capability spawns without
+	// a submission: local-transport work has no controller registration
+	// endpoint, so without the exclusion it would post to the local daemon
+	// and be refused. Dropping the local-transport check in step 6c turns
+	// this case red because the run posts.
+	t.Run("stamped local-transport work with the capability spawns without a submission", func(t *testing.T) {
+		h := newRunnerHarness(t)
+		var spawns, submissions atomic.Int64
+		inner, err := stub.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		localReg, err := NewRegistryWithOptions(RegistryOptions{RuntimeTransportMode: RuntimeTransportLocal})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := localReg.Register(&spawnCountingStubProvider{Provider: inner, spawns: &spawns}); err != nil {
+			t.Fatal(err)
+		}
+		h.runner.registry = localReg
+		h.runner.executionSecurityReporterOverride = &acceptingExecutionSecurityReporter{submissions: &submissions}
+
+		qw := h.queuedWork("LOOP-REPORT-LOCAL")
+		qw.ExecutionSecurity = executionSecuritySection(nil)
+		qw.Capabilities = map[string]bool{CapabilityExecutionSecurityReportIngest: true}
+		// Local transport carries no controller runtime credentials.
+		qw.AuthToken = ""
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := h.runner.Run(ctx, qw)
+		if err != nil || res.Status != "completed" {
+			t.Fatalf("status=%q err=%v (%s), want completed", res.Status, err, res.Error)
+		}
+		if submissions.Load() != 0 {
+			t.Fatalf("submissions = %d, want zero: local-transport work has no registration endpoint", submissions.Load())
+		}
+		if spawns.Load() != 1 {
+			t.Fatalf("spawns = %d, want one", spawns.Load())
+		}
+	})
+}

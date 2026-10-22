@@ -1183,6 +1183,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 	res.ExecutionSecurity = report
 
+	// 6c. Execution-security report submission: send what the rendered
+	// session will enforce through the preflight registration call and wait
+	// for acceptance before any state, credential or provider side effect
+	// beyond provisioning. A refusal or a failed post ends with a typed
+	// refusal and no spawn; an accepted post spawns as before. Stamped
+	// controller-transport work only, and only when the dispatch target
+	// advertises the report contract: unstamped work has no report to send,
+	// local-transport work has no controller registration endpoint, and work
+	// dispatched without the capability spawns as before, so a controller
+	// that has not shipped the report contract never refuses the session.
+	if report != nil && !isLocalRuntimeTransport(qw.runtimeTransport) && qw.hasCapability(CapabilityExecutionSecurityReportIngest) {
+		if submitErr := r.submitExecutionSecurityReport(ctx, qw, *report); submitErr != nil {
+			refuseForExecutionSecurity(res, submitErr)
+			return res, submitErr
+		}
+	}
+
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
 	var journalBoundaryErr error
