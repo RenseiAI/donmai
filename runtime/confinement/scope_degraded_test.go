@@ -1,8 +1,10 @@
 package confinement
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -70,10 +72,12 @@ func TestScopeVerdict_PartialBelowTheFloor(t *testing.T) {
 
 // TestScopeVerdict_DegradedNeverAttests pins the production attestation
 // entry points against the degraded marking: a passing record marked
-// through applyScopeVerdict with a sub-floor verdict attests nothing —
-// through the record or the confiner — and Prepare refuses a seat from it
-// with self_test_failed. Deleting any of the three guards (record
-// attestation, confiner attestation, Prepare refusal) turns this test red.
+// through applyScopeVerdict with a sub-floor verdict keeps its session modes
+// so seats still start, but attests nothing — through the record or the
+// confiner — while Prepare starts a seat from it and Degraded carries the
+// reason. Deleting any of the guards (record attestation, confiner
+// attestation) turns this test red; restoring the old Prepare refusal turns
+// the start assertion red.
 func TestScopeVerdict_DegradedNeverAttests(t *testing.T) {
 	w := newSpecWorld(t)
 	c := newTestConfiner(t, w, renderingBackend{}, nil, "sha256:test")
@@ -89,29 +93,16 @@ func TestScopeVerdict_DegradedNeverAttests(t *testing.T) {
 	if record.Degraded == "" {
 		t.Fatal("a passing record under a sub-floor verdict carries no degraded reason")
 	}
-	if len(record.SessionModes) != 0 {
-		t.Fatalf("a degraded record keeps attested modes %v, want none", record.SessionModes)
+	if len(record.SessionModes) != 2 {
+		t.Fatalf("a degraded record keeps modes %v, want both so seats still start", record.SessionModes)
 	}
 	record.Digest = record.computeDigest()
 	// The record entry point refuses on the degraded marking alone: even
-	// a degraded record that kept its modes attests nothing.
-	modesKept := record
-	modesKept.SessionModes = []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}
-	if attestation := modesKept.Attestation(); len(attestation.SessionModes) != 0 {
-		t.Fatalf("a degraded record attests modes %v, want none", attestation.SessionModes)
-	}
+	// with its modes kept, it attests nothing as a full boundary.
 	if attestation := record.Attestation(); len(attestation.SessionModes) != 0 {
 		t.Fatalf("a degraded record attests modes %v, want none", attestation.SessionModes)
 	}
-	// The confiner entry point refuses on the degraded marking alone:
-	// a degraded record that kept its modes must not attest through it.
-	// Store the modes-kept shape first, so the check below drives the
-	// production Confiner.Attestation guard rather than the empty-modes
-	// short-circuit.
-	c.store(modesKept)
-	if attestation, ok := c.Attestation(); ok {
-		t.Fatalf("a degraded record with modes attests through the confiner: %+v", attestation)
-	}
+	// The confiner entry point refuses on the degraded marking alone.
 	c.store(record)
 	if attestation, ok := c.Attestation(); ok {
 		t.Fatalf("a degraded record attests through the confiner: %+v", attestation)
@@ -119,20 +110,11 @@ func TestScopeVerdict_DegradedNeverAttests(t *testing.T) {
 	if _, ok := c.Degraded(); !ok {
 		t.Fatal("Degraded reports nothing for a degraded record")
 	}
-	// Prepare refuses the degraded record on its marking alone: restore
-	// the modes-kept shape so the check below drives the production
-	// Prepare degraded branch rather than the empty-modes refusal.
-	c.store(modesKept)
-	if _, err := c.Prepare(w.spec()); err == nil {
-		t.Fatal("Prepare started a seat from a degraded record")
-	} else if reason, _ := ReasonOf(err); reason != ReasonSelfTestFailed {
-		t.Fatalf("Prepare from a degraded record: err=%v, want self_test_failed", err)
-	}
-	c.store(record)
-	if _, err := c.Prepare(w.spec()); err == nil {
-		t.Fatal("Prepare started a seat from a degraded record")
-	} else if reason, _ := ReasonOf(err); reason != ReasonSelfTestFailed {
-		t.Fatalf("Prepare from a degraded record: err=%v, want self_test_failed", err)
+	// Prepare still starts seats from a passing degraded record: the probes
+	// passed and only the scope layer is missing, which the status surface
+	// reports as degraded.
+	if _, err := c.Prepare(w.spec()); err != nil {
+		t.Fatalf("Prepare from a passing degraded record: err=%v, want a seat", err)
 	}
 	stripped := record
 	stripped.Degraded = ""
@@ -164,6 +146,101 @@ func TestScopeVerdict_EnforcedLeavesAPassingRecordWhole(t *testing.T) {
 	if failing.Degraded != "" {
 		t.Fatal("an enforced verdict marked a failing record degraded")
 	}
+}
+
+// TestSelfTest_MarksDegradedBelowTheFloor runs the production self-test with
+// the scope probe stubbed below the floor and asserts the production record
+// carries the degraded marking (modes kept so seats still start, no
+// full-boundary attestation). Deleting the production applyScopeVerdict call
+// in SelfTest turns this test red: the record would come back whole.
+func TestSelfTest_MarksDegradedBelowTheFloor(t *testing.T) {
+	backend := DefaultBackend()
+	if backend == nil {
+		t.Skip("no confinement backend on this host; nothing to prove")
+	}
+	stubScopeProbe(t, landlockScopeABI-1)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(base, "home")
+	stateHome := filepath.Join(home, ".state")
+	profileDir := filepath.Join(stateHome, "profiles")
+	scratchBase, err := os.MkdirTemp("", "dcs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeAllForce(scratchBase) })
+	scratchBase, err = filepath.EvalSymlinks(scratchBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{profileDir, home, stateHome} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := New(Options{Backend: backend, ProfileDir: profileDir, Home: home, StateHome: stateHome, ExecutableDigest: "sha256:test"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	record, err := c.SelfTest(ctx, SelfTestOptions{ProbeCommand: []string{exe}, ScratchDir: scratchBase})
+	if err != nil {
+		t.Fatalf("SelfTest below the floor: %v", err)
+	}
+	if !record.Passed {
+		t.Fatalf("SelfTest below the floor did not pass: %+v", record.Failures())
+	}
+	if record.Degraded == "" {
+		t.Fatal("a passing self-test below the floor carries no degraded reason; want the production scope marking")
+	}
+	if len(record.SessionModes) != 2 {
+		t.Fatalf("a degraded record keeps modes %v, want both so seats still start", record.SessionModes)
+	}
+	if attestation, ok := c.Attestation(); ok {
+		t.Fatalf("a degraded self-test attests through the confiner: %+v", attestation)
+	}
+	if _, ok := c.Degraded(); !ok {
+		t.Fatal("Degraded reports nothing for a degraded self-test")
+	}
+}
+
+// TestScopeVerdict_CacheReusesDegradedAsDegraded pins the scope-keyed cache
+// reuse: a degraded record hits on a host whose scope layer is still missing
+// (so a sub-floor host does not re-probe on every spawn) and misses where
+// the layer holds (so a kernel upgrade re-tests to a full record). Deleting
+// either scope arm in load turns this test red.
+func TestScopeVerdict_CacheReusesDegradedAsDegraded(t *testing.T) {
+	now := time.Now()
+	cw := newCacheWorld(t, noopBackend{}, nil, "sha256:harness")
+	slot, _ := cw.seed(t, now.Add(-time.Hour))
+	writeScopeCacheEntry(t, slot.path, func(entry *selfTestCacheEntry) {
+		entry.Record.Degraded = "the scope layer is unenforced"
+		entry.Record.Digest = entry.Record.computeDigest()
+	})
+	stubScopeProbe(t, landlockScopeABI-1)
+	if loaded, hit := slot.load(now); !hit {
+		t.Fatal("a degraded record is a miss with the scope layer still missing; want a degraded hit so a sub-floor host does not re-probe")
+	} else if loaded.Degraded == "" {
+		t.Fatalf("a degraded cache hit loads without the reason: %+v", loaded)
+	}
+	// Where the layer holds, the same degraded entry misses so the kernel
+	// upgrade re-tests to a full record instead of reusing the partial one.
+	// Re-stub enforced: the helper restores the ambient probe at cleanup,
+	// so scoping the enforced read in a subtest keeps the outer sub-floor
+	// stub for the rest of the test.
+	t.Run("enforced", func(t *testing.T) {
+		stubScopeProbe(t, landlockScopeABI)
+		if loaded, hit := slot.load(now); hit {
+			t.Fatalf("a degraded record loads with the scope layer enforced: %+v", loaded)
+		}
+	})
 }
 
 // TestScopeVerdict_CacheNeverReusesAScopeGap pins the cache side on both

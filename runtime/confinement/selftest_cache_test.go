@@ -3,6 +3,7 @@ package confinement
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -239,7 +240,174 @@ func TestProvenRecord_IgnoresOversizedFile(t *testing.T) {
 	}
 }
 
-// TestSelfTest_ReusesACachedPassingRecord: a later process on the same host
+// TestProvenRecord_FailureSupersedesPass pins the fail-closed latest outcome:
+// a failure recorded after a pass (a failing self-test or a backend Check
+// failure) supersedes the pass, so the status path reports unproven instead
+// of attesting from the stale pass. A later pass supersedes the failure
+// again. Ignoring the latest file (reading the older proven pass) turns this
+// test red.
+func TestProvenRecord_FailureSupersedesPass(t *testing.T) {
+	base := t.TempDir()
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+	dir := latestSelfTestCacheDir()
+	if dir == "" {
+		t.Fatal("latestSelfTestCacheDir is empty; want the shared proven directory")
+	}
+	passing := SelfTestRecord{
+		Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+		ExecutableDigest: "sha256:test",
+		SessionModes:     bothModes, Passed: true,
+		Probes: []ProbeOutcome{{ID: "p", Pass: true}}, TestedAt: time.Now().Add(-3 * time.Hour).UTC(),
+	}
+	passing.Digest = passing.computeDigest()
+	recordProvenSelfTest(passing)
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != passing.Digest {
+		t.Fatalf("LatestProvenRecord = %+v, %v; want the proven %s", latest, ok, passing.Digest)
+	}
+	// A failure an hour later (the Check-failure shape: not passing, with a
+	// digest) supersedes the pass.
+	failing := passing
+	failing.Passed = false
+	failing.TestedAt = passing.TestedAt.Add(time.Hour)
+	failing.Digest = failing.computeDigest()
+	recordLatestSelfTest(dir, failing)
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord reads a pass superseded by a failure as evidence: %+v", latest)
+	}
+	// A later pass supersedes the failure again.
+	repassed := passing
+	repassed.TestedAt = failing.TestedAt.Add(time.Hour)
+	repassed.Digest = repassed.computeDigest()
+	recordLatestSelfTest(dir, repassed)
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != repassed.Digest {
+		t.Fatalf("LatestProvenRecord = %+v, %v; want the repassed %s", latest, ok, repassed.Digest)
+	}
+}
+
+// TestProvenRecord_FutureStampIsNoEvidence pins the future-stamp arm in both
+// readers: a record stamped in the future (clock skew at test time) is no
+// evidence, through the per-record scan and through the latest file. Deleting
+// either future check turns this test red.
+func TestProvenRecord_FutureStampIsNoEvidence(t *testing.T) {
+	base := t.TempDir()
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+	dir := latestSelfTestCacheDir()
+	if dir == "" {
+		t.Fatal("latestSelfTestCacheDir is empty; want the shared proven directory")
+	}
+	future := SelfTestRecord{
+		Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+		ExecutableDigest: "sha256:test",
+		SessionModes:     bothModes, Passed: true,
+		Probes: []ProbeOutcome{{ID: "p", Pass: true}}, TestedAt: time.Now().Add(time.Hour).UTC(),
+	}
+	future.Digest = future.computeDigest()
+	recordLatestSelfTest(dir, future)
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord reads a future-stamped latest as evidence: %+v", latest)
+	}
+	if err := os.Remove(filepath.Join(dir, latestSelfTestFileName)); err != nil {
+		t.Fatal(err)
+	}
+	writeProvenFileForTest(t, dir, "proven-future.json", provenSelfTestFile{Version: provenSelfTestFileVersion, Record: future})
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord reads a future-stamped proven file as evidence: %+v", latest)
+	}
+}
+
+// TestProvenRecord_FreshPassReadAmongManyStale pins the newest-first scan:
+// with more stale files than the read cap plus one fresh pass, the fresh
+// pass is still read. The stale names sort before the fresh name, so an
+// alphabetical scan capped at 128 would break before the fresh file and
+// report no evidence; the newest-first (modification-time) scan reads it.
+// Deleting the ordering (or the prune that keeps the directory small) turns
+// this test red on the old scan.
+func TestProvenRecord_FreshPassReadAmongManyStale(t *testing.T) {
+	base := t.TempDir()
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+	dir := latestSelfTestCacheDir()
+	if dir == "" {
+		t.Fatal("latestSelfTestCacheDir is empty; want the shared proven directory")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staleAt := time.Now().Add(-2 * provenRecordTTL).UTC()
+	oldMod := staleAt
+	for i := 0; i < maxProvenRecordsPerRead+1; i++ {
+		stale := SelfTestRecord{
+			Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+			ExecutableDigest: "sha256:test",
+			SessionModes:     bothModes, Passed: true,
+			Probes: []ProbeOutcome{{ID: "p", Pass: true}}, TestedAt: staleAt.Add(time.Duration(i) * time.Second),
+		}
+		stale.Digest = stale.computeDigest()
+		// Zero-padded sequence sorts before the fresh name, so an
+		// alphabetical scan capped at 128 breaks before the fresh file.
+		name := fmt.Sprintf("proven-%04d.json", i)
+		writeProvenFileForTest(t, dir, name, provenSelfTestFile{Version: provenSelfTestFileVersion, Record: stale})
+		if err := os.Chtimes(filepath.Join(dir, name), oldMod, oldMod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := SelfTestRecord{
+		Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+		ExecutableDigest: "sha256:test",
+		SessionModes:     bothModes, Passed: true,
+		Probes: []ProbeOutcome{{ID: "p", Pass: true}}, TestedAt: time.Now().Add(-time.Hour).UTC(),
+	}
+	fresh.Digest = fresh.computeDigest()
+	writeProvenFileForTest(t, dir, "proven-zzzz-fresh.json", provenSelfTestFile{Version: provenSelfTestFileVersion, Record: fresh})
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != fresh.Digest {
+		t.Fatalf("LatestProvenRecord among %d stale files = %+v, %v; want the fresh %s", maxProvenRecordsPerRead+1, latest, ok, fresh.Digest)
+	}
+}
+
+// TestProvenRecord_PruneKeepsOnlyLatest pins the write-time prune: recording
+// a second passing record deletes the first file, so the directory never
+// grows one file per self-test. Deleting the prune turns this test red (two
+// files remain).
+func TestProvenRecord_PruneKeepsOnlyLatest(t *testing.T) {
+	base := t.TempDir()
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+	dir := latestSelfTestCacheDir()
+	if dir == "" {
+		t.Fatal("latestSelfTestCacheDir is empty; want the shared proven directory")
+	}
+	first := SelfTestRecord{
+		Backend: BackendMacOSSeatbelt, BackendVersion: "v", ProbeSetVersion: ProbeSetVersion,
+		ExecutableDigest: "sha256:test",
+		SessionModes:     bothModes, Passed: true,
+		Probes: []ProbeOutcome{{ID: "p", Pass: true}}, TestedAt: time.Now().Add(-2 * time.Hour).UTC(),
+	}
+	first.Digest = first.computeDigest()
+	recordProvenSelfTest(first)
+	second := first
+	second.TestedAt = time.Now().Add(-time.Hour).UTC()
+	second.Digest = second.computeDigest()
+	recordProvenSelfTest(second)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proven []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), "proven-") && strings.HasSuffix(entry.Name(), ".json") {
+			proven = append(proven, entry.Name())
+		}
+	}
+	if len(proven) != 1 {
+		t.Fatalf("proven files = %v, want exactly the latest", proven)
+	}
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != second.Digest {
+		t.Fatalf("LatestProvenRecord = %+v, %v; want the second %s", latest, ok, second.Digest)
+	}
+}
+
 // reuses a cached passing self-test without spawning a probe, and Prepare
 // accepts it; once the record is older than the TTL the self-test runs
 // again, and a failing run never replaces the cache.

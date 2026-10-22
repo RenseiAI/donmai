@@ -35,9 +35,11 @@ func TestScopesAvailable_DegradedBelowABI6(t *testing.T) {
 
 // TestSelfTestRecord_DegradedNeverAttests drives the production attestation
 // entry points: a passing record taken below the scope ABI marks itself
-// degraded, attests nothing, and refuses Prepare — the host never reports
-// as confined while the scope layer is missing. Reverting the degraded
-// marking (passing the record through as attested) turns this test red.
+// degraded, attests nothing as a full boundary, but still starts seats — the
+// host runs with a degraded boundary while the scope layer is missing.
+// Reverting the degraded marking (passing the record through as attested)
+// turns this test red; restoring the old Prepare refusal turns the start
+// assertion red.
 func TestSelfTestRecord_DegradedNeverAttests(t *testing.T) {
 	stubScopeProbe(t, landlockScopeABI-1)
 	w := newLinuxWorld(t)
@@ -72,6 +74,9 @@ func TestSelfTestRecord_DegradedNeverAttests(t *testing.T) {
 	if record.Degraded == "" {
 		t.Fatal("a passing record below the scope ABI carries no degraded reason")
 	}
+	if len(record.SessionModes) != 2 {
+		t.Fatalf("a degraded record keeps modes %v, want both so seats still start", record.SessionModes)
+	}
 	if attestation, ok := c.Attestation(); ok {
 		t.Fatalf("a degraded record attests: %+v", attestation)
 	}
@@ -79,10 +84,8 @@ func TestSelfTestRecord_DegradedNeverAttests(t *testing.T) {
 		t.Fatal("Degraded reports nothing for a degraded record")
 	}
 	spec := linuxSpec(w)
-	if _, err := c.Prepare(spec); err == nil {
-		t.Fatal("Prepare started a seat from a degraded record")
-	} else if reason, _ := ReasonOf(err); reason != ReasonSelfTestFailed {
-		t.Fatalf("Prepare from a degraded record: err=%v, want self_test_failed", err)
+	if _, err := c.Prepare(spec); err != nil {
+		t.Fatalf("Prepare from a passing degraded record: err=%v, want a seat", err)
 	}
 	// The digest covers the degraded marking: stripping it changes the
 	// digest, so a degraded record never verifies as a full one.

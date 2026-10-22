@@ -197,16 +197,19 @@ func (r SelfTestRecord) computeDigest() string {
 
 // applyScopeVerdict marks a passing record degraded where the scope probe
 // says the layer is missing: the probes passed but the boundary they prove
-// is partial, so no spawn path stays attested. An enforced layer, or a
-// record that did not pass, is left alone. SelfTest calls it on its
-// production record; tests drive it directly with both verdicts, without
-// a Linux kernel.
+// is partial, so the full-boundary attestation stays empty while the seat
+// still runs (the mount tree, the process namespace and the filesystem rules
+// hold; only the scope layer is missing). The session modes stay on the
+// record so Prepare still starts seats from it; Attestation refuses it as a
+// full boundary and the status surface carries the degraded reason. An
+// enforced layer, or a record that did not pass, is left alone. SelfTest
+// calls it on its production record; tests drive it directly with both
+// verdicts, without a Linux kernel.
 func (r *SelfTestRecord) applyScopeVerdict(ok bool, why string) {
 	if !r.Passed || ok || why == "" {
 		return
 	}
 	r.Degraded = why
-	r.SessionModes = nil
 }
 
 // SelfTest proves the backend on this host: it drives a probe process through
@@ -246,6 +249,9 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 	if err := c.opts.Backend.Check(); err != nil {
 		record.Digest = record.computeDigest()
 		c.store(record)
+		// A Check failure is an outcome too: it supersedes any earlier pass
+		// so the status path reports unproven instead of attesting from it.
+		c.recordLatest(record)
 		return record, err
 	}
 	cache, cacheOK := c.selfTestCache(opts, current)
@@ -314,17 +320,23 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 	}
 	record.Digest = record.computeDigest()
 	c.store(record)
+	// The latest outcome supersedes any earlier pass: record it where the
+	// status path reads it back, passing or not, so a failure after a pass
+	// reports unproven instead of attesting from the stale pass.
+	c.recordLatest(record)
 	// A passing, whole record is proof seats start from: keep it where
 	// the status path reads it back, so the operator surface reports
-	// what the seats proved rather than what the daemon guessed.
+	// what the seats proved rather than what the daemon guessed. A
+	// degraded passing record is proof of a partial boundary: it is kept
+	// as the latest outcome above, and the cache below reuses it as
+	// degraded on a host whose scope layer is still missing.
 	if record.Passed && record.Degraded == "" && refusal == nil {
-		recordProvenSelfTest(record)
+		c.recordProven(record)
 	}
-	// A degraded record proves a partial boundary only: the load path
-	// refuses it (Degraded set, plus the scope recheck), so persisting it
-	// would pay a write on every sub-floor run for an entry that can
-	// never hit.
-	if cacheOK && record.Passed && record.Degraded == "" && refusal == nil {
+	// A degraded passing record is reusable as degraded where the scope
+	// layer is still missing (keyed by the scope verdict in load), so a
+	// sub-floor host does not re-run the full self-test on every spawn.
+	if cacheOK && record.Passed && refusal == nil {
 		cache.save(record)
 	}
 	if refusal != nil {

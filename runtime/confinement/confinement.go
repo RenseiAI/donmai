@@ -376,11 +376,12 @@ func (p *Plan) Release() error {
 
 // Prepare renders and writes the confinement for spec. It refuses with a
 // typed *Error when the confinement cannot be applied: no backend, a nested
-// profile, no passing or a stale self-test, a degraded record (the scope
-// layer missing: Prepare refuses rather than run a seat the host reports
-// as confined while signals and abstract sockets stay reachable), an
-// unrepresentable writable set, or an unrenderable composer rule. It never
-// returns a weaker plan. It walks
+// profile, no passing or a stale self-test for the session mode, an
+// unrepresentable writable set, or an unrenderable composer rule. A degraded
+// record (the scope layer missing) still starts seats: the probes passed and
+// the boundary holds except for the missing scope layer, which the status
+// surface reports as degraded while the full-boundary attestation stays empty.
+// It never returns a weaker plan. It walks
 // the writable set once to account for hard links (D2.3), so its cost grows
 // with the number of files in the set.
 func (c *Confiner) Prepare(spec Spec) (*Plan, error) {
@@ -393,9 +394,6 @@ func (c *Confiner) Prepare(spec Spec) (*Plan, error) {
 	record, ok := c.SelfTestRecord()
 	if !ok {
 		return nil, refuse(ReasonSelfTestFailed, "no self-test has run on this host")
-	}
-	if record.Degraded != "" {
-		return nil, refuse(ReasonSelfTestFailed, "the self-test proves a partial boundary only: %s", record.Degraded)
 	}
 	if !record.Passed || !containsMode(record.SessionModes, spec.SessionMode) {
 		return nil, refuse(ReasonSelfTestFailed, "the self-test did not pass for session mode %s", spec.SessionMode)

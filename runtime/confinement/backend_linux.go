@@ -992,5 +992,22 @@ func emptyPlaceholderBase() (string, error) {
 	if err := os.MkdirAll(base, 0o700); err != nil { //nolint:gosec // G301: the empty overlay parent.
 		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
 	}
+	// The base is predictable per-user state in the shared temporary
+	// directory: verify it is still the owner-only directory this process
+	// staged, not a symlink or a directory another user owns. Anything else
+	// refuses closed rather than hiding a deny behind attacker state.
+	var st unix.Stat_t
+	if err := unix.Lstat(base, &st); err != nil {
+		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: %v", errnoText(err))
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: the placeholder base is not a directory")
+	}
+	if st.Uid != uint32(os.Getuid()) { //nolint:gosec // G115: uids are small non-negative values.
+		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: the placeholder base is not owned by this user")
+	}
+	if st.Mode&0o777 != 0o700 {
+		return "", refuse(ReasonNamespaceUnavailable, "cannot stage empty overlay: the placeholder base is not owner-only")
+	}
 	return base, nil
 }

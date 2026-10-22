@@ -54,7 +54,11 @@
 // process already inside a profile (nested_sandbox), without a passing and
 // current self-test for the session mode (self_test_failed, self_test_stale),
 // for a writable set it cannot represent (writable_set_unrepresentable), or
-// for a composer rule the backend cannot render (rule_unrenderable).
+// for a composer rule the backend cannot render (rule_unrenderable). A
+// degraded record (the scope layer missing) still starts seats: the probes
+// passed and the boundary holds except for the missing scope layer, which the
+// status surface reports as degraded while the full-boundary attestation stays
+// empty.
 //
 // The self-test drives a probe process — an executable that calls
 // RunLandlockStageFromEnv first in main, then RunProbeFromEnv (the stage
@@ -134,14 +138,13 @@
 // terminal's foreground group, so Ctrl-C and job control reach it; a
 // headless one runs in a session of its own. The full boundary needs
 // Landlock ABI 6 (Linux 6.12), where the stage also scopes signals and
-// abstract unix sockets to its domain. Below it confined seats refuse
-// closed: the mount tree, the process namespace and the filesystem rules
-// would hold, but signals to same-user processes outside and abstract
-// sockets outside stay reachable, so the self-test records that kernel as
-// kernel_unsupported instead of passing it, marks the record degraded,
-// never attests it, and Prepare refuses it — the host reports a partial
+// abstract unix sockets to its domain. Below it seats run with a degraded
+// boundary: the mount tree, the process namespace and the filesystem rules
+// hold, but signals to same-user processes outside and abstract sockets
+// outside stay reachable, so the self-test marks the passing record degraded,
+// the full-boundary attestation stays empty, and the host reports a partial
 // boundary, never a confined one. Status and doctor output carry the
-// degraded reason, and seat hosts that must attest confinement run
+// degraded reason, and seat hosts that must attest a full boundary run
 // Linux 6.12 or newer.
 //
 // The Linux self-test runs its own widening probes, each judged by its

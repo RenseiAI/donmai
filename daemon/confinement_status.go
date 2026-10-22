@@ -8,9 +8,10 @@ import (
 )
 
 // confinementKernelFloor names the kernel floor for a full seat boundary:
-// the scope layer needs Landlock ABI 6, which ships in Linux 6.12. Below
-// it confined seats refuse closed: signals and abstract sockets outside
-// would stay reachable, so the host never reports itself as confined.
+// the scope layer needs Landlock ABI 6, which ships in Linux 6.12. Below it
+// seats run with a degraded boundary: the mount tree, the process namespace
+// and the filesystem rules hold, while signals and abstract sockets outside
+// stay reachable, so the host reports a partial boundary, never a confined one.
 const confinementKernelFloor = "Linux 6.12 (Landlock ABI 6) for the full boundary"
 
 // confinementStatusReporter answers the daemon's OS-confinement self-check
@@ -23,6 +24,11 @@ type confinementStatusReporter struct {
 	scopesAvailable func() (bool, string)
 	// latestProvenRecord reports the last proven self-test, if any.
 	latestProvenRecord func() (record confinement.SelfTestRecord, ok bool)
+	// checkBackend reports whether the backend can apply a boundary from
+	// this process now. Nil means the running backend's Check. A failure
+	// reports unproven even where a passing record remains: the boundary
+	// seats would start from no longer holds.
+	checkBackend func() error
 }
 
 // productionConfinementReporter is the status path's reporter: the running
@@ -74,6 +80,16 @@ func (r confinementStatusReporter) status() *afclient.ConfinementStatus {
 		return status
 	}
 	scopeOK, scopeWhy := r.scopesAvailable()
+	// The backend check is live, not cached: a host whose backend now fails
+	// (user namespaces disabled after a pass, a nested sandbox, a missing
+	// launcher) reports unproven even where a passing record remains, so the
+	// operator surface never attests a boundary seats can no longer start from.
+	checkErr := error(nil)
+	if r.checkBackend != nil {
+		checkErr = r.checkBackend()
+	} else {
+		checkErr = backend.Check()
+	}
 	record, recordOK := confinement.SelfTestRecord{}, false
 	if r.latestProvenRecord != nil {
 		record, recordOK = r.latestProvenRecord()
@@ -106,6 +122,10 @@ func (r confinementStatusReporter) status() *afclient.ConfinementStatus {
 	}
 	if !recordOK || !record.Passed || len(record.SessionModes) == 0 {
 		status.Detail = "seat boundary unproven at " + confinementKernelFloor + " or newer: no passing self-test recorded on this host"
+		return status
+	}
+	if checkErr != nil {
+		status.Detail = "seat boundary unproven at " + confinementKernelFloor + " or newer: the backend cannot apply a boundary on this host"
 		return status
 	}
 	if !recordStillCurrent(backend, record) {

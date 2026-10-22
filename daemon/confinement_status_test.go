@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,11 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 )
+
+// errBackendUnavailableForTest stands in for a backend that cannot apply a
+// boundary now (user namespaces disabled, a nested sandbox, a missing
+// launcher): the status path must report unproven from it.
+var errBackendUnavailableForTest = errors.New("backend unavailable")
 
 // TestConfinementStatus_DegradedBelowTheFloor pins the daemon's degraded
 // posture through the production status entry point: with the scope probe
@@ -140,7 +146,107 @@ func TestConfinementStatus_NilProbeNeverAttests(t *testing.T) {
 	}
 }
 
-// TestConfinementStatus_EmptyReasonIsDegraded pins the malformed-probe
+// TestConfinementStatus_CheckFailureNeverAttests pins the live backend check
+// in the status path: a current, passing, whole record still reports unproven
+// (never attested) where the backend cannot apply a boundary now. Deleting
+// the check gate turns this test red.
+func TestConfinementStatus_CheckFailureNeverAttests(t *testing.T) {
+	backend := confinement.DefaultBackend()
+	if backend == nil {
+		t.Skip("no confinement backend on this host; the status reports none")
+	}
+	version, err := backend.Version()
+	if err != nil {
+		t.Skipf("backend version unavailable: %v", err)
+	}
+	passing := confinement.SelfTestRecord{
+		Backend: backend.Name(), BackendVersion: version,
+		ProbeSetVersion: confinement.ProbeSetVersion,
+		Passed:          true,
+		SessionModes: []agent.PromptSessionMode{
+			agent.PromptModeAutonomous, agent.PromptModeHumanControlled,
+		},
+	}
+	reporter := confinementStatusReporter{
+		scopesAvailable: enforcedScopes,
+		latestProvenRecord: func() (confinement.SelfTestRecord, bool) {
+			return passing, true
+		},
+		checkBackend: func() error { return errBackendUnavailableForTest },
+	}
+	if got := reporter.status(); got.Attested || got.Degraded != "" {
+		t.Fatalf("confinement status attests or degrades with a failing backend: %+v", got)
+	}
+}
+
+// TestConfinementStatus_StaleBackendVersionIsUnproven pins the staleness gate
+// on the backend version: a passing record taken under another version
+// reports unproven, never attested. Weakening the version compare (accepting
+// any non-empty running version) turns this test red.
+func TestConfinementStatus_StaleBackendVersionIsUnproven(t *testing.T) {
+	backend := confinement.DefaultBackend()
+	if backend == nil {
+		t.Skip("no confinement backend on this host; the status reports none")
+	}
+	version, err := backend.Version()
+	if err != nil {
+		t.Skipf("backend version unavailable: %v", err)
+	}
+	if version == "" {
+		t.Skip("backend version is empty; nothing to differ from")
+	}
+	stale := confinement.SelfTestRecord{
+		Backend: backend.Name(), BackendVersion: version + ".stale",
+		ProbeSetVersion: confinement.ProbeSetVersion,
+		Passed:          true,
+		SessionModes: []agent.PromptSessionMode{
+			agent.PromptModeAutonomous, agent.PromptModeHumanControlled,
+		},
+	}
+	reporter := confinementStatusReporter{
+		scopesAvailable: enforcedScopes,
+		latestProvenRecord: func() (confinement.SelfTestRecord, bool) {
+			return stale, true
+		},
+		checkBackend: func() error { return nil },
+	}
+	if got := reporter.status(); got.Attested {
+		t.Fatalf("confinement status attests a stale backend version: %+v", got)
+	}
+}
+
+// TestConfinementStatus_StaleProbeSetIsUnproven pins the staleness gate on
+// the probe set: a passing record taken under another probe set reports
+// unproven, never attested. Deleting the staleness gate turns this test red.
+func TestConfinementStatus_StaleProbeSetIsUnproven(t *testing.T) {
+	backend := confinement.DefaultBackend()
+	if backend == nil {
+		t.Skip("no confinement backend on this host; the status reports none")
+	}
+	version, err := backend.Version()
+	if err != nil {
+		t.Skipf("backend version unavailable: %v", err)
+	}
+	stale := confinement.SelfTestRecord{
+		Backend: backend.Name(), BackendVersion: version,
+		ProbeSetVersion: confinement.ProbeSetVersion + ".stale",
+		Passed:          true,
+		SessionModes: []agent.PromptSessionMode{
+			agent.PromptModeAutonomous, agent.PromptModeHumanControlled,
+		},
+	}
+	reporter := confinementStatusReporter{
+		scopesAvailable: enforcedScopes,
+		latestProvenRecord: func() (confinement.SelfTestRecord, bool) {
+			return stale, true
+		},
+		checkBackend: func() error { return nil },
+	}
+	if got := reporter.status(); got.Attested {
+		t.Fatalf("confinement status attests a stale probe set: %+v", got)
+	}
+}
+
 // gate: a missing layer with no reason still reports degraded with a
 // non-empty line, never an empty degraded marker. Deleting the generic
 // fallback (passing the empty reason through) turns this test red.
