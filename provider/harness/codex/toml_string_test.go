@@ -3,6 +3,7 @@ package codex
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"github.com/RenseiAI/donmai/agent"
@@ -124,6 +125,35 @@ func TestBuildInteractiveLaunch_DeveloperInstructionsRoundTrip(t *testing.T) {
 	}
 	if decoded.Instructions != appendText {
 		t.Fatalf("decoded developer instructions = %q, want %q", decoded.Instructions, appendText)
+	}
+}
+
+// TestTOMLBasicString_ReplacesInvalidUTF8 pins the invalid-byte rule: raw
+// invalid UTF-8 never reaches the wire. Each invalid byte becomes one
+// U+FFFD, so the encoded form stays valid UTF-8 and decodes to the
+// replacement text instead of carrying raw bytes the CLI would reject.
+func TestTOMLBasicString_ReplacesInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "single invalid byte", input: "\xff", want: "\uFFFD"},
+		{name: "run of invalid bytes", input: "\xff\xfe", want: "\uFFFD\uFFFD"},
+		{name: "invalid byte in text", input: "a\xffb", want: "a\uFFFDb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			encoded := tomlBasicString(tt.input)
+			if !utf8.ValidString(encoded) {
+				t.Fatalf("tomlBasicString(%q) = %q, not valid UTF-8", tt.input, encoded)
+			}
+			if got := decodeTOMLBasicString(t, encoded); got != tt.want {
+				t.Fatalf("round trip of %q = %q, want %q (encoded %q)", tt.input, got, tt.want, encoded)
+			}
+		})
 	}
 }
 
