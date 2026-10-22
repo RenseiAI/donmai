@@ -558,6 +558,88 @@ func TestNoticeClaimFixture_CrashBetweenApplyAndMarkerReplaysReceipt(t *testing.
 	}
 }
 
+// TestNoticeClaimFixture_CrashWindowBindsPersistedText pins the
+// crash-window replay's text binding: the session holds the valid offer
+// for (D1, HELLO) but the persisted message carries a peer's different
+// text. The reclaim must re-apply HELLO — never replay the receipt off
+// the peer's message.
+//
+// RED proof: drop the text equality from findAppliedMessage and the
+// reclaim appends the applied receipt with no send ("already applied").
+func TestNoticeClaimFixture_CrashWindowBindsPersistedText(t *testing.T) {
+	t.Parallel()
+	entries := `[{"type":"custom","customType":"donmai-notice-offer","data":{"delivery":"D1","text":"HELLO"}},` +
+		`{"type":"custom_message","customType":"donmai-notice","content":"PEER-TEXT","details":{"deliveryId":"D1"},"display":true}]`
+	out := runNoticeClaimFixture(t, true, entries, `D1 HELLO`)
+	if !out.Registered {
+		t.Fatal("donmai-claim command was not registered")
+	}
+	if len(out.Sent) != 1 {
+		t.Fatalf("mismatched crash-window message sent %+v, want exactly one re-application of the offered text", out.Sent)
+	}
+	if len(out.Notified) != 1 || out.Notified[0].Msg != "claimed D1" {
+		t.Fatalf("notified = %+v, want exactly [claimed D1], not the crash-window replay", out.Notified)
+	}
+}
+
+// TestNoticeClaimFixture_NonCustomMessageEndMintsNothing pins the
+// message_end shape filter: only a persisted custom donmai-notice message
+// mints the receipt. A same-delivery event with the wrong role or the
+// wrong custom type mints nothing, trusted or not.
+//
+// RED proof: drop the role/customType filter from the message_end
+// handler and either event appends the applied receipt.
+func TestNoticeClaimFixture_NonCustomMessageEndMintsNothing(t *testing.T) {
+	t.Parallel()
+	offer := `{"type":"custom","customType":"donmai-notice-offer","data":{"delivery":"D1","text":"HELLO"}}`
+	for _, tc := range []struct {
+		name string
+		msg  string
+	}{
+		{name: "wrong role", msg: `{"role":"assistant","customType":"donmai-notice","content":"HELLO","details":{"deliveryId":"D1"}}`},
+		{name: "wrong type", msg: `{"role":"custom","customType":"donmai-notice-other","content":"HELLO","details":{"deliveryId":"D1"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out := runNoticeClaimMessageEnd(t, true, `[`+offer+`]`, tc.msg)
+			if !out.Registered {
+				t.Fatal("donmai-claim extension did not register its handlers")
+			}
+			if len(out.Appended) != 0 {
+				t.Fatalf("%s event minted %+v, want no receipt", tc.name, out.Appended)
+			}
+		})
+	}
+}
+
+// TestNoticeClaimFixture_DatalessAppliedEntryCannotWedgeClaim pins the
+// findEntry malformed-entry guard on the applied-receipt path: a dataless
+// applied entry (same-user writable state a peer can plant) is skipped,
+// never fatal — the claim proceeds down the normal offer path instead of
+// surfacing a TypeError that would wedge every delivery.
+//
+// RED proof: drop the data guard from findEntry and the claim notifies a
+// TypeError instead of claiming.
+func TestNoticeClaimFixture_DatalessAppliedEntryCannotWedgeClaim(t *testing.T) {
+	t.Parallel()
+	entries := `[{"type":"custom","customType":"donmai-notice-applied"}]`
+	out := runNoticeClaimFixture(t, true, entries, `D1 HELLO`)
+	if !out.Registered {
+		t.Fatal("donmai-claim command was not registered")
+	}
+	if len(out.Notified) != 1 || out.Notified[0].Msg != "claimed D1" {
+		t.Fatalf("notified = %+v, want exactly [claimed D1] past the dataless applied entry", out.Notified)
+	}
+	for _, n := range out.Notified {
+		if strings.Contains(n.Msg, "TypeError") {
+			t.Fatalf("dataless applied entry wedged the channel with %q", n.Msg)
+		}
+	}
+	if len(out.Sent) != 1 {
+		t.Fatalf("sent = %+v, want exactly one application", out.Sent)
+	}
+}
+
 // recovery replays instead of losing: an offer with no applied marker is
 // still claimable — the reclaim re-offers nothing (the offer persists) and
 // re-applies exactly once.

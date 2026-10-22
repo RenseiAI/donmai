@@ -37,16 +37,17 @@ func TestSpawn_Interactive_InjectRequiresTrustedDurableReceipt(t *testing.T) {
 }
 
 // TestSpawn_Interactive_ClaimExtensionLoadsSecondByExplicitPath proves the
-// host-owned applied-receipt extension rides the interactive spawn on its
-// own explicit `-e` path — boundary first, receipt extension second, caller
-// deliveries after — and never by workspace discovery. The fake pi records
-// its argv; the assertion reads the recorded load order off it.
+// host-owned applied-receipt extension rides a TRUSTED interactive spawn on
+// its own explicit `-e` path — boundary first, receipt extension second,
+// caller deliveries after — and never by workspace discovery. The fake pi
+// records its argv; the assertion reads the recorded load order off it.
 //
 // RED proof: drop noticeClaimPath from the extensionPaths list in
 // spawnInteractive and the claim path vanishes from the argv.
 func TestSpawn_Interactive_ClaimExtensionLoadsSecondByExplicitPath(t *testing.T) {
 	workdir := t.TempDir()
 	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+	p.trustedExtensions = []TrustedExtensionIdentity{{ID: noticeClaimDeliveryID, Digest: noticeClaimSHA()}}
 	h, err := p.Spawn(context.Background(), agent.Spec{
 		Cwd:         workdir,
 		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
@@ -130,6 +131,92 @@ func TestNoticeClaimTrusted_RequiresExactDigestAndNoShadow(t *testing.T) {
 	}
 }
 
+// TestSpawn_Interactive_TrustVerdictStampedOnlyWhenTrusted is the
+// Spawn-level pin for the trust verdict: it drives the production Spawn
+// entry point and reads the stamped verdict off the child's captured env.
+// Only an exact-digest trusted set with no caller shadow stamps
+// DONMAI_NOTICE_CLAIM_TRUST=1; every other shape leaves it absent.
+//
+// RED proof: force claimTrusted true at the Spawn call site and the
+// untrusted/shadow rows stamp; force it false and the trusted row stays
+// absent — both mutants stay GREEN without this test.
+func TestSpawn_Interactive_TrustVerdictStampedOnlyWhenTrusted(t *testing.T) {
+	trusted := []TrustedExtensionIdentity{{ID: noticeClaimDeliveryID, Digest: noticeClaimSHA()}}
+	stale := []TrustedExtensionIdentity{{ID: noticeClaimDeliveryID, Digest: strings.Repeat("0", 64)}}
+	shadowBody := []byte("export default function activate(pi) {}\n")
+	shadow := []agent.ExtensionDelivery{{ID: noticeClaimDeliveryID, Kind: agent.ExtensionDeliveryInline, Source: shadowBody, Basename: "shadow.ts", Digest: sha256Hex(shadowBody)}}
+	cases := []struct {
+		name    string
+		trusted []TrustedExtensionIdentity
+		shadow  []agent.ExtensionDelivery
+		want    string
+	}{
+		{name: "trusted stamps", trusted: trusted, want: "DONMAI_NOTICE_CLAIM_TRUST=[1]"},
+		{name: "untrusted absent", trusted: nil, want: "DONMAI_NOTICE_CLAIM_TRUST=[]"},
+		{name: "stale digest absent", trusted: stale, want: "DONMAI_NOTICE_CLAIM_TRUST=[]"},
+		{name: "shadow fails closed", trusted: trusted, shadow: shadow, want: "DONMAI_NOTICE_CLAIM_TRUST=[]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workdir := t.TempDir()
+			p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+			p.trustedExtensions = tc.trusted
+			spec := agent.Spec{Cwd: workdir, Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24}, AdditionalExtensions: tc.shadow}
+			h, err := p.Spawn(context.Background(), spec)
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			t.Cleanup(func() { _ = h.Stop(context.Background()) })
+			awaitPTYExit(t, h)
+			env := readCapturedFile(t, workdir, "env.txt")
+			if !strings.Contains(env, tc.want) {
+				t.Errorf("captured child env missing %q; got:\n%s", tc.want, env)
+				}
+		})
+	}
+}
+
+// TestSpawn_Interactive_UntrustedLoadsBoundaryOnly pins the M1 load gate:
+// an untrusted spawn never registers `/donmai-claim` — the boundary rides
+// alone — while a trusted spawn loads boundary then claim. The env bit is
+// only a per-event re-check; the load gate is the boundary.
+//
+// RED proof: always append the claim path in spawnInteractive and the
+// untrusted row loads two; never append it and the trusted row loads one.
+func TestSpawn_Interactive_UntrustedLoadsBoundaryOnly(t *testing.T) {
+	spawnLoads := func(t *testing.T, trusted []TrustedExtensionIdentity) []string {
+		t.Helper()
+		workdir := t.TempDir()
+		p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+		p.trustedExtensions = trusted
+		h, err := p.Spawn(context.Background(), agent.Spec{
+			Cwd:         workdir,
+			Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		t.Cleanup(func() { _ = h.Stop(context.Background()) })
+		awaitPTYExit(t, h)
+		argv := argvLines(readCapturedFile(t, workdir, "argv.txt"))
+		var loads []string
+		for i := 0; i+1 < len(argv); i++ {
+			if argv[i] == "-e" {
+				loads = append(loads, argv[i+1])
+			}
+		}
+		return loads
+	}
+	untrusted := spawnLoads(t, nil)
+	if len(untrusted) != 1 || filepath.Base(untrusted[0]) != extensionFileName {
+		t.Fatalf("untrusted -e loads = %q, want only the boundary %q", untrusted, extensionFileName)
+	}
+	trusted := spawnLoads(t, []TrustedExtensionIdentity{{ID: noticeClaimDeliveryID, Digest: noticeClaimSHA()}})
+	if len(trusted) != 2 || filepath.Base(trusted[0]) != extensionFileName || filepath.Base(trusted[1]) != noticeClaimFileName {
+		t.Fatalf("-e loads = %q, want [boundary %q, claim %q]", trusted, extensionFileName, noticeClaimFileName)
+	}
+}
+
 // captureArgvEnvScript is the fake-pi body the fixture tests use. It dumps its
 // own argv (one element per line so an argument containing spaces still lands on
 // one line) and the provider-pin / handshake / home env vars to files in the
@@ -162,6 +249,7 @@ printf '%s\n' "$@" > "$PWD/argv.txt"
   printf 'DONMAI_PI_PRICE_OUTPUT=%s\n' "$DONMAI_PI_PRICE_OUTPUT"
   printf 'DONMAI_PI_PRICE_CACHE_READ=%s\n' "$DONMAI_PI_PRICE_CACHE_READ"
   printf 'DONMAI_PI_PRICE_CACHE_WRITE=%s\n' "$DONMAI_PI_PRICE_CACHE_WRITE"
+  printf 'DONMAI_NOTICE_CLAIM_TRUST=[%s]\n' "$DONMAI_NOTICE_CLAIM_TRUST"
   printf 'PI_HOME=%s\n' "$PI_HOME"
 } > "$PWD/env.txt"
 `

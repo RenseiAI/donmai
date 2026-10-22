@@ -2,11 +2,12 @@
 // interactive sessions.
 //
 // This file is the TRUSTED-extension half of the interactive notice receipt
-// contract (docs/agents/PI-INTERACTIVE-NOTICES.md). It is delivered through
-// the SAME explicit `-e` path as the embedded policy extension — never
-// through workspace discovery (`--no-extensions` stays on) — and it is
-// effective only when its measured identity matches the compiled embedder's
-// trusted set (Options.TrustedExtensions). An arbitrary peer
+// contract (docs/agents/PI-INTERACTIVE-NOTICES.md). The host loads it
+// through the SAME explicit `-e` path as the embedded policy extension —
+// never through workspace discovery (`--no-extensions` stays on) — and
+// only when its measured identity matches the compiled embedder's
+// trusted set (Options.TrustedExtensions): untrusted sessions never
+// register `/donmai-claim` at all. An arbitrary peer
 // AdditionalExtension cannot mint its receipts: the applied marker is
 // written only when the same session holds this extension's own persisted
 // offer for that delivery (same ID, same text) AND the spawn proved the

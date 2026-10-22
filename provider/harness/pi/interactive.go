@@ -78,17 +78,22 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	}
 	// The host-owned applied-receipt extension loads second — after the
 	// boundary, before caller deliveries — by explicit `-e` path, never by
-	// discovery. It is effective only when its measured identity matches
-	// the compiled embedder's trusted set: without that match the claim
-	// command refuses every delivery (see the extension's own header), so
-	// a session that cannot prove the receipt boundary runs without one
-	// rather than with a forged one.
-	noticeClaimPath, err := materializeNoticeClaimExtension(layout, confiner != nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
-	}
+	// discovery, and only when the compiled embedder trusts it. The
+	// per-event trust bit below is defense-in-depth, not the boundary:
+	// every AdditionalExtension shares this process, so a peer can read
+	// (and mutate) process.env — the load gate is what keeps an
+	// untrusted session from ever registering `/donmai-claim`.
 	claimTrusted := noticeClaimTrusted(p.trustedExtensions, spec.AdditionalExtensions)
-	extensionPaths := append([]string{layout.extension, noticeClaimPath}, extraPaths...)
+	var extensionPaths []string
+	if claimTrusted {
+		noticeClaimPath, err := materializeNoticeClaimExtension(layout, confiner != nil)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+		}
+		extensionPaths = append([]string{layout.extension, noticeClaimPath}, extraPaths...)
+	} else {
+		extensionPaths = append([]string{layout.extension}, extraPaths...)
+	}
 
 	// Deliver session credentials through files, never the child env — the
 	// same posture as the headless lane (pi.go launch): the exec environment
@@ -284,9 +289,10 @@ const piStateDirEnvVar = "DONMAI_PI_STATE_DIR"
 // only after noticeClaimTrusted passes (exact embedded digest in
 // Options.TrustedExtensions, no caller shadow); otherwise absent. The
 // extension refuses every claim without it. It rides the spawn's complete
-// environment (interactiveExecEnvWithTrust below, ExactEnv), so a
-// same-process peer extension cannot set it for the session — it can only
-// read it, and reading it confers no authority.
+// environment (interactiveExecEnvWithTrust below, ExactEnv) as a per-event
+// re-check: same-process peers share process.env, so the bit alone is not
+// a boundary — the boundary is the conditional `-e` load in
+// spawnInteractive, which never registers `/donmai-claim` untrusted.
 const noticeClaimTrustEnvVar = "DONMAI_NOTICE_CLAIM_TRUST"
 
 // piAllowedToolsEnvVar / piDisallowedToolsEnvVar carry a JSON-encoded
