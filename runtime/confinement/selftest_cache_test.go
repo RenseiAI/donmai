@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 var bothModes = []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}
@@ -27,7 +28,7 @@ func newCacheWorld(t *testing.T, backend Backend, extra ExtraRules, digest strin
 	t.Helper()
 	w := newSpecWorld(t)
 	probe := filepath.Join(w.base, "probe")
-	if err := os.WriteFile(probe, []byte("probe executable v1"), 0o700); err != nil { //nolint:gosec // G306: a stand-in executable.
+	if err := testexec.WriteFile(probe, []byte("probe executable v1"), 0o700); err != nil { //nolint:gosec // G306: a stand-in executable.
 		t.Fatal(err)
 	}
 	launches := &atomic.Int32{}
@@ -126,7 +127,7 @@ func TestSelfTestCache_KeyCoversWhatTheRecordProves(t *testing.T) {
 	}
 	otherProbe := base
 	otherProbe.opts.ProbeCommand = []string{filepath.Join(base.w.base, "probe2")}
-	if err := os.WriteFile(otherProbe.opts.ProbeCommand[0], []byte("probe executable v2"), 0o700); err != nil { //nolint:gosec // G306: a stand-in executable.
+	if err := testexec.WriteFile(otherProbe.opts.ProbeCommand[0], []byte("probe executable v2"), 0o700); err != nil { //nolint:gosec // G306: a stand-in executable.
 		t.Fatal(err)
 	}
 	otherHarness := base

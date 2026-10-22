@@ -878,6 +878,13 @@ type Result struct {
 	// it. Nil when the seat carried no budget. Additive — old platforms
 	// ignore it.
 	SeatBudget *SeatBudgetReport `json:"seatBudget,omitempty"`
+
+	// PreparationSeconds is how long the session spent preparing before
+	// the agent started: workarea provisioning, dependency installs and
+	// prompt assembly, in whole seconds. Zero is omitted so a result that
+	// never recorded the phase stays byte-identical. Additive — old
+	// platforms ignore it.
+	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
 }
 
 // ResumeCheckpoint identifies the branch + head commit a retryable session

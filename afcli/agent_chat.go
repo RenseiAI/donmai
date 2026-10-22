@@ -41,6 +41,19 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 
 			resp, err := client.ChatSession(id, afclient.ChatSessionRequest{Prompt: message, IdempotencyKey: idempotencyKey})
 			if err != nil {
+				var promptErr *afclient.PromptSessionError
+				if errors.As(err, &promptErr) {
+					if jsonMode {
+						enc := json.NewEncoder(cmd.OutOrStdout())
+						enc.SetIndent("", "  ")
+						if encodeErr := enc.Encode(promptErr); encodeErr != nil {
+							return fmt.Errorf("encode prompt refusal: %w", encodeErr)
+						}
+					} else {
+						_, _ = fmt.Fprintln(cmd.OutOrStdout(), formatPromptRefusalLine(id, promptErr))
+					}
+					return fmt.Errorf("prompt session %s refused: %w", id, promptErr)
+				}
 				if errors.Is(err, afclient.ErrNotFound) {
 					return fmt.Errorf("prompt session %s: session not found: %w", id, err)
 				}
@@ -66,6 +79,9 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 			}
 			_, _ = fmt.Fprintf(out, "Prompt %s %s to %s (status: %s)\n",
 				resp.PromptID, verb, resp.SessionID, resp.SessionStatus)
+			if resp.Code != "" {
+				_, _ = fmt.Fprintln(out, formatPromptReceiptCodeLine(resp))
+			}
 			return nil
 		},
 	}
@@ -74,4 +90,47 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Stable key for safe prompt retries")
 
 	return cmd
+}
+
+// formatPromptRefusalLine renders the one-line human refusal for a refused
+// prompt: the session id, the refusal code, the reason and the recovery
+// action. Prompt text and retry keys are never echoed.
+func formatPromptRefusalLine(id string, promptErr *afclient.PromptSessionError) string {
+	reason := promptErr.Reason
+	if promptErr.Code != "" {
+		reason = "(" + promptErr.Code + "): " + reason
+	}
+	line := "prompt session " + id + " refused " + reason + "."
+	if next := humanizePromptRecoveryAction(promptErr.RecoveryAction); next != "" {
+		line += " Next step: " + next + "."
+	}
+	if len(promptErr.MissingFields) > 0 {
+		line += " missing: " + strings.Join(promptErr.MissingFields, ", ")
+	}
+	return line
+}
+
+// humanizePromptRecoveryAction renders the wire recoveryAction value in
+// human prose. Underscore names print with spaces (start_new_session reads
+// as "start a new session" via the article fixup below); unknown values
+// pass through unchanged.
+func humanizePromptRecoveryAction(action string) string {
+	if action == "" {
+		return ""
+	}
+	human := strings.ReplaceAll(action, "_", " ")
+	if human == "start new session" {
+		return "start a new session"
+	}
+	return human
+}
+
+// formatPromptReceiptCodeLine renders the follow-up line for a 200 receipt
+// that still carries a refusal code and recovery hint.
+func formatPromptReceiptCodeLine(resp *afclient.ChatSessionResponse) string {
+	line := "Refusal code " + resp.Code
+	if next := humanizePromptRecoveryAction(resp.RecoveryAction); next != "" {
+		line += ": next step " + next
+	}
+	return line
 }

@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // linuxWorld is a render-test session on real temporary directories: every
@@ -779,7 +780,7 @@ func newLinuxApplyWorld(t *testing.T) linuxApplyWorld {
 	t.Helper()
 	w := newLinuxWorld(t)
 	launcher := filepath.Join(t.TempDir(), "bwrap")
-	if err := os.WriteFile(launcher, []byte("#!/bin/sh\nexec \"$@\"\n"), 0o700); err != nil { //nolint:gosec // G306: a stand-in launcher executable.
+	if err := testexec.WriteFile(launcher, []byte("#!/bin/sh\nexec \"$@\"\n"), 0o700); err != nil { //nolint:gosec // G306: a stand-in launcher executable.
 		t.Fatalf("launcher seed: %v", err)
 	}
 	t.Setenv("PATH", "")
@@ -811,7 +812,7 @@ func TestApply_WrapBindsStageAndHarnessExecutables(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 	harness := filepath.Join(w.base, "harness")
-	if err := os.WriteFile(harness, []byte("#!/bin/sh\ntrue\n"), 0o700); err != nil { //nolint:gosec // G306: a stand-in harness executable.
+	if err := testexec.WriteFile(harness, []byte("#!/bin/sh\ntrue\n"), 0o700); err != nil { //nolint:gosec // G306: a stand-in harness executable.
 		t.Fatalf("harness seed: %v", err)
 	}
 	wrapped := mustWrap(t, applied, []string{harness, "-c", "true"})
@@ -1128,7 +1129,7 @@ func fakeLauncher(t *testing.T, body string) string {
 	dir := t.TempDir()
 	launcher := filepath.Join(dir, "bwrap")
 	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$(dirname \"$0\")/args\"\n" + body + "\n"
-	if err := os.WriteFile(launcher, []byte(script), 0o700); err != nil { //nolint:gosec // G306: a stand-in launcher executable.
+	if err := testexec.WriteFile(launcher, []byte(script), 0o700); err != nil { //nolint:gosec // G306: a stand-in launcher executable.
 		t.Fatalf("launcher seed: %v", err)
 	}
 	return launcher

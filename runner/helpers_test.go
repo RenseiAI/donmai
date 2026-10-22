@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
@@ -122,6 +123,20 @@ type recordingPlatformServer struct {
 	// polling. Buffered by the test; a full buffer coalesces wakeups and
 	// the waiter always re-scans the full history, so no beat is missed.
 	stepBeatNotify chan struct{}
+	// beacons are the bodies of every /progress beacon post, in order.
+	beacons [][]byte
+	// beaconNotify, when non-nil, gets a non-blocking send for every
+	// /progress beacon post so a test can wait for the next beacon
+	// without polling. Same coalescing contract as stepBeatNotify.
+	beaconNotify chan struct{}
+	// beaconFail, when true, makes every /progress post answer 500 so a
+	// test can prove the run continues with no failure.
+	beaconFail bool
+	// beaconHang, when positive, makes every /progress post sleep that
+	// long before answering, so a test can prove beacon posts never
+	// block the run loop: the worker's own timeout bounds the wait,
+	// not the endpoint.
+	beaconHang time.Duration
 }
 
 // terminalStatus returns the last terminal /status body the double received,
@@ -145,6 +160,13 @@ func (s *recordingPlatformServer) stepBeats() [][]byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([][]byte(nil), s.stepHeartbeats...)
+}
+
+// beaconPosts returns a copy of every /progress beacon body received.
+func (s *recordingPlatformServer) beaconPosts() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]byte(nil), s.beacons...)
 }
 
 // injectReports returns every ack and dead-letter the worker echoed.
@@ -188,6 +210,33 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 	t.Helper()
 	rec := &recordingPlatformServer{}
 	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/progress") {
+			body, _ := io.ReadAll(r.Body)
+			rec.mu.Lock()
+			fail := rec.beaconFail
+			hang := rec.beaconHang
+			if !fail {
+				rec.beacons = append(rec.beacons, body)
+			}
+			notify := rec.beaconNotify
+			rec.mu.Unlock()
+			if notify != nil {
+				select {
+				case notify <- struct{}{}:
+				default:
+				}
+			}
+			if hang > 0 {
+				select {
+				case <-time.After(hang):
+				case <-r.Context().Done():
+				}
+			}
+			if fail {
+				http.Error(w, "no", http.StatusInternalServerError)
+				return
+			}
+		}
 		if strings.HasSuffix(r.URL.Path, "/step-heartbeat") {
 			body, _ := io.ReadAll(r.Body)
 			rec.mu.Lock()

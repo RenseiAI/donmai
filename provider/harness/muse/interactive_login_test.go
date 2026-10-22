@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // TestCheckHostSessionLoginFile pins the offline leg of the host login
@@ -110,7 +111,7 @@ func TestProbeHostSessionLogin(t *testing.T) {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "fake-muse")
 		script := "#!/bin/bash\n" + body + "\n"
-		if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+		if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 			t.Fatal(err)
 		}
 		if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
@@ -345,7 +346,7 @@ func TestProbeHostSessionLogin_RequiresProbeModelID(t *testing.T) {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "fake-muse")
 		script := "#!/bin/bash\n" + body + "\n"
-		if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+		if err := testexec.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 			t.Fatal(err)
 		}
 		if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
@@ -395,7 +396,7 @@ func TestProbeHostSessionLogin_ModelIDOnOtherLineRefuses(t *testing.T) {
 	script := "#!/bin/bash\n" +
 		`echo "using model ` + hostLoginProbeModel + `"` + "\n" +
 		`echo "keychain item does not exist" >&2; exit 1` + "\n"
-	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
@@ -423,7 +424,7 @@ func TestProbeHostSessionLogin_OversizeOutputRefuses(t *testing.T) {
 	script := "#!/bin/bash\n" +
 		`for ((i=0; i<2048; i++)); do echo "junk-padding-line-$i-padding-padding-padding"; done` + "\n" +
 		`echo "agent loop failed: model failed: model ` + hostLoginProbeModel + ` does not exist or you lack access" >&2; exit 1` + "\n"
-	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
@@ -455,7 +456,7 @@ func TestProbeHostSessionLogin_ScrubsAmbientMetaKey(t *testing.T) {
 	script := "#!/bin/bash\n" +
 		`env > "` + dump + `"` + "\n" +
 		`echo "missing meta credentials" >&2; exit 1` + "\n"
-	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit

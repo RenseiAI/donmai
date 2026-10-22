@@ -21,6 +21,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
@@ -54,7 +55,7 @@ func writeShim(t *testing.T) string {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-interactive-cli")
-	if err := os.WriteFile(bin, []byte(shimScript), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte(shimScript), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
@@ -80,7 +81,7 @@ func writeMuseShim(t *testing.T, shim string) string {
 		// check refuses and the muse rows below fail loudly.
 		"if [[ \"$1\" == \"exec\" ]]; then echo \"model donmai-login-probe-nonexistent-model does not exist or you lack access\" >&2; exit 1; fi\n" +
 		"exec \"" + shim + "\"\n"
-	if err := os.WriteFile(bin, []byte(body), 0o600); err != nil { //nolint:gosec // test fixture
+	if err := testexec.WriteFile(bin, []byte(body), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit

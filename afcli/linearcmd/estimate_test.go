@@ -14,9 +14,11 @@ func TestLinearIssueEstimateOutputs(t *testing.T) {
 		args []string
 	}{
 		{"get", []string{"get-issue", "ENG-1"}},
-		{"list", []string{"list-issues"}},
+		// list-issues defaults to the slim row, so estimate coverage opts
+		// into the full column set explicitly.
+		{"list", []string{"list-issues", "--full"}},
 		{"children", []string{"list-sub-issues", "ENG-1"}},
-		{"manual", []string{"list-issues", "--order-by", "manual"}},
+		{"manual", []string{"list-issues", "--order-by", "manual", "--full"}},
 		{"backlog", []string{"list-backlog-issues", "--project", "TestProject"}},
 		{"unblocked", []string{"list-unblocked-backlog", "--project", "TestProject"}},
 	}

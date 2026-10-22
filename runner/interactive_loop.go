@@ -268,6 +268,13 @@ func (r *Runner) dispatchInteractive(
 		res.Status = "failed"
 		res.FailureMode = FailureInteractiveInput
 		res.Error = err.Error()
+		// The PTY never went live, but the terminal step must still advance
+		// past "spawning" so the local dashboard does not render the
+		// fallback for a session that already failed. Best-effort, like
+		// every other state write; the Result already carries the status.
+		r.markInteractiveStep(worktreePath, qw.SessionID, "stopped")
+		r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+			"interactive session ended: "+res.Error)
 		return res, err
 	}
 
@@ -289,6 +296,9 @@ func (r *Runner) dispatchInteractive(
 		)
 		r.logger.Error("[interactive] handle is not InteractiveCapable",
 			"sessionId", qw.SessionID, "provider", res.ProviderName)
+		r.markInteractiveStep(worktreePath, qw.SessionID, "stopped")
+		r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+			"interactive session ended: "+res.Error)
 		return res, errors.New(res.Error)
 	}
 
@@ -322,6 +332,9 @@ func (r *Runner) dispatchInteractive(
 		)
 		r.logger.Error("[interactive] half-configured attach env",
 			"sessionId", qw.SessionID, "hasURL", attachURL != "", "hasToken", attachToken != "")
+		r.markInteractiveStep(worktreePath, qw.SessionID, "stopped")
+		r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+			"interactive session ended: "+res.Error)
 		return res, errors.New(res.Error)
 	}
 
@@ -581,7 +594,7 @@ func (r *Runner) finishInteractiveOwnershipLoss(
 		res.Error = "operator cancelled interactive session (lock-refresh stop=true)"
 	} else {
 		res.FailureMode = FailureLostOwnership
-		res.Error = heartbeat.ErrLostOwnership.Error()
+		res.Error = heartbeat.LostOwnershipError(pulser)
 	}
 	r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
 		"interactive session ownership lost: "+res.FailureMode)

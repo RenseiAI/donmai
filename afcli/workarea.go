@@ -26,7 +26,8 @@ import (
 type workareaDaemonClient interface {
 	ListWorkareas() (*afclient.ListWorkareasResponse, error)
 	GetWorkarea(id string) (*afclient.WorkareaEnvelope, error)
-	RestoreWorkareaContext(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error)
+	GetWorkareaV1(id string) (*afclient.WorkareaV1Envelope, error)
+	RestoreWorkareaV1Context(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreV1Result, error)
 	DiffWorkareas(idA, idB string) (*afclient.WorkareaDiffResult, error)
 }
 
@@ -152,6 +153,13 @@ and the resolved toolchain map.`,
 }
 
 func runWorkareaShow(out io.Writer, client workareaDaemonClient, id string, jsonOut bool) error {
+	if env, err := client.GetWorkareaV1(id); err == nil {
+		if jsonOut {
+			return encodeWorkareaJSON(out, &env.Workarea)
+		}
+		noColor := workareaview.NoColorEnv()
+		return workareaview.RenderInspectV1(out, &env.Workarea, noColor)
+	}
 	env, err := client.GetWorkarea(id)
 	if err != nil {
 		if errors.Is(err, afclient.ErrNotFound) {
@@ -207,17 +215,16 @@ Pool saturation returns 503 + Retry-After.`,
 func runWorkareaRestore(ctx context.Context, out io.Writer, client workareaDaemonClient, archiveID string,
 	req afclient.WorkareaRestoreRequest, jsonOut bool,
 ) error {
-	res, err := client.RestoreWorkareaContext(ctx, archiveID, req)
+	// Restore is mutating, so it is submitted exactly once and its body is
+	// decoded once. The versioned projection is a superset of the legacy
+	// one served by the same endpoint: an older daemon's body decodes with
+	// no archive reference and renders the legacy view unchanged. A failed
+	// call is never re-submitted, because the daemon may already have
+	// restored and a second POST would materialise a duplicate workarea.
+	res, err := client.RestoreWorkareaV1Context(ctx, archiveID, req)
 	if err != nil {
-		switch {
-		case errors.Is(err, afclient.ErrNotFound):
-			return fmt.Errorf("archive not found: %s", archiveID)
-		case errors.Is(err, afclient.ErrConflict):
-			return fmt.Errorf("session id already in use: %s", req.IntoSessionID)
-		case errors.Is(err, afclient.ErrUnavailable):
-			return fmt.Errorf("pool saturated; retry later: %w", err)
-		case errors.Is(err, afclient.ErrBadRequest):
-			return fmt.Errorf("archive corrupted or unreadable: %w", err)
+		if mapped := mapWorkareaRestoreError(err, archiveID, req); mapped != nil {
+			return mapped
 		}
 		return fmt.Errorf("restore workarea: %w", err)
 	}
@@ -225,7 +232,25 @@ func runWorkareaRestore(ctx context.Context, out io.Writer, client workareaDaemo
 		return encodeWorkareaJSON(out, res)
 	}
 	noColor := workareaview.NoColorEnv()
-	return workareaview.RenderRestore(out, res, noColor)
+	return workareaview.RenderRestoreV1(out, res, noColor)
+}
+
+// mapWorkareaRestoreError maps sentinel restore failures to operator
+// messages. It returns nil for any other error, which the caller reports
+// as-is.
+func mapWorkareaRestoreError(err error, archiveID string, req afclient.WorkareaRestoreRequest) error {
+	switch {
+	case errors.Is(err, afclient.ErrNotFound):
+		return fmt.Errorf("archive not found: %s", archiveID)
+	case errors.Is(err, afclient.ErrConflict):
+		return fmt.Errorf("session id already in use: %s", req.IntoSessionID)
+	case errors.Is(err, afclient.ErrUnavailable):
+		return fmt.Errorf("pool saturated; retry later: %w", err)
+	case errors.Is(err, afclient.ErrBadRequest):
+		return fmt.Errorf("archive corrupted or unreadable: %w", err)
+	default:
+		return nil
+	}
 }
 
 // ── diff ──────────────────────────────────────────────────────────────────

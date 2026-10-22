@@ -77,3 +77,38 @@ func (e *StopSessionError) Error() string {
 // Unwrap preserves compatibility for callers that already branch on the
 // coarse HTTP 409 sentinel.
 func (e *StopSessionError) Unwrap() error { return ErrConflict }
+
+// PromptSessionError is the bounded, whitelisted refusal receipt returned by
+// the public session-prompt endpoint (POST /api/public/sessions/:id/prompt).
+// It preserves the 409 code, reason and recovery hint without retaining the
+// raw HTTP body and without echoing prompt text. The command layer renders
+// the human line and the --json body from these fields.
+type PromptSessionError struct {
+	HTTPStatus     int           `json:"httpStatus"`
+	Delivered      bool          `json:"delivered"`
+	DeliveryTier   string        `json:"deliveryTier,omitempty"`
+	Disposition    string        `json:"disposition,omitempty"`
+	SessionID      string        `json:"sessionId,omitempty"`
+	SessionStatus  SessionStatus `json:"sessionStatus,omitempty"`
+	Code           string        `json:"code,omitempty"`
+	Reason         string        `json:"error,omitempty"`
+	RecoveryAction string        `json:"recoveryAction,omitempty"`
+	MissingFields  []string      `json:"missingProjectionFields,omitempty"`
+}
+
+func (e *PromptSessionError) Error() string {
+	if e.Code != "" && e.Reason != "" {
+		return fmt.Sprintf("%s: %s", e.Code, e.Reason)
+	}
+	if e.Reason != "" {
+		return e.Reason
+	}
+	if e.Code != "" {
+		return e.Code
+	}
+	return "prompt refused"
+}
+
+// Unwrap preserves compatibility for callers that already branch on the
+// coarse HTTP 409 sentinel.
+func (e *PromptSessionError) Unwrap() error { return ErrConflict }

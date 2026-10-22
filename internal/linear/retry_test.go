@@ -241,3 +241,37 @@ func TestRetryRequestDeadline(t *testing.T) {
 		t.Fatalf("calls=%d elapsed=%v err=%v", calls, time.Since(start), err)
 	}
 }
+
+// TestRetryBudgetComparesWorstCaseSleep pins the request-budget guard to the
+// worst-case jittered sleep. A 2s Retry-After with maximum upward jitter
+// draws a 3s sleep, which cannot finish inside a 2.5s caller budget, so the
+// client must return the denial immediately instead of starting a sleep that
+// runs into the deadline and surfaces a context error.
+func TestRetryBudgetComparesWorstCaseSleep(t *testing.T) {
+	defer func(restore func(int64) int64) { retryJitterIntn = restore }(retryJitterIntn)
+	retryJitterIntn = func(n int64) int64 { return n - 1 }
+	calls := 0
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(429)
+		_, _ = io.WriteString(w, `{"errors":[{"message":"budget exhausted","code":"QUOTA"}]}`)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.ListTeams(ctx)
+	elapsed := time.Since(start)
+	if calls != 1 {
+		t.Fatalf("calls=%d want 1", calls)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("retry waited %v for an unaffordable worst-case sleep, want an immediate denial", elapsed)
+	}
+	if !errors.Is(err, ErrRateLimited) || !strings.Contains(err.Error(), "retry after 2s") {
+		t.Fatalf("err=%v want rate-limited denial with retry after 2s", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("unaffordable retry surfaced a context error: %v", err)
+	}
+}

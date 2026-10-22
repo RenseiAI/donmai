@@ -1006,6 +1006,13 @@ func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.
 	if archived.WorkareaRoot == "" || archived.Path != archived.RepositoryWorktreePath || filepath.Base(archived.Path) != "docs" || len(archived.Repositories) != 2 {
 		t.Fatalf("archived root projection = %+v", archived)
 	}
+	// Pre-contract archives keep serving their existing shape unchanged: the
+	// non-canonical legacy manifest (session "archive-session", workarea
+	// "wa_archive_root") projects no versioned recovery reference. Deleting
+	// the shape guard must turn this RED.
+	if archived.ArchiveReference != nil {
+		t.Fatalf("pre-contract archive serves no recovery reference, got %+v", archived.ArchiveReference)
+	}
 	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
 		t.Fatal(err)
 	}
@@ -1043,6 +1050,11 @@ func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.
 	}
 	if restored.WorkareaRoot == "" || restored.Path != restored.RepositoryWorktreePath || filepath.Base(restored.Path) != "docs" || len(restored.Repositories) != 2 {
 		t.Fatalf("restored root projection = %+v", restored)
+	}
+	// The restore projection preserves the same pre-contract shape: no
+	// versioned reference for a non-canonical legacy manifest.
+	if restored.ArchiveReference != nil {
+		t.Fatalf("pre-contract restore serves no recovery reference, got %+v", restored.ArchiveReference)
 	}
 	if restored.WorkareaRoot != sourceRoot || restored.WorkareaRoot == manifest.OriginalRoot {
 		t.Fatalf("restore trusted mutable OriginalRoot: restored=%q manifest=%q", restored.WorkareaRoot, manifest.OriginalRoot)

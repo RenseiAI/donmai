@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	"github.com/sigstore/sigstore-go/pkg/testing/ca"
+
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 const (
@@ -281,7 +283,7 @@ func TestUpdater_RunUpdate_SwapsWhenVerified(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	current := filepath.Join(t.TempDir(), "donmai-daemon")
-	if err := os.WriteFile(current, []byte("old-binary-content"), 0o755); err != nil { //nolint:gosec
+	if err := testexec.WriteFile(current, []byte("old-binary-content"), 0o755); err != nil { //nolint:gosec
 		t.Fatalf("write current binary: %v", err)
 	}
 

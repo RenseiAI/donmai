@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 )
 
@@ -186,7 +187,7 @@ func writeLinuxLiveHarness(t *testing.T, w linuxLiveWorld) string {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(dir, "fake-pi")
-	if err := os.WriteFile(bin, []byte(fakeLinuxHarnessScript), 0o755); err != nil { //nolint:gosec // G306: test fixture needs the exec bit.
+	if err := testexec.WriteFile(bin, []byte(fakeLinuxHarnessScript), 0o755); err != nil { //nolint:gosec // G306: test fixture needs the exec bit.
 		t.Fatal(err)
 	}
 	handshake := filepath.Join(dir, "handshake.jsonl")

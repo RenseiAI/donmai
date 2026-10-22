@@ -3,11 +3,71 @@ package linear
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// maxRetryJitterCap bounds the upward jitter added to a server-supplied
+// Retry-After delay, so an extreme header value cannot schedule an absurd
+// spread on top of an already long wait.
+const maxRetryJitterCap = 30 * time.Second
+
+// retryJitterIntn is the randomness seam behind Retry-After jitter. A
+// var so tests can pin both jitter bounds deterministically.
+var retryJitterIntn = rand.Int64N
+
+// retryJitterExtra returns the deterministic upper bound of the added jitter
+// for delay: half the delay, capped. Kept separate so the request-budget
+// check compares against the worst case without drawing.
+func retryJitterExtra(delay time.Duration) time.Duration {
+	extra := delay / 2
+	if extra > maxRetryJitterCap {
+		extra = maxRetryJitterCap
+	}
+	if extra < 0 {
+		return 0
+	}
+	return extra
+}
+
+// retryDelayUpperBound returns the worst-case sleep for a Retry-After delay:
+// the server value plus the full capped jitter spread, saturating instead
+// of overflowing on extreme header values.
+func retryDelayUpperBound(delay time.Duration) time.Duration {
+	extra := retryJitterExtra(delay)
+	if delay > time.Duration(math.MaxInt64-int64(extra)) {
+		return time.Duration(math.MaxInt64)
+	}
+	return delay + extra
+}
+
+// jitteredRetryDelay adds bounded upward jitter to a server-supplied
+// Retry-After delay: a sleep in [delay, delay + min(delay/2, cap)].
+// Retry-After is a minimum wait, so the sleep never lands before the
+// server's deadline — denied callers bursting together spread out after it
+// instead of waking in lock-step and stampeding the still-empty bucket. A
+// zero delay stays zero: a bare 429 with no guidance still fails fast
+// through the bounded attempt loop rather than sleeping.
+func jitteredRetryDelay(delay time.Duration) time.Duration {
+	extra := retryJitterExtra(delay)
+	if extra <= 0 {
+		return delay
+	}
+	// rand.Int64N(n) draws from [0, n): requesting extra+1 keeps the top of
+	// the window reachable so the full [delay, delay+extra] range is live.
+	draw := retryJitterIntn(int64(extra) + 1)
+	if draw < 0 {
+		draw = 0
+	}
+	if draw > int64(extra) {
+		draw = int64(extra)
+	}
+	return delay + time.Duration(draw) //nolint:gosec // G404: jitter, not crypto
+}
 
 // retryDenial retains the upstream error and retry guidance for CLI embedders.
 // ExitCode follows EX_TEMPFAIL, allowing callers to distinguish back-pressure

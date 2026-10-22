@@ -8,7 +8,61 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- `linear list-issues` defaults to the slim row (id, title, status, project, sortOrder, parent, labels) at page size 50, with `--fields a,b` and `--full` opting into more, and `linear get-issue` takes `--fields`. The output envelope echoes the effective field set. Retry-After backoff on rate-limited (429) and temporarily unavailable (503) responses now sleeps at least the server-supplied delay, plus bounded upward jitter, at most twice, before exiting with the preserved upstream error. `--full` and `--fields` cannot be combined.
+
+## v0.72.85 — 2026-10-22
+
+### Chores
+
+- Advance interactive step to stopped on pre-PTY failures
+- Pin invalid-byte replacement in TOML launch-string tests
+- Bundle the gated consumer with its carrier-installed latch
+- Pin isolated fixture for pi live-binary adaptation probes
+- Expose committed workarea archive identity to recovery clients
+- Scope session pattern kills to the session worktree and process group
+- Runner posts current-step status beacons to the session progress endpoint
+- Pin the agent-run wiring for the interactive Muse terminal mode
+- Export Go module cache to seats; record preparation time on the session result
+- Keep archive release retries and workarea restore idempotent
+
+## v0.72.84 — 2026-10-22
+
+### Chores
+
+- Fix ETXTBSY flakes from executing freshly written test fixtures
+- Session shim: a lineage held past the re-adoption window continues instead of withdrawing
+
+## v0.72.83 — 2026-10-21
+
+### Chores
+
+- Hold durable output batches on the adoption gate during re-adoption
+- Report the host CLI login check on the heartbeat quota field
+- Revert "Hold durable output batches on the adoption gate during re-adoption"
+- Interactive terminal mode for the Muse harness
+- Render stream progress as an in-place indicator, not lines
+- Hold durable output batches on carrier install during re-adoption
+- Pin role forwarding at every completion decision point
+- Target session backstop push-back at the configured repository
+- End option parsing before the positional PTY seed prompt
+- Report the serving provider and attempts per model call
+- Refuse gateway pi sessions with no configured context window
+- Harden keeper mirror store: poison refusal, credential-free argv, cross-process locks and leases
+- Linux seat refusal proof for pi harness under mount-namespace backend
+- Runner asks the platform for the provider by default
+- Advance interactive session lifecycle past spawning
+- Encode interactive launch strings as valid TOML basic strings
+- Provision live-binary adaptation probes for the pi harness
+- Render the tool lookup cache as an exact file allow
+- Harden restore ledger sidecars against symlink redirection
+- Print prompt refusal code, reason and next step instead of bare conflict
+- Runner defers failure-side tracker transition for retry-eligible attempts
+- Clamp dispatched budget durations through one shared helper
+- Cap proactive token-refresh waits and gate refresh on wall-clock expiry
+- Name the lock-refresh status in lost-ownership results; count step-heartbeat auth rejections
+- Tick the hanging-CLI heartbeat once before forking the helper
 
 ## v0.72.82 — 2026-10-19
 

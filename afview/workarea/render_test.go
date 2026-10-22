@@ -296,3 +296,62 @@ func TestRenderDiff_PlainFallbackHasNoANSI(t *testing.T) {
 		t.Errorf("plain diff contains ANSI escape sequences:\n%s", buf.String())
 	}
 }
+
+func TestRenderInspectV1_RendersReferenceAndNilSafe(t *testing.T) {
+	t.Parallel()
+	var out strings.Builder
+	if err := workarea.PlainInspectV1(&out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "No workarea record.") {
+		t.Fatalf("nil output = %q", out.String())
+	}
+	out.Reset()
+	wa := afclient.WorkareaV1{
+		ID: "wa-ref", Kind: afclient.WorkareaKindArchived, Status: afclient.WorkareaStatusArchived,
+		ArchiveReference: &afclient.ArchiveReference{
+			SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: "wa-ref",
+			ArchiveDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			SessionID:     "11111111-1111-4111-8111-111111111111", WorkareaID: "wa-ref",
+			TerminalResultID: "tr_11111111111111111111111111111111",
+			CommittedAt:      "2026-07-18T12:30:00.123456789Z",
+		},
+	}
+	if err := workarea.PlainInspectV1(&out, &wa); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"wa-ref", "sha256:bbbb", "tr_1111", "Archive reference:"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("inspect missing %q:\n%s", want, out.String())
+		}
+	}
+	out.Reset()
+	plain := afclient.WorkareaV1{ID: "wa-plain", Kind: afclient.WorkareaKindArchived, Status: afclient.WorkareaStatusArchived}
+	if err := workarea.PlainInspectV1(&out, &plain); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "Archive reference:") {
+		t.Errorf("reference-free archive must not render a reference:\n%s", out.String())
+	}
+}
+
+func TestRenderRestoreV1_SurfacesSourceReference(t *testing.T) {
+	t.Parallel()
+	var out strings.Builder
+	res := &afclient.WorkareaRestoreV1Result{Workarea: afclient.WorkareaV1{
+		ID: "wa-new", Kind: afclient.WorkareaKindActive, Status: afclient.WorkareaStatusReady,
+		ArchiveReference: &afclient.ArchiveReference{
+			SchemaVersion: afclient.ArchiveReferenceSchemaV1, ArchiveID: "wa-src",
+			ArchiveDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+			SessionID:     "11111111-1111-4111-8111-111111111111", WorkareaID: "wa-src",
+		},
+	}}
+	if err := workarea.PlainRestoreV1(&out, res); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Workarea restored", "wa-new", "wa-src", "sha256:cccc"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("restore missing %q:\n%s", want, out.String())
+		}
+	}
+}
