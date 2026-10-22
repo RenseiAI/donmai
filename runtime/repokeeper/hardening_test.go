@@ -1077,3 +1077,69 @@ func mustList(t *testing.T, store *Store) []MirrorEntry {
 	}
 	return entries
 }
+
+// TestReconcileKeepsRevocationTombstones pins the revocation-sticky
+// contract: a revoked row survives Reconcile even when its mirror
+// directory is gone (or was never created), persisted with zero bytes so
+// it never counts toward the budget, while a non-revoked stale row is
+// still dropped. It drives the production Ensure, RecordFetch,
+// MarkRevoked, Reconcile, and List entry points against real local git
+// repositories.
+func TestReconcileKeepsRevocationTombstones(t *testing.T) {
+	t.Parallel()
+	srcDir, _ := newSourceRepo(t)
+	otherSrc, _ := newSourceRepo(t)
+	store := newTestStore(t)
+
+	lease, err := store.Ensure(context.Background(), srcDir, "")
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	revokedDigest := lease.Digest()
+	revokedDir := lease.Dir()
+	lease.Release()
+
+	if err := store.RecordFetch(revokedDigest, time.Now(), 42, true); err != nil {
+		t.Fatalf("RecordFetch(revoked) error = %v", err)
+	}
+	preRevokedDigest, err := MirrorDigest(otherSrc, "")
+	if err != nil {
+		t.Fatalf("MirrorDigest() error = %v", err)
+	}
+	if err := store.MarkRevoked(preRevokedDigest, true); err != nil {
+		t.Fatalf("MarkRevoked() error = %v", err)
+	}
+
+	if err := os.RemoveAll(revokedDir); err != nil {
+		t.Fatalf("remove mirror dir: %v", err)
+	}
+
+	verified, _, err := store.Reconcile(nil)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	for _, entry := range verified {
+		if entry.Digest == revokedDigest || entry.Digest == preRevokedDigest {
+			t.Errorf("Reconcile served tombstone %q with no directory", entry.Digest)
+		}
+	}
+
+	rows := mustList(t, store)
+	byDigest := make(map[string]MirrorEntry, len(rows))
+	for _, entry := range rows {
+		byDigest[entry.Digest] = entry
+	}
+	for _, digest := range []string{revokedDigest, preRevokedDigest} {
+		entry, ok := byDigest[digest]
+		if !ok {
+			t.Errorf("revoked row %q dropped from disk by Reconcile, want tombstone", digest)
+			continue
+		}
+		if !entry.Revoked {
+			t.Errorf("row %q Revoked = false, want true", digest)
+		}
+		if entry.Bytes != 0 {
+			t.Errorf("tombstone %q Bytes = %d, want 0 so it never counts toward the budget", digest, entry.Bytes)
+		}
+	}
+}

@@ -807,6 +807,65 @@ func TestRepoKeeper_RevokedMirrorDegradesToPlainClone(t *testing.T) {
 	}
 }
 
+// TestRepoKeeper_RevokedTombstoneSurvivesReconcile drives the production
+// Acquire, RecordFetch, Reconcile, and Acquire entry points and proves a
+// revoked mirror stays degraded after its directory is removed and the
+// keeper reconciles: the tombstone survives on disk with zero bytes, so
+// the daemon never re-creates and serves the revoked mirror.
+func TestRepoKeeper_RevokedTombstoneSurvivesReconcile(t *testing.T) {
+	t.Parallel()
+
+	remote := newKeeperSourceRepo(t)
+	k := newKeeperForTest(t, RepoKeeperSettings{Enabled: true}, nil, nil)
+	dirLease, ok := k.Acquire(context.Background(), remote)
+	if !ok {
+		t.Fatal("Acquire degraded")
+	}
+	dir := dirLease.Dir()
+	digest := filepath.Base(dir)
+	dirLease.Release()
+	k.RecordFetch(digest, 42, time.Millisecond, true)
+
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove mirror dir: %v", err)
+	}
+	if err := k.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if !k.Ready() {
+		t.Fatal("Ready() = false after reconcile, want true")
+	}
+	if dir2Lease, ok := k.Acquire(context.Background(), remote); ok || dir2Lease != nil {
+		if dir2Lease != nil {
+			dir2Lease.Release()
+		}
+		t.Fatalf("revoked+dir-gone Acquire after Reconcile = (%v, %v), want (nil, false)", dir2Lease, ok)
+	}
+	if got := k.Stats().RevokedCount; got != 1 {
+		t.Errorf("RevokedCount = %d, want 1 (tombstone survives Reconcile)", got)
+	}
+	rows, err := k.store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.Digest != digest {
+			continue
+		}
+		found = true
+		if !row.Revoked {
+			t.Error("tombstone Revoked = false, want true")
+		}
+		if row.Bytes != 0 {
+			t.Errorf("tombstone Bytes = %d, want 0", row.Bytes)
+		}
+	}
+	if !found {
+		t.Errorf("tombstone %q dropped from disk by Reconcile", digest)
+	}
+}
+
 // TestRepoKeeper_UnreadableCatalogDegradesToPlainClone proves a corrupt
 // catalog degrades every Acquire: revocation state is unknown, so no
 // mirror is served until a fetch re-establishes state.

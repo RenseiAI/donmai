@@ -367,6 +367,11 @@ func (s *Store) Reconcile(candidates []ReconcileCandidate) (verified []MirrorEnt
 	if err != nil {
 		return nil, nil, err
 	}
+	// Revoked tombstones survive without a directory so revocation stays
+	// sticky across a daemon restart: a revoked row whose mirror is gone
+	// (or was never created) is kept on disk with zero bytes, never
+	// served, until the flag is explicitly cleared.
+	var tombstones []MirrorEntry
 	for _, entry := range entries {
 		if v, ok := byDigest[entry.Digest]; ok && v.verified {
 			verified = append(verified, entry)
@@ -374,10 +379,14 @@ func (s *Store) Reconcile(candidates []ReconcileCandidate) (verified []MirrorEnt
 		}
 		// A catalog row survives only when its directory is still a real
 		// directory on disk: anything else is a stale row for a mirror
-		// that is gone (or never was), and is dropped.
+		// that is gone (or never was), and is dropped — unless it is a
+		// revocation tombstone, which is kept with zero bytes.
 		dir := filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, entry.Digest)
 		if info, err := os.Lstat(dir); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 			verified = append(verified, entry)
+		} else if entry.Revoked {
+			entry.Bytes = 0
+			tombstones = append(tombstones, entry)
 		}
 	}
 	// Adopt verified candidate directories the catalog does not name.
@@ -397,11 +406,16 @@ func (s *Store) Reconcile(candidates []ReconcileCandidate) (verified []MirrorEnt
 		entry := MirrorEntry{Digest: digest, LastFetch: dirModTime(filepath.Join(s.stateDir, keeperDirName, mirrorsDirName, digest)), Bytes: numBytes}
 		verified = append(verified, entry)
 	}
-	// Persist the filtered serving set, not the pre-scan entries: rows
-	// whose directory is gone are dropped from disk, so their bytes stop
-	// counting toward the daemon's budget total and a later row at a
-	// recycled digest cannot inherit stale fetch or revocation state.
-	if err := writeCatalog(s.catalogPath(), verified); err != nil {
+	// Persist the filtered serving set plus the revocation tombstones, not
+	// the pre-scan entries: stale non-revoked rows whose directory is gone
+	// are dropped from disk, so their bytes stop counting toward the
+	// daemon's budget total and a later row at a recycled digest cannot
+	// inherit stale fetch state. Revocation stays sticky by construction:
+	// a recycled digest re-reads the tombstone and stays degraded until
+	// the flag is explicitly cleared.
+	persisted := verified
+	persisted = append(persisted, tombstones...)
+	if err := writeCatalog(s.catalogPath(), persisted); err != nil {
 		return nil, nil, err
 	}
 	return verified, unverified, nil
