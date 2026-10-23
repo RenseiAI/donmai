@@ -2,6 +2,7 @@ package google
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -125,5 +126,36 @@ func TestResolve_SubscriptionHostRejected(t *testing.T) {
 				t.Fatalf("Resolve(subscription host) returned binding = %+v, want zero", got)
 			}
 		})
+	}
+}
+
+// TestResolveEndpointProtocol_LegacyPath resolves one Google tuple through the
+// explicit helper. Google declares one protocol per host and does not opt in
+// to qualified rows, so the helper must use the legacy Manifest and Resolve
+// and return exactly the legacy binding; a protocol the host does not serve
+// refuses.
+func TestResolveEndpointProtocol_LegacyPath(t *testing.T) {
+	var provider agent.ModelEndpointProvider = New()
+	if _, optedIn := provider.(agent.ProtocolEndpointResolver); optedIn {
+		t.Fatal("google endpoint unexpectedly declares qualified protocol rows")
+	}
+	req := agent.EndpointRequest{
+		Model: "gemini-2.5-pro", Host: agent.HostVertex, Mechanism: agent.AuthServiceAccount, Auth: agent.AuthBYOK,
+		Region:      "us-central1",
+		EnvProvided: map[string]string{"GOOGLE_VERTEX_PROJECT_ID": "proj-123"},
+	}
+	legacy, err := provider.Resolve(context.Background(), req)
+	if err != nil {
+		t.Fatalf("legacy resolve: %v", err)
+	}
+	got, err := agent.ResolveEndpointProtocol(context.Background(), provider, req, agent.ProtoGeminiGenerate)
+	if err != nil {
+		t.Fatalf("explicit gemini-generate on vertex: %v", err)
+	}
+	if !reflect.DeepEqual(got, legacy) {
+		t.Fatalf("explicit binding differs from legacy:\n got=%+v\nwant=%+v", got, legacy)
+	}
+	if _, err := agent.ResolveEndpointProtocol(context.Background(), provider, req, agent.ProtoOpenAIChat); !errors.Is(err, agent.ErrEndpointProtocolUnsupported) {
+		t.Fatalf("openai-chat on vertex error = %v, want ErrEndpointProtocolUnsupported", err)
 	}
 }

@@ -2,6 +2,8 @@ package meta
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -127,5 +129,33 @@ func TestResolve_UnknownHost(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected error for unknown host, got nil")
+	}
+}
+
+// TestResolveEndpointProtocol_LegacyPath resolves a Meta tuple through the
+// explicit helper. Meta declares one protocol per host and does not opt in to
+// qualified rows, so the helper must use the legacy Manifest and Resolve and
+// return exactly the legacy binding; any other protocol refuses.
+func TestResolveEndpointProtocol_LegacyPath(t *testing.T) {
+	var provider agent.ModelEndpointProvider = New()
+	if _, optedIn := provider.(agent.ProtocolEndpointResolver); optedIn {
+		t.Fatal("meta endpoint unexpectedly declares qualified protocol rows")
+	}
+	req := agent.EndpointRequest{
+		Model: "muse-spark-1.3", Host: agent.HostOAuthCLI, Mechanism: agent.AuthCLISession, Auth: agent.AuthHostSession,
+	}
+	legacy, err := provider.Resolve(context.Background(), req)
+	if err != nil {
+		t.Fatalf("legacy resolve: %v", err)
+	}
+	got, err := agent.ResolveEndpointProtocol(context.Background(), provider, req, agent.ProtoMuseMSP)
+	if err != nil {
+		t.Fatalf("explicit muse-msp on oauth-cli: %v", err)
+	}
+	if !reflect.DeepEqual(got, legacy) {
+		t.Fatalf("explicit binding differs from legacy:\n got=%+v\nwant=%+v", got, legacy)
+	}
+	if _, err := agent.ResolveEndpointProtocol(context.Background(), provider, req, agent.ProtoOpenAIChat); !errors.Is(err, agent.ErrEndpointProtocolUnsupported) {
+		t.Fatalf("openai-chat on meta error = %v, want ErrEndpointProtocolUnsupported", err)
 	}
 }
