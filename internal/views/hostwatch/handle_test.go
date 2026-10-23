@@ -57,8 +57,9 @@ func newHandleTestModel(t *testing.T, fd *fakeDaemon, h HandleEnricher) *Model {
 }
 
 // TestModel_HandleEnricherPrefersHandle drives the real snapshot + tail
-// path: the handled card renders its handle as its identity and its stream
-// lines carry the handle prefix, while the other cards fall back.
+// path: the handled cards render their handles as their identity and its stream
+// lines carry the handle prefix, while the other cards fall back. Held rows
+// resolve handles through the same snapshot path.
 func TestModel_HandleEnricherPrefersHandle(t *testing.T) {
 	root := t.TempDir()
 	wtA := filepath.Join(root, "a")
@@ -72,10 +73,11 @@ func TestModel_HandleEnricherPrefersHandle(t *testing.T) {
 			{SessionID: "sess-handled-long-id-aaaa", State: "running", Repository: "o/a", WorktreePath: wtA, IssueIdentifier: "ENG-100"},
 			{SessionID: "sess-plain-long-id-bbbb", State: "running", Repository: "o/a", WorktreePath: wtB, IssueIdentifier: "ENG-200"},
 			{SessionID: "abcdef0123456789-long", State: "running", Repository: "o/a", WorktreePath: wtC},
+			{SessionID: "held-handled-long-id-dddd", State: "unknown", Repository: "o/a", IssueIdentifier: "ENG-300"},
 		},
 		status: &afclient.DaemonStatusResponse{MaxSessions: 8},
 	}
-	m := newHandleTestModel(t, fd, mapHandleEnricher{"sess-handled-long-id-aaaa": "ops-lead"})
+	m := newHandleTestModel(t, fd, mapHandleEnricher{"sess-handled-long-id-aaaa": "ops-lead", "held-handled-long-id-dddd": "held-lead"})
 
 	m.applySnapshot(m.src.Snapshot())
 
@@ -88,6 +90,9 @@ func TestModel_HandleEnricherPrefersHandle(t *testing.T) {
 	if got := findCard(m, "abcdef0123456789-long"); got == nil || got.displayID() != "abcdef01" {
 		t.Fatalf("bare card display = %v, want short id abcdef01", got)
 	}
+	if got := findCard(m, "held-handled-long-id-dddd"); got == nil || got.displayID() != "held-lead" {
+		t.Fatalf("held handled card display = %v, want held-lead", got)
+	}
 
 	// Card title and detail title follow the handle.
 	now := time.Date(2026, 6, 13, 14, 2, 11, 0, time.UTC)
@@ -98,6 +103,17 @@ func TestModel_HandleEnricherPrefersHandle(t *testing.T) {
 	}
 	if got := detailTitle(*handled, true, theme.DefaultTheme(), 80); !strings.Contains(got, "ops-lead") {
 		t.Errorf("detail title = %q, want ops-lead", got)
+	}
+	if held := findCard(m, "held-handled-long-id-dddd"); held == nil {
+		t.Fatal("held handled card missing from snapshot")
+	} else {
+		heldRows := cardText(*held, false, true, now, 80)
+		if !strings.Contains(heldRows[0], "held-lead") {
+			t.Errorf("held card first row = %q, want held-lead", heldRows[0])
+		}
+		if got := m.labels["held-handled-long-id-dddd"]; got != "held-lead" {
+			t.Errorf("held stream label = %q, want held-lead", got)
+		}
 	}
 
 	// Stream prefix follows the handle on the real tail path.
@@ -218,5 +234,56 @@ func TestDisplayID_PreferenceOrder(t *testing.T) {
 				t.Errorf("displayID = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestModel_HandleMapChangeUpdatesStreamPrefix pins that a handle arriving
+// between two index snapshots updates both the card identity and the merged
+// stream prefix on the real snapshot + tail path.
+func TestModel_HandleMapChangeUpdatesStreamPrefix(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, "s")
+	writeState(t, wt, state.State{SessionID: "sess-late-handle", StartedAt: 1})
+	fd := &fakeDaemon{
+		sessions: []afclient.DaemonSessionHandle{
+			{SessionID: "sess-late-handle", State: "running", Repository: "o/a", WorktreePath: wt, IssueIdentifier: "ENG-42"},
+		},
+		status: &afclient.DaemonStatusResponse{MaxSessions: 8},
+	}
+	handles := mapHandleEnricher{}
+	m := newHandleTestModel(t, fd, handles)
+
+	m.applySnapshot(m.src.Snapshot())
+	if got := findCard(m, "sess-late-handle"); got == nil || got.displayID() != "ENG-42" {
+		t.Fatalf("before fill display = %v, want ENG-42", got)
+	}
+	if got := m.labels["sess-late-handle"]; got != "ENG-42" {
+		t.Fatalf("before fill label = %q, want ENG-42", got)
+	}
+
+	handles["sess-late-handle"] = "late-lead"
+	m.applySnapshot(m.src.Snapshot())
+	if got := findCard(m, "sess-late-handle"); got == nil || got.displayID() != "late-lead" {
+		t.Fatalf("after fill display = %v, want late-lead", got)
+	}
+	if got := m.labels["sess-late-handle"]; got != "late-lead" {
+		t.Fatalf("after fill label = %q, want late-lead", got)
+	}
+
+	evPath := filepath.Join(wt, state.AgentDirName, "events.jsonl")
+	writeEvents(t, evPath, agent.ToolUseEvent{ToolName: "Bash", Input: map[string]any{"command": "go test"}})
+	drainTails(t, m)
+	lines := m.stream.View(120, 0)
+	found := false
+	for _, line := range lines {
+		if strings.Contains(line, "[late-lead]") {
+			found = true
+		}
+		if strings.Contains(line, "[ENG-42]") {
+			t.Errorf("stale fallback prefix survives handle fill: %q", line)
+		}
+	}
+	if !found {
+		t.Errorf("stream missing [late-lead] prefix after fill: %q", lines)
 	}
 }

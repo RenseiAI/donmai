@@ -36,7 +36,9 @@ const (
 // optional embedder-supplied hook: the handle is opaque text supplied
 // through the command context, never fetched over the network. A nil or
 // empty result means the session has no handle and the card falls back
-// to its issue identifier, then its short session id.
+// to its issue identifier, then its short session id. The hook may be
+// called concurrently with background updates filling the handle map, so
+// implementations must be safe for concurrent use.
 type HandleEnricher interface {
 	Handle(sessionID string) string
 }
@@ -53,9 +55,6 @@ func WithHandleEnricher(ctx context.Context, h HandleEnricher) context.Context {
 // HandleEnricherFrom returns the handle hook carried by ctx, or nil when
 // no hook was supplied. A nil hook leaves every existing render unchanged.
 func HandleEnricherFrom(ctx context.Context) HandleEnricher {
-	if ctx == nil {
-		return nil
-	}
 	h, _ := ctx.Value(handleEnricherKey{}).(HandleEnricher)
 	return h
 }
