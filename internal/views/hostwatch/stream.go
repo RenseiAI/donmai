@@ -3,6 +3,7 @@ package hostwatch
 import (
 	"fmt"
 	"image/color"
+	"strconv"
 	"strings"
 
 	"charm.land/lipgloss/v2"
@@ -139,6 +140,12 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 			return "", ""
 		}
 		return "thought", truncateRunes(collapseWS(txt), maxStreamSummary)
+	case agent.LlmCallEvent:
+		s := llmCallSummary(e)
+		if s == "" {
+			return "", ""
+		}
+		return string(agent.EventLlmCall), truncateRunes(collapseWS(s), maxStreamSummary)
 	case agent.ToolUseEvent:
 		return "tool_use", truncateRunes(toolUseSummary(e), maxStreamSummary)
 	case agent.ToolResultEvent:
@@ -153,6 +160,24 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 		return "tool_result", truncateRunes(collapseWS(name+" → "+status), maxStreamSummary)
 	case agent.ToolProgressEvent:
 		return "tool_progress", truncateRunes(fmt.Sprintf("%s (%.0fs)", e.ToolName, e.ElapsedSeconds), maxStreamSummary)
+	case agent.UsageEvent:
+		msg := strings.TrimSpace(e.Message)
+		if msg == "" {
+			return "", ""
+		}
+		return string(agent.EventUsage), truncateRunes(collapseWS(msg), maxStreamSummary)
+	case agent.ContextUsageEvent:
+		s := contextUsageSummary(e)
+		if s == "" {
+			return "", ""
+		}
+		return string(agent.EventContextUsage), truncateRunes(collapseWS(s), maxStreamSummary)
+	case agent.SubagentEvent:
+		s := subagentSummary(e)
+		if s == "" {
+			return "", ""
+		}
+		return string(agent.EventSubagent), truncateRunes(collapseWS(s), maxStreamSummary)
 	case agent.ResultEvent:
 		if e.Success {
 			return "result", "✓ completed"
@@ -227,6 +252,80 @@ func strArg(input map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(s)
+}
+
+// llmCallSummary renders one model call as a compact token/cost line:
+// the serving model, the input/output totals, the cached input share,
+// the observed price and the turn marker. A synthetic aggregate event
+// carries the rolled-up session total rather than a measured per-call
+// value, so it is marked (aggregate). The model is the native response
+// model when the call is provider-measured and reports one, else the
+// requested model. An event with no model, no tokens and no cost carries
+// no stream text and returns "" so no row prints.
+func llmCallSummary(e agent.LlmCallEvent) string {
+	model := ""
+	if !e.Synthetic && e.ResponseModel != "" {
+		model = e.ResponseModel
+	} else if e.Model != "" {
+		model = e.Model
+	}
+	if model == "" && e.InputTokens == 0 && e.OutputTokens == 0 &&
+		e.CachedInputTokens == 0 && e.ObservedCostUsd == nil {
+		return ""
+	}
+	var parts []string
+	if model != "" {
+		parts = append(parts, model)
+	}
+	if e.InputTokens > 0 || e.OutputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("in %d out %d", e.InputTokens, e.OutputTokens))
+	}
+	if e.CachedInputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("cached %d", e.CachedInputTokens))
+	}
+	if e.ObservedCostUsd != nil {
+		parts = append(parts, fmt.Sprintf("$%.4f", *e.ObservedCostUsd))
+	}
+	if e.TurnCompleted {
+		parts = append(parts, "turn")
+	}
+	if e.Synthetic {
+		parts = append(parts, "(aggregate)")
+	}
+	return collapseWS(strings.Join(parts, " "))
+}
+
+// contextUsageSummary renders a harness context notice as its kind plus
+// the reported measurements: the consumed window share and the input
+// total. Unknown measurements stay absent, never zero. An event with no
+// kind and no measurement carries no stream text and returns "".
+func contextUsageSummary(e agent.ContextUsageEvent) string {
+	var parts []string
+	if kind := string(e.NoticeKind); kind != "" {
+		parts = append(parts, kind)
+	}
+	if e.UsedPercent != nil {
+		parts = append(parts, strconv.FormatFloat(*e.UsedPercent, 'f', -1, 64)+"%")
+	}
+	if e.InputTokens != nil {
+		parts = append(parts, fmt.Sprintf("in %d", *e.InputTokens))
+	}
+	return collapseWS(strings.Join(parts, " "))
+}
+
+// subagentSummary renders a delegation lifecycle tick as the delegating
+// tool and its phase. Either half absent still prints the other; both
+// absent carries no stream text and returns "".
+func subagentSummary(e agent.SubagentEvent) string {
+	phase := string(e.Phase)
+	switch {
+	case e.ToolName != "" && phase != "":
+		return e.ToolName + " " + phase
+	case e.ToolName != "":
+		return e.ToolName
+	default:
+		return phase
+	}
 }
 
 // collapseWS collapses runs of whitespace (incl. newlines) to single

@@ -11,6 +11,10 @@ import (
 
 func at() time.Time { return time.Date(2026, 6, 13, 14, 2, 11, 0, time.UTC) }
 
+func f64p(v float64) *float64 { return &v }
+
+func i64p(v int64) *int64 { return &v }
+
 func TestFormatStreamLine_Plain(t *testing.T) {
 	tm := theme.DefaultTheme()
 	tests := []struct {
@@ -55,6 +59,84 @@ func TestFormatStreamLine_Plain(t *testing.T) {
 			ev:    agent.InitEvent{SessionID: "p"},
 			label: "ENG-1",
 			want:  "14:02:11 [ENG-1] init",
+		},
+		{
+			name:  "llm_call prefers response model",
+			ev:    agent.LlmCallEvent{Model: "requested", ResponseModel: "served", InputTokens: 100, OutputTokens: 50},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  served in 100 out 50",
+		},
+		{
+			name:  "llm_call falls back to requested model",
+			ev:    agent.LlmCallEvent{Model: "requested", InputTokens: 10, OutputTokens: 5},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  requested in 10 out 5",
+		},
+		{
+			name:  "llm_call cost present",
+			ev:    agent.LlmCallEvent{Model: "m", InputTokens: 1, OutputTokens: 2, ObservedCostUsd: f64p(0.5)},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  m in 1 out 2 $0.5000",
+		},
+		{
+			name:  "llm_call cost nil omits price",
+			ev:    agent.LlmCallEvent{Model: "m", InputTokens: 1, OutputTokens: 2},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  m in 1 out 2",
+		},
+		{
+			name:  "llm_call cached and turn",
+			ev:    agent.LlmCallEvent{Model: "m", InputTokens: 100, OutputTokens: 50, CachedInputTokens: 10, TurnCompleted: true},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  m in 100 out 50 cached 10 turn",
+		},
+		{
+			name:  "llm_call synthetic aggregate ignores response model",
+			ev:    agent.LlmCallEvent{Synthetic: true, Model: "requested", ResponseModel: "served", InputTokens: 10, OutputTokens: 5},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  requested in 10 out 5 (aggregate)",
+		},
+		{
+			name:  "llm_call synthetic cost and turn",
+			ev:    agent.LlmCallEvent{Synthetic: true, Model: "m", InputTokens: 1, OutputTokens: 2, ObservedCostUsd: f64p(0.01), TurnCompleted: true},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  m in 1 out 2 $0.0100 turn (aggregate)",
+		},
+		{
+			name:     "empty llm_call skipped",
+			ev:       agent.LlmCallEvent{},
+			label:    "ENG-1",
+			wantSkip: true,
+		},
+		{
+			name:  "context_usage threshold with measurements",
+			ev:    agent.ContextUsageEvent{NoticeKind: agent.ContextUsageThreshold, UsedPercent: f64p(62.5), InputTokens: i64p(125000)},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] context_usage  threshold 62.5% in 125000",
+		},
+		{
+			name:  "context_usage compaction marker alone",
+			ev:    agent.ContextUsageEvent{NoticeKind: agent.ContextUsageCompaction},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] context_usage  compaction",
+		},
+		{
+			name:  "usage message",
+			ev:    agent.UsageEvent{Message: "allowed_warning"},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] usage  allowed_warning",
+		},
+		{
+			name:     "empty usage skipped",
+			ev:       agent.UsageEvent{},
+			label:    "ENG-1",
+			wantSkip: true,
+		},
+		{
+			name:  "subagent completed",
+			ev:    agent.SubagentEvent{ToolName: "Task", Phase: agent.SubagentCompleted},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] subagent  Task completed",
 		},
 	}
 	for _, tc := range tests {
