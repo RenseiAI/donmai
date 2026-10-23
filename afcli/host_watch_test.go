@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/views/hostwatch"
 )
 
 func TestRepoSlugFromRemote(t *testing.T) {
@@ -193,6 +194,14 @@ func TestHostWatchPlainPipeRunsWithoutTTY(t *testing.T) {
 	if os.Getenv("DONMAI_TEST_HOST_WATCH_PIPE_CHILD") == "1" {
 		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 		defer cancel()
+		// Embedder seam: when the handle child flag is set, supply the
+		// display handle through the command context exactly as an
+		// embedder would via its PreRunE.
+		if os.Getenv("DONMAI_TEST_HOST_WATCH_HANDLE_CHILD") == "1" {
+			ctx = hostwatch.WithHandleEnricher(ctx, testHandleMap{
+				"watch-fixture-session-1234": "fixture-handle",
+			})
+		}
 		cmd := newHostWatchCmd()
 		args := []string{"--all", "--daemon-url", os.Getenv("DONMAI_TEST_HOST_WATCH_PIPE_URL")}
 		if os.Getenv("DONMAI_TEST_HOST_WATCH_EXPLICIT_PLAIN") == "1" {
@@ -291,6 +300,88 @@ func TestHostWatchPlainPipeRunsWithoutTTY(t *testing.T) {
 	for _, path := range []string{"/api/daemon/sessions", "/api/daemon/status", "/api/daemon/stats"} {
 		if requests[path] == 0 {
 			t.Errorf("real watch command did not read %s", path)
+		}
+	}
+}
+
+// testHandleMap is the test embedder handle hook: an opaque session id to
+// display-handle map with the Handle method the dashboard reads.
+type testHandleMap map[string]string
+
+func (m testHandleMap) Handle(sessionID string) string { return m[sessionID] }
+
+// TestHostWatchPlainPipeShowsHandleWhenEnriched drives the real command in
+// a child with a handle hook in the command context. The plain output
+// shows the handle where the issue identifier showed before; without the
+// hook (see TestHostWatchPlainPipeRunsWithoutTTY) it still shows FIX-77.
+func TestHostWatchPlainPipeShowsHandleWhenEnriched(t *testing.T) {
+	if os.Getenv("DONMAI_TEST_HOST_WATCH_PIPE_CHILD") == "1" {
+		t.Skip("child process runs the pipe fixture via TestHostWatchPlainPipeRunsWithoutTTY")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/daemon/sessions":
+			_, _ = w.Write([]byte(`[{"sessionId":"watch-fixture-session-1234","pid":42,"state":"running","projectName":"private-watch-project","repository":"https://github.com/example/watch-fixture-repo.git","harness":"claude-code","model":"fixture-model","workType":"development","issueIdentifier":"FIX-77"}]`))
+		case "/api/daemon/status":
+			_, _ = w.Write([]byte(`{"status":"running","version":"9.9.9-fixture","maxSessions":2,"uptimeSeconds":90}`))
+		case "/api/daemon/stats":
+			_, _ = w.Write([]byte(`{"queueDepth":1}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	root := t.TempDir()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.CreateTemp(root, "watch-handle-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.Open(os.DevNull)
+	if err != nil {
+		_ = output.Close()
+		t.Fatal(err)
+	}
+	env := []string{
+		"HOME=" + root, "TMPDIR=" + root, "PATH=" + os.Getenv("PATH"),
+		"TERM=dumb", "NO_COLOR=1", "GORACE=atexit_sleep_ms=0",
+		"DONMAI_TEST_HOST_WATCH_PIPE_CHILD=1",
+		"DONMAI_TEST_HOST_WATCH_PIPE_URL=" + server.URL,
+		"DONMAI_TEST_HOST_WATCH_HANDLE_CHILD=1",
+	}
+	process, err := os.StartProcess(binary, []string{binary, "-test.run=^TestHostWatchPlainPipeRunsWithoutTTY$"}, &os.ProcAttr{
+		Dir: root, Env: env, Files: []*os.File{input, output, output},
+	})
+	_ = input.Close()
+	_ = output.Close()
+	if err != nil {
+		t.Fatalf("start owned watch child: %v", err)
+	}
+	state, err := process.Wait()
+	raw, readErr := os.ReadFile(output.Name())
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if err != nil || !state.Success() {
+		t.Fatalf("owned watch child failed: state=%v err=%v output=%s", state, err, raw)
+	}
+	text := string(raw)
+	if strings.Contains(text, "\x1b") {
+		t.Errorf("piped plain output carries terminal escapes: %q", text)
+	}
+	if !strings.Contains(text, "fixture-handle") {
+		t.Errorf("enriched watch lost fixture-handle: %q", text)
+	}
+	if strings.Contains(text, "FIX-77") {
+		t.Errorf("enriched watch still shows the issue identifier where the handle belongs: %q", text)
+	}
+	for _, wanted := range []string{"watch-fixture-repo · development", "fixture-model", "9.9.9-fixture"} {
+		if !strings.Contains(text, wanted) {
+			t.Errorf("piped watch lost %q: %q", wanted, text)
 		}
 	}
 }
