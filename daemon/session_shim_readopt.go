@@ -43,6 +43,13 @@ const (
 	readoptionAttemptsSpent
 	// readoptionShutdown leaves the live lineage to final daemon release.
 	readoptionShutdown
+	// readoptionComposingReleased is internal only: the composing layer no
+	// longer holds this lineage (LineageLive answered false inside the
+	// attempt). The fixed-attempt hold maps it to readoptionAttemptsSpent
+	// while the shim stays observable; every other path maps it to
+	// readoptionLineageGone, so a decisive, recorded, or vanished LineageGone
+	// is never relabelled by a predicate that flips at the same time.
+	readoptionComposingReleased
 )
 
 // readoptSessionShimAfterControllerLoss re-adopts ONE live shim whose
@@ -211,6 +218,12 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 		}
 		disposition, done := d.readoptSessionShimAttempt(registry, cfg, id, lost, hello, attempt, policy.Attempts)
 		if done {
+			if disposition == readoptionComposingReleased {
+				// The composing layer let go inside the bounded run: the
+				// lineage withdraws the way a vanished shim would, not
+				// as a spent budget.
+				return readoptionLineageGone
+			}
 			return disposition
 		}
 	}
@@ -312,6 +325,12 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 		}
 		disposition, done := d.readoptSessionShimAttempt(registry, cfg, id, lost, hello, attempt, 0)
 		if done {
+			if disposition == readoptionComposingReleased {
+				// The composing layer let go inside the window: the
+				// window ends the way a vanished shim would, through
+				// the ordinary withdrawal.
+				return readoptionLineageGone
+			}
 			return disposition
 		}
 	}
@@ -356,13 +375,17 @@ func (d *Daemon) readoptSessionShimAttempt(
 		// The composing layer no longer holds this lineage. Retrying would
 		// re-adopt something nobody upstream wants, and every further keepalive
 		// would extend the clock of a harness that should be reaped on the
-		// ordinary deadline.
+		// ordinary deadline. The distinct disposition carries that reason out
+		// so the fixed-attempt hold can report the spent budget while every
+		// other path reports the ordinary withdrawal — without re-asking a
+		// predicate that may have flipped under a decisive, recorded, or
+		// vanished answer on the same attempt.
 		slog.Warn("session shim: the composing layer no longer holds this lineage; stopping re-adoption",
 			"session", id.String(), "attempt", attempt)
 		if d.shims.recoveryCtx.Err() != nil {
 			return readoptionShutdown, true
 		}
-		return readoptionLineageGone, true
+		return readoptionComposingReleased, true
 	}
 	if d.shims.recoveryCtx.Err() != nil {
 		return readoptionShutdown, true
@@ -537,16 +560,19 @@ func (d *Daemon) holdFixedAttemptsPastBudget(registry *sessionshim.Registry, cfg
 		}
 		disposition, done := d.readoptSessionShimAttempt(registry, cfg, id, lost, hello, attempt, 0)
 		if done {
-			if disposition == readoptionLineageGone &&
-				sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) &&
-				!d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
-				// The attempt withdrew the lineage because the composing
-				// layer let it go — not because the shim vanished and not
-				// on a decisive answer, both of which still withdraw as
-				// LineageGone — while the shim stayed observable. That is
-				// the hold ending under the ordinary bound outcome, so it
-				// reports the spent budget, the way the bounded run would.
-				return readoptionAttemptsSpent
+			if disposition == readoptionComposingReleased {
+				// The attempt carries its own reason: the composing layer
+				// let go. While the shim stays observable that is the
+				// hold ending under the ordinary bound outcome, so it
+				// reports the spent budget, the way the bounded run
+				// would. A decisive released answer, an expired
+				// credential, recorded conflicting evidence, or a
+				// vanished shim keeps its own LineageGone whatever a
+				// predicate re-asked afterwards would say.
+				if sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) {
+					return readoptionAttemptsSpent
+				}
+				return readoptionLineageGone
 			}
 			return disposition
 		}

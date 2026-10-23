@@ -572,17 +572,30 @@ func TestFixedHoldBackoffStaysCapped(t *testing.T) {
 
 // TestFixedHoldWithdrawsSpentBudgetWhenLineageLiveLetsGoMidHold pins the
 // attempt half of the let-go outcome: when the composing layer stops holding
-// the lineage mid-hold, the attempt's own liveness gate withdraws the lineage
-// while the shim stays observable, and the hold reports the spent budget
-// rather than the dead-shim detail. Only a vanished shim, a decisive answer,
-// or recorded conflicting evidence withdraws as LineageGone.
+// the lineage mid-hold, the attempt carries that reason out in its own
+// composing-released disposition, and the hold maps it to the spent budget
+// while the shim stays observable. A decisive released answer, an expired
+// credential, recorded conflicting evidence, or a vanished shim keeps its own
+// LineageGone whatever a predicate re-asked afterwards would say.
 func TestFixedHoldWithdrawsSpentBudgetWhenLineageLiveLetsGoMidHold(t *testing.T) {
 	t.Parallel()
-	releasedAfter := 500 * time.Millisecond
-	started := time.Now()
+	// Event-driven release, not wall-clock: the first four lineage
+	// observations see the lineage held (budgeted-attempt gate, hold-entry
+	// check, first hold-attempt gate, post-attempt hold check), and the fifth
+	// — the second hold attempt's gate, after the backoff sleep — sees it
+	// released. The budgeted attempt plus the first hold attempt both run
+	// their adoptions before the release lands, so the hold has armed. The
+	// virtual clock makes the hold backoff instant while the keepalive stays
+	// on its real ~20s interval, so no keepalive predicate call can consume
+	// an observation count mid-test.
+	var observations atomic.Int64
+	clock := newVirtualShimClock()
 	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
-		policy:      SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Second},
-		lineageLive: func(context.Context, sessionshim.Identity) bool { return time.Since(started) < releasedAfter },
+		policy: SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Second},
+		clock:  clock,
+		lineageLive: func(context.Context, sessionshim.Identity) bool {
+			return observations.Add(1) <= 4
+		},
 		heldPastWindow: func(context.Context, sessionshim.Identity) bool {
 			return true
 		},
@@ -591,12 +604,71 @@ func TestFixedHoldWithdrawsSpentBudgetWhenLineageLiveLetsGoMidHold(t *testing.T)
 	lost := f.lostEntry(t)
 
 	// The budget is spent while the lineage is held, so the hold arms; the
-	// release lands mid-hold, and the next attempt withdraws under the
-	// spent-budget outcome with the shim still observable.
+	// release lands on the second hold attempt's gate, which carries the
+	// composing-released reason out and withdraws under the spent-budget
+	// outcome with the shim still observable.
 	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionAttemptsSpent {
 		t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d) — letting go mid-hold is the bound ending, not a death", got, readoptionAttemptsSpent)
 	}
+	if adoptions, _ := f.snapshot(); adoptions < 2 {
+		t.Fatalf("durable adoption attempted %d times, want at least 2 — the hold must arm (budget plus one hold attempt) before the mid-hold release", adoptions)
+	}
 	if _, err := f.registry.GetTombstoneIncarnation(f.id, lost.shimID, lost.controller.Hello().ProcessEpoch); err == nil {
 		t.Fatal("a terminal tombstone exists for a lineage that was withdrawn only because the hold ended")
+	}
+}
+
+// TestFixedHoldDecisiveAnswerWithPredicateFlipStaysLineageGone pins the
+// reason-carried hold exit: when a decisive released answer (or an expired
+// credential) lands on the same attempt that the composing layer's predicate
+// flips, the hold still withdraws as LineageGone. The attempt carries the
+// decisive reason out in its own disposition, so the hold never re-asks a
+// predicate that flipped underneath the answer and relabels it as
+// AttemptsSpent ("the carrier never came back").
+func TestFixedHoldDecisiveAnswerWithPredicateFlipStaysLineageGone(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		join func(cause error) error
+	}{
+		{name: "released lineage", join: func(cause error) error {
+			return errors.Join(cause, ErrSessionShimLineageReleased)
+		}},
+		{name: "expired credential", join: func(cause error) error {
+			return errors.Join(cause, ErrSessionShimCredentialExpired)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var live atomic.Bool
+			live.Store(true)
+			var held atomic.Bool
+			held.Store(true)
+			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+				policy:         SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+				lineageLive:    func(context.Context, sessionshim.Identity) bool { return live.Load() },
+				heldPastWindow: func(context.Context, sessionshim.Identity) bool { return held.Load() },
+				adoption: func(_ context.Context, attempt int) error {
+					if attempt < 2 {
+						return errors.New("injected carrier outage: timeout")
+					}
+					// The decisive answer and the predicate flip land
+					// together: the budget is spent while held so the
+					// hold arms, then the first hold attempt answers
+					// decisively while the predicates flip underneath it.
+					live.Store(false)
+					held.Store(false)
+					return tc.join(errors.New("carrier refused"))
+				},
+			})
+			lost := f.lostEntry(t)
+
+			if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
+				t.Fatalf("disposition = %d, want readoptionLineageGone (%d) — a decisive answer stays a release even when the predicate flips with it", got, readoptionLineageGone)
+			}
+			if adoptions, _ := f.snapshot(); adoptions != 2 {
+				t.Fatalf("durable adoption attempted %d times, want 2 — the hold must arm on the silent budget attempt before the decisive hold attempt", adoptions)
+			}
+		})
 	}
 }
