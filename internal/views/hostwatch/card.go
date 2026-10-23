@@ -288,9 +288,14 @@ func (c SessionCard) modelText(budget int) string {
 	return model + tail
 }
 
-// displayID is the card's identifier: the issue identifier when known,
-// else a short session id.
+// displayID is the card's identifier: the display handle when present,
+// then the issue identifier when known, else a short session id. The
+// handle is untrusted embedder text: it renders only through cleanText
+// plus the caller's width truncation, like every other display value.
 func (c SessionCard) displayID() string {
+	if h := cleanText(c.Handle); h != "" {
+		return h
+	}
 	if id := cleanText(c.IssueIdentifier); id != "" {
 		return id
 	}

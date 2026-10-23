@@ -1,6 +1,7 @@
 package hostwatch
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -31,10 +32,44 @@ const (
 	maxEventsPerTailerTick = 16 * maxEventsPerPoll
 )
 
+// HandleEnricher maps a session id to its display handle. It is an
+// optional embedder-supplied hook: the handle is opaque text supplied
+// through the command context, never fetched over the network. A nil or
+// empty result means the session has no handle and the card falls back
+// to its issue identifier, then its short session id.
+type HandleEnricher interface {
+	Handle(sessionID string) string
+}
+
+// handleEnricherKey is the context key carrying the optional handle hook.
+type handleEnricherKey struct{}
+
+// WithHandleEnricher returns a context carrying the handle hook the
+// host-watch model reads for session display names.
+func WithHandleEnricher(ctx context.Context, h HandleEnricher) context.Context {
+	return context.WithValue(ctx, handleEnricherKey{}, h)
+}
+
+// HandleEnricherFrom returns the handle hook carried by ctx, or nil when
+// no hook was supplied. A nil hook leaves every existing render unchanged.
+func HandleEnricherFrom(ctx context.Context) HandleEnricher {
+	if ctx == nil {
+		return nil
+	}
+	h, _ := ctx.Value(handleEnricherKey{}).(HandleEnricher)
+	return h
+}
+
 // Options configures a hostwatch Model.
 type Options struct {
 	// Source is the local data layer (daemon index + state.json). Required.
 	Source *Source
+	// Handles optionally maps session ids to display handles. Nil allowed:
+	// without it every label renders exactly as before. When set, the
+	// model reads it once per card on every index snapshot (never per
+	// tail event), so an embedder may fill its map in the background and
+	// later polls pick the handle up.
+	Handles HandleEnricher
 	// Theme is the active theme; zero value uses theme.DefaultTheme().
 	Theme theme.Theme
 	// ProjectLabel is the header scope label (e.g. the project slug or repo).
@@ -355,6 +390,7 @@ func (m *Model) applySnapshot(snap Snapshot) {
 	m.snapErr = snap.Err
 	m.counters = snap.Counters
 	if snap.Err == nil {
+		enrichHandles(m.opts.Handles, snap.Cards)
 		kept := make(map[string]SessionCard, len(m.cards))
 		for _, c := range m.cards {
 			kept[c.SessionID] = c
@@ -385,6 +421,26 @@ func (m *Model) applySnapshot(snap Snapshot) {
 		m.cursor = 0
 	}
 	m.reconcileTailers()
+}
+
+// enrichHandles fills each card's display handle from the optional hook
+// once per index snapshot. It never runs on the tail path, so the call
+// count stays flat across tail ticks. Empty or whitespace-only results
+// clear the handle and fall back to the issue identifier.
+func enrichHandles(h HandleEnricher, cards []SessionCard) {
+	if h == nil {
+		for i := range cards {
+			cards[i].Handle = ""
+		}
+		return
+	}
+	for i := range cards {
+		if handle := h.Handle(cards[i].SessionID); strings.TrimSpace(handle) != "" {
+			cards[i].Handle = handle
+		} else {
+			cards[i].Handle = ""
+		}
+	}
 }
 
 // reconcileTailers starts a tailer for every scoped session that has a known

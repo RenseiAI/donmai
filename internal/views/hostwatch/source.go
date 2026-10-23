@@ -46,6 +46,11 @@ type SessionCard struct {
 	ProjectName         string
 	Repository          string
 
+	// Handle is the optional embedder-supplied display handle, filled by
+	// the model from Options.Handles once per index snapshot. Empty
+	// means the card falls back to its issue identifier.
+	Handle string
+
 	// From state.json (best-effort; zero values when unreadable).
 	IssueID          string
 	IssueIdentifier  string
