@@ -3,12 +3,15 @@ package codex
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/gateway"
 )
 
 const (
@@ -242,6 +245,12 @@ func removeAuthLink(path string) error {
 // silently spawning against the default endpoint. The model still travels
 // through thread/start (resolveModel); the provider id here only names the
 // block.
+//
+// A loopback binding (the worker-local gateway's own listener) carries its
+// per-session bearer under the gateway's bearer name; a remote binding keeps
+// the existing provider-key shape. The private provider block always reads
+// the projected key under codexGatewayEnvKey, so both shapes converge on one
+// child env name after projectGatewayKey.
 func gatewayBinding(spec agent.Spec) (baseURL, key string, ok bool, err error) {
 	ep := spec.Endpoint
 	if ep == nil || strings.TrimSpace(ep.BaseURL) == "" {
@@ -253,6 +262,20 @@ func gatewayBinding(spec agent.Spec) (baseURL, key string, ok bool, err error) {
 	if err := agent.ValidateEndpointBindingBaseURL(ep.BaseURL); err != nil {
 		return "", "", false, fmt.Errorf("codex: invalid endpoint base URL: %w", err)
 	}
+	baseURL = strings.TrimSpace(ep.BaseURL)
+	if isLoopbackGatewayBaseURL(baseURL) {
+		key = ""
+		if ep.Env != nil {
+			key = strings.TrimSpace(ep.Env[gateway.TokenEnvVar])
+		}
+		if key == "" && spec.Env != nil {
+			key = strings.TrimSpace(spec.Env[gateway.TokenEnvVar])
+		}
+		if key == "" {
+			return "", "", false, fmt.Errorf("codex: endpoint base URL requires a key on %s", gateway.TokenEnvVar)
+		}
+		return baseURL, key, true, nil
+	}
 	key = ""
 	if ep.Env != nil {
 		key = strings.TrimSpace(ep.Env[codexGatewayEnvKey])
@@ -263,7 +286,24 @@ func gatewayBinding(spec agent.Spec) (baseURL, key string, ok bool, err error) {
 	if key == "" {
 		return "", "", false, fmt.Errorf("codex: endpoint base URL requires a key on %s", codexGatewayEnvKey)
 	}
-	return strings.TrimSpace(ep.BaseURL), key, true, nil
+	return baseURL, key, true, nil
+}
+
+// isLoopbackGatewayBaseURL reports whether rawURL names this machine
+// (localhost or a loopback IP), the shape the worker-local gateway's own
+// listener always takes (http://127.0.0.1:<port>/v1). Remote bindings name a
+// non-loopback https host. The check mirrors pi's isLoopbackHTTPURL: scheme
+// must be http(s); the hostname decides, never the port or path.
+func isLoopbackGatewayBaseURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || !u.IsAbs() {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	hostname := u.Hostname()
+	return strings.EqualFold(hostname, "localhost") || net.ParseIP(hostname).IsLoopback()
 }
 
 // appendGatewayProviderBlock writes the neutral model-provider block into
