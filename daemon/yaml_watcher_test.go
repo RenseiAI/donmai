@@ -416,9 +416,10 @@ func TestOnYamlChanged_UpdatesProjects(t *testing.T) {
 
 // TestOnYamlChanged_AdoptsRotatedRegistrationToken pins the live-rotation
 // contract: when the config file carries a new registration token for the
-// same orchestrator, the watcher adopts it into the credential refresher
-// before the re-registration runs, so the reload presents the current
-// generation instead of the revoked boot-time one.
+// same orchestrator, the watcher proves it against the control plane and
+// adopts the proven generation into the credential refresher before the
+// re-registration runs, so the reload presents the current generation
+// instead of the revoked boot-time one.
 //
 // Against the pre-change code this test fails: nothing adopts the reloaded
 // token, so the registration request still carries the stale generation.
@@ -428,14 +429,31 @@ func TestOnYamlChanged_AdoptsRotatedRegistrationToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var mu sync.Mutex
-	var gotAuth []string
+	var proveAuth []string
+	var registerAuth []string
+	var registerReqs []RegisterRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			// The rotation's own prove round trip: honours the candidate
+			// generation without minting a new worker identity.
+			mu.Lock()
+			proveAuth = append(proveAuth, r.Header.Get("Authorization"))
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "rotated.jwt"})
+			return
+		}
 		if r.URL.Path != RegisterEndpoint {
 			http.NotFound(w, r)
 			return
 		}
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
 		mu.Lock()
-		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		registerAuth = append(registerAuth, r.Header.Get("Authorization"))
+		registerReqs = append(registerReqs, request)
 		mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_rotated", "runtimeToken": "rotated.jwt"})
@@ -469,12 +487,29 @@ func TestOnYamlChanged_AdoptsRotatedRegistrationToken(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(gotAuth) == 0 {
+	if len(proveAuth) == 0 {
+		t.Fatal("rotation made no prove request against the control plane")
+	}
+	for _, auth := range proveAuth {
+		if auth != "Bearer rsp_live_rotated" {
+			t.Errorf("prove request presented %q, want Bearer rsp_live_rotated", auth)
+		}
+	}
+	// The re-registration is recorded separately from the prove round trip:
+	// dropping the deferred project publish after a rotation (or publishing
+	// it before the proof, under the revoked generation) must fail here
+	// instead of hiding behind the prove request's bearer.
+	if len(registerReqs) == 0 {
 		t.Fatal("project enable with a rotated key made no registration request")
 	}
-	for _, auth := range gotAuth {
+	for _, auth := range registerAuth {
 		if auth != "Bearer rsp_live_rotated" {
 			t.Errorf("registration presented %q, want Bearer rsp_live_rotated — the reload used the revoked generation", auth)
+		}
+	}
+	for _, request := range registerReqs {
+		if !slices.Equal(request.ProjectIDs, []string{"alpha", "beta"}) {
+			t.Errorf("registered project IDs = %v, want alpha,beta — the staged declaration was not published with the proven generation", request.ProjectIDs)
 		}
 	}
 	if token, _ := credentials.Registration(); token != "rsp_live_rotated" {
@@ -486,10 +521,13 @@ func TestOnYamlChanged_AdoptsRotatedRegistrationToken(t *testing.T) {
 }
 
 // TestOnYamlChanged_PureTokenRotationReregisters pins that a rotation with no
-// accompanying project change still triggers a re-registration presenting the
-// new generation. Without this, a key-only file edit is swallowed by the
-// watcher's no-change early return and the daemon keeps the revoked key until
-// the next project edit or restart.
+// accompanying project change is proven and then presented: the watcher's
+// prove round trip re-presents the identity under the new generation, and the
+// re-registration presents it to the control plane. Without this, a key-only
+// file edit is swallowed by the watcher's no-change early return and the
+// daemon keeps the revoked key until the next project edit or restart. A
+// generation the control plane refuses is never adopted and triggers no
+// re-registration.
 func TestOnYamlChanged_PureTokenRotationReregisters(t *testing.T) {
 	t.Parallel()
 
@@ -497,6 +535,11 @@ func TestOnYamlChanged_PureTokenRotationReregisters(t *testing.T) {
 	defer cancel()
 	requests := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			// The rotation's own prove round trip.
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "rotated.jwt"})
+			return
+		}
 		if r.URL.Path != RegisterEndpoint {
 			http.NotFound(w, r)
 			return
@@ -565,6 +608,58 @@ func TestOnYamlChanged_RefusesTokenForADifferentOrchestrator(t *testing.T) {
 	}
 	if d.config.Orchestrator.AuthToken != "rsp_live_before" {
 		t.Errorf("stored config token = %q, want the previous generation kept", d.config.Orchestrator.AuthToken)
+	}
+}
+
+// TestOnYamlChanged_RehomeMakesNoProveRequest pins the re-home URL guard
+// with a live recording server: the running registration points at the
+// test server and the filed config names a different orchestrator URL with
+// a valid-shape token. The candidate must be refused by the URL check
+// before any round trip, so zero prove requests reach the running server
+// and the previous generation stays. Without the guard the watcher would
+// prove (and adopt) the foreign-plane token against the running plane.
+func TestOnYamlChanged_RehomeMakesNoProveRequest(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	proveRequests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		proveRequests++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	// #nosec G101 -- test fixture token
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			Orchestrator: OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_before"},
+		},
+		credentials: credentials,
+	}
+	d.onYamlChanged(&Config{
+		// #nosec G101 -- test fixture token
+		Orchestrator: OrchestratorConfig{URL: "https://elsewhere.example.test", AuthToken: "rsp_live_foreign"},
+	})
+	if token, _ := credentials.Registration(); token != "rsp_live_before" {
+		t.Errorf("refresher token = %q, want the previous generation kept", token)
+	}
+	if d.config.Orchestrator.AuthToken != "rsp_live_before" {
+		t.Errorf("stored config token = %q, want the previous generation kept", d.config.Orchestrator.AuthToken)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if proveRequests != 0 {
+		t.Errorf("re-home attempt made %d prove request(s) against the running plane; want none", proveRequests)
 	}
 }
 
@@ -711,5 +806,334 @@ func TestOnYamlChanged_RefusedTokenLeavesRegistrationUntouched(t *testing.T) {
 				t.Errorf("worker id = %q, want the running identity kept", workerID)
 			}
 		})
+	}
+}
+
+// TestOnYamlChanged_ControlPlaneRefusalMakesNoRegistrationRequest pins that a
+// rotation the control plane refuses (401 on the prove round trip) is a full
+// no-op for the registration half: with a live reload context set, the
+// refresher and the filed pointer keep the previous generation, the lanes
+// keep the running credentials, and no re-registration runs. Re-registering
+// anyway would mint a fresh worker identity on every later write of the same
+// refused file.
+func TestOnYamlChanged_ControlPlaneRefusalMakesNoRegistrationRequest(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	registerCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			if r.Header.Get("Authorization") == "Bearer rsp_live_rejected" {
+				http.Error(w, `{"error":"unknown registration"}`, http.StatusUnauthorized)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+			return
+		}
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		registerCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_churned", "runtimeToken": "churned.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	// #nosec G101 -- test fixture token
+	opts.Registration.RegistrationToken = "rsp_live_before"
+	credentials := NewCredentialRefresher(opts)
+	lane := &recordingLane{}
+	credentials.Attach(lane)
+	d := &Daemon{
+		config: &Config{
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			EnabledProjectIDs:       []string{"alpha"},
+			Orchestrator:            OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_before"},
+		},
+		credentials:           credentials,
+		registrationReloadCtx: ctx,
+	}
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha"},
+		// #nosec G101 -- test fixture token
+		Orchestrator: OrchestratorConfig{URL: srv.URL, AuthToken: "rsp_live_rejected"},
+	})
+	if err := credentials.WaitReregister(ctx); err != nil {
+		t.Fatalf("wait for reload registration: %v", err)
+	}
+	if token, _ := credentials.Registration(); token != "rsp_live_before" {
+		t.Errorf("refresher token = %q, want the previous generation kept", token)
+	}
+	if d.config.Orchestrator.AuthToken != "rsp_live_before" {
+		t.Errorf("stored config token = %q, want the previous generation kept", d.config.Orchestrator.AuthToken)
+	}
+	if id, jwt, _ := lane.current(); id != "wkr_before" || jwt != "before.jwt" {
+		t.Errorf("lane = (%q, %q), want the running credentials kept", id, jwt)
+	}
+	if workerID, _ := credentials.Current(); workerID != "wkr_before" {
+		t.Errorf("worker id = %q, want the running identity kept", workerID)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if registerCount != 0 {
+		t.Errorf("refused rotation made %d registration request(s), want none", registerCount)
+	}
+}
+
+// watcherRotationHarness serves the prove round trip for back-to-back
+// rotation tests: the first T1 prove blocks until release, every other
+// candidate bearer is honoured, and every registration request is recorded.
+type watcherRotationHarness struct {
+	t            *testing.T
+	srv          *httptest.Server
+	entered      chan struct{}
+	release      chan struct{}
+	enterOnce    sync.Once
+	mu           sync.Mutex
+	registerAuth []string
+	registerReqs []RegisterRequest
+}
+
+func newWatcherRotationHarness(t *testing.T, blockedBearer string) *watcherRotationHarness {
+	t.Helper()
+	h := &watcherRotationHarness{
+		t:       t,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/refresh-token") {
+			auth := r.Header.Get("Authorization")
+			if auth == blockedBearer {
+				h.enterOnce.Do(func() { close(h.entered) })
+				select {
+				case <-h.release:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+			return
+		}
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		h.mu.Lock()
+		h.registerAuth = append(h.registerAuth, r.Header.Get("Authorization"))
+		h.registerReqs = append(h.registerReqs, request)
+		h.mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_before", "runtimeToken": "refreshed.jwt"})
+	}))
+	t.Cleanup(h.srv.Close)
+	t.Cleanup(func() {
+		select {
+		case <-h.release:
+		default:
+			close(h.release)
+		}
+	})
+	return h
+}
+
+func (h *watcherRotationHarness) watchedDaemon(ctx context.Context, t *testing.T, filedToken string) *Daemon {
+	t.Helper()
+	opts := testRefresherOptions(t, h.srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	// #nosec G101 -- test fixture token
+	opts.Registration.RegistrationToken = filedToken
+	return &Daemon{
+		config: &Config{
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			EnabledProjectIDs:       []string{"alpha"},
+			// #nosec G101 -- test fixture token
+			Orchestrator: OrchestratorConfig{URL: h.srv.URL, AuthToken: filedToken},
+		},
+		credentials:           NewCredentialRefresher(opts),
+		registrationReloadCtx: ctx,
+	}
+}
+
+func (h *watcherRotationHarness) rotationCfg(nextToken string) *Config {
+	h.t.Helper()
+	return &Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha"},
+		// #nosec G101 -- test fixture tokens
+		Orchestrator: OrchestratorConfig{URL: h.srv.URL, AuthToken: nextToken},
+	}
+}
+
+func (h *watcherRotationHarness) filedToken(d *Daemon) string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.config.Orchestrator.AuthToken
+}
+
+// TestOnYamlChanged_ConcurrentReloadsSerialize pins that whole reloads
+// serialize across the prove round trip. Two rows drive it:
+//
+//   - back to back: a second write landing inside the first rotation's prove
+//     waits for the first rotation to commit, then validates and proves
+//     against the committed state, so the filed pointer and the refresher
+//     converge on the newest generation. Without the serialization both
+//     validate against the pre-flight generation and the older commit wins
+//     the filed pointer while the refresher holds the newer one.
+//   - revert in flight: a revert landing while a rotation is proving waits
+//     for the in-flight rotation to commit, then validates the filed value
+//     against the committed state and rotates back, so the daemon ends on
+//     the generation the file names. Without the serialization the revert
+//     sees no change against the pre-flight filed pointer and returns early,
+//     stranding the daemon on a generation the file no longer names.
+func TestOnYamlChanged_ConcurrentReloadsSerialize(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		secondToken string
+		wantFinal   string
+	}{
+		{
+			name:        "back to back rotations converge on the newest generation",
+			secondToken: "rsp_live_t2",
+			wantFinal:   "rsp_live_t2",
+		},
+		{
+			name:        "revert during rotation is not lost",
+			secondToken: "rsp_live_t0",
+			wantFinal:   "rsp_live_t0",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			// #nosec G101 -- test fixture tokens
+			h := newWatcherRotationHarness(t, "Bearer rsp_live_t1")
+			d := h.watchedDaemon(ctx, t, "rsp_live_t0")
+
+			firstDone := make(chan struct{})
+			go func() {
+				defer close(firstDone)
+				d.onYamlChanged(h.rotationCfg("rsp_live_t1"))
+			}()
+			select {
+			case <-h.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first rotation did not reach the wire")
+			}
+			secondDone := make(chan struct{})
+			go func() {
+				defer close(secondDone)
+				d.onYamlChanged(h.rotationCfg(tc.secondToken))
+			}()
+			// Give the second reload a chance to (incorrectly) validate
+			// against the pre-flight generation before the first rotation
+			// commits.
+			time.Sleep(200 * time.Millisecond)
+			close(h.release)
+			select {
+			case <-firstDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("first reload did not return")
+			}
+			select {
+			case <-secondDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("second reload did not return")
+			}
+			if err := d.credentials.WaitReregister(ctx); err != nil {
+				t.Fatalf("reload registrations: %v", err)
+			}
+			if token, _ := d.credentials.Registration(); token != tc.wantFinal {
+				t.Errorf("refresher holds %q, want %q", token, tc.wantFinal)
+			}
+			if filed := h.filedToken(d); filed != tc.wantFinal {
+				t.Errorf("filed token = %q, want %q — the reloads did not serialize", filed, tc.wantFinal)
+			}
+		})
+	}
+}
+
+// TestOnYamlChanged_NoRegistrationBeforeProof pins that the staged project
+// declaration is published only after the rotation proves: while the prove
+// round trip is in flight, no registration request reaches the wire, and the
+// one that follows presents the proven generation with the staged project
+// IDs. Publishing before the proof would present the revoked generation to
+// the control plane.
+func TestOnYamlChanged_NoRegistrationBeforeProof(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// #nosec G101 -- test fixture tokens
+	h := newWatcherRotationHarness(t, "Bearer rsp_live_rotated")
+	d := h.watchedDaemon(ctx, t, "rsp_live_t0")
+
+	// A project enable riding with the rotated key, the shape a project
+	// enable writes.
+	next := h.rotationCfg("rsp_live_rotated")
+	next.EnabledProjectIDs = []string{"alpha", "beta"}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.onYamlChanged(next)
+	}()
+	select {
+	case <-h.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not reach the wire")
+	}
+	// Give an early (pre-proof) publish a chance to (incorrectly) reach the
+	// wire while the prove is still blocked.
+	time.Sleep(200 * time.Millisecond)
+	h.mu.Lock()
+	early := len(h.registerAuth)
+	h.mu.Unlock()
+	if early != 0 {
+		t.Fatalf("registration published before the proof (%d request(s)) — the reload presented the revoked generation", early)
+	}
+	close(h.release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reload did not return")
+	}
+	if err := d.credentials.WaitReregister(ctx); err != nil {
+		t.Fatalf("reload registrations: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Exactly one registration: the proven rotation publishes the staged
+	// declaration once. A publish ahead of the proof queues a second forced
+	// re-registration (and can race the rotation for the old generation).
+	if got := len(h.registerReqs); got != 1 {
+		t.Fatalf("proven rotation with a project enable made %d registration request(s), want exactly 1", got)
+	}
+	for _, auth := range h.registerAuth {
+		if auth != "Bearer rsp_live_rotated" {
+			t.Errorf("registration presented %q, want Bearer rsp_live_rotated", auth)
+		}
+	}
+	for _, request := range h.registerReqs {
+		if !slices.Equal(request.ProjectIDs, []string{"alpha", "beta"}) {
+			t.Errorf("registered project IDs = %v, want alpha,beta", request.ProjectIDs)
+		}
 	}
 }
