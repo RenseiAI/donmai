@@ -236,6 +236,45 @@ func TestDecodeResponsesRequest_RefusesFormatlessCustom(t *testing.T) {
 	}
 }
 
+// TestDecodeResponsesRequest_RefusesEmptyNamespace pins that a namespace
+// tool with a name but no nested tools is refused: an empty grouping must
+// never enter the IR silently.
+func TestDecodeResponsesRequest_RefusesEmptyNamespace(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing_tools": `{"model":"m","input":"hi","tools":[{"type":"namespace","name":"n"}]}`,
+		"empty_tools":   `{"model":"m","input":"hi","tools":[{"type":"namespace","name":"n","tools":[]}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := DecodeResponsesRequest([]byte(body))
+			if err == nil {
+				t.Fatalf("DecodeResponsesRequest(%s) = nil error, want refusal", name)
+			}
+		})
+	}
+}
+
+// TestDecodeResponsesRequest_RefusesNamelessFunction pins that a function
+// tool without its name is refused: follow-ups and tool contracts route by
+// name, so an empty name must never enter the IR silently.
+func TestDecodeResponsesRequest_RefusesNamelessFunction(t *testing.T) {
+	body := `{"model":"m","input":"hi","tools":[{"type":"function","parameters":{"type":"object"}}]}`
+	_, err := DecodeResponsesRequest([]byte(body))
+	if err == nil {
+		t.Fatalf("DecodeResponsesRequest(nameless function) = nil error, want refusal")
+	}
+}
+
+// TestDecodeResponsesRequest_RefusesNamelessCustom pins that a custom tool
+// without its name is refused: an empty name must never enter the IR
+// silently.
+func TestDecodeResponsesRequest_RefusesNamelessCustom(t *testing.T) {
+	body := `{"model":"m","input":"hi","tools":[{"type":"custom","format":{"type":"grammar","syntax":"lark","definition":"start: \"patch\""}}]}`
+	_, err := DecodeResponsesRequest([]byte(body))
+	if err == nil {
+		t.Fatalf("DecodeResponsesRequest(nameless custom) = nil error, want refusal")
+	}
+}
+
 // TestDecodeResponsesRequest_FunctionToolsUnchanged pins that function tools
 // behave as before: strict/defer_loading (which Codex sends) are accepted and
 // the IR carries the function as before.
