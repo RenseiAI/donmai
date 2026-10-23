@@ -414,6 +414,26 @@ func TestGatewayResponsesRefusedBilledTurnIsMetered(t *testing.T) {
 			`{"type":"response.created","response":{"id":"r","top_logprobs":0}}`,
 			`{"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"m","delta":"hi"}`,
 			`{"type":"response.completed","response":{"id":"r","top_logprobs":0,"usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 1},
+		// A malformed creation names no response: nothing is bound, nothing
+		// is metered, and the reader does not crash.
+		{"native_stream_creation_without_response", true, true, nativeStream(
+			`{"type":"response.created"}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 0},
+		{"native_stream_creation_null_response", true, true, nativeStream(
+			`{"type":"response.created","response":null}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 0},
+		// A refused second creation never rebinds the response already open.
+		{"native_stream_refused_second_creation_other_terminal", true, true, nativeStream(
+			`{"type":"response.created","response":{"id":"r"}}`,
+			`{"type":"response.created","response":{"id":"x","top_logprobs":0}}`,
+			`{"type":"response.completed","response":{"id":"x","usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 0},
+		{"native_stream_refused_second_creation_own_terminal", true, true, nativeStream(
+			`{"type":"response.created","response":{"id":"r"}}`,
+			`{"type":"response.created","response":{"id":"x","top_logprobs":0}}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 1},
+		// Only a creation binds: a refused terminal with no creation opens nothing.
+		{"native_stream_refused_terminal_without_creation", true, true, nativeStream(
+			`{"type":"response.completed","response":{"id":"r","top_logprobs":0,"usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 0},
 		// The finish was accepted; the usage chunk that bills it is refused.
 		{"chat_stream_finish_then_refused_usage", false, true, realChatChunk(`{"role":"assistant","content":"done"}`, "null") + realChatChunk(`{}`, "stop") +
 			`data: {"choices":[],` + strings.Replace(realChatUsage, `"total_tokens":29,`, `"total_tokens":29,"cost":"0.1",`, 1) + `}` + "\n\n" + "data: [DONE]\n\n", 1},
@@ -507,8 +527,8 @@ func TestGatewayResponsesNativeIncompleteIsServedAndMetered(t *testing.T) {
 
 // TestGatewayResponsesRefusedDrainStopsOnClientCancel refuses a stream and
 // then lets the upstream run on: when the client gives up, the upstream
-// request is cancelled, no stream reader is left draining, and the turn that
-// never finished is not metered.
+// request is cancelled, every goroutine the exchange started is gone, and the
+// turn that never finished is not metered.
 func TestGatewayResponsesRefusedDrainStopsOnClientCancel(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -520,6 +540,7 @@ func TestGatewayResponsesRefusedDrainStopsOnClientCancel(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hungUp := make(chan struct{})
+			draining := make(chan struct{})
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer close(hungUp)
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -528,7 +549,10 @@ func TestGatewayResponsesRefusedDrainStopsOnClientCancel(t *testing.T) {
 				tick := time.NewTicker(10 * time.Millisecond)
 				defer tick.Stop()
 				giveUp := time.After(5 * time.Second) // bounds the fixture if the reader never stops
-				for {
+				for sent := 0; ; sent++ {
+					if sent == 5 {
+						close(draining) // the refusal happened; the reader is draining now
+					}
 					select {
 					case <-r.Context().Done():
 						return
@@ -546,6 +570,7 @@ func TestGatewayResponsesRefusedDrainStopsOnClientCancel(t *testing.T) {
 			sink := &costfeed.MemorySink{}
 			g := startGateway(t, sink)
 			b := bindResponses(t, g, "drain-cancel", "key", ts.URL, tc.native)
+			baseline := settledGoroutines(0)
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 			defer cancel()
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.BaseURL+"/responses", strings.NewReader(`{"model":"fixture-model",`+userInput+`,"stream":true}`))
@@ -553,27 +578,60 @@ func TestGatewayResponsesRefusedDrainStopsOnClientCancel(t *testing.T) {
 				t.Fatal(err)
 			}
 			req.Header.Set("Authorization", "Bearer "+b.Env[gateway.TokenEnvVar])
-			if resp, err := http.DefaultClient.Do(req); err == nil {
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if resp, err := http.DefaultClient.Do(req); err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+				}
+			}()
+			select {
+			case <-draining:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the upstream never started streaming")
 			}
+			// Self-check: while it drains, the reader is visible to both probes,
+			// so neither can pass by never seeing a reader at all.
+			if readers := streamReaders(); readers == 0 {
+				t.Fatal("no stream reader frame found while the refused stream drains")
+			}
+			if during := runtime.NumGoroutine(); during <= baseline {
+				t.Fatalf("goroutines during the drain = %d, want above the baseline %d", during, baseline)
+			}
+			<-done
 			select {
 			case <-hungUp:
 			case <-time.After(3 * time.Second):
 				t.Fatal("the upstream request outlived the client")
 			}
-			deadline := time.Now().Add(2 * time.Second)
-			for readers := streamReaders(); readers != 0; readers = streamReaders() {
-				if time.Now().After(deadline) {
-					t.Fatalf("%d stream reader frames still running after the client left", readers)
-				}
-				time.Sleep(10 * time.Millisecond)
+			if left := settledGoroutines(baseline); left > baseline {
+				t.Fatalf("%d goroutines left after the client left, baseline %d", left, baseline)
+			}
+			if readers := streamReaders(); readers != 0 {
+				t.Fatalf("%d stream reader frames still running after the client left", readers)
 			}
 			if rows := sink.Events(); len(rows) != 0 {
 				t.Fatalf("an unfinished cancelled turn was metered %+v", rows)
 			}
 		})
 	}
+}
+
+// settledGoroutines waits up to two seconds for the goroutine count to fall
+// to target (0 waits for it to stop changing) and returns the last count.
+func settledGoroutines(target int) int {
+	deadline := time.Now().Add(2 * time.Second)
+	last := runtime.NumGoroutine()
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		n := runtime.NumGoroutine()
+		if target > 0 && n <= target || target == 0 && n == last {
+			return n
+		}
+		last = n
+	}
+	return last
 }
 
 // streamReaders counts stack frames of live upstream stream readers.

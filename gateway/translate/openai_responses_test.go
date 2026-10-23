@@ -958,3 +958,20 @@ func TestResponsesNestingDepthBounded(t *testing.T) {
 		t.Fatal("a schema past the nesting bound was accepted")
 	}
 }
+
+// TestResponsesCreatedIDReadsOnlyACreation pins the lenient creation read: it
+// names the response only for a response.created event that carries one.
+func TestResponsesCreatedIDReadsOnlyACreation(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"type":"response.created","response":{"id":"r","top_logprobs":0}}`: "r",
+		`{"type":"response.created"}`:                                        "",
+		`{"type":"response.created","response":null}`:                        "",
+		`{"type":"response.completed","response":{"id":"r"}}`:                "",
+		`{"type":"response.in_progress","response":{"id":"r"}}`:              "",
+		`{bad}`: "",
+	} {
+		if got := ResponsesCreatedID([]byte(body)); got != want {
+			t.Errorf("ResponsesCreatedID(%s) = %q, want %q", body, got, want)
+		}
+	}
+}
