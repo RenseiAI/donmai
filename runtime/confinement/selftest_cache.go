@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -325,7 +327,10 @@ type provenSelfTestFile struct {
 // written on every completed self-test and every Check failure) supersedes
 // the per-record files: when it is present, only it is evidence — a failing,
 // degraded, stale or future-stamped latest reports no evidence even where an
-// older passing proven file remains. Anything else — no file, an undecodable
+// older passing proven file remains, and so does a latest file that exists
+// but cannot be read or decoded, or carries a version this binary does not
+// read. Only a missing latest file falls back to the per-record scan (records
+// that predate it). Anything else — no file, an undecodable
 // shape, a version the binary does not read, a degraded or failing
 // record, a digest that no longer covers it, a record older than the
 // proven window or stamped in the future — is no evidence, so the status
@@ -352,23 +357,35 @@ func LatestProvenRecordIn(dir string) (SelfTestRecord, bool) {
 		return SelfTestRecord{}, false
 	}
 	now := time.Now()
-	if raw, err := os.ReadFile(filepath.Join(dir, latestSelfTestFileName)); err == nil { //nolint:gosec // G304: the latest file name is a constant in the proven-record directory.
-		var file provenSelfTestFile
-		if err := json.Unmarshal(raw, &file); err == nil && file.Version == provenSelfTestFileVersion {
-			record := file.Record
-			if record.Passed && record.Degraded == "" && len(record.SessionModes) != 0 &&
-				record.Digest != "" && record.computeDigest() == record.Digest &&
-				!record.TestedAt.After(now.Add(time.Minute)) && now.Sub(record.TestedAt) < provenRecordTTL {
-				return record, true
-			}
-			// A present, decodable latest outcome that is not a passing,
-			// whole, fresh record supersedes any older proven file: the
-			// newest outcome on this host is a failure (or a stale or
-			// future-stamped pass), so there is no evidence to attest from.
-			return SelfTestRecord{}, false
-		}
+	raw, err := os.ReadFile(filepath.Join(dir, latestSelfTestFileName)) //nolint:gosec // G304: the latest file name is a constant in the proven-record directory.
+	if errors.Is(err, fs.ErrNotExist) {
+		// No latest outcome was ever recorded here (records that predate
+		// the latest-outcome file): the per-record scan is the evidence.
+		return latestProvenScan(dir, now)
 	}
-	return latestProvenScan(dir, now)
+	if err != nil {
+		// The newest outcome exists but cannot be read: it may be the
+		// failure that supersedes every older pass, so there is no
+		// evidence to attest from. Never fall back to an older record.
+		return SelfTestRecord{}, false
+	}
+	var file provenSelfTestFile
+	if err := json.Unmarshal(raw, &file); err != nil || file.Version != provenSelfTestFileVersion {
+		// An undecodable latest outcome, or one in a shape this binary does
+		// not read, is no evidence either: it supersedes the older files.
+		return SelfTestRecord{}, false
+	}
+	record := file.Record
+	if record.Passed && record.Degraded == "" && len(record.SessionModes) != 0 &&
+		record.Digest != "" && record.computeDigest() == record.Digest &&
+		!record.TestedAt.After(now.Add(time.Minute)) && now.Sub(record.TestedAt) < provenRecordTTL {
+		return record, true
+	}
+	// A present latest outcome that is not a passing, whole, intact, fresh
+	// record supersedes any older proven file: the newest outcome on this
+	// host is a failure (or a stale, tampered or future-stamped pass), so
+	// there is no evidence to attest from.
+	return SelfTestRecord{}, false
 }
 
 // latestProvenScan scans the per-record proven files and returns the newest

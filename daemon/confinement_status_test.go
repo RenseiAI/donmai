@@ -247,6 +247,7 @@ func TestConfinementStatus_StaleProbeSetIsUnproven(t *testing.T) {
 	}
 }
 
+// TestConfinementStatus_EmptyReasonIsDegraded pins the malformed-probe
 // gate: a missing layer with no reason still reports degraded with a
 // non-empty line, never an empty degraded marker. Deleting the generic
 // fallback (passing the empty reason through) turns this test red.

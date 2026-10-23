@@ -408,6 +408,217 @@ func TestProvenRecord_PruneKeepsOnlyLatest(t *testing.T) {
 	}
 }
 
+// checkFailingBackend is a backend whose Check fails, as a host does once
+// user namespaces are disabled or the launcher goes missing after a pass.
+type checkFailingBackend struct{ noopBackend }
+
+func (checkFailingBackend) Check() error {
+	return refuse(ReasonNamespaceUnavailable, "user namespaces are disabled")
+}
+
+// provenWorld is a confiner wired the way the harness adapters wire it: its
+// state home is the host state home (under an isolated base home), so the
+// latest outcome and proven files its self-test writes land exactly where
+// the public LatestProvenRecord reader looks. Its launchers only count, so
+// a real SelfTest through it runs every probe and fails them all (nothing
+// is applied): a completed, failing self-test.
+type provenWorld struct {
+	base string
+	c    *Confiner
+	opts SelfTestOptions
+	dir  string
+}
+
+func newProvenWorld(t *testing.T, backend Backend) provenWorld {
+	t.Helper()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	statehome.SetBaseHome(base)
+	t.Cleanup(statehome.ResetForTest)
+	stateHome := statehome.StateDir("")
+	profileDir := filepath.Join(stateHome, "profiles")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(base, "probe")
+	if err := testexec.WriteFile(probe, []byte("probe executable v1"), 0o700); err != nil { //nolint:gosec // G306: a stand-in executable.
+		t.Fatal(err)
+	}
+	count := func(context.Context, []string, []string, string) (int, error) { return 0, nil }
+	pw := provenWorld{
+		base: base,
+		opts: SelfTestOptions{
+			ProbeCommand: []string{probe},
+			ScratchDir:   filepath.Join(base, "scratch"),
+			Launchers:    map[agent.PromptSessionMode]Launcher{agent.PromptModeAutonomous: count, agent.PromptModeHumanControlled: count},
+		},
+		dir: latestSelfTestCacheDir(),
+	}
+	pw.c = pw.confiner(t, backend)
+	if pw.dir == "" || pw.c.provenDir() != pw.dir {
+		t.Fatalf("confiner proven dir %q, status reader dir %q: want the same directory", pw.c.provenDir(), pw.dir)
+	}
+	return pw
+}
+
+// confiner returns a confiner over pw's directories with backend.
+func (pw provenWorld) confiner(t *testing.T, backend Backend) *Confiner {
+	t.Helper()
+	stateHome := statehome.StateDir("")
+	c, err := New(Options{Backend: backend, ProfileDir: filepath.Join(stateHome, "profiles"), Home: pw.base, StateHome: stateHome, ExecutableDigest: "sha256:harness"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return c
+}
+
+// seedPass records a passing, whole record taken age ago through the writers
+// a passing SelfTest calls (the latest outcome plus the proven file), and
+// checks that the public reader attests from it.
+func (pw provenWorld) seedPass(t *testing.T, age time.Duration) SelfTestRecord {
+	t.Helper()
+	pass := passingRecord(t, pw.c, bothModes...)
+	pass.TestedAt = time.Now().Add(-age).UTC()
+	pass.Digest = pass.computeDigest()
+	pw.c.recordLatest(pass)
+	pw.c.recordProven(pass)
+	if latest, ok := LatestProvenRecord(); !ok || latest.Digest != pass.Digest {
+		t.Fatalf("LatestProvenRecord after a pass = %+v, %v; want the pass %s", latest, ok, pass.Digest)
+	}
+	return pass
+}
+
+// failSelfTest runs the real SelfTest through c and requires it to fail.
+func (pw provenWorld) failSelfTest(t *testing.T, c *Confiner) {
+	t.Helper()
+	record, err := c.SelfTest(t.Context(), pw.opts)
+	if err == nil || record.Passed {
+		t.Fatalf("SelfTest = %+v, %v; want a failing self-test", record.Passed, err)
+	}
+}
+
+// TestSelfTest_FailureAfterPassIsNoEvidence pins the latest-outcome write
+// after a completed self-test: a real SelfTest that fails its probes (the
+// backend Check passes) after a pass supersedes the pass, so the public
+// reader reports no evidence. The status path's live Check cannot catch this
+// failure, so deleting the write in SelfTest turns this test red.
+func TestSelfTest_FailureAfterPassIsNoEvidence(t *testing.T) {
+	pw := newProvenWorld(t, noopBackend{})
+	pw.seedPass(t, time.Hour)
+	pw.failSelfTest(t, pw.c)
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord after a failing self-test reads the earlier pass as evidence: %+v", latest)
+	}
+}
+
+// TestSelfTest_CheckFailureAfterPassIsNoEvidence pins the latest-outcome
+// write on a backend Check failure: a real SelfTest whose Check fails after a
+// pass supersedes the pass, so the public reader reports no evidence.
+// Deleting the write on the Check-failure path turns this test red.
+func TestSelfTest_CheckFailureAfterPassIsNoEvidence(t *testing.T) {
+	pw := newProvenWorld(t, noopBackend{})
+	pw.seedPass(t, time.Hour)
+	pw.failSelfTest(t, pw.confiner(t, checkFailingBackend{}))
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord after a Check failure reads the earlier pass as evidence: %+v", latest)
+	}
+}
+
+// TestProvenRecord_StaleLatestPassIsNoEvidence pins the proven window on the
+// latest outcome: a passing latest record older than the window is no
+// evidence. Deleting the age check on the latest file turns this test red.
+func TestProvenRecord_StaleLatestPassIsNoEvidence(t *testing.T) {
+	pw := newProvenWorld(t, noopBackend{})
+	stale := passingRecord(t, pw.c, bothModes...)
+	stale.TestedAt = time.Now().Add(-provenRecordTTL - time.Minute).UTC()
+	stale.Digest = stale.computeDigest()
+	pw.c.recordLatest(stale)
+	pw.c.recordProven(stale)
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord reads a latest pass older than the proven window as evidence: %+v", latest)
+	}
+}
+
+// TestProvenRecord_TamperedLatestIsNoEvidence pins the digest check on the
+// latest outcome: a latest record re-stamped by hand (its time moved forward,
+// its digest left as it was) is no evidence, and the intact older proven file
+// is not read in its place. Deleting the digest check on the latest file
+// turns this test red.
+func TestProvenRecord_TamperedLatestIsNoEvidence(t *testing.T) {
+	pw := newProvenWorld(t, noopBackend{})
+	pass := pw.seedPass(t, 2*time.Hour)
+	tampered := pass
+	tampered.TestedAt = time.Now().UTC()
+	writeProvenFileForTest(t, pw.dir, latestSelfTestFileName, provenSelfTestFile{Version: provenSelfTestFileVersion, Record: tampered})
+	if latest, ok := LatestProvenRecord(); ok {
+		t.Fatalf("LatestProvenRecord reads a tampered latest outcome as evidence: %+v", latest)
+	}
+}
+
+// TestProvenRecord_BadLatestNeverFallsBack pins the fail-closed read of the
+// latest outcome. An older pass stays on disk as a proven file while a real
+// failing SelfTest records the newest outcome; then that newest outcome is
+// made unreadable (a directory where the file was, an error even a root
+// reader gets), undecodable, or of a version this binary does not read. Each
+// is no evidence through the public reader: falling back to the older pass
+// would attest a host whose newest self-test failed. Only a missing latest
+// file falls back to the per-record scan, so records that predate the latest
+// file still read. Treating any read or decode failure as "missing" turns the
+// bad cases red; treating "missing" as no evidence turns the last case red.
+func TestProvenRecord_BadLatestNeverFallsBack(t *testing.T) {
+	cases := []struct {
+		name   string
+		damage func(t *testing.T, latest string, pass SelfTestRecord)
+		want   bool
+	}{
+		{"unreadable", func(t *testing.T, latest string, _ SelfTestRecord) {
+			if err := os.Remove(latest); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(latest, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"undecodable", func(t *testing.T, latest string, _ SelfTestRecord) {
+			if err := os.WriteFile(latest, []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"unknown version", func(t *testing.T, latest string, pass SelfTestRecord) {
+			// A newer binary's latest outcome: a shape this binary does not
+			// read, even where its record would decode as a pass.
+			writeProvenFileForTest(t, filepath.Dir(latest), filepath.Base(latest), provenSelfTestFile{Version: provenSelfTestFileVersion + 1, Record: pass})
+		}, false},
+		{"missing", func(t *testing.T, latest string, _ SelfTestRecord) {
+			if err := os.Remove(latest); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pw := newProvenWorld(t, noopBackend{})
+			pass := pw.seedPass(t, time.Hour)
+			pw.failSelfTest(t, pw.c)
+			latest := filepath.Join(pw.dir, latestSelfTestFileName)
+			if _, err := os.Stat(latest); err != nil {
+				t.Fatalf("the failing self-test recorded no latest outcome: %v", err)
+			}
+			tc.damage(t, latest, pass)
+			got, ok := LatestProvenRecord()
+			if ok != tc.want {
+				t.Fatalf("LatestProvenRecord with a %s latest outcome = %+v, %v; want evidence %v", tc.name, got, ok, tc.want)
+			}
+			if ok && got.Digest != pass.Digest {
+				t.Fatalf("LatestProvenRecord with a %s latest outcome read %s; want the older pass %s", tc.name, got.Digest, pass.Digest)
+			}
+		})
+	}
+}
+
+// TestSelfTest_ReusesACachedPassingRecord: a later process on the same host
 // reuses a cached passing self-test without spawning a probe, and Prepare
 // accepts it; once the record is older than the TTL the self-test runs
 // again, and a failing run never replaces the cache.
