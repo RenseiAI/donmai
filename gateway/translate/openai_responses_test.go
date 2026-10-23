@@ -431,24 +431,27 @@ func TestDecodeResponsesRequest_StringInput(t *testing.T) {
 
 // TestDecodeResponsesRequest_FullShape decodes every supported item family
 // into canonical items with their identity kept: instructions stay separate,
-// a developer message keeps its role, a replayed call keeps its call_id, the
-// tool output stays joined to it, and the reasoning summary stays a reasoning
-// item. Shapes outside the stateless codec (string content, structured tool
-// output, sampling controls) are refused rather than flattened.
+// a developer message (in the string-content shorthand) keeps its role, a
+// replayed call keeps its call_id, the tool output stays joined to it, the
+// reasoning summary stays a reasoning item, and the sampling controls reach
+// the canonical sampling spec. Only a structured multi-part tool output is
+// refused, rather than being flattened into text.
 func TestDecodeResponsesRequest_FullShape(t *testing.T) {
 	body := `{
 		"model": "m",
 		"instructions": "be brief",
 		"input": [
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
-			{"type":"message","role":"developer","content":[{"type":"input_text","text":"sys"}]},
+			{"type":"message","role":"developer","content":"sys"},
 			{"type":"function_call","call_id":"call-1","name":"get_weather","arguments":"{}"},
 			{"type":"function_call_output","call_id":"call-1","output":"sunny"},
 			{"type":"reasoning","summary":[{"type":"summary_text","text":"thought"}]}
 		],
 		"tools": [{"type":"function","name":"get_weather","description":"d","parameters":{"type":"object"}}],
 		"tool_choice": "auto",
-		"reasoning": {"effort":"high"}
+		"reasoning": {"effort":"high"},
+		"temperature": 0.5,
+		"max_output_tokens": 100
 	}`
 	req, err := DecodeResponsesRequest([]byte(body))
 	if err != nil {
@@ -463,8 +466,8 @@ func TestDecodeResponsesRequest_FullShape(t *testing.T) {
 	if req.Items[0].Role != ir.RoleUser {
 		t.Errorf("first item role = %q, want user", req.Items[0].Role)
 	}
-	if dev := req.Items[1]; dev.Role != ir.RoleDeveloper || len(dev.Parts) != 1 || dev.Parts[0].Text != "sys" {
-		t.Errorf("developer item = %+v, want the developer role kept", dev)
+	if dev := req.Items[1]; dev.Role != ir.RoleDeveloper || len(dev.Parts) != 1 || dev.Parts[0].Kind != ir.PartText || dev.Parts[0].Text != "sys" {
+		t.Errorf("developer item = %+v, want the developer role and its string content kept", dev)
 	}
 	if replayed := req.Items[2]; replayed.Kind != "function_call" || replayed.Name != "get_weather" || replayed.CallID != "call-1" {
 		t.Errorf("replayed call = %+v, want the function_call item", replayed)
@@ -484,15 +487,57 @@ func TestDecodeResponsesRequest_FullShape(t *testing.T) {
 	if req.Thinking.Level != ir.ThinkingHigh {
 		t.Errorf("thinking level = %q, want high", req.Thinking.Level)
 	}
-	for name, refused := range map[string]string{
-		"string_content":    `{"model":"m","input":[{"type":"message","role":"developer","content":"sys"}]}`,
-		"structured_output": `{"model":"m","input":[{"type":"function_call_output","call_id":"call-1","output":[{"type":"input_text","text":"sunny"}]}]}`,
-		"temperature":       `{"model":"m","input":"x","temperature":0.5}`,
-		"max_output_tokens": `{"model":"m","input":"x","max_output_tokens":100}`,
-	} {
-		if _, err := DecodeResponsesRequest([]byte(refused)); err == nil {
-			t.Errorf("%s accepted; want a refusal instead of a flattened or dropped field", name)
+	if req.Sampling.Temperature == nil || *req.Sampling.Temperature != 0.5 {
+		t.Errorf("temperature = %+v", req.Sampling.Temperature)
+	}
+	if req.Sampling.MaxTokens == nil || *req.Sampling.MaxTokens != 100 {
+		t.Errorf("max tokens = %+v", req.Sampling.MaxTokens)
+	}
+	structured := `{"model":"m","input":[{"type":"function_call_output","call_id":"call-1","output":[{"type":"input_text","text":"sunny"}]}]}`
+	if _, err := DecodeResponsesRequest([]byte(structured)); err == nil {
+		t.Error("structured tool output accepted; want a refusal instead of flattened text")
+	}
+}
+
+// TestResponsesSamplingReachesBothCodecs carries temperature, top_p and
+// max_output_tokens onto the Chat wire and the native Responses wire.
+func TestResponsesSamplingReachesBothCodecs(t *testing.T) {
+	req, err := DecodeResponsesRequest([]byte(`{"model":"m","input":[{"type":"message","role":"assistant","content":"earlier"},{"type":"message","role":"user","content":"next"}],"temperature":0.25,"top_p":0.5,"max_output_tokens":64}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Items) != 2 || req.Items[0].Parts[0].Text != "earlier" || req.Items[1].Parts[0].Text != "next" {
+		t.Fatalf("string content lost: %+v", req.Items)
+	}
+	projected, err := ProjectResponsesToChat(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatBody, err := EncodeRequest(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat ChatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if chat.Temperature == nil || *chat.Temperature != 0.25 || chat.TopP == nil || *chat.TopP != 0.5 || chat.MaxTokens == nil || *chat.MaxTokens != 64 {
+		t.Fatalf("Chat wire lost sampling: %s", chatBody)
+	}
+	if len(chat.Messages) != 2 || chat.Messages[0].Role != "assistant" || chat.Messages[0].Content != "earlier" || chat.Messages[1].Content != "next" {
+		t.Fatalf("Chat wire lost string content: %s", chatBody)
+	}
+	nativeBody, err := EncodeResponsesRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"temperature":0.25`, `"top_p":0.5`, `"max_output_tokens":64`, `"type":"output_text","text":"earlier"`} {
+		if !strings.Contains(string(nativeBody), want) {
+			t.Fatalf("native wire missing %s: %s", want, nativeBody)
 		}
+	}
+	if _, err := DecodeResponsesRequest([]byte(`{"model":"m","input":"x","max_output_tokens":0}`)); err == nil {
+		t.Fatal("a zero output budget was accepted")
 	}
 }
 
@@ -614,7 +659,17 @@ func encodeStatus(t *testing.T, resp ir.Response) encodedStatus {
 }
 
 func TestEncodeResponsesResponse_IncompleteLength(t *testing.T) {
-	obj := encodeStatus(t, ir.Response{Model: "m", FinishReason: ir.FinishLength})
+	// The production path: a documented Chat reply that stopped on length
+	// passes the bridge validator, decodes, and encodes as incomplete.
+	reply := []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":null,"annotations":[]},"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":9,"total_tokens":14},"system_fingerprint":"fp"}`)
+	if err := ValidateChatResponsesSubset(reply, false); err != nil {
+		t.Fatalf("length reply refused by the bridge: %v", err)
+	}
+	resp, err := DecodeResponse(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := encodeStatus(t, resp)
 	if obj.Status != "incomplete" {
 		t.Errorf("status = %q, want incomplete", obj.Status)
 	}
@@ -633,21 +688,35 @@ func TestEncodeResponsesResponse_ErrorIsFailed(t *testing.T) {
 	}
 }
 
-// TestResponsesTerminal_MatchesStatus pins the only terminal the codec emits:
-// response.completed, carrying a completed snapshot. An incomplete or failed
-// stream is never encoded as a codec event; the surface closes it with its
-// own response.failed frame and never meters it.
+// TestResponsesTerminal_MatchesStatus pins that the terminal event type always
+// matches the snapshot status the surface emits: a stop finish completes, a
+// length or content-filter finish is incomplete, and a failed stream is
+// failed. A finish cannot be relabeled onto a different terminal.
 func TestResponsesTerminal_MatchesStatus(t *testing.T) {
-	raw, err := EncodeResponsesStreamEvent(ir.ResponsesStreamEvent{Kind: "response.completed", ResponseID: "r", Usage: &ir.Usage{}})
-	if err != nil {
-		t.Fatalf("encode completed: %v", err)
+	for _, tc := range []struct {
+		status string
+		want   string
+		finish ir.FinishReason
+	}{
+		{"completed", "response.completed", ir.FinishStop},
+		{"incomplete", "response.incomplete", ir.FinishLength},
+		{"incomplete", "response.incomplete", ir.FinishContentFilter},
+		{"failed", "response.failed", ""},
+	} {
+		raw, err := EncodeResponsesStreamEvent(ir.ResponsesStreamEvent{Kind: tc.want, ResponseID: "r", Usage: &ir.Usage{}, Response: &ir.Response{FinishReason: tc.finish}})
+		if err != nil {
+			t.Fatalf("status %q: %v", tc.status, err)
+		}
+		if !strings.Contains(string(raw), `"type":"`+tc.want+`"`) || !strings.Contains(string(raw), `"status":"`+tc.status+`"`) {
+			t.Errorf("status %q -> event %s, want %q", tc.status, raw, tc.want)
+		}
 	}
-	if !strings.Contains(string(raw), `"type":"response.completed"`) || !strings.Contains(string(raw), `"status":"completed"`) {
-		t.Errorf("wire event missing type or status: %s", raw)
-	}
-	for _, kind := range []string{"response.incomplete", "response.failed"} {
-		if raw, err := EncodeResponsesStreamEvent(ir.ResponsesStreamEvent{Kind: kind, ResponseID: "r", Usage: &ir.Usage{}}); err == nil {
-			t.Errorf("%s encoded as %s; want a refusal", kind, raw)
+	for _, mismatch := range []ir.ResponsesStreamEvent{
+		{Kind: "response.completed", ResponseID: "r", Usage: &ir.Usage{}, Response: &ir.Response{FinishReason: ir.FinishLength}},
+		{Kind: "response.incomplete", ResponseID: "r", Usage: &ir.Usage{}, Response: &ir.Response{FinishReason: ir.FinishStop}},
+	} {
+		if raw, err := EncodeResponsesStreamEvent(mismatch); err == nil {
+			t.Errorf("%s with finish %q encoded as %s; want a refusal", mismatch.Kind, mismatch.Response.FinishReason, raw)
 		}
 	}
 }
@@ -689,5 +758,158 @@ func TestResponsesStreamEventShapes(t *testing.T) {
 	textDone := encode(ir.ResponsesStreamEvent{Kind: "response.output_text.done", ItemID: "msg-1", Delta: "hi"})
 	if strings.Contains(textDone, "delta") || !strings.Contains(textDone, `"text":"hi"`) {
 		t.Errorf("text done event = %s", textDone)
+	}
+}
+
+// TestValidateChatResponsesSubsetClassifiesFields drives documented OpenAI
+// Chat Completions replies and stream chunks through the bridge: envelope
+// metadata, usage counters and empty fields pass; anything that would be
+// dropped with content in it is refused.
+func TestValidateChatResponsesSubsetClassifiesFields(t *testing.T) {
+	const usage = `"usage":{"prompt_tokens":19,"completion_tokens":10,"total_tokens":29,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}`
+	reply := func(message, extra string) string {
+		return `{"id":"chatcmpl-1","object":"chat.completion","created":1741569952,"model":"m","choices":[{"index":0,"message":` + message + `,"logprobs":null,"finish_reason":"stop"}],` + usage + `,"service_tier":"default","system_fingerprint":"fp_1"` + extra + `}`
+	}
+	chunk := func(choices, extra string) string {
+		return `{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","service_tier":"default","system_fingerprint":"fp_1","choices":` + choices + `,"usage":null,"obfuscation":"pad"` + extra + `}`
+	}
+	accepted := []struct {
+		name   string
+		body   string
+		stream bool
+	}{
+		{"reply", reply(`{"role":"assistant","content":"Hello","refusal":null,"annotations":[]}`, ""), false},
+		{"reply_tool_call", reply(`{"role":"assistant","content":null,"refusal":null,"annotations":[],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}`, ""), false},
+		{"reply_empty_logprobs_object", strings.Replace(reply(`{"role":"assistant","content":"Hi"}`, ""), `"logprobs":null`, `"logprobs":{"content":null,"refusal":null}`, 1), false},
+		{"chunk_role", chunk(`[{"index":0,"delta":{"role":"assistant","content":"","refusal":null},"logprobs":null,"finish_reason":null}]`, ""), true},
+		{"chunk_tool_call", chunk(`[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":""}}]},"logprobs":null,"finish_reason":null}]`, ""), true},
+		{"chunk_finish_length", chunk(`[{"index":0,"delta":{},"logprobs":null,"finish_reason":"length"}]`, ""), true},
+		{"chunk_include_usage", strings.Replace(chunk(`[]`, ""), `"usage":null`, usage, 1), true},
+	}
+	for _, tc := range accepted {
+		if err := ValidateChatResponsesSubset([]byte(tc.body), tc.stream); err != nil {
+			t.Errorf("documented %s refused: %v", tc.name, err)
+		}
+	}
+	refused := []struct {
+		name   string
+		body   string
+		stream bool
+	}{
+		{"refusal_text", reply(`{"role":"assistant","content":null,"refusal":"I cannot help"}`, ""), false},
+		{"annotations", reply(`{"role":"assistant","content":"x","annotations":[{"type":"url_citation","url_citation":{"url":"https://example.com"}}]}`, ""), false},
+		{"audio", reply(`{"role":"assistant","content":null,"audio":{"id":"a","data":"AAAA"}}`, ""), false},
+		{"reasoning_content", reply(`{"role":"assistant","content":"x","reasoning_content":"hidden chain"}`, ""), false},
+		{"legacy_function_call", reply(`{"role":"assistant","content":null,"function_call":{"name":"f","arguments":"{}"}}`, ""), false},
+		{"logprobs_content", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"logprobs":null`, `"logprobs":{"content":[{"token":"x","logprob":-0.1}]}`, 1), false},
+		{"top_level_error", reply(`{"role":"assistant","content":"x"}`, `,"error":{"message":"overloaded"}`), false},
+		{"role_user", reply(`{"role":"user","content":"x"}`, ""), false},
+		{"content_parts", reply(`{"role":"assistant","content":[{"type":"text","text":"x"}]}`, ""), false},
+		{"finish_function_call", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"finish_reason":"stop"`, `"finish_reason":"function_call"`, 1), false},
+		{"zero_choices", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"logprobs":null,"finish_reason":"stop"}]`, `"choices":[]`, 1), false},
+		{"two_choices", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"finish_reason":"stop"}]`, `"finish_reason":"stop"},{"index":1,"message":{"role":"assistant","content":"y"},"finish_reason":"stop"}]`, 1), false},
+		{"usage_counter_text", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"audio_tokens":0}`, `"audio_tokens":"0"}`, 1), false},
+		{"chunk_two_tool_calls", chunk(`[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"f","arguments":""}},{"index":1,"id":"b","type":"function","function":{"name":"g","arguments":""}}]},"finish_reason":null}]`, ""), true},
+		{"chunk_refusal_text", chunk(`[{"index":0,"delta":{"refusal":"no"},"finish_reason":null}]`, ""), true},
+		{"chunk_unknown_choice_content", chunk(`[{"index":0,"delta":{"content":"x"},"finish_reason":null,"content_blocks":[{"text":"y"}]}]`, ""), true},
+	}
+	for _, tc := range refused {
+		if err := ValidateChatResponsesSubset([]byte(tc.body), tc.stream); err == nil {
+			t.Errorf("%s accepted; it would be dropped by the Chat decoder", tc.name)
+		}
+	}
+}
+
+// TestResponsesNativeGuardsPinned pins the codec guards that stop a native
+// exchange from fabricating success or silently dropping a Responses control.
+func TestResponsesNativeGuardsPinned(t *testing.T) {
+	for _, status := range []string{"incomplete", "failed", "in_progress"} {
+		body := `{"id":"r","object":"response","status":"` + status + `","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+		if _, err := DecodeResponsesResponse([]byte(body)); err == nil {
+			t.Errorf("native reply with status %q and complete usage decoded as a success", status)
+		}
+	}
+	req, err := DecodeResponsesRequest([]byte(`{"model":"m","input":"x","parallel_tool_calls":false,"store":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := EncodeResponsesRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wire), `"parallel_tool_calls":false`) {
+		t.Fatalf("explicit serial tool use did not reach the native wire: %s", wire)
+	}
+	for name, chatShaped := range map[string]ir.Request{
+		"messages": {Model: "m", Messages: []ir.Message{{Role: ir.RoleUser, Parts: []ir.Part{{Kind: ir.PartText, Text: "x"}}}}},
+		"system":   {Model: "m", System: []ir.Part{{Kind: ir.PartText, Text: "x"}}},
+		"stop":     {Model: "m", Sampling: ir.Sampling{Stop: []string{"END"}}},
+	} {
+		if body, err := EncodeResponsesRequest(chatShaped); err == nil {
+			t.Errorf("Chat-shaped %s encoded onto the native wire: %s", name, body)
+		}
+	}
+}
+
+// TestResponsesChatProjectionRefusesNativeOnlyControls pins every control the
+// Chat projection refuses rather than dropping.
+func TestResponsesChatProjectionRefusesNativeOnlyControls(t *testing.T) {
+	for name, body := range map[string]string{
+		"developer_item":   `{"model":"m","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]}]}`,
+		"text_format":      `{"model":"m","input":"x","text":{"format":{"type":"json_schema","name":"s","schema":{"type":"object"}}}}`,
+		"message_id":       `{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"x"}]}]}`,
+		"prompt_cache_key": `{"model":"m","input":"x","prompt_cache_key":"k"}`,
+		"service_tier":     `{"model":"m","input":"x","service_tier":"flex"}`,
+		"client_metadata":  `{"model":"m","input":"x","client_metadata":{"k":"v"}}`,
+	} {
+		req, err := DecodeResponsesRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("%s: decode: %v", name, err)
+		}
+		if _, err := ProjectResponsesToChat(req); err == nil {
+			t.Errorf("Chat projection dropped %s instead of refusing it", name)
+		}
+	}
+}
+
+// TestResponsesRequiredZeroIndexes pins the zero output_index and
+// summary_index the protocol requires on the first item.
+func TestResponsesRequiredZeroIndexes(t *testing.T) {
+	for _, tc := range []struct {
+		ev    ir.ResponsesStreamEvent
+		field string
+	}{
+		{ir.ResponsesStreamEvent{Kind: "response.output_item.added", OutputIndex: 0, Item: &ir.Item{Kind: "message", ID: "m", Role: ir.RoleAssistant, Status: "in_progress"}}, "output_index"},
+		{ir.ResponsesStreamEvent{Kind: "response.function_call_arguments.delta", ItemID: "fc", Delta: "{}"}, "output_index"},
+		{ir.ResponsesStreamEvent{Kind: "response.reasoning_summary_text.delta", ItemID: "rs", Delta: "plan"}, "summary_index"},
+	} {
+		body, err := EncodeResponsesStreamEvent(tc.ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if string(fields[tc.field]) != "0" {
+			t.Errorf("%s: required zero %s absent: %s", tc.ev.Kind, tc.field, body)
+		}
+	}
+}
+
+// TestResponsesNestingDepthBounded nests a schema past the bound under a field
+// the codec admits, so only the depth limit can refuse it.
+func TestResponsesNestingDepthBounded(t *testing.T) {
+	nest := func(depth int) string {
+		return strings.Repeat(`{"a":`, depth) + `{}` + strings.Repeat(`}`, depth)
+	}
+	tool := func(depth int) string {
+		return `{"model":"m","input":[],"tools":[{"type":"function","name":"f","parameters":` + nest(depth) + `}]}`
+	}
+	if _, err := DecodeResponsesRequest([]byte(tool(40))); err != nil {
+		t.Fatalf("a schema within the bound was refused: %v", err)
+	}
+	if _, err := DecodeResponsesRequest([]byte(tool(70))); err == nil {
+		t.Fatal("a schema past the nesting bound was accepted")
 	}
 }

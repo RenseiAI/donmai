@@ -55,7 +55,8 @@ func (h *OpenAIResponses) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := translate.DecodeResponsesRequest(body)
 	if err != nil {
-		// Decode errors name the refused field or value (never upstream text).
+		// Decode errors carry the codec refusal, which names a refused value
+		// such as an unknown effort; they never carry upstream text.
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -77,36 +78,51 @@ func (h *OpenAIResponses) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.stream(r.Context(), w, out, model)
 		return
 	}
-	if out.Response == nil || !out.Response.UsageReported || (out.Response.FinishReason != "" && out.Response.FinishReason != ir.FinishStop && out.Response.FinishReason != ir.FinishToolCalls) {
+	resp := out.Response
+	if resp == nil || !resp.UsageReported {
+		// Without reported usage there is nothing truthful to serve or meter.
 		writeError(w, http.StatusBadGateway, "invalid_upstream", "upstream omitted response or usage")
 		return
 	}
-	if out.Response.Model == "" {
-		out.Response.Model = req.Model
+	// The upstream finished and reported its usage, so the exchange is
+	// metered exactly once whatever the client is served. A length or
+	// content-filter finish is served as incomplete, never as completed.
+	if out.Meter != nil {
+		defer out.Meter(resp.Usage, resp.FinishReason)
 	}
-	encoded, err := translate.EncodeResponsesResponse(*out.Response, h.newID())
+	if resp.Model == "" {
+		resp.Model = req.Model
+	}
+	encoded, err := translate.EncodeResponsesResponse(*resp, h.newID())
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "invalid_upstream", "upstream response cannot be represented")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if _, err = w.Write(encoded); err != nil || r.Context().Err() != nil {
-		return
-	}
-	if out.Meter != nil {
-		out.Meter(out.Response.Usage, out.Response.FinishReason)
-	}
+	_, _ = w.Write(encoded)
 }
 
 // chatSlot is one output item assembled from a Chat upstream stream: the
 // assistant message or one function call, at the output index it was first
-// announced with. Deltas, done events and the completed snapshot all share
+// announced with. Deltas, done events and the terminal snapshot all share
 // that announcement order.
 type chatSlot struct {
 	item   ir.Item
 	output int
 	text   string // message text or function-call arguments
+}
+
+// chatFinished reports whether a Chat finish ends a turn the Responses
+// surface can serve: completed (stop, tool_calls) or incomplete (length,
+// content_filter). A stream that ends without one was truncated.
+func chatFinished(finish ir.FinishReason) bool {
+	switch finish {
+	case ir.FinishStop, ir.FinishToolCalls, ir.FinishLength, ir.FinishContentFilter:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *OpenAIResponses) stream(ctx context.Context, w http.ResponseWriter, out Outcome, model string) {
@@ -137,13 +153,8 @@ func (h *OpenAIResponses) stream(ctx context.Context, w http.ResponseWriter, out
 		}
 		return true
 	}
-	failed := func() {
-		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"gateway_stream_failed\",\"message\":\"upstream stream failed\"}}}\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
 	id := h.newID()
+	failed := func() { _ = send(ir.ResponsesStreamEvent{Kind: "response.failed", ResponseID: id}) }
 	created := false
 	var completed *ir.ResponsesStreamEvent
 	var usage *ir.Usage
@@ -153,56 +164,64 @@ func (h *OpenAIResponses) stream(ctx context.Context, w http.ResponseWriter, out
 	tools := map[int]*chatSlot{}
 	var streamFailure bool
 	var native bool
+	var upstreamDone bool
 streamLoop:
 	for {
 		var delta ir.StreamDelta
 		select {
 		case <-ctx.Done():
-			failed()
+			failed() // the upstream has not finished: nothing is metered
 			return
 		case next, ok := <-out.Stream.Deltas:
 			if !ok {
+				upstreamDone = true
 				break streamLoop
 			}
 			delta = next
 		}
+		// Once the stream has failed nothing more is forwarded, but the
+		// upstream is still drained so its terminal usage is known.
 		if delta.Responses != nil {
 			event := *delta.Responses
 			native = true
-			if event.Kind != "response.created" && (!created || event.ResponseID != "" && event.ResponseID != id) {
+			switch {
+			case event.Kind != "response.created" && (!created || event.ResponseID != "" && event.ResponseID != id):
 				streamFailure = true
-				continue
-			}
-			if event.Kind == "response.created" {
+			case event.Kind == "response.created":
 				if created {
 					streamFailure = true
 					continue
 				}
 				created = true
 				id = event.ResponseID
-			}
-			if event.Kind == "response.completed" {
+				if !streamFailure && !send(event) {
+					streamFailure = true
+				}
+			case event.Kind == "response.completed":
 				if completed != nil {
 					streamFailure = true
 					continue
 				}
 				terminal := event
 				completed = &terminal
-				usage = event.Usage
-				continue // terminal success is sent only after Stream.Err is known
-			}
-			if !send(event) {
-				streamFailure = true
-				continue
+				usage = event.Usage // sent only after Stream.Err is known
+			default:
+				if !streamFailure && !send(event) {
+					streamFailure = true
+				}
 			}
 			continue
 		}
-		if native {
+		if native || delta.ThinkingDelta != "" {
 			streamFailure = true
-			continue
 		}
-		if delta.ThinkingDelta != "" {
-			streamFailure = true
+		if delta.Finish != "" {
+			finish = delta.Finish
+		}
+		if delta.Usage != nil {
+			usage = delta.Usage
+		}
+		if streamFailure {
 			continue
 		}
 		// A Chat upstream can serve only a representable text/function subset.
@@ -222,6 +241,7 @@ streamLoop:
 				if !send(ir.ResponsesStreamEvent{Kind: "response.output_item.added", OutputIndex: message.output, Item: &added}) ||
 					!send(ir.ResponsesStreamEvent{Kind: "response.content_part.added", OutputIndex: message.output, ItemID: message.item.ID, Part: &ir.Part{Kind: ir.PartText}}) {
 					streamFailure = true
+					continue
 				}
 			}
 			message.text += delta.TextDelta
@@ -249,7 +269,7 @@ streamLoop:
 					continue
 				}
 			} else if fragment.ID != "" && fragment.ID != call.item.CallID || fragment.Name != "" && fragment.Name != call.item.Name {
-				streamFailure = true
+				streamFailure = true // a drifted identity is never merged into the first call
 				continue
 			}
 			if fragment.ArgsDelta != "" {
@@ -260,23 +280,24 @@ streamLoop:
 				}
 			}
 		}
-		if delta.Finish != "" {
-			finish = delta.Finish
-		}
-		if delta.Usage != nil {
-			usage = delta.Usage
-		}
 	}
-	if streamFailure || out.Stream.Err != nil && out.Stream.Err() != nil || ctx.Err() != nil {
+	upstreamFailed := out.Stream.Err != nil && out.Stream.Err() != nil
+	finished := completed != nil
+	if !native {
+		finished = chatFinished(finish)
+	}
+	// An upstream that ended on its own with a finished turn and reported
+	// usage is metered exactly once, whatever the client is served. A failed,
+	// truncated or cancelled upstream stream has no usage to meter.
+	if upstreamDone && !upstreamFailed && finished && usage != nil && out.Meter != nil {
+		defer out.Meter(*usage, finish)
+	}
+	if streamFailure || upstreamFailed || ctx.Err() != nil || !finished || usage == nil || !created {
 		failed()
 		return
 	}
 	if completed == nil {
-		if native || !created || (finish != ir.FinishStop && finish != ir.FinishToolCalls) || usage == nil {
-			failed()
-			return
-		}
-		snapshot := &ir.Response{Model: model}
+		snapshot := &ir.Response{Model: model, FinishReason: finish}
 		for _, slot := range order {
 			done := slot.item
 			done.Status = "completed"
@@ -295,13 +316,13 @@ streamLoop:
 			}
 			snapshot.Items = append(snapshot.Items, done)
 		}
-		completed = &ir.ResponsesStreamEvent{Kind: "response.completed", ResponseID: id, Usage: usage, Response: snapshot}
+		kind := "response.completed"
+		if finish == ir.FinishLength || finish == ir.FinishContentFilter {
+			kind = "response.incomplete"
+		}
+		completed = &ir.ResponsesStreamEvent{Kind: kind, ResponseID: id, Usage: usage, Response: snapshot}
 	}
-	if usage == nil || !created || !send(*completed) {
+	if !send(*completed) {
 		failed()
-		return
-	}
-	if out.Meter != nil {
-		out.Meter(*usage, finish)
 	}
 }

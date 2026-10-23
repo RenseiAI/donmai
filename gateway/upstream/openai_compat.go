@@ -89,8 +89,11 @@ func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Cre
 		return Outcome{Status: resp.StatusCode}, fmt.Errorf("gateway/upstream: read body: %w", err)
 	}
 	if responsesInbound {
+		// The reply's content is refused, not the credential: report the
+		// upstream's real status so a healthy key is never cooled down. The
+		// gateway still answers its client 502.
 		if err := translate.ValidateChatResponsesSubset(raw, false); err != nil {
-			return Outcome{Status: http.StatusBadGateway}, err
+			return Outcome{Status: resp.StatusCode}, err
 		}
 	}
 	irResp, err := translate.DecodeResponse(raw)

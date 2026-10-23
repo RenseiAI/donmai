@@ -107,6 +107,10 @@ func decodeResponseItem(body json.RawMessage) (ir.Item, error) {
 }
 
 func decodeResponseItemMode(body json.RawMessage, partial bool) (ir.Item, error) {
+	body, err := expandMessageContent(body)
+	if err != nil {
+		return ir.Item{}, err
+	}
 	var w responseWireItem
 	if err := strictJSON(body, &w); err != nil {
 		return ir.Item{}, fmt.Errorf("%w: item shape", ErrResponsesUnsupported)
@@ -184,6 +188,42 @@ func decodeResponseItemMode(body json.RawMessage, partial bool) (ir.Item, error)
 		return ir.Item{}, ErrResponsesUnsupported
 	}
 	return item, nil
+}
+
+// expandMessageContent rewrites the protocol's string shorthand for message
+// content into its one equivalent text part (input_text, or output_text for an
+// assistant message). Every other shape passes through untouched.
+func expandMessageContent(body json.RawMessage) (json.RawMessage, error) {
+	if err := uniqueJSON(json.NewDecoder(bytes.NewReader(body)), 0); err != nil {
+		return nil, fmt.Errorf("%w: item shape", ErrResponsesUnsupported)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, fmt.Errorf("%w: item shape", ErrResponsesUnsupported)
+	}
+	content := bytes.TrimSpace(fields["content"])
+	if len(content) == 0 || content[0] != '"' || string(bytes.TrimSpace(fields["type"])) != `"message"` {
+		return body, nil
+	}
+	var text, role string
+	if err := json.Unmarshal(content, &text); err != nil {
+		return nil, fmt.Errorf("%w: item shape", ErrResponsesUnsupported)
+	}
+	if raw, ok := fields["role"]; ok {
+		if err := json.Unmarshal(raw, &role); err != nil {
+			return nil, fmt.Errorf("%w: item shape", ErrResponsesUnsupported)
+		}
+	}
+	kind := "input_text"
+	if role == "assistant" {
+		kind = "output_text"
+	}
+	parts, err := json.Marshal([]responseWireContent{{Type: kind, Text: text}})
+	if err != nil {
+		return nil, err
+	}
+	fields["content"] = parts
+	return json.Marshal(fields)
 }
 
 func encodeResponseItem(item ir.Item, partial ...bool) (responseWireItem, error) {
@@ -288,6 +328,9 @@ type responsesWireRequest struct {
 	PromptCacheKey    string            `json:"prompt_cache_key,omitempty"`
 	Text              map[string]any    `json:"text,omitempty"`
 	ClientMetadata    map[string]string `json:"client_metadata,omitempty"`
+	Temperature       *float64          `json:"temperature,omitempty"`
+	TopP              *float64          `json:"top_p,omitempty"`
+	MaxOutputTokens   *int              `json:"max_output_tokens,omitempty"`
 }
 
 // DecodeResponsesRequest admits the finite stateless text/function/custom/reasoning surface.
@@ -299,9 +342,14 @@ func DecodeResponsesRequest(body []byte) (ir.Request, error) {
 	if strings.TrimSpace(w.Model) == "" || w.Input == nil || w.Store || (w.ToolChoice != "" && w.ToolChoice != "auto" && w.ToolChoice != "none" && w.ToolChoice != "required") {
 		return ir.Request{}, ErrResponsesUnsupported
 	}
+	if w.MaxOutputTokens != nil && *w.MaxOutputTokens < 1 {
+		return ir.Request{}, fmt.Errorf("%w: max_output_tokens", ErrResponsesUnsupported)
+	}
 	req := ir.Request{
 		Model: w.Model, Instructions: w.Instructions, Stream: w.Stream,
 		ToolChoice: ir.ToolChoice(w.ToolChoice),
+		// Sampling controls are canonical IR: both codecs carry them.
+		Sampling: ir.Sampling{Temperature: w.Temperature, TopP: w.TopP, MaxTokens: w.MaxOutputTokens},
 		Responses: &ir.ResponsesControls{
 			ParallelToolCalls: w.ParallelToolCalls, Store: w.Store,
 			Include: w.Include, Reasoning: w.Reasoning, Text: w.Text,
@@ -385,7 +433,8 @@ func decodeResponsesInput(raw json.RawMessage) ([]ir.Item, error) {
 
 // EncodeResponsesRequest emits stateless Responses requests from canonical items.
 func EncodeResponsesRequest(req ir.Request) ([]byte, error) {
-	if len(req.Messages) > 0 || len(req.System) > 0 || req.Sampling.Temperature != nil || req.Sampling.TopP != nil || req.Sampling.MaxTokens != nil || len(req.Sampling.Stop) > 0 {
+	// Chat-shaped history and stop sequences have no Responses representation.
+	if len(req.Messages) > 0 || len(req.System) > 0 || len(req.Sampling.Stop) > 0 {
 		return nil, ErrResponsesUnsupported
 	}
 	controls := req.Responses
@@ -400,6 +449,7 @@ func EncodeResponsesRequest(req ir.Request) ([]byte, error) {
 		ParallelToolCalls: controls.ParallelToolCalls, Reasoning: controls.Reasoning, Store: false,
 		Stream: req.Stream, Include: controls.Include, ServiceTier: controls.ServiceTier,
 		PromptCacheKey: controls.PromptCacheKey, Text: controls.Text, ClientMetadata: controls.ClientMetadata,
+		Temperature: req.Sampling.Temperature, TopP: req.Sampling.TopP, MaxOutputTokens: req.Sampling.MaxTokens,
 	}
 	if w.ToolChoice == "" {
 		w.ToolChoice = "auto"
@@ -1019,12 +1069,22 @@ func EncodeResponsesStreamEvent(ev ir.ResponsesStreamEvent) ([]byte, error) {
 			return nil, err
 		}
 		w.Annotation = &annotations[0]
-	case "response.completed":
+	case "response.completed", "response.incomplete":
+		// The terminal kind is decided by the finish: a length or
+		// content-filter finish is incomplete, never completed.
 		if ev.ResponseID == "" || ev.Usage == nil {
 			return nil, ErrResponsesUnsupported
 		}
+		var finish ir.FinishReason
+		if ev.Response != nil {
+			finish = ev.Response.FinishReason
+		}
+		status, reason, err := responsesFinishStatus(finish)
+		if err != nil || "response."+status != ev.Kind {
+			return nil, ErrResponsesUnsupported
+		}
 		u := usageToResponses(*ev.Usage)
-		w.Response = &responsesWireResponse{ID: ev.ResponseID, Object: "response", Status: "completed", Usage: &u, EndTurn: ev.EndTurn}
+		w.Response = &responsesWireResponse{ID: ev.ResponseID, Usage: &u, EndTurn: ev.EndTurn}
 		if ev.Response != nil {
 			w.Response.Model = ev.Response.Model
 			if err := applyResponseDetails(w.Response, ev.Response.Details); err != nil {
@@ -1042,12 +1102,24 @@ func EncodeResponsesStreamEvent(ev ir.ResponsesStreamEvent) ([]byte, error) {
 				w.Response.Output = append(w.Response.Output, b)
 			}
 		}
+		w.Response.Status = status
+		w.Response.Object = "response"
+		if reason != "" {
+			if w.Response.IncompleteDetails, err = json.Marshal(map[string]string{"reason": reason}); err != nil {
+				return nil, err
+			}
+		}
+	case "response.failed":
+		// The gateway's own failure terminal: no upstream text crosses it.
+		if ev.ResponseID == "" {
+			return nil, ErrResponsesUnsupported
+		}
+		w.Response = &responsesWireResponse{
+			ID: ev.ResponseID, Object: "response", Status: "failed",
+			Error: json.RawMessage(`{"code":"gateway_stream_failed","message":"upstream stream failed"}`),
+		}
 	default:
 		return nil, ErrResponsesUnsupported
-	}
-	if w.Response != nil && ev.Kind == "response.completed" {
-		w.Response.Status = "completed"
-		w.Response.Object = "response"
 	}
 	body, err := json.Marshal(w)
 	if err != nil {
@@ -1133,53 +1205,298 @@ func applyResponseDetails(w *responsesWireResponse, d *ir.ResponseDetails) error
 	return nil
 }
 
-// ValidateChatResponsesSubset prevents the legacy Chat decoder from silently
-// flattening or dropping fields on an explicitly selected Responses exchange.
+// ValidateChatResponsesSubset classifies every field of an OpenAI-compatible
+// Chat reply (or stream chunk) on an explicitly selected Responses exchange
+// before the legacy Chat decoder reads it, because that decoder silently
+// ignores whatever it does not declare. The classes are:
+//
+//   - carried: choices[0].index, finish_reason, message/delta role, content
+//     and tool_calls, and usage prompt/completion/total tokens;
+//   - envelope metadata, ignored: id, object, created, model,
+//     system_fingerprint, service_tier and obfuscation (stream padding);
+//   - accounting counters, ignored: every other usage member and the members
+//     of prompt_tokens_details and completion_tokens_details, which must be
+//     non-negative integers (breakdowns of the carried totals);
+//   - empty-only: logprobs, refusal, annotations, audio, function_call,
+//     reasoning_content and every other field are admitted only when they
+//     carry nothing (null, "", [], {} or an object of empty members). With
+//     content they would be dropped, so they are refused.
+//
+// A finish other than stop, tool_calls, length or content_filter (or the
+// end_turn and max_tokens aliases the Chat decoder maps faithfully) is
+// refused rather than relabeled.
 func ValidateChatResponsesSubset(body []byte, stream bool) error {
+	if err := uniqueJSON(json.NewDecoder(bytes.NewReader(body)), 0); err != nil {
+		return ErrResponsesUnsupported
+	}
 	if err := validateChatUsagePresence(body, stream); err != nil {
 		return err
 	}
+	top, err := jsonObject(body)
+	if err != nil {
+		return err
+	}
+	for key, raw := range top {
+		if key != "choices" && key != "usage" && !chatEnvelopeMetadata[key] && !emptyJSON(raw) {
+			return chatFieldRefused(key)
+		}
+	}
+	if err := validateChatUsageCounters(top["usage"]); err != nil {
+		return err
+	}
+	var choices []json.RawMessage
+	if raw, ok := top["choices"]; ok && !nullJSON(raw) {
+		if err := json.Unmarshal(raw, &choices); err != nil {
+			return chatFieldRefused("choices")
+		}
+	}
+	if len(choices) > 1 || !stream && len(choices) != 1 {
+		return fmt.Errorf("%w: chat reply carries %d choices", ErrResponsesUnsupported, len(choices))
+	}
+	for _, raw := range choices {
+		if err := validateChatChoice(raw, stream); err != nil {
+			return err
+		}
+	}
+	// The carried fields must also have the types the legacy decoder reads.
 	var w ChatResponse
-	if err := strictJSON(body, &w); err != nil {
+	if err := json.Unmarshal(body, &w); err != nil {
 		return ErrResponsesUnsupported
 	}
-	if len(w.Choices) > 1 || !stream && len(w.Choices) != 1 {
-		return ErrResponsesUnsupported
+	return nil
+}
+
+// chatEnvelopeMetadata lists the documented reply envelope fields that carry
+// no assistant output.
+var chatEnvelopeMetadata = map[string]bool{
+	"id": true, "object": true, "created": true, "model": true,
+	"system_fingerprint": true, "service_tier": true, "obfuscation": true,
+}
+
+// chatFinishCarried lists the finish reasons the Chat decoder maps faithfully.
+var chatFinishCarried = map[string]bool{
+	"stop": true, "end_turn": true, "tool_calls": true,
+	"length": true, "max_tokens": true, "content_filter": true,
+}
+
+func chatFieldRefused(field string) error {
+	return fmt.Errorf("%w: chat reply field %q", ErrResponsesUnsupported, field)
+}
+
+func validateChatChoice(raw json.RawMessage, stream bool) error {
+	fields, err := jsonObject(raw)
+	if err != nil {
+		return err
 	}
-	if w.Usage != nil && (w.Usage.PromptTokens < 0 || w.Usage.CompletionTokens < 0) {
-		return ErrResponsesUnsupported
+	body := "message"
+	if stream {
+		body = "delta"
 	}
-	for _, choice := range w.Choices {
-		if choice.Index != 0 || choice.FinishReason != nil && *choice.FinishReason != "" && *choice.FinishReason != "stop" && *choice.FinishReason != "tool_calls" {
-			return ErrResponsesUnsupported
-		}
-		if choice.Message != nil {
-			if choice.Message.Role != "assistant" {
-				return ErrResponsesUnsupported
+	if _, ok := fields[body]; !ok && !stream {
+		return chatFieldRefused("choices[].message")
+	}
+	for key, v := range fields {
+		switch key {
+		case "index":
+			var index int
+			if err := json.Unmarshal(v, &index); err != nil || index != 0 {
+				return chatFieldRefused("choices[].index")
 			}
-			if choice.Message.Content != nil {
-				if _, ok := choice.Message.Content.(string); !ok {
-					return ErrResponsesUnsupported
-				}
+		case "finish_reason":
+			var finish *string
+			if err := json.Unmarshal(v, &finish); err != nil || finish != nil && *finish != "" && !chatFinishCarried[*finish] {
+				return chatFieldRefused("choices[].finish_reason")
 			}
-			for _, call := range choice.Message.ToolCalls {
-				if call.Type != "function" || call.ID == "" || call.Function.Name == "" || !json.Valid([]byte(call.Function.Arguments)) {
-					return ErrResponsesUnsupported
-				}
+		case body:
+			if err := validateChatMessage(v, stream); err != nil {
+				return err
 			}
-		}
-		if choice.Delta != nil {
-			if choice.Delta.Role != "" && choice.Delta.Role != "assistant" || len(choice.Delta.ToolCalls) > 1 {
-				return ErrResponsesUnsupported
-			}
-			for _, call := range choice.Delta.ToolCalls {
-				if call.Index < 0 || call.Type != "" && call.Type != "function" {
-					return ErrResponsesUnsupported
-				}
+		default:
+			if !emptyJSON(v) {
+				return chatFieldRefused("choices[]." + key)
 			}
 		}
 	}
 	return nil
+}
+
+func validateChatMessage(raw json.RawMessage, delta bool) error {
+	if delta && nullJSON(raw) {
+		return nil
+	}
+	fields, err := jsonObject(raw)
+	if err != nil {
+		return err
+	}
+	var role *string
+	for key, v := range fields {
+		switch key {
+		case "role":
+			if err := json.Unmarshal(v, &role); err != nil {
+				return chatFieldRefused("role")
+			}
+		case "content":
+			var content *string
+			if err := json.Unmarshal(v, &content); err != nil {
+				return chatFieldRefused("content")
+			}
+		case "tool_calls":
+			var calls []json.RawMessage
+			if err := json.Unmarshal(v, &calls); err != nil || delta && len(calls) > 1 {
+				return chatFieldRefused("tool_calls")
+			}
+			for _, call := range calls {
+				if err := validateChatToolCall(call, delta); err != nil {
+					return err
+				}
+			}
+		default:
+			if !emptyJSON(v) {
+				return chatFieldRefused(key)
+			}
+		}
+	}
+	if delta && role != nil && *role != "" && *role != "assistant" || !delta && (role == nil || *role != "assistant") {
+		return chatFieldRefused("role")
+	}
+	return nil
+}
+
+func validateChatToolCall(raw json.RawMessage, delta bool) error {
+	fields, err := jsonObject(raw)
+	if err != nil {
+		return err
+	}
+	var id, kind, name, arguments string
+	for key, v := range fields {
+		var target *string
+		switch key {
+		case "index":
+			var index int
+			if err := json.Unmarshal(v, &index); err != nil || index < 0 {
+				return chatFieldRefused("tool_calls[].index")
+			}
+			continue
+		case "id":
+			target = &id
+		case "type":
+			target = &kind
+		case "function":
+			function, err := jsonObject(v)
+			if err != nil {
+				return err
+			}
+			for fkey, fv := range function {
+				switch fkey {
+				case "name":
+					target = &name
+				case "arguments":
+					target = &arguments
+				default:
+					if !emptyJSON(fv) {
+						return chatFieldRefused("tool_calls[].function." + fkey)
+					}
+					continue
+				}
+				if err := json.Unmarshal(fv, target); err != nil {
+					return chatFieldRefused("tool_calls[].function." + fkey)
+				}
+			}
+			continue
+		default:
+			if !emptyJSON(v) {
+				return chatFieldRefused("tool_calls[]." + key)
+			}
+			continue
+		}
+		if err := json.Unmarshal(v, target); err != nil {
+			return chatFieldRefused("tool_calls[]." + key)
+		}
+	}
+	if delta {
+		if kind != "" && kind != "function" {
+			return chatFieldRefused("tool_calls[].type")
+		}
+		return nil
+	}
+	if kind != "function" || id == "" || name == "" || !json.Valid([]byte(arguments)) {
+		return chatFieldRefused("tool_calls[]")
+	}
+	return nil
+}
+
+func validateChatUsageCounters(raw json.RawMessage) error {
+	if raw == nil || nullJSON(raw) {
+		return nil
+	}
+	fields, err := jsonObject(raw)
+	if err != nil {
+		return err
+	}
+	for key, v := range fields {
+		switch key {
+		case "prompt_tokens", "completion_tokens", "total_tokens":
+			// Presence and arithmetic are checked by validateChatUsagePresence.
+		case "prompt_tokens_details", "completion_tokens_details":
+			if nullJSON(v) {
+				continue
+			}
+			details, err := jsonObject(v)
+			if err != nil {
+				return err
+			}
+			for detail, counter := range details {
+				if !nullJSON(counter) && !counterJSON(counter) {
+					return chatFieldRefused("usage." + key + "." + detail)
+				}
+			}
+		default:
+			if !nullJSON(v) && !counterJSON(v) {
+				return chatFieldRefused("usage." + key)
+			}
+		}
+	}
+	return nil
+}
+
+func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return nil, ErrResponsesUnsupported
+	}
+	return fields, nil
+}
+
+func nullJSON(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// emptyJSON reports whether raw carries nothing: null, "", [], {} or an object
+// whose members all carry nothing.
+func emptyJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	switch string(trimmed) {
+	case "null", `""`, "[]", "{}":
+		return true
+	}
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false
+	}
+	fields, err := jsonObject(trimmed)
+	if err != nil {
+		return false
+	}
+	for _, v := range fields {
+		if !emptyJSON(v) {
+			return false
+		}
+	}
+	return true
+}
+
+func counterJSON(raw json.RawMessage) bool {
+	var n int64
+	return json.Unmarshal(raw, &n) == nil && n >= 0
 }
 
 // Presence checks are local to the Responses bridge. The public legacy Chat

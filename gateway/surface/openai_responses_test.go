@@ -127,13 +127,29 @@ func TestResponsesSurfaceCanceledBlockedStreamReturns(t *testing.T) {
 }
 
 func TestResponsesSurfaceMissingUsageOrUnrepresentableOutput(t *testing.T) {
-	for _, resp := range []ir.Response{{Content: []ir.Part{{Kind: ir.PartText, Text: "hello"}}}, {UsageReported: true, Content: []ir.Part{{Kind: ir.PartImage, ImageURL: "x"}}}, {UsageReported: true, FinishReason: ir.FinishLength}} {
-		metered := 0
-		d := &responsesDispatcher{out: Outcome{Response: &resp, Meter: func(ir.Usage, ir.FinishReason) { metered++ }}}
-		rec := post(t, NewOpenAIResponses(d), "Bearer t", `{"model":"m","input":[]}`)
-		if rec.Code != 502 || metered != 0 {
-			t.Fatalf("unsupported output code=%d meter=%d", rec.Code, metered)
-		}
+	// Unreported usage is never served or metered. Reported usage is metered
+	// exactly once whatever the client sees: an unrepresentable reply is a
+	// 502, and a length finish is served as incomplete, never as completed.
+	for _, tc := range []struct {
+		name   string
+		resp   ir.Response
+		code   int
+		meter  int
+		status string
+	}{
+		{"missing_usage", ir.Response{Content: []ir.Part{{Kind: ir.PartText, Text: "hello"}}}, 502, 0, ""},
+		{"unrepresentable", ir.Response{UsageReported: true, Content: []ir.Part{{Kind: ir.PartImage, ImageURL: "x"}}}, 502, 1, ""},
+		{"length", ir.Response{UsageReported: true, FinishReason: ir.FinishLength}, 200, 1, `"status":"incomplete"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metered := 0
+			resp := tc.resp
+			d := &responsesDispatcher{out: Outcome{Response: &resp, Meter: func(ir.Usage, ir.FinishReason) { metered++ }}}
+			rec := post(t, NewOpenAIResponses(d), "Bearer t", `{"model":"m","input":[]}`)
+			if rec.Code != tc.code || metered != tc.meter || !strings.Contains(rec.Body.String(), tc.status) || strings.Contains(rec.Body.String(), `"status":"completed"`) {
+				t.Fatalf("code=%d meter=%d body=%s", rec.Code, metered, rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -468,4 +484,66 @@ func addedOutputIndices(t *testing.T, body string) []int {
 		}
 	}
 	return out
+}
+
+// failingWriter drops the client connection on the first write that carries
+// failOn, like a client that disconnects mid-reply.
+type failingWriter struct {
+	*httptest.ResponseRecorder
+	failOn string
+}
+
+func (f *failingWriter) Write(b []byte) (int, error) {
+	if strings.Contains(string(b), f.failOn) {
+		return 0, errors.New("client disconnected")
+	}
+	return f.ResponseRecorder.Write(b)
+}
+
+// TestResponsesSurfaceMetersFinishedUpstreamWhateverClientSees pins that an
+// upstream turn that finished and reported usage is metered exactly once even
+// when the client never receives the reply.
+func TestResponsesSurfaceMetersFinishedUpstreamWhateverClientSees(t *testing.T) {
+	usage := &ir.Usage{TokensIn: 3, TokensOut: 2}
+	for _, tc := range []struct {
+		name   string
+		body   string
+		failOn string
+		out    func(cancel context.CancelFunc) Outcome
+	}{
+		{"reply_write_fails", `{"model":"m","input":[]}`, `"object":"response"`, func(context.CancelFunc) Outcome {
+			return Outcome{Response: &ir.Response{Model: "m", FinishReason: ir.FinishStop, Usage: *usage, UsageReported: true, Content: []ir.Part{{Kind: ir.PartText, Text: "hi"}}}}
+		}},
+		{"native_terminal_write_fails", `{"model":"m","input":[],"stream":true}`, `"type":"response.completed"`, func(context.CancelFunc) Outcome {
+			ch := make(chan ir.StreamDelta, 2)
+			ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.created", ResponseID: "r"}}
+			ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.completed", ResponseID: "r", Usage: usage}}
+			close(ch)
+			return Outcome{Stream: &ir.Stream{Deltas: ch, Err: func() error { return nil }}}
+		}},
+		{"chat_client_gone_after_finish", `{"model":"m","input":[],"stream":true}`, "\x00never", func(cancel context.CancelFunc) Outcome {
+			ch := make(chan ir.StreamDelta, 2)
+			ch <- ir.StreamDelta{TextDelta: "hi"}
+			ch <- ir.StreamDelta{Finish: ir.FinishStop, Usage: usage}
+			close(ch)
+			// The upstream ended cleanly; the client disconnects just after.
+			return Outcome{Stream: &ir.Stream{Deltas: ch, Err: func() error { cancel(); return nil }}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			out := tc.out(cancel)
+			metered := 0
+			var got ir.Usage
+			out.Meter = func(u ir.Usage, _ ir.FinishReason) { metered++; got = u }
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tc.body)).WithContext(ctx)
+			req.Header.Set("Authorization", "Bearer t")
+			rec := &failingWriter{ResponseRecorder: httptest.NewRecorder(), failOn: tc.failOn}
+			NewOpenAIResponses(&responsesDispatcher{out: out}).ServeHTTP(rec, req)
+			if metered != 1 || got != *usage {
+				t.Fatalf("finished upstream metered %d times with %+v; body=%s", metered, got, rec.Body.String())
+			}
+		})
+	}
 }
