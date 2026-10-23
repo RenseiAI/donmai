@@ -122,8 +122,10 @@ verify-operational-payload-provenance-empty-cache:
 # warms the caller's module cache; it is the deterministic cache-warming path.
 warm-operational-payload-provenance-cache: verify-operational-payload-provenance
 
+# Lint on the release toolchain floor (go.mod), as CI's setup-go does: a newer
+# local Go writes export data the pinned golangci-lint cannot read.
 lint:
-	golangci-lint run
+	GOTOOLCHAIN=go1.26.6 golangci-lint run
 
 # `guard` stays fast and scoped to what you're about to commit: self-test
 # (proves the rules still fire) + --staged (this change only). --all currently
