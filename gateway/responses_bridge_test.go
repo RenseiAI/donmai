@@ -1,14 +1,18 @@
 package gateway_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/RenseiAI/donmai/gateway"
 	"github.com/RenseiAI/donmai/gateway/costfeed"
 )
 
@@ -405,6 +409,28 @@ func TestGatewayResponsesRefusedBilledTurnIsMetered(t *testing.T) {
 			`{"type":"response.created","response":{"id":"other"}}`,
 			`{"type":"response.completed","response":{"id":"other","usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 0},
 		{"native_failed_reply_with_usage", true, false, `{"id":"r","object":"response","status":"failed","error":{"code":"server_error","message":"x"},"output":[],"usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}`, 1},
+		// A creation the codec refuses still opens the response it names.
+		{"native_stream_refused_creation", true, true, nativeStream(
+			`{"type":"response.created","response":{"id":"r","top_logprobs":0}}`,
+			`{"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"m","delta":"hi"}`,
+			`{"type":"response.completed","response":{"id":"r","top_logprobs":0,"usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 1},
+		// The finish was accepted; the usage chunk that bills it is refused.
+		{"chat_stream_finish_then_refused_usage", false, true, realChatChunk(`{"role":"assistant","content":"done"}`, "null") + realChatChunk(`{}`, "stop") +
+			`data: {"choices":[],` + strings.Replace(realChatUsage, `"total_tokens":29,`, `"total_tokens":29,"cost":"0.1",`, 1) + `}` + "\n\n" + "data: [DONE]\n\n", 1},
+		// Negative counters are not a trustworthy report: nothing is written.
+		{"chat_negative_reasoning", false, false, strings.Replace(realChatReply(`{"role":"assistant","content":"x"}`, "stop"), `"reasoning_tokens":0`, `"reasoning_tokens":-7`, 1), 0},
+		{"chat_stream_negative_reasoning", false, true, strings.Replace(realChatStream(realChatChunk(`{"role":"assistant","content":"x"}`, "null"), realChatChunk(`{}`, "stop")), `"reasoning_tokens":0`, `"reasoning_tokens":-7`, 1), 0},
+		// A mid-stream event for another response does not stop the drain
+		// from reaching this response's own terminal.
+		{"native_stream_mismatch_then_terminal", true, true, nativeStream(
+			`{"type":"response.created","response":{"id":"r"}}`,
+			`{"type":"response.in_progress","response":{"id":"other"}}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 1},
+		// Usage on a snapshot that is not a terminal never bills an unfinished turn.
+		{"native_stream_refused_then_in_progress_usage", true, true, nativeStream(
+			`{"type":"response.created","response":{"id":"r"}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"tool_search_call","id":"ts"}}`,
+			`{"type":"response.in_progress","response":{"id":"r","status":"in_progress","usage":{"input_tokens":19,"output_tokens":10,"total_tokens":29}}}`), 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ts, _ := replyServer(t, tc.wire)
@@ -476,5 +502,89 @@ func TestGatewayResponsesNativeIncompleteIsServedAndMetered(t *testing.T) {
 				t.Fatalf("native incomplete meter=%+v", rows)
 			}
 		})
+	}
+}
+
+// TestGatewayResponsesRefusedDrainStopsOnClientCancel refuses a stream and
+// then lets the upstream run on: when the client gives up, the upstream
+// request is cancelled, no stream reader is left draining, and the turn that
+// never finished is not metered.
+func TestGatewayResponsesRefusedDrainStopsOnClientCancel(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		native      bool
+		first, more string
+	}{
+		{"chat", false, `data: {"choices":[{"index":0,"delta":{"role":"assistant","refusal":"no"},"finish_reason":null}]}`, `data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`},
+		{"native", true, `data: {"type":"response.created","response":{"id":"r"}}` + "\n\n" + `data: {"type":"response.output_item.added","output_index":0,"item":{"type":"tool_search_call","id":"ts"}}`, `data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"m","delta":"x"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hungUp := make(chan struct{})
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(hungUp)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, tc.first+"\n\n")
+				w.(http.Flusher).Flush()
+				tick := time.NewTicker(10 * time.Millisecond)
+				defer tick.Stop()
+				giveUp := time.After(5 * time.Second) // bounds the fixture if the reader never stops
+				for {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-giveUp:
+						return
+					case <-tick.C:
+						if _, err := io.WriteString(w, tc.more+"\n\n"); err != nil {
+							return
+						}
+						w.(http.Flusher).Flush()
+					}
+				}
+			}))
+			t.Cleanup(ts.Close)
+			sink := &costfeed.MemorySink{}
+			g := startGateway(t, sink)
+			b := bindResponses(t, g, "drain-cancel", "key", ts.URL, tc.native)
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.BaseURL+"/responses", strings.NewReader(`{"model":"fixture-model",`+userInput+`,"stream":true}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+b.Env[gateway.TokenEnvVar])
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
+			select {
+			case <-hungUp:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the upstream request outlived the client")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for readers := streamReaders(); readers != 0; readers = streamReaders() {
+				if time.Now().After(deadline) {
+					t.Fatalf("%d stream reader frames still running after the client left", readers)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if rows := sink.Events(); len(rows) != 0 {
+				t.Fatalf("an unfinished cancelled turn was metered %+v", rows)
+			}
+		})
+	}
+}
+
+// streamReaders counts stack frames of live upstream stream readers.
+func streamReaders() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			stacks := string(buf[:n])
+			return strings.Count(stacks, "upstream.(*OpenAICompat).readStreamMode") + strings.Count(stacks, "upstream.readResponsesStream")
+		}
+		buf = make([]byte, 2*len(buf))
 	}
 }

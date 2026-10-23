@@ -829,6 +829,7 @@ func TestValidateChatResponsesSubsetClassifiesFields(t *testing.T) {
 		// Content filters that blocked something are never served as a success.
 		{"azure_filtered_output_with_stop", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"logprobs":null`, `"logprobs":null,"content_filter_results":{"violence":{"filtered":true,"severity":"high"}}`, 1), false},
 		{"azure_filtered_prompt", reply(`{"role":"assistant","content":"x"}`, `,"prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"jailbreak":{"filtered":true,"detected":true}}}]`), false},
+		{"native_finish_reason_object", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"finish_reason":"stop"`, `"finish_reason":"stop","native_finish_reason":{"raw":"blocked"}`, 1), false},
 		{"usage_cost_text", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"total_tokens":29,`, `"total_tokens":29,"cost":"0.1",`, 1), false},
 	}
 	for _, tc := range refused {

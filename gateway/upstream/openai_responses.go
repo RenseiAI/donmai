@@ -112,6 +112,11 @@ func readResponsesStream(ctx context.Context, resp *http.Response) *ir.Stream {
 				event, err := translate.DecodeResponsesStreamEvent([]byte(payload))
 				if err != nil || name != "" && name != event.Kind {
 					refuse(errors.New("gateway/upstream: invalid responses stream event"))
+					// A refused creation still names the response this
+					// connection opened, so its billed terminal is matched.
+					if responseID == "" {
+						responseID = translate.ResponsesCreatedID([]byte(payload))
+					}
 					if billed(payload) {
 						return
 					}
@@ -161,7 +166,6 @@ func readResponsesStream(ctx context.Context, resp *http.Response) *ir.Stream {
 			}
 		}
 		if err := sc.Err(); err != nil {
-			refusedUsage = nil
 			refuse(errors.New("gateway/upstream: responses stream read failed"))
 		} else {
 			refuse(errors.New("gateway/upstream: responses stream closed before completion"))

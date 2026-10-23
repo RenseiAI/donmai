@@ -1263,7 +1263,8 @@ func applyResponseDetails(w *responsesWireResponse, d *ir.ResponseDetails) error
 //     content_filter finish, which is served as incomplete;
 //   - carried usage details: prompt_tokens_details.cached_tokens and
 //     completion_tokens_details.reasoning_tokens, which must be non-negative
-//     integers because they reach the cost row;
+//     integers because they reach the canonical usage (reasoning tokens are
+//     written to the cost row);
 //   - accounting, ignored: every other usage member (counters, costs, timings
 //     and flags) as long as it is numeric, boolean or null, or an object or
 //     array of those;
@@ -1674,6 +1675,22 @@ func ResponsesReplyUsage(body []byte) *ir.Usage {
 		return nil
 	}
 	return u
+}
+
+// ResponsesCreatedID reads, leniently, the response id a native
+// response.created event names, or "" for any other payload. A creation the
+// codec refused still opens that response on the connection.
+func ResponsesCreatedID(body []byte) string {
+	var w struct {
+		Type     string `json:"type"`
+		Response *struct {
+			ID string `json:"id"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &w); err != nil || w.Type != "response.created" || w.Response == nil {
+		return ""
+	}
+	return w.Response.ID
 }
 
 // ResponsesTerminalUsage reads, leniently, the usage a native terminal event
