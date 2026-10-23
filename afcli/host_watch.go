@@ -115,6 +115,10 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 				HostLabel:    hostname(),
 				Plain:        plain,
 				Replay:       replayFlag,
+				// An embedder supplies its handle map through the command
+				// context (see hostwatch.WithHandleEnricher); without it
+				// every label renders exactly as before.
+				Handles: hostwatch.HandleEnricherFrom(cmd.Context()),
 			})
 		},
 	}

@@ -25,8 +25,11 @@
 package afcli
 
 import (
+	"context"
+
 	"github.com/RenseiAI/donmai/afcli/linearcmd"
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/views/hostwatch"
 	"github.com/spf13/cobra"
 )
 
@@ -120,4 +123,20 @@ func NewRoutingCmd(ds func() afclient.DataSource) *cobra.Command {
 // to the downstream binary's own first-class command.
 func NewHostWatchCmd() *cobra.Command {
 	return newHostWatchCmd()
+}
+
+// HostWatchHandleEnricher maps a session id to its display handle for
+// `host watch`. It aliases the dashboard's hook so an external module can
+// name the contract without importing an internal package.
+//
+// The hook may be called concurrently with background updates filling the
+// handle map, so implementations must be safe for concurrent use.
+type HostWatchHandleEnricher = hostwatch.HandleEnricher
+
+// WithHostWatchHandleEnricher returns a context carrying the display-handle
+// hook the `host watch` command reads for session display names. Without a
+// hook every label renders exactly as before (issue identifier, then the
+// short session id).
+func WithHostWatchHandleEnricher(ctx context.Context, e HostWatchHandleEnricher) context.Context {
+	return hostwatch.WithHandleEnricher(ctx, e)
 }
