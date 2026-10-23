@@ -55,10 +55,16 @@ type Part struct {
 // ToolCall is a model's request to invoke a named tool with JSON arguments.
 // Arguments is the raw JSON argument object as the model emitted it (kept as a
 // string so a streaming assembler can append fragments without re-parsing).
+// For custom (freeform) tools Arguments carries the raw freeform input text.
+// Namespace names the Responses namespace the call belongs to (empty for
+// top-level function tools). Kind is "custom" for freeform calls and empty
+// or "function" for function calls.
 type ToolCall struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+	Namespace string `json:"namespace,omitempty"`
+	Kind      string `json:"kind,omitempty"`
 }
 
 // Message is one turn in the canonical conversation.
@@ -68,10 +74,16 @@ type Message struct {
 }
 
 // ToolDef declares a callable tool. Parameters is a JSON Schema object.
+// Kind is "", "function", "custom", or "namespace" (empty means function
+// for back-compat). Format carries a custom (freeform) tool's grammar
+// descriptor. Tools carries a namespace tool's nested function/custom tools.
 type ToolDef struct {
+	Kind        string         `json:"kind,omitempty"`
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	Parameters  map[string]any `json:"parameters,omitempty"`
+	Format      map[string]any `json:"format,omitempty"`
+	Tools       []ToolDef      `json:"tools,omitempty"`
 }
 
 // Sampling holds the canonical decoding parameters. Pointers so "unset" is

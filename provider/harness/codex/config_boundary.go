@@ -286,7 +286,14 @@ func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL, key string, sp
 	if strings.Contains(string(body), codexGatewayProviderID) {
 		return projectGatewayKey(specEnv, key), b.validate()
 	}
+	// A gateway-routed Codex session must never offer hosted (server-executed)
+	// tools: the gateway has no server-side tool to run and refuses them
+	// fail-closed. web_search is disabled here so Codex never sends it;
+	// tool_search is always enabled in the pinned CLI (its feature flag is a
+	// Removed no-op), so the gateway refusal is its enforcement — the
+	// isolated home carries no tool_search switch to flip.
 	block := "model_provider = " + tomlBasicString(codexGatewayProviderID) + "\n" +
+		"web_search = \"disabled\"\n" +
 		"[model_providers." + codexGatewayProviderID + "]\n" +
 		"name = " + tomlBasicString(codexGatewayProviderID) + "\n" +
 		"base_url = " + tomlBasicString(baseURL) + "\n" +

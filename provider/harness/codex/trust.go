@@ -247,8 +247,14 @@ func gatewayProviderConfigOverride(baseURL string) []string {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil
 	}
+	// web_search="disabled" rides the CLI layer above every file layer so a
+	// repo-checked-in web_search stanza cannot re-enable a hosted tool the
+	// gateway would have to refuse. tool_search has no Codex off switch
+	// (Removed no-op in the pinned CLI); its enforcement is the gateway's
+	// typed refusal.
 	return []string{
 		"--config", "model_provider=" + tomlBasicString(codexGatewayProviderID),
+		"--config", "web_search=" + tomlBasicString("disabled"),
 		"--config", "model_providers." + codexGatewayProviderID + ".base_url=" + tomlBasicString(strings.TrimSpace(baseURL)),
 		"--config", "model_providers." + codexGatewayProviderID + ".env_key=" + tomlBasicString(codexGatewayEnvKey),
 		"--config", "model_providers." + codexGatewayProviderID + ".wire_api=\"responses\"",

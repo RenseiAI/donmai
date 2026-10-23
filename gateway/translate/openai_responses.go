@@ -16,8 +16,10 @@
 // Fail-closed rules (never silently discard or fabricate):
 //   - previous_response_id / item_reference: refused — the gateway keeps no
 //     response-state store and invents no history authority.
-//   - non-function tools (web_search, file_search, …): refused — the hub has
-//     no server-side tool to run.
+//   - hosted tools (web_search, tool_search, file_search, …) and hosted
+//     items (web_search_call, …): refused with ErrResponsesHostedTool — the
+//     hub has no server-side tool to run and never drops them silently.
+//     Client-executed kinds (function, custom, namespace) are served.
 //   - unknown input item / content part types: refused — not silently skipped.
 //   - parallel_tool_calls:false: refused — the gateway cannot enforce serial
 //     tool use on a third-party upstream.
@@ -38,11 +40,18 @@ package translate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/RenseiAI/donmai/gateway/ir"
 )
+
+// ErrResponsesHostedTool refuses a hosted (server-executed) tool kind that
+// the gateway cannot run. The gateway only serves client-executed tools
+// (function, custom, namespace); hosted kinds (web_search, tool_search and
+// any other server-side tool) are never dropped silently.
+var ErrResponsesHostedTool = errors.New("gateway/translate: responses hosted tool is not supported")
 
 // ─── OpenAI Responses wire types (the subset the gateway maps) ───────────────
 
@@ -67,12 +76,18 @@ type ResponsesRequest struct {
 	Modalities         []string            `json:"modalities,omitempty"`
 }
 
-// ResponsesTool is one tool declaration. Only type "function" is served.
+// ResponsesTool is one tool declaration. The gateway serves the
+// client-executed kinds: function, custom (freeform), and namespace (a named
+// group of function/custom tools). Hosted (server-executed) kinds such as
+// web_search and tool_search are refused fail-closed (see
+// ErrResponsesHostedTool) — they are never dropped silently.
 type ResponsesTool struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name,omitempty"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Type        string          `json:"type"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Parameters  map[string]any  `json:"parameters,omitempty"`
+	Format      map[string]any  `json:"format,omitempty"`
+	Tools       []ResponsesTool `json:"tools,omitempty"`
 }
 
 // ResponsesReasoning is the reasoning effort request.
@@ -83,21 +98,25 @@ type ResponsesReasoning struct {
 
 // ResponsesInputItem is one element of the input array. Type discriminates:
 // "message" (user/system/developer/assistant text or images),
-// "function_call_output" (a tool result), "function_call" (a replayed prior
-// assistant tool call — mapped back to an assistant tool_call part), or
-// "reasoning" (a summary the hub carries as thinking content).
+// "function_call_output" / "custom_tool_call_output" (a tool result),
+// "function_call" / "custom_tool_call" (a replayed prior assistant tool call
+// — mapped back to an assistant tool_call part), or "reasoning" (a summary
+// the hub carries as thinking content).
 type ResponsesInputItem struct {
-	Type    string         `json:"type"`
-	Role    string         `json:"role,omitempty"`
-	Content any            `json:"content,omitempty"`
-	CallID  string         `json:"call_id,omitempty"`
-	Output  any            `json:"output,omitempty"`
-	Name    string         `json:"name,omitempty"`
-	ID      string         `json:"id,omitempty"`
-	CallID2 string         `json:"-"`
-	Summary []ResponseText `json:"summary,omitempty"`
+	Type      string         `json:"type"`
+	Role      string         `json:"role,omitempty"`
+	Content   any            `json:"content,omitempty"`
+	CallID    string         `json:"call_id,omitempty"`
+	Output    any            `json:"output,omitempty"`
+	Name      string         `json:"name,omitempty"`
+	ID        string         `json:"id,omitempty"`
+	CallID2   string         `json:"-"`
+	Summary   []ResponseText `json:"summary,omitempty"`
+	Namespace string         `json:"namespace,omitempty"`
 	// Arguments carries a replayed function_call's argument string.
 	Arguments string `json:"arguments,omitempty"`
+	// Input carries a replayed custom_tool_call's freeform input string.
+	Input string `json:"input,omitempty"`
 }
 
 // ResponseText is a {type:"summary_text", text} entry in a reasoning summary.
@@ -141,8 +160,13 @@ func responsesRequestToIR(rr ResponsesRequest) (ir.Request, error) {
 		}
 	}
 	for _, t := range rr.Tools {
-		if t.Type != "function" {
-			return ir.Request{}, fmt.Errorf("gateway/translate: responses tool type %q is not supported (function tools only)", t.Type)
+		if err := checkResponsesToolKind(t.Type); err != nil {
+			return ir.Request{}, err
+		}
+		if t.Type == "namespace" {
+			if err := checkResponsesNamespaceTools(t); err != nil {
+				return ir.Request{}, err
+			}
 		}
 	}
 
@@ -163,11 +187,11 @@ func responsesRequestToIR(rr ResponsesRequest) (ir.Request, error) {
 		req.Thinking = ir.ThinkingSpec{Level: level, Emit: ir.EmitFull}
 	}
 	for _, t := range rr.Tools {
-		req.Tools = append(req.Tools, ir.ToolDef{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  t.Parameters,
-		})
+		def, err := responsesToolToIR(t)
+		if err != nil {
+			return ir.Request{}, err
+		}
+		req.Tools = append(req.Tools, def)
 	}
 	req.ToolChoice = responsesToolChoiceToIR(rr.ToolChoice)
 
@@ -210,6 +234,8 @@ func appendResponsesInput(req *ir.Request, input any) error {
 			Name:      stringVal(m, "name"),
 			ID:        stringVal(m, "id"),
 			Arguments: stringVal(m, "arguments"),
+			Namespace: stringVal(m, "namespace"),
+			Input:     stringVal(m, "input"),
 		}
 		item.Type, _ = m["type"].(string)
 		item.Content = m["content"]
@@ -231,6 +257,119 @@ func appendResponsesInput(req *ir.Request, input any) error {
 	return nil
 }
 
+// checkResponsesToolKind refuses hosted (server-executed) tool kinds
+// fail-closed with a typed error. Client-executed kinds (function, custom,
+// namespace) pass; hosted kinds (web_search, tool_search) and any other
+// unknown kind are never dropped silently.
+func checkResponsesToolKind(kind string) error {
+	switch kind {
+	case "function", "custom", "namespace":
+		return nil
+	case "web_search", "tool_search":
+		return fmt.Errorf("%w: tool type %q requires server-side execution the gateway does not provide", ErrResponsesHostedTool, kind)
+	default:
+		if kind == "" {
+			return fmt.Errorf("gateway/translate: responses tool is missing its type")
+		}
+		return fmt.Errorf("%w: tool type %q is not supported", ErrResponsesHostedTool, kind)
+	}
+}
+
+// checkResponsesNamespaceTools validates a namespace tool's nested tools:
+// only function and custom children are served, never a nested namespace and
+// never a hosted kind.
+func checkResponsesNamespaceTools(t ResponsesTool) error {
+	if t.Name == "" {
+		return fmt.Errorf("gateway/translate: responses namespace tool is missing its name")
+	}
+	if len(t.Tools) == 0 {
+		return fmt.Errorf("gateway/translate: responses namespace tool %q carries no tools", t.Name)
+	}
+	for _, child := range t.Tools {
+		switch child.Type {
+		case "function", "custom":
+		default:
+			return fmt.Errorf("%w: namespace tool %q nests unsupported tool type %q", ErrResponsesHostedTool, t.Name, child.Type)
+		}
+		if child.Type == "namespace" || len(child.Tools) > 0 {
+			return fmt.Errorf("gateway/translate: responses namespace tool %q must not nest namespaces", t.Name)
+		}
+	}
+	return nil
+}
+
+// responsesToolToIR maps one client-executed tool declaration into the IR.
+// Function tools behave as before; custom carries its grammar format and
+// namespace carries its nested function/custom tools.
+func responsesToolToIR(t ResponsesTool) (ir.ToolDef, error) {
+	switch t.Type {
+	case "function":
+		if t.Name == "" {
+			return ir.ToolDef{}, fmt.Errorf("gateway/translate: responses function tool is missing its name")
+		}
+		return ir.ToolDef{
+			Kind:        "function",
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		}, nil
+	case "custom":
+		if t.Name == "" {
+			return ir.ToolDef{}, fmt.Errorf("gateway/translate: responses custom tool is missing its name")
+		}
+		if len(t.Format) == 0 {
+			return ir.ToolDef{}, fmt.Errorf("gateway/translate: responses custom tool %q is missing its format", t.Name)
+		}
+		return ir.ToolDef{
+			Kind:        "custom",
+			Name:        t.Name,
+			Description: t.Description,
+			Format:      t.Format,
+		}, nil
+	case "namespace":
+		if err := checkResponsesNamespaceTools(t); err != nil {
+			return ir.ToolDef{}, err
+		}
+		def := ir.ToolDef{
+			Kind:        "namespace",
+			Name:        t.Name,
+			Description: t.Description,
+		}
+		for _, child := range t.Tools {
+			cdef, err := responsesToolToIR(child)
+			if err != nil {
+				return ir.ToolDef{}, err
+			}
+			def.Tools = append(def.Tools, cdef)
+		}
+		return def, nil
+	default:
+		return ir.ToolDef{}, checkResponsesToolKind(t.Type)
+	}
+}
+
+// responsesToolFromIR maps one IR tool back onto its Responses wire shape.
+// It is the inverse of responsesToolToIR: function, custom, and namespace
+// round-trip; hosted kinds never appear in the IR so they can never be
+// emitted here.
+func responsesToolFromIR(def ir.ToolDef) ResponsesTool {
+	kind := def.Kind
+	if kind == "" {
+		kind = "function"
+	}
+	out := ResponsesTool{
+		Type:        kind,
+		Name:        def.Name,
+		Description: def.Description,
+		Parameters:  def.Parameters,
+		Format:      def.Format,
+	}
+	for _, child := range def.Tools {
+		out.Tools = append(out.Tools, responsesToolFromIR(child))
+	}
+	return out
+}
+
 func stringVal(m map[string]any, key string) string {
 	s, _ := m[key].(string)
 	return s
@@ -250,7 +389,7 @@ func appendResponsesItem(req *ir.Request, i int, item ResponsesInputItem) error 
 		}
 		req.Messages = append(req.Messages, ir.Message{Role: role, Parts: parts})
 		return nil
-	case "function_call_output":
+	case "function_call_output", "custom_tool_call_output":
 		text, err := responsesOutputText(item.Output)
 		if err != nil {
 			return fmt.Errorf("gateway/translate: responses input item %d: %w", i, err)
@@ -263,11 +402,31 @@ func appendResponsesItem(req *ir.Request, i int, item ResponsesInputItem) error 
 	case "function_call":
 		// A replayed prior assistant tool call: back onto an assistant
 		// tool_call part so the upstream sees the same call it issued.
+		// The namespace rides the IR ToolCall so a namespaced follow-up
+		// returns to the same namespace on encode.
+		if item.CallID == "" || item.Name == "" {
+			return fmt.Errorf("gateway/translate: responses input item %d is a function_call missing call_id or name", i)
+		}
 		req.Messages = append(req.Messages, ir.Message{
 			Role: ir.RoleAssistant,
 			Parts: []ir.Part{{
 				Kind:     ir.PartToolCall,
-				ToolCall: &ir.ToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Arguments},
+				ToolCall: &ir.ToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Arguments, Namespace: item.Namespace, Kind: "function"},
+			}},
+		})
+		return nil
+	case "custom_tool_call":
+		// A replayed prior freeform call: the freeform input rides
+		// Arguments so the chat upstream sees the same bytes; the kind
+		// marks it for custom_tool_call re-encode on the way back.
+		if item.CallID == "" || item.Name == "" {
+			return fmt.Errorf("gateway/translate: responses input item %d is a custom_tool_call missing call_id or name", i)
+		}
+		req.Messages = append(req.Messages, ir.Message{
+			Role: ir.RoleAssistant,
+			Parts: []ir.Part{{
+				Kind:     ir.PartToolCall,
+				ToolCall: &ir.ToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Input, Namespace: item.Namespace, Kind: "custom"},
 			}},
 		})
 		return nil
@@ -288,6 +447,8 @@ func appendResponsesItem(req *ir.Request, i int, item ResponsesInputItem) error 
 		return nil
 	case "item_reference":
 		return fmt.Errorf("gateway/translate: responses input item %d is an item_reference, which requires response history the gateway does not keep", i)
+	case "web_search_call", "tool_search_call", "file_search_call", "computer_call", "computer_use_call", "image_generation_call":
+		return fmt.Errorf("%w: responses input item %d is a hosted %q item requiring server-side execution", ErrResponsesHostedTool, i, item.Type)
 	default:
 		return fmt.Errorf("gateway/translate: responses input item %d has unsupported type %q", i, item.Type)
 	}
@@ -420,8 +581,8 @@ type ResponsesObject struct {
 	IncompleteDetails *ResponsesIncomplete  `json:"incomplete_details,omitempty"`
 }
 
-// ResponsesOutputItem is one output entry: a message, a function_call, or a
-// reasoning summary.
+// ResponsesOutputItem is one output entry: a message, a function_call, a
+// custom_tool_call, or a reasoning summary.
 type ResponsesOutputItem struct {
 	Type      string                   `json:"type"`
 	ID        string                   `json:"id,omitempty"`
@@ -431,6 +592,8 @@ type ResponsesOutputItem struct {
 	CallID    string                   `json:"call_id,omitempty"`
 	Name      string                   `json:"name,omitempty"`
 	Arguments string                   `json:"arguments,omitempty"`
+	Input     string                   `json:"input,omitempty"`
+	Namespace string                   `json:"namespace,omitempty"`
 	Summary   []ResponsesSummaryPart   `json:"summary,omitempty"`
 }
 
@@ -538,12 +701,15 @@ func responsesUsageFromIR(u ir.Usage) *ResponsesUsage {
 }
 
 // responsesOutputItems renders IR content as Responses output items: reasoning
-// summaries first, then the assistant message, then one function_call item per
-// tool call — the order native Responses servers use.
+// summaries first, then the assistant message, then one function_call or
+// custom_tool_call item per tool call — the order native Responses servers
+// use. Custom calls carry their freeform input in input (not arguments) and
+// namespaced calls carry their namespace so follow-ups return to the same
+// namespace.
 func responsesOutputItems(resp ir.Response, ids ResponsesIDs) []ResponsesOutputItem {
 	var thinking, text strings.Builder
 	type call struct {
-		id, name, args string
+		id, name, args, namespace, kind string
 	}
 	var calls []call
 	for _, p := range resp.Content {
@@ -554,7 +720,7 @@ func responsesOutputItems(resp ir.Response, ids ResponsesIDs) []ResponsesOutputI
 			thinking.WriteString(p.Text)
 		case ir.PartToolCall:
 			if p.ToolCall != nil {
-				calls = append(calls, call{id: p.ToolCall.ID, name: p.ToolCall.Name, args: p.ToolCall.Arguments})
+				calls = append(calls, call{id: p.ToolCall.ID, name: p.ToolCall.Name, args: p.ToolCall.Arguments, namespace: p.ToolCall.Namespace, kind: p.ToolCall.Kind})
 			}
 		}
 	}
@@ -581,6 +747,18 @@ func responsesOutputItems(resp ir.Response, ids ResponsesIDs) []ResponsesOutputI
 		if id == "" {
 			id = fmt.Sprintf("%s-fc-%d", ids.Response, i)
 		}
+		if c.kind == "custom" {
+			out = append(out, ResponsesOutputItem{
+				Type:      "custom_tool_call",
+				ID:        id,
+				CallID:    id,
+				Status:    "completed",
+				Name:      c.name,
+				Input:     c.args,
+				Namespace: c.namespace,
+			})
+			continue
+		}
 		out = append(out, ResponsesOutputItem{
 			Type:      "function_call",
 			ID:        id,
@@ -588,6 +766,7 @@ func responsesOutputItems(resp ir.Response, ids ResponsesIDs) []ResponsesOutputI
 			Status:    "completed",
 			Name:      c.name,
 			Arguments: c.args,
+			Namespace: c.namespace,
 		})
 	}
 	if out == nil {

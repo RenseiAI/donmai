@@ -193,8 +193,32 @@ func chatRequestToIR(cr ChatRequest) (ir.Request, error) {
 }
 
 // EncodeRequest maps the canonical IR back onto a /v1/chat/completions request
-// body for an OpenAI-compatible upstream.
+// body for an OpenAI-compatible upstream. Only function tools are served: a
+// custom or namespace tool (or a namespaced/custom call) is refused
+// fail-closed — such sessions require a native Responses upstream, and
+// silently flattening them onto chat function tools would fabricate a tool
+// contract the model never saw.
 func EncodeRequest(req ir.Request) ([]byte, error) {
+	for _, t := range req.Tools {
+		if t.Kind != "" && t.Kind != "function" {
+			return nil, fmt.Errorf("%w: chat upstream cannot serve %q tool %q (function tools only)", ErrResponsesHostedTool, t.Kind, t.Name)
+		}
+		if len(t.Tools) > 0 || len(t.Format) > 0 {
+			return nil, fmt.Errorf("%w: chat upstream cannot serve namespaced/custom tool %q (function tools only)", ErrResponsesHostedTool, t.Name)
+		}
+	}
+	for _, m := range req.Messages {
+		for _, p := range m.Parts {
+			if p.Kind == ir.PartToolCall && p.ToolCall != nil {
+				if p.ToolCall.Kind != "" && p.ToolCall.Kind != "function" {
+					return nil, fmt.Errorf("%w: chat upstream cannot serve %q call %q (function calls only)", ErrResponsesHostedTool, p.ToolCall.Kind, p.ToolCall.Name)
+				}
+				if p.ToolCall.Namespace != "" {
+					return nil, fmt.Errorf("%w: chat upstream cannot serve namespaced call %q (function calls only)", ErrResponsesHostedTool, p.ToolCall.Name)
+				}
+			}
+		}
+	}
 	cr := ChatRequest{
 		Model:  req.Model,
 		Stream: req.Stream,
