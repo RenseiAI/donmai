@@ -68,6 +68,13 @@ type Record struct {
 	// normal and signalling a reused PID is how cleanup code kills the wrong
 	// process (§D2, §D10).
 	ProcessStartedAt int64 `json:"processStartedAt"`
+	// ProcessStartTicks and BootID carry the Linux drift-free identity
+	// beside ProcessStartedAt: raw field-22 ticks-since-boot plus the boot
+	// ID. Both are empty on platforms without them and on records that
+	// predate them; the Linux comparison prefers them and never consults
+	// the wall clock.
+	ProcessStartTicks int64  `json:"processStartTicks,omitempty"`
+	BootID            string `json:"bootId,omitempty"`
 
 	SocketPath string `json:"socketPath"`
 	// SocketDevice / SocketInode bind the record to the exact socket file that

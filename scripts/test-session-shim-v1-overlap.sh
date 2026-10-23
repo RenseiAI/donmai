@@ -66,12 +66,59 @@ run_reverse_overlap() {
   (cd "$old_tree" && GOWORK=off go build -o "$old_binary" ./cmd/session-shim-overlap)
   "$new_shim_binary" "$registry" "org-reverse-$suffix" "session-reverse-$suffix" "$workarea" &
   old_pids+=("$!")
+  new_shim_pid="$!"
   for _ in $(seq 1 400); do
     if [[ -n "$(find "$registry" -name '*.json' -print -quit)" ]]; then
       break
     fi
     sleep 0.025
   done
+  # The Linux start-time unit changed from raw /proc ticks to Unix
+  # nanoseconds, so a released controller (raw-tick comparison) cannot match
+  # a new-format record. It must leave the record stale — fail closed, kill
+  # nothing — and upgrades stay controller-first. Other platforms never
+  # changed units, so adoption still succeeds there.
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    reverse_out="$overlap_tmp/reverse-$suffix.out"
+    if "$old_binary" "$registry" "org-reverse-$suffix" "session-reverse-$suffix" "$workarea" "$released_sha" >"$reverse_out" 2>&1; then
+      echo "released controller unexpectedly adopted a new-format record on Linux" >&2
+      cat "$reverse_out" >&2
+      exit 1
+    fi
+    if ! grep -q "adopted=0" "$reverse_out"; then
+      echo "released controller failed without the pinned adopted=0 stale refusal" >&2
+      cat "$reverse_out" >&2
+      exit 1
+    fi
+    if [[ -n "$(find "$registry" -name '*.ack' -print -quit)" ]]; then
+      echo "selected-v2 overlap unexpectedly published a v3-only ACK sidecar" >&2
+      exit 1
+    fi
+    if [[ -z "$(find "$registry" -name '*.json' -print -quit)" ]]; then
+      echo "released controller removed a record it refused to adopt" >&2
+      exit 1
+    fi
+    if ! kill -0 "$new_shim_pid" 2>/dev/null; then
+      echo "released controller killed a shim it refused to adopt" >&2
+      exit 1
+    fi
+    # A released v0.68.2 scanner ignores unknown non-.json entries: the corrupt
+    # sidecar-shaped sentinel must leave the outcome unchanged (same stale
+    # refusal, no crash on the unknown file).
+    printf '%s' 'corrupt-v3-only-sidecar' > "$registry/overlap-corrupt.ack"
+    if "$old_binary" "$registry" "org-reverse-$suffix" "session-reverse-$suffix" "$workarea" "$released_sha" >"$reverse_out" 2>&1; then
+      echo "released controller unexpectedly adopted a new-format record on Linux" >&2
+      cat "$reverse_out" >&2
+      exit 1
+    fi
+    if ! grep -q "adopted=0" "$reverse_out"; then
+      echo "released controller failed without the pinned adopted=0 stale refusal" >&2
+      cat "$reverse_out" >&2
+      exit 1
+    fi
+    echo "PINNED-REVERSE-OVERLAP documented-break old=$released_sha selected=2 new_format_record=stale_not_adopted"
+    return 0
+  fi
   "$old_binary" "$registry" "org-reverse-$suffix" "session-reverse-$suffix" "$workarea" "$released_sha"
   if [[ -n "$(find "$registry" -name '*.ack' -print -quit)" ]]; then
     echo "selected-v2 overlap unexpectedly published a v3-only ACK sidecar" >&2

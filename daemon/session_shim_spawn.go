@@ -2314,9 +2314,12 @@ func shimDiscoveryRecordMatchesLaunch(rec sessionshim.Record, id sessionshim.Ide
 	if started.StartedAt == 0 {
 		return false
 	}
-	return rec.OrgID == id.OrgID && rec.SessionID == id.SessionID &&
-		rec.ProcessEpoch == launch.ProcessEpoch && rec.PID == started.PID &&
-		rec.ProcessStartedAt == started.StartedAt
+	if rec.OrgID != id.OrgID || rec.SessionID != id.SessionID ||
+		rec.ProcessEpoch != launch.ProcessEpoch || rec.PID != started.PID {
+		return false
+	}
+	recID := sessionshim.ProcessIdentity{PID: rec.PID, StartedAt: rec.ProcessStartedAt, StartTicks: rec.ProcessStartTicks, BootID: rec.BootID}
+	return recID.Matches(started)
 }
 
 // launchedSessionTmpClaim picks up the executor-owned scratch-directory claim

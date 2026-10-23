@@ -183,16 +183,20 @@ func TestSeatLaunchIsDisposedWithTheTerminalProof(t *testing.T) {
 // member set. Released daemons decode it with DisallowUnknownFields, so a new
 // member — a seat fact, say — would make every older daemon quarantine every
 // interactive shim launched after it. New per-launch state goes in a sidecar
-// beside the record instead (see seat.go, flowcontrol.go, ack.go). The one
-// member added since is `workload`, which interactive records omit (absence
-// means the PTY profile), so their bytes are unchanged; it is pinned below
-// together with that omission.
+// beside the record instead (see seat.go, flowcontrol.go, ack.go). The members
+// added since are `workload`, which interactive records omit (absence means
+// the PTY profile), and the Linux drift-free identity (`processStartTicks`,
+// `bootId`), which records without the key omit so their bytes stay identical
+// to what released readers decode; both omissions are pinned below. A Linux
+// record with the key changes bytes and older daemons quarantine it fail
+// closed (kill nothing) — the documented one-way break for the start-time
+// conversion, which upgrades controller-first.
 func TestInteractiveRecordKeepsTheReleasedSchema(t *testing.T) {
 	t.Parallel()
 
 	released := []string{
-		"createdAt", "orgId", "orphanDeadlineAt", "phase", "pid", "processEpoch",
-		"processStartedAt", "protocolMax", "protocolMin", "resumeKey", "schemaVersion",
+		"bootId", "createdAt", "orgId", "orphanDeadlineAt", "phase", "pid", "processEpoch",
+		"processStartTicks", "processStartedAt", "protocolMax", "protocolMin", "resumeKey", "schemaVersion",
 		"sessionId", "shimId", "socketDevice", "socketInode", "socketPath",
 		"workareaPath", "workarea_root", "workload",
 	}
@@ -216,6 +220,9 @@ func TestInteractiveRecordKeepsTheReleasedSchema(t *testing.T) {
 	}
 	if strings.Contains(string(raw), `"workload"`) {
 		t.Fatalf("interactive record encodes a workload member: %s; released readers refuse it", raw)
+	}
+	if strings.Contains(string(raw), `"processStartTicks"`) || strings.Contains(string(raw), `"bootId"`) {
+		t.Fatalf("interactive record without the drift-free key encodes it anyway: %s; released readers refuse unknown members", raw)
 	}
 }
 

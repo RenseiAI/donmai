@@ -315,7 +315,7 @@ func (d *Daemon) observeSessionShimAbsence(
 // quarantine is where it stays, and a probe that read an error as death would
 // discharge a lineage on the strength of the one answer it did not get.
 func (d *Daemon) sessionShimProcessGone(key shimIncarnation, rec sessionshim.Record, reading string) bool {
-	identity := sessionshim.ProcessIdentity{PID: rec.PID, StartedAt: rec.ProcessStartedAt}
+	identity := sessionshim.ProcessIdentity{PID: rec.PID, StartedAt: rec.ProcessStartedAt, StartTicks: rec.ProcessStartTicks, BootID: rec.BootID}
 	alive, err := d.readSessionShimLiveness(identity)
 	if err != nil {
 		slog.Warn("session shim: process identity unverifiable; not attesting absence",
@@ -472,7 +472,7 @@ func (d *Daemon) retainProvenSessionShimAbsence(
 		observedAt = time.Now().UnixNano()
 	}
 	proof := sessionShimAbsenceProof{
-		process:    sessionshim.ProcessIdentity{PID: record.PID, StartedAt: record.ProcessStartedAt},
+		process:    sessionshim.ProcessIdentity{PID: record.PID, StartedAt: record.ProcessStartedAt, StartTicks: record.ProcessStartTicks, BootID: record.BootID},
 		observedAt: observedAt,
 	}
 	d.retainSessionShimAbsence(key, proof)

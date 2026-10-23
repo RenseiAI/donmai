@@ -28,7 +28,17 @@ func TestProcessIdentityForPinsALiveChild(t *testing.T) {
 	if err != nil || !alive {
 		t.Fatalf("pinned live child reported alive=%t err=%v", alive, err)
 	}
-	reused := ProcessIdentity{PID: identity.PID, StartedAt: identity.StartedAt + 1}
+	// A reused pid is a different incarnation: mutate the drift-free key
+	// when the platform carries one (Linux ticks plus boot ID), else the
+	// Unix-nanosecond start time. Mutating only StartedAt on Linux would
+	// leave the ticks plus boot ID identical and must still verify — the
+	// wall clock is not part of the identity.
+	reused := identity
+	if reused.StartTicks > 0 && reused.BootID != "" {
+		reused.StartTicks++
+	} else {
+		reused.StartedAt++
+	}
 	if alive, err := reused.Alive(); err != nil || alive {
 		t.Fatalf("a pid with a different start time reported alive=%t err=%v — a reused pid is a "+
 			"DIFFERENT process and the recorded one is gone", alive, err)

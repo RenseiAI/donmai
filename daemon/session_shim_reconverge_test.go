@@ -470,6 +470,7 @@ func TestBootBatchSurvivesAlreadyRecordedAdoptionEvidence(t *testing.T) {
 		}
 		alive, err := sessionshim.ProcessIdentity{
 			PID: record.PID, StartedAt: record.ProcessStartedAt,
+			StartTicks: record.ProcessStartTicks, BootID: record.BootID,
 		}.Alive()
 		if err != nil {
 			t.Fatalf("%s shim liveness: %v", sessionID, err)

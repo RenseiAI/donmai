@@ -31,6 +31,22 @@ func processStartTime(pid int) (int64, error) {
 	return tv.Sec*1e9 + int64(tv.Usec)*1e3, nil
 }
 
+// processIdentityExtra reports the drift-free key for pid. Darwin has no
+// ticks/boot-ID pair; the Unix-nanosecond start time is already wall-clock
+// stable (stamped once at fork), so there is nothing extra to carry.
+func processIdentityExtra(int) (int64, string, error) { return 0, "", nil }
+
+// validateStoredProcessIdentity checks a stored identity before comparison.
+// Darwin needs no validation beyond what processStartTime already enforces.
+func validateStoredProcessIdentity(ProcessIdentity) error { return nil }
+
+// processIdentityMatches reports whether two identities name the same process
+// incarnation. The darwin reader is wall-clock stable, so identity is exact
+// equality on the Unix-nanosecond start time.
+func processIdentityMatches(a, b ProcessIdentity) (bool, error) {
+	return a.StartedAt == b.StartedAt, nil
+}
+
 // isNoSuchProcess maps the several ways this sysctl reports an unknown pid onto
 // one answer.
 //

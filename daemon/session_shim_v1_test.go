@@ -39,7 +39,9 @@ func TestSelectedV1StaysLocallyAdoptedButPublishesCarrierQuarantine(t *testing.T
 	record := sessionshim.Record{
 		SchemaVersion: sessionshim.RecordSchemaVersion,
 		OrgID:         id.OrgID, SessionID: id.SessionID, ShimID: "released-v1-shim", ProcessEpoch: 9,
-		PID: self.PID, ProcessStartedAt: self.StartedAt, SocketPath: socketPath,
+		PID: self.PID, ProcessStartedAt: self.StartedAt,
+		ProcessStartTicks: self.StartTicks, BootID: self.BootID,
+		SocketPath:  socketPath,
 		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V1, Phase: shimwire.PhaseRunning,
 		CreatedAtUnixNano: time.Now().Add(-time.Second).UnixNano(),
 	}
@@ -61,7 +63,9 @@ func TestSelectedV1StaysLocallyAdoptedButPublishesCarrierQuarantine(t *testing.T
 			Protocol: shimwire.ProtocolName, Min: shimwire.V1, Max: shimwire.V1,
 			OrgID: id.OrgID, SessionID: id.SessionID, ShimID: record.ShimID,
 			ProcessEpoch: record.ProcessEpoch, PID: self.PID, ProcessStartedAt: self.StartedAt,
+			ProcessStartTicks: self.StartTicks, ProcessBootID: self.BootID,
 			HarnessPID: self.PID, HarnessStartedAt: self.StartedAt,
+			HarnessStartTicks: self.StartTicks, HarnessBootID: self.BootID,
 			Phase: shimwire.PhaseRunning, Generation: 4,
 		})
 		if w.Write(shimwire.TypeHello, hello) != nil {

@@ -37,6 +37,11 @@ type Hello struct {
 	// nanoseconds. It is paired with PID everywhere because PID reuse is normal
 	// and a bare PID match is not evidence (§D2).
 	ProcessStartedAt int64 `json:"processStartedAt"`
+	// ProcessStartTicks and ProcessBootID carry the Linux drift-free
+	// identity beside ProcessStartedAt: raw ticks plus the boot ID. Empty
+	// on platforms without them and on peers that predate them.
+	ProcessStartTicks int64  `json:"processStartTicks,omitempty"`
+	ProcessBootID     string `json:"processBootId,omitempty"`
 
 	// HarnessPID and HarnessStartedAt identify the OWNED harness process, as
 	// distinct from the shim that owns it.
@@ -49,6 +54,10 @@ type Hello struct {
 	// is what a live one asserts about the process it is still parenting.
 	HarnessPID       int   `json:"harnessPid,omitempty"`
 	HarnessStartedAt int64 `json:"harnessStartedAt,omitempty"`
+	// HarnessStartTicks and HarnessBootID carry the harness's Linux
+	// drift-free identity beside HarnessStartedAt.
+	HarnessStartTicks int64  `json:"harnessStartTicks,omitempty"`
+	HarnessBootID     string `json:"harnessBootId,omitempty"`
 
 	// WorkareaPath is the workarea the harness was launched against. The daemon
 	// compares it to the session's own record so a shim cannot be adopted into a

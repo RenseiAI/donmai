@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -257,5 +258,40 @@ func TestPublishHelperTombstoneWithdrawsTheDiscoveryRecord(t *testing.T) {
 	}
 	if _, err := registry.GetTombstoneIncarnation(record.Identity(), record.ShimID, record.ProcessEpoch); err != nil {
 		t.Fatalf("the tombstone did not survive the record withdrawal: %v", err)
+	}
+}
+
+// TestIncompatibleHelperRecordCarriesTheDriftFreeKey pins that the helper's
+// discovery record keeps every field of its process identity, including the
+// Linux start ticks and boot ID that the daemon's liveness check requires
+// before it arms the acceptance quarantine.
+func TestIncompatibleHelperRecordCarriesTheDriftFreeKey(t *testing.T) {
+	self := sessionshim.ProcessIdentity{
+		PID: 4242, StartedAt: time.Unix(1_760_000_000, 0).UnixNano(),
+		StartTicks: 987_654, BootID: "0f6b0c4e-boot-id-fixture",
+	}
+	record := incompatibleHelperRecord("org-1", "session-1", "shim-1", 1, self, "/run/shim.sock", 7, 8, time.Unix(1_760_000_001, 0))
+	if err := record.Validate(); err != nil {
+		t.Fatalf("helper record does not validate: %v", err)
+	}
+	got := sessionshim.ProcessIdentity{PID: record.PID, StartedAt: record.ProcessStartedAt, StartTicks: record.ProcessStartTicks, BootID: record.BootID}
+	if got != self {
+		t.Fatalf("helper record identity pid=%d start=%d ticks=%d boot=%q, want pid=%d start=%d ticks=%d boot=%q (the drift-free key must survive)",
+			got.PID, got.StartedAt, got.StartTicks, got.BootID, self.PID, self.StartedAt, self.StartTicks, self.BootID)
+	}
+}
+
+// TestIncompatibleHelperRecordVerifiesAsAlive drives the record built from the
+// running process through the liveness check the daemon's quarantine arm and
+// adoption use. On Linux a record without start ticks and boot ID fails it.
+func TestIncompatibleHelperRecordVerifiesAsAlive(t *testing.T) {
+	self, err := sessionshim.Self()
+	if err != nil {
+		t.Fatalf("self identity: %v", err)
+	}
+	record := incompatibleHelperRecord("org-1", "session-1", "shim-1", 1, self, "/run/shim.sock", 7, 8, time.Now())
+	alive, err := sessionshim.ProcessIdentity{PID: record.PID, StartedAt: record.ProcessStartedAt, StartTicks: record.ProcessStartTicks, BootID: record.BootID}.Alive()
+	if err != nil || !alive {
+		t.Fatalf("helper record for the live process: alive=%t err=%v, want alive=true err=nil", alive, err)
 	}
 }

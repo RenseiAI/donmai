@@ -79,6 +79,24 @@ type helperState struct {
 	StopPath         string `json:"stopPath"`
 }
 
+// incompatibleHelperRecord builds the discovery record the incompatible-shim
+// helper publishes for itself. It carries self's whole process identity,
+// including the Linux drift-free key (start ticks plus boot ID): on Linux a
+// record without that key cannot be verified as alive, so the daemon would
+// refuse to arm its acceptance quarantine and adoption would quarantine the
+// record as an identity mismatch instead of reaching its protocol decision.
+func incompatibleHelperRecord(orgID, sessionID, shimID string, processEpoch uint64, self sessionshim.ProcessIdentity, socketPath string, device, inode uint64, now time.Time) sessionshim.Record {
+	return sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: processEpoch,
+		PID: self.PID, ProcessStartedAt: self.StartedAt,
+		ProcessStartTicks: self.StartTicks, BootID: self.BootID,
+		SocketPath: socketPath, SocketDevice: device, SocketInode: inode,
+		ProtocolMin: shimwire.ProtocolMax + 1, ProtocolMax: shimwire.ProtocolMax + 1,
+		Phase: shimwire.PhaseRunning, CreatedAtUnixNano: now.UnixNano(),
+	}
+}
+
 type helperLaunch struct {
 	OrgID        string `json:"orgId"`
 	SessionID    string `json:"sessionId"`
@@ -606,14 +624,7 @@ func holdIncompatible() error {
 		return err
 	}
 	defer func() { _ = stateRoot.Close() }()
-	record := sessionshim.Record{
-		SchemaVersion: sessionshim.RecordSchemaVersion,
-		OrgID:         orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: processEpoch,
-		PID: self.PID, ProcessStartedAt: self.StartedAt,
-		SocketPath: socketPath, SocketDevice: device, SocketInode: inode,
-		ProtocolMin: shimwire.ProtocolMax + 1, ProtocolMax: shimwire.ProtocolMax + 1,
-		Phase: shimwire.PhaseRunning, CreatedAtUnixNano: time.Now().UnixNano(),
-	}
+	record := incompatibleHelperRecord(orgID, sessionID, shimID, processEpoch, self, socketPath, device, inode, time.Now())
 	if err := record.Validate(); err != nil {
 		return err
 	}
