@@ -171,6 +171,41 @@ func newSessionLayoutForSpec(spec agent.Spec) sessionLayout {
 	}
 }
 
+// noticeClaimLayoutPath is the materialized path of the host-owned
+// applied-receipt extension inside a session layout. It lives at the
+// layout root beside the boundary extension (never under
+// extensions-injected, so it can never collide with caller deliveries)
+// and loads by explicit `-e` path, never by discovery.
+func noticeClaimLayoutPath(layout sessionLayout) string {
+	return filepath.Join(layout.root, noticeClaimFileName)
+}
+
+// materializeNoticeClaimExtension writes the embedded applied-receipt
+// extension into the session layout and measures it against the embedded
+// digest. Same fail-closed shape as the boundary write: any write or
+// measurement error denies the spawn before the child starts.
+func materializeNoticeClaimExtension(layout sessionLayout, strict bool) (string, error) {
+	if strict {
+		state, err := openSessionStateFS(layout)
+		if err != nil {
+			return "", fmt.Errorf("pi: open state dir: %w", err)
+		}
+		defer func() { _ = state.Close() }()
+		if err := state.writeFile(noticeClaimLayoutPath(layout), noticeClaimSource(), 0o600); err != nil {
+			return "", fmt.Errorf("pi: write notice-claim extension: %w", err)
+		}
+	} else if err := os.WriteFile(noticeClaimLayoutPath(layout), noticeClaimSource(), 0o600); err != nil {
+		return "", fmt.Errorf("pi: write notice-claim extension: %w", err)
+	}
+	path := noticeClaimLayoutPath(layout)
+	measured, err := measureExtensionFile("donmai-notice-claim", path, noticeClaimSHA(), nil)
+	if err != nil {
+		return "", fmt.Errorf("pi: measure notice-claim extension: %w", err)
+	}
+	_ = measured
+	return path, nil
+}
+
 // materializeExtensionForSpec materializes the boundary extension into the
 // session state root, after creating the root, and records the root in the
 // checkout's exclude file. confined marks the layout strict: the session will

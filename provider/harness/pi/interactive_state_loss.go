@@ -1,6 +1,9 @@
 package pi
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -9,6 +12,21 @@ import (
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 )
+
+// ErrInteractiveReceiptUnavailable identifies an interactive injection refusal
+// caused by the absence of a durable receipt outside peer-extension authority.
+// Callers must retain the input in their durable mailbox rather than mark it
+// applied. The returned error also matches agent.ErrUnsupported.
+var ErrInteractiveReceiptUnavailable = errors.New("pi interactive applied receipt unavailable")
+
+// Inject refuses runtime notices even when transcript activity is available.
+// Activity is observational: same-user files and same-process extensions cannot
+// prove that Pi durably applied an exact delivery. Human terminal input remains
+// available through InteractiveSession, without an application acknowledgement.
+func (h *interactiveStateLossHandle) Inject(context.Context, string) error {
+	return fmt.Errorf("pi interactive Inject: %w: %w; use durable mailbox polling or headless --mode rpc",
+		agent.ErrUnsupported, ErrInteractiveReceiptUnavailable)
+}
 
 // harnessStateLostSubtype is an observable, provider-owned condition. It is
 // deliberately a SystemEvent rather than a synthetic terminal result: pi can
