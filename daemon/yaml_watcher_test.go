@@ -1120,8 +1120,11 @@ func TestOnYamlChanged_NoRegistrationBeforeProof(t *testing.T) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if len(h.registerReqs) == 0 {
-		t.Fatal("proven rotation with a project enable made no registration request")
+	// Exactly one registration: the proven rotation publishes the staged
+	// declaration once. A publish ahead of the proof queues a second forced
+	// re-registration (and can race the rotation for the old generation).
+	if got := len(h.registerReqs); got != 1 {
+		t.Fatalf("proven rotation with a project enable made %d registration request(s), want exactly 1", got)
 	}
 	for _, auth := range h.registerAuth {
 		if auth != "Bearer rsp_live_rotated" {
