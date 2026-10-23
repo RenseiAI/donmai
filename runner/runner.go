@@ -843,6 +843,11 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// here own the result envelope + post-Run teardown.
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
 	r.checkpointProviderError(qw, res)
+	r.checkpointFailedSession(qw, res)
+	// Retain the runner warning field while copying it to the terminal wire.
+	if res != nil {
+		res.Result.PostSessionWarnings = res.PostSessionWarnings
+	}
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
 	// Never delete work that exists nowhere else: a teardown first archives
 	// every checkout's unpublished work under the rescue directory, and keeps

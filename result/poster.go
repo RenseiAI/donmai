@@ -342,6 +342,12 @@ type statusRequest struct {
 	// resume from after a retryable failure. Additive; omitted when nil.
 	ResumeCheckpoint *agent.ResumeCheckpoint `json:"resumeCheckpoint,omitempty"`
 
+	// WIPRef preserves unpublished work. Additive; old platforms ignore it.
+	WIPRef *agent.WIPRef `json:"wipRef,omitempty"`
+
+	// PostSessionWarnings reports non-fatal terminal warnings. Additive; old platforms ignore it.
+	PostSessionWarnings []string `json:"postSessionWarnings,omitempty"`
+
 	// UpstreamError carries the model endpoint's structured refusal or
 	// throttle (HTTP status, provider code, truncated provider message,
 	// reset time) on a session that failed because the endpoint refused
@@ -734,8 +740,9 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		TerminalArchiveReference: archiveReference,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		PreparationSeconds: r.PreparationSeconds,
-		BudgetBreach:       r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint,
-		UpstreamError: agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
+		BudgetBreach:       r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
+		PostSessionWarnings: r.PostSessionWarnings,
+		UpstreamError:       agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 		GenerationIDs: r.GenerationIDs,

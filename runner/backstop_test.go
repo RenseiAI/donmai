@@ -213,6 +213,137 @@ func TestCaptureHeadSHA(t *testing.T) {
 	}
 }
 
+// TestShouldExcludeFromWIPCheckpoint_Secrets pins the secret deny-list
+// the remote WIP checkpoint layers over the backstop excludes: every
+// secret-bearing shape plus nested harness state stays out of the pushed
+// tree, while the safe .env siblings and lookalike names stay committable.
+func TestShouldExcludeFromWIPCheckpoint_Secrets(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		path string
+		want bool
+	}{
+		// .env and .env.* are secrets, in any letter case ...
+		{".env", true},
+		{".ENV", true},
+		{".env.local", true},
+		{".Env.local", true},
+		{"service/.env.production", true},
+		// ... except the placeholder siblings, also in any case.
+		{".env.example", false},
+		{".ENV.EXAMPLE", false},
+		{".env.sample", false},
+		{".env.template", false},
+		{"service/.env.example", false},
+		// Dotted copies: only a copy of a placeholder sibling stays
+		// committable; anything else fails closed to excluded, so a
+		// backup of a secret file cannot leak through the invisible ref.
+		{".env.example.backup", false},
+		{".env.example.bak", false},
+		{".env.sample.old", false},
+		{".env.local.backup", true},
+		// .env dash variants and editor backups carry secrets like the
+		// dotted family, without its placeholder convention.
+		{".env-prod", true},
+		{".env-production", true},
+		{".ENV-PROD", true},
+		{".env~", true},
+		{".env.local~", true},
+		// Dotfile credentials by exact name, in any letter case, plus
+		// copies of them: a backup of a secret file is a secret file.
+		{".envrc", true},
+		{".ENVRC", true},
+		{".envrc.backup", true},
+		{".npmrc", true},
+		{".NPMRC", true},
+		{".npmrc.bak", true},
+		{".NPMRC.BAK", true},
+		{"service/.npmrc", true},
+		{"service/.NPMRC", true},
+		{".pypirc", true},
+		{".PYPIRC", true},
+		{".netrc", true},
+		{".NETRC", true},
+		{".netrc.old", true},
+		{".git-credentials", true},
+		{".GIT-CREDENTIALS", true},
+		{".yarnrc.yml", true},
+		{".YARNRC.YML", true},
+		{".pgpass", true},
+		{".PGPASS", true},
+		// Private keys and credential bundles (case-insensitive).
+		{"tls/server.pem", true},
+		{"tls/SERVER.PEM", true},
+		{"deploy.key", true},
+		{"bundle.p12", true},
+		{"bundle.pfx", true},
+		// Private keys: the whole id_<type> family, plus credential
+		// bundles by name or by *credentials*.json shape.
+		{"id_rsa", true},
+		{"id_rsa.pub", true},
+		{"id_ed25519", true},
+		{"id_ecdsa", true},
+		{"id_dsa", true},
+		{"home/.ssh/id_ecdsa", true},
+		{"home/.ssh/id_ed25519", true},
+		{"credentials", true},
+		{"CREDENTIALS", true},
+		{"credentials.json", true},
+		{"config/Credentials.Production.JSON", true},
+		{"application_default_credentials.json", true},
+		{"mycredentials.json", true},
+		{"credentials-backup.json", true},
+		{"service-account.json", true},
+		{"service-account-prod.json", true},
+		// Credential stores at any depth, in any letter case: git
+		// preserves case and tools and Windows checkouts produce
+		// uppercase variants. Container and cluster config dirs hold
+		// registry and API credentials the same way.
+		{".aws/credentials", true},
+		{"service/.aws/config", true},
+		{".ssh/known_hosts", true},
+		{"home/.gnupg/pubring.kbx", true},
+		{".AWS/credentials", true},
+		{".SSH/config", true},
+		{".docker/config.json", true},
+		{"svc/.docker/config.json", true},
+		{".kube/config", true},
+		{"svc/.kube/cache", true},
+		// A dotenv dir component holds the same secrets as the files.
+		{"svc/.env/production", true},
+		// Infrastructure state carries secrets by design.
+		{"prod.tfvars", true},
+		{"terraform.tfstate", true},
+		{"infra/prod.tfvars", true},
+		// Harness-state dirs at any depth, not just the top level,
+		// in any letter case for the same reason as above.
+		{".pi/session.jsonl", true},
+		{".PI/session.jsonl", true},
+		{"sub/.PI/x", true},
+		{"sub/.pi/transcript.jsonl", true},
+		{"sub/.pi/agent-home/config.json", true},
+		{"sub/.agent/events.jsonl", true},
+		{"sub/.scratch/notes.md", true},
+		{"sub/.claude/settings.json", true},
+		{"sub/.codex/history.jsonl", true},
+		// The backstop layer still applies through the same helper.
+		{"node_modules/index.js", true},
+		{".agent/state.json", true},
+		// Lookalikes stay committable.
+		{".pi-cache/blob", false},
+		{"src/main.go", false},
+		{"README.md", false},
+		{"src/env.go", false},
+		{"docs/credentials.md", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := shouldExcludeFromWIPCheckpoint(tc.path); got != tc.want {
+			t.Errorf("shouldExcludeFromWIPCheckpoint(%q) = %v; want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 // TestShouldExcludeFromBackstop_Table table-tests the path-exclude
 // decision against the data tables. The rows cover the legacy TS cases plus
 // Donmai's Go-native code-intel cache.

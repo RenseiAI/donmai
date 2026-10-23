@@ -81,6 +81,163 @@ var excludePathPrefixes = []string{
 	".donmai/code-index/",
 }
 
+// wipSecretBasenames are exact secret-bearing basenames that must never
+// enter a remote WIP checkpoint: the checkpoint stages the whole tree
+// (including files the agent chose not to commit) and pushes it to a
+// ref no review ever opens, so a checked-in secret there is invisible
+// and world-fetchable on public repositories. Exact names keep the rule
+// auditable next to the deny patterns below.
+var wipSecretBasenames = map[string]bool{
+	".envrc":           true,
+	".npmrc":           true,
+	".pypirc":          true,
+	".netrc":           true,
+	".git-credentials": true,
+	".yarnrc.yml":      true,
+	".pgpass":          true,
+}
+
+// wipSecretEnvExamples are safe .env siblings that must NOT be excluded:
+// example/sample/template files carry placeholders, not secrets.
+var wipSecretEnvExamples = map[string]bool{
+	".env.example":  true,
+	".env.sample":   true,
+	".env.template": true,
+}
+
+// wipSecretDirAnyDepth lists directory names that disqualify a path at
+// any depth from a WIP checkpoint: credential stores (cloud CLIs, SSH,
+// container and cluster config) and harness-state
+// dirs. Harness state must match at ANY depth (not just the top level):
+// a nested <subdir>/.pi/ holds the spawn transcript with the full
+// environment, and the scratch-index checkpoint cannot rely on the
+// provision-time info/exclude write that covers only the checkout root.
+var wipSecretDirAnyDepth = map[string]bool{
+	".aws":    true,
+	".ssh":    true,
+	".gnupg":  true,
+	".docker": true,
+	".kube":   true,
+}
+
+// shouldExcludeFromWIPCheckpoint reports whether a staged path must be
+// dropped from a remote WIP checkpoint before it is committed and
+// pushed. It layers the secret deny-list over the shared backstop
+// excludes: everything the backstop would never commit (build output,
+// harness state at the top level) is also dropped here, and on top of
+// that the secret patterns below apply — every consumer that stages the
+// whole tree into a scratch index and pushes it (the provider-error
+// wip/<session> branch checkpoint and the failed-session reserved-ref
+// checkpoint share createWIPCheckpoint) gets both.
+//
+// `path` is relative to the worktree root, with forward slashes (git's
+// --name-only output uses forward slashes on every platform).
+func shouldExcludeFromWIPCheckpoint(path string) bool {
+	if path == "" {
+		return false
+	}
+	if shouldExcludeFromBackstop(path) {
+		return true
+	}
+	parts := strings.Split(path, "/")
+	basename := parts[len(parts)-1]
+	// Lower once: every rule below compares case-insensitively, so
+	// .ENV, .NPMRC and Credentials.JSON are handled exactly like
+	// their lowercase twins.
+	lower := strings.ToLower(basename)
+	// Harness-state, credential-store and dotenv dirs at any depth: each table
+	// entry matched as a whole path component, so a directory that
+	// merely shares a prefix (".pi-cache") stays ordinary project
+	// content. Components are lowered too: git preserves case and tools
+	// and Windows checkouts produce .AWS, .SSH or .PI, which hold the
+	// same secrets and transcripts as their lowercase twins. The tables
+	// themselves stay lowercase, so lowering the component before the
+	// lookup is exactly a case-insensitive match. A component literally
+	// named ".env" is a dotenv dir (svc/.env/production) and is excluded
+	// for the same reason as the .env files themselves.
+	for _, part := range parts[:len(parts)-1] {
+		lowerPart := strings.ToLower(part)
+		if lowerPart == ".env" {
+			return true
+		}
+		if harnessstate.IsStateDir(lowerPart) {
+			return true
+		}
+		if wipSecretDirAnyDepth[lowerPart] {
+			return true
+		}
+	}
+	if wipSecretBasenames[lower] {
+		return true
+	}
+	// A basename that starts with a denied basename is a copy of it
+	// (.npmrc.bak, .envrc.backup): copies of secrets are secrets.
+	for denied := range wipSecretBasenames {
+		if strings.HasPrefix(lower, denied) {
+			return true
+		}
+	}
+	// .env and .env.* carry secrets; the example/sample/template
+	// siblings carry placeholders and stay committable. Compared on the
+	// lowered name: tools and Windows checkouts produce .ENV,
+	// .Env.local and the like, and git preserves the case. Only the
+	// first dotted segment after ".env." decides: a dotted copy of a
+	// placeholder sibling (.env.example.backup) stays committable, while
+	// anything else (.env.local.backup, .env.foo.bar) fails closed to
+	// excluded, so a backup of a secret file cannot leak through the
+	// invisible ref.
+	if lower == ".env" {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(lower, ".env."); ok {
+		name, _, _ := strings.Cut(rest, ".")
+		return !wipSecretEnvExamples[".env."+name]
+	}
+	// .env-<name> variants (.env-prod, .env-production) carry secrets
+	// like their dotted siblings; unlike the dotted family they have no
+	// placeholder convention, so every one is excluded.
+	if strings.HasPrefix(lower, ".env-") {
+		return true
+	}
+	// Editor backup copies (.env~, .env.local~): a backup of a secret
+	// file is a secret file.
+	if strings.HasSuffix(lower, "~") && (lower == ".env~" || strings.HasPrefix(lower, ".env.") || strings.HasPrefix(lower, ".env-")) {
+		return true
+	}
+	// Private keys and credential bundles, matched case-insensitively
+	// so KEY.PEM or Credentials.JSON cannot slip through.
+	for _, ext := range []string{".pem", ".key", ".p12", ".pfx"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	// Private-key files are id_<type> (id_rsa, id_ed25519, id_ecdsa,
+	// id_dsa, ...): match the whole family, not just the two common
+	// types, so a less common key type cannot leak.
+	if strings.HasPrefix(lower, "id_") {
+		return true
+	}
+	// A bare "credentials" file (the AWS credentials-file format lives
+	// at exactly that name) and any *credentials*.json bundle.
+	if lower == "credentials" {
+		return true
+	}
+	if strings.HasSuffix(lower, ".json") {
+		trimmed := strings.TrimSuffix(lower, ".json")
+		if strings.Contains(trimmed, "credentials") || strings.HasPrefix(trimmed, "service-account") {
+			return true
+		}
+	}
+	// Infrastructure state carries secrets by design: variable files hold
+	// passwords and keys, state files hold whole resource bodies.
+	for _, ext := range []string{".tfvars", ".tfstate"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
 // backstopMaxFiles is the upper bound on the number of files the
 // backstop will auto-commit. Beyond this we abort rather than create
 // a polluted PR. Mirrors BACKSTOP_MAX_FILES.
