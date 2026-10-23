@@ -579,10 +579,11 @@ func TestFixedHoldBackoffStaysCapped(t *testing.T) {
 // LineageGone whatever a predicate re-asked afterwards would say.
 func TestFixedHoldWithdrawsSpentBudgetWhenLineageLiveLetsGoMidHold(t *testing.T) {
 	t.Parallel()
-	// Event-driven release, not wall-clock: the first four lineage
+	// Event-driven release, not wall-clock: the first five lineage
 	// observations see the lineage held (budgeted-attempt gate, hold-entry
-	// check, first hold-attempt gate, post-attempt hold check), and the fifth
-	// — the second hold attempt's gate, after the backoff sleep — sees it
+	// check, the keepalive's immediate check as it starts, first
+	// hold-attempt gate, post-attempt hold check), and the sixth — the
+	// second hold attempt's gate, after the backoff sleep — sees it
 	// released. The budgeted attempt plus the first hold attempt both run
 	// their adoptions before the release lands, so the hold has armed. The
 	// virtual clock makes the hold backoff instant while the keepalive stays
@@ -594,7 +595,7 @@ func TestFixedHoldWithdrawsSpentBudgetWhenLineageLiveLetsGoMidHold(t *testing.T)
 		policy: SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Second},
 		clock:  clock,
 		lineageLive: func(context.Context, sessionshim.Identity) bool {
-			return observations.Add(1) <= 4
+			return observations.Add(1) <= 5
 		},
 		heldPastWindow: func(context.Context, sessionshim.Identity) bool {
 			return true
