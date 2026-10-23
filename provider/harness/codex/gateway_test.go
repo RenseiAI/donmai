@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/gateway"
 )
 
 func gatewayTestSpec(baseURL, key string) agent.Spec {
@@ -643,5 +644,346 @@ func TestSpawnInteractive_GatewayRouteWithoutPlatformMCP(t *testing.T) {
 	}
 	if entries, rerr := os.ReadDir(boundaryRoot); rerr != nil || len(entries) != 0 {
 		t.Fatalf("hook-aborted spawn leaked its private boundary: err=%v entries=%v", rerr, entries)
+	}
+}
+
+// gatewayLoopbackCellSpec builds a loopback session whose binding carries the
+// per-session bearer under the gateway bearer name. Loopback bindings never
+// carry the remote provider-key shape.
+func gatewayLoopbackCellSpec(baseURL, cellBearer, sessionBearer string) agent.Spec {
+	spec := agent.Spec{
+		Prompt: "gateway loopback probe",
+		Endpoint: &agent.EndpointBinding{
+			BaseURL:  baseURL,
+			Protocol: agent.ProtoOpenAIResponses,
+			Env:      map[string]string{},
+		},
+		Env: map[string]string{},
+	}
+	if cellBearer != "" {
+		spec.Endpoint.Env[gateway.TokenEnvVar] = cellBearer
+	}
+	if sessionBearer != "" {
+		spec.Env[gateway.TokenEnvVar] = sessionBearer
+	}
+	return spec
+}
+
+func TestIsLoopbackGatewayBaseURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"http://127.0.0.1:1/v1", true},
+		{"http://127.0.0.1:8080/v1", true},
+		{"http://localhost:8080/v1", true},
+		{"http://[::1]:8080/v1", true},
+		{"https://127.0.0.1:8080/v1", true},
+		{"https://gateway.example/codex/v1", false},
+		{"https://api.openai.com/v1", false},
+		{"http://192.0.2.1/v1", false},
+		{"", false},
+		{"not-a-url", false},
+	}
+	for _, tc := range cases {
+		if got := isLoopbackGatewayBaseURL(tc.url); got != tc.want {
+			t.Errorf("isLoopbackGatewayBaseURL(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestGatewayBinding_LoopbackCarriesBearer(t *testing.T) {
+	t.Parallel()
+	const baseURL = "http://127.0.0.1:9/v1"
+	// Loopback with the bearer on the binding resolves.
+	spec := gatewayLoopbackCellSpec(baseURL, "loop-bearer", "")
+	gotURL, gotKey, ok, err := gatewayBinding(spec)
+	if err != nil || !ok {
+		t.Fatalf("loopback gatewayBinding = ok=%v err=%v, want routed", ok, err)
+	}
+	if gotURL != baseURL || gotKey != "loop-bearer" {
+		t.Fatalf("loopback gatewayBinding = %q/%q, want %q/loop-bearer", gotURL, gotKey, baseURL)
+	}
+	// Loopback without any bearer fails naming the bearer env name.
+	if _, _, _, err := gatewayBinding(gatewayLoopbackCellSpec(baseURL, "", "")); err == nil {
+		t.Fatal("loopback without bearer = nil error, want a loud refusal")
+	} else if !strings.Contains(err.Error(), gateway.TokenEnvVar) {
+		t.Fatalf("loopback refusal %q does not name %s", err.Error(), gateway.TokenEnvVar)
+	}
+	// Loopback with only the remote provider key does not satisfy the bearer.
+	remoteOnly := agent.Spec{
+		Endpoint: &agent.EndpointBinding{
+			BaseURL:  baseURL,
+			Protocol: agent.ProtoOpenAIResponses,
+			Env:      map[string]string{codexGatewayEnvKey: "remote-key"},
+		},
+		Env: map[string]string{},
+	}
+	if _, _, _, err := gatewayBinding(remoteOnly); err == nil {
+		t.Fatal("loopback with only the remote key = nil error, want a bearer refusal")
+	} else if !strings.Contains(err.Error(), gateway.TokenEnvVar) {
+		t.Fatalf("loopback remote-key refusal %q does not name %s", err.Error(), gateway.TokenEnvVar)
+	}
+}
+
+func TestGatewayBinding_RemoteKeepsProviderKeyShape(t *testing.T) {
+	t.Parallel()
+	const baseURL = "https://gateway.example/codex/v1"
+	// Remote with the provider key on the binding resolves.
+	spec := gatewayCellSpec(baseURL, "cell-key", "")
+	gotURL, gotKey, ok, err := gatewayBinding(spec)
+	if err != nil || !ok {
+		t.Fatalf("remote gatewayBinding = ok=%v err=%v, want routed", ok, err)
+	}
+	if gotURL != baseURL || gotKey != "cell-key" {
+		t.Fatalf("remote gatewayBinding = %q/%q, want %q/cell-key", gotURL, gotKey, baseURL)
+	}
+	// Remote with only the loopback bearer does not satisfy the provider key.
+	bearerOnly := gatewayLoopbackCellSpec(baseURL, "loop-bearer", "")
+	// gatewayLoopbackCellSpec uses a loopback bearer name on a remote URL:
+	// the remote shape must not accept it.
+	if _, _, _, err := gatewayBinding(bearerOnly); err == nil {
+		t.Fatal("remote with only the loopback bearer = nil error, want a provider-key refusal")
+	} else if !strings.Contains(err.Error(), codexGatewayEnvKey) {
+		t.Fatalf("remote bearer refusal %q does not name %s", err.Error(), codexGatewayEnvKey)
+	}
+}
+
+func TestGatewayBinding_LoopbackCellBeatsSession(t *testing.T) {
+	t.Parallel()
+	const baseURL = "http://127.0.0.1:9/v1"
+	spec := gatewayLoopbackCellSpec(baseURL, "cell-bearer", "session-bearer")
+	_, gotKey, ok, err := gatewayBinding(spec)
+	if err != nil || !ok {
+		t.Fatalf("loopback gatewayBinding = ok=%v err=%v, want routed", ok, err)
+	}
+	if gotKey != "cell-bearer" {
+		t.Fatalf("loopback gatewayBinding key = %q, want the binding cell bearer", gotKey)
+	}
+}
+
+// TestSpawnInteractive_LoopbackNamedAndUnnamedShareSelection drives the
+// production interactive entry point twice with the same loopback binding:
+// once unnamed and once named. Both must reach the same isolated pre-PTY
+// boundary with the same provider block and the same projected child key,
+// and both must clean the private boundary when the hook aborts. A named
+// path that fell back to ambient (or a loopback that skipped the isolated
+// boundary) never calls the hook, so either goes red.
+func TestSpawnInteractive_LoopbackNamedAndUnnamedShareSelection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	const (
+		baseURL    = "http://127.0.0.1:9/v1"
+		cellBearer = "loop-cell-bearer"
+	)
+	for _, tc := range []struct {
+		name        string
+		sessionName string
+	}{
+		{name: "unnamed", sessionName: ""},
+		{name: "named", sessionName: "loopback-named-session"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearInteractiveCodexAuthEnv(t)
+			t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "absent-codex-home"))
+			workdir := t.TempDir()
+			boundaryRoot := t.TempDir()
+			bin := writeFakeCodexScript(t, `exit 0`)
+
+			spec := gatewayLoopbackCellSpec(baseURL, cellBearer, "")
+			spec.Cwd = workdir
+			spec.SessionName = tc.sessionName
+			spec.Interactive = &agent.InteractiveSpec{Cols: 80, Rows: 24}
+
+			var (
+				hookCalled bool
+				seenKey    string
+				seenBlock  bool
+				seenArg    bool
+			)
+			_, err := SpawnInteractive(context.Background(), Options{
+				CodexBin:      bin,
+				configTempDir: boundaryRoot,
+				interactiveMCPInventoryRunner: func(_ context.Context, _ string, _ string, _ []string, _ []string, queryArgs []string) ([]byte, error) {
+					if slices.Contains(queryArgs, "list") {
+						return json.Marshal([]codexMCPInventoryEntry{})
+					}
+					return nil, errors.New("unexpected fake inventory query")
+				},
+				interactiveBeforePTYSpawn: func(_ context.Context, _ string, spec agent.Spec, launch interactiveLaunch, home string) error {
+					hookCalled = true
+					seenKey = launch.env[codexGatewayEnvKey]
+					if _, hasBearer := launch.env[gateway.TokenEnvVar]; hasBearer {
+						return errors.New("private child env carries the loopback bearer name")
+					}
+					body, rerr := os.ReadFile(filepath.Join(home, codexConfigFileName))
+					if rerr != nil {
+						return rerr
+					}
+					seenBlock = strings.Contains(string(body), `model_provider = "donmai-gateway"`) &&
+						strings.Contains(string(body), `base_url = "`+baseURL+`"`) &&
+						strings.Contains(string(body), `env_key = "`+codexGatewayEnvKey+`"`)
+					seenArg = slices.ContainsFunc(launch.argv, func(arg string) bool {
+						return strings.Contains(arg, baseURL)
+					})
+					if _, serr := os.Lstat(filepath.Join(home, codexAuthFileName)); !errors.Is(serr, os.ErrNotExist) {
+						return errors.New("gateway boundary carries an operator auth file")
+					}
+					return errors.New("stop before PTY")
+				},
+			}, spec)
+			if !hookCalled {
+				t.Fatal("loopback cell never reached the isolated pre-PTY boundary")
+			}
+			if !seenBlock {
+				t.Fatal("private interactive config lacks the loopback provider block")
+			}
+			if !seenArg {
+				t.Fatal("interactive argv lacks the loopback provider override")
+			}
+			if seenKey != cellBearer {
+				t.Fatalf("pre-PTY child env key = %q, want the binding cell bearer %q", seenKey, cellBearer)
+			}
+			if !errors.Is(err, agent.ErrSpawnFailed) {
+				t.Fatalf("hook-aborted SpawnInteractive error = %v, want ErrSpawnFailed", err)
+			}
+			if entries, rerr := os.ReadDir(boundaryRoot); rerr != nil || len(entries) != 0 {
+				t.Fatalf("hook-aborted spawn leaked its private boundary: err=%v entries=%v", rerr, entries)
+			}
+		})
+	}
+}
+
+// TestSpawnInteractive_LoopbackExclusiveMCPNotLoosened proves the loopback
+// route keeps the exclusive-MCP readback: an inventory that reports an extra
+// server fails closed before any PTY starts and still cleans the boundary.
+func TestSpawnInteractive_LoopbackExclusiveMCPNotLoosened(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	clearInteractiveCodexAuthEnv(t)
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "absent-codex-home"))
+	workdir := t.TempDir()
+	boundaryRoot := t.TempDir()
+	bin := writeFakeCodexScript(t, `exit 0`)
+
+	const (
+		baseURL    = "http://127.0.0.1:9/v1"
+		cellBearer = "loop-cell-bearer"
+	)
+	mcpServers := []agent.MCPServerConfig{{
+		Name: "donmai-platform",
+		Type: "http",
+		URL:  "https://platform.example.com/api/mcp/session",
+		Headers: map[string]string{
+			"Authorization": "Bearer session-mcp-bearer",
+		},
+	}}
+	spec := gatewayLoopbackCellSpec(baseURL, cellBearer, "")
+	spec.Cwd = workdir
+	spec.Interactive = &agent.InteractiveSpec{Cols: 80, Rows: 24}
+	spec.MCPServers = mcpServers
+
+	_, err := SpawnInteractive(context.Background(), Options{
+		CodexBin:      bin,
+		configTempDir: boundaryRoot,
+		interactiveMCPInventoryRunner: func(_ context.Context, _ string, _ string, _ []string, _ []string, queryArgs []string) ([]byte, error) {
+			if slices.Contains(queryArgs, "list") {
+				entries := []codexMCPInventoryEntry{
+					{Name: "donmai-platform", Enabled: true, Transport: codexMCPInventoryTransport{Type: "streamable_http", URL: "https://platform.example.com/api/mcp/session", EnvHTTPHeaders: map[string]string{"Authorization": codexHTTPHeaderEnvName("donmai-platform", "Authorization")}}},
+					{Name: "extra-server", Enabled: true, Transport: codexMCPInventoryTransport{Type: "stdio", Command: "/usr/bin/false"}},
+				}
+				return json.Marshal(entries)
+			}
+			return nil, errors.New("unexpected fake inventory query")
+		},
+		interactiveBeforePTYSpawn: func(_ context.Context, _ string, _ agent.Spec, _ interactiveLaunch, _ string) error {
+			return errors.New("exclusive check must fail before the pre-PTY hook")
+		},
+	}, spec)
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("extra-server SpawnInteractive error = %v, want ErrSpawnFailed", err)
+	}
+	if !errors.Is(err, ErrInteractiveCodexMCPIsolation) {
+		t.Fatalf("extra-server SpawnInteractive error = %v, want the exclusive-MCP isolation sentinel", err)
+	}
+	if entries, rerr := os.ReadDir(boundaryRoot); rerr != nil || len(entries) != 0 {
+		t.Fatalf("refused spawn leaked its private boundary: err=%v entries=%v", rerr, entries)
+	}
+}
+
+// TestGatewayHeadlessSpawn_LoopbackProjectsBearer proves the headless lane
+// also accepts a loopback binding carrying the per-session bearer: the child
+// env carries the projected provider key, the private config carries the
+// loopback route, and no operator login is projected. Remote coverage above
+// pins the unchanged remote shape; this pins the additive loopback shape.
+func TestGatewayHeadlessSpawn_LoopbackProjectsBearer(t *testing.T) {
+	const (
+		baseURL    = "http://127.0.0.1:9/v1"
+		cellBearer = "loop-cell-bearer"
+	)
+	fs, stdinW, stdoutR := newFakeServer()
+	p, err := New(Options{
+		skipProcess:      true,
+		stdinOverride:    stdinW,
+		stdoutOverride:   stdoutR,
+		configTempDir:    t.TempDir(),
+		HandshakeTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+	go fs.run(t, "thread-gateway-loopback-headless")
+
+	spec := gatewayLoopbackCellSpec(baseURL, cellBearer, "")
+	spec.Cwd = t.TempDir()
+	h, err := p.Spawn(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("loopback gateway Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	if got := p.pinnedSessionEnv[codexGatewayEnvKey]; got != cellBearer {
+		t.Fatalf("pinned child env key = %q, want the loopback cell bearer %q", got, cellBearer)
+	}
+	if p.config.authPath != "" {
+		t.Fatalf("loopback gateway Spawn projected host auth %q, want no operator login", p.config.authPath)
+	}
+	body, err := os.ReadFile(p.config.configPath)
+	if err != nil {
+		t.Fatalf("read private config: %v", err)
+	}
+	for _, want := range []string{
+		`model_provider = "donmai-gateway"`,
+		`base_url = "` + baseURL + `"`,
+		`env_key = "AI_GATEWAY_API_KEY"`,
+		`wire_api = "responses"`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("private config missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestGatewayBinding_LoopbackSessionFallback proves a loopback binding with
+// the bearer only on the session layer still resolves, the shape production
+// uses when the runner forwards the bearer without endpoint env.
+func TestGatewayBinding_LoopbackSessionFallback(t *testing.T) {
+	t.Parallel()
+	const baseURL = "http://127.0.0.1:9/v1"
+	spec := gatewayLoopbackCellSpec(baseURL, "", "session-bearer")
+	_, gotKey, ok, err := gatewayBinding(spec)
+	if err != nil || !ok {
+		t.Fatalf("loopback session-fallback gatewayBinding = ok=%v err=%v, want routed", ok, err)
+	}
+	if gotKey != "session-bearer" {
+		t.Fatalf("loopback session-fallback key = %q, want session-bearer", gotKey)
 	}
 }
