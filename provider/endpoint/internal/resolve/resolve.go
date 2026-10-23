@@ -31,7 +31,57 @@ func FromManifest(m agent.ModelEndpointManifest, req agent.EndpointRequest) (age
 	if host == nil {
 		return agent.EndpointBinding{}, fmt.Errorf("%s endpoint: unknown serving host %q", m.Company, req.Host)
 	}
+	return fromHost(m.Company, *host, req), nil
+}
 
+// FromProtocolManifest selects exactly one declared host/protocol row. It is
+// used by opt-in providers; the public helper also validates the declaration
+// and resulting binding before handing it to a caller.
+func FromProtocolManifest(m agent.ModelEndpointManifest, req agent.EndpointRequest, protocol agent.WireProtocol) (agent.EndpointBinding, error) {
+	if protocol == "" {
+		return agent.EndpointBinding{}, agent.ErrEndpointProtocolRequired
+	}
+	declared := false
+	for _, candidate := range m.Speaks {
+		if candidate == protocol {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return agent.EndpointBinding{}, agent.ErrEndpointProtocolUnsupported
+	}
+	seen := make(map[[2]string]bool, len(m.Hosts))
+	var selected *agent.HostDesc
+	for i := range m.Hosts {
+		row := &m.Hosts[i]
+		key := [2]string{string(row.Host), string(row.Protocol)}
+		if row.Host == "" || row.Protocol == "" || seen[key] {
+			return agent.EndpointBinding{}, agent.ErrEndpointHostProtocolAmbiguous
+		}
+		seen[key] = true
+		if row.Host != req.Host || row.Protocol != protocol {
+			continue
+		}
+		selected = row
+	}
+	if selected == nil {
+		return agent.EndpointBinding{}, agent.ErrEndpointProtocolUnsupported
+	}
+	allowed := false
+	for _, mode := range selected.AuthModes {
+		if mode == req.Auth {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return agent.EndpointBinding{}, agent.ErrEndpointProtocolUnsupported
+	}
+	return fromHost(m.Company, *selected, req), nil
+}
+
+func fromHost(company agent.Company, host agent.HostDesc, req agent.EndpointRequest) agent.EndpointBinding {
 	env := make(map[string]string, len(host.EnvKeys))
 	for _, k := range host.EnvKeys {
 		if v, ok := req.EnvProvided[k]; ok {
@@ -40,7 +90,7 @@ func FromManifest(m agent.ModelEndpointManifest, req agent.EndpointRequest) (age
 	}
 
 	return agent.EndpointBinding{
-		Company:       m.Company,
+		Company:       company,
 		Model:         req.Model,
 		BaseURL:       TemplateBaseURL(host.BaseURLTmpl, req.Region),
 		Protocol:      host.Protocol,
@@ -51,7 +101,7 @@ func FromManifest(m agent.ModelEndpointManifest, req agent.EndpointRequest) (age
 		CostModel:     host.CostModel,
 		BringsOwnAuth: host.BringsOwnAuth,
 		Env:           env,
-	}, nil
+	}
 }
 
 // TemplateBaseURL substitutes the {region} placeholder in a host's
