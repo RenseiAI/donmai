@@ -142,10 +142,15 @@ func TestDecodeResponsesRequest_CodexFollowUps(t *testing.T) {
 // dropped silently.
 func TestDecodeResponsesRequest_RefusesHostedTools(t *testing.T) {
 	cases := map[string]string{
-		"web_search":      `{"model":"m","input":"x","tools":[{"type":"web_search","external_web_access":true}]}`,
-		"tool_search":     `{"model":"m","input":"x","tools":[{"type":"tool_search","execution":"sync","description":"Search app tools","parameters":{"type":"object"}}]}`,
-		"web_search_item": `{"model":"m","input":[{"type":"web_search_call","id":"ws-1","status":"completed"}]}`,
-		"nested_hosted":   `{"model":"m","input":"x","tools":[{"type":"namespace","name":"n","tools":[{"type":"function","name":"f","parameters":{"type":"object"}},{"type":"web_search"}]}]}`,
+		"web_search":        `{"model":"m","input":"x","tools":[{"type":"web_search","external_web_access":true}]}`,
+		"tool_search":       `{"model":"m","input":"x","tools":[{"type":"tool_search","execution":"sync","description":"Search app tools","parameters":{"type":"object"}}]}`,
+		"web_search_item":   `{"model":"m","input":[{"type":"web_search_call","id":"ws-1","status":"completed"}]}`,
+		"tool_search_item":  `{"model":"m","input":[{"type":"tool_search_call","id":"ts-1","status":"completed"}]}`,
+		"file_search_item":  `{"model":"m","input":[{"type":"file_search_call","id":"fs-1","status":"completed"}]}`,
+		"computer_item":     `{"model":"m","input":[{"type":"computer_call","id":"c-1","status":"completed"}]}`,
+		"computer_use_item": `{"model":"m","input":[{"type":"computer_use_call","id":"cu-1","status":"completed"}]}`,
+		"image_gen_item":    `{"model":"m","input":[{"type":"image_generation_call","id":"ig-1","status":"completed"}]}`,
+		"nested_hosted":     `{"model":"m","input":"x","tools":[{"type":"namespace","name":"n","tools":[{"type":"function","name":"f","parameters":{"type":"object"}},{"type":"web_search"}]}]}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -177,6 +182,57 @@ func TestEncodeRequest_RefusesNamespacedCustom(t *testing.T) {
 				t.Fatalf("EncodeRequest(%s) error = %v, want ErrResponsesHostedTool", name, err)
 			}
 		})
+	}
+}
+
+// TestDecodeResponsesRequest_RefusesUnnamedNamespace pins that a namespace
+// tool without its grouping name is refused: follow-ups route by that name,
+// so an empty grouping key must never enter the IR silently.
+func TestDecodeResponsesRequest_RefusesUnnamedNamespace(t *testing.T) {
+	body := `{"model":"m","input":"hi","tools":[{"type":"namespace","tools":[{"type":"function","name":"f","parameters":{"type":"object"}}]}]}`
+	_, err := DecodeResponsesRequest([]byte(body))
+	if err == nil {
+		t.Fatalf("DecodeResponsesRequest(unnamed namespace) = nil error, want refusal")
+	}
+}
+
+// TestDecodeResponsesRequest_RefusesNestedNamespaceTools pins fail-closed
+// handling of namespace children that themselves carry tools: a function
+// child with a Tools array would otherwise have its nested tools silently
+// dropped on the way into the IR.
+func TestDecodeResponsesRequest_RefusesNestedNamespaceTools(t *testing.T) {
+	body := `{"model":"m","input":"hi","tools":[{"type":"namespace","name":"n","tools":[{"type":"function","name":"f","parameters":{"type":"object"},"tools":[{"type":"function","name":"g"}]}]}]}`
+	_, err := DecodeResponsesRequest([]byte(body))
+	if err == nil {
+		t.Fatalf("DecodeResponsesRequest(nested tools) = nil error, want refusal")
+	}
+}
+
+// TestDecodeResponsesRequest_RefusesTypelessTool pins that a tool
+// declaration with a missing/empty type is refused instead of entering the
+// IR as an empty phantom ToolDef.
+func TestDecodeResponsesRequest_RefusesTypelessTool(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing_type": `{"model":"m","input":"hi","tools":[{"name":"x"}]}`,
+		"empty_type":   `{"model":"m","input":"hi","tools":[{"type":"","name":"x"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := DecodeResponsesRequest([]byte(body))
+			if err == nil {
+				t.Fatalf("DecodeResponsesRequest(%s) = nil error, want refusal", name)
+			}
+		})
+	}
+}
+
+// TestDecodeResponsesRequest_RefusesFormatlessCustom pins that a custom
+// tool without its grammar format is refused: the model never saw a tool
+// contract, so it must never enter the IR silently.
+func TestDecodeResponsesRequest_RefusesFormatlessCustom(t *testing.T) {
+	body := `{"model":"m","input":"hi","tools":[{"type":"custom","name":"c"}]}`
+	_, err := DecodeResponsesRequest([]byte(body))
+	if err == nil {
+		t.Fatalf("DecodeResponsesRequest(format-less custom) = nil error, want refusal")
 	}
 }
 
