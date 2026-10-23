@@ -126,6 +126,10 @@ const (
 
 // SelfTestRecord names the backend, its version (implementation plus OS
 // build), the probe-set version, each probe's outcome and a digest (D1.2).
+// A record taken where the scope layer is missing (ScopesAvailable false
+// on Linux below ABI 6) is degraded: every probe it ran passed, but the
+// boundary it proves is partial, so Degraded names the missing layer and
+// Attestation refuses it.
 type SelfTestRecord struct {
 	Backend          BackendName               `json:"backend"`
 	BackendVersion   string                    `json:"backendVersion"`
@@ -135,8 +139,13 @@ type SelfTestRecord struct {
 	Probes           []ProbeOutcome            `json:"probes"`
 	NotProbed        []NotProbed               `json:"notProbed,omitempty"`
 	Passed           bool                      `json:"passed"`
-	TestedAt         time.Time                 `json:"testedAt"`
-	Digest           string                    `json:"digest"`
+	// Degraded names the unenforced layer when the record proves a
+	// partial boundary only (the scope layer below Landlock ABI 6).
+	// Empty means the record proves the full boundary. It is part of
+	// the digest, so a degraded record never verifies as a full one.
+	Degraded string    `json:"degraded,omitempty"`
+	TestedAt time.Time `json:"testedAt"`
+	Digest   string    `json:"digest"`
 }
 
 // Failures returns the probes that did not pass.
@@ -151,8 +160,13 @@ func (r SelfTestRecord) Failures() []ProbeOutcome {
 }
 
 // Attestation is the per-harness attestation this record supports: the
-// session modes whose spawn path passed every probe.
+// session modes whose spawn path passed every probe. A degraded record
+// (Degraded set) attests nothing: the probes passed but the boundary is
+// partial, so no spawn path is reported as confined.
 func (r SelfTestRecord) Attestation() Attestation {
+	if r.Degraded != "" {
+		return Attestation{}
+	}
 	return Attestation{
 		Backend:         r.Backend,
 		BackendVersion:  r.BackendVersion,
@@ -181,15 +195,35 @@ func (r SelfTestRecord) computeDigest() string {
 	return digestBytes(raw)
 }
 
+// applyScopeVerdict marks a passing record degraded where the scope probe
+// says the layer is missing: the probes passed but the boundary they prove
+// is partial, so the full-boundary attestation stays empty while the seat
+// still runs (the mount tree, the process namespace and the filesystem rules
+// hold; only the scope layer is missing). The session modes stay on the
+// record so Prepare still starts seats from it; Attestation refuses it as a
+// full boundary and the status surface carries the degraded reason. An
+// enforced layer, or a record that did not pass, is left alone. SelfTest
+// calls it on its production record; tests drive it directly with both
+// verdicts, without a Linux kernel.
+func (r *SelfTestRecord) applyScopeVerdict(ok bool, why string) {
+	if !r.Passed || ok || why == "" {
+		return
+	}
+	r.Degraded = why
+}
+
 // SelfTest proves the backend on this host: it drives a probe process through
 // the production spawn binding once per session mode, with every writable
 // class, a read-only leaf, protected paths, decoys outside the set and the
 // write proxies in reach, and observes what changed. A second pass per mode
 // renders the same world under the workarea read scope and proves the read
 // allowlist: reads inside it succeed, reads and listings outside it fail. A
-// mode is attested only when every probe in it passed. The record is kept
-// for Prepare, passing or not; a failure returns the record with a typed
-// error.
+// mode is attested only when every probe in it passed — and where the scope
+// layer is missing (Linux below ABI 6) the passing record is marked
+// degraded instead of attested: the mount tree, the process namespace and
+// the filesystem rules hold, but signals and abstract sockets outside stay
+// reachable. The record is kept for Prepare, passing or not; a failure
+// returns the record with a typed error.
 func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTestRecord, error) {
 	if len(opts.ProbeCommand) == 0 {
 		return SelfTestRecord{}, errors.New("confinement: self-test needs a probe command")
@@ -215,6 +249,9 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 	if err := c.opts.Backend.Check(); err != nil {
 		record.Digest = record.computeDigest()
 		c.store(record)
+		// A Check failure is an outcome too: it supersedes any earlier pass
+		// so the status path reports unproven instead of attesting from it.
+		c.recordLatest(record)
 		return record, err
 	}
 	cache, cacheOK := c.selfTestCache(opts, current)
@@ -273,8 +310,32 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 		}
 	}
 	record.Passed = len(record.SessionModes) == 2 && allPass(record.Probes)
+	if record.Passed {
+		// A passing record on a kernel without the scope layer proves a
+		// partial boundary only: every probe passed, but the layer that
+		// holds signals and abstract sockets is missing. Mark it so
+		// Attestation refuses it and operators see it, rather than
+		// reporting the host as confined.
+		record.applyScopeVerdict(ScopesAvailable())
+	}
 	record.Digest = record.computeDigest()
 	c.store(record)
+	// The latest outcome supersedes any earlier pass: record it where the
+	// status path reads it back, passing or not, so a failure after a pass
+	// reports unproven instead of attesting from the stale pass.
+	c.recordLatest(record)
+	// A passing, whole record is proof seats start from: keep it where
+	// the status path reads it back, so the operator surface reports
+	// what the seats proved rather than what the daemon guessed. A
+	// degraded passing record is proof of a partial boundary: it is kept
+	// as the latest outcome above, and the cache below reuses it as
+	// degraded on a host whose scope layer is still missing.
+	if record.Passed && record.Degraded == "" && refusal == nil {
+		c.recordProven(record)
+	}
+	// A degraded passing record is reusable as degraded where the scope
+	// layer is still missing (keyed by the scope verdict in load), so a
+	// sub-floor host does not re-run the full self-test on every spawn.
 	if cacheOK && record.Passed && refusal == nil {
 		cache.save(record)
 	}
