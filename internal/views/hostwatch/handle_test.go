@@ -255,7 +255,11 @@ func TestModel_HandleMapChangeUpdatesStreamPrefix(t *testing.T) {
 
 	m.applySnapshot(m.src.Snapshot())
 	if got := findCard(m, "sess-late-handle"); got == nil || got.displayID() != "ENG-42" {
-		t.Fatalf("before fill display = %v, want ENG-42", got)
+		display := "<missing>"
+		if got != nil {
+			display = got.displayID()
+		}
+		t.Fatalf("before fill display = %q, want ENG-42", display)
 	}
 	if got := m.labels["sess-late-handle"]; got != "ENG-42" {
 		t.Fatalf("before fill label = %q, want ENG-42", got)
@@ -264,7 +268,11 @@ func TestModel_HandleMapChangeUpdatesStreamPrefix(t *testing.T) {
 	handles["sess-late-handle"] = "late-lead"
 	m.applySnapshot(m.src.Snapshot())
 	if got := findCard(m, "sess-late-handle"); got == nil || got.displayID() != "late-lead" {
-		t.Fatalf("after fill display = %v, want late-lead", got)
+		display := "<missing>"
+		if got != nil {
+			display = got.displayID()
+		}
+		t.Fatalf("after fill display = %q, want late-lead", display)
 	}
 	if got := m.labels["sess-late-handle"]; got != "late-lead" {
 		t.Fatalf("after fill label = %q, want late-lead", got)
