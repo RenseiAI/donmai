@@ -48,6 +48,7 @@ type Gateway struct {
 // route is one bound session: the upstream to dial and the credential scope to
 // dial it with, plus the attribution facts stamped onto every cost row.
 type route struct {
+	protocol   agent.WireProtocol
 	sessionID  string
 	dispatchID string
 	harness    string
@@ -100,6 +101,7 @@ func (g *Gateway) Start(_ context.Context) error {
 	mux := http.NewServeMux()
 	chat := surface.NewOpenAIChat(g)
 	mux.Handle("/v1/chat/completions", chat)
+	mux.Handle("/v1/responses", surface.NewOpenAIResponses(g))
 	mux.HandleFunc("/v1/models", g.handleModels)
 
 	g.listener = ln
@@ -159,8 +161,8 @@ type BindConfig struct {
 	Source pool.CredentialSource
 	// PoolOpts tunes the rotation state machine (optional).
 	PoolOpts pool.Options
-	// Surface is the inbound wire protocol the harness will drive. M1 supports
-	// agent.ProtoOpenAIChat only.
+	// Surface is the inbound protocol. Legacy Bind requires Chat;
+	// BindProtocol allows an explicit implemented protocol.
 	Surface agent.WireProtocol
 }
 
@@ -174,6 +176,22 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 	if cfg.Surface != agent.ProtoOpenAIChat {
 		return agent.EndpointBinding{}, fmt.Errorf("gateway: unsupported inbound surface %q (M1 = openai-chat only)", cfg.Surface)
 	}
+	return g.bindProtocol(cfg, agent.ProtoOpenAIChat)
+}
+
+// BindProtocol explicitly selects a working inbound surface. It does not
+// mutate cfg or relax the legacy Bind contract.
+func (g *Gateway) BindProtocol(cfg BindConfig, protocol agent.WireProtocol) (agent.EndpointBinding, error) {
+	if protocol != agent.ProtoOpenAIChat && protocol != agent.ProtoOpenAIResponses {
+		return agent.EndpointBinding{}, errors.New("gateway: unsupported or missing inbound protocol")
+	}
+	if cfg.Surface != "" && cfg.Surface != protocol {
+		return agent.EndpointBinding{}, errors.New("gateway: conflicting inbound protocol")
+	}
+	return g.bindProtocol(cfg, protocol)
+}
+
+func (g *Gateway) bindProtocol(cfg BindConfig, protocol agent.WireProtocol) (agent.EndpointBinding, error) {
 	if cfg.Upstream == nil || cfg.Source == nil {
 		return agent.EndpointBinding{}, errors.New("gateway: bind requires an upstream and a credential source")
 	}
@@ -192,6 +210,7 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 		dispatchID = cfg.SessionID
 	}
 	g.routes[tok] = &route{
+		protocol:   protocol,
 		sessionID:  cfg.SessionID,
 		dispatchID: dispatchID,
 		harness:    cfg.Harness,
@@ -208,7 +227,7 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 		Company:   cfg.Company,
 		Model:     cfg.Model,
 		BaseURL:   fmt.Sprintf("http://%s/v1", addr),
-		Protocol:  agent.ProtoOpenAIChat,
+		Protocol:  protocol,
 		Host:      agent.HostGateway,
 		Mechanism: agent.AuthAPIKey,
 		Auth:      cfg.AuthMode,
@@ -236,11 +255,20 @@ func (g *Gateway) Routes() int {
 // select a credential, invoke the upstream, and hand back the outcome plus a
 // Meter closure the surface calls once the reply is fully written.
 func (g *Gateway) Dispatch(ctx context.Context, tok token.Token, req ir.Request) (surface.Outcome, error) {
+	return g.DispatchProtocol(ctx, tok, agent.ProtoOpenAIChat, req)
+}
+
+// DispatchProtocol refuses a valid bearer on a different inbound surface
+// before consulting the credential pool or dialing an upstream.
+func (g *Gateway) DispatchProtocol(ctx context.Context, tok token.Token, protocol agent.WireProtocol, req ir.Request) (surface.Outcome, error) {
 	g.mu.RLock()
 	rt := g.routes[tok]
 	g.mu.RUnlock()
 	if rt == nil {
 		return surface.Outcome{}, &surface.HTTPError{Status: http.StatusUnauthorized, Code: "invalid_token", Message: "unknown or expired session token"}
+	}
+	if rt.protocol != protocol {
+		return surface.Outcome{}, &surface.HTTPError{Status: http.StatusForbidden, Code: "wrong_surface", Message: "session token is bound to another surface"}
 	}
 
 	req.Metadata = ir.Metadata{SessionID: rt.sessionID, DispatchID: rt.dispatchID, Harness: rt.harness}
@@ -289,7 +317,7 @@ func (g *Gateway) Dispatch(ctx context.Context, tok token.Token, req ir.Request)
 // (status 0) or a 5xx becomes 502 Bad Gateway.
 func clientStatus(upstreamStatus int) int {
 	switch {
-	case upstreamStatus == 0:
+	case upstreamStatus == 0 || upstreamStatus >= 200 && upstreamStatus < 300:
 		return http.StatusBadGateway
 	case upstreamStatus >= 500:
 		return http.StatusBadGateway
@@ -321,7 +349,9 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 // SupportedSurfaces lists the inbound wire surfaces the gateway presents at
 // this milestone (M1: openai-chat only). Exposed so a caller rendering a
 // disabled-gateway status need not import the agent package.
-func SupportedSurfaces() []string { return []string{string(agent.ProtoOpenAIChat)} }
+func SupportedSurfaces() []string {
+	return []string{string(agent.ProtoOpenAIChat), string(agent.ProtoOpenAIResponses)}
+}
 
 // Status is the snapshot the daemon /api/daemon/gateway surface renders.
 type Status struct {

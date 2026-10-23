@@ -250,6 +250,7 @@ func DecodeResponse(body []byte) (ir.Response, error) {
 	}
 	if cr.Usage != nil {
 		resp.Usage = usageToIR(cr.Usage)
+		resp.UsageReported = true
 	}
 	return resp, nil
 }

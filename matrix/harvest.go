@@ -66,12 +66,18 @@ func stubManifest() agent.HarnessManifest {
 // EndpointHarvestList is the harvest list of the 5 model-endpoint providers.
 // Each Manifest() is state-free; constructed via New() for clarity.
 func EndpointHarvestList() []EndpointHarvest {
-	return []EndpointHarvest{
-		{Company: agent.CompanyAnthropic, Manifest: func() agent.ModelEndpointManifest { return endpAnthropic.New().Manifest() }},
-		{Company: agent.CompanyOpenAI, Manifest: func() agent.ModelEndpointManifest { return endpOpenAI.New().Manifest() }},
-		{Company: agent.CompanyGoogle, Manifest: func() agent.ModelEndpointManifest { return endpGoogle.New().Manifest() }},
-		{Company: agent.CompanyLocal, Manifest: func() agent.ModelEndpointManifest { return endpLocal.New().Manifest() }},
-		{Company: agent.CompanyStub, Manifest: func() agent.ModelEndpointManifest { return endpStub.New().Manifest() }},
+	providers := endpointProviders()
+	out := make([]EndpointHarvest, 0, len(providers))
+	for _, provider := range providers {
+		out = append(out, EndpointHarvest{Company: provider.Manifest().Company, Manifest: provider.Manifest})
+	}
+	return out
+}
+
+// endpointProviders is the sole endpoint factory roster for both views.
+func endpointProviders() []agent.ModelEndpointProvider {
+	return []agent.ModelEndpointProvider{
+		endpAnthropic.New(), endpOpenAI.New(), endpGoogle.New(), endpLocal.New(), endpStub.New(),
 	}
 }
 

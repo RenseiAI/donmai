@@ -125,7 +125,11 @@ func BuildWithCapabilityRealizations(
 	}
 	endpoints, endpointByCompany := buildEndpoints()
 
-	cells, err := buildCells(validCells, harnessByName, endpointByCompany)
+	declarations, err := validateProtocolDeclarations(cellDeclarations)
+	if err != nil {
+		return nil, err
+	}
+	cells, err := buildCells(legacyCellProjection(declarations), harnessByName, endpointByCompany)
 	if err != nil {
 		return nil, err
 	}
@@ -272,8 +276,13 @@ func buildCells(
 	}
 
 	out := make([]HarnessEndpointCell, 0, len(cells))
+	seen := map[CellKey]bool{}
 	for _, c := range cells {
 		key := c.Key()
+		if seen[key] {
+			return nil, fmt.Errorf("cell %+v: duplicate legacy triple", key)
+		}
+		seen[key] = true
 		if denied[key] {
 			return nil, fmt.Errorf("cell %+v is on the denylist", key)
 		}

@@ -15,7 +15,10 @@ import (
 type Endpoint struct{}
 
 // Compile-time assertion: Endpoint satisfies ModelEndpointProvider.
-var _ agent.ModelEndpointProvider = (*Endpoint)(nil)
+var (
+	_ agent.ModelEndpointProvider    = (*Endpoint)(nil)
+	_ agent.ProtocolEndpointResolver = (*Endpoint)(nil)
+)
 
 // New constructs a zero-state OpenAI endpoint provider. Never fails.
 func New() *Endpoint { return &Endpoint{} }
@@ -24,4 +27,9 @@ func New() *Endpoint { return &Endpoint{} }
 // without dialing.
 func (e *Endpoint) Resolve(_ context.Context, req agent.EndpointRequest) (agent.EndpointBinding, error) {
 	return resolve.FromManifest(e.Manifest(), req)
+}
+
+// ResolveProtocol resolves the exact opt-in host/protocol declaration.
+func (e *Endpoint) ResolveProtocol(_ context.Context, req agent.EndpointRequest, protocol agent.WireProtocol) (agent.EndpointBinding, error) {
+	return resolve.FromProtocolManifest(e.ProtocolManifest(), req, protocol)
 }

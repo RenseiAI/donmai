@@ -40,6 +40,14 @@ func (u *OpenAICompat) Name() string { return u.Company }
 
 // Invoke implements Upstream.
 func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Credential) (Outcome, error) {
+	responsesInbound := len(req.Items) > 0 || req.Responses != nil
+	if responsesInbound {
+		var err error
+		req, err = translate.ProjectResponsesToChat(req)
+		if err != nil {
+			return Outcome{Status: http.StatusBadRequest}, err
+		}
+	}
 	body, err := translate.EncodeRequest(req)
 	if err != nil {
 		return Outcome{}, err
@@ -71,7 +79,7 @@ func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Cre
 	}
 
 	if req.Stream {
-		stream := u.readStream(resp)
+		stream := u.readStreamMode(ctx, resp, responsesInbound)
 		return Outcome{Status: resp.StatusCode, Stream: stream}, nil
 	}
 
@@ -79,6 +87,11 @@ func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Cre
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return Outcome{Status: resp.StatusCode}, fmt.Errorf("gateway/upstream: read body: %w", err)
+	}
+	if responsesInbound {
+		if err := translate.ValidateChatResponsesSubset(raw, false); err != nil {
+			return Outcome{Status: http.StatusBadGateway}, err
+		}
 	}
 	irResp, err := translate.DecodeResponse(raw)
 	if err != nil {
@@ -102,7 +115,7 @@ func (u *OpenAICompat) applyAuth(r *http.Request, cred pool.Credential) {
 // readStream consumes the SSE body in a goroutine, decoding each `data:` chunk
 // into an ir.StreamDelta. The channel closes when the upstream sends [DONE] or
 // EOF; a mid-stream transport error is surfaced via the returned Stream.Err.
-func (u *OpenAICompat) readStream(resp *http.Response) *ir.Stream {
+func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, strict bool) *ir.Stream {
 	deltas := make(chan ir.StreamDelta)
 	var streamErr error
 	done := make(chan struct{})
@@ -120,6 +133,12 @@ func (u *OpenAICompat) readStream(resp *http.Response) *ir.Stream {
 				continue
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if strict && payload != "[DONE]" {
+				if err := translate.ValidateChatResponsesSubset([]byte(payload), true); err != nil {
+					streamErr = err
+					return
+				}
+			}
 			delta, isDone, derr := translate.DecodeStreamChunk([]byte(payload))
 			if isDone {
 				return
@@ -128,7 +147,12 @@ func (u *OpenAICompat) readStream(resp *http.Response) *ir.Stream {
 				streamErr = derr
 				return
 			}
-			deltas <- delta
+			select {
+			case deltas <- delta:
+			case <-ctx.Done():
+				streamErr = ctx.Err()
+				return
+			}
 		}
 		if err := sc.Err(); err != nil {
 			streamErr = fmt.Errorf("gateway/upstream: read stream: %w", err)

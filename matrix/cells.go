@@ -7,7 +7,7 @@
 //
 // This file holds the ONLY hand-authored capability data (per 03 §1):
 //   - the harvest lists (which providers/endpoints to call Manifest() on),
-//   - the valid-cell list (validCells),
+//   - the canonical declarations and retained ValidCells projection,
 //   - the denylist of known-bad (harness, endpoint, host) triples.
 //
 // The generator (matrix/gen) validates every hand-authored cell against the
@@ -128,120 +128,120 @@ type EndpointHarvest struct {
 	Manifest func() agent.ModelEndpointManifest
 }
 
-// validCells is the authoritative hand-authored valid-cell list (§2.9 + the
+// cellDeclarations is the authoritative cell source for both views (§2.9 + the
 // north-star cell). Order here is the emit order (the generator sorts
 // deterministically before marshalling, so hand order does not affect output).
-var validCells = []HarnessEndpointCell{
+var cellDeclarations = []protocolCellDeclaration{
 	// claude-code × Anthropic ------------------------------------------------
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: agent.HostOAuthCLI,
 		Protocol: agent.ProtoAnthropicMessages, Transport: agent.TransportCLIInjection,
 		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderClaude),
 		Stability: "stable", Smoked: true,
-	},
-	{
+	}),
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: agent.HostDirect,
 		Protocol: agent.ProtoAnthropicMessages, Transport: agent.TransportCLIInjection,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "forced-tool", LegacyProviderID: nil,
 		Stability: "stable", Smoked: false,
-	},
-	{
+	}),
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: agent.HostBedrock,
 		Protocol: agent.ProtoAnthropicMessages, Transport: agent.TransportCLIInjection,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "forced-tool", LegacyProviderID: nil,
 		Stability: "beta", Smoked: false,
-	},
-	{
+	}),
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: agent.HostVertex,
 		Protocol: agent.ProtoAnthropicMessages, Transport: agent.TransportCLIInjection,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "forced-tool", LegacyProviderID: nil,
 		Stability: "beta", Smoked: false,
-	},
+	}),
 
 	// codex × OpenAI ---------------------------------------------------------
 	// All three cells ride the app-server harness (TransportSubprocessRPC),
 	// which threads Spec.ResponseSchema as turn/start outputSchema — native
 	// strict structured output ("output-schema").
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostOAuthCLI,
 		Protocol: agent.ProtoOpenAIResponses, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "output-schema", LegacyProviderID: pn(agent.ProviderCodex),
 		Stability: "stable", Smoked: true,
-	},
-	{
+	}),
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostDirect,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "output-schema", LegacyProviderID: nil,
 		Stability: "beta", Smoked: false,
-	},
-	{
+	}),
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostAzure,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "output-schema", LegacyProviderID: nil,
 		Stability: "beta", Smoked: false,
-	},
+	}),
 
 	// gemini-direct × Google -----------------------------------------------
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostDirect,
 		Protocol: agent.ProtoGeminiGenerate, Transport: agent.TransportDirectAPI,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "response-schema", LegacyProviderID: pn(agent.ProviderGemini),
 		Stability: "stable", Smoked: true,
-	},
-	{
+	}),
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostVertex,
 		Protocol: agent.ProtoGeminiGenerate, Transport: agent.TransportDirectAPI,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "response-schema", LegacyProviderID: nil,
 		Stability: "beta", Smoked: false,
-	},
+	}),
 
 	// antigravity × Google (agy host login) ---------------------------------
-	{
+	legacyOnlyCell(HarnessEndpointCell{
 		Harness: agent.HarnessAntigravity, Endpoint: agent.CompanyGoogle, Host: agent.HostOAuthCLI,
 		Protocol: agent.ProtoAntigravityOAuth, Transport: agent.TransportPTY,
 		AuthModes: []agent.AuthMode{agent.AuthHostSession, agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderAGYCLI),
 		Stability: "stable", Smoked: true,
-	},
+	}),
 
 	// ollama × Local --------------------------------------------------------
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: agent.HostLocal,
 		Protocol: agent.ProtoOllama, Transport: agent.TransportDirectAPI,
 		AuthModes: []agent.AuthMode{agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostLocalFree, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "format-json", LegacyProviderID: pn(agent.ProviderOllama),
 		Stability: "beta", Smoked: false,
-	},
+	}),
 
 	// opencode × OpenAI (direct) — legacy default for ProviderName "opencode"
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: agent.HostDirect,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportCLIInjection,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "json-schema", LegacyProviderID: pn(agent.ProviderOpenCode),
 		Stability: "beta", Smoked: true,
-	},
+	}),
 
 	// opencode × OpenAI on the gateway (openai-chat surface) — the first
 	// gateway cell (M1; ADR-2026-07-24 / 08 §9). opencode drives openai-chat and
@@ -250,57 +250,57 @@ var validCells = []HarnessEndpointCell{
 	// value proves out in M2). Smoked per DEC-2/DEC-3: donmai-smokes step19
 	// gateway lane green 3 consecutive main runs (2026-07-25 → 2026-07-26).
 	// Not a legacy anchor — the opencode default stays the direct cell above.
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: agent.HostGateway,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportCLIInjection,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "json-schema", LegacyProviderID: nil,
 		Stability: "experimental", Smoked: true,
-	},
+	}),
 
 	// opencode × Google on local (/v1 openai-chat) — THE NORTH-STAR CELL ----
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyGoogle, Host: agent.HostLocal,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportCLIInjection,
 		AuthModes: []agent.AuthMode{agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostLocalFree, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "json-schema", LegacyProviderID: nil,
 		Stability: "experimental", Smoked: false,
-	},
+	}),
 
 	// pi × Anthropic (direct) — deliberately narrow (09 §3): pi's Drive
 	// surface is the broadest in the fleet, but only two direct cells are
 	// authored, both experimental/untested, until the donmai-smokes step20
 	// gate accrues green history (DEC-2/DEC-3). Anchors ProviderName "pi".
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessPi, Endpoint: agent.CompanyAnthropic, Host: agent.HostDirect,
 		Protocol: agent.ProtoAnthropicMessages, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderPi),
 		Stability: "experimental", Smoked: false,
-	},
+	}),
 
 	// pi × OpenAI (direct) --------------------------------------------------
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessPi, Endpoint: agent.CompanyOpenAI, Host: agent.HostDirect,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
 		StructuredVia: "spawn-collect", LegacyProviderID: nil,
 		Stability: "experimental", Smoked: false,
-	},
+	}),
 
 	// stub × stub -----------------------------------------------------------
-	{
+	legacyDefaultCell(HarnessEndpointCell{
 		Harness: agent.HarnessStub, Endpoint: agent.CompanyStub, Host: agent.HostLocal,
 		Protocol: agent.ProtoStub, Transport: agent.TransportDirectAPI,
 		AuthModes: []agent.AuthMode{agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostLocalFree, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "stub", LegacyProviderID: pn(agent.ProviderStub),
 		Stability: "stable", Smoked: true,
-	},
+	}),
 }
 
 // denylist is the small set of known-bad (harness, endpoint, host) triples
@@ -363,7 +363,7 @@ var harnessBinaryPins = map[agent.HarnessName]HarnessBinaryPin{
 
 // ValidCells returns the hand-authored valid-cell list. Exported so the
 // parity test (same package) and the generator can both read it.
-func ValidCells() []HarnessEndpointCell { return validCells }
+func ValidCells() []HarnessEndpointCell { return legacyCellProjection(cellDeclarations) }
 
 // Denylist returns the hand-authored denylist.
 func Denylist() []CellKey { return denylist }

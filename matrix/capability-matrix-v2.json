@@ -1,0 +1,1743 @@
+{
+  "schemaVersion": "p2.0",
+  "contractAbi": "capability-matrix/v2",
+  "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
+  "harnesses": [
+    {
+      "name": "claude-code",
+      "humanLabel": "Claude Code",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": false,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": true,
+        "subagents": true,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "interactivePty": true,
+        "noticeDelivery": "hook",
+        "drives": [
+          "anthropic-messages"
+        ],
+        "drivesHosts": [
+          "bedrock",
+          "direct",
+          "oauth-cli",
+          "vertex"
+        ],
+        "transport": "cli-injection"
+      },
+      "drives": [
+        "anthropic-messages"
+      ],
+      "drivesHosts": [
+        "bedrock",
+        "direct",
+        "oauth-cli",
+        "vertex"
+      ],
+      "promptDelivery": [
+        {
+          "id": "claude-code/headless/cli-v1",
+          "mode": "autonomous",
+          "systemDelivery": "claude_cli_append_system_prompt",
+          "baseAppendDelivery": "claude_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "claude_cli_append_system_prompt",
+          "userDelivery": "claude_cli_stdin",
+          "amendmentDelivery": "claude_cli_stdin"
+        },
+        {
+          "id": "claude-code/interactive/pty-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "claude_cli_append_system_prompt",
+          "baseAppendDelivery": "claude_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "claude_cli_append_system_prompt",
+          "userDelivery": "claude_cli_pty_seed",
+          "amendmentDelivery": "claude_cli_pty_seed"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "claude-code/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "claude_cli_mcp_config",
+          "nativeToolPolicyDelivery": "claude_cli_allow_deny",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "claude_cli_allow_deny",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "claude-code/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "claude_cli_mcp_config",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
+      "name": "codex",
+      "humanLabel": "Codex",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": true,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "codex",
+        "streamingTransport": "none",
+        "interactivePty": true,
+        "multiRepositoryWorkareaProtocols": [
+          "session-root-v1"
+        ],
+        "repositoryAuthorityEnforcement": "isolated-read-only-v1",
+        "noticeDelivery": "mcp-rpc",
+        "drives": [
+          "openai-chat",
+          "openai-responses"
+        ],
+        "drivesHosts": [
+          "azure",
+          "direct",
+          "oauth-cli"
+        ],
+        "transport": "subprocess-jsonrpc"
+      },
+      "drives": [
+        "openai-chat",
+        "openai-responses"
+      ],
+      "drivesHosts": [
+        "azure",
+        "direct",
+        "oauth-cli"
+      ],
+      "promptDelivery": [
+        {
+          "id": "codex/headless/app-server-v2",
+          "mode": "autonomous",
+          "systemDelivery": "codex_app_server_developer_instructions",
+          "baseAppendDelivery": "codex_app_server_developer_instructions",
+          "baseReplaceDelivery": "codex_app_server_base_instructions",
+          "contextDelivery": "codex_app_server_turn_input",
+          "userDelivery": "codex_app_server_turn_input",
+          "amendmentDelivery": "codex_app_server_turn_input"
+        },
+        {
+          "id": "codex/interactive/pty-developer-instructions-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "codex_cli_developer_instructions",
+          "baseAppendDelivery": "codex_cli_developer_instructions",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "codex_cli_pty_seed",
+          "userDelivery": "codex_cli_pty_seed",
+          "amendmentDelivery": "codex_cli_pty_seed"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "codex/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "codex_app_server_mcp",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "codex_approval_bridge",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "codex/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "codex_cli_mcp_config",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "codex/interactive/tool-lifecycle-v2",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "codex_cli_mcp_config",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "native_verified",
+          "productionEligible": true
+        }
+      ]
+    },
+    {
+      "name": "gemini-direct",
+      "humanLabel": "Gemini (direct)",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": false,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": true,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "gemini",
+        "streamingTransport": "sse",
+        "interactivePty": false,
+        "noticeDelivery": "in-box-loop",
+        "drives": [
+          "gemini-generate"
+        ],
+        "drivesHosts": [
+          "direct",
+          "vertex"
+        ],
+        "transport": "direct-api"
+      },
+      "drives": [
+        "gemini-generate"
+      ],
+      "drivesHosts": [
+        "direct",
+        "vertex"
+      ],
+      "promptDelivery": [
+        {
+          "id": "gemini-direct/gemini-generate/direct-api-v1",
+          "mode": "autonomous",
+          "systemDelivery": "gemini_system_instruction",
+          "baseAppendDelivery": "gemini_system_instruction",
+          "baseReplaceDelivery": "gemini_system_instruction",
+          "contextDelivery": "gemini_system_instruction",
+          "userDelivery": "gemini_user_content",
+          "amendmentDelivery": "gemini_user_content"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "gemini-direct/gemini-generate/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "gemini_in_box_mcp_bridge",
+          "nativeToolPolicyDelivery": "gemini_in_box_native_boundary",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "gemini_in_box_native_boundary",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
+      "name": "ollama",
+      "humanLabel": "Ollama (local)",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": false,
+        "tools": false,
+        "mcp": false,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": false,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "interactivePty": false,
+        "noticeDelivery": "none",
+        "drives": [
+          "ollama"
+        ],
+        "drivesHosts": [
+          "local"
+        ],
+        "transport": "direct-api"
+      },
+      "drives": [
+        "ollama"
+      ],
+      "drivesHosts": [
+        "local"
+      ],
+      "promptDelivery": [
+        {
+          "id": "ollama/ollama-chat/direct-api-v1",
+          "mode": "autonomous",
+          "systemDelivery": "ollama_system_message",
+          "baseAppendDelivery": "ollama_system_message",
+          "baseReplaceDelivery": "ollama_system_message",
+          "contextDelivery": "ollama_system_message",
+          "userDelivery": "ollama_user_message",
+          "amendmentDelivery": "ollama_user_message"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "ollama/ollama-chat/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "assistant_text",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "assistant_text",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
+      "name": "opencode",
+      "humanLabel": "OpenCode",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": true,
+        "tools": false,
+        "mcp": true,
+        "allowedToolsList": true,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "interactivePty": false,
+        "noticeDelivery": "http-session",
+        "drives": [
+          "openai-chat"
+        ],
+        "drivesHosts": [
+          "direct",
+          "gateway",
+          "local",
+          "oauth-cli"
+        ],
+        "transport": "cli-injection"
+      },
+      "drives": [
+        "openai-chat"
+      ],
+      "drivesHosts": [
+        "direct",
+        "gateway",
+        "local",
+        "oauth-cli"
+      ],
+      "promptDelivery": [
+        {
+          "id": "opencode/headless/prompt-v1",
+          "mode": "autonomous",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "unsupported",
+          "userDelivery": "opencode_prompt",
+          "amendmentDelivery": "opencode_prompt"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "opencode/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "opencode_project_mcp_config",
+          "nativeToolPolicyDelivery": "opencode_permission_map",
+          "permissionConfigDelivery": "opencode_permission_map",
+          "mcpToolPolicyDelivery": "opencode_permission_map",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
+      "name": "pi",
+      "humanLabel": "pi",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": true,
+        "tools": true,
+        "mcp": false,
+        "allowedToolsList": true,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "interactivePty": true,
+        "noticeDelivery": "rpc-steer",
+        "drives": [
+          "anthropic-messages",
+          "gemini-generate",
+          "openai-chat",
+          "openai-responses"
+        ],
+        "drivesHosts": [
+          "bedrock",
+          "direct",
+          "local",
+          "vertex"
+        ],
+        "transport": "subprocess-jsonrpc"
+      },
+      "drives": [
+        "anthropic-messages",
+        "gemini-generate",
+        "openai-chat",
+        "openai-responses"
+      ],
+      "drivesHosts": [
+        "bedrock",
+        "direct",
+        "local",
+        "vertex"
+      ],
+      "promptDelivery": [
+        {
+          "id": "pi/headless/rpc-v1",
+          "mode": "autonomous",
+          "systemDelivery": "pi_cli_append_system_prompt",
+          "baseAppendDelivery": "pi_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "pi_cli_append_system_prompt",
+          "userDelivery": "pi_rpc_prompt",
+          "amendmentDelivery": "pi_rpc_prompt"
+        },
+        {
+          "id": "pi/interactive/pty-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "pi_cli_append_system_prompt",
+          "baseAppendDelivery": "pi_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "pi_cli_pty_seed",
+          "userDelivery": "pi_cli_pty_seed",
+          "amendmentDelivery": "pi_cli_pty_seed"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "pi/headless/tool-lifecycle-v2",
+          "mode": "autonomous",
+          "toolPluginDelivery": "pi_additional_extension_registration",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "pi_handshake_policy_extension",
+          "permissionConfigDelivery": "pi_handshake_policy_extension",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "pi/interactive/tool-lifecycle-v6",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "pi_additional_extension_registration",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "pi_interactive_local_tool_policy",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
+      "name": "shell",
+      "humanLabel": "Shell",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": false,
+        "tools": false,
+        "mcp": false,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": false,
+        "oneShot": false,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "",
+        "streamingTransport": "none",
+        "interactivePty": true,
+        "noticeDelivery": "pty-notice",
+        "drives": [],
+        "drivesHosts": [],
+        "transport": "pty"
+      },
+      "drives": [],
+      "drivesHosts": [],
+      "promptDelivery": [
+        {
+          "id": "shell/interactive/pty-seed-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "unsupported",
+          "userDelivery": "shell_pty_seed",
+          "amendmentDelivery": "unsupported"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "shell/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
+      "name": "stub",
+      "humanLabel": "Test Stub",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": true,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": true,
+        "subagents": true,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "none",
+        "interactivePty": true,
+        "noticeDelivery": "in-box-loop",
+        "drives": [
+          "stub"
+        ],
+        "drivesHosts": [
+          "local"
+        ],
+        "transport": "direct-api"
+      },
+      "drives": [
+        "stub"
+      ],
+      "drivesHosts": [
+        "local"
+      ],
+      "promptDelivery": [
+        {
+          "id": "stub/interactive/pty-seed-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "stub_pty_seed",
+          "userDelivery": "stub_pty_seed",
+          "amendmentDelivery": "stub_pty_seed"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "stub/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "no_tool_surface",
+          "permissionConfigDelivery": "no_tool_surface",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "stub/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "stub_oracle",
+          "mcpDelivery": "stub_oracle",
+          "nativeToolPolicyDelivery": "stub_oracle",
+          "permissionConfigDelivery": "stub_oracle",
+          "mcpToolPolicyDelivery": "stub_oracle",
+          "toolHookDelivery": "stub_oracle",
+          "lifecycleDelivery": "stub_oracle",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "stub_oracle",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "stub_oracle",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "company": "anthropic",
+      "humanLabel": "Anthropic",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "anthropic-messages"
+      ],
+      "hosts": [
+        {
+          "host": "bedrock",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://bedrock-runtime.{region}.amazonaws.com",
+          "envKeys": [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION"
+          ]
+        },
+        {
+          "host": "direct",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://api.anthropic.com",
+          "envKeys": [
+            "ANTHROPIC_API_KEY"
+          ]
+        },
+        {
+          "host": "oauth-cli",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "host-session"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "host-subscription",
+          "baseUrlTmpl": "",
+          "envKeys": []
+        },
+        {
+          "host": "vertex",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://{region}-aiplatform.googleapis.com",
+          "envKeys": [
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "ANTHROPIC_VERTEX_PROJECT_ID"
+          ]
+        }
+      ],
+      "models": [
+        {
+          "id": "claude-sonnet-4-5",
+          "humanLabel": "Claude Sonnet 4.5",
+          "contextWindow": 200000,
+          "supportsTools": true,
+          "supportsJsonMode": false,
+          "hosts": [
+            "direct",
+            "bedrock",
+            "vertex"
+          ]
+        },
+        {
+          "id": "claude-haiku",
+          "humanLabel": "Claude Haiku",
+          "contextWindow": 200000,
+          "supportsTools": true,
+          "supportsJsonMode": false,
+          "hosts": [
+            "direct",
+            "bedrock",
+            "vertex"
+          ]
+        },
+        {
+          "id": "claude-sonnet-5",
+          "humanLabel": "Claude Sonnet 5",
+          "contextWindow": 1000000,
+          "supportsTools": true,
+          "supportsJsonMode": false,
+          "hosts": [
+            "oauth-cli"
+          ]
+        }
+      ]
+    },
+    {
+      "company": "google",
+      "humanLabel": "Google",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v2",
+      "speaks": [
+        "gemini-generate",
+        "openai-chat"
+      ],
+      "hosts": [
+        {
+          "host": "direct",
+          "protocol": "gemini-generate",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://generativelanguage.googleapis.com",
+          "envKeys": [
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        },
+        {
+          "host": "local",
+          "protocol": "openai-chat",
+          "authModes": [
+            "local"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "local",
+          "baseUrlTmpl": "http://127.0.0.1:11434/v1",
+          "envKeys": []
+        },
+        {
+          "host": "vertex",
+          "protocol": "gemini-generate",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://{region}-aiplatform.googleapis.com",
+          "envKeys": [
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_VERTEX_PROJECT_ID"
+          ]
+        }
+      ],
+      "models": [
+        {
+          "id": "gemini-2.5-pro",
+          "humanLabel": "Gemini 2.5 Pro",
+          "contextWindow": 1000000,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "direct",
+            "vertex"
+          ]
+        }
+      ]
+    },
+    {
+      "company": "local",
+      "humanLabel": "Local (Ollama)",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "ollama"
+      ],
+      "hosts": [
+        {
+          "host": "local",
+          "protocol": "ollama",
+          "authModes": [
+            "local"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "local",
+          "baseUrlTmpl": "http://127.0.0.1:11434",
+          "envKeys": []
+        }
+      ],
+      "models": null
+    },
+    {
+      "company": "openai",
+      "humanLabel": "OpenAI",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v2",
+      "speaks": [
+        "openai-chat",
+        "openai-responses"
+      ],
+      "hosts": [
+        {
+          "host": "azure",
+          "protocol": "openai-chat",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://{resource}.openai.azure.com",
+          "envKeys": [
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_ENDPOINT"
+          ]
+        },
+        {
+          "host": "direct",
+          "protocol": "openai-chat",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://api.openai.com/v1",
+          "envKeys": [
+            "OPENAI_API_KEY"
+          ]
+        },
+        {
+          "host": "direct",
+          "protocol": "openai-responses",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://api.openai.com/v1",
+          "envKeys": [
+            "OPENAI_API_KEY"
+          ]
+        },
+        {
+          "host": "gateway",
+          "protocol": "openai-chat",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "http://127.0.0.1:{port}/v1",
+          "envKeys": [
+            "DONMAI_GW_TOKEN"
+          ]
+        },
+        {
+          "host": "oauth-cli",
+          "protocol": "openai-responses",
+          "authModes": [
+            "host-session"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "host-subscription",
+          "baseUrlTmpl": "",
+          "envKeys": []
+        }
+      ],
+      "models": [
+        {
+          "id": "gpt-5-codex",
+          "humanLabel": "GPT-5 Codex",
+          "contextWindow": 400000,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "direct",
+            "azure"
+          ]
+        },
+        {
+          "id": "gpt-6-sol",
+          "humanLabel": "GPT-6 Sol",
+          "contextWindow": 1050000,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "oauth-cli"
+          ]
+        }
+      ]
+    },
+    {
+      "company": "stub",
+      "humanLabel": "Test Stub Endpoint",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "stub"
+      ],
+      "hosts": [
+        {
+          "host": "local",
+          "protocol": "stub",
+          "authModes": [
+            "local"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "local",
+          "baseUrlTmpl": "http://127.0.0.1:0",
+          "envKeys": []
+        }
+      ],
+      "models": [
+        {
+          "id": "stub-model",
+          "humanLabel": "Stub Model",
+          "contextWindow": 8192,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "local"
+          ]
+        }
+      ]
+    }
+  ],
+  "cells": [
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "bedrock",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "forced-tool",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "direct",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "forced-tool",
+      "legacyProviderId": null,
+      "stability": "stable",
+      "smoked": false
+    },
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "oauth-cli",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "host-session"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "host-subscription",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "claude",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "vertex",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "forced-tool",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "codex",
+      "endpoint": "openai",
+      "host": "azure",
+      "protocol": "openai-chat",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "codex",
+      "endpoint": "openai",
+      "host": "direct",
+      "protocol": "openai-chat",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "codex",
+      "endpoint": "openai",
+      "host": "oauth-cli",
+      "protocol": "openai-responses",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "host-session"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "host-subscription",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
+      "legacyProviderId": "codex",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "gemini-direct",
+      "endpoint": "google",
+      "host": "direct",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": "gemini",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "gemini-direct",
+      "endpoint": "google",
+      "host": "vertex",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "ollama",
+      "endpoint": "local",
+      "host": "local",
+      "protocol": "ollama",
+      "transport": "direct-api",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "format-json",
+      "legacyProviderId": "ollama",
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "opencode",
+      "endpoint": "google",
+      "host": "local",
+      "protocol": "openai-chat",
+      "transport": "cli-injection",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "json-schema",
+      "legacyProviderId": null,
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
+      "harness": "opencode",
+      "endpoint": "openai",
+      "host": "direct",
+      "protocol": "openai-chat",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "json-schema",
+      "legacyProviderId": "opencode",
+      "stability": "beta",
+      "smoked": true
+    },
+    {
+      "harness": "opencode",
+      "endpoint": "openai",
+      "host": "gateway",
+      "protocol": "openai-chat",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "json-schema",
+      "legacyProviderId": null,
+      "stability": "experimental",
+      "smoked": true
+    },
+    {
+      "harness": "pi",
+      "endpoint": "anthropic",
+      "host": "direct",
+      "protocol": "anthropic-messages",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "pi",
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
+      "harness": "pi",
+      "endpoint": "openai",
+      "host": "direct",
+      "protocol": "openai-chat",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": null,
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
+      "harness": "stub",
+      "endpoint": "stub",
+      "host": "local",
+      "protocol": "stub",
+      "transport": "direct-api",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "stub",
+      "legacyProviderId": "stub",
+      "stability": "stable",
+      "smoked": true
+    }
+  ],
+  "legacyDefaults": [
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "bedrock"
+      },
+      "protocol": "anthropic-messages"
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "direct"
+      },
+      "protocol": "anthropic-messages"
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "oauth-cli"
+      },
+      "protocol": "anthropic-messages"
+    },
+    {
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "vertex"
+      },
+      "protocol": "anthropic-messages"
+    },
+    {
+      "cell": {
+        "harness": "codex",
+        "endpoint": "openai",
+        "host": "azure"
+      },
+      "protocol": "openai-chat"
+    },
+    {
+      "cell": {
+        "harness": "codex",
+        "endpoint": "openai",
+        "host": "direct"
+      },
+      "protocol": "openai-chat"
+    },
+    {
+      "cell": {
+        "harness": "codex",
+        "endpoint": "openai",
+        "host": "oauth-cli"
+      },
+      "protocol": "openai-responses"
+    },
+    {
+      "cell": {
+        "harness": "gemini-direct",
+        "endpoint": "google",
+        "host": "direct"
+      },
+      "protocol": "gemini-generate"
+    },
+    {
+      "cell": {
+        "harness": "gemini-direct",
+        "endpoint": "google",
+        "host": "vertex"
+      },
+      "protocol": "gemini-generate"
+    },
+    {
+      "cell": {
+        "harness": "ollama",
+        "endpoint": "local",
+        "host": "local"
+      },
+      "protocol": "ollama"
+    },
+    {
+      "cell": {
+        "harness": "opencode",
+        "endpoint": "google",
+        "host": "local"
+      },
+      "protocol": "openai-chat"
+    },
+    {
+      "cell": {
+        "harness": "opencode",
+        "endpoint": "openai",
+        "host": "direct"
+      },
+      "protocol": "openai-chat"
+    },
+    {
+      "cell": {
+        "harness": "opencode",
+        "endpoint": "openai",
+        "host": "gateway"
+      },
+      "protocol": "openai-chat"
+    },
+    {
+      "cell": {
+        "harness": "pi",
+        "endpoint": "anthropic",
+        "host": "direct"
+      },
+      "protocol": "anthropic-messages"
+    },
+    {
+      "cell": {
+        "harness": "pi",
+        "endpoint": "openai",
+        "host": "direct"
+      },
+      "protocol": "openai-chat"
+    },
+    {
+      "cell": {
+        "harness": "stub",
+        "endpoint": "stub",
+        "host": "local"
+      },
+      "protocol": "stub"
+    }
+  ],
+  "legacyAliases": [
+    {
+      "providerName": "claude",
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "oauth-cli"
+      }
+    },
+    {
+      "providerName": "codex",
+      "cell": {
+        "harness": "codex",
+        "endpoint": "openai",
+        "host": "oauth-cli"
+      }
+    },
+    {
+      "providerName": "gemini",
+      "cell": {
+        "harness": "gemini-direct",
+        "endpoint": "google",
+        "host": "direct"
+      }
+    },
+    {
+      "providerName": "ollama",
+      "cell": {
+        "harness": "ollama",
+        "endpoint": "local",
+        "host": "local"
+      }
+    },
+    {
+      "providerName": "opencode",
+      "cell": {
+        "harness": "opencode",
+        "endpoint": "openai",
+        "host": "direct"
+      }
+    },
+    {
+      "providerName": "pi",
+      "cell": {
+        "harness": "pi",
+        "endpoint": "anthropic",
+        "host": "direct"
+      }
+    },
+    {
+      "providerName": "stub",
+      "cell": {
+        "harness": "stub",
+        "endpoint": "stub",
+        "host": "local"
+      }
+    }
+  ],
+  "denylist": [],
+  "binaryPins": [
+    {
+      "harness": "opencode",
+      "minVersion": "1.17.18",
+      "pinnedVersion": "1.17.18",
+      "verifiedAgainst": "1.17.18"
+    },
+    {
+      "harness": "pi",
+      "minVersion": "0.80.10",
+      "pinnedVersion": "0.80.10",
+      "verifiedAgainst": "0.80.10"
+    }
+  ]
+}

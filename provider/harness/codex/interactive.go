@@ -85,6 +85,10 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	if err := validateNamedInteractiveTransport(spec, goos); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	selectedEndpoint, err := prepareInteractiveCodexEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, persistInteractiveMCPApplicationDenial(spec, err))
 	}
@@ -96,7 +100,7 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	if !hasPlatformSessionMCPAuthority(spec.MCPServers) {
+	if !hasPlatformSessionMCPAuthority(spec.MCPServers) && (selectedEndpoint == nil || selectedEndpoint.nativeHostLogin) {
 		if spec.SessionName != "" {
 			home, homeErr := ambientCodexHome()
 			if homeErr != nil {
@@ -112,7 +116,21 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		spec.Env = launch.env
 		return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
 	}
-	config, auth, err := newInteractiveCodexConfigBoundary(opts.configTempDir, launch.env)
+	var (
+		config *codexConfigBoundary
+		auth   interactiveCodexAuthProjection
+	)
+	if selectedEndpoint != nil && !selectedEndpoint.nativeHostLogin {
+		config, err = newCodexConfigBoundaryWithAuthMode(opts.configTempDir, "")
+		if err == nil {
+			err = writeInteractiveEndpointConfig(config, selectedEndpoint)
+			if err != nil {
+				err = errors.Join(err, config.remove())
+			}
+		}
+	} else {
+		config, auth, err = newInteractiveCodexConfigBoundary(opts.configTempDir, launch.env)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: isolate codex interactive config: %w", agent.ErrSpawnFailed, err)
 	}
@@ -136,15 +154,17 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	// an explicit empty mcp_servers table.
 	launch.env["CODEX_HOME"] = config.home
 	spec.Env = launch.env
-	authSeeder := opts.interactiveAuthSeeder
-	if authSeeder == nil {
-		authSeeder = seedInteractiveCodexEnvironmentAuth
-	}
-	if err := authSeeder(ctx, bin, config.home, auth); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
-			config.remove(),
-		)
+	if selectedEndpoint == nil || selectedEndpoint.nativeHostLogin {
+		authSeeder := opts.interactiveAuthSeeder
+		if authSeeder == nil {
+			authSeeder = seedInteractiveCodexEnvironmentAuth
+		}
+		if err := authSeeder(ctx, bin, config.home, auth); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
+				config.remove(),
+			)
+		}
 	}
 	if err := refuseProtectedMCPStoredOAuth(config.home, spec.MCPServers); err != nil {
 		return nil, errors.Join(fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err), config.remove())
@@ -153,19 +173,24 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	// deliberately override inherited parent credentials in both the effective
 	// config preflight and the PTY process environment.
 	launch.env = clearInteractiveCodexAuthEnvironment(launch.env)
+	if selectedEndpoint != nil && !selectedEndpoint.nativeHostLogin && selectedEndpoint.envKey != "" {
+		launch.env[selectedEndpoint.envKey] = selectedEndpoint.envValue
+	}
 	spec.Env = launch.env
-	if err := verifyExclusiveInteractiveMCP(
-		ctx,
-		opts.interactiveMCPInventoryRunner,
-		bin,
-		spec,
-		launch,
-		config.home,
-	); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
-			config.remove(),
-		)
+	if len(spec.MCPServers) > 0 {
+		if err := verifyExclusiveInteractiveMCP(
+			ctx,
+			opts.interactiveMCPInventoryRunner,
+			bin,
+			spec,
+			launch,
+			config.home,
+		); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
+				config.remove(),
+			)
+		}
 	}
 	if opts.interactiveBeforePTYSpawn != nil {
 		if err := opts.interactiveBeforePTYSpawn(ctx, bin, spec, launch, config.home); err != nil {
@@ -427,7 +452,11 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 			}
 		}
 	}
-	if model := strings.TrimSpace(spec.Model); model != "" {
+	model := strings.TrimSpace(spec.Model)
+	if spec.Endpoint != nil && !spec.Endpoint.IsZero() && spec.Endpoint.Model != "" {
+		model = spec.Endpoint.Model
+	}
+	if model != "" {
 		args = append(args, "--config", "model="+tomlBasicString(model))
 	}
 	// Reasoning effort rides the same process-local override as model:

@@ -18,6 +18,9 @@ const codexFakeMCPStdioEnv = "DONMAI_CODEX_FAKE_MCP_STDIO"
 // (appserver_env_test.go). Both child paths never run tests and write protocol
 // messages only to stdout.
 func TestMain(m *testing.M) {
+	if os.Getenv(codexEndpointFixtureEnv) == "1" {
+		os.Exit(runCodexEndpointFixture())
+	}
 	if os.Getenv(codexFakeMCPStdioEnv) == "1" {
 		runCodexFakeMCPStdio()
 		os.Exit(0)

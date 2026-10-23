@@ -38,6 +38,21 @@ func run() error {
 		return fmt.Errorf("render artifacts: %w", err)
 	}
 
+	protocolView, err := matrix.BuildProtocolView()
+	if err != nil {
+		return fmt.Errorf("build protocol view: %w", err)
+	}
+	protocolArtifacts, err := protocolView.Render()
+	if err != nil {
+		return fmt.Errorf("render protocol view: %w", err)
+	}
+	for name, content := range protocolArtifacts.Files {
+		if _, exists := arts.Files[name]; exists {
+			return fmt.Errorf("protocol artifact would replace legacy artifact %q", name)
+		}
+		arts.Files[name] = content
+	}
+
 	outDir, err := matrixDir()
 	if err != nil {
 		return err
