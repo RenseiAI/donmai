@@ -33,14 +33,18 @@ type quotaState struct {
 	museAuth   *agent.UsageAuthCheck
 }
 
-// quotaSnapshot composes the heartbeat quota field: one entry per
+// QuotaSnapshot composes the heartbeat quota field: one entry per
 // account with quota state. Nil-safe: a daemon that has never produced
-// a snapshot reports nothing, and the beat omits the key.
+// a snapshot reports nothing, and the beat omits the key. An embedding
+// binary that runs its own heartbeat lane may call this to publish the
+// same host login checks the daemon's own lane sends.
 //
 // Account IDs ride as opaque values the platform hashes; the snapshot
 // never carries an address. Each entry carries the harness's latest
 // login-check outcome as authCheck, or omits it when no probe has run.
-func (d *Daemon) quotaSnapshot() []agent.UsageAccount {
+// The returned accounts are copies: mutating them never disturbs the
+// cached readings a later probe replaces.
+func (d *Daemon) QuotaSnapshot() []agent.UsageAccount {
 	if d == nil {
 		return nil
 	}
@@ -60,7 +64,7 @@ func (q *quotaState) snapshot() []agent.UsageAccount {
 			Provider:  agent.UsageHarnessCodex,
 			Plan:      q.codexPlan,
 			LimitID:   providercodex.CodexMainLimitID,
-			Limits:    *q.codex,
+			Limits:    copyUsageLimits(q.codex),
 			AuthCheck: copyAuthCheck(q.codexAuth),
 		})
 	}
@@ -68,7 +72,7 @@ func (q *quotaState) snapshot() []agent.UsageAccount {
 		out = append(out, agent.UsageAccount{
 			ID:        q.claudeID,
 			Provider:  agent.UsageHarnessClaude,
-			Limits:    *q.claude,
+			Limits:    copyUsageLimits(q.claude),
 			AuthCheck: copyAuthCheck(q.claudeAuth),
 		})
 	}
@@ -76,9 +80,40 @@ func (q *quotaState) snapshot() []agent.UsageAccount {
 		out = append(out, agent.UsageAccount{
 			ID:        q.museID,
 			Provider:  agent.UsageHarnessMuse,
-			Limits:    *q.muse,
+			Limits:    copyUsageLimits(q.muse),
 			AuthCheck: copyAuthCheck(q.museAuth),
 		})
+	}
+	return out
+}
+
+// copyUsageLimits returns a private copy so a published snapshot never
+// aliases the cached readings a later probe replaces. Windows copy with
+// make plus copy (guarded by a nil check) so an empty non-nil set stays
+// an empty non-nil set on the wire, and each window duration pointer,
+// the reset credits and the unavailability reason copy by value.
+func copyUsageLimits(src *agent.UsageLimits) agent.UsageLimits {
+	if src == nil {
+		return agent.UsageLimits{}
+	}
+	out := *src
+	if src.Windows != nil {
+		out.Windows = make([]agent.UsageWindow, len(src.Windows))
+		copy(out.Windows, src.Windows)
+		for i := range src.Windows {
+			if src.Windows[i].WindowDurationMins != nil {
+				d := *src.Windows[i].WindowDurationMins
+				out.Windows[i].WindowDurationMins = &d
+			}
+		}
+	}
+	if src.ResetCredits != nil {
+		rc := *src.ResetCredits
+		out.ResetCredits = &rc
+	}
+	if src.Unavailable != nil {
+		u := *src.Unavailable
+		out.Unavailable = &u
 	}
 	return out
 }

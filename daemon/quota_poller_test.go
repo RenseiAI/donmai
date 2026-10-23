@@ -97,7 +97,7 @@ func TestQuotaPoller_ProbesDueImmediatelyOnStart(t *testing.T) {
 		t.Errorf("claude probe calls = %d, want exactly 1 (one attempt per interval)", got)
 	}
 
-	snapshot := (&Daemon{quota: q}).quotaSnapshot()
+	snapshot := (&Daemon{quota: q}).QuotaSnapshot()
 	byProvider := map[string]agent.UsageAccount{}
 	for _, acct := range snapshot {
 		byProvider[acct.Provider] = acct
@@ -189,7 +189,7 @@ func TestQuotaPoller_FailedAttemptStillAdvancesClock(t *testing.T) {
 		t.Fatal("failed attempt retried immediately; retries must stay on the interval cadence")
 	case <-time.After(1500 * time.Millisecond):
 	}
-	got := (&Daemon{quota: q}).quotaSnapshot()
+	got := (&Daemon{quota: q}).QuotaSnapshot()
 	if len(got) != 1 || len(got[0].Limits.Windows) == 0 {
 		t.Fatalf("snapshot = %+v, want the last good windows kept after a failed attempt", got)
 	}
@@ -249,7 +249,7 @@ func TestQuotaPoller_MuseProbeToHeartbeatSnapshot(t *testing.T) {
 			// func), not the cache note, then read the heartbeat
 			// field shape the daemon sends.
 			probes[agent.UsageHarnessMuse](context.Background(), d.quota)
-			got := d.quotaSnapshot()
+			got := d.QuotaSnapshot()
 			if len(got) != 1 {
 				t.Fatalf("snapshot = %+v, want the one muse entry", got)
 			}
@@ -280,7 +280,7 @@ func TestQuotaPoller_MuseProbeMissingBinaryOmitsEntry(t *testing.T) {
 	if probes := d.quotaProbes(); probes[agent.UsageHarnessMuse] != nil {
 		t.Fatal("muse probe registered without a configured binary")
 	}
-	if got := d.quotaSnapshot(); len(got) != 0 {
+	if got := d.QuotaSnapshot(); len(got) != 0 {
 		t.Fatalf("snapshot = %+v, want no muse entry", got)
 	}
 	// A configured-but-gone binary records a refusal, not an entry
@@ -291,7 +291,7 @@ func TestQuotaPoller_MuseProbeMissingBinaryOmitsEntry(t *testing.T) {
 		t.Fatal("no muse probe registered for a configured binary")
 	}
 	probes[agent.UsageHarnessMuse](context.Background(), dGone.quota)
-	got := dGone.quotaSnapshot()
+	got := dGone.QuotaSnapshot()
 	if len(got) != 1 || got[0].AuthCheck == nil || got[0].AuthCheck.OK {
 		t.Fatalf("snapshot = %+v, want one muse entry with ok:false", got)
 	}
@@ -315,7 +315,7 @@ func TestQuotaPoller_MuseLoopPublishesEntry(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		for _, acct := range d.quotaSnapshot() {
+		for _, acct := range d.QuotaSnapshot() {
 			if acct.Provider != agent.UsageHarnessMuse {
 				continue
 			}
@@ -331,7 +331,7 @@ func TestQuotaPoller_MuseLoopPublishesEntry(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("poller loop never published the muse entry: %+v", d.quotaSnapshot())
+			t.Fatalf("poller loop never published the muse entry: %+v", d.QuotaSnapshot())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

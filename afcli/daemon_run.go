@@ -170,14 +170,15 @@ func rotateDaemonLogs(errOut io.Writer) {
 // BuildDecoratedAgentRunRegistry's real ctor list probes every one of them.
 var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
 
-// resolveQuotaProbeBinaries resolves the harness CLIs the daemon's live
+// ResolveQuotaProbeBinaries resolves the harness CLIs the daemon's live
 // quota probes shell out to, keyed by harness. A harness with no binary
 // on PATH is absent from the map, which leaves its probe disabled: the
 // daemon reports no verdict for a harness it cannot read, rather than a
 // false one. The muse entry resolves through the harness's own shared
 // resolver, so the probe and the harness constructor never disagree
-// about which binary they see.
-func resolveQuotaProbeBinaries() map[string]string {
+// about which binary they see. An embedding binary that constructs its
+// own daemon may pass the result as Options.QuotaProbeBinaries.
+func ResolveQuotaProbeBinaries() map[string]string {
 	out := map[string]string{}
 	if path, err := exec.LookPath("codex"); err == nil && path != "" {
 		out["codex"] = path
@@ -429,7 +430,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// The live quota probes — resolved from PATH so a host
 				// without an installed harness simply leaves that
 				// harness unprobed. See Options.QuotaProbeBinaries.
-				QuotaProbeBinaries: resolveQuotaProbeBinaries(),
+				QuotaProbeBinaries: ResolveQuotaProbeBinaries(),
 			}
 			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
 			d = daemon.New(daemonOpts)

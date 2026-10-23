@@ -189,7 +189,9 @@ type Options struct {
 	// a daemon built for real operator use probes its host logins
 	// while a daemon built for a test — including every test that
 	// predates this field and never mentions it — never shells out
-	// to a real harness login.
+	// to a real harness login. An embedding binary may pass
+	// afcli.ResolveQuotaProbeBinaries() to resolve the same set from
+	// PATH for its own daemon.
 	QuotaProbeBinaries map[string]string
 
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
@@ -2020,7 +2022,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// signed-in accounts, read at most every 5 minutes per
 			// provider and merged with turn-driven updates. Nil-safe:
 			// a host with no quota state omits the key.
-			GetQuota: d.quotaSnapshot,
+			GetQuota: d.QuotaSnapshot,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)

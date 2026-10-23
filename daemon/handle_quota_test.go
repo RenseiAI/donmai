@@ -119,7 +119,7 @@ func TestSessionUsageRoute_MergesStreamUpdate(t *testing.T) {
 		t.Fatalf("post usage status = %d, want 200", got)
 	}
 
-	snapshot := d.quotaSnapshot()
+	snapshot := d.QuotaSnapshot()
 	if len(snapshot) != 1 {
 		t.Fatalf("snapshot = %+v, want the one probed codex account", snapshot)
 	}
@@ -307,7 +307,7 @@ func TestSessionUsageRoute_RefusesForeignAndMissingCredentials(t *testing.T) {
 
 	// None of the refused POSTs merged: the snapshot still carries the
 	// probe's rows with the login verdict stamped at the probe time.
-	snapshot := d.quotaSnapshot()
+	snapshot := d.QuotaSnapshot()
 	if len(snapshot) != 1 {
 		t.Fatalf("snapshot = %+v, want the one probed codex account", snapshot)
 	}

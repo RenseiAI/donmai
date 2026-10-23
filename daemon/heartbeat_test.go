@@ -1288,7 +1288,7 @@ func TestHeartbeatRequestBody_QuotaAuthCheckGolden(t *testing.T) {
 			getQuota: func() []agent.UsageAccount {
 				q := &quotaState{}
 				q.noteCodexProbe("opaque-account-1", "promax", good(base), base)
-				return (&Daemon{quota: q}).quotaSnapshot()
+				return (&Daemon{quota: q}).QuotaSnapshot()
 			},
 			want: `[{"id":"opaque-account-1","provider":"codex","plan":"promax","limitId":"codex",` +
 				`"limits":{"checkedAt":"2026-10-06T12:00:00Z","windows":[` + window + `]},` +
@@ -1300,7 +1300,7 @@ func TestHeartbeatRequestBody_QuotaAuthCheckGolden(t *testing.T) {
 				q := &quotaState{}
 				q.noteClaudeProbe("opaque-account-2", good(base), base)
 				q.noteClaudeProbe("opaque-account-2", quotaTestRefusedProbe(later), later)
-				return (&Daemon{quota: q}).quotaSnapshot()
+				return (&Daemon{quota: q}).QuotaSnapshot()
 			},
 			want: `[{"id":"opaque-account-2","provider":"claude",` +
 				`"limits":{"checkedAt":"2026-10-06T12:00:00Z","windows":[` + window + `]},` +
