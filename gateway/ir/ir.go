@@ -19,6 +19,7 @@ type Role string
 // Role constants — the canonical set every surface maps onto.
 const (
 	RoleSystem    Role = "system"
+	RoleDeveloper Role = "developer"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
 	RoleTool      Role = "tool"
@@ -50,6 +51,9 @@ type Part struct {
 	ToolCall *ToolCall `json:"toolCall,omitempty"`
 	// ToolCallID links a PartToolResult back to the PartToolCall it answers.
 	ToolCallID string `json:"toolCallId,omitempty"`
+	// Opaque encrypted reasoning is never treated as readable text.
+	EncryptedContent string        `json:"encryptedContent,omitempty"`
+	Annotations      []URLCitation `json:"annotations,omitempty"`
 }
 
 // ToolCall is a model's request to invoke a named tool with JSON arguments.
@@ -57,6 +61,8 @@ type Part struct {
 // string so a streaming assembler can append fragments without re-parsing).
 type ToolCall struct {
 	ID        string `json:"id"`
+	ItemID    string `json:"itemId,omitempty"`
+	Kind      string `json:"kind,omitempty"` // function or custom
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
 }
@@ -69,9 +75,94 @@ type Message struct {
 
 // ToolDef declares a callable tool. Parameters is a JSON Schema object.
 type ToolDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Kind         string           `json:"kind,omitempty"` // function or custom
+	Name         string           `json:"name"`
+	Description  string           `json:"description,omitempty"`
+	Parameters   map[string]any   `json:"parameters,omitempty"`
+	Format       map[string]any   `json:"format,omitempty"`
+	Strict       *bool            `json:"strict,omitempty"`
+	DeferLoading *bool            `json:"deferLoading,omitempty"`
+	Tools        []ToolDef        `json:"tools,omitempty"`
+	WebSearch    *WebSearchConfig `json:"webSearch,omitempty"`
+}
+
+// Item is a typed Responses conversation item. Item identity and call_id are
+// distinct: the latter joins tool outputs to calls across HTTP requests.
+type Item struct {
+	Kind             string           `json:"kind"`
+	ID               string           `json:"id,omitempty"`
+	Role             Role             `json:"role,omitempty"`
+	Phase            string           `json:"phase,omitempty"`
+	Status           string           `json:"status,omitempty"`
+	Namespace        string           `json:"namespace,omitempty"`
+	Parts            []Part           `json:"parts,omitempty"`
+	CallID           string           `json:"callId,omitempty"`
+	Name             string           `json:"name,omitempty"`
+	Arguments        string           `json:"arguments,omitempty"`
+	Input            string           `json:"input,omitempty"`
+	Output           string           `json:"output,omitempty"`
+	Summary          []string         `json:"summary,omitempty"`
+	EncryptedContent string           `json:"encryptedContent,omitempty"`
+	WebSearchAction  *WebSearchAction `json:"webSearchAction,omitempty"`
+}
+
+// WebSearchConfig is the native provider's search tool configuration. The
+// gateway preserves these values; the selected provider executes searches.
+type WebSearchConfig struct {
+	ExternalWebAccess  *bool                  `json:"externalWebAccess,omitempty"`
+	IndexedWebAccess   *bool                  `json:"indexedWebAccess,omitempty"`
+	Filters            *WebSearchFilters      `json:"filters,omitempty"`
+	UserLocation       *WebSearchUserLocation `json:"userLocation,omitempty"`
+	SearchContextSize  *string                `json:"searchContextSize,omitempty"`
+	SearchContentTypes []string               `json:"searchContentTypes,omitempty"`
+}
+
+// WebSearchFilters limits the provider's search domains.
+type WebSearchFilters struct {
+	AllowedDomains []string `json:"allowedDomains,omitempty"`
+}
+
+// WebSearchUserLocation carries the provider's approximate geographic context.
+type WebSearchUserLocation struct {
+	Type     string  `json:"type"`
+	Country  *string `json:"country,omitempty"`
+	Region   *string `json:"region,omitempty"`
+	City     *string `json:"city,omitempty"`
+	Timezone *string `json:"timezone,omitempty"`
+}
+
+// WebSearchAction records provider-executed search/page actions as data only.
+// Kind determines which fields are meaningful; codecs reject cross-kind data.
+type WebSearchAction struct {
+	Kind    string   `json:"kind"`
+	Query   *string  `json:"query,omitempty"`
+	Queries []string `json:"queries,omitempty"`
+	URL     *string  `json:"url,omitempty"`
+	Pattern *string  `json:"pattern,omitempty"`
+}
+
+// URLCitation retains source attribution and text offsets from native output.
+// URLs are data; the gateway never fetches them.
+type URLCitation struct {
+	URL        string `json:"url"`
+	Title      string `json:"title"`
+	StartIndex int    `json:"startIndex"`
+	EndIndex   int    `json:"endIndex"`
+}
+
+// ResponsesControls carry request semantics that have no Chat equivalent.
+// They are typed IR data, never an opaque raw-body pass-through.
+type ResponsesControls struct {
+	// ParallelToolCalls is nil when the client left the protocol default
+	// (parallel) in place, so an absent field stays distinct from serial.
+	ParallelToolCalls *bool             `json:"parallelToolCalls,omitempty"`
+	Store             bool              `json:"store"`
+	Include           []string          `json:"include,omitempty"`
+	Reasoning         map[string]string `json:"reasoning,omitempty"`
+	Text              map[string]any    `json:"text,omitempty"`
+	ServiceTier       string            `json:"serviceTier,omitempty"`
+	PromptCacheKey    string            `json:"promptCacheKey,omitempty"`
+	ClientMetadata    map[string]string `json:"clientMetadata,omitempty"`
 }
 
 // Sampling holds the canonical decoding parameters. Pointers so "unset" is
@@ -97,15 +188,18 @@ const (
 // Request is the canonical request. Metadata carries the session token →
 // dispatch identity used for cost attribution; it never travels to an upstream.
 type Request struct {
-	Model      string       `json:"model"`
-	System     []Part       `json:"system,omitempty"`
-	Messages   []Message    `json:"messages"`
-	Tools      []ToolDef    `json:"tools,omitempty"`
-	ToolChoice ToolChoice   `json:"toolChoice,omitempty"`
-	Sampling   Sampling     `json:"sampling,omitempty"`
-	Thinking   ThinkingSpec `json:"thinking,omitempty"`
-	Stream     bool         `json:"stream,omitempty"`
-	Metadata   Metadata     `json:"-"`
+	Model        string             `json:"model"`
+	Instructions string             `json:"instructions,omitempty"`
+	Items        []Item             `json:"items,omitempty"`
+	Responses    *ResponsesControls `json:"responses,omitempty"`
+	System       []Part             `json:"system,omitempty"`
+	Messages     []Message          `json:"messages"`
+	Tools        []ToolDef          `json:"tools,omitempty"`
+	ToolChoice   ToolChoice         `json:"toolChoice,omitempty"`
+	Sampling     Sampling           `json:"sampling,omitempty"`
+	Thinking     ThinkingSpec       `json:"thinking,omitempty"`
+	Stream       bool               `json:"stream,omitempty"`
+	Metadata     Metadata           `json:"-"`
 }
 
 // Metadata is out-of-band request context for attribution — never serialized
@@ -141,19 +235,47 @@ type Usage struct {
 
 // Response is a fully-assembled non-streaming result.
 type Response struct {
-	Model        string       `json:"model"`
-	Content      []Part       `json:"content"`
-	FinishReason FinishReason `json:"finishReason"`
-	Usage        Usage        `json:"usage"`
+	ID            string           `json:"id,omitempty"`
+	Details       *ResponseDetails `json:"details,omitempty"`
+	Items         []Item           `json:"items,omitempty"`
+	Model         string           `json:"model"`
+	Content       []Part           `json:"content"`
+	FinishReason  FinishReason     `json:"finishReason"`
+	Usage         Usage            `json:"usage"`
+	UsageReported bool             `json:"usageReported,omitempty"`
 	// AppliedThinking records the thinking configuration actually sent to the
 	// upstream (normalize.go), so cost/eval sees what really ran.
 	AppliedThinking *AppliedThinking `json:"appliedThinking,omitempty"`
+}
+
+// ResponseDetails preserves the supported Responses envelope alongside canonical
+// items and usage. Stateful/background responses are refused by the codec.
+type ResponseDetails struct {
+	Object            string            `json:"object,omitempty"`
+	Status            string            `json:"status,omitempty"`
+	CreatedAt         *int64            `json:"createdAt,omitempty"`
+	Instructions      *string           `json:"instructions,omitempty"`
+	ParallelToolCalls *bool             `json:"parallelToolCalls,omitempty"`
+	ToolChoice        *string           `json:"toolChoice,omitempty"`
+	Tools             []ToolDef         `json:"tools,omitempty"`
+	Reasoning         map[string]string `json:"reasoning,omitempty"`
+	Text              map[string]any    `json:"text,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	ServiceTier       *string           `json:"serviceTier,omitempty"`
+	PromptCacheKey    *string           `json:"promptCacheKey,omitempty"`
+	Store             *bool             `json:"store,omitempty"`
+	Background        *bool             `json:"background,omitempty"`
+	Temperature       *float64          `json:"temperature,omitempty"`
+	TopP              *float64          `json:"topP,omitempty"`
+	MaxOutputTokens   *int              `json:"maxOutputTokens,omitempty"`
+	Truncation        *string           `json:"truncation,omitempty"`
 }
 
 // StreamDelta is one incremental chunk on the hot path. Exactly the fields
 // that changed are set; the rest stay zero. A terminal delta carries Finish
 // (and Usage when the upstream reports it on the final chunk).
 type StreamDelta struct {
+	Responses *ResponsesStreamEvent `json:"responses,omitempty"`
 	// TextDelta is appended assistant text.
 	TextDelta string `json:"textDelta,omitempty"`
 	// ThinkingDelta is appended reasoning/thinking text.
@@ -165,6 +287,26 @@ type StreamDelta struct {
 	Finish FinishReason `json:"finish,omitempty"`
 	// Usage is set on the terminal delta when the upstream reports it.
 	Usage *Usage `json:"usage,omitempty"`
+}
+
+// ResponsesStreamEvent is one canonical item lifecycle or terminal event.
+// The surface encodes it as SSE; upstream decoders never pass raw JSON through.
+type ResponsesStreamEvent struct {
+	Kind            string       `json:"kind"`
+	SequenceNumber  *int         `json:"sequenceNumber,omitempty"`
+	Response        *Response    `json:"response,omitempty"`
+	ResponseID      string       `json:"responseId,omitempty"`
+	ItemID          string       `json:"itemId,omitempty"`
+	OutputIndex     int          `json:"outputIndex,omitempty"`
+	ContentIndex    int          `json:"contentIndex,omitempty"`
+	SummaryIndex    int          `json:"summaryIndex,omitempty"`
+	AnnotationIndex int          `json:"annotationIndex,omitempty"`
+	Annotation      *URLCitation `json:"annotation,omitempty"`
+	Item            *Item        `json:"item,omitempty"`
+	Part            *Part        `json:"part,omitempty"`
+	Delta           string       `json:"delta,omitempty"`
+	Usage           *Usage       `json:"usage,omitempty"`
+	EndTurn         *bool        `json:"endTurn,omitempty"`
 }
 
 // ToolCallDelta is a streamed fragment of a tool call. Index disambiguates

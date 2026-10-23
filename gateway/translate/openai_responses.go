@@ -1,776 +1,1430 @@
-// Package translate holds the surface-protocol ⇄ IR codecs. Each protocol has
-// ONE codec used on both sides of the hub: the inbound surface uses it to
-// decode a client request and encode the client response; an outbound upstream
-// speaking the same protocol uses it to encode the request and decode the
-// response. N-to-N translation is therefore 2N codecs, never N².
-//
-// This file is the OpenAI Responses codec (POST /v1/responses, with SSE). It
-// maps the Responses wire shape onto the same canonical IR the Chat
-// Completions codec uses, so responses-in → openai-compat-out is a faithful
-// cross-protocol trip through the hub: input items become IR messages (with
-// function_call_output items becoming tool-role results), and the IR reply is
-// encoded back as a Responses object with message / function_call output
-// items. A real Chat upstream serves Responses inbound through this IR; no
-// native Responses upstream codec is needed for that backend.
-//
-// Fail-closed rules (never silently discard or fabricate):
-//   - previous_response_id / item_reference: refused — the gateway keeps no
-//     response-state store and invents no history authority.
-//   - non-function tools (web_search, file_search, …): refused — the hub has
-//     no server-side tool to run.
-//   - unknown input item / content part types: refused — not silently skipped.
-//   - parallel_tool_calls:false: refused — the gateway cannot enforce serial
-//     tool use on a third-party upstream.
-//   - background:true: refused — the gateway answers synchronously.
-//   - logprobs / top_logprobs: refused — token probabilities do not survive
-//     the hub.
-//   - non-empty include (e.g. reasoning.encrypted_content): refused —
-//     encrypted reasoning blobs are opaque to the hub.
-//   - audio modalities: refused — the hub carries text, image references,
-//     tool calls/results, and reasoning summaries.
-//
-// Ignored-but-documented (no observable semantic effect on one exchange):
-// store (nothing is ever stored), metadata echo, max_tool_calls (a client loop
-// bound over stateless requests), service_tier / safety_identifier /
-// prompt_cache_key / user (routing/identity hints the loopback hub does not
-// act on).
 package translate
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/RenseiAI/donmai/gateway/ir"
 )
 
-// ─── OpenAI Responses wire types (the subset the gateway maps) ───────────────
+// ErrResponsesUnsupported refuses semantics the selected codec cannot preserve.
+var ErrResponsesUnsupported = errors.New("gateway/translate: unsupported responses semantics")
 
-// ResponsesRequest is the POST /v1/responses request body.
-type ResponsesRequest struct {
-	Model              string              `json:"model"`
-	Input              any                 `json:"input,omitempty"`
-	Instructions       string              `json:"instructions,omitempty"`
-	Tools              []ResponsesTool     `json:"tools,omitempty"`
-	ToolChoice         any                 `json:"tool_choice,omitempty"`
-	Reasoning          *ResponsesReasoning `json:"reasoning,omitempty"`
-	Temperature        *float64            `json:"temperature,omitempty"`
-	TopP               *float64            `json:"top_p,omitempty"`
-	MaxOutputTokens    *int                `json:"max_output_tokens,omitempty"`
-	Stream             bool                `json:"stream,omitempty"`
-	ParallelToolCalls  *bool               `json:"parallel_tool_calls,omitempty"`
-	Background         bool                `json:"background,omitempty"`
-	PreviousResponseID string              `json:"previous_response_id,omitempty"`
-	Include            []string            `json:"include,omitempty"`
-	Logprobs           bool                `json:"logprobs,omitempty"`
-	TopLogprobs        *int                `json:"top_logprobs,omitempty"`
-	Modalities         []string            `json:"modalities,omitempty"`
+func strictJSON(body []byte, target any) error {
+	if err := uniqueJSON(json.NewDecoder(bytes.NewReader(body)), 0); err != nil {
+		return err
+	}
+	d := json.NewDecoder(bytes.NewReader(body))
+	d.DisallowUnknownFields()
+	if err := d.Decode(target); err != nil {
+		return err
+	}
+	if err := d.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON value")
+	}
+	return nil
 }
 
-// ResponsesTool is one tool declaration. Only type "function" is served.
-type ResponsesTool struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name,omitempty"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+// Reject duplicate keys and bound nesting before decoding typed values.
+func uniqueJSON(d *json.Decoder, depth int) error {
+	if depth > 64 {
+		return errors.New("JSON nesting limit")
+	}
+	tok, err := d.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := map[string]bool{}
+		for d.More() {
+			key, err := d.Token()
+			if err != nil {
+				return err
+			}
+			name, ok := key.(string)
+			if !ok || seen[name] {
+				return errors.New("duplicate JSON key")
+			}
+			seen[name] = true
+			if err := uniqueJSON(d, depth+1); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for d.More() {
+			if err := uniqueJSON(d, depth+1); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
+	_, err = d.Token()
+	return err
 }
 
-// ResponsesReasoning is the reasoning effort request.
-type ResponsesReasoning struct {
-	Effort  string `json:"effort,omitempty"`
-	Summary string `json:"summary,omitempty"`
+type responseWireContent struct {
+	Type        string                   `json:"type"`
+	Text        string                   `json:"text,omitempty"`
+	Annotations []responseWireAnnotation `json:"annotations,omitempty"`
+	Logprobs    []any                    `json:"logprobs,omitempty"`
 }
 
-// ResponsesInputItem is one element of the input array. Type discriminates:
-// "message" (user/system/developer/assistant text or images),
-// "function_call_output" (a tool result), "function_call" (a replayed prior
-// assistant tool call — mapped back to an assistant tool_call part), or
-// "reasoning" (a summary the hub carries as thinking content).
-type ResponsesInputItem struct {
-	Type    string         `json:"type"`
-	Role    string         `json:"role,omitempty"`
-	Content any            `json:"content,omitempty"`
-	CallID  string         `json:"call_id,omitempty"`
-	Output  any            `json:"output,omitempty"`
-	Name    string         `json:"name,omitempty"`
-	ID      string         `json:"id,omitempty"`
-	CallID2 string         `json:"-"`
-	Summary []ResponseText `json:"summary,omitempty"`
-	// Arguments carries a replayed function_call's argument string.
-	Arguments string `json:"arguments,omitempty"`
-}
-
-// ResponseText is a {type:"summary_text", text} entry in a reasoning summary.
-type ResponseText struct {
+type responseWireSummary struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 }
 
-// ─── request codec ───────────────────────────────────────────────────────────
-
-// DecodeResponsesRequest maps a POST /v1/responses request body onto the
-// canonical IR. Fields the hub cannot serve truthfully are refused (see the
-// package doc); fields with no per-exchange semantic effect are ignored.
-func DecodeResponsesRequest(body []byte) (ir.Request, error) {
-	var rr ResponsesRequest
-	if err := json.Unmarshal(body, &rr); err != nil {
-		return ir.Request{}, fmt.Errorf("gateway/translate: decode responses request: %w", err)
-	}
-	return responsesRequestToIR(rr)
+type responseWireItem struct {
+	Type             string                       `json:"type"`
+	ID               string                       `json:"id,omitempty"`
+	Role             string                       `json:"role,omitempty"`
+	Phase            string                       `json:"phase,omitempty"`
+	Status           string                       `json:"status,omitempty"`
+	Namespace        string                       `json:"namespace,omitempty"`
+	Content          []responseWireContent        `json:"content,omitempty"`
+	CallID           string                       `json:"call_id,omitempty"`
+	Name             string                       `json:"name,omitempty"`
+	Arguments        string                       `json:"arguments,omitempty"`
+	Input            string                       `json:"input,omitempty"`
+	Output           json.RawMessage              `json:"output,omitempty"`
+	Summary          []responseWireSummary        `json:"summary,omitempty"`
+	EncryptedContent string                       `json:"encrypted_content,omitempty"`
+	Action           *responseWireWebSearchAction `json:"action,omitempty"`
 }
 
-func responsesRequestToIR(rr ResponsesRequest) (ir.Request, error) {
-	if strings.TrimSpace(rr.PreviousResponseID) != "" {
-		return ir.Request{}, fmt.Errorf("gateway/translate: responses previous_response_id is not supported (the gateway keeps no response history)")
-	}
-	if rr.Background {
-		return ir.Request{}, fmt.Errorf("gateway/translate: responses background mode is not supported (the gateway answers synchronously)")
-	}
-	if rr.Logprobs || (rr.TopLogprobs != nil && *rr.TopLogprobs > 0) {
-		return ir.Request{}, fmt.Errorf("gateway/translate: responses logprobs are not supported (token probabilities do not survive translation)")
-	}
-	if len(rr.Include) > 0 {
-		return ir.Request{}, fmt.Errorf("gateway/translate: responses include %q is not supported", rr.Include)
-	}
-	if rr.ParallelToolCalls != nil && !*rr.ParallelToolCalls {
-		return ir.Request{}, fmt.Errorf("gateway/translate: responses parallel_tool_calls=false is not supported (serial tool use cannot be enforced on the upstream)")
-	}
-	for _, m := range rr.Modalities {
-		if strings.EqualFold(m, "audio") {
-			return ir.Request{}, fmt.Errorf("gateway/translate: responses audio modality is not supported")
-		}
-	}
-	for _, t := range rr.Tools {
-		if t.Type != "function" {
-			return ir.Request{}, fmt.Errorf("gateway/translate: responses tool type %q is not supported (function tools only)", t.Type)
-		}
-	}
+func decodeResponseItem(body json.RawMessage) (ir.Item, error) {
+	return decodeResponseItemMode(body, false)
+}
 
+func decodeResponseItemMode(body json.RawMessage, partial bool) (ir.Item, error) {
+	var w responseWireItem
+	if err := strictJSON(body, &w); err != nil {
+		return ir.Item{}, fmt.Errorf("%w: item shape", ErrResponsesUnsupported)
+	}
+	if err := validateResponseItemFields(body, w.Type); err != nil {
+		return ir.Item{}, err
+	}
+	if w.Type != "web_search_call" && w.Status != "" && w.Status != "completed" && !(partial && w.Status == "in_progress") {
+		return ir.Item{}, ErrResponsesUnsupported
+	}
+	item := ir.Item{
+		Kind: w.Type, ID: w.ID, Role: ir.Role(w.Role), Phase: w.Phase, Status: w.Status, Namespace: w.Namespace,
+		CallID: w.CallID, Name: w.Name, Arguments: w.Arguments, Input: w.Input,
+		EncryptedContent: w.EncryptedContent,
+	}
+	switch w.Type {
+	case "message":
+		if w.Role != "user" && w.Role != "assistant" && w.Role != "system" && w.Role != "developer" {
+			return ir.Item{}, ErrResponsesUnsupported
+		}
+		for _, c := range w.Content {
+			if (c.Type != "input_text" && c.Type != "output_text") || len(c.Logprobs) != 0 ||
+				(w.Role == "assistant" && c.Type != "output_text") || (w.Role != "assistant" && c.Type != "input_text") {
+				return ir.Item{}, ErrResponsesUnsupported
+			}
+			annotations, err := decodeResponseAnnotations(c.Annotations)
+			if err != nil || c.Type != "output_text" && len(annotations) > 0 {
+				return ir.Item{}, ErrResponsesUnsupported
+			}
+			item.Parts = append(item.Parts, ir.Part{Kind: ir.PartText, Text: c.Text, Annotations: annotations})
+		}
+		if w.CallID != "" || w.Arguments != "" || w.Input != "" || len(w.Output) > 0 || len(w.Summary) > 0 || w.EncryptedContent != "" {
+			return ir.Item{}, ErrResponsesUnsupported
+		}
+	case "function_call":
+		if w.CallID == "" || w.Name == "" || (!partial && !json.Valid([]byte(w.Arguments))) || len(w.Content) > 0 || len(w.Output) > 0 {
+			return ir.Item{}, ErrResponsesUnsupported
+		}
+	case "custom_tool_call":
+		if w.CallID == "" || w.Name == "" || len(w.Content) > 0 || len(w.Output) > 0 {
+			return ir.Item{}, ErrResponsesUnsupported
+		}
+	case "function_call_output", "custom_tool_call_output":
+		if w.CallID == "" || len(w.Output) == 0 || bytes.Equal(bytes.TrimSpace(w.Output), []byte("null")) || len(w.Content) > 0 {
+			return ir.Item{}, ErrResponsesUnsupported
+		}
+		if err := json.Unmarshal(w.Output, &item.Output); err != nil {
+			return ir.Item{}, ErrResponsesUnsupported // structured output is not silently flattened
+		}
+	case "web_search_call":
+		if w.Action != nil {
+			action, err := decodeWebSearchAction(*w.Action)
+			if err != nil {
+				return ir.Item{}, err
+			}
+			item.WebSearchAction = &action
+		}
+	case "reasoning":
+		for _, c := range w.Content {
+			if c.Type != "reasoning_text" || len(c.Annotations) != 0 || len(c.Logprobs) != 0 {
+				return ir.Item{}, ErrResponsesUnsupported
+			}
+			item.Parts = append(item.Parts, ir.Part{Kind: ir.PartThinking, Text: c.Text})
+		}
+		for _, s := range w.Summary {
+			if s.Type != "summary_text" {
+				return ir.Item{}, ErrResponsesUnsupported
+			}
+			item.Summary = append(item.Summary, s.Text)
+		}
+		if w.CallID != "" || len(w.Output) > 0 {
+			return ir.Item{}, ErrResponsesUnsupported
+		}
+	default:
+		return ir.Item{}, ErrResponsesUnsupported
+	}
+	return item, nil
+}
+
+func encodeResponseItem(item ir.Item, partial ...bool) (responseWireItem, error) {
+	isPartial := len(partial) > 0 && partial[0]
+	w := responseWireItem{
+		Type: item.Kind, ID: item.ID, Role: string(item.Role), Phase: item.Phase, Status: item.Status, Namespace: item.Namespace,
+		CallID: item.CallID, Name: item.Name, Arguments: item.Arguments, Input: item.Input,
+		EncryptedContent: item.EncryptedContent,
+	}
+	switch item.Kind {
+	case "message":
+		for _, p := range item.Parts {
+			if p.Kind != ir.PartText {
+				return w, ErrResponsesUnsupported
+			}
+			kind := "input_text"
+			if item.Role == ir.RoleAssistant {
+				kind = "output_text"
+			}
+			annotations, err := encodeResponseAnnotations(p.Annotations)
+			if err != nil || kind != "output_text" && len(annotations) > 0 {
+				return w, ErrResponsesUnsupported
+			}
+			w.Content = append(w.Content, responseWireContent{Type: kind, Text: p.Text, Annotations: annotations})
+		}
+	case "function_call":
+		if item.CallID == "" || item.Name == "" || (!isPartial && !json.Valid([]byte(item.Arguments))) {
+			return w, ErrResponsesUnsupported
+		}
+	case "custom_tool_call":
+		if item.CallID == "" || item.Name == "" {
+			return w, ErrResponsesUnsupported
+		}
+	case "function_call_output", "custom_tool_call_output":
+		if item.CallID == "" {
+			return w, ErrResponsesUnsupported
+		}
+		w.Output, _ = json.Marshal(item.Output)
+	case "web_search_call":
+		if item.WebSearchAction != nil {
+			action, err := encodeWebSearchAction(*item.WebSearchAction)
+			if err != nil {
+				return w, err
+			}
+			w.Action = &action
+		}
+	case "reasoning":
+		for _, part := range item.Parts {
+			if part.Kind != ir.PartThinking {
+				return w, ErrResponsesUnsupported
+			}
+			w.Content = append(w.Content, responseWireContent{Type: "reasoning_text", Text: part.Text})
+		}
+		for _, text := range item.Summary {
+			w.Summary = append(w.Summary, responseWireSummary{Type: "summary_text", Text: text})
+		}
+	default:
+		return w, ErrResponsesUnsupported
+	}
+	body, err := marshalResponseItem(w)
+	if err != nil {
+		return w, err
+	}
+	if _, err = decodeResponseItemMode(body, isPartial); err != nil {
+		return w, err
+	}
+	if item.Kind != "message" && item.Kind != "reasoning" && len(item.Parts) != 0 || item.Kind != "reasoning" && len(item.Summary) != 0 || item.Kind != "web_search_call" && item.WebSearchAction != nil {
+		return w, ErrResponsesUnsupported
+	}
+	return w, nil
+}
+
+type responsesWireTool struct {
+	Type               string                             `json:"type"`
+	Name               string                             `json:"name,omitempty"`
+	Description        string                             `json:"description,omitempty"`
+	Parameters         map[string]any                     `json:"parameters,omitempty"`
+	Format             map[string]any                     `json:"format,omitempty"`
+	Strict             *bool                              `json:"strict,omitempty"`
+	DeferLoading       *bool                              `json:"defer_loading,omitempty"`
+	Tools              []json.RawMessage                  `json:"tools,omitempty"`
+	ExternalWebAccess  *bool                              `json:"external_web_access,omitempty"`
+	IndexedWebAccess   *bool                              `json:"indexed_web_access,omitempty"`
+	Filters            *responseWireWebSearchFilters      `json:"filters,omitempty"`
+	UserLocation       *responseWireWebSearchUserLocation `json:"user_location,omitempty"`
+	SearchContextSize  *string                            `json:"search_context_size,omitempty"`
+	SearchContentTypes []string                           `json:"search_content_types,omitempty"`
+}
+
+type responsesWireRequest struct {
+	Model             string            `json:"model"`
+	Instructions      string            `json:"instructions,omitempty"`
+	Input             json.RawMessage   `json:"input"`
+	Tools             []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice        string            `json:"tool_choice"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
+	Reasoning         map[string]string `json:"reasoning,omitempty"`
+	Store             bool              `json:"store"`
+	Stream            bool              `json:"stream"`
+	Include           []string          `json:"include,omitempty"`
+	ServiceTier       string            `json:"service_tier,omitempty"`
+	PromptCacheKey    string            `json:"prompt_cache_key,omitempty"`
+	Text              map[string]any    `json:"text,omitempty"`
+	ClientMetadata    map[string]string `json:"client_metadata,omitempty"`
+}
+
+// DecodeResponsesRequest admits the finite stateless text/function/custom/reasoning surface.
+func DecodeResponsesRequest(body []byte) (ir.Request, error) {
+	var w responsesWireRequest
+	if err := strictJSON(body, &w); err != nil {
+		return ir.Request{}, fmt.Errorf("%w: request shape", ErrResponsesUnsupported)
+	}
+	if strings.TrimSpace(w.Model) == "" || w.Input == nil || w.Store || (w.ToolChoice != "" && w.ToolChoice != "auto" && w.ToolChoice != "none" && w.ToolChoice != "required") {
+		return ir.Request{}, ErrResponsesUnsupported
+	}
 	req := ir.Request{
-		Model:  rr.Model,
-		Stream: rr.Stream,
-		Sampling: ir.Sampling{
-			Temperature: rr.Temperature,
-			TopP:        rr.TopP,
-			MaxTokens:   rr.MaxOutputTokens,
+		Model: w.Model, Instructions: w.Instructions, Stream: w.Stream,
+		ToolChoice: ir.ToolChoice(w.ToolChoice),
+		Responses: &ir.ResponsesControls{
+			ParallelToolCalls: w.ParallelToolCalls, Store: w.Store,
+			Include: w.Include, Reasoning: w.Reasoning, Text: w.Text,
+			ServiceTier: w.ServiceTier, PromptCacheKey: w.PromptCacheKey, ClientMetadata: w.ClientMetadata,
 		},
 	}
-	if rr.Reasoning != nil && rr.Reasoning.Effort != "" {
-		level, err := ir.LevelFromEffort(rr.Reasoning.Effort)
+	for _, include := range w.Include {
+		if include != "reasoning.encrypted_content" {
+			return ir.Request{}, ErrResponsesUnsupported
+		}
+	}
+	for key := range w.Reasoning {
+		if key != "effort" && key != "summary" && key != "context" {
+			return ir.Request{}, ErrResponsesUnsupported
+		}
+	}
+	if len(w.Text) > 0 {
+		for key := range w.Text {
+			if key != "verbosity" && key != "format" {
+				return ir.Request{}, ErrResponsesUnsupported
+			}
+		}
+	}
+	if effort := w.Reasoning["effort"]; effort != "" {
+		level, err := ir.LevelFromEffort(effort)
 		if err != nil {
-			return ir.Request{}, fmt.Errorf("gateway/translate: decode responses request: %w", err)
+			return ir.Request{}, fmt.Errorf("%w: %w", ErrResponsesUnsupported, err)
 		}
 		req.Thinking = ir.ThinkingSpec{Level: level, Emit: ir.EmitFull}
 	}
-	for _, t := range rr.Tools {
-		req.Tools = append(req.Tools, ir.ToolDef{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  t.Parameters,
-		})
-	}
-	req.ToolChoice = responsesToolChoiceToIR(rr.ToolChoice)
-
-	if s := strings.TrimSpace(rr.Instructions); s != "" {
-		req.System = append(req.System, ir.Part{Kind: ir.PartText, Text: s})
-	}
-	if err := appendResponsesInput(&req, rr.Input); err != nil {
+	items, err := decodeResponsesInput(w.Input)
+	if err != nil {
 		return ir.Request{}, err
+	}
+	req.Items = items
+	for _, raw := range w.Tools {
+		tool, err := decodeResponseTool(raw, false)
+		if err != nil {
+			return ir.Request{}, err
+		}
+		req.Tools = append(req.Tools, tool)
 	}
 	return req, nil
 }
 
-// appendResponsesInput maps the input (a plain string or an array of typed
-// items) onto IR messages.
-func appendResponsesInput(req *ir.Request, input any) error {
-	if input == nil {
-		return nil
+// decodeResponsesInput admits the two input shapes the protocol defines: a
+// string, which is exactly one user text message, or an array of typed items.
+func decodeResponsesInput(raw json.RawMessage) ([]ir.Item, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, ErrResponsesUnsupported
 	}
-	if s, ok := input.(string); ok {
-		if strings.TrimSpace(s) != "" {
-			req.Messages = append(req.Messages, ir.Message{
-				Role:  ir.RoleUser,
-				Parts: []ir.Part{{Kind: ir.PartText, Text: s}},
-			})
+	switch trimmed[0] {
+	case '"':
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return nil, ErrResponsesUnsupported
 		}
-		return nil
+		if text == "" {
+			return nil, nil
+		}
+		return []ir.Item{{Kind: "message", Role: ir.RoleUser, Parts: []ir.Part{{Kind: ir.PartText, Text: text}}}}, nil
+	case '[':
+		var elems []json.RawMessage
+		if err := json.Unmarshal(trimmed, &elems); err != nil {
+			return nil, ErrResponsesUnsupported
+		}
+		var items []ir.Item
+		for _, elem := range elems {
+			item, err := decodeResponseItem(elem)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, item)
+		}
+		return items, nil
+	default:
+		return nil, ErrResponsesUnsupported
 	}
-	items, ok := input.([]any)
-	if !ok {
-		return fmt.Errorf("gateway/translate: responses input must be a string or an array of items")
+}
+
+// EncodeResponsesRequest emits stateless Responses requests from canonical items.
+func EncodeResponsesRequest(req ir.Request) ([]byte, error) {
+	if len(req.Messages) > 0 || len(req.System) > 0 || req.Sampling.Temperature != nil || req.Sampling.TopP != nil || req.Sampling.MaxTokens != nil || len(req.Sampling.Stop) > 0 {
+		return nil, ErrResponsesUnsupported
 	}
-	for i, raw := range items {
-		m, ok := raw.(map[string]any)
-		if !ok {
-			return fmt.Errorf("gateway/translate: responses input item %d must be an object", i)
+	controls := req.Responses
+	if controls == nil {
+		controls = &ir.ResponsesControls{}
+	}
+	if controls.Store {
+		return nil, ErrResponsesUnsupported
+	}
+	w := responsesWireRequest{
+		Model: req.Model, Instructions: req.Instructions, ToolChoice: string(req.ToolChoice),
+		ParallelToolCalls: controls.ParallelToolCalls, Reasoning: controls.Reasoning, Store: false,
+		Stream: req.Stream, Include: controls.Include, ServiceTier: controls.ServiceTier,
+		PromptCacheKey: controls.PromptCacheKey, Text: controls.Text, ClientMetadata: controls.ClientMetadata,
+	}
+	if w.ToolChoice == "" {
+		w.ToolChoice = "auto"
+	}
+	input := []json.RawMessage{}
+	for _, item := range req.Items {
+		wi, err := encodeResponseItem(item)
+		if err != nil {
+			return nil, err
 		}
-		item := ResponsesInputItem{
-			Role:      stringVal(m, "role"),
-			CallID:    stringVal(m, "call_id"),
-			Name:      stringVal(m, "name"),
-			ID:        stringVal(m, "id"),
-			Arguments: stringVal(m, "arguments"),
+		body, err := marshalResponseItem(wi)
+		if err != nil {
+			return nil, err
 		}
-		item.Type, _ = m["type"].(string)
-		item.Content = m["content"]
-		item.Output = m["output"]
-		if sum, ok := m["summary"].([]any); ok {
-			for _, sraw := range sum {
-				if sm, ok := sraw.(map[string]any); ok {
-					item.Summary = append(item.Summary, ResponseText{
-						Type: stringVal(sm, "type"),
-						Text: stringVal(sm, "text"),
-					})
-				}
+		input = append(input, body)
+	}
+	var err error
+	if w.Input, err = json.Marshal(input); err != nil {
+		return nil, err
+	}
+	for _, tool := range req.Tools {
+		raw, err := encodeResponseTool(tool, false)
+		if err != nil {
+			return nil, err
+		}
+		w.Tools = append(w.Tools, raw)
+	}
+	body, err := json.Marshal(w)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = DecodeResponsesRequest(body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// ProjectResponsesToChat admits only the subset whose semantics the Chat
+// codec can preserve. It never strips a Responses-only control or item.
+// Parallel tool use is the Chat default, so only an explicit serial request
+// is unrepresentable; a reasoning effort rides the canonical thinking ladder,
+// while a requested reasoning summary has no Chat equivalent.
+func ProjectResponsesToChat(req ir.Request) (ir.Request, error) {
+	c := req.Responses
+	if c != nil && (c.Store || c.ParallelToolCalls != nil && !*c.ParallelToolCalls || len(c.Include) != 0 ||
+		len(c.Text) != 0 || c.ServiceTier != "" || c.PromptCacheKey != "" || len(c.ClientMetadata) != 0) {
+		return ir.Request{}, ErrResponsesUnsupported
+	}
+	projected := req
+	if c != nil {
+		for key := range c.Reasoning {
+			if key != "effort" {
+				return ir.Request{}, ErrResponsesUnsupported
 			}
 		}
-		if err := appendResponsesItem(req, i, item); err != nil {
+		if effort := c.Reasoning["effort"]; effort != "" {
+			level, err := ir.LevelFromEffort(effort)
+			if err != nil {
+				return ir.Request{}, fmt.Errorf("%w: %w", ErrResponsesUnsupported, err)
+			}
+			projected.Thinking = ir.ThinkingSpec{Level: level, Emit: ir.EmitFull}
+		}
+	}
+	projected.Responses = nil
+	projected.Items = nil
+	projected.Messages = nil
+	if req.Instructions != "" {
+		projected.System = []ir.Part{{Kind: ir.PartText, Text: req.Instructions}}
+	}
+	for _, item := range req.Items {
+		switch item.Kind {
+		case "message":
+			if item.ID != "" || item.Phase != "" || item.Status != "" || item.Role == ir.RoleDeveloper {
+				return ir.Request{}, ErrResponsesUnsupported
+			}
+			for _, part := range item.Parts {
+				if part.Kind != ir.PartText || len(part.Annotations) > 0 {
+					return ir.Request{}, ErrResponsesUnsupported
+				}
+			}
+			projected.Messages = append(projected.Messages, ir.Message{Role: item.Role, Parts: item.Parts})
+		case "function_call":
+			if item.ID != "" || item.Namespace != "" || item.Status != "" {
+				return ir.Request{}, ErrResponsesUnsupported
+			}
+			projected.Messages = append(projected.Messages, ir.Message{Role: ir.RoleAssistant, Parts: []ir.Part{{
+				Kind: ir.PartToolCall, ToolCall: &ir.ToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Arguments},
+			}}})
+		case "function_call_output":
+			if item.Name != "" {
+				return ir.Request{}, ErrResponsesUnsupported
+			}
+			if item.ID != "" || item.Namespace != "" || item.Status != "" {
+				return ir.Request{}, ErrResponsesUnsupported
+			}
+			projected.Messages = append(projected.Messages, ir.Message{Role: ir.RoleTool, Parts: []ir.Part{{
+				Kind: ir.PartToolResult, ToolCallID: item.CallID, Text: item.Output,
+			}}})
+		default:
+			return ir.Request{}, ErrResponsesUnsupported
+		}
+	}
+	for _, tool := range req.Tools {
+		if (tool.Kind != "" && tool.Kind != "function") || tool.Strict != nil || tool.DeferLoading != nil || len(tool.Tools) > 0 || tool.WebSearch != nil || len(tool.Format) != 0 {
+			return ir.Request{}, ErrResponsesUnsupported
+		}
+	}
+	if strings.TrimSpace(projected.Model) == "" {
+		return ir.Request{}, ErrResponsesUnsupported
+	}
+	return projected, nil
+}
+
+type responsesWireUsage struct {
+	InputTokens  *int `json:"input_tokens"`
+	OutputTokens *int `json:"output_tokens"`
+	TotalTokens  *int `json:"total_tokens"`
+	InputDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details,omitempty"`
+	OutputDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details,omitempty"`
+}
+
+func usageFromResponses(w *responsesWireUsage) (*ir.Usage, error) {
+	if w == nil || w.InputTokens == nil || w.OutputTokens == nil || w.TotalTokens == nil || *w.InputTokens < 0 || *w.OutputTokens < 0 || *w.TotalTokens < 0 {
+		return nil, ErrResponsesUnsupported
+	}
+	if *w.TotalTokens != *w.InputTokens+*w.OutputTokens {
+		return nil, ErrResponsesUnsupported
+	}
+	u := &ir.Usage{TokensIn: *w.InputTokens, TokensOut: *w.OutputTokens}
+	if w.InputDetails != nil {
+		u.CacheReadTokens = w.InputDetails.CachedTokens
+	}
+	if w.OutputDetails != nil {
+		u.ReasoningTokens = w.OutputDetails.ReasoningTokens
+	}
+	if u.CacheReadTokens < 0 || u.CacheReadTokens > u.TokensIn || u.ReasoningTokens < 0 || u.ReasoningTokens > u.TokensOut {
+		return nil, ErrResponsesUnsupported
+	}
+	return u, nil
+}
+
+func usageToResponses(u ir.Usage) responsesWireUsage {
+	input, output, total := u.TokensIn, u.TokensOut, u.TokensIn+u.TokensOut
+	return responsesWireUsage{
+		InputTokens: &input, OutputTokens: &output, TotalTokens: &total,
+		InputDetails: &struct {
+			CachedTokens int `json:"cached_tokens"`
+		}{u.CacheReadTokens},
+		OutputDetails: &struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		}{u.ReasoningTokens},
+	}
+}
+
+type responsesWireResponse struct {
+	CreatedAt         *int64            `json:"created_at,omitempty"`
+	Instructions      *string           `json:"instructions,omitempty"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
+	ToolChoice        *string           `json:"tool_choice,omitempty"`
+	Tools             []json.RawMessage `json:"tools,omitempty"`
+	Reasoning         map[string]string `json:"reasoning,omitempty"`
+	Text              map[string]any    `json:"text,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	ServiceTier       *string           `json:"service_tier,omitempty"`
+	PromptCacheKey    *string           `json:"prompt_cache_key,omitempty"`
+	Store             *bool             `json:"store,omitempty"`
+	Background        *bool             `json:"background,omitempty"`
+	Temperature       *float64          `json:"temperature,omitempty"`
+	TopP              *float64          `json:"top_p,omitempty"`
+	MaxOutputTokens   *int              `json:"max_output_tokens,omitempty"`
+	Truncation        *string           `json:"truncation,omitempty"`
+	// Only null is representable for these state/error fields.
+	PreviousResponseID json.RawMessage     `json:"previous_response_id,omitempty"`
+	Error              json.RawMessage     `json:"error,omitempty"`
+	IncompleteDetails  json.RawMessage     `json:"incomplete_details,omitempty"`
+	User               json.RawMessage     `json:"user,omitempty"`
+	ID                 string              `json:"id"`
+	Object             string              `json:"object,omitempty"`
+	Status             string              `json:"status,omitempty"`
+	Model              string              `json:"model,omitempty"`
+	Output             []json.RawMessage   `json:"output,omitempty"`
+	Usage              *responsesWireUsage `json:"usage,omitempty"`
+	EndTurn            *bool               `json:"end_turn,omitempty"`
+}
+
+// DecodeResponsesResponse requires a completed response with explicit usage.
+func DecodeResponsesResponse(body []byte) (ir.Response, error) {
+	var w responsesWireResponse
+	if err := strictJSON(body, &w); err != nil {
+		return ir.Response{}, ErrResponsesUnsupported
+	}
+	if w.ID == "" || w.Status != "completed" || validateResponseEnvelope(w) != nil {
+		return ir.Response{}, ErrResponsesUnsupported
+	}
+	u, err := usageFromResponses(w.Usage)
+	if err != nil {
+		return ir.Response{}, err
+	}
+	out := ir.Response{ID: w.ID, Details: detailsFromResponses(w), Model: w.Model, FinishReason: ir.FinishStop, Usage: *u, UsageReported: true}
+	for _, raw := range w.Output {
+		item, err := decodeResponseItem(raw)
+		if err != nil {
+			return ir.Response{}, err
+		}
+		out.Items = append(out.Items, item)
+		if item.Kind == "function_call" || item.Kind == "custom_tool_call" {
+			out.FinishReason = ir.FinishToolCalls
+		}
+	}
+	return out, nil
+}
+
+// EncodeResponsesResponse refuses response parts without a lossless Responses
+// representation. A length or content-filter finish encodes as incomplete and
+// an error finish as failed: a partial or failed reply is never labeled
+// completed.
+func EncodeResponsesResponse(resp ir.Response, id string) ([]byte, error) {
+	if resp.ID != "" {
+		id = resp.ID
+	}
+	if id == "" {
+		return nil, ErrResponsesUnsupported
+	}
+	status, incompleteReason, err := responsesFinishStatus(resp.FinishReason)
+	if err != nil {
+		return nil, err
+	}
+	items := resp.Items
+	if len(items) == 0 {
+		item := ir.Item{Kind: "message", Role: ir.RoleAssistant, Parts: []ir.Part{}}
+		for _, p := range resp.Content {
+			switch p.Kind {
+			case ir.PartText:
+				item.Parts = append(item.Parts, p)
+			case ir.PartToolCall:
+				if p.ToolCall == nil {
+					return nil, ErrResponsesUnsupported
+				}
+				items = append(items, ir.Item{Kind: "function_call", CallID: p.ToolCall.ID, Name: p.ToolCall.Name, Arguments: p.ToolCall.Arguments})
+			default:
+				return nil, ErrResponsesUnsupported
+			}
+		}
+		if len(item.Parts) > 0 {
+			items = append([]ir.Item{item}, items...)
+		}
+	}
+	wire := responsesWireResponse{ID: id, Object: "response", Status: "completed", Model: resp.Model, Usage: func() *responsesWireUsage { u := usageToResponses(resp.Usage); return &u }(), Output: []json.RawMessage{}}
+	for _, item := range items {
+		w, err := encodeResponseItem(item)
+		if err != nil {
+			return nil, err
+		}
+		b, err := marshalResponseItem(w)
+		if err != nil {
+			return nil, err
+		}
+		wire.Output = append(wire.Output, b)
+	}
+	if err := applyResponseDetails(&wire, resp.Details); err != nil {
+		return nil, err
+	}
+	if status != "completed" {
+		// Each output item was validated above; the envelope decoder admits
+		// only completed replies, so it cannot re-check this one.
+		wire.Object = "response"
+		wire.Status = status
+		if incompleteReason != "" {
+			if wire.IncompleteDetails, err = json.Marshal(map[string]string{"reason": incompleteReason}); err != nil {
+				return nil, err
+			}
+		}
+		return json.Marshal(wire)
+	}
+	body, err := json.Marshal(wire)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = DecodeResponsesResponse(body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// responsesFinishStatus maps a canonical finish onto the Responses status and
+// incomplete reason. An unknown finish is refused rather than labeled.
+func responsesFinishStatus(finish ir.FinishReason) (status, incompleteReason string, err error) {
+	switch finish {
+	case "", ir.FinishStop, ir.FinishToolCalls:
+		return "completed", "", nil
+	case ir.FinishLength:
+		return "incomplete", "max_output_tokens", nil
+	case ir.FinishContentFilter:
+		return "incomplete", "content_filter", nil
+	case ir.FinishError:
+		return "failed", "", nil
+	default:
+		return "", "", ErrResponsesUnsupported
+	}
+}
+
+type responsesWireEvent struct {
+	Type            string                  `json:"type"`
+	SequenceNumber  *int                    `json:"sequence_number,omitempty"`
+	Arguments       string                  `json:"arguments,omitempty"`
+	Input           string                  `json:"input,omitempty"`
+	Response        *responsesWireResponse  `json:"response,omitempty"`
+	Item            json.RawMessage         `json:"item,omitempty"`
+	Part            *responseWireContent    `json:"part,omitempty"`
+	Delta           string                  `json:"delta,omitempty"`
+	Text            string                  `json:"text,omitempty"`
+	ItemID          string                  `json:"item_id,omitempty"`
+	CallID          string                  `json:"call_id,omitempty"`
+	OutputIndex     int                     `json:"output_index,omitempty"`
+	ContentIndex    int                     `json:"content_index,omitempty"`
+	SummaryIndex    int                     `json:"summary_index,omitempty"`
+	AnnotationIndex int                     `json:"annotation_index,omitempty"`
+	Annotation      *responseWireAnnotation `json:"annotation,omitempty"`
+}
+
+// DecodeResponsesStreamEvent translates supported typed SSE events into the IR.
+func DecodeResponsesStreamEvent(body []byte) (ir.ResponsesStreamEvent, error) {
+	var w responsesWireEvent
+	if err := strictJSON(body, &w); err != nil {
+		return ir.ResponsesStreamEvent{}, ErrResponsesUnsupported
+	}
+	if err := validateResponseEventFields(body, w.Type); err != nil {
+		return ir.ResponsesStreamEvent{}, err
+	}
+	ev := ir.ResponsesStreamEvent{Kind: w.Type, SequenceNumber: w.SequenceNumber, Delta: w.Delta, ItemID: w.ItemID, OutputIndex: w.OutputIndex, ContentIndex: w.ContentIndex, SummaryIndex: w.SummaryIndex, AnnotationIndex: w.AnnotationIndex}
+	switch w.Type {
+	case "response.created", "response.in_progress":
+		if w.Response == nil || w.Response.ID == "" || validateResponseEnvelope(*w.Response) != nil {
+			return ev, ErrResponsesUnsupported
+		}
+		ev.ResponseID = w.Response.ID
+		ev.Response = &ir.Response{ID: w.Response.ID, Model: w.Response.Model, Details: detailsFromResponses(*w.Response)}
+		for _, raw := range w.Response.Output {
+			item, err := decodeResponseItemPartial(raw)
+			if err != nil {
+				return ev, err
+			}
+			ev.Response.Items = append(ev.Response.Items, item)
+		}
+	case "response.output_item.added", "response.output_item.done":
+		if len(w.Item) == 0 {
+			return ev, ErrResponsesUnsupported
+		}
+		var item ir.Item
+		var err error
+		if w.Type == "response.output_item.added" {
+			item, err = decodeResponseItemPartial(w.Item)
+		} else {
+			item, err = decodeResponseItem(w.Item)
+		}
+		if err != nil {
+			return ev, err
+		}
+		ev.Item = &item
+	case "response.output_text.delta", "response.function_call_arguments.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.custom_tool_call_input.delta":
+		if w.Delta == "" {
+			return ev, ErrResponsesUnsupported
+		}
+	case "response.output_text.done", "response.function_call_arguments.done", "response.reasoning_summary_text.done", "response.reasoning_text.done", "response.custom_tool_call_input.done":
+		ev.Delta = w.Text
+		if w.Type == "response.function_call_arguments.done" {
+			ev.Delta = w.Arguments
+		}
+		if w.Type == "response.custom_tool_call_input.done" {
+			ev.Delta = w.Input
+		}
+	case "response.content_part.added", "response.content_part.done", "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		if w.Part == nil || (w.Part.Type != "input_text" && w.Part.Type != "output_text" && w.Part.Type != "summary_text" && w.Part.Type != "reasoning_text") || len(w.Part.Logprobs) != 0 {
+			return ev, ErrResponsesUnsupported
+		}
+		annotations, err := decodeResponseAnnotations(w.Part.Annotations)
+		if err != nil || w.Part.Type != "output_text" && len(annotations) > 0 {
+			return ev, ErrResponsesUnsupported
+		}
+		ev.Part = &ir.Part{Kind: ir.PartText, Text: w.Part.Text, Annotations: annotations}
+		if w.Part.Type == "summary_text" || w.Part.Type == "reasoning_text" {
+			ev.Part.Kind = ir.PartThinking
+		}
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		if w.ItemID == "" {
+			return ev, ErrResponsesUnsupported
+		}
+	case "response.output_text.annotation.added":
+		if w.Annotation == nil || w.ItemID == "" || w.AnnotationIndex < 0 {
+			return ev, ErrResponsesUnsupported
+		}
+		annotations, err := decodeResponseAnnotations([]responseWireAnnotation{*w.Annotation})
+		if err != nil {
+			return ev, err
+		}
+		ev.Annotation = &annotations[0]
+	case "response.completed":
+		if w.Response == nil || w.Response.ID == "" || validateResponseEnvelope(*w.Response) != nil {
+			return ev, ErrResponsesUnsupported
+		}
+		ev.ResponseID = w.Response.ID
+		ev.Response = &ir.Response{ID: w.Response.ID, Model: w.Response.Model, Details: detailsFromResponses(*w.Response)}
+		usage, err := usageFromResponses(w.Response.Usage)
+		if err != nil {
+			return ev, err
+		}
+		if w.Response.Status != "" && w.Response.Status != "completed" {
+			return ev, ErrResponsesUnsupported
+		}
+		for _, raw := range w.Response.Output {
+			item, err := decodeResponseItem(raw)
+			if err != nil {
+				return ev, err
+			}
+			ev.Response.Items = append(ev.Response.Items, item)
+		}
+		ev.Response.Usage = *usage
+		ev.Response.UsageReported = true
+		ev.Usage = usage
+		ev.EndTurn = w.Response.EndTurn
+	case "response.failed", "response.incomplete", "response.error":
+		return ev, ErrResponsesUnsupported
+	default:
+		return ev, ErrResponsesUnsupported
+	}
+	return ev, nil
+}
+
+func validateResponseEventFields(body []byte, kind string) error {
+	keys := []string{"type", "sequence_number"}
+	switch kind {
+	case "response.created", "response.in_progress", "response.completed":
+		keys = append(keys, "response")
+	case "response.output_item.added", "response.output_item.done":
+		keys = append(keys, "output_index", "item")
+	case "response.output_text.delta", "response.reasoning_text.delta":
+		keys = append(keys, "output_index", "item_id", "content_index", "delta")
+	case "response.output_text.done", "response.reasoning_text.done":
+		keys = append(keys, "output_index", "item_id", "content_index", "text")
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		keys = append(keys, "output_index", "item_id", "delta")
+	case "response.function_call_arguments.done":
+		keys = append(keys, "output_index", "item_id", "arguments")
+	case "response.custom_tool_call_input.done":
+		keys = append(keys, "output_index", "item_id", "input")
+	case "response.reasoning_summary_text.delta":
+		keys = append(keys, "output_index", "item_id", "summary_index", "delta")
+	case "response.reasoning_summary_text.done":
+		keys = append(keys, "output_index", "item_id", "summary_index", "text")
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		keys = append(keys, "item_id", "output_index")
+	case "response.output_text.annotation.added":
+		keys = append(keys, "item_id", "output_index", "content_index", "annotation_index", "annotation")
+	case "response.content_part.added", "response.content_part.done":
+		keys = append(keys, "output_index", "item_id", "content_index", "part")
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		keys = append(keys, "output_index", "item_id", "summary_index", "part")
+	default:
+		return ErrResponsesUnsupported
+	}
+	allowed := map[string]bool{}
+	for _, key := range keys {
+		allowed[key] = true
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return ErrResponsesUnsupported
+	}
+	for key := range fields {
+		if !allowed[key] {
+			return ErrResponsesUnsupported
+		}
+	}
+	return nil
+}
+
+func decodeResponseItemPartial(body json.RawMessage) (ir.Item, error) {
+	return decodeResponseItemMode(body, true)
+}
+
+func validateResponseItemFields(body []byte, kind string) error {
+	common := map[string]bool{"type": true, "id": true, "status": true}
+	switch kind {
+	case "message":
+		for _, k := range []string{"role", "phase", "content"} {
+			common[k] = true
+		}
+	case "function_call":
+		for _, k := range []string{"call_id", "name", "namespace", "arguments"} {
+			common[k] = true
+		}
+	case "custom_tool_call":
+		for _, k := range []string{"call_id", "name", "namespace", "input"} {
+			common[k] = true
+		}
+	case "function_call_output", "custom_tool_call_output":
+		for _, k := range []string{"call_id", "name", "namespace", "output"} {
+			common[k] = true
+		}
+	case "web_search_call":
+		common["action"] = true
+	case "reasoning":
+		for _, k := range []string{"summary", "content", "encrypted_content"} {
+			common[k] = true
+		}
+	default:
+		return ErrResponsesUnsupported
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return ErrResponsesUnsupported
+	}
+	for key := range fields {
+		if !common[key] {
+			return ErrResponsesUnsupported
+		}
+	}
+	return nil
+}
+
+func marshalResponseItem(w responseWireItem) ([]byte, error) {
+	body, err := json.Marshal(w)
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	switch w.Type {
+	case "message":
+		fields["content"] = w.Content
+		if w.Content == nil {
+			fields["content"] = []any{}
+		}
+	case "reasoning":
+		fields["summary"] = w.Summary
+		if w.Summary == nil {
+			fields["summary"] = []any{}
+		}
+	case "function_call":
+		fields["arguments"] = w.Arguments
+	case "custom_tool_call":
+		fields["input"] = w.Input
+	}
+	return json.Marshal(fields)
+}
+
+// EncodeResponsesStreamEvent renders an IR item lifecycle event as Responses JSON.
+func EncodeResponsesStreamEvent(ev ir.ResponsesStreamEvent) ([]byte, error) {
+	w := responsesWireEvent{Type: ev.Kind, SequenceNumber: ev.SequenceNumber, Delta: ev.Delta, ItemID: ev.ItemID, OutputIndex: ev.OutputIndex, ContentIndex: ev.ContentIndex, SummaryIndex: ev.SummaryIndex, AnnotationIndex: ev.AnnotationIndex}
+	switch ev.Kind {
+	case "response.created", "response.in_progress":
+		if ev.ResponseID == "" {
+			return nil, ErrResponsesUnsupported
+		}
+		w.Response = &responsesWireResponse{ID: ev.ResponseID}
+		if ev.Response != nil {
+			w.Response.Model = ev.Response.Model
+			if err := applyResponseDetails(w.Response, ev.Response.Details); err != nil {
+				return nil, err
+			}
+		}
+	case "response.output_item.added", "response.output_item.done":
+		if ev.Item == nil {
+			return nil, ErrResponsesUnsupported
+		}
+		item, err := encodeResponseItem(*ev.Item, ev.Kind == "response.output_item.added")
+		if err != nil {
+			return nil, err
+		}
+		w.Item, _ = marshalResponseItem(item)
+	case "response.output_text.delta", "response.function_call_arguments.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.custom_tool_call_input.delta":
+		if ev.Delta == "" {
+			return nil, ErrResponsesUnsupported
+		}
+	case "response.output_text.done", "response.function_call_arguments.done", "response.reasoning_summary_text.done", "response.reasoning_text.done", "response.custom_tool_call_input.done":
+		w.Delta = ""
+		w.Text = ev.Delta
+		if ev.Kind == "response.function_call_arguments.done" {
+			w.Text = ""
+			w.Arguments = ev.Delta
+		}
+		if ev.Kind == "response.custom_tool_call_input.done" {
+			w.Text = ""
+			w.Input = ev.Delta
+		}
+	case "response.content_part.added", "response.content_part.done", "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		if ev.Part == nil || (ev.Part.Kind != ir.PartText && ev.Part.Kind != ir.PartThinking) {
+			return nil, ErrResponsesUnsupported
+		}
+		kind := "output_text"
+		if strings.Contains(ev.Kind, "reasoning_summary_part") {
+			kind = "summary_text"
+		} else if ev.Part.Kind == ir.PartThinking {
+			kind = "reasoning_text"
+		}
+		annotations, err := encodeResponseAnnotations(ev.Part.Annotations)
+		if err != nil || kind != "output_text" && len(annotations) > 0 {
+			return nil, ErrResponsesUnsupported
+		}
+		w.Part = &responseWireContent{Type: kind, Text: ev.Part.Text, Annotations: annotations}
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		if ev.ItemID == "" {
+			return nil, ErrResponsesUnsupported
+		}
+	case "response.output_text.annotation.added":
+		if ev.Annotation == nil || ev.ItemID == "" || ev.AnnotationIndex < 0 {
+			return nil, ErrResponsesUnsupported
+		}
+		annotations, err := encodeResponseAnnotations([]ir.URLCitation{*ev.Annotation})
+		if err != nil {
+			return nil, err
+		}
+		w.Annotation = &annotations[0]
+	case "response.completed":
+		if ev.ResponseID == "" || ev.Usage == nil {
+			return nil, ErrResponsesUnsupported
+		}
+		u := usageToResponses(*ev.Usage)
+		w.Response = &responsesWireResponse{ID: ev.ResponseID, Object: "response", Status: "completed", Usage: &u, EndTurn: ev.EndTurn}
+		if ev.Response != nil {
+			w.Response.Model = ev.Response.Model
+			if err := applyResponseDetails(w.Response, ev.Response.Details); err != nil {
+				return nil, err
+			}
+			for _, item := range ev.Response.Items {
+				wi, err := encodeResponseItem(item)
+				if err != nil {
+					return nil, err
+				}
+				b, err := marshalResponseItem(wi)
+				if err != nil {
+					return nil, err
+				}
+				w.Response.Output = append(w.Response.Output, b)
+			}
+		}
+	default:
+		return nil, ErrResponsesUnsupported
+	}
+	if w.Response != nil && ev.Kind == "response.completed" {
+		w.Response.Status = "completed"
+		w.Response.Object = "response"
+	}
+	body, err := json.Marshal(w)
+	if err != nil {
+		return nil, err
+	}
+	// Required zero indexes must be emitted for item/content events.
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	if ev.Item != nil || ev.ItemID != "" {
+		fields["output_index"] = ev.OutputIndex
+	}
+	if ev.Part != nil || strings.Contains(ev.Kind, "output_text") || strings.Contains(ev.Kind, "reasoning_text") {
+		fields["content_index"] = ev.ContentIndex
+	}
+	if ev.Annotation != nil {
+		fields["annotation_index"] = ev.AnnotationIndex
+	}
+	if strings.Contains(ev.Kind, "reasoning_summary") {
+		fields["summary_index"] = ev.SummaryIndex
+		delete(fields, "content_index")
+	}
+	return json.Marshal(fields)
+}
+
+func validateResponseEnvelope(w responsesWireResponse) error {
+	if w.Object != "" && w.Object != "response" || w.Store != nil && *w.Store || w.Background != nil && *w.Background {
+		return ErrResponsesUnsupported
+	}
+	for _, v := range []json.RawMessage{w.PreviousResponseID, w.Error, w.IncompleteDetails, w.User} {
+		if len(v) > 0 && !bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
+			return ErrResponsesUnsupported
+		}
+	}
+	for _, raw := range w.Tools {
+		if _, err := decodeResponseTool(raw, false); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func stringVal(m map[string]any, key string) string {
-	s, _ := m[key].(string)
-	return s
+func detailsFromResponses(w responsesWireResponse) *ir.ResponseDetails {
+	d := &ir.ResponseDetails{Object: w.Object, Status: w.Status, CreatedAt: w.CreatedAt, Instructions: w.Instructions, ParallelToolCalls: w.ParallelToolCalls, ToolChoice: w.ToolChoice, Reasoning: w.Reasoning, Text: w.Text, Metadata: w.Metadata, ServiceTier: w.ServiceTier, PromptCacheKey: w.PromptCacheKey, Store: w.Store, Background: w.Background, Temperature: w.Temperature, TopP: w.TopP, MaxOutputTokens: w.MaxOutputTokens, Truncation: w.Truncation}
+	for _, raw := range w.Tools {
+		tool, err := decodeResponseTool(raw, false)
+		if err == nil {
+			d.Tools = append(d.Tools, tool)
+		}
+	}
+	return d
 }
 
-func appendResponsesItem(req *ir.Request, i int, item ResponsesInputItem) error {
-	switch item.Type {
-	case "message":
-		role := responsesRoleToIR(item.Role)
-		parts, err := responsesContentParts(item.Content)
+func applyResponseDetails(w *responsesWireResponse, d *ir.ResponseDetails) error {
+	if d == nil {
+		return nil
+	}
+	w.Object = d.Object
+	w.Status = d.Status
+	w.CreatedAt = d.CreatedAt
+	w.Instructions = d.Instructions
+	w.ParallelToolCalls = d.ParallelToolCalls
+	w.ToolChoice = d.ToolChoice
+	w.Reasoning = d.Reasoning
+	w.Text = d.Text
+	w.Metadata = d.Metadata
+	w.ServiceTier = d.ServiceTier
+	w.PromptCacheKey = d.PromptCacheKey
+	w.Store = d.Store
+	w.Background = d.Background
+	w.Temperature = d.Temperature
+	w.TopP = d.TopP
+	w.MaxOutputTokens = d.MaxOutputTokens
+	w.Truncation = d.Truncation
+	for _, tool := range d.Tools {
+		raw, err := encodeResponseTool(tool, false)
 		if err != nil {
-			return fmt.Errorf("gateway/translate: responses input item %d: %w", i, err)
+			return err
 		}
-		if role == ir.RoleSystem {
-			req.System = append(req.System, parts...)
+		w.Tools = append(w.Tools, raw)
+	}
+	return nil
+}
+
+// ValidateChatResponsesSubset prevents the legacy Chat decoder from silently
+// flattening or dropping fields on an explicitly selected Responses exchange.
+func ValidateChatResponsesSubset(body []byte, stream bool) error {
+	if err := validateChatUsagePresence(body, stream); err != nil {
+		return err
+	}
+	var w ChatResponse
+	if err := strictJSON(body, &w); err != nil {
+		return ErrResponsesUnsupported
+	}
+	if len(w.Choices) > 1 || !stream && len(w.Choices) != 1 {
+		return ErrResponsesUnsupported
+	}
+	if w.Usage != nil && (w.Usage.PromptTokens < 0 || w.Usage.CompletionTokens < 0) {
+		return ErrResponsesUnsupported
+	}
+	for _, choice := range w.Choices {
+		if choice.Index != 0 || choice.FinishReason != nil && *choice.FinishReason != "" && *choice.FinishReason != "stop" && *choice.FinishReason != "tool_calls" {
+			return ErrResponsesUnsupported
+		}
+		if choice.Message != nil {
+			if choice.Message.Role != "assistant" {
+				return ErrResponsesUnsupported
+			}
+			if choice.Message.Content != nil {
+				if _, ok := choice.Message.Content.(string); !ok {
+					return ErrResponsesUnsupported
+				}
+			}
+			for _, call := range choice.Message.ToolCalls {
+				if call.Type != "function" || call.ID == "" || call.Function.Name == "" || !json.Valid([]byte(call.Function.Arguments)) {
+					return ErrResponsesUnsupported
+				}
+			}
+		}
+		if choice.Delta != nil {
+			if choice.Delta.Role != "" && choice.Delta.Role != "assistant" || len(choice.Delta.ToolCalls) > 1 {
+				return ErrResponsesUnsupported
+			}
+			for _, call := range choice.Delta.ToolCalls {
+				if call.Index < 0 || call.Type != "" && call.Type != "function" {
+					return ErrResponsesUnsupported
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Presence checks are local to the Responses bridge. The public legacy Chat
+// types and decoding behavior retain their existing contract.
+func validateChatUsagePresence(body []byte, stream bool) error {
+	var wire struct {
+		Usage *struct {
+			PromptTokens     *int `json:"prompt_tokens"`
+			CompletionTokens *int `json:"completion_tokens"`
+			TotalTokens      *int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return ErrResponsesUnsupported
+	}
+	if wire.Usage == nil {
+		if stream {
 			return nil
 		}
-		req.Messages = append(req.Messages, ir.Message{Role: role, Parts: parts})
-		return nil
-	case "function_call_output":
-		text, err := responsesOutputText(item.Output)
+		return ErrResponsesUnsupported
+	}
+	u := wire.Usage
+	if u.PromptTokens == nil || u.CompletionTokens == nil || u.TotalTokens == nil || *u.PromptTokens < 0 || *u.CompletionTokens < 0 || *u.TotalTokens < 0 || *u.TotalTokens != *u.PromptTokens+*u.CompletionTokens {
+		return ErrResponsesUnsupported
+	}
+	return nil
+}
+
+type responseWireAnnotation struct {
+	Type       string `json:"type"`
+	URL        string `json:"url"`
+	Title      string `json:"title"`
+	StartIndex *int   `json:"start_index"`
+	EndIndex   *int   `json:"end_index"`
+}
+
+type responseWireWebSearchAction struct {
+	Type    string   `json:"type"`
+	Query   *string  `json:"query,omitempty"`
+	Queries []string `json:"queries,omitempty"`
+	URL     *string  `json:"url,omitempty"`
+	Pattern *string  `json:"pattern,omitempty"`
+}
+
+type responseWireWebSearchFilters struct {
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+}
+
+type responseWireWebSearchUserLocation struct {
+	Type     string  `json:"type"`
+	Country  *string `json:"country,omitempty"`
+	Region   *string `json:"region,omitempty"`
+	City     *string `json:"city,omitempty"`
+	Timezone *string `json:"timezone,omitempty"`
+}
+
+func decodeResponseAnnotations(w []responseWireAnnotation) ([]ir.URLCitation, error) {
+	var annotations []ir.URLCitation
+	for _, a := range w {
+		if a.Type != "url_citation" || a.URL == "" || a.StartIndex == nil || a.EndIndex == nil || *a.StartIndex < 0 || *a.EndIndex < *a.StartIndex {
+			return nil, ErrResponsesUnsupported
+		}
+		annotations = append(annotations, ir.URLCitation{URL: a.URL, Title: a.Title, StartIndex: *a.StartIndex, EndIndex: *a.EndIndex})
+	}
+	return annotations, nil
+}
+
+func encodeResponseAnnotations(annotations []ir.URLCitation) ([]responseWireAnnotation, error) {
+	var wire []responseWireAnnotation
+	for _, a := range annotations {
+		if a.URL == "" || a.StartIndex < 0 || a.EndIndex < a.StartIndex {
+			return nil, ErrResponsesUnsupported
+		}
+		start, end := a.StartIndex, a.EndIndex
+		wire = append(wire, responseWireAnnotation{Type: "url_citation", URL: a.URL, Title: a.Title, StartIndex: &start, EndIndex: &end})
+	}
+	return wire, nil
+}
+
+func decodeWebSearchAction(w responseWireWebSearchAction) (ir.WebSearchAction, error) {
+	action := ir.WebSearchAction{Kind: w.Type, Query: w.Query, Queries: w.Queries, URL: w.URL, Pattern: w.Pattern}
+	switch w.Type {
+	case "search":
+		if w.URL != nil || w.Pattern != nil {
+			return action, ErrResponsesUnsupported
+		}
+	case "open_page":
+		if w.Query != nil || w.Queries != nil || w.Pattern != nil {
+			return action, ErrResponsesUnsupported
+		}
+	case "find_in_page":
+		if w.Query != nil || w.Queries != nil {
+			return action, ErrResponsesUnsupported
+		}
+	default:
+		return action, ErrResponsesUnsupported
+	}
+	return action, nil
+}
+
+func encodeWebSearchAction(a ir.WebSearchAction) (responseWireWebSearchAction, error) {
+	w := responseWireWebSearchAction{Type: a.Kind, Query: a.Query, Queries: a.Queries, URL: a.URL, Pattern: a.Pattern}
+	_, err := decodeWebSearchAction(w)
+	return w, err
+}
+
+func decodeResponseTool(body json.RawMessage, nested bool) (ir.ToolDef, error) {
+	var w responsesWireTool
+	if err := strictJSON(body, &w); err != nil {
+		return ir.ToolDef{}, ErrResponsesUnsupported
+	}
+	allowed := map[string]bool{"type": true}
+	switch w.Type {
+	case "function":
+		for _, key := range []string{"name", "description", "parameters", "strict", "defer_loading"} {
+			allowed[key] = true
+		}
+	case "custom":
+		for _, key := range []string{"name", "description", "format", "defer_loading"} {
+			allowed[key] = true
+		}
+	case "namespace":
+		if nested {
+			return ir.ToolDef{}, ErrResponsesUnsupported
+		}
+		for _, key := range []string{"name", "description", "tools"} {
+			allowed[key] = true
+		}
+	case "web_search":
+		if nested {
+			return ir.ToolDef{}, ErrResponsesUnsupported
+		}
+		for _, key := range []string{"external_web_access", "indexed_web_access", "filters", "user_location", "search_context_size", "search_content_types"} {
+			allowed[key] = true
+		}
+	default:
+		return ir.ToolDef{}, ErrResponsesUnsupported
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return ir.ToolDef{}, ErrResponsesUnsupported
+	}
+	for key := range fields {
+		if !allowed[key] {
+			return ir.ToolDef{}, ErrResponsesUnsupported
+		}
+	}
+	tool := ir.ToolDef{Kind: w.Type, Name: w.Name, Description: w.Description, Parameters: w.Parameters, Format: w.Format, Strict: w.Strict, DeferLoading: w.DeferLoading}
+	switch w.Type {
+	case "function":
+		if w.Name == "" {
+			return ir.ToolDef{}, ErrResponsesUnsupported
+		}
+	case "custom":
+		if w.Name == "" || len(w.Format) == 0 {
+			return ir.ToolDef{}, ErrResponsesUnsupported
+		}
+	case "namespace":
+		if w.Name == "" || w.Tools == nil {
+			return ir.ToolDef{}, ErrResponsesUnsupported
+		}
+		for _, raw := range w.Tools {
+			child, err := decodeResponseTool(raw, true)
+			if err != nil {
+				return ir.ToolDef{}, err
+			}
+			tool.Tools = append(tool.Tools, child)
+		}
+	case "web_search":
+		config := &ir.WebSearchConfig{ExternalWebAccess: w.ExternalWebAccess, IndexedWebAccess: w.IndexedWebAccess, SearchContextSize: w.SearchContextSize, SearchContentTypes: w.SearchContentTypes}
+		if w.SearchContextSize != nil && *w.SearchContextSize != "low" && *w.SearchContextSize != "medium" && *w.SearchContextSize != "high" {
+			return ir.ToolDef{}, ErrResponsesUnsupported
+		}
+		for _, kind := range w.SearchContentTypes {
+			if kind != "text" && kind != "image" {
+				return ir.ToolDef{}, ErrResponsesUnsupported
+			}
+		}
+		if w.Filters != nil {
+			config.Filters = &ir.WebSearchFilters{AllowedDomains: w.Filters.AllowedDomains}
+		}
+		if w.UserLocation != nil {
+			if w.UserLocation.Type != "approximate" {
+				return ir.ToolDef{}, ErrResponsesUnsupported
+			}
+			config.UserLocation = &ir.WebSearchUserLocation{Type: w.UserLocation.Type, Country: w.UserLocation.Country, Region: w.UserLocation.Region, City: w.UserLocation.City, Timezone: w.UserLocation.Timezone}
+		}
+		tool.WebSearch = config
+	}
+	return tool, nil
+}
+
+func encodeResponseTool(tool ir.ToolDef, nested bool) (json.RawMessage, error) {
+	kind := tool.Kind
+	if kind == "" {
+		kind = "function"
+	}
+	w := responsesWireTool{Type: kind, Name: tool.Name, Description: tool.Description, Parameters: tool.Parameters, Format: tool.Format, Strict: tool.Strict, DeferLoading: tool.DeferLoading}
+	if kind != "namespace" && len(tool.Tools) > 0 || kind != "web_search" && tool.WebSearch != nil {
+		return nil, ErrResponsesUnsupported
+	}
+	if kind == "namespace" {
+		w.Tools = []json.RawMessage{}
+		for _, child := range tool.Tools {
+			raw, err := encodeResponseTool(child, true)
+			if err != nil {
+				return nil, err
+			}
+			w.Tools = append(w.Tools, raw)
+		}
+	}
+	if tool.WebSearch != nil {
+		c := tool.WebSearch
+		w.ExternalWebAccess = c.ExternalWebAccess
+		w.IndexedWebAccess = c.IndexedWebAccess
+		w.SearchContextSize = c.SearchContextSize
+		w.SearchContentTypes = c.SearchContentTypes
+		if c.Filters != nil {
+			w.Filters = &responseWireWebSearchFilters{AllowedDomains: c.Filters.AllowedDomains}
+		}
+		if c.UserLocation != nil {
+			w.UserLocation = &responseWireWebSearchUserLocation{Type: c.UserLocation.Type, Country: c.UserLocation.Country, Region: c.UserLocation.Region, City: c.UserLocation.City, Timezone: c.UserLocation.Timezone}
+		}
+	}
+	body, err := json.Marshal(w)
+	if err != nil {
+		return nil, err
+	}
+	if kind == "namespace" {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			return nil, err
+		}
+		raw, err := json.Marshal(w.Tools)
 		if err != nil {
-			return fmt.Errorf("gateway/translate: responses input item %d: %w", i, err)
+			return nil, err
 		}
-		req.Messages = append(req.Messages, ir.Message{
-			Role:  ir.RoleTool,
-			Parts: []ir.Part{{Kind: ir.PartToolResult, Text: text, ToolCallID: item.CallID}},
-		})
-		return nil
-	case "function_call":
-		// A replayed prior assistant tool call: back onto an assistant
-		// tool_call part so the upstream sees the same call it issued.
-		req.Messages = append(req.Messages, ir.Message{
-			Role: ir.RoleAssistant,
-			Parts: []ir.Part{{
-				Kind:     ir.PartToolCall,
-				ToolCall: &ir.ToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Arguments},
-			}},
-		})
-		return nil
-	case "reasoning":
-		var b strings.Builder
-		for _, s := range item.Summary {
-			if s.Type != "" && s.Type != "summary_text" {
-				return fmt.Errorf("gateway/translate: responses input item %d has unsupported reasoning summary type %q", i, s.Type)
-			}
-			b.WriteString(s.Text)
-		}
-		if b.Len() > 0 {
-			req.Messages = append(req.Messages, ir.Message{
-				Role:  ir.RoleAssistant,
-				Parts: []ir.Part{{Kind: ir.PartThinking, Text: b.String()}},
-			})
-		}
-		return nil
-	case "item_reference":
-		return fmt.Errorf("gateway/translate: responses input item %d is an item_reference, which requires response history the gateway does not keep", i)
-	default:
-		return fmt.Errorf("gateway/translate: responses input item %d has unsupported type %q", i, item.Type)
-	}
-}
-
-func responsesRoleToIR(r string) ir.Role {
-	switch r {
-	case "system", "developer":
-		return ir.RoleSystem
-	case "assistant":
-		return ir.RoleAssistant
-	default:
-		return ir.RoleUser
-	}
-}
-
-// responsesContentParts maps message content (a string or an array of typed
-// parts) onto IR parts. input_text → text; input_image → image reference
-// (re-encoded per surface downstream, never fetched).
-func responsesContentParts(content any) ([]ir.Part, error) {
-	if content == nil {
-		return nil, nil
-	}
-	if s, ok := content.(string); ok {
-		if s == "" {
-			return nil, nil
-		}
-		return []ir.Part{{Kind: ir.PartText, Text: s}}, nil
-	}
-	arr, ok := content.([]any)
-	if !ok {
-		return nil, fmt.Errorf("message content must be a string or an array of parts")
-	}
-	var out []ir.Part
-	for _, raw := range arr {
-		pm, ok := raw.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("message content part must be an object")
-		}
-		typ, _ := pm["type"].(string)
-		switch typ {
-		case "input_text", "output_text", "text":
-			if t, _ := pm["text"].(string); t != "" {
-				out = append(out, ir.Part{Kind: ir.PartText, Text: t})
-			}
-		case "input_image":
-			url := ""
-			if iu, ok := pm["image_url"].(map[string]any); ok {
-				url, _ = iu["url"].(string)
-			}
-			if url == "" {
-				url, _ = pm["image_url"].(string)
-			}
-			out = append(out, ir.Part{Kind: ir.PartImage, ImageURL: url})
-		case "refusal":
-			if t, _ := pm["refusal"].(string); t != "" {
-				out = append(out, ir.Part{Kind: ir.PartText, Text: t})
-			}
-		default:
-			return nil, fmt.Errorf("unsupported message content part type %q", typ)
+		fields["tools"] = raw
+		body, err = json.Marshal(fields)
+		if err != nil {
+			return nil, err
 		}
 	}
-	return out, nil
-}
-
-// responsesOutputText flattens a function_call_output output (a string or an
-// array of input_text parts) to plain text.
-func responsesOutputText(output any) (string, error) {
-	if output == nil {
-		return "", nil
+	if _, err := decodeResponseTool(body, nested); err != nil {
+		return nil, err
 	}
-	if s, ok := output.(string); ok {
-		return s, nil
-	}
-	arr, ok := output.([]any)
-	if !ok {
-		return "", fmt.Errorf("function_call_output output must be a string or an array of parts")
-	}
-	var b strings.Builder
-	for _, raw := range arr {
-		pm, ok := raw.(map[string]any)
-		if !ok {
-			return "", fmt.Errorf("function_call_output output part must be an object")
-		}
-		if typ, _ := pm["type"].(string); typ != "" && typ != "input_text" && typ != "text" {
-			return "", fmt.Errorf("unsupported function_call_output output part type %q", typ)
-		}
-		if t, _ := pm["text"].(string); t != "" {
-			b.WriteString(t)
-		}
-	}
-	return b.String(), nil
-}
-
-func responsesToolChoiceToIR(tc any) ir.ToolChoice {
-	switch v := tc.(type) {
-	case string:
-		switch v {
-		case "none":
-			return ir.ToolChoiceNone
-		case "required":
-			return ir.ToolChoiceRequired
-		case "auto":
-			return ir.ToolChoiceAuto
-		}
-	case map[string]any:
-		// {"type":"function",...} — a forced specific tool; canonicalize as
-		// required, mirroring the chat codec.
-		if typ, _ := v["type"].(string); typ == "function" {
-			return ir.ToolChoiceRequired
-		}
-	}
-	return ""
-}
-
-// ─── response codec ──────────────────────────────────────────────────────────
-
-// ResponsesObject is the non-streaming POST /v1/responses response body (and
-// the snapshot carried by response.completed / response.failed).
-type ResponsesObject struct {
-	ID                string                `json:"id"`
-	Object            string                `json:"object"`
-	CreatedAt         int64                 `json:"created_at"`
-	Model             string                `json:"model"`
-	Output            []ResponsesOutputItem `json:"output"`
-	Status            string                `json:"status"`
-	ParallelToolCalls bool                  `json:"parallel_tool_calls"`
-	ToolChoice        string                `json:"tool_choice"`
-	Usage             *ResponsesUsage       `json:"usage,omitempty"`
-	IncompleteDetails *ResponsesIncomplete  `json:"incomplete_details,omitempty"`
-}
-
-// ResponsesOutputItem is one output entry: a message, a function_call, or a
-// reasoning summary.
-type ResponsesOutputItem struct {
-	Type      string                   `json:"type"`
-	ID        string                   `json:"id,omitempty"`
-	Status    string                   `json:"status,omitempty"`
-	Role      string                   `json:"role,omitempty"`
-	Content   []ResponsesOutputContent `json:"content,omitempty"`
-	CallID    string                   `json:"call_id,omitempty"`
-	Name      string                   `json:"name,omitempty"`
-	Arguments string                   `json:"arguments,omitempty"`
-	Summary   []ResponsesSummaryPart   `json:"summary,omitempty"`
-}
-
-// ResponsesOutputContent is one content part of a message output item.
-type ResponsesOutputContent struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
-}
-
-// ResponsesSummaryPart is one summary_text entry of a reasoning output item.
-type ResponsesSummaryPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-// ResponsesUsage is the token accounting.
-type ResponsesUsage struct {
-	InputTokens         int                     `json:"input_tokens"`
-	OutputTokens        int                     `json:"output_tokens"`
-	TotalTokens         int                     `json:"total_tokens"`
-	InputTokensDetails  *ResponsesInputDetails  `json:"input_tokens_details,omitempty"`
-	OutputTokensDetails *ResponsesOutputDetails `json:"output_tokens_details,omitempty"`
-}
-
-// ResponsesInputDetails carries cache-read accounting.
-type ResponsesInputDetails struct {
-	CachedTokens int `json:"cached_tokens,omitempty"`
-}
-
-// ResponsesOutputDetails carries reasoning-token accounting.
-type ResponsesOutputDetails struct {
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
-}
-
-// ResponsesIncomplete explains an incomplete status.
-type ResponsesIncomplete struct {
-	Reason string `json:"reason"`
-}
-
-// EncodeResponsesResponse maps the IR back onto a non-streaming Responses
-// object. respID/item IDs are supplied by the caller (the surface mints them
-// with its ID seam so fixtures stay deterministic).
-func EncodeResponsesResponse(resp ir.Response, ids ResponsesIDs) ResponsesObject {
-	out := ResponsesObject{
-		ID:                ids.Response,
-		Object:            "response",
-		CreatedAt:         ids.CreatedAt,
-		Model:             resp.Model,
-		Status:            responsesStatus(resp.FinishReason),
-		ParallelToolCalls: true,
-		ToolChoice:        "auto",
-		Usage:             responsesUsageFromIR(resp.Usage),
-	}
-	if reason := responsesIncompleteReason(resp.FinishReason); reason != "" {
-		out.IncompleteDetails = &ResponsesIncomplete{Reason: reason}
-	}
-	out.Output = responsesOutputItems(resp, ids)
-	return out
-}
-
-// ResponsesIDs carries the caller-minted identifiers for one encoded response.
-type ResponsesIDs struct {
-	Response  string
-	CreatedAt int64
-}
-
-func responsesStatus(f ir.FinishReason) string {
-	switch f {
-	case ir.FinishLength, ir.FinishContentFilter:
-		return "incomplete"
-	case ir.FinishError:
-		return "failed"
-	default:
-		return "completed"
-	}
-}
-
-func responsesIncompleteReason(f ir.FinishReason) string {
-	switch f {
-	case ir.FinishLength:
-		return "max_output_tokens"
-	case ir.FinishContentFilter:
-		return "content_filter"
-	default:
-		return ""
-	}
-}
-
-func responsesUsageFromIR(u ir.Usage) *ResponsesUsage {
-	if u.TokensIn == 0 && u.TokensOut == 0 {
-		return nil
-	}
-	out := &ResponsesUsage{
-		InputTokens:  u.TokensIn,
-		OutputTokens: u.TokensOut,
-		TotalTokens:  u.TokensIn + u.TokensOut,
-	}
-	if u.CacheReadTokens > 0 {
-		out.InputTokensDetails = &ResponsesInputDetails{CachedTokens: u.CacheReadTokens}
-	}
-	if u.ReasoningTokens > 0 {
-		out.OutputTokensDetails = &ResponsesOutputDetails{ReasoningTokens: u.ReasoningTokens}
-	}
-	return out
-}
-
-// responsesOutputItems renders IR content as Responses output items: reasoning
-// summaries first, then the assistant message, then one function_call item per
-// tool call — the order native Responses servers use.
-func responsesOutputItems(resp ir.Response, ids ResponsesIDs) []ResponsesOutputItem {
-	var thinking, text strings.Builder
-	type call struct {
-		id, name, args string
-	}
-	var calls []call
-	for _, p := range resp.Content {
-		switch p.Kind {
-		case ir.PartText:
-			text.WriteString(p.Text)
-		case ir.PartThinking:
-			thinking.WriteString(p.Text)
-		case ir.PartToolCall:
-			if p.ToolCall != nil {
-				calls = append(calls, call{id: p.ToolCall.ID, name: p.ToolCall.Name, args: p.ToolCall.Arguments})
-			}
-		}
-	}
-	var out []ResponsesOutputItem
-	if thinking.Len() > 0 {
-		out = append(out, ResponsesOutputItem{
-			Type:    "reasoning",
-			ID:      ids.Response + "-rs-0",
-			Status:  "completed",
-			Summary: []ResponsesSummaryPart{{Type: "summary_text", Text: thinking.String()}},
-		})
-	}
-	if text.Len() > 0 {
-		out = append(out, ResponsesOutputItem{
-			Type:    "message",
-			ID:      ids.Response + "-msg-0",
-			Status:  "completed",
-			Role:    "assistant",
-			Content: []ResponsesOutputContent{{Type: "output_text", Text: text.String()}},
-		})
-	}
-	for i, c := range calls {
-		id := c.id
-		if id == "" {
-			id = fmt.Sprintf("%s-fc-%d", ids.Response, i)
-		}
-		out = append(out, ResponsesOutputItem{
-			Type:      "function_call",
-			ID:        id,
-			CallID:    id,
-			Status:    "completed",
-			Name:      c.name,
-			Arguments: c.args,
-		})
-	}
-	if out == nil {
-		out = []ResponsesOutputItem{}
-	}
-	return out
-}
-
-// ─── stream codec ───
-
-// ResponsesStreamEvent is one SSE `data:` payload on the Responses stream.
-// Type names the event; the remaining fields carry the event's payload — only
-// the fields relevant to Type are populated. The surface streaming loop mints
-// stable item ids (one per output item) and announces each item exactly once
-// with output_item.added before its first delta, so fragments for one tool
-// call share one item id.
-type ResponsesStreamEvent struct {
-	Type         string               `json:"-"`
-	Response     *ResponsesObject     `json:"response,omitempty"`
-	Item         *ResponsesOutputItem `json:"item,omitempty"`
-	OutputIndex  int                  `json:"output_index,omitempty"`
-	ContentIndex int                  `json:"content_index,omitempty"`
-	ItemID       string               `json:"item_id,omitempty"`
-	Delta        string               `json:"delta,omitempty"`
-	Text         string               `json:"text,omitempty"`
-	Arguments    string               `json:"arguments,omitempty"`
-}
-
-// MarshalJSON renders the event in its wire shape: {"type":…,…payload}.
-// Only the payload keys the event type defines are emitted.
-func (e ResponsesStreamEvent) MarshalJSON() ([]byte, error) {
-	m := map[string]any{"type": e.Type}
-	switch e.Type {
-	case "response.created", "response.in_progress":
-		m["response"] = e.Response
-	case "response.output_item.added", "response.output_item.done":
-		m["output_index"] = e.OutputIndex
-		m["item"] = e.Item
-	case "response.output_text.delta", "response.function_call_arguments.delta":
-		m["item_id"] = e.ItemID
-		m["output_index"] = e.OutputIndex
-		m["content_index"] = e.ContentIndex
-		m["delta"] = e.Delta
-	case "response.output_text.done":
-		m["item_id"] = e.ItemID
-		m["output_index"] = e.OutputIndex
-		m["content_index"] = e.ContentIndex
-		m["text"] = e.Text
-	case "response.function_call_arguments.done":
-		m["item_id"] = e.ItemID
-		m["output_index"] = e.OutputIndex
-		m["content_index"] = e.ContentIndex
-		m["arguments"] = e.Arguments
-	case "response.completed", "response.incomplete", "response.failed":
-		m["response"] = e.Response
-	}
-	return json.Marshal(m)
-}
-
-// ResponsesCreated renders the opening response.created event. The snapshot
-// is a stub (id/object/model only): the full output snapshot rides the
-// terminal response.completed event.
-func ResponsesCreated(ids ResponsesIDs, model string) ResponsesStreamEvent {
-	return ResponsesStreamEvent{
-		Type: "response.created",
-		Response: &ResponsesObject{
-			ID:     ids.Response,
-			Object: "response",
-			Model:  model,
-			Output: []ResponsesOutputItem{},
-			Status: "in_progress",
-		},
-	}
-}
-
-// ResponsesMessageAdded announces the assistant message output item before
-// its first text delta.
-func ResponsesMessageAdded(outputIndex int, itemID string) ResponsesStreamEvent {
-	return ResponsesStreamEvent{
-		Type:        "response.output_item.added",
-		OutputIndex: outputIndex,
-		Item: &ResponsesOutputItem{
-			Type:   "message",
-			ID:     itemID,
-			Status: "in_progress",
-			Role:   "assistant",
-		},
-	}
-}
-
-// ResponsesFunctionCallAdded announces one function_call output item before
-// its first arguments delta.
-func ResponsesFunctionCallAdded(outputIndex int, itemID, name string) ResponsesStreamEvent {
-	return ResponsesStreamEvent{
-		Type:        "response.output_item.added",
-		OutputIndex: outputIndex,
-		Item: &ResponsesOutputItem{
-			Type:      "function_call",
-			ID:        itemID,
-			CallID:    itemID,
-			Status:    "in_progress",
-			Name:      name,
-			Arguments: "",
-		},
-	}
-}
-
-// ResponsesTextDelta renders one assistant-text fragment.
-func ResponsesTextDelta(outputIndex int, itemID, delta string) ResponsesStreamEvent {
-	return ResponsesStreamEvent{
-		Type:        "response.output_text.delta",
-		ItemID:      itemID,
-		OutputIndex: outputIndex,
-		Delta:       delta,
-	}
-}
-
-// ResponsesArgsDelta renders one function-call arguments fragment.
-func ResponsesArgsDelta(outputIndex int, itemID, delta string) ResponsesStreamEvent {
-	return ResponsesStreamEvent{
-		Type:        "response.function_call_arguments.delta",
-		ItemID:      itemID,
-		OutputIndex: outputIndex,
-		Delta:       delta,
-	}
-}
-
-// ResponsesTextDone renders the terminal done event for the message item
-// with the assembled text.
-func ResponsesTextDone(outputIndex int, itemID, text string) ResponsesStreamEvent {
-	return ResponsesStreamEvent{
-		Type:        "response.output_text.done",
-		ItemID:      itemID,
-		OutputIndex: outputIndex,
-		Text:        text,
-	}
-}
-
-// ResponsesFunctionCallDone renders the terminal done event for one
-// function_call item with the assembled arguments.
-func ResponsesFunctionCallDone(outputIndex int, itemID, args string) ResponsesStreamEvent {
-	return ResponsesStreamEvent{
-		Type:        "response.function_call_arguments.done",
-		ItemID:      itemID,
-		OutputIndex: outputIndex,
-		Arguments:   args,
-	}
-}
-
-// ResponsesTerminal renders the final response.completed / response.incomplete
-// / response.failed snapshot event for resp.
-func ResponsesTerminal(resp ResponsesObject) ResponsesStreamEvent {
-	terminal := "response.completed"
-	switch resp.Status {
-	case "incomplete":
-		terminal = "response.incomplete"
-	case "failed":
-		terminal = "response.failed"
-	}
-	return ResponsesStreamEvent{Type: terminal, Response: &resp}
-}
-
-// EncodeResponsesOrderedResponse builds a Responses snapshot from output
-// items in a caller-determined order (the streaming path's announcement
-// order), with the caller's usage and finish. Status, incomplete details, and
-// the parallel_tool_calls / tool_choice echoes match EncodeResponsesResponse.
-func EncodeResponsesOrderedResponse(model string, usage ir.Usage, finish ir.FinishReason, ids ResponsesIDs, output []ResponsesOutputItem) ResponsesObject {
-	out := ResponsesObject{
-		ID:                ids.Response,
-		Object:            "response",
-		CreatedAt:         ids.CreatedAt,
-		Model:             model,
-		Output:            output,
-		Status:            responsesStatus(finish),
-		ParallelToolCalls: true,
-		ToolChoice:        "auto",
-		Usage:             responsesUsageFromIR(usage),
-	}
-	if reason := responsesIncompleteReason(finish); reason != "" {
-		out.IncompleteDetails = &ResponsesIncomplete{Reason: reason}
-	}
-	if out.Output == nil {
-		out.Output = []ResponsesOutputItem{}
-	}
-	return out
+	return body, nil
 }

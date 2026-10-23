@@ -48,6 +48,7 @@ type Gateway struct {
 // route is one bound session: the upstream to dial and the credential scope to
 // dial it with, plus the attribution facts stamped onto every cost row.
 type route struct {
+	protocol   agent.WireProtocol
 	sessionID  string
 	dispatchID string
 	harness    string
@@ -224,6 +225,7 @@ func (g *Gateway) bind(cfg BindConfig, surface agent.WireProtocol) (agent.Endpoi
 		dispatchID = cfg.SessionID
 	}
 	g.routes[tok] = &route{
+		protocol:   surface,
 		sessionID:  cfg.SessionID,
 		dispatchID: dispatchID,
 		harness:    cfg.Harness,
@@ -268,11 +270,20 @@ func (g *Gateway) Routes() int {
 // select a credential, invoke the upstream, and hand back the outcome plus a
 // Meter closure the surface calls once the reply is fully written.
 func (g *Gateway) Dispatch(ctx context.Context, tok token.Token, req ir.Request) (surface.Outcome, error) {
+	return g.DispatchProtocol(ctx, tok, agent.ProtoOpenAIChat, req)
+}
+
+// DispatchProtocol refuses a valid bearer on a different inbound surface
+// before consulting the credential pool or dialing an upstream.
+func (g *Gateway) DispatchProtocol(ctx context.Context, tok token.Token, protocol agent.WireProtocol, req ir.Request) (surface.Outcome, error) {
 	g.mu.RLock()
 	rt := g.routes[tok]
 	g.mu.RUnlock()
 	if rt == nil {
 		return surface.Outcome{}, &surface.HTTPError{Status: http.StatusUnauthorized, Code: "invalid_token", Message: "unknown or expired session token"}
+	}
+	if rt.protocol != protocol {
+		return surface.Outcome{}, &surface.HTTPError{Status: http.StatusForbidden, Code: "wrong_surface", Message: "session token is bound to another surface"}
 	}
 
 	req.Metadata = ir.Metadata{SessionID: rt.sessionID, DispatchID: rt.dispatchID, Harness: rt.harness}
@@ -318,10 +329,11 @@ func (g *Gateway) Dispatch(ctx context.Context, tok token.Token, req ir.Request)
 
 // clientStatus maps an upstream HTTP status onto the status the gateway returns
 // to its own client. Auth/rate/timeout pass through; a transport failure
-// (status 0) or a 5xx becomes 502 Bad Gateway.
+// (status 0), a 2xx whose body failed to decode, or a 5xx becomes 502 Bad
+// Gateway.
 func clientStatus(upstreamStatus int) int {
 	switch {
-	case upstreamStatus == 0:
+	case upstreamStatus == 0 || upstreamStatus >= 200 && upstreamStatus < 300:
 		return http.StatusBadGateway
 	case upstreamStatus >= 500:
 		return http.StatusBadGateway
