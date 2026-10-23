@@ -10,6 +10,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.88 — 2026-10-23
+
+### Chores
+
+- Wire top-level poll duration into the stage budget
+- Map the full reasoning-effort ladder and refuse unknown values
+- Bump the go-minor-patch group with 11 updates
+- Bump the actions group across 1 directory with 9 updates
+- Pre-trusted harness hooks for activity telemetry
+- Measure the upstream snapshot-authority build lane; keep HOLD verdict
+- Harden default-on provider routing gate and its tests
+- Executor-owned per-session scratch directories
+- Persist the filtered reconcile set so stale catalog rows drop from disk
+- Accept custom work type names; template, model-access keys and routing reward follow the role
+- Lint on the release toolchain floor; bound the darwin rename descriptor
+
 ## v0.72.87 — 2026-10-22
 
 ### Fixes
