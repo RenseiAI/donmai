@@ -40,6 +40,14 @@ func (u *OpenAICompat) Name() string { return u.Company }
 
 // Invoke implements Upstream.
 func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Credential) (Outcome, error) {
+	responsesInbound := len(req.Items) > 0 || req.Responses != nil
+	if responsesInbound {
+		var err error
+		req, err = translate.ProjectResponsesToChat(req)
+		if err != nil {
+			return Outcome{Status: http.StatusBadRequest}, err
+		}
+	}
 	body, err := translate.EncodeRequest(req)
 	if err != nil {
 		return Outcome{}, err
@@ -71,7 +79,7 @@ func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Cre
 	}
 
 	if req.Stream {
-		stream := u.readStream(resp)
+		stream := u.readStreamMode(ctx, resp, responsesInbound)
 		return Outcome{Status: resp.StatusCode, Stream: stream}, nil
 	}
 
@@ -79,6 +87,15 @@ func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Cre
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return Outcome{Status: resp.StatusCode}, fmt.Errorf("gateway/upstream: read body: %w", err)
+	}
+	if responsesInbound {
+		// The reply's content is refused, not the credential: report the
+		// upstream's real status so a healthy key is never cooled down. The
+		// gateway still answers its client 502.
+		if err := translate.ValidateChatResponsesSubset(raw, false); err != nil {
+			_, billed := translate.ChatTurnReport(raw)
+			return Outcome{Status: resp.StatusCode, RefusedUsage: billed}, err
+		}
 	}
 	irResp, err := translate.DecodeResponse(raw)
 	if err != nil {
@@ -99,12 +116,15 @@ func (u *OpenAICompat) applyAuth(r *http.Request, cred pool.Credential) {
 	r.Header.Set("Authorization", "Bearer "+cred.Secret)
 }
 
-// readStream consumes the SSE body in a goroutine, decoding each `data:` chunk
-// into an ir.StreamDelta. The channel closes when the upstream sends [DONE] or
-// EOF; a mid-stream transport error is surfaced via the returned Stream.Err.
-func (u *OpenAICompat) readStream(resp *http.Response) *ir.Stream {
+// readStreamMode consumes the SSE body in a goroutine, decoding each `data:`
+// chunk into an ir.StreamDelta. The channel closes when the upstream sends
+// [DONE] or EOF; a mid-stream transport error or a cancelled ctx is surfaced
+// via the returned Stream.Err. strict validates every chunk against the
+// subset a Responses exchange can represent.
+func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, strict bool) *ir.Stream {
 	deltas := make(chan ir.StreamDelta)
 	var streamErr error
+	var refusedUsage *ir.Usage
 	done := make(chan struct{})
 
 	go func() {
@@ -112,6 +132,18 @@ func (u *OpenAICompat) readStream(resp *http.Response) *ir.Stream {
 		defer close(done)
 		defer func() { _ = resp.Body.Close() }()
 
+		// After a strict refusal nothing more is forwarded, but the rest of
+		// the turn is read so the usage the upstream bills for a finished
+		// turn can still be metered.
+		var finished bool
+		var billed *ir.Usage
+		note := func(payload string) {
+			f, u := translate.ChatTurnReport([]byte(payload))
+			finished = finished || f
+			if u != nil {
+				billed = u
+			}
+		}
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for sc.Scan() {
@@ -120,18 +152,49 @@ func (u *OpenAICompat) readStream(resp *http.Response) *ir.Stream {
 				continue
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if streamErr != nil {
+				if payload == "[DONE]" {
+					break
+				}
+				note(payload)
+				continue
+			}
+			if strict && payload != "[DONE]" {
+				if err := translate.ValidateChatResponsesSubset([]byte(payload), true); err != nil {
+					streamErr = err
+					note(payload)
+					continue
+				}
+			}
 			delta, isDone, derr := translate.DecodeStreamChunk([]byte(payload))
 			if isDone {
 				return
 			}
 			if derr != nil {
 				streamErr = derr
+				if !strict {
+					return
+				}
+				continue
+			}
+			if strict {
+				note(payload)
+			}
+			select {
+			case deltas <- delta:
+			case <-ctx.Done():
+				streamErr = ctx.Err()
 				return
 			}
-			deltas <- delta
 		}
 		if err := sc.Err(); err != nil {
-			streamErr = fmt.Errorf("gateway/upstream: read stream: %w", err)
+			if streamErr == nil {
+				streamErr = fmt.Errorf("gateway/upstream: read stream: %w", err)
+			}
+			return
+		}
+		if streamErr != nil && finished {
+			refusedUsage = billed
 		}
 	}()
 
@@ -140,6 +203,10 @@ func (u *OpenAICompat) readStream(resp *http.Response) *ir.Stream {
 		Err: func() error {
 			<-done
 			return streamErr
+		},
+		RefusedUsage: func() *ir.Usage {
+			<-done
+			return refusedUsage
 		},
 	}
 }

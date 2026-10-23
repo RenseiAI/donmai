@@ -33,11 +33,14 @@ type Upstream interface {
 
 // Outcome bundles an upstream exchange result. Status is always the observed
 // HTTP status (0 for a pre-dial/transport failure). On success, Stream is set
-// for a streaming request and Response for a non-streaming one.
+// for a streaming request and Response for a non-streaming one. RefusedUsage
+// accompanies an error when a 2xx reply finished a billed turn with valid
+// usage that the gateway nonetheless refused to serve; the caller meters it.
 type Outcome struct {
-	Status   int
-	Stream   *ir.Stream
-	Response *ir.Response
+	Status       int
+	Stream       *ir.Stream
+	Response     *ir.Response
+	RefusedUsage *ir.Usage
 }
 
 // Error is a typed upstream failure carrying the HTTP status so the gateway can

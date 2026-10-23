@@ -1,14 +1,163 @@
 package surface
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/gateway/ir"
+	"github.com/RenseiAI/donmai/gateway/token"
 )
+
+type responsesDispatcher struct {
+	out         Outcome
+	err         error
+	gotProtocol agent.WireProtocol
+	gotRequest  ir.Request
+	gotToken    token.Token
+	called      bool
+}
+
+func (d *responsesDispatcher) DispatchProtocol(_ context.Context, tok token.Token, p agent.WireProtocol, r ir.Request) (Outcome, error) {
+	d.called = true
+	d.gotProtocol = p
+	d.gotRequest = r
+	d.gotToken = tok
+	return d.out, d.err
+}
+
+func TestResponsesSurfaceStrictRequestsAndProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		name, auth, body string
+		status           int
+	}{
+		{"missing_token", "", `{"model":"m","input":[]}`, 401},
+		{"malformed", "Bearer t", "{bad}", 400},
+		{"stateful", "Bearer t", `{"model":"m","input":[],"previous_response_id":"r"}`, 400},
+		{"unknown", "Bearer t", `{"model":"m","input":[],"new_field":true}`, 400},
+		{"oversized", "Bearer t", strings.Repeat(" ", (32<<20)+1), 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &responsesDispatcher{}
+			rec := post(t, NewOpenAIResponses(d), tc.auth, tc.body)
+			if rec.Code != tc.status || d.called {
+				t.Fatalf("code=%d called=%v", rec.Code, d.called)
+			}
+		})
+	}
+	d := &responsesDispatcher{out: Outcome{Response: &ir.Response{Model: "m", Content: []ir.Part{{Kind: ir.PartText, Text: "hello"}}, FinishReason: ir.FinishStop, UsageReported: true}}}
+	h := NewOpenAIResponses(d)
+	h.IDFn = func() string { return "response-test" }
+	rec := post(t, h, "Bearer exact-token", `{"model":"m","input":[],"store":false}`)
+	if rec.Code != 200 || d.gotProtocol != agent.ProtoOpenAIResponses || d.gotToken != "exact-token" || !strings.Contains(rec.Body.String(), `"id":"response-test"`) {
+		t.Fatalf("protocol dispatch code=%d token=%s protocol=%s body=%s", rec.Code, d.gotToken, d.gotProtocol, rec.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 405 {
+		t.Fatalf("method refusal=%d", rec.Code)
+	}
+}
+
+func TestResponsesSurfaceStreamErrorAndCancelNeverMeter(t *testing.T) {
+	usage := &ir.Usage{TokensIn: 1, TokensOut: 1}
+	for _, mode := range []string{"terminal_error", "missing_terminal", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			ch := make(chan ir.StreamDelta, 2)
+			ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.created", ResponseID: "r"}}
+			if mode == "terminal_error" {
+				ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.completed", ResponseID: "r", Usage: usage}}
+			}
+			if mode != "cancel" {
+				close(ch)
+			}
+			metered := 0
+			out := Outcome{Stream: &ir.Stream{Deltas: ch, Err: func() error {
+				if mode == "terminal_error" {
+					return errors.New("private upstream error")
+				}
+				return nil
+			}}, Meter: func(ir.Usage, ir.FinishReason) { metered++ }}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if mode == "cancel" {
+				cancel()
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":[],"stream":true}`)).WithContext(ctx)
+			req.Header.Set("Authorization", "Bearer t")
+			rec := httptest.NewRecorder()
+			NewOpenAIResponses(&responsesDispatcher{out: out}).ServeHTTP(rec, req)
+			if metered != 0 || strings.Contains(rec.Body.String(), `"type":"response.completed"`) || !strings.Contains(rec.Body.String(), `"type":"response.failed"`) {
+				t.Fatalf("mode=%s meter=%d body=%s", mode, metered, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "private upstream") {
+				t.Fatal("stream leaked upstream error")
+			}
+		})
+	}
+}
+
+func TestResponsesSurfaceCanceledBlockedStreamReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	started := make(chan struct{})
+	returned := make(chan struct{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":[],"stream":true}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer t")
+	ch := make(chan ir.StreamDelta)
+	go func() {
+		close(started)
+		NewOpenAIResponses(&responsesDispatcher{out: Outcome{Stream: &ir.Stream{Deltas: ch}}}).ServeHTTP(httptest.NewRecorder(), req)
+		close(returned)
+	}()
+	<-started
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("blocked stream did not honor cancellation")
+	}
+}
+
+func TestResponsesSurfaceMissingUsageOrUnrepresentableOutput(t *testing.T) {
+	// Unreported usage is never served or metered. Reported usage is metered
+	// exactly once whatever the client sees: an unrepresentable reply is a
+	// 502, and a length finish is served as incomplete, never as completed.
+	for _, tc := range []struct {
+		name   string
+		resp   ir.Response
+		code   int
+		meter  int
+		status string
+	}{
+		{"missing_usage", ir.Response{Content: []ir.Part{{Kind: ir.PartText, Text: "hello"}}}, 502, 0, ""},
+		{"unrepresentable", ir.Response{UsageReported: true, Content: []ir.Part{{Kind: ir.PartImage, ImageURL: "x"}}}, 502, 1, ""},
+		{"length", ir.Response{UsageReported: true, FinishReason: ir.FinishLength}, 200, 1, `"status":"incomplete"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metered := 0
+			resp := tc.resp
+			d := &responsesDispatcher{out: Outcome{Response: &resp, Meter: func(ir.Usage, ir.FinishReason) { metered++ }}}
+			rec := post(t, NewOpenAIResponses(d), "Bearer t", `{"model":"m","input":[]}`)
+			if rec.Code != tc.code || metered != tc.meter || !strings.Contains(rec.Body.String(), tc.status) || strings.Contains(rec.Body.String(), `"status":"completed"`) {
+				t.Fatalf("code=%d meter=%d body=%s", rec.Code, metered, rec.Body.String())
+			}
+		})
+	}
+}
+
+// DispatchProtocol lets the shared Chat fake drive the surface-bound
+// Responses seam; protocol selection itself is pinned by responsesDispatcher.
+func (f *fakeDispatcher) DispatchProtocol(ctx context.Context, tok token.Token, _ agent.WireProtocol, req ir.Request) (Outcome, error) {
+	return f.Dispatch(ctx, tok, req)
+}
 
 func postResponses(t *testing.T, h http.Handler, auth, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -72,7 +221,7 @@ func TestResponses_UnknownEffortIsBadRequestNamingValue(t *testing.T) {
 
 func TestResponses_XHighEffortReachesDispatcher(t *testing.T) {
 	fd := &fakeDispatcher{outcome: Outcome{
-		Response: &ir.Response{Model: "m", FinishReason: ir.FinishStop},
+		Response: &ir.Response{Model: "m", FinishReason: ir.FinishStop, UsageReported: true},
 		Model:    "m",
 	}}
 	h := NewOpenAIResponses(fd)
@@ -98,9 +247,10 @@ func TestResponses_NonStreamingMetersAndShapes(t *testing.T) {
 	var metered bool
 	fd := &fakeDispatcher{outcome: Outcome{
 		Response: &ir.Response{
-			Model:        "m",
-			FinishReason: ir.FinishStop,
-			Usage:        ir.Usage{TokensIn: 2, TokensOut: 1},
+			Model:         "m",
+			FinishReason:  ir.FinishStop,
+			Usage:         ir.Usage{TokensIn: 2, TokensOut: 1},
+			UsageReported: true,
 			Content: []ir.Part{
 				{Kind: ir.PartText, Text: "hi"},
 				{Kind: ir.PartToolCall, ToolCall: &ir.ToolCall{ID: "call-1", Name: "f", Arguments: "{}"}},
@@ -171,8 +321,9 @@ func TestResponses_EmptyUpstreamResponseIsBadGateway(t *testing.T) {
 }
 
 // TestResponses_StreamingEventSequence drives a text + tool-call stream and
-// asserts the full wire order: created, per-item added before first delta,
-// deltas, per-item done with assembled payloads, and the completed snapshot
+// asserts the full wire order: created, per-item added (and the message's
+// content part) before first delta, deltas, per-item done events with
+// assembled payloads closed by output_item.done, and the completed snapshot
 // with usage — plus exactly one Meter call.
 func TestResponses_StreamingEventSequence(t *testing.T) {
 	deltas := make(chan ir.StreamDelta, 5)
@@ -207,13 +358,17 @@ func TestResponses_StreamingEventSequence(t *testing.T) {
 	wantOrder := []string{
 		"response.created",
 		"response.output_item.added", // message
+		"response.content_part.added",
 		"response.output_text.delta",
 		"response.output_text.delta",
 		"response.output_item.added", // function_call
 		"response.function_call_arguments.delta",
 		"response.function_call_arguments.delta",
 		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done", // message
 		"response.function_call_arguments.done",
+		"response.output_item.done", // function_call
 		"response.completed",
 	}
 	if len(types) != len(wantOrder) {
@@ -329,4 +484,84 @@ func addedOutputIndices(t *testing.T, body string) []int {
 		}
 	}
 	return out
+}
+
+// failingWriter drops the client connection on the first write that carries
+// failOn, like a client that disconnects mid-reply.
+type failingWriter struct {
+	*httptest.ResponseRecorder
+	failOn string
+}
+
+func (f *failingWriter) Write(b []byte) (int, error) {
+	if strings.Contains(string(b), f.failOn) {
+		return 0, errors.New("client disconnected")
+	}
+	return f.ResponseRecorder.Write(b)
+}
+
+// TestResponsesSurfaceMetersFinishedUpstreamWhateverClientSees pins that an
+// upstream turn that finished and reported usage is metered exactly once even
+// when the client never receives the reply.
+func TestResponsesSurfaceMetersFinishedUpstreamWhateverClientSees(t *testing.T) {
+	usage := &ir.Usage{TokensIn: 3, TokensOut: 2}
+	for _, tc := range []struct {
+		name   string
+		body   string
+		failOn string
+		out    func(cancel context.CancelFunc) Outcome
+	}{
+		{"reply_write_fails", `{"model":"m","input":[]}`, `"object":"response"`, func(context.CancelFunc) Outcome {
+			return Outcome{Response: &ir.Response{Model: "m", FinishReason: ir.FinishStop, Usage: *usage, UsageReported: true, Content: []ir.Part{{Kind: ir.PartText, Text: "hi"}}}}
+		}},
+		{"native_terminal_write_fails", `{"model":"m","input":[],"stream":true}`, `"type":"response.completed"`, func(context.CancelFunc) Outcome {
+			ch := make(chan ir.StreamDelta, 2)
+			ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.created", ResponseID: "r"}}
+			ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.completed", ResponseID: "r", Usage: usage}}
+			close(ch)
+			return Outcome{Stream: &ir.Stream{Deltas: ch, Err: func() error { return nil }}}
+		}},
+		{"chat_client_gone_after_finish", `{"model":"m","input":[],"stream":true}`, "\x00never", func(cancel context.CancelFunc) Outcome {
+			ch := make(chan ir.StreamDelta, 2)
+			ch <- ir.StreamDelta{TextDelta: "hi"}
+			ch <- ir.StreamDelta{Finish: ir.FinishStop, Usage: usage}
+			close(ch)
+			// The upstream ended cleanly; the client disconnects just after.
+			return Outcome{Stream: &ir.Stream{Deltas: ch, Err: func() error { cancel(); return nil }}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			out := tc.out(cancel)
+			metered := 0
+			var got ir.Usage
+			out.Meter = func(u ir.Usage, _ ir.FinishReason) { metered++; got = u }
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tc.body)).WithContext(ctx)
+			req.Header.Set("Authorization", "Bearer t")
+			rec := &failingWriter{ResponseRecorder: httptest.NewRecorder(), failOn: tc.failOn}
+			NewOpenAIResponses(&responsesDispatcher{out: out}).ServeHTTP(rec, req)
+			if metered != 1 || got != *usage {
+				t.Fatalf("finished upstream metered %d times with %+v; body=%s", metered, got, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestResponsesSurfaceStopsForwardingAfterFailure fails a native stream on
+// its first event: nothing the upstream sends afterwards reaches the client
+// before the failure terminal.
+func TestResponsesSurfaceStopsForwardingAfterFailure(t *testing.T) {
+	ch := make(chan ir.StreamDelta, 4)
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.output_text.delta", ItemID: "m", Delta: "early"}}
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.created", ResponseID: "r"}}
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.output_text.delta", ItemID: "m", Delta: "late"}}
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.completed", ResponseID: "r", Usage: &ir.Usage{TokensIn: 1, TokensOut: 1}}}
+	close(ch)
+	d := &responsesDispatcher{out: Outcome{Stream: &ir.Stream{Deltas: ch, Err: func() error { return nil }}}}
+	rec := post(t, NewOpenAIResponses(d), "Bearer t", `{"model":"m","input":[],"stream":true}`)
+	body := rec.Body.String()
+	if strings.Contains(body, "late") || strings.Contains(body, "early") || strings.Contains(body, `"type":"response.created"`) || !strings.Contains(body, `"type":"response.failed"`) {
+		t.Fatalf("events forwarded after the stream failed: %s", body)
+	}
 }
