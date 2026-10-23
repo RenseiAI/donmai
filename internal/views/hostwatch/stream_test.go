@@ -109,6 +109,30 @@ func TestFormatStreamLine_Plain(t *testing.T) {
 			wantSkip: true,
 		},
 		{
+			name:     "llm_call turn marker alone skipped",
+			ev:       agent.LlmCallEvent{TurnCompleted: true},
+			label:    "ENG-1",
+			wantSkip: true,
+		},
+		{
+			name:  "llm_call input-only renders token part",
+			ev:    agent.LlmCallEvent{Model: "m", InputTokens: 1},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  m in 1 out 0",
+		},
+		{
+			name:  "llm_call output-only renders token part",
+			ev:    agent.LlmCallEvent{Model: "m", OutputTokens: 1},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  m in 0 out 1",
+		},
+		{
+			name:  "llm_call model-only omits token part",
+			ev:    agent.LlmCallEvent{Model: "m"},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  m",
+		},
+		{
 			name:  "context_usage threshold with measurements",
 			ev:    agent.ContextUsageEvent{NoticeKind: agent.ContextUsageThreshold, UsedPercent: f64p(62.5), InputTokens: i64p(125000)},
 			label: "ENG-1",
@@ -119,6 +143,12 @@ func TestFormatStreamLine_Plain(t *testing.T) {
 			ev:    agent.ContextUsageEvent{NoticeKind: agent.ContextUsageCompaction},
 			label: "ENG-1",
 			want:  "14:02:11 [ENG-1] context_usage  compaction",
+		},
+		{
+			name:     "empty context_usage skipped",
+			ev:       agent.ContextUsageEvent{},
+			label:    "ENG-1",
+			wantSkip: true,
 		},
 		{
 			name:  "usage message",
@@ -137,6 +167,24 @@ func TestFormatStreamLine_Plain(t *testing.T) {
 			ev:    agent.SubagentEvent{ToolName: "Task", Phase: agent.SubagentCompleted},
 			label: "ENG-1",
 			want:  "14:02:11 [ENG-1] subagent  Task completed",
+		},
+		{
+			name:     "empty subagent skipped",
+			ev:       agent.SubagentEvent{},
+			label:    "ENG-1",
+			wantSkip: true,
+		},
+		{
+			name:  "subagent tool name only",
+			ev:    agent.SubagentEvent{ToolName: "Task"},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] subagent  Task",
+		},
+		{
+			name:  "subagent phase only",
+			ev:    agent.SubagentEvent{Phase: agent.SubagentCompleted},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] subagent  completed",
 		},
 	}
 	for _, tc := range tests {
