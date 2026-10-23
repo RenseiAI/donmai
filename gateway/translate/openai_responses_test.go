@@ -681,6 +681,8 @@ func TestEncodeResponsesResponse_IncompleteLength(t *testing.T) {
 	}
 }
 
+// TestEncodeResponsesResponse_ErrorIsFailed pins the encoder alone: neither
+// upstream path produces an error finish, so production never reaches it.
 func TestEncodeResponsesResponse_ErrorIsFailed(t *testing.T) {
 	obj := encodeStatus(t, ir.Response{Model: "m", FinishReason: ir.FinishError})
 	if obj.Status != "failed" {
@@ -785,6 +787,12 @@ func TestValidateChatResponsesSubsetClassifiesFields(t *testing.T) {
 		{"chunk_tool_call", chunk(`[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":""}}]},"logprobs":null,"finish_reason":null}]`, ""), true},
 		{"chunk_finish_length", chunk(`[{"index":0,"delta":{},"logprobs":null,"finish_reason":"length"}]`, ""), true},
 		{"chunk_include_usage", strings.Replace(chunk(`[]`, ""), `"usage":null`, usage, 1), true},
+		// Aggregator metadata and accounting extensions.
+		{"openrouter_reply", strings.Replace(strings.Replace(reply(`{"role":"assistant","content":"Hi","refusal":null,"reasoning":null}`, `,"provider":"Fixture"`), `"finish_reason":"stop"`, `"finish_reason":"stop","native_finish_reason":"end_turn"`, 1), `"total_tokens":29,`, `"total_tokens":29,"cost":0.00012,"is_byok":false,"cost_details":{"upstream_inference_cost":null,"upstream_inference_prompt_cost":0.00005},`, 1), false},
+		{"groq_reply", strings.Replace(reply(`{"role":"assistant","content":"Hi"}`, `,"x_groq":{"id":"req_1"},"usage_breakdown":null`), `"total_tokens":29,`, `"total_tokens":29,"queue_time":0.03,"prompt_time":0.001,"completion_time":0.02,"total_time":0.021,`, 1), false},
+		{"azure_reply_unfiltered", strings.Replace(reply(`{"role":"assistant","content":"Hi","refusal":null,"annotations":[]}`, `,"prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"},"jailbreak":{"filtered":false,"detected":false}}}]`), `"logprobs":null`, `"logprobs":null,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"},"protected_material_text":{"filtered":false,"detected":false}}`, 1), false},
+		{"azure_reply_filtered_output", strings.Replace(strings.Replace(reply(`{"role":"assistant","content":null}`, ""), `"logprobs":null`, `"logprobs":null,"content_filter_results":{"violence":{"filtered":true,"severity":"high"}}`, 1), `"finish_reason":"stop"`, `"finish_reason":"content_filter"`, 1), false},
+		{"azure_first_chunk", `{"choices":[],"created":0,"id":"","model":"","object":"","prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}]}`, true},
 	}
 	for _, tc := range accepted {
 		if err := ValidateChatResponsesSubset([]byte(tc.body), tc.stream); err != nil {
@@ -812,6 +820,16 @@ func TestValidateChatResponsesSubsetClassifiesFields(t *testing.T) {
 		{"chunk_two_tool_calls", chunk(`[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"f","arguments":""}},{"index":1,"id":"b","type":"function","function":{"name":"g","arguments":""}}]},"finish_reason":null}]`, ""), true},
 		{"chunk_refusal_text", chunk(`[{"index":0,"delta":{"refusal":"no"},"finish_reason":null}]`, ""), true},
 		{"chunk_unknown_choice_content", chunk(`[{"index":0,"delta":{"content":"x"},"finish_reason":null,"content_blocks":[{"text":"y"}]}]`, ""), true},
+		// Guards that keep a malformed reply from being served or metered.
+		{"chunk_second_choice_index", chunk(`[{"index":1,"delta":{"content":"other"},"finish_reason":null}]`, ""), true},
+		{"duplicate_message_key", strings.Replace(reply(`{"role":"assistant","content":null,"refusal":"I refuse"}`, ""), `"logprobs":null`, `"message":{"role":"assistant","content":"ok"},"logprobs":null`, 1), false},
+		{"choice_without_message", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"message":{"role":"assistant","content":"x"},`, ``, 1), false},
+		{"null_message", reply(`null`, ""), false},
+		{"negative_reasoning_tokens", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"reasoning_tokens":0`, `"reasoning_tokens":-7`, 1), false},
+		// Content filters that blocked something are never served as a success.
+		{"azure_filtered_output_with_stop", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"logprobs":null`, `"logprobs":null,"content_filter_results":{"violence":{"filtered":true,"severity":"high"}}`, 1), false},
+		{"azure_filtered_prompt", reply(`{"role":"assistant","content":"x"}`, `,"prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"jailbreak":{"filtered":true,"detected":true}}}]`), false},
+		{"usage_cost_text", strings.Replace(reply(`{"role":"assistant","content":"x"}`, ""), `"total_tokens":29,`, `"total_tokens":29,"cost":"0.1",`, 1), false},
 	}
 	for _, tc := range refused {
 		if err := ValidateChatResponsesSubset([]byte(tc.body), tc.stream); err == nil {
@@ -823,10 +841,36 @@ func TestValidateChatResponsesSubsetClassifiesFields(t *testing.T) {
 // TestResponsesNativeGuardsPinned pins the codec guards that stop a native
 // exchange from fabricating success or silently dropping a Responses control.
 func TestResponsesNativeGuardsPinned(t *testing.T) {
-	for _, status := range []string{"incomplete", "failed", "in_progress"} {
-		body := `{"id":"r","object":"response","status":"` + status + `","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+	// A turn the backend did not end is never decoded; an incomplete turn
+	// needs a reason the IR carries; neither is ever labeled completed.
+	for _, refused := range []string{
+		`"status":"failed"`,
+		`"status":"in_progress"`,
+		`"status":"incomplete"`,
+		`"status":"incomplete","incomplete_details":{"reason":"interrupted"}`,
+		`"status":"completed","incomplete_details":{"reason":"max_output_tokens"}`,
+	} {
+		body := `{"id":"r","object":"response",` + refused + `,"output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
 		if _, err := DecodeResponsesResponse([]byte(body)); err == nil {
-			t.Errorf("native reply with status %q and complete usage decoded as a success", status)
+			t.Errorf("native reply %s with complete usage decoded", refused)
+		}
+	}
+	for reason, finish := range map[string]ir.FinishReason{"max_output_tokens": ir.FinishLength, "content_filter": ir.FinishContentFilter} {
+		body := `{"id":"r","object":"response","status":"incomplete","incomplete_details":{"reason":"` + reason + `"},"output":[{"type":"message","id":"m","status":"incomplete","role":"assistant","content":[{"type":"output_text","text":"cut"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+		resp, err := DecodeResponsesResponse([]byte(body))
+		if err != nil || resp.FinishReason != finish {
+			t.Fatalf("incomplete %s decoded as %q, %v", reason, resp.FinishReason, err)
+		}
+		encoded, err := EncodeResponsesResponse(resp, "r")
+		if err != nil || !strings.Contains(string(encoded), `"status":"incomplete"`) || !strings.Contains(string(encoded), `"reason":"`+reason+`"`) || strings.Contains(string(encoded), `"status":"completed"`) {
+			t.Fatalf("incomplete %s re-encoded as %s, %v", reason, encoded, err)
+		}
+		event, err := DecodeResponsesStreamEvent([]byte(`{"type":"response.incomplete","response":` + body + `}`))
+		if err != nil || event.Response.FinishReason != finish || event.Usage == nil {
+			t.Fatalf("incomplete %s terminal decoded as %+v, %v", reason, event, err)
+		}
+		if _, err := DecodeResponsesStreamEvent([]byte(`{"type":"response.completed","response":` + body + `}`)); err == nil {
+			t.Fatalf("an incomplete snapshot decoded under a completed terminal")
 		}
 	}
 	req, err := DecodeResponsesRequest([]byte(`{"model":"m","input":"x","parallel_tool_calls":false,"store":false}`))

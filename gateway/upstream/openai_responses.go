@@ -61,7 +61,7 @@ func (u *OpenAIResponses) Invoke(ctx context.Context, req ir.Request, cred pool.
 	}
 	decoded, err := translate.DecodeResponsesResponse(raw)
 	if err != nil {
-		return Outcome{Status: resp.StatusCode}, err
+		return Outcome{Status: resp.StatusCode, RefusedUsage: translate.ResponsesReplyUsage(raw)}, err
 	}
 	return Outcome{Status: resp.StatusCode, Response: &decoded}, nil
 }
@@ -70,6 +70,7 @@ func readResponsesStream(ctx context.Context, resp *http.Response) *ir.Stream {
 	deltas := make(chan ir.StreamDelta)
 	done := make(chan struct{})
 	var streamErr error
+	var refusedUsage *ir.Usage
 	go func() {
 		defer close(deltas)
 		defer close(done)
@@ -79,6 +80,18 @@ func readResponsesStream(ctx context.Context, resp *http.Response) *ir.Stream {
 		var responseID string
 		var eventName string
 		var data strings.Builder
+		// refuse records the first refusal. Nothing more is forwarded, but a
+		// terminal the backend still sends for this response is read so the
+		// usage it bills for that turn can be metered.
+		refuse := func(err error) {
+			if streamErr == nil {
+				streamErr = err
+			}
+		}
+		billed := func(payload string) bool {
+			refusedUsage = translate.ResponsesTerminalUsage([]byte(payload), responseID)
+			return refusedUsage != nil
+		}
 		for sc.Scan() {
 			line := sc.Text()
 			if line == "" {
@@ -86,22 +99,33 @@ func readResponsesStream(ctx context.Context, resp *http.Response) *ir.Stream {
 					eventName = ""
 					continue
 				}
-				event, err := translate.DecodeResponsesStreamEvent([]byte(data.String()))
+				payload := data.String()
 				data.Reset()
-				if err != nil || eventName != "" && eventName != event.Kind {
-					streamErr = errors.New("gateway/upstream: invalid responses stream event")
-					return
-				}
+				name := eventName
 				eventName = ""
+				if streamErr != nil {
+					if billed(payload) {
+						return
+					}
+					continue
+				}
+				event, err := translate.DecodeResponsesStreamEvent([]byte(payload))
+				if err != nil || name != "" && name != event.Kind {
+					refuse(errors.New("gateway/upstream: invalid responses stream event"))
+					if billed(payload) {
+						return
+					}
+					continue
+				}
 				if event.Kind == "response.created" {
 					if responseID != "" {
-						streamErr = errors.New("gateway/upstream: duplicate responses creation")
-						return
+						refuse(errors.New("gateway/upstream: duplicate responses creation"))
+						continue
 					}
 					responseID = event.ResponseID
 				} else if responseID == "" || (event.ResponseID != "" && event.ResponseID != responseID) {
-					streamErr = errors.New("gateway/upstream: responses lifecycle mismatch")
-					return
+					refuse(errors.New("gateway/upstream: responses lifecycle mismatch"))
+					continue
 				}
 				select {
 				case deltas <- ir.StreamDelta{Responses: &event}:
@@ -109,7 +133,7 @@ func readResponsesStream(ctx context.Context, resp *http.Response) *ir.Stream {
 					streamErr = ctx.Err()
 					return
 				}
-				if event.Kind == "response.completed" {
+				if event.Kind == "response.completed" || event.Kind == "response.incomplete" {
 					return
 				}
 				continue
@@ -120,27 +144,32 @@ func readResponsesStream(ctx context.Context, resp *http.Response) *ir.Stream {
 			case strings.HasPrefix(line, "data:"):
 				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				if payload == "[DONE]" {
-					streamErr = errors.New("gateway/upstream: responses stream ended without completion")
+					refuse(errors.New("gateway/upstream: responses stream ended without completion"))
 					return
 				}
 				if data.Len() > 0 {
 					data.WriteByte('\n')
 				}
 				if data.Len()+len(payload) > 1<<20 {
-					streamErr = errors.New("gateway/upstream: responses event too large")
+					refuse(errors.New("gateway/upstream: responses event too large"))
 					return
 				}
 				data.WriteString(payload)
 			case !strings.HasPrefix(line, ":"):
-				streamErr = errors.New("gateway/upstream: unsupported responses SSE field")
+				refuse(errors.New("gateway/upstream: unsupported responses SSE field"))
 				return
 			}
 		}
 		if err := sc.Err(); err != nil {
-			streamErr = errors.New("gateway/upstream: responses stream read failed")
+			refusedUsage = nil
+			refuse(errors.New("gateway/upstream: responses stream read failed"))
 		} else {
-			streamErr = errors.New("gateway/upstream: responses stream closed before completion")
+			refuse(errors.New("gateway/upstream: responses stream closed before completion"))
 		}
 	}()
-	return &ir.Stream{Deltas: deltas, Err: func() error { <-done; return streamErr }}
+	return &ir.Stream{
+		Deltas:       deltas,
+		Err:          func() error { <-done; return streamErr },
+		RefusedUsage: func() *ir.Usage { <-done; return refusedUsage },
+	}
 }

@@ -93,7 +93,8 @@ func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Cre
 		// upstream's real status so a healthy key is never cooled down. The
 		// gateway still answers its client 502.
 		if err := translate.ValidateChatResponsesSubset(raw, false); err != nil {
-			return Outcome{Status: resp.StatusCode}, err
+			_, billed := translate.ChatTurnReport(raw)
+			return Outcome{Status: resp.StatusCode, RefusedUsage: billed}, err
 		}
 	}
 	irResp, err := translate.DecodeResponse(raw)
@@ -123,6 +124,7 @@ func (u *OpenAICompat) applyAuth(r *http.Request, cred pool.Credential) {
 func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, strict bool) *ir.Stream {
 	deltas := make(chan ir.StreamDelta)
 	var streamErr error
+	var refusedUsage *ir.Usage
 	done := make(chan struct{})
 
 	go func() {
@@ -130,6 +132,18 @@ func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, 
 		defer close(done)
 		defer func() { _ = resp.Body.Close() }()
 
+		// After a strict refusal nothing more is forwarded, but the rest of
+		// the turn is read so the usage the upstream bills for a finished
+		// turn can still be metered.
+		var finished bool
+		var billed *ir.Usage
+		note := func(payload string) {
+			f, u := translate.ChatTurnReport([]byte(payload))
+			finished = finished || f
+			if u != nil {
+				billed = u
+			}
+		}
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for sc.Scan() {
@@ -138,10 +152,18 @@ func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, 
 				continue
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if streamErr != nil {
+				if payload == "[DONE]" {
+					break
+				}
+				note(payload)
+				continue
+			}
 			if strict && payload != "[DONE]" {
 				if err := translate.ValidateChatResponsesSubset([]byte(payload), true); err != nil {
 					streamErr = err
-					return
+					note(payload)
+					continue
 				}
 			}
 			delta, isDone, derr := translate.DecodeStreamChunk([]byte(payload))
@@ -150,7 +172,13 @@ func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, 
 			}
 			if derr != nil {
 				streamErr = derr
-				return
+				if !strict {
+					return
+				}
+				continue
+			}
+			if strict {
+				note(payload)
 			}
 			select {
 			case deltas <- delta:
@@ -160,7 +188,13 @@ func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, 
 			}
 		}
 		if err := sc.Err(); err != nil {
-			streamErr = fmt.Errorf("gateway/upstream: read stream: %w", err)
+			if streamErr == nil {
+				streamErr = fmt.Errorf("gateway/upstream: read stream: %w", err)
+			}
+			return
+		}
+		if streamErr != nil && finished {
+			refusedUsage = billed
 		}
 	}()
 
@@ -169,6 +203,10 @@ func (u *OpenAICompat) readStreamMode(ctx context.Context, resp *http.Response, 
 		Err: func() error {
 			<-done
 			return streamErr
+		},
+		RefusedUsage: func() *ir.Usage {
+			<-done
+			return refusedUsage
 		},
 	}
 }

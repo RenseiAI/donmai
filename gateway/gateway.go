@@ -293,15 +293,6 @@ func (g *Gateway) DispatchProtocol(ctx context.Context, tok token.Token, protoco
 		return surface.Outcome{}, &surface.HTTPError{Status: http.StatusServiceUnavailable, Code: "no_credential", Message: "no upstream credential available"}
 	}
 
-	out, err := rt.upstream.Invoke(ctx, req, cred)
-	rt.pool.Report(cred, out.Status)
-	if err != nil {
-		// Transport errors can contain the complete request URL, and provider
-		// error bodies are not a safe client-facing surface. Preserve only the
-		// classified status and code across the gateway trust boundary.
-		return surface.Outcome{}, &surface.HTTPError{Status: clientStatus(out.Status), Code: "upstream_error", Message: "upstream request failed"}
-	}
-
 	model := rt.model
 	if model == "" {
 		model = req.Model
@@ -322,6 +313,20 @@ func (g *Gateway) DispatchProtocol(ctx context.Context, tok token.Token, protoco
 			RawCostUSD:      0, // M1: token-only ledger; a price table lands with the platform cost ingest
 			EmittedAt:       g.now().UTC(),
 		})
+	}
+
+	out, err := rt.upstream.Invoke(ctx, req, cred)
+	rt.pool.Report(cred, out.Status)
+	if err != nil {
+		// A refused reply that finished a billed turn is still a cost: it is
+		// recorded once here, because the surface never sees this exchange.
+		if out.RefusedUsage != nil {
+			meter(*out.RefusedUsage, "")
+		}
+		// Transport errors can contain the complete request URL, and provider
+		// error bodies are not a safe client-facing surface. Preserve only the
+		// classified status and code across the gateway trust boundary.
+		return surface.Outcome{}, &surface.HTTPError{Status: clientStatus(out.Status), Code: "upstream_error", Message: "upstream request failed"}
 	}
 
 	return surface.Outcome{Stream: out.Stream, Response: out.Response, Model: model, Meter: meter}, nil

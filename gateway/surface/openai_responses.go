@@ -164,7 +164,6 @@ func (h *OpenAIResponses) stream(ctx context.Context, w http.ResponseWriter, out
 	tools := map[int]*chatSlot{}
 	var streamFailure bool
 	var native bool
-	var upstreamDone bool
 streamLoop:
 	for {
 		var delta ir.StreamDelta
@@ -174,7 +173,6 @@ streamLoop:
 			return
 		case next, ok := <-out.Stream.Deltas:
 			if !ok {
-				upstreamDone = true
 				break streamLoop
 			}
 			delta = next
@@ -197,7 +195,7 @@ streamLoop:
 				if !streamFailure && !send(event) {
 					streamFailure = true
 				}
-			case event.Kind == "response.completed":
+			case event.Kind == "response.completed" || event.Kind == "response.incomplete":
 				if completed != nil {
 					streamFailure = true
 					continue
@@ -205,6 +203,9 @@ streamLoop:
 				terminal := event
 				completed = &terminal
 				usage = event.Usage // sent only after Stream.Err is known
+				if event.Response != nil {
+					finish = event.Response.FinishReason
+				}
 			default:
 				if !streamFailure && !send(event) {
 					streamFailure = true
@@ -286,11 +287,19 @@ streamLoop:
 	if !native {
 		finished = chatFinished(finish)
 	}
-	// An upstream that ended on its own with a finished turn and reported
-	// usage is metered exactly once, whatever the client is served. A failed,
-	// truncated or cancelled upstream stream has no usage to meter.
-	if upstreamDone && !upstreamFailed && finished && usage != nil && out.Meter != nil {
-		defer out.Meter(*usage, finish)
+	// An upstream that finished its turn and reported usage is metered
+	// exactly once, whatever the client is served: on a clean stream from the
+	// terminal it reported, and on a stream the reader refused from the usage
+	// the upstream still billed. A truncated or cancelled stream that never
+	// finished has no usage to meter.
+	if out.Meter != nil {
+		if !upstreamFailed && finished && usage != nil {
+			defer out.Meter(*usage, finish)
+		} else if upstreamFailed && out.Stream.RefusedUsage != nil {
+			if billed := out.Stream.RefusedUsage(); billed != nil {
+				defer out.Meter(*billed, "")
+			}
+		}
 	}
 	if streamFailure || upstreamFailed || ctx.Err() != nil || !finished || usage == nil || !created {
 		failed()

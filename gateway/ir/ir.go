@@ -327,4 +327,9 @@ type Stream struct {
 	// Err returns any terminal error observed after Deltas closed. Safe to
 	// call only after the Deltas channel is drained.
 	Err func() error
+	// RefusedUsage returns the usage the upstream reported for a turn it
+	// finished after the reader refused the stream, so a billed turn is
+	// metered even though the client is served a failure. Nil (or a nil
+	// result) when the upstream reported none. Same calling rule as Err.
+	RefusedUsage func() *Usage
 }

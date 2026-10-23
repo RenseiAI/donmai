@@ -288,7 +288,8 @@ func TestGatewayResponsesFailuresNeverMeterSuccess(t *testing.T) {
 
 // TestGatewayResponsesUndecodableSuccessIsBadGateway pins that a 2xx
 // upstream reply the codec cannot represent reaches the client as 502 Bad
-// Gateway, never as a 200 carrying an error body, and is never metered.
+// Gateway, never as a 200 carrying an error body, while the turn the backend
+// billed is metered exactly once.
 func TestGatewayResponsesUndecodableSuccessIsBadGateway(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -302,8 +303,8 @@ func TestGatewayResponsesUndecodableSuccessIsBadGateway(t *testing.T) {
 	if status != http.StatusBadGateway || strings.Contains(body, "tool_search_call") {
 		t.Fatalf("undecodable 2xx reply status=%d body=%s", status, body)
 	}
-	if rows := sink.Events(); len(rows) != 0 {
-		t.Fatalf("undecodable reply metered %+v", rows)
+	if rows := waitEvents(t, sink, 1); len(rows) != 1 || rows[0].TokensIn != 1 || rows[0].TokensOut != 1 {
+		t.Fatalf("billed undecodable reply meter=%+v", rows)
 	}
 }
 

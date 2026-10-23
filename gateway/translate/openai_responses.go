@@ -118,7 +118,7 @@ func decodeResponseItemMode(body json.RawMessage, partial bool) (ir.Item, error)
 	if err := validateResponseItemFields(body, w.Type); err != nil {
 		return ir.Item{}, err
 	}
-	if w.Type != "web_search_call" && w.Status != "" && w.Status != "completed" && !(partial && w.Status == "in_progress") {
+	if w.Type != "web_search_call" && w.Status != "" && w.Status != "completed" && w.Status != "incomplete" && !(partial && w.Status == "in_progress") {
 		return ir.Item{}, ErrResponsesUnsupported
 	}
 	item := ir.Item{
@@ -645,8 +645,14 @@ func DecodeResponsesResponse(body []byte) (ir.Response, error) {
 	if err := strictJSON(body, &w); err != nil {
 		return ir.Response{}, ErrResponsesUnsupported
 	}
-	if w.ID == "" || w.Status != "completed" || validateResponseEnvelope(w) != nil {
+	// Only a turn the backend ended is admitted: completed, or incomplete
+	// with its reason. A failed or still-running response is never decoded.
+	if w.ID == "" || w.Status != "completed" && w.Status != "incomplete" || validateResponseEnvelope(w) != nil {
 		return ir.Response{}, ErrResponsesUnsupported
+	}
+	incomplete, err := responsesIncompleteFinish(w)
+	if err != nil {
+		return ir.Response{}, err
 	}
 	u, err := usageFromResponses(w.Usage)
 	if err != nil {
@@ -663,7 +669,36 @@ func DecodeResponsesResponse(body []byte) (ir.Response, error) {
 			out.FinishReason = ir.FinishToolCalls
 		}
 	}
+	if incomplete != "" {
+		out.FinishReason = incomplete
+	}
 	return out, nil
+}
+
+// responsesIncompleteFinish maps an incomplete envelope onto its canonical
+// finish. A completed envelope yields ""; an incomplete one must name a
+// reason the IR carries, and incomplete details on any other status refuse.
+func responsesIncompleteFinish(w responsesWireResponse) (ir.FinishReason, error) {
+	if w.Status != "incomplete" {
+		if len(w.IncompleteDetails) > 0 && !nullJSON(w.IncompleteDetails) {
+			return "", ErrResponsesUnsupported
+		}
+		return "", nil
+	}
+	var details struct {
+		Reason string `json:"reason"`
+	}
+	if err := strictJSON(w.IncompleteDetails, &details); err != nil {
+		return "", ErrResponsesUnsupported
+	}
+	switch details.Reason {
+	case "max_output_tokens":
+		return ir.FinishLength, nil
+	case "content_filter":
+		return ir.FinishContentFilter, nil
+	default:
+		return "", ErrResponsesUnsupported
+	}
 }
 
 // EncodeResponsesResponse refuses response parts without a lossless Responses
@@ -850,7 +885,7 @@ func DecodeResponsesStreamEvent(body []byte) (ir.ResponsesStreamEvent, error) {
 			return ev, err
 		}
 		ev.Annotation = &annotations[0]
-	case "response.completed":
+	case "response.completed", "response.incomplete":
 		if w.Response == nil || w.Response.ID == "" || validateResponseEnvelope(*w.Response) != nil {
 			return ev, ErrResponsesUnsupported
 		}
@@ -860,8 +895,14 @@ func DecodeResponsesStreamEvent(body []byte) (ir.ResponsesStreamEvent, error) {
 		if err != nil {
 			return ev, err
 		}
-		if w.Response.Status != "" && w.Response.Status != "completed" {
+		// The terminal kind and the snapshot status must agree; an incomplete
+		// terminal carries the reason the canonical finish records.
+		if w.Type == "response.completed" && w.Response.Status != "" && w.Response.Status != "completed" ||
+			w.Type == "response.incomplete" && w.Response.Status != "incomplete" {
 			return ev, ErrResponsesUnsupported
+		}
+		if ev.Response.FinishReason, err = responsesIncompleteFinish(*w.Response); err != nil {
+			return ev, err
 		}
 		for _, raw := range w.Response.Output {
 			item, err := decodeResponseItem(raw)
@@ -874,7 +915,7 @@ func DecodeResponsesStreamEvent(body []byte) (ir.ResponsesStreamEvent, error) {
 		ev.Response.UsageReported = true
 		ev.Usage = usage
 		ev.EndTurn = w.Response.EndTurn
-	case "response.failed", "response.incomplete", "response.error":
+	case "response.failed", "response.error":
 		return ev, ErrResponsesUnsupported
 	default:
 		return ev, ErrResponsesUnsupported
@@ -885,7 +926,7 @@ func DecodeResponsesStreamEvent(body []byte) (ir.ResponsesStreamEvent, error) {
 func validateResponseEventFields(body []byte, kind string) error {
 	keys := []string{"type", "sequence_number"}
 	switch kind {
-	case "response.created", "response.in_progress", "response.completed":
+	case "response.created", "response.in_progress", "response.completed", "response.incomplete":
 		keys = append(keys, "response")
 	case "response.output_item.added", "response.output_item.done":
 		keys = append(keys, "output_index", "item")
@@ -1150,7 +1191,7 @@ func validateResponseEnvelope(w responsesWireResponse) error {
 	if w.Object != "" && w.Object != "response" || w.Store != nil && *w.Store || w.Background != nil && *w.Background {
 		return ErrResponsesUnsupported
 	}
-	for _, v := range []json.RawMessage{w.PreviousResponseID, w.Error, w.IncompleteDetails, w.User} {
+	for _, v := range []json.RawMessage{w.PreviousResponseID, w.Error, w.User} {
 		if len(v) > 0 && !bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
 			return ErrResponsesUnsupported
 		}
@@ -1213,10 +1254,19 @@ func applyResponseDetails(w *responsesWireResponse, d *ir.ResponseDetails) error
 //   - carried: choices[0].index, finish_reason, message/delta role, content
 //     and tool_calls, and usage prompt/completion/total tokens;
 //   - envelope metadata, ignored: id, object, created, model,
-//     system_fingerprint, service_tier and obfuscation (stream padding);
-//   - accounting counters, ignored: every other usage member and the members
-//     of prompt_tokens_details and completion_tokens_details, which must be
-//     non-negative integers (breakdowns of the carried totals);
+//     system_fingerprint, service_tier, obfuscation (stream padding) and the
+//     aggregator extensions provider (OpenRouter), x_groq (Groq) and
+//     choices[].native_finish_reason (OpenRouter's raw provider finish);
+//   - content-filter annotations, ignored while nothing was filtered:
+//     prompt_filter_results and choices[].content_filter_results (Azure). A
+//     filtered prompt is refused; filtered output must carry the
+//     content_filter finish, which is served as incomplete;
+//   - carried usage details: prompt_tokens_details.cached_tokens and
+//     completion_tokens_details.reasoning_tokens, which must be non-negative
+//     integers because they reach the cost row;
+//   - accounting, ignored: every other usage member (counters, costs, timings
+//     and flags) as long as it is numeric, boolean or null, or an object or
+//     array of those;
 //   - empty-only: logprobs, refusal, annotations, audio, function_call,
 //     reasoning_content and every other field are admitted only when they
 //     carry nothing (null, "", [], {} or an object of empty members). With
@@ -1237,7 +1287,13 @@ func ValidateChatResponsesSubset(body []byte, stream bool) error {
 		return err
 	}
 	for key, raw := range top {
-		if key != "choices" && key != "usage" && !chatEnvelopeMetadata[key] && !emptyJSON(raw) {
+		switch {
+		case key == "choices", key == "usage", chatEnvelopeMetadata[key]:
+		case key == "prompt_filter_results":
+			if filterBlocked(raw) {
+				return chatFieldRefused(key)
+			}
+		case !emptyJSON(raw):
 			return chatFieldRefused(key)
 		}
 	}
@@ -1271,6 +1327,7 @@ func ValidateChatResponsesSubset(body []byte, stream bool) error {
 var chatEnvelopeMetadata = map[string]bool{
 	"id": true, "object": true, "created": true, "model": true,
 	"system_fingerprint": true, "service_tier": true, "obfuscation": true,
+	"provider": true, "x_groq": true,
 }
 
 // chatFinishCarried lists the finish reasons the Chat decoder maps faithfully.
@@ -1295,6 +1352,8 @@ func validateChatChoice(raw json.RawMessage, stream bool) error {
 	if _, ok := fields[body]; !ok && !stream {
 		return chatFieldRefused("choices[].message")
 	}
+	var finish *string
+	var filtered bool
 	for key, v := range fields {
 		switch key {
 		case "index":
@@ -1303,10 +1362,16 @@ func validateChatChoice(raw json.RawMessage, stream bool) error {
 				return chatFieldRefused("choices[].index")
 			}
 		case "finish_reason":
-			var finish *string
 			if err := json.Unmarshal(v, &finish); err != nil || finish != nil && *finish != "" && !chatFinishCarried[*finish] {
 				return chatFieldRefused("choices[].finish_reason")
 			}
+		case "native_finish_reason":
+			var native *string
+			if err := json.Unmarshal(v, &native); err != nil {
+				return chatFieldRefused("choices[]." + key)
+			}
+		case "content_filter_results":
+			filtered = filterBlocked(v)
 		case body:
 			if err := validateChatMessage(v, stream); err != nil {
 				return err
@@ -1316,6 +1381,10 @@ func validateChatChoice(raw json.RawMessage, stream bool) error {
 				return chatFieldRefused("choices[]." + key)
 			}
 		}
+	}
+	// Filtered output is served only as the content_filter finish it caused.
+	if filtered && (finish == nil || *finish != "content_filter") {
+		return chatFieldRefused("choices[].content_filter_results")
 	}
 	return nil
 }
@@ -1446,12 +1515,14 @@ func validateChatUsageCounters(raw json.RawMessage) error {
 				return err
 			}
 			for detail, counter := range details {
-				if !nullJSON(counter) && !counterJSON(counter) {
+				carried := key == "prompt_tokens_details" && detail == "cached_tokens" ||
+					key == "completion_tokens_details" && detail == "reasoning_tokens"
+				if carried && !nullJSON(counter) && !counterJSON(counter) || !carried && !accountingJSON(counter) {
 					return chatFieldRefused("usage." + key + "." + detail)
 				}
 			}
 		default:
-			if !nullJSON(v) && !counterJSON(v) {
+			if !accountingJSON(v) {
 				return chatFieldRefused("usage." + key)
 			}
 		}
@@ -1494,9 +1565,141 @@ func emptyJSON(raw json.RawMessage) bool {
 	return true
 }
 
+// accountingJSON reports whether raw is accounting data: a number, boolean
+// or null, or an object or array of those. Text is never accounting.
+func accountingJSON(raw json.RawMessage) bool {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	var accounting func(any) bool
+	accounting = func(v any) bool {
+		switch t := v.(type) {
+		case nil, bool, float64:
+			return true
+		case map[string]any:
+			for _, child := range t {
+				if !accounting(child) {
+					return false
+				}
+			}
+			return true
+		case []any:
+			for _, child := range t {
+				if !accounting(child) {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+	}
+	return accounting(v)
+}
+
+// filterBlocked reports whether a content-filter annotation records that
+// anything was filtered; an unreadable annotation counts as filtered.
+func filterBlocked(raw json.RawMessage) bool {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return true
+	}
+	var blocked func(any) bool
+	blocked = func(v any) bool {
+		switch t := v.(type) {
+		case map[string]any:
+			for key, child := range t {
+				if key == "filtered" && child == true || blocked(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range t {
+				if blocked(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return blocked(v)
+}
+
 func counterJSON(raw json.RawMessage) bool {
 	var n int64
 	return json.Unmarshal(raw, &n) == nil && n >= 0
+}
+
+// ChatTurnReport reads, leniently, what a Chat reply or stream chunk reports
+// about its turn: whether a choice finished, and the usage when it is
+// complete and consistent. It lets a reply the bridge refused still be
+// metered for the turn the upstream billed; it never admits content.
+func ChatTurnReport(body []byte) (finished bool, usage *ir.Usage) {
+	var w struct {
+		Choices []struct {
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *ChatUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &w); err != nil {
+		return false, nil
+	}
+	for _, choice := range w.Choices {
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			finished = true
+		}
+	}
+	if w.Usage == nil || validateChatUsagePresence(body, false) != nil ||
+		w.Usage.CompletionDetail != nil && w.Usage.CompletionDetail.ReasoningTokens < 0 ||
+		w.Usage.PromptDetail != nil && w.Usage.PromptDetail.CachedTokens < 0 {
+		return finished, nil
+	}
+	u := usageToIR(w.Usage)
+	return finished, &u
+}
+
+// ResponsesReplyUsage reads, leniently, the usage a native reply reported
+// when it is complete and consistent, or nil. A reply the codec refused is
+// still metered for the turn the backend billed.
+func ResponsesReplyUsage(body []byte) *ir.Usage {
+	var w struct {
+		Usage *responsesWireUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &w); err != nil {
+		return nil
+	}
+	u, err := usageFromResponses(w.Usage)
+	if err != nil {
+		return nil
+	}
+	return u
+}
+
+// ResponsesTerminalUsage reads, leniently, the usage a native terminal event
+// (completed, incomplete or failed) reported for responseID, or nil. A
+// terminal for any other response is not this turn's report.
+func ResponsesTerminalUsage(body []byte, responseID string) *ir.Usage {
+	var w struct {
+		Type     string `json:"type"`
+		Response *struct {
+			ID    string              `json:"id"`
+			Usage *responsesWireUsage `json:"usage"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &w); err != nil || w.Response == nil || responseID == "" || w.Response.ID != responseID {
+		return nil
+	}
+	switch w.Type {
+	case "response.completed", "response.incomplete", "response.failed":
+	default:
+		return nil
+	}
+	u, err := usageFromResponses(w.Response.Usage)
+	if err != nil {
+		return nil
+	}
+	return u
 }
 
 // Presence checks are local to the Responses bridge. The public legacy Chat

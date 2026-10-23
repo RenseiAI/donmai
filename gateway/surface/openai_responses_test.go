@@ -547,3 +547,21 @@ func TestResponsesSurfaceMetersFinishedUpstreamWhateverClientSees(t *testing.T) 
 		})
 	}
 }
+
+// TestResponsesSurfaceStopsForwardingAfterFailure fails a native stream on
+// its first event: nothing the upstream sends afterwards reaches the client
+// before the failure terminal.
+func TestResponsesSurfaceStopsForwardingAfterFailure(t *testing.T) {
+	ch := make(chan ir.StreamDelta, 4)
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.output_text.delta", ItemID: "m", Delta: "early"}}
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.created", ResponseID: "r"}}
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.output_text.delta", ItemID: "m", Delta: "late"}}
+	ch <- ir.StreamDelta{Responses: &ir.ResponsesStreamEvent{Kind: "response.completed", ResponseID: "r", Usage: &ir.Usage{TokensIn: 1, TokensOut: 1}}}
+	close(ch)
+	d := &responsesDispatcher{out: Outcome{Stream: &ir.Stream{Deltas: ch, Err: func() error { return nil }}}}
+	rec := post(t, NewOpenAIResponses(d), "Bearer t", `{"model":"m","input":[],"stream":true}`)
+	body := rec.Body.String()
+	if strings.Contains(body, "late") || strings.Contains(body, "early") || strings.Contains(body, `"type":"response.created"`) || !strings.Contains(body, `"type":"response.failed"`) {
+		t.Fatalf("events forwarded after the stream failed: %s", body)
+	}
+}
