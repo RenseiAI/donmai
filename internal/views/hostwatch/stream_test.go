@@ -91,6 +91,18 @@ func TestFormatStreamLine_Plain(t *testing.T) {
 			want:  "14:02:11 [ENG-1] llm_call  m in 100 out 50 cached 10 turn",
 		},
 		{
+			name:  "llm_call with only cached tokens still renders",
+			ev:    agent.LlmCallEvent{CachedInputTokens: 5},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  cached 5",
+		},
+		{
+			name:  "llm_call with only a zero observed cost still renders",
+			ev:    agent.LlmCallEvent{ObservedCostUsd: f64p(0)},
+			label: "ENG-1",
+			want:  "14:02:11 [ENG-1] llm_call  $0.0000",
+		},
+		{
 			name:  "llm_call synthetic aggregate ignores response model",
 			ev:    agent.LlmCallEvent{Synthetic: true, Model: "requested", ResponseModel: "served", InputTokens: 10, OutputTokens: 5},
 			label: "ENG-1",
