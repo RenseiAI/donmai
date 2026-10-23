@@ -171,7 +171,7 @@ func TestSpawn_Interactive_TrustVerdictStampedOnlyWhenTrusted(t *testing.T) {
 			env := readCapturedFile(t, workdir, "env.txt")
 			if !strings.Contains(env, tc.want) {
 				t.Errorf("captured child env missing %q; got:\n%s", tc.want, env)
-				}
+			}
 		})
 	}
 }
