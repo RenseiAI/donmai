@@ -519,7 +519,7 @@ func TestCheckpointFailedSession_SkipsPushWhenHistoryHidesSecrets(t *testing.T) 
 				// The secret enters only in the merge commit itself (a
 				// conflict resolution or a --no-commit add): the side
 				// branch is clean, so only the merge diff can catch it.
-				gitRun(t, wt, "merge", "--no-commit", "--no-ff", "evil-branch")
+				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "merge", "--no-commit", "--no-ff", "evil-branch")
 				writeFile(t, wt, "evil.txt", "token ghp_faketoken0123456789ab\n")
 				gitRun(t, wt, "add", "-A")
 				gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "merge evil")
@@ -762,7 +762,7 @@ func TestCheckpointFailedSession_EvilMergeNoBaseSkipsPush(t *testing.T) {
 	gitRun(t, wt, "add", "-A")
 	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "clean side")
 	gitRun(t, wt, "checkout", "-q", base)
-	gitRun(t, wt, "merge", "--no-commit", "--no-ff", "evil-branch")
+	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "merge", "--no-commit", "--no-ff", "evil-branch")
 	writeFile(t, wt, "evil.txt", "token ghp_faketoken0123456789ab\n")
 	gitRun(t, wt, "add", "-A")
 	gitRun(t, wt, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "merge evil")
