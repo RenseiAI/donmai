@@ -320,10 +320,17 @@ func TestHeldPastWindowValidation(t *testing.T) {
 			refused: true,
 		},
 		{
-			name: "continuation in fixed-attempt mode",
+			name: "hold in fixed-attempt mode with both predicates",
 			cfg: SessionShimConfig{
 				Orphan: orphan, Readoption: DefaultSessionShimReadoptionPolicy(),
 				LineageLive: alwaysLive, ReadoptionHeldPastWindow: held,
+			},
+		},
+		{
+			name: "hold in fixed-attempt mode without LineageLive",
+			cfg: SessionShimConfig{
+				Orphan: orphan, Readoption: DefaultSessionShimReadoptionPolicy(),
+				ReadoptionHeldPastWindow: held,
 			},
 			refused: true,
 		},

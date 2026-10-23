@@ -820,14 +820,21 @@ type SessionShimConfig struct {
 	// ends with the shim still observable, the daemon starts another window
 	// with the keepalive still armed and the backoff still capped, and a
 	// controller lost again inside the previous window is re-adopted (after
-	// one backoff) instead of quarantined. Nothing else changes. Every attempt
+	// one backoff) instead of quarantined. In fixed-attempt mode the same true
+	// answer holds the lineage past its spent attempt budget instead: the daemon
+	// keeps the orphan keepalive running and retries with capped backoff
+	// indefinitely until the carrier returns or positive evidence ends the
+	// hold (a decisive released answer, an expired credential, a released
+	// lineage, an explicit stop or shutdown). Nothing else changes. Every attempt
 	// still runs the full prepare-and-adopt pipeline, so no carrier is ever
 	// granted without a fresh preparation, and the lineage is never more than
 	// adopted at its retained revision. The moment the predicate answers false
 	// — or LineageLive does, or the shim stops being observable — the window
 	// ends the ordinary way: OnReadoptionWindowExhausted, then the
 	// unconditional withdrawal (ADR-2026-09-03-readoption-exhaustion-withdraws,
-	// amendment 2026-10-21).
+	// amendment 2026-10-21). A fixed-attempt hold ends the same way the bounded
+	// budget would, under the spent-budget detail, except through the
+	// decisive-release and credential-expiry sentinels, which withdraw at once.
 	//
 	// It must answer FALSE on any error, timeout, or uncertainty, and must not
 	// block past its context or panic (a panic is recovered and read as false).
@@ -835,12 +842,12 @@ type SessionShimConfig struct {
 	// external release bound — a dispatched, non-interactive run is the usual
 	// one — so an embedder never wires it session-class-blind.
 	//
-	// Nil keeps the bounded window, which is the OSS default. It is consulted
-	// only together with LineageLive (configuration is refused without it, and
-	// outside ReadoptionLineageLive mode), at every window end, on every
-	// attempt and every paced keepalive tick once a window has been continued,
-	// and on a re-entry inside the previous window. It runs off the daemon's
-	// lock, under its own bounded context.
+	// Nil keeps the bounded behaviour, which is the OSS default. It is consulted
+	// only together with LineageLive (configuration is refused without it), at
+	// every window end, on every attempt and every paced keepalive tick once a
+	// window has been continued, on a re-entry inside the previous window, and
+	// past a spent fixed-attempt budget. It runs off the daemon's lock, under
+	// its own bounded context.
 	ReadoptionHeldPastWindow func(context.Context, sessionshim.Identity) bool
 
 	// OnReadoptionWindowExhausted runs exactly once when a ReadoptionLineageLive
@@ -1975,7 +1982,9 @@ func (d *Daemon) sessionResumeKey(sessionID, organizationID string) (*sessionshi
 // Continuing is not keeping. SessionShimConfig.ReadoptionHeldPastWindow lets a
 // composing layer that holds a lineage without an external release bound — an
 // interactive session nobody asked to stop — start another window instead of
-// exhausting this one (amendment 2026-10-21). The keepalive, the liveness
+// exhausting this one (amendment 2026-10-21). In fixed-attempt mode the same
+// predicate holds the lineage past its spent budget instead, with the
+// keepalive running and capped backoff. The keepalive, the liveness
 // gate, and the attempts all keep running, so the lineage is still under the
 // same observation that would withdraw it the instant any of them fails; it is
 // never an adopted entry nothing is watching.
@@ -1997,7 +2006,8 @@ type SessionShimReadoptionPolicy struct {
 	// in ReadoptionLineageLive mode, where nothing reads it.
 	Attempts int
 	// Backoff is the delay before the second attempt; each later attempt
-	// doubles it, capped at BackoffCap in lineage-live mode. Zero uses
+	// doubles it, capped at BackoffCap in lineage-live mode and in a
+	// fixed-attempt hold past its budget. Zero uses
 	// defaultSessionShimReadoptionBackoff.
 	Backoff time.Duration
 	// AttemptTimeout bounds ONE attempt end to end — dial, prepare, durable
@@ -2058,6 +2068,23 @@ func (m SessionShimReadoptionMode) String() string {
 // when a carrier fault arrives: a policy that silently loses re-adoption is
 // discovered during the incident it was configured to survive.
 var ErrSessionShimReadoptionPolicy = errors.New("session shim: invalid re-adoption policy")
+
+// ErrSessionShimLineageReleased reports a decisive, authenticated control-plane
+// answer that the lineage is released or ended. It is the one OnAdoption
+// refusal that ends a held lineage at once: unlike timeouts, 5xx, connection
+// refused, or relay draining — all of which carry no fact about the lineage —
+// a released answer is positive evidence the session should end, so the hold
+// withdraws rather than retries. An embedder returns it (wrapped with %w) from
+// OnAdoption or OnAdoptionV2 when the control plane authoritatively answers
+// released or ended for this lineage.
+var ErrSessionShimLineageReleased = errors.New("session shim: lineage released by the control plane")
+
+// ErrSessionShimCredentialExpired reports that a credential the hold may not
+// extend has expired on its own schedule. A hold never grants anything new
+// and never extends credential lifetime: an expired credential ends the hold
+// even when the shim is still observable and the composing layer still holds
+// the lineage.
+var ErrSessionShimCredentialExpired = errors.New("session shim: credential expired")
 
 // Validate refuses a policy whose fields belong to a mode it is not in.
 //
@@ -2223,13 +2250,17 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 		if policy.Attempts <= 0 {
 			policy.Attempts = defaultSessionShimReadoptionAttempts
 		}
+		// No BackoffCap default here: a configured value stays refused in
+		// fixed mode, and the fixed-attempt hold reads the default itself
+		// when the resolved value is zero.
 	}
 	return policy
 }
 
-// validateReadoptionAgainstOrphanPolicy refuses the two lineage-live
-// configurations that only a policy and its orphan policy TOGETHER can be seen
-// to be wrong. Validate cannot make these checks: it is a method on the policy
+// validateReadoptionAgainstOrphanPolicy refuses the configurations that only
+// a policy and its orphan policy TOGETHER can be seen to be wrong — a
+// lineage-live window, or a fixed-attempt hold past its budget, whose
+// keepalive re-arms the orphan deadline. Validate cannot make these checks: it is a method on the policy
 // and neither the orphan deadline nor the composing seams are in scope there.
 //
 // The first is the §D8 inequality itself. OrphanPolicy.Validate enforces
@@ -2256,21 +2287,24 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 	policy := c.readoption()
 	if c.ReadoptionHeldPastWindow != nil {
-		// Continuation past the window is only meaningful for a window, and it
-		// is only safe while the composing layer can also say it still holds the
+		// A hold past the bound is only meaningful for a bound, and it is only
+		// safe while the composing layer can also say it still holds the
 		// lineage at all: a standalone daemon's "yes, always" LineageLive would
-		// turn a continuation into a re-adoption nothing could ever release.
-		if policy.Disabled || policy.Mode != ReadoptionLineageLive {
-			return fmt.Errorf("%w: ReadoptionHeldPastWindow continues a %s window and is meaningless in %s mode (disabled=%t)",
-				ErrSessionShimReadoptionPolicy, ReadoptionLineageLive, policy.Mode, policy.Disabled)
+		// turn a hold into a re-adoption nothing could ever release. In
+		// lineage-live mode the bound is the window, which continues in place;
+		// in fixed-attempt mode it is the attempt budget, past which the
+		// daemon holds with the keepalive running and capped backoff.
+		if policy.Disabled || (policy.Mode != ReadoptionLineageLive && policy.Mode != ReadoptionFixedAttempts) {
+			return fmt.Errorf("%w: ReadoptionHeldPastWindow holds a %s lineage past its bound and is meaningless in %s mode (disabled=%t)",
+				ErrSessionShimReadoptionPolicy, policy.Mode, policy.Mode, policy.Disabled)
 		}
 		if c.LineageLive == nil {
-			return fmt.Errorf("%w: ReadoptionHeldPastWindow requires SessionShimConfig.LineageLive; continuing a window "+
+			return fmt.Errorf("%w: ReadoptionHeldPastWindow requires SessionShimConfig.LineageLive; holding a lineage "+
 				"for a lineage nothing above this daemon can release would never end while the shim lives",
 				ErrSessionShimReadoptionPolicy)
 		}
 	}
-	if policy.Disabled || policy.Mode != ReadoptionLineageLive {
+	if policy.Disabled || (policy.Mode != ReadoptionLineageLive && c.ReadoptionHeldPastWindow == nil) {
 		return nil
 	}
 	if c.Orphan.ExternalReleaseThreshold > 0 && c.LineageLive == nil {
@@ -3515,7 +3549,7 @@ func validateSessionShimAdoptionPreparationResult(
 			return errors.New("session shim: adopted-candidate recovery disposition is not exact")
 		}
 		if recovery.CredentialExpiresAt.IsZero() || !recovery.CredentialExpiresAt.After(now) {
-			return errors.New("session shim: adopted-candidate recovery original credential is expired")
+			return fmt.Errorf("%w: adopted-candidate recovery original credential is expired", ErrSessionShimCredentialExpired)
 		}
 		return nil
 	default:
