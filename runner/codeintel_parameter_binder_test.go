@@ -413,6 +413,51 @@ func TestNativeFactsRefuseSurfaceConfigDivergenceWithValidDigests(t *testing.T) 
 	}
 }
 
+// nativeFactsOtherRepoConfig builds a self-consistent rogue config carrying
+// the same admitted tools under a different subtree, for divergence probes.
+func nativeFactsOtherRepoConfig(t *testing.T, resolved ResolvedCapabilityParameterBinding) (json.RawMessage, string) {
+	t.Helper()
+	base, _, err := codeintelbridge.DecodeRuntimeConfig(resolved.Materialization.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, digest, err := codeintelbridge.CanonicalRuntimeConfig(codeintelbridge.RuntimeConfigV1{ContractVersion: codeintelbridge.RuntimeConfigVersion, RepoPath: "other", Tools: base.Tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw, digest
+}
+
+func TestNativeFactsRefuseMaterializationConfigDigestMismatch(t *testing.T) {
+	_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
+	rogueRaw, rogueDigest := nativeFactsOtherRepoConfig(t, resolved)
+	mutated := resolved
+	mutated.Materialization.Config = rogueRaw
+	mutated.Materialization.ConfigDigest = rogueDigest
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", mutated); err == nil || !strings.Contains(err.Error(), "binding identity differs") {
+		t.Fatalf("materialization config drift compiled: err=%v", err)
+	}
+}
+
+func TestNativeFactsRefuseMaterializationCapabilityMismatch(t *testing.T) {
+	_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
+	mutated := resolved
+	mutated.Materialization.CapabilityID = "example.other/v1"
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", mutated); err == nil || !strings.Contains(err.Error(), "binding identity differs") {
+		t.Fatalf("materialization capability drift compiled: err=%v", err)
+	}
+}
+
+func TestNativeFactsRefuseStaleMaterializationConfig(t *testing.T) {
+	_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
+	rogueRaw, _ := nativeFactsOtherRepoConfig(t, resolved)
+	mutated := resolved
+	mutated.Materialization.Config = rogueRaw
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", mutated); err == nil || !strings.Contains(err.Error(), "config differs") {
+		t.Fatalf("stale materialization config compiled: err=%v", err)
+	}
+}
+
 func TestNativeFactsRefusePolicyAndMismatch(t *testing.T) {
 	registry, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
 	unknownRaw := `{"codeIntel":{"tools":["no_such_tool"]}}`
