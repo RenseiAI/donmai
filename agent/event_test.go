@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -325,5 +326,209 @@ func TestEvent_GenerationIDWire(t *testing.T) {
 		} else if string(got) != `["response-one"]` {
 			t.Fatalf("wire generationIds = %s; want response-one", got)
 		}
+	}
+}
+
+func usageIntPtr(n int64) *int64       { return &n }
+func usageFloatPtr(f float64) *float64 { return &f }
+
+// canonicalInferenceUsage is the AC-1 golden fixture: one logical inference
+// with two ordered attempts, identities, model/route/auth metadata, token
+// classes, status, an explicit zero (attempt-2 cached input), and an absent
+// class (cache write, absent at every level).
+func canonicalInferenceUsage() *LlmInferenceUsage {
+	return &LlmInferenceUsage{
+		Version: LlmInferenceUsageVersionV2, InferenceID: "inf-9f2",
+		Evidence: LlmInferenceEvidenceProvider, Completeness: LlmInferenceCompletenessComplete, Status: LlmInferenceStatusSucceeded,
+		Provider: "anthropic", GenerationID: "resp-7",
+		RequestedModel: "claude-opus-4", ResolvedModel: "claude-opus-4-20260701",
+		Route: "responses", Auth: "api_key",
+		LlmInferenceCounts: LlmInferenceCounts{
+			InputTokens: usageIntPtr(120), OutputTokens: usageIntPtr(45),
+			CachedInputTokens: usageIntPtr(80), ReasoningTokens: usageIntPtr(12),
+			NativeCostUsd: usageFloatPtr(0.75),
+		},
+		Attempts: []LlmInferenceAttempt{
+			{
+				AttemptID: "att-1", Ordinal: 1, StartTimeUnixNano: "1719600000000000000", EndTimeUnixNano: "1719600001000000000",
+				LlmInferenceCounts: LlmInferenceCounts{InputTokens: usageIntPtr(100), OutputTokens: usageIntPtr(30), CachedInputTokens: usageIntPtr(80), ReasoningTokens: usageIntPtr(10), NativeCostUsd: usageFloatPtr(0.5)},
+			},
+			{
+				AttemptID: "att-2", Ordinal: 2, StartTimeUnixNano: "1719600001000000000", EndTimeUnixNano: "1719600002500000000",
+				LlmInferenceCounts: LlmInferenceCounts{InputTokens: usageIntPtr(20), OutputTokens: usageIntPtr(15), CachedInputTokens: usageIntPtr(0), ReasoningTokens: usageIntPtr(2), NativeCostUsd: usageFloatPtr(0.25)},
+			},
+		},
+	}
+}
+
+// usageV2Golden is the exact wire shape the canonical fixture must produce.
+const usageV2Golden = `{"kind":"llm_call","generationId":"resp-7","system":"anthropic","model":"claude-opus-4",` +
+	`"finishReason":"end_turn","usageSource":"provider","usageV2":{"version":"v2","inferenceId":"inf-9f2",` +
+	`"evidence":"provider","completeness":"complete","status":"succeeded","provider":"anthropic","generationId":"resp-7",` +
+	`"requestedModel":"claude-opus-4","resolvedModel":"claude-opus-4-20260701","route":"responses","auth":"api_key",` +
+	`"inputTokens":120,"outputTokens":45,"cachedInputTokens":80,"reasoningTokens":12,"nativeCostUsd":0.75,` +
+	`"attempts":[{"attemptId":"att-1","ordinal":1,"startTimeUnixNano":"1719600000000000000","endTimeUnixNano":"1719600001000000000",` +
+	`"inputTokens":100,"outputTokens":30,"cachedInputTokens":80,"reasoningTokens":10,"nativeCostUsd":0.5},` +
+	`{"attemptId":"att-2","ordinal":2,"startTimeUnixNano":"1719600001000000000","endTimeUnixNano":"1719600002500000000",` +
+	`"inputTokens":20,"outputTokens":15,"cachedInputTokens":0,"reasoningTokens":2,"nativeCostUsd":0.25}]}}`
+
+// TestLlmCallEvent_UsageV2RoundTrip pins the canonical usage-v2 wire shape
+// and proves explicit zero stays present while the absent class stays absent.
+func TestLlmCallEvent_UsageV2RoundTrip(t *testing.T) {
+	t.Parallel()
+	in := LlmCallEvent{
+		GenerationID: "resp-7", System: "anthropic", Model: "claude-opus-4",
+		FinishReason: "end_turn", UsageSource: LlmUsageProvider, UsageV2: canonicalInferenceUsage(),
+	}
+	wire, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	var got, want map[string]any
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	if err := json.Unmarshal([]byte(usageV2Golden), &want); err != nil {
+		t.Fatalf("golden: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("wire mismatch:\n got=%s\nwant=%s", wire, usageV2Golden)
+	}
+	usage := got["usageV2"].(map[string]any)
+	attempts := usage["attempts"].([]any)
+	first := attempts[0].(map[string]any)
+	second := attempts[1].(map[string]any)
+	if zero, ok := second["cachedInputTokens"]; !ok || zero != float64(0) {
+		t.Fatalf("explicit zero lost: %v", second)
+	}
+	for _, m := range []map[string]any{usage, first, second} {
+		if _, ok := m["cacheWriteTokens"]; ok {
+			t.Fatalf("absent class leaked onto the wire: %v", m)
+		}
+	}
+	out, err := UnmarshalEvent(wire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent: %v", err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("round-trip mismatch:\n got=%+v\nwant=%+v", out, in)
+	}
+}
+
+// TestLlmCallEvent_UsageV2Invalid pins fail-closed validation on both codec
+// directions: every case must be rejected by MarshalEvent and by decode.
+func TestLlmCallEvent_UsageV2Invalid(t *testing.T) {
+	t.Parallel()
+	nan := math.NaN()
+	inf := math.Inf(1)
+	cases := []struct {
+		name   string
+		mutate func(*LlmInferenceUsage)
+	}{
+		{"unknown version", func(u *LlmInferenceUsage) { u.Version = "v9" }},
+		{"empty version", func(u *LlmInferenceUsage) { u.Version = "" }},
+		{"empty inference id", func(u *LlmInferenceUsage) { u.InferenceID = "" }},
+		{"unknown evidence", func(u *LlmInferenceUsage) { u.Evidence = "gossip" }},
+		{"unknown completeness", func(u *LlmInferenceUsage) { u.Completeness = "mostly" }},
+		{"unknown status", func(u *LlmInferenceUsage) { u.Status = "pending" }},
+		{"negative input", func(u *LlmInferenceUsage) { u.InputTokens = usageIntPtr(-1) }},
+		{"negative cache write", func(u *LlmInferenceUsage) { u.CacheWriteTokens = usageIntPtr(-2) }},
+		{"negative charge", func(u *LlmInferenceUsage) { u.NativeCostUsd = usageFloatPtr(-0.5) }},
+		{"nan charge", func(u *LlmInferenceUsage) { u.NativeCostUsd = &nan }},
+		{"inf charge", func(u *LlmInferenceUsage) { u.NativeCostUsd = &inf }},
+		{"reasoning above output", func(u *LlmInferenceUsage) { u.ReasoningTokens = usageIntPtr(46) }},
+		{"attempt reasoning above output", func(u *LlmInferenceUsage) { u.Attempts[0].ReasoningTokens = usageIntPtr(31) }},
+		{"no attempts", func(u *LlmInferenceUsage) { u.Attempts = nil }},
+		{"empty attempt id", func(u *LlmInferenceUsage) { u.Attempts[1].AttemptID = "" }},
+		{"duplicate attempt id", func(u *LlmInferenceUsage) { u.Attempts[1].AttemptID = "att-1" }},
+		{"zero ordinal", func(u *LlmInferenceUsage) { u.Attempts[0].Ordinal = 0 }},
+		{"duplicate ordinal", func(u *LlmInferenceUsage) { u.Attempts[1].Ordinal = 1 }},
+		{"ordinal gap", func(u *LlmInferenceUsage) { u.Attempts[1].Ordinal = 3 }},
+		{"unordered ordinals", func(u *LlmInferenceUsage) { u.Attempts[0].Ordinal, u.Attempts[1].Ordinal = 2, 1 }},
+		{"reversed timestamps", func(u *LlmInferenceUsage) { u.Attempts[0].EndTimeUnixNano = "1719599999000000000" }},
+		{"malformed timestamp", func(u *LlmInferenceUsage) { u.Attempts[0].StartTimeUnixNano = "soon" }},
+		{"complete total mismatch", func(u *LlmInferenceUsage) { u.InputTokens = usageIntPtr(121) }},
+		{"complete logical absent", func(u *LlmInferenceUsage) { u.OutputTokens = nil }},
+		{"complete attempt absent", func(u *LlmInferenceUsage) { u.Attempts[1].CachedInputTokens = nil }},
+		{"complete charge mismatch", func(u *LlmInferenceUsage) { u.NativeCostUsd = usageFloatPtr(0.76) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			u := canonicalInferenceUsage()
+			tc.mutate(u)
+			ev := LlmCallEvent{UsageSource: LlmUsageProvider, UsageV2: u}
+			if _, err := MarshalEvent(ev); err == nil {
+				t.Fatalf("MarshalEvent accepted %s", tc.name)
+			}
+			raw, err := json.Marshal(ev)
+			if err != nil {
+				return // non-finite charges cannot ride JSON; marshal already refused
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatalf("re-decode: %v", err)
+			}
+			fields["kind"] = string(EventLlmCall)
+			raw, err = json.Marshal(fields)
+			if err != nil {
+				t.Fatalf("re-encode: %v", err)
+			}
+			if _, err := UnmarshalEvent(raw); err == nil {
+				t.Fatalf("UnmarshalEvent accepted %s", tc.name)
+			}
+		})
+	}
+}
+
+// TestLlmCallEvent_UsageV2LegacyCompatibility proves additive compatibility:
+// legacy llm_call JSON decodes without the group, and a test-local old
+// projection ignores the group in new JSON.
+func TestLlmCallEvent_UsageV2LegacyCompatibility(t *testing.T) {
+	t.Parallel()
+	legacy := `{"kind":"llm_call","generationId":"resp-legacy","system":"anthropic","model":"claude-opus-4",` +
+		`"inputTokens":10,"outputTokens":5,"finishReason":"end_turn","usageSource":"provider"}`
+	ev, err := UnmarshalEvent([]byte(legacy))
+	if err != nil {
+		t.Fatalf("UnmarshalEvent legacy: %v", err)
+	}
+	call, ok := ev.(LlmCallEvent)
+	if !ok {
+		t.Fatalf("legacy decoded as %T", ev)
+	}
+	if call.UsageV2 != nil {
+		t.Fatalf("legacy UsageV2 = %+v, want nil", call.UsageV2)
+	}
+	if call.InputTokens != 10 || call.OutputTokens != 5 || call.UsageSource != LlmUsageProvider {
+		t.Fatalf("legacy scalars changed: %+v", call)
+	}
+	wire, err := MarshalEvent(call)
+	if err != nil {
+		t.Fatalf("MarshalEvent legacy: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(wire, &fields); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	if _, ok := fields["usageV2"]; ok {
+		t.Fatalf("legacy marshal emits usageV2: %s", wire)
+	}
+	type legacyLlmCall struct {
+		GenerationID string         `json:"generationId,omitempty"`
+		System       string         `json:"system,omitempty"`
+		Model        string         `json:"model,omitempty"`
+		InputTokens  int64          `json:"inputTokens,omitempty"`
+		UsageSource  LlmUsageSource `json:"usageSource"`
+	}
+	fresh, err := MarshalEvent(LlmCallEvent{GenerationID: "resp-7", System: "anthropic", Model: "claude-opus-4", UsageSource: LlmUsageProvider, UsageV2: canonicalInferenceUsage()})
+	if err != nil {
+		t.Fatalf("MarshalEvent new: %v", err)
+	}
+	var old legacyLlmCall
+	if err := json.Unmarshal(fresh, &old); err != nil {
+		t.Fatalf("old projection: %v", err)
+	}
+	if old.Model != "claude-opus-4" || old.UsageSource != LlmUsageProvider {
+		t.Fatalf("old projection mismatch: %+v", old)
 	}
 }
