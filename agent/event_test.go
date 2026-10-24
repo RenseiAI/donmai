@@ -327,3 +327,59 @@ func TestEvent_GenerationIDWire(t *testing.T) {
 		}
 	}
 }
+
+// TestLlmCallEvent_CostOnlyCumulativeDeltaContract pins the shared-contract
+// exception for interactive cost-only deltas: a non-synthetic provider event
+// carrying only a price (no tokens, no turn, empty generation id) round-trips
+// and is filterable from per-call usage, so spend meters keep it while
+// call counters skip it.
+func TestLlmCallEvent_CostOnlyCumulativeDeltaContract(t *testing.T) {
+	t.Parallel()
+	cost := 0.25
+	delta := LlmCallEvent{ObservedCostUsd: &cost, UsageSource: LlmUsageProvider}
+	if !delta.IsCostOnlyCumulativeDelta() {
+		t.Fatalf("cost-only delta not recognized: %+v", delta)
+	}
+	wire, err := MarshalEvent(delta)
+	if err != nil {
+		t.Fatalf("MarshalEvent cost-only delta: %v", err)
+	}
+	decoded, err := UnmarshalEvent(wire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent cost-only delta: %v", err)
+	}
+	call, ok := decoded.(LlmCallEvent)
+	if !ok {
+		t.Fatalf("decoded type = %T; want LlmCallEvent", decoded)
+	}
+	if !call.IsCostOnlyCumulativeDelta() || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.25 {
+		t.Fatalf("round-trip lost cost-only delta: %+v", call)
+	}
+	// The review wire probe decodes to the same filterable shape.
+	probe, err := UnmarshalEvent([]byte(`{"kind":"llm_call","observedCostUsd":0.25,"usageSource":"provider"}`))
+	if err != nil {
+		t.Fatalf("UnmarshalEvent wire probe: %v", err)
+	}
+	if probeCall, ok := probe.(LlmCallEvent); !ok || !probeCall.IsCostOnlyCumulativeDelta() {
+		t.Fatalf("wire probe not a cost-only delta: %+v", probe)
+	}
+	// Per-call, synthetic, aggregate, turned and identified events are calls
+	// or fallbacks - never cost-only deltas.
+	price := 0.5
+	for _, tc := range []struct {
+		name string
+		ev   LlmCallEvent
+	}{
+		{"per-call tokens", LlmCallEvent{GenerationID: "resp-1", InputTokens: 10, OutputTokens: 5, UsageSource: LlmUsageProvider, TurnCompleted: true}},
+		{"turn only", LlmCallEvent{UsageSource: LlmUsageProvider, TurnCompleted: true}},
+		{"identified", LlmCallEvent{GenerationID: "resp-1", ObservedCostUsd: &price, UsageSource: LlmUsageProvider}},
+		{"tokened price", LlmCallEvent{InputTokens: 1, ObservedCostUsd: &price, UsageSource: LlmUsageProvider}},
+		{"synthetic", LlmCallEvent{ObservedCostUsd: &price, UsageSource: LlmUsageAggregate, Synthetic: true}},
+		{"aggregate", LlmCallEvent{ObservedCostUsd: &price, UsageSource: LlmUsageAggregate}},
+		{"no price", LlmCallEvent{UsageSource: LlmUsageProvider}},
+	} {
+		if tc.ev.IsCostOnlyCumulativeDelta() {
+			t.Fatalf("%s matches as cost-only delta: %+v", tc.name, tc.ev)
+		}
+	}
+}

@@ -237,11 +237,18 @@ func (AssistantTextEvent) isAgentEvent()   {}
 // LlmUsageSource records whether an LlmCallEvent carries usage reported for
 // that exact provider call or a session/turn aggregate copied without
 // apportionment. Consumers must never interpret aggregate usage as a measured
-// per-call value.
+// per-call value. The one provider-labelled exception is the interactive
+// cost-only cumulative delta documented on ObservedCostUsd: it carries only
+// a price and must not be counted as a call (see IsCostOnlyCumulativeDelta).
 type LlmUsageSource string
 
 const (
-	// LlmUsageProvider means the provider reported usage for this exact call.
+	// LlmUsageProvider means the provider reported usage for this exact call,
+	// except for an interactive cost-only cumulative delta: a difference of
+	// two client-side session-cumulative totals that may span several model
+	// calls, carrying only ObservedCostUsd with no tokens, no turn and an
+	// empty generation id. Meters that sum spend keep these deltas;
+	// consumers that count provider events as calls must filter them out.
 	LlmUsageProvider LlmUsageSource = "provider"
 	// LlmUsageAggregate means the provider exposed only a rolled-up total. The
 	// event is necessarily synthetic and preserves that total without dividing
@@ -285,9 +292,14 @@ type LlmCallEvent struct {
 	// never an additive extra (see CostData).
 	ReasoningTokens int64  `json:"reasoningTokens,omitempty"`
 	FinishReason    string `json:"finishReason,omitempty"`
-	// ObservedCostUsd is the provider's price for this exact call. A pointer
-	// distinguishes a reported zero from an absent price. Estimated prices
-	// and aggregate fallbacks must not populate it.
+	// ObservedCostUsd is the provider's price for this exact call, plus the one
+	// interactive cost-only cumulative delta exception: a difference of two
+	// client-side session-cumulative totals that may span several model calls
+	// (no tokens, TurnCompleted false, empty GenerationID, non-synthetic
+	// provider source). A pointer distinguishes a reported zero from an
+	// absent price. Estimated prices and aggregate fallbacks must not
+	// populate it, except for that delta, which sums into spend totals but
+	// must never be counted as a call (see IsCostOnlyCumulativeDelta).
 	ObservedCostUsd *float64 `json:"observedCostUsd,omitempty"`
 	// TurnCompleted is set only by a native completed model-turn event.
 	// Synthetic usage, tool results and text output never set it.
@@ -316,6 +328,23 @@ type LlmCallEvent struct {
 	PromptHash      string `json:"promptHash,omitempty"`
 	ContextHash     string `json:"contextHash,omitempty"`
 	ModelSnapshotID string `json:"modelSnapshotId,omitempty"`
+}
+
+// IsCostOnlyCumulativeDelta reports whether e is an interactive cost-only
+// cumulative delta: a difference of two client-side session-cumulative
+// totals that may span several model calls, carrying only ObservedCostUsd
+// with all token counts zero, TurnCompleted false and an empty GenerationID
+// on a non-synthetic provider event. Meters that sum spend keep these
+// deltas; consumers that count provider events as calls must filter them
+// out. A versioned usage atom on such a delta, if ever attached, must
+// describe aggregate—not per-call—evidence and a partial—not complete—total.
+func (e LlmCallEvent) IsCostOnlyCumulativeDelta() bool {
+	return !e.Synthetic && e.UsageSource == LlmUsageProvider &&
+		e.ObservedCostUsd != nil &&
+		e.InputTokens == 0 && e.OutputTokens == 0 &&
+		e.CachedInputTokens == 0 && e.CacheWriteTokens == 0 &&
+		e.ReasoningTokens == 0 &&
+		!e.TurnCompleted && e.GenerationID == ""
 }
 
 // Kind reports the EventKind discriminant.
