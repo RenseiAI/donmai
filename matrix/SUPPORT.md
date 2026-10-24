@@ -36,9 +36,9 @@ harness-native controls are separate facts.
 | claude-code | a2a | unverified |  |
 | claude-code | architecture_intelligence | unverified |  |
 | claude-code | code_intelligence | unverified |  |
-| claude-code | credential_delivery | supported | cell:claude-code/anthropic/bedrock, cell:claude-code/anthropic/direct, cell:claude-code/anthropic/vertex |
-| claude-code | headless_dispatch | supported | profile:claude-code/headless/tool-lifecycle-v1 |
-| claude-code | interactive_use | supported | profile:claude-code/interactive/tool-lifecycle-v2 |
+| claude-code | credential_delivery | unverified |  |
+| claude-code | headless_dispatch | unverified |  |
+| claude-code | interactive_use | unverified |  |
 | claude-code | local_auth | unverified |  |
 | claude-code | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | claude-code | subagent_control.harnessNativeControls | unverified |  |
@@ -46,9 +46,9 @@ harness-native controls are separate facts.
 | codex | a2a | unverified |  |
 | codex | architecture_intelligence | unverified |  |
 | codex | code_intelligence | unverified |  |
-| codex | credential_delivery | supported | cell:codex/openai/azure, cell:codex/openai/direct |
-| codex | headless_dispatch | supported | profile:codex/headless/tool-lifecycle-v1 |
-| codex | interactive_use | supported | profile:codex/interactive/tool-lifecycle-v1, profile:codex/interactive/tool-lifecycle-v2 |
+| codex | credential_delivery | unverified |  |
+| codex | headless_dispatch | unverified |  |
+| codex | interactive_use | supported | profile:codex/interactive/tool-lifecycle-v2 |
 | codex | local_auth | unverified |  |
 | codex | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | codex | subagent_control.harnessNativeControls | unverified |  |
@@ -56,8 +56,8 @@ harness-native controls are separate facts.
 | gemini-direct | a2a | unverified |  |
 | gemini-direct | architecture_intelligence | unverified |  |
 | gemini-direct | code_intelligence | unverified |  |
-| gemini-direct | credential_delivery | supported | cell:gemini-direct/google/direct, cell:gemini-direct/google/vertex |
-| gemini-direct | headless_dispatch | supported | profile:gemini-direct/gemini-generate/tool-lifecycle-v1 |
+| gemini-direct | credential_delivery | unverified |  |
+| gemini-direct | headless_dispatch | unverified |  |
 | gemini-direct | interactive_use | unverified |  |
 | gemini-direct | local_auth | unverified |  |
 | gemini-direct | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
@@ -66,9 +66,9 @@ harness-native controls are separate facts.
 | muse | a2a | unverified |  |
 | muse | architecture_intelligence | unverified |  |
 | muse | code_intelligence | unverified |  |
-| muse | credential_delivery | supported | cell:muse/meta/direct |
-| muse | headless_dispatch | supported | profile:muse/headless/tool-lifecycle-v1 |
-| muse | interactive_use | supported | profile:muse/interactive/tool-lifecycle-v1 |
+| muse | credential_delivery | unverified |  |
+| muse | headless_dispatch | unverified |  |
+| muse | interactive_use | unverified |  |
 | muse | local_auth | unverified |  |
 | muse | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | muse | subagent_control.harnessNativeControls | unverified |  |
@@ -77,28 +77,28 @@ harness-native controls are separate facts.
 | ollama | architecture_intelligence | unverified |  |
 | ollama | code_intelligence | unverified |  |
 | ollama | credential_delivery | unverified |  |
-| ollama | headless_dispatch | supported | profile:ollama/ollama-chat/tool-lifecycle-v1 |
+| ollama | headless_dispatch | unverified |  |
 | ollama | interactive_use | unverified |  |
-| ollama | local_auth | supported | cell:ollama/local/local |
+| ollama | local_auth | unverified |  |
 | ollama | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | ollama | subagent_control.harnessNativeControls | unverified |  |
 | ollama | token_cost_accuracy | unverified |  |
 | opencode | a2a | unverified |  |
 | opencode | architecture_intelligence | unverified |  |
 | opencode | code_intelligence | unverified |  |
-| opencode | credential_delivery | supported | cell:opencode/openai/direct, cell:opencode/openai/gateway |
-| opencode | headless_dispatch | supported | profile:opencode/headless/tool-lifecycle-v1 |
+| opencode | credential_delivery | supported | cell:opencode/openai/direct, smoke:TestOpenCodeHarnessSmoke_RealBinary_SpawnEventStreamTerminal, smoke:TestOpenCodeHarnessSmoke_RealBinary_Teardown |
+| opencode | headless_dispatch | unverified |  |
 | opencode | interactive_use | unverified |  |
-| opencode | local_auth | supported | cell:opencode/google/local |
+| opencode | local_auth | unverified |  |
 | opencode | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | opencode | subagent_control.harnessNativeControls | unverified |  |
 | opencode | token_cost_accuracy | unverified |  |
 | pi | a2a | unverified |  |
 | pi | architecture_intelligence | unverified |  |
 | pi | code_intelligence | unverified |  |
-| pi | credential_delivery | supported | cell:pi/anthropic/direct, cell:pi/openai/direct |
-| pi | headless_dispatch | supported | profile:pi/headless/tool-lifecycle-v2 |
-| pi | interactive_use | supported | profile:pi/interactive/tool-lifecycle-v6 |
+| pi | credential_delivery | unverified |  |
+| pi | headless_dispatch | unverified |  |
+| pi | interactive_use | unverified |  |
 | pi | local_auth | unverified |  |
 | pi | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | pi | subagent_control.harnessNativeControls | unverified |  |
@@ -108,7 +108,7 @@ harness-native controls are separate facts.
 | shell | code_intelligence | unverified |  |
 | shell | credential_delivery | unverified |  |
 | shell | headless_dispatch | unverified |  |
-| shell | interactive_use | supported | profile:shell/interactive/tool-lifecycle-v1 |
+| shell | interactive_use | unverified |  |
 | shell | local_auth | unverified |  |
 | shell | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | shell | subagent_control.harnessNativeControls | unverified |  |
@@ -117,9 +117,9 @@ harness-native controls are separate facts.
 | stub | architecture_intelligence | unverified |  |
 | stub | code_intelligence | unverified |  |
 | stub | credential_delivery | unverified |  |
-| stub | headless_dispatch | supported | profile:stub/tool-lifecycle-v1 |
-| stub | interactive_use | supported | profile:stub/interactive/tool-lifecycle-v1 |
-| stub | local_auth | supported | cell:stub/stub/local |
+| stub | headless_dispatch | unverified |  |
+| stub | interactive_use | unverified |  |
+| stub | local_auth | supported | cell:stub/stub/local, smoke:TestSiblingContextReposSmoke |
 | stub | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | stub | subagent_control.harnessNativeControls | unverified |  |
 | stub | token_cost_accuracy | unverified |  |

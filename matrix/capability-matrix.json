@@ -168,26 +168,15 @@
           },
           {
             "axis": "credential_delivery",
-            "level": "supported",
-            "evidence": [
-              "cell:claude-code/anthropic/bedrock",
-              "cell:claude-code/anthropic/direct",
-              "cell:claude-code/anthropic/vertex"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:claude-code/headless/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
-            "level": "supported",
-            "evidence": [
-              "profile:claude-code/interactive/tool-lifecycle-v2"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "local_auth",
@@ -404,24 +393,16 @@
           },
           {
             "axis": "credential_delivery",
-            "level": "supported",
-            "evidence": [
-              "cell:codex/openai/azure",
-              "cell:codex/openai/direct"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:codex/headless/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
             "level": "supported",
             "evidence": [
-              "profile:codex/interactive/tool-lifecycle-v1",
               "profile:codex/interactive/tool-lifecycle-v2"
             ]
           },
@@ -556,18 +537,11 @@
           },
           {
             "axis": "credential_delivery",
-            "level": "supported",
-            "evidence": [
-              "cell:gemini-direct/google/direct",
-              "cell:gemini-direct/google/vertex"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:gemini-direct/gemini-generate/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
@@ -755,24 +729,15 @@
           },
           {
             "axis": "credential_delivery",
-            "level": "supported",
-            "evidence": [
-              "cell:muse/meta/direct"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:muse/headless/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
-            "level": "supported",
-            "evidence": [
-              "profile:muse/interactive/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "local_auth",
@@ -901,10 +866,7 @@
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:ollama/ollama-chat/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
@@ -912,10 +874,7 @@
           },
           {
             "axis": "local_auth",
-            "level": "supported",
-            "evidence": [
-              "cell:ollama/local/local"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "subagent_control",
@@ -1055,15 +1014,13 @@
             "level": "supported",
             "evidence": [
               "cell:opencode/openai/direct",
-              "cell:opencode/openai/gateway"
+              "smoke:TestOpenCodeHarnessSmoke_RealBinary_SpawnEventStreamTerminal",
+              "smoke:TestOpenCodeHarnessSmoke_RealBinary_Teardown"
             ]
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:opencode/headless/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
@@ -1071,10 +1028,7 @@
           },
           {
             "axis": "local_auth",
-            "level": "supported",
-            "evidence": [
-              "cell:opencode/google/local"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "subagent_control",
@@ -1262,25 +1216,15 @@
           },
           {
             "axis": "credential_delivery",
-            "level": "supported",
-            "evidence": [
-              "cell:pi/anthropic/direct",
-              "cell:pi/openai/direct"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:pi/headless/tool-lifecycle-v2"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
-            "level": "supported",
-            "evidence": [
-              "profile:pi/interactive/tool-lifecycle-v6"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "local_auth",
@@ -1405,10 +1349,7 @@
           },
           {
             "axis": "interactive_use",
-            "level": "supported",
-            "evidence": [
-              "profile:shell/interactive/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "local_auth",
@@ -1581,23 +1522,18 @@
           },
           {
             "axis": "headless_dispatch",
-            "level": "supported",
-            "evidence": [
-              "profile:stub/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "interactive_use",
-            "level": "supported",
-            "evidence": [
-              "profile:stub/interactive/tool-lifecycle-v1"
-            ]
+            "level": "unverified"
           },
           {
             "axis": "local_auth",
             "level": "supported",
             "evidence": [
-              "cell:stub/stub/local"
+              "cell:stub/stub/local",
+              "smoke:TestSiblingContextReposSmoke"
             ]
           },
           {

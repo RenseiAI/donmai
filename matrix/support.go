@@ -311,15 +311,18 @@ func escapeCell(s string) string {
 // carries none. SUPPORT.md v2 and harnesses.json render the same in-memory
 // rows (HarnessRow.SupportV2), never re-derived claims.
 // Evidence (all in Built, all public): profile:<tool-lifecycle id> for
-// headless/interactive; cell:<harness>/<endpoint>/<host> for local-auth and
-// credential delivery; capability:<id>@<adapter>#<mode> for code, A2A,
-// architecture, token/cost, and dispatch-spawned workspaces (adapter must
-// match a harvested profile id+mode); subagent:<cell>@<adapter>#<mode>:<digest>
+// headless/interactive, gated on the profile's own evidence tier
+// (ProductionEligible or a verified tier); cell:<harness>/<endpoint>/<host>
+// plus smoke:<lane> for local-auth and credential delivery, gated on the
+// cell's derived Smoked flag and proving lanes; capability:<id>@<adapter>#<mode>
+// for code, A2A, architecture, token/cost, and dispatch-spawned workspaces
+// (adapter must match a harvested profile id+mode); subagent:<cell>@<adapter>#<mode>:<digest>
 // for harness-native controls (EmitsSubagentEvents AND a non-empty delivery
 // digest — event observation alone never promotes either control fact).
-// Manifest booleans, absent/skipped/malformed/non-qualifying rows stay
-// unverified and never inherit HarnessRow.Caps. Dispatch (capability) and
-// native (subagent) facts are separate and may differ.
+// Manifest booleans, unsmoked cells, unverified tiers, absent/skipped/
+// malformed/non-qualifying rows stay unverified and never inherit
+// HarnessRow.Caps. Dispatch (capability) and native (subagent) facts are
+// separate and may differ.
 
 // HarnessSupportContractVersion pins the per-harness support contract version.
 const HarnessSupportContractVersion = "harness-support/v2"
@@ -455,25 +458,51 @@ func sortedUnique(in []string) []string {
 	return out
 }
 
-// modeDispatchSupport checks one session mode for a non-unsupported lifecycle
-// delivery; all-unsupported is negative evidence, no profile stays unverified.
-// The PTY flag is required only for the interactive mode.
+// isVerifiedDispatchProfile gates a headless/interactive positive on the
+// profile's own evidence: a production-eligible profile or a verified tier.
+// Unit-verified adapter declarations without production eligibility prove
+// nothing and stay unverified.
+func isVerifiedDispatchProfile(profile agent.ToolLifecycleProfile) bool {
+	if profile.ProductionEligible {
+		return true
+	}
+	switch profile.EvidenceTier {
+	case "native_verified", "smoked":
+		return true
+	}
+	return false
+}
+
+// modeDispatchSupport checks one session mode for a verified non-unsupported
+// lifecycle delivery; all-unsupported is negative evidence, an unverified
+// tier or a missing PTY grant stays unverified. The PTY flag is required
+// only for the interactive mode.
 func modeDispatchSupport(h HarnessRow, mode agent.PromptSessionMode, needPTY bool) (SupportLevel, []string) {
 	var positive, negative []string
 	hasMode := false
+	hasUnprovenDelivery := false
 	for _, profile := range h.ToolLifecycle {
 		if profile.Mode != mode {
 			continue
 		}
 		hasMode = true
-		if profile.LifecycleDelivery != agent.ToolDeliveryUnsupported {
-			positive = append(positive, "profile:"+profile.ID)
-		} else {
+		switch {
+		case profile.LifecycleDelivery == agent.ToolDeliveryUnsupported:
 			negative = append(negative, "profile:"+profile.ID)
+		case isVerifiedDispatchProfile(profile):
+			positive = append(positive, "profile:"+profile.ID)
+		default:
+			hasUnprovenDelivery = true
 		}
 	}
-	if len(positive) > 0 && (!needPTY || h.Caps.SupportsInteractivePTY) {
-		return SupportSupported, sortedUnique(positive)
+	if len(positive) > 0 {
+		if !needPTY || h.Caps.SupportsInteractivePTY {
+			return SupportSupported, sortedUnique(positive)
+		}
+		return SupportUnverified, nil
+	}
+	if hasUnprovenDelivery {
+		return SupportUnverified, nil
 	}
 	if hasMode && len(negative) > 0 {
 		return SupportUnsupported, sortedUnique(negative)
@@ -481,14 +510,22 @@ func modeDispatchSupport(h HarnessRow, mode agent.PromptSessionMode, needPTY boo
 	return SupportUnverified, nil
 }
 
-// cellFlagSupport needs a validated cell passing match; absence stays unverified.
+// cellFlagSupport needs a smoked, lane-proven cell passing match; an unsmoked
+// or lane-less cell stays unverified. Supported refs cite the cell plus each
+// proving smoke lane, so the doc evidence traces to the lane that proved it.
 func cellFlagSupport(h HarnessRow, cells []HarnessEndpointCell, match func(HarnessEndpointCell) bool) (SupportLevel, []string) {
 	var refs []string
 	for _, c := range cells {
 		if c.Harness != h.Name || !match(c) {
 			continue
 		}
+		if !c.Smoked || len(c.ProvingLanes) == 0 {
+			continue
+		}
 		refs = append(refs, "cell:"+string(c.Harness)+"/"+string(c.Endpoint)+"/"+string(c.Host))
+		for _, lane := range c.ProvingLanes {
+			refs = append(refs, "smoke:"+string(lane))
+		}
 	}
 	if len(refs) > 0 {
 		return SupportSupported, sortedUnique(refs)
