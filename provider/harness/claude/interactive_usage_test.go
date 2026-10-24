@@ -337,6 +337,20 @@ func TestInteractiveUsageTailer_SidecarCostEmitsDeltasOnly(t *testing.T) {
 		if ev.InputTokens != 0 || ev.OutputTokens != 0 || ev.CachedInputTokens != 0 || ev.CacheWriteTokens != 0 {
 			t.Fatalf("cost-only invents tokens: %+v", ev)
 		}
+		if !ev.IsCostOnlyCumulativeDelta() {
+			t.Fatalf("production delta not recognized: %+v", ev)
+		}
+		wire, err := agent.MarshalEvent(ev)
+		if err != nil {
+			t.Fatalf("production delta rejected by strict validator: %v", err)
+		}
+		decoded, err := agent.UnmarshalEvent(wire)
+		if err != nil {
+			t.Fatalf("production delta decode: %v", err)
+		}
+		if call, ok := decoded.(agent.LlmCallEvent); !ok || !call.IsCostOnlyCumulativeDelta() {
+			t.Fatalf("validator round-trip lost cost-only delta: %+v", decoded)
+		}
 	}
 	if _, ok := tailer.sweepSidecarCost(); ok {
 		t.Fatal("missing sidecar emitted")

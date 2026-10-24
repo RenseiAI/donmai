@@ -681,3 +681,46 @@ func TestLlmCallEvent_CostOnlyCumulativeDeltaContract(t *testing.T) {
 		}
 	}
 }
+
+// TestLlmCallEvent_CostOnlyDeltaPassesStrictValidator proves the interactive
+// cost-only delta passes the versioned usage-atom validator on both codec
+// directions: the production shape carries no atom (nil stays valid for
+// legacy/partial evidence), and an attached atom describing
+// aggregate/partial evidence validates as well.
+func TestLlmCallEvent_CostOnlyDeltaPassesStrictValidator(t *testing.T) {
+	t.Parallel()
+	cost := 0.25
+	delta := LlmCallEvent{ObservedCostUsd: &cost, UsageSource: LlmUsageProvider}
+	if !delta.IsCostOnlyCumulativeDelta() {
+		t.Fatalf("cost-only delta not recognized: %+v", delta)
+	}
+	wire, err := MarshalEvent(delta)
+	if err != nil {
+		t.Fatalf("MarshalEvent cost-only delta with nil atom: %v", err)
+	}
+	decoded, err := UnmarshalEvent(wire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent cost-only delta with nil atom: %v", err)
+	}
+	call, ok := decoded.(LlmCallEvent)
+	if !ok || !call.IsCostOnlyCumulativeDelta() {
+		t.Fatalf("strict-validator round-trip lost cost-only delta: %+v", decoded)
+	}
+	withAtom := delta
+	withAtom.UsageV2 = &LlmInferenceUsage{
+		Version: LlmInferenceUsageVersionV2, InferenceID: "inf-cost-only",
+		Evidence: LlmInferenceEvidenceAggregate, Completeness: LlmInferenceCompletenessPartial, Status: LlmInferenceStatusSucceeded,
+		Attempts: []LlmInferenceAttempt{{AttemptID: "att-1", Ordinal: 1}},
+	}
+	atomWire, err := MarshalEvent(withAtom)
+	if err != nil {
+		t.Fatalf("MarshalEvent cost-only delta with aggregate/partial atom: %v", err)
+	}
+	atomDecoded, err := UnmarshalEvent(atomWire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent cost-only delta with aggregate/partial atom: %v", err)
+	}
+	if atomCall, ok := atomDecoded.(LlmCallEvent); !ok || !atomCall.IsCostOnlyCumulativeDelta() {
+		t.Fatalf("aggregate/partial atom lost cost-only delta: %+v", atomDecoded)
+	}
+}
