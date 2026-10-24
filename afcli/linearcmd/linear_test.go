@@ -25,7 +25,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,9 +39,12 @@ import (
 // platform proxy whenever DONMAI_API_URL and MCP_GATEWAY_TOKEN_FILE are both
 // set, so running the suite inside a session environment would otherwise
 // divert these tests' traffic to the live proxy (including writes). Clear
-// every session-detection variable and point the bearer-file lookup at a path
-// that cannot exist before m.Run(). Tests that exercise the in-session path
-// opt back in explicitly via t.Setenv and a temp bearer file.
+// every session-detection variable before m.Run() so no test inherits a live
+// session. Tests that exercise the in-session path opt back in explicitly via
+// t.Setenv and a temp bearer file. MCP_GATEWAY_TOKEN_FILE is left unset (not
+// pointed at a missing path) so worker-credential tests that set
+// DONMAI_API_URL without a bearer file stay on the worker path instead of
+// silently moving onto the session path.
 func TestMain(m *testing.M) {
 	for _, key := range []string{"DONMAI_API_URL", "WORKER_AUTH_TOKEN", "MCP_GATEWAY_TOKEN_FILE"} {
 		if err := os.Unsetenv(key); err != nil {
@@ -50,14 +52,6 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
-	dir, err := os.MkdirTemp("", "donmai-linearcmd-no-session")
-	if err != nil {
-		_, _ = os.Stderr.WriteString("TestMain: create temp dir: " + err.Error() + "\n")
-		os.Exit(1)
-	}
-	// Join a name that is never created, so the lookup always misses even if
-	// a test sets DONMAI_API_URL without providing its own bearer file.
-	_ = os.Setenv("MCP_GATEWAY_TOKEN_FILE", filepath.Join(dir, "missing-bearer"))
 	os.Exit(m.Run())
 }
 

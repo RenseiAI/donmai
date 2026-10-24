@@ -284,9 +284,8 @@ func TestLinearListCommentsDirectAuthRefusalDoesNotTryAlternateIdentity(t *testi
 			})
 			t.Setenv("WORKER_AUTH_TOKEN", "other-fixture-token")
 			t.Setenv("DONMAI_API_URL", "http://127.0.0.1:1")
-			// The package TestMain points the bearer-file lookup at a dummy
-			// path, so a direct-path test that sets DONMAI_API_URL must
-			// declare the file variable empty to stay out of session.
+			// A direct-path test that sets DONMAI_API_URL must declare the
+			// bearer-file variable empty to stay out of session.
 			t.Setenv("MCP_GATEWAY_TOKEN_FILE", "")
 			_, err := runLinearCmd(t, "", "list-comments", "ENG-1")
 			if err == nil {
