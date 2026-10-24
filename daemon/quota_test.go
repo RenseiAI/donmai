@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,7 +81,7 @@ func TestQuotaState_SnapshotOmitsUnavailable(t *testing.T) {
 	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	q.noteCodexProbe("opaque-1", "promax", agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows()), base)
 	q.noteClaudeProbe("opaque-2", agent.MakeUnavailableUsageLimits(agent.ISOTime(base), agent.UsageUnavailableUnsupported, ""), base)
-	got := (&Daemon{quota: q}).quotaSnapshot()
+	got := (&Daemon{quota: q}).QuotaSnapshot()
 	if len(got) != 1 || got[0].Provider != "codex" || got[0].Plan != "promax" {
 		t.Fatalf("snapshot = %+v, want the codex account only", got)
 	}
@@ -137,7 +139,7 @@ func TestQuotaState_SparseUpdateMerges(t *testing.T) {
 		}
 	}
 	var nilDaemon *Daemon
-	if nilDaemon.quotaSnapshot() != nil {
+	if nilDaemon.QuotaSnapshot() != nil {
 		t.Error("nil daemon must report no quota")
 	}
 }
@@ -267,7 +269,7 @@ func TestQuotaState_AuthCheck(t *testing.T) {
 			q := &quotaState{}
 			tt.run(q)
 			got := map[string]*agent.UsageAuthCheck{}
-			for _, acct := range (&Daemon{quota: q}).quotaSnapshot() {
+			for _, acct := range (&Daemon{quota: q}).QuotaSnapshot() {
 				got[acct.Provider] = acct.AuthCheck
 			}
 			if !reflect.DeepEqual(got, tt.want) {
@@ -311,7 +313,7 @@ func TestQuotaState_MuseProbeEmitsWindowlessEntry(t *testing.T) {
 		t.Fatalf("empty snapshot = %+v, want none", got)
 	}
 	q.noteMuseProbe("muse-host-session", agent.MakeUsageLimits(agent.ISOTime(base), nil), base)
-	got := (&Daemon{quota: q}).quotaSnapshot()
+	got := (&Daemon{quota: q}).QuotaSnapshot()
 	if len(got) != 1 {
 		t.Fatalf("snapshot = %+v, want the one muse entry", got)
 	}
@@ -334,7 +336,7 @@ func TestQuotaState_MuseProbeEmitsWindowlessEntry(t *testing.T) {
 	refused := agent.MakeUnavailableUsageLimits(agent.ISOTime(later), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
 	refused.Unavailable.Answered = true
 	q.noteMuseProbe("muse-host-session", refused, later)
-	got = (&Daemon{quota: q}).quotaSnapshot()
+	got = (&Daemon{quota: q}).QuotaSnapshot()
 	if len(got) != 1 {
 		t.Fatalf("snapshot = %+v, want the one muse entry", got)
 	}
@@ -347,7 +349,7 @@ func TestQuotaState_MuseProbeEmitsWindowlessEntry(t *testing.T) {
 	// A read that never reached the CLI keeps the previous verdict.
 	unreached := agent.MakeUnavailableUsageLimits(agent.ISOTime(later.Add(time.Minute)), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
 	q.noteMuseProbe("muse-host-session", unreached, later.Add(time.Minute))
-	got = (&Daemon{quota: q}).quotaSnapshot()
+	got = (&Daemon{quota: q}).QuotaSnapshot()
 	if len(got) != 1 || got[0].AuthCheck == nil || got[0].AuthCheck.OK || got[0].AuthCheck.CheckedAt != agent.ISOTime(later) {
 		t.Fatalf("authCheck = %+v, want the refused verdict untouched", got[0].AuthCheck)
 	}
@@ -369,5 +371,115 @@ func TestQuotaState_SnapshotDoesNotAliasAuthCheck(t *testing.T) {
 	again := q.snapshot()
 	if len(again) != 1 || again[0].AuthCheck == nil || !again[0].AuthCheck.OK || again[0].AuthCheck.CheckedAt != agent.ISOTime(base) {
 		t.Fatalf("authCheck = %+v, want the cached ok verdict untouched", again[0].AuthCheck)
+	}
+}
+
+// TestDaemon_QuotaSnapshot_NilSafeAndSeeded pins the exported snapshot
+// contract: nil and empty daemons report nothing, and a daemon with all
+// three probes seeded reports one account per harness, each with its
+// login verdict.
+func TestDaemon_QuotaSnapshot_NilSafeAndSeeded(t *testing.T) {
+	t.Parallel()
+	var nilDaemon *Daemon
+	if got := nilDaemon.QuotaSnapshot(); got != nil {
+		t.Fatalf("nil daemon snapshot = %+v, want nil", got)
+	}
+	if got := (&Daemon{}).QuotaSnapshot(); got != nil {
+		t.Fatalf("empty daemon snapshot = %+v, want nil", got)
+	}
+	if got := New(Options{}).QuotaSnapshot(); got != nil {
+		t.Fatalf("fresh daemon snapshot = %+v, want nil", got)
+	}
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	q := &quotaState{}
+	q.noteCodexProbe("opaque-1", "promax", agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows()), base)
+	q.noteClaudeProbe("opaque-2", agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows()), base)
+	q.noteMuseProbe("muse-host-session", agent.MakeUsageLimits(agent.ISOTime(base), nil), base)
+	got := (&Daemon{quota: q}).QuotaSnapshot()
+	if len(got) != 3 {
+		t.Fatalf("snapshot = %+v, want one account per harness", got)
+	}
+	byProvider := map[string]agent.UsageAccount{}
+	for _, acct := range got {
+		byProvider[acct.Provider] = acct
+	}
+	for _, harness := range []string{agent.UsageHarnessCodex, agent.UsageHarnessClaude, agent.UsageHarnessMuse} {
+		acct, ok := byProvider[harness]
+		if !ok {
+			t.Fatalf("snapshot has no %s entry: %+v", harness, got)
+		}
+		if acct.AuthCheck == nil || acct.AuthCheck.Harness != harness {
+			t.Errorf("%s authCheck = %+v, want a verdict for %s", harness, acct.AuthCheck, harness)
+		}
+	}
+}
+
+// TestDaemon_QuotaSnapshot_DeepCopy guards the published snapshot
+// against aliasing the cache: mutating every mutable field of a
+// returned account leaves the next call untouched.
+func TestDaemon_QuotaSnapshot_DeepCopy(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	probed := agent.MakeUsageLimits(agent.ISOTime(base), quotaTestWindows())
+	probed.ResetCredits = &agent.ResetCredits{AvailableCount: 2, NextExpiresAt: agent.ISOTime(base)}
+	q := &quotaState{}
+	q.noteCodexProbe("opaque-1", "promax", probed, base)
+	d := &Daemon{quota: q}
+	first := d.QuotaSnapshot()
+	if len(first) != 1 {
+		t.Fatalf("snapshot = %+v, want the one codex account", first)
+	}
+	if first[0].AuthCheck == nil || first[0].Limits.ResetCredits == nil || len(first[0].Limits.Windows) != 1 || first[0].Limits.Windows[0].WindowDurationMins == nil {
+		t.Fatalf("snapshot = %+v, want verdict, reset credits and a window duration to mutate", first)
+	}
+	want := d.QuotaSnapshot()
+	mut := &first[0]
+	mut.AuthCheck.OK = !mut.AuthCheck.OK
+	mut.AuthCheck.CheckedAt = "tampered"
+	mut.Limits.Windows[0].UsedPercent = 999
+	*mut.Limits.Windows[0].WindowDurationMins = 9999
+	mut.Limits.ResetCredits.AvailableCount = 999
+	mut.Limits.Windows = append(mut.Limits.Windows, agent.UsageWindow{ID: "injected", Kind: agent.UsageWindowWeekly, Label: "Injected", UsedPercent: 50})
+	got := d.QuotaSnapshot()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("second snapshot = %+v, want the pristine %+v", got, want)
+	}
+	if got[0].Limits.Windows[0].UsedPercent == 999 || *got[0].Limits.Windows[0].WindowDurationMins == 9999 {
+		t.Errorf("windows = %+v, want the probe's values untouched", got[0].Limits.Windows)
+	}
+	if got[0].Limits.ResetCredits.AvailableCount == 999 {
+		t.Errorf("resetCredits = %+v, want the probe's count untouched", got[0].Limits.ResetCredits)
+	}
+	if len(got[0].Limits.Windows) != 1 {
+		t.Errorf("windows = %+v, want the appended row kept out of the cache", got[0].Limits.Windows)
+	}
+}
+
+// TestDaemon_QuotaSnapshot_MuseWindowsEmptyArray pins the windowless
+// entry's wire shape: an empty non-nil window set serializes as [],
+// never null, both on first read and on a copy.
+func TestDaemon_QuotaSnapshot_MuseWindowsEmptyArray(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	q := &quotaState{}
+	q.noteMuseProbe("muse-host-session", agent.MakeUsageLimits(agent.ISOTime(base), nil), base)
+	d := &Daemon{quota: q}
+	for _, snap := range []struct {
+		name string
+		acct []agent.UsageAccount
+	}{
+		{"first read", d.QuotaSnapshot()},
+		{"copy", d.QuotaSnapshot()},
+	} {
+		if len(snap.acct) != 1 {
+			t.Fatalf("%s: snapshot = %+v, want the one muse entry", snap.name, snap.acct)
+		}
+		raw, err := json.Marshal(snap.acct[0].Limits)
+		if err != nil {
+			t.Fatalf("%s: marshal limits: %v", snap.name, err)
+		}
+		if !strings.Contains(string(raw), `"windows":[]`) {
+			t.Errorf("%s: limits = %s, want an empty windows array", snap.name, raw)
+		}
 	}
 }

@@ -712,14 +712,14 @@ func TestResolveQuotaProbeBinaries_MuseThroughSharedResolver(t *testing.T) {
 	t.Setenv("PATH", dir)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MUSE_BIN", "")
-	got := resolveQuotaProbeBinaries()
+	got := ResolveQuotaProbeBinaries()
 	if got["muse"] != path {
 		t.Fatalf("muse probe binary = %q, want %q", got["muse"], path)
 	}
 	// With no muse anywhere, the harness stays unprobed rather than
 	// reporting a false verdict.
 	t.Setenv("PATH", t.TempDir())
-	if got := resolveQuotaProbeBinaries(); got["muse"] != "" {
+	if got := ResolveQuotaProbeBinaries(); got["muse"] != "" {
 		t.Fatalf("muse probe binary = %q, want absent", got["muse"])
 	}
 }
@@ -773,4 +773,36 @@ func TestStartTerminalReplayLoopsDrainsBothKinds(t *testing.T) {
 		t.Fatalf("standalone sends=%d, want 1 on the loops' first pass", sent.Load())
 	}
 	cancel()
+}
+
+// TestResolveQuotaProbeBinaries_CodexClaudePathLookup pins the PATH
+// half of the production wiring: with fake codex and claude binaries
+// on PATH the resolver reports both paths, and with PATH pointing at
+// an empty dir it reports neither (no key, not an empty string).
+func TestResolveQuotaProbeBinaries_CodexClaudePathLookup(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"codex", "claude"} {
+		path := filepath.Join(dir, name)
+		if err := testexec.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // test fixture script
+			t.Fatalf("write fake %s CLI: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MUSE_BIN", "")
+	got := ResolveQuotaProbeBinaries()
+	if got["codex"] != filepath.Join(dir, "codex") {
+		t.Errorf("codex probe binary = %q, want the PATH file", got["codex"])
+	}
+	if got["claude"] != filepath.Join(dir, "claude") {
+		t.Errorf("claude probe binary = %q, want the PATH file", got["claude"])
+	}
+	t.Setenv("PATH", t.TempDir())
+	got = ResolveQuotaProbeBinaries()
+	if _, ok := got["codex"]; ok {
+		t.Errorf("codex probe binary = %q, want no key without a binary on PATH", got["codex"])
+	}
+	if _, ok := got["claude"]; ok {
+		t.Errorf("claude probe binary = %q, want no key without a binary on PATH", got["claude"])
+	}
 }

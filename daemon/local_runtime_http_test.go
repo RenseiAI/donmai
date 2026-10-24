@@ -512,7 +512,7 @@ func TestLocalUsageAcceptsAttemptCredentialAndMerges(t *testing.T) {
 		t.Fatalf("unknown session usage=%d, want 401", code)
 	}
 	// The refused POSTs merged nothing: no quota state exists yet.
-	if snapshot := f.d.quotaSnapshot(); len(snapshot) != 0 {
+	if snapshot := f.d.QuotaSnapshot(); len(snapshot) != 0 {
 		t.Fatalf("refused updates merged: snapshot = %+v", snapshot)
 	}
 
@@ -524,7 +524,7 @@ func TestLocalUsageAcceptsAttemptCredentialAndMerges(t *testing.T) {
 		t.Fatal("usage response carries credential bytes")
 	}
 
-	snapshot := f.d.quotaSnapshot()
+	snapshot := f.d.QuotaSnapshot()
 	if len(snapshot) != 1 || snapshot[0].Provider != agent.UsageHarnessClaude {
 		t.Fatalf("snapshot = %+v, want the one updated claude account", snapshot)
 	}
