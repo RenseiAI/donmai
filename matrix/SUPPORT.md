@@ -24,3 +24,102 @@ a code change without regeneration fails it too.
 | shell | human_controlled | interactive | shell_pty_seed | no | unsupported | unsupported | unsupported | unavailable | unavailable | no | coarse_pty_events(coarse,2) | yes | unit_verified | no | - | - | no |
 | stub | autonomous | headless | - | yes | stub_oracle | stub_oracle | stub_oracle | unavailable | unavailable | yes | stub_oracle(structured,9) | yes | unit_verified | no | - | stable | yes |
 | stub | human_controlled | interactive | stub_pty_seed | yes | no_tool_surface | unsupported | unsupported | unavailable | unavailable | yes | coarse_pty_events(coarse,2) | yes | unit_verified | no | - | stable | yes |
+
+## Harness support v2 (`harness-support/v2`)
+
+One evidence-backed fact per harness per v2 axis from the same contract
+rows the machine artifact carries. Dispatch-spawned workspaces and
+harness-native controls are separate facts.
+
+| harness | axis | level | evidence |
+| --- | --- | --- | --- |
+| claude-code | a2a | unverified |  |
+| claude-code | architecture_intelligence | unverified |  |
+| claude-code | code_intelligence | unverified |  |
+| claude-code | credential_delivery | supported | cell:claude-code/anthropic/bedrock, cell:claude-code/anthropic/direct, cell:claude-code/anthropic/vertex |
+| claude-code | headless_dispatch | supported | profile:claude-code/headless/tool-lifecycle-v1 |
+| claude-code | interactive_use | supported | profile:claude-code/interactive/tool-lifecycle-v2 |
+| claude-code | local_auth | unverified |  |
+| claude-code | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| claude-code | subagent_control.harnessNativeControls | unverified |  |
+| claude-code | token_cost_accuracy | unverified |  |
+| codex | a2a | unverified |  |
+| codex | architecture_intelligence | unverified |  |
+| codex | code_intelligence | unverified |  |
+| codex | credential_delivery | supported | cell:codex/openai/azure, cell:codex/openai/direct |
+| codex | headless_dispatch | supported | profile:codex/headless/tool-lifecycle-v1 |
+| codex | interactive_use | supported | profile:codex/interactive/tool-lifecycle-v1, profile:codex/interactive/tool-lifecycle-v2 |
+| codex | local_auth | unverified |  |
+| codex | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| codex | subagent_control.harnessNativeControls | unverified |  |
+| codex | token_cost_accuracy | unverified |  |
+| gemini-direct | a2a | unverified |  |
+| gemini-direct | architecture_intelligence | unverified |  |
+| gemini-direct | code_intelligence | unverified |  |
+| gemini-direct | credential_delivery | supported | cell:gemini-direct/google/direct, cell:gemini-direct/google/vertex |
+| gemini-direct | headless_dispatch | supported | profile:gemini-direct/gemini-generate/tool-lifecycle-v1 |
+| gemini-direct | interactive_use | unverified |  |
+| gemini-direct | local_auth | unverified |  |
+| gemini-direct | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| gemini-direct | subagent_control.harnessNativeControls | unverified |  |
+| gemini-direct | token_cost_accuracy | unverified |  |
+| muse | a2a | unverified |  |
+| muse | architecture_intelligence | unverified |  |
+| muse | code_intelligence | unverified |  |
+| muse | credential_delivery | supported | cell:muse/meta/direct |
+| muse | headless_dispatch | supported | profile:muse/headless/tool-lifecycle-v1 |
+| muse | interactive_use | supported | profile:muse/interactive/tool-lifecycle-v1 |
+| muse | local_auth | unverified |  |
+| muse | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| muse | subagent_control.harnessNativeControls | unverified |  |
+| muse | token_cost_accuracy | unverified |  |
+| ollama | a2a | unverified |  |
+| ollama | architecture_intelligence | unverified |  |
+| ollama | code_intelligence | unverified |  |
+| ollama | credential_delivery | unverified |  |
+| ollama | headless_dispatch | supported | profile:ollama/ollama-chat/tool-lifecycle-v1 |
+| ollama | interactive_use | unverified |  |
+| ollama | local_auth | supported | cell:ollama/local/local |
+| ollama | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| ollama | subagent_control.harnessNativeControls | unverified |  |
+| ollama | token_cost_accuracy | unverified |  |
+| opencode | a2a | unverified |  |
+| opencode | architecture_intelligence | unverified |  |
+| opencode | code_intelligence | unverified |  |
+| opencode | credential_delivery | supported | cell:opencode/openai/direct, cell:opencode/openai/gateway |
+| opencode | headless_dispatch | supported | profile:opencode/headless/tool-lifecycle-v1 |
+| opencode | interactive_use | unverified |  |
+| opencode | local_auth | supported | cell:opencode/google/local |
+| opencode | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| opencode | subagent_control.harnessNativeControls | unverified |  |
+| opencode | token_cost_accuracy | unverified |  |
+| pi | a2a | unverified |  |
+| pi | architecture_intelligence | unverified |  |
+| pi | code_intelligence | unverified |  |
+| pi | credential_delivery | supported | cell:pi/anthropic/direct, cell:pi/openai/direct |
+| pi | headless_dispatch | supported | profile:pi/headless/tool-lifecycle-v2 |
+| pi | interactive_use | supported | profile:pi/interactive/tool-lifecycle-v6 |
+| pi | local_auth | unverified |  |
+| pi | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| pi | subagent_control.harnessNativeControls | unverified |  |
+| pi | token_cost_accuracy | unverified |  |
+| shell | a2a | unverified |  |
+| shell | architecture_intelligence | unverified |  |
+| shell | code_intelligence | unverified |  |
+| shell | credential_delivery | unverified |  |
+| shell | headless_dispatch | unverified |  |
+| shell | interactive_use | supported | profile:shell/interactive/tool-lifecycle-v1 |
+| shell | local_auth | unverified |  |
+| shell | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| shell | subagent_control.harnessNativeControls | unverified |  |
+| shell | token_cost_accuracy | unverified |  |
+| stub | a2a | unverified |  |
+| stub | architecture_intelligence | unverified |  |
+| stub | code_intelligence | unverified |  |
+| stub | credential_delivery | unverified |  |
+| stub | headless_dispatch | supported | profile:stub/tool-lifecycle-v1 |
+| stub | interactive_use | supported | profile:stub/interactive/tool-lifecycle-v1 |
+| stub | local_auth | supported | cell:stub/stub/local |
+| stub | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
+| stub | subagent_control.harnessNativeControls | unverified |  |
+| stub | token_cost_accuracy | unverified |  |

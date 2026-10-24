@@ -40,7 +40,13 @@ import (
 // p1.2 -> p1.3: additive generated harness support page (SUPPORT.md) plus the
 // per-harness execution-security deny-baseline records in harnesses.json.
 // Both publish what the live manifests already declare; no consumer break.
-const SchemaVersion = "p1.3"
+//
+// p1.3 -> p1.4: additive harness-support/v2 contract per harness (supportV2
+// on every HarnessRow, rendered in harnesses.json, capability-matrix.json,
+// and the SUPPORT.md v2 section from the same in-memory rows). Values are
+// evidence-derived with missing proof as `unverified`; no runtime, route,
+// auth, or provider behavior changes.
+const SchemaVersion = "p1.4"
 
 // ContractABI pins the matrix-document contract version (distinct from the
 // per-manifest harness/v2 and model-endpoint/v1 ABIs).

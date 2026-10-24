@@ -77,6 +77,14 @@ type HarnessRow struct {
 	// index 0 via RenderExecutionSecurity). It publishes what the code
 	// already enforces; it never declares new enforcement.
 	ExecutionSecurity []HarnessExecutionSecurityRow `json:"executionSecurity"`
+	// SupportV2 is the versioned harness-support/v2 contract for this
+	// harness: one evidence-backed fact per v2 axis in canonical order.
+	// Computed by the generator from qualifying evidence already present
+	// in Built (exact profile/cell identities or validated fixture rows);
+	// missing proof stays `unverified`. Rendered in harnesses.json,
+	// capability-matrix.json, and the SUPPORT.md v2 section from these
+	// same rows.
+	SupportV2 HarnessSupportV2 `json:"supportV2"`
 }
 
 // HarnessExecutionSecurityRow is one harness+mode deny-baseline record: how
@@ -260,6 +268,10 @@ func BuildWithSubagentFixtures(
 		return nil, err
 	}
 	applySubagentQualification(harnesses, cells, subagentQualification)
+
+	for i := range harnesses {
+		harnesses[i].SupportV2 = projectHarnessSupportV2(harnesses[i], cells, capabilities, subagentQualification)
+	}
 
 	canonicalRealizations := cloneCapabilityRealizationEvidenceRows(realizations)
 	canonicalCapabilities := cloneCapabilityEligibilityRows(capabilities)

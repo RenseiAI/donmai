@@ -102,6 +102,7 @@ func RenderSupportPage(built *Built) string {
 			escapeCell(smokedCell(built, h.Name)),
 		}, " | ") + " |\n")
 	}
+	buf.WriteString(renderSupportV2Section(built))
 	return buf.String()
 }
 
@@ -301,4 +302,280 @@ func joinSorted(values []string) string {
 
 func escapeCell(s string) string {
 	return strings.ReplaceAll(s, "|", "\\|")
+}
+
+// ---------------------------------------------------------------------------
+// Harness support v2: versioned per-harness contract (harness-support/v2).
+// One evidence-backed fact per axis per harness; missing proof stays
+// unverified. Supported/unsupported carry public evidence refs; unverified
+// carries none. SUPPORT.md v2 and harnesses.json render the same in-memory
+// rows (HarnessRow.SupportV2), never re-derived claims.
+// Evidence (all in Built, all public): profile:<tool-lifecycle id> for
+// headless/interactive; cell:<harness>/<endpoint>/<host> for local-auth and
+// credential delivery; capability:<id>@<adapter>#<mode> for code, A2A,
+// architecture, token/cost, and dispatch-spawned workspaces (adapter must
+// match a harvested profile id+mode); subagent:<cell>@<adapter>#<mode>:<digest>
+// for harness-native controls (EmitsSubagentEvents AND a non-empty delivery
+// digest — event observation alone never promotes either control fact).
+// Manifest booleans, absent/skipped/malformed/non-qualifying rows stay
+// unverified and never inherit HarnessRow.Caps. Dispatch (capability) and
+// native (subagent) facts are separate and may differ.
+
+// HarnessSupportContractVersion pins the per-harness support contract version.
+const HarnessSupportContractVersion = "harness-support/v2"
+
+// V2 axes in canonical order; sub-agent carries two distinct facts.
+const (
+	SupportAxisA2A                      = "a2a"
+	SupportAxisArchitectureIntelligence = "architecture_intelligence"
+	SupportAxisCodeIntelligence         = "code_intelligence"
+	SupportAxisCredentialDelivery       = "credential_delivery" //nolint:gosec // G101: axis identifier, not a credential.
+	SupportAxisHeadlessDispatch         = "headless_dispatch"
+	SupportAxisInteractiveUse           = "interactive_use"
+	SupportAxisLocalAuth                = "local_auth"
+	SupportAxisSubagentControl          = "subagent_control"
+	SupportAxisTokenCostAccuracy        = "token_cost_accuracy" //nolint:gosec // G101: axis identifier, not a credential.
+)
+
+var supportAxisOrder = []string{
+	SupportAxisA2A,
+	SupportAxisArchitectureIntelligence,
+	SupportAxisCodeIntelligence,
+	SupportAxisCredentialDelivery,
+	SupportAxisHeadlessDispatch,
+	SupportAxisInteractiveUse,
+	SupportAxisLocalAuth,
+	SupportAxisSubagentControl,
+	SupportAxisTokenCostAccuracy,
+}
+
+// Capability IDs qualifying the fixture-derived axes; the adapter must match
+// a harvested profile id+mode for the same harness.
+const (
+	supportCapA2A            = "a2a/v1"
+	supportCapArchitecture   = "architecture_intelligence/v1"
+	supportCapCode           = "code_intelligence/v1"
+	supportCapTokenCost      = "token_cost_accuracy/v1" //nolint:gosec // G101: capability identifier, not a credential.
+	supportCapDispatchSpaces = "dispatch_spawned_workspaces/v1"
+)
+
+// SupportLevel is the v2 value domain: supported, unsupported, or unverified.
+type SupportLevel string
+
+// Support levels for the v2 contract.
+const (
+	SupportSupported   SupportLevel = "supported"
+	SupportUnsupported SupportLevel = "unsupported"
+	SupportUnverified  SupportLevel = "unverified"
+)
+
+// SupportValue is one fact: level plus ordered public refs (none when unverified).
+type SupportValue struct {
+	Level    SupportLevel `json:"level"`
+	Evidence []string     `json:"evidence"`
+}
+
+// SupportAxisEntry is one axis row; subagent_control carries the nested facts.
+type SupportAxisEntry struct {
+	Axis                      string        `json:"axis"`
+	Level                     SupportLevel  `json:"level,omitempty"`
+	Evidence                  []string      `json:"evidence,omitempty"`
+	DispatchSpawnedWorkspaces *SupportValue `json:"dispatchSpawnedWorkspaces,omitempty"`
+	HarnessNativeControls     *SupportValue `json:"harnessNativeControls,omitempty"`
+}
+
+// HarnessSupportV2 is the per-harness v2 contract embedded in HarnessRow.
+type HarnessSupportV2 struct {
+	ContractVersion string             `json:"contractVersion"`
+	Axes            []SupportAxisEntry `json:"axes"`
+}
+
+// projectHarnessSupportV2 builds one harness contract from qualifying evidence
+// in Built; it never reads Caps booleans as support.
+func projectHarnessSupportV2(h HarnessRow, cells []HarnessEndpointCell, capabilities []CapabilityEligibilityRow, subagents []SubagentQualificationRow) HarnessSupportV2 {
+	axes := make([]SupportAxisEntry, 0, len(supportAxisOrder))
+	for _, axis := range supportAxisOrder {
+		if axis == SupportAxisSubagentControl {
+			dispatchLevel, dispatchEvidence := capabilityAxisSupport(h, capabilities, supportCapDispatchSpaces)
+			nativeLevel, nativeEvidence := nativeControlsSupport(h, subagents)
+			axes = append(axes, SupportAxisEntry{
+				Axis:                      axis,
+				DispatchSpawnedWorkspaces: &SupportValue{Level: dispatchLevel, Evidence: dispatchEvidence},
+				HarnessNativeControls:     &SupportValue{Level: nativeLevel, Evidence: nativeEvidence},
+			})
+			continue
+		}
+		var level SupportLevel
+		var evidence []string
+		switch axis {
+		case SupportAxisHeadlessDispatch:
+			level, evidence = modeDispatchSupport(h, agent.PromptModeAutonomous, false)
+		case SupportAxisInteractiveUse:
+			level, evidence = modeDispatchSupport(h, agent.PromptModeHumanControlled, true)
+		case SupportAxisLocalAuth:
+			level, evidence = cellFlagSupport(h, cells, isLocalCell)
+		case SupportAxisCredentialDelivery:
+			level, evidence = cellFlagSupport(h, cells, needsKeyCell)
+		case SupportAxisCodeIntelligence:
+			level, evidence = capabilityAxisSupport(h, capabilities, supportCapCode)
+		case SupportAxisA2A:
+			level, evidence = capabilityAxisSupport(h, capabilities, supportCapA2A)
+		case SupportAxisArchitectureIntelligence:
+			level, evidence = capabilityAxisSupport(h, capabilities, supportCapArchitecture)
+		case SupportAxisTokenCostAccuracy:
+			level, evidence = capabilityAxisSupport(h, capabilities, supportCapTokenCost)
+		default:
+			level = SupportUnverified
+		}
+		axes = append(axes, SupportAxisEntry{Axis: axis, Level: level, Evidence: evidence})
+	}
+	return HarnessSupportV2{ContractVersion: HarnessSupportContractVersion, Axes: axes}
+}
+
+func hasToolProfile(h HarnessRow, adapter string, mode agent.PromptSessionMode) bool {
+	for _, profile := range h.ToolLifecycle {
+		if profile.ID == adapter && profile.Mode == mode {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedUnique(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range in {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// modeDispatchSupport checks one session mode for a non-unsupported lifecycle
+// delivery; all-unsupported is negative evidence, no profile stays unverified.
+// The PTY flag is required only for the interactive mode.
+func modeDispatchSupport(h HarnessRow, mode agent.PromptSessionMode, needPTY bool) (SupportLevel, []string) {
+	var positive, negative []string
+	hasMode := false
+	for _, profile := range h.ToolLifecycle {
+		if profile.Mode != mode {
+			continue
+		}
+		hasMode = true
+		if profile.LifecycleDelivery != agent.ToolDeliveryUnsupported {
+			positive = append(positive, "profile:"+profile.ID)
+		} else {
+			negative = append(negative, "profile:"+profile.ID)
+		}
+	}
+	if len(positive) > 0 && (!needPTY || h.Caps.SupportsInteractivePTY) {
+		return SupportSupported, sortedUnique(positive)
+	}
+	if hasMode && len(negative) > 0 {
+		return SupportUnsupported, sortedUnique(negative)
+	}
+	return SupportUnverified, nil
+}
+
+// cellFlagSupport needs a validated cell passing match; absence stays unverified.
+func cellFlagSupport(h HarnessRow, cells []HarnessEndpointCell, match func(HarnessEndpointCell) bool) (SupportLevel, []string) {
+	var refs []string
+	for _, c := range cells {
+		if c.Harness != h.Name || !match(c) {
+			continue
+		}
+		refs = append(refs, "cell:"+string(c.Harness)+"/"+string(c.Endpoint)+"/"+string(c.Host))
+	}
+	if len(refs) > 0 {
+		return SupportSupported, sortedUnique(refs)
+	}
+	return SupportUnverified, nil
+}
+
+func isLocalCell(c HarnessEndpointCell) bool {
+	for _, am := range c.AuthModes {
+		if am == agent.AuthLocal {
+			return true
+		}
+	}
+	return false
+}
+
+func needsKeyCell(c HarnessEndpointCell) bool { return c.NeedsAPIKey && !c.BringsOwnAuth }
+
+// capabilityAxisSupport needs a smoked, production-eligible row for the exact
+// capability whose adapter matches a harvested profile id+mode; plain-build
+// emptiness stays unverified without inheriting Caps.
+func capabilityAxisSupport(h HarnessRow, capabilities []CapabilityEligibilityRow, capabilityID string) (SupportLevel, []string) {
+	var refs []string
+	for _, row := range capabilities {
+		if row.HarnessID != h.Name || row.CapabilityID != capabilityID {
+			continue
+		}
+		if row.EvidenceTier != agent.CapabilityEvidenceSmoked || !row.ProductionEligible {
+			continue
+		}
+		if !hasToolProfile(h, row.AdapterVersion, row.Mode) {
+			continue
+		}
+		refs = append(refs, "capability:"+row.CapabilityID+"@"+row.AdapterVersion+"#"+string(row.Mode))
+	}
+	if len(refs) > 0 {
+		return SupportSupported, sortedUnique(refs)
+	}
+	return SupportUnverified, nil
+}
+
+// nativeControlsSupport is the harness-native half: an executed fixture with
+// EmitsSubagentEvents AND a non-empty delivery digest; events alone never
+// promote it.
+func nativeControlsSupport(h HarnessRow, subagents []SubagentQualificationRow) (SupportLevel, []string) {
+	var refs []string
+	for _, row := range subagents {
+		if row.Cell.Harness != h.Name || !row.EmitsSubagentEvents || row.DeliveryInputDigest == "" || !hasToolProfile(h, row.AdapterVersion, row.Mode) {
+			continue
+		}
+		refs = append(refs, "subagent:"+string(row.Cell.Harness)+"/"+string(row.Cell.Endpoint)+"/"+string(row.Cell.Host)+"@"+row.AdapterVersion+"#"+string(row.Mode)+":"+row.DeliveryInputDigest)
+	}
+	if len(refs) > 0 {
+		return SupportSupported, sortedUnique(refs)
+	}
+	return SupportUnverified, nil
+}
+
+func v2Row(harness, axis, level, evidence string) string {
+	return "| " + strings.Join([]string{escapeCell(harness), escapeCell(axis), escapeCell(level), escapeCell(evidence)}, " | ") + " |\n"
+}
+
+// renderSupportV2Section renders the v2 contract from the same in-memory rows
+// the machine artifact carries; the sub-agent axis renders as two rows.
+func renderSupportV2Section(built *Built) string {
+	var buf strings.Builder
+	buf.WriteString("\n## Harness support v2 (`" + HarnessSupportContractVersion + "`)\n\n")
+	buf.WriteString("One evidence-backed fact per harness per v2 axis from the same contract\n")
+	buf.WriteString("rows the machine artifact carries. Dispatch-spawned workspaces and\n")
+	buf.WriteString("harness-native controls are separate facts.\n\n")
+	buf.WriteString("| harness | axis | level | evidence |\n")
+	buf.WriteString("| --- | --- | --- | --- |\n")
+	harnesses := append([]HarnessRow(nil), built.Harnesses...)
+	sort.Slice(harnesses, func(i, j int) bool { return harnesses[i].Name < harnesses[j].Name })
+	for _, h := range harnesses {
+		for _, axis := range h.SupportV2.Axes {
+			if axis.Axis == SupportAxisSubagentControl {
+				if axis.DispatchSpawnedWorkspaces != nil {
+					buf.WriteString(v2Row(string(h.Name), axis.Axis+".dispatchSpawnedWorkspaces", string(axis.DispatchSpawnedWorkspaces.Level), strings.Join(axis.DispatchSpawnedWorkspaces.Evidence, ", ")))
+				}
+				if axis.HarnessNativeControls != nil {
+					buf.WriteString(v2Row(string(h.Name), axis.Axis+".harnessNativeControls", string(axis.HarnessNativeControls.Level), strings.Join(axis.HarnessNativeControls.Evidence, ", ")))
+				}
+				continue
+			}
+			buf.WriteString(v2Row(string(h.Name), axis.Axis, string(axis.Level), strings.Join(axis.Evidence, ", ")))
+		}
+	}
+	return buf.String()
 }
