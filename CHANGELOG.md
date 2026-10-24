@@ -10,6 +10,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.89 — 2026-10-24
+
+### Chores
+
+- Host watch: render typed summaries for model calls and context notices
+- Host watch: name sessions by display handle
+- Prove registration-token rotations before adopting them
+- Re-land failed-session checkpoints with secret filtering
+- Record Linux process start time as Unix nanoseconds
+- Report a degraded seat boundary below the scope-layer floor
+- Interactive Pi host-owned applied-receipt claim channel
+- Hold healthy harnesses through control-plane outages instead of reaping on silence
+- Add explicit endpoint protocol selection with an OpenAI qualified manifest
+- Complete the Responses gateway surface: codec, native upstream and per-surface isolation
+- Export daemon quota snapshot and quota-probe binary resolver for embedders
+- Thread the dispatch-target span-ingest capability from poll item to runner
+
 ## v0.72.88 — 2026-10-23
 
 ### Chores
