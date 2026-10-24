@@ -214,3 +214,205 @@ func TestSpawnInteractive_ExitUsageWithoutStop(t *testing.T) {
 		})
 	}
 }
+
+// TestSpawnInteractive_LiveUsageIncludesSidecarCost is AC-1: transcript usage
+// and statusline cost written while running surface as tokens plus one
+// cost-only LlmCallEvent before Done; the terminal keeps transcript totals.
+func TestSpawnInteractive_LiveUsageIncludesSidecarCost(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatal(err)
+	}
+	config := t.TempDir()
+	ready := filepath.Join(t.TempDir(), "ready")
+	env := map[string]string{claudeConfigDirEnv: config, "TEST_USAGE_MODE": "both", "TEST_USAGE_READY": ready}
+	p := newFakeInteractiveProvider(t, noStopUsageREPL)
+	h, err := p.Spawn(t.Context(), agent.Spec{Cwd: t.TempDir(), Env: env, Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("REPL never wrote usage sources")
+		case <-poll.C:
+		}
+	}
+	wrapper := h.(*interactiveHandle)
+	var tokenEv, costEv *agent.LlmCallEvent
+	liveDeadline := time.NewTimer(10 * time.Second)
+	defer liveDeadline.Stop()
+collect:
+	for tokenEv == nil || costEv == nil {
+		select {
+		case ev, ok := <-wrapper.Events():
+			if !ok {
+				t.Fatal("Events closed before live usage observed")
+			}
+			if call, ok := ev.(agent.LlmCallEvent); ok {
+				if call.TurnCompleted && call.InputTokens == 100 {
+					cp := call
+					tokenEv = &cp
+				}
+				if !call.TurnCompleted && call.ObservedCostUsd != nil {
+					cp := call
+					costEv = &cp
+				}
+			}
+		case <-liveDeadline.C:
+			break collect
+		}
+	}
+	if tokenEv == nil || tokenEv.OutputTokens != 20 || tokenEv.CachedInputTokens != 30 || tokenEv.CacheWriteTokens != 40 {
+		t.Fatalf("live token event = %+v; want transcript usage", tokenEv)
+	}
+	if tokenEv.UsageSource != agent.LlmUsageProvider || tokenEv.ObservedCostUsd != nil {
+		t.Fatalf("token event must be provider without cost: %+v", *tokenEv)
+	}
+	if costEv == nil {
+		t.Fatal("no cost-only sidecar event before Done")
+	}
+	if got := *costEv.ObservedCostUsd; got < 0.249999 || got > 0.250001 {
+		t.Fatalf("live cost delta = %v; want 0.25", got)
+	}
+	if costEv.UsageSource != agent.LlmUsageProvider || costEv.TurnCompleted || costEv.Synthetic {
+		t.Fatalf("cost-only event must be provider, no turn, non-synthetic: %+v", *costEv)
+	}
+	if costEv.InputTokens != 0 || costEv.OutputTokens != 0 || costEv.CachedInputTokens != 0 || costEv.CacheWriteTokens != 0 {
+		t.Fatalf("cost-only event invents tokens: %+v", *costEv)
+	}
+	if err := h.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				t.Fatal("no terminal result")
+			}
+			if result, ok := ev.(agent.ResultEvent); ok {
+				want := agent.CostData{InputTokens: 100, OutputTokens: 20, CachedInputTokens: 30, CacheWriteTokens: 40, NumTurns: 1}
+				if result.Cost == nil || *result.Cost != want {
+					t.Fatalf("terminal cost = %+v; want %+v", result.Cost, want)
+				}
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("terminal event did not arrive")
+		}
+	}
+}
+
+// TestInteractiveUsageTailer_SidecarCostEmitsDeltasOnly is AC-4: 0.25, 0.25,
+// 0.10, 0.75 emit exactly 0.25 then 0.50; invalid readings move no baseline.
+// sweepBoth and flushBoth carry the same delta beside transcript usage.
+func TestInteractiveUsageTailer_SidecarCostEmitsDeltasOnly(t *testing.T) {
+	t.Parallel()
+	c := newTestStopHookChannel(t)
+	tailer := newInteractiveUsageTailer(c)
+	writeSidecar := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(c.sidecarPath(), []byte(body), 0o600); err != nil {
+			t.Fatalf("write sidecar: %v", err)
+		}
+	}
+	checkCostOnly := func(ev agent.LlmCallEvent, want float64) {
+		t.Helper()
+		if ev.ObservedCostUsd == nil {
+			t.Fatalf("no price: %+v", ev)
+		}
+		if got := *ev.ObservedCostUsd; got < want-1e-9 || got > want+1e-9 {
+			t.Fatalf("delta = %v; want %v", got, want)
+		}
+		if ev.UsageSource != agent.LlmUsageProvider || ev.TurnCompleted || ev.Synthetic {
+			t.Fatalf("must be provider cost-only: %+v", ev)
+		}
+		if ev.InputTokens != 0 || ev.OutputTokens != 0 || ev.CachedInputTokens != 0 || ev.CacheWriteTokens != 0 {
+			t.Fatalf("cost-only invents tokens: %+v", ev)
+		}
+	}
+	if _, ok := tailer.sweepSidecarCost(); ok {
+		t.Fatal("missing sidecar emitted")
+	}
+	writeSidecar(`{"total_cost_usd":0.25}`)
+	ev, ok := tailer.sweepSidecarCost()
+	if !ok {
+		t.Fatal("first 0.25 emitted nothing")
+	}
+	checkCostOnly(ev, 0.25)
+	writeSidecar(`{"total_cost_usd":0.25}`)
+	if _, ok := tailer.sweepSidecarCost(); ok {
+		t.Fatal("repeat 0.25 re-emitted")
+	}
+	writeSidecar(`{"total_cost_usd":0.10}`)
+	if _, ok := tailer.sweepSidecarCost(); ok {
+		t.Fatal("regressing 0.10 emitted")
+	}
+	writeSidecar(`{"total_cost_usd":0.75}`)
+	ev, ok = tailer.sweepSidecarCost()
+	if !ok {
+		t.Fatal("0.75 catch-up emitted nothing")
+	}
+	checkCostOnly(ev, 0.50)
+	for _, body := range []string{`{"total_cost_usd":0}`, `{"total_cost_usd":-1}`, `{"total_cost_usd": NaN}`, `{"total_cost_usd": Infinity}`, `{`, `{}`, `{"total_cost_usd":"0.25"}`, ``} {
+		writeSidecar(body)
+		if _, ok := tailer.sweepSidecarCost(); ok {
+			t.Fatalf("invalid %q emitted", body)
+		}
+	}
+	writeSidecar(`{"total_cost_usd":1.0}`)
+	ev, ok = tailer.sweepSidecarCost()
+	if !ok {
+		t.Fatal("1.0 after invalids emitted nothing")
+	}
+	checkCostOnly(ev, 0.25)
+	// sweepBoth pairs one token turn with one cost delta; flushBoth emits a
+	// trailing sidecar write once.
+	c2 := newTestStopHookChannel(t)
+	path := writeTranscript(t, []string{usageLine(t, "msg-1", 100, 20, 1000, 50)})
+	fireHook(t, c2, hookStdin(path, false))
+	if err := os.WriteFile(c2.sidecarPath(), []byte(`{"total_cost_usd":0.25}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	events := newInteractiveUsageTailer(c2).sweepBoth()
+	var sawTokens, sawCost bool
+	for _, e := range events {
+		if call, ok := e.(agent.LlmCallEvent); ok {
+			if call.TurnCompleted && call.InputTokens == 100 {
+				sawTokens = true
+			}
+			if !call.TurnCompleted && call.ObservedCostUsd != nil {
+				sawCost = true
+			}
+		}
+	}
+	if !sawTokens || !sawCost {
+		t.Fatalf("sweepBoth = %+v; want tokens plus cost delta", events)
+	}
+	c3 := newTestStopHookChannel(t)
+	p3 := writeTranscript(t, []string{usageLine(t, "msg-1", 100, 20, 1000, 50)})
+	fireHook(t, c3, hookStdin(p3, false))
+	t3 := newInteractiveUsageTailer(c3)
+	_ = t3.sweepBoth()
+	if err := os.WriteFile(c3.sidecarPath(), []byte(`{"total_cost_usd":0.40}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got []agent.Event
+	t3.flushBoth(func(ev agent.Event) { got = append(got, ev) })
+	n := 0
+	for _, e := range got {
+		if call, ok := e.(agent.LlmCallEvent); ok && call.ObservedCostUsd != nil {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("flushBoth emitted %d cost deltas; want 1", n)
+	}
+}
