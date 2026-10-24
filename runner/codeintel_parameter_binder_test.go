@@ -413,6 +413,38 @@ func TestNativeFactsRefuseSurfaceConfigDivergenceWithValidDigests(t *testing.T) 
 	}
 }
 
+func TestNativeFactsRefuseStaleSelectedSurfaceDigestWithValidDigests(t *testing.T) {
+	_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub","tools":["af_code_get_repo_map"]}}`)
+	rogueRaw, rogueDigest, err := codeintelbridge.CanonicalRuntimeConfig(codeintelbridge.RuntimeConfigV1{ContractVersion: codeintelbridge.RuntimeConfigVersion, RepoPath: "pkg/sub", Tools: []string{"af_code_get_repo_map", "af_code_search_symbols"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	widened := []string{"af_code_get_repo_map", "af_code_search_symbols"}
+	surface := make([]agent.CapabilitySurfaceIdentity, 0, len(widened))
+	for _, id := range widened {
+		surface = append(surface, agent.CapabilitySurfaceIdentity{Kind: agent.CapabilitySurfaceNativeTool, ID: id})
+	}
+	mutated := resolved
+	bindingCopy := *mutated.Realization.ParameterBinding
+	bindingCopy.SelectedSurface = surface
+	// SelectedSurfaceDigest stays stale on purpose: the widened surface and
+	// config agree with self-consistent runtime-config and binding digests,
+	// so only the selected-surface digest re-check can refuse.
+	bindingCopy.RuntimeConfigDigest = rogueDigest
+	newBindingDigest, err := agent.CapabilityParameterBindingDigest(bindingCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingCopy.BindingDigest = newBindingDigest
+	mutated.Realization.ParameterBinding = &bindingCopy
+	mutated.Materialization.Config = rogueRaw
+	mutated.Materialization.ConfigDigest = rogueDigest
+	mutated.Materialization.BindingDigest = newBindingDigest
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", mutated); err == nil || !strings.Contains(err.Error(), "native surface differs") {
+		t.Fatalf("stale selected-surface digest with valid digests compiled: err=%v", err)
+	}
+}
+
 // nativeFactsOtherRepoConfig builds a self-consistent rogue config carrying
 // the same admitted tools under a different subtree, for divergence probes.
 func nativeFactsOtherRepoConfig(t *testing.T, resolved ResolvedCapabilityParameterBinding) (json.RawMessage, string) {

@@ -40,7 +40,7 @@ func TestNativeFactsCanonicalAndOldConfigUntouched(t *testing.T) {
 	if err != nil || string(again) != string(raw) || againDigest != digest {
 		t.Fatal("native facts are not deterministic")
 	}
-	for _, bad := range []NativeFactsV1{{ContractVersion: NativeFactsVersion, Root: "relative/path", RepoPath: "", Tools: []string{"a"}}, {ContractVersion: NativeFactsVersion, Root: "/abs//worktree", RepoPath: "", Tools: []string{"a"}}, {ContractVersion: NativeFactsVersion, Root: "/abs/worktree", RepoPath: "../outside", Tools: []string{"a"}}, {ContractVersion: NativeFactsVersion, Root: "/abs/worktree", RepoPath: "", Tools: []string{"b", "a"}}} {
+	for _, bad := range []NativeFactsV1{{ContractVersion: NativeFactsVersion, Root: "relative/path", RepoPath: "", Tools: []string{"a"}}, {ContractVersion: NativeFactsVersion, Root: "/abs//worktree", RepoPath: "", Tools: []string{"a"}}, {ContractVersion: NativeFactsVersion, Root: "/abs/worktree", RepoPath: "../outside", Tools: []string{"a"}}, {ContractVersion: NativeFactsVersion, Root: "/abs/worktree", RepoPath: "", Tools: []string{"b", "a"}}, {ContractVersion: NativeFactsVersion, Root: "/abs/worktree", RepoPath: "pkg/sub", Tools: nil}} {
 		if _, _, err := CanonicalNativeFacts(bad); err == nil {
 			t.Fatalf("malformed native facts compiled: %+v", bad)
 		}
