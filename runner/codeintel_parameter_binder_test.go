@@ -299,3 +299,135 @@ func TestSameBinderContractSupportsDistinctCapabilityMaterializations(t *testing
 		t.Fatalf("shared binder contract rejected distinct capability bindings: %v", err)
 	}
 }
+
+func nativeRecipeRegistryFixture(t *testing.T, capability, raw string) (*agent.CapabilityRealizationRegistry, ResolvedCapabilityParameterBinding) {
+	t.Helper()
+	input, err := NewNativeCodeIntelRealizationInput(capability, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, testCodeIntelBinderDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration, err := agent.NewCapabilityRealization(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "synthetic", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: input.Entries[0].EntryID, Channel: input.Entries[0].Channel, InputDigest: input.Entries[0].InputDigest}}, ObservedSurface: input.DeclaredSurface})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binder, err := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binders, err := NewCapabilityParameterBinderRegistry(binder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts := codeIntelRequirementFacts(t, raw)
+	facts.CapabilityID = capability
+	resolved, err := binders.ResolveAndBind(registry, facts, json.RawMessage(raw), agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry, resolved
+}
+
+func TestNativeRecipeCompilesDeterministicExactFacts(t *testing.T) {
+	cases := []struct {
+		name, raw, repoPath string
+		tools               []string
+	}{
+		{"allSix", `{"codeIntel":{"repoPath":"./pkg//sub"}}`, "pkg/sub", []string{"af_code_check_duplicate", "af_code_find_type_usages", "af_code_get_repo_map", "af_code_search_code", "af_code_search_symbols", "af_code_validate_cross_deps"}},
+		{"subset", `{"codeIntel":{"repoPath":"pkg/sub","tools":["af_code_search_symbols","af_code_get_repo_map"]}}`, "pkg/sub", []string{"af_code_get_repo_map", "af_code_search_symbols"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", tc.raw)
+			facts, digest, err := CompileNativeCodeIntelFacts("/abs/worktree", resolved)
+			if err != nil || facts.Root != "/abs/worktree" || facts.RepoPath != tc.repoPath || strings.Join(facts.Tools, ",") != strings.Join(tc.tools, ",") {
+				t.Fatalf("facts=%+v digest=%q err=%v", facts, digest, err)
+			}
+			again, againDigest, err := CompileNativeCodeIntelFacts("/abs/worktree", resolved)
+			if err != nil || againDigest != digest || strings.Join(again.Tools, ",") != strings.Join(facts.Tools, ",") || again.Root != facts.Root || again.RepoPath != facts.RepoPath {
+				t.Fatal("native facts are not deterministic")
+			}
+		})
+	}
+	_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
+	if _, _, err := CompileNativeCodeIntelFacts("", resolved); err == nil {
+		t.Fatal("empty root compiled")
+	}
+}
+
+func TestNativeFactsRefusePolicyAndMismatch(t *testing.T) {
+	registry, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
+	unknownRaw := `{"codeIntel":{"tools":["no_such_tool"]}}`
+	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
+	binders, _ := NewCapabilityParameterBinderRegistry(binder)
+	if _, err := binders.ResolveAndBind(registry, codeIntelRequirementFacts(t, unknownRaw), json.RawMessage(unknownRaw), agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous); err == nil {
+		t.Fatal("unknown tool bound")
+	}
+	for _, root := range []string{"relative/path", "/abs//worktree", "/abs/worktree/../other"} {
+		if _, _, err := CompileNativeCodeIntelFacts(root, resolved); err == nil {
+			t.Fatalf("unclean root %q compiled", root)
+		}
+	}
+	foreign := resolved
+	foreign.Realization.ParameterContract = &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: "foreign/contract/v1", BinderSourceDigest: testCodeIntelBinderDigest, SurfaceProjection: "subset", RuntimeObservation: "none"}
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", foreign); err == nil {
+		t.Fatal("foreign contract compiled")
+	}
+	mismatched := resolved
+	mismatched.Realization.ParameterBinding.SelectedSurface = append(append([]agent.CapabilitySurfaceIdentity(nil), resolved.Realization.ParameterBinding.SelectedSurface...), agent.CapabilitySurfaceIdentity{Kind: agent.CapabilitySurfaceNativeTool, ID: "af_code_search_symbols"})
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", mismatched); err == nil {
+		t.Fatal("surface/config mismatch compiled")
+	}
+}
+
+func TestNativeFactsLeaveHistoricalBytesUntouched(t *testing.T) {
+	route, err := resolveCodeIntelDeliveryRoute(nil, nil)
+	if err != nil || route.Route != codeIntelDeliveryLegacy || len(route.Tools) != 0 {
+		t.Fatalf("legacy route drifted: %+v err=%v", route, err)
+	}
+}
+
+func TestNativeRecipeCoexistsAndRefusesDuplicates(t *testing.T) {
+	compile := func(capability string) agent.CompiledCapabilityRealization {
+		input, err := NewNativeCodeIntelRealizationInput(capability, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, testCodeIntelBinderDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		declaration, err := agent.NewCapabilityRealization(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "synthetic", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: input.Entries[0].EntryID, Channel: input.Entries[0].Channel, InputDigest: input.Entries[0].InputDigest}}, ObservedSurface: input.DeclaredSurface})
+		if err != nil {
+			t.Fatal(err)
+		}
+		compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return compiled
+	}
+	first := compile("example.code-intelligence/v1")
+	second := compile("example.other/v1")
+	if _, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{first, second}); err != nil {
+		t.Fatalf("unrelated tuples refused: %v", err)
+	}
+	if _, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{first, first}); err == nil {
+		t.Fatal("duplicate tuple compiled")
+	}
+	_, old := codeIntelRealizationFixture(t, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, true)
+	if _, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{first, old}); err == nil {
+		t.Fatal("conflicting tuple compiled")
+	}
+}
