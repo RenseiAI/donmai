@@ -416,54 +416,73 @@ func TestLlmCallEvent_UsageV2RoundTrip(t *testing.T) {
 }
 
 // TestLlmCallEvent_UsageV2Invalid pins fail-closed validation on both codec
-// directions: every case must be rejected by MarshalEvent and by decode.
+// directions: every case must be rejected by MarshalEvent and by decode,
+// with the message fragment identifying the rule that fired. Per-field
+// guard cases (negative counts/charges, reasoning above output, no
+// attempts, attempt-level counts) run on a partial fixture so the
+// complete-totals check cannot mask the guard: deleting the guard must
+// turn the case green-lit, not leave the totals check to reject it for
+// the wrong reason.
 func TestLlmCallEvent_UsageV2Invalid(t *testing.T) {
 	t.Parallel()
 	nan := math.NaN()
 	inf := math.Inf(1)
 	cases := []struct {
-		name   string
-		mutate func(*LlmInferenceUsage)
+		name string
+		// partial runs the case on a partial fixture so complete
+		// totals are skipped and only the targeted guard can fire.
+		partial bool
+		mutate  func(*LlmInferenceUsage)
+		want    string
 	}{
-		{"unknown version", func(u *LlmInferenceUsage) { u.Version = "v9" }},
-		{"empty version", func(u *LlmInferenceUsage) { u.Version = "" }},
-		{"empty inference id", func(u *LlmInferenceUsage) { u.InferenceID = "" }},
-		{"unknown evidence", func(u *LlmInferenceUsage) { u.Evidence = "gossip" }},
-		{"unknown completeness", func(u *LlmInferenceUsage) { u.Completeness = "mostly" }},
-		{"unknown status", func(u *LlmInferenceUsage) { u.Status = "pending" }},
-		{"negative input", func(u *LlmInferenceUsage) { u.InputTokens = usageIntPtr(-1) }},
-		{"negative cache write", func(u *LlmInferenceUsage) { u.CacheWriteTokens = usageIntPtr(-2) }},
-		{"negative charge", func(u *LlmInferenceUsage) { u.NativeCostUsd = usageFloatPtr(-0.5) }},
-		{"nan charge", func(u *LlmInferenceUsage) { u.NativeCostUsd = &nan }},
-		{"inf charge", func(u *LlmInferenceUsage) { u.NativeCostUsd = &inf }},
-		{"reasoning above output", func(u *LlmInferenceUsage) { u.ReasoningTokens = usageIntPtr(46) }},
-		{"attempt reasoning above output", func(u *LlmInferenceUsage) { u.Attempts[0].ReasoningTokens = usageIntPtr(31) }},
-		{"no attempts", func(u *LlmInferenceUsage) { u.Attempts = nil }},
-		{"empty attempt id", func(u *LlmInferenceUsage) { u.Attempts[1].AttemptID = "" }},
-		{"duplicate attempt id", func(u *LlmInferenceUsage) { u.Attempts[1].AttemptID = "att-1" }},
-		{"zero ordinal", func(u *LlmInferenceUsage) { u.Attempts[0].Ordinal = 0 }},
-		{"duplicate ordinal", func(u *LlmInferenceUsage) { u.Attempts[1].Ordinal = 1 }},
-		{"ordinal gap", func(u *LlmInferenceUsage) { u.Attempts[1].Ordinal = 3 }},
-		{"unordered ordinals", func(u *LlmInferenceUsage) { u.Attempts[0].Ordinal, u.Attempts[1].Ordinal = 2, 1 }},
-		{"reversed timestamps", func(u *LlmInferenceUsage) { u.Attempts[0].EndTimeUnixNano = "1719599999000000000" }},
-		{"malformed timestamp", func(u *LlmInferenceUsage) { u.Attempts[0].StartTimeUnixNano = "soon" }},
-		{"complete total mismatch", func(u *LlmInferenceUsage) { u.InputTokens = usageIntPtr(121) }},
-		{"complete logical absent", func(u *LlmInferenceUsage) { u.OutputTokens = nil }},
-		{"complete attempt absent", func(u *LlmInferenceUsage) { u.Attempts[1].CachedInputTokens = nil }},
-		{"complete charge mismatch", func(u *LlmInferenceUsage) { u.NativeCostUsd = usageFloatPtr(0.76) }},
+		{"unknown version", false, func(u *LlmInferenceUsage) { u.Version = "v9" }, `must be "v2"`},
+		{"empty version", false, func(u *LlmInferenceUsage) { u.Version = "" }, `must be "v2"`},
+		{"empty inference id", false, func(u *LlmInferenceUsage) { u.InferenceID = "" }, "requires an inference id"},
+		{"unknown evidence", false, func(u *LlmInferenceUsage) { u.Evidence = "gossip" }, `evidence "gossip" is unknown`},
+		{"unknown completeness", false, func(u *LlmInferenceUsage) { u.Completeness = "mostly" }, `completeness "mostly" is unknown`},
+		{"unknown status", false, func(u *LlmInferenceUsage) { u.Status = "pending" }, `status "pending" is unknown`},
+		{"negative input", true, func(u *LlmInferenceUsage) { u.InputTokens = usageIntPtr(-1) }, "inputTokens count -1 is negative"},
+		{"negative cache write", true, func(u *LlmInferenceUsage) { u.CacheWriteTokens = usageIntPtr(-2) }, "cacheWriteTokens count -2 is negative"},
+		{"attempt negative input", true, func(u *LlmInferenceUsage) { u.Attempts[0].InputTokens = usageIntPtr(-5) }, "inputTokens count -5 is negative"},
+		{"negative charge", true, func(u *LlmInferenceUsage) { u.NativeCostUsd = usageFloatPtr(-0.5) }, "is not finite nonnegative"},
+		{"attempt negative charge", true, func(u *LlmInferenceUsage) { u.Attempts[0].NativeCostUsd = usageFloatPtr(-0.5) }, "is not finite nonnegative"},
+		{"nan charge", true, func(u *LlmInferenceUsage) { u.NativeCostUsd = &nan }, "is not finite nonnegative"},
+		{"inf charge", true, func(u *LlmInferenceUsage) { u.NativeCostUsd = &inf }, "is not finite nonnegative"},
+		{"reasoning above output", true, func(u *LlmInferenceUsage) { u.ReasoningTokens = usageIntPtr(46) }, "reasoning 46 exceeds output 45"},
+		{"attempt reasoning above output", true, func(u *LlmInferenceUsage) { u.Attempts[0].ReasoningTokens = usageIntPtr(31) }, "reasoning 31 exceeds output 30"},
+		{"no attempts", true, func(u *LlmInferenceUsage) { u.Attempts = nil }, "requires at least one attempt"},
+		{"empty attempt id", false, func(u *LlmInferenceUsage) { u.Attempts[1].AttemptID = "" }, "requires an attempt id"},
+		{"duplicate attempt id", false, func(u *LlmInferenceUsage) { u.Attempts[1].AttemptID = "att-1" }, "is duplicated"},
+		{"zero ordinal", false, func(u *LlmInferenceUsage) { u.Attempts[0].Ordinal = 0 }, "must be 1 in order"},
+		{"duplicate ordinal", false, func(u *LlmInferenceUsage) { u.Attempts[1].Ordinal = 1 }, "must be 2 in order"},
+		{"ordinal gap", false, func(u *LlmInferenceUsage) { u.Attempts[1].Ordinal = 3 }, "must be 2 in order"},
+		{"unordered ordinals", false, func(u *LlmInferenceUsage) { u.Attempts[0].Ordinal, u.Attempts[1].Ordinal = 2, 1 }, "must be 1 in order"},
+		{"reversed timestamps", false, func(u *LlmInferenceUsage) { u.Attempts[0].EndTimeUnixNano = "1719599999000000000" }, "end time precedes start time"},
+		{"malformed timestamp", false, func(u *LlmInferenceUsage) { u.Attempts[0].StartTimeUnixNano = "soon" }, "is not decimal nanoseconds"},
+		{"complete total mismatch", false, func(u *LlmInferenceUsage) { u.InputTokens = usageIntPtr(121) }, "inputTokens total 121 does not equal attempt sum 120"},
+		{"complete logical absent", false, func(u *LlmInferenceUsage) { u.OutputTokens = nil }, "outputTokens total is absent but attempts report values"},
+		{"complete attempt absent", false, func(u *LlmInferenceUsage) { u.Attempts[1].CachedInputTokens = nil }, "cachedInputTokens total is present but an attempt omits it"},
+		{"complete charge mismatch", false, func(u *LlmInferenceUsage) { u.NativeCostUsd = usageFloatPtr(0.76) }, "does not equal attempt sum"},
+		{"complete charge absent but attempts report", false, func(u *LlmInferenceUsage) { u.NativeCostUsd = nil }, "native charge total is absent but attempts report values"},
+		{"complete charge present but attempt omits", false, func(u *LlmInferenceUsage) { u.Attempts[1].NativeCostUsd = nil }, "native charge total is present but an attempt omits it"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			u := canonicalInferenceUsage()
+			if tc.partial {
+				u.Completeness = LlmInferenceCompletenessPartial
+			}
 			tc.mutate(u)
 			ev := LlmCallEvent{UsageSource: LlmUsageProvider, UsageV2: u}
 			if _, err := MarshalEvent(ev); err == nil {
 				t.Fatalf("MarshalEvent accepted %s", tc.name)
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("MarshalEvent error for %s = %q, missing rule pin %q", tc.name, err.Error(), tc.want)
 			}
 			raw, err := json.Marshal(ev)
 			if err != nil {
-				return // non-finite charges cannot ride JSON; marshal already refused
+				return // non-finite charges cannot ride JSON; marshal already refused above
 			}
 			var fields map[string]any
 			if err := json.Unmarshal(raw, &fields); err != nil {
@@ -476,8 +495,82 @@ func TestLlmCallEvent_UsageV2Invalid(t *testing.T) {
 			}
 			if _, err := UnmarshalEvent(raw); err == nil {
 				t.Fatalf("UnmarshalEvent accepted %s", tc.name)
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("UnmarshalEvent error for %s = %q, missing rule pin %q", tc.name, err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+// TestLlmCallEvent_UsageV2ChargeTolerance proves a correct complete usage
+// whose attempts cost 0.1 and 0.2 with a provider-reported total of 0.3
+// validates on both codec directions despite binary floating-point error.
+func TestLlmCallEvent_UsageV2ChargeTolerance(t *testing.T) {
+	t.Parallel()
+	u := canonicalInferenceUsage()
+	u.InputTokens = usageIntPtr(3)
+	u.OutputTokens = usageIntPtr(3)
+	u.CachedInputTokens = nil
+	u.ReasoningTokens = nil
+	u.NativeCostUsd = usageFloatPtr(0.3)
+	u.Attempts[0].InputTokens = usageIntPtr(1)
+	u.Attempts[0].OutputTokens = usageIntPtr(1)
+	u.Attempts[0].CachedInputTokens = nil
+	u.Attempts[0].ReasoningTokens = nil
+	u.Attempts[0].NativeCostUsd = usageFloatPtr(0.1)
+	u.Attempts[1].InputTokens = usageIntPtr(2)
+	u.Attempts[1].OutputTokens = usageIntPtr(2)
+	u.Attempts[1].CachedInputTokens = nil
+	u.Attempts[1].ReasoningTokens = nil
+	u.Attempts[1].NativeCostUsd = usageFloatPtr(0.2)
+	ev := LlmCallEvent{UsageSource: LlmUsageProvider, UsageV2: u}
+	wire, err := MarshalEvent(ev)
+	if err != nil {
+		t.Fatalf("MarshalEvent rejected 0.1+0.2 vs 0.3: %v", err)
+	}
+	if _, err := UnmarshalEvent(wire); err != nil {
+		t.Fatalf("UnmarshalEvent rejected 0.1+0.2 vs 0.3: %v", err)
+	}
+}
+
+// TestLlmCallEvent_UsageV2ReasoningEqualsOutput pins the reasoning
+// boundary: reasoning equal to output is a valid subset, only strictly
+// greater is rejected.
+func TestLlmCallEvent_UsageV2ReasoningEqualsOutput(t *testing.T) {
+	t.Parallel()
+	u := canonicalInferenceUsage()
+	u.Completeness = LlmInferenceCompletenessPartial
+	u.OutputTokens = usageIntPtr(12)
+	u.ReasoningTokens = usageIntPtr(12)
+	u.Attempts[0].OutputTokens = usageIntPtr(10)
+	u.Attempts[0].ReasoningTokens = usageIntPtr(10)
+	u.Attempts[1].OutputTokens = usageIntPtr(2)
+	u.Attempts[1].ReasoningTokens = usageIntPtr(2)
+	ev := LlmCallEvent{UsageSource: LlmUsageProvider, UsageV2: u}
+	if _, err := MarshalEvent(ev); err != nil {
+		t.Fatalf("MarshalEvent rejected reasoning == output: %v", err)
+	}
+}
+
+// TestLlmCallEvent_UsageV2PointerMarshal pins the *LlmCallEvent marshal
+// branch: a valid pointer round-trips and an invalid pointer is rejected
+// with the firing rule.
+func TestLlmCallEvent_UsageV2PointerMarshal(t *testing.T) {
+	t.Parallel()
+	valid := &LlmCallEvent{UsageSource: LlmUsageProvider, UsageV2: canonicalInferenceUsage()}
+	wire, err := MarshalEvent(valid)
+	if err != nil {
+		t.Fatalf("MarshalEvent(&LlmCallEvent) valid: %v", err)
+	}
+	if _, err := UnmarshalEvent(wire); err != nil {
+		t.Fatalf("UnmarshalEvent pointer wire: %v", err)
+	}
+	bad := &LlmCallEvent{UsageSource: LlmUsageProvider, UsageV2: canonicalInferenceUsage()}
+	bad.UsageV2.Version = "v9"
+	if _, err := MarshalEvent(bad); err == nil {
+		t.Fatal("MarshalEvent(&LlmCallEvent) accepted unknown version")
+	} else if !strings.Contains(err.Error(), `must be "v2"`) {
+		t.Fatalf("MarshalEvent pointer error = %q, missing rule pin", err.Error())
 	}
 }
 

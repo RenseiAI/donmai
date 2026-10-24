@@ -540,6 +540,18 @@ func (c LlmInferenceCounts) intCounts() []*int64 {
 	return []*int64{c.InputTokens, c.OutputTokens, c.CachedInputTokens, c.CacheWriteTokens, c.ReasoningTokens}
 }
 
+// inferenceChargeEqual compares native-charge totals within a small
+// relative tolerance so decimal sums that are inexact in binary
+// (0.1 + 0.2 vs 0.3) still validate. Exact equality stays the fast path.
+func inferenceChargeEqual(total, sum float64) bool {
+	if total == sum {
+		return true
+	}
+	diff := math.Abs(total - sum)
+	tol := 1e-9 * math.Max(1, math.Max(math.Abs(total), math.Abs(sum)))
+	return diff <= tol
+}
+
 // validateCompleteTotals requires each present logical total to equal its
 // attempt sum with uniform presence per class; a class absent everywhere
 // stays consistent. Partial and unknown evidence skip this.
@@ -581,7 +593,7 @@ func (u *LlmInferenceUsage) validateCompleteTotals() error {
 		}
 	case chargePresent != len(u.Attempts):
 		return fmt.Errorf("agent: llm inference usage complete native charge total is present but an attempt omits it")
-	case *u.NativeCostUsd != chargeSum:
+	case !inferenceChargeEqual(*u.NativeCostUsd, chargeSum):
 		return fmt.Errorf("agent: llm inference usage complete native charge total %v does not equal attempt sum %v", *u.NativeCostUsd, chargeSum)
 	}
 	return nil
