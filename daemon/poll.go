@@ -206,6 +206,13 @@ type PollWorkItem struct {
 	// distinguishable from explicit false, preserving the legacy capability fallback.
 	MergeQueueLanding *bool `json:"mergeQueueLanding,omitempty"`
 
+	// Capabilities carries the dispatch-target capability flags the coordinator
+	// stamps per-item on the poll payload. Only the keys listed in
+	// dispatchTargetCapabilityKeys are honoured, and only when true: a false
+	// or absent item key never clears a flag a SessionDetailOption set. Other
+	// keys ride their own option (merge-queue stays on MergeQueueLanding).
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+
 	// DeferFailureTransition opts this work item into deferring the
 	// failure-side tracker transition when a failed attempt may be
 	// retried on another endpoint. The runner skips the failure-side
@@ -1543,6 +1550,15 @@ func WithWorkerCapabilities(caps map[string]bool) SessionDetailOption {
 // as a daemon-local literal to keep this package import-light.
 const capabilityMergeQueue = "merge-queue"
 
+// dispatchTargetCapabilityKeys lists the poll-item capability keys
+// PollItemToSessionDetail threads from the dispatch target onto the built
+// SessionDetail. Today that is exactly the span-ingest key: the coordinator
+// stamps it on every poll item, and the runner gates its additive per-call
+// span pipeline on it. Every other key gets its own change later — the item
+// map is never copied wholesale, so a key this list does not name stays
+// exactly as the SessionDetailOptions left it.
+var dispatchTargetCapabilityKeys = []string{runner.CapabilitySpanIngest}
+
 // WithMergeQueueLanding stamps the coordinator's per-org merge-queue flag onto
 // SessionDetail.Capabilities["merge-queue"] for THIS item. nil ⇒ no-op (legacy
 // value stands). Append AFTER WithWorkerCapabilities so the per-item flag wins.
@@ -1741,6 +1757,22 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 	}
 	for _, opt := range opts {
 		opt(detail)
+	}
+	// Dispatch-target capabilities land AFTER the options loop on purpose:
+	// WithWorkerCapabilities REPLACES d.Capabilities, so merging here keeps
+	// the item key on every call site (the daemon poll loop, local-runtime
+	// recovery, and embedders that build a detail directly) instead of being
+	// clobbered by an option appended later. The item can only ADD a true
+	// key — a false or absent item key never clears a flag an option set —
+	// and the map is allocated only when a key actually lands, so an item
+	// with no capabilities and no options still builds Capabilities == nil.
+	for _, key := range dispatchTargetCapabilityKeys {
+		if item.Capabilities[key] {
+			if detail.Capabilities == nil {
+				detail.Capabilities = make(map[string]bool, len(dispatchTargetCapabilityKeys))
+			}
+			detail.Capabilities[key] = true
+		}
 	}
 	return detail
 }
