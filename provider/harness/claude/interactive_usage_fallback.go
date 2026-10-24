@@ -72,7 +72,9 @@ func (c *stopHookChannel) usageTranscriptPath() (string, bool) {
 // context_window token counts describe the last response, not session spend. A
 // percentage or window size is context occupancy, not token spend. Missing,
 // malformed, impossible, and all-zero readings preserve unknown usage. The
-// sidecar is a last resort, never added to transcript totals or live events.
+// sidecar is a last resort for the terminal exit total, never added to
+// transcript totals; the live tail separately emits its cumulative total as
+// cost-only delta events (see interactive_usage.go sweepSidecarCost).
 func (c *stopHookChannel) readSidecarUsage() agent.CostData {
 	f, err := openTranscript(c.sidecarPath())
 	if err != nil {
