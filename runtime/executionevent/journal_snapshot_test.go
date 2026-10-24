@@ -342,3 +342,144 @@ func TestJournalSnapshotNegativeAgeClamped(t *testing.T) {
 		t.Fatalf("oldest age = %v, want 0 clamped", *snap.OldestUnacknowledgedAge)
 	}
 }
+
+func appendQuarantineLine(t *testing.T, dir string, entry quarantineRecord) {
+	t.Helper()
+	b, err := MarshalCompact(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, quarantineFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertSnapshotUnavailable(t *testing.T, snap JournalSnapshot, reason string) {
+	t.Helper()
+	if snap.Status != JournalSnapshotUnavailable || snap.UnavailableReason != reason {
+		t.Fatalf("snapshot = %+v, want unavailable/%s", snap, reason)
+	}
+	for _, v := range []*uint64{snap.PendingRecords, snap.PendingBytes, snap.AckedSequence, snap.QuarantineTotal, snap.QuarantineConflicts} {
+		if v != nil {
+			t.Fatalf("unavailable metric = %v, want nil", *v)
+		}
+	}
+	if snap.OldestUnacknowledgedAge != nil || snap.AckedAt != nil {
+		t.Fatal("unavailable age/time must be nil")
+	}
+}
+
+func TestJournalSnapshotRejectsCorruptQuarantineEntries(t *testing.T) {
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	t.Run("status", func(t *testing.T) {
+		session := "snapshot-corrupt-quarantine"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		r := snapshotFixture(t, session, 1, base)
+		if err := j.Append(session, r); err != nil {
+			t.Fatal(err)
+		}
+		appendQuarantineLine(t, dir, quarantineRecord{Record: r, Status: 500, Reason: "platform returned HTTP 500"})
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+	t.Run("reason", func(t *testing.T) {
+		session := "snapshot-corrupt-quarantine"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		r := snapshotFixture(t, session, 1, base)
+		if err := j.Append(session, r); err != nil {
+			t.Fatal(err)
+		}
+		appendQuarantineLine(t, dir, quarantineRecord{Record: r, Status: 409, Reason: ""})
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+	t.Run("duplicate", func(t *testing.T) {
+		session := "snapshot-corrupt-quarantine"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		r := snapshotFixture(t, session, 1, base)
+		if err := j.Append(session, r); err != nil {
+			t.Fatal(err)
+		}
+		entry := quarantineRecord{Record: r, Status: 409, Reason: "platform returned HTTP 409"}
+		appendQuarantineLine(t, dir, entry)
+		appendQuarantineLine(t, dir, entry)
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+	t.Run("identity", func(t *testing.T) {
+		session := "snapshot-corrupt-quarantine"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		r := snapshotFixture(t, session, 1, base)
+		if err := j.Append(session, r); err != nil {
+			t.Fatal(err)
+		}
+		forged := r
+		forged.EventID = "evt_tampered"
+		appendQuarantineLine(t, dir, quarantineRecord{Record: forged, Status: 409, Reason: "platform returned HTTP 409"})
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+}
+
+func TestJournalSnapshotRejectsCorruptAck(t *testing.T) {
+	session := "snapshot-corrupt-ack"
+	dir := t.TempDir()
+	j, err := OpenJournal(dir, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ackFileName), []byte("{bad}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+}
+
+func TestJournalSnapshotRejectsCorruptEventsWithoutAck(t *testing.T) {
+	session := "snapshot-corrupt-events"
+	dir := t.TempDir()
+	j, err := OpenJournal(dir, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, journalFileName), []byte("{not-json}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+}
