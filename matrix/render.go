@@ -42,6 +42,9 @@ func (b *Built) Render() (*Artifacts, error) {
 	if err := b.validateSubagentQualification(); err != nil {
 		return nil, fmt.Errorf("render matrix: %w", err)
 	}
+	if err := b.validateHarnessSupportV2(); err != nil {
+		return nil, fmt.Errorf("render matrix: %w", err)
+	}
 	capabilities, err := deriveCapabilityEligibilityRows(b.Realizations)
 	if err != nil {
 		return nil, fmt.Errorf("render matrix: %w", err)
@@ -176,4 +179,34 @@ func renderRegistry(aliases []LegacyAlias) ([]byte, error) {
 		return nil, fmt.Errorf("gofmt registry source: %w", err)
 	}
 	return formatted, nil
+}
+
+// validateHarnessSupportV2 rejects a Built whose per-harness supportV2 rows
+// do not match a fresh projection from the canonical evidence mirrors. A
+// hand-edited harnesses.json support block, a caller-mutated HarnessRow, or a
+// matrix/harness mirror skew fails here before any artifact is emitted.
+func (b *Built) validateHarnessSupportV2() error {
+	for _, h := range b.Harnesses {
+		stripped := h
+		stripped.SupportV2 = HarnessSupportV2{}
+		want := projectHarnessSupportV2(stripped, b.Matrix.Cells, b.canonicalCapabilities, b.canonicalSubagentQualification)
+		if !reflect.DeepEqual(h.SupportV2, want) {
+			return fmt.Errorf("harness %q supportV2 does not match executed evidence", h.Name)
+		}
+	}
+	for _, mh := range b.Matrix.Harnesses {
+		found := false
+		for _, h := range b.Harnesses {
+			if h.Name == mh.Name {
+				found = true
+				if !reflect.DeepEqual(mh.SupportV2, h.SupportV2) {
+					return fmt.Errorf("harness %q supportV2 mirror does not match harness row", h.Name)
+				}
+			}
+		}
+		if !found {
+			return fmt.Errorf("harness %q supportV2 has no harness row", mh.Name)
+		}
+	}
+	return nil
 }

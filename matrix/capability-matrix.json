@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "p1.3",
+  "schemaVersion": "p1.4",
   "contractAbi": "capability-matrix/v1",
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "harnesses": [
@@ -150,7 +150,55 @@
           "toolDenyBaseline": "best_effort",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "codex",
@@ -327,7 +375,58 @@
           "toolDenyBaseline": "unavailable",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "supported",
+            "evidence": [
+              "profile:codex/interactive/tool-lifecycle-v2"
+            ]
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "gemini-direct",
@@ -420,7 +519,55 @@
           "toolDenyBaseline": "best_effort",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "muse",
@@ -564,7 +711,55 @@
           "toolDenyBaseline": "unavailable",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "ollama",
@@ -649,7 +844,55 @@
           "toolDenyBaseline": "unavailable",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "opencode",
@@ -750,7 +993,60 @@
           "toolDenyBaseline": "best_effort",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "supported",
+            "evidence": [
+              "cell:opencode/openai/direct",
+              "smoke:TestOpenCodeHarnessSmoke_RealBinary_SpawnEventStreamTerminal",
+              "smoke:TestOpenCodeHarnessSmoke_RealBinary_Teardown"
+            ]
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "pi",
@@ -902,7 +1198,55 @@
           "toolDenyBaseline": "best_effort",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "shell",
@@ -979,7 +1323,55 @@
           "toolDenyBaseline": "unavailable",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "unverified"
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     },
     {
       "name": "stub",
@@ -1108,7 +1500,59 @@
           "toolDenyBaseline": "unavailable",
           "networkDenyBaseline": "unavailable"
         }
-      ]
+      ],
+      "supportV2": {
+        "contractVersion": "harness-support/v2",
+        "axes": [
+          {
+            "axis": "a2a",
+            "level": "unverified"
+          },
+          {
+            "axis": "architecture_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "code_intelligence",
+            "level": "unverified"
+          },
+          {
+            "axis": "credential_delivery",
+            "level": "unverified"
+          },
+          {
+            "axis": "headless_dispatch",
+            "level": "unverified"
+          },
+          {
+            "axis": "interactive_use",
+            "level": "unverified"
+          },
+          {
+            "axis": "local_auth",
+            "level": "supported",
+            "evidence": [
+              "cell:stub/stub/local",
+              "smoke:TestSiblingContextReposSmoke"
+            ]
+          },
+          {
+            "axis": "subagent_control",
+            "dispatchSpawnedWorkspaces": {
+              "level": "unverified",
+              "evidence": null
+            },
+            "harnessNativeControls": {
+              "level": "unverified",
+              "evidence": null
+            }
+          },
+          {
+            "axis": "token_cost_accuracy",
+            "level": "unverified"
+          }
+        ]
+      }
     }
   ],
   "endpoints": [

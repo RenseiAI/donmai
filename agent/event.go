@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 )
 
@@ -328,6 +329,13 @@ type LlmCallEvent struct {
 	PromptHash      string `json:"promptHash,omitempty"`
 	ContextHash     string `json:"contextHash,omitempty"`
 	ModelSnapshotID string `json:"modelSnapshotId,omitempty"`
+
+	// UsageV2 is the optional versioned inference-usage atom: one logical
+	// inference and its ordered physical attempts. Nil means legacy/partial
+	// evidence — only the scalar fields above apply — and stays valid so
+	// old events keep decoding. When present it is strictly validated on
+	// marshal and decode; see LlmInferenceUsage.
+	UsageV2 *LlmInferenceUsage `json:"usageV2,omitempty"`
 }
 
 // IsCostOnlyCumulativeDelta reports whether e is an interactive cost-only
@@ -350,6 +358,275 @@ func (e LlmCallEvent) IsCostOnlyCumulativeDelta() bool {
 // Kind reports the EventKind discriminant.
 func (LlmCallEvent) Kind() EventKind { return EventLlmCall }
 func (LlmCallEvent) isAgentEvent()   {}
+
+// LlmInferenceUsageVersionV2 is the only accepted LlmInferenceUsage
+// version. The version is exact-match and fail-closed: empty or unknown
+// versions are rejected on marshal and decode.
+const LlmInferenceUsageVersionV2 = "v2"
+
+// LlmInferenceEvidence records how an LlmInferenceUsage was evidenced.
+// Provider means the model endpoint reported usage for the exact call;
+// aggregate means only a rolled-up total was exposed.
+type LlmInferenceEvidence string
+
+// Accepted LlmInferenceEvidence values.
+const (
+	LlmInferenceEvidenceProvider  LlmInferenceEvidence = "provider"
+	LlmInferenceEvidenceAggregate LlmInferenceEvidence = "aggregate"
+)
+
+// LlmInferenceCompleteness records whether an LlmInferenceUsage accounts
+// for every physical attempt. Only complete usage requires logical totals
+// to equal attempt sums; partial and unknown evidence never invent values.
+type LlmInferenceCompleteness string
+
+// Accepted LlmInferenceCompleteness values.
+const (
+	LlmInferenceCompletenessComplete LlmInferenceCompleteness = "complete"
+	LlmInferenceCompletenessPartial  LlmInferenceCompleteness = "partial"
+	LlmInferenceCompletenessUnknown  LlmInferenceCompleteness = "unknown"
+)
+
+// LlmInferenceStatus is the outcome of the logical inference.
+type LlmInferenceStatus string
+
+// Accepted LlmInferenceStatus values.
+const (
+	LlmInferenceStatusSucceeded LlmInferenceStatus = "succeeded"
+	LlmInferenceStatusFailed    LlmInferenceStatus = "failed"
+)
+
+// LlmInferenceCounts carries presence-preserving token classes and the
+// native charge: pointers so absent differs from reported zero through
+// the JSON round-trip. Reasoning sits inside output, never as an extra
+// (see CostData); cache classes are excluded from input.
+type LlmInferenceCounts struct {
+	InputTokens       *int64   `json:"inputTokens,omitempty"`
+	OutputTokens      *int64   `json:"outputTokens,omitempty"`
+	CachedInputTokens *int64   `json:"cachedInputTokens,omitempty"`
+	CacheWriteTokens  *int64   `json:"cacheWriteTokens,omitempty"`
+	ReasoningTokens   *int64   `json:"reasoningTokens,omitempty"`
+	NativeCostUsd     *float64 `json:"nativeCostUsd,omitempty"`
+}
+
+// LlmInferenceUsage is the versioned additive usage atom on LlmCallEvent:
+// one logical inference and its ordered physical attempts. A nil group is
+// legacy/partial evidence and always valid.
+type LlmInferenceUsage struct {
+	// Version must be LlmInferenceUsageVersionV2; InferenceID is the
+	// logical identity. Evidence, Completeness and Status accept only
+	// their declared constants.
+	Version      string                   `json:"version"`
+	InferenceID  string                   `json:"inferenceId"`
+	Evidence     LlmInferenceEvidence     `json:"evidence"`
+	Completeness LlmInferenceCompleteness `json:"completeness"`
+	Status       LlmInferenceStatus       `json:"status"`
+
+	// Provider and GenerationID are serving identity when exposed;
+	// RequestedModel is asked for, ResolvedModel is what responded;
+	// Route and Auth are free-form serving metadata.
+	Provider       string `json:"provider,omitempty"`
+	GenerationID   string `json:"generationId,omitempty"`
+	RequestedModel string `json:"requestedModel,omitempty"`
+	ResolvedModel  string `json:"resolvedModel,omitempty"`
+	Route          string `json:"route,omitempty"`
+	Auth           string `json:"auth,omitempty"`
+
+	// Counts flattens the token classes and native charge onto the object.
+	LlmInferenceCounts
+
+	// Attempts are the ordered physical attempts behind the inference.
+	Attempts []LlmInferenceAttempt `json:"attempts"`
+}
+
+// LlmInferenceAttempt is one physical serving attempt behind a logical
+// inference. Ordinals are 1-based, contiguous, and slice-ordered.
+// AttemptID is unique per inference; stamps are decimal nanoseconds that
+// may be absent, with end never preceding start when both are present.
+type LlmInferenceAttempt struct {
+	AttemptID         string `json:"attemptId"`
+	Ordinal           int    `json:"ordinal"`
+	StartTimeUnixNano string `json:"startTimeUnixNano,omitempty"`
+	EndTimeUnixNano   string `json:"endTimeUnixNano,omitempty"`
+
+	// Counts flattens the token classes and native charge onto the object.
+	LlmInferenceCounts
+}
+
+// validate reports whether the usage atom is well-formed. A nil receiver
+// is valid: absent usage-v2 is legacy/partial evidence. MarshalEvent and
+// the UnmarshalEvent llm_call branch both apply it, so neither in-memory
+// values nor stored JSON bypass the checks.
+func (u *LlmInferenceUsage) validate() error {
+	if u == nil {
+		return nil
+	}
+	if u.Version != LlmInferenceUsageVersionV2 {
+		return fmt.Errorf("agent: llm inference usage version %q must be %q", u.Version, LlmInferenceUsageVersionV2)
+	}
+	if u.InferenceID == "" {
+		return fmt.Errorf("agent: llm inference usage requires an inference id")
+	}
+	switch u.Evidence {
+	case LlmInferenceEvidenceProvider, LlmInferenceEvidenceAggregate:
+	default:
+		return fmt.Errorf("agent: llm inference usage evidence %q is unknown", string(u.Evidence))
+	}
+	switch u.Completeness {
+	case LlmInferenceCompletenessComplete, LlmInferenceCompletenessPartial, LlmInferenceCompletenessUnknown:
+	default:
+		return fmt.Errorf("agent: llm inference usage completeness %q is unknown", string(u.Completeness))
+	}
+	switch u.Status {
+	case LlmInferenceStatusSucceeded, LlmInferenceStatusFailed:
+	default:
+		return fmt.Errorf("agent: llm inference usage status %q is unknown", string(u.Status))
+	}
+	if err := checkInferenceCounts("inference", u.LlmInferenceCounts); err != nil {
+		return err
+	}
+	if len(u.Attempts) == 0 {
+		return fmt.Errorf("agent: llm inference usage requires at least one attempt")
+	}
+	seen := make(map[string]struct{}, len(u.Attempts))
+	for i := range u.Attempts {
+		a := &u.Attempts[i]
+		if a.AttemptID == "" {
+			return fmt.Errorf("agent: llm inference usage attempt %d requires an attempt id", i+1)
+		}
+		if _, dup := seen[a.AttemptID]; dup {
+			return fmt.Errorf("agent: llm inference usage attempt id %q is duplicated", a.AttemptID)
+		}
+		seen[a.AttemptID] = struct{}{}
+		if a.Ordinal != i+1 {
+			return fmt.Errorf("agent: llm inference usage attempt %q ordinal %d must be %d in order", a.AttemptID, a.Ordinal, i+1)
+		}
+		if err := checkInferenceCounts(fmt.Sprintf("attempt %q", a.AttemptID), a.LlmInferenceCounts); err != nil {
+			return err
+		}
+		if err := validateInferenceInterval(a.AttemptID, a.StartTimeUnixNano, a.EndTimeUnixNano); err != nil {
+			return err
+		}
+	}
+	if u.Completeness == LlmInferenceCompletenessComplete {
+		if err := u.validateCompleteTotals(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkInferenceCounts rejects negative counts, non-finite or negative
+// charges, and reasoning above output. Nil means absent and is valid.
+func checkInferenceCounts(where string, c LlmInferenceCounts) error {
+	counts := []struct {
+		name  string
+		value *int64
+	}{{"inputTokens", c.InputTokens}, {"outputTokens", c.OutputTokens}, {"cachedInputTokens", c.CachedInputTokens}, {"cacheWriteTokens", c.CacheWriteTokens}, {"reasoningTokens", c.ReasoningTokens}}
+	for _, f := range counts {
+		if f.value != nil && *f.value < 0 {
+			return fmt.Errorf("agent: llm inference usage %s %s count %d is negative", where, f.name, *f.value)
+		}
+	}
+	if c.NativeCostUsd != nil && (*c.NativeCostUsd < 0 || math.IsNaN(*c.NativeCostUsd) || math.IsInf(*c.NativeCostUsd, 0)) {
+		return fmt.Errorf("agent: llm inference usage %s native charge %v is not finite nonnegative", where, *c.NativeCostUsd)
+	}
+	if c.ReasoningTokens != nil && c.OutputTokens != nil && *c.ReasoningTokens > *c.OutputTokens {
+		return fmt.Errorf("agent: llm inference usage %s reasoning %d exceeds output %d", where, *c.ReasoningTokens, *c.OutputTokens)
+	}
+	return nil
+}
+
+// validateInferenceInterval rejects malformed decimal-nanosecond stamps
+// and an end that precedes its start. Either stamp may be absent.
+func validateInferenceInterval(attemptID, start, end string) error {
+	if start == "" && end == "" {
+		return nil
+	}
+	var startV, endV int64
+	if start != "" {
+		v, err := strconv.ParseInt(start, 10, 64)
+		if err != nil {
+			return fmt.Errorf("agent: llm inference usage attempt %q start time %q is not decimal nanoseconds", attemptID, start)
+		}
+		startV = v
+	}
+	if end != "" {
+		v, err := strconv.ParseInt(end, 10, 64)
+		if err != nil {
+			return fmt.Errorf("agent: llm inference usage attempt %q end time %q is not decimal nanoseconds", attemptID, end)
+		}
+		endV = v
+	}
+	if start != "" && end != "" && endV < startV {
+		return fmt.Errorf("agent: llm inference usage attempt %q end time precedes start time", attemptID)
+	}
+	return nil
+}
+
+// intCounts returns the five token classes in wire order for indexed scans.
+func (c LlmInferenceCounts) intCounts() []*int64 {
+	return []*int64{c.InputTokens, c.OutputTokens, c.CachedInputTokens, c.CacheWriteTokens, c.ReasoningTokens}
+}
+
+// inferenceChargeEqual compares native-charge totals within a small
+// relative tolerance so decimal sums that are inexact in binary
+// (0.1 + 0.2 vs 0.3) still validate. Exact equality stays the fast path.
+func inferenceChargeEqual(total, sum float64) bool {
+	if total == sum {
+		return true
+	}
+	diff := math.Abs(total - sum)
+	tol := 1e-9 * math.Max(1, math.Max(math.Abs(total), math.Abs(sum)))
+	return diff <= tol
+}
+
+// validateCompleteTotals requires each present logical total to equal its
+// attempt sum with uniform presence per class; a class absent everywhere
+// stays consistent. Partial and unknown evidence skip this.
+func (u *LlmInferenceUsage) validateCompleteTotals() error {
+	names := []string{"inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteTokens", "reasoningTokens"}
+	logical := u.LlmInferenceCounts.intCounts()
+	for i, name := range names {
+		var sum int64
+		present := 0
+		for _, a := range u.Attempts {
+			if v := a.LlmInferenceCounts.intCounts()[i]; v != nil {
+				sum += *v
+				present++
+			}
+		}
+		switch {
+		case logical[i] == nil:
+			if present > 0 {
+				return fmt.Errorf("agent: llm inference usage complete %s total is absent but attempts report values", name)
+			}
+		case present != len(u.Attempts):
+			return fmt.Errorf("agent: llm inference usage complete %s total is present but an attempt omits it", name)
+		case *logical[i] != sum:
+			return fmt.Errorf("agent: llm inference usage complete %s total %d does not equal attempt sum %d", name, *logical[i], sum)
+		}
+	}
+	var chargeSum float64
+	chargePresent := 0
+	for _, a := range u.Attempts {
+		if a.NativeCostUsd != nil {
+			chargeSum += *a.NativeCostUsd
+			chargePresent++
+		}
+	}
+	switch {
+	case u.NativeCostUsd == nil:
+		if chargePresent > 0 {
+			return fmt.Errorf("agent: llm inference usage complete native charge total is absent but attempts report values")
+		}
+	case chargePresent != len(u.Attempts):
+		return fmt.Errorf("agent: llm inference usage complete native charge total is present but an attempt omits it")
+	case !inferenceChargeEqual(*u.NativeCostUsd, chargeSum):
+		return fmt.Errorf("agent: llm inference usage complete native charge total %v does not equal attempt sum %v", *u.NativeCostUsd, chargeSum)
+	}
+	return nil
+}
 
 // ToolUseEvent fires when the agent invokes a tool. Verbatim port of
 // AgentToolUseEvent.
@@ -601,6 +878,16 @@ func MarshalEvent(e Event) ([]byte, error) {
 	if e == nil {
 		return nil, fmt.Errorf("agent: cannot marshal nil Event")
 	}
+	switch ev := e.(type) {
+	case LlmCallEvent:
+		if err := ev.UsageV2.validate(); err != nil {
+			return nil, err
+		}
+	case *LlmCallEvent:
+		if err := ev.UsageV2.validate(); err != nil {
+			return nil, err
+		}
+	}
 	// Marshal the variant first to capture its native field layout.
 	variantBytes, err := json.Marshal(e)
 	if err != nil {
@@ -653,6 +940,9 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	case EventLlmCall:
 		var ev LlmCallEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode LlmCallEvent: %w", err)
+		}
+		if err := ev.UsageV2.validate(); err != nil {
 			return nil, fmt.Errorf("agent: decode LlmCallEvent: %w", err)
 		}
 		return ev, nil
