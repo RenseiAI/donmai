@@ -366,6 +366,53 @@ func TestNativeRecipeCompilesDeterministicExactFacts(t *testing.T) {
 	}
 }
 
+func rebindNativeFactsWithValidDigests(t *testing.T, base ResolvedCapabilityParameterBinding, configTools, surfaceIDs []string) ResolvedCapabilityParameterBinding {
+	t.Helper()
+	rogueRaw, rogueDigest, err := codeintelbridge.CanonicalRuntimeConfig(codeintelbridge.RuntimeConfigV1{ContractVersion: codeintelbridge.RuntimeConfigVersion, RepoPath: "pkg/sub", Tools: configTools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	surface := make([]agent.CapabilitySurfaceIdentity, 0, len(surfaceIDs))
+	for _, id := range surfaceIDs {
+		surface = append(surface, agent.CapabilitySurfaceIdentity{Kind: agent.CapabilitySurfaceNativeTool, ID: id})
+	}
+	selectedDigest, err := agent.CapabilitySelectedSurfaceDigest(surface)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := base
+	bindingCopy := *mutated.Realization.ParameterBinding
+	bindingCopy.SelectedSurface = surface
+	bindingCopy.SelectedSurfaceDigest = selectedDigest
+	bindingCopy.RuntimeConfigDigest = rogueDigest
+	newBindingDigest, err := agent.CapabilityParameterBindingDigest(bindingCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingCopy.BindingDigest = newBindingDigest
+	mutated.Realization.ParameterBinding = &bindingCopy
+	mutated.Materialization.Config = rogueRaw
+	mutated.Materialization.ConfigDigest = rogueDigest
+	mutated.Materialization.BindingDigest = newBindingDigest
+	return mutated
+}
+
+func TestNativeFactsRefuseUnadmittedToolWithValidDigests(t *testing.T) {
+	_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
+	rogue := rebindNativeFactsWithValidDigests(t, resolved, []string{"no_such_tool"}, []string{"no_such_tool"})
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", rogue); err == nil || !strings.Contains(err.Error(), "not admitted") {
+		t.Fatalf("unadmitted tool with valid digests compiled: err=%v", err)
+	}
+}
+
+func TestNativeFactsRefuseSurfaceConfigDivergenceWithValidDigests(t *testing.T) {
+	_, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
+	rogue := rebindNativeFactsWithValidDigests(t, resolved, []string{"af_code_get_repo_map"}, []string{"af_code_get_repo_map", "af_code_search_symbols"})
+	if _, _, err := CompileNativeCodeIntelFacts("/abs/worktree", rogue); err == nil || !strings.Contains(err.Error(), "surface and config differ") {
+		t.Fatalf("surface/config divergence with valid digests compiled: err=%v", err)
+	}
+}
+
 func TestNativeFactsRefusePolicyAndMismatch(t *testing.T) {
 	registry, resolved := nativeRecipeRegistryFixture(t, "example.code-intelligence/v1", `{"codeIntel":{"repoPath":"pkg/sub"}}`)
 	unknownRaw := `{"codeIntel":{"tools":["no_such_tool"]}}`
