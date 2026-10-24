@@ -239,3 +239,106 @@ func TestJournalSnapshotMarshalsOnlyAggregates(t *testing.T) {
 		}
 	}
 }
+
+func TestJournalSnapshotQuarantineDerivedAckTimeUnknown(t *testing.T) {
+	session := "snapshot-quarantine-ack-time"
+	dir := t.TempDir()
+	j, err := OpenJournal(dir, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	first := snapshotFixture(t, session, 1, base)
+	second := snapshotFixture(t, session, 2, base.Add(time.Minute))
+	for _, r := range []Record{first, second} {
+		if err := j.Append(session, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Ack(1); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an interrupted ack write: quarantine advances the effective
+	// acknowledgement without updating ack.json, the crash-recovery shape
+	// load() already recovers.
+	entry, err := MarshalCompact(quarantineRecord{Record: second, Status: 409, Reason: "platform returned HTTP 409"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, quarantineFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(entry, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	snap := j.Snapshot(base.Add(10 * time.Minute))
+	if snap.Status != JournalSnapshotAvailable {
+		t.Fatalf("status = %q, want available", snap.Status)
+	}
+	mustUint(t, snap.AckedSequence, 2, "quarantine-derived acked sequence")
+	if snap.AckedAt != nil {
+		t.Fatalf("acked time = %v, want nil (quarantine-derived unknown)", snap.AckedAt)
+	}
+	mustUint(t, snap.QuarantineTotal, 1, "quarantine total")
+	mustUint(t, snap.QuarantineConflicts, 1, "quarantine conflicts")
+	mustUint(t, snap.PendingRecords, 0, "pending records")
+}
+
+func TestJournalSnapshotCountsNonConflictQuarantine(t *testing.T) {
+	for _, status := range []int{400, 404, 413} {
+		t.Run("", func(t *testing.T) {
+			session := "snapshot-non-conflict"
+			dir := t.TempDir()
+			j, err := OpenJournal(dir, session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = j.Close() }()
+			base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+			r := snapshotFixture(t, session, 1, base)
+			if err := j.Append(session, r); err != nil {
+				t.Fatal(err)
+			}
+			if err := j.Quarantine([]Record{r}, status, "platform returned permanent disposition"); err != nil {
+				t.Fatal(err)
+			}
+			snap := j.Snapshot(base.Add(time.Minute))
+			if snap.Status != JournalSnapshotAvailable {
+				t.Fatalf("status %d: status = %q, want available", status, snap.Status)
+			}
+			mustUint(t, snap.QuarantineTotal, 1, "quarantine total")
+			mustUint(t, snap.QuarantineConflicts, 0, "quarantine conflicts")
+			mustUint(t, snap.AckedSequence, 1, "acked sequence")
+		})
+	}
+}
+
+func TestJournalSnapshotNegativeAgeClamped(t *testing.T) {
+	session := "snapshot-negative-age"
+	dir := t.TempDir()
+	j, err := OpenJournal(dir, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+		t.Fatal(err)
+	}
+	snap := j.Snapshot(base.Add(-time.Hour))
+	if snap.Status != JournalSnapshotAvailable {
+		t.Fatalf("status = %q, want available", snap.Status)
+	}
+	if snap.OldestUnacknowledgedAge == nil {
+		t.Fatal("oldest age = nil, want 0 clamped")
+	}
+	if *snap.OldestUnacknowledgedAge != 0 {
+		t.Fatalf("oldest age = %v, want 0 clamped", *snap.OldestUnacknowledgedAge)
+	}
+}
