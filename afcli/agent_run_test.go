@@ -424,11 +424,11 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 			want: runner.MaxSessionDurationCeiling,
 		},
 		{
-			name: "exact unlimited duration disables the runner timeout",
+			name: "dispatched unlimited duration clamps to the safety ceiling",
 			detail: &daemon.SessionDetail{
 				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds},
 			},
-			want: -1,
+			want: runner.MaxSessionDurationCeiling,
 		},
 		{
 			name: "interactive session keeps precedence over unlimited duration",
@@ -472,8 +472,8 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 // are malformed and refused before spawn on both the legacy-sibling door
 // (no operational payload, sibling adopted) and the operational-payload
 // door (receipt-bearing work, sibling compared). Exact -1 passes through
-// on the legacy door — the unlimited value the runner disables its
-// session-duration timer from.
+// on the legacy door — the unlimited value the dispatched worker clamps to
+// the outer safety ceiling (only interactive sessions run uncapped).
 func TestDetailToQueuedWorkRefusesBelowUnlimitedDuration(t *testing.T) {
 	below := prompt.UnlimitedStageDurationSeconds - 1
 

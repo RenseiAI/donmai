@@ -231,14 +231,17 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 //
 //   - Interactive sessions are human-driven and may remain attached beyond any
 //     budget the dispatcher sized, so a negative duration disables the
-//     runner-side cap entirely. Unchanged.
-//   - A dispatched stage budget carrying exactly
+//     runner-side cap entirely. Unchanged: interactive + explicit unlimited
+//     still runs with no outer timer.
+//   - A dispatched (non-interactive) stage budget carrying exactly
 //     prompt.UnlimitedStageDurationSeconds (-1) is the sole explicit
-//     unlimited duration: the runner-side wall-clock cap is disabled and no
-//     session-duration timer is installed. Every other enforcement dimension
+//     unlimited duration: the stage carries no duration cap of its own, so
+//     the runner-side wall-clock falls back to
+//     runner.MaxSessionDurationCeiling — the dispatched-input safety ceiling,
+//     not "no timer". Every other enforcement dimension
 //     (token, sub-agent, cost, idle, cancellation, operator-stop, and the
-//     parent-context bound) stays armed — only the stage-duration timer is
-//     bypassed.
+//     parent-context bound) stays armed — only the stage-duration cap is
+//     lifted, and the outer 24 h ceiling still bounds the session.
 //   - A dispatched stage budget carrying a positive maxDurationSeconds IS the
 //     session's maximum duration. The platform sized the stage; the runner's
 //     two-hour default must not silently truncate it. It would: the value
@@ -273,7 +276,11 @@ func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
 		return 0
 	}
 	if budget.MaxDurationSeconds == prompt.UnlimitedStageDurationSeconds {
-		return -1
+		// Dispatched unlimited means "no stage cap", not "no outer timer":
+		// the session still runs under the dispatched-input safety ceiling
+		// so a wedged session frees its host slot within a day. Only
+		// interactive sessions (handled above) run without an outer timer.
+		return runner.MaxSessionDurationCeiling
 	}
 	if budget.MaxDurationSeconds <= 0 {
 		return 0

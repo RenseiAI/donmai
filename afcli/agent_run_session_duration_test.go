@@ -281,15 +281,16 @@ func TestAgentRunWithoutBudgetKeepsTheRunnerDefault(t *testing.T) {
 	}
 }
 
-// TestAgentRunUnlimitedBudgetInstallsNoDeadline drives the whole production
+// TestAgentRunUnlimitedBudgetClampsToCeiling drives the whole production
 // chain a daemon-spawned worker walks for explicit unlimited duration — raw
 // poll JSON → PollItemToSessionDetail → session-detail HTTP →
 // fetchSessionDetail → agentRunMaxSessionDuration → runner.Options →
-// runner.Run — and pins that the provider Spawn observes NO run-context
-// deadline. Removing the exact -1 branch from agentRunMaxSessionDuration is
-// the red mutant: the worker would fall back to the runner default and Spawn
-// would observe a deadline.
-func TestAgentRunUnlimitedBudgetInstallsNoDeadline(t *testing.T) {
+// runner.Run — and pins that a DISPATCHED (non-interactive) session with the
+// explicit unlimited sentinel observes the dispatched-input safety ceiling
+// (about 24 h), not an unbounded context. Mapping dispatched -1 to -1 is the
+// red mutant: Spawn would then observe no deadline. Falling back to the
+// runner default is the other red mutant: Spawn would observe a 2 h deadline.
+func TestAgentRunUnlimitedBudgetClampsToCeiling(t *testing.T) {
 	repository := makeSpecDecoratorBareRepo(t)
 	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -336,8 +337,8 @@ func TestAgentRunUnlimitedBudgetInstallsNoDeadline(t *testing.T) {
 	if detail.StageBudget == nil || detail.StageBudget.MaxDurationSeconds != prompt.UnlimitedStageDurationSeconds {
 		t.Fatalf("fetched stage budget = %+v; want explicit unlimited duration", detail.StageBudget)
 	}
-	if got := agentRunMaxSessionDuration(detail); got != -1 {
-		t.Fatalf("agentRunMaxSessionDuration() = %s; want no runner-side cap (-1)", got)
+	if got := agentRunMaxSessionDuration(detail); got != runner.MaxSessionDurationCeiling {
+		t.Fatalf("agentRunMaxSessionDuration() = %s; want dispatched safety ceiling %s", got, runner.MaxSessionDurationCeiling)
 	}
 
 	queued, err := detailToQueuedWork(detail)
@@ -382,12 +383,47 @@ func TestAgentRunUnlimitedBudgetInstallsNoDeadline(t *testing.T) {
 	// would clamp the run context and mask the value under test (context.
 	// WithTimeout keeps the earlier of the two). The go test binary's own
 	// -timeout is the backstop for a wedged run.
+	dispatchedAt := time.Now()
 	if _, err := run.Run(t.Context(), queued); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if deadline, seen := probe.observed(); seen {
-		t.Fatalf("run context carried deadline %s; want no session-duration timer for explicit unlimited duration", deadline)
+	const slack = 2 * time.Minute
+	deadline, seen := probe.observed()
+	if !seen {
+		t.Fatal("run context carried no deadline; want dispatched safety ceiling for explicit unlimited duration")
+	}
+	want := runner.MaxSessionDurationCeiling
+	if got := deadline.Sub(dispatchedAt); got < want-slack || got > want+slack {
+		t.Fatalf("run context deadline is %s after dispatch; want the dispatched ceiling %s (±%s)",
+			got.Round(time.Second), want, slack)
+	}
+}
+
+// TestAgentRunInteractiveUnlimitedBudgetInstallsNoDeadline pins the only
+// uncapped lane: an interactive session carrying the explicit unlimited
+// sentinel derives to -1 (no outer session-duration timer). The dispatched
+// ceiling test above drives the full runner.Run chain for the headless lane;
+// the interactive lane parks on its PTY/inject loop, so a full Run here would
+// hang the suite — the derivation plus the table row in
+// TestAgentRunMaxSessionDuration pin the lane without entering that loop.
+// Clamping interactive -1 to the ceiling is the red mutant: the derivation
+// would then return the ceiling instead of -1.
+func TestAgentRunInteractiveUnlimitedBudgetInstallsNoDeadline(t *testing.T) {
+	detail := &daemon.SessionDetail{
+		SessionID:   "session-interactive-unlimited",
+		Mode:        prompt.InteractiveRunMode,
+		StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds},
+	}
+	if got := agentRunMaxSessionDuration(detail); got != -1 {
+		t.Fatalf("agentRunMaxSessionDuration() = %s; want no runner-side cap (-1) for interactive unlimited", got)
+	}
+	queued, err := detailToQueuedWork(detail)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if queued.StageBudget == nil || queued.StageBudget.MaxDurationSeconds != prompt.UnlimitedStageDurationSeconds {
+		t.Fatalf("queued work stage budget = %+v; want explicit unlimited duration", queued.StageBudget)
 	}
 }
 
