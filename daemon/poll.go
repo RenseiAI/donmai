@@ -1642,7 +1642,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 	// (see the empty-payload branch) and the runner adopts it as its own
 	// authority — sibling and payload agree by construction.
 	if len(item.OperationalPayload) == 0 && item.MaxDuration > 0 &&
-		(item.StageBudget == nil || item.StageBudget.MaxDurationSeconds <= 0) {
+		(item.StageBudget == nil || item.StageBudget.MaxDurationSeconds == 0) {
 		backfilled := &PollStageBudget{MaxDurationSeconds: item.MaxDuration}
 		if item.StageBudget != nil {
 			copied := *item.StageBudget
