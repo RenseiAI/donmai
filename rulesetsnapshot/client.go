@@ -82,6 +82,24 @@ type Client struct {
 	jwksMu        sync.Mutex
 	jwks          map[string]ed25519.PublicKey
 	jwksFetchedAt time.Time
+
+	// pollMu guards the poll-boundary clock observations used to detect a
+	// forward wall-clock discontinuity (suspend/resume or an operator clock
+	// step). lastWall is the previous injected wall reading, lastMono the
+	// previous real monotonic reading, and pollInterval the ticker cadence
+	// last supplied to Start. All three exist only to decide when to kick
+	// a background refresh; they never affect the snapshot served.
+	pollMu       sync.Mutex
+	lastWall     time.Time
+	lastMono     time.Time
+	havePoll     bool
+	pollInterval time.Duration
+
+	// refreshMu guards refreshInFlight, the single shared background-refresh
+	// slot. At most one kicked refresh (periodic, discontinuity, or
+	// expired-snapshot) is ever in flight; concurrent kicks coalesce.
+	refreshMu       sync.Mutex
+	refreshInFlight bool
 }
 
 // NewClient constructs a Client and best-effort loads any on-disk
@@ -150,7 +168,15 @@ func (c *Client) LastError() error {
 // computed Status. ok is false only when nothing has EVER verified — not
 // even a persisted copy. Age/Degraded in Status are always computed
 // relative to now, never frozen at fetch time (Consul `Age` semantics).
+//
+// Current is also a poll boundary: when Start has supplied a refresh
+// interval, a forward wall-clock discontinuity larger than that interval
+// (injected wall elapsed far ahead of real monotonic elapsed, as after a
+// suspend/resume or an operator clock step) kicks one shared background
+// refresh. The kick never delays this read — the cached snapshot is
+// returned immediately either way.
 func (c *Client) Current() (Snapshot, Status, bool) {
+	c.observePoll()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.current == nil {
@@ -167,6 +193,73 @@ func (c *Client) Current() (Snapshot, Status, bool) {
 		CompiledAt: c.current.CompiledAt,
 	}
 	return *c.current, status, true
+}
+
+// observePoll records this poll boundary's wall and monotonic readings and
+// kicks a background refresh when the injected wall clock has jumped forward
+// past the real monotonic clock by more than the Start interval. A normal
+// passage of time advances both clocks together, so their difference stays
+// near zero; a suspend/resume or forward step advances wall far beyond
+// monotonic. The kick is coalesced and never awaited.
+func (c *Client) observePoll() {
+	nowWall := c.now()
+	realNow := time.Now()
+	c.pollMu.Lock()
+	interval := c.pollInterval
+	shouldKick := false
+	if c.havePoll && interval > 0 && !c.lastWall.IsZero() {
+		wallElapsed := nowWall.Sub(c.lastWall)
+		monoElapsed := realNow.Sub(c.lastMono)
+		if wallElapsed-monoElapsed > interval {
+			shouldKick = true
+		}
+	}
+	c.lastWall = nowWall
+	c.lastMono = realNow
+	c.havePoll = true
+	c.pollMu.Unlock()
+	if shouldKick {
+		c.kickRefresh(context.Background())
+	}
+}
+
+// RequestRefresh kicks one shared background refresh and returns
+// immediately without waiting for it. Concurrent kicks (poll ticker,
+// discontinuity observations, expired-snapshot refusals) coalesce: while a
+// kicked refresh is in flight, further kicks are dropped. The refresh runs
+// under a 10-second bound even when Config.HTTPClient carries no timeout of
+// its own, adopts through the usual verified Refresh path on success, and
+// preserves the last verified snapshot on failure. A no-op when no snapshot
+// source is configured.
+func (c *Client) RequestRefresh() {
+	c.kickRefresh(context.Background())
+}
+
+// kickRefresh starts the coalesced background refresh described by
+// RequestRefresh, parented by parent for cancellation. At most one refresh
+// is ever in flight.
+func (c *Client) kickRefresh(parent context.Context) {
+	c.refreshMu.Lock()
+	if c.refreshInFlight {
+		c.refreshMu.Unlock()
+		return
+	}
+	if !c.Configured() {
+		c.refreshMu.Unlock()
+		return
+	}
+	c.refreshInFlight = true
+	c.refreshMu.Unlock()
+	go func() {
+		defer func() {
+			c.refreshMu.Lock()
+			c.refreshInFlight = false
+			c.refreshMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+		defer cancel()
+		_ = c.Refresh(ctx)
+	}()
 }
 
 // Refresh fetches, verifies, and — on success — adopts and durably persists
@@ -300,8 +393,11 @@ func (c *Client) Start(ctx context.Context, interval time.Duration) {
 	if !c.Configured() || interval <= 0 {
 		return
 	}
+	c.pollMu.Lock()
+	c.pollInterval = interval
+	c.pollMu.Unlock()
 	go func() {
-		_ = c.Refresh(ctx)
+		c.kickRefresh(ctx)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -309,7 +405,7 @@ func (c *Client) Start(ctx context.Context, interval time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = c.Refresh(ctx)
+				c.kickRefresh(ctx)
 			}
 		}
 	}()

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -293,5 +294,197 @@ func TestClient_DegradedAndExpired(t *testing.T) {
 	}
 	if status.Age <= c.RefuseAfter() {
 		t.Fatalf("Age = %v, want > RefuseAfter (%v)", status.Age, c.RefuseAfter())
+	}
+}
+
+// TestClient_ForwardDiscontinuityKicksSingleRefresh proves a forward
+// wall-clock jump greater than the refresh interval triggers exactly one
+// background fetch at the next Current boundary, without waiting another
+// full interval.
+func TestClient_ForwardDiscontinuityKicksSingleRefresh(t *testing.T) {
+	t.Parallel()
+	pub, priv := mustGenerateKey(t)
+	var hits atomic.Int64
+	base := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buildSignedSnapshot(t, priv, signedSnapshotOpts{compiledAt: base}))
+	}))
+	t.Cleanup(srv.Close)
+
+	now := base
+	c, err := NewClient(Config{
+		Endpoint:      srv.URL,
+		TrustedKeys:   map[string]ed25519.PublicKey{"ksk_test": pub},
+		StatePath:     filepath.Join(t.TempDir(), "snap.json"),
+		DegradedAfter: 5 * time.Minute,
+		RefuseAfter:   30 * time.Minute,
+		Now:           func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("setup Refresh hits = %d, want 1", got)
+	}
+	// Wire the refresh interval the way Start would, without starting the
+	// ticker's own async fetch.
+	c.pollMu.Lock()
+	c.pollInterval = time.Minute
+	c.pollMu.Unlock()
+
+	if _, _, ok := c.Current(); !ok {
+		t.Fatal("Current() ok=false after Refresh")
+	}
+	if _, _, ok := c.Current(); !ok {
+		t.Fatal("second Current() ok=false")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("poll without discontinuity fetched: hits = %d, want 1", got)
+	}
+
+	now = base.Add(5 * time.Minute) // forward jump greater than the interval
+	if _, _, ok := c.Current(); !ok {
+		t.Fatal("Current() ok=false after wall jump")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("forward wall jump did not kick a refresh: hits = %d, want 2", hits.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A further poll at the same jumped time must not start a second fetch.
+	if _, _, ok := c.Current(); !ok {
+		t.Fatal("Current() ok=false on repeat poll")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("wall jump kicked %d fetches, want exactly 2 total (1 setup + 1 kick)", got)
+	}
+}
+
+// TestClient_ConcurrentKicksCoalesceToOneFetch proves concurrent background
+// kicks share a single in-flight fetch.
+func TestClient_ConcurrentKicksCoalesceToOneFetch(t *testing.T) {
+	t.Parallel()
+	pub, priv := mustGenerateKey(t)
+	var hits atomic.Int64
+	release := make(chan struct{})
+	var block atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		if block.Load() {
+			<-release
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buildSignedSnapshot(t, priv, signedSnapshotOpts{}))
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := NewClient(Config{
+		Endpoint:    srv.URL,
+		TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
+		StatePath:   filepath.Join(t.TempDir(), "snap.json"),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("setup Refresh: %v", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("setup hits = %d, want 1", got)
+	}
+
+	block.Store(true)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.RequestRefresh()
+		}()
+	}
+	wg.Wait()
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("concurrent kicks did not start a fetch: hits = %d, want 2", hits.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Further kicks while the first is still in flight must coalesce.
+	for i := 0; i < 10; i++ {
+		c.RequestRefresh()
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("concurrent kicks started %d fetches, want exactly 2 total (1 setup + 1 shared)", got)
+	}
+	close(release)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		c.refreshMu.Lock()
+		inFlight := c.refreshInFlight
+		c.refreshMu.Unlock()
+		if !inFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("kicked refresh did not finish after release")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestClient_BackgroundKickAdoptsVerifiedSnapshot proves a kicked refresh
+// adopts through the usual verified path: after the background fetch
+// succeeds, Current serves the newer snapshot.
+func TestClient_BackgroundKickAdoptsVerifiedSnapshot(t *testing.T) {
+	t.Parallel()
+	pub, priv := mustGenerateKey(t)
+	var hits atomic.Int64
+	var revision atomic.Int64
+	revision.Store(1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buildSignedSnapshot(t, priv, signedSnapshotOpts{revision: int(revision.Load())}))
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := NewClient(Config{
+		Endpoint:    srv.URL,
+		TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
+		StatePath:   filepath.Join(t.TempDir(), "snap.json"),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("setup Refresh: %v", err)
+	}
+	snap, _, _ := c.Current()
+	if snap.Revision != 1 {
+		t.Fatalf("setup revision = %d, want 1", snap.Revision)
+	}
+
+	revision.Store(2)
+	c.RequestRefresh()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cur, _, ok := c.Current()
+		if ok && cur.Revision == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background kick did not adopt revision 2 (hits=%d)", hits.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
