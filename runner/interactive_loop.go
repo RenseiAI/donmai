@@ -465,6 +465,9 @@ func (r *Runner) dispatchInteractive(
 	// best-effort and never blocks the PTY: drops on a slow consumer,
 	// silence when the harness reports no signal. The pi leg reports
 	// compaction markers through its RPC stream instead of a file poll.
+	// The launch context file lands beside the sidecar first, so a later
+	// compaction can re-inject it — best-effort like the watcher itself.
+	writeLaunchContextFile(handle, qw.MemoryBlock, qw.InitialPrompt, r.logger)
 	stopContextWatch := r.startContextUsageWatch(interactiveCtx, worktreePath, handle, sink)
 	defer stopContextWatch()
 	handleEvents := handle.Events()
@@ -821,6 +824,38 @@ func resolveContextUsageSource(handle agent.Handle) contextUsageSource {
 		}
 	}
 	return contextUsageSource{}
+}
+
+// writeLaunchContextFile stages the runner's launch context beside the
+// session's statusline sidecar for the compact hook: the dispatch-time
+// memory block plus the launch seed, each under its own heading. Only the
+// claude leg carries a sidecar; any other handle, or an empty context, is
+// a silent no-op. Best-effort: never a failed session.
+func writeLaunchContextFile(handle agent.Handle, memoryBlock, initialPrompt string, logger *slog.Logger) {
+	memory, prompt := strings.TrimSpace(memoryBlock), strings.TrimSpace(initialPrompt)
+	if memory == "" && prompt == "" {
+		return
+	}
+	sourcer, ok := handle.(agent.ContextUsageSourcer)
+	if !ok || sourcer == nil {
+		return
+	}
+	sidecar := strings.TrimSpace(sourcer.ContextUsageSidecarPath())
+	if sidecar == "" {
+		return
+	}
+	var text strings.Builder
+	text.WriteString("# Launch context\n\n")
+	if memory != "" {
+		text.WriteString("## Agent memory\n\n" + memory + "\n\n")
+	}
+	if prompt != "" {
+		text.WriteString("## Initial task\n\n" + prompt + "\n")
+	}
+	path := filepath.Join(filepath.Dir(sidecar), agent.ClaudeLaunchContextFileName)
+	if err := os.WriteFile(path, []byte(text.String()), 0o600); err != nil && logger != nil {
+		logger.Warn("[interactive] failed to stage launch context", "path", path, "err", err)
+	}
 }
 
 // drainInteractiveActivity runs once the PTY session is Done. A handle that
