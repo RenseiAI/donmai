@@ -10,6 +10,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.90 — 2026-10-25
+
+### Chores
+
+- Define and strictly validate the versioned inference-usage atom on llm_call
+- Define and generate the evidence-backed harness capability matrix v2
+- Publish Claude interactive statusline USD as live cost-only usage
+- Compile authority-bound native code-intelligence realization facts
+
 ## v0.72.89 — 2026-10-24
 
 ### Chores
