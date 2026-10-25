@@ -523,13 +523,14 @@ for line in '          cache-from: type=gha' '          cache-to: type=gha,mode=
 done
 
 # Runner policy: every workflow job runs on a standard hosted runner —
-# ubuntu-latest for Linux, macos-15 for the signed macOS release — and the
+# ubuntu-latest for Linux (ubuntu-24.04 where a job is pinned while the suite
+# is not yet green on the 26.04 image), macos-15 for the signed macOS release — and the
 # guard still reports on merge_group so queued PRs cannot stall. Job names
 # stay identical so required checks keep reporting. No self-hosted runner
 # may appear anywhere.
 ruby -ryaml - "${root_dir}" <<'RUBY'
 root_dir = ARGV.fetch(0)
-allowed = %w[ubuntu-latest macos-15]
+allowed = %w[ubuntu-latest ubuntu-24.04 macos-15]
 abort 'FAIL: no workflow files found' if Dir.glob(File.join(root_dir, '.github/workflows/*.yml')).empty?
 Dir.glob(File.join(root_dir, '.github/workflows/*.yml')).sort.each do |path|
   raw = File.binread(path).force_encoding('UTF-8')
