@@ -178,11 +178,14 @@ func newStopHookChannel() (*stopHookChannel, error) {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("stop-hook channel: write statusline script: %w", err)
 	}
-	// The SessionStart compact hook: on `source = compact` it marks the
-	// sidecar so the watcher emits one compaction notice, and re-injects
-	// the runner-written launch context file. Best-effort like the writer
-	// above: a session without it still runs, without compaction notices.
-	if err := os.WriteFile(c.path(sessionStartCompactScriptFile), []byte(sessionStartCompactScript(c.path(statusLineSidecarFile), c.path(agent.ClaudeLaunchContextFileName))), 0o700); err != nil { //nolint:gosec // the hook is executed by the CLI; it is owner-only
+	// The SessionStart compact hook: on `source = compact` it appends one
+	// line to its own compaction log (the watcher counts new lines) and
+	// re-injects the runner-written launch context file. Best-effort like
+	// the writer above: a session without it still runs, without
+	// compaction notices. The hook never touches the sidecar, so a later
+	// statusline rewrite cannot erase an unread compaction and the two
+	// writers never race each other.
+	if err := os.WriteFile(c.path(sessionStartCompactScriptFile), []byte(sessionStartCompactScript(c.path(agent.ClaudeCompactionLogFileName), c.path(agent.ClaudeLaunchContextFileName))), 0o700); err != nil { //nolint:gosec // the hook is executed by the CLI; it is owner-only
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("stop-hook channel: write compact script: %w", err)
 	}
@@ -202,6 +205,18 @@ func (c *stopHookChannel) sidecarPath() string {
 		return ""
 	}
 	return c.path(statusLineSidecarFile)
+}
+
+// compactionLogPath returns the session's compaction log path: the file
+// the compact hook appends one line per compaction. It lives beside the
+// sidecar in the same private drop directory. The watcher counts new
+// lines, so the signal is durable and single-writer — the statusline
+// writer never touches this file and the hook never touches the sidecar.
+func (c *stopHookChannel) compactionLogPath() string {
+	if c == nil {
+		return ""
+	}
+	return c.path(agent.ClaudeCompactionLogFileName)
 }
 
 // statusLineSidecarScriptFile is the statusLine command the CLI invokes
@@ -271,18 +286,21 @@ const sessionStartCompactScriptFile = "sessionstart-compact.sh"
 
 // sessionStartCompactScript renders the marker hook. Paths ride by value so
 // the command needs no environment. Any non-compact source exits silent;
-// without python3 only the marker is attempted, never the context.
-func sessionStartCompactScript(sidecar, contextFile string) string {
-	s, c := shellQuote(sidecar), shellQuote(contextFile)
+// without python3 only the marker is attempted, never the context. The
+// marker is an O_APPEND line in the hook's own log file — never a
+// read-modify-write on the sidecar — so a statusline rewrite landing
+// between the mark and the watcher's next poll cannot erase it, and the
+// two writers never race each other.
+func sessionStartCompactScript(compactionLog, contextFile string) string {
+	l, c := shellQuote(compactionLog), shellQuote(contextFile)
 	return `#!/bin/sh
 # donmai SessionStart compact hook. Generated per session; do not edit.
 set -u
-s=` + s + `
+l=` + l + `
 c=` + c + `
-tmp="$s.$$.tmp"
 input=$(cat)
 if command -v python3 >/dev/null 2>&1; then
-  printf '%s' "$input" | SIDECAR="$s" TMP="$tmp" CONTEXT_FILE="$c" python3 -c '
+  printf '%s' "$input" | COMPACT_LOG="$l" CONTEXT_FILE="$c" python3 -c '
 import json, os, sys
 try:
     doc = json.loads(sys.stdin.read())
@@ -290,25 +308,11 @@ except Exception:
     sys.exit(0)
 if doc.get("source") != "compact":
     sys.exit(0)
-sidecar = os.environ.get("SIDECAR", "")
-tmp = os.environ.get("TMP", "")
 try:
-    with open(sidecar) as f:
-        cur = json.load(f)
-    if not isinstance(cur, dict):
-        cur = {}
+    with open(os.environ.get("COMPACT_LOG", ""), "a") as f:
+        f.write("compact\n")
 except Exception:
-    cur = {}
-cur["compacted"] = True
-try:
-    with open(tmp, "w") as f:
-        json.dump(cur, f)
-    os.rename(tmp, sidecar)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except Exception:
-        pass
+    pass
 try:
     with open(os.environ.get("CONTEXT_FILE", "")) as f:
         text = f.read()
@@ -319,7 +323,7 @@ if text.strip():
 '
 else
   case "$input" in
-    *'"source"'*'"compact"'*) printf '{"compacted": true}' > "$tmp" 2>/dev/null && mv -f "$tmp" "$s" 2>/dev/null || rm -f "$tmp" 2>/dev/null ;;
+    *'"source"'*'"compact"'*) printf 'compact\n' >> "$l" 2>/dev/null ;;
   esac
 fi
 exit 0

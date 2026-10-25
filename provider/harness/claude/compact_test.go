@@ -56,54 +56,65 @@ func stageCompactChannel(t *testing.T, contextText, seed string) *stopHookChanne
 	return c
 }
 
-// markedSidecarNotice reads the sidecar through the production parser.
-// wantMarked=false expects the file byte-identical to seed.
-func markedSidecarNotice(t *testing.T, c *stopHookChannel, seed string, wantMarked bool) []byte {
+// compactionLogLines reads the hook's own append-only log. wantMarked=false
+// expects no log file; wantMarked=true expects exactly wantLines
+// non-empty lines. The sidecar check is separate: the hook must never
+// touch it, so the statusline writer stays the sole sidecar writer.
+func compactionLogLines(t *testing.T, c *stopHookChannel, wantLines int) []string {
+	t.Helper()
+	raw, err := os.ReadFile(c.compactionLogPath())
+	if wantLines == 0 {
+		if err == nil {
+			t.Fatalf("non-compact fire wrote the compaction log: %q", raw)
+		}
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read compaction log: %v", err)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) != wantLines {
+		t.Fatalf("compaction log has %d lines, want %d: %q", len(lines), wantLines, raw)
+	}
+	return lines
+}
+
+// assertSidecarUntouched pins the single-writer split: the compact hook
+// never writes the sidecar, so a statusline rewrite cannot race it.
+func assertSidecarUntouched(t *testing.T, c *stopHookChannel, seed string) {
 	t.Helper()
 	raw, err := os.ReadFile(c.sidecarPath())
+	if seed == "" {
+		if !os.IsNotExist(err) {
+			t.Fatalf("compact fire created the sidecar: %q", raw)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("read sidecar: %v", err)
 	}
-	if !wantMarked {
-		if string(raw) != seed {
-			t.Fatalf("non-compact fire rewrote the sidecar: %q", raw)
-		}
-		return raw
+	if string(raw) != seed {
+		t.Fatalf("compact fire rewrote the sidecar: %q, want seed %q", raw, seed)
 	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("sidecar is not JSON: %v (%q)", err, raw)
-	}
-	if doc["compacted"] != true {
-		t.Fatalf("sidecar lost the compaction mark: %q", raw)
-	}
-	notice, err := agent.ParseClaudeSidecarNotice(raw, "claude-code")
-	if err != nil {
-		t.Fatalf("ParseClaudeSidecarNotice on the marked sidecar: %v", err)
-	}
-	if notice == nil || notice.NoticeKind != agent.ContextUsageCompaction {
-		t.Fatalf("marked sidecar yielded %+v, want a compaction notice", notice)
-	}
-	return raw
 }
 
 // TestSessionStartCompactHook drives the production compact script: a
-// compact fire marks the sidecar and returns the staged context, any other
-// source stays silent, and the marker never depends on the context file.
+// compact fire appends one line to its own log and returns the staged
+// context, any other source stays silent, the marker never depends on the
+// context file, and the sidecar is never touched (single-writer split).
 func TestSessionStartCompactHook(t *testing.T) {
 	const contextText = "recall: the deploy finished\nnext: cut the release"
 	seed := `{"used_percentage": 62.5, "total_input_tokens": 125000}`
 	t.Run("compact marks and returns context", func(t *testing.T) {
 		c := stageCompactChannel(t, contextText, seed)
 		out := fireCompactHook(t, c, compactStdin("compact"))
-		raw := markedSidecarNotice(t, c, seed, true)
-		var doc map[string]any
-		if err := json.Unmarshal(raw, &doc); err != nil {
-			t.Fatalf("sidecar is not JSON: %v", err)
-		}
-		if doc["used_percentage"] != 62.5 {
-			t.Fatalf("compact fire clobbered live measurements: %q", raw)
-		}
+		compactionLogLines(t, c, 1)
+		assertSidecarUntouched(t, c, seed)
 		var decoded struct {
 			HookSpecificOutput struct {
 				HookEventName     string `json:"hookEventName"`
@@ -125,14 +136,16 @@ func TestSessionStartCompactHook(t *testing.T) {
 		if out := fireCompactHook(t, c, compactStdin("startup")); out != "" {
 			t.Fatalf("startup fire emitted %q; want silence", out)
 		}
-		markedSidecarNotice(t, c, seed, false)
+		compactionLogLines(t, c, 0)
+		assertSidecarUntouched(t, c, seed)
 	})
 	t.Run("compact without a file still marks", func(t *testing.T) {
 		c := stageCompactChannel(t, "", "")
 		if out := fireCompactHook(t, c, compactStdin("compact")); out != "" {
 			t.Fatalf("context-less compact fire emitted %q; want silence", out)
 		}
-		markedSidecarNotice(t, c, "", true)
+		compactionLogLines(t, c, 1)
+		assertSidecarUntouched(t, c, "")
 	})
 }
 

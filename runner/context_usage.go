@@ -92,8 +92,15 @@ type contextUsageWatcher struct {
 	armed map[float64]bool
 	// lastCompaction is the last reported compaction identity
 	// (harness + source + measurements), so a steady compacted state
-	// reports once.
+	// reports once. It covers the legacy sidecar boolean and the
+	// rollout compacted line; the append-only compaction log below
+	// reports by count instead (compactionsSeen).
 	lastCompaction string
+	// compactionsSeen is how many compaction-log lines have been
+	// reported. The log is append-only and single-writer, so the count
+	// only advances — a statusline rewrite cannot erase an unread
+	// compaction the way overwriting the sidecar boolean could.
+	compactionsSeen int
 }
 
 func newContextUsageWatcher(source contextUsageSource) *contextUsageWatcher {
@@ -132,6 +139,7 @@ func (w *contextUsageWatcher) poll() []agent.Event {
 		if ev := w.pollSidecar(); ev != nil {
 			out = append(out, *ev)
 		}
+		out = append(out, w.pollCompactionLog()...)
 	}
 	if w.source.rolloutHome != "" {
 		out = append(out, w.pollRollout()...)
@@ -157,6 +165,51 @@ func (w *contextUsageWatcher) pollSidecar() *agent.Event {
 		return nil
 	}
 	return w.classify(notice)
+}
+
+// pollCompactionLog emits one compaction notice per new line in the
+// hook's own append-only log beside the sidecar. The log is the durable,
+// single-writer signal: the hook is its only writer (O_APPEND) and the
+// statusline writer never touches it, so a statusline rewrite landing
+// between the mark and this poll cannot erase an unread compaction the
+// way overwriting the sidecar boolean could. Identity is the line count,
+// not the measurements, so two compactions with identical readings still
+// report twice. A missing log is silence, never an error.
+func (w *contextUsageWatcher) pollCompactionLog() []agent.Event {
+	if w.source.sidecarPath == "" {
+		return nil
+	}
+	logPath := filepath.Join(filepath.Dir(w.source.sidecarPath), agent.ClaudeCompactionLogFileName)
+	//nolint:gosec // G304: path is the harness's own session dir sibling of the sidecar.
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		return nil
+	}
+	count := 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	if count <= w.compactionsSeen {
+		// A replaced file restarts the count rather than going negative.
+		if count < w.compactionsSeen {
+			w.compactionsSeen = count
+		}
+		return nil
+	}
+	fresh := count - w.compactionsSeen
+	w.compactionsSeen = count
+	out := make([]agent.Event, 0, fresh)
+	for i := 0; i < fresh; i++ {
+		ev := agent.ContextUsageEvent{
+			Harness:    w.source.harness,
+			Source:     agent.ContextUsageSourceStatuslineSidecar,
+			NoticeKind: agent.ContextUsageCompaction,
+		}
+		out = append(out, ev)
+	}
+	return out
 }
 
 // pollRollout tails the rollout JSONL for new token_count events. A torn
