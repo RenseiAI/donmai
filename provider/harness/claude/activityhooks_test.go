@@ -124,10 +124,17 @@ func TestMergedSettingsKeepNoticeStopAndPin(t *testing.T) {
 		t.Fatalf("second Stop command = %q, want the telemetry relay", stopCommands[1])
 	}
 
-	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PermissionRequest"} {
+	for _, event := range []string{"UserPromptSubmit", "PermissionRequest"} {
 		if got := hookCommands(t, hooks, event); len(got) != 1 {
 			t.Fatalf("%s has %d commands, want 1: %q", event, len(got), got)
 		}
+	}
+
+	// SessionStart carries the telemetry relay plus the compact marker.
+	sessionCommands := hookCommands(t, hooks, "SessionStart")
+	if len(sessionCommands) != 2 || !strings.Contains(sessionCommands[0], relay.ScriptPath()) ||
+		!strings.Contains(sessionCommands[1], sessionStartCompactScriptFile) {
+		t.Fatalf("SessionStart = %q, want telemetry relay then compact marker", sessionCommands)
 	}
 
 	// The routing pin still rides the winning layer beside the hooks.
@@ -168,10 +175,14 @@ func TestMergedSettingsWithoutActivityIsUnchanged(t *testing.T) {
 	if got := hookCommands(t, hooks, "Stop"); len(got) != 1 {
 		t.Fatalf("Stop has %d commands without telemetry, want only the notice hook", len(got))
 	}
-	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PermissionRequest"} {
+	// Without telemetry only the compact marker remains.
+	for _, event := range []string{"UserPromptSubmit", "PermissionRequest"} {
 		if _, present := hooks[event]; present {
 			t.Fatalf("%s present without telemetry — the headless shape must stay hook-free", event)
 		}
+	}
+	if got := hookCommands(t, hooks, "SessionStart"); len(got) != 1 || !strings.Contains(got[0], sessionStartCompactScriptFile) {
+		t.Fatalf("SessionStart without telemetry = %q, want only the compact marker script", got)
 	}
 }
 

@@ -148,6 +148,72 @@ func TestContextWatcher_SidecarCompactionMarker(t *testing.T) {
 	}
 }
 
+// appendCompactionLog simulates the generated compact hook's durable mark:
+// one O_APPEND line in the hook's own log beside the sidecar.
+func appendCompactionLog(t *testing.T, sidecarPath string) {
+	t.Helper()
+	logPath := filepath.Join(filepath.Dir(sidecarPath), agent.ClaudeCompactionLogFileName)
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("compact\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestContextWatcher_CompactionSurvivesStatuslineRewrite pins the
+// lost-update the boolean sidecar mark had: the compact hook appends to
+// its own log (single-writer, O_APPEND) and the statusline writer owns
+// the sidecar, so a statusline rewrite landing between the mark and the
+// next poll cannot erase the unread compaction. It drives the production
+// poll loop: mark, rewrite the sidecar, then poll.
+func TestContextWatcher_CompactionSurvivesStatuslineRewrite(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := writeSidecar(t, dir, `{"used_percentage": 30}`)
+	w := newContextUsageWatcher(contextUsageSource{harness: "claude-code", sidecarPath: path})
+
+	// Below every threshold bound: silence, and the baseline poll pins
+	// lastSidecar so the rewrite below reads as a change.
+	if got := drainNotices(w); len(got) != 0 {
+		t.Fatalf("baseline yielded %d notices, want none", len(got))
+	}
+	// The lost-update window: the hook marks, then the statusline
+	// rewrite replaces the whole sidecar before the watcher polls.
+	appendCompactionLog(t, path)
+	if err := os.WriteFile(path, []byte(`{"used_percentage": 31}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := drainNotices(w)
+	if len(got) != 1 {
+		t.Fatalf("mark-then-rewrite yielded %d notices, want exactly 1 compaction", len(got))
+	}
+	if notice := got[0].(agent.ContextUsageEvent); notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Fatalf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	// A second compaction with identical measurements still reports:
+	// identity is the log count, not the readings.
+	appendCompactionLog(t, path)
+	if err := os.WriteFile(path, []byte(`{"used_percentage": 31}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got = drainNotices(w)
+	if len(got) != 1 {
+		t.Fatalf("second identical compaction yielded %d notices, want 1", len(got))
+	}
+	if notice := got[0].(agent.ContextUsageEvent); notice.NoticeKind != agent.ContextUsageCompaction {
+		t.Fatalf("kind = %q, want compaction", notice.NoticeKind)
+	}
+	// Drained: nothing more.
+	if got := drainNotices(w); len(got) != 0 {
+		t.Fatalf("drained log yielded %d notices, want none", len(got))
+	}
+}
+
 // TestContextWatcher_RolloutTokenCounts uses a fixture rollout file: only
 // token_count lines yield notices, each line once, with torn tails held.
 func TestContextWatcher_RolloutTokenCounts(t *testing.T) {
