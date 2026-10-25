@@ -3,6 +3,7 @@ package afcli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/prompt"
 	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
@@ -222,6 +224,204 @@ func TestAgentRunWithoutBudgetKeepsTheRunnerDefault(t *testing.T) {
 		AuthToken:       "token", //nolint:gosec // G101: fixed test-only credential.
 		PlatformURL:     platform.URL,
 		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: string(agent.ProviderStub)},
+	}
+	queued, err := detailToQueuedWork(detail)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+
+	stub, err := providerstub.New()
+	if err != nil {
+		t.Fatalf("stub provider: %v", err)
+	}
+	probe := &deadlineProbeProvider{Provider: stub}
+	registry := runner.NewRegistry()
+	if err := registry.Register(probe); err != nil {
+		t.Fatalf("register probe provider: %v", err)
+	}
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: platform.URL, WorkerID: "worker-1", AuthToken: "token",
+		HTTPClient: platform.Client(), BaseDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	run, err := runner.New(runner.Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster,
+		HTTPClient: platform.Client(), Logger: quietLogger(),
+		MaxSessionDuration: agentRunMaxSessionDuration(detail),
+		SkipBackstop:       true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+
+	// The parent context deliberately carries NO deadline: a bounded parent
+	// would clamp the run context and mask the value under test (context.
+	// WithTimeout keeps the earlier of the two). The go test binary's own
+	// -timeout is the backstop for a wedged run.
+	ctx := t.Context()
+	dispatchedAt := time.Now()
+	if _, err := run.Run(ctx, queued); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	deadline, seen := probe.observed()
+	if !seen {
+		t.Fatal("run context carried no deadline; want runner.DefaultMaxSessionDuration")
+	}
+	want := runner.DefaultMaxSessionDuration
+	if got := deadline.Sub(dispatchedAt); got < want-slack || got > want+slack {
+		t.Fatalf("run context deadline is %s after dispatch; want the runner default %s (±%s)",
+			got.Round(time.Second), want, slack)
+	}
+}
+
+// TestAgentRunUnlimitedBudgetInstallsNoDeadline drives the whole production
+// chain a daemon-spawned worker walks for explicit unlimited duration — raw
+// poll JSON → PollItemToSessionDetail → session-detail HTTP →
+// fetchSessionDetail → agentRunMaxSessionDuration → runner.Options →
+// runner.Run — and pins that the provider Spawn observes NO run-context
+// deadline. Removing the exact -1 branch from agentRunMaxSessionDuration is
+// the red mutant: the worker would fall back to the runner default and Spawn
+// would observe a deadline.
+func TestAgentRunUnlimitedBudgetInstallsNoDeadline(t *testing.T) {
+	repository := makeSpecDecoratorBareRepo(t)
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+	}))
+	t.Cleanup(platform.Close)
+
+	rawPoll := fmt.Sprintf(`{
+		"sessionId": "session-unlimited-duration",
+		"issueId": "issue-unlimited",
+		"issueIdentifier": "UNLIMITED-1",
+		"workType": "development",
+		"projectName": "TestProject",
+		"organizationId": "org_test",
+		"title": "Explicit unlimited duration",
+		"body": "Dispatched with stageBudget.maxDurationSeconds:-1.",
+		"repository": %q,
+		"resolvedProfile": {"provider": "stub"},
+		"stageBudget": {"maxDurationSeconds": %d}
+	}`, repository, prompt.UnlimitedStageDurationSeconds)
+	var item daemon.PollWorkItem
+	if err := json.Unmarshal([]byte(rawPoll), &item); err != nil {
+		t.Fatalf("decode raw poll JSON: %v", err)
+	}
+	if item.StageBudget == nil || item.StageBudget.MaxDurationSeconds != prompt.UnlimitedStageDurationSeconds {
+		t.Fatalf("poll stage budget = %+v; want explicit unlimited duration", item.StageBudget)
+	}
+
+	dispatched := daemon.PollItemToSessionDetail(item, nil, platform.URL, "token", "worker-1")
+	if dispatched.StageBudget == nil || dispatched.StageBudget.MaxDurationSeconds != prompt.UnlimitedStageDurationSeconds {
+		t.Fatalf("session detail stage budget = %+v; want explicit unlimited duration", dispatched.StageBudget)
+	}
+
+	// Fetch through the real daemon-control client so the unlimited value
+	// has to survive the detail wire shape, not just the in-process struct.
+	detailServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(dispatched) //nolint:gosec // fixed test-only credentials
+	}))
+	t.Cleanup(detailServer.Close)
+	detail, err := fetchSessionDetail(t.Context(), detailServer.Client(), detailServer.URL, dispatched.SessionID, "")
+	if err != nil {
+		t.Fatalf("fetchSessionDetail: %v", err)
+	}
+	if detail.StageBudget == nil || detail.StageBudget.MaxDurationSeconds != prompt.UnlimitedStageDurationSeconds {
+		t.Fatalf("fetched stage budget = %+v; want explicit unlimited duration", detail.StageBudget)
+	}
+	if got := agentRunMaxSessionDuration(detail); got != -1 {
+		t.Fatalf("agentRunMaxSessionDuration() = %s; want no runner-side cap (-1)", got)
+	}
+
+	queued, err := detailToQueuedWork(detail)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if queued.StageBudget == nil || queued.StageBudget.MaxDurationSeconds != prompt.UnlimitedStageDurationSeconds {
+		t.Fatalf("queued work stage budget = %+v; want explicit unlimited duration", queued.StageBudget)
+	}
+
+	stub, err := providerstub.New()
+	if err != nil {
+		t.Fatalf("stub provider: %v", err)
+	}
+	probe := &deadlineProbeProvider{Provider: stub}
+	registry := runner.NewRegistry()
+	if err := registry.Register(probe); err != nil {
+		t.Fatalf("register probe provider: %v", err)
+	}
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: platform.URL, WorkerID: "worker-1", AuthToken: "token",
+		HTTPClient: platform.Client(), BaseDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	run, err := runner.New(runner.Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster,
+		HTTPClient: platform.Client(), Logger: quietLogger(),
+		MaxSessionDuration: agentRunMaxSessionDuration(detail),
+		SkipBackstop:       true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+
+	// The parent context deliberately carries NO deadline: a bounded parent
+	// would clamp the run context and mask the value under test (context.
+	// WithTimeout keeps the earlier of the two). The go test binary's own
+	// -timeout is the backstop for a wedged run.
+	if _, err := run.Run(t.Context(), queued); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if deadline, seen := probe.observed(); seen {
+		t.Fatalf("run context carried deadline %s; want no session-duration timer for explicit unlimited duration", deadline)
+	}
+}
+
+// TestAgentRunZeroDurationBudgetKeepsTheRunnerDefault is the explicit-zero
+// half of the legacy pair: work dispatched with an explicit zero duration
+// must still be bounded by runner.DefaultMaxSessionDuration, not left to run
+// unbounded. Treating every non-positive value as unlimited is the red
+// mutant: Spawn would then observe no deadline.
+func TestAgentRunZeroDurationBudgetKeepsTheRunnerDefault(t *testing.T) {
+	const slack = 2 * time.Minute
+
+	repository := makeSpecDecoratorBareRepo(t)
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+	}))
+	t.Cleanup(platform.Close)
+
+	detail := &daemon.SessionDetail{
+		SessionID:       "session-zero-duration",
+		IssueID:         "issue-zero-duration",
+		IssueIdentifier: "ZERO-1",
+		WorkType:        "development",
+		ProjectName:     "TestProject",
+		OrganizationID:  "org_test",
+		Title:           "Explicit zero duration",
+		Body:            "Dispatched with an explicit zero stage duration.",
+		Repository:      repository,
+		WorkerID:        "worker-1",
+		AuthToken:       "token", //nolint:gosec // G101: fixed test-only credential.
+		PlatformURL:     platform.URL,
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: string(agent.ProviderStub)},
+		StageID:         "development",
+		StageBudget:     &daemon.PollStageBudget{MaxDurationSeconds: 0},
 	}
 	queued, err := detailToQueuedWork(detail)
 	if err != nil {

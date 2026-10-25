@@ -424,6 +424,27 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 			want: runner.MaxSessionDurationCeiling,
 		},
 		{
+			name: "exact unlimited duration disables the runner timeout",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds},
+			},
+			want: -1,
+		},
+		{
+			name: "interactive session keeps precedence over unlimited duration",
+			detail: &daemon.SessionDetail{
+				Mode:        prompt.InteractiveRunMode,
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds},
+			},
+			want: -1,
+		},
+		{
+			name: "duration below the unlimited sentinel keeps runner default",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds - 1},
+			},
+		},
+		{
 			name: "zero-duration budget keeps runner default",
 			detail: &daemon.SessionDetail{
 				StageBudget: &daemon.PollStageBudget{MaxSubAgents: ptr(4)},
@@ -444,6 +465,52 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDetailToQueuedWorkRefusesBelowUnlimitedDuration pins the closed
+// duration decoding: durations below prompt.UnlimitedStageDurationSeconds
+// are malformed and refused before spawn on both the legacy-sibling door
+// (no operational payload, sibling adopted) and the operational-payload
+// door (receipt-bearing work, sibling compared). Exact -1 passes through
+// on the legacy door — the unlimited value the runner disables its
+// session-duration timer from.
+func TestDetailToQueuedWorkRefusesBelowUnlimitedDuration(t *testing.T) {
+	below := prompt.UnlimitedStageDurationSeconds - 1
+
+	t.Run("legacy sibling below sentinel refuses", func(t *testing.T) {
+		_, err := detailToQueuedWork(&daemon.SessionDetail{
+			SessionID:   "sess-below-unlimited-legacy",
+			StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: below},
+		})
+		if err == nil || !strings.Contains(err.Error(), "below the unlimited sentinel") {
+			t.Fatalf("detailToQueuedWork error = %v, want below-sentinel refusal", err)
+		}
+	})
+
+	t.Run("operational payload below sentinel refuses", func(t *testing.T) {
+		payload := []byte(`{"sessionId":"sess-below-unlimited-receipt","stageBudget":{"maxDurationSeconds":-2}}`)
+		_, err := detailToQueuedWork(&daemon.SessionDetail{
+			SessionID:          "sess-below-unlimited-receipt",
+			OperationalPayload: payload,
+			StageBudget:        &daemon.PollStageBudget{MaxDurationSeconds: below},
+		})
+		if err == nil || !strings.Contains(err.Error(), "below the unlimited sentinel") {
+			t.Fatalf("detailToQueuedWork error = %v, want below-sentinel refusal", err)
+		}
+	})
+
+	t.Run("legacy sibling unlimited passes through", func(t *testing.T) {
+		qw, err := detailToQueuedWork(&daemon.SessionDetail{
+			SessionID:   "sess-unlimited-legacy",
+			StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds},
+		})
+		if err != nil {
+			t.Fatalf("detailToQueuedWork: %v", err)
+		}
+		if qw.StageBudget == nil || qw.StageBudget.MaxDurationSeconds != prompt.UnlimitedStageDurationSeconds {
+			t.Fatalf("StageBudget = %+v, want explicit unlimited duration", qw.StageBudget)
+		}
+	})
 }
 
 // TestFetchSessionDetail_HappyPath drives fetchSessionDetail against

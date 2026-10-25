@@ -227,11 +227,18 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a
-// daemon-spawned agent session. Three answers, in precedence order:
+// daemon-spawned agent session. Four answers, in precedence order:
 //
 //   - Interactive sessions are human-driven and may remain attached beyond any
 //     budget the dispatcher sized, so a negative duration disables the
 //     runner-side cap entirely. Unchanged.
+//   - A dispatched stage budget carrying exactly
+//     prompt.UnlimitedStageDurationSeconds (-1) is the sole explicit
+//     unlimited duration: the runner-side wall-clock cap is disabled and no
+//     session-duration timer is installed. Every other enforcement dimension
+//     (token, sub-agent, cost, idle, cancellation, operator-stop, and the
+//     parent-context bound) stays armed — only the stage-duration timer is
+//     bypassed.
 //   - A dispatched stage budget carrying a positive maxDurationSeconds IS the
 //     session's maximum duration. The platform sized the stage; the runner's
 //     two-hour default must not silently truncate it. It would: the value
@@ -243,7 +250,10 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 //     as a timeout.
 //   - Everything else leaves the option at zero and retains
 //     runner.DefaultMaxSessionDuration — the fallback for work dispatched with
-//     no duration of its own.
+//     no duration of its own. That includes durations below -1: they are
+//     malformed and refused upstream by runner.ReconcileStageBudget before a
+//     runner is ever built, so this derivation stays bounded (fail closed)
+//     rather than mapping an invalid value to an unbounded session.
 //
 // The dispatched value is clamped to runner.MaxSessionDurationCeiling. It
 // arrives over the wire, and the comparison is made in SECONDS on purpose: a
@@ -259,7 +269,13 @@ func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
 		return -1
 	}
 	budget := detail.StageBudget
-	if budget == nil || budget.MaxDurationSeconds <= 0 {
+	if budget == nil {
+		return 0
+	}
+	if budget.MaxDurationSeconds == prompt.UnlimitedStageDurationSeconds {
+		return -1
+	}
+	if budget.MaxDurationSeconds <= 0 {
 		return 0
 	}
 	return runner.BudgetDuration(budget.MaxDurationSeconds)
