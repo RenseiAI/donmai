@@ -321,3 +321,87 @@ func TestA2ACommandRegistrationIsOptInForEmbedders(t *testing.T) {
 		}
 	}
 }
+
+func TestA2ACLIDiscoveryFailurePreservesTypedIdentity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("invalid card URL", func(t *testing.T) {
+		t.Parallel()
+		_, err := executeA2ACommand(t, Config{},
+			"get", "--card", "ftp://agent.example/card", "--id", "task-1")
+		if err == nil {
+			t.Fatal("get succeeded, want discovery failure")
+		}
+		var discoveryErr *a2a.DiscoveryError
+		if !errors.As(err, &discoveryErr) {
+			t.Fatalf("error = %#v, want DiscoveryError", err)
+		}
+		if got, want := err.Error(), "a2a: fetch Agent Card: a2a discovery: card URL must be an absolute HTTP(S) URL"; got != want {
+			t.Fatalf("error text = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("card HTTP status", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "secret upstream detail", http.StatusNotFound)
+		}))
+		t.Cleanup(server.Close)
+		_, err := executeA2ACommand(t, Config{A2AHTTPClient: server.Client()},
+			"get", "--card", server.URL+"/card", "--id", "task-1")
+		if err == nil {
+			t.Fatal("get succeeded, want discovery failure")
+		}
+		var discoveryErr *a2a.DiscoveryError
+		if !errors.As(err, &discoveryErr) {
+			t.Fatalf("error = %#v, want DiscoveryError", err)
+		}
+		if got, want := err.Error(), "a2a: fetch Agent Card: a2a transport: HTTP 404: Not Found"; got != want {
+			t.Fatalf("error text = %q, want %q", got, want)
+		}
+		var transportErr *a2a.TransportError
+		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusNotFound {
+			t.Fatalf("error = %#v, want nested TransportError with status 404", err)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("error = %q, must not leak upstream detail", err.Error())
+		}
+	})
+}
+
+func TestA2ACLIJSONRPCFailureIsNotDiscoveryError(t *testing.T) {
+	t.Parallel()
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/card" {
+			_ = json.NewEncoder(w).Encode(a2a.AgentCard{
+				Name: "rpc fixture", Description: "fixture", Version: "1",
+				SupportedInterfaces: []a2a.AgentInterface{{URL: server.URL + "/rpc", ProtocolBinding: a2a.ProtocolBindingJSONRPC, ProtocolVersion: "1.0"}},
+				Capabilities:        a2a.AgentCapabilities{}, DefaultInputModes: []string{"text/plain"}, DefaultOutputModes: []string{"text/plain"}, Skills: []a2a.AgentSkill{},
+			})
+			return
+		}
+		http.Error(w, "secret rpc detail", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+	_, err := executeA2ACommand(t, Config{A2AHTTPClient: server.Client()},
+		"get", "--card", server.URL+"/card", "--id", "task-1")
+	if err == nil {
+		t.Fatal("get succeeded, want JSON-RPC transport failure")
+	}
+	var transportErr *a2a.TransportError
+	if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("error = %#v, want TransportError with status 503", err)
+	}
+	var discoveryErr *a2a.DiscoveryError
+	if errors.As(err, &discoveryErr) {
+		t.Fatalf("error = %#v, JSON-RPC failure must not match DiscoveryError", err)
+	}
+	var aliasErr *a2a.AgentCardDiscoveryError
+	if errors.As(err, &aliasErr) {
+		t.Fatalf("error = %#v, JSON-RPC failure must not match AgentCardDiscoveryError", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error = %q, must not leak upstream detail", err.Error())
+	}
+}
