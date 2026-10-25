@@ -30,6 +30,15 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // — a local openai-compat pi cell needs either a local-openai host on the
 // local endpoint or routing via google × local, deferred as a follow-up.
 func (p *Provider) Manifest() agent.HarnessManifest {
+	// One Manifest() evaluation shares one validated attestation between
+	// its execution-security rendering and its workarea caps: a second
+	// self-test would re-probe the backend and could diverge, so both
+	// derive from this single result. Only a both-mode, nonempty-digest
+	// proof attests the read-only workarea protocol and enforcement;
+	// every other proof leaves both workarea fields empty while a
+	// single-mode proof still renders its one execution-security mode.
+	attestation, ok := p.manifestAttestation()
+	workareaProtocols, workareaEnforcement := workareaCapsFromAttestation(attestation, ok)
 	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
 	// The interactive PTY spawn mode observes only the coarse Init/terminal
 	// boundary the shared ptycli driver emits (byte-accurate terminal stream is
@@ -41,7 +50,7 @@ func (p *Provider) Manifest() agent.HarnessManifest {
 		HumanLabel:        "pi",
 		Family:            agent.FamilyHarness,
 		ContractABI:       "harness/v2",
-		ExecutionSecurity: p.executionSecurity(),
+		ExecutionSecurity: executionSecurityFromAttestation(attestation, ok),
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true, // steer / follow_up
 			SupportsSessionResume:    true, // session file + cursor replay (get_entries since=<id>)
@@ -77,6 +86,17 @@ func (p *Provider) Manifest() agent.HarnessManifest {
 			// document; PTY is selected per Spawn call by Spec.Interactive != nil,
 			// never by a Transport value.
 			SupportsInteractivePTY: true,
+			// session-root-v1 with isolated-read-only-v1 is attested only
+			// when the executable-bound confinement proof covers both
+			// exact modes with a nonempty digest (workareaCapsFromAttestation
+			// shares the single manifestAttestation above): a read-only
+			// leaf then needs the executor OS boundary, which the
+			// self-test proved with negative write/rename/remove/chmod
+			// evidence. Every other proof leaves both fields empty, so
+			// admission refuses an authority-bearing spec before any
+			// child or state exists.
+			MultiRepositoryWorkareaProtocols: workareaProtocols,
+			RepositoryAuthorityEnforcement:   workareaEnforcement,
 			// `pi --mode rpc` carries an explicit steering verb on the same
 			// JSONL channel that drives the session: Handle.Inject maps to
 			// steer while a turn is in flight and follow_up while idle

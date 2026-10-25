@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +68,9 @@ echo "gocache=$GOCACHE" >> "$r"
 echo "gopath=$GOPATH" >> "$r"
 echo "pnpm_store=$PNPM_CONFIG_STORE_DIR" >> "$r"
 echo "xdg_runtime=$XDG_RUNTIME_DIR" >> "$r"
+if [ -n "$PROBE_RO_SEED" ]; then
+	(cat "$PROBE_RO_SEED" > /dev/null) 2>>"$r"; echo "read_ro=$?" >> "$r"
+fi
 ls -l /dev/fd > "$PROBE_MUT/fds.txt" 2>/dev/null
 case " $* " in
 *" --mode rpc "*)
@@ -180,7 +184,9 @@ func (w linuxLiveWorld) spec() agent.Spec {
 // grants full access — and returns the harness path. A script outside the
 // set would need its interpreter resolved through Landlock grants the
 // boundary never gives; inside, the seat reads and executes its own tree.
-func writeLinuxLiveHarness(t *testing.T, w linuxLiveWorld) string {
+// extra are further KEY=VALUE lines for probe.env (for example the
+// seeded read-only leaf a read proof names).
+func writeLinuxLiveHarness(t *testing.T, w linuxLiveWorld, extra ...string) string {
 	t.Helper()
 	dir := filepath.Join(w.mut, ".pi-probe-"+sanitizeStateKey(t.Name()))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -204,6 +210,9 @@ func writeLinuxLiveHarness(t *testing.T, w linuxLiveWorld) string {
 	extension := newSessionLayoutForSpec(w.spec()).extension
 	env := fmt.Sprintf("PROBE_MUT='%s'\nPROBE_OUTSIDE='%s'\nPROBE_RO='%s'\nPROBE_EXTENSION='%s'\nPROBE_HANDSHAKE='%s'\nPROBE_BODY='%s'\n",
 		w.mut, w.outside, w.ro, extension, handshake, body)
+	for _, line := range extra {
+		env += line + "\n"
+	}
 	if err := os.WriteFile(filepath.Join(dir, "probe.env"), []byte(env), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -474,6 +483,58 @@ func TestPiConfinementLinux_InteractiveSpawnRefusesForbiddenWrites(t *testing.T)
 	assertLinuxUnconfined(t, w)
 }
 
+// TestPiConfinementLinux_AuthorityAdmittedThroughSpawnReadsAndRefusesReadOnly
+// is the Linux half of the authority proof through the public entry point:
+// an attested host admits a declared repository authority at
+// Provider.Spawn, the confined seat reads the seeded read-only leaf,
+// writes the mutable leaf, and is refused a read-only write. Mutant RED:
+// removing the manifest workarea fields or dropping ReadOnlyLeaves from
+// seatSpec refuses at admission or lets the read-only write land.
+func TestPiConfinementLinux_AuthorityAdmittedThroughSpawnReadsAndRefusesReadOnly(t *testing.T) {
+	if !linuxLiveAvailable(t) {
+		return
+	}
+	w := newLinuxLiveWorld(t)
+	seedPath := w.ro + "/seed.txt"
+	seedBody := "sibling-context\n"
+	if err := os.WriteFile(seedPath, []byte(seedBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := writeLinuxLiveHarness(t, w, "PROBE_RO_SEED='"+seedPath+"'")
+	spec := w.spec()
+	spec.SandboxLevel = agent.SandboxWorkspaceWrite
+	spec.RepositoryAuthority = &agent.RepositoryAuthorityPolicy{
+		Protocol: "session-root-v1", WorkareaRoot: w.root, SelectedPath: w.mut,
+		MutablePaths: []string{w.mut}, ReadOnlyPaths: []string{w.ro}, Enforcement: "isolated-read-only-v1",
+	}
+	h, err := linuxLiveProvider(t, bin, true).Spawn(linuxLiveCtx(t), spec)
+	if err != nil {
+		t.Fatalf("attested Spawn with authority: %v", err)
+	}
+	plan := h.(*Handle).confinement
+	finishLinuxHeadless(t, h)
+	if plan == nil {
+		t.Fatalf("an authority-bearing session spawned without a confinement plan")
+	}
+	record := plan.Record()
+	if !slices.Contains(record.ReadOnlyLeaves, filepath.Base(w.ro)) {
+		t.Errorf("confinement record read-only leaves = %v, want %q", record.ReadOnlyLeaves, filepath.Base(w.ro))
+	}
+	for _, class := range []confinement.WritableClass{confinement.ClassMutableLeaf, confinement.ClassHarnessState, confinement.ClassSessionTmp, confinement.ClassSessionCache} {
+		if !slices.Contains(record.WritableClasses, class) {
+			t.Errorf("confinement record writable classes = %v, missing %s", record.WritableClasses, class)
+		}
+	}
+	assertLinuxConfined(t, w)
+	r := readLinuxProbeReport(t, w)
+	if r.vals["read_ro"] != "0" {
+		t.Errorf("confined: the read of the seeded read-only leaf failed (status %q):\n%s", r.vals["read_ro"], r.raw)
+	}
+	if got, err := os.ReadFile(seedPath); err != nil || string(got) != seedBody {
+		t.Errorf("confined: the seeded read-only leaf changed under the run (err %v, body %q)", err, got)
+	}
+}
+
 // TestPiConfinementLinux_UnsupportedHostRefusesReadOnlyDeclaration pins the
 // clean refusal on a host that cannot confine: a session that declares a
 // repository authority — whose read-only leaves need the executor boundary
@@ -494,12 +555,14 @@ func TestPiConfinementLinux_UnsupportedHostRefusesReadOnlyDeclaration(t *testing
 	w := newLinuxLiveWorld(t)
 	bin := writeLinuxLiveHarness(t, w)
 	spec := w.spec()
+	spec.SandboxLevel = agent.SandboxWorkspaceWrite
 	spec.RepositoryAuthority = &agent.RepositoryAuthorityPolicy{
 		Protocol:      "session-root-v1",
 		WorkareaRoot:  w.root,
 		SelectedPath:  w.mut,
 		MutablePaths:  []string{w.mut},
 		ReadOnlyPaths: []string{w.ro},
+		Enforcement:   "isolated-read-only-v1",
 	}
 	before := snapshotLinuxTree(t, w.outside)
 	// Enter at launch, the shared post-admission entry of Spawn and Resume,
