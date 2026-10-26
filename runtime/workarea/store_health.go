@@ -93,6 +93,17 @@ func DiagnoseAcquisitionStore(parent string) (StoreDiagnosis, error) {
 		}, nil
 	}
 	if storeRecord.Identity != physical || anchorRecord.Identity != physical {
+		// Records written before birth tracking carry the same device and
+		// inode but no birth time. That is the same directory, not a
+		// renumber: report a healthy upgradable store so doctor stays
+		// green. The daemon pins birth on its next open.
+		if storeRecord.Identity.Device == physical.Device && anchorRecord.Identity.Device == physical.Device &&
+			storeRecord.Identity.Inode == physical.Inode && anchorRecord.Identity.Inode == physical.Inode {
+			return StoreDiagnosis{
+				Healthy: true, Present: true, StoreID: storeRecord.StoreID,
+				Reason: "acquisition store identity is pinned; birth time upgrade pending",
+			}, nil
+		}
 		return StoreDiagnosis{
 			Healthy: false, Present: true, StoreID: storeRecord.StoreID,
 			NeedsReanchor: true,

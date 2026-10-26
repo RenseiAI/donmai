@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -299,6 +300,9 @@ func TestAcquisitionStoreRefusesBirthMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !physical.HasBirth {
+		if runtime.GOOS == "darwin" {
+			t.Fatal("fileIdentity must record birth time on darwin; HasBirth=false breaks renumber vs replacement distinction")
+		}
 		t.Skip("platform does not record birth time; store-level birth refusal is covered by TestFileIdentityMatchesRejectsBirthMismatch")
 	}
 
@@ -332,5 +336,157 @@ func TestAcquisitionStoreRefusesBirthMismatch(t *testing.T) {
 	}
 	if err := RepairAcquisitionStore(parent); err == nil {
 		t.Fatal("repair accepted a birth-mismatched directory")
+	}
+}
+
+// TestAcquisitionStoreRefusesStoreIDMismatchWithRenumber pins the StoreID
+// second factor: a store.json StoreID that differs from the anchor, with a
+// device-only drift that still matches on inode (and birth), must refuse on
+// open, on the read-only scan, and in diagnosis, and must not be repairable.
+// Deleting any of the StoreID guards must turn this test RED; otherwise a
+// forged store ID would open, scan, or diagnose as healthy on inode alone.
+func TestAcquisitionStoreRefusesStoreIDMismatchWithRenumber(t *testing.T) {
+	parent := t.TempDir()
+	if _, err := NewAcquisitionStore(parent, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+	storeRecord := readStoreIdentityForTest(t, storePath)
+	anchorRecord := readStoreIdentityForTest(t, anchorPath)
+
+	renumbered := storeRecord.Identity
+	renumbered.Device += 1000
+	if renumbered.Device == storeRecord.Identity.Device {
+		renumbered.Device++
+	}
+	storeRecord.Identity = renumbered
+	anchorRecord.Identity = renumbered
+	storeRecord.StoreID += "-forged"
+	writeStoreIdentityForTest(t, storePath, storeRecord)
+	writeStoreIdentityForTest(t, anchorPath, anchorRecord)
+
+	if _, err := NewAcquisitionStore(parent, nil); err == nil {
+		t.Fatal("store with a mismatched store ID opened without error")
+	}
+	if _, _, err := ReadExistingReadyRecordsFound(parent); err == nil {
+		t.Fatal("read-only scan accepted a mismatched store ID")
+	}
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnosis.Healthy || diagnosis.NeedsReanchor {
+		t.Fatalf("store ID mismatch must fail closed without repair: %+v", diagnosis)
+	}
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair accepted a mismatched store ID")
+	}
+}
+
+// TestAcquisitionStoreRefusesSingleSidedForgery pins the one-sided identity
+// guards: a store.json-only forged inode with the anchor intact must refuse
+// on open, on the read-only scan, and in diagnosis, and must not be
+// repairable. Deleting the store-side identity check or weakening the
+// diagnose disjunction must turn this test RED; otherwise a forged store
+// document would open or be repaired while the anchor still matches.
+func TestAcquisitionStoreRefusesSingleSidedForgery(t *testing.T) {
+	parent := t.TempDir()
+	if _, err := NewAcquisitionStore(parent, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+	storeRecord := readStoreIdentityForTest(t, storePath)
+	anchorRecord := readStoreIdentityForTest(t, anchorPath)
+	if storeRecord.StoreID != anchorRecord.StoreID {
+		t.Fatalf("store IDs drifted: %q vs %q", storeRecord.StoreID, anchorRecord.StoreID)
+	}
+
+	forged := storeRecord.Identity
+	forged.Inode++
+	storeRecord.Identity = forged
+	writeStoreIdentityForTest(t, storePath, storeRecord)
+	writeStoreIdentityForTest(t, anchorPath, anchorRecord)
+
+	if _, err := NewAcquisitionStore(parent, nil); err == nil {
+		t.Fatal("store with a forged store.json identity opened without error")
+	}
+	if _, _, err := ReadExistingReadyRecordsFound(parent); err == nil {
+		t.Fatal("read-only scan accepted a forged store.json identity")
+	}
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnosis.Healthy || diagnosis.NeedsReanchor {
+		t.Fatalf("single-sided forgery must fail closed without repair: %+v", diagnosis)
+	}
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair accepted a forged store.json identity")
+	}
+}
+
+// TestAcquisitionDiagnoseHealthyForBirthOnlyUpgrade pins the upgrade path:
+// when device and inode are equal and only the birth fields are missing
+// (records written before birth tracking), the store is the same directory
+// and must diagnose healthy without requiring a re-anchor. The daemon
+// records birth on its next open; doctor must stay green in between.
+func TestAcquisitionDiagnoseHealthyForBirthOnlyUpgrade(t *testing.T) {
+	parent := t.TempDir()
+	if _, err := NewAcquisitionStore(parent, nil); err != nil {
+		t.Fatal(err)
+	}
+	dirInfo, err := os.Lstat(filepath.Join(parent, acquisitionStoreDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical, err := fileIdentity(dirInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !physical.HasBirth {
+		t.Skip("platform does not record birth time; no birth-only upgrade to pin")
+	}
+
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+	storeRecord := readStoreIdentityForTest(t, storePath)
+	anchorRecord := readStoreIdentityForTest(t, anchorPath)
+	// Strip birth but keep device and inode equal: a pre-birth record for
+	// the same directory.
+	storeRecord.Identity.HasBirth = false
+	storeRecord.Identity.BirthSec = 0
+	storeRecord.Identity.BirthNsec = 0
+	anchorRecord.Identity.HasBirth = false
+	anchorRecord.Identity.BirthSec = 0
+	anchorRecord.Identity.BirthNsec = 0
+	if storeRecord.Identity.Device != physical.Device || anchorRecord.Identity.Device != physical.Device {
+		t.Fatal("test setup requires the same device; device drift is a renumber, not an upgrade")
+	}
+	writeStoreIdentityForTest(t, storePath, storeRecord)
+	writeStoreIdentityForTest(t, anchorPath, anchorRecord)
+
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diagnosis.Healthy || diagnosis.NeedsReanchor {
+		t.Fatalf("birth-only upgrade must diagnose healthy without re-anchor: %+v", diagnosis)
+	}
+	if err := RepairAcquisitionStore(parent); err != nil {
+		t.Fatalf("healthy birth-only upgrade must need no repair: %v", err)
+	}
+	if _, err := NewAcquisitionStore(parent, nil); err != nil {
+		t.Fatalf("store with a birth-only upgrade refused to open: %v", err)
+	}
+	after, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Healthy || after.NeedsReanchor {
+		t.Fatalf("post-open diagnosis = %+v, want healthy", after)
 	}
 }
