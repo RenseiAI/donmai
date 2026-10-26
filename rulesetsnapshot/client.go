@@ -202,7 +202,12 @@ func (c *Client) Current() (Snapshot, Status, bool) {
 // near zero; a suspend/resume or forward step advances wall far beyond
 // monotonic. The kick is coalesced and never awaited.
 func (c *Client) observePoll() {
-	nowWall := c.now()
+	// Round(0) strips the monotonic reading so nowWall and lastWall are
+	// wall-only: wallElapsed is then a pure wall-clock delta to compare
+	// against the real monotonic delta. Without the strip, a production
+	// time.Now() reading carries a monotonic component and Sub would use
+	// the monotonic readings alone, hiding any wall-clock jump.
+	nowWall := c.now().Round(0)
 	realNow := time.Now()
 	c.pollMu.Lock()
 	interval := c.pollInterval

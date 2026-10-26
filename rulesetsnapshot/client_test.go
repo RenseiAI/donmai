@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -502,5 +503,45 @@ func TestClient_BackgroundKickAdoptsVerifiedSnapshot(t *testing.T) {
 			t.Fatal("kicked refresh did not finish after adopting")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestClient_PollObservationStoresWallOnlyTime pins the production clock-jump
+// path: with Config.Now nil (the default every non-test caller uses),
+// Current must record a wall-only lastWall with no monotonic reading, so the
+// next poll compares a pure wall-clock delta against the real monotonic
+// delta. Without the strip, both readings would carry monotonic components
+// and their difference would stay near zero after a suspend or operator step.
+func TestClient_PollObservationStoresWallOnlyTime(t *testing.T) {
+	t.Parallel()
+	pub, _ := mustGenerateKey(t)
+	c, err := NewClient(Config{
+		Endpoint:    "https://example.invalid/snapshot",
+		TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
+		StatePath:   filepath.Join(t.TempDir(), "snap.json"),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if c.cfg.Now != nil {
+		t.Fatal("test setup error: Config.Now must be nil to exercise the production path")
+	}
+	c.pollMu.Lock()
+	c.pollInterval = time.Minute
+	c.pollMu.Unlock()
+	// Drive the production entry point, not the helper directly.
+	_, _, _ = c.Current()
+	c.pollMu.Lock()
+	storedWall := c.lastWall
+	storedMono := c.lastMono
+	c.pollMu.Unlock()
+	if storedWall.IsZero() {
+		t.Fatal("observePoll did not record lastWall on the production path")
+	}
+	if strings.Contains(storedWall.String(), "m=") {
+		t.Fatalf("lastWall carries a monotonic reading on the production path: %q — wall-clock jumps would be invisible", storedWall.String())
+	}
+	if !strings.Contains(storedMono.String(), "m=") {
+		t.Fatalf("lastMono lost its monotonic reading: %q — discontinuity detection needs a real monotonic baseline", storedMono.String())
 	}
 }
