@@ -118,3 +118,69 @@ func TestPlanApplyToEnv_CarriesBoundaryEnv(t *testing.T) {
 		t.Fatalf("ApplyToEnv = %v, want %v: the boundary env the plan carries must survive the merge", got, want)
 	}
 }
+
+// TestPlanApplyToEnv_StripsEngineControlsBeforeTrustedAppend pins the final
+// child boundary: inherited or session-supplied engine re-exec controls are
+// stripped from childEnv, while safe near-misses survive and the
+// producer-owned bindings appended last (session-tmp plus the boundary's
+// stage policy) still reach the child.
+//
+// RED: remove the ApplyToEnv engine filter and the evil entries below
+// survive in the merged env.
+func TestPlanApplyToEnv_StripsEngineControlsBeforeTrustedAppend(t *testing.T) {
+	t.Parallel()
+	plan := &Plan{
+		env: []string{"TMPDIR=/plan/tmp", "TMP=/plan/tmp", "TEMP=/plan/tmp"},
+		applied: Applied{Environ: func() []string {
+			return []string{"DONMAI_CONFINEMENT_LANDLOCK_STAGE=trusted-policy"}
+		}},
+	}
+	childEnv := []string{
+		"PATH=/usr/bin",
+		"DONMAI_CONFINEMENT_PROBE=evil-probe",
+		"DONMAI_CONFINEMENT_LANDLOCK_STAGE=evil-stage",
+		"DONMAI_CONFINEMENT_PROBE_DECOY=evil-decoy",
+		"DONMAI_CONFINEMENT_PROBE_REMOUNT=evil-remount",
+		"RENSEI_SEATBELT_ENFORCE=evil-seatbelt",
+		"EVIL_PROBE=evil-suffix",
+		"FOO_PROBE_EXTRA=near-miss",
+		"DONMAI_CONFINEMENT=bare-prefix",
+		"TMPDIR=/executor/seat-9",
+	}
+	got := plan.ApplyToEnv(childEnv)
+	for _, kv := range got {
+		if strings.Contains(kv, "evil") {
+			t.Fatalf("untrusted engine control survived the final boundary: %v", got)
+		}
+	}
+	// The trusted stage policy appended last survives exactly once, even
+	// though the child carried an evil copy of the same name. Moving the
+	// trusted append before the filter strips it as well, so this
+	// assertion is the trusted-last RED.
+	stage := 0
+	for _, kv := range got {
+		if kv == "DONMAI_CONFINEMENT_LANDLOCK_STAGE=trusted-policy" {
+			stage++
+		}
+		if kv == "DONMAI_CONFINEMENT_LANDLOCK_STAGE=evil-stage" {
+			t.Fatalf("evil stage copy survived alongside the trusted one: %v", got)
+		}
+	}
+	if stage != 1 {
+		t.Fatalf("trusted stage policy present %d times, want exactly once: %v", stage, got)
+	}
+	for _, want := range []string{
+		"PATH=/usr/bin",
+		"FOO_PROBE_EXTRA=near-miss",
+		"DONMAI_CONFINEMENT=bare-prefix",
+		"TMPDIR=/plan/tmp",
+	} {
+		found := false
+		for _, kv := range got {
+			found = found || kv == want
+		}
+		if !found {
+			t.Fatalf("entry %q lost in the merge (env %v)", want, got)
+		}
+	}
+}

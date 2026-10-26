@@ -423,3 +423,157 @@ func TestInheritedLayersStripSessionReadToken(t *testing.T) {
 		}
 	})
 }
+
+// TestIsEngineControlEnv_RefusesControlsKeepsNearMisses pins the single
+// case-sensitive classifier for engine re-exec controls: the
+// DONMAI_CONFINEMENT_* namespace, the RENSEI_SEATBELT_* namespace and any
+// *_PROBE marker are controls; bare prefixes, lower-case spellings and
+// suffix extensions are not.
+//
+// RED: remove any one classifier arm and its row goes green-when-it-should-
+// be-red (the table below fails naming the arm).
+func TestIsEngineControlEnv_RefusesControlsKeepsNearMisses(t *testing.T) {
+	t.Parallel()
+	refused := []string{
+		"DONMAI_CONFINEMENT_PROBE",
+		"DONMAI_CONFINEMENT_LANDLOCK_STAGE",
+		"DONMAI_CONFINEMENT_PROBE_DECOY",
+		"DONMAI_CONFINEMENT_PROBE_REMOUNT",
+		"DONMAI_CONFINEMENT_FUTURE_CONTROL",
+		"RENSEI_SEATBELT_ENFORCE",
+		"RENSEI_SEATBELT_FOO",
+		"FOO_PROBE",
+		"MY_SERVICE_PROBE",
+		"A_PROBE",
+	}
+	for _, key := range refused {
+		if !env.IsEngineControlEnv(key) {
+			t.Errorf("IsEngineControlEnv(%q) = false, want true", key)
+		}
+	}
+	kept := []string{
+		"DONMAI_CONFINEMENT",
+		"RENSEI_SEATBELT",
+		"DONMAI_CONFINEMENT_",
+		"RENSEI_SEATBELT_",
+		"donmai_confinement_probe",
+		"rensei_seatbelt_enforce",
+		"my_probe",
+		"FOO_PROBE_EXTRA",
+		"FOO_PROBES",
+		"DONMAI_CONFINEMENTPROBE",
+		"PATH",
+	}
+	for _, key := range kept {
+		if env.IsEngineControlEnv(key) {
+			t.Errorf("IsEngineControlEnv(%q) = true, want false (a near-miss)", key)
+		}
+	}
+}
+
+// TestComposeChildEnv_FiltersEngineControlsAtEveryLayer pins that inherited
+// and explicit engine controls never reach the child, while safe near-misses
+// survive on both layers.
+//
+// RED: drop the explicit-layer engine check and the explicit evil below
+// reaches the child.
+func TestComposeChildEnv_FiltersEngineControlsAtEveryLayer(t *testing.T) {
+	t.Parallel()
+	got := env.ComposeChildEnv(
+		[]string{
+			"PATH=/usr/bin",
+			"DONMAI_CONFINEMENT_PROBE=parent-evil",
+			"DONMAI_CONFINEMENT_LANDLOCK_STAGE=parent-evil",
+			"RENSEI_SEATBELT_ENFORCE=parent-evil",
+			"FOO_PROBE=parent-evil",
+			"FOO_PROBE_EXTRA=parent-near-miss",
+		},
+		map[string]string{
+			"DONMAI_CONFINEMENT_PROBE":       "explicit-evil",
+			"DONMAI_CONFINEMENT_PROBE_DECOY": "explicit-evil",
+			"RENSEI_SEATBELT_FOO":            "explicit-evil",
+			"BAR_PROBE":                      "explicit-evil",
+			"FOO_PROBE_EXTRA":                "explicit-near-miss",
+			"DONMAI_CONFINEMENT":             "explicit-bare-prefix",
+			"SAFE":                           "kept",
+		},
+	)
+	for _, kv := range got {
+		if strings.Contains(kv, "evil") {
+			t.Fatalf("engine control reached the child env: %v", got)
+		}
+	}
+	want := []string{
+		"PATH=/usr/bin",
+		"FOO_PROBE_EXTRA=parent-near-miss",
+		"DONMAI_CONFINEMENT=explicit-bare-prefix",
+		"FOO_PROBE_EXTRA=explicit-near-miss",
+		"SAFE=kept",
+	}
+	// Both near-miss copies remain with last-entry-wins semantics (the
+	// explicit copy wins), exactly as ordinary bindings compose.
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ComposeChildEnv engine filter:\n got: %v\nwant: %v", got, want)
+	}
+}
+
+// TestComposer_FiltersEngineControlsAtBothLayers pins the map-input
+// counterpart: base and Spec.Env engine controls are refused, while the
+// agent-auth allowlist stays trusted in the explicit layer.
+//
+// RED: drop either layer's engine check and its evil below reaches the
+// composed env.
+func TestComposer_FiltersEngineControlsAtBothLayers(t *testing.T) {
+	t.Parallel()
+	c := env.NewComposer()
+	got := c.Compose(map[string]string{
+		"PATH":                             "/usr/bin",
+		"DONMAI_CONFINEMENT_PROBE":         "base-evil",
+		"DONMAI_CONFINEMENT_PROBE_REMOUNT": "base-evil",
+		"RENSEI_SEATBELT_X":                "base-evil",
+		"EVIL_PROBE":                       "base-evil",
+	}, agent.Spec{Env: map[string]string{
+		"ANTHROPIC_API_KEY":        "runner-set-trusted",
+		"DONMAI_CONFINEMENT_PROBE": "spec-evil",
+		"QUX_PROBE":                "spec-evil",
+		"SAFE":                     "kept",
+	}})
+	for _, kv := range got {
+		if strings.Contains(kv, "evil") {
+			t.Fatalf("engine control reached the composed env: %v", got)
+		}
+	}
+	want := []string{
+		"ANTHROPIC_API_KEY=runner-set-trusted",
+		"PATH=/usr/bin",
+		"SAFE=kept",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Compose engine filter:\n got: %v\nwant: %v", got, want)
+	}
+}
+
+// TestInheritedEngineControls_IgnoreInjectionDeclaration pins that no
+// InjectedEnvKeysVar declaration re-admits an engine control on either
+// composer API.
+func TestInheritedEngineControls_IgnoreInjectionDeclaration(t *testing.T) {
+	t.Parallel()
+	const evil = "DONMAI_CONFINEMENT_PROBE=declared-evil"
+	parent := []string{"PATH=/usr/bin", evil, env.InjectedEnvKeysVar + "=DONMAI_CONFINEMENT_PROBE"}
+	for _, kv := range env.ComposeChildEnv(parent) {
+		if strings.Contains(kv, "declared-evil") {
+			t.Fatalf("declared engine control reached ComposeChildEnv: %v", env.ComposeChildEnv(parent))
+		}
+	}
+	c := env.NewComposer()
+	base := map[string]string{
+		"PATH":                     "/usr/bin",
+		"DONMAI_CONFINEMENT_PROBE": "declared-evil",
+		env.InjectedEnvKeysVar:     "DONMAI_CONFINEMENT_PROBE",
+	}
+	for _, kv := range c.Compose(base, agent.Spec{}) {
+		if strings.Contains(kv, "declared-evil") {
+			t.Fatalf("declared engine control reached Compose: %v", kv)
+		}
+	}
+}

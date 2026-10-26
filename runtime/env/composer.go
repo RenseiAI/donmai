@@ -369,6 +369,82 @@ func ValidEnvKey(key string) bool {
 	return key != "" && !strings.ContainsAny(key, "=\x00")
 }
 
+// Engine-control prefixes and suffix that must never cross an untrusted
+// environment boundary into an engine child. The engine re-executes itself
+// when one of these is set (the Landlock stage, the confinement probe and
+// its decoy/remount helpers), so an inherited or session-supplied copy
+// would select a re-exec role for the child. Matching is exact and
+// case-sensitive: only the upper-case prefix or suffix names a control.
+// A bare prefix without a trailing name ("DONMAI_CONFINEMENT",
+// "RENSEI_SEATBELT", or the prefixes with an empty suffix) is not a
+// control and is left alone, as are lower-case spellings and names that
+// merely extend the probe suffix ("*_PROBE_EXTRA").
+const (
+	engineControlDonmaiPrefix   = "DONMAI_CONFINEMENT_"
+	engineControlSeatbeltPrefix = "RENSEI_SEATBELT_"
+	engineControlProbeSuffix    = "_PROBE"
+)
+
+// IsEngineControlEnv reports whether key is an engine re-exec control that
+// must be stripped from every untrusted or inherited environment map before
+// an engine child is launched. It covers the DONMAI_CONFINEMENT_* namespace
+// (confinement stage, probe, decoy and remount controls), the
+// RENSEI_SEATBELT_* namespace, and any *_PROBE re-exec marker. Only the
+// producer-owned copies appended after filtering (Plan.Environment and the
+// self-test probe marker) may reach the child.
+func IsEngineControlEnv(key string) bool {
+	if len(key) > len(engineControlDonmaiPrefix) && strings.HasPrefix(key, engineControlDonmaiPrefix) {
+		return true
+	}
+	if len(key) > len(engineControlSeatbeltPrefix) && strings.HasPrefix(key, engineControlSeatbeltPrefix) {
+		return true
+	}
+	if len(key) > len(engineControlProbeSuffix) && strings.HasSuffix(key, engineControlProbeSuffix) {
+		return true
+	}
+	return false
+}
+
+// FilterEngineControlEnv returns a copy of entries with engine re-exec
+// controls removed. Entries use the os.Environ KEY=VALUE form; a bare
+// control name without '=' is removed as well so malformed input cannot
+// bypass the boundary. Values are never logged.
+func FilterEngineControlEnv(entries []string) []string {
+	if len(entries) == 0 {
+		return entries
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if IsEngineControlEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// FilterEngineControlEnvMap returns a defensive copy of entries with engine
+// re-exec controls removed. Entries whose key is not a valid variable name
+// are dropped as well, for the same serialization reason FilterRunnerOnlyMap
+// documents.
+func FilterEngineControlEnvMap(entries map[string]string) map[string]string {
+	if entries == nil {
+		return nil
+	}
+	out := make(map[string]string, len(entries))
+	for key, value := range entries {
+		if !ValidEnvKey(key) || IsEngineControlEnv(key) {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
 // isSessionReadToken reports whether key is the per-session read
 // credential a supervisor states in a spawned worker's environment
 // (SessionReadTokenEnv). The worker consumes it during bootstrap; it must
@@ -392,6 +468,13 @@ func filterInheritedChildEnv(entries []string) []string {
 		key := entry
 		if i := strings.IndexByte(entry, '='); i >= 0 {
 			key = entry[:i]
+		}
+		// Engine re-exec controls never cross an inherited boundary, no
+		// matter what the injection declaration says: only the
+		// producer-owned copies appended after filtering may reach the
+		// child.
+		if IsEngineControlEnv(key) {
+			continue
 		}
 		if IsRunnerOnly(key) {
 			continue
@@ -431,6 +514,13 @@ func ComposeChildEnv(parent []string, explicit ...map[string]string) []string {
 	mergedExplicit := make(map[string]string)
 	for _, layer := range explicit {
 		for key, value := range FilterRunnerOnlyMap(layer) {
+			// Engine re-exec controls are refused at every layer, explicit
+			// included: a session-supplied copy must not select a re-exec
+			// role for the child. Only producer-owned copies appended
+			// after this composition may reach it.
+			if IsEngineControlEnv(key) {
+				continue
+			}
 			mergedExplicit[key] = value
 		}
 	}
@@ -515,6 +605,11 @@ func (c *Composer) Compose(base map[string]string, spec agent.Spec) []string {
 
 	merged := make(map[string]string)
 	for k, v := range base {
+		// Engine re-exec controls never cross the inherited base layer,
+		// no matter what the injection declaration says.
+		if IsEngineControlEnv(k) {
+			continue
+		}
 		if IsRunnerOnly(k) {
 			continue
 		}
@@ -532,7 +627,13 @@ func (c *Composer) Compose(base map[string]string, spec agent.Spec) []string {
 	}
 	// spec.Env wins for session credentials and metadata, except for
 	// runner-only attach controls: those remain host-side at every layer.
+	// Engine re-exec controls are refused here as well: a session-supplied
+	// copy must not select a re-exec role. Only producer-owned copies
+	// appended after this composition may reach the child.
 	for k, v := range spec.Env {
+		if IsEngineControlEnv(k) {
+			continue
+		}
 		if IsRunnerOnly(k) {
 			continue
 		}

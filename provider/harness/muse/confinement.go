@@ -577,12 +577,16 @@ func confineMuseArgv(plan *confinement.Plan, argv []string) ([]string, error) {
 	return plan.Command(argv)
 }
 
-// confineMuseEnv appends the plan's environment bindings (TMPDIR/TMP/TEMP
-// and any cache bindings) after the already-composed child environment, so
-// they win under last-entry-wins semantics. A nil plan adds nothing.
+// confineMuseEnv applies the plan's environment bindings (TMPDIR/TMP/TEMP,
+// cache bindings and the boundary's own stage policy) after the
+// already-composed child environment, so they win under last-entry-wins
+// semantics. It routes through the hardened plan merge Plan.ApplyToEnv, so
+// Pi and Muse share the same trusted-last rule: any inherited or
+// session-supplied engine re-exec control in childEnv is stripped before the
+// producer-owned copies below are appended. A nil plan adds nothing.
 func confineMuseEnv(childEnv []string, plan *confinement.Plan) []string {
 	if plan == nil {
 		return childEnv
 	}
-	return append(childEnv, plan.Environment()...)
+	return plan.ApplyToEnv(childEnv)
 }

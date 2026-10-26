@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -1098,7 +1099,13 @@ func (fx *fixture) startDecoy(marker string) (int, error) {
 	cmd := exec.Command(fx.probeCommand[0], fx.probeCommand[1:]...) //nolint:gosec // G204: the self-test's own probe command.
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, kv := range os.Environ() {
-		if key, _, _ := strings.Cut(kv, "="); key == ProbeEnv || key == landlockStageEnv {
+		// Strip every engine re-exec control the parent may carry before
+		// the trusted decoy marker below re-introduces the sole
+		// producer-owned copy; an inherited probe or stage marker must
+		// not select a re-exec role for the decoy. The explicit probe and
+		// stage names are named alongside the shared classifier so the
+		// stage constant stays referenced on hosts without the Linux stage.
+		if key, _, _ := strings.Cut(kv, "="); key == ProbeEnv || key == landlockStageEnv || runtimeenv.IsEngineControlEnv(key) {
 			continue
 		}
 		env = append(env, kv)

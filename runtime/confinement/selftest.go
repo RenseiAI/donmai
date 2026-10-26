@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // SelfTestOptions configure one startup self-test.
@@ -447,7 +448,13 @@ func (c *Confiner) probePass(ctx context.Context, in passInput) ([]ProbeOutcome,
 	if err != nil {
 		return nil, err
 	}
-	env := append(plan.Environment(), in.opts.ProbeEnv...)
+	// The probe's extra environment is untrusted session input: strip any
+	// engine re-exec control it carries before the trusted probe marker
+	// below re-introduces the sole producer-owned copy. Plan.Environment
+	// stays verbatim: its stage policy is the producer-owned control the
+	// child needs.
+	filteredExtra := runtimeenv.FilterEngineControlEnv(in.opts.ProbeEnv)
+	env := append(plan.Environment(), filteredExtra...)
 	env = append(env, ProbeEnv+"="+in.planPath)
 	exitCode, launchErr, unserved := c.launchProbe(ctx, in, argv, env)
 	if unserved != nil {

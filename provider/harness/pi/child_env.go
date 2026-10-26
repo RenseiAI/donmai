@@ -148,8 +148,11 @@ func proxyURLCarriesNoUserinfo(value string) bool {
 // auth.json), the known secret-valued bindings no child is entitled to, the
 // per-session read credential the worker consumed during bootstrap, the
 // host model-auth names the shared blocklist guards, runner-only controls,
-// and the harness-owned namespaces.
+// engine re-exec controls, and the harness-owned namespaces.
 func childEnvRefused(name string) bool {
+	if runtimeenv.IsEngineControlEnv(name) {
+		return true
+	}
 	if isSessionCredentialName(name) || runtimeenv.IsRunnerOnly(name) || name == runtimeenv.SessionReadTokenEnv {
 		return true
 	}

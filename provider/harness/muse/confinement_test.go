@@ -196,6 +196,113 @@ func TestEndpointLoopbackPorts_RefusesSupervisorChannels(t *testing.T) {
 	}
 }
 
+// TestConfineMuseEnv_StripsEngineControlsBeforeTrustedAppend pins the
+// hardened plan merge: inherited or session-supplied engine re-exec controls
+// in childEnv are stripped before the producer-owned plan bindings are
+// appended last, while safe near-misses and the tmp/cache precedence survive.
+//
+// RED: revert confineMuseEnv to a raw append and the evil entries below
+// survive in the merged env.
+func TestConfineMuseEnv_StripsEngineControlsBeforeTrustedAppend(t *testing.T) {
+	t.Parallel()
+	plan := confinement.PlanForTest(
+		[]string{"TMPDIR=/plan/tmp", "TMP=/plan/tmp", "TEMP=/plan/tmp", "GOCACHE=/plan/cache/go-build"},
+		[]string{"DONMAI_CONFINEMENT_LANDLOCK_STAGE=trusted-policy"},
+	)
+	childEnv := []string{
+		"PATH=/usr/bin",
+		"TMPDIR=/executor/seat-9",
+		"GOCACHE=/operator/cache",
+		"DONMAI_CONFINEMENT_PROBE=evil-probe",
+		"DONMAI_CONFINEMENT_LANDLOCK_STAGE=evil-stage",
+		"DONMAI_CONFINEMENT_PROBE_DECOY=evil-decoy",
+		"RENSEI_SEATBELT_FOO=evil-seatbelt",
+		"EVIL_PROBE=evil-suffix",
+		"FOO_PROBE_EXTRA=near-miss",
+		"DONMAI_CONFINEMENT=bare-prefix",
+	}
+	got := confineMuseEnv(childEnv, plan)
+	for _, kv := range got {
+		if strings.Contains(kv, "evil") {
+			t.Fatalf("untrusted engine control survived confineMuseEnv: %v", got)
+		}
+	}
+	stage := 0
+	for _, kv := range got {
+		if kv == "DONMAI_CONFINEMENT_LANDLOCK_STAGE=trusted-policy" {
+			stage++
+		}
+	}
+	if stage != 1 {
+		t.Fatalf("trusted stage present %d times, want exactly once: %v", stage, got)
+	}
+	// Tmp precedence survives the hardened merge: the plan binding wins
+	// exactly once, and the operator cache entry passes through alongside
+	// the plan cache binding.
+	tmp := 0
+	for _, kv := range got {
+		if kv == "TMPDIR=/plan/tmp" {
+			tmp++
+		}
+		if kv == "TMPDIR=/executor/seat-9" {
+			t.Fatalf("shadowed TMPDIR survived confineMuseEnv: %v", got)
+		}
+	}
+	if tmp != 1 {
+		t.Fatalf("plan TMPDIR present %d times, want exactly once: %v", tmp, got)
+	}
+	for _, want := range []string{
+		"PATH=/usr/bin",
+		"FOO_PROBE_EXTRA=near-miss",
+		"DONMAI_CONFINEMENT=bare-prefix",
+		"GOCACHE=/operator/cache",
+		"GOCACHE=/plan/cache/go-build",
+	} {
+		found := false
+		for _, kv := range got {
+			found = found || kv == want
+		}
+		if !found {
+			t.Fatalf("entry %q lost in confineMuseEnv (env %v)", want, got)
+		}
+	}
+}
+
+// TestServeEnv_FiltersEngineControlsAtEveryLayer pins that the serve child
+// environment never carries an engine control from any layer, while the
+// host's own MUSE_NO_AUTO_UPDATE marker and ordinary bindings still do.
+//
+// RED: drop the ComposeChildEnv engine filter and the session evil below
+// reaches the serve env.
+func TestServeEnv_FiltersEngineControlsAtEveryLayer(t *testing.T) {
+	t.Parallel()
+	got := serveEnv(
+		[]string{"PATH=/bin", "DONMAI_CONFINEMENT_PROBE=parent-evil", "FOO_PROBE_EXTRA=parent-near-miss"},
+		map[string]string{"RENSEI_SEATBELT_X": "extra-evil"},
+		map[string]string{"DONMAI_CONFINEMENT_PROBE_DECOY": "session-evil", "SAFE": "kept", "FOO_PROBE_EXTRA": "session-near-miss"},
+	)
+	for _, kv := range got {
+		if strings.Contains(kv, "evil") {
+			t.Fatalf("engine control reached the serve env: %v", got)
+		}
+	}
+	foundNear, foundSafe, foundMarker := false, false, false
+	for _, kv := range got {
+		if kv == "FOO_PROBE_EXTRA=session-near-miss" {
+			foundNear = true
+		}
+		if kv == "SAFE=kept" {
+			foundSafe = true
+		}
+		if kv == "MUSE_NO_AUTO_UPDATE=1" {
+			foundMarker = true
+		}
+	}
+	if !foundNear || !foundSafe || !foundMarker {
+		t.Fatalf("serve env lost a wanted entry (env %v)", got)
+	}
+}
+
 // TestConfineMuseSeatSpecForTest_SharesProductionLines pins that the test
 // seam builds the same workarea + daemon-private lines the production
 // entry point builds (shared through museSeatSpec, not copied): the

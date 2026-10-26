@@ -532,6 +532,79 @@ func TestInteractiveSpawn_SentinelTableAbsentFromExecEnv(t *testing.T) {
 	assertSentinelRoutes(t, credentials, environment)
 }
 
+// TestPartitionChildEnv_StripsEngineControlsFromBothCarriers pins AC-4: no
+// inherited, session-supplied or credential-file-derived re-exec control
+// reaches either carrier — neither the exec environment nor the deferred
+// environment section the policy extension restores — on either lane, while
+// a harmless near-miss still rides the environment section.
+//
+// RED: bypass the shared runtimeenv.IsEngineControlEnv classification in
+// partitionChildEnv (or childEnvRefused) and the evil entries below appear
+// in the deferred section.
+func TestPartitionChildEnv_StripsEngineControlsFromBothCarriers(t *testing.T) {
+	t.Parallel()
+	parent := []string{
+		"PATH=/usr/bin",
+		"DONMAI_CONFINEMENT_PROBE=parent-evil",
+		"DONMAI_CONFINEMENT_LANDLOCK_STAGE=parent-evil",
+		"RENSEI_SEATBELT_ENFORCE=parent-evil",
+		"EVIL_PROBE=parent-evil",
+		"FOO_PROBE_EXTRA=parent-near-miss",
+		"DONMAI_CONFINEMENT=parent-bare",
+	}
+	spec := agent.Spec{Env: map[string]string{
+		"DONMAI_CONFINEMENT_PROBE":         "spec-evil",
+		"DONMAI_CONFINEMENT_PROBE_DECOY":   "spec-evil",
+		"DONMAI_CONFINEMENT_PROBE_REMOUNT": "spec-evil",
+		"RENSEI_SEATBELT_FOO":              "spec-evil",
+		"BAR_PROBE":                        "spec-evil",
+		"FOO_PROBE_EXTRA":                  "spec-near-miss",
+		"GH_TOKEN":                         "tool-binding",
+	}}
+	parts := partitionChildEnv(parent, spec)
+	for _, entry := range parts.exec {
+		if strings.Contains(entry, "evil") {
+			t.Errorf("exec environment carries an engine control: %q (exec %v)", entry, parts.exec)
+		}
+		if name := entry[:strings.IndexByte(entry, '=')]; runtimeenv.IsEngineControlEnv(name) {
+			t.Errorf("exec environment carries engine control %q", entry)
+		}
+	}
+	for _, d := range parts.deferred {
+		if strings.Contains(d.Value, "evil") || runtimeenv.IsEngineControlEnv(d.Env) {
+			t.Errorf("environment section carries an engine control: %s=%q", d.Env, d.Value)
+		}
+	}
+	// The harmless near-miss survives in the environment section: it is
+	// unlisted but not refused, so the tools still see it. The explicit
+	// copy wins over the parent copy.
+	if got := deferredValue(parts, "FOO_PROBE_EXTRA"); got != "spec-near-miss" {
+		t.Errorf("near-miss FOO_PROBE_EXTRA deferred as %q, want the explicit copy", got)
+	}
+	if got := deferredValue(parts, "DONMAI_CONFINEMENT"); got == "" {
+		t.Errorf("bare prefix DONMAI_CONFINEMENT was dropped; it is not a control")
+	}
+	if got := deferredValue(parts, "GH_TOKEN"); got != "tool-binding" {
+		t.Errorf("tool binding GH_TOKEN deferred as %q", got)
+	}
+	// Direct classifier pin: every current confinement control is refused,
+	// every near-miss is not.
+	for _, evil := range []string{
+		"DONMAI_CONFINEMENT_PROBE", "DONMAI_CONFINEMENT_LANDLOCK_STAGE",
+		"DONMAI_CONFINEMENT_PROBE_DECOY", "DONMAI_CONFINEMENT_PROBE_REMOUNT",
+		"RENSEI_SEATBELT_X", "SOME_PROBE",
+	} {
+		if !childEnvRefused(evil) {
+			t.Errorf("childEnvRefused(%q) = false, want true", evil)
+		}
+	}
+	for _, near := range []string{"DONMAI_CONFINEMENT", "RENSEI_SEATBELT", "FOO_PROBE_EXTRA", "my_probe"} {
+		if childEnvRefused(near) {
+			t.Errorf("childEnvRefused(%q) = true, want false (a near-miss)", near)
+		}
+	}
+}
+
 // readCredentialFileSections reads both sections of a session credential
 // file.
 func readCredentialFileSections(t *testing.T, path string) (credentials, environment map[string]string) {
