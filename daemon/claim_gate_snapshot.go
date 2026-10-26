@@ -71,6 +71,12 @@ func (p *FailStaticClaimGateProvider) ResolveClaimLocalReality(cellJSON json.Raw
 			return nil, fmt.Errorf("rulesetsnapshot claim gate: %w", rulesetsnapshot.ErrNoCachedSnapshot)
 		}
 		if status.Age > p.Snapshot.RefuseAfter() {
+			// Kick one shared background refresh and refuse immediately.
+			// The refresh is never awaited: the claim decision stays
+			// memory-only and non-blocking, concurrent expiries coalesce
+			// into a single in-flight fetch, and the next successful
+			// refresh adopts through the usual verified path.
+			p.Snapshot.RequestRefresh()
 			return nil, fmt.Errorf("rulesetsnapshot claim gate: %w", &rulesetsnapshot.ExpiredError{
 				Rev: status.Rev, Age: status.Age, RefuseAfter: p.Snapshot.RefuseAfter(),
 			})
