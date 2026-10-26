@@ -268,6 +268,13 @@ type statusRequest struct {
 	CommitSHA      string `json:"commitSha,omitempty"`
 	PullRequestURL string `json:"pullRequestUrl,omitempty"`
 
+	// BaseSHA is the provision-time commit the session workarea was created
+	// from (agent.Result.BaseSHA): the exact tip selected by the explicit
+	// BaseRef at launch. Empty when no explicit-base receipt was produced;
+	// omitted for mixed-version compatibility — old platforms ignore it.
+	// Never paths, URLs, or fetch timing; one scalar beside CommitSHA.
+	BaseSHA string `json:"baseSha,omitempty"`
+
 	// Manifest is the structured turn-result manifest the agent wrote to
 	// `.agent/turn-result.json` (W3 — deterministic turn outcome), when one was
 	// present + valid. The platform's `applyTurnManifest` route consumes the
@@ -734,7 +741,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		Model:        r.Model,
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
-		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
+		BaseSHA: r.BaseSHA, PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		ContinuationOutcome:      r.ContinuationOutcome,
 		TerminalWorkareaLease:    projection,
 		TerminalArchiveReference: archiveReference,
