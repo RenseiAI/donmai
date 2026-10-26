@@ -333,37 +333,63 @@ func decideQuotaClaimAdmission(accounts []agent.UsageAccount, authMode, harness 
 }
 
 // quotaExhaustionSuspendsClaiming is the host-wide, pre-claim counterpart of
-// the per-item admission decision. Poll requests cannot select a harness, so
-// any fresh, still-blocking host-session exhaustion suspends the whole tick:
-// the poll request never goes out and no claim is taken, which keeps a typed
-// exhaustion NACK (unread by older platforms and counted toward their
-// terminal nack-loop) from terminalizing sessions the window would have
-// requeued. Stale snapshots and past resets admit, so the gate reopens on
-// reset or probe refresh without a restart. It never parses prose and never
-// infers exhaustion from endpoint errors or 429s.
+// the per-item admission decision. A subscription window binds one harness's
+// host-session lane only: other harnesses, other auth modes for the same
+// harness, and the non-session lanes riding the same poll response (kg
+// extraction, landing triggers, inbox) are unaffected by it. Suspending the
+// whole tick for one harness would starve them all, so the gate suspends
+// ONLY when every fresh host-session harness snapshot this host holds is
+// still blocking (UsedPercent >= 100 with a future reset, or a fresh
+// missing/malformed reset that fails closed). Otherwise the poll request
+// still goes out and the per-item admission refuses only the exhausted
+// harness's host-session items. Stale snapshots and past resets admit as
+// available, so the gate reopens on reset or probe refresh without a
+// restart. It never parses prose and never infers exhaustion from endpoint
+// errors or 429s.
 func quotaExhaustionSuspendsClaiming(accounts []agent.UsageAccount, now time.Time) (bool, string) {
 	latest := time.Time{}
 	sawUnusable := false
+	freshCount := 0
+	blockedCount := 0
 	for i := range accounts {
 		if !quotaSnapshotFresh(accounts[i].Limits.CheckedAt, now) {
 			continue
 		}
+		freshCount++
+		accountBlocked := false
+		accountLatest := time.Time{}
 		for _, window := range accounts[i].Limits.Windows {
 			if window.UsedPercent < 100 {
 				continue
 			}
 			reset, ok := parseQuotaInstant(window.ResetsAt)
 			if !ok {
+				accountBlocked = true
 				sawUnusable = true
 				continue
 			}
 			if !reset.After(now) {
 				continue
 			}
-			if reset.After(latest) {
-				latest = reset
+			accountBlocked = true
+			if reset.After(accountLatest) {
+				accountLatest = reset
 			}
 		}
+		if !accountBlocked {
+			// One fresh harness still admits: keep polling so its
+			// host-session items, other auth modes, and the non-session
+			// lanes on the same response keep flowing. The exhausted
+			// harness is refused per item after the poll.
+			return false, ""
+		}
+		blockedCount++
+		if accountLatest.After(latest) {
+			latest = accountLatest
+		}
+	}
+	if freshCount == 0 || blockedCount != freshCount {
+		return false, ""
 	}
 	if !latest.IsZero() {
 		return true, "subscription window exhausted until " + latest.UTC().Format(time.RFC3339)

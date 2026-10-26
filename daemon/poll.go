@@ -813,7 +813,7 @@ func (p *PollService) claimGateBlocks() bool {
 				reason,
 			)
 		} else {
-			p.opts.LogInfo("daemon poll: resuming new-work claims — host status is ok again")
+			p.opts.LogInfo("daemon poll: resuming new-work claims — suspension cleared")
 		}
 	}
 	return suspended

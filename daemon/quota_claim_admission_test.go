@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 func quotaClaimWindow(id string, used float64, resetsAt string) agent.UsageWindow {
@@ -40,8 +42,22 @@ func seedQuotaWindows(d *Daemon, windows []agent.UsageWindow) {
 	d.quota.noteCodexProbe("opaque-codex", "promax", agent.MakeUsageLimits(agent.ISOTime(now), windows), now)
 }
 
+func seedClaudeWindows(d *Daemon, windows []agent.UsageWindow) {
+	now := time.Now()
+	d.quota.noteClaudeProbe("opaque-claude", agent.MakeUsageLimits(agent.ISOTime(now), windows), now)
+}
+
 func seedQuotaWindowsAt(d *Daemon, windows []agent.UsageWindow, checkedAt, probeAt time.Time) {
 	d.quota.noteCodexProbe("opaque-codex", "promax", agent.MakeUsageLimits(agent.ISOTime(checkedAt), windows), probeAt)
+}
+
+// quotaClaimPollBodyFor renders a poll envelope for one harness/auth-mode
+// pair plus the sibling claimAttempts member the poll decoder binds.
+func quotaClaimPollBodyFor(sessionID, harness, authMode, token string) string {
+	return fmt.Sprintf(`{"work":[{"sessionId":%q,"projectId":"project",`+
+		`"repository":"github.com/acme/repo","priority":1,"queuedAt":1700000000000,"resolvedProfile":{"harness":%q,"authMode":%q}}],`+
+		`"claimAttempts":{%q:{"contractVersion":"work-claim-attempt/v1","sessionId":%q,"attemptToken":%q}}}`,
+		sessionID, harness, authMode, sessionID, sessionID, token)
 }
 
 func quotaClaimDaemon(t *testing.T, spawns *int) *Daemon {
@@ -315,4 +331,150 @@ func TestQuotaClaimAdmission_ProofGateAndPayloadBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Mixed-host gate: one exhausted harness must not starve the other harness,
+// other auth modes, or the non-session lanes on the same poll response. The
+// gate suspends ONLY when every fresh harness snapshot is still blocking;
+// otherwise the poll goes out and the per-item admission refuses only the
+// exhausted harness. A fresh missing reset still suspends when it is the
+// only fresh snapshot (fail closed, bounded by the freshness TTL).
+func TestQuotaClaimAdmission_MixedHarnessKeepsPolling(t *testing.T) {
+	exhaustedCodex := []agent.UsageWindow{quotaClaimWindow("seven_day", 100, "2031-02-03T04:05:06Z")}
+	availableClaude := []agent.UsageWindow{quotaClaimWindow("five_hour", 42, "2031-02-03T04:05:06Z")}
+
+	t.Run("codex exhausted claude available still polls and spawns claude", func(t *testing.T) {
+		fixture := newClaimAttemptHTTPFixture(t, quotaClaimPollBodyFor("claude-1", "claude", string(agent.AuthHostSession), claimAttemptTokenOne))
+		var spawns int
+		d := quotaClaimDaemon(t, &spawns)
+		seedQuotaWindows(d, exhaustedCodex)
+		seedClaudeWindows(d, availableClaude)
+		if blocked, _ := d.PollClaimGate()(); blocked {
+			t.Fatal("claim gate blocked with claude available, want open")
+		}
+		poller := NewPollService(PollOptions{
+			WorkerID: "worker-quota", RuntimeJWT: "runtime-quota",
+			OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+			OnWork: func(item PollWorkItem) error {
+				return d.handlePollWorkItem(item, fixture.server.URL)
+			},
+			ClaimSuspended: d.PollClaimGate(),
+		})
+		poller.pollOnce(context.Background())
+		if n := fixture.pollIndex; n != 1 {
+			t.Fatalf("poll requests = %d, want 1 (mixed host keeps polling)", n)
+		}
+		if spawns != 1 || len(fixture.nackBodies()) != 0 {
+			t.Fatalf("spawns = %d nacks = %d, want claude admitted without NACK", spawns, len(fixture.nackBodies()))
+		}
+		if poller.ClaimsSuspended() {
+			t.Fatal("ClaimsSuspended() = true with claude available, want false")
+		}
+	})
+
+	t.Run("codex exhausted BYOK still polls and spawns through production gate", func(t *testing.T) {
+		fixture := newClaimAttemptHTTPFixture(t, quotaClaimPollBodyFor("byok-1", "codex", string(agent.AuthBYOK), claimAttemptTokenOne))
+		var spawns int
+		d := quotaClaimDaemon(t, &spawns)
+		seedQuotaWindows(d, exhaustedCodex)
+		seedClaudeWindows(d, availableClaude)
+		if blocked, _ := d.PollClaimGate()(); blocked {
+			t.Fatal("claim gate blocked with claude available, want open for BYOK")
+		}
+		poller := NewPollService(PollOptions{
+			WorkerID: "worker-quota", RuntimeJWT: "runtime-quota",
+			OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+			OnWork: func(item PollWorkItem) error {
+				return d.handlePollWorkItem(item, fixture.server.URL)
+			},
+			ClaimSuspended: d.PollClaimGate(),
+		})
+		poller.pollOnce(context.Background())
+		if n := fixture.pollIndex; n != 1 {
+			t.Fatalf("poll requests = %d, want 1 (BYOK rides the open gate)", n)
+		}
+		if spawns != 1 || len(fixture.nackBodies()) != 0 {
+			t.Fatalf("spawns = %d nacks = %d, want BYOK admitted without NACK", spawns, len(fixture.nackBodies()))
+		}
+	})
+
+	t.Run("codex exhausted claude available keeps landing and kg lanes flowing", func(t *testing.T) {
+		body := `{"work":[{"sessionId":"claude-lane","projectId":"project","repository":"github.com/acme/repo","priority":1,"queuedAt":1700000000000,"resolvedProfile":{"harness":"claude","authMode":"host-session"}}],` +
+			`"landingWork":[{"batchJobId":"batch:landing:1","workType":"landing-run","orgId":"org-1","repoId":"repo-1"}],` +
+			`"kgExtractWork":[{"batchJobId":"batch:kg:1","workType":"kg-extraction"}],` +
+			`"claimAttempts":{"claude-lane":{"contractVersion":"work-claim-attempt/v1","sessionId":"claude-lane","attemptToken":"` + claimAttemptTokenOne + `"}}}`
+		fixture := newClaimAttemptHTTPFixture(t, body)
+		var spawns, landings int
+		var kgs atomic.Int32
+		d := newRunningTestDaemon(t, Options{
+			OnLandingWork: func(context.Context, PollWorkItem) error { landings++; return nil },
+		}, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}},
+			func(SessionSpec, []string) ([]string, error) { spawns++; return nil, nil })
+		seedQuotaWindows(d, exhaustedCodex)
+		seedClaudeWindows(d, availableClaude)
+		poller := NewPollService(PollOptions{
+			WorkerID: "worker-quota", RuntimeJWT: "runtime-quota",
+			OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+			OnWork: func(item PollWorkItem) error {
+				return d.handlePollWorkItem(item, fixture.server.URL)
+			},
+			OnKgExtractWork: func(context.Context, worker.BatchWorkItem) error { kgs.Add(1); return nil },
+			ClaimSuspended:  d.PollClaimGate(),
+		})
+		poller.pollOnce(context.Background())
+		poller.Stop()
+		if n := fixture.pollIndex; n != 1 {
+			t.Fatalf("poll requests = %d, want 1 (lanes ride the open poll)", n)
+		}
+		if spawns != 1 {
+			t.Fatalf("spawns = %d, want 1 claude session", spawns)
+		}
+		if landings != 1 {
+			t.Fatalf("landing handler calls = %d, want 1", landings)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for kgs.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := kgs.Load(); got != 1 {
+			t.Fatalf("kg handler calls = %d, want 1", got)
+		}
+		if nacks := fixture.nackBodies(); len(nacks) != 0 {
+			t.Fatalf("NACK count = %d, want 0", len(nacks))
+		}
+	})
+
+	t.Run("single-harness missing reset suspends polling before claim", func(t *testing.T) {
+		bodies := make([]string, 2)
+		for i := range bodies {
+			bodies[i] = quotaClaimPollBody("quota-gate", claimAttemptTokenOne)
+		}
+		fixture := newClaimAttemptHTTPFixture(t, bodies...)
+		var spawns int
+		d := quotaClaimDaemon(t, &spawns)
+		seedQuotaWindows(d, []agent.UsageWindow{quotaClaimWindow("five_hour", 100, "")})
+		if blocked, reason := d.PollClaimGate()(); !blocked || reason == "" {
+			t.Fatalf("claim gate blocked = %v reason = %q, want suspended awaiting probe", blocked, reason)
+		}
+		poller := NewPollService(PollOptions{
+			WorkerID: "worker-quota", RuntimeJWT: "runtime-quota",
+			OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+			OnWork: func(item PollWorkItem) error {
+				return d.handlePollWorkItem(item, fixture.server.URL)
+			},
+			ClaimSuspended: d.PollClaimGate(),
+		})
+		for range 2 {
+			poller.pollOnce(context.Background())
+		}
+		if n := fixture.pollIndex; n != 0 {
+			t.Fatalf("poll requests = %d, want 0 (unusable snapshot fails closed before claim)", n)
+		}
+		if nacks := fixture.nackBodies(); len(nacks) != 0 {
+			t.Fatalf("NACK count = %d, want 0 (no claim means no NACK)", len(nacks))
+		}
+		if spawns != 0 {
+			t.Fatalf("spawns = %d, want 0", spawns)
+		}
+	})
 }
