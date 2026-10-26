@@ -7,15 +7,18 @@ package pi
 // complete a round-trip" but "what outcome did the boundary record for it".
 // These fixtures pin the three-way split that answer produces: an honoured
 // ruling, a recorded refusal, and a call with no record at all — plus the one
-// case that still ends the session, a trusted denial that the runtime executed
-// successfully anyway.
+// case that ends the session, and an unproven call that ends it too: only an
+// exact revalidated v1 receipt, an output-limit proof, or a start/end
+// argument proof excuses a guarded end. A trusted denial the runtime executed
+// successfully anyway stays fatal, and every unrecorded guarded end is now
+// fatal as well.
 //
-// Every case whose behaviour this change moves was watched RED first: the
-// missing-record cases and both call-id cases aborted the session on the prior
-// cut, and the demonstrable-bypass case was NOT fatal there. The allow path is
-// the unchanged control.
+// Every miss case was watched RED first against the prior non-fatal cut,
+// then GREEN after the fail-closed change. The allow, output-limit, and
+// argument-rejection paths are the unchanged controls.
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -335,13 +338,15 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 		},
 		{
 			// A success-claiming end leaves its note unconsumed; turn_end
-			// still drops it, so it cannot excuse a later errored end.
+			// still drops it, so it cannot excuse a later errored end. The
+			// first miss is terminal fail-closed, so the later end never
+			// dispatches and only one miss is recorded.
 			name: "an unconsumed note is dropped at turn_end",
 			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
 				endEvent("edit", "toolCallId", "c-trunc", false) +
 				event(map[string]any{"type": "turn_end"}) +
 				endEvent("edit", "toolCallId", "c-trunc", true),
-			wantMissIDs: []string{"c-trunc", "c-trunc"},
+			wantMissIDs: []string{"c-trunc"},
 		},
 		{
 			// One named call explains one end event, not a second one.
@@ -473,7 +478,7 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 			}
 			evs := drainToResultOrClose(t, h)
 
-			var fatal, completed, decisions, refusedEvents int
+			var fatal, completed, decisions, refusedEvents, toolResults int
 			var missEvents []agent.ErrorEvent
 			for _, e := range evs {
 				switch value := e.(type) {
@@ -488,6 +493,8 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 					}
 				case agent.ResultEvent:
 					completed++
+				case agent.ToolResultEvent:
+					toolResults++
 				case agent.SystemEvent:
 					switch value.Subtype {
 					case "permission_decision":
@@ -511,19 +518,52 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 				}
 			}
 
-			if tc.wantFatal {
-				if fatal != 1 {
+			wantMissFatal := len(tc.wantMissIDs) > 0
+			wantTerminalFatal := tc.wantFatal || wantMissFatal
+			if wantTerminalFatal {
+				if completed != 0 {
+					t.Errorf("a fatal guarded end reached a ResultEvent; want terminal fail-closed: %+v", evs)
+				}
+				if tc.wantFatal && fatal != 1 {
 					t.Errorf("fatal ErrorEvents = %d, want exactly 1: %+v", fatal, evs)
 				}
-				if completed != 0 {
-					t.Errorf("session reached a ResultEvent after a demonstrated bypass: %+v", evs)
+				if !tc.wantFatal && fatal != 0 {
+					t.Errorf("unexpected bypass fatal alongside the miss terminal: %+v", evs)
+				}
+				// The terminal must close before it is observable: a racing
+				// Inject has to see the closed session, never a live pump.
+				if err := h.Inject(context.Background(), "race after fatal"); err == nil {
+					t.Errorf("Inject after a fatal miss returned nil; want a closed-session error proving close-before-emit")
+				}
+				// A fatal miss returns before mapEvent, so no recoverable
+				// ToolResult may follow it. A fall-through mutant that keeps
+				// mapping would surface one here.
+				wantTools := len(tc.wantRefusedIDs) + len(tc.wantRejectedIDs)
+				if !tc.wantFatal {
+					wantTools += 0 // misses contribute no ToolResult; decisions only where no miss ends the turn first
+					// Accounted adjudicated ends that precede the fatal miss
+					// still map: every decision in a non-fatal stream maps,
+					// but a stream that ends in a miss maps only its
+					// refused/rejected prefix (no case mixes decisions with a miss).
+					if len(tc.wantMissIDs) == 0 {
+						wantTools += tc.wantDecisions
+					}
+				} else {
+					wantTools += 0 // bypass maps nothing; rejected prefix maps
+				}
+				if toolResults != wantTools {
+					t.Errorf("ToolResultEvents = %d, want %d (fatal ends map nothing): %+v", toolResults, wantTools, evs)
 				}
 			} else {
 				if fatal != 0 {
-					t.Errorf("session aborted on an unproven call: %+v", evs)
+					t.Errorf("session aborted on an accounted call: %+v", evs)
 				}
 				if completed != 1 {
 					t.Errorf("session did not run to its own terminal (ResultEvents = %d): %+v", completed, evs)
+				}
+				wantTools := len(tc.wantRefusedIDs) + len(tc.wantRejectedIDs) + tc.wantDecisions
+				if toolResults != wantTools {
+					t.Errorf("ToolResultEvents = %d, want %d: %+v", toolResults, wantTools, evs)
 				}
 			}
 			if decisions != tc.wantDecisions {
@@ -547,8 +587,8 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 				if missEvents[i].Message == "" {
 					t.Errorf("miss[%d] event carried no message", i)
 				}
-				if !missEvents[i].SessionContinues {
-					t.Errorf("miss[%d] event does not say the session continues: %+v", i, missEvents[i])
+				if missEvents[i].SessionContinues {
+					t.Errorf("miss[%d] event says the session continues; a miss is terminal: %+v", i, missEvents[i])
 				}
 			}
 
@@ -743,14 +783,19 @@ func TestPolicyFence_UnverifiedFrameCannotWriteTheRegistry(t *testing.T) {
 			evs := drainToResultOrClose(t, h)
 			ph := h.(*Handle)
 
-			var fatal, misses int
+			var fatal, misses, results int
+			var missTerminal agent.ErrorEvent
 			for _, e := range evs {
 				ee, ok := e.(agent.ErrorEvent)
 				if !ok {
+					if _, isResult := e.(agent.ResultEvent); isResult {
+						results++
+					}
 					continue
 				}
 				if ee.Code == adjudicationMissingCode {
 					misses++
+					missTerminal = ee
 					continue
 				}
 				fatal++
@@ -768,6 +813,17 @@ func TestPolicyFence_UnverifiedFrameCannotWriteTheRegistry(t *testing.T) {
 			}
 			if misses != wantMisses {
 				t.Errorf("%s events = %d, want %d: %+v", adjudicationMissingCode, misses, wantMisses, evs)
+			}
+			if tc.wantMissID != "" {
+				if missTerminal.SessionContinues {
+					t.Errorf("miss terminal must not say the session continues: %+v", missTerminal)
+				}
+				if results != 0 {
+					t.Errorf("a fatal miss reached a ResultEvent; want terminal fail-closed: %+v", evs)
+				}
+				if err := h.Inject(context.Background(), "race after fatal"); err == nil {
+					t.Errorf("Inject after a fatal miss returned nil; want closed-session error proving close-before-emit")
+				}
 			}
 			recorded := ph.adjudicationMisses()
 			if len(recorded) != wantMisses {

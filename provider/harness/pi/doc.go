@@ -159,7 +159,7 @@
 // unauthenticated caller on the same channel the power to erase the very
 // evidence this design rests on.
 //
-// The monitor then splits three ways, and only the first ends the session:
+// The monitor then splits three ways, and the first and third end the session:
 //
 //  1. A trusted DENY for this call id, and the end event says the call ran and
 //     SUCCEEDED (top-level isError present and false). The refusal was not
@@ -186,16 +186,17 @@
 //     for why this one reading of result text is safe).
 //  3. NO recorded outcome. Unknowable: a real bypass, a lost ruling, a refusal
 //     that could not be registered, or a call id that could not be correlated
-//     all land here. The call is recorded as unproven and surfaced as a
-//     NON-fatal ErrorEvent{Code:"policy_adjudication_missing",
-//     SessionContinues:true} naming the tool and the call id, and the session
-//     runs on to its own terminal. The event says the session continues, so
-//     it stays on the record (the event log, the activity stream) while no
-//     consumer makes it the run's failure (runner/loop.go): the session's
-//     work, its verdict and its cost accounting all survive.
+//     all land here. The call is recorded as unproven and surfaced as a FATAL
+//     ErrorEvent{Code:"policy_adjudication_missing"} naming the tool and the
+//     call id, and the session ends here with no ToolResult following. The
+//     close runs before the emit so no later Inject can race the terminal,
+//     and dispatch returns before mapEvent so no recoverable ToolResult can
+//     follow the error. Only an exact revalidated v1 SDK receipt (case 2),
+//     an output-limit proof, or a start/end argument proof excuses a guarded
+//     end; anything else is terminal fail-closed.
 //
-// Why case 3 only records: there is no refusal left to deliver. The end event
-// is emitted after pi has already finalized the call's result, and the only
+// Why case 3 ends the session: the end event arrives after pi has already
+// finalized the call's result, and the only
 // pre-execution hook (tool_call) returned long before. Refusing "this single
 // call" is possible in exactly one place — the hook — and by the END the
 // window has closed.
@@ -221,8 +222,8 @@
 //
 // The argument-rejection reading in case 2 is the one place the monitor reads
 // result text, and it is bounded so that it cannot reopen that class. It is
-// consulted only for a call with NO ruling, so it can neither arm nor disarm
-// the fatal; all it can do is decline to record a miss. And the text must
+// consulted only for a call with NO ruling, so it can never arm the bypass
+// fatal; all it can do is excuse its own call from the unproven-call fatal. And the text must
 // close with JSON equal to the arguments the call's own tool_execution_start
 // carried, after the runtime's rejection line for that tool. An executed
 // built-in does not write a result that does both: bash appends its exit
@@ -231,31 +232,25 @@
 // hostile execution that forges the opening line still ends on text that is
 // not the call's arguments, and stays a miss.
 //
-// # Posture change (deliberate, and what compensates for it)
+// # Fail-closed posture (deliberate)
 //
-// Before this design a guarded end with no recorded outcome aborted the
-// session. For a genuinely subverted extension that capped the blast radius at
-// ONE unadjudicated call; now every subsequent call runs, each producing one
-// non-fatal record. That is a real reduction in containment and is accepted
-// knowingly, for three reasons. The fence never PREVENTED the first call —
-// its check point is the END event, after the runtime has finalized the
-// result — so the old abort was damage limitation, not prevention, and it
-// bought that limitation at the price of destroying sessions whose only fault
-// was a ruling lost in transit. The compensating control is that the miss is
-// now durable and machine-readable rather than a session obituary: it is an
-// agent.ErrorEvent carrying its own code, so it lands in the session's
-// event-log audit trail, reaches the activity sink, and is inspectable on the
-// handle — a subverted extension cannot run quietly, it can only run loudly.
-// It no longer fails the run: it says the session continues
-// (SessionContinues), so the verdict of a session that went on to finish its
-// work stands, while the record stays. And that record is itself unforgeable
-// from the channel an attacker has: only a token-verified round-trip can
-// write the registry that would silence it, and the runtime-evidence
-// exceptions of case 2 (a verified receipt, an output-limit stop, an argument
-// rejection) each excuse only a call the runtime did not run.
+// A guarded end with no recorded outcome ends the session. For a genuinely
+// subverted extension that caps the blast radius at ONE unadjudicated call:
+// the fence check point is the END event, after the runtime has finalized
+// the result, so the abort is damage limitation after the fact — and the
+// single narrow exception is an exact revalidated v1 SDK pre-execution
+// receipt proving a declared validation or unknown-tool refusal preceded
+// execution (case 2). The miss stays durable and machine-readable rather
+// than a silent drop: it is an agent.ErrorEvent carrying its own code, so it
+// lands in the session's event-log audit trail, reaches the activity sink,
+// and is inspectable on the handle — a subverted extension cannot run
+// quietly, it can only run once. The record itself is unforgeable from the
+// channel an attacker has: only a token-verified round-trip can write the
+// registry that would silence it, and the runtime-evidence exceptions of
+// case 2 (an exact receipt, an output-limit stop, an argument rejection)
+// each excuse only a call the runtime did not run.
 //
-// Two residual gaps, both deliberate and both bounded to "recorded, not
-// fatal":
+// Two residual gaps, both deliberate and both bounded to fatal case 3:
 //
 //   - An extension-side refusal raised with NO UI channel, or one whose own
 //     registration round-trip fails, cannot be registered — the channel it
