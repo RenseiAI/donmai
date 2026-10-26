@@ -825,6 +825,15 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.ContextKey = SignalGuardDegradedContextKey
 			out.ContextValue = SignalGuardDegradedContextValue
 			return out, true
+		case narrationNudgeSubtype:
+			// A narration-only continuation nudge the runner sent after a
+			// development turn that ended on a progress note with no new
+			// commit or pull request. Fixed content keeps the marker safe.
+			out.Type = "context"
+			out.Content = narrationNudgeContent
+			out.ContextKey = NarrationNudgeContextKey
+			out.ContextValue = NarrationNudgeContextValue
+			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
 		// command_progress, diff_updated, compaction, stream progress, and
@@ -929,6 +938,24 @@ const SignalGuardDegradedContextKey = "signalGuardDegraded"
 // SignalGuardDegradedContextValue is the fixed contextValue of a
 // signal-guard degraded marker.
 const SignalGuardDegradedContextValue = "degraded"
+
+// narrationNudgeSubtype mirrors runner's narration-nudge activity marker as
+// a literal: runtime/activity cannot import runner (runner imports this
+// package for the Poster), so the subtype string is pinned here. If the
+// runner constant ever changes, update both together.
+const narrationNudgeSubtype = "narration_nudge"
+
+// narrationNudgeContent is the fixed activity content for a narration-only
+// continuation nudge.
+const narrationNudgeContent = "runner sent a narration-only continuation nudge"
+
+// NarrationNudgeContextKey is the contextKey a narration-nudge marker
+// carries.
+const NarrationNudgeContextKey = "narrationNudge"
+
+// NarrationNudgeContextValue is the fixed contextValue of a narration-nudge
+// marker.
+const NarrationNudgeContextValue = "sent"
 
 // toolCallBoundsNotConfiguredContent is the fixed text forwarded when the
 // session carries no per-call bound; toolCallBoundsContentPrefix prefixes

@@ -975,6 +975,11 @@ type TurnContinuations struct {
 	// bounds was reached; the session then ended as failed, its failure mode
 	// naming the bound.
 	Exhausted bool `json:"exhausted,omitempty"`
+	// NarrationNudges counts the narration-only nudges sent in total: one
+	// automatic continuation after a development turn that ended on a
+	// narration-only assistant message with no new commit or pull request.
+	// Additive — old platforms ignore it.
+	NarrationNudges int `json:"narrationNudges,omitempty"`
 }
 
 // TurnManifest is the deterministic turn-outcome the agent writes to

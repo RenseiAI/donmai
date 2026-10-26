@@ -458,6 +458,15 @@ type Options struct {
 	// the progress bound and the ceiling above.
 	TurnContinuationUndeliveredLimit int
 
+	// NarrationNudgeLimit bounds the narration-only nudges of one session
+	// in total (narration_nudge.go): a development turn that ends on a
+	// narration-only assistant message, with no tool call in that message
+	// and no new commit or pull request, gets one automatic continuation
+	// over the existing steer channel before the runner fails the session.
+	// Zero uses DefaultNarrationNudgeLimit; negative disables the nudge,
+	// leaving tail recovery on the continuation bounds alone.
+	NarrationNudgeLimit int
+
 	// RescueDir is where teardown archives a session's unpublished work —
 	// uncommitted changes and commits no remote holds — as a patch before it
 	// deletes the workarea (<RescueDir>/<session>/<time>-<id>/<repository>.patch).
@@ -595,6 +604,8 @@ type Runner struct {
 	// turnContinuationUndeliveredLimit is
 	// Options.TurnContinuationUndeliveredLimit.
 	turnContinuationUndeliveredLimit int
+	// narrationNudgeLimit is Options.NarrationNudgeLimit.
+	narrationNudgeLimit int
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
 	providerRetryBackoff func(attempt int) time.Duration
@@ -725,6 +736,7 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationLimit:             opts.TurnContinuationLimit,
 		turnContinuationCeiling:           opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit:  opts.TurnContinuationUndeliveredLimit,
+		narrationNudgeLimit:               opts.NarrationNudgeLimit,
 		quotaReporterForSession:           opts.QuotaReporterForSession,
 		quotaReporters:                    map[string]*QuotaReporter{},
 		interactiveUsage:                  map[string]*interactiveUsageTotals{},
