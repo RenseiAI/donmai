@@ -240,3 +240,97 @@ func TestOpenRootExactToleratesDeviceRenumber(t *testing.T) {
 		t.Fatal("OpenRootExact accepted a different inode")
 	}
 }
+
+// TestFileIdentityMatchesRejectsBirthMismatch pins the birth guard in
+// fileIdentityMatches: the same inode on a renumbered device matches only
+// when the birth time matches too. Deleting the birth comparison must turn
+// this test RED; otherwise an inode-reusing replacement would be
+// misclassified as a renumber and auto-repaired.
+func TestFileIdentityMatchesRejectsBirthMismatch(t *testing.T) {
+	stored := FileIdentity{Device: 11, Inode: 1001, BirthSec: 1000, BirthNsec: 2, HasBirth: true}
+	renumbered := FileIdentity{Device: 12, Inode: 1001, BirthSec: 1000, BirthNsec: 2, HasBirth: true}
+	if !fileIdentityMatches(stored, renumbered) {
+		t.Fatal("same inode and birth on a renumbered device must match")
+	}
+	reused := renumbered
+	reused.BirthSec++
+	if fileIdentityMatches(stored, reused) {
+		t.Fatal("same inode with a different birth time must not match (inode reuse)")
+	}
+	reusedNsec := renumbered
+	reusedNsec.BirthNsec++
+	if fileIdentityMatches(stored, reusedNsec) {
+		t.Fatal("same inode with a different birth nanosecond must not match")
+	}
+	// Records written before birth tracking carry no birth time; the inode
+	// alone decides so old records migrate forward instead of crash-looping.
+	legacy := FileIdentity{Device: 12, Inode: 1001}
+	if !fileIdentityMatches(stored, legacy) {
+		t.Fatal("stored birth with a birthless current directory must match on inode")
+	}
+	if !fileIdentityMatches(legacy, renumbered) {
+		t.Fatal("birthless stored identity must match on inode")
+	}
+	otherInode := renumbered
+	otherInode.Inode++
+	if fileIdentityMatches(stored, otherInode) {
+		t.Fatal("different inode must not match even with the same birth")
+	}
+	if fileIdentityMatches(FileIdentity{}, renumbered) {
+		t.Fatal("zero stored identity must not match")
+	}
+}
+
+// TestAcquisitionStoreRefusesBirthMismatch pins the fail-closed side of the
+// birth guard at the store level: the same inode on a renumbered device
+// with a different birth time (inode reuse) is a replacement, not a
+// renumber, so open fails, diagnosis refuses repair, and repair refuses.
+func TestAcquisitionStoreRefusesBirthMismatch(t *testing.T) {
+	parent := t.TempDir()
+	if _, err := NewAcquisitionStore(parent, nil); err != nil {
+		t.Fatal(err)
+	}
+	dirInfo, err := os.Lstat(filepath.Join(parent, acquisitionStoreDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical, err := fileIdentity(dirInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !physical.HasBirth {
+		t.Skip("platform does not record birth time; store-level birth refusal is covered by TestFileIdentityMatchesRejectsBirthMismatch")
+	}
+
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+	storeRecord := readStoreIdentityForTest(t, storePath)
+	anchorRecord := readStoreIdentityForTest(t, anchorPath)
+	if !storeRecord.Identity.HasBirth || !anchorRecord.Identity.HasBirth {
+		t.Fatal("store identity should carry birth time on this platform")
+	}
+	reused := storeRecord.Identity
+	reused.Device += 1000
+	if reused.Device == storeRecord.Identity.Device {
+		reused.Device++
+	}
+	reused.BirthSec++
+	storeRecord.Identity = reused
+	anchorRecord.Identity = reused
+	writeStoreIdentityForTest(t, storePath, storeRecord)
+	writeStoreIdentityForTest(t, anchorPath, anchorRecord)
+
+	if _, err := NewAcquisitionStore(parent, nil); err == nil {
+		t.Fatal("store with a mismatched birth time opened without error")
+	}
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnosis.Healthy || diagnosis.NeedsReanchor {
+		t.Fatalf("birth mismatch must fail closed without repair: %+v", diagnosis)
+	}
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair accepted a birth-mismatched directory")
+	}
+}
