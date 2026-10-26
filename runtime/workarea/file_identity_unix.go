@@ -17,7 +17,13 @@ func fileIdentity(info os.FileInfo) (FileIdentity, error) {
 	if stat.Dev < 0 {
 		return FileIdentity{}, fmt.Errorf("runtime/workarea: negative filesystem device identity")
 	}
-	return FileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}, nil
+	return FileIdentity{
+		Device:    uint64(stat.Dev),
+		Inode:     uint64(stat.Ino),
+		BirthSec:  stat.Birthtimespec.Sec,
+		BirthNsec: stat.Birthtimespec.Nsec,
+		HasBirth:  true,
+	}, nil
 }
 
 func allocatedFileBytes(info os.FileInfo) (int64, error) {

@@ -24,6 +24,7 @@ import (
 	"github.com/RenseiAI/donmai/installer/servicepriority"
 	"github.com/RenseiAI/donmai/internal/anontoken"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // daemonDoer is the interface used by daemon subcommands. It is satisfied by
@@ -724,7 +725,8 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 			"current host binary.\n\n" +
 			"With --fix, doctor also strips retired config keys from every daemon\n" +
 			"config file (atomic rewrite, mode preserved, backup kept) and prints\n" +
-			"one summary line.\n\n" +
+			"one summary line. It also re-anchors the workarea acquisition store\n" +
+			"after a device-number renumber (backups kept beside the identity files).\n\n" +
 			"Exits 0 when the unit is installed and healthy, non-zero otherwise.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -755,18 +757,37 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 				return fmt.Errorf("daemon doctor: %w", err)
 			}
 
+			worktreeParent := statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
+			diagnosis, diagErr := workarea.DiagnoseAcquisitionStore(worktreeParent)
+			if diagErr != nil {
+				return fmt.Errorf("daemon doctor: workarea store: %w", diagErr)
+			}
+			repairNote := ""
+			if fix && diagnosis.NeedsReanchor {
+				if repairErr := workarea.RepairAcquisitionStore(worktreeParent); repairErr != nil {
+					return fmt.Errorf("daemon doctor: workarea store repair: %w", repairErr)
+				}
+				repaired, reErr := workarea.DiagnoseAcquisitionStore(worktreeParent)
+				if reErr != nil {
+					return fmt.Errorf("daemon doctor: workarea store: %w", reErr)
+				}
+				diagnosis = repaired
+				repairNote = "workarea store re-anchored to the current device (backups kept beside the identity files)"
+			}
+
 			out := cmd.OutOrStdout()
 			if jsonOut {
 				if !fix {
-					enc := json.NewEncoder(out)
-					enc.SetIndent("", "  ")
-					return enc.Encode(report)
+					return encodeDoctorReportWithWorkarea(out, report, diagnosis)
 				}
-				return encodeDoctorReportWithSweep(out, report, sweep)
+				return encodeDoctorReportWithSweepAndWorkarea(out, report, sweep, diagnosis, repairNote)
 			}
 
 			if fix {
 				_, _ = fmt.Fprintln(out, sweep.Line())
+			}
+			if repairNote != "" {
+				_, _ = fmt.Fprintln(out, repairNote)
 			}
 
 			binPath := resolveCurrentBinPath()
@@ -782,9 +803,21 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 			}
 			_, _ = fmt.Fprintf(out, "Host binary:      %s\n", binPath)
 			_, _ = fmt.Fprintf(out, "Binary present:   %v\n", binPresent)
+			_, _ = fmt.Fprintf(out, "Workarea parent:  %s\n", worktreeParent)
+			_, _ = fmt.Fprintf(out, "Workarea store:   %s\n", workareaDoctorLine(diagnosis))
 			if report.Detail != "" {
 				_, _ = fmt.Fprintln(out)
 				_, _ = fmt.Fprintln(out, report.Detail)
+			}
+			if diagnosis.Present && !diagnosis.Healthy {
+				if diagnosis.NeedsReanchor {
+					_, _ = fmt.Fprintln(out)
+					_, _ = fmt.Fprintf(out, "Workarea store device renumbered: run `%s host doctor --fix` to re-anchor (backups kept).\n", bin)
+					return fmt.Errorf("workarea store needs re-anchor — run `%s host doctor --fix`", bin)
+				}
+				_, _ = fmt.Fprintln(out)
+				_, _ = fmt.Fprintln(out, "Workarea store identity does not match this directory; manual review is required (no automatic repair).")
+				return fmt.Errorf("workarea store identity mismatch")
 			}
 			if !report.Installed {
 				return fmt.Errorf("service is not installed — run `%s host install`", bin)
@@ -796,7 +829,7 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output the doctor report as JSON")
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Inspect user-scoped systemd unit (Linux, default)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Inspect system-scoped systemd unit (Linux)")
-	cmd.Flags().BoolVar(&fix, "fix", false, "Strip retired config keys from every daemon config file")
+	cmd.Flags().BoolVar(&fix, "fix", false, "Strip retired config keys and re-anchor the workarea store after a device renumber")
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml; siblings are swept too)")
 
 	return cmd
@@ -819,6 +852,73 @@ func encodeDoctorReportWithSweep(out io.Writer, report installer.DoctorReport, s
 		"filesCleaned": sweep.FilesCleaned(),
 		"keysRemoved":  sweep.KeysRemoved(),
 		"summary":      sweep.Line(),
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(doc)
+}
+
+// workareaDoctorLine renders the workarea store diagnosis as a one-line
+// human summary for `host doctor`.
+func workareaDoctorLine(diagnosis workarea.StoreDiagnosis) string {
+	if !diagnosis.Present {
+		return "absent (no workareas yet)"
+	}
+	if diagnosis.Healthy {
+		return "pinned (" + diagnosis.Reason + ")"
+	}
+	return "needs attention (" + diagnosis.Reason + ")"
+}
+
+// encodeDoctorReportWithWorkarea renders the doctor report as JSON with the
+// workarea store diagnosis merged in.
+func encodeDoctorReportWithWorkarea(out io.Writer, report installer.DoctorReport, diagnosis workarea.StoreDiagnosis) error {
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	doc["workareaStore"] = map[string]any{
+		"present":       diagnosis.Present,
+		"healthy":       diagnosis.Healthy,
+		"storeId":       diagnosis.StoreID,
+		"needsReanchor": diagnosis.NeedsReanchor,
+		"reason":        diagnosis.Reason,
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(doc)
+}
+
+// encodeDoctorReportWithSweepAndWorkarea renders the doctor report as JSON
+// with both the retired-key sweep and the workarea store diagnosis merged in.
+func encodeDoctorReportWithSweepAndWorkarea(out io.Writer, report installer.DoctorReport, sweep daemonRuntime.RetiredKeySweepSummary, diagnosis workarea.StoreDiagnosis, repairNote string) error {
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("encode doctor report: %w", err)
+	}
+	doc["retiredKeySweep"] = map[string]any{
+		"filesChecked": len(sweep.Files),
+		"filesCleaned": sweep.FilesCleaned(),
+		"keysRemoved":  sweep.KeysRemoved(),
+		"summary":      sweep.Line(),
+	}
+	doc["workareaStore"] = map[string]any{
+		"present":       diagnosis.Present,
+		"healthy":       diagnosis.Healthy,
+		"storeId":       diagnosis.StoreID,
+		"needsReanchor": diagnosis.NeedsReanchor,
+		"reason":        diagnosis.Reason,
+	}
+	if repairNote != "" {
+		doc["workareaRepair"] = repairNote
 	}
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
