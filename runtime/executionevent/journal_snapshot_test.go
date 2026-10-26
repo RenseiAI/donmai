@@ -483,3 +483,285 @@ func TestJournalSnapshotRejectsCorruptEventsWithoutAck(t *testing.T) {
 	}
 	assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
 }
+
+func assertSnapshotReasonBounded(t *testing.T, snap JournalSnapshot, sentinel string) {
+	t.Helper()
+	if snap.UnavailableReason != JournalSnapshotReadError && snap.UnavailableReason != JournalSnapshotInvalidData {
+		t.Fatalf("unavailable reason = %q, want read_error or invalid_data", snap.UnavailableReason)
+	}
+	out, err := MarshalCompact(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sentinel != "" && strings.Contains(string(out), sentinel) {
+		t.Fatalf("snapshot leaks durable string %q in %s", sentinel, out)
+	}
+}
+
+func TestJournalSnapshotUnavailableReasonStaysBounded(t *testing.T) {
+	sentinel := "SENTINEL_SECRET_FIELD_TOKEN_8Z3Q"
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	t.Run("quarantine decode sentinel", func(t *testing.T) {
+		session := "snapshot-bounded-qdecode"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		line := `{` + `"` + sentinel + `":1}` + "\n"
+		if err := os.WriteFile(filepath.Join(dir, quarantineFileName), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotInvalidData)
+		assertSnapshotReasonBounded(t, snap, sentinel)
+	})
+	t.Run("events decode sentinel", func(t *testing.T) {
+		session := "snapshot-bounded-edecode"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		line := `{` + `"` + sentinel + `":1}` + "\n"
+		if err := os.WriteFile(filepath.Join(dir, journalFileName), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotInvalidData)
+		assertSnapshotReasonBounded(t, snap, sentinel)
+	})
+	t.Run("ack decode sentinel", func(t *testing.T) {
+		session := "snapshot-bounded-ackdecode"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		line := `{"structuredSeq":1,"` + sentinel + `":1}`
+		if err := os.WriteFile(filepath.Join(dir, ackFileName), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotInvalidData)
+		assertSnapshotReasonBounded(t, snap, sentinel)
+	})
+	t.Run("events oversize", func(t *testing.T) {
+		session := "snapshot-bounded-eversize"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		big := strings.Repeat("X", MaxRecordBytes+8192) + "\n"
+		if err := os.WriteFile(filepath.Join(dir, journalFileName), []byte(big), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotInvalidData)
+		assertSnapshotReasonBounded(t, snap, "")
+	})
+	t.Run("quarantine oversize", func(t *testing.T) {
+		session := "snapshot-bounded-qoversize"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		big := strings.Repeat("Y", MaxRecordBytes+8192) + "\n"
+		if err := os.WriteFile(filepath.Join(dir, quarantineFileName), []byte(big), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotInvalidData)
+		assertSnapshotReasonBounded(t, snap, "")
+	})
+	t.Run("events dir", func(t *testing.T) {
+		session := "snapshot-bounded-edir"
+		parent := t.TempDir()
+		dir := filepath.Join(parent, sentinel)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(dir, journalFileName)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(dir, journalFileName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotReadError)
+		assertSnapshotReasonBounded(t, snap, sentinel)
+	})
+	t.Run("quarantine dir", func(t *testing.T) {
+		session := "snapshot-bounded-qdir"
+		parent := t.TempDir()
+		dir := filepath.Join(parent, sentinel)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(dir, quarantineFileName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotReadError)
+		assertSnapshotReasonBounded(t, snap, sentinel)
+	})
+}
+
+func TestJournalSnapshotValidationGuards(t *testing.T) {
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	t.Run("foreign session", func(t *testing.T) {
+		session := "snapshot-guard-local"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		foreign := snapshotFixture(t, "snapshot-guard-foreign", 1, base)
+		raw, err := MarshalCompact(foreign)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, journalFileName), append(raw, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := j.Snapshot(base.Add(time.Minute))
+		assertSnapshotUnavailable(t, snap, JournalSnapshotInvalidData)
+		out, _ := MarshalCompact(snap)
+		if strings.Contains(string(out), "snapshot-guard-foreign") {
+			t.Fatalf("snapshot leaks foreign session in %s", out)
+		}
+	})
+	t.Run("ack ahead", func(t *testing.T) {
+		session := "snapshot-guard-ackahead"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ackFileName), []byte(`{"structuredSeq":5}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+	t.Run("quarantine seq zero", func(t *testing.T) {
+		session := "snapshot-guard-seqzero"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		r := snapshotFixture(t, session, 1, base)
+		if err := j.Append(session, r); err != nil {
+			t.Fatal(err)
+		}
+		bad := r
+		bad.StructuredSeq = 0
+		appendQuarantineLine(t, dir, quarantineRecord{Record: bad, Status: 409, Reason: "platform returned HTTP 409"})
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+	t.Run("quarantine reason too long", func(t *testing.T) {
+		session := "snapshot-guard-reasonlen"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		r := snapshotFixture(t, session, 1, base)
+		if err := j.Append(session, r); err != nil {
+			t.Fatal(err)
+		}
+		appendQuarantineLine(t, dir, quarantineRecord{Record: r, Status: 409, Reason: strings.Repeat("r", 257)})
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+	t.Run("events oversize", func(t *testing.T) {
+		session := "snapshot-guard-oversize"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		if err := j.Append(session, snapshotFixture(t, session, 1, base)); err != nil {
+			t.Fatal(err)
+		}
+		big := strings.Repeat("Z", MaxRecordBytes+8192) + "\n"
+		if err := os.WriteFile(filepath.Join(dir, journalFileName), []byte(big), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+	t.Run("oldest age uses first", func(t *testing.T) {
+		session := "snapshot-guard-oldest"
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		for seq := uint64(1); seq <= 3; seq++ {
+			observed := base.Add(time.Duration(seq-1) * time.Minute)
+			if err := j.Append(session, snapshotFixture(t, session, seq, observed)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		snap := j.Snapshot(base.Add(10 * time.Minute))
+		if snap.Status != JournalSnapshotAvailable {
+			t.Fatalf("status = %q, want available", snap.Status)
+		}
+		if snap.OldestUnacknowledgedAge == nil || *snap.OldestUnacknowledgedAge != 10*time.Minute {
+			t.Fatalf("oldest age = %v, want 10m from first pending", snap.OldestUnacknowledgedAge)
+		}
+	})
+	t.Run("zero journal", func(t *testing.T) {
+		var j Journal
+		assertSnapshotUnavailable(t, j.Snapshot(base.Add(time.Minute)), JournalSnapshotInvalidData)
+	})
+}
