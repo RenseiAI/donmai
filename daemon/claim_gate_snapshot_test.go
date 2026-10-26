@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -515,6 +516,51 @@ func mustGenerateTestKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	return pub, priv
 }
 
+// drainSnapshotBackgroundIO blocks until the background snapshot refresh a
+// test kicked has finished all of its filesystem writes, so t.TempDir
+// cleanup cannot race a mid-persist temp file (persist writes a temp file
+// beside the state path, then renames it into place). It waits for the
+// in-flight fetch to complete — hits stops increasing — plus a short
+// quiescence window, with no temp file present at the end. No new fetch can
+// start afterwards: these tests never start the poll ticker (so there is no
+// poll interval to observe) and issue no further claims once released.
+func drainSnapshotBackgroundIO(t *testing.T, stateDir string, hits *atomic.Int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var last int64 = -1
+	lastChange := time.Now()
+	for {
+		now := time.Now()
+		if now.After(deadline) {
+			t.Fatalf("background snapshot refresh did not settle within 10s (hits=%d)", hits.Load())
+		}
+		if got := hits.Load(); got != last {
+			last = got
+			lastChange = now
+		}
+		if last > 0 && now.Sub(lastChange) >= 200*time.Millisecond && !snapshotTmpPresent(stateDir) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// snapshotTmpPresent reports whether a persist temp file
+// (.ruleset-snapshot-*.tmp) currently exists in dir.
+func snapshotTmpPresent(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".ruleset-snapshot-") && strings.HasSuffix(name, ".tmp") {
+			return true
+		}
+	}
+	return false
+}
+
 // TestFailStatic_ExpiredRefusalKicksBackgroundRefreshWithoutBlocking proves
 // a production claim against an expired snapshot refuses with the typed
 // expiry before a deliberately blocked fetch completes, while still starting
@@ -541,9 +587,10 @@ func TestFailStatic_ExpiredRefusalKicksBackgroundRefreshWithoutBlocking(t *testi
 	}))
 	t.Cleanup(srv.Close)
 
+	stateDir := t.TempDir()
 	client, err := rulesetsnapshot.NewClient(rulesetsnapshot.Config{
 		Endpoint: srv.URL, TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
-		StatePath:     filepath.Join(t.TempDir(), "snap.json"),
+		StatePath:     filepath.Join(stateDir, "snap.json"),
 		DegradedAfter: 10 * time.Second, RefuseAfter: time.Minute,
 	})
 	if err != nil {
@@ -584,6 +631,7 @@ func TestFailStatic_ExpiredRefusalKicksBackgroundRefreshWithoutBlocking(t *testi
 		time.Sleep(10 * time.Millisecond)
 	}
 	close(release)
+	drainSnapshotBackgroundIO(t, stateDir, &hits)
 }
 
 // TestFailStatic_ConcurrentExpiredClaimsCoalesceToOneFetch proves concurrent
@@ -611,9 +659,10 @@ func TestFailStatic_ConcurrentExpiredClaimsCoalesceToOneFetch(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
+	stateDir := t.TempDir()
 	client, err := rulesetsnapshot.NewClient(rulesetsnapshot.Config{
 		Endpoint: srv.URL, TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
-		StatePath:     filepath.Join(t.TempDir(), "snap.json"),
+		StatePath:     filepath.Join(stateDir, "snap.json"),
 		DegradedAfter: 10 * time.Second, RefuseAfter: time.Minute,
 	})
 	if err != nil {
@@ -669,6 +718,7 @@ func TestFailStatic_ConcurrentExpiredClaimsCoalesceToOneFetch(t *testing.T) {
 		t.Fatalf("concurrent expired claims started %d fetches, want exactly 1", got)
 	}
 	close(release)
+	drainSnapshotBackgroundIO(t, stateDir, &hits)
 }
 
 // TestFailStatic_ExpiredRecoversAfterBackgroundRefresh proves the next
@@ -706,9 +756,10 @@ func TestFailStatic_ExpiredRecoversAfterBackgroundRefresh(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
+	stateDir := t.TempDir()
 	client, err := rulesetsnapshot.NewClient(rulesetsnapshot.Config{
 		Endpoint: srv.URL, TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
-		StatePath:     filepath.Join(t.TempDir(), "snap.json"),
+		StatePath:     filepath.Join(stateDir, "snap.json"),
 		DegradedAfter: 10 * time.Second, RefuseAfter: time.Minute,
 	})
 	if err != nil {
@@ -764,4 +815,5 @@ func TestFailStatic_ExpiredRecoversAfterBackgroundRefresh(t *testing.T) {
 	if len(detail2.ClaimReceipt) == 0 {
 		t.Fatal("no claim receipt was attached after recovery")
 	}
+	drainSnapshotBackgroundIO(t, stateDir, &hits)
 }

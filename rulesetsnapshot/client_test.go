@@ -487,4 +487,20 @@ func TestClient_BackgroundKickAdoptsVerifiedSnapshot(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	// Adoption lands in memory before the durable write completes: drain the
+	// kicked refresh (same as the coalescing test above) so TempDir cleanup
+	// cannot race its persist.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		c.refreshMu.Lock()
+		inFlight := c.refreshInFlight
+		c.refreshMu.Unlock()
+		if !inFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("kicked refresh did not finish after adopting")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
