@@ -141,3 +141,64 @@ func TestRequiredBranchBaseRejectsTagFallbackAndStaleTracking(t *testing.T) {
 		})
 	}
 }
+
+func TestCloneExplicitBaseRecordsInitialHeadAsReceipt(t *testing.T) {
+	t.Parallel()
+	f := newBranchGitFixture(t)
+	m := branchManager(t, f)
+	mainTip := f.git(t, "--git-dir", f.remote, "rev-parse", "refs/heads/main")
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{SessionID: "clone-base", RepoURL: f.remote, Strategy: worktree.StrategyClone, Branch: "main", BaseRef: "main", RequireBranchBase: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := m.Teardown(context.Background(), "clone-base"); err != nil {
+			t.Error(err)
+		}
+	})
+	head := f.git(t, "-C", path, "rev-parse", "HEAD")
+	if head != mainTip {
+		t.Fatalf("clone HEAD = %q, want remote main tip %q", head, mainTip)
+	}
+	result, err := m.Result("clone-base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BaseSHA != head {
+		t.Fatalf("clone receipt BaseSHA = %q, want initial HEAD %q", result.BaseSHA, head)
+	}
+	if result.BaseRef != "main" {
+		t.Fatalf("clone receipt BaseRef = %q, want %q", result.BaseRef, "main")
+	}
+}
+
+func TestCloneWithoutBaseRefOmitsReceipt(t *testing.T) {
+	t.Parallel()
+	f := newBranchGitFixture(t)
+	m := branchManager(t, f)
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{SessionID: "clone-legacy", RepoURL: f.remote, Strategy: worktree.StrategyClone, Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := m.Teardown(context.Background(), "clone-legacy"); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := m.Result("clone-legacy"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.Result("clone-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BaseSHA != "" {
+		t.Fatalf("legacy clone BaseSHA = %q, want empty", result.BaseSHA)
+	}
+	if result.BaseRef != "" {
+		t.Fatalf("legacy clone BaseRef = %q, want empty", result.BaseRef)
+	}
+	if got := f.git(t, "-C", path, "rev-parse", "HEAD"); got == "" {
+		t.Fatal("expected resolvable HEAD")
+	}
+}

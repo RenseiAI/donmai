@@ -1686,3 +1686,63 @@ func TestPosterPost_StatusServingReportSerialized(t *testing.T) {
 		})
 	}
 }
+
+// TestPosterPost_StatusBaseSHASerialized pins the additive launch-base SHA on
+// the /status body: baseSha carries the provision-time branch point
+// (agent.Result.BaseSHA) and is omitted when empty for mixed-version
+// compatibility. Removing the buildStatusRequest mapping drops the key and
+// fails the populated row.
+func TestPosterPost_StatusBaseSHASerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "omitted when no explicit base", in: "", want: ""},
+		{name: "launch base", in: "abc123abc123abc123abc123abc123abc123abcd", want: `"abc123abc123abc123abc123abc123abc123abcd"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			var completionBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				if strings.HasSuffix(r.URL.Path, "/completion") {
+					completionBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.BaseSHA = tc.in
+			if err := p.Post(context.Background(), "sess-base", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["baseSha"]
+			if present != (tc.want != "") {
+				t.Fatalf("baseSha present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("baseSha = %s; want %s", got, tc.want)
+			}
+			// The completion comment wire shape is unchanged: no base key.
+			var completion map[string]json.RawMessage
+			if err := json.Unmarshal(completionBody, &completion); err != nil {
+				t.Fatalf("completion body not JSON: %v", err)
+			}
+			if _, present := completion["baseSha"]; present {
+				t.Fatalf("completion body carries baseSha: %s", completionBody)
+			}
+		})
+	}
+}
