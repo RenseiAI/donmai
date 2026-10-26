@@ -218,3 +218,127 @@ func TestLaunchers_SelfTestProbeMarkerSurvivesAsTrustedLast(t *testing.T) {
 
 	_ = agent.PromptModeAutonomous
 }
+
+// TestProbePass_FiltersEvilProbeExtra pins the probe-extra guard at the
+// production entry point: probePass must strip engine re-exec controls
+// carried in SelfTestOptions.ProbeEnv before the trusted probe marker is
+// appended last. Removing the FilterEngineControlEnv call lets an evil
+// extra ride into the probe child alongside the trusted marker.
+func TestProbePass_FiltersEvilProbeExtra(t *testing.T) {
+	w := newSpecWorld(t)
+	c := newTestConfiner(t, w, noopBackend{}, nil, "")
+	var got []string
+	launcher := func(_ context.Context, _ []string, env []string, _ string) (int, error) {
+		got = append([]string(nil), env...)
+		return 0, nil
+	}
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "plan.json")
+	resultPath := filepath.Join(dir, "result.json")
+	// Not parallel: probePass reads no parent environment here; the evil
+	// rides the explicit ProbeEnv session input instead.
+	_, err := c.probePass(context.Background(), passInput{
+		mode:     agent.PromptModeAutonomous,
+		launcher: launcher,
+		opts: SelfTestOptions{
+			ProbeCommand: []string{"/bin/true"},
+			ProbeEnv: []string{
+				"DONMAI_CONFINEMENT_PROBE_DECOY=evil-decoy",
+				"RENSEI_SEATBELT_X=evil-seatbelt",
+				"BAR_PROBE=evil-suffix",
+				"SAFE_KEEP=keep",
+			},
+			ProbeHandshakeTimeout: time.Second,
+		},
+		fx:         &fixture{mut: dir, tmp: dir},
+		spec:       w.spec(),
+		planPath:   planPath,
+		resultPath: resultPath,
+	})
+	if err != nil {
+		t.Fatalf("probePass: %v", err)
+	}
+	if got == nil {
+		t.Fatal("probePass never invoked the launcher")
+	}
+	envMap := map[string]string{}
+	for _, kv := range got {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			envMap[kv[:i]] = kv[i+1:]
+		}
+	}
+	for _, evil := range []string{"DONMAI_CONFINEMENT_PROBE_DECOY", "RENSEI_SEATBELT_X", "BAR_PROBE"} {
+		if v, ok := envMap[evil]; ok {
+			t.Errorf("probe child observes evil extra %s=%q", evil, v)
+		}
+	}
+	if envMap["SAFE_KEEP"] != "keep" {
+		t.Errorf("probe child misses safe extra SAFE_KEEP=%q", envMap["SAFE_KEEP"])
+	}
+	if envMap[ProbeEnv] != planPath {
+		t.Errorf("probe child probe marker = %q, want the trusted %q", envMap[ProbeEnv], planPath)
+	}
+}
+
+// TestStartDecoy_StripsBroadEngineControls pins the decoy broadening at the
+// production entry point: startDecoy must strip every engine re-exec
+// control from the parent, not just the explicit probe and stage names.
+// Removing the shared-classifier clause lets a parent carrying a seatbelt
+// or suffix control ride into the decoy re-exec.
+func TestStartDecoy_StripsBroadEngineControls(t *testing.T) {
+	// Not parallel: stages engine controls in the process environment.
+	t.Setenv(ProbeEnv, "parent-evil-probe")
+	t.Setenv(landlockStageEnv, "parent-evil-stage")
+	t.Setenv("RENSEI_SEATBELT_ENFORCE", "parent-evil-seatbelt")
+	t.Setenv("BAR_PROBE", "parent-evil-suffix")
+	t.Setenv("FOO_PROBE_EXTRA", "parent-near-miss")
+	t.Setenv("DONMAI_CONFINEMENT", "parent-bare-prefix")
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "decoy-env")
+	script := filepath.Join(dir, "decoy.sh")
+	body := "#!/bin/sh\nenv > " + dump + "\nprintf \"ready\\n\"\nsleep 30\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil { //nolint:gosec // G306: a test-owned stand-in executable the launcher runs.
+		t.Fatalf("write decoy stand-in: %v", err)
+	}
+	fx := &fixture{probeCommand: []string{script}, probeHandshake: 10 * time.Second, out: dir}
+	t.Cleanup(fx.cleanup)
+	marker := filepath.Join(dir, "marker")
+	if _, err := fx.startDecoy(marker); err != nil {
+		t.Fatalf("startDecoy: %v", err)
+	}
+	raw, err := os.ReadFile(dump) //nolint:gosec // G304: the test-owned recorder file.
+	if err != nil {
+		t.Fatalf("read recorded decoy env: %v", err)
+	}
+	got := map[string]string{}
+	decoyCount := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		if i := strings.IndexByte(line, '='); i >= 0 {
+			key, value := line[:i], line[i+1:]
+			got[key] = value
+			if key == probeDecoyEnv {
+				decoyCount++
+			}
+		}
+	}
+	for _, evil := range []string{ProbeEnv, landlockStageEnv, "RENSEI_SEATBELT_ENFORCE", "BAR_PROBE"} {
+		if v, ok := got[evil]; ok {
+			t.Errorf("decoy child observes parent %s=%q", evil, v)
+		}
+	}
+	if decoyCount != 1 {
+		t.Errorf("decoy marker present %d times, want exactly once", decoyCount)
+	}
+	if got[probeDecoyEnv] != marker {
+		t.Errorf("decoy child marker = %q, want the trusted %q", got[probeDecoyEnv], marker)
+	}
+	if got["FOO_PROBE_EXTRA"] != "parent-near-miss" {
+		t.Errorf("decoy child misses near-miss FOO_PROBE_EXTRA=%q", got["FOO_PROBE_EXTRA"])
+	}
+	if got["DONMAI_CONFINEMENT"] != "parent-bare-prefix" {
+		t.Errorf("decoy child misses bare prefix DONMAI_CONFINEMENT=%q", got["DONMAI_CONFINEMENT"])
+	}
+}
