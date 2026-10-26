@@ -100,21 +100,31 @@ func bufferedEvents(h *Handle) []agent.Event {
 	}
 }
 
+// closedNow reports whether the handle's teardown broadcast has fired.
+func closedNow(h *Handle) bool {
+	select {
+	case <-h.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 // TestDispatchPreExecutionRefusalClosedClassifier pins the classifier that
 // decides whether a tool_execution_end carries a VERIFIED SDK pre-execution
-// refusal. Its discrimination is unchanged — only the two accepted shapes are
-// accepted, and every tampered, forged, drifted or wrong-mode variant is
-// rejected. What a rejection MEANS changed: an unverified claim is a call the
-// boundary cannot prove, so it is recorded as a miss and surfaced non-fatally
-// rather than ending the session (doc.go "The fail-safe fence"). The refusal's
-// own recoverable ToolResultEvent reaches the caller either way.
+// refusal. Only the two exact v1 shapes are accepted, and every absent,
+// drifted, mismatched, forged, or stale variant is rejected. An accepted
+// receipt stays recoverable with one error ToolResult; a rejected claim is a
+// call the boundary cannot prove, so it is recorded as a miss and ends the
+// session as a terminal policy_adjudication_missing with no ToolResult and
+// no ResultEvent (doc.go "The fail-safe fence").
 func TestDispatchPreExecutionRefusalClosedClassifier(t *testing.T) {
 	tests := []struct {
 		name string
 		// mutate tampers with the admission, the event, or the measured files.
 		mutate func(*testing.T, *receiptAdmission, *rawEvent, string, string)
 		// wantMiss is true when the claim must be rejected and the call
-		// recorded as unproven.
+		// recorded as unproven and fatal.
 		wantMiss bool
 		// wantCallID is the id the recorded miss must name.
 		wantCallID string
@@ -128,6 +138,9 @@ func TestDispatchPreExecutionRefusalClosedClassifier(t *testing.T) {
 		{name: "missing profile", mutate: func(_ *testing.T, admission *receiptAdmission, _ *rawEvent, _, _ string) {
 			*admission = receiptAdmission{}
 		}, wantMiss: true, wantCallID: "call-1"},
+		{name: "absent receipt field", mutate: func(_ *testing.T, _ *receiptAdmission, ev *rawEvent, _, _ string) {
+			delete(ev.Fields, "preExecutionRefusal")
+		}, wantMiss: true, wantCallID: "call-1"},
 		{name: "wrong schema", mutate: func(_ *testing.T, _ *receiptAdmission, ev *rawEvent, _, _ string) {
 			ev.Fields["preExecutionRefusal"].(map[string]any)["schemaVersion"] = float64(2)
 		}, wantMiss: true, wantCallID: "call-1"},
@@ -140,6 +153,12 @@ func TestDispatchPreExecutionRefusalClosedClassifier(t *testing.T) {
 		{name: "outer id mismatch", mutate: func(_ *testing.T, _ *receiptAdmission, ev *rawEvent, _, _ string) {
 			ev.Fields["toolCallId"] = "other"
 		}, wantMiss: true, wantCallID: "other"},
+		{name: "inner id mismatch", mutate: func(_ *testing.T, _ *receiptAdmission, ev *rawEvent, _, _ string) {
+			ev.Fields["preExecutionRefusal"].(map[string]any)["toolCallId"] = "other"
+		}, wantMiss: true, wantCallID: "call-1"},
+		{name: "outer name mismatch", mutate: func(_ *testing.T, _ *receiptAdmission, ev *rawEvent, _, _ string) {
+			ev.Fields["toolName"] = "bash"
+		}, wantMiss: true, wantCallID: "call-1"},
 		{name: "inner name mismatch", mutate: func(_ *testing.T, _ *receiptAdmission, ev *rawEvent, _, _ string) {
 			ev.Fields["preExecutionRefusal"].(map[string]any)["toolName"] = "bash"
 		}, wantMiss: true, wantCallID: "call-1"},
@@ -176,9 +195,7 @@ func TestDispatchPreExecutionRefusalClosedClassifier(t *testing.T) {
 				test.mutate(t, admission, &ev, binary, extension)
 			}
 			h := newHandle(nil, nil, agent.Spec{Autonomous: true}, "", admission)
-			if fatal := h.dispatch(ev); fatal {
-				t.Fatalf("an unproven refusal claim ended the session; only a denial the runtime executed anyway may")
-			}
+			fatal := h.dispatch(ev)
 
 			events := bufferedEvents(h)
 			var misses []agent.ErrorEvent
@@ -192,27 +209,52 @@ func TestDispatchPreExecutionRefusalClosedClassifier(t *testing.T) {
 					misses = append(misses, value)
 				case agent.ToolResultEvent:
 					results = append(results, value)
+				case agent.ResultEvent:
+					t.Fatalf("a guarded end produced a ResultEvent: %+v", value)
 				}
 			}
-			// The refusal's own recoverable result still reaches the caller,
-			// carrying the event's identity and error flag verbatim.
-			wantErr, _ := ev.Fields["isError"].(bool)
-			if len(results) != 1 || results[0].IsError != wantErr || results[0].ToolUseID != toolCallID(ev.Fields) {
-				t.Fatalf("recoverable result lost error/identity: %+v", results)
-			}
-			wantMisses := 0
-			if test.wantMiss {
-				wantMisses = 1
-			}
-			if len(misses) != wantMisses {
-				t.Fatalf("%s events = %d, want %d: %+v", adjudicationMissingCode, len(misses), wantMisses, misses)
-			}
-			recorded := h.adjudicationMisses()
-			if len(recorded) != wantMisses {
-				t.Fatalf("recorded misses = %+v, want %d", recorded, wantMisses)
-			}
-			if test.wantMiss && recorded[0].callID != test.wantCallID {
-				t.Errorf("recorded miss call id = %q, want %q", recorded[0].callID, test.wantCallID)
+			if !test.wantMiss {
+				// Accepted receipt: recoverable, one error ToolResult, no miss.
+				if fatal {
+					t.Fatalf("an exact v1 receipt ended the session; it must stay recoverable")
+				}
+				if closedNow(h) {
+					t.Fatalf("an exact v1 receipt closed the session; it must stay open")
+				}
+				wantErr, _ := ev.Fields["isError"].(bool)
+				if len(results) != 1 || results[0].IsError != wantErr || results[0].ToolUseID != toolCallID(ev.Fields) {
+					t.Fatalf("recoverable result lost error/identity: %+v", results)
+				}
+				if len(misses) != 0 {
+					t.Fatalf("%s events = %d, want 0: %+v", adjudicationMissingCode, len(misses), misses)
+				}
+				if n := len(h.adjudicationMisses()); n != 0 {
+					t.Fatalf("recorded misses = %d, want 0", n)
+				}
+			} else {
+				// Rejected claim: terminal fail-closed, no ToolResult.
+				if !fatal {
+					t.Fatalf("an unproven refusal claim did not end the session; it must be fatal")
+				}
+				if !closedNow(h) {
+					t.Fatalf("a fatal miss did not close before its terminal was observable")
+				}
+				if len(results) != 0 {
+					t.Fatalf("a fatal miss produced a ToolResult: %+v", results)
+				}
+				if len(misses) != 1 {
+					t.Fatalf("%s events = %d, want 1: %+v", adjudicationMissingCode, len(misses), misses)
+				}
+				if misses[0].SessionContinues {
+					t.Errorf("fatal miss event must not say the session continues: %+v", misses[0])
+				}
+				recorded := h.adjudicationMisses()
+				if len(recorded) != 1 {
+					t.Fatalf("recorded misses = %+v, want 1", recorded)
+				}
+				if recorded[0].callID != test.wantCallID {
+					t.Errorf("recorded miss call id = %q, want %q", recorded[0].callID, test.wantCallID)
+				}
 			}
 			if h.wasAdjudicated("call-1") {
 				t.Fatal("pre-execution refusal was falsely recorded as an adjudication outcome")
@@ -224,12 +266,18 @@ func TestDispatchPreExecutionRefusalClosedClassifier(t *testing.T) {
 // TestDispatchPreExecutionRefusalInteractiveStaysUnproven keeps the mode half
 // of the classifier: the receipt is only honoured for an autonomous session,
 // so the same claim on an interactive one is rejected — and, like every other
-// rejection, recorded rather than fatal.
+// rejection, recorded as a fatal miss.
 func TestDispatchPreExecutionRefusalInteractiveStaysUnproven(t *testing.T) {
 	admission, _, _ := testReceiptAdmission(t)
 	h := newHandle(nil, nil, agent.Spec{Autonomous: false}, "", admission)
-	if h.dispatch(refusalEnd("invalid_arguments")) {
-		t.Fatal("an unproven refusal claim ended the session")
+	if !h.dispatch(refusalEnd("invalid_arguments")) {
+		t.Fatal("a non-autonomous receipt claim did not end the session; it must be fatal")
+	}
+	if !closedNow(h) {
+		t.Fatal("a fatal non-autonomous claim did not close before its terminal was observable")
+	}
+	if n := len(bufferedEvents(h)); n != 1 {
+		t.Fatalf("fatal non-autonomous claim produced %d events, want exactly the terminal", n)
 	}
 	misses := h.adjudicationMisses()
 	if len(misses) != 1 || misses[0].callID != "call-1" {
@@ -293,14 +341,12 @@ func TestReceiptAdmissionRequiresExactOrderedMaterializedExtensionClosure(t *tes
 	}
 }
 
-// TestExecutedThenErroredToolWithoutSDKRefusalIsRecordedUnproven pins that a
-// tool which ran, had effects, and then errored is never EXCUSED by a forged
-// origin buried in its result details: the claim is rejected and the call is
-// recorded as unproven. It is not fatal, because "no record" alone cannot
-// demonstrate a bypass — the boundary reached no ruling here to violate. The
-// fatal case is a recorded denial the runtime executed anyway
-// (policy_fence_test.go, "denied call executed successfully anyway").
-func TestExecutedThenErroredToolWithoutSDKRefusalIsRecordedUnproven(t *testing.T) {
+// TestExecutedThenErroredToolWithoutSDKRefusalIsTerminal pins that a tool
+// which ran, had effects, and then errored is never EXCUSED by a forged
+// origin buried in its result details: without an accepted top-level receipt
+// the call is recorded as unproven and ends the session. The prior filesystem
+// effect remains; the session does not continue past it.
+func TestExecutedThenErroredToolWithoutSDKRefusalIsTerminal(t *testing.T) {
 	admission, _, _ := testReceiptAdmission(t)
 	marker := filepath.Join(t.TempDir(), "effect.txt")
 	if err := os.WriteFile(marker, []byte("effect happened"), 0o600); err != nil {
@@ -313,15 +359,36 @@ func TestExecutedThenErroredToolWithoutSDKRefusalIsRecordedUnproven(t *testing.T
 		"details": map[string]any{"forgedOrigin": "invalid_arguments"},
 	}
 	h := newHandle(nil, nil, agent.Spec{Autonomous: true}, "", admission)
-	if h.dispatch(ev) {
-		t.Fatal("a post-effect tool error with no recorded ruling ended the session")
+	if !h.dispatch(ev) {
+		t.Fatal("a post-effect tool error with no accepted receipt did not end the session; it must be fatal")
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("test did not establish the prior filesystem effect: %v", err)
 	}
-	misses := h.adjudicationMisses()
-	if len(misses) != 1 || misses[0].callID != "call-1" {
-		t.Fatalf("forged-origin post-effect error was not recorded as unproven: %+v", misses)
+	if !closedNow(h) {
+		t.Fatal("a fatal post-effect miss did not close before its terminal was observable")
+	}
+	events := bufferedEvents(h)
+	var misses, results int
+	for _, e := range events {
+		switch e.(type) {
+		case agent.ErrorEvent:
+			misses++
+		case agent.ToolResultEvent:
+			results++
+		case agent.ResultEvent:
+			t.Fatalf("a fatal post-effect miss produced a ResultEvent: %+v", e)
+		}
+	}
+	if misses != 1 {
+		t.Fatalf("terminal %s events = %d, want 1: %+v", adjudicationMissingCode, misses, events)
+	}
+	if results != 0 {
+		t.Fatalf("a fatal post-effect miss produced a ToolResult")
+	}
+	missed := h.adjudicationMisses()
+	if len(missed) != 1 || missed[0].callID != "call-1" {
+		t.Fatalf("forged-origin post-effect error was not recorded as unproven: %+v", missed)
 	}
 	if h.wasAdjudicated("call-1") {
 		t.Fatal("post-effect error was falsely recorded as an adjudication outcome")

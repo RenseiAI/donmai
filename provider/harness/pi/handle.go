@@ -99,12 +99,11 @@ type startedCall struct {
 	args any
 }
 
-// adjudicationMissingCode is the non-fatal error code the monitor emits for a
+// adjudicationMissingCode is the fatal error code the monitor emits for a
 // guarded tool call that ended without a recorded outcome. Distinct from
-// policy_extension_failed on purpose: that code means the session must stop,
-// this one means one call could not be proven and the session continues —
-// which the event itself says structurally (agent.ErrorEvent.SessionContinues),
-// so no consumer makes it the session's failure.
+// policy_extension_failed on purpose: that code means a recorded denial was
+// not honoured, this one means no ruling, receipt, or runtime proof accounts
+// for the call — so the session must stop with no ToolResult following.
 const adjudicationMissingCode = "policy_adjudication_missing"
 
 // Pieces of the runtime's own argument-validation rejection text for a tool
@@ -186,7 +185,7 @@ type Handle struct {
 	// This registry is per-Handle and in memory only: a new Handle (Resume,
 	// or any re-adoption of a live pi session) starts empty, so calls ruled on
 	// by the previous handle read as unproven. That is bounded by design —
-	// unproven is recorded, never fatal — and doc.go states why no seeding
+	// unproven is recorded and fatal — and doc.go states why no seeding
 	// path exists.
 	adjMu         sync.Mutex
 	adjudications map[string]adjudicationOutcome
@@ -519,7 +518,7 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	// BEFORE the tool_call hook our adjudication rides (verified against the
 	// pinned binary — see doc.go).
 	//
-	// The split is three-way, and only the first case ends the session:
+	// The split is three-way, and the first and third end the session:
 	//
 	//  1. A trusted DENY for this call id, yet the call ended as a SUCCESSFUL
 	//     execution — the refusal was not honoured and the tool ran anyway.
@@ -535,13 +534,14 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	//     refusal, never as a miss.
 	//  3. NO recorded outcome. This cannot distinguish a real bypass from a
 	//     ruling that was lost in transit, an extension-side refusal that
-	//     never reached us, or a call id we could not correlate — so it is
-	//     recorded and surfaced as a NON-fatal error that says the session
-	//     continues (SessionContinues), and the session continues. There is
-	//     no refusal left to deliver at this point: the end event is emitted
-	//     after pi has already finalized the call's result, and the only
-	//     pre-execution hook (tool_call) has long returned. Record only is
-	//     all that is available here.
+	//     never reached us, or a call id we could not correlate — so the call
+	//     is recorded as unproven and surfaced as a FATAL error that ends the
+	//     session with no SessionContinues and no ToolResult following. The
+	//     end event cannot be honoured as a result: without a recorded ruling,
+	//     an exact revalidated receipt, or runtime proof, the call is unproven
+	//     and the session ends here. The close runs before the emit so no
+	//     later Inject can race the terminal, and dispatch returns before
+	//     mapEvent so no recoverable ToolResult can follow it.
 	if ev.Type == "tool_execution_end" {
 		tool := stringField(ev.Fields, "toolName", "tool", "name")
 		callID := toolCallID(ev.Fields)
@@ -583,12 +583,17 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 				// error result (mapped below) and continues from it.
 			default:
 				h.recordMiss(tool, callID)
+				// Fatal miss: close before emit so a racing Inject observes the
+				// closed session, then emit the terminal without
+				// SessionContinues and return before mapEvent so no
+				// recoverable ToolResult can follow the error.
+				h.signalClosed()
 				h.emit(agent.ErrorEvent{
-					Message:          fmt.Sprintf("policy adjudication missing: tool %q (call %q) ended without a recorded policy ruling — the call is unproven and the session continues", tool, callID),
-					Code:             adjudicationMissingCode,
-					SessionContinues: true,
-					Raw:              raw(ev),
+					Message: fmt.Sprintf("policy adjudication missing: tool %q (call %q) ended without a recorded policy ruling — the call is unproven and the session ends here", tool, callID),
+					Code:    adjudicationMissingCode,
+					Raw:     raw(ev),
 				})
+				return true // fatal: unproven guarded call, abort now.
 			}
 		}
 	}
