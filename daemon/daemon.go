@@ -194,6 +194,19 @@ type Options struct {
 	// PATH for its own daemon.
 	QuotaProbeBinaries map[string]string
 
+	// EnableSubscriptionWindowExhaustionRefusal arms the subscription-window
+	// exhaustion claim admission: the host-wide pre-claim gate consulted by
+	// claimSuspended and the per-item typed refusal in handlePollWorkItem.
+	// Off by default (the zero value): with the flag off the host behaves
+	// exactly as before the refusal existed — the quota snapshot never
+	// suspends claiming and an exhausted host-session item is admitted, so
+	// every existing deployment is byte-identical until its coordinator can
+	// consume the typed subscriptionWindowExhausted NACK member (older
+	// coordinators count claim-then-NACK round trips toward terminalization).
+	// Enable it only once the coordinator exempts the typed exhaustion NACK
+	// from that accounting and requeues at the carried reset instant.
+	EnableSubscriptionWindowExhaustionRefusal bool
+
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
 	// polls, verifies (Ed25519 + content hash), and caches to disk,

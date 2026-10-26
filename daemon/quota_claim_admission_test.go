@@ -51,6 +51,25 @@ func seedQuotaWindowsAt(d *Daemon, windows []agent.UsageWindow, checkedAt, probe
 	d.quota.noteCodexProbe("opaque-codex", "promax", agent.MakeUsageLimits(agent.ISOTime(checkedAt), windows), probeAt)
 }
 
+func seedClaudeWindowsAt(d *Daemon, windows []agent.UsageWindow, checkedAt, probeAt time.Time) {
+	d.quota.noteClaudeProbe("opaque-claude", agent.MakeUsageLimits(agent.ISOTime(checkedAt), windows), probeAt)
+}
+
+func seedClaudeUnsupported(d *Daemon, at time.Time) {
+	d.quota.noteClaudeProbe("opaque-claude",
+		agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableUnsupported, "usage read unsupported"), at)
+}
+
+// quotaNamesRegistry is a minimal ProviderRegistry stub declaring exactly the
+// provider names given, so quota-gate tests can state which harnesses (and,
+// by presence, key-carried auth) a host serves.
+type quotaNamesRegistry struct{ names []string }
+
+func (r quotaNamesRegistry) Names() []string { return append([]string(nil), r.names...) }
+func (r quotaNamesRegistry) Capabilities(string) (map[string]any, bool) {
+	return map[string]any{}, true
+}
+
 // quotaClaimPollBodyFor renders a poll envelope for one harness/auth-mode
 // pair plus the sibling claimAttempts member the poll decoder binds.
 func quotaClaimPollBodyFor(sessionID, harness, authMode, token string) string {
@@ -62,7 +81,12 @@ func quotaClaimPollBodyFor(sessionID, harness, authMode, token string) string {
 
 func quotaClaimDaemon(t *testing.T, spawns *int) *Daemon {
 	t.Helper()
-	return newRunningTestDaemon(t, Options{}, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}},
+	return quotaClaimDaemonWithOptions(t, Options{EnableSubscriptionWindowExhaustionRefusal: true}, spawns)
+}
+
+func quotaClaimDaemonWithOptions(t *testing.T, opts Options, spawns *int) *Daemon {
+	t.Helper()
+	return newRunningTestDaemon(t, opts, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}},
 		func(SessionSpec, []string) ([]string, error) { *spawns++; return nil, nil })
 }
 
@@ -407,6 +431,7 @@ func TestQuotaClaimAdmission_MixedHarnessKeepsPolling(t *testing.T) {
 		var spawns, landings int
 		var kgs atomic.Int32
 		d := newRunningTestDaemon(t, Options{
+			EnableSubscriptionWindowExhaustionRefusal: true,
 			OnLandingWork: func(context.Context, PollWorkItem) error { landings++; return nil },
 		}, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}},
 			func(SessionSpec, []string) ([]string, error) { spawns++; return nil, nil })
@@ -475,6 +500,331 @@ func TestQuotaClaimAdmission_MixedHarnessKeepsPolling(t *testing.T) {
 		}
 		if spawns != 0 {
 			t.Fatalf("spawns = %d, want 0", spawns)
+		}
+	})
+}
+
+// The exhaustion behaviour is behind a default-off flag: with the flag off
+// the host behaves exactly as before the refusal existed. The gate stays
+// open and an exhausted host-session item is admitted and spawned with no
+// NACK and no typed member — even with a fresh blocking snapshot, and even
+// with a fresh missing reset that fails closed when the flag is on.
+func TestQuotaClaimAdmission_FlagOffAdmitsExhaustedSnapshot(t *testing.T) {
+	cases := []struct {
+		name    string
+		windows []agent.UsageWindow
+	}{
+		{"exhausted future reset admits", []agent.UsageWindow{quotaClaimWindow("seven_day", 100, "2031-02-03T04:05:06Z")}},
+		{"missing reset admits", []agent.UsageWindow{quotaClaimWindow("five_hour", 100, "")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newClaimAttemptHTTPFixture(t, quotaClaimPollBody("flag-off-1", claimAttemptTokenOne))
+			var spawns int
+			// Default options: the flag is off.
+			d := quotaClaimDaemonWithOptions(t, Options{}, &spawns)
+			seedQuotaWindows(d, tc.windows)
+			if blocked, reason := d.PollClaimGate()(); blocked {
+				t.Fatalf("claim gate blocked with flag off (reason %q), want open", reason)
+			}
+			poller := NewPollService(PollOptions{
+				WorkerID: "worker-quota", RuntimeJWT: "runtime-quota",
+				OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+				OnWork: func(item PollWorkItem) error {
+					return d.handlePollWorkItem(item, fixture.server.URL)
+				},
+				ClaimSuspended: d.PollClaimGate(),
+			})
+			poller.pollOnce(context.Background())
+			if n := fixture.pollIndex; n != 1 {
+				t.Fatalf("poll requests = %d, want 1 (flag off never suspends)", n)
+			}
+			if spawns != 1 {
+				t.Fatalf("spawns = %d, want 1 (flag off admits)", spawns)
+			}
+			if nacks := fixture.nackBodies(); len(nacks) != 0 {
+				t.Fatalf("NACK count = %d, want 0 (flag off never refuses)", len(nacks))
+			}
+		})
+	}
+}
+
+// Served lanes keep the poll open: the host-wide gate suspends only when
+// every lane this host serves is freshly exhausted. A served harness without
+// a fresh blocking snapshot — none, stale, or an unsupported read that
+// clears the account — is available, as is a harness with no probe at all
+// and a key-carried auth mode the snapshot never binds. Each row drives a
+// production pollOnce through PollClaimGate and asserts the poll goes out
+// and the item spawns with no NACK.
+func TestQuotaClaimAdmission_ServedLanesKeepPolling(t *testing.T) {
+	exhaustedCodex := []agent.UsageWindow{quotaClaimWindow("seven_day", 100, "2031-02-03T04:05:06Z")}
+
+	serve := func(t *testing.T, registry []string, seed func(*Daemon), body string) (*Daemon, *claimAttemptHTTPFixture, *int) {
+		t.Helper()
+		fixture := newClaimAttemptHTTPFixture(t, body)
+		var spawns int
+		opts := Options{EnableSubscriptionWindowExhaustionRefusal: true}
+		if registry != nil {
+			opts.ProviderRegistry = quotaNamesRegistry{names: registry}
+		}
+		d := quotaClaimDaemonWithOptions(t, opts, &spawns)
+		seed(d)
+		if blocked, reason := d.PollClaimGate()(); blocked {
+			t.Fatalf("claim gate blocked (reason %q), want open with an available served lane", reason)
+		}
+		poller := NewPollService(PollOptions{
+			WorkerID: "worker-quota", RuntimeJWT: "runtime-quota",
+			OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+			OnWork: func(item PollWorkItem) error {
+				return d.handlePollWorkItem(item, fixture.server.URL)
+			},
+			ClaimSuspended: d.PollClaimGate(),
+		})
+		poller.pollOnce(context.Background())
+		return d, fixture, &spawns
+	}
+	checkPolledAndSpawned := func(t *testing.T, d *Daemon, fixture *claimAttemptHTTPFixture, spawns *int) {
+		t.Helper()
+		if n := fixture.pollIndex; n != 1 {
+			t.Fatalf("poll requests = %d, want 1 (available lane keeps polling)", n)
+		}
+		// No ActiveCount assertion here: the stub spawn completes
+		// asynchronously, so the child may still be registered when the
+		// tick returns. spawns == 1 plus zero NACKs is the admission
+		// signal; the zero-spawn rows below assert ActiveCount == 0.
+		if *spawns != 1 {
+			t.Fatalf("spawns = %d, want 1 (available lane admits)", *spawns)
+		}
+		if nacks := fixture.nackBodies(); len(nacks) != 0 {
+			t.Fatalf("NACK count = %d, want 0 (available lane admits)", len(nacks))
+		}
+	}
+
+	t.Run("no claude snapshot keeps polling claude item", func(t *testing.T) {
+		d, fixture, spawns := serve(t, []string{"codex", "claude"},
+			func(d *Daemon) { seedQuotaWindows(d, exhaustedCodex) },
+			quotaClaimPollBodyFor("claude-1", "claude", string(agent.AuthHostSession), claimAttemptTokenOne))
+		checkPolledAndSpawned(t, d, fixture, spawns)
+	})
+
+	t.Run("stale claude snapshot keeps polling claude item", func(t *testing.T) {
+		d, fixture, spawns := serve(t, []string{"codex", "claude"},
+			func(d *Daemon) {
+				seedQuotaWindows(d, exhaustedCodex)
+				stale := time.Now().Add(-time.Hour)
+				seedClaudeWindowsAt(d, exhaustedCodex, stale, stale)
+			},
+			quotaClaimPollBodyFor("claude-2", "claude", string(agent.AuthHostSession), claimAttemptTokenOne))
+		checkPolledAndSpawned(t, d, fixture, spawns)
+	})
+
+	t.Run("unsupported claude probe keeps polling claude item", func(t *testing.T) {
+		d, fixture, spawns := serve(t, []string{"codex", "claude"},
+			func(d *Daemon) {
+				seedQuotaWindows(d, exhaustedCodex)
+				seedClaudeUnsupported(d, time.Now())
+			},
+			quotaClaimPollBodyFor("claude-3", "claude", string(agent.AuthHostSession), claimAttemptTokenOne))
+		checkPolledAndSpawned(t, d, fixture, spawns)
+	})
+
+	t.Run("pi item on codex-snapshot host keeps polling", func(t *testing.T) {
+		d, fixture, spawns := serve(t, []string{"codex", "pi"},
+			func(d *Daemon) { seedQuotaWindows(d, exhaustedCodex) },
+			quotaClaimPollBodyFor("pi-1", "pi", string(agent.AuthHostSession), claimAttemptTokenOne))
+		checkPolledAndSpawned(t, d, fixture, spawns)
+	})
+
+	t.Run("codex BYOK on codex-snapshot host keeps polling", func(t *testing.T) {
+		d, fixture, spawns := serve(t, []string{"codex"},
+			func(d *Daemon) { seedQuotaWindows(d, exhaustedCodex) },
+			quotaClaimPollBodyFor("byok-1", "codex", string(agent.AuthBYOK), claimAttemptTokenOne))
+		checkPolledAndSpawned(t, d, fixture, spawns)
+	})
+
+	t.Run("fully exhausted registry host still refuses per item with typed NACK", func(t *testing.T) {
+		// Every host-session lane is freshly exhausted, but the host serves
+		// key-carried lanes the snapshot never binds, so the gate stays
+		// open and the per-item fallback refuses the exhausted item with
+		// the typed contract before reserve or spawn.
+		body := quotaClaimPollBodyFor("codex-9", "codex", string(agent.AuthHostSession), claimAttemptTokenOne)
+		fixture := newClaimAttemptHTTPFixture(t, body)
+		var spawns int
+		opts := Options{EnableSubscriptionWindowExhaustionRefusal: true, ProviderRegistry: quotaNamesRegistry{names: []string{"codex", "claude"}}}
+		d := quotaClaimDaemonWithOptions(t, opts, &spawns)
+		seedQuotaWindows(d, exhaustedCodex)
+		seedClaudeWindows(d, exhaustedCodex)
+		if blocked, reason := d.PollClaimGate()(); blocked {
+			t.Fatalf("claim gate blocked (reason %q), want open: key-carried lanes never exhaust", reason)
+		}
+		var onWorkErr error
+		NewPollService(PollOptions{
+			WorkerID: "worker-quota", RuntimeJWT: "runtime-quota",
+			OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+			OnWork: func(item PollWorkItem) error {
+				onWorkErr = d.handlePollWorkItem(item, fixture.server.URL)
+				return onWorkErr
+			},
+			ClaimSuspended: d.PollClaimGate(),
+		}).pollOnce(context.Background())
+		if n := fixture.pollIndex; n != 1 {
+			t.Fatalf("poll requests = %d, want 1 (gate stays open for key-carried lanes)", n)
+		}
+		var exhausted *subscriptionWindowExhaustedError
+		if !errors.As(onWorkErr, &exhausted) || !exhausted.usable {
+			t.Fatalf("handlePollWorkItem error = %v, want usable quota-exhaustion refusal", onWorkErr)
+		}
+		if spawns != 0 || d.spawner.ActiveCount() != 0 {
+			t.Fatalf("spawns = %d active = %d, want no spawn or reservation", spawns, d.spawner.ActiveCount())
+		}
+		nacks := fixture.nackBodies()
+		if len(nacks) != 1 {
+			t.Fatalf("NACK count = %d, want exactly 1 (per-item fallback releases the claim)", len(nacks))
+		}
+		var report map[string]any
+		if err := json.Unmarshal(nacks[0]["subscriptionWindowExhausted"], &report); err != nil {
+			t.Fatalf("typed member missing or invalid: %s", mustJSON(nacks[0]))
+		}
+		if !mapsEqual(report, map[string]any{
+			"contractVersion": subscriptionWindowExhaustedContractVersion,
+			"code":            subscriptionWindowExhaustedCode, "resetAt": "2031-02-03T04:05:06Z",
+		}) {
+			t.Fatalf("typed member = %#v, want version/code/exact reset", report)
+		}
+		if proof := decodeClaimAttemptBody(t, nacks[0]["claimAttempt"]); proof["sessionId"] != "codex-9" ||
+			proof["attemptToken"] != claimAttemptTokenOne {
+			t.Fatalf("claimAttempt = %#v, want exact session/attempt binding", proof)
+		}
+	})
+}
+
+// The host-wide gate measured against explicit served lanes: suspend only
+// when every served lane is freshly exhausted. Unprobed harnesses and
+// key-carried auth never block; stale snapshots and past resets admit; a
+// fresh missing reset fails closed; with nothing freshly blocked the poll
+// stays open.
+func TestQuotaExhaustionSuspendsClaiming_ServedLanes(t *testing.T) {
+	now := time.Now()
+	fresh := agent.ISOTime(now)
+	stale := agent.ISOTime(now.Add(-time.Hour))
+	future := "2031-02-03T04:05:06Z"
+	past := "2001-01-02T03:04:05Z"
+	account := func(provider, checkedAt string, windows ...agent.UsageWindow) agent.UsageAccount {
+		return agent.UsageAccount{ID: "opaque-" + provider, Provider: provider, Limits: agent.MakeUsageLimits(checkedAt, windows)}
+	}
+	blocked := func(provider, checkedAt, resetsAt string) agent.UsageAccount {
+		return account(provider, checkedAt, quotaClaimWindow("seven_day", 100, resetsAt))
+	}
+	hsOnly := func(harnesses ...string) quotaServedClaimLanes {
+		return quotaServedClaimLanes{harnesses: harnesses}
+	}
+	cases := []struct {
+		name     string
+		accounts []agent.UsageAccount
+		served   quotaServedClaimLanes
+		suspend  bool
+		reason   string // substring the reason must carry when suspending
+	}{
+		{"single served harness exhausted suspends",
+			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("codex"), true, future},
+		{"unserved harness exhaustion is ignored",
+			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("claude"), false, ""},
+		{"served harness without snapshot is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("codex", "claude"), false, ""},
+		{"stale served snapshot is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", stale, future)}, hsOnly("codex", "claude"), false, ""},
+		{"past reset is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", fresh, past)}, hsOnly("codex", "claude"), false, ""},
+		{"every served harness exhausted suspends with the latest reset",
+			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", fresh, "2031-07-08T09:10:11Z")},
+			hsOnly("codex", "claude"), true, "2031-07-08T09:10:11Z"},
+		{"unprobed served harness without snapshot is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("codex", "pi"), false, ""},
+		{"key-carried auth lane is always available",
+			[]agent.UsageAccount{blocked("codex", fresh, future)},
+			quotaServedClaimLanes{harnesses: []string{"codex"}, otherAuthModes: true}, false, ""},
+		{"fresh missing reset fails closed",
+			[]agent.UsageAccount{account("codex", fresh, quotaClaimWindow("five_hour", 100, ""))}, hsOnly("codex"), true, "awaiting fresh quota probe"},
+		{"usage below full admits",
+			[]agent.UsageAccount{account("codex", fresh, quotaClaimWindow("five_hour", 99.9, future))}, hsOnly("codex"), false, ""},
+		{"no fresh snapshot never suspends",
+			[]agent.UsageAccount{blocked("codex", stale, future)}, hsOnly("codex"), false, ""},
+		{"no snapshot never suspends",
+			nil, hsOnly("codex"), false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			suspended, reason := quotaExhaustionSuspendsClaiming(tc.accounts, tc.served, now)
+			if suspended != tc.suspend {
+				t.Fatalf("suspended = %v reason = %q, want %v", suspended, reason, tc.suspend)
+			}
+			if tc.suspend && (reason == "" || !strings.Contains(reason, tc.reason)) {
+				t.Fatalf("reason = %q, want it to carry %q", reason, tc.reason)
+			}
+			if !tc.suspend && reason != "" {
+				t.Fatalf("reason = %q, want empty when open", reason)
+			}
+		})
+	}
+}
+
+// The served-lane derivation: the registry states which harnesses the host
+// can run, a configured probe declares its harness served, and snapshot
+// providers speak for a host with no runtime view. Test-only and
+// interactive-only providers never constrain claiming.
+func TestQuotaServedClaimLanesForSnapshot(t *testing.T) {
+	now := time.Now()
+	accounts := []agent.UsageAccount{{
+		ID: "opaque-codex", Provider: "codex",
+		Limits: agent.MakeUsageLimits(agent.ISOTime(now), []agent.UsageWindow{quotaClaimWindow("seven_day", 42, "2031-02-03T04:05:06Z")}),
+	}}
+
+	t.Run("registry declares harnesses and key-carried auth", func(t *testing.T) {
+		served := quotaServedClaimLanesForSnapshot(accounts,
+			map[string]string{"claude": "/bin/false"},
+			quotaNamesRegistry{names: []string{"codex", "pi", "stub", "shell"}})
+		for _, want := range []string{"codex", "claude", "pi"} {
+			found := false
+			for _, got := range served.harnesses {
+				found = found || got == want
+			}
+			if !found {
+				t.Fatalf("served harnesses = %v, want %q", served.harnesses, want)
+			}
+		}
+		for _, got := range served.harnesses {
+			if got == "stub" || got == "shell" {
+				t.Fatalf("served harnesses = %v, want no test-only or interactive-only lanes", served.harnesses)
+			}
+		}
+		if !served.otherAuthModes {
+			t.Fatal("otherAuthModes = false with a registered runtime, want true")
+		}
+	})
+
+	t.Run("no runtime view falls back to snapshots and probes", func(t *testing.T) {
+		served := quotaServedClaimLanesForSnapshot(accounts, map[string]string{"claude": "/bin/false"}, nil)
+		if served.otherAuthModes {
+			t.Fatal("otherAuthModes = true with no registry, want false")
+		}
+		for _, want := range []string{"codex", "claude"} {
+			found := false
+			for _, got := range served.harnesses {
+				found = found || got == want
+			}
+			if !found {
+				t.Fatalf("served harnesses = %v, want %q", served.harnesses, want)
+			}
+		}
+	})
+
+	t.Run("empty host serves nothing and suspends nothing", func(t *testing.T) {
+		served := quotaServedClaimLanesForSnapshot(nil, nil, nil)
+		if len(served.harnesses) != 0 || served.otherAuthModes {
+			t.Fatalf("served = %+v, want empty", served)
+		}
+		if suspended, _ := quotaExhaustionSuspendsClaiming(nil, served, now); suspended {
+			t.Fatal("suspended with no snapshot, want open")
 		}
 	})
 }

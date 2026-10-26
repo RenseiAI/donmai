@@ -242,9 +242,11 @@ func (e *subscriptionWindowExhaustedError) Error() string {
 
 // quotaClaimAdmission decides whether a poll-claimed session may proceed
 // past claim admission given this host's cached quota snapshot. It runs over
-// the locked snapshot copy; a nil daemon admits.
+// the locked snapshot copy; a nil daemon admits. The refusal is armed by
+// EnableSubscriptionWindowExhaustionRefusal: with the flag off (the default)
+// every item is admitted, exactly as before the refusal existed.
 func (d *Daemon) quotaClaimAdmission(spec SessionSpec) error {
-	if d == nil {
+	if d == nil || !d.opts.EnableSubscriptionWindowExhaustionRefusal {
 		return nil
 	}
 	return decideQuotaClaimAdmission(d.QuotaSnapshot(), spec.AuthMode, spec.Harness, time.Now())
@@ -332,67 +334,145 @@ func decideQuotaClaimAdmission(accounts []agent.UsageAccount, authMode, harness 
 	return &subscriptionWindowExhaustedError{resetAt: latest.UTC().Format(time.RFC3339), usable: true}
 }
 
+// quotaServedClaimLanes is the set of claim lanes the subscription-window
+// exhaustion gate measures a snapshot against. Suspending the whole poll
+// request stops every lane on the response — the session lane, the other
+// auth modes, and the non-session lanes riding it (kg extraction, landing
+// triggers, inbox) — so the gate may only suspend when every lane this host
+// could serve is freshly exhausted. Any served lane the snapshot does not
+// freshly block counts as available and keeps the poll open; the exhausted
+// harness is then refused per item after the poll.
+type quotaServedClaimLanes struct {
+	// harnesses are the host-session lanes this host can serve, by harness
+	// name. A served harness with no fresh blocking snapshot — none, stale,
+	// unsupported, or a harness with no probe at all — is available.
+	harnesses []string
+	// otherAuthModes reports whether the host can serve key-carried
+	// (non-host-session) sessions. Their credentials ride the session rather
+	// than the host login, so subscription windows never bind them and the
+	// lane is always available.
+	otherAuthModes bool
+}
+
+// quotaClaimHarnessForProvider maps a registered runtime provider name onto
+// the host-session harness lane it can serve. The quota-tracked harnesses
+// and the real harness providers without a quota probe alike map onto
+// themselves; ok is false for names that can never serve a poll-claimed
+// session (stub is test-only, shell is interactive-only PTY whose headless
+// spawn fails loudly by design), so neither constrains claiming.
+func quotaClaimHarnessForProvider(name string) (string, bool) {
+	switch name {
+	case "", "stub", "shell":
+		return "", false
+	default:
+		return name, true
+	}
+}
+
+// quotaServedClaimLanesForSnapshot derives the served lanes from what the
+// host declares plus what its snapshot shows. The registered runtime
+// registry states which harnesses this host can run; a configured quota
+// probe declares its harness served even before its first reading lands;
+// snapshot providers speak for a host with no runtime view at all (nil
+// registry), where failing closed on the snapshots is the only safe
+// posture. A host with a registered runtime can additionally serve
+// key-carried sessions, so its other-auth-mode lane is always available;
+// a host with no runtime view declares nothing beyond its snapshots, and
+// an embedder that serves key-carried work without a registry wires a
+// trivial ProviderRegistry (two methods) to say so.
+func quotaServedClaimLanesForSnapshot(accounts []agent.UsageAccount, probes map[string]string, registry ProviderRegistry) quotaServedClaimLanes {
+	set := map[string]struct{}{}
+	add := func(harness string) {
+		if harness == "" {
+			return
+		}
+		set[harness] = struct{}{}
+	}
+	for i := range accounts {
+		add(accounts[i].Provider)
+	}
+	for harness := range probes {
+		add(harness)
+	}
+	if registry != nil {
+		for _, name := range registry.Names() {
+			if harness, ok := quotaClaimHarnessForProvider(name); ok {
+				add(harness)
+			}
+		}
+	}
+	served := quotaServedClaimLanes{otherAuthModes: registry != nil}
+	for harness := range set {
+		served.harnesses = append(served.harnesses, harness)
+	}
+	return served
+}
+
 // quotaExhaustionSuspendsClaiming is the host-wide, pre-claim counterpart of
 // the per-item admission decision. A subscription window binds one harness's
-// host-session lane only: other harnesses, other auth modes for the same
-// harness, and the non-session lanes riding the same poll response (kg
-// extraction, landing triggers, inbox) are unaffected by it. Suspending the
-// whole tick for one harness would starve them all, so the gate suspends
-// ONLY when every fresh host-session harness snapshot this host holds is
-// still blocking (UsedPercent >= 100 with a future reset, or a fresh
-// missing/malformed reset that fails closed). Otherwise the poll request
-// still goes out and the per-item admission refuses only the exhausted
-// harness's host-session items. Stale snapshots and past resets admit as
-// available, so the gate reopens on reset or probe refresh without a
-// restart. It never parses prose and never infers exhaustion from endpoint
-// errors or 429s.
-func quotaExhaustionSuspendsClaiming(accounts []agent.UsageAccount, now time.Time) (bool, string) {
-	latest := time.Time{}
+// host-session lane only. The gate suspends ONLY when every served lane is
+// freshly still-blocking (UsedPercent >= 100 with a future reset, or a
+// fresh missing/malformed reset that fails closed); otherwise the poll
+// request still goes out and the per-item admission refuses only the
+// exhausted harness's host-session items. Stale snapshots and past resets
+// admit as available, so the gate reopens on reset or probe refresh without
+// a restart. It never parses prose and never infers exhaustion from endpoint
+// errors or 429s. On a fully-blocked host the stopped poll also pauses the
+// non-session lanes riding the same response until the window resets.
+func quotaExhaustionSuspendsClaiming(accounts []agent.UsageAccount, served quotaServedClaimLanes, now time.Time) (bool, string) {
+	fresh := map[string]bool{}
+	blocked := map[string]bool{}
+	latest := map[string]time.Time{}
 	sawUnusable := false
-	freshCount := 0
-	blockedCount := 0
 	for i := range accounts {
-		if !quotaSnapshotFresh(accounts[i].Limits.CheckedAt, now) {
+		harness := accounts[i].Provider
+		if harness == "" || !quotaSnapshotFresh(accounts[i].Limits.CheckedAt, now) {
 			continue
 		}
-		freshCount++
-		accountBlocked := false
-		accountLatest := time.Time{}
+		fresh[harness] = true
 		for _, window := range accounts[i].Limits.Windows {
 			if window.UsedPercent < 100 {
 				continue
 			}
 			reset, ok := parseQuotaInstant(window.ResetsAt)
 			if !ok {
-				accountBlocked = true
+				blocked[harness] = true
 				sawUnusable = true
 				continue
 			}
 			if !reset.After(now) {
 				continue
 			}
-			accountBlocked = true
-			if reset.After(accountLatest) {
-				accountLatest = reset
+			blocked[harness] = true
+			if reset.After(latest[harness]) {
+				latest[harness] = reset
 			}
 		}
-		if !accountBlocked {
-			// One fresh harness still admits: keep polling so its
-			// host-session items, other auth modes, and the non-session
-			// lanes on the same response keep flowing. The exhausted
-			// harness is refused per item after the poll.
+	}
+	// One available served lane keeps the poll open: a harness without a
+	// fresh blocking snapshot can still claim — its items, the other auth
+	// modes, and the non-session lanes on the same response keep flowing,
+	// while the exhausted harness is refused per item after the poll.
+	for _, harness := range served.harnesses {
+		if !fresh[harness] || !blocked[harness] {
 			return false, ""
 		}
-		blockedCount++
-		if accountLatest.After(latest) {
-			latest = accountLatest
-		}
 	}
-	if freshCount == 0 || blockedCount != freshCount {
+	if served.otherAuthModes {
+		// Key-carried sessions never consume a subscription window.
 		return false, ""
 	}
-	if !latest.IsZero() {
-		return true, "subscription window exhausted until " + latest.UTC().Format(time.RFC3339)
+	overallLatest := time.Time{}
+	if len(blocked) == 0 {
+		return false, ""
+	}
+	for harness := range blocked {
+		if latest[harness].After(overallLatest) {
+			overallLatest = latest[harness]
+		}
+	}
+	if !overallLatest.IsZero() {
+		return true, "subscription window exhausted until " + overallLatest.UTC().Format(time.RFC3339)
 	}
 	if sawUnusable {
 		return true, "subscription window exhausted (awaiting fresh quota probe)"
@@ -402,12 +482,16 @@ func quotaExhaustionSuspendsClaiming(accounts []agent.UsageAccount, now time.Tim
 
 // quotaSuspendsClaiming reports whether this host's cached quota snapshot
 // must stop the poll loop from claiming new work. Nil-safe: no snapshot
-// never suspends.
+// never suspends. Armed by EnableSubscriptionWindowExhaustionRefusal: with
+// the flag off (the default) claiming is never suspended, exactly as before
+// the refusal existed.
 func (d *Daemon) quotaSuspendsClaiming(now time.Time) (bool, string) {
-	if d == nil {
+	if d == nil || !d.opts.EnableSubscriptionWindowExhaustionRefusal {
 		return false, ""
 	}
-	return quotaExhaustionSuspendsClaiming(d.QuotaSnapshot(), now)
+	accounts := d.QuotaSnapshot()
+	served := quotaServedClaimLanesForSnapshot(accounts, d.opts.QuotaProbeBinaries, d.opts.ProviderRegistry)
+	return quotaExhaustionSuspendsClaiming(accounts, served, now)
 }
 
 // museProbeDue reports whether the muse login check may fire now.
