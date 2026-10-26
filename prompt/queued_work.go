@@ -520,6 +520,29 @@ type InterviewBudget struct {
 	IdleGraceSeconds int `json:"idleGraceSeconds,omitempty"`
 }
 
+// UnlimitedStageDurationSeconds is the sole explicit unlimited value for
+// StageBudget.MaxDurationSeconds on the wire. A stage budget carrying exactly
+// this value lifts the stage-duration cap without weakening any other
+// enforcement (token, sub-agent, cost, idle,
+// cancellation, operator-stop, or parent-context controls stay armed); the
+// dispatched worker still bounds the outer session timer at
+// runner.MaxSessionDurationCeiling, and only interactive sessions run without
+// an outer timer.
+//
+// The wire contract the runner owns is closed:
+//   - absent or 0 selects the existing outer default
+//     (runner.DefaultMaxSessionDuration);
+//   - a positive value selects that bounded finite cap (clamped to
+//     runner.MaxSessionDurationCeiling);
+//   - exactly -1 selects no stage-duration cap; the dispatched worker still
+//     bounds the outer session timer at runner.MaxSessionDurationCeiling
+//     (only interactive sessions run without an outer timer);
+//   - values below -1 are invalid and refused before spawn.
+//
+// An old runner reads -1 as absent and imposes its default, so the
+// consumer must be released before any producer emits this value.
+const UnlimitedStageDurationSeconds = -1
+
 // StageBudget mirrors the platform's StageBudget type from
 // src/lib/workflow/stages/index.ts. The runner enforces these caps via
 // runner.BudgetEnforcer; see runner/budget.go for the cap-breach
@@ -530,7 +553,13 @@ type InterviewBudget struct {
 // means "no sub-agents allowed".
 type StageBudget struct {
 	// MaxDurationSeconds is the wall-clock cap on the stage instance.
-	// 0 = no cap.
+	// 0 (or absent) keeps the existing outer default; a positive value
+	// selects that bounded finite cap; exactly
+	// UnlimitedStageDurationSeconds (-1) is the sole explicit unlimited
+	// value and lifts the stage-duration cap without lifting the dispatched
+	// outer ceiling (only interactive sessions run without an outer timer).
+	// Values below -1 are
+	// invalid: the runner refuses them before spawn.
 	MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
 
 	// MaxSubAgents is the cap on sub-agent tool invocations the agent

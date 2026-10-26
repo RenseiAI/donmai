@@ -10,8 +10,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -511,4 +514,306 @@ func mustGenerateTestKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 		t.Fatalf("generate ed25519 key: %v", err)
 	}
 	return pub, priv
+}
+
+// drainSnapshotBackgroundIO blocks until the background snapshot refresh a
+// test kicked has finished all of its filesystem writes, so t.TempDir
+// cleanup cannot race a mid-persist temp file (persist writes a temp file
+// beside the state path, then renames it into place). It waits for the
+// in-flight fetch to complete — hits stops increasing — plus a short
+// quiescence window, with no temp file present at the end. No new fetch can
+// start afterwards: these tests never start the poll ticker (so there is no
+// poll interval to observe) and issue no further claims once released.
+func drainSnapshotBackgroundIO(t *testing.T, stateDir string, hits *atomic.Int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var last int64 = -1
+	lastChange := time.Now()
+	for {
+		now := time.Now()
+		if now.After(deadline) {
+			t.Fatalf("background snapshot refresh did not settle within 10s (hits=%d)", hits.Load())
+		}
+		if got := hits.Load(); got != last {
+			last = got
+			lastChange = now
+		}
+		if last > 0 && now.Sub(lastChange) >= 200*time.Millisecond && !snapshotTmpPresent(stateDir) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// snapshotTmpPresent reports whether a persist temp file
+// (.ruleset-snapshot-*.tmp) currently exists in dir.
+func snapshotTmpPresent(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".ruleset-snapshot-") && strings.HasSuffix(name, ".tmp") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFailStatic_ExpiredRefusalKicksBackgroundRefreshWithoutBlocking proves
+// a production claim against an expired snapshot refuses with the typed
+// expiry before a deliberately blocked fetch completes, while still starting
+// that background fetch.
+func TestFailStatic_ExpiredRefusalKicksBackgroundRefreshWithoutBlocking(t *testing.T) {
+	t.Parallel()
+	pub, priv := mustGenerateTestKey(t)
+	var hits atomic.Int64
+	var block atomic.Bool
+	release := make(chan struct{})
+	compiledOld := time.Now().Add(-time.Hour).UTC()
+	oldBody := buildSnapshotResponse(t, priv, snapshotFixture{
+		poolID: "pool-expire-noblock", poolStatus: "active", grantedByProfile: true,
+		hostID: "worker-local", hostStatus: "ready", harnessID: "codex",
+		compiledAt: compiledOld, revision: 1,
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		if block.Load() {
+			<-release
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(oldBody)
+	}))
+	t.Cleanup(srv.Close)
+
+	stateDir := t.TempDir()
+	client, err := rulesetsnapshot.NewClient(rulesetsnapshot.Config{
+		Endpoint: srv.URL, TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
+		StatePath:     filepath.Join(stateDir, "snap.json"),
+		DegradedAfter: 10 * time.Second, RefuseAfter: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatalf("setup Refresh: %v", err)
+	}
+	hits.Store(0)
+	block.Store(true)
+
+	d := startSnapshotClaimGateDaemon(t, &stubPreflightOnlyProvider{}, client)
+	admission, cell := snapshotBoundAdmission(t, "pool-expire-noblock")
+	detail := snapshotDetail(t, "request-expire-noblock", cell, admission)
+
+	start := time.Now()
+	_, err = d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "p1"}, detail)
+	elapsed := time.Since(start)
+	if err == nil {
+		close(release)
+		t.Fatal("claim against an expired snapshot was accepted")
+	}
+	var expired *rulesetsnapshot.ExpiredError
+	if !errors.As(err, &expired) {
+		close(release)
+		t.Fatalf("error = %v, want an *rulesetsnapshot.ExpiredError in its chain", err)
+	}
+	if elapsed > 2*time.Second {
+		close(release)
+		t.Fatalf("expired claim took %s, want a non-blocking refusal well before the blocked fetch completes", elapsed)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("expired refusal did not start a background fetch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(release)
+	drainSnapshotBackgroundIO(t, stateDir, &hits)
+}
+
+// TestFailStatic_ConcurrentExpiredClaimsCoalesceToOneFetch proves concurrent
+// production claims against one expired snapshot start exactly one in-flight
+// background fetch.
+func TestFailStatic_ConcurrentExpiredClaimsCoalesceToOneFetch(t *testing.T) {
+	t.Parallel()
+	pub, priv := mustGenerateTestKey(t)
+	var hits atomic.Int64
+	var block atomic.Bool
+	release := make(chan struct{})
+	compiledOld := time.Now().Add(-time.Hour).UTC()
+	oldBody := buildSnapshotResponse(t, priv, snapshotFixture{
+		poolID: "pool-expire-coalesce", poolStatus: "active", grantedByProfile: true,
+		hostID: "worker-local", hostStatus: "ready", harnessID: "codex",
+		compiledAt: compiledOld, revision: 1,
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		if block.Load() {
+			<-release
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(oldBody)
+	}))
+	t.Cleanup(srv.Close)
+
+	stateDir := t.TempDir()
+	client, err := rulesetsnapshot.NewClient(rulesetsnapshot.Config{
+		Endpoint: srv.URL, TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
+		StatePath:     filepath.Join(stateDir, "snap.json"),
+		DegradedAfter: 10 * time.Second, RefuseAfter: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatalf("setup Refresh: %v", err)
+	}
+	hits.Store(0)
+	block.Store(true)
+
+	d := startSnapshotClaimGateDaemon(t, &stubPreflightOnlyProvider{}, client)
+	admission, cell := snapshotBoundAdmission(t, "pool-expire-coalesce")
+
+	const callers = 8
+	type result struct {
+		err error
+	}
+	results := make([]result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			detail := snapshotDetail(t, "request-expire-coalesce-"+itoaForTest(i+1), cell, admission)
+			_, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "p1"}, detail)
+			results[i].err = err
+		}(i)
+	}
+	wg.Wait()
+	for i, r := range results {
+		if r.err == nil {
+			close(release)
+			t.Fatalf("caller %d: claim against an expired snapshot was accepted", i)
+		}
+		var expired *rulesetsnapshot.ExpiredError
+		if !errors.As(r.err, &expired) {
+			close(release)
+			t.Fatalf("caller %d: error = %v, want an *rulesetsnapshot.ExpiredError in its chain", i, r.err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("expired refusals did not start a background fetch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := hits.Load(); got != 1 {
+		close(release)
+		t.Fatalf("concurrent expired claims started %d fetches, want exactly 1", got)
+	}
+	close(release)
+	drainSnapshotBackgroundIO(t, stateDir, &hits)
+}
+
+// TestFailStatic_ExpiredRecoversAfterBackgroundRefresh proves the next
+// production claim proceeds once the kicked background fetch succeeds with a
+// newer valid snapshot.
+func TestFailStatic_ExpiredRecoversAfterBackgroundRefresh(t *testing.T) {
+	t.Parallel()
+	pub, priv := mustGenerateTestKey(t)
+	var hits atomic.Int64
+	var block atomic.Bool
+	var serveFresh atomic.Bool
+	release := make(chan struct{})
+	compiledOld := time.Now().Add(-time.Hour).UTC()
+	oldBody := buildSnapshotResponse(t, priv, snapshotFixture{
+		poolID: "pool-expire-recover", poolStatus: "active", grantedByProfile: true,
+		hostID: "worker-local", hostStatus: "ready", harnessID: "codex",
+		compiledAt: compiledOld, revision: 1,
+	})
+	freshBody := buildSnapshotResponse(t, priv, snapshotFixture{
+		poolID: "pool-expire-recover", poolStatus: "active", grantedByProfile: true,
+		hostID: "worker-local", hostStatus: "ready", harnessID: "codex",
+		compiledAt: time.Now().UTC(), revision: 2,
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		if block.Load() {
+			<-release
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if serveFresh.Load() {
+			_, _ = w.Write(freshBody)
+		} else {
+			_, _ = w.Write(oldBody)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	stateDir := t.TempDir()
+	client, err := rulesetsnapshot.NewClient(rulesetsnapshot.Config{
+		Endpoint: srv.URL, TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
+		StatePath:     filepath.Join(stateDir, "snap.json"),
+		DegradedAfter: 10 * time.Second, RefuseAfter: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatalf("setup Refresh: %v", err)
+	}
+	hits.Store(0)
+	block.Store(true)
+
+	d := startSnapshotClaimGateDaemon(t, &stubPreflightOnlyProvider{}, client)
+	admission, cell := snapshotBoundAdmission(t, "pool-expire-recover")
+	detail := snapshotDetail(t, "request-expire-recover-1", cell, admission)
+
+	_, err = d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "p1"}, detail)
+	if err == nil {
+		close(release)
+		t.Fatal("claim against an expired snapshot was accepted")
+	}
+	var expired *rulesetsnapshot.ExpiredError
+	if !errors.As(err, &expired) {
+		close(release)
+		t.Fatalf("error = %v, want an *rulesetsnapshot.ExpiredError in its chain", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("expired refusal did not start a background fetch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	serveFresh.Store(true)
+	close(release)
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		cur, _, ok := client.Current()
+		if ok && cur.Revision == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh did not adopt the newer snapshot")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	detail2 := snapshotDetail(t, "request-expire-recover-2", cell, admission)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail2.SessionID, ProjectID: "p1"}, detail2); err != nil {
+		t.Fatalf("claim after background recovery: %v", err)
+	}
+	if len(detail2.ClaimReceipt) == 0 {
+		t.Fatal("no claim receipt was attached after recovery")
+	}
+	drainSnapshotBackgroundIO(t, stateDir, &hits)
 }

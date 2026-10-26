@@ -503,6 +503,24 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	res.WorktreePath = wpath
+	// Provision-time launch-base receipt: the worktree manager owns the exact
+	// commit the explicit BaseRef selected. Capture it here, before the agent
+	// can commit, so the terminal status can show the launch base instead of
+	// inferring it from a later HEAD. Repository-free work and launches
+	// without an explicit BaseRef carry no receipt and stay wire-identical;
+	// never recompute from Git here.
+	if qw.BaseRef != "" && !repositoryFree {
+		receipt, receiptErr := r.wt.Result(qw.SessionID)
+		if receiptErr != nil || receipt.BaseSHA == "" {
+			missingErr := fmt.Errorf("runner: explicit base %q has no recorded base SHA", qw.BaseRef)
+			if receiptErr != nil {
+				missingErr = fmt.Errorf("runner: explicit base %q has no recorded base SHA: %w", qw.BaseRef, receiptErr)
+			}
+			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, missingErr.Error()
+			return res, missingErr
+		}
+		res.BaseSHA = receipt.BaseSHA
+	}
 	// Clone workareas only: linked worktrees (worktree-add) share hooks with
 	// their parent repository and are deliberately outside this hook's scope.
 	// A directory check also protects re-entered linked worktrees.

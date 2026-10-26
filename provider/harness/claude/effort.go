@@ -11,6 +11,10 @@ import "github.com/RenseiAI/donmai/agent"
 // the operator's saved level would apply.
 const effortEnvVar = "CLAUDE_CODE_EFFORT_LEVEL"
 
+// autoMemoryDisableEnvVar disables the CLI's host-local automatic memory:
+// host-local notes never reach the next session, so they stay off.
+const autoMemoryDisableEnvVar = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+
 // effortModelDefault is the effortEnvVar value that selects the model's own
 // default effort, ignoring any level saved in a settings file.
 const effortModelDefault = "auto"
@@ -44,6 +48,18 @@ func withEffortEnv(env map[string]string, effort agent.EffortLevel) map[string]s
 		out[k] = v
 	}
 	out[effortEnvVar] = effortEnvValue(effort)
+	return out
+}
+
+// withAutoMemoryDisabledEnv returns a copy of env with host-local
+// automatic memory disabled. Always set, so no settings or inherited value
+// can re-enable host-local notes on a hosted run.
+func withAutoMemoryDisabledEnv(env map[string]string) map[string]string {
+	out := make(map[string]string, len(env)+1)
+	for k, v := range env {
+		out[k] = v
+	}
+	out[autoMemoryDisableEnvVar] = "1"
 	return out
 }
 

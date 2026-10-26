@@ -10,6 +10,45 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.91 — 2026-10-26
+
+### Chores
+
+- Claude sessions report compactions, re-inject launch context, disable host-local auto memory
+- Add explicit unlimited stage duration contract (-1 lifts stage cap under the safety ceiling)
+- Backstop: 261c3950-c73c-4f3a-8bf9-cfa7bc9f9790
+- Pin preflight registration requests to accepted contract version
+- Add typed Agent Card discovery failure
+- Recover stale snapshots without blocking claims
+- Record explicit-base launch SHA through runner to status
+- Consume typed pre-execution refusal evidence fail closed
+
+## v0.72.90 — 2026-10-25
+
+### Chores
+
+- Define and strictly validate the versioned inference-usage atom on llm_call
+- Define and generate the evidence-backed harness capability matrix v2
+- Publish Claude interactive statusline USD as live cost-only usage
+- Compile authority-bound native code-intelligence realization facts
+
+## v0.72.89 — 2026-10-24
+
+### Chores
+
+- Host watch: render typed summaries for model calls and context notices
+- Host watch: name sessions by display handle
+- Prove registration-token rotations before adopting them
+- Re-land failed-session checkpoints with secret filtering
+- Record Linux process start time as Unix nanoseconds
+- Report a degraded seat boundary below the scope-layer floor
+- Interactive Pi host-owned applied-receipt claim channel
+- Hold healthy harnesses through control-plane outages instead of reaping on silence
+- Add explicit endpoint protocol selection with an OpenAI qualified manifest
+- Complete the Responses gateway surface: codec, native upstream and per-surface isolation
+- Export daemon quota snapshot and quota-probe binary resolver for embedders
+- Thread the dispatch-target span-ingest capability from poll item to runner
+
 ## v0.72.88 — 2026-10-23
 
 ### Chores

@@ -3,7 +3,10 @@ package daemon
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/runner"
 )
 
 // The top-level maxDurationSeconds on the poll wire used to be decoded and
@@ -102,6 +105,70 @@ func TestPollItemToSessionDetail_ExplicitNestedDurationWins(t *testing.T) {
 
 	if detail.StageBudget == nil || detail.StageBudget.MaxDurationSeconds != 7200 {
 		t.Errorf("StageBudget = %+v, want nested duration 7200 to win over top-level 3600", detail.StageBudget)
+	}
+}
+
+// TestPollItemToSessionDetail_ExplicitUnlimitedDurationSurvivesLegacyBackfill
+// asserts that an explicitly stamped unlimited nested duration (-1) is never
+// rewritten to the legacy top-level value: the nested stage-instance cap is
+// the more specific authority, including for the explicit unlimited value a
+// mixed-fleet producer stamps alongside a legacy top-level duration. The
+// preserved -1 must then adopt cleanly through runner.ReconcileStageBudget —
+// the legacy door that admits it — so the runner installs no session timer.
+func TestPollItemToSessionDetail_ExplicitUnlimitedDurationSurvivesLegacyBackfill(t *testing.T) {
+	t.Parallel()
+
+	item := PollWorkItem{
+		SessionID:   "sess-unlimited-survives-backfill",
+		ProjectName: "alpha",
+		MaxDuration: 86400,
+		StageBudget: &PollStageBudget{MaxDurationSeconds: -1},
+	}
+	detail := PollItemToSessionDetail(item, nil, "https://platform.example", "token", "worker-1")
+
+	if detail.StageBudget == nil || detail.StageBudget.MaxDurationSeconds != -1 {
+		t.Fatalf("StageBudget = %+v, want explicit unlimited duration -1 to survive over top-level 86400", detail.StageBudget)
+	}
+
+	siblingJSON, err := json.Marshal(detail.StageBudget)
+	if err != nil {
+		t.Fatalf("marshal preserved stage budget: %v", err)
+	}
+	got, err := runner.ReconcileStageBudget(runner.QueuedWork{}, siblingJSON)
+	if err != nil {
+		t.Fatalf("ReconcileStageBudget refused preserved unlimited duration: %v", err)
+	}
+	if got.StageBudget == nil || got.StageBudget.MaxDurationSeconds != -1 {
+		t.Fatalf("reconciled StageBudget = %+v, want explicit unlimited duration -1", got.StageBudget)
+	}
+}
+
+// TestPollItemToSessionDetail_BelowUnlimitedPreservedForDownstreamRefusal
+// asserts that a malformed nested duration below the unlimited sentinel (-1)
+// is never rewritten to the legacy top-level value either: it is preserved
+// so runner.ReconcileStageBudget refuses it before spawn instead of silently
+// becoming a bounded session.
+func TestPollItemToSessionDetail_BelowUnlimitedPreservedForDownstreamRefusal(t *testing.T) {
+	t.Parallel()
+
+	item := PollWorkItem{
+		SessionID:   "sess-below-unlimited-preserved",
+		ProjectName: "alpha",
+		MaxDuration: 86400,
+		StageBudget: &PollStageBudget{MaxDurationSeconds: -2},
+	}
+	detail := PollItemToSessionDetail(item, nil, "https://platform.example", "token", "worker-1")
+
+	if detail.StageBudget == nil || detail.StageBudget.MaxDurationSeconds != -2 {
+		t.Fatalf("StageBudget = %+v, want malformed duration -2 preserved for downstream refusal", detail.StageBudget)
+	}
+
+	siblingJSON, err := json.Marshal(detail.StageBudget)
+	if err != nil {
+		t.Fatalf("marshal preserved stage budget: %v", err)
+	}
+	if _, err := runner.ReconcileStageBudget(runner.QueuedWork{}, siblingJSON); err == nil || !strings.Contains(err.Error(), "below the unlimited sentinel") {
+		t.Fatalf("ReconcileStageBudget error = %v, want below-sentinel refusal", err)
 	}
 }
 

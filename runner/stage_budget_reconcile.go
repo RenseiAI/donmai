@@ -18,12 +18,26 @@ import (
 // already immutable operational authority: the sibling must match its
 // absence/presence and value exactly, and never overwrites it. Only legacy work
 // with no authoritative raw OperationalPayload adopts the sibling value.
+//
+// Duration validation is closed: exactly prompt.UnlimitedStageDurationSeconds
+// (-1) is the sole explicit unlimited duration and passes through unchanged;
+// absent/zero and positive finite durations keep their existing meaning. A
+// duration below -1 on either side is malformed and refused before
+// adoption/comparison, so no spawn or retained-execution path can admit it.
 func ReconcileStageBudget(qw QueuedWork, stageBudgetJSON json.RawMessage) (QueuedWork, error) {
 	var sibling *prompt.StageBudget
 	if len(stageBudgetJSON) > 0 {
 		if err := json.Unmarshal(stageBudgetJSON, &sibling); err != nil {
 			return qw, fmt.Errorf("runner: decode stage budget: %w", err)
 		}
+	}
+	if sibling != nil && sibling.MaxDurationSeconds < prompt.UnlimitedStageDurationSeconds {
+		return qw, fmt.Errorf("runner: stage budget duration %d is below the unlimited sentinel %d",
+			sibling.MaxDurationSeconds, prompt.UnlimitedStageDurationSeconds)
+	}
+	if qw.StageBudget != nil && qw.StageBudget.MaxDurationSeconds < prompt.UnlimitedStageDurationSeconds {
+		return qw, fmt.Errorf("runner: stage budget duration %d is below the unlimited sentinel %d",
+			qw.StageBudget.MaxDurationSeconds, prompt.UnlimitedStageDurationSeconds)
 	}
 	if len(qw.OperationalPayload) == 0 {
 		qw.StageBudget = sibling

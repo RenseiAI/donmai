@@ -440,8 +440,23 @@ func TestStopHookSettings_DeclareTheStopHookAndNothingElse(t *testing.T) {
 	}
 
 	hooks, _ := settings["hooks"].(map[string]any)
-	if keys := sortedKeys(hooks); !slices.Equal(keys, []string{"Stop"}) {
-		t.Fatalf("hooks declares %v; want only [Stop]", keys)
+	if keys := sortedKeys(hooks); !slices.Equal(keys, []string{"SessionStart", "Stop"}) {
+		t.Fatalf("hooks declares %v; want only [SessionStart Stop]", keys)
+	}
+
+	// SessionStart is the compact-source group only (telemetry arrives via
+	// the activity merge): it marks the sidecar and re-injects context.
+	compactGroups, _ := hooks["SessionStart"].([]any)
+	if len(compactGroups) != 1 {
+		t.Fatalf("SessionStart has %d groups; want only the compact group", len(compactGroups))
+	}
+	compact, _ := compactGroups[0].(map[string]any)
+	if compact["matcher"] != "compact" {
+		t.Fatalf("SessionStart matcher = %v; want compact", compact["matcher"])
+	}
+	compactCmd, _ := compact["hooks"].([]any)[0].(map[string]any)["command"].(string)
+	if !strings.Contains(compactCmd, sessionStartCompactScriptFile) {
+		t.Fatalf("compact hook command %q misses the generated script", compactCmd)
 	}
 
 	entry := hooks["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)

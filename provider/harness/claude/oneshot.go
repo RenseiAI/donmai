@@ -229,22 +229,19 @@ func buildOneShotArgs(req agent.OneShotRequest) (argv []string, stdinPrompt stri
 // lanes. A request with no Endpoint contributes no routing env and the child
 // inherits the parent environment — which is what carries host-session auth.
 //
-// One-shot calls carry no execution-security stamp, so they never force the
-// reasoning-effort variable: the request's --effort flag (see
-// buildOneShotArgs) is the only effort signal, and the operator's saved
-// preferences and inherited environment stay in place.
+// One-shot calls carry no execution-security stamp, so the effort variable
+// is never forced; host-local automatic memory is disabled on every call.
 func oneShotEnv(req agent.OneShotRequest) map[string]string {
 	if req.Endpoint == nil {
-		return nil
+		return withAutoMemoryDisabledEnv(nil)
 	}
 	spec, err := applyEndpoint(agent.Spec{Endpoint: req.Endpoint})
 	if err != nil {
-		// A mis-bound endpoint is reported by the CLI itself (unknown model /
-		// missing credentials) rather than silently routed to the default host;
-		// there is no endpoint env to add in that case.
-		return nil
+		// A mis-bound endpoint is reported by the CLI itself; there is no
+		// endpoint env to add in that case.
+		return withAutoMemoryDisabledEnv(nil)
 	}
-	return spec.Env
+	return withAutoMemoryDisabledEnv(spec.Env)
 }
 
 // parseOneShotEnvelope decodes the single `--output-format json` document. It

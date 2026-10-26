@@ -55,6 +55,16 @@ const (
 	ContextUsageSourceMuseTokenUsage = "muse-token-usage"
 )
 
+// ClaudeLaunchContextFileName is the session file the runner stages beside
+// the sidecar and the compact hook re-injects. Shared so both sides agree.
+const ClaudeLaunchContextFileName = "launch-context.md"
+
+// ClaudeCompactionLogFileName is the session file the compact hook appends
+// one line per compaction. The watcher counts new lines, so a later
+// statusline rewrite cannot erase an unread compaction. Shared so the hook
+// (provider) and the watcher (runner) agree on the sibling path.
+const ClaudeCompactionLogFileName = "compactions.log"
+
 // ContextUsageEvent is the typed harness notice for a compaction or a
 // context-window threshold crossing. It rides the normal agent.Event stream
 // so the runner's activity sink, execution-event journal, and JSONL audit

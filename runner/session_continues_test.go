@@ -9,12 +9,22 @@ import (
 )
 
 // continuingError is the error a harness reports for the record while its
-// session runs on: here, the pi harness's unproven-call record for a tool
-// call that ended without a policy ruling.
+// session runs on: a generic explicitly-continuing note. It deliberately does
+// not reuse the pi miss code, whose terminal no longer carries
+// SessionContinues. The discriminator under test is generic: only
+// SessionContinues:true is skipped.
 var continuingError = agent.ErrorEvent{
-	Message:          `policy adjudication missing: tool "edit" (call "c-1") ended without a recorded policy ruling — the call is unproven and the session continues`,
-	Code:             "policy_adjudication_missing",
+	Message:          `transient provider note: tool "edit" (call "c-1") reported a recoverable warning and the session continues`,
+	Code:             "transient_provider_note",
 	SessionContinues: true,
+}
+
+// piFatalMiss is the pi harness terminal for a guarded call that ended with
+// no recorded ruling, receipt, or runtime proof. It carries no
+// SessionContinues, so the runner must record it as the stream's error.
+var piFatalMiss = agent.ErrorEvent{
+	Message: `policy adjudication missing: tool "edit" (call "c-1") ended without a recorded policy ruling — the call is unproven and the session ends here`,
+	Code:    "policy_adjudication_missing",
 }
 
 // malformedEditThenValidEdit is a turn's tool traffic in which an edit call
@@ -135,6 +145,20 @@ func TestConsumeEvents_ErrorTheSessionContinuesPast(t *testing.T) {
 		obs, _ := r.consumeEvents(context.Background(), &fakeHandle{events: events}, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-2")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil, nil)
 		if obs.errorEvent == nil || obs.errorEvent.Message != "provider crashed" {
 			t.Fatalf("errorEvent = %+v; want the fatal error recorded", obs.errorEvent)
+		}
+	})
+	t.Run("fatal pi miss without SessionContinues is recorded", func(t *testing.T) {
+		t.Parallel()
+		r := minimalRunner(t)
+		events := make(chan agent.Event, 2)
+		events <- piFatalMiss
+		close(events)
+		obs, _ := r.consumeEvents(context.Background(), &fakeHandle{events: events}, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-3")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil, nil)
+		if obs.errorEvent == nil || obs.errorEvent.Code != "policy_adjudication_missing" {
+			t.Fatalf("errorEvent = %+v; want the pi miss terminal recorded", obs.errorEvent)
+		}
+		if obs.errorEvent.SessionContinues {
+			t.Fatalf("pi miss terminal must not carry SessionContinues: %+v", obs.errorEvent)
 		}
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
+	"math"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -16,7 +17,10 @@ import (
 // appended assistant message.usage is forwarded as the same LlmCallEvent the
 // headless lane emits for a model call (see clijsonl.mapAssistant), so an
 // interactive session's spend reaches the activity stream turn by turn. The
-// terminal session totals come from the whole-file sum at exit (see
+// statusline sidecar's cumulative USD total rides alongside as cost-only
+// delta events (one LlmCallEvent per finite positive increase, carrying only
+// ObservedCostUsd): it invents no turn or tokens, and the transcript remains
+// the token and turn owner. The terminal session totals come from the whole-file sum at exit (see
 // transcript_usage.go), not from these events: the events are the live meter,
 // the exit sum is the reconciled total, and the runner's own budget meter
 // already reconciles the two without double counting.
@@ -75,6 +79,12 @@ type interactiveUsageTailer struct {
 	path   string
 	offset int64
 	seen   map[string]struct{}
+	// sidecarMax is the greatest accepted statusline cumulative total so far.
+	// The statusline value is a session-cumulative snapshot: each sweep emits
+	// only the finite positive increase over this baseline as a cost-only
+	// delta, and repeated or regressing snapshots never move it — so a later
+	// catch-up cannot recharge spend the session already reported.
+	sidecarMax float64
 }
 
 func newInteractiveUsageTailer(hook *stopHookChannel) *interactiveUsageTailer {
@@ -107,17 +117,27 @@ func (t *interactiveUsageTailer) run(sessionDone <-chan struct{}, emit func(agen
 	}
 }
 
-// sweepBoth sweeps the activity relay beside the transcript: hook fires
-// become harness-lifecycle events on the same channel as the usage meter.
+// sweepBoth sweeps the activity relay beside the transcript and the
+// statusline sidecar: hook fires become harness-lifecycle events on the
+// same channel as the usage meter, and the sidecar's cumulative total
+// becomes one cost-only delta event (see sweepSidecarCost).
 func (t *interactiveUsageTailer) sweepBoth() []agent.Event {
 	events := sweepActivityRelay(t.activity)
-	return append(events, t.sweep()...)
+	events = append(events, t.sweep()...)
+	if ev, ok := t.sweepSidecarCost(); ok {
+		events = append(events, ev)
+	}
+	return events
 }
 
-// flushBoth flushes trailing transcript writes, then trailing relay
-// lines, so activity the child wrote on its way out is still delivered.
+// flushBoth flushes trailing transcript writes, then the trailing sidecar
+// cost, then trailing relay lines, so activity the child wrote on its way
+// out is still delivered.
 func (t *interactiveUsageTailer) flushBoth(emit func(agent.Event)) {
 	t.flush(emit)
+	if ev, ok := t.sweepSidecarCost(); ok {
+		emit(ev)
+	}
 	for _, ev := range sweepActivityRelay(t.activity) {
 		emit(ev)
 	}
@@ -143,6 +163,39 @@ func (t *interactiveUsageTailer) flush(emit func(agent.Event)) {
 func (t *interactiveUsageTailer) sweep() []agent.Event {
 	events, _ := t.sweepCapped()
 	return events
+}
+
+// sweepSidecarCost maps the statusline sidecar's cumulative USD snapshot to
+// one cost-only LlmCallEvent carrying the increase since the greatest total
+// accepted so far. The sidecar value is session-cumulative, so the emitted
+// delta is current minus maxPreviouslyAccepted: equality, regression,
+// malformed, non-finite, negative, zero, and absent readings emit nothing
+// and never move the baseline, so a later catch-up cannot recharge old
+// spend. The event is cost-only: it invents no turn or tokens
+// (TurnCompleted stays false, token counts stay zero) and the transcript
+// remains the token and turn owner; the terminal withTranscriptCost
+// reconciliation stays authoritative and is never added to this delta sum.
+func (t *interactiveUsageTailer) sweepSidecarCost() (agent.LlmCallEvent, bool) {
+	if t == nil || t.hook == nil {
+		return agent.LlmCallEvent{}, false
+	}
+	total := t.hook.readSidecarUsage().TotalCostUsd
+	if total <= 0 || math.IsNaN(total) || math.IsInf(total, 0) {
+		return agent.LlmCallEvent{}, false
+	}
+	if total <= t.sidecarMax {
+		return agent.LlmCallEvent{}, false
+	}
+	delta := total - t.sidecarMax
+	if delta <= 0 || math.IsNaN(delta) || math.IsInf(delta, 0) {
+		return agent.LlmCallEvent{}, false
+	}
+	t.sidecarMax = total
+	cost := delta
+	return agent.LlmCallEvent{
+		ObservedCostUsd: &cost,
+		UsageSource:     agent.LlmUsageProvider,
+	}, true
 }
 
 // sweepCapped is sweep with a more flag reporting that a cap left input
