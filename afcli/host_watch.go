@@ -21,11 +21,18 @@ import (
 const hostWatchEnvDaemonURL = "DONMAI_DAEMON_URL"
 
 // hostWatchSource is the minimal daemon-client surface the host-watch engine
-// needs. *afclient.DaemonClient satisfies it; tests inject a fake.
+// needs. *afclient.DaemonClient satisfies it; tests inject a fake. The three
+// GETs feed the polling Source; the four context-bounded methods feed the
+// model's lifecycle actions (pause, resume, deadline-bound drain and
+// per-session stop). The whole-daemon stop door is deliberately absent.
 type hostWatchSource interface {
 	GetSessions() ([]afclient.DaemonSessionHandle, error)
 	GetStatus() (*afclient.DaemonStatusResponse, error)
 	GetStats(withPool, byMachine bool) (*afclient.DaemonStatsResponse, error)
+	PauseContext(ctx context.Context) (*afclient.DaemonActionResponse, error)
+	ResumeContext(ctx context.Context) (*afclient.DaemonActionResponse, error)
+	DrainContext(ctx context.Context, timeoutSeconds int) (*afclient.DaemonActionResponse, error)
+	StopSessionContext(ctx context.Context, sessionID string) (*afclient.DaemonActionResponse, error)
 }
 
 // newHostWatchCmd constructs the `host watch` live dashboard command — the
@@ -70,8 +77,9 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 		Short: "Live dashboard of the agent sessions running on this host",
 		Long: "Launch a per-project live dashboard of all agent work on this host, sourced\n" +
 			"entirely from LOCAL data: the local daemon's session index joined with each\n" +
-			"session's on-disk .agent/events.jsonl stream. It is a pure reader — killing it\n" +
-			"never affects the daemon or any running agent.\n\n" +
+			"session's on-disk .agent/events.jsonl stream. Polling is a local read —\n" +
+			"killing the watcher never affects the daemon or any running agent;\n" +
+			"only the explicit lifecycle keys (x/p/r/d) send authenticated requests.\n\n" +
 			"With no --project/--all, the scope auto-detects from the current repo's git\n" +
 			"remote (the \"one tab per project\" ergonomic). --all shows every session on the\n" +
 			"host.\n\n" +
@@ -84,7 +92,11 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 			"Keys: up/down or j/k select a card; enter swaps the stream for the selected\n" +
 			"session's full detail and esc returns; [ and ] move the cards/stream split\n" +
 			"(50/50 by default), 0 resets it, and the ratio survives terminal resizes;\n" +
-			"f pauses or resumes the stream, g jumps to its tail; q quits.",
+			"f pauses or resumes the stream, g jumps to its tail; x asks to stop the\n" +
+			"selected session (y confirms, n cancels), p pauses host admissions,\n" +
+			"r reopens them, d drains the host to an explicit deadline; q quits.\n" +
+			"Lifecycle keys send one authenticated request each and the next\n" +
+			"daemon snapshot owns what the dashboard shows.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg := afclient.DefaultDaemonConfig()
@@ -104,22 +116,11 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 				}
 			}
 
-			src := hostwatch.NewSource(client, nil, repoScope)
 			label := scopeLabel(repoScope, allFlag)
 			interactive := isInteractiveTTY()
 			plain := plainFlag || !interactive
 
-			return runHostWatch(cmd.Context(), cmd.OutOrStdout(), !interactive, hostwatch.Options{
-				Source:       src,
-				ProjectLabel: label,
-				HostLabel:    hostname(),
-				Plain:        plain,
-				Replay:       replayFlag,
-				// An embedder supplies its handle map through the command
-				// context (see hostwatch.WithHandleEnricher); without it
-				// every label renders exactly as before.
-				Handles: hostwatch.HandleEnricherFrom(cmd.Context()),
-			})
+			return runHostWatch(cmd.Context(), cmd.OutOrStdout(), !interactive, newHostWatchOptions(cmd.Context(), client, repoScope, label, plain, replayFlag))
 		},
 	}
 	cmd.Flags().StringVar(&projectFlag, "project", "", "Scope to a project/repo (default: auto-detect from CWD git remote)")
@@ -128,6 +129,29 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 	cmd.Flags().BoolVar(&plainFlag, "plain", false, "Plain (no color / box) output for non-TTY / CI")
 	cmd.Flags().StringVar(&daemonURL, "daemon-url", "", "Daemon control URL (default: $DONMAI_DAEMON_URL or http://127.0.0.1:7734)")
 	return cmd
+}
+
+// newHostWatchOptions builds the dashboard options around one daemon
+// client: the same production client feeds the polling Source and the
+// lifecycle actions, bounded by the command context. The daemon snapshot
+// owns visible state; actions only report their outcome.
+func newHostWatchOptions(ctx context.Context, client hostWatchSource, repoScope, label string, plain, replay bool) hostwatch.Options {
+	return hostwatch.Options{
+		Source:       hostwatch.NewSource(client, nil, repoScope),
+		ProjectLabel: label,
+		HostLabel:    hostname(),
+		Plain:        plain,
+		Replay:       replay,
+		// An embedder supplies its handle map through the command
+		// context (see hostwatch.WithHandleEnricher); without it
+		// every label renders exactly as before.
+		Handles: hostwatch.HandleEnricherFrom(ctx),
+		// Lifecycle keys act through the same production client
+		// that feeds the polling Source, bounded by the command
+		// context; the daemon snapshot owns visible state.
+		Actions:       client,
+		ActionContext: ctx,
+	}
 }
 
 // newHostWatchClient builds the production daemon client for host watch.

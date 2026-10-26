@@ -2,6 +2,7 @@ package afcli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/views/hostwatch"
 )
@@ -89,7 +91,11 @@ func TestNewHostWatchCmd_Wiring(t *testing.T) {
 // fakeHostWatchSource confirms *afclient.DaemonClient satisfies the
 // hostWatchSource interface (compile-time check) and that the interface is
 // usable with a fake.
-type fakeHostWatchSource struct{}
+type fakeHostWatchSource struct {
+	paused, resumed, drained, stopped int
+	lastDrainTimeout                  int
+	lastStopID                        string
+}
 
 func (fakeHostWatchSource) GetSessions() ([]afclient.DaemonSessionHandle, error) { return nil, nil }
 func (fakeHostWatchSource) GetStatus() (*afclient.DaemonStatusResponse, error)   { return nil, nil }
@@ -97,12 +103,34 @@ func (fakeHostWatchSource) GetStats(_, _ bool) (*afclient.DaemonStatsResponse, e
 	return nil, nil
 }
 
+func (f *fakeHostWatchSource) PauseContext(context.Context) (*afclient.DaemonActionResponse, error) {
+	f.paused++
+	return &afclient.DaemonActionResponse{OK: true, Message: "paused"}, nil
+}
+
+func (f *fakeHostWatchSource) ResumeContext(context.Context) (*afclient.DaemonActionResponse, error) {
+	f.resumed++
+	return &afclient.DaemonActionResponse{OK: true, Message: "resumed"}, nil
+}
+
+func (f *fakeHostWatchSource) DrainContext(_ context.Context, timeoutSeconds int) (*afclient.DaemonActionResponse, error) {
+	f.drained++
+	f.lastDrainTimeout = timeoutSeconds
+	return &afclient.DaemonActionResponse{OK: true, Message: "drained"}, nil
+}
+
+func (f *fakeHostWatchSource) StopSessionContext(_ context.Context, sessionID string) (*afclient.DaemonActionResponse, error) {
+	f.stopped++
+	f.lastStopID = sessionID
+	return &afclient.DaemonActionResponse{OK: true, Message: "stopped"}, nil
+}
+
 func TestHostWatchSource_Satisfied(t *testing.T) {
 	var _ hostWatchSource = (*afclient.DaemonClient)(nil)
-	var _ hostWatchSource = fakeHostWatchSource{}
+	var _ hostWatchSource = &fakeHostWatchSource{}
 	// Build a command with an injected fake factory to exercise that path.
 	cmd := newHostWatchCmdWithSource(func(afclient.DaemonConfig) hostWatchSource {
-		return fakeHostWatchSource{}
+		return &fakeHostWatchSource{}
 	})
 	if cmd == nil {
 		t.Fatal("nil command")
@@ -383,5 +411,110 @@ func TestHostWatchPlainPipeShowsHandleWhenEnriched(t *testing.T) {
 		if !strings.Contains(text, wanted) {
 			t.Errorf("piped watch lost %q: %q", wanted, text)
 		}
+	}
+}
+
+// TestHostWatchLifecycleWiringProduction pins AC-6 at the command seam:
+// the production constructor's options wire the model's actions to the
+// real daemon client, so lifecycle keys send one authenticated request
+// each against an owned loopback daemon. Dropping the wiring
+// (Actions: nil) makes this RED.
+func TestHostWatchLifecycleWiringProduction(t *testing.T) {
+	const token = "watch-wiring-token"
+	var (
+		mu       sync.Mutex
+		posts    = map[string]int{}
+		postAuth = map[string]string{}
+		getAuth  = map[string]string{}
+	)
+	var drainTimeout int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.Method == http.MethodPost {
+			posts[r.URL.EscapedPath()]++
+			postAuth[r.URL.EscapedPath()] = r.Header.Get("Authorization")
+		} else {
+			getAuth[r.URL.EscapedPath()] = r.Header.Get("Authorization")
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/daemon/sessions":
+			_, _ = w.Write([]byte(`[{"sessionId":"sess-wired-1","state":"running","repository":"o/a"}]`))
+		case r.URL.Path == "/api/daemon/status":
+			_, _ = w.Write([]byte(`{"status":"running","version":"t","maxSessions":4}`))
+		case r.URL.Path == "/api/daemon/stats":
+			_, _ = w.Write([]byte(`{"queueDepth":0}`))
+		case r.URL.Path == "/api/daemon/pause":
+			_, _ = w.Write([]byte(`{"ok":true,"message":"paused"}`))
+		case r.URL.Path == "/api/daemon/drain":
+			var req afclient.DaemonDrainRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			mu.Lock()
+			drainTimeout = req.TimeoutSeconds
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true,"message":"drained"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := newHostWatchClient(srv.URL, afclient.DaemonConfig{ControlToken: token})
+	var _ hostwatch.HostActions = client
+	var _ hostWatchSource = client
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	opts := newHostWatchOptions(ctx, client, "", "all projects", true, false)
+	if opts.Actions == nil {
+		t.Fatal("production host-watch options must wire model actions to the real client")
+	}
+	model := hostwatch.New(opts)
+	sized, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = sized.(*hostwatch.Model)
+
+	// Pause through the real key path: one authenticated request.
+	_, pauseCmd := model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	if pauseCmd == nil {
+		t.Fatal("wired pause key must dispatch")
+	}
+	_, pauseFollow := model.Update(pauseCmd())
+	if pauseFollow == nil {
+		t.Fatal("accepted pause must return a fresh index poll")
+	}
+	model.Update(pauseFollow())
+
+	// Drain through the real key path: explicit deadline in the body.
+	_, drainCmd := model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	if drainCmd == nil {
+		t.Fatal("wired drain key must dispatch")
+	}
+	_, drainFollow := model.Update(drainCmd())
+	if drainFollow == nil {
+		t.Fatal("accepted drain must return a fresh index poll")
+	}
+	model.Update(drainFollow())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if posts["/api/daemon/pause"] != 1 {
+		t.Errorf("pause posts = %d, want 1", posts["/api/daemon/pause"])
+	}
+	if posts["/api/daemon/drain"] != 1 {
+		t.Errorf("drain posts = %d, want 1", posts["/api/daemon/drain"])
+	}
+	for _, path := range []string{"/api/daemon/pause", "/api/daemon/drain"} {
+		if postAuth[path] != "Bearer "+token {
+			t.Errorf("%s Authorization = %q, want the operator bearer", path, postAuth[path])
+		}
+	}
+	for _, path := range []string{"/api/daemon/sessions", "/api/daemon/status", "/api/daemon/stats"} {
+		if got, ok := getAuth[path]; !ok || got != "" {
+			t.Errorf("GET %s Authorization = %q (seen %v), want a credential-free GET", path, got, ok)
+		}
+	}
+	if drainTimeout != hostwatch.DefaultDrainTimeoutSeconds {
+		t.Errorf("drain body timeoutSeconds = %d, want the explicit default %d", drainTimeout, hostwatch.DefaultDrainTimeoutSeconds)
 	}
 }
