@@ -13,6 +13,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/ptyhost"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // Launcher starts argv the way one session mode's spawn path starts a
@@ -37,7 +38,12 @@ func DefaultLaunchers() map[agent.PromptSessionMode]Launcher {
 const headlessWaitDelay = 5 * time.Second
 
 // HeadlessLauncher starts argv as a plain child with piped output in its own
-// process group, as the headless harness spawn does.
+// process group, as the headless harness spawn does. The launcher's base
+// (this process's environment) is stripped of engine re-exec controls
+// before the trusted overrides are layered on top, so an inherited
+// confinement, embedder-registered, or *_PROBE copy never selects a
+// re-exec role for the child; only the producer-owned copies in env
+// (Plan.Environment plus the self-test probe marker) reach it.
 func HeadlessLauncher() Launcher {
 	return func(ctx context.Context, argv, env []string, dir string) (int, error) {
 		if len(argv) == 0 {
@@ -45,7 +51,7 @@ func HeadlessLauncher() Launcher {
 		}
 		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: the confined argv the caller built.
 		cmd.Dir = dir
-		cmd.Env = overlayEnv(os.Environ(), env)
+		cmd.Env = overlayEnv(runtimeenv.FilterEngineControlEnv(os.Environ()), env)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		// Cancel kills the whole process group, not just the direct child:
 		// the child may have forked (a shell wrapper, a daemonizing
@@ -111,8 +117,13 @@ func InteractiveLauncher() Launcher {
 	}
 }
 
-// overlayEnv applies KEY=VALUE overrides on top of base, last wins.
+// overlayEnv applies KEY=VALUE overrides on top of base, last wins. Engine
+// re-exec controls are stripped from the base layer before the overlay, so
+// only the producer-owned copies in overrides (Plan.Environment plus the
+// self-test probe marker) reach the child. Overrides are trusted and kept
+// verbatim: filtering them would strip the boundary's own stage policy.
 func overlayEnv(base, overrides []string) []string {
+	base = runtimeenv.FilterEngineControlEnv(base)
 	index := map[string]int{}
 	out := make([]string, 0, len(base)+len(overrides))
 	for _, kv := range append(append([]string{}, base...), overrides...) {

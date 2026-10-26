@@ -184,6 +184,14 @@ func composeEnv(parent, overrides []string) []string {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			key = kv[:i]
 		}
+		// Engine re-exec controls never cross the inherited parent layer:
+		// only producer-owned copies appended after filtering may reach
+		// the child. Overrides are trusted (Plan.Environment plus the
+		// self-test probe marker already survived their own boundary), so
+		// they are kept verbatim to preserve the boundary's stage policy.
+		if inherited && runtimeenv.IsEngineControlEnv(key) {
+			return
+		}
 		if runtimeenv.IsRunnerOnly(key) {
 			return
 		}

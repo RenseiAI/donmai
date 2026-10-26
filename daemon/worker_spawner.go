@@ -2156,10 +2156,20 @@ func (s *WorkerSpawner) sessionEnv(spec SessionSpec, project *ProjectConfig) []s
 // inherited names no other session and must not ride along. The explicit
 // maps above are untouched — stripping there would remove the credential
 // the worker needs for its own detail read.
+//
+// Both the explicit maps and the inherited parent layer additionally
+// refuse engine re-exec controls (runtimeenv.IsEngineControlEnv): an
+// inherited or work-item copy of the confinement probe, the Landlock
+// stage, a decoy/remount helper, an embedder-registered control, or any
+// *_PROBE marker would otherwise make the spawned worker re-execute as a
+// probe or stage instead of running the session. Only producer-owned
+// copies appended after this composition (the worker's own stage policy)
+// may reach the child. OnPreSpawn runs after this composition, so an
+// embedder's trusted post-filter injection is unaffected.
 func composeEnv(parts ...map[string]string) []string {
 	merged := map[string]string{}
 	for _, p := range parts {
-		for k, v := range runtimeenv.FilterRunnerOnlyMap(p) {
+		for k, v := range runtimeenv.FilterEngineControlEnvMap(runtimeenv.FilterRunnerOnlyMap(p)) {
 			merged[k] = v
 		}
 	}
@@ -2173,14 +2183,15 @@ func composeEnv(parts ...map[string]string) []string {
 }
 
 // filterSpawnerParentEnv is the daemon spawn path's inherited-environment
-// filter: the runner-only controls plus the per-session read credential.
+// filter: the runner-only controls, the engine re-exec controls, plus the
+// per-session read credential.
 // A stale read credential in the daemon's own environment names some other
 // session's detail read; it must not ride into a worker beside that
 // worker's own explicitly stated credential. Kept beside composeEnv (not
 // in runtime/env) because the explicit-map half of that composition must
 // keep stating the credential.
 func filterSpawnerParentEnv(entries []string) []string {
-	out := runtimeenv.FilterRunnerOnly(entries)
+	out := runtimeenv.FilterEngineControlEnv(runtimeenv.FilterRunnerOnly(entries))
 	kept := out[:0]
 	prefix := runtimeenv.SessionReadTokenEnv + "="
 	for _, entry := range out {

@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // BackendName is the ConfinementBackend of the ADR's D1.
@@ -367,17 +368,49 @@ func (p *Plan) Environment() []string {
 // binding wins, exactly once.
 var sessionTmpBindingKeys = []string{"TMPDIR", "TMP", "TEMP"}
 
+// PlanForTest builds a Plan carrying the given session-tmp/cache bindings
+// plus the boundary's own bindings, for tests outside this package that
+// must drive the production trusted-last merge (Plan.ApplyToEnv) without
+// reimplementing it. It is the only way to mint a Plan with producer-owned
+// engine controls from another package: Prepare needs a passing self-test,
+// which a unit test cannot fabricate.
+func PlanForTest(env []string, boundaryEnv []string) *Plan {
+	copied := append([]string(nil), env...)
+	bound := append([]string(nil), boundaryEnv...)
+	return &Plan{env: copied, applied: Applied{Environ: func() []string {
+		return append([]string(nil), bound...)
+	}}}
+}
+
 // ApplyToEnv returns childEnv with this plan's environment applied: any
-// prior TMPDIR, TMP or TEMP entry is replaced — never shadowed — and the
-// plan's full environment is appended. The result binds each of the three
-// exactly once, to session_tmp, however the child environment was
-// otherwise configured. A spawn site with no prior binding sees only the
-// append; a confined run that already carries an executor-owned session
-// scratch keeps the plan's own binding.
+// prior TMPDIR, TMP or TEMP entry is replaced — never shadowed —, any
+// inherited or session-supplied engine re-exec control is stripped, and the
+// plan's full environment is appended last so it wins. The result binds each
+// of the three tmp variables exactly once, to session_tmp, however the child
+// environment was otherwise configured. A spawn site with no prior binding
+// sees only the append; a confined run that already carries an
+// executor-owned session scratch keeps the plan's own binding. Only the
+// producer-owned copies in Environment (the session-tmp and cache bindings
+// plus the boundary's own stage policy) may carry engine controls past this
+// boundary.
 func (p *Plan) ApplyToEnv(childEnv []string) []string {
 	full := p.Environment()
 	out := make([]string, 0, len(childEnv)+len(full))
 	for _, kv := range childEnv {
+		key := kv
+		if i := len(kv); i > 0 {
+			for j := 0; j < len(kv); j++ {
+				if kv[j] == '=' {
+					key = kv[:j]
+					break
+				}
+			}
+		}
+		// Strip any untrusted engine control before the trusted bindings
+		// below re-introduce the producer-owned copies.
+		if runtimeenv.IsEngineControlEnv(key) {
+			continue
+		}
 		if isSessionTmpBindingKey(kv) {
 			continue
 		}
