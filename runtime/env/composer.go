@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -369,38 +370,80 @@ func ValidEnvKey(key string) bool {
 	return key != "" && !strings.ContainsAny(key, "=\x00")
 }
 
-// Engine-control prefixes and suffix that must never cross an untrusted
+// Engine-control prefix and suffix that must never cross an untrusted
 // environment boundary into an engine child. The engine re-executes itself
 // when one of these is set (the Landlock stage, the confinement probe and
 // its decoy/remount helpers), so an inherited or session-supplied copy
 // would select a re-exec role for the child. Matching is exact and
 // case-sensitive: only the upper-case prefix or suffix names a control.
-// A bare prefix without a trailing name ("DONMAI_CONFINEMENT",
-// "RENSEI_SEATBELT", or the prefixes with an empty suffix) is not a
-// control and is left alone, as are lower-case spellings and names that
-// merely extend the probe suffix ("*_PROBE_EXTRA").
+// A bare prefix without a trailing name ("DONMAI_CONFINEMENT_" with an
+// empty suffix) is not a control and is left alone, as are lower-case
+// spellings and names that merely extend the probe suffix
+// ("*_PROBE_EXTRA").
+//
+// An embedding program that owns additional re-exec controls registers
+// their prefixes at init with RegisterEngineControlPrefix; those prefixes
+// follow the same exact, case-sensitive, bare-prefix-excluded rule. No
+// embedder namespace is hard-coded here.
 const (
-	engineControlDonmaiPrefix   = "DONMAI_CONFINEMENT_"
-	engineControlSeatbeltPrefix = "RENSEI_SEATBELT_"
-	engineControlProbeSuffix    = "_PROBE"
+	engineControlDonmaiPrefix = "DONMAI_CONFINEMENT_"
+	engineControlProbeSuffix  = "_PROBE"
 )
+
+// engineControlExtraPrefixes holds the embedder-registered control
+// prefixes consulted by IsEngineControlEnv alongside the built-in
+// confinement prefix and probe suffix. It is append-only and guarded by
+// engineControlExtraMu so parallel spawns can classify while an embedder
+// registers at init.
+var (
+	engineControlExtraMu       sync.RWMutex
+	engineControlExtraPrefixes []string
+)
+
+// RegisterEngineControlPrefix registers an additional case-sensitive
+// control prefix that IsEngineControlEnv and both engine-control filters
+// strip from every untrusted or inherited map before an engine child is
+// launched. The embedding program calls it at init for the control
+// namespaces it owns; only producer-owned copies appended after filtering
+// may then reach the child. Matching mirrors the built-in prefix: the key
+// must be longer than the prefix and carry it exactly. Empty prefixes and
+// prefixes holding '=' or NUL are ignored, and registering the same prefix
+// twice records it once. Values are never logged.
+func RegisterEngineControlPrefix(prefix string) {
+	if prefix == "" || strings.ContainsAny(prefix, "=\x00") {
+		return
+	}
+	engineControlExtraMu.Lock()
+	defer engineControlExtraMu.Unlock()
+	for _, p := range engineControlExtraPrefixes {
+		if p == prefix {
+			return
+		}
+	}
+	engineControlExtraPrefixes = append(engineControlExtraPrefixes, prefix)
+}
 
 // IsEngineControlEnv reports whether key is an engine re-exec control that
 // must be stripped from every untrusted or inherited environment map before
 // an engine child is launched. It covers the DONMAI_CONFINEMENT_* namespace
-// (confinement stage, probe, decoy and remount controls), the
-// RENSEI_SEATBELT_* namespace, and any *_PROBE re-exec marker. Only the
-// producer-owned copies appended after filtering (Plan.Environment and the
-// self-test probe marker) may reach the child.
+// (confinement stage, probe, decoy and remount controls), any *_PROBE
+// re-exec marker, and every prefix registered with
+// RegisterEngineControlPrefix. Only the producer-owned copies appended
+// after filtering (Plan.Environment and the self-test probe marker) may
+// reach the child.
 func IsEngineControlEnv(key string) bool {
 	if len(key) > len(engineControlDonmaiPrefix) && strings.HasPrefix(key, engineControlDonmaiPrefix) {
 		return true
 	}
-	if len(key) > len(engineControlSeatbeltPrefix) && strings.HasPrefix(key, engineControlSeatbeltPrefix) {
-		return true
-	}
 	if len(key) > len(engineControlProbeSuffix) && strings.HasSuffix(key, engineControlProbeSuffix) {
 		return true
+	}
+	engineControlExtraMu.RLock()
+	defer engineControlExtraMu.RUnlock()
+	for _, prefix := range engineControlExtraPrefixes {
+		if len(key) > len(prefix) && strings.HasPrefix(key, prefix) {
+			return true
+		}
 	}
 	return false
 }

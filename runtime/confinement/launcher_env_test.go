@@ -17,7 +17,16 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
+
+// embedderSeatbeltPrefix is the neutral fixture standing in for an
+// embedder-owned control namespace registered with the shared classifier.
+const embedderSeatbeltPrefix = "EMBEDDER_SEATBELT_"
+
+func init() {
+	runtimeenv.RegisterEngineControlPrefix(embedderSeatbeltPrefix)
+}
 
 func readEnvFile(t *testing.T, path string) map[string]string {
 	t.Helper()
@@ -44,7 +53,7 @@ func TestLaunchers_StripInheritedEngineControls(t *testing.T) {
 	// Not parallel: stages engine controls in the process environment.
 	t.Setenv("DONMAI_CONFINEMENT_PROBE", "parent-evil-probe")
 	t.Setenv("DONMAI_CONFINEMENT_LANDLOCK_STAGE", "parent-evil-stage")
-	t.Setenv("RENSEI_SEATBELT_ENFORCE", "parent-evil-seatbelt")
+	t.Setenv("EMBEDDER_SEATBELT_ENFORCE", "parent-evil-seatbelt")
 	t.Setenv("EVIL_PROBE", "parent-evil-suffix")
 	t.Setenv("FOO_PROBE_EXTRA", "parent-near-miss")
 	t.Setenv("DONMAI_CONFINEMENT", "parent-bare-prefix")
@@ -58,7 +67,7 @@ func TestLaunchers_StripInheritedEngineControls(t *testing.T) {
 		t.Fatalf("headless launch = %d, %v", code, err)
 	}
 	headless := readEnvFile(t, headlessFile)
-	for _, evil := range []string{"DONMAI_CONFINEMENT_PROBE", "DONMAI_CONFINEMENT_LANDLOCK_STAGE", "RENSEI_SEATBELT_ENFORCE", "EVIL_PROBE"} {
+	for _, evil := range []string{"DONMAI_CONFINEMENT_PROBE", "DONMAI_CONFINEMENT_LANDLOCK_STAGE", "EMBEDDER_SEATBELT_ENFORCE", "EVIL_PROBE"} {
 		if v, ok := headless[evil]; ok {
 			t.Errorf("headless child observes inherited %s=%q", evil, v)
 		}
@@ -82,7 +91,7 @@ func TestLaunchers_StripInheritedEngineControls(t *testing.T) {
 		t.Fatalf("interactive launch = %d, %v", code, err)
 	}
 	ptyEnv := readEnvFile(t, ptyFile)
-	for _, evil := range []string{"DONMAI_CONFINEMENT_PROBE", "DONMAI_CONFINEMENT_LANDLOCK_STAGE", "RENSEI_SEATBELT_ENFORCE", "EVIL_PROBE"} {
+	for _, evil := range []string{"DONMAI_CONFINEMENT_PROBE", "DONMAI_CONFINEMENT_LANDLOCK_STAGE", "EMBEDDER_SEATBELT_ENFORCE", "EVIL_PROBE"} {
 		if v, ok := ptyEnv[evil]; ok {
 			t.Errorf("pty child observes inherited %s=%q", evil, v)
 		}
@@ -244,7 +253,7 @@ func TestProbePass_FiltersEvilProbeExtra(t *testing.T) {
 			ProbeCommand: []string{"/bin/true"},
 			ProbeEnv: []string{
 				"DONMAI_CONFINEMENT_PROBE_DECOY=evil-decoy",
-				"RENSEI_SEATBELT_X=evil-seatbelt",
+				"EMBEDDER_SEATBELT_X=evil-seatbelt",
 				"BAR_PROBE=evil-suffix",
 				"SAFE_KEEP=keep",
 			},
@@ -267,7 +276,7 @@ func TestProbePass_FiltersEvilProbeExtra(t *testing.T) {
 			envMap[kv[:i]] = kv[i+1:]
 		}
 	}
-	for _, evil := range []string{"DONMAI_CONFINEMENT_PROBE_DECOY", "RENSEI_SEATBELT_X", "BAR_PROBE"} {
+	for _, evil := range []string{"DONMAI_CONFINEMENT_PROBE_DECOY", "EMBEDDER_SEATBELT_X", "BAR_PROBE"} {
 		if v, ok := envMap[evil]; ok {
 			t.Errorf("probe child observes evil extra %s=%q", evil, v)
 		}
@@ -289,7 +298,7 @@ func TestStartDecoy_StripsBroadEngineControls(t *testing.T) {
 	// Not parallel: stages engine controls in the process environment.
 	t.Setenv(ProbeEnv, "parent-evil-probe")
 	t.Setenv(landlockStageEnv, "parent-evil-stage")
-	t.Setenv("RENSEI_SEATBELT_ENFORCE", "parent-evil-seatbelt")
+	t.Setenv("EMBEDDER_SEATBELT_ENFORCE", "parent-evil-seatbelt")
 	t.Setenv("BAR_PROBE", "parent-evil-suffix")
 	t.Setenv("FOO_PROBE_EXTRA", "parent-near-miss")
 	t.Setenv("DONMAI_CONFINEMENT", "parent-bare-prefix")
@@ -324,7 +333,7 @@ func TestStartDecoy_StripsBroadEngineControls(t *testing.T) {
 			}
 		}
 	}
-	for _, evil := range []string{ProbeEnv, landlockStageEnv, "RENSEI_SEATBELT_ENFORCE", "BAR_PROBE"} {
+	for _, evil := range []string{ProbeEnv, landlockStageEnv, "EMBEDDER_SEATBELT_ENFORCE", "BAR_PROBE"} {
 		if v, ok := got[evil]; ok {
 			t.Errorf("decoy child observes parent %s=%q", evil, v)
 		}

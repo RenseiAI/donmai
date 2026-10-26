@@ -12,6 +12,14 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
+// embedderSeatbeltPrefix is the neutral fixture standing in for an
+// embedder-owned control namespace registered with the shared classifier.
+const embedderSeatbeltPrefix = "EMBEDDER_SEATBELT_"
+
+func init() {
+	runtimeenv.RegisterEngineControlPrefix(embedderSeatbeltPrefix)
+}
+
 // This file is the allowlist suite for the pi child's exec environment
 // (child_env.go). pi renames its process at startup, and a same-user process
 // listing then renders the leading entries of the exec-time environment
@@ -547,7 +555,7 @@ func TestPartitionChildEnv_StripsEngineControlsFromBothCarriers(t *testing.T) {
 		"PATH=/usr/bin",
 		"DONMAI_CONFINEMENT_PROBE=parent-evil",
 		"DONMAI_CONFINEMENT_LANDLOCK_STAGE=parent-evil",
-		"RENSEI_SEATBELT_ENFORCE=parent-evil",
+		"EMBEDDER_SEATBELT_ENFORCE=parent-evil",
 		"EVIL_PROBE=parent-evil",
 		"FOO_PROBE_EXTRA=parent-near-miss",
 		"DONMAI_CONFINEMENT=parent-bare",
@@ -556,7 +564,7 @@ func TestPartitionChildEnv_StripsEngineControlsFromBothCarriers(t *testing.T) {
 		"DONMAI_CONFINEMENT_PROBE":         "spec-evil",
 		"DONMAI_CONFINEMENT_PROBE_DECOY":   "spec-evil",
 		"DONMAI_CONFINEMENT_PROBE_REMOUNT": "spec-evil",
-		"RENSEI_SEATBELT_FOO":              "spec-evil",
+		"EMBEDDER_SEATBELT_FOO":            "spec-evil",
 		"BAR_PROBE":                        "spec-evil",
 		"FOO_PROBE_EXTRA":                  "spec-near-miss",
 		"GH_TOKEN":                         "tool-binding",
@@ -592,13 +600,13 @@ func TestPartitionChildEnv_StripsEngineControlsFromBothCarriers(t *testing.T) {
 	for _, evil := range []string{
 		"DONMAI_CONFINEMENT_PROBE", "DONMAI_CONFINEMENT_LANDLOCK_STAGE",
 		"DONMAI_CONFINEMENT_PROBE_DECOY", "DONMAI_CONFINEMENT_PROBE_REMOUNT",
-		"RENSEI_SEATBELT_X", "SOME_PROBE",
+		"EMBEDDER_SEATBELT_X", "SOME_PROBE",
 	} {
 		if !childEnvRefused(evil) {
 			t.Errorf("childEnvRefused(%q) = false, want true", evil)
 		}
 	}
-	for _, near := range []string{"DONMAI_CONFINEMENT", "RENSEI_SEATBELT", "FOO_PROBE_EXTRA", "my_probe"} {
+	for _, near := range []string{"DONMAI_CONFINEMENT", "EMBEDDER_SEATBELT", "FOO_PROBE_EXTRA", "my_probe"} {
 		if childEnvRefused(near) {
 			t.Errorf("childEnvRefused(%q) = true, want false (a near-miss)", near)
 		}

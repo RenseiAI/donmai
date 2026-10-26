@@ -139,19 +139,3 @@ CLOSED_TUI_REPO :: ^internal/credentials/blocklist\.go :: rens[e]i-tui :: (- ren
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist_json_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's generated baseline \(daemon/credentials/generated_blocklist\.go,|this constant is updated deliberately in the same commit — and rens[e]i-tui's|update this constant AND expect rens[e]i-tui/platform freshness checks)
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's daemon/credentials/socket\.go hardcodes the same list and|AgentEnvBlocklist drifted \(sync with rens[e]i-tui daemon/credentials/socket\.go\))
 
-# Engine-control deny policy: the RENS[E]I_SEATBELT_* namespace is the
-# reserved seatbelt-control prefix the engine child-env boundary must deny
-# alongside DONMAI_CONFINEMENT_* and *_PROBE. The classifier in
-# runtime/env/composer.go and its table, launcher and plan tests name only
-# synthetic evil/near-miss values (parent-evil, spec-evil, FOO) — never a
-# real credential — to pin that the boundary strips the namespace. Rewriting
-# the literals would make the deny contract untestable. Scoped per file to
-# the exact prefix so a NEW unscoped occurrence still fails.
-CLOSED_ENV_VAR :: ^runtime/env/composer\.go :: RENS[E]I_SEATBELT
-CLOSED_ENV_VAR :: ^runtime/env/composer_test\.go :: RENS[E]I_SEATBELT
-CLOSED_ENV_VAR :: ^runtime/confinement/launcher\.go :: RENS[E]I_SEATBELT
-CLOSED_ENV_VAR :: ^runtime/confinement/launcher_env_test\.go :: RENS[E]I_SEATBELT
-CLOSED_ENV_VAR :: ^runtime/confinement/plan_env_test\.go :: RENS[E]I_SEATBELT
-CLOSED_ENV_VAR :: ^provider/harness/pi/child_env_test\.go :: RENS[E]I_SEATBELT
-CLOSED_ENV_VAR :: ^provider/harness/muse/confinement_test\.go :: RENS[E]I_SEATBELT
-

@@ -10,6 +10,16 @@ import (
 	"github.com/RenseiAI/donmai/runtime/env"
 )
 
+// embedderSeatbeltPrefix is the neutral fixture standing in for an
+// embedder-owned control namespace. Tests register it so the classifier
+// proves the registration seam strips embedder controls alongside the
+// built-in confinement prefix and probe suffix.
+const embedderSeatbeltPrefix = "EMBEDDER_SEATBELT_"
+
+func init() {
+	env.RegisterEngineControlPrefix(embedderSeatbeltPrefix)
+}
+
 func TestComposeSpecOverridesBaseAndDeterministic(t *testing.T) {
 	t.Parallel()
 
@@ -426,7 +436,7 @@ func TestInheritedLayersStripSessionReadToken(t *testing.T) {
 
 // TestIsEngineControlEnv_RefusesControlsKeepsNearMisses pins the single
 // case-sensitive classifier for engine re-exec controls: the
-// DONMAI_CONFINEMENT_* namespace, the RENSEI_SEATBELT_* namespace and any
+// DONMAI_CONFINEMENT_* namespace, the registered embedder prefix and any
 // *_PROBE marker are controls; bare prefixes, lower-case spellings and
 // suffix extensions are not.
 //
@@ -440,8 +450,8 @@ func TestIsEngineControlEnv_RefusesControlsKeepsNearMisses(t *testing.T) {
 		"DONMAI_CONFINEMENT_PROBE_DECOY",
 		"DONMAI_CONFINEMENT_PROBE_REMOUNT",
 		"DONMAI_CONFINEMENT_FUTURE_CONTROL",
-		"RENSEI_SEATBELT_ENFORCE",
-		"RENSEI_SEATBELT_FOO",
+		"EMBEDDER_SEATBELT_ENFORCE",
+		"EMBEDDER_SEATBELT_FOO",
 		"FOO_PROBE",
 		"MY_SERVICE_PROBE",
 		"A_PROBE",
@@ -453,11 +463,11 @@ func TestIsEngineControlEnv_RefusesControlsKeepsNearMisses(t *testing.T) {
 	}
 	kept := []string{
 		"DONMAI_CONFINEMENT",
-		"RENSEI_SEATBELT",
+		"EMBEDDER_SEATBELT",
 		"DONMAI_CONFINEMENT_",
-		"RENSEI_SEATBELT_",
+		"EMBEDDER_SEATBELT_",
 		"donmai_confinement_probe",
-		"rensei_seatbelt_enforce",
+		"embedder_seatbelt_enforce",
 		"my_probe",
 		"FOO_PROBE_EXTRA",
 		"FOO_PROBES",
@@ -484,14 +494,14 @@ func TestComposeChildEnv_FiltersEngineControlsAtEveryLayer(t *testing.T) {
 			"PATH=/usr/bin",
 			"DONMAI_CONFINEMENT_PROBE=parent-evil",
 			"DONMAI_CONFINEMENT_LANDLOCK_STAGE=parent-evil",
-			"RENSEI_SEATBELT_ENFORCE=parent-evil",
+			"EMBEDDER_SEATBELT_ENFORCE=parent-evil",
 			"FOO_PROBE=parent-evil",
 			"FOO_PROBE_EXTRA=parent-near-miss",
 		},
 		map[string]string{
 			"DONMAI_CONFINEMENT_PROBE":       "explicit-evil",
 			"DONMAI_CONFINEMENT_PROBE_DECOY": "explicit-evil",
-			"RENSEI_SEATBELT_FOO":            "explicit-evil",
+			"EMBEDDER_SEATBELT_FOO":          "explicit-evil",
 			"BAR_PROBE":                      "explicit-evil",
 			"FOO_PROBE_EXTRA":                "explicit-near-miss",
 			"DONMAI_CONFINEMENT":             "explicit-bare-prefix",
@@ -530,7 +540,7 @@ func TestComposer_FiltersEngineControlsAtBothLayers(t *testing.T) {
 		"PATH":                             "/usr/bin",
 		"DONMAI_CONFINEMENT_PROBE":         "base-evil",
 		"DONMAI_CONFINEMENT_PROBE_REMOUNT": "base-evil",
-		"RENSEI_SEATBELT_X":                "base-evil",
+		"EMBEDDER_SEATBELT_X":              "base-evil",
 		"EVIL_PROBE":                       "base-evil",
 	}, agent.Spec{Env: map[string]string{
 		"ANTHROPIC_API_KEY":        "runner-set-trusted",

@@ -41,7 +41,7 @@ const headlessWaitDelay = 5 * time.Second
 // process group, as the headless harness spawn does. The launcher's base
 // (this process's environment) is stripped of engine re-exec controls
 // before the trusted overrides are layered on top, so an inherited
-// DONMAI_CONFINEMENT_*, RENSEI_SEATBELT_* or *_PROBE copy never selects a
+// confinement, embedder-registered, or *_PROBE copy never selects a
 // re-exec role for the child; only the producer-owned copies in env
 // (Plan.Environment plus the self-test probe marker) reach it.
 func HeadlessLauncher() Launcher {

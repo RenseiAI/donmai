@@ -11,7 +11,15 @@ package confinement
 import (
 	"strings"
 	"testing"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
+
+func init() {
+	// Neutral fixture for the embedder-owned namespace; the shared
+	// constant lives in launcher_env_test.go (same package).
+	runtimeenv.RegisterEngineControlPrefix("EMBEDDER_SEATBELT_")
+}
 
 // TestPlanApplyToEnv_ReplacesPriorTmpBindings pins the confined-run merge:
 // each of TMPDIR/TMP/TEMP appears exactly once, bound to session_tmp,
@@ -141,7 +149,7 @@ func TestPlanApplyToEnv_StripsEngineControlsBeforeTrustedAppend(t *testing.T) {
 		"DONMAI_CONFINEMENT_LANDLOCK_STAGE=evil-stage",
 		"DONMAI_CONFINEMENT_PROBE_DECOY=evil-decoy",
 		"DONMAI_CONFINEMENT_PROBE_REMOUNT=evil-remount",
-		"RENSEI_SEATBELT_ENFORCE=evil-seatbelt",
+		"EMBEDDER_SEATBELT_ENFORCE=evil-seatbelt",
 		"EVIL_PROBE=evil-suffix",
 		"FOO_PROBE_EXTRA=near-miss",
 		"DONMAI_CONFINEMENT=bare-prefix",

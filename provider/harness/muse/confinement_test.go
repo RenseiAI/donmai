@@ -8,7 +8,16 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
+
+// embedderSeatbeltPrefix is the neutral fixture standing in for an
+// embedder-owned control namespace registered with the shared classifier.
+const embedderSeatbeltPrefix = "EMBEDDER_SEATBELT_"
+
+func init() {
+	runtimeenv.RegisterEngineControlPrefix(embedderSeatbeltPrefix)
+}
 
 // TestMuseConfinementEnabled_FollowsTheRequest pins the gate: confinement
 // is requested by the host requirement or by a declared repository
@@ -216,7 +225,7 @@ func TestConfineMuseEnv_StripsEngineControlsBeforeTrustedAppend(t *testing.T) {
 		"DONMAI_CONFINEMENT_PROBE=evil-probe",
 		"DONMAI_CONFINEMENT_LANDLOCK_STAGE=evil-stage",
 		"DONMAI_CONFINEMENT_PROBE_DECOY=evil-decoy",
-		"RENSEI_SEATBELT_FOO=evil-seatbelt",
+		"EMBEDDER_SEATBELT_FOO=evil-seatbelt",
 		"EVIL_PROBE=evil-suffix",
 		"FOO_PROBE_EXTRA=near-miss",
 		"DONMAI_CONFINEMENT=bare-prefix",
@@ -278,7 +287,7 @@ func TestServeEnv_FiltersEngineControlsAtEveryLayer(t *testing.T) {
 	t.Parallel()
 	got := serveEnv(
 		[]string{"PATH=/bin", "DONMAI_CONFINEMENT_PROBE=parent-evil", "FOO_PROBE_EXTRA=parent-near-miss"},
-		map[string]string{"RENSEI_SEATBELT_X": "extra-evil"},
+		map[string]string{"EMBEDDER_SEATBELT_X": "extra-evil"},
 		map[string]string{"DONMAI_CONFINEMENT_PROBE_DECOY": "session-evil", "SAFE": "kept", "FOO_PROBE_EXTRA": "session-near-miss"},
 	)
 	for _, kv := range got {
