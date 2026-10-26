@@ -96,7 +96,9 @@ func IdentityOf(info os.FileInfo) (FileIdentity, error) { return fileIdentity(in
 // reuse (same device+inode, different birth) or a genuine replacement
 // (different inode). When either side lacks a birth time (records written
 // before birth tracking), the inode alone decides so old records migrate
-// forward instead of crash-looping.
+// forward instead of crash-looping. Linux never records birth (see
+// file_identity_linux.go), so there the inode alone decides and a
+// same-inode cross-device collision is accepted on inode alone.
 func fileIdentityMatches(stored, current FileIdentity) bool {
 	if stored.Inode == 0 || current.Inode == 0 {
 		return false
@@ -108,17 +110,6 @@ func fileIdentityMatches(stored, current FileIdentity) bool {
 		return stored.BirthSec == current.BirthSec && stored.BirthNsec == current.BirthNsec
 	}
 	return true
-}
-
-// fileIdentityDeviceOnlyChange reports whether stored and current differ
-// only by device number: same inode (and compatible birth), different
-// device. Callers use it to decide between a silent birth-metadata refresh
-// (same device) and a renumber re-anchor (device changed).
-func fileIdentityDeviceOnlyChange(stored, current FileIdentity) bool {
-	if !fileIdentityMatches(stored, current) {
-		return false
-	}
-	return stored.Device != current.Device
 }
 
 // Participant is one shared-mode reference to an owner root.
@@ -790,7 +781,7 @@ func (s *AcquisitionStore) Commit(acquisitionID string) (AcquisitionRecord, erro
 	if err != nil {
 		return AcquisitionRecord{}, err
 	}
-	if publishedIdentity.Mode()&os.ModeSymlink != 0 || !os.SameFile(stagingIdentity, publishedIdentity) || publishedFileIdentity != identity {
+	if publishedIdentity.Mode()&os.ModeSymlink != 0 || !os.SameFile(stagingIdentity, publishedIdentity) || !fileIdentityMatches(identity, publishedFileIdentity) {
 		return AcquisitionRecord{}, fmt.Errorf("runtime/workarea: published root identity changed during claim")
 	}
 	record.State = AcquisitionReady

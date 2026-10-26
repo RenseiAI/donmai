@@ -835,29 +835,6 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 	return cmd
 }
 
-// encodeDoctorReportWithSweep renders the doctor report as JSON with the
-// retired-key sweep outcome merged in, keeping the report's own fields at
-// the top level so existing JSON consumers keep parsing.
-func encodeDoctorReportWithSweep(out io.Writer, report installer.DoctorReport, sweep daemonRuntime.RetiredKeySweepSummary) error {
-	raw, err := json.Marshal(report)
-	if err != nil {
-		return fmt.Errorf("encode doctor report: %w", err)
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return fmt.Errorf("encode doctor report: %w", err)
-	}
-	doc["retiredKeySweep"] = map[string]any{
-		"filesChecked": len(sweep.Files),
-		"filesCleaned": sweep.FilesCleaned(),
-		"keysRemoved":  sweep.KeysRemoved(),
-		"summary":      sweep.Line(),
-	}
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	return enc.Encode(doc)
-}
-
 // workareaDoctorLine renders the workarea store diagnosis as a one-line
 // human summary for `host doctor`.
 func workareaDoctorLine(diagnosis workarea.StoreDiagnosis) string {

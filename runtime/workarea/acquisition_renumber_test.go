@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -187,28 +188,24 @@ func TestAcquisitionDiagnoseAndRepairRenumber(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backups := 0
+	storeBackups := 0
 	for _, entry := range entries {
-		name := entry.Name()
-		if len(name) > 7 && (name[:6] == "store." || name[:7] == ".anchor" || len(name) >= 6 && name[len(name)-6:] != ".obt") {
-			// Count any backup file the repair kept beside the identity files.
-			if len(name) > len(acquisitionStoreIdentityName) && name[:6] == "store." {
-				backups++
-			}
+		if strings.HasPrefix(entry.Name(), acquisitionStoreIdentityName+".backup-") {
+			storeBackups++
 		}
 	}
 	anchorEntries, err := os.ReadDir(parent)
 	if err != nil {
 		t.Fatal(err)
 	}
+	anchorBackups := 0
 	for _, entry := range anchorEntries {
-		name := entry.Name()
-		if len(name) > len(acquisitionStoreAnchorName) && name[:len(acquisitionStoreAnchorName)] == acquisitionStoreAnchorName {
-			backups++
+		if strings.HasPrefix(entry.Name(), acquisitionStoreAnchorName+".backup-") {
+			anchorBackups++
 		}
 	}
-	if backups < 2 {
-		t.Fatalf("repair kept %d backups, want at least 2 (store + anchor)", backups)
+	if storeBackups < 1 || anchorBackups < 1 {
+		t.Fatalf("repair kept %d store backups and %d anchor backups, want at least 1 each", storeBackups, anchorBackups)
 	}
 }
 
