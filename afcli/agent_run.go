@@ -227,11 +227,21 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a
-// daemon-spawned agent session. Three answers, in precedence order:
+// daemon-spawned agent session. Four answers, in precedence order:
 //
 //   - Interactive sessions are human-driven and may remain attached beyond any
 //     budget the dispatcher sized, so a negative duration disables the
-//     runner-side cap entirely. Unchanged.
+//     runner-side cap entirely. Unchanged: interactive + explicit unlimited
+//     still runs with no outer timer.
+//   - A dispatched (non-interactive) stage budget carrying exactly
+//     prompt.UnlimitedStageDurationSeconds (-1) is the sole explicit
+//     unlimited duration: the stage carries no duration cap of its own, so
+//     the runner-side wall-clock falls back to
+//     runner.MaxSessionDurationCeiling — the dispatched-input safety ceiling,
+//     not "no timer". Every other enforcement dimension
+//     (token, sub-agent, cost, idle, cancellation, operator-stop, and the
+//     parent-context bound) stays armed — only the stage-duration cap is
+//     lifted, and the outer 24 h ceiling still bounds the session.
 //   - A dispatched stage budget carrying a positive maxDurationSeconds IS the
 //     session's maximum duration. The platform sized the stage; the runner's
 //     two-hour default must not silently truncate it. It would: the value
@@ -243,7 +253,10 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 //     as a timeout.
 //   - Everything else leaves the option at zero and retains
 //     runner.DefaultMaxSessionDuration — the fallback for work dispatched with
-//     no duration of its own.
+//     no duration of its own. That includes durations below -1: they are
+//     malformed and refused upstream by runner.ReconcileStageBudget before a
+//     runner is ever built, so this derivation stays bounded (fail closed)
+//     rather than mapping an invalid value to an unbounded session.
 //
 // The dispatched value is clamped to runner.MaxSessionDurationCeiling. It
 // arrives over the wire, and the comparison is made in SECONDS on purpose: a
@@ -259,7 +272,17 @@ func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
 		return -1
 	}
 	budget := detail.StageBudget
-	if budget == nil || budget.MaxDurationSeconds <= 0 {
+	if budget == nil {
+		return 0
+	}
+	if budget.MaxDurationSeconds == prompt.UnlimitedStageDurationSeconds {
+		// Dispatched unlimited means "no stage cap", not "no outer timer":
+		// the session still runs under the dispatched-input safety ceiling
+		// so a wedged session frees its host slot within a day. Only
+		// interactive sessions (handled above) run without an outer timer.
+		return runner.MaxSessionDurationCeiling
+	}
+	if budget.MaxDurationSeconds <= 0 {
 		return 0
 	}
 	return runner.BudgetDuration(budget.MaxDurationSeconds)

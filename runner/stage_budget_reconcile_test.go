@@ -82,6 +82,89 @@ func TestReconcileStageBudgetPreservesOperationalAuthority(t *testing.T) {
 	}
 }
 
+func TestReconcileStageBudgetExplicitUnlimitedDuration(t *testing.T) {
+	unlimited := prompt.StageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds}
+	finite := prompt.StageBudget{MaxDurationSeconds: 1800}
+	belowUnlimited := prompt.StageBudget{MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds - 1}
+
+	t.Run("legacy adopts explicit unlimited duration", func(t *testing.T) {
+		siblingJSON, err := json.Marshal(unlimited)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ReconcileStageBudget(QueuedWork{}, siblingJSON)
+		if err != nil {
+			t.Fatalf("ReconcileStageBudget: %v", err)
+		}
+		if got.StageBudget == nil || !stageBudgetsEqual(got.StageBudget, &unlimited) {
+			t.Fatalf("legacy StageBudget = %+v, want %+v", got.StageBudget, unlimited)
+		}
+	})
+
+	t.Run("receipt matching unlimited duration preserves admitted value", func(t *testing.T) {
+		admitted := unlimited
+		qw := QueuedWork{OperationalPayload: json.RawMessage(`{}`)}
+		qw.StageBudget = &admitted
+		admittedPointer := qw.StageBudget
+		siblingJSON, err := json.Marshal(unlimited)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ReconcileStageBudget(qw, siblingJSON)
+		if err != nil {
+			t.Fatalf("ReconcileStageBudget: %v", err)
+		}
+		if got.StageBudget != admittedPointer {
+			t.Fatalf("receipt-bearing reconciliation replaced admitted pointer: got=%p want=%p", got.StageBudget, admittedPointer)
+		}
+	})
+
+	tests := []struct {
+		name           string
+		hasOperational bool
+		admitted       *prompt.StageBudget
+		sibling        *prompt.StageBudget
+	}{
+		{name: "legacy sibling below unlimited refuses", sibling: &belowUnlimited},
+		{name: "receipt sibling below unlimited refuses", hasOperational: true, admitted: &unlimited, sibling: &belowUnlimited},
+		{name: "receipt admitted below unlimited refuses with absent sibling", hasOperational: true, admitted: &belowUnlimited},
+		{name: "receipt admitted below unlimited refuses with matching sibling", hasOperational: true, admitted: &belowUnlimited, sibling: &belowUnlimited},
+		{name: "receipt unlimited admitted against finite sibling refuses", hasOperational: true, admitted: &unlimited, sibling: &finite},
+		{name: "receipt finite admitted against unlimited sibling refuses", hasOperational: true, admitted: &finite, sibling: &unlimited},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			qw := QueuedWork{}
+			if tt.hasOperational {
+				qw.OperationalPayload = json.RawMessage(`{}`)
+			}
+			if tt.admitted != nil {
+				admittedBudget := *tt.admitted
+				qw.StageBudget = &admittedBudget
+			}
+			var siblingJSON json.RawMessage
+			if tt.sibling != nil {
+				var err error
+				siblingJSON, err = json.Marshal(tt.sibling)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := ReconcileStageBudget(qw, siblingJSON)
+			if err == nil {
+				t.Fatalf("ReconcileStageBudget accepted %q, want refusal", tt.name)
+			}
+			if strings.Contains(err.Error(), "below the unlimited sentinel") {
+				return
+			}
+			if !strings.Contains(err.Error(), "stage budget compatibility mirror differs from operational payload") {
+				t.Fatalf("ReconcileStageBudget error = %v, want sentinel or mirror-mismatch refusal", err)
+			}
+		})
+	}
+}
+
 func TestPreflightAndSpawnAgreeForAutonomousStageDispatchWithMatchingSiblingBudget(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -96,6 +179,12 @@ func TestPreflightAndSpawnAgreeForAutonomousStageDispatchWithMatchingSiblingBudg
 				MaxDurationSeconds: 1800,
 				MaxSubAgents:       subAgentCap(3),
 				MaxTokens:          24_000,
+			},
+		},
+		{
+			name: "unlimited duration only",
+			budget: prompt.StageBudget{
+				MaxDurationSeconds: prompt.UnlimitedStageDurationSeconds,
 			},
 		},
 		{name: "explicit zero budget"},

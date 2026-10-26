@@ -10,6 +10,28 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.91 — 2026-10-26
+
+### Chores
+
+- Claude sessions report compactions, re-inject launch context, disable host-local auto memory
+- Add explicit unlimited stage duration contract (-1 lifts stage cap under the safety ceiling)
+- Backstop: 261c3950-c73c-4f3a-8bf9-cfa7bc9f9790
+- Pin preflight registration requests to accepted contract version
+- Add typed Agent Card discovery failure
+- Recover stale snapshots without blocking claims
+- Record explicit-base launch SHA through runner to status
+- Consume typed pre-execution refusal evidence fail closed
+
+## v0.72.90 — 2026-10-25
+
+### Chores
+
+- Define and strictly validate the versioned inference-usage atom on llm_call
+- Define and generate the evidence-backed harness capability matrix v2
+- Publish Claude interactive statusline USD as live cost-only usage
+- Compile authority-bound native code-intelligence realization facts
+
 ## v0.72.89 — 2026-10-24
 
 ### Chores

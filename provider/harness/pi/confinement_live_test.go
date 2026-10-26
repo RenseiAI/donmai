@@ -84,6 +84,9 @@ echo "gocache=$GOCACHE" >> "$r"
 echo "gopath=$GOPATH" >> "$r"
 echo "pnpm_store=$PNPM_CONFIG_STORE_DIR" >> "$r"
 echo "xdg_runtime=$XDG_RUNTIME_DIR" >> "$r"
+if [ -n "$PROBE_RO_SEED" ]; then
+	(cat "$PROBE_RO_SEED" > /dev/null) 2>>"$r"; echo "read_ro=$?" >> "$r"
+fi
 if [ -n "$PROBE_READ_OUTSIDE" ]; then
 	(cat "$PROBE_READ_OUTSIDE" > /dev/null) 2>>"$r"; echo "read_outside=$?" >> "$r"
 	(ls "$PROBE_OUTSIDE" > /dev/null) 2>>"$r"; echo "list_outside=$?" >> "$r"
@@ -190,7 +193,8 @@ func (w liveWorld) spec() agent.Spec {
 }
 
 // authority is a declared repository authority over the world: the mutable
-// leaf writable, the sibling read-only.
+// leaf writable, the sibling read-only, with the isolated-read-only-v1
+// enforcement the attested manifest must declare for admission.
 func (w liveWorld) authority() *agent.RepositoryAuthorityPolicy {
 	return &agent.RepositoryAuthorityPolicy{
 		Protocol:      "session-root-v1",
@@ -198,6 +202,7 @@ func (w liveWorld) authority() *agent.RepositoryAuthorityPolicy {
 		SelectedPath:  w.mut,
 		MutablePaths:  []string{w.mut},
 		ReadOnlyPaths: []string{w.ro},
+		Enforcement:   "isolated-read-only-v1",
 	}
 }
 
@@ -476,29 +481,28 @@ func TestPiConfinement_InteractiveSpawnRefusesForbiddenWrites(t *testing.T) {
 	assertUnconfined(t, w)
 }
 
-// TestPiConfinement_AuthorityRequestConfinesThroughLaunch covers the other
-// gate input: a declared repository authority requests confinement, and the
-// per-session confinement record names its read-only leaves. pi's manifest
-// declares no multi-repository workarea protocol yet, so admission refuses
-// such a spec at Spawn (asserted first); the test therefore enters at
-// launch, the shared post-admission entry of Spawn and Resume, with the gate
-// still evaluated on the spec. When the manifest gains a protocol, the
-// admission assertion fails and this test should move to Spawn.
-func TestPiConfinement_AuthorityRequestConfinesThroughLaunch(t *testing.T) {
+// TestPiConfinement_AuthorityAdmittedThroughSpawnReadsAndRefusesReadOnly
+// covers the authority gate input through the public entry point: an
+// attested host admits a declared repository authority at Provider.Spawn,
+// the confined seat reads the seeded read-only leaf, writes the mutable
+// leaf, and is refused a read-only write. The per-session confinement
+// record names the read-only leaf. Mutant RED: removing the manifest
+// workarea fields or dropping ReadOnlyLeaves from seatSpec refuses at
+// admission or lets the read-only write land.
+func TestPiConfinement_AuthorityAdmittedThroughSpawnReadsAndRefusesReadOnly(t *testing.T) {
 	w := newLiveWorld(t)
-	bin := writeLiveHarness(t, w)
+	seedPath := filepath.Join(w.ro, "seed.txt")
+	seedBody := "sibling-context\n"
+	mustWrite(t, seedPath, seedBody)
+	bin := writeLiveHarness(t, w, "PROBE_RO_SEED='"+seedPath+"'")
 	spec := w.spec()
+	spec.SandboxLevel = agent.SandboxWorkspaceWrite
 	spec.RepositoryAuthority = w.authority()
-	p := liveProvider(t, bin, false)
+	p := liveProvider(t, bin, true)
 
-	if h, err := p.Spawn(liveCtx(t), spec); err == nil {
-		_ = h.Stop(context.Background())
-		t.Fatalf("Spawn admitted a repository authority for pi; drive this test through Spawn now")
-	}
-
-	h, err := p.launch(liveCtx(t), spec, launchPrompt, "")
+	h, err := p.Spawn(liveCtx(t), spec)
 	if err != nil {
-		t.Fatalf("launch: %v", err)
+		t.Fatalf("attested Spawn with authority: %v", err)
 	}
 	plan := h.(*Handle).confinement
 	finishHeadless(t, h)
@@ -515,6 +519,13 @@ func TestPiConfinement_AuthorityRequestConfinesThroughLaunch(t *testing.T) {
 		}
 	}
 	assertConfined(t, w)
+	r := readProbeReport(t, w)
+	if r.vals["read_ro"] != "0" {
+		t.Errorf("confined: the read of the seeded read-only leaf failed (status %q):\n%s", r.vals["read_ro"], r.raw)
+	}
+	if got, err := os.ReadFile(seedPath); err != nil || string(got) != seedBody {
+		t.Errorf("confined: the seeded read-only leaf changed under the run (err %v, body %q)", err, got)
+	}
 }
 
 // TestPiConfinement_InlineRequiredExtensionStartsConfined pins the

@@ -156,8 +156,9 @@ func TestSpawnInteractive_ActivityTelemetryReachesEvents(t *testing.T) {
 	if !ok {
 		t.Fatalf("settings carry no hooks map: %v", settings)
 	}
-	// Four moments beside the notice Stop entry.
-	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PermissionRequest"} {
+	// Four moments beside the notice Stop entry; SessionStart adds the
+	// compact-source marker group to the telemetry group.
+	for _, event := range []string{"UserPromptSubmit", "PermissionRequest"} {
 		raw, present := hooks[event]
 		if !present {
 			t.Fatalf("%s missing from --settings hooks %v", event, hooks)
@@ -165,6 +166,11 @@ func TestSpawnInteractive_ActivityTelemetryReachesEvents(t *testing.T) {
 		if groups, ok := raw.([]any); !ok || len(groups) != 1 {
 			t.Fatalf("%s is not one matcher group: %v", event, raw)
 		}
+	}
+	if raw, present := hooks["SessionStart"]; !present {
+		t.Fatalf("SessionStart missing from --settings hooks %v", hooks)
+	} else if groups, ok := raw.([]any); !ok || len(groups) != 2 {
+		t.Fatalf("SessionStart is not two matcher groups (telemetry + compact): %v", raw)
 	}
 	stopRaw, present := hooks["Stop"]
 	if !present {

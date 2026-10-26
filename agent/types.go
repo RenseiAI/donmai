@@ -741,6 +741,14 @@ type Result struct {
 	// CommitSHA is the head commit sha of the work branch when known.
 	CommitSHA string `json:"commitSha,omitempty"`
 
+	// BaseSHA is the provision-time commit the session workarea was created
+	// from: the exact tip selected by the explicit BaseRef at launch. It is
+	// the branch point, not the terminal head — the agent may have committed
+	// by the time CommitSHA is captured. Empty when no explicit-base receipt
+	// was produced (repository-free work or a launch without BaseRef); omitted
+	// for mixed-version compatibility. Old platforms ignore it.
+	BaseSHA string `json:"baseSha,omitempty"`
+
 	// Summary is a short human-readable summary of the work done.
 	Summary string `json:"summary,omitempty"`
 

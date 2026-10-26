@@ -879,6 +879,23 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 					return "", resolveErr
 				}
 				res.BaseSHA = strings.TrimSpace(string(out))
+			} else if declaration == nil && spec.Strategy == StrategyClone && spec.BaseRef != "" {
+				// Single-repository clone with an explicit base: the clone
+				// already checked out the base branch (verified when
+				// RequireBranchBase), so its initial HEAD is the
+				// provision-time branch point. Record it without a fetch;
+				// worktree-add (Fetched) and empty/repository-free (no
+				// BaseRef) semantics are unchanged.
+				res.BaseRef = spec.BaseRef
+				out, headErr := m.runGit(ctx, "", "-C", res.Path, "rev-parse", "HEAD")
+				if headErr != nil {
+					resolveErr := fmt.Errorf("%w %q: resolve created worktree tip: %w (%s)", ErrBaseFetch, spec.BaseRef, headErr, strings.TrimSpace(string(out)))
+					if cleanupErr := m.teardownResult(ctx, *res); cleanupErr != nil {
+						return "", fmt.Errorf("%w; cleanup worktree: %w", resolveErr, cleanupErr)
+					}
+					return "", resolveErr
+				}
+				res.BaseSHA = strings.TrimSpace(string(out))
 			}
 			m.mu.Lock()
 			m.sessions[spec.SessionID] = res

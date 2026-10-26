@@ -603,3 +603,198 @@ func makeBareRepo(t *testing.T) string {
 	}
 	return filepath.Join(bare, "repo.git")
 }
+
+// committingBaseProvider wraps the stub harness and commits one file before
+// delegating to the stub, so the terminal HEAD differs from the launch base.
+type committingBaseProvider struct {
+	agent.HarnessProvider
+	t *testing.T
+}
+
+func (p *committingBaseProvider) Manifest() agent.HarnessManifest {
+	return p.HarnessProvider.Manifest()
+}
+
+func (p *committingBaseProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.t.Helper()
+	if err := os.WriteFile(filepath.Join(spec.Cwd, "agent-work.txt"), []byte("agent work\n"), 0o600); err != nil {
+		return nil, err
+	}
+	if _, err := runGit(ctx, spec.Cwd, gitIdentity{Name: "Agent", Email: "agent@example.test"}, "add", "agent-work.txt"); err != nil {
+		return nil, err
+	}
+	if _, err := runGit(ctx, spec.Cwd, gitIdentity{Name: "Agent", Email: "agent@example.test"}, "commit", "-m", "agent work"); err != nil {
+		return nil, err
+	}
+	return p.HarnessProvider.Spawn(ctx, spec)
+}
+
+// TestRun_ExplicitBaseCarriesProvisionTimeSHA proves the end-to-end receipt:
+// an explicit-base run returns the provision-time SHA in Result.BaseSHA and
+// posts the same value as baseSha on /status, while CommitSHA is the
+// terminal work-branch head.
+func TestRun_ExplicitBaseCarriesProvisionTimeSHA(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	var mu sync.Mutex
+	var statusBodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			var decoded map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&decoded); err == nil {
+				mu.Lock()
+				statusBodies = append(statusBodies, decoded)
+				mu.Unlock()
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	bareRepo := makeBareRepo(t)
+	// Launch tip: the bare main tip the clone will check out.
+	//nolint:gosec // G204: test fixture, bareRepo comes from t.TempDir.
+	mainTipOut, err := exec.Command("git", "--git-dir", bareRepo, "rev-parse", "refs/heads/main").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse bare main: %v: %s", err, mainTipOut)
+	}
+	mainTip := strings.TrimSpace(string(mainTipOut))
+	wtParent := t.TempDir()
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker-1", AuthToken: "tok", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	reg, err := NewRegistryWithOptions(RegistryOptions{RuntimeTransportMode: RuntimeTransportLocalV2})
+	if err != nil {
+		t.Fatalf("NewRegistryWithOptions: %v", err)
+	}
+	inner, _ := stub.New()
+	if err := reg.Register(&committingBaseProvider{HarnessProvider: inner.(agent.HarnessProvider), t: t}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{Registry: reg, WorktreeManager: wtm, Poster: poster, HTTPClient: srv.Client(), SkipBackstop: true, SkipSteering: true, SkipPostSession: true, PreserveWorktreeAlways: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BASE-SHA"), WorkerID: "worker-1", AuthToken: "", PlatformURL: srv.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub}}
+	qw.Repository = bareRepo
+	qw.BaseRef = "main"
+	qw.Branch = "work/session"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v (%+v)", err, res)
+	}
+	if res.BaseSHA != mainTip {
+		t.Fatalf("BaseSHA = %q, want launch tip %q", res.BaseSHA, mainTip)
+	}
+	if res.CommitSHA == "" || res.CommitSHA == res.BaseSHA {
+		t.Fatalf("CommitSHA = %q, want terminal head distinct from base %q", res.CommitSHA, res.BaseSHA)
+	}
+	headOut, err := runGit(context.Background(), res.WorktreePath, gitIdentity{}, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse worktree HEAD: %v", err)
+	}
+	if strings.TrimSpace(headOut) != res.CommitSHA {
+		t.Fatalf("CommitSHA = %q, want worktree HEAD %q", res.CommitSHA, strings.TrimSpace(headOut))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, body := range statusBodies {
+		if v, ok := body["baseSha"]; ok && v == res.BaseSHA {
+			found = true
+		}
+		if _, ok := body["baseSha"]; ok {
+			if body["baseSha"] != res.BaseSHA {
+				t.Fatalf("status baseSha = %v, want %q", body["baseSha"], res.BaseSHA)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no /status body carried baseSha %q (bodies %v)", res.BaseSHA, statusBodies)
+	}
+}
+
+// TestRun_OmitsBaseSHAWithoutExplicitBase pins the wire stays unchanged for
+// repository-free work and for repository work without BaseRef.
+func TestRun_OmitsBaseSHAWithoutExplicitBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	for _, tc := range []struct {
+		name string
+		free bool
+	}{
+		{name: "repository-free", free: true},
+		{name: "repository without base", free: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var statusBodies []map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					var decoded map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&decoded); err == nil {
+						mu.Lock()
+						statusBodies = append(statusBodies, decoded)
+						mu.Unlock()
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+			}))
+			t.Cleanup(srv.Close)
+			bareRepo := makeBareRepo(t)
+			wtParent := t.TempDir()
+			wtm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+			if err != nil {
+				t.Fatalf("worktree.NewManager: %v", err)
+			}
+			poster, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "worker-1", AuthToken: "tok", HTTPClient: srv.Client(), BaseDelay: 0})
+			if err != nil {
+				t.Fatalf("result.NewPoster: %v", err)
+			}
+			reg := NewRegistry()
+			p, _ := stub.New()
+			if err := reg.Register(p); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			r, err := New(Options{Registry: reg, WorktreeManager: wtm, Poster: poster, HTTPClient: srv.Client(), SkipBackstop: true, SkipSteering: true, SkipPostSession: true, PreserveWorktreeAlways: true})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			qw := QueuedWork{QueuedWork: queuedWorkBase("OMIT-" + tc.name), WorkerID: "worker-1", AuthToken: "tok", PlatformURL: srv.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub}}
+			if tc.free {
+				qw.Repository = ""
+			} else {
+				qw.Repository = bareRepo
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := r.Run(ctx, qw)
+			if err != nil {
+				t.Fatalf("Run: %v (%+v)", err, res)
+			}
+			if res.BaseSHA != "" {
+				t.Fatalf("BaseSHA = %q, want empty", res.BaseSHA)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, body := range statusBodies {
+				if _, ok := body["baseSha"]; ok {
+					t.Fatalf("status body carries baseSha without explicit base: %v", body)
+				}
+			}
+			if len(statusBodies) == 0 {
+				t.Fatal("no /status body posted")
+			}
+		})
+	}
+}

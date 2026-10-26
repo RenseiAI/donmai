@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/codeintelbridge"
+	"github.com/RenseiAI/donmai/internal/codeintelcontract"
 )
 
 var windowsPathPrefix = regexp.MustCompile(`^[A-Za-z]:`)
@@ -192,4 +194,79 @@ func (b *codeIntelParameterBinder) Bind(context CapabilityParameterBindingContex
 		}
 	}
 	return result, nil
+}
+
+// nativeCodeIntelRecipeID names the inert native declaration shape only.
+const nativeCodeIntelRecipeID = "donmai/code-intelligence-native/v1"
+
+// NewNativeCodeIntelRealizationInput builds the authority-bound native recipe
+// input for one capability, harness, adapter, and mode from the six native
+// descriptors and the subset contract; it fixes no downstream requirement.
+func NewNativeCodeIntelRealizationInput(capabilityID string, harness agent.HarnessName, adapterVersion string, mode agent.PromptSessionMode, binderSourceDigest string) (agent.CapabilityRealizationInput, error) {
+	if !agent.ValidCapabilityParameterContractID(capabilityID) || harness == "" || adapterVersion == "" || mode == "" || !validLowerHexDigest(binderSourceDigest) {
+		return agent.CapabilityRealizationInput{}, fmt.Errorf("code-intelligence native recipe identity is malformed")
+	}
+	delivery := codeintelbridge.Delivery()
+	entryID, err := agent.AdditionalExtensionCapabilityEntryID(delivery.ID)
+	if err != nil {
+		return agent.CapabilityRealizationInput{}, err
+	}
+	descriptors := codeintelcontract.Descriptors()
+	surface := make([]agent.CapabilitySurfaceIdentity, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		surface = append(surface, agent.CapabilitySurfaceIdentity{Kind: agent.CapabilitySurfaceNativeTool, ID: descriptor.Name})
+	}
+	inputDigest := agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{delivery})
+	contract := &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: codeintelbridge.ParameterContractID, BinderSourceDigest: binderSourceDigest, SurfaceProjection: "subset", RuntimeObservation: "none"}
+	return agent.CapabilityRealizationInput{CapabilityID: capabilityID, HarnessID: harness, AdapterVersion: adapterVersion, Mode: mode, RecipeID: nativeCodeIntelRecipeID, Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID, Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract}, nil
+}
+
+// CompileNativeCodeIntelFacts binds the runner-owned absolute root to the
+// validated binding's canonical subtree and ordered tools, verifying contract,
+// binding/materialization identity, and surface/config agreement.
+func CompileNativeCodeIntelFacts(worktreeRoot string, resolved ResolvedCapabilityParameterBinding) (codeintelbridge.NativeFactsV1, string, error) {
+	if !filepath.IsAbs(worktreeRoot) || filepath.Clean(worktreeRoot) != worktreeRoot {
+		return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native root is not a clean absolute path")
+	}
+	if resolved.Realization.ParameterContract == nil || resolved.Realization.ParameterContract.ID != codeintelbridge.ParameterContractID {
+		return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native contract is foreign")
+	}
+	binding := resolved.Realization.ParameterBinding
+	if binding == nil {
+		return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native binding is missing")
+	}
+	materialization := resolved.Materialization
+	if materialization.ContractVersion != agent.CapabilityRuntimeMaterializationContractVersionV1 || materialization.CapabilityID != binding.CapabilityID || materialization.ParameterContractID != binding.ParameterContractID || materialization.BindingDigest != binding.BindingDigest || materialization.ConfigDigest != binding.RuntimeConfigDigest || binding.CapabilityID != resolved.Realization.CapabilityID {
+		return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native binding identity differs")
+	}
+	config, configDigest, err := codeintelbridge.DecodeRuntimeConfig(materialization.Config)
+	if err != nil || configDigest != binding.RuntimeConfigDigest || configDigest != materialization.ConfigDigest {
+		return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native config differs")
+	}
+	selectedDigest, err := agent.CapabilitySelectedSurfaceDigest(binding.SelectedSurface)
+	if err != nil || selectedDigest != binding.SelectedSurfaceDigest {
+		return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native surface differs")
+	}
+	selected := make([]string, 0, len(binding.SelectedSurface))
+	for _, identity := range binding.SelectedSurface {
+		if identity.Kind == agent.CapabilitySurfaceMCPTool || identity.Kind == agent.CapabilitySurfaceNativeTool {
+			selected = append(selected, identity.ID)
+		}
+	}
+	sort.Strings(selected)
+	if strings.Join(selected, "\x00") != strings.Join(config.Tools, "\x00") {
+		return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native surface and config differ")
+	}
+	for _, tool := range config.Tools {
+		match, matchErr := codeintelcontract.NormalizePolicyIdentity(tool)
+		if matchErr != nil || !match.Related || match.Canonical != tool {
+			return codeintelbridge.NativeFactsV1{}, "", fmt.Errorf("code-intelligence native tool is not admitted")
+		}
+	}
+	facts := codeintelbridge.NativeFactsV1{ContractVersion: codeintelbridge.NativeFactsVersion, Root: worktreeRoot, RepoPath: config.RepoPath, Tools: append([]string(nil), config.Tools...)}
+	_, digest, err := codeintelbridge.CanonicalNativeFacts(facts)
+	if err != nil {
+		return codeintelbridge.NativeFactsV1{}, "", err
+	}
+	return facts, digest, nil
 }
