@@ -214,9 +214,16 @@ type Model struct {
 	actionCtx context.Context
 	// drainTimeoutSecs is the explicit drain deadline in seconds.
 	drainTimeoutSecs int
-	// confirmStopID is the session id awaiting stop confirmation (""
-	// when idle). The stop key sets it; y confirms, n/esc or a
-	// selection change returns to idle with no request.
+	// confirmKind is the lifecycle action awaiting confirmation (""
+	// when idle): "stop" for a per-session stop, "drain" for a host
+	// drain. The stop key sets "stop" with confirmStopID; the drain key
+	// sets "drain". y confirms with one request; n/esc or a selection
+	// change returns to idle with no request. Draining stops every
+	// session still running past the explicit deadline, so it shares
+	// the gate instead of firing on one keypress.
+	confirmKind string
+	// confirmStopID is the session id awaiting stop confirmation
+	// (valid only when confirmKind == "stop").
 	confirmStopID string
 	// actionBusy is true from an accepted action's dispatch until its
 	// result returns; duplicate action keys are ignored meanwhile.
@@ -379,31 +386,35 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
-	// A stop confirmation is pending: y confirms the still-selected id
-	// with one request; n/esc or a selection change returns to idle
-	// with no request. Quit still quits.
-	if m.confirmStopID != "" {
+	// A lifecycle confirmation is pending: y confirms with one request;
+	// n/esc or a selection change returns to idle with no request. Any
+	// other key is swallowed with the gate still armed. Quit still quits.
+	if m.confirmKind != "" {
 		switch key {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "y":
+			kind := m.confirmKind
 			id := m.confirmStopID
-			m.confirmStopID = ""
+			m.confirmKind, m.confirmStopID = "", ""
+			if kind == "drain" {
+				return m, m.startDrain()
+			}
 			if m.selectedCardID() != id {
 				return m, nil // selection moved: idle, no request
 			}
 			return m, m.startStopSession(id)
 		case "n", "esc":
-			m.confirmStopID = ""
+			m.confirmKind, m.confirmStopID = "", ""
 			return m, nil
 		case "up", "k":
-			m.confirmStopID = "" // selection change: idle, no request
+			m.confirmKind, m.confirmStopID = "", "" // selection change: idle, no request
 			if m.cursor > 0 {
 				m.cursor--
 			}
 			return m, nil
 		case "down", "j":
-			m.confirmStopID = "" // selection change: idle, no request
+			m.confirmKind, m.confirmStopID = "", "" // selection change: idle, no request
 			if m.cursor < len(m.cards)-1 {
 				m.cursor++
 			}
@@ -444,7 +455,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		return m, m.startResume()
 	case "d":
-		return m, m.startDrain()
+		return m, m.requestDrainConfirm()
 	}
 	return m, nil
 }
@@ -465,8 +476,21 @@ func (m *Model) requestStopConfirm() tea.Cmd {
 		return nil
 	}
 	if id := m.selectedCardID(); id != "" {
+		m.confirmKind = "stop"
 		m.confirmStopID = id
 	}
+	return nil
+}
+
+// requestDrainConfirm enters the drain gate. It sends no request;
+// confirmation arrives on a later key. The prompt names the effect:
+// sessions still running past the explicit deadline are stopped.
+func (m *Model) requestDrainConfirm() tea.Cmd {
+	if m.actions == nil || m.actionBusy {
+		return nil
+	}
+	m.confirmKind = "drain"
+	m.confirmStopID = ""
 	return nil
 }
 
@@ -1302,8 +1326,14 @@ const helpText = "↑↓/jk select   enter detail   x stop   p pause   r resume 
 
 func (m *Model) renderHelp() string {
 	help := helpText
-	if m.confirmStopID != "" {
+	if m.confirmKind == "stop" {
 		help = "stop " + shortID(sanitizeHostActionText(m.confirmStopID)) + "? y confirm · n cancel"
+	} else if m.confirmKind == "drain" {
+		secs := m.drainTimeoutSecs
+		if secs <= 0 {
+			secs = DefaultDrainTimeoutSeconds
+		}
+		help = fmt.Sprintf("drain host (%ds): sessions still running are stopped? y confirm · n cancel", secs)
 	} else if m.notice != "" {
 		help = m.notice + "   " + helpText
 	}

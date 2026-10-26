@@ -210,6 +210,29 @@ func TestModel_StopRequiresExplicitConfirm(t *testing.T) {
 		}
 	})
 
+	t.Run("up cancels without a request", func(t *testing.T) {
+		acts := newFakeHostActions()
+		m := newActionTestModel(t, actionTestSessions("sess-a", "sess-b"), acts, 0)
+		if _, cmd := pressActionKey(m, "x"); cmd != nil {
+			t.Fatal("stop key must not dispatch")
+		}
+		// Cursor is already at the top: the key still moves nothing but
+		// must clear the gate. Without the up-clear, the y below would
+		// stop sess-a while nothing visibly changed.
+		if _, cmd := pressActionKey(m, "up"); cmd != nil {
+			t.Fatal("selection change must not dispatch")
+		}
+		if m.confirmKind != "" || m.confirmStopID != "" {
+			t.Fatalf("confirmKind = %q confirmStopID = %q after up, want idle", m.confirmKind, m.confirmStopID)
+		}
+		if _, cmd := pressActionKey(m, "y"); cmd != nil {
+			t.Fatal("idle y must not dispatch")
+		}
+		if _, _, _, stops := acts.counts(); len(stops) != 0 {
+			t.Fatalf("up then y sent %d requests, want 0", len(stops))
+		}
+	})
+
 	t.Run("selection change cancels without a request", func(t *testing.T) {
 		acts := newFakeHostActions()
 		m := newActionTestModel(t, actionTestSessions("sess-a", "sess-b"), acts, 0)
@@ -230,6 +253,60 @@ func TestModel_StopRequiresExplicitConfirm(t *testing.T) {
 		}
 		if _, _, _, stops := acts.counts(); len(stops) != 0 {
 			t.Fatalf("selection change sent %d requests, want 0", len(stops))
+		}
+	})
+
+	t.Run("snapshot removing the confirmed session cancels the confirm", func(t *testing.T) {
+		fd := actionTestSessions("sess-a", "sess-b")
+		acts := newFakeHostActions()
+		m := newActionTestModel(t, fd, acts, 0)
+		if _, cmd := pressActionKey(m, "x"); cmd != nil {
+			t.Fatal("stop key must not dispatch")
+		}
+		// The daemon reaps sess-a before the operator confirms: the
+		// cursor now selects sess-b, so y must send nothing. Without
+		// the still-selected re-check, y would stop the reaped id.
+		fd.sessions = fd.sessions[1:]
+		m.applySnapshot(m.src.Snapshot())
+		if m.selectedCardID() != "sess-b" {
+			t.Fatalf("selectedCardID = %q after reap, want sess-b", m.selectedCardID())
+		}
+		if _, cmd := pressActionKey(m, "y"); cmd != nil {
+			t.Fatal("y after the confirmed session vanished must not dispatch")
+		}
+		if m.confirmKind != "" {
+			t.Fatalf("confirmKind = %q after stale confirm, want idle", m.confirmKind)
+		}
+		if _, _, _, stops := acts.counts(); len(stops) != 0 {
+			t.Fatalf("stale confirm sent %d requests, want 0", len(stops))
+		}
+	})
+
+	t.Run("other lifecycle keys are swallowed with the gate still armed", func(t *testing.T) {
+		acts := newFakeHostActions()
+		m := newActionTestModel(t, actionTestSessions("sess-a", "sess-b"), acts, 0)
+		if _, cmd := pressActionKey(m, "x"); cmd != nil {
+			t.Fatal("stop key must not dispatch")
+		}
+		// p/r/d must neither dispatch nor resolve the gate: falling
+		// through would pause the host, resume admissions, or drain
+		// every session from inside a stop confirmation.
+		for _, key := range []string{"p", "r", "d"} {
+			if _, cmd := pressActionKey(m, key); cmd != nil {
+				t.Fatalf("%s during stop confirm must not dispatch", key)
+			}
+			if m.confirmKind != "stop" || m.confirmStopID != "sess-a" {
+				t.Fatalf("%s resolved the gate: confirmKind = %q confirmStopID = %q, want stop/sess-a", key, m.confirmKind, m.confirmStopID)
+			}
+		}
+		if pauses, resumes, drains, stops := acts.counts(); pauses != 0 || resumes != 0 || drains != 0 || len(stops) != 0 {
+			t.Fatalf("swallowed keys dispatched: pauses=%d resumes=%d drains=%d stops=%v", pauses, resumes, drains, stops)
+		}
+		// The still-armed gate confirms the original session.
+		_, cmd := pressActionKey(m, "y")
+		runActionCmd(t, m, cmd)
+		if _, _, _, stops := acts.counts(); len(stops) != 1 || stops[0] != "sess-a" {
+			t.Fatalf("confirm sent stops = %v, want exactly [sess-a]", stops)
 		}
 	})
 
@@ -368,6 +445,102 @@ func TestModel_PauseResumeChangeStateOnlyViaSnapshot(t *testing.T) {
 	}
 }
 
+// TestModel_DrainRequiresExplicitConfirm pins the host-scope gate: one d
+// keypress only arms confirmation with a prompt naming the effect
+// (sessions still running past the deadline are stopped); n/esc and a
+// selection change send zero requests; y sends exactly one
+// deadline-bound request. Dispatching the drain on d makes this RED.
+func TestModel_DrainRequiresExplicitConfirm(t *testing.T) {
+	t.Run("confirm sends exactly one deadline-bound request", func(t *testing.T) {
+		acts := newFakeHostActions()
+		m := newActionTestModel(t, actionTestSessions("sess-a", "sess-b"), acts, 0)
+
+		if _, cmd := pressActionKey(m, "d"); cmd != nil {
+			t.Fatal("drain key must arm confirmation without a request, got a command")
+		}
+		if m.confirmKind != "drain" {
+			t.Fatalf("confirmKind = %q, want drain", m.confirmKind)
+		}
+		if _, _, drains, _ := acts.counts(); drains != 0 {
+			t.Fatalf("armed confirmation sent %d requests, want 0", drains)
+		}
+		// The prompt names the effect: one keypress stops every session.
+		if help := m.renderHelp(); !strings.Contains(help, "drain host") || !strings.Contains(help, "stopped") {
+			t.Fatalf("drain prompt = %q, want the host effect named", help)
+		}
+
+		_, cmd := pressActionKey(m, "y")
+		runActionCmd(t, m, cmd)
+		calls, timeouts, hasDeadline, _ := acts.drainObservation()
+		if calls != 1 || len(timeouts) != 1 || timeouts[0] != DefaultDrainTimeoutSeconds {
+			t.Fatalf("confirm sent drains = %d timeouts = %v, want 1x[%d]", calls, timeouts, DefaultDrainTimeoutSeconds)
+		}
+		if !hasDeadline {
+			t.Fatal("confirmed drain context carries no deadline")
+		}
+		if m.confirmKind != "" {
+			t.Fatalf("confirmKind = %q after confirm, want idle", m.confirmKind)
+		}
+		if !strings.Contains(m.notice, "drained") {
+			t.Errorf("notice = %q, want the drain outcome", m.notice)
+		}
+	})
+
+	t.Run("cancel and selection change send no request", func(t *testing.T) {
+		for _, key := range []string{"n", "esc", "up", "down"} {
+			acts := newFakeHostActions()
+			m := newActionTestModel(t, actionTestSessions("sess-a", "sess-b"), acts, 0)
+			if _, cmd := pressActionKey(m, "d"); cmd != nil {
+				t.Fatalf("%s: drain key must not dispatch", key)
+			}
+			if _, cmd := pressActionKey(m, key); cmd != nil {
+				t.Fatalf("%s: must not dispatch", key)
+			}
+			if m.confirmKind != "" {
+				t.Fatalf("%s: confirmKind = %q, want idle", key, m.confirmKind)
+			}
+			if _, _, drains, _ := acts.counts(); drains != 0 {
+				t.Fatalf("%s: sent %d requests, want 0", key, drains)
+			}
+			// The gate is idle: a stray y dispatches nothing either.
+			if _, cmd := pressActionKey(m, "y"); cmd != nil {
+				t.Fatalf("%s: idle y must not dispatch", key)
+			}
+			if _, _, drains, _ := acts.counts(); drains != 0 {
+				t.Fatalf("%s: idle y sent %d requests, want 0", key, drains)
+			}
+		}
+	})
+
+	t.Run("other lifecycle keys are swallowed with the gate still armed", func(t *testing.T) {
+		acts := newFakeHostActions()
+		m := newActionTestModel(t, actionTestSessions("sess-a", "sess-b"), acts, 0)
+		if _, cmd := pressActionKey(m, "d"); cmd != nil {
+			t.Fatal("drain key must not dispatch")
+		}
+		// x/p/r must neither dispatch nor resolve the drain gate: a
+		// fall-through would stop a session or flip admissions from
+		// inside a host-drain confirmation.
+		for _, key := range []string{"x", "p", "r"} {
+			if _, cmd := pressActionKey(m, key); cmd != nil {
+				t.Fatalf("%s during drain confirm must not dispatch", key)
+			}
+			if m.confirmKind != "drain" {
+				t.Fatalf("%s resolved the gate: confirmKind = %q, want drain", key, m.confirmKind)
+			}
+		}
+		if pauses, resumes, drains, stops := acts.counts(); pauses != 0 || resumes != 0 || drains != 0 || len(stops) != 0 {
+			t.Fatalf("swallowed keys dispatched: pauses=%d resumes=%d drains=%d stops=%v", pauses, resumes, drains, stops)
+		}
+		// The still-armed gate confirms the drain.
+		_, cmd := pressActionKey(m, "y")
+		runActionCmd(t, m, cmd)
+		if _, _, drains, _ := acts.counts(); drains != 1 {
+			t.Fatalf("confirm sent drains = %d, want 1", drains)
+		}
+	})
+}
+
 // TestModel_DrainIsDeadlineBound pins the drain door: the explicit timeout
 // travels in the request and bounds the command context, and timeout or
 // refusal renders without success wording. Dropping deadline propagation
@@ -377,7 +550,10 @@ func TestModel_DrainIsDeadlineBound(t *testing.T) {
 		for _, secs := range []int{0, 7} {
 			acts := newFakeHostActions()
 			m := newActionTestModel(t, actionTestSessions("sess-a"), acts, secs)
-			_, cmd := pressActionKey(m, "d")
+			if _, cmd := pressActionKey(m, "d"); cmd != nil {
+				t.Fatal("drain key must arm confirmation without a request")
+			}
+			_, cmd := pressActionKey(m, "y")
 			runActionCmd(t, m, cmd)
 			calls, timeouts, hasDeadline, remain := acts.drainObservation()
 			want := secs
@@ -415,7 +591,10 @@ func TestModel_DrainIsDeadlineBound(t *testing.T) {
 				acts := newFakeHostActions()
 				acts.drainErr, acts.drainOK, acts.drainMsg = tc.drainErr, tc.drainOK, tc.drainMsg
 				m := newActionTestModel(t, actionTestSessions("sess-a"), acts, 0)
-				_, cmd := pressActionKey(m, "d")
+				if _, cmd := pressActionKey(m, "d"); cmd != nil {
+					t.Fatal("drain key must arm confirmation without a request")
+				}
+				_, cmd := pressActionKey(m, "y")
 				runActionCmd(t, m, cmd)
 				if !strings.Contains(m.notice, tc.wantFragment) {
 					t.Errorf("notice = %q, want %q", m.notice, tc.wantFragment)
@@ -455,6 +634,11 @@ func TestModel_ActionErrorsAreBoundedAndSecretFree(t *testing.T) {
 			if tc.key == "y" {
 				if _, c := pressActionKey(m, "x"); c != nil {
 					t.Fatal("stop key must not dispatch")
+				}
+				_, cmd = pressActionKey(m, "y")
+			} else if tc.key == "d" {
+				if _, c := pressActionKey(m, "d"); c != nil {
+					t.Fatal("drain key must arm confirmation without a request")
 				}
 				_, cmd = pressActionKey(m, "y")
 			} else {
@@ -599,8 +783,12 @@ func TestModel_ProductionClientDispatchesActions(t *testing.T) {
 		t.Fatal("accepted stop must return a fresh index poll")
 	}
 
-	// Drain: the explicit deadline travels in the JSON body.
-	_, drainCmd := m.Update(actionKey("d"))
+	// Drain: the confirm gate arms on d, then the explicit deadline
+	// travels in the JSON body on y.
+	if _, cmd := m.Update(actionKey("d")); cmd != nil {
+		t.Fatal("drain key must arm confirmation without a request")
+	}
+	_, drainCmd := m.Update(actionKey("y"))
 	runActionCmd(t, m, drainCmd)
 
 	mu.Lock()

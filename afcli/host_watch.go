@@ -94,7 +94,9 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 			"(50/50 by default), 0 resets it, and the ratio survives terminal resizes;\n" +
 			"f pauses or resumes the stream, g jumps to its tail; x asks to stop the\n" +
 			"selected session (y confirms, n cancels), p pauses host admissions,\n" +
-			"r reopens them, d drains the host to an explicit deadline; q quits.\n" +
+			"r reopens them, d asks to drain the host to an explicit deadline\n" +
+			"(y confirms, n cancels): sessions still running past the deadline\n" +
+			"are stopped; q quits.\n" +
 			"Lifecycle keys send one authenticated request each and the next\n" +
 			"daemon snapshot owns what the dashboard shows.",
 		SilenceUsage: true,

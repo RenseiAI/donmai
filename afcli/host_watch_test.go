@@ -485,8 +485,12 @@ func TestHostWatchLifecycleWiringProduction(t *testing.T) {
 	}
 	model.Update(pauseFollow())
 
-	// Drain through the real key path: explicit deadline in the body.
-	_, drainCmd := model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	// Drain through the real key path: d arms the confirm gate, y sends
+	// one authenticated request with the explicit deadline in the body.
+	if _, cmd := model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"}); cmd != nil {
+		t.Fatal("wired drain key must arm confirmation without a request")
+	}
+	_, drainCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	if drainCmd == nil {
 		t.Fatal("wired drain key must dispatch")
 	}
