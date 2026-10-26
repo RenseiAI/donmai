@@ -194,6 +194,19 @@ type Options struct {
 	// PATH for its own daemon.
 	QuotaProbeBinaries map[string]string
 
+	// EnableSubscriptionWindowExhaustionRefusal arms the subscription-window
+	// exhaustion claim admission: the host-wide pre-claim gate consulted by
+	// claimSuspended and the per-item typed refusal in handlePollWorkItem.
+	// Off by default (the zero value): with the flag off the host behaves
+	// exactly as before the refusal existed — the quota snapshot never
+	// suspends claiming and an exhausted host-session item is admitted, so
+	// every existing deployment is byte-identical until its coordinator can
+	// consume the typed subscriptionWindowExhausted NACK member (older
+	// coordinators count claim-then-NACK round trips toward terminalization).
+	// Enable it only once the coordinator exempts the typed exhaustion NACK
+	// from that accounting and requeues at the carried reset instant.
+	EnableSubscriptionWindowExhaustionRefusal bool
+
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
 	// polls, verifies (Ed25519 + content hash), and caches to disk,
@@ -1136,14 +1149,23 @@ func (d *Daemon) claimSuspended() (bool, string) {
 		}
 	}
 	status := d.HostStatus()
-	if !status.SuspendsClaiming() {
-		return false, ""
+	if status.SuspendsClaiming() {
+		reason := "host status " + status.Status
+		if status.RecommendedAction != "" {
+			reason += ": " + status.RecommendedAction
+		}
+		return true, reason
 	}
-	reason := "host status " + status.Status
-	if status.RecommendedAction != "" {
-		reason += ": " + status.RecommendedAction
+	// A fresh, still-blocking subscription-window exhaustion stops the poll
+	// request before any claim is taken. Claiming then NACKing would hand
+	// the session back through the legacy NACK path older platforms count
+	// toward terminalization, losing the claim; declining before the request
+	// keeps in-flight sessions running and resumes automatically on reset
+	// or probe refresh.
+	if suspended, reason := d.quotaSuspendsClaiming(time.Now()); suspended {
+		return true, reason
 	}
-	return true, reason
+	return false, ""
 }
 
 // PollClaimGate is the per-tick new-work admission predicate consumed by
@@ -2918,6 +2940,15 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	projects := d.spawner.AllProjects()
 	spec := PollItemToSessionSpec(item, projects)
 
+	// Subscription-window exhaustion race fallback: the poll claim gate is
+	// the primary decline (it stops the request before any claim is taken).
+	// A snapshot that turned exhausted after the request left still refuses
+	// here, before reserve or spawn, through the existing rejection/NACK
+	// branch, the sole release call.
+	if quotaErr := d.quotaClaimAdmission(spec); quotaErr != nil {
+		return d.nackRejectedClaim(item, quotaErr, orchestratorURL)
+	}
+
 	// Advertise worker capabilities only when a provider is wired, so the nil
 	// case builds a byte-identical SessionDetail (no capability option).
 	opts := []SessionDetailOption{}
@@ -2975,35 +3006,39 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 		// (15min default) to reclaim. NACK is best-effort: failure to deliver
 		// it only adds latency; the original AcceptWork error is what the
 		// caller logs.
-		item := item
-		nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		nackErr := NackRejectedWork(
-			nackCtx,
-			nil, // default 10s-timeout client
-			orchestratorURL,
-			d.WorkerID(),
-			d.runtimeJWT(),
-			&item,
-			err,
-		)
-		if nackErr != nil {
-			slog.Warn(
-				"daemon poll: nack failed; orchestrator will reclaim via stale-claim sweep",
-				"sessionId", item.SessionID,
-				"acceptErr", err.Error(),
-				"nackErr", nackErr.Error(),
-			)
-		} else {
-			slog.Info(
-				"daemon poll: nacked rejected session",
-				"sessionId", item.SessionID,
-				"reason", err.Error(),
-			)
-		}
-		return fmt.Errorf("accept work %s: %w", item.SessionID, err)
+		return d.nackRejectedClaim(item, err, orchestratorURL)
 	}
 	return nil
+}
+
+// nackRejectedClaim releases a locally refused claim through the existing best-effort NACK.
+func (d *Daemon) nackRejectedClaim(item PollWorkItem, acceptErr error, orchestratorURL string) error {
+	nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	nackErr := NackRejectedWork(
+		nackCtx,
+		nil, // default 10s-timeout client
+		orchestratorURL,
+		d.WorkerID(),
+		d.runtimeJWT(),
+		&item,
+		acceptErr,
+	)
+	if nackErr != nil {
+		slog.Warn(
+			"daemon poll: nack failed; orchestrator will reclaim via stale-claim sweep",
+			"sessionId", item.SessionID,
+			"acceptErr", acceptErr.Error(),
+			"nackErr", nackErr.Error(),
+		)
+	} else {
+		slog.Info(
+			"daemon poll: nacked rejected session",
+			"sessionId", item.SessionID,
+			"reason", acceptErr.Error(),
+		)
+	}
+	return fmt.Errorf("accept work %s: %w", item.SessionID, acceptErr)
 }
 
 // executionSecurityRefusalReportTimeout bounds the terminal refusal report so

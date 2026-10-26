@@ -813,7 +813,7 @@ func (p *PollService) claimGateBlocks() bool {
 				reason,
 			)
 		} else {
-			p.opts.LogInfo("daemon poll: resuming new-work claims — host status is ok again")
+			p.opts.LogInfo("daemon poll: resuming new-work claims — suspension cleared")
 		}
 	}
 	return suspended
@@ -1063,7 +1063,8 @@ func callPollEndpoint(ctx context.Context, client *http.Client, orchestratorURL,
 // receiptPreflightReason is an additive, optional closed reason projection. It
 // is deliberately absent for every error except the canonical typed
 // HarnessAdmissionError with DenialFallbackNotAllowed; prose is never trusted
-// as authority.
+// as authority. A typed subscription-window exhaustion refusal additionally projects one closed
+// subscriptionWindowExhausted member, but only with the item's valid sibling claim-attempt proof.
 const receiptPreflightNackReasonContractVersion = "receipt-preflight-nack-reason/v1"
 
 type receiptPreflightNackReason struct {
@@ -1080,6 +1081,45 @@ func receiptPreflightNackReasonForError(err error) *receiptPreflightNackReason {
 		ContractVersion: receiptPreflightNackReasonContractVersion,
 		Code:            string(executioncell.DenialFallbackNotAllowed),
 	}
+}
+
+// subscriptionWindowExhaustedReport is the additive, closed quota-exhaustion
+// projection on the NACK wire. It is emitted only for the typed admission
+// refusal with a validated sibling claimAttempt; every other error omits it.
+type subscriptionWindowExhaustedReport struct {
+	ContractVersion string `json:"contractVersion"`
+	Code            string `json:"code"`
+	ResetAt         string `json:"resetAt"`
+}
+
+// subscriptionWindowExhaustedReportForError projects the typed quota-exhaustion
+// refusal onto its closed wire report. It matches only the usable typed
+// admission error; prose is never trusted, so a generic error with the same
+// text yields no report.
+func subscriptionWindowExhaustedReportForError(err error) *subscriptionWindowExhaustedReport {
+	var exhausted *subscriptionWindowExhaustedError
+	if !errors.As(err, &exhausted) || exhausted == nil || exhausted.resetAt == "" {
+		return nil
+	}
+	return &subscriptionWindowExhaustedReport{
+		ContractVersion: subscriptionWindowExhaustedContractVersion,
+		Code:            subscriptionWindowExhaustedCode,
+		ResetAt:         exhausted.resetAt,
+	}
+}
+
+// validQuotaExhaustedClaimAttempt validates the process-local claim-attempt
+// proof binding a typed quota-exhaustion report to the exact claimed session
+// and attempt. Only a well-formed proof matching this session authorizes the
+// additive typed member.
+func validQuotaExhaustedClaimAttempt(item *PollWorkItem) bool {
+	if item == nil || item.claimAttempt == nil {
+		return false
+	}
+	proof := item.claimAttempt
+	return proof.ContractVersion == workClaimAttemptContractVersion &&
+		proof.SessionID == item.SessionID &&
+		canonicalUUIDv4.MatchString(proof.AttemptToken)
 }
 
 // NackRejectedWork reports work that an embedder claimed but could not accept.
@@ -1105,6 +1145,10 @@ func NackRejectedWork(
 	if permanentDenial != nil && (!item.preSpawnPermanentDenialV1 || item.claimAttempt == nil) {
 		permanentDenial = nil
 	}
+	quotaExhausted := subscriptionWindowExhaustedReportForError(acceptErr)
+	if quotaExhausted != nil && !validQuotaExhaustedClaimAttempt(item) {
+		quotaExhausted = nil
+	}
 	reason := fmt.Sprintf("accept work failed: %v", acceptErr)
 	if permanentDenial != nil {
 		reason = preSpawnPermanentDenialReason
@@ -1118,6 +1162,7 @@ func NackRejectedWork(
 		runtimeJWT,
 		reason,
 		receiptPreflightNackReasonForError(acceptErr),
+		quotaExhausted,
 		permanentDenial,
 		item,
 	)
@@ -1136,6 +1181,7 @@ func callNackEndpoint(
 	client *http.Client,
 	orchestratorURL, sessionID, workerID, runtimeJWT, reason string,
 	receiptPreflightReason *receiptPreflightNackReason,
+	quotaExhausted *subscriptionWindowExhaustedReport,
 	permanentDenial *preSpawnPermanentDenialReport,
 	work *PollWorkItem,
 ) error {
@@ -1158,17 +1204,19 @@ func callNackEndpoint(
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	body := struct {
-		WorkerID                string                         `json:"workerId"`
-		Reason                  string                         `json:"reason,omitempty"`
-		ReceiptPreflightReason  *receiptPreflightNackReason    `json:"receiptPreflightReason,omitempty"`
-		ClaimAttempt            *workClaimAttemptProof         `json:"claimAttempt,omitempty"`
-		PreSpawnPermanentDenial *preSpawnPermanentDenialReport `json:"preSpawnPermanentDenial,omitempty"`
-		Work                    *PollWorkItem                  `json:"work"`
+		WorkerID                string                             `json:"workerId"`
+		Reason                  string                             `json:"reason,omitempty"`
+		ReceiptPreflightReason  *receiptPreflightNackReason        `json:"receiptPreflightReason,omitempty"`
+		ClaimAttempt            *workClaimAttemptProof             `json:"claimAttempt,omitempty"`
+		SubscriptionExhausted   *subscriptionWindowExhaustedReport `json:"subscriptionWindowExhausted,omitempty"`
+		PreSpawnPermanentDenial *preSpawnPermanentDenialReport     `json:"preSpawnPermanentDenial,omitempty"`
+		Work                    *PollWorkItem                      `json:"work"`
 	}{
 		WorkerID:                workerID,
 		Reason:                  reason,
 		ReceiptPreflightReason:  receiptPreflightReason,
 		ClaimAttempt:            work.claimAttempt,
+		SubscriptionExhausted:   quotaExhausted,
 		PreSpawnPermanentDenial: permanentDenial,
 		Work:                    work,
 	}

@@ -445,7 +445,7 @@ func TestPermanentDenialNackResponseContract(t *testing.T) {
 			err := callNackEndpoint(
 				context.Background(), srv.Client(), srv.URL,
 				item.SessionID, "worker", "runtime", preSpawnPermanentDenialReason,
-				nil, report, item,
+				nil, nil, report, item,
 			)
 			if (err != nil) != tc.wantError {
 				t.Fatalf("error = %v, wantError=%v", err, tc.wantError)
@@ -477,7 +477,7 @@ func TestPermanentDenialDirectSenderRefusesInvalidProofBeforeHTTP(t *testing.T) 
 		}
 		err := callNackEndpoint(
 			context.Background(), srv.Client(), srv.URL, "s", "worker", "runtime",
-			preSpawnPermanentDenialReason, nil, report, item,
+			preSpawnPermanentDenialReason, nil, nil, report, item,
 		)
 		srv.Close()
 		if err == nil || calls.Load() != 0 {
