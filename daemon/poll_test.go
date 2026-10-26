@@ -1243,6 +1243,7 @@ func TestCallNackEndpoint_PostsExpectedShape(t *testing.T) {
 		"accept work failed: allowlist mismatch",
 		nil,
 		nil,
+		nil,
 		item,
 	)
 	if err != nil {
@@ -1299,6 +1300,7 @@ func TestCallNackEndpoint_PropagatesServerError(t *testing.T) {
 		"reason",
 		nil,
 		nil,
+		nil,
 		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)
 	if err == nil {
@@ -1327,7 +1329,7 @@ func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := callNackEndpoint(
-				context.Background(), nil, "http://x", tc.sessionID, tc.workerID, "j", "r", nil, nil, tc.work,
+				context.Background(), nil, "http://x", tc.sessionID, tc.workerID, "j", "r", nil, nil, nil, tc.work,
 			)
 			if err == nil {
 				t.Fatalf("expected error")
@@ -1512,6 +1514,7 @@ func TestCallNackEndpoint_ReceiptPreflightReasonWire(t *testing.T) {
 				context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
 				"accept work failed: "+tc.err.Error(), receiptPreflightNackReasonForError(tc.err),
 				nil,
+				nil,
 				&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 			)
 			if err != nil {
@@ -1523,6 +1526,63 @@ func TestCallNackEndpoint_ReceiptPreflightReasonWire(t *testing.T) {
 				}
 			} else if !mapsEqual(got, tc.wantReason) {
 				t.Fatalf("receiptPreflightReason = %#v, want %#v", got, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestCallNackEndpoint_SubscriptionWindowExhaustedWire pins the additive typed
+// quota-exhaustion NACK contract: the typed refusal serializes one closed
+// member, while identical generic prose or a provider 429 projects nothing.
+func TestCallNackEndpoint_SubscriptionWindowExhaustedWire(t *testing.T) {
+	const resetAt = "2031-02-03T04:05:06Z"
+	typed := &subscriptionWindowExhaustedError{resetAt: resetAt, usable: true}
+	cases := []struct {
+		name       string
+		err        error
+		wantMember map[string]any
+	}{
+		{
+			name: "typed refusal has exact closed member", err: fmt.Errorf("accept work: %w", typed),
+			wantMember: map[string]any{
+				"contractVersion": subscriptionWindowExhaustedContractVersion,
+				"code":            subscriptionWindowExhaustedCode, "resetAt": resetAt,
+			},
+		},
+		{name: "identical prose is omitted", err: errors.New(typed.Error())},
+		{name: "provider 429 is omitted", err: errors.New("provider request failed: status 429")},
+	}
+
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode NACK body: %v", err)
+		}
+		bodies = append(bodies, body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	item := &PollWorkItem{
+		SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1,
+		claimAttempt: &workClaimAttemptProof{
+			ContractVersion: workClaimAttemptContractVersion,
+			SessionID:       "s1", AttemptToken: claimAttemptTokenOne,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := callNackEndpoint(context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
+				"accept work failed: "+tc.err.Error(), nil,
+				subscriptionWindowExhaustedReportForError(tc.err), nil, item); err != nil {
+				t.Fatalf("callNackEndpoint: %v", err)
+			}
+			if got, ok := bodies[len(bodies)-1]["subscriptionWindowExhausted"]; tc.wantMember == nil {
+				if ok {
+					t.Fatalf("subscriptionWindowExhausted = %#v, want omitted", got)
+				}
+			} else if !mapsEqual(got, tc.wantMember) {
+				t.Fatalf("subscriptionWindowExhausted = %#v, want %#v", got, tc.wantMember)
 			}
 		})
 	}
@@ -1546,6 +1606,7 @@ func TestCallNackEndpoint_ReceiptPreflightReasonLegacyWireCompatibility(t *testi
 	err := callNackEndpoint(
 		context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
 		"accept work failed: fallback_not_allowed", receiptPreflightNackReasonForError(errors.New("accept work failed: fallback_not_allowed")),
+		nil,
 		nil,
 		&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)

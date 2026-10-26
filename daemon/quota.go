@@ -214,6 +214,83 @@ func (q *quotaState) noteMuseProbe(accountID string, probed agent.UsageLimits, a
 	}
 }
 
+// Subscription-window exhaustion claim admission refuses a poll-claimed
+// host-session whose cached subscription allowance is exhausted, before
+// AcceptWorkWithDetail can reserve or spawn. The decision is structural only:
+// it never parses prose and never infers exhaustion from agent.UpstreamError
+// or a provider 429.
+const (
+	subscriptionWindowExhaustedContractVersion = "subscription-window-exhausted/v1"
+	subscriptionWindowExhaustedCode            = "subscription_window_exhausted"
+)
+
+// subscriptionWindowExhaustedError refuses an exhausted host-session claim.
+// resetAt is the canonical RFC3339 effective reset; usable reports whether
+// every blocking window supplied a valid future instant — the only case that
+// may publish the typed NACK member. An unusable reset still refuses (fail
+// closed); the prose stays fixed so identical text never gains authority.
+type subscriptionWindowExhaustedError struct {
+	resetAt string
+	usable  bool
+}
+
+func (e *subscriptionWindowExhaustedError) Error() string {
+	return "subscription window exhausted"
+}
+
+// quotaClaimAdmission decides whether a poll-claimed session may proceed
+// past claim admission given this host's cached quota snapshot. It runs over
+// the locked snapshot copy; a nil daemon admits.
+func (d *Daemon) quotaClaimAdmission(spec SessionSpec) error {
+	if d == nil {
+		return nil
+	}
+	return decideQuotaClaimAdmission(d.QuotaSnapshot(), spec.AuthMode, spec.Harness, time.Now())
+}
+
+// decideQuotaClaimAdmission is the clock-parameterized admission decision over
+// one copied snapshot. It refuses only host-session claims whose harness
+// matches a cached account with an exhausted window (UsedPercent >= 100);
+// anything else preserves current admission (nil). The effective reset is the
+// latest future RFC3339 instant across ALL exhausted windows: every blocking
+// window must supply a valid future instant, or admission fails closed
+// without the typed member.
+func decideQuotaClaimAdmission(accounts []agent.UsageAccount, authMode, harness string, now time.Time) error {
+	if authMode != string(agent.AuthHostSession) || harness == "" {
+		return nil
+	}
+	var matched *agent.UsageAccount
+	for i := range accounts {
+		if accounts[i].Provider == harness {
+			matched = &accounts[i]
+			break
+		}
+	}
+	if matched == nil {
+		return nil
+	}
+	var exhausted []agent.UsageWindow
+	for _, window := range matched.Limits.Windows {
+		if window.UsedPercent >= 100 {
+			exhausted = append(exhausted, window)
+		}
+	}
+	if len(exhausted) == 0 {
+		return nil
+	}
+	latest := time.Time{}
+	for _, window := range exhausted {
+		reset, err := time.Parse(time.RFC3339, window.ResetsAt)
+		if err != nil || !reset.After(now) {
+			return &subscriptionWindowExhaustedError{}
+		}
+		if reset.After(latest) {
+			latest = reset
+		}
+	}
+	return &subscriptionWindowExhaustedError{resetAt: latest.UTC().Format(time.RFC3339), usable: true}
+}
+
 // museProbeDue reports whether the muse login check may fire now.
 func (q *quotaState) museProbeDue(now time.Time) bool {
 	if q == nil {

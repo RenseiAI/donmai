@@ -2918,6 +2918,12 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	projects := d.spawner.AllProjects()
 	spec := PollItemToSessionSpec(item, projects)
 
+	// Subscription-window exhaustion is decided here, after the spec is built:
+	// the refusal feeds the existing rejection/NACK branch, the sole release call.
+	if quotaErr := d.quotaClaimAdmission(spec); quotaErr != nil {
+		return d.nackRejectedClaim(item, quotaErr, orchestratorURL)
+	}
+
 	// Advertise worker capabilities only when a provider is wired, so the nil
 	// case builds a byte-identical SessionDetail (no capability option).
 	opts := []SessionDetailOption{}
@@ -2975,35 +2981,39 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 		// (15min default) to reclaim. NACK is best-effort: failure to deliver
 		// it only adds latency; the original AcceptWork error is what the
 		// caller logs.
-		item := item
-		nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		nackErr := NackRejectedWork(
-			nackCtx,
-			nil, // default 10s-timeout client
-			orchestratorURL,
-			d.WorkerID(),
-			d.runtimeJWT(),
-			&item,
-			err,
-		)
-		if nackErr != nil {
-			slog.Warn(
-				"daemon poll: nack failed; orchestrator will reclaim via stale-claim sweep",
-				"sessionId", item.SessionID,
-				"acceptErr", err.Error(),
-				"nackErr", nackErr.Error(),
-			)
-		} else {
-			slog.Info(
-				"daemon poll: nacked rejected session",
-				"sessionId", item.SessionID,
-				"reason", err.Error(),
-			)
-		}
-		return fmt.Errorf("accept work %s: %w", item.SessionID, err)
+		return d.nackRejectedClaim(item, err, orchestratorURL)
 	}
 	return nil
+}
+
+// nackRejectedClaim releases a locally refused claim through the existing best-effort NACK.
+func (d *Daemon) nackRejectedClaim(item PollWorkItem, acceptErr error, orchestratorURL string) error {
+	nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	nackErr := NackRejectedWork(
+		nackCtx,
+		nil, // default 10s-timeout client
+		orchestratorURL,
+		d.WorkerID(),
+		d.runtimeJWT(),
+		&item,
+		acceptErr,
+	)
+	if nackErr != nil {
+		slog.Warn(
+			"daemon poll: nack failed; orchestrator will reclaim via stale-claim sweep",
+			"sessionId", item.SessionID,
+			"acceptErr", acceptErr.Error(),
+			"nackErr", nackErr.Error(),
+		)
+	} else {
+		slog.Info(
+			"daemon poll: nacked rejected session",
+			"sessionId", item.SessionID,
+			"reason", acceptErr.Error(),
+		)
+	}
+	return fmt.Errorf("accept work %s: %w", item.SessionID, acceptErr)
 }
 
 // executionSecurityRefusalReportTimeout bounds the terminal refusal report so
