@@ -1098,7 +1098,7 @@ type subscriptionWindowExhaustedReport struct {
 // text yields no report.
 func subscriptionWindowExhaustedReportForError(err error) *subscriptionWindowExhaustedReport {
 	var exhausted *subscriptionWindowExhaustedError
-	if !errors.As(err, &exhausted) || exhausted == nil || !exhausted.usable || exhausted.resetAt == "" {
+	if !errors.As(err, &exhausted) || exhausted == nil || exhausted.resetAt == "" {
 		return nil
 	}
 	return &subscriptionWindowExhaustedReport{

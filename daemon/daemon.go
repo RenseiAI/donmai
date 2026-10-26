@@ -1136,14 +1136,23 @@ func (d *Daemon) claimSuspended() (bool, string) {
 		}
 	}
 	status := d.HostStatus()
-	if !status.SuspendsClaiming() {
-		return false, ""
+	if status.SuspendsClaiming() {
+		reason := "host status " + status.Status
+		if status.RecommendedAction != "" {
+			reason += ": " + status.RecommendedAction
+		}
+		return true, reason
 	}
-	reason := "host status " + status.Status
-	if status.RecommendedAction != "" {
-		reason += ": " + status.RecommendedAction
+	// A fresh, still-blocking subscription-window exhaustion stops the poll
+	// request before any claim is taken. Claiming then NACKing would hand
+	// the session back through the legacy NACK path older platforms count
+	// toward terminalization, losing the claim; declining before the request
+	// keeps in-flight sessions running and resumes automatically on reset
+	// or probe refresh.
+	if suspended, reason := d.quotaSuspendsClaiming(time.Now()); suspended {
+		return true, reason
 	}
-	return true, reason
+	return false, ""
 }
 
 // PollClaimGate is the per-tick new-work admission predicate consumed by
@@ -2918,8 +2927,11 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	projects := d.spawner.AllProjects()
 	spec := PollItemToSessionSpec(item, projects)
 
-	// Subscription-window exhaustion is decided here, after the spec is built:
-	// the refusal feeds the existing rejection/NACK branch, the sole release call.
+	// Subscription-window exhaustion race fallback: the poll claim gate is
+	// the primary decline (it stops the request before any claim is taken).
+	// A snapshot that turned exhausted after the request left still refuses
+	// here, before reserve or spawn, through the existing rejection/NACK
+	// branch, the sole release call.
 	if quotaErr := d.quotaClaimAdmission(spec); quotaErr != nil {
 		return d.nackRejectedClaim(item, quotaErr, orchestratorURL)
 	}

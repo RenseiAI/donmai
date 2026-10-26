@@ -228,7 +228,9 @@ const (
 // resetAt is the canonical RFC3339 effective reset; usable reports whether
 // every blocking window supplied a valid future instant — the only case that
 // may publish the typed NACK member. An unusable reset still refuses (fail
-// closed); the prose stays fixed so identical text never gains authority.
+// closed) when the snapshot is fresh; the prose stays fixed so identical
+// text never gains authority. A stale snapshot or a reset at or before now
+// admits, so the refusal never wedges on a cache the probe has not refreshed.
 type subscriptionWindowExhaustedError struct {
 	resetAt string
 	usable  bool
@@ -248,13 +250,45 @@ func (d *Daemon) quotaClaimAdmission(spec SessionSpec) error {
 	return decideQuotaClaimAdmission(d.QuotaSnapshot(), spec.AuthMode, spec.Harness, time.Now())
 }
 
+// parseQuotaInstant parses a snapshot instant in either RFC3339 form the
+// snapshots carry (ISOTime renders RFC3339Nano, which also reads plain
+// RFC3339). It reports false on a missing or malformed value.
+func parseQuotaInstant(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed, true
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
+// quotaSnapshotFresh reports whether a snapshot CheckedAt still verifies the
+// host: a missing, malformed, or older-than-TTL reading is unknown and
+// admits. The probe interval stays below the TTL, so a live harness keeps
+// its snapshot fresh; a stale one means the cache has not been refreshed
+// since the window may have reset.
+func quotaSnapshotFresh(checkedAt string, now time.Time) bool {
+	parsed, ok := parseQuotaInstant(checkedAt)
+	if !ok {
+		return false
+	}
+	return now.Sub(parsed) <= quotaConsumerFreshnessTTL
+}
+
 // decideQuotaClaimAdmission is the clock-parameterized admission decision over
 // one copied snapshot. It refuses only host-session claims whose harness
-// matches a cached account with an exhausted window (UsedPercent >= 100);
-// anything else preserves current admission (nil). The effective reset is the
-// latest future RFC3339 instant across ALL exhausted windows: every blocking
-// window must supply a valid future instant, or admission fails closed
-// without the typed member.
+// matches a cached account with a fresh, still-blocking exhausted window
+// (UsedPercent >= 100 with a valid future reset); anything else preserves
+// current admission (nil). A reset at or before now means the window has
+// reset and admits; a stale snapshot admits as unknown. Only a fresh
+// snapshot with a missing or malformed reset fails closed without the typed
+// member, bounded by the freshness TTL. The effective reset is the latest
+// future RFC3339 instant across all still-blocking windows.
 func decideQuotaClaimAdmission(accounts []agent.UsageAccount, authMode, harness string, now time.Time) error {
 	if authMode != string(agent.AuthHostSession) || harness == "" {
 		return nil
@@ -269,26 +303,85 @@ func decideQuotaClaimAdmission(accounts []agent.UsageAccount, authMode, harness 
 	if matched == nil {
 		return nil
 	}
-	var exhausted []agent.UsageWindow
-	for _, window := range matched.Limits.Windows {
-		if window.UsedPercent >= 100 {
-			exhausted = append(exhausted, window)
-		}
-	}
-	if len(exhausted) == 0 {
+	if !quotaSnapshotFresh(matched.Limits.CheckedAt, now) {
 		return nil
 	}
 	latest := time.Time{}
-	for _, window := range exhausted {
-		reset, err := time.Parse(time.RFC3339, window.ResetsAt)
-		if err != nil || !reset.After(now) {
+	sawBlocking := false
+	for _, window := range matched.Limits.Windows {
+		if window.UsedPercent < 100 {
+			continue
+		}
+		reset, ok := parseQuotaInstant(window.ResetsAt)
+		if !ok {
 			return &subscriptionWindowExhaustedError{}
 		}
+		if !reset.After(now) {
+			// The window has reset since the snapshot was taken: it no
+			// longer blocks this harness.
+			continue
+		}
+		sawBlocking = true
 		if reset.After(latest) {
 			latest = reset
 		}
 	}
+	if !sawBlocking {
+		return nil
+	}
 	return &subscriptionWindowExhaustedError{resetAt: latest.UTC().Format(time.RFC3339), usable: true}
+}
+
+// quotaExhaustionSuspendsClaiming is the host-wide, pre-claim counterpart of
+// the per-item admission decision. Poll requests cannot select a harness, so
+// any fresh, still-blocking host-session exhaustion suspends the whole tick:
+// the poll request never goes out and no claim is taken, which keeps a typed
+// exhaustion NACK (unread by older platforms and counted toward their
+// terminal nack-loop) from terminalizing sessions the window would have
+// requeued. Stale snapshots and past resets admit, so the gate reopens on
+// reset or probe refresh without a restart. It never parses prose and never
+// infers exhaustion from endpoint errors or 429s.
+func quotaExhaustionSuspendsClaiming(accounts []agent.UsageAccount, now time.Time) (bool, string) {
+	latest := time.Time{}
+	sawUnusable := false
+	for i := range accounts {
+		if !quotaSnapshotFresh(accounts[i].Limits.CheckedAt, now) {
+			continue
+		}
+		for _, window := range accounts[i].Limits.Windows {
+			if window.UsedPercent < 100 {
+				continue
+			}
+			reset, ok := parseQuotaInstant(window.ResetsAt)
+			if !ok {
+				sawUnusable = true
+				continue
+			}
+			if !reset.After(now) {
+				continue
+			}
+			if reset.After(latest) {
+				latest = reset
+			}
+		}
+	}
+	if !latest.IsZero() {
+		return true, "subscription window exhausted until " + latest.UTC().Format(time.RFC3339)
+	}
+	if sawUnusable {
+		return true, "subscription window exhausted (awaiting fresh quota probe)"
+	}
+	return false, ""
+}
+
+// quotaSuspendsClaiming reports whether this host's cached quota snapshot
+// must stop the poll loop from claiming new work. Nil-safe: no snapshot
+// never suspends.
+func (d *Daemon) quotaSuspendsClaiming(now time.Time) (bool, string) {
+	if d == nil {
+		return false, ""
+	}
+	return quotaExhaustionSuspendsClaiming(d.QuotaSnapshot(), now)
 }
 
 // museProbeDue reports whether the muse login check may fire now.
