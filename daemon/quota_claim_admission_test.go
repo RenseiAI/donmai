@@ -583,7 +583,7 @@ func TestQuotaClaimAdmission_ServedLanesKeepPolling(t *testing.T) {
 		poller.pollOnce(context.Background())
 		return d, fixture, &spawns
 	}
-	checkPolledAndSpawned := func(t *testing.T, d *Daemon, fixture *claimAttemptHTTPFixture, spawns *int) {
+	checkPolledAndSpawned := func(t *testing.T, _ *Daemon, fixture *claimAttemptHTTPFixture, spawns *int) {
 		t.Helper()
 		if n := fixture.pollIndex; n != 1 {
 			t.Fatalf("poll requests = %d, want 1 (available lane keeps polling)", n)
@@ -725,32 +725,66 @@ func TestQuotaExhaustionSuspendsClaiming_ServedLanes(t *testing.T) {
 		suspend  bool
 		reason   string // substring the reason must carry when suspending
 	}{
-		{"single served harness exhausted suspends",
-			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("codex"), true, future},
-		{"unserved harness exhaustion is ignored",
-			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("claude"), false, ""},
-		{"served harness without snapshot is available",
-			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("codex", "claude"), false, ""},
-		{"stale served snapshot is available",
-			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", stale, future)}, hsOnly("codex", "claude"), false, ""},
-		{"past reset is available",
-			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", fresh, past)}, hsOnly("codex", "claude"), false, ""},
-		{"every served harness exhausted suspends with the latest reset",
-			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", fresh, "2031-07-08T09:10:11Z")},
-			hsOnly("codex", "claude"), true, "2031-07-08T09:10:11Z"},
-		{"unprobed served harness without snapshot is available",
-			[]agent.UsageAccount{blocked("codex", fresh, future)}, hsOnly("codex", "pi"), false, ""},
-		{"key-carried auth lane is always available",
+		{
+			"single served harness exhausted suspends",
 			[]agent.UsageAccount{blocked("codex", fresh, future)},
-			quotaServedClaimLanes{harnesses: []string{"codex"}, otherAuthModes: true}, false, ""},
-		{"fresh missing reset fails closed",
-			[]agent.UsageAccount{account("codex", fresh, quotaClaimWindow("five_hour", 100, ""))}, hsOnly("codex"), true, "awaiting fresh quota probe"},
-		{"usage below full admits",
-			[]agent.UsageAccount{account("codex", fresh, quotaClaimWindow("five_hour", 99.9, future))}, hsOnly("codex"), false, ""},
-		{"no fresh snapshot never suspends",
-			[]agent.UsageAccount{blocked("codex", stale, future)}, hsOnly("codex"), false, ""},
-		{"no snapshot never suspends",
-			nil, hsOnly("codex"), false, ""},
+			hsOnly("codex"), true, future,
+		},
+		{
+			"unserved harness exhaustion is ignored",
+			[]agent.UsageAccount{blocked("codex", fresh, future)},
+			hsOnly("claude"), false, "",
+		},
+		{
+			"served harness without snapshot is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future)},
+			hsOnly("codex", "claude"), false, "",
+		},
+		{
+			"stale served snapshot is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", stale, future)},
+			hsOnly("codex", "claude"), false, "",
+		},
+		{
+			"past reset is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", fresh, past)},
+			hsOnly("codex", "claude"), false, "",
+		},
+		{
+			"every served harness exhausted suspends with the latest reset",
+			[]agent.UsageAccount{blocked("codex", fresh, future), blocked("claude", fresh, "2031-07-08T09:10:11Z")},
+			hsOnly("codex", "claude"), true, "2031-07-08T09:10:11Z",
+		},
+		{
+			"unprobed served harness without snapshot is available",
+			[]agent.UsageAccount{blocked("codex", fresh, future)},
+			hsOnly("codex", "pi"), false, "",
+		},
+		{
+			"key-carried auth lane is always available",
+			[]agent.UsageAccount{blocked("codex", fresh, future)},
+			quotaServedClaimLanes{harnesses: []string{"codex"}, otherAuthModes: true},
+			false, "",
+		},
+		{
+			"fresh missing reset fails closed",
+			[]agent.UsageAccount{account("codex", fresh, quotaClaimWindow("five_hour", 100, ""))},
+			hsOnly("codex"), true, "awaiting fresh quota probe",
+		},
+		{
+			"usage below full admits",
+			[]agent.UsageAccount{account("codex", fresh, quotaClaimWindow("five_hour", 99.9, future))},
+			hsOnly("codex"), false, "",
+		},
+		{
+			"no fresh snapshot never suspends",
+			[]agent.UsageAccount{blocked("codex", stale, future)},
+			hsOnly("codex"), false, "",
+		},
+		{
+			"no snapshot never suspends",
+			nil, hsOnly("codex"), false, "",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
