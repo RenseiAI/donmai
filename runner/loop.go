@@ -1295,6 +1295,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stopCancel()
 		_ = handle.Stop(stopCtx)
+		// Capture terminal transcript descriptors once, from the finally
+		// bound handle after its writers have stopped. The deferred
+		// closure reads the mutable handle variable, so steering,
+		// follow-up, and stall recovery rebinding is observed; only the
+		// handle bound here contributes. Absence or a failed/empty read
+		// is a no-op: it never changes the session result or teardown.
+		if tc, ok := handle.(agent.TerminalTranscriptCapable); ok {
+			if descs, err := tc.TerminalTranscripts(); err == nil && len(descs) > 0 {
+				cp := make([]agent.TerminalTranscriptDescriptor, len(descs))
+				copy(cp, descs)
+				res.terminalTranscripts = cp
+			}
+		}
 	}()
 
 	// Current-step status beacons ride the session progress endpoint from

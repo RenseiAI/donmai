@@ -439,6 +439,14 @@ type Result struct {
 	// was provisioned at. Run reads them before teardown to preserve any work
 	// that exists nowhere else (see preserveUnpublishedWork).
 	rescueTargets []rescueTarget
+
+	// terminalTranscripts retains immutable, session-owned transcript
+	// descriptors captured from the final live handle after its writers
+	// stopped (see runLoop's deferred teardown). Defensive copy; never
+	// read, opened, validated, or serialized. Unexported: runner-internal
+	// state, never on the wire (encoding/json ignores it, and the poster
+	// carries only the embedded agent.Result).
+	terminalTranscripts []agent.TerminalTranscriptDescriptor
 }
 
 // LinearStatusTransition records the runner's post-session attempt to
