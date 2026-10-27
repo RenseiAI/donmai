@@ -10,6 +10,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.93 — 2026-10-27
+
+### Chores
+
+- Host watch authenticated lifecycle actions with stop confirmation
+- Capture terminal transcript descriptors from stopped session handle
+- Nudge once when a development turn ends on a narration-only message
+- Render host watch capacity strip, shared status roles, and attach hint
+- Add deterministic Host Watch card filtering
+- Carry optional park reason through session detail JSON
+- Raise Go toolchain to 1.26.10 and x/net to v0.60.0
+
 ## v0.72.92 — 2026-10-27
 
 ### Chores
