@@ -977,6 +977,9 @@ func ReadDeclaration(root RootPath) (DeclarationRecord, error) {
 }
 
 // OpenRootExact opens one real root and optionally proves its durable identity.
+// The identity proof tolerates a device-only renumber: the same inode (and
+// compatible birth time) on a different device is the same directory on a
+// renumbered volume, not a replacement.
 func OpenRootExact(root RootPath, expected FileIdentity) (*os.Root, error) {
 	handle, err := openDeclarationRoot(root)
 	if err != nil {
@@ -989,7 +992,7 @@ func OpenRootExact(root RootPath, expected FileIdentity) (*os.Root, error) {
 			return nil, err
 		}
 		identity, err := fileIdentity(info)
-		if err != nil || identity != expected {
+		if err != nil || !fileIdentityMatches(expected, identity) {
 			_ = handle.Close()
 			return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root identity mismatch")
 		}

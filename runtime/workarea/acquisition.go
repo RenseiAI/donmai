@@ -70,9 +70,17 @@ const (
 )
 
 // FileIdentity is a durable local filesystem object identity.
+// Device is the OS device number, which is not stable across boots on
+// some filesystems (macOS APFS renumbers st_dev after travel/reboot).
+// Inode plus the directory birth time identifies the same directory
+// across such renumbers: a device-only change with a matching inode (and
+// matching birth time when both sides recorded it) is the same directory.
 type FileIdentity struct {
-	Device uint64 `json:"device"`
-	Inode  uint64 `json:"inode"`
+	Device    uint64 `json:"device"`
+	Inode     uint64 `json:"inode"`
+	BirthSec  int64  `json:"birthSec,omitempty"`
+	BirthNsec int64  `json:"birthNsec,omitempty"`
+	HasBirth  bool   `json:"hasBirth,omitempty"`
 }
 
 // Empty reports whether no published root identity is recorded.
@@ -80,6 +88,29 @@ func (i FileIdentity) Empty() bool { return i.Device == 0 && i.Inode == 0 }
 
 // IdentityOf returns the durable local identity of one filesystem object.
 func IdentityOf(info os.FileInfo) (FileIdentity, error) { return fileIdentity(info) }
+
+// fileIdentityMatches reports whether stored and current describe the same
+// directory, tolerating a device-only change. Inode must match; when both
+// sides recorded a birth time, the birth must match as well, which
+// distinguishes a renumbered volume (same inode, same birth) from an inode
+// reuse (same device+inode, different birth) or a genuine replacement
+// (different inode). When either side lacks a birth time (records written
+// before birth tracking), the inode alone decides so old records migrate
+// forward instead of crash-looping. Linux never records birth (see
+// file_identity_linux.go), so there the inode alone decides and a
+// same-inode cross-device collision is accepted on inode alone.
+func fileIdentityMatches(stored, current FileIdentity) bool {
+	if stored.Inode == 0 || current.Inode == 0 {
+		return false
+	}
+	if stored.Inode != current.Inode {
+		return false
+	}
+	if stored.HasBirth && current.HasBirth {
+		return stored.BirthSec == current.BirthSec && stored.BirthNsec == current.BirthNsec
+	}
+	return true
+}
 
 // Participant is one shared-mode reference to an owner root.
 type Participant struct {
@@ -295,26 +326,55 @@ func (s *AcquisitionStore) loadOrCreateStoreIdentity(create bool) (string, error
 	if err != nil {
 		return "", err
 	}
-	if anchorExists && anchorRecord.Identity != physical {
+	// A device-only change (same inode, compatible birth) is the same
+	// directory on a renumbered volume, not a replacement. The device
+	// number is not stable across boots on some filesystems, so the
+	// identity check tolerates it when the inode, store ID, and birth
+	// time agree, and re-anchors both documents to the current device
+	// instead of crash-looping.
+	if anchorExists && !fileIdentityMatches(anchorRecord.Identity, physical) {
 		return "", fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
 	}
-	if storeExists && storeRecord.Identity != physical {
+	if storeExists && !fileIdentityMatches(storeRecord.Identity, physical) {
 		return "", fmt.Errorf("runtime/workarea: acquisition store identity mismatch")
 	}
 	switch {
 	case storeExists && anchorExists:
-		if storeRecord != anchorRecord {
+		if storeRecord.StoreID != anchorRecord.StoreID {
 			return "", fmt.Errorf("runtime/workarea: acquisition store and parent anchor disagree")
+		}
+		if storeRecord.Identity != physical || anchorRecord.Identity != physical {
+			repaired := acquisitionStoreIdentity{SchemaVersion: acquisitionStoreSchemaV1, StoreID: storeRecord.StoreID, Identity: physical}
+			if err := s.writeStoreIdentity(repaired); err != nil {
+				return "", err
+			}
+			if err := overwriteAcquisitionStoreAnchor(s.parentRoot, repaired); err != nil {
+				return "", err
+			}
 		}
 		return storeRecord.StoreID, nil
 	case storeExists:
-		if err := writeAcquisitionStoreAnchor(s.parentRoot, storeRecord); err != nil {
+		repaired := acquisitionStoreIdentity{SchemaVersion: acquisitionStoreSchemaV1, StoreID: storeRecord.StoreID, Identity: physical}
+		if storeRecord.Identity != physical {
+			if err := s.writeStoreIdentity(repaired); err != nil {
+				return "", err
+			}
+		} else {
+			repaired = storeRecord
+		}
+		if err := writeAcquisitionStoreAnchor(s.parentRoot, repaired); err != nil {
 			return "", err
 		}
 		return storeRecord.StoreID, nil
 	case anchorExists:
-		if err := s.writeStoreIdentity(anchorRecord); err != nil {
+		repaired := acquisitionStoreIdentity{SchemaVersion: acquisitionStoreSchemaV1, StoreID: anchorRecord.StoreID, Identity: physical}
+		if err := s.writeStoreIdentity(repaired); err != nil {
 			return "", err
+		}
+		if anchorRecord.Identity != physical {
+			if err := overwriteAcquisitionStoreAnchor(s.parentRoot, repaired); err != nil {
+				return "", err
+			}
 		}
 		return anchorRecord.StoreID, nil
 	default:
@@ -387,6 +447,42 @@ func writeAcquisitionStoreAnchor(parent *os.Root, record acquisitionStoreIdentit
 		return err
 	}
 	if err := file.Close(); err != nil {
+		return err
+	}
+	return syncRoot(parent)
+}
+
+// overwriteAcquisitionStoreAnchor atomically replaces the durable parent
+// anchor, used when re-anchoring the same directory after a device-number
+// renumber. The caller must already hold the exclusive store lock and have
+// proved the existing anchor describes the same directory (same inode and
+// compatible birth) so the rewrite cannot launder a replacement.
+func overwriteAcquisitionStoreAnchor(parent *os.Root, record acquisitionStoreIdentity) error {
+	body, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	tempName, err := rootedTempName(".anchor-")
+	if err != nil {
+		return err
+	}
+	file, err := parent.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Remove(tempName) }()
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := parent.Rename(tempName, acquisitionStoreAnchorName); err != nil {
 		return err
 	}
 	return syncRoot(parent)
@@ -685,7 +781,7 @@ func (s *AcquisitionStore) Commit(acquisitionID string) (AcquisitionRecord, erro
 	if err != nil {
 		return AcquisitionRecord{}, err
 	}
-	if publishedIdentity.Mode()&os.ModeSymlink != 0 || !os.SameFile(stagingIdentity, publishedIdentity) || publishedFileIdentity != identity {
+	if publishedIdentity.Mode()&os.ModeSymlink != 0 || !os.SameFile(stagingIdentity, publishedIdentity) || !fileIdentityMatches(identity, publishedFileIdentity) {
 		return AcquisitionRecord{}, fmt.Errorf("runtime/workarea: published root identity changed during claim")
 	}
 	record.State = AcquisitionReady
@@ -993,7 +1089,7 @@ func (s *AcquisitionStore) finishPrivateDisposal(record *AcquisitionRecord) erro
 	}
 	declaration, declarationErr := readDeclarationFromRoot(privateRoot)
 	_ = privateRoot.Close()
-	if declarationErr != nil || record.RootIdentity.Empty() || identity != record.RootIdentity || declaration.AcquisitionID != record.AcquisitionID || declaration.WorkareaID != record.WorkareaID || declaration.SessionID != record.SessionID {
+	if declarationErr != nil || record.RootIdentity.Empty() || !fileIdentityMatches(record.RootIdentity, identity) || declaration.AcquisitionID != record.AcquisitionID || declaration.WorkareaID != record.WorkareaID || declaration.SessionID != record.SessionID {
 		record.State = AcquisitionQuarantined
 		if declarationErr != nil {
 			record.LastError = declarationErr.Error()
@@ -1074,10 +1170,14 @@ func ReadExistingReadyRecordsFound(parent string) ([]AcquisitionRecord, bool, er
 	if !storeExists || !anchorExists {
 		return nil, false, fmt.Errorf("runtime/workarea: acquisition store identity is incomplete")
 	}
-	if storeRecord.Identity != physical || anchorRecord.Identity != physical {
+	// The read-only scan tolerates a device-only renumber without mutating:
+	// the same inode (and compatible birth) with matching store IDs is the
+	// same directory on a renumbered volume. A different inode or birth
+	// still fails closed.
+	if !fileIdentityMatches(storeRecord.Identity, physical) || !fileIdentityMatches(anchorRecord.Identity, physical) {
 		return nil, false, fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
 	}
-	if storeRecord != anchorRecord {
+	if storeRecord.StoreID != anchorRecord.StoreID {
 		return nil, false, fmt.Errorf("runtime/workarea: acquisition store and parent anchor disagree")
 	}
 	lock, err := root.OpenFile(acquisitionStoreLockName, os.O_RDWR, 0)
@@ -1109,7 +1209,7 @@ func ReadExistingReadyRecordsFound(parent string) ([]AcquisitionRecord, bool, er
 		return nil, false, fmt.Errorf("runtime/workarea: acquisition store directory identity changed")
 	}
 	anchor, exists, err := readAcquisitionStoreIdentity(parentRoot, acquisitionStoreAnchorName)
-	if err != nil || !exists || anchor != storeRecord {
+	if err != nil || !exists || anchor.StoreID != storeRecord.StoreID || !fileIdentityMatches(anchor.Identity, physical) {
 		return nil, false, fmt.Errorf("runtime/workarea: acquisition store parent anchor changed")
 	}
 	// The scan below reuses the already-open identity-verified shared-locked
@@ -1641,7 +1741,7 @@ func (s *AcquisitionStore) RemovePublishedRoot(acquisitionID string) error {
 	if err != nil {
 		return err
 	}
-	if !pathIdentity.IsDir() || pathIdentity.Mode()&os.ModeSymlink != 0 || identity != record.RootIdentity {
+	if !pathIdentity.IsDir() || pathIdentity.Mode()&os.ModeSymlink != 0 || !fileIdentityMatches(record.RootIdentity, identity) {
 		return fmt.Errorf("runtime/workarea: published root identity changed before disposal")
 	}
 	privateRelative := filepath.Join(acquisitionStoreDirName, acquisitionID, acquisitionReleasedRootName)
@@ -1669,7 +1769,7 @@ func (s *AcquisitionStore) RemovePublishedRoot(acquisitionID string) error {
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(pathIdentity, openedIdentity) || openedFileIdentity != record.RootIdentity {
+	if !os.SameFile(pathIdentity, openedIdentity) || !fileIdentityMatches(record.RootIdentity, openedFileIdentity) {
 		record.State = AcquisitionQuarantined
 		record.LastError = "root identity changed during disposal quarantine"
 		record.UpdatedAt = s.now().UTC()
