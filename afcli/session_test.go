@@ -2,6 +2,9 @@ package afcli
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -222,4 +225,79 @@ func TestSessionListProjectScoping(t *testing.T) {
 			}
 		})
 	}
+}
+
+// newParkReasonServer serves raw session-detail JSON on the detail route
+// and an empty activity list on the activities route, so the test drives
+// the real client decoder and the real `session show --json` renderer.
+func newParkReasonServer(t *testing.T, detailRaw string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/public/session-activities") {
+			_ = json.NewEncoder(w).Encode(afclient.ActivityListResponse{
+				Activities:    []afclient.ActivityEvent{},
+				SessionStatus: afclient.StatusParked,
+			})
+			return
+		}
+		_, _ = w.Write([]byte(detailRaw))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestSessionShowJSONPreservesParkReason pins the optional public
+// session-detail parkReason field through `session show --json`:
+// a non-null reason round-trips unchanged, and an older response
+// without the field omits the key via omitempty.
+func TestSessionShowJSONPreservesParkReason(t *testing.T) {
+	t.Parallel()
+
+	t.Run("non_null_reason_round_trips", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newParkReasonServer(t, `{"session":{"id":"sess-parked","identifier":"OPS-1202","status":"parked","workType":"refinement","startedAt":"2026-10-26T12:00:00Z","duration":480,"timeline":{"created":"2026-10-26T11:52:00Z"},"parkReason":"waiting for required status"},"timestamp":"2026-10-26T12:08:00Z"}`)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestSessionCmd(ds, []string{"show", "sess-parked", "--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
+			t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
+		}
+		session, ok := payload["session"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected top-level 'session' object; got: %v", payload)
+		}
+		got, ok := session["parkReason"].(string)
+		if !ok || got != "waiting for required status" {
+			t.Errorf("expected session.parkReason %q, got %v (session=%v)", "waiting for required status", session["parkReason"], session)
+		}
+	})
+
+	t.Run("absent_reason_stays_omitted", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newParkReasonServer(t, `{"session":{"id":"sess-parked","identifier":"OPS-1202","status":"parked","workType":"refinement","startedAt":"2026-10-26T12:00:00Z","duration":480,"timeline":{"created":"2026-10-26T11:52:00Z"}},"timestamp":"2026-10-26T12:08:00Z"}`)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestSessionCmd(ds, []string{"show", "sess-parked", "--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
+			t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
+		}
+		session, ok := payload["session"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected top-level 'session' object; got: %v", payload)
+		}
+		if _, present := session["parkReason"]; present {
+			t.Errorf("expected no session.parkReason key for older response; got: %v", session["parkReason"])
+		}
+	})
 }

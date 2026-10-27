@@ -73,6 +73,7 @@ type SessionDetail struct {
 	Provider     *string         `json:"provider,omitempty"`
 	Branch       *string         `json:"branch,omitempty"`
 	IssueTitle   *string         `json:"issueTitle,omitempty"`
+	ParkReason   *string         `json:"parkReason,omitempty"`
 	CostUsd      *float64        `json:"costUsd,omitempty"`
 	InputTokens  *int            `json:"inputTokens,omitempty"`
 	OutputTokens *int            `json:"outputTokens,omitempty"`
