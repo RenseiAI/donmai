@@ -1,4 +1,4 @@
- build-host-01                                           14 sessions   queue 2   slots 13/16   uptime 3h 16m   v0.72.68 
+ build-host-01                                           14 sessions   queue 2   cap 13 / 16   uptime 3h 16m   v0.72.68 
 ↑ 9 more
 ┃▸● ENG-1401  Backfill audit rows fo… ┃ │ ● ENG-1402  Backfill audit rows fo… │ │ ● ENG-1403  Backfill audit rows fo… │
 ┃ api · development                   ┃ │ api · development                   │ │ api · development                   │

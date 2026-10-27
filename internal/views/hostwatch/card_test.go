@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/tui-components/theme"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -293,5 +294,209 @@ func TestCleanText(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "東京") || !strings.Contains(got, "ok") {
 		t.Fatalf("printable text lost: %q", got)
+	}
+}
+
+// TestStatusDot_SharedRegistryRoles pins the status dot to the shared
+// status registry: held renders the parked symbol, live pulses through the
+// working head frame and the parked mid frame, and every other state
+// renders the working symbol statically. Restoring either local literal
+// breaks the registry-override assertions below (AC-3 mutant).
+func TestStatusDot_SharedRegistryRoles(t *testing.T) {
+	working := theme.GetStatusStyle("working").Symbol
+	parked := theme.GetStatusStyle("parked").Symbol
+	if working == "" || parked == "" || working == parked {
+		t.Fatalf("shared roles must supply two distinct status symbols, got %q and %q", working, parked)
+	}
+	held := SessionCard{SessionID: "h", DaemonState: "unknown"}
+	for frame := 0; frame < 8; frame++ {
+		if got := held.statusDot(frame); got != parked {
+			t.Errorf("held frame %d: want parked %q, got %q", frame, parked, got)
+		}
+	}
+	live := SessionCard{SessionID: "r", DaemonState: "running"}
+	wantPulse := []string{working, "\u25c9", parked, "\u25c9"}
+	for frame, want := range wantPulse {
+		if got := live.statusDot(frame); got != want {
+			t.Errorf("live frame %d: want %q, got %q", frame, want, got)
+		}
+	}
+	if got := live.statusDot(4); got != wantPulse[0] {
+		t.Errorf("pulse must wrap every four frames, frame 4 gave %q", got)
+	}
+	for _, state := range []string{"", "completed", "failed", "terminated", "starting"} {
+		c := SessionCard{SessionID: "s", DaemonState: state}
+		if state == "starting" {
+			if got := c.statusDot(0); got != working {
+				t.Errorf("starting frame 0: want working head %q, got %q", working, got)
+			}
+			continue
+		}
+		for frame := 0; frame < 4; frame++ {
+			if got := c.statusDot(frame); got != working {
+				t.Errorf("state %q frame %d: want static working %q, got %q", state, frame, working, got)
+			}
+		}
+	}
+}
+
+// TestStatusDot_FollowsRegistryOverride proves the dots are sourced from
+// the shared registry rather than duplicated literals: overriding the
+// working/parked symbols moves the dots, and restoring the registry moves
+// them back. A reverted literal keeps rendering while the registry says
+// otherwise, failing this test.
+func TestStatusDot_FollowsRegistryOverride(t *testing.T) {
+	restore := overrideStatusSymbols(t, map[string]string{"working": "W", "parked": "P"})
+	defer restore()
+	held := SessionCard{SessionID: "h", DaemonState: "unknown"}
+	if got := held.statusDot(0); got != "P" {
+		t.Errorf("held dot must follow the parked override, got %q", got)
+	}
+	live := SessionCard{SessionID: "r", DaemonState: "running"}
+	for frame, want := range []string{"W", "\u25c9", "P", "\u25c9"} {
+		if got := live.statusDot(frame); got != want {
+			t.Errorf("live frame %d must follow the override, want %q got %q", frame, want, got)
+		}
+	}
+	if got := (SessionCard{SessionID: "s", DaemonState: "completed"}).statusDot(0); got != "W" {
+		t.Errorf("static dot must follow the working override, got %q", got)
+	}
+}
+
+// overrideStatusSymbols swaps the registry symbols for kinds, returning a
+// restore func. Callers must not run in parallel with other registry users.
+func overrideStatusSymbols(t *testing.T, symbols map[string]string) func() {
+	t.Helper()
+	prev := map[string]theme.StatusEntry{}
+	for kind := range symbols {
+		if e, ok := theme.GlobalRegistry.GetStatus(kind); ok {
+			prev[kind] = e
+		}
+	}
+	for kind, symbol := range symbols {
+		e, ok := theme.GlobalRegistry.GetStatus(kind)
+		if !ok {
+			t.Fatalf("no shared status role %q to override", kind)
+		}
+		e.Symbol = symbol
+		theme.GlobalRegistry.RegisterStatus(e)
+	}
+	return func() {
+		for _, e := range prev {
+			theme.GlobalRegistry.RegisterStatus(e)
+		}
+	}
+}
+
+// TestSelectionMarker_SharedAcrossDoors pins the shared selection role: the
+// helper reports the marker both doors render, so a selected card carries
+// it in full-card and compact output while an unselected card never does.
+// Restoring a door-local literal breaks the cross-door assertions (AC-3
+// mutant).
+func TestSelectionMarker_SharedAcrossDoors(t *testing.T) {
+	if got := selectionMarker(true, false); got != "\u25b8" {
+		t.Errorf("styled selection marker: want \u25b8, got %q", got)
+	}
+	if got := selectionMarker(true, true); got != ">" {
+		t.Errorf("plain selection marker: want >, got %q", got)
+	}
+	if got := selectionMarker(false, false); got != " " {
+		t.Errorf("unselected marker must stay blank, got %q", got)
+	}
+	now := time.Now()
+	tm := theme.DefaultTheme()
+	card := SessionCard{SessionID: "s1", IssueIdentifier: "ENG-1", WorkType: "development", DaemonState: "running"}
+	for _, plain := range []bool{true, false} {
+		sel := renderCard(tm, card, 0, true, plain, now, 40)
+		if !strings.Contains(ansi.Strip(sel), selectionMarker(true, plain)) {
+			t.Errorf("plain=%v: selected full card lacks the shared marker:\n%s", plain, ansi.Strip(sel))
+		}
+		unsel := renderCard(tm, card, 0, false, plain, now, 40)
+		if strings.Contains(ansi.Strip(unsel), selectionMarker(true, plain)) && selectionMarker(true, plain) != " " {
+			t.Errorf("plain=%v: unselected full card carries the selection marker:\n%s", plain, ansi.Strip(unsel))
+		}
+		// Width 35 forces the compact door; the marker role is identical.
+		compact := renderGrid(tm, []SessionCard{card}, 0, 0, 35, 0, plain, now)
+		if !strings.Contains(compact, selectionMarker(true, plain)) {
+			t.Errorf("plain=%v: selected compact row lacks the shared marker:\n%s", plain, compact)
+		}
+		compactUnsel := renderGrid(tm, []SessionCard{card}, -1, 0, 35, 0, plain, now)
+		if strings.Contains(compactUnsel, selectionMarker(true, plain)) && selectionMarker(true, plain) != " " {
+			t.Errorf("plain=%v: unselected compact row carries the selection marker:\n%s", plain, compactUnsel)
+		}
+		for _, line := range strings.Split(compact, "\n") {
+			if w := lipgloss.Width(line); w > 35 {
+				t.Errorf("plain=%v: compact line exceeds its width: %q", plain, line)
+			}
+		}
+	}
+}
+
+// TestAttachHint_Eligibility pins the hint contract: only a selected live
+// card shows it, in both the full-card status row and the compact line, in
+// plain and styled output. Unselected, held/unknown, failed, terminated and
+// completed cards never show it. Removing the eligibility predicate fails
+// the negative assertions; suppressing the hint fails the positive ones
+// (AC-3 mutant).
+func TestAttachHint_Eligibility(t *testing.T) {
+	now := time.Date(2026, 6, 13, 14, 5, 0, 0, time.UTC)
+	live := func(state string) SessionCard {
+		return SessionCard{
+			SessionID: "sess-1", DaemonState: state, IssueIdentifier: "ENG-1",
+			WorkType: "development", StartedAtUnixMs: now.Add(-4 * time.Minute).UnixMilli(),
+		}
+	}
+	tests := []struct {
+		name     string
+		card     SessionCard
+		selected bool
+		wantHint bool
+	}{
+		{"selected running", live("running"), true, true},
+		{"selected starting", live("starting"), true, true},
+		{"unselected running", live("running"), false, false},
+		{"selected held", live("unknown"), true, false},
+		{"selected empty state", live(""), true, false},
+		{"selected failed", live("failed"), true, false},
+		{"selected terminated", live("terminated"), true, false},
+		{"selected completed", live("completed"), true, false},
+	}
+	tm := theme.DefaultTheme()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.card.attachHintEligible(tc.selected); got != tc.wantHint {
+				t.Errorf("attachHintEligible(selected=%v) = %v, want %v", tc.selected, got, tc.wantHint)
+			}
+			for _, plain := range []bool{true, false} {
+				// Full card: the status row carries the hint within budget.
+				rows := cardText(tc.card, tc.selected, plain, now, 60)
+				if !plain {
+					rows = rows[1 : len(rows)-1] // drop the frame rows
+				}
+				full := strings.Join(rows, "\n")
+				if len(rows) != cardBodyRows {
+					t.Fatalf("plain=%v: hint must not add a row, got %d", plain, len(rows))
+				}
+				if tc.wantHint && !strings.Contains(full, attachHint) {
+					t.Errorf("plain=%v: eligible card lacks the hint:\n%s", plain, full)
+				}
+				if !tc.wantHint && strings.Contains(full, attachHint) {
+					t.Errorf("plain=%v: ineligible card shows the hint:\n%s", plain, full)
+				}
+				// Compact door at width 35: short fields leave room.
+				compact := renderGrid(tm, []SessionCard{tc.card}, map[bool]int{true: 0, false: -1}[tc.selected], 0, 35, 0, plain, now)
+				if tc.wantHint && !strings.Contains(compact, attachHint) {
+					t.Errorf("plain=%v: eligible compact row lacks the hint:\n%s", plain, compact)
+				}
+				if !tc.wantHint && strings.Contains(compact, attachHint) {
+					t.Errorf("plain=%v: ineligible compact row shows the hint:\n%s", plain, compact)
+				}
+				for _, line := range strings.Split(compact, "\n") {
+					if w := lipgloss.Width(line); w > 35 {
+						t.Errorf("plain=%v: compact line exceeds its width: %q", plain, line)
+					}
+				}
+			}
+		})
 	}
 }

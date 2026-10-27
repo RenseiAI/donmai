@@ -855,8 +855,8 @@ func (m *Model) renderStreamTitle() string {
 
 // renderHeader renders the one-line host header: the host identity first,
 // then the scope (only when it narrows the default "all projects" view),
-// then the counters — sessions in scope, queue depth, the host's
-// occupied/total session slots, uptime and version. All values are local (daemon
+// then the counters — sessions in scope, queue depth, the compact
+// capacity strip (host active/max), uptime and version. All values are local (daemon
 // status/stats). The single line is budgeted against the terminal width:
 // lower-priority counters drop first, the host is kept whole whenever it
 // fits, and the only horizontal chrome is the style's one padding cell on
@@ -891,9 +891,9 @@ func (m *Model) renderHeader() string {
 }
 
 // headerCounterVariants lists the counter strings from richest to barest.
-// Counters drop lowest priority first — version, uptime, host slots, then
-// queue — before the in-scope session count itself, so a narrow header
-// keeps the work waiting before the host's capacity.
+// Counters drop lowest priority first — version, uptime, the capacity
+// strip, then queue — before the in-scope session count itself, so a
+// narrow header keeps the work waiting before the host's capacity.
 func headerCounterVariants(c Counters) []string {
 	status := fmt.Sprintf("%d running", c.Running)
 	if c.Sessions > c.Running {
@@ -901,7 +901,12 @@ func headerCounterVariants(c Counters) []string {
 	}
 	parts := []string{status, fmt.Sprintf("queue %d", c.QueueDepth)}
 	if c.MaxSessions > 0 {
-		parts = append(parts, fmt.Sprintf("slots %d/%d", c.HostActive, c.MaxSessions))
+		// Known capacity renders as a compact strip through the shared
+		// capacity formatter. Zero MaxSessions means an older daemon with
+		// unknown capacity, so the strip omits it and the queue keeps its
+		// higher drop priority.
+		capMax := c.MaxSessions
+		parts = append(parts, "cap "+format.CapacityRatio(c.HostActive, &capMax))
 	}
 	parts = append(parts, "uptime "+format.Duration(int(c.UptimeSeconds)))
 	if c.Version != "" {

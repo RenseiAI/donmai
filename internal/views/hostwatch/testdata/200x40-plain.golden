@@ -1,4 +1,4 @@
-build-host-01                                                                                                                             14 sessions   queue 2   slots 13/16   uptime 3h 16m   v0.72.68
+build-host-01                                                                                                                             14 sessions   queue 2   cap 13 / 16   uptime 3h 16m   v0.72.68
   ● ENG-1284  Fix flaky retry in the upload worker
     web · development
     claude-sonnet-4-5 · claude-code
@@ -7,7 +7,7 @@ build-host-01                                                                   
 > ● ENG-1290  Migrate the billing reconciliation job to the new ledger schema and backfill historical rows without downtime
     billing · qa
     gpt-5-codex · codex
-    running 12m
+    running 12m · attachable
     2s ago · Reconciliation totals match for the sampled accounts red.
   ● ENG-1301  日本語のドキュメントを更新する
     docs · development
