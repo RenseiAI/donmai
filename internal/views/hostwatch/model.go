@@ -169,6 +169,15 @@ type Model struct {
 	// detail, when true, replaces the stream pane with the selected
 	// session's full detail (enter toggles, esc closes).
 	detail bool
+
+	// filterActive, when true, narrows the visible card grid to the
+	// cards matching filterQuery. The source snapshot (m.cards),
+	// counters, tailers, and the merged stream are never affected:
+	// filtering is a derived card-grid projection only.
+	filterActive bool
+	// filterQuery is the live filter text typed after "/". Empty
+	// matches every card; clearing restores snapshot order.
+	filterQuery string
 }
 
 // New constructs a host-watch Model.
@@ -306,19 +315,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.filterActive {
+		if _, done := m.handleFilterKey(msg); done {
+			return m, nil
+		}
+		// Printable keys (including q, f, and navigation letters) are
+		// consumed as filter text while filtering and never reach the
+		// global shortcuts below. Only non-printable keys fall through.
+		if msg.Text != "" {
+			return m, nil
+		}
+	}
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
+	case "/":
+		m.filterActive = true
+		m.filterQuery = ""
+		// Entering with an empty query shows every card; keep the
+		// current selection by id (a no-op when unfiltered).
+		m.reconcileVisibleCursor(m.selectedVisibleID())
+		return m, nil
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
 		}
 	case "down", "j":
-		if m.cursor < len(m.cards)-1 {
+		if m.cursor < len(m.visibleCards())-1 {
 			m.cursor++
 		}
 	case "enter":
-		m.detail = !m.detail && len(m.cards) > 0
+		vis := m.visibleCards()
+		m.detail = !m.detail && len(vis) > 0 && m.cursor >= 0 && m.cursor < len(vis)
 	case "esc":
 		m.detail = false
 	case "f":
@@ -333,6 +361,136 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.setSplit(defaultSplitRatio)
 	}
 	return m, nil
+}
+
+// handleFilterKey routes keys while the card filter is active. It returns
+// true when the key was consumed as filter input (or filter navigation)
+// and no global shortcut should run. Printable text appends to the query;
+// backspace deletes one rune; escape clears the query and exits filtering.
+// Arrow navigation and enter operate on the visible slice; ctrl+c still
+// quits and is left for the global handler (false).
+func (m *Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, bool) {
+	// Match by name and by code: String() is the documented matcher, Code
+	// is the foolproof fallback for special keys.
+	if msg.Code == tea.KeyEscape || msg.String() == "esc" || msg.String() == "escape" {
+		keep := m.selectedVisibleID()
+		m.filterQuery = ""
+		m.filterActive = false
+		m.detail = false
+		m.reconcileVisibleCursor(keep)
+		return m, true
+	}
+	if msg.Code == tea.KeyBackspace || msg.String() == "backspace" {
+		keep := m.selectedVisibleID()
+		m.filterQuery = deleteLastRune(m.filterQuery)
+		m.reconcileVisibleCursor(keep)
+		return m, true
+	}
+	switch msg.String() {
+	case "up":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		return m, true
+	case "down":
+		if m.cursor < len(m.visibleCards())-1 {
+			m.cursor++
+		}
+		return m, true
+	case "enter":
+		vis := m.visibleCards()
+		m.detail = !m.detail && len(vis) > 0 && m.cursor >= 0 && m.cursor < len(vis)
+		return m, true
+	case "ctrl+c":
+		return m, false
+	}
+	if msg.Text != "" {
+		keep := m.selectedVisibleID()
+		m.filterQuery += msg.Text
+		m.reconcileVisibleCursor(keep)
+		return m, true
+	}
+	return m, false
+}
+
+// visibleCards returns the cards matching the active filter in snapshot
+// order. With no active filter (or an empty query) it returns the full
+// source slice; otherwise it returns a derived projection. The source
+// slice (m.cards) is never mutated by filtering.
+func (m *Model) visibleCards() []SessionCard {
+	if !m.filterActive || m.filterQuery == "" {
+		return m.cards
+	}
+	lower := strings.ToLower(m.filterQuery)
+	out := make([]SessionCard, 0, len(m.cards))
+	for _, c := range m.cards {
+		if cardMatchesFilter(c, lower) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// cardMatchesFilter reports whether a card matches the lowercased query
+// over the sanitized display surfaces only: display identity, title,
+// repository name, and work type. All four are cleaned before comparison
+// so ANSI escapes and control characters never reach search.
+func cardMatchesFilter(c SessionCard, lowerQuery string) bool {
+	if lowerQuery == "" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(c.displayID()), lowerQuery) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(c.title()), lowerQuery) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(c.repoName()), lowerQuery) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(cleanText(c.WorkType)), lowerQuery) {
+		return true
+	}
+	return false
+}
+
+// selectedVisibleID returns the SessionID under the cursor in the current
+// visible slice, or "" when nothing is selected.
+func (m *Model) selectedVisibleID() string {
+	vis := m.visibleCards()
+	if m.cursor >= 0 && m.cursor < len(vis) {
+		return vis[m.cursor].SessionID
+	}
+	return ""
+}
+
+// reconcileVisibleCursor repoints the cursor at the visible slice,
+// preserving keepID when it remains visible. Exclusion selects the first
+// match; no matches (or no cards) selects nothing without panicking.
+func (m *Model) reconcileVisibleCursor(keepID string) {
+	vis := m.visibleCards()
+	if len(vis) == 0 {
+		m.cursor = 0
+		return
+	}
+	if keepID != "" {
+		for i := range vis {
+			if vis[i].SessionID == keepID {
+				m.cursor = i
+				return
+			}
+		}
+	}
+	m.cursor = 0
+}
+
+// deleteLastRune removes the final Unicode rune (rune-safe backspace).
+func deleteLastRune(s string) string {
+	r := []rune(s)
+	if len(r) == 0 {
+		return s
+	}
+	return string(r[:len(r)-1])
 }
 
 // setSplit clamps ratio into bounds. Only an explicit keypress changes the
@@ -386,6 +544,7 @@ func splitPaneHeights(contentH int, ratio float64) (gridH, streamH int) {
 // on every tick. Metrics carry over only for the same fenced run;
 // reordered cards keep their own metrics and removed ids drop theirs.
 func (m *Model) applySnapshot(snap Snapshot) {
+	keepID := m.selectedVisibleID()
 	m.snapErr = snap.Err
 	m.counters = snap.Counters
 	if snap.Err == nil {
@@ -413,12 +572,7 @@ func (m *Model) applySnapshot(snap Snapshot) {
 		}
 		m.cards = snap.Cards
 	}
-	if m.cursor >= len(m.cards) {
-		m.cursor = len(m.cards) - 1
-	}
-	if m.cursor < 0 {
-		m.cursor = 0
-	}
+	m.reconcileVisibleCursor(keepID)
 	m.reconcileTailers()
 }
 
@@ -794,16 +948,17 @@ func (m *Model) render() string {
 
 	gridH, streamH := splitPaneHeights(m.height-2, m.split)
 	rows := []string{header}
+	vis := m.visibleCards()
 	if unbounded {
-		rows = append(rows, renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, 0, true, m.now()))
+		rows = append(rows, renderGrid(m.theme, vis, m.cursor, m.frame, m.width, 0, true, m.now()))
 	} else {
-		grid := renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, gridH, m.opts.Plain, m.now())
+		grid := renderGrid(m.theme, vis, m.cursor, m.frame, m.width, gridH, m.opts.Plain, m.now())
 		rows = append(rows, fitLines(grid, gridH)...)
 	}
 	if streamH > 0 || unbounded {
 		bodyH := max(streamH-1, 0)
-		if m.detail && m.cursor < len(m.cards) {
-			card := m.cards[m.cursor]
+		if m.detail && m.cursor >= 0 && m.cursor < len(vis) {
+			card := vis[m.cursor]
 			rows = append(rows, detailTitle(card, m.opts.Plain, m.theme, m.width))
 			rows = append(rows, fitLines(strings.Join(renderDetail(m.theme, card, m.now(), m.width, bodyH, m.opts.Plain), "\n"), bodyH)...)
 		} else {
@@ -1000,7 +1155,11 @@ func truncateHeaderHost(host string, width int) string {
 const helpText = "↑↓/jk select   enter detail   [ ] split   0 reset   f follow/pause   g tail   q quit"
 
 func (m *Model) renderHelp() string {
-	help := truncateWidth(helpText, m.width)
+	help := helpText
+	if m.filterActive {
+		help += "   filter: /" + m.filterQuery
+	}
+	help = truncateWidth(help, m.width)
 	if m.opts.Plain {
 		return help
 	}
