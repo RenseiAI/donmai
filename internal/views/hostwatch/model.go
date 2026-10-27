@@ -2,6 +2,7 @@ package hostwatch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -10,6 +11,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/tui-components/format"
 	"github.com/RenseiAI/tui-components/theme"
@@ -59,6 +61,28 @@ func HandleEnricherFrom(ctx context.Context) HandleEnricher {
 	return h
 }
 
+// HostActions is the narrow lifecycle-mutation surface the host-watch
+// model needs. *afclient.DaemonClient satisfies it; tests inject a fake.
+// Every method runs off the render loop in a Bubble Tea command with a
+// bounded context. The daemon owns lifecycle truth: an accepted command
+// reports the response (or the sanitized error) and returns a fresh index
+// poll — it never edits cards or counters directly.
+type HostActions interface {
+	PauseContext(ctx context.Context) (*afclient.DaemonActionResponse, error)
+	ResumeContext(ctx context.Context) (*afclient.DaemonActionResponse, error)
+	DrainContext(ctx context.Context, timeoutSeconds int) (*afclient.DaemonActionResponse, error)
+	StopSessionContext(ctx context.Context, sessionID string) (*afclient.DaemonActionResponse, error)
+}
+
+// DefaultDrainTimeoutSeconds is the explicit drain deadline the model
+// sends when the command does not configure one. It mirrors the daemon's
+// own default so the request body and the command context carry the same
+// bound either way.
+const DefaultDrainTimeoutSeconds = 30
+
+// maxHostActionNoticeRunes bounds every rendered lifecycle outcome line.
+const maxHostActionNoticeRunes = 160
+
 // Options configures a hostwatch Model.
 type Options struct {
 	// Source is the local data layer (daemon index + state.json). Required.
@@ -91,6 +115,20 @@ type Options struct {
 	TailInterval  time.Duration
 	// Now overrides the clock (tests). Zero uses time.Now.
 	Now func() time.Time
+	// Actions performs host lifecycle mutations (pause, resume,
+	// deadline-bound drain, per-session stop) against the local daemon's
+	// authenticated control API. Nil keeps the dashboard a pure reader:
+	// action keys are ignored. Tests inject a fake; the command passes
+	// the production daemon client.
+	Actions HostActions
+	// ActionContext bounds lifecycle commands. Nil uses
+	// context.Background; the command passes its own context so
+	// cancellation ends in-flight actions with the program.
+	ActionContext context.Context
+	// DrainTimeoutSeconds is the explicit deadline sent in the drain
+	// request body and its command context. Zero uses
+	// DefaultDrainTimeoutSeconds.
+	DrainTimeoutSeconds int
 }
 
 // indexTickMsg drives the daemon index poll.
@@ -169,6 +207,31 @@ type Model struct {
 	// detail, when true, replaces the stream pane with the selected
 	// session's full detail (enter toggles, esc closes).
 	detail bool
+
+	// actions performs host lifecycle mutations (nil = pure reader).
+	actions HostActions
+	// actionCtx bounds lifecycle commands (never nil after New).
+	actionCtx context.Context
+	// drainTimeoutSecs is the explicit drain deadline in seconds.
+	drainTimeoutSecs int
+	// confirmKind is the lifecycle action awaiting confirmation (""
+	// when idle): "stop" for a per-session stop, "drain" for a host
+	// drain. The stop key sets "stop" with confirmStopID; the drain key
+	// sets "drain". y confirms with one request; n/esc or a selection
+	// change returns to idle with no request. Draining stops every
+	// session still running past the explicit deadline, so it shares
+	// the gate instead of firing on one keypress.
+	confirmKind string
+	// confirmStopID is the session id awaiting stop confirmation
+	// (valid only when confirmKind == "stop").
+	confirmStopID string
+	// actionBusy is true from an accepted action's dispatch until its
+	// result returns; duplicate action keys are ignored meanwhile.
+	actionBusy bool
+	// notice is the last bounded lifecycle outcome (response or
+	// sanitized error), rendered with the help row until the next
+	// action replaces it.
+	notice string
 }
 
 // New constructs a host-watch Model.
@@ -181,6 +244,14 @@ func New(opts Options) *Model {
 	if now == nil {
 		now = time.Now
 	}
+	actionCtx := opts.ActionContext
+	if actionCtx == nil {
+		actionCtx = context.Background()
+	}
+	drainSecs := opts.DrainTimeoutSeconds
+	if drainSecs <= 0 {
+		drainSecs = DefaultDrainTimeoutSeconds
+	}
 	idx := opts.IndexInterval
 	if idx <= 0 {
 		idx = defaultIndexInterval
@@ -190,17 +261,20 @@ func New(opts Options) *Model {
 		tail = defaultTailInterval
 	}
 	return &Model{
-		src:           opts.Source,
-		theme:         t,
-		opts:          opts,
-		now:           now,
-		indexInterval: idx,
-		tailInterval:  tail,
-		tailers:       map[string]*Tailer{},
-		prefixes:      newPrefixIndex(),
-		labels:        map[string]string{},
-		stream:        newStreamPane(),
-		split:         defaultSplitRatio,
+		src:              opts.Source,
+		theme:            t,
+		opts:             opts,
+		now:              now,
+		indexInterval:    idx,
+		tailInterval:     tail,
+		tailers:          map[string]*Tailer{},
+		prefixes:         newPrefixIndex(),
+		labels:           map[string]string{},
+		stream:           newStreamPane(),
+		split:            defaultSplitRatio,
+		actions:          opts.Actions,
+		actionCtx:        actionCtx,
+		drainTimeoutSecs: drainSecs,
 	}
 }
 
@@ -299,6 +373,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyTailBatch(msg.events)
 		return m, nil
 
+	case hostActionResultMsg:
+		m.actionBusy = false
+		m.notice = formatHostActionResult(msg)
+		return m, m.pollIndex()
+
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
@@ -306,7 +385,45 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	key := msg.String()
+	// A lifecycle confirmation is pending: y confirms with one request;
+	// n/esc or a selection change returns to idle with no request. Any
+	// other key is swallowed with the gate still armed. Quit still quits.
+	if m.confirmKind != "" {
+		switch key {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "y":
+			kind := m.confirmKind
+			id := m.confirmStopID
+			m.confirmKind, m.confirmStopID = "", ""
+			if kind == "drain" {
+				return m, m.startDrain()
+			}
+			if m.selectedCardID() != id {
+				return m, nil // selection moved: idle, no request
+			}
+			return m, m.startStopSession(id)
+		case "n", "esc":
+			m.confirmKind, m.confirmStopID = "", ""
+			return m, nil
+		case "up", "k":
+			m.confirmKind, m.confirmStopID = "", "" // selection change: idle, no request
+			if m.cursor > 0 {
+				m.cursor--
+			}
+			return m, nil
+		case "down", "j":
+			m.confirmKind, m.confirmStopID = "", "" // selection change: idle, no request
+			if m.cursor < len(m.cards)-1 {
+				m.cursor++
+			}
+			return m, nil
+		default:
+			return m, nil // swallow: only an explicit key resolves the gate
+		}
+	}
+	switch key {
 	case "ctrl+c", "q":
 		return m, tea.Quit
 	case "up", "k":
@@ -331,8 +448,216 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.setSplit(m.split + splitStep)
 	case "0":
 		m.setSplit(defaultSplitRatio)
+	case "x":
+		return m, m.requestStopConfirm()
+	case "p":
+		return m, m.startPause()
+	case "r":
+		return m, m.startResume()
+	case "d":
+		return m, m.requestDrainConfirm()
 	}
 	return m, nil
+}
+
+// selectedCardID reports the cursor's session id, or "" when no card
+// is selected.
+func (m *Model) selectedCardID() string {
+	if m.cursor >= 0 && m.cursor < len(m.cards) {
+		return m.cards[m.cursor].SessionID
+	}
+	return ""
+}
+
+// requestStopConfirm enters the stop gate for the selected session. It
+// sends no request; confirmation arrives on a later key.
+func (m *Model) requestStopConfirm() tea.Cmd {
+	if m.actions == nil || m.actionBusy || len(m.cards) == 0 {
+		return nil
+	}
+	if id := m.selectedCardID(); id != "" {
+		m.confirmKind = "stop"
+		m.confirmStopID = id
+	}
+	return nil
+}
+
+// requestDrainConfirm enters the drain gate. It sends no request;
+// confirmation arrives on a later key. The prompt names the effect:
+// sessions still running past the explicit deadline are stopped.
+func (m *Model) requestDrainConfirm() tea.Cmd {
+	if m.actions == nil || m.actionBusy {
+		return nil
+	}
+	m.confirmKind = "drain"
+	m.confirmStopID = ""
+	return nil
+}
+
+// startPause dispatches one authenticated pause request off the render
+// loop. Visible admission state changes only through the next snapshot.
+func (m *Model) startPause() tea.Cmd {
+	if m.actions == nil || m.actionBusy {
+		return nil
+	}
+	m.actionBusy = true
+	ctx, actions := m.actionCtx, m.actions
+	return func() tea.Msg {
+		resp, err := actions.PauseContext(ctx)
+		return hostActionResultMsg{kind: "pause", ok: err == nil && resp != nil && resp.OK, message: actionResponseMessage(resp), err: err}
+	}
+}
+
+// startResume dispatches one authenticated resume request off the render
+// loop. Visible admission state changes only through the next snapshot.
+func (m *Model) startResume() tea.Cmd {
+	if m.actions == nil || m.actionBusy {
+		return nil
+	}
+	m.actionBusy = true
+	ctx, actions := m.actionCtx, m.actions
+	return func() tea.Msg {
+		resp, err := actions.ResumeContext(ctx)
+		return hostActionResultMsg{kind: "resume", ok: err == nil && resp != nil && resp.OK, message: actionResponseMessage(resp), err: err}
+	}
+}
+
+// startDrain dispatches one deadline-bound drain request off the render
+// loop. The explicit timeout travels in both the request body and the
+// command context; the daemon owns drain truth and the next snapshot
+// carries the visible state.
+func (m *Model) startDrain() tea.Cmd {
+	if m.actions == nil || m.actionBusy {
+		return nil
+	}
+	secs := m.drainTimeoutSecs
+	if secs <= 0 {
+		secs = DefaultDrainTimeoutSeconds
+	}
+	m.actionBusy = true
+	actions := m.actions
+	ctx, cancel := context.WithTimeout(m.actionCtx, time.Duration(secs)*time.Second)
+	return func() tea.Msg {
+		defer cancel()
+		resp, err := actions.DrainContext(ctx, secs)
+		return hostActionResultMsg{kind: "drain", timeoutSecs: secs, ok: err == nil && resp != nil && resp.OK, message: actionResponseMessage(resp), err: err}
+	}
+}
+
+// startStopSession dispatches the single authenticated stop request for
+// the confirmed session id off the render loop. The acknowledged card
+// stays visible until a later snapshot omits it (terminal reap).
+func (m *Model) startStopSession(id string) tea.Cmd {
+	if m.actions == nil || m.actionBusy || id == "" {
+		return nil
+	}
+	m.actionBusy = true
+	ctx, actions := m.actionCtx, m.actions
+	return func() tea.Msg {
+		resp, err := actions.StopSessionContext(ctx, id)
+		return hostActionResultMsg{kind: "stop", sessionID: id, ok: err == nil && resp != nil && resp.OK, message: actionResponseMessage(resp), err: err}
+	}
+}
+
+// hostActionResultMsg carries one lifecycle command's outcome back to
+// the render loop. Handling reports it, releases the in-flight guard,
+// and returns a fresh index poll — it never edits cards or counters.
+type hostActionResultMsg struct {
+	kind        string
+	sessionID   string
+	timeoutSecs int
+	ok          bool
+	message     string
+	err         error
+}
+
+func actionResponseMessage(resp *afclient.DaemonActionResponse) string {
+	if resp == nil {
+		return ""
+	}
+	return resp.Message
+}
+
+// formatHostActionResult renders one lifecycle outcome as a single
+// bounded line. Failures and refusals never claim success and never
+// carry credential or header material.
+func formatHostActionResult(msg hostActionResultMsg) string {
+	target := msg.kind + ": "
+	switch msg.kind {
+	case "stop":
+		target = "stop " + shortID(sanitizeHostActionText(msg.sessionID)) + ": "
+	case "drain":
+		secs := msg.timeoutSecs
+		if secs <= 0 {
+			secs = DefaultDrainTimeoutSeconds
+		}
+		target = fmt.Sprintf("drain (%ds): ", secs)
+	}
+	if msg.err != nil {
+		return target + hostActionErrorDetail(msg.err)
+	}
+	if !msg.ok {
+		if detail := sanitizeHostActionText(msg.message); detail != "" {
+			return target + "refused: " + detail
+		}
+		return target + "refused"
+	}
+	if detail := sanitizeHostActionText(msg.message); detail != "" {
+		return target + detail
+	}
+	return target + "accepted"
+}
+
+// hostActionErrorDetail classifies a lifecycle failure for display. The
+// daemon's reason travels only through the sanitizer: bounded, with
+// bearer material redacted, so headers and credentials never render.
+func hostActionErrorDetail(err error) string {
+	detail := sanitizeHostActionText(err.Error())
+	switch {
+	case errors.Is(err, afclient.ErrNotAuthenticated) || errors.Is(err, afclient.ErrUnauthorized):
+		return "unauthorized: " + detail
+	case errors.Is(err, afclient.ErrUnavailable):
+		return "unavailable: " + detail
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+		return "timed out: " + detail
+	default:
+		return "failed: " + detail
+	}
+}
+
+// sanitizeHostActionText strips terminal escapes and controls, redacts
+// bearer credential material, and bounds the result to one notice line.
+func sanitizeHostActionText(s string) string {
+	return truncateRunes(redactBearerMaterial(cleanText(s)), maxHostActionNoticeRunes)
+}
+
+// redactBearerMaterial replaces every "Bearer <token>" span with a
+// fixed placeholder so a credential echoed in an error or detail can
+// never reach the display.
+func redactBearerMaterial(s string) string {
+	var b strings.Builder
+	lower := strings.ToLower(s)
+	for {
+		idx := strings.Index(lower, "bearer ")
+		if idx < 0 {
+			b.WriteString(s)
+			break
+		}
+		rest := s[idx+len("bearer "):]
+		if rest == "" {
+			// Trailing "Bearer " with no token: nothing to redact.
+			b.WriteString(s)
+			break
+		}
+		b.WriteString(s[:idx])
+		b.WriteString("Bearer [redacted]")
+		if i := strings.IndexAny(rest, " \t\n\r\"'"); i >= 0 {
+			s, lower = rest[i:], lower[idx+len("bearer ")+i:]
+		} else {
+			break
+		}
+	}
+	return b.String()
 }
 
 // setSplit clamps ratio into bounds. Only an explicit keypress changes the
@@ -997,10 +1322,23 @@ func truncateHeaderHost(host string, width int) string {
 }
 
 // helpText documents every key. It is truncated to the terminal width.
-const helpText = "↑↓/jk select   enter detail   [ ] split   0 reset   f follow/pause   g tail   q quit"
+const helpText = "↑↓/jk select   enter detail   x stop   p pause   r resume   d drain   [ ] split   0 reset   f follow/pause   g tail   q quit"
 
 func (m *Model) renderHelp() string {
-	help := truncateWidth(helpText, m.width)
+	help := helpText
+	switch {
+	case m.confirmKind == "stop":
+		help = "stop " + shortID(sanitizeHostActionText(m.confirmStopID)) + "? y confirm · n cancel"
+	case m.confirmKind == "drain":
+		secs := m.drainTimeoutSecs
+		if secs <= 0 {
+			secs = DefaultDrainTimeoutSeconds
+		}
+		help = fmt.Sprintf("drain host (%ds): sessions still running are stopped? y confirm · n cancel", secs)
+	case m.notice != "":
+		help = m.notice + "   " + helpText
+	}
+	help = truncateWidth(help, m.width)
 	if m.opts.Plain {
 		return help
 	}
