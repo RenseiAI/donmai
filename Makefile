@@ -125,7 +125,7 @@ warm-operational-payload-provenance-cache: verify-operational-payload-provenance
 # Lint on the release toolchain floor (go.mod), as CI's setup-go does: a newer
 # local Go writes export data the pinned golangci-lint cannot read.
 lint:
-	GOTOOLCHAIN=go1.26.6 golangci-lint run
+	GOTOOLCHAIN=go1.26.10 golangci-lint run
 
 # `guard` stays fast and scoped to what you're about to commit: self-test
 # (proves the rules still fire) + --staged (this change only). --all currently
@@ -187,4 +187,4 @@ verify-generated:
 # binaries, push a tag. Snapshot runs are version-only and never publish a cask
 # or alter GitHub's Latest release.
 release-dry-run:
-	GOWORK=off GOTOOLCHAIN=go1.26.6 GORELEASER_PUBLISH_HOMEBREW=false GORELEASER_MAKE_LATEST=false goreleaser release --snapshot --clean --skip=sign
+	GOWORK=off GOTOOLCHAIN=go1.26.10 GORELEASER_PUBLISH_HOMEBREW=false GORELEASER_MAKE_LATEST=false goreleaser release --snapshot --clean --skip=sign

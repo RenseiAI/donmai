@@ -52,7 +52,7 @@ brew install RenseiAI/homebrew-tap/donmai
 
 On Linux, use Go installation or a release archive below.
 
-### go install (requires Go 1.26.6+)
+### go install (requires Go 1.26.10+)
 
 ```bash
 go install github.com/RenseiAI/donmai/cmd/donmai@v0.72.74

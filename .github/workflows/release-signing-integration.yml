@@ -52,6 +52,6 @@ jobs:
 
       - name: Hermetic signing pipeline
         env:
-          GOTOOLCHAIN: go1.26.6
+          GOTOOLCHAIN: go1.26.10
           GOWORK: "off"
         run: bash scripts/test-sign-and-notarize.sh --goreleaser
