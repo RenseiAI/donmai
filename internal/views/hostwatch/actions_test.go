@@ -631,17 +631,18 @@ func TestModel_ActionErrorsAreBoundedAndSecretFree(t *testing.T) {
 			acts.pauseErr, acts.resumeErr, acts.drainErr, acts.stopErr = tc.err, tc.err, tc.err, tc.err
 			m := newActionTestModel(t, actionTestSessions("sess-a"), acts, 0)
 			var cmd tea.Cmd
-			if tc.key == "y" {
+			switch tc.key {
+			case "y":
 				if _, c := pressActionKey(m, "x"); c != nil {
 					t.Fatal("stop key must not dispatch")
 				}
 				_, cmd = pressActionKey(m, "y")
-			} else if tc.key == "d" {
+			case "d":
 				if _, c := pressActionKey(m, "d"); c != nil {
 					t.Fatal("drain key must arm confirmation without a request")
 				}
 				_, cmd = pressActionKey(m, "y")
-			} else {
+			default:
 				_, cmd = pressActionKey(m, tc.key)
 			}
 			runActionCmd(t, m, cmd)

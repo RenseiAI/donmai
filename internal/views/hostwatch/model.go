@@ -1326,15 +1326,16 @@ const helpText = "↑↓/jk select   enter detail   x stop   p pause   r resume 
 
 func (m *Model) renderHelp() string {
 	help := helpText
-	if m.confirmKind == "stop" {
+	switch {
+	case m.confirmKind == "stop":
 		help = "stop " + shortID(sanitizeHostActionText(m.confirmStopID)) + "? y confirm · n cancel"
-	} else if m.confirmKind == "drain" {
+	case m.confirmKind == "drain":
 		secs := m.drainTimeoutSecs
 		if secs <= 0 {
 			secs = DefaultDrainTimeoutSeconds
 		}
 		help = fmt.Sprintf("drain host (%ds): sessions still running are stopped? y confirm · n cancel", secs)
-	} else if m.notice != "" {
+	case m.notice != "":
 		help = m.notice + "   " + helpText
 	}
 	help = truncateWidth(help, m.width)
