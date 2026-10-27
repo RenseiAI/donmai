@@ -33,9 +33,47 @@ const (
 	maxActivityRunes = 240
 )
 
-// animFrames is the status-dot pulse animation. A running session cycles
-// these; a terminal or idle session shows a static glyph.
-var animFrames = []string{"●", "◉", "○", "◉"} // ● ◉ ○ ◉
+// livePulseDot cycles the live status-dot pulse. The head and mid frames
+// reuse the shared status registry's working/parked symbols so the live
+// dot and the held dot stay one vocabulary; the fisheye frames have no
+// registry equivalent and remain local literals. The four-beat timing is
+// preserved: the frame advances once per index tick.
+func livePulseDot(frame int) string {
+	frames := []string{
+		theme.GetStatusStyle("working").Symbol,
+		"◉",
+		theme.GetStatusStyle("parked").Symbol,
+		"◉",
+	}
+	return frames[frame%len(frames)]
+}
+
+// selectionMarker is the selection role shared by both render doors: full
+// cards (renderCard) and the compact fallback (renderCompactList). The
+// selected row carries the marker (">" without color); unselected rows a
+// blank, so selection never changes geometry. The pinned shared module
+// exports no equivalent selection glyph, so the shape stays local while
+// the role itself is defined once and used identically in both doors.
+func selectionMarker(selected, plain bool) string {
+	if !selected {
+		return " "
+	}
+	if plain {
+		return ">"
+	}
+	return "▸"
+}
+
+// attachHint marks a selected live card as attachable. It is descriptive
+// text only: this view offers no attach key, command, callback or request.
+const attachHint = "attachable"
+
+// attachHintEligible reports whether a card shows the attach hint: the
+// selected live session only. Unselected, held/unknown, failed,
+// terminated and completed cards are ineligible.
+func (c SessionCard) attachHintEligible(selected bool) bool {
+	return selected && isLiveState(c.DaemonState)
+}
 
 // statusColor maps a card's effective status to a theme status color.
 // Colors are read from the theme exclusively.
@@ -87,7 +125,8 @@ func joinSegments(segs []segment, plain bool) string {
 //  1. selection marker, status dot, issue id and title
 //  2. project (repository) and work type
 //  3. model (with the observed serving model when it differs) and harness
-//  4. state, elapsed time, and turns / cost when the harness reported them
+//  4. state, elapsed time, turns / cost when the harness reported them,
+//     and the attach hint when the card is selected and live
 //  5. age of the last activity and what it was
 //
 // Values are bare; a label appears only where a bare value would be
@@ -102,11 +141,8 @@ func joinSegments(segs []segment, plain bool) string {
 // padded, and the selection marker is ">".
 func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool, now time.Time, width int) string {
 	if plain {
-		marker := "  "
-		if selected {
-			marker = "> "
-		}
-		rows := cardRows(t, card, frame, true, now, width-len(marker))
+		marker := selectionMarker(selected, true) + " "
+		rows := cardRows(t, card, frame, selected, true, now, width-len(marker))
 		for i := range rows {
 			lead := "  "
 			if i == 0 {
@@ -120,14 +156,14 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	if inner < 1 {
 		inner = 1
 	}
-	rows := cardRows(t, card, frame, false, now, inner)
+	rows := cardRows(t, card, frame, selected, false, now, inner)
 	border := lipgloss.RoundedBorder()
 	borderColor := t.SurfaceBorder
 	marker := " "
 	if selected {
 		border = lipgloss.ThickBorder()
 		borderColor = t.SurfaceBorderBright
-		marker = lipgloss.NewStyle().Bold(true).Foreground(t.Accent).Render("▸")
+		marker = lipgloss.NewStyle().Bold(true).Foreground(t.Accent).Render(selectionMarker(true, false))
 	}
 	bs := lipgloss.NewStyle().Foreground(borderColor)
 	out := make([]string, 0, len(rows)+2)
@@ -153,8 +189,10 @@ func cardHeight(plain bool) int {
 
 // cardRows returns the card's content rows (always cardBodyRows of them),
 // each composed and truncated to at most inner cells. Plain rows after the
-// first are indented to line up under the issue id.
-func cardRows(t theme.Theme, card SessionCard, frame int, plain bool, now time.Time, inner int) []string {
+// first are indented to line up under the issue id. A selected live card
+// appends the attach hint to its status row within the same budget, so the
+// row count and geometry never change.
+func cardRows(t theme.Theme, card SessionCard, frame int, selected, plain bool, now time.Time, inner int) []string {
 	sc := statusColor(t, card)
 	primary := lipgloss.NewStyle().Foreground(t.TextPrimary)
 	secondary := lipgloss.NewStyle().Foreground(t.TextSecondary)
@@ -193,6 +231,9 @@ func cardRows(t theme.Theme, card SessionCard, frame int, plain bool, now time.T
 		}
 		if card.Errored {
 			status = append(status, segment{" · errored", lipgloss.NewStyle().Foreground(t.StatusError)})
+		}
+		if card.attachHintEligible(selected) {
+			status = append(status, segment{" · " + attachHint, tertiary})
 		}
 		activity = card.activitySegments(now, indent+card.streamingIndicator(now, plain), primary, tertiary)
 	}
@@ -328,15 +369,17 @@ func repoShortName(repo string) string {
 }
 
 // statusDot is the pulsing status glyph: animated while live, a hollow
-// glyph for held rows, static otherwise.
+// glyph for held rows, static otherwise. The live head frame and the held
+// and static dots reuse the shared status registry's working/parked
+// symbols; state mapping, pulse timing, colors and geometry are unchanged.
 func (c SessionCard) statusDot(frame int) string {
 	switch {
 	case c.isHeld():
-		return "○"
+		return theme.GetStatusStyle("parked").Symbol
 	case isLiveState(c.DaemonState):
-		return animFrames[frame%len(animFrames)]
+		return livePulseDot(frame)
 	default:
-		return animFrames[0]
+		return theme.GetStatusStyle("working").Symbol
 	}
 }
 

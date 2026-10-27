@@ -8,9 +8,12 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/RenseiAI/tui-components/format"
 	"github.com/RenseiAI/tui-components/theme"
 	"github.com/charmbracelet/x/ansi"
 )
+
+func intPtr(n int) *int { return &n }
 
 func TestSplitPaneHeights_DefaultFiftyFifty(t *testing.T) {
 	gridH, streamH := splitPaneHeights(20, defaultSplitRatio)
@@ -132,28 +135,46 @@ func TestTruncateWidth_Graphemes(t *testing.T) {
 	}
 }
 
-// TestModel_HeaderShowsHostSlots: the header carries the host's occupied
-// and total session slots after the queue, and drops them before the queue
+// TestModel_HeaderShowsHostSlots: the header carries the compact capacity
+// strip (host active/max) after the queue, and drops it before the queue
 // (but after uptime and version) when narrowing.
 func TestModel_HeaderShowsHostSlots(t *testing.T) {
 	m := New(Options{Plain: true, HostLabel: "studio-test"})
 	m.counters = Counters{Running: 3, HostActive: 9, MaxSessions: 64, QueueDepth: 1, UptimeSeconds: 60, Version: "1.2.3"}
 	m.width = 120
-	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1   slots 9/64   uptime 1m   v1.2.3") {
-		t.Errorf("wide header lacks host slots: %q", out)
+	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1   cap 9 / 64   uptime 1m   v1.2.3") {
+		t.Errorf("wide header lacks the capacity strip: %q", out)
 	}
 	m.width = 48
-	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1   slots 9/64") || strings.Contains(out, "uptime") {
-		t.Errorf("slots must outlast uptime/version: %q", out)
+	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1   cap 9 / 64") || strings.Contains(out, "uptime") {
+		t.Errorf("capacity strip must outlast uptime/version: %q", out)
 	}
 	m.width = 36
-	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1") || strings.Contains(out, "slots") {
-		t.Errorf("narrow header keeps the queue before slots: %q", out)
+	if out := m.renderHeader(); !strings.Contains(out, "3 running   queue 1") || strings.Contains(out, "cap ") {
+		t.Errorf("narrow header keeps the queue before the capacity strip: %q", out)
 	}
 	m.counters.MaxSessions = 0 // an older daemon without capacity
 	m.width = 120
-	if out := m.renderHeader(); strings.Contains(out, "slots") {
-		t.Errorf("unknown capacity must not render as slots: %q", out)
+	if out := m.renderHeader(); strings.Contains(out, "cap ") {
+		t.Errorf("unknown capacity must not render a capacity strip: %q", out)
+	}
+}
+
+// TestModel_HeaderCapacityStripUsesSharedFormat pins the strip to the
+// shared capacity formatter: known capacity renders active/max plus the
+// queue, and zero MaxSessions omits capacity while keeping the queue.
+// Removing the known-capacity branch loses the strip (AC-1 mutant).
+func TestModel_HeaderCapacityStripUsesSharedFormat(t *testing.T) {
+	m := New(Options{Plain: true, HostLabel: "h"})
+	m.counters = Counters{Running: 3, Sessions: 3, HostActive: 9, MaxSessions: 64, QueueDepth: 1}
+	m.width = 120
+	want := "cap " + format.CapacityRatio(9, intPtr(64))
+	if out := m.renderHeader(); !strings.Contains(out, want) || !strings.Contains(out, "queue 1") {
+		t.Errorf("known capacity must render %q plus queue: %q", want, out)
+	}
+	m.counters.MaxSessions = 0
+	if out := m.renderHeader(); strings.Contains(out, "cap ") || !strings.Contains(out, "queue 1") {
+		t.Errorf("unknown capacity omits the strip but keeps the queue: %q", out)
 	}
 }
 

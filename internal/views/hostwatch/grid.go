@@ -215,20 +215,15 @@ func overflowMarker(t theme.Theme, above bool, n int, plain bool) string {
 
 // renderCompactList is the tiny-terminal fallback (width < minCardWidth):
 // one line per session — selection marker, status dot, issue id, state,
-// elapsed and title — truncated to the terminal width and windowed around
-// the selection, so sessions stay reachable where no full card fits.
+// elapsed, title and the attach hint when selected and live — truncated to
+// the terminal width and windowed around the selection, so sessions stay
+// reachable where no full card fits.
 func renderCompactList(t theme.Theme, cards []SessionCard, selectedIdx, frame, width, maxLines int, plain bool, now time.Time) string {
 	width = max(width, 1)
 	blocks := make([]string, len(cards))
 	counts := make([]int, len(cards))
 	for i, c := range cards {
-		marker := " "
-		if i == selectedIdx {
-			marker = ">"
-			if !plain {
-				marker = "▸"
-			}
-		}
+		marker := selectionMarker(i == selectedIdx, plain)
 		state := c.displayState() + " " + c.elapsedText(now)
 		segs := []segment{
 			{marker + " ", lipgloss.NewStyle().Bold(true).Foreground(t.Accent)},
@@ -238,6 +233,9 @@ func renderCompactList(t theme.Theme, cards []SessionCard, selectedIdx, frame, w
 		}
 		if title := c.title(); title != "" {
 			segs = append(segs, segment{" · " + title, lipgloss.NewStyle().Foreground(t.TextTertiary)})
+		}
+		if c.attachHintEligible(i == selectedIdx) {
+			segs = append(segs, segment{" · " + attachHint, lipgloss.NewStyle().Foreground(t.TextTertiary)})
 		}
 		blocks[i] = truncateWidth(joinSegments(segs, plain), width)
 		counts[i] = 1
