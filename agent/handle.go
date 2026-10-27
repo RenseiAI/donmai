@@ -35,3 +35,30 @@ type Handle interface {
 	// then SIGKILL for child-process providers).
 	Stop(ctx context.Context) error
 }
+
+// TerminalTranscriptDescriptor is a path-only descriptor for one
+// session-owned transcript file.
+//
+// It carries path metadata only. Holders retain a copy without reading,
+// opening, validating, or serializing the file it names.
+type TerminalTranscriptDescriptor struct {
+	// Path is the session-owned transcript file path.
+	Path string
+}
+
+// TerminalTranscriptCapable is the optional capability a Handle
+// implements when its session maintains transcript files that survive
+// the session.
+//
+// It mirrors NoticeChannelCapable: callers type-assert, and absence of
+// the interface means the session exposes no descriptors. Descriptors
+// are valid only after Stop has returned; implementations refuse the
+// call while writers may still be active.
+type TerminalTranscriptCapable interface {
+	Handle
+
+	// TerminalTranscripts returns path-only descriptors for this
+	// handle's session. Valid only after Stop has returned; before
+	// then it returns an error.
+	TerminalTranscripts() ([]TerminalTranscriptDescriptor, error)
+}
