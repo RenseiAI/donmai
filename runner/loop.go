@@ -1760,6 +1760,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	reviewWork := RequiresReviewVerdict(qw.WorkType, qw.WorkTypeRole)
 	continuable := (RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
 	tailRecoverable := selectedRepositoryMutable || reviewWork
+	narration := r.newNarrationNudgeState()
 tailRecovery:
 	for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
 		steerView := streamRes
@@ -1782,6 +1783,19 @@ tailRecovery:
 			}
 		}
 		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
+		// Narration-only stop: a development turn that ended on a
+		// narration-only assistant message with no new commit and no
+		// delivering pull request gets the narration wording on its next
+		// continuation, once per session. An explicit blocked/verdict
+		// result is never nudged. The wording is only a prompt swap: the
+		// generic continuation bounds (unproductive streak, ceiling,
+		// undelivered) still decide exhaustion, so a productive agent that
+		// ends several turns on a progress note keeps working. A disabled
+		// nudge (limit 0) never counts as narration: the turn stays on the
+		// generic continuation prompt. step == tailContinue is required:
+		// retry replaces the prompt wholesale, and steer/done/exhausted
+		// never reach the continuation prompt below.
+		isNarration := step == tailContinue && narration.canNudge() && isNarrationOnlyStop(qw, res, streamRes, lastTurn, reportedPR, followUps.undelivered) && !r.sessionHasNewCommit(ctx, res, wpath)
 		switch step {
 		case tailDone:
 			break tailRecovery
@@ -1838,7 +1852,13 @@ tailRecovery:
 		// arrives without the goal and the seat can decline it, losing
 		// the verdict the prior turn reached. The retry and wrap-up
 		// prompts replace the base text wholesale below, as before.
+		// A narration-only stop carries its own prompt: the turn ended on
+		// a progress note with no new commit, so the nudge names that and
+		// asks for commit, push and report.
 		prompt := continuationPrompt(reviewWork, followUps.undelivered, continueGoalBlock(qw))
+		if isNarration {
+			prompt = narrationNudgePromptFor(qw)
+		}
 		wrapUp := enforcer.wrapUpDue()
 		if step == tailRetry {
 			prompt = retryPrompt
@@ -1852,6 +1872,9 @@ tailRecovery:
 				stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err)
 				if stopped {
 					res.TurnContinuations = followUps.report()
+					if res.TurnContinuations != nil && narration.sent > 0 {
+						res.TurnContinuations.NarrationNudges = narration.sent
+					}
 					res.Cost = enforcer.cost()
 					return res, stopErr
 				}
@@ -1875,6 +1898,17 @@ tailRecovery:
 			r.logger.Info("token budget nearly spent; asking the agent to wrap up",
 				"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
 		}
+		// Only a delivered narration prompt consumes the budget: when the
+		// wrap-up prompt replaces it, nothing is recorded and no activity
+		// is posted, so the next narration-only stop still gets its nudge.
+		sentNarration := isNarration && !wrapUp
+		if sentNarration {
+			r.logger.Info("turn ended on a narration-only message with no new commit; sending the narration nudge",
+				"sessionId", qw.SessionID,
+				"narrationNudge", narration.sent+1,
+				"limit", narration.limit,
+			)
+		}
 		newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
 		handle = newHandle
 		if err != nil || !delivered {
@@ -1890,10 +1924,17 @@ tailRecovery:
 		} else {
 			followUps.sentContinuation()
 		}
+		if sentNarration {
+			narration.recordSent()
+			r.postNarrationNudgeActivity(ctx, sink)
+		}
 		tail, tailErr := r.consumeEventsWithoutStallDetector(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, beacons)
 		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
 		if stopped {
 			res.TurnContinuations = followUps.report()
+			if res.TurnContinuations != nil && narration.sent > 0 {
+				res.TurnContinuations.NarrationNudges = narration.sent
+			}
 			res.Cost = enforcer.cost()
 			return res, stopErr
 		}
@@ -1906,6 +1947,14 @@ tailRecovery:
 		}
 	}
 	res.TurnContinuations = followUps.report()
+	// A recorded narration nudge always follows sentContinuation, so report
+	// is non-nil whenever sent > 0: there is no nil branch to maintain.
+	if narration.sent > 0 && res.TurnContinuations != nil {
+		res.TurnContinuations.NarrationNudges = narration.sent
+		if res.FailureMode == FailureContinuationsUnproductive || res.FailureMode == FailureContinuationsCeiling {
+			res.TurnContinuations.Exhausted = true
+		}
+	}
 	res.Cost = enforcer.cost()
 
 	// 11·B. Budget stop. A cap ended the session: the runner stopped the
@@ -2800,6 +2849,11 @@ type streamObservation struct {
 	// carried. Tail recovery reads a turn with at least one as productive
 	// (turn_continuation.go).
 	toolCalls int
+	// toolAfterLastAssistant reports whether a tool call was observed after
+	// the most recent non-empty assistant message. A narration-only ending
+	// has a last assistant message with no tool call: lastAssistantText is
+	// set and no ToolUseEvent came after it. Updated in observeEvent.
+	toolAfterLastAssistant bool
 	// finalProvider names the provider the stream's model calls last
 	// identified from native response evidence
 	// (LlmCallEvent.ResponseModelProvider): the provider the wire response
@@ -3422,6 +3476,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.AssistantTextEvent:
 		if strings.TrimSpace(e.Text) != "" {
 			obs.lastAssistantText = e.Text
+			obs.toolAfterLastAssistant = false
 			obs.providerError = ""
 			obs.providerErrorNotRetryable = false
 			obs.upstream = nil
@@ -3466,6 +3521,12 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		}
 	case agent.ToolUseEvent:
 		obs.toolCalls++
+		// A tool call after the latest assistant message means that
+		// message carried a tool call: the turn did not end on a
+		// narration-only message.
+		if strings.TrimSpace(obs.lastAssistantText) != "" {
+			obs.toolAfterLastAssistant = true
+		}
 		// The model produced a tool call: any earlier provider error in
 		// this stream was recovered from.
 		obs.providerError = ""

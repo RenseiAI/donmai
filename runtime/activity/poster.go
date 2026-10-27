@@ -825,6 +825,15 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.ContextKey = SignalGuardDegradedContextKey
 			out.ContextValue = SignalGuardDegradedContextValue
 			return out, true
+		case NarrationNudgeSubtype:
+			// A narration-only continuation nudge the runner sent after a
+			// development turn that ended on a progress note with no new
+			// commit or pull request. Fixed content keeps the marker safe.
+			out.Type = "context"
+			out.Content = NarrationNudgeContent
+			out.ContextKey = NarrationNudgeContextKey
+			out.ContextValue = NarrationNudgeContextValue
+			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
 		// command_progress, diff_updated, compaction, stream progress, and
@@ -929,6 +938,25 @@ const SignalGuardDegradedContextKey = "signalGuardDegraded"
 // SignalGuardDegradedContextValue is the fixed contextValue of a
 // signal-guard degraded marker.
 const SignalGuardDegradedContextValue = "degraded"
+
+// NarrationNudgeSubtype is the session activity marker the runner sends
+// when it nudges a narration-only stop. Exported so the runner aliases it
+// instead of duplicating the literal: a change here breaks the runner build,
+// never drifts silently. It mirrors the runner constant (same import-cycle
+// reason as the signal-guard literals above, in reverse).
+const NarrationNudgeSubtype = "narration_nudge"
+
+// NarrationNudgeContent is the fixed activity content for a narration-only
+// continuation nudge.
+const NarrationNudgeContent = "runner sent a narration-only continuation nudge"
+
+// NarrationNudgeContextKey is the contextKey a narration-nudge marker
+// carries.
+const NarrationNudgeContextKey = "narrationNudge"
+
+// NarrationNudgeContextValue is the fixed contextValue of a narration-nudge
+// marker.
+const NarrationNudgeContextValue = "sent"
 
 // toolCallBoundsNotConfiguredContent is the fixed text forwarded when the
 // session carries no per-call bound; toolCallBoundsContentPrefix prefixes

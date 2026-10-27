@@ -382,6 +382,12 @@ type scriptedSession struct {
 	// continuationUndeliveredLimit is
 	// Options.TurnContinuationUndeliveredLimit (0 = default).
 	continuationUndeliveredLimit int
+	// narrationLimit is Options.NarrationNudgeLimit. Zero keeps the
+	// narration nudge disabled for scripted sessions that predate it, so
+	// their generic-continuation expectations stay byte-identical;
+	// set it to 1 (or 0 via a dedicated constructor) to enable the
+	// narration-only nudge under test.
+	narrationLimit int
 	// idleTimeout is Options.IdleTimeout (0 = default).
 	idleTimeout time.Duration
 	// providerStallTimeout is Options.ProviderStallTimeout (0 = default).
@@ -450,6 +456,14 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.TurnContinuationLimit = cfg.continuationLimit
 		o.TurnContinuationCeiling = cfg.continuationCeiling
 		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
+		// Scripted sessions that predate the narration nudge keep it
+		// disabled (their generic-continuation expectations stay
+		// byte-identical); narration tests opt in with narrationLimit 1.
+		if cfg.narrationLimit == 0 {
+			o.NarrationNudgeLimit = -1
+		} else {
+			o.NarrationNudgeLimit = cfg.narrationLimit
+		}
 		o.IdleTimeout = cfg.idleTimeout
 		o.ProviderStallTimeout = cfg.providerStallTimeout
 		o.ProviderStallRetries = cfg.providerStallRetries

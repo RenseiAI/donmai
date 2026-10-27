@@ -713,6 +713,14 @@ func TestEventMappingTable(t *testing.T) {
 			wantContext: "signalGuardDegraded=degraded",
 		},
 		{
+			name:        "System narration nudge -> context with fixed content",
+			event:       agent.SystemEvent{Subtype: "narration_nudge", Message: "runner sent a narration-only continuation nudge"},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "runner sent a narration-only continuation nudge",
+			wantContext: "narrationNudge=sent",
+		},
+		{
 			name:     "System signal guard refused empty message -> skipped",
 			event:    agent.SystemEvent{Subtype: "signal_guard_refused", Message: "  \n\t"},
 			wantSent: false,

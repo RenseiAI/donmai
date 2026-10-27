@@ -137,6 +137,8 @@ type recordingPlatformServer struct {
 	// block the run loop: the worker's own timeout bounds the wait,
 	// not the endpoint.
 	beaconHang time.Duration
+	// activities are the bodies of every /activity post, in order.
+	activities [][]byte
 }
 
 // terminalStatus returns the last terminal /status body the double received,
@@ -167,6 +169,13 @@ func (s *recordingPlatformServer) beaconPosts() [][]byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([][]byte(nil), s.beacons...)
+}
+
+// activityPosts returns a copy of every /activity body received.
+func (s *recordingPlatformServer) activityPosts() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]byte(nil), s.activities...)
 }
 
 // injectReports returns every ack and dead-letter the worker echoed.
@@ -249,6 +258,12 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 				default:
 				}
 			}
+		}
+		if strings.HasSuffix(r.URL.Path, "/activity") {
+			body, _ := io.ReadAll(r.Body)
+			rec.mu.Lock()
+			rec.activities = append(rec.activities, body)
+			rec.mu.Unlock()
 		}
 		if strings.HasSuffix(r.URL.Path, "/status") {
 			body, _ := io.ReadAll(r.Body)
