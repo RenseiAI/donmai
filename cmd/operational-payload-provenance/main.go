@@ -27,7 +27,7 @@ const (
 	generatorVersion    = "2"
 	pinnedTag           = "v0.72.2"
 	pinnedCommit        = "a177e8929f1b0b0cd27fc6c8480f6cc210fde1ff"
-	pinnedGoVersion     = "go1.26.6"
+	pinnedGoVersion     = "go1.26.10"
 	artifactPath        = "runner/testdata/v0.72.2-operational-payload-provenance.json"
 	generatorSource     = "cmd/operational-payload-provenance/main.go"
 	probePath           = "cmd/pinned-operational-payload-probe/main.go"

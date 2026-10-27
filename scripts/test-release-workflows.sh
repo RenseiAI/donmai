@@ -449,7 +449,7 @@ abort 'FAIL: signing integration GoReleaser version differs from release' unless
 abort 'FAIL: signing integration must install GoReleaser without publishing' unless integration_action.dig('with', 'install-only') == true && !integration_action.dig('with', 'args')
 run = steps.find { |step| step['name'] == 'Hermetic signing pipeline' }
 abort 'FAIL: GoReleaser signing integration is not enrolled in CI' unless run && run['run'].strip == 'bash scripts/test-sign-and-notarize.sh --goreleaser'
-abort 'FAIL: signing integration must use the release Go toolchain floor' unless run['env'] == { 'GOTOOLCHAIN' => 'go1.26.6', 'GOWORK' => 'off' }
+abort 'FAIL: signing integration must use the release Go toolchain floor' unless run['env'] == { 'GOTOOLCHAIN' => 'go1.26.10', 'GOWORK' => 'off' }
 RUBY
 if awk '/^signs:/{in_signs=1} in_signs && /^[[:space:]]+cmd:.*sign-and-notarize/{found=1} END{exit found ? 0 : 1}' "${root_dir}/.goreleaser.yaml"; then
   fail 'archive/checksum signs pipe still invokes the archive-mutating Apple signer'

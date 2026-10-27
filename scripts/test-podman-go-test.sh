@@ -16,7 +16,7 @@ cleanup_fixture() {
 trap cleanup_fixture EXIT
 mkdir -p "${fixture_dir}/bin" "${fixture_dir}/repo"
 git -C "${fixture_dir}/repo" init -q
-printf 'module example.test/fixture\ngo 1.26.6\n' >"${fixture_dir}/repo/go.mod"
+printf 'module example.test/fixture\ngo 1.26.10\n' >"${fixture_dir}/repo/go.mod"
 cat >"${fixture_dir}/bin/podman" <<'PODMAN'
 #!/usr/bin/env python3
 import json
