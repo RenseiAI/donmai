@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -696,8 +697,16 @@ func (c *DaemonClient) GetSessions() ([]DaemonSessionHandle, error) {
 
 // Pause sends a pause command to the daemon (stops accepting new sessions).
 func (c *DaemonClient) Pause() (*DaemonActionResponse, error) {
+	return c.PauseContext(context.Background())
+}
+
+// PauseContext sends a pause command to the daemon using ctx to bound
+// transport waiting. The client's existing 10-second HTTP bound applies;
+// the daemon owns admission truth and the caller refreshes state from the
+// next snapshot, never from this response.
+func (c *DaemonClient) PauseContext(ctx context.Context) (*DaemonActionResponse, error) {
 	var resp DaemonActionResponse
-	if err := c.post("/api/daemon/pause", nil, &resp); err != nil {
+	if err := c.postContext(ctx, c.httpClient, "/api/daemon/pause", nil, &resp); err != nil {
 		return nil, fmt.Errorf("daemon pause: %w", err)
 	}
 	return &resp, nil
@@ -705,9 +714,36 @@ func (c *DaemonClient) Pause() (*DaemonActionResponse, error) {
 
 // Resume sends a resume command to the daemon (re-enables accepting sessions).
 func (c *DaemonClient) Resume() (*DaemonActionResponse, error) {
+	return c.ResumeContext(context.Background())
+}
+
+// ResumeContext sends a resume command to the daemon using ctx to bound
+// transport waiting. The client's existing 10-second HTTP bound applies;
+// the daemon owns admission truth and the caller refreshes state from the
+// next snapshot, never from this response.
+func (c *DaemonClient) ResumeContext(ctx context.Context) (*DaemonActionResponse, error) {
 	var resp DaemonActionResponse
-	if err := c.post("/api/daemon/resume", nil, &resp); err != nil {
+	if err := c.postContext(ctx, c.httpClient, "/api/daemon/resume", nil, &resp); err != nil {
 		return nil, fmt.Errorf("daemon resume: %w", err)
+	}
+	return &resp, nil
+}
+
+// StopSessionContext posts the deterministic per-session cancel for id:
+// POST /api/daemon/sessions/<escaped-id>/stop. A 200 only acknowledges the
+// owned generation (cleanup may still be in flight); capacity is released
+// asynchronously after process-group reaping. The caller keeps the card
+// until a later snapshot omits the session. A 404 means no owned
+// generation exists for id.
+func (c *DaemonClient) StopSessionContext(ctx context.Context, sessionID string) (*DaemonActionResponse, error) {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
+		return nil, fmt.Errorf("daemon stop session: %w: empty session id", ErrBadRequest)
+	}
+	var resp DaemonActionResponse
+	path := "/api/daemon/sessions/" + url.PathEscape(id) + "/stop"
+	if err := c.postContext(ctx, c.httpClient, path, nil, &resp); err != nil {
+		return nil, fmt.Errorf("daemon stop session: %w", err)
 	}
 	return &resp, nil
 }

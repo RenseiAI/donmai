@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -183,5 +184,100 @@ func TestDaemonClientDrainContextCancelsPromptly(t *testing.T) {
 	case <-handlerCanceled:
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("drain handler did not observe cancellation")
+	}
+}
+
+// TestDaemonClientLifecycleContextDoors pins the host-watch lifecycle
+// surface: pause, resume and per-session stop each send one authenticated
+// POST, the session id travels URL-escaped in the stop path, and an empty
+// id refuses without a request.
+func TestDaemonClientLifecycleContextDoors(t *testing.T) {
+	const token = "lifecycle-test-token"
+	var (
+		mu     sync.Mutex
+		calls  []string
+		auths  []string
+		bodies []string
+		paths  []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, r.Method+" "+r.URL.EscapedPath())
+		auths = append(auths, r.Header.Get("Authorization"))
+		bodies = append(bodies, strings.TrimSpace(string(body)))
+		paths = append(paths, r.URL.EscapedPath())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true,"message":"done"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewDaemonClientFromURL(srv.URL)
+	client.SetControlToken(token)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := client.PauseContext(ctx); err != nil {
+		t.Fatalf("PauseContext: %v", err)
+	}
+	if _, err := client.ResumeContext(ctx); err != nil {
+		t.Fatalf("ResumeContext: %v", err)
+	}
+	if _, err := client.StopSessionContext(ctx, "sess-1"); err != nil {
+		t.Fatalf("StopSessionContext: %v", err)
+	}
+	// An id hostile to path routing travels as one escaped segment.
+	if _, err := client.StopSessionContext(ctx, "a/b c"); err != nil {
+		t.Fatalf("StopSessionContext escaped: %v", err)
+	}
+	if _, err := client.DrainContext(ctx, 7); err != nil {
+		t.Fatalf("DrainContext: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantCalls := []string{
+		"POST /api/daemon/pause",
+		"POST /api/daemon/resume",
+		"POST /api/daemon/sessions/sess-1/stop",
+		"POST /api/daemon/sessions/a%2Fb%20c/stop",
+		"POST /api/daemon/drain",
+	}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("calls = %v, want %d requests", calls, len(wantCalls))
+	}
+	for i, want := range wantCalls {
+		if calls[i] != want {
+			t.Errorf("call %d = %q, want %q", i, calls[i], want)
+		}
+		if auths[i] != "Bearer "+token {
+			t.Errorf("call %d Authorization = %q, want the operator bearer", i, auths[i])
+		}
+	}
+	// Drain carries the explicit deadline in its JSON body.
+	var drainReq DaemonDrainRequest
+	if err := json.Unmarshal([]byte(bodies[4]), &drainReq); err != nil || drainReq.TimeoutSeconds != 7 {
+		t.Errorf("drain body = %q (decode %v), want timeoutSeconds 7", bodies[4], err)
+	}
+	_ = paths
+}
+
+// TestDaemonClientStopSessionContextEmptyID refuses without a request.
+func TestDaemonClientStopSessionContextEmptyID(t *testing.T) {
+	requested := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requested = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	client := NewDaemonClientFromURL(srv.URL)
+	for _, id := range []string{"", "   "} {
+		if _, err := client.StopSessionContext(context.Background(), id); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("StopSessionContext(%q) error = %v, want ErrBadRequest", id, err)
+		}
+	}
+	if requested {
+		t.Error("empty session id must not reach the daemon")
 	}
 }

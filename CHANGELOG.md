@@ -10,6 +10,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.92 — 2026-10-27
+
+### Chores
+
+- Define and enforce engine-control child-env deny policy
+- Emit typed subscription-window exhaustion claim refusal
+- Tolerate volume device renumber in workarea acquisition-store identity
+- Define a secret-free execution-event journal health snapshot
+
 ## v0.72.91 — 2026-10-26
 
 ### Chores

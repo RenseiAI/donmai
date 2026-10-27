@@ -305,6 +305,17 @@ func newFilterModel(t *testing.T, width, height int) *Model {
 	return m
 }
 
+// newUnboundedFilterModel builds the same filter fixture with the piped
+// plain unbounded card path enabled, so grid assertions cover both the
+// bounded and the unbounded renderGrid call sites.
+func newUnboundedFilterModel(t *testing.T, width, height int) *Model {
+	t.Helper()
+	m := New(Options{Plain: true, UnboundedCards: true, Now: func() time.Time { return fixtureNow }, Handles: mapHandleEnricher{"sess-delta-0004": "ops-lead"}})
+	_, _ = m.Update(tea.WindowSizeMsg{Width: width, Height: height})
+	m.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	return m
+}
+
 // feedQuery feeds one production Update per rune.
 func feedQuery(m *Model, query string) {
 	for _, r := range query {
@@ -344,7 +355,7 @@ func TestModel_FilterNarrowsAndRestores(t *testing.T) {
 		{"display identity issue id", "ENG-2002", []string{"sess-beta-0002"}},
 		{"display identity handle", "ops-lead", []string{"sess-delta-0004"}},
 		{"title match", "ledger", []string{"sess-beta-0002"}},
-		{"repository match", "billing", []string{"sess-beta-0002"}},
+		{"repository match", "web", []string{"sess-alpha-0001"}},
 		{"work type match", "research", []string{"sess-gamma-0003"}},
 		{"case insensitive", "LEDGER", []string{"sess-beta-0002"}},
 		{"unicode title", "日本語", []string{"sess-gamma-0003"}},
@@ -365,16 +376,51 @@ func TestModel_FilterNarrowsAndRestores(t *testing.T) {
 				t.Fatalf("query %q visible = %v, want %v", tc.query, got, tc.want)
 			}
 			view := m.render()
-			if len(tc.want) == 1 {
-				for _, id := range tc.want {
-					c := findCard(m, id)
-					if c == nil {
-						t.Fatalf("source card %s missing", id)
-					}
-					if !strings.Contains(view, c.displayID()) {
-						t.Errorf("render missing visible %q:\n%s", c.displayID(), view)
-					}
+			wantSet := map[string]bool{}
+			for _, w := range tc.want {
+				wantSet[w] = true
+			}
+			for _, id := range tc.want {
+				c := findCard(m, id)
+				if c == nil {
+					t.Fatalf("source card %s missing", id)
 				}
+				if !strings.Contains(view, c.displayID()) {
+					t.Errorf("bounded render missing visible %q for query %q:\n%s", c.displayID(), tc.query, view)
+				}
+			}
+			// B1 (bounded): no non-matching card may render in the grid.
+			for _, c := range m.cards {
+				if !wantSet[c.SessionID] && strings.Contains(view, c.displayID()) {
+					t.Errorf("bounded render shows non-match %q (%s) for query %q:\n%s", c.SessionID, c.displayID(), tc.query, view)
+				}
+			}
+			// B4: the active query is visible in the help row.
+			if !strings.Contains(view, "filter: /"+tc.query) {
+				t.Errorf("bounded render missing filter indicator %q for query %q:\n%s", "filter: /"+tc.query, tc.query, view)
+			}
+			// B1 (unbounded): the same query on the piped unbounded path
+			// must also hide every non-match.
+			mu := newUnboundedFilterModel(t, 120, 40)
+			feedKey(mu, tea.KeyPressMsg{Code: '/', Text: "/"})
+			feedQuery(mu, tc.query)
+			uview := mu.render()
+			for _, id := range tc.want {
+				c := findCard(mu, id)
+				if c == nil {
+					t.Fatalf("unbounded source card %s missing", id)
+				}
+				if !strings.Contains(uview, c.displayID()) {
+					t.Errorf("unbounded render missing visible %q for query %q:\n%s", c.displayID(), tc.query, uview)
+				}
+			}
+			for _, c := range mu.cards {
+				if !wantSet[c.SessionID] && strings.Contains(uview, c.displayID()) {
+					t.Errorf("unbounded render shows non-match %q (%s) for query %q:\n%s", c.SessionID, c.displayID(), tc.query, uview)
+				}
+			}
+			if !strings.Contains(uview, "filter: /"+tc.query) {
+				t.Errorf("unbounded render missing filter indicator %q for query %q:\n%s", "filter: /"+tc.query, tc.query, uview)
 			}
 			for _, c := range m.cards {
 				isWant := false
@@ -397,6 +443,11 @@ func TestModel_FilterNarrowsAndRestores(t *testing.T) {
 			}
 			if got := visibleIDs(m); !equalIDs(got, []string{"sess-alpha-0001", "sess-beta-0002", "sess-gamma-0003", "sess-delta-0004"}) {
 				t.Fatalf("after escape visible = %v, want snapshot order", got)
+			}
+			// B4 (exit): the indicator must clear with the query.
+			escapedView := m.render()
+			if strings.Contains(escapedView, "filter: /") {
+				t.Errorf("render still shows filter indicator after esc for query %q:\n%s", tc.query, escapedView)
 			}
 			if len(m.cards) != 4 {
 				t.Fatalf("source cards mutated by filter: %d", len(m.cards))
@@ -533,11 +584,30 @@ func TestModel_FilterSelectionPreservedAcrossEditsAndSnapshots(t *testing.T) {
 	if got := m.selectedVisibleID(); got != "sess-delta-0004" {
 		t.Fatalf("after down selected = %s, want delta", got)
 	}
+	// B2: pressing down past the end of a narrowed filter must clamp to
+	// the last visible card instead of overshooting the visible slice
+	// (overshoot leaves selection "" and breaks enter/highlight).
+	feedKey(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	feedKey(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	if got := m.selectedVisibleID(); got != "sess-delta-0004" {
+		t.Fatalf("after overshoot down selected = %q, want last visible sess-delta-0004", got)
+	}
+	if m.cursor != 1 {
+		t.Fatalf("after overshoot down cursor = %d, want 1 (last visible index)", m.cursor)
+	}
 	feedKey(m, tea.KeyPressMsg{Code: tea.KeyUp})
 	if got := m.selectedVisibleID(); got != "sess-alpha-0001" {
 		t.Fatalf("after up selected = %s, want alpha", got)
 	}
+	// B2 (unfiltered): down past the end without a filter clamps to the
+	// last card as well.
 	feedKey(m, tea.KeyPressMsg{Code: tea.KeyEscape})
+	for i := 0; i < 6; i++ {
+		feedKey(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	if got := m.selectedVisibleID(); got != "sess-delta-0004" {
+		t.Fatalf("unfiltered overshoot down selected = %q, want last sess-delta-0004", got)
+	}
 	feedKey(m, tea.KeyPressMsg{Code: '/', Text: "/"})
 	feedQuery(m, "zzz-no-such-session")
 	if len(m.visibleCards()) != 0 {
@@ -549,6 +619,60 @@ func TestModel_FilterSelectionPreservedAcrossEditsAndSnapshots(t *testing.T) {
 		t.Error("enter with no match must not open detail")
 	}
 	_ = m.render()
+}
+
+// TestModel_FilteredStopTargetsVisibleCard proves the merge-forward with
+// the lifecycle-confirm gate: x/d stop selection follows the visible
+// (filtered) card at the cursor, not m.cards[m.cursor]. While filtering,
+// printable keys are filter text, so the test arms the stop through the
+// production requestStopConfirm handler (what x calls) after narrowing
+// to "development" and moving to the second visible card; y then goes
+// through the production confirm gate (which outranks filtering) and must
+// stop the visible delta, not the unfiltered beta at the same numeric
+// cursor. Indexing m.cards directly stops the wrong session and fails.
+func TestModel_FilteredStopTargetsVisibleCard(t *testing.T) {
+	acts := newFakeHostActions()
+	m := New(Options{
+		Plain:   true,
+		Now:     func() time.Time { return fixtureNow },
+		Handles: mapHandleEnricher{"sess-delta-0004": "ops-lead"},
+		Actions: acts,
+	})
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	feedKey(m, tea.KeyPressMsg{Code: '/', Text: "/"})
+	feedQuery(m, "development")
+	if got := visibleIDs(m); !equalIDs(got, []string{"sess-alpha-0001", "sess-delta-0004"}) {
+		t.Fatalf("development visible = %v, want [alpha delta]", got)
+	}
+	// Second visible card is delta (unfiltered index 3); the same numeric
+	// cursor in the unfiltered slice is beta.
+	feedKey(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	if got := m.selectedVisibleID(); got != "sess-delta-0004" {
+		t.Fatalf("filtered selected = %s, want sess-delta-0004", got)
+	}
+	if m.cards[m.cursor].SessionID == "sess-delta-0004" {
+		t.Fatalf("test setup broken: unfiltered m.cards[%d] is already delta, cannot pin visible indexing", m.cursor)
+	}
+	// x while filtering is filter text, so arm through the production x
+	// handler directly; y then flows through the production Update gate.
+	if cmd := m.requestStopConfirm(); cmd != nil {
+		t.Fatalf("requestStopConfirm must arm without dispatch, got a command")
+	}
+	if m.confirmStopID != "sess-delta-0004" {
+		t.Fatalf("confirmStopID = %q, want visible sess-delta-0004 (unfiltered m.cards[%d] is %s)", m.confirmStopID, m.cursor, m.cards[m.cursor].SessionID)
+	}
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if cmd == nil {
+		t.Fatal("y must dispatch the confirmed stop")
+	}
+	msg := cmd()
+	_, follow := m.Update(msg)
+	_ = follow
+	_, _, _, stops := acts.counts()
+	if len(stops) != 1 || stops[0] != "sess-delta-0004" {
+		t.Fatalf("stops = %v, want exactly [sess-delta-0004]", stops)
+	}
 }
 
 // TestModel_FilterViewWidthBoundedAndSourceUnchanged proves AC-3 through
