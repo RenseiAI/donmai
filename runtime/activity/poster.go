@@ -825,12 +825,12 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.ContextKey = SignalGuardDegradedContextKey
 			out.ContextValue = SignalGuardDegradedContextValue
 			return out, true
-		case narrationNudgeSubtype:
+		case NarrationNudgeSubtype:
 			// A narration-only continuation nudge the runner sent after a
 			// development turn that ended on a progress note with no new
 			// commit or pull request. Fixed content keeps the marker safe.
 			out.Type = "context"
-			out.Content = narrationNudgeContent
+			out.Content = NarrationNudgeContent
 			out.ContextKey = NarrationNudgeContextKey
 			out.ContextValue = NarrationNudgeContextValue
 			return out, true
@@ -939,15 +939,16 @@ const SignalGuardDegradedContextKey = "signalGuardDegraded"
 // signal-guard degraded marker.
 const SignalGuardDegradedContextValue = "degraded"
 
-// narrationNudgeSubtype mirrors runner's narration-nudge activity marker as
-// a literal: runtime/activity cannot import runner (runner imports this
-// package for the Poster), so the subtype string is pinned here. If the
-// runner constant ever changes, update both together.
-const narrationNudgeSubtype = "narration_nudge"
+// NarrationNudgeSubtype is the session activity marker the runner sends
+// when it nudges a narration-only stop. Exported so the runner aliases it
+// instead of duplicating the literal: a change here breaks the runner build,
+// never drifts silently. It mirrors the runner constant (same import-cycle
+// reason as the signal-guard literals above, in reverse).
+const NarrationNudgeSubtype = "narration_nudge"
 
-// narrationNudgeContent is the fixed activity content for a narration-only
+// NarrationNudgeContent is the fixed activity content for a narration-only
 // continuation nudge.
-const narrationNudgeContent = "runner sent a narration-only continuation nudge"
+const NarrationNudgeContent = "runner sent a narration-only continuation nudge"
 
 // NarrationNudgeContextKey is the contextKey a narration-nudge marker
 // carries.

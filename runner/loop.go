@@ -1771,22 +1771,18 @@ tailRecovery:
 		}
 		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
 		// Narration-only stop: a development turn that ended on a
-		// narration-only assistant message with no new commit or pull
-		// request gets one automatic continuation over the steer channel
-		// before the runner fails. An explicit blocked/verdict result is
-		// never nudged. When the narration budget is spent the session
-		// fails with the bound named, instead of another continuation.
-		// A disabled nudge (limit 0) never counts as narration: the turn
-		// stays on the generic continuation bounds.
-		isNarration := narration.limit > 0 && step == tailContinue && isNarrationOnlyStop(qw, res, streamRes, lastTurn, reportedPR) && !r.sessionHasNewCommit(ctx, res, wpath)
-		if isNarration && !narration.canNudge() {
-			narration.fail(res)
-			r.logger.Warn("turn still ended on a narration-only message after its narration nudge; failing the session",
-				"sessionId", qw.SessionID,
-				"narrationNudges", narration.sent,
-			)
-			break tailRecovery
-		}
+		// narration-only assistant message with no new commit and no
+		// delivering pull request gets the narration wording on its next
+		// continuation, once per session. An explicit blocked/verdict
+		// result is never nudged. The wording is only a prompt swap: the
+		// generic continuation bounds (unproductive streak, ceiling,
+		// undelivered) still decide exhaustion, so a productive agent that
+		// ends several turns on a progress note keeps working. A disabled
+		// nudge (limit 0) never counts as narration: the turn stays on the
+		// generic continuation prompt. step == tailContinue is required:
+		// retry replaces the prompt wholesale, and steer/done/exhausted
+		// never reach the continuation prompt below.
+		isNarration := step == tailContinue && narration.canNudge() && isNarrationOnlyStop(qw, res, streamRes, lastTurn, reportedPR, followUps.undelivered) && !r.sessionHasNewCommit(ctx, res, wpath)
 		switch step {
 		case tailDone:
 			break tailRecovery
@@ -1889,7 +1885,11 @@ tailRecovery:
 			r.logger.Info("token budget nearly spent; asking the agent to wrap up",
 				"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
 		}
-		if isNarration {
+		// Only a delivered narration prompt consumes the budget: when the
+		// wrap-up prompt replaces it, nothing is recorded and no activity
+		// is posted, so the next narration-only stop still gets its nudge.
+		sentNarration := isNarration && !wrapUp
+		if sentNarration {
 			r.logger.Info("turn ended on a narration-only message with no new commit; sending the narration nudge",
 				"sessionId", qw.SessionID,
 				"narrationNudge", narration.sent+1,
@@ -1911,7 +1911,7 @@ tailRecovery:
 		} else {
 			followUps.sentContinuation()
 		}
-		if isNarration {
+		if sentNarration {
 			narration.recordSent()
 			r.postNarrationNudgeActivity(ctx, sink)
 		}
@@ -1934,22 +1934,12 @@ tailRecovery:
 		}
 	}
 	res.TurnContinuations = followUps.report()
-	if narration.sent > 0 {
-		if res.TurnContinuations == nil {
-			res.TurnContinuations = &agent.TurnContinuations{
-				Continued:       followUps.continued,
-				Unproductive:    followUps.unproductive,
-				Retried:         followUps.retried,
-				Limit:           followUps.limit,
-				Ceiling:         followUps.ceiling,
-				Exhausted:       res.FailureMode == FailureContinuationsUnproductive || res.FailureMode == FailureContinuationsCeiling,
-				NarrationNudges: narration.sent,
-			}
-		} else {
-			res.TurnContinuations.NarrationNudges = narration.sent
-			if res.FailureMode == FailureContinuationsUnproductive || res.FailureMode == FailureContinuationsCeiling {
-				res.TurnContinuations.Exhausted = true
-			}
+	// A recorded narration nudge always follows sentContinuation, so report
+	// is non-nil whenever sent > 0: there is no nil branch to maintain.
+	if narration.sent > 0 && res.TurnContinuations != nil {
+		res.TurnContinuations.NarrationNudges = narration.sent
+		if res.FailureMode == FailureContinuationsUnproductive || res.FailureMode == FailureContinuationsCeiling {
+			res.TurnContinuations.Exhausted = true
 		}
 	}
 	res.Cost = enforcer.cost()

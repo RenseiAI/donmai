@@ -2,11 +2,11 @@ package runner
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/activity"
 )
 
 // Narration nudge — one automatic continuation for a development turn that
@@ -36,13 +36,14 @@ const DefaultNarrationNudgeLimit = 1
 // tracker, platform, repository or harness: the same bytes ride every lane.
 const narrationNudgePrompt = "You ended your turn with a progress note. Continue the task to completion: commit, push, and report the result."
 
-// narrationNudgeActivitySubtype is the session activity marker recorded when
-// the nudge is sent. The activity poster forwards it as a context marker so
-// the nudge is visible wherever activities render.
-const narrationNudgeActivitySubtype = "narration_nudge"
+// narrationNudgeActivitySubtype aliases the activity poster's exported
+// marker instead of duplicating the literal: a change to the wire subtype
+// breaks this build instead of drifting silently.
+const narrationNudgeActivitySubtype = activity.NarrationNudgeSubtype
 
-// narrationNudgeActivityMessage is the fixed activity content for the nudge.
-const narrationNudgeActivityMessage = "runner sent a narration-only continuation nudge"
+// narrationNudgeActivityMessage aliases the poster content for the same
+// reason: the runner-sent message and the rendered content stay byte-equal.
+const narrationNudgeActivityMessage = activity.NarrationNudgeContent
 
 // narrationNudgeState is one session's narration-nudge budget.
 type narrationNudgeState struct {
@@ -75,17 +76,26 @@ func (s *narrationNudgeState) recordSent() {
 
 // isNarrationOnlyStop reports whether the latest turn ended on a
 // narration-only assistant message that the runner should nudge once:
-// development work that owes a pull request, no pull request (verified or
-// reported on the session's own repository), no turn-result manifest, no
-// structured blocked or verdict result in this or any earlier turn, a clean
-// terminal, and a last assistant message that carries text with no tool call
-// after it. A provider error, a crash, or an unsuccessful terminal never
-// counts: those have their own recovery.
-func isNarrationOnlyStop(qw QueuedWork, res *Result, session, turn streamObservation, reportedPR bool) bool {
+// development work that owes a pull request, no delivering pull request
+// (verified or reported on the session's own repository), no turn-result
+// manifest, no structured blocked or verdict result in this or any earlier
+// turn, a clean terminal, and a last assistant message that carries text
+// with no tool call after it. A provider error, a crash, or an unsuccessful
+// terminal never counts: those have their own recovery. undelivered is the
+// tail-recovery reason the session's pull request does not deliver the work
+// ("" when it delivers or there is none): a continued pull request whose
+// head has not moved (undeliveredNoNewCommit) counts as no pull request so
+// the nudge fires on the undelivered path instead of the generic
+// no-new-commit continuation. Any other pull request (delivered, or a draft
+// with its own remedy prompt) suppresses the nudge.
+func isNarrationOnlyStop(qw QueuedWork, res *Result, session, turn streamObservation, reportedPR bool, undelivered string) bool {
 	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
 		return false
 	}
-	if res.PullRequestURL != "" || reportedPR {
+	if res.PullRequestURL != "" && undelivered != undeliveredNoNewCommit {
+		return false
+	}
+	if reportedPR {
 		return false
 	}
 	if res.Manifest != nil {
@@ -175,14 +185,9 @@ func (r *Runner) postNarrationNudgeActivity(ctx context.Context, sink activitySi
 	})
 }
 
-// failNarrationExhausted ends a session that stopped narration-only again
-// once its narration nudges ran out. It never relabels a failure the runner
-// already recorded.
-func (s *narrationNudgeState) fail(res *Result) {
-	if res.FailureMode != "" {
-		return
-	}
-	res.Status = "failed"
-	res.FailureMode = FailureContinuationsUnproductive
-	res.Error = fmt.Sprintf("the turn still ended on a narration-only message after %d narration nudge(s): no turn-result manifest, no pull request and no verdict", s.sent)
-}
+// The nudge never fails the session on its own: once the budget is spent a
+// further narration-only stop takes the generic continuation path and the
+// existing continuation bounds (unproductive streak, ceiling, undelivered)
+// decide exhaustion. A productive agent that ends several turns on a
+// progress note keeps working; only the first such continuation carries the
+// narration wording.

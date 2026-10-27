@@ -2,10 +2,12 @@ package runner
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/activity"
 )
 
 // TestNewNarrationNudgeState_ResolvesBounds pins the option values: zero is
@@ -78,18 +80,22 @@ func TestIsNarrationOnlyStop(t *testing.T) {
 	}
 	mkRes := func() Result { return Result{} }
 	cases := []struct {
-		name       string
-		workType   string
-		res        Result
-		session    streamObservation
-		turn       streamObservation
-		reportedPR bool
-		want       bool
+		name        string
+		workType    string
+		res         Result
+		session     streamObservation
+		turn        streamObservation
+		reportedPR  bool
+		undelivered string
+		want        bool
 	}{
 		{name: "narration-only development stop", workType: "development", res: mkRes(), turn: clean, want: true},
 		{name: "review work is never a narration stop", workType: "qa", res: mkRes(), turn: clean, want: false},
 		{name: "research work is never a narration stop", workType: "research", res: mkRes(), turn: clean, want: false},
 		{name: "verified pull request is not narration", workType: "development", res: func() Result { r := mkRes(); r.PullRequestURL = followUpPR; return r }(), turn: clean, want: false},
+		{name: "continued pull request with no new commit is narration", workType: "development", res: func() Result { r := mkRes(); r.PullRequestURL = "https://github.com/example/repo/pull/12"; return r }(), turn: clean, undelivered: undeliveredNoNewCommit, want: true},
+		{name: "continued pull request that delivers is not narration", workType: "development", res: func() Result { r := mkRes(); r.PullRequestURL = "https://github.com/example/repo/pull/12"; return r }(), turn: clean, undelivered: "", want: false},
+		{name: "draft pull request keeps its own remedy", workType: "development", res: func() Result { r := mkRes(); r.PullRequestURL = followUpPR; return r }(), turn: clean, undelivered: undeliveredDraft, want: false},
 		{name: "reported pull request is not narration", workType: "development", res: mkRes(), turn: clean, reportedPR: true, want: false},
 		{name: "manifest is not narration", workType: "development", res: func() Result { r := mkRes(); r.Manifest = &TurnManifest{Verdict: "passed"}; return r }(), turn: clean, want: false},
 		{name: "work result is not narration", workType: "development", res: func() Result { r := mkRes(); r.WorkResult = "passed"; return r }(), turn: clean, want: false},
@@ -109,7 +115,7 @@ func TestIsNarrationOnlyStop(t *testing.T) {
 			qw := QueuedWork{}
 			qw.WorkType = tc.workType
 			res := tc.res
-			if got := isNarrationOnlyStop(qw, &res, tc.session, tc.turn, tc.reportedPR); got != tc.want {
+			if got := isNarrationOnlyStop(qw, &res, tc.session, tc.turn, tc.reportedPR, tc.undelivered); got != tc.want {
 				t.Fatalf("isNarrationOnlyStop = %v; want %v", got, tc.want)
 			}
 		})
@@ -194,27 +200,68 @@ func TestRun_NarrationOnlyStopNudgedThenCommits(t *testing.T) {
 	}
 }
 
-// TestRun_NarrationOnlySecondStopFails pins the bound: a second
-// narration-only stop after the single nudge fails the session with the
-// bound named, sending nothing more.
-func TestRun_NarrationOnlySecondStopFails(t *testing.T) {
+// TestRun_NarrationOnlySecondProductiveStopContinues pins that the nudge is
+// only a prompt swap: a second narration-only stop after the single nudge
+// takes the generic continuation path and the existing continuation bounds
+// decide exhaustion. Both turns here are productive (tool calls), so the
+// session continues instead of failing.
+func TestRun_NarrationOnlySecondProductiveStopContinues(t *testing.T) {
 	res, provider := runNarrationScenario(t, 1,
 		verdictScriptTurn{toolCalls: 3, text: "Mapping the fix."},
 		verdictScriptTurn{toolCalls: 2, text: "Still mapping the fix."},
-		verdictScriptTurn{text: "never reached"},
+		verdictScriptTurn{text: "Opened " + followUpPR},
 	)
-	if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
-		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsUnproductive)
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
 	}
-	if !strings.Contains(res.Error, "narration") {
-		t.Fatalf("Error = %q; want it to name the narration nudge", res.Error)
+	if len(provider.prompts) != 2 {
+		t.Fatalf("prompts = %q; want the narration nudge then the generic continuation", provider.prompts)
 	}
-	wantNarrationPrompt(t, provider.prompts, 1)
-	if res.TurnContinuations == nil || res.TurnContinuations.NarrationNudges != 1 || !res.TurnContinuations.Exhausted {
-		t.Fatalf("TurnContinuations = %+v; want one exhausted narration nudge", res.TurnContinuations)
+	wantNarrationPrompt(t, provider.prompts[:1], 1)
+	base := provider.prompts[1]
+	if idx := strings.Index(base, "\n\nThe goal is"); idx >= 0 {
+		base = base[:idx]
+	}
+	if base != continuePrompt {
+		t.Fatalf("second prompt = %q; want the generic continuation %q", provider.prompts[1], continuePrompt)
+	}
+	if res.TurnContinuations == nil || res.TurnContinuations.NarrationNudges != 1 {
+		t.Fatalf("TurnContinuations = %+v; want one narration nudge", res.TurnContinuations)
+	}
+	if res.TurnContinuations.Exhausted {
+		t.Fatalf("TurnContinuations = %+v; a completed nudge must not read as exhausted", *res.TurnContinuations)
 	}
 	if res.SteeringTriggered {
-		t.Fatalf("SteeringTriggered = true; a narration stop gets the narration nudge, not the pull request nudge")
+		t.Fatalf("SteeringTriggered = true; a narration stop gets a continuation, not the pull request nudge")
+	}
+}
+
+// TestRun_NarrationProductiveStopsContinuePastLimit runs the existing
+// productive-continuation shape with the nudge at its production default:
+// an agent that ends its turns early but keeps working is continued past
+// the narration budget under the generic bounds, not failed after two turns.
+func TestRun_NarrationProductiveStopsContinuePastLimit(t *testing.T) {
+	turns := append(slices.Repeat([]verdictScriptTurn{{toolCalls: 3, text: "Next I will run the tests."}}, 6),
+		verdictScriptTurn{text: "Opened " + followUpPR})
+	res, provider := runNarrationScenario(t, 1, turns...)
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	if len(provider.prompts) != 6 {
+		t.Fatalf("prompts = %d; want 6 continuations", len(provider.prompts))
+	}
+	wantNarrationPrompt(t, provider.prompts[:1], 1)
+	for i, p := range provider.prompts[1:] {
+		base := p
+		if idx := strings.Index(p, "\n\nThe goal is"); idx >= 0 {
+			base = p[:idx]
+		}
+		if base != continuePrompt {
+			t.Fatalf("prompt %d = %q; want the generic continuation after the nudge", i+1, p)
+		}
+	}
+	if res.TurnContinuations == nil || res.TurnContinuations.NarrationNudges != 1 || res.TurnContinuations.Continued != 6 {
+		t.Fatalf("TurnContinuations = %+v; want 6 continuations with one narration nudge", res.TurnContinuations)
 	}
 }
 
@@ -249,6 +296,175 @@ func TestPostNarrationNudgeActivity(t *testing.T) {
 	sys, ok := rec.events[0].(agent.SystemEvent)
 	if !ok || sys.Subtype != narrationNudgeActivitySubtype {
 		t.Fatalf("activity = %#v; want a SystemEvent with subtype %q", rec.events[0], narrationNudgeActivitySubtype)
+	}
+	if sys.Message != narrationNudgeActivityMessage {
+		t.Fatalf("activity message = %q; want %q", sys.Message, narrationNudgeActivityMessage)
+	}
+}
+
+// TestNarrationNudgeActivitySubtypePinsPoster ties the runner marker to the
+// activity poster without duplicating the literal: the runner aliases the
+// poster's exported constants, and the poster maps that subtype to the
+// fixed context marker.
+func TestNarrationNudgeActivitySubtypePinsPoster(t *testing.T) {
+	if narrationNudgeActivitySubtype != activity.NarrationNudgeSubtype {
+		t.Fatalf("runner subtype = %q; want the poster subtype %q", narrationNudgeActivitySubtype, activity.NarrationNudgeSubtype)
+	}
+	if narrationNudgeActivityMessage != activity.NarrationNudgeContent {
+		t.Fatalf("runner message = %q; want the poster content %q", narrationNudgeActivityMessage, activity.NarrationNudgeContent)
+	}
+	if activity.NarrationNudgeContextKey != "narrationNudge" || activity.NarrationNudgeContextValue != "sent" {
+		t.Fatalf("poster context = %q=%q; want narrationNudge=sent", activity.NarrationNudgeContextKey, activity.NarrationNudgeContextValue)
+	}
+}
+
+// TestRun_NarrationNudgePostsActivity pins the marker end to end: a scripted
+// development session that takes the narration nudge posts the activity to
+// the platform, where the poster renders it as the fixed context marker.
+func TestRun_NarrationNudgePostsActivity(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		repository:     followUpRepository,
+		pulls:          map[int]string{7: pullAtSessionCommit},
+		narrationLimit: 1,
+		platform:       platform,
+		turns: []verdictScriptTurn{
+			{toolCalls: 2, text: "Mapping the fix."},
+			{text: "Opened " + followUpPR},
+		},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status=%q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	wantNarrationPrompt(t, provider.prompts, 1)
+	// The asynchronous poster may not have flushed before Run returned:
+	// poll the captured activity posts briefly.
+	deadline := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			for _, body := range platform.activityPosts() {
+				if strings.Contains(string(body), activity.NarrationNudgeContent) && strings.Contains(string(body), "narrationNudge") {
+					close(deadline)
+					return
+				}
+			}
+		}
+		close(deadline)
+	}()
+	<-deadline
+	found := false
+	for _, body := range platform.activityPosts() {
+		s := string(body)
+		if strings.Contains(s, activity.NarrationNudgeContent) && strings.Contains(s, "narrationNudge") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no narration-nudge activity among %d posts", len(platform.activityPosts()))
+	}
+}
+
+// TestRun_NarrationContinuedPullRequestNudgedThenPushes pins the rework path:
+// a continued pull request with no new commit counts as no pull request for
+// the narration check, so the first narration-only stop gets the narration
+// nudge (not the generic no-new-commit continuation) and the session
+// completes after the follow-up turn pushes.
+func TestRun_NarrationContinuedPullRequestNudgedThenPushes(t *testing.T) {
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		repository:     followUpRepository,
+		narrationLimit: 1,
+		continueNumber: 12,
+		turns: []verdictScriptTurn{
+			{text: "Mapping the fix."},
+			{
+				files: map[string]string{"fix.txt": "work\n"},
+				push:  []string{"refs/heads/continued/pr-12", "refs/pull/12/head"},
+				text:  "Pushed the fix.",
+			},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with the continued pull request", res.Status, res.PullRequestURL, res.FailureMode, res.Error)
+	}
+	wantNarrationPrompt(t, provider.prompts, 1)
+	if res.TurnContinuations == nil || res.TurnContinuations.NarrationNudges != 1 {
+		t.Fatalf("TurnContinuations = %+v; want one narration nudge", res.TurnContinuations)
+	}
+}
+
+// TestRun_NarrationAfterLocalCommitGetsGenericContinuation pins the commit
+// guard at the runner seam: a narration-only turn whose checkout already
+// holds a commit of its own takes the generic continuation, never the
+// narration nudge.
+func TestRun_NarrationAfterLocalCommitGetsGenericContinuation(t *testing.T) {
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		repository:     followUpRepository,
+		pulls:          map[int]string{7: pullAtSessionCommit},
+		narrationLimit: 1,
+		turns: []verdictScriptTurn{
+			{
+				files: map[string]string{"fix.txt": "work\n"},
+				push:  []string{"refs/heads/" + scriptedSessionBranch},
+				text:  "Mapping the fix.",
+			},
+			{
+				files: map[string]string{"more.txt": "more\n"},
+				push:  []string{"refs/heads/" + scriptedSessionBranch, "refs/pull/7/head"},
+				text:  "Opened " + followUpPR,
+			},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	if len(provider.prompts) != 1 {
+		t.Fatalf("prompts = %q; want one generic continuation", provider.prompts)
+	}
+	base := provider.prompts[0]
+	if idx := strings.Index(base, "\n\nThe goal is"); idx >= 0 {
+		base = base[:idx]
+	}
+	if base != continuePrompt {
+		t.Fatalf("prompt = %q; want the generic continuation, not the narration nudge", provider.prompts[0])
+	}
+	if res.TurnContinuations != nil && res.TurnContinuations.NarrationNudges != 0 {
+		t.Fatalf("TurnContinuations = %+v; a committed turn must not record a narration nudge", res.TurnContinuations)
+	}
+}
+
+// TestRun_NarrationWrapUpDoesNotConsumeBudget pins that a wrap-up follow-up
+// is not a narration nudge: when the token meter passes the wrap-up point,
+// the narration candidate gets the wrap-up prompt, records nothing, and the
+// next narration-only stop still gets its nudge.
+func TestRun_NarrationWrapUpDoesNotConsumeBudget(t *testing.T) {
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		repository:     followUpRepository,
+		pulls:          map[int]string{7: pullAtSessionCommit},
+		narrationLimit: 1,
+		budget:         tokenBudget(),
+		turns: []verdictScriptTurn{
+			{events: concat(modelCall("Mapping the fix.", 850))},
+			{events: modelCall("Still mapping.", 10)},
+			{events: modelCall("Opened "+followUpPR, 10)},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	if len(provider.prompts) != 2 {
+		t.Fatalf("prompts = %q; want wrap-up then narration", provider.prompts)
+	}
+	if provider.prompts[0] != wrapUpPrompt {
+		t.Fatalf("first prompt = %q; want the wrap-up prompt, not the narration nudge", provider.prompts[0])
+	}
+	wantNarrationPrompt(t, provider.prompts[1:], 1)
+	if res.TurnContinuations == nil || res.TurnContinuations.NarrationNudges != 1 {
+		t.Fatalf("TurnContinuations = %+v; want exactly one narration nudge (the wrap-up is not one)", res.TurnContinuations)
 	}
 }
 
@@ -285,5 +501,12 @@ func TestSessionHasNewCommit(t *testing.T) {
 	}
 	if r.sessionHasNewCommit(ctx, &Result{}, dir) {
 		t.Fatalf("session with no rescue target must read as having no commit")
+	}
+	// An empty rescue base fails closed as having a commit: with no base to
+	// compare against, the checkout never reads as having done nothing.
+	emptyBase := &Result{}
+	emptyBase.rescueTargets = []rescueTarget{{path: dir, base: "  "}}
+	if !r.sessionHasNewCommit(ctx, emptyBase, dir) {
+		t.Fatalf("empty rescue base must fail closed as having a commit")
 	}
 }
