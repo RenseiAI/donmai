@@ -460,7 +460,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 					return archiveRegistry.CommitArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
 						AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
 						WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath,
-						TerminalResultID: spec.TerminalResultID,
+						TerminalResultID: spec.TerminalResultID, Quiesced: spec.Quiesced,
 					})
 				},
 			})

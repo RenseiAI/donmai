@@ -15,6 +15,15 @@ func copySparseData(source, destination *os.File, size int64) error {
 	if size == 0 {
 		return destination.Truncate(0)
 	}
+	// A concurrent append between the caller's size check and this
+	// read leaves the staged copy short of the live source. Clamp
+	// the read to the captured size: io.CopyN then hits EOF exactly
+	// when the source grew (short read), which surfaces as an
+	// error — fail closed — instead of staging a silently short
+	// file. A truncate under the read likewise errors.
+	if current, err := source.Stat(); err != nil || current.Size() != size {
+		return errors.New("archive copy source file changed during copy")
+	}
 	sourceFD, err := archiveFileDescriptor(source.Fd())
 	if err != nil {
 		return err
