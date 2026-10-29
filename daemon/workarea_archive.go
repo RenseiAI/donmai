@@ -525,11 +525,14 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 			}
 			// The tree digest is the committed identity; physical allocation
 			// is accounting that the filesystem may revise after commit.
-			digest, digestErr := archiveTreeDigestRoot(archivedRoot)
+			// Either digest format matches: pre-witness archives stored
+			// the legacy (sizes included) digest, new captures store the
+			// zeroed-directory digest.
+			digestMatch, digestErr := archiveTreeDigestRootMatches(archivedRoot, existing.TreeDigest)
 			if existing.SchemaVersion == workareaArchiveLegacyFlatV1 && spec.AcquisitionID == "" && existing.SelectedLeaf == "" {
 				info, treeErr := archivedRoot.Stat(".")
 				_ = archivedRoot.Close()
-				if treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digest == existing.TreeDigest {
+				if treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digestMatch {
 					return r.committedArchiveReference(spec, existing)
 				}
 			} else {
@@ -539,8 +542,8 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 					validErr = workarea.ValidateDeclaredRootHandle(archivedRoot, archivedDeclaration)
 				}
 				_ = archivedRoot.Close()
-				if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && validErr == nil && digestErr == nil && digest == existing.TreeDigest && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
-					if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, digest); err != nil {
+				if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && validErr == nil && digestErr == nil && digestMatch && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
+					if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, existing.TreeDigest); err != nil {
 						return nil, fmt.Errorf("archive root: bind existing immutable archive: %w", err)
 					}
 					return r.committedArchiveReference(spec, existing)
@@ -820,12 +823,14 @@ func (r *WorkareaArchiveRegistry) readCommittedArchiveReference(archiveRoot *os.
 	if err != nil {
 		return nil, fmt.Errorf("archive root: open committed archive tree: %w", err)
 	}
-	digest, err := archiveTreeDigestRoot(archivedRoot)
+	// Either digest format matches: pre-witness archives stored the
+	// legacy (sizes included) digest.
+	digestMatch, err := archiveTreeDigestRootMatches(archivedRoot, manifest.TreeDigest)
 	_ = archivedRoot.Close()
 	if err != nil {
 		return nil, fmt.Errorf("archive root: digest committed archive tree: %w", err)
 	}
-	if digest != manifest.TreeDigest {
+	if !digestMatch {
 		return nil, fmt.Errorf("archive root: committed archive digest mismatch: %w", ErrArchiveCorrupted)
 	}
 	return r.committedArchiveReference(spec, manifest)
@@ -1793,8 +1798,10 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 		if err := syncArchiveTree(restore.StagingRoot.String()); err != nil {
 			return err
 		}
-		digest, err := archiveTreeDigest(restore.StagingRoot.String())
-		if err != nil || digest != manifest.TreeDigest {
+		// Either digest format matches: pre-witness archives stored the
+		// legacy (sizes included) digest.
+		digestMatch, err := archiveTreeDigestPathMatches(restore.StagingRoot.String(), manifest.TreeDigest)
+		if err != nil || !digestMatch {
 			return fmt.Errorf("restore: copied archive digest mismatch: %w", ErrArchiveCorrupted)
 		}
 		selectedLeaf, repositories, err := restoredDeclarationMetadata(restore.StagingRoot)
@@ -2504,14 +2511,6 @@ func diffWalkers(idA, idB string, a, b []archiveEntry) (
 	return entries, summary
 }
 
-func archiveTreeDigest(root string) (string, error) {
-	entries, err := walkArchiveTreeMode(root, false)
-	if err != nil {
-		return "", err
-	}
-	return archiveTreeDigestEntries(entries)
-}
-
 func archiveTreeDigestRoot(root *os.Root) (string, error) {
 	entries, err := walkArchiveRoot(root)
 	if err != nil {
@@ -2676,6 +2675,85 @@ func archiveTreeDigestEntries(entries []archiveEntry) (string, error) {
 		}
 	}
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// archiveTreeDigestEntriesLegacy encodes the pre-quiescence digest format
+// that included directory sizes. Archives committed before the witness
+// carry this format; verification accepts either format so a pre-witness
+// archive stays restorable and idempotent after the format change.
+// New captures always use archiveTreeDigestEntries (sizes zeroed).
+func archiveTreeDigestEntriesLegacy(entries []archiveEntry) (string, error) {
+	hash := sha256.New()
+	encoder := json.NewEncoder(hash)
+	encoder.SetEscapeHTML(false)
+	for _, entry := range entries {
+		if err := encoder.Encode(struct {
+			Path          string `json:"path"`
+			Mode          string `json:"mode"`
+			Size          int64  `json:"size"`
+			Hash          string `json:"hash"`
+			SymlinkTarget string `json:"symlinkTarget"`
+			HardlinkTo    string `json:"hardlinkTo"`
+		}{
+			Path: entry.Path, Mode: entry.ModeStr, Size: entry.Size, Hash: entry.Hash,
+			SymlinkTarget: entry.SymlinkTo, HardlinkTo: entry.HardlinkTo,
+		}); err != nil {
+			return "", err
+		}
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// archiveDigestMatchesEntries reports whether want equals either the
+// current (directory sizes zeroed) or the legacy (sizes included)
+// digest of entries. Either match proves the same captured bytes:
+// directory sizes are allocation metadata the filesystem may revise
+// without changing a byte, so the legacy value can only differ in
+// that metadata.
+func archiveDigestMatchesEntries(entries []archiveEntry, want string) (bool, error) {
+	current, err := archiveTreeDigestEntries(entries)
+	if err != nil {
+		return false, err
+	}
+	if current == want {
+		return true, nil
+	}
+	legacy, err := archiveTreeDigestEntriesLegacy(entries)
+	if err != nil {
+		return false, err
+	}
+	return legacy == want, nil
+}
+
+// archiveTreeDigestRootMatches walks the rooted tree once and reports
+// whether its digest — current or legacy format — equals want.
+func archiveTreeDigestRootMatches(root *os.Root, want string) (bool, error) {
+	entries, err := walkArchiveRoot(root)
+	if err != nil {
+		return false, err
+	}
+	return archiveDigestMatchesEntries(entries, want)
+}
+
+// archiveTreeDigestPathMatches walks the path tree once and reports
+// whether its digest — current or legacy format — equals want.
+func archiveTreeDigestPathMatches(path, want string) (bool, error) {
+	entries, err := walkArchiveTreeMode(path, false)
+	if err != nil {
+		return false, err
+	}
+	return archiveDigestMatchesEntries(entries, want)
+}
+
+// archiveTreeDigestLegacyPath computes the legacy (sizes included)
+// digest of the path tree. Tests forge pre-witness manifests with it;
+// production verification never commits it.
+func archiveTreeDigestLegacyPath(path string) (string, error) {
+	entries, err := walkArchiveTreeMode(path, false)
+	if err != nil {
+		return "", err
+	}
+	return archiveTreeDigestEntriesLegacy(entries)
 }
 
 func walkArchiveRoot(root *os.Root) ([]archiveEntry, error) {
@@ -3307,25 +3385,7 @@ func archiveFirstLine(s string) string {
 	return s
 }
 
-// copyRootContentsExcluding copies like copyRootContents but skips
-// regenerable dependency and build-output directories (see
-// archiveExcludedDirNames) at any depth. It returns the skipped
-// directories as slash-separated paths relative to the copied root,
-// sorted, for the archive manifest's excluded list. A candidate is
-// skipped only when the guard proves it regenerable — ignored by the
-// enclosing checkout and holding no tracked files — so tracked source,
-// uncommitted source and git metadata are always copied. Roots that are
-// not git checkouts copy whole: sourceRootName carries the absolute
-// source path the guard inspects (empty keeps every candidate).
-// Restore paths keep using copyRootContents so an already-committed
-// archive always reproduces byte for byte, including archives written
-// before the exclusion existed.
-func copyRootContentsExcluding(source, destination *os.Root, sourceRootName string) ([]string, error) {
-	excluded, _, err := copyRootContentsExcludingGuarded(source, destination, sourceRootName)
-	return excluded, err
-}
-
-// copyRootContentsExcludingGuarded copies like copyRootContentsExcluding
+// copyRootContentsExcludingGuarded copies like the filtered capture copy
 // and additionally returns the guard that decided the exclusions, so the
 // capture-stability witness can reuse the same inspection instead of
 // re-running git between the copy and witness walks (see
@@ -3483,7 +3543,7 @@ func copyRootFile(source, destination *os.Root, name string, expected os.FileInf
 	if current, statErr := in.Stat(); statErr != nil || current.Size() != expected.Size() {
 		_ = out.Close()
 		_ = destination.Remove(name)
-		return fmt.Errorf(errArchiveCopyChanged)
+		return errors.New(errArchiveCopyChanged)
 	}
 	if err := copySparseData(in, out, expected.Size()); err != nil {
 		_ = out.Close()
@@ -3499,7 +3559,7 @@ func copyRootFile(source, destination *os.Root, name string, expected os.FileInf
 	if current, statErr := in.Stat(); statErr != nil || current.Size() != expected.Size() {
 		_ = out.Close()
 		_ = destination.Remove(name)
-		return fmt.Errorf(errArchiveCopyChanged)
+		return errors.New(errArchiveCopyChanged)
 	}
 	if err := out.Sync(); err != nil {
 		_ = out.Close()

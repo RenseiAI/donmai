@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // stableGenerationFixture builds a minimal legacy-flat source tree: two files
@@ -297,7 +298,7 @@ func TestArchiveQuiescence_EscapedDescendantMutationFailsClosed(t *testing.T) {
 		<-releaseCopy
 		return nil
 	}})
-	helper := exec.Command(os.Args[0], "-test.run", "TestArchiveQuiescence_EscapedDescendantMutationFailsClosed")
+	helper := exec.Command(os.Args[0], "-test.run", "TestArchiveQuiescence_EscapedDescendantMutationFailsClosed") //nolint:gosec // G204: test re-executes its own binary with fixed args
 	helper.Env = append(os.Environ(),
 		"DONMAI_TEST_ARCHIVE_ESCAPED_WRITER=1",
 		"DONMAI_TEST_ARCHIVE_ESCAPED_DIR="+source,
@@ -432,7 +433,7 @@ func runArchiveEscapedWriter() {
 	}
 	// First fork: re-execute as the grandchild, then exit the middle.
 	if os.Getenv("DONMAI_TEST_ARCHIVE_ESCAPED_GRANDCHILD") != "1" {
-		cmd := exec.Command(os.Args[0], "-test.run", "TestArchiveQuiescence_EscapedDescendantMutationFailsClosed")
+		cmd := exec.Command(os.Args[0], "-test.run", "TestArchiveQuiescence_EscapedDescendantMutationFailsClosed") //nolint:gosec // G204: test re-executes its own binary with fixed args
 		cmd.Env = append(os.Environ(), "DONMAI_TEST_ARCHIVE_ESCAPED_GRANDCHILD=1")
 		_ = cmd.Start()
 		os.Exit(0)
@@ -446,7 +447,7 @@ func runArchiveEscapedWriter() {
 	// wall-clock time) bounds the loop so short test timeouts cannot
 	// truncate the escape mid-proof.
 	for i := 0; i < 10000; i++ {
-		f, err := os.OpenFile(filepath.Join(dir, "escaped.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(filepath.Join(dir, "escaped.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G703: dir is test-controlled env, joined with a fixed filename
 		if err != nil {
 			os.Exit(1)
 		}
@@ -558,5 +559,156 @@ func TestArchiveQuiescence_ExcludedRegenerableChangeDoesNotFailCapture(t *testin
 	manifest := readWorkareaArchiveManifest(t, archiveRoot, "wa_filtered")
 	if manifest.CaptureStableGeneration != manifest.TreeDigest {
 		t.Fatal("filtered witness does not match committed digest")
+	}
+}
+
+// Pre-witness legacy-flat archives stay idempotent and restorable: the
+// digest format changed to exclude directory sizes, but verification
+// accepts either the current or the legacy digest so a pre-witness
+// commit (legacy TreeDigest, no witness) re-archives idempotently and
+// restores without an identity collision or corruption error.
+func TestArchiveQuiescence_OldDigestLegacyFlatIdempotentAndRestorable(t *testing.T) {
+	archiveRoot := t.TempDir()
+	source := t.TempDir()
+	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	if err := os.MkdirAll(filepath.Join(source, "subdir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "subdir", "c.txt"), []byte("generation-one-c"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot})
+	spec := WorkareaRootArchiveSpec{
+		WorkareaID: "wa_oldflat", SessionID: "oldflat-session",
+		WorkareaRoot: source, SelectedPath: source, Quiesced: true,
+	}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	manifest := readWorkareaArchiveManifest(t, archiveRoot, "wa_oldflat")
+	legacy, err := archiveTreeDigestLegacyPath(filepath.Join(archiveRoot, "wa_oldflat", "tree"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy == manifest.TreeDigest {
+		t.Fatal("legacy digest equals current digest; fixture needs a subdirectory to diverge")
+	}
+	manifest.TreeDigest = legacy
+	manifest.CaptureStableGeneration = ""
+	manifest.CaptureQuiesced = false
+	forged, err := json.Marshal(&manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archiveRoot, "wa_oldflat", "manifest.json"), forged, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatalf("idempotent retry over pre-witness flat archive: %v", err)
+	}
+	if _, _, err := registry.Restore("wa_oldflat", afclient.WorkareaRestoreRequest{}); err != nil {
+		t.Fatalf("restore of pre-witness flat archive: %v", err)
+	}
+}
+
+// Pre-witness session-root (nested) archives stay idempotent and
+// restorable after source disposal: the manifest and the durable
+// acquisition record both carry the legacy digest, exactly as the
+// pre-witness writer stored them, and the registry verifies either
+// digest format when re-reading the committed bytes.
+func TestArchiveQuiescence_OldDigestNestedIdempotentAndRestorable(t *testing.T) {
+	archiveRoot := t.TempDir()
+	worktreeParent := t.TempDir()
+	sourceRoot := filepath.Join(worktreeParent, "session-root")
+	declaration := workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: "https://example.test/web.git", Ref: "main"}, Name: "web", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: "https://example.test/docs.git", Ref: "main"}, Name: "docs", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+		Select: &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: "docs"},
+	}
+	normalized, err := declaration.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisitions, err := workarea.NewAcquisitionStore(worktreeParent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition, err := acquisitions.Begin("oldnested-session", "wa_oldnested", workarea.RootPath(sourceRoot), "docs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for leaf, body := range map[string]string{"web/source.txt": "mutable", "docs/context.txt": "readonly"} {
+		path := filepath.Join(acquisition.StagingRoot.String(), leaf)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := workarea.NewDeclarationRecord(
+		"oldnested-session", "wa_oldnested", normalized,
+		map[string]string{"web": "aaa", "docs": "bbb"}, acquisition.Record.AcquisitionID,
+	)
+	if err := workarea.WriteDeclaration(t.Context(), acquisition.StagingRoot, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquisitions.Commit(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions})
+	spec := WorkareaRootArchiveSpec{
+		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: "wa_oldnested", SessionID: "oldnested-session",
+		WorkareaRoot: sourceRoot, SelectedPath: filepath.Join(sourceRoot, "docs"),
+	}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	manifest := readWorkareaArchiveManifest(t, archiveRoot, "wa_oldnested")
+	legacy, err := archiveTreeDigestLegacyPath(filepath.Join(archiveRoot, "wa_oldnested", "tree"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy == manifest.TreeDigest {
+		t.Fatal("legacy digest equals current digest; nested tree should diverge via directory entries")
+	}
+	manifest.TreeDigest = legacy
+	manifest.CaptureStableGeneration = ""
+	manifest.CaptureQuiesced = false
+	forged, err := json.Marshal(&manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archiveRoot, "wa_oldnested", "manifest.json"), forged, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(worktreeParent, ".workarea-acquisitions", acquisition.Record.AcquisitionID, "acquisition.json")
+	raw, err := os.ReadFile(recordPath) //nolint:gosec // G304: test fixture path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored workarea.AcquisitionRecord
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.ArchiveDigest = legacy
+	rewritten, err := json.Marshal(&stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recordPath, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatalf("idempotent retry over pre-witness nested archive: %v", err)
+	}
+	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.RestoreV1("wa_oldnested", afclient.WorkareaRestoreRequest{IntoSessionID: "oldnested-session"}); err != nil {
+		t.Fatalf("restore of pre-witness nested archive after source disposal: %v", err)
 	}
 }

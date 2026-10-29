@@ -160,7 +160,7 @@ func TestWriterQuiescence_OrdinaryQuiescedReleaseArchivesBeforeDisposal(t *testi
 // recorded unquiesced so operators can distinguish it.
 func TestWriterQuiescence_UnquiescedReleaseProceedsAsUnquiescedEvidence(t *testing.T) {
 	parent := t.TempDir()
-	var archivedQuiesced = true
+	archivedQuiesced := true
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: quiescenceSessionID,
 		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
@@ -270,13 +270,28 @@ func TestWriterQuiescence_ArchiveFailureRetainsSourceForRetry(t *testing.T) {
 // reaper — it does not acknowledge, release, or permit reuse. The
 // reaper records expiry as the release reason, moves to
 // release-pending, and drives the same archive-then-dispose provider
-// path. This test proves the expiry half with a destroy disposition
-// (no archive provider), pinning that expiry carries the same
-// release-pending gate as acknowledgement.
+// path. This test proves the expiry half by advancing the injected
+// clock past the lease expiry with an archive disposition, pinning that
+// expiry carries the same release-pending gate as acknowledgement and
+// drives archive-then-disposal with the caller-side quiescence evidence.
 func TestWriterQuiescence_ExpiryReapsThroughReleasePending(t *testing.T) {
 	parent := t.TempDir()
+	current := time.Now()
+	var archiveCalls int
+	var archivedQuiesced bool
+	var archivedRoot string
 	manager, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: quiescenceSessionID,
+		Now: func() time.Time { return current },
+		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+			archiveCalls++
+			archivedQuiesced = spec.Quiesced
+			archivedRoot = spec.WorkareaRoot
+			if _, err := os.Stat(filepath.Join(spec.WorkareaRoot, ".workarea", "declaration.json")); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -288,9 +303,10 @@ func TestWriterQuiescence_ExpiryReapsThroughReleasePending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager.RequireWriterQuiescence(quiescenceSessionID, true)
 	lease, err := manager.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
 		SessionID: quiescenceSessionID, TerminalResultID: quiescenceResultID,
-		Policy: workarea.DefaultLeasePolicy(), ReleaseRequested: true, ReleaseDisposition: "destroy",
+		Policy: workarea.DefaultLeasePolicy(), ReleaseRequested: true, ReleaseDisposition: "archive",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -310,7 +326,38 @@ func TestWriterQuiescence_ExpiryReapsThroughReleasePending(t *testing.T) {
 	if _, err := os.Stat(layout.Root.String()); err != nil {
 		t.Fatalf("source removed before expiry: %v", err)
 	}
-	_ = active
+	if archiveCalls != 0 {
+		t.Fatalf("archive provider calls before expiry = %d, want 0", archiveCalls)
+	}
+	// Advance the injected clock past the lease expiry. The reaper must
+	// record expiry as the release reason, move to release-pending, and
+	// drive the same archive-then-dispose provider path.
+	current = current.Add(workarea.DefaultLeaseDuration + time.Second)
+	if _, err := manager.ReapExpiredTerminalLeases(context.Background(), 32, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if archiveCalls != 1 {
+		t.Fatalf("archive provider calls after expiry = %d, want 1", archiveCalls)
+	}
+	if !archivedQuiesced {
+		t.Fatal("expired release did not carry caller-side quiescence to the archive provider")
+	}
+	if archivedRoot != layout.Root.String() {
+		t.Fatalf("archived root = %q, want %q", archivedRoot, layout.Root.String())
+	}
+	if _, err := os.Stat(layout.Root.String()); !os.IsNotExist(err) {
+		t.Fatalf("source survived expiry-driven archive-backed disposal: %v", err)
+	}
+	settled, err := manager.TerminalLease(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled.State != workarea.LeaseReleased {
+		t.Fatalf("lease state after expiry-driven archive+disposal = %q, want released", settled.State)
+	}
+	if settled.ReleaseReason != "expiry" {
+		t.Fatalf("release reason after expiry = %q, want expiry", settled.ReleaseReason)
+	}
 }
 
 // Restart path: a process restart after release-pending resumes provider
