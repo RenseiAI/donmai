@@ -127,6 +127,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		IssueIdentifier: qw.IssueIdentifier,
 		StartedAt:       startedAt,
 	}
+	// Ensure every failed headless return carries structured evidence even
+	// when it exits before the stream finalise block below: the phase/decider
+	// pair for the mode plus a bounded redacted tail, with unavailable
+	// details left null. The stream finalise block adds the
+	// provider/assistant-text fallback for post-stream failures; this defer
+	// covers the raw Error on all pre-stream early returns.
+	defer func() {
+		ensureHeadlessFailureEvidence(res)
+	}()
 
 	// 1. Resolve exactly one harness/provider pair before any posterior network
 	// request, worktree creation, credential delivery, or provider spawn.
@@ -3877,6 +3886,31 @@ func stampHeadlessFailure(res *Result, mode, rawTail string, exitCode *int) {
 	res.ExitCode = exitCode
 	if tail := boundedFailureTail(rawTail); tail != "" {
 		res.OutputTail = tail
+	}
+}
+
+// ensureHeadlessFailureEvidence fills the structured evidence for any
+// failed headless return that bypassed the stream finalise block: the
+// phase/decider pair for the mode plus a bounded redacted tail derived
+// from the raw Error. Unavailable details stay null; unknown modes report
+// no phase rather than an invented one. Idempotent: already-stamped
+// results are left unchanged, and bounding twice is a no-op.
+func ensureHeadlessFailureEvidence(res *Result) {
+	if res == nil || res.Status != "failed" || res.FailureMode == "" {
+		return
+	}
+	if res.FailurePhase == "" {
+		phase, decidedBy := failurePhaseForMode(res.FailureMode)
+		res.FailurePhase = phase
+		res.FailureDecidedBy = decidedBy
+	}
+	if res.OutputTail == "" && res.Error != "" {
+		if tail := boundedFailureTail(res.Error); tail != "" {
+			res.OutputTail = tail
+		}
+	}
+	if res.Error != "" {
+		res.Error = boundedFailureTail(res.Error)
 	}
 }
 

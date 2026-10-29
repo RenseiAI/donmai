@@ -773,7 +773,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 		GenerationIDs: r.GenerationIDs,
-		ExitCode: r.ExitCode, OutputTail: r.OutputTail,
+		ExitCode:      r.ExitCode, OutputTail: r.OutputTail,
 		FailurePhase: r.FailurePhase, FailureDecidedBy: r.FailureDecidedBy,
 	}
 	if r.Cost != nil {

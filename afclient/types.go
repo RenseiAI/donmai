@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // SessionStatus matches the public API status union type.
@@ -882,9 +883,11 @@ func TruncateHeadlessFailureTail(s string) string {
 	if len(s) <= MaxHeadlessFailureTailBytes {
 		return s
 	}
-	runes := []rune(s)
-	for len(string(runes)) > MaxHeadlessFailureTailBytes && len(runes) > 0 {
-		runes = runes[1:]
+	// Keep the longest rune-aligned suffix within the byte bound: slice
+	// from the end once, then trim a leading partial rune. O(n).
+	s = s[len(s)-MaxHeadlessFailureTailBytes:]
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
 	}
-	return string(runes)
+	return s
 }

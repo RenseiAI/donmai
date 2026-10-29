@@ -324,8 +324,10 @@ func TestTerminalEvidence_HeadlessProviderErrorPreservesUpstreamAndBoundedTail(t
 	secret := "api_key=super-secret-value-abc123"
 	msg := "endpoint refused\n" + strings.Repeat("filler line\n", 80) + secret + "\n" + strings.Repeat("x", 6000) + "\nBearer hidden-token-xyz"
 	upstream := &agent.UpstreamError{HTTPStatus: 400, ProviderCode: "invalid_request", ProviderMessage: "bad params"}
-	res, _ := runScriptedSession(t, scriptedSession{workType: "qa", skipSteering: true,
-		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg, Upstream: upstream}}}}})
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg, Upstream: upstream}}}},
+	})
 	if res.Status != "failed" || res.FailureMode != FailureProviderError {
 		t.Fatalf("Status=%q Mode=%q; want failed/provider-error", res.Status, res.FailureMode)
 	}
@@ -359,8 +361,10 @@ func TestTerminalEvidence_HeadlessProviderErrorPreservesUpstreamAndBoundedTail(t
 	}
 	// Unavailable upstream stays null with a bounded tail.
 	secret2 := "api_key=another-hidden-value-xyz789"
-	res2, _ := runScriptedSession(t, scriptedSession{workType: "qa", skipSteering: true,
-		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: strings.Repeat("pad\n", 100) + secret2 + "\n" + strings.Repeat("z", 8000)}}}}})
+	res2, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: strings.Repeat("pad\n", 100) + secret2 + "\n" + strings.Repeat("z", 8000)}}}},
+	})
 	if res2.Upstream != nil {
 		t.Fatalf("Upstream=%+v; want nil", res2.Upstream)
 	}
@@ -415,8 +419,10 @@ func TestTerminalEvidence_SpawnFailureHasNullExitCodeWithPhase(t *testing.T) {
 // Negative control: completed runs carry no failure evidence.
 func TestTerminalEvidence_SuccessCarriesNoFailureEvidence(t *testing.T) {
 	t.Parallel()
-	res, _ := runScriptedSession(t, scriptedSession{workType: "qa", skipSteering: true,
-		turns: []verdictScriptTurn{{text: "done\n<!-- WORK_RESULT:passed -->"}}})
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{text: "done\n<!-- WORK_RESULT:passed -->"}},
+	})
 	if res.Status != "completed" {
 		t.Fatalf("Status=%q; want completed", res.Status)
 	}
@@ -426,5 +432,143 @@ func TestTerminalEvidence_SuccessCarriesNoFailureEvidence(t *testing.T) {
 	ev := headlessFailureEvidence(res)
 	if ev.FailureMode != "" || ev.UpstreamHTTPStatus != nil || ev.UpstreamProviderCode != nil || ev.ExitCode != nil || ev.OutputTail != "" {
 		t.Fatalf("completed evidence not empty: %+v", ev)
+	}
+}
+
+// Unknown failure modes report no phase rather than an invented stream
+// phase. Known spawn/provision/stream modes keep their explicit mapping.
+func TestTerminalEvidence_FailurePhaseUnknownReportsNoPhase(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{
+		FailureAgentBlocked, FailureBudgetExceeded, FailureBackstop,
+		FailureKitProvision, FailureProviderResolve, FailurePromptRender,
+		FailureInteractiveInput, "totally-unknown",
+	} {
+		if phase, decidedBy := failurePhaseForMode(mode); phase != "" || decidedBy != "" {
+			t.Fatalf("failurePhaseForMode(%q) = %q/%q; want empty", mode, phase, decidedBy)
+		}
+	}
+	for _, tc := range []struct {
+		mode        string
+		wantPhase   string
+		wantDecided string
+	}{
+		{FailureSpawn, "spawn", "runner"},
+		{FailureWorktreeProvision, "provision", "runner"},
+		{FailureProviderError, "stream", "runner"},
+		{FailureSilentExit, "stream", "runner"},
+		{FailureTimeout, "stream", "runner"},
+		{FailureNoProgress, "stream", "runner"},
+	} {
+		if phase, decidedBy := failurePhaseForMode(tc.mode); phase != tc.wantPhase || decidedBy != tc.wantDecided {
+			t.Fatalf("failurePhaseForMode(%q) = %q/%q; want %q/%q", tc.mode, phase, decidedBy, tc.wantPhase, tc.wantDecided)
+		}
+	}
+	// Production entry: a deliberately declined agent reports no invented
+	// phase through the real run loop.
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{text: "need a decision\nAGENT_BLOCKED: need a product decision\nWORK_RESULT: blocked"}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureAgentBlocked {
+		t.Fatalf("Status=%q Mode=%q; want failed/agent-blocked", res.Status, res.FailureMode)
+	}
+	if res.FailurePhase != "" || res.FailureDecidedBy != "" {
+		t.Fatalf("phase=%q decidedBy=%q; want empty (no invented stream)", res.FailurePhase, res.FailureDecidedBy)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail even with empty phase")
+	}
+}
+
+// Pre-stream early returns carry bounded evidence through the real run:
+// a provider-resolve refusal has a null exit and a bounded redacted tail.
+func TestTerminalEvidence_PreStreamProviderResolveCarriesBoundedTail(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	qw := h.queuedWork("EVIDENCE-RESOLVE")
+	qw.ResolvedProfile.Provider = agent.ProviderName("nonexistent")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err == nil || res == nil {
+		t.Fatalf("err=%v res=%+v; want provider-resolve failure", err, res)
+	}
+	if res.Status != "failed" || res.FailureMode != FailureProviderResolve {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-resolve", res.Status, res.FailureMode)
+	}
+	if res.ExitCode != nil {
+		t.Fatalf("ExitCode=%d; want null", *res.ExitCode)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail on pre-stream failure")
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+}
+
+// Oversized diagnostic tails stay bounded through the real run: a 100 KB
+// provider-error message completes with a 4096-byte redacted tail.
+func TestTerminalEvidence_OversizedTailStaysBounded(t *testing.T) {
+	t.Parallel()
+	msg := strings.Repeat("x", 100*1024) + "\napi_key=oversized-secret-value"
+	upstream := &agent.UpstreamError{HTTPStatus: 500, ProviderCode: "server_error", ProviderMessage: "boom"}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg, Upstream: upstream}}}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-error", res.Status, res.FailureMode)
+	}
+	assertBoundedRedacted(t, res.OutputTail, "oversized-secret-value")
+}
+
+// Line bound is independent of the byte bound: 200 short lines fit well
+// under 4096 bytes, so only the 50-line bound can trim them.
+func TestTerminalEvidence_LineBoundIndependentOfByteBound(t *testing.T) {
+	t.Parallel()
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		b.WriteString("pad-line\n")
+	}
+	msg := b.String()
+	if len(msg) >= afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("fixture is %d bytes; want under %d so only the line bound applies", len(msg), afclient.MaxHeadlessFailureTailBytes)
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg}}}},
+	})
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if n := headlessTailLines(res.OutputTail); n > afclient.MaxHeadlessFailureTailLines {
+		t.Fatalf("tail has %d lines; want at most %d", n, afclient.MaxHeadlessFailureTailLines)
+	}
+	if n := headlessTailLines(res.OutputTail); n != afclient.MaxHeadlessFailureTailLines {
+		t.Fatalf("tail has %d lines; want exactly %d (last lines kept)", n, afclient.MaxHeadlessFailureTailLines)
+	}
+}
+
+// Zero HTTP status with a provider code keeps the code while the status
+// stays null: the endpoint named a code but no status.
+func TestTerminalEvidence_ZeroStatusWithCodePreservesCode(t *testing.T) {
+	t.Parallel()
+	upstream := &agent.UpstreamError{HTTPStatus: 0, ProviderCode: "throttled_code", ProviderMessage: "slow down"}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: "endpoint throttled", Upstream: upstream}}}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-error", res.Status, res.FailureMode)
+	}
+	if res.Upstream == nil || res.Upstream.HTTPStatus != 0 || res.Upstream.ProviderCode != "throttled_code" {
+		t.Fatalf("Upstream=%+v; want 0/throttled_code", res.Upstream)
+	}
+	ev := headlessFailureEvidence(res)
+	if ev.UpstreamHTTPStatus != nil {
+		t.Fatalf("UpstreamHTTPStatus=%d; want nil", *ev.UpstreamHTTPStatus)
+	}
+	if ev.UpstreamProviderCode == nil || *ev.UpstreamProviderCode != "throttled_code" {
+		t.Fatalf("UpstreamProviderCode=%+v; want throttled_code", ev.UpstreamProviderCode)
 	}
 }

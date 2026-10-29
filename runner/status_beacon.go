@@ -77,10 +77,8 @@ func failurePhaseForMode(mode string) (phase, decidedBy string) {
 		return "provision", "runner"
 	case FailureProviderError, FailureSilentExit, FailureTimeout, FailureNoProgress:
 		return "stream", "runner"
-	case "":
-		return "", ""
 	default:
-		return "stream", "runner"
+		return "", ""
 	}
 }
 
