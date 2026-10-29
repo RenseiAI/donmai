@@ -16,8 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/internal/diagnostic"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/internal/providerretry"
@@ -498,8 +500,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				return res, err
 			}
 		}
-		res.FailureMode = classifyWorktreeErr(err)
-		res.Error = err.Error()
+		mode := classifyWorktreeErr(err)
+		// No process existed on a clone/provision failure, so the exit
+		// code stays null and the phase/decider carry the evidence.
+		stampHeadlessFailure(res, mode, err.Error(), nil)
+		res.Error = res.OutputTail
+		if res.Error == "" {
+			res.Error = err.Error()
+		}
 		return res, err
 	}
 	res.WorktreePath = wpath
@@ -1286,8 +1294,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	handle, err := provider.Spawn(ctx, spec)
 	if err != nil {
 		res.Status = "failed"
-		res.FailureMode = FailureSpawn
-		res.Error = err.Error()
+		res.Error = boundedFailureTail(err.Error())
+		// No process existed, so the exit code stays null (never zero)
+		// and no agent verdict is invented: phase/decider carry the
+		// spawn evidence instead.
+		stampHeadlessFailure(res, FailureSpawn, err.Error(), nil)
+		res.Error = res.OutputTail
+		if res.Error == "" {
+			res.Error = "provider spawn failed"
+		}
 		return res, err
 	}
 	defer func() {
@@ -2256,6 +2271,31 @@ tailRecovery:
 			if res.FailureMode == "" {
 				res.FailureMode = FailureSilentExit
 			}
+		}
+	}
+	// Ensure every failed headless run carries structured evidence:
+	// phase/decider, null exit code when unknown, and a bounded
+	// redacted tail. Unavailable upstream details stay nil.
+	if res.Status == "failed" && res.FailureMode != "" {
+		if res.FailurePhase == "" {
+			phase, decidedBy := failurePhaseForMode(res.FailureMode)
+			res.FailurePhase = phase
+			res.FailureDecidedBy = decidedBy
+		}
+		if res.OutputTail == "" {
+			raw := res.Error
+			if raw == "" && streamRes.providerError != "" {
+				raw = streamRes.providerError
+			}
+			if raw == "" && streamRes.lastAssistantText != "" {
+				raw = streamRes.lastAssistantText
+			}
+			if tail := boundedFailureTail(raw); tail != "" {
+				res.OutputTail = tail
+			}
+		}
+		if res.Error != "" {
+			res.Error = boundedFailureTail(res.Error)
 		}
 	}
 
@@ -3808,6 +3848,35 @@ func classifyWorktreeErr(err error) string {
 		return FailureLostOwnership
 	default:
 		return FailureWorktreeProvision
+	}
+}
+
+// boundedFailureTail redacts secret-shaped values then applies the
+// operator-facing byte and line bounds. Redaction runs first so a
+// secret never survives truncation, and unavailable details stay absent
+// rather than invented.
+func boundedFailureTail(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	return afclient.TruncateHeadlessFailureTail(diagnostic.Redact(raw))
+}
+
+// stampHeadlessFailure records structured evidence for a failed headless
+// run: the phase/decider pair for the mode, a nil exit code when no
+// process existed, and the bounded redacted tail. It never invents an
+// agent verdict: WorkResult and Summary are left for the stream to fill.
+func stampHeadlessFailure(res *Result, mode, rawTail string, exitCode *int) {
+	if res == nil {
+		return
+	}
+	phase, decidedBy := failurePhaseForMode(mode)
+	res.FailureMode = mode
+	res.FailurePhase = phase
+	res.FailureDecidedBy = decidedBy
+	res.ExitCode = exitCode
+	if tail := boundedFailureTail(rawTail); tail != "" {
+		res.OutputTail = tail
 	}
 }
 

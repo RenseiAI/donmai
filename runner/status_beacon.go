@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/runtime/statusbeacon"
 )
 
@@ -61,6 +62,55 @@ func terminalBeaconStep(res *Result) string {
 		return "failed"
 	}
 	return StatusBeaconTeardown
+}
+
+// failurePhaseForMode maps a terminal failure classification onto the
+// phase and decider the terminal report carries. Spawn and provisioning
+// failures happen before any agent process exists, so they report their
+// own phase; stream failures report the event-stream phase. Unknown modes
+// report no phase rather than an invented one.
+func failurePhaseForMode(mode string) (phase, decidedBy string) {
+	switch mode {
+	case FailureSpawn:
+		return "spawn", "runner"
+	case FailureWorktreeProvision:
+		return "provision", "runner"
+	case FailureProviderError, FailureSilentExit, FailureTimeout, FailureNoProgress:
+		return "stream", "runner"
+	case "":
+		return "", ""
+	default:
+		return "stream", "runner"
+	}
+}
+
+// headlessFailureEvidence builds the operator-facing projection of a
+// terminal Result: failure mode, nullable upstream status/code, nullable
+// exit code and the bounded redacted tail, plus the phase/decider pair.
+// Unavailable upstream details stay nil; a nil result yields an empty
+// evidence value.
+func headlessFailureEvidence(res *Result) afclient.HeadlessFailureEvidence {
+	if res == nil {
+		return afclient.HeadlessFailureEvidence{}
+	}
+	out := afclient.HeadlessFailureEvidence{
+		FailureMode: res.FailureMode,
+		ExitCode:    res.ExitCode,
+		OutputTail:  res.OutputTail,
+		Phase:       res.FailurePhase,
+		DecidedBy:   res.FailureDecidedBy,
+	}
+	if res.Upstream != nil {
+		if res.Upstream.HTTPStatus != 0 {
+			status := res.Upstream.HTTPStatus
+			out.UpstreamHTTPStatus = &status
+		}
+		if res.Upstream.ProviderCode != "" {
+			code := res.Upstream.ProviderCode
+			out.UpstreamProviderCode = &code
+		}
+	}
+	return out
 }
 
 // statusBeaconReporter is the runner's per-session current-step beacon:

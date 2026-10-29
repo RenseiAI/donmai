@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
@@ -278,5 +279,152 @@ func TestTerminalEvidence_SentinelAbsentFromWire(t *testing.T) {
 	}
 	if strings.Contains(string(body), sentinel) {
 		t.Fatalf("prepared terminal body carries the sentinel descriptor path")
+	}
+}
+
+// spawnFailEvidenceProvider fails Spawn before any process exists.
+type spawnFailEvidenceProvider struct {
+	agent.HarnessProvider
+	spawnErr error
+}
+
+func (p *spawnFailEvidenceProvider) Spawn(context.Context, agent.Spec) (agent.Handle, error) {
+	return nil, p.spawnErr
+}
+
+func headlessTailLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	return len(strings.Split(s, "\n"))
+}
+
+func assertBoundedRedacted(t *testing.T, tail string, secrets ...string) {
+	t.Helper()
+	if tail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail")
+	}
+	if len(tail) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("tail is %d bytes; want at most %d", len(tail), afclient.MaxHeadlessFailureTailBytes)
+	}
+	if n := headlessTailLines(tail); n > afclient.MaxHeadlessFailureTailLines {
+		t.Fatalf("tail has %d lines; want at most %d", n, afclient.MaxHeadlessFailureTailLines)
+	}
+	for _, s := range secrets {
+		if s != "" && strings.Contains(tail, s) {
+			t.Fatalf("tail carries unredacted secret")
+		}
+	}
+}
+
+// Headless regression: a 400 with provider code keeps its cause and the
+// diagnostic tail is bounded/redacted; an unavailable upstream stays null.
+func TestTerminalEvidence_HeadlessProviderErrorPreservesUpstreamAndBoundedTail(t *testing.T) {
+	t.Parallel()
+	secret := "api_key=super-secret-value-abc123"
+	msg := "endpoint refused\n" + strings.Repeat("filler line\n", 80) + secret + "\n" + strings.Repeat("x", 6000) + "\nBearer hidden-token-xyz"
+	upstream := &agent.UpstreamError{HTTPStatus: 400, ProviderCode: "invalid_request", ProviderMessage: "bad params"}
+	res, _ := runScriptedSession(t, scriptedSession{workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg, Upstream: upstream}}}}})
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-error", res.Status, res.FailureMode)
+	}
+	if res.Upstream == nil || res.Upstream.HTTPStatus != 400 || res.Upstream.ProviderCode != "invalid_request" {
+		t.Fatalf("Upstream=%+v; want 400/invalid_request", res.Upstream)
+	}
+	if res.ExitCode != nil {
+		t.Fatalf("ExitCode=%d; want null", *res.ExitCode)
+	}
+	assertBoundedRedacted(t, res.OutputTail, secret, "hidden-token-xyz")
+	if res.FailurePhase == "" || res.FailureDecidedBy == "" {
+		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
+	}
+	ev := headlessFailureEvidence(res)
+	if ev.UpstreamHTTPStatus == nil || *ev.UpstreamHTTPStatus != 400 || ev.UpstreamProviderCode == nil || *ev.UpstreamProviderCode != "invalid_request" || ev.ExitCode != nil || ev.OutputTail == "" {
+		t.Fatalf("evidence=%+v; want 400/code with tail and null exit", ev)
+	}
+	h := newRunnerHarness(t)
+	body, err := h.runner.poster.PrepareTerminalStatusBody(context.Background(), "evidence-headless", res.Result, nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
+	}
+	raw := string(body)
+	for _, want := range []string{`"failureMode":"provider-error"`, `"httpStatus":400`, `"providerCode":"invalid_request"`, `"outputTail"`} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("terminal body lacks %s: %s", want, raw)
+		}
+	}
+	if strings.Contains(raw, secret) || strings.Contains(raw, "hidden-token-xyz") {
+		t.Fatalf("terminal body carries secret")
+	}
+	// Unavailable upstream stays null with a bounded tail.
+	secret2 := "api_key=another-hidden-value-xyz789"
+	res2, _ := runScriptedSession(t, scriptedSession{workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: strings.Repeat("pad\n", 100) + secret2 + "\n" + strings.Repeat("z", 8000)}}}}})
+	if res2.Upstream != nil {
+		t.Fatalf("Upstream=%+v; want nil", res2.Upstream)
+	}
+	assertBoundedRedacted(t, res2.OutputTail, secret2)
+	ev2 := headlessFailureEvidence(res2)
+	if ev2.UpstreamHTTPStatus != nil || ev2.UpstreamProviderCode != nil {
+		t.Fatalf("evidence upstream=%+v/%+v; want null", ev2.UpstreamHTTPStatus, ev2.UpstreamProviderCode)
+	}
+}
+
+// Spawn before any process: null exit, phase/decider, no invented result.
+func TestTerminalEvidence_SpawnFailureHasNullExitCodeWithPhase(t *testing.T) {
+	t.Parallel()
+	base := stubBaseForEvidence(t, nil)
+	provider := &spawnFailEvidenceProvider{HarnessProvider: base, spawnErr: errors.New("handshake failed: Bearer hidden-spawn-token dial refused\n" + strings.Repeat("detail\n", 80))}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-SPAWN")
+	qw.WorkType = "research"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err == nil || res == nil {
+		t.Fatalf("err=%v res=%+v; want spawn failure", err, res)
+	}
+	if res.Status != "failed" || res.FailureMode != FailureSpawn {
+		t.Fatalf("Status=%q Mode=%q; want failed/spawn-failed", res.Status, res.FailureMode)
+	}
+	if res.ExitCode != nil {
+		t.Fatalf("ExitCode=%d; want null (never zero)", *res.ExitCode)
+	}
+	if res.FailurePhase != "spawn" || res.FailureDecidedBy != "runner" {
+		t.Fatalf("phase=%q decidedBy=%q; want spawn/runner", res.FailurePhase, res.FailureDecidedBy)
+	}
+	if res.WorkResult != "" {
+		t.Fatalf("WorkResult=%q; want empty", res.WorkResult)
+	}
+	assertBoundedRedacted(t, res.OutputTail, "hidden-spawn-token")
+	if res.Upstream != nil {
+		t.Fatalf("Upstream=%+v; want nil", res.Upstream)
+	}
+	ev := headlessFailureEvidence(res)
+	if ev.ExitCode != nil || ev.Phase != "spawn" || ev.DecidedBy != "runner" {
+		t.Fatalf("evidence=%+v; want null exit with spawn/runner", ev)
+	}
+}
+
+// Negative control: completed runs carry no failure evidence.
+func TestTerminalEvidence_SuccessCarriesNoFailureEvidence(t *testing.T) {
+	t.Parallel()
+	res, _ := runScriptedSession(t, scriptedSession{workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{text: "done\n<!-- WORK_RESULT:passed -->"}}})
+	if res.Status != "completed" {
+		t.Fatalf("Status=%q; want completed", res.Status)
+	}
+	if res.FailureMode != "" || res.Upstream != nil || res.ExitCode != nil || res.OutputTail != "" || res.FailurePhase != "" || res.FailureDecidedBy != "" {
+		t.Fatalf("completed carries evidence: %+v", res)
+	}
+	ev := headlessFailureEvidence(res)
+	if ev.FailureMode != "" || ev.UpstreamHTTPStatus != nil || ev.UpstreamProviderCode != nil || ev.ExitCode != nil || ev.OutputTail != "" {
+		t.Fatalf("completed evidence not empty: %+v", ev)
 	}
 }

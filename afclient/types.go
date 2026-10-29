@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -827,4 +828,63 @@ type StatsResponseV2 struct {
 	// Providers is the per-provider cost and capacity breakdown.
 	// Empty when no provider cost data is available.
 	Providers []ProviderCost `json:"providers,omitempty"`
+}
+
+// ── Headless runner failure evidence ─────────────────────────────────────────
+//
+// Operator surface for failed headless runs: the structured cause the
+// terminal status carries so infrastructure failures cannot collapse into
+// an unowned label. All pointer fields are nullable: a nil upstream
+// status/code means the endpoint named none, and a nil exit code means no
+// process existed to report one (never zero for a spawn failure).
+const (
+	// MaxHeadlessFailureTailBytes bounds one failure tail in bytes.
+	MaxHeadlessFailureTailBytes = 4096
+	// MaxHeadlessFailureTailLines bounds one failure tail in lines.
+	MaxHeadlessFailureTailLines = 50
+)
+
+// HeadlessFailureEvidence is the bounded, operator-facing projection of a
+// failed headless run. Additive and secret-free: OutputTail is already
+// redacted and bounded before transport, and every unavailable detail
+// stays null rather than invented.
+type HeadlessFailureEvidence struct {
+	// FailureMode is the runner classification (for example
+	// "spawn-failed" or "provider-error").
+	FailureMode string `json:"failureMode"`
+	// UpstreamHTTPStatus is the endpoint HTTP status when the harness
+	// exposed one. Nil when unavailable.
+	UpstreamHTTPStatus *int `json:"upstreamHttpStatus,omitempty"`
+	// UpstreamProviderCode is the endpoint error code when the harness
+	// exposed one. Nil when unavailable.
+	UpstreamProviderCode *string `json:"upstreamProviderCode,omitempty"`
+	// ExitCode is the process exit when one existed. Nil when no process
+	// existed (spawn failure) or the harness reported none.
+	ExitCode *int `json:"exitCode,omitempty"`
+	// OutputTail is the redacted, bounded diagnostic tail.
+	OutputTail string `json:"outputTail,omitempty"`
+	// Phase names where the failure was decided (for example "spawn",
+	// "provision" or "stream").
+	Phase string `json:"phase,omitempty"`
+	// DecidedBy names who decided the failure (for example "runner").
+	DecidedBy string `json:"decidedBy,omitempty"`
+}
+
+// TruncateHeadlessFailureTail applies line then byte bounds to a redacted
+// tail, rune-safe. Empty stays empty.
+func TruncateHeadlessFailureTail(s string) string {
+	if s == "" {
+		return ""
+	}
+	if lines := strings.Split(s, "\n"); len(lines) > MaxHeadlessFailureTailLines {
+		s = strings.Join(lines[len(lines)-MaxHeadlessFailureTailLines:], "\n")
+	}
+	if len(s) <= MaxHeadlessFailureTailBytes {
+		return s
+	}
+	runes := []rune(s)
+	for len(string(runes)) > MaxHeadlessFailureTailBytes && len(runes) > 0 {
+		runes = runes[1:]
+	}
+	return string(runes)
 }

@@ -384,6 +384,26 @@ type statusRequest struct {
 	// reads as "did nothing" rather than unknown.
 	ToolCalls int `json:"toolCalls"`
 
+	// ExitCode is the headless process exit when one existed. Nil when no
+	// process existed or the harness reported none. Additive; omitted
+	// when nil — old platforms ignore it.
+	ExitCode *int `json:"exitCode,omitempty"`
+
+	// OutputTail is the redacted, bounded diagnostic tail of a failed
+	// headless run. Additive; omitted when empty — old platforms
+	// ignore it.
+	OutputTail string `json:"outputTail,omitempty"`
+
+	// FailurePhase names where a failure was decided (for example
+	// "spawn", "provision" or "stream"). Additive; omitted when
+	// empty — old platforms ignore it.
+	FailurePhase string `json:"failurePhase,omitempty"`
+
+	// FailureDecidedBy names who decided a failure (for example
+	// "runner"). Additive; omitted when empty — old platforms ignore
+	// it.
+	FailureDecidedBy string `json:"failureDecidedBy,omitempty"`
+
 	// SeatState is the seat's final three-axis report: session presence,
 	// activity with its decided-by rung, resumability, plus the
 	// orthogonal needs-input count and reason. Additive; omitted when
@@ -753,6 +773,8 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 		GenerationIDs: r.GenerationIDs,
+		ExitCode: r.ExitCode, OutputTail: r.OutputTail,
+		FailurePhase: r.FailurePhase, FailureDecidedBy: r.FailureDecidedBy,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd
