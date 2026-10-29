@@ -464,6 +464,118 @@ func TestGuardedRepairSwapAfterDiagnosisFails(t *testing.T) {
 	}
 }
 
+// TestGuardedRepairPrePinSwapFails pins the diagnosed-inode pin: a swap
+// planted after diagnosis but before the repair opens the store directory
+// reuses the diagnosed store ID with a different-inode forgery. Only the
+// diagnosed-inode re-check under the exclusive lock can reject it: the
+// post-open SameFile checks pin the replacement itself once the swapped
+// directory is opened, so removing the inode pin must let the swap through.
+func TestGuardedRepairPrePinSwapFails(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	storeID, _ := legacyDriftForGuardedTest(t, parent)
+
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diagnosis.NeedsReanchor || diagnosis.StoreID != storeID || diagnosis.Inode == 0 {
+		t.Fatalf("pre-swap diagnosis = %+v, want needs-reanchor for %q", diagnosis, storeID)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+	origAnchorBody, err := os.ReadFile(anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repairPreOpenHook = func() {
+		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		if err := os.Rename(storeDir, storeDir+".orig"); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Mkdir(storeDir, 0o700); err != nil {
+			t.Error(err)
+			return
+		}
+		forgedInfo, err := os.Lstat(storeDir)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		forgedPhysical, err := fileIdentity(forgedInfo)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		oldDevice := forgedPhysical.Device + 1000
+		if oldDevice == forgedPhysical.Device {
+			oldDevice++
+		}
+		legacy := FileIdentity{Device: oldDevice, Inode: forgedPhysical.Inode}
+		forged := acquisitionStoreIdentity{SchemaVersion: acquisitionStoreSchemaV1, StoreID: storeID, Identity: legacy}
+		forgedBody, err := json.Marshal(forged)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(storeDir, acquisitionStoreIdentityName), forgedBody, 0o600); err != nil {
+			t.Error(err)
+		}
+		// Rewrite the parent anchor to the same forged legacy identity so
+		// every check except the diagnosed-inode pin still passes: both
+		// documents share the forged inode and device with matching store
+		// IDs, and the empty forgery carries no acquisition rows to refuse.
+		//nolint:gosec // test-only TempDir anchor path from Join(parent, constant).
+		if err := os.WriteFile(anchorPath, forgedBody, 0o600); err != nil {
+			t.Error(err)
+		}
+		lockFile, err := os.OpenFile(filepath.Join(storeDir, acquisitionStoreLockName), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = lockFile.Close()
+	}
+	t.Cleanup(func() {
+		repairPreOpenHook = nil
+		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		if _, err := os.Lstat(storeDir + ".orig"); err == nil {
+			_ = os.RemoveAll(storeDir)
+			_ = os.Rename(storeDir+".orig", storeDir)
+			//nolint:gosec // test-only TempDir anchor restore; path from Join(parent, constant).
+			_ = os.WriteFile(anchorPath, origAnchorBody, 0o600)
+		}
+	})
+
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted a pre-pin swapped store directory")
+	}
+	swappedEntries, err := os.ReadDir(filepath.Join(parent, acquisitionStoreDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range swappedEntries {
+		if strings.Contains(entry.Name(), ".backup-") {
+			t.Fatalf("repair wrote backups into the pre-pin replacement: %q", entry.Name())
+		}
+	}
+	storeDir := filepath.Join(parent, acquisitionStoreDirName)
+	if _, err := os.Lstat(storeDir + ".orig"); err == nil {
+		_ = os.RemoveAll(storeDir)
+		if err := os.Rename(storeDir+".orig", storeDir); err != nil {
+			t.Fatal(err)
+		}
+		//nolint:gosec // test-only TempDir anchor restore; path from Join(parent, constant).
+		if err := os.WriteFile(anchorPath, origAnchorBody, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		repairPreOpenHook = nil
+		assertAcquisitionParentUnchanged(t, parent, before)
+	}
+}
+
 // TestGuardedRepairConcurrentWriterBlocked pins AC-4 (locking): an
 // exclusive writer blocks explicit repair until released.
 func TestGuardedRepairConcurrentWriterBlocked(t *testing.T) {
@@ -618,6 +730,56 @@ func TestGuardedRepairRefusesStoreSideLegacyAlone(t *testing.T) {
 	}
 	if !after.Healthy || after.NeedsReanchor || after.StoreID != storeID {
 		t.Fatalf("post-repair diagnosis = %+v, want healthy for %q", after, storeID)
+	}
+}
+
+// TestGuardedRepairRefusesAnchorSideLegacyAlone pins the anchor-side legacy
+// refusal: a current store document (pinned to the present device) with a
+// legacy parent anchor (same inode, old device, no birth) must fail closed
+// on the writable door and require explicit repair. Deleting the
+// anchor-side guard lets the writable open auto-heal the same directory
+// without explicit repair or acquisition-record validation. On platforms
+// without birth the inode-only tolerance still heals, so only the
+// diagnosis and repair legs are pinned there.
+func TestGuardedRepairRefusesAnchorSideLegacyAlone(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	storeID, physical := legacyDriftForGuardedTest(t, parent)
+	if !physical.HasBirth {
+		t.Skip("platform does not record birth; anchor-side legacy refusal needs birth")
+	}
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	storeRecord := readStoreIdentityForTest(t, storePath)
+	storeRecord.Identity = physical
+	writeStoreIdentityForTest(t, storePath, storeRecord)
+	before := snapshotAcquisitionParent(t, parent)
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnosis.Healthy || !diagnosis.NeedsReanchor || diagnosis.StoreID != storeID {
+		t.Fatalf("anchor-side legacy diagnosis = %+v, want needs-reanchor for %q", diagnosis, storeID)
+	}
+	if _, err := NewAcquisitionStore(parent, nil); err == nil {
+		t.Fatal("writable open auto-healed store-current without explicit repair")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+	if err := RepairAcquisitionStore(parent); err != nil {
+		t.Fatalf("repair of anchor-side legacy: %v", err)
+	}
+	after, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Healthy || after.NeedsReanchor || after.StoreID != storeID {
+		t.Fatalf("post-repair diagnosis = %+v, want healthy for %q", after, storeID)
+	}
+	reopened, err := NewAcquisitionStore(parent, nil)
+	if err != nil {
+		t.Fatalf("reopen after anchor-side repair: %v", err)
+	}
+	if reopened.storeID != storeID {
+		t.Fatalf("store ID changed across anchor-side repair: %q vs %q", reopened.storeID, storeID)
 	}
 }
 

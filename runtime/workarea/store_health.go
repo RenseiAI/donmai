@@ -17,6 +17,13 @@ import (
 // scan still consumes the pinned root rather than a replacement.
 var repairSwapHook func()
 
+// repairPreOpenHook is a test-only seam invoked after the repair diagnoses
+// the parent but before it opens and pins the store directory. Tests use
+// it to swap the path-visible store directory and prove the diagnosed
+// inode pin still rejects a different-inode forgery that reuses the
+// diagnosed store ID.
+var repairPreOpenHook func()
+
 // StoreDiagnosis describes the health of the workarea acquisition-store
 // identity for one worktree parent.
 type StoreDiagnosis struct {
@@ -156,6 +163,12 @@ func RepairAcquisitionStore(parent string) error {
 	}
 	if !diagnosis.NeedsReanchor {
 		return fmt.Errorf("runtime/workarea: acquisition store needs manual review: %s", diagnosis.Reason)
+	}
+	// Test-only pre-pin swap seam: runs after diagnosis but before the
+	// repair opens and pins the store directory, so a path swap here can
+	// only be caught by the diagnosed-inode pin.
+	if repairPreOpenHook != nil {
+		repairPreOpenHook()
 	}
 	abs, err := filepath.Abs(parent)
 	if err != nil {
