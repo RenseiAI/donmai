@@ -68,7 +68,7 @@ RUN curl -fsSL https://go.dev/dl/go1.26.10.linux-amd64.tar.gz -o /tmp/go.tgz \
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm /tmp/go.tgz \
     && /usr/local/go/bin/go version
-ENV PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"
+ENV PATH=/usr/local/go/bin:/usr/local/bin:${PATH}
 
 # Go lint + format tools, version-pinned (see header). GOBIN keeps the
 # binaries on the default PATH without an extra GOPATH entry.

@@ -13,9 +13,12 @@ const {
   assertPiVersionOutput,
   assertVersionOutput,
   hasCToolchainForRace,
+  hasE2bCompatibleGoPath,
   isGoTemplateRef,
   main,
   parseAptInstalledPackages,
+  parseE2bPathEntries,
+  parseE2bPathRaw,
   parseGofumptVersion,
   parseGolangciLintVersion,
   parseGoVersion,
@@ -414,12 +417,53 @@ test('e2b.go.Dockerfile installs the C toolchain for go test -race', () => {
 test('C-toolchain assertion ignores Dockerfile comments', () => {
   const source = [
     '# gcc libc6-dev are mentioned here but install nothing',
+    '# RUN apt-get install -y gcc libc6-dev',
     'FROM debian:bookworm-slim',
     'RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git curl \\',
     '    && rm -rf /var/lib/apt/lists/*',
   ].join('\n')
   assert.deepEqual(parseAptInstalledPackages(source), ['ca-certificates', 'git', 'curl'])
   assert.equal(hasCToolchainForRace(source), false)
+})
+
+test('e2b.go.Dockerfile sets an E2B-compatible Go PATH', () => {
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
+    'utf8'
+  )
+  assert.equal(hasE2bCompatibleGoPath(dockerfile), true)
+  const entries = parseE2bPathEntries(dockerfile)
+  assert.ok(entries, 'expected ENV PATH entries')
+  assert.equal(entries[0], '/usr/local/go/bin')
+  assert.doesNotMatch(parseE2bPathRaw(dockerfile), /^["'].*/)
+})
+
+test('E2B PATH evaluation retains quotes where an ordinary parser would strip them', () => {
+  const quoted = [
+    'FROM debian:bookworm-slim',
+    'ENV PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"',
+    'RUN go version',
+  ].join('\n')
+  assert.equal(hasE2bCompatibleGoPath(quoted), false)
+  assert.equal(parseE2bPathEntries(quoted)[0], '"/usr/local/go/bin')
+  const fixed = [
+    'FROM debian:bookworm-slim',
+    'ENV PATH=/usr/local/go/bin:/usr/local/bin:${PATH}',
+    'RUN go version',
+  ].join('\n')
+  assert.equal(hasE2bCompatibleGoPath(fixed), true)
+  assert.equal(parseE2bPathEntries(fixed)[0], '/usr/local/go/bin')
+})
+
+test('E2B Go PATH check fails when the ENV is deleted', () => {
+  const noEnv = [
+    'FROM debian:bookworm-slim',
+    'RUN /usr/local/go/bin/go version',
+  ].join('\n')
+  assert.equal(parseE2bPathRaw(noEnv), null)
+  assert.equal(parseE2bPathEntries(noEnv), null)
+  assert.equal(hasE2bCompatibleGoPath(noEnv), false)
 })
 
 test('e2b.go.Dockerfile Go tarball tracks the go.mod floor', () => {

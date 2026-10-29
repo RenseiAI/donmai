@@ -154,6 +154,55 @@ function hasCToolchainForRace(dockerfileSource) {
   )
 }
 
+// parseE2bPathRaw returns the raw ENV PATH value exactly as the pinned E2B
+// SDK backend sees it via fromDockerfile: surrounding quotes are retained,
+// not stripped the way an ordinary Dockerfile parser or shell would. A quoted
+// `ENV PATH="..."` therefore yields a value starting with `"` whose first
+// colon-separated entry cannot resolve `go`.
+function parseE2bPathRaw(dockerfileSource) {
+  const lines = String(dockerfileSource).split('\n')
+  let raw = null
+  for (const line of lines) {
+    if (/^\s*#/.test(line)) {
+      continue
+    }
+    const trimmed = line.trim()
+    if (!/^ENV\b/i.test(trimmed)) {
+      continue
+    }
+    let match = trimmed.match(/\bPATH\s*=\s*("[^"]*"|'[^']*'|[^\s]+)/)
+    if (match) {
+      raw = match[1]
+      continue
+    }
+    match = trimmed.match(/^ENV\s+PATH\s+("[^"]*"|'[^']*'|[^\s]+)\s*$/i)
+    if (match) {
+      raw = match[1]
+    }
+  }
+  return raw
+}
+
+function parseE2bPathEntries(dockerfileSource) {
+  const raw = parseE2bPathRaw(dockerfileSource)
+  if (raw === null) {
+    return null
+  }
+  return raw.split(':')
+}
+
+function hasE2bCompatibleGoPath(dockerfileSource) {
+  const raw = parseE2bPathRaw(dockerfileSource)
+  if (raw === null) {
+    return false
+  }
+  if (/["']/.test(raw)) {
+    return false
+  }
+  const entries = raw.split(':')
+  return entries[0] === '/usr/local/go/bin'
+}
+
 function resolveRepoRoot({ env, cwd, scriptDir } = {}) {
   const sourceEnv = env || process.env
   const sourceCwd = cwd || process.cwd()
@@ -416,9 +465,12 @@ module.exports = {
   assertVersionOutput,
   formatFailure,
   hasCToolchainForRace,
+  hasE2bCompatibleGoPath,
   isGoTemplateRef,
   main,
   parseAptInstalledPackages,
+  parseE2bPathEntries,
+  parseE2bPathRaw,
   parseGofumptVersion,
   parseGolangciLintVersion,
   parseGoVersion,
