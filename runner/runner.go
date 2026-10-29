@@ -816,18 +816,21 @@ func (r *Runner) RunAdmitted(ctx context.Context, qw QueuedWork, admission *Harn
 }
 
 // recordWriterQuiescence records the ordinary-writer half of the
-// writer-quiescence boundary: the terminal generation has exited by the
-// time the run loop returns, so the embedder-owned writers it supervised
-// are gone. Recording happens here — before lease settlement — so an
-// archive-disposition release carries quiescence evidence into the
-// archive manifest (durable via the lease record, surviving daemon
-// reapers and restarts). A nil manager or empty session records
-// nothing; those releases stay unquiesced evidence, never refused.
-func (r *Runner) recordWriterQuiescence(sessionID string) {
+// writer-quiescence boundary: the caller proves the terminal generation
+// stopped and reaped through the handle it supervised, then records the
+// outcome here — before lease settlement — so an archive-disposition
+// release carries quiescence evidence into the archive manifest (durable
+// via the lease record, surviving daemon reapers and restarts). Only a
+// clean Stop proves the owned writers gone, so callers pass quiesced=true
+// solely when Stop returned nil; a timed-out or failed Stop records false
+// and the release stays unquiesced evidence, never refused. A nil manager
+// or empty session records nothing; those releases stay unquiesced
+// evidence, never refused.
+func (r *Runner) recordWriterQuiescence(sessionID string, quiesced bool) {
 	if r.wt == nil || sessionID == "" {
 		return
 	}
-	r.wt.RequireWriterQuiescence(sessionID, true)
+	r.wt.RequireWriterQuiescence(sessionID, quiesced)
 }
 
 func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmission) (*Result, error) {
@@ -868,8 +871,11 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 
 	// Drive the loop. loop.go owns the step sequence; the helpers
 	// here own the result envelope + post-Run teardown.
+	// Writer quiescence is recorded inside runLoop's terminal Stop
+	// (see loop.go): only a clean Stop proves the owned writers
+	// stopped and reaped, so a timed-out Stop must not become durable
+	// quiesced evidence.
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
-	r.recordWriterQuiescence(qw.SessionID)
 	r.checkpointProviderError(qw, res)
 	r.checkpointFailedSession(qw, res)
 	// Retain the runner warning field while copying it to the terminal wire.

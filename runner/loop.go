@@ -1291,10 +1291,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	defer func() {
-		// Best-effort stop on exit. Stop is idempotent.
+		// Terminal stop owns the ordinary-writer half of the
+		// writer-quiescence boundary: only a clean Stop proves the
+		// embedder-owned generation stopped and reaped. A timed-out
+		// or failed Stop leaves writers possibly live, so it records
+		// unquiesced (false) rather than durable true. Recording
+		// happens here — where the Stop error is visible and before
+		// lease settlement — so an archive-disposition release
+		// carries the evidence into the archive manifest via the
+		// durable lease snapshot. Stop is idempotent.
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stopCancel()
-		_ = handle.Stop(stopCtx)
+		stopErr := handle.Stop(stopCtx)
+		r.recordWriterQuiescence(qw.SessionID, stopErr == nil)
 		// Capture terminal transcript descriptors once, from the finally
 		// bound handle after its writers have stopped. The deferred
 		// closure reads the mutable handle variable, so steering,
