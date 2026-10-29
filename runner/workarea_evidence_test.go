@@ -325,3 +325,50 @@ func TestMixedEvidenceAndPatchAttemptsShareRetention(t *testing.T) {
 		t.Errorf("non-attempt entry counted as archive: %v", archives)
 	}
 }
+
+// TestTerminalEvidence_PreservesPatchMetadataForTranscriptsRepository pins
+// the evidence/patch filename boundary: a failed session with unpublished
+// work in a repository named "transcripts" and a transcript descriptor
+// keeps both the patch recovery metadata (transcripts.json) and the
+// terminal evidence sidecar in the same teardown directory. The evidence
+// name contains a "+" no sanitized repository label can produce, so the
+// evidence write cannot truncate the recovery metadata.
+func TestTerminalEvidence_PreservesPatchMetadataForTranscriptsRepository(t *testing.T) {
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, "work.txt", "uncommitted\n")
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{rescueTargets: []rescueTarget{{name: "transcripts", path: clone, base: base}}}
+	res.Status = "failed"
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: "evidence/collision-9f3a1c.cast"}}
+	if !r.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase("COLLISION")}, res) {
+		t.Fatal("preserveUnpublishedWork = false; want the patch and the evidence archived")
+	}
+	sessionRoot := filepath.Join(r.rescueDir, "test-session-COLLISION")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		t.Fatalf("read session rescue root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("archive attempts = %d; want exactly 1", len(entries))
+	}
+	dir := filepath.Join(sessionRoot, entries[0].Name())
+	patch := onlyRescuePatch(t, dir)
+	if body := readFile(t, patch); !strings.Contains(body, "work.txt") {
+		t.Errorf("rescue patch does not carry the uncommitted work.txt")
+	}
+	var meta rescueMetadata
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(dir, "transcripts.json"))), &meta); err != nil {
+		t.Fatalf("decode patch recovery metadata: %v", err)
+	}
+	if meta.Repository != "transcripts" || meta.Base != base || len(meta.ChangedPaths) == 0 {
+		t.Fatalf("recovery metadata = %+v; want repository transcripts with base %s and changed paths", meta, base)
+	}
+	var manifest terminalEvidenceManifest
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(dir, terminalEvidenceFileName))), &manifest); err != nil {
+		t.Fatalf("decode terminal evidence: %v", err)
+	}
+	if manifest.Status != "failed" || len(manifest.Transcripts) != 1 || manifest.Transcripts[0] != "evidence/collision-9f3a1c.cast" {
+		t.Fatalf("evidence manifest = %+v; want failed with exactly [evidence/collision-9f3a1c.cast]", manifest)
+	}
+}

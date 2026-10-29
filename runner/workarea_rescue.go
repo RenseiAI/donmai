@@ -172,12 +172,14 @@ func shouldPreserveTerminalEvidence(status string) bool {
 	return status == "failed" || status == "stopped"
 }
 
-// terminalEvidenceFileName is the sidecar written per evidence attempt. It
-// is distinct from the per-repository "<label>.patch" / "<label>.json"
-// pair so an evidence-only attempt (transcripts, no patch) and a
-// patch-bearing attempt share the same directory naming and the same
-// per-session retention boundary.
-const terminalEvidenceFileName = "transcripts.json"
+// terminalEvidenceFileName is the sidecar written per evidence attempt. The
+// "+" keeps it distinct from every per-repository "<label>.patch" /
+// "<label>.json" pair: rescueSegment maps every character outside
+// [A-Za-z0-9._-] to "_", so no repository name (even "transcripts") can
+// sanitize to a label containing "+". An evidence-only attempt and a
+// patch-bearing attempt therefore share the same directory naming and the
+// same per-session retention boundary without overwriting each other.
+const terminalEvidenceFileName = "transcripts+evidence.json"
 
 // terminalEvidenceManifest is the local-only record of a session's terminal
 // transcript descriptors. It is written under the rescue directory and never
