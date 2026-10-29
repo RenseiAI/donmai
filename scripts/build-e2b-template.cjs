@@ -87,17 +87,23 @@ async function buildTemplate({
   return Template.build(template, templateRef, options)
 }
 
-async function main() {
-  const templateRef = process.env.E2B_TEMPLATE_REF
-  const apiKey = process.env.E2B_API_KEY
-  const outputFile = process.env.GITHUB_OUTPUT
+async function main(overrides = {}) {
+  const env = overrides.env || process.env
+  const cwd = overrides.cwd || process.cwd()
+  const loadSdk = overrides.loadSdk || (() => require('e2b'))
+  const readFile = overrides.readFile || ((p, enc) => fs.readFileSync(p, enc))
+  const appendFile = overrides.appendFile || ((p, data) => fs.appendFileSync(p, data))
+  const stdout = overrides.stdout || process.stdout
+  const templateRef = env.E2B_TEMPLATE_REF
+  const apiKey = env.E2B_API_KEY
+  const outputFile = env.GITHUB_OUTPUT
   const additionalTags = parseAdditionalTags(
-    process.env.E2B_ADDITIONAL_TAGS
+    env.E2B_ADDITIONAL_TAGS
   )
-  const dockerfileName = parseDockerfileName(process.env.E2B_DOCKERFILE)
-  const cpuCount = parseCpuCount(process.env.E2B_CPU_COUNT)
-  const memoryMB = parseMemoryMB(process.env.E2B_MEMORY_MB)
-  const fileContextPath = process.cwd()
+  const dockerfileName = parseDockerfileName(env.E2B_DOCKERFILE)
+  const cpuCount = parseCpuCount(env.E2B_CPU_COUNT)
+  const memoryMB = parseMemoryMB(env.E2B_MEMORY_MB)
+  const fileContextPath = cwd
   const dockerfilePath = path.join(fileContextPath, dockerfileName)
 
   if (!templateRef) {
@@ -110,8 +116,8 @@ async function main() {
     throw new Error('GITHUB_OUTPUT is required')
   }
 
-  const dockerfile = fs.readFileSync(dockerfilePath, 'utf8')
-  const sdk = require('e2b')
+  const dockerfile = readFile(dockerfilePath, 'utf8')
+  const sdk = loadSdk()
   const buildInfo = await buildTemplate({
     sdk,
     dockerfile,
@@ -123,7 +129,7 @@ async function main() {
     memoryMB,
   })
 
-  fs.appendFileSync(
+  appendFile(
     outputFile,
     [
       `template_id=${buildInfo.templateId}`,
@@ -133,17 +139,18 @@ async function main() {
     ].join('\n')
   )
 
-  process.stdout.write(
+  stdout.write(
     `Built ${templateRef} as template ${buildInfo.templateId}, build ${buildInfo.buildId}\n`
   )
   if (additionalTags.includes('default')) {
-    process.stdout.write('Advanced the rolling default tag to the same build.\n')
+    stdout.write('Advanced the rolling default tag to the same build.\n')
   } else {
-    process.stdout.write('Left the rolling default tag unchanged.\n')
+    stdout.write('Left the rolling default tag unchanged.\n')
   }
+  return buildInfo
 }
 
-module.exports = { buildTemplate, parseAdditionalTags, parseCpuCount, parseDockerfileName, parseMemoryMB }
+module.exports = { buildTemplate, main, parseAdditionalTags, parseCpuCount, parseDockerfileName, parseMemoryMB }
 
 if (require.main === module) {
   main().catch((error) => {

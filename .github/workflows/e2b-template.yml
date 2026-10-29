@@ -127,6 +127,8 @@ jobs:
           printf 'NODE_PATH=%s\n' "$(npm root --global)" >> "${GITHUB_ENV}"
 
       - name: Test E2B version assertion
+        env:
+          DONMAI_REPO_ROOT: ${{ github.workspace }}
         run: |
           node --test "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
           node --test "${RUNNER_TEMP}/build-e2b-template.test.cjs"

@@ -12,17 +12,25 @@ const {
   assertGoVersionOutput,
   assertPiVersionOutput,
   assertVersionOutput,
+  hasCToolchainForRace,
   isGoTemplateRef,
+  main,
+  parseAptInstalledPackages,
   parseGofumptVersion,
   parseGolangciLintVersion,
   parseGoVersion,
   parsePinnedPiVersion,
   readGoVersion,
   readPinnedPiVersion,
+  resolveRepoRoot,
   runMain,
   shouldExpectGoTools,
   verifyTemplateVersion,
 } = require('./verify-e2b-template.cjs')
+
+function testRepoRoot() {
+  return resolveRepoRoot({ env: process.env, cwd: process.cwd(), scriptDir: __dirname })
+}
 
 test('assertVersionOutput accepts the exact immutable version', () => {
   assert.doesNotThrow(() =>
@@ -378,8 +386,9 @@ test('assertGofumptVersionOutput accepts the pinned version', () => {
 })
 
 test('e2b.go.Dockerfile keeps a single FROM for the E2B build SDK', () => {
+  const repoRoot = testRepoRoot()
   const dockerfile = fs.readFileSync(
-    path.join(__dirname, '..', 'worker', 'e2b', 'e2b.go.Dockerfile'),
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
     'utf8'
   )
   const fromLines = dockerfile.match(/^FROM\b/gm) || []
@@ -388,16 +397,33 @@ test('e2b.go.Dockerfile keeps a single FROM for the E2B build SDK', () => {
 })
 
 test('e2b.go.Dockerfile installs the C toolchain for go test -race', () => {
+  const repoRoot = testRepoRoot()
   const dockerfile = fs.readFileSync(
-    path.join(__dirname, '..', 'worker', 'e2b', 'e2b.go.Dockerfile'),
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
     'utf8'
   )
-  assert.match(dockerfile, /\bgcc\b/)
-  assert.match(dockerfile, /libc6-dev|build-essential/)
+  const installed = parseAptInstalledPackages(dockerfile)
+  assert.ok(installed.includes('gcc'), `apt installs must include gcc, got ${JSON.stringify(installed)}`)
+  assert.ok(
+    installed.includes('libc6-dev') || installed.includes('build-essential'),
+    `apt installs must include libc6-dev or build-essential, got ${JSON.stringify(installed)}`
+  )
+  assert.equal(hasCToolchainForRace(dockerfile), true)
+})
+
+test('C-toolchain assertion ignores Dockerfile comments', () => {
+  const source = [
+    '# gcc libc6-dev are mentioned here but install nothing',
+    'FROM debian:bookworm-slim',
+    'RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git curl \\',
+    '    && rm -rf /var/lib/apt/lists/*',
+  ].join('\n')
+  assert.deepEqual(parseAptInstalledPackages(source), ['ca-certificates', 'git', 'curl'])
+  assert.equal(hasCToolchainForRace(source), false)
 })
 
 test('e2b.go.Dockerfile Go tarball tracks the go.mod floor', () => {
-  const repoRoot = path.join(__dirname, '..')
+  const repoRoot = testRepoRoot()
   const goVersion = readGoVersion(repoRoot)
   const dockerfile = fs.readFileSync(
     path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
@@ -594,4 +620,141 @@ test('verifyTemplateVersion refuses incomplete Go toolchain expectations', async
       }),
     /incomplete/
   )
+})
+
+test('resolveRepoRoot finds the checkout from cwd when staged away from the checkout', () => {
+  const repoRoot = testRepoRoot()
+  const stagedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-staged-'))
+  try {
+    const resolved = resolveRepoRoot({
+      env: process.env,
+      cwd: repoRoot,
+      scriptDir: stagedDir,
+    })
+    assert.equal(resolved, repoRoot)
+    assert.ok(fs.existsSync(path.join(resolved, 'go.mod')))
+    assert.ok(fs.existsSync(path.join(resolved, 'worker', 'e2b', 'e2b.go.Dockerfile')))
+  } finally {
+    fs.rmSync(stagedDir, { recursive: true, force: true })
+  }
+})
+
+test('resolveRepoRoot honors an explicit checkout root', () => {
+  const repoRoot = testRepoRoot()
+  const resolved = resolveRepoRoot({
+    env: { ...process.env, DONMAI_REPO_ROOT: repoRoot },
+    cwd: os.tmpdir(),
+    scriptDir: os.tmpdir(),
+  })
+  assert.equal(resolved, repoRoot)
+})
+
+test('main() runs Go toolchain checks for the Go template through production selection', async () => {
+  const repoRoot = testRepoRoot()
+  const runs = []
+  const fakeSandbox = {
+    async create(templateRef, options) {
+      return {
+        commands: {
+          async run(command) {
+            runs.push(command)
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: `donmai version v0.68.5\n` }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            if (command === 'go version') {
+              return { exitCode: 0, stdout: `go version go${readGoVersion(repoRoot)} linux/amd64\n` }
+            }
+            if (command === 'golangci-lint --version') {
+              const source = fs.readFileSync(
+                path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
+                'utf8'
+              )
+              const { parseGolangciLintVersion: parseLint } = require('./verify-e2b-template.cjs')
+              return {
+                exitCode: 0,
+                stdout: `golangci-lint has version ${parseLint(source)} built with go1.27.3\n`,
+              }
+            }
+            if (command === 'gofumpt --version') {
+              const source = fs.readFileSync(
+                path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
+                'utf8'
+              )
+              const { parseGofumptVersion: parseFumpt } = require('./verify-e2b-template.cjs')
+              return { exitCode: 0, stdout: `v${parseFumpt(source)} (go1.27.3)\n` }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker-go:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    runMain: async (args) => {
+      assert.equal(args.templateRef, 'donmai-worker-go:v0.68.5')
+      assert.ok(args.expectedGoVersion, 'Go version must be set for the Go template')
+      assert.ok(args.expectedGolangciLintVersion, 'lint version must be set for the Go template')
+      assert.ok(args.expectedGofumptVersion, 'gofumpt version must be set for the Go template')
+      const { runMain: realRunMain } = require('./verify-e2b-template.cjs')
+      return realRunMain({ ...args, writeError: () => {} })
+    },
+    writeError: () => {},
+  })
+  assert.equal(code, 0)
+  assert.deepEqual(runs, [
+    'donmai --version',
+    'pi --version',
+    'go version',
+    'golangci-lint --version',
+    'gofumpt --version',
+  ])
+})
+
+test('main() skips Go toolchain checks for the base template', async () => {
+  const repoRoot = testRepoRoot()
+  const runs = []
+  const fakeSandbox = {
+    async create() {
+      return {
+        commands: {
+          async run(command) {
+            runs.push(command)
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: 'donmai version v0.68.5\n' }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    writeError: () => {},
+  })
+  assert.equal(code, 0)
+  assert.deepEqual(runs, ['donmai --version', 'pi --version'])
 })

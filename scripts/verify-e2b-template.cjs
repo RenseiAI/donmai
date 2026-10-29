@@ -120,6 +120,65 @@ function isGoTemplateRef(templateRef) {
   return typeof templateRef === 'string' && templateRef.includes('donmai-worker-go')
 }
 
+// parseAptInstalledPackages extracts the package names from executable
+// `apt-get install` instructions, ignoring Dockerfile comment lines. Header
+// comments may name packages (for example the race-detector note below), so
+// matching the raw Dockerfile text would stay green after deleting the real
+// `apt-get install` entries.
+function parseAptInstalledPackages(dockerfileSource) {
+  const executable = String(dockerfileSource)
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+  const normalized = executable.replace(/\\\n/g, ' ')
+  const packages = []
+  const installRe = /apt-get\s+install\s+([^&;]+)/g
+  let match
+  while ((match = installRe.exec(normalized)) !== null) {
+    for (const token of match[1].split(/\s+/)) {
+      const name = token.trim()
+      if (!name || name.startsWith('-')) {
+        continue
+      }
+      packages.push(name)
+    }
+  }
+  return packages
+}
+
+function hasCToolchainForRace(dockerfileSource) {
+  const installed = parseAptInstalledPackages(dockerfileSource)
+  return (
+    installed.includes('gcc') &&
+    (installed.includes('libc6-dev') || installed.includes('build-essential'))
+  )
+}
+
+function resolveRepoRoot({ env, cwd, scriptDir } = {}) {
+  const sourceEnv = env || process.env
+  const sourceCwd = cwd || process.cwd()
+  const sourceDir = scriptDir || __dirname
+  const candidates = []
+  if (sourceEnv.DONMAI_REPO_ROOT) {
+    candidates.push(sourceEnv.DONMAI_REPO_ROOT)
+  }
+  candidates.push(sourceCwd)
+  candidates.push(path.join(sourceDir, '..'))
+  for (const candidate of candidates) {
+    try {
+      if (
+        fs.existsSync(path.join(candidate, 'go.mod')) &&
+        fs.existsSync(path.join(candidate, 'worker', 'e2b', 'e2b.go.Dockerfile'))
+      ) {
+        return candidate
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return sourceEnv.DONMAI_REPO_ROOT || sourceCwd
+}
+
 function shouldExpectGoTools({ templateRef, expectGoTools }) {
   if (expectGoTools === '1' || expectGoTools === 'true') {
     return true
@@ -315,29 +374,37 @@ async function runMain({
   }
 }
 
-async function main() {
-  const { Sandbox } = require('e2b')
-  const repoRoot = process.cwd()
-  const templateRef = process.env.E2B_TEMPLATE_REF
+async function main(overrides = {}) {
+  const env = overrides.env || process.env
+  const cwd = overrides.cwd || process.cwd()
+  const loadSandbox = overrides.loadSandbox || (() => require('e2b').Sandbox)
+  const readGo = overrides.readGoVersion || readGoVersion
+  const readDocker = overrides.readGoDockerfileSource || readGoDockerfileSource
+  const readPi = overrides.readPinnedPiVersion || readPinnedPiVersion
+  const runMainFn = overrides.runMain || runMain
+  const writeError = overrides.writeError || ((line) => process.stderr.write(line))
+  const Sandbox = loadSandbox()
+  const repoRoot = env.DONMAI_REPO_ROOT || cwd
+  const templateRef = env.E2B_TEMPLATE_REF
   let expectedGoVersion
   let expectedGolangciLintVersion
   let expectedGofumptVersion
-  if (shouldExpectGoTools({ templateRef, expectGoTools: process.env.E2B_EXPECT_GO_TOOLCHAIN })) {
-    expectedGoVersion = readGoVersion(repoRoot)
-    const dockerfileSource = readGoDockerfileSource(repoRoot)
+  if (shouldExpectGoTools({ templateRef, expectGoTools: env.E2B_EXPECT_GO_TOOLCHAIN })) {
+    expectedGoVersion = readGo(repoRoot)
+    const dockerfileSource = readDocker(repoRoot)
     expectedGolangciLintVersion = parseGolangciLintVersion(dockerfileSource)
     expectedGofumptVersion = parseGofumptVersion(dockerfileSource)
   }
-  return runMain({
+  return runMainFn({
     Sandbox,
     templateRef,
-    expectedVersion: process.env.DONMAI_VERSION,
-    expectedPiVersion: readPinnedPiVersion(repoRoot),
-    apiKey: process.env.E2B_API_KEY,
+    expectedVersion: env.DONMAI_VERSION,
+    expectedPiVersion: readPi(repoRoot),
+    apiKey: env.E2B_API_KEY,
     expectedGoVersion,
     expectedGolangciLintVersion,
     expectedGofumptVersion,
-    writeError: (line) => process.stderr.write(line),
+    writeError,
   })
 }
 
@@ -348,7 +415,10 @@ module.exports = {
   assertPiVersionOutput,
   assertVersionOutput,
   formatFailure,
+  hasCToolchainForRace,
   isGoTemplateRef,
+  main,
+  parseAptInstalledPackages,
   parseGofumptVersion,
   parseGolangciLintVersion,
   parseGoVersion,
@@ -356,6 +426,7 @@ module.exports = {
   readGoDockerfileSource,
   readGoVersion,
   readPinnedPiVersion,
+  resolveRepoRoot,
   runMain,
   shouldExpectGoTools,
   verifyTemplateVersion,
