@@ -63,20 +63,54 @@ type SessionTimeline struct {
 
 // SessionDetail is the inner session object in the detail response.
 type SessionDetail struct {
-	ID           string          `json:"id"`
-	Identifier   string          `json:"identifier"`
-	Status       SessionStatus   `json:"status"`
-	WorkType     string          `json:"workType"`
-	StartedAt    string          `json:"startedAt"`
-	Duration     int             `json:"duration"`
-	Timeline     SessionTimeline `json:"timeline"`
-	Provider     *string         `json:"provider,omitempty"`
-	Branch       *string         `json:"branch,omitempty"`
-	IssueTitle   *string         `json:"issueTitle,omitempty"`
-	ParkReason   *string         `json:"parkReason,omitempty"`
-	CostUsd      *float64        `json:"costUsd,omitempty"`
-	InputTokens  *int            `json:"inputTokens,omitempty"`
-	OutputTokens *int            `json:"outputTokens,omitempty"`
+	ID             string              `json:"id"`
+	Identifier     string              `json:"identifier"`
+	Status         SessionStatus       `json:"status"`
+	WorkType       string              `json:"workType"`
+	StartedAt      string              `json:"startedAt"`
+	Duration       int                 `json:"duration"`
+	Timeline       SessionTimeline     `json:"timeline"`
+	Provider       *string             `json:"provider,omitempty"`
+	Branch         *string             `json:"branch,omitempty"`
+	IssueTitle     *string             `json:"issueTitle,omitempty"`
+	ParkReason     *string             `json:"parkReason,omitempty"`
+	CostUsd        *float64            `json:"costUsd,omitempty"`
+	InputTokens    *int                `json:"inputTokens,omitempty"`
+	OutputTokens   *int                `json:"outputTokens,omitempty"`
+	TerminalReason *TerminalReason     `json:"terminalReason,omitempty"`
+	BudgetBreach   *SessionBudgetBreach `json:"budgetBreach,omitempty"`
+	PullRequestURL *string             `json:"pullRequestUrl,omitempty"`
+	PullRequest    *SessionPullRequest `json:"pullRequest,omitempty"`
+	Summary        *string             `json:"summary,omitempty"`
+}
+
+// TerminalReason is the structured terminal failure reason carried on a
+// failed session detail response. It mirrors the server's diagnostic
+// shape: a stable machine code, a human message, the lifecycle phase
+// where the failure was decided, the deciding component, and the time
+// the reason was recorded.
+type TerminalReason struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Phase     string `json:"phase"`
+	DecidedBy string `json:"decidedBy"`
+	At        string `json:"at"`
+}
+
+// SessionBudgetBreach is the runner's budget report carried on a terminal
+// session detail response. Cap names the cap that fired; Detail is the
+// short human explanation.
+type SessionBudgetBreach struct {
+	Cap    string `json:"cap"`
+	Detail string `json:"detail"`
+}
+
+// SessionPullRequest is the structured pull-request artifact carried on a
+// terminal session detail response.
+type SessionPullRequest struct {
+	Number  *int    `json:"number,omitempty"`
+	URL     string  `json:"url,omitempty"`
+	HeadSHA *string `json:"headSha,omitempty"`
 }
 
 // SessionDetailResponse matches GET /api/public/sessions/:id.
