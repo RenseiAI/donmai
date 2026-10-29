@@ -355,6 +355,67 @@ func TestGuardedRepairRefusesMismatchesWithoutWrites(t *testing.T) {
 		}
 		assertAcquisitionParentUnchanged(t, parent, before)
 	})
+
+	t.Run("differing old devices", func(t *testing.T) {
+		parent := t.TempDir()
+		committedReadyForReadback(t, parent)
+		_, physical := legacyDriftForGuardedTest(t, parent)
+		storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+		anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+		storeRecord := readStoreIdentityForTest(t, storePath)
+		anchorRecord := readStoreIdentityForTest(t, anchorPath)
+		// Same inode and store ID on both documents, but different old
+		// devices: one side is forged. Diagnosis still reports
+		// repair-required (inode alone matches while birth is absent);
+		// only the locked differing-old-device refusal stops repair
+		// from laundering the forgery.
+		storeDevice := physical.Device + 1000
+		if storeDevice == physical.Device {
+			storeDevice++
+		}
+		anchorDevice := physical.Device + 2000
+		if anchorDevice == physical.Device || anchorDevice == storeDevice {
+			anchorDevice += 1000
+		}
+		storeRecord.Identity = FileIdentity{Device: storeDevice, Inode: physical.Inode}
+		anchorRecord.Identity = FileIdentity{Device: anchorDevice, Inode: physical.Inode}
+		writeStoreIdentityForTest(t, storePath, storeRecord)
+		writeStoreIdentityForTest(t, anchorPath, anchorRecord)
+		before := snapshotAcquisitionParent(t, parent)
+		diagnosis, err := DiagnoseAcquisitionStore(parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !diagnosis.NeedsReanchor {
+			t.Fatalf("differing old devices must still diagnose as repair-required: %+v", diagnosis)
+		}
+		if err := RepairAcquisitionStore(parent); err == nil {
+			t.Fatal("repair admitted differing old devices")
+		}
+		assertAcquisitionParentUnchanged(t, parent, before)
+	})
+
+	t.Run("malformed identity", func(t *testing.T) {
+		parent := t.TempDir()
+		committedReadyForReadback(t, parent)
+		_, _ = legacyDriftForGuardedTest(t, parent)
+		storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+		if err := os.WriteFile(storePath, []byte("{invalid"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotAcquisitionParent(t, parent)
+		diagnosis, err := DiagnoseAcquisitionStore(parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diagnosis.Healthy || diagnosis.NeedsReanchor {
+			t.Fatalf("malformed identity must fail closed without repair: %+v", diagnosis)
+		}
+		if err := RepairAcquisitionStore(parent); err == nil {
+			t.Fatal("repair admitted a malformed identity document")
+		}
+		assertAcquisitionParentUnchanged(t, parent, before)
+	})
 }
 
 // TestGuardedRepairSwapAfterDiagnosisFails pins AC-4 (swap): a path swap
@@ -574,6 +635,107 @@ func TestGuardedRepairPrePinSwapFails(t *testing.T) {
 		repairPreOpenHook = nil
 		assertAcquisitionParentUnchanged(t, parent, before)
 	}
+}
+
+// TestGuardedRepairLockedStoreIDRecheckFails pins the locked storeID
+// re-check: a swap after the pin-plus-lock that rewrites one locked
+// document's store ID in place (same directory and inode) must fail closed
+// with no writes. The forged record is re-pointed at the forged store ID
+// so only the storeID re-check can reject the swap: removing it must let
+// the swap through to a successful (laundering) repair.
+func TestGuardedRepairLockedStoreIDRecheckFails(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	storeID, _ := legacyDriftForGuardedTest(t, parent)
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+	origStoreBody, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origRecordBody, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	forgedStoreID := "wstore_ffffffffffffffffffffffffffffffff"
+	if forgedStoreID == storeID {
+		forgedStoreID = "wstore_00000000000000000000000000000000"
+	}
+	repairSwapHook = func() {
+		body, err := os.ReadFile(storePath)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var rec acquisitionStoreIdentity
+		if err := json.Unmarshal(body, &rec); err != nil {
+			t.Error(err)
+			return
+		}
+		rec.StoreID = forgedStoreID
+		forged, err := json.Marshal(rec)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		//nolint:gosec // test-only TempDir swap-hook forgery; path from Join(parent, constant).
+		if err := os.WriteFile(storePath, forged, 0o600); err != nil {
+			t.Error(err)
+			return
+		}
+		recordBody, err := os.ReadFile(recordPath)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(recordBody, &doc); err != nil {
+			t.Error(err)
+			return
+		}
+		doc["storeId"] = forgedStoreID
+		reforged, err := json.Marshal(doc)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		//nolint:gosec // test-only TempDir swap-hook forgery; path from Join(parent, constant).
+		if err := os.WriteFile(recordPath, reforged, 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() {
+		repairSwapHook = nil
+		//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+		_ = os.WriteFile(storePath, origStoreBody, 0o600)
+		//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+		_ = os.WriteFile(recordPath, origRecordBody, 0o600)
+	})
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted a locked storeID mismatch")
+	}
+	for _, dir := range []string{filepath.Join(parent, acquisitionStoreDirName), parent} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if strings.Contains(entry.Name(), ".backup-") {
+				t.Fatalf("repair wrote backups after a locked storeID mismatch: %q", entry.Name())
+			}
+		}
+	}
+	repairSwapHook = nil
+	//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+	if err := os.WriteFile(storePath, origStoreBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+	if err := os.WriteFile(recordPath, origRecordBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
 }
 
 // TestGuardedRepairConcurrentWriterBlocked pins AC-4 (locking): an
