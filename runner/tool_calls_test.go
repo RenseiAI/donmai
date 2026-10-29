@@ -82,9 +82,12 @@ func TestRun_ToolCallsCountedOnStoppedRun(t *testing.T) {
 
 // TestRun_ToolCallsAndScalarsAcrossBufferedInjects drains two buffered
 // memory injects after the initial turn. The first inject turn reports the
-// pull request and the review verdict; the second reports neither. The
-// envelope must keep the first inject turn's pull request and verdicts, and
-// count every turn's tool calls exactly once (1 + 2 + 2).
+// pull request via the trusted tool-result channel (a `gh pr create` return
+// value) and the review verdict via narrative; the second reports neither.
+// The envelope must keep the first inject turn's pull request and verdicts,
+// and count every turn's tool calls exactly once (1 + 2 + 2). A pull request
+// URL printed only in assistant narrative is hint-only and never lands on
+// the envelope (see TestObserveEvent_AssistantNarrativePRURLIsHintOnly).
 func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 	platform := newRecordingPlatformServer(t)
 	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
@@ -110,8 +113,9 @@ func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 		turns: []verdictScriptTurn{
 			{toolCalls: 1, text: "Reviewing."},
 			{
-				toolCalls: 2, before: secondBuffered,
-				text: "Reviewed " + followUpPR + "\nREVIEW_VERDICT: APPROVE\nWORK_RESULT: passed",
+				toolCalls: 1, before: secondBuffered,
+				events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)},
+				text:   "Reviewed " + followUpPR + "\nREVIEW_VERDICT: APPROVE\nWORK_RESULT: passed",
 			},
 			{toolCalls: 2, text: "Noted."},
 		},
