@@ -475,3 +475,140 @@ func TestAgentStatusDiagnosticDetail(t *testing.T) {
 		}
 	})
 }
+
+// diagnosticTextRowValue extracts the exact cell value for a detail row
+// label (including its trailing colon) from tabwriter-aligned human output.
+// It trims the alignment padding so the comparison is against the exact
+// rendered value, not a substring.
+func diagnosticTextRowValue(t *testing.T, out, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, label) {
+			return strings.TrimSpace(strings.TrimPrefix(line, label))
+		}
+	}
+	t.Fatalf("missing row %q; got:\n%s", label, out)
+	return ""
+}
+
+// TestAgentStatusDiagnosticPartialExactRows pins the exact human row values
+// for partial diagnostic objects through the production entry point
+// (HTTP detail response -> cobra status command). Deleting or inverting any
+// partial branch (message-only reason, code-only reason, reason context,
+// cap-only or detail-only budget, number-only pull request, blank summary)
+// changes one of these exact values to "unavailable" (or drops context)
+// and fails the table.
+func TestAgentStatusDiagnosticPartialExactRows(t *testing.T) {
+	t.Parallel()
+
+	const prefix = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"}`
+	const suffix = `},"timestamp":"2026-10-27T12:02:00Z"}`
+
+	cases := []struct {
+		name     string
+		fragment string
+		label    string
+		want     string
+	}{
+		{
+			name:     "message_only_reason",
+			fragment: `,"terminalReason":{"message":"Workarea provisioning failed"}`,
+			label:    "Terminal Reason:",
+			want:     "Workarea provisioning failed",
+		},
+		{
+			name:     "code_only_reason",
+			fragment: `,"terminalReason":{"code":"provision_failed"}`,
+			label:    "Terminal Reason:",
+			want:     "provision_failed",
+		},
+		{
+			name:     "reason_full_context",
+			fragment: `,"terminalReason":{"code":"provision_failed","message":"Workarea provisioning failed","phase":"spawn","decidedBy":"platform","at":"2026-10-27T12:01:00Z"}`,
+			label:    "Terminal Reason:",
+			want:     "provision_failed: Workarea provisioning failed (spawn/platform)",
+		},
+		{
+			name:     "reason_message_with_context",
+			fragment: `,"terminalReason":{"message":"Workarea provisioning failed","phase":"spawn","decidedBy":"platform"}`,
+			label:    "Terminal Reason:",
+			want:     "Workarea provisioning failed (spawn/platform)",
+		},
+		{
+			name:     "reason_code_with_phase_only",
+			fragment: `,"terminalReason":{"code":"provision_failed","phase":"spawn"}`,
+			label:    "Terminal Reason:",
+			want:     "provision_failed (spawn)",
+		},
+		{
+			name:     "reason_empty_object_unavailable",
+			fragment: `,"terminalReason":{}`,
+			label:    "Terminal Reason:",
+			want:     "unavailable",
+		},
+		{
+			name:     "budget_cap_only",
+			fragment: `,"budgetBreach":{"cap":"max-tokens"}`,
+			label:    "Budget Breach:",
+			want:     "max-tokens",
+		},
+		{
+			name:     "budget_detail_only",
+			fragment: `,"budgetBreach":{"detail":"quota hit"}`,
+			label:    "Budget Breach:",
+			want:     "quota hit",
+		},
+		{
+			name:     "budget_full",
+			fragment: `,"budgetBreach":{"cap":"max-tokens","detail":"max-tokens exceeded"}`,
+			label:    "Budget Breach:",
+			want:     "max-tokens: max-tokens exceeded",
+		},
+		{
+			name:     "budget_empty_object_unavailable",
+			fragment: `,"budgetBreach":{}`,
+			label:    "Budget Breach:",
+			want:     "unavailable",
+		},
+		{
+			name:     "pr_number_only",
+			fragment: `,"pullRequest":{"number":42}`,
+			label:    "Pull Request:",
+			want:     "#42",
+		},
+		{
+			name:     "blank_summary_spaces_unavailable",
+			fragment: `,"summary":"   "`,
+			label:    "Summary:",
+			want:     "unavailable",
+		},
+		{
+			name:     "blank_summary_empty_unavailable",
+			fragment: `,"summary":""`,
+			label:    "Summary:",
+			want:     "unavailable",
+		},
+		{
+			name:     "summary_trims_surrounding_spaces",
+			fragment: `,"summary":"  Migrated middleware.  "`,
+			label:    "Summary:",
+			want:     "Migrated middleware.",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newDiagnosticServer(t, prefix+tc.fragment+suffix)
+			ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+			cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if got := diagnosticTextRowValue(t, buf.String(), tc.label); got != tc.want {
+				t.Errorf("%s row = %q, want %q\nfull output:\n%s", tc.label, got, tc.want, buf.String())
+			}
+		})
+	}
+}
