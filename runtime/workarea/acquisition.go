@@ -332,6 +332,24 @@ func (s *AcquisitionStore) loadOrCreateStoreIdentity(create bool) (string, error
 	// identity check tolerates it when the inode, store ID, and birth
 	// time agree, and re-anchors both documents to the current device
 	// instead of crash-looping.
+	//
+	// Pre-birth records carry no birth time, so inode alone cannot prove
+	// continuity across a device change: the same inode with a different
+	// device and no birth time could be an inode-reusing replacement.
+	// That legacy device-only drift must not auto-heal here; it fails
+	// closed and requires the explicit guarded repair authority, which
+	// validates acquisition records under the exclusive store lock
+	// before re-anchoring. Platforms that never record birth (physical
+	// has no birth) keep the documented inode-only tolerance so existing
+	// stores migrate forward instead of crash-looping.
+	if physical.HasBirth {
+		if storeExists && !storeRecord.Identity.HasBirth && storeRecord.Identity.Inode == physical.Inode && storeRecord.Identity.Device != physical.Device {
+			return "", fmt.Errorf("runtime/workarea: acquisition store needs repair: device renumbered for legacy identity")
+		}
+		if anchorExists && !anchorRecord.Identity.HasBirth && anchorRecord.Identity.Inode == physical.Inode && anchorRecord.Identity.Device != physical.Device {
+			return "", fmt.Errorf("runtime/workarea: acquisition store needs repair: device renumbered for legacy identity")
+		}
+	}
 	if anchorExists && !fileIdentityMatches(anchorRecord.Identity, physical) {
 		return "", fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
 	}

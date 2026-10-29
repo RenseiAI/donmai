@@ -1,13 +1,21 @@
 package workarea
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
+
+// repairSwapHook is a test-only seam invoked after the repair pins and
+// exclusively locks the store root, before it re-reads every premise.
+// Tests use it to swap the path-visible store directory and prove the
+// scan still consumes the pinned root rather than a replacement.
+var repairSwapHook func()
 
 // StoreDiagnosis describes the health of the workarea acquisition-store
 // identity for one worktree parent.
@@ -22,6 +30,10 @@ type StoreDiagnosis struct {
 	// (same inode, compatible birth, matching store IDs) on a renumbered
 	// device and can be safely re-anchored.
 	NeedsReanchor bool
+	// Inode pins the expected store-directory inode when NeedsReanchor is
+	// true. Repair re-checks it under the exclusive lock so a path swap
+	// after diagnosis cannot pass.
+	Inode uint64
 	// Reason is a human-readable one-line summary.
 	Reason string
 }
@@ -106,8 +118,8 @@ func DiagnoseAcquisitionStore(parent string) (StoreDiagnosis, error) {
 		}
 		return StoreDiagnosis{
 			Healthy: false, Present: true, StoreID: storeRecord.StoreID,
-			NeedsReanchor: true,
-			Reason:        "acquisition store device renumbered; same directory needs re-anchor",
+			NeedsReanchor: true, Inode: physical.Inode,
+			Reason: "acquisition store device renumbered; same directory needs re-anchor",
 		}, nil
 	}
 	return StoreDiagnosis{
@@ -119,9 +131,21 @@ func DiagnoseAcquisitionStore(parent string) (StoreDiagnosis, error) {
 // RepairAcquisitionStore re-anchors the acquisition-store identity after a
 // device-number renumber. It only acts when DiagnoseAcquisitionStore reports
 // NeedsReanchor: the same inode (and compatible birth time) with matching
-// store IDs on a different device. It keeps timestamped backups of both
-// documents beside the originals and then pins both to the current device.
-// Any other condition fails closed without writing.
+// store IDs on a different device. The repair opens and pins the private
+// real store directory, acquires the existing exclusive store lock, then
+// re-reads every premise while holding the lock: both identity documents
+// must still be valid with the same schema, store ID, device, and inode
+// (allowing a recoverable half-repaired state where one document already
+// matches the current device), the current inode must match and only the
+// device may have changed, and every existing acquisition record must
+// belong to that store. It keeps timestamped backups of both documents
+// beside the originals and then pins both to the current device using the
+// interruption-safe temp-file plus rename transition. A swap after
+// diagnosis or a concurrent writer cannot pass the locked re-check; an
+// interruption between the two replicated writes stays recoverable via
+// retry. Any other condition fails closed without writing: no missing
+// store is created, no acquisition row is changed, and no other mismatch
+// is converted.
 func RepairAcquisitionStore(parent string) error {
 	diagnosis, err := DiagnoseAcquisitionStore(parent)
 	if err != nil {
@@ -142,18 +166,64 @@ func RepairAcquisitionStore(parent string) error {
 		return fmt.Errorf("runtime/workarea: open acquisition parent: %w", err)
 	}
 	defer func() { _ = parentRoot.Close() }()
+	info, err := parentRoot.Lstat(acquisitionStoreDirName)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("runtime/workarea: acquisition store is not a private real directory")
+	}
 	root, err := parentRoot.OpenRoot(acquisitionStoreDirName)
 	if err != nil {
 		return fmt.Errorf("runtime/workarea: open acquisition store root: %w", err)
 	}
 	defer func() { _ = root.Close() }()
 	openedInfo, err := root.Stat(".")
-	if err != nil {
-		return fmt.Errorf("runtime/workarea: stat acquisition store: %w", err)
+	if err != nil || !os.SameFile(info, openedInfo) {
+		return fmt.Errorf("runtime/workarea: acquisition store identity changed while opening")
 	}
-	physical, err := fileIdentity(openedInfo)
+	// Acquire the existing exclusive store lock without creating it. A
+	// missing lock file means the store was never fully created or was
+	// tampered with: fail closed without writing rather than minting
+	// fresh lock state that could launder a replacement.
+	lock, err := root.OpenFile(acquisitionStoreLockName, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("runtime/workarea: acquisition store lock is missing")
+		}
+		return fmt.Errorf("runtime/workarea: open acquisition store lock: %w", err)
+	}
+	if err := flockExclusive(lock, false); err != nil {
+		_ = lock.Close()
+		return fmt.Errorf("runtime/workarea: lock acquisition store: %w", err)
+	}
+	defer releaseFlock(lock)
+	// Locked re-check: re-read every premise while holding the exclusive
+	// lock so a swap after diagnosis or a concurrent writer cannot slip
+	// between the check and the rewrite. The test seam below swaps the
+	// path-visible directory after the pin+lock to prove the re-check
+	// still consumes the pinned root rather than the replacement.
+	if repairSwapHook != nil {
+		repairSwapHook()
+	}
+	current, err := parentRoot.Lstat(acquisitionStoreDirName)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, openedInfo) {
+		return fmt.Errorf("runtime/workarea: acquisition store directory identity changed")
+	}
+	if current.Mode().Perm() != 0o700 {
+		return fmt.Errorf("runtime/workarea: acquisition store is not a private real directory")
+	}
+	lockedInfo, err := root.Stat(".")
+	if err != nil || !os.SameFile(openedInfo, lockedInfo) {
+		return fmt.Errorf("runtime/workarea: acquisition store identity changed while locking")
+	}
+	physical, err := fileIdentity(lockedInfo)
 	if err != nil {
 		return err
+	}
+	// The pinned inode must still be the diagnosed inode: a path swap
+	// after diagnosis that plants a different directory (different inode)
+	// with matching documents cannot pass, even when the forged
+	// documents reuse the diagnosed store ID.
+	if diagnosis.Inode != 0 && physical.Inode != diagnosis.Inode {
+		return fmt.Errorf("runtime/workarea: acquisition store directory identity changed")
 	}
 	storeRecord, storeExists, err := readAcquisitionStoreIdentity(root, acquisitionStoreIdentityName)
 	if err != nil || !storeExists {
@@ -169,7 +239,44 @@ func RepairAcquisitionStore(parent string) error {
 	if !fileIdentityMatches(storeRecord.Identity, physical) || !fileIdentityMatches(anchorRecord.Identity, physical) {
 		return fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
 	}
-	stamp := time.Now().UTC().Format("20060102T150405Z")
+	// Permit only the device-only drift: the current inode must match and
+	// only the device may have changed. Both documents must agree on the
+	// inode; when both still carry the old device they must agree on it
+	// too, otherwise one side is forged or swapped. A half-repaired state
+	// (one document already pinned to the current device after an
+	// interruption between the two replicated writes) is allowed so the
+	// retry can finish the second write.
+	if storeRecord.Identity.Inode == 0 || anchorRecord.Identity.Inode == 0 || physical.Inode == 0 {
+		return fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
+	}
+	if storeRecord.Identity.Inode != physical.Inode || anchorRecord.Identity.Inode != physical.Inode {
+		return fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
+	}
+	if storeRecord.Identity.Inode != anchorRecord.Identity.Inode {
+		return fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
+	}
+	storePinned := storeRecord.Identity.Device == physical.Device
+	anchorPinned := anchorRecord.Identity.Device == physical.Device
+	if storePinned && anchorPinned {
+		// A concurrent repair already finished while this caller waited
+		// for the exclusive lock: idempotent success without writing.
+		return nil
+	}
+	if !storePinned && !anchorPinned && storeRecord.Identity.Device != anchorRecord.Identity.Device {
+		return fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
+	}
+	// Existing acquisition rows must already belong to this store before
+	// the stable identity is rewritten. A malformed row or a row from
+	// another store refuses the repair without writing, so a forged
+	// store directory cannot be laundered by re-anchoring its identity.
+	if err := validateAcquisitionRecordsBelongToStore(root, storeRecord.StoreID); err != nil {
+		return err
+	}
+	// All premises re-verified under lock: back up, then durably replace
+	// both documents with the interruption-safe temp-file plus rename
+	// transition. No store is created, no row is changed, no root is
+	// removed.
+	stamp := time.Now().UTC().Format("20060102T150405.999999999Z")
 	if err := backupAcquisitionIdentityFile(root, acquisitionStoreIdentityName, acquisitionStoreIdentityName+".backup-"+stamp); err != nil {
 		return err
 	}
@@ -178,14 +285,69 @@ func RepairAcquisitionStore(parent string) error {
 	}
 	repaired := acquisitionStoreIdentity{SchemaVersion: acquisitionStoreSchemaV1, StoreID: storeRecord.StoreID, Identity: physical}
 	// Reuse the store's atomic temp+rename writer via a short-lived handle.
-	// The root descriptors above already pin the same directory, so the
-	// rewrite cannot launder a path-swapped replacement.
-	store := &AcquisitionStore{parent: abs, dir: filepath.Join(abs, acquisitionStoreDirName), parentRoot: parentRoot, root: root, identity: openedInfo}
+	// The root descriptors above already pin the same directory while the
+	// exclusive lock is held, so the rewrite cannot launder a path-swapped
+	// replacement.
+	store := &AcquisitionStore{parent: abs, dir: filepath.Join(abs, acquisitionStoreDirName), parentRoot: parentRoot, root: root, identity: lockedInfo}
 	if err := store.writeStoreIdentity(repaired); err != nil {
 		return err
 	}
 	if err := overwriteAcquisitionStoreAnchor(parentRoot, repaired); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateAcquisitionRecordsBelongToStore scans the pinned store root for
+// durable acquisition rows and proves each one belongs to the expected
+// store. It reads through the already-pinned root only, validates the
+// closed record independently, and requires the store ID and the
+// directory identity to match. Any malformed row or foreign-store row
+// refuses the caller without writing.
+func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) error {
+	if storeID == "" || !strings.HasPrefix(storeID, "wstore_") {
+		return fmt.Errorf("runtime/workarea: acquisition store identity is invalid")
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	if closeErr := directory.Close(); readErr == nil {
+		readErr = closeErr
+	}
+	if readErr != nil {
+		return readErr
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || !strings.HasPrefix(name, "wac_") {
+			continue
+		}
+		acquisitionRoot, err := root.OpenRoot(name)
+		if err != nil {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		body, err := acquisitionRoot.ReadFile(acquisitionRecordFileName)
+		_ = acquisitionRoot.Close()
+		if err != nil {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		var record AcquisitionRecord
+		decoder := json.NewDecoder(strings.NewReader(string(body)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&record); err != nil {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		if err := ensureJSONEOF(decoder); err != nil {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		if err := record.Validate(); err != nil {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		if record.AcquisitionID != name || record.StoreID != storeID {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
 	}
 	return nil
 }
