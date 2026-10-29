@@ -871,6 +871,14 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		teardownRequired = false
 		retainUnpreserved = true
 	}
+	// Archive declared terminal evidence for failed/stopped sessions before
+	// teardown. Completed sessions are untouched. A preservation failure
+	// keeps the workarea: the archive holds the only other copy, so deleting
+	// the workarea would destroy the sole evidence.
+	if teardownRequired && needsTerminalEvidenceArchive(res) && !r.preserveTerminalEvidence(qw, res) {
+		teardownRequired = false
+		retainUnpreserved = true
+	}
 	leaseAcquired := false
 	leasePrepared := false
 	interactiveDisposition := qw.isInteractive() && res.Status == "completed" && teardownRequired
