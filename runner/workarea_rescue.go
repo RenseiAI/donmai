@@ -61,11 +61,14 @@ const rescueMaxPatchBytes = 256 << 20
 // rescueResetBatch caps the paths passed to one `git reset` invocation.
 const rescueResetBatch = 100
 
-// rescueKeepPerSession is how many archives (one per teardown) a session's
-// rescue directory keeps; older ones are pruned after a new one is written.
-// Archives of other sessions are never pruned: each holds work that exists
-// nowhere else, so the directory is left to the operator rather than capped
-// globally.
+// rescueKeepPerSession is how many archive attempts (one directory per
+// teardown) a session's rescue directory keeps; older ones are pruned
+// after a new one is written. Patch-bearing and evidence-only attempts
+// share this boundary: every directory matching rescueArchiveDirRE under
+// one session's root counts, whether it holds a patch, terminal evidence,
+// or both. Archives of other sessions are never pruned: each holds work
+// that exists nowhere else, so the directory is left to the operator
+// rather than capped globally.
 const rescueKeepPerSession = 5
 
 // rescueArchiveDirRE matches the per-teardown archive directories this file
@@ -161,11 +164,48 @@ func reseedRescueBasesFromDeclaration(ctx context.Context, res *Result, workarea
 	}
 }
 
+// shouldPreserveTerminalEvidence reports whether a terminal status owns
+// evidence preservation: failed and stopped sessions preserve their
+// terminal transcript descriptors; every other status (including completed)
+// stays evidence-free.
+func shouldPreserveTerminalEvidence(status string) bool {
+	return status == "failed" || status == "stopped"
+}
+
+// terminalEvidenceFileName is the sidecar written per evidence attempt. It
+// is distinct from the per-repository "<label>.patch" / "<label>.json"
+// pair so an evidence-only attempt (transcripts, no patch) and a
+// patch-bearing attempt share the same directory naming and the same
+// per-session retention boundary.
+const terminalEvidenceFileName = "transcripts.json"
+
+// terminalEvidenceManifest is the local-only record of a session's terminal
+// transcript descriptors. It is written under the rescue directory and never
+// placed on any wire surface: the descriptors stay out of the terminal
+// status body and the marshalled result exactly as before.
+type terminalEvidenceManifest struct {
+	SessionID   string   `json:"sessionId"`
+	Status      string   `json:"status"`
+	Transcripts []string `json:"transcripts,omitempty"`
+	CreatedAt   string   `json:"createdAt"`
+}
+
 // preserveUnpublishedWork archives every checkout's unpublished work before
 // teardown and logs where it went. It returns false when some checkout's work
 // could not be preserved; the caller must then keep the workarea.
+//
+// It also archives the session's terminal transcript descriptors as local
+// evidence when the terminal status owns preservation (failed or stopped):
+// the evidence shares this teardown's archive directory, so evidence-only
+// and patch-bearing attempts count together under rescueKeepPerSession.
+// Evidence is best-effort and never flips the return: a teardown with no
+// unpublished work still tears down when the evidence cannot be written.
 func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
-	if res == nil || len(res.rescueTargets) == 0 {
+	if res == nil {
+		return true
+	}
+	wantEvidence := shouldPreserveTerminalEvidence(res.Status) && len(res.terminalTranscripts) > 0
+	if len(res.rescueTargets) == 0 && !wantEvidence {
 		return true
 	}
 	preserved := true
@@ -210,13 +250,67 @@ func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 			)
 		}
 	}
+	if wantEvidence {
+		if err := r.archiveTerminalEvidence(qw.SessionID, res, dirFor); err != nil {
+			r.logger.Warn("could not preserve terminal evidence before teardown",
+				"sessionId", qw.SessionID,
+				"err", err,
+			)
+		}
+	}
 	if archiveDir != "" {
 		// Removes the directory only when every checkout turned out to hold
-		// nothing but non-work paths.
+		// nothing but non-work paths and no terminal evidence was archived.
 		_ = os.Remove(archiveDir)
 		pruneRescueArchives(r, qw.SessionID, sessionRoot)
 	}
 	return preserved
+}
+
+// archiveTerminalEvidence writes the result's terminal transcript
+// descriptors into this teardown's archive directory (created on first use
+// via dirFor, shared with any patch this teardown archives). Only the
+// descriptor paths are recorded; the transcript files themselves are never
+// read, opened, uploaded, or placed on any wire surface. A nil result, a
+// status outside failed/stopped, or no descriptors is a no-op. Failures
+// are returned so the caller can log them; they never keep the workarea.
+func (r *Runner) archiveTerminalEvidence(sessionID string, res *Result, dirFor func() (string, error)) error {
+	if res == nil || !shouldPreserveTerminalEvidence(res.Status) || len(res.terminalTranscripts) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(res.terminalTranscripts))
+	for _, desc := range res.terminalTranscripts {
+		if desc.Path != "" {
+			paths = append(paths, desc.Path)
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	dir, err := dirFor()
+	if err != nil {
+		return err
+	}
+	manifest := terminalEvidenceManifest{
+		SessionID:   sessionID,
+		Status:      res.Status,
+		Transcripts: paths,
+		CreatedAt:   r.now().UTC().Format(time.RFC3339),
+	}
+	body, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode terminal evidence: %w", err)
+	}
+	//nolint:gosec // G304: runner-owned path built from sanitized segments.
+	if err := os.WriteFile(filepath.Join(dir, terminalEvidenceFileName), append(body, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write terminal evidence: %w", err)
+	}
+	r.logger.Info("terminal evidence preserved before teardown",
+		"sessionId", sessionID,
+		"status", res.Status,
+		"transcripts", len(paths),
+	)
+	return nil
 }
 
 // pruneRescueArchives keeps the newest rescueKeepPerSession archive
