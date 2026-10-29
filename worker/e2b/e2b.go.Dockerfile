@@ -8,8 +8,12 @@
 # The donmai binary is built OUTSIDE this Dockerfile (see build.sh / README.md)
 # and copied in, exactly like e2b.Dockerfile. Do NOT commit the binary.
 #
+# Single-stage only: the E2B template build SDK rejects multi-stage
+# Dockerfiles, so this file must keep exactly one FROM and no COPY --from.
+#
 # Pins:
-# - Go 1.26.10 tracks go.mod (`go 1.26.10`), via the official golang image.
+# - Go 1.26.10 tracks go.mod (`go 1.26.10`), via the official Go tarball
+#   below. Bump the URL together with go.mod.
 # - golangci-lint v2.11.4 tracks CI's lint action
 #   (.github/workflows/ci.yml `golangci-lint-action` version).
 # - gofumpt v0.12.0 is the first line supporting the Go 1.26 floor
@@ -20,16 +24,15 @@
 # E2B_MEMORY_MB in e2b-template.yml — E2B's defaults (2 vCPU / 1 GiB) are too
 # small for `go test -race ./...`. The base `donmai-worker` template keeps
 # E2B's defaults.
-FROM golang:1.26.10-bookworm AS gotoolchain
-
 FROM debian:bookworm-slim
 
-# Base tools + GitHub CLI (`gh`). Same as e2b.Dockerfile: `gh` is not in
-# Debian's default repos, so the official GitHub CLI apt repo is added.
-# arch=amd64 matches the e2b sandbox arch and the prebuilt linux/amd64
-# donmai binary.
+# Base tools + GitHub CLI (`gh`) + C toolchain for `go test -race`. Same as
+# e2b.Dockerfile: `gh` is not in Debian's default repos, so the official
+# GitHub CLI apt repo is added. arch=amd64 matches the e2b sandbox arch and
+# the prebuilt linux/amd64 donmai binary. gcc + libc6-dev satisfy the Linux
+# race detector's cgo requirement (a C compiler must be installed).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git curl \
+      ca-certificates git curl gcc libc6-dev \
     && mkdir -p -m 755 /etc/apt/keyrings \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -59,10 +62,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 COPY donmai /usr/local/bin/donmai
 RUN chmod +x /usr/local/bin/donmai
 
-# Go toolchain for Go seats (matches go.mod's 1.26.10 floor).
-# Sourced from the target-arch `gotoolchain` stage so the image stays
-# single-arch (linux/amd64, like the donmai binary above).
-COPY --from=gotoolchain /usr/local/go /usr/local/go
+# Go toolchain for Go seats (matches go.mod's 1.26.10 floor). Single-stage
+# tarball install keeps this Dockerfile to one FROM for the E2B build SDK.
+RUN curl -fsSL https://go.dev/dl/go1.26.10.linux-amd64.tar.gz -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz \
+    && /usr/local/go/bin/go version
 ENV PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"
 
 # Go lint + format tools, version-pinned (see header). GOBIN keeps the

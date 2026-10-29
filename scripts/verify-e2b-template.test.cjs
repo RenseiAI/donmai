@@ -333,7 +333,32 @@ test('assertGoVersionOutput accepts the pinned toolchain', () => {
 test('assertGoVersionOutput rejects a wrong toolchain', () => {
   assert.throws(
     () => assertGoVersionOutput({ exitCode: 0, stdout: 'go version go1.25.0 linux/amd64\n' }, '1.26.10'),
-    /want substring "go1\.26\.10"/
+    /want "1\.26\.10"/
+  )
+})
+
+test('assertGoVersionOutput rejects a longer patch sharing the expected prefix', () => {
+  assert.throws(
+    () => assertGoVersionOutput({ exitCode: 0, stdout: 'go version go1.26.100 linux/amd64\n' }, '1.26.10'),
+    /parsed version "1\.26\.100"/
+  )
+})
+
+test('assertGolangciLintVersionOutput rejects a longer patch sharing the expected prefix', () => {
+  assert.throws(
+    () =>
+      assertGolangciLintVersionOutput(
+        { exitCode: 0, stdout: 'golangci-lint has version 2.11.40 built with go1.27.3\n' },
+        '2.11.4'
+      ),
+    /parsed version "2\.11\.40"/
+  )
+})
+
+test('assertGofumptVersionOutput rejects a longer patch sharing the expected prefix', () => {
+  assert.throws(
+    () => assertGofumptVersionOutput({ exitCode: 0, stdout: 'v0.12.00 (go1.27.3)\n' }, '0.12.0'),
+    /parsed version "0\.12\.00"/
   )
 })
 
@@ -349,6 +374,38 @@ test('assertGolangciLintVersionOutput accepts the pinned version', () => {
 test('assertGofumptVersionOutput accepts the pinned version', () => {
   assert.doesNotThrow(() =>
     assertGofumptVersionOutput({ exitCode: 0, stdout: 'v0.12.0 (go1.27.3)\n' }, '0.12.0')
+  )
+})
+
+test('e2b.go.Dockerfile keeps a single FROM for the E2B build SDK', () => {
+  const dockerfile = fs.readFileSync(
+    path.join(__dirname, '..', 'worker', 'e2b', 'e2b.go.Dockerfile'),
+    'utf8'
+  )
+  const fromLines = dockerfile.match(/^FROM\b/gm) || []
+  assert.equal(fromLines.length, 1)
+  assert.doesNotMatch(dockerfile, /^COPY\s+--from=/mi)
+})
+
+test('e2b.go.Dockerfile installs the C toolchain for go test -race', () => {
+  const dockerfile = fs.readFileSync(
+    path.join(__dirname, '..', 'worker', 'e2b', 'e2b.go.Dockerfile'),
+    'utf8'
+  )
+  assert.match(dockerfile, /\bgcc\b/)
+  assert.match(dockerfile, /libc6-dev|build-essential/)
+})
+
+test('e2b.go.Dockerfile Go tarball tracks the go.mod floor', () => {
+  const repoRoot = path.join(__dirname, '..')
+  const goVersion = readGoVersion(repoRoot)
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
+    'utf8'
+  )
+  assert.ok(
+    dockerfile.includes(`go${goVersion}.linux-amd64.tar.gz`),
+    `Go Dockerfile must install go${goVersion} from the official tarball`
   )
 })
 
@@ -454,9 +511,73 @@ test('verifyTemplateVersion rejects a Go toolchain mismatch after cleanup', asyn
         expectedGolangciLintVersion: '2.11.4',
         expectedGofumptVersion: '0.12.0',
       }),
-    /want substring "go1\.26\.10"/
+    /want "1\.26\.10"/
   )
   assert.ok(calls.includes('kill') || calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion rejects a golangci-lint mismatch after cleanup', async () => {
+  const { Sandbox, calls } = makeGoSandbox()
+  const originalCreate = Sandbox.create
+  Sandbox.create = async (templateRef, options) => {
+    const sandbox = await originalCreate(templateRef, options)
+    const originalRun = sandbox.commands.run
+    sandbox.commands.run = async (command) => {
+      if (command === 'golangci-lint --version') {
+        return { exitCode: 0, stdout: 'golangci-lint has version 2.11.40 built with go1.27.3\n' }
+      }
+      return originalRun(command)
+    }
+    return sandbox
+  }
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-go:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedGoVersion: '1.26.10',
+        expectedGolangciLintVersion: '2.11.4',
+        expectedGofumptVersion: '0.12.0',
+      }),
+    /parsed version "2\.11\.40"/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion rejects a gofumpt mismatch after cleanup', async () => {
+  const { Sandbox, calls } = makeGoSandbox()
+  const originalCreate = Sandbox.create
+  Sandbox.create = async (templateRef, options) => {
+    const sandbox = await originalCreate(templateRef, options)
+    const originalRun = sandbox.commands.run
+    sandbox.commands.run = async (command) => {
+      if (command === 'gofumpt --version') {
+        return { exitCode: 0, stdout: 'v0.12.00 (go1.27.3)\n' }
+      }
+      return originalRun(command)
+    }
+    return sandbox
+  }
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-go:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedGoVersion: '1.26.10',
+        expectedGolangciLintVersion: '2.11.4',
+        expectedGofumptVersion: '0.12.0',
+      }),
+    /parsed version "0\.12\.00"/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
 })
 
 test('verifyTemplateVersion refuses incomplete Go toolchain expectations', async () => {

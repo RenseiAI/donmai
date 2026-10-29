@@ -127,6 +127,21 @@ function shouldExpectGoTools({ templateRef, expectGoTools }) {
   return isGoTemplateRef(templateRef)
 }
 
+function extractGoToolchainVersion(output) {
+  const match = String(output).match(/\bgo(\d+\.\d+\.\d+)(?![\d.])/)
+  return match ? match[1] : null
+}
+
+function extractVersionAfterKeyword(output) {
+  const match = String(output).match(/version\s+v?(\d+\.\d+\.\d+)(?![\d.])/i)
+  return match ? match[1] : null
+}
+
+function extractFirstDottedVersion(output) {
+  const match = String(output).match(/\bv?(\d+\.\d+\.\d+)(?![\d.])/)
+  return match ? match[1] : null
+}
+
 function assertGoVersionOutput(result, expectedGoVersion) {
   if (!expectedGoVersion) {
     throw new Error('the expected Go version is required')
@@ -137,9 +152,10 @@ function assertGoVersionOutput(result, expectedGoVersion) {
     )
   }
   const raw = String(result.stdout || '').trim()
-  if (!raw.includes(`go${expectedGoVersion}`)) {
+  const got = extractGoToolchainVersion(raw)
+  if (got !== String(expectedGoVersion).replace(/^go/, '')) {
     throw new Error(
-      `go version = ${JSON.stringify(raw)}, want substring ${JSON.stringify(`go${expectedGoVersion}`)}`
+      `go version = ${JSON.stringify(raw)}, parsed version ${JSON.stringify(got)}, want ${JSON.stringify(String(expectedGoVersion))}`
     )
   }
 }
@@ -155,9 +171,10 @@ function assertGolangciLintVersionOutput(result, expectedVersion) {
   }
   const raw = `${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim()
   const want = String(expectedVersion).replace(/^v/, '')
-  if (!raw.includes(want)) {
+  const got = extractVersionAfterKeyword(raw)
+  if (got !== want) {
     throw new Error(
-      `golangci-lint --version = ${JSON.stringify(raw.trim())}, want substring ${JSON.stringify(want)}`
+      `golangci-lint --version = ${JSON.stringify(raw.trim())}, parsed version ${JSON.stringify(got)}, want ${JSON.stringify(want)}`
     )
   }
 }
@@ -173,9 +190,10 @@ function assertGofumptVersionOutput(result, expectedVersion) {
   }
   const raw = `${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim()
   const want = String(expectedVersion).replace(/^v/, '')
-  if (!raw.includes(want)) {
+  const got = extractFirstDottedVersion(raw)
+  if (got !== want) {
     throw new Error(
-      `gofumpt --version = ${JSON.stringify(raw.trim())}, want substring ${JSON.stringify(want)}`
+      `gofumpt --version = ${JSON.stringify(raw.trim())}, parsed version ${JSON.stringify(got)}, want ${JSON.stringify(want)}`
     )
   }
 }
