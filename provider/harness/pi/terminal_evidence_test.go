@@ -122,7 +122,7 @@ func TestTerminalEvidence_HeadlessProductionEntry_TranscriptSurvivesWorkareaRemo
 	// the copy lives outside the workarea and must survive its removal.
 	rescueDir := t.TempDir()
 	archived := filepath.Join(rescueDir, "evidence.jsonl")
-	if err := os.WriteFile(archived, raw, 0o600); err != nil {
+	if err := os.WriteFile(archived, raw, 0o600); err != nil { //nolint:gosec // test-owned rescue path joins a fixed filename under t.TempDir()
 		t.Fatalf("archive copy: %v", err)
 	}
 	if err := os.RemoveAll(workdir); err != nil {

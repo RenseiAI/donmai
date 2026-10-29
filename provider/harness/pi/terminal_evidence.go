@@ -93,7 +93,7 @@ func collectPiTranscriptDescriptors(root string) []agent.TerminalTranscriptDescr
 		return nil
 	}
 	var descs []agent.TerminalTranscriptDescriptor
-	walkInteractiveTranscriptFiles(clean, func(path string, entry os.DirEntry) {
+	walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
 		rel, err := filepath.Rel(clean, filepath.Clean(path))
 		if err != nil || rel == "." || !filepath.IsLocal(rel) || strings.HasPrefix(rel, "..") {
 			return

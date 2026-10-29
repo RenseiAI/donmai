@@ -165,9 +165,13 @@ type interactiveStateLossHandle struct {
 // been constructed before the child was spawned (see
 // newInteractiveTranscriptTailer).
 func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, tailer *interactiveTranscriptTailer) *interactiveStateLossHandle {
+	cleanRoot := ""
+	if strings.TrimSpace(stateDir) != "" {
+		cleanRoot = filepath.Clean(stateDir)
+	}
 	h := &interactiveStateLossHandle{
 		Handle:          handle,
-		stateRoot:       filepath.Clean(stateDir),
+		stateRoot:       cleanRoot,
 		events:          make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
 		activityFlushed: make(chan struct{}),
 		finished:        make(chan struct{}),
