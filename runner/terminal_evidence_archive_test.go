@@ -31,12 +31,14 @@ func (h *archiveTestHandle) Events() <-chan agent.Event { return h.events }
 func (h *archiveTestHandle) Inject(context.Context, string) error {
 	return nil
 }
+
 func (h *archiveTestHandle) Stop(context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.stopped = true
 	return nil
 }
+
 func (h *archiveTestHandle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -82,14 +84,15 @@ func (p *archiveTestProvider) Spawn(_ context.Context, spec agent.Spec) (agent.H
 	}
 	ch := make(chan agent.Event, 8)
 	ch <- agent.InitEvent{SessionID: "archive-session"}
-	if p.crash {
+	switch {
+	case p.crash:
 		ch <- agent.AssistantTextEvent{Text: "working"}
 		ch <- agent.ErrorEvent{Message: "provider crashed mid turn"}
 		close(ch)
-	} else if p.hang {
+	case p.hang:
 		ch <- agent.InitEvent{SessionID: "archive-session"}
 		// No terminal event: the run parks until the caller cancels.
-	} else {
+	default:
 		ch <- agent.AssistantTextEvent{Text: "WORK_RESULT:passed"}
 		ch <- agent.ResultEvent{Success: true, Message: "done"}
 		close(ch)
@@ -426,12 +429,14 @@ func (h *missingEvidenceHandle) Events() <-chan agent.Event { return h.events }
 func (h *missingEvidenceHandle) Inject(context.Context, string) error {
 	return nil
 }
+
 func (h *missingEvidenceHandle) Stop(context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.stopped = true
 	return nil
 }
+
 func (h *missingEvidenceHandle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -439,4 +444,93 @@ func (h *missingEvidenceHandle) TerminalTranscripts() ([]agent.TerminalTranscrip
 		return nil, errors.New("archive: session still running")
 	}
 	return []agent.TerminalTranscriptDescriptor{{Path: filepath.Join(os.TempDir(), "donmai-missing-evidence-9f3a1c.cast")}}, nil
+}
+
+// TestPreserveTerminalEvidence_OversizeRetainsWorkarea pins the size bound:
+// an evidence file larger than terminalEvidenceMaxBytes is rejected, the
+// workarea is kept, exactly the value-free warning is emitted, and no
+// archive is written. Deleting the bound would archive the oversize file.
+func TestPreserveTerminalEvidence_OversizeRetainsWorkarea(t *testing.T) {
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	src := filepath.Join(t.TempDir(), "evidence.cast")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatalf("create oversize evidence: %v", err)
+	}
+	if err := f.Truncate(int64(terminalEvidenceMaxBytes) + 1); err != nil {
+		_ = f.Close()
+		t.Fatalf("truncate oversize evidence: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close oversize evidence: %v", err)
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		t.Fatalf("stat oversize evidence: %v", err)
+	}
+	if fi.Size() <= int64(terminalEvidenceMaxBytes) {
+		t.Fatalf("oversize fixture size = %d; want more than %d", fi.Size(), int64(terminalEvidenceMaxBytes))
+	}
+	res := &Result{Result: agent.Result{Status: "failed"}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: src}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-OVERSIZE")}
+
+	if r.preserveTerminalEvidence(qw, res) {
+		t.Fatal("preserveTerminalEvidence = true for an oversize evidence file; want false so the workarea is kept")
+	}
+	if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	if len(res.Result.PostSessionWarnings) != 1 || res.Result.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("wire PostSessionWarnings = %v; want exactly [%q]", res.Result.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	for _, w := range append(append([]string{}, res.PostSessionWarnings...), res.Result.PostSessionWarnings...) {
+		if strings.Contains(w, src) || strings.Contains(w, ".cast") {
+			t.Fatalf("warning %q carries a path; want value-free", w)
+		}
+	}
+	if archives := findEvidenceArchives(t, r.rescueDir); len(archives) != 0 {
+		t.Fatalf("evidence archives = %v; want none on oversize rejection", archives)
+	}
+}
+
+// TestPreserveTerminalEvidence_SymlinkRetainsWorkarea pins the non-regular
+// rejection: a symlink descriptor is refused before any read, the workarea
+// is kept, exactly the value-free warning is emitted, and the outside target
+// is never archived. Weakening the gate to error-only would follow the link.
+func TestPreserveTerminalEvidence_SymlinkRetainsWorkarea(t *testing.T) {
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	outsideDir := t.TempDir()
+	secret := filepath.Join(outsideDir, "outside-secret.cast")
+	const secretBody = "outside-secret-should-never-be-archived\n"
+	if err := os.WriteFile(secret, []byte(secretBody), 0o600); err != nil {
+		t.Fatalf("write outside secret: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "evidence.cast")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Fatalf("symlink evidence: %v", err)
+	}
+	res := &Result{Result: agent.Result{Status: "failed"}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: link}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-SYMLINK")}
+
+	if r.preserveTerminalEvidence(qw, res) {
+		t.Fatal("preserveTerminalEvidence = true for a symlink evidence path; want false so the workarea is kept")
+	}
+	if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	if len(res.Result.PostSessionWarnings) != 1 || res.Result.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("wire PostSessionWarnings = %v; want exactly [%q]", res.Result.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	for _, w := range append(append([]string{}, res.PostSessionWarnings...), res.Result.PostSessionWarnings...) {
+		if strings.Contains(w, secretBody) || strings.Contains(w, secret) || strings.Contains(w, link) || strings.Contains(w, ".cast") {
+			t.Fatalf("warning %q leaks a path or value; want value-free", w)
+		}
+	}
+	if archives := findEvidenceArchives(t, r.rescueDir); len(archives) != 0 {
+		t.Fatalf("evidence archives = %v; want none on symlink rejection", archives)
+	}
 }

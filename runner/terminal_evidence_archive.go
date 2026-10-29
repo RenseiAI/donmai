@@ -78,6 +78,7 @@ func (r *Runner) preserveTerminalEvidence(qw QueuedWork, res *Result) bool {
 		}
 		base := rescueSegment(filepath.Base(desc.Path))
 		dest := filepath.Join(archiveDir, fmt.Sprintf("evidence-%02d-%s", i, base))
+		//nolint:gosec // G703: dest is runner-owned under the rescue root, base is rescueSegment-sanitized
 		if err := os.WriteFile(dest, raw, 0o600); err != nil {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
