@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -447,9 +448,12 @@ func (h *missingEvidenceHandle) TerminalTranscripts() ([]agent.TerminalTranscrip
 }
 
 // TestPreserveTerminalEvidence_OversizeRetainsWorkarea pins the size bound:
-// an evidence file larger than terminalEvidenceMaxBytes is rejected, the
-// workarea is kept, exactly the value-free warning is emitted, and no
-// archive is written. Deleting the bound would archive the oversize file.
+// an evidence file larger than terminalEvidenceMaxBytes is rejected before any
+// unbounded read, the workarea is kept, exactly the value-free warning is
+// emitted, and no archive is written. The sparse 2x-bound fixture plus the
+// allocation cap proves the read is bounded: an unbounded ReadFile would
+// allocate the whole file before rejecting. Deleting the bound would archive
+// the oversize file.
 func TestPreserveTerminalEvidence_OversizeRetainsWorkarea(t *testing.T) {
 	r := minimalRunner(t)
 	r.rescueDir = t.TempDir()
@@ -458,7 +462,7 @@ func TestPreserveTerminalEvidence_OversizeRetainsWorkarea(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create oversize evidence: %v", err)
 	}
-	if err := f.Truncate(int64(terminalEvidenceMaxBytes) + 1); err != nil {
+	if err := f.Truncate(int64(terminalEvidenceMaxBytes) * 2); err != nil {
 		_ = f.Close()
 		t.Fatalf("truncate oversize evidence: %v", err)
 	}
@@ -476,7 +480,19 @@ func TestPreserveTerminalEvidence_OversizeRetainsWorkarea(t *testing.T) {
 	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: src}}
 	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-OVERSIZE")}
 
-	if r.preserveTerminalEvidence(qw, res) {
+	// Bound the read: rejecting a 2x-bound sparse file must not allocate the
+	// file. An unbounded pre-check-after-read allocates ~128 MiB here.
+	runtime.GC()
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+	preserved := r.preserveTerminalEvidence(qw, res)
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	if grew := memAfter.TotalAlloc - memBefore.TotalAlloc; grew > uint64(terminalEvidenceMaxBytes) {
+		t.Fatalf("preserve allocated %d bytes rejecting oversize evidence; want < %d (bounded read)", grew, uint64(terminalEvidenceMaxBytes))
+	}
+
+	if preserved {
 		t.Fatal("preserveTerminalEvidence = true for an oversize evidence file; want false so the workarea is kept")
 	}
 	if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {

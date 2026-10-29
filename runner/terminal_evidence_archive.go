@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -66,8 +67,30 @@ func (r *Runner) preserveTerminalEvidence(qw QueuedWork, res *Result) bool {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
 		}
+		// Reject oversized files before reading so the size check bounds
+		// allocation: an unbounded ReadFile would load the whole transcript
+		// into memory before the limit could apply.
+		if fi.Size() > terminalEvidenceMaxBytes {
+			r.warnTerminalEvidencePreservation(qw, res)
+			return false
+		}
 		//nolint:gosec // G304: path comes from the session-owned descriptor captured after Stop.
-		raw, err := os.ReadFile(desc.Path)
+		f, err := os.Open(desc.Path)
+		if err != nil {
+			r.warnTerminalEvidencePreservation(qw, res)
+			return false
+		}
+		// Re-verify after open: the descriptor could have been swapped
+		// between Lstat and Open. The LimitReader below additionally caps
+		// a file that grew in that window, so the read never allocates
+		// beyond the bound plus one probe byte.
+		if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || st.Size() > terminalEvidenceMaxBytes {
+			_ = f.Close()
+			r.warnTerminalEvidencePreservation(qw, res)
+			return false
+		}
+		raw, err := io.ReadAll(io.LimitReader(f, terminalEvidenceMaxBytes+1))
+		_ = f.Close()
 		if err != nil {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
