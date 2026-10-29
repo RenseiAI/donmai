@@ -149,6 +149,10 @@ const (
 type interactiveStateLossHandle struct {
 	*ptycli.Handle
 	events chan agent.Event
+	// stateRoot is the exact per-session layout root (layout.root) this
+	// handle's transcripts live under. Stored at spawn; read by
+	// TerminalTranscripts after the final flush.
+	stateRoot string
 	// activityFlushed closes once the transcript tailer has enqueued its
 	// final flush (or dropped it on a full channel) and returned.
 	activityFlushed chan struct{}
@@ -163,6 +167,7 @@ type interactiveStateLossHandle struct {
 func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, tailer *interactiveTranscriptTailer) *interactiveStateLossHandle {
 	h := &interactiveStateLossHandle{
 		Handle:          handle,
+		stateRoot:       filepath.Clean(stateDir),
 		events:          make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
 		activityFlushed: make(chan struct{}),
 		finished:        make(chan struct{}),

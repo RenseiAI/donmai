@@ -548,6 +548,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		h.maxConsecutiveOutputLimitTurns = p.opts.MaxConsecutiveOutputLimitTurns
 	}
 	h.setConfinement(plan)
+	h.setStateRoot(layout.root)
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the
 	// worktree lifecycle that removes the state root is the backstop.

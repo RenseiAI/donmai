@@ -242,8 +242,9 @@ func (t *interactiveTranscriptTailer) pendingFiles() (files []pendingTranscript,
 
 // walkInteractiveTranscriptFiles calls fn for every .jsonl file under dir,
 // recursing into subdirectories (older pi builds nest transcripts under
-// sessions/) but never into the per-session config home or the
-// injected-extensions dir, which hold no transcripts.
+// sessions/) but never into the per-session config home, the
+// injected-extensions dir, or the per-session tmp/cache dirs, which hold
+// no transcripts.
 func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.DirEntry)) {
 	_ = filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -251,7 +252,7 @@ func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.Di
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
-			case agentHomeDir, injectedExtensionsDir:
+			case agentHomeDir, injectedExtensionsDir, piSessionTmpDir, piSessionCacheDir:
 				return filepath.SkipDir
 			}
 			return nil
