@@ -831,45 +831,17 @@ type StatsResponseV2 struct {
 	Providers []ProviderCost `json:"providers,omitempty"`
 }
 
-// ── Headless runner failure evidence ─────────────────────────────────────────
+// ── Headless runner failure tail bounds ────────────────────────────────────
 //
-// Operator surface for failed headless runs: the structured cause the
-// terminal status carries so infrastructure failures cannot collapse into
-// an unowned label. All pointer fields are nullable: a nil upstream
-// status/code means the endpoint named none, and a nil exit code means no
-// process existed to report one (never zero for a spawn failure).
+// Operator bounds for failed headless runs: every redacted failure tail
+// is capped to these byte and line limits before transport so
+// infrastructure failures cannot collapse into an unowned label.
 const (
 	// MaxHeadlessFailureTailBytes bounds one failure tail in bytes.
 	MaxHeadlessFailureTailBytes = 4096
 	// MaxHeadlessFailureTailLines bounds one failure tail in lines.
 	MaxHeadlessFailureTailLines = 50
 )
-
-// HeadlessFailureEvidence is the bounded, operator-facing projection of a
-// failed headless run. Additive and secret-free: OutputTail is already
-// redacted and bounded before transport, and every unavailable detail
-// stays null rather than invented.
-type HeadlessFailureEvidence struct {
-	// FailureMode is the runner classification (for example
-	// "spawn-failed" or "provider-error").
-	FailureMode string `json:"failureMode"`
-	// UpstreamHTTPStatus is the endpoint HTTP status when the harness
-	// exposed one. Nil when unavailable.
-	UpstreamHTTPStatus *int `json:"upstreamHttpStatus,omitempty"`
-	// UpstreamProviderCode is the endpoint error code when the harness
-	// exposed one. Nil when unavailable.
-	UpstreamProviderCode *string `json:"upstreamProviderCode,omitempty"`
-	// ExitCode is the process exit when one existed. Nil when no process
-	// existed (spawn failure) or the harness reported none.
-	ExitCode *int `json:"exitCode,omitempty"`
-	// OutputTail is the redacted, bounded diagnostic tail.
-	OutputTail string `json:"outputTail,omitempty"`
-	// Phase names where the failure was decided (for example "spawn",
-	// "provision" or "stream").
-	Phase string `json:"phase,omitempty"`
-	// DecidedBy names who decided the failure (for example "runner").
-	DecidedBy string `json:"decidedBy,omitempty"`
-}
 
 // TruncateHeadlessFailureTail applies line then byte bounds to a redacted
 // tail, rune-safe. Empty stays empty.

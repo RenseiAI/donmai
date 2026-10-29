@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/runtime/statusbeacon"
 )
 
@@ -80,35 +79,6 @@ func failurePhaseForMode(mode string) (phase, decidedBy string) {
 	default:
 		return "", ""
 	}
-}
-
-// headlessFailureEvidence builds the operator-facing projection of a
-// terminal Result: failure mode, nullable upstream status/code, nullable
-// exit code and the bounded redacted tail, plus the phase/decider pair.
-// Unavailable upstream details stay nil; a nil result yields an empty
-// evidence value.
-func headlessFailureEvidence(res *Result) afclient.HeadlessFailureEvidence {
-	if res == nil {
-		return afclient.HeadlessFailureEvidence{}
-	}
-	out := afclient.HeadlessFailureEvidence{
-		FailureMode: res.FailureMode,
-		ExitCode:    res.ExitCode,
-		OutputTail:  res.OutputTail,
-		Phase:       res.FailurePhase,
-		DecidedBy:   res.FailureDecidedBy,
-	}
-	if res.Upstream != nil {
-		if res.Upstream.HTTPStatus != 0 {
-			status := res.Upstream.HTTPStatus
-			out.UpstreamHTTPStatus = &status
-		}
-		if res.Upstream.ProviderCode != "" {
-			code := res.Upstream.ProviderCode
-			out.UpstreamProviderCode = &code
-		}
-	}
-	return out
 }
 
 // statusBeaconReporter is the runner's per-session current-step beacon:

@@ -341,10 +341,6 @@ func TestTerminalEvidence_HeadlessProviderErrorPreservesUpstreamAndBoundedTail(t
 	if res.FailurePhase == "" || res.FailureDecidedBy == "" {
 		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
 	}
-	ev := headlessFailureEvidence(res)
-	if ev.UpstreamHTTPStatus == nil || *ev.UpstreamHTTPStatus != 400 || ev.UpstreamProviderCode == nil || *ev.UpstreamProviderCode != "invalid_request" || ev.ExitCode != nil || ev.OutputTail == "" {
-		t.Fatalf("evidence=%+v; want 400/code with tail and null exit", ev)
-	}
 	h := newRunnerHarness(t)
 	body, err := h.runner.poster.PrepareTerminalStatusBody(context.Background(), "evidence-headless", res.Result, nil)
 	if err != nil {
@@ -369,10 +365,6 @@ func TestTerminalEvidence_HeadlessProviderErrorPreservesUpstreamAndBoundedTail(t
 		t.Fatalf("Upstream=%+v; want nil", res2.Upstream)
 	}
 	assertBoundedRedacted(t, res2.OutputTail, secret2)
-	ev2 := headlessFailureEvidence(res2)
-	if ev2.UpstreamHTTPStatus != nil || ev2.UpstreamProviderCode != nil {
-		t.Fatalf("evidence upstream=%+v/%+v; want null", ev2.UpstreamHTTPStatus, ev2.UpstreamProviderCode)
-	}
 }
 
 // Spawn before any process: null exit, phase/decider, no invented result.
@@ -410,10 +402,6 @@ func TestTerminalEvidence_SpawnFailureHasNullExitCodeWithPhase(t *testing.T) {
 	if res.Upstream != nil {
 		t.Fatalf("Upstream=%+v; want nil", res.Upstream)
 	}
-	ev := headlessFailureEvidence(res)
-	if ev.ExitCode != nil || ev.Phase != "spawn" || ev.DecidedBy != "runner" {
-		t.Fatalf("evidence=%+v; want null exit with spawn/runner", ev)
-	}
 }
 
 // Negative control: completed runs carry no failure evidence.
@@ -428,10 +416,6 @@ func TestTerminalEvidence_SuccessCarriesNoFailureEvidence(t *testing.T) {
 	}
 	if res.FailureMode != "" || res.Upstream != nil || res.ExitCode != nil || res.OutputTail != "" || res.FailurePhase != "" || res.FailureDecidedBy != "" {
 		t.Fatalf("completed carries evidence: %+v", res)
-	}
-	ev := headlessFailureEvidence(res)
-	if ev.FailureMode != "" || ev.UpstreamHTTPStatus != nil || ev.UpstreamProviderCode != nil || ev.ExitCode != nil || ev.OutputTail != "" {
-		t.Fatalf("completed evidence not empty: %+v", ev)
 	}
 }
 
@@ -564,11 +548,85 @@ func TestTerminalEvidence_ZeroStatusWithCodePreservesCode(t *testing.T) {
 	if res.Upstream == nil || res.Upstream.HTTPStatus != 0 || res.Upstream.ProviderCode != "throttled_code" {
 		t.Fatalf("Upstream=%+v; want 0/throttled_code", res.Upstream)
 	}
-	ev := headlessFailureEvidence(res)
-	if ev.UpstreamHTTPStatus != nil {
-		t.Fatalf("UpstreamHTTPStatus=%d; want nil", *ev.UpstreamHTTPStatus)
+	// The posted terminal body preserves the code while the status stays
+	// absent: the endpoint named a code but no status.
+	h := newRunnerHarness(t)
+	body, err := h.runner.poster.PrepareTerminalStatusBody(context.Background(), "evidence-zero-status", res.Result, nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
 	}
-	if ev.UpstreamProviderCode == nil || *ev.UpstreamProviderCode != "throttled_code" {
-		t.Fatalf("UpstreamProviderCode=%+v; want throttled_code", ev.UpstreamProviderCode)
+	raw := string(body)
+	if !strings.Contains(raw, `"providerCode":"throttled_code"`) {
+		t.Fatalf("terminal body lacks providerCode throttled_code: %s", raw)
+	}
+	if strings.Contains(raw, `"httpStatus":0`) {
+		t.Fatalf("terminal body carries zero httpStatus: %s", raw)
+	}
+}
+
+// providerErrorOnlyHandle emits a failed terminal with no ErrorEvent: the
+// envelope Error stays empty while the stream observation carries a
+// provider error, so the run-loop finalise block must fill the diagnostic
+// tail from the provider error. Disabling that fallback leaves OutputTail
+// empty and fails this test.
+type providerErrorOnlyHandle struct {
+	events chan agent.Event
+}
+
+func (h *providerErrorOnlyHandle) SessionID() string { return "evidence-provider-only" }
+
+func (h *providerErrorOnlyHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *providerErrorOnlyHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *providerErrorOnlyHandle) Stop(context.Context) error { return nil }
+
+// A failed run whose envelope Error is empty must still carry a bounded
+// tail from the stream provider error: the finalise fallback, not the
+// Error-derived defer, owns this path.
+func TestTerminalEvidence_ProviderErrorOnlyFillsTailWhenErrorEmpty(t *testing.T) {
+	t.Parallel()
+	const providerText = "model overloaded, retry later"
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "evidence-provider-only"}
+	ch <- agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: providerText}
+	ch <- agent.ResultEvent{Success: false}
+	close(ch)
+	base := stubBaseForEvidence(t, nil)
+	provider := &evidenceProvider{HarnessProvider: base, spawnHandle: &providerErrorOnlyHandle{events: ch}}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-PROVIDER-ONLY")
+	qw.WorkType = "qa"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("res is nil; want failed envelope")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if res.Error != "" {
+		t.Fatalf("Error=%q; want empty so the provider-error fallback owns the tail", res.Error)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail from the provider error when Error is empty")
+	}
+	if !strings.Contains(res.OutputTail, providerText) {
+		t.Fatalf("OutputTail=%q; want provider text %q", res.OutputTail, providerText)
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+	if res.FailurePhase == "" || res.FailureDecidedBy == "" {
+		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
 	}
 }

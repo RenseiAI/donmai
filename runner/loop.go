@@ -1303,7 +1303,6 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	handle, err := provider.Spawn(ctx, spec)
 	if err != nil {
 		res.Status = "failed"
-		res.Error = boundedFailureTail(err.Error())
 		// No process existed, so the exit code stays null (never zero)
 		// and no agent verdict is invented: phase/decider carry the
 		// spawn evidence instead.
