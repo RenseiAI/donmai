@@ -8,8 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// repairLockTimeout bounds the exclusive store-lock wait during explicit
+// repair so a stuck writer cannot wedge doctor --fix indefinitely. The
+// concurrent-writer test releases after 200ms, well inside this bound.
+const repairLockTimeout = 5 * time.Second
 
 // repairSwapHook is a test-only seam invoked after the repair pins and
 // exclusively locks the store root, before it re-reads every premise.
@@ -198,7 +204,11 @@ func RepairAcquisitionStore(parent string) error {
 	// fresh lock state that could launder a replacement. The lock must be
 	// the canonical regular file: a symlink (for example to store.json)
 	// must not be followed, otherwise locking the identity file would
-	// succeed while the original writer lock is still held elsewhere.
+	// succeed while the original writer lock is still held elsewhere. A
+	// hard link to an identity document is the same bypass through a
+	// different kernel alias: it must also fail closed, otherwise repair
+	// locks the identity-file inode and rewrites both documents while the
+	// original writer still holds its exclusive store lock.
 	lockInfo, err := root.Lstat(acquisitionStoreLockName)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -207,6 +217,9 @@ func RepairAcquisitionStore(parent string) error {
 		return fmt.Errorf("runtime/workarea: open acquisition store lock: %w", err)
 	}
 	if !lockInfo.Mode().IsRegular() || lockInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
+	}
+	if nlink, ok := fileLinkCount(lockInfo); !ok || nlink != 1 {
 		return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
 	}
 	lock, err := root.OpenFile(acquisitionStoreLockName, os.O_RDWR, 0)
@@ -221,9 +234,23 @@ func RepairAcquisitionStore(parent string) error {
 		_ = lock.Close()
 		return fmt.Errorf("runtime/workarea: acquisition store lock changed while opening")
 	}
-	if err := flockExclusive(lock, false); err != nil {
+	if nlink, ok := fileLinkCount(openedLockInfo); !ok || nlink != 1 {
 		_ = lock.Close()
-		return fmt.Errorf("runtime/workarea: lock acquisition store: %w", err)
+		return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
+	}
+	// The lock must not alias an identity document: a hard link from
+	// store.json (or the parent anchor) into the lock path would pass the
+	// regular-file and SameFile checks above yet flock a different inode
+	// than the original writer holds.
+	if storeLockInfo, err := root.Lstat(acquisitionStoreIdentityName); err == nil {
+		if os.SameFile(lockInfo, storeLockInfo) || os.SameFile(openedLockInfo, storeLockInfo) {
+			_ = lock.Close()
+			return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
+		}
+	}
+	if err := acquireRepairLock(lock); err != nil {
+		_ = lock.Close()
+		return err
 	}
 	defer releaseFlock(lock)
 	// Locked re-check: re-read every premise while holding the exclusive
@@ -381,7 +408,17 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 		if err != nil {
 			_ = acquisitionRoot.Close()
 			if errors.Is(err, fs.ErrNotExist) {
-				continue
+				// An unpublished claim without a record file is an
+				// abandoned claim: recovery removes it and there is
+				// no store identity to check. A published row without
+				// its record file is a damaged store whose ownership
+				// cannot be proved: fail closed without writing,
+				// otherwise repair would re-anchor and report healthy
+				// while the writable open still cannot read the row.
+				if isClaim {
+					continue
+				}
+				return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 			}
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
@@ -411,6 +448,37 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 		}
 	}
 	return nil
+}
+
+// fileLinkCount reports the hard-link count for one Lstat/Stat result.
+// A canonical store lock has exactly one link: a higher count proves the
+// path aliases another file (for example a hard-linked identity
+// document), which must fail closed like a symlink.
+func fileLinkCount(info os.FileInfo) (uint64, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(stat.Nlink), true
+}
+
+// acquireRepairLock takes the exclusive store lock with a bound: it polls
+// with the shared nonblocking acquisition and refuses with a busy error
+// after repairLockTimeout instead of waiting indefinitely behind a stuck
+// writer.
+func acquireRepairLock(lock *os.File) error {
+	deadline := time.Now().Add(repairLockTimeout)
+	for {
+		if err := flockExclusive(lock, true); err == nil {
+			return nil
+		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return fmt.Errorf("runtime/workarea: lock acquisition store: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("runtime/workarea: acquisition store is busy")
+		}
+		time.Sleep(lockRetryInterval)
+	}
 }
 
 func backupAcquisitionIdentityFile(root *os.Root, name, backupName string) error {

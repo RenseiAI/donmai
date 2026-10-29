@@ -1055,3 +1055,266 @@ func TestGuardedRepairRefusesSymlinkLock(t *testing.T) {
 	}
 	assertAcquisitionParentUnchanged(t, parent, before)
 }
+
+// TestGuardedRepairRefusesMissingPublishedRecord pins the published-row
+// completeness guard: a published wac_* directory without its
+// acquisition.json must fail closed with no writes. An empty unpublished
+// claim is an abandoned claim that recovery removes, but a published row
+// without a record cannot prove ownership: re-anchoring would report
+// healthy while the writable open still cannot read the row.
+func TestGuardedRepairRefusesMissingPublishedRecord(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+	if err := os.Remove(recordPath); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diagnosis.NeedsReanchor {
+		t.Fatalf("missing published record must still diagnose as repair-required at the identity layer: %+v", diagnosis)
+	}
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted a published row without its acquisition record")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+// TestGuardedRepairRefusesHardlinkedLock pins the canonical-lock hard-link
+// guard: a .store.lock hard link to store.json must fail closed even when
+// the original exclusive lock is still held elsewhere. Locking the
+// identity-file inode instead would let repair rewrite both documents
+// while the original writer lock remains held.
+func TestGuardedRepairRefusesHardlinkedLock(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	lockPath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreLockName)
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	holder, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close() }()
+	fd, err := intFileDescriptor(holder.Fd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	// While the original exclusive lock stays held on the renamed inode,
+	// swap the path-visible lock for a hard link to store.json. Repair
+	// must refuse the aliased lock rather than flock the identity file
+	// and rewrite while the original writer lock is still held.
+	if err := os.Rename(lockPath, lockPath+".orig"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(lockPath)
+		if _, err := os.Lstat(lockPath + ".orig"); err == nil {
+			_ = os.Rename(lockPath+".orig", lockPath)
+		}
+	})
+	if err := os.Link(storePath, lockPath); err != nil {
+		t.Skipf("hard-link probe needs link support: %v", err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair succeeded through hard-linked lock while original exclusive store lock remained held")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+// TestGuardedRepairBusyLockTimesOut pins the bounded lock wait: a writer
+// that never releases must not wedge explicit repair indefinitely. Repair
+// polls the exclusive lock and refuses with a busy error after its
+// deadline instead of blocking forever.
+func TestGuardedRepairBusyLockTimesOut(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	lockPath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreLockName)
+	holder, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close() }()
+	fd, err := intFileDescriptor(holder.Fd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	done := make(chan error, 1)
+	go func() { done <- RepairAcquisitionStore(parent) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("repair succeeded while the exclusive store lock was held by a stuck writer")
+		}
+		if !strings.Contains(err.Error(), "busy") {
+			t.Fatalf("stuck-writer repair error = %q, want a busy refusal", err)
+		}
+	case <-time.After(repairLockTimeout + 15*time.Second):
+		t.Fatal("repair blocked indefinitely behind a stuck writer; want a bounded busy refusal")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+// TestGuardedRepairRefusesBothDocumentsForgedAwayFromDiagnosedID pins the
+// diagnosed-ID re-check: rewriting both locked identity documents to the
+// same forged store ID (with the acquisition rows repointed to match, so
+// only the diagnosed pin can refuse) must fail closed with no writes.
+// Changing only one document is already refused by the
+// document-to-document comparison; this test kills the mutant that drops
+// the comparison against the diagnosed store ID.
+func TestGuardedRepairRefusesBothDocumentsForgedAwayFromDiagnosedID(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	storeID, _ := legacyDriftForGuardedTest(t, parent)
+	storePath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName)
+	anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+	recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+	origStoreBody, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origAnchorBody, err := os.ReadFile(anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origRecordBody, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	forgedStoreID := "wstore_ffffffffffffffffffffffffffffffff"
+	if forgedStoreID == storeID {
+		forgedStoreID = "wstore_00000000000000000000000000000000"
+	}
+	repairSwapHook = func() {
+		for _, path := range []string{storePath, anchorPath} {
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			var rec acquisitionStoreIdentity
+			if err := json.Unmarshal(body, &rec); err != nil {
+				t.Error(err)
+				return
+			}
+			rec.StoreID = forgedStoreID
+			forged, err := json.Marshal(rec)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			//nolint:gosec // test-only TempDir swap-hook forgery; path from Join(parent, constant).
+			if err := os.WriteFile(path, forged, 0o600); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+		recordBody, err := os.ReadFile(recordPath)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(recordBody, &doc); err != nil {
+			t.Error(err)
+			return
+		}
+		doc["storeId"] = forgedStoreID
+		reforged, err := json.Marshal(doc)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		//nolint:gosec // test-only TempDir swap-hook forgery; path from Join(parent, constant).
+		if err := os.WriteFile(recordPath, reforged, 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() {
+		repairSwapHook = nil
+		//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+		_ = os.WriteFile(storePath, origStoreBody, 0o600)
+		//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+		_ = os.WriteFile(anchorPath, origAnchorBody, 0o600)
+		//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+		_ = os.WriteFile(recordPath, origRecordBody, 0o600)
+	})
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted both locked identity documents changed away from diagnosed store ID")
+	}
+	for _, dir := range []string{filepath.Join(parent, acquisitionStoreDirName), parent} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if strings.Contains(entry.Name(), ".backup-") {
+				t.Fatalf("repair wrote backups after a diagnosed-ID mismatch: %q", entry.Name())
+			}
+		}
+	}
+	repairSwapHook = nil
+	//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+	if err := os.WriteFile(storePath, origStoreBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+	if err := os.WriteFile(anchorPath, origAnchorBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+	if err := os.WriteFile(recordPath, origRecordBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+// TestGuardedRepairRefusesAcquisitionIDMismatch pins the record-ID guard:
+// an acquisition record whose ID differs from its directory name (with a
+// matching store ID, so only the directory-identity comparison can refuse)
+// must fail closed with no writes.
+func TestGuardedRepairRefusesAcquisitionIDMismatch(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatal(err)
+	}
+	forgedAcquisitionID := "wac_ffffffffffffffffffffffffffffffff"
+	if forgedAcquisitionID == committed.AcquisitionID {
+		forgedAcquisitionID = "wac_00000000000000000000000000000000"
+	}
+	doc["acquisitionId"] = forgedAcquisitionID
+	forged, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recordPath, forged, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted an acquisition ID that differs from its directory")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
