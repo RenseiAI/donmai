@@ -192,44 +192,55 @@ type terminalEvidenceManifest struct {
 	CreatedAt   string   `json:"createdAt"`
 }
 
-// preserveUnpublishedWork archives every checkout's unpublished work before
-// teardown and logs where it went. It returns false when some checkout's work
-// could not be preserved; the caller must then keep the workarea.
-//
-// It also archives the session's terminal transcript descriptors as local
-// evidence when the terminal status owns preservation (failed or stopped):
-// the evidence shares this teardown's archive directory, so evidence-only
-// and patch-bearing attempts count together under rescueKeepPerSession.
-// Evidence is best-effort and never flips the return: a teardown with no
-// unpublished work still tears down when the evidence cannot be written.
-func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
-	if res == nil {
-		return true
+// teardownPreservation carries one teardown's archive directory across the
+// patch phase (before the terminal lease decision) and the evidence phase
+// (after the final status is known). Both phases share the same directory
+// so evidence-only and patch-bearing attempts count together under
+// rescueKeepPerSession as a single attempt per teardown.
+type teardownPreservation struct {
+	sessionRoot string
+	archiveDir  string
+	stamp       string
+}
+
+// newTeardownPreservation starts one teardown's preservation scope for the
+// session. The stamp is fixed at creation so the patch and evidence phases
+// share one directory even when the clock advances between them.
+func (r *Runner) newTeardownPreservation(sessionID string) *teardownPreservation {
+	return &teardownPreservation{
+		sessionRoot: filepath.Join(r.rescueRoot(), rescueSegment(sessionID)),
+		stamp:       r.now().UTC().Format("20060102T150405Z"),
 	}
-	wantEvidence := shouldPreserveTerminalEvidence(res.Status) && len(res.terminalTranscripts) > 0
-	if len(res.rescueTargets) == 0 && !wantEvidence {
+}
+
+// dirFor creates this teardown's archive directory on first use, unique
+// even when two teardowns of one session share a second.
+func (p *teardownPreservation) dirFor() (string, error) {
+	if p.archiveDir != "" {
+		return p.archiveDir, nil
+	}
+	if err := os.MkdirAll(p.sessionRoot, 0o700); err != nil {
+		return "", fmt.Errorf("create rescue directory: %w", err)
+	}
+	dir, err := os.MkdirTemp(p.sessionRoot, p.stamp+"-")
+	if err != nil {
+		return "", fmt.Errorf("create rescue directory: %w", err)
+	}
+	p.archiveDir = dir
+	return dir, nil
+}
+
+// preservePatches archives every checkout's unpublished work into the
+// scope's directory. It returns false when some checkout's work could not
+// be preserved; the caller must then keep the workarea. Evidence is never
+// archived here: the terminal status is not final until the lease decision
+// runs, so evidence waits for preserveTerminalEvidenceFinal below.
+func (r *Runner) preservePatches(qw QueuedWork, res *Result, pres *teardownPreservation) bool {
+	if res == nil || pres == nil {
 		return true
 	}
 	preserved := true
-	stamp := r.now().UTC().Format("20060102T150405Z")
-	sessionRoot := filepath.Join(r.rescueRoot(), rescueSegment(qw.SessionID))
-	archiveDir := ""
-	// dirFor creates this teardown's archive directory on first use, unique
-	// even when two teardowns of one session share a second.
-	dirFor := func() (string, error) {
-		if archiveDir != "" {
-			return archiveDir, nil
-		}
-		if err := os.MkdirAll(sessionRoot, 0o700); err != nil {
-			return "", fmt.Errorf("create rescue directory: %w", err)
-		}
-		dir, err := os.MkdirTemp(sessionRoot, stamp+"-")
-		if err != nil {
-			return "", fmt.Errorf("create rescue directory: %w", err)
-		}
-		archiveDir = dir
-		return dir, nil
-	}
+	dirFor := pres.dirFor
 	for _, target := range res.rescueTargets {
 		archive, err := r.rescueCheckout(qw.SessionID, dirFor, target)
 		switch {
@@ -252,20 +263,64 @@ func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 			)
 		}
 	}
+	return preserved
+}
+
+// preserveTerminalEvidenceFinal archives the session's terminal transcript
+// descriptors based on the FINAL terminal status (after the lease decision
+// may have flipped completed to failed). It shares the teardown's directory
+// with any patch preservePatches archived, so one teardown still produces a
+// single attempt. Evidence stays best-effort: failures are logged and never
+// keep the workarea.
+func (r *Runner) preserveTerminalEvidenceFinal(qw QueuedWork, res *Result, pres *teardownPreservation) {
+	if res == nil || pres == nil {
+		return
+	}
+	if err := r.archiveTerminalEvidence(qw.SessionID, res, pres.dirFor); err != nil {
+		r.logger.Warn("could not preserve terminal evidence before teardown",
+			"sessionId", qw.SessionID,
+			"err", err,
+		)
+	}
+}
+
+// finalizeTeardownPreservation drops the teardown directory when it holds
+// neither a patch nor terminal evidence, then prunes the session to the
+// retention boundary. It runs once per teardown after both phases.
+func (r *Runner) finalizeTeardownPreservation(qw QueuedWork, pres *teardownPreservation) {
+	if pres == nil || pres.archiveDir == "" {
+		return
+	}
+	// Removes the directory only when every checkout turned out to hold
+	// nothing but non-work paths and no terminal evidence was archived.
+	_ = os.Remove(pres.archiveDir)
+	pruneRescueArchives(r, qw.SessionID, pres.sessionRoot)
+}
+
+// preserveUnpublishedWork archives every checkout's unpublished work before
+// teardown and logs where it went. It returns false when some checkout's work
+// could not be preserved; the caller must then keep the workarea.
+//
+// It also archives the session's terminal transcript descriptors as local
+// evidence when the terminal status owns preservation (failed or stopped):
+// the evidence shares this teardown's archive directory, so evidence-only
+// and patch-bearing attempts count together under rescueKeepPerSession.
+// Evidence is best-effort and never flips the return: a teardown with no
+// unpublished work still tears down when the evidence cannot be written.
+func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
+	if res == nil {
+		return true
+	}
+	wantEvidence := shouldPreserveTerminalEvidence(res.Status) && len(res.terminalTranscripts) > 0
+	if len(res.rescueTargets) == 0 && !wantEvidence {
+		return true
+	}
+	pres := r.newTeardownPreservation(qw.SessionID)
+	preserved := r.preservePatches(qw, res, pres)
 	if wantEvidence {
-		if err := r.archiveTerminalEvidence(qw.SessionID, res, dirFor); err != nil {
-			r.logger.Warn("could not preserve terminal evidence before teardown",
-				"sessionId", qw.SessionID,
-				"err", err,
-			)
-		}
+		r.preserveTerminalEvidenceFinal(qw, res, pres)
 	}
-	if archiveDir != "" {
-		// Removes the directory only when every checkout turned out to hold
-		// nothing but non-work paths and no terminal evidence was archived.
-		_ = os.Remove(archiveDir)
-		pruneRescueArchives(r, qw.SessionID, sessionRoot)
-	}
+	r.finalizeTeardownPreservation(qw, pres)
 	return preserved
 }
 

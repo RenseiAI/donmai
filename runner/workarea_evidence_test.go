@@ -372,3 +372,383 @@ func TestTerminalEvidence_PreservesPatchMetadataForTranscriptsRepository(t *test
 		t.Fatalf("evidence manifest = %+v; want failed with exactly [evidence/collision-9f3a1c.cast]", manifest)
 	}
 }
+
+// stoppedMultiEvidenceHandle is a live interview session that blocks until
+// Stop and then serves a fixed descriptor list. Descriptor access before
+// Stop refuses, modelling writers that stop only when Stop returns.
+type stoppedMultiEvidenceHandle struct {
+	events  chan agent.Event
+	mu      sync.Mutex
+	stopped bool
+	descs   []agent.TerminalTranscriptDescriptor
+}
+
+func (h *stoppedMultiEvidenceHandle) SessionID() string          { return "stopped-multi-evidence" }
+func (h *stoppedMultiEvidenceHandle) Events() <-chan agent.Event { return h.events }
+func (h *stoppedMultiEvidenceHandle) Inject(context.Context, string) error {
+	return nil
+}
+
+func (h *stoppedMultiEvidenceHandle) Stop(context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopped = true
+	return nil
+}
+
+func (h *stoppedMultiEvidenceHandle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.stopped {
+		return nil, errors.New("evidence: session still running")
+	}
+	return h.descs, nil
+}
+
+// stoppedMultiEvidenceProvider serves one stoppedMultiEvidenceHandle and
+// signals gate on Spawn so the test can cancel once provisioning finished.
+type stoppedMultiEvidenceProvider struct {
+	agent.HarnessProvider
+	gate  chan struct{}
+	once  *sync.Once
+	descs []agent.TerminalTranscriptDescriptor
+}
+
+func (p *stoppedMultiEvidenceProvider) Spawn(context.Context, agent.Spec) (agent.Handle, error) {
+	p.once.Do(func() { close(p.gate) })
+	return &stoppedMultiEvidenceHandle{events: make(chan agent.Event), descs: p.descs}, nil
+}
+
+// runStoppedEvidenceSession runs one cancelled interview session whose
+// handle serves descs after Stop, and returns the terminal result. repository
+// selects the provisioned workarea: empty provisions a repository-free
+// session with no rescue targets.
+func runStoppedEvidenceSession(t *testing.T, r *Runner, platformURL, repository string, descs []agent.TerminalTranscriptDescriptor, qwSessionID string) *Result {
+	t.Helper()
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	harness, ok := base.(agent.HarnessProvider)
+	if !ok {
+		t.Fatal("stub provider is not a HarnessProvider")
+	}
+	gate := make(chan struct{})
+	provider := &stoppedMultiEvidenceProvider{HarnessProvider: harness, gate: gate, once: &sync.Once{}, descs: descs}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r.registry = reg
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("STOPPED-EVIDENCE"),
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		PlatformURL: platformURL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderStub,
+		},
+	}
+	qw.SessionID = qwSessionID
+	qw.Repository = repository
+	qw.Mode = "interview"
+	runCtx, cancel := context.WithCancel(context.Background())
+	type runResult struct {
+		res *Result
+		err error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		res, runErr := r.Run(runCtx, qw)
+		done <- runResult{res: res, err: runErr}
+	}()
+	select {
+	case <-gate:
+		cancel()
+	case <-time.After(30 * time.Second):
+		cancel()
+		t.Fatal("Run did not reach provider spawn before cancellation")
+	}
+	var got runResult
+	select {
+	case got = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if got.res == nil || got.res.Status != "stopped" {
+		t.Fatalf("Status = %+v err = %v; want stopped", got.res, got.err)
+	}
+	return got.res
+}
+
+func newEvidenceRunner(t *testing.T, wtParent, rescueDir string) (*Runner, string) {
+	t.Helper()
+	srv := mockPlatformServer(t)
+	t.Cleanup(srv.Close)
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL, WorkerID: "worker-1", AuthToken: "tok",
+		HTTPClient: srv.Client(), BaseDelay: 1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	reg := NewRegistry()
+	if err := reg.Register(base); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry: reg, WorktreeManager: manager, Poster: poster,
+		HTTPClient: srv.Client(), SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		MaxSessionDuration: -1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	r.rescueDir = rescueDir
+	return r, srv.URL
+}
+
+// TestRepositoryFreeStoppedEvidenceViaRun pins the repository-free
+// boundary end to end: a stopped session with no checkout targets still
+// archives its transcript descriptor. Restoring the old early return for
+// sessions without checkout targets drops it and this test fails with zero
+// evidence attempts.
+func TestRepositoryFreeStoppedEvidenceViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	const wantPath = "evidence/repo-free-8c1d2a.cast"
+	rescueDir := t.TempDir()
+	r, platformURL := newEvidenceRunner(t, t.TempDir(), rescueDir)
+	res := runStoppedEvidenceSession(t, r, platformURL, "", []agent.TerminalTranscriptDescriptor{{Path: wantPath}}, "test-session-REPO-FREE-EVIDENCE")
+	if res.WorktreePath == "" {
+		t.Fatal("stopped session has no worktree path")
+	}
+	sessionRoot := filepath.Join(rescueDir, "test-session-REPO-FREE-EVIDENCE")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		t.Fatalf("read session rescue root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("evidence attempts = %d; want exactly 1 for a repository-free stopped session", len(entries))
+	}
+	body, err := os.ReadFile(filepath.Join(sessionRoot, entries[0].Name(), terminalEvidenceFileName)) //nolint:gosec // G304: test-owned path.
+	if err != nil {
+		t.Fatalf("read terminal evidence: %v", err)
+	}
+	var manifest terminalEvidenceManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatalf("decode terminal evidence: %v", err)
+	}
+	if manifest.Status != "stopped" || len(manifest.Transcripts) != 1 || manifest.Transcripts[0] != wantPath {
+		t.Fatalf("evidence manifest = %+v; want stopped with exactly [%q]", manifest, wantPath)
+	}
+}
+
+// TestStoppedEvidenceDescriptorFilteringViaRun pins the descriptor filter
+// end to end: empty descriptor paths are dropped while a valid
+// one-character path is kept. Admitting empty paths leaves "" in the
+// manifest; rejecting one-character paths drops "x"; both fail this test.
+func TestStoppedEvidenceDescriptorFilteringViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	const validPath = "evidence/filtered-valid-6b3e1f.cast"
+	rescueDir := t.TempDir()
+	r, platformURL := newEvidenceRunner(t, t.TempDir(), rescueDir)
+	descs := []agent.TerminalTranscriptDescriptor{{Path: ""}, {Path: "x"}, {Path: validPath}}
+	runStoppedEvidenceSession(t, r, platformURL, makeBareRepo(t), descs, "test-session-FILTER-EVIDENCE")
+	sessionRoot := filepath.Join(rescueDir, "test-session-FILTER-EVIDENCE")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		t.Fatalf("read session rescue root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("evidence attempts = %d; want exactly 1", len(entries))
+	}
+	body, err := os.ReadFile(filepath.Join(sessionRoot, entries[0].Name(), terminalEvidenceFileName)) //nolint:gosec // G304: test-owned path.
+	if err != nil {
+		t.Fatalf("read terminal evidence: %v", err)
+	}
+	var manifest terminalEvidenceManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatalf("decode terminal evidence: %v", err)
+	}
+	if len(manifest.Transcripts) != 2 || manifest.Transcripts[0] != "x" || manifest.Transcripts[1] != validPath {
+		t.Fatalf("evidence manifest transcripts = %q; want [x %q] with empty paths dropped", manifest.Transcripts, validPath)
+	}
+}
+
+// TestStoppedEmptyEvidenceWritesNoAttemptViaRun pins the empty-evidence
+// boundary end to end: descriptors that are all empty write no archive
+// directory at all. Writing an empty evidence attempt creates one and this
+// test fails.
+func TestStoppedEmptyEvidenceWritesNoAttemptViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	rescueDir := t.TempDir()
+	r, platformURL := newEvidenceRunner(t, t.TempDir(), rescueDir)
+	runStoppedEvidenceSession(t, r, platformURL, makeBareRepo(t), []agent.TerminalTranscriptDescriptor{{Path: ""}, {Path: ""}}, "test-session-EMPTY-EVIDENCE")
+	sessionRoot := filepath.Join(rescueDir, "test-session-EMPTY-EVIDENCE")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("read session rescue root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("evidence attempts = %d; want none when every descriptor path is empty", len(entries))
+	}
+}
+
+// TestStoppedEvidenceWriteFailureStillTearsDownViaRun pins the
+// best-effort boundary end to end: when the evidence cannot be written the
+// teardown still proceeds. Making evidence failure prevent teardown keeps
+// the workarea and this test fails on the surviving worktree.
+func TestStoppedEvidenceWriteFailureStillTearsDownViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("a file where the rescue directory should go\n"), 0o600); err != nil {
+		t.Fatalf("write rescue blocker: %v", err)
+	}
+	r, platformURL := newEvidenceRunner(t, t.TempDir(), blocked)
+	res := runStoppedEvidenceSession(t, r, platformURL, makeBareRepo(t), []agent.TerminalTranscriptDescriptor{{Path: "evidence/best-effort-4f2a9c.cast"}}, "test-session-EVIDENCE-BEST-EFFORT")
+	if res.WorktreePath == "" {
+		t.Fatal("stopped session has no worktree path")
+	}
+	if _, err := os.Stat(res.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("worktree stat err = %v; want the stopped session's worktree torn down despite evidence failure", err)
+	}
+	// The helper contract matches: evidence failure never flips the
+	// preservation result, so the caller still tears down.
+	helper := minimalRunner(t)
+	helper.rescueDir = blocked
+	helperRes := &Result{terminalTranscripts: []agent.TerminalTranscriptDescriptor{{Path: "evidence/best-effort-4f2a9c.cast"}}}
+	helperRes.Status = "stopped"
+	if !helper.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase("BEST-EFFORT")}, helperRes) {
+		t.Fatal("preserveUnpublishedWork = false on evidence-write failure; want true (best-effort)")
+	}
+}
+
+// TestLateLeaseFailurePreservesEvidenceViaRun pins the late-lease
+// boundary end to end: a research session that completes with a captured
+// descriptor but whose requested terminal lease fails acquisition flips to
+// failed and still archives its evidence manifest before teardown.
+// Sampling evidence before the final status is what loses it: the
+// pre-lease decision sees completed and archives nothing.
+func TestLateLeaseFailurePreservesEvidenceViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	const sentinel = "evidence/late-lease-failure-3e7a1c.cast"
+	wtParent := t.TempDir()
+	srv := mockPlatformServer(t)
+	t.Cleanup(srv.Close)
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	// Break lease acquisition after provisioning: the session record stays
+	// valid so the clone succeeds, but every lease write fails and the
+	// completed session flips to failed in the lease block.
+	leaseRecords := filepath.Join(wtParent, ".terminal-leases", "records")
+	if err := os.RemoveAll(leaseRecords); err != nil {
+		t.Fatalf("remove lease records dir: %v", err)
+	}
+	if err := os.WriteFile(leaseRecords, []byte("blocked\n"), 0o600); err != nil {
+		t.Fatalf("block lease records dir: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL, WorkerID: "worker-1", AuthToken: "tok",
+		HTTPClient: srv.Client(), BaseDelay: 1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	handle := newOrderedEvidenceHandle(sentinel, "WORK_RESULT:passed", nil)
+	baseStub, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	harness, ok := baseStub.(agent.HarnessProvider)
+	if !ok {
+		t.Fatal("stub provider is not a HarnessProvider")
+	}
+	provider := &evidenceProvider{HarnessProvider: harness, spawnHandle: handle}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry: reg, WorktreeManager: manager, Poster: poster,
+		HTTPClient: srv.Client(), SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		MaxSessionDuration: -1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rescueDir := t.TempDir()
+	r.rescueDir = rescueDir
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("LATE-LEASE-FAILURE"),
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		PlatformURL: srv.URL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderStub,
+		},
+		TerminalWorkareaLease: terminalLeaseRequest(),
+	}
+	qw.SessionID = "test-session-LATE-LEASE-FAILURE"
+	qw.Repository = makeBareRepo(t)
+	qw.WorkType = "research"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err == nil {
+		t.Fatalf("Run err = nil; want the lease-acquisition failure")
+	}
+	if res == nil || res.Status != "failed" || res.FailureMode != FailureTerminalWorkareaLease {
+		t.Fatalf("Status = %+v err = %v; want failed with %q", res, err, FailureTerminalWorkareaLease)
+	}
+	if len(res.terminalTranscripts) != 1 || res.terminalTranscripts[0].Path != sentinel {
+		t.Fatalf("terminalTranscripts = %+v; want exactly [%q]", res.terminalTranscripts, sentinel)
+	}
+	sessionRoot := filepath.Join(rescueDir, "test-session-LATE-LEASE-FAILURE")
+	entries, readErr := os.ReadDir(sessionRoot)
+	if readErr != nil {
+		t.Fatalf("read session rescue root: %v", readErr)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("evidence attempts = %d; want exactly 1 after the late lease failure", len(entries))
+	}
+	body, readErr := os.ReadFile(filepath.Join(sessionRoot, entries[0].Name(), terminalEvidenceFileName)) //nolint:gosec // G304: test-owned path.
+	if readErr != nil {
+		t.Fatalf("read terminal evidence: %v", readErr)
+	}
+	var manifest terminalEvidenceManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatalf("decode terminal evidence: %v", err)
+	}
+	if manifest.Status != "failed" || len(manifest.Transcripts) != 1 || manifest.Transcripts[0] != sentinel {
+		t.Fatalf("evidence manifest = %+v; want failed with exactly [%q]", manifest, sentinel)
+	}
+	if res.WorktreePath == "" {
+		t.Fatal("failed session has no worktree path")
+	}
+	if _, err := os.Stat(res.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("worktree stat err = %v; want the failed session's worktree torn down", err)
+	}
+}
