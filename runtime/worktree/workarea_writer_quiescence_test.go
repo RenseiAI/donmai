@@ -366,9 +366,13 @@ func TestWriterQuiescence_ExpiryReapsThroughReleasePending(t *testing.T) {
 // drives the same archive-then-dispose order.
 func TestWriterQuiescence_RestartAfterReleasePendingResumesProviderRelease(t *testing.T) {
 	parent := t.TempDir()
+	current := time.Now()
+	clock := func() time.Time { return current }
 	var archivedByRestart bool
+	var restartedQuiesced bool
 	first, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: quiescenceSessionID,
+		Now: clock,
 		ArchiveRoot: func(_ context.Context, _ worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
 			return nil, errors.New("restart before provider release")
 		},
@@ -413,8 +417,10 @@ func TestWriterQuiescence_RestartAfterReleasePendingResumesProviderRelease(t *te
 	// TestWriterQuiescence_UnquiescedReleaseProceedsAsUnquiescedEvidence).
 	restarted, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: quiescenceSessionID,
+		Now: clock,
 		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
 			archivedByRestart = true
+			restartedQuiesced = spec.Quiesced
 			if !spec.Quiesced {
 				t.Error("restarted release lost the quiescence recorded before settlement")
 			}
@@ -434,30 +440,29 @@ func TestWriterQuiescence_RestartAfterReleasePendingResumesProviderRelease(t *te
 	if adopted.State != workarea.LeaseReleasePending {
 		t.Fatalf("adopted lease state = %q, want release-pending", adopted.State)
 	}
+	// Advance past the provider retry backoff so the restarted reaper is
+	// deterministically actionable: the first-pass failure schedules the
+	// next attempt DefaultReleaseRetryBase in the future, and without this
+	// the reaper would stay parked and the quiescence-carry check below
+	// would never run (the prior GREEN-on-mutant gap).
+	current = current.Add(workarea.DefaultReleaseRetryBase + time.Second)
 	if _, err := restarted.ReapExpiredTerminalLeases(context.Background(), 32, 30*time.Second); err != nil {
-		t.Logf("restarted reaper attempt: %v", err)
+		t.Fatalf("restarted reaper attempt: %v", err)
 	}
-	if archivedByRestart {
-		if _, err := os.Stat(layout.Root.String()); !os.IsNotExist(err) {
-			t.Fatalf("restarted archive-backed disposal left source: %v", err)
-		}
-		if settled, err := restarted.TerminalLease(lease.LeaseID); err == nil && settled.State == workarea.LeaseReleased {
-			return
-		}
+	if !archivedByRestart {
+		t.Fatal("restarted reaper did not drive provider release after backoff")
 	}
-	// If the backoff window has not elapsed the retry is not yet
-	// actionable: the lease must still be release-pending with the
-	// source retained — never silently released, never disposed.
+	if !restartedQuiesced {
+		t.Fatal("restarted release lost the quiescence recorded before settlement")
+	}
+	if _, err := os.Stat(layout.Root.String()); !os.IsNotExist(err) {
+		t.Fatalf("restarted archive-backed disposal left source: %v", err)
+	}
 	settled, err := restarted.TerminalLease(lease.LeaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settled.State != workarea.LeaseReleasePending && settled.State != workarea.LeaseReleased {
-		t.Fatalf("lease state after restart = %q, want release-pending or released", settled.State)
-	}
-	if settled.State == workarea.LeaseReleasePending {
-		if _, err := os.Stat(layout.Root.String()); err != nil {
-			t.Fatalf("source removed while release still pending after restart: %v", err)
-		}
+	if settled.State != workarea.LeaseReleased {
+		t.Fatalf("lease state after restart = %q, want released", settled.State)
 	}
 }

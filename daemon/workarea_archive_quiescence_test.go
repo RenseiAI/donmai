@@ -542,12 +542,12 @@ func runArchiveEscapedWriter() {
 	// removal.
 	alive := filepath.Join(dir, ".escaped-alive")
 	stop := filepath.Join(dir, ".stop-escaped-writer")
-	if err := os.WriteFile(alive, []byte("alive"), 0o600); err != nil {
+	if err := os.WriteFile(alive, []byte("alive"), 0o600); err != nil { //nolint:gosec // G703: alive derives from test-controlled env dir with a fixed filename
 		os.Exit(1)
 	}
 	for i := 0; i < 10000; i++ {
-		if _, err := os.Stat(stop); err == nil {
-			_ = os.Remove(alive)
+		if _, err := os.Stat(stop); err == nil { //nolint:gosec // G703: stop derives from test-controlled env dir with a fixed filename
+			_ = os.Remove(alive) //nolint:gosec // G703: alive derives from test-controlled env dir with a fixed filename
 			os.Exit(0)
 		}
 		f, err := os.OpenFile(filepath.Join(dir, "escaped.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G703: dir is test-controlled env, joined with a fixed filename
@@ -563,7 +563,7 @@ func runArchiveEscapedWriter() {
 		_ = f.Close()
 		time.Sleep(10 * time.Millisecond)
 	}
-	_ = os.Remove(alive)
+	_ = os.Remove(alive) //nolint:gosec // G703: alive derives from test-controlled env dir with a fixed filename
 	os.Exit(0)
 }
 
@@ -641,28 +641,57 @@ func TestArchiveQuiescence_PreWitnessArchiveStillRestores(t *testing.T) {
 // the archive, while tracked source still fails closed. This pins the
 // same-filter rule on both halves of the witness.
 func TestArchiveQuiescence_ExcludedRegenerableChangeDoesNotFailCapture(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
 	archiveRoot := t.TempDir()
 	source := t.TempDir()
 	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	depPath := filepath.Join(source, "node_modules", "pkg", "index.js")
+	if err := os.MkdirAll(filepath.Dir(depPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(depPath, []byte("dependency v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The guard skips node_modules only inside a checkout that ignores
+	// it: without this the candidate is copied whole and the mutation
+	// below would fail closed like tracked source.
+	initExcludeTestRepo(t, source)
 	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
-		if stage != "before-copy-archive-tree" {
-			return nil
+		if stage == "after-copy-archive-tree" {
+			// Mutate only the excluded regenerable tree after the copy
+			// completes but before the post-copy witness runs: the
+			// filtered witness walks skip it, so the capture must still
+			// commit one stable generation.
+			if err := os.WriteFile(depPath, []byte("dependency v2 rebuilt\n"), 0o600); err != nil {
+				return err
+			}
 		}
-		// node_modules outside a git checkout is copied whole (the
-		// guard keeps every candidate without a checkout), so plant
-		// the mutation where the filter actually applies: a tracked
-		// checkout tested below pins the fail-closed half.
 		return nil
 	}})
 	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
 		WorkareaID: "wa_filtered", SessionID: "filtered-session",
 		WorkareaRoot: source, SelectedPath: source, Quiesced: true,
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("excluded regenerable change failed capture: %v", err)
 	}
 	manifest := readWorkareaArchiveManifest(t, archiveRoot, "wa_filtered")
 	if manifest.CaptureStableGeneration != manifest.TreeDigest {
 		t.Fatal("filtered witness does not match committed digest")
+	}
+	found := false
+	for _, excluded := range manifest.Excluded {
+		if excluded == "node_modules" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("manifest excluded = %q, want node_modules recorded", manifest.Excluded)
+	}
+	if _, err := os.Stat(filepath.Join(archiveRoot, "wa_filtered", "tree", "node_modules")); !os.IsNotExist(err) {
+		t.Fatalf("archived tree still holds excluded node_modules: %v", err)
 	}
 }
 
