@@ -182,13 +182,31 @@ func RepairAcquisitionStore(parent string) error {
 	// Acquire the existing exclusive store lock without creating it. A
 	// missing lock file means the store was never fully created or was
 	// tampered with: fail closed without writing rather than minting
-	// fresh lock state that could launder a replacement.
+	// fresh lock state that could launder a replacement. The lock must be
+	// the canonical regular file: a symlink (for example to store.json)
+	// must not be followed, otherwise locking the identity file would
+	// succeed while the original writer lock is still held elsewhere.
+	lockInfo, err := root.Lstat(acquisitionStoreLockName)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("runtime/workarea: acquisition store lock is missing")
+		}
+		return fmt.Errorf("runtime/workarea: open acquisition store lock: %w", err)
+	}
+	if !lockInfo.Mode().IsRegular() || lockInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
+	}
 	lock, err := root.OpenFile(acquisitionStoreLockName, os.O_RDWR, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("runtime/workarea: acquisition store lock is missing")
 		}
 		return fmt.Errorf("runtime/workarea: open acquisition store lock: %w", err)
+	}
+	openedLockInfo, err := lock.Stat()
+	if err != nil || !openedLockInfo.Mode().IsRegular() || !os.SameFile(lockInfo, openedLockInfo) {
+		_ = lock.Close()
+		return fmt.Errorf("runtime/workarea: acquisition store lock changed while opening")
 	}
 	if err := flockExclusive(lock, false); err != nil {
 		_ = lock.Close()
@@ -300,10 +318,18 @@ func RepairAcquisitionStore(parent string) error {
 
 // validateAcquisitionRecordsBelongToStore scans the pinned store root for
 // durable acquisition rows and proves each one belongs to the expected
-// store. It reads through the already-pinned root only, validates the
-// closed record independently, and requires the store ID and the
+// store. It covers both published rows (wac_*) and unpublished claiming
+// rows (.claim-wac_*) written durably by Begin and handled by recovery:
+// a foreign-store claim must refuse just like a foreign published row,
+// otherwise re-anchoring would launder it and the next writable open
+// would delete the foreign claim and its payload through recovery. It
+// reads through the already-pinned root only, refuses non-regular record
+// files (FIFOs, sockets, devices, symlinks) without blocking, validates
+// the closed record independently, and requires the store ID and the
 // directory identity to match. Any malformed row or foreign-store row
-// refuses the caller without writing.
+// refuses the caller without writing. An empty claim directory with no
+// record file is skipped: recovery removes such abandoned claims and
+// there is no store identity to check.
 func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) error {
 	if storeID == "" || !strings.HasPrefix(storeID, "wstore_") {
 		return fmt.Errorf("runtime/workarea: acquisition store identity is invalid")
@@ -321,11 +347,33 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if !entry.IsDir() || !strings.HasPrefix(name, "wac_") {
+		isPublished := entry.IsDir() && strings.HasPrefix(name, "wac_")
+		isClaim := entry.IsDir() && strings.HasPrefix(name, ".claim-wac_")
+		if !isPublished && !isClaim {
 			continue
+		}
+		expectedID := name
+		if isClaim {
+			expectedID = strings.TrimPrefix(name, ".claim-")
+		}
+		dirInfo, err := root.Lstat(name)
+		if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
 		acquisitionRoot, err := root.OpenRoot(name)
 		if err != nil {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		recordInfo, err := acquisitionRoot.Lstat(acquisitionRecordFileName)
+		if err != nil {
+			_ = acquisitionRoot.Close()
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		if !recordInfo.Mode().IsRegular() || recordInfo.Mode()&os.ModeSymlink != 0 {
+			_ = acquisitionRoot.Close()
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
 		body, err := acquisitionRoot.ReadFile(acquisitionRecordFileName)
@@ -345,7 +393,7 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 		if err := record.Validate(); err != nil {
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
-		if record.AcquisitionID != name || record.StoreID != storeID {
+		if record.AcquisitionID != expectedID || record.StoreID != storeID {
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
 	}

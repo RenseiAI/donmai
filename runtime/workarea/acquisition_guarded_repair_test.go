@@ -272,9 +272,11 @@ func TestGuardedRepairRefusesMismatchesWithoutWrites(t *testing.T) {
 		committedReadyForReadback(t, parent)
 		_, _ = legacyDriftForGuardedTest(t, parent)
 		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		//nolint:gosec // intentional unsafe mode to prove diagnosis and repair fail closed.
 		if err := os.Chmod(storeDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
+		//nolint:gosec // restore private mode for TempDir cleanup after the unsafe-mode probe.
 		t.Cleanup(func() { _ = os.Chmod(storeDir, 0o700) })
 		before := snapshotAcquisitionParent(t, parent)
 		diagnosis, err := DiagnoseAcquisitionStore(parent)
@@ -374,7 +376,11 @@ func TestGuardedRepairSwapAfterDiagnosisFails(t *testing.T) {
 	// Swap the path-visible store directory after the repair pins and
 	// locks the original root: rename the verified store aside and plant
 	// a forged store at the same path that reuses the diagnosed store ID.
-	// The locked re-check must still fail closed on the pinned inode.
+	// The parent anchor is left untouched so only the post-lock
+	// path-identity re-check (SameFile against the pinned root plus the
+	// diagnosed inode) can reject the swap: removing that check must let
+	// the swap through. The locked re-check must still fail closed on
+	// the pinned inode.
 	repairSwapHook = func() {
 		storeDir := filepath.Join(parent, acquisitionStoreDirName)
 		if err := os.Rename(storeDir, storeDir+".orig"); err != nil {
@@ -404,9 +410,12 @@ func TestGuardedRepairSwapAfterDiagnosisFails(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(storeDir, acquisitionStoreIdentityName), forgedBody, 0o600); err != nil {
 			t.Error(err)
 		}
-		if err := os.WriteFile(filepath.Join(parent, acquisitionStoreAnchorName), forgedBody, 0o600); err != nil {
-			t.Error(err)
-		}
+		// The parent anchor is deliberately left on the diagnosed legacy
+		// identity: the pinned root still carries the same legacy
+		// documents, so only the path-identity re-check distinguishes the
+		// swap. An earlier revision also rewrote the anchor here, which
+		// let the later anchor-mismatch reject mask deletion of the
+		// path-identity guard.
 		lockFile, err := os.OpenFile(filepath.Join(storeDir, acquisitionStoreLockName), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 		if err != nil {
 			t.Error(err)
@@ -417,10 +426,12 @@ func TestGuardedRepairSwapAfterDiagnosisFails(t *testing.T) {
 	t.Cleanup(func() {
 		repairSwapHook = nil
 		storeDir := filepath.Join(parent, acquisitionStoreDirName)
-		_ = os.RemoveAll(storeDir)
-		// The hook renamed the original aside only when it ran; restore
-		// it when present so TempDir cleanup sees the original tree.
+		// Restore the pinned original when the hook ran so TempDir
+		// cleanup sees the original tree; when repair correctly fails
+		// before any write the restored tree must equal the pre-swap
+		// snapshot asserted below.
 		if _, err := os.Lstat(storeDir + ".orig"); err == nil {
+			_ = os.RemoveAll(storeDir)
 			_ = os.Rename(storeDir+".orig", storeDir)
 		}
 	})
@@ -429,10 +440,10 @@ func TestGuardedRepairSwapAfterDiagnosisFails(t *testing.T) {
 		t.Fatal("repair admitted a swapped store directory")
 	}
 	// The failure must happen before any write to the pinned original:
-	// the pre-swap snapshot (original tree) is restored by cleanup, but
-	// the repair must not have created backups in the swapped forgery
-	// that would indicate it consumed the replacement. Check the swapped
-	// tree has no backups.
+	// the swapped forgery must carry no backups (repair must not have
+	// consumed the replacement), and restoring the pinned original must
+	// yield the exact pre-swap tree (repair must not have written to the
+	// pinned root either).
 	swappedEntries, err := os.ReadDir(filepath.Join(parent, acquisitionStoreDirName))
 	if err != nil {
 		t.Fatal(err)
@@ -442,7 +453,15 @@ func TestGuardedRepairSwapAfterDiagnosisFails(t *testing.T) {
 			t.Fatalf("repair wrote backups into the swapped replacement: %q", entry.Name())
 		}
 	}
-	_ = before
+	storeDir := filepath.Join(parent, acquisitionStoreDirName)
+	if _, err := os.Lstat(storeDir + ".orig"); err == nil {
+		_ = os.RemoveAll(storeDir)
+		if err := os.Rename(storeDir+".orig", storeDir); err != nil {
+			t.Fatal(err)
+		}
+		repairSwapHook = nil
+		assertAcquisitionParentUnchanged(t, parent, before)
+	}
 }
 
 // TestGuardedRepairConcurrentWriterBlocked pins AC-4 (locking): an
@@ -558,4 +577,157 @@ func committedReadyForReadbackID(t *testing.T, _ string, records []AcquisitionRe
 		t.Fatalf("want exactly 1 ready record, got %d", len(records))
 	}
 	return records[0].AcquisitionID
+}
+
+// TestGuardedRepairRefusesStoreSideLegacyAlone pins the store-side legacy
+// refusal: a current anchor (pinned to the present device) with a legacy
+// store document (same inode, different device, no birth) must fail closed
+// on the writable door and require explicit repair. Deleting the
+// store-side guard lets the writable open auto-heal anchor-first without
+// explicit repair. On platforms without birth the inode-only tolerance
+// still heals, so only the diagnosis and repair legs are pinned there.
+func TestGuardedRepairRefusesStoreSideLegacyAlone(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	storeID, physical := legacyDriftForGuardedTest(t, parent)
+	if !physical.HasBirth {
+		t.Skip("platform does not record birth; store-side legacy refusal needs birth")
+	}
+	anchorPath := filepath.Join(parent, acquisitionStoreAnchorName)
+	anchorRecord := readStoreIdentityForTest(t, anchorPath)
+	anchorRecord.Identity = physical
+	writeStoreIdentityForTest(t, anchorPath, anchorRecord)
+	before := snapshotAcquisitionParent(t, parent)
+	diagnosis, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnosis.Healthy || !diagnosis.NeedsReanchor || diagnosis.StoreID != storeID {
+		t.Fatalf("store-side legacy diagnosis = %+v, want needs-reanchor for %q", diagnosis, storeID)
+	}
+	if _, err := NewAcquisitionStore(parent, nil); err == nil {
+		t.Fatal("writable open auto-healed anchor-first without explicit repair")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+	if err := RepairAcquisitionStore(parent); err != nil {
+		t.Fatalf("repair of store-side legacy: %v", err)
+	}
+	after, err := DiagnoseAcquisitionStore(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Healthy || after.NeedsReanchor || after.StoreID != storeID {
+		t.Fatalf("post-repair diagnosis = %+v, want healthy for %q", after, storeID)
+	}
+}
+
+// TestGuardedRepairRefusesFIFORecord pins the file-type refusal: a FIFO at
+// acquisition.json must fail closed without blocking while holding the
+// exclusive store lock. Opening it with ReadFile alone blocks with no
+// writer and wedges repair plus subsequent store users.
+func TestGuardedRepairRefusesFIFORecord(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+	if err := os.Remove(recordPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(recordPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	done := make(chan error, 1)
+	go func() { done <- RepairAcquisitionStore(parent) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("repair admitted a FIFO acquisition record")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("repair blocked on FIFO acquisition record while holding exclusive store lock")
+	}
+	// Repair must not have replaced the FIFO or written backups.
+	if fi, err := os.Lstat(recordPath); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("repair disturbed the FIFO record: %+v %v", fi, err)
+	}
+	_ = before
+}
+
+// TestGuardedRepairRefusesForeignUnpublishedClaim pins the unpublished-claim
+// refusal: a valid foreign-store record under .claim-wac_* must fail closed
+// with no writes, otherwise re-anchoring launders it and the next writable
+// open deletes the foreign claim and its payload through recovery.
+func TestGuardedRepairRefusesForeignUnpublishedClaim(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	foreignAcquisitionID := "wac_ffffffffffffffffffffffffffffffff"
+	claimLeaf := ".claim-" + foreignAcquisitionID
+	claimDir := filepath.Join(parent, acquisitionStoreDirName, claimLeaf)
+	if err := os.Mkdir(claimDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := committed
+	foreign.AcquisitionID = foreignAcquisitionID
+	foreign.StoreID = "wstore_ffffffffffffffffffffffffffffffff"
+	foreign.State = AcquisitionClaiming
+	foreignBody, err := json.Marshal(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claimDir, acquisitionRecordFileName), foreignBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Convert both identity documents to legacy drift so repair is attempted.
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	before := snapshotAcquisitionParent(t, parent)
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted foreign unpublished acquisition")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+// TestGuardedRepairRefusesSymlinkLock pins the canonical-lock check: a
+// .store.lock symlink (for example to store.json) must fail closed even
+// when the original exclusive lock is still held elsewhere. Locking the
+// identity file instead would let repair rewrite both documents while the
+// original writer lock remains held.
+func TestGuardedRepairRefusesSymlinkLock(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	lockPath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreLockName)
+	holder, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close() }()
+	fd, err := intFileDescriptor(holder.Fd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	// While the original exclusive lock stays held on the renamed inode,
+	// swap the path-visible lock for a symlink to store.json. Repair must
+	// refuse the symlink rather than lock the identity file and rewrite
+	// while the original writer lock is still held.
+	if err := os.Rename(lockPath, lockPath+".orig"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(lockPath)
+		if _, err := os.Lstat(lockPath + ".orig"); err == nil {
+			_ = os.Rename(lockPath+".orig", lockPath)
+		}
+	})
+	if err := os.Symlink(acquisitionStoreIdentityName, lockPath); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair succeeded through symlink lock while original exclusive store lock remained held")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
 }
