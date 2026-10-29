@@ -352,6 +352,9 @@ func TestAgentStatusDiagnosticDetail(t *testing.T) {
 		if got := pr["url"]; got != "https://example.invalid/repo/pull/42" {
 			t.Errorf("pullRequest.url = %v, want PR url", got)
 		}
+		if got := pr["headSha"]; got != "abc123def456abc123def456abc123def456abcd" {
+			t.Errorf("pullRequest.headSha = %v, want head sha", got)
+		}
 		if got := session["summary"]; got != "Migrated middleware and opened PR." {
 			t.Errorf("summary = %v, want summary text", got)
 		}
@@ -428,6 +431,47 @@ func TestAgentStatusDiagnosticDetail(t *testing.T) {
 		}
 		if got := strings.Count(out, "unavailable"); got < 4 {
 			t.Errorf("expected unavailable placeholder on >= 4 rows, got %d; out:\n%s", got, out)
+		}
+	})
+
+	t.Run("pull_request_structured_wins_over_flat", func(t *testing.T) {
+		t.Parallel()
+		const divergentRaw = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"},"pullRequestUrl":"https://example.invalid/repo/pull/41","pullRequest":{"number":42,"url":"https://example.invalid/repo/pull/42","headSha":"abc123def456abc123def456abc123def456abcd"}},"timestamp":"2026-10-27T12:02:00Z"}`
+		srv := newDiagnosticServer(t, divergentRaw)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "https://example.invalid/repo/pull/42") {
+			t.Errorf("expected structured PR url to win; got:\n%s", out)
+		}
+		if !strings.Contains(out, "#42:") {
+			t.Errorf("expected structured PR number to render; got:\n%s", out)
+		}
+		if strings.Contains(out, "https://example.invalid/repo/pull/41") {
+			t.Errorf("flat PR url must not win over structured record; got:\n%s", out)
+		}
+	})
+
+	t.Run("pull_request_flat_only_falls_back", func(t *testing.T) {
+		t.Parallel()
+		const flatOnlyRaw = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"},"pullRequestUrl":"https://example.invalid/repo/pull/41"},"timestamp":"2026-10-27T12:02:00Z"}`
+		srv := newDiagnosticServer(t, flatOnlyRaw)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "https://example.invalid/repo/pull/41") {
+			t.Errorf("expected flat PR url fallback to render; got:\n%s", out)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "Pull Request:") && strings.Contains(line, "unavailable") {
+				t.Errorf("flat PR url must not render as unavailable; got:\n%s", out)
+			}
 		}
 	})
 }
