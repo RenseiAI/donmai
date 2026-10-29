@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"io"
 	"math"
@@ -11,7 +12,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func copySparseData(source, destination *os.File, size int64) error {
+func copySparseData(ctx context.Context, source, destination *os.File, size int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if size == 0 {
 		return destination.Truncate(0)
 	}
@@ -30,6 +34,9 @@ func copySparseData(source, destination *os.File, size int64) error {
 	}
 	position := int64(0)
 	for position < size {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		data, err := unix.Seek(sourceFD, position, unix.SEEK_DATA)
 		if errors.Is(err, unix.ENXIO) {
 			break

@@ -403,15 +403,20 @@ func TestWriterQuiescence_RestartAfterReleasePendingResumesProviderRelease(t *te
 		t.Fatalf("state before restart = %q, want release-pending", pending.State)
 	}
 	// Simulate process loss: drop the manager; a fresh one adopts the
-	// same durable lease and acquisition. The restarted view records
-	// no quiescence (it never supervised the generation) — the
-	// release still proceeds, as unquiesced evidence.
+	// same durable store and acquisition. The quiescence the first
+	// manager recorded before settlement survives the restart inside
+	// the durable lease record (see leaseWriterQuiesced): the restarted
+	// view carries quiescence it did not supervise but that was proved
+	// before settlement — still evidence, never a refusal. A restart
+	// over a lease acquired WITHOUT recorded quiescence still
+	// proceeds as unquiesced (pinned by
+	// TestWriterQuiescence_UnquiescedReleaseProceedsAsUnquiescedEvidence).
 	restarted, err := worktree.NewManager(worktree.Options{
 		ParentDir: parent, CommandRunner: nestedCloneStub(), RestoreSessionID: quiescenceSessionID,
 		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
 			archivedByRestart = true
-			if spec.Quiesced {
-				t.Error("restarted release recorded quiescence it never proved")
+			if !spec.Quiesced {
+				t.Error("restarted release lost the quiescence recorded before settlement")
 			}
 			if _, err := os.Stat(filepath.Join(spec.WorkareaRoot, ".workarea", "declaration.json")); err != nil {
 				return nil, err

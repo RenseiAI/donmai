@@ -142,6 +142,26 @@ func startTerminalReplayLoops(ctx context.Context, leaseManager *worktree.Manage
 	}, leaseSender)
 }
 
+// forwardArchiveRootToRegistry adapts the manager's provider-neutral
+// archive spec to the daemon registry's commit call. Every field is
+// forwarded, including Quiesced: the caller-side no-writer evidence the
+// manager assembled from the live session flag and the durable lease
+// snapshot (see Manager.leaseWriterQuiesced) reaches the committed
+// manifest as CaptureQuiesced, so operators can distinguish a quiesced
+// capture from one whose caller could not prove the ordinary writers
+// gone. Dropping Quiesced here would silently relabel quiesced
+// captures as unquiesced — strictly worse labeling, never a refusal —
+// and is pinned by TestForwardArchiveRootToRegistryCarriesQuiescence.
+func forwardArchiveRootToRegistry(archiveRegistry *daemon.WorkareaArchiveRegistry) worktree.ArchiveRootFunc {
+	return func(ctx context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
+		return archiveRegistry.CommitArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
+			AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
+			WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath,
+			TerminalResultID: spec.TerminalResultID, Quiesced: spec.Quiesced,
+		})
+	}
+}
+
 // rotateDaemonLogs size-checks the launchd-managed daemon log files
 // (daemon.log / daemon-error.log) and rotates any that exceed
 // daemon.DefaultLogRotateMaxBytes. Best-effort: failures are reported to
@@ -454,15 +474,9 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			worktreeParent := statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 			archiveRegistry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot, WorktreeParent: worktreeParent})
 			leaseManager, err := worktree.NewManager(worktree.Options{
-				ParentDir: worktreeParent,
-				Logger:    slog.Default(),
-				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) (*workarea.TerminalArchiveReference, error) {
-					return archiveRegistry.CommitArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
-						AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
-						WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath,
-						TerminalResultID: spec.TerminalResultID, Quiesced: spec.Quiesced,
-					})
-				},
+				ParentDir:   worktreeParent,
+				Logger:      slog.Default(),
+				ArchiveRoot: forwardArchiveRootToRegistry(archiveRegistry),
 			})
 			if err != nil {
 				return fmt.Errorf("terminal lease recovery authority: %w", err)

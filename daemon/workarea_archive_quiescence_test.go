@@ -18,6 +18,7 @@ package daemon
 // path on mismatch.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -126,20 +127,61 @@ func TestArchiveQuiescence_QuietSourceCommitsOneStableGeneration(t *testing.T) {
 // source is retained with the writer's bytes intact, and the error is the
 // stability sentinel so the release path keeps release-pending for a
 // bounded retry instead of disposing the only complete copy.
+//
+// Determinism note: the racing writer alternates a.txt between two
+// SAME-LENGTH generations in a tight loop from the moment the capture
+// reaches the before-copy seam until the capture returns. Same-length
+// bodies isolate the generation digest — per-file size guards observe
+// no torn read, so the pre/post/staged equality check is the guard
+// that fires (removing it would commit a mixed pair). The main test
+// holds the copy gate until it has COUNTED writer flips during the
+// hold (content changes observed, not wall-clock sleep), and a dense
+// stable file stretches the copy walk itself across writer
+// generations, so the staged copy provably spans generations while
+// the witness observes another — the mixed pair a real racing writer
+// produces.
 func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *testing.T) {
 	archiveRoot := t.TempDir()
 	source := t.TempDir()
 	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	// c.txt is a stable part of every generation here (pre-created
+	// before the capture starts): the race is purely the alternating
+	// a.txt content, so the failure cannot be blamed on a file-set
+	// race the witness and the copy resolve differently.
+	if err := os.WriteFile(filepath.Join(source, "c.txt"), []byte("generation-two-c"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A dense stable file forces the copy walk to stream for longer
+	// than one writer alternation, so the copy provably spans writer
+	// generations even on a fast filesystem. 16MiB streams in tens
+	// of milliseconds — thousands of tight-loop alternations —
+	// without burdening the suite.
+	stablePath := filepath.Join(source, "slow-stable.bin")
+	stable, err := os.OpenFile(stablePath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	for written := 0; written < 16; written++ {
+		if _, err := stable.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stable.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stable.Close(); err != nil {
+		t.Fatal(err)
+	}
 	releaseCopy := make(chan struct{})
 	copyReached := make(chan struct{})
 	var copyReachedOnce sync.Once
-	// The racing writer alternates a.txt between two generations in a
-	// tight loop from the moment the capture reaches the before-copy
-	// seam until the capture returns. The copy walk (milliseconds over
-	// a small tree) always overlaps at least one alternation while the
-	// gate is held, so the staged copy provably spans writer
-	// generations while the witness walk observes a different one —
-	// the mixed pair a real racing writer produces.
+	// The capture parks inside the before-copy seam until the main
+	// test has counted writer flips during the hold (below); the
+	// writer runs from seam-arrival until the capture returns.
 	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
 		if stage == "before-copy-archive-tree" {
 			copyReachedOnce.Do(func() { close(copyReached) })
@@ -177,21 +219,42 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 				return
 			default:
 			}
-			body := []byte("generation-two-a")
+			// Same-length generations: sizes never change, so no
+			// torn-read size guard can fire — only the
+			// generation equality check observes the race.
+			body := []byte("generation-two-a!")
 			if i%2 == 1 {
-				body = []byte("generation-two-a-prime")
+				body = []byte("generation-two-a?")
 			}
 			if err := os.WriteFile(filepath.Join(source, "a.txt"), body, 0o600); err != nil {
 				return
 			}
-			if err := os.WriteFile(filepath.Join(source, "c.txt"), []byte("generation-two-c"), 0o600); err != nil {
-				return
-			}
 		}
 	}()
-	// Hold the copy gate briefly so the copy walk overlaps the racing
-	// writer, then release it and let the witness observe.
-	time.Sleep(250 * time.Millisecond)
+	// Hold the copy gate until the writer has provably flipped
+	// generations DURING the hold: count observed content changes
+	// rather than sleeping a fixed window. Twenty flips take ~tens
+	// of milliseconds against a tight-loop writer and prove the
+	// race is mid-flight before the copy walk starts; the dense
+	// stable file then keeps the copy walk spanning generations.
+	flips := 0
+	previous, _ := os.ReadFile(filepath.Join(source, "a.txt"))
+	flipDeadline := time.Now().Add(15 * time.Second)
+	for flips < 20 {
+		if time.Now().After(flipDeadline) {
+			t.Fatal("racing writer flipped nothing during the hold")
+		}
+		current, err := os.ReadFile(filepath.Join(source, "a.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(current) != string(previous) {
+			flips++
+			previous = current
+			continue
+		}
+		time.Sleep(time.Millisecond)
+	}
 	close(releaseCopy)
 	select {
 	case err := <-done:
@@ -211,7 +274,7 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 	// one of the two raced generations; either is a writer byte, and
 	// the capture published neither as an archive.
 	switch got := sourceTreeFile(t, source, "a.txt"); got {
-	case "generation-two-a", "generation-two-a-prime":
+	case "generation-two-a!", "generation-two-a?":
 	default:
 		t.Fatalf("source a.txt = %q after failed capture, want a raced generation-two byte", got)
 	}
@@ -229,14 +292,17 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 // same way. The test binary re-executes itself as the detached writer.
 //
 // Determinism note: the escaped writer appends a DISTINCT line on every
-// iteration, so ANY append that lands between the copy walk's hash of
-// escaped.txt and the witness walk's hash fails the capture. The main
-// test holds the copy gate open for a full second while the writer
-// appends every 10ms (~100 appends); the copy walk of the small tree
-// completes in milliseconds, so the witness always observes a longer
-// file than the copy staged. A quiet writer (killed before the gate)
-// would commit — correctly, as one stable generation — so the test
-// asserts the writer is still alive after the capture returns.
+// iteration, so ANY append that lands between the copy walk's read of
+// escaped.txt and a witness walk's read fails the capture. Overlap is
+// proved by counting appends, not by timing: the test holds the copy
+// gate until it has observed at least 20 new fsynced generations
+// DURING the hold, then releases; the dense stable file keeps the copy
+// walk spanning further generations. The writer is stopped via a stop
+// file and proved exited (alive sentinel gone) before TempDir cleanup,
+// so it can never recreate escaped.txt during removal. A quiet writer
+// (stopped before the gate) would commit — correctly, as one stable
+// generation — so the test asserts the writer is still alive after the
+// capture returns.
 func TestArchiveQuiescence_EscapedDescendantMutationFailsClosed(t *testing.T) {
 	if os.Getenv("DONMAI_TEST_ARCHIVE_ESCAPED_WRITER") == "1" {
 		runArchiveEscapedWriter()
@@ -311,13 +377,36 @@ func TestArchiveQuiescence_EscapedDescendantMutationFailsClosed(t *testing.T) {
 	t.Cleanup(func() {
 		_ = helper.Wait()
 	})
+	// Stop the detached grandchild and prove it exited BEFORE TempDir
+	// cleanup runs (this Cleanup was registered after TempDir
+	// creation, so it runs first). Without this, the reparented
+	// grandchild — which no Wait observes — could recreate
+	// escaped.txt while TempDir removal is in progress, failing
+	// cleanup with "directory not empty" and flaking the suite.
+	stopEscapedWriter := func() {
+		_ = os.WriteFile(filepath.Join(source, ".stop-escaped-writer"), []byte("stop"), 0o600)
+		stopDeadline := time.Now().Add(15 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(source, ".escaped-alive")); os.IsNotExist(err) {
+				return
+			}
+			if time.Now().After(stopDeadline) {
+				t.Fatal("escaped writer did not exit after the stop file")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	t.Cleanup(stopEscapedWriter)
 	// Wait for the escaped writer's first mutation, proving it outlived
 	// the spawning generation's wait (Start returns immediately; the
-	// double-forked grandchild is reparented and unwatched).
+	// double-forked grandchild is reparented and unwatched). The alive
+	// sentinel proves the grandchild (not just the exited middle
+	// child) is the one mutating.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		body, err := os.ReadFile(filepath.Join(source, "escaped.txt"))
-		if err == nil && len(body) > 0 {
+		_, aliveErr := os.Stat(filepath.Join(source, ".escaped-alive"))
+		if err == nil && len(body) > 0 && aliveErr == nil {
 			writerStartedOnce.Do(func() { close(writerStarted) })
 			break
 		}
@@ -381,17 +470,12 @@ func TestArchiveQuiescence_EscapedDescendantMutationFailsClosed(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// Barrier: the counted generations are durable before the gate
-	// releases. The grandchild keeps appending after the release
-	// (it only exits with the test binary), but a copy that finishes
-	// between two 10ms appends still stages a stable generation and
-	// correctly commits — a timing coincidence this test must not
-	// depend on. Force the overlap structurally instead: slow the
-	// copy walk itself by planting a large stable file the copy must
-	// stream while the writer keeps appending to escaped.txt. The
-	// copy then always spans writer generations; the witness
-	// disagrees and the capture fails closed.
-	time.Sleep(50 * time.Millisecond)
+	// Release the copy gate: the counted generations are durable and
+	// the dense stable file keeps the copy walk spanning further
+	// generations — the witness disagrees and the capture fails
+	// closed. (No trailing sleep: the growth counted above already
+	// proves the overlap; the writer keeps appending until the stop
+	// file below, so the post-publish check observes the same race.)
 	close(releaseCopy)
 	select {
 	case err := <-done:
@@ -406,26 +490,39 @@ func TestArchiveQuiescence_EscapedDescendantMutationFailsClosed(t *testing.T) {
 	}
 	// Source retained: the escaped writer's bytes are still there, and
 	// the writer is still alive (it outlived the capture — the escape
-	// held). Size growth after the capture proves the writer was
-	// mid-flight throughout, not finished before the copy ran.
+	// held). The alive sentinel proves mid-flight without a
+	// sleep-and-compare race: the grandchild only removes it on exit
+	// via the stop file below.
 	after, err := os.Stat(filepath.Join(source, "escaped.txt"))
 	if err != nil {
 		t.Fatalf("source lost escaped writer bytes: %v", err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	later, err := os.Stat(filepath.Join(source, "escaped.txt"))
-	if err != nil {
-		t.Fatalf("source lost escaped writer bytes: %v", err)
+	if after.Size() == 0 {
+		t.Fatal("source lost escaped writer bytes: escaped.txt is empty")
 	}
-	if later.Size() <= after.Size() {
-		t.Fatalf("escaped writer was not mid-flight: size %d -> %d", after.Size(), later.Size())
+	if _, err := os.Stat(filepath.Join(source, ".escaped-alive")); err != nil {
+		t.Fatalf("escaped writer was not mid-flight: alive sentinel gone: %v", err)
 	}
+	// Stop the writer now and prove it exited before TempDir cleanup.
+	stopEscapedWriter()
 }
 
 // runArchiveEscapedWriter is the detached-descendant helper: it
 // double-forks so the intermediate child exits at once (the test parent's
 // Start returns; nobody waits on the grandchild) and the grandchild keeps
-// appending to the source until killed with the test binary.
+// appending to the source until the test stops it.
+//
+// Lifecycle: the grandchild creates .escaped-alive at start and removes
+// it on exit; it exits promptly when .stop-escaped-writer appears. The
+// test stops the writer and waits for the alive sentinel to disappear
+// BEFORE TempDir cleanup runs (via t.Cleanup registered after TempDir
+// creation), so the grandchild can never recreate escaped.txt during
+// TempDir removal. Each iteration appends a DISTINCT line and fsyncs, so every
+// iteration is a new source generation the capture must observe:
+// any iteration that lands between the copy walk's read and the
+// witness walk's read fails the capture. Iteration count (not
+// wall-clock time) bounds the loop so short test timeouts cannot
+// truncate the escape mid-proof.
 func runArchiveEscapedWriter() {
 	dir := os.Getenv("DONMAI_TEST_ARCHIVE_ESCAPED_DIR")
 	if dir == "" {
@@ -439,14 +536,20 @@ func runArchiveEscapedWriter() {
 		os.Exit(0)
 	}
 	// Grandchild: detached, reparented, unwatched — the exact escaped
-	// shape a PTY group stop leaves behind. Mutate until the test ends.
-	// Each iteration appends a DISTINCT line and fsyncs, so every
-	// iteration is a new source generation the capture must observe:
-	// any iteration that lands between the copy walk's read and the
-	// witness walk's read fails the capture. Iteration count (not
-	// wall-clock time) bounds the loop so short test timeouts cannot
-	// truncate the escape mid-proof.
+	// shape a PTY group stop leaves behind. Mutate until the test
+	// writes the stop file, then exit and remove the alive sentinel
+	// so the test can prove the writer is dead before TempDir
+	// removal.
+	alive := filepath.Join(dir, ".escaped-alive")
+	stop := filepath.Join(dir, ".stop-escaped-writer")
+	if err := os.WriteFile(alive, []byte("alive"), 0o600); err != nil {
+		os.Exit(1)
+	}
 	for i := 0; i < 10000; i++ {
+		if _, err := os.Stat(stop); err == nil {
+			_ = os.Remove(alive)
+			os.Exit(0)
+		}
 		f, err := os.OpenFile(filepath.Join(dir, "escaped.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G703: dir is test-controlled env, joined with a fixed filename
 		if err != nil {
 			os.Exit(1)
@@ -460,6 +563,7 @@ func runArchiveEscapedWriter() {
 		_ = f.Close()
 		time.Sleep(10 * time.Millisecond)
 	}
+	_ = os.Remove(alive)
 	os.Exit(0)
 }
 
@@ -710,5 +814,217 @@ func TestArchiveQuiescence_OldDigestNestedIdempotentAndRestorable(t *testing.T) 
 	}
 	if _, _, err := registry.RestoreV1("wa_oldnested", afclient.WorkareaRestoreRequest{IntoSessionID: "oldnested-session"}); err != nil {
 		t.Fatalf("restore of pre-witness nested archive after source disposal: %v", err)
+	}
+}
+
+// A synchronous mutation planted between the copy and the post-copy
+// witness must fail closed. The seam fires deterministically (no racing
+// writer to schedule), so this test isolates the post-copy equality
+// check: the pre-copy generation and the staged copy agree, only the
+// post-copy source moved. Removing the post-copy comparison would
+// commit the staged (now stale) tree — the test goes RED — proving
+// the witness is the guard that fires, not a torn-read size check.
+func TestArchiveQuiescence_AfterCopyMutationFailsClosed(t *testing.T) {
+	archiveRoot := t.TempDir()
+	source := t.TempDir()
+	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
+		if stage == "after-copy-archive-tree" {
+			if err := os.WriteFile(filepath.Join(source, "b.txt"), []byte("NEW-B"), 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa_aftercopy", SessionID: "aftercopy-session",
+		WorkareaRoot: source, SelectedPath: source, Quiesced: true,
+	})
+	if !errors.Is(err, ErrArchiveUnstableSource) {
+		t.Fatalf("after-copy mutation err = %v, want %v", err, ErrArchiveUnstableSource)
+	}
+	if _, statErr := os.Stat(filepath.Join(archiveRoot, "wa_aftercopy")); !os.IsNotExist(statErr) {
+		t.Fatalf("after-copy mutation published an archive: %v", statErr)
+	}
+	if got := sourceTreeFile(t, source, "b.txt"); got != "NEW-B" {
+		t.Fatalf("source b.txt = %q after failed capture, want NEW-B retained", got)
+	}
+}
+
+// A synchronous mutation planted after the post-copy witness but before
+// publication must fail closed with the source retained. The staged
+// tree was stable at witness time but is stale at publish time —
+// publishing it and disposing the source would delete the newer live
+// bytes. The final pre-publish re-walk (ordered AFTER the
+// before-publish seam) observes the mutation and aborts before the
+// rename; the stage is cleaned up and nothing is published.
+func TestArchiveQuiescence_BeforePublishMutationFailsClosedRetainingSource(t *testing.T) {
+	archiveRoot := t.TempDir()
+	source := t.TempDir()
+	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
+		if stage == "before-publish-archive" {
+			if err := os.WriteFile(filepath.Join(source, "b.txt"), []byte("NEW-B"), 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa_beforepublish", SessionID: "beforepublish-session",
+		WorkareaRoot: source, SelectedPath: source, Quiesced: true,
+	})
+	if !errors.Is(err, ErrArchiveUnstableSource) {
+		t.Fatalf("before-publish mutation err = %v, want %v", err, ErrArchiveUnstableSource)
+	}
+	if _, statErr := os.Stat(filepath.Join(archiveRoot, "wa_beforepublish")); !os.IsNotExist(statErr) {
+		t.Fatalf("before-publish mutation published an archive: %v", statErr)
+	}
+	if got := sourceTreeFile(t, source, "b.txt"); got != "NEW-B" {
+		t.Fatalf("source b.txt = %q after failed capture, want NEW-B retained", got)
+	}
+}
+
+// A synchronous mutation planted after publication but before the
+// manager's disposal must fail closed AND roll back the just-published
+// archive. The staged tree was stable at publish time, but the live
+// source moved on — leaving the stale archive committed would let a
+// retry accept bytes restore refuses (or dispose the newer live
+// source). The post-publish check removes the published archive and
+// returns the stability sentinel with the source retained, so a later
+// pass captures the newer generation fresh.
+func TestArchiveQuiescence_AfterPublishMutationRollsBackRetainingSource(t *testing.T) {
+	archiveRoot := t.TempDir()
+	source := t.TempDir()
+	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
+		if stage == "after-publish-archive" {
+			if err := os.WriteFile(filepath.Join(source, "b.txt"), []byte("NEW-B"), 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa_afterpublish", SessionID: "afterpublish-session",
+		WorkareaRoot: source, SelectedPath: source, Quiesced: true,
+	})
+	if !errors.Is(err, ErrArchiveUnstableSource) {
+		t.Fatalf("after-publish mutation err = %v, want %v", err, ErrArchiveUnstableSource)
+	}
+	if _, statErr := os.Stat(filepath.Join(archiveRoot, "wa_afterpublish")); !os.IsNotExist(statErr) {
+		t.Fatalf("after-publish mutation left a stale published archive: %v", statErr)
+	}
+	if got := sourceTreeFile(t, source, "b.txt"); got != "NEW-B" {
+		t.Fatalf("source b.txt = %q after rolled-back capture, want NEW-B retained", got)
+	}
+}
+
+// A committed archive whose witness was tampered to disagree with its
+// digest must be refused by idempotent retry — the same rule restore
+// enforces. Accepting it would return a reference that restore
+// rejects, while the manager proceeds to dispose the source: a
+// published-but-unrestorable archive with the only complete copy
+// deleted. The retry fails with corruption, publishes nothing new,
+// and leaves the source alone.
+func TestArchiveQuiescence_TamperedWitnessRetryRefuses(t *testing.T) {
+	archiveRoot := t.TempDir()
+	source := t.TempDir()
+	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot})
+	spec := WorkareaRootArchiveSpec{
+		WorkareaID: "wa_tampered", SessionID: "tampered-session",
+		WorkareaRoot: source, SelectedPath: source, Quiesced: true,
+	}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(archiveRoot, "wa_tampered", "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest archiveManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.CaptureStableGeneration == "" {
+		t.Fatal("committed manifest carries no stability witness to tamper")
+	}
+	manifest.CaptureStableGeneration = "sha256:deadbeef"
+	tampered, _ := json.Marshal(&manifest)
+	if err := os.WriteFile(manifestPath, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = registry.ArchiveRoot(t.Context(), spec)
+	if !errors.Is(err, ErrArchiveCorrupted) {
+		t.Fatalf("retry over tampered-witness archive err = %v, want %v", err, ErrArchiveCorrupted)
+	}
+}
+
+// A cancelled capture must abort promptly with the caller's error —
+// even mid-copy over a large tree — releasing the registry mutex
+// through the deferred unlock so a bounded reaper attempt completes
+// instead of hanging behind an unbounded live-source read. The old
+// code hashed to EOF with no deadline: a continuously growing file
+// could keep the reader from ever reaching EOF, and cancellation
+// could not release the attempt.
+func TestArchiveQuiescence_CancelledContextAbortsPromptly(t *testing.T) {
+	archiveRoot := t.TempDir()
+	source := t.TempDir()
+	stableGenerationFixture(t, source, "generation-one-a", "generation-one-b")
+	big, err := os.OpenFile(filepath.Join(source, "big-stable.bin"), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	for written := 0; written < 32; written++ {
+		if _, err := big.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := big.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := big.Close(); err != nil {
+		t.Fatal(err)
+	}
+	copyReached := make(chan struct{})
+	var copyReachedOnce sync.Once
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
+		if stage == "before-copy-archive-tree" {
+			copyReachedOnce.Do(func() { close(copyReached) })
+			return nil
+		}
+		return nil
+	}})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- registry.ArchiveRoot(ctx, WorkareaRootArchiveSpec{
+			WorkareaID: "wa_cancelled", SessionID: "cancelled-session",
+			WorkareaRoot: source, SelectedPath: source, Quiesced: true,
+		})
+	}()
+	select {
+	case <-copyReached:
+	case <-time.After(15 * time.Second):
+		cancel()
+		t.Fatal("capture did not reach the copy gate")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled capture err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("cancelled capture did not return promptly")
+	}
+	if _, statErr := os.Stat(filepath.Join(archiveRoot, "wa_cancelled")); !os.IsNotExist(statErr) {
+		t.Fatalf("cancelled capture published an archive: %v", statErr)
 	}
 }

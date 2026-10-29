@@ -1287,6 +1287,19 @@ func (m *Manager) acquireTerminalLeaseLocked(ctx context.Context, spec workarea.
 		metadata[key] = value
 	}
 	metadata["strategy"] = strconv.Itoa(int(res.Strategy))
+	// Snapshot the caller-side no-writer gate outcome into the durable
+	// lease: the release may run later, in another process or after a
+	// restart, on a manager that never supervised the terminal
+	// generation. The in-memory session flag alone would not survive
+	// that handoff, leaving every daemon-reaper release unquiesced
+	// even when the embedder proved the ordinary writers gone before
+	// settlement. The lease record is the durable bridge: release
+	// carries quiescence when it was recorded here OR when the lease
+	// says it was (see leaseWriterQuiesced). Absence reads as
+	// unquiesced evidence, never as a refusal.
+	if m.writerQuiesced(spec.SessionID) {
+		metadata["writerQuiesced"] = "true"
+	}
 	if res.AcquisitionID != "" {
 		metadata["acquisitionID"] = res.AcquisitionID
 		metadata["ownerSessionID"] = res.OwnerSessionID
@@ -1366,7 +1379,7 @@ func (m *Manager) CommittedArchiveReference(ctx context.Context, lease workarea.
 	return m.archiveRoot(ctx, ArchiveRootSpec{
 		AcquisitionID: lease.ReleaseMetadata["acquisitionID"], WorkareaID: lease.WorkareaID,
 		SessionID: lease.SessionID, WorkareaRoot: lease.WorkareaPath,
-		SelectedPath: repositoryPath, TerminalResultID: lease.TerminalResultID, Quiesced: m.writerQuiesced(lease.SessionID),
+		SelectedPath: repositoryPath, TerminalResultID: lease.TerminalResultID, Quiesced: m.leaseWriterQuiesced(lease),
 	})
 }
 
@@ -1549,7 +1562,7 @@ func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease worka
 		reference, err := m.archiveRoot(ctx, ArchiveRootSpec{
 			AcquisitionID: res.AcquisitionID, WorkareaID: lease.WorkareaID, SessionID: lease.SessionID,
 			WorkareaRoot: lease.WorkareaPath, SelectedPath: repositoryPath,
-			TerminalResultID: lease.TerminalResultID, Quiesced: m.writerQuiesced(lease.SessionID),
+			TerminalResultID: lease.TerminalResultID, Quiesced: m.leaseWriterQuiesced(lease),
 		})
 		if err != nil {
 			return fmt.Errorf("runtime/worktree: archive whole workarea root: %w", err)
@@ -2453,7 +2466,21 @@ func (m *Manager) RequireWriterQuiescence(sessionID string, quiesced bool) {
 	}
 }
 
-// writerQuiesced reports the caller-side no-writer gate outcome recorded
+// leaseWriterQuiesced reports the caller-side no-writer gate outcome
+// for the lease that owns the root being released. It reads the live
+// session flag recorded via RequireWriterQuiescence, or the durable
+// snapshot taken into the lease's release metadata at acquisition
+// time — so a release driven after a restart, or by a daemon reaper
+// that never supervised the terminal generation, still carries the
+// evidence the embedder proved before settlement. Unknown sessions
+// with no snapshot read as unquiesced evidence, never as a refusal.
+func (m *Manager) leaseWriterQuiesced(lease workarea.TerminalLease) bool {
+	if m.writerQuiesced(lease.SessionID) {
+		return true
+	}
+	return lease.ReleaseMetadata["writerQuiesced"] == "true"
+}
+
 // via RequireWriterQuiescence for the session that owns the leased root.
 // The release path (not the in-memory session table) is authoritative
 // for disposal — a restart that never saw the session still releases
