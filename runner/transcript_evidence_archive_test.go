@@ -1,11 +1,15 @@
 package runner
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -431,5 +435,172 @@ func TestTranscriptEvidence_FailuresKeepWorkareaWithoutLeak(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestTranscriptEvidence_RedactsJSONEscapedSecrets pins B1/B4: secrets with
+// newline, quote, or backslash survive only in JSON-escaped form inside
+// JSONL, so the archive must redact both the raw and escaped bytes.
+func TestTranscriptEvidence_RedactsJSONEscapedSecrets(t *testing.T) {
+	secretNewline := "newline-secret-abc123\nsecond-line-xyz789"
+	secretQuote := `quote-secret-abc123"quoted-part-xyz789`
+	secretBackslash := `backslash-secret-abc123\rest-xyz789`
+	t.Setenv("TRANSCRIPT_EVIDENCE_BACKUP_TOKEN", secretBackslash)
+	marshal := func(v string) string {
+		b, err := json.Marshal(map[string]string{"msg": v})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b) + "\n"
+	}
+	body := marshal(secretNewline) + marshal(secretQuote) + marshal(secretBackslash) + "{\"msg\":\"clean\"}\n"
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, ".agent/transcript.jsonl", body)
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{}
+	res.Status = "failed"
+	res.WorktreePath = clone
+	res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("ESCAPED")}
+	qw.AuthToken = secretNewline
+	qw.Env = map[string]string{"MY_CUSTOM_VAR": secretQuote}
+	if !r.preserveUnpublishedWork(qw, res) {
+		t.Fatalf("preserve = false (warnings %v)", res.PostSessionWarnings)
+	}
+	files := findEvidenceFiles(t, r.rescueDir)
+	if len(files) != 1 {
+		t.Fatalf("evidence files = %v; want one", files)
+	}
+	got := readEvidence(t, files[0])
+	for _, secret := range []string{secretNewline, secretQuote, secretBackslash} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("archive carries raw secret %q:\n%q", secret, got)
+		}
+		for _, form := range transcriptEvidenceEscapedForms(secret) {
+			if form != "" && strings.Contains(got, form) {
+				t.Fatalf("archive carries JSON-escaped secret %q (of %q):\n%q", form, secret, got)
+			}
+		}
+		// Belt-and-braces: the marshal inner form must be gone too.
+		if b, err := json.Marshal(secret); err == nil {
+			inner := string(b[1 : len(b)-1])
+			if strings.Contains(got, inner) {
+				t.Fatalf("archive carries marshalled secret %q:\n%q", inner, got)
+			}
+		}
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("archive missing [REDACTED]:\n%q", got)
+	}
+	if !strings.Contains(got, `"clean"`) {
+		t.Fatalf("archive lost clean line:\n%q", got)
+	}
+}
+
+// TestTranscriptEvidence_ExactFitTailKept pins B3/B7: a complete newest
+// line that exactly fills the cap must be kept, not discarded.
+func TestTranscriptEvidence_ExactFitTailKept(t *testing.T) {
+	newest := strings.Repeat("x", 15) + "\n" // 16 bytes, one complete line
+	content := "old\n" + newest              // window of 16 is exactly newest
+	if got := capTranscriptBytes(content, 16); got != newest {
+		t.Fatalf("capTranscriptBytes exact fit = %q; want %q", got, newest)
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "t.jsonl")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // G304: test-owned transcript file.
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := readTranscriptTailBounded(f, info, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(tail) != newest {
+		t.Fatalf("readTranscriptTailBounded exact fit = %q; want %q", tail, newest)
+	}
+}
+
+// TestTranscriptEvidence_FIFORefusedWithoutHang pins B2/B5: swapping the
+// validated regular file for a FIFO without a writer must not hang
+// finalization; the swap is refused fail-closed.
+func TestTranscriptEvidence_FIFORefusedWithoutHang(t *testing.T) {
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, ".agent/fifo.jsonl", "{\"ok\":true}\n")
+	oldHook := transcriptEvidenceAfterValidate
+	transcriptEvidenceAfterValidate = func(path string) {
+		_ = os.Remove(path)
+		_ = syscall.Mkfifo(path, 0o600)
+	}
+	t.Cleanup(func() { transcriptEvidenceAfterValidate = oldHook })
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{}
+	res.Status = "failed"
+	res.WorktreePath = clone
+	res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/fifo.jsonl"}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("FIFO")}
+	done := make(chan bool, 1)
+	go func() {
+		done <- r.preserveUnpublishedWork(qw, res)
+	}()
+	select {
+	case preserved := <-done:
+		if preserved {
+			t.Fatal("preserve = true for FIFO swap; want false")
+		}
+		if len(res.PostSessionWarnings) == 0 {
+			t.Fatal("no warning recorded for FIFO swap")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("preserveUnpublishedWork hung on FIFO swap; want fail-closed refusal")
+	}
+}
+
+// TestTranscriptEvidence_FailureLogsSanitized pins B6: structured failure
+// logs must not expose the declared path or any embedded secret.
+func TestTranscriptEvidence_FailureLogsSanitized(t *testing.T) {
+	secret := "log-path-secret-sentinel-13579-xyz"
+	declared := ".agent/" + secret + ".jsonl"
+	clone, _, base := cloneForRescue(t)
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	var buf bytes.Buffer
+	r.logger = slog.New(slog.NewTextHandler(&buf, nil))
+	res := &Result{}
+	res.Status = "failed"
+	res.WorktreePath = clone
+	res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: declared}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("LOGLEAK")}
+	qw.AuthToken = secret
+	if r.preserveUnpublishedWork(qw, res) {
+		t.Fatal("preserve = true for missing transcript; want false")
+	}
+	if len(res.PostSessionWarnings) == 0 {
+		t.Fatal("no warning recorded")
+	}
+	for _, w := range res.PostSessionWarnings {
+		if strings.Contains(w, secret) || strings.Contains(w, declared) {
+			t.Fatalf("warning exposes path or secret: %q", w)
+		}
+	}
+	logs := buf.String()
+	if strings.Contains(logs, secret) {
+		t.Fatalf("structured logs carry secret value:\n%s", logs)
+	}
+	if strings.Contains(logs, declared) {
+		t.Fatalf("structured logs carry declared path:\n%s", logs)
 	}
 }

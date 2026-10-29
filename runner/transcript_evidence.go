@@ -1,11 +1,15 @@
 package runner
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/RenseiAI/donmai/internal/diagnostic"
 )
@@ -34,9 +38,20 @@ var transcriptEvidencePerAttemptCapBytes int64 = 256 * 1024
 // final symlink. A variable so tests can prove the fail-closed branches.
 var transcriptEvidenceLstat = os.Lstat
 
-// transcriptEvidenceOpen opens the validated path for reading. A variable
-// so tests can inject an open failure without touching the filesystem.
-var transcriptEvidenceOpen = os.Open
+// transcriptEvidenceOpen opens the validated path for reading without
+// blocking on a FIFO swap. A variable so tests can inject an open failure
+// without touching the filesystem.
+var transcriptEvidenceOpen = openTranscriptEvidenceFile
+
+// openTranscriptEvidenceFile opens path with O_NONBLOCK so a
+// post-validation swap to a FIFO without a writer cannot hang
+// failed-session finalization: the non-blocking open succeeds and the
+// caller's Stat/SameFile checks refuse the non-regular file before any
+// read. Regular-file reads are unaffected by O_NONBLOCK.
+func openTranscriptEvidenceFile(path string) (*os.File, error) {
+	//nolint:gosec // G304: path is the validated declared transcript path.
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+}
 
 // transcriptEvidenceAfterValidate runs between validation (Lstat) and read
 // (Open). Nil in production; tests arm it to swap the file identity and
@@ -91,8 +106,9 @@ func sameTranscriptFile(a, b os.FileInfo) bool {
 // readTranscriptTailBounded keeps the newest complete JSONL tail of an
 // opened transcript under perFileCap bytes: the last perFileCap bytes with
 // the leading partial line dropped and the trailing partial line (when the
-// file does not end in newline) dropped. It returns nil when no complete
-// line fits.
+// file does not end in newline) dropped. When the window already starts at
+// a line boundary (the preceding byte is a newline) the whole window is
+// kept. It returns nil when no complete line fits.
 func readTranscriptTailBounded(f *os.File, finfo os.FileInfo, perFileCap int64) ([]byte, error) {
 	if perFileCap <= 0 {
 		return nil, fmt.Errorf("invalid per-file cap %d", perFileCap)
@@ -112,7 +128,20 @@ func readTranscriptTailBounded(f *os.File, finfo os.FileInfo, perFileCap int64) 
 		}
 		raw = buf
 	} else {
-		if _, err := f.Seek(size-perFileCap, io.SeekStart); err != nil {
+		offset := size - perFileCap
+		// A window that starts at a line boundary is already complete:
+		// only drop a leading partial line. The byte before the window
+		// decides; offset > 0 here because size > perFileCap.
+		atBoundary := false
+		if _, err := f.Seek(offset-1, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("seek transcript tail boundary: %w", err)
+		}
+		prev := make([]byte, 1)
+		if _, err := io.ReadFull(f, prev); err != nil {
+			return nil, fmt.Errorf("read transcript tail boundary: %w", err)
+		}
+		atBoundary = prev[0] == '\n'
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("seek transcript tail: %w", err)
 		}
 		buf := make([]byte, perFileCap)
@@ -120,11 +149,13 @@ func readTranscriptTailBounded(f *os.File, finfo os.FileInfo, perFileCap int64) 
 			return nil, fmt.Errorf("read transcript tail: %w", err)
 		}
 		raw = buf
-		// Drop the leading partial line: keep from after the first newline.
-		if idx := strings.IndexByte(string(raw), '\n'); idx >= 0 {
-			raw = raw[idx+1:]
-		} else {
-			return nil, nil
+		if !atBoundary {
+			// Drop the leading partial line: keep from after the first newline.
+			if idx := strings.IndexByte(string(raw), '\n'); idx >= 0 {
+				raw = raw[idx+1:]
+			} else {
+				return nil, nil
+			}
 		}
 	}
 	if len(raw) == 0 {
@@ -147,7 +178,11 @@ func readTranscriptTailBounded(f *os.File, finfo os.FileInfo, perFileCap int64) 
 }
 
 // redactTranscriptEvidence redacts one tail with both rails: the shared
-// output rail and every session secret value.
+// output rail and every session secret value, including the value's
+// JSON-escaped form. A secret containing a newline, quote, or backslash is
+// stored escaped inside JSONL (for example a newline becomes backslash-n),
+// so replacing only the raw value would leave the escaped bytes
+// recoverably in the archive.
 func redactTranscriptEvidence(tail string, values []string) string {
 	redacted := diagnostic.Redact(tail)
 	for _, v := range values {
@@ -155,19 +190,87 @@ func redactTranscriptEvidence(tail string, values []string) string {
 			continue
 		}
 		redacted = strings.ReplaceAll(redacted, v, "[REDACTED]")
+		for _, form := range transcriptEvidenceEscapedForms(v) {
+			if form == "" || form == v {
+				continue
+			}
+			redacted = strings.ReplaceAll(redacted, form, "[REDACTED]")
+		}
 	}
 	return redacted
 }
 
+// transcriptEvidenceEscapedForms returns the JSON string-body encodings of
+// v (without surrounding quotes) for the two common encoder flavours:
+// with HTML escaping (encoding/json default) and without. Either flavour
+// may appear in transcript JSONL depending on the writer.
+func transcriptEvidenceEscapedForms(v string) []string {
+	var out []string
+	if b, err := json.Marshal(v); err == nil && len(b) >= 2 {
+		if inner := string(b[1 : len(b)-1]); inner != v {
+			out = append(out, inner)
+		}
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err == nil {
+		s := strings.TrimSuffix(buf.String(), "\n")
+		if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+			if inner := s[1 : len(s)-1]; inner != v {
+				dup := false
+				for _, have := range out {
+					if have == inner {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					out = append(out, inner)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// transcriptEvidenceSafeErr renders err for structured logs without
+// exposing the declared transcript path or any embedded secret. PathError
+// paths are the resolved declared path (which may embed a session
+// credential in its filename); only the operation and the underlying
+// reason are kept, redacted through both rails.
+func transcriptEvidenceSafeErr(err error, values []string) string {
+	if err == nil {
+		return ""
+	}
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		msg := pe.Op
+		if pe.Err != nil {
+			msg += ": " + pe.Err.Error()
+		}
+		return redactTranscriptEvidence(msg, values)
+	}
+	return redactTranscriptEvidence(err.Error(), values)
+}
+
 // capTranscriptBytes keeps the newest complete lines of s under capBytes.
 // s must end in newline; the result does too, or is empty when no complete
-// line fits.
+// line fits. When the window already starts at a line boundary the whole
+// window is kept; otherwise the leading partial line is dropped.
 func capTranscriptBytes(s string, capBytes int64) string {
 	if capBytes < 0 {
 		return ""
 	}
+	if capBytes == 0 {
+		return ""
+	}
 	if int64(len(s)) <= capBytes {
 		return s
+	}
+	// len(s) > capBytes, so the index before the window exists.
+	if s[len(s)-int(capBytes)-1] == '\n' {
+		return s[len(s)-int(capBytes):]
 	}
 	tail := s[len(s)-int(capBytes):]
 	if idx := strings.IndexByte(tail, '\n'); idx >= 0 {
@@ -277,13 +380,13 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 	for i, desc := range res.terminalTranscripts {
 		resolved, err := resolveTranscriptEvidencePath(desc.Path, res)
 		if err != nil {
-			r.logger.Warn("transcript evidence validation failed; keeping workarea", "sessionId", qw.SessionID, "err", err)
+			r.logger.Warn("transcript evidence validation failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
 		linfo, err := transcriptEvidenceLstat(resolved)
 		if err != nil {
-			r.logger.Warn("transcript evidence validation failed; keeping workarea", "sessionId", qw.SessionID, "err", err)
+			r.logger.Warn("transcript evidence validation failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
@@ -298,7 +401,7 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 		//nolint:gosec // G304: resolved is the validated declared transcript path.
 		f, err := transcriptEvidenceOpen(resolved)
 		if err != nil {
-			r.logger.Warn("transcript evidence read failed; keeping workarea", "sessionId", qw.SessionID, "err", err)
+			r.logger.Warn("transcript evidence read failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
@@ -317,7 +420,7 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 		}()
 		_ = f.Close()
 		if readErr != nil {
-			r.logger.Warn("transcript evidence read failed; keeping workarea", "sessionId", qw.SessionID, "err", readErr)
+			r.logger.Warn("transcript evidence read failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(readErr, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
@@ -334,18 +437,18 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 		}
 		dir, err := dirFor()
 		if err != nil {
-			r.logger.Warn("transcript evidence write failed; keeping workarea", "sessionId", qw.SessionID, "err", err)
+			r.logger.Warn("transcript evidence write failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
 		name := transcriptEvidenceName(i)
 		if err := transcriptEvidenceWriteAtomic(dir, name, []byte(redacted)); err != nil {
-			r.logger.Warn("transcript evidence write failed; keeping workarea", "sessionId", qw.SessionID, "err", err)
+			r.logger.Warn("transcript evidence write failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
 		if err := transcriptEvidenceReadback(filepath.Join(dir, name), []byte(redacted)); err != nil {
-			r.logger.Warn("transcript evidence readback failed; keeping workarea", "sessionId", qw.SessionID, "err", err)
+			r.logger.Warn("transcript evidence readback failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
