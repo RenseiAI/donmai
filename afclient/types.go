@@ -844,8 +844,19 @@ const (
 )
 
 // TruncateHeadlessFailureTail applies line then byte bounds to a redacted
-// tail, rune-safe. Empty stays empty.
+// tail, rune-safe. Empty stays empty. Invalid UTF-8 is sanitized first so
+// the Go-string bound is also the JSON-decoded wire bound: encoding/json
+// replaces each invalid byte with U+FFFD on marshal, which would otherwise
+// expand a 4096-byte invalid tail to 12288 bytes for the recipient.
 func TruncateHeadlessFailureTail(s string) string {
+	if s == "" {
+		return ""
+	}
+	// Sanitize before measuring: raw subprocess diagnostics can carry
+	// invalid UTF-8, and the JSON transport replaces each invalid byte
+	// with U+FFFD on decode. Bounding the raw bytes first would still
+	// deliver an expanded tail past the byte limit.
+	s = strings.ToValidUTF8(s, string(utf8.RuneError))
 	if s == "" {
 		return ""
 	}

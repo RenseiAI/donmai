@@ -2295,6 +2295,13 @@ tailRecovery:
 			if raw == "" && streamRes.providerError != "" {
 				raw = streamRes.providerError
 			}
+			// A canonical failed ResultEvent can carry its only diagnostic
+			// in Errors, without an ErrorEvent or a provider-error
+			// SystemEvent. Without this the terminal status omits
+			// outputTail despite an available diagnostic.
+			if raw == "" && streamRes.terminalEvent != nil && len(streamRes.terminalEvent.Errors) > 0 {
+				raw = strings.Join(streamRes.terminalEvent.Errors, "\n")
+			}
 			if raw == "" && streamRes.lastAssistantText != "" {
 				raw = streamRes.lastAssistantText
 			}

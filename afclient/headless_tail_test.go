@@ -1,6 +1,7 @@
 package afclient
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -61,5 +62,37 @@ func TestTruncateHeadlessFailureTail_MultibyteRuneSafe(t *testing.T) {
 	}
 	if tail != strings.Repeat("あ", len(tail)/3) {
 		t.Fatalf("multibyte tail is not a whole-rune suffix of the input")
+	}
+}
+
+// TestTruncateHeadlessFailureTail_InvalidUTF8StaysWireBound pins the
+// transport boundary: raw subprocess diagnostics can carry invalid UTF-8,
+// and encoding/json expands each invalid byte to U+FFFD on decode. The
+// helper sanitizes before measuring so the decoded wire tail stays within
+// the 4096-byte bound. Without the sanitize-first step the Go string
+// measures 4096 bytes but decodes to 12288.
+func TestTruncateHeadlessFailureTail_InvalidUTF8StaysWireBound(t *testing.T) {
+	t.Parallel()
+	raw := strings.Repeat("\xff", 5000)
+	tail := TruncateHeadlessFailureTail(raw)
+	if !utf8.ValidString(tail) {
+		t.Fatalf("malformed tail is not valid UTF-8 after truncation")
+	}
+	if len(tail) > 4096 {
+		t.Fatalf("malformed tail is %d bytes; want at most 4096", len(tail))
+	}
+	payload, err := json.Marshal(tail)
+	if err != nil {
+		t.Fatalf("marshal tail: %v", err)
+	}
+	var decoded string
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal tail: %v", err)
+	}
+	if len(decoded) > 4096 {
+		t.Fatalf("decoded tail is %d bytes; want at most 4096", len(decoded))
+	}
+	if !utf8.ValidString(decoded) {
+		t.Fatalf("decoded tail is not valid UTF-8")
 	}
 }

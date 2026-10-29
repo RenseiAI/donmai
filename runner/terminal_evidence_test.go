@@ -630,3 +630,186 @@ func TestTerminalEvidence_ProviderErrorOnlyFillsTailWhenErrorEmpty(t *testing.T)
 		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
 	}
 }
+
+// resultErrorsOnlyHandle emits a canonical failed ResultEvent whose only
+// diagnostic is Errors: no assistant text, no ErrorEvent, no provider-error
+// SystemEvent. The run-loop finalise block must fill the diagnostic tail
+// from the terminal Errors. Removing that fallback leaves OutputTail empty
+// and fails this test.
+type resultErrorsOnlyHandle struct {
+	events chan agent.Event
+}
+
+func (h *resultErrorsOnlyHandle) SessionID() string { return "evidence-result-errors" }
+
+func (h *resultErrorsOnlyHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *resultErrorsOnlyHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *resultErrorsOnlyHandle) Stop(context.Context) error { return nil }
+
+func TestTerminalEvidence_FailedResultErrorsFillTail(t *testing.T) {
+	t.Parallel()
+	const diagnostic = "terminal diagnostic from result errors: clone handshake refused"
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "evidence-result-errors"}
+	ch <- agent.ResultEvent{Success: false, Errors: []string{diagnostic}}
+	close(ch)
+	base := stubBaseForEvidence(t, nil)
+	provider := &evidenceProvider{HarnessProvider: base, spawnHandle: &resultErrorsOnlyHandle{events: ch}}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-RESULT-ERRORS")
+	qw.WorkType = "qa"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("res is nil; want failed envelope")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail from the failed terminal Errors")
+	}
+	if !strings.Contains(res.OutputTail, diagnostic) {
+		t.Fatalf("OutputTail=%q; want terminal Errors diagnostic %q", res.OutputTail, diagnostic)
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+	if res.FailurePhase == "" || res.FailureDecidedBy == "" {
+		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
+	}
+}
+
+// assistantOnlyHandle emits a failed terminal with assistant text and no
+// envelope error or provider-error observation. The run-loop finalise
+// block must fill the diagnostic tail from the assistant text. Disabling
+// that fallback leaves OutputTail empty and fails this test.
+type assistantOnlyHandle struct {
+	events chan agent.Event
+}
+
+func (h *assistantOnlyHandle) SessionID() string { return "evidence-assistant-only" }
+
+func (h *assistantOnlyHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *assistantOnlyHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *assistantOnlyHandle) Stop(context.Context) error { return nil }
+
+func TestTerminalEvidence_AssistantOnlyFillsTailWhenErrorEmpty(t *testing.T) {
+	t.Parallel()
+	const assistantText = "assistant diagnostic tail: model stopped without a verdict"
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "evidence-assistant-only"}
+	ch <- agent.AssistantTextEvent{Text: assistantText}
+	ch <- agent.ResultEvent{Success: false}
+	close(ch)
+	base := stubBaseForEvidence(t, nil)
+	provider := &evidenceProvider{HarnessProvider: base, spawnHandle: &assistantOnlyHandle{events: ch}}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-ASSISTANT-ONLY")
+	qw.WorkType = "qa"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("res is nil; want failed envelope")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if res.Error != "" {
+		t.Fatalf("Error=%q; want empty so the assistant-text fallback owns the tail", res.Error)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail from the assistant text when Error is empty")
+	}
+	if !strings.Contains(res.OutputTail, assistantText) {
+		t.Fatalf("OutputTail=%q; want assistant text %q", res.OutputTail, assistantText)
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+}
+
+// TestTerminalEvidence_MalformedSpawnTailWireBound proves the byte bound
+// holds at the transport boundary: a spawn failure carrying invalid UTF-8
+// must decode within 4096 bytes after a JSON round-trip. Without the
+// sanitize-first step the Go string measures 4096 bytes but decodes to
+// 12288.
+func TestTerminalEvidence_MalformedSpawnTailWireBound(t *testing.T) {
+	t.Parallel()
+	malformed := strings.Repeat("\xff", 5000)
+	base := stubBaseForEvidence(t, nil)
+	provider := &spawnFailEvidenceProvider{HarnessProvider: base, spawnErr: errors.New("handshake failed: " + malformed)}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-MALFORMED-SPAWN")
+	qw.WorkType = "research"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err == nil || res == nil {
+		t.Fatalf("err=%v res=%+v; want spawn failure", err, res)
+	}
+	if res.Status != "failed" || res.FailureMode != FailureSpawn {
+		t.Fatalf("Status=%q Mode=%q; want failed/spawn-failed", res.Status, res.FailureMode)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail on malformed spawn failure")
+	}
+	if len(res.OutputTail) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("tail is %d bytes; want at most %d", len(res.OutputTail), afclient.MaxHeadlessFailureTailBytes)
+	}
+	payload, err := json.Marshal(res.OutputTail)
+	if err != nil {
+		t.Fatalf("marshal tail: %v", err)
+	}
+	var decoded string
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal tail: %v", err)
+	}
+	if len(decoded) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("decoded tail is %d bytes; want at most %d", len(decoded), afclient.MaxHeadlessFailureTailBytes)
+	}
+	// The same bound holds on the posted terminal body the recipient
+	// decodes.
+	body, err := h.runner.poster.PrepareTerminalStatusBody(context.Background(), "evidence-malformed-spawn", res.Result, nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal terminal body: %v", err)
+	}
+	wireTail, _ := wire["outputTail"].(string)
+	if wireTail == "" {
+		t.Fatal("terminal body lacks outputTail")
+	}
+	if len(wireTail) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("wire outputTail is %d bytes; want at most %d", len(wireTail), afclient.MaxHeadlessFailureTailBytes)
+	}
+}
