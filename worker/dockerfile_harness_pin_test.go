@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// workerImageDockerfiles are the two image definitions that install the
-// provider CLIs: the container worker image and the e2b sandbox template.
+// workerImageDockerfiles are the image definitions that install the
+// provider CLIs: the container worker image and the e2b sandbox templates.
 // Paths are relative to this package directory.
 var workerImageDockerfiles = []struct {
 	name string
@@ -16,6 +16,7 @@ var workerImageDockerfiles = []struct {
 }{
 	{name: "worker/Dockerfile", path: "Dockerfile"},
 	{name: "worker/e2b/e2b.Dockerfile", path: "e2b/e2b.Dockerfile"},
+	{name: "worker/e2b/e2b.go.Dockerfile", path: "e2b/e2b.go.Dockerfile"},
 }
 
 // realCodexFixturePackage is the npm manifest CI installs for the real Codex
@@ -46,7 +47,7 @@ func dockerfilePin(t *testing.T, name, path string, re *regexp.Regexp) string {
 }
 
 // TestHarnessCLIPins_MatchAcrossWorkerImages guards the Claude Code and Codex
-// npm pins in worker/Dockerfile and worker/e2b/e2b.Dockerfile against
+// npm pins in worker/Dockerfile and the e2b Dockerfiles against
 // drifting apart. A bump that lands in only one image leaves the other
 // substrate running a CLI the model API may already reject.
 func TestHarnessCLIPins_MatchAcrossWorkerImages(t *testing.T) {

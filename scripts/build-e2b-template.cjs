@@ -14,6 +14,49 @@ function parseAdditionalTags(value) {
     .filter(Boolean)
 }
 
+function parseCpuCount(value) {
+  if (value === undefined || value === null || value === '') {
+    return undefined
+  }
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `E2B_CPU_COUNT must be a positive integer, got ${JSON.stringify(value)}`
+    )
+  }
+  return parsed
+}
+
+function parseMemoryMB(value) {
+  if (value === undefined || value === null || value === '') {
+    return undefined
+  }
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `E2B_MEMORY_MB must be a positive integer, got ${JSON.stringify(value)}`
+    )
+  }
+  return parsed
+}
+
+function parseDockerfileName(value) {
+  if (!value) {
+    return 'e2b.Dockerfile'
+  }
+  if (
+    value.includes('/') ||
+    value.includes('\\') ||
+    value.includes('..') ||
+    !value.endsWith('.Dockerfile')
+  ) {
+    throw new Error(
+      `E2B_DOCKERFILE must be a Dockerfile basename, got ${JSON.stringify(value)}`
+    )
+  }
+  return value
+}
+
 async function buildTemplate({
   sdk,
   dockerfile,
@@ -21,17 +64,27 @@ async function buildTemplate({
   templateRef,
   additionalTags,
   apiKey,
+  cpuCount,
+  memoryMB,
 }) {
   const { Template, defaultBuildLogger } = sdk
   const template = Template({ fileContextPath })
     .fromDockerfile(dockerfile)
     .setStartCmd('sleep infinity', 'true')
 
-  return Template.build(template, templateRef, {
+  const options = {
     apiKey,
     tags: additionalTags,
     onBuildLogs: defaultBuildLogger(),
-  })
+  }
+  if (cpuCount !== undefined) {
+    options.cpuCount = cpuCount
+  }
+  if (memoryMB !== undefined) {
+    options.memoryMB = memoryMB
+  }
+
+  return Template.build(template, templateRef, options)
 }
 
 async function main() {
@@ -41,8 +94,11 @@ async function main() {
   const additionalTags = parseAdditionalTags(
     process.env.E2B_ADDITIONAL_TAGS
   )
+  const dockerfileName = parseDockerfileName(process.env.E2B_DOCKERFILE)
+  const cpuCount = parseCpuCount(process.env.E2B_CPU_COUNT)
+  const memoryMB = parseMemoryMB(process.env.E2B_MEMORY_MB)
   const fileContextPath = process.cwd()
-  const dockerfilePath = path.join(fileContextPath, 'e2b.Dockerfile')
+  const dockerfilePath = path.join(fileContextPath, dockerfileName)
 
   if (!templateRef) {
     throw new Error('E2B_TEMPLATE_REF is required')
@@ -63,6 +119,8 @@ async function main() {
     templateRef,
     additionalTags,
     apiKey,
+    cpuCount,
+    memoryMB,
   })
 
   fs.appendFileSync(
@@ -85,7 +143,7 @@ async function main() {
   }
 }
 
-module.exports = { buildTemplate, parseAdditionalTags }
+module.exports = { buildTemplate, parseAdditionalTags, parseCpuCount, parseDockerfileName, parseMemoryMB }
 
 if (require.main === module) {
   main().catch((error) => {

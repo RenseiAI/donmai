@@ -7,11 +7,20 @@ const os = require('node:os')
 const path = require('node:path')
 
 const {
+  assertGofumptVersionOutput,
+  assertGolangciLintVersionOutput,
+  assertGoVersionOutput,
   assertPiVersionOutput,
   assertVersionOutput,
+  isGoTemplateRef,
+  parseGofumptVersion,
+  parseGolangciLintVersion,
+  parseGoVersion,
   parsePinnedPiVersion,
+  readGoVersion,
   readPinnedPiVersion,
   runMain,
+  shouldExpectGoTools,
   verifyTemplateVersion,
 } = require('./verify-e2b-template.cjs')
 
@@ -281,4 +290,187 @@ test('runMain succeeds when both donmai and pi report their pinned versions', as
   assert.equal(code, 0)
   assert.deepEqual(calls, expectedCalls())
   assert.deepEqual(output, [])
+})
+
+test('parseGoVersion extracts the go directive', () => {
+  assert.equal(parseGoVersion('module example.com/x\n\ngo 1.26.10\n'), '1.26.10')
+})
+
+test('parseGoVersion rejects a go.mod with no go directive', () => {
+  assert.throws(() => parseGoVersion('module example.com/x\n'), /go directive/)
+})
+
+test('parseGolangciLintVersion extracts the go install pin', () => {
+  const source = [
+    'RUN go version \\',
+    '    && GOBIN=/usr/local/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4 \\',
+    '    && GOBIN=/usr/local/bin go install mvdan.cc/gofumpt@v0.12.0',
+  ].join('\n')
+  assert.equal(parseGolangciLintVersion(source), '2.11.4')
+})
+
+test('parseGofumptVersion extracts the go install pin', () => {
+  const source = 'RUN GOBIN=/usr/local/bin go install mvdan.cc/gofumpt@v0.12.0\n'
+  assert.equal(parseGofumptVersion(source), '0.12.0')
+})
+
+test('readGoVersion reads the floor from go.mod under a repo root', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-go-version-'))
+  fs.writeFileSync(path.join(repoRoot, 'go.mod'), 'module example.com/x\n\ngo 1.26.10\n')
+  try {
+    assert.equal(readGoVersion(repoRoot), '1.26.10')
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true })
+  }
+})
+
+test('assertGoVersionOutput accepts the pinned toolchain', () => {
+  assert.doesNotThrow(() =>
+    assertGoVersionOutput({ exitCode: 0, stdout: 'go version go1.26.10 linux/amd64\n' }, '1.26.10')
+  )
+})
+
+test('assertGoVersionOutput rejects a wrong toolchain', () => {
+  assert.throws(
+    () => assertGoVersionOutput({ exitCode: 0, stdout: 'go version go1.25.0 linux/amd64\n' }, '1.26.10'),
+    /want substring "go1\.26\.10"/
+  )
+})
+
+test('assertGolangciLintVersionOutput accepts the pinned version', () => {
+  assert.doesNotThrow(() =>
+    assertGolangciLintVersionOutput(
+      { exitCode: 0, stdout: 'golangci-lint has version 2.11.4 built with go1.27.3\n' },
+      '2.11.4'
+    )
+  )
+})
+
+test('assertGofumptVersionOutput accepts the pinned version', () => {
+  assert.doesNotThrow(() =>
+    assertGofumptVersionOutput({ exitCode: 0, stdout: 'v0.12.0 (go1.27.3)\n' }, '0.12.0')
+  )
+})
+
+test('isGoTemplateRef matches only the Go worker template', () => {
+  assert.equal(isGoTemplateRef('donmai-worker-go:v1.2.3'), true)
+  assert.equal(isGoTemplateRef('donmai-worker:v1.2.3'), false)
+  assert.equal(isGoTemplateRef(''), false)
+})
+
+test('shouldExpectGoTools follows the template name or the explicit flag', () => {
+  assert.equal(shouldExpectGoTools({ templateRef: 'donmai-worker-go:v1.2.3' }), true)
+  assert.equal(shouldExpectGoTools({ templateRef: 'donmai-worker:v1.2.3' }), false)
+  assert.equal(
+    shouldExpectGoTools({ templateRef: 'donmai-worker:v1.2.3', expectGoTools: '1' }),
+    true
+  )
+})
+
+function makeGoSandbox() {
+  const calls = []
+  const outputs = {
+    'donmai --version': { exitCode: 0, stdout: 'donmai version v0.68.5\n' },
+    'pi --version': { exitCode: 0, stdout: 'pi 0.80.10\n' },
+    'go version': { exitCode: 0, stdout: 'go version go1.26.10 linux/amd64\n' },
+    'golangci-lint --version': {
+      exitCode: 0,
+      stdout: 'golangci-lint has version 2.11.4 built with go1.27.3\n',
+    },
+    'gofumpt --version': { exitCode: 0, stdout: 'v0.12.0 (go1.27.3)\n' },
+  }
+  const Sandbox = {
+    async create(templateRef, options) {
+      calls.push(['create', templateRef, options])
+      return {
+        commands: {
+          async run(command) {
+            calls.push(['run', command])
+            if (outputs[command]) {
+              return outputs[command]
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {
+          calls.push(['kill'])
+        },
+      }
+    },
+  }
+  return { Sandbox, calls }
+}
+
+test('verifyTemplateVersion checks the Go toolchain inside the Go template', async () => {
+  const { Sandbox, calls } = makeGoSandbox()
+
+  await verifyTemplateVersion({
+    Sandbox,
+    templateRef: 'donmai-worker-go:v0.68.5',
+    expectedVersion: 'v0.68.5',
+    expectedPiVersion: '0.80.10',
+    apiKey: 'test-key',
+    expectedGoVersion: '1.26.10',
+    expectedGolangciLintVersion: '2.11.4',
+    expectedGofumptVersion: '0.12.0',
+  })
+
+  assert.deepEqual(calls, [
+    ['create', 'donmai-worker-go:v0.68.5', { apiKey: 'test-key', timeoutMs: 60_000 }],
+    ['run', 'donmai --version'],
+    ['run', 'pi --version'],
+    ['run', 'go version'],
+    ['run', 'golangci-lint --version'],
+    ['run', 'gofumpt --version'],
+    ['kill'],
+  ])
+})
+
+test('verifyTemplateVersion rejects a Go toolchain mismatch after cleanup', async () => {
+  const { Sandbox, calls } = makeGoSandbox()
+  // Make `go version` report the wrong floor by wrapping the sandbox.
+  const originalCreate = Sandbox.create
+  Sandbox.create = async (templateRef, options) => {
+    const sandbox = await originalCreate(templateRef, options)
+    const originalRun = sandbox.commands.run
+    sandbox.commands.run = async (command) => {
+      if (command === 'go version') {
+        return { exitCode: 0, stdout: 'go version go1.25.0 linux/amd64\n' }
+      }
+      return originalRun(command)
+    }
+    return sandbox
+  }
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-go:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedGoVersion: '1.26.10',
+        expectedGolangciLintVersion: '2.11.4',
+        expectedGofumptVersion: '0.12.0',
+      }),
+    /want substring "go1\.26\.10"/
+  )
+  assert.ok(calls.includes('kill') || calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion refuses incomplete Go toolchain expectations', async () => {
+  const { Sandbox } = makeGoSandbox()
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-go:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedGoVersion: '1.26.10',
+      }),
+    /incomplete/
+  )
 })

@@ -1,14 +1,19 @@
 name: e2b-template
 
-# Builds the `donmai-worker` E2B sandbox template in CI.
+# Builds the `donmai-worker` and `donmai-worker-go` E2B sandbox templates in CI.
 #
 # The Dockerfile build authenticates non-interactively with E2B_API_KEY (the
 # org/team API key from https://e2b.dev/dashboard?tab=keys).
 #
-# Every release writes the verified semantic version to an explicit E2B target
-# such as `donmai-worker:v0.53.0`. Automatic stable tag pushes also assign
-# `default` to the same build, preserving the rolling target. Prereleases and
-# manual retries rebuild only the version target, so neither can move `default`.
+# Every release writes the verified semantic version to explicit E2B targets
+# such as `donmai-worker:v0.53.0` and `donmai-worker-go:v0.53.0`. Automatic
+# stable tag pushes also assign `default` to the same builds, preserving the
+# rolling targets. Prereleases and manual retries rebuild only the versioned
+# targets, so neither can move `default`.
+#
+# `donmai-worker` keeps E2B's default build resources and has no Go toolchain.
+# `donmai-worker-go` layers the pinned Go toolchain, golangci-lint and gofumpt
+# on the same base and builds at 4 vCPU / 8 GiB for `go test -race ./...`.
 #
 # @e2b/cli 2.13.3 help confirms `template create` accepts only an untagged name
 # constrained to lowercase letters, numbers, dashes, and underscores. E2B's
@@ -71,6 +76,7 @@ jobs:
         run: |
           install -m 0755 scripts/verify-release-tag.sh "${RUNNER_TEMP}/verify-release-tag.sh"
           install -m 0644 scripts/build-e2b-template.cjs "${RUNNER_TEMP}/build-e2b-template.cjs"
+          install -m 0644 scripts/build-e2b-template.test.cjs "${RUNNER_TEMP}/build-e2b-template.test.cjs"
           install -m 0755 scripts/verify-e2b-template.cjs "${RUNNER_TEMP}/verify-e2b-template.cjs"
           install -m 0644 scripts/verify-e2b-template.test.cjs "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
 
@@ -92,7 +98,7 @@ jobs:
             "${GITHUB_OUTPUT}" \
             "${GITHUB_ENV}"
           if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
-            echo "::notice::Manual retry rebuilds only donmai-worker:${RELEASE_TAG}; default is unchanged."
+            echo "::notice::Manual retry rebuilds only donmai-worker:${RELEASE_TAG} and donmai-worker-go:${RELEASE_TAG}; default is unchanged."
           fi
 
       - name: Guard - require E2B_API_KEY secret
@@ -121,7 +127,9 @@ jobs:
           printf 'NODE_PATH=%s\n' "$(npm root --global)" >> "${GITHUB_ENV}"
 
       - name: Test E2B version assertion
-        run: node --test "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
+        run: |
+          node --test "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
+          node --test "${RUNNER_TEMP}/build-e2b-template.test.cjs"
 
       - name: Cross-compile donmai binary (linux/amd64)
         env:
@@ -145,10 +153,29 @@ jobs:
           E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
         run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
 
+      - name: Build versioned E2B Go template
+        id: template-go
+        working-directory: worker/e2b
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_TEMPLATE_REF: donmai-worker-go:${{ steps.release.outputs.tag }}
+          E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
+          E2B_DOCKERFILE: e2b.go.Dockerfile
+          E2B_CPU_COUNT: 4
+          E2B_MEMORY_MB: 8192
+        run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
+
       - name: Assert published E2B template binary version
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
           E2B_TEMPLATE_REF: ${{ steps.template.outputs.template_ref }}
+          DONMAI_VERSION: ${{ steps.release.outputs.tag }}
+        run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
+
+      - name: Assert published E2B Go template toolchain
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_TEMPLATE_REF: ${{ steps.template-go.outputs.template_ref }}
           DONMAI_VERSION: ${{ steps.release.outputs.tag }}
         run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
 
@@ -157,10 +184,16 @@ jobs:
           TEMPLATE_REF: ${{ steps.template.outputs.template_ref }}
           TEMPLATE_ID: ${{ steps.template.outputs.template_id }}
           BUILD_ID: ${{ steps.template.outputs.build_id }}
+          GO_TEMPLATE_REF: ${{ steps.template-go.outputs.template_ref }}
+          GO_TEMPLATE_ID: ${{ steps.template-go.outputs.template_id }}
+          GO_BUILD_ID: ${{ steps.template-go.outputs.build_id }}
         run: |
           {
             printf '## E2B template release\n\n'
             printf -- "- Target: \`%s\`\n" "${TEMPLATE_REF}"
             printf -- "- Template ID: \`%s\`\n" "${TEMPLATE_ID}"
             printf -- "- Build ID: \`%s\`\n" "${BUILD_ID}"
+            printf -- "- Go target: \`%s\`\n" "${GO_TEMPLATE_REF}"
+            printf -- "- Go template ID: \`%s\`\n" "${GO_TEMPLATE_ID}"
+            printf -- "- Go build ID: \`%s\`\n" "${GO_BUILD_ID}"
           } >> "${GITHUB_STEP_SUMMARY}"

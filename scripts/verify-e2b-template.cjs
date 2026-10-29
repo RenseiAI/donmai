@@ -66,7 +66,130 @@ function readPinnedPiVersion(repoRoot) {
   return parsePinnedPiVersion(fs.readFileSync(probePath, 'utf8'))
 }
 
-async function verifyTemplateVersion({ Sandbox, templateRef, expectedVersion, expectedPiVersion, apiKey }) {
+const GO_VERSION_RE = /^\s*go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)/m
+const GOLANGCI_LINT_PIN_RE =
+  /go\s+install\s+github\.com\/golangci\/golangci-lint\/v2\/cmd\/golangci-lint@v([0-9]+\.[0-9]+\.[0-9]+)/
+const GOFUMPT_PIN_RE = /go\s+install\s+mvdan\.cc\/gofumpt@v([0-9]+\.[0-9]+\.[0-9]+)/
+
+function parseGoVersion(goModSource) {
+  const match = goModSource.match(GO_VERSION_RE)
+  if (!match) {
+    throw new Error('could not find go directive in go.mod')
+  }
+  return match[1]
+}
+
+function readGoVersion(repoRoot) {
+  return parseGoVersion(fs.readFileSync(path.join(repoRoot, 'go.mod'), 'utf8'))
+}
+
+function parseGolangciLintVersion(dockerfileSource) {
+  const match = dockerfileSource.match(GOLANGCI_LINT_PIN_RE)
+  if (!match) {
+    throw new Error('could not find golangci-lint pin in the Go Dockerfile')
+  }
+  return match[1]
+}
+
+function parseGofumptVersion(dockerfileSource) {
+  const match = dockerfileSource.match(GOFUMPT_PIN_RE)
+  if (!match) {
+    throw new Error('could not find gofumpt pin in the Go Dockerfile')
+  }
+  return match[1]
+}
+
+function readGoDockerfileSource(repoRoot) {
+  const candidates = [
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
+    path.join(repoRoot, 'e2b.go.Dockerfile'),
+  ]
+  for (const candidate of candidates) {
+    try {
+      return fs.readFileSync(candidate, 'utf8')
+    } catch {
+      // try the next candidate
+    }
+  }
+  throw new Error(
+    'could not find e2b.go.Dockerfile under ' + JSON.stringify(repoRoot)
+  )
+}
+
+function isGoTemplateRef(templateRef) {
+  return typeof templateRef === 'string' && templateRef.includes('donmai-worker-go')
+}
+
+function shouldExpectGoTools({ templateRef, expectGoTools }) {
+  if (expectGoTools === '1' || expectGoTools === 'true') {
+    return true
+  }
+  return isGoTemplateRef(templateRef)
+}
+
+function assertGoVersionOutput(result, expectedGoVersion) {
+  if (!expectedGoVersion) {
+    throw new Error('the expected Go version is required')
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `go version exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+  const raw = String(result.stdout || '').trim()
+  if (!raw.includes(`go${expectedGoVersion}`)) {
+    throw new Error(
+      `go version = ${JSON.stringify(raw)}, want substring ${JSON.stringify(`go${expectedGoVersion}`)}`
+    )
+  }
+}
+
+function assertGolangciLintVersionOutput(result, expectedVersion) {
+  if (!expectedVersion) {
+    throw new Error('the expected golangci-lint version is required')
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `golangci-lint --version exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+  const raw = `${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim()
+  const want = String(expectedVersion).replace(/^v/, '')
+  if (!raw.includes(want)) {
+    throw new Error(
+      `golangci-lint --version = ${JSON.stringify(raw.trim())}, want substring ${JSON.stringify(want)}`
+    )
+  }
+}
+
+function assertGofumptVersionOutput(result, expectedVersion) {
+  if (!expectedVersion) {
+    throw new Error('the expected gofumpt version is required')
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `gofumpt --version exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+  const raw = `${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim()
+  const want = String(expectedVersion).replace(/^v/, '')
+  if (!raw.includes(want)) {
+    throw new Error(
+      `gofumpt --version = ${JSON.stringify(raw.trim())}, want substring ${JSON.stringify(want)}`
+    )
+  }
+}
+
+async function verifyTemplateVersion({
+  Sandbox,
+  templateRef,
+  expectedVersion,
+  expectedPiVersion,
+  apiKey,
+  expectedGoVersion,
+  expectedGolangciLintVersion,
+  expectedGofumptVersion,
+}) {
   if (!templateRef) {
     throw new Error('E2B_TEMPLATE_REF is required')
   }
@@ -82,9 +205,26 @@ async function verifyTemplateVersion({ Sandbox, templateRef, expectedVersion, ex
     assertVersionOutput(result, expectedVersion)
     const piResult = await sandbox.commands.run('pi --version')
     assertPiVersionOutput(piResult, expectedPiVersion)
-    process.stdout.write(
-      `Verified ${templateRef}: donmai version ${expectedVersion}, pi version ${expectedPiVersion}\n`,
-    )
+    const expectGo =
+      expectedGoVersion !== undefined ||
+      expectedGolangciLintVersion !== undefined ||
+      expectedGofumptVersion !== undefined
+    if (expectGo) {
+      if (!expectedGoVersion || !expectedGolangciLintVersion || !expectedGofumptVersion) {
+        throw new Error('Go toolchain expectations are incomplete')
+      }
+      const goResult = await sandbox.commands.run('go version')
+      assertGoVersionOutput(goResult, expectedGoVersion)
+      const lintResult = await sandbox.commands.run('golangci-lint --version')
+      assertGolangciLintVersionOutput(lintResult, expectedGolangciLintVersion)
+      const fumptResult = await sandbox.commands.run('gofumpt --version')
+      assertGofumptVersionOutput(fumptResult, expectedGofumptVersion)
+    }
+    let verified = `Verified ${templateRef}: donmai version ${expectedVersion}, pi version ${expectedPiVersion}`
+    if (expectGo) {
+      verified += `, go version ${expectedGoVersion}, golangci-lint version ${expectedGolangciLintVersion}, gofumpt version ${expectedGofumptVersion}`
+    }
+    process.stdout.write(`${verified}\n`)
   } catch (error) {
     primaryError = error
   }
@@ -128,7 +268,17 @@ function formatFailure(error, apiKey) {
   return `E2B template version verification failed: ${redact(String(error?.message || error), apiKey)}`
 }
 
-async function runMain({ Sandbox, templateRef, expectedVersion, expectedPiVersion, apiKey, writeError }) {
+async function runMain({
+  Sandbox,
+  templateRef,
+  expectedVersion,
+  expectedPiVersion,
+  apiKey,
+  expectedGoVersion,
+  expectedGolangciLintVersion,
+  expectedGofumptVersion,
+  writeError,
+}) {
   try {
     await verifyTemplateVersion({
       Sandbox,
@@ -136,6 +286,9 @@ async function runMain({ Sandbox, templateRef, expectedVersion, expectedPiVersio
       expectedVersion,
       expectedPiVersion,
       apiKey,
+      expectedGoVersion,
+      expectedGolangciLintVersion,
+      expectedGofumptVersion,
     })
     return 0
   } catch (error) {
@@ -146,23 +299,47 @@ async function runMain({ Sandbox, templateRef, expectedVersion, expectedPiVersio
 
 async function main() {
   const { Sandbox } = require('e2b')
+  const repoRoot = process.cwd()
+  const templateRef = process.env.E2B_TEMPLATE_REF
+  let expectedGoVersion
+  let expectedGolangciLintVersion
+  let expectedGofumptVersion
+  if (shouldExpectGoTools({ templateRef, expectGoTools: process.env.E2B_EXPECT_GO_TOOLCHAIN })) {
+    expectedGoVersion = readGoVersion(repoRoot)
+    const dockerfileSource = readGoDockerfileSource(repoRoot)
+    expectedGolangciLintVersion = parseGolangciLintVersion(dockerfileSource)
+    expectedGofumptVersion = parseGofumptVersion(dockerfileSource)
+  }
   return runMain({
     Sandbox,
-    templateRef: process.env.E2B_TEMPLATE_REF,
+    templateRef,
     expectedVersion: process.env.DONMAI_VERSION,
-    expectedPiVersion: readPinnedPiVersion(process.cwd()),
+    expectedPiVersion: readPinnedPiVersion(repoRoot),
     apiKey: process.env.E2B_API_KEY,
+    expectedGoVersion,
+    expectedGolangciLintVersion,
+    expectedGofumptVersion,
     writeError: (line) => process.stderr.write(line),
   })
 }
 
 module.exports = {
+  assertGofumptVersionOutput,
+  assertGolangciLintVersionOutput,
+  assertGoVersionOutput,
   assertPiVersionOutput,
   assertVersionOutput,
   formatFailure,
+  isGoTemplateRef,
+  parseGofumptVersion,
+  parseGolangciLintVersion,
+  parseGoVersion,
   parsePinnedPiVersion,
+  readGoDockerfileSource,
+  readGoVersion,
   readPinnedPiVersion,
   runMain,
+  shouldExpectGoTools,
   verifyTemplateVersion,
 }
 
