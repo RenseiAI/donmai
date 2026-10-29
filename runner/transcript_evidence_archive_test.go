@@ -16,10 +16,10 @@ import (
 // transcriptCrashHandle is a failing handle that writes its transcript file
 // into the worktree during Spawn and declares it after Stop.
 type transcriptCrashHandle struct {
-	events chan agent.Event
-	mu     sync.Mutex
+	events  chan agent.Event
+	mu      sync.Mutex
 	stopped bool
-	descs  []agent.TerminalTranscriptDescriptor
+	descs   []agent.TerminalTranscriptDescriptor
 }
 
 func (h *transcriptCrashHandle) SessionID() string          { return "transcript-crash" }
@@ -27,12 +27,14 @@ func (h *transcriptCrashHandle) Events() <-chan agent.Event { return h.events }
 func (h *transcriptCrashHandle) Inject(context.Context, string) error {
 	return nil
 }
+
 func (h *transcriptCrashHandle) Stop(context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.stopped = true
 	return nil
 }
+
 func (h *transcriptCrashHandle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -96,10 +98,9 @@ func runTranscriptCrashSession(t *testing.T, body string, rel string) (*Result, 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	res, err := h.runner.Run(ctx, qw)
-	if err == nil {
-		// Run returns the terminal error alongside the failed envelope;
-		// the envelope is what the assertions below need.
-	}
+	// Run returns the terminal error alongside the failed envelope; the
+	// envelope is what the assertions below need.
+	_ = err
 	if res == nil {
 		t.Fatalf("Run returned nil result (err=%v)", err)
 	}
@@ -271,11 +272,6 @@ func TestTranscriptEvidence_CapsTails(t *testing.T) {
 		body := readEvidence(t, f)
 		if !strings.HasSuffix(body, "\n") {
 			t.Fatalf("%s does not end in a complete line:\n%q", f, body)
-		}
-		if strings.HasPrefix(body, "{") && !strings.Contains(body[:min(40, len(body))], "\n") {
-			// First line must start at a line boundary: the byte before
-			// the tail in the source was a newline (or start of file).
-			// A mid-line cut would leave a fragment without a leading {.
 		}
 		if !strings.Contains(body, "{\"newest\":true}") {
 			t.Fatalf("%s missing newest line:\n%q", f, body)

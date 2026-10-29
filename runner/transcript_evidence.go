@@ -36,10 +36,7 @@ var transcriptEvidenceLstat = os.Lstat
 
 // transcriptEvidenceOpen opens the validated path for reading. A variable
 // so tests can inject an open failure without touching the filesystem.
-var transcriptEvidenceOpen = func(path string) (*os.File, error) {
-	//nolint:gosec // G304: path is the runner-resolved declared transcript, validated as regular before and after open.
-	return os.Open(path)
-}
+var transcriptEvidenceOpen = os.Open
 
 // transcriptEvidenceAfterValidate runs between validation (Lstat) and read
 // (Open). Nil in production; tests arm it to swap the file identity and
