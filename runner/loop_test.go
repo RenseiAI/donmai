@@ -552,45 +552,61 @@ func TestScanBlocked_DoesNotShadowWorkResult(t *testing.T) {
 }
 
 // TestClassifyBlocked_ForksOutcome exercises the classification fork: a
-// blocked observation with no PR becomes FailureAgentBlocked; a blocked
-// observation that nonetheless produced a PR is NOT blocked (the work
-// landed); a non-blocked observation is untouched.
+// blocked observation with no verified PR becomes FailureAgentBlocked; a
+// blocked observation with a VERIFIED PR is NOT blocked (the work landed);
+// a blocked observation with only an unverified scraped URL is still blocked
+// (a hallucinated link never suppresses the fork); a non-blocked observation
+// is untouched.
 func TestClassifyBlocked_ForksOutcome(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name        string
-		obs         streamObservation
-		startPR     string
-		wantBlocked bool
-		wantMode    string
-		wantErrSub  string
+		name          string
+		obs           streamObservation
+		startPR       string
+		hasVerifiedPR bool
+		wantBlocked   bool
+		wantMode      string
+		wantErrSub    string
 	}{
 		{
-			name:        "blocked-no-pr-with-reason",
-			obs:         streamObservation{blocked: true, blockedReason: "spec ambiguous"},
-			wantBlocked: true,
-			wantMode:    FailureAgentBlocked,
-			wantErrSub:  "spec ambiguous",
+			name:          "blocked-no-pr-with-reason",
+			obs:           streamObservation{blocked: true, blockedReason: "spec ambiguous"},
+			hasVerifiedPR: false,
+			wantBlocked:   true,
+			wantMode:      FailureAgentBlocked,
+			wantErrSub:    "spec ambiguous",
 		},
 		{
-			name:        "blocked-no-pr-no-reason",
-			obs:         streamObservation{blocked: true},
-			wantBlocked: true,
-			wantMode:    FailureAgentBlocked,
-			wantErrSub:  "blocked",
+			name:          "blocked-no-pr-no-reason",
+			obs:           streamObservation{blocked: true},
+			hasVerifiedPR: false,
+			wantBlocked:   true,
+			wantMode:      FailureAgentBlocked,
+			wantErrSub:    "blocked",
 		},
 		{
-			name:        "blocked-but-pr-produced-not-blocked",
-			obs:         streamObservation{blocked: true, blockedReason: "x"},
-			startPR:     "https://github.com/o/r/pull/1",
-			wantBlocked: false,
-			wantMode:    "",
+			name:          "blocked-but-verified-pr-produced-not-blocked",
+			obs:           streamObservation{blocked: true, blockedReason: "x"},
+			startPR:       "https://github.com/o/r/pull/1",
+			hasVerifiedPR: true,
+			wantBlocked:   false,
+			wantMode:      "",
 		},
 		{
-			name:        "not-blocked-untouched",
-			obs:         streamObservation{blocked: false},
-			wantBlocked: false,
-			wantMode:    "",
+			name:          "blocked-with-unverified-scraped-url-still-blocked",
+			obs:           streamObservation{blocked: true, blockedReason: "x"},
+			startPR:       "https://github.com/o/r/pull/1",
+			hasVerifiedPR: false,
+			wantBlocked:   true,
+			wantMode:      FailureAgentBlocked,
+			wantErrSub:    "x",
+		},
+		{
+			name:          "not-blocked-untouched",
+			obs:           streamObservation{blocked: false},
+			hasVerifiedPR: false,
+			wantBlocked:   false,
+			wantMode:      "",
 		},
 	}
 	for _, tt := range tests {
@@ -599,7 +615,7 @@ func TestClassifyBlocked_ForksOutcome(t *testing.T) {
 			t.Parallel()
 			res := &Result{}
 			res.PullRequestURL = tt.startPR
-			got := classifyBlocked(res, tt.obs)
+			got := classifyBlocked(res, tt.obs, tt.hasVerifiedPR)
 			if got != tt.wantBlocked {
 				t.Fatalf("classifyBlocked = %v; want %v", got, tt.wantBlocked)
 			}
@@ -1008,6 +1024,57 @@ func TestScanPRURL_ExtractsURL(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("scanPRURL(%q) = %q; want %q", tc.text, got, tc.want)
 		}
+	}
+}
+
+// TestObserveEvent_AssistantNarrativePRURLIsHintOnly pins the provenance
+// contract: a pull request URL in assistant free text never becomes the
+// session's authoritative URL — it is only a candidate for the remote
+// verifier. A hallucinated narrative link must not suppress the blocked
+// fork or mark the run complete before verification.
+func TestObserveEvent_AssistantNarrativePRURLIsHintOnly(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	h.runner.observeEvent(
+		agent.AssistantTextEvent{Text: "Done! See https://github.com/o/r/pull/99 for the fix."},
+		obs, t.TempDir(), QueuedWork{}, nil,
+	)
+	if obs.pullRequestURL != "" {
+		t.Fatalf("assistant narrative set pullRequestURL = %q; want empty (hint only)", obs.pullRequestURL)
+	}
+	if len(obs.pullRequestCandidates) != 1 || obs.pullRequestCandidates[0] != "https://github.com/o/r/pull/99" {
+		t.Fatalf("pullRequestCandidates = %v; want the narrative URL as hint", obs.pullRequestCandidates)
+	}
+}
+
+// TestObserveEvent_ToolResultPRURLIsTrustedChannel pins that tool output is
+// the trusted channel: the latest tool-result URL becomes the authoritative
+// observation (still subject to remote verification before it may suppress
+// the blocked fork).
+func TestObserveEvent_ToolResultPRURLIsTrustedChannel(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	wt := t.TempDir()
+	h.runner.observeEvent(
+		agent.AssistantTextEvent{Text: "Working on it, see https://github.com/o/r/pull/99."},
+		obs, wt, QueuedWork{}, nil,
+	)
+	h.runner.observeEvent(
+		agent.ToolResultEvent{ToolName: "bash", ToolUseID: "1", Content: "opened https://github.com/o/r/pull/7"},
+		obs, wt, QueuedWork{}, nil,
+	)
+	if obs.pullRequestURL != "https://github.com/o/r/pull/7" {
+		t.Fatalf("pullRequestURL = %q; want the trusted tool-result URL", obs.pullRequestURL)
+	}
+	// The latest trusted URL wins over an earlier one.
+	h.runner.observeEvent(
+		agent.ToolResultEvent{ToolName: "bash", ToolUseID: "2", Content: "opened https://github.com/o/r/pull/8"},
+		obs, wt, QueuedWork{}, nil,
+	)
+	if obs.pullRequestURL != "https://github.com/o/r/pull/8" {
+		t.Fatalf("pullRequestURL = %q; want the latest tool-result URL", obs.pullRequestURL)
 	}
 }
 
