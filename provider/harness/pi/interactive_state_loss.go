@@ -153,6 +153,12 @@ type interactiveStateLossHandle struct {
 	// handle's transcripts live under. Stored at spawn; read by
 	// TerminalTranscripts after the final flush.
 	stateRoot string
+	// evidenceBaseline holds the transcripts that already existed under the
+	// layout root before this session's child started, copied from the
+	// tailer's pre-spawn snapshot. TerminalTranscripts excludes them so a
+	// reused workarea never attributes a previous session's transcript to
+	// this one. Nil means the root held no transcript at spawn.
+	evidenceBaseline map[string]struct{}
 	// activityFlushed closes once the transcript tailer has enqueued its
 	// final flush (or dropped it on a full channel) and returned.
 	activityFlushed chan struct{}
@@ -169,12 +175,23 @@ func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, taile
 	if strings.TrimSpace(stateDir) != "" {
 		cleanRoot = filepath.Clean(stateDir)
 	}
+	// Copy the tailer's pre-spawn baseline (see newInteractiveTranscriptTailer):
+	// the tailer was constructed before the child started, so its baseline
+	// is exactly the previous-session set evidence must exclude.
+	var baseline map[string]struct{}
+	if tailer != nil && len(tailer.baseline) > 0 {
+		baseline = make(map[string]struct{}, len(tailer.baseline))
+		for p := range tailer.baseline {
+			baseline[filepath.Clean(p)] = struct{}{}
+		}
+	}
 	h := &interactiveStateLossHandle{
-		Handle:          handle,
-		stateRoot:       cleanRoot,
-		events:          make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
-		activityFlushed: make(chan struct{}),
-		finished:        make(chan struct{}),
+		Handle:           handle,
+		stateRoot:        cleanRoot,
+		evidenceBaseline: baseline,
+		events:           make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
+		activityFlushed:  make(chan struct{}),
+		finished:         make(chan struct{}),
 	}
 	session := handle.InteractiveSession()
 	// emit forwards one transcript event best-effort. Only the tailer

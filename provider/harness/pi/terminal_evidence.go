@@ -27,6 +27,41 @@ func (h *Handle) setStateRoot(root string) {
 	h.stateRoot = filepath.Clean(root)
 }
 
+// setEvidenceBaseline records the transcripts that already existed under the
+// layout root before this session's child started. TerminalTranscripts
+// excludes them: the state dir is shared across reuses of a workarea, so
+// directory membership alone cannot prove session ownership (the tailer in
+// interactive_transcript.go snapshots the same baseline for the same reason).
+// Called once at spawn from the pre-spawn snapshot, before the pump starts.
+func (h *Handle) setEvidenceBaseline(baseline map[string]struct{}) {
+	if len(baseline) == 0 {
+		return
+	}
+	h.evidenceBaseline = baseline
+}
+
+// snapshotPiTranscriptBaseline records every transcript already present under
+// root. Call it after the parent has finished writing the layout (extensions,
+// credentials, tmp/cache dirs) and before the child starts, so only files
+// this session did not create are recorded. A missing root snapshots to nil.
+func snapshotPiTranscriptBaseline(root string) map[string]struct{} {
+	if strings.TrimSpace(root) == "" {
+		return nil
+	}
+	clean := filepath.Clean(root)
+	if info, err := os.Lstat(clean); err != nil || !info.IsDir() {
+		return nil
+	}
+	var baseline map[string]struct{}
+	walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
+		if baseline == nil {
+			baseline = make(map[string]struct{})
+		}
+		baseline[filepath.Clean(path)] = struct{}{}
+	})
+	return baseline
+}
+
 // TerminalTranscripts implements agent.TerminalTranscriptCapable for the
 // headless RPC lane. It returns path-only descriptors for this session's
 // own JSONL transcripts beneath the exact per-session layout root, after
@@ -44,9 +79,11 @@ func (h *Handle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, er
 	}
 	root := h.stateRoot
 	if root == "" {
-		root = sessionStateRoot(h.spec)
+		// No per-session root was recorded at spawn: fail closed rather
+		// than guessing ownership across a reused workarea.
+		return nil, nil
 	}
-	descs := collectPiTranscriptDescriptors(root)
+	descs := collectPiTranscriptDescriptors(root, h.evidenceBaseline)
 	if len(descs) == 0 {
 		return nil, nil
 	}
@@ -66,7 +103,10 @@ func (h *interactiveStateLossHandle) TerminalTranscripts() ([]agent.TerminalTran
 	default:
 		return nil, errors.New("pi: transcript evidence unavailable until the final transcript flush completes")
 	}
-	descs := collectPiTranscriptDescriptors(h.stateRoot)
+	if strings.TrimSpace(h.stateRoot) == "" {
+		return nil, nil
+	}
+	descs := collectPiTranscriptDescriptors(h.stateRoot, h.evidenceBaseline)
 	if len(descs) == 0 {
 		return nil, nil
 	}
@@ -74,16 +114,17 @@ func (h *interactiveStateLossHandle) TerminalTranscripts() ([]agent.TerminalTran
 }
 
 // collectPiTranscriptDescriptors returns path-only descriptors for the
-// regular .jsonl transcripts beneath the exact per-session layout root.
-// It reuses the transcript walker so evidence and tailing agree on what a
-// transcript is, then applies the evidence exclusions: the per-session
-// config home, injected extensions, session tmp/cache content, credential
-// files, policy extensions, symlinks, non-regular files, non-JSONL files,
-// and any path outside the layout root are absent. A missing, non-directory,
-// or link-swapped root yields no descriptors; a session with no transcript
-// yields nil so callers keep today's cleanup behavior with no empty
-// evidence artifact.
-func collectPiTranscriptDescriptors(root string) []agent.TerminalTranscriptDescriptor {
+// regular .jsonl transcripts beneath the exact per-session layout root that
+// this session created. It reuses the transcript walker so evidence and
+// tailing agree on what a transcript is, then applies the evidence
+// exclusions: the pre-spawn baseline (previous sessions reusing this
+// workarea), the per-session config home, injected extensions, session
+// tmp/cache content, credential files, policy extensions, symlinks,
+// non-regular files, non-JSONL files, and any path outside the layout root
+// are absent. A missing, non-directory, or link-swapped root yields no
+// descriptors; a session with no transcript yields nil so callers keep
+// today's cleanup behavior with no empty evidence artifact.
+func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) []agent.TerminalTranscriptDescriptor {
 	if strings.TrimSpace(root) == "" {
 		return nil
 	}
@@ -94,6 +135,13 @@ func collectPiTranscriptDescriptors(root string) []agent.TerminalTranscriptDescr
 	}
 	var descs []agent.TerminalTranscriptDescriptor
 	walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
+		// A transcript that already existed before this session started
+		// belongs to a previous session reusing this workarea, never to
+		// this one — even when the child later appends to it (the tailer
+		// in interactive_transcript.go skips baseline files the same way).
+		if _, excluded := baseline[filepath.Clean(path)]; excluded {
+			return
+		}
 		rel, err := filepath.Rel(clean, filepath.Clean(path))
 		if err != nil || rel == "." || !filepath.IsLocal(rel) || strings.HasPrefix(rel, "..") {
 			return

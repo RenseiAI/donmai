@@ -513,6 +513,14 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		}
 	}
 
+	// Snapshot the shared state dir's existing transcripts BEFORE the child
+	// starts, so evidence reports only what this session writes. The state
+	// dir is shared across reuses of a workarea: without this, a reused
+	// workarea would attribute the previous session's transcript to this
+	// one. Taken after every parent write (extensions, credentials,
+	// tmp/cache dirs) and before the child can create its own transcript.
+	evidenceBaseline := snapshotPiTranscriptBaseline(layout.root)
+
 	var (
 		cmd    *exec.Cmd
 		stdin  io.Writer
@@ -549,6 +557,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	}
 	h.setConfinement(plan)
 	h.setStateRoot(layout.root)
+	h.setEvidenceBaseline(evidenceBaseline)
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the
 	// worktree lifecycle that removes the state root is the backstop.

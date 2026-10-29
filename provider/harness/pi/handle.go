@@ -172,6 +172,12 @@ type Handle struct {
 	// this handle's transcripts live under. Set once at spawn from the
 	// materialized layout; read by TerminalTranscripts after Stop.
 	stateRoot string
+	// evidenceBaseline holds the transcripts that already existed under the
+	// layout root before this session's child started. TerminalTranscripts
+	// excludes them so a reused workarea never attributes a previous
+	// session's transcript to this one. Set once at spawn from the
+	// pre-spawn snapshot; nil means the root held no transcript at spawn.
+	evidenceBaseline map[string]struct{}
 	// stopped closes once Stop has reaped the child and removed the
 	// session credential files: transcript writers have stopped and the
 	// state root is stable for evidence collection. TerminalTranscripts

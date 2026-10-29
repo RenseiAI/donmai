@@ -256,7 +256,7 @@ func TestTerminalEvidence_Exclusions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	descs := collectPiTranscriptDescriptors(root)
+	descs := collectPiTranscriptDescriptors(root, nil)
 	got := make(map[string]bool, len(descs))
 	for _, d := range descs {
 		got[d.Path] = true
@@ -280,13 +280,13 @@ func TestTerminalEvidence_Exclusions(t *testing.T) {
 func TestTerminalEvidence_EmptyReturnsNil(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	if descs := collectPiTranscriptDescriptors(root); len(descs) != 0 {
+	if descs := collectPiTranscriptDescriptors(root, nil); len(descs) != 0 {
 		t.Fatalf("empty layout descriptors = %+v; want none", descs)
 	}
-	if descs := collectPiTranscriptDescriptors(filepath.Join(root, "missing")); len(descs) != 0 {
+	if descs := collectPiTranscriptDescriptors(filepath.Join(root, "missing"), nil); len(descs) != 0 {
 		t.Fatalf("missing root descriptors = %+v; want none", descs)
 	}
-	if descs := collectPiTranscriptDescriptors(""); len(descs) != 0 {
+	if descs := collectPiTranscriptDescriptors("", nil); len(descs) != 0 {
 		t.Fatalf("empty root descriptors = %+v; want none", descs)
 	}
 
@@ -323,5 +323,144 @@ func TestTerminalEvidence_InteractiveRefusesBeforeFlush(t *testing.T) {
 	inter := &interactiveStateLossHandle{stateRoot: root, activityFlushed: make(chan struct{})}
 	if _, err := inter.TerminalTranscripts(); err == nil {
 		t.Fatal("TerminalTranscripts before the final flush must refuse even with a transcript on disk")
+	}
+}
+
+// TestTerminalEvidence_HeadlessReusedWorkareaExcludesPrevious drives the
+// production headless Spawn entry with a reused workarea: a previous
+// session's transcript already sits under the per-session layout root before
+// spawn. The new session's evidence must expose only its own transcript,
+// never the previous session's.
+//
+// RED proof: snapshot no baseline (return every transcript under the root)
+// and the previous-session exclusion assertion fails.
+func TestTerminalEvidence_HeadlessReusedWorkareaExcludesPrevious(t *testing.T) {
+	bin := buildEvidenceFakePi(t)
+	workdir := t.TempDir()
+	const prevMarker = "PREVIOUS_SESSION_MARKER_1a2b3c"
+	const lastLine = "REUSED_HEADLESS_FINAL_5d6e7f"
+	prevRoot := sessionStateRoot(agent.Spec{Cwd: workdir})
+	if err := os.MkdirAll(prevRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prevPath := filepath.Join(prevRoot, "20980101T000000Z_prev.jsonl")
+	writeTranscriptLine(t, prevPath, transcriptMessage("prev", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": prevMarker}},
+	}))
+	t.Setenv("FAKEPI_WRITE_TRANSCRIPT", "1")
+	t.Setenv("FAKEPI_TRANSCRIPT_LAST_LINE", lastLine)
+	t.Setenv("FAKEPI_REPLY", "reused turn done")
+	p, err := New(Options{
+		PiBin:            bin,
+		HandshakeTimeout: 20 * time.Second,
+		VersionProbe:     func(context.Context, string) (string, error) { return PinnedVersion, nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	h, err := p.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	drainToTerminal(t, h)
+	if err := h.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	capable, ok := h.(agent.TerminalTranscriptCapable)
+	if !ok {
+		t.Fatal("headless handle does not expose the terminal-transcript capability")
+	}
+	descs, err := capable.TerminalTranscripts()
+	if err != nil {
+		t.Fatalf("TerminalTranscripts after Stop: %v", err)
+	}
+	if len(descs) != 1 {
+		t.Fatalf("descriptors = %+v; want exactly this session's transcript, not the previous session's", descs)
+	}
+	if descs[0].Path == prevPath {
+		t.Fatalf("previous session transcript %q exposed by current session capability", prevPath)
+	}
+	raw, err := os.ReadFile(descs[0].Path) //nolint:gosec // path came from the session's own evidence capability under test
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	if !strings.Contains(string(raw), lastLine) {
+		t.Fatalf("transcript does not preserve this session's last line %q; got:\n%s", lastLine, raw)
+	}
+	if strings.Contains(string(raw), prevMarker) {
+		t.Fatalf("transcript mixes the previous session's marker %q", prevMarker)
+	}
+}
+
+// TestTerminalEvidence_InteractiveReusedWorkareaExcludesPrevious drives the
+// production interactive Spawn entry with a reused workarea: a previous
+// session's transcript already sits under the per-session layout root before
+// spawn. After the final flush, evidence must expose only this session's
+// transcript, never the previous session's.
+//
+// RED proof: report every transcript under the root (ignore the tailer's
+// pre-spawn baseline) and the previous-session exclusion assertion fails.
+func TestTerminalEvidence_InteractiveReusedWorkareaExcludesPrevious(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	const prevMarker = "PREVIOUS_INTERACTIVE_MARKER_8a9b0c"
+	const lastLine = "REUSED_INTERACTIVE_FINAL_3d4e5f"
+	prevRoot := sessionStateRoot(agent.Spec{Cwd: workdir})
+	if err := os.MkdirAll(prevRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prevPath := filepath.Join(prevRoot, "20980101T000000Z_prev.jsonl")
+	writeTranscriptLine(t, prevPath, transcriptMessage("prev", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": prevMarker}},
+	}))
+	script := fakePiTranscriptPrelude + `
+sleep 0.2
+tool_line final FINAL_TOOL
+printf '{"type":"message","id":"last-line","message":{"role":"assistant","content":[{"type":"text","text":"` + lastLine + `"}]}}\n' >> "$live"
+`
+	p := newFakeInteractivePiProvider(t, script)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	capable, ok := h.(agent.TerminalTranscriptCapable)
+	if !ok {
+		t.Fatal("interactive handle does not expose the terminal-transcript capability")
+	}
+	flusher, ok := h.(agent.InteractiveActivityFlusher)
+	if !ok {
+		t.Fatal("interactive handle does not signal its activity flush")
+	}
+	select {
+	case <-flusher.ActivityFlushed():
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for the interactive final flush")
+	}
+	descs, err := capable.TerminalTranscripts()
+	if err != nil {
+		t.Fatalf("TerminalTranscripts after flush: %v", err)
+	}
+	if len(descs) != 1 {
+		t.Fatalf("descriptors = %+v; want exactly this session's transcript, not the previous session's", descs)
+	}
+	if descs[0].Path == prevPath {
+		t.Fatalf("previous session transcript %q exposed by interactive session capability", prevPath)
+	}
+	raw, err := os.ReadFile(descs[0].Path) //nolint:gosec // path came from the session's own evidence capability under test
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	if !strings.Contains(string(raw), lastLine) {
+		t.Fatalf("interactive transcript lost its trailing line %q; got:\n%s", lastLine, raw)
+	}
+	if strings.Contains(string(raw), prevMarker) {
+		t.Fatalf("interactive transcript mixes the previous session's marker %q", prevMarker)
 	}
 }
