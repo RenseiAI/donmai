@@ -33,12 +33,14 @@ func (h *hangingEvidenceHandle) Events() <-chan agent.Event { return h.events }
 func (h *hangingEvidenceHandle) Inject(context.Context, string) error {
 	return nil
 }
+
 func (h *hangingEvidenceHandle) Stop(context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.stopped = true
 	return nil
 }
+
 func (h *hangingEvidenceHandle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -102,7 +104,7 @@ func TestStoppedSessionArchivesEvidenceBeforeTeardown(t *testing.T) {
 	}
 	r, err := New(Options{
 		Registry: reg, WorktreeManager: manager, Poster: poster,
-		HTTPClient: srv.Client(),
+		HTTPClient:   srv.Client(),
 		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
 		MaxSessionDuration: -1,
 	})
