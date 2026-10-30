@@ -388,8 +388,206 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseClickMsg:
+		return m.handleMouseClick(msg)
+
+	case tea.MouseReleaseMsg, tea.MouseMotionMsg, tea.MouseWheelMsg:
+		return m, nil // releases, motion and wheel never act
 	}
 	return m, nil
+}
+
+// handleMouseClick routes button presses through the production loop.
+// Left selects the rendered session under the cursor (Enter toggles when
+// it is already selected); right follows Escape. Releases, motion and
+// wheel are inert. Plain/unbounded views never react. Confirmation
+// clicks cancel without dispatching or confirming lifecycle actions.
+func (m *Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	if m.opts.Plain || m.opts.UnboundedCards {
+		return m, nil
+	}
+	if m.width <= 0 || m.height <= 0 {
+		return m, nil
+	}
+	if msg.X < 0 || msg.Y < 0 || msg.X >= m.width || msg.Y >= m.height {
+		return m, nil
+	}
+	isLeft := msg.Button == tea.MouseLeft
+	isRight := msg.Button == tea.MouseRight
+	if !isLeft && !isRight {
+		return m, nil
+	}
+	if m.confirmKind != "" {
+		if isRight {
+			m.confirmKind, m.confirmStopID = "", ""
+			return m, nil
+		}
+		idx, ok := m.sessionIndexAt(msg.X, msg.Y)
+		if !ok {
+			return m, nil // invalid clicks keep the gate armed
+		}
+		m.confirmKind, m.confirmStopID = "", ""
+		m.cursor = idx
+		return m, nil
+	}
+	if isRight {
+		if m.filterActive {
+			keep := m.selectedVisibleID()
+			m.filterQuery = ""
+			m.filterActive = false
+			m.detail = false
+			m.reconcileVisibleCursor(keep)
+			return m, nil
+		}
+		m.detail = false
+		return m, nil
+	}
+	idx, ok := m.sessionIndexAt(msg.X, msg.Y)
+	if !ok {
+		return m, nil
+	}
+	if idx == m.cursor {
+		vis := m.visibleCards()
+		m.detail = !m.detail && len(vis) > 0 && m.cursor >= 0 && m.cursor < len(vis)
+		return m, nil
+	}
+	m.cursor = idx
+	return m, nil
+}
+
+// sessionIndexAt maps terminal coordinates to the visible card index
+// under the rendered grid window. It shares gridGeometry and the block
+// window with the renderer, so filtering, overflow markers, gaps,
+// partial rows and clipping resolve to the rendered identity. Markers,
+// padding, header/help, stream and empty/error views miss.
+func (m *Model) sessionIndexAt(x, y int) (int, bool) {
+	if m.snapErr != nil {
+		return 0, false
+	}
+	if m.opts.Plain && m.opts.UnboundedCards {
+		return 0, false
+	}
+	if m.width <= 0 || m.height <= 0 {
+		return 0, false
+	}
+	if x < 0 || y < 0 || x >= m.width || y >= m.height {
+		return 0, false
+	}
+	vis := m.visibleCards()
+	if len(vis) == 0 {
+		return 0, false
+	}
+	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	yGrid := y - 1 // header occupies row 0
+	if yGrid < 0 || yGrid >= gridH {
+		return 0, false
+	}
+	perRow, cardW := gridGeometry(m.width, m.opts.Plain)
+	if perRow == 0 {
+		heights := make([]int, len(vis))
+		counts := make([]int, len(vis))
+		for i := range vis {
+			heights[i] = 1
+			counts[i] = 1
+		}
+		sel := m.cursor
+		if sel < 0 || sel >= len(vis) {
+			sel = 0
+		}
+		w := computeBlockWindow(heights, counts, sel, gridH, false)
+		if w.expanded {
+			top := 0
+			if w.topMarker {
+				if yGrid == 0 {
+					return 0, false
+				}
+				top = 1
+			}
+			idx := w.lo + (yGrid - top)
+			if idx < w.lo || idx > w.hi {
+				return 0, false
+			}
+			return idx, true
+		}
+		top := 0
+		if w.topMarker {
+			if yGrid == 0 {
+				return 0, false
+			}
+			top = 1
+		}
+		if yGrid-top < w.visible {
+			return w.lo, true
+		}
+		return 0, false
+	}
+	nBlocks := (len(vis) + perRow - 1) / perRow
+	heights := make([]int, nBlocks)
+	counts := make([]int, nBlocks)
+	for i := 0; i < nBlocks; i++ {
+		start := i * perRow
+		end := min(start+perRow, len(vis))
+		counts[i] = end - start
+		heights[i] = cardHeight(m.opts.Plain)
+	}
+	selRow := 0
+	if m.cursor >= 0 && m.cursor < len(vis) {
+		selRow = m.cursor / perRow
+	}
+	w := computeBlockWindow(heights, counts, selRow, gridH, !m.opts.Plain)
+	mapX := func(block int) (int, bool) {
+		if perRow == 1 {
+			idx := block * perRow
+			if idx >= len(vis) {
+				return 0, false
+			}
+			return idx, true
+		}
+		stride := cardW + cardGap
+		if stride <= 0 {
+			return 0, false
+		}
+		k := x / stride
+		if k < 0 || k >= perRow || k >= counts[block] {
+			return 0, false
+		}
+		if off := x - k*stride; off < 0 || off >= cardW {
+			return 0, false // inter-card gap or trailing pad
+		}
+		idx := block*perRow + k
+		if idx >= len(vis) {
+			return 0, false
+		}
+		return idx, true
+	}
+	if w.expanded {
+		yy := yGrid
+		if w.topMarker {
+			if yy == 0 {
+				return 0, false
+			}
+			yy--
+		}
+		for b := w.lo; b <= w.hi; b++ {
+			if yy < heights[b] {
+				return mapX(b)
+			}
+			yy -= heights[b]
+		}
+		return 0, false
+	}
+	yy := yGrid
+	if w.topMarker {
+		if yy == 0 {
+			return 0, false
+		}
+		yy--
+	}
+	if yy < w.visible {
+		return mapX(w.lo)
+	}
+	return 0, false
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1250,6 +1448,9 @@ func finiteNonnegative(value float64) bool {
 func (m *Model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = !m.opts.Plain
+	if !m.opts.Plain && !m.opts.UnboundedCards {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	return v
 }
 

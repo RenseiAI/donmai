@@ -13,7 +13,321 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/charmbracelet/x/ansi"
 )
+
+// mouse helpers ground coordinates in the rendered frame: y comes from the
+// stripped view row holding the identity, x from the card column geometry.
+func mouseClick(m *Model, x, y int, btn tea.MouseButton) tea.Cmd {
+	_, cmd := m.Update(tea.MouseClickMsg{X: x, Y: y, Button: btn})
+	return cmd
+}
+
+func mouseXYForVis(t *testing.T, m *Model, visIdx int) (int, int) {
+	t.Helper()
+	vis := m.visibleCards()
+	if visIdx < 0 || visIdx >= len(vis) {
+		t.Fatalf("visIdx %d out of %d", visIdx, len(vis))
+	}
+	id := vis[visIdx].displayID()
+	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	lines := strings.Split(ansi.Strip(m.render()), "\n")
+	y := -1
+	for i := 1; i < 1+gridH && i < len(lines); i++ {
+		if strings.Contains(lines[i], id) {
+			y = i
+			break
+		}
+	}
+	if y < 0 {
+		t.Fatalf("id %q not in grid window:\n%s", id, strings.Join(lines, "\n"))
+	}
+	perRow, cardW := gridGeometry(m.width, m.opts.Plain)
+	if perRow == 0 {
+		return 2, y
+	}
+	return (visIdx%perRow)*(cardW+cardGap) + 1, y
+}
+
+func mouseRowWith(t *testing.T, m *Model, sub string) int {
+	t.Helper()
+	for i, ln := range strings.Split(ansi.Strip(m.render()), "\n") {
+		if strings.Contains(ln, sub) {
+			return i
+		}
+	}
+	t.Fatalf("row with %q not rendered", sub)
+	return -1
+}
+
+func newMouseModel(t *testing.T, w, h, cursor int) *Model {
+	t.Helper()
+	m := newFixtureModel(t, w, h, false, cursor)
+	return m
+}
+
+// AC-1: clicks select the rendered identity across layouts, filtering,
+// resize/split and snapshot reorder. Removing dispatch leaves the cursor.
+func TestModel_MouseSelectsRenderedIdentity(t *testing.T) {
+	// Multi-column styled grid.
+	m := newMouseModel(t, 120, 40, 0)
+	x, y := mouseXYForVis(t, m, 1)
+	if cmd := mouseClick(m, x, y, tea.MouseLeft); cmd != nil {
+		t.Fatal("selection click must not dispatch")
+	}
+	if got := m.selectedVisibleID(); got != m.visibleCards()[1].SessionID {
+		t.Fatalf("multi-column click selected %q, want %q", got, m.visibleCards()[1].SessionID)
+	}
+	// Single column styled (width 40 -> one card per row).
+	m = newMouseModel(t, 40, 40, 0)
+	x, y = mouseXYForVis(t, m, 1)
+	mouseClick(m, x, y, tea.MouseLeft)
+	if got := m.selectedVisibleID(); got != m.visibleCards()[1].SessionID {
+		t.Fatalf("single-column click selected %q", got)
+	}
+	// Compact list (width below card minimum).
+	m = newMouseModel(t, 30, 30, 0)
+	x, y = mouseXYForVis(t, m, 3)
+	mouseClick(m, x, y, tea.MouseLeft)
+	if got := m.selectedVisibleID(); got != m.visibleCards()[3].SessionID {
+		t.Fatalf("compact click selected %q", got)
+	}
+	// Overflow window: short terminal, selection deep keeps window on it.
+	m = newMouseModel(t, 80, 12, 9)
+	vis := m.visibleCards()
+	x, y = mouseXYForVis(t, m, 9)
+	mouseClick(m, x, y, tea.MouseLeft)
+	if got := m.selectedVisibleID(); got != vis[9].SessionID {
+		t.Fatalf("overflow click selected %q, want %q", got, vis[9].SessionID)
+	}
+	// Clicking another visible card in the same window selects it.
+	lines := strings.Split(ansi.Strip(m.render()), "\n")
+	found := ""
+	for _, ln := range lines {
+		for _, c := range m.visibleCards() {
+			if c.SessionID != m.selectedVisibleID() && strings.Contains(ln, c.displayID()) {
+				found = c.SessionID
+				break
+			}
+		}
+		if found != "" {
+			break
+		}
+	}
+	if found == "" {
+		t.Fatal("no second visible card to click")
+	}
+	idx := -1
+	for i, c := range m.visibleCards() {
+		if c.SessionID == found {
+			idx = i
+		}
+	}
+	x, y = mouseXYForVis(t, m, idx)
+	mouseClick(m, x, y, tea.MouseLeft)
+	if got := m.selectedVisibleID(); got != found {
+		t.Fatalf("overflow reselect = %q, want %q", got, found)
+	}
+	// Filtering: mapping follows the visible projection, not the source.
+	m = New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	_, _ = m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	feedQuery(m, "development")
+	if got := len(m.visibleCards()); got != 2 {
+		t.Fatalf("filtered visible = %d, want 2", got)
+	}
+	x, y = mouseXYForVis(t, m, 1)
+	mouseClick(m, x, y, tea.MouseLeft)
+	if got := m.selectedVisibleID(); got != "sess-delta-0004" {
+		t.Fatalf("filtered click selected %q, want delta (source index would be beta)", got)
+	}
+	mouseClick(m, x, y, tea.MouseLeft)
+	if !m.detail {
+		t.Fatal("filtered selected click must toggle detail")
+	}
+	if view := ansi.Strip(m.render()); !strings.Contains(view, "sess-delta-0004") || strings.Contains(view, "sess-beta-0002") {
+		t.Fatalf("filtered detail must show delta, not source beta:\n%s", view)
+	}
+	mouseClick(m, x, y, tea.MouseLeft) // close again for later steps
+	// Resize/split/snapshot reorder keep hits on the rendered identity.
+	mr := newMouseModel(t, 120, 40, 0)
+	_, _ = mr.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	mr.handleKey(keyMsg("["))
+	x, y = mouseXYForVis(t, mr, 1)
+	mouseClick(mr, x, y, tea.MouseLeft)
+	if got := mr.selectedVisibleID(); got != mr.visibleCards()[1].SessionID {
+		t.Fatalf("after resize/split click = %q", got)
+	}
+	rev := []SessionCard{mr.cards[3], mr.cards[2], mr.cards[1], mr.cards[0]}
+	mr.applySnapshot(Snapshot{Cards: rev, Counters: fixtureCounters()})
+	x, y = mouseXYForVis(t, mr, 3)
+	mouseClick(mr, x, y, tea.MouseLeft)
+	if got := mr.selectedVisibleID(); got != mr.visibleCards()[3].SessionID {
+		t.Fatalf("after reorder click = %q, want %q", got, mr.visibleCards()[3].SessionID)
+	}
+}
+
+// AC-2: selected-card clicks toggle like Enter, right clicks match Escape;
+// gaps, markers, chrome, stream and empty/error views do nothing.
+func TestModel_MouseDetailAndInertRegions(t *testing.T) {
+	m := newMouseModel(t, 120, 40, 1)
+	x, y := mouseXYForVis(t, m, 1)
+	if cmd := mouseClick(m, x, y, tea.MouseLeft); cmd != nil {
+		t.Fatal("detail toggle must not dispatch")
+	}
+	if !m.detail {
+		t.Fatal("clicking the selected card must toggle detail like Enter")
+	}
+	if view := ansi.Strip(m.render()); !strings.Contains(view, m.visibleCards()[1].displayID()) {
+		t.Fatalf("detail frame missing selected identity:\n%s", view)
+	}
+	mouseClick(m, x, y, tea.MouseLeft)
+	if m.detail {
+		t.Fatal("second click on the selected card must close detail")
+	}
+	// Right click matches Escape (closes detail).
+	mouseClick(m, x, y, tea.MouseLeft)
+	if !m.detail {
+		t.Fatal("setup: detail should be open")
+	}
+	mouseClick(m, 5, 5, tea.MouseRight)
+	if m.detail {
+		t.Fatal("right click must match Escape and close detail")
+	}
+	// Right click while filtering clears it like Escape.
+	mf := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = mf.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	mf.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	_, _ = mf.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	feedQuery(mf, "development")
+	mouseClick(mf, 5, 5, tea.MouseRight)
+	if mf.filterActive || mf.filterQuery != "" || len(mf.visibleCards()) != 4 {
+		t.Fatalf("right click must clear filter like Escape: active=%v query=%q", mf.filterActive, mf.filterQuery)
+	}
+	// Inert regions: header, help, stream, gaps, markers, bounds, empty.
+	m2 := newMouseModel(t, 120, 40, 0)
+	keep, keepDetail := m2.cursor, m2.detail
+	mouseClick(m2, 2, 0, tea.MouseLeft)           // header
+	mouseClick(m2, 2, m2.height-1, tea.MouseLeft) // help
+	gridH, _ := splitPaneHeights(m2.height-2, m2.split)
+	mouseClick(m2, 2, 1+gridH, tea.MouseLeft) // stream title
+	if m2.cursor != keep || m2.detail != keepDetail {
+		t.Fatal("header/help/stream clicks must do nothing")
+	}
+	perRow, cardW := gridGeometry(m2.width, false)
+	if perRow > 1 {
+		xg := cardW // inter-card gap column
+		yg := mouseRowWith(t, m2, m2.visibleCards()[0].displayID())
+		mouseClick(m2, xg, yg, tea.MouseLeft)
+		if m2.cursor != keep {
+			t.Fatal("gap click must do nothing")
+		}
+	}
+	mo := newMouseModel(t, 80, 12, 9)
+	keep = mo.cursor
+	if view := ansi.Strip(mo.render()); strings.Contains(view, "more") {
+		my := mouseRowWith(t, mo, "more")
+		mouseClick(mo, 1, my, tea.MouseLeft)
+		if mo.cursor != keep || mo.detail {
+			t.Fatal("marker click must do nothing")
+		}
+	}
+	if cmd := mouseClick(mo, -1, -1, tea.MouseLeft); cmd != nil {
+		t.Fatal("out-of-bounds click must not dispatch")
+	}
+	if mo.cursor != keep {
+		t.Fatal("out-of-bounds click must do nothing")
+	}
+	me := newMouseModel(t, 120, 40, 0)
+	me.applySnapshot(Snapshot{Cards: nil})
+	if cmd := mouseClick(me, 10, 5, tea.MouseLeft); cmd != nil {
+		t.Fatal("empty view click must not dispatch")
+	}
+	if me.detail {
+		t.Fatal("empty view click must do nothing")
+	}
+	me.snapErr = fmt.Errorf("down")
+	if cmd := mouseClick(me, 10, 5, tea.MouseLeft); cmd != nil {
+		t.Fatal("error view click must not dispatch")
+	}
+}
+
+// AC-3: only interactive bounded views request reporting and react.
+func TestModel_MouseViewPolicy(t *testing.T) {
+	m := newMouseModel(t, 120, 40, 0)
+	if got := m.View().MouseMode; got != tea.MouseModeCellMotion {
+		t.Fatalf("interactive MouseMode = %v, want CellMotion", got)
+	}
+	mp := newFixtureModel(t, 120, 40, true, 0)
+	if got := mp.View().MouseMode; got == tea.MouseModeCellMotion {
+		t.Fatalf("plain MouseMode = %v, must not request reporting", got)
+	}
+	mu := New(Options{Plain: true, UnboundedCards: true, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = mu.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	mu.applySnapshot(Snapshot{Cards: fixtureCards(), Counters: fixtureCounters()})
+	if got := mu.View().MouseMode; got == tea.MouseModeCellMotion {
+		t.Fatalf("unbounded MouseMode = %v, must not request reporting", got)
+	}
+	keep := mp.cursor
+	_, cmd := mp.Update(tea.MouseClickMsg{X: 10, Y: 3, Button: tea.MouseLeft})
+	if cmd != nil || mp.cursor != keep || mp.detail {
+		t.Fatal("plain views must ignore mouse input")
+	}
+	_, cmd = mu.Update(tea.MouseClickMsg{X: 10, Y: 3, Button: tea.MouseLeft})
+	if cmd != nil || mu.detail {
+		t.Fatal("unbounded views must ignore mouse input")
+	}
+}
+
+// AC-4: selection clicks cancel stop/drain confirmation without toggling
+// or dispatching; right clicks cancel; y afterwards sends nothing.
+func TestModel_MouseCancelsConfirmation(t *testing.T) {
+	for _, kind := range []string{"stop", "drain"} {
+		acts := newFakeHostActions()
+		m := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }, Actions: acts})
+		_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		m.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+		if kind == "stop" {
+			if cmd := m.requestStopConfirm(); cmd != nil {
+				t.Fatal("arm must not dispatch")
+			}
+		} else {
+			if cmd := m.requestDrainConfirm(); cmd != nil {
+				t.Fatal("arm must not dispatch")
+			}
+		}
+		x, y := mouseXYForVis(t, m, 1)
+		if cmd := mouseClick(m, x, y, tea.MouseLeft); cmd != nil {
+			t.Fatalf("%s: selection click must not dispatch", kind)
+		}
+		if m.confirmKind != "" || m.detail {
+			t.Fatalf("%s: selection click must cancel without toggling detail", kind)
+		}
+		if got := m.selectedVisibleID(); got != m.visibleCards()[1].SessionID {
+			t.Fatalf("%s: selection click must select, got %q", kind, got)
+		}
+		_, cmd := m.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
+		if cmd != nil {
+			t.Fatalf("%s: y after cancel must not dispatch", kind)
+		}
+		if _, _, drains, stops := acts.counts(); drains != 0 || len(stops) != 0 {
+			t.Fatalf("%s: canceled action dispatched drains=%d stops=%v", kind, drains, stops)
+		}
+		// Right click cancels the same way.
+		if kind == "stop" {
+			m.requestStopConfirm()
+		} else {
+			m.requestDrainConfirm()
+		}
+		if cmd := mouseClick(m, 5, 5, tea.MouseRight); cmd != nil {
+			t.Fatalf("%s: right cancel must not dispatch", kind)
+		}
+		if m.confirmKind != "" {
+			t.Fatalf("%s: right click must cancel confirmation", kind)
+		}
+	}
+}
 
 // newTestModel builds a plain-mode model over a fake daemon + on-disk
 // worktree fixtures, sized for rendering.
