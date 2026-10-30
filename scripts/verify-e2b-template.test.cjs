@@ -952,6 +952,139 @@ test('main() runs Go toolchain checks for the Go template through production sel
   ])
 })
 
+test('main() rejects a golangci-lint prerelease for the Go template', async () => {
+  const repoRoot = testRepoRoot()
+  const fakeSandbox = {
+    async create() {
+      return {
+        commands: {
+          async run(command) {
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: 'donmai version v0.68.5\n' }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            if (command === 'go version') {
+              return { exitCode: 0, stdout: `go version go${readGoVersion(repoRoot)} linux/amd64\n` }
+            }
+            if (command === 'golangci-lint --version') {
+              return { exitCode: 0, stdout: 'golangci-lint has version 2.11.4-beta.1 built with go1.27.3\n' }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const errors = []
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker-go:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    writeError: (line) => errors.push(line),
+  })
+  assert.equal(code, 1)
+  assert.match(errors.join(''), /golangci-lint --version/)
+})
+
+test('main() rejects a gofumpt prerelease for the Go template', async () => {
+  const repoRoot = testRepoRoot()
+  const fakeSandbox = {
+    async create() {
+      return {
+        commands: {
+          async run(command) {
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: 'donmai version v0.68.5\n' }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            if (command === 'go version') {
+              return { exitCode: 0, stdout: `go version go${readGoVersion(repoRoot)} linux/amd64\n` }
+            }
+            if (command === 'golangci-lint --version') {
+              const source = fs.readFileSync(
+                path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'),
+                'utf8'
+              )
+              return {
+                exitCode: 0,
+                stdout: `golangci-lint has version ${parseGolangciLintVersion(source)} built with go1.27.3\n`,
+              }
+            }
+            if (command === 'gofumpt --version') {
+              return { exitCode: 0, stdout: 'v0.12.0-rc1 (go1.27.3)\n' }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const errors = []
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker-go:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    writeError: (line) => errors.push(line),
+  })
+  assert.equal(code, 1)
+  assert.match(errors.join(''), /gofumpt --version/)
+})
+
+test('main() rejects a Go toolchain prerelease for the Go template', async () => {
+  const repoRoot = testRepoRoot()
+  const fakeSandbox = {
+    async create() {
+      return {
+        commands: {
+          async run(command) {
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: 'donmai version v0.68.5\n' }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            if (command === 'go version') {
+              return { exitCode: 0, stdout: `go version go${readGoVersion(repoRoot)}-beta linux/amd64\n` }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const errors = []
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker-go:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    writeError: (line) => errors.push(line),
+  })
+  assert.equal(code, 1)
+  assert.match(errors.join(''), /go version/)
+})
+
 test('main() skips Go toolchain checks for the base template', async () => {
   const repoRoot = testRepoRoot()
   const runs = []

@@ -271,17 +271,17 @@ function shouldExpectGoTools({ templateRef, expectGoTools }) {
 }
 
 function extractGoToolchainVersion(output) {
-  const match = String(output).match(/\bgo(\d+\.\d+\.\d+)(?![\d.])/)
+  const match = String(output).match(/\bgo(\d+\.\d+\.\d+)(?![\w.+-])/)
   return match ? match[1] : null
 }
 
 function extractVersionAfterKeyword(output) {
-  const match = String(output).match(/version\s+v?(\d+\.\d+\.\d+)(?![\d.])/i)
+  const match = String(output).match(/version\s+v?(\d+\.\d+\.\d+)(?![\w.+-])/i)
   return match ? match[1] : null
 }
 
 function extractFirstDottedVersion(output) {
-  const match = String(output).match(/\bv?(\d+\.\d+\.\d+)(?![\d.])/)
+  const match = String(output).match(/\bv?(\d+\.\d+\.\d+)(?![\w.+-])/)
   return match ? match[1] : null
 }
 
