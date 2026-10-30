@@ -254,15 +254,44 @@ func TestModel_MouseDetailAndInertRegions(t *testing.T) {
 	}
 	me := newMouseModel(t, 120, 40, 0)
 	me.applySnapshot(Snapshot{Cards: nil})
+	keepEmpty := me.cursor
 	if cmd := mouseClick(me, 10, 5, tea.MouseLeft); cmd != nil {
 		t.Fatal("empty view click must not dispatch")
 	}
-	if me.detail {
-		t.Fatal("empty view click must do nothing")
+	if me.detail || me.cursor != keepEmpty {
+		t.Fatalf("empty view click must do nothing (cursor=%d detail=%v)", me.cursor, me.detail)
 	}
-	me.snapErr = fmt.Errorf("down")
-	if cmd := mouseClick(me, 10, 5, tea.MouseLeft); cmd != nil {
+	// Error frame with cards present: clicks that would select must miss.
+	// Coordinates are grounded before the error renders (the error frame
+	// hides the grid), so deleting the snapErr guard selects and fails.
+	meErr := newMouseModel(t, 120, 40, 1)
+	xOther, yOther := mouseXYForVis(t, meErr, 2)
+	xSel, ySel := mouseXYForVis(t, meErr, 1)
+	keepErr, keepErrDetail := meErr.cursor, meErr.detail
+	keepErrID := meErr.selectedVisibleID()
+	meErr.snapErr = fmt.Errorf("down")
+	if cmd := mouseClick(meErr, xOther, yOther, tea.MouseLeft); cmd != nil {
 		t.Fatal("error view click must not dispatch")
+	}
+	if meErr.cursor != keepErr || meErr.detail != keepErrDetail {
+		t.Fatalf("error frame click must leave cursor=%d detail=%v (got cursor=%d detail=%v)", keepErr, keepErrDetail, meErr.cursor, meErr.detail)
+	}
+	if got := meErr.selectedVisibleID(); got != keepErrID {
+		t.Fatalf("error frame click selected %q, want %q", got, keepErrID)
+	}
+	// Clicking the selected card on the error frame must not toggle detail.
+	if cmd := mouseClick(meErr, xSel, ySel, tea.MouseLeft); cmd != nil {
+		t.Fatal("error selected click must not dispatch")
+	}
+	if meErr.cursor != keepErr || meErr.detail != keepErrDetail {
+		t.Fatalf("error selected click must leave cursor=%d detail=%v (got cursor=%d detail=%v)", keepErr, keepErrDetail, meErr.cursor, meErr.detail)
+	}
+	meErr.detail = true
+	if cmd := mouseClick(meErr, xSel, ySel, tea.MouseLeft); cmd != nil {
+		t.Fatal("error selected click with detail must not dispatch")
+	}
+	if meErr.cursor != keepErr || !meErr.detail {
+		t.Fatalf("error selected click must keep detail open (got cursor=%d detail=%v)", meErr.cursor, meErr.detail)
 	}
 }
 
@@ -283,6 +312,124 @@ func TestModel_MouseExpandedMarkerIsInert(t *testing.T) {
 	}
 	if m.cursor != keep || m.detail {
 		t.Fatalf("expanded marker click must leave cursor=%d detail=%v (got cursor=%d detail=%v)", keep, false, m.cursor, m.detail)
+	}
+}
+
+// Compact overflow markers are inert in both expanded and partial windows
+// and with detail open or closed. Width 30 forces the one-line-per-session
+// compact list; height 12 keeps an expanded window (top and bottom markers),
+// height 6 forces the partial window. Deleting the compact marker guards
+// selects the marker row and fails.
+func TestModel_MouseCompactMarkerIsInert(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cursor int
+		detail bool
+	}{
+		{"expanded detail closed", 8, false},
+		{"expanded detail open", 9, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMouseModel(t, 30, 12, tc.cursor)
+			m.detail = tc.detail
+			keep, keepDetail := m.cursor, m.detail
+			keepID := m.selectedVisibleID()
+			view := ansi.Strip(m.render())
+			lines := strings.Split(view, "\n")
+			if len(lines) < 2 || !strings.Contains(lines[1], "more") {
+				t.Fatalf("expected compact top marker at row 1:\n%s", view)
+			}
+			if cmd := mouseClick(m, 2, 1, tea.MouseLeft); cmd != nil {
+				t.Fatal("compact marker click must not dispatch")
+			}
+			if m.cursor != keep || m.detail != keepDetail {
+				t.Fatalf("compact marker at (2,1) changed state: cursor=%d detail=%v (want cursor=%d detail=%v)", m.cursor, m.detail, keep, keepDetail)
+			}
+			if got := m.selectedVisibleID(); got != keepID {
+				t.Fatalf("compact marker selected %q, want %q", got, keepID)
+			}
+			// Bottom marker in the same expanded window is also inert.
+			gridH, _ := splitPaneHeights(m.height-2, m.split)
+			bottomY := gridH // yGrid gridH-1 -> y gridH
+			if bottomY > 0 && bottomY < len(lines) && strings.Contains(lines[bottomY], "more") {
+				if cmd := mouseClick(m, 2, bottomY, tea.MouseLeft); cmd != nil {
+					t.Fatal("compact bottom marker must not dispatch")
+				}
+				if m.cursor != keep || m.detail != keepDetail {
+					t.Fatalf("compact bottom marker changed state: cursor=%d detail=%v", m.cursor, m.detail)
+				}
+			}
+		})
+	}
+	// Partial compact window (tiny height) keeps the top marker inert too.
+	m := newMouseModel(t, 30, 6, 8)
+	view := ansi.Strip(m.render())
+	lines := strings.Split(view, "\n")
+	if len(lines) < 2 || !strings.Contains(lines[1], "more") {
+		t.Fatalf("expected partial compact top marker at row 1:\n%s", view)
+	}
+	keep := m.cursor
+	if cmd := mouseClick(m, 2, 1, tea.MouseLeft); cmd != nil {
+		t.Fatal("partial compact marker must not dispatch")
+	}
+	if m.cursor != keep || m.detail {
+		t.Fatalf("partial compact marker at (2,1) changed state: cursor=%d detail=%v", m.cursor, m.detail)
+	}
+}
+
+// A single visible session still selects and toggles detail via mouse.
+// Mapping that ignores a singleton (len <= 1 miss, or detail requiring
+// more than one card) leaves detail closed and fails.
+func TestModel_MouseSingletonSelectsAndToggles(t *testing.T) {
+	m := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.applySnapshot(Snapshot{Cards: filterTestCards()[:1], Counters: Counters{Sessions: 1, Running: 1}})
+	if got := len(m.visibleCards()); got != 1 {
+		t.Fatalf("setup: visible = %d, want 1", got)
+	}
+	x, y := mouseXYForVis(t, m, 0)
+	if cmd := mouseClick(m, x, y, tea.MouseLeft); cmd != nil {
+		t.Fatal("singleton click must not dispatch")
+	}
+	if !m.detail {
+		t.Fatal("singleton click on the selected card must open detail like Enter")
+	}
+	if got := m.selectedVisibleID(); got != m.visibleCards()[0].SessionID {
+		t.Fatalf("singleton click selected %q", got)
+	}
+	if cmd := mouseClick(m, x, y, tea.MouseLeft); cmd != nil {
+		t.Fatal("singleton second click must not dispatch")
+	}
+	if m.detail {
+		t.Fatal("singleton second click must close detail")
+	}
+}
+
+// Right-click with an active but empty filter still clears like Escape.
+// Requiring a non-empty query retains the active empty filter and fails.
+func TestModel_MouseRightClearsEmptyFilter(t *testing.T) {
+	m := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	_, _ = m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	if !m.filterActive || m.filterQuery != "" {
+		t.Fatalf("setup: active empty filter active=%v query=%q", m.filterActive, m.filterQuery)
+	}
+	if got := len(m.visibleCards()); got != 4 {
+		t.Fatalf("setup: empty filter visible = %d, want 4", got)
+	}
+	m.detail = true
+	if cmd := mouseClick(m, 5, 5, tea.MouseRight); cmd != nil {
+		t.Fatal("empty-filter right-click must not dispatch")
+	}
+	if m.filterActive || m.filterQuery != "" {
+		t.Fatalf("empty-filter right-click must clear: active=%v query=%q", m.filterActive, m.filterQuery)
+	}
+	if m.detail {
+		t.Fatal("empty-filter right-click must close detail like Escape")
+	}
+	if got := len(m.visibleCards()); got != 4 {
+		t.Fatalf("after clear visible = %d, want 4", got)
 	}
 }
 
@@ -390,17 +537,40 @@ func TestModel_MouseCancelsConfirmation(t *testing.T) {
 		if _, _, drains, stops := acts.counts(); drains != 0 || len(stops) != 0 {
 			t.Fatalf("%s: canceled action dispatched drains=%d stops=%v", kind, drains, stops)
 		}
-		// Right click cancels the same way.
+		// Right click cancels the same way and must only cancel: cursor,
+		// detail, filter and selection are preserved. A right click on a
+		// rendered card that acted as left would reselect or toggle.
 		if kind == "stop" {
 			m.requestStopConfirm()
 		} else {
 			m.requestDrainConfirm()
 		}
-		if cmd := mouseClick(m, 5, 5, tea.MouseRight); cmd != nil {
+		m.cursor = 0
+		m.detail = true
+		keepCursor, keepDetail := m.cursor, m.detail
+		keepID := m.selectedVisibleID()
+		keepFilterActive, keepFilterQuery := m.filterActive, m.filterQuery
+		xR, yR := mouseXYForVis(t, m, 1)
+		if cmd := mouseClick(m, xR, yR, tea.MouseRight); cmd != nil {
 			t.Fatalf("%s: right cancel must not dispatch", kind)
 		}
 		if m.confirmKind != "" {
 			t.Fatalf("%s: right click must cancel confirmation", kind)
+		}
+		if m.cursor != keepCursor || m.detail != keepDetail {
+			t.Fatalf("%s: right confirmation click must only cancel: cursor=%d detail=%v gate=%q (got cursor=%d detail=%v)", kind, keepCursor, keepDetail, "", m.cursor, m.detail)
+		}
+		if got := m.selectedVisibleID(); got != keepID {
+			t.Fatalf("%s: right confirmation click must keep selection %q (got %q)", kind, keepID, got)
+		}
+		if m.filterActive != keepFilterActive || m.filterQuery != keepFilterQuery {
+			t.Fatalf("%s: right confirmation click must keep filter active=%v query=%q", kind, m.filterActive, m.filterQuery)
+		}
+		if _, _, drains, stops := acts.counts(); drains != 0 || len(stops) != 0 {
+			t.Fatalf("%s: right cancel dispatched drains=%d stops=%v", kind, drains, stops)
+		}
+		if _, cmd := m.Update(tea.KeyPressMsg{Code: 'y', Text: "y"}); cmd != nil {
+			t.Fatalf("%s: y after right-cancel must not dispatch", kind)
 		}
 	}
 }
