@@ -541,6 +541,12 @@ func TestAgentStatusDiagnosticPartialExactRows(t *testing.T) {
 			want:     "provision_failed (spawn)",
 		},
 		{
+			name:     "reason_message_with_decidedBy_only",
+			fragment: `,"terminalReason":{"message":"Workarea provisioning failed","decidedBy":"platform"}`,
+			label:    "Terminal Reason:",
+			want:     "Workarea provisioning failed (platform)",
+		},
+		{
 			name:     "reason_empty_object_unavailable",
 			fragment: `,"terminalReason":{}`,
 			label:    "Terminal Reason:",
