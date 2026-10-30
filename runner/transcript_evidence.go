@@ -157,13 +157,49 @@ func transcriptEvidenceSecretValues(qw QueuedWork) []string {
 // transcriptSensitiveKeyRE mirrors the shared output rail's secret-name
 // list for JSON-aware redaction. A string value under one of these keys is
 // replaced wholesale so an unknown password never survives with its JSON
-// quoting intact. Numbers that equal a known session secret are redacted
-// too (a numeric PIN emitted as a JSON number); other numbers, booleans,
-// and null are left alone so ordinary token-usage counters stay valid JSON
+// quoting intact. Sensitive numbers, booleans, and nulls are replaced
+// wholesale as well so an unknown numeric PIN cannot survive; ordinary
+// token-usage counters are allowlisted explicitly so they stay valid JSON
 // numbers.
 var transcriptSensitiveKeyRE = regexp.MustCompile(`(?i)(authorization|bearer|api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)`)
 
+// transcriptUsageCounterKeys allowlists ordinary token-usage counters that
+// happen to contain the substring "token": they are telemetry, not
+// credentials, and must stay numeric so evidence keeps its shape.
+var transcriptUsageCounterKeys = map[string]bool{
+	"inputtokens":              true,
+	"outputtokens":             true,
+	"totaltokens":              true,
+	"totalinputtokens":         true,
+	"totaloutputtokens":        true,
+	"cachedtokens":             true,
+	"cachetokens":              true,
+	"cachereadinputtokens":     true,
+	"cachecreationinputtokens": true,
+	"prompttokens":             true,
+	"completiontokens":         true,
+	"prompt_tokencount":        true,
+}
+
+func isUsageTranscriptCounterKey(k string) bool {
+	lower := strings.ToLower(k)
+	norm := strings.ReplaceAll(strings.ReplaceAll(lower, "_", ""), "-", "")
+	if transcriptUsageCounterKeys[norm] {
+		return true
+	}
+	// Camel/snake variants collapse to the same normalized form above;
+	// anything else containing a usage prefix plus "token" is still
+	// telemetry (for example future cache_*_tokens counters).
+	if strings.Contains(norm, "token") && (strings.HasPrefix(norm, "input") || strings.HasPrefix(norm, "output") || strings.HasPrefix(norm, "total") || strings.HasPrefix(norm, "cache") || strings.HasPrefix(norm, "prompt") || strings.HasPrefix(norm, "completion")) {
+		return true
+	}
+	return false
+}
+
 func isSensitiveTranscriptKey(k string) bool {
+	if isUsageTranscriptCounterKey(k) {
+		return false
+	}
 	return transcriptSensitiveKeyRE.MatchString(k)
 }
 
@@ -254,6 +290,13 @@ func redactTranscriptEvidence(tail string, values []string) string {
 	if tail == "" {
 		return ""
 	}
+	// Multiline known values must not survive split across JSONL records.
+	// Replace every value containing a line break while the tail is still
+	// whole: per-line redaction below would otherwise see only fragments
+	// that never match the complete secret. Both the raw form (plain-text
+	// lines) and the JSON string-body encodings (newlines inside JSON
+	// strings) are replaced so neither representation survives intact.
+	tail = redactMultilineSecretsInTail(tail, values)
 	parts := strings.SplitAfter(tail, "\n")
 	var sb strings.Builder
 	for _, part := range parts {
@@ -299,9 +342,12 @@ func parseTranscriptJSONLine(line string, out *interface{}) error {
 }
 
 // redactJSONValue redacts one decoded JSON value. Object keys carrying a
-// known secret are rewritten, json.Number values equal to a known secret
-// are replaced, and sensitive context propagates into nested objects and
-// arrays so unknown credentials under a sensitive key cannot survive.
+// known secret are rewritten and passed through the shared output rail so
+// token-shaped keys cannot survive, json.Number values equal to a known
+// secret are replaced, structured values equal to a known JSON credential
+// are replaced wholesale, and sensitive context propagates into nested
+// objects and arrays so unknown credentials under a sensitive key cannot
+// survive.
 func redactJSONValue(v interface{}, values []string) interface{} {
 	return redactJSONValueSensitive(v, values, false)
 }
@@ -310,9 +356,14 @@ func redactJSONValue(v interface{}, values []string) interface{} {
 // value as sensitive when it sits under a sensitive key. Sensitive string
 // values are replaced wholesale (unknown passwords fail closed);
 // sensitive arrays are replaced wholesale so array elements cannot lose
-// that context. Numbers are redacted only when they equal a known secret
-// so usage counters stay numeric while numeric PINs do not survive.
+// that context. Sensitive numbers, booleans, and nulls are replaced
+// wholesale so an unknown numeric PIN or flag under a sensitive key cannot
+// survive with its JSON shape intact; other numbers, booleans, and null
+// are left alone so ordinary token-usage counters stay valid JSON.
 func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) interface{} {
+	if isStructuredTranscriptSecret(v, values) {
+		return "[REDACTED]"
+	}
 	switch typed := v.(type) {
 	case string:
 		if sensitive {
@@ -320,6 +371,9 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 		}
 		return redactJSONString(typed, values)
 	case json.Number:
+		if sensitive {
+			return "[REDACTED]"
+		}
 		s := string(typed)
 		for _, sec := range values {
 			if sec != "" && s == sec {
@@ -328,11 +382,24 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 		}
 		return v
 	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		if sensitive {
+			return "[REDACTED]"
+		}
 		s := fmt.Sprint(typed)
 		for _, sec := range values {
 			if sec != "" && s == sec {
 				return "[REDACTED]"
 			}
+		}
+		return v
+	case bool:
+		if sensitive {
+			return "[REDACTED]"
+		}
+		return v
+	case nil:
+		if sensitive {
+			return "[REDACTED]"
 		}
 		return v
 	case map[string]interface{}:
@@ -344,6 +411,7 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 					rk = strings.ReplaceAll(rk, sec, "[REDACTED]")
 				}
 			}
+			rk = diagnostic.Redact(rk)
 			childSensitive := sensitive || isSensitiveTranscriptKey(k)
 			out[rk] = redactJSONValueSensitive(val, values, childSensitive)
 		}
@@ -361,6 +429,123 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 	}
 }
 
+// isStructuredTranscriptSecret reports whether the decoded JSON value equals
+// a known session secret that is itself JSON (an object or array credential
+// value). Traversal otherwise splits the credential into ordinary fields
+// without matching the complete secret, leaving the value recoverable.
+// Comparison is structural with numeric normalization so whitespace and
+// number-encoding differences cannot bypass the match.
+func isStructuredTranscriptSecret(v interface{}, values []string) bool {
+	switch v.(type) {
+	case map[string]interface{}, []interface{}:
+	default:
+		return false
+	}
+	for _, sec := range values {
+		vt := strings.TrimSpace(sec)
+		if len(vt) < 2 {
+			continue
+		}
+		isSecretJSON := (vt[0] == '{' && vt[len(vt)-1] == '}') || (vt[0] == '[' && vt[len(vt)-1] == ']')
+		if !isSecretJSON {
+			continue
+		}
+		var secretRaw interface{}
+		dec := json.NewDecoder(strings.NewReader(vt))
+		dec.UseNumber()
+		if err := dec.Decode(&secretRaw); err != nil {
+			continue
+		}
+		var extra interface{}
+		if err := dec.Decode(&extra); err != io.EOF {
+			continue
+		}
+		if transcriptJSONValuesEqual(v, secretRaw) {
+			return true
+		}
+	}
+	return false
+}
+
+// transcriptJSONValuesEqual compares two decoded JSON values structurally,
+// normalizing numbers across json.Number and float/int encodings so the
+// same credential written with different spacing or number forms still
+// matches.
+func transcriptJSONValuesEqual(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	switch av := a.(type) {
+	case string:
+		bv, ok := b.(string)
+		return ok && av == bv
+	case bool:
+		bv, ok := b.(bool)
+		return ok && av == bv
+	case json.Number:
+		return transcriptJSONNumberEqual(string(av), b)
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return transcriptJSONNumberEqual(fmt.Sprint(av), b)
+	case map[string]interface{}:
+		bv, ok := b.(map[string]interface{})
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for k, va := range av {
+			vb, ok := bv[k]
+			if !ok || !transcriptJSONValuesEqual(va, vb) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		bv, ok := b.([]interface{})
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !transcriptJSONValuesEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
+// transcriptJSONNumberEqual compares one number literal against any decoded
+// JSON number form by string literal first, then by numeric value so 123
+// and 123.0 match fail-closed.
+func transcriptJSONNumberEqual(a string, b interface{}) bool {
+	var bs string
+	switch bv := b.(type) {
+	case json.Number:
+		bs = string(bv)
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		bs = fmt.Sprint(bv)
+	case string:
+		bs = bv
+	default:
+		return false
+	}
+	if a == bs {
+		return true
+	}
+	af, aerr := parseTranscriptJSONFloat(a)
+	bf, berr := parseTranscriptJSONFloat(bs)
+	return aerr == nil && berr == nil && af == bf
+}
+
+// parseTranscriptJSONFloat parses one JSON number literal for equality.
+func parseTranscriptJSONFloat(s string) (float64, error) {
+	var f float64
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &f); err != nil {
+		return 0, err
+	}
+	return f, nil
+}
+
 // redactJSONString redacts one decoded string value. A JSON-shaped string
 // that contains a known session secret is itself a credential value and is
 // replaced wholesale so the secret cannot survive behind a second encoding.
@@ -368,13 +553,25 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 // the inner record is redacted recursively and the re-encoded form is
 // redacted again with the literal rail so a complete JSON credential value
 // emitted as an escaped JSON string cannot bypass the exact-match loop.
+// Non-JSON prose (including a JSON object embedded after a prefix) is
+// redacted with both rails over the raw and JSON-escaped byte forms so a
+// secret containing quotes or backslashes cannot survive escaped, and any
+// embedded JSON object is redacted recursively before the literal rail.
 func redactJSONString(s string, values []string) string {
 	trimmed := strings.TrimSpace(s)
 	isJSONShape := len(trimmed) >= 2 && ((trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}') || (trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']'))
 	if isJSONShape {
 		for _, v := range values {
-			if v != "" && strings.Contains(s, v) {
+			if v == "" {
+				continue
+			}
+			if strings.Contains(s, v) {
 				return "[REDACTED]"
+			}
+			for _, form := range transcriptEvidenceEscapedForms(v) {
+				if form != "" && form != v && strings.Contains(s, form) {
+					return "[REDACTED]"
+				}
 			}
 		}
 		var innerRaw interface{}
@@ -411,12 +608,119 @@ func redactJSONString(s string, values []string) string {
 			}
 		}
 	}
+	s = diagnostic.Redact(s)
 	for _, v := range values {
-		if v != "" {
-			s = strings.ReplaceAll(s, v, "[REDACTED]")
+		if v == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, v, "[REDACTED]")
+		for _, form := range transcriptEvidenceEscapedForms(v) {
+			if form == "" || form == v {
+				continue
+			}
+			s = strings.ReplaceAll(s, form, "[REDACTED]")
 		}
 	}
+	s = redactEmbeddedTranscriptJSON(s, values)
 	return diagnostic.Redact(s)
+}
+
+// redactEmbeddedTranscriptJSON redacts JSON objects embedded in prose (a
+// prefix followed by a JSON credential object). The whole-string JSON
+// parser cannot see them, and the literal rail alone cannot match secrets
+// whose quoting changed the byte form, so each balanced JSON candidate is
+// decoded and redacted recursively. Candidates that fail to parse are left
+// for the literal rail.
+func redactEmbeddedTranscriptJSON(s string, values []string) string {
+	type span struct {
+		start int
+		end   int
+		text  string
+	}
+	var spans []span
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' && s[i] != '[' {
+			continue
+		}
+		dec := json.NewDecoder(strings.NewReader(s[i:]))
+		dec.UseNumber()
+		var cand interface{}
+		if err := dec.Decode(&cand); err != nil {
+			continue
+		}
+		end := i + int(dec.InputOffset())
+		if end <= i || end > len(s) {
+			continue
+		}
+		// Only treat it as embedded JSON when the decoded form round-trips
+		// to the same bytes modulo whitespace: avoids redacting prose
+		// braces that merely happen to parse as JSON fragments.
+		raw := strings.TrimSpace(s[i:end])
+		if raw == "" {
+			continue
+		}
+		redacted := redactJSONValue(cand, values)
+		if b, err := json.Marshal(redacted); err == nil {
+			if string(b) != raw {
+				// Only record when redaction changed something or the
+				// candidate is a plausible credential container; plain
+				// prose braces that parse but need no redaction are left
+				// untouched to keep the archive faithful.
+				if redactedNeedsReplacement(cand, redacted) {
+					spans = append(spans, span{start: i, end: end, text: string(b)})
+					i = end - 1
+				}
+			}
+		}
+		if len(spans) >= 8 {
+			break
+		}
+	}
+	if len(spans) == 0 {
+		return s
+	}
+	var sb strings.Builder
+	prev := 0
+	for _, sp := range spans {
+		sb.WriteString(s[prev:sp.start])
+		sb.WriteString(sp.text)
+		prev = sp.end
+	}
+	sb.WriteString(s[prev:])
+	return sb.String()
+}
+
+// redactedNeedsReplacement reports whether redacting a JSON candidate
+// changed it: only then does the prose embedding need rewriting.
+func redactedNeedsReplacement(before, after interface{}) bool {
+	bb, err1 := json.Marshal(before)
+	ab, err2 := json.Marshal(after)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return string(bb) != string(ab)
+}
+
+// redactMultilineSecretsInTail replaces multiline known values while the
+// tail is still whole. Per-line redaction would otherwise see only
+// fragments split across records that never match the complete secret.
+func redactMultilineSecretsInTail(tail string, values []string) string {
+	for _, v := range values {
+		if v == "" {
+			continue
+		}
+		if !strings.Contains(v, "\n") && !strings.Contains(v, "\r") {
+			continue
+		}
+		tail = strings.ReplaceAll(tail, v, "[REDACTED]")
+		for _, form := range transcriptEvidenceEscapedForms(v) {
+			if form == "" || form == v {
+				continue
+			}
+			tail = strings.ReplaceAll(tail, form, "[REDACTED]")
+		}
+	}
+	return tail
 }
 
 // redactTextWithSecrets redacts one non-JSON line with both rails. Unicode

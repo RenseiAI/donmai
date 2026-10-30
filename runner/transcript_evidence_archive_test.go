@@ -1396,3 +1396,159 @@ func TestTranscriptEvidence_StalledReadFailsClosed(t *testing.T) {
 		t.Fatal("preserveUnpublishedWork hung on stalled read; want fail-closed timeout")
 	}
 }
+
+// TestTranscriptEvidence_ShadowBlockersRedacted pins the five second-pass
+// blockers through the production entry point: a token-shaped object key
+// with no known value, an unknown numeric password, a structured JSON
+// credential split across fields, a bearer with quoting inside prefixed
+// JSON prose, and a multiline known value split across lines. Each
+// subtest fails when its rail is reverted.
+func TestTranscriptEvidence_ShadowBlockersRedacted(t *testing.T) {
+	t.Run("token-shaped-key", func(t *testing.T) {
+		key := "ghs_ABCDEFGHIJKLMNOPQRSTuvwx0123"
+		body := `{"` + key + `":"value","msg":"clean"}` + "\n"
+		clone, _, base := cloneForRescue(t)
+		writeFile(t, clone, ".agent/transcript.jsonl", body)
+		r := minimalRunner(t)
+		r.rescueDir = t.TempDir()
+		res := &Result{}
+		res.Status = "failed"
+		res.WorktreePath = clone
+		res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+		res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+		qw := QueuedWork{QueuedWork: queuedWorkBase("SHADOWKEY")}
+		if !r.preserveUnpublishedWork(qw, res) {
+			t.Fatalf("preserve = false (warnings %v)", res.PostSessionWarnings)
+		}
+		got := readEvidence(t, findEvidenceFiles(t, r.rescueDir)[0])
+		if strings.Contains(got, key) {
+			t.Fatalf("archive retains token-shaped key:\n%q", got)
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("archive missing [REDACTED]:\n%q", got)
+		}
+	})
+	t.Run("unknown-numeric-password", func(t *testing.T) {
+		clone, _, base := cloneForRescue(t)
+		writeFile(t, clone, ".agent/transcript.jsonl", "{\"password\":84627519}\n")
+		r := minimalRunner(t)
+		r.rescueDir = t.TempDir()
+		res := &Result{}
+		res.Status = "failed"
+		res.WorktreePath = clone
+		res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+		res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+		qw := QueuedWork{QueuedWork: queuedWorkBase("SHADOWPIN")}
+		if !r.preserveUnpublishedWork(qw, res) {
+			t.Fatalf("preserve = false (warnings %v)", res.PostSessionWarnings)
+		}
+		got := readEvidence(t, findEvidenceFiles(t, r.rescueDir)[0])
+		if strings.Contains(got, "84627519") {
+			t.Fatalf("archive retains numeric password:\n%q", got)
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("archive missing [REDACTED]:\n%q", got)
+		}
+	})
+	t.Run("structured-object", func(t *testing.T) {
+		secret := `{"mykey": "probe-structured-value"}`
+		clone, _, base := cloneForRescue(t)
+		writeFile(t, clone, ".agent/transcript.jsonl", "{\"msg\":{\"mykey\":\"probe-structured-value\"}}\n")
+		r := minimalRunner(t)
+		r.rescueDir = t.TempDir()
+		res := &Result{}
+		res.Status = "failed"
+		res.WorktreePath = clone
+		res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+		res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+		qw := QueuedWork{QueuedWork: queuedWorkBase("SHADOWOBJ")}
+		qw.Env = map[string]string{"MY_JSON_CRED": secret}
+		if !r.preserveUnpublishedWork(qw, res) {
+			t.Fatalf("preserve = false (warnings %v)", res.PostSessionWarnings)
+		}
+		got := readEvidence(t, findEvidenceFiles(t, r.rescueDir)[0])
+		if strings.Contains(got, "probe-structured-value") {
+			t.Fatalf("archive retains structured value:\n%q", got)
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("archive missing [REDACTED]:\n%q", got)
+		}
+	})
+	t.Run("prefixed-json-bearer", func(t *testing.T) {
+		bearer := `sec"ret-97531-xyzQWE`
+		inner, err := json.Marshal(map[string]string{"data": bearer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		outer, err := json.Marshal(map[string]string{"msg": "tool output: " + string(inner)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clone, _, base := cloneForRescue(t)
+		writeFile(t, clone, ".agent/transcript.jsonl", string(outer)+"\n")
+		r := minimalRunner(t)
+		r.rescueDir = t.TempDir()
+		res := &Result{}
+		res.Status = "failed"
+		res.WorktreePath = clone
+		res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+		res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+		qw := QueuedWork{QueuedWork: queuedWorkBase("SHADOWPRE")}
+		qw.AuthToken = bearer
+		if !r.preserveUnpublishedWork(qw, res) {
+			t.Fatalf("preserve = false (warnings %v)", res.PostSessionWarnings)
+		}
+		got := readEvidence(t, findEvidenceFiles(t, r.rescueDir)[0])
+		if strings.Contains(got, bearer) {
+			t.Fatalf("archive retains bearer:\n%q", got)
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(strings.TrimSuffix(got, "\n")), &m); err != nil {
+			t.Fatalf("archived record invalid JSON %q: %v", got, err)
+		}
+		if msg, ok := m["msg"].(string); ok {
+			for _, form := range transcriptEvidenceEscapedForms(bearer) {
+				if form != "" && strings.Contains(msg, form) {
+					t.Fatalf("archived msg retains escaped bearer %q:\n%q", form, got)
+				}
+			}
+			if idx := strings.Index(msg, "{"); idx >= 0 {
+				var innerM map[string]interface{}
+				if err := json.Unmarshal([]byte(msg[idx:]), &innerM); err == nil {
+					for _, v := range innerM {
+						if str, ok := v.(string); ok && (str == bearer || strings.Contains(str, bearer)) {
+							t.Fatalf("decoded inner recovers bearer:\n%q", got)
+						}
+					}
+				}
+			}
+			if strings.Contains(msg, bearer) {
+				t.Fatalf("archived msg retains bearer:\n%q", got)
+			}
+		}
+	})
+	t.Run("multiline-known", func(t *testing.T) {
+		secret := "multiline-line1-abc\nmultiline-line2-xyz"
+		clone, _, base := cloneForRescue(t)
+		writeFile(t, clone, ".agent/transcript.jsonl", "multiline-line1-abc\nmultiline-line2-xyz\n")
+		r := minimalRunner(t)
+		r.rescueDir = t.TempDir()
+		res := &Result{}
+		res.Status = "failed"
+		res.WorktreePath = clone
+		res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+		res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+		qw := QueuedWork{QueuedWork: queuedWorkBase("SHADOWML")}
+		qw.AuthToken = secret
+		if !r.preserveUnpublishedWork(qw, res) {
+			t.Fatalf("preserve = false (warnings %v)", res.PostSessionWarnings)
+		}
+		got := readEvidence(t, findEvidenceFiles(t, r.rescueDir)[0])
+		if strings.Contains(got, secret) {
+			t.Fatalf("archive retains multiline secret:\n%q", got)
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("archive missing [REDACTED]:\n%q", got)
+		}
+	})
+}
