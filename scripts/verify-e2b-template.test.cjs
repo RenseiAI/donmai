@@ -7,16 +7,31 @@ const os = require('node:os')
 const path = require('node:path')
 
 const {
+  PG_START_COMMAND,
+  PGVECTOR_PROBE_COMMAND,
+  PNPM_VERSION_COMMAND,
   assertGofumptVersionOutput,
   assertGolangciLintVersionOutput,
   assertGoVersionOutput,
+  assertNodePgCheckOutput,
+  assertPgStartOutput,
+  assertPgvectorProbeOutput,
   assertPiVersionOutput,
+  assertPnpmVersionOutput,
   assertVersionOutput,
+  executableDockerfileText,
+  hasBuildTimeVectorSmoke,
   hasCToolchainForRace,
   hasE2bCompatibleGoPath,
   hasGoTemplate,
+  hasNodePgTemplate,
+  hasPgStartScript,
+  hasPgvectorPackage,
+  hasTrustLocalAuth,
   isGoTemplateRef,
+  isNodePgTemplateRef,
   main,
+  nodePgCheckCommands,
   parseAptInstalledPackages,
   parseE2bPathEntries,
   parseE2bPathRaw,
@@ -24,12 +39,17 @@ const {
   parseGolangciLintVersion,
   parseGoVersion,
   parsePinnedPiVersion,
+  parsePnpmSeedPins,
+  parsePnpmVersion,
+  parsePostgresMajorVersion,
   readGoDockerfileSource,
   readGoVersion,
+  readNodePgDockerfileSource,
   readPinnedPiVersion,
   resolveRepoRoot,
   runMain,
   shouldExpectGoTools,
+  shouldExpectNodePgTools,
   verifyTemplateVersion,
 } = require('./verify-e2b-template.cjs')
 
@@ -1272,5 +1292,771 @@ test('release workflow gates Go toolchain verification on the release checkout',
   } finally {
     fs.rmSync(withGo, { recursive: true, force: true })
     fs.rmSync(withoutGo, { recursive: true, force: true })
+  }
+})
+
+// node-pg template checks (donmai-worker-node-pg): pnpm --version, pg-start,
+// and the CREATE EXTENSION vector probe.
+
+test('node-pg checks include pnpm --version and the CREATE EXTENSION vector probe', () => {
+  // Load-bearing for the node-pg template: removing the probe from the
+  // check list must fail this test (and the order test below).
+  const checks = nodePgCheckCommands()
+  assert.ok(
+    checks.includes(PNPM_VERSION_COMMAND),
+    `node-pg checks must include pnpm --version, got ${JSON.stringify(checks)}`
+  )
+  assert.ok(
+    checks.some((command) => command.includes('CREATE EXTENSION vector')),
+    `node-pg checks must include the CREATE EXTENSION vector probe, got ${JSON.stringify(checks)}`
+  )
+})
+
+test('nodePgCheckCommands runs the start before the probe', () => {
+  const checks = nodePgCheckCommands()
+  assert.deepEqual(checks, [PNPM_VERSION_COMMAND, PG_START_COMMAND, PGVECTOR_PROBE_COMMAND])
+  assert.ok(checks.indexOf(PG_START_COMMAND) < checks.indexOf(PGVECTOR_PROBE_COMMAND))
+})
+
+test('parsePnpmVersion extracts the ARG pin', () => {
+  const source = [
+    'ARG PNPM_VERSION=12.16.1',
+    'RUN corepack prepare pnpm@${PNPM_VERSION} --activate \\',
+    '    && npm i -g pnpm@${PNPM_VERSION}',
+  ].join('\n')
+  assert.equal(parsePnpmVersion(source), '12.16.1')
+})
+
+test('parsePnpmVersion rejects a Dockerfile with no PNPM_VERSION pin', () => {
+  assert.throws(
+    () => parsePnpmVersion('FROM debian:bookworm-slim\nRUN npm i -g pnpm\n'),
+    /could not find PNPM_VERSION pin/
+  )
+})
+
+test('node-pg Dockerfile keeps one pnpm pin across corepack and npm', () => {
+  const repoRoot = testRepoRoot()
+  const source = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  const arg = parsePnpmVersion(source)
+  assert.ok(arg, 'expected an ARG PNPM_VERSION pin')
+  assert.equal((source.match(/^\s*ARG\s+PNPM_VERSION=/gm) || []).length, 1)
+  // Both installs reference ${PNPM_VERSION}, so the two copies can never
+  // drift apart; only the ARG line carries the literal pin.
+  assert.match(source, /corepack prepare pnpm@\$\{PNPM_VERSION\}/)
+  assert.match(source, /npm i -g pnpm@\$\{PNPM_VERSION\}/)
+})
+
+test('parsePostgresMajorVersion extracts 17 from the apt packages', () => {
+  const source = [
+    'RUN apt-get update && apt-get install -y --no-install-recommends \\',
+    '         postgresql-17 postgresql-17-pgvector \\',
+    '    && rm -rf /var/lib/apt/lists/*',
+  ].join('\n')
+  assert.equal(parsePostgresMajorVersion(source), '17')
+})
+
+test('parsePostgresMajorVersion ignores Dockerfile comments', () => {
+  const source = [
+    '# postgresql-17 postgresql-17-pgvector are mentioned here but install nothing',
+    'FROM debian:bookworm-slim',
+    'RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl',
+  ].join('\n')
+  assert.throws(
+    () => parsePostgresMajorVersion(source),
+    /could not find postgresql-<major> package/
+  )
+})
+
+test('parsePostgresMajorVersion rejects a bare pgvector package with no server', () => {
+  const source = [
+    'RUN apt-get update && apt-get install -y --no-install-recommends \\',
+    '         postgresql-17-pgvector',
+  ].join('\n')
+  assert.throws(
+    () => parsePostgresMajorVersion(source),
+    /could not find postgresql-<major> package/
+  )
+})
+
+test('parsePnpmSeedPins extracts the exact warm-store pins', () => {
+  const source = [
+    '\'    "pg": "8.23.1",\'',
+    '\'    "typescript": "7.0.2",\'',
+    '\'    "vitest": "5.0.5"\'',
+  ].join('\n')
+  assert.deepEqual(parsePnpmSeedPins(source), {
+    pg: '8.23.1',
+    typescript: '7.0.2',
+    vitest: '5.0.5',
+  })
+})
+
+test('parsePnpmSeedPins skips floating ranges', () => {
+  const source = '\'    "vitest": "^5.0.5",\''
+  assert.deepEqual(parsePnpmSeedPins(source), {})
+})
+
+test('node-pg Dockerfile warms the store from an exactly-pinned seed', () => {
+  const repoRoot = testRepoRoot()
+  const source = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  const pins = parsePnpmSeedPins(source)
+  for (const dep of ['pg', 'typescript', 'vitest']) {
+    assert.match(
+      pins[dep] || '',
+      /^\d+\.\d+\.\d+$/,
+      `warm-store seed must pin ${dep} exactly`
+    )
+  }
+  const executable = executableDockerfileText(source)
+  assert.match(executable, /pnpm install --lockfile-only/)
+  assert.match(executable, /pnpm fetch/)
+})
+
+test('hasPgvectorPackage detects the extension package outside comments', () => {
+  assert.equal(
+    hasPgvectorPackage('RUN apt-get install -y postgresql-17 postgresql-17-pgvector\n'),
+    true
+  )
+  assert.equal(
+    hasPgvectorPackage('# postgresql-17-pgvector\nFROM debian:bookworm-slim\n'),
+    false
+  )
+})
+
+test('hasPgStartScript ignores comment-only mentions', () => {
+  assert.equal(
+    hasPgStartScript('# pg-start\n# pg_ctlcluster 17 main start\n# pg_isready\nFROM x\n'),
+    false
+  )
+})
+
+test('hasBuildTimeVectorSmoke ignores comment-only mentions', () => {
+  assert.equal(
+    hasBuildTimeVectorSmoke('# CREATE EXTENSION vector\n# pg_ctlcluster 17 main stop\nFROM x\n'),
+    false
+  )
+})
+
+test('hasTrustLocalAuth requires the pg_hba trust switch', () => {
+  assert.equal(
+    hasTrustLocalAuth("RUN sed -i -e 's/peer$/trust/' /etc/postgresql/17/main/pg_hba.conf\n"),
+    true
+  )
+  assert.equal(hasTrustLocalAuth('FROM x\n'), false)
+})
+
+test('isNodePgTemplateRef matches only the node-pg worker template', () => {
+  assert.equal(isNodePgTemplateRef('donmai-worker-node-pg:v1.2.3'), true)
+  assert.equal(isNodePgTemplateRef('donmai-worker-go:v1.2.3'), false)
+  assert.equal(isNodePgTemplateRef('donmai-worker:v1.2.3'), false)
+  assert.equal(isNodePgTemplateRef(''), false)
+})
+
+test('shouldExpectNodePgTools follows the template name or the explicit flag', () => {
+  assert.equal(shouldExpectNodePgTools({ templateRef: 'donmai-worker-node-pg:v1.2.3' }), true)
+  assert.equal(shouldExpectNodePgTools({ templateRef: 'donmai-worker-go:v1.2.3' }), false)
+  assert.equal(shouldExpectNodePgTools({ templateRef: 'donmai-worker:v1.2.3' }), false)
+  assert.equal(
+    shouldExpectNodePgTools({ templateRef: 'donmai-worker:v1.2.3', expectNodePg: '1' }),
+    true
+  )
+  assert.equal(
+    shouldExpectNodePgTools({ templateRef: 'donmai-worker:v1.2.3', expectNodePg: 'true' }),
+    true
+  )
+})
+
+test('assertPnpmVersionOutput accepts the pinned version', () => {
+  assert.doesNotThrow(() =>
+    assertPnpmVersionOutput({ exitCode: 0, stdout: '12.16.1\n' }, '12.16.1')
+  )
+})
+
+test('assertPnpmVersionOutput rejects a wrong version', () => {
+  assert.throws(
+    () => assertPnpmVersionOutput({ exitCode: 0, stdout: '11.0.0\n' }, '12.16.1'),
+    /want "12\.16\.1"/
+  )
+})
+
+test('assertPnpmVersionOutput rejects a longer patch sharing the expected prefix', () => {
+  assert.throws(
+    () => assertPnpmVersionOutput({ exitCode: 0, stdout: '12.16.10\n' }, '12.16.1'),
+    /parsed version "12\.16\.10"/
+  )
+})
+
+test('assertPnpmVersionOutput refuses a nonzero exit even with the pinned version', () => {
+  assert.throws(
+    () =>
+      assertPnpmVersionOutput(
+        { exitCode: 1, stdout: '12.16.1\n', stderr: 'boom' },
+        '12.16.1'
+      ),
+    /pnpm --version exited 1/
+  )
+})
+
+test('assertPnpmVersionOutput requires an expected version', () => {
+  assert.throws(
+    () => assertPnpmVersionOutput({ exitCode: 0, stdout: '12.16.1\n' }, ''),
+    /the expected pnpm version is required/
+  )
+})
+
+test('assertPgStartOutput accepts a clean start', () => {
+  assert.doesNotThrow(() =>
+    assertPgStartOutput({ exitCode: 0, stdout: 'postgres 17/main ready\n' })
+  )
+})
+
+test('assertPgStartOutput refuses a nonzero exit', () => {
+  assert.throws(
+    () => assertPgStartOutput({ exitCode: 1, stdout: '', stderr: 'did not become ready' }),
+    /pg-start exited 1/
+  )
+})
+
+test('assertPgvectorProbeOutput accepts a clean probe', () => {
+  assert.doesNotThrow(() =>
+    assertPgvectorProbeOutput({ exitCode: 0, stdout: 'CREATE EXTENSION\n' })
+  )
+})
+
+test('assertPgvectorProbeOutput refuses a nonzero probe exit', () => {
+  assert.throws(
+    () =>
+      assertPgvectorProbeOutput({ exitCode: 1, stdout: '', stderr: 'extension "vector" does not exist' }),
+    /CREATE EXTENSION vector probe exited 1/
+  )
+})
+
+test('assertNodePgCheckOutput rejects an unknown check without running it', () => {
+  assert.throws(
+    () => assertNodePgCheckOutput('psql --version', { exitCode: 0, stdout: '' }, { expectedPnpmVersion: '12.16.1' }),
+    /unknown node-pg check/
+  )
+})
+
+function makeNodePgSandbox({ commandResults = {}, commandErrors = {}, cleanupError } = {}) {
+  const calls = []
+  const defaults = {
+    'donmai --version': { exitCode: 0, stdout: 'donmai version v0.68.5\n' },
+    'pi --version': { exitCode: 0, stdout: 'pi 0.80.10\n' },
+    [PNPM_VERSION_COMMAND]: { exitCode: 0, stdout: '12.16.1\n' },
+    [PG_START_COMMAND]: { exitCode: 0, stdout: 'postgres 17/main ready\n' },
+    [PGVECTOR_PROBE_COMMAND]: { exitCode: 0, stdout: 'CREATE EXTENSION\n' },
+  }
+  const Sandbox = {
+    async create(templateRef, options) {
+      calls.push(['create', templateRef, options])
+      return {
+        commands: {
+          async run(command) {
+            calls.push(['run', command])
+            if (commandErrors[command]) {
+              throw commandErrors[command]
+            }
+            if (commandResults[command]) {
+              return commandResults[command]
+            }
+            if (defaults[command]) {
+              return defaults[command]
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {
+          calls.push(['kill'])
+        },
+      }
+    },
+  }
+  if (cleanupError) {
+    const originalCreate = Sandbox.create
+    Sandbox.create = async (templateRef, options) => {
+      const sandbox = await originalCreate(templateRef, options)
+      sandbox.kill = async () => {
+        calls.push(['kill'])
+        throw cleanupError
+      }
+      return sandbox
+    }
+  }
+  return { Sandbox, calls }
+}
+
+function expectedNodePgCalls({ runs, kill = true, apiKey = 'test-key' } = {}) {
+  const defaultRuns = [
+    'donmai --version',
+    'pi --version',
+    PNPM_VERSION_COMMAND,
+    PG_START_COMMAND,
+    PGVECTOR_PROBE_COMMAND,
+  ]
+  const calls = [['create', 'donmai-worker-node-pg:v0.68.5', { apiKey, timeoutMs: 60_000 }]]
+  for (const run of runs || defaultRuns) {
+    calls.push(['run', run])
+  }
+  if (kill) calls.push(['kill'])
+  return calls
+}
+
+test('verifyTemplateVersion checks pnpm, Postgres, and pgvector inside the node-pg template', async () => {
+  const { Sandbox, calls } = makeNodePgSandbox()
+
+  await verifyTemplateVersion({
+    Sandbox,
+    templateRef: 'donmai-worker-node-pg:v0.68.5',
+    expectedVersion: 'v0.68.5',
+    expectedPiVersion: '0.80.10',
+    apiKey: 'test-key',
+    expectedPnpmVersion: '12.16.1',
+    expectedPostgresMajorVersion: '17',
+  })
+
+  assert.deepEqual(calls, expectedNodePgCalls())
+})
+
+test('verifyTemplateVersion fails when the CREATE EXTENSION vector probe exits non-zero', async () => {
+  const { Sandbox, calls } = makeNodePgSandbox({
+    commandResults: {
+      [PGVECTOR_PROBE_COMMAND]: { exitCode: 1, stdout: '', stderr: 'extension "vector" does not exist' },
+    },
+  })
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-node-pg:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedPnpmVersion: '12.16.1',
+        expectedPostgresMajorVersion: '17',
+      }),
+    /CREATE EXTENSION vector probe exited 1/
+  )
+  assert.deepEqual(calls, expectedNodePgCalls())
+})
+
+test('verifyTemplateVersion fails when pg-start exits non-zero', async () => {
+  const { Sandbox, calls } = makeNodePgSandbox({
+    commandResults: {
+      [PG_START_COMMAND]: { exitCode: 1, stdout: '', stderr: 'did not become ready' },
+    },
+  })
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-node-pg:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedPnpmVersion: '12.16.1',
+        expectedPostgresMajorVersion: '17',
+      }),
+    /pg-start exited 1/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion rejects a pnpm mismatch after cleanup', async () => {
+  const { Sandbox, calls } = makeNodePgSandbox({
+    commandResults: {
+      [PNPM_VERSION_COMMAND]: { exitCode: 0, stdout: '11.0.0\n' },
+    },
+  })
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-node-pg:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedPnpmVersion: '12.16.1',
+        expectedPostgresMajorVersion: '17',
+      }),
+    /want "12\.16\.1"/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion refuses a nonzero pnpm exit even with the pinned version', async () => {
+  const { Sandbox, calls } = makeNodePgSandbox({
+    commandResults: {
+      [PNPM_VERSION_COMMAND]: { exitCode: 1, stdout: '12.16.1\n', stderr: 'boom' },
+    },
+  })
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-node-pg:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedPnpmVersion: '12.16.1',
+        expectedPostgresMajorVersion: '17',
+      }),
+    /pnpm --version exited 1/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion refuses incomplete Node.js/Postgres expectations', async () => {
+  const { Sandbox } = makeNodePgSandbox()
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-node-pg:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedPnpmVersion: '12.16.1',
+      }),
+    /incomplete/
+  )
+})
+
+test('e2b.node-pg.Dockerfile keeps a single FROM for the E2B build SDK', () => {
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  const fromLines = dockerfile.match(/^FROM\b/gm) || []
+  assert.equal(fromLines.length, 1)
+  assert.doesNotMatch(dockerfile, /^COPY\s+--from=/mi)
+})
+
+test('e2b.node-pg.Dockerfile installs Postgres 17 with the pgvector extension', () => {
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  assert.equal(parsePostgresMajorVersion(dockerfile), '17')
+  assert.equal(hasPgvectorPackage(dockerfile), true)
+  const installed = parseAptInstalledPackages(dockerfile)
+  assert.ok(installed.includes('postgresql-17'), `apt installs must include postgresql-17, got ${JSON.stringify(installed)}`)
+})
+
+test('e2b.node-pg.Dockerfile provisions pg-start and the build-time vector smoke', () => {
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  assert.equal(hasPgStartScript(dockerfile), true)
+  assert.equal(hasBuildTimeVectorSmoke(dockerfile), true)
+  assert.equal(hasTrustLocalAuth(dockerfile), true)
+  assert.match(
+    executableDockerfileText(dockerfile),
+    /bash -l -c 'pnpm --version'/
+  )
+})
+
+test('main() runs node-pg checks for the node-pg template through production selection', async () => {
+  const repoRoot = testRepoRoot()
+  const runs = []
+  const fakeSandbox = {
+    async create() {
+      return {
+        commands: {
+          async run(command) {
+            runs.push(command)
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: 'donmai version v0.68.5\n' }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            if (command === PNPM_VERSION_COMMAND) {
+              const source = fs.readFileSync(
+                path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+                'utf8'
+              )
+              const { parsePnpmVersion: parsePin } = require('./verify-e2b-template.cjs')
+              return { exitCode: 0, stdout: `${parsePin(source)}\n` }
+            }
+            if (command === PG_START_COMMAND) {
+              return { exitCode: 0, stdout: 'postgres 17/main ready\n' }
+            }
+            if (command === PGVECTOR_PROBE_COMMAND) {
+              return { exitCode: 0, stdout: 'CREATE EXTENSION\n' }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker-node-pg:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    runMain: async (args) => {
+      assert.equal(args.templateRef, 'donmai-worker-node-pg:v0.68.5')
+      assert.ok(args.expectedPnpmVersion, 'pnpm version must be set for the node-pg template')
+      assert.ok(args.expectedPostgresMajorVersion, 'postgres major must be set for the node-pg template')
+      assert.equal(args.expectedGoVersion, undefined)
+      const { runMain: realRunMain } = require('./verify-e2b-template.cjs')
+      return realRunMain({ ...args, writeError: () => {} })
+    },
+    writeError: () => {},
+  })
+  assert.equal(code, 0)
+  assert.deepEqual(runs, [
+    'donmai --version',
+    'pi --version',
+    PNPM_VERSION_COMMAND,
+    PG_START_COMMAND,
+    PGVECTOR_PROBE_COMMAND,
+  ])
+})
+
+test('main() runs node-pg checks for the base template with the explicit flag', async () => {
+  const repoRoot = testRepoRoot()
+  const runs = []
+  const fakeSandbox = {
+    async create() {
+      return {
+        commands: {
+          async run(command) {
+            runs.push(command)
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: 'donmai version v0.68.5\n' }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            if (command === PNPM_VERSION_COMMAND) {
+              const source = fs.readFileSync(
+                path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+                'utf8'
+              )
+              const { parsePnpmVersion: parsePin } = require('./verify-e2b-template.cjs')
+              return { exitCode: 0, stdout: `${parsePin(source)}\n` }
+            }
+            if (command === PG_START_COMMAND) {
+              return { exitCode: 0, stdout: 'postgres 17/main ready\n' }
+            }
+            if (command === PGVECTOR_PROBE_COMMAND) {
+              return { exitCode: 0, stdout: 'CREATE EXTENSION\n' }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      E2B_EXPECT_NODE_PG_TOOLCHAIN: '1',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    writeError: () => {},
+  })
+  assert.equal(code, 0)
+  assert.deepEqual(runs, [
+    'donmai --version',
+    'pi --version',
+    PNPM_VERSION_COMMAND,
+    PG_START_COMMAND,
+    PGVECTOR_PROBE_COMMAND,
+  ])
+})
+
+test('main() rejects a failing vector probe for the node-pg template', async () => {
+  const repoRoot = testRepoRoot()
+  const fakeSandbox = {
+    async create() {
+      return {
+        commands: {
+          async run(command) {
+            if (command === 'donmai --version') {
+              return { exitCode: 0, stdout: 'donmai version v0.68.5\n' }
+            }
+            if (command === 'pi --version') {
+              return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+            }
+            if (command === PNPM_VERSION_COMMAND) {
+              return { exitCode: 0, stdout: '12.16.1\n' }
+            }
+            if (command === PG_START_COMMAND) {
+              return { exitCode: 0, stdout: 'postgres 17/main ready\n' }
+            }
+            if (command === PGVECTOR_PROBE_COMMAND) {
+              return { exitCode: 1, stdout: '', stderr: 'extension "vector" is not available' }
+            }
+            throw new Error(`unexpected command: ${command}`)
+          },
+        },
+        async kill() {},
+      }
+    },
+  }
+  const errors = []
+  const code = await main({
+    env: {
+      E2B_TEMPLATE_REF: 'donmai-worker-node-pg:v0.68.5',
+      DONMAI_VERSION: 'v0.68.5',
+      E2B_API_KEY: 'test-key',
+      DONMAI_REPO_ROOT: repoRoot,
+    },
+    cwd: repoRoot,
+    loadSandbox: () => fakeSandbox,
+    writeError: (line) => errors.push(line),
+  })
+  assert.equal(code, 1)
+  assert.match(errors.join(''), /CREATE EXTENSION vector probe exited 1/)
+})
+
+test('historical checkout without the node-pg Dockerfile verifies the base template without node-pg checks', async () => {
+  // Mimics a release checkout that predates worker/e2b/e2b.node-pg.Dockerfile.
+  // The production verifier must still verify the base template with only
+  // donmai/pi checks, while node-pg expectations stay gated on the file existing.
+  const historicalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-historical-nodepg-'))
+  try {
+    fs.writeFileSync(path.join(historicalRoot, 'go.mod'), 'module example.com/x\ngo 1.26.10\n')
+    fs.mkdirSync(path.join(historicalRoot, 'worker', 'e2b'), { recursive: true })
+    fs.writeFileSync(
+      path.join(historicalRoot, 'worker', 'e2b', 'e2b.Dockerfile'),
+      'FROM debian:bookworm-slim\n'
+    )
+    fs.mkdirSync(path.join(historicalRoot, 'provider', 'harness', 'pi'), { recursive: true })
+    fs.writeFileSync(
+      path.join(historicalRoot, 'provider', 'harness', 'pi', 'probe.go'),
+      'package pi\n\nconst PinnedVersion = "0.80.10"\n'
+    )
+    assert.equal(hasNodePgTemplate(historicalRoot), false)
+    assert.throws(() => readNodePgDockerfileSource(historicalRoot), /could not find e2b\.node-pg\.Dockerfile/)
+
+    const runs = []
+    const fakeSandbox = {
+      async create() {
+        return {
+          commands: {
+            async run(command) {
+              runs.push(command)
+              if (command === 'donmai --version') {
+                return { exitCode: 0, stdout: 'donmai version v0.53.0\n' }
+              }
+              if (command === 'pi --version') {
+                return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+              }
+              throw new Error(`unexpected command: ${command}`)
+            },
+          },
+          async kill() {},
+        }
+      },
+    }
+    const code = await main({
+      env: {
+        E2B_TEMPLATE_REF: 'donmai-worker:v0.53.0',
+        DONMAI_VERSION: 'v0.53.0',
+        E2B_API_KEY: 'test-key',
+        DONMAI_REPO_ROOT: historicalRoot,
+      },
+      cwd: historicalRoot,
+      loadSandbox: () => fakeSandbox,
+      writeError: () => {},
+    })
+    assert.equal(code, 0)
+    assert.deepEqual(runs, ['donmai --version', 'pi --version'])
+  } finally {
+    fs.rmSync(historicalRoot, { recursive: true, force: true })
+  }
+})
+
+test('hasNodePgTemplate reports the node-pg template only when the Dockerfile exists', () => {
+  const withNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-hasnodepg-'))
+  const withoutNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-nonodepg-'))
+  try {
+    fs.mkdirSync(path.join(withNodePg, 'worker', 'e2b'), { recursive: true })
+    fs.writeFileSync(path.join(withNodePg, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'), 'FROM x\n')
+    fs.mkdirSync(path.join(withoutNodePg, 'worker', 'e2b'), { recursive: true })
+    assert.equal(hasNodePgTemplate(withNodePg), true)
+    assert.equal(hasNodePgTemplate(withoutNodePg), false)
+    assert.equal(hasNodePgTemplate(''), false)
+    assert.equal(hasNodePgTemplate(undefined), false)
+  } finally {
+    fs.rmSync(withNodePg, { recursive: true, force: true })
+    fs.rmSync(withoutNodePg, { recursive: true, force: true })
+  }
+})
+
+test('release workflow gates node-pg verification on the release checkout', () => {
+  // Load-bearing guard for the pre-node-pg retry: the node-pg build and
+  // verification only run when the release contains the node-pg Dockerfile.
+  // Deleting either node-pg step condition must fail this test.
+  const workflow = fs.readFileSync(resolveWorkflowPath(), 'utf8')
+  const detect = workflowStepBlock(workflow, 'Detect node-pg template in release checkout')
+  assert.match(detect, /hasNodePgDockerfile/, 'detection must call the production hasNodePgDockerfile helper')
+  assert.match(detect, /present=false/, 'detection must name the pre-node-pg retry it preserves')
+  const nodePgVerify = workflowStepBlock(workflow, 'Assert published E2B node-pg template toolchain')
+  assert.match(
+    nodePgVerify,
+    /steps\.node-pg-template\.outputs\.present\s*==\s*'true'/,
+    'node-pg toolchain verification must be gated on the release containing the node-pg Dockerfile'
+  )
+  const nodePgBuild = workflowStepBlock(workflow, 'Build versioned E2B node-pg template')
+  assert.match(
+    nodePgBuild,
+    /steps\.node-pg-template\.outputs\.present\s*==\s*'true'/,
+    'node-pg template build must be gated on the release containing the node-pg Dockerfile'
+  )
+  assert.match(nodePgBuild, /E2B_CPU_COUNT:\s*8/, 'node-pg template build must request 8 vCPU')
+  assert.match(nodePgBuild, /E2B_MEMORY_MB:\s*16384/, 'node-pg template build must request 16384 MB')
+  assert.match(nodePgBuild, /E2B_DOCKERFILE:\s*e2b\.node-pg\.Dockerfile/, 'node-pg build must select the node-pg Dockerfile')
+  const baseVerify = workflowStepBlock(workflow, 'Assert published E2B template binary version')
+  assert.doesNotMatch(
+    baseVerify,
+    /steps\.node-pg-template/,
+    'base template verification must stay ungated so historical retries still verify it'
+  )
+  const conditions = workflow.match(/steps\.node-pg-template\.outputs\.present\s*==\s*'true'/g) || []
+  assert.equal(conditions.length, 2, `both node-pg steps must be gated, found ${conditions.length}`)
+  const summary = workflowStepBlock(workflow, 'Summarize E2B template build')
+  assert.match(summary, /pre-node-pg retry/, 'summary must name the pre-node-pg retry it preserves')
+  // Execute the production presence helper against both release layouts.
+  const withNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-workflow-nodepg-'))
+  const withoutNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-workflow-nobase-'))
+  try {
+    fs.mkdirSync(path.join(withNodePg, 'worker', 'e2b'), { recursive: true })
+    fs.writeFileSync(path.join(withNodePg, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'), 'FROM x\n')
+    fs.mkdirSync(path.join(withoutNodePg, 'worker', 'e2b'), { recursive: true })
+    assert.equal(hasNodePgTemplate(withNodePg), true)
+    assert.equal(hasNodePgTemplate(withoutNodePg), false)
+  } finally {
+    fs.rmSync(withNodePg, { recursive: true, force: true })
+    fs.rmSync(withoutNodePg, { recursive: true, force: true })
   }
 })
