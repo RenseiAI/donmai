@@ -788,17 +788,71 @@ func (r *Runner) acceptSessionPullRequest(ctx context.Context, v *sessionPullReq
 // unbounded: dropping an older hint under a flood of newer URLs is what
 // flipped landed sessions to agent-blocked, so no hint is ever evicted.
 // Retention stays proportional to the transcript that carried the URLs.
+//
+// Collection is linear: the final list is the distinct URLs of
+// candidates followed by the URLs in text, ordered by last occurrence, so
+// a repeated URL moves to its latest position without rescanning the list
+// for every URL (which stalled session end on transcripts with tens of
+// thousands of URLs).
 func appendPullRequestCandidates(candidates []string, text string) []string {
-	for _, u := range prURLRE.FindAllString(text, -1) {
-		for i, existing := range candidates {
-			if existing == u {
-				candidates = append(candidates[:i], candidates[i+1:]...)
-				break
-			}
-		}
-		candidates = append(candidates, u)
+	urls := prURLRE.FindAllString(text, -1)
+	if len(urls) == 0 {
+		return candidates
 	}
-	return candidates
+	return unionPullRequestCandidates(candidates, urls)
+}
+
+// unionPullRequestCandidates returns the distinct URLs of a followed by b,
+// ordered by last occurrence: a URL appearing in both (or twice in b)
+// keeps only its latest position. Both inputs are already in that form in
+// the common case, so the union preserves their order and runs in linear
+// time via a single seen-set instead of rescanning the list per URL.
+func unionPullRequestCandidates(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return dedupPullRequestCandidatesByLastOccurrence(b)
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	rev := make([]string, 0, len(a)+len(b))
+	for i := len(b) - 1; i >= 0; i-- {
+		if _, dup := seen[b[i]]; dup {
+			continue
+		}
+		seen[b[i]] = struct{}{}
+		rev = append(rev, b[i])
+	}
+	for i := len(a) - 1; i >= 0; i-- {
+		if _, dup := seen[a[i]]; dup {
+			continue
+		}
+		seen[a[i]] = struct{}{}
+		rev = append(rev, a[i])
+	}
+	// Reverse so the order is by last occurrence in a followed by b.
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	return rev
+}
+
+// dedupPullRequestCandidatesByLastOccurrence keeps each URL once at its
+// latest position, preserving first-seen order of last occurrences.
+func dedupPullRequestCandidatesByLastOccurrence(urls []string) []string {
+	seen := make(map[string]struct{}, len(urls))
+	rev := make([]string, 0, len(urls))
+	for i := len(urls) - 1; i >= 0; i-- {
+		if _, dup := seen[urls[i]]; dup {
+			continue
+		}
+		seen[urls[i]] = struct{}{}
+		rev = append(rev, urls[i])
+	}
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	return rev
 }
 
 // firstLine returns the first non-empty line of s, for compact diagnostics.

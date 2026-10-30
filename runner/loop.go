@@ -2706,10 +2706,9 @@ func newInjectAcceptor(
 // earlier hint is still verified when a later turn carries none; first trusted
 // URL wins so later chatter cannot displace it; all else takes the latest.
 func mergeInjectObservation(merged, turn streamObservation) streamObservation {
-	cands := merged.pullRequestCandidates
-	for _, u := range turn.pullRequestCandidates {
-		cands = appendPullRequestCandidates(cands, u)
-	}
+	// Batch union: appending one URL at a time rescans the list per URL
+	// (quadratic over a flooded turn), so union both candidate lists once.
+	cands := unionPullRequestCandidates(merged.pullRequestCandidates, turn.pullRequestCandidates)
 	first := merged.pullRequestURL
 	if first == "" {
 		first = turn.pullRequestURL
