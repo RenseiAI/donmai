@@ -2,9 +2,14 @@ package ptyhost
 
 import (
 	"bytes"
+	"context"
+	"flag"
 	"io"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/attachwire"
 )
@@ -21,6 +26,53 @@ import (
 // saved cursor, modes, resize, query responses, serialization, reset, and
 // memory bounds, plus the Kitty keyboard state-fidelity lane.
 
+// A supplied checkout is verified locally; this lane never fetches or builds
+// upstream code. Omit the flag for the hermetic stand-in matrix.
+var candidateCheckout = flag.String("vt-candidate-checkout", "", "local pinned upstream checkout for the spike rerun")
+
+func TestCandidateCheckout(t *testing.T) {
+	if *candidateCheckout == "" {
+		t.Skip("upstream checkout lane requires -vt-candidate-checkout; stand-in matrix is independent")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "HEAD^{commit}")
+	cmd.Dir = *candidateCheckout
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("verify candidate checkout: %v", err)
+	}
+	got := strings.TrimSpace(string(out))
+	if got != vtCandidateUpstream || got != vtCandidateSHAs["candidate"] {
+		t.Fatalf("candidate checkout = %s, want %s (%s)", got, vtCandidateUpstream, vtCandidateUpstreamTag)
+	}
+	t.Logf("verified candidate checkout %s (%s)", got, vtCandidateUpstreamTag)
+}
+
+// Exercise the real checkout lane in a subprocess so an accidental removal
+// of its refusal cannot turn the normal hermetic suite green.
+func TestCandidateCheckoutRefuses(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test executable: %v", err)
+	}
+	for _, tc := range []struct{ name, checkout, diagnostic string }{
+		{"other-revision", ".", "candidate checkout ="},
+		{"git-error", t.TempDir(), "verify candidate checkout:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestCandidateCheckout$", "-vt-candidate-checkout=.")
+			cmd.Dir = tc.checkout
+			out, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), tc.diagnostic) {
+				t.Fatalf("checkout refusal: err=%v output=%s", err, out)
+			}
+		})
+	}
+}
+
 func feedControl(t *testing.T, cols, rows int, raw []byte, resp io.Writer) *vtHost {
 	t.Helper()
 	if resp == nil {
@@ -33,6 +85,7 @@ func feedControl(t *testing.T, cols, rows int, raw []byte, resp io.Writer) *vtHo
 
 func feedCandidate(t *testing.T, cols, rows int, raw []byte, resp io.Writer) *vtCandidate {
 	t.Helper()
+	t.Logf("stand-in seam matrix: %s (%s); not a linked upstream emulator", vtCandidateUpstreamTag, vtCandidateUpstream)
 	if resp == nil {
 		resp = io.Discard
 	}
@@ -143,11 +196,11 @@ func diffScreens(t *testing.T, lane string, got, want attachwire.Screen) int {
 // against, so the pins are asserted here, not just commented.
 func TestCandidatePinExposed(t *testing.T) {
 	upstream, tag, control, license, shas, toolchain := candidatePin()
-	if upstream != "332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28" {
+	if upstream != "83fb95624b0439ee660c2679b43b38c8b63769cd" {
 		t.Errorf("candidate pin = %s", upstream)
 	}
-	if tag == "" || control == "" || license == "" {
-		t.Error("candidate pin labels must be non-empty")
+	if tag != "v1.4.0" || control == "" || license != "MIT" {
+		t.Errorf("candidate labels = %q, %q, %q", tag, control, license)
 	}
 	if shas["candidate"] != upstream || shas["control"] == "" {
 		t.Errorf("candidate SHAs = %v", shas)
