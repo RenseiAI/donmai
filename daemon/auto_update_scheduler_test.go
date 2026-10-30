@@ -331,9 +331,13 @@ func TestAutoUpdateScheduler_StartStop_OptedInRunsAtApprovedTick(t *testing.T) {
 			waitForUpdateCondition(t, 10*time.Second, "binary download", func() bool {
 				return probe.binaryHits.Load() == 1
 			})
-			if got := probe.sigHits.Load(); got != 1 {
-				t.Fatalf("bundle downloads = %d, want 1", got)
-			}
+			// The bundle download follows the binary download inside the
+			// same attempt; poll rather than asserting once, since the
+			// binary hit is already visible while the bundle fetch is
+			// still in flight under suite load.
+			waitForUpdateCondition(t, 10*time.Second, "bundle download", func() bool {
+				return probe.sigHits.Load() == 1
+			})
 			// The failed attempt leaves the daemon draining by contract:
 			// failures never silently resume.
 			if state := d.State(); state != StateDraining {
