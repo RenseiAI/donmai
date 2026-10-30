@@ -1685,7 +1685,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// re-dispatching the identical context. Only a pull request the remote
 	// verifier accepted suppresses the fork; a URL scraped from narrative
 	// never does.
-	if classifyBlocked(res, streamRes, prVerifier != nil && prVerifier.accepted != "") {
+	// A decline never relabels a recorded failure (mirrors the follow-up fork).
+	if res.FailureMode == "" && classifyBlocked(res, streamRes, prVerifier != nil && prVerifier.accepted != "") {
 		r.logger.Info("agent blocked: deliberate decline detected",
 			"sessionId", qw.SessionID,
 			"reason", streamRes.blockedReason,
@@ -2701,6 +2702,24 @@ func newInjectAcceptor(
 	}
 }
 
+// mergeInjectObservation unions buffered-inject turns: candidates union so an
+// earlier hint is still verified when a later turn carries none; first trusted
+// URL wins so later chatter cannot displace it; all else takes the latest.
+func mergeInjectObservation(merged, turn streamObservation) streamObservation {
+	cands := merged.pullRequestCandidates
+	for _, u := range turn.pullRequestCandidates {
+		cands = appendPullRequestCandidates(cands, u)
+	}
+	first := merged.pullRequestURL
+	if first == "" {
+		first = turn.pullRequestURL
+	}
+	merged = turn
+	merged.pullRequestCandidates = cands
+	merged.pullRequestURL = first
+	return merged
+}
+
 // drainMemoryInjects delivers every memory block the heartbeat transport
 // buffered onto injectCh during the just-completed turn, then re-consumes
 // the resume turn's events. It is invoked at the post-terminal seam (the
@@ -2766,7 +2785,7 @@ func (r *Runner) drainMemoryInjects(
 			// turn — never a provider error to retry outside that bound.
 			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 			injRes.applyTo(res, res.ProviderName)
-			merged = injRes
+			merged = mergeInjectObservation(merged, injRes)
 			if enforcer != nil && enforcer.breached() != nil {
 				// A budget cap ended the turn: deliver nothing more.
 				return merged
@@ -3554,12 +3573,9 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			}
 		}
 	case agent.ToolResultEvent:
-		// Provenance: tool output is the trusted channel for the session
-		// pull request (e.g. the `gh pr create` return value). The latest
-		// trusted URL wins; a narrative URL never competes here. The
-		// remote verifier still confirms it before it may suppress the
-		// blocked fork or mark the run complete.
-		if u := scanPRURL(e.Content); u != "" {
+		// Tool output is the trusted channel (`gh pr create`): first URL wins
+		// so later chatter cannot displace it; verifier still confirms it.
+		if u := scanPRURL(e.Content); u != "" && obs.pullRequestURL == "" {
 			obs.pullRequestURL = u
 		}
 		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Content)

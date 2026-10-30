@@ -137,6 +137,37 @@ func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 	}
 }
 
+// Earlier inject hint survives a later empty inject: first inject reports the
+// session PR in narrative, second reports nothing; the verified PR must stand.
+func TestRun_BufferedInjectNarrativeHintIsPreserved(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "recall: second memory block"})
+	secondBuffered := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if acks, _ := platform.injectReports(); slices.Contains(acks, "dlv-2") {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("second inject was never buffered")
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository,
+		pulls:             map[int]string{7: pullAtSessionCommit},
+		heartbeatInterval: 10 * time.Millisecond, platform: platform,
+		turns: []verdictScriptTurn{
+			{text: "Working."},
+			{before: secondBuffered, text: "Opened " + followUpPR + "\nWORK_RESULT: passed"},
+			{text: "Noted."},
+		},
+	})
+	if res.PullRequestURL != followUpPR {
+		t.Fatalf("PullRequestURL = %q; want verified %q", res.PullRequestURL, followUpPR)
+	}
+}
+
 // TestApplyTo_DoesNotCountToolCalls pins that applying an observation never
 // touches the tool-call count: consumeEvents meters it, so an observation
 // applied more than once (per inject turn, then by the caller) cannot

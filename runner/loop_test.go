@@ -1049,9 +1049,11 @@ func TestObserveEvent_AssistantNarrativePRURLIsHintOnly(t *testing.T) {
 }
 
 // TestObserveEvent_ToolResultPRURLIsTrustedChannel pins that tool output is
-// the trusted channel: the latest tool-result URL becomes the authoritative
+// the trusted channel: the first tool-result URL becomes the authoritative
 // observation (still subject to remote verification before it may suppress
-// the blocked fork).
+// the blocked fork). Later tool chatter must not displace it: a `gh pr list`
+// of unrelated pull requests after the session's own `gh pr create` leaves
+// the session's pull request in place so the verifier still checks it first.
 func TestObserveEvent_ToolResultPRURLIsTrustedChannel(t *testing.T) {
 	t.Parallel()
 	h := newRunnerHarness(t)
@@ -1068,13 +1070,75 @@ func TestObserveEvent_ToolResultPRURLIsTrustedChannel(t *testing.T) {
 	if obs.pullRequestURL != "https://github.com/o/r/pull/7" {
 		t.Fatalf("pullRequestURL = %q; want the trusted tool-result URL", obs.pullRequestURL)
 	}
-	// The latest trusted URL wins over an earlier one.
+	// Later tool chatter does not displace the first trusted URL.
 	h.runner.observeEvent(
 		agent.ToolResultEvent{ToolName: "bash", ToolUseID: "2", Content: "opened https://github.com/o/r/pull/8"},
 		obs, wt, QueuedWork{}, nil,
 	)
-	if obs.pullRequestURL != "https://github.com/o/r/pull/8" {
-		t.Fatalf("pullRequestURL = %q; want the latest tool-result URL", obs.pullRequestURL)
+	if obs.pullRequestURL != "https://github.com/o/r/pull/7" {
+		t.Fatalf("pullRequestURL = %q; want the first trusted tool-result URL (later chatter must not displace it)", obs.pullRequestURL)
+	}
+	if len(obs.pullRequestCandidates) != 3 {
+		t.Fatalf("pullRequestCandidates = %v; want all three URLs as candidates", obs.pullRequestCandidates)
+	}
+}
+
+// Verified PRs suppress the blocked fork at both callers (forcing either to false must fail).
+func TestRun_VerifiedPRSuppressesBlocked(t *testing.T) {
+	initial := runScripted(t, "development", true, "",
+		verdictScriptTurn{
+			events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)},
+			text:   "Stuck.\nAGENT_BLOCKED: need a decision",
+		})
+	if initial.FailureMode == FailureAgentBlocked || initial.PullRequestURL != followUpPR {
+		t.Fatalf("initial: FailureMode=%q PR=%q; want verified exemption with %q", initial.FailureMode, initial.PullRequestURL, followUpPR)
+	}
+	followUp := runScripted(t, "development", false, "",
+		verdictScriptTurn{text: "Work in progress."},
+		verdictScriptTurn{
+			events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)},
+			text:   "Need a decision.\nAGENT_BLOCKED: need a decision",
+		},
+	)
+	if followUp.FailureMode == FailureAgentBlocked || followUp.PullRequestURL != followUpPR {
+		t.Fatalf("follow-up: FailureMode=%q PR=%q; want verified exemption with %q", followUp.FailureMode, followUp.PullRequestURL, followUpPR)
+	}
+}
+
+// A decline never relabels a crash: PR URL plus AGENT_BLOCKED plus ErrorEvent
+// stays provider-error, for narrative and tool-result URLs.
+func TestRun_ProviderCrashKeepsProviderErrorOverBlocked(t *testing.T) {
+	for _, turn := range []verdictScriptTurn{
+		{text: "Opened " + followUpPR + "\nAGENT_BLOCKED: need a decision", crash: true},
+		{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "AGENT_BLOCKED: need a decision", crash: true},
+	} {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType: WorkTypeQAStr, repository: followUpRepository,
+			pulls: map[int]string{7: pullAtSessionCommit}, turns: []verdictScriptTurn{turn},
+		})
+		if res.FailureMode != FailureProviderError || !strings.Contains(res.Error, "provider crashed mid turn") {
+			t.Fatalf("FailureMode=%q Error=%q; want provider-error with the crash", res.FailureMode, res.Error)
+		}
+	}
+}
+
+// Later chatter cannot displace the session PR: real URL first, then eight `gh pr list` URLs.
+func TestRun_LaterToolChatterKeepsSessionPR(t *testing.T) {
+	var events []agent.Event
+	events = append(events, toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR))
+	pulls := map[int]string{7: pullAtSessionCommit}
+	for n := 101; n <= 108; n++ {
+		u := "https://github.com/example/repo/pull/" + fmt.Sprint(n)
+		events = append(events, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+		pulls[n] = pullAtOtherCommit
+	}
+	events = append(events, say("Still need a decision.\nAGENT_BLOCKED: need a decision"))
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		turns: []verdictScriptTurn{{events: events}},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
 	}
 }
 
