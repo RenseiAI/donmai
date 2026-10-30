@@ -591,6 +591,15 @@ type Runner struct {
 	protectedRuntimeMCPV2Selector     ProtectedRuntimeMCPV2Selector
 	selectionPolicy                   protectedRuntimeMCPSelectionPolicy
 
+	// terminalEvidenceWriteFile archives one evidence copy; nil uses
+	// os.WriteFile. Tests substitute it to fail the archive write at the
+	// exact verified stage.
+	terminalEvidenceWriteFile func(string, []byte, os.FileMode) error
+	// terminalEvidenceReadFile reads back one archived copy; nil uses
+	// os.ReadFile. Tests substitute it to return mismatched bytes and pin
+	// the readback refusal.
+	terminalEvidenceReadFile func(string) ([]byte, error)
+
 	// rescueDir is Options.RescueDir (see rescueRoot for the default).
 	rescueDir string
 	// depsExecer is Options.DepsExecer.

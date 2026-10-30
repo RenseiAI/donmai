@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -548,5 +549,196 @@ func TestPreserveTerminalEvidence_SymlinkRetainsWorkarea(t *testing.T) {
 	}
 	if archives := findEvidenceArchives(t, r.rescueDir); len(archives) != 0 {
 		t.Fatalf("evidence archives = %v; want none on symlink rejection", archives)
+	}
+}
+
+// TestOpenTerminalEvidenceFile_RejectsSymlinkAndFIFO pins the safe open:
+// a trailing symlink fails instead of archiving its target, and a FIFO
+// opens without blocking so the regular-file check can reject it.
+// Ordinary os.Open would follow the symlink and block on the FIFO.
+func TestOpenTerminalEvidenceFile_RejectsSymlinkAndFIFO(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "outside.cast")
+	if err := os.WriteFile(outside, []byte("outside-content\n"), 0o600); err != nil {
+		t.Fatalf("write outside: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "evidence.cast")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if f, err := openTerminalEvidenceFile(link); err == nil {
+		_ = f.Close()
+		t.Fatal("openTerminalEvidenceFile(symlink) = nil error; want ELOOP so the target is never archived")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFO open semantics are unix-only")
+	}
+	fifo := filepath.Join(t.TempDir(), "evidence.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	type openResult struct {
+		f   *os.File
+		err error
+	}
+	done := make(chan openResult, 1)
+	go func() {
+		f, err := openTerminalEvidenceFile(fifo)
+		done <- openResult{f: f, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("openTerminalEvidenceFile(fifo) err = %v; want success without blocking so Stat can reject", r.err)
+		}
+		defer func() { _ = r.f.Close() }()
+		if st, err := r.f.Stat(); err != nil || st.Mode().IsRegular() {
+			t.Fatalf("fifo Stat regular = %v err = %v; want non-regular rejection", st, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("openTerminalEvidenceFile(fifo) blocked over 5s; want O_NONBLOCK so terminal delivery never stalls")
+	}
+}
+
+// TestPreserveTerminalEvidence_SwappedSymlinkNeverArchivesOutside drives
+// the production archive while another process swaps the declared path
+// between a regular file and a symlink to outside content. No archive may
+// ever hold the outside bytes: with O_NOFOLLOW the swapped open fails and
+// preservation returns false instead of archiving the target.
+func TestPreserveTerminalEvidence_SwappedSymlinkNeverArchivesOutside(t *testing.T) {
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	dir := t.TempDir()
+	const victimBody = "victim-transcript-body\n"
+	const outsideBody = "outside-content-must-never-be-archived\n"
+	outside := filepath.Join(dir, "outside.cast")
+	if err := os.WriteFile(outside, []byte(outsideBody), 0o600); err != nil {
+		t.Fatalf("write outside: %v", err)
+	}
+	path := filepath.Join(dir, "evidence.cast")
+	if err := os.WriteFile(path, []byte(victimBody), 0o600); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = os.Remove(path)
+			_ = os.WriteFile(path, []byte(victimBody), 0o600)
+			_ = os.Remove(path)
+			_ = os.Symlink(outside, path)
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		res := &Result{Result: agent.Result{Status: "failed"}}
+		res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: path}}
+		qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-SWAP")}
+		_ = r.preserveTerminalEvidence(qw, res)
+	}
+	close(stop)
+	wg.Wait()
+	for _, a := range findEvidenceArchives(t, r.rescueDir) {
+		//nolint:gosec // G304: test-owned archive path under t.TempDir().
+		raw, err := os.ReadFile(a)
+		if err != nil {
+			t.Fatalf("read archive: %v", err)
+		}
+		if string(raw) == outsideBody {
+			t.Fatalf("archive %s holds outside content; swapped symlink must fail preservation", a)
+		}
+	}
+}
+
+// TestPreserveTerminalEvidence_FIFONeverBlocksPreservation proves a FIFO at
+// the declared path fails fast instead of stalling terminal completion.
+// Ordinary os.Open would block until a writer appears, ahead of result
+// posting, with no deadline.
+func TestPreserveTerminalEvidence_FIFONeverBlocksPreservation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFO semantics are unix-only")
+	}
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	fifo := filepath.Join(t.TempDir(), "evidence.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	res := &Result{Result: agent.Result{Status: "failed"}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: fifo}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-FIFO")}
+	done := make(chan bool, 1)
+	go func() { done <- r.preserveTerminalEvidence(qw, res) }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("preserveTerminalEvidence(fifo) = true; want false so the workarea is kept")
+		}
+		if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+			t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("preserveTerminalEvidence(fifo) blocked over 10s; swapped FIFO must fail fast")
+	}
+}
+
+// TestPreserveTerminalEvidence_ReadbackMismatchRetainsWorkarea pins the
+// archive readback refusal: a corrupted or unreadable copy suppresses
+// teardown with the value-free warning. Disabling the comparison would
+// return true and delete the only good copy.
+func TestPreserveTerminalEvidence_ReadbackMismatchRetainsWorkarea(t *testing.T) {
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	src := filepath.Join(t.TempDir(), "evidence.cast")
+	const body = "readback-pin-body\n"
+	if err := os.WriteFile(src, []byte(body), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	r.terminalEvidenceReadFile = func(string) ([]byte, error) { return []byte("corrupted-mismatch\n"), nil }
+	res := &Result{Result: agent.Result{Status: "failed"}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: src}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-READBACK")}
+	if r.preserveTerminalEvidence(qw, res) {
+		t.Fatal("preserveTerminalEvidence = true with mismatched readback; want false so the workarea is kept")
+	}
+	if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	for _, w := range append(append([]string{}, res.PostSessionWarnings...), res.Result.PostSessionWarnings...) {
+		if strings.Contains(w, body) || strings.Contains(w, "corrupted") || strings.Contains(w, ".cast") {
+			t.Fatalf("warning %q leaks content or path; want value-free", w)
+		}
+	}
+}
+
+// TestPreserveTerminalEvidence_ArchiveWriteFailureRetainsWorkarea pins the
+// archive-stage write refusal: failing the copy itself suppresses teardown.
+// The existing unwritable-rescue test fails before any copy; this one
+// reaches the verified write. The read seam returns matching bytes so only
+// the write check can refuse: ignoring the write error would let the
+// readback pass and return true.
+func TestPreserveTerminalEvidence_ArchiveWriteFailureRetainsWorkarea(t *testing.T) {
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	src := filepath.Join(t.TempDir(), "evidence.cast")
+	const body = "archive-write-pin\n"
+	if err := os.WriteFile(src, []byte(body), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	r.terminalEvidenceWriteFile = func(string, []byte, os.FileMode) error { return errors.New("injected archive write failure") }
+	r.terminalEvidenceReadFile = func(string) ([]byte, error) { return []byte(body), nil }
+	res := &Result{Result: agent.Result{Status: "failed"}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: src}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-ARCHIVE-WRITE")}
+	if r.preserveTerminalEvidence(qw, res) {
+		t.Fatal("preserveTerminalEvidence = true with archive write failure; want false")
+	}
+	if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
 	}
 }

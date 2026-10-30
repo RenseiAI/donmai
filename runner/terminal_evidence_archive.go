@@ -74,14 +74,19 @@ func (r *Runner) preserveTerminalEvidence(qw QueuedWork, res *Result) bool {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
 		}
-		//nolint:gosec // G304: path comes from the session-owned descriptor captured after Stop.
-		f, err := os.Open(desc.Path)
+		// Open without following a trailing symlink and without blocking
+		// on a FIFO: a path swapped to a symlink between Lstat and Open
+		// fails here with ELOOP instead of archiving its target, and a
+		// path swapped to a FIFO opens without blocking so the
+		// regular-file check below can reject it. The post-open Stat is
+		// authoritative; the pre-open Lstat is only a fast-path hint.
+		f, err := openTerminalEvidenceFile(desc.Path)
 		if err != nil {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
 		}
-		// Re-verify after open: the descriptor could have been swapped
-		// between Lstat and Open. The LimitReader below additionally caps
+		// Re-verify after open: the descriptor could have grown between
+		// the Lstat hint and Open. The LimitReader below additionally caps
 		// a file that grew in that window, so the read never allocates
 		// beyond the bound plus one probe byte.
 		if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || st.Size() > terminalEvidenceMaxBytes {
@@ -101,13 +106,21 @@ func (r *Runner) preserveTerminalEvidence(qw QueuedWork, res *Result) bool {
 		}
 		base := rescueSegment(filepath.Base(desc.Path))
 		dest := filepath.Join(archiveDir, fmt.Sprintf("evidence-%02d-%s", i, base))
+		writeFile := r.terminalEvidenceWriteFile
+		if writeFile == nil {
+			writeFile = os.WriteFile
+		}
+		readFile := r.terminalEvidenceReadFile
+		if readFile == nil {
+			readFile = os.ReadFile
+		}
 		//nolint:gosec // G703: dest is runner-owned under the rescue root, base is rescueSegment-sanitized
-		if err := os.WriteFile(dest, raw, 0o600); err != nil {
+		if err := writeFile(dest, raw, 0o600); err != nil {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
 		}
 		//nolint:gosec // G304: dest is runner-owned under the rescue root.
-		back, err := os.ReadFile(dest)
+		back, err := readFile(dest)
 		if err != nil || !bytes.Equal(raw, back) {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
