@@ -694,6 +694,17 @@ type Daemon struct {
 	// terminal and rung 2 cannot precede rung 1. See mutation_session_wake.go.
 	wakeLedger       wakeLedger
 	preflightConfigs *preflightConfigRegistry
+
+	// hostUpgradeMu guards the consented host-upgrade request state below.
+	// It is never held across lifecycle waits, config writes, preflight or
+	// update execution: the heartbeat path only records intent here and hands
+	// bounded execution to a background goroutine, so a delayed update
+	// cannot block the next beat.
+	hostUpgradeMu       sync.Mutex
+	hostUpgradeInFlight map[string]struct{}
+	hostUpgradeCancels  map[string]context.CancelFunc
+	hostUpgradeDone     map[string]hostUpgradeOutcome
+	hostUpgradeLoaded   bool
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -2654,6 +2665,12 @@ func (d *Daemon) Stop(ctx context.Context) error {
 		return err
 	}
 	d.lifecycleMu.Unlock()
+
+	// Bound a hosted upgrade attempt: cancel its execution context before
+	// waiting on the lifecycle lease so Shutdown never waits past the
+	// attempt's own bound. The attempt records a failure outcome and
+	// releases the lease; Stop then proceeds.
+	d.cancelHostUpgrades()
 
 	lease, err := d.claimLifecycle(ctx, lifecycleStop)
 	if err != nil {

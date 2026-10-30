@@ -825,7 +825,7 @@ type HeartbeatMutationFailure struct {
 // 2026-05-18-daemon-config-sync-DESIGN.md.
 type PendingMutation struct {
 	ID          string          `json:"id"`
-	Op          string          `json:"op"` // session.kill | pool.deleted | project.enable | project.disable | legacy project.add | project.remove
+	Op          string          `json:"op"` // session.kill | pool.deleted | host.upgrade | project.enable | project.disable | legacy project.add | project.remove
 	Params      json.RawMessage `json:"params"`
 	RequestedAt string          `json:"requestedAt"`
 	RequestedBy string          `json:"requestedBy"`
