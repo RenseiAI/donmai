@@ -1461,7 +1461,12 @@ func TestGuardedRepairRefusesReplacedLock(t *testing.T) {
 			t.Errorf("create replacement lock: %v", err)
 			return
 		}
-		fd := int(f.Fd())
+		fd, err := intFileDescriptor(f.Fd())
+		if err != nil {
+			t.Errorf("lock replacement fd: %v", err)
+			_ = f.Close()
+			return
+		}
 		if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 			t.Errorf("lock replacement: %v", err)
 		}
@@ -1531,6 +1536,163 @@ func TestGuardedRepairDoesNotBlockOnRecordFIFORace(t *testing.T) {
 			//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
 			_ = os.WriteFile(recordPath, body, 0o600)
 			t.Fatalf("repair blocked on swapped FIFO at attempt %d while holding the exclusive lock", attempt)
+		}
+	}
+}
+
+// TestGuardedRepairRefusesSymlinkRecord pins the descriptor-relative
+// no-follow record open: an in-root symlink for acquisition.json (pointing
+// at a regular file with valid bytes in the same directory) must fail
+// closed. os.Root's OpenFile follows such a link even with O_NOFOLLOW and
+// the descriptor Stat then sees the regular target, so only a
+// descriptor-relative openat with O_NOFOLLOW can refuse it. Deleting that
+// open lets the repair follow the link and rewrite identity.
+func TestGuardedRepairRefusesSymlinkRecord(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	recordDir := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID)
+	recordPath := filepath.Join(recordDir, acquisitionRecordFileName)
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := filepath.Join(recordDir, "real.json")
+	//nolint:gosec // test-only TempDir fixture; path from Join(parent, constant).
+	if err := os.WriteFile(targetPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(recordPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.json", recordPath); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted a symlinked acquisition record")
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+// TestGuardedRepairRefusesStoreDirSwapDuringScan pins the post-scan
+// directory check: a canonical store-directory swap during the record scan
+// leaves the pinned root pointing at the moved-away directory while the
+// parent path no longer resolves to it. The pre-scan checks already passed
+// before the swap and the lock re-check resolves through the pinned root,
+// so only the post-scan directory comparison can refuse. Deleting it lets
+// the repair write backups into the moved store and succeed.
+func TestGuardedRepairRefusesStoreDirSwapDuringScan(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	oldHook := repairPostScanHook
+	defer func() { repairPostScanHook = oldHook }()
+	repairPostScanHook = func() {
+		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		if err := os.Rename(storeDir, storeDir+".moved"); err != nil {
+			t.Errorf("rename store dir: %v", err)
+		}
+	}
+	storeBefore, err := os.ReadFile(filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreIdentityName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair succeeded after canonical store was replaced during record scan")
+	}
+	movedStore, err := os.ReadFile(filepath.Join(parent, acquisitionStoreDirName+".moved", acquisitionStoreIdentityName))
+	if err != nil {
+		t.Fatalf("moved store identity unreadable: %v", err)
+	}
+	if string(movedStore) != string(storeBefore) {
+		t.Fatal("repair wrote into the moved store before refusing the swapped directory")
+	}
+}
+
+// TestGuardedRepairRefusesReplacedLockAfterScan pins the final
+// lock-canonical re-check: replacing the canonical lock after the record
+// scan (so the post-lock re-check has already passed) must still fail
+// closed. Deleting the final check lets the repair rewrite identity while
+// a concurrent holder owns the replacement lock.
+func TestGuardedRepairRefusesReplacedLockAfterScan(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	oldHook := repairPostScanHook
+	defer func() { repairPostScanHook = oldHook }()
+	repairPostScanHook = func() {
+		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		lockPath := filepath.Join(storeDir, acquisitionStoreLockName)
+		if err := os.Rename(lockPath, lockPath+".old"); err != nil {
+			t.Errorf("rename lock: %v", err)
+			return
+		}
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Errorf("create replacement lock: %v", err)
+			return
+		}
+		fd, err := intFileDescriptor(f.Fd())
+		if err != nil {
+			t.Errorf("lock replacement fd: %v", err)
+			_ = f.Close()
+			return
+		}
+		if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Errorf("lock replacement: %v", err)
+		}
+		go func() {
+			time.Sleep(2 * time.Second)
+			_ = syscall.Flock(fd, syscall.LOCK_UN)
+			_ = f.Close()
+		}()
+	}
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair rewrote identity while a concurrent holder owned the replacement lock")
+	}
+}
+
+// TestGuardedRepairRefusesReadableFIFORecord pins the regular-file refusal
+// in the record scan: a FIFO carrying valid record bytes is readable, so
+// decoding, validation, and store-ID checks would all pass and only the
+// regular-file check can refuse. Deleting it lets the repair admit the
+// FIFO and rewrite identity.
+func TestGuardedRepairRefusesReadableFIFORecord(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(recordPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(recordPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := os.OpenFile(recordPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close() }()
+	if _, err := holder.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair admitted a FIFO acquisition record carrying valid bytes")
+	}
+	// The repair must not have replaced the FIFO or written backups.
+	if fi, err := os.Lstat(recordPath); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("repair disturbed the FIFO record: %+v %v", fi, err)
+	}
+	after := snapshotAcquisitionParent(t, parent)
+	for name := range after {
+		if _, ok := before[name]; !ok && strings.Contains(name, ".backup-") {
+			t.Fatalf("repair wrote backup %q for a refused FIFO record", name)
 		}
 	}
 }

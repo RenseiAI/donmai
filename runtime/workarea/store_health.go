@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // repairLockTimeout bounds the exclusive store-lock wait during explicit
@@ -30,6 +32,13 @@ var repairSwapHook func()
 // inode pin still rejects a different-inode forgery that reuses the
 // diagnosed store ID.
 var repairPreOpenHook func()
+
+// repairPostScanHook is a test-only seam invoked after the repair scans
+// every acquisition record but before the final lock-canonical re-check
+// that precedes the first write. Tests use it to replace the canonical
+// lock after the post-lock re-check has passed, proving the final
+// re-check still refuses a replacement owned by a concurrent holder.
+var repairPostScanHook func()
 
 // StoreDiagnosis describes the health of the workarea acquisition-store
 // identity for one worktree parent.
@@ -340,6 +349,29 @@ func RepairAcquisitionStore(parent string) error {
 	if err := validateAcquisitionRecordsBelongToStore(root, storeRecord.StoreID); err != nil {
 		return err
 	}
+	// Test-only post-scan seam: runs after the record scan but before the
+	// final lock-canonical re-check, so a lock replacement here is only
+	// caught by that final check.
+	if repairPostScanHook != nil {
+		repairPostScanHook()
+	}
+	// Post-scan directory check: a canonical store-directory swap during
+	// the record scan leaves the pinned root pointing at the moved-away
+	// directory while the parent path resolves to the replacement. The
+	// lock re-check below resolves through the pinned root and would miss
+	// it, so re-resolve the parent pathname here and require it to still
+	// be the pinned directory before any write.
+	postScan, err := parentRoot.Lstat(acquisitionStoreDirName)
+	if err != nil || postScan.Mode()&os.ModeSymlink != 0 || !os.SameFile(postScan, openedInfo) || !os.SameFile(postScan, lockedInfo) {
+		return fmt.Errorf("runtime/workarea: acquisition store directory identity changed")
+	}
+	if postScan.Mode().Perm() != 0o700 {
+		return fmt.Errorf("runtime/workarea: acquisition store is not a private real directory")
+	}
+	postLockedInfo, err := root.Stat(".")
+	if err != nil || !os.SameFile(postLockedInfo, openedInfo) || !os.SameFile(postLockedInfo, lockedInfo) {
+		return fmt.Errorf("runtime/workarea: acquisition store identity changed while locking")
+	}
 	// Re-check the lock pathname immediately before writing: a replacement
 	// between the post-lock re-check and the rewrite must still fail
 	// closed. The window cannot be eliminated entirely while the lock is
@@ -403,6 +435,15 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 	if readErr != nil {
 		return readErr
 	}
+	storeDirFile, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = storeDirFile.Close() }()
+	storeFd, err := intFileDescriptor(storeDirFile.Fd())
+	if err != nil {
+		return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+	}
 	for _, entry := range entries {
 		name := entry.Name()
 		isPublished := entry.IsDir() && strings.HasPrefix(name, "wac_")
@@ -418,22 +459,40 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 		if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
-		acquisitionRoot, err := root.OpenRoot(name)
+		// Open the acquisition subdirectory without following symlinks:
+		// O_NOFOLLOW|O_DIRECTORY refuses a symlinked wac_ directory
+		// that the Lstat above could have missed after a swap, and the
+		// descriptor pins the directory the record open resolves
+		// against. os.Root's OpenFile follows an in-root symlink even
+		// with O_NOFOLLOW, so a kernel-level openat relative to the
+		// pinned store directory is required here.
+		subFd, err := unix.Openat(storeFd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 		if err != nil {
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		subStat := &unix.Stat_t{}
+		if err := unix.Fstat(subFd, subStat); err != nil {
+			_ = unix.Close(subFd)
+			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+		if subStat.Mode&unix.S_IFMT != unix.S_IFDIR {
+			_ = unix.Close(subFd)
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
 		// Open the record without following symlinks and without blocking:
 		// a concurrent swap of the regular file for a FIFO between the
 		// check and the read must be rejected, not blocked on, while the
 		// exclusive store lock is held. Opening with O_NONBLOCK succeeds
-		// immediately on a FIFO, and the Stat below then refuses it as
+		// immediately on a FIFO, and the fstat below then refuses it as
 		// non-regular. Reading from the open description (instead of a
 		// second pathname read) also closes the Lstat-to-read swap window:
 		// a swap after the open cannot change the bytes this scan
-		// validates.
-		recordFile, err := acquisitionRoot.OpenFile(acquisitionRecordFileName, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+		// validates. The open is descriptor-relative (openat relative to
+		// the pinned subdirectory) so an in-root symlink cannot be
+		// followed: O_NOFOLLOW fails with ELOOP and the repair refuses.
+		recordFd, err := unix.Openat(subFd, acquisitionRecordFileName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		_ = unix.Close(subFd)
 		if err != nil {
-			_ = acquisitionRoot.Close()
 			if errors.Is(err, fs.ErrNotExist) {
 				// An unpublished claim without a record file is an
 				// abandoned claim: recovery removes it and there is
@@ -449,15 +508,14 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 			}
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
+		recordFile := os.NewFile(uintptr(recordFd), name+"/"+acquisitionRecordFileName) //nolint:gosec // G115: unix.Openat returns a non-negative descriptor or an error, checked immediately above.
 		recordInfo, err := recordFile.Stat()
 		if err != nil || !recordInfo.Mode().IsRegular() || recordInfo.Mode()&os.ModeSymlink != 0 {
 			_ = recordFile.Close()
-			_ = acquisitionRoot.Close()
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
 		body, err := io.ReadAll(recordFile)
 		_ = recordFile.Close()
-		_ = acquisitionRoot.Close()
 		if err != nil {
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
