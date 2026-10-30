@@ -1318,3 +1318,123 @@ func TestGuardedRepairRefusesAcquisitionIDMismatch(t *testing.T) {
 	}
 	assertAcquisitionParentUnchanged(t, parent, before)
 }
+
+// TestGuardedRepairRefusesSemanticallyInvalidRecords pins the three
+// fail-closed record-content checks in the repair scan: semantic
+// validation, trailing-data rejection, and unknown-field rejection. The
+// pre-existing "malformed record" case feeds invalid JSON, which fails at
+// decoding before any of these checks run, so disabling any one of them
+// leaves that case (and the rest of the suite) green while admitting a
+// forged record. Each subtest below forges a record that passes decoding
+// but is refused by exactly one of the three checks, so removing that
+// check lets repair through (RED on revert).
+func TestGuardedRepairRefusesSemanticallyInvalidRecords(t *testing.T) {
+	t.Run("invalid state passes decoding but fails validation", func(t *testing.T) {
+		parent := t.TempDir()
+		committed := committedReadyForReadback(t, parent)
+		_, _ = legacyDriftForGuardedTest(t, parent)
+		recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+		body, err := os.ReadFile(recordPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(body, &doc); err != nil {
+			t.Fatal(err)
+		}
+		// Keep every identity field intact so only the semantic
+		// validation can refuse: valid JSON, no trailing data, no
+		// unknown fields, matching store and acquisition IDs, but a
+		// state outside the closed set.
+		doc["state"] = "bogus-state"
+		forged, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(recordPath, forged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotAcquisitionParent(t, parent)
+		diagnosis, err := DiagnoseAcquisitionStore(parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !diagnosis.NeedsReanchor {
+			t.Fatalf("invalid-state record must still diagnose as repair-required at the identity layer: %+v", diagnosis)
+		}
+		if err := RepairAcquisitionStore(parent); err == nil {
+			t.Fatal("repair admitted an acquisition record with an invalid state")
+		}
+		assertAcquisitionParentUnchanged(t, parent, before)
+	})
+
+	t.Run("trailing data after valid record", func(t *testing.T) {
+		parent := t.TempDir()
+		committed := committedReadyForReadback(t, parent)
+		_, _ = legacyDriftForGuardedTest(t, parent)
+		recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+		body, err := os.ReadFile(recordPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The first JSON value is the intact valid record (so decoding
+		// and semantic validation of that value would pass); only the
+		// trailing-data check can refuse the extra value.
+		forged := append(append([]byte{}, body...), []byte(" {}")...)
+		//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+		if err := os.WriteFile(recordPath, forged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotAcquisitionParent(t, parent)
+		diagnosis, err := DiagnoseAcquisitionStore(parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !diagnosis.NeedsReanchor {
+			t.Fatalf("trailing-data record must still diagnose as repair-required at the identity layer: %+v", diagnosis)
+		}
+		if err := RepairAcquisitionStore(parent); err == nil {
+			t.Fatal("repair admitted an acquisition record with trailing data")
+		}
+		assertAcquisitionParentUnchanged(t, parent, before)
+	})
+
+	t.Run("unknown field in valid record", func(t *testing.T) {
+		parent := t.TempDir()
+		committed := committedReadyForReadback(t, parent)
+		_, _ = legacyDriftForGuardedTest(t, parent)
+		recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+		body, err := os.ReadFile(recordPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(body, &doc); err != nil {
+			t.Fatal(err)
+		}
+		// Every known field stays valid so decoding (without the
+		// unknown-field guard), trailing-data, semantic validation, and
+		// both identity comparisons would all pass; only the closed
+		// decoder can refuse the forged extra field.
+		doc["extra"] = 0
+		forged, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(recordPath, forged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotAcquisitionParent(t, parent)
+		diagnosis, err := DiagnoseAcquisitionStore(parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !diagnosis.NeedsReanchor {
+			t.Fatalf("unknown-field record must still diagnose as repair-required at the identity layer: %+v", diagnosis)
+		}
+		if err := RepairAcquisitionStore(parent); err == nil {
+			t.Fatal("repair admitted an acquisition record with an unknown field")
+		}
+		assertAcquisitionParentUnchanged(t, parent, before)
+	})
+}
