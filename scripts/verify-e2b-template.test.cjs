@@ -390,6 +390,43 @@ test('assertGofumptVersionOutput accepts the pinned version', () => {
   )
 })
 
+test('assertGoVersionOutput refuses a nonzero exit even with the pinned version', () => {
+  assert.throws(
+    () =>
+      assertGoVersionOutput(
+        { exitCode: 1, stdout: 'go version go1.26.10 linux/amd64\n', stderr: 'boom' },
+        '1.26.10'
+      ),
+    /go version exited 1/
+  )
+})
+
+test('assertGolangciLintVersionOutput refuses a nonzero exit even with the pinned version', () => {
+  assert.throws(
+    () =>
+      assertGolangciLintVersionOutput(
+        {
+          exitCode: 1,
+          stdout: 'golangci-lint has version 2.11.4 built with go1.27.3\n',
+          stderr: 'boom',
+        },
+        '2.11.4'
+      ),
+    /golangci-lint --version exited 1/
+  )
+})
+
+test('assertGofumptVersionOutput refuses a nonzero exit even with the pinned version', () => {
+  assert.throws(
+    () =>
+      assertGofumptVersionOutput(
+        { exitCode: 1, stdout: 'v0.12.0 (go1.27.3)\n', stderr: 'boom' },
+        '0.12.0'
+      ),
+    /gofumpt --version exited 1/
+  )
+})
+
 test('e2b.go.Dockerfile keeps a single FROM for the E2B build SDK', () => {
   const repoRoot = testRepoRoot()
   const dockerfile = fs.readFileSync(
@@ -648,6 +685,106 @@ test('verifyTemplateVersion rejects a gofumpt mismatch after cleanup', async () 
         expectedGofumptVersion: '0.12.0',
       }),
     /parsed version "0\.12\.00"/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion refuses a nonzero go version exit even with the pinned version', async () => {
+  const { Sandbox, calls } = makeGoSandbox()
+  const originalCreate = Sandbox.create
+  Sandbox.create = async (templateRef, options) => {
+    const sandbox = await originalCreate(templateRef, options)
+    const originalRun = sandbox.commands.run
+    sandbox.commands.run = async (command) => {
+      if (command === 'go version') {
+        return { exitCode: 1, stdout: 'go version go1.26.10 linux/amd64\n', stderr: 'boom' }
+      }
+      return originalRun(command)
+    }
+    return sandbox
+  }
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-go:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedGoVersion: '1.26.10',
+        expectedGolangciLintVersion: '2.11.4',
+        expectedGofumptVersion: '0.12.0',
+      }),
+    /go version exited 1/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion refuses a nonzero golangci-lint exit even with the pinned version', async () => {
+  const { Sandbox, calls } = makeGoSandbox()
+  const originalCreate = Sandbox.create
+  Sandbox.create = async (templateRef, options) => {
+    const sandbox = await originalCreate(templateRef, options)
+    const originalRun = sandbox.commands.run
+    sandbox.commands.run = async (command) => {
+      if (command === 'golangci-lint --version') {
+        return {
+          exitCode: 1,
+          stdout: 'golangci-lint has version 2.11.4 built with go1.27.3\n',
+          stderr: 'boom',
+        }
+      }
+      return originalRun(command)
+    }
+    return sandbox
+  }
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-go:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedGoVersion: '1.26.10',
+        expectedGolangciLintVersion: '2.11.4',
+        expectedGofumptVersion: '0.12.0',
+      }),
+    /golangci-lint --version exited 1/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion refuses a nonzero gofumpt exit even with the pinned version', async () => {
+  const { Sandbox, calls } = makeGoSandbox()
+  const originalCreate = Sandbox.create
+  Sandbox.create = async (templateRef, options) => {
+    const sandbox = await originalCreate(templateRef, options)
+    const originalRun = sandbox.commands.run
+    sandbox.commands.run = async (command) => {
+      if (command === 'gofumpt --version') {
+        return { exitCode: 1, stdout: 'v0.12.0 (go1.27.3)\n', stderr: 'boom' }
+      }
+      return originalRun(command)
+    }
+    return sandbox
+  }
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-go:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedGoVersion: '1.26.10',
+        expectedGolangciLintVersion: '2.11.4',
+        expectedGofumptVersion: '0.12.0',
+      }),
+    /gofumpt --version exited 1/
   )
   assert.ok(calls.some((entry) => entry[0] === 'kill'))
 })
