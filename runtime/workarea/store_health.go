@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -261,6 +262,15 @@ func RepairAcquisitionStore(parent string) error {
 	if repairSwapHook != nil {
 		repairSwapHook()
 	}
+	// The exclusive lock is held on an open file description, not on the
+	// pathname: replacing .store.lock after acquisition lets a production
+	// writer flock the replacement while this repair still holds the old
+	// inode. Re-resolve the canonical pathname while holding the lock and
+	// require it to be the same file, otherwise fail closed without
+	// writing.
+	if err := verifyRepairLockStillCanonical(root, lock); err != nil {
+		return err
+	}
 	current, err := parentRoot.Lstat(acquisitionStoreDirName)
 	if err != nil || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, openedInfo) {
 		return fmt.Errorf("runtime/workarea: acquisition store directory identity changed")
@@ -328,6 +338,14 @@ func RepairAcquisitionStore(parent string) error {
 	// another store refuses the repair without writing, so a forged
 	// store directory cannot be laundered by re-anchoring its identity.
 	if err := validateAcquisitionRecordsBelongToStore(root, storeRecord.StoreID); err != nil {
+		return err
+	}
+	// Re-check the lock pathname immediately before writing: a replacement
+	// between the post-lock re-check and the rewrite must still fail
+	// closed. The window cannot be eliminated entirely while the lock is
+	// pathname-addressed, but verifying as late as possible leaves no
+	// test-observable gap between premise validation and the first write.
+	if err := verifyRepairLockStillCanonical(root, lock); err != nil {
 		return err
 	}
 	// All premises re-verified under lock: back up, then durably replace
@@ -404,7 +422,16 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 		if err != nil {
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
-		recordInfo, err := acquisitionRoot.Lstat(acquisitionRecordFileName)
+		// Open the record without following symlinks and without blocking:
+		// a concurrent swap of the regular file for a FIFO between the
+		// check and the read must be rejected, not blocked on, while the
+		// exclusive store lock is held. Opening with O_NONBLOCK succeeds
+		// immediately on a FIFO, and the Stat below then refuses it as
+		// non-regular. Reading from the open description (instead of a
+		// second pathname read) also closes the Lstat-to-read swap window:
+		// a swap after the open cannot change the bytes this scan
+		// validates.
+		recordFile, err := acquisitionRoot.OpenFile(acquisitionRecordFileName, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			_ = acquisitionRoot.Close()
 			if errors.Is(err, fs.ErrNotExist) {
@@ -422,11 +449,14 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 			}
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
-		if !recordInfo.Mode().IsRegular() || recordInfo.Mode()&os.ModeSymlink != 0 {
+		recordInfo, err := recordFile.Stat()
+		if err != nil || !recordInfo.Mode().IsRegular() || recordInfo.Mode()&os.ModeSymlink != 0 {
+			_ = recordFile.Close()
 			_ = acquisitionRoot.Close()
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
 		}
-		body, err := acquisitionRoot.ReadFile(acquisitionRecordFileName)
+		body, err := io.ReadAll(recordFile)
+		_ = recordFile.Close()
 		_ = acquisitionRoot.Close()
 		if err != nil {
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
@@ -445,6 +475,42 @@ func validateAcquisitionRecordsBelongToStore(root *os.Root, storeID string) erro
 		}
 		if record.AcquisitionID != expectedID || record.StoreID != storeID {
 			return fmt.Errorf("runtime/workarea: acquisition record belongs to another store")
+		}
+	}
+	return nil
+}
+
+// verifyRepairLockStillCanonical re-resolves the canonical lock pathname
+// while the exclusive lock is held and requires it to be the same file
+// the repair locked. A lock-file replacement after acquisition lets a
+// production writer flock the replacement while the repair still holds
+// the old inode; without this check the repair would rewrite identity
+// believing it holds mutual exclusion. Any divergence fails closed
+// without writing.
+func verifyRepairLockStillCanonical(root *os.Root, lock *os.File) error {
+	currentLockInfo, err := root.Lstat(acquisitionStoreLockName)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("runtime/workarea: acquisition store lock changed while locking")
+		}
+		return fmt.Errorf("runtime/workarea: open acquisition store lock: %w", err)
+	}
+	if !currentLockInfo.Mode().IsRegular() || currentLockInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
+	}
+	if nlink, ok := fileLinkCount(currentLockInfo); !ok || nlink != 1 {
+		return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
+	}
+	heldInfo, err := lock.Stat()
+	if err != nil || !heldInfo.Mode().IsRegular() || !os.SameFile(currentLockInfo, heldInfo) {
+		return fmt.Errorf("runtime/workarea: acquisition store lock changed while locking")
+	}
+	if nlink, ok := fileLinkCount(heldInfo); !ok || nlink != 1 {
+		return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
+	}
+	if storeLockInfo, err := root.Lstat(acquisitionStoreIdentityName); err == nil {
+		if os.SameFile(currentLockInfo, storeLockInfo) || os.SameFile(heldInfo, storeLockInfo) {
+			return fmt.Errorf("runtime/workarea: acquisition store lock is unsafe")
 		}
 	}
 	return nil

@@ -1438,3 +1438,99 @@ func TestGuardedRepairRefusesSemanticallyInvalidRecords(t *testing.T) {
 		assertAcquisitionParentUnchanged(t, parent, before)
 	})
 }
+
+// TestGuardedRepairRefusesReplacedLock pins the post-lock pathname check:
+// replacing the canonical lock after the repair acquires its hold lets a
+// concurrent holder lock the replacement. The repair must refuse instead
+// of rewriting identity without mutual exclusion.
+func TestGuardedRepairRefusesReplacedLock(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	_, _ = legacyDriftForGuardedTest(t, parent)
+	oldHook := repairSwapHook
+	defer func() { repairSwapHook = oldHook }()
+	repairSwapHook = func() {
+		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		lockPath := filepath.Join(storeDir, acquisitionStoreLockName)
+		if err := os.Rename(lockPath, lockPath+".old"); err != nil {
+			t.Errorf("rename lock: %v", err)
+			return
+		}
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Errorf("create replacement lock: %v", err)
+			return
+		}
+		fd := int(f.Fd())
+		if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Errorf("lock replacement: %v", err)
+		}
+		go func() {
+			time.Sleep(2 * time.Second)
+			_ = syscall.Flock(fd, syscall.LOCK_UN)
+			_ = f.Close()
+		}()
+	}
+	if err := RepairAcquisitionStore(parent); err == nil {
+		t.Fatal("repair rewrote identity while a concurrent holder owned the replacement lock")
+	}
+}
+
+// TestGuardedRepairDoesNotBlockOnRecordFIFORace pins the non-blocking
+// record scan: a concurrent swap of a regular record for a FIFO between
+// the check and the read must be refused, never blocked on, while the
+// exclusive store lock is held.
+func TestGuardedRepairDoesNotBlockOnRecordFIFORace(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	recordPath := filepath.Join(parent, acquisitionStoreDirName, committed.AcquisitionID, acquisitionRecordFileName)
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 150; attempt++ {
+		_, _ = legacyDriftForGuardedTest(t, parent)
+		stop := make(chan struct{})
+		swapped := make(chan struct{})
+		go func() {
+			defer close(swapped)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = os.Remove(recordPath)
+				_ = syscall.Mkfifo(recordPath, 0o600)
+				_ = os.Remove(recordPath)
+				//nolint:gosec // test-only TempDir race swap; path from Join(parent, constant).
+				_ = os.WriteFile(recordPath, body, 0o600)
+			}
+		}()
+		done := make(chan error, 1)
+		go func() { done <- RepairAcquisitionStore(parent) }()
+		select {
+		case repairErr := <-done:
+			if repairErr != nil {
+				t.Logf("attempt %d refused as expected: %v", attempt, repairErr)
+			}
+			close(stop)
+			<-swapped
+			// Restore the regular record before the next re-drift so
+			// the fixture stays well-formed; either outcome (repaired
+			// or refused on a FIFO window) is accepted, blocking is not.
+			// The swapper has exited here, so the remove+write below
+			// cannot race a fresh FIFO into a blocking open.
+			_ = os.Remove(recordPath)
+			//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+			_ = os.WriteFile(recordPath, body, 0o600)
+		case <-time.After(5 * time.Second):
+			close(stop)
+			<-swapped
+			_ = os.Remove(recordPath)
+			//nolint:gosec // test-only TempDir restore; path from Join(parent, constant).
+			_ = os.WriteFile(recordPath, body, 0o600)
+			t.Fatalf("repair blocked on swapped FIFO at attempt %d while holding the exclusive lock", attempt)
+		}
+	}
+}
